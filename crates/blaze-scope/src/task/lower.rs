@@ -464,12 +464,23 @@ impl<'s, 'a> Cfg<'s, 'a> {
                 // `#[lang = "panic_impl"]` declaration is bound to (blaze-ladder
                 // front2/panic_entry.rs asks the row by this name). No `#[lang]` is named so.
                 "panic_handler" => attrs.lang = Some("panic_handler"),
-                // `#[global_allocator]` files its static in the lang rows under the attribute's
-                // own name: the allocator's `extern "Rust"` declarations bind to it (blaze-ladder
-                // front2/alloc_shim.rs asks the row by this name, and refuses a program with
-                // one until the attribute's expansion is built); two are the index's
-                // `LangTwice`. No `#[lang]` is named so.
-                "global_allocator" => attrs.lang = Some("global_allocator"),
+                // `#[global_allocator]` is the prelude's attribute macro (core's
+                // `#[rustc_builtin_macro] pub macro global_allocator`): it takes the item, and its
+                // expansion (blaze-expand global_allocator.rs) writes the static back with the four
+                // `__rust_*` allocator fns beside it, which alloc's `extern "Rust"` declarations
+                // bind to (blaze-ladder front2/alloc_shim.rs). The static is also filed in the
+                // lang rows under the attribute's own name, keyed as the expansion declares it
+                // (`Lower::item`): the ladder asks the row by this name; two are the index's
+                // `LangTwice`. No `#[lang]` is named so. The taker is the path as written, which
+                // the call's item walk finds the attribute by.
+                "global_allocator" => {
+                    attrs.lang = Some("global_allocator");
+                    let written = head(content).trim();
+                    attrs.takers.push(written);
+                    if attrs.attr_macro.is_none() {
+                        attrs.attr_macro = Some(written);
+                    }
+                }
                 "rustc_builtin_macro" => {
                     attrs.builtin = true;
                     // `#[rustc_builtin_macro(Default, attributes(default))]` (the pinned library,
@@ -491,6 +502,14 @@ impl<'s, 'a> Cfg<'s, 'a> {
                 "no_implicit_prelude" => attrs.no_implicit_prelude = true,
                 "no_std" => attrs.no_std = true,
                 "no_core" => attrs.no_core = true,
+                "feature" => {
+                    for feature in SplitTop::new(args(content)) {
+                        let feature = feature.trim();
+                        if !feature.is_empty() {
+                            attrs.features.push(feature);
+                        }
+                    }
+                }
                 "register_tool" => {
                     for tool in SplitTop::new(args(content)) {
                         let tool = tool.trim();
@@ -526,7 +545,11 @@ impl<'s, 'a> Cfg<'s, 'a> {
                             attrs.attr_macro = Some(name);
                         }
                     }
-                    if !is_builtin_attr(name) {
+                    // A path no tool of `TOOLS` owns is a taker wherever it is written, so after a
+                    // derive it is one of the item's after-derive calls too (derive_where's
+                    // `#[::derive_where::derive_where_visited]`); `Lower::attrs` drops the paths
+                    // of the crate's registered tools.
+                    if tool.map_or(!is_builtin_attr(name), |tool| !tool) {
                         attrs.others.push(name);
                         attrs.derives_before.push(attrs.derives.len());
                     }
@@ -710,9 +733,13 @@ pub struct Attrs<'t, 'a> {
     /// `#![blaze::arbitrary_ints]` (docs/v2/plan/design/arbitrary-ints.md).
     pub arbitrary_ints: bool,
     pub tools: AVec<'a, &'t str>,
-    /// One-segment attribute names that are neither built in nor a tool's: an attribute macro
-    /// (the item's taker) or, after a derive, a derive's helper, which `Lower::helper_checks`
-    /// sends to the cells (names-attr-4).
+    /// `#![feature(a, b)]`'s names, as written (a crate root's: the crate root record's
+    /// `features`, which a gate of the crate's code reads).
+    pub features: AVec<'a, &'t str>,
+    /// Attribute names that are neither built in nor a tool's, in written order: a one-segment
+    /// name is an attribute macro (the item's taker) or, after a derive, a derive's helper,
+    /// which `Lower::helper_checks` sends to the cells (names-attr-4); a path is always an
+    /// attribute macro (a helper is one segment).
     pub others: AVec<'a, &'t str>,
     /// For each of `others`, how many of `derives` were written before it: a derive written
     /// after an attribute macro that takes the item is refused (attr-bang-kind-2).
@@ -816,6 +843,7 @@ impl<'a> Attrs<'_, 'a> {
             no_core: false,
             arbitrary_ints: false,
             tools: AVec::new_in(alloc),
+            features: AVec::new_in(alloc),
             others: AVec::new_in(alloc),
             derives_before: AVec::new_in(alloc),
             checks: AVec::new_in(alloc),
@@ -1088,24 +1116,30 @@ fn path_tokens<'t, 'a>(text: &'t str, alloc: Alloc<'a>) -> Option<AVec<'a, PTok<
     Some(out)
 }
 
-/// How an expansion's text writes a `$crate`: its one home is blaze-surface, beside `DefSite`.
-pub use blaze_surface::{DOLLAR_CRATE, DollarCrate, dollar_crate_of};
-
-/// The path of `segments` as written (`abs` for a leading `::`) in the crate `krate`.
+/// The path of `segments` as written (`abs` for a leading `::`) in the crate `krate`, its first
+/// segment written by no expansion ([`to_path_marked`] with no mark).
 pub fn to_path<'t, 'a>(abs: bool, segments: &[&'t str], krate: CrateItemKey, alloc: Alloc<'a>) -> Path<'a, &'t str> {
+    to_path_marked(abs, segments, None, krate, alloc)
+}
+
+/// The path of `segments` as written in the crate `krate`; `first_mark` is the mark of its first
+/// segment's token in an expansion's text (token-mark-2): a `$crate` or `crate` root is read by it
+/// through the one resolver, [`crate::crate_roots::root_by_mark`].
+pub fn to_path_marked<'t, 'a>(abs: bool, segments: &[&'t str], first_mark: Option<blaze_expand::origin_column::TextMark>, krate: CrateItemKey, alloc: Alloc<'a>) -> Path<'a, &'t str> {
+    use crate::crate_roots::Root;
     let own = |it: &[&'t str]| AVec::from_slice_in(it, alloc);
     if abs {
         return Path { kind: PathKind::Abs, segments: own(segments) };
     }
-    match segments.first().copied() {
-        Some("crate") => Path { kind: PathKind::Crate, segments: own(&segments[1..]) },
-        Some("$crate") => Path { kind: PathKind::DollarCrate(krate), segments: own(&segments[1..]) },
-        Some(first) if first.starts_with(DOLLAR_CRATE) => match dollar_crate_of(first) {
-            Some(other) => Path { kind: PathKind::DollarCrate(other), segments: own(&segments[1..]) },
-            None => Path { kind: PathKind::Plain, segments: own(segments) },
-        },
-        Some("self") => Path { kind: PathKind::SelfMod, segments: own(&segments[1..]) },
-        Some("super") => {
+    let first = segments.first().copied();
+    let root = first.map_or(Root::NotARoot, |first| crate::crate_roots::root_by_mark(first, first_mark));
+    match (first, root) {
+        (Some("crate"), Root::Here) => Path { kind: PathKind::Crate, segments: own(&segments[1..]) },
+        (Some("crate"), Root::Crate(k)) if k == krate => Path { kind: PathKind::Crate, segments: own(&segments[1..]) },
+        (_, Root::Here) => Path { kind: PathKind::DollarCrate(krate), segments: own(&segments[1..]) },
+        (_, Root::Crate(k)) => Path { kind: PathKind::DollarCrate(k), segments: own(&segments[1..]) },
+        (Some("self"), _) => Path { kind: PathKind::SelfMod, segments: own(&segments[1..]) },
+        (Some("super"), _) => {
             let n = segments.iter().take_while(|it| **it == "super").count();
             Path { kind: PathKind::Super(u8::try_from(n).unwrap_or(u8::MAX)), segments: own(&segments[n..]) }
         }
@@ -1115,6 +1149,17 @@ pub fn to_path<'t, 'a>(abs: bool, segments: &[&'t str], krate: CrateItemKey, all
 
 /// A simple path (`a::b`, `crate::a`, `$crate::a`, `::a`); `None` for anything else.
 pub fn parse_path<'t, 'a>(text: &'t str, krate: CrateItemKey, alloc: Alloc<'a>) -> Option<Path<'a, &'t str>> {
+    parse_path_marked(text, krate, &|_| None, alloc)
+}
+
+/// [`parse_path`] in an expansion's text: `mark_of` gives a segment's token's mark, read for the
+/// first segment ([`to_path_marked`]).
+pub fn parse_path_marked<'t, 'a>(
+    text: &'t str,
+    krate: CrateItemKey,
+    mark_of: &dyn Fn(&'t str) -> Option<blaze_expand::origin_column::TextMark>,
+    alloc: Alloc<'a>,
+) -> Option<Path<'a, &'t str>> {
     let mut tokens = (PLex { text, at: 0 }).peekable();
     let mut abs = false;
     let mut segments = AVec::new_in(alloc);
@@ -1131,7 +1176,8 @@ pub fn parse_path<'t, 'a>(text: &'t str, krate: CrateItemKey, alloc: Alloc<'a>) 
             Some(_) => return None,
         }
     }
-    Some(to_path(abs, &segments, krate, alloc))
+    let first_mark = segments.first().copied().and_then(mark_of);
+    Some(to_path_marked(abs, &segments, first_mark, krate, alloc))
 }
 
 /// One leaf of a `use` tree.
@@ -1581,6 +1627,10 @@ pub struct CallSrc<'t> {
     /// Where the call stands in its text: what a finding in its expansion maps back through
     /// (crate::expansion_origins). `None` for a check call, which is never expanded.
     pub place: Option<crate::expansion_origins::CallInText>,
+    /// Where the input's tokens come from: a file's text, or (a call written in an
+    /// expansion) a range of that expansion's sealed tokens, each keeping its context
+    /// (crate::nested_input). `input` is then read only for its place and length.
+    pub tokens: crate::nested_input::CallTokens<'t>,
 }
 
 /// The attribute macro a blaze-edition binary's root `fn main` is the input of when none is
@@ -1628,6 +1678,9 @@ pub struct ImplSrc<'t> {
     pub key: ItemKey,
     pub header: &'t str,
     pub loc: Loc,
+    /// The marks of the text `header` is a slice of ([`Fragment::marks`], token-mark-2): the
+    /// items record reads each header path's root by them (R2).
+    pub marks: Option<crate::crate_roots::TextMarks<'t>>,
 }
 
 /// A `fn`, `const` or `static` (an item or a member) whose text may write an `impl` in a
@@ -1652,11 +1705,26 @@ pub struct BodySrc<'t> {
     /// `macro.decl.scope.textual`: a `macro_rules!` is in scope "after the definition .. up
     /// until its surrounding scope, typically a module, is closed": a body's block is inside it).
     pub place: (ItemKey, u32),
+    /// The marks of the text `text` is a slice of ([`Fragment::marks`]): `None` for a body
+    /// written in a file. A block's module text is rewritten from `text`; its rows are moved
+    /// with each slice it copies (crate_roots `remapped`), so a local item's `crate` written for
+    /// another crate's `$crate` keeps the mark that names that crate.
+    pub marks: Option<crate::crate_roots::TextMarks<'t>>,
 }
 
 impl<'t> BodySrc<'t> {
     /// The entry for an item of `detail` and `text`, if its body may write an impl.
-    fn of(detail: ItemDetail, key: ItemKey, module: ItemKey, text: &'t str, loc: Loc, written: &'t str, depth: u16, place: (ItemKey, u32)) -> Option<BodySrc<'t>> {
+    fn of(
+        detail: ItemDetail,
+        key: ItemKey,
+        module: ItemKey,
+        text: &'t str,
+        loc: Loc,
+        written: &'t str,
+        depth: u16,
+        place: (ItemKey, u32),
+        marks: Option<crate::crate_roots::TextMarks<'t>>,
+    ) -> Option<BodySrc<'t>> {
         let holds = matches!(
             detail,
             ItemDetail::Fn { body_holds_items: true } | ItemDetail::Const { body_holds_items: true } | ItemDetail::Static { body_holds_items: true }
@@ -1669,7 +1737,7 @@ impl<'t> BodySrc<'t> {
         const WORDS: [&str; 8] = ["impl", "struct", "enum", "union", "type", "trait", "mod", "extern"];
         // A `!` too: a statement call may declare items (crate::expanded_blocks); the scan
         // decides whether one is in statement position.
-        (holds && (text.contains('!') || WORDS.iter().any(|w| text.contains(w)))).then_some(BodySrc { key, module, text, loc, written, depth, place })
+        (holds && (text.contains('!') || WORDS.iter().any(|w| text.contains(w)))).then_some(BodySrc { key, module, text, loc, written, depth, place, marks })
     }
 }
 
@@ -1873,6 +1941,12 @@ pub struct Fragment<'c, 't> {
     /// attributes written after its derives, whose calls, with its derives and its helper
     /// checks, the calling fragment sent (`Lower::after_derive_takers`); none is sent again.
     pub kept: bool,
+    /// The marks of an expansion's text (token-mark-2, crate::crate_roots): a path's first
+    /// segment's mark resolves its root. `None`: a file, or a text no column carries.
+    pub marks: Option<crate::crate_roots::TextMarks<'t>>,
+    /// The tokens `text` was rendered from (an expansion's; crate::nested_input): a call in it
+    /// takes its input as a range of them. `None`: a file, or a text rewritten after rendering.
+    pub tokens: Option<crate::nested_input::ExpansionTokens<'t>>,
 }
 
 /// Lowers `fragment`'s items under `cx`.
@@ -1898,6 +1972,8 @@ pub fn lower<'p: 't, 't, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fra
         depth: fragment.depth,
         made: fragment.made,
         kept: fragment.kept,
+        marks: fragment.marks,
+        tokens: fragment.tokens,
         pos: 0,
         procs: cx.procs,
         alloc,
@@ -1982,6 +2058,10 @@ struct Lower<'c, 't, 'a, W: ?Sized> {
     made: bool,
     /// [`Fragment::kept`].
     kept: bool,
+    /// [`Fragment::marks`].
+    marks: Option<crate::crate_roots::TextMarks<'t>>,
+    /// [`Fragment::tokens`].
+    tokens: Option<crate::nested_input::ExpansionTokens<'t>>,
     pos: u32,
     procs: ProcDecls<'t>,
     alloc: Alloc<'a>,
@@ -2039,7 +2119,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             if !self.checked.insert((path, span)) {
                 continue;
             }
-            let Some(parsed) = parse_path(path, self.krate, self.alloc) else {
+            let Some(parsed) = parse_path_marked(path, self.krate, &|s| self.mark_of(s), self.alloc) else {
                 self.note(LowerNoteKind::AttrMacroNotLowered { attr: path }, at, path);
                 continue;
             };
@@ -2048,7 +2128,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: Some(idx.0), role: CallRole::Call });
             // No input: a check is never `Called`, so never expanded; only its place is read
             // (an error's location, blaze-cli names.rs).
-            let src = CallSrc { module: self.module, owner: None, name: path, input: "", kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit: false, place: None };
+            let src = CallSrc { module: self.module, owner: None, name: path, input: "", kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit: false, place: None, tokens: crate::nested_input::CallTokens::Text };
             self.out.calls.push((call, src));
             self.checks_sent += 1;
         }
@@ -2068,6 +2148,16 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         // A tool's attribute is inert and the item is kept, never the input of a call the cells
         // then skip (names-attr-3: the item vanished).
         attrs.attr_macro = attrs.takers.iter().copied().find(|p| tool_segment(p).is_none_or(|t| !self.tools.contains(&t)));
+        // A registered tool's path is inert, never an after-derive call.
+        let mut k = 0;
+        while k < attrs.others.len() {
+            if tool_segment(attrs.others[k]).is_some_and(|t| self.tools.contains(&t)) {
+                attrs.others.remove(k);
+                attrs.derives_before.remove(k);
+            } else {
+                k += 1;
+            }
+        }
         // A value written as a macro call (`#[lang = stringify!(x)]`), read where the crate's
         // edition and the allocator are at hand (task/attr_value.rs); one that does not read
         // is refused by name and leaves the attribute unset.
@@ -2086,9 +2176,16 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         attrs
     }
 
+    /// The mark of a path's first segment in this fragment's expansion text (token-mark-2). A
+    /// segment that is no slice of the text (a path blaze writes itself, `KEEP_PATH`) was
+    /// written by no expansion: it has none ([`crate::crate_roots::MarkMiss`]).
+    fn mark_of(&self, segment: &str) -> Option<blaze_expand::origin_column::TextMark> {
+        self.marks.and_then(|marks| marks.mark_of(segment).ok().flatten())
+    }
+
     fn vis(&self, item: &Item) -> WrittenVis<Path<'a, &'t str>> {
         let path = |r| {
-            parse_path(item.text(self.text, r), self.krate, self.alloc)
+            parse_path_marked(item.text(self.text, r), self.krate, &|s| self.mark_of(s), self.alloc)
                 .unwrap_or_else(|| to_path(false, &[item.text(self.text, r)], self.krate, self.alloc))
         };
         match item.visibility {
@@ -2151,20 +2248,45 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             && item.parent.is_none()
             && name == Some("main")
             && matches!(item.detail, ItemDetail::Fn { .. });
-        let written = attrs.attr_macro.filter(|_| !proc_fn);
+        // rustc's `take_first_attr` takes attributes in written order, a derive among them: the
+        // first taker written after a derive (a path `::derive_where::derive_where_visited` is
+        // always one) runs after that derive, on the item the derive saw. And in an expansion a
+        // one-segment name may be the helper of a derive on the item the expansion came from
+        // (rustc's `Scope::DeriveHelpers` walks the parent expansions: derive_where's output
+        // keeps `#[derive_where(..)]`, reth-codecs' `add_arbitrary_tests` keeps
+        // `#[reth_codecs(..)]`). Either way which name takes the item is the cells' answer, so
+        // the item goes as after-derive calls (`Lower::after_derive_takers`), never one call.
+        let derive_target = matches!(item.detail, ItemDetail::Struct | ItemDetail::Enum | ItemDetail::Union);
+        let after_derive = derive_target
+            && attrs.attr_macro.is_some_and(|taker| {
+                let derived_first = attrs.others.iter().position(|&o| o == taker).is_some_and(|k| attrs.derives_before[k] > 0);
+                derived_first || (self.depth > 0 && attrs.derives.is_empty() && !taker.contains("::"))
+            });
+        let written = attrs.attr_macro.filter(|_| !proc_fn && !after_derive);
         if let Some(path) = written.or(implicit.then_some(IMPLICIT_MAIN)) {
             // The item is the call's input: what it declares is the expansion's (its derives
             // and later attribute macros too, lowered from the expansion).
             let call = self.key(self.owner, "attr", path);
-            let Some(parsed) = parse_path(path, self.krate, self.alloc) else {
+            let Some(parsed) = parse_path_marked(path, self.krate, &|s| self.mark_of(s), self.alloc) else {
                 self.note(LowerNoteKind::AttrMacroNotLowered { attr: path }, at, name.unwrap_or("_"));
                 return false;
             };
             let pos = self.next_pos();
             self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: Some(idx.0), role: CallRole::Call });
             let place = self.call_in_text(idx, item, whole);
-            let src = CallSrc { module: self.module, owner: None, name: path, input: whole, kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit, place };
+            let tokens = self.call_tokens(whole, crate::nested_input::InputCut::Whole);
+        let src = CallSrc { module: self.module, owner: None, name: path, input: whole, kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit, place, tokens };
             self.out.calls.push((call, src));
+            // `#[global_allocator]` writes the static back first in its expansion, whose fragment
+            // is owned by the call (resolve.rs `expand_decls`'s `Fragment::owner`), so the static's
+            // key there is the first of its kind and name under `call`: filed here, where the
+            // attribute is still on the item.
+            let allocator = attrs.lang == Some("global_allocator") && prelude_attr(path) == "global_allocator";
+            if let (true, ItemDetail::Static { .. }, Some(name)) = (allocator, item.detail, name) {
+                let key = key_of(self.krate, call, kind_tag(item.detail.kind()), name, 0);
+                let loc = self.loc(at);
+                self.out.langs.push(LangSrc { name: "global_allocator", key, loc });
+            }
             return false;
         }
         // A one-segment attribute written after a derive on the item itself is that derive's
@@ -2173,11 +2295,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         // one is the cells' answer, so the item is sent as calls and kept by its keep call when
         // none took it (`Lower::after_derive_takers`, attr-bang-kind-2). In the keep call's own
         // fragment (`kept`) the item is lowered here, its calls already sent.
-        if !self.kept
-            && !attrs.derives.is_empty()
-            && !attrs.others.is_empty()
-            && matches!(item.detail, ItemDetail::Struct | ItemDetail::Enum | ItemDetail::Union)
-        {
+        if !self.kept && (after_derive || (!attrs.derives.is_empty() && !attrs.others.is_empty() && derive_target)) {
             self.after_derive_takers(idx, item, &attrs, whole);
             return false;
         }
@@ -2196,7 +2314,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             let loc = self.loc(at);
             self.out.langs.push(LangSrc { name: lang, key, loc });
         }
-        if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(at), self.written, self.depth, (self.owner, self.pos)) {
+        if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(at), self.written, self.depth, (self.owner, self.pos), self.marks) {
             self.out.bodies.push(body);
         }
         match item.detail {
@@ -2262,7 +2380,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             ItemDetail::Impl => {
                 let header = self.impl_header(item);
                 let loc = self.loc(at);
-                self.out.impls.push(ImplSrc { module: self.module, key, header, loc });
+                self.out.impls.push(ImplSrc { module: self.module, key, header, loc, marks: self.marks });
                 self.assoc(Some(idx), key);
             }
             ItemDetail::Mod { inline, .. } => {
@@ -2314,7 +2432,8 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
                 }
                 for leaf in leaves {
                     let pos = self.next_pos();
-                    let path = to_path(leaf.abs, &leaf.segments, self.krate, self.alloc);
+                    let first_mark = leaf.segments.first().and_then(|s| self.mark_of(s));
+                    let path = to_path_marked(leaf.abs, &leaf.segments, first_mark, self.krate, self.alloc);
                     self.out.decls.uses.push(UseDecl { path, leaf: leaf.form, vis: vis.clone(), pos });
                     let loc = self.loc(at);
                     self.out.use_locs.push(loc);
@@ -2410,6 +2529,20 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         })
     }
 
+    /// Where the tokens of a call's input `input` (a slice of this fragment's text) come from:
+    /// a file's text, or the range of the expansion's tokens it was rendered from. A range not
+    /// found is kept as the refusal it is, for the expansion to report (rule 3).
+    fn call_tokens(&self, input: &'t str, cut: crate::nested_input::InputCut) -> crate::nested_input::CallTokens<'t> {
+        use crate::nested_input::CallTokens;
+        match self.tokens {
+            None => CallTokens::Text,
+            Some(tokens) => match tokens.input(input, cut) {
+                Ok(input) => CallTokens::Expansion(input),
+                Err(error) => CallTokens::Refused(error),
+            },
+        }
+    }
+
     /// A function-like macro call `item` keyed `call`: its path declared for the solver at this
     /// position and its source kept for the fill. `owner`: the trait or impl whose body it
     /// stands in (its expansion's items are that owner's members), `None` in a module.
@@ -2421,13 +2554,15 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             return;
         };
         let path_text = item.text(text, path);
-        let Some(parsed) = parse_path(path_text, self.krate, self.alloc) else {
+        let Some(parsed) = parse_path_marked(path_text, self.krate, &|s| self.mark_of(s), self.alloc) else {
             self.note(LowerNoteKind::MacroCallPathNotRead, at, path_text);
             return;
         };
         let pos = self.next_pos();
         self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::FnLike, pos, item: None, role: CallRole::Call });
+        let tokens = self.call_tokens(inside(item.text(text, input)), crate::nested_input::InputCut::Inside);
         let src = CallSrc {
+            tokens,
             module: self.module,
             owner,
             name: path_text,
@@ -2475,7 +2610,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             let whole = &text[item.range.start as usize..item.range.end as usize];
             members.push(Member { key, name, item: idx, detail: item.detail, text: whole, written_by });
             self.attr_checks(idx, item.range.start, &attrs.checks);
-            if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(item.range.start), self.written, self.depth, (self.owner, self.pos)) {
+            if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(item.range.start), self.written, self.depth, (self.owner, self.pos), self.marks) {
                 self.out.bodies.push(body);
             }
             if is_call {
@@ -2685,6 +2820,8 @@ pub fn crate_root<'t, 'a>(
         prelude,
     };
     let mut cr = CrateRootBuilder::new_in(head, alloc);
+    // The root's language features (the record sorts them).
+    cr.features.extend_from_slice(&attrs.features);
     // The extern prelude: the graph's, and the root's `extern crate` items (rustc adds an
     // `extern crate` at the root to it, `extern crate self as name` too).
     let mut externs: AVec<'a, (&'t str, ItemKey)> = AVec::from_slice_in(&plan.extern_prelude, alloc);

@@ -1,6 +1,8 @@
 // Own program f3-dyn (front2), edition blaze-2026.11, so `Box` and the unsizing lang items come
 // from the real libraries: a call through `&dyn Area`, a call through `Box<dyn Area>` and that
 // box's drop through the vtable's drop word. No formatting: the lines are chosen, not printed.
+// The boxes are blaze-own's (the prelude's, D120), made in the frame `main` was handed
+// (`cx.frame()`), so the free goes through the vtable's size and alignment to that frame.
 trait Area {
     fn area(&self) -> u32;
 }
@@ -40,11 +42,11 @@ fn main(cx: &Cx, out: Out) -> Result<(), Error> {
     // 25 + 2 * 3 + 2 * 4 + 3 = 42 when every call goes to its own impl.
     let mut total = through_ref(&square);
     {
-        let first: Box<dyn Area + '_> = Box::new(Counted { side: 3, drops: &mut drops });
+        let first: Box<dyn Area + '_, &Frame> = Box::new_in(Counted { side: 3, drops: &mut drops }, cx.frame());
         total += first.area();
     }
     {
-        let second: Box<dyn Area + '_> = Box::new(Counted { side: 4, drops: &mut drops });
+        let second: Box<dyn Area + '_, &Frame> = Box::new_in(Counted { side: 4, drops: &mut drops }, cx.frame());
         total += through_ref(&*second) + 3;
     }
     if total == 42 {

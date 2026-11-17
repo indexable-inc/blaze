@@ -2,7 +2,14 @@
 //! INTRINSICS.md 3.3, P7b): a declaration of an `extern "llvm-intrinsic"` block that front2
 //! tabled as `Intrinsic::Target`, its arguments on top of the value stack.
 //!
-//! Two kinds, by [`Target`]:
+//! Four kinds, by [`Target`]:
+//! - a NEON integer function (`llvm.aarch64.neon.tbl1.v16i8`, `llvm.aarch64.neon.ushl.v2i64`
+//!   and kin, intrinsics/target/neon.rs): each operand loaded whole as its shape's LIR vector
+//!   from its place, the result stored whole into a temporary; an operand or result whose size
+//!   is not its shape's is refused by name, as for a float function;
+//! - a SHA3 bitwise function (`llvm.aarch64.crypto.bcaxu.v2i64`, `llvm.aarch64.crypto.xar`
+//!   and kin, intrinsics/target/sha3.rs): as a NEON one, its vectors loaded whole; `xar`'s
+//!   trailing `i64` rotate amount must be a constant below 64;
 //! - a barrier or hint (`llvm.aarch64.isb` and kin, THREADS.md D1): `fn(i32 imm)`, the
 //!   immediate a constant, no result; built as LIR's `target_intrinsic` by
 //!   [`intrinsics::target::build`];
@@ -24,6 +31,9 @@ use crate::BuildError;
 use crate::intrinsics;
 use crate::intrinsics::target::Target;
 use crate::intrinsics::target::float::FloatCall;
+use crate::intrinsics::target::neon::NeonCall;
+use crate::intrinsics::target::sha2::Sha2Fn;
+use crate::intrinsics::target::sha3::Sha3Call;
 
 /// The most operands a generic float function takes (`llvm.fma`).
 const MOST_OPERANDS: usize = 3;
@@ -42,6 +52,9 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     pub(super) fn target_intrinsic(&mut self, e: ExprId, list: &[ExprId], t: Target) -> Result<(), BuildError> {
         match t {
             Target::Float(call) => self.float_intrinsic(e, list, t, call),
+            Target::Neon(call) => self.neon_intrinsic(e, list, t, call),
+            Target::Sha3(call) => self.sha3_intrinsic(e, list, t, call),
+            Target::Sha2(f) => self.sha2_intrinsic(e, list, t, f),
             // A barrier or hint (THREADS.md D1, intrinsics/target.rs): `fn(i32 imm)`, the
             // immediate a constant (the library passes `arg::SY` and the like), no result.
             _ => {
@@ -131,6 +144,132 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             }
         };
         self.push_val(out, None);
+        Ok(())
+    }
+
+    /// NEON integer call `e` (`t` is `Target::Neon(call)`): each operand loaded whole as the
+    /// LIR vector of its shape from its place, the call's operations applied
+    /// ([`intrinsics::target::neon::build`]), the result stored whole into a temporary.
+    fn neon_intrinsic(&mut self, e: ExprId, list: &[ExprId], t: Target, call: NeonCall) -> Result<(), BuildError> {
+        let refuse = move |why: &'static str| BuildError::Target { target: t, expr: Some(e), why };
+        let shapes = call.operands();
+        if list.len() != shapes.len() {
+            return Err(refuse("a call with other than its function's two operands"));
+        }
+        let base = self.vals.len().checked_sub(shapes.len()).ok_or(malformed("an intrinsic's arguments missing from the value stack (a build bug)"))?;
+        let mut loaded = [Value(0); 2];
+        for (i, (&a, shape)) in list.iter().zip(shapes).enumerate() {
+            let v = self.vals[base + i];
+            let at = self.adjusted_ty(a)?;
+            let repr = self.repr_at(a, at)?;
+            let Repr::Agg(_) = repr else { return Err(refuse("an operand that is not the vector its name's shape says")) };
+            let (size, align) = self.size_align(repr);
+            if u64::from(size) != shape.bytes() {
+                return Err(refuse("an operand whose size is not that of the vector its name's shape says"));
+            }
+            let (p, off) = self.place(v, repr)?;
+            loaded[i] = self.b.load(shape.ty(), Flags::NONE, p, off, MemAttrs::aligned(align));
+        }
+        self.truncate_vals(base);
+        let rt = self.expr_ty(e)?;
+        let rrepr = self.repr_at(e, rt)?;
+        let Repr::Agg(_) = rrepr else { return Err(refuse("a result that is not the vector its name's shape says")) };
+        let (size, align) = self.size_align(rrepr);
+        if u64::from(size) != call.shape().bytes() {
+            return Err(refuse("a result whose size is not that of the vector its name's shape says"));
+        }
+        let r = intrinsics::target::neon::build(&mut self.b, call, loaded[0], loaded[1]);
+        let to = self.temp(rrepr);
+        self.b.store(Flags::NONE, r, to.0, to.1, MemAttrs::aligned(align));
+        self.push_val(V::Place(to.0, to.1), None);
+        Ok(())
+    }
+
+    /// SHA3 call `e` (`t` is `Target::Sha3(call)`): each vector operand loaded whole as the LIR
+    /// vector of the call's shape from its place, `xar`'s rotate amount read as the constant it
+    /// must be ([`intrinsics::target::sha3::rotate_amount`]), the call's operations applied
+    /// ([`intrinsics::target::sha3::build`]), the result stored whole into a temporary.
+    fn sha3_intrinsic(&mut self, e: ExprId, list: &[ExprId], t: Target, call: Sha3Call) -> Result<(), BuildError> {
+        let refuse = move |why: &'static str| BuildError::Target { target: t, expr: Some(e), why };
+        let vectors = call.vectors();
+        let n = vectors + usize::from(call.takes_imm());
+        if list.len() != n {
+            return Err(refuse("a call with other than its function's number of operands"));
+        }
+        let shape = call.shape();
+        let base = self.vals.len().checked_sub(n).ok_or(malformed("an intrinsic's arguments missing from the value stack (a build bug)"))?;
+        let mut loaded = [Value(0); 3];
+        let mut imm = 0;
+        for (i, &a) in list.iter().enumerate() {
+            let v = self.vals[base + i];
+            let at = self.adjusted_ty(a)?;
+            let repr = self.repr_at(a, at)?;
+            if i == vectors {
+                let ty = repr.scalar().ok_or(refuse("a rotate amount that is not a scalar"))?;
+                let x = self.scalar(v, ty)?;
+                imm = intrinsics::target::sha3::rotate_amount(&self.b, x).map_err(|r| refuse(r.why()))?;
+                continue;
+            }
+            let Repr::Agg(_) = repr else { return Err(refuse("an operand that is not the vector its name's shape says")) };
+            let (size, align) = self.size_align(repr);
+            if u64::from(size) != shape.bytes() {
+                return Err(refuse("an operand whose size is not that of the vector its name's shape says"));
+            }
+            let (p, off) = self.place(v, repr)?;
+            loaded[i] = self.b.load(shape.ty(), Flags::NONE, p, off, MemAttrs::aligned(align));
+        }
+        self.truncate_vals(base);
+        let rt = self.expr_ty(e)?;
+        let rrepr = self.repr_at(e, rt)?;
+        let Repr::Agg(_) = rrepr else { return Err(refuse("a result that is not the vector its name's shape says")) };
+        let (size, align) = self.size_align(rrepr);
+        if u64::from(size) != shape.bytes() {
+            return Err(refuse("a result whose size is not that of the vector its name's shape says"));
+        }
+        let r = intrinsics::target::sha3::build(&mut self.b, call, &loaded[..vectors], imm)
+            .ok_or(malformed("a SHA3 call built with other than its operand count (a build bug)"))?;
+        let to = self.temp(rrepr);
+        self.b.store(Flags::NONE, r, to.0, to.1, MemAttrs::aligned(align));
+        self.push_val(V::Place(to.0, to.1), None);
+        Ok(())
+    }
+
+    /// SHA-256 or SHA-512 call `e` (`t` is `Target::Sha2(f)`): each operand loaded whole as the
+    /// LIR vector of the function's shape from its place, the rule built on its lanes
+    /// ([`intrinsics::target::sha2::build`]), the result stored whole into a temporary.
+    fn sha2_intrinsic(&mut self, e: ExprId, list: &[ExprId], t: Target, f: Sha2Fn) -> Result<(), BuildError> {
+        let refuse = move |why: &'static str| BuildError::Target { target: t, expr: Some(e), why };
+        let n = f.vectors();
+        if list.len() != n {
+            return Err(refuse("a call with other than its function's number of operands"));
+        }
+        let shape = f.shape();
+        let base = self.vals.len().checked_sub(n).ok_or(malformed("an intrinsic's arguments missing from the value stack (a build bug)"))?;
+        let mut loaded = [Value(0); 3];
+        for (i, &a) in list.iter().enumerate() {
+            let v = self.vals[base + i];
+            let at = self.adjusted_ty(a)?;
+            let repr = self.repr_at(a, at)?;
+            let Repr::Agg(_) = repr else { return Err(refuse("an operand that is not the vector its name's shape says")) };
+            let (size, align) = self.size_align(repr);
+            if u64::from(size) != shape.bytes() {
+                return Err(refuse("an operand whose size is not that of the vector its name's shape says"));
+            }
+            let (p, off) = self.place(v, repr)?;
+            loaded[i] = self.b.load(shape.ty(), Flags::NONE, p, off, MemAttrs::aligned(align));
+        }
+        self.truncate_vals(base);
+        let rt = self.expr_ty(e)?;
+        let rrepr = self.repr_at(e, rt)?;
+        let Repr::Agg(_) = rrepr else { return Err(refuse("a result that is not the vector its name's shape says")) };
+        let (size, align) = self.size_align(rrepr);
+        if u64::from(size) != shape.bytes() {
+            return Err(refuse("a result whose size is not that of the vector its name's shape says"));
+        }
+        let r = intrinsics::target::sha2::build(&mut self.b, f, &loaded[..n]).ok_or(malformed("a SHA-2 call built with other than its operand count (a build bug)"))?;
+        let to = self.temp(rrepr);
+        self.b.store(Flags::NONE, r, to.0, to.1, MemAttrs::aligned(align));
+        self.push_val(V::Place(to.0, to.1), None);
         Ok(())
     }
 

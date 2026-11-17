@@ -28,7 +28,7 @@
 //! weak_lang_items.rs` and `compiler/rustc_abi/src/extern_abi.rs` (`is_rustic_abi`) (MIT or
 //! Apache-2.0).
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use hir::{InFile, LangItem};
 use std::alloc::Global;
 use syntax::{
@@ -530,7 +530,7 @@ fn must_implement_one_of(
             }
         }
     }
-    let mut seen: HashMap<&str, TextRange, Global> = HashMap::new_in(Global);
+    let mut seen: Map<&str, TextRange, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     for (name, range) in names {
         if let Some(dup) = seen.insert(name.as_str(), *range) {
             let mut diag = Diag::error(None, "functions names are duplicated", fx.span(attr, dup));

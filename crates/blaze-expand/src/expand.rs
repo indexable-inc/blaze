@@ -6,11 +6,11 @@ use crate::{
     builtin,
     call::Call,
     cx::{ExpandCx, ProcCall, ProcDiagnostic},
-    def::{LocalInner, MacroDefinition, MacroKind, ProcKind},
+    def::{BuiltinAttr, LocalInner, MacroDefinition, MacroKind, ProcKind},
     derive,
     error::{ExpandError, Stream, Unbuilt},
     expansion::{Diagnostic, Expanded, Expansion, TokenOrigin, PathScope},
-    nested, rules,
+    global_allocator, nested, rules,
     tokens::{Ctx, CtxNode, Delim, Spacing, Text, TokenKind, Transparency},
 };
 
@@ -87,6 +87,7 @@ pub fn expand_prepared<'a>(
             }
         }
         MacroKind::BuiltinDerive(which) => derive::expand(which, &mut out)?,
+        MacroKind::BuiltinAttr(BuiltinAttr::GlobalAllocator) => global_allocator::expand(&mut out)?,
         MacroKind::BuiltinAttr(which) => {
             return Err(ExpandError::NotBuilt { what: Unbuilt::BuiltinAttr(which) });
         }
@@ -259,6 +260,53 @@ impl<'a> Out<'_, 'a> {
         transparency: Transparency,
     ) -> Result<(), ExpandError> {
         self.push(kind, text, TokenOrigin::Made(transparency))
+    }
+
+    /// Writes `code`, made with `transparency`: a run of letters, digits, `_` and `$` is an
+    /// identifier (`$crate` one), each other character a punct, joined to the next when that is
+    /// a punct too, and a bracket a group's delimiter. Spaces only separate. `code` is ASCII.
+    pub(crate) fn made_code(
+        &mut self,
+        code: &str,
+        transparency: Transparency,
+    ) -> Result<(), ExpandError> {
+        let bytes = code.as_bytes();
+        let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$';
+        let delim = |byte: u8| b"()[]{}".contains(&byte);
+        let mut at = 0;
+        while let Some(&byte) = bytes.get(at) {
+            if byte == b' ' {
+                at += 1;
+                continue;
+            }
+            if word(byte) {
+                let start = at;
+                while bytes.get(at).is_some_and(|&it| word(it)) {
+                    at += 1;
+                }
+                let ident = TokenKind::Ident { raw: crate::tokens::Raw::No, spacing: Spacing::Alone };
+                self.made(ident, &code[start..at], transparency)?;
+                continue;
+            }
+            let kind = match byte {
+                b'(' => TokenKind::Open(Delim::Paren),
+                b')' => TokenKind::Close(Delim::Paren),
+                b'[' => TokenKind::Open(Delim::Bracket),
+                b']' => TokenKind::Close(Delim::Bracket),
+                b'{' => TokenKind::Open(Delim::Brace),
+                b'}' => TokenKind::Close(Delim::Brace),
+                _ => {
+                    let joined = bytes.get(at + 1).is_some_and(|&next| {
+                        next.is_ascii_punctuation() && !word(next) && !delim(next)
+                    });
+                    let spacing = if joined { Spacing::Joint } else { Spacing::Alone };
+                    TokenKind::Punct { char: char::from(byte), spacing }
+                }
+            };
+            self.made(kind, "", transparency)?;
+            at += 1;
+        }
+        Ok(())
     }
 
     /// `#[automatically_derived]`, made def-site.

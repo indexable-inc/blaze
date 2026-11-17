@@ -34,7 +34,7 @@ use std::{
 };
 
 use blaze_graph::wait::{OwnedBy, WaitKind};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use std::alloc::Global;
 
 use crate::{
@@ -80,7 +80,8 @@ impl Eq for Name {}
 thread_local! {
     /// The names [`Name::kept`] gave on this thread, by the address and length of their text.
     // alloc: once per thread, grown to the kept names it opens spans of
-    static KEPT: RefCell<HashMap<(usize, usize), Name, Global>> = RefCell::new(HashMap::new_in(Global));
+    static KEPT: RefCell<Map<(usize, usize), Name, FixedState, Global>> =
+        RefCell::new(Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }));
 }
 
 impl Name {

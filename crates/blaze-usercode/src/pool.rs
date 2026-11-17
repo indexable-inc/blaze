@@ -16,7 +16,7 @@ use std::{ffi::OsString, fmt::Write as _, path::PathBuf};
 use blaze_core::{
     Address, Command, Completion, Conn, Done, Effect, Exit, FileName, IoError, Sandbox, Tag,
 };
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::{ContentId, Hasher, radix};
 use std::alloc::Global;
 
@@ -130,9 +130,9 @@ struct Process {
 pub struct Pool {
     config: Config,
     next: u64,
-    servers: HashMap<Server, Process, Global>,
-    asked: HashMap<Tag, Asked, Global>,
-    idle: HashMap<WarmKey, Vec<Server>, Global>,
+    servers: Map<Server, Process, FixedState, Global>,
+    asked: Map<Tag, Asked, FixedState, Global>,
+    idle: Map<WarmKey, Vec<Server>, FixedState, Global>,
     count: u32,
 }
 
@@ -141,9 +141,9 @@ impl Pool {
         Pool {
             config,
             next: 0,
-            servers: HashMap::new_in(Global),
-            asked: HashMap::new_in(Global),
-            idle: HashMap::new_in(Global),
+            servers: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            asked: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            idle: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             count: 0,
         }
     }

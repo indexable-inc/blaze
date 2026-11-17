@@ -116,16 +116,16 @@ pub extern "C" fn main() -> i32 {
 fn a_borrowed_call_of_a_member_fn_checks_and_reads_its_attributes() {
     let heap = blaze_own::testing::heap();
     let files = [SourceFile { path: "src/main.rs", text: PROGRAM }];
-    let tc = Toolchain::none();
+    let tc = Toolchain::none(blaze_own::Alloc::global());
     let new = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
-    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc).unwrap_or_else(|e| panic!("the program's texts: {e}"));
+    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind).unwrap_or_else(|e| panic!("the program's texts: {e}"));
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
-    let mut front = Front2::new(&names, &frame, &files).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"), front.frame);
+    let mut front = Front2::new(&names, &frame, &files, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let hook = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &["hook"] }, heap.alloc())
         .ok()
         .and_then(|f| f.whole(1))

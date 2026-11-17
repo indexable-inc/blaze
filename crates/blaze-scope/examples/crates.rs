@@ -17,6 +17,11 @@
 //!   changed; its manifest's path to bstd is ignored: bstd is the blaze edition's `std`);
 //!   `hello=<dir>`: the same with the package in `<dir>`.
 //!
+//! `crates --links-agree [--threads 1] <core|alloc|std|bstd-deps|bstd|hello|hello=DIR>...`:
+//! each crate's records at module grain checked against its written scopes (D116 point 7):
+//! one sorted line a crate, the total, then a `DISAGREES` line for each crate that does not
+//! agree, and exit 1 if any does.
+//!
 //! This file is the adapter: it reads manifests from disk into each crate's `CrateInput`
 //! (its features, dependencies and cfg), answers `SourceTexts` from disk, runs the library's
 //! fill across threads, and prints. The names themselves (walk, lowering, records, the fill
@@ -82,7 +87,7 @@ impl<T> std::ops::Deref for OnGlobal<T> {
 
 
 fn main() {
-    let usage = "usage: crates [--threads 1,18] [--examples N] [--show NAME] [--verbose] [--first prefetch|alone] <core|alloc|std|bstd-deps|bstd|hello|hello=DIR>...";
+    let usage = "usage: crates [--threads 1,18] [--examples N] [--show NAME] [--verbose] [--first prefetch|alone] [--d116-decide] [--links-agree] [--per-crate] <core|alloc|std|bstd-deps|bstd|hello|hello=DIR>...";
     let most = std::thread::available_parallelism().map_or(1, |it| it.get());
     let mut counts: Vec<usize> = vec![1];
     let mut sets: Vec<String> = Vec::new();
@@ -103,6 +108,10 @@ fn main() {
             }
             "--verbose" => VERBOSE.store(true, Ordering::Relaxed),
             "--d116-decide" => D116_DECIDE.store(true, Ordering::Relaxed),
+            "--links-agree" => {
+                LINKS_AGREE.store(true, Ordering::Relaxed);
+                D116_DECIDE.store(true, Ordering::Relaxed);
+            }
             "--per-crate" => PER_CRATE.store(true, Ordering::Relaxed),
             "--show" => {
                 let _ = SHOW.set(args.next().unwrap_or_default());
@@ -142,6 +151,14 @@ static EXAMPLES: AtomicUsize = AtomicUsize::new(3);
 
 /// `--d116-decide`: each crate's cells decided again on demand and compared (D116).
 static D116_DECIDE: AtomicBool = AtomicBool::new(false);
+
+/// `--links-agree`: each crate's records at module grain checked against its written scopes
+/// (D116 point 7, `blaze_scope::links::Agreed`); implies `--d116-decide`, whose hook runs it.
+static LINKS_AGREE: AtomicBool = AtomicBool::new(false);
+
+/// What `--links-agree` gave each crate of the current run: its totals, or the first
+/// disagreement as printed.
+static LINKS: std::sync::Mutex<Vec<(String, Result<blaze_scope::links::Agreed, String>)>> = std::sync::Mutex::new(Vec::new());
 
 /// The D116 check's clock: nanoseconds since its first call.
 fn decide_clock() -> u64 {
@@ -370,6 +387,15 @@ impl blaze_scope::task::Par for Threads {
 
     fn decided(&self, krate: &str, check: &blaze_scope::DecideCheck<'_, &str>) {
         println!("d116 decide {krate}: {check}");
+        if LINKS_AGREE.load(Ordering::Relaxed)
+            && let Some(links) = check.links()
+        {
+            let got = match links {
+                Ok(a) => Ok(*a),
+                Err(d) => Err(d.to_string()),
+            };
+            LINKS.lock().expect("no thread panicked holding the `--links-agree` list").push((krate.to_string(), got));
+        }
     }
 
     fn map<T, F: Fn(usize) -> T>(&self, n: usize, f: F, out: &mut AVec<'_, T>) {
@@ -838,6 +864,9 @@ fn note_text(c: &CrateNames<'static>, note: &NamesNote<'static>) -> (String, Str
                     };
                     (format!("macro diagnostic: {what}"), format!("{at}: {macro_name}!"))
                 }
+                ExpandNote::ForeignDollarCrate { macro_name, krate } => ("an expansion writes a macro definition holding another crate's `$crate` (token-mark-3)".to_string(), format!("{at}: {macro_name}!: crate {krate:?}")),
+                ExpandNote::RootsLost { macro_name, lost } => ("an expansion writes another crate's root with no marks".to_string(), format!("{at}: {macro_name}!: {lost}")),
+        ExpandNote::NestedInput { macro_name, error } => ("a nested call's input is no range of its expansion's tokens".to_string(), format!("{at}: {macro_name}!: {error}")),
                 ExpandNote::NotItems { macro_name, message } => ("an expansion that does not read as items (syntax errors)".to_string(), format!("{at}: {macro_name}!: {message}")),
                 ExpandNote::Failed { path, implicit, failed } => {
                     let what = match failed.diagnostic {
@@ -996,6 +1025,7 @@ fn run_set(set: &str, hello_dir: &std::path::Path, thread_counts: &[usize]) {
     for &threads in thread_counts {
         // The last run's names are dropped first: each run's memory is its own.
         drop(last.take());
+        LINKS.lock().expect("no thread panicked holding the `--links-agree` list").clear();
         let start = Instant::now();
         let resolved = resolve_crates_with(&inputs, plan.sysroot, &Disk, &Threads(threads), first, g());
         let ms = start.elapsed().as_secs_f64() * 1e3;
@@ -1033,6 +1063,27 @@ fn run_set(set: &str, hello_dir: &std::path::Path, thread_counts: &[usize]) {
             }
         }
         last = Some(names);
+    }
+    // `--links-agree`: the last run's crates, sorted, their total, then each disagreement.
+    let mut disagrees = false;
+    if LINKS_AGREE.load(Ordering::Relaxed) {
+        let mut links = std::mem::take(&mut *LINKS.lock().expect("no thread panicked holding the `--links-agree` list"));
+        links.sort_by(|a, b| a.0.cmp(&b.0));
+        println!("\n  links agree (names at module grain against the written scopes, D116):");
+        let mut total = blaze_scope::links::Agreed::default();
+        for (krate, got) in &links {
+            if let Ok(a) = got {
+                println!("{krate}: {a}");
+                total.add(a);
+            }
+        }
+        println!("total: {total}");
+        for (krate, got) in &links {
+            if let Err(text) = got {
+                println!("{krate}: DISAGREES: {text}");
+                disagrees = true;
+            }
+        }
     }
     let Some(names) = last else { return };
     if PER_CRATE.load(Ordering::Relaxed) {
@@ -1104,6 +1155,10 @@ fn run_set(set: &str, hello_dir: &std::path::Path, thread_counts: &[usize]) {
         hello_report(&names);
     }
     println!("  peak RSS so far {:.1} MB", peak_rss_mb());
+    if disagrees {
+        eprintln!("`{set}`: names at module grain disagree with the written scopes (the DISAGREES lines above)");
+        std::process::exit(1);
+    }
 }
 
 /// The graph, by wave: each crate, its features and the names of its dependencies.

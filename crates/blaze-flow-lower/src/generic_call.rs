@@ -147,15 +147,15 @@ enum Slot {
 const MOST: u32 = 4096;
 
 /// Reads the generic shape of a head whose erased inputs and output are `inputs` and `output`
-/// in `tys`, counting positions as [`crate::sig::read_signature`] does (`adt_lifetimes`: whether
-/// an ADT's head declares lifetimes). Refused: a type whose positions cannot be lined up with a
+/// in `tys`, counting positions as [`crate::sig::read_signature`] does (`adt_lifetimes`: how many
+/// lifetime parameters an ADT's head declares). Refused: a type whose positions cannot be lined up with a
 /// type argument substituted in (an alias or opaque type: its positions are not its
 /// arguments'), a closure or coroutine node, an unknown ADT.
 pub fn read_shape<A: Allocator + Clone>(
     tys: PTys<'_>,
     inputs: &[PTy],
     output: PTy,
-    adt_lifetimes: &dyn Fn(ItemKey) -> Option<bool>,
+    adt_lifetimes: &dyn Fn(ItemKey) -> Option<u32>,
     out: &mut ShapeBuf<A>,
     alloc: A,
 ) -> Result<(), SigRefusal> {
@@ -184,7 +184,7 @@ pub fn read_shape<A: Allocator + Clone>(
                     }
                 }
                 PNode::Adt(k, l) => {
-                    if adt_lifetimes(k).ok_or(SigRefusal::Unknown)? {
+                    for _ in 0..adt_lifetimes(k).ok_or(SigRefusal::Unknown)? {
                         out.marks.push(Mark::Own);
                     }
                     for &x in tys.list(l).map_err(|_| SigRefusal::Unknown)?.iter().rev() {

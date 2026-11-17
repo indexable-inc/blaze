@@ -655,7 +655,7 @@ pub fn eval_asked<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
             }
             Err(e) => {
                 use core::fmt::Write as _;
-                let mut why = String::new_in(Alloc::global());
+                let mut why = String::new_in(r.store.tys.alloc());
                 if write!(why, "{e}").is_err() {
                     why.push_str(" (the rest of this refusal could not be written)");
                 }

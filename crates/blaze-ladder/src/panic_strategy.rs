@@ -7,12 +7,13 @@
 //! unwinding, then all its crates must be built with the unwind panic strategy." So the strategy
 //! is one value for the whole program, std included; no crate is built with another.
 //!
-//! Cargo's profiles: `panic = "unwind"` is the default of every built-in profile, `"abort"` is
-//! the other stable value; `"immediate-abort"` needs `-Zbuild-std` (the library itself rebuilt
-//! with it), which blaze does not do, so it is refused by name.
+//! The profile's `panic` is read, and every value but `"unwind"` and `"abort"` refused by name,
+//! in one place: blaze-manifest `layout::panic::panic_strategy` (no `panic` key is `unwind`,
+//! Rust's rule). [`of_profile`] maps its answer to the builder's strategy.
 //!
-//! Two enums stay, each with its own job: [`blaze_build::Panic`] is the builder's input and
-//! [`PanicStrategy`] the key's byte. This file is their one map, both ways.
+//! Three enums stay, each with its own job: blaze-manifest's `ProfilePanic` is what the manifest
+//! says (that crate is under the builder and cannot name it), [`blaze_build::Panic`] the
+//! builder's input and [`PanicStrategy`] the key's byte. This file is their one map.
 //!
 //! ONE CARRIER (main's decision on P1/P2, 2026-11-16): the strategy is a fact of the program's
 //! build setting, carried in the program's inputs (`crates::UserCrate::panic`, filled by
@@ -27,6 +28,7 @@
 use core::fmt;
 
 use blaze_build::Panic;
+use blaze_manifest::layout::panic::ProfilePanic;
 use blaze_scope::resolve::Names;
 
 use crate::code_records::PanicStrategy;
@@ -121,39 +123,12 @@ pub fn of_program<'n>(names: &'n Names<'n>) -> Result<Panic, ProgramPanicError<'
     }
 }
 
-/// Why a profile's `panic` value is not a strategy blaze builds.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PanicStrategyError<'a> {
-    /// `panic = "immediate-abort"`: a `-Zbuild-std` strategy.
-    ImmediateAbort,
-    /// A value Cargo's profiles do not define.
-    Unknown { written: &'a str },
-}
-
-impl fmt::Display for PanicStrategyError<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PanicStrategyError::ImmediateAbort => {
-                write!(f, "`panic = \"immediate-abort\"` is a `-Zbuild-std` strategy blaze does not build (profile `panic`)")
-            }
-            PanicStrategyError::Unknown { written } => {
-                write!(f, "`panic = \"{written}\"` is no panic strategy: the profile's `panic` is `\"unwind\"` or `\"abort\"`")
-            }
-        }
-    }
-}
-
-impl core::error::Error for PanicStrategyError<'_> {}
-
-/// The strategy a profile's `panic` value names: `written` is the value as the root manifest's
-/// `[profile.<name>]` table writes it, `None` when it does not (every built-in profile then
-/// unwinds).
-pub fn of_profile(written: Option<&str>) -> Result<Panic, PanicStrategyError<'_>> {
-    match written {
-        None | Some("unwind") => Ok(Panic::Unwind),
-        Some("abort") => Ok(Panic::Abort),
-        Some("immediate-abort") => Err(PanicStrategyError::ImmediateAbort),
-        Some(written) => Err(PanicStrategyError::Unknown { written }),
+/// The builder's strategy for the profile's `panic`, as blaze-manifest read it from the root
+/// manifest's `[profile.<name>]` table (`layout::panic::panic_strategy`).
+pub const fn of_profile(read: ProfilePanic) -> Panic {
+    match read {
+        ProfilePanic::Unwind => Panic::Unwind,
+        ProfilePanic::Abort => Panic::Abort,
     }
 }
 

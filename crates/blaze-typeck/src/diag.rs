@@ -85,6 +85,10 @@ pub enum DiagCode {
     CantDeref,
     /// E0608: cannot index into a value of this type.
     CantIndex,
+    /// E0596: a mutable place through an overloaded index of a type that implements `Index`
+    /// but not `IndexMut` at that index type (rules/mut_places.rs); `found` is the indexed
+    /// type. rustc's borrow check says "cannot borrow data in an index of `T` as mutable".
+    IndexNotMut,
     /// E0369: binary operation cannot be applied.
     BinOp,
     /// E0600: unary operation cannot be applied.
@@ -196,6 +200,7 @@ impl DiagCode {
             DiagCode::CallArgsNotTuple => "E0059",
             DiagCode::CantDeref => "E0614",
             DiagCode::CantIndex => "E0608",
+            DiagCode::IndexNotMut => "E0596",
             DiagCode::BinOp => "E0369",
             DiagCode::UnOp => "E0600",
             DiagCode::InvalidCast => "E0606",

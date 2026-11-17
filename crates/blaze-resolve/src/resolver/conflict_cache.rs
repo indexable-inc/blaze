@@ -1,4 +1,4 @@
-use crate::resolver::{HashMap, HashSet};
+use crate::resolver::{FixedState, Map, MapOpts, Set};
 use std::alloc::Global;
 use std::collections::BTreeMap;
 
@@ -142,17 +142,17 @@ pub(super) struct ConflictCache {
     // as a global cache which we never delete from. Any entry in this map is
     // unconditionally true regardless of our resolution history of how we got
     // here.
-    con_from_dep: HashMap<Dependency, ConflictStoreTrie, Global>,
+    con_from_dep: Map<Dependency, ConflictStoreTrie, FixedState, Global>,
     // `dep_from_pid` is an inverse-index of `con_from_dep`.
     // For every `PackageId` this lists the `Dependency`s that mention it in `dep_from_pid`.
-    dep_from_pid: HashMap<PackageId, HashSet<Dependency, Global>, Global>,
+    dep_from_pid: Map<PackageId, Set<Dependency, FixedState, Global>, FixedState, Global>,
 }
 
 impl ConflictCache {
     pub(super) fn new() -> ConflictCache {
         ConflictCache {
-            con_from_dep: HashMap::new_in(Global),
-            dep_from_pid: HashMap::new_in(Global),
+            con_from_dep: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            dep_from_pid: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
         }
     }
     pub(super) fn find(
@@ -212,7 +212,7 @@ impl ConflictCache {
     pub(super) fn dependencies_conflicting_with(
         &self,
         pid: PackageId,
-    ) -> Option<&HashSet<Dependency, Global>> {
+    ) -> Option<&Set<Dependency, FixedState, Global>> {
         self.dep_from_pid.get(&pid)
     }
 }

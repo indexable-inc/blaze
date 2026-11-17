@@ -8,13 +8,13 @@
 
 use std::{alloc::Global, vec::Vec};
 
-use blaze_hash::{KeyedMap, SipKey};
+use blaze_hash::{Map, MapOpts, SipKey};
 
 use crate::io::{Io, Offers};
 
 /// The keys of `0..256` in the order a table keyed by `key` iterates them, filled in order.
 fn order(key: SipKey) -> Vec<u64> {
-    let mut map: KeyedMap<u64, (), Global> = KeyedMap::with_hasher_in(key, Global); // alloc: a test's map
+    let mut map: Map<u64, (), SipKey, Global> = Map::new(MapOpts { hasher: key, alloc: Global, capacity: None }); // alloc: a test's map
     for at in 0..256 {
         map.insert(at, ());
     }

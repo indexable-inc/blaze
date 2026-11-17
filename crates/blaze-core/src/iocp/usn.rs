@@ -258,11 +258,11 @@ impl How {
 pub(super) struct Names {
     dir: FileName,
     root: u128,
-    dirs: HashMap<u128, Place, Global>,
+    dirs: Map<u128, Place, FixedState, Global>,
     /// The names [`Place`]s point at; the watched directory's is the first.
     paths: Vec<FileName>,
     /// Files of this read already named where they are now.
-    seen: HashSet<u128, Global>,
+    seen: Set<u128, FixedState, Global>,
     files: Vec<FileName>,
     lost: Vec<(FileName, Lost)>,
     /// The watched directory itself moved or went: the watch ends after this read.
@@ -272,7 +272,7 @@ pub(super) struct Names {
 
 impl Names {
     pub(super) fn new(dir: FileName, root: u128) -> Names {
-        let mut dirs = HashMap::new_in(Global);
+        let mut dirs = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         dirs.insert(root, Place::Under(0));
         // alloc: setup, once per watch; the buffers are reused for its life.
         Names {
@@ -281,7 +281,7 @@ impl Names {
             dir,
             root,
             dirs,
-            seen: HashSet::new_in(Global),
+            seen: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }),
             // alloc: setup.
             files: Vec::new(),
             lost: Vec::new(), // alloc: setup.
@@ -1118,7 +1118,7 @@ mod tests {
     /// A volume as a map of where each reference number is now.
     #[derive(Default)]
     struct Fake {
-        now: HashMap<u128, Found, Global>,
+        now: Map<u128, Found, FixedState, Global>,
         moved: bool,
         asked: Vec<u128>,
     }

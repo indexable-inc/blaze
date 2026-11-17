@@ -105,7 +105,7 @@ unsafe fn drop_and_free<T, A: Allocator>(segs: impl Iterator<Item = *mut T>, len
     }
 }
 
-/// An append-only vector of doubling segments ([module](self)).
+/// An append-only vector of doubling segments ([module](self)): a push never moves a value, an index is two shifts and one load.
 pub struct Segs<T, A: Allocator> {
     /// Segment `s`'s first slot, or null before a value lands in it.
     segs: [*mut T; SEGMENTS],

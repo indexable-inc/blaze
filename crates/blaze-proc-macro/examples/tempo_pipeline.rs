@@ -315,6 +315,8 @@ impl Cfg for HostCfg {
 /// A file's outside but its proc macros: the package's cargo variables and the cfg.
 struct Host {
     package: Arc<Package>,
+    /// The cfg predicate's scratch: the thread's handle of the entry's heap.
+    alloc: Alloc<'static>,
 }
 
 impl ExpandCx for Host {
@@ -328,7 +330,7 @@ impl ExpandCx for Host {
 
     fn cfg(&self, predicate: &TokenStream<'_>) -> Result<bool, HostError> {
         let mut atom = |name: &str, value: Option<&str>| -> Result<bool, ()> { Ok(HostCfg.atom(name, value) == CfgAnswer::Yes) };
-        blaze_expand::cfg_predicate(predicate, Alloc::global(), &mut atom).map_err(|_| HostError { ask: HostAsk::Cfg, why: HostWhy::Refused })
+        blaze_expand::cfg_predicate(predicate, self.alloc, &mut atom).map_err(|_| HostError { ask: HostAsk::Cfg, why: HostWhy::Refused })
     }
 
     fn include(&self, _: &str, _: IncludeAs) -> Result<Included<'_>, HostError> {
@@ -460,8 +462,16 @@ impl<E: Expand> Noted<'_, E> {
 }
 
 impl<E: Expand> Expand for Noted<'_, E> {
-    fn expand(&mut self, path: &str, input: &str, edition: Edition, cfg: &mut dyn blaze_lower::Cfg, out: &mut BodyOut<'_>) -> Expansion {
-        let e = self.inner.expand(path, input, edition, cfg, out);
+    fn expand(
+        &mut self,
+        path: &str,
+        path_mark: Option<blaze_lower::mark_site::TextMark>,
+        input: &str,
+        edition: Edition,
+        cfg: &mut dyn blaze_lower::Cfg,
+        out: &mut BodyOut<'_>,
+    ) -> Expansion {
+        let e = self.inner.expand(path, path_mark, input, edition, cfg, out);
         self.note("item call", path, e)
     }
 
@@ -474,16 +484,32 @@ impl<E: Expand> Expand for Noted<'_, E> {
         self.inner.begin_body();
     }
 
-    fn attr(&mut self, path: &str, args: Option<&TokenStream<'_>>, item: &TokenStream<'_>, edition: Edition, out: &mut BodyOut<'_>) -> Expansion {
-        let e = self.inner.attr(path, args, item, edition, out);
+    fn attr(
+        &mut self,
+        path: &str,
+        path_mark: Option<blaze_lower::mark_site::TextMark>,
+        args: Option<&TokenStream<'_>>,
+        item: &TokenStream<'_>,
+        edition: Edition,
+        out: &mut BodyOut<'_>,
+    ) -> Expansion {
+        let e = self.inner.attr(path, path_mark, args, item, edition, out);
         if e == Expansion::Expanded {
             *self.attrs.entry(path.replace(' ', "")).or_default() += 1;
         }
         self.note("attribute", path, e)
     }
 
-    fn derive(&mut self, path: &str, item: &TokenStream<'_>, facts: blaze_expand::DeriveFacts, edition: Edition, out: &mut BodyOut<'_>) -> Expansion {
-        let e = self.inner.derive(path, item, facts, edition, out);
+    fn derive(
+        &mut self,
+        path: &str,
+        path_mark: Option<blaze_lower::mark_site::TextMark>,
+        item: &TokenStream<'_>,
+        facts: blaze_expand::DeriveFacts,
+        edition: Edition,
+        out: &mut BodyOut<'_>,
+    ) -> Expansion {
+        let e = self.inner.derive(path, path_mark, item, facts, edition, out);
         self.note("derive", path, e)
     }
 }
@@ -491,7 +517,7 @@ impl<E: Expand> Expand for Noted<'_, E> {
 /// Counts the records the driver hands over, and checks each body as stage h of blaze-real's
 /// `stages` does: clean when the lowering left no form unhandled and no diagnostic, and
 /// blaze-typeck's `to_typeck` takes it (written types left to inference).
-struct Records(u64, u32, Bodies);
+struct Records(u64, u32, Bodies, Alloc<'static>);
 
 /// Bodies by where their item came from: `[a file's item, an expansion's item, an item declared
 /// in a body]` (the last of either: a derive's `const _: () = { impl .. }` is one).
@@ -523,7 +549,7 @@ impl Types for Unresolved {
 }
 
 impl Bodies {
-    fn check(&mut self, from: usize, view: &View<'_>) {
+    fn check(&mut self, from: usize, view: &View<'_>, alloc: Alloc<'_>) {
         if view.cfg_out() {
             self.cfg_out[from] += 1;
             return;
@@ -543,8 +569,8 @@ impl Bodies {
                 Err(_) => "lower: a bad row".to_owned(),
             }
         } else {
-            let mut tys = PortableTys::new_in(Alloc::global());
-            match to_typeck(view, ItemKey(0), &mut tys, &mut Unresolved, Alloc::global()) {
+            let mut tys = PortableTys::new_in(alloc);
+            match to_typeck(view, ItemKey(0), &mut tys, &mut Unresolved, alloc) {
                 Ok(_) => {
                     self.clean[from] += 1;
                     return;
@@ -586,7 +612,7 @@ impl Sink for Records {
             blaze_lower::Source::BodyItem => 2,
         };
         if let (What::Body, Outcome::Record { view, .. }) = (what, outcome) {
-            self.2.check(from, &view);
+            self.2.check(from, &view, self.3);
         }
     }
 
@@ -732,7 +758,7 @@ fn main() {
                             Uses::default()
                         });
                         let resolve = Resolve { names: &names, member, uses: &uses };
-                        let cx = Counted { cx: ProcCx { inner: Host { package: Arc::clone(&package) }, procs: &procs, package, edition }, labels: &labels, tally: &tally, panics: &panics };
+                        let cx = Counted { cx: ProcCx { inner: Host { package: Arc::clone(&package), alloc: heap.alloc() }, procs: &procs, package, edition }, labels: &labels, tally: &tally, panics: &panics };
                         let rules: &[(&str, blaze_expand::Prepared<'_>)] = &[];
                         let at = DefAt {
                             site: DefSite { krate: CrateItemKey(blaze_ids::ContentId([1; 32])), module: None },
@@ -742,9 +768,9 @@ fn main() {
                             transparency: None,
                         };
                         let lists = Lists { rules, builtin_at: at, then: Some(&resolve) };
-                        let mut by_name = Noted { inner: ByName::with_names(&lists, cx, Alloc::global()), failed: &failed, attrs: BTreeMap::new() };
-                        let mut sink = Records(0, 0, Bodies::default());
-                        let stats = lower_file(&text, edition, &mut HostCfg, &mut blaze_lower::NoModule, &mut by_name, &mut sink, Alloc::global());
+                        let mut by_name = Noted { inner: ByName::with_names(&lists, cx, heap.alloc()), failed: &failed, attrs: BTreeMap::new() };
+                        let mut sink = Records(0, 0, Bodies::default(), heap.alloc());
+                        let stats = lower_file(&text, edition, &mut HostCfg, &mut blaze_lower::NoModule, &mut by_name, &mut sink, heap.alloc());
                         // `#[tokio::test` written in the file (doc comments aside) against the calls expanded.
                         for (name, head) in [("tokio::test", "#[tokio::test"), ("contract", "#[contract")] {
                             let written = text.lines().filter(|l| l.trim_start().starts_with(head)).count() as u64;

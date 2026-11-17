@@ -7,7 +7,7 @@
 
 use std::alloc::Global;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 
 /// What one process's rings hold, as the dump writes it.
 #[derive(Default)]
@@ -72,7 +72,11 @@ pub(crate) fn chrome(
         write!(out, "{comma}{event}")
     };
     out.write_all(b"{\"traceEvents\":[\n")?;
-    let mut named = blaze_hash::HashSet::new_in(Global);
+    let mut named = blaze_hash::Set::new(blaze_hash::SetOpts {
+        hasher: blaze_hash::FixedState,
+        alloc: Global,
+        capacity: None,
+    });
     for part in parts {
         if named.insert((part.pid, u64::MAX)) {
             put(
@@ -153,7 +157,7 @@ pub(crate) fn chrome(
     let mut ours = json!({"start_us": start, "total_us": end.saturating_sub(start)});
     // The samples folded, outermost function first and `;` between, with how often each stack
     // was seen, most first: a flame graph's input, and text an agent reads.
-    let mut folded: HashMap<String, u64, Global> = HashMap::new_in(Global);
+    let mut folded: Map<String, u64, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     for it in parts.iter().flat_map(|part| &part.samples) {
         // alloc: a dump, on demand
         let stack: Vec<&str> = it.stack.iter().rev().map(String::as_str).collect();

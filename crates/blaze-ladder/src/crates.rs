@@ -120,6 +120,12 @@ pub struct UserCrate<'u> {
     pub root: &'u str,
     pub files: &'u [(String, String)],
     pub edition: PackageEdition,
+    /// The program's ONE panic strategy (its profile's `panic`; UNWIND.md 3.1): the one
+    /// carrier of that fact. Crate 0's `cfg(panic)` is derived from it ([`Inputs::new`]) and
+    /// front2 reads it back from there (`panic_strategy::of_program`). The Reference,
+    /// linkage.html [link.unwinding.prohibited]: "If a Rust artifact is potentially unwinding,
+    /// then all its crates must be built with the unwind panic strategy."
+    pub panic: blaze_build::Panic,
 }
 
 /// One toolchain unit the program reaches: its crate's name and pack, its root, features and
@@ -152,8 +158,9 @@ impl Toolchain {
     /// toolchain resolve per run). A program that names `core` or `std` over it does not resolve.
     /// Its cfg is still [`TRIPLE`]'s whole target set ([`target_cfg`]): a `no_core` program's
     /// pattern type (`usize is 0..=HALF`) reads `target_pointer_width` as any crate's does.
-    pub fn none() -> Toolchain {
-        Toolchain { units: Vec::new(), cfg: target_cfg() }
+    /// `alloc` is the caller's scratch for the target's cfg, copied out before this returns.
+    pub fn none(alloc: Alloc<'_>) -> Toolchain {
+        Toolchain { units: Vec::new(), cfg: target_cfg(alloc) }
     }
 
     /// Opens the shelf's pinned manifest and reads the packs of every unit reachable from bstd,
@@ -237,9 +244,9 @@ impl Toolchain {
 /// (`Cfg::of(&Target::AARCH64_APPLE_DARWIN, ..)`, crates/blaze-scope/src/task/lower.rs), the
 /// one list that names every target atom (`target_pointer_width`, `target_os`, ..). Asserted
 /// equal in triple by the constant's name: [`TRIPLE`] is `aarch64-apple-darwin`.
-fn target_cfg() -> Vec<(String, Option<String>)> {
+fn target_cfg(alloc: Alloc<'_>) -> Vec<(String, Option<String>)> {
     let target = blaze_scope::task::Target::AARCH64_APPLE_DARWIN;
-    let cfg = blaze_scope::task::Cfg::of(&target, &[], Alloc::global());
+    let cfg = blaze_scope::task::Cfg::of(&target, &[], alloc);
     cfg.atoms().iter().map(|&(n, v)| (n.to_owned(), v.map(str::to_owned))).collect()
 }
 
@@ -281,12 +288,23 @@ pub fn syntax_of(e: PackageEdition) -> Edition {
     }
 }
 
+/// The program crate's `Implicit`: a binary of its package's edition (under a blaze edition its
+/// root's `fn main` is `std::main`'s input, D104). The one home of it: [`Inputs::crates`] gives
+/// it to the names library, and `blaze run`'s choice of process (run.rs `entry_start`) reads
+/// its `std` before any name is resolved.
+pub fn program_implicit(edition: PackageEdition) -> blaze_unit_graph::Implicit {
+    implicit(edition, &blaze_unit_graph::UnitKind::Lib).binary()
+}
+
 impl Toolchain {
     /// The program crate's cfg atoms (the target's and the profile's; it has no features), as
     /// [`Inputs::crates`] gives them: what the entry's choice (front2 `entry`) lowers `main` by
-    /// before names resolve.
-    pub fn program_cfg(&self) -> Vec<(&str, Option<&str>)> {
-        self.cfg.iter().map(|(n, v)| (n.as_str(), v.as_deref())).chain(PROFILE.iter().copied()).collect()
+    /// before names resolve. `panic` is the program's strategy: its `cfg(panic)` is derived from
+    /// it ([`crate::panic_strategy::derive_cfg`]), never the target list's.
+    pub fn program_cfg(&self, panic: blaze_build::Panic) -> Vec<(&str, Option<&str>)> {
+        let mut atoms: Vec<(&str, Option<&str>)> = self.cfg.iter().map(|(n, v)| (n.as_str(), v.as_deref())).chain(PROFILE.iter().copied()).collect();
+        crate::panic_strategy::derive_cfg(&mut atoms, panic);
+        atoms
     }
 }
 
@@ -316,13 +334,16 @@ impl<'t> Inputs<'t> {
             features.push(u.features.iter().map(String::as_str).collect());
             deps.push(u.deps.iter().map(|(n, d)| (n.as_str(), d + 1)).collect());
         }
-        let cfgs = features
+        let mut cfgs: Vec<Vec<(&str, Option<&str>)>> = features
             .iter()
             .map(|fs| {
                 let target = tc.cfg.iter().map(|(n, v)| (n.as_str(), v.as_deref()));
                 target.chain(PROFILE.iter().copied()).chain(fs.iter().map(|f| ("feature", Some(*f)))).collect()
             })
             .collect();
+        // The program crate's `cfg(panic)` is its inputs' strategy; the toolchain's crates keep
+        // the strategy their records were cut under (the target list's), as Rust does with std.
+        crate::panic_strategy::derive_cfg(&mut cfgs[0], user.panic);
         Ok(Inputs { texts: Texts { user: user.files, packs }, features, cfgs, deps, user, tc, sysroot })
     }
 
@@ -339,7 +360,7 @@ impl<'t> Inputs<'t> {
             edition: syntax,
             // The program crate is a binary: under a blaze edition its root's `fn main` is
             // `std::main`'s input (D104, `Implicit::binary`).
-            implicit: implicit(self.user.edition, &blaze_unit_graph::UnitKind::Lib).binary(),
+            implicit: program_implicit(self.user.edition),
             root: self.user.root,
             shown_from: self.user.dir,
             features: &[],
@@ -364,8 +385,9 @@ impl<'t> Inputs<'t> {
         out
     }
 
-    /// Every crate's names, resolved together.
-    pub fn resolve(&'t self, crates: &[CrateInput<'t>]) -> Result<Names<'t>, NamesError<'t>> {
-        resolve_crates(crates, self.sysroot, &self.texts, &Serial, Alloc::global())
+    /// Every crate's names, resolved together, held in `alloc` (the caller's, alive as long as
+    /// the names).
+    pub fn resolve(&'t self, crates: &[CrateInput<'t>], alloc: Alloc<'t>) -> Result<Names<'t>, NamesError<'t>> {
+        resolve_crates(crates, self.sysroot, &self.texts, &Serial, alloc)
     }
 }

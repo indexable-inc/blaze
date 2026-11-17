@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use annotate_snippets::{AnnotationKind, Group, Patch, Renderer, Snippet};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::radix;
 use blaze_sim::{Config, Tape};
 use serde::Serialize;
@@ -23,7 +23,7 @@ use crate::model::{
 const MAX_SUGGESTIONS: usize = 4;
 
 pub(super) struct Sources {
-    files: HashMap<String, Option<Arc<File>>, Global>,
+    files: Map<String, Option<Arc<File>>, FixedState, Global>,
 }
 
 pub(super) struct File {

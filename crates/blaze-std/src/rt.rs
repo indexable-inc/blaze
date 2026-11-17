@@ -34,6 +34,7 @@ use crate::{
     entry::{Outcome, Status, run_on},
     env::Vars,
     io::{Io, Limits, NativeWorld},
+    mem::Heap,
     task::threads::{Plants, Topology},
 };
 
@@ -99,6 +100,15 @@ pub fn run_with<R: Outcome>(os: &'static blaze_core::Os, main: impl FnOnce(&Cx, 
     run_io(native(os), main)
 }
 
+/// [`run_with`] for an entry that is also handed the process's heap as a grant (D102, D120):
+/// the closure form of `fn main(cx: &Cx, .., heap: Heap)` for a plain binary's `main` (the
+/// `blaze` command's). The heap is taken by bstd's entry (`entry::process_heap`), once; nothing
+/// below `main` reaches for it, it is handed down.
+pub fn run_with_heap<R: Outcome>(os: &'static blaze_core::Os, main: impl FnOnce(&Cx, Io, Heap) -> R) -> Exit {
+    let heap = crate::entry::process_heap();
+    run_io(native(os), move |cx, io| main(cx, io, heap))
+}
+
 /// [`run`] in the world `world` made, or saying why it could not be: the one home of the
 /// pool's start and stop for a program's `main` ([`run`], and `launch`'s spec-made world).
 pub(crate) fn run_io<R: Outcome>(world: Result<Io, String>, main: impl FnOnce(&Cx, Io) -> R) -> Exit {
@@ -141,8 +151,9 @@ pub(crate) fn run_io<R: Outcome>(world: Result<Io, String>, main: impl FnOnce(&C
     Exit(status)
 }
 
-/// The process ends with `status` at once: standard output and error are written through as
-/// each line is (`write_out`, `error_line`), so nothing waits in a buffer, and nothing is torn
+/// The process ends with `status` at once: the world's stream buffers were written when
+/// `main` ended (`entry::run_on`), and `error_line` writes through, so nothing waits in a
+/// buffer here, and nothing is torn
 /// down that the kernel frees: the pool `running` is not stopped or joined, and no destructor
 /// runs. `std::process::exit` is libc's `exit`: the C library's atexit handlers and stdio
 /// flush, nothing of Rust's.
@@ -621,9 +632,65 @@ fn error_line(said: &str) {
 }
 
 /// `parts`, in order, on the process's `stream`, with the operating system when this
-/// returns: all of them or the host's refusal as it says it. Standard output goes through
-/// Rust std's handle, whose buffer is flushed here, so `parts` reach the system as one write
-/// when they fit it and never wait in it; standard error has no buffer.
+/// returns: all of them or the host's refusal as it says it. On unix they go to the file
+/// descriptor itself in vectored writes, one system call when the kernel takes them whole:
+/// the world's own buffer ([`crate::out`]) already made them a buffer's worth, and Rust std's
+/// `LineWriter` in between would split a chunk that does not end in a line feed into two
+/// writes and copy it. What std's handle holds is written first, so anything printed through
+/// it stays before. Elsewhere it goes through std's handles, flushed here.
+#[cfg(unix)]
+pub(crate) fn write_out(stream: crate::out::Stream, parts: &[&[u8]]) -> Result<(), String> {
+    use std::{
+        io::{IoSlice, Write as _},
+        os::fd::FromRawFd as _,
+    };
+    let fd = match stream {
+        crate::out::Stream::Out => {
+            // alloc: an error's message.
+            std::io::stdout().lock().flush().map_err(|error| error.to_string())?;
+            1
+        }
+        crate::out::Stream::Err => 2,
+    };
+    #[expect(
+        unsafe_code,
+        reason = "a File over the process's standard stream, never closed: writes go to the descriptor \
+                  with no buffer of std's between"
+    )]
+    // SAFETY: descriptors 1 and 2 are open for the process's life (the runtime closes neither),
+    // and `ManuallyDrop` keeps this `File` from closing it: it is a view, owning nothing.
+    let mut file = core::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+    // At most this many parts a call: a write, the buffer and one more piece, has two.
+    const AT_ONCE: usize = 4;
+    let mut at = 0;
+    while at < parts.len() {
+        let mut slices = [IoSlice::new(&[]); AT_ONCE];
+        let mut n = 0;
+        while n < AT_ONCE && at + n < parts.len() {
+            slices[n] = IoSlice::new(parts[at + n]);
+            n += 1;
+        }
+        at += n;
+        let mut left: &mut [IoSlice<'_>] = &mut slices[..n];
+        IoSlice::advance_slices(&mut left, 0);
+        while !left.is_empty() {
+            match file.write_vectored(left) {
+                // alloc: an error's message.
+                Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).to_string()),
+                Ok(wrote) => IoSlice::advance_slices(&mut left, wrote),
+                // A signal broke the call before it wrote: the same write again, as std's
+                // `write_all` does; nothing was written, so nothing is said twice.
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                // alloc: an error's message.
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// See the unix `write_out`: here through std's handles, flushed.
+#[cfg(not(unix))]
 pub(crate) fn write_out(stream: crate::out::Stream, parts: &[&[u8]]) -> Result<(), String> {
     use std::io::Write as _;
     fn all(mut to: impl std::io::Write, parts: &[&[u8]]) -> std::io::Result<()> {

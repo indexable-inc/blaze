@@ -213,12 +213,13 @@ pub(super) fn pack_refused(error: PackError) -> CliError {
 
 impl Pack {
     /// Its producer table, sorted, read with one positioned read into `scratch` (the caller
-    /// resets it). `None` when another command's merge removed the pack since the open (its
-    /// records are in that merge's pack); a table that does not hold is refused by name.
-    pub(super) fn producers(&self, cx: &Cx, scratch: &Frame, folder: &'static str, pack: u64) -> Result<Option<Vec<Producer, SharedAlloc<'static>>>, CliError> {
+    /// resets it); the table itself on `heap`, the caller's. `None` when another command's merge
+    /// removed the pack since the open (its records are in that merge's pack); a table that does
+    /// not hold is refused by name.
+    pub(super) fn producers(&self, cx: &Cx, scratch: &Frame, folder: &'static str, pack: u64, heap: SharedAlloc<'static>) -> Result<Option<Vec<Producer, SharedAlloc<'static>>>, CliError> {
         let entries = self.producers as usize;
         let len = table_len(self.producers) as usize;
-        let mut table: Vec<Producer, SharedAlloc<'static>> = Vec::try_with_capacity_in(entries, SharedAlloc::global()).map_err(|_| pack_refused(PackError::NoRoom { folder, what: "a pack's producer table", entries }))?;
+        let mut table: Vec<Producer, SharedAlloc<'static>> = Vec::try_with_capacity_in(entries, heap).map_err(|_| pack_refused(PackError::NoRoom { folder, what: "a pack's producer table", entries }))?;
         let mut bytes = Bytes::new_in(scratch, "a pack's producer table");
         let read = self.file.read_at(cx, self.table_at, len, &mut bytes);
         if !matches!(read, Ok(_)) || bytes.len() != len {
@@ -319,12 +320,12 @@ impl PackStore {
 
     /// Who made `key`'s record in the packs this store holds: `None` when no pack holds it (a
     /// record put and not yet sealed has no producer row yet). What the collector (piece 10)
-    /// reads; one positioned read of the holding pack's table.
-    pub(crate) fn producer_of(&mut self, cx: &Cx, key: Key) -> Result<Option<Producer>, CliError> {
+    /// reads; one positioned read of the holding pack's table, made on the caller's `heap`.
+    pub(crate) fn producer_of(&mut self, cx: &Cx, key: Key, heap: &'static blaze_own::Heap) -> Result<Option<Producer>, CliError> {
         for (number, pack) in self.packs.iter().filter(|(_, pack)| !pack.gone) {
             let Ok(at) = pack.rows.binary_search_by(|row| row.0.cmp(&key)) else { continue };
-            let table = pack.producers(cx, &self.scratch, self.folder, *number);
-            // The table owns its entries on the global heap; the frame's read is spent.
+            let table = pack.producers(cx, &self.scratch, self.folder, *number, heap.shared());
+            // The table owns its entries on the heap; the frame's read is spent.
             self.scratch.reset();
             let table = match table {
                 Ok(Some(table)) => table,

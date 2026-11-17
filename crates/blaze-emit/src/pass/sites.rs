@@ -110,6 +110,12 @@ impl<A: Allocator + Clone> Form<A> {
 pub(crate) const UNALIGNED_ADDRESS: &str =
     "an address at an offset that is not 8-aligned in its row (the image binds whole aligned words of the relro part)";
 
+/// Why the record form refuses a data row holding a source position (a `Location`'s line or
+/// column): a `blaze_code` record has no position field yet, and writing the line in would put
+/// an absolute position in a code record (rule 71).
+pub(crate) const RECORD_POSITION: &str =
+    "a source position (a `#[track_caller]` `Location`'s line or column) in the code record form, which has no position field";
+
 impl<A: Allocator> Pass<'_, '_, A> {
     /// Whether the pass emits the record form.
     pub(super) fn in_record(&self) -> bool {
@@ -189,6 +195,9 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 return Err(EmitError::Data { row, why: "data aligned past 16 bytes (a segment aligns a record's code and relro part to 16)" });
             }
             let align = 8usize.max(1 << rec.align);
+            if !view.data_positions_of(DataId(row)).is_empty() {
+                return Err(EmitError::Data { row, why: RECORD_POSITION });
+            }
             let relocs = view.data_relocs_of(DataId(row));
             let bytes = view.data_bytes_of(DataId(row));
             if relocs.is_empty() {

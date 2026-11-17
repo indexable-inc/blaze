@@ -18,7 +18,7 @@
 //!   at its root is a file like any other.
 
 use blaze_core::{Effect, FileName, Stamp, Tag};
-use blaze_hash::HashSet;
+use blaze_hash::{FixedState, Set, SetOpts};
 use std::alloc::Global;
 
 use crate::{
@@ -79,7 +79,7 @@ pub(crate) fn is_tag(bytes: &[u8]) -> bool {
 #[derive(Default)]
 pub(crate) struct Caches {
     // alloc: a handful of names per checkout (its target directories), kept for the watch.
-    dirs: HashSet<Box<str>, Global>,
+    dirs: Set<Box<str>, FixedState, Global>,
 }
 
 impl Caches {

@@ -47,16 +47,18 @@ pub(crate) fn file<A: Allocator + Copy>(made: &mut Record<A>, range: (u32, u32),
     made.find(crate::body_types::TYPES_NOT_CHECKED, range, &[item, "\x1f", cause, "\x1f", sep, detail]);
 }
 
-/// The item and cause of a `TYPES_NOT_CHECKED` finding's words ([`file`]'s form), copied into
-/// `frame` and pushed onto `into` with the finding's file. A finding not of that form is a
-/// typed refusal naming the rule (rule 3): it is never counted as some other item.
-pub(crate) fn keep<'f>(into: &mut Vec<Unchecked<'f>, &'f Frame>, frame: &'f Frame, file: Option<&str>, words: &[u8]) -> Result<(), CliError> {
+/// The item and cause of a `TYPES_NOT_CHECKED` finding's words ([`file`]'s form), borrowed from
+/// the listed finding (its words and path live as long as the list, `'f`) and pushed onto
+/// `into` with the finding's file: nothing is copied. A finding not of that form is a typed
+/// refusal naming the rule (rule 3): it is never counted as some other item.
+pub(crate) fn keep<'f>(into: &mut Vec<Unchecked<'f>, &'f Frame>, file: Option<&'f str>, words: &'f [u8]) -> Result<(), CliError> {
     let refused = CliError::Text { what: "a types-not-checked finding without its item and cause (blaze-cli not_checked/items.rs `file`)" };
     let mut parts = words.split(|b| *b == 0x1f);
     let (Some(item), Some(cause), Some(_detail), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else { return Err(refused) };
     let (Ok(item), Ok(cause)) = (core::str::from_utf8(item), core::str::from_utf8(cause)) else { return Err(refused) };
     let file = file.unwrap_or("<no file>");
-    into.push(Unchecked { cause: crate::work::held_str(cause, frame), file: crate::work::held_str(file, frame), item: crate::work::held_str(item, frame) });
+    into.try_reserve(1).map_err(|_| CliError::Text { what: "the command's frame has no room for one more item not checked (blaze-cli not_checked/items.rs `keep`)" })?;
+    into.push(Unchecked { cause, file, item });
     Ok(())
 }
 

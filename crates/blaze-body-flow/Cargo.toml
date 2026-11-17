@@ -1,0 +1,47 @@
+[package]
+name = "blaze-body-flow"
+description = "The body projected to the flow the borrow check reads (docs/v2/plan/design/backend-next.md, \"One lowering\", D119 P3): a blaze-body Body to a blaze-flow Flow, with the map both ways between their ids, and the harness that makes blaze-flow-lower the oracle of the one lowering"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# core only beside the crates it names; the allocator is a value the caller passes in.
+[dependencies]
+# `Verified`, every row form: what is projected.
+blaze-body.workspace = true
+# `FlowBuilder`, `Flow`, `moves::{inits, drop_kind}`: what it is projected to, and the drop kinds read back.
+blaze-flow.workspace = true
+# `Vec`: the maps, in the allocator the caller names.
+blaze-own.workspace = true
+# The oracle (tests/equal_flows.rs, feature `oracle` only): the old lowering and the new one, so
+# that the library never depends on either. By path: blaze-body-lower may not be in the
+# workspace table when this is first built.
+blaze-flow-lower = { workspace = true, optional = true }
+blaze-body-lower = { path = "../blaze-body-lower", optional = true }
+
+[features]
+# `cargo test -p blaze-body-flow --features oracle --test equal_flows`: once blaze-body-lower
+# compiles, the old lowering's flow and the projection of the new lowering's body must print the
+# same canonical text.
+oracle = ["dep:blaze-flow-lower", "dep:blaze-body-lower"]
+
+[dev-dependencies]
+# The fixture world and the type checker the oracle's bodies are checked by.
+blaze-typeck = { workspace = true, features = ["testing"] }
+# `testing::heap()`: a test's root allocator capability (D102).
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
+[[test]]
+name = "equal_flows"
+required-features = ["oracle"]
+
+[lints]
+workspace = true

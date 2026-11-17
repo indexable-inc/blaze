@@ -35,7 +35,7 @@
 use std::{alloc::Global, collections::VecDeque, sync::Arc, time::Duration};
 
 use blaze_core::{Effect, FileName};
-use blaze_hash::{ByHash, ByHashSet};
+use blaze_hash::{BuildKeyHasher, Map, MapOpts, Set, SetOpts};
 use blaze_ids::{ContentId, radix};
 use blaze_reclaim::enter;
 
@@ -171,11 +171,11 @@ fn newest_pins(mut pins: Vec<(Key, Pin)>) -> Vec<(Key, Pin)> {
 /// store's (`generation`), since a pin or a place made after it names keys it does not hold.
 pub(crate) struct Mark {
     generation: u64,
-    rooted: ByHashSet<Key, Global>, // alloc: the mark's set, held while the mark is the store's
+    rooted: Set<Key, BuildKeyHasher, Global>, // alloc: the mark's set, held while the mark is the store's
     /// What only records that may themselves be forgotten name (a chunk of a value no root
     /// keeps), each with the records that name it: it goes with the last of them, in the
     /// same seal, never before ([`CollectBatch::scan`]).
-    weak: ByHash<Key, Vec<Key>, Global>, // alloc: the mark's table, held while the mark is the store's
+    weak: Map<Key, Vec<Key>, BuildKeyHasher, Global>, // alloc: the mark's table, held while the mark is the store's
     /// Every referent could be read: a mark that could not follow one keeps everything.
     sound: bool,
     /// How many keys readers had ever kept ([`Keep`]) when its scan was taken: a key kept
@@ -489,10 +489,10 @@ pub struct PeriodScan {
     done: bool,
     pub(crate) demote: Vec<(Key, Loc, Row)>,
     pub(crate) promote: Vec<(Key, Loc, Row)>,
-    pub(crate) named: ByHash<ContentId, u32, Global>,
+    pub(crate) named: Map<ContentId, u32, BuildKeyHasher, Global>,
     pins: Vec<(Key, Pin)>,
-    rooted: ByHashSet<Key, Global>,
-    weak: ByHash<Key, Vec<Key>, Global>,
+    rooted: Set<Key, BuildKeyHasher, Global>,
+    weak: Map<Key, Vec<Key>, BuildKeyHasher, Global>,
     sound: bool,
     scanned: Scanned,
     problems: Vec<String>,
@@ -799,7 +799,7 @@ pub struct CollectBatch {
     /// which of them go with those ([`Mark::weak`]).
     weakly: Vec<Judged>,
     /// The forgotten records that name others, by key.
-    going: ByHashSet<Key, Global>,
+    going: Set<Key, BuildKeyHasher, Global>,
     /// How many bytes one [`CollectBatch::work`] reads ahead of the store's copies.
     fill_most: u64,
     problems: Vec<String>,
@@ -1318,10 +1318,10 @@ impl Store {
             done: false,
             demote: Vec::new(),  // alloc: empty, allocates nothing
             promote: Vec::new(), // alloc: empty, allocates nothing
-            named: ByHash::new_in(Global), // alloc: once a scan, a count for each whole file a record names: a few
+            named: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: None }), // alloc: once a scan, a count for each whole file a record names: a few
             pins: Vec::new(), // alloc: empty, allocates nothing
-            rooted: ByHashSet::new_in(Global), // alloc: once a scan, the keys pins and kept records name
-            weak: ByHash::new_in(Global), // alloc: once a scan, what only forgettable records name
+            rooted: Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: None }), // alloc: once a scan, the keys pins and kept records name
+            weak: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: None }), // alloc: once a scan, what only forgettable records name
             sound: true,
             scanned: Scanned::default(),
             problems: Vec::new(), // alloc: empty, allocates nothing
@@ -1618,7 +1618,7 @@ impl Store {
             externals: Vec::new(), // alloc: empty, allocates nothing
             files: Vec::new(),     // alloc: empty, allocates nothing
             weakly: Vec::new(),    // alloc: empty, allocates nothing
-            going: ByHashSet::new_in(Global), // alloc: once a batch, the forgotten records that name others
+            going: Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: None }), // alloc: once a batch, the forgotten records that name others
             fill_most: pace.fill_most,
             problems: Vec::new(), // alloc: empty, allocates nothing
             #[cfg(test)]

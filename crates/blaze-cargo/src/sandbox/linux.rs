@@ -78,7 +78,7 @@ use std::{
 };
 
 use blaze_core::{Untraceable, exit::Exit, utf8::push_lossy};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_usercode::{
     provider::{Answers, Asker, Provider, SOURCE_DATE_EPOCH, Wall},
     trace::{ANSWERED_DEVICE, ANSWERED_RANDOM},
@@ -715,11 +715,11 @@ fn run_in(
     let mut watch = Watch {
         around,
         network: also.network,
-        processes: HashMap::new_in(Global),
+        processes: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
         provided: provider.map(|provider| Provided {
             answers: Answers::new(&provider),
             wall: provider.wall,
-            numbers: HashMap::new_in(Global),
+            numbers: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             devices: Vec::with_capacity(0),
         }),
     };
@@ -2321,7 +2321,7 @@ struct Watch {
     /// Whether the program may reach the network ([`Also::network`]).
     network: bool,
     /// The process of each thread seen, by the thread's id.
-    processes: HashMap<u64, u64, Global>,
+    processes: Map<u64, u64, FixedState, Global>,
     /// What the run's provider answers, when the run was given one.
     provided: Option<Provided>,
 }
@@ -2347,7 +2347,7 @@ struct Provided {
     wall: Wall,
     /// The number of each process in the provider's streams, by its id as the supervisor
     /// sees it.
-    numbers: HashMap<u64, u64, Global>,
+    numbers: Map<u64, u64, FixedState, Global>,
     /// The file each answered open of a random device was handed, through the same open
     /// file: how far the program read it is read here as the run ends.
     devices: Vec<OwnedFd>,

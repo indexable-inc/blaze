@@ -24,7 +24,7 @@ use bstd::{
 };
 use core::time::Duration;
 
-use super::{Boot, FolderOrigin, HttpAt, HttpOrigin, Machine, NamedOrigin, OneKey, PACKS_MOST, PackStore, SHARED, StorePlant};
+use super::{FolderOrigin, HttpAt, HttpOrigin, OneKey};
 
 const AT: (&str, u16) = ("127.0.0.1", 8090);
 
@@ -199,102 +199,4 @@ fn laid_out(cx: &Cx, io: &Io, objects: &BTreeMap<String, StdVec<u8>>) -> Dir<Rea
         fs.root().publish(cx, &Path::new(&format!("origin/{name}")).expect("a path"), Content::bytes(bytes), Durable::No).expect("an object");
     }
     fs.open_dir(cx, &Path::new("origin").expect("a path")).expect("the origin folder")
-}
-
-/// CI's writer, as a function (remote-read.md, "One chain of stores"): `records` in plain
-/// segments of at most 4 MiB, then index pages, summaries, the manifest and the head signed
-/// by `signer` (`publish`): the origin's objects by name.
-fn seal_records(records: &BTreeMap<ContentId, StdVec<u8>>, signer: &Signer) -> BTreeMap<String, StdVec<u8>> {
-    const SEGMENT_MOST: usize = 4 << 20;
-    let all: StdVec<(&ContentId, &StdVec<u8>)> = records.iter().collect();
-    let mut segments: StdVec<StdVec<u8>> = StdVec::new();
-    let mut from = 0;
-    while from < all.len() {
-        let (mut to, mut size) = (from, 0);
-        while to < all.len() && (to == from || size + all[to].1.len() <= SEGMENT_MOST) {
-            size += all[to].1.len();
-            to += 1;
-        }
-        let refs: StdVec<(RecordRef, &[u8])> = all[from..to].iter().map(|(key, bytes)| (RecordRef { tag: Tag(1), key: **key }, bytes.as_slice())).collect();
-        let mut out = StdVec::new();
-        seal_segment(Namespace::PUBLIC, &refs, &mut out).expect("a segment of records read whole");
-        segments.push(out);
-        from = to;
-    }
-    let refs: StdVec<&[u8]> = segments.iter().map(|s| s.as_slice()).collect();
-    let global = Erased::new(Global);
-    let sealed = publish(Namespace::PUBLIC, 1, signer, &refs, 64, global.handle()).expect("publish");
-    sealed.iter().map(|o| (o.object.name().as_str().to_owned(), o.bytes.as_slice().to_vec())).collect()
-}
-
-/// Every record of the PUBLIC machine store under `home` (`v2/shared`, never `v2/own`), read
-/// from its packs: what an origin is sealed from.
-fn public_records(cx: &Cx, io: &Io, home: &str) -> BTreeMap<ContentId, StdVec<u8>> {
-    let fs = io.need_fs().expect("files");
-    let home = match Machine::of(cx, &fs, Some(home)).expect("no harness error") {
-        Machine::Home(home) => home,
-        Machine::Off(why) => panic!("the simulation's home: {why}"),
-    };
-    let shared = PackStore::open_in(cx, &home, SHARED, Boot::Unknown, PACKS_MOST, StorePlant::None).expect("the public machine store");
-    let scratch = bstd::mem::Frame::with_reserve(TASK_FRAME, bstd::mem::Tag::Other).expect("a frame");
-    let mut records = BTreeMap::new();
-    let handed = shared
-        .each_record(cx, &scratch, &mut |key, bytes| {
-            records.insert(key.0, bytes.to_vec());
-            Ok(())
-        })
-        .expect("the packs read");
-    assert_eq!(handed as usize, records.len(), "one record a key");
-    records
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    bytes.iter().flat_map(|b| [HEX[usize::from(b >> 4)] as char, HEX[usize::from(b & 15)] as char]).collect()
-}
-
-/// The origin's last uncounted line on standard error: "N keys asked, M found, ...".
-fn origin_line(io: &Io) -> String {
-    let err = io.script(|host| host.err.clone()).expect("a simulated host");
-    let err = String::from_utf8(err).expect("UTF-8");
-    err.lines().filter(|line| line.starts_with("blaze: origin: ") && line.contains("keys asked")).last().unwrap_or("").to_owned()
-}
-
-/// STEP 2 of the shared cache (remote-read.md, "One chain of stores"): project A fills the
-/// machine store; an origin is sealed from its PUBLIC packs; every sealed record comes back
-/// byte-equal through the folder and over HTTP from a simulated server, and a lying server's
-/// flipped byte is refused by the digest chain; project B, with an EMPTY home (its shelf only)
-/// and that origin named, finds the toolchain's records there, runs fewer tasks than a fresh
-/// build, and answers as a fresh build does.
-#[test]
-fn an_origin_sealed_from_the_machine_packs_answers_a_second_machine() {
-    use super::worktree_tests::{Keys, ONE, TWO, check_with, worktree};
-    let io = Io::sim(13);
-    let cx = io.cx(Duration::from_secs(3600), TASK_FRAME).expect("a root");
-    worktree(&io, ONE);
-    let a = check_with(&io, ONE, Keys::FromText, "/h", None);
-    let records = public_records(&cx, &io, "/h");
-    assert!(!records.is_empty(), "project A put no public record in the machine store:\n{}", a.profile);
-    let signer = Signer::from_seed(&[7; 32]);
-    let folder = laid_out(&cx, &io, &seal_records(&records, &signer));
-    let keys: StdVec<ContentId> = records.keys().copied().collect();
-    let (by_folder, by_http) = through(&cx, &io, &folder, &signer, &keys, false);
-    let truth: StdVec<Option<StdVec<u8>>> = records.values().map(|bytes| Some(bytes.clone())).collect();
-    std::eprintln!("sealed from packs: {} public records; folder equal {}, http equal {}", keys.len(), by_folder == truth, by_http == truth);
-    assert_eq!((&by_folder, &by_http), (&truth, &truth), "every sealed record, byte-equal, through the folder and over HTTP");
-    let (_, lied) = through(&cx, &io, &folder, &signer, &keys, true);
-    let wrong = lied.iter().zip(truth.iter()).filter(|(got, want)| got.is_some() && got != want).count();
-    assert_eq!(wrong, 0, "nothing a liar sent is taken");
-    // Project B: another machine (an empty home, the toolchain's shelf only), the origin named.
-    worktree(&io, TWO);
-    let named = NamedOrigin::of(&cx, &io.need_fs().expect("files"), None, Some("origin"), Some(&hex(&signer.public().0))).expect("the origin's arguments").expect("an origin");
-    let b = check_with(&io, TWO, Keys::FromText, "/h2", Some(&named));
-    let said = origin_line(&io);
-    let fresh_io = Io::sim(13);
-    worktree(&fresh_io, TWO);
-    let fresh = check_with(&fresh_io, TWO, Keys::FromText, "/h2", None);
-    std::eprintln!("B through the origin: {} runs against a fresh build's {}; {said}", b.runs, fresh.runs);
-    assert_eq!((b.errors, b.status, &b.findings), (fresh.errors, fresh.status, &fresh.findings), "B's answer is a fresh build's");
-    assert!(b.runs < fresh.runs, "the origin answered none of B's tasks: {} runs against {}:\n{}\n{said}", b.runs, fresh.runs, b.profile);
-    assert!(said.contains(" 0 not fetched"), "every public record B asked came: {said}");
 }

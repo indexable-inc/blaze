@@ -245,11 +245,11 @@ pub enum NetFailure {
 }
 
 impl NetFailure {
-    fn transient(self) -> bool {
+    pub(crate) fn transient(self) -> bool {
         matches!(self, NetFailure::Connect | NetFailure::Reset | NetFailure::Timeout)
     }
 
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             NetFailure::Connect => "no connection",
             NetFailure::Reset => "the connection broke",

@@ -50,6 +50,7 @@ fn refused(error: RecordEmitError) -> TierError {
         RecordEmitError::Emit(EmitError::Signature { why }) => TierError::Refused { tier: TIER, inst: None, what: why },
         RecordEmitError::Emit(EmitError::Data { row: _, why }) => TierError::Refused { tier: TIER, inst: None, what: why },
         RecordEmitError::Emit(EmitError::Record { why }) => TierError::Refused { tier: TIER, inst: None, what: why },
+        RecordEmitError::Emit(EmitError::Legalize(why)) | RecordEmitError::Legalize(why) => legalize_refused(why),
         RecordEmitError::NoSymbol { of } => TierError::NoName { tier: TIER, of },
         RecordEmitError::CName { of: _ } => {
             TierError::Refused { tier: TIER, inst: None, what: "a C name given for a reference other than a function or a static" }
@@ -57,18 +58,23 @@ fn refused(error: RecordEmitError) -> TierError {
         RecordEmitError::CAddend { of: _, addend: _ } => {
             TierError::Refused { tier: TIER, inst: None, what: "data holding a C name's address plus an addend" }
         }
-        RecordEmitError::Legalize(why) => match why {
-            blaze_lir::legalize::LegalizeError::Refused { inst, op: _, what } => {
-                TierError::Refused { tier: TIER, inst: Some(inst as u32), what }
-            }
-            blaze_lir::legalize::LegalizeError::NoRoutine(_) => {
-                TierError::Refused { tier: TIER, inst: None, what: "an `f128` operation whose compiler_builtins routine is not bound (INTRINSICS.md P5b)" }
-            }
-            blaze_lir::legalize::LegalizeError::Scalable => TierError::Refused { tier: TIER, inst: None, what: "a scalable vector" },
-            blaze_lir::legalize::LegalizeError::Full { table } => TierError::TooLarge { tier: TIER, what: table },
-            blaze_lir::legalize::LegalizeError::Verify(_) => {
-                TierError::Refused { tier: TIER, inst: None, what: "legalize's output does not verify (a bug of blaze-lir's legalize)" }
-            }
-        },
+    }
+}
+
+/// Legalize's refusal (of either form) as the seam's.
+fn legalize_refused(why: blaze_lir::legalize::LegalizeError) -> TierError {
+    const TIER: TierName = TierName::Reference;
+    match why {
+        blaze_lir::legalize::LegalizeError::Refused { inst, op: _, what } => {
+            TierError::Refused { tier: TIER, inst: Some(inst as u32), what }
+        }
+        blaze_lir::legalize::LegalizeError::NoRoutine(_) => {
+            TierError::Refused { tier: TIER, inst: None, what: "an `f128` operation whose compiler_builtins routine is not bound (INTRINSICS.md P5b)" }
+        }
+        blaze_lir::legalize::LegalizeError::Scalable => TierError::Refused { tier: TIER, inst: None, what: "a scalable vector" },
+        blaze_lir::legalize::LegalizeError::Full { table } => TierError::TooLarge { tier: TIER, what: table },
+        blaze_lir::legalize::LegalizeError::Verify(_) => {
+            TierError::Refused { tier: TIER, inst: None, what: "legalize's output does not verify (a bug of blaze-lir's legalize)" }
+        }
     }
 }

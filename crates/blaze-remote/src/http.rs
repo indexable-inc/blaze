@@ -13,8 +13,10 @@
 //! - No header, address with a query, or body is ever logged or put in a reply: a failure says
 //!   the object, the status and the client's kind of error.
 //!
-//! The wait for answers ([`Bucket::wait`]) parks in `blaze_http::mailbox::block_on`, named
-//! (every-wait-says-what), and is bounded by the asks' deadlines.
+//! The wait for answers ([`Bucket::wait`]) is one timed receive, `blaze_http::mailbox::answer`,
+//! named (every-wait-says-what) and bounded by the earliest deadline in flight plus
+//! [`ANSWER_SLACK`]: the driver answers every ask by its deadline, so a wait past that is the
+//! driver's failure, and every ask in flight is answered with it.
 
 use std::{
     alloc::Global,
@@ -23,10 +25,11 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use blaze_core::chan::{self, Receiver, Sender};
 use blaze_http::{
     Client, Config, Method, Range, Request,
     driver::{Fetched, Handle},
-    mailbox::{self, Rx, Tx},
+    mailbox,
 };
 
 use crate::{
@@ -38,6 +41,10 @@ use crate::{
 
 /// The most bytes an S3 answer that is not an object may be (XML of a multipart upload).
 pub const XML_MOST: u64 = 1 << 20;
+
+/// How long past the earliest deadline in flight [`Bucket::wait`] waits for the driver's
+/// answer: the driver's clock and this one read the same time apart by at most this.
+pub const ANSWER_SLACK: Duration = Duration::from_secs(1);
 
 /// Where requests go and with what.
 #[derive(Clone, Debug)]
@@ -185,10 +192,11 @@ pub struct HttpBucket {
     access: Arc<Access, Global>,
     start: Instant,
     /// Where the driver hands each ask's answer, by its key.
-    to_us: Tx<(u64, Fetched)>,
-    answers: Rx<(u64, Fetched)>,
-    /// Each ask in flight in the driver, by its key: its ticket, its object and how to read it.
-    asked: BTreeMap<u64, (Ticket, String, Want), Global>,
+    to_us: Sender<(u64, Fetched)>,
+    answers: Receiver<(u64, Fetched)>,
+    /// Each ask in flight in the driver, by its key: its ticket, its object, how to read it
+    /// and its deadline (ms on [`Bucket::now_ms`]'s clock).
+    asked: BTreeMap<u64, (Ticket, String, Want, u64), Global>,
     next_key: u64,
     /// Replies made without asking (a request that could not be made), for the next wait.
     ready: Vec<(Ticket, Reply), Global>,
@@ -217,7 +225,7 @@ impl HttpBucket {
         let proxies = blaze_http::proxy_env::from_env().map_err(|e| Failure::Misused(format!("the proxy settings: {e}")))?;
         let config = Config { idle_most: crate::push::IN_FLIGHT, proxies, redirects: 0, ..Config::new(tls, "blaze (https://github.com/indexable-inc/blaze)", Duration::from_secs(30)) };
         let http = Handle::spawn(Client::new(config), crate::push::IN_FLIGHT).map_err(|e| Failure::Misused(format!("starting the cache's HTTP driver: {e}")))?;
-        let (to_us, answers) = mailbox::channel(None);
+        let (to_us, answers) = chan::unbounded();
         Ok(HttpBucket {
             http,
             access: Arc::new_in(access, Global),
@@ -251,7 +259,7 @@ impl Bucket for HttpBucket {
                 Ok((req, want)) => {
                     let key = self.next_key;
                     self.next_key += 1;
-                    self.asked.insert(key, (ticket, object, want));
+                    self.asked.insert(key, (ticket, object, want, deadline_ms));
                     let allowed = Duration::from_millis(deadline_ms.saturating_sub(now));
                     self.http.fetch(req, allowed, key, &self.to_us);
                 }
@@ -268,13 +276,17 @@ impl Bucket for HttpBucket {
         if self.in_flight == 0 {
             return out;
         }
-        if self.ready.is_empty() {
-            // Bounded: the driver answers every ask by its deadline, on its clock. This holds
-            // a sender, so `None` (every sender gone) cannot come while it lives.
-            match mailbox::block_on("the cache's HTTP answers", None, self.answers.recv()) {
+        // `in_flight` counts the ready replies too: with none ready, an ask is in the driver.
+        if self.ready.is_empty()
+            && let Some(earliest) = self.asked.values().map(|(_, _, _, deadline_ms)| *deadline_ms).min()
+        {
+            // The driver answers every ask by its deadline, on its clock. This holds a sender,
+            // so `None` (every sender gone) cannot come while it lives.
+            let within = Duration::from_millis(earliest.saturating_sub(self.now_ms())) + ANSWER_SLACK;
+            match mailbox::answer("the cache's HTTP answers", &self.answers, within) {
                 Ok(Some((key, answer))) => self.answered(key, answer, &mut out),
                 Ok(None) => self.fail_all("the HTTP driver ended", &mut out),
-                Err(blocked) => self.fail_all(&format!("waiting for the HTTP driver: {blocked}"), &mut out),
+                Err(unanswered) => self.fail_all(&format!("waiting for the HTTP driver: {unanswered}"), &mut out),
             }
         }
         self.taken(&mut out);
@@ -290,9 +302,8 @@ impl HttpBucket {
     /// Adds every answer ready to `out`, and counts what `out` holds as taken.
     fn taken(&mut self, out: &mut Vec<(Ticket, Reply)>) {
         out.append(&mut self.ready);
-        // `Err` is every sender gone, which cannot be while this holds one; `Ok(None)` is
-        // nothing more ready.
-        while let Ok(Some((key, answer))) = self.answers.try_recv() {
+        // `Err` is nothing more ready (every sender gone cannot be while this holds one).
+        while let Ok((key, answer)) = self.answers.try_recv() {
             self.answered(key, answer, out);
         }
         self.in_flight -= out.len();
@@ -307,7 +318,7 @@ impl HttpBucket {
 impl HttpBucket {
     /// The reply to the ask `key`.
     fn answered(&mut self, key: u64, answer: Fetched, out: &mut Vec<(Ticket, Reply)>) {
-        let Some((ticket, object, want)) = self.asked.remove(&key) else {
+        let Some((ticket, object, want, _)) = self.asked.remove(&key) else {
             panic!("blaze-remote's HTTP bucket: the driver answered key {key}, which names no ask in flight")
         };
         out.push((ticket, fetched(&object, want, answer)));
@@ -315,7 +326,7 @@ impl HttpBucket {
 
     /// Every ask in flight answered [`Reply::Failed`] with `why`: the driver can answer none.
     fn fail_all(&mut self, why: &str, out: &mut Vec<(Ticket, Reply)>) {
-        for (_, (ticket, object, _)) in std::mem::take(&mut self.asked) {
+        for (_, (ticket, object, _, _)) in std::mem::take(&mut self.asked) {
             out.push((ticket, Reply::Failed { why: format!("{object}: {why}") }));
         }
     }

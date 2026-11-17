@@ -148,7 +148,9 @@ mod tests {
         let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
         let frame = cx.frame();
         let fs = io.need_fs().expect("files");
-        let manifest = record::write(&[], &[], blaze_own::Alloc::global()).expect("a record");
+        // In the test's root frame, from its context: no allocator is reached for.
+        let erased = blaze_own::Erased::new(frame);
+        let manifest = record::write(&[], &[], erased.handle()).expect("a record");
         let id = ToolchainView::id_of_bytes(&manifest);
         // The simulation keeps the home beneath its one root (`Fs::home`).
         let path = Path::new(&format!("u/me/{SHELF}/{id}")).expect("a path");

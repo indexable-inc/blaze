@@ -10,7 +10,7 @@
 use std::{alloc::Global, fmt, sync::Arc};
 
 use blaze_format::{SchemaHash, schema};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::ContentId;
 
 use crate::{Bytes, sync::Lock};
@@ -70,7 +70,7 @@ impl std::error::Error for StoreFault {}
 /// Texts held in a map, durable as soon as they are put unless [`HeldTexts::hold_back`] says
 /// otherwise: the store of a test, a fuzz target or a tool run with no daemon.
 pub struct HeldTexts {
-    held: Lock<HashMap<ContentId, Bytes, Global>>,
+    held: Lock<Map<ContentId, Bytes, FixedState, Global>>,
     undurable: std::sync::atomic::AtomicBool,
 }
 
@@ -84,7 +84,7 @@ impl HeldTexts {
     pub fn new() -> HeldTexts {
         HeldTexts {
             // alloc: a test's or a tool's texts, each kept as put.
-            held: Lock::new("vfs.texts.held", HashMap::new_in(Global)),
+            held: Lock::new("vfs.texts.held", Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None })),
             undurable: std::sync::atomic::AtomicBool::new(false),
         }
     }

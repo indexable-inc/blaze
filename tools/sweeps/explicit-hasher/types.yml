@@ -1,0 +1,66 @@
+# Type positions: each alias that hides the hasher becomes the table with its hasher written
+# (D125). One rule per alias; each matches the generic type wherever a type stands (a `let`'s
+# annotation, a field, a signature, a turbofish, an `impl` header).
+id: explicit-hasher-type-hash-map
+language: rust
+severity: hint
+message: "D125: write the hasher; `Map<K, V, FixedState, A>`"
+rule:
+  pattern: { context: "type T = HashMap<$K, $V, $A>;", selector: generic_type }
+fix: "Map<$K, $V, FixedState, $A>"
+---
+id: explicit-hasher-type-hash-set
+language: rust
+severity: hint
+message: "D125: write the hasher; `Set<T, FixedState, A>`"
+rule:
+  pattern: { context: "type T = HashSet<$K, $A>;", selector: generic_type }
+fix: "Set<$K, FixedState, $A>"
+---
+id: explicit-hasher-type-index-map
+language: rust
+severity: hint
+message: "D125: write the hasher; `OrderMap<K, V, FixedState, A>`"
+rule:
+  pattern: { context: "type T = IndexMap<$K, $V, $A>;", selector: generic_type }
+fix: "OrderMap<$K, $V, FixedState, $A>"
+---
+id: explicit-hasher-type-index-set
+language: rust
+severity: hint
+message: "D125: write the hasher; `OrderSet<T, FixedState, A>`"
+rule:
+  pattern: { context: "type T = IndexSet<$K, $A>;", selector: generic_type }
+fix: "OrderSet<$K, FixedState, $A>"
+---
+id: explicit-hasher-type-by-hash
+language: rust
+severity: hint
+message: "D125: write the hasher; `Map<K, V, BuildKeyHasher, A>`"
+rule:
+  pattern: { context: "type T = ByHash<$K, $V, $A>;", selector: generic_type }
+fix: "Map<$K, $V, BuildKeyHasher, $A>"
+---
+id: explicit-hasher-type-by-hash-set
+language: rust
+severity: hint
+message: "D125: write the hasher; `Set<T, BuildKeyHasher, A>`"
+rule:
+  pattern: { context: "type T = ByHashSet<$K, $A>;", selector: generic_type }
+fix: "Set<$K, BuildKeyHasher, $A>"
+---
+id: explicit-hasher-type-keyed-map
+language: rust
+severity: hint
+message: "D125: write the hasher; `Map<K, V, SipKey, A>`"
+rule:
+  pattern: { context: "type T = KeyedMap<$K, $V, $A>;", selector: generic_type }
+fix: "Map<$K, $V, SipKey, $A>"
+---
+id: explicit-hasher-type-keyed-set
+language: rust
+severity: hint
+message: "D125: write the hasher; `Set<T, SipKey, A>`"
+rule:
+  pattern: { context: "type T = KeyedSet<$K, $A>;", selector: generic_type }
+fix: "Set<$K, SipKey, $A>"

@@ -23,6 +23,7 @@ use blaze_build::{Abi, Adts, BuildError, Instance, InstanceKey, Intrinsic, Stati
 /// The profile's overflow setting every build entry here takes (D101), for callers that do not
 /// name blaze-build.
 pub use blaze_build::OverflowChecks;
+pub use blaze_build::Panic;
 use blaze_emit::{Code, EmitError, Isa, Os, Via};
 use blaze_own::Alloc;
 use blaze_typeck::{
@@ -42,6 +43,10 @@ use crate::class_chain::class_chain;
 
 /// D106: one missing instance made for the record walk (body_ids.rs `Walk`).
 pub mod make_one;
+
+/// D124: the run's roots (its entry, its launcher form, the root instances) and its special
+/// records (the C entry shim, the thread-local getter and ender), from names records.
+pub mod special;
 
 /// Coroutine states laid out from types, then each coroutine built into its state (ASYNC.md P8).
 mod lay_states;
@@ -111,8 +116,10 @@ pub enum RunError {
     /// names the trait, `Self`'s form and the solver's error (the seam's `last_projection`).
     Projection { function: Named, why: Box<str> },
     /// A call of a trait's fn found no impl to run. `path` is the callee's name where the front
-    /// end gives it (the seam's `item_named`).
-    Resolve { function: Named, callee: ItemKey, path: Option<Box<str>>, error: ResolveError },
+    /// end gives it (the seam's `item_named`). `at` is the FORM of the call's `Self`
+    /// (callee_shown.rs `self_form`): "a tuple", "a closure", "an ADT", .., so a gap of the
+    /// language's builtin impls is told from an impl the program lacks.
+    Resolve { function: Named, callee: ItemKey, path: Option<Box<str>>, at: &'static str, error: ResolveError },
     /// A vtable the function takes the address of could not be made.
     Vtable { function: Named, principal: ItemKey, why: VtableFail },
     Place(PlaceError),
@@ -128,9 +135,17 @@ pub enum RunError {
     MainShape { main: Named, what: &'static str },
     /// The program starts at bstd's hosted entry and the caller gave no host table.
     NoHost { start: Named },
+    /// The program starts at a C `main(argc, argv)` and the caller gave no argument vector
+    /// ([`Given::args`]): refused, never called with a made-up one.
+    NoArgs { start: Named },
+    /// The command line cannot be given to the program (crate::argv: a NUL inside an argument,
+    /// more arguments than `argc` counts, or no memory for the vector).
+    Args(crate::argv::ArgvError),
     /// The program is a Rust-edition program (its start is `lang_start::<T>` through the C
     /// entry shim) and this is the in-process runner: it runs only in its own process under the
-    /// run parent (run.md piece 6). `start` is its `main`.
+    /// run parent (run.md piece 6). `start` is its `main`. `blaze run` asks [`entry_start`]
+    /// first and never hands such a program to the in-process runner, so this is a caller's
+    /// error, not a route.
     OwnProcess { start: Named },
     /// The constant evaluator refused `const` item `constant` (or a constant it reads).
     Const { constant: Named, error: ConstError<'static> },
@@ -170,6 +185,9 @@ pub enum RunError {
     /// in one line (crate::trap). The PROGRAM's failure: `blaze run` prints the line and exits
     /// `trap::PROGRAM_TRAPPED`, not blaze's own status.
     Trapped { trap: crate::trap::Trap },
+    /// The run's roots (its entry, its form, its root instances) could not be made from the
+    /// names (run/special.rs `roots`), by name.
+    Roots(special::RootsError),
 }
 
 /// The Itanium ABI's entry that starts an unwind (`_Unwind_RaiseException`): a call of it by a
@@ -225,9 +243,9 @@ impl core::fmt::Display for RunError {
                 Some(path) => write!(f, "`{function}` reads `{path}`: {refusal}"),
                 None => write!(f, "`{function}`: {refusal}"),
             },
-            RunError::Resolve { function, callee, path, error } => match path {
-                Some(path) => write!(f, "`{function}` calls trait fn `{path}` ({:#x}): {error}", callee.0),
-                None => write!(f, "`{function}` calls trait fn {:#x}: {error}", callee.0),
+            RunError::Resolve { function, callee, path, at, error } => match path {
+                Some(path) => write!(f, "`{function}` calls trait fn `{path}` ({:#x}) with Self {at}: {error}", callee.0),
+                None => write!(f, "`{function}` calls trait fn {:#x} with Self {at}: {error}", callee.0),
             },
             RunError::Vtable { function, principal, why } => {
                 write!(f, "`{function}` takes a vtable of trait {:#x}: ", principal.0)?;
@@ -246,6 +264,10 @@ impl core::fmt::Display for RunError {
             RunError::NoHost { start } => {
                 write!(f, "`{start}` is bstd's hosted entry, and this run was given no host table to start it with")
             }
+            RunError::NoArgs { start } => {
+                write!(f, "`{start}` is a C `main` of `argc` and `argv`, and this run was given no argument vector to call it with")
+            }
+            RunError::Args(error) => write!(f, "{error}"),
             RunError::OwnProcess { .. } => write!(f, "a Rust-edition program runs only in its own process (run.md piece 6)"),
             RunError::Const { constant, error } => write!(f, "`{constant}`: {error}"),
             RunError::Statics { error } => write!(f, "the program's statics: {error}"),
@@ -269,6 +291,7 @@ impl core::fmt::Display for RunError {
                 None => write!(f, "a static points to fn instance {:?}, which no code of the program reaches, so it is not built yet", key.0),
             },
             RunError::Trapped { trap } => write!(f, "{trap}"),
+            RunError::Roots(error) => write!(f, "{error}"),
             RunError::UnwindRaised { function } => write!(
                 f,
                 "the program panicked and `{function}` raised the panic to unwind (`{UNWIND_RAISE}`): unwinding from code records is not registered yet (run.md piece 11, part C), so the run was stopped at the raise"
@@ -347,6 +370,7 @@ impl RunError {
             | RunError::Vtable { ref function, .. }
             | RunError::MainShape { main: ref function, .. }
             | RunError::NoHost { start: ref function }
+            | RunError::NoArgs { start: ref function }
             | RunError::OwnProcess { start: ref function }
             | RunError::UnwindRaised { ref function }
             | RunError::ConstAt { ref function, .. }
@@ -365,6 +389,8 @@ impl RunError {
             | RunError::Manifest { .. }
             | RunError::StaticFn { .. }
             | RunError::Trapped { .. }
+            | RunError::Roots(_)
+            | RunError::Args(_)
             | RunError::Names { .. } => None,
         }
     }
@@ -388,6 +414,12 @@ struct Bodies<'a> {
     coroutines: crate::front2::coroutines::Coroutines,
     /// What [`FrontAdts`]'s `overflow_checks` answers: the build's caller's setting (D101).
     overflow: OverflowChecks,
+    /// What [`FrontAdts`]'s `panic` answers: on the record path the program's strategy (the
+    /// key's, from which its inputs were made); Abort on the in-process paths (D91).
+    panic: blaze_build::Panic,
+    /// The build's allocator, handed down from its caller: the scratch of [`FrontAdts`]'s
+    /// answers (an opaque type's hidden type, a promoted fn's key).
+    alloc: Alloc<'static>,
 }
 
 /// One built coroutine instance, its three functions kept until each one's slot is reached
@@ -412,16 +444,21 @@ struct ClosureTable {
 }
 
 impl ClosureTable {
-    fn of<P: FrontEnd>(program: &P, checked: &[Option<Checked<'static>>]) -> ClosureTable {
-        let mut tys = PortableTys::new_in(Alloc::global());
+    /// `alloc` holds the table's types for the build that keeps it, and each closure's scratch.
+    fn of<P: FrontEnd>(program: &P, checked: &[Option<Checked<'static>>], alloc: Alloc<'static>) -> ClosureTable {
+        let mut tys = PortableTys::new_in(alloc);
         let mut rows = Vec::new_in(Global);
+        let types = program.types();
         for (i, done) in checked.iter().enumerate() {
             let Some(done) = done else { continue };
             let sig = program.sig(i);
             let generics = sig.parent_count + sig.own_count;
-            let owner = program.function(i).key;
+            let function = program.function(i);
+            let owner = function.key;
+            let Some((body, _)) = function.body else { continue };
+            let view = body.view(types);
             for ordinal in 0..done.closures.len() as u32 {
-                let facts = blaze_build::layout::closure_facts(done, ordinal, generics, &mut tys, Alloc::global());
+                let facts = blaze_build::layout::closure_facts(&view, done, ordinal, generics, &mut tys, alloc);
                 rows.push((owner, ordinal, facts));
             }
         }
@@ -455,26 +492,6 @@ fn closure_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, called: Instance, gr
         return None;
     }
     program.fn_index(of.owner)
-}
-
-/// The list a closure's `Fn*` method instance is keyed by: its owner's arguments first (so the
-/// owner's projections normalize at them), then the method as a `FnDef`, then the instance's
-/// own arguments (the closure and its argument tuple). Never equal to an owner's own list: it
-/// is longer, and the count is hashed.
-fn closure_key_args(instance: Instance, ground: &mut PortableTys<'_>) -> Result<List, BuildError> {
-    let malformed = |_| BuildError::Malformed { what: "a closure instance's arguments past the ground table" };
-    let full = |_| BuildError::Malformed { what: "the ground table is full" };
-    let own: Vec<PTy, Global> = {
-        let mut v = Vec::new_in(Global);
-        v.extend_from_slice(ground.view().list(instance.args).map_err(malformed)?);
-        v
-    };
-    let of = own.first().and_then(|&t| blaze_build::closure_of(ground.view(), t)).ok_or(BuildError::Malformed { what: "a closure method instance whose self is not a closure" })?;
-    let mut all: Vec<PTy, Global> = Vec::new_in(Global);
-    all.extend_from_slice(ground.view().list(of.owner_args).map_err(malformed)?);
-    all.push(ground.intern(PNode::FnDef(instance.item, List::EMPTY)).map_err(full)?);
-    all.extend_from_slice(&own);
-    ground.intern_list(&all).map_err(full)
 }
 
 /// The lang ADTs the builder asks for ([`blaze_build::Adts::lang_adt`]), asked of the front end
@@ -568,12 +585,18 @@ impl<P: FrontEnd> ConstWorld for FrontConsts<'_, P> {
     fn explicit_discriminant(&self, _: ItemKey, _: u32) -> Option<ItemKey> {
         None
     }
+
+    /// The item [`FrontAdts`]'s `fn_trait_method` answers the builder: the program's lang
+    /// trait's method, by the one map (front2/langs.rs `fn_trait_method`).
+    fn fn_trait_method(&self, which: blaze_build::FnTrait) -> Option<ItemKey> {
+        let (lang, name) = crate::front2::langs::fn_trait_method(which);
+        self.program.lang_trait_fn(lang, name)
+    }
 }
 
 /// Every `const` item's value, evaluated once each with what it reads settled first, as the
 /// build reads it: the record's bytes in the build's allocator.
-fn eval_consts<P: FrontEnd>(program: &P, checked: &[Option<Checked<'static>>]) -> Result<Vec<(ItemKey, DataRecord<Global>), Global>, RunError> {
-    let alloc = Alloc::global();
+fn eval_consts<P: FrontEnd>(program: &P, checked: &[Option<Checked<'static>>], alloc: Alloc<'static>) -> Result<Vec<(ItemKey, DataRecord<Global>), Global>, RunError> {
     let mut world = FrontConsts { program, checked, store: Vec::new_in(Global) };
     let mut ground = PortableTys::new_in(alloc);
     let mut layout = Layouts::new_in(alloc);
@@ -640,7 +663,8 @@ pub(crate) fn condition_holds(program: &Front<'_>, cond: ItemKey, args: &[PTy], 
 }
 
 fn settle_condition(program: &Front<'_>, cond: ItemKey, args: &[PTy], types: PTys<'_>) -> Option<bool> {
-    let alloc = Alloc::global();
+    // The program's own allocator: the condition's scratch lives no longer than the program.
+    let alloc = program.alloc;
     let mut ground = PortableTys::new_in(alloc);
     let args = ground_list(&mut ground, args, types)?;
     let mut checked = Vec::with_capacity_in(program.fns.len(), Global);
@@ -690,8 +714,8 @@ fn check_for_condition(program: &Front<'_>, j: usize) -> Option<Checked<'static>
     let body = program.fns[j].body.as_ref()?;
     let view = body.body.view(program.tys.view());
     let world = program.nested_world(j);
-    let mut cx = InferCtx::new_in(Alloc::global());
-    match blaze_typeck::check(&view, &world, &mut cx, &Needs::new_in(Alloc::global()), Alloc::global()) {
+    let mut cx = InferCtx::new_in(program.alloc);
+    match blaze_typeck::check(&view, &world, &mut cx, &Needs::new_in(program.alloc), program.alloc) {
         Ok(Outcome::Done(done)) if done.diags.is_empty() => Some(done),
         _ => None,
     }
@@ -797,7 +821,7 @@ impl<P: FrontEnd> LayoutFacts for FrontAdts<'_, P> {
     }
 
     fn opaque_hidden(&self, opaque: ItemKey, args: &[PTy], ground: &mut PortableTys<'_>) -> Result<PTy, BuildError> {
-        crate::front2::coroutines::opaque_hidden(self.0, self.4.checked, self, opaque, args, ground, Alloc::global())
+        crate::front2::coroutines::opaque_hidden(self.0, self.4.checked, self, opaque, args, ground, self.4.alloc)
     }
 }
 
@@ -808,6 +832,10 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
 
     fn overflow_checks(&self) -> OverflowChecks {
         self.4.overflow
+    }
+
+    fn panic(&self) -> blaze_build::Panic {
+        self.4.panic
     }
 
     fn facts(&self) -> &dyn LayoutFacts {
@@ -873,13 +901,11 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
         self.0.str_pat(owner, pat)
     }
 
-    /// The `Fn*` lang traits' methods, as looked up when the program was made.
+    /// The `Fn*` lang traits' methods, as looked up when the program was made (the one map,
+    /// front2/langs.rs `fn_trait_method`).
     fn fn_trait_method(&self, which: blaze_build::FnTrait) -> Option<ItemKey> {
-        match which {
-            blaze_build::FnTrait::Fn => self.0.lang_trait_fn(LangItem::Fn, "call"),
-            blaze_build::FnTrait::FnMut => self.0.lang_trait_fn(LangItem::FnMut, "call_mut"),
-            blaze_build::FnTrait::FnOnce => self.0.lang_trait_fn(LangItem::FnOnce, "call_once"),
-        }
+        let (lang, name) = crate::front2::langs::fn_trait_method(which);
+        self.0.lang_trait_fn(lang, name)
     }
 
     fn lang_fn(&self, name: &str) -> Option<ItemKey> {
@@ -951,8 +977,38 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
         self.0.nounwind(owner)
     }
 
+    /// Held at `None` ("not said": no hidden location is passed, so every call builds as an
+    /// untracked one). A call of a tracked fn from an untracked one makes a `Location` row whose
+    /// line and column are source positions; the literal-word form places them (place.rs
+    /// `resolve_positions`, `FrontEnd::source_position`), but the code record form
+    /// (blaze-emit pass/sites.rs `RECORD_POSITION`) and the LLVM tier refuse such a row, and
+    /// the record walk shares these answers: answering now would stop every record walk that
+    /// reaches `panic_bounds_check`, the overflow panics, `unwrap` or `expect`. Once
+    /// `blaze_code::record::CodeRecord` carries a position field, the answer is
+    /// `self.0.track_caller(instance.item)`: the fn's own attribute, or its trait's
+    /// declaration's for a trait impl's method, one per item.
+    fn track_caller(&self, instance: Instance, _ground: &mut PortableTys<'_>) -> Option<bool> {
+        let _ = instance;
+        None
+    }
+
+    /// The library's `#[lang = "panic_location"]` struct (core/src/panic/location.rs).
+    fn location_adt(&self) -> Option<ItemKey> {
+        self.0.lang_named("panic_location")
+    }
+
+    /// From the front end (`FrontEnd::caller_site`): item-relative, never a line (rule 71).
+    fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Option<blaze_build::CallerSite<'_>> {
+        self.0.caller_site(owner, expr)
+    }
+
     fn c_variadic(&self, item: ItemKey) -> Option<u32> {
         self.0.c_variadic(item)
+    }
+
+    /// From the fn's head (`FnHead::legacy_const_generics`, front2 heads.rs).
+    fn legacy_const_generics(&self, item: ItemKey) -> &[u32] {
+        self.0.legacy_const_generics(item)
     }
 
     fn static_item(&self, item: ItemKey) -> Option<StaticItem> {
@@ -973,9 +1029,9 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
     /// instance. front2 makes no record at no arguments for a path with arguments
     /// (program.rs `const_values`): there the table is the only answer.
     fn const_value(&self, item: ItemKey, args: &[PTy]) -> Option<&DataRecord<Global>> {
-        if !args.is_empty()
-            && let Some(record) = self.4.const_at.get(crate::front2::const_at::ConstNeed::Item(item), args)
-        {
+        // A pulled row first, at no arguments too: a non-generic ADT's field default (RFC
+        // 3681) is pulled at no arguments (const_at.rs `needs_of`) and has no program record.
+        if let Some(record) = self.4.const_at.get(crate::front2::const_at::ConstNeed::Item(item), args) {
             return Some(record);
         }
         match self.0.const_record(item) {
@@ -989,6 +1045,54 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
     /// arguments, so `const { size_of::<T>() }` at `u64` and at `u16` are two rows.
     fn const_block_value(&self, owner: ItemKey, block: blaze_typeck::ExprId, args: &[PTy]) -> Option<&DataRecord<Global>> {
         self.4.const_at.get(crate::front2::const_at::ConstNeed::Block { owner, block }, args)
+    }
+
+    /// Promoted borrow `borrow` of `owner` at the instance's ground arguments `args`: the
+    /// operand's value pulled before the instance's walk (front2/const_at.rs
+    /// `ConstNeed::Promoted`), as a const block's is.
+    fn promoted_value(&self, owner: ItemKey, borrow: blaze_typeck::ExprId, args: &[PTy]) -> Option<&DataRecord<Global>> {
+        self.4.const_at.get(crate::front2::const_at::ConstNeed::Promoted { owner, borrow }, args)
+    }
+
+    /// A plain fn item's instance key exactly as the build loop keys it (`key_of` in
+    /// [`build_from`]: the item's code identity, `FrontEnd::code_of`, the identity the
+    /// evaluator's fn pointers take, consts.rs `item_code_id`; then the arguments and what the
+    /// fn's projections normalize to there). A promoted operand names only fn items by path
+    /// (blaze-build walk/promote.rs), never a closure's or a shim's instance.
+    fn promoted_fn_key(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<InstanceKey> {
+        let c = self.0.fn_index(instance.item)?;
+        if self.0.function(c).key != instance.item {
+            return None;
+        }
+        let from = self.4.checked.get(c).and_then(Option::as_ref).map_or(PTys::EMPTY, |d| d.types.view());
+        blaze_build::instance_key_normalized(self.0.code_of(c), instance.args, from, ground, self, self.4.alloc).ok()
+    }
+
+    /// The fn instance a constant's record names by key (`DataTarget::Fn(key)`: `const F: fn()
+    /// -> i32 = seven;`). The evaluator keyed it over the fn's code identity (consts.rs
+    /// `item_code_id`, which `FrontEnd::code_of` gives too) at its ground arguments, a hash
+    /// with no inverse here: the candidates are the program's non-generic fns with a checked
+    /// body, each keyed exactly as [`Adts::promoted_fn_key`] and the build loop key it, in the
+    /// program's order (as [`build_from`] finds a static's fn targets); the first equal key is
+    /// the answer. The walk files it in `Built::refs`, which the loop reaches like any callee.
+    /// A fn whose key cannot be made is no record's target (the evaluator made a key for each
+    /// target). Not found here, and refused by the walk naming the key
+    /// (`BuildError::NoConstFnInstance`): a generic instance (`const F: fn() = f::<u8>;`) and a
+    /// closure's `call_once` (the evaluator would have to say which instance it keyed).
+    fn const_fn_instance(&self, key: InstanceKey, ground: &mut PortableTys<'_>) -> Option<Instance> {
+        for c in 0..self.0.fn_count() {
+            let function = self.0.function(c);
+            let sig = self.0.sig(c);
+            if function.body.is_none() || sig.parent_count != 0 || sig.own_count != 0 {
+                continue;
+            }
+            let Some(done) = self.4.checked.get(c).and_then(Option::as_ref) else { continue };
+            let made = blaze_build::instance_key_normalized(self.0.code_of(c), List::EMPTY, done.types.view(), ground, self, self.4.alloc);
+            if made.ok() == Some(key) {
+                return Some(Instance { item: function.key, args: List::EMPTY });
+            }
+        }
+        None
     }
 
     fn intrinsic(&self, item: ItemKey) -> Option<Intrinsic> {
@@ -1018,7 +1122,8 @@ pub fn plain(files: &[SourceFile<'_>], refusals: &[Refusal]) -> std::string::Str
     text
 }
 
-/// How `main` is called, from its signature: `fn main()` or `extern "C" fn main() -> i32`.
+/// How `main` is called, from its signature: `fn main()`, `extern "C" fn main() -> i32`, a C
+/// `extern "C" fn main(argc: i32, argv: *const *const c_char) -> i32`, or bstd's hosted entry.
 fn entry_shape<P: FrontEnd>(program: &P, main: usize) -> Result<Start, RunError> {
     let sig = program.sig(main);
     let row = program.function(main);
@@ -1027,7 +1132,9 @@ fn entry_shape<P: FrontEnd>(program: &P, main: usize) -> Result<Start, RunError>
     let returns_i32 = matches!(node(sig.output), Some(PNode::Int(blaze_typeck::IntTy::I32)));
     // A Rust-edition root: `fn main() -> T` starts through `lang_start::<T>`, called by the C
     // entry shim (blaze-build start.rs); `T: Termination` is the check's. The Reference,
-    // "Crates and source files": "it must take no arguments".
+    // "Crates and source files": "it must take no arguments". `rust_start` is `Some` exactly
+    // when front2's start rule (`front2::program::start_of`) answered `LangStart`: the rule
+    // [`entry_start`] asks before anything is built, so `blaze run` never builds this here.
     if program.rust_start().is_some() {
         if !sig.inputs.is_empty() {
             return Err(shape("a Rust program's `main` takes no arguments (the Reference, \"Crates and source files\")"));
@@ -1041,8 +1148,31 @@ fn entry_shape<P: FrontEnd>(program: &P, main: usize) -> Result<Start, RunError>
             _ => Err(shape("bstd's hosted entry is `extern \"C\" fn(*const HostTable) -> i32`")),
         };
     }
-    if !sig.inputs.is_empty() {
-        return Err(shape("it takes parameters (argc and argv are not passed yet)"));
+    // A C `main` of its command line (C17 5.1.2.2.1: `int main(int argc, char *argv[])`):
+    // called with the run's argument vector (crate::argv), the one a hosted program's `args`
+    // grant reads. `c_char` is `i8` on arm64 macOS and `u8` on arm64 Linux (core::ffi's alias
+    // resolves to the integer), so both are taken; either mutability at each level (`char **`
+    // is `*mut *mut c_char`; the call passes the same address). Any other list is refused by
+    // name: no start passes it.
+    match sig.inputs {
+        [] => {}
+        [argc, argv] => {
+            let is_argc = matches!(node(*argc), Some(PNode::Int(blaze_typeck::IntTy::I32)));
+            let is_argv = match node(*argv) {
+                Some(PNode::Ptr(_, inner)) => match node(*inner) {
+                    Some(PNode::Ptr(_, ch)) => matches!(node(*ch), Some(PNode::Int(blaze_typeck::IntTy::I8) | PNode::Uint(blaze_typeck::UintTy::U8))),
+                    _ => false,
+                },
+                _ => false,
+            };
+            return match (is_argc && is_argv, row.abi, returns_i32) {
+                (false, _, _) => Err(shape("its two parameters are not `(argc: i32, argv: *const *const c_char)`")),
+                (true, Abi::C, true) => Ok(Start::Main),
+                (true, Abi::C, false) => Err(shape("it takes `argc` and `argv` and does not return `i32`, as a C `main` does")),
+                (true, _, _) => Err(shape("it takes `argc` and `argv` but is not `extern \"C\"`; write `extern \"C\"` and `#![no_main]`")),
+            };
+        }
+        _ => return Err(shape("its parameters are neither none nor `(argc: i32, argv: *const *const c_char)`")),
     }
     match node(sig.output) {
         Some(PNode::Tuple(list)) if list.len == 0 => Ok(Start::Plain(Entry::Unit)),
@@ -1059,6 +1189,8 @@ fn entry_shape<P: FrontEnd>(program: &P, main: usize) -> Result<Start, RunError>
 pub enum Start {
     Plain(Entry),
     Hosted,
+    /// A C `main(argc, argv)`: called with the run's argument vector ([`Given::args`]).
+    Main,
 }
 
 /// A program built and ready to place: each reached instance's code, the entry's first.
@@ -1097,6 +1229,13 @@ impl Built {
     /// The instances the entry reaches, built or stubbed.
     pub fn reached(&self) -> u32 {
         self.reached
+    }
+
+    /// Slot `slot`'s code as placement binds it: its record id (place.rs `place`) and its bytes,
+    /// source position fields zero; `None` for a slot past the bodies.
+    pub fn code_record(&self, slot: usize) -> Option<(blaze_launch::wire::RecordId, &[u8])> {
+        let body = self.bodies.get(slot)?;
+        Some((place::record_id(&body.code), &body.code.bytes))
     }
 }
 
@@ -1233,8 +1372,8 @@ pub struct NewFront<'a> {
 /// [`run`] through the front end `choice` names.
 pub fn run_with(files: &[SourceFile<'_>], root: &str, host: Option<NonNull<c_void>>, choice: FrontChoice<'_>, alloc: blaze_own::SharedAlloc<'static>) -> Result<u8, RunError> {
     let built = match choice {
-        FrontChoice::Old(overflow) => build(files, root, overflow)?,
-        FrontChoice::New(new) => build_new(files, root, new)?,
+        FrontChoice::Old(overflow) => build(files, root, overflow, alloc.local())?,
+        FrontChoice::New(new) => build_new(files, root, new, alloc.local())?,
     };
     run_built(built, host, alloc)
 }
@@ -1248,14 +1387,37 @@ pub fn run_built(built: Built, host: Option<NonNull<c_void>>, alloc: blaze_own::
 /// [`run_built`], with the count of instances not built; a called stub is
 /// [`RunError::NotBuilt`] with that instance's refusal. A trap's names are kept in `alloc`, the
 /// caller's (D102: no allocator is fetched here).
-pub fn ran_built(mut built: Built, host: Option<NonNull<c_void>>, alloc: blaze_own::SharedAlloc<'static>) -> Result<Ran, RunError> {
-    let entry = match (built.start, host) {
+pub fn ran_built(built: Built, host: Option<NonNull<c_void>>, alloc: blaze_own::SharedAlloc<'static>) -> Result<Ran, RunError> {
+    ran_built_given(built, Given { host, args: None }, alloc)
+}
+
+/// What a run gives the program to start with (run.md, "What a program is given"): the host's
+/// table, for bstd's hosted entry, and the command line's C form, for a C `main(argc, argv)`.
+/// Both come from one command line: the caller makes its `Argv` (crate::argv) once, hands the
+/// host `Argv::strings` and this `Argv::c`. An entry that needs one that is `None` is refused
+/// by name ([`RunError::NoHost`], [`RunError::NoArgs`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Given {
+    /// bstd's `wire::HostTable`, alive until the run returns (the caller holds its `Hosting`).
+    pub host: Option<NonNull<c_void>>,
+    /// The program's `argc` and `argv`, alive until the run returns (the caller holds the
+    /// `Argv` they point into).
+    pub args: Option<crate::argv::CArgs>,
+}
+
+/// [`ran_built`], given the host's table and the command line ([`Given`]).
+pub fn ran_built_given(mut built: Built, given: Given, alloc: blaze_own::SharedAlloc<'static>) -> Result<Ran, RunError> {
+    let entry = match (built.start, given.host, given.args) {
         // L1b: a Rust-edition program never runs inside blaze's process (its `process::exit`
-        // would end blaze, and its argv would be blaze's own): run.md piece 6.
-        (Start::Plain(Entry::CMainShim), _) => return Err(RunError::OwnProcess { start: built.start_fn }),
-        (Start::Plain(entry), _) => entry,
-        (Start::Hosted, Some(table)) => Entry::Hosted(table),
-        (Start::Hosted, None) => return Err(RunError::NoHost { start: built.start_fn }),
+        // would end blaze, and its argv would be blaze's own): run.md piece 6. `blaze run`
+        // decides that before building ([`entry_start`]) and never hands one here; a caller
+        // that does is refused by name, never placed.
+        (Start::Plain(Entry::CMainShim), _, _) => return Err(RunError::OwnProcess { start: built.start_fn }),
+        (Start::Plain(entry), _, _) => entry,
+        (Start::Hosted, Some(table), _) => Entry::Hosted(table),
+        (Start::Hosted, None, _) => return Err(RunError::NoHost { start: built.start_fn }),
+        (Start::Main, _, Some(args)) => Entry::Main(args),
+        (Start::Main, _, None) => return Err(RunError::NoArgs { start: built.start_fn }),
     };
     let image = match &built.image {
         Some(image) => Some((image, place::load_statics(image).map_err(RunError::Place)?)),
@@ -1300,17 +1462,18 @@ pub fn ran_built(mut built: Built, host: Option<NonNull<c_void>>, alloc: blaze_o
 /// What `blaze run` refuses of the program of `files`, every stage up to placing: empty when
 /// it would place and call `main`. blaze-cli's findings path calls this, and [`run`] stops at
 /// the same refusals, so the two cannot disagree (rule 30). Each stage stops at its first.
-pub fn refusals(files: &[SourceFile<'_>], root: &str, overflow: OverflowChecks) -> Vec<Refusal, Global> {
-    findings(files, root, overflow).0
+/// `alloc` is the caller's, handed down from its entry: the program's records live in it.
+pub fn refusals(files: &[SourceFile<'_>], root: &str, overflow: OverflowChecks, alloc: Alloc<'static>) -> Vec<Refusal, Global> {
+    findings(files, root, overflow, alloc).0
 }
 
 /// [`refusals`], and the `blaze::` attributes the front end read: the advice about unknown
 /// names and the count nothing checks ([`BlazeAttrs::note`]). `blaze check`'s call.
 /// `overflow` is the setting `blaze run` would build with: with it on, an integer `+` needs
 /// core's `panic_const_add_overflow`, so the refusals can differ.
-pub fn findings(files: &[SourceFile<'_>], root: &str, overflow: OverflowChecks) -> (Vec<Refusal, Global>, BlazeAttrs) {
+pub fn findings(files: &[SourceFile<'_>], root: &str, overflow: OverflowChecks, alloc: Alloc<'static>) -> (Vec<Refusal, Global>, BlazeAttrs) {
     let mut blaze = BlazeAttrs::default();
-    let refusals = match build_noting(files, root, &mut blaze, overflow) {
+    let refusals = match build_noting(files, root, &mut blaze, overflow, alloc) {
         Ok(_) => Vec::new_in(Global),
         Err(error) => error.refusals(),
     };
@@ -1322,29 +1485,33 @@ pub fn findings(files: &[SourceFile<'_>], root: &str, overflow: OverflowChecks) 
 /// Every body is checked once, generically. Instances are then built from `main` forward:
 /// slot `n` is the `n`th instance reached, and only reached instances are built (a generic fn
 /// once per list of ground arguments, an unreached fn never).
-pub fn build(files: &[SourceFile<'_>], root: &str, overflow: OverflowChecks) -> Result<Built, RunError> {
-    build_noting(files, root, &mut BlazeAttrs::default(), overflow)
+/// `alloc` is the caller's, handed down from its entry: the build's tables live in it.
+pub fn build(files: &[SourceFile<'_>], root: &str, overflow: OverflowChecks, alloc: Alloc<'static>) -> Result<Built, RunError> {
+    build_noting(files, root, &mut BlazeAttrs::default(), overflow, alloc)
 }
 
 /// [`build`] through the new front end: the program's names resolved by the names library over
 /// the toolchain `new` names, then front2's answers to the back half.
-pub fn build_new(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>) -> Result<Built, RunError> {
-    let tc = crate::library_set::toolchain_for(files, root, new, Alloc::global())?;
-    let texts = ProgramTexts::new(files, root, new, &tc)?;
+pub fn build_new(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>, alloc: Alloc<'static>) -> Result<Built, RunError> {
+    // The in-process path (D91): the program's inputs say Unwind, Rust's default, so std binds
+    // panic_unwind and a raise stops at D91's `UnwindRaised`; the code is built Abort.
+    let panic = blaze_build::Panic::Unwind;
+    let tc = crate::library_set::toolchain_for(files, root, new, panic, alloc)?;
+    let texts = ProgramTexts::new(files, root, new, &tc, panic)?;
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).map_err(RunError::Crates)?;
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).map_err(|e| RunError::Names { shown: std::format!("{e}").into_boxed_str() })?;
-    build_over(&names, files, &texts)
+    let names = inputs.resolve(&crates, alloc).map_err(|e| RunError::Names { shown: std::format!("{e}").into_boxed_str() })?;
+    build_over(&names, files, &texts, alloc)
 }
 
 /// [`build_new`] from the program's names on: front2's answers to the back half over `names`
 /// (the program's crate at index 0, resolved from `texts`). For a caller that resolved the
 /// names itself (examples/front2_rungs.rs: the toolchain library once, `crates::library`).
-pub fn build_over(names: &blaze_scope::resolve::Names<'_>, files: &[SourceFile<'_>], texts: &ProgramTexts) -> Result<Built, RunError> {
+pub fn build_over(names: &blaze_scope::resolve::Names<'_>, files: &[SourceFile<'_>], texts: &ProgramTexts, alloc: Alloc<'static>) -> Result<Built, RunError> {
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).map_err(|e| RunError::Names { shown: std::format!("the command's frame: {e}").into_boxed_str() })?;
-    let mut program = Front2Program::new(names, &frame, files).map_err(RunError::Front2)?;
-    build_with(&mut program, texts.overflow)
+    let mut program = Front2Program::new(names, &frame, files, alloc).map_err(RunError::Front2)?;
+    build_with(&mut program, texts.overflow, alloc)
 }
 
 /// `blaze run`'s call on the new front end: the program of `files` built with a STUB for each
@@ -1352,14 +1519,66 @@ pub fn build_over(names: &blaze_scope::resolve::Names<'_>, files: &[SourceFile<'
 /// called. `Ok` is the program's own status with the two counts the command's closing note
 /// prints ([`Ran`]); a called stub is [`RunError::NotBuilt`] naming that function's refusal.
 pub fn run_program(files: &[SourceFile<'_>], root: &str, host: Option<NonNull<c_void>>, new: NewFront<'_>, alloc: blaze_own::SharedAlloc<'static>) -> Result<Ran, RunError> {
-    let tc = crate::library_set::toolchain_for(files, root, new, Alloc::global())?;
-    let texts = ProgramTexts::new(files, root, new, &tc)?;
+    run_program_given(files, root, Given { host, args: None }, new, alloc)
+}
+
+/// `blaze run`'s first question of the program of `files` (crate root `root`, package `new`,
+/// built with the profile's `panic`): WHICH START it has, as the launcher's form
+/// ([`special::EntryForm`]), from the cheapest facts that decide it, before any body is
+/// lowered, checked or built. Every program runs in the launcher's child (run.md, "Every
+/// program runs in the child"); the form says how the child starts its entry.
+///
+/// One rule, [`crate::front2::program::start_of`] (through [`entry_start_of`]), so the run and
+/// the build cannot disagree:
+/// - the package's edition alone, first: a blaze edition's `std` is bstd, which links no
+///   `#[lang = "start"]` (start.rs `may_link_lang_start`), and its root's `fn main` is always
+///   expanded by `bstd::main` into the exported hosted entry (D104), so its form is
+///   [`special::EntryForm::Hosted`] with no file read and no name resolved (a root that exports
+///   none is refused by the walk's roots, `Front2Refusal::NoHostedStart`, never started);
+/// - otherwise the program's names, resolved as the run resolves them, and [`entry_start_of`]
+///   over them: crate 0's items (its exports), its root's attributes, the linked crates' lang
+///   rows, and for a Rust start `main`'s head (its return type is `lang_start`'s `T`).
+///
+/// `alloc` is the caller's, handed down from its entry: the names live in it for the call.
+pub fn entry_start(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>, panic: Panic, alloc: Alloc<'static>) -> Result<special::EntryForm, RunError> {
+    let edition = edition::PackageEdition::of_manifest(new.edition).map_err(|_| RunError::Edition { written: new.edition.into() })?;
+    if !crate::front2::start::may_link_lang_start(crate::crates::program_implicit(edition).std) {
+        return Ok(special::EntryForm::Hosted);
+    }
+    let tc = crate::library_set::toolchain_for(files, root, new, panic, alloc)?;
+    let texts = ProgramTexts::new(files, root, new, &tc, panic)?;
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).map_err(RunError::Crates)?;
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).map_err(|e| RunError::Names { shown: std::format!("{e}").into_boxed_str() })?;
-    let built = build_stubbed(&names, files, &texts)?;
-    ran_built(built, host, alloc)
+    let names = inputs.resolve(&crates, alloc).map_err(|e| RunError::Names { shown: std::format!("{e}").into_boxed_str() })?;
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).map_err(|e| RunError::Names { shown: std::format!("the command's frame: {e}").into_boxed_str() })?;
+    Ok(entry_start_of(&names, &frame, alloc, alloc)?.form)
+}
+
+/// The run's roots over any names source (run/special.rs [`special::roots`]): `blaze run`'s
+/// parent asks it over the names RECORDS with nothing solved (D124), [`entry_start`] over the
+/// solved names. `frame` and `tables` hold the head store `main`'s head is lowered in (for a
+/// Rust start); `alloc` holds the roots.
+pub fn entry_start_of<'n, 'a, S: crate::front2::source::NamesSource<'n>>(names: S, frame: &'n blaze_mem::Frame, tables: Alloc<'static>, alloc: Alloc<'a>) -> Result<special::Roots<'a>, RunError> {
+    special::roots(names, frame, tables, alloc).map_err(RunError::Roots)
+}
+
+/// [`run_program`], given the host's table and the command line ([`Given`]). The in-process
+/// run: `blaze run` no longer calls it (every program runs in the launcher's child, run.md
+/// "Every program runs in the child"); tests and examples still do, and it is deleted at the
+/// switch. Handed a Rust program with std, its build ends at
+/// [`ran_built_given`]'s typed refusal ([`RunError::OwnProcess`]): no caller hands it one.
+pub fn run_program_given(files: &[SourceFile<'_>], root: &str, given: Given, new: NewFront<'_>, alloc: blaze_own::SharedAlloc<'static>) -> Result<Ran, RunError> {
+    // The in-process path (D91), as [`build_new`]: inputs Unwind, code built Abort.
+    let panic = blaze_build::Panic::Unwind;
+    let tc = crate::library_set::toolchain_for(files, root, new, panic, alloc.local())?;
+    let texts = ProgramTexts::new(files, root, new, &tc, panic)?;
+    let user = texts.user();
+    let inputs = Inputs::new(&user, &tc).map_err(RunError::Crates)?;
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, alloc.local()).map_err(|e| RunError::Names { shown: std::format!("{e}").into_boxed_str() })?;
+    let built = build_stubbed(&names, files, &texts, alloc.local())?;
+    ran_built_given(built, given, alloc)
 }
 
 /// [`build_over`] for a run that starts although some reached function cannot be built: a
@@ -1376,16 +1595,16 @@ pub fn run_program(files: &[SourceFile<'_>], root: &str, host: Option<NonNull<c_
 /// not check (the strict front end names why), or a function or item of its own crate was left
 /// out ([`Front2Program::own_left_out`]). Only a library's function blaze cannot check or
 /// build is left behind a stub.
-pub fn build_stubbed(names: &blaze_scope::resolve::Names<'_>, files: &[SourceFile<'_>], texts: &ProgramTexts) -> Result<Built, RunError> {
+pub fn build_stubbed(names: &blaze_scope::resolve::Names<'_>, files: &[SourceFile<'_>], texts: &ProgramTexts, alloc: Alloc<'static>) -> Result<Built, RunError> {
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).map_err(|e| RunError::Names { shown: std::format!("the command's frame: {e}").into_boxed_str() })?;
     // The survey front leaves a fn it refuses out of the program (each caller's build then
     // names it: [`RunError::LeftOut`]); its list of them is the seam's `left_out`, read there.
     let mut left_out = Vec::new_in(Global);
-    let mut program = Front2Program::survey(names, &frame, files, &mut left_out).map_err(RunError::Front2)?;
+    let mut program = Front2Program::survey(names, &frame, files, &mut left_out, alloc).map_err(RunError::Front2)?;
     if program.entry().is_none() {
         // The entry did not check or could not be tabled: the strict front end stops at
         // exactly that, and its refusal is the answer.
-        return Err(match Front2Program::new(names, &frame, files) {
+        return Err(match Front2Program::new(names, &frame, files, alloc) {
             Err(refusal) => RunError::Front2(refusal),
             Ok(_) => RunError::NoMain,
         });
@@ -1393,26 +1612,30 @@ pub fn build_stubbed(names: &blaze_scope::resolve::Names<'_>, files: &[SourceFil
     if let Some((item, why)) = program.own_left_out() {
         return Err(RunError::Front2(Front2Refusal::OwnLeftOut { item, why }));
     }
-    let built = build_from(&mut program, None, None, true, texts.overflow)?;
+    // Placed in this process as literal-word code (place.rs), which carries no landing pads:
+    // built Abort, with D91's stop at a raise, until run.md piece 13 deletes this path.
+    let built = build_from(&mut program, None, None, true, texts.overflow, blaze_build::Panic::Abort, alloc)?;
     built.ok_or(RunError::NoMain)
 }
 
 /// [`build`], the `blaze::` attributes the front end read put in `blaze`.
-fn build_noting(files: &[SourceFile<'_>], root: &str, blaze: &mut BlazeAttrs, overflow: OverflowChecks) -> Result<Built, RunError> {
-    let mut program = Front::new(files, root, blaze).map_err(|refusal| {
+fn build_noting(files: &[SourceFile<'_>], root: &str, blaze: &mut BlazeAttrs, overflow: OverflowChecks, alloc: Alloc<'static>) -> Result<Built, RunError> {
+    let mut program = Front::new(files, root, blaze, alloc).map_err(|refusal| {
         let mut refusals = Vec::with_capacity_in(1, Global);
         refusals.push(refusal);
         let shown = plain(files, &refusals).into_boxed_str();
         RunError::Lower { refusals, shown }
     })?;
-    build_with(&mut program, overflow)
+    build_with(&mut program, overflow, alloc)
 }
 
 /// The back half over any front end (crate::seam): its bodies checked, consts and statics
 /// evaluated, instances built from the entry forward, emitted, with the profile's `overflow`.
-pub fn build_with<P: FrontEnd>(program: &mut P, overflow: OverflowChecks) -> Result<Built, RunError> {
-    // Only a survey goes on with no entry: a run's `None` is no `main`.
-    build_from(program, None, None, false, overflow)?.ok_or(RunError::NoMain)
+/// `alloc` is the caller's: the build's tables and scratch live in it.
+pub fn build_with<P: FrontEnd>(program: &mut P, overflow: OverflowChecks, alloc: Alloc<'static>) -> Result<Built, RunError> {
+    // Only a survey goes on with no entry: a run's `None` is no `main`. Placed in this process
+    // (place.rs): built Abort with D91's stop, until run.md piece 13 deletes this path.
+    build_from(program, None, None, false, overflow, blaze_build::Panic::Abort, alloc)?.ok_or(RunError::NoMain)
 }
 
 /// The run path's code records (code_records.rs; run.md pieces 3 and 7): every instance the
@@ -1423,29 +1646,34 @@ pub fn build_with<P: FrontEnd>(program: &mut P, overflow: OverflowChecks) -> Res
 /// the thread-local getter when the program has thread-locals: one function a program, made as
 /// its own record (`RecordRun::getter`) since no caller declares it. The program's vtables and
 /// statics are data, not records here: placed by the launcher's piece.
-/// The walk's overflow setting is the one the records are keyed by (`records.builder`).
-pub fn build_records<P: FrontEnd>(program: &mut P, records: &mut crate::code_records::RecordRun<'_>) -> Result<(), RunError> {
+/// The walk's overflow setting and panic strategy are the ones the records are keyed by
+/// (`records.builder`): the key is where the record path's strategy lives.
+pub fn build_records<P: FrontEnd>(program: &mut P, records: &mut crate::code_records::RecordRun<'_>, alloc: Alloc<'static>) -> Result<(), RunError> {
     let overflow = records.builder.settings.overflow_checks;
-    build_from(program, None, Some(records), false, overflow)?;
+    let panic = crate::panic_strategy::of_strategy(records.builder.settings.panic);
+    build_from(program, None, Some(records), false, overflow, panic, alloc)?;
     Ok(())
 }
 
 /// [`build_records`] over the new front end, the program read as [`build_new`] reads it: the
 /// run path of `blaze run` on front2 (run.md piece 3).
-pub fn build_records_new(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>, records: &mut crate::code_records::RecordRun<'_>) -> Result<(), RunError> {
+pub fn build_records_new(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>, records: &mut crate::code_records::RecordRun<'_>, alloc: Alloc<'static>) -> Result<(), RunError> {
     let key = records.builder.settings.overflow_checks;
     if new.overflow != key {
         return Err(RunError::OverflowDisagrees { walk: new.overflow, key });
     }
-    let tc = crate::library_set::toolchain_for(files, root, new, Alloc::global())?;
-    let texts = ProgramTexts::new(files, root, new, &tc)?;
+    // The record path: the program's inputs are made from the key's strategy, so the code and
+    // the key it is filed under cannot disagree (rule 21) and nothing compares two copies.
+    let panic = crate::panic_strategy::of_strategy(records.builder.settings.panic);
+    let tc = crate::library_set::toolchain_for(files, root, new, panic, alloc)?;
+    let texts = ProgramTexts::new(files, root, new, &tc, panic)?;
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).map_err(RunError::Crates)?;
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).map_err(|e| RunError::Names { shown: std::format!("{e}").into_boxed_str() })?;
+    let names = inputs.resolve(&crates, alloc).map_err(|e| RunError::Names { shown: std::format!("{e}").into_boxed_str() })?;
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).map_err(|e| RunError::Names { shown: std::format!("the command's frame: {e}").into_boxed_str() })?;
-    let mut program = Front2Program::new(&names, &frame, files).map_err(RunError::Front2)?;
-    build_records(&mut program, records)
+    let mut program = Front2Program::new(&names, &frame, files, alloc).map_err(RunError::Front2)?;
+    build_records(&mut program, records, alloc)
 }
 
 /// What [`build_survey`] tried: instances built clean, instances tried, and the generic fns no
@@ -1462,9 +1690,10 @@ pub struct SurveyCounts {
 /// is built as the run builds it, but a refusal (the builder's, a callee's resolution or
 /// absence, the emitter's) is filed in `refused` (the fn, the refusal's typed name) and the
 /// walk goes on, so one refusal hides nothing behind it but the callees of the refused fn.
-pub fn build_survey<P: FrontEnd>(program: &mut P, refused: &mut Vec<(Box<str>, Box<str>), Global>, overflow: OverflowChecks) -> Result<SurveyCounts, RunError> {
+pub fn build_survey<P: FrontEnd>(program: &mut P, refused: &mut Vec<(Box<str>, Box<str>), Global>, overflow: OverflowChecks, alloc: Alloc<'static>) -> Result<SurveyCounts, RunError> {
     let mut counts = SurveyCounts { built: 0, tried: 0, no_instance: Vec::new_in(Global) };
-    build_from(program, Some((refused, &mut counts)), None, false, overflow)?;
+    // As the in-process run builds (D91): Abort, until run.md piece 13.
+    build_from(program, Some((refused, &mut counts)), None, false, overflow, blaze_build::Panic::Abort, alloc)?;
     Ok(counts)
 }
 
@@ -1521,9 +1750,9 @@ fn filed(sink: &mut Sink<'_>, e: RunError) -> Result<(), RunError> {
         }
         // By the error's variant chain (`Check(Solve(Overflow`) and the callee's name, so each
         // cause at each trait fn is one class and the cause is not cut at its first field.
-        RunError::Resolve { function, callee, path, error } => {
+        RunError::Resolve { function, callee, path, at, error } => {
             let shown = path.as_deref().map_or_else(|| format!("{:#x}", callee.0), |p| format!("`{p}`"));
-            (function, format!("callee: resolve {}: {shown}", class_chain(&format!("{error:?}"), 3)).into_boxed_str())
+            (function, format!("callee: resolve {} at {at}: {shown}", class_chain(&format!("{error:?}"), 3)).into_boxed_str())
         }
         RunError::Vtable { function, why, .. } => (function, format!("vtable: {}", class_of(&format!("{why:?}"))).into_boxed_str()),
         _ => return Err(e),
@@ -1667,7 +1896,7 @@ impl Stubs {
         let mut targets = Vec::with_capacity_in(2, Global);
         targets.push(Target::Stops);
         targets.push(Target::Stop);
-        Some(Body { code, targets, statics: Vec::new_in(Global), tls: Vec::new_in(Global), vtables: Vec::new_in(Global) })
+        Some(Body { code, targets, statics: Vec::new_in(Global), tls: Vec::new_in(Global), vtables: Vec::new_in(Global), positions: Vec::new_in(Global) })
     }
 }
 
@@ -1728,6 +1957,10 @@ fn build_from<P: FrontEnd>(
     mut records: Option<&mut crate::code_records::RecordRun<'_>>,
     stub_refusals: bool,
     overflow: OverflowChecks,
+    panic: blaze_build::Panic,
+    // The caller's, for the build's tables (ground types, layouts, closures, coroutines) and
+    // each instance's scratch: none outlives the build.
+    alloc: Alloc<'static>,
 ) -> Result<Option<Built>, RunError> {
     let (survey, mut counts) = match surveyed {
         Some((refused, counts)) => (Some(refused), Some(counts)),
@@ -1759,24 +1992,26 @@ fn build_from<P: FrontEnd>(
     // borrow of it, taken again in each step of the loop and after it.
     let program_mut = program;
     let program = &*program_mut;
-    let consts = eval_consts(program, &checked)?;
+    let consts = eval_consts(program, &checked, alloc)?;
     let langs = BackLangs::of(program)?;
     let (image, mut tls_vars) = static_image(program, &consts, survey.survey.as_deref_mut())?;
     // The rows the descriptor holds: a thread-local first numbered past them has none.
     let tls_rows = tls_vars.as_ref().map_or(0, TlsVars::len);
-    let mut ground = PortableTys::new_in(Alloc::global());
+    let mut ground = PortableTys::new_in(alloc);
     // An item's code identity, until the item layer's records give one (shortcuts 2 and 12): its
     // key and its item's text. Never stale; coarse only in that a signature edit changes it too.
     // The key covers what each projection of the fn's checked types normalizes to at the
     // instance (`instance_key_normalized`): two instances that differ only there never share
     // one. A closure's `Fn*` method instance keys its owner's code at the owner's arguments,
-    // then the method and the instance's own arguments ([`closure_key_args`]).
+    // then the method and the instance's own arguments (`blaze_build::closure_method_key_args`).
     let mut checked_bodies = Bodies {
         checked: &checked,
-        closures: ClosureTable::of(program, &checked),
-        coroutines: crate::front2::coroutines::Coroutines::of(program, &checked, Alloc::global()),
+        closures: ClosureTable::of(program, &checked, alloc),
+        coroutines: crate::front2::coroutines::Coroutines::of(program, &checked, alloc),
         const_at: crate::front2::const_at::ConstTable::new_in(Global),
         overflow,
+        panic,
+        alloc,
     };
     // Each coroutine instance built, its three functions waiting for their slots.
     let mut coroutine_stash: Vec<BuiltParts, Global> = Vec::new_in(Global);
@@ -1795,13 +2030,13 @@ fn build_from<P: FrontEnd>(
             instance.args
         } else if crate::front2::coroutines::self_is_coroutine(instance, ground) {
             // One of a coroutine's three functions, tabled as its owner (front2/coroutines.rs).
-            crate::front2::coroutines::key_args(instance, ground, Alloc::global()).map_err(fail)?
+            crate::front2::coroutines::key_args(instance, ground, alloc).map_err(fail)?
         } else if crate::fn_shim::self_is_fn(instance, ground) {
             crate::fn_shim::fn_shim_key_args(instance, ground).map_err(fail)?
         } else {
-            closure_key_args(instance, ground).map_err(fail)?
+            blaze_build::closure_method_key_args(instance, ground, alloc).map_err(fail)?
         };
-        blaze_build::instance_key_normalized(code, args, from, ground, facts, Alloc::global()).map_err(fail)
+        blaze_build::instance_key_normalized(code, args, from, ground, facts, alloc).map_err(fail)
     };
     let key_of = |program: &P, c: usize, instance: Instance, ground: &mut PortableTys<'_>, facts: &dyn LayoutFacts| key_with(program, program.code_of(c), c, instance, ground, facts);
     let keyer = FrontAdts(program, entry.unwrap_or(0), &consts, &langs, &checked_bodies);
@@ -1814,7 +2049,7 @@ fn build_from<P: FrontEnd>(
         pre_taken: 0,
     };
     let mut tables = Tables { refs: Vec::new_in(Global), images: Vec::new_in(Global) };
-    let mut layouts = Layouts::new_in(Alloc::global());
+    let mut layouts = Layouts::new_in(alloc);
     if let Some(main) = entry {
         reached.instances.push(Instance { item: program.function(main).key, args: List::EMPTY });
         reached.tabled.push(main);
@@ -1917,7 +2152,17 @@ fn build_from<P: FrontEnd>(
         let i = reached.tabled[at - 1];
         let function = program.function(i);
         let name = || function.named();
-        let (Some((body, _)), Some(done)) = (function.body, checked[i].as_ref()) else {
+        // A tuple struct's or variant's ctor, tabled with no body: the function the language
+        // makes for its name as a value (blaze-build ctor_fn.rs), its own instance or its `Fn*`
+        // shim's (fn_shim.rs tables a fn item's shim at the item's row). Its variant.
+        let ctor_row = match (function.kind, function.body) {
+            (FnKind::Ctor, None) => program.ctor_of(function.key).map(|(_, variant)| variant),
+            _ => None,
+        };
+        let (body, done) = match (function.body, checked[i].as_ref()) {
+            (Some((body, _)), Some(done)) => (Some(body), Some(done)),
+            _ if ctor_row.is_some() => (None, None),
+            _ => {
             let refusal = callee_refusal(&*program, name(), instance.args, instance, crate::callee_shown::CalleeGap::NoBody, ground.view());
             // A survey files it (by the fn and the callee) and goes on, as its doc promises; a
             // run and the stub build stop here as before.
@@ -1926,61 +2171,44 @@ fn build_from<P: FrontEnd>(
                 continue;
             }
             return Err(refusal);
+            }
         };
-        // The record walk (`build_records`): the instance's full key, before the work. Found in
-        // the store, the instances its entry declares are what the walk goes on to, and
-        // nothing is built.
+        // The record walk (`build_records`): the instance's full key, before the work. Its entry
+        // is looked up once this instance's constants are pulled (below), so its read list can
+        // be asked again.
         let record_key = match records.as_deref() {
             None => None,
             Some(run) => {
                 let fail = |error| RunError::CodeRecord { function: name(), error };
-                let symbol = crate::symbols::fn_symbol(instance.item, instance.args, ground.view(), Alloc::global())
+                let symbol = crate::symbols::fn_symbol(instance.item, instance.args, ground.view(), alloc)
                     .map_err(|e| fail(crate::code_records::CodeRecordError::Symbol(e)))?;
-                let reads = program.body_reads(i, done).ok_or_else(|| fail(crate::code_records::CodeRecordError::NoReads { item: function.key }))?;
-                let body_digest = crate::code_records::body_digest(function.text, Some(reads));
+                // A ctor row has no body, so no read list: its code is its fields' layout, which
+                // the ground facts below key.
+                let reads = match done {
+                    Some(done) => Some(program.body_reads(i, done).ok_or_else(|| fail(crate::code_records::CodeRecordError::NoReads { item: function.key }))?),
+                    None => None,
+                };
+                let body_digest = crate::code_records::body_digest(function.text, reads);
                 let facts = key_with(program, crate::symbols::item_identity(function.key), i, instance, &mut ground, &keyer)?;
                 let parts = crate::code_records::KeyParts { symbol, body: body_digest, ground: facts.0 };
                 Some((parts, crate::code_records::code_key(&parts, &run.builder)))
             }
         };
-        if let (Some(run), Some((parts, key))) = (records.as_deref_mut(), record_key) {
-            use crate::code_records::CodeRecordError;
-            let fail = |error| RunError::CodeRecord { function: name(), error };
-            let mut declared: Vec<(ItemKey, Instance), Global> = Vec::new_in(Global);
-            let found = run.store.get(key).map_err(|e| fail(CodeRecordError::Store(e)))?;
-            if let Some(bytes) = found {
-                let entry = crate::code_records::EntryView::read(bytes).map_err(|e| fail(CodeRecordError::Entry(e)))?;
-                entry
-                    .each_declared(
-                        |d| {
-                            let (item, args) = crate::symbols::decode_instance(d.name, &mut ground, Alloc::global()).map_err(CodeRecordError::Symbol)?;
-                            declared.push((d.tabled, Instance { item, args }));
-                            Ok(())
-                        },
-                        CodeRecordError::Entry,
-                    )
-                    .map_err(fail)?;
-                for &(tabled, callee) in declared.iter() {
-                    let c = program.fn_index(tabled).ok_or_else(|| fail(CodeRecordError::NoTabledFn { tabled }))?;
-                    let k = key_of(program, c, callee, &mut ground, &keyer)?;
-                    reached.slot(callee, c, k)?;
-                }
-                run.met.push(crate::code_records::Met { symbol: parts.symbol, key, parts, function: format!("{}", name()).into_boxed_str(), found: true });
-                continue;
-            }
-        }
         // The constants and const blocks this instance reads, at its ground arguments, PULLED
         // from the front end before the walk (front2/const_at.rs): the walk's `Adts` only reads
         // them. A plain instance's body only: a closure's, a coroutine's or a shim's instance is
         // built at its owner's arguments, and the owner's instance, built first (it is what
         // reaches them), pulled them. A need the evaluator refuses is this instance's refusal.
         const_needs.clear();
-        if instance.item == function.key && program.evaluates_at_args() {
+        if instance.item == function.key
+            && program.evaluates_at_args()
+            && let (Some(body), Some(done)) = (body, done)
+        {
             args.clear();
             args.extend_from_slice(ground.view().list(instance.args).map_err(|_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None })?);
             let view = body.view(types);
             let facts = FrontAdts(program, i, &consts, &langs, &checked_bodies);
-            if let Err(error) = crate::front2::const_at::needs_of(&view, done, &args, &mut ground, &facts, Alloc::global(), &mut const_needs) {
+            if let Err(error) = crate::front2::const_at::needs_of(&view, done, &args, &mut ground, &facts, alloc, &mut const_needs) {
                 filed(&mut survey, RunError::Build { function: name(), error, range: None })?;
                 continue;
             }
@@ -1989,10 +2217,7 @@ fn build_from<P: FrontEnd>(
         if !const_needs.is_empty()
             && let Err(refusal) = crate::front2::const_at::pull(&mut *program_mut, &const_needs, ground.view(), &mut checked_bodies.const_at)
         {
-            let item = match refusal.need {
-                crate::front2::const_at::ConstNeed::Item(k) => k,
-                crate::front2::const_at::ConstNeed::Block { owner, .. } => owner,
-            };
+            let item = refusal.need.item();
             let path = program_mut.item_named(item);
             filed(&mut survey, RunError::ConstAt { function: named, refusal, path })?;
             continue;
@@ -2002,11 +2227,50 @@ fn build_from<P: FrontEnd>(
         let types = program.types();
         let function = program.function(i);
         let name = || function.named();
-        let Some((body, _)) = function.body else {
+        let body = function.body.map(|(body, _)| body);
+        if body.is_none() && ctor_row.is_none() {
             return Err(callee_refusal(&*program, named, instance.args, instance, crate::callee_shown::CalleeGap::NoBody, ground.view()));
-        };
+        }
+        // The record walk: the entry its key's pointer names is used only when every row of its
+        // read list, asked again through the world the build is handed, answers the same; the
+        // instances it declares are then what the walk goes on to, and nothing is built. A row
+        // answered otherwise: the entry is stale, built again below and pointed to.
+        if let (Some(run), Some((parts, key))) = (records.as_deref_mut(), record_key) {
+            use crate::code_records::CodeRecordError;
+            use crate::code_records::reads::{Verdict, verify};
+            let fail = |error| RunError::CodeRecord { function: name(), error };
+            let found = crate::code_records::entry_of(&*run.store, key).map_err(|e| fail(CodeRecordError::Store(e)))?;
+            if let Some(bytes) = found {
+                let entry = crate::code_records::EntryView::read(bytes).map_err(|e| fail(CodeRecordError::Entry(e)))?;
+                let world = FrontAdts(program, i, &consts, &langs, &checked_bodies);
+                let mut resolve = |item: ItemKey, args: List, ground: &mut PortableTys<'_>| program.resolve(i, item, args, ground).ok();
+                match verify(&entry, &world, &mut resolve, &mut ground, alloc).map_err(|e| fail(CodeRecordError::Reads(e)))? {
+                    Verdict::Stale { .. } => run.stale += 1,
+                    Verdict::Holds => {
+                        let mut declared: Vec<(ItemKey, Instance), Global> = Vec::new_in(Global);
+                        entry
+                            .each_declared(
+                                |d| {
+                                    let (item, args) = crate::symbols::decode_instance(d.name, &mut ground, alloc).map_err(CodeRecordError::Symbol)?;
+                                    declared.push((d.tabled, Instance { item, args }));
+                                    Ok(())
+                                },
+                                CodeRecordError::Entry,
+                            )
+                            .map_err(fail)?;
+                        for &(tabled, callee) in declared.iter() {
+                            let c = program.fn_index(tabled).ok_or_else(|| fail(CodeRecordError::NoTabledFn { tabled }))?;
+                            let k = key_of(program, c, callee, &mut ground, &world)?;
+                            reached.slot(callee, c, k)?;
+                        }
+                        run.met.push(crate::code_records::Met { symbol: parts.symbol, key, parts, function: format!("{}", name()).into_boxed_str(), found: true });
+                        continue;
+                    }
+                }
+            }
+        }
         args.clear();
-        let malformed = |_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None };
+        let malformed =|_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None };
         // A closure's `Fn*` method instance (`[closure, (A..)]`, tabled as its owner): built
         // from the owner's body at the owner's arguments the closure's type holds.
         // A fn item's or fn pointer's `Fn*` method instance: a shim (fn_shim.rs).
@@ -2053,7 +2317,7 @@ fn build_from<P: FrontEnd>(
                 if find(&coroutine_stash).is_none() {
                     // Its state laid out from types, with every state it holds, and each built
                     // into its state (run/lay_states.rs).
-                    let laid = lay_states::lay_and_build(&*program, &consts, &langs, &checked_bodies, &mut ground, &mut layouts, &mut coroutine_stash, i, &[of], Alloc::global());
+                    let laid = lay_states::lay_and_build(&*program, &consts, &langs, &checked_bodies, &mut ground, &mut layouts, &mut coroutine_stash, i, &[of], alloc);
                     match laid {
                         Ok(lay_states::Lay::Done) => {}
                         Ok(lay_states::Lay::Unchecked(owner)) => {
@@ -2084,9 +2348,9 @@ fn build_from<P: FrontEnd>(
         // no body of its own.
         if from_coroutine.is_none() && shim.is_none() {
             let adts = FrontAdts(&*program, i, &consts, &langs, &checked_bodies);
-            let laid = match lay_states::roots_of_instance(&*program, &checked_bodies, &adts, i, &args, &mut ground, Alloc::global()) {
+            let laid = match lay_states::roots_of_instance(&*program, &checked_bodies, &adts, i, &args, &mut ground, alloc) {
                 Ok(roots) if roots.is_empty() => Ok(lay_states::Lay::Done),
-                Ok(roots) => lay_states::lay_and_build(&*program, &consts, &langs, &checked_bodies, &mut ground, &mut layouts, &mut coroutine_stash, i, &roots, Alloc::global()),
+                Ok(roots) => lay_states::lay_and_build(&*program, &consts, &langs, &checked_bodies, &mut ground, &mut layouts, &mut coroutine_stash, i, &roots, alloc),
                 Err(e) => Err(e),
             };
             match laid {
@@ -2101,23 +2365,40 @@ fn build_from<P: FrontEnd>(
                 }
             }
         }
-        let view = body.view(types);
+        let view = body.map(|body| body.view(types));
         let adts = FrontAdts(program, i, &consts, &langs, &checked_bodies);
-        let mut subst = Subst { args: &args, ground: &mut ground, scratch: Alloc::global() };
+        // The record walk hands the builder its world recorded: what the build reads beyond the
+        // key is the entry's read list (code_reads.rs).
+        let recorded = records.as_deref().map(|run| {
+            run.reads.clear();
+            crate::code_records::reads::Recorded::new(&adts, &run.reads)
+        });
+        let world: &dyn Adts = match &recorded {
+            Some(it) => it,
+            None => &adts,
+        };
+        let mut subst = Subst { args: &args, ground: &mut ground, scratch: alloc };
         // `drop_in_place::<T>` is built as `T`'s drop glue, never from its written body.
         let built = if let Some(taken) = from_coroutine {
             Ok(taken)
         } else if let Some(s) = shim {
             match s.item {
-                Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, &adts, Global),
-                None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, &adts, Global),
+                Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, world, Global),
+                None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, world, Global),
             }
-        } else if let Some((of, which)) = closure {
-            blaze_build::build_closure(&view, done, of.ordinal, which, &program.sig(i), &mut subst, &adts, Global)
-        } else if Some(function.key) == program.fn_lang(FnLang::DropInPlace) {
-            blaze_build::build_drop_glue(&view, done, &program.sig(i), &mut subst, &adts, Global)
+        } else if let Some(variant) = ctor_row {
+            // The ctor's own instance (a shim of it was taken above): its fields in, its value out.
+            blaze_build::build_ctor_fn(function.key, variant, &program.sig(i), &mut subst, world, Global)
+        } else if let (Some(view), Some(done)) = (view.as_ref(), done) {
+            if let Some((of, which)) = closure {
+                blaze_build::build_closure(view, done, of.ordinal, which, &program.sig(i), &mut subst, world, Global)
+            } else if Some(function.key) == program.fn_lang(FnLang::DropInPlace) {
+                blaze_build::build_drop_glue(view, done, &program.sig(i), &mut subst, world, Global)
+            } else {
+                blaze_build::build(view, done, &program.sig(i), &mut subst, world, Global)
+            }
         } else {
-            blaze_build::build(&view, done, &program.sig(i), &mut subst, &adts, Global)
+            Err(BuildError::Malformed { what: "a row with no body built as other than a ctor or its shim" })
         }
         .map_err(|error| {
             let ranges = |all: &[blaze_typeck::Range], i: u32| all.get(i as usize).copied();
@@ -2125,9 +2406,9 @@ fn build_from<P: FrontEnd>(
                 BuildError::Unsupported { expr, .. }
                 | BuildError::UnsupportedType { expr, .. }
                 | BuildError::NoConstBlockValue { expr, .. } => {
-                    ranges(&body.expr_ranges, expr.0)
+                    body.and_then(|body| ranges(&body.expr_ranges, expr.0))
                 }
-                BuildError::UnsupportedPat { pat, .. } => ranges(&body.pat_ranges, pat.0),
+                BuildError::UnsupportedPat { pat, .. } => body.and_then(|body| ranges(&body.pat_ranges, pat.0)),
                 // A static the statics pass refused (front2 program.rs `made_statics` files it in
                 // `left_out` with the evaluator's words) is that cause, not "no static".
                 BuildError::NoAdt { adt }
@@ -2171,7 +2452,8 @@ fn build_from<P: FrontEnd>(
             let called = match crate::fn_item_resolve::resolved_shim_self(program, &adts, i, called, &mut ground) {
                 Ok(c) => c,
                 Err(error) => {
-                    let refusal = RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), error };
+                    let at = crate::callee_shown::self_form(ground.view(), called.args);
+                    let refusal = RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), at, error };
                     match unresolved(&mut survey, &mut reached, called, i, refusal)? {
                         Some(slot) => {
                             via.push(Via::Slot);
@@ -2206,11 +2488,19 @@ fn build_from<P: FrontEnd>(
                 }
                 continue;
             }
-            // A trait's fn runs as the selected impl's.
-            let (item, resolved) = match program.resolve(i, called.item, called.args, &mut ground) {
+            // A trait's fn runs as the selected impl's. A ctor is no trait's fn: it runs as
+            // itself, and nothing is selected, so a caller with no body of its own (the `Fn*`
+            // shim of a ctor's fn item, tabled at the ctor's bodiless row) asks no world.
+            let is_ctor = program.fn_index(called.item).is_some_and(|c| program.function(c).kind == FnKind::Ctor);
+            let selected = match is_ctor {
+                true => Ok((called.item, called.args)),
+                false => program.resolve(i, called.item, called.args, &mut ground),
+            };
+            let (item, resolved) = match selected {
                 Ok(r) => r,
                 Err(error) => {
-                    let refusal = RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), error };
+                    let at = crate::callee_shown::self_form(ground.view(), called.args);
+                    let refusal = RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), at, error };
                     match unresolved(&mut survey, &mut reached, called, i, refusal)? {
                         Some(slot) => {
                             via.push(Via::Slot);
@@ -2234,7 +2524,8 @@ fn build_from<P: FrontEnd>(
                 continue;
             };
             let target = program.function(c);
-            if target.body.is_some() {
+            // A ctor is built as its fn (blaze-build ctor_fn.rs), as a body is.
+            if target.body.is_some() || target.kind == FnKind::Ctor {
                 // A key the callee cannot have (a projection not normalized) refuses this caller.
                 let key = match key_of(program, c, callee, &mut ground, &adts) {
                     Ok(k) => k,
@@ -2299,7 +2590,7 @@ fn build_from<P: FrontEnd>(
                         stack.push(r);
                         continue;
                     }
-                    let mut cx = LayoutCx { ground: &mut ground, facts: &adts, scratch: Alloc::global() };
+                    let mut cx = LayoutCx { ground: &mut ground, facts: &adts, scratch: alloc };
                     let id = layouts.of(t.concrete, &mut cx).map_err(|e| fail(VtableFail::Layout(e)))?;
                     let (size, align) = (layouts.get(id).size, layouts.get(id).align_bytes());
                     // Word 0: `drop_in_place::<T>` (a no-op glue when `T` needs none). With no
@@ -2332,7 +2623,7 @@ fn build_from<P: FrontEnd>(
                                     true => (f.item, f.args),
                                     false => program
                                         .resolve(i, f.item, f.args, &mut ground)
-                                        .map_err(|error| RunError::Resolve { function: name(), callee: f.item, path: program.item_named(f.item), error })?,
+                                        .map_err(|error| RunError::Resolve { function: name(), callee: f.item, path: program.item_named(f.item), at: crate::callee_shown::self_form(ground.view(), f.args), error })?,
                                 };
                                 let c = program.fn_index(item).filter(|&c| program.function(c).body.is_some());
                                 let Some(c) = c else {
@@ -2380,8 +2671,8 @@ fn build_from<P: FrontEnd>(
             let name_of = |n: u32, reaches: &mut Vec<(ItemKey, blaze_own::AVec<'static, u8>), Global>| -> Result<blaze_code::record::Symbol, RunError> {
                 let callee = reached.instances[n as usize];
                 let tabled = program.function(reached.tabled[n as usize]).key;
-                let mut bytes = blaze_own::Vec::new_in(Alloc::global());
-                encode_instance(callee.item, callee.args, ground.view(), Alloc::global(), &mut bytes).map_err(sym)?;
+                let mut bytes = blaze_own::Vec::new_in(alloc);
+                encode_instance(callee.item, callee.args, ground.view(), alloc, &mut bytes).map_err(sym)?;
                 let symbol = fn_symbol_of_name(&bytes);
                 reaches.push((tabled, bytes));
                 Ok(symbol)
@@ -2422,18 +2713,38 @@ fn build_from<P: FrontEnd>(
             tls_names.extend(built.thread_locals.iter().map(|&k| tls_symbol(k)));
             let mut vtables = Vec::with_capacity_in(built.vtables.len(), Global);
             for &table in built.vtables.iter() {
-                vtables.push(vtable_symbol(table, ground.view(), Alloc::global()).map_err(sym)?);
+                vtables.push(vtable_symbol(table, ground.view(), alloc).map_err(sym)?);
             }
             let names = InstanceNames { funcs: &funcs, statics: &statics, vtables: &vtables, tls: &tls_names };
-            let mut declared = blaze_own::Vec::new_in(Alloc::global());
+            // A census walk (`RecordRun::census`): the instance's LIR and names go to the census,
+            // which emits them itself; no record is made. The walk goes on to the slots it filled.
+            if let Some(seen) = run.seen.as_deref_mut() {
+                let function = format!("{}", name());
+                seen.seen(&function, parts.symbol, &built.func, &names);
+                run.met.push(crate::code_records::Met { symbol: parts.symbol, key, parts, function: function.into_boxed_str(), found: false });
+                continue;
+            }
+            let mut declared = blaze_own::Vec::new_in(alloc);
             for (tabled, bytes) in reaches.iter() {
                 declared.push(Declared { tabled: *tabled, name: &bytes[..] });
             }
             // The eager walk binds no soft-float routine (its reached set is fixed before the
             // emitter answers which it calls): an `f128` operation is refused naming its
             // routine. The record walk (run/make_one.rs) binds them.
-            let entry = crate::code_records::make_entry(&built.func, &names, crate::front2::builtins_shim::Routines::NONE, &mut declared, run.builder.isa, Alloc::global()).map_err(fail)?;
-            run.store.put(key, &entry).map_err(|e| fail(CodeRecordError::Store(e)))?;
+            // The instance each call runs is part of what the entry read: a trait's fn selected
+            // to an impl (the front end's `resolve`, asked again when the entry is found).
+            for &called in built.refs.iter() {
+                let resolved = program.resolve(i, called.item, called.args, &mut ground).ok();
+                run.reads.ask_resolve(called, resolved, ground.view(), alloc);
+            }
+            let reads = run.reads.seal(&mut ground, alloc).map_err(|e| fail(CodeRecordError::Reads(e)))?;
+            let entry = crate::code_records::make_entry_reading(&built.func, &names, crate::front2::builtins_shim::Routines::NONE, &mut declared, &reads, run.builder.isa, alloc)
+                .map_err(fail)?;
+            // Put under its content key, and its code key pointed at it: an entry built again
+            // after a stale one replaces the pointer, never the bytes under a key.
+            let content = crate::code_records::content_key(&entry);
+            run.store.put(content, &entry).map_err(|e| fail(CodeRecordError::Store(e)))?;
+            run.store.point(key, content).map_err(|e| fail(CodeRecordError::Store(e)))?;
             run.met.push(crate::code_records::Met { symbol: parts.symbol, key, parts, function: format!("{}", name()).into_boxed_str(), found: false });
             continue;
         }
@@ -2457,7 +2768,14 @@ fn build_from<P: FrontEnd>(
             }
             tls_at.push(index);
         }
-        bodies.push(Body { code, targets, statics: built.statics, tls: tls_at, vtables: table_of });
+        let positions = match place::resolve_positions(&code, &|item, site| program_mut.source_position(ItemKey(item), site)) {
+            Ok(positions) => positions,
+            Err(error) => {
+                filed(&mut survey, RunError::Place(PlaceError::Position(error)))?;
+                continue;
+            }
+        };
+        bodies.push(Body { code, targets, statics: built.statics, tls: tls_at, vtables: table_of, positions });
     }
     let program = &*program_mut;
     // The record walk keeps no body: its answer is the store's entries and `met`. A program
@@ -2467,8 +2785,8 @@ fn build_from<P: FrontEnd>(
     // a program with no `main` stopped at `RunError::NoMain` above.
     if let Some(run) = records.as_deref_mut() {
         if let (Some(_), Some(main)) = (tls_vars.as_ref(), entry) {
-            run.getter().map_err(|error| RunError::CodeRecord { function: program.function(main).named(), error })?;
-            run.ender().map_err(|error| RunError::CodeRecord { function: program.function(main).named(), error })?;
+            run.getter(alloc).map_err(|error| RunError::CodeRecord { function: program.function(main).named(), error })?;
+            run.ender(alloc).map_err(|error| RunError::CodeRecord { function: program.function(main).named(), error })?;
         }
         return Ok(None);
     }
@@ -2524,7 +2842,14 @@ fn build_from<P: FrontEnd>(
                 }
                 let mut code = Code::new_in(Global);
                 blaze_emit::emit(func.view(), &via, isa(), &mut code).map_err(|error| RunError::Emit { function: named(), error })?;
-                bodies.push(Body { code, targets, statics: Vec::new_in(Global), tls: Vec::new_in(Global), vtables: Vec::new_in(Global) });
+                bodies.push(Body {
+                    code,
+                    targets,
+                    statics: Vec::new_in(Global),
+                    tls: Vec::new_in(Global),
+                    vtables: Vec::new_in(Global),
+                    positions: Vec::new_in(Global),
+                });
             }
             let ender = u32::try_from(bodies.len() - 1).map_err(|_| RunError::TooManyInstances)?;
             (Some(ender - 1), Some(ender))

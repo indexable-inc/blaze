@@ -193,7 +193,7 @@ fn same(sim: &Sim, world: &Disk) -> Result<(), Broke> {
             }
         }
     }
-    let names: Vec<Named> = sim.names.iter().map(named).collect::<Result<_, _>>()?;
+    let names: Vec<Named> = sim.names.iter().map(|change| named(&change.named)).collect::<Result<_, _>>()?;
     if names != world.names {
         return Err(oracle(format!(
             "the changes of names a crash may undo are {names:?} in the simulation and {:?} in the world",

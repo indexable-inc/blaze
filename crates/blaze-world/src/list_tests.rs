@@ -147,6 +147,7 @@ impl Packages<'static> for Places {
             "app" => Ok(Place::Checkout { dir: "app" }),
             "pm" => Ok(Place::Checkout { dir: "pm" }),
             "hello" => Ok(Place::Checkout { dir: "hello" }),
+            "helper" => Ok(Place::Checkout { dir: "helper" }),
             _ => Ok(Place::Pack { view: PackView::open_verified(self.dep).expect("a pack"), dir: "" }),
         }
     }
@@ -325,6 +326,157 @@ fn an_owner_sees_one_side() {
     std::println!("check scope: app's core is crate {}, pm's crate {}; the old rule gave pm {old_cores} cores", app_cores[0], pm_cores[0]);
 }
 
+/// The workspace of check_scope.rs's sides: `app` (member) depends on `helper` (member) and on
+/// `pm` (member proc macro), and has a build script depending on `bdep` (registry); `helper`
+/// depends on `reg` (registry); `pm` depends on `helper` and `reg`. tempo's shape:
+/// `tempo-precompiles-macros` is a member proc macro on `syn` and `alloy`, both also built for
+/// the target.
+const SIDES: &str = r#"version = 4
+
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = ["bdep", "helper", "pm"]
+
+[[package]]
+name = "bdep"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[package]]
+name = "helper"
+version = "0.1.0"
+dependencies = ["reg"]
+
+[[package]]
+name = "pm"
+version = "0.1.0"
+dependencies = ["helper", "reg"]
+
+[[package]]
+name = "reg"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+"#;
+
+/// [`SIDES`]' units as blaze-unit-graph makes them with tests asked (`blaze check`): 0 `reg`
+/// for the target, 1 `reg` for the host, 2 `helper` for the target, 3 `helper` for the host,
+/// 4 `pm` (proc macro, on the host's `helper` and `reg`), 5 `pm`'s library test harness (a
+/// target unit on the target's `helper` and `reg`: resolve.rs `Kind::TestLib`), 6 `app` (on
+/// the target's `helper` and on `pm`, its build script unit 7), 7 `app`'s build script (on
+/// the host's `bdep`), 8 `bdep` for the host.
+fn sides_world() -> World<'static> {
+    let lock: &'static Lock<'static> = StdBox::leak(StdBox::new(Lock::read(SIDES.as_bytes(), a()).expect("the lock reads")));
+    let mut units = AVec::new_in(a());
+    units.push(unit(lock, "reg", UnitKind::Lib, false, &[]));
+    units.push(unit(lock, "reg", UnitKind::Lib, true, &[]));
+    units.push(unit(lock, "helper", UnitKind::Lib, false, &[("reg", 0)]));
+    units.push(unit(lock, "helper", UnitKind::Lib, true, &[("reg", 1)]));
+    units.push(unit(lock, "pm", UnitKind::ProcMacro, true, &[("helper", 3), ("reg", 1)]));
+    units.push(unit(lock, "pm", UnitKind::Test { bin: None }, false, &[("helper", 2), ("reg", 0)]));
+    let mut app = unit(lock, "app", UnitKind::Lib, false, &[("helper", 2), ("pm", 4)]);
+    app.build_script = Some(UnitId(7));
+    units.push(app);
+    let mut script = unit(lock, "app", UnitKind::BuildScript, true, &[("bdep", 8)]);
+    script.root = t("build.rs");
+    units.push(script);
+    units.push(unit(lock, "bdep", UnitKind::Lib, true, &[]));
+    let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(a()), resolver: Resolver::V2 }));
+    let reg = crate::fixture::pack(&[("src/lib.rs", "pub struct Expr;\n")], a());
+    let mut places = Places { lock, dep: StdBox::leak(reg.into_boxed_slice()) };
+    let (id, mut shelf) = shelf(true);
+    let listed = open_list(&mut shelf, id, TRIPLE, graph, lock, &mut places, a()).unwrap_or_else(|e| panic!("{e}"));
+    let listed = StdBox::leak(StdBox::new(listed));
+    world(graph, lock, listed, &mut places, &NoFiles, a()).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// check_scope.rs `check_side`: every owner of [`SIDES`] has a scope on the side it is built
+/// for, and every crate of it is that side's (a proc macro aside, seen for its macros):
+/// - `pm` (a member proc macro) on the macro side, over the macro side's `helper` and `reg`;
+/// - `pm`'s library test harness on the macro side too: the list points its edges at the macro
+///   side's copies while the world files it among the target's crates (side Target), so a
+///   side read from its row, the rule before, refuses its first edge; tempo's 208
+///   `task-failed` rows of `crates/precompiles-macros/src/*.rs` (2026-11-17 03:49);
+/// - `helper`, built for both sides: two crates under two keys, each an owner checked on its
+///   side over its side's `reg`;
+/// - `app` on the target side, `pm` seen for its macros only; its build script and the
+///   build-dependency `bdep` are no crate of the world (no owner).
+/// Prints `check scope sides: <n> owners, harness on Macro (its row Target), helper's owners on
+/// [<sides>]`.
+#[test]
+fn every_owner_is_checked_on_the_side_it_is_built_for() {
+    use crate::check_scope::{Seen, check_scope, check_side};
+    let w = sides_world();
+    assert!(w.refused.is_empty(), "{:?}", w.refused);
+    let at = |unit: u32| w.crate_of_unit[unit as usize].unwrap_or_else(|| panic!("unit {unit} is a target-side crate")) as usize;
+    let (helper, pm, harness, app) = (at(2), at(4), at(5), at(6));
+    // Every owner: a scope whose crates are all its check side's, a proc macro aside; one core.
+    let mut sides_of_helper: StdVec<Side> = StdVec::new();
+    for owner in 0..w.crates.len() {
+        if matches!(w.crates[owner].origin, crate::Origin::Toolchain(_)) {
+            continue;
+        }
+        let scope = check_scope(&w, owner, false, a()).unwrap_or_else(|e| panic!("owner `{}`: {e}", w.crates[owner].input.name));
+        let side = scope.side();
+        for &(seen, how) in scope.readers() {
+            // The owner's own row may say another side (the harness); a linked crate may not.
+            assert!(!matches!(how, Seen::Linked { .. }) || w.crates[seen].side == side, "owner `{}` on {side:?} sees `{}` of {:?}", w.crates[owner].input.name, w.crates[seen].input.name, w.crates[seen].side);
+        }
+        let cores = scope.lang_places().filter(|p| w.crates[scope.readers()[*p].0].input.name == "core").count();
+        assert_eq!(cores, 1, "owner `{}` has one core", w.crates[owner].input.name);
+        if w.crates[owner].input.name == "helper" {
+            sides_of_helper.push(side);
+        }
+    }
+    let side_of = |owner: usize| check_side(&w, owner).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(side_of(pm), Side::Macro, "a member proc macro is checked on the macro side");
+    assert_eq!(side_of(harness), Side::Macro, "its library test harness is the same code, built for the macro side");
+    assert_eq!(w.crates[harness].side, Side::Target, "the harness's row says Target: the rule before read the side from it");
+    assert!(w.crates[harness].input.deps.iter().all(|(_, d)| w.crates[*d].side == Side::Macro), "the list points the harness's edges at the macro side");
+    assert_eq!(side_of(helper), Side::Target);
+    assert_eq!(side_of(app), Side::Target);
+    let app_scope = check_scope(&w, app, false, a()).unwrap_or_else(|e| panic!("{e}"));
+    assert!(app_scope.readers().contains(&(pm, Seen::MacrosOnly)), "app names pm for its macros only");
+    assert!(app_scope.readers().contains(&(helper, Seen::Linked { toolchain: false })), "app links the target's helper");
+    // `helper` is two crates under two keys, one a side.
+    let helpers: StdVec<usize> = (0..w.crates.len()).filter(|c| w.crates[*c].input.name == "helper").collect();
+    assert!(helpers.iter().any(|c| w.crates[*c].side == Side::Target) && helpers.iter().any(|c| w.crates[*c].side == Side::Macro), "helper is built for both sides");
+    let mut keys: StdVec<[u8; 32]> = helpers.iter().map(|c| w.crates[*c].input.key.0.0).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    assert_eq!(keys.len(), helpers.len(), "each side's helper has a key of its own");
+    assert!(sides_of_helper.contains(&Side::Target) && sides_of_helper.contains(&Side::Macro), "helper is checked once per side: {sides_of_helper:?}");
+    // The build script reads its run on the target side; it and its build-dependency are no crate.
+    assert!(matches!(w.crates[app].script, crate::Script::Read { .. }), "app reads its script's run");
+    assert!(w.crate_of_unit[7].is_none() && w.crate_of_unit[8].is_none(), "a build script and its build-dependency are no crate of the world");
+    assert!(!w.crates.iter().any(|c| c.input.name == "bdep"), "bdep is no owner");
+    let owners = w.crates.iter().filter(|c| !matches!(c.origin, crate::Origin::Toolchain(_))).count();
+    std::println!("check scope sides: {owners} owners, harness on Macro (its row Target), helper's owners on {sides_of_helper:?}");
+}
+
+/// check_scope.rs `OtherSide` stays for a real error: an edge from the target's `app` to the
+/// macro side's `helper` (no proc macro between) is refused naming the owner and the edge's two
+/// crates. CONTROL: the world as made gives `app` its scope.
+/// Prints `check scope: a crossing edge: <the refusal's words>`.
+#[test]
+fn an_edge_across_sides_is_refused_naming_it() {
+    use crate::check_scope::{ScopeError, check_scope};
+    let mut w = sides_world();
+    let app = w.crate_of_unit[6].expect("app is a crate") as usize;
+    assert!(check_scope(&w, app, false, a()).is_ok(), "CONTROL: app's scope as made");
+    let side_helper = (0..w.crates.len()).find(|c| w.crates[*c].input.name == "helper" && w.crates[*c].side == Side::Macro).expect("the macro side's helper");
+    let mut deps: StdVec<(&'static str, usize)> = w.crates[app].input.deps.to_vec();
+    deps.push(("side_helper", side_helper));
+    w.crates[app].input.deps = StdBox::leak(deps.into_boxed_slice());
+    let refused = check_scope(&w, app, false, a()).err().expect("a crossing edge is refused");
+    assert_eq!(refused, ScopeError::OtherSide { owner: "app", from: "app", krate: "helper", side: Side::Target });
+    let words = std::format!("{refused}");
+    assert!(words.contains("`app` -> `helper`"), "{words}");
+    std::println!("check scope: a crossing edge: {words}");
+}
+
 /// crate_list.rs: the crate list written from a world reads back EQUAL to it (every field of
 /// every crate found by its key, each dependency's name and key, the sysroot), and every
 /// owner's check scope over the list names the crates its scope over the world names, seen
@@ -363,4 +515,73 @@ fn the_crate_list_reads_back_as_its_world() {
         assert!(control > 0, "{what}: CONTROL: a row holding another crate's root must differ");
         std::println!("crate list: {what}: {} crates, {} bytes, {differ} differences; control: {control} differences", w.crates.len(), bytes.len());
     }
+}
+
+/// crate_list.rs, version 2: the tree table names each tree's pack as the world placed it, in
+/// `Texts::packs` order (tree `k` is pack `k - 1`): a toolchain tree by its shelf digest (the
+/// pack's own footer), the fetched `dep` by its sources-store key (the lock's fetch plan's unit,
+/// `SourceId::key`), each with its files' listing BLAKE3; and every crate's `shown_from` names a
+/// tree of the table. CONTROL: one byte of a tree's files changed differs. Prints
+/// `crate list trees: <t> trees (<s> shelf, <f> fetched), dep is tree <k>; control: <n> differences`.
+#[test]
+fn the_tree_table_names_each_trees_pack() {
+    use crate::PackOrigin;
+    use crate::crate_list::{CrateGraph as _, CrateList, HEADER_LEN, ROW, TREE, differences, encode};
+    let w = made(true);
+    let bytes = encode(&w, &|_| None, a()).unwrap_or_else(|e| panic!("{e}"));
+    let list = CrateList::open(&bytes).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(differences(&w, &list), 0, "the list differs from its world");
+    assert_eq!(list.trees(), w.texts.packs().len(), "one tree per pack");
+    assert_eq!(list.tree(0), None, "the checkout is no row of the table");
+    assert_eq!(list.tree(list.trees() + 1), None, "past the table is no row");
+    let (mut shelf, mut fetched) = (0, 0);
+    for (k, pack) in w.texts.packs().iter().enumerate() {
+        let row = list.tree(k + 1).expect("every tree has its row");
+        assert_eq!(row.files, pack.tree().0, "tree {}: its files are the pack's", k + 1);
+        match row.origin {
+            PackOrigin::Shelf { .. } => shelf += 1,
+            PackOrigin::Source { .. } => fetched += 1,
+        }
+    }
+    let dep = w.crate_of_unit[0].expect("the target's dep is a crate") as usize;
+    let shown = w.crates[dep].input.shown_from;
+    let k: usize = shown.trim_start_matches('/').split('/').next().and_then(|n| n.parse().ok()).expect("dep's shown_from names a tree");
+    let lock = lock();
+    let dep_package = lock.named("dep").next().expect("in the lock");
+    let plan = blaze_fetch::plan::plan(lock, a()).unwrap_or_else(|_| panic!("the lock plans"));
+    let want = plan.units.iter().find(|u| matches!(u, blaze_fetch::Unit::Crate { package, .. } if *package == dep_package)).expect("dep is a unit").key();
+    assert_eq!(list.tree(k).map(|row| row.origin), Some(PackOrigin::Source { key: want }), "dep's tree is its fetched record, by key");
+    for c in w.crates.iter() {
+        let k: usize = c.input.shown_from.trim_start_matches('/').split('/').next().and_then(|n| n.parse().ok()).expect("a tree number");
+        assert!(k == 0 || list.tree(k).is_some(), "`{}` is shown from tree {k}, which the table names", c.input.name);
+    }
+    // CONTROL: the last byte of the first tree's files.
+    let mut planted = bytes.to_vec();
+    let at = HEADER_LEN + list.len() * ROW + bytes_of_deps(&list) + TREE - 1;
+    planted[at] ^= 1;
+    let control = differences(&w, &CrateList::open(&planted).unwrap_or_else(|e| panic!("{e}")));
+    assert!(control > 0, "CONTROL: a tree of other files must differ");
+    std::println!("crate list trees: {} trees ({shelf} shelf, {fetched} fetched), dep is tree {k}; control: {control} differences", list.trees());
+}
+
+/// The bytes of a list's dependency table: its entries counted over every row.
+fn bytes_of_deps(list: &crate::crate_list::CrateList<'_>) -> usize {
+    use crate::crate_list::CrateGraph as _;
+    (0..list.len()).map(|r| list.deps_named(r).count()).sum::<usize>() * crate::crate_list::DEP
+}
+
+/// A list of version 1 (no tree table) is refused by name, never read as this form. Prints
+/// `crate list: an old list: <the refusal's words>`.
+#[test]
+fn an_old_crate_list_is_refused_by_name() {
+    use crate::crate_list::{CrateList, ListError, VERSION, encode};
+    let w = hello(BLAZE);
+    let mut bytes = encode(&w, &|_| None, a()).unwrap_or_else(|e| panic!("{e}")).to_vec();
+    assert_eq!(VERSION, 2);
+    bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
+    let refused = CrateList::open(&bytes).err().expect("a version-1 list is refused");
+    assert_eq!(refused, ListError::Version { found: 1 });
+    let words = std::format!("{refused}");
+    assert!(words.contains("version 1, not 2"), "{words}");
+    std::println!("crate list: an old list: {words}");
 }

@@ -9,6 +9,9 @@
 //!    354; areas 8 + 10 = 18.
 //! 4. a Box<dyn Area> of a type with no Drop (Plain): area 7, log unchanged 354.
 //! A wrong builder whose vtable has no drop entry exits 2 (0); one that drops twice exits 2 (33).
+//! The boxes are blaze-own's (the edition's prelude, D120), made in `main`'s root frame
+//! (`cx.frame()`), the allocator the entry hands `main`: freeing one through the vtable's size
+//! and alignment is tested with the drop.
 
 use core::cell::Cell;
 
@@ -37,18 +40,19 @@ impl Area for Plain {
     }
 }
 
-fn main() -> std::entry::Status {
+fn main(cx: &Cx) -> std::entry::Status {
+    let frame = cx.frame();
     let log = Cell::new(0);
-    let b1: Box<dyn Area + '_> = Box::new(Counted(3, &log));
+    let b1: Box<dyn Area + '_, &Frame> = Box::new_in(Counted(3, &log), frame);
     let one = b1.area() == 6 && log.get() == 0;
     drop(b1);
     let two = log.get();
     let areas = {
-        let x: Box<dyn Area + '_> = Box::new(Counted(4, &log));
-        let y: Box<dyn Area + '_> = Box::new(Counted(5, &log));
+        let x: Box<dyn Area + '_, &Frame> = Box::new_in(Counted(4, &log), frame);
+        let y: Box<dyn Area + '_, &Frame> = Box::new_in(Counted(5, &log), frame);
         x.area() + y.area()
     };
-    let p: Box<dyn Area> = Box::new(Plain);
+    let p: Box<dyn Area, &Frame> = Box::new_in(Plain, frame);
     let status = if !one {
         1
     } else if two != 3 {

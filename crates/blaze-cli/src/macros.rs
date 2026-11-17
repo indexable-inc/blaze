@@ -22,7 +22,7 @@ use blaze_own::Alloc;
 use blaze_manifest::lock::LockId;
 use blaze_proc_macro::module::{LockedPackages, ModuleError, find_module};
 use blaze_unit_graph::{Unit, UnitKind};
-use blaze_world::procs::{MacroIdentity, Unidentified, git_folders, identify_files};
+use blaze_world::procs::{MacroIdentity, Unidentified, git_folders, identify};
 use bstd::cx::Cx;
 use bstd::mem::Frame;
 
@@ -86,9 +86,10 @@ fn subject(unit: &Unit<'_>) -> ContentId {
 }
 
 /// The `MacroModule` parts of a graph record `graph_record` made over the graph source
-/// `graph_source`: one per proc-macro unit, by subject, sorted and without repeats.
-pub(crate) fn parts(graph_source: ContentId, graph_record: &[u8]) -> Result<std::vec::Vec<(Name, ContentId), Global>, blaze_unit_graph::record::RecordRefused> {
-    let decoded = blaze_unit_graph::record::decode(graph_record, Alloc::global())?;
+/// `graph_source`: one per proc-macro unit, by subject, sorted and without repeats. The decoded
+/// graph is scratch, made over `scratch` and dropped here.
+pub(crate) fn parts(graph_source: ContentId, graph_record: &[u8], scratch: Alloc<'_>) -> Result<std::vec::Vec<(Name, ContentId), Global>, blaze_unit_graph::record::RecordRefused> {
+    let decoded = blaze_unit_graph::record::decode(graph_record, scratch)?;
     let mut parts = std::vec::Vec::new_in(Global);
     for unit in decoded.graph.units.iter().filter(|unit| matches!(unit.kind, UnitKind::ProcMacro)) {
         let subject = subject(unit);
@@ -127,9 +128,10 @@ impl core::fmt::Display for MacrosError {
 }
 
 /// Every macro crate of the graph `graph_record` with its identity, over `lock`, the module
-/// store `modules` (its git folders) and `place` (a member's folder).
-fn list(graph_record: &[u8], lock: &crate::fetch::Lockfile<'_>, modules: &std::path::Path, place: &Place<'_, '_>) -> Result<MacroCrates, MacrosError> {
-    let decoded = blaze_unit_graph::record::decode(graph_record, Alloc::global()).map_err(MacrosError::Graph)?;
+/// store `modules` (its git folders) and `place` (a member's folder). The decoded graph is the
+/// task's scratch, made over `scratch`.
+fn list(graph_record: &[u8], lock: &crate::fetch::Lockfile<'_>, modules: &std::path::Path, place: &Place<'_, '_>, scratch: Alloc<'_>) -> Result<MacroCrates, MacrosError> {
+    let decoded = blaze_unit_graph::record::decode(graph_record, scratch).map_err(MacrosError::Graph)?;
     let text = core::str::from_utf8(lock.text).map_err(|_| MacrosError::LockText)?;
     let locked = LockedPackages::read(text);
     let folders = git_folders(modules).map_err(MacrosError::Procs)?;
@@ -137,7 +139,7 @@ fn list(graph_record: &[u8], lock: &crate::fetch::Lockfile<'_>, modules: &std::p
     for unit in decoded.graph.units.iter().filter(|unit| matches!(unit.kind, UnitKind::ProcMacro)) {
         // A member macro crate's identity is its files' digest, read from its folder; a path
         // package that is no member has no folder here and is named as not identified.
-        let identity = identify_files(lock.lock, &locked, &folders, unit, |id| place.member_files(id)).map_err(MacrosError::Procs)?;
+        let identity = identify(lock.lock, &locked, &folders, unit, |id| Ok(place.member_files(id))).map_err(MacrosError::Procs)?;
         crates.push((subject(unit), identity));
     }
     crates.sort_unstable_by_key(|(subject, _)| *subject);
@@ -148,7 +150,7 @@ fn list(graph_record: &[u8], lock: &crate::fetch::Lockfile<'_>, modules: &std::p
 #[expect(clippy::too_many_arguments, reason = "a task's edge: each argument one handle or frame of it")]
 pub(crate) fn run<'b>(
     cx: &Cx,
-    store: &mut dyn Store,
+    store: &mut dyn Store<'_>,
     lock: Option<&crate::fetch::Lockfile<'_>>,
     crates: &mut Option<MacroCrates>,
     place: Place<'_, '_>,
@@ -170,8 +172,10 @@ pub(crate) fn run<'b>(
             return Ok(Did::Need(wants));
         };
         let read = crate::work::payload(&cx, store, graph, frame)?;
+        // The task's frame carries no header: erased here, for this task's scratch.
+        let scratch = blaze_own::Erased::new(frame);
         let listed = match lock {
-            Some(lock) => list(read.unit_graph(graph.name)?.graph, lock, &modules, &place),
+            Some(lock) => list(read.unit_graph(graph.name)?.graph, lock, &modules, &place, scratch.handle()),
             None => Err(MacrosError::NoLock),
         };
         match listed {

@@ -34,18 +34,39 @@ use crate::BuildError;
 pub mod float;
 #[cfg(test)]
 mod float_tests;
+pub mod neon;
+#[cfg(test)]
+mod neon_tests;
+pub mod sha2;
+#[cfg(test)]
+mod sha2_tests;
+pub mod sha3;
+#[cfg(test)]
+mod sha3_tests;
 #[cfg(test)]
 mod tests;
 
 /// A target intrinsic blaze builds: a barrier or hint, `fn(i32 imm)` returning nothing (the
-/// four below), or a generic float function, built as its LIR float operation
-/// ([`Target::Float`], target/float.rs).
+/// four below), a generic float function, built as its LIR float operation
+/// ([`Target::Float`], target/float.rs), a NEON integer function, built as LIR vector
+/// operations ([`Target::Neon`], target/neon.rs), or a SHA3 bitwise function, built as LIR
+/// vector operations too ([`Target::Sha3`], target/sha3.rs).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Target {
     /// `llvm.<fn>.<shape>` of target/float.rs (`llvm.roundeven.v4f32` and kin): LIR's float
     /// operation lane by lane, no `target_intrinsic` (INTRINSICS.md 3.3: "a generic name with
     /// an LIR op maps to it").
     Float(float::FloatCall),
+    /// `llvm.aarch64.neon.<fn>.<shape>` of target/neon.rs (`llvm.aarch64.neon.tbl1.v16i8`,
+    /// `llvm.aarch64.neon.ushl.v2i64` and kin): LIR vector operations, no `target_intrinsic`.
+    Neon(neon::NeonCall),
+    /// `llvm.aarch64.crypto.{eor3,bcax}{u,s}.<shape>`, `llvm.aarch64.crypto.rax1` and
+    /// `llvm.aarch64.crypto.xar` of target/sha3.rs: LIR vector operations, no
+    /// `target_intrinsic`.
+    Sha3(sha3::Sha3Call),
+    /// `llvm.aarch64.crypto.sha256{h,h2,su0,su1}` and `llvm.aarch64.crypto.sha512{h,h2,su0,su1}`
+    /// of target/sha2.rs: LIR scalar operations on the lanes, no `target_intrinsic`.
+    Sha2(sha2::Sha2Fn),
     /// `llvm.aarch64.isb`: instruction synchronization barrier, `isb #imm`.
     Aarch64Isb,
     /// `llvm.aarch64.dmb`: data memory barrier, `dmb #imm`.
@@ -106,6 +127,15 @@ pub fn named(link_name: &str) -> Result<Target, UnknownTarget> {
     if let Some(call) = float::named(link_name) {
         return Ok(Target::Float(call));
     }
+    if let Some(call) = neon::named(link_name) {
+        return Ok(Target::Neon(call));
+    }
+    if let Some(call) = sha3::named(link_name) {
+        return Ok(Target::Sha3(call));
+    }
+    if let Some(f) = sha2::named(link_name) {
+        return Ok(Target::Sha2(f));
+    }
     ALL.iter().copied().find(|t| t.link_name() == link_name).ok_or_else(|| UnknownTarget::of(link_name))
 }
 
@@ -118,6 +148,9 @@ impl Target {
             Target::Aarch64Dsb => "llvm.aarch64.dsb",
             Target::Aarch64Hint => "llvm.aarch64.hint",
             Target::Float(call) => call.link_name(),
+            Target::Neon(call) => call.link_name(),
+            Target::Sha3(call) => call.link_name(),
+            Target::Sha2(f) => f.link_name(),
         }
     }
 }
@@ -130,8 +163,20 @@ impl Target {
 pub fn build<A: Allocator + Clone>(b: &mut Builder<A, Full>, t: Target, imm: Value) -> Result<(), BuildError> {
     // A float function is its LIR operation, built by the walk (walk/target_intr.rs), never a
     // `target_intrinsic` of `fn(i32)`.
-    if let Target::Float(_) = t {
-        return Err(BuildError::Target { target: t, expr: None, why: "a generic float function built as a barrier (a build bug)" });
+    match t {
+        Target::Float(_) => {
+            return Err(BuildError::Target { target: t, expr: None, why: "a generic float function built as a barrier (a build bug)" });
+        }
+        Target::Neon(_) => {
+            return Err(BuildError::Target { target: t, expr: None, why: "a NEON integer function built as a barrier (a build bug)" });
+        }
+        Target::Sha3(_) => {
+            return Err(BuildError::Target { target: t, expr: None, why: "a SHA3 function built as a barrier (a build bug)" });
+        }
+        Target::Sha2(_) => {
+            return Err(BuildError::Target { target: t, expr: None, why: "a SHA-2 function built as a barrier (a build bug)" });
+        }
+        Target::Aarch64Isb | Target::Aarch64Dmb | Target::Aarch64Dsb | Target::Aarch64Hint => {}
     }
     // `ty` answers `Ty::NONE` for a value past the function's, so the index below is in range
     // once the type is `i32`.

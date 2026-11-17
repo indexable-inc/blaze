@@ -226,7 +226,7 @@ fn config(workers: u32) -> Config {
     Config { tool: Tool(key::digest("sim scripts tool", b"")), tools, workers, most_entries: 32, most_jobs: 1 << 16, is_error: never_an_error }
 }
 
-const ASK: Ask<'static> = Ask { command: Command::Check, args: b"", gate: Gate::Beside, space: Space::NONE };
+const ASK: Ask<'static> = Ask { command: Command::Check, args: b"", gate: Gate::Beside, space: Space::NONE, program: None, facts: &[] };
 
 fn request(tape: &Tape, world: &World, store: &mut BTreeMap<Key, StdVec<u8>>, last: Option<&[u8]>) -> Result<Ended, Broke> {
     let manifest = b"Cargo.toml".to_vec();
@@ -262,7 +262,7 @@ fn request(tape: &Tape, world: &World, store: &mut BTreeMap<Key, StdVec<u8>>, la
                     let outputs: StdVec<Output<'_>> = answered
                         .iter()
                         .filter_map(|(_, answer)| match answer {
-                            Answered::Done(m) => Some(Output { name: m.name, out: m.out, reads: &m.reads, parts: &m.parts, paths: &no_paths, findings: &no_findings, payload: b"" }),
+                            Answered::Done(m) => Some(Output { name: m.name, out: m.out, reads: &m.reads, cells: &[], parts: &m.parts, paths: &no_paths, findings: &no_findings, payload: b"" }),
                             _ => None,
                         })
                         .collect();

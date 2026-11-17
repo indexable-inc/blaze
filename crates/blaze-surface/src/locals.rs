@@ -6,7 +6,7 @@ use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_id::ItemKey;
 use blaze_own::{AVec, Alloc};
 
@@ -95,14 +95,14 @@ impl<T> fmt::Debug for Local<T> {
 /// long as the task, in the allocator the task names (its frame), and is never kept.
 pub struct LocalTable<'a, T> {
     keys: AVec<'a, ItemKey>,
-    locals: HashMap<ItemKey, u32, Alloc<'a>>,
+    locals: Map<ItemKey, u32, FixedState, Alloc<'a>>,
     of: PhantomData<fn() -> T>,
 }
 
 impl<'a, T> LocalTable<'a, T> {
     /// An empty table in `alloc`. It allocates nothing until its first intern.
     pub fn new_in(alloc: Alloc<'a>) -> LocalTable<'a, T> {
-        LocalTable { keys: AVec::new_in(alloc), locals: HashMap::new_in(alloc), of: PhantomData }
+        LocalTable { keys: AVec::new_in(alloc), locals: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }), of: PhantomData }
     }
 
     /// The local of `key`, numbered now if the task has not asked about it before.

@@ -100,7 +100,10 @@ mod tests {
     #[test]
     fn a_payload_reads_back_its_graph_and_list() {
         let (graph, list) = (b"graph bytes".as_slice(), b"list".as_slice());
-        let joined = join(graph, list, Alloc::global());
+        // The test's one frame, made at its top: its memory is the OS's, not the global heap.
+        let frame = bstd::mem::Frame::with_reserve(1 << 16, bstd::mem::Tag::Other).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let joined = join(graph, list, erased.handle());
         let read = sections(&joined).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!((read.graph, read.list), (graph, list));
         let older = sections(graph).err().expect("the older form is refused");

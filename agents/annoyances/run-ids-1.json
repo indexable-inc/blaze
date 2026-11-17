@@ -1,0 +1,14 @@
+{
+ "id": "run-ids-1",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), write-only lane I (every body has a key before any check) on rebuild-1115",
+ "where": "crates/blaze-cli/src/run_ids.rs (`WorkspaceBody`) against crates/blaze-cli/src/work.rs `body_name` and body_types.rs `body_source`",
+ "what": "Keying a workspace body by its BodyCheck task needs the task's Name, but nothing maps a checker ItemKey to it: work.rs `body_name` is private and is made from the file's outline entry and text, and one BodyCheck also covers the fns written inside its body (covered.rs). RunIds therefore takes the (item, name, text) rows from its caller, and no caller can make them yet.",
+ "cost": "about half an hour of reading to establish that no record holds the map",
+ "cause": "the BodyCheck name is derived from the outline (file grain), the checker key from the item tree (item grain); no record joins them",
+ "whys": "BodyCheck predates the run path's record walk; the walk starts from checker keys, the drive from outline entries",
+ "class": "two keys for one body made by two layers with no record linking them",
+ "prevention": "wanted: the BodyCheck record (or the items record) lists the checker keys it covers, so the map is read in place",
+ "workaround": "the caller passes WorkspaceBody rows",
+ "state": "open"
+}

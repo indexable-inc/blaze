@@ -82,7 +82,7 @@ pub mod inline;
     expect(blaze::unwired, reason = "wired off WASI; WASI keeps no spawns, watches or listens")
 )]
 pub(crate) mod tagged {
-    use blaze_hash::HashMap;
+    use blaze_hash::{FixedState, Map, MapOpts};
     use blaze_mem::{Slab, Tag as MemTag};
     use std::alloc::Global;
 
@@ -100,7 +100,7 @@ pub(crate) mod tagged {
 
     pub(crate) struct Tagged<T> {
         slab: Slab<Entry<T>>,
-        by_tag: HashMap<Tag, Id<T>, Global>,
+        by_tag: Map<Tag, Id<T>, FixedState, Global>,
     }
 
     impl<T> Tagged<T> {
@@ -113,7 +113,7 @@ pub(crate) mod tagged {
                 Err(error) => panic!("{error}"),
             };
             // alloc: once per driver, the room of the tags in flight at once.
-            let by_tag = HashMap::with_capacity_in(reserve, Global);
+            let by_tag = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(reserve) });
             Tagged { slab, by_tag }
         }
 
@@ -187,7 +187,7 @@ pub(crate) mod tagged {
 
     #[cfg(test)]
     mod tests {
-        use blaze_hash::HashMap;
+        use blaze_hash::{FixedState, Map, MapOpts};
         use std::alloc::Global;
 
         use super::Tagged;
@@ -198,7 +198,7 @@ pub(crate) mod tagged {
             for seed in 0..50 {
                 let mut rng = Rng::new(seed);
                 let mut tagged = Tagged::new(4);
-                let mut model: HashMap<Tag, u64, Global> = HashMap::new_in(Global);
+                let mut model: Map<Tag, u64, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
                 let mut ids = Vec::new();
                 for step in 0..2000u64 {
                     let tag = Tag(rng.below(16));

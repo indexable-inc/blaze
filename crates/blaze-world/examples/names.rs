@@ -1669,7 +1669,8 @@ fn main() {
         println!("scripts       {} units given their build script's outputs from {dir}", records.len());
         &*Box::leak(Box::new(records))
     });
-    let world: &'static World<'static> = Box::leak(Box::new(blaze_world::world(graph, lock, listed, &mut packages, checkout, g()).unwrap_or_else(|e| panic!("{e}"))));
+    let world: &'static World<'static> =
+        blaze_own::Box::leak(blaze_own::Box::new_in(blaze_world::world(graph, lock, listed, &mut packages, checkout, g()).unwrap_or_else(|e| panic!("{e}")), g()));
     // The record a crate's task would join (D115 (B)): its unit's, from `--scripts`.
     let given = |c: &blaze_world::Crate<'static>| match (c.script, c.origin) {
         (Script::Read { .. }, blaze_world::Origin::Unit(unit)) => records.and_then(|r| r.outputs(unit)),
@@ -1879,21 +1880,19 @@ fn main() {
                     let start = Instant::now();
                     let record = world.record(i).unwrap_or_else(|| panic!("no names record of `{}`", inputs[i].name));
                     let root = record.root_module();
-                    let scope = record.scope(root).unwrap_or_else(|e| panic!("`{}`: {e:?}", inputs[i].name));
-                    let name: &str = scope.and_then(|s| s.bindings.first()).map_or("main", |b| b.name);
+                    let first = record.scope(root).and_then(|s| s.bindings().next());
+                    let name: &str = first.map_or("main", |b| b.name);
                     let segments = [name];
                     let written = blaze_scope::names::Written { kind: blaze_surface::PathKind::Plain, segments: &segments };
                     let answer = blaze_scope::names::path(&world, root, blaze_surface::Namespace::Types, written, g());
                     let took = start.elapsed();
                     let after = world.decoded();
                     println!(
-                        "question: `{}` `{name}` -> {:?} in {:.3} ms: record {} bytes opened, {} scopes decoded ({} bytes)",
+                        "question: `{}` `{name}` -> {:?} in {:.3} ms: record {} bytes opened, read in place",
                         inputs[i].name,
                         answer.map(|r| r.consumed),
                         ms(took),
-                        after.bytes - before.bytes,
-                        after.scopes - before.scopes,
-                        after.scope_bytes - before.scope_bytes
+                        after.bytes - before.bytes
                     );
                 }
             }

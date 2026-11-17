@@ -27,6 +27,8 @@ extern crate alloc;
 #[cfg(any(test, feature = "testing"))]
 extern crate std;
 
+/// The integer and float rules on bits, shared with blaze-body-eval (rule 30).
+pub mod arith;
 mod drop_ask;
 mod error;
 pub mod layout;
@@ -34,6 +36,7 @@ mod lit;
 mod machine;
 pub mod mem;
 mod record;
+mod soft;
 
 /// A world, bodies and a store written by hand, for the tests and `examples/cost.rs`.
 #[cfg(any(test, feature = "testing"))]
@@ -117,6 +120,11 @@ pub struct Typed<'b> {
     /// list of `types`; blaze-typeck `Checked::const_args`): `[Self, trait args..]` for
     /// `Self::NAME`, `T::NAME` or `<T as Tr>::NAME`, the impl's for an inherent impl's.
     pub const_args: (&'b [ExprId], &'b [List]),
+    /// Each field a base-less struct expression `S { a: 1, .. }` takes from its default
+    /// (RFC 3681; blaze-typeck `Checked::default_fields`), sorted by expression then field:
+    /// the expression, the field's index in its variant, the default's key (a constant over
+    /// the ADT's generics, read at the expression's type's arguments).
+    pub default_fields: (&'b [ExprId], &'b [u32], &'b [ItemKey]),
 }
 
 impl<'b> Typed<'b> {
@@ -137,6 +145,7 @@ impl<'b> Typed<'b> {
             expr_defs: (checked.expr_defs.column::<0>(), checked.expr_defs.column::<1>()),
             pat_defs: (checked.pat_defs.column::<0>(), checked.pat_defs.column::<1>()),
             const_args: (checked.const_args.column::<0>(), checked.const_args.column::<1>()),
+            default_fields: (checked.default_fields.column::<0>(), checked.default_fields.column::<1>(), checked.default_fields.column::<2>()),
         }
     }
 }
@@ -252,6 +261,16 @@ pub trait ConstWorld: LayoutFacts {
     /// `Some(None)` when the library declares none. `None`, the default: not answered, refused
     /// as [`ConstWorld::drop_impl`]'s default is.
     fn manually_drop(&self) -> Option<Option<ItemKey>> {
+        None
+    }
+
+    /// The trait method `which` names (`Fn::call`, `FnMut::call_mut`, `FnOnce::call_once`), as
+    /// `blaze_build::Adts::fn_trait_method` answers the builder (rule 30: the same item). A
+    /// closure coerced to a fn pointer in a constant points to `FnOnce::call_once` at
+    /// `[closure, (args..)]`, the instance blaze-build's `closure_fn_addr` builds. `None`, the
+    /// default: that coercion is refused by name.
+    fn fn_trait_method(&self, which: blaze_build::FnTrait) -> Option<ItemKey> {
+        let _ = which;
         None
     }
 

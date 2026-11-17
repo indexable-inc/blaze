@@ -1,6 +1,6 @@
 //! D71: the host tools a native build script may start besides the pinned C toolchain (today:
 //! `perl`, which sha3-asm starts to turn cryptogams' perlasm into assembly). The list's one home
-//! is the pin table's `host_tools` (`crates/hir-ty-codegen/clang.json`, [`crate::toolchain::PIN`]).
+//! is the pin table's `host_tools` (`crates/blaze-toolchain/pins/clang.json`, [`crate::toolchain::PIN`]).
 //!
 //! A script whose package is in a tool's `needed_by` is granted read and execute of the tool's
 //! resolved real path and read-only of the folders its runtime needs; the tool's binary digest
@@ -19,7 +19,9 @@
 //! `exec_under`).
 //!
 //! nm-row: a row's program is on the machine (`path`, its resolved real path) or on the pinned
-//! toolchain's shelf (`shelf`, one of [`crate::toolchain::SHELF_MEMBERS`]) ([`Place`]). `nm` is
+//! toolchain's shelf (`shelf`, the name of its row in the table's `shelf_programs`, which pins
+//! the archive member by digest: [`crate::shelf_pins::shelf_program`]; a tool with no row cannot
+//! be granted, shelf-pins) ([`Place`]). `nm` is
 //! the shelf's `llvm-nm`, from the same pinned LLVM as its clang and lld, never the machine's
 //! `/usr/bin/nm` (an xcrun shim). [`HostTool::programs_in`] names every program at its real
 //! path. A row with `env` is named to the script by that variable ([`tool_env`]: `NM`) and its
@@ -165,10 +167,15 @@ pub fn host_tools<'t, 'a>(text: &'t str, target: &'t str, alloc: Alloc<'a>) -> R
         if !body.starts_with('{') {
             return Err(malformed("object"));
         }
-        // nm-row: the machine's program by its real path, or a member of the shelf; never both.
+        // nm-row: the machine's program by its real path, or a program of the shelf; never both.
+        // shelf-pins: the shelf program is named by its pinned row, which gives its shelf path;
+        // no row (or a row that is not a program under `bin/`), no grant.
         let (path, place) = match (scalar(body, "path"), scalar(body, "shelf")) {
             (Some(path), None) if path.starts_with('/') => (path, Place::Machine),
-            (None, Some(member)) if member.starts_with("bin/") && crate::toolchain::SHELF_MEMBERS.iter().any(|m| *m == member) => (member, Place::Shelf),
+            (None, Some(program)) => match crate::shelf_pins::shelf_program(text, target, program) {
+                Ok(row) if row.shelf_path.starts_with("bin/") => (row.shelf_path, Place::Shelf),
+                _ => return Err(malformed("shelf")),
+            },
             (_, Some(_)) => return Err(malformed("shelf")),
             _ => return Err(malformed("path")),
         };

@@ -1,6 +1,6 @@
 //! shelf-pins (main's design, wave 3): the shelf's programs are pinned one by one.
 //!
-//! The pin table ([`crate::toolchain::PIN`], `crates/hir-ty-codegen/clang.json`) pins the whole
+//! The pin table ([`crate::toolchain::PIN`], `crates/blaze-toolchain/pins/clang.json`) pins the whole
 //! archive by its SHA-256 (`targets`). Beside it, `shelf_programs` holds per host target one row
 //! per program placed on the shelf (clang-23, libclang.dylib, lld, llvm-ar, llvm-nm): the
 //! member's path in the archive (`member`, under the archive's top folder) and the member's own

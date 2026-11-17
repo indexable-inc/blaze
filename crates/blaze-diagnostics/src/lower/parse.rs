@@ -14,7 +14,7 @@
 //! it recovers): what it reports in a form rustc has is written as rustc writes it, the rest in
 //! the parser's own words, always an error (`fed1eb428d:docs/v2/requests/diagnostics.md`).
 
-use blaze_hash::HashSet;
+use blaze_hash::{FixedState, Set, SetOpts};
 use blaze_ids::radix;
 use hir::{HirFileId, InFile};
 use std::alloc::Global;
@@ -238,7 +238,7 @@ fn lower_file(
     let mut literals: Vec<&SyntaxError> = Vec::new();
     // alloc: the error's parts, for an error hir found
     let mut validation: Vec<&SyntaxError> = Vec::new();
-    let mut seen: HashSet<(String, TextRange), Global> = HashSet::new_in(Global);
+    let mut seen: Set<(String, TextRange), FixedState, Global> = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
     for error in errors {
         // alloc: the error's text, for an error hir found
         if is_lexer_error(error) || !seen.insert((error.to_string(), error.range())) {

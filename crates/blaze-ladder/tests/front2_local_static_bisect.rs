@@ -95,7 +95,7 @@ fn local_static_bisect() {
         };
         let files = [SourceFile { path: "src/main.rs", text: &text }];
         let new = NewFront { package: "bisect", edition: "blaze-2026.11", shelf: Some(&shelf), overflow: blaze_build::OverflowChecks::On };
-        let texts = match ProgramTexts::new(&files, "src/main.rs", new, &tc) {
+        let texts = match ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind) {
             Ok(t) => t,
             Err(e) => {
                 note(&format!("case {case}: the program's texts: {e}"));
@@ -111,14 +111,14 @@ fn local_static_bisect() {
             }
         };
         let crates = inputs.crates();
-        let names = match inputs.resolve(&crates) {
+        let names = match inputs.resolve(&crates, blaze_own::Alloc::global()) {
             Ok(n) => n,
             Err(e) => {
                 note(&format!("case {case}: resolve_crates: {e}"));
                 continue;
             }
         };
-        let said = match build_stubbed(&names, &files, &texts) {
+        let said = match build_stubbed(&names, &files, &texts, blaze_own::Alloc::global()) {
             Ok(_) => {
                 note(&format!("case {case}: ok"));
                 continue;

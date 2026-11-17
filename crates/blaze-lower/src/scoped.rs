@@ -21,14 +21,14 @@
 //! build, not at each call: [`Prepares`] holds each by the key of the item that defines it,
 //! found by the path's lookup before any work (one entry per distinct macro called).
 
-use blaze_expand::{DefAt, DefSite, Export, LocalInner, MacroDefinition, ProcKind, Transparency};
+use blaze_expand::{DefAt, DefSite, Export, LocalInner, MacroDefinition, ProcKind};
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_scope::names::Written;
 // The one home of the prepared definitions, shared with the item-position expansions.
 pub use blaze_scope::prepares::Prepares;
 use blaze_scope::prepares::Kept;
 use blaze_scope::resolve::{ItemAt, MacroDefError, Names};
-use blaze_scope::task::{DOLLAR_CRATE, MacroBody, MacroSrc, dollar_crate_of};
+use blaze_scope::task::{MacroBody, MacroSrc};
 use blaze_scope::{CallShape, Namespace, PathKind};
 use blaze_surface::ItemKey;
 
@@ -59,17 +59,6 @@ where
     }
 }
 
-impl<'d, 'p: 'd> Scoped<'d, 'p> {
-    /// The module `at`'s path is resolved in: a `macro`'s (an opaque mark with a module), or
-    /// the body's.
-    fn module_at(&self, at: PathAt) -> ItemKey {
-        match at.mark {
-            Some(mark) if mark.transparency == Transparency::Opaque => mark.site.module.unwrap_or(self.module),
-            _ => self.module,
-        }
-    }
-}
-
 impl<'d, 'p: 'd> MacroNames<'d> for Scoped<'d, 'p> {
     fn resolve<'a>(&self, path: &str, at: PathAt, kind: ProcKind, alloc: Alloc<'a>) -> Result<Resolved<'d, 'a>, NoMacro<'a>>
     where
@@ -82,19 +71,13 @@ impl<'d, 'p: 'd> MacroNames<'d> for Scoped<'d, 'p> {
         if segments.iter().skip(1).any(|s| matches!(*s, "$crate" | "crate")) {
             return Err(NoMacro::NotAPath);
         }
-        let (written_kind, rest) = match first {
+        // Where the call's name is read, by its first token's mark: the one rule
+        // (`crate::mark_site::site_of`).
+        let site = crate::mark_site::site_of(at.mark, first, absolute, self.module).map_err(NoMacro::Site)?;
+        let (written_kind, rest) = match (first, site.dollar_crate) {
             _ if absolute => (PathKind::Abs, 0),
-            "$crate" => match at.mark {
-                Some(mark) => (PathKind::DollarCrate(mark.site.krate), 1),
-                None => return Err(NoMacro::UnmarkedDollarCrate),
-            },
-            // The names library writes another crate's `$crate` into an item expansion's text
-            // as one identifier ([`blaze_scope::task::DOLLAR_CRATE`]); a `macro_rules!` that
-            // expansion wrote carries it into the bodies it expands in.
-            _ if first.starts_with(DOLLAR_CRATE) => match dollar_crate_of(first) {
-                Some(krate) => (PathKind::DollarCrate(krate), 1),
-                None => return Err(NoMacro::NotAPath),
-            },
+            (_, Some(krate)) => (PathKind::DollarCrate(krate), 1),
+            (first, None) => match first {
             "crate" => (PathKind::Crate, 1),
             "self" => (PathKind::SelfMod, 1),
             "super" => {
@@ -102,6 +85,7 @@ impl<'d, 'p: 'd> MacroNames<'d> for Scoped<'d, 'p> {
                 (PathKind::Super(u8::try_from(supers).map_err(|_| NoMacro::NotAPath)?), supers)
             }
             _ => (PathKind::Plain, 0),
+            },
         };
         let written = Written { kind: written_kind, segments: &segments[rest..] };
         let shape = match kind {
@@ -109,7 +93,7 @@ impl<'d, 'p: 'd> MacroNames<'d> for Scoped<'d, 'p> {
             ProcKind::Attr => CallShape::Attr,
             ProcKind::Derive => CallShape::Derive,
         };
-        let module = self.module_at(at);
+        let module = site.module;
         // The defining item first: a `macro_rules!` or `macro` is prepared once, by its key.
         let found = self.prepared.map(|prepared| (prepared, self.names.item_at(module, Namespace::Macros, written, alloc)));
         let rules_item = match found {

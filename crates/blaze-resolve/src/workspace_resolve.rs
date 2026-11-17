@@ -8,7 +8,7 @@
 //! prints along the way (unused patches, fields a patch or `[replace]` ignores) are not
 //! written.
 
-use blaze_hash::{HashMap, HashSet};
+use blaze_hash::{FixedState, Map, MapOpts, Set, SetOpts};
 use std::alloc::Global;
 use blaze_trace::{debug, trace};
 use url::Url;
@@ -18,8 +18,7 @@ use crate::error::ResolveError;
 use crate::interning::InternedString;
 use crate::package_id::PackageId;
 use crate::package_id_spec::PackageIdSpec;
-use crate::poll::answer;
-use crate::registry::{IndexSummary, QueryKind, Registry};
+use crate::registry::{IndexSummary, Lookup, QueryKind, Registry};
 use crate::resolve::{Resolve, ResolveVersion};
 use crate::resolver::{
     self, CliFeatures, HasDevUnits, Members, ResolveOpts, ResolveSettings, VersionOrdering,
@@ -78,19 +77,7 @@ pub type PatchDependency<'a> = (&'a Patch, Option<LockedPatchDependency>);
 /// has a `PackageId` for which package it represents as well as a list of
 /// `PackageId` for the resolved dependencies. The hash map is otherwise
 /// structured though for easy access throughout this registry.
-type LockedMap = HashMap<
-    // The first level of key-ing done in this hash map is the source that
-    // dependencies come from, identified by a `SourceId`.
-    // The next level is keyed by the name of the package...
-    (SourceId, InternedString),
-    // ... and the value here is a list of tuples. The first element of each
-    // tuple is a package which has the source/name used to get to this
-    // point. The second element of each tuple is the list of locked
-    // dependencies that the first element has.
-    Vec<(PackageId, Vec<PackageId>)>,
-    // alloc: the registry's locks, kept for the whole resolve
-    Global,
->;
+type LockedMap = Map<(SourceId, InternedString), Vec<(PackageId, Vec<PackageId>)>, FixedState, Global>;
 
 /// The sources with `[patch]` and the locks of a previous resolve applied: what the resolver
 /// queries.
@@ -103,7 +90,7 @@ pub struct PackageRegistry<R> {
     ///
     /// These are available for `query` after calling [`PackageRegistry::lock_patches`],
     /// which `lock`s them all to specific versions.
-    patches: HashMap<CanonicalUrl, Vec<Summary>, Global>,
+    patches: Map<CanonicalUrl, Vec<Summary>, FixedState, Global>,
     /// Whether patches are locked. That is, they are available to resolution.
     ///
     /// See [`PackageRegistry::lock_patches`] and [`PackageRegistry::patch`] for more.
@@ -116,24 +103,24 @@ pub struct PackageRegistry<R> {
     ///
     /// This is constructed during calls to [`PackageRegistry::patch`],
     /// along with the `patches` field, thoough these entries never get locked.
-    patches_available: HashMap<CanonicalUrl, Vec<PackageId>, Global>,
+    patches_available: Map<CanonicalUrl, Vec<PackageId>, FixedState, Global>,
 }
 
 impl<R: Registry> PackageRegistry<R> {
     pub fn new(sources: R) -> PackageRegistry<R> {
         PackageRegistry {
             sources,
-            locked: HashMap::new_in(Global),
-            patches: HashMap::new_in(Global),
+            locked: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            patches: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             patches_locked: false,
-            patches_available: HashMap::new_in(Global),
+            patches_available: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
         }
     }
 
     /// remove all residual state from previous lock files.
     pub fn clear_lock(&mut self) {
         trace!("clear_lock");
-        self.locked = HashMap::new_in(Global);
+        self.locked = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     }
 
     /// Registers one "locked package" to the registry, for guiding the
@@ -193,9 +180,14 @@ impl<R: Registry> PackageRegistry<R> {
             };
             debug!("registering a patch for `{}` with `{}`", url, dep.package_name());
 
-            let what = "the registry's versions of a `[patch]` dependency (bounded by the HTTP client's timeouts)";
-            let summaries = answer(what, self.sources.query_vec(dep, QueryKind::Exact))
-                .map_err(load_source(dep))?
+            // Unknown: none, and the patch refused this round, which the resolve machine
+            // throws away and runs again once it is answered.
+            let summaries = match self.sources.query_vec(dep, QueryKind::Exact) {
+                Ok(Lookup::Answered(summaries)) => summaries,
+                Ok(Lookup::Unknown) => Vec::new(),
+                Err(error) => return Err(load_source(dep)(error)),
+            };
+            let summaries = summaries
                 .into_iter()
                 .filter_map(|s| match s {
                     IndexSummary::Candidate(s) => Some(s),
@@ -219,7 +211,7 @@ impl<R: Registry> PackageRegistry<R> {
             unlocked_summaries.push(summary);
         }
 
-        let mut name_and_version = HashSet::new_in(Global);
+        let mut name_and_version = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
         for summary in unlocked_summaries.iter() {
             let name = summary.package_id().name();
             let version = summary.package_id().version();
@@ -285,7 +277,7 @@ impl<R: Registry> PackageRegistry<R> {
     ///
     /// These patches are mainly collected from [`patch`](Self::patch).
     /// They might not be the same as patches actually used during dependency resolving.
-    pub fn patches(&self) -> &HashMap<CanonicalUrl, Vec<Summary>, Global> {
+    pub fn patches(&self) -> &Map<CanonicalUrl, Vec<Summary>, FixedState, Global> {
         &self.patches
     }
 
@@ -296,12 +288,12 @@ impl<R: Registry> PackageRegistry<R> {
 }
 
 impl<R: Registry> Registry for PackageRegistry<R> {
-    async fn query(
+    fn query(
         &self,
         dep: &Dependency,
         kind: QueryKind,
         f: &mut impl FnMut(IndexSummary),
-    ) -> Result<()> {
+    ) -> Result<Lookup> {
         assert!(self.patches_locked);
 
         // Next up on our list of candidates is to check the `[patch]` section
@@ -323,7 +315,7 @@ impl<R: Registry> Registry for PackageRegistry<R> {
         // priority over the actual source then if we have a candidate we're done.
         if patches.len() == 1 && dep.is_locked() {
             f(IndexSummary::Candidate(patches.remove(0)));
-            return Ok(());
+            return Ok(Lookup::Answered(()));
         }
 
         if !patches.is_empty() {
@@ -360,10 +352,7 @@ impl<R: Registry> Registry for PackageRegistry<R> {
             let summary = summary.map_summary(|summary| lock(locked, all_patches, summary));
             f(summary)
         };
-        self.sources
-            .query(dep, kind, callback)
-            .await
-            .map_err(load_source(dep))
+        self.sources.query(dep, kind, callback).map_err(load_source(dep))
     }
 
     fn describe_source(&self, source: SourceId) -> String {
@@ -378,7 +367,7 @@ impl<R: Registry> Registry for PackageRegistry<R> {
 /// See [`PackageRegistry::lock`].
 fn lock(
     locked: &LockedMap,
-    patches: &HashMap<CanonicalUrl, Vec<PackageId>, Global>,
+    patches: &Map<CanonicalUrl, Vec<PackageId>, FixedState, Global>,
     summary: Summary,
 ) -> Summary {
     let pair = locked
@@ -516,12 +505,16 @@ fn summary_for_patch(
     }
     assert!(summaries.is_empty());
     let candidates = |dep: &Dependency| -> Vec<Summary> {
-        let what = "the registry's versions of a patch's dependency, for its error (bounded by the HTTP client's timeouts)";
-        answer(what, source.query_vec(dep, QueryKind::Exact))
-            .unwrap_or_else(|e| {
+        let found = match source.query_vec(dep, QueryKind::Exact) {
+            Ok(Lookup::Answered(found)) => found,
+            // None this round, which the resolve machine throws away once it is answered.
+            Ok(Lookup::Unknown) => Vec::new(),
+            Err(e) => {
                 blaze_trace::warn!("could not query {:?}: {:?}", dep, e);
                 Vec::new()
-            })
+            }
+        };
+        found
             .into_iter()
             .filter_map(|s| match s {
                 IndexSummary::Candidate(s) => Some(s),
@@ -566,7 +559,7 @@ pub struct Workspace<'a> {
     /// Every package with a path source the workspace can reach (its members, their path
     /// dependencies and those of `[patch]` and `[replace]`), by source: cargo reads their
     /// manifests to tell what changed since the previous resolve.
-    pub path_packages: &'a HashMap<SourceId, Summary, Global>,
+    pub path_packages: &'a Map<SourceId, Summary, FixedState, Global>,
     /// The root manifest's `[patch]`, by the URL patched.
     pub patch: &'a [(Url, Vec<Patch>)],
     /// The root manifest's `[replace]`.
@@ -660,7 +653,7 @@ pub fn resolve_with_previous<R: Registry>(
     let avoid_patch_ids = if register_patches {
         register_patch_entries(registry, ws, previous, &mut version_prefs)?
     } else {
-        HashSet::new_in(Global)
+        Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None })
     };
 
     // Keep all of the previous resolve but the patches that should avoid locking.
@@ -768,7 +761,7 @@ fn register_previous_locks<R: Registry>(
     // however, nothing else in the dependency graph depends on `log` and the
     // newer version of `serde` requires a new version of `log` it'll get pulled
     // in (as we didn't accidentally lock it to an old version).
-    let mut avoid_locking = HashSet::new_in(Global);
+    let mut avoid_locking = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
     for node in resolve.iter() {
         if !keep(&node) {
             add_deps(resolve, node, &mut avoid_locking);
@@ -808,7 +801,7 @@ fn register_previous_locks<R: Registry>(
     // come up first before newer version, if newer version are available.
     {
         let mut path_deps: Vec<&Summary> = ws.members.members.to_vec();
-        let mut visited = HashSet::new_in(Global);
+        let mut visited = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
         while let Some(member) = path_deps.pop() {
             if !visited.insert(member.package_id()) {
                 continue;
@@ -909,7 +902,7 @@ fn register_previous_locks<R: Registry>(
     }
 
     /// Recursively add `node` and all its transitive dependencies to `set`.
-    fn add_deps(resolve: &Resolve, node: PackageId, set: &mut HashSet<PackageId, Global>) {
+    fn add_deps(resolve: &Resolve, node: PackageId, set: &mut Set<PackageId, FixedState, Global>) {
         if !set.insert(node) {
             return;
         }
@@ -945,8 +938,8 @@ fn register_patch_entries<R: Registry>(
     ws: &Workspace<'_>,
     previous: Option<&Resolve>,
     version_prefs: &mut VersionPreferences,
-) -> Result<HashSet<PackageId, Global>> {
-    let mut avoid_patch_ids = HashSet::new_in(Global);
+) -> Result<Set<PackageId, FixedState, Global>> {
+    let mut avoid_patch_ids = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
     for (url, patches) in ws.patch.iter() {
         for patch in patches {
             version_prefs.prefer_dependency(patch.dep.clone());

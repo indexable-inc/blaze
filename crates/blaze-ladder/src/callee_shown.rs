@@ -42,6 +42,37 @@ impl fmt::Display for CalleeGap {
     }
 }
 
+/// The FORM of the first of `args` (an instance's `Self`), in words: what a resolve refusal is
+/// classed by (run.rs `filed`), so a census tells "no impl at a tuple" (a builtin impl the
+/// language gives) from "no impl at an ADT" (an impl table or bound gap) without one class per
+/// type. `"no argument"` for an empty list.
+pub fn self_form(v: PTys<'_>, args: List) -> &'static str {
+    let Ok(list) = v.list(args) else { return "a list past the ground table" };
+    let Some(&first) = list.first() else { return "no argument" };
+    let Ok(node) = v.node(first) else { return "a type past the ground table" };
+    match node {
+        PNode::Adt(..) => "an ADT",
+        PNode::Tuple(_) => "a tuple",
+        PNode::FnDef(..) => "a fn item",
+        PNode::FnPtr(..) => "a fn pointer",
+        PNode::Closure { .. } => "a closure",
+        PNode::Coroutine { .. } | PNode::Future(..) => "an async block",
+        PNode::Ref(..) => "a reference",
+        PNode::Ptr(..) => "a raw pointer",
+        PNode::Array(..) => "an array",
+        PNode::Slice(_) => "a slice",
+        PNode::Str => "str",
+        PNode::Never => "!",
+        PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_) => "a primitive",
+        PNode::Pat(..) => "a pattern type",
+        PNode::Dynamic(_) => "a trait object",
+        PNode::Alias { .. } => "a projection",
+        PNode::Opaque(..) => "an opaque type",
+        PNode::Param(_) | PNode::ConstParam(_) | PNode::Infer => "a parameter",
+        _ => "another form",
+    }
+}
+
 /// One step of [`args_shown`]'s work list: a type to spell, or words to write.
 enum Step {
     Ty(PTy),
@@ -196,7 +227,10 @@ mod tests {
 
     #[test]
     fn args_are_spelled_as_rust_writes_them() {
-        let mut g = PortableTys::new_in(blaze_own::testing::heap().alloc());
+        // The test's one allocator, made at its top: a frame, its memory from the OS.
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let mut g = PortableTys::new_in(erased.handle());
         let (world, lock, arc) = (ItemKey(1), ItemKey(2), ItemKey(3));
         let w = g.intern(PNode::Adt(world, List::EMPTY)).unwrap();
         let wl = g.intern_list(&[w]).unwrap();

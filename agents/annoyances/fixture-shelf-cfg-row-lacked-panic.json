@@ -1,0 +1,14 @@
+{
+ "id": "fixture-shelf-cfg-row-lacked-panic",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane FXT under rebuild-1115",
+ "where": "crates/blaze-cli/src/main.rs tests `shelf` and crates/blaze-cli/src/store_worktree_tests.rs `shelf`, against blaze-world src/panic.rs `Cuts::read`",
+ "what": "Seven blaze-cli tests stopped with `the toolchain shelf's cfg row for aarch64-apple-darwin has no panic atom (blaze-world unit_panic)`. The real cut (scripts/src/bin/toolchain_cut.rs `target_desc`) always writes `panic=\"<strategy>\"` into a target's row; the two blaze-cli test shelves passed a hand-written row `[target_os, unix]` to blaze_world::fixture::shelf, written before the panic strategy was read from the row (2026-11-16 ruling), and nobody updated them.",
+ "cost": "a lane; the tests were red on the tree before and after the night's changes",
+ "cause": "each test file wrote its own copy of the target's cfg atoms instead of one row shaped as the cut writes it",
+ "whys": "fixture::shelf takes the atoms from its caller; the row's shape (which atoms the cut always writes) has no type or shared constant; a new reader of the row (Cuts::read) made an atom required without a check that every fixture row carries it",
+ "class": "a test fixture's hand-written copy of a record field drifts from what the real writer puts there",
+ "prevention": "done in blaze-cli: one `tests::SHELF_CFG` row with the panic atom, used by both shelves. Wanted: blaze-world's fixture (or blaze-toolchain's record writer) to require the panic atom in a cut row, so a row without it cannot be written at all; blaze-world tests.rs and list_tests.rs still pass rows without it",
+ "workaround": "none needed now",
+ "state": "fixed in blaze-cli, uncompiled; the writer-side check is open"
+}

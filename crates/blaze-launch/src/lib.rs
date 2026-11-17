@@ -14,6 +14,7 @@
 //! | [`record`] | one function's code or one static's value as the launcher takes it: position- and process-independent bytes with the places an address goes, by place |
 //! | [`place`] | a record made code at an address: its pool of cells, each fixup written against what its place is in this process |
 //! | [`frame`] | a placed function's unwind entry as bytes, and where its addresses are in them |
+//! | [`grants`] | `BLAZE_LAUNCH_GRANTS`: the grants `blaze run` hands a hosted program's launcher, written and read in one place |
 //! | [`image`] | what a launcher's first edit leaves in its memory, made once by the daemon against the addresses of no process: the bytes, the words to move, the launcher's tables |
 //! | [`wire`] | the patch protocol between the launcher and the daemon: one versioned schema in deterministic CBOR, written and read without an allocator of its own |
 //!
@@ -46,6 +47,7 @@ extern crate alloc;
 
 pub mod area;
 pub mod frame;
+pub mod grants;
 pub mod image;
 pub mod launch;
 pub mod observe;

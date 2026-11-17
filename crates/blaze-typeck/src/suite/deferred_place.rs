@@ -22,7 +22,23 @@
 //! of 2026-11-16 18:05). rules/control.rs `start_body` now selects once after the signature is
 //! lowered (rustc's `check_fn` takes the signature normalized in the param env), so `?r = u8`
 //! before the body. The planted bug `Plant::SignatureUnsettled` skips that select; the control
-//! sees the placeless error come back.
+//! sees the finding move off `1u16`: the late projection fails at the body's block (the output
+//! signature obligation's place, machine.rs `sig_place`), an E0277 where E0308 is wanted.
+//!
+//! The second case is the census class `check: Check: DiagWithoutPlace { code: Unsatisfied,
+//! name: None }` (tempo build census 7, 8 functions, e.g. primeorder's `<impl<C>
+//! From<AffinePoint<C>> for Sec1Point<C>>::from`): a projection goal that a relation defers
+//! (unifying an alias with another type, `<X as Tr>::A` against `u16`) and the signature's own
+//! obligations were registered with `Cause::Body`, so when one failed the finding had no place.
+//!
+//! ```text
+//! fn rigid<X: Tr>(a: X::A) -> u16 { a }       // `a` (ExprId 0): rustc's E0308 there
+//! ```
+//!
+//! Each deferred goal is now an obligation of the node the walk was checking
+//! (machine.rs `Machine::place`, `TypeCtx::unify_at`), and each signature obligation one of
+//! its parameter or of the body (`sig_place`). The plant `Plant::ObligationsWithoutPlace` puts
+//! both back at `Cause::Body`; the control sees `DiagWithoutPlace` come back.
 
 use std::format;
 use std::vec::Vec;
@@ -87,10 +103,87 @@ fn signature_projection_is_settled_before_the_body() {
         Ok(d) if d.as_slice() == [(DiagCode::Mismatch, lit.0)] || d.as_slice() == [(DiagCode::Mismatch, root.0)] => {}
         other => wrong.push(format!("wide: want [(Mismatch, {})] (`1u16` where `u8` is wanted), got {other:?}", lit.0)),
     }
+    // Settled late, the projection fails after `1u16` bound `?r`: a finding with a place (the
+    // body's block, where the output's obligation is filed), but not E0308 at `1u16`.
     let planted = findings(&fx, &b, wide, root, Plant::SignatureUnsettled);
-    if !matches!(planted, Err(CheckError::DiagWithoutPlace { name: None, .. })) {
-        wrong.push(format!("control: Plant::SignatureUnsettled should give DiagWithoutPlace, got {planted:?}"));
+    match &planted {
+        Ok(d) if d.as_slice() != [(DiagCode::Mismatch, lit.0)] && d.iter().any(|&(c, _)| c == DiagCode::Unsatisfied) => {}
+        other => wrong.push(format!("control: Plant::SignatureUnsettled should give an E0277 with a place, not E0308 at `1u16`, got {other:?}")),
     }
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
     std::println!("signature_projection_is_settled_before_the_body: ok (control caught)");
+}
+
+/// `trait Tr { type A; } fn rigid<X: Tr>(a: X::A) -> u16`: `a` is ExprId 0 and PatId 0 (range
+/// start 1000), the block ExprId 1.
+fn rigid() -> (Fx, ItemKey, Bb, ExprId, ExprId) {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let tr = fx.tr("Tr", 1, Vec::new(), &["A"]);
+    let p0 = fx.param(0);
+    let a_ty = fx.alias(tr, "A", &[p0]);
+    let u16_ = fx.ty(crate::PNode::Uint(UintTy::U16));
+    let is_tr = fx.bound(tr, &[p0]);
+    let f = fx.func("rigid", 1, &[a_ty], u16_, std::vec![is_tr]);
+    fx.finish();
+    let mut b = Bb::new();
+    let a = b.param("a");
+    let e0 = b.local(a);
+    let root = b.block(&[], Some(e0));
+    (fx, f, b, e0, root)
+}
+
+/// `trait Tr { type A; } fn unbound<X>(a: <X as Tr>::A) {}`: `a` is PatId 0 (range start
+/// 1000), the empty block the root.
+fn unbound() -> (Fx, ItemKey, Bb, ExprId) {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let tr = fx.tr("Tr", 1, Vec::new(), &["A"]);
+    let p0 = fx.param(0);
+    let a_ty = fx.alias(tr, "A", &[p0]);
+    let unit = fx.unit();
+    let f = fx.func("unbound", 1, &[a_ty], unit, Vec::new());
+    fx.finish();
+    let mut b = Bb::new();
+    let _a = b.param("a");
+    let root = b.block(&[], None);
+    (fx, f, b, root)
+}
+
+/// Expected line: "a_deferred_projection_is_at_the_relating_expression: ok (control caught)".
+#[test]
+fn a_deferred_projection_is_at_the_relating_expression() {
+    let (fx, f, b, e0, root) = rigid();
+    let mut wrong = Vec::new();
+    // `X::A` is rigid under `X: Tr` (no clause names it), so `a` where `u16` is wanted is a
+    // finding (rustc: E0308 at `a`); whichever code the checker gives, it has a place in the
+    // body: `a`, the block, or the parameter `a`.
+    let places = [e0.0, root.0, 1000];
+    match findings(&fx, &b, f, root, Plant::None) {
+        Ok(d) if !d.is_empty() && d.iter().all(|&(_, at)| places.contains(&at)) => {}
+        other => wrong.push(format!("rigid: want findings at {places:?} (`a` where `u16` is wanted), got {other:?}")),
+    }
+    // Since `start_body` selects before the body (the test above), `X::A` is rigid when `a` is
+    // related to `u16`: the relation defers nothing and the mismatch is at `a` with or without
+    // the plant (run of 2026-11-17 03:4x: `Ok([(Mismatch, 0)])` under the plant). So the
+    // control is the other half of the fix, a signature obligation that fails:
+    // `fn unbound<X>(a: <X as Tr>::A) {}`, no `X: Tr` (the Reference, "Trait and lifetime
+    // bounds": the projection needs `X: Tr`, E0277). It is a finding at the parameter `a`;
+    // with the obligation filed at `Cause::Body` (the plant), it has no place.
+    let (ufx, unbound, ub, uroot) = unbound();
+    match findings(&ufx, &ub, unbound, uroot, Plant::None) {
+        Ok(d) if !d.is_empty() && d.iter().all(|&(c, at)| c == DiagCode::Unsatisfied && at == 1000) => {}
+        other => wrong.push(format!("unbound: want E0277 at the parameter `a` (1000), got {other:?}")),
+    }
+    let planted = findings(&ufx, &ub, unbound, uroot, Plant::ObligationsWithoutPlace);
+    if !matches!(planted, Err(CheckError::DiagWithoutPlace { name: None, .. })) {
+        wrong.push(format!(
+            "control: Plant::ObligationsWithoutPlace should give DiagWithoutPlace (the signature obligation filed at \
+             `Cause::Body`), got {planted:?}"
+        ));
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+    std::println!("a_deferred_projection_is_at_the_relating_expression: ok (control caught)");
 }

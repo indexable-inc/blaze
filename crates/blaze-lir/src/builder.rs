@@ -30,13 +30,13 @@
 use std::{alloc::Allocator, hash::BuildHasher, marker::PhantomData};
 
 use blaze_format::SpanRef;
-use blaze_hash::{FixedState, HashMap};
+use blaze_hash::{FixedState, Map, MapOpts};
 
 use crate::{
     flags::{AtomicRmw, Flags, FloatCond, IntCond},
     func::{
         AsmId, AsmOperandKind, AsmOperandRec, AsmPieceRec, AsmRec, Block, BlockKind, CompoundRec,
-        Conv, DataId, DataRec, DataRelocRec, Ext, FnAttrs, Func, Head, InlinedRec, IntrinsicId,
+        Conv, DataId, DataPositionRec, DataRec, DataRelocRec, Ext, FnAttrs, Func, Head, InlinedRec, IntrinsicId,
         IntrinsicRec, MemAttrsRec, NONE, ParamFactsRec, ParamKind, ParamRec, RangeRec, RefId,
         RefKind, RefRec, SigId, SigRec, SlotId, SlotKind, SlotRec, Value, VarRec,
     },
@@ -201,6 +201,22 @@ pub struct DataReloc {
     pub addend: i64,
 }
 
+/// A source position in data ([`DataPositionRec`]): at byte `offset`, the `field` of byte
+/// `site` of item `item`'s text, filled when the program is placed.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DataPosition {
+    pub offset: u32,
+    /// The item's key.
+    pub item: u128,
+    /// The byte offset from the item's first byte.
+    pub site: u32,
+    pub field: crate::func::PositionField,
+}
+
+fn position_rec(it: &DataPosition) -> DataPositionRec {
+    DataPositionRec { item: it.item.to_le_bytes(), offset: it.offset, site: it.site, field: it.field as u32 }
+}
+
 /// A piece of an `asm!` template.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AsmPiece<'a> {
@@ -255,15 +271,15 @@ pub struct Builder<A: Allocator + Clone, S: Sink> {
     loc: u32,
     signature: Option<SigId>,
     error: Option<BuildError>,
-    compound_rows: HashMap<u64, u32, A>,
-    sig_rows: HashMap<u64, u32, A>,
-    fact_rows: HashMap<ParamFactsRec, u32, A>,
-    attr_rows: HashMap<MemAttrsRec, u32, A>,
-    range_rows: HashMap<RangeRec, u32, A>,
-    ref_rows: HashMap<RefRec, u32, A>,
-    data_rows: HashMap<u64, u32, A>,
-    intrinsic_rows: HashMap<u64, u32, A>,
-    span_rows: HashMap<SpanRef, u32, A>,
+    compound_rows: Map<u64, u32, FixedState, A>,
+    sig_rows: Map<u64, u32, FixedState, A>,
+    fact_rows: Map<ParamFactsRec, u32, FixedState, A>,
+    attr_rows: Map<MemAttrsRec, u32, FixedState, A>,
+    range_rows: Map<RangeRec, u32, FixedState, A>,
+    ref_rows: Map<RefRec, u32, FixedState, A>,
+    data_rows: Map<u64, u32, FixedState, A>,
+    intrinsic_rows: Map<u64, u32, FixedState, A>,
+    span_rows: Map<SpanRef, u32, FixedState, A>,
     /// The most alignment (log2) a plain access made from now on may claim: `None` until
     /// [`Builder::cap_access_align`] lowers it (a `repr(packed)` aggregate's parts sit below
     /// their own alignment). Atomics are never capped: an atomic access is at its size.
@@ -273,7 +289,7 @@ pub struct Builder<A: Allocator + Clone, S: Sink> {
 /// The row of `hash` in a table of `rows` rows: `Ok` with the one `same` holds of, or `Err`
 /// with the row a new one takes. A hash shared by two rows finds the second by a scan.
 fn intern<A: Allocator + Clone>(
-    map: &mut HashMap<u64, u32, A>,
+    map: &mut Map<u64, u32, FixedState, A>,
     hash: u64,
     rows: u32,
     same: impl Fn(u32) -> bool,
@@ -315,15 +331,15 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
             loc: 0,
             signature: None,
             error: None,
-            compound_rows: HashMap::new_in(alloc.clone()),
-            sig_rows: HashMap::new_in(alloc.clone()),
-            fact_rows: HashMap::new_in(alloc.clone()),
-            attr_rows: HashMap::new_in(alloc.clone()),
-            range_rows: HashMap::new_in(alloc.clone()),
-            ref_rows: HashMap::new_in(alloc.clone()),
-            data_rows: HashMap::new_in(alloc.clone()),
-            intrinsic_rows: HashMap::new_in(alloc.clone()),
-            span_rows: HashMap::new_in(alloc),
+            compound_rows: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            sig_rows: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            fact_rows: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            attr_rows: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            range_rows: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            ref_rows: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            data_rows: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            intrinsic_rows: Map::new(MapOpts { hasher: FixedState, alloc: alloc.clone(), capacity: None }),
+            span_rows: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             access_cap: None,
         }
     }
@@ -544,19 +560,35 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
 
     /// The function's own data, made once per content, aligned to `1 << align`.
     pub fn data(&mut self, bytes: &[u8], align: u32, relocs: &[DataReloc]) -> RefId {
-        let hash = FixedState.hash_one((bytes, align, relocs));
+        self.data_with_positions(bytes, align, relocs, &[])
+    }
+
+    /// [`Builder::data`] with source positions in it (`positions` by ascending offset, each a
+    /// 4-byte field the verifier checks lies in the bytes and overlaps no address).
+    pub fn data_with_positions(
+        &mut self,
+        bytes: &[u8],
+        align: u32,
+        relocs: &[DataReloc],
+        positions: &[DataPosition],
+    ) -> RefId {
+        let hash = FixedState.hash_one((bytes, align, relocs, positions));
         let func = &self.func;
         let same = |row: u32| {
             let rec = func.datas[row as usize];
             let have_bytes = &func.data_bytes[rec.bytes_first as usize..][..rec.bytes_len as usize];
             let have_relocs =
                 &func.data_relocs[rec.relocs_first as usize..][..rec.relocs_len as usize];
+            let have_positions =
+                &func.data_positions[rec.positions_first as usize..][..rec.positions_len as usize];
             rec.align == align
                 && have_bytes == bytes
                 && have_relocs.len() == relocs.len()
                 && have_relocs.iter().zip(relocs).all(|(a, b)| {
                     a.offset == b.offset && a.target == b.target.0 && a.addend == b.addend
                 })
+                && have_positions.len() == positions.len()
+                && have_positions.iter().zip(positions).all(|(a, b)| *a == position_rec(b))
         };
         let rows = self.func.datas.len() as u32;
         let row = match intern(&mut self.data_rows, hash, rows, same) {
@@ -570,12 +602,16 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
                     offset: it.offset,
                     target: it.target.0,
                 }));
+                let positions_first = self.func.data_positions.len() as u32;
+                self.func.data_positions.extend(positions.iter().map(position_rec));
                 self.func.datas.push(DataRec {
                     bytes_first,
                     bytes_len: bytes.len() as u32,
                     relocs_first,
                     relocs_len: relocs.len() as u32,
                     align,
+                    positions_first,
+                    positions_len: positions.len() as u32,
                 });
                 row
             }

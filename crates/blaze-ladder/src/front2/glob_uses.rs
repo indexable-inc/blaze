@@ -78,7 +78,7 @@ pub const MAX_STEPS: u32 = 4096;
 
 /// Whether `segment` is a path head the names library reads itself.
 fn is_head(segment: &str) -> bool {
-    matches!(segment, "self" | "super" | "crate" | "{{root}}") || segment.starts_with('$') || segment.starts_with(blaze_scope::task::DOLLAR_CRATE)
+    matches!(segment, "self" | "super" | "crate" | "{{root}}") || segment.starts_with('$')
 }
 
 /// A copy of `segments` in `alloc`.
@@ -402,52 +402,39 @@ impl<'a> PatternBlocks<'a> {
         };
         PatternBlocks { nested, modules }
     }
-
-    /// The module of the innermost written block around the statement at offset `at` of the
-    /// body's text.
-    fn module_at(&self, at: u32) -> Option<LibKey> {
-        let modules = self.modules.as_ref()?;
-        let stmt = self.nested.items.iter().find(|i| i.range.start <= at && at < i.range.end)?;
-        let mut block = Some(stmt.block);
-        // A chain is at most as long as the body's blocks.
-        for _ in 0..self.nested.blocks.len() {
-            let b = block?;
-            if let Some(m) = modules.get(b as usize).copied().flatten() {
-                return Some(m);
-            }
-            block = self.nested.blocks.get(b as usize)?.parent;
-        }
-        None
-    }
 }
 
 /// What `name`, an identifier pattern, is in the value namespace through the `use` items
 /// `block_uses` of the blocks around it (the lowering's list, nearest first; `local_names`:
-/// the names of those blocks' own items), in a body of `module` whose item is `item`:
+/// the names of those blocks' own items), in a body of `module` whose item is `item`, lowered
+/// to `view` (as far as it is lowered: every scope around the pattern is in it):
 /// [`blaze_lower::ValueNames::value_name_by_uses`]'s answer before its shape. `None`: no `use`
-/// binds it as a value.
+/// binds it as a value. `planted`: the scope table's planted bug (`Planted::None` but in its
+/// test).
+#[allow(clippy::too_many_arguments, reason = "the world's one question: the body, its lowering and the uses")]
 pub fn by_uses<'n, 'a, S: NamesSource<'n>>(
     paths: &Paths<S>,
     module: LibKey,
     item: LibKey,
     blocks: &PatternBlocks<'_>,
+    view: &blaze_lower::View<'_>,
     name: &'a str,
     block_uses: &[BlockUse<'a>],
     local_names: &[&str],
+    planted: super::scope_table::Planted,
     alloc: Alloc<'a>,
 ) -> Result<Option<Target>, LocalGap> {
+    // The body's scope table (super::scope_table), built at the first `use` whose path starts
+    // with an item of a block.
+    let mut table: Option<super::scope_table::ScopeTable<'a>> = None;
     let mut uses: AVec<'a, UseAt<'a>> = AVec::new_in(alloc);
     // (the name a named import binds, its path, whether from the root): what a later `use`
     // path may start with.
     let mut named: AVec<'a, (&'a str, AVec<'a, &'a str>, bool)> = AVec::new_in(alloc);
     let mut leaves_of: AVec<'a, (usize, Range)> = AVec::new_in(alloc);
     for (i, u) in block_uses.iter().enumerate() {
-        // Where the `use` is in the body's item: its start to its end when the body's text
-        // holds it; an expansion's has no place there.
-        let range = match u.at {
-            Some(at) => Range::new(at, at + u.text.len() as u32),
-            None => Range::new(0, 0),
-        };
+        // Where the `use` is shown in the body's item, for a refusal's words.
+        let range: Range = u.shown;
         let Some(leaves) = blaze_scope::task::use_leaves(super::locals::use_tree(u.text), alloc) else {
             return Err(LocalGap { item, form: UNREAD, range });
         };
@@ -481,21 +468,22 @@ pub fn by_uses<'n, 'a, S: NamesSource<'n>>(
             let path = copy(&uses[n].written, alloc);
             uses[n].start = Some(Start { abs: false, at: module, path });
         } else if local_names.contains(&first) {
-            // An item of a block: read at the module of the block the `use` is written in.
+            // An item of a block: read at the module of the block the `use` is written in, the
+            // scope table's for the `use`'s scope (super::scope_table, where the order is
+            // stated): a hand block's or an expansion's, by the block, never by a site.
             let (i, range) = leaves_of[n];
-            let m = match block_uses[i].at {
-                Some(at) => blocks.module_at(at),
-                // Written by an expansion: read at the block module the names library filed for
-                // the expansion of the statement call around the use's site
-                // (super::expansion_blocks::start_module).
-                None => blocks.modules.as_ref().and_then(|ms| {
-                    let krate = paths.names.crate_of(module)?;
-                    let crate_key = paths.names.crate_key(krate)?;
-                    super::expansion_blocks::start_module(paths.names, crate_key, &blocks.nested, ms, block_uses[i].site, first, alloc)
-                }),
-            };
-            let Some(m) = m else {
-                return Err(LocalGap { item, form: THROUGH_LOCAL, range });
+            if table.is_none() {
+                let Some(crate_key) = paths.names.crate_of(module).and_then(|k| paths.names.crate_key(k)) else {
+                    return Err(LocalGap { item, form: THROUGH_LOCAL, range });
+                };
+                let built = super::scope_table::build(crate_key, module, view, &blocks.nested, blocks.modules.as_deref(), planted, alloc)
+                    .map_err(|r| LocalGap { item, form: r.form(), range })?;
+                table = Some(built);
+            }
+            // A block the library filed no module for: its items are nowhere to read (refused).
+            let m = match table.as_ref().and_then(|t| t.at(block_uses[i].scope.0)) {
+                Some(super::scope_table::ScopeAt::Own(m) | super::scope_table::ScopeAt::Inherits(m)) => m,
+                Some(super::scope_table::ScopeAt::Unfiled(_)) | None => return Err(LocalGap { item, form: THROUGH_LOCAL, range }),
             };
             let path = copy(&uses[n].written, alloc);
             uses[n].start = Some(Start { abs: false, at: m, path });

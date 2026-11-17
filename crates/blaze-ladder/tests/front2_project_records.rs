@@ -161,7 +161,7 @@ fn compare(label: &str, files: &[(String, String)]) -> Compared {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let placed: Vec<(String, String)> = files.iter().map(|(path, text)| (format!("/project/{path}"), text.clone())).collect();
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
-    let user = UserCrate { name: "project", dir: "/project/", root: "/project/src/main.rs", files: &placed, edition };
+    let user = UserCrate { name: "project", dir: "/project/", root: "/project/src/main.rs", files: &placed, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("{label}: the crates: {e}"));
     let crates = inputs.crates();
     let crate_names: &'static [&'static str] = Vec::leak(crates.iter().map(|c| leak(c.name)).collect());
@@ -174,7 +174,7 @@ fn compare(label: &str, files: &[(String, String)]) -> Compared {
     // Over the solved names: every verdict, the bodies by chain, the planted index, and the
     // records written from the solve. Nothing else of the solved names leaves this block.
     let (kept, solved_bodies, solved_verdicts, solved_rows, unplaced, unplaced_bodies, planted) = {
-        let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("{label}: resolve_crates: {e}"));
+        let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("{label}: resolve_crates: {e}"));
         let sources: Vec<SourceFile<'_>> = files.iter().map(|(path, text)| SourceFile { path, text }).collect();
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
         let mut world = ProjectWorld::new(&names, &frame, &sources, g).unwrap_or_else(|e| panic!("{label}: front2: {e}"));

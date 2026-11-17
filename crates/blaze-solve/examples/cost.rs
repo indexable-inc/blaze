@@ -48,8 +48,7 @@ fn clone_goal(tys: &mut TestTys, t: blaze_solve::term::Ty) -> Pred {
     Pred::Trait { trait_: def_of("trait", "Clone"), args, polarity: Polarity::Positive }
 }
 
-fn goals_per_sec(label: &str, w: &World, tys: &mut TestTys, env_clauses: &[Clause], preds: &[Pred], cold: bool) {
-    let alloc = Alloc::global();
+fn goals_per_sec(label: &str, w: &World, tys: &mut TestTys, env_clauses: &[Clause], preds: &[Pred], cold: bool, alloc: Alloc<'_>) {
     let mut reads = OVec::new_in(alloc);
     let mut solver = Solver::new_in(alloc);
     let env = solver.env(tys, w, env_clauses, &mut reads).expect("env");
@@ -79,8 +78,7 @@ fn goals_per_sec(label: &str, w: &World, tys: &mut TestTys, env_clauses: &[Claus
     );
 }
 
-fn fulfill<S: Strategy>(label: &str, n: u32, waves: u32) -> u64 {
-    let alloc = Alloc::global();
+fn fulfill<S: Strategy>(label: &str, n: u32, waves: u32, alloc: Alloc<'_>) -> u64 {
     let mut s = staggered(n, waves, |i| (i.wrapping_mul(2_654_435_761) >> 7) % waves).expect("load builds");
     let mut solver = Solver::new_in(alloc);
     let mut reads = OVec::new_in(alloc);
@@ -101,8 +99,7 @@ fn fulfill<S: Strategy>(label: &str, n: u32, waves: u32) -> u64 {
     f.evaluations
 }
 
-fn prefilter_cost(len: usize) {
-    let alloc = Alloc::global();
+fn prefilter_cost(len: usize, alloc: Alloc<'_>) {
     let mut x: u64 = 0x9e37_79b9_7f4a_7c15 ^ len as u64;
     let mut next = || {
         x ^= x << 13;
@@ -150,12 +147,17 @@ fn prefilter_cost(len: usize) {
 }
 
 fn main() {
+    // An entry that takes no grant yet (a plain `fn main`): the run's memory is one frame
+    // taken from the OS here and handed down.
+    let frame = blaze_mem::Frame::with_reserve(1 << 36, blaze_mem::Tag::Solver).expect("the entry's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
     let w = world();
     let mut tys = TestTys::new();
     // Ground: `Vec^d<u32>: Clone` for 200 depths; each needs d+1 impl steps cold.
     let ground: Vec<Pred> = (0..200).map(|d| { let t = nested(&mut tys, d % 8); clone_goal(&mut tys, t) }).collect();
-    goals_per_sec("ground, cold (fresh solver per goal)", &w, &mut tys, &[], &ground, true);
-    goals_per_sec("ground, warm (canonical cache)", &w, &mut tys, &[], &ground, false);
+    goals_per_sec("ground, cold (fresh solver per goal)", &w, &mut tys, &[], &ground, true, alloc);
+    goals_per_sec("ground, warm (canonical cache)", &w, &mut tys, &[], &ground, false, alloc);
     // Generic: `Vec^d<T>: Clone` with `T: Clone` in the env.
     let p = tys.mk(TyKind::Param(0)).expect("arena");
     let env = [Clause { pred: clone_goal(&mut tys, p), bound: 0 }];
@@ -170,17 +172,17 @@ fn main() {
             clone_goal(&mut tys, t)
         })
         .collect();
-    goals_per_sec("generic, cold (fresh solver per goal)", &w, &mut tys, &env, &generic, true);
-    goals_per_sec("generic, warm (canonical cache)", &w, &mut tys, &env, &generic, false);
+    goals_per_sec("generic, cold (fresh solver per goal)", &w, &mut tys, &env, &generic, true, alloc);
+    goals_per_sec("generic, warm (canonical cache)", &w, &mut tys, &env, &generic, false, alloc);
 
     println!();
-    let a = fulfill::<Wake>("fulfill 10000, 100 waves, wake lists", 10_000, 100);
-    let b = fulfill::<Rescan>("fulfill 10000, 100 waves, rescan", 10_000, 100);
+    let a = fulfill::<Wake>("fulfill 10000, 100 waves, wake lists", 10_000, 100, alloc);
+    let b = fulfill::<Rescan>("fulfill 10000, 100 waves, rescan", 10_000, 100, alloc);
     println!("rescan / wake evaluations: {:.1}x", b as f64 / a as f64);
 
     println!();
     for len in [8, 64, 1024] {
-        prefilter_cost(len);
+        prefilter_cost(len, alloc);
     }
 }
 

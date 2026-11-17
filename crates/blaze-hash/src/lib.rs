@@ -1,5 +1,41 @@
 //! What blaze hashes in memory with: one choice per kind of key, so no crate picks its own.
 //!
+//! **A table names its hasher (decision D125)**, in its type and as a value when it is made, as
+//! it names its allocator, and it has one constructor, `new`, taking one options struct whose
+//! every field is written (D126, rule 83 options-struct):
+//!
+//! ```text
+//! let map: Map<K, V, FixedState, &Frame> =
+//!     Map::new(MapOpts { hasher: FixedState, alloc: frame, capacity: None });
+//! let set = Set::new(SetOpts { hasher: key, alloc: frame, capacity: Some(n) }); // key: SipKey
+//! let ordered = OrderMap::new(OrderMapOpts { hasher: FixedState, alloc, capacity: None });
+//! let shared = shared::Map::new(shared::MapOpts {
+//!     name: "cas.packs", hasher: FixedState, alloc, capacity: None,
+//! });
+//! ```
+//!
+//! [`MapOpts`], [`SetOpts`], [`OrderMapOpts`], [`OrderSetOpts`] and the shared tables'
+//! `shared::MapOpts` and `shared::SetOpts` (here `SharedMapOpts`, `SharedSetOpts`). A table
+//! of an iterator's items is `new` then `extend`. The older constructors (`new_in`,
+//! `with_capacity_in`, `from_iter_in`, `with_hasher_in`, `with_capacity_and_hasher_in`) are each
+//! a call of `new` and go at the sweep, as do the aliases that hide the hasher (`HashMap`,
+//! `HashSet`, `IndexMap`, `IndexSet`, `ByHash`, `ByHashSet`, `KeyedMap`, `KeyedSet`,
+//! `SharedMap`, `SharedSet`, `SharedByHash`); the lint rule `ambient-hasher` finds them. Which
+//! hasher:
+//!
+//! | Keys | Hasher | Its value | Open to |
+//! |---|---|---|---|
+//! | Ordinary keys: ids, names blaze made, tuples, paths of the tree | [`FixedState`] | `FixedState` (zero-sized) | HashDoS: its seed is fixed and public, so whoever picks the keys can pick many that share a hash, and each insert then walks them all |
+//! | Keys an outsider picks: a source's names and literals, file names, a request's headers | [`SipKey`] | the key from the randomness grant (bstd's `Io::sip_key`), handed in by the table's maker; no `Default`, so no table of it is made without one | nothing known while the key stays secret (a keyed PRF) |
+//! | Keys that are hashes already: a content ID, a store key, a fingerprint | [`BuildKeyHasher`] | `BuildKeyHasher::default()` (zero-sized) | anything, if the key is not really a hash: it takes the key's first word as its hash |
+//!
+//! [`FixedState`] holds nothing of the machine or the run (rule 25): its hasher is foldhash's
+//! on constants written in `fold`, seed 0, with no address, clock, thread or process input.
+//! Its hashes do depend on the target's byte order and word size (bytes are loaded in native
+//! order, a `usize` is written at the target's width, and std's `Hash` writes a slice's length
+//! as a `usize`), so a table's order can differ between a 64-bit host and `wasm32`: no output
+//! may depend on a map's order, which an [`OrderMap`] keeps to.
+//!
 //! - Ordinary keys (ids, names, tuples, paths): [`HashMap`] and [`HashSet`], this crate's own
 //!   SwissTable ([`hash_map`], [`hash_set`], on `blaze_swiss`'s group probe) on [`FixedState`],
 //!   foldhash's fast hasher with its one fixed seed, in the allocator the type names
@@ -106,10 +142,15 @@ mod tests;
 pub use blake3::{Blake3, Blake3Hasher};
 pub use key::{BuildKeyHasher, ByHash, ByHashSet, KeyHasher};
 pub use sip::{LazyKey, SipHasher, SipKey};
-pub use order::{OrderMap, OrderSet};
+pub use order::{OrderMap, OrderMapOpts, OrderSet, OrderSetOpts};
 pub use plain::{KeyHash, PlainKey, hash_plain};
-pub use hash_map::Map;
-pub use hash_set::Set;
+pub use hash_map::{Map, MapOpts};
+pub use hash_set::{Set, SetOpts};
+/// The shared tables' options (`shared::MapOpts`, `shared::SetOpts`), named apart from the
+/// single-owner ones:
+/// `blaze_core::SharedMap::new(SharedMapOpts { name, hasher, alloc, capacity: None })`.
+#[cfg(feature = "shared")]
+pub use shared::{MapOpts as SharedMapOpts, SetOpts as SharedSetOpts};
 /// Why a `try_reserve` was refused: blaze-own's, the one allocation failure of the tree.
 pub use blaze_own::AllocFailure;
 
@@ -129,15 +170,27 @@ impl<Q: ?Sized + Eq, K: ?Sized + core::borrow::Borrow<Q>> Equivalent<K> for Q {
 
 /// A map of ordinary keys in the allocator `A`, which every use names: `HashMap::new_in(frame)`,
 /// `HashMap::with_capacity_in(n, frame)`, `HashMap::from_iter_in(iter, frame)`.
+///
+/// D125: goes at the sweep; write the hasher: `Map<K, V, FixedState, A>`, made by
+/// `Map::new(MapOpts { hasher: FixedState, alloc, capacity: None })`.
 pub type HashMap<K, V, A> = Map<K, V, FixedState, A>;
 
 /// A set of ordinary keys in the allocator `A`, which every use names, as for [`HashMap`].
+///
+/// D125: goes at the sweep; write the hasher: `Set<K, FixedState, A>`, made by
+/// `Set::new(SetOpts { hasher: FixedState, alloc, capacity: None })`.
 pub type HashSet<K, A> = Set<K, FixedState, A>;
 /// A map of ordinary keys that iterates in insertion order, in the allocator `A`, which every
 /// use names: `IndexMap::new_in(frame)`, `IndexMap::with_capacity_in(n, frame)`.
+///
+/// D125: goes at the sweep; write the hasher: `OrderMap<K, V, FixedState, A>`, made by
+/// `OrderMap::new(OrderMapOpts { hasher: FixedState, alloc, capacity: None })`.
 pub type IndexMap<K, V, A> = OrderMap<K, V, FixedState, A>;
 
 /// A set of ordinary keys that iterates in insertion order, in the allocator `A`.
+///
+/// D125: goes at the sweep; write the hasher: `OrderSet<K, FixedState, A>`, made by
+/// `OrderSet::new(OrderSetOpts { hasher: FixedState, alloc, capacity: None })`.
 pub type IndexSet<K, A> = OrderSet<K, FixedState, A>;
 
 /// A map of keys an attacker may pick (names and paths from outside, a request's headers), in
@@ -146,9 +199,14 @@ pub type IndexSet<K, A> = OrderSet<K, FixedState, A>;
 /// capability that gives randomness). [`SipKey`] has no `Default`, so there is no `new_in`: a
 /// keyed table cannot be made without its key. With the fixed seed of [`HashMap`], whoever
 /// picks the keys can pick ones that share a hash, and each insert then walks them all.
+///
+/// D125: goes at the sweep; write the hasher: `Map<K, V, SipKey, A>`, made by
+/// `Map::new(MapOpts { hasher: key, alloc, capacity: None })`.
 pub type KeyedMap<K, V, A> = Map<K, V, SipKey, A>;
 
 /// A set of keys an attacker may pick, as [`KeyedMap`].
+///
+/// D125: goes at the sweep; write the hasher: `Set<K, SipKey, A>`.
 pub type KeyedSet<K, A> = Set<K, SipKey, A>;
 
 /// A map of ordinary keys shared between threads ([`shared`]), in the allocator its caller
@@ -157,17 +215,24 @@ pub type KeyedSet<K, A> = Set<K, SipKey, A>;
 /// instantiation, `blaze_core::SharedMap`, made by `SharedMap::new_in(name, alloc)`; the root
 /// `.clippy.toml` bans naming this one elsewhere. Behind the `shared` feature, which the crates
 /// that share a table turn on (the root manifest's entry).
+///
+/// D125: goes at the sweep with blaze-core's instantiation; write the hasher in the type, and
+/// make it by `new(SharedMapOpts { name, hasher: FixedState, alloc, capacity: None })`.
 #[cfg(feature = "shared")]
 #[expect(clippy::disallowed_types, reason = "the generic alias blaze-core instantiates (D64)")]
 pub type SharedMap<K, V, A, L> = shared::Map<K, V, FixedState, A, L>;
 
 /// A set of ordinary keys shared between threads, as [`SharedMap`]: `blaze_core::SharedSet`.
+///
+/// D125: goes at the sweep, as [`SharedMap`].
 #[cfg(feature = "shared")]
 #[expect(clippy::disallowed_types, reason = "the generic alias blaze-core instantiates (D64)")]
 pub type SharedSet<K, A, L> = shared::Set<K, FixedState, A, L>;
 
 /// A map on hashes shared between threads, indexed by the hash itself, as [`SharedMap`]:
 /// `blaze_core::SharedByHash`.
+///
+/// D125: goes at the sweep, as [`SharedMap`], with `BuildKeyHasher::default()` as its hasher.
 #[cfg(feature = "shared")]
 #[expect(clippy::disallowed_types, reason = "the generic alias blaze-core instantiates (D64)")]
 pub type SharedByHash<K, V, A, L> = shared::Map<K, V, BuildKeyHasher, A, L>;

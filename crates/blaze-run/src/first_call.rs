@@ -33,7 +33,7 @@
 
 use core::fmt;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_own::{AVec, Alloc, Vec};
 
 use crate::{CodeRef, Nanos, SlotId, ThreadId, Why};
@@ -181,7 +181,7 @@ struct Row {
 pub struct FirstCall<'a> {
     config: Config,
     rows: AVec<'a, Row>,
-    by_symbol: HashMap<Symbol, SlotId, Alloc<'a>>,
+    by_symbol: Map<Symbol, SlotId, FixedState, Alloc<'a>>,
     /// Threads waiting in a stub, each with its slot; at most `config.most_waiters`.
     waiters: AVec<'a, (SlotId, ThreadId)>,
     pub(crate) slip: Slip,
@@ -192,7 +192,7 @@ impl<'a> FirstCall<'a> {
         FirstCall {
             config,
             rows: Vec::new_in(alloc),
-            by_symbol: HashMap::new_in(alloc),
+            by_symbol: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             waiters: Vec::new_in(alloc),
             slip: Slip::None,
         }

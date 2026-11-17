@@ -36,23 +36,22 @@ const SPEC_FD: &str = "/dev/fd/3";
 /// The process's `main` of a `#[bstd::main]` program: what file descriptor 3 asks, then
 /// `main` with every parameter made, or the refusal and [`Status::REFUSED`].
 ///
-/// It reaches the process's roots itself (the OS's and the heap's): [`launch_with`], to which
-/// the program's entry hands them, is the form to call; this one goes in batch B1
-/// (port27/bstd-capabilities.md).
+/// It reaches the OS's root itself: [`launch_with`], to which the program's entry hands it, is
+/// the form to call; this one goes in batch B1 (port27/bstd-capabilities.md).
 pub fn launch<R: crate::entry::Outcome>(
     manifest: &'static Manifest,
     body: impl FnOnce(&mut Given<'_>) -> Result<R, Refused>,
 ) -> Exit {
-    launch_with(blaze_core::Os::process(), blaze_own::Heap::process(), manifest, body)
+    launch_with(blaze_core::Os::process(), manifest, body)
 }
 
-/// [`launch`] with the roots handed down by the program's entry, its `fn main`, where
-/// `blaze_core::Os::process()` and `blaze_own::Heap::process()` are taken (D102, plan
-/// port27/bstd-capabilities.md P3): `os` makes the native world, `heap` every allocation the
-/// launcher makes.
+/// [`launch`] with the OS's root handed down by the program's entry, its `fn main`, where
+/// `blaze_core::Os::process()` is taken (D102, plan port27/bstd-capabilities.md P3): `os`
+/// makes the native world. The process's heap is taken here, by bstd's entry
+/// (`entry::process_heap`, D120): every allocation the launcher makes is in it, and a
+/// `heap: Heap` parameter of `main` is handed it.
 pub fn launch_with<R: crate::entry::Outcome>(
     os: &'static blaze_core::Os,
-    heap: &'static blaze_own::Heap,
     manifest: &'static Manifest,
     body: impl FnOnce(&mut Given<'_>) -> Result<R, Refused>,
 ) -> Exit {
@@ -70,7 +69,8 @@ pub fn launch_with<R: crate::entry::Outcome>(
             return Exit(Status::FAILED);
         }
     };
-    // The heap the process's entry took, once, and handed down (D102).
+    // The process's heap, taken by bstd's entry, once, and handed down (D120).
+    let heap = crate::entry::process_heap();
     let alloc: SharedAlloc<'static> = heap.shared();
     // An ordinary start's spec holds no command line, environment or directory: the world reads
     // the process's own, where the kernel left them (std.md, "What a program pays for at
@@ -108,7 +108,7 @@ pub fn launch_with<R: crate::entry::Outcome>(
                     open_native(os, ArgList::given(args), Vars::given(env), std::path::Path::new(given.dir.as_str()), 0)
                 }
             };
-            run_io(world, main_of(manifest, &spec, started, fake.as_ref(), body))
+            run_io(world, main_of(manifest, &spec, started, fake.as_ref(), heap, body))
         }
     }
 }

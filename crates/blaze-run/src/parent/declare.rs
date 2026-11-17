@@ -24,7 +24,7 @@
 
 #![blaze::sans_io]
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_own::{AVec, Alloc, Vec};
 
 use super::{Compiled, Config, Effect, Error, FastRecord, Function, Parent, Row, State};
@@ -68,8 +68,8 @@ pub enum CompiledNamed<'r> {
 /// The parent's names: each instance's slot, the pairs the program was told, and the most slots
 /// the program's reservation holds. Looked up only, never iterated: no order reaches an output.
 pub(crate) struct Names<'a> {
-    by_instance: HashMap<InstanceKey, SlotId, Alloc<'a>>,
-    told: HashMap<Symbol, SlotId, Alloc<'a>>,
+    by_instance: Map<InstanceKey, SlotId, FixedState, Alloc<'a>>,
+    told: Map<Symbol, SlotId, FixedState, Alloc<'a>>,
     most: u32,
 }
 
@@ -77,11 +77,11 @@ impl<'a> Names<'a> {
     /// The names of a parent started with `functions` in slots `0..`: no slot past them unless
     /// it was made by [`Parent::growing`].
     pub(crate) fn new(functions: &[Function], alloc: Alloc<'a>) -> Names<'a> {
-        let mut by_instance = HashMap::new_in(alloc);
+        let mut by_instance = Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None });
         for (at, function) in functions.iter().enumerate() {
             by_instance.insert(function.instance, SlotId(at as u32));
         }
-        Names { by_instance, told: HashMap::new_in(alloc), most: functions.len() as u32 }
+        Names { by_instance, told: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }), most: functions.len() as u32 }
     }
 }
 

@@ -51,9 +51,9 @@
 
 use std::sync::Arc;
 
-use blaze_core::{Completion, Cursor, Done, Effect, FileName, Stamp, Tag};
+use blaze_core::{Completion, Cursor, DirName, Done, Effect, FileName, Stamp, Tag};
 use blaze_format::cursor::{Put as _, Reader};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::{ContentId, Hasher, bits::BitSet};
 use std::alloc::Global;
 
@@ -91,7 +91,9 @@ const APPEND: u64 = 0;
 const SYNC: u64 = 1;
 const CUT: u64 = 2;
 const REWRITE: u64 = 3;
-const TAGS: u64 = 4;
+/// The sync of the file's directory that makes its name durable ([`Journal::named`]).
+const NAME: u64 = 4;
+const TAGS: u64 = 5;
 
 #[derive(Default)]
 struct Batch {
@@ -105,8 +107,22 @@ enum Flight {
     Idle,
     Appending(Vec<Ticket>),
     Syncing(Vec<Ticket>),
+    /// The file's bytes are synced; its directory is being synced so its name is too.
+    Naming(Vec<Ticket>),
     Cutting,
     Rewriting(Vec<Ticket>),
+}
+
+/// The planted bug [`crate::Plant::NameUnsynced`]: tickets told durable after the file's sync
+/// alone, its name never synced.
+#[cfg(test)]
+fn skips_naming() -> bool {
+    crate::planted(crate::Plant::NameUnsynced)
+}
+
+#[cfg(not(test))]
+const fn skips_naming() -> bool {
+    false
 }
 
 /// By node, one bit: whether a record of it is in the file (or the image it starts from), or
@@ -155,11 +171,21 @@ pub(crate) struct FromImage {
 
 pub(crate) struct Journal {
     file: FileName,
+    /// The directory `file` is in, whose sync makes the file's name durable.
+    dir: DirName,
+    /// The file's name is known durable: its directory was synced, or a rewrite (an
+    /// [`Effect::Write`], which syncs its directories before it completes) completed, since
+    /// this journal was loaded. An append makes the file if it is missing, and a sync of a
+    /// file makes its bytes durable, never its name: until the name is, a crash may take the
+    /// whole file and every record acknowledged in it. Not known at a load (the process
+    /// before may have made the file and stopped before syncing its directory), so each
+    /// journal syncs its directory once, before it tells its first ticket durable.
+    named: bool,
     tags: u64,
     written: Written,
     sequence: u64,
     /// The sequence of each head, as last written.
-    heads: HashMap<Box<str>, u64, Global>,
+    heads: Map<Box<str>, u64, FixedState, Global>,
     /// Records made and not yet handed to an append.
     open: Batch,
     flight: Flight,
@@ -196,7 +222,7 @@ pub(crate) struct Journal {
 /// What [`Journal::recover`] rebuilt.
 pub(crate) struct Loaded {
     pub(crate) tree: Tree,
-    pub(crate) heads: HashMap<Box<str>, NodeId, Global>,
+    pub(crate) heads: Map<Box<str>, NodeId, FixedState, Global>,
     pub(crate) journal: Journal,
     pub(crate) found: Recovered,
 }
@@ -238,8 +264,8 @@ impl Journal {
         marks: &mut Marks,
     ) -> Loaded {
         let mut found = Recovered::default();
-        let mut moves: HashMap<Box<str>, Vec<(u64, Option<ContentId>)>, Global> =
-            HashMap::new_in(Global);
+        let mut moves: Map<Box<str>, Vec<(u64, Option<ContentId>)>, FixedState, Global> =
+            Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         let mut sequence = 0;
         let (mut tree, from) = match image {
             Some(FromImage { tree, name, nodes, resumed }) => {
@@ -275,12 +301,21 @@ impl Journal {
                 disk.root = None;
             }
         }
+        let dir = match file.as_str().rsplit_once('/') {
+            // alloc: once per load, the name of the journal's directory.
+            Some((dir, _)) => DirName::Named(
+                FileName::new(dir).expect("the part of a file's name before its last `/` is a name"),
+            ),
+            None => DirName::Root,
+        };
         let mut journal = Journal {
             file,
+            dir,
+            named: false,
             tags,
             written: Written::filled(tree.len()),
             sequence,
-            heads: HashMap::new_in(Global),
+            heads: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             open: Batch::default(),
             flight: Flight::Idle,
             cut: (valid < bytes.len()).then_some(valid as u64),
@@ -309,7 +344,7 @@ impl Journal {
             Some((image, false)) => journal.base = Some(image),
             None => {}
         }
-        let mut heads = HashMap::new_in(Global);
+        let mut heads = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         // alloc: once per recovery, the heads by name.
         let mut names: Vec<Box<str>> = moves.keys().cloned().collect();
         names.sort_unstable();
@@ -449,7 +484,7 @@ impl Journal {
     pub(crate) fn flush(
         &mut self,
         tree: &Tree,
-        heads: &HashMap<Box<str>, NodeId, Global>,
+        heads: &Map<Box<str>, NodeId, FixedState, Global>,
         disks: &Disks,
         marks: &Marks,
         effects: &mut Vec<Effect>,
@@ -554,7 +589,7 @@ impl Journal {
     pub(crate) fn complete(
         &mut self,
         tree: &Tree,
-        heads: &HashMap<Box<str>, NodeId, Global>,
+        heads: &Map<Box<str>, NodeId, FixedState, Global>,
         disks: &Disks,
         marks: &Marks,
         completion: Completion,
@@ -569,7 +604,18 @@ impl Journal {
                 effects.push(Effect::Sync { file: self.file.clone(), tag: self.tag(SYNC) }); // durable: the journal's appended records: their tickets are told durable when this completes
                 self.flight = Flight::Syncing(tickets);
             }
-            (SYNC, Done::Synced, Flight::Syncing(tickets)) => durable = tickets,
+            (SYNC, Done::Synced, Flight::Syncing(tickets)) if self.named || skips_naming() => {
+                durable = tickets;
+            }
+            (SYNC, Done::Synced, Flight::Syncing(tickets)) => {
+                // clone: an effect owns its directory's name (blaze-core's `Effect`); once per load.
+                effects.push(Effect::SyncDir { dir: self.dir.clone(), tag: self.tag(NAME) }); // durable: the journal's name, which an append may have made: its tickets are told durable when this completes
+                self.flight = Flight::Naming(tickets);
+            }
+            (NAME, Done::Synced, Flight::Naming(tickets)) => {
+                self.named = true;
+                durable = tickets;
+            }
             (CUT, Done::Truncated, Flight::Cutting) => {
                 self.cut = None;
                 // clone: an effect owns its file's name (blaze-core's `Effect`); one per effect.
@@ -584,17 +630,23 @@ impl Journal {
                 }
                 self.settled = self.rewrite_settles;
                 self.rewritten = self.rewriting;
+                // A whole-file write syncs its directories before it completes.
+                self.named = true;
                 durable = tickets;
             }
             // A failed rewrite left the file as it was. A failed append may have left part of
             // its batch, and after a failed sync the kernel may have dropped the pages it could
             // not write, so a second sync could succeed without them. Either way the next
             // effect is a rewrite made of the state then, which holds every move recorded since
-            // and replaces whatever the file has.
+            // and replaces whatever the file has. A failed sync of the directory leaves the name
+            // unknown; the rewrite, a whole-file write, syncs it.
             (
-                APPEND | SYNC | REWRITE,
+                APPEND | SYNC | REWRITE | NAME,
                 Done::Failed(_),
-                Flight::Appending(tickets) | Flight::Syncing(tickets) | Flight::Rewriting(tickets),
+                Flight::Appending(tickets)
+                | Flight::Syncing(tickets)
+                | Flight::Naming(tickets)
+                | Flight::Rewriting(tickets),
             ) => {
                 let later = std::mem::take(&mut self.open).tickets;
                 self.open.tickets = tickets;
@@ -904,7 +956,7 @@ fn record(bytes: &[u8]) -> Option<Record<'_>> {
 fn load(
     tree: &mut Tree,
     record: &Record<'_>,
-    moves: &mut HashMap<Box<str>, Vec<(u64, Option<ContentId>)>, Global>,
+    moves: &mut Map<Box<str>, Vec<(u64, Option<ContentId>)>, FixedState, Global>,
     sequence: &mut u64,
 ) -> Option<()> {
     let payload = record.payload;

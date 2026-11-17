@@ -55,6 +55,7 @@ mod offset;
 mod placed;
 mod planted;
 mod raw;
+pub mod rows;
 mod schema;
 mod verified;
 mod writer;
@@ -625,6 +626,23 @@ pub fn open_as<R: Record>(buffer: &[u8], schema: SchemaHash) -> Result<&Verified
         return Err(FormatError::Schema { found: header.schema, wanted: schema });
     }
     record_at::<R>(buffer, header.root)
+}
+
+/// The root `R` of `buffer` with no check at all, in O(1): what a reader holding the proof of an
+/// earlier [`open`] or [`open_as`] of the same bytes uses to view them again (D114 rule 1: a
+/// record is checked once a process and read in place after; rule 74).
+///
+/// # Safety
+///
+/// [`open`] or [`open_as`] for `R` returned `Ok` for these same bytes, at this same address,
+/// earlier in this process, and they have not changed since.
+pub unsafe fn reopen<R: Record>(buffer: &[u8]) -> &Verified<R> {
+    let start = read_u64(buffer, offset_of!(Header, root)) as usize;
+    // SAFETY: `record_at::<R>` accepted the `R` at the header's root offset of these unchanged
+    // bytes (the caller's promise): `start + size_of::<R>()` is inside the buffer, the `R` is
+    // aligned for it and deeply checked, so `Verified`'s invariant holds for the buffer's prefix
+    // up to the `R`'s end, the slice `record_at` gave `Verified::assume`.
+    unsafe { Verified::assume(buffer.get_unchecked(..start + size_of::<R>())) }
 }
 
 /// The `R` at `at` in `buffer`, checked: past the header, inside the buffer, aligned for `R`,

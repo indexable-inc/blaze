@@ -30,11 +30,10 @@ use blaze_id::{CrateItemKey, ItemKey};
 use blaze_ladder::front2::source::Load;
 use blaze_own::{AVec, Alloc};
 use blaze_scope::items_record::{ItemsRecord, ItemsRecordError};
-use blaze_scope::names_record::{NamesRecord, NamesRecordError};
+use blaze_scope::names_record::{NamesRecordError, Verified};
 use blaze_scope::package_path::PackagePath;
 use blaze_scope::resolve::SourceTexts;
 use bstd::cx::Cx;
-use bstd::mem::{Bytes, Frame};
 
 use crate::CliError;
 use crate::names::expansion_texts::{ExpansionTexts, ExpansionTextsError};
@@ -46,6 +45,9 @@ use crate::store::Store;
 pub(crate) struct CrateRecords<'n> {
     pub key: CrateItemKey,
     pub names: &'n [u8],
+    /// The names section's one form check this process (rule 74): every later read of `names`
+    /// opens it from here, in O(1), with no check again.
+    pub names_proof: Verified<'n>,
     pub items: &'n [u8],
     /// The texts its macro calls made, opened once at the read.
     pub expansions: ExpansionTexts<'n>,
@@ -95,7 +97,8 @@ pub(crate) fn crate_records<'n>(name: Name, payload: &[u8], key: CrateItemKey, a
     let names = blaze_scope::resolve::aligned(parts.names, alloc);
     let items = blaze_scope::resolve::aligned(parts.items, alloc);
     let expansions = ExpansionTexts::open(blaze_scope::resolve::aligned(parts.expansions, alloc)).map_err(|error| LoadError::Expansions { name, error })?;
-    let found = NamesRecord::open(names, alloc).map_err(|error| LoadError::Names { name, error })?.key();
+    let names_proof = Verified::check(names).map_err(|error| LoadError::Names { name, error })?;
+    let found = names_proof.key();
     if found != key {
         return Err(LoadError::OtherCrate { name, asked: key, found, which: "names" });
     }
@@ -103,19 +106,18 @@ pub(crate) fn crate_records<'n>(name: Name, payload: &[u8], key: CrateItemKey, a
     if found != key {
         return Err(LoadError::OtherCrate { name, asked: key, found, which: "items" });
     }
-    Ok(CrateRecords { key, names, items, expansions })
+    Ok(CrateRecords { key, names, names_proof, items, expansions })
 }
 
 /// The crate `key`'s sections from the record `input` names, read from `store` by its key
-/// (`input.at`) into `scratch` and copied into `alloc` ([`crate_records`]). Absent:
+/// (`input.at`) in place and copied into `alloc` ([`crate_records`]). Absent:
 /// [`LoadError::NotInStore`].
-pub(crate) fn read_crate<'n>(cx: &Cx, store: &mut dyn Store, input: &Input, key: CrateItemKey, scratch: &Frame, alloc: Alloc<'n>) -> Result<CrateRecords<'n>, LoadError> {
+pub(crate) fn read_crate<'n>(cx: &Cx, store: &mut dyn Store<'_>, input: &Input, key: CrateItemKey, alloc: Alloc<'n>) -> Result<CrateRecords<'n>, LoadError> {
     let cx = cx.span("front load: read a crate's records");
-    let mut bytes = Bytes::new_in(scratch, "a crate scope record");
-    if !store.get_into(&cx, input.at, &mut bytes).map_err(LoadError::Store)? {
+    let Some(held) = store.get(&cx, input.at).map_err(LoadError::Store)? else {
         return Err(LoadError::NotInStore { name: input.name, at: input.at });
-    }
-    match blaze_drive::record::open(bytes.as_slice()) {
+    };
+    match blaze_drive::record::open(held.bytes) {
         Ok(blaze_drive::record::Stored::Whole(view)) => crate_records(input.name, view.payload, key, alloc),
         Ok(blaze_drive::record::Stored::Shape(_)) => Err(LoadError::NotWhole { name: input.name, why: "a shape record, which holds no payload" }),
         Err(_) => Err(LoadError::NotWhole { name: input.name, why: "its bytes are not a record of this tool's form" }),
@@ -200,6 +202,7 @@ mod tests {
     use blaze_drive::Kind;
     use blaze_ids::ContentId;
     use blaze_ladder::front2::source::{Log, NamesSource, Records};
+    use bstd::mem::Frame;
     use blaze_scope::graph::Sysroot;
     use blaze_scope::resolve::{CrateInput, Names};
     use blaze_surface::{Edition, Namespace};
@@ -263,7 +266,7 @@ mod tests {
             let i = blaze_scope::items_record::encode(c, g).unwrap_or_else(|e| panic!("items record of `{}`: {e:?}", c.name));
             let e = crate::names::expansion_texts::write(c).unwrap_or_else(|e| panic!("expansion texts of `{}`: {e}", c.name));
             let e: &[u8] = if texts { &e[..] } else { &[] };
-            out.push(sections::write(0, [&[], &[], &n[..], &i[..], &[], e]));
+            out.push(sections::write(0, [&[], &[], &n[..], &i[..], &[], e, &[]]));
         }
         out
     }
@@ -388,14 +391,14 @@ mod tests {
     #[test]
     fn a_record_the_store_lacks_is_not_in_the_store() {
         struct Empty;
-        impl Store for Empty {
-            fn get_into(&mut self, _cx: &Cx, _key: Key, _into: &mut Bytes) -> Result<bool, CliError> {
-                Ok(false)
+        impl<'m> Store<'m> for Empty {
+            fn get(&mut self, _cx: &Cx, _key: Key) -> Result<Option<crate::store::Held<'m>>, CliError> {
+                Ok(None)
             }
             fn put(&mut self, _cx: &Cx, _key: Key, _bytes: &[u8]) -> Result<(), CliError> {
                 Ok(())
             }
-            fn seal(&mut self, _cx: &Cx) -> Result<(), CliError> {
+            fn map_all(&mut self, _cx: &Cx) -> Result<(), CliError> {
                 Ok(())
             }
             fn after_answer(&mut self, _cx: &Cx, _profile: &mut blaze_drive::profile::Profile) -> Result<(), CliError> {
@@ -410,8 +413,7 @@ mod tests {
         assert_eq!(name.kind, Kind::CrateScope);
         let at = Key(ContentId::of("blaze-cli front load test key", b"absent"));
         let input = Input { name, at, out: ContentId::of("blaze-cli front load test out", b"absent") };
-        let scratch = Frame::new(bstd::mem::Tag::Other).expect("a frame");
-        match read_crate(&cx, &mut Empty, &input, key, &scratch, Alloc::global()) {
+        match read_crate(&cx, &mut Empty, &input, key, Alloc::global()) {
             Err(error @ LoadError::NotInStore { .. }) => assert!(error.to_string().starts_with("not in the store: "), "{error}"),
             other => panic!("an empty store gave {other:?}"),
         }

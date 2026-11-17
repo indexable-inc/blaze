@@ -117,6 +117,7 @@ pub(crate) struct Working<'a> {
 }
 
 pub(crate) mod rows;
+pub(crate) mod token_outline;
 
 impl<'a> Working<'a> {
     /// Empty: nothing is allocated until the first outline.

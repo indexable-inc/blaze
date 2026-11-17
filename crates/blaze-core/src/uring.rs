@@ -66,7 +66,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_mem::{Handle, Slab, Tag as MemTag, scratch};
 use blaze_radix as radix;
 use std::alloc::Global;
@@ -1831,13 +1831,13 @@ pub struct Uring {
     provided: ManuallyDrop<Provided>,
     /// Each file opened, for reading and appending, and the name each is kept under.
     kept: Slab<Kept>,
-    names: HashMap<FileName, Handle<Kept>, Global>,
+    names: Map<FileName, Handle<Kept>, FixedState, Global>,
     /// Each file opened for reads into and writes from memory ([`Effect::ReadInto`],
     /// [`Effect::WriteFrom`]), by its name: the store's pool's packs, opened once and kept.
-    positional: HashMap<FileName, Handle<Kept>, Global>,
+    positional: Map<FileName, Handle<Kept>, FixedState, Global>,
     /// Each [`Effect::ReadMany`] in flight, by its tag: its parts, each read by a request of
     /// its own on the ring (`ops::PART`), and how many of them are not in yet.
-    batches: HashMap<Tag, Batch, Global>,
+    batches: Map<Tag, Batch, FixedState, Global>,
     /// The table [`crate::threads::run`] is handed for the work done off the ring, which reads
     /// nothing into memory (this driver's reads are on the ring, `positional`'s): it stays
     /// empty, allocating nothing.
@@ -1867,12 +1867,12 @@ pub struct Uring {
     /// Completions to hand out at the next poll, in order.
     ready: Vec<Completion>,
     /// The request reading each watch's events, by the watch's tag.
-    watches: HashMap<Tag, Id, Global>,
+    watches: Map<Tag, Id, FixedState, Global>,
     /// What each watch's read reads for. Not freed while the kernel may still write into a
     /// buffer of one (see `Drop`).
     watchings: ManuallyDrop<Slab<Watching>>,
     /// The request accepting each listen's connections, by the listen's tag.
-    listens: HashMap<Tag, Id, Global>,
+    listens: Map<Tag, Id, FixedState, Global>,
     /// What each listen accepts on, by the handle in its accept's [`ops::Hot::of`].
     listeners: Slab<crate::net::Listener>,
     /// Each connect in flight, by the handle in its request's [`ops::Hot::of`]. Not freed while
@@ -1880,7 +1880,7 @@ pub struct Uring {
     connectings: ManuallyDrop<Slab<Connecting>>,
     spawns: Slab<Spawning>,
     /// Each spawn in flight by its tag, for a kill.
-    spawning: HashMap<Tag, Handle<Spawning>, Global>,
+    spawning: Map<Tag, Handle<Spawning>, FixedState, Global>,
     conns: Slab<Connection>,
     /// By ticks since `start`; a wait of the ring ends at the next one due.
     timers: Wheel<Tag>,
@@ -1895,7 +1895,7 @@ pub struct Uring {
     /// The tables of watches that ended, with their lists of flushes, for the next watch.
     trees: Vec<(crate::watch::Spare, Vec<Tag>)>,
     /// Watches whose start is out on the [`Walker`], by tag.
-    starting: HashMap<Tag, Starting, Global>,
+    starting: Map<Tag, Starting, FixedState, Global>,
     /// Effects that wait for a start ([`Uring::holds`]), in the order they were submitted:
     /// counted in flight, and submitted as a start is put in place.
     held: Vec<Effect>,
@@ -1982,9 +1982,9 @@ impl Uring {
             table,
             provided,
             kept: slab(KEPT)?,
-            names: HashMap::new_in(Global),
-            positional: HashMap::new_in(Global),
-            batches: HashMap::new_in(Global),
+            names: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            positional: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            batches: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             // alloc: setup, once per driver: an empty table, which nothing reads through.
             descriptors: Arc::new(crate::descriptors::Descriptors::new()),
             ops: ManuallyDrop::new(ops::Ops::new(PENDING).map_err(io::Error::other)?),
@@ -2001,20 +2001,20 @@ impl Uring {
             slots_held: 0,
             zero_copy_sends: 0,
             ready: Vec::new(), // alloc: empty, nothing allocated; reused after.
-            watches: HashMap::new_in(Global),
+            watches: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             watchings: ManuallyDrop::new(slab(WATCHES)?),
-            listens: HashMap::new_in(Global),
+            listens: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             listeners: slab(LISTENS)?,
             connectings: ManuallyDrop::new(slab(CONNS)?),
             spawns: slab(SPAWNS)?,
-            spawning: HashMap::new_in(Global),
+            spawning: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             conns: slab(CONNS)?,
             timers: Wheel::new(),
             confine: None,
             spawn_dirs,
             buffers: Vec::with_capacity(SPARES), // alloc: setup, once per driver.
             trees: Vec::with_capacity(SPARES),   // alloc: setup, once per driver.
-            starting: HashMap::with_capacity_in(STARTS, Global),
+            starting: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(STARTS) }),
             held: Vec::new_in(Global),
             started: Vec::with_capacity_in(STARTS, Global),
             grown: Vec::with_capacity_in(STARTS, Global),
@@ -2643,7 +2643,7 @@ fn unflushed(ready: &mut Vec<Completion>, flushes: &mut Vec<Tag>) {
 /// Forgets the descriptor kept for `name`: the name now is another file. It is closed once no
 /// request in flight holds it.
 fn forget(
-    names: &mut HashMap<FileName, Handle<Kept>, Global>,
+    names: &mut Map<FileName, Handle<Kept>, FixedState, Global>,
     kept: &mut Slab<Kept>,
     name: &FileName,
 ) {
@@ -4671,7 +4671,7 @@ mod tests {
         for seed in 0..64 {
             let mut rng = crate::sim::Rng::new(seed);
             let mut ours = ops::Ops::new(PENDING).unwrap();
-            let mut theirs: HashMap<u64, Model, Global> = HashMap::new_in(Global);
+            let mut theirs: Map<u64, Model, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
             let (mut live, mut ended): (Vec<(u64, Id)>, Vec<Id>) = (Vec::new(), Vec::new());
             for next in 0..2_000u64 {
                 match rng.below(4) {

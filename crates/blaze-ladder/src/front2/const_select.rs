@@ -137,8 +137,8 @@ pub(super) fn select_once<'n, S: NamesSource<'n>>(
     let Some(module) = keys.library_in(names, trait_) else { return refuse(SelectWhy::NoLibraryTrait) };
     let spell = Spelling::fixed();
     // An empty block list (no block's `use` is in a trait's own scope); `BlockTraits::module`
-    // takes an `Alloc<'static>`, which the caller's `alloc` is not, as const_project.rs's does.
-    let blocks = BlockTraits::module(Alloc::global());
+    // takes an `Alloc<'static>`, which the caller's `alloc` is not: the store's is.
+    let blocks = BlockTraits::module(store.tys.alloc());
     let self_ = SelfTy::None;
     let world = BodyWorld {
         names,
@@ -154,8 +154,12 @@ pub(super) fn select_once<'n, S: NamesSource<'n>>(
         spell: &spell,
         traits: &[],
         blocks: &blocks,
+        path_marks: &[],
         fills: RefCell::new(Vec::new_in(Global)),
         gaps: RefCell::new(Vec::new_in(Global)),
+        // A constant is evaluated after analysis (rustc's CTFE runs post-analysis): every
+        // opaque in the arguments or the impls' where-clauses is its hidden type.
+        reveal: super::opaque_auto::Reveal::All,
     };
     let out = tc::resolve_instance(&world, constant, args, ground, alloc);
     let fills = world.fills.into_inner();

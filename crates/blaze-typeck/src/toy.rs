@@ -147,6 +147,7 @@ impl World for ToyWorld {
             self_param: false,
             header: crate::ids::FnPtrHeader::RUST,
             c_variadic: false,
+            legacy_const_generics: &[],
             inputs: &self.sig_inputs,
             output: self.sig_output,
             types: self.sig_types.view(),

@@ -36,6 +36,21 @@ macro_rules! outer { () => { $crate::inner_m!() } }
 #[macro_export]
 macro_rules! inner_m { () => { $crate::deep::f() } }
 pub mod deep { pub fn f() -> u32 { 1 } }
+// core's `const_eval_select`: core panic.rs `const_panic!` writes `$crate::intrinsics::const_eval_select!(..)`,
+// a `macro` item of core::intrinsics whose body calls the bare `const_eval_select(..)` fn of that module.
+pub mod intr {
+    pub fn sel() -> u32 { 9 }
+    pub macro cev() { sel() }
+}
+#[macro_export]
+macro_rules! cpanic { () => { $crate::intr::cev!() } }
+// The control: a `macro_rules!` writing bare item names. `deep::f` is in both `dep` and `user`;
+// `only_dep` only in `dep`.
+pub fn only_dep() -> u32 { 4 }
+#[macro_export]
+macro_rules! call_deep { () => { deep::f() } }
+#[macro_export]
+macro_rules! call_only_dep { () => { only_dep() } }
 // core's `extern crate self as core;` and `assert_unsafe_precondition!`'s `::core::ub_checks::$kind()`.
 extern crate self as dep;
 macro_rules! kind_call { ($kind:ident) => { ::dep::deep::$kind() } }
@@ -264,6 +279,49 @@ fn an_ident_fragment_as_a_path_segment_in_a_body() {
     assert!(asked.iter().any(|(_, hit)| *hit == Some(dep_f)), "{asked:?}\n{dump}");
 }
 
+/// The Reference, "Macros By Example" / `macro` items are def-site (rustc's opaque
+/// transparency; drive.md "A token keeps its mark"): the bare `sel()` a `macro` of `dep::intr`
+/// writes resolves at `dep::intr`, where the macro is DEFINED, from `user`'s body (which has
+/// no `sel`). Without the mark (resolving at the call, as before the fix) the asked `sel` hits
+/// nothing. Expected: `test scoped_tests::a_bare_name_in_a_macro_body_resolves_at_its_definition ... ok`.
+#[test]
+fn a_bare_name_in_a_macro_body_resolves_at_its_definition() {
+    let (asked, dump) = asked_paths(0, "fn t() -> u32 { dep::intr::cev!() }");
+    let sel = item_of(1, &["intr", "sel"]);
+    assert!(asked.iter().any(|(p, hit)| p == "sel" && *hit == Some(sel)), "{asked:?} (dep's `intr::sel` is {sel:?})\n{dump}");
+}
+
+/// The pinned core's shape (library/core/src/panic.rs `const_panic!` writes
+/// `$crate::intrinsics::const_eval_select!(..)`; library/core/src/intrinsics/mod.rs
+/// `pub macro const_eval_select` writes the bare `const_eval_select(..)`, a fn of
+/// `core::intrinsics`): a `macro_rules!` reaches a `macro` by `$crate`, whose bare name then
+/// resolves at the `macro`'s module. Expected:
+/// `test scoped_tests::the_const_eval_select_shape_resolves_at_the_macro_s_module ... ok`.
+#[test]
+fn the_const_eval_select_shape_resolves_at_the_macro_s_module() {
+    let (asked, dump) = asked_paths(0, "fn u() -> u32 { dep::cpanic!() }");
+    let sel = item_of(1, &["intr", "sel"]);
+    assert!(asked.iter().any(|(p, hit)| p == "sel" && *hit == Some(sel)), "{asked:?} (dep's `intr::sel` is {sel:?})\n{dump}");
+}
+
+/// THE CONTROL (main's caution: only `macro` items are opaque). The Reference, "Macros By
+/// Example", Hygiene: "By default, all identifiers referred to in a macro expansion are
+/// looked up as if they appeared at the invocation site"; a `macro_rules!` is def-site only
+/// for locals, labels and `$crate`. So `call_deep!` (in `dep`) writing `deep::f()` names
+/// `user`'s `deep::f` when `user` calls it, never `dep`'s; and `call_only_dep!` writing
+/// `only_dep()` names nothing from `user` (E0425 at the call). A resolver that read a
+/// `macro_rules!` name at its definition fails both asserts. Expected:
+/// `test scoped_tests::an_item_name_a_macro_rules_writes_resolves_at_the_call ... ok`.
+#[test]
+fn an_item_name_a_macro_rules_writes_resolves_at_the_call() {
+    let (asked, dump) = asked_paths(0, "fn v() -> u32 { dep::call_deep!() }");
+    let (user_f, dep_f) = (item_of(0, &["deep", "f"]), item_of(1, &["deep", "f"]));
+    assert!(asked.iter().any(|(p, hit)| p == "deep::f" && *hit == Some(user_f)), "{asked:?} (user's {user_f:?}, dep's {dep_f:?})\n{dump}");
+    assert!(!asked.iter().any(|(_, hit)| *hit == Some(dep_f)), "{asked:?}\n{dump}");
+    let (asked, dump) = asked_paths(0, "fn w() -> u32 { dep::call_only_dep!() }");
+    assert!(asked.iter().any(|(p, hit)| p == "only_dep" && hit.is_none()), "{asked:?}\n{dump}");
+}
+
 /// The library item `segments` name from crate `krate`'s root (`crate::..`).
 fn item_of(krate: usize, segments: &[&str]) -> blaze_id::ItemKey {
     use blaze_scope::names::{self, Written};
@@ -286,16 +344,28 @@ fn asked_paths(krate: usize, text: &str) -> (StdVec<(String, Option<blaze_id::It
     /// Each value path asked, as written, and the library item it names from the crate's root.
     struct Ask(&'static Names<'static>, usize, CrateItemKey, StdVec<(String, Option<blaze_id::ItemKey>)>);
     impl crate::resolve::Names for Ask {
-        fn lookup(&mut self, ns: Ns, absolute: bool, segments: &[&str]) -> Answer {
+        fn lookup(&mut self, ns: Ns, absolute: bool, segments: &[&str], mark: Option<crate::mark_site::TextMark>) -> Answer {
             let ns = match ns {
                 Ns::Type => Namespace::Types,
                 Ns::Value => Namespace::Values,
                 Ns::Macro => Namespace::Macros,
             };
-            let p = to_path(absolute, segments, self.2, Alloc::global());
-            let hit = match names::path(self.0, self.0.root(self.1), ns, Written { kind: p.kind, segments: &p.segments }, Alloc::global()) {
-                Ok(r) if r.consumed == p.segments.len() => Some(r.def.key),
-                _ => None,
+            let first = segments.first().copied().unwrap_or("");
+            let hit = match crate::mark_site::site_of(mark, first, absolute, self.0.root(self.1)) {
+                Ok(site) => {
+                    // `$crate` names the mark's crate; `self.2` is read for no other path.
+                    let mut p = to_path(absolute, segments, site.dollar_crate.unwrap_or(self.2), Alloc::global());
+                    // token-mark-2: an item text writes `crate` for another crate's `$crate`; its
+                    // mark's crate is `site.dollar_crate` (blaze-scope `crate_roots::root_by_mark`).
+                    if let (Some(k), false, Some(&"crate")) = (site.dollar_crate, absolute, segments.first()) {
+                        p.kind = blaze_scope::PathKind::DollarCrate(k);
+                    }
+                    match names::path(self.0, site.module, ns, Written { kind: p.kind, segments: &p.segments }, Alloc::global()) {
+                        Ok(r) if r.consumed == p.segments.len() => Some(r.def.key),
+                        _ => None,
+                    }
+                }
+                Err(_) => None,
             };
             self.3.push((segments.join("::"), hit));
             Answer::Absent

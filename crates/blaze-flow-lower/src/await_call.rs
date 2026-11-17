@@ -72,7 +72,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             self.stats.calls_hidden += 1;
         }
         if sig.is_some_and(|s| s.writes_lifetimes) {
-            return self.refuse(Form::CallWritesLifetimes, e);
+            return self.refuse(Form::CallWritesLifetimes { callee: item, lacks: self.call_lacks(item) }, e);
         }
         self.unify_call(&vs, dest, e)?;
         self.stats.calls_unified += 1;

@@ -48,6 +48,7 @@ use crate::BuildError;
 
 mod boxes;
 mod field_scrutinee;
+mod struct_update;
 
 /// One step down a value: a struct's or tuple's field (its row of `layout_fields`), a field of
 /// an enum's variant `v` (its row), an array's element `k`, a `Box`'s contents (at its data
@@ -109,6 +110,11 @@ pub(super) struct Moves<A: Allocator> {
     roots: Vec<Root, A>,
     assigned: Vec<Assigned, A>,
     cx: Option<Cx>,
+    /// The last `Box` whose first adjustment `box_deref_builtin` built: its expression and the
+    /// pointer to it. A move out of a temporary box's contents (walk/moves/boxes.rs
+    /// `move_temp_box_contents`) finds the box's held entry by this pointer: the contents'
+    /// place it is given is the data pointer, which says nothing of where the box is.
+    box_self: Option<(ExprId, Value)>,
 }
 
 impl<A: Allocator + Clone> Moves<A> {
@@ -119,6 +125,7 @@ impl<A: Allocator + Clone> Moves<A> {
             roots: Vec::new_in(alloc.clone()),
             assigned: Vec::new_in(alloc),
             cx: None,
+            box_self: None,
         }
     }
 }
@@ -198,6 +205,23 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         self.scope_pats[held] = Held::Moved { at: (p, off), g, mask: slot };
         self.moves.roots.push(Root { m, expr: e, owner: Owner::Temp, mask: Some(slot), g, field: None });
         Ok(Some((p, off, g)))
+    }
+
+    /// A parameter whose pattern leaves a part that needs drop unbound (walk/matches/irrefutable.rs
+    /// `bind_param`): the argument at `at` (the callee's own copy), of ground type `g`, is owned
+    /// as a temporary scrutinee is, the root of `m` (the next match's number, as `bind_let_owned`
+    /// takes it): a word of its own, all held, and `Held::Moved` in the innermost drop scope (the
+    /// parameters'), pushed before the parameter's bindings so it drops after them. No expression
+    /// moves it: its root names the body's root, which no assignment is under before the
+    /// parameters are bound (`part_bit`'s loop check never applies).
+    pub(super) fn own_param(&mut self, m: u32, at: (Value, i32), g: PTy) {
+        self.moves.roots.retain(|r| r.m != m);
+        let slot = self.b.slot(8, 3, SlotKind::Named);
+        let fa = self.b.slot_addr(slot);
+        let all = self.b.iconst(Ty::I64, u128::from(u64::MAX));
+        self.b.store(Flags::NONE, all, fa, 0, MemAttrs::aligned(3));
+        self.scope_pats.push(Held::Moved { at, g, mask: slot });
+        self.moves.roots.push(Root { m, expr: self.body.root, owner: Owner::Temp, mask: Some(slot), g, field: None });
     }
 
     /// Arm `pat` of match `m` is about to bind (`guarded`: it has a guard): its moves are of
@@ -916,5 +940,26 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             }
         }
         Ok(false)
+    }
+
+    /// `scan_flags`, for an `if let`, `while let` or `let`-`else` pattern `pat`, or a `let`
+    /// that owns its initializer's parts (matches/irrefutable.rs `let_owns_parts`), over
+    /// `scrutinee`: when the scrutinee is a whole local (through parentheses, no adjustment),
+    /// the local gets what a `match` arm over it gives it (walk.rs `scan_flags`'s
+    /// `Expr::Match`): a drop flag when `pat` binds all of it by value, field flags
+    /// (`partial`) when a binding inside `pat` binds a part by value (`moves_deep`), the word
+    /// `move_out` clears that part's bit in.
+    pub(in crate::walk) fn scan_local_scrutinee(&mut self, scrutinee: ExprId, pat: PatId) -> Result<(), BuildError> {
+        if !self.adjust_rows(scrutinee).is_empty() {
+            return Ok(());
+        }
+        let Some(x) = self.local_of(scrutinee)? else { return Ok(()) };
+        let whole = matches!(self.body.pats.get(pat.ix()), Some(Pat::Bind { ann, .. }) if ann.by_ref.is_none());
+        if whole {
+            *self.needs_flag.get_mut(x.ix()).ok_or(malformed("a local past `pats`"))? = true;
+        } else if self.moves_deep(pat)? {
+            *self.partial.get_mut(x.ix()).ok_or(malformed("a local past `pats`"))? = true;
+        }
+        Ok(())
     }
 }

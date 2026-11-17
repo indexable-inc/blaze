@@ -69,7 +69,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_mem::{Slab, Tag as MemTag};
 use crate::chan::{Receiver, Sender};
 use std::alloc::Global;
@@ -557,7 +557,7 @@ pub struct Iocp {
     /// The launcher runs are handed to now.
     warm_now: Option<WarmId>,
     /// The runs in flight in it, by the run the frame names.
-    runs: HashMap<u64, SpawnId, Global>,
+    runs: Map<u64, SpawnId, FixedState, Global>,
     /// The last run handed.
     run: u64,
     /// Frames not yet written to the launcher, in the order of their spawns.
@@ -566,8 +566,8 @@ pub struct Iocp {
     failing: Vec<SpawnId>,
     dirs: RunDirs,
     files: Slab<Cached>,
-    readers: HashMap<FileName, FileId, Global>,
-    appenders: HashMap<FileName, FileId, Global>,
+    readers: Map<FileName, FileId, FixedState, Global>,
+    appenders: Map<FileName, FileId, FixedState, Global>,
     /// Every request in flight. Dropped only once none is (`Drop`): the kernel may write any
     /// of their entries until its packet is taken.
     requests: ManuallyDrop<Slab<Request>>,
@@ -580,11 +580,11 @@ pub struct Iocp {
     ready: Vec<Completion>,
     /// By ticks since `start`: due, then the order they were asked for.
     timers: Wheel<Tag>,
-    watches: HashMap<Tag, Id, Global>,
-    journals: HashMap<Tag, Journaling, Global>,
-    listens: HashMap<Tag, Id, Global>,
+    watches: Map<Tag, Id, FixedState, Global>,
+    journals: Map<Tag, Journaling, FixedState, Global>,
+    listens: Map<Tag, Id, FixedState, Global>,
     spawns: Slab<Spawned>,
-    spawning: HashMap<Tag, SpawnId, Global>,
+    spawning: Map<Tag, SpawnId, FixedState, Global>,
     conns: Slab<Connection>,
     entries: [OVERLAPPED_ENTRY; ENTRIES],
     /// The file locks of [`Effect::Lock`], each taken as it is asked for.
@@ -603,9 +603,9 @@ pub struct Iocp {
 // tied to the thread that made it; the driver is used from one thread at a time (`&mut self`).
 unsafe impl Send for Iocp {}
 
-fn reserved<K, V>() -> HashMap<K, V, Global> {
+fn reserved<K, V>() -> Map<K, V, FixedState, Global> {
     // alloc: setup, the room of a map of what is named by tag.
-    HashMap::with_capacity_in(TAGGED, Global)
+    Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(TAGGED) })
 }
 
 impl Iocp {
@@ -670,9 +670,9 @@ impl Iocp {
             dirs,
             files: Slab::new(FILES, MemTag::Io).map_err(mem)?,
             // alloc: setup, room for every handle kept.
-            readers: HashMap::with_capacity_in(CACHED, Global),
+            readers: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(CACHED) }),
             // alloc: as above.
-            appenders: HashMap::with_capacity_in(CACHED, Global),
+            appenders: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(CACHED) }),
             requests: ManuallyDrop::new(Slab::new(REQUESTS, MemTag::Io).map_err(mem)?),
             stale: 0,
             buffers: ManuallyDrop::new(Buffers::new(BUFFERS).map_err(mem)?),
@@ -3781,7 +3781,7 @@ mod tests {
         for seed in 0..64 {
             let mut rng = crate::sim::Rng::new(seed);
             let mut slab: Slab<Model> = Slab::new(1 << 12, MemTag::Io).unwrap();
-            let mut map: HashMap<u64, Tag, Global> = HashMap::new_in(Global);
+            let mut map: Map<u64, Tag, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
             let mut next = 0u64;
             let (mut live, mut ended): (Vec<(u64, Of)>, Vec<(u64, Of)>) = (Vec::new(), Vec::new());
             for _ in 0..2000 {

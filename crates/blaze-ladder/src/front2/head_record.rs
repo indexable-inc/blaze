@@ -60,7 +60,13 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// 4: a trait's flags carry `COINDUCTIVE` from `#[rustc_coinductive]` (census 14, brief A).
 /// 5: a trait member's predicates hold `Self: MetaSized` unless the trait states a sizedness
 /// (self_size.rs).
-pub const VERSION: u32 = 5;
+/// 6: a fn's record holds its `#[rustc_legacy_const_generics]` positions after its C-variadic
+/// flag (`FnHead::legacy_const_generics`).
+/// 7: an ADT's record holds its `#[blaze::args]` mark after its narrowed-range flag
+/// (`AdtRow::args`, rule 83).
+/// 8: an ADT's record holds its field defaults (RFC 3681) after that mark: one optional key
+/// per field (`Store::field_defaults`), each the key of an anonymous constant's fn head.
+pub const VERSION: u32 = 8;
 /// The digest domains: the record's out digest and a fn text's check.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -195,6 +201,9 @@ pub enum HeadRef<'h, 'n> {
         row: &'h AdtRow,
         defaults: &'h [Option<PTy>],
         const_params: &'h [(u32, PTy)],
+        /// Its field defaults (`Store::field_defaults`): one per field, or empty when no
+        /// field has one. Each default's own head is the fn record of its key.
+        field_defaults: &'h [Option<ItemKey>],
         preds: Option<&'h Preds>,
         life: Option<&'h AdtLife>,
     },
@@ -236,6 +245,7 @@ pub enum Head<'n> {
         row: AdtRow,
         defaults: Vec<Option<PTy>, Mem>,
         const_params: Vec<(u32, PTy), Mem>,
+        field_defaults: Vec<Option<ItemKey>, Mem>,
         preds: Option<Preds>,
         life: Option<AdtLife>,
     },
@@ -261,11 +271,12 @@ impl<'n> Head<'n> {
             Head::Fn { key, head, preds, static_, life } => {
                 HeadRef::Fn { key: *key, head, preds: preds.as_ref(), static_: *static_, life: life.as_ref() }
             }
-            Head::Adt { key, row, defaults, const_params, preds, life } => HeadRef::Adt {
+            Head::Adt { key, row, defaults, const_params, field_defaults, preds, life } => HeadRef::Adt {
                 key: *key,
                 row,
                 defaults: &defaults[..],
                 const_params: &const_params[..],
+                field_defaults: &field_defaults[..],
                 preds: preds.as_ref(),
                 life: life.as_ref(),
             },
@@ -345,7 +356,9 @@ pub fn from_store<'h, 'n>(
             let row = store.adts.get(&ck).ok_or(none)?;
             let defaults = store.maps.generics.get(&lib).map_or(&[][..], |(_, d)| &d[..]);
             let const_params = store.maps.const_params.get(&lib).map_or(&[][..], |c| &c[..]);
-            HeadRef::Adt { key: lib, row, defaults, const_params, preds: store.preds.get(&ck), life: adt_life }
+            // Made with the row (`Store::adt`): a row without it is not this store's own.
+            let field_defaults = store.field_defaults.get(&ck).ok_or(E::NotMade { at })?;
+            HeadRef::Adt { key: lib, row, defaults, const_params, field_defaults: &field_defaults[..], preds: store.preds.get(&ck), life: adt_life }
         }
         HeadAt::Ctor(k) => HeadRef::Ctor { key: k, sig: store.ctors.get(&k).ok_or(none)? },
         HeadAt::Trait(lib) => {
@@ -405,6 +418,30 @@ fn copy<T: Copy>(from: &[T], alloc: Mem) -> Vec<T, Mem> {
 
 /// `head` as a record. Its terms are read from `tys`, the table they are in.
 pub fn encode<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, HeadRecordError> {
+    encode_with(head, tys, alloc, Text::Kept)
+}
+
+/// What a head's READERS compare (the drive's `Signature` out, head_digest.rs `want_digest`):
+/// [`digest`] of `head`'s record with a fn's text slot (its length and digest) zeroed, so the
+/// out holds what the head MEANS (its terms, keys, names, counts and flags) and nothing of how
+/// it is spelled. A fn's text is its whole item, spacing, comments and body included: it is in
+/// the record only so [`decode`] can check the text it is handed (the body is lowered from
+/// it), and a reader of the head never reads it. Its own body's record is keyed by that text.
+/// (Before: a reformat of `fn f( _x : u8 )` moved every reader of `f`, blaze-cli test
+/// `a_signature_edit_makes_its_head_and_its_readers_only`, 2026-11-17.) Never decoded.
+pub fn reader_digest(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'_>) -> Result<ContentId, HeadRecordError> {
+    let bytes = encode_with(head, tys, alloc, Text::Zeroed)?;
+    Ok(digest(&bytes))
+}
+
+/// Whether a fn's text slot holds its text's length and digest, or zeros of the same width.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Text {
+    Kept,
+    Zeroed,
+}
+
+fn encode_with<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>, slot: Text) -> Result<RecordBytes<'b>, HeadRecordError> {
     let mut o = Out {
         tys,
         terms: RecordBytes::new_in(alloc),
@@ -419,8 +456,16 @@ pub fn encode<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>) -> Res
             o.key(key);
             let text = head.text.as_bytes();
             let len = u32::try_from(text.len()).map_err(|_| E::TooBig { what: "a fn's text" })?;
-            o.u32(len);
-            o.body.extend_from_slice(&ContentId::of(TEXT_DOMAIN, text).0);
+            match slot {
+                Text::Kept => {
+                    o.u32(len);
+                    o.body.extend_from_slice(&ContentId::of(TEXT_DOMAIN, text).0);
+                }
+                Text::Zeroed => {
+                    o.u32(0);
+                    o.body.extend_from_slice(&[0; 32]);
+                }
+            }
             o.lib(head.lib);
             o.opt(head.container, |o, k| {
                 o.key(k);
@@ -435,6 +480,10 @@ pub fn encode<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>) -> Res
             o.ty(head.output)?;
             o.flag(head.has_body);
             o.flag(head.c_variadic);
+            o.count(head.legacy_const_generics.len(), "a fn's legacy const generic positions")?;
+            for &k in &head.legacy_const_generics {
+                o.u32(k);
+            }
             o.lib(head.module);
             o.count(head.params.len(), "a fn's parameters in scope")?;
             for &(n, i) in &head.params {
@@ -479,7 +528,7 @@ pub fn encode<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>) -> Res
             })?;
             K_FN
         }
-        HeadRef::Adt { key, row, defaults, const_params, preds, life } => {
+        HeadRef::Adt { key, row, defaults, const_params, field_defaults, preds, life } => {
             o.lib(key);
             o.byte(match row.kind {
                 tc::AdtKind::Struct => 0,
@@ -506,12 +555,21 @@ pub fn encode<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>) -> Res
             }
             o.repr(row.repr);
             o.flag(row.narrowed);
+            o.flag(row.args);
             o.count(row.discrs.len(), "an enum's discriminants")?;
             for &d in &row.discrs {
                 o.body.extend_from_slice(&d.to_le_bytes());
             }
             o.defaults(defaults)?;
             o.const_params(const_params)?;
+            // Its field defaults (form 8): one optional key per field, or none at all.
+            o.count(field_defaults.len(), "an ADT's field defaults")?;
+            for &d in field_defaults {
+                o.opt(d, |o, k| {
+                    o.key(k);
+                    Ok(())
+                })?;
+            }
             o.opt(preds, |o, p| o.preds(p))?;
             o.opt(life, |o, l| {
                 o.u32(l.lifetimes);
@@ -1453,6 +1511,7 @@ impl<'r> In<'r, '_, '_> {
         let output = self.ty("a fn's output")?;
         let has_body = self.flag("a fn's body flag")?;
         let c_variadic = self.flag("a fn's C-variadic flag")?;
+        let legacy_const_generics = self.many("a fn's legacy const generic positions", |r| r.u32("a legacy const generic position"))?;
         let module = self.lib("a fn's module")?;
         let params = self.many("a fn's parameters in scope", |r| Ok((r.name("a parameter's name")?, r.u32("a parameter's index")?)))?;
         let consts = self.many("const parameters", |r| Ok((r.u32("a const parameter")?, r.ty("a const parameter's type")?)))?;
@@ -1482,6 +1541,7 @@ impl<'r> In<'r, '_, '_> {
             self_param,
             header,
             c_variadic,
+            legacy_const_generics,
             inputs,
             output,
             has_body,
@@ -1531,9 +1591,11 @@ impl<'r> In<'r, '_, '_> {
         let fields = self.many("an ADT's fields", |r| Ok(tc::Field { name: r.name("a field's name")?, ty: r.ty("a field's type")? }))?;
         let repr = self.repr()?;
         let narrowed = self.flag("an ADT's narrowed range")?;
+        let args = self.flag("an ADT's `#[blaze::args]` mark")?;
         let discrs = self.many("an enum's discriminants", |r| Ok(i128::from_le_bytes(r.array("a discriminant")?)))?;
         let defaults = self.defaults()?;
         let const_params = self.const_params_own()?;
+        let field_defaults = self.own("an ADT's field defaults", |r| r.opt("a field default", |r| r.key("a field default's key")))?;
         let preds = self.opt("an ADT's where-clauses", |r| r.preds())?;
         let life = self.opt("an ADT's lifetime part", |r| {
             let lifetimes = r.u32("an ADT's lifetimes")?;
@@ -1551,14 +1613,17 @@ impl<'r> In<'r, '_, '_> {
             let field_ends = r.own("an ADT's field region ends", |r| r.u32("a field region end"))?;
             Ok(AdtLife { lifetimes, variances, bounds, fields, field_ends })
         })?;
-        let row = AdtRow { kind, generics, variants, fields, repr, narrowed, discrs };
+        let row = AdtRow { kind, generics, variants, fields, repr, narrowed, discrs, args };
         for v in &row.variants {
             let end = v.fields.start.checked_add(v.fields.len);
             if end.and_then(|e| usize::try_from(e).ok()).is_none_or(|e| e > row.fields.len()) {
                 return Err(E::Shape { what: "a variant's fields run past the ADT's" });
             }
         }
-        Ok(Head::Adt { key, row, defaults, const_params, preds, life })
+        if !field_defaults.is_empty() && field_defaults.len() != row.fields.len() {
+            return Err(E::Shape { what: "an ADT's field defaults are not one per field" });
+        }
+        Ok(Head::Adt { key, row, defaults, const_params, field_defaults, preds, life })
     }
 
     fn repr(&mut self) -> Result<ReprAttrs, E> {
@@ -1730,20 +1795,9 @@ fn mutbl_of(b: u8) -> Result<tc::Mutbl, E> {
     }
 }
 
-/// The inverse of `FnPtrHeader::bits`: the ABI in the low bits, `unsafe` the top bit.
+/// The inverse of `FnPtrHeader::bits` (its one home, blaze-solve term.rs).
 fn header_of(b: u8) -> Result<tc::FnPtrHeader, E> {
-    let abi = match b & 0x7f {
-        0 => tc::Abi::Rust,
-        1 => tc::Abi::C,
-        2 => tc::Abi::CUnwind,
-        3 => tc::Abi::System,
-        4 => tc::Abi::SystemUnwind,
-        5 => tc::Abi::RustCall,
-        6 => tc::Abi::LlvmIntrinsic,
-        _ => return Err(E::Byte { what: "a fn header's ABI", byte: b }),
-    };
-    let safety = if b & 0x80 != 0 { tc::Safety::Unsafe } else { tc::Safety::Safe };
-    Ok(tc::FnPtrHeader { abi, safety })
+    tc::FnPtrHeader::from_bits(b).ok_or(E::Byte { what: "a fn header", byte: b })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1794,6 +1848,7 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(h1.output == h2.output, "a fn's output");
             need!(h1.has_body == h2.has_body, "a fn's body flag");
             need!(h1.c_variadic == h2.c_variadic, "a fn's C-variadic flag");
+            need!(h1.legacy_const_generics[..] == h2.legacy_const_generics[..], "a fn's legacy const generic positions");
             need!(h1.module == h2.module, "a fn's module");
             need!(h1.params[..] == h2.params[..], "a fn's parameters in scope");
             need!(h1.consts[..] == h2.consts[..], "a fn's const parameters");
@@ -1831,14 +1886,16 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             None
         }
         (
-            HeadRef::Adt { key: k1, row: r1, defaults: d1, const_params: c1, preds: p1, life: l1 },
-            HeadRef::Adt { key: k2, row: r2, defaults: d2, const_params: c2, preds: p2, life: l2 },
+            HeadRef::Adt { key: k1, row: r1, defaults: d1, const_params: c1, field_defaults: f1, preds: p1, life: l1 },
+            HeadRef::Adt { key: k2, row: r2, defaults: d2, const_params: c2, field_defaults: f2, preds: p2, life: l2 },
         ) => {
+            need!(f1 == f2, "an ADT's field defaults");
             need!(k1 == k2, "an ADT's key");
             need!(r1.kind == r2.kind && r1.generics == r2.generics, "an ADT's kind or generics");
             need!(r1.variants[..] == r2.variants[..], "an ADT's variants");
             need!(r1.fields[..] == r2.fields[..], "an ADT's fields");
             need!(r1.repr == r2.repr && r1.narrowed == r2.narrowed, "an ADT's repr");
+            need!(r1.args == r2.args, "an ADT's `#[blaze::args]` mark");
             need!(r1.discrs[..] == r2.discrs[..], "an enum's discriminants");
             need!(d1 == d2, "an ADT's parameter defaults");
             need!(c1 == c2, "an ADT's const parameters");

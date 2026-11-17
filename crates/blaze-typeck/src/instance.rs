@@ -135,6 +135,47 @@ impl<W: World> ClosureSource for Asked<'_, '_, '_, W> {
     }
 }
 
+/// The closures of the body whose check is being written back, by ordinal: closure `i`'s kind
+/// is `kinds[i]` and its signature `sigs[i]`, a type of the table the selection imports from
+/// (rules/writeback.rs builds `Checked::closures` so: row `i` is ordinal `i`). The world has
+/// no record of a body still being checked, so its own closures are never asked of it: a
+/// selection at a call of that body (`<Filter<Iter<u8>, {closure#0}> as Iterator>::..`, core's
+/// `char_count_general_case`) takes them from here.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OwnClosures<'s> {
+    pub owner: ItemKey,
+    pub kinds: &'s [crate::ty::ClosureKind],
+    pub sigs: &'s [PTy],
+}
+
+/// A closure of `own.owner` from `own` (its signature in `types`); any other from the world.
+struct OwnFirst<'o, 'p, 'r, 'w, 'a, W: World> {
+    own: Option<OwnClosures<'o>>,
+    types: PTys<'p>,
+    asked: Asked<'r, 'w, 'a, W>,
+}
+
+impl<W: World> ClosureSource for OwnFirst<'_, '_, '_, '_, '_, W> {
+    fn closure_of(&mut self, cx: &mut InferCtx<'_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, CheckError> {
+        let Some(own) = self.own.filter(|o| o.owner == owner) else {
+            return self.asked.closure_of(cx, owner, ordinal, args, depth);
+        };
+        let i = ordinal as usize;
+        let (Some(&kind), Some(&sig)) = (own.kinds.get(i), own.sigs.get(i)) else {
+            return Err(CheckError::Malformed(crate::error::Malformed::BodyTypeInRecord(Question::Closure(owner, ordinal))));
+        };
+        let n = cx.list_len(args);
+        let mut subst: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(n as usize, cx.alloc());
+        for i in 0..n {
+            subst.push(cx.list_get(args, i));
+        }
+        // A signature may name another closure of the same body (`|| |y| y`): this source.
+        let types = self.types;
+        let sig = import(cx, self, types, sig, &subst, depth)?;
+        cx.mk(TyView::ClosureOf { owner, ordinal, args, sig, kind })
+    }
+}
+
 /// Imports portable type `t` of `types` into `cx`, `Param(i)` becoming `subst[i]`.
 pub(crate) fn import(cx: &mut InferCtx<'_>, src: &mut dyn ClosureSource, types: PTys<'_>, t: PTy, subst: &[Ty], depth: u32) -> Result<Ty, CheckError> {
     if depth > MAX_DEPTH {
@@ -380,19 +421,20 @@ pub(crate) fn shape_of(v: TyView, cx: &InferCtx<'_>) -> Option<Shape> {
 /// Instantiates impl header `h` with fresh variables and relates its self type and trait
 /// arguments to the goal's `args` (self first); the fresh arguments when all unify. On `None`
 /// the unifications made are left for the caller's snapshot to roll back.
-pub(crate) fn unify_header(
-    cx: &mut InferCtx<'_>,
+pub(crate) fn unify_header<'a>(
+    cx: &mut InferCtx<'a>,
     h: &ImplHeader<'_>,
     args: crate::ty::TyList,
-) -> Result<Option<Vec<Ty, Alloc<'static>>>, CheckError> {
+) -> Result<Option<Vec<Ty, Alloc<'a>>>, CheckError> {
     let rest = h.types.list(h.trait_args.list())?;
     if rest.len() as u32 + 1 != cx.list_len(args) {
         return Ok(None);
     }
-    let mut fresh: Vec<Ty, Alloc<'static>> = Vec::with_capacity_in(h.generics as usize, Alloc::global());
+    let alloc = cx.alloc();
+    let mut fresh: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(h.generics as usize, alloc);
     // A const parameter's argument is a const (the Reference, "Generic parameters"): each
     // generic gets a variable of the kind its header uses it as (walk AJ P1).
-    let kinds = crate::impl_kinds::impl_var_kinds(h, Alloc::global())?;
+    let kinds = crate::impl_kinds::impl_var_kinds(h, alloc)?;
     for &k in kinds.iter() {
         fresh.push(cx.fresh(k)?);
     }
@@ -474,17 +516,31 @@ pub(crate) fn select_in<W: World>(
     args: &[PTy],
     ground: &mut PortableTys<'_>,
 ) -> Result<Option<(ItemKey, List)>, ResolveError> {
+    select_owning(cx, reads, None, trait_, args, ground)
+}
+
+/// [`select_in`] at a call of a body whose check is being written back: a closure of that body
+/// among the arguments takes its facts from `own` (its signature a type of `ground`).
+pub(crate) fn select_owning<W: World>(
+    cx: &mut InferCtx<'_>,
+    reads: &mut Reads<'_, '_, W>,
+    own: Option<OwnClosures<'_>>,
+    trait_: ItemKey,
+    args: &[PTy],
+    ground: &mut PortableTys<'_>,
+) -> Result<Option<(ItemKey, List)>, ResolveError> {
     if args.is_empty() {
         return Err(ResolveError::NotGround { item: trait_ });
     }
     let mut tys: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(args.len(), cx.alloc());
     for &p in args {
-        // A closure among the arguments is imported through `Question::Closure`.
-        let mut src = Asked { reads: &mut *reads, need: None };
-        match import(cx, &mut src, ground.view(), p, &[], 0) {
+        // A closure of another body among the arguments is imported through `Question::Closure`.
+        let types = ground.view();
+        let mut src = OwnFirst { own, types, asked: Asked { reads: &mut *reads, need: None } };
+        match import(cx, &mut src, types, p, &[], 0) {
             Ok(t) => tys.push(t),
             Err(e) => {
-                return Err(match src.need {
+                return Err(match src.asked.need {
                     Some(q) => ResolveError::Missing(q),
                     None => ResolveError::Check(e),
                 });

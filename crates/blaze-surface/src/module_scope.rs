@@ -35,6 +35,9 @@ use crate::kind::{
 use crate::module_decls::NO_TEXT;
 use crate::path::{Path, PathRow, PathTable, PathView, Paths};
 
+mod in_place;
+pub use in_place::Globs;
+
 /// One `macro_rules!` of a textual scope, in source order (later shadows earlier).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct TextualDef<N> {
@@ -131,7 +134,13 @@ byte_enum! {
 }
 
 impl Unresolved {
-    fn to_record(self) -> (UnresolvedTag, AmbiguityKind) {
+    /// The reason from its two record bytes (a finding of an `Imports` record); `None` for a
+    /// byte that is no reason or no ambiguity kind.
+    pub(crate) fn from_record_bytes(tag: u8, kind: u8) -> Option<Unresolved> {
+        Some(Unresolved::from_record(UnresolvedTag::from_byte(tag)?, AmbiguityKind::from_byte(kind)?))
+    }
+
+    pub(crate) fn to_record(self) -> (UnresolvedTag, AmbiguityKind) {
         let none = AmbiguityKind::GlobVsGlob;
         match self {
             Unresolved::NotFound => (UnresolvedTag::NotFound, none),

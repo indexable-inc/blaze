@@ -3,6 +3,8 @@
 //! cargo's tests build the project and read the features from what it prints or fails to
 //! compile; here they are read from the feature resolver. cargo is MIT or Apache-2.0.
 
+#![feature(allocator_api)]
+
 #[path = "resolver/helpers.rs"]
 mod helpers;
 

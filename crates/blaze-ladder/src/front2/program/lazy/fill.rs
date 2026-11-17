@@ -9,14 +9,15 @@
 use super::*;
 
 use crate::front2::check::eval_len;
+use crate::front2::program::head_abi::{BuildAbi, head_abi};
 use crate::front2::heads::{HeadError, Want};
 use crate::front2::keys::Origin;
 use crate::front2::lower_made::{LowerTarget, lower_made};
 
 impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
     /// The seam's `check_one` (module docs, step 1). `Ok(None)` is never answered: a key this
-    /// program cannot find is [`LazyRefusal::UnknownKey`], since over records an unknown key
-    /// may be a member whose container's head is not made yet, not a fn that does not exist.
+    /// program cannot find (lazy/locate.rs searched its crate's records) is
+    /// [`LazyRefusal::NotFound`], naming what was searched.
     pub(super) fn check_one_key(&mut self, key: ItemKey) -> Result<Option<(usize, Checked<'static>)>, LazyRefusal> {
         if let Some(&i) = self.rows.by_key.get(&key)
             && self.rows.checked[i as usize]
@@ -48,12 +49,42 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             let of_trait = matches!(self.front.keys.origin(callee), Some(Origin::Member { container, kind: MemberKind::Fn, .. }) if !self.store.impls.contains_key(container));
             self.row(callee, of_trait)?;
         }
+        self.async_rows(&made)?;
         self.adt_rows(&checked)?;
         self.body_consts(&checked)?;
         self.body_statics(&checked, &function)?;
         self.body_objects(&checked, &function)?;
+        // Its async blocks' state recipes (coroutine_recipes.rs, as `Front2Program::make_from`
+        // makes them), AFTER its callees' heads are in the store: the lowering relates a call
+        // through its callee's signature (an `async fn` called with an `.await`, its future's
+        // lifetimes), and with no head there the call is refused `ElisionAmbiguous`. A body
+        // with no async block asks nothing.
+        self.body_recipes(&made, &checked, &function)?;
         self.refork(i, made, &function)?;
         Ok(Some((i, checked)))
+    }
+
+    /// Decides where the process starts, once, by THE start rule (program.rs `start_of`, as
+    /// run/special.rs `roots` takes it): an exported entry; else a Rust root's `fn main` (found
+    /// by run_entry.rs `root_main`) through the linked `#[lang = "start"]`, its head read into
+    /// THIS program's store (start.rs `rust_start`: `T`, `main`'s return type, is a type of the
+    /// store's table, the one the back half reads); else `main` called directly. What the seam's
+    /// `rust_start` answers. Reads crate 0's fn rows and their attributes, the linked crates'
+    /// lang rows, and for a Rust start `main`'s head; no body.
+    pub fn decide_start(&mut self) -> Result<(), crate::run::special::RootsError> {
+        use crate::front2::start::{Entry2, rust_start};
+        use crate::run::special::RootsError;
+        let names = self.front.names;
+        let entry = match start_of(names, self.alloc).map_err(RootsError::Start)? {
+            StartOf::Exported(e) => e,
+            StartOf::LangStart(lang_start) => {
+                let main = crate::front2::program::run_entry::root_main(names).map_err(RootsError::Entry)?;
+                Entry2::Rust(rust_start(names, lang_start, main, &mut self.store, &mut self.front.keys).map_err(RootsError::Start)?)
+            }
+            StartOf::Direct => Entry2::Direct(crate::front2::program::run_entry::root_main(names).map_err(RootsError::Entry)?),
+        };
+        self.start = Some(entry);
+        Ok(())
     }
 
     /// The seam's `done`: row `i`'s body is dropped (its head facts stay).
@@ -66,17 +97,25 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
     }
 
     /// How fn `key`'s body is lowered and its head made.
-    fn target_of(&self, key: ItemKey) -> Result<(LowerTarget, Want), LazyRefusal> {
+    /// A key the key map does not know yet is first found and filed from the records
+    /// (lazy/locate.rs: an item row, a member of a container whose head is not made, an item
+    /// declared in a body); the container's head is then the want, made on demand.
+    fn target_of(&mut self, key: ItemKey) -> Result<(LowerTarget, Want), LazyRefusal> {
+        self.locate(key)?;
         if let Some(lib) = self.front.keys.library_in(self.front.names, key) {
             return Ok((LowerTarget::Free(lib), self.store.need(lib)));
         }
         match self.front.keys.origin(key) {
             Some(Origin::Member { container, kind: MemberKind::Fn, .. }) => {
-                let c = self.front.keys.library_in(self.front.names, *container).ok_or(LazyRefusal::UnknownKey { key: *container })?;
-                let want = if self.store.impls.contains_key(container) { Want::MemberFn(c, key) } else { Want::Members(c) };
+                let container = *container;
+                let Some(c) = self.front.keys.library_in(self.front.names, container) else {
+                    return Err(LazyRefusal::NotFound { key, krate: self.refused_shown(key), searched: format!("its container {:032x} is filed with no library key", container.0).into_boxed_str() });
+                };
+                let want = if self.store.impls.contains_key(&container) { Want::MemberFn(c, key) } else { Want::Members(c) };
                 Ok((LowerTarget::Member(key), want))
             }
-            _ => Err(LazyRefusal::UnknownKey { key }),
+            Some(Origin::Member { kind, .. }) => Err(LazyRefusal::NotFound { key, krate: self.refused_shown(key), searched: format!("it is a member of kind {kind:?}, not a fn with a body").into_boxed_str() }),
+            Some(Origin::Item(_)) | None => Err(LazyRefusal::NotFound { key, krate: self.refused_shown(key), searched: Box::from("the key map filed it with no library key") }),
         }
     }
 
@@ -113,12 +152,12 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         let refuse = |refusal: Front2Refusal| LazyRefusal::Row { function: Box::from(path.as_str()), refusal: Box::new(refusal) };
         // A ctor is the language's: tabled as one; the build makes its value.
         if self.store.ctors.contains_key(&key) {
-            let at = match self.front.keys.library(key) {
-                Some(lib) => self.placed_of(lib, &path)?.0,
-                // A struct's ctor is a member key, placed with its struct (owed, as make_from).
-                None => At { file: 0, place: 0 },
-            };
-            return Ok(self.push(key, FnKind::Ctor, Abi::Rust, at, &path, "", None, None));
+            // Placed by the one rule (head_abi.rs `placed_ctor`): no `extern` block is asked.
+            let at = crate::front2::program::head_abi::placed_ctor(self.front.names, self.front.keys.library_in(self.front.names, key));
+            // A ctor is a safe Rust fn (head_abi.rs `head_abi`, the one home): unwinding, never
+            // nounwind, never tracked.
+            let ctor = head_abi(self.front.names, &self.store, key, || Box::from(path.as_str())).map_err(&refuse)?;
+            return Ok(self.push(key, FnKind::Ctor, ctor, false, at, &path, "", None, None));
         }
         if !self.store.fns.contains_key(&key) {
             let (_, want) = self.target_of(key)?;
@@ -127,20 +166,15 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         let Some(head) = self.store.fns.get(&key) else {
             return Err(refuse(Front2Refusal::NoHead { function: Box::from(path.as_str()) }));
         };
-        let (lib, text, header_abi, in_container) = (head.lib, head.text, head.header.abi, head.container.is_some());
-        let abi = match header_abi {
-            tc::Abi::Rust => Abi::Rust,
-            tc::Abi::C => Abi::C,
-            tc::Abi::RustCall => Abi::RustCall,
-            abi => return Err(refuse(Front2Refusal::Abi { function: Box::from(path.as_str()), abi })),
-        };
+        let (lib, text, in_container) = (head.lib, head.text, head.container.is_some());
         let symbols = symbols_of(self.front.names, lib, text, &path).map_err(&refuse)?;
-        let (at, foreign) = self.placed_of(lib, &path)?;
+        let (at, foreign) = self.placed_of(key, lib, &path)?;
         let local = |why: crate::front2::panic_entry::Refused| Front2Refusal::Attrs { function: Box::from(path.as_str()), why: why.form().into() };
         let foreign = foreign.or_else(|| crate::front2::panic_entry::local_abi(&self.store, key));
         let declared_name = crate::front2::panic_entry::local_name(&self.store, key).map_err(local).map_err(&refuse)?;
-        let panic_entry = crate::front2::panic_entry::declares(self.front.names, &self.store, key, Alloc::global()).map_err(local).map_err(&refuse)?;
-        let alloc_shim = crate::front2::alloc_shim::declares(self.front.names, &self.store, key, Alloc::global())
+        let alloc = self.store.tys.alloc();
+        let panic_entry = crate::front2::panic_entry::declares(self.front.names, &self.store, key, alloc).map_err(local).map_err(&refuse)?;
+        let alloc_shim = crate::front2::alloc_shim::declares(self.front.names, &self.store, key, alloc)
             .map_err(|why| refuse(Front2Refusal::Attrs { function: Box::from(path.as_str()), why: why.detail() }))?;
         // As tabled.rs `row`, less its `NoBody` arm: a fn with a body is `Free` here whether or
         // not `check_one` made the body yet (the seam's `function(i).body` is `Some` once it has).
@@ -168,25 +202,42 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         } else {
             None
         };
-        let abi = match foreign {
-            None => abi,
-            Some("C" | "C-unwind") => Abi::C,
-            Some("Rust") => Abi::Rust,
-            Some("rust-call") => Abi::RustCall,
-            Some(_) => return Err(refuse(Front2Refusal::Abi { function: Box::from(path.as_str()), abi: header_abi })),
-        };
-        Ok(self.push(key, kind, abi, at, &path, &symbol, symbols.export.as_deref(), intrinsic))
+        // The ABI and its unwind category, from the ONE home of the rule (program/head_abi.rs
+        // `head_abi`, which tabled.rs `row` calls too): a fn's own head ("C" nounwind,
+        // "C-unwind" not), or a foreign fn's block. An ABI with no reading is refused by name.
+        let own = head_abi(self.front.names, &self.store, key, || Box::from(path.as_str())).map_err(&refuse)?;
+        // `#[rustc_nounwind]` makes any fn nounwind (core/src/panicking.rs:88-92), as tabled.rs.
+        let build = BuildAbi { abi: own.abi, nounwind: own.nounwind || symbols.nounwind };
+        Ok(self.push(key, kind, build, symbols.track_caller, at, &path, &symbol, symbols.export.as_deref(), intrinsic))
+    }
+
+    /// Fn `key`'s own `#[track_caller]` (program/seam_rules.rs `track_caller` asks it of the fn
+    /// and of its trait's declaration): its row's when it has one, else read from its head in
+    /// the store (`symbols_of`, as `row` reads it) without adding a row (`&self`: a callee the
+    /// build resolved to, whose row its own `check_one` makes later). `None`: no row and no
+    /// head, or the head's attributes refused.
+    pub(super) fn own_track_caller(&self, key: ItemKey) -> Option<bool> {
+        if let Some(&i) = self.rows.by_key.get(&key) {
+            return self.rows.track_caller.get(i as usize).copied();
+        }
+        if self.store.ctors.contains_key(&key) {
+            return Some(false);
+        }
+        let head = self.store.fns.get(&key)?;
+        symbols_of(self.front.names, head.lib, head.text, "").ok().map(|s| s.track_caller)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn push(&mut self, key: ItemKey, kind: FnKind, abi: Abi, at: At, path: &str, symbol: &str, export: Option<&str>, intrinsic: Option<Intrinsic>) -> usize {
+    fn push(&mut self, key: ItemKey, kind: FnKind, build: BuildAbi, track_caller: bool, at: At, path: &str, symbol: &str, export: Option<&str>, intrinsic: Option<Intrinsic>) -> usize {
         let i = self.rows.len();
         let path = self.rows.put(path);
         let symbol = self.rows.put(symbol);
         let export = export.map(|e| self.rows.put(e));
         self.rows.key.push(key);
         self.rows.kind.push(kind);
-        self.rows.abi.push(abi);
+        self.rows.abi.push(build.abi);
+        self.rows.nounwind.push(build.nounwind);
+        self.rows.track_caller.push(track_caller);
         self.rows.at.push(at);
         self.rows.path.push(path);
         self.rows.symbol.push(symbol);
@@ -201,8 +252,8 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
 
     /// `placed` over this program's names source; an unanswered `extern_abi` is refused by
     /// name (never taken for "not foreign").
-    fn placed_of(&self, lib: LibKey, item: &str) -> Result<(At, Option<&'n str>), LazyRefusal> {
-        placed(self.front.names, lib).map_err(|_| LazyRefusal::Unanswered { question: "extern_abi", item: Box::from(item) })
+    fn placed_of(&self, key: ItemKey, lib: LibKey, item: &str) -> Result<(At, Option<&'n str>), LazyRefusal> {
+        crate::front2::program::head_abi::placed_fn(self.front.names, &self.store, key, lib).map_err(|_| LazyRefusal::Unanswered { question: "extern_abi", item: Box::from(item) })
     }
 
     /// A fn's name for messages (front2 row_path.rs `shown_name`, the one printer): its row
@@ -239,21 +290,82 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
                 return Err(LazyRefusal::Adt { adt: self.refused_shown(first), why: Box::from("rows still missing after the most rounds") });
             }
             for &k in missing.iter() {
-                let Some(lib) = self.front.keys.library(k) else {
+                // `library_in`: over records the keys map files no item (keys.rs).
+                let Some(lib) = self.front.keys.library_in(self.front.names, k) else {
                     return Err(LazyRefusal::Adt { adt: self.refused_shown(k), why: Box::from("no library key") });
                 };
-                self.make_want(Want::Adt(lib), k).map_err(|e| match e {
-                    LazyRefusal::Head { item, why } => LazyRefusal::Adt { adt: item, why },
-                    other => other,
-                })?;
-                if !self.store.adts.contains_key(&k) {
-                    return Err(LazyRefusal::Adt { adt: self.refused_shown(k), why: Box::from("made, but no row filed under its key") });
-                }
+                self.adt_row(lib, k)?;
             }
         }
         if let Some(k) = self.store.adts.iter().filter(|(_, a)| a.narrowed).map(|(k, _)| *k).min() {
             let adt = self.refused_shown(k);
             return Err(LazyRefusal::Row { function: adt.clone(), refusal: Box::new(Front2Refusal::Layout { adt }) });
+        }
+        Ok(())
+    }
+
+    /// The ADT `k` (library item `lib`) made and filed under its key, or refused by name.
+    fn adt_row(&mut self, lib: LibKey, k: ItemKey) -> Result<(), LazyRefusal> {
+        self.make_want(Want::Adt(lib), k).map_err(|e| match e {
+            LazyRefusal::Head { item, why } => LazyRefusal::Adt { adt: item, why },
+            other => other,
+        })?;
+        if !self.store.adts.contains_key(&k) {
+            return Err(LazyRefusal::Adt { adt: self.refused_shown(k), why: Box::from("made, but no row filed under its key") });
+        }
+        Ok(())
+    }
+
+    /// For a body with an async block, the rows of the library's async items the build of ANY
+    /// coroutine reads: the fns an `.await` calls (below), and the ADTs (front2/coroutines.rs `async_items`: `Poll`'s variants by
+    /// name, `Pin`), as the whole program has them from its census: the body's own types need
+    /// not name them (`add_slowly` names no `Poll`; the executor that matches on it may be
+    /// checked later or never). A library without such an item files nothing here: the
+    /// builder refuses the async block naming `Adts::async_items`. Rows their fields name are
+    /// made by `adt_rows` after this.
+    fn async_rows(&mut self, made: &crate::front2::body::Body<'_>) -> Result<(), LazyRefusal> {
+        if !made.typeck.exprs.iter().any(|e| matches!(e, tc::Expr::AsyncBlock { .. })) {
+            return Ok(());
+        }
+        for name in ["Poll", "pin"] {
+            let Some(lib) = self.front.index.lang(name) else { continue };
+            let k = crate::front2::keys::checker_of(lib);
+            if !self.store.adts.contains_key(&k) {
+                self.adt_row(lib, k)?;
+            }
+        }
+        // The trait fns an `.await` and a coroutine's entries call, which the body's callees do
+        // not list (the builder makes those calls, blaze-build coroutine.rs, by the keys the
+        // seam's `lang_named` gives): each one's head made, so the build reads its ABI from it
+        // (`fn_abi`: no row, the head's). A head not filed under that key is refused by name.
+        for name in ["into_future", "poll", "coroutine_resume"] {
+            let Some(lib) = self.front.index.lang(name) else { continue };
+            // The key the seam's `lang_named` and `lang_item` give (keys.rs `asked_key`): a
+            // trait's fn is filed under its member key, not its library key's first bytes.
+            let k = crate::front2::keys::asked_key(self.front.names, lib);
+            if self.store.fns.contains_key(&k) {
+                continue;
+            }
+            // A trait's fn is a library-keyed member (by_origin.rs `kind_of_lib`): its head is
+            // made with its trait's members (`Store::need` of the owner).
+            let want = match self.front.names.member_owner(lib) {
+                Some((owner, _)) => self.store.need(owner),
+                None => self.store.need(lib),
+            };
+            // No head filed under `k` after this is refused where it is needed, by name (the
+            // build's `NoAbi`: "the build's `Adts` gave no ABI for it").
+            self.make_want(want, k)?;
+        }
+        // Each one's row, as a callee's: the build resolves the call it makes by the fn's row
+        // (`fn_index`), a trait's fn tabled as declared, as `check_one_key` tables a callee.
+        for name in ["into_future", "poll", "coroutine_resume"] {
+            let Some(lib) = self.front.index.lang(name) else { continue };
+            let k = crate::front2::keys::asked_key(self.front.names, lib);
+            if !self.store.fns.contains_key(&k) {
+                continue;
+            }
+            let of_trait = matches!(self.front.keys.origin(k), Some(Origin::Member { container, kind: MemberKind::Fn, .. }) if !self.store.impls.contains_key(container));
+            self.row(k, of_trait)?;
         }
         Ok(())
     }
@@ -314,6 +426,25 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
     /// (what `make_from` asks over every body: here over this one) that this program has not
     /// made, with every supertrait under it (program.rs `object_tables`, the one home). A
     /// refused trait stops the run, naming it.
+    /// The state recipe of each async block of `made`, filed in (owner, ordinal) order for the
+    /// seam's `coroutine_recipe` (coroutine_recipes.rs `recipes_of` and `find`, the one home).
+    /// A block whose flow is refused is filed with its refusal, as `make_from` files it.
+    fn body_recipes(&mut self, made: &crate::front2::body::Body<'_>, checked: &Checked<'static>, function: &str) -> Result<(), LazyRefusal> {
+        let mut recipes: Vec<crate::front2::coroutine_recipes::RecipeRow, Global> = Vec::new_in(Global);
+        let alloc = self.alloc;
+        {
+            let mut r = self.records(true);
+            crate::front2::coroutine_recipes::recipes_of(&mut r, made, checked, &mut recipes, alloc)
+        }
+        .map_err(|error| LazyRefusal::Check { function: Box::from(function), error: CheckFail::Check { owner: made.typeck.owner, error } })?;
+        for row in recipes {
+            if let Err(at) = self.recipes.binary_search_by_key(&(row.0, row.1), |r| (r.0, r.1)) {
+                self.recipes.insert(at, row);
+            }
+        }
+        Ok(())
+    }
+
     fn body_objects(&mut self, checked: &Checked<'static>, function: &str) -> Result<(), LazyRefusal> {
         let mut asked = dyn_principals([self.store.tys.view(), checked.types.view()].into_iter());
         asked.retain(|k| !self.objects.contains_key(k));
@@ -333,7 +464,7 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
     /// then `made` (row `i`'s new body) too, its literals read: module docs.
     fn refork(&mut self, i: usize, made: Body<'n>, function: &str) -> Result<(), LazyRefusal> {
         let lower = |error| LazyRefusal::Lower { function: Box::from(function), error };
-        let mut tys = self.store.tys.fork_in(Alloc::global()).map_err(|_| LazyRefusal::Table { function: Box::from(function) })?;
+        let mut tys = self.store.tys.fork_in(self.store.tys.alloc()).map_err(|_| LazyRefusal::Table { function: Box::from(function) })?;
         let (names, prepared) = (self.front.names, self.prepared);
         for l in self.live.iter_mut().flatten() {
             l.again = lower_again(names, prepared, &mut self.front.keys, &mut self.store, &l.made, &mut tys).map_err(lower)?;

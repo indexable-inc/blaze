@@ -39,7 +39,15 @@
 //! keep, which is why a sync and a barrier are told how many changes they cover.
 //!
 //! Not modelled yet: modes, links, holes and clones (a file is its bytes); a full disk; a
-//! read cut short.
+//! read cut short; and a barrier's order before a later change of a name. `Effect::Barrier`
+//! orders what it covers before every later write, an unsynced rename's new name included
+//! ("the bytes ordered before the name"), and `Sim` keeps that (`sim.rs`'s `keep_ordered`:
+//! a change of a name a crash does not undo counts as kept, by the epoch it was made in);
+//! this world's [`Named`] carries no epoch, so [`Disk::allows`] still allows a crash that keeps
+//! an unsynced rename made after a barrier and tears what the barrier covers. The simulation
+//! draws fewer cuts than the world allows, never more, so the refinement (`sim/world.rs`)
+//! holds; a proof here of a commit by "write, barrier, rename" waits for the epoch on
+//! [`Named`] and the proofs under `lean/BlazeCore/World` redone over it.
 
 #![blaze::sans_io]
 

@@ -105,7 +105,7 @@ pub(crate) fn emit_record_up_to<'a>(
     };
     let mut out = Code::new_in(alloc);
     let mut form = Form::new_in(alloc);
-    pass::run(func, &[], isa, inline_most, &mut out.bytes, &mut out.fixups, &mut out.relocs, Some(&mut form))
+    pass::run(func, &[], isa, inline_most, &mut out.bytes, &mut out.fixups, &mut out.relocs, &mut out.positions, Some(&mut form))
         .map_err(RecordEmitError::Emit)?;
     if !out.fixups.is_empty() || !out.relocs.is_empty() {
         let why = "an address word asked of placement (the record form places none)";

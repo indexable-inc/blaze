@@ -1,5 +1,5 @@
 // blaze: the pin of blaze-stencil's libraries, `stencils.json` beside this file, as
-// crates/hir-ty-codegen/llvm.json pins LLVM: each library's file and the id it must have, the
+// crates/blaze-toolchain/pins/llvm.json pins LLVM: each library's file and the id it must have, the
 // BLAKE3 hash of its bytes with the id field zeroed (`format::Writer::finish`). blaze-stencil's
 // build script holds every library it includes to it: a library the pinned LLVM makes (the
 // `llvm-stencils` feature) must be the pinned one, so a change to what the generator makes is a

@@ -20,26 +20,48 @@
 //! out), largest first, each with one example: the fn's path and the whole refusal line. Then
 //! the refusals by the refused fn's crate, and the front end's left-out classes the same way.
 //! Every table is sorted (count, then text): no map order reaches the output. One thread.
+//!
+//! Under each of the [`MOST_WHY`] largest `SPLIT` rows, a `WHY` block: the evidence for the
+//! row's first fn, read from its typed refusal and the names' tables (blaze-ladder
+//! front2/census_why.rs: an unresolved header path's modules, macro calls, imports and cfgs; a
+//! constant's chain innermost first; a refused head's range and token mark; else the innermost
+//! refusal and its place), at most 20 lines.
+//!
+//! `--only <crate>[,<crate>..]`: the walk starts from every free fn (no member, no foreign fn)
+//! DEFINED in the crates of those names, in place of the positional root's `main`; the LEFT,
+//! SPLIT, WHY, REFUSALS and CRATE rows count only fns of those crates (what the walk reached
+//! in their dependencies is counted on one line, not listed). The names are still resolved
+//! for every unit, but the walk is limited to those crates (`Front2Program::survey_within`):
+//! a fn of another crate is left out from its head only (reach.rs `OUTSIDE`), never lowered,
+//! checked or built, and a call of one is one counted line, not a refusal row; a root that does
+//! not lower is a left-out row. `PHASES` gives each phase's wall time. `REACHED BY CRATE` gives
+//! the 15 crates with the most fns the walk tabled.
 
 use std::{env, panic, process, time::Instant};
 
+use blaze_ladder::front2::census_why;
 use blaze_ladder::front2::program::{Front2Program, LeftOut};
+use blaze_ladder::front2::reach;
 use blaze_ladder::run::{OverflowChecks, build_survey};
 use blaze_ladder::seam::FrontEnd;
 use blaze_own::{AString, AVec, Alloc, ASortedMap};
 use blaze_scope::names::{self as scope_names, Written};
 use blaze_scope::resolve::Names;
-use blaze_surface::{Namespace, PathKind};
+use blaze_surface::{ItemDetail, Namespace, PathKind};
 
 #[expect(dead_code, reason = "stages' loader, shared: this example reads only the names and the members")]
 mod names_load;
 
+/// The largest `SPLIT` rows that get a `WHY` block.
+const MOST_WHY: usize = 12;
+
 /// One class's row: how many refusals, and the first example (in the survey's order, which is
-/// the program's key order: deterministic).
+/// the program's key order: deterministic) with its index in the list it came from.
 struct Row<'a> {
     count: usize,
     function: AString<'a>,
     line: AString<'a>,
+    first: usize,
 }
 
 /// A refusal's stage, from the words `build_survey` files it under (run.rs `filed`).
@@ -107,16 +129,69 @@ fn crate_of(path: &str) -> &str {
     p.split("::").next().unwrap_or(p)
 }
 
-/// Files `(function, said)` under its class in `table`.
-fn file<'a>(table: &mut ASortedMap<'a, AString<'a>, Row<'a>>, key: &str, function: &str, line: &str, alloc: Alloc<'a>) {
+/// Files `(function, said)`, the `at`th of its list, under its class in `table`.
+fn file<'a>(table: &mut ASortedMap<'a, AString<'a>, Row<'a>>, key: &str, function: &str, line: &str, at: usize, alloc: Alloc<'a>) {
     let k = AString::from_str_in(key, alloc);
     match table.get_mut(&k) {
         Some(row) => row.count += 1,
         None => {
-            table.insert(k, Row { count: 1, function: AString::from_str_in(function, alloc), line: AString::from_str_in(line, alloc) });
+            table.insert(k, Row { count: 1, function: AString::from_str_in(function, alloc), line: AString::from_str_in(line, alloc), first: at });
         }
     }
 }
+
+/// Whether `function` is counted: every fn without `--only`, else a fn of a named crate.
+fn counted(only: &[&str], function: &str) -> bool {
+    only.is_empty() || only.contains(&crate_of(function))
+}
+
+/// The `--only` roots: every free fn defined in each crate of a name in `only` (a fn of a
+/// module or of a fn's body; no member of an impl or trait, no foreign fn), sorted by key.
+fn only_roots<'a>(names: &Names<'_>, only: &[&str], alloc: Alloc<'a>) -> AVec<'a, blaze_id::ItemKey> {
+    let mut out: AVec<'a, blaze_id::ItemKey> = AVec::with_capacity_in(256, alloc);
+    for want in only {
+        let mut crates = 0usize;
+        for (k, c) in names.crates().iter().enumerate() {
+            if c.name != *want {
+                continue;
+            }
+            crates += 1;
+            let before = out.len();
+            for (key, _, place) in names.items(k) {
+                let Some((_, outline)) = names.outline_at(k, place.at) else { continue };
+                let item = outline.item(place.item);
+                if !matches!(item.detail, ItemDetail::Fn { .. }) {
+                    continue;
+                }
+                let free = item.parent.is_none_or(|p| !matches!(outline.item(p).detail, ItemDetail::Impl | ItemDetail::Trait | ItemDetail::ExternBlock { .. }));
+                if free {
+                    out.push(key);
+                }
+            }
+            println!("only: crate {want} ({k}): {} free fns as roots", out.len() - before);
+        }
+        if crates == 0 {
+            println!("only: no crate is named {want:?}");
+        }
+    }
+    out.as_mut_slice().sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The indices of the crates of the names in `only`, sorted (a name two units share is both).
+fn only_crates<'a>(names: &Names<'_>, only: &[&str], alloc: Alloc<'a>) -> AVec<'a, usize> {
+    let mut out: AVec<'a, usize> = AVec::with_capacity_in(only.len(), alloc);
+    for (k, c) in names.crates().iter().enumerate() {
+        if only.contains(&c.name) {
+            out.push(k);
+        }
+    }
+    out
+}
+
+/// How many crates `REACHED BY CRATE` lists.
+const MOST_REACHED_CRATES: usize = 15;
 
 /// `table`'s rows largest first, then by class.
 fn sorted<'t, 'a>(table: &'t ASortedMap<'a, AString<'a>, Row<'a>>, alloc: Alloc<'a>) -> AVec<'a, (&'t str, &'t Row<'a>)> {
@@ -158,37 +233,59 @@ fn roots<'a>(names: &Names<'_>, member: &[bool], wanted: &str, alloc: Alloc<'a>)
 /// out), largest first, each with its first fn and the whole cause; under each class, the
 /// causes behind it by the row's split (front2 program/left_out.rs `LeftOut::split`: a gap's
 /// own item by its path and why), kept whole, so "check gap: RefusedImpl" splits by impl and
-/// why. Printed before the survey, so a survey that stops still leaves them.
-fn print_left(left: &[(Box<str>, LeftOut)], alloc: Alloc<'_>) {
+/// why. Printed before the survey, so a survey that stops still leaves them. The
+/// [`MOST_WHY`] largest split rows each get a `WHY` block (census_why.rs) for their first fn.
+/// With `only` non-empty, only the fns of those crates are counted.
+fn print_left<'n>(names: &'n Names<'n>, left: &[(Box<str>, LeftOut)], only: &[&str], alloc: Alloc<'_>) {
     let mut lefts: ASortedMap<'_, AString<'_>, Row<'_>> = ASortedMap::with_capacity_in(64, alloc);
     // Keyed `<class>\t<split>`: a class never holds a tab (its words are the refusal's).
     let mut splits: ASortedMap<'_, AString<'_>, Row<'_>> = ASortedMap::with_capacity_in(256, alloc);
-    for (function, row) in left.iter() {
+    let mut outside = 0usize;
+    for (at, (function, row)) in left.iter().enumerate() {
         let function: &str = function;
+        if !counted(only, function) {
+            outside += 1;
+            continue;
+        }
         let mut line = AString::from_str_in(function, alloc);
         line.push_str(": ");
         for c in row.whole.chars() {
             line.push(if c == '\n' { ' ' } else { c });
         }
         let class = class_of(&row.class, alloc);
-        file(&mut lefts, class.as_str(), function, line.as_str(), alloc);
+        file(&mut lefts, class.as_str(), function, line.as_str(), at, alloc);
         if !row.split.is_empty() {
             let mut key = AString::from_str_in(class.as_str(), alloc);
             key.push('\t');
             key.push_str(&row.split);
-            file(&mut splits, key.as_str(), function, line.as_str(), alloc);
+            file(&mut splits, key.as_str(), function, line.as_str(), at, alloc);
         }
     }
-    println!("LEFT OUT BY THE FRONT END ({} fns, {} classes, {} split rows)", left.len(), lefts.len(), splits.len());
+    println!("LEFT OUT BY THE FRONT END ({} fns, {} classes, {} split rows)", left.len() - outside, lefts.len(), splits.len());
+    if !only.is_empty() {
+        println!("only: {outside} more fns left out are of other crates (reached in dependencies), not listed");
+    }
     let split_rows = sorted(&splits, alloc);
+    // The split rows that get a WHY block: the largest, by the order `sorted` gives.
+    let why_rows = &split_rows[..split_rows.len().min(MOST_WHY)];
+    let mut block = AString::new_in(alloc);
     for (k, r) in sorted(&lefts, alloc).iter() {
         println!("LEFT {} {k}", r.count);
         println!("    e.g. {}", r.line.as_str());
         for (sk, sr) in split_rows.iter() {
             let Some((class, split)) = sk.split_once('\t') else { continue };
-            if class == *k {
-                println!("SPLIT {} {class} | {split}", sr.count);
-                println!("    e.g. {}", sr.line.as_str());
+            if class != *k {
+                continue;
+            }
+            println!("SPLIT {} {class} | {split}", sr.count);
+            println!("    e.g. {}", sr.line.as_str());
+            if why_rows.iter().any(|(wk, _)| wk == sk) {
+                block.truncate(0);
+                let why = census_why::why_of(names, &left[sr.first].1, alloc);
+                match why.write_to(&mut block, "    ") {
+                    Ok(()) => print!("{}", block.as_str()),
+                    Err(e) => println!("    WHY: the block did not write: {e}"),
+                }
             }
         }
     }
@@ -204,10 +301,35 @@ fn main() {
         }
         v
     };
+    const USAGE: &str = "usage: tempo_build <checkout> <fetch-store> <module-store> <modules-out> <script-records> <root crate[,crate..]> [--only <crate>[,<crate>..]] [--crates]";
     if args.len() < 7 {
-        println!("usage: tempo_build <checkout> <fetch-store> <module-store> <modules-out> <script-records> <root crate[,crate..]>");
+        println!("{USAGE}");
         process::exit(2);
     }
+    // The flags after the positional ones; an unknown one stops the run by name.
+    let mut only: AVec<'_, &str> = AVec::with_capacity_in(4, alloc);
+    let mut i = 7;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--only" => {
+                let Some(list) = args.get(i + 1) else {
+                    println!("stopped: `--only` names no crate\n{USAGE}");
+                    process::exit(2);
+                };
+                only.extend(list.as_str().split(',').filter(|c| !c.is_empty()));
+                i += 2;
+            }
+            // The per-crate table (`CRATE` rows) is always printed.
+            "--crates" => i += 1,
+            other => {
+                println!("stopped: unknown flag {other:?}\n{USAGE}");
+                process::exit(2);
+            }
+        }
+    }
+    only.as_mut_slice().sort_unstable();
+    only.dedup();
+    let only: &[&str] = only.as_slice();
     let mut shown = AString::new_in(alloc);
     for a in args.iter() {
         shown.push_str(a.as_str());
@@ -224,8 +346,16 @@ fn main() {
         }
     };
     let names = loaded.names;
-    println!("names: {} crates in {:.1}s", names.crates().len(), t0.elapsed().as_secs_f64());
-    let roots = roots(names, &loaded.member, path(6), alloc);
+    let names_s = t0.elapsed().as_secs_f64();
+    println!("names: {} crates in {names_s:.1}s", names.crates().len());
+    let roots = if only.is_empty() {
+        roots(names, &loaded.member, path(6), alloc)
+    } else {
+        println!("only: the roots are the free fns of {only:?}; the positional root {} is not walked", path(6));
+        only_roots(names, only, alloc)
+    };
+    let from: &str = if only.is_empty() { path(6) } else { "the --only crates" };
+    let only_at = only_crates(names, only, alloc);
     if roots.is_empty() {
         println!("stopped: no root");
         process::exit(1);
@@ -243,7 +373,13 @@ fn main() {
     let mut refused = Default::default();
     let t1 = Instant::now();
     let got = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let mut program = match Front2Program::survey_from(names, &frame, &[], roots.as_slice(), &mut left_out) {
+        let walked = if only.is_empty() {
+            Front2Program::survey_from(names, &frame, &[], roots.as_slice(), &mut left_out, alloc)
+        } else {
+            let within = reach::Within { crates: Some(only_at.as_slice()), most_fns: None };
+            Front2Program::survey_within(names, &frame, &[], roots.as_slice(), within, &mut left_out, alloc)
+        };
+        let mut program = match walked {
             Ok(p) => p,
             Err(e) => {
                 println!("stopped: the walk from the roots: {e}");
@@ -260,10 +396,16 @@ fn main() {
         }
         // Printed before the survey, so a survey that stops still leaves the reach's counts.
         let left_n: usize = left_out.len();
-        println!("REACH from {}: {fns} fns tabled ({bodied} with a body); {left_n} left out by the front end; {reach_s:.1}s", path(6));
-        print_left(&left_out, alloc);
+        println!("REACH from {from}: {fns} fns tabled ({bodied} with a body); {left_n} left out by the front end; {reach_s:.1}s");
+        let by_crate = program.reached_by_crate();
+        println!("REACHED BY CRATE ({} crates; the {} with the most fns the walk tabled, left-out ones too)", by_crate.len(), by_crate.len().min(MOST_REACHED_CRATES));
+        for &(k, n) in by_crate.iter().take(MOST_REACHED_CRATES) {
+            let name = names.crates().get(k).map_or("(no crate)", |c| c.name);
+            println!("  {n} {name} ({k})");
+        }
+        print_left(names, &left_out, only, alloc);
         let t2 = Instant::now();
-        let counts = match build_survey(&mut program, &mut refused, OverflowChecks::On) {
+        let counts = match build_survey(&mut program, &mut refused, OverflowChecks::On, alloc) {
             Ok(c) => c,
             Err(e) => {
                 println!("stopped: the build survey: {e}");
@@ -280,13 +422,25 @@ fn main() {
     };
     let left: &[(_, _)] = &left_out;
     let refused: &[(_, _)] = &refused;
-    let _ = (reach_s, bodied);
+    let _ = bodied;
     // By stage and class.
     let mut classes: ASortedMap<'_, AString<'_>, Row<'_>> = ASortedMap::with_capacity_in(64, alloc);
     let mut crates: ASortedMap<'_, AString<'_>, Row<'_>> = ASortedMap::with_capacity_in(64, alloc);
     let (mut builder, mut callee, mut tier) = (0usize, 0usize, 0usize);
-    for (function, said) in refused.iter() {
+    let mut refused_outside = 0usize;
+    let mut calls_outside = 0usize;
+    for (at, (function, said)) in refused.iter().enumerate() {
         let (function, said): (&str, &str) = (function, said);
+        if !counted(only, function) {
+            refused_outside += 1;
+            continue;
+        }
+        // A call of a fn the walk was limited away from (reach.rs `OUTSIDE`): not a refusal
+        // of this crate's code, one counted line.
+        if said.contains(reach::OUTSIDE) {
+            calls_outside += 1;
+            continue;
+        }
         let s = stage(said);
         match s {
             "tier" => tier += 1,
@@ -299,8 +453,8 @@ fn main() {
         let mut line = AString::from_str_in(function, alloc);
         line.push_str(": ");
         line.push_str(said);
-        file(&mut classes, key.as_str(), function, line.as_str(), alloc);
-        file(&mut crates, crate_of(function), function, line.as_str(), alloc);
+        file(&mut classes, key.as_str(), function, line.as_str(), at, alloc);
+        file(&mut crates, crate_of(function), function, line.as_str(), at, alloc);
     }
     let pct = |n: usize| if tried == 0 { 0.0 } else { 100.0 * n as f64 / tried as f64 };
     println!(
@@ -308,6 +462,11 @@ fn main() {
         pct(built),
         refused.len()
     );
+    if !only.is_empty() {
+        println!("only: {refused_outside} of the {} refusals are of fns of other crates, not listed (tried and built count every crate)", refused.len());
+        println!("only: {calls_outside} refusals are a call of a fn of a crate outside the walk (tabled from its head only), not listed");
+    }
+    println!("PHASES names {names_s:.1}s, reach {reach_s:.1}s, instances {build_s:.1}s");
     println!("REFUSALS BY CLASS ({} classes; stage, count, class; then the first example)", classes.len());
     for (k, r) in sorted(&classes, alloc).iter() {
         let (s, c) = k.split_once('\t').unwrap_or(("?", k));
@@ -319,5 +478,5 @@ fn main() {
     for (k, r) in sorted(&crates, alloc).iter() {
         println!("CRATE {} {k}", r.count);
     }
-    println!("TOTAL {}: reached {fns} fns, left out {}; instances tried {tried}, built {built} ({:.1}%), refused at the builder {builder}, at a callee {callee}, at the tier {tier}; {:.1}s in all", path(6), left.len(), pct(built), t0.elapsed().as_secs_f64());
+    println!("TOTAL {from}: reached {fns} fns, left out {}; instances tried {tried}, built {built} ({:.1}%), refused at the builder {builder}, at a callee {callee}, at the tier {tier}; {:.1}s in all", left.len(), pct(built), t0.elapsed().as_secs_f64());
 }

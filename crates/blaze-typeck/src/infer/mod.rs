@@ -475,10 +475,11 @@ impl<'a> InferCtx<'a> {
         Err(CheckError::Limit(crate::error::Limit::Solver).into())
     }
 
-    /// Registers the projection goals relating emitted.
-    fn defer(&mut self, pairs: &[(STy, STy)]) {
+    /// Registers the projection goals relating emitted, each an obligation of `cause` (the
+    /// place whose check related the types: [`TypeCtx::unify_at`]).
+    fn defer(&mut self, pairs: &[(STy, STy)], cause: crate::ty::Cause) {
         for &(alias, term) in pairs {
-            self.obs.push(Obligation { goal: Goal::WellFormed(Ty(alias.0)), cause: crate::ty::Cause::Body });
+            self.obs.push(Obligation { goal: Goal::WellFormed(Ty(alias.0)), cause });
             self.preds.push(Pred::Projection { alias, term });
             self.state.push(State::Pending);
         }
@@ -871,6 +872,10 @@ impl<'a> TypeCtx for InferCtx<'a> {
     }
 
     fn unify(&mut self, a: Ty, b: Ty) -> Result<bool, CheckError> {
+        self.unify_at(a, b, crate::ty::Cause::Body)
+    }
+
+    fn unify_at(&mut self, a: Ty, b: Ty, cause: crate::ty::Cause) -> Result<bool, CheckError> {
         #[cfg(test)]
         let (a, b) = {
             let (mut a, mut b) = (a, b);
@@ -892,7 +897,7 @@ impl<'a> TypeCtx for InferCtx<'a> {
         let mut pairs: Vec<(STy, STy), Alloc<'a>> = Vec::new_in(self.alloc);
         let ok = self.terms.unify(STy(a.0), STy(b.0), blaze_solve::tys::Relate::Lazy, &mut pairs)?;
         if ok {
-            self.defer(&pairs);
+            self.defer(&pairs, cause);
         }
         Ok(ok)
     }

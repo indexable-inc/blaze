@@ -50,7 +50,7 @@ use std::{
     path::Path,
 };
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_mem::{RegionVec, Tag as MemTag};
 use std::alloc::Global;
 
@@ -873,7 +873,7 @@ struct Inotify {
 pub(crate) struct Room {
     /// Each directory watched, by its watch, relative to the root ("" for the root), in
     /// `names`.
-    dirs: HashMap<i32, Span, Global>,
+    dirs: Map<i32, Span, FixedState, Global>,
     names: Strings,
     root: Vec<u8>,
     /// The watched directory. inotify watches an inode, not a name: once it is deleted or
@@ -897,7 +897,7 @@ pub(crate) struct Room {
 impl Room {
     fn new() -> io::Result<Room> {
         Ok(Room {
-            dirs: HashMap::new_in(Global),
+            dirs: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             names: Strings::new()?,
             root: Vec::new_in(Global),
             top: String::new(),
@@ -1176,8 +1176,8 @@ mod tests {
         for seed in 0..32 {
             let mut rng = crate::sim::Rng::new(seed);
             let mut strings = Strings::new().unwrap();
-            let mut ours: HashMap<u32, Span, Global> = HashMap::new_in(Global);
-            let mut theirs: HashMap<u32, String, Global> = HashMap::new_in(Global);
+            let mut ours: Map<u32, Span, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
+            let mut theirs: Map<u32, String, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
             for step in 0..4_000u32 {
                 let key = rng.below(64) as u32;
                 if rng.below(3) == 0 {

@@ -15,7 +15,7 @@
 
 use blaze_own::{Alloc, Soa, Vec};
 
-use crate::columns::{Adjusts, Callees, Captures, Checked, Closures, ConstArgs, ExprDefs, Fields, PatDefs};
+use crate::columns::{Adjusts, Callees, Captures, Checked, Closures, ConstArgs, ExprDefs, Fields, FruFields, PatDefs};
 use crate::ty::ClosureKind;
 
 /// `Checked::selected`'s rows (impl-per-call).
@@ -361,6 +361,22 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             };
             closures.push((e, kind, sig));
         }
+        // The fields each struct update takes from its base, exported before the diagnostics
+        // are made so a field type still unknown is the export's E0282 at the struct
+        // expression, never a missing row the flow lowering would read as "not taken".
+        let mut fru_fields: FruFields<'a> = Soa::with_capacity_in(self.fru_fields.len(), alloc);
+        for i in 0..self.fru_fields.len() {
+            let (e, at, t) = self.fru_fields[i];
+            let t = self.ty.resolve(t)?;
+            let p = self.export(&mut ex, t, At::Expr(e))?;
+            fru_fields.push((e, at, p));
+        }
+        fru_fields.sort_by_key(|rows, i| (rows.column::<0>()[i], rows.column::<1>()[i]));
+        let mut default_fields: crate::columns::DefaultFields<'a> = Soa::with_capacity_in(self.default_fields.len(), alloc);
+        for &row in self.default_fields.iter() {
+            default_fields.push(row);
+        }
+        default_fields.sort_by_key(|rows, i| (rows.column::<0>()[i], rows.column::<1>()[i]));
         // The stalled auto-trait goals (src/stalled.rs), each with the finding it becomes when it
         // fails on the exact interior, made as a finding of `diags` is made below.
         let mut stalled: Vec<crate::stalled::Stalled, Alloc<'a>> = Vec::with_capacity_in(self.stalled.len(), alloc);
@@ -532,15 +548,26 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         awaited.sort_unstable_by_key(|r| r.0);
         // The impl chosen for each projection of a callee's signature at each call
         // (writeback/selected_rows.rs), over the body's own reads: before they are finished.
-        let selected = self.selected_rows(&mut ex)?;
+        let selected = self.selected_rows(&mut ex, &closures)?;
+        let mut findings: Vec<crate::rules::args_inline::TypedFinding, Alloc<'a>> = Vec::with_capacity_in(self.typed_findings.len(), alloc);
+        findings.extend_from_slice(&self.typed_findings);
+        findings.sort_unstable_by_key(|f| f.order());
+        // The overloaded indexes that are mutable places (rules/mut_places.rs), sorted.
+        let mut index_mut: Vec<crate::ids::ExprId, Alloc<'a>> = Vec::with_capacity_in(self.index_mut.len(), alloc);
+        index_mut.extend_from_slice(&self.index_mut);
+        index_mut.sort_unstable();
         let (reads, needs) = self.reads.finish(alloc);
         Ok(Checked {
+            findings,
+            index_mut,
             suggests,
             hidden,
             promoted,
             stalled,
             awaited,
             selected,
+            fru_fields,
+            default_fields,
             types: ex.out,
             expr_ty,
             pat_ty,

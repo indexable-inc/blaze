@@ -66,6 +66,8 @@ fn prim(name: &str) -> Option<PNode> {
         "usize" => PNode::Uint(UintTy::Usize),
         "f32" => PNode::Float(FloatTy::F32),
         "f64" => PNode::Float(FloatTy::F64),
+        "f16" => PNode::Float(FloatTy::F16),
+        "f128" => PNode::Float(FloatTy::F128),
         _ => return None,
     })
 }
@@ -112,6 +114,26 @@ impl Types for Names<'_> {
             }
             TypeRef::Slice(e) => PNode::Slice(self.ty(v, e, tys)?),
             TypeRef::Never => PNode::Never,
+            // A safe Rust-ABI fn pointer: the inputs, then the output last (unit when none is
+            // written), as blaze-ladder's front reads one.
+            TypeRef::FnPtr { params, ret, abi: None, unsafety: false, extern_: false, variadic: false } => {
+                let mut ts = StdVec::new();
+                for &n in v.rows(params)? {
+                    let p = Param::decode(n)?;
+                    let t = p.ty.ok_or(refuse("a fn pointer parameter with no type"))?;
+                    ts.push(self.ty(v, t, tys)?);
+                }
+                ts.push(match ret {
+                    Some(r) => self.ty(v, r, tys)?,
+                    None => tys.intern(PNode::Tuple(List::EMPTY))?,
+                });
+                let header = blaze_typeck::FnPtrHeader {
+                    abi: blaze_typeck::Abi::Rust,
+                    safety: blaze_typeck::Safety::Safe,
+                    c_variadic: false,
+                };
+                PNode::FnPtr(tys.intern_list(&ts)?, header)
+            }
             _ => return Err(refuse("a written type the fixture does not resolve")),
         };
         Ok(tys.intern(node)?)
@@ -208,6 +230,8 @@ pub struct World {
     drop_impls: StdVec<ItemKey>,
     /// The ADT standing for core's `ManuallyDrop` ([`World::manually_drop_is`]).
     manually_drop: Option<ItemKey>,
+    /// The item standing for `FnOnce::call_once` ([`World::fn_once_is`]).
+    fn_once: Option<ItemKey>,
     /// The unit's ground table and layouts, kept between evaluations.
     unit: Option<(PortableTys<'static>, Layouts<Alloc<'static>>, Codes<Alloc<'static>>)>,
 }
@@ -270,6 +294,7 @@ impl World {
             anon: 0,
             drop_impls: StdVec::new(),
             manually_drop: None,
+            fn_once: None,
             unit: None,
         }
     }
@@ -283,6 +308,11 @@ impl World {
     /// ADT `adt` is core's `ManuallyDrop` (`#[lang = "manually_drop"]`) in this world.
     pub fn manually_drop_is(&mut self, adt: ItemKey) {
         self.manually_drop = Some(adt);
+    }
+
+    /// Item `item` is `FnOnce::call_once` in this world ([`ConstWorld::fn_trait_method`]).
+    pub fn fn_once_is(&mut self, item: ItemKey) {
+        self.fn_once = Some(item);
     }
 
     /// The item declared as `name`.
@@ -325,6 +355,12 @@ impl World {
                 let ts: StdVec<PTy> = ts.into_iter().map(|x| self.import(from, x)).collect();
                 PNode::Tuple(self.fx.list(&ts))
             }
+            // The inputs and output, each imported: the list indexes `from`, not the world.
+            PNode::FnPtr(l, header) => {
+                let ts: StdVec<PTy> = from.list(l).expect("list").to_vec();
+                let ts: StdVec<PTy> = ts.into_iter().map(|x| self.import(from, x)).collect();
+                PNode::FnPtr(self.fx.list(&ts), header)
+            }
             other => other,
         };
         self.fx.ty(n)
@@ -338,6 +374,23 @@ impl World {
     pub fn konst(&mut self, name: &str, ty: &str, body: &str) -> ItemKey {
         let t = self.ty(ty);
         let k = self.fx.func(&std::format!("const {name}"), 0, &[], t, StdVec::new());
+        self.fx.use_path(name, Def::Const(k));
+        self.declare(name, k);
+        self.kinds.push((k, FnKind::NotConst));
+        self.texts.push((k, std::format!("const {name}: {ty} = {body};")));
+        k
+    }
+
+    /// `const NAME: TY = BODY;` as a member of an `impl<const PARAM: PARAM_TY>`: the constant
+    /// has one generic parameter, a const one, at index 0, which `PARAM` in the body names
+    /// (`const LAP: usize = CAP + 1;` of `impl<T, const CAP: usize>`, with the type parameter
+    /// left out). Evaluated at an argument with [`World::eval_at`].
+    pub fn generic_konst(&mut self, name: &str, ty: &str, param: (&str, &str), body: &str) -> ItemKey {
+        let t = self.ty(ty);
+        let pt = self.ty(param.1);
+        let k = self.fx.func(&std::format!("const {name}"), 1, &[], t, StdVec::new());
+        self.fx.const_param(k, 0, pt);
+        self.fx.use_path(param.0, Def::TyParam(0));
         self.fx.use_path(name, Def::Const(k));
         self.declare(name, k);
         self.kinds.push((k, FnKind::NotConst));
@@ -701,12 +754,25 @@ impl World {
     }
 
     pub fn eval_item(&mut self, item: ItemKey) -> Result<&ConstRecord<Alloc<'static>>, ConstError<'static>> {
+        self.eval_item_at(item, &[])
+    }
+
+    /// Evaluates `name`, a constant with const generic parameters of type `usize` only
+    /// ([`World::generic_konst`]), at the arguments `usizes`, in order.
+    pub fn eval_at(&mut self, name: &str, usizes: &[u64]) -> Result<&ConstRecord<Alloc<'static>>, ConstError<'static>> {
+        let item = self.key(name);
+        self.eval_item_at(item, usizes)
+    }
+
+    fn eval_item_at(&mut self, item: ItemKey, usizes: &[u64]) -> Result<&ConstRecord<Alloc<'static>>, ConstError<'static>> {
         let alloc = blaze_own::testing::heap().alloc();
-        let mut settle = Settle::new(Need { kind: NeedKind::Value, item, args: List::EMPTY }, 64, alloc);
-        let mut last = None;
         // The unit's ground table and layouts: one for every evaluation of the world.
         let (mut ground, mut layout, mut codes) =
             self.unit.take().unwrap_or_else(|| (PortableTys::new_in(alloc), Layouts::new_in(alloc), Codes::new_in(alloc)));
+        let values: StdVec<PTy> = usizes.iter().map(|&n| ground.usize_value(n).expect("a const argument in the ground table")).collect();
+        let args = ground.intern_list(&values).expect("the arguments in the ground table");
+        let mut settle = Settle::new(Need { kind: NeedKind::Value, item, args }, 64, alloc);
+        let mut last = None;
         while let Some(n) = settle.next() {
             let answer = value_of(&*self, &mut layout, &mut codes, n.item, n.args, &mut ground, self.limits, alloc);
             let step = match answer {
@@ -847,5 +913,12 @@ impl ConstWorld for World {
 
     fn manually_drop(&self) -> Option<Option<ItemKey>> {
         Some(self.manually_drop)
+    }
+
+    fn fn_trait_method(&self, which: blaze_build::FnTrait) -> Option<ItemKey> {
+        match which {
+            blaze_build::FnTrait::FnOnce => self.fn_once,
+            blaze_build::FnTrait::Fn | blaze_build::FnTrait::FnMut => None,
+        }
     }
 }

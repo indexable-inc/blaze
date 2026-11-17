@@ -148,11 +148,12 @@ macro_rules! with_program {
     ($libs:expr, |$names:ident, $files:ident| $body:block) => {{
     let libs: &[(&str, &str)] = $libs;
     let files = [SourceFile { path: "src/main.rs", text: ROOT }];
-    let tc = Toolchain::none();
+    let tc = Toolchain::none(blaze_own::Alloc::global());
     let new = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
-    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc).unwrap_or_else(|e| panic!("the program's texts: {e}"));
+    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind).unwrap_or_else(|e| panic!("the program's texts: {e}"));
     let user = texts.user();
-    let cfg = tc.program_cfg();
+    // The program's strategy, Unwind (Rust's default): front2 reads it back from this cfg.
+    let cfg = tc.program_cfg(Panic::Unwind);
     let roots: Vec<(String, &str)> = libs.iter().map(|(name, text)| (format!("/{name}/src/lib.rs"), *text)).collect();
     let deps: Vec<(&str, usize)> = libs.iter().enumerate().map(|(i, (name, _))| (*name, i + 1)).collect();
     let rust = PackageEdition { syntax: edition::Edition::Edition2024, blaze: None };
@@ -216,7 +217,7 @@ fn unwind_binds_panic_unwind_abort_binds_panic_abort() {
 
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the survey's frame");
         let mut left_out = Vec::new_in(Global);
-        let mut program = Front2Program::survey(names, &frame, files, &mut left_out).unwrap_or_else(|e| panic!("no survey: {e}"));
+        let mut program = Front2Program::survey(names, &frame, files, &mut left_out, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("no survey: {e}"));
         let left: Vec<String> = left_out.iter().map(|(f, class)| format!("{f}: {class}")).collect();
         assert!(left.is_empty(), "front2 tables every fn the walk reaches; left out: {left:?}");
         // Each row with the crate it comes from, asked by the crate's identity: the crate whose
@@ -237,7 +238,7 @@ fn unwind_binds_panic_unwind_abort_binds_panic_abort() {
         assert_eq!(defined.len(), 1, "one runtime entry tabled with its body: {rows:?}");
         assert_eq!(defined[0], Some("panic_unwind"), "panic_unwind's `__rust_start_panic` tabled with its body, not panic_abort's: {rows:?}");
         let mut refused = Vec::new_in(Global);
-        let counts = build_survey(&mut program, &mut refused, blaze_build::OverflowChecks::On).unwrap_or_else(|e| panic!("the survey stopped: {e}"));
+        let counts = build_survey(&mut program, &mut refused, blaze_build::OverflowChecks::On, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("the survey stopped: {e}"));
         let refusals: Vec<String> = refused.iter().map(|(f, class)| format!("{f}: {class}")).collect();
         assert!(refusals.is_empty(), "every body builds, the call bound to a known instance: {refusals:?}");
         assert_eq!((counts.built, counts.tried), (2, 2), "`main` and panic_unwind's `__rust_start_panic`");
@@ -260,7 +261,7 @@ fn a_graph_without_the_runtime_is_refused_by_name() {
         assert_eq!(bound_crate(names, Panic::Abort), Err(InternalRefused::NoPanicRuntime { strategy: Panic::Abort }));
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the survey's frame");
         let mut left_out = Vec::new_in(Global);
-        let made = Front2Program::survey(names, &frame, files, &mut left_out);
+        let made = Front2Program::survey(names, &frame, files, &mut left_out, blaze_own::Alloc::global());
         let left: Vec<String> = left_out.iter().map(|(f, class)| format!("{f}: {class}")).collect();
         let refusal = match made {
             Err(e) => format!("{e}"),

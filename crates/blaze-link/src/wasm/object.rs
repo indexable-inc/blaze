@@ -11,7 +11,7 @@
 use blaze_hash::hash_map::Entry;
 use std::ops::Range;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::radix;
 
 use super::code::{self, Parts, Sig};
@@ -154,8 +154,8 @@ fn archive(bytes: &[u8], whole: bool) -> Result<Archive, String> {
             // A BSD `__.SYMDEF` names its strings by offset, so many entries may name one: each
             // string is pushed once, keyed by where it is in the input (O(1) per entry, and the
             // arena no bigger than the index's strings).
-            let mut pushed: HashMap<(usize, usize), Name, std::alloc::Global> =
-                HashMap::with_capacity_in(entries, std::alloc::Global);
+            let mut pushed: Map<(usize, usize), Name, FixedState, std::alloc::Global> =
+                Map::new(MapOpts { hasher: FixedState, alloc: std::alloc::Global, capacity: Some(entries) });
             for symbol in symbols {
                 // alloc: error path
                 let symbol = symbol.map_err(|e| format!("the archive's index: {e}"))?;

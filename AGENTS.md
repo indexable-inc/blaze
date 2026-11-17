@@ -54,24 +54,16 @@ Not now:
 
 ## How work is done
 
-- The main agent designs: every architecture, spec, floor and trade-off is its own work, written into the
-  design doc before a lane starts. Lanes implement from it; a lane that meets a design question stops and
-  asks. A critic may attack a design; no lane writes one (28, 29, 62).
 - Work in parallel: lanes write in one directory and never wait on a compile or on a yes (35, 48).
 - Until `blaze run` exists again, a merge's proof is the whole build and its tests, quoted (68).
 - Every command has a timeout; a hang is a bug to report, never one to wait out (69, 18).
 - Facts come from tool output in this session (61); verdicts from real projects, run first (7, 82).
-- A simple, exactly specified edit (one expression replaced by another across a crate, a rename) goes
-  to Codex, which is cheap and literal: `bunx @openai/codex@latest exec -m gpt-6.1-terra -c
-  model_reasoning_effort='"high"'`, one crate a job, with the files, the exact replacement and what
-  not to touch; then read its diff and compile it. Judgement stays with the lane, design with the main agent.
 - Build, test and land: docs/contributing.md. Every doc: docs/README.md.
 
 ## Rules
 
-One line per rule; its full text is in the skill its heading names, under .agents/skills/: load that
-skill before work it covers. Numbers are stable ids that code cites, not an order. Edit
-tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
+One line per rule; the full text is in its heading's skill (.agents/skills/): load it before work it
+covers. Numbers are stable ids, not an order. Edit tools/agents/rules.ts, run it with `--write`.
 
 ### Memory and data (skill `memory-and-data`)
 - **11. bump-allocate**: Don't allocate where a borrow does; where you must, name the allocator in code (a frame, `Global`).
@@ -122,7 +114,7 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 
 ### Speed and tracing (skill `perf-and-tracing`)
 - **16. slow-is-p0-traced**: Anything slow or large is a P0 until the profile names it; the fix quotes before and after.
-- **60. incremental-first**: Judge by the edit loop first; trade in the order incremental, memory, cold, disk cleanup, disk.
+- **60. incremental-first**: Judge by the edit loop first; trade: incremental and lints, remote, memory, cold, cleanup, disk.
 
 ### Evidence and debugging (skill `debugging`)
 - **17. ask-the-profile-first**: Say why a build was slow, reran or grew from its profile, before guessing or measuring.
@@ -146,6 +138,7 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **76. correct-by-construction**: A value that means something is a newtype, never a bare number; an obligation is linear or a proof.
 - **78. strategy-is-a-type-parameter**: A choice between strategies is a type parameter at one seam, each instantiation tested equal.
 - **79. interfaces-first**: A rewrite starts as one small crate of types and state machines that compiles and is simulated.
+- **83. options-struct**: One constructor a type, `new(Opts { .. })`: choices required, tunables defaulted; no `with_*` names.
 
 ### Building, lanes and machines (skill `build-and-test`)
 - **2. blaze-builds-blaze**: Cargo is the dev-loop builder for now; blaze still builds itself and makes every verdict.

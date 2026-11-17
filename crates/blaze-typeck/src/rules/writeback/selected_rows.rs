@@ -5,10 +5,11 @@
 use blaze_own::{Alloc, Vec};
 
 use super::Export;
+use crate::columns::Closures;
 use crate::diag::At;
 use crate::error::{CheckError, Limit};
 use crate::infer::InferCtx;
-use crate::instance::ResolveError;
+use crate::instance::{OwnClosures, ResolveError};
 use crate::machine::{Machine, children};
 use crate::portable::{PNode, PTy, PTys};
 use crate::selected::{MOST_NODES, MOST_PROJECTED, Projected, Selected};
@@ -20,8 +21,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// signature was lowered (numbered by `at`). A row whose arguments did not resolve adds no
     /// finding here (the body's own diagnostics say why) and is not kept: the borrow check
     /// finds fewer rows than hidden positions and refuses that call by name.
-    pub(super) fn selected_rows(&mut self, ex: &mut Export<'a>) -> Result<Vec<Projected, Alloc<'a>>, CheckError> {
+    /// `closures` is the record's `Checked::closures` (row `i` is closure `i`, its signature a
+    /// type of `ex.out`): a closure of this body among a row's arguments (`iter.filter(|b| ..)
+    /// .count()`) is selected with its facts from there, since the world holds no record of a
+    /// body still being checked.
+    pub(super) fn selected_rows(&mut self, ex: &mut Export<'a>, closures: &Closures<'a>) -> Result<Vec<Projected, Alloc<'a>>, CheckError> {
         let alloc = self.alloc;
+        let own = OwnClosures { owner: self.body.owner, kinds: closures.column::<1>(), sigs: closures.column::<2>() };
         if self.projected.len() > MOST_PROJECTED {
             return Err(CheckError::Limit(Limit::Solver));
         }
@@ -46,7 +52,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             } else {
                 // The one selection home for ground arguments, over the body's own reads.
                 let mut cx = InferCtx::new_in(alloc);
-                match crate::instance::select_in(&mut cx, &mut self.reads, trait_, &ps, &mut ex.out) {
+                match crate::instance::select_owning(&mut cx, &mut self.reads, Some(own), trait_, &ps, &mut ex.out) {
                     Ok(Some((imp, iargs))) => Selected::Impl { imp, args: iargs },
                     Ok(None) => Selected::NotImpl,
                     Err(ResolveError::NoImpl { .. }) => Selected::NotImpl,

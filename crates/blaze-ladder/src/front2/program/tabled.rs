@@ -31,6 +31,7 @@ struct Row<'n> {
     at: At,
     abi: Abi,
     nounwind: bool,
+    track_caller: bool,
     symbol: Box<str>,
     export: Option<Box<str>>,
     lits: Literals,
@@ -57,6 +58,7 @@ pub(super) fn table_one<'n>(
             at: r.at,
             abi: r.abi,
             nounwind: r.nounwind,
+            track_caller: r.track_caller,
             symbol: r.symbol,
             export: r.export,
             lits: r.lits,
@@ -82,7 +84,7 @@ fn row<'n>(
         return Err(Front2Refusal::NoHead { function: function() });
     };
     let symbols = symbols_of(names, head.lib, head.text, path)?;
-    let (at, foreign) = placed(names, head.lib).map_err(|_| Front2Refusal::Unplaced { function: function() })?;
+    let (at, foreign) = super::head_abi::placed_fn(names, store, key, head.lib).map_err(|_| Front2Refusal::Unplaced { function: function() })?;
     // A fn an `extern` block in a BODY declares is foreign as a module-level one is: the
     // names library places no local item, so its block's ABI and its declared name are the
     // store's (front2/panic_entry.rs `local_abi`, `local_name`).
@@ -91,12 +93,31 @@ fn row<'n>(
     // A declaration of an `extern "llvm-intrinsic"` block has no calling convention and is no
     // symbol to link: it IS the LLVM intrinsic its `link_name` names (front2/llvm_intrinsic.rs).
     // So it is routed here, one call before the ABI's one rule (head_abi.rs, where such a block
-    // has no builder ABI), and refused by name until the builder builds one (blaze-build
-    // `Intrinsic::Target`, intr-P7b).
+    // has no builder ABI). One in blaze-build's set (intrinsics/target.rs `named`, the one home
+    // of what the builder builds) is tabled for the walk to build in place; any other name is
+    // refused by name.
     if foreign == Some(crate::front2::llvm_intrinsic::ABI) {
         let symbol = crate::front2::llvm_intrinsic::symbol(symbols.link_name.as_deref())
             .map_err(|why| Front2Refusal::Attrs { function: function(), why: why.form().into() })?;
-        return Err(Front2Refusal::TargetIntrinsic { function: function(), symbol: symbol.into() });
+        let Ok(target) = blaze_build::intrinsics::target::named(symbol) else {
+            return Err(Front2Refusal::TargetIntrinsic { function: function(), symbol: symbol.into() });
+        };
+        // `Abi::C`: the convention blaze-build declares a barrier in (intrinsics/target.rs
+        // `build`); a call of an intrinsic row reads no ABI (the walk builds it in place).
+        // `nounwind`: an intrinsic is an instruction, never a callee that unwinds.
+        return Ok(Row {
+            body: None,
+            checked: None,
+            kind: FnKind::Free,
+            at,
+            abi: Abi::C,
+            nounwind: true,
+            track_caller: false,
+            symbol: Box::<str>::from(""),
+            export: symbols.export,
+            lits: Literals::default(),
+            intrinsic: Some(Intrinsic::Target(target)),
+        });
     }
     // The head's ABI, a foreign block's overriding it (head_abi.rs: one rule for the table's
     // rows and for the builder's question of a fn left out): the calling convention AND the
@@ -106,16 +127,17 @@ fn row<'n>(
     let declared_name = crate::front2::panic_entry::local_name(store, key).map_err(local)?;
     // Core's `#[lang = "panic_impl"]` declaration is no symbol: a call of it is a call of the
     // program's `#[panic_handler]` fn (the walk queued it; `resolve` answers it).
-    let panic_entry = crate::front2::panic_entry::declares(names, store, key, Alloc::global()).map_err(local)?;
+    let alloc = store.tys.alloc();
+    let panic_entry = crate::front2::panic_entry::declares(names, store, key, alloc).map_err(local)?;
     // Alloc's `extern "Rust"` allocator declarations are no symbols either: a call of one is a
     // call of its default (the walk queued it; `resolve` answers it), and the marker
     // `__rust_no_alloc_shim_is_unstable_v2` is built in place as nothing (front2/alloc_shim.rs).
-    let alloc_shim = crate::front2::alloc_shim::declares(names, store, key, Alloc::global())
+    let alloc_shim = crate::front2::alloc_shim::declares(names, store, key, alloc)
         .map_err(|why| Front2Refusal::Attrs { function: function(), why: why.detail() })?;
     // Every other `extern "Rust"` `#[rustc_std_internal_symbol]` declaration is no symbol
     // either: a call of one is a call of its definition (the walk queued it; `resolve` answers
     // it) (front2/internal_symbol.rs).
-    let internal_symbol = crate::front2::internal_symbol::declares(names, store, key, Alloc::global())
+    let internal_symbol = crate::front2::internal_symbol::declares(names, store, key, alloc)
         .map_err(|why| Front2Refusal::Attrs { function: function(), why: why.detail() })?;
     let (body, checked, kind, symbol, lits) = match body {
         Some((body, checked)) => {
@@ -159,7 +181,7 @@ fn row<'n>(
     };
     // `#[rustc_nounwind]` makes any fn nounwind (core/src/panicking.rs:88-92).
     let nounwind = own.nounwind || symbols.nounwind;
-    Ok(Row { body, checked, kind, at, abi: own.abi, nounwind, symbol, export: symbols.export, lits, intrinsic })
+    Ok(Row { body, checked, kind, at, abi: own.abi, nounwind, track_caller: symbols.track_caller, symbol, export: symbols.export, lits, intrinsic })
 }
 
 /// The cause a survey files a left-out fn under: the refusal without the fn's own name or
@@ -280,14 +302,17 @@ mod tests {
         let tc = crate::crates::Toolchain::open(&mut crate::crates::DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
         let files = [(String::from("/hello-world/src/main.rs"), String::from(HELLO))];
         let edition = edition::PackageEdition::of_manifest("blaze-2026.11").expect("a known edition");
-        let user = crate::crates::UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition };
+        let user = crate::crates::UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
         let inputs = crate::crates::Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
         let crates = inputs.crates();
-        let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        // The store's tables are `'static` (heads.rs `Store::new`): until the test grant hands
+        // one down, the global allocator is the only `Alloc<'static>` a test can name.
+        let alloc = blaze_own::Alloc::global();
+        let names = inputs.resolve(&crates, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
         let sources = [SourceFile { path: "src/main.rs", text: HELLO }];
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
-        let front = crate::front2::Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
-        let store = Store::new(front.index.lang("sized"), front.frame);
+        let front = crate::front2::Front2::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
+        let store = Store::new(front.index.lang("sized"), front.frame, alloc);
         let ghost = ItemKey(0x2980e808e42ac8c9057e8231da5614fc);
         let made = crate::front2::row_path::RowPath::of(&names, &front.keys, &store, ghost);
         let no = made.clone().expect_err("no names source here holds the census's key");

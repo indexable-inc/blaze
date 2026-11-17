@@ -292,10 +292,25 @@ impl core::ops::Deref for FixedText {
     }
 }
 
+/// Where a tree's pack is kept, by content, never by a path of this machine (rule 25): what a
+/// reader that makes no world opens it by, through the crate list's tree table
+/// (crate_list.rs, blaze-cli body_types.rs `Kept::packs`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PackOrigin {
+    /// A toolchain crate's pack on the toolchain's shelf: the file named by its BLAKE3, which is
+    /// the pack's footer (`blaze_toolchain::shelf::open_pack` checked the two are one).
+    Shelf { digest: [u8; 32] },
+    /// A fetched package's record in the machine's sources store, at the key the lock's fetch
+    /// plan gives its unit (`blaze_fetch::SourceId::key`).
+    Source { key: ContentId },
+}
+
 /// The texts `resolve_crates` reads: tree 0 the checkout, then each pack.
 pub struct Texts<'w> {
     checkout: &'w dyn Tree,
     packs: AVec<'w, PackView<'w>>,
+    /// Each pack's origin, in [`Self::packs`]'s order: tree `k` (1 and up) is `origins[k - 1]`.
+    origins: AVec<'w, PackOrigin>,
     /// Files read corrected (D58): `(tree, path in it, corrected text)`, read in place of the
     /// pack's bytes.
     corrected: AVec<'w, (u32, &'w str, &'w str)>,
@@ -308,6 +323,11 @@ impl<'w> Texts<'w> {
     /// The trees after the checkout: the toolchain's packs, then the fetched packages'.
     pub fn packs(&self) -> &[PackView<'w>] {
         &self.packs
+    }
+
+    /// Where each pack of [`Self::packs`] is kept, in the same order.
+    pub fn origins(&self) -> &[PackOrigin] {
+        &self.origins
     }
 
     /// The files read corrected (D58), each `(tree, path in it, corrected text)`: what a reader
@@ -370,6 +390,10 @@ pub enum WorldError<'w> {
     ToolchainCycle { krate: &'w str },
     /// A toolchain pack read and verified is no pack form.
     Pack { krate: &'w str },
+    /// A fetched package's record whose key the lock's fetch plan does not give (no unit of
+    /// the plan is that package's, or its record is of no fetched kind): the crate list's tree
+    /// table names each fetched tree by that key ([`PackOrigin::Source`]).
+    SourceRecord { package: &'w str },
     /// A source correction (D58, `blaze_fetch::correct`) refused this package: the words say
     /// which file and why (a stale row, a missing file).
     Correction { package: &'w str, version: &'w str, why: &'w str },
@@ -410,6 +434,10 @@ impl fmt::Display for WorldError<'_> {
                 write!(f, "the toolchain crate `{krate}` depends on `{dep}`, which is not a target-side library of the toolchain")
             }
             WorldError::Pack { krate } => write!(f, "the toolchain's pack of `{krate}` is no pack"),
+            WorldError::SourceRecord { package } => write!(
+                f,
+                "the package `{package}`'s files were placed from a fetched record the lock's fetch plan holds no unit of (blaze-fetch `plan`), so the crate list cannot name the record's key"
+            ),
         }
     }
 }

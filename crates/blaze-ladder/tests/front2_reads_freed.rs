@@ -49,13 +49,13 @@ fn kept_checks_hold_no_read_list() {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let files = [("/hello-world/src/main.rs".to_string(), BODY.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
-    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: BODY }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
-    let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
     let key = |n: &str| {
         let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &[n] }, Alloc::global())
             .unwrap_or_else(|e| panic!("`{n}`: {e}"));
@@ -66,7 +66,7 @@ fn kept_checks_hold_no_read_list() {
     let sized = front.index.lang("sized");
 
     // N bodies checked over one store, every `Checked` kept.
-    let (mut store, mut buckets, mut consts) = (Store::new(sized, front.frame), None, Consts::default());
+    let (mut store, mut buckets, mut consts) = (Store::new(sized, front.frame, blaze_own::Alloc::global()), None, Consts::default());
     let mut kept = Vec::new();
     let mut owners = Vec::new();
     for (&k, name) in keys.iter().zip(FNS) {
@@ -84,7 +84,7 @@ fn kept_checks_hold_no_read_list() {
     assert_eq!(store.reads.len(), FNS.len(), "each clean body filed one digest");
 
     // The control: the same bodies over a fresh store, their lists handed back.
-    let (mut fresh, mut buckets, mut consts) = (Store::new(sized, front.frame), None, Consts::default());
+    let (mut fresh, mut buckets, mut consts) = (Store::new(sized, front.frame, blaze_own::Alloc::global()), None, Consts::default());
     let mut filed_bytes = 0;
     for ((&k, name), owner) in keys.iter().zip(FNS).zip(&owners) {
         let body = lower_fn(&names, prepared, &mut front.keys, &mut fresh, k).unwrap_or_else(|e| panic!("lowering `{name}` again: {e}"));

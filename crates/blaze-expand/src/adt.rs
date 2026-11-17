@@ -40,6 +40,8 @@ pub(crate) struct Field {
     pub(crate) name: Option<usize>,
     pub(crate) index: usize,
     pub(crate) ty: Range<usize>,
+    /// The field declares a default value (`a: u8 = 1`, RFC 3681): `derive(Default)` takes it.
+    pub(crate) defaulted: bool,
 }
 
 /// A struct's fields or an enum's variant: `fields` indexes [`Adt::fields`].
@@ -479,7 +481,9 @@ impl<'s> Reader<'s> {
                 return Err(NotAnAdt::Malformed);
             }
             let ty = ty..self.top_eq(ty..piece.end)?;
-            fields.push(Field { name, index: fields.len() - first, ty });
+            // Past the type, a lone `=` and the default's expression (RFC 3681).
+            let defaulted = ty.end < piece.end;
+            fields.push(Field { name, index: fields.len() - first, ty, defaulted });
             Ok(())
         })
     }

@@ -86,8 +86,9 @@ pub struct AdtFacts {
     pub drop_impl: bool,
     /// Dropping it may run code (a `Drop` impl, or a field that does).
     pub needs_drop: bool,
-    /// Its head declares lifetime parameters: one origin stands for all of them, invariant.
-    pub lifetimes: bool,
+    /// How many lifetime parameters its head declares: one origin position each, in declared
+    /// order, each invariant (blaze-ladder front2 lifetimes.rs `Grain::PerParam`).
+    pub lifetimes: u32,
     pub union: bool,
     pub is_enum: bool,
     pub is_box: bool,
@@ -196,7 +197,6 @@ pub enum Form {
     InteriorTable,
     Union,
     StaticMut,
-    StructUpdate,
     DestructuringAssign,
     OrPatternBinding,
     SlicePatternBinding,
@@ -207,8 +207,10 @@ pub enum Form {
     BindingMode,
     /// A guard over a by-value binding of a non-`Copy` type.
     GuardMovesBinding,
-    /// The callee's signature writes lifetimes (needs the heads' lifetime part).
-    CallWritesLifetimes,
+    /// A call of `callee`, whose signature writes lifetimes, that no row of [`Facts`] let the
+    /// lowering relate: `lacks` names the row that was missing, or that the rows given did not
+    /// line up with the call (rule 19: the refusal names the callee and what it needs).
+    CallWritesLifetimes { callee: ItemKey, lacks: CallLacks },
     /// The callee's signature is not known (no head, or a lifetime part that does not line
     /// up) and an argument or the result carries a lifetime: one origin for all cannot say
     /// "this argument must be `'static`", so the body is not checked rather than accepted.
@@ -264,6 +266,39 @@ pub enum Form {
     /// A `super let` form not placed: with an `else` block, or in a block no temporary scope
     /// holds (super_let.rs).
     SuperLet,
+}
+
+/// Which fact a call of a head that writes lifetimes lacked ([`Form::CallWritesLifetimes`]):
+/// relating it takes the head's lifetime part, its generic shape and its declared bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CallLacks {
+    /// No lifetime part for the callee ([`Facts::sig`] gave `None`).
+    Sig,
+    /// No generic shape for the callee ([`Facts::shape`] gave `None`).
+    Shape,
+    /// No declared type-outlives bounds for the callee ([`Facts::call_bounds`] gave `None`).
+    Bounds,
+    /// Every row was given, and they did not line up with the call: the lifetime part or the
+    /// shape has another count of inputs than the call has operands, a part's positions do
+    /// not match its place, or the lifetime part holds a hidden region.
+    Unaligned,
+}
+
+impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
+    /// Which row a call of `item`, whose head writes lifetimes, lacked to be related by its
+    /// signature: the first of [`Facts::sig`], [`Facts::shape`], [`Facts::call_bounds`] that
+    /// is `None`, else [`CallLacks::Unaligned`].
+    fn call_lacks(&self, item: ItemKey) -> CallLacks {
+        if self.facts.sig(item).is_none() {
+            CallLacks::Sig
+        } else if self.facts.shape(item).is_none() {
+            CallLacks::Shape
+        } else if self.facts.call_bounds(item).is_none() {
+            CallLacks::Bounds
+        } else {
+            CallLacks::Unaligned
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -451,6 +486,12 @@ enum Task {
     RawDone(ExprId),
     DerefDone(ExprId, bool),
     FieldDone(ExprId),
+    /// A struct update's base, its value on the stack: replaced by the fields it gives
+    /// (`struct_base`).
+    StructBase(ExprId),
+    /// A base-less struct expression's defaulted fields (`S { a: 1, .. }`): one constant
+    /// operand per field it takes from its defaults (`field_defaults`).
+    FieldDefaults(ExprId),
     IndexDone(ExprId, bool),
     FmtDone(ExprId, u32),
     LetInit(StmtId),
@@ -677,7 +718,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
 
     // ---- type facts, each a bounded work list ----
 
-    /// The number of origin positions of `t`: one per reference, one per ADT with lifetimes, one
+    /// The number of origin positions of `t`: one per reference, one per lifetime parameter of an ADT, one
     /// per opaque, alias or trait object; in pre-order, a node's own before its children's.
     fn npos(&self, t: PTy, e: ExprId) -> Result<u32, Refusal> {
         let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
@@ -698,9 +739,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 PNode::Array(i, _) => stack.push(i),
                 PNode::Tuple(l) => stack.extend_from_slice(self.list(l, e)?),
                 PNode::Adt(k, l) => {
-                    if self.adt_facts(k, e)?.lifetimes {
-                        n += 1;
-                    }
+                    n += self.adt_facts(k, e)?.lifetimes;
                     stack.extend_from_slice(self.list(l, e)?);
                 }
                 PNode::Opaque(_, _) | PNode::Alias { .. } | PNode::Dynamic(_) => n += 1,
@@ -1226,13 +1265,21 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         Ok(loan)
     }
 
+    /// The end of local `l`'s scope: its `Drop` when its type needs one, then its storage's end
+    /// WHATEVER its type (the Reference, "Drop scopes"): the end invalidates every loan of it
+    /// still live (blaze-flow loans.rs, `StorageDead` is a shallow write). `needs_drop` decides
+    /// only the `Drop`.
     fn drop_local(&mut self, l: Local, e: ExprId) -> Result<(), Refusal> {
         let t = self.local_ty[l.0 as usize];
-        if self.needs_drop(t, e)? {
+        let drops = self.needs_drop(t, e)?;
+        if drops {
             let p = self.place_of(l);
             self.b.stmt(StmtKind::Drop(p), self.span(e));
         }
-        self.b.stmt(StmtKind::StorageDead(l), self.span(e));
+        // CONTROL (`Plant::StorageEndTiedToDrop`): no storage end without a drop.
+        if drops || self.plant != Plant::StorageEndTiedToDrop {
+            self.b.stmt(StmtKind::StorageDead(l), self.span(e));
+        }
         Ok(())
     }
 
@@ -1250,15 +1297,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         };
         for i in (vfrom..self.vars.len()).rev() {
             let l = self.vars[i];
-            if l.0 > self.nargs {
-                self.drop_local(l, e)?;
-            } else {
-                let t = self.local_ty[l.0 as usize];
-                if self.needs_drop(t, e)? {
-                    let p = self.place_of(l);
-                    self.b.stmt(StmtKind::Drop(p), self.span(e));
-                }
-            }
+            // A parameter (or a closure's or async block's argument) too: its drop when it
+            // needs one, and its storage's end whatever its type (storage-end-loans: before,
+            // a parameter of a type with no drop glue was never ended, and a loan of it that
+            // must outlive the function was accepted).
+            self.drop_local(l, e)?;
         }
         Ok(())
     }
@@ -1420,7 +1463,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                     }
                 }
                 PNode::Adt(k, l) => {
-                    let mut off = at + u32::from(self.adt_facts(k, e)?.lifetimes);
+                    let mut off = at + self.adt_facts(k, e)?.lifetimes;
                     for &x in self.list(l, e)? {
                         stack.push((x, off));
                         off += self.npos(x, e)?;
@@ -1803,6 +1846,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 Ok(())
             }
             Task::FieldDone(e) => self.field_done(e),
+            Task::StructBase(e) => self.struct_base(e),
+            Task::FieldDefaults(e) => {
+                self.field_defaults(e);
+                Ok(())
+            }
             Task::IndexDone(e, m) => self.index_done(e, m),
             Task::LetInit(s) => self.let_init(s),
             Task::AwaitDone(e) => self.await_done(e),
@@ -2096,14 +2144,32 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 self.tasks.push(Task::Eval(elem, false));
             }
             Expr::Struct { fields, base, .. } => {
-                if base.is_some() {
-                    return self.refuse(Form::StructUpdate, e);
-                }
                 let fs = match body.field_inits.get(fields.range()) {
                     Some(a) => a,
                     None => return self.refuse(Form::Malformed, e),
                 };
-                self.tasks.push(Task::AggDone(e, fs.len() as u32));
+                // A struct update (`S { a: x, ..base }`, the Reference, "Functional update
+                // syntax"): the written fields in source order, then the base as a place, then
+                // one operand per field the update takes from it (`Checked::fru_fields`), each
+                // `base.f` moved or copied by its own type as `let x = base.f;` is: a partial
+                // move, so the written fields of a place base stay usable. A temporary base is
+                // taken the same way: its fields not taken are still dropped with it.
+                // A base-less `S { a: 1, .. }` (RFC 3681): each unwritten field is its default,
+                // a constant (`Checked::default_fields`): a value of no place, no borrow and no
+                // move; its operand is a constant of the field's type (`fru_fields` row).
+                let n = match base {
+                    blaze_typeck::StructBase::Expr(_) => fs.len() as u32 + self.ck.fru_fields_of(e).0.len() as u32,
+                    blaze_typeck::StructBase::Defaults => fs.len() as u32 + self.ck.default_fields_of(e).0.len() as u32,
+                    blaze_typeck::StructBase::None => fs.len() as u32,
+                };
+                self.tasks.push(Task::AggDone(e, n));
+                if base == blaze_typeck::StructBase::Defaults {
+                    self.tasks.push(Task::FieldDefaults(e));
+                }
+                if let Some(b) = base.expr() {
+                    self.tasks.push(Task::StructBase(e));
+                    self.tasks.push(Task::Eval(b, false));
+                }
                 for f in fs.iter().rev() {
                     self.tasks.push(Task::Eval(f.expr, false));
                 }
@@ -2312,6 +2378,49 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         };
         let fp = self.project(p, v.ty, Proj::Field(idx), ty, drop_type, e)?;
         self.push_place(fp, ty);
+        Ok(())
+    }
+
+    /// The base of the struct update `e`, its value on the stack, replaced by one place per
+    /// field the update takes (`Checked::fru_fields`, in field order): each is `base.f` as
+    /// [`Self::field_done`] projects it, so the aggregate moves or copies each by its type and
+    /// the borrow check sees a partial move. A base whose type implements `Drop` marks the
+    /// projection, so a move out of it is refused as for `let x = base.f;` (E0509).
+    /// The fields the base-less struct expression `e` takes from its defaults, after its
+    /// written ones: each a constant of the field's type (`Checked::fru_fields`, which the
+    /// checker fills for every defaulted field, in field order), as a constant item's value
+    /// is: no place, no loan, no move.
+    fn field_defaults(&mut self, e: ExprId) {
+        let ck = self.ck;
+        let (_, tys) = ck.fru_fields_of(e);
+        for &t in tys {
+            self.vals.push(Val { at: At::Const, ty: TyD::of(t) });
+        }
+    }
+
+    fn struct_base(&mut self, e: ExprId) -> Result<(), Refusal> {
+        let v = self.pop(e)?;
+        let p = self.as_place(v, e)?;
+        if v.ty.wrap.is_some() {
+            return self.refuse(Form::Malformed, e);
+        }
+        let drop_type = match self.node(v.ty.ty, e)? {
+            PNode::Adt(k, _) => {
+                let f = self.adt_facts(k, e)?;
+                if f.union {
+                    return self.refuse(Form::Union, e);
+                }
+                f.drop_impl
+            }
+            _ => return self.refuse(Form::Malformed, e),
+        };
+        let ck = self.ck;
+        let (idx, tys) = ck.fru_fields_of(e);
+        for (&i, &t) in idx.iter().zip(tys.iter()) {
+            let ft = TyD::of(t);
+            let fp = self.project(p, v.ty, Proj::Field(i), ft, drop_type, e)?;
+            self.push_place(fp, ft);
+        }
         Ok(())
     }
 
@@ -2636,7 +2745,13 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             self.stats.calls_hidden += 1;
         }
         match sig {
-            Some(s) if s.writes_lifetimes => return self.refuse(Form::CallWritesLifetimes, e),
+            Some(s) if s.writes_lifetimes => {
+                // `sig` is `callee`'s head, so `callee` is known here.
+                let Some((item, _)) = callee else {
+                    return self.refuse(Form::Malformed, e);
+                };
+                return self.refuse(Form::CallWritesLifetimes { callee: item, lacks: self.call_lacks(item) }, e);
+            }
             Some(s) if !generic_origins => {
                 if out.len > 0 {
                     let first_in = vs.first().and_then(|v| match v.at {

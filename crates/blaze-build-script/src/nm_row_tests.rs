@@ -88,33 +88,39 @@ fn the_script_env_has_nm_from_the_table() {
     println!("script env: {}={}", pairs[0].0, pairs[0].1);
 }
 
-/// A shelf row must name a shelf member and the variable that names it; a variable is upper
-/// case and names one row; `path` and `shelf` are not both given. Each is refused by name.
-/// Prints "shelf rows refused: not a member, no env, both, lower case, twice".
+/// A shelf row must name a pinned shelf program (shelf-pins: a row of `shelf_programs`) and the
+/// variable that names it; a variable is upper case and names one row; `path` and `shelf` are
+/// not both given. Each is refused by name.
+/// Prints "shelf rows refused: no row, no env, both, lower case, twice".
 #[test]
 fn a_shelf_row_is_refused_unless_whole() {
     let alloc = blaze_own::testing::heap().alloc();
+    const PINS: &str = r#"{"shelf_programs": {"t": {"llvm-ar": {"member": "L/bin/llvm-ar", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}, "llvm-nm": {"member": "L/bin/llvm-nm", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}, "names": "llvm-ar llvm-nm"}}, "#;
     let row = |body: &str| {
         let mut text = blaze_own::String::new_in(alloc);
-        text.push_str(r#"{"host_tools": {"t": {"nm": {"#);
+        text.push_str(PINS);
+        text.push_str(r#""host_tools": {"t": {"nm": {"#);
         text.push_str(body);
         text.push_str(r#", "reads": "", "runs": "", "needed_by": "x", "runs_out_dir": "no"}, "names": "nm"}}}"#);
         text
     };
     let refused = |field: &'static str| Some(HostToolError::Malformed { target: "t", tool: "nm", field });
-    let not_member = row(r#""shelf": "bin/nm", "env": "NM""#);
-    assert_eq!(host_tools(not_member.as_str(), "t", alloc).err(), refused("shelf"));
-    let no_env = row(r#""shelf": "bin/llvm-nm""#);
+    let no_row = row(r#""shelf": "nm", "env": "NM""#);
+    assert_eq!(host_tools(no_row.as_str(), "t", alloc).err(), refused("shelf"));
+    let no_env = row(r#""shelf": "llvm-nm""#);
     assert_eq!(host_tools(no_env.as_str(), "t", alloc).err(), refused("env"));
-    let both = row(r#""path": "/usr/bin/nm", "shelf": "bin/llvm-nm", "env": "NM""#);
+    let both = row(r#""path": "/usr/bin/nm", "shelf": "llvm-nm", "env": "NM""#);
     assert_eq!(host_tools(both.as_str(), "t", alloc).err(), refused("shelf"));
-    let lower = row(r#""shelf": "bin/llvm-nm", "env": "nm""#);
+    let lower = row(r#""shelf": "llvm-nm", "env": "nm""#);
     assert_eq!(host_tools(lower.as_str(), "t", alloc).err(), refused("env"));
-    let whole = row(r#""shelf": "bin/llvm-nm", "env": "NM""#);
-    assert_eq!(host_tools(whole.as_str(), "t", alloc).expect("a whole row")[0].place, Place::Shelf);
-    let twice = r#"{"host_tools": {"t": {"ar": {"shelf": "bin/llvm-ar", "env": "NM", "reads": "", "runs": "", "needed_by": "x", "runs_out_dir": "no"}, "nm": {"shelf": "bin/llvm-nm", "env": "NM", "reads": "", "runs": "", "needed_by": "x", "runs_out_dir": "no"}, "names": "ar nm"}}}"#;
-    assert_eq!(host_tools(twice, "t", alloc).err(), refused("env"));
-    println!("shelf rows refused: not a member, no env, both, lower case, twice");
+    let whole = row(r#""shelf": "llvm-nm", "env": "NM""#);
+    let tools = host_tools(whole.as_str(), "t", alloc).expect("a whole row");
+    assert_eq!((tools[0].place, tools[0].path), (Place::Shelf, "bin/llvm-nm"));
+    let mut twice = blaze_own::String::new_in(alloc);
+    twice.push_str(PINS);
+    twice.push_str(r#""host_tools": {"t": {"ar": {"shelf": "llvm-ar", "env": "NM", "reads": "", "runs": "", "needed_by": "x", "runs_out_dir": "no"}, "nm": {"shelf": "llvm-nm", "env": "NM", "reads": "", "runs": "", "needed_by": "x", "runs_out_dir": "no"}, "names": "ar nm"}}}"#);
+    assert_eq!(host_tools(twice.as_str(), "t", alloc).err(), refused("env"));
+    println!("shelf rows refused: no row, no env, both, lower case, twice");
 }
 
 /// tikv-jemalloc-sys's Seatbelt profile, made as `native_script` makes it, lets it start the

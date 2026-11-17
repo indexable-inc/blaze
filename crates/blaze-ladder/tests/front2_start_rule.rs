@@ -34,7 +34,7 @@ use blaze_surface::{Namespace, PathKind};
 /// The toolchain: the installed shelf, or none (a program of its own crate only).
 fn toolchain(shelf: bool) -> Toolchain {
     if !shelf {
-        return Toolchain::none();
+        return Toolchain::none(blaze_own::Alloc::global());
     }
     let home = std::env::var("HOME").expect("HOME is set");
     let place = format!("{home}/.blaze/v2/toolchain");
@@ -57,16 +57,16 @@ fn a_rust_program_without_std_starts_at_main() {
     let tc = toolchain(false);
     let files = [("/hello/src/main.rs".to_string(), text.to_string())];
     let edition = edition::PackageEdition::of_manifest("2024").expect("a known edition");
-    let user = UserCrate { name: "hello", dir: "/hello/", root: "/hello/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "hello", dir: "/hello/", root: "/hello/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names: Names<'_> = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names: Names<'_> = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let linked = linked_lang_start(&names, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the start rule: {e}"));
     assert_eq!(linked, None, "a graph with no std links no `#[lang = \"start\"]`");
     let main = main_of(&names);
     let sources = [SourceFile { path: "src/main.rs", text }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
-    let program = Front2Program::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("a core-only Rust program is refused: {e}"));
+    let program = Front2Program::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("a core-only Rust program is refused: {e}"));
     assert_eq!(program.start(), Some(Entry2::Direct(main)), "a program without std starts at its `fn main`");
 }
 
@@ -78,10 +78,10 @@ fn a_no_std_root_on_the_shelf_starts_at_main() {
     let tc = toolchain(true);
     let files = [("/hello/src/main.rs".to_string(), text.to_string())];
     let edition = edition::PackageEdition::of_manifest("2024").expect("a known edition");
-    let user = UserCrate { name: "hello", dir: "/hello/", root: "/hello/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "hello", dir: "/hello/", root: "/hello/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names: Names<'_> = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names: Names<'_> = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let linked = linked_lang_start(&names, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the start rule: {e}"));
     assert_eq!(linked, None, "a `#![no_std]` root links core only: no `#[lang = \"start\"]`");
 }
@@ -94,10 +94,10 @@ fn a_std_program_starts_through_lang_start() {
     let tc = toolchain(true);
     let files = [("/hello/src/main.rs".to_string(), text.to_string())];
     let edition = edition::PackageEdition::of_manifest("2024").expect("a known edition");
-    let user = UserCrate { name: "hello", dir: "/hello/", root: "/hello/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "hello", dir: "/hello/", root: "/hello/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names: Names<'_> = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names: Names<'_> = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let linked = linked_lang_start(&names, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the start rule: {e}"));
     let lib = linked.expect("a program with std links `#[lang = \"start\"]`");
     let name = names.item_text(lib).and_then(|t| t.name).expect("lang_start has a name");

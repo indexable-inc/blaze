@@ -287,4 +287,30 @@ the old code in place; the old code is switched off and deleted as soon as its r
 ports (`whole-ports`). How: before splitting work across lanes, land the interface crate on the
 green head; every brief names it and the crate the lane owns.
 
+## options-struct (rule 83)
+
+A type made from more than one input, or with any tunable, has ONE constructor, `T::new(opts)`
+(`T::try_new` when making it can fail), which takes one plain struct of named public fields,
+`<Type>Opts`: never a family of names (`new_in`, `with_capacity_in`, `with_hasher_in`,
+`with_capacity_and_hasher_in`, `from_iter_in`), a builder, or positional flags. A field WITHOUT a
+default is a decision the caller must write: every capability (the allocator, the clock, randomness,
+a grant), every strategy (the hasher, an ordering) and any input with no value that is right
+everywhere. An input that changes what the reader should expect of cost or behaviour is written too,
+even when its usual value is nothing: a table's `capacity: Option<usize>` has no default, and most
+calls say `capacity: None`. A field WITH a default (`pub shards: usize = 64`: nightly's
+`default_field_values`, named in the crate's features while cargo builds blaze and on unasked in a
+blaze edition) is only a tunable almost no caller should think about, its default safe and stated in
+its doc. The call names what it sets and takes any such rest by `..`: `Map::new(MapOpts { hasher:
+FixedState, alloc: frame, capacity: None })`. An options struct is a call's named arguments and
+nothing else: it is marked `#[blaze::args]`, and a value of it is only ever written as a struct
+literal directly in the call that takes it, never bound by a `let`, kept in a `const` or `static`,
+held in a field or returned from a helper (lint `args-inline`), so every choice is read at the call.
+The same holds for a function with a flag, an optional input, two parameters of one type or more
+than three parameters: it takes one struct of named fields. A conversion from one value (`from`,
+`as_*`) and a hot leaf with one or two distinct inputs stay positional. Length at the call is not a
+cost: models write and read this code, and a name at the use is where a mistake is seen. bstd's API
+follows this wherever a thing is made, and blaze's own crates use it (`blaze-uses-its-extensions`).
+blaze builds it: a struct expression with `..` and no base takes each unset field's default, a
+constant of the field's type.
+
 <!-- End of the generated rules. Hand-written notes follow. -->

@@ -14,7 +14,7 @@
 
 use std::ops::ControlFlow;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use hir::{HirFileId, InFile};
 use std::alloc::Global;
 use syntax::{
@@ -584,12 +584,12 @@ fn doc_gate(name: &str) -> Option<(&'static str, &'static str)> {
 /// item is, an expansion where its macro is called (what a derive makes, after the item it
 /// is on), then where in its own tree the node is, outer nodes before those in them.
 struct Places {
-    files: HashMap<HirFileId, Vec<(u32, u32)>, Global>,
+    files: Map<HirFileId, Vec<(u32, u32)>, FixedState, Global>,
 }
 
 impl Places {
     fn new(cx: &Cx<'_, '_>) -> Places {
-        let mut files: HashMap<HirFileId, Vec<(u32, u32)>, Global> = HashMap::new_in(Global);
+        let mut files: Map<HirFileId, Vec<(u32, u32)>, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for module in crate::checks::modules(cx) {
             let Some(file) = module.as_source_file_id(cx.db) else { continue };
             // alloc: on the error path (`Places` is made only when a gate is hit)

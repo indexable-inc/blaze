@@ -134,7 +134,7 @@ impl fmt::Display for InternedString {
 #[cfg(test)]
 mod tests {
     use super::InternedString;
-    use blaze_hash::HashMap;
+    use blaze_hash::{FixedState, Map, MapOpts};
     use std::alloc::Global;
 
     #[test]
@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn ordered_and_looked_up_as_str() {
         assert!(InternedString::new("a") < InternedString::new("b"));
-        let mut map = HashMap::new_in(Global);
+        let mut map = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         map.insert(InternedString::new("default"), 1);
         assert_eq!(map.get("default"), Some(&1));
     }

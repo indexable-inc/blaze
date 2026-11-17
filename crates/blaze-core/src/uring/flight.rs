@@ -1439,7 +1439,7 @@ impl Drop for Uring {
         self.slot_waiting.clear();
         self.load_waiting.clear();
         // alloc: drop, once.
-        let mut owed: HashMap<Id, usize, std::alloc::Global> =
+        let mut owed: Map<Id, usize, FixedState, std::alloc::Global> =
             self.ops.iter().map(|(id, hot)| (id, owed(hot))).collect();
         // Those the kernel holds nothing of: never handed to it, or every completion in.
         owed.retain(|&id, left| {

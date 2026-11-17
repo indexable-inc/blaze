@@ -16,7 +16,7 @@ use std::vec;
 use blaze_flow::record::check;
 use blaze_own::Alloc;
 use blaze_typeck::fixture::{Bb, Fx};
-use blaze_typeck::{ExprId, InferCtx, ItemKey, Mutbl, Name, Needs, Outcome, PTy, Selected};
+use blaze_typeck::{ExprId, InferCtx, ItemKey, List, Mutbl, Name, Needs, Outcome, PNode, PTy, Selected};
 
 use crate::{AdtFacts, CallBounds, CalleeFacts, Facts, Form, ImplSource, Plant, Refusal, SigBuf, SigLife, lower_planted, read_signature};
 
@@ -44,7 +44,7 @@ struct Heads {
 impl Heads {
     fn add(&mut self, fx: &Fx, item: ItemKey, text: &str, inputs: &[PTy], output: PTy) {
         let lifes = self.with_lifetime.clone();
-        let adt = move |k: ItemKey| Some(lifes.contains(&k));
+        let adt = move |k: ItemKey| Some(u32::from(lifes.contains(&k)));
         let mut buf = SigBuf::new_in(alloc());
         if let Err(why) = read_signature(text, fx.t.view(), inputs, output, &adt, &mut buf, alloc()) {
             panic!("`{text}` was not read: {why:?}");
@@ -55,7 +55,7 @@ impl Heads {
 
 impl Facts for Heads {
     fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
-        let lifetimes = self.with_lifetime.contains(&k);
+        let lifetimes = u32::from(self.with_lifetime.contains(&k));
         Some(AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes, union: false, is_enum: false, is_box: false })
     }
     fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
@@ -84,11 +84,12 @@ impl Facts for Heads {
 /// The world: `S`, `Wrap<'a>`, `Keep<'a>`, `trait Tr { type Out; }`, `impl<'a> Tr for Wrap<'a> {
 /// type Out = &'a S; }`, `impl<'a> Tr for Keep<'a> { type Out = &'static S; }`, `fn take<T:
 /// Tr>(x: T::Out) {}`, and the owner `bad(s: S)`. Portable types hold no lifetimes: `Wrap` and
-/// `Keep` hold one by their `AdtFacts`.
+/// `Keep` hold one by their `AdtFacts`. `wrap` and `keep` are the structs' items: a body names
+/// them as a type in ITS OWN table (`call_take`), never by a `PTy` of the world's.
 struct World {
     fx: Fx,
-    wrap: PTy,
-    keep: PTy,
+    wrap: ItemKey,
+    keep: ItemKey,
     wrap_impl: ItemKey,
     bad: ItemKey,
     heads: Heads,
@@ -100,7 +101,9 @@ fn world() -> World {
     let st = fx.adt(s, &[]);
     let rs = fx.r(Mutbl::Not, st);
     let unit = fx.unit();
-    let tr = fx.tr("Tr", 0, vec![], &["Out"]);
+    // One parameter, `Self` (fixture.rs `tr`: the count includes `Self`); with 0 the trait goal
+    // `<T as Tr>` has no arguments and the solver refuses it as malformed.
+    let tr = fx.tr("Tr", 1, vec![], &["Out"]);
     let w = fx.strukt("Wrap", 0, &[]);
     let wrap = fx.adt(w, &[]);
     let k = fx.strukt("Keep", 0, &[]);
@@ -117,12 +120,14 @@ fn world() -> World {
     let mut heads = Heads { sigs: vec::Vec::new(), with_lifetime: vec![w, k], impls, take };
     heads.add(&fx, take, "fn take<T: Tr>(x: T::Out) {}", &[out], unit);
     heads.add(&fx, bad, "fn bad(s: S) { take::<Wrap<'_>>(&s); }", &[st], unit);
-    World { fx, wrap, keep, wrap_impl, bad, heads }
+    World { fx, wrap: w, keep: k, wrap_impl, bad, heads }
 }
 
-/// `take::<t>(&s)` as the body's one statement.
-fn call_take(b: &mut Bb, t: PTy) -> ExprId {
+/// `take::<adt>(&s)` as the body's one statement. The type argument is interned in the
+/// body's table: a world `PTy` there indexes another table (`Malformed::TypeOrder`).
+fn call_take(b: &mut Bb, adt: ItemKey) -> ExprId {
     let s = b.param("s");
+    let t = b.ty(PNode::Adt(adt, List::EMPTY));
     let callee = b.path_args("take", &[t]);
     let ls = b.local(s);
     let arg = b.borrow(Mutbl::Not, ls);

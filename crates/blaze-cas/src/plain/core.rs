@@ -38,6 +38,20 @@ pub use probe::{Found, Probe, Probes};
 /// [`Namespace::LOCAL`]: reserved, no kind of blaze-keyed's takes it.
 pub const ROOT_TAG: Tag = Tag(u16::MAX);
 
+/// The tag of a POINTER: a record whose key is a name and whose payload is the 32-byte key of
+/// another record, its target ([`super::Lent::point`]). The one record a newer commit may
+/// REPLACE: two values under one name are the old and the new, never refused, and the value
+/// in the newest row of the manifest holding the name is the pointer's
+/// ([`Plain::find_newest`]). Every other tag keeps the two-values refusal (rule 21). A pointer
+/// lives in [`Namespace::LOCAL`] only; compaction keeps only its newest value. Reserved: apart
+/// from the roots' ([`ROOT_TAG`]), the startup image's (`u16::MAX - 1`), the drive's records
+/// (blaze-cli `DRIVE_TAG`, `u16::MAX - 2`) and code entries (blaze-cli `CODE_TAG`,
+/// `u16::MAX - 3`).
+pub const POINTER_TAG: Tag = Tag(u16::MAX - 4);
+
+/// A pointer's payload: its target's key.
+pub const POINTER_LEN: usize = 32;
+
 /// The tags a store asks with: `tags .. tags + TAGS`.
 pub const TAGS: u64 = 1 << 40;
 
@@ -304,6 +318,9 @@ pub(crate) enum Plant {
     TrustsUnchecked,
     /// The lazy open maps (and checks) every segment its generation names, as the old open did.
     MapsAllAtOpen,
+    /// A pointer's read walks the rows OLDEST first: the first value ever committed of a name
+    /// answers, not the last (pointer_tests).
+    PointerOldest,
 }
 
 /// What one slice of the background pass did ([`Plain::scrub_next`]).
@@ -1239,7 +1256,18 @@ impl Plain {
                     continue;
                 }
                 last = Some(entry);
-                if let Some((_, kept)) = self.find_in(std::slice::from_ref(&namespace), &Key(entry.key)) {
+                if entry.tag == POINTER_TAG {
+                    // A pointer replaces, so it is always laid out, even when this process's view
+                    // holds its value: that view may be older than another process's commit of
+                    // another value, and this commit's row, after every row the generation it
+                    // flips on names, must make this value the newest. A key held under another
+                    // tag is two values (rule 21).
+                    if let Some((_, kept)) = self.newest_mapped(namespace, &Key(entry.key))
+                        && kept.tag != POINTER_TAG
+                    {
+                        return Err(StoreError::TwoValues { tag: entry.tag, key: entry.key });
+                    }
+                } else if let Some((_, kept)) = self.find_in(std::slice::from_ref(&namespace), &Key(entry.key)) {
                     if kept.same_record(&entry) {
                         // Committed already: not laid again.
                         continue;
@@ -1398,7 +1426,16 @@ impl Plain {
         };
         let mut out = Vec::new_in(Global);
         let mut bytes = 0u64;
-        for seg in self.manifest.segments.iter().filter(eligible).filter(|it| it.namespace == namespace) {
+        // A CONTIGUOUS run of the namespace's rows held here: the copy takes the first one's
+        // place, so a row the slice skipped would move from before a pointer's newest value
+        // to after it, and its older value would read as the newest.
+        for seg in self.manifest.segments.iter().filter(|it| it.local && it.namespace == namespace) {
+            if !eligible(&seg) {
+                if out.is_empty() {
+                    continue;
+                }
+                break;
+            }
             if !out.is_empty() && bytes + seg.file_len() > SLICE_BYTES {
                 break;
             }
@@ -1481,7 +1518,10 @@ impl Plain {
                 // A proved segment's entry: read, not checked (decision 18).
                 let entry = Entry::read(&run[i * ENTRY..(i + 1) * ENTRY]);
                 let keep = live.as_ref().is_none_or(|live| young || live.contains(&entry.key));
-                if !keep {
+                // A pointer keeps only its newest value: the one in the newest row holding its
+                // name (in this slice or after it); an older value is let go.
+                let newest = entry.tag != POINTER_TAG || self.newest_mapped(seg.namespace, &Key(entry.key)).is_some_and(|(at, _)| at == self.by_id[&seg.id]);
+                if !keep || !newest {
                     stats.dropped += 1;
                     continue;
                 }
@@ -1585,16 +1625,22 @@ impl Plain {
                     for (seg, _) in segs.iter_mut() {
                         m.retired.retain(|it| !(it.id == seg.id && !it.log));
                         seg.generation = generation;
-                        match m.segments.iter_mut().find(|it| it.id == seg.id) {
+                        match m.segments.iter().position(|it| it.id == seg.id) {
                             // The same bytes, named already: here again if they were not. A
-                            // file written again is unsealed and named anew, so a seal asked for
-                            // the old file (by its generation) never seals the new one.
-                            Some(named) => {
+                            // file written again is unsealed, so a seal asked for the old file
+                            // (by its generation) never seals the new one. Either way the row is
+                            // this generation's and moves to the END: the manifest's order is the
+                            // commit order a pointer's read walks newest first (a pointer set back
+                            // to a value an older row holds writes that row's bytes again), and
+                            // generations stay in row order for pruning's oldest-first slices.
+                            Some(at) => {
+                                let mut named = m.segments.remove(at);
                                 if !named.local {
                                     named.sealed = false;
-                                    named.generation = generation;
                                 }
+                                named.generation = generation;
                                 named.local = true;
+                                m.segments.push(named);
                             }
                             None => m.segments.push(*seg),
                         }
@@ -1643,9 +1689,27 @@ impl Plain {
                 }
             }
             Change::Compact { seg, candidates, orphans, .. } => {
-                if candidates.iter().any(|id| !m.segments.iter().any(|it| it.id == *id && it.local)) {
+                // Each candidate still named here as this process planned it: a row committed
+                // again since moved to the end with a newer generation (a pointer's newest
+                // value may be in it), so the copy may not take its place.
+                let planned = |id: &u64| self.manifest.segments.iter().find(|it| it.id == *id).map(|it| it.generation);
+                // The copy's bytes may equal a named segment's (a merge of pointers keeps each
+                // name's newest value alone, which can be one candidate's whole content or an
+                // older row's): that file is the copy, so it is never removed or retired here.
+                let copy = seg.as_ref().map(|(it, _)| it.id);
+                let named = |id: u64| m.segments.iter().any(|it| it.id == id);
+                if candidates.iter().any(|id| !m.segments.iter().any(|it| it.id == *id && it.local && Some(it.generation) == planned(id))) {
                     aborted = true;
+                    if copy.is_some_and(named) {
+                        *seg = None;
+                    }
                 } else {
+                    // A row holding the copy's bytes (a candidate, or an older row: a pointer's
+                    // copied value is its newest, so no later row holds it) gives way to the
+                    // copy at the run's place.
+                    if let Some(copy) = copy {
+                        m.segments.retain(|it| it.published || it.id != copy || candidates.contains(&it.id));
+                    }
                     let first = m.segments.iter().position(|it| candidates.first() == Some(&it.id));
                     // A published candidate stays named, as not here: a source has it.
                     for it in m.segments.iter_mut().filter(|it| it.published && candidates.contains(&it.id)) {
@@ -1661,7 +1725,7 @@ impl Plain {
                         seg.generation = oldest.unwrap_or(generation);
                         m.segments.insert(first.unwrap_or(0).min(m.segments.len()), *seg);
                     }
-                    for id in candidates.iter() {
+                    for id in candidates.iter().filter(|id| copy != Some(**id)) {
                         retire(&mut m, *id, false);
                     }
                     adopt_orphans(&mut m, orphans);

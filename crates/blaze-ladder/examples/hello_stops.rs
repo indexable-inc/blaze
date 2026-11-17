@@ -50,20 +50,23 @@ fn main() {
     // `blaze run`'s setting: the dev profile's overflow checks (D101).
     let new = NewFront { package, edition, shelf, overflow: blaze_build::OverflowChecks::On };
     let mut lines = String::new();
+    // The program's tables are `'static` (front2's store, the build's): until a tool's main is
+    // handed its heap, the global allocator is the only `Alloc<'static>` it can name.
+    let alloc = blaze_own::Alloc::global();
     let tc = match shelf {
         Some(shelf) => Toolchain::open(&mut DirShelf::new(shelf.into())).unwrap_or_else(|e| panic!("the toolchain: {e}")),
-        None => Toolchain::none(),
+        None => Toolchain::none(alloc),
     };
-    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc).unwrap_or_else(|e| panic!("the program's texts: {e}"));
+    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind).unwrap_or_else(|e| panic!("the program's texts: {e}"));
     let user = texts.user();
     let appended = user.files.iter().any(|(_, text)| text.contains("mod __blaze_entry"));
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the frame");
     {
         let mut left_out = Vec::new_in(Global);
-        match Front2Program::survey(&names, &frame, &files, &mut left_out) {
+        match Front2Program::survey(&names, &frame, &files, &mut left_out, alloc) {
             Err(e) => writeln!(lines, "ENTRY: no survey: {e}").expect("a line"),
             Ok(program) => {
                 match program.entry() {
@@ -84,7 +87,7 @@ fn main() {
             writeln!(lines, "left out: {function}: {class}").expect("a line");
         }
     }
-    match build_stubbed(&names, &files, &texts) {
+    match build_stubbed(&names, &files, &texts, alloc) {
         Err(e) => writeln!(lines, "REFUSED BEFORE THE RUN: {e}").expect("a line"),
         Ok(built) => {
             writeln!(lines, "NOT BUILT: {} of {}", built.refused().len(), built.reached()).expect("a line");

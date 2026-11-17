@@ -33,7 +33,7 @@
 //! | `Vec`: the initialized prefix, `drain`, `retain`, `truncate`, `extend`, `clone`, and their unwinding | `vec_matches_std`, `vec_frees_everything_when_*`, `vec_sorts_and_dedups_a_tail`, `vec_in_makes_what_it_says` |
 //! | the block copies and the `TrustedLen` extend (`spec`), `insert_many` | `specialized_paths_match_the_generic_ones`, `trusted_extend_frees_everything_when_the_iterator_panics`, `insert_many_frees_everything_when_a_clone_panics`, `collect_in_from_an_exact_iterator_allocates_once` |
 //! | `VecDeque`: the wrapped slots, growth from a wrap, `append` in runs, drain and retain unwinding | `deque_matches_std`, `deque_grows_from_every_wrap`, `deque_grown_while_wrapped_matches_std`, `deque_frees_everything_when_a_drop_panics_across_the_wrap`, `deque_drain_and_retain_keep_order_when_a_drop_panics` |
-//! | `Box`: unsizing, `dyn` drop, `CallOnce` | `box_unsizes_and_drops_once`, `boxed_closures_are_called_once_and_freed` |
+//! | `Box`: unsizing, `dyn` drop, `CallOnce`, pinned unsizing | `box_unsizes_and_drops_once`, `boxed_closures_are_called_once_and_freed`, `pinned_box_unsizes_and_drops_its_future_once` |
 //! | `Arc`, `Rc`, their `Weak`s: counts, `make_mut`, `get_mut`, `new_cyclic`, raw round trips, slices | `arc_under_threads_drops_once_and_frees`, `arc_unique_paths`, `arc_make_mut_with_only_a_weak`, `arc_get_mut_waits_for_the_others_reads`, `new_cyclic_refers_to_itself_and_frees`, `raw_pointers_round_trip`, `arc_slice_frees_everything_when_clone_panics`, `arc_clones_count`, `rc_counts_and_frees` |
 //! | `Soa`: one block of columns, growth, the column copies, permute, compaction | `soa_matches_a_vec_of_rows`, `soa_grows_every_column`, `soa_columns_sit_where_the_layout_says`, `soa_frees_everything_when_a_drop_panics`, `soa_retain_keeps_the_unseen_when_a_drop_panics`, `soa_of_fields_sized_zero_never_allocates`, `soa_debug_and_insert_remove` |
 //! | `SortedMap`, `SortedSet` | `sorted_map_and_set_match_std`, `sorted_map_entry_and_index`, `from_sorted_refuses_what_is_not` |
@@ -189,6 +189,11 @@ unsafe impl Allocator for Counting {
         }
     }
 }
+
+// SAFETY: a block is invalidated only by `deallocate` (which passes it to `System`): dropping the
+// ledger frees nothing it handed out, no method invalidates a block, and every `Counting` is its
+// own `System` blocks, so a pinned box over one keeps its block until it frees it.
+unsafe impl core::alloc::StaticAllocator for Counting {}
 
 // ---------------------------------------------------------------------------------------------
 // Tokens: values whose drops are counted, on this thread.
@@ -755,6 +760,42 @@ fn box_unsizes_and_drops_once() -> Result<(), Broke> {
         tokens::check(5)?;
         let inner = Box::into_inner(Box::new_in(Token::new(3), &alloc));
         drop(inner);
+    }
+    tokens::check(0)?;
+    alloc.check()
+}
+
+/// `Pin<Box<{async block}, A>>` unsizes to `Pin<Box<dyn Future, A>>` (`PinSafePointer` for
+/// `Box` in a `StaticAllocator`), an unstarted one drops its captured token once through the
+/// vtable, a polled one gives its value, and both blocks are freed. A box without the impl does
+/// not build; one whose drop skips the value leaves a token live. Passes with the harness's `ok`
+/// line.
+#[test]
+fn pinned_box_unsizes_and_drops_its_future_once() -> Result<(), Broke> {
+    use core::{
+        future::Future,
+        pin::Pin,
+        task::{Context, Poll, Waker},
+    };
+    tokens::fresh();
+    let alloc = Counting::new();
+    {
+        let held = Token::new(3);
+        let unstarted: Pin<Box<dyn Future<Output = u64>, &Counting>> = Box::pin_in(
+            async move {
+                let held = held;
+                held.value + 1
+            },
+            &alloc,
+        );
+        let mut ready: Pin<Box<dyn Future<Output = u64>, &Counting>> = Box::pin_in(async { 7u64 }, &alloc);
+        tokens::check(1)?;
+        drop(unstarted);
+        tokens::check(0)?;
+        let mut cx = Context::from_waker(Waker::noop());
+        if ready.as_mut().poll(&mut cx) != Poll::Ready(7) {
+            return Err(Broke::Oracle(String::from("a pinned boxed future did not finish with its value")));
+        }
     }
     tokens::check(0)?;
     alloc.check()
@@ -2015,6 +2056,26 @@ fn string_stays_utf8_and_frees() -> Result<(), Broke> {
         format_into!(&mut buf, "{}!", formatted);
         if &*buf != "aé-007!" || buf.capacity() != 16 {
             return Err(Broke::Oracle(format!("format_in and format_into gave {buf:?}")));
+        }
+    }
+    alloc.check()
+}
+
+/// `format_in!` of a text that starts with a literal reserves once, by `format!`'s estimate
+/// (twice the literal bytes, 54 here, for 41 written), and so allocates exactly one block. A
+/// text that starts with a placeholder and has under 16 literal bytes (`"{} {}"`) is estimated
+/// at 0 by that same rule, so it grows as it is written and is not asserted here. Prints
+/// nothing, as no test in this file does; it passes as `test format_in_reserves_once ... ok`.
+#[test]
+fn format_in_reserves_once() -> Result<(), Broke> {
+    let alloc = Counting::new();
+    {
+        let text = format_in!(&alloc, "after the count {}, the text {}", 12345u32, "some text");
+        if &*text != "after the count 12345, the text some text" {
+            return Err(Broke::Oracle(format!("format_in gave {text:?}")));
+        }
+        if alloc.allocs() != 1 {
+            return Err(Broke::Oracle(format!("{} allocations for one format_in!, not 1", alloc.allocs())));
         }
     }
     alloc.check()

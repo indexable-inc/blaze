@@ -13,7 +13,7 @@
 //! `core` and `alloc` are Rust's under every edition (the same table), so only `std` is noted.
 
 use blaze_id::ItemKey as LibKey;
-use blaze_scope::names::{PathError, Why};
+use blaze_scope::names::{PathError, Unheld, Why};
 use blaze_typeck::{self as tc, Fetch};
 use blaze_unit_graph::StdIs;
 
@@ -36,7 +36,7 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
         if shift != 0 || why != tc::MissWhy::NotFound || rest.len() < 2 || rest[0] != STD {
             return Ok(None);
         }
-        let not_read = || Gap::Resolve(ResolveError::Path(PathError { module, at: 0, why: Why::NotRead { module } }));
+        let not_read = || Gap::Resolve(ResolveError::Path(PathError { module, at: 0, why: Why::NotRead { module, layer: Unheld::Step } }));
         let Some(krate) = self.names.crate_of(module) else { return self.gap(not_read()) };
         let edition = match self.names.std_is(krate) {
             Some(StdIs::Rust) => return Ok(None),

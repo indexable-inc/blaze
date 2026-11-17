@@ -452,7 +452,7 @@ libusb1-sys and hidapi-rusb `pkg-config`: each such spawn is refused by name (on
 compiler may be started), so they need their own answers later (pkg-config from a table, as D53
 answers git).
 
-**The compiler.** blaze's LLVM fork (`crates/hir-ty-codegen/llvm.json`: 23.1.4, indexable-inc/llvm
+**The compiler.** blaze's LLVM fork (`crates/blaze-toolchain/pins/llvm.json`: 23.1.4, indexable-inc/llvm
 `ix/23.x` e152d9fa2bc2, archives at blaze-releases.ix.dev/native) builds with
 `-DLLVM_ENABLE_PROJECTS=` (`.github/scripts/llvm.py`): no clang, no libclang; the fetched
 aarch64-apple-darwin archive (`~/.blaze/native/sha256-e95fc3b4..`) holds only `llvm-config`,
@@ -556,7 +556,7 @@ by default; bindgen's text holds no paths. Proven by a two-run byte compare once
     The host-tool test's perl now does a piped open of a quoted command.
 
 - **Runner 10: the first native scripts ran (D69), 2026-11-16.** Built: the pin table
-  `crates/hir-ty-codegen/clang.json` (both 23.1.4 rows; `sysroots`: macOS `macos-sdk`, Linux
+  `crates/blaze-toolchain/pins/clang.json` (both 23.1.4 rows; `sysroots`: macOS `macos-sdk`, Linux
   `null`, a typed `PinError::NoSysroot`), read by `blaze_build_script::toolchain` (`clang_pin`,
   `sysroot`, `c_env`, `depfile_reads`, `headers_digest`, `map_paths`, `placement` with
   `NATIVE_EVERY_MODE`); `RunnerKey::Native` adds `sysroot` (`macos-sdk <SDKSettings Version>`);

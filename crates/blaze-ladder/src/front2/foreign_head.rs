@@ -81,8 +81,8 @@ pub(super) fn module_foreign_header<'n, S: NamesSource<'n>>(names: S, lib: LibKe
     };
     let safety = if flags & sig::SAFE != 0 { tc::Safety::Safe } else { tc::Safety::Unsafe };
     match block_abi(block) {
-        Some(BlockAbi::Checker(abi)) => Ok(tc::FnPtrHeader { abi, safety }),
-        Some(BlockAbi::LlvmIntrinsic) => Ok(tc::FnPtrHeader { abi: own.abi, safety }),
+        Some(BlockAbi::Checker(abi)) => Ok(tc::FnPtrHeader { abi, safety, ..own }),
+        Some(BlockAbi::LlvmIntrinsic) => Ok(tc::FnPtrHeader { safety, ..own }),
         None => Err(Why::Unsupported(OTHER_ABI, whole)),
     }
 }

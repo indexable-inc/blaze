@@ -51,7 +51,7 @@ fn world() -> (Fx, Items) {
     let u8_c = fx.ty(PNode::Uint(UintTy::U8));
     fx.imp("impl Copy for u8", 0, u8_c, Some((copy, &[])), &[], Vec::new());
     let (p0, p1, p2) = (fx.param(0), fx.param(1), fx.param(2));
-    let rust_call = FnPtrHeader { abi: Abi::RustCall, safety: Safety::Safe };
+    let rust_call = FnPtrHeader { abi: Abi::RustCall, safety: Safety::Safe, c_variadic: false };
 
     let fn_once = fx.tr("FnOnce", 2, Vec::new(), &["Output"]);
     fx.lang(LangItem::FnOnce, fn_once);

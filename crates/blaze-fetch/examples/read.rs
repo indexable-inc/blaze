@@ -98,7 +98,11 @@ fn main() {
         [_, lock_path, store, whole] => (lock_path, store, whole.strip_prefix("whole=")),
         _ => fail("usage: read <Cargo.lock> <store folder> [whole=<crate name>]"),
     };
-    let alloc = Alloc::global();
+    // An entry that takes no grant yet (a plain `fn main`): the run's memory is one frame
+    // taken from the OS here and handed down.
+    let frame = blaze_mem::Frame::with_reserve(1 << 36, blaze_mem::Tag::Other).expect("the entry's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
     let text = std::fs::read(lock_path).unwrap_or_else(|e| fail(&format!("reading {lock_path}: {e}")));
     let lock = Lock::read(&text, alloc).unwrap_or_else(|e| fail(&format!("{lock_path}: {e}")));
     let plan = plan::plan(&lock, alloc).unwrap_or_else(|e| fail(&shown(&e)));

@@ -49,6 +49,8 @@ struct BodyBuf {
     asm_pieces: Vec<blaze_typeck::AsmPiece, Global>,
     asm_operands: Vec<blaze_typeck::AsmOperand, Global>,
     asm_text: &'static str,
+    /// Call arguments' literal values for `#[rustc_legacy_const_generics]` (`BodyView::call_arg_ints`).
+    call_arg_ints: Vec<(ExprId, u128), Global>,
 }
 
 impl BodyBuf {
@@ -76,6 +78,7 @@ impl BodyBuf {
             asm_pieces: Vec::new_in(Global),
             asm_operands: Vec::new_in(Global),
             asm_text: "",
+            call_arg_ints: Vec::new_in(Global),
         }
     }
 
@@ -231,6 +234,7 @@ impl BodyBuf {
             asm_operands: &self.asm_operands,
             asm_clobbers: &[],
             asm_text: self.asm_text,
+            call_arg_ints: &self.call_arg_ints,
         }
     }
 }
@@ -242,6 +246,9 @@ struct Fun {
     generics: u32,
     inputs: Vec<PTy, Global>,
     output: PTy,
+    /// Its `#[rustc_legacy_const_generics(..)]` positions (`FnSig::legacy_const_generics`,
+    /// `Adts::legacy_const_generics`); empty for most.
+    legacy_const_generics: Vec<u32, Global>,
 }
 
 struct Struct {
@@ -284,6 +291,13 @@ struct TestWorld {
     consts: Vec<(ItemKey, Option<DataRecord<Global>>), Global>,
     /// The promoted borrows and their evaluated values (`None`: the evaluator gave none).
     promoted: Vec<(ExprId, Option<DataRecord<Global>>), Global>,
+    /// Every item's const generic parameters (`World::const_params`), by index, their types of
+    /// this world's table, and the one-segment names that resolve to them as `Def::TyParam`
+    /// (tests/const_paths.rs).
+    const_params: Vec<(u32, PTy), Global>,
+    param_names: Vec<(Name, u32), Global>,
+    /// What `Adts::const_fn_instance` answers: the instance a constant's fn relocation names.
+    const_fns: Vec<(crate::InstanceKey, Instance), Global>,
     /// `#[lang = "deref"] trait Deref { type Target; }` (`DEREF`) and its one impl (`DEREF_IMPL`):
     /// `impl Deref for <self> { type Target = <target>; }`, both types of this world's table.
     deref: Option<(PTy, PTy)>,
@@ -310,9 +324,24 @@ struct TestWorld {
     index_assoc: Vec<(Name, PTy), Global>,
     /// What `Adts::index_fn(Not)` answers: the fn a call at `[Self, Idx]` runs.
     index_fn: Option<ItemKey>,
+    /// `#[lang = "index_mut"] trait IndexMut<Idx>: Index<Idx> {}` (`INDEX_MUT`) and its one
+    /// impl (`INDEX_MUT_IMPL`) for the `Index` impl's self type and index, when set: what
+    /// `Adts::index_fn(Mut)` answers (tests/index.rs).
+    index_mut_fn: Option<ItemKey>,
+    /// Inherent methods `impl <ADT> { fn <name>(&mut self, ..) }` (`TestWorld::method`): the
+    /// ADT's shape, the name, the item as `inherent` answers it, and the impl's self type.
+    methods: Vec<(Shape, Name, AssocItem, PTy), Global>,
     /// The bug a control plants in the walk (`Adts::planted`).
     planted: crate::Planted,
+    /// The fns declared `#[track_caller]` (`Adts::track_caller`; tests/track_caller.rs).
+    tracked: Vec<ItemKey, Global>,
+    /// What `Adts::location_adt` answers; when set, `Adts::caller_site` answers
+    /// [`TRACK_SITE`] for every expression.
+    location: Option<ItemKey>,
 }
+
+/// Where every expression is, to `Adts::caller_site` (tests/track_caller.rs).
+const TRACK_SITE: crate::CallerSite<'static> = crate::CallerSite { file: "src/main.rs", item: MAIN, offset: 30 };
 
 const DEREF: ItemKey = ItemKey(90);
 const DEREF_TARGET: ItemKey = ItemKey(91);
@@ -320,6 +349,8 @@ const DEREF_IMPL: ItemKey = ItemKey(92);
 const INDEX: ItemKey = ItemKey(93);
 const INDEX_OUTPUT: ItemKey = ItemKey(94);
 const INDEX_IMPL: ItemKey = ItemKey(95);
+const INDEX_MUT: ItemKey = ItemKey(97);
+const INDEX_MUT_IMPL: ItemKey = ItemKey(98);
 /// What [`TestAdts`] answers for every `panic_const_*` lang fn (walk/arith_checks.rs).
 const PANIC_CONST: ItemKey = ItemKey(96);
 
@@ -343,6 +374,9 @@ impl TestWorld {
             statics: Vec::new_in(Global),
             consts: Vec::new_in(Global),
             promoted: Vec::new_in(Global),
+            const_params: Vec::new_in(Global),
+            param_names: Vec::new_in(Global),
+            const_fns: Vec::new_in(Global),
             deref: None,
             deref_defs: Vec::new_in(Global),
             deref_assoc: Vec::new_in(Global),
@@ -355,7 +389,11 @@ impl TestWorld {
             index_defs: Vec::new_in(Global),
             index_assoc: Vec::new_in(Global),
             index_fn: None,
+            index_mut_fn: None,
+            methods: Vec::new_in(Global),
             planted: crate::Planted::Nothing,
+            tracked: Vec::new_in(Global),
+            location: None,
         }
     }
 
@@ -405,6 +443,21 @@ impl TestWorld {
         self.index_fn = Some(index_fn);
     }
 
+    /// `impl IndexMut<idx> for <self_> {}` for the `Index` impl's types, whose `index_mut` is
+    /// fn `index_mut_fn`.
+    fn index_mut_impl(&mut self, index_mut_fn: ItemKey) {
+        assert!(self.index.is_some(), "`IndexMut: Index`: the `Index` impl first");
+        self.index_mut_fn = Some(index_mut_fn);
+    }
+
+    /// `impl <adt> { fn <name>(self: <fn's first input>, ..) }`: impl `imp` holding method
+    /// `f`, a fn already declared with `func` (its first input the receiver).
+    fn method(&mut self, adt: ItemKey, name: &str, imp: ItemKey, f: ItemKey) {
+        let self_ty = self.ty(PNode::Adt(adt, List::EMPTY));
+        let item = AssocItem { container: imp, item: f, kind: blaze_typeck::AssocKind::Fn { self_param: true } };
+        self.methods.push((Shape::Adt(adt), Name::of(name), item, self_ty));
+    }
+
     /// `#[lang = "panic_bounds_check"] fn panic_bounds_check(index: usize, len: usize) -> !`.
     fn bounds_fn(&mut self) -> ItemKey {
         self.func(5, "panic_bounds_check", &[USIZE, USIZE], PNode::Never);
@@ -423,7 +476,7 @@ impl TestWorld {
             ins.push(t);
         }
         let output = self.ty(output);
-        self.fns.push(Fun { key: ItemKey(key), name: Name::of(name), generics, inputs: ins, output });
+        self.fns.push(Fun { key: ItemKey(key), name: Name::of(name), generics, inputs: ins, output, legacy_const_generics: Vec::new_in(Global) });
     }
 
     fn strukt(&mut self, key: u128, name: &str, fields: &[(&str, PNode)]) {
@@ -474,9 +527,10 @@ impl TestWorld {
             parent_count: 0,
             own_count: f.generics,
             declared_count: f.generics,
-            self_param: false,
+            self_param: self.methods.iter().any(|m| m.2.item == key),
             header: blaze_typeck::FnPtrHeader::RUST,
             c_variadic: false,
+            legacy_const_generics: &f.legacy_const_generics,
             inputs: &f.inputs,
             output: f.output,
             types: self.types.view(),
@@ -524,12 +578,25 @@ impl World for TestWorld {
             &[DEREF_IMPL]
         } else if trait_ == INDEX && ours(self.index.map(|(s, _)| s)) {
             &[INDEX_IMPL]
+        } else if trait_ == INDEX_MUT && self.index_mut_fn.is_some() && ours(self.index.map(|(s, _)| s)) {
+            &[INDEX_MUT_IMPL]
         } else {
             &[]
         })
     }
 
     fn impl_header(&self, _: Seal, item: ItemKey) -> Fetch<Option<ImplHeader<'_>>> {
+        if let Some(m) = self.methods.iter().find(|m| m.2.container == item) {
+            return Ok(Some(ImplHeader {
+                generics: 0,
+                self_ty: m.3,
+                trait_: None,
+                trait_args: blaze_typeck::ArgsAfterSelf::NONE,
+                assoc_types: &[],
+                types: self.types.view(),
+                polarity: blaze_typeck::ImplPolarity::Positive,
+            }));
+        }
         Ok(match (item, self.deref, self.index) {
             (DEREF_IMPL, Some((s, _)), _) => Some(ImplHeader {
                             generics: 0,
@@ -549,12 +616,24 @@ impl World for TestWorld {
                 types: self.types.view(),
                 polarity: blaze_typeck::ImplPolarity::Positive,
             }),
+            (INDEX_MUT_IMPL, _, Some((s, after))) if self.index_mut_fn.is_some() => Some(ImplHeader {
+                generics: 0,
+                self_ty: s,
+                trait_: Some(INDEX_MUT),
+                trait_args: after,
+                assoc_types: &[],
+                types: self.types.view(),
+                polarity: blaze_typeck::ImplPolarity::Positive,
+            }),
             _ => None,
         })
     }
 
-    fn inherent(&self, _: Seal, _: Shape, _: Name) -> Fetch<&[AssocItem]> {
-        Ok(&[])
+    fn inherent(&self, _: Seal, shape: Shape, name: Name) -> Fetch<&[AssocItem]> {
+        Ok(match self.methods.iter().find(|m| m.0 == shape && m.1 == name) {
+            Some(m) => core::slice::from_ref(&m.2),
+            None => &[],
+        })
     }
 
     fn assoc_item(&self, _: Seal, _: ItemKey, _: Name) -> Fetch<Option<AssocItem>> {
@@ -569,6 +648,9 @@ impl World for TestWorld {
         // This world names one-segment paths only: a longer one is a miss it does not locate,
         // a one-segment name that is none is its first segment's.
         let [n] = segments else { return Ok(Err(blaze_typeck::PathMiss::Whole)) };
+        if let Some(&(_, index)) = self.param_names.iter().find(|(p, _)| p == n) {
+            return Ok(Ok(PathRes { def: Def::TyParam(index), consumed: 1 }));
+        }
         if let Some(f) = self.fns.iter().find(|f| f.name == *n) {
             // A static or a const is a `Fun` of no inputs, for its type.
             let def = match (self.statics.iter().find(|(k, _)| *k == f.key), self.consts.iter().any(|(k, _)| *k == f.key)) {
@@ -596,6 +678,7 @@ impl World for TestWorld {
         Ok(match item {
             LangItem::Deref => self.deref.is_some().then_some(DEREF),
             LangItem::Index => self.index.is_some().then_some(INDEX),
+            LangItem::IndexMut => self.index_mut_fn.is_some().then_some(INDEX_MUT),
             // forms.rs: `c"..."`'s referent, when the test declares it.
             LangItem::CStr => self.structs.iter().any(|s| s.key == forms::CSTR).then_some(forms::CSTR),
             _ => None,
@@ -631,6 +714,20 @@ impl World for TestWorld {
                 defaults: blaze_typeck::TraitDefaults::Known(&[None]),
             }));
         }
+        if item == INDEX_MUT && self.index_mut_fn.is_some() {
+            // `trait IndexMut<Idx>: Index<Idx>`: `Self` and `Idx`; no goal here asks the
+            // supertrait, so it is not listed.
+            return Ok(Some(blaze_typeck::TraitDef {
+                generics: 2,
+                flags: blaze_typeck::TraitFlags(0),
+                lang: Some(LangItem::IndexMut),
+                supertraits: &[],
+                members: blaze_typeck::TraitMembers::NotKnown,
+                assoc_types: &[],
+                types: self.types.view(),
+                defaults: blaze_typeck::TraitDefaults::Known(&[None]),
+            }));
+        }
         Ok((item == DEREF && self.deref.is_some()).then(|| blaze_typeck::TraitDef {
             generics: 1,
             flags: blaze_typeck::TraitFlags(0),
@@ -652,9 +749,10 @@ impl World for TestWorld {
         Ok(blaze_typeck::ConstHolds::Error)
     }
 
-    /// No test item has a const generic parameter.
+    /// Every item has the const parameters `const_params` lists (none but in
+    /// tests/const_paths.rs).
     fn const_params(&self, _: Seal, _: ItemKey) -> Fetch<blaze_typeck::ConstParams<'_>> {
-        Ok(blaze_typeck::ConstParams { params: &[], types: self.types.view() })
+        Ok(blaze_typeck::ConstParams { params: &self.const_params, types: self.types.view() })
     }
 }
 
@@ -727,6 +825,10 @@ impl Adts for TestAdts<'_> {
         self.world.promoted.iter().find(|(k, _)| *k == borrow).and_then(|(_, r)| r.as_ref())
     }
 
+    fn const_fn_instance(&self, key: crate::InstanceKey, _: &mut PortableTys<'_>) -> Option<Instance> {
+        self.world.const_fns.iter().find(|(k, _)| *k == key).map(|&(_, i)| i)
+    }
+
     fn int_lit(&self, _: ItemKey, expr: ExprId) -> Option<u128> {
         self.body.lits.iter().find(|(e, _)| *e == expr).map(|&(_, v)| v)
     }
@@ -766,7 +868,7 @@ impl Adts for TestAdts<'_> {
     fn index_fn(&self, mutbl: Mutbl) -> Option<ItemKey> {
         match mutbl {
             Mutbl::Not => self.world.index_fn,
-            Mutbl::Mut => None,
+            Mutbl::Mut => self.world.index_mut_fn,
         }
     }
 
@@ -818,9 +920,26 @@ impl Adts for TestAdts<'_> {
         })
     }
 
+    fn legacy_const_generics(&self, item: ItemKey) -> &[u32] {
+        self.world.fns.iter().find(|f| f.key == item).map(|f| &f.legacy_const_generics[..]).unwrap_or(&[])
+    }
+
     /// The world's `extern "C"` fns are "C" (non-unwinding); every other unwinds.
     fn nounwind(&self, item: ItemKey) -> Option<bool> {
         self.world.fns.iter().any(|f| f.key == item).then(|| self.world.c_abi.contains(&item))
+    }
+
+    fn track_caller(&self, instance: Instance, _: &mut PortableTys<'_>) -> Option<bool> {
+        let item = instance.item;
+        self.world.fns.iter().any(|f| f.key == item).then(|| self.world.tracked.contains(&item))
+    }
+
+    fn caller_site(&self, _: ItemKey, _: ExprId) -> Option<crate::CallerSite<'_>> {
+        self.world.location.map(|_| TRACK_SITE)
+    }
+
+    fn location_adt(&self) -> Option<ItemKey> {
+        self.world.location
     }
 }
 
@@ -1022,7 +1141,7 @@ fn a_struct_local_written_and_read() {
     let start = b.field_inits.len() as u32;
     b.field_inits.push(FieldInit { name: Name::of("a"), expr: one_ });
     b.field_inits.push(FieldInit { name: Name::of("b"), expr: seven });
-    let lit = b.e(Expr::Struct { path, fields: List { start, len: 2 }, base: None });
+    let lit = b.e(Expr::Struct { path, fields: List { start, len: 2 }, base: blaze_typeck::StructBase::None });
     let set = |b: &mut BodyBuf, field: &str, value: u128| {
         let base = b.local(p);
         let f = b.e(Expr::Field { base, name: Name::of(field) });
@@ -1082,6 +1201,59 @@ fn a_call_names_its_callee() {
     assert!(text.lines().any(|l| l.contains("call") && l.contains("ref0")), "{text}");
 }
 
+/// `#[rustc_legacy_const_generics(1)] fn vget<const N: i32>(v: i32) -> i32;`
+/// `fn main() -> i32 { vget(5, 3) }`: the checker makes `3` the callee's const argument
+/// (`vget::<3>`), so the call passes one value, `5`. A builder that passed every written
+/// argument makes a call of two values and fails the last assertion.
+///
+/// Prints: `test tests::a_legacy_const_generic_argument_is_not_passed ... ok`
+#[test]
+fn a_legacy_const_generic_argument_is_not_passed() {
+    const VGET: ItemKey = ItemKey(8);
+    let mut w = TestWorld::new();
+    w.func(1, "main", &[], I32);
+    w.generic_func(VGET.0, "vget", 1, &[I32], I32);
+    w.fns.last_mut().expect("vget was just declared").legacy_const_generics.push(1);
+    let i32_ = w.ty(I32);
+    w.const_params.push((0, i32_));
+    let mut b = BodyBuf::new();
+    let path = b.path("vget");
+    let callee = b.e(Expr::Path(path));
+    let v = b.int(5, None);
+    let lane = b.int(3, None);
+    b.call_arg_ints.push((v, 5));
+    b.call_arg_ints.push((lane, 3));
+    let args = b.exprs_list(&[v, lane]);
+    let root = b.e(Expr::Call { callee, args });
+    let mut ground = PortableTys::new_in(Alloc::global());
+    let built = build_instance(&w, &b, MAIN, root, &[], &mut ground).unwrap_or_else(|e| panic!("{e}"));
+    let [callee_instance] = built.refs.as_slice() else { panic!("one callee, not {:?}", built.refs) };
+    assert_eq!(callee_instance.item, VGET);
+    let gv = ground.view();
+    let args = gv.list(callee_instance.args).expect("the callee's arguments are in the ground table");
+    let [n] = args else { panic!("`vget` takes one generic argument, not {args:?}") };
+    assert!(matches!(gv.node(*n), Ok(PNode::ConstValue { bits: 3, .. })), "`N` is 3: {:?}", gv.node(*n));
+    let view = built.func.view();
+    let text = blaze_lir::print(view);
+    let mut passed = Vec::new_in(Global);
+    for block in 0..view.blocks() {
+        for at in view.block(blaze_lir::Block(block as u32)) {
+            let op = view.op(at);
+            if op == blaze_lir::Op::Call || op == blaze_lir::Op::Invoke {
+                let mut o = view.operands(at);
+                let _callee = o.reference();
+                let _sig = o.sig();
+                if op == blaze_lir::Op::Invoke {
+                    let _normal = o.block();
+                    let _pad = o.block();
+                }
+                passed.push(o.values().len());
+            }
+        }
+    }
+    assert_eq!(passed.as_slice(), &[1], "one call, of one value (`5`):\n{text}");
+}
+
 const U8: PNode = PNode::Uint(UintTy::U8);
 const T: PNode = PNode::Param(0);
 const PICK: ItemKey = ItemKey(2);
@@ -1139,7 +1311,7 @@ fn a_generic_struct_is_laid_out_at_its_arguments() {
         let start = b.field_inits.len() as u32;
         b.field_inits.push(FieldInit { name: Name::of("a"), expr: x });
         b.field_inits.push(FieldInit { name: Name::of("b"), expr: y });
-        b.e(Expr::Struct { path, fields: List { start, len: 2 }, base: None })
+        b.e(Expr::Struct { path, fields: List { start, len: 2 }, base: blaze_typeck::StructBase::None })
     };
     let field = |b: &mut BodyBuf, of: PatId, name: &str| {
         let base = b.local(of);
@@ -1295,11 +1467,28 @@ fn own_sig(built: &Built<Global>) -> (Vec<Ty, Global>, Vec<Ty, Global>) {
     sig_tys(built, SigId(built.func.view().head.sig))
 }
 
-/// Whether some call in the function has signature `params -> rets`.
+/// Whether some call in the function has signature `params -> rets`: the signature its call
+/// instruction names. Signatures are made once however often asked for (blaze-lir builder.rs
+/// `sig`), so a call whose signature equals the function's own (a tracked fn calling a tracked
+/// fn of its shape) names the head's: the call's operand is read, never "every signature but
+/// the head's".
 fn has_call_sig(built: &Built<Global>, params: &[Ty], rets: &[Ty]) -> bool {
+    use blaze_lir::Op;
     let view = built.func.view();
-    (0..view.sigs.len() as u32).filter(|&s| s != view.head.sig).any(|s| {
-        let (p, r) = sig_tys(built, SigId(s));
+    (0..view.len()).any(|inst| {
+        let mut o = view.operands(inst);
+        let sig = match view.op(inst) {
+            Op::Call | Op::Invoke | Op::TailCall => {
+                let _callee = o.reference();
+                o.sig()
+            }
+            Op::CallIndirect | Op::InvokeIndirect | Op::TailCallIndirect => {
+                let _callee = o.value();
+                o.sig()
+            }
+            _ => return false,
+        };
+        let (p, r) = sig_tys(built, sig);
         p.as_slice() == params && r.as_slice() == rets
     })
 }
@@ -1318,7 +1507,7 @@ fn p_lit(b: &mut BodyBuf, x: ExprId, y: ExprId) -> ExprId {
     let start = b.field_inits.len() as u32;
     b.field_inits.push(FieldInit { name: Name::of("a"), expr: x });
     b.field_inits.push(FieldInit { name: Name::of("b"), expr: y });
-    b.e(Expr::Struct { path, fields: List { start, len: 2 }, base: None })
+    b.e(Expr::Struct { path, fields: List { start, len: 2 }, base: blaze_typeck::StructBase::None })
 }
 
 /// `fn mk(a: i32, b: u8) -> P { P { a, b } }` writes its result through a hidden first
@@ -1758,7 +1947,7 @@ fn g_lit(b: &mut BodyBuf, v: u128) -> ExprId {
     let x = b.int(v, None);
     let start = b.field_inits.len() as u32;
     b.field_inits.push(FieldInit { name: Name::of("x"), expr: x });
-    b.e(Expr::Struct { path, fields: List { start, len: 1 }, base: None })
+    b.e(Expr::Struct { path, fields: List { start, len: 1 }, base: blaze_typeck::StructBase::None })
 }
 
 /// How many calls the function makes of its `n`th reference.
@@ -2231,7 +2420,7 @@ fn a_c_fn_pointer_returns_16_bytes_in_two_registers() {
         sig.push(w.ty(n));
     }
     let list = w.types.intern_list(&sig).expect("a list interns");
-    let header = blaze_typeck::FnPtrHeader { abi: blaze_typeck::Abi::C, safety: blaze_typeck::Safety::Safe };
+    let header = blaze_typeck::FnPtrHeader { abi: blaze_typeck::Abi::C, safety: blaze_typeck::Safety::Safe, c_variadic: false };
     let write = PNode::FnPtr(list, header);
     w.strukt(11, "Table", &[("write", write)]);
     let table = PNode::Adt(ItemKey(11), List::EMPTY);
@@ -2661,11 +2850,11 @@ fn an_overloaded_deref_calls_deref_with_the_place() {
     let foo_path = b.path("Foo");
     let start = b.field_inits.len() as u32;
     b.field_inits.push(FieldInit { name: Name::of("n"), expr: forty });
-    let foo_lit = b.e(Expr::Struct { path: foo_path, fields: List { start, len: 1 }, base: None });
+    let foo_lit = b.e(Expr::Struct { path: foo_path, fields: List { start, len: 1 }, base: blaze_typeck::StructBase::None });
     let wrap_path = b.path("Wrap");
     let start = b.field_inits.len() as u32;
     b.field_inits.push(FieldInit { name: Name::of("inner"), expr: foo_lit });
-    let wrap_lit = b.e(Expr::Struct { path: wrap_path, fields: List { start, len: 1 }, base: None });
+    let wrap_lit = b.e(Expr::Struct { path: wrap_path, fields: List { start, len: 1 }, base: blaze_typeck::StructBase::None });
     let w_e = b.local(wv);
     let r_init = b.e(Expr::Ref { mutbl: Mutbl::Not, operand: w_e });
     let r_e = b.local(rv);
@@ -2747,7 +2936,7 @@ fn four_locals_drop_in_reverse_order_when_run() {
     let start = b.field_inits.len() as u32;
     b.field_inits.push(FieldInit { name: Name::of("n"), expr: seven });
     b.field_inits.push(FieldInit { name: Name::of("g"), expr: g2 });
-    let b_init = b.e(Expr::Struct { path: b_path, fields: List { start, len: 2 }, base: None });
+    let b_init = b.e(Expr::Struct { path: b_path, fields: List { start, len: 2 }, base: blaze_typeck::StructBase::None });
     let c_init = g_lit(&mut b, 3);
     let d_init = g_lit(&mut b, 4);
     let e_init = b.local(d);
@@ -2911,7 +3100,7 @@ fn a_manually_drop_field_is_never_dropped() {
         let m_path = b.path("M");
         let start = b.field_inits.len() as u32;
         b.field_inits.push(FieldInit { name: Name::of("g"), expr: g1 });
-        let m_init = b.e(Expr::Struct { path: m_path, fields: List { start, len: 1 }, base: None });
+        let m_init = b.e(Expr::Struct { path: m_path, fields: List { start, len: 1 }, base: blaze_typeck::StructBase::None });
         let k_init = g_lit(&mut b, 2);
         let root = b.block(
             &[
@@ -2976,7 +3165,7 @@ fn a_union_copies_its_bytes_not_a_field() {
     let seven = b.int(7, None);
     let start = b.field_inits.len() as u32;
     b.field_inits.push(FieldInit { name: Name::of("a"), expr: seven });
-    let u_init = b.e(Expr::Struct { path: u_path, fields: List { start, len: 1 }, base: None });
+    let u_init = b.e(Expr::Struct { path: u_path, fields: List { start, len: 1 }, base: blaze_typeck::StructBase::None });
     let u_e = b.local(u);
     let v_e = b.local(v);
     let va = b.field(v_e, "a");
@@ -3041,7 +3230,7 @@ fn enum_glue_drops_the_live_variant() {
     let r_path = b.path("R");
     let start = b.field_inits.len() as u32;
     b.field_inits.push(FieldInit { name: Name::of("r"), expr: r_ref });
-    let r_lit = b.e(Expr::Struct { path: r_path, fields: List { start, len: 1 }, base: None });
+    let r_lit = b.e(Expr::Struct { path: r_path, fields: List { start, len: 1 }, base: blaze_typeck::StructBase::None });
     let s_init = b.call("S", &[r_lit]);
     let n_path = b.path("N");
     let o_init = b.e(Expr::Path(n_path));
@@ -3049,7 +3238,7 @@ fn enum_glue_drops_the_live_variant() {
     let four = b.int(4, None);
     let start = b.field_inits.len() as u32;
     b.field_inits.push(FieldInit { name: Name::of("n"), expr: four });
-    let u_init = b.e(Expr::Struct { path: u_path, fields: List { start, len: 1 }, base: None });
+    let u_init = b.e(Expr::Struct { path: u_path, fields: List { start, len: 1 }, base: blaze_typeck::StructBase::None });
     let root = b.block(
         &[
             Stmt::Let { pat: seven, ty: None, init: Some(seven_lit), else_: None },
@@ -3314,6 +3503,20 @@ fn g_drops(w: &TestWorld, b: &BodyBuf, root: ExprId, types: [PNode; 3]) -> Resul
             other => panic!("the check did not finish: {:?}", other.err()),
         };
         let sig = w.sig(DROP_IN_PLACE).expect("a signature");
+        // Every other type whose glue `main` names (a tuple of `G`s an `if let`'s failure edge
+        // drops whole, lets.rs `link_fail`, though an irrefutable pattern never takes it): its
+        // glue is built and placed too, so the run places every callee the code names.
+        let mut more: Vec<PNode, Global> = Vec::new_in(Global);
+        {
+            let v = ground.view();
+            for r in main.refs.iter().filter(|r| r.item == DROP_IN_PLACE) {
+                let node = v.list(r.args).ok().and_then(|l| l.first().copied()).and_then(|t| v.get(t).copied());
+                let Some(node) = node else { return Err(format!("`main` drops at arguments {:?} the table does not hold:\n{text}", r.args)) };
+                if ![g, n, e].contains(&node) && !more.contains(&node) {
+                    more.push(node);
+                }
+            }
+        }
         let mut glue = |t: PNode| -> (List, Built<Global>) {
             let ty = ground.intern(t).expect("intern");
             let args = ground.intern_list(&[ty]).expect("intern");
@@ -3325,16 +3528,24 @@ fn g_drops(w: &TestWorld, b: &BodyBuf, root: ExprId, types: [PNode; 3]) -> Resul
         let (g_args, g_glue) = glue(g);
         let (n_args, n_glue) = glue(n);
         let (e_args, e_glue) = glue(e);
+        let more: Vec<(List, Built<Global>), Global> = {
+            let mut out = Vec::new_in(Global);
+            for &t in more.iter() {
+                out.push(glue(t));
+            }
+            out
+        };
+        // The three first: a glue of another type calls theirs, and is placed before `main`.
+        let mut fns: Vec<(ItemKey, Option<List>, &Built<Global>), Global> = Vec::new_in(Global);
+        fns.push((DROP_IN_PLACE, Some(g_args), &g_glue));
+        fns.push((DROP_IN_PLACE, Some(n_args), &n_glue));
+        fns.push((DROP_IN_PLACE, Some(e_args), &e_glue));
+        for (args, built) in more.iter() {
+            fns.push((DROP_IN_PLACE, Some(*args), built));
+        }
+        fns.push((MAIN, None, &main));
         DROPPED.with(|d| d.borrow_mut().clear());
-        run_native_with(
-            &[(G_DROP, host_g_drop as usize as u64)],
-            &[
-                (DROP_IN_PLACE, Some(g_args), &g_glue),
-                (DROP_IN_PLACE, Some(n_args), &n_glue),
-                (DROP_IN_PLACE, Some(e_args), &e_glue),
-                (MAIN, None, &main),
-            ],
-        );
+        run_native_with(&[(G_DROP, host_g_drop as usize as u64)], &fns);
         let seen = DROPPED.with(|d| d.borrow().clone());
         if std::env::var_os("BLAZE_TEST_PRINT").is_some() {
             println!("{seen:?}\n{text}");
@@ -3490,6 +3701,7 @@ mod casts;
 mod matches;
 mod guards;
 mod promote;
+mod const_paths;
 mod target_intr;
 #[cfg(target_arch = "aarch64")]
 mod operators;
@@ -3497,6 +3709,7 @@ mod operators;
 mod arith_panics;
 mod moves;
 mod moves_places;
+mod struct_update;
 mod nounwind;
 mod unwind;
 mod unwind_ladder;
@@ -3517,11 +3730,16 @@ mod lets;
 #[cfg(target_arch = "aarch64")]
 mod irrefutable;
 #[cfg(target_arch = "aarch64")]
+mod peeled_let;
+#[cfg(target_arch = "aarch64")]
 mod ref_bind;
+#[cfg(target_arch = "aarch64")]
+mod drop_patterns;
 mod wide;
 mod halfquad;
 mod index;
 mod fmt;
+mod expr_shapes;
 mod asm;
 mod coroutines;
 mod coroutine_held;
@@ -3529,3 +3747,4 @@ mod coroutine_id_agree;
 #[cfg(target_arch = "aarch64")]
 mod coroutines_emit;
 mod never_reads;
+mod track_caller;

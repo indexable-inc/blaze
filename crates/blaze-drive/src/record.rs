@@ -16,14 +16,16 @@
 use blaze_id::ContentId;
 use blaze_own::{AVec, Alloc};
 
+use crate::cells::{CELL_BYTES, Cell, CellRead, read_cell, write_cell};
 use crate::condition::Var;
 use crate::key::{Key, Name};
 use crate::wire::{NAME_BYTES, Reader, WireError, WireWhy, Writer};
 
 /// 2: a whole record holds its split variable (drive.md, "One check covers every
-/// configuration"). 3: and the path of each `Locate::File` part ([`PathOf`]). A home of an older
+/// configuration"). 3: and the path of each `Locate::File` part ([`PathOf`]). 4: and its cell
+/// reads after its whole reads, a shape its cells after its names (cells.rs). A home of an older
 /// form is refused by its magic, reported and rebuilt.
-pub(crate) const MAGIC: &[u8; 4] = b"BDR3";
+pub(crate) const MAGIC: &[u8; 4] = b"BDR4";
 const WHOLE: u8 = 1;
 const SHAPE: u8 = 2;
 
@@ -78,6 +80,8 @@ pub struct Finding<'a> {
 }
 
 const READ_BYTES: usize = NAME_BYTES + 32;
+const CELL_READ_BYTES: usize = NAME_BYTES + CELL_BYTES + 32;
+const SHAPE_CELL_BYTES: usize = NAME_BYTES + CELL_BYTES;
 const PART_BYTES: usize = NAME_BYTES + 1 + 32 + 4;
 const FINDING_LEAST: usize = 2 + 4 + 4 + 4;
 const PATH_LEAST: usize = NAME_BYTES + 1 + 4;
@@ -88,6 +92,8 @@ pub(crate) struct Whole<'a> {
     pub(crate) source: ContentId,
     pub(crate) out: ContentId,
     pub(crate) reads: &'a [(Name, ContentId)],
+    /// Its part reads, sorted by (name, cell), one entry each.
+    pub(crate) cells: &'a [CellRead],
     pub(crate) parts: &'a [Part],
     pub(crate) paths: &'a [PathOf<'a>],
     pub(crate) findings: &'a [Finding<'a>],
@@ -110,7 +116,7 @@ pub fn write_plain<'a>(
     payload: &[u8],
     alloc: Alloc<'a>,
 ) -> AVec<'a, u8> {
-    write_whole(&Whole { name, source, out, reads, parts: &[], paths: &[], findings: &[], payload, split: None }, alloc)
+    write_whole(&Whole { name, source, out, reads, cells: &[], parts: &[], paths: &[], findings: &[], payload, split: None }, alloc)
 }
 
 pub(crate) fn write_whole<'a>(whole: &Whole<'_>, alloc: Alloc<'a>) -> AVec<'a, u8> {
@@ -124,6 +130,12 @@ pub(crate) fn write_whole<'a>(whole: &Whole<'_>, alloc: Alloc<'a>) -> AVec<'a, u
     for (name, saw) in whole.reads {
         w.name(*name);
         w.id(saw);
+    }
+    w.count(whole.cells.len());
+    for read in whole.cells {
+        w.name(read.name);
+        write_cell(&mut w, read.cell);
+        w.id(&read.saw);
     }
     w.count(whole.parts.len());
     for part in whole.parts {
@@ -170,13 +182,18 @@ pub(crate) fn write_whole<'a>(whole: &Whole<'_>, alloc: Alloc<'a>) -> AVec<'a, u
 /// The store hands every record in such a buffer (drive.md, "The system side").
 pub const PAYLOAD_ALIGN: usize = 16;
 
-pub(crate) fn write_shape<'a>(name: Name, reads: &[(Name, ContentId)], alloc: Alloc<'a>) -> AVec<'a, u8> {
+pub(crate) fn write_shape<'a>(name: Name, reads: &[(Name, ContentId)], cells: &[CellRead], alloc: Alloc<'a>) -> AVec<'a, u8> {
     let mut w = Writer::new_in(MAGIC, alloc);
     w.u8(SHAPE);
     w.name(name);
     w.count(reads.len());
     for (read, _) in reads {
         w.name(*read);
+    }
+    w.count(cells.len());
+    for read in cells {
+        w.name(read.name);
+        write_cell(&mut w, read.cell);
     }
     w.finish()
 }
@@ -196,6 +213,7 @@ pub struct WholeView<'a> {
     /// See [`Whole::split`].
     pub split: Option<Var>,
     reads: &'a [u8],
+    cells: &'a [u8],
     parts: &'a [u8],
     paths: &'a [u8],
     npaths: usize,
@@ -209,6 +227,7 @@ pub struct WholeView<'a> {
 pub struct ShapeView<'a> {
     pub name: Name,
     names: &'a [u8],
+    cells: &'a [u8],
 }
 
 /// `bytes` as a record of the drive's, checked whole.
@@ -223,6 +242,12 @@ pub fn open(bytes: &[u8]) -> Result<Stored<'_>, WireError> {
             let split = r.split()?;
             let reads = fixed(&mut r, bytes, READ_BYTES, |r| {
                 r.name()?;
+                r.id()?;
+                Ok(())
+            })?;
+            let cells = fixed(&mut r, bytes, CELL_READ_BYTES, |r| {
+                r.name()?;
+                read_cell(r)?;
                 r.id()?;
                 Ok(())
             })?;
@@ -259,13 +284,17 @@ pub fn open(bytes: &[u8]) -> Result<Stored<'_>, WireError> {
             r.pad_to(PAYLOAD_ALIGN)?;
             let payload = r.take_bytes(len)?;
             r.done()?;
-            Ok(Stored::Whole(WholeView { name, source, out, split, reads, parts, paths, npaths, findings, nfindings, payload }))
+            Ok(Stored::Whole(WholeView { name, source, out, split, reads, cells, parts, paths, npaths, findings, nfindings, payload }))
         }
         SHAPE => {
             let name = r.name()?;
             let names = fixed(&mut r, bytes, NAME_BYTES, |r| r.name().map(|_| ()))?;
+            let cells = fixed(&mut r, bytes, SHAPE_CELL_BYTES, |r| {
+                r.name()?;
+                read_cell(r).map(|_| ())
+            })?;
             r.done()?;
-            Ok(Stored::Shape(ShapeView { name, names }))
+            Ok(Stored::Shape(ShapeView { name, names, cells }))
         }
         tag => Err(r.error(WireWhy::Tag(tag))),
     }
@@ -299,6 +328,16 @@ impl<'a> WholeView<'a> {
         self.reads.chunks_exact(READ_BYTES).map(|chunk| {
             let mut r = checked(chunk);
             (r.name().expect(CHECKED), r.id().expect(CHECKED))
+        })
+    }
+
+    /// The part reads, sorted by (name, cell).
+    pub fn cells(&self) -> impl ExactSizeIterator<Item = CellRead> + 'a {
+        self.cells.chunks_exact(CELL_READ_BYTES).map(|chunk| {
+            let mut r = checked(chunk);
+            let name = r.name().expect(CHECKED);
+            let cell = read_cell(&mut r).expect(CHECKED);
+            CellRead { name, cell, saw: r.id().expect(CHECKED) }
         })
     }
 
@@ -339,6 +378,14 @@ impl<'a> WholeView<'a> {
 impl<'a> ShapeView<'a> {
     pub fn names(&self) -> impl ExactSizeIterator<Item = Name> + 'a {
         self.names.chunks_exact(NAME_BYTES).map(|chunk| checked(chunk).name().expect(CHECKED))
+    }
+
+    /// The cells its value key reads, sorted by (name, cell).
+    pub fn cells(&self) -> impl ExactSizeIterator<Item = (Name, Cell)> + 'a {
+        self.cells.chunks_exact(SHAPE_CELL_BYTES).map(|chunk| {
+            let mut r = checked(chunk);
+            (r.name().expect(CHECKED), read_cell(&mut r).expect(CHECKED))
+        })
     }
 }
 

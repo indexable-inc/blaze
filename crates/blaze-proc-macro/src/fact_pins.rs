@@ -132,7 +132,7 @@ pub fn read_apple_userland<'a>(alloc: Alloc<'a>) -> Result<UserlandText<'a>, Com
 }
 
 /// The spawn setting with the derived facts' pins for scripts whose guest is `host`, from the
-/// userland's `text` and the clang pin table ([`PIN`], at `crates/hir-ty-codegen/clang.json`).
+/// userland's `text` and the clang pin table ([`PIN`], at `crates/blaze-toolchain/pins/clang.json`).
 pub fn pinned_setting<'a>(host: &str, text: &UserlandText<'_>, alloc: Alloc<'a>) -> Result<SpawnSetting, CommandPinsError<'a>> {
     let userland = fact_pins::apple_userland(text.plist.as_str(), text.darwin_release.as_str()).map_err(|e| owned_userland(e, alloc))?;
     let pins = fact_pins::fact_pins(PIN, host, &userland, CLANG_GUEST_DIR, alloc).map_err(|e| owned_pin(e, alloc))?;

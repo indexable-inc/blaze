@@ -53,9 +53,24 @@ pub fn tool(producers: &Producers) -> Tool {
 /// Each kind's tool, by `Kind::index` (decision D105): the row of the producer that makes the
 /// kind ([`row_of`]) and every form, so an edit to one producer moves only the keys of its kinds
 /// and a release that leaves a producer's crates alone keeps its records. The certificate and the
-/// pointer keep [`tool`], which every producer moves.
-pub fn tools(producers: &Producers) -> [Tool; blaze_drive::key::KINDS] {
-    Kind::ALL.map(|kind| with_forms(ContentId::of("blaze-cli kind tool 1", &producers.row(row_of(kind)).0)))
+/// pointer keep [`tool`], which every producer moves. The rule set that runs (the step's and
+/// `lints-add`'s, lints.rs `lints_of`; `blaze_lint::RuleSet::id`) joins the `FileItems` tool
+/// (whether it lists lint units) and the `Lint` tool (which rules a unit's findings are of):
+/// another step or another added rule is another key for those two kinds alone (rule 65).
+pub fn tools(producers: &Producers, lints: blaze_lint::RuleSet) -> [Tool; blaze_drive::key::KINDS] {
+    let rules = lints.id();
+    Kind::ALL.map(|kind| {
+        let row = producers.row(row_of(kind)).0;
+        match kind {
+            Kind::FileItems | Kind::Lint => {
+                let mut chained = [0u8; 64];
+                chained[..32].copy_from_slice(&row);
+                chained[32..].copy_from_slice(&rules);
+                with_forms(ContentId::of("blaze-cli kind tool with lints 1", &chained))
+            }
+            _ => with_forms(ContentId::of("blaze-cli kind tool 1", &row)),
+        }
+    })
 }
 
 /// The producer that makes each kind of record: one exhaustive match, so a new kind is placed
@@ -81,7 +96,16 @@ pub fn row_of(kind: Kind) -> Row {
         // Made by the request machine itself (blaze-drive owners.rs), never a task.
         | Kind::Owners
         // A script run is made by the sandbox runner, in no producer's row yet (D105 leg 2).
-        | Kind::Script => Row::Whole,
+        | Kind::Script
+        // A link table is copied from its scope's record, and the native image is made by
+        // blaze-ladder's native_links.rs: in no producer's row yet.
+        | Kind::Links
+        | Kind::Native
+        // The request machine's own answer from what the command gives: never a task's record.
+        | Kind::Given
+        // Made by blaze-lint's rules (lints.rs), in no producer's row yet: placed when blaze-lint
+        // is a producer of its own, so an edit elsewhere keeps the lint records.
+        | Kind::Lint => Row::Whole,
     }
 }
 

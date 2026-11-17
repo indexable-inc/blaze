@@ -143,6 +143,9 @@ impl<A: Allocator> Pass<'_, '_, A> {
     pub(super) fn overflow(&mut self, inst: usize, op: Op) -> Result<(), EmitError> {
         let mut o = self.view.operands(inst);
         let (a, b) = (o.value(), o.value());
+        if Self::is_wide(self.view.ty(a)) {
+            return self.wide_overflow(inst, op);
+        }
         let width = self.width_of(inst, op, a)?;
         if !self.is_pair(self.view.ty(Value(inst as u32))) {
             return Err(unsupported(inst, op, "an overflow operation whose result is not a pair"));

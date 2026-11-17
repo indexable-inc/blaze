@@ -20,7 +20,7 @@ fn a_running_rung_has_no_findings() {
         let dir = ladder().join(rung);
         let files = sources(&dir);
         let views: Vec<SourceFile<'_>> = files.iter().map(|(path, text)| SourceFile { path, text }).collect();
-        let found = refusals(&views, "src/main.rs", rungs::x::overflow_of(&dir));
+        let found = refusals(&views, "src/main.rs", rungs::x::overflow_of(&dir), blaze_own::Alloc::global());
         assert!(found.is_empty(), "rung {rung} runs, yet the findings path refuses it: {found:?}");
     }
 }
@@ -39,9 +39,9 @@ fn a_refused_program_has_the_runners_refusal() {
     ];
     for text in programs {
         let views = [SourceFile { path: "src/main.rs", text }];
-        let found = refusals(&views, "src/main.rs", OverflowChecks::On);
+        let found = refusals(&views, "src/main.rs", OverflowChecks::On, blaze_own::Alloc::global());
         assert!(!found.is_empty(), "`{text}` is refused");
-        let Err(error) = build(&views, "src/main.rs", OverflowChecks::On) else { panic!("`{text}` built") };
+        let Err(error) = build(&views, "src/main.rs", OverflowChecks::On, blaze_own::Alloc::global()) else { panic!("`{text}` built") };
         assert_eq!(error.refusals().as_slice(), found.as_slice(), "`{text}`");
     }
 }

@@ -35,7 +35,6 @@ use std::vec::Vec;
 use blaze_build::StaticItem;
 use blaze_build::data::{DataAlloc, DataRecord, DataTarget};
 use blaze_lower::head;
-use blaze_own::Alloc;
 use blaze_typeck as tc;
 use blaze_typeck::{Checked, ItemKey};
 
@@ -150,7 +149,7 @@ fn thread_local_of<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -
     let krate = r.names.crate_of(f.lib).ok_or_else(|| refuse(format!("no crate holds {:x}", f.lib)))?;
     let atoms = r.names.cfg_atoms(krate).ok_or_else(|| refuse(format!("crate {krate}'s cfg was not answered by the names source")))?;
     let edition = r.names.edition_of(krate).ok_or_else(|| refuse(format!("crate {krate}'s edition was not answered by the names source")))?;
-    let sig = blaze_lower::lower_signature(f.text, edition, &mut CrateCfg(atoms), Alloc::global())
+    let sig = blaze_lower::lower_signature(f.text, edition, &mut CrateCfg(atoms), r.store.tys.alloc())
         .map_err(|_| refuse(String::from("its signature needs a `cfg` the crate does not answer")))?;
     let v = sig.view();
     for &n in v.rows(v.list(head::ATTRS)).map_err(|e| refuse(format!("{e:?}")))? {

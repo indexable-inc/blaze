@@ -65,12 +65,14 @@ static FILE_NAMES: Domain = Domain::new("blaze v2 file inner attributes names 1"
 /// Whether an attribute named `name` makes the name solver read no item text: a built-in
 /// attribute (`blaze_surface::builtin_attrs::BUILTIN_ATTRS`, the list the solver's lowering
 /// reads), so the solver never calls it as an attribute macro and reads only the attribute's own
-/// text, which the digest holds; or the prelude's `test` and `global_allocator`, which the
-/// lowering reads itself and keeps the item for. Left out on purpose: `cfg_attr` and `unsafe`
-/// (each holds another attribute), `derive` and `derive_const` (the item is the derive's input),
-/// `cfg_eval` and `define_opaque` (built-in attribute macros), and a derive's helper (`default`).
+/// text, which the digest holds; or the prelude's `test`, which the lowering reads itself and
+/// keeps the item for. Left out on purpose: `cfg_attr` and `unsafe` (each holds another
+/// attribute), `derive` and `derive_const` (the item is the derive's input), `global_allocator`
+/// (the item is its expansion's input: blaze-expand global_allocator.rs writes the static back
+/// with the allocator fns), `cfg_eval` and `define_opaque` (built-in attribute macros), and a
+/// derive's helper (`default`).
 pub(crate) fn inert(name: &str) -> bool {
-    (BUILTIN_ATTRS.binary_search(&name).is_ok() && !matches!(name, "cfg_attr" | "unsafe")) || matches!(name, "global_allocator" | "test")
+    (BUILTIN_ATTRS.binary_search(&name).is_ok() && !matches!(name, "cfg_attr" | "unsafe")) || name == "test"
 }
 
 /// Each entry of `items` (an outline of `text` in the edition whose hash byte is `edition`, its

@@ -43,6 +43,10 @@ fn patterns_match_as_glob_s_do() {
         ("a/**", "a/", true),
         ("a/**", "a/x/y", true),
         ("a/**/**/b", "a/b", true),
+        ("**/", "a", true),
+        ("**/", "a/b", true),
+        ("a/**", "a/xyz", true),
+        ("**/b", "a/c", false),
         ("é?", "éé", true),
     ];
     for &(pattern, text, want) in cases {
@@ -134,7 +138,7 @@ const LETTERS: &[char] = &['a', 'b', 'c', '/', '.'];
 /// The table matcher and the backtracker agree on every pattern that parses.
 #[test]
 fn the_table_is_the_backtracker() {
-    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+    blaze_sim::check_kept(blaze_sim::Config::DEFAULT, blaze_sim::sim_kept!(), |tape| {
         let pattern: String = tape.vec(0..=6, "pattern", |tape| *tape.one_of(PIECES, "piece")).concat();
         let text: String = tape.vec(0..=8, "text", |tape| *tape.one_of(LETTERS, "char")).into_iter().collect();
         if let Ok(parsed) = Pattern::new(&pattern) {

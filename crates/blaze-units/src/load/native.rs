@@ -5,7 +5,7 @@
 //!
 //! ```toml
 //! [workspace.metadata.blaze.native.llvm]
-//! pin = "crates/hir-ty-codegen/llvm.json"
+//! pin = "crates/blaze-toolchain/pins/llvm.json"
 //! env = "LLVM_SYS_231_PREFIX"
 //! packages = ["llvm-sys", "blaze-stencil/llvm-stencils"]
 //! ```

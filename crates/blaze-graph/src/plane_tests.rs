@@ -10,7 +10,7 @@ mod reference;
 
 use std::sync::Arc;
 
-use blaze_hash::{HashMap, HashSet};
+use blaze_hash::{FixedState, Map, MapOpts, Set};
 use blaze_ids::rng::SplitMix64;
 use blaze_protocol::events::{Event, NodeKind, NodeState, Order, Record};
 use blaze_core::lock::Lock;
@@ -255,7 +255,7 @@ fn one_request_without_keys_or_budget_says_what_the_machine_says() {
 
 /// What the query database has, as the plane's [`crate::plane::Memo`] sees it: the test puts a
 /// task's value in it before its `Done`, as the work does.
-type Db = Arc<Lock<HashMap<Key, Outcome, Global>>>; // alloc: a test's model
+type Db = Arc<Lock<Map<Key, Outcome, FixedState, Global>>>; // alloc: a test's model
 
 /// A test's [`Db`] as the plane's memo.
 struct DbMemo(Db);
@@ -267,7 +267,10 @@ impl Memo for DbMemo {
 }
 
 fn with_db(config: PlaneConfig) -> (Plane<DbMemo>, Db) {
-    let db: Db = Arc::new(Lock::new("graph.test.plane.db", HashMap::default()));
+    let db: Db = Arc::new(Lock::new(
+        "graph.test.plane.db",
+        Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+    ));
     (Plane::with_memo(config, DbMemo(Arc::clone(&db))).unwrap(), db)
 }
 
@@ -936,7 +939,10 @@ struct ModelDb(Db);
 
 impl Default for ModelDb {
     fn default() -> Self {
-        ModelDb(Arc::new(Lock::new("graph.test.plane.db", HashMap::default())))
+        ModelDb(Arc::new(Lock::new(
+            "graph.test.plane.db",
+            Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+        )))
     }
 }
 
@@ -951,27 +957,27 @@ impl std::ops::Deref for ModelDb {
 #[derive(Default)]
 struct Model {
     seed: u64,
-    specs: HashMap<u32, Spec, Global>,     // alloc: a test's model
-    request_of: HashMap<u32, u32, Global>, // alloc: a test's model
-    nodes_of: HashMap<u32, Vec<u32>, Global>, // alloc: a test's model
-    dependents: HashMap<u32, Vec<u32>, Global>, // alloc: a test's model
-    states: HashMap<u32, NodeState, Global>, // alloc: a test's model
+    specs: Map<u32, Spec, FixedState, Global>,     // alloc: a test's model
+    request_of: Map<u32, u32, FixedState, Global>, // alloc: a test's model
+    nodes_of: Map<u32, Vec<u32>, FixedState, Global>, // alloc: a test's model
+    dependents: Map<u32, Vec<u32>, FixedState, Global>, // alloc: a test's model
+    states: Map<u32, NodeState, FixedState, Global>, // alloc: a test's model
     /// The tasks running, by the node they run as.
     running: Vec<u32>,
-    running_keys: HashSet<Key, Global>, // alloc: a test's model
+    running_keys: Set<Key, FixedState, Global>, // alloc: a test's model
     /// What the database has: keys whose task ended well, some that failed, less those
     /// dropped since.
     db: ModelDb,
-    finished: HashMap<u32, bool, Global>, // alloc: a test's model
-    cancelled: HashSet<u32, Global>,      // alloc: a test's model
+    finished: Map<u32, bool, FixedState, Global>, // alloc: a test's model
+    cancelled: Set<u32, FixedState, Global>,      // alloc: a test's model
     /// The requests idle now.
-    idle: HashSet<u32, Global>, // alloc: a test's model
+    idle: Set<u32, FixedState, Global>, // alloc: a test's model
     /// The requests that keep going past a failure.
-    keep_going: HashSet<u32, Global>, // alloc: a test's model
+    keep_going: Set<u32, FixedState, Global>, // alloc: a test's model
     /// The running tasks asked to give way, by the node they run as.
-    yielding: HashSet<u32, Global>, // alloc: a test's model
+    yielding: Set<u32, FixedState, Global>, // alloc: a test's model
     /// How many `Run`s each request was said, less those that gave way.
-    ran: HashMap<u32, u64, Global>, // alloc: a test's model
+    ran: Map<u32, u64, FixedState, Global>, // alloc: a test's model
     outputs: Vec<PlaneOutput>,
 }
 
@@ -988,7 +994,7 @@ impl Model {
     }
 
     /// The longest path of expected cost from `id` to the end of its request.
-    fn priority(&self, id: u32, memo: &mut HashMap<u32, u64, Global>) -> u64 {
+    fn priority(&self, id: u32, memo: &mut Map<u32, u64, FixedState, Global>) -> u64 {
         // alloc: a test's model
         if let Some(&it) = memo.get(&id) {
             return it;
@@ -1079,7 +1085,7 @@ impl Model {
                     assert_eq!(self.states[&id.0], NodeState::Running, "seed {seed}: #{id}");
                     // Critical exactly when nothing ready or running of its request has a
                     // longer path to go, counted from the whole graph.
-                    let mut memo = HashMap::new_in(Global); // alloc: a test's model
+                    let mut memo = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }); // alloc: a test's model
                     let mine = self.priority(id.0, &mut memo);
                     let most = self.nodes_of[&self.request_of[&id.0]]
                         .iter()
@@ -1111,7 +1117,7 @@ impl Model {
                         );
                     }
                     // Admission is by threads alone, so a request's order is its priority's.
-                    let mut memo = HashMap::new_in(Global); // alloc: a test's model
+                    let mut memo = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }); // alloc: a test's model
                     let request = self.request_of[&id.0];
                     let mine = self.priority(id.0, &mut memo);
                     for other in &self.nodes_of[&request] {
@@ -1541,7 +1547,10 @@ fn releasing_requests_changes_no_output() {
 /// Puts the reference through what `simulated` did to the plane, and checks that it says the
 /// same to each act and of itself after it.
 fn replay(seed: u64, simulated: &Simulated) {
-    let db: Db = Arc::new(Lock::new("graph.test.plane.db", HashMap::default()));
+    let db: Db = Arc::new(Lock::new(
+        "graph.test.plane.db",
+        Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+    ));
     let mut model =
         reference::Plane::with_memo(simulated.config.clone(), DbMemo(Arc::clone(&db))).unwrap();
     assert_eq!(model.config(), &simulated.config);

@@ -217,7 +217,7 @@ enum Op {
     Intersect,
 }
 
-/// A set of ids `I` below a domain, in chunks (see the module).
+/// A set of ids `I` below a domain, in chunks (see the module): 8 bytes a uniform chunk of 2,048 ids, 264 a mixed one shared by copies; a copy costs a word a chunk.
 pub struct ChunkedBitSet<I: Id, A: AllocatorClone> {
     chunks: Vec<*mut Block<A>, A>,
     domain: usize,

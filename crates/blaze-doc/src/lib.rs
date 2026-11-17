@@ -25,7 +25,7 @@ mod source;
 mod tests;
 
 use base_db::Db;
-use blaze_hash::HashSet;
+use blaze_hash::{FixedState, Set, SetOpts};
 use hir::Crate;
 use std::alloc::Global;
 
@@ -34,7 +34,7 @@ pub use crate::places::Documented;
 /// Each crate's dependencies only its tests use (a workspace member's dev-dependencies), which
 /// rust-analyzer's crate graph gives the crate itself and `cargo doc` neither documents nor
 /// links: `(crate, dependency)`, each by its key, as it is held across [`set_cfg_doc`]'s commit.
-pub type TestOnly = HashSet<(base_db::CrateKey, base_db::CrateKey), Global>;
+pub type TestOnly = Set<(base_db::CrateKey, base_db::CrateKey), FixedState, Global>;
 
 /// Whether `dep` is a dependency of `krate` only its tests use (`test_only`).
 pub(crate) fn only_tests_use(db: &Db, test_only: &TestOnly, krate: Crate, dep: Crate) -> bool {
@@ -61,8 +61,8 @@ pub fn crates_to_document(
     test_only: &TestOnly,
 ) -> Result<Vec<Documented>, base_db::UnnamedCrate> {
     let mut out: Vec<Documented> = vec![];
-    let mut names = HashSet::new_in(Global);
-    let mut seen = HashSet::new_in(Global);
+    let mut names = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
+    let mut seen = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
     for it in asked {
         let name = crate_name(db, it.krate)?;
         if names.insert(name.clone()) {
@@ -76,7 +76,7 @@ pub fn crates_to_document(
     // Each crate reached, and whether a path to it leads through no proc macro: cargo builds
     // a proc macro and everything it depends on for the host, the rest for the target.
     let mut reached: Vec<(Crate, bool)> = vec![];
-    let mut walked = HashSet::new_in(Global);
+    let mut walked = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
     let mut stack: Vec<(Crate, bool)> = asked.iter().map(|it| (it.krate, false)).collect();
     while let Some((krate, host)) = stack.pop() {
         for dep in krate.dependencies(db) {
@@ -111,7 +111,7 @@ pub fn crates_to_document(
         .filter(|it| !names.contains(&it.name))
         .collect();
     let kept = one_per_name(reached);
-    let keep: HashSet<Crate, Global> = kept.iter().map(|it| it.krate).collect();
+    let keep: Set<Crate, FixedState, Global> = kept.iter().map(|it| it.krate).collect();
     let roots: Vec<Crate> = asked.iter().map(|it| it.krate).collect();
     let linked = still_reached(&roots, &keep, |krate| {
         krate
@@ -171,10 +171,10 @@ fn one_per_name<K>(reached: Vec<Reached<K>>) -> Vec<Reached<K>> {
 /// (`remove_duplicate_doc` in `src/cargo/ops/cargo_compile/mod.rs`, cargo 749d85d9fc).
 fn still_reached<K: Copy + Eq + std::hash::Hash>(
     roots: &[K],
-    kept: &HashSet<K, Global>,
+    kept: &Set<K, FixedState, Global>,
     deps: impl Fn(K) -> Vec<K>,
-) -> HashSet<K, Global> {
-    let mut out = HashSet::new_in(Global);
+) -> Set<K, FixedState, Global> {
+    let mut out = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
     let mut stack = roots.to_vec();
     while let Some(it) = stack.pop() {
         for dep in deps(it) {

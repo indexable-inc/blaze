@@ -40,11 +40,11 @@ pub(super) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
 /// What [`check_body`] keeps of one body, cleared and reused for the next.
 #[derive(Default)]
 struct Scratch {
-    parent: HashMap<PatId, PatId, Global>,
-    seen: HashSet<InFile<SyntaxNodePtr>, Global>,
+    parent: Map<PatId, PatId, FixedState, Global>,
+    seen: Set<InFile<SyntaxNodePtr>, FixedState, Global>,
     roots: Vec<Root>,
     /// The product context of each parameter list, its parameters' names in it.
-    lists: HashMap<InFile<SyntaxNodePtr>, Ctx, Global>,
+    lists: Map<InFile<SyntaxNodePtr>, Ctx, FixedState, Global>,
     ctxs: Vec<Ctx>,
 }
 
@@ -139,16 +139,16 @@ struct Root {
 /// rustc's `PatBoundCtx` with the names bound in it.
 struct Ctx {
     product: bool,
-    names: HashSet<(Name, HygieneId), Global>,
+    names: Set<(Name, HygieneId), FixedState, Global>,
 }
 
 impl Ctx {
     fn product() -> Ctx {
-        Ctx { product: true, names: HashSet::new_in(Global) }
+        Ctx { product: true, names: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }) }
     }
 
     fn or() -> Ctx {
-        Ctx { product: false, names: HashSet::new_in(Global) }
+        Ctx { product: false, names: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }) }
     }
 }
 

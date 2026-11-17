@@ -15,7 +15,7 @@
 //! makes after `b`, when the cut at `b` is decided by tokens of the text after `b` that it
 //! reads too: [`resplit`] and [`join`] rest on these two facts.
 
-use blaze_hash::ByHash;
+use blaze_hash::{BuildKeyHasher, Map, MapOpts};
 use blaze_ids::ContentId;
 use blaze_lex::{Cpu, DocStyle, FrontmatterAllowed, TokenKind, skip_body, tokenize};
 use blaze_own::{AVec, Alloc, Vec};
@@ -479,7 +479,7 @@ impl<'o, 'a> Assembled<'o, 'a> {
         let count = |len: usize| u32::try_from(len).expect("an outline's entries are counted in u32");
         let mut placed: AVec<'a, Placed<'o, 'a>> = Vec::new_in(alloc);
         let mut disambiguators: AVec<'a, (ItemIndex, u32)> = Vec::new_in(alloc);
-        let mut siblings: ByHash<ContentId, u32, Alloc<'a>> = ByHash::new_in(alloc);
+        let mut siblings: Map<ContentId, u32, BuildKeyHasher, Alloc<'a>> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: alloc, capacity: None });
         let (mut items, mut attrs, mut flags) = (0u32, 0u32, ItemFlags::NONE);
         for (index, (base, outline)) in parts.enumerate() {
             assert!(

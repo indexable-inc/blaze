@@ -137,7 +137,7 @@ impl<'n> Front2Program<'n> {
         user: &[SourceFile<'_>],
         tests: &TestsRecord<'r>,
         left_out: Option<&mut Vec<(Box<str>, super::LeftOut), Global>>,
-        alloc: Alloc<'a>,
+        alloc: Alloc<'static>,
     ) -> Result<Suite<'n, 'r, 'a>, SuiteError> {
         // The roots: every `#[test]` row, in the record's (path) order; a bench is not entered.
         let mut roots: AVec<'a, LibKey> = AVec::new_in(alloc);
@@ -149,7 +149,7 @@ impl<'n> Front2Program<'n> {
                 roots.push(row.key);
             }
         }
-        let made = Self::make_from(names, frame, user, left_out, Starts::Tests(&roots)).map_err(SuiteError::Program)?;
+        let made = Self::make_from(names, frame, user, left_out, Starts::Tests(&roots), alloc).map_err(SuiteError::Program)?;
         let program = made.program;
         let mut rows: AVec<'a, SuiteRow<'r>> = AVec::with_capacity_in(listed.len(), alloc);
         let mut root = 0usize;

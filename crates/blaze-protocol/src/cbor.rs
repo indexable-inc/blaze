@@ -4,7 +4,7 @@
 //! - every integer, length and count in the shortest head that holds it;
 //! - definite lengths only;
 //! - a map's entries sorted bytewise by the encoding of their keys, each key once, whatever
-//!   order the type gave them in (a `HashMap` too): "b" comes before "aa";
+//!   order the type gave them in (a hash `Map` too): "b" comes before "aa";
 //! - a float in the shortest of half, single and double precision that holds it exactly, and
 //!   NaN as `f9 7e00`;
 //! - no tags, and of the simple values only false, true and null.

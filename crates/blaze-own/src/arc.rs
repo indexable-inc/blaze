@@ -56,7 +56,7 @@ fn slice_layout<T>(len: usize) -> Option<Layout> {
     Some(layout.pad_to_align())
 }
 
-/// A shared `T` in `A`, counted atomically.
+/// A shared `T` in `A`, counted atomically: one block for value and counts; every clone and drop writes the one shared count line.
 ///
 /// # Invariants
 ///

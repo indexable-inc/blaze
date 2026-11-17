@@ -43,8 +43,12 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             spell: scope.spell,
             traits: scope.traits,
             blocks: scope.blocks,
+            path_marks: scope.path_marks,
             fills: RefCell::new(Vec::new_in(Global)),
             gaps: RefCell::new(Vec::new_in(Global)),
+            // As `Front2Program::in_world`: every question is at ground arguments after the
+            // body checked (rustc's post-analysis mode), so every opaque is its hidden type.
+            reveal: crate::front2::opaque_auto::Reveal::All,
         };
         Ok(f(&world))
     }
@@ -84,6 +88,10 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
         head.c_variadic.then_some(head.inputs.len() as u32)
     }
 
+    fn legacy_const_generics(&self, key: ItemKey) -> &[u32] {
+        self.store.fns.get(&key).map(|head| &head.legacy_const_generics[..]).unwrap_or(&[])
+    }
+
     /// The entry's row once `check_one` made it.
     fn entry(&self) -> Option<usize> {
         self.entry_key.and_then(|k| self.rows.by_key.get(&k)).map(|&i| i as usize)
@@ -95,18 +103,20 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
 
     fn resolve(&self, i: usize, item: ItemKey, args: List, ground: &mut PortableTys<'_>) -> Result<(ItemKey, List), ResolveError> {
         // As `Front2Program::resolve`, over this program's names source.
-        if let Some(handler) = crate::front2::panic_entry::bound(self.front.names, &self.front.index, &self.store, item, Alloc::global()) {
+        let alloc = self.store.tys.alloc();
+        if let Some(handler) = crate::front2::panic_entry::bound(self.front.names, &self.front.index, &self.store, item, alloc) {
             return Ok((handler, List::EMPTY));
         }
-        if let Some(default) = crate::front2::alloc_shim::bound(self.front.names, &self.front.index, &self.store, item, Alloc::global()) {
+        if let Some(default) = crate::front2::alloc_shim::bound(self.front.names, &self.front.index, &self.store, item, alloc) {
             return Ok((default, List::EMPTY));
         }
-        let r = self.in_world(i, |w| resolve_instance(w, item, args, ground, Alloc::global()))??;
+        let r = self.in_world(i, |w| resolve_instance(w, item, args, ground, alloc))??;
         Ok((r.item, r.args))
     }
 
     fn selects(&self, i: usize, trait_: ItemKey, ty: PTy, ground: &mut PortableTys<'_>) -> Result<bool, ResolveError> {
-        Ok(self.in_world(i, |w| select_impl(w, trait_, &[ty], ground, Alloc::global()))??.is_some())
+        let alloc = self.store.tys.alloc();
+        Ok(self.in_world(i, |w| select_impl(w, trait_, &[ty], ground, alloc))??.is_some())
     }
 
     fn adt_drop_impl(&self, i: usize, drop_trait: ItemKey, adt: ItemKey, alloc: Alloc<'_>) -> Result<Option<ItemKey>, ResolveError> {
@@ -118,8 +128,8 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
         let key = self.rows.key[i];
         let types = self.types();
         if let Some(c) = self.store.ctors.get(&key) {
-            let header = tc::FnPtrHeader { abi: tc::Abi::Rust, safety: tc::Safety::Safe };
-            return FnSig { parent_count: 0, own_count: c.generics, declared_count: c.generics, self_param: false, header, c_variadic: false, inputs: &c.inputs[..], output: c.output, types };
+            let header = tc::FnPtrHeader::RUST;
+            return FnSig { parent_count: 0, own_count: c.generics, declared_count: c.generics, self_param: false, header, c_variadic: false, legacy_const_generics: &[], inputs: &c.inputs[..], output: c.output, types };
         }
         let f = &self.store.fns[&key];
         FnSig {
@@ -129,10 +139,62 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
             self_param: f.self_param,
             header: f.header,
             c_variadic: false,
+            legacy_const_generics: &[],
             inputs: &f.inputs,
             output: f.output,
             types,
         }
+    }
+
+    /// From the fn's row (fill.rs `row`): its written ABI's unwind category (program/head_abi.rs
+    /// `BuildAbi`: "C"/"system" nounwind, "Rust"/"rust-call"/"-unwind" not) or
+    /// `#[rustc_nounwind]`, as `Front2Program`'s. `None`: no row made for `key` yet.
+    fn nounwind(&self, key: ItemKey) -> Option<bool> {
+        let &i = self.rows.by_key.get(&key)?;
+        self.rows.nounwind.get(i as usize).copied()
+    }
+
+    /// A row's ABI, else the head's (program/seam_rules.rs `fn_abi`, `Front2Program`'s rule): a
+    /// callee the build resolved to before its own `check_one` made its row still has its
+    /// signature's ABI.
+    fn fn_abi(&self, key: ItemKey) -> Option<Abi> {
+        let tabled = self.rows.by_key.get(&key).and_then(|&i| self.rows.abi.get(i as usize).copied());
+        super::seam_rules::fn_abi(tabled, self.front.names, &self.store, key)
+    }
+
+    /// program/seam_rules.rs `track_caller` over the rows' own attributes, else the heads'
+    /// (fill.rs `own_track_caller`): a trait impl's method that does not say it itself answers
+    /// with its trait's declaration's.
+    fn track_caller(&self, key: ItemKey) -> Option<bool> {
+        super::seam_rules::track_caller(&self.front.keys, &self.store, key, |k| self.own_track_caller(k))
+    }
+
+    /// From `owner`'s live body (the build asks while it builds that body) by program/
+    /// seam_rules.rs `caller_site`: item-relative, the file by its shown path from the names
+    /// source (over records, the items record's file row).
+    fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Option<blaze_build::CallerSite<'_>> {
+        let live = self.live_by_key(owner)?;
+        super::seam_rules::caller_site(self.front.names, &self.front.keys, owner, &live.again, expr)
+    }
+
+    /// program/seam_rules.rs `source_position`: the item's first byte today and today's text of
+    /// its file, from the names source (over records, item_grain.rs `row_now` and `file_now`).
+    fn source_position(&self, item: ItemKey, site: u32) -> Result<(u32, u32), crate::seam::PositionGap> {
+        super::seam_rules::source_position(self.front.names, &self.front.keys, item, site)
+    }
+
+    /// The start [`LazyProgram::decide_start`] decided, when it is a Rust start.
+    fn rust_start(&self) -> Option<&crate::front2::start::RustStart> {
+        match &self.start {
+            Some(crate::front2::start::Entry2::Rust(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The recipe made with the owner's check (fill.rs `check_one_key`), as
+    /// `Front2Program::coroutine_recipe`. `None`: the owner was not checked, or has no such block.
+    fn coroutine_recipe(&self, owner: ItemKey, ordinal: u32) -> Option<Result<&blaze_flow_lower::state_recipe::StateRecipe<Global>, blaze_flow_lower::Refusal>> {
+        crate::front2::coroutine_recipes::find(&self.recipes, owner, ordinal)
     }
 
     /// Only rows already made: a row is added by `check_one` alone (module docs).
@@ -187,7 +249,8 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
             *self.projection_why.borrow_mut() = Some(Box::from("the lazy program holds no live body to ask in"));
             return Ok(None);
         };
-        let out = self.in_world(i, |w| blaze_typeck::normalize_projection(w, trait_, name, args, ground, Alloc::global()))?;
+        let alloc = self.store.tys.alloc();
+        let out = self.in_world(i, |w| blaze_typeck::normalize_projection(w, trait_, name, args, ground, alloc))?;
         if !matches!(out, Ok(Some(_))) {
             let trait_shown = self.item_named(trait_).unwrap_or_else(|| format!("{:#x}", trait_.0).into_boxed_str());
             let why = match &out {
@@ -218,14 +281,18 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
     }
 
     fn lang_item(&self, item: LangItem) -> Result<Option<ItemKey>, crate::seam::LangRefusal> {
+        // A lang member (`Future::poll`) by the key its container's head files it under
+        // (keys.rs `asked_key`), so the build's call and the head the program makes are one key.
+        let names = self.front.names;
         match crate::front2::langs::find(&self.front.index, self.front.resolver, item) {
-            Ok(found) => Ok(found.map(checker_of)),
+            Ok(found) => Ok(found.map(|lib| crate::front2::keys::asked_key(names, lib))),
             Err(why) => Err(crate::seam::LangRefusal { item, why }),
         }
     }
 
     fn lang_named(&self, name: &str) -> Option<ItemKey> {
-        self.front.index.lang(name).map(checker_of)
+        let names = self.front.names;
+        self.front.index.lang(name).map(|lib| crate::front2::keys::asked_key(names, lib))
     }
 
     fn lang_trait_fn(&self, trait_: LangItem, name: &str) -> Option<ItemKey> {
@@ -284,7 +351,7 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// `body_objects`), as `Front2Program::object_trait`.
     fn object_trait(&self, t: ItemKey) -> Option<blaze_build::vtable::ObjectTrait<'_>> {
         let o = self.objects.get(&t)?;
-        Some(blaze_build::vtable::ObjectTrait { supers: &o.supers, methods: &o.methods, shape: o.shape })
+        Some(blaze_build::vtable::ObjectTrait { supers: &o.supers, super_args: &o.super_args, methods: &o.methods, shape: o.shape })
     }
 
     /// `crate::module::Name`, over the source's questions (module path, name).
@@ -349,6 +416,7 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// any impl row the value needs.
     fn const_at(&mut self, need: crate::front2::const_at::ConstNeed, from: tc::PTys<'_>, args: &[tc::PTy]) -> Result<DataRecord<Global>, crate::front2::const_at::ConstAtWhy> {
         let prepared = self.prepared;
+        let alloc = self.store.tys.alloc();
         let mut records = Records {
             names: self.front.names,
             keys: &mut self.front.keys,
@@ -359,13 +427,14 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
             consts: None,
         };
         let made = match need {
-            crate::front2::const_at::ConstNeed::Item(item) => self.consts.value_with_args(&mut records, prepared, item, from, args, Alloc::global()),
-            crate::front2::const_at::ConstNeed::Block { owner, block } => {
-                let Some(text) = records.store.fns.get(&owner).map(|h| h.text) else {
+            crate::front2::const_at::ConstNeed::Item(item) => self.consts.value_with_args(&mut records, prepared, item, from, args, alloc),
+            crate::front2::const_at::ConstNeed::Block { .. } | crate::front2::const_at::ConstNeed::Promoted { .. } => {
+                let owner = need.item();
+                let in_body = records.store.fns.get(&owner).and_then(|h| need.in_body(h.text));
+                let Some((owner, root, key)) = in_body else {
                     return Err(crate::front2::const_at::ConstAtWhy::Eval(crate::front2::consts::ConstFail::Body { item: owner, error: BodyError::NoHead(owner) }));
                 };
-                let key = crate::front2::const_at::block_key(owner, block, text);
-                self.consts.block_value(&mut records, prepared, owner, block, key, from, args, Alloc::global())
+                self.consts.body_value(&mut records, prepared, owner, root, key, from, args, alloc)
             }
         };
         made.map(crate::front2::const_at::data_record).map_err(crate::front2::const_at::ConstAtWhy::Eval)

@@ -120,7 +120,7 @@ job of the gate runs on Linux AArch64 on an ix runner ([ix runners](#ix-runners)
 | `blaze.yaml` (`cargo`) | a change of code | on a 64-vCPU ix runner, with cargo and the pinned nightly (`harness/toolchain`): `cargo check --locked --workspace --exclude blaze-std --all-targets`, then `cargo test --locked --workspace --exclude blaze-std --no-fail-fast` |
 | `blaze.yaml` (`ci`) | always | whether every job the tier expected ran and succeeded: the one check the branch rules require |
 | `fmt.yaml` | push to main | `blaze fmt --all` with the release `.github/blaze-version` names, and a commit `fmt` when it changed a file |
-| `llvm.yaml` | a change of its recipe, by hand | the pinned LLVM (`crates/hir-ty-codegen/llvm.json`) built for each target by `.github/scripts/llvm.py` on hosted runners, and put into R2 (`.github/scripts/r2.py`) |
+| `llvm.yaml` | a change of its recipe, by hand | the pinned LLVM (`crates/blaze-toolchain/pins/llvm.json`) built for each target by `.github/scripts/llvm.py` on hosted runners, and put into R2 (`.github/scripts/r2.py`) |
 | `site.yaml` | a change of the site, by hand | builds and checks `site/`; a push to main deploys it |
 
 The `cargo` job runs only for a change that touches a file it reads; any other change runs the

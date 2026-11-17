@@ -1,7 +1,7 @@
 //! The resolve's packages, interned once to a dense [`Pkg`] in `PackageId` order, with what the
 //! tree reads of each.
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_resolve::{InternedString, PackageId, PackageIdSpec, Resolve};
 use std::alloc::Global;
 
@@ -21,8 +21,8 @@ impl Pkg {
 /// What was read of every package of the resolve: blaze-metadata's, or the database's load.
 #[derive(Clone, Copy)]
 pub(crate) enum Reads<'a> {
-    Metadata(&'a HashMap<PackageId, blaze_metadata::Read, Global>),
-    Units(&'a HashMap<PackageId, blaze_units::Read, Global>),
+    Metadata(&'a Map<PackageId, blaze_metadata::Read, FixedState, Global>),
+    Units(&'a Map<PackageId, blaze_units::Read, FixedState, Global>),
 }
 
 /// What the tree reads of one package.
@@ -60,7 +60,7 @@ impl<'a> Reads<'a> {
 /// The resolve's packages, each hashed once here and indexed by [`Pkg`] after.
 pub(crate) struct Table<'a> {
     ids: Vec<PackageId>,
-    index: HashMap<PackageId, Pkg, Global>,
+    index: Map<PackageId, Pkg, FixedState, Global>,
     info: Vec<Option<Info<'a>>>,
 }
 
@@ -71,7 +71,7 @@ impl<'a> Table<'a> {
         ids.extend(resolve.iter());
         // The resolve keeps its packages in an ordered map, so this only checks the order.
         ids.sort_unstable();
-        let mut index = HashMap::with_capacity_in(len, Global);
+        let mut index = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(len) });
         let mut info = Vec::with_capacity(len);
         for (i, &id) in ids.iter().enumerate() {
             let pkg = Pkg(u32::try_from(i).expect("fewer than 2^32 packages"));

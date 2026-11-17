@@ -72,11 +72,11 @@ use blaze_trace::{debug, trace};
 
 use crate::interning::InternedString;
 use crate::lockfile;
-use crate::poll::PollExt;
+use crate::registry::Lookup;
 use crate::{Dependency, PackageId, PackageIdSpec, Registry, Resolve, ResolveVersion, Summary};
 
 use self::context::ResolverContext;
-use self::dep_cache::{Query, RegistryQueryer, registry_queryer};
+use self::dep_cache::RegistryQueryer;
 use self::features::RequestedFeatures;
 use self::types::{ConflictMap, ConflictReason, DepsFrame};
 use self::types::{FeaturesSet, RcVecIter, RemainingDeps, ResolverProgress};
@@ -92,7 +92,7 @@ pub use self::version_prefs::VersionOrdering;
 pub use self::version_prefs::VersionPreferences;
 
 pub(crate) type CargoResult<T> = Result<T, crate::ResolveError>;
-pub(crate) use blaze_hash::{HashMap, HashSet};
+pub(crate) use blaze_hash::{FixedState, Map, MapOpts, Set, SetOpts};
 
 mod conflict_cache;
 mod context;
@@ -144,6 +144,10 @@ pub struct ResolveSettings<'a> {
 /// * `resolve_version` - this controls how the lockfile will be serialized.
 ///
 /// * `settings` - what of cargo's configuration the resolver uses.
+///
+/// One round over what `registry` knows now: a dependency whose query it answers
+/// [`Lookup::Unknown`] is left out, so the answer is good only when no query was; the resolve
+/// machine ([`crate::resolving::Resolving`]) runs it until then.
 pub fn resolve(
     summaries: &[(Summary, ResolveOpts)],
     replacements: &[(PackageIdSpec, Dependency)],
@@ -153,25 +157,20 @@ pub fn resolve(
     settings: &ResolveSettings<'_>,
 ) -> CargoResult<Resolve> {
     let first_version = None;
-    let mut registry = registry_queryer(registry, replacements, version_prefs);
+    let mut registry = RegistryQueryer::new(registry, replacements, version_prefs);
 
     // Global cache of the reasons for each time we backtrack.
     let mut past_conflicting_activations = conflict_cache::ConflictCache::new();
 
-    let resolver_ctx = loop {
-        let resolver_ctx = activate_deps_loop(
-            &mut registry,
-            summaries,
-            first_version,
-            settings,
-            &mut past_conflicting_activations,
-        )?;
-        if registry.wait()? {
-            break resolver_ctx;
-        }
-    };
+    let resolver_ctx = activate_deps_loop(
+        &mut registry,
+        summaries,
+        first_version,
+        settings,
+        &mut past_conflicting_activations,
+    )?;
 
-    let mut cksums = HashMap::new_in(Global);
+    let mut cksums = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     for (summary, _) in resolver_ctx.activations.values() {
         let cksum = summary.checksum().map(|s| s.to_owned());
         cksums.insert(summary.package_id(), cksum);
@@ -212,7 +211,7 @@ pub fn resolve(
 /// If all dependencies can be activated and resolved to a version in the
 /// dependency graph, `cx` is returned.
 fn activate_deps_loop(
-    registry: &mut RegistryQueryer<'_, impl Registry, impl Query>,
+    registry: &mut RegistryQueryer<'_, impl Registry>,
     summaries: &[(Summary, ResolveOpts)],
     first_version: Option<VersionOrdering>,
     settings: &ResolveSettings<'_>,
@@ -622,7 +621,7 @@ fn activate_deps_loop(
 /// iterate through next.
 fn activate(
     cx: &mut ResolverContext,
-    registry: &mut RegistryQueryer<'_, impl Registry, impl Query>,
+    registry: &mut RegistryQueryer<'_, impl Registry>,
     parent: Option<(&Summary, &Dependency)>,
     candidate: Summary,
     first_version: Option<VersionOrdering>,
@@ -792,7 +791,7 @@ impl RemainingCandidates {
 /// It will add the new conflict to the cache if one is found.
 fn generalize_conflicting(
     cx: &ResolverContext,
-    registry: &mut RegistryQueryer<'_, impl Registry, impl Query>,
+    registry: &mut RegistryQueryer<'_, impl Registry>,
     past_conflicting_activations: &mut conflict_cache::ConflictCache,
     parent: &Summary,
     dep: &Dependency,
@@ -826,7 +825,10 @@ fn generalize_conflicting(
             // to be conflicting, then we can just say that we conflict with the parent.
             if let Some(others) = registry
                 .query(critical_parents_dep, first_version)
-                .expect("an already used dep now pending!?")
+                .map(|found| match found {
+                    Lookup::Answered(found) => found,
+                    Lookup::Unknown => panic!("an already used dep now unknown!?"),
+                })
                 .expect("an already used dep now error!?")
                 .iter()
                 .rev() // the last one to be tried is the least likely to be in the cache, so start with that.
@@ -979,9 +981,9 @@ fn check_cycles(resolve: &Resolve) -> CargoResult<()> {
     // We visit each node at most once and we keep
     // track of the path through the graph as we walk it. If we walk onto the
     // same node twice that's a cycle.
-    let mut checked = HashSet::with_capacity_in(resolve.len(), Global);
+    let mut checked = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: Some(resolve.len()) });
     let mut path = Vec::with_capacity(4);
-    let mut visited = HashSet::with_capacity_in(4, Global);
+    let mut visited = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: Some(4) });
     for pkg in resolve.iter() {
         if !checked.contains(&pkg) {
             visit(resolve, pkg, &mut visited, &mut path, &mut checked)?
@@ -992,9 +994,9 @@ fn check_cycles(resolve: &Resolve) -> CargoResult<()> {
     fn visit(
         resolve: &Resolve,
         id: PackageId,
-        visited: &mut HashSet<PackageId, Global>,
+        visited: &mut Set<PackageId, FixedState, Global>,
         path: &mut Vec<PackageId>,
-        checked: &mut HashSet<PackageId, Global>,
+        checked: &mut Set<PackageId, FixedState, Global>,
     ) -> CargoResult<()> {
         if !visited.insert(id) {
             // We found a cycle and need to construct an error. Performance is no longer top priority.
@@ -1035,7 +1037,7 @@ fn check_cycles(resolve: &Resolve) -> CargoResult<()> {
 /// particular, we don't store paths of path dependencies. That means that
 /// *different* packages may collide in the lock file, hence this check.
 fn check_duplicate_pkgs_in_lockfile(resolve: &Resolve) -> CargoResult<()> {
-    let mut unique_pkg_ids = HashMap::new_in(Global);
+    let mut unique_pkg_ids = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     let state = lockfile::EncodeState::new(resolve);
     for pkg_id in resolve.iter() {
         let encodable_pkd_id = lockfile::encodable_package_id(pkg_id, &state, resolve.version());

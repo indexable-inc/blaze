@@ -23,6 +23,7 @@ use blaze_id::ContentId;
 use blaze_ids::Hasher;
 use blaze_own::{AString, AVec, Alloc, Vec};
 
+use crate::origin_column::TextMark;
 use crate::tokens::{Ctx, Delim, LitKind, MarkOf, Raw, Token, TokenKind, Transparency, TokenStream};
 
 /// What a call's position takes, and so what its expansion is parsed as.
@@ -119,6 +120,10 @@ pub struct BodyWord {
     /// One past the word's last token.
     pub end: u32,
     pub hygiene: u64,
+    /// The innermost mark of the word's token (a lifetime's: its name's), `None` for a token
+    /// of the call as written: where a path starting at this word resolves (drive.md, "A token
+    /// keeps its mark"; blaze-ladder front2 world_paths.rs `site_of`).
+    pub mark: Option<TextMark>,
     /// Whether a space may go before the word's text: not after a joint punctuation, which
     /// would no longer glue to it when the text is lexed again (`::`, `->`, `..=`).
     pub space_before: bool,
@@ -174,6 +179,7 @@ pub fn body_words<'a>(stream: &TokenStream<'_>, this: ContentId, alloc: Alloc<'a
                 token: crate::tokens::index(at),
                 end: crate::tokens::index(at + if quote { 2 } else { 1 }),
                 hygiene: local_hygiene(stream, ctx, this),
+                mark: stream.hygiene(ctx).mark.map(TextMark::of),
                 space_before: !glued,
             });
         }
@@ -181,23 +187,28 @@ pub fn body_words<'a>(stream: &TokenStream<'_>, this: ContentId, alloc: Alloc<'a
             glued = glues(token.kind);
         }
         // `$crate` "refers to the crate defining the macro" (the Reference, "Macros By
-        // Example", Hygiene): the crate is the token's mark's, which the text alone loses, so
-        // it is written as that crate's one identifier (`blaze_surface::DOLLAR_CRATE`), read
-        // back by the path reader wherever the body is resolved. The same text through any
-        // number of nested expansions: the mark is the expansion that wrote the token.
-        match (token.kind, stream.hygiene(token.ctx).mark) {
-            (TokenKind::Ident { .. }, Some(mark)) if stream.text_of(token) == "$crate" => {
-                use core::fmt::Write as _;
-                // An `AString` takes every write.
-                let _ = write!(text, "{}", blaze_surface::DollarCrate(mark.site.krate));
-            }
-            _ => write_token(stream, token, &mut text),
-        }
+        // Example", Hygiene): written as `$crate`; its crate is its word's mark
+        // (`BodyWord::mark`), which the lowering keeps beside the text.
+        write_token(stream, token, &mut text);
         if let Some(word) = words.last_mut() {
             word.text.1 = crate::tokens::index(text.len());
         }
     }
     BodyWords { parser, words, text }
+}
+
+/// Whether a renderer that keeps the stream's spacing writes no space between `written` and
+/// `next`, the token written after it: `written` is not `Alone` (it touched `next` where it
+/// was read), unless the two would lex back as another token. The one such pair is an integer
+/// with no suffix before a `.`: rustc's lexer reads `999.` that a space or an operator follows
+/// as the float `999.`, so core's `999.try_into()`, whose `.` is `Alone` before an identifier,
+/// would be written `999. try_into()` and not parse; `999 .try_into()` lexes as its tokens.
+/// blaze-scope resolve.rs `render_with` (an item expansion's text) asks it.
+pub fn glued_in_text(written: TokenKind, next: TokenKind) -> bool {
+    if let (TokenKind::Literal { kind: LitKind::Integer, suffix_len: 0, .. }, TokenKind::Punct { char: '.', .. }) = (written, next) {
+        return false;
+    }
+    !matches!(written.spacing(), crate::tokens::Spacing::Alone)
 }
 
 /// A punctuation that glues to the next token: no space may go between them.
@@ -272,5 +283,50 @@ pub fn write_token(stream: &TokenStream<'_>, token: &Token, out: &mut AString<'_
             (0..hashes).for_each(|_| out.push('#'));
             out.push_str(suffix);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_own::AString;
+
+    use super::{glued_in_text, write_token};
+    use crate::tokens::{Edition, LitKind, TokenKind, lex};
+
+    /// core's `_fmt_inner` (library/core/src/fmt/num.rs) holds `999.try_into()` and
+    /// `1_00_00.try_into()`: written with the stream's spacing they read `999. try_into ..`,
+    /// the float `999.` then a name, and the expansion of `impl_Display!` did not parse
+    /// (`Diag { kind: Syntax }` at the byte after `999.`). Written by [`glued_in_text`] they
+    /// lex back to the same tokens.
+    ///
+    /// Prints: `test body::tests::an_integer_before_a_dot_stays_an_integer ... ok`. A wrong
+    /// version (glued by spacing alone) fails with "the integer lexed back as Float".
+    #[test]
+    fn an_integer_before_a_dot_stays_an_integer() {
+        let alloc = blaze_own::testing::heap().alloc();
+        for text in ["999.try_into()", "1_00_00.try_into()", "0x1f.min(3)", "x.0.1", "1..2", "a.b"] {
+            let stream = lex(text, Edition::E2024, alloc).expect("the text lexes");
+            let tokens = stream.tokens();
+            let mut out = AString::new_in(alloc);
+            for (at, token) in tokens.iter().enumerate() {
+                if at > 0 && !glued_in_text(tokens[at - 1].kind, token.kind) {
+                    out.push(' ');
+                }
+                write_token(&stream, token, &mut out);
+            }
+            let again = lex(&out, Edition::E2024, alloc).expect("the written text lexes");
+            assert_eq!(again.tokens().len(), tokens.len(), "{text} written as {out}");
+            for (was, now) in tokens.iter().zip(again.tokens()) {
+                let kind = |k: TokenKind| match k {
+                    TokenKind::Literal { kind, .. } => Some(kind),
+                    _ => None,
+                };
+                assert_eq!(kind(now.kind), kind(was.kind), "{text} written as {out}: the integer lexed back as {:?}", kind(now.kind));
+            }
+        }
+        // `1..2` keeps its range: the integer's next token is `.`, and a space before it
+        // changes nothing.
+        let stream = lex("1..2", Edition::E2024, alloc).expect("the text lexes");
+        assert!(matches!(stream.tokens()[0].kind, TokenKind::Literal { kind: LitKind::Integer, .. }));
     }
 }

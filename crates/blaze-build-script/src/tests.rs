@@ -40,7 +40,8 @@ fn a_native_grant_says_only_what_it_names_and_refuses_what_it_cannot_say() {
     }
 }
 use crate::outputs::{FileError, FileLimits, NoteKind, Outputs, OutputsRef, RecordError};
-use crate::probe::{self, Request, Table};
+use crate::probe::{self, Table};
+use crate::probe_ask::Ask;
 
 fn instr(line: &str) -> Instr<'_> {
     match parse(line.as_bytes()) {
@@ -506,21 +507,30 @@ fn the_key_covers_every_input() {
 #[test]
 fn the_compiler_answers_its_version_and_refuses_the_rest() {
     let alloc = Alloc::global();
-    assert_eq!(probe::request("rustc", &["--version"]), Request::Version { verbose: false });
-    assert_eq!(probe::request("rustc", &["-vV"]), Request::Version { verbose: true });
-    assert_eq!(probe::request("rustc", &["-Vv"]), Request::Version { verbose: true });
-    assert_eq!(probe::request("rustc", &["--version", "--verbose"]), Request::Version { verbose: true });
-    assert_eq!(probe::request("rustc", &["--verbose", "--version"]), Request::Version { verbose: true });
-    assert_eq!(probe::request("rustc", &["--crate-type=lib", "--emit=metadata", "-"]), Request::Compile);
-    assert_eq!(probe::request("cc", &["-E"]), Request::Other { program: "cc" });
-    assert_eq!(probe::request("git", &["describe"]), Request::Other { program: "git" });
+    let ask = |args: &[&str]| -> Result<std::string::String, crate::probe_ask::Refused> {
+        Ok(match crate::probe_ask::classify(args, alloc)? {
+            Ask::Version { verbose } => std::format!("version verbose={verbose}"),
+            Ask::Print { what } => std::format!("print {what}"),
+            Ask::Compile(_) => std::format!("compile"),
+        })
+    };
+    assert_eq!(ask(&["--version"]).as_deref(), Ok("version verbose=false"));
+    assert_eq!(ask(&["-vV"]).as_deref(), Ok("version verbose=true"));
+    assert_eq!(ask(&["-Vv"]).as_deref(), Ok("version verbose=true"));
+    assert_eq!(ask(&["--version", "--verbose"]).as_deref(), Ok("version verbose=true"));
+    assert_eq!(ask(&["--verbose", "--version"]).as_deref(), Ok("version verbose=true"));
+    assert_eq!(ask(&["--crate-type=lib", "--emit=metadata", "-"]).as_deref(), Ok("compile"));
     assert_eq!(probe::version(false, "aarch64-apple-darwin", alloc).as_str(), "rustc 1.101.0-nightly (16d1ffac1 2026-10-26)\n");
     let verbose = probe::version(true, "aarch64-apple-darwin", alloc);
     assert!(verbose.as_str().contains("\nhost: aarch64-apple-darwin\nrelease: 1.101.0-nightly\nLLVM version: 23.1.4\n"), "{}", verbose.as_str());
     // A try-compile is keyed without its path, by its snippet; the empty table answers none.
-    let a = probe::compile_key("aarch64-apple-darwin", &["--emit=metadata", "/target/debug/build/x-1/out/probe.rs"], Some(1), b"fn f() {}");
-    let b = probe::compile_key("aarch64-apple-darwin", &["--emit=metadata", "/target/debug/build/x-2/out/probe.rs"], Some(1), b"fn f() {}");
-    let c = probe::compile_key("aarch64-apple-darwin", &["--emit=metadata", "/p.rs"], Some(1), b"fn g() {}");
+    let key = |args: &[&str], snippet: &[u8]| match crate::probe_ask::classify(args, alloc) {
+        Ok(Ask::Compile(compile)) => compile.key("aarch64-apple-darwin", snippet),
+        other => panic!("not a compile: {other:?}"),
+    };
+    let a = key(&["--emit=metadata", "/target/debug/build/x-1/out/probe.rs"], b"fn f() {}");
+    let b = key(&["--emit=metadata", "/target/debug/build/x-2/out/probe.rs"], b"fn f() {}");
+    let c = key(&["--emit=metadata", "/p.rs"], b"fn g() {}");
     assert_eq!(a, b);
     assert_ne!(a, c);
     assert_eq!(Table::EMPTY.answer(&a), None);

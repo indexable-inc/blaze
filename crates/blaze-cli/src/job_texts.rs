@@ -29,6 +29,13 @@ pub(crate) struct JobTexts<'n> {
     /// Each checkout path asked (tree 0, after `/0/`), in the order first asked, with its text
     /// or `None` when there is no such file.
     pub(crate) read: RefCell<std::vec::Vec<(&'n str, Option<&'n str>), Global>>,
+    /// Each checkout path read as DATA (`include_str!`, `include_bytes!`; tree 0, after `/0/`),
+    /// with the checkout file whose call read it, in the order asked: no module, so never in
+    /// `read` (a reader wants its bytes' digest, never its `Surface`: data_include.rs).
+    pub(crate) data: RefCell<std::vec::Vec<(&'n str, &'n str), Global>>,
+    /// Each include told to have left its own package inside the workspace (D111), in the order
+    /// told: filed as warning findings at their calls (names/include_outside.rs).
+    pub(crate) left: RefCell<std::vec::Vec<crate::names::include_outside::Left<'n>, Global>>,
     /// The command's proc-macro runner (proc_runner.rs), lent read-only. `None`: no runner, so
     /// a proc-macro crate gets no key and a proc-macro call is refused by name where lowered.
     pub(crate) procs: Option<&'n crate::proc_runner::ProcRunner<'static>>,
@@ -43,6 +50,10 @@ pub(crate) struct JobTexts<'n> {
 
 impl<'n> JobTexts<'n> {
     fn checkout(&self, inner: &str) -> Option<&'n str> {
+        core::str::from_utf8(self.checkout_bytes(inner)?).ok()
+    }
+
+    fn checkout_bytes(&self, inner: &str) -> Option<&'n [u8]> {
         if inner.split('/').any(|part| part == ".." || part == ".") {
             return None;
         }
@@ -50,7 +61,7 @@ impl<'n> JobTexts<'n> {
         let mut bytes = Bytes::new_in(self.frame, "a pool job's checkout files");
         self.root.read_all(self.cx, &at, &mut bytes).ok()?;
         let held: &'n Bytes<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(bytes, self.frame));
-        core::str::from_utf8(held.as_slice()).ok()
+        Some(held.as_slice())
     }
 }
 
@@ -71,6 +82,36 @@ impl<'n> SourceTexts<'n> for JobTexts<'n> {
         let text = self.checkout(inner);
         self.read.borrow_mut().push((held_str(inner, self.frame), text));
         text
+    }
+
+    /// A file read as data: its bytes (any bytes: `include_bytes!` of a binary file), from the
+    /// pack or the checkout as [`SourceTexts::read`] reads a text. A checkout file is listed in
+    /// `data` with the calling file `from`, found or not (a missing one is read absent, so
+    /// creating it asks the reader again). `from` is in the same tree: blaze-scope's
+    /// `include_place` keeps a member's include inside the workspace (the checkout, D111) and a
+    /// dependency's inside its package.
+    fn read_data(&self, _krate: usize, from: &str, path: &str) -> Option<&'n [u8]> {
+        let rest = path.strip_prefix('/')?;
+        let (tree, inner) = rest.split_once('/')?;
+        let tree: usize = tree.parse().ok()?;
+        if tree != 0 {
+            return Some(self.packs.get(tree - 1)?.find(inner)?.bytes);
+        }
+        let bytes = self.checkout_bytes(inner);
+        let from = from.strip_prefix("/0/").unwrap_or(from);
+        self.data.borrow_mut().push((held_str(inner, self.frame), held_str(from, self.frame)));
+        bytes
+    }
+
+    /// A read of a call (an include, a member's proc macro) that left its package inside the
+    /// workspace (D111): kept, to be filed as a warning finding at its call by the crate's names
+    /// record.
+    fn left_package(&self, _krate: usize, left: blaze_scope::include_place::LeftPackage<'_>) {
+        let from = held_str(left.from, self.frame);
+        let path = held_str(left.path, self.frame);
+        // The macro as written at the call (`macros::sol`), no longer a builtin's static name.
+        let call = held_str(left.call, self.frame);
+        self.left.borrow_mut().push((from, left.at, left.shape, call, path));
     }
 
     fn crate_env(&self, krate: usize) -> Option<&CrateEnv<'n>> {

@@ -377,12 +377,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     }
                 }
             }
+            // The stack pops last-pushed first: `cond` is pushed last so its `let` marks its
+            // bindings bound before `then` (which uses them) is visited.
             Expr::If { cond, then, else_ } => {
-                exprs.push((cond, 0));
-                exprs.push((then, 0));
                 if let Some(e) = else_ {
                     exprs.push((e, 0));
                 }
+                exprs.push((then, 0));
+                exprs.push((cond, 0));
             }
             Expr::Let { pat, init } => {
                 pats.clear();
@@ -420,15 +422,25 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     exprs.push((a, USE_MOVE));
                 }
             }
-            // A field read is a place use of its base (moving a field out is not yet told
-            // apart: rustc captures the field's place by value, we capture the base by ref).
+            // A field use is a place use of its base. A non-`Copy` field moved out of a base
+            // held by value moves out of the base's place (the Reference, "Capture modes": a
+            // moved non-`Copy` place is captured by value, and the closure is `FnOnce`): the
+            // base is captured by value. rustc captures the field's place (`a.b`, "Capture
+            // precision"); the whole binding is a superset, so a later use of the rest of the
+            // base is refused by the borrow check, never miscompiled. A field through a
+            // reference cannot be moved out (only reborrowed or copied): a read of its base.
             Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
-                exprs.push((base, if usage == USE_MOVE { 0 } else { usage }))
+                let held = self.ty.resolve(self.expr_ty[base.ix()])?;
+                let by_value = !matches!(self.view(held), TyView::Ref(..) | TyView::Ptr(..));
+                let of_block = matches!(self.body.expr(closure)?, Expr::AsyncBlock { .. });
+                let moves = usage == USE_MOVE && by_value && if of_block { self.block_moved_out(x)? } else { self.moved_out(x)? };
+                exprs.push((base, if moves { USE_MOVE } else if usage == USE_MOVE { 0 } else { usage }))
             }
             Expr::Unary { op, operand } => exprs.push((operand, if op == UnOp::Deref { usage } else { 0 })),
+            // `lhs` pushed last, visited first: a let chain's `let` binds before `rhs` uses it.
             Expr::Binary { lhs, rhs, .. } => {
-                exprs.push((lhs, 0));
                 exprs.push((rhs, 0));
+                exprs.push((lhs, 0));
             }
             Expr::Assign { lhs, rhs } | Expr::AssignOp { lhs, rhs, .. } => {
                 exprs.push((lhs, 1));
@@ -450,7 +462,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 for fi in self.body.field_init_list(fields)? {
                     exprs.push((fi.expr, 0));
                 }
-                if let Some(b) = base {
+                if let Some(b) = base.expr() {
                     exprs.push((b, 0));
                 }
             }

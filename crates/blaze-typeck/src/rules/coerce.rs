@@ -10,7 +10,8 @@
 //! items) and types/src/typeck/coerce_unsized.rs (`coerce_unsized`).
 //!
 //! Unsizing (`coerce_unsized`): `[T; N]` to `[T]` behind a reference or pointer by unification;
-//! to a `dyn` pointee by the solver's `Unsize`; one ADT's two instances (`Box`, `Pin<Box<_>>`)
+//! to a `dyn` pointee, and between two instances of one struct whose tail unsizes, by the
+//! solver's `Unsize`; one ADT's two instances (`Box`, `Pin<Box<_>>`)
 //! by `CoerceUnsized`; each goal asked in a probe, then registered. Said where it differs: two
 //! unresolved variables unify instead of registering a `Coerce` predicate. A closure that
 //! captures nothing coerces to a fn pointer (`ClosureFnPointer`).
@@ -151,7 +152,8 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
     /// object, between objects; an auto trait dropped, never added); then deref, borrow, unsize.
     /// Another pointer of one ADT whose target holds a `dyn` or slice argument (`Box<T>` to
     /// `Box<dyn Tr>`): `Source: CoerceUnsized<Target>` (core's and alloc's impls). Each goal is
-    /// asked in a probe, then registered; never on a variable source pointee.
+    /// asked in a probe, then registered; never on a variable source pointee (one to a `dyn`
+    /// target is first resolved by selecting the pending obligations: a projection's variable).
     fn coerce_unsized(&mut self, a: Ty, b: Ty, cause: Cause) -> Result<Option<()>, Stop> {
         let (ma, pointee_a, mb, pointee_b, raw) = match (self.view(a), self.view(b)) {
             (TyView::Ref(ma, x), TyView::Ref(mb, y)) => (ma, x, mb, y, false),
@@ -170,24 +172,39 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
                     return Ok(None);
                 }
             }
-            (TyView::Infer(_), _) | (_, TyView::Infer(_)) => return Ok(None),
-            (_, TyView::Dynamic(_)) => {
-                // Equal pointees are no unsizing: the reborrow arms take them. An opaque type is
-                // never the object type (a caller knows only its bounds: the Reference, "Abstract
-                // return types"), and must not be asked: unification with an alias is lazy (the
-                // pair is deferred and "succeeds"), which made `&mut impl Tr` to `&mut dyn Tr`
-                // a plain reborrow whose deferred `impl Tr == dyn Tr` then failed.
-                let opaque_source = matches!(self.view(pointee_a), TyView::Opaque(..));
-                if !opaque_source && self.probe(|m| m.unify_some(pointee_a, pointee_b))?.is_some() {
+            // A type that names an associated type (a field `digest: T::Digest` read through
+            // `&self.digest`, a call's `-> &T::Digest`) is lowered as a variable bound by its
+            // `Projection` obligation (`Machine::lower`), and is the alias (`<T as
+            // Digestible>::Digest`, rigid in a generic body) only once that obligation is
+            // selected. Selected here, as autoderef does at each step: else the variable
+            // refused the unsizing, the reborrow arm then resolved it to the alias, and `&Alias`
+            // to `&dyn Debug` was E0308. The Reference, "Unsized Coercions": "`T` to `dyn U`,
+            // when `T` implements `U + Sized`": for a projection that is the associated type's
+            // declared bounds (`type Digest: Debug;`, its implied `Sized`) or a where clause in
+            // scope, which the solver's `Unsize` asks of the alias.
+            (TyView::Infer(_), TyView::Dynamic(_)) if self.is_ty_var(pointee_a) => {
+                let resolved = self.try_structurally_resolve(pointee_a)?;
+                if self.is_ty_var(resolved) || self.unsize_to_dyn(resolved, pointee_b, cause)?.is_none() {
                     return Ok(None);
                 }
-                // No `Unsize` in the world: the coercion is undecidable, so the finding naming
-                // it, and the coercion taken (no second error as a mismatch).
-                if let Some(unsize) = self.need_lang(LangItem::Unsize, crate::diag::At::of(cause))? {
-                    let args = self.mk_list(&[pointee_a, pointee_b])?;
-                    if !self.unsize_goal(unsize, args, cause)? {
-                        return Ok(None);
-                    }
+            }
+            (TyView::Infer(_), _) | (_, TyView::Infer(_)) => return Ok(None),
+            (_, TyView::Dynamic(_)) => {
+                if self.unsize_to_dyn(pointee_a, pointee_b, cause)?.is_none() {
+                    return Ok(None);
+                }
+            }
+            // A struct whose tail field unsizes (the Reference, "Type coercions", "Unsized
+            // Coercions": "`Foo<.., T, ..>` to `Foo<.., U, ..>`, when `Foo` is a struct, `T`
+            // implements `Unsize<U>`, the last field of `Foo` has a type involving `T` ..";
+            // core's `array::IntoIter::unsize_mut`, `&mut PolymorphicIter<[MaybeUninit<T>; N]>`
+            // to `&mut PolymorphicIter<[MaybeUninit<T>]>`): the solver's structural
+            // `Unsize` (blaze-solve `step_struct_unsize`) decides which parameters may change.
+            // Asked only when the target's arguments reach a slice or `dyn`
+            // (rules/coerce_nested.rs): `&S<?0>` to `&S<u8>` would register an ambiguous goal.
+            (TyView::Adt(ka, _), TyView::Adt(kb, lb)) if ka == kb && self.target_reaches_unsized(lb) => {
+                if self.unsize_pointee(pointee_a, pointee_b, true, cause)?.is_none() {
+                    return Ok(None);
                 }
             }
             _ => return Ok(None),
@@ -196,6 +213,34 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         self.adj_scratch.push((AdjustKind::Deref { overloaded: None }, pointee_a));
         self.adj_scratch.push((AdjustKind::Borrow { mutbl: mb, two_phase: false, raw }, borrowed));
         self.adj_scratch.push((AdjustKind::Unsize, b));
+        Ok(Some(()))
+    }
+
+    /// The pointee `a` unsizes to the object `b` (`a: Unsize<b>`), as [`Self::unsize_pointee`].
+    fn unsize_to_dyn(&mut self, a: Ty, b: Ty, cause: Cause) -> Result<Option<()>, Stop> {
+        // An opaque type is never the object type (a caller knows only its bounds: the
+        // Reference, "Abstract return types"), and must not be asked: unification with an alias
+        // is lazy (the pair is deferred and "succeeds"), which made `&mut impl Tr` to `&mut dyn
+        // Tr` a plain reborrow whose deferred `impl Tr == dyn Tr` then failed.
+        let opaque_source = matches!(self.view(a), TyView::Opaque(..));
+        self.unsize_pointee(a, b, !opaque_source, cause)
+    }
+
+    /// Whether the pointee `a` unsizes to `b` behind a pointer: `None` when the two are equal
+    /// (asked only when `equal_is_no_unsize`; the reborrow arms take them) or `a: Unsize<b>`
+    /// cannot hold; else the goal registered.
+    fn unsize_pointee(&mut self, a: Ty, b: Ty, equal_is_no_unsize: bool, cause: Cause) -> Result<Option<()>, Stop> {
+        if equal_is_no_unsize && self.probe(|m| m.unify_some(a, b))?.is_some() {
+            return Ok(None);
+        }
+        // No `Unsize` in the world: the coercion is undecidable, so the finding naming it, and
+        // the coercion taken (no second error as a mismatch).
+        if let Some(unsize) = self.need_lang(LangItem::Unsize, crate::diag::At::of(cause))? {
+            let args = self.mk_list(&[a, b])?;
+            if !self.unsize_goal(unsize, args, cause)? {
+                return Ok(None);
+            }
+        }
         Ok(Some(()))
     }
 

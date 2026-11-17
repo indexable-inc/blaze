@@ -22,7 +22,7 @@ use std::alloc::Global;
 use std::string::String;
 
 use blaze_build_script::outputs::OutputsRef;
-use blaze_drive::{Input, Key, Kind, Name, Task, TaskFailure, Want, Why};
+use blaze_drive::{Input, Key, Kind, Locate, Name, Part, Task, TaskFailure, Want, Why};
 use blaze_fetch::pack::PackView;
 use blaze_id::CrateItemKey;
 use blaze_manifest::lock::{Lock, LockId};
@@ -188,7 +188,7 @@ fn have<'t>(names: &Names<'_>, task: &'t Task<'_>, g: usize) -> Option<&'t Input
 pub(crate) fn prepare<'f: 'j, 'j, 'b>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
-    store: &mut dyn Store,
+    store: &mut dyn Store<'_>,
     names: &mut Option<Names<'f>>,
     lock: Option<&'f Lock<'static>>,
     members: Option<&[(LockId, blaze_unit_graph::Text<'_>)]>,
@@ -353,8 +353,11 @@ pub(crate) fn resolve(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame:
             payload: sections::write(0, [&[][..]; sections::SECTIONS]),
             files: std::vec::Vec::new(),
             absent: std::vec::Vec::new(),
+            data: std::vec::Vec::new(),
             findings: blaze_own::Vec::new_in(Global),
+            left_package: blaze_own::Vec::new_in(Global),
             failed: Some(words),
+            failed_calls: blaze_own::Vec::new_in(Global),
         },
         ok: false,
         unresolved: 0,
@@ -375,6 +378,8 @@ pub(crate) fn resolve(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame:
         corrected: job.corrected,
         env: env.map(|env| (job.at, env)),
         read: RefCell::new(std::vec::Vec::new()),
+        data: RefCell::new(std::vec::Vec::new()),
+        left: RefCell::new(std::vec::Vec::new()),
         procs: job.procs,
         own: Some(job.at),
         callers,
@@ -384,10 +389,22 @@ pub(crate) fn resolve(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame:
         let _cx = cx.span("crate scope: resolve_crate");
         resolve_crate(&job.input, job.deps, job.sysroot, &texts, job.at, &Serial, prepares, alloc)
     };
+    // Each include that left its package inside the workspace (D111): a warning finding at
+    // its call, placed in the crate's own files (none when the crate failed).
+    let left_package = match &done {
+        Ok(done) => crate::names::include_outside::findings(done.names, &texts.left.borrow(), job.input.shown_from),
+        Err(_) => blaze_own::Vec::new_in(Global),
+    };
     // The out of a resolved crate: its names record here, its files below ([`OUT_DOMAIN`]);
     // `None`: failed ([`crate::work::failed_out`]).
+    // Each failed macro call of the crate's own code (a `main` the implicit `::std::main` did
+    // not write among them): an error finding at the call with the matcher's reason.
+    let failed_calls = match &done {
+        Ok(done) => crate::names::failed_call::findings(done.names),
+        Err(_) => blaze_own::Vec::new_in(Global),
+    };
     let (out, payload, findings, failed, ok, unresolved) = match done {
-        Ok(done) => match scope_record(&done, crate_name) {
+        Ok(done) => match scope_record(&done, crate_name, alloc) {
             Ok(record) => {
                 let mut out = blaze_ids::Hasher::new(OUT_DOMAIN);
                 out.update(&(done.record.len() as u64).to_le_bytes()).update(&done.record);
@@ -429,6 +446,12 @@ pub(crate) fn resolve(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame:
     absent.sort_unstable();
     absent.dedup();
     absent.retain(|path| files.binary_search(path).is_err());
+    // Each file read as data, with the slot of the file whose call read it: that file's
+    // outline lists it as a data part, so it is the home its want names.
+    let mut data: std::vec::Vec<(String, String), Global> =
+        texts.data.into_inner().into_iter().map(|(path, from)| (String::from(path), slot_of(String::from(from), looked))).collect();
+    data.sort_unstable();
+    data.dedup();
     // The checkout files the crate holds, each at its own place (`x/mod.rs`, not its slot:
     // a body's file is matched by its path), sorted: what a body's check reads of the
     // items record to find its owner.
@@ -442,7 +465,7 @@ pub(crate) fn resolve(cx: &Cx, root: &Dir<ReadWrite>, job: &ScopeJob<'_>, frame:
         }
         None => crate::work::failed_out(),
     };
-    Resolution::Made { resolved: Resolved { out, payload, files, absent, findings, failed }, ok, unresolved }
+    Resolution::Made { resolved: Resolved { out, payload, files, absent, data, findings, left_package, failed, failed_calls }, ok, unresolved }
 }
 
 /// A resolution filed on the main thread: a need is the task's answer; a made crate is kept
@@ -476,8 +499,8 @@ pub(crate) fn settle<'b>(names: &mut Names<'_>, task: &Task<'_>, resolution: Res
 
 /// The last step, for a crate made this command: each checkout file it read is asked for as
 /// its `Surface` (with the dependencies' records again, so the entry after holds them all);
-/// with all of them handed in, its record.
-pub(crate) fn answer<'b>(names: &Names<'_>, task: &Task<'_>, held: &'b Frame) -> Result<Did<'b>, CliError> {
+/// with all of them handed in, its record, its payload moved out of `names` ([`hand_payload`]).
+pub(crate) fn answer<'b>(names: &mut Names<'_>, task: &Task<'_>, held: &'b Frame) -> Result<Did<'b>, CliError> {
     let name = task.name;
     let Ok(at) = names.by_subject.binary_search_by_key(&name.subject, |(subject, _)| *subject).map(|i| names.by_subject[i].1) else {
         return Err(CliError::Text { what: "a made crate the world does not hold" });
@@ -489,23 +512,36 @@ pub(crate) fn answer<'b>(names: &Names<'_>, task: &Task<'_>, held: &'b Frame) ->
     let local = locals(names, at, task).local;
     let crates = &names.world.crates;
     let unread: std::vec::Vec<&String, Global> = resolved.files.iter().filter(|path| !task.inputs.iter().any(|input| input.name == surface(path))).collect();
+    // Each file read as data is read as its own `FileItems` record (its bytes' id), listed by
+    // the outline of the file whose call read it (data_include.rs): never a `Surface`.
+    let unread_data: std::vec::Vec<&(String, String), Global> =
+        resolved.data.iter().filter(|(path, _)| !task.inputs.iter().any(|input| input.name == blaze_drive::Name::file(path.as_bytes()))).collect();
     let script = names.script_of(at);
-    if !unread.is_empty() {
-        let mut wants = blaze_own::Vec::with_capacity_in(unread.len() + local.len() + 1, held);
+    if !unread.is_empty() || !unread_data.is_empty() {
+        let mut wants = blaze_own::Vec::with_capacity_in(unread.len() + unread_data.len() + local.len() + 1, held);
         wants.extend(unread.iter().map(|path| Want { name: surface(path), home: blaze_drive::Name::file(path.as_bytes()) }));
+        wants.extend(unread_data.iter().map(|(path, home)| Want { name: blaze_drive::Name::file(path.as_bytes()), home: blaze_drive::Name::file(home.as_bytes()) }));
         wants.extend(local.iter().map(|g| Want { name: name_of(crates[*g].input.key), home: Name::unit_graph() }));
         wants.extend(script.map(|script| Want { name: script, home: Name::unit_graph() }));
         return Ok(Did::Need(wants));
     }
     let mut made = Made::new_in(name, held);
     made.out = resolved.out;
-    made.payload.extend_from_slice(&resolved.payload);
     for finding in resolved.findings.iter() {
         let words = core::str::from_utf8(&finding.message).map_err(|_| CliError::Text { what: "a path's segment is not UTF-8" })?;
         made.find(UNRESOLVED, finding.at, &[words]);
     }
+    for finding in resolved.failed_calls.iter() {
+        let words = core::str::from_utf8(&finding.message).map_err(|_| CliError::Text { what: "a failed call's words are not UTF-8" })?;
+        made.find(crate::names::failed_call::FAILED_CALL, finding.at, &[words]);
+    }
     if let Some(words) = &resolved.failed {
         made.find(crate::work::TASK_FAILED, (0, 0), &[words.as_str()]);
+    }
+    // D111: an include read outside its package inside the workspace, a warning at its call.
+    for finding in resolved.left_package.iter() {
+        let words = core::str::from_utf8(&finding.message).map_err(|_| CliError::Text { what: "an included file's path is not UTF-8" })?;
+        made.find(crate::names::include_outside::INCLUDE_OUTSIDE_PACKAGE, finding.at, &[words]);
     }
     for path in resolved.files.iter() {
         let input = task.inputs.iter().find(|input| input.name == surface(path)).ok_or(CliError::Text { what: "a surface, checked above, is gone" })?;
@@ -513,6 +549,13 @@ pub(crate) fn answer<'b>(names: &Names<'_>, task: &Task<'_>, held: &'b Frame) ->
     }
     for path in resolved.absent.iter() {
         made.reads.push((surface(path), blaze_drive::key::ABSENT));
+    }
+    // The bytes' digest of each data file in the read list (rule 21): an edit of the file moves
+    // its record's out and asks this crate again; nothing else does.
+    for (path, _) in resolved.data.iter() {
+        let file = blaze_drive::Name::file(path.as_bytes());
+        let input = task.inputs.iter().find(|input| input.name == file).ok_or(CliError::Text { what: "a data file's record, checked above, is gone" })?;
+        made.reads.push((input.name, input.out));
     }
     for g in local.iter() {
         let input = have(names, task, *g).ok_or(CliError::Text { what: "a crate's input, checked above, is gone" })?;
@@ -523,9 +566,36 @@ pub(crate) fn answer<'b>(names: &Names<'_>, task: &Task<'_>, held: &'b Frame) ->
         let input = task.inputs.iter().find(|input| input.name == script).ok_or(CliError::Text { what: "a crate's build script's record, checked above, is gone" })?;
         made.reads.push((input.name, input.out));
     }
+    // The crate's link table as a part of its own, located by the table's digest
+    // (native_links.rs `table_digest`): its reader, the program's native image, is moved only
+    // when the table's bytes move, never by a re-solve that leaves them equal. An empty payload
+    // is a second answer, which `hand_payload` refuses below.
+    if !resolved.payload.is_empty() {
+        let links = sections::sections(&resolved.payload)
+            .map_err(|_| CliError::Text { what: "a crate's `CrateScope` payload, written by its resolution, does not open (names/scope.rs `answer`)" })?
+            .links;
+        made.parts.push(Part { name: Name::links_of(name), locate: Locate::Source(blaze_ladder::native_links::table_digest(links)), place: 0 });
+    }
+    // Last, after every step that can fail: a payload handed is gone from `names`.
+    hand_payload(&mut names.made[i].1, &mut made)?;
     #[cfg(test)]
-    MADE.with(|kept| kept.borrow_mut().push((name.subject, made.out, blaze_ids::ContentId::of("names scope test", &made.payload))));
+    MADE.with(|kept| kept.borrow_mut().push((name.subject, made.out, blaze_ids::ContentId::of("names scope test", made.payload_bytes()))));
     Ok(Did::Done(made))
+}
+
+/// Hands `resolved`'s payload to its record `made`, moved, never copied (rules 11 and 51): the
+/// bytes stay in `Global`, where the crate's resolution made them, until the batch's answer is
+/// written. A copy into the task's frame bounded the record by the frame: `core`'s payload,
+/// 76,367,791 bytes, against a 64 MiB frame, failed `core` and left every crate above it
+/// unchecked (2026-11-16 23:11). A crate's record is answered once a command; a second answer
+/// finds the payload gone (a written one is never empty: [`sections::write`] puts its head
+/// first) and is refused (rule 3), never answered with an empty record.
+fn hand_payload(resolved: &mut Resolved, made: &mut Made<'_>) -> Result<(), CliError> {
+    if resolved.payload.is_empty() {
+        return Err(CliError::Text { what: "a crate's `CrateScope` record answered twice this command: its payload went to the first answer (names/scope.rs `hand_payload`)" });
+    }
+    let payload = core::mem::replace(&mut resolved.payload, blaze_own::Vec::new_in(Global));
+    made.hand(payload)
 }
 
 /// [`MADE`], for a test.
@@ -547,7 +617,7 @@ std::thread_local! {
 pub(crate) fn run<'f, 'b>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
-    store: &mut dyn Store,
+    store: &mut dyn Store<'_>,
     names: &mut Option<Names<'f>>,
     lock: Option<&'f Lock<'static>>,
     members: Option<&[(LockId, blaze_unit_graph::Text<'_>)]>,
@@ -612,5 +682,48 @@ mod tests {
         assert_eq!(given(4), [true, false, true, false], "blaze_ids: its row names std");
         assert_eq!(given(5), [true, true, true, true], "a program crate: every sysroot crate");
         println!("sysroot given: bstd {:?}, blaze_ids {:?}, app {:?}", given(3), given(4), given(5));
+    }
+
+    /// A crate's payload larger than its task's frame is handed to its record, not copied: the
+    /// record reads the payload's exact bytes at the address its resolution made them, the
+    /// frame grew by 0, and a second answer of the crate is refused, never answered empty.
+    /// CONTROL: the copy this replaced (`made.payload.extend_from_slice`) panics here, the frame
+    /// refusing the payload's bytes as `core`'s 64 MiB task frame refused its 76 MB
+    /// (2026-11-16 23:11); a copy into `Global` instead fails the address check. Prints
+    /// `scope payload lent: 1048576 bytes, frame grew by 0`.
+    #[test]
+    fn a_scope_payload_larger_than_the_task_frame_is_handed_not_copied() {
+        use bstd::mem::{Frame, Tag};
+        use std::alloc::Global;
+        const FRAME: usize = 64 << 10;
+        const LEN: usize = 1 << 20;
+        let bytes: std::vec::Vec<u8> = (0..LEN).map(|i| (i * 31 % 251) as u8).collect();
+        let payload = blaze_own::Vec::from_slice_in(&bytes, Global);
+        let at = payload.as_ptr();
+        let mut resolved = super::Resolved {
+            payload,
+            out: blaze_ids::ContentId([7; 32]),
+            files: std::vec::Vec::new(),
+            absent: std::vec::Vec::new(),
+            data: std::vec::Vec::new(),
+            findings: blaze_own::Vec::new_in(Global),
+            left_package: blaze_own::Vec::new_in(Global),
+            failed: None,
+            failed_calls: blaze_own::Vec::new_in(Global),
+        };
+        let frame = Frame::with_reserve(FRAME, Tag::Other).expect("a test frame");
+        assert!(LEN > frame.reserved(), "the payload ({LEN} bytes) is larger than the frame ({} bytes)", frame.reserved());
+        let name = blaze_drive::Name::unit_graph();
+        let mut made = crate::work::Made::new_in(name, &frame);
+        let before = frame.used();
+        super::hand_payload(&mut resolved, &mut made).expect("the payload handed");
+        let grew = frame.used() - before;
+        assert!(made.payload_bytes() == &bytes[..], "the record reads the payload's exact bytes");
+        assert_eq!(made.payload_bytes().as_ptr(), at, "the record reads the payload where it was made: it was copied");
+        assert_eq!(grew, 0, "the task's frame grew by the payload");
+        let mut again = crate::work::Made::new_in(name, &frame);
+        assert!(super::hand_payload(&mut resolved, &mut again).is_err(), "a second answer of the crate was not refused");
+        assert!(again.payload_bytes().is_empty(), "a refused answer holds no payload");
+        println!("scope payload lent: {} bytes, frame grew by {grew}", made.payload_bytes().len());
     }
 }

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use blaze_hash::{HashMap, HashSet};
+use blaze_hash::{FixedState, Map, Set, SetOpts};
 use std::alloc::Global;
 
 use crate::dependency::Dependency;
@@ -79,30 +79,30 @@ pub type LockfileMetadata = BTreeMap<String, String>;
 /// read from a lock file has no dependencies on its edges and no features.
 #[derive(Clone)]
 pub struct Resolve {
-    graph: Graph<PackageId, HashSet<Dependency, Global>>,
+    graph: Graph<PackageId, Set<Dependency, FixedState, Global>>,
     /// `[replace]`: the package replaced and its replacement.
-    replacements: HashMap<PackageId, PackageId, Global>,
-    reverse_replacements: HashMap<PackageId, PackageId, Global>,
-    features: HashMap<PackageId, Vec<InternedString>, Global>,
+    replacements: Map<PackageId, PackageId, FixedState, Global>,
+    reverse_replacements: Map<PackageId, PackageId, FixedState, Global>,
+    features: Map<PackageId, Vec<InternedString>, FixedState, Global>,
     /// The sha256 of each package's `.crate`, `None` for sources without one (path, git).
-    checksums: HashMap<PackageId, Option<String>, Global>,
+    checksums: Map<PackageId, Option<String>, FixedState, Global>,
     metadata: LockfileMetadata,
     /// `[patch]` entries that matched nothing, kept as `[[patch.unused]]`.
     unused_patches: Vec<PackageId>,
     version: ResolveVersion,
-    summaries: HashMap<PackageId, Summary, Global>,
+    summaries: Map<PackageId, Summary, FixedState, Global>,
 }
 
 impl Resolve {
     pub fn new(
-        graph: Graph<PackageId, HashSet<Dependency, Global>>,
-        replacements: HashMap<PackageId, PackageId, Global>,
-        features: HashMap<PackageId, Vec<InternedString>, Global>,
-        checksums: HashMap<PackageId, Option<String>, Global>,
+        graph: Graph<PackageId, Set<Dependency, FixedState, Global>>,
+        replacements: Map<PackageId, PackageId, FixedState, Global>,
+        features: Map<PackageId, Vec<InternedString>, FixedState, Global>,
+        checksums: Map<PackageId, Option<String>, FixedState, Global>,
         metadata: LockfileMetadata,
         unused_patches: Vec<PackageId>,
         version: ResolveVersion,
-        summaries: HashMap<PackageId, Summary, Global>,
+        summaries: Map<PackageId, Summary, FixedState, Global>,
     ) -> Resolve {
         let reverse_replacements = replacements.iter().map(|(&p, &r)| (r, p)).collect();
         Resolve {
@@ -158,7 +158,7 @@ impl Resolve {
         self.graph.len()
     }
 
-    pub fn graph(&self) -> &Graph<PackageId, HashSet<Dependency, Global>> {
+    pub fn graph(&self) -> &Graph<PackageId, Set<Dependency, FixedState, Global>> {
         &self.graph
     }
 
@@ -166,7 +166,7 @@ impl Resolve {
     pub fn deps(
         &self,
         pkg: PackageId,
-    ) -> impl Iterator<Item = (PackageId, &HashSet<Dependency, Global>)> {
+    ) -> impl Iterator<Item = (PackageId, &Set<Dependency, FixedState, Global>)> {
         self.deps_not_replaced(pkg)
             .map(move |(id, deps)| (self.replacement(id).unwrap_or(id), deps))
     }
@@ -174,7 +174,7 @@ impl Resolve {
     pub fn deps_not_replaced(
         &self,
         pkg: PackageId,
-    ) -> impl Iterator<Item = (PackageId, &HashSet<Dependency, Global>)> {
+    ) -> impl Iterator<Item = (PackageId, &Set<Dependency, FixedState, Global>)> {
         self.graph.edges(&pkg).map(|(id, deps)| (*id, deps))
     }
 
@@ -192,7 +192,7 @@ impl Resolve {
         self.replacements.get(&pkg).cloned()
     }
 
-    pub fn replacements(&self) -> &HashMap<PackageId, PackageId, Global> {
+    pub fn replacements(&self) -> &Map<PackageId, PackageId, FixedState, Global> {
         &self.replacements
     }
 
@@ -208,7 +208,7 @@ impl Resolve {
         to: PackageId,
         to_crate_name: &str,
     ) -> Result<(InternedString, Option<InternedString>)> {
-        let empty_set = HashSet::new_in(Global);
+        let empty_set = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
         let deps = if from == to { &empty_set } else { self.dependencies_listed(from, to) };
 
         let target_crate_name = || (to_crate_name.to_owned(), None);
@@ -226,7 +226,7 @@ impl Resolve {
         Ok((InternedString::new(&extern_crate_name), dep_name))
     }
 
-    fn dependencies_listed(&self, from: PackageId, to: PackageId) -> &HashSet<Dependency, Global> {
+    fn dependencies_listed(&self, from: PackageId, to: PackageId) -> &Set<Dependency, FixedState, Global> {
         // We've got a dependency on `from` to `to`, but this dependency edge
         // may be affected by [replace]. If the `to` package is listed as the
         // target of a replacement (aka the key of a reverse replacement map)
@@ -265,7 +265,7 @@ impl Resolve {
             .collect();
     }
 
-    pub fn checksums(&self) -> &HashMap<PackageId, Option<String>, Global> {
+    pub fn checksums(&self) -> &Map<PackageId, Option<String>, FixedState, Global> {
         &self.checksums
     }
 
@@ -289,7 +289,7 @@ impl Resolve {
         &self.summaries[&pkg_id]
     }
 
-    pub fn summaries(&self) -> &HashMap<PackageId, Summary, Global> {
+    pub fn summaries(&self) -> &Map<PackageId, Summary, FixedState, Global> {
         &self.summaries
     }
 }

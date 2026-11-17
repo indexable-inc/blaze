@@ -177,3 +177,51 @@ fn extract_reads_its_constant_lane_and_refuses_others() {
         b.iconst(Ty::I64, 0)
     });
 }
+
+/// `simd_select_bitmask::<M, u8x8>(m, yes, no)`: "if the bit in `mask` is `1`, select the
+/// element from `if_true`", lane 0 the lowest bit; the same with `M` a `u8` and a `[u8; 1]`. A
+/// mask of fewer bits than lanes, and a signed `M`, are refused by name.
+/// Prints `test intrinsics::simd::tests::select_bitmask_takes_lane_i_by_bit_i ... ok`.
+#[test]
+fn select_bitmask_takes_lane_i_by_bit_i() {
+    let mut env = Env::new();
+    let u8x8 = env.v8(U8);
+    let u8_ = env.g.n(U8);
+    let bytes1 = env.g.array(u8_, 1);
+    let yes = [1, 2, 3, 4, 5, 6, 7, 8];
+    let no = [0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8];
+    // Bits 0, 2, 5 and 7 set.
+    let want = u64::from_le_bytes([1, 0xA2, 3, 0xA4, 0xA5, 6, 0xA7, 8]);
+    for array in [false, true] {
+        let got = run(&mut env, yes, no, |env, b, y, n| {
+            let m = b.iconst(Ty::I8, 0b1010_0101);
+            let (mt, arg) = if array {
+                let slot = b.slot(1, 0, SlotKind::Temp);
+                let at = b.slot_addr(slot);
+                b.store(Flags::NONE, m, at, 0, MemAttrs::aligned(0));
+                (bytes1, Arg::Place(at))
+            } else {
+                (u8_, Arg::Scalar(m))
+            };
+            let generics = [GenericArg::Ty(mt), GenericArg::Ty(u8x8)];
+            let c = Call { which: Which::Simd(SimdOp::SelectBitmask), generics: &generics, args: &[arg, Arg::Place(y), Arg::Place(n)], ret: u8x8, site: None };
+            let r = at(env.call(b, &c).expect("select_bitmask builds"));
+            as_u64(b, r)
+        });
+        assert_eq!(got, u128::from(want), "a mask as {}", if array { "`[u8; 1]`" } else { "`u8`" });
+    }
+    let u16_ = env.g.n(PNode::Uint(UintTy::U16));
+    let lanes16 = env.g.array(u16_, 16);
+    let u16x16 = env.g.adt(env.vector, &[lanes16]);
+    let i8_ = env.g.n(I8);
+    run(&mut env, [0; 8], [0; 8], |env, b, y, n| {
+        let m = b.iconst(Ty::I8, 0);
+        for (mt, vt, why) in [(u8_, u16x16, "fewer bits"), (i8_, u8x8, "unsigned integer")] {
+            let generics = [GenericArg::Ty(mt), GenericArg::Ty(vt)];
+            let c = Call { which: Which::Simd(SimdOp::SelectBitmask), generics: &generics, args: &[Arg::Scalar(m), Arg::Place(y), Arg::Place(n)], ret: vt, site: None };
+            let error = env.call(b, &c).expect_err(why);
+            assert!(error.to_string().contains(why), "{error}");
+        }
+        b.iconst(Ty::I64, 0)
+    });
+}

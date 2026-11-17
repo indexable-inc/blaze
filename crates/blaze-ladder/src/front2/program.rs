@@ -64,6 +64,17 @@ pub enum Front2Refusal {
     Front(super::FrontError),
     /// The crate root names no `main` in the value namespace.
     NoMain,
+    /// The root's `fn main` is the input of an attribute call that wrote no `main` (Class P: a
+    /// written `#[bstd::main]` whose path does not resolve, a refused call, or one that expanded
+    /// and declares no `main`; [`blaze_scope::main_call::MainCall`]) (rule 19).
+    MainTakenBy { call: LibKey, path: Box<str>, implicit: bool, why: blaze_scope::main_call::MainCallWhy },
+    /// The root's `main` is missing because the macro call that would have written it failed:
+    /// under D104 the implicit `#[::std::main]` whose input is the written `fn main` (or a
+    /// written attribute macro on it). The parts of blaze-scope's
+    /// [`blaze_scope::failed_call::FailedCall`]: the call and its module by key, the macro's
+    /// path, whether it is the implicit call, and the matcher's typed reason (`diagnostic`, its
+    /// texts ranges of `notes`; [`blaze_expand::Failed::from_parts`]) (rule 19).
+    MainNotWritten { call: LibKey, module: LibKey, path: Box<str>, implicit: bool, diagnostic: blaze_expand::Diagnostic, notes: Box<[u8]> },
     /// `main`'s body did not lower.
     Lower(BodyError),
     /// `main`'s names could not be spelled back from its lowering.
@@ -83,7 +94,10 @@ pub enum Front2Refusal {
     Static { static_: Box<str>, why: Box<str> },
     /// The walk from `entry` (the program's start, named) met more fns than
     /// [`super::reach::MOST_FNS`]; `queued` were still waiting when it stopped.
-    Capped { entry: Box<str>, queued: usize },
+    /// `cap` is the walk's ([`super::reach::Census::cap`]): sized by the `items` the names
+    /// held, unless `forced` (the caller's); `report` is what the walk met
+    /// ([`super::reach::capped_report`]: by crate, keys tabled twice, the fns still queued).
+    Capped { entry: Box<str>, queued: usize, cap: usize, items: usize, forced: bool, report: Box<str> },
     /// A tabled fn has no head in front2's store.
     NoHead { function: Box<str> },
     /// A fn's attributes could not be read from its signature's lowering.
@@ -103,9 +117,8 @@ pub enum Front2Refusal {
     Layout { adt: Box<str> },
     /// A `#[rustc_intrinsic]` fn the build's intrinsic table does not name.
     Intrinsic { function: Box<str> },
-    /// A declaration of an `extern "llvm-intrinsic"` block: the LLVM intrinsic `symbol`
-    /// (front2/llvm_intrinsic.rs), which the builder does not build yet (blaze-build's
-    /// `Intrinsic::Target`, prompt P7b, replaces this refusal).
+    /// A declaration of an `extern "llvm-intrinsic"` block naming an LLVM intrinsic `symbol`
+    /// (front2/llvm_intrinsic.rs) outside blaze-build's set (intrinsics/target.rs `named`).
     TargetIntrinsic { function: Box<str>, symbol: Box<str> },
     /// Two fns of the program's crate are exported under the process entry's symbol.
     TwoEntries { symbol: &'static str, first: Box<str>, second: Box<str> },
@@ -131,6 +144,9 @@ pub enum Front2Refusal {
     /// [`run_entry::HostedStartMissing`], the record walk's `EntryRefusal::NoHostedStart`):
     /// never started at its `main` directly.
     NoHostedStart,
+    /// The names source did not answer a fact the start rule reads (over records: the error is
+    /// in the source's log): `what` names the question, `krate` the crate it was asked of.
+    StartFact { krate: usize, what: &'static str },
     /// The lazy program (program/lazy) refused one body, by name.
     Lazy(lazy::LazyRefusal),
     /// A reached fn's row path could not be built from the names the program declares (front2
@@ -145,6 +161,22 @@ impl core::fmt::Display for Front2Refusal {
             Front2Refusal::Lazy(e) => write!(f, "{e}"),
             Front2Refusal::NoRowPath(e) => write!(f, "{e}"),
             Front2Refusal::NoMain => write!(f, "front2: the crate root has no `main`"),
+            Front2Refusal::MainTakenBy { call, path, implicit, why } => {
+                let taken = blaze_scope::main_call::MainCall { call: *call, path: &**path, implicit: *implicit, at: None, why: *why };
+                write!(f, "front2: the crate root's {taken}")
+            }
+            Front2Refusal::MainNotWritten { call, module, path, implicit, diagnostic, notes } => {
+                let failed = blaze_scope::failed_call::FailedCall {
+                    name: "main",
+                    call: *call,
+                    module: *module,
+                    path: &**path,
+                    implicit: *implicit,
+                    at: None,
+                    failed: blaze_expand::Failed::from_parts(*diagnostic, &**notes),
+                };
+                write!(f, "front2: the crate root's {failed}")
+            }
             Front2Refusal::Lower(e) => write!(f, "front2: `main` did not lower: {e:?}"),
             Front2Refusal::Spell(e) => write!(f, "front2: `main`'s names: {e:?}"),
             Front2Refusal::Check(e) => write!(f, "front2: `main` did not check: {e:?}"),
@@ -154,11 +186,15 @@ impl core::fmt::Display for Front2Refusal {
             Front2Refusal::NoBody { function } => write!(f, "front2: `{function}`, reached from `main`, has no body (front2's)"),
             Front2Refusal::Const { constant, why } => write!(f, "front2: the constant `{constant}`, read by a body of the program, was not evaluated: {why}"),
             Front2Refusal::Static { static_, why } => write!(f, "front2: the static `{static_}`, reached by the program, was not made: {why}"),
-            Front2Refusal::Capped { entry, queued } => write!(
+            Front2Refusal::Capped { entry, queued, cap, items, forced: false, report } => write!(
                 f,
-                "front2: `{entry}` reaches more than {} fns (the cap above the whole library's fn count; {queued} still queued): a walk that does not end",
-                super::reach::MOST_FNS
+                "front2: `{entry}` reaches more than {cap} fns, the cap: {} x the {items} items, members and variants the program's names hold (under {}); {queued} still queued: the walk tabled more fns than exist, so it does not end\n{report}",
+                super::reach::NEED_FACTOR,
+                super::reach::MOST_FNS_CEILING
             ),
+            Front2Refusal::Capped { entry, queued, cap, items, forced: true, report } => {
+                write!(f, "front2: `{entry}` reaches more than {cap} fns, the cap its caller set (the names hold {items} items, members and variants); {queued} still queued\n{report}")
+            }
             Front2Refusal::NoHead { function } => write!(f, "front2: `{function}` has no head in the store (front2's)"),
             Front2Refusal::Attrs { function, why } => write!(f, "front2: `{function}`'s attributes: {why}"),
             Front2Refusal::Unlisted { krate } => write!(f, "front2: the items of crate {krate} were not listed by the names source"),
@@ -172,7 +208,7 @@ impl core::fmt::Display for Front2Refusal {
             }
             Front2Refusal::Intrinsic { function } => write!(f, "front2: `{function}` is an intrinsic the build's table does not name (blaze-build intrinsics)"),
             Front2Refusal::TargetIntrinsic { function, symbol } => {
-                write!(f, "front2: `{function}` is a target intrinsic (`{symbol}`), which the builder does not build yet")
+                write!(f, "front2: `{function}` is a target intrinsic (`{symbol}`) outside the set the builder builds (blaze-build intrinsics/target.rs)")
             }
             Front2Refusal::AdtRow { adt, why } => write!(f, "front2: the ADT `{adt}`'s row: {why}"),
             Front2Refusal::ObjectTrait { trait_, why } => write!(f, "front2: the trait `{trait_}` as a trait object sees it: {why}"),
@@ -184,6 +220,9 @@ impl core::fmt::Display for Front2Refusal {
             Front2Refusal::NoLangStart { shelf } => write!(f, "the shelf has no `#[lang = \"start\"]` item: {shelf}"),
             Front2Refusal::Start { item, what } => write!(f, "front2: the Rust start: `{item}` {what}"),
             Front2Refusal::NoHostedStart => write!(f, "front2: the program's start: {}", run_entry::HostedStartMissing),
+            Front2Refusal::StartFact { krate, what } => {
+                write!(f, "front2: the program's start: the names source did not answer {what} of crate {krate} (the start rule reads it: program.rs `start_of`)")
+            }
         }
     }
 }
@@ -202,6 +241,9 @@ struct Tabled<'n> {
     /// Whether the fn is nounwind ([`FrontEnd::nounwind`]; program/head_abi.rs `BuildAbi`):
     /// `abi` is one calling convention for "C" and "C-unwind", this keeps which.
     nounwind: bool,
+    /// Whether the fn's own signature says `#[track_caller]` ([`FrontEnd::track_caller`] adds
+    /// what a trait impl's method inherits from the trait's declaration).
+    track_caller: bool,
     symbol: Box<str>,
     export: Option<Box<str>>,
     lits: Literals,
@@ -284,6 +326,8 @@ pub struct Front2Program<'n> {
     /// Every checked body's async blocks' state recipes, sorted by (owner, ordinal)
     /// (coroutine_recipes.rs): the seam's `coroutine_recipe`.
     recipes: Vec<super::coroutine_recipes::RecipeRow, Global>,
+    /// The walk's fns by crate (crate index, fns tabled), most first ([`super::reach::by_crate`]).
+    reached_by_crate: Vec<(usize, usize), Global>,
 }
 
 /// Where a program's walk starts.
@@ -293,6 +337,9 @@ pub(crate) enum Starts<'a> {
     Main,
     /// Every test fn of a test unit, by its tests record's row order (program/suite.rs).
     Tests(&'a [LibKey]),
+    /// A survey's roots, the walk limited by `within` ([`Front2Program::survey_within`]): a
+    /// root that does not lower is a left-out row, not the survey's stop.
+    Within { roots: &'a [LibKey], within: super::reach::Within<'a> },
 }
 
 /// What [`Front2Program::make_from`] made beside the program.
@@ -312,7 +359,9 @@ const SEAM_LANGS: [LangItem; 8] = [LangItem::Drop, LangItem::Deref, LangItem::De
 
 fn lang_of(front: &Front2<'_>, item: LangItem) -> Result<Option<ItemKey>, crate::seam::LangRefusal> {
     match super::langs::find(&front.index, front.resolver, item) {
-        Ok(found) => Ok(found.map(checker_of)),
+        // A `#[lang]` member (`Future::poll`) is asked by its member key, as the lazy program asks
+        // it (keys.rs `asked_key`).
+        Ok(found) => Ok(found.map(|lib| super::keys::asked_key(front.names, lib))),
         Err(why) => Err(crate::seam::LangRefusal { item, why }),
     }
 }
@@ -326,7 +375,9 @@ impl Front2Program<'_> {
 
 /// One trait as a trait object sees it (blaze-build's `vtable::ObjectTrait`, owned).
 struct ObjectTable {
-    supers: Vec<ItemKey, Global>,
+    supers: Vec<blaze_build::vtable::ObjectSuper, Global>,
+    /// The pool `supers`' argument spans index (blaze-build's `ObjectTrait::super_args`).
+    super_args: Vec<u32, Global>,
     methods: Vec<blaze_build::vtable::ObjectMethod, Global>,
     shape: ContentId,
 }
@@ -473,14 +524,33 @@ fn object_tables<'n, S: super::source::NamesSource<'n>>(
             r.store.ensure(r.names, r.keys, super::heads::Want::Members(lib)).map_err(|e| format!("its members: {e:?}"))?;
             let head = r.store.maps.traits.get(&lib).ok_or_else(|| String::from("made, but no head filed under its key"))?;
             let supers_written = r.store.maps.supers.get(&lib).ok_or_else(|| String::from("made, but no supertraits filed under its key"))?;
+            let view = r.store.tys.view();
             let mut supers = Vec::with_capacity_in(supers_written.len(), Global);
+            let mut super_args: Vec<u32, Global> = Vec::new_in(Global);
             let mut waiting = false;
             for &(s, args) in supers_written.iter() {
-                // `Self` is the first argument; one past it is a generic supertrait.
-                if args.len > 1 {
-                    return Err(format!("its supertrait {} has generic arguments, which a table does not carry yet", fn_shown(r, checker_of(s))));
-                }
                 let sk = checker_of(s);
+                let written = view.list(args).map_err(|e| format!("its supertrait {}'s arguments: {e:?}", fn_shown(r, sk)))?;
+                // `Self` is the first argument (always the trait's own `Self`); each one after
+                // it is filed by the position of the trait's own parameter it is (`Self` 0, the
+                // trait's parameters from 1): `FnMut<Args>: FnOnce<Args>` files `[1]`. The
+                // builder composes them down the tree (blaze-build vtable.rs `Shape::of`).
+                let at = super_args.len();
+                for &a in written.iter().skip(1) {
+                    match view.node(a) {
+                        Ok(tc::PNode::Param(i) | tc::PNode::ConstParam(i)) => super_args.push(i),
+                        _ => {
+                            return Err(format!(
+                                "its supertrait {} has an argument that is not one of the trait's own parameters, which a table does not carry yet",
+                                fn_shown(r, sk)
+                            ));
+                        }
+                    }
+                }
+                let span = blaze_build::vtable::ArgSpan {
+                    at: u32::try_from(at).map_err(|_| String::from("more supertrait arguments than a table indexes"))?,
+                    len: u32::try_from(super_args.len() - at).map_err(|_| String::from("more supertrait arguments than a table indexes"))?,
+                };
                 if refused.contains_key(&sk) {
                     return Err(format!("its supertrait {} has no table", fn_shown(r, sk)));
                 }
@@ -488,7 +558,7 @@ fn object_tables<'n, S: super::source::NamesSource<'n>>(
                     asked.push(sk);
                     waiting = true;
                 }
-                supers.push(sk);
+                supers.push(blaze_build::vtable::ObjectSuper { trait_: sk, args: span });
             }
             if waiting {
                 return Ok(None);
@@ -503,16 +573,20 @@ fn object_tables<'n, S: super::source::NamesSource<'n>>(
                 let item = head.fns.iter().find(|(n, _)| *n == m.name).map(|(_, f)| *f).ok_or_else(|| String::from("a method with no fn filed under its name"))?;
                 methods.push(blaze_build::vtable::ObjectMethod { item, dispatch });
             }
-            let mut h = blaze_ids::Hasher::new("blaze-ladder front2 object trait 1");
+            let mut h = blaze_ids::Hasher::new("blaze-ladder front2 object trait 2");
             h.update(&k.0.to_le_bytes());
             for m in methods.iter() {
                 h.update(&m.item.0.to_le_bytes()).update(&[u8::from(m.dispatch)]);
             }
             for s in supers.iter() {
-                let below = tables.get(s).map_or([0; 32], |t| t.shape.0);
-                h.update(&s.0.to_le_bytes()).update(&below);
+                let below = tables.get(&s.trait_).map_or([0; 32], |t| t.shape.0);
+                h.update(&s.trait_.0.to_le_bytes()).update(&below).update(&s.args.len.to_le_bytes());
+                let at = s.args.at as usize;
+                for p in &super_args[at..at + s.args.len as usize] {
+                    h.update(&p.to_le_bytes());
+                }
             }
-            Ok(Some(ObjectTable { supers, methods, shape: h.finish() }))
+            Ok(Some(ObjectTable { supers, super_args, methods, shape: h.finish() }))
         })();
         match why {
             Ok(None) => {}
@@ -540,9 +614,10 @@ fn object_tables<'n, S: super::source::NamesSource<'n>>(
 impl<'n> Front2Program<'n> {
     /// `main` of the program's crate (index 0 of `names`), lowered and checked; refused by name
     /// where the back half would ask what front2 cannot answer yet.
-    /// `frame` is the caller's, alive for the command (`Front2::new`).
-    pub fn new(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>]) -> Result<Front2Program<'n>, Front2Refusal> {
-        Self::make(names, frame, user, None)
+    /// `frame` is the caller's, alive for the command (`Front2::new`); `alloc` is the check's,
+    /// handed down from the program's entry (`'static`, as the head store's tables are).
+    pub fn new(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], alloc: Alloc<'static>) -> Result<Front2Program<'n>, Front2Refusal> {
+        Self::make(names, frame, user, None, alloc)
     }
 
     /// Where the process starts ([`super::start::Entry2`]): what the builder makes the C entry
@@ -553,8 +628,8 @@ impl<'n> Front2Program<'n> {
     /// The program with every fn that checks clean tabled and every other one LEFT OUT (each
     /// named in `left_out` with its cause), for a survey of what the back half builds
     /// ([`crate::run::build_survey`]); never run: a left-out fn's caller cannot be built.
-    pub fn survey(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], left_out: &mut Vec<(Box<str>, LeftOut), Global>) -> Result<Front2Program<'n>, Front2Refusal> {
-        Self::make(names, frame, user, Some(left_out))
+    pub fn survey(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], left_out: &mut Vec<(Box<str>, LeftOut), Global>, alloc: Alloc<'static>) -> Result<Front2Program<'n>, Front2Refusal> {
+        Self::make(names, frame, user, Some(left_out), alloc)
     }
 
     /// [`Front2Program::survey`] from given ROOTS (each a fn's library key, of any crate): one
@@ -563,8 +638,22 @@ impl<'n> Front2Program<'n> {
     /// 0's (blaze-real's `tempo_build` example: a workspace's binary). Never run: the program has
     /// no entry, so [`crate::run::build_survey`] builds every clean non-generic fn and each
     /// generic one at the instances the built bodies call it at.
-    pub fn survey_from(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], roots: &[LibKey], left_out: &mut Vec<(Box<str>, LeftOut), Global>) -> Result<Front2Program<'n>, Front2Refusal> {
-        Self::make_from(names, frame, user, Some(left_out), Starts::Tests(roots)).map(|made| made.program)
+    pub fn survey_from(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], roots: &[LibKey], left_out: &mut Vec<(Box<str>, LeftOut), Global>, alloc: Alloc<'static>) -> Result<Front2Program<'n>, Front2Refusal> {
+        Self::make_from(names, frame, user, Some(left_out), Starts::Tests(roots), alloc).map(|made| made.program)
+    }
+
+    /// [`Front2Program::survey_from`] limited by `within` (reach.rs [`super::reach::Within`]):
+    /// only fns of its crates are lowered, checked and walked (another crate's fn is a left-out
+    /// row of class [`super::reach::OUTSIDE`], so the builds survey builds none of it), and a
+    /// root that does not lower is a left-out row (`lower: root`), not the survey's stop.
+    pub fn survey_within(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], roots: &[LibKey], within: super::reach::Within<'_>, left_out: &mut Vec<(Box<str>, LeftOut), Global>, alloc: Alloc<'static>) -> Result<Front2Program<'n>, Front2Refusal> {
+        Self::make_from(names, frame, user, Some(left_out), Starts::Within { roots, within }, alloc).map(|made| made.program)
+    }
+
+    /// The walk's fns by crate: (crate index, fns tabled), most first, then by crate
+    /// (`usize::MAX`: a key no crate holds).
+    pub fn reached_by_crate(&self) -> &[(usize, usize)] {
+        &self.reached_by_crate
     }
 
     /// Of a program made by [`Front2Program::survey`]: the left-out fn or item of the
@@ -607,32 +696,50 @@ impl<'n> Front2Program<'n> {
         Some((shown, Box::from(why)))
     }
 
-    fn make(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], left_out: Option<&mut Vec<(Box<str>, LeftOut), Global>>) -> Result<Front2Program<'n>, Front2Refusal> {
-        Self::make_from(names, frame, user, left_out, Starts::Main).map(|made| made.program)
+    fn make(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], left_out: Option<&mut Vec<(Box<str>, LeftOut), Global>>, alloc: Alloc<'static>) -> Result<Front2Program<'n>, Front2Refusal> {
+        Self::make_from(names, frame, user, left_out, Starts::Main, alloc).map(|made| made.program)
     }
 
     /// The program from its ROOTS ([`Starts`]): `main` (the process's entry), or every test fn
     /// of a test unit (program/suite.rs). One walk from all roots ([`super::reach::reach_all`]),
     /// so a fn two roots reach is checked and tabled once; each root keeps its row.
-    fn make_from(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], mut left_out: Option<&mut Vec<(Box<str>, LeftOut), Global>>, starts: Starts<'_>) -> Result<Made<'n>, Front2Refusal> {
+    fn make_from(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], mut left_out: Option<&mut Vec<(Box<str>, LeftOut), Global>>, starts: Starts<'_>, alloc: Alloc<'static>) -> Result<Made<'n>, Front2Refusal> {
         // The program's lang rows are its link closure's (linked.rs): `main`'s program is
         // crate 0's; given roots (a workspace's binary in `survey_from`, a test unit's tests,
         // a walk's roots) are the program of their crates.
         let linked = match starts {
-            Starts::Main => super::linked::Linked::of(names, &[0], Alloc::global()),
-            Starts::Tests(keys) => super::linked::Linked::of_keys(names, keys, Alloc::global()),
+            Starts::Main => super::linked::Linked::of(names, &[0], alloc),
+            Starts::Tests(keys) | Starts::Within { roots: keys, .. } => super::linked::Linked::of_keys(names, keys, alloc),
         }
         .map_err(|e| Front2Refusal::Front(super::FrontError::Roots(e)))?;
         let mut front = Front2::for_program(names, frame, user, &linked).map_err(Front2Refusal::Front)?;
         let mut roots: Vec<LibKey, Global> = Vec::new_in(Global);
         // Made before the roots: a Rust program's start reads `main`'s head (start.rs).
-        let mut store = Store::new(front.index.lang("sized"), front.frame);
+        let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
         store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
         let mut start2: Option<super::start::Entry2> = None;
         let tests = match starts {
             Starts::Main => {
                 let written = Written { kind: PathKind::Plain, segments: &["main"] };
-                let found = names::path(names, names.root(0), Namespace::Values, written, Alloc::global()).map_err(|_| Front2Refusal::NoMain)?;
+                // A miss behind a failed call (D104's implicit `::std::main` that took no arm)
+                // names that call and why (blaze-scope failed_call.rs), never "no `main`"; one
+                // behind an attribute call that wrote no `main` names that call (main_call.rs).
+                let found = names::path(names, names.root(0), Namespace::Values, written, alloc).map_err(|error| {
+                    match blaze_scope::failed_call::FailedCall::of(names, &error, "main") {
+                        Some(failed) => Front2Refusal::MainNotWritten {
+                            call: failed.call,
+                            module: failed.module,
+                            path: failed.path.into(),
+                            implicit: failed.implicit,
+                            diagnostic: failed.failed.diagnostic,
+                            notes: failed.failed.notes().into(),
+                        },
+                        None => match blaze_scope::main_call::MainCall::of(names, 0) {
+                            Some(taken) => Front2Refusal::MainTakenBy { call: taken.call, path: taken.path.into(), implicit: taken.implicit, why: taken.why },
+                            None => Front2Refusal::NoMain,
+                        },
+                    }
+                })?;
                 let rust_main: LibKey = found.whole(1).ok_or(Front2Refusal::NoMain)?.key;
                 // The process's entry: an exported one ([`exported_entry`]); else the root's
                 // start by THE rule the record walk takes too (run_entry.rs `RootStart`, decided
@@ -641,44 +748,59 @@ impl<'n> Front2Program<'n> {
                 // directly; a Rust root starts through the `#[lang = "start"]` the program links
                 // (start.rs `linked_lang_start`, Rust's rule), else at its `fn main` directly (a
                 // program that links no std). The walk and `entry()` start at its root.
-                let entry = match exported_entry(names)? {
-                    Some(e) => e,
-                    None => {
-                        let start = run_entry::RootStart::of_names(names).ok_or(Front2Refusal::NoMain)?;
-                        match start.unexported().map_err(|run_entry::HostedStartMissing| Front2Refusal::NoHostedStart)? {
-                            // `linked_lang_start` reads what is linked, which `RootStart` does not
-                            // (a `#![no_std]` root's `extern crate std`, a shelf-less program): it
-                            // refines both Rust starts.
-                            run_entry::Unhosted::LangStart | run_entry::Unhosted::Direct => match super::start::linked_lang_start(names, Alloc::global())? {
-                                Some(lang_start) => super::start::Entry2::Rust(super::start::rust_start(names, lang_start, rust_main, &mut store, &mut front.keys)?),
-                                None => super::start::Entry2::Direct(rust_main),
-                            },
-                        }
-                    }
+                // The rule is [`start_of`], which `blaze run` asks too before anything is built
+                // (run.rs `entry_start`): one home.
+                let entry = match start_of(names, alloc)? {
+                    StartOf::Exported(e) => e,
+                    StartOf::LangStart(lang_start) => super::start::Entry2::Rust(super::start::rust_start(names, lang_start, rust_main, &mut store, &mut front.keys)?),
+                    StartOf::Direct => super::start::Entry2::Direct(rust_main),
                 };
                 roots.push(entry.root());
                 start2 = Some(entry);
                 false
             }
-            Starts::Tests(list) => {
+            Starts::Tests(list) | Starts::Within { roots: list, .. } => {
                 roots.extend_from_slice(list);
                 true
             }
         };
         let mut buckets = None;
-        let prepared = Prepares::new_in(Alloc::global());
+        let prepared = Prepares::new_in(alloc);
         let mut mains: Vec<Body<'n>, Global> = Vec::with_capacity_in(roots.len(), Global);
+        let mut kept: Vec<LibKey, Global> = Vec::with_capacity_in(roots.len(), Global);
         for &lib in roots.iter() {
             // An entry declared in a block (super::nested_exports): the bodies around it are
             // lowered first, outermost first, so each keeps its local items (locals.rs
             // `Locals::keep`, which runs before the body's check) and the entry's head and text
             // are known. An enclosing body's refusal stops the run, named (no quiet pass;
             // coordinator's ruling 19:1x).
-            for &outer in super::nested_exports::enclosing_bodies(names, Alloc::global(), lib)?.iter() {
-                lower_fn(names, prepared, &mut front.keys, &mut store, outer).map_err(Front2Refusal::Lower)?;
+            let mut lowered = Ok(());
+            for &outer in super::nested_exports::enclosing_bodies(names, alloc, lib)?.iter() {
+                if let Err(e) = lower_fn(names, prepared, &mut front.keys, &mut store, outer) {
+                    lowered = Err(e);
+                    break;
+                }
             }
-            mains.push(lower_fn(names, prepared, &mut front.keys, &mut store, lib).map_err(Front2Refusal::Lower)?);
+            let lowered = lowered.and_then(|()| lower_fn(names, prepared, &mut front.keys, &mut store, lib));
+            match (lowered, left_out.as_deref_mut()) {
+                (Ok(m), _) => {
+                    mains.push(m);
+                    kept.push(lib);
+                }
+                // A survey limited by `Within` (its roots are every fn of some crates, no suite's
+                // rows): a root that does not lower is filed and left out, as a reached fn is.
+                (Err(e), Some(out)) if matches!(starts, Starts::Within { .. }) => {
+                    // By its path, as every reached fn's row is (`fn_shown`), so a census files
+                    // it by its crate; its key only when the names hold no path.
+                    let item = super::item_shown::ItemShown::of_lib(names, lib);
+                    let shown: Box<str> = item.path().map_or_else(|| item.boxed(), Box::from);
+                    out.push((shown, LeftOut::named(Box::from("lower: root"), Front2Refusal::Lower(e))));
+                }
+                (Err(e), _) => return Err(Front2Refusal::Lower(e)),
+            }
         }
+        // The roots that lowered, in the order given: what `mains` is the bodies of.
+        roots = kept;
         let mut lowered = Vec::with_capacity_in(mains.len(), Global);
         for m in mains.iter() {
             lowered.push(m.lowered.view());
@@ -708,7 +830,7 @@ impl<'n> Front2Program<'n> {
         let mut recipes: Vec<super::coroutine_recipes::RecipeRow, Global> = Vec::new_in(Global);
         for (m, scope) in mains.iter().zip(scopes.iter()) {
             let done = check_body(&mut records, m, scope).and_then(|c| {
-                super::coroutine_recipes::recipes_of(&mut records, m, &c, &mut recipes, blaze_own::Alloc::global())
+                super::coroutine_recipes::recipes_of(&mut records, m, &c, &mut recipes, alloc)
                     .map_err(|error| CheckFail::Check { owner: m.owner, error })?;
                 Ok(c)
             });
@@ -761,11 +883,17 @@ impl<'n> Front2Program<'n> {
             };
             walk_from.push(Start { owner: m.owner, first, scope });
         }
-        let mut census = reach_all(&mut records, prepared, walk_from, &also);
+        let within = match starts {
+            Starts::Within { within, .. } => within,
+            Starts::Main | Starts::Tests(_) => super::reach::Within::ALL,
+        };
+        let mut census = reach_all(&mut records, prepared, walk_from, &also, within);
         if census.capped {
             let entry = mains.first().map_or_else(|| String::from("the suite's tests"), |m| fn_shown(&records, m.owner));
-            return Err(Front2Refusal::Capped { entry: entry.into_boxed_str(), queued: census.queued });
+            let report = super::reach::capped_report(&records, &census).into_boxed_str();
+            return Err(Front2Refusal::Capped { entry: entry.into_boxed_str(), queued: census.queued, cap: census.cap, items: census.items, forced: census.forced, report });
         }
+        let reached_by_crate = super::reach::by_crate(&records, &census.fns);
         // Every fn the walk met is checked clean, or the program is refused by its first one
         // that is not: a fn with any diagnostic or gap is never built.
         // Each row's path, or why none is built: decided per fn by `tabled::left_out_or_stop`
@@ -932,7 +1060,7 @@ impl<'n> Front2Program<'n> {
         // would share indices; the records' table never holds a body's type.)
         // A table error names the first root (the crate's root module when a suite has none).
         let table_item = roots.first().copied().unwrap_or_else(|| names.root(0));
-        let mut tys = store.tys.fork_in(Alloc::global()).map_err(|error| Front2Refusal::Lower(BodyError::Table { item: table_item, error }))?;
+        let mut tys = store.tys.fork_in(alloc).map_err(|error| Front2Refusal::Lower(BodyError::Table { item: table_item, error }))?;
         // A bodied fn is lowered again only when its row path is built; no path, or a body that
         // does not lower again, is that ONE fn's refusal (tabled.rs `lowered_row`), decided
         // where every fn's is (`left_out_or_stop`): a survey files it and goes on, a run stops.
@@ -1015,10 +1143,9 @@ impl<'n> Front2Program<'n> {
                 continue;
             }
             by_key.insert(key, fns.len());
-            // A variant's place; a struct's ctor is a member key, placed with its struct (owed).
-            let at = front.keys.library(key).map_or(At { file: 0, place: 0 }, |lib| item_at(names, lib));
+            let at = head_abi::placed_ctor(names, front.keys.library(key));
             let none = Box::<str>::from("");
-            fns.push(Tabled { key, body: None, checked: None, kind: FnKind::Ctor, path: path.into_text(), at, abi: Abi::Rust, nounwind: false, symbol: none, export: None, lits: Literals::default(), intrinsic: None });
+            fns.push(Tabled { key, body: None, checked: None, kind: FnKind::Ctor, path: path.into_text(), at, abi: Abi::Rust, nounwind: false, track_caller: false, symbol: none, export: None, lits: Literals::default(), intrinsic: None });
         }
         let mut langs = [(LangItem::Drop, None); SEAM_LANGS.len()];
         for (slot, item) in langs.iter_mut().zip(SEAM_LANGS) {
@@ -1029,7 +1156,7 @@ impl<'n> Front2Program<'n> {
         rows.extend(mains.iter().map(|m| (m.owner, by_key.get(&m.owner).copied())));
         // The evaluator is kept, not dropped: the build pulls constants at instances' ground
         // arguments from it (`FrontEnd::const_at`, const_at.rs).
-        let program = Front2Program { front, store, tys, buckets, fns, by_key, entry, objects, langs, left, const_values: values, statics, projection_why: core::cell::RefCell::new(None), edges, consts, prepared, start: start2, recipes };
+        let program = Front2Program { front, store, tys, buckets, fns, by_key, entry, objects, langs, left, const_values: values, statics, projection_why: core::cell::RefCell::new(None), edges, consts, prepared, start: start2, recipes, reached_by_crate };
         Ok(Made { program, roots: rows, shapes })
     }
 
@@ -1054,10 +1181,57 @@ impl<'n> Front2Program<'n> {
             spell: scope.spell,
             traits: scope.traits,
             blocks: scope.blocks,
+            path_marks: scope.path_marks,
             fills: RefCell::new(Vec::new_in(Global)),
             gaps: RefCell::new(Vec::new_in(Global)),
+            // Every question here is at an instance's ground arguments, after the body checked
+            // (rustc's post-analysis mode): an opaque is its hidden type, so `Iterator::next`
+            // on a `FlatMap` whose fn returns `impl Iterator` finds the impl.
+            reveal: super::opaque_auto::Reveal::All,
         };
         f(&world)
+    }
+}
+
+/// How the process of the program in `names` starts, decided from its names before any head or
+/// body is read: what [`start_of`] answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartOf {
+    /// An entry crate 0 exports ([`exported_entry`]): `Entry2::Hosted` or `Entry2::CMain`.
+    Exported(super::start::Entry2),
+    /// A Rust program with std: its root's `fn main` through this `#[lang = "start"]` item
+    /// (start.rs [`super::start::rust_start`] then reads `main`'s head).
+    LangStart(LibKey),
+    /// The root's `fn main`, called directly: a program that links no `#[lang = "start"]`.
+    Direct,
+}
+
+/// THE START RULE (one home): an exported entry ([`exported_entry`]); else the root's start
+/// ([`run_entry::RootStart`], from crate 0's `Implicit::std` and root attributes: a
+/// blaze-edition root with no export is refused, [`Front2Refusal::NoHostedStart`]), refined by
+/// what is linked (start.rs `linked_lang_start`: a `#![no_std]` root's `extern crate std`, a
+/// shelf-less program), which `RootStart` does not read. Reads crate 0's items and the linked
+/// crates' lang rows; no head, no body. [`Front2Program`]'s walk and `blaze run`'s choice of
+/// process (run.rs `entry_start`) both take it, so the two cannot disagree. `alloc` holds the
+/// link walk's lists for the call.
+///
+/// Generic over the names source (D124): over the solved names as the solved front asks it,
+/// and over the names RECORDS as `blaze run` asks it before anything is solved. The two give
+/// one answer by construction (tests/run_special.rs asserts it). A fact the source does not
+/// answer is [`Front2Refusal::StartFact`] naming it.
+pub fn start_of<'n, S: super::source::NamesSource<'n>>(names: S, alloc: Alloc<'_>) -> Result<StartOf, Front2Refusal> {
+    if let Some(e) = exported_entry(names)? {
+        return Ok(StartOf::Exported(e));
+    }
+    if names.crate_count() == 0 {
+        return Err(Front2Refusal::NoMain);
+    }
+    let start = run_entry::RootStart::of_names(names).ok_or(Front2Refusal::StartFact { krate: 0, what: "its `Implicit::std` and its root's `#![no_core]`/`#![no_std]`" })?;
+    match start.unexported().map_err(|run_entry::HostedStartMissing| Front2Refusal::NoHostedStart)? {
+        run_entry::Unhosted::LangStart | run_entry::Unhosted::Direct => match super::start::linked_lang_start(names, alloc)? {
+            Some(lang_start) => Ok(StartOf::LangStart(lang_start)),
+            None => Ok(StartOf::Direct),
+        },
     }
 }
 
@@ -1133,6 +1307,9 @@ struct Symbols {
     intrinsic: bool,
     /// `#[rustc_nounwind]`: the fn never unwinds whatever its ABI (program/head_abi.rs).
     nounwind: bool,
+    /// `#[track_caller]`: the fn takes its caller's `Location` as a hidden last parameter
+    /// (the Reference, "The `track_caller` attribute").
+    track_caller: bool,
 }
 
 /// The identifier a signature's lowering declares, `r#` dropped: the symbol `#[no_mangle]`
@@ -1152,7 +1329,7 @@ fn symbols_of<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey, text
     let sig = blaze_lower::lower_signature(text, edition, &mut CrateCfg(atoms), Alloc::global())
         .map_err(|_| refuse(String::from("its signature needs a `cfg` the crate does not answer")))?;
     let v = sig.view();
-    let mut out = Symbols { export: None, link_name: None, intrinsic: false, nounwind: false };
+    let mut out = Symbols { export: None, link_name: None, intrinsic: false, nounwind: false, track_caller: false };
     for &n in v.rows(v.list(head::ATTRS)).map_err(|e| refuse(format!("{e:?}")))? {
         let a = v.attr(n).map_err(|e| refuse(format!("{e:?}")))?;
         let value = || v.text_at(a.args).map(|t| Box::<str>::from(unquote(t))).map_err(|e| refuse(format!("{e:?}")));
@@ -1168,6 +1345,7 @@ fn symbols_of<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey, text
             "link_name" => out.link_name = Some(value()?),
             "rustc_intrinsic" => out.intrinsic = true,
             "rustc_nounwind" => out.nounwind = true,
+            "track_caller" => out.track_caller = true,
             _ => {}
         }
     }
@@ -1302,15 +1480,17 @@ impl FrontEnd for Front2Program<'_> {
         head.c_variadic.then_some(head.inputs.len() as u32)
     }
 
+    fn legacy_const_generics(&self, key: ItemKey) -> &[u32] {
+        self.store.fns.get(&key).map(|head| &head.legacy_const_generics[..]).unwrap_or(&[])
+    }
+
     /// A tabled fn's row holds its ABI; any other fn's is read from its head (head_abi.rs):
     /// a fn left out for its body keeps its signature's ABI. `None` where it has no head or an
     /// ABI the builder spreads no arguments of: the builder's `NoAbi` names the fn, and a
     /// survey's left-out cause is printed beside it (run.rs `callee_refusal`).
     fn fn_abi(&self, key: ItemKey) -> Option<Abi> {
-        if let Some(&i) = self.by_key.get(&key) {
-            return Some(self.fns[i].abi);
-        }
-        head_abi::head_abi(self.front.names, &self.store, key, || Box::from("")).ok().map(|read| read.abi)
+        let tabled = self.by_key.get(&key).map(|&i| self.fns[i].abi);
+        lazy::seam_rules::fn_abi(tabled, self.front.names, &self.store, key)
     }
 
     fn entry(&self) -> Option<usize> {
@@ -1324,29 +1504,34 @@ impl FrontEnd for Front2Program<'_> {
     fn resolve(&self, i: usize, item: ItemKey, args: List, ground: &mut PortableTys<'_>) -> Result<(ItemKey, List), ResolveError> {
         // A call of core's `#[lang = "panic_impl"]` declaration runs the program's one
         // `#[panic_handler]` fn, which takes no generic arguments (front2/panic_entry.rs).
-        if let Some(handler) = super::panic_entry::bound(self.front.names, &self.front.index, &self.store, item, Alloc::global()) {
+        let alloc = self.store.tys.alloc();
+        if let Some(handler) = super::panic_entry::bound(self.front.names, &self.front.index, &self.store, item, alloc) {
             return Ok((handler, List::EMPTY));
         }
         // A call of one of alloc's `extern "Rust"` allocator declarations (`__rust_alloc` ..)
         // runs its default, std's `__rdl_*` fn, which takes no generic arguments
         // (front2/alloc_shim.rs).
-        if let Some(default) = super::alloc_shim::bound(self.front.names, &self.front.index, &self.store, item, Alloc::global()) {
+        if let Some(default) = super::alloc_shim::bound(self.front.names, &self.front.index, &self.store, item, alloc) {
             return Ok((default, List::EMPTY));
         }
         // A call of any other `extern "Rust"` `#[rustc_std_internal_symbol]` declaration
         // (`__rust_start_panic`, `__rust_drop_panic` ..) runs its one definition in the graph,
         // the panic runtime's by the strategy (front2/internal_symbol.rs); no generic arguments.
-        // P1 replaces this with the program's strategy.
-        let panic = blaze_build::Panic::Unwind;
-        if let Some(def) = super::internal_symbol::bound(self.front.names, &self.front.index, &self.store, item, panic, Alloc::global()) {
+        // The program's strategy, read from its inputs (crate 0's cfg, derived from
+        // `UserCrate::panic`: crate::panic_strategy). An unreadable one was refused by name by
+        // the reach walk at the declaration, so no call of it is built to come here.
+        if let Ok(panic) = crate::panic_strategy::of_program(self.front.names)
+            && let Some(def) = super::internal_symbol::bound(self.front.names, &self.front.index, &self.store, item, panic, alloc)
+        {
             return Ok((def, List::EMPTY));
         }
-        let r = self.in_world(i, |w| resolve_instance(w, item, args, ground, Alloc::global()))?;
+        let r = self.in_world(i, |w| resolve_instance(w, item, args, ground, alloc))?;
         Ok((r.item, r.args))
     }
 
     fn selects(&self, i: usize, trait_: ItemKey, ty: PTy, ground: &mut PortableTys<'_>) -> Result<bool, ResolveError> {
-        Ok(self.in_world(i, |w| select_impl(w, trait_, &[ty], ground, Alloc::global()))?.is_some())
+        let alloc = self.store.tys.alloc();
+        Ok(self.in_world(i, |w| select_impl(w, trait_, &[ty], ground, alloc))?.is_some())
     }
 
     fn adt_drop_impl(&self, i: usize, drop_trait: ItemKey, adt: ItemKey, alloc: Alloc<'_>) -> Result<Option<ItemKey>, ResolveError> {
@@ -1358,9 +1543,9 @@ impl FrontEnd for Front2Program<'_> {
         let key = self.fns[i].key;
         // A ctor: a safe Rust fn from its fields to its type, generic over the type's params.
         if let Some(c) = self.store.ctors.get(&key) {
-            let header = tc::FnPtrHeader { abi: tc::Abi::Rust, safety: tc::Safety::Safe };
+            let header = tc::FnPtrHeader::RUST;
             let (inputs, output, types) = (&c.inputs[..], c.output, self.tys.view());
-            return FnSig { parent_count: 0, own_count: c.generics, declared_count: c.generics, self_param: false, header, c_variadic: false, inputs, output, types };
+            return FnSig { parent_count: 0, own_count: c.generics, declared_count: c.generics, self_param: false, header, c_variadic: false, legacy_const_generics: &[], inputs, output, types };
         }
         let f = &self.store.fns[&key];
         FnSig {
@@ -1370,6 +1555,7 @@ impl FrontEnd for Front2Program<'_> {
             self_param: f.self_param,
             header: f.header,
             c_variadic: false,
+            legacy_const_generics: &[],
             inputs: &f.inputs,
             output: f.output,
             types: self.tys.view(),
@@ -1421,7 +1607,7 @@ impl FrontEnd for Front2Program<'_> {
 
     /// By the library's `#[lang]` table, as [`super::langs::find`] reads a marked item.
     fn lang_named(&self, name: &str) -> Option<ItemKey> {
-        self.front.index.lang(name).map(checker_of)
+        self.front.index.lang(name).map(|lib| super::keys::asked_key(self.front.names, lib))
     }
 
     /// The Rust start the program was made with (start.rs [`super::start::Entry2::Rust`]);
@@ -1449,7 +1635,7 @@ impl FrontEnd for Front2Program<'_> {
 
     fn object_trait(&self, t: ItemKey) -> Option<blaze_build::vtable::ObjectTrait<'_>> {
         let o = self.objects.get(&t)?;
-        Some(blaze_build::vtable::ObjectTrait { supers: &o.supers, methods: &o.methods, shape: o.shape })
+        Some(blaze_build::vtable::ObjectTrait { supers: &o.supers, super_args: &o.super_args, methods: &o.methods, shape: o.shape })
     }
 
     /// The fn `name` of the lang trait `trait_` (`Deref::deref`), filed with its trait's head.
@@ -1540,7 +1726,8 @@ impl FrontEnd for Front2Program<'_> {
             *self.projection_why.borrow_mut() = Some(Box::from("the program tables no body to ask in"));
             return Ok(None);
         };
-        let out = self.in_world(i, |w| blaze_typeck::normalize_projection(w, trait_, name, args, ground, Alloc::global()));
+        let alloc = self.store.tys.alloc();
+        let out = self.in_world(i, |w| blaze_typeck::normalize_projection(w, trait_, name, args, ground, alloc));
         if !matches!(out, Ok(Some(_))) {
             // Named for the refusal: the trait, `Self`'s form (an ADT by its path, else the
             // node's kind: `FnDef`, `Closure`, `Slice`..), and the solver's error or none.
@@ -1572,9 +1759,11 @@ impl FrontEnd for Front2Program<'_> {
 
     /// `need` at ground `args` (types of `from`) by the evaluator the program kept: a constant
     /// read by path (`Consts::value_with_args`: a trait's constant selected at `args[0]`), or
-    /// a const block of a body (`Consts::block_value`, under the block's key over the owner's
-    /// text). The evaluator checks any body and makes any impl row the value needs.
+    /// a const block or a promoted borrow of a body (`Consts::body_value`, under its key over
+    /// the owner's text: `ConstNeed::in_body`). The evaluator checks any body and makes any
+    /// impl row the value needs.
     fn const_at(&mut self, need: super::const_at::ConstNeed, from: tc::PTys<'_>, args: &[tc::PTy]) -> Result<DataRecord<Global>, super::const_at::ConstAtWhy> {
+        let alloc = self.store.tys.alloc();
         let mut records = Records {
             names: self.front.names,
             keys: &mut self.front.keys,
@@ -1587,13 +1776,14 @@ impl FrontEnd for Front2Program<'_> {
             consts: None,
         };
         let made = match need {
-            super::const_at::ConstNeed::Item(item) => self.consts.value_with_args(&mut records, self.prepared, item, from, args, Alloc::global()),
-            super::const_at::ConstNeed::Block { owner, block } => {
-                let Some(text) = records.store.fns.get(&owner).map(|h| h.text) else {
+            super::const_at::ConstNeed::Item(item) => self.consts.value_with_args(&mut records, self.prepared, item, from, args, alloc),
+            super::const_at::ConstNeed::Block { .. } | super::const_at::ConstNeed::Promoted { .. } => {
+                let owner = need.item();
+                let in_body = records.store.fns.get(&owner).and_then(|h| need.in_body(h.text));
+                let Some((owner, root, key)) = in_body else {
                     return Err(super::const_at::ConstAtWhy::Eval(super::consts::ConstFail::Body { item: owner, error: super::body::BodyError::NoHead(owner) }));
                 };
-                let key = super::const_at::block_key(owner, block, text);
-                self.consts.block_value(&mut records, self.prepared, owner, block, key, from, args, Alloc::global())
+                self.consts.body_value(&mut records, self.prepared, owner, root, key, from, args, alloc)
             }
         };
         made.map(super::const_at::data_record).map_err(super::const_at::ConstAtWhy::Eval)
@@ -1621,6 +1811,27 @@ impl FrontEnd for Front2Program<'_> {
     /// answer is guessed from its ABI alone).
     fn nounwind(&self, key: ItemKey) -> Option<bool> {
         Some(self.fns.get(*self.by_key.get(&key)?)?.nounwind)
+    }
+
+    /// From the fn's row; a trait impl's method that does not say it itself answers with the
+    /// row of its trait's declaration of the method of its name (`None` when that row is not
+    /// tabled: never guessed `false`).
+    fn track_caller(&self, key: ItemKey) -> Option<bool> {
+        lazy::seam_rules::track_caller(&self.front.keys, &self.store, key, |k| Some(self.fns.get(*self.by_key.get(&k)?)?.track_caller))
+    }
+
+    /// From `owner`'s lowered body (`View::site`: item-relative, or the outermost macro call's
+    /// range) and the solved file the item is written in, by its shown name (seam_rules.rs).
+    fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Option<blaze_build::CallerSite<'_>> {
+        let row = self.fns.get(*self.by_key.get(&owner)?)?;
+        lazy::seam_rules::caller_site(self.front.names, &self.front.keys, owner, row.body.as_ref()?, expr)
+    }
+
+    /// From the item's present first byte in today's text of its file (`NamesSource::item_start`,
+    /// item_grain.rs) and that text's line starts: an edit above the item moves the answer and
+    /// no record (seam_rules.rs).
+    fn source_position(&self, item: ItemKey, site: u32) -> Result<(u32, u32), crate::seam::PositionGap> {
+        lazy::seam_rules::source_position(self.front.names, &self.front.keys, item, site)
     }
 
     /// A static the program reaches: its head's mutability and `#[thread_local]` (statics.rs).

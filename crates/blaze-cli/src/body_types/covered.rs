@@ -43,6 +43,7 @@
 use core::alloc::Allocator;
 use core::fmt;
 
+use blaze_id::ItemKey;
 use blaze_ids::ContentId;
 use blaze_ladder::front2::program::run_entry::{EntryRefusal, root_main};
 use blaze_ladder::front2::project::every_body::Reached;
@@ -50,9 +51,12 @@ use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
 use blaze_ladder::front2::project_records::{ByChain, Listed};
 use blaze_ladder::front2::source::{NamesSource, Records};
 use blaze_own::{AVec, Alloc};
+use blaze_scope::expansion_origins::OriginsView;
+use blaze_scope::items_record::{ItemsRecord, MacroBodyAt};
 use blaze_scope::resolve::At;
-use blaze_surface::{Item, ItemKind};
+use blaze_surface::{Item, ItemIndex, ItemKind};
 
+use crate::names::expansion_texts::ExpansionTexts;
 use crate::work::Record;
 
 /// The body an outline entry stands for: where the bodies its check covers start.
@@ -62,23 +66,159 @@ pub(super) enum Root<'n> {
     Written(Listed<'n>),
     /// The root `fn main` an attribute took: crate 0's root `main`, which its expansion wrote.
     Replaced(Listed<'n>),
+    /// A body an expansion at the entry wrote at module level ([`WrittenBy`]): a free fn, or a
+    /// fn of an impl or trait the expansion wrote. `by`: the macro's path as written at the
+    /// call that wrote it (its origins' `macro_name`).
+    Expanded { listed: Listed<'n>, by: &'n str },
 }
 
 impl<'n> Root<'n> {
     pub(super) fn listed(self) -> Listed<'n> {
         match self {
-            Root::Written(l) | Root::Replaced(l) => l,
+            Root::Written(l) | Root::Replaced(l) | Root::Expanded { listed: l, .. } => l,
         }
     }
 
     /// The first segment of a covered body's path ([`Shown`]): the entry's name, or for a
-    /// replaced `main` the expansion that wrote it.
+    /// replaced `main` the expansion that wrote it. An expanded root's is [`Expanded`]'s words,
+    /// made by the caller (they hold the body's name).
     pub(super) fn label<'t>(self, name: &'t str) -> &'t str {
         match self {
             Root::Written(_) => name,
             Root::Replaced(_) => "{the expansion that took `main`}",
+            Root::Expanded { .. } => "{an expansion at this item}",
         }
     }
+}
+
+/// An expanded root's label ([`Root::label`]): the expansion by its macro, then the body by
+/// its name, `{the expansion of `write_f!`}::f`; a member, `{..}::clone`. What a finding in
+/// expanded code names, at the call (module doc, "WHERE A FINDING GOES").
+pub(super) struct Expanded<'n> {
+    pub(super) records: &'n Records<'n>,
+    pub(super) root: Root<'n>,
+}
+
+impl fmt::Display for Expanded<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Root::Expanded { listed, by } = self.root else { return f.write_str(self.root.label("")) };
+        let by = by.trim_start_matches("::").trim_end_matches('!');
+        let name = match listed.body {
+            BodyRef::Free(key) => NamesSource::name_of(self.records, key).unwrap_or("_"),
+            BodyRef::Member { name, .. } => name,
+        };
+        write!(f, "{{the expansion of `{by}!`}}::{name}")
+    }
+}
+
+/// A body of the owner's crate that a macro wrote at module level, and the file entry its call
+/// (or its outermost caller) is at: the entry whose check covers it (D122: a macro-written
+/// item's place is its expansion's). `top` is `Err` when the call's origins do not say it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct WrittenBy<'n> {
+    pub(super) listed: Listed<'n>,
+    /// The call whose expansion wrote it (the innermost).
+    pub(super) call: ItemKey,
+    /// That call's macro, as written.
+    pub(super) by: &'n str,
+    pub(super) top: Result<(u32, ItemIndex), &'static str>,
+}
+
+/// The key whose place says where a listed body is written: a free fn's own, a member's
+/// container's (an impl or trait a macro wrote writes its members).
+fn placed_by(body: BodyRef<'_>) -> ItemKey {
+    match body {
+        BodyRef::Free(key) => key,
+        BodyRef::Member { container, .. } => container,
+    }
+}
+
+/// Walks the call `call` of a crate whose expansion texts are `texts` up to the file entry it
+/// is at: its own origins' calling text when that is a file, else its caller's. `each` is
+/// given each call's macro path as written, innermost first. Bounded by the crate's count of
+/// calls: a chain longer than it is a loop, refused by name. The same walk as heads.rs
+/// `top_of` (lane R8's), which keeps no names: one of them goes when the two lanes are joined.
+pub(super) fn callers<'n>(texts: &ExpansionTexts<'n>, call: ItemKey, each: &mut dyn FnMut(&'n str)) -> Result<(u32, ItemIndex), &'static str> {
+    let mut at = call;
+    for _ in 0..=texts.len() {
+        let bytes = match texts.origins(at) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Err("a macro call's expansion holds no text in its crate's record (names/expansion_texts.rs)"),
+            Err(_) => return Err("a macro call's expansion origins run past their section (names/expansion_texts.rs)"),
+        };
+        if bytes.is_empty() {
+            return Err("the expansion that wrote it keeps no origins (blaze-scope expansion_origins.rs `Rewritten`), so the entry its call is at is not known");
+        }
+        let view = OriginsView::open(bytes).map_err(|_| "a macro call's expansion origins do not open (blaze-scope expansion_origins.rs)")?;
+        each(view.macro_name);
+        match view.text {
+            At::File(file) => return Ok((file, view.item)),
+            At::Expansion(up) => at = up,
+        }
+    }
+    Err("a macro call's origins name its callers in a loop (body_types/covered.rs `callers`)")
+}
+
+/// Every listed body of crate 0 a macro wrote at module level, each with the entry its call is
+/// at ([`WrittenBy`]): by call, each call's chain walked once. A fn of an impl written in a
+/// file that a macro call inside the impl block wrote is not here (its container's place is
+/// the file): NAMED, not covered yet (heads.rs says the same of its head).
+pub(super) fn written_by<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n>, listed: &[Listed<'n>], alloc: Alloc<'n>) -> AVec<'n, WrittenBy<'n>> {
+    let mut calls: AVec<'n, (ItemKey, Listed<'n>)> = AVec::new_in(alloc);
+    for l in listed.iter().filter(|l| l.entry.is_none()) {
+        if let Some(At::Expansion(call)) = NamesSource::place_of(records, placed_by(l.body)).map(|p| p.at) {
+            calls.push((call, *l));
+        }
+    }
+    calls.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.body.cmp(&b.1.body)));
+    let mut out: AVec<'n, WrittenBy<'n>> = AVec::with_capacity_in(calls.len(), alloc);
+    let mut last: Option<(ItemKey, &'n str, Result<(u32, ItemIndex), &'static str>)> = None;
+    for (call, l) in calls.iter().copied() {
+        let (by, top) = match last {
+            Some((was, by, top)) if was == call => (by, top),
+            _ => {
+                let mut first: Option<&'n str> = None;
+                let top = callers(texts, call, &mut |name| {
+                    first.get_or_insert(name);
+                });
+                let by = first.unwrap_or("?");
+                last = Some((call, by, top));
+                (by, top)
+            }
+        };
+        out.push(WrittenBy { listed: l, call, by, top });
+    }
+    out
+}
+
+/// The files of crate 0 that define a declarative macro by a name `called` holds (a path's
+/// last segment), each given to `each` (once a definition: the caller's read list keeps one
+/// read a name), for the `Surface` reads of an entry whose
+/// expansions they wrote: an edit of such a macro's body in another file moves that file's
+/// `Surface` (it holds a macro's tokens: blaze-file-items `Outline::surface`), and with it the
+/// entry's check. By name, not by resolution: a macro of that name the call did not use costs
+/// a rerun, never a stale check. A macro defined in an expansion, or in another crate, is not
+/// here: another crate's is under its `CrateScope` and `MacroModule` reads.
+pub(super) fn rules_files(items: &ItemsRecord<'_>, called: &[&str], each: &mut dyn FnMut(u32)) {
+    for i in 0..items.macros() {
+        let Ok(Some(row)) = items.macro_at(i) else { continue };
+        if !called.iter().any(|c| last_segment(c) == row.name) {
+            continue;
+        }
+        let span = match row.body {
+            MacroBodyAt::Rules(span) | MacroBodyAt::Macro2 { body: span, .. } => span,
+            _ => None,
+        };
+        if let Some(At::File(file)) = span.map(|s| s.at) {
+            each(file);
+        }
+    }
+}
+
+/// A macro path's last segment: `write_f` of `crate::write_f`, `::std::main`'s `main`.
+fn last_segment(path: &str) -> &str {
+    let path = path.trim_end_matches('!').trim();
+    path.rsplit("::").next().unwrap_or(path).trim()
 }
 
 /// Why an entry with a fn body has no root: each a `TYPES_NOT_CHECKED` note naming the item.
@@ -94,6 +234,18 @@ pub(super) enum NoRoot {
     /// The root `main` front2 finds is written in a file, yet not listed at this entry's chain:
     /// the chain index and the item rows disagree.
     RootMainElsewhere { file: u32 },
+}
+
+impl NoRoot {
+    /// The fixed phrase that groups the items with this reason (not_checked/items.rs).
+    pub(super) fn cause(&self) -> &'static str {
+        match self {
+            NoRoot::NoBody => "front2 lists no body for it",
+            NoRoot::NoRootMain(_) => "the root's `fn main` was replaced by an attribute and front2 finds no root `main`",
+            NoRoot::RootMainUnplaced => "the root's `fn main` was replaced by an attribute and the root `main` has no place in the records",
+            NoRoot::RootMainElsewhere { .. } => "the root's `fn main` was replaced by an attribute and the root `main` is listed at another item",
+        }
+    }
 }
 
 impl fmt::Display for NoRoot {

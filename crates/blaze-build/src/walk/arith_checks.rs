@@ -31,16 +31,16 @@
 //! bounds check's, and called through [`Walk::call_unwinding`], the one path a call that can
 //! unwind takes. Never a trap instruction: a trap neither unwinds nor says which check failed.
 //!
-//! NOT BUILT: `#[track_caller]`'s location (the pinned entry points are `#[track_caller]`;
-//! walk.rs refuses `caller_location` by name, so a panic's message has no site yet).
+//! The pinned entry points are `#[track_caller]`: each call passes the location of the
+//! expression whose check failed, or the enclosing tracked fn's own (walk/track_caller.rs).
+//!
 //! The literal exception for unary `-` (`-128i8` is no overflow): the caller (walk.rs
 //! `Task::Unary`) checks no negation whose operand is a literal expression, under any
 //! parentheses, so `-128i8` is the wrapped `-(128 as i8)`, which is `MIN`, as Rust has it.
 
 use core::alloc::Allocator;
 
-use blaze_lir::builder::Variadic;
-use blaze_lir::func::{Conv, RefKind};
+use blaze_lir::func::RefKind;
 use blaze_lir::{Flags, IntCond, Op, Ty, Value};
 use blaze_typeck::{BinOp, ExprId, List};
 
@@ -116,10 +116,13 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let fail = self.create();
         self.br(failed, (fail, &[]), (ok, &[]));
         self.begin(fail);
-        let place = self.ref_place(Instance { item, args: List::EMPTY });
+        // The pinned entry points are `#[track_caller]`: the location is passed last
+        // (walk/track_caller.rs), the place of the expression whose check failed.
+        let callee = Instance { item, args: List::EMPTY };
+        let (sig, values) = self.lang_call_sig(Some(e), callee, &[], &[])?;
+        let place = self.ref_place(callee);
         let reference = self.b.reference(RefKind::Func, place);
-        let sig = self.b.sig(Conv::C, Variadic::No, &[], &[]);
-        self.call_unwinding(Callee::Direct(reference), sig, &[])?;
+        self.call_unwinding(Callee::Direct(reference), sig, &values)?;
         self.b.unreachable();
         self.begin(ok);
         Ok(())

@@ -24,9 +24,13 @@ use blaze_surface::{CallRole, DeclsBuilder, SurfaceError};
 use crate::facts::ScopeFacts;
 use crate::{AmbiguityKind, CallShape, Def, DefKind, Edition, ExternTarget, Namespace, Origin, PathKind, Rename, Unresolved, UseForm, Visibility};
 
+// D116: the old scopes against the records at module grain, name by name.
+mod agree;
 mod decide;
 mod deps;
 mod early;
+// D116: a module's tables of links and its `Imports`, from what the core loaded and decided.
+mod made;
 mod switch;
 #[cfg(test)]
 mod tests;
@@ -38,8 +42,11 @@ mod write;
 use early::EarlyAmbiguity;
 
 #[cfg(test)]
-pub(crate) use world::solve_world;
+pub(crate) use world::{links_agree_world, solve_world};
 
+pub use agree::{Agreed, Answer, AnswersDiffer, Asked, Disagreement};
+pub(crate) use made::Tables;
+pub use made::TablesError;
 pub(crate) use switch::solve_and_write;
 pub use decide::{DecideCheck, DecideError};
 pub use switch::{MOST_ROUNDS, Unwritten};
@@ -2473,30 +2480,45 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// attributes"). A derive not grown yet is waited for (its helpers are read as it expands,
     /// [`Cells::expand_call`], before it grows); under a stall's guess its guessed outcome is
     /// taken, and a derive whose helpers are not read yet then gives none. Reads only the
-    /// derives of the call's own item (`derives_on`), never the module's calls.
+    /// derives of the call's own item (`derives_on`), never the module's calls; then, when the
+    /// fragment is the output of an attribute call on an item, the derives written before that
+    /// call on that item, and so up the fragments: rustc's `Scope::DeriveHelpers` walks the
+    /// parent expansions, so a helper the taking macro wrote back (derive_where's
+    /// `#[derive_where(..)]` under its `derive_where_visited`, reth-codecs' `#[reth_codecs(..)]`
+    /// under `add_arbitrary_tests`) stays inert in its output.
     fn derive_helper(&self, i: ItemId, at: CallAt, name: N, guess: Option<&Guess<'a>>) -> Step<bool> {
         let Some(&on) = self.call_on.get(&i) else { return Step::Done(false) };
-        let Some(derives) = self.derives_on.get(&(at.frag, on)) else { return Step::Done(false) };
-        for &d in derives.iter() {
-            let it = &self.items[d as usize];
-            if it.pos >= at.pos {
-                continue;
-            }
-            let outcome = if it.grown {
-                it.outcome
-            } else {
-                match guess.and_then(|g| g.items.get(&d)) {
-                    Some(&o) => o,
-                    None => return Step::Wait(Node::Item(d)),
+        let (mut frag, mut on, mut before) = (at.frag, on, at.pos);
+        loop {
+            for &d in self.derives_on.get(&(frag, on)).map_or(&[][..], |ds| &ds[..]) {
+                let it = &self.items[d as usize];
+                if it.pos >= before {
+                    continue;
                 }
-            };
-            if let Some(Outcome::Called(def)) = outcome
-                && self.helpers.get(&def.key).is_some_and(|h| h.binary_search(&name).is_ok())
-            {
-                return Step::Done(true);
+                let outcome = if it.grown {
+                    it.outcome
+                } else {
+                    match guess.and_then(|g| g.items.get(&d)) {
+                        Some(&o) => o,
+                        None => return Step::Wait(Node::Item(d)),
+                    }
+                };
+                if let Some(Outcome::Called(def)) = outcome
+                    && self.helpers.get(&def.key).is_some_and(|h| h.binary_search(&name).is_ok())
+                {
+                    return Step::Done(true);
+                }
             }
+            let Some((up, pos)) = self.frags[frag as usize].up else { return Step::Done(false) };
+            let slots = &self.frags[up as usize].slots;
+            let Ok(k) = slots.binary_search_by_key(&pos, |s| s.0) else { return Step::Done(false) };
+            let Slot::Call(call) = slots[k].1 else { return Step::Done(false) };
+            if self.items[call as usize].call.is_none_or(|c| c.shape != CallShape::Attr) {
+                return Step::Done(false);
+            }
+            let Some(&up_on) = self.call_on.get(&call) else { return Step::Done(false) };
+            (frag, on, before) = (up, up_on, pos);
         }
-        Step::Done(false)
     }
 
     /// A plain path's first segment `name` (or a one-segment path's leaf) in `ns` at `m`, asked

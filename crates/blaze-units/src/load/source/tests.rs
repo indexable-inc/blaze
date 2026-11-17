@@ -1,12 +1,11 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
 
 use blaze_format::SchemaHash;
 use blaze_ids::ContentId;
 use blaze_query::{Cancelled, Config, Cx, Database, MemTree, Query, QueryKind};
 use blaze_resolve::{
-    Dependency, MemRegistry, PackageId, QueryKind as Matching, Registry, SourceId,
+    Dependency, Lookup, MemRegistry, PackageId, QueryKind as Matching, Registry, SourceId,
 };
 use blaze_vfs::{View, ViewId};
 use serde::{Deserialize, Serialize};
@@ -155,13 +154,9 @@ impl Query for IndexQuery {
         let dep = Dependency::parse(name.as_str(), Some(req.as_str()), SourceId::crates_io())
             .expect("a dependency");
         let index = Index::new(&sources, cx, MemRegistry::new());
-        let found = {
-            let mut query = std::pin::pin!(index.query_vec(&dep, Matching::Exact));
-            let mut context = Context::from_waker(Waker::noop());
-            let Poll::Ready(found) = query.as_mut().poll(&mut context) else {
-                panic!("an index query waits for nothing")
-            };
-            found.expect("the query")
+        let Lookup::Answered(found) = index.query_vec(&dep, Matching::Exact).expect("the query")
+        else {
+            panic!("the index answers each query from the files it holds or notes as fetches")
         };
         let needs = index.finish()?;
         let mut found: Vec<String> = found

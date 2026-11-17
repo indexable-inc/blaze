@@ -58,7 +58,9 @@ impl<'a> Failed<'a> {
         let mut expansion = Expansion::new_in(alloc);
         expansion.notes.extend_from_slice(self.notes);
         expansion.diagnostics.push(self.diagnostic);
-        expansion.write_record(alloc)
+        expansion
+            .write_record(&crate::OriginMaps::NONE, alloc)
+            .expect("a failure's expansion holds no token, so no origin needs a source")
     }
 
     /// A failure read back from [`Failed::write_record`]'s bytes (16-aligned, as every

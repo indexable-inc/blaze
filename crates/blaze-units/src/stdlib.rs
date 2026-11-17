@@ -17,7 +17,7 @@ pub mod target;
 #[cfg(test)]
 mod tests;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::ContentId;
 use blaze_query::{Cancelled, Cx, Database, Query, QueryKind};
 use std::alloc::Global;
@@ -223,8 +223,8 @@ fn checked(ask: &ForeignAsk, graph: &StdGraph) -> Result<(), String> {
             graph.units.len()
         ));
     }
-    let mut names: HashMap<&str, &str, Global> =
-        HashMap::with_capacity_in(graph.packages.len(), Global);
+    let mut names: Map<&str, &str, FixedState, Global> =
+        Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(graph.packages.len()) });
     names.extend(graph.packages.iter().map(|it| (it.id.as_str(), it.name.as_str())));
     let name_of = |pkg_id: &str| names.get(pkg_id).copied();
     for unit in &graph.units {

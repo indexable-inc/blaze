@@ -15,11 +15,14 @@
 //!
 //! [`Handle`] runs one [`Loop`] on blaze-core's native driver on a thread of its own, for
 //! callers that have no loop: askers on any thread post to its inbox and wake its driver
-//! ([`blaze_core::Waker`]); each [`Answer`] is read as a future any executor polls, or on the
-//! calling thread through [`crate::mailbox::block_on`] (blaze-core's deadline wait). Taking
-//! the next event says the last piece of the body was taken ([`Client::consumed`]), so a slow
-//! asker holds the transfer back rather than the driver buffering it; dropping an answer
-//! before its end cancels the request ([`Client::cancel`]), closing its connection.
+//! ([`blaze_core::Waker`]); [`serve`] is that thread's loop, written once as a plain blocking
+//! loop: drain the inbox, step the machine, submit its effects, wait on the driver to the
+//! machine's deadline, hand the completions back. An asker reads its [`Answer`] with
+//! [`Answer::next`], one timed receive on blaze-core's channel ([`crate::mailbox::answer`]):
+//! no future, waker or executor is anywhere in it. Taking the next event says the last piece
+//! of the body was taken ([`Client::consumed`]), so a slow asker holds the transfer back
+//! rather than the driver buffering it; dropping an answer before its end cancels the request
+//! ([`Client::cancel`]), closing its connection.
 //!
 //! TLS stays the client's: the driver moves bytes.
 //!
@@ -42,9 +45,9 @@
 //! # The waits
 //!
 //! The driver's one wait is [`Driver::poll`], to the client's next deadline (armed as a timer)
-//! or the next completion or wake. An asker's wait on a [`Handle`] goes through
-//! [`crate::mailbox::block_on`], named by what it waits for. Every request ends by the client's
-//! deadlines (its timeout), so no asker's wait is open.
+//! or the next completion or wake. An asker's wait on a [`Handle`] is a receive on blaze-core's
+//! channel that takes how long it may wait and ends in [`Unanswered::TimedOut`] naming what
+//! it waited for; every request also ends by the client's deadlines (its timeout).
 
 use std::{
     alloc::Global,
@@ -59,12 +62,18 @@ use std::{
     time::Duration,
 };
 
-use blaze_core::{self as effects, Address, Conn, Done, Driver, Effect, Tag};
+use blaze_core::{
+    self as effects, Address, Conn, Done, Driver, Effect, Tag,
+    chan::{self, Receiver, Sender},
+};
 
 use crate::{
     Client, Completion, ConnId, Error, Event, Io, Kind, Request, RequestId,
-    mailbox::{self, Blocked, Rx, Tx},
+    mailbox::{self, Unanswered},
 };
+
+/// What [`Answer::next`] says it waits for.
+pub const NEXT_EVENT: &str = "the next event of an HTTP request";
 
 /// The most bytes one receive reads: enough for a TLS record's worth of an answer many times
 /// over, and the bound of the buffer each receive holds.
@@ -580,8 +589,8 @@ pub enum Fetched {
 
 /// What an asker of a [`Handle`] gets its request's events by.
 enum Asker {
-    Events(Tx<Event>),
-    Collect { key: u64, to: Tx<(u64, Fetched)>, head: Option<(String, u16, Vec<(String, String)>)>, body: Vec<u8> },
+    Events(Sender<Event>),
+    Collect { key: u64, to: Sender<(u64, Fetched)>, head: Option<(String, u16, Vec<(String, String)>)>, body: Vec<u8> },
 }
 
 /// What a [`Handle`]'s askers post to its thread.
@@ -590,7 +599,7 @@ enum Message {
     Ask { id: RequestId, request: Request, within: Option<Duration>, asker: Asker },
     Consumed { id: RequestId, bytes: usize },
     Cancel { id: RequestId },
-    Sleep { after: Duration, woke: Tx<()> },
+    Sleep { after: Duration, woke: Sender<()> },
     Stop,
 }
 
@@ -618,7 +627,7 @@ pub struct Handle {
 impl Handle {
     /// Starts the thread driving `client`, at most `most` requests in it at once.
     pub fn spawn(client: Client, most: usize) -> std::io::Result<Handle> {
-        let (ready_to, ready) = mailbox::channel::<std::io::Result<Arc<Inbox, Global>>>(Some(1));
+        let (ready_to, ready) = chan::bounded::<std::io::Result<Arc<Inbox, Global>>>(1);
         std::thread::Builder::new().name("blaze-http h1".to_owned()).spawn(move || {
             // No file effect is asked: the root is never read.
             let mut driver = match effects::native(Path::new("/"), 1) {
@@ -639,10 +648,10 @@ impl Handle {
             drop(ready_to);
             serve(&mut driver, Loop::new(client, 0, most), &inbox);
         })?;
-        let inbox = match mailbox::block_on("blaze-http's driver thread to make its driver", Some(START_WAIT), ready.recv()) {
+        let inbox = match mailbox::answer("blaze-http's driver thread to make its driver", &ready, START_WAIT) {
             Ok(Some(made)) => made?,
             Ok(None) => return Err(std::io::Error::other("blaze-http's driver thread ended before it made its driver")),
-            Err(blocked) => return Err(std::io::Error::other(blocked.to_string())),
+            Err(unanswered) => return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, unanswered)),
         };
         let owner = Owner { inbox, ids: AtomicU64::new(0) };
         Ok(Handle { owner: Arc::new_in(owner, Global) })
@@ -655,34 +664,36 @@ impl Handle {
     /// Starts `request`: its events come from the [`Answer`].
     pub fn ask(&self, request: Request) -> Answer {
         let id = self.id();
-        let (events, from_loop) = mailbox::channel(None);
+        // Not bounded: the body's pieces in it are held to the client's window
+        // ([`crate::WINDOW`]) ahead of what the asker took.
+        let (events, from_loop) = chan::unbounded();
         self.owner.inbox.post(Message::Ask { id, request, within: None, asker: Asker::Events(events) });
         Answer { id, from_loop, inbox: Arc::clone(&self.owner.inbox), taken: 0, over: false }
     }
 
     /// Starts `request`, collected whole on the driver's thread and handed to `to` as `key`'s
-    /// [`Fetched`], [`Fetched::TimedOut`] once `within` passes first.
-    pub fn fetch(&self, request: Request, within: Duration, key: u64, to: &Tx<(u64, Fetched)>) {
+    /// [`Fetched`], [`Fetched::TimedOut`] once `within` passes first. `to` is an unbounded
+    /// channel (`blaze_core::chan::unbounded`): the driver's thread never waits to hand over.
+    pub fn fetch(&self, request: Request, within: Duration, key: u64, to: &Sender<(u64, Fetched)>) {
         let id = self.id();
         let asker = Asker::Collect { key, to: to.clone(), head: None, body: Vec::new_in(Global) };
         self.owner.inbox.post(Message::Ask { id, request, within: Some(within), asker });
     }
 
-    /// A future that is ready once `after` has passed on the driver's clock, or the driver
-    /// stopped.
-    pub fn sleep(&self, after: Duration) -> impl Future<Output = ()> + Send + 'static {
-        let (woke, waking) = mailbox::channel(Some(1));
+    /// A timer on the driver's clock: the receiver gets `()` once `after` has passed there, and
+    /// reads its end ([`blaze_core::chan::RecvTimeoutError::Disconnected`]) if the driver stopped first. The
+    /// caller's receive on it takes its own bound, as every wait does.
+    pub fn sleep(&self, after: Duration) -> Receiver<()> {
+        let (woke, waking) = chan::bounded(1);
         self.owner.inbox.post(Message::Sleep { after, woke });
-        async move {
-            _ = waking.recv().await;
-        }
+        waking
     }
 }
 
 /// One request's events, as they come.
 pub struct Answer {
     id: RequestId,
-    from_loop: Rx<Event>,
+    from_loop: Receiver<Event>,
     inbox: Arc<Inbox, Global>,
     /// The bytes of the last piece of the body handed out, said taken at the next ask.
     taken: usize,
@@ -691,25 +702,22 @@ pub struct Answer {
 }
 
 impl Answer {
-    /// The request's next event; `None` when the driver stopped first (its handle dropped, or
-    /// its thread panicked), which no deadline of the client's can then end.
-    pub async fn next(&mut self) -> Option<Event> {
+    /// The request's next event, waiting at most `within` on this thread ([`NEXT_EVENT`] in
+    /// [`Unanswered::TimedOut`] once it passes; the request goes on, and the next call waits
+    /// again); `Ok(None)` when the driver stopped first (its handle dropped, or its thread
+    /// panicked), which no deadline of the client's can then end.
+    pub fn next(&mut self, within: Duration) -> Result<Option<Event>, Unanswered> {
         if self.taken > 0 {
             let bytes = std::mem::take(&mut self.taken);
             self.inbox.post(Message::Consumed { id: self.id, bytes });
         }
-        let event = self.from_loop.recv().await?;
+        let Some(event) = mailbox::answer(NEXT_EVENT, &self.from_loop, within)? else { return Ok(None) };
         match &event {
             Event::Body { bytes, .. } => self.taken = bytes.len(),
             Event::Done { .. } | Event::Failed { .. } => self.over = true,
             Event::Head { .. } => {}
         }
-        Some(event)
-    }
-
-    /// [`Answer::next`] on this thread: the client's deadlines bound the wait.
-    pub fn wait(&mut self) -> Result<Option<Event>, Blocked> {
-        mailbox::block_on("the next event of an HTTP request (bounded by the client's timeout)", None, self.next())
+        Ok(Some(event))
     }
 }
 
@@ -725,7 +733,7 @@ impl Drop for Answer {
 /// askers, until the handle is dropped.
 fn serve(driver: &mut impl Driver, mut core: Loop, inbox: &Inbox) {
     let mut askers: BTreeMap<RequestId, Asker> = BTreeMap::new_in(Global);
-    let mut sleeps: BTreeMap<u64, Tx<()>> = BTreeMap::new_in(Global);
+    let mut sleeps: BTreeMap<u64, Sender<()>> = BTreeMap::new_in(Global);
     let mut next_sleep = 0u64;
     let mut messages = Vec::new_in(Global);
     let mut effects = Vec::new_in(Global);
@@ -773,14 +781,15 @@ fn serve(driver: &mut impl Driver, mut core: Loop, inbox: &Inbox) {
 }
 
 /// Hands `told` to whoever waits for it.
-fn tell(core: &mut Loop, askers: &mut BTreeMap<RequestId, Asker>, sleeps: &mut BTreeMap<u64, Tx<()>>, told: Told) {
+fn tell(core: &mut Loop, askers: &mut BTreeMap<RequestId, Asker>, sleeps: &mut BTreeMap<u64, Sender<()>>, told: Told) {
     let id = match &told {
         Told::Event(event) => event.request(),
         Told::TimedOut(id) => *id,
         Told::Woke(key) => {
             if let Some(woke) = sleeps.remove(key) {
-                // A sleeper that went away has nothing to wake.
-                _ = woke.send(());
+                // A sleeper that went away has nothing to wake; its one slot is empty, so the
+                // loop's thread never waits here.
+                _ = woke.try_send(());
             }
             return;
         }
@@ -811,8 +820,13 @@ fn tell(core: &mut Loop, askers: &mut BTreeMap<RequestId, Asker>, sleeps: &mut B
                 Told::Woke(_) => None,
             };
             if let Some(fetched) = fetched {
-                // A reader that is gone wants nothing more.
-                _ = to.send((*key, fetched));
+                match to.try_send((*key, fetched)) {
+                    // A reader that is gone wants nothing more.
+                    Ok(()) | Err(chan::TrySendError::Disconnected(_)) => {}
+                    Err(chan::TrySendError::Full(_)) => panic!(
+                        "blaze-http's driver: the channel {id:?}'s answer goes to is full; `Handle::fetch` takes an unbounded one (`chan::unbounded`), so the driver's thread never waits on an asker"
+                    ),
+                }
             }
         }
     }

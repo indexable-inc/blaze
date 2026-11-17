@@ -78,6 +78,53 @@ mod threads {
         }
     }
 
+    /// D126: `new(MapOpts)` makes what `new_in` made: with `capacity: None` no shard has a
+    /// table until its first insert, with `Some(n)` every shard has one now; after the same
+    /// inserts either holds what `new_in`'s holds. A set likewise.
+    #[test]
+    fn new_with_options_is_new_in() {
+        use blaze_sim::Config;
+
+        use crate::{FixedState, SharedMapOpts, SharedSetOpts};
+
+        blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 128 }), |tape| {
+            let room = if tape.coin("reserve") { Some(tape.index(2_000, "capacity")) } else { None };
+            let new: SharedMap<u64, u64, Global> = SharedMap::new(SharedMapOpts {
+                name: "test.new",
+                hasher: FixedState,
+                alloc: Global,
+                capacity: room,
+            });
+            let made_now = new.shards.iter().all(|shard| !shard.table.load(Ordering::Relaxed).is_null());
+            let none_now = new.shards.iter().all(|shard| shard.table.load(Ordering::Relaxed).is_null());
+            match room {
+                None | Some(0) => assert!(none_now, "no table before the first insert"),
+                Some(_) => assert!(made_now, "every shard's table made for {room:?}"),
+            }
+            let old: SharedMap<u64, u64, Global> = SharedMap::new_in("test.old", Global);
+            let set: super::SharedSet<u64, Global> = super::SharedSet::new(SharedSetOpts {
+                name: "test.set",
+                hasher: FixedState,
+                alloc: Global,
+                capacity: room,
+            });
+            let (pinned_new, pinned_old, pinned_set) = (new.pin(), old.pin(), set.pin());
+            let range = 1 + tape.below(3_000, "range");
+            for step in 0..tape.below(if cfg!(miri) { 40 } else { 600 }, "inserts") {
+                let key = tape.below(range, "key");
+                let (a, b) = (pinned_new.insert(key, step).copied(), pinned_old.insert(key, step).copied());
+                assert_eq!(a, b, "key {key}");
+                pinned_set.insert(key);
+            }
+            assert_eq!(new.len(), old.len());
+            assert_eq!(set.len(), old.len());
+            for key in 0..range {
+                assert_eq!(pinned_new.get(&key), pinned_old.get(&key), "key {key}");
+                assert_eq!(pinned_set.get(&key).is_some(), pinned_old.get(&key).is_some(), "set key {key}");
+            }
+        });
+    }
+
     /// `get_many` and `get_many_into` answer what `get` answers of each key, duplicates,
     /// absent and removed keys among them, past the slice form's batch of 16; a set's too.
     #[test]

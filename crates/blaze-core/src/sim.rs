@@ -92,7 +92,7 @@ pub mod seeds;
 
 use std::{cell::Cell, mem, path::PathBuf, time::Duration};
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_mem::{Slab, Tag as MemTag};
 use std::alloc::Global;
 
@@ -230,7 +230,7 @@ struct SimFile {
     stamps: Vec<u64>,
     /// Each barrier of the file ([`Effect::Barrier`]) no sync has covered yet: how many of
     /// `ops` it covers, and the epoch it completed in. A crash that keeps a change of a later
-    /// epoch, of any file, keeps the changes it covers.
+    /// epoch, of any file's bytes or of a name ([`NameChange`]), keeps the changes it covers.
     barriers: Vec<(usize, u64)>,
     /// The sectors of it that hold blocks ([`SECTOR`] each, by index): what a write covered,
     /// less what a cut dropped. A cut that grows the file, and every byte no write covered,
@@ -292,6 +292,61 @@ impl Named {
             Named::Put { file, .. } | Named::Gone { file, .. } => parent_of(file),
             Named::Moved { to, .. } => parent_of(to),
             Named::MadeDir { dir } | Named::RemovedDir { dir } => parent_of(dir),
+        }
+    }
+}
+
+/// A change of a name in [`Sim::names`], and the epoch it was made in: how many barriers had
+/// completed then, as a file's change is stamped ([`SimFile::stamps`]). A barrier orders what
+/// it covers before every write asked for after it, a name's change included (the contract of
+/// [`Effect::Barrier`]: "the bytes ordered before the name"), so a crash that keeps this
+/// change keeps whole what every barrier of an earlier epoch covers ([`keep_ordered`]).
+#[derive(Debug)]
+struct NameChange {
+    named: Named,
+    epoch: u64,
+}
+
+/// The barriers' promise on one crash's cut, the one home of the rule that [`Sim::crash_cut`]
+/// draws by and `sim/every_cut.rs` enumerates by: a change kept whole or in part, of any file
+/// or name, of a later epoch than a barrier keeps whole what the barrier covers, which may in
+/// turn be of an epoch later than another's; in rounds, until nothing moves.
+///
+/// `files` is each file's stamps (every change stamped, [`Sim::stamp_epochs`]) and barriers,
+/// in the order of `cut`, which is each file's (changes kept whole, changes landed up to). A
+/// change that may have landed in part is on the disk in part: it counts as kept, whatever its
+/// sectors draw. `names` is the newest epoch of the changes of names the crash does not undo,
+/// none where it undoes them all or there are none. `planted`
+/// ([`host::Plant::BarriersNotKept`]): nothing is kept for a barrier.
+fn keep_ordered(files: &[(&[u64], &[(usize, u64)])], names: Option<u64>, planted: bool, cut: &mut [(usize, usize)]) {
+    if planted {
+        return;
+    }
+    // Bounded: each round that moves raises some file's whole changes to what one of its
+    // barriers covers, which no later round lowers.
+    let rounds: usize = files.iter().map(|(_, barriers)| barriers.len()).sum();
+    for _ in 0..=rounds {
+        let mut newest = names;
+        for ((stamps, _), (kept, upto)) in files.iter().zip(cut.iter()) {
+            let reach = (*upto).max(*kept).min(stamps.len());
+            if let Some(most) = stamps[..reach].iter().max().copied() {
+                newest = Some(newest.map_or(most, |it| it.max(most)));
+            }
+        }
+        let Some(newest) = newest else { break };
+        let mut forced = false;
+        for ((_, barriers), (kept, upto)) in files.iter().zip(cut.iter_mut()) {
+            let covered =
+                barriers.iter().filter(|(_, epoch)| *epoch < newest).map(|(covers, _)| *covers).max().unwrap_or(0);
+            if covered > *kept {
+                *kept = covered;
+                // What a barrier covers is whole; what came after it may still be torn.
+                *upto = (*upto).max(covered);
+                forced = true;
+            }
+        }
+        if !forced {
+            break;
         }
     }
 }
@@ -599,21 +654,22 @@ pub struct Sim {
     /// The generator boots are drawn from: the seed's own, apart from `rng`, so that drawing a
     /// boot moves no other draw of a seed's run.
     boots: Rng,
-    files: HashMap<FileName, SimFile, Global>,
+    files: Map<FileName, SimFile, FixedState, Global>,
     /// The changes of names no sync of their directory has covered, oldest first: a crash may
     /// undo any of them, with every later one that shares a name ([`Sim::crash`]). A name is
     /// durable only once its directory is synced; a file's sync makes its bytes durable,
     /// never its name. A directory made ([`Effect::MakeDir`]) or removed
     /// ([`Effect::RemoveDir`]) is in it as a change of a name of its parent's, durable once the
     /// parent is synced; a directory's own sync never makes its own name durable
-    /// (`sim/host/dir_names.rs`).
-    names: Vec<Named>,
+    /// (`sim/host/dir_names.rs`). Each is stamped with the epoch it was made in: a crash that
+    /// keeps it keeps what the barriers before it cover ([`NameChange`]).
+    names: Vec<NameChange>,
     /// The folders above the root, nearest first ([`Sim::set_above`]): read-only, so they are
     /// plain bytes, outside the disk's journal and its crashes.
     above: Vec<SimAbove>,
     /// Whose a file or directory is and who else can write it, where a test said it is not
     /// the user's alone ([`Sim::set_access`]).
-    access: HashMap<FileName, Access, Global>,
+    access: Map<FileName, Access, FixedState, Global>,
     /// Effects in flight by the tick of the virtual clock they are ready at. The clock ends
     /// some 584 years in ([`wheel::ticks`]): one due later is due at its end.
     pending: Wheel<Pending>,
@@ -631,7 +687,7 @@ pub struct Sim {
     told: Vec<Told>,
     /// What a poll left in `told`, swapped with it: both keep their room.
     later: Vec<Told>,
-    programs: HashMap<PathBuf, Program, Global>,
+    programs: Map<PathBuf, Program, FixedState, Global>,
     listens: Tagged<Address>,
     ends: Slab<End>,
     /// Receives waiting for bytes or a hang-up.
@@ -678,12 +734,12 @@ pub struct Sim {
     room: Option<(FileName, u64)>,
     /// Who holds each file's lock ([`Effect::Lock`]), by the tag that took it, in the order
     /// taken; a file no one holds has no entry.
-    locks: HashMap<FileName, Vec<(Tag, LockMode)>, Global>,
+    locks: Map<FileName, Vec<(Tag, LockMode)>, FixedState, Global>,
     /// Locks held of files removed or replaced since: still held, so an unlock lets them go,
     /// but of a file no name leads to, so they exclude no one.
     unlinked: Vec<Tag>,
     /// The locks another process holds ([`Sim::hold_lock`]).
-    outside: HashMap<FileName, LockMode, Global>,
+    outside: Map<FileName, LockMode, FixedState, Global>,
     /// The tags of each [`Effect::Pressure`] in flight, in the order asked: each is told of
     /// the memory pressure a test makes ([`Sim::press`]).
     pressures: Vec<Tag>,
@@ -745,7 +801,7 @@ pub(crate) type Drawn = std::sync::Arc<crate::lock::Lock<Option<Vec<u8>>>>;
 
 /// The file `name` of the simulated disk, made empty if it is not there.
 fn file_mut<'a>(
-    files: &'a mut HashMap<FileName, SimFile, Global>,
+    files: &'a mut Map<FileName, SimFile, FixedState, Global>,
     name: &FileName,
 ) -> &'a mut SimFile {
     if !files.contains_key(name) {
@@ -764,11 +820,11 @@ impl Sim {
             // Drawn below, once the boots' generator is there.
             boot: crate::Boot([0; 16]),
             boots: Rng::new(seed ^ 0xB007_B007_B007_B007),
-            files: HashMap::new_in(Global),
+            files: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             names: Vec::new_in(Global),
             // alloc: none until a test sets folders above the root.
             above: Vec::new(),
-            access: HashMap::new_in(Global),
+            access: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             pending: Wheel::new(),
             spawns: Tagged::new(RESERVE),
             ready: Vec::with_capacity(RESERVE),
@@ -777,7 +833,7 @@ impl Sim {
             disk: journal::Disk::default(),
             told: Vec::with_capacity(RESERVE),
             later: Vec::with_capacity(RESERVE),
-            programs: HashMap::new_in(Global),
+            programs: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             listens: Tagged::new(RESERVE),
             ends: match Slab::new(MAX_ENDS, MemTag::Io) {
                 Ok(ends) => ends,
@@ -805,10 +861,10 @@ impl Sim {
             recording: Vec::new(),
             recorded: Vec::new(),
             room: None,
-            locks: HashMap::new_in(Global),
+            locks: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             // alloc: none until a locked file is removed.
             unlinked: Vec::new(),
-            outside: HashMap::new_in(Global),
+            outside: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             // alloc: none until memory pressure is watched.
             pressures: Vec::new(),
             stall_holders: None,
@@ -974,6 +1030,8 @@ impl Sim {
     /// may be undone, with every later change that shares a name with it (the name holds what
     /// it held before, as far as that was durable; a renamed file is back under the name it
     /// had), and an unsynced write's bytes are torn by [`SECTOR`]s as any change not synced is.
+    /// What a barrier covers is kept whole by any change kept of a later epoch, of a file's
+    /// bytes or of a name ([`keep_ordered`]).
     ///
     /// Every lock goes with the processes that held them, another process's too
     /// ([`Sim::hold_lock`]), and a disk filled up ([`Sim::fill`]) has room again.
@@ -1040,64 +1098,33 @@ impl Sim {
         // What each file keeps of its changes not synced, drawn file by file: how many changes
         // whole, then (only where some are not) how many more may have landed in part. A file
         // with nothing unsynced draws one number, as before tears by sectors.
-        let mut cuts: Vec<Cut> = Vec::with_capacity_in(files.len(), Global);
-        for (name, file) in &files {
+        let mut drawn: Vec<(usize, usize)> = Vec::with_capacity_in(files.len(), Global);
+        for (_, file) in &files {
             let all = file.ops.len();
             let kept = self.rng.below(all as u64 + 1) as usize;
             let upto = match kept < all {
                 true => kept + self.rng.below((all - kept) as u64 + 1) as usize,
                 false => kept,
             };
-            // clone: a crash, not an op: the name the cut is of.
-            cuts.push(Cut { name: (*name).clone(), kept, upto, torn: crate::world::disk::Torn::Nothing });
+            drawn.push((kept, upto));
         }
         // Which changes of names not synced are undone: any of them, each later one that
         // shares a name with one undone undone with it (a name's changes are kept in order).
         let mut undone: Vec<bool> = Vec::with_capacity_in(self.names.len(), Global);
-        for (i, named) in self.names.iter().enumerate() {
-            let forced = (0..i).any(|earlier| undone[earlier] && self.names[earlier].shares(named));
+        for (i, change) in self.names.iter().enumerate() {
+            let forced = (0..i).any(|earlier| undone[earlier] && self.names[earlier].named.shares(&change.named));
             undone.push(forced || self.rng.one_in(3));
         }
-        // A barrier's promise: a change made after it completed is on the disk only if what
-        // it covers is. So whatever is kept of a later epoch than a barrier keeps that
-        // barrier's changes whole, which may in turn be of an epoch later than another's.
-        let newest = |files: &[(&FileName, &SimFile)], cuts: &[Cut]| {
-            files
-                .iter()
-                .zip(cuts)
-                .filter_map(|((_, file), cut)| {
-                    // A change that may have landed in part is on the disk in part: it counts
-                    // as kept, whatever its sectors draw.
-                    let reach = cut.upto.max(cut.kept).min(file.stamps.len());
-                    file.stamps[..reach].iter().max().copied()
-                })
-                .max()
-        };
-        // Bounded: each round keeps more of some file or ends.
-        for _ in 0..=files.iter().map(|(_, file)| file.barriers.len()).sum::<usize>() {
-            let Some(newest) = newest(&files, &cuts) else { break };
-            if self.planted(host::Plant::BarriersNotKept) {
-                break;
-            }
-            let mut forced = false;
-            for ((_, file), cut) in files.iter().zip(&mut cuts) {
-                let covered = file
-                    .barriers
-                    .iter()
-                    .filter(|(_, epoch)| *epoch < newest)
-                    .map(|(covers, _)| *covers)
-                    .max()
-                    .unwrap_or(0);
-                if covered > cut.kept {
-                    cut.kept = covered;
-                    // What a barrier covers is whole; what came after it may still be torn.
-                    cut.upto = cut.upto.max(covered);
-                    forced = true;
-                }
-            }
-            if !forced {
-                break;
-            }
+        // A barrier's promise: a change made after it completed, of a file's bytes or of a
+        // name, is on the disk only if what it covers is.
+        let names = self.names.iter().zip(&undone).filter(|(_, undone)| !**undone).map(|(change, _)| change.epoch).max();
+        let mut ordered: Vec<(&[u64], &[(usize, u64)])> = Vec::with_capacity_in(files.len(), Global);
+        ordered.extend(files.iter().map(|(_, file)| (&file.stamps[..], &file.barriers[..])));
+        keep_ordered(&ordered, names, self.planted(host::Plant::BarriersNotKept), &mut drawn);
+        let mut cuts: Vec<Cut> = Vec::with_capacity_in(files.len(), Global);
+        for ((name, _), (kept, upto)) in files.iter().zip(&drawn) {
+            // clone: a crash, not an op: the name the cut is of.
+            cuts.push(Cut { name: (*name).clone(), kept: *kept, upto: *upto, torn: crate::world::disk::Torn::Nothing });
         }
         // The tears, drawn last, file by file in the order of the names: of the changes after
         // those kept whole, up to `upto`, the file's length between the two files they leave
@@ -1153,7 +1180,7 @@ impl Sim {
         }
         let keep_barriers = self.planted(host::Plant::PutBackWithBarriers);
         let mut names = mem::take(&mut self.names);
-        while let Some(named) = names.pop() {
+        while let Some(NameChange { named, .. }) = names.pop() {
             if !cuts.undone.get(names.len()).copied().unwrap_or(false) {
                 continue;
             }
@@ -1189,11 +1216,11 @@ impl Sim {
     /// directory's sync makes the names in it durable, never its own ([`Named::kept_by`]).
     fn sync_names(&mut self, dir: &str) {
         let mut synced: Vec<bool> = Vec::with_capacity_in(self.names.len(), Global);
-        synced.extend(self.names.iter().map(|named| named.dir() == dir));
+        synced.extend(self.names.iter().map(|change| change.named.dir() == dir));
         for i in (0..self.names.len()).rev() {
             if synced[i] {
                 for earlier in 0..i {
-                    if self.names[earlier].kept_by(&self.names[i]) {
+                    if self.names[earlier].named.kept_by(&self.names[i].named) {
                         synced[earlier] = true;
                     }
                 }
@@ -1206,9 +1233,11 @@ impl Sim {
         });
     }
 
-    /// The change of a name `named` made: durable once its directory is synced.
+    /// The change of a name `named` made, in the epoch that is now: durable once its directory
+    /// is synced.
     fn named(&mut self, named: Named) {
-        self.names.push(named);
+        let epoch = self.epoch;
+        self.names.push(NameChange { named, epoch });
     }
 
     /// `file` made where no file is: a change of its name.
@@ -1738,7 +1767,7 @@ impl Sim {
     /// `file`'s name changed durably by something outside the state machine: no crash undoes
     /// a change of it made before.
     fn outside_named(&mut self, file: &FileName) {
-        self.names.retain(|named| !named.touches(file));
+        self.names.retain(|change| !change.named.touches(file));
     }
 
     pub fn rng(&mut self) -> &mut Rng {
@@ -2412,7 +2441,7 @@ impl Sim {
                 let less = self.planted(host::Plant::SyncCoversLess);
                 // The planted bug: the loose rule, a file's sync keeping its name too.
                 if self.planted(host::Plant::FileSyncKeepsName) {
-                    self.names.retain(|named| !named.touches(&file));
+                    self.names.retain(|change| !change.named.touches(&file));
                 }
                 self.made(&file);
                 let sim = self.files.entry(file).or_default();
@@ -3701,6 +3730,79 @@ mod tests {
         assert!(lost, "a barrier alone never lost its bytes to a crash: it is modelled as a sync");
     }
 
+    /// A table committed by its name, as blaze-solo commits its table: the old table durable
+    /// under `st/table`, the new one written beside it (`st/table.part`) with no sync, a
+    /// barrier of the part, and the part renamed over the table with no sync either; then a
+    /// crash. `planted`: the simulation's barriers keep nothing
+    /// ([`host::Plant::BarriersNotKept`]). What the table's name holds after the crash, then
+    /// the old table and the new.
+    fn barrier_then_rename(seed: u64, planted: bool) -> (Option<Vec<u8>>, Vec<u8>, Vec<u8>) {
+        let mut sim = Sim::new(seed, Faults::default());
+        if planted {
+            sim.plant(host::Plant::BarriersNotKept);
+        }
+        let (table, part) = (name("st/table"), name("st/table.part"));
+        let old = vec![0xEE; 900];
+        // Three sectors, none of them zero: a tear is told from the whole table.
+        let new: Vec<u8> = (0..1500u32).map(|at| (at % 250) as u8 + 1).collect();
+        ran(&mut sim, vec![Effect::Write { file: table.clone(), bytes: old.clone(), tag: Tag(1) }]);
+        ran(&mut sim, vec![Effect::SyncDir { dir: name("st").into(), tag: Tag(2) }]);
+        ran(&mut sim, vec![Effect::WriteUnsynced { file: part.clone(), bytes: new.clone(), tag: Tag(3) }]);
+        let done = ran(&mut sim, vec![Effect::Barrier { file: part.clone(), tag: Tag(4) }]);
+        assert_eq!(done[&Tag(4)], Done::Ordered, "seed {seed}");
+        let done = ran(&mut sim, vec![Effect::RenameUnsynced { from: part, to: table.clone(), tag: Tag(5) }]);
+        assert_eq!(done[&Tag(5)], Done::Renamed, "seed {seed}");
+        sim.crash();
+        let left = sim.exists(&table).then(|| sim.contents(&table));
+        (left, old, new)
+    }
+
+    /// What the table's name held, said for a failure.
+    fn held(left: &Option<Vec<u8>>) -> String {
+        match left {
+            Some(bytes) => format!("{} bytes", bytes.len()),
+            None => "no file".to_string(),
+        }
+    }
+
+    /// The invariant: a barrier orders what it covers before every write asked for after it
+    /// completed, a change of a name included ([`Effect::Barrier`]: "the bytes ordered before
+    /// the name"). So a table written beside its name, barriered and renamed over it, none of
+    /// it synced, is after any crash the old table or the whole new one under its name, never a
+    /// tear: on every seed. Both outcomes are reached, or the test judged nothing. Prints
+    /// `test sim::tests::a_rename_after_a_barrier_keeps_the_bytes_it_orders ... ok`.
+    #[test]
+    fn a_rename_after_a_barrier_keeps_the_bytes_it_orders() {
+        let (mut olds, mut news) = (0, 0);
+        for seed in 0..2000 {
+            let (left, old, new) = barrier_then_rename(seed, false);
+            match &left {
+                Some(bytes) if *bytes == old => olds += 1,
+                Some(bytes) if *bytes == new => news += 1,
+                _ => panic!(
+                    "seed {seed}: the table's name holds {}, neither the old table ({} bytes) nor the whole new one ({} bytes)",
+                    held(&left),
+                    old.len(),
+                    new.len()
+                ),
+            }
+        }
+        assert!(olds > 100 && news > 100, "the crashes left the old table {olds} times and the new {news}: too few to judge by");
+    }
+
+    /// The planted-bug control: with the barriers keeping nothing, some crash keeps the rename
+    /// and tears (or loses) the bytes the barrier ordered before it, and the oracle names it.
+    /// Prints `test sim::tests::the_oracle_catches_a_rename_kept_without_the_bytes_its_barrier_ordered ... ok`.
+    #[test]
+    fn the_oracle_catches_a_rename_kept_without_the_bytes_its_barrier_ordered() {
+        let torn = (0..2000).find_map(|seed| {
+            let (left, old, new) = barrier_then_rename(seed, true);
+            (left.as_ref() != Some(&old) && left.as_ref() != Some(&new)).then(|| (seed, held(&left)))
+        });
+        let (seed, held) = torn.expect("with the barriers keeping nothing no crash tore the table under its name: the oracle sees nothing");
+        assert!(held != "no file", "seed {seed}: the table's name lost its file, which no barrier is about");
+    }
+
     #[test]
     fn a_sync_covers_only_what_was_appended_before_it() {
         let mut sim = Sim::new(
@@ -4632,7 +4734,7 @@ mod tests {
         for seed in 0..100 {
             let mut sim = Sim::new(seed, Faults::default());
             sim.submit(&mut vec![Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) }]);
-            let mut model: HashMap<u64, Old, Global> = HashMap::new_in(Global);
+            let mut model: Map<u64, Old, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
             let mut conns: Vec<Conn> = Vec::new();
             let mut rng = Rng::new(seed ^ 0x5eed);
             let mut out = Vec::new();

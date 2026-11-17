@@ -26,7 +26,7 @@
 
 use std::{alloc::Global, collections::BTreeMap};
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 
 use crate::Hasher;
 
@@ -92,7 +92,7 @@ pub struct Keyed {
     /// Each entry's value and leaf, by key.
     // BTreeMap: the entries under a prefix are a range of it.
     entries: BTreeMap<Hash, (Hash, Hash)>,
-    nodes: HashMap<(u16, Hash), Hash, Global>,
+    nodes: Map<(u16, Hash), Hash, FixedState, Global>,
     /// The bytes hashed since it was made: 64 a leaf or a node.
     hashed: u64,
     /// The planted bug of `the_oracle_catches_a_removed_entry_left_in_the_root`: a removal
@@ -114,7 +114,7 @@ impl Keyed {
             // alloc: none until an entry is set, then kept as long as the set
             entries: BTreeMap::new(),
             // alloc: none until two entries are set, then kept as long as the set
-            nodes: HashMap::new_in(Global),
+            nodes: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             hashed: 0,
             #[cfg(test)]
             plant_keeps_removed: false,

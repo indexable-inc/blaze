@@ -273,6 +273,7 @@ impl World {
             match effect {
                 Effect::Append { .. }
                 | Effect::Sync { .. }
+                | Effect::SyncDir { .. }
                 | Effect::Write { .. }
                 | Effect::Truncate { .. } => journal.push(effect),
                 Effect::Journal { since, tag, .. } => {

@@ -78,8 +78,13 @@ fn an_invoke_gets_a_cleanup_row_and_a_call_in_the_cleanup_none() {
     assert_eq!((second.action, second.len), (Action::Cleanup, 4));
     assert_eq!(inst(code, first.start), BLR_X16);
     assert_eq!(inst(code, second.start), BLR_X16);
-    // `str x0, [sp, #imm]`: the exception pointer to the landing block's parameter cell.
-    assert_eq!(inst(code, second.landing) & 0xffc0_03ff, 0xf900_03e0, "the landing's first instruction");
+    // `sp` put back from `x29` first (pass/stack.rs: an `invoke` with stacked arguments lands
+    // with `sp` lowered): `sub x16, x29, #hi, lsl #12; sub x16, x16, #lo; mov sp, x16`.
+    assert_eq!(inst(code, second.landing) & 0xffc0_03ff, 0xd140_03b0, "the landing's first instruction");
+    assert_eq!(inst(code, second.landing + 4) & 0xffc0_03ff, 0xd100_0210, "its second");
+    assert_eq!(inst(code, second.landing + 8), 0x9100_021f, "`mov sp, x16`");
+    // Then `str x0, [sp, #imm]`: the exception pointer to the landing block's parameter cell.
+    assert_eq!(inst(code, second.landing + 12) & 0xffc0_03ff, 0xf900_03e0, "the landing's fourth instruction");
     // The dropper's `blr`, inside the cleanup, has no row: an unwind out of it ends the program.
     let in_cleanup = (second.landing / 4..code.len() as u32 / 4).find(|&i| inst(code, 4 * i) == BLR_X16).unwrap();
     assert!((0..rows.rows()).all(|i| rows.row(i).start != 4 * in_cleanup));

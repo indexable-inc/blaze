@@ -79,6 +79,11 @@ pub(crate) enum Plant {
     /// rules/obligation_site.rs (`suite::obligation_range::control_whole_expression_fails_all_four`).
     #[cfg(test)]
     ClauseAtWholeExpr,
+    /// The obligations of the signature and the projection goals a relation defers take no
+    /// place (`Cause::Body`), as before they were given one
+    /// (`suite::deferred_place::a_deferred_projection_is_at_the_relating_expression`).
+    #[cfg(test)]
+    ObligationsWithoutPlace,
 }
 
 /// What the context expects of an expression (rustc's `Expectation`).
@@ -228,6 +233,8 @@ pub(crate) struct MachineSnapshot<S> {
     diverging: usize,
     closures: usize,
     projected: usize,
+    fru_fields: usize,
+    default_fields: usize,
 }
 
 /// An autoderef step: the type, and whether it was reached by `Deref::deref`.
@@ -341,6 +348,22 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     /// Each `.await` in an async context and the future it holds while suspended
     /// (`<T as IntoFuture>::IntoFuture`): part of the enclosing future's interior.
     pub awaited: Vec<(ExprId, Ty), Alloc<'a>>,
+    /// Each field a struct update takes from its base (rules/adt.rs `record_fru_fields`): the
+    /// struct expression, the field's index in the struct, its type at the struct's arguments.
+    /// Written back as `Checked::fru_fields`; rolled back with a probe.
+    pub fru_fields: Vec<(ExprId, u32, Ty), Alloc<'a>>,
+    /// Each field a base-less struct expression `S { a: 1, .. }` takes from its default
+    /// (rules/adt.rs `record_default_fields`): the expression, the field's index in the
+    /// variant, the default's key. Written back as `Checked::default_fields`; rolled back with
+    /// a probe.
+    pub default_fields: Vec<(ExprId, u32, ItemKey), Alloc<'a>>,
+    /// Each overloaded index expression that is a mutable place and so calls
+    /// `IndexMut::index_mut` (rules/mut_places.rs), in body order. Filled after the walk, so
+    /// no probe sees it; written back as `Checked::index_mut`.
+    pub index_mut: Vec<ExprId, Alloc<'a>>,
+    /// The typed lints' findings (rules/args_inline.rs), filed after the end sequence: written
+    /// back as `Checked::findings`.
+    pub typed_findings: Vec<crate::rules::args_inline::TypedFinding, Alloc<'a>>,
     pub coerce_many: Vec<CoerceMany, Alloc<'a>>,
     /// Each coercion site's value sources so far, `(site, expression)`, in push order; a `!`
     /// source is not listed. Read when the site's fn items meet at a fn pointer
@@ -373,6 +396,10 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     pub interior: crate::stalled::Interior,
     /// The stalled auto-trait goals, in the order they failed (src/stalled.rs).
     pub stalled: Vec<crate::stalled::PendingStalled, Alloc<'a>>,
+    /// The place of the node the walk is checking (set by `run` for each frame): the cause of
+    /// the projection goals [`Machine::unify`] defers, so one that fails later is a finding at
+    /// the expression, pattern or statement that related the types (rule 19).
+    pub place: Cause,
 }
 
 impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
@@ -443,6 +470,10 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             closure_kinds: Vec::new_in(alloc),
             futures: Vec::new_in(alloc),
             awaited: Vec::new_in(alloc),
+            fru_fields: Vec::new_in(alloc),
+            default_fields: Vec::new_in(alloc),
+            index_mut: Vec::new_in(alloc),
+            typed_findings: Vec::new_in(alloc),
             coerce_many: Vec::new_in(alloc),
             coerce_sources: Vec::new_in(alloc),
             breaks: Vec::new_in(alloc),
@@ -456,6 +487,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             projected: Vec::new_in(alloc),
             interior: crate::stalled::Interior::Gap,
             stalled: Vec::new_in(alloc),
+            place: Cause::Body,
             alloc,
         })
     }
@@ -475,12 +507,26 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 let bytes = self.state_bytes();
                 self.reads.at(steps as u32, bytes);
             }
+            // A statement's place is its pattern or expression (statements keep no range); an
+            // item statement relates nothing, so the place before it stays.
+            self.place = match f.node {
+                Node::Expr(e) => Cause::Expr(e),
+                Node::Pat(p) => Cause::Pat(p),
+                Node::Stmt(s) => match self.body.stmt(s)? {
+                    crate::body::Stmt::Let { pat, .. } => Cause::Pat(pat),
+                    crate::body::Stmt::Expr { expr, .. } => Cause::Expr(expr),
+                    crate::body::Stmt::Item => self.place,
+                },
+            };
             match f.node {
                 Node::Expr(e) => self.step_expr(f, e)?,
                 Node::Pat(p) => self.step_pat(f, p)?,
                 Node::Stmt(s) => self.step_stmt(f, s)?,
             }
         }
+        // Past the walk no node is being checked: a relation made now (fallback) names its
+        // own place through `unify_at`, or has none.
+        self.place = Cause::Body;
         Ok(())
     }
 
@@ -824,13 +870,23 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         matches!(self.view(t), TyView::Infer(Var { kind: VarKind::Ty, .. }))
     }
 
+    /// Unifies; what the relation defers is an obligation of the node being checked
+    /// ([`Machine::place`]).
     pub(crate) fn unify(&mut self, a: Ty, b: Ty) -> Result<bool, Stop> {
-        Ok(self.ty.unify(a, b)?)
+        let cause = self.place;
+        self.unify_at(a, b, cause)
     }
 
-    /// Unifies, reporting a mismatch at `at`.
+    /// Unifies; what the relation defers is an obligation of `cause` ([`TypeCtx::unify_at`]).
+    pub(crate) fn unify_at(&mut self, a: Ty, b: Ty, cause: Cause) -> Result<bool, Stop> {
+        #[cfg(test)]
+        let cause = if self.plant == Plant::ObligationsWithoutPlace { Cause::Body } else { cause };
+        Ok(self.ty.unify_at(a, b, cause)?)
+    }
+
+    /// Unifies, reporting a mismatch at `at`, and what the relation defers there too.
     pub(crate) fn demand_eq(&mut self, at: At, expected: Ty, found: Ty) -> Result<bool, Stop> {
-        let ok = self.unify(expected, found)?;
+        let ok = self.unify_at(expected, found, at.cause())?;
         if !ok {
             self.diag(DiagCode::Mismatch, at, About::types(expected, found));
         }
@@ -1054,7 +1110,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         for c in wc.clauses {
             let PClause::Trait { trait_: ct, args: ca } = *c else { continue };
             let parts = wc.types.list(ca)?;
-            let mut tys: blaze_own::Vec<Ty, Alloc<'static>> = blaze_own::Vec::with_capacity_in(parts.len(), Alloc::global());
+            let mut tys: blaze_own::Vec<Ty, Alloc<'a>> = blaze_own::Vec::with_capacity_in(parts.len(), self.alloc);
             for &p in parts {
                 let t = self.lower(wc.types, p, Lower::Args(iargs), Cause::Body)?;
                 tys.push(self.ty.resolve(t)?);
@@ -1126,6 +1182,8 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             diverging: self.diverging.len(),
             closures: self.closures.len(),
             projected: self.projected.len(),
+            fru_fields: self.fru_fields.len(),
+            default_fields: self.default_fields.len(),
         }
     }
 
@@ -1148,6 +1206,8 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         self.diverging.truncate(s.diverging);
         self.closures.truncate(s.closures);
         self.projected.truncate(s.projected);
+        self.fru_fields.truncate(s.fru_fields);
+        self.default_fields.truncate(s.default_fields);
     }
 
     /// Runs `f` in a snapshot that is always rolled back (`probe`).
@@ -1473,9 +1533,28 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         self.lower_at(types, t, Lower::Body, at.cause(), Some(at))
     }
 
-    /// The owner's signature type `t` of `types`, checked for `dyn` as written in the body.
-    pub(crate) fn lower_sig_ty(&mut self, types: PTys<'_>, t: PTy) -> Result<Ty, Stop> {
-        self.lower_at(types, t, Lower::Body, Cause::Body, Some(At::Body))
+    /// The owner's signature type `t` of `types`, checked for `dyn` as written in the body; a
+    /// projection in it that fails is a finding at `cause` ([`Machine::sig_place`]).
+    pub(crate) fn lower_sig_ty(&mut self, types: PTys<'_>, t: PTy, cause: Cause) -> Result<Ty, Stop> {
+        #[cfg(test)]
+        let cause = if self.plant == Plant::ObligationsWithoutPlace { Cause::Body } else { cause };
+        self.lower_at(types, t, Lower::Body, cause, Some(At::Body))
+    }
+
+    /// Where an obligation of the owner's signature type `i` is filed: input `i`'s parameter
+    /// pattern, and for the output (`i` past the inputs) the body's own expression. The record's
+    /// signature keeps no range of its types (world.rs `FnSig`), so the finding is at the
+    /// nearest place the body writes: the parameter the type is written beside, the body whose
+    /// value the output is. A body with fewer parameter patterns than inputs has no such place
+    /// (`Cause::Body`), and a finding there stops the check as `DiagWithoutPlace`.
+    pub(crate) fn sig_place(&self, i: usize, inputs: usize) -> Cause {
+        if i >= inputs {
+            return Cause::Expr(self.body.root);
+        }
+        match self.body.params.get(i) {
+            Some(&p) => Cause::Pat(p),
+            None => Cause::Body,
+        }
     }
 
     /// `principal` in a `dyn` written at `at` (the Reference, "Traits", "Dyn compatibility"):

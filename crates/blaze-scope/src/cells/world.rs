@@ -76,6 +76,30 @@ fn in_dependency_order(w: &World) -> Result<Vec<(CrateItemKey, ItemKey)>, String
     Ok(out)
 }
 
+/// D116's equality check (`Cells::links_agree`) on the crate whose root is `root`, solved as
+/// [`solve_world`] solves it: every crate before it in dependency order is solved first and read
+/// as its dependency, so the scopes the tables are judged against are the decided ones (a crate
+/// run alone leaves what reads its dependencies unknown, which the check refuses).
+pub(crate) fn links_agree_world(w: &World, root: ItemKey) -> Result<super::Agreed, super::Disagreement<'static, N>> {
+    let alloc: Alloc<'static> = blaze_own::testing::heap().alloc();
+    w.expanded.borrow_mut().clear();
+    let solved: &'static SolvedCrates = std::boxed::Box::leak(std::boxed::Box::new(SolvedCrates { crates: RefCell::new(Vec::new()) }));
+    let expand = |call: ItemKey, _: crate::Def| {
+        w.expanded.borrow_mut().insert(call);
+    };
+    let order = in_dependency_order(w).expect("a test world's crates have no dependency cycle");
+    for (krate, at) in order {
+        let mut c = Cells::load_planted(w, at, Some(solved), CellPlant::None, alloc).map_err(super::Disagreement::Unsolved)?;
+        c.run(w, &expand, &[]).map_err(super::Disagreement::Unsolved)?;
+        if at == root {
+            return c.links_agree(alloc, alloc);
+        }
+        let held: &'static RefCell<Cells<'static, N>> = std::boxed::Box::leak(std::boxed::Box::new(RefCell::new(c)));
+        solved.crates.borrow_mut().push((krate, at, held));
+    }
+    panic!("{root:x} is the root of no crate of the world");
+}
+
 /// Every module of `w` the cell core writes, by module, its facts read from `facts` (`w` itself,
 /// or its records read back): each crate solved in dependency order, its items pushed in the
 /// order `tape` draws (none: the load's order). A module the core leaves holding an unknown

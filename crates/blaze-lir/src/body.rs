@@ -41,4 +41,12 @@ pub trait Bodies {
     fn body(&self, _id: BodyId) -> Option<View<'_>> {
         None
     }
+
+    /// The line and the column (each from 1, the column in chars) of byte `site` of item
+    /// `item`'s text where the program's source is now: what a data row's source position
+    /// ([`crate::func::DataPositionRec`]) is filled with when the row is placed. `None` for a
+    /// run that knows no source, whose rows with positions are refused by name.
+    fn position(&self, _item: u128, _site: u32) -> Option<(u32, u32)> {
+        None
+    }
 }

@@ -1,6 +1,6 @@
 //! Forms: which edits reach an item's interface, body and closures, and which leave them.
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::ContentId;
 use hir_def::{
     AdtId, DefWithBodyId, VariantId,
@@ -622,13 +622,13 @@ fn shared_type_forms_are_the_forms_each_cx_spelled() {
 /// A walk's order, block numbers and unwinds, kept as `Canon` kept them before its columns.
 type HashedWalk = (
     Vec<BasicBlockId>,
-    HashMap<BasicBlockId, u32, Global>,
-    HashMap<(BasicBlockId, usize), BasicBlockId, Global>,
+    Map<BasicBlockId, u32, FixedState, Global>,
+    Map<(BasicBlockId, usize), BasicBlockId, FixedState, Global>,
 );
 
 fn hashed_walk(body: &MirBody<'_>) -> HashedWalk {
     let mut order = Vec::new();
-    let mut blocks = HashMap::new_in(Global);
+    let mut blocks = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     let mut stack = vec![body.start_block];
     while let Some(id) = stack.pop() {
         if blocks.contains_key(&id) {

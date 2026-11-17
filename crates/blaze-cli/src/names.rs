@@ -55,16 +55,19 @@ use crate::store::Store;
 use crate::work::{Did, Made, held_str};
 
 pub(crate) mod expansion_texts;
+pub(crate) mod failed_call;
+pub(crate) mod include_outside;
 mod scope;
 pub(crate) mod sections;
 
-// The subject and source domains name the payload's form ([`sections::FORM`] 4) and its producer:
+// The subject and source domains name the payload's form ([`sections::FORM`] 5) and its producer:
 // an old home's records (form 1: exports then inner; form 2: no tests section; "3": form 3 by
 // the old name fill, before blaze-scope's cell core became the writer; "4": form 3, without the
-// expansion texts; "5": an out of the names record alone, see [`OUT_DOMAIN`]) are under other
-// names, never found, made again.
-const SUBJECT_DOMAIN: &str = "blaze-cli crate scope 6";
-const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 6";
+// expansion texts; "5": an out of the names record alone, see [`OUT_DOMAIN`]; "6": a names
+// section of names record version 1, without the failed calls; "7": form 4, without the link
+// table) are under other names, never found, made again.
+const SUBJECT_DOMAIN: &str = "blaze-cli crate scope 8";
+const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 8";
 /// The out: the names record AND the checkout files the crate holds ([`crate_out`]). "1" was
 /// the names record alone, but a body's check reads its crate's items record to find which
 /// crate owns its file (body_types.rs `prepare`): a module file created gave a new record at
@@ -205,12 +208,23 @@ pub(crate) struct Resolved {
     /// Each checkout file looked for and not found (a `mod x;` whose file is missing, a
     /// module's other place): read as its `Surface`, absent, so creating it reruns the crate.
     absent: std::vec::Vec<String, Global>,
+    /// Each checkout file read as DATA (`include_str!`, `include_bytes!`), with the slot of the
+    /// file whose call read it (the home whose outline lists it as a data part), sorted and
+    /// without repeats: read as the file's own `FileItems` record, whose out is its bytes' id
+    /// (data_include.rs), never as a `Surface`.
+    data: std::vec::Vec<(String, String), Global>,
     /// Each unresolved path of the crate's own code, as its record's finding ([`unresolved`]).
     findings: blaze_own::Vec<Unresolved, Global>,
+    /// Each include of the crate's own code read outside its package, inside the workspace
+    /// (D111): its record's warning finding ([`include_outside::findings`]).
+    left_package: blaze_own::Vec<Unresolved, Global>,
     /// The crate's failure, filed as the record's [`crate::work::TASK_FAILED`] error: its
     /// names could not be resolved or a section written (the out is then
     /// [`crate::work::failed_out`]), or its tests section is empty though it is a test unit.
     failed: Option<std::string::String>,
+    /// Each failed macro call of the crate's own code, as its record's error finding
+    /// ([`failed_call::findings`]).
+    failed_calls: blaze_own::Vec<Unresolved, Global>,
 }
 
 /// A resolved crate's payload ([`sections::write`]) with its unresolved paths as findings.
@@ -236,21 +250,24 @@ impl core::fmt::Display for Unwritten {
     }
 }
 
-/// The record of the crate `crate_name` resolved as `done`.
-fn scope_record(done: &blaze_scope::crate_scope::CrateScope<'_>, crate_name: &str) -> Result<ScopeRecord, Unwritten> {
+/// The record of the crate `crate_name` resolved as `done`; `alloc` is the allocator `done` was
+/// made in (its task's frame), which the link table is written into before its copy into the
+/// payload.
+fn scope_record<'a>(done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name: &str, alloc: Alloc<'a>) -> Result<ScopeRecord, Unwritten> {
     let unwritten = |section: &'static str, why: std::string::String| Unwritten { crate_name: crate_name.into(), section, why };
     let mut findings = blaze_own::Vec::new_in(Global);
     let unresolved = done.names.notes.len() as u32 + unresolved(done.names, &mut findings);
     // The names and items records, filed in the same record (drive.md, "End state", piece
     // 3): a body is checked by reading them, never by solving the crate graph again.
-    let names_record = blaze_scope::names_record::encode(done.names, Alloc::global()).map_err(|error| unwritten("names", std::format!("{error:?}")))?;
-    let items_record = blaze_scope::items_record::encode(done.names, Alloc::global()).map_err(|error| unwritten("items", std::format!("{error:?}")))?;
+    // Scratch copied into the payload below: in the task's frame, as the link table is.
+    let names_record = blaze_scope::names_record::encode(done.names, alloc).map_err(|error| unwritten("names", std::format!("{error:?}")))?;
+    let items_record = blaze_scope::items_record::encode(done.names, alloc).map_err(|error| unwritten("items", std::format!("{error:?}")))?;
     // A test unit's tests, from attributes alone (test.md, "The tests record", piece 6): the
     // fifth section. A unit without `test` in its cfg has none, and its section is empty.
     // A refused tests record is the crate's finding, not its failure: the section stays
     // empty and the rest of the record is kept, standing until a file it read moves.
     let mut tests_refused = None;
-    let tests_record = match blaze_scope::tests_record::encode(done.names, Alloc::global()) {
+    let tests_record = match blaze_scope::tests_record::encode(done.names, alloc) {
         Ok(bytes) => Some(bytes),
         Err(blaze_scope::tests_record::TestsRecordError::NotATestUnit { .. }) => None,
         Err(error) => {
@@ -265,7 +282,12 @@ fn scope_record(done: &blaze_scope::crate_scope::CrateScope<'_>, crate_name: &st
     // The texts the crate's macro calls made, beside the items rows that name them (piece 16):
     // a body's check reads an item an expansion wrote from here.
     let expansions = expansion_texts::write(done.names).map_err(|error| unwritten("expansion texts", std::format!("{error}")))?;
-    let payload = sections::write(unresolved, [&done.record[..], &done.inner[..], &names_record[..], &items_record[..], tests, &expansions[..]]);
+    // The crate's link table, from the names resolved here (run.md, "the native image as a
+    // task"): a refused table is written as its refusal (state 1), so only a program that links
+    // the crate fails; an error here is a table that could not be written at all.
+    let mut links = blaze_own::AVec::new_in(alloc);
+    blaze_ladder::native_links::scope_table(done.names, &mut links, alloc).map_err(|error| unwritten("link table", std::format!("{error:?}")))?;
+    let payload = sections::write(unresolved, [&done.record[..], &done.inner[..], &names_record[..], &items_record[..], tests, &expansions[..], &links[..]]);
     #[cfg(test)]
     sections::watch_tests(crate_name, &payload, tests);
     Ok(ScopeRecord { payload, findings, unresolved, tests_refused })
@@ -590,10 +612,12 @@ pub(crate) fn world<'f>(
     let lock_whole: &'f Lock<'static> = lock.ok_or(NamesError::NoLock)?;
     let lock: &'f Lock<'f> = lock_whole;
     let members = members.ok_or(NamesError::NoMembers)?;
-    // The command's allocator for the world and the records: the global one, held to the end.
-    let alloc: Alloc<'f> = Alloc::global();
+    // The command's allocator for the world and the records: the process's heap, handed from
+    // `main` in `env`, held to the end.
+    let heap: Alloc<'static> = env.heap.alloc();
+    let alloc: Alloc<'f> = heap;
     let Some(home) = env.home else { return Err(NamesError::NoHome) };
-    let decoded = blaze_unit_graph::record::decode(graph_record, Alloc::global()).map_err(NamesError::Graph)?;
+    let decoded = blaze_unit_graph::record::decode(graph_record, heap).map_err(NamesError::Graph)?;
     let decoded: &'static blaze_unit_graph::record::Decoded<'static> = std::boxed::Box::leak(std::boxed::Box::new(decoded));
     let graph = &decoded.graph;
     // The files read for the names step live to the end of the command: a context of the
@@ -602,7 +626,7 @@ pub(crate) fn world<'f>(
     let frame: &'static Frame = std::boxed::Box::leak(std::boxed::Box::new(Frame::with_reserve(NAMES_FRAME, bstd::mem::Tag::Other).map_err(|_| NamesError::Frame)?));
     let mut shelf = crate::toolchain::HomeShelf::open(cx, &env.fs, home, frame).map_err(NamesError::Shelf)?;
     let reader: &'static Reader = std::boxed::Box::leak(std::boxed::Box::new(Reader { cx, root: root.read_only(), frame }));
-    let sources = StoreSources::new(lock_whole, Folder::of(reader, env)?, PackView::open_source_put, Alloc::global())
+    let sources = StoreSources::new(lock_whole, Folder::of(reader, env)?, PackView::open_source_put, heap)
         .map_err(|e| NamesError::Sources(std::format!("{e}")))?;
     let sources = std::boxed::Box::leak(std::boxed::Box::new(sources));
     // Every path package the graph reaches is a member, placed at its own directory (the
@@ -641,16 +665,16 @@ pub(crate) fn world<'f>(
     }
     let paths: &'f [(LockId, &'static str)] = std::vec::Vec::leak(paths);
     let checkout: &'f ReadTree = std::boxed::Box::leak(std::boxed::Box::new(ReadTree(reader)));
-    let mut fetched = Fetched { store: sources, paths, lock: lock_whole, alloc: Alloc::global() };
+    let mut fetched = Fetched { store: sources, paths, lock: lock_whole, alloc: heap };
     // Every place the world is told, kept for the proc-macro runner (proc_callers.rs).
     let mut packages = crate::proc_callers::Placing::new(&mut fetched, alloc);
     // The crate list (blaze-scope's units list, the one home) and the toolchain crates it needs.
-    let listed = blaze_world::open_list(&mut shelf, env.toolchain, crate::graph::TRIPLE, graph, lock, &mut packages, Alloc::global()).map_err(|e| match e {
+    let listed = blaze_world::open_list(&mut shelf, env.toolchain, crate::graph::TRIPLE, graph, lock, &mut packages, heap).map_err(|e| match e {
         WorldError::Toolchain(_) => NamesError::Toolchain(std::format!("{e}")),
         other => NamesError::World(std::format!("{other}")),
     })?;
-    let listed: &'f Listed<'f, crate::toolchain::Held<'static>> = std::boxed::Box::leak(std::boxed::Box::new(listed));
-    let world = blaze_world::world(graph, lock, listed, &mut packages, checkout, Alloc::global())
+    let listed: &'f Listed<'f, crate::toolchain::Held<'static>> = blaze_own::Box::leak(blaze_own::Box::new_in(listed, Global));
+    let world = blaze_world::world(graph, lock, listed, &mut packages, checkout, heap)
         .map_err(|e| NamesError::World(std::format!("{e}")))?;
     let placed = packages.finish();
     let mut by_subject = std::vec::Vec::new();
@@ -687,29 +711,28 @@ pub(crate) fn world<'f>(
             scripts.push((at, Name::new(Kind::Script, subject)));
         }
     }
-    // Each crate's build-script file, from the units it is: the script a crate reads is one
-    // (ruling D115 (3)), so the first unit with a script names it.
+    // Each crate's build-script file, from the unit it is made from ([`script_units`]): the
+    // script a crate reads is one (ruling D115 (3); `blaze_world::list::one_script` refuses two
+    // units under one key with different runs), so its origin unit's script names it.
     // And its module's lookup (script_modules.rs, ruling D115 (c)): the script UNIT's package,
     // version and features, what the bootstrap builder's identity names.
+    // Crate order, so `script_roots` and `placements` are sorted by index, each crate once.
     let mut script_roots = std::vec::Vec::new_in(Global);
     let mut script_modules = std::vec::Vec::new_in(Global);
     let mut placements = std::vec::Vec::new_in(Global);
-    for (unit, at) in world.crate_of_unit.iter().enumerate() {
-        let (Some(at), Some(script)) = (*at, graph.units[unit].build_script) else { continue };
-        placements.push((at as usize, crate::scripts::placement(graph, script, Alloc::global())));
+    for (at, script) in script_units(world.crates.iter().map(|krate| krate.origin), |unit| graph.units[unit.index()].build_script) {
+        // The module is looked up for the run's placement (D112): a native run's record is a
+        // host binary, a wasm run's a module.
+        let ran_as = crate::scripts::placement(graph, script, heap);
+        placements.push((at, ran_as));
         let script = &graph.units[script.index()];
-        script_roots.push((at as usize, script.root.as_str()));
+        script_roots.push((at, script.root.as_str()));
         let mut features = std::vec::Vec::new_in(Global);
         features.extend(script.features.iter().map(|feature| feature.as_str()));
-        let subject = crate::script_modules::subject(script.name.as_str(), script.version.as_str(), &features);
-        script_modules.push(crate::script_modules::ScriptModule { subject, crate_at: at as usize, package: script.name.as_str(), version: script.version.as_str(), features });
+        let subject = crate::script_modules::subject(ran_as, script.name.as_str(), script.version.as_str(), &features);
+        script_modules.push(crate::script_modules::ScriptModule { subject, crate_at: at, ran_as, package: script.name.as_str(), version: script.version.as_str(), features });
     }
-    script_roots.sort_unstable();
-    script_roots.dedup_by_key(|(at, _)| *at);
     script_modules.sort_unstable_by_key(|module| (module.subject, module.crate_at));
-    script_modules.dedup_by_key(|module| (module.subject, module.crate_at));
-    placements.sort_unstable_by_key(|(at, _)| *at);
-    placements.dedup_by_key(|(at, _)| *at);
     // Each run's placement, and the public list's script subjects (ruling D115 sharing (i)):
     // a public crate's run is added only when placed on the wasm path; one not added stays
     // this machine's, and so does every record reading it (the safe direction).
@@ -732,11 +755,29 @@ pub(crate) fn world<'f>(
     Ok(Names { world, by_subject, by_key, made: std::vec::Vec::new(), public, scripts, script_placed, script_roots, script_modules, prepares: Prepares::new_in(alloc), graph, procs: None, placed, resolved: 0, unresolved: 0 })
 }
 
+/// Each crate (by world index, in order) made from a unit with a build script, with that
+/// build-script unit: `origins` is each crate's [`blaze_world::Origin`] in world order and
+/// `build_script` a unit's build-script unit.
+///
+/// Taken from the crates, never from `World::crate_of_unit`: that map holds only the target
+/// side, so a macro-side copy (a member proc macro's dependency, ruling D115 (2)) that reads
+/// its side's run had no placement and the world was refused as "no unit of it has a build
+/// script" (tempo, 2026-11-16: `icu_properties_data`, reached from a member proc macro).
+pub(crate) fn script_units<'a>(
+    origins: impl Iterator<Item = blaze_world::Origin> + 'a,
+    build_script: impl Fn(blaze_unit_graph::UnitId) -> Option<blaze_unit_graph::UnitId> + 'a,
+) -> impl Iterator<Item = (usize, blaze_unit_graph::UnitId)> + 'a {
+    origins.enumerate().filter_map(move |(at, origin)| match origin {
+        blaze_world::Origin::Unit(unit) => build_script(unit).map(|script| (at, script)),
+        blaze_world::Origin::Toolchain(_) => None,
+    })
+}
+
 /// Tells `store` the world's public crates (the toolchain's and checksummed registry
 /// archives'), whose records hold nothing of a project when every name they read is public
 /// too: they go to the machine store (remote-read.md, "One chain of stores"). Called wherever
 /// a world is made.
-pub(crate) fn tell_public(store: &mut dyn Store, names: &Names<'_>) {
+pub(crate) fn tell_public(store: &mut dyn Store<'_>, names: &Names<'_>) {
     store.public_crates(&names.public);
 }
 
@@ -780,6 +821,9 @@ fn slot_of(path: String, probed: impl Fn(&str) -> bool) -> String {
 fn surface(path: &str) -> Name {
     Name::new(Kind::Surface, Name::file(path.as_bytes()).subject)
 }
+
+#[cfg(test)]
+mod script_units_tests;
 
 #[cfg(test)]
 pub(crate) use scope::scope_made;

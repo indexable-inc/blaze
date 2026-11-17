@@ -1,0 +1,14 @@
+{
+ "id": "lazy-seam-shared-file-overwritten",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane M (lazy program's seam methods) under rebuild-1115",
+ "where": "crates/blaze-ladder/src/front2/program.rs (shared with E and a reach.rs lane)",
+ "what": "My four small edits to program.rs (a `mod seam_rules;` line and three bodies moved to the shared rules) vanished at 03:27: another lane wrote the whole file from its own older copy while editing reach.rs and walk_report.rs. The runner's cut then failed to compile in program.rs either way: with my copy it carried the other lane's half-written edit, without it my module was gone.",
+ "cost": "about twenty minutes and four runner rounds",
+ "cause": "two lanes write one file in one directory, one of them by whole-file writes",
+ "whys": "program.rs is the home of Front2Program and of several lanes' hooks; a lane that rewrites it whole loses the edits made since it read it; the runner cuts files as they are on disk",
+ "class": "a lane's whole-file write over a file another lane edits drops that lane's edits silently",
+ "prevention": "wanted: a shared file is edited by exact replacement only (Edit), never rewritten whole; a lane keeps a shared rule in its own directory and names the one-line hook another lane's file needs (done here: the rules live in lazy/seam_rules.rs)",
+ "workaround": "the shared rules moved to front2/program/lazy/seam_rules.rs, visible to all of `program`; Front2Program's side is an OLD/NEW for the coordinator",
+ "state": "open"
+}

@@ -20,7 +20,34 @@
 //! the vectors over them, kept blocks, the subsystem [`Tag`]s, and owned text in an allocator
 //! ([`String`], [`format_in!`]). The functions of blaze-mem that reach a frame through the
 //! thread (`frame::current`, `frame::task`) are left out: in bstd the frame is `cx.frame()`.
+//!
+//! # The allocator a function takes
+//!
+//! | form | reach for it instead of | cost |
+//! |---|---|---|
+//! | [`Alloc`] | `<A: Allocator>(alloc: A)` on a function, or the global heap | one word, `Copy`; a call through it is two loads and an indirect call; the function is compiled once |
+//! | [`Erased`] | an allocator with no header of its own | its header and the allocator: `Erased::new(cx.frame()).handle()` is an [`Alloc`] |
+//! | [`SharedAlloc`] | an [`Alloc`] in a value that crosses threads | the same word, made only from a `Sync` allocator; `shared.local()` is an [`Alloc`] |
+//!
+//! These are blaze-own's handles. They are here, not in a `bstd::alloc`, because bstd's root
+//! links `alloc` as `extern crate alloc`, whose name a module of the root cannot take.
+//! `Alloc::global()` is not a bstd path: a program's allocator is handed down from its entry.
+//!
+//! # The heap is a grant
+//!
+//! Memory that outlives every task (a `'static` store, a pinned box) is the process's heap,
+//! [`Heap`]: a `main` or a `#[bstd::test]` names it in its signature (`heap: Heap`) and its
+//! entry hands it over, as it hands `out: Out` (D120). Nothing else makes one: bstd's entry
+//! takes the process's heap in one function (`entry::process_heap`) and nowhere else, so a
+//! function that allocates for the long term says so by taking a `Heap` (or the [`Alloc`] it
+//! gives) from its caller.
 
+use core::{
+    alloc::{AllocError, Allocator, AllocatorClone, Layout, StaticAllocator},
+    ptr::NonNull,
+};
+
+pub use blaze_own::{Alloc, Erased, SharedAlloc};
 pub use blaze_mem::{
     AppendVec, ArenaLocal, Block, Built, Cache, Column, Frame, FromUtf8Error, HUGE_PAGE, Handle,
     Kept, Marker, MemError, Pool, Pooled, Region, RegionVec, Revisions, Slab, String, Tag,
@@ -33,6 +60,116 @@ use crate::{Plant, Stopped, io::Io};
 
 /// The most a frame not given a limit hands out: a task's ([`crate::task`]) and the root's.
 pub const TASK_FRAME: usize = 64 << 20;
+
+/// The process's heap, as a grant (D120): one word, `Copy`; each call goes to the global
+/// allocator through blaze-own's handle (two loads and an indirect call). What `main` or a
+/// `#[bstd::test]` names as `heap: Heap`; it fills itself ([`crate::grant::Kind::Heap`]).
+///
+/// It is the allocator for what lives as long as the program: a `'static` store
+/// (`heap.alloc()`, an `Alloc<'static>`), a value that crosses threads (`heap.shared()`), and
+/// a pinned box (`Box::pin_in(future, heap)`), which needs an allocator that never reuses a
+/// live block ([`StaticAllocator`]): a frame or an arena is not one, since either can be reset
+/// or dropped under a box that was forgotten. Everything shorter lives in `cx.frame()`.
+#[derive(Clone, Copy)]
+pub struct Heap {
+    heap: &'static blaze_own::Heap,
+}
+
+impl Heap {
+    /// The grant over `heap`: made only by bstd's entries (`entry::process_heap`), so holding
+    /// one is the proof it was handed down.
+    pub(crate) const fn of(heap: &'static blaze_own::Heap) -> Heap {
+        Heap { heap }
+    }
+
+    /// The heap's one-word handle, for a function that takes an [`Alloc`].
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn alloc(self) -> Alloc<'static> {
+        self.heap.alloc()
+    }
+
+    /// The heap's handle that may cross threads.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn shared(self) -> SharedAlloc<'static> {
+        self.heap.shared()
+    }
+
+    /// blaze-own's heap this grant is, for an API that takes `&'static blaze_own::Heap` (a
+    /// crate below bstd: blaze-fetch's `FetchEnv::heap`, blaze-cli's `request`).
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn root(self) -> &'static blaze_own::Heap {
+        self.heap
+    }
+}
+
+impl core::fmt::Debug for Heap {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Heap")
+    }
+}
+
+// SAFETY: every method forwards to the heap's handle (`blaze_own::Heap::alloc`), the global
+// allocator's, with the caller's arguments unchanged, so each method keeps that allocator's
+// contract and the caller's part of it is passed on as it came. Every `Heap` is the same one
+// global allocator, so a block made through one copy may be freed or resized through any other.
+#[expect(unsafe_code, reason = "the heap's `Allocator`, forwarding to blaze-own's handle, with its SAFETY")]
+unsafe impl Allocator for Heap {
+    #[inline]
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        self.heap.alloc().allocate(layout)
+    }
+
+    #[inline]
+    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        self.heap.alloc().allocate_zeroed(layout)
+    }
+
+    #[inline]
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        // SAFETY: the caller's: `ptr` was made by this allocator (the global one) with `layout`.
+        unsafe { self.heap.alloc().deallocate(ptr, layout) }
+    }
+
+    #[inline]
+    unsafe fn grow(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        // SAFETY: the caller's, as `Allocator::grow` states it, for the same allocator.
+        unsafe { self.heap.alloc().grow(ptr, old, new) }
+    }
+
+    #[inline]
+    unsafe fn grow_zeroed(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        // SAFETY: the caller's, as `Allocator::grow_zeroed` states it, for the same allocator.
+        unsafe { self.heap.alloc().grow_zeroed(ptr, old, new) }
+    }
+
+    #[inline]
+    unsafe fn shrink(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        // SAFETY: the caller's, as `Allocator::shrink` states it, for the same allocator.
+        unsafe { self.heap.alloc().shrink(ptr, old, new) }
+    }
+}
+
+// SAFETY: a copy is the same global allocator (the one `blaze_own::Heap`), so a block made
+// through either may be freed through the other; copying is cloning, and neither a copy nor a
+// drop (it has none) touches a block.
+#[expect(unsafe_code, reason = "the heap's copies are one allocator, with its SAFETY")]
+unsafe impl AllocatorClone for Heap {}
+
+// SAFETY: the process's heap never reuses a live block: the global allocator invalidates a
+// block only when it is deallocated, grown or shrunk through it. `Heap` has no `Drop` and its
+// reference is `'static`, so neither dropping it nor its lifetime ending frees anything; it has
+// no reset and no safe method that frees (unlike a frame or an arena, which free every block at
+// a reset or a drop); and every copy is the same allocator, so the same holds for all of them.
+// That is what a pinned box needs: its value's memory is not reused before its drop runs, even
+// when the box is forgotten.
+#[expect(unsafe_code, reason = "the heap's promise that a live block is never reused, with its SAFETY")]
+unsafe impl StaticAllocator for Heap {}
 
 /// Bytes in an allocator its owner handed in: a frame's or an arena's.
 pub struct Bytes<'a> {

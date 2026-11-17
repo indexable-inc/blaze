@@ -1000,7 +1000,7 @@ fn a_rust_call_fn_takes_its_arguments_as_one_tuple() {
     let pair = fx.tuple(&[u32_, u32_]);
     let good = fx.func("good", 0, &[pair], unit, std::vec::Vec::new());
     let bad = fx.func("bad", 0, &[u32_], unit, std::vec::Vec::new());
-    let header = FnPtrHeader { abi: Abi::RustCall, safety: Safety::Safe };
+    let header = FnPtrHeader { abi: Abi::RustCall, safety: Safety::Safe, c_variadic: false };
     fx.set_header(good, header);
     fx.set_header(bad, header);
     fx.finish();
@@ -1353,6 +1353,41 @@ fn const_literals_read_their_values() {
     assert_eq!(v("-1u8"), None);
     assert_eq!(v("'\\n'"), None);
     assert_eq!(v("{ 3 }"), None);
+}
+
+/// A call argument that is an integer literal, or a `-` of one, has its value as written in
+/// `call_arg_ints` (a `#[rustc_legacy_const_generics]` callee's const argument; blaze-typeck
+/// rules/legacy_const.rs): hex, `_` and a suffix read, the `-` left to the checker, the entry
+/// at the literal's own id, ascending by id across nested calls; a literal past `u128` and a
+/// literal that is no call argument are not recorded.
+/// Prints `test typeck_tests::call_arguments_that_are_integer_literals_keep_their_values ... ok`.
+#[test]
+fn call_arguments_that_are_integer_literals_keep_their_values() {
+    let text = "fn main() {
+    let x = 5;
+    f(x, 0x1f);
+    f(x, -3);
+    f(x, 1_000u16);
+    f(g(7), (2));
+    f(x, 340282366920938463463374607431768211456);
+}";
+    let alloc = Alloc::global();
+    let lowered = match lower_body(text, Edition::E2024, &mut NoCfg, &mut crate::NoModule, alloc) {
+        Ok(l) => l,
+        Err(need) => panic!("{text}: needs {:?}", need.atoms),
+    };
+    let view = lowered.view();
+    let mut tys = PortableTys::new_in(alloc);
+    let body = match to_typeck(&view, ItemKey(1), &mut tys, &mut NoTypes, alloc) {
+        Ok(b) => b,
+        Err(e) => panic!("to_typeck refused {e:?} in\n{text}"),
+    };
+    let values: std::vec::Vec<u128> = body.call_arg_ints.iter().map(|&(_, v)| v).collect();
+    assert_eq!(values, [31, 3, 1000, 7, 2], "the values, in id order");
+    assert!(body.call_arg_ints.windows(2).all(|w| w[0].0 < w[1].0), "ascending by id: {:?}", &body.call_arg_ints[..]);
+    for &(e, v) in body.call_arg_ints.iter() {
+        assert!(matches!(view.expr(ExprId(e.0)), Ok(crate::form::Expr::Lit(_))), "the entry for {v} is at a literal, not its `-` or parentheses");
+    }
 }
 
 /// The world for an impl generic over a const: `trait Tr<U> {}`,

@@ -37,7 +37,7 @@ pub mod schema;
 pub mod sources;
 pub mod stdlib;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_manifest::manifest::Manifest;
 use blaze_manifest::profiles::Profiles;
 use blaze_resolve::resolver::ResolvedFeatures;
@@ -221,7 +221,7 @@ pub struct Package<'a> {
 /// Everything a unit graph is made from.
 pub struct Request<'a> {
     /// Every package of the resolve, by its id.
-    pub packages: &'a HashMap<PackageId, Package<'a>, Global>,
+    pub packages: &'a Map<PackageId, Package<'a>, FixedState, Global>,
     /// The resolve of the build (cargo's `targeted_resolve`).
     pub resolve: &'a Resolve,
     /// The features the feature resolver activated for the build.

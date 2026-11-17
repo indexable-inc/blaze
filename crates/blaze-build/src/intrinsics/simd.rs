@@ -18,7 +18,7 @@
 //! (the reductions, `simd_bitmask`, `simd_shuffle`, the casts, shifts, divisions, saturating
 //! arithmetic, float rounding, `fma`, masked and gathered accesses) are built as one LIR vector
 //! operation each by intrinsics/simd_vec.rs. A `simd_*` intrinsic not in the table
-//! (`simd_funnel_shl`, `simd_select_bitmask`, `simd_fsin`, the pointer casts, ...) is refused by
+//! (`simd_funnel_shl`, `simd_fsin`, the pointer casts, ...) is refused by
 //! name as any intrinsic the table lacks. `f16` and `f128` lanes are built as any float lane
 //! (walk/halfquad.rs; blaze-lir's legalize widens or calls for them before the Reference and
 //! Fast tiers). A fn declared in an `extern "unadjusted"` block with a
@@ -30,7 +30,7 @@ use core::alloc::Allocator;
 use blaze_lir::builder::{Makes, MemAttrs};
 use blaze_lir::func::SlotKind;
 use blaze_lir::{Flags, FloatCond, IntCond, Op, Sink, Ty, Value};
-use blaze_typeck::PTy;
+use blaze_typeck::{PNode, PTy, UintTy};
 
 use super::{Arg, B, Call, Entry, IntrinsicError, Out, Which, e, lir, ty_arg};
 use crate::layout::Prim;
@@ -59,6 +59,7 @@ pub enum SimdOp {
     Extract,
     Insert,
     Select,
+    SelectBitmask,
     // Built as one LIR vector operation each (intrinsics/simd_vec.rs).
     Div,
     Rem,
@@ -157,6 +158,7 @@ pub const TABLE: &[Entry] = &[
     e("simd_saturating_sub", Which::Simd(SimdOp::SaturatingSub), "Subtracts two simd vectors elementwise, with saturation.", "one vector `usub_sat`/`ssub_sat`"),
     e("simd_scatter", Which::Simd(SimdOp::Scatter), "Writes to a vector of pointers.", "one `scatter` on the mask `!= 0`"),
     e("simd_select", Which::Simd(SimdOp::Select), "Selects elements from a mask.", "per lane: `select` on the mask lane `!= 0`"),
+    e("simd_select_bitmask", Which::Simd(SimdOp::SelectBitmask), "Selects elements from a bitmask.", "per lane `i`: `select` on bit `i` of the integer mask (of byte `i / 8`, bit `i % 8`, of a `[u8]` mask)"),
     e("simd_shl", Which::Simd(SimdOp::Shl), "Shifts vector left elementwise, with UB on overflow.", "one vector `shl in_range`"),
     e("simd_shr", Which::Simd(SimdOp::Shr), "Shifts vector right elementwise, with UB on overflow.", "one vector `lshr`/`ashr in_range`"),
     e("simd_shuffle", Which::Simd(SimdOp::Shuffle), "Shuffles two vectors by const indices.", "one `shuffle` of the const's indices"),
@@ -410,6 +412,50 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
             for i in 0..l.count {
                 let bits = load(s, &m, mask, i);
                 let set = s.b.icmp(IntCond::Ne, bits, zero);
+                let a = load(s, &l, yes, i);
+                let b = load(s, &l, no, i);
+                let lane = s.b.select(Flags::NONE, set, a, b);
+                store(s, &l, lane, out, i);
+            }
+            Out::At(out)
+        }
+        // "`T` must be a vector. `M` must be an unsigned integer or array of `u8`, matching
+        // `simd_bitmask`. For each element, if the bit in `mask` is `1`, select the element from
+        // `if_true`. If the corresponding bit in `mask` is `0`, select the element from
+        // `if_false`. The remaining bits of the mask are ignored. The bitmask bit order matches
+        // `simd_bitmask`": lane 0 the lowest bit, so the bit of lane `i` is bit `i % 8` of byte
+        // `i / 8` (little-endian: an integer's bit `i` too).
+        SimdOp::SelectBitmask => {
+            let mt = ty(0)?;
+            let l = lanes(s, ty(1)?)?;
+            let u8_mask = match s.node(mt) {
+                Some(PNode::Uint(_)) => true,
+                Some(PNode::Array(elem, _)) => s.node(elem) == Some(PNode::Uint(UintTy::U8)),
+                _ => false,
+            };
+            if !u8_mask {
+                return Err(shape("`M` must be an unsigned integer or array of `u8`"));
+            }
+            let id = s.layout(mt)?;
+            let bytes = s.cx.layouts.get(id).size;
+            if bytes * 8 < l.count {
+                return Err(shape("a mask of fewer bits than the vector's lanes (`M` must match `simd_bitmask`)"));
+            }
+            let (yes, no) = (place(1)?, place(2)?);
+            let mask = c.args.first().copied().ok_or(shape("a missing mask"))?;
+            let out = temp(s, &l);
+            for i in 0..l.count {
+                let (word, bit) = match mask {
+                    Arg::Scalar(m) => (m, i),
+                    Arg::Place(at) => (s.b.load(Ty::I8, Flags::NONE, at, (i / 8) as i32, MemAttrs::aligned(0)), i % 8),
+                    Arg::None => return Err(shape("a zero-sized mask")),
+                };
+                let wty = s.b.ty(word);
+                let amount = s.b.iconst(wty, u128::from(bit));
+                let shifted = s.b.binary(Op::Lshr, Flags::NONE, word, amount);
+                let one = s.b.iconst(wty, 1);
+                let low = s.b.binary(Op::And, Flags::NONE, shifted, one);
+                let set = s.b.icmp(IntCond::Eq, low, one);
                 let a = load(s, &l, yes, i);
                 let b = load(s, &l, no, i);
                 let lane = s.b.select(Flags::NONE, set, a, b);

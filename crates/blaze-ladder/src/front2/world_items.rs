@@ -37,8 +37,11 @@ pub enum Fill {
     Store(Want),
     /// The headers of the impls that can answer a trait at a shape, then the answer.
     Impls(ItemKey, Shape),
-    /// The headers of the inherent impls that can answer a shape, then its fns.
-    Inherent(Shape),
+    /// The headers of the inherent impls of a shape that declare an item of the name, then
+    /// the shape's items of that name. The name filters first, as rustc finds an inherent item
+    /// by name before it unifies self types: `impl Uint<{ <U1792>::LIMBS / 2 }> { fn concat }`
+    /// is no candidate of `LIMBS`, so evaluating its header's constant never needs its own header.
+    Inherent(Shape, Name),
 }
 
 /// A question this front end cannot answer yet, by the item it is about.
@@ -99,6 +102,14 @@ pub enum Gap {
     /// A question refused by what its key is ([`super::by_origin::KindGap`]): a made want with
     /// no answer, a variant index past its ADT's, an unfiled anonymous constant, ..
     Kind(super::by_origin::KindGap),
+    /// The body path at `path` (its index in the checked body): `why` its mark gives it no
+    /// site (blaze-lower `mark_site::SiteRefused`), or `None`: the world holds no mark row
+    /// for it (made without the body's `path_marks`).
+    Site { path: u32, why: Option<blaze_lower::mark_site::SiteRefused> },
+    /// A base-less struct expression (`S { a: 1, .. }`) of an ADT whose head row was filed
+    /// without its field defaults (every maker files both: heads.rs `Store::adt`, and a head
+    /// record carries them since form 8, head_record.rs).
+    FieldDefaults(ItemKey),
 }
 
 impl core::fmt::Display for Gap {
@@ -121,10 +132,14 @@ impl core::fmt::Display for Gap {
                 let why = match gap.why {
                     ConstGapWhy::NoEvaluator => "its converter evaluates no constant",
                     ConstGapWhy::OverGeneric => "a constant expression over a generic parameter (the checker's type form has no node for an unevaluated expression)",
-                    ConstGapWhy::AnonInBody => "an anonymous constant in a body (its type is the checker's to find, or the evaluator refused it)",
+                    ConstGapWhy::AnonInBody(_) => "an anonymous constant in a body (its type is the checker's to find, or the evaluator refused it)",
                     ConstGapWhy::NegativeNoSuffix => "a negated literal with no suffix (its bits wait for the parameter's type)",
                 };
-                write!(f, "the {site} at {}..{} of the body {owner:?} has no value yet: {why}", gap.range.start, gap.range.end)
+                write!(f, "the {site} at {}..{} of the body {owner:?} has no value yet: {why}", gap.range.start, gap.range.end)?;
+                match gap.why {
+                    ConstGapWhy::AnonInBody(text) if !text.text().is_empty() => write!(f, ": `{text}`"),
+                    _ => Ok(()),
+                }
             }
             Gap::Unspelled(u) => write!(f, "the body names {:?}, whose text its lowering does not hold", u.0),
             Gap::Resolve(e) => write!(f, "{e}"),
@@ -137,6 +152,9 @@ impl core::fmt::Display for Gap {
             Gap::RefusedImpl { impl_, place, why } => write!(f, "the impl {impl_:x} at {place}, a candidate of this question, has a refused header: {why}"),
             Gap::ForeignClosure { text, .. } => write!(f, "{text}"),
             Gap::Kind(g) => write!(f, "{g}"),
+            Gap::Site { path, why: Some(why) } => write!(f, "the body path {path}: {why}"),
+            Gap::Site { path, why: None } => write!(f, "the body path {path} has no mark row in the world (made without the body's `path_marks`)"),
+            Gap::FieldDefaults(k) => write!(f, "the field defaults of ADT {k:?}, read by a base-less `S {{ a: 1, .. }}`: its head row was filed without them"),
         }
     }
 }
@@ -188,8 +206,15 @@ pub struct BodyWorld<'w, 'n, S = &'n Names<'n>> {
     pub traits: &'w [ItemKey],
     /// The traits in scope at the body's blocks whose list is not `traits` (a block's `use`).
     pub blocks: &'w super::block_traits::BlockTraits,
+    /// Parallel to the body's paths (blaze-lower `TypeckBody::path_marks`): where each is
+    /// read ([`Self::path`], by `blaze_lower::mark_site::site_of`). Empty for a world that
+    /// resolves no path (a projection's, a selection's): a path asked there is a gap.
+    pub path_marks: &'w [Option<blaze_lower::mark_site::TextMark>],
     pub fills: RefCell<Vec<Fill, Global>>,
     pub gaps: RefCell<Vec<Gap, Global>>,
+    /// Which opaques this world answers the hidden type of: a body's check sees only its leak
+    /// list's, a resolution at ground arguments after checking sees every one.
+    pub reveal: super::opaque_auto::Reveal,
 }
 
 impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {
@@ -296,6 +321,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
                 self_param: f.self_param,
                 header: f.header,
                 c_variadic: f.c_variadic,
+                legacy_const_generics: &f.legacy_const_generics,
                 inputs: &f.inputs,
                 output: f.output,
                 types: self.types(),
@@ -307,8 +333,9 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
                 own_count: c.generics,
                 declared_count: c.generics,
                 self_param: false,
-                header: tc::FnPtrHeader { abi: tc::Abi::Rust, safety: tc::Safety::Safe },
+                header: tc::FnPtrHeader::RUST,
                 c_variadic: false,
+                legacy_const_generics: &[],
                 inputs: &c.inputs,
                 output: c.output,
                 types: self.types(),
@@ -366,6 +393,20 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
         }
     }
 
+    fn field_defaults(&self, _: Seal, adt: ItemKey) -> Fetch<&[Option<ItemKey>]> {
+        if let Some(d) = self.store.field_defaults.get(&adt) {
+            return Ok(&d[..]);
+        }
+        // A row filed with no defaults entry: the gap, never "no defaults".
+        if self.store.adts.contains_key(&adt) {
+            return self.gap(Gap::FieldDefaults(adt));
+        }
+        match self.detail(adt) {
+            Some(ItemDetail::Struct | ItemDetail::Enum | ItemDetail::Union) => self.want(adt),
+            _ => Ok(&[]),
+        }
+    }
+
     fn adt(&self, _: Seal, item: ItemKey) -> Fetch<Option<tc::Adt<'_>>> {
         if let Some(a) = self.store.adts.get(&item) {
             return Ok(Some(tc::Adt { kind: a.kind, generics: a.generics, variants: &a.variants, fields: &a.fields, types: self.types() }));
@@ -409,12 +450,12 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
     }
 
     fn inherent(&self, _: Seal, shape: Shape, name: Name) -> Fetch<&[AssocItem]> {
-        if let Some((k, why)) = self.buckets.and_then(|b| b.inherent_gap(shape)) {
-            return self.gap(self.failed_impl(k, why, &format!("the inherent items of {shape:?}")));
+        if let Some((k, why)) = self.buckets.and_then(|b| b.inherent_gap(shape, name)) {
+            return self.gap(self.failed_impl(k, why, &format!("the inherent items of {shape:?} named {name:?}")));
         }
         match self.buckets.and_then(|b| b.inherent(shape, name)) {
             Some(v) => Ok(v),
-            None => self.fill(Fill::Inherent(shape)),
+            None => self.fill(Fill::Inherent(shape, name)),
         }
     }
 
@@ -473,8 +514,8 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
         }
     }
 
-    fn resolve_path(&self, _: Seal, scope: ScopeId, _: PathIdx, segments: &[Name]) -> Fetch<tc::PathAnswer> {
-        self.path(scope, segments)
+    fn resolve_path(&self, _: Seal, scope: ScopeId, p: PathIdx, segments: &[Name]) -> Fetch<tc::PathAnswer> {
+        self.path(scope, p, segments)
     }
 
     fn lang_item(&self, _: Seal, item: LangItem) -> Fetch<Option<ItemKey>> {
@@ -531,14 +572,15 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
 
     /// An opaque type a fn's head made: `None` (a body sees only its bounds: the Reference,
     /// "Impl trait", "Abstract return types") unless the running check's own leak list holds it
-    /// (an auto trait of it was asked: "Auto trait leakage"), then its hidden type from its
+    /// (an auto trait of it was asked: "Auto trait leakage") or the world is a ground
+    /// resolution's ([`super::opaque_auto::Reveal::All`]), then its hidden type from its
     /// defining body's filed check ([`super::opaque_auto`]). A filed record with no hidden type
     /// for it, and any key no head made, is a gap.
     fn opaque_hidden(&self, _: Seal, item: ItemKey) -> Fetch<Option<Hidden<'_>>> {
         let Some(&(owner, _)) = self.store.opaques.get(&item) else {
             return self.gap(Gap::BodyRecord(tc::Question::Opaque(item)));
         };
-        match self.store.hidden.answer(item, owner) {
+        match self.store.hidden.answer(item, owner, self.reveal) {
             super::opaque_auto::HiddenAnswer::Known(h) => Ok(Some(h)),
             super::opaque_auto::HiddenAnswer::Opaque => Ok(None),
             super::opaque_auto::HiddenAnswer::NoneGiven => self.gap(Gap::BodyRecord(tc::Question::Opaque(item))),
@@ -580,10 +622,12 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
     /// asked for as an ADT (rung x0-drop-11-zst-temporary: "a fn (asked for as an ADT)").
     fn attrs(&self, _: Seal, item: ItemKey) -> Fetch<TypeAttrs> {
         if let Some(a) = self.store.adts.get(&item) {
+            // `#[blaze::args]` (rule 83): the options-struct mark, from the made head or its record.
+            let args = if a.args { TypeAttrs::ARGS } else { 0 };
             return Ok(match a.kind {
-                tc::AdtKind::Enum => TypeAttrs(0).with_discr(super::heads::discr_ty(a.repr)),
-                tc::AdtKind::Struct if a.repr.simd => TypeAttrs(TypeAttrs::SIMD),
-                _ => TypeAttrs(0),
+                tc::AdtKind::Enum => TypeAttrs(args).with_discr(super::heads::discr_ty(a.repr)),
+                tc::AdtKind::Struct if a.repr.simd => TypeAttrs(TypeAttrs::SIMD | args),
+                _ => TypeAttrs(args),
             });
         }
         if let Some(f) = self.store.fns.get(&item) {
@@ -682,5 +726,26 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
             };
         };
         Ok(self.store.maps.assoc_generics.get(&(lib, name)).map(|&own| tc::AssocGenerics { parent: t.generics, own }))
+    }
+
+    /// A type alias's definition from its head (`Maps::aliases`, `Maps::alias_defaults`, made
+    /// by `Store::alias`): asked for while its head is not made, the gap naming it when its head
+    /// was refused (as `BodyWorld::path` names it), `None` for an item that is no alias.
+    fn type_alias(&self, _: Seal, item: ItemKey) -> Fetch<Option<tc::AliasDef<'_>>> {
+        let Some(lib) = self.keys.library_in(self.names, item) else { return Ok(None) };
+        match self.store.maps.aliases.get(&lib) {
+            Some(&Some((generics, ty))) => {
+                let defaults = self.store.maps.alias_defaults.get(&lib).map_or(&[][..], |d| &d[..]);
+                Ok(Some(tc::AliasDef { generics, defaults, ty, types: self.types() }))
+            }
+            Some(None) => {
+                let why = self.store.maps.alias_gaps.get(&lib).map_or_else(|| "(no why recorded)".into(), |w| format!("{w:?}").into_boxed_str());
+                self.gap(Gap::AliasHead(lib, why))
+            }
+            None => match self.resolver().detail(lib) {
+                Some(ItemDetail::TypeAlias) => self.fill(Fill::Store(Want::Head(lib))),
+                _ => Ok(None),
+            },
+        }
     }
 }

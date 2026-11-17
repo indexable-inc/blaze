@@ -533,6 +533,11 @@ pub(crate) const fn adc(rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0x9a00_0000 | (rm << 16) | (rn << 5) | rd
 }
 
+/// `adcs xd, xn, xm`: `adc` setting the flags.
+pub(crate) const fn adcs(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0xba00_0000 | (rm << 16) | (rn << 5) | rd
+}
+
 /// `sbc xd, xn, xm`.
 pub(crate) const fn sbc(rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0xda00_0000 | (rm << 16) | (rn << 5) | rd

@@ -95,6 +95,9 @@ pub struct Fx {
     /// Async blocks of other bodies (`PNode::Coroutine`): owner, ordinal, output and
     /// interior (of `t`, in the owner's parameters), as the owner's check records them.
     pub coroutines: Vec<(ItemKey, u32, PTy, PTy)>,
+    /// Type aliases (`type A<..> = X;`): key, generics and aliased type (of `t`, over the
+    /// alias's parameters), what `type_alias` answers; an item without a row is `None`.
+    pub type_aliases: Vec<(ItemKey, u32, PTy)>,
     fns: Vec<FnRow>,
     adts: Vec<AdtRow>,
     traits: Vec<TraitRow>,
@@ -125,6 +128,9 @@ pub struct Fx {
     /// Typing attributes set by [`Fx::set_attrs`]; an enum not named here has the default
     /// representation (discriminant `isize`), any other item none.
     attrs: Vec<(ItemKey, TypeAttrs)>,
+    /// `#[rustc_legacy_const_generics(..)]` of a fn ([`Fx::legacy_const_generics`]): its
+    /// argument positions; a fn not named here has none.
+    legacy: Vec<(ItemKey, Vec<u32>)>,
 }
 
 /// The shape an impl's self type is bucketed by; `None` for a blanket impl.
@@ -171,6 +177,7 @@ impl Fx {
             closures: Vec::new(),
             hidden: Vec::new(),
             coroutines: Vec::new(),
+            type_aliases: Vec::new(),
             fns: Vec::new(),
             adts: Vec::new(),
             traits: Vec::new(),
@@ -190,7 +197,19 @@ impl Fx {
             const_params: Vec::new(),
             assoc_generics: Vec::new(),
             attrs: Vec::new(),
+            legacy: Vec::new(),
         }
+    }
+
+    /// Gives fn `f` `#[rustc_legacy_const_generics(at..)]`: its own const parameters may be
+    /// passed as the value arguments at positions `at`.
+    pub fn legacy_const_generics(&mut self, f: ItemKey, at: &[u32]) {
+        self.legacy.retain(|(k, _)| *k != f);
+        self.legacy.push((f, at.to_vec()));
+    }
+
+    fn legacy_of(&self, f: ItemKey) -> &[u32] {
+        self.legacy.iter().find(|(k, _)| *k == f).map_or(&[] as &[u32], |(_, at)| at.as_slice())
     }
 
     /// Sets `item`'s typing attributes (`#[repr(u8)]` is
@@ -243,6 +262,15 @@ impl Fx {
     /// The clause `where const { cond }` at `args`.
     pub fn holds(&mut self, cond: ItemKey, args: &[PTy]) -> PClause {
         PClause::Const { cond, args: self.list(args) }
+    }
+
+    /// A type alias `type name<..generics> = ty;` that body paths name by `name`: the world
+    /// answers the path with `Def::Alias` and `type_alias` with `ty`.
+    pub fn type_alias_item(&mut self, name: &str, generics: u32, ty: PTy) -> ItemKey {
+        let k = self.key(name);
+        self.type_aliases.push((k, generics, ty));
+        self.use_path(name, Def::Alias(k));
+        k
     }
 
     /// A return-position `impl Trait` occurrence's key (the front end's: the function's key and
@@ -682,6 +710,7 @@ impl Fx {
         self.fn_row(item).map(|f| FnSig { parent_count: f.parent, own_count: f.own, declared_count: f.own - f.anon, self_param: f.self_param,
         header: f.header,
         c_variadic: false,
+        legacy_const_generics: self.legacy_of(item),
         inputs: &f.inputs,
         output: f.output,
         types: self.t.view(), })
@@ -889,6 +918,7 @@ impl World for Fx {
         Ok(self.fn_row(item).map(|f| FnSig { parent_count: f.parent, own_count: f.own, declared_count: f.own - f.anon, self_param: f.self_param,
         header: f.header,
         c_variadic: false,
+        legacy_const_generics: self.legacy_of(item),
         inputs: &f.inputs,
         output: f.output,
         types: self.t.view(), }))
@@ -1044,6 +1074,10 @@ impl World for Fx {
         let own = self.assoc_generics.iter().find(|(k, _)| *k == item).map_or(0, |&(_, n)| n);
         Ok(Some(crate::world::AssocGenerics { parent: t.generics, own }))
     }
+
+    fn type_alias(&self, _: Seal, item: ItemKey) -> Fetch<Option<crate::world::AliasDef<'_>>> {
+        Ok(self.type_aliases.iter().find(|(k, ..)| *k == item).map(|&(_, generics, ty)| crate::world::AliasDef { generics, defaults: &[], ty, types: self.t.view() }))
+    }
 }
 
 /// A body under construction (see the module): its columns and its own table of written types.
@@ -1070,6 +1104,8 @@ pub struct Bb {
     arms: Vec<Arm>,
     fmt_uses: Vec<FmtUse>,
     coroutine: Option<CoroutineKind>,
+    /// `BodyView::call_arg_ints`, ascending (each pushed as its literal is made).
+    call_arg_ints: Vec<(ExprId, u128)>,
     pub t: PortableTys<'static>,
 }
 
@@ -1095,8 +1131,17 @@ impl Bb {
             arms: Vec::new(),
             fmt_uses: Vec::new(),
             coroutine: None,
+            call_arg_ints: Vec::new(),
             t: PortableTys::new_in(Alloc::global()),
         }
+    }
+
+    /// An integer literal written as a call's argument, whose value `value` the lowering
+    /// hands over (`BodyView::call_arg_ints`).
+    pub fn int_valued(&mut self, suffix: Option<IntSuffix>, value: u128) -> ExprId {
+        let e = self.e(Expr::Lit(Lit::Int(suffix)));
+        self.call_arg_ints.push((e, value));
+        e
     }
 
     pub(crate) fn e(&mut self, x: Expr) -> ExprId {
@@ -1358,6 +1403,7 @@ impl Bb {
             asm_operands: &[],
             asm_clobbers: &[],
             asm_text: "",
+            call_arg_ints: &self.call_arg_ints,
         }
     }
 

@@ -421,6 +421,25 @@ impl<D: Driver> Driven<D> {
         Ok(found)
     }
 
+    /// The NEWEST record under `key` in [`Namespace::LOCAL`] ([`Plain::find_newest`]): what a
+    /// pointer is read by. Mapped as [`Driven::get`] maps; read the bytes with [`Driven::got`].
+    pub fn newest(&mut self, key: &Key) -> Result<Option<Found>, StoreError> {
+        let before = self.core.probes().probes;
+        let lost = self.core.report().lost.len();
+        // Bounded: each map is of a row not mapped before, and the generation names few.
+        let found = loop {
+            let now = self.driver.wall_ns();
+            match self.core.find_newest(Namespace::LOCAL, key, now, &mut self.effects)? {
+                Probe::Hit(found) => break Some(found),
+                Probe::Absent => break None,
+                Probe::Map => self.run("mapping a segment at a pointer's first probe")?,
+            }
+        };
+        self.core.count_get(before);
+        self.hand_losses(lost);
+        Ok(found)
+    }
+
     /// The bytes of what [`Driven::get`] found, in place, borrowed from the store.
     pub fn got(&self, found: Found) -> Got<'_> {
         self.core.got(found)

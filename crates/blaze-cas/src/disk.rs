@@ -660,7 +660,11 @@ impl Head {
         }
         // The units seen live only while the head is read: a frame's.
         blaze_mem::frame::task(blaze_mem::Tag::Store, |frame| {
-            let mut seen = blaze_hash::HashSet::new_in(frame);
+            let mut seen = blaze_hash::Set::new(blaze_hash::SetOpts {
+                hasher: blaze_hash::FixedState,
+                alloc: frame,
+                capacity: None,
+            });
             for _ in 0..units {
                 let unit = ContentId(*read.array()?);
                 if unit == ContentId::default() || !seen.insert(unit) {

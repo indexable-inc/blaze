@@ -218,7 +218,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             // the object of its right-hand side, each trait's dyn-compatibility its own).
             let mut traits: Vec<(LibKey, List), Global> = Vec::new_in(Global);
             let mut projs: Vec<(ItemKey, Name, List, PTy), Global> = Vec::new_in(Global);
-            match self.bound_target(env, abs, &texts, pr)? {
+            match self.bound_target(env, v, p, abs, &texts, pr)? {
                 Bounded::Trait(key) => {
                     let (key, args) = self.trait_args(tys, key, pr, erased, &given)?;
                     if !binds.is_empty() && self.heads.trait_auto(key).ok_or(Why::Need(key))? {

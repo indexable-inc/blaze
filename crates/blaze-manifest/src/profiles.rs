@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 
-use blaze_hash::{HashMap, HashSet};
+use blaze_hash::{FixedState, Map, MapOpts, Set, SetOpts};
 use blaze_resolve::PackageIdSpec;
 use blaze_toml::{Document, Item};
 use serde::Serialize;
@@ -160,8 +160,8 @@ fn spec_matches(spec: &PackageIdSpec, pkg: &PackageId) -> bool {
 #[derive(Clone, Debug)]
 pub struct Profiles {
     incremental: Option<bool>,
-    dir_names: HashMap<String, String, Global>,
-    by_name: HashMap<String, ProfileMaker, Global>,
+    dir_names: Map<String, String, FixedState, Global>,
+    by_name: Map<String, ProfileMaker, FixedState, Global>,
     original_profiles: BTreeMap<String, TomlProfile>,
     requested_profile: String,
     rustc_host: String,
@@ -190,7 +190,7 @@ impl Profiles {
         let mut makers = Profiles {
             incremental,
             dir_names: predefined_dir_names(),
-            by_name: HashMap::new_in(Global),
+            by_name: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             original_profiles: profiles.clone(),
             requested_profile: requested_profile.to_owned(),
             rustc_host: rustc_host.to_owned(),
@@ -240,7 +240,7 @@ impl Profiles {
             }
             return Ok(());
         }
-        let mut set = HashSet::new_in(Global);
+        let mut set = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
         set.insert(name.to_owned());
         let maker = self.process_chain(name, profile, &mut set, profiles)?;
         self.by_name.insert(name.to_owned(), maker);
@@ -251,7 +251,7 @@ impl Profiles {
         &mut self,
         name: &str,
         profile: &TomlProfile,
-        set: &mut HashSet<String, Global>,
+        set: &mut Set<String, FixedState, Global>,
         profiles: &BTreeMap<String, TomlProfile>,
     ) -> Result<ProfileMaker, ProfileError> {
         let mut maker = match &profile.inherits {
@@ -515,7 +515,7 @@ fn is_ci<F: Files>(config: &Config<F>) -> bool {
     config.env("CI").is_some() || config.env("TF_BUILD").is_some()
 }
 
-fn predefined_dir_names() -> HashMap<String, String, Global> {
+fn predefined_dir_names() -> Map<String, String, FixedState, Global> {
     [("dev", "debug"), ("test", "debug"), ("bench", "release")]
         .into_iter()
         .map(|(k, v)| (k.to_owned(), v.to_owned()))
@@ -955,7 +955,7 @@ fn merge_config_profiles<F: Files>(
         }
         None => BTreeMap::new(),
     };
-    let mut check_to_add = HashSet::new_in(Global);
+    let mut check_to_add = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
     check_to_add.insert(requested_profile.to_owned());
     for (name, profile) in &mut profiles {
         if let Some(config_profile) = get_config_profile(features, config, name)? {
@@ -968,7 +968,7 @@ fn merge_config_profiles<F: Files>(
     for name in ["dev", "release", "debug", "test", "bench"] {
         check_to_add.insert(name.to_owned());
     }
-    let mut current = HashSet::new_in(Global);
+    let mut current = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
     while !check_to_add.is_empty() {
         std::mem::swap(&mut current, &mut check_to_add);
         for name in current.drain() {

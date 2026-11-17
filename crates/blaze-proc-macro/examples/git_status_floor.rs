@@ -26,6 +26,11 @@ fn main() {
         eprintln!("usage: git_status_floor <checkout> <folder>");
         std::process::exit(2);
     };
+    // An entry that takes no grant yet (a plain `fn main`): the run's memory is one frame
+    // taken from the OS here and handed down.
+    let frame = blaze_mem::Frame::with_reserve(1 << 34, blaze_mem::Tag::Other).expect("the entry's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc: Alloc<'_> = erased.handle();
     let root = PathBuf::from(checkout);
     let mut floor = Vec::new();
     let mut with_folders = Vec::new();
@@ -34,7 +39,7 @@ fn main() {
     for _ in 0..ROUNDS {
         let start = Instant::now();
         let bytes = std::fs::read(root.join(".git/index")).expect("the checkout's .git/index");
-        let paths = git::index_paths(&bytes, Alloc::global()).expect("an index status can read");
+        let paths = git::index_paths(&bytes, alloc).expect("an index status can read");
         for path in paths.iter() {
             std::hint::black_box(std::fs::symlink_metadata(root.join(path.as_str())).is_ok());
         }
@@ -43,7 +48,7 @@ fn main() {
 
         let start = Instant::now();
         let bytes = std::fs::read(root.join(".git/index")).expect("the checkout's .git/index");
-        let paths = git::index_paths(&bytes, Alloc::global()).expect("an index status can read");
+        let paths = git::index_paths(&bytes, alloc).expect("an index status can read");
         let mut seen: Vec<&str> = Vec::new();
         for path in paths.iter() {
             for (end, _) in path.match_indices('/') {

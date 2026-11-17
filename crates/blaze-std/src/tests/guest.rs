@@ -80,6 +80,31 @@ fn a_kind_that_fills_itself_is_answered_with_no_grant() {
     assert_eq!(io.script(|host| host.out.clone()), Some(b"Hello, world!\n".to_vec()));
 }
 
+/// What `#[bstd::main]` makes of `fn main(cx: &Cx, heap: Heap)` for a hosted start: a value
+/// boxed in the heap it was handed, read back and dropped (7 when all of it held).
+fn hosted_heap(_cx: &Cx, io: Io) -> Status {
+    let heap = match guest::grant::<crate::mem::Heap>(&io, "heap") {
+        Some(granted) => granted,
+        None => return Status::REFUSED,
+    };
+    let boxed = crate::boxed::Box::new_in(7u8, heap);
+    let status = Status(*boxed);
+    drop(boxed);
+    status
+}
+
+/// The hosted start hands a `heap: Heap` parameter the heap it took (D120), with no grant:
+/// the heap fills itself, so the host answers it unasked, and the value boxed in it is read
+/// back. Without `Kind::Heap` in `Kind::FILLS_ITSELF` the host refuses `heap` and the start
+/// ends refused.
+/// Prints `test tests::guest::the_hosted_start_hands_main_its_heap ... ok`.
+#[test]
+fn the_hosted_start_hands_main_its_heap() {
+    let io = Io::sim(6);
+    let hosting = host(io.clone(), &[]);
+    assert_eq!(guest::start(&hosting.table(), hosted_heap), 7);
+}
+
 #[test]
 fn a_grant_the_host_withholds_refuses_the_start() {
     let io = Io::sim(2);

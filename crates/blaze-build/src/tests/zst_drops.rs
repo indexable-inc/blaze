@@ -60,7 +60,7 @@ fn z_world(w: &mut TestWorld) -> [PNode; 3] {
 /// `Name {}`.
 fn z_lit(b: &mut BodyBuf, name: &str) -> ExprId {
     let path = b.path(name);
-    b.e(Expr::Struct { path, fields: List::EMPTY, base: None })
+    b.e(Expr::Struct { path, fields: List::EMPTY, base: blaze_typeck::StructBase::None })
 }
 
 /// `drop_in_place::<t>`, built.
@@ -167,7 +167,7 @@ fn zero_sized_locals_fields_and_elements_drop_in_reverse_order() {
     let start = b.field_inits.len() as u32;
     b.field_inits.push(FieldInit { name: Name::of("n"), expr: seven });
     b.field_inits.push(FieldInit { name: Name::of("z"), expr: z });
-    let w_init = b.e(Expr::Struct { path: w_path, fields: List { start, len: 2 }, base: None });
+    let w_init = b.e(Expr::Struct { path: w_path, fields: List { start, len: 2 }, base: blaze_typeck::StructBase::None });
     let c_init = z_lit(&mut b, "Z2");
     let d_init = b.local(c);
     let (e0, e1) = (z_lit(&mut b, "Z3"), z_lit(&mut b, "Z3"));

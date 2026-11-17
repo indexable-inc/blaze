@@ -11,8 +11,9 @@
 //! the tail are placed at fixed offsets, and the tail at the next offset that is a multiple of
 //! its alignment; a slice `[T]`'s alignment is `T`'s and `str`'s is 1, both known statically,
 //! so the tail's offset is fixed too (`ls`, layout.rs `univariant`, keeps the unsized field last
-//! and places it so). A `dyn Trait` tail's alignment is the vtable's, a run-time value: `ls`
-//! refuses that struct by name ("a struct ending in a trait object"). The size of a value is a
+//! and places it so). A `dyn Trait` tail's alignment is the vtable's, a run-time value: its
+//! offset is the prefix's end rounded up to the vtable's word 2 where the tail is reached
+//! (crate::dyn_tail); the wide pointer's second word is then the vtable. The size of a value is a
 //! function of its length: `Layouts::size_of_val` (the prefix, plus `len` strides, rounded up
 //! to the alignment).
 //!
@@ -41,7 +42,7 @@ use super::{Shape, V, Walk, malformed, unsupported};
 use crate::BuildError;
 
 /// The refusal of a struct or tuple with an unsized tail used by value.
-pub(super) const UNSIZED_BY_VALUE: &str = "a struct or tuple whose last field is unsized (a slice or `str` tail) held by \
+pub(super) const UNSIZED_BY_VALUE: &str = "a struct or tuple whose last field is unsized (a slice, `str` or `dyn` tail) held by \
                                            value: the Reference, \"Dynamically Sized Types\": it exists only behind a \
                                            pointer";
 
@@ -66,8 +67,11 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let g = self.ground_ty(t).map_err(|error| Self::ty_err(base, error))?;
         let l = self.layout(g).map_err(|error| Self::ty_err(base, error))?;
         if !self.has_unsized_tail(l) {
-            return Err(unsupported(base, "a field of an unsized place that is not a struct or tuple ending in a slice or `str`"));
+            return Err(unsupported(base, "a field of an unsized place that is not a struct or tuple ending in a slice, `str` or `dyn`"));
         }
+        // A `dyn` tail's offset is rounded up to the vtable's alignment (crate::dyn_tail).
+        let ls_id = self.ls_of(g).map_err(|error| Self::ty_err(base, error))?;
+        let dyn_prefix = self.ls.dyn_prefix(ls_id);
         let Shape::Fields { first, len } = self.layouts[l as usize].shape else {
             return Err(malformed("an unsized aggregate that is not a struct or a tuple"));
         };
@@ -83,11 +87,19 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let addr = self.b.load(Ty::PTR, Flags::NONE, w, woff, MemAttrs::aligned(3));
         let v = if at + 1 == len {
             if !as_place {
-                return Err(unsupported(e, "an unsized field (a slice or `str` tail) held by value"));
+                return Err(unsupported(e, "an unsized field (a slice, `str` or `dyn` tail) held by value"));
             }
-            // The tail's wide pointer: the address plus the tail's offset, the same length.
+            // The tail's wide pointer: the address plus the tail's offset, the same metadata
+            // (a length, or the vtable).
             let len_word = self.b.load(Ty::I64, Flags::NONE, w, woff + 8, MemAttrs::aligned(3));
-            let tail = self.address((addr, field_off));
+            let tail = match dyn_prefix {
+                None => self.address((addr, field_off)),
+                Some(prefix) => {
+                    let vtable = self.b.load(Ty::PTR, Flags::NONE, w, woff + 8, MemAttrs::aligned(3));
+                    let off = crate::dyn_tail::tail_offset(&mut self.b, prefix, vtable);
+                    self.b.ptr_add(Flags::INBOUNDS, addr, off)
+                }
+            };
             let slot = self.b.slot(16, 3, SlotKind::Temp);
             let to = self.b.slot_addr(slot);
             self.b.store(Flags::NONE, tail, to, 0, MemAttrs::aligned(3));

@@ -134,6 +134,23 @@ pub fn module_of_native(store: &Path, name: &str, version: &str, features: &[&st
     module_where(store, name, version, features, Some(host))
 }
 
+/// Every record of the store whose identity names `name` and `version`, whatever its features
+/// and runner: (its folder, its identity's text), sorted by folder. What a refusal of a lookup
+/// shows beside the asked identity (rule 19): which line of the nearest record differs.
+pub fn records_named(store: &Path, name: &str, version: &str) -> Vec<(PathBuf, String)> {
+    let (name, version) = (format!("name {name}"), format!("version {version}"));
+    let Ok(entries) = std::fs::read_dir(store.join("build-script/modules")) else { return Vec::new() };
+    let mut found: Vec<(PathBuf, String)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let identity = std::fs::read_to_string(entry.path().join("identity")).ok()?;
+            (identity.lines().any(|l| l == name) && identity.lines().any(|l| l == version)).then(|| (entry.path(), identity))
+        })
+        .collect();
+    found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    found
+}
+
 /// The record whose identity names `name`, `version`, `features` and, for `host`, `target
 /// <host>`; for `None`, one with no `target` line (a wasm module).
 fn module_where(store: &Path, name: &str, version: &str, features: &[&str], host: Option<&str>) -> Option<PathBuf> {

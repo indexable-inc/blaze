@@ -59,7 +59,7 @@ const RET: u32 = 0xD65F_03C0;
 const MOV_W0_1: u32 = 0x5280_0020;
 const MOV_W0_42: u32 = 0x5280_0540;
 
-/// The host's row in the pin table (crates/hir-ty-codegen/clang.json).
+/// The host's row in the pin table (crates/blaze-toolchain/pins/clang.json).
 const HOST: &str = "aarch64-apple-darwin";
 const CLANG_DEADLINE: Duration = Duration::from_secs(60);
 const RUN_DEADLINE: Duration = Duration::from_secs(20);

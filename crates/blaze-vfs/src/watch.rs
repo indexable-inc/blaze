@@ -59,7 +59,7 @@ use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use blaze_core::{
     Completion, Cursor, Done, Effect, FileName, IoError, Listing, Lost, Names, S_IFMT, Stamp, Tag,
 };
-use blaze_hash::{HashMap, HashSet};
+use blaze_hash::{FixedState, Map, MapOpts, Set};
 use blaze_ids::ContentId;
 use blaze_mem::{MemError, Slab};
 use std::alloc::Global;
@@ -210,7 +210,7 @@ struct Batch {
     slots: Vec<Slot>,
     /// Each slot by name, once a listing may add names to it (the swept names are found in
     /// `names`).
-    index: HashMap<PathId, usize, Global>,
+    index: Map<PathId, usize, FixedState, Global>,
     /// Stamps and listings in flight: it commits once none is and every slot is looked at.
     open: u32,
     /// The slots read whose stamps are to be taken again before the batch commits
@@ -223,7 +223,7 @@ struct Batch {
     /// The directory a [`Lost::Unnamed`] lists alone: its slots are what was in it.
     relist: Option<PathId>,
     /// Each gone file the head had, by its inode: a name new to the batch with its stamp is it.
-    gone: HashMap<u64, usize, Global>,
+    gone: Map<u64, usize, FixedState, Global>,
     /// The journal's place once this is committed, and whether it then has told everything
     /// from before the watch.
     cursor: Option<Cursor>,
@@ -257,7 +257,7 @@ impl Batch {
             forced: Vec::new(),
             // alloc: none until a path changed; its room is kept as the batch is reused.
             slots: Vec::new(),
-            index: HashMap::new_in(Global),
+            index: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             open: 1,
             // alloc: none until a file is read; its room is kept as the batch is reused.
             verify: Vec::new(),
@@ -265,7 +265,7 @@ impl Batch {
             unsure: Vec::new(),
             rescan: None,
             relist: None,
-            gone: HashMap::new_in(Global),
+            gone: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             cursor: None,
             caught_up: false,
             asked_ns: 0,
@@ -484,7 +484,7 @@ struct Work {
     moves: Vec<(usize, usize)>,
     taken: Vec<PathId>,
     renames: Vec<(PathId, PathId)>,
-    renamed: HashSet<usize, Global>,
+    renamed: Set<usize, FixedState, Global>,
     sources: Vec<PathId>,
     early: Vec<PathId>,
     late: Vec<PathId>,
@@ -513,7 +513,7 @@ pub struct Watcher {
     /// Looks in flight, by their tag past `tags + FIRST`: a slot is reused once its look is in.
     pending: Slab<Pending>,
     /// What this watcher's commits left at each name, while batches told before them wait.
-    ours: HashMap<PathId, Seen, Global>,
+    ours: Map<PathId, Seen, FixedState, Global>,
     /// Every name a batch, a look in flight or `ours` holds; cleared once none is.
     paths: Paths,
     /// Committed batches, emptied, and the stamp buffer the driver last gave back.
@@ -525,7 +525,7 @@ pub struct Watcher {
     /// Each name saved as [`Stamp::UNKNOWN`] because its stamp was racy, and when that stamp
     /// is steady ([`steady_at`](crate::disk::steady_at): its change plus its window): told again then
     /// ([`Watcher::steady`]).
-    racy: HashMap<Box<str>, u64, Global>,
+    racy: Map<Box<str>, u64, FixedState, Global>,
     /// The cache directories out of the view ([`view`]), relative to `dir`.
     caches: Caches,
     /// The planted bug of the tests' control: a file's first stamp is saved whatever its read
@@ -567,14 +567,14 @@ impl Watcher {
             batches: VecDeque::new(),
             first: 0,
             pending: Slab::new(MOST_IN_FLIGHT, blaze_mem::Tag::Vfs)?,
-            ours: HashMap::new_in(Global),
+            ours: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             paths: Paths::default(),
             // alloc: none until a batch commits; then at most `SPARE_BATCHES`, reused.
             spare: Vec::new(),
             spare_names: None,
             work: Work::default(),
             now_ns: 0,
-            racy: HashMap::new_in(Global),
+            racy: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             caches: Caches::default(),
             #[cfg(test)]
             trusts_reads: false,
@@ -2013,7 +2013,7 @@ impl Watcher {
 /// directory, its `was` taken before an earlier batch deleted or moved that file, finds it gone
 /// by this watcher's own hand).
 fn made(
-    ours: &HashMap<PathId, Seen, Global>,
+    ours: &Map<PathId, Seen, FixedState, Global>,
     paths: &Paths,
     below: usize,
     name: PathId,
@@ -2090,7 +2090,7 @@ fn save(
     paths: &Paths,
     asked_ns: u64,
     conflicted: &[bool],
-    racy_names: &mut HashMap<Box<str>, u64, Global>,
+    racy_names: &mut Map<Box<str>, u64, FixedState, Global>,
     entries: &mut Vec<u8>,
 ) -> u32 {
     #[cfg(test)]

@@ -222,7 +222,7 @@ fn place_scrutinees_through_a_reference_move_nothing() {
         let path = b.path("G");
         let start = b.field_inits.len() as u32;
         b.field_inits.push(FieldInit { name: Name::of("x"), expr: sum });
-        let k_init = b.e(Expr::Struct { path, fields: List { start, len: 1 }, base: None });
+        let k_init = b.e(Expr::Struct { path, fields: List { start, len: 1 }, base: blaze_typeck::StructBase::None });
         let k = b.bind("k");
         stmts.push(Stmt::Let { pat: k, ty: None, init: Some(k_init), else_: None });
         let root = b.block(&stmts, None);

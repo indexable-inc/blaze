@@ -2,10 +2,12 @@
 //! the bounds, the field reader, the event stream, and the round trip against `Value` with its
 //! planted-bug control.
 
-use std::{alloc::Global, format, string::ToString, vec::Vec as StdVec};
+use std::{format, string::ToString};
+
+use blaze_mem::{Frame, Tag};
 
 use blaze_data::{Int, Map, Value, value};
-use blaze_own::{String, Vec};
+use blaze_own::{Alloc, AVec, Erased, String, Vec};
 use blaze_sim::{Broke, Config, Tape};
 
 use crate::{
@@ -14,108 +16,111 @@ use crate::{
     read_in, to_vec_in, why,
 };
 
-fn hex(text: &str) -> StdVec<u8> {
-    let digits: StdVec<u8> = text.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    digits
-        .chunks(2)
-        .map(|pair| u8::from_str_radix(core::str::from_utf8(pair).unwrap(), 16).unwrap())
-        .collect()
+fn hex<'a>(text: &str, alloc: Alloc<'a>) -> AVec<'a, u8> {
+    let digits = Vec::from_iter_in(text.bytes().filter(|b| !b.is_ascii_whitespace()), alloc);
+    Vec::from_iter_in(digits.chunks(2).map(|pair| u8::from_str_radix(core::str::from_utf8(pair).unwrap(), 16).unwrap()), alloc)
 }
 
-fn read(bytes: &[u8]) -> Value<Global> {
-    match read_in(bytes, Limits::DEFAULT, Global) {
+fn read<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Value<Alloc<'a>> {
+    match read_in(bytes, Limits::DEFAULT, alloc) {
         Ok(value) => value,
         Err(error) => panic!("{bytes:02x?}: {error}"),
     }
 }
 
-fn refused(text: &str) -> Error {
-    let bytes = hex(text);
-    match read_in(&bytes, Limits::DEFAULT, Global) {
+fn refused(text: &str, alloc: Alloc<'_>) -> Error {
+    let bytes = hex(text, alloc);
+    match read_in(&bytes, Limits::DEFAULT, alloc) {
         Ok(value) => panic!("{text} read as {value:?}"),
         Err(error) => error,
     }
 }
 
-fn written(value: &Value<Global>) -> StdVec<u8> {
-    to_vec_in(value, Global).as_slice().to_vec()
+fn written<'a>(value: &Value<Alloc<'_>>, alloc: Alloc<'a>) -> AVec<'a, u8> {
+    to_vec_in(value, alloc)
 }
 
 /// Appendix A's vectors that are deterministic: read as the value, and the value written back
 /// as the same bytes.
 #[test]
 fn appendix_a_reads_and_writes_back() {
-    let ints: &[(&str, Value<Global>)] = &[
-        ("00", value!(in Global; 0)),
-        ("01", value!(in Global; 1)),
-        ("0a", value!(in Global; 10)),
-        ("17", value!(in Global; 23)),
-        ("1818", value!(in Global; 24)),
-        ("1819", value!(in Global; 25)),
-        ("1864", value!(in Global; 100)),
-        ("1903e8", value!(in Global; 1000)),
-        ("1a000f4240", value!(in Global; 1_000_000)),
-        ("1b000000e8d4a51000", value!(in Global; 1_000_000_000_000u64)),
-        ("1bffffffffffffffff", value!(in Global; u64::MAX)),
-        ("20", value!(in Global; -1)),
-        ("29", value!(in Global; -10)),
-        ("3863", value!(in Global; -100)),
-        ("3903e7", value!(in Global; -1000)),
-        ("3b7fffffffffffffff", value!(in Global; i64::MIN)),
-        ("f90000", value!(in Global; 0.0)),
-        ("f98000", value!(in Global; -0.0)),
-        ("f93c00", value!(in Global; 1.0)),
-        ("fb3ff199999999999a", value!(in Global; 1.1)),
-        ("f93e00", value!(in Global; 1.5)),
-        ("f97bff", value!(in Global; 65504.0)),
-        ("fa47c35000", value!(in Global; 100_000.0)),
-        ("fa7f7fffff", value!(in Global; 3.4028234663852886e38)),
-        ("fb7e37e43c8800759c", value!(in Global; 1.0e300)),
-        ("f90001", value!(in Global; 5.960464477539063e-8)),
-        ("f90400", value!(in Global; 0.00006103515625)),
-        ("f9c400", value!(in Global; -4.0)),
-        ("fbc010666666666666", value!(in Global; -4.1)),
-        ("f97c00", value!(in Global; f64::INFINITY)),
-        ("f97e00", value!(in Global; f64::NAN)),
-        ("f9fc00", value!(in Global; f64::NEG_INFINITY)),
-        ("f4", value!(in Global; false)),
-        ("f5", value!(in Global; true)),
-        ("f6", value!(in Global; null)),
-        ("60", value!(in Global; "")),
-        ("6161", value!(in Global; "a")),
-        ("6449455446", value!(in Global; "IETF")),
-        ("62225c", value!(in Global; "\"\\")),
-        ("62c3bc", value!(in Global; "\u{fc}")),
-        ("63e6b0b4", value!(in Global; "\u{6c34}")),
-        ("64f0908591", value!(in Global; "\u{10151}")),
-        ("80", value!(in Global; [])),
-        ("83010203", value!(in Global; [1, 2, 3])),
-        ("8301820203820405", value!(in Global; [1, [2, 3], [4, 5]])),
+    let frame = Frame::with_reserve(4usize << 30, Tag::Codegen).expect("reserve");
+    let erased = Erased::new(&frame);
+    let alloc = erased.handle();
+    let ints: &[(&str, Value<Alloc<'_>>)] = &[
+        ("00", value!(in alloc; 0)),
+        ("01", value!(in alloc; 1)),
+        ("0a", value!(in alloc; 10)),
+        ("17", value!(in alloc; 23)),
+        ("1818", value!(in alloc; 24)),
+        ("1819", value!(in alloc; 25)),
+        ("1864", value!(in alloc; 100)),
+        ("1903e8", value!(in alloc; 1000)),
+        ("1a000f4240", value!(in alloc; 1_000_000)),
+        ("1b000000e8d4a51000", value!(in alloc; 1_000_000_000_000u64)),
+        ("1bffffffffffffffff", value!(in alloc; u64::MAX)),
+        ("20", value!(in alloc; -1)),
+        ("29", value!(in alloc; -10)),
+        ("3863", value!(in alloc; -100)),
+        ("3903e7", value!(in alloc; -1000)),
+        ("3b7fffffffffffffff", value!(in alloc; i64::MIN)),
+        ("f90000", value!(in alloc; 0.0)),
+        ("f98000", value!(in alloc; -0.0)),
+        ("f93c00", value!(in alloc; 1.0)),
+        ("fb3ff199999999999a", value!(in alloc; 1.1)),
+        ("f93e00", value!(in alloc; 1.5)),
+        ("f97bff", value!(in alloc; 65504.0)),
+        ("fa47c35000", value!(in alloc; 100_000.0)),
+        ("fa7f7fffff", value!(in alloc; 3.4028234663852886e38)),
+        ("fb7e37e43c8800759c", value!(in alloc; 1.0e300)),
+        ("f90001", value!(in alloc; 5.960464477539063e-8)),
+        ("f90400", value!(in alloc; 0.00006103515625)),
+        ("f9c400", value!(in alloc; -4.0)),
+        ("fbc010666666666666", value!(in alloc; -4.1)),
+        ("f97c00", value!(in alloc; f64::INFINITY)),
+        ("f97e00", value!(in alloc; f64::NAN)),
+        ("f9fc00", value!(in alloc; f64::NEG_INFINITY)),
+        ("f4", value!(in alloc; false)),
+        ("f5", value!(in alloc; true)),
+        ("f6", value!(in alloc; null)),
+        ("60", value!(in alloc; "")),
+        ("6161", value!(in alloc; "a")),
+        ("6449455446", value!(in alloc; "IETF")),
+        ("62225c", value!(in alloc; "\"\\")),
+        ("62c3bc", value!(in alloc; "\u{fc}")),
+        ("63e6b0b4", value!(in alloc; "\u{6c34}")),
+        ("64f0908591", value!(in alloc; "\u{10151}")),
+        ("80", value!(in alloc; [])),
+        ("83010203", value!(in alloc; [1, 2, 3])),
+        ("8301820203820405", value!(in alloc; [1, [2, 3], [4, 5]])),
         (
             "98190102030405060708090a0b0c0d0e0f101112131415161718181819",
-            value!(in Global; [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]),
+            value!(in alloc; [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]),
         ),
-        ("a0", value!(in Global; {})),
-        ("a26161016162820203", value!(in Global; {"a": 1, "b": [2, 3]})),
-        ("826161a161626163", value!(in Global; ["a", {"b": "c"}])),
-        ("a56161614161626142616361436164614461656145", value!(in Global; {"a": "A", "b": "B", "c": "C", "d": "D", "e": "E"})),
+        ("a0", value!(in alloc; {})),
+        ("a26161016162820203", value!(in alloc; {"a": 1, "b": [2, 3]})),
+        ("826161a161626163", value!(in alloc; ["a", {"b": "c"}])),
+        ("a56161614161626142616361436164614461656145", value!(in alloc; {"a": "A", "b": "B", "c": "C", "d": "D", "e": "E"})),
     ];
     for (text, value) in ints {
-        let bytes = hex(text);
-        assert_eq!(read(&bytes), *value, "{text}");
-        assert_eq!(written(value), bytes, "{text}");
+        let bytes = hex(text, alloc);
+        assert_eq!(read(&bytes, alloc), *value, "{text}");
+        assert_eq!(written(value, alloc), bytes, "{text}");
     }
-    let mut b = Vec::new_in(Global);
+    let mut b = Vec::new_in(alloc);
     b.extend_from_slice(&[1, 2, 3, 4]);
-    let bytes = Value::<Global>::Bytes(b);
-    assert_eq!(read(&hex("4401020304")), bytes);
-    assert_eq!(written(&bytes), hex("4401020304"));
-    assert_eq!(read(&hex("40")), Value::Bytes(Vec::new_in(Global)));
+    let bytes = Value::<Alloc<'_>>::Bytes(b);
+    assert_eq!(read(&hex("4401020304", alloc), alloc), bytes);
+    assert_eq!(written(&bytes, alloc), hex("4401020304", alloc));
+    assert_eq!(read(&hex("40", alloc), alloc), Value::Bytes(Vec::new_in(alloc)));
 }
 
 /// Appendix A's vectors that have no `Value` or break the deterministic rules: refused, by name.
 #[test]
 fn appendix_a_outside_the_rules_is_refused() {
+    let frame = Frame::with_reserve(4usize << 30, Tag::Codegen).expect("reserve");
+    let erased = Erased::new(&frame);
+    let alloc = erased.handle();
     let cases: &[(&str, usize, &str)] = &[
         ("3bffffffffffffffff", 0, why::NEGATIVE_PAST_I64),
         ("c074323031332d30332d32315432303a30343a30305a", 0, why::TAG),
@@ -139,70 +144,76 @@ fn appendix_a_outside_the_rules_is_refused() {
         ("826161bf61626163ff", 3, why::INDEFINITE),
     ];
     for &(text, at, why) in cases {
-        assert_eq!(refused(text), Error { at, why }, "{text}");
+        assert_eq!(refused(text, alloc), Error { at, why }, "{text}");
     }
 }
 
 /// Each rule of RFC 8949 4.2.1, a canonical input read and a non-canonical one refused.
 #[test]
 fn each_deterministic_rule_refuses_its_breach() {
+    let frame = Frame::with_reserve(4usize << 30, Tag::Codegen).expect("reserve");
+    let erased = Erased::new(&frame);
+    let alloc = erased.handle();
     // Shortest heads: numbers, and every length's head.
-    assert_eq!(read(&hex("17")), value!(in Global; 23));
-    assert_eq!(refused("1817"), Error { at: 0, why: why::NOT_SHORTEST });
-    assert_eq!(refused("190017"), Error { at: 0, why: why::NOT_SHORTEST });
-    assert_eq!(refused("1a0000ffff"), Error { at: 0, why: why::NOT_SHORTEST });
-    assert_eq!(refused("1b00000000ffffffff"), Error { at: 0, why: why::NOT_SHORTEST });
-    assert_eq!(refused("3817"), Error { at: 0, why: why::NOT_SHORTEST });
-    assert_eq!(refused("5800"), Error { at: 0, why: why::NOT_SHORTEST });
-    assert_eq!(refused("780161"), Error { at: 0, why: why::NOT_SHORTEST });
-    assert_eq!(refused("9800"), Error { at: 0, why: why::NOT_SHORTEST });
-    assert_eq!(refused("b800"), Error { at: 0, why: why::NOT_SHORTEST });
-    assert_eq!(refused("1c"), Error { at: 0, why: why::INDEFINITE });
+    assert_eq!(read(&hex("17", alloc), alloc), value!(in alloc; 23));
+    assert_eq!(refused("1817", alloc), Error { at: 0, why: why::NOT_SHORTEST });
+    assert_eq!(refused("190017", alloc), Error { at: 0, why: why::NOT_SHORTEST });
+    assert_eq!(refused("1a0000ffff", alloc), Error { at: 0, why: why::NOT_SHORTEST });
+    assert_eq!(refused("1b00000000ffffffff", alloc), Error { at: 0, why: why::NOT_SHORTEST });
+    assert_eq!(refused("3817", alloc), Error { at: 0, why: why::NOT_SHORTEST });
+    assert_eq!(refused("5800", alloc), Error { at: 0, why: why::NOT_SHORTEST });
+    assert_eq!(refused("780161", alloc), Error { at: 0, why: why::NOT_SHORTEST });
+    assert_eq!(refused("9800", alloc), Error { at: 0, why: why::NOT_SHORTEST });
+    assert_eq!(refused("b800", alloc), Error { at: 0, why: why::NOT_SHORTEST });
+    assert_eq!(refused("1c", alloc), Error { at: 0, why: why::INDEFINITE });
     // Definite lengths only.
-    assert_eq!(refused("5fff"), Error { at: 0, why: why::INDEFINITE });
-    assert_eq!(refused("bfff"), Error { at: 0, why: why::INDEFINITE });
-    assert_eq!(refused("ff"), Error { at: 0, why: why::INDEFINITE });
+    assert_eq!(refused("5fff", alloc), Error { at: 0, why: why::INDEFINITE });
+    assert_eq!(refused("bfff", alloc), Error { at: 0, why: why::INDEFINITE });
+    assert_eq!(refused("ff", alloc), Error { at: 0, why: why::INDEFINITE });
     // Keys in their encodings' bytewise order, the shorter first, none twice.
-    assert_eq!(read(&hex("a2 6162 01 626161 02")), value!(in Global; {"b": 1, "aa": 2}));
-    assert_eq!(written(&value!(in Global; {"aa": 2, "b": 1})), hex("a2 6162 01 626161 02"));
-    assert_eq!(refused("a2 626161 02 6162 01"), Error { at: 5, why: why::KEY_ORDER });
-    assert_eq!(refused("a2 6162 01 6161 02"), Error { at: 4, why: why::KEY_ORDER });
-    assert_eq!(refused("a2 6161 01 6161 02"), Error { at: 4, why: why::KEY_TWICE });
+    assert_eq!(read(&hex("a2 6162 01 626161 02", alloc), alloc), value!(in alloc; {"b": 1, "aa": 2}));
+    assert_eq!(written(&value!(in alloc; {"aa": 2, "b": 1}), alloc), hex("a2 6162 01 626161 02", alloc));
+    assert_eq!(refused("a2 626161 02 6162 01", alloc), Error { at: 5, why: why::KEY_ORDER });
+    assert_eq!(refused("a2 6162 01 6161 02", alloc), Error { at: 4, why: why::KEY_ORDER });
+    assert_eq!(refused("a2 6161 01 6161 02", alloc), Error { at: 4, why: why::KEY_TWICE });
     // Shortest exact floats; one NaN.
-    assert_eq!(refused("fa3f800000"), Error { at: 0, why: why::FLOAT_NOT_SHORTEST });
-    assert_eq!(refused("fb3ff0000000000000"), Error { at: 0, why: why::FLOAT_NOT_SHORTEST });
-    assert_eq!(refused("fb3ff8000000000000"), Error { at: 0, why: why::FLOAT_NOT_SHORTEST });
-    assert_eq!(refused("fb47efffffe0000000"), Error { at: 0, why: why::FLOAT_NOT_SHORTEST });
-    assert_eq!(refused("f97e01"), Error { at: 0, why: why::NAN_NOT_CANONICAL });
-    assert_eq!(refused("f9fe00"), Error { at: 0, why: why::NAN_NOT_CANONICAL });
-    assert_eq!(written(&value!(in Global; f64::from_bits(0x7ff8_0000_0000_0001))), hex("f97e00"), "every NaN is one");
-    assert_eq!(written(&value!(in Global; 1.0e-7)), hex("fb3e7ad7f29abcaf48"));
-    assert_eq!(written(&value!(in Global; 0.5f32)), hex("f93800"));
-    assert_eq!(written(&value!(in Global; f64::from(f32::MIN_POSITIVE))), hex("fa00800000"));
+    assert_eq!(refused("fa3f800000", alloc), Error { at: 0, why: why::FLOAT_NOT_SHORTEST });
+    assert_eq!(refused("fb3ff0000000000000", alloc), Error { at: 0, why: why::FLOAT_NOT_SHORTEST });
+    assert_eq!(refused("fb3ff8000000000000", alloc), Error { at: 0, why: why::FLOAT_NOT_SHORTEST });
+    assert_eq!(refused("fb47efffffe0000000", alloc), Error { at: 0, why: why::FLOAT_NOT_SHORTEST });
+    assert_eq!(refused("f97e01", alloc), Error { at: 0, why: why::NAN_NOT_CANONICAL });
+    assert_eq!(refused("f9fe00", alloc), Error { at: 0, why: why::NAN_NOT_CANONICAL });
+    assert_eq!(written(&value!(in alloc; f64::from_bits(0x7ff8_0000_0000_0001)), alloc), hex("f97e00", alloc), "every NaN is one");
+    assert_eq!(written(&value!(in alloc; 1.0e-7), alloc), hex("fb3e7ad7f29abcaf48", alloc));
+    assert_eq!(written(&value!(in alloc; 0.5f32), alloc), hex("f93800", alloc));
+    assert_eq!(written(&value!(in alloc; f64::from(f32::MIN_POSITIVE)), alloc), hex("fa00800000", alloc));
     // One value, then the end.
-    assert_eq!(refused("0000"), Error { at: 1, why: why::BYTES_AFTER });
-    assert_eq!(refused(""), Error { at: 0, why: why::END_AT_VALUE });
+    assert_eq!(refused("0000", alloc), Error { at: 1, why: why::BYTES_AFTER });
+    assert_eq!(refused("", alloc), Error { at: 0, why: why::END_AT_VALUE });
 }
 
 #[test]
 fn bounds_are_parameters_and_refused() {
+    let frame = Frame::with_reserve(4usize << 30, Tag::Codegen).expect("reserve");
+    let erased = Erased::new(&frame);
+    let alloc = erased.handle();
     let limits = Limits { most_depth: 2, ..Limits::DEFAULT };
-    assert!(read_in(&hex("818100"), limits, Global).is_ok());
-    assert_eq!(read_in(&hex("81818100"), limits, Global).unwrap_err(), Error { at: 2, why: why::TOO_DEEP });
-    assert_eq!(read_in(&hex("a1616181a0"), limits, Global).unwrap_err(), Error { at: 4, why: why::TOO_DEEP });
+    assert!(read_in(&hex("818100", alloc), limits, alloc).is_ok());
+    assert_eq!(read_in(&hex("81818100", alloc), limits, alloc).unwrap_err(), Error { at: 2, why: why::TOO_DEEP });
+    assert_eq!(read_in(&hex("a1616181a0", alloc), limits, alloc).unwrap_err(), Error { at: 4, why: why::TOO_DEEP });
     let limits = Limits { most_bytes: 2, ..Limits::DEFAULT };
-    assert_eq!(read_in(&hex("1903e8"), limits, Global).unwrap_err(), Error { at: 0, why: why::TOO_LARGE });
+    assert_eq!(read_in(&hex("1903e8", alloc), limits, alloc).unwrap_err(), Error { at: 0, why: why::TOO_LARGE });
     // A length is checked against the input before anything is sized by it.
-    assert_eq!(refused("9affffffff00"), Error { at: 0, why: why::ARRAY_PAST_INPUT });
-    assert_eq!(refused("baffffffff00"), Error { at: 0, why: why::MAP_PAST_INPUT });
-    assert_eq!(refused("a2616100"), Error { at: 0, why: why::MAP_PAST_INPUT });
-    assert_eq!(refused("5affffffff00"), Error { at: 0, why: why::BYTES_PAST_INPUT });
-    assert_eq!(refused("7b00000001000000000000"), Error { at: 0, why: why::TEXT_PAST_INPUT });
-    assert_eq!(refused("62c3"), Error { at: 0, why: why::TEXT_PAST_INPUT });
-    assert_eq!(refused("61ff"), Error { at: 0, why: why::NOT_UTF8 });
-    assert_eq!(refused("1903"), Error { at: 1, why: why::END_IN_VALUE });
-    assert_eq!(refused("8201"), Error { at: 0, why: why::ARRAY_PAST_INPUT });
-    assert_eq!(refused("a16161"), Error { at: 3, why: why::END_AT_VALUE });
+    assert_eq!(refused("9affffffff00", alloc), Error { at: 0, why: why::ARRAY_PAST_INPUT });
+    assert_eq!(refused("baffffffff00", alloc), Error { at: 0, why: why::MAP_PAST_INPUT });
+    assert_eq!(refused("a2616100", alloc), Error { at: 0, why: why::MAP_PAST_INPUT });
+    assert_eq!(refused("5affffffff00", alloc), Error { at: 0, why: why::BYTES_PAST_INPUT });
+    assert_eq!(refused("7b00000001000000000000", alloc), Error { at: 0, why: why::TEXT_PAST_INPUT });
+    assert_eq!(refused("62c3", alloc), Error { at: 0, why: why::TEXT_PAST_INPUT });
+    assert_eq!(refused("61ff", alloc), Error { at: 0, why: why::NOT_UTF8 });
+    assert_eq!(refused("1903", alloc), Error { at: 1, why: why::END_IN_VALUE });
+    assert_eq!(refused("8201", alloc), Error { at: 0, why: why::ARRAY_PAST_INPUT });
+    assert_eq!(refused("a16161", alloc), Error { at: 3, why: why::END_AT_VALUE });
 }
 
 /// `body` on a thread with a 64 KiB stack, where a recursion on depth overflows long before a
@@ -213,8 +224,8 @@ fn small_stack(body: impl FnOnce() + Send + 'static) {
 }
 
 /// `n` levels, one-element arrays and one-entry maps (key `"k"`) by turns, around a `0`.
-fn nested(n: usize) -> StdVec<u8> {
-    let mut bytes = StdVec::new();
+fn nested<'a>(n: usize, alloc: Alloc<'a>) -> AVec<'a, u8> {
+    let mut bytes = Vec::new_in(alloc);
     for i in 0..n {
         match i % 2 {
             0 => bytes.push(0x81),
@@ -227,24 +238,30 @@ fn nested(n: usize) -> StdVec<u8> {
 
 #[test]
 fn deep_nesting_reads_writes_and_drops_in_a_small_stack() {
-    for (n, limits) in [(128, Limits::DEFAULT), (1_000_000, Limits { most_depth: 1_000_000, ..Limits::DEFAULT })] {
-        small_stack(move || {
-            let bytes = nested(n);
-            let value = read_in(&bytes, limits, Global).unwrap();
-            assert_eq!(to_vec_in(&value, Global).as_slice(), bytes.as_slice(), "write(read(bytes)) is the bytes");
-            let copy = value.copy_in(Global);
-            assert_eq!(to_vec_in(&copy, Global).as_slice(), bytes.as_slice(), "the copy writes the same");
-            assert_eq!(read_in(&nested(n + 1), limits, Global).unwrap_err().why, why::TOO_DEEP);
+    let frame = Frame::with_reserve(4usize << 30, Tag::Codegen).expect("reserve");
+    small_stack(move || {
+        let erased = Erased::new(&frame);
+        let alloc = erased.handle();
+        for (n, limits) in [(128, Limits::DEFAULT), (1_000_000, Limits { most_depth: 1_000_000, ..Limits::DEFAULT })] {
+            let bytes = nested(n, alloc);
+            let value = read_in(&bytes, limits, alloc).unwrap();
+            assert_eq!(to_vec_in(&value, alloc).as_slice(), bytes.as_slice(), "write(read(bytes)) is the bytes");
+            let copy = value.copy_in(alloc);
+            assert_eq!(to_vec_in(&copy, alloc).as_slice(), bytes.as_slice(), "the copy writes the same");
+            assert_eq!(read_in(&nested(n + 1, alloc), limits, alloc).unwrap_err().why, why::TOO_DEEP);
             drop(value);
             drop(copy);
-        });
-    }
+        }
+    });
 }
 
 /// The field reader blaze-pack's and blaze-watch's records are read with, as it was moved.
 #[test]
 fn the_field_reader_reads_records() {
-    let mut out = Vec::new_in(Global);
+    let frame = Frame::with_reserve(4usize << 30, Tag::Codegen).expect("reserve");
+    let erased = Erased::new(&frame);
+    let alloc = erased.handle();
+    let mut out = Vec::new_in(alloc);
     crate::array(&mut out, 4);
     crate::uint(&mut out, 500);
     crate::text(&mut out, "name");
@@ -269,9 +286,12 @@ fn the_field_reader_reads_records() {
 
 #[test]
 fn events_stream_both_ways() {
-    let bytes = hex("a2 6161 01 6162 82 f6 43010203");
-    let mut decoder = Decoder::new_in(&bytes, Limits::DEFAULT, Global).unwrap();
-    let mut events = StdVec::new();
+    let frame = Frame::with_reserve(4usize << 30, Tag::Codegen).expect("reserve");
+    let erased = Erased::new(&frame);
+    let alloc = erased.handle();
+    let bytes = hex("a2 6161 01 6162 82 f6 43010203", alloc);
+    let mut decoder = Decoder::new_in(&bytes, Limits::DEFAULT, alloc).unwrap();
+    let mut events = Vec::new_in(alloc);
     while let Some(item) = decoder.next().unwrap() {
         events.push((item.at, item.event));
     }
@@ -289,16 +309,16 @@ fn events_stream_both_ways() {
             (12, Event::EndMap),
         ]
     );
-    let mut out = Vec::new_in(Global);
-    let mut encoder = Encoder::new_in(&mut out, Global);
+    let mut out = Vec::new_in(alloc);
+    let mut encoder = Encoder::new_in(&mut out, alloc);
     for (_, event) in &events {
         encoder.event(event).unwrap();
     }
     encoder.finish().unwrap();
     assert_eq!(out.as_slice(), bytes.as_slice());
 
-    let mut out = Vec::new_in(Global);
-    let mut e = Encoder::new_in(&mut out, Global);
+    let mut out = Vec::new_in(alloc);
+    let mut e = Encoder::new_in(&mut out, alloc);
     assert_eq!(e.event(&Event::Key("a")).unwrap_err().what, StreamWhat::KeyNotDue);
     e.event(&Event::StartMap { len: 2 }).unwrap();
     assert_eq!(e.event(&Event::Null).unwrap_err().what, StreamWhat::KeyDue);
@@ -313,12 +333,12 @@ fn events_stream_both_ways() {
     e.event(&Event::EndMap).unwrap();
     assert_eq!(e.event(&Event::Null).unwrap_err().what, StreamWhat::AfterEnd);
     e.finish().unwrap();
-    assert_eq!(out.as_slice(), hex("a2 6162 f6 626161 f5").as_slice());
-    let mut out = Vec::new_in(Global);
-    let mut e = Encoder::new_in(&mut out, Global);
+    assert_eq!(out.as_slice(), hex("a2 6162 f6 626161 f5", alloc).as_slice());
+    let mut out = Vec::new_in(alloc);
+    let mut e = Encoder::new_in(&mut out, alloc);
     e.event(&Event::StartList { len: 0 }).unwrap_or_else(|error| panic!("{error}"));
-    let mut out2 = Vec::new_in(Global);
-    let mut e2 = Encoder::new_in(&mut out2, Global);
+    let mut out2 = Vec::new_in(alloc);
+    let mut e2 = Encoder::new_in(&mut out2, alloc);
     e2.event(&Event::StartList { len: 1 }).unwrap();
     assert_eq!(e2.finish().unwrap_err().what, StreamWhat::Unfinished);
     e.event(&Event::EndList).unwrap();
@@ -326,7 +346,7 @@ fn events_stream_both_ways() {
 }
 
 /// A value from the tape, `depth` levels at most; floats finite or the one NaN.
-fn draw_value(tape: &Tape, depth: u32) -> Value<Global> {
+fn draw_value<'a>(tape: &Tape, depth: u32, alloc: Alloc<'a>) -> Value<Alloc<'a>> {
     let kinds: u8 = if depth == 0 { 5 } else { 7 };
     match tape.int_in(0u8..=kinds, "kind") {
         0 => Value::Null,
@@ -340,23 +360,23 @@ fn draw_value(tape: &Tape, depth: u32) -> Value<Global> {
             1 => f64::from(f32::from_bits(tape.int_in(0..=u32::MAX, "f32 bits"))),
             _ => tape.f64_finite("float"),
         }),
-        4 => Value::Text(String::from_str_in(&tape.text(0..=8, "text"), Global)),
+        4 => Value::Text(String::from_str_in(&tape.text(0..=8, "text"), alloc)),
         5 => {
-            let mut bytes = Vec::new_in(Global);
+            let mut bytes = Vec::new_in(alloc);
             bytes.extend_from_slice(&tape.bytes(0..=8, "bytes"));
             Value::Bytes(bytes)
         }
         6 => {
-            let mut list = Vec::new_in(Global);
-            for item in tape.vec(0..=4, "list", |t| draw_value(t, depth - 1)) {
+            let mut list = Vec::new_in(alloc);
+            for item in tape.vec(0..=4, "list", |t| draw_value(t, depth - 1, alloc)) {
                 list.push(item);
             }
             Value::List(list)
         }
         _ => {
-            let mut map = Map::new_in(Global);
-            for (key, value) in tape.vec(0..=4, "map", |t| (t.text_from("ab", 0..=3, "key"), draw_value(t, depth - 1))) {
-                map.insert(String::from_str_in(&key, Global), value);
+            let mut map = Map::new_in(alloc);
+            for (key, value) in tape.vec(0..=4, "map", |t| (t.text_from("ab", 0..=3, "key"), draw_value(t, depth - 1, alloc))) {
+                map.insert(String::from_str_in(&key, alloc), value);
             }
             Value::Map(map)
         }
@@ -365,21 +385,21 @@ fn draw_value(tape: &Tape, depth: u32) -> Value<Global> {
 
 /// read(write(v)) == v (a NaN read back as the one NaN), the bytes written twice equal, and
 /// the decoder's events through the encoder give the same bytes.
-fn round_trip(tape: &Tape) -> Result<(), Broke> {
-    let v = draw_value(tape, 3);
-    let bytes = to_vec_in(&v, Global);
-    let back = read_in(bytes.as_slice(), Limits::DEFAULT, Global)
+fn round_trip(tape: &Tape, alloc: Alloc<'_>) -> Result<(), Broke> {
+    let v = draw_value(tape, 3, alloc);
+    let bytes = to_vec_in(&v, alloc);
+    let back = read_in(bytes.as_slice(), Limits::DEFAULT, alloc)
         .map_err(|error| Broke::Oracle(format!("the round trip of {v:?} wrote {:02x?}: {error}", bytes.as_slice())))?;
-    let canonical = |x: &Value<Global>| to_vec_in(x, Global).as_slice().to_vec();
+    let canonical = |x: &Value<Alloc<'_>>| to_vec_in(x, alloc);
     if canonical(&back) != bytes.as_slice() {
         return Err(Broke::Oracle(format!("the round trip of {v:?} gave {back:?}")));
     }
     if !has_nan(&v) && back != v {
         return Err(Broke::Oracle(format!("the round trip of {v:?} gave {back:?}")));
     }
-    let mut out = Vec::new_in(Global);
-    let mut encoder = Encoder::new_in(&mut out, Global);
-    let mut decoder = Decoder::new_in(bytes.as_slice(), Limits::DEFAULT, Global).map_err(|e| Broke::Harness(e.to_string()))?;
+    let mut out = Vec::new_in(alloc);
+    let mut encoder = Encoder::new_in(&mut out, alloc);
+    let mut decoder = Decoder::new_in(bytes.as_slice(), Limits::DEFAULT, alloc).map_err(|e| Broke::Harness(e.to_string()))?;
     while let Some(item) = decoder.next().map_err(|e| Broke::Oracle(format!("the decoder: {e}")))? {
         encoder.event(&item.event).map_err(|e| Broke::Oracle(format!("the encoder: {e}")))?;
     }
@@ -390,7 +410,7 @@ fn round_trip(tape: &Tape) -> Result<(), Broke> {
     Ok(())
 }
 
-fn has_nan(v: &Value<Global>) -> bool {
+fn has_nan(v: &Value<Alloc<'_>>) -> bool {
     match v {
         Value::Float(x) => x.is_nan(),
         Value::List(list) => list.iter().any(has_nan),
@@ -401,11 +421,17 @@ fn has_nan(v: &Value<Global>) -> bool {
 
 #[test]
 fn the_round_trip_holds() {
-    blaze_sim::check(Config::cases(400), round_trip);
+    let frame = Frame::with_reserve(4usize << 30, Tag::Codegen).expect("reserve");
+    let erased = Erased::new(&frame);
+    let alloc = erased.handle();
+    blaze_sim::check(Config::cases(400), |tape| round_trip(tape, alloc));
 }
 
 #[test]
 fn the_oracle_catches_keys_sorted_by_bytes_alone() {
-    let run = |tape: &Tape, p: Plant| plant::with(p, || round_trip(tape));
+    let frame = Frame::with_reserve(4usize << 30, Tag::Codegen).expect("reserve");
+    let erased = Erased::new(&frame);
+    let alloc = erased.handle();
+    let run = |tape: &Tape, p: Plant| plant::with(p, || round_trip(tape, alloc));
     blaze_sim::control(Config::cases(400), Plant::Clean, Plant::KeysBytewise, "the round trip", run);
 }

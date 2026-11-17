@@ -400,9 +400,9 @@ number marked "estimate" is one; no run backs it.
    (parked) gen/ shows LLVM driven at build time with a pinned prebuilt output checked by BLAKE3 (pin.rs,
    stencils.json): the model for the table's digest (point 2, stage 2).
    How LLVM is pinned and linked: root Cargo.toml `[workspace.metadata.blaze.native.llvm] pin =
-   "crates/hir-ty-codegen/llvm.json", env = "LLVM_SYS_231_PREFIX", packages = ["llvm-sys",
+   "crates/blaze-toolchain/pins/llvm.json", env = "LLVM_SYS_231_PREFIX", packages = ["llvm-sys",
    "blaze-stencil/llvm-stencils"]`; llvm.json pins 23.1.4 with per-target tarballs and sha256; vendor/llvm-sys
-   pin.rs reads `PIN_JSON = "../../crates/hir-ty-codegen/llvm.json"`, wrappers/passes.cpp holds
+   pin.rs reads `PIN_JSON = "../../crates/blaze-toolchain/pins/llvm.json"`, wrappers/passes.cpp holds
    `LLVMBlazeRunPasses`. The pin lives in a parked crate and must move when blaze-llvm exists (coordinator's
    edit: vendor/ is no lane's).
 5. Export. blaze-export export.rs `export(program, platform, out, alloc)` already makes every in-reach call a
@@ -482,7 +482,7 @@ records shareable across a layout edit. Kept as decided.
 | 14 | Loop-entry variant, poll fault handler | none | F3 |
 | 15 | Export of optimized records | export takes today's records | G |
 | 16 | x86-64 | refused in run mode; parked stencils only | H |
-| 17 | The LLVM pin out of a parked crate | crates/hir-ty-codegen/llvm.json, vendor/llvm-sys pin.rs | coordinator |
+| 17 | The LLVM pin out of a parked crate (moved 2026-11-16: crates/hir-ty-codegen/llvm.json is crates/blaze-toolchain/pins/llvm.json) | crates/blaze-toolchain/pins/llvm.json, vendor/llvm-sys pin.rs | coordinator |
 
 #### Pieces, in point 7's order
 
@@ -662,3 +662,95 @@ in the state; a value it wants to keep across a suspension that the table does n
 the expression: that is a gap in the flow body (and so in what the check knows is held across the await),
 fixed there. The builder's own values (addresses, derived pointers) are recomputed after a resume. Test, a
 rung each: every slot kept across a suspension names a flow local; plant: a builder-made slot is caught.
+
+### The body: one lowering, built now (D119, the coordinator's design, 2026-11-16 23:50)
+
+The owner asked for the end state now, in parallel with tempo ("if there is more of a SOTA architecture ...
+please just send that as well"). This replaces "started after tempo runs" above.
+
+What was read (rounds/wave-2311/G1-one-lowering-facts.md in the coordinator's notes): a checked body is
+lowered THREE times, each over the same 37 expression forms: blaze-flow-lower (7.4k lines) to a check-only
+skeleton (no type of any local, no callee, no constant's value, every operator a nameless aggregate, a
+`match` one coarse switch, no unwind edge); blaze-build's walk (17k lines) to LIR, once per INSTANCE,
+redoing scopes, temporaries, match tests and drop flags each time; blaze-consteval's compiler to its own
+ops. On one night ten lanes each added a form to one of the three and two had to add it to a second. The
+borrow check proves a different program from the one that runs, and no proof passes between them.
+
+END STATE. One lowering, to one complete, typed, generic BODY; everything else reads it:
+
+    checked body --lower (once a body)--> Body --check: loans, moves, saved locals (proof)
+                                               --elaborate drops (body to body, once a body)
+                                               --evaluate (constants, at ground arguments)
+                                               --build (LIR, at ground arguments: one linear pass)
+
+The body is a RECORD (crate `blaze-body`): flat tables read in place, keyed like the check that made it,
+positions item-relative (rule 71), no pointer in it. It is generic: its types are the checked record's
+portable types; an instance grounds them when it builds or evaluates. What it holds, so that no reader goes
+back to the expression tree:
+
+- `locals`: type, kind (return, argument, binding, temporary), mutability, and the identity the 21:07
+  ruling named (binding's pattern, or expression and role). A local is one thing for every reader.
+- `places`: interned (local, projections): field (index, type), deref, index (by a local), constant index
+  and subslice (slice patterns), downcast (variant).
+- `consts`: a literal's bits with its type; a string or byte data row; an item constant (key, arguments);
+  a promoted; a fn item (key, arguments); a static's address; an anonymous constant.
+- statements, fixed-width rows: `Assign(place, value)`, `StorageLive`, `StorageDead`, `Activate(loan)`,
+  `FakeRead` (a guard's shallow borrow). A value is one of: use, borrow (kind, place, loan), raw address,
+  binary op, checked binary op (value and overflow flag), unary op, cast (kind, operand, type), aggregate
+  (tuple, array, ADT variant, closure, coroutine; operands), repeat, length, discriminant, a type's size or
+  alignment, a thread-local's address.
+- terminators: `Goto`; `Switch` (an operand; (value, block) cases; otherwise); `Call` (callee, arguments,
+  destination, target, unwind; its lifetime part for the check); `Drop` (place, target, unwind); `Assert`
+  (condition, expected, kind: overflow of an op, bounds (length, index), division or remainder by zero,
+  a resumed-after-completion coroutine; target, unwind); `Suspend` (resume, cancel); `Return`;
+  `Unreachable`; `Resume`; `Terminate`; `InlineAsm`. A callee is a fn item (key, arguments), a trait method
+  (key, arguments: resolved to an impl or a vtable slot when the instance is ground), a value (a fn
+  pointer), or an intrinsic. `unwind` is continue, a cleanup block, unreachable or terminate.
+- blocks (rows, terminator, normal or cleanup), and the borrow facts the flow body has today (loans,
+  origins, subsets), carried by the same ids.
+
+Rules that make it better than a second MIR:
+
+1. A `match` is lowered ONCE to tests (switches on discriminants and values, in Rust's order of arms and
+   guards), and the borrow check, the evaluator and the builder all run those same tests.
+2. Unwinding is in the body: every call, drop and assert that may unwind names its cleanup block, made once
+   a body. `panic = "abort"` is a build fact: the builder then emits no pad; the body does not change.
+3. Drops are written un-elaborated (`Drop(place)` means "if initialized") so the check sees Rust's rule;
+   ELABORATION is one body-to-body pass that reads the check's move dataflow (blaze-flow moves.rs already
+   computes `DropKind` and nothing reads it) and writes drop flags as locals. Once a body, not once an
+   instance.
+4. The builder takes the check's PROOF (rule 74): `build(body: &Checked<Body>, ..)`. No code is built from
+   a body the check has not passed.
+5. Building an instance is a linear pass over the rows with a substitution: layout, ABI, intrinsics,
+   vtables, format templates and checks stay in blaze-build (layout.rs, cabi.rs, intrinsics.rs, vtable.rs
+   are kept); scope logic, temporaries, match lowering and drop flags leave it. FLOOR: an instance's build
+   reads each row once; the first measurement to quote is rows a second against today's walk on the same
+   instances (the profile's build rows), and the target is within 10% of LIR emission alone.
+6. Two instances whose builds READ the same facts (layouts, callee symbols) share one code record (point
+   (b) above): the key is the body's digest and the facts read, never the type arguments as written.
+7. The evaluator interprets the same rows over blaze-consteval's memory; its own compiler is deleted.
+8. The Lean semantics of rule 57 is of this body; each body-to-body pass (elaboration, the coroutine
+   transform when it moves here) is validated against it.
+
+HOW IT IS BUILT (rule 79, then rule 48: a fresh core in new crates beside the old code; nothing old is
+edited until the switch):
+
+- P1 `blaze-body` (interfaces first): the tables and ids above; a builder API; a printer and parser of a
+  text form (tests are written in it); `verify` (every operand typed and of the type its use wants; every
+  block ends in one terminator; an unwind edge enters only a cleanup block; a local is live where used);
+  the record form (blaze-format, read in place). Compiles alone.
+- P2 `blaze-body-lower`: checked body to body, on the same task stack as today's lowerings: (a) operators,
+  casts, places, literals, constants; (b) calls, methods, closures, fn pointers, operators that are calls;
+  (c) patterns and `match` tests; (d) scopes, temporaries, drops and cleanup blocks; (e) async and
+  coroutines; (f) `format_args!`, statics, `asm!`. Its signature and lifetime reading (3k lines of
+  blaze-flow-lower) is kept and moved, not rewritten.
+- P3 the check over the body: blaze-flow's loans, moves and saved-locals analyses read `blaze-body`.
+- P4 drop elaboration (body to body) from the check's dataflow.
+- P5 the evaluator over the body (blaze-consteval's machine and memory kept, its compiler replaced).
+- P6 the builder over the body (a linear pass; blaze-build's layout, ABI, intrinsics, vtables kept).
+- P7 the switch: front2 calls the new path; flow-lower, the walk and the evaluator's compiler are deleted.
+
+PROOF AT EACH STEP (rule 78: the two builders are one seam with two instantiations, tested equal): every
+x0 ladder rung and the std census run through both paths and must print the same; the body's interpreter
+against the built code on generated bodies (the tier fuzzer of (e), one level up); a planted bug in each
+pass is caught.

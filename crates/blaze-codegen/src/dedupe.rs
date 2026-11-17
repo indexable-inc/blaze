@@ -23,7 +23,7 @@ use std::alloc::{Allocator, Global};
 use std::collections::BTreeMap;
 use std::fmt;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::ItemKey;
 
@@ -107,14 +107,14 @@ impl DedupeError {
     }
 }
 
-fn renamed(key: &InstanceKey, kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>) -> InstanceKey {
+fn renamed(key: &InstanceKey, kept: &Map<InstanceKey, InstanceKey, FixedState, impl Allocator>) -> InstanceKey {
     kept.get(key).copied().unwrap_or(*key)
 }
 
 fn rename_target(
     target: &Target,
-    kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>,
-    data: &HashMap<ContentId, ContentId, Global>,
+    kept: &Map<InstanceKey, InstanceKey, FixedState, impl Allocator>,
+    data: &Map<ContentId, ContentId, FixedState, Global>,
 ) -> Target {
     match target {
         Target::Function(key) => Target::Function(renamed(key, kept)),
@@ -128,16 +128,16 @@ fn rename_target(
 
 fn rename_relocs(
     relocs: &Relocs,
-    kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>,
-    data: &HashMap<ContentId, ContentId, Global>,
+    kept: &Map<InstanceKey, InstanceKey, FixedState, impl Allocator>,
+    data: &Map<ContentId, ContentId, FixedState, Global>,
 ) -> Relocs {
     relocs.map(|target| rename_target(target, kept, data))
 }
 
 fn rename_unwind(
     unwind: Unwind,
-    kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>,
-    data: &HashMap<ContentId, ContentId, Global>,
+    kept: &Map<InstanceKey, InstanceKey, FixedState, impl Allocator>,
+    data: &Map<ContentId, ContentId, FixedState, Global>,
 ) -> Unwind {
     let routine = |it: &Option<Target>| it.as_ref().map(|it| rename_target(it, kept, data));
     let area = |it: Option<ContentId>| it.map(|id| data.get(&id).copied().unwrap_or(id));
@@ -160,12 +160,12 @@ fn rename_unwind(
 }
 
 /// Whether `target` is a function of `kept`.
-fn names(target: &Target, kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>) -> bool {
+fn names(target: &Target, kept: &Map<InstanceKey, InstanceKey, FixedState, impl Allocator>) -> bool {
     matches!(target, Target::Function(key) | Target::Direct(key) if kept.contains_key(key))
 }
 
 /// Whether `relocs` name a function of `kept`.
-fn names_kept(relocs: &Relocs, kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>) -> bool {
+fn names_kept(relocs: &Relocs, kept: &Map<InstanceKey, InstanceKey, FixedState, impl Allocator>) -> bool {
     relocs.targets().iter().any(|target| names(target, kept))
 }
 
@@ -177,10 +177,10 @@ fn names_kept(relocs: &Relocs, kept: &HashMap<InstanceKey, InstanceKey, impl All
 /// [`DedupeError::DataOrder`]. The answer is each changed datum's old ID with its new one.
 fn rename_data(
     data: &mut [Data],
-    kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>,
+    kept: &Map<InstanceKey, InstanceKey, FixedState, impl Allocator>,
     owner: DataOwner,
-) -> Result<HashMap<ContentId, ContentId, Global>, DedupeError> {
-    let mut ids: HashMap<ContentId, ContentId, Global> = HashMap::new_in(Global);
+) -> Result<Map<ContentId, ContentId, FixedState, Global>, DedupeError> {
+    let mut ids: Map<ContentId, ContentId, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     for at in 0..data.len() {
         let it = &data[at];
         let later = |target: &Target| matches!(target, Target::Data(id) if data[at..].iter().any(|it| it.id == *id));
@@ -210,7 +210,7 @@ fn rename_data(
 
 /// Whether `function` names a function of `kept`: in its code, its data or its unwind
 /// routine. What [`rename`] changes it for.
-fn names_any(function: &CompiledFunction, kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>) -> bool {
+fn names_any(function: &CompiledFunction, kept: &Map<InstanceKey, InstanceKey, FixedState, impl Allocator>) -> bool {
     let routine_named = match &function.unwind {
         Some(
             Unwind::Dwarf { personality: Some(it), .. } | Unwind::Windows { handler: Some(it), .. },
@@ -223,7 +223,7 @@ fn names_any(function: &CompiledFunction, kept: &HashMap<InstanceKey, InstanceKe
 }
 
 /// Whether `value` names a function of `kept`: what [`rename_static`] changes it for.
-fn static_names_any(value: &Static, kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>) -> bool {
+fn static_names_any(value: &Static, kept: &Map<InstanceKey, InstanceKey, FixedState, impl Allocator>) -> bool {
     matches!(&value.init, Init::Bytes { relocs, .. } if names_kept(relocs, kept))
         || value.data.iter().any(|it| names_kept(&it.relocs, kept))
 }
@@ -232,7 +232,7 @@ fn static_names_any(value: &Static, kept: &HashMap<InstanceKey, InstanceKey, imp
 /// it as it is, and says so, when it names nothing of `kept`.
 pub(crate) fn rename(
     function: &mut CompiledFunction,
-    kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>,
+    kept: &Map<InstanceKey, InstanceKey, FixedState, impl Allocator>,
 ) -> Result<bool, DedupeError> {
     if !names_any(function, kept) {
         return Ok(false);
@@ -247,7 +247,7 @@ pub(crate) fn rename(
 /// whether anything changed, which changes its digest.
 pub(crate) fn rename_static(
     value: &mut Static,
-    kept: &HashMap<InstanceKey, InstanceKey, impl Allocator>,
+    kept: &Map<InstanceKey, InstanceKey, FixedState, impl Allocator>,
 ) -> Result<bool, DedupeError> {
     if !static_names_any(value, kept) {
         return Ok(false);
@@ -324,7 +324,7 @@ fn dedupe_in(
         blaze_hash::HashSet::new_in(frame);
     // Each candidate's code ID, by key: hashed once, and again only when a round renames it.
     // Unordered: only grouped, and each group is sorted on its own.
-    let mut ids: HashMap<InstanceKey, ContentId, &blaze_mem::Frame> = HashMap::new_in(frame);
+    let mut ids: Map<InstanceKey, ContentId, FixedState, &blaze_mem::Frame> = Map::new(MapOpts { hasher: FixedState, alloc: frame, capacity: None });
     for function in functions.iter().filter(|it| candidate(it)) {
         ids.insert(function.key, code_id(function));
     }
@@ -340,7 +340,7 @@ fn dedupe_in(
     );
     let _entered = span.enter();
     // Unordered: `merged` is sorted as it is made.
-    let mut kept: HashMap<InstanceKey, InstanceKey, &blaze_mem::Frame> = HashMap::new_in(frame);
+    let mut kept: Map<InstanceKey, InstanceKey, FixedState, &blaze_mem::Frame> = Map::new(MapOpts { hasher: FixedState, alloc: frame, capacity: None });
     let (mut rounds, mut bytes) = (0u32, 0u64);
     let mut last = None;
     loop {
@@ -351,11 +351,11 @@ fn dedupe_in(
             return Err(DedupeError::NoFixpoint { rounds: rounds - 1, candidates, merging });
         }
         // Unordered: each group is sorted on its own, and only fills `more`, a map by key.
-        let mut groups: HashMap<ContentId, Vec<InstanceKey>, Global> = HashMap::new_in(Global);
+        let mut groups: Map<ContentId, Vec<InstanceKey>, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for (key, id) in &ids {
             groups.entry(*id).or_default().push(*key);
         }
-        let mut more: HashMap<InstanceKey, InstanceKey, Global> = HashMap::new_in(Global);
+        let mut more: Map<InstanceKey, InstanceKey, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for mut keys in groups.into_values().filter(|it| it.len() > 1) {
             keys.sort();
             let first = keys[0];

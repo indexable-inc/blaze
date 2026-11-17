@@ -12,7 +12,7 @@ use core::alloc::Allocator;
 use core::cmp::Ordering;
 
 use blaze_columns::{Batch, Values};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_own::Vec;
 
 use crate::Bounds;
@@ -178,7 +178,7 @@ fn skips(d: Datum, null_equal: bool) -> bool {
 
 /// Entries of a hash index: each a key of `width` datums and the row it came from.
 pub struct Index<A: Allocator + Copy> {
-    map: HashMap<u64, u32, A>,
+    map: Map<u64, u32, FixedState, A>,
     next: Vec<u32, A>,
     keys: Vec<Datum, A>,
     rows: Vec<u32, A>,
@@ -190,7 +190,7 @@ const END: u32 = u32::MAX;
 impl<A: Allocator + Copy> Index<A> {
     pub fn new_in(width: usize, alloc: A) -> Index<A> {
         Index {
-            map: HashMap::new_in(alloc),
+            map: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             next: Vec::new_in(alloc),
             keys: Vec::new_in(alloc),
             rows: Vec::new_in(alloc),

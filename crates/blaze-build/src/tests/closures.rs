@@ -73,7 +73,7 @@ fn open_world() -> World {
     let copy = fx.tr("Copy", 1, Vec::new(), &[]);
     fx.lang(LangItem::Copy, copy);
     let (p0, p1) = (fx.param(0), fx.param(1));
-    let rust_call = FnPtrHeader { abi: TAbi::RustCall, safety: Safety::Safe };
+    let rust_call = FnPtrHeader { abi: TAbi::RustCall, safety: Safety::Safe, c_variadic: false };
     let fn_once = fx.tr("FnOnce", 2, Vec::new(), &["Output"]);
     fx.lang(LangItem::FnOnce, fn_once);
     let out = fx.alias(fn_once, "Output", &[p0, p1]);
@@ -256,10 +256,10 @@ fn run_progs(w: &World, progs: &[Prog<'_>]) -> (u64, usize) {
         .collect();
     let mut table = PortableTys::new_in(Alloc::global());
     let mut rows = StdVec::new();
-    for (p, c) in progs.iter().zip(checked.iter()) {
+    for ((p, c), view) in progs.iter().zip(checked.iter()).zip(views.iter()) {
         let s = w.fx.sig_of(p.item).expect("the fn's signature");
         for ordinal in 0..c.closures.len() as u32 {
-            let (kind, sig, env) = crate::layout::closure_facts(c, ordinal, s.parent_count + s.own_count, &mut table, Alloc::global())
+            let (kind, sig, env) = crate::layout::closure_facts(view, c, ordinal, s.parent_count + s.own_count, &mut table, Alloc::global())
                 .unwrap_or_else(|e| panic!("closure {ordinal}'s facts: {e}"));
             rows.push((p.item, ordinal, kind, sig, env));
         }

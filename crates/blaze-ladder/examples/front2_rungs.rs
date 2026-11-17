@@ -264,28 +264,28 @@ fn exit_status(counts: &x::Counts) -> i32 {
 /// The toolchain library's names for programs of `edition`, kept for the process: resolved
 /// under a stand-in program crate of the rungs' package name and that edition (`fn main() {}`;
 /// its text is not read by the library's resolve).
-fn library_of(tc: &'static Toolchain, edition: &str) -> Result<&'static Library<'static>, Stop> {
+fn library_of(tc: &'static Toolchain, edition: &str, alloc: blaze_own::Alloc<'static>) -> Result<&'static Library<'static>, Stop> {
     let stand_in = [SourceFile { path: x::ROOT, text: "fn main() {}\n" }];
     // The stand-in is never built (only the library's names are read of it): its overflow
     // setting is the dev profile's, as a rung's is unless its manifest says otherwise.
     let new = NewFront { package: x::PACKAGE, edition, shelf: None, overflow: blaze_build::OverflowChecks::On };
-    let texts = kept(ProgramTexts::new(&stand_in, x::ROOT, new, tc).map_err(|error| Stop::StandIn { edition: edition.to_string(), error })?);
+    let texts = kept(ProgramTexts::new(&stand_in, x::ROOT, new, tc, blaze_build::Panic::Unwind).map_err(|error| Stop::StandIn { edition: edition.to_string(), error })?);
     let user: &'static UserCrate<'static> = kept(texts.user());
     let inputs: &'static Inputs<'static> = kept(Inputs::new(user, tc).map_err(Stop::Toolchain)?);
     let crates = kept(inputs.crates());
-    let library = Library::solve(inputs, crates).map_err(|error| Stop::Library { edition: edition.to_string(), error })?;
+    let library = Library::solve(inputs, crates, alloc).map_err(|error| Stop::Library { edition: edition.to_string(), error })?;
     Ok(kept(library))
 }
 
 /// One program built and run over `library` (IN A CHILD: see the module doc): `run_with`'s
 /// stages, the names resolved for the program's crate alone.
 fn run_over(library: &'static Library<'static>, views: &[SourceFile<'_>], new: NewFront<'_>, alloc: blaze_own::SharedAlloc<'static>) -> Result<u8, RunError> {
-    let texts = kept(ProgramTexts::new(views, x::ROOT, new, library.toolchain())?);
+    let texts = kept(ProgramTexts::new(views, x::ROOT, new, library.toolchain(), blaze_build::Panic::Unwind)?);
     let user: &'static UserCrate<'static> = kept(texts.user());
     let inputs: &'static Inputs<'static> = kept(library.inputs_for(user));
     let crates = inputs.crates();
     let names = library.names(inputs, &crates).map_err(|e| RunError::Names { shown: format!("{e}").into_boxed_str() })?;
-    let built = build_over(&names, views, texts)?;
+    let built = build_over(&names, views, texts, alloc.local())?;
     run_built(built, None, alloc)
 }
 
@@ -351,7 +351,7 @@ fn run(heap: &'static blaze_own::Heap) -> Result<i32, Stop> {
         say(&format!("FRONT2 X RUNGS: the toolchain's packs read in {:.1} s", started.elapsed().as_secs_f64()));
         for edition in editions {
             let started = Instant::now();
-            let library = library_of(tc, &edition)?;
+            let library = library_of(tc, &edition, heap.alloc())?;
             say(&format!("FRONT2 X RUNGS: the toolchain library's names for edition {edition} resolved once in {:.1} s", started.elapsed().as_secs_f64()));
             libraries.push((edition, library));
         }

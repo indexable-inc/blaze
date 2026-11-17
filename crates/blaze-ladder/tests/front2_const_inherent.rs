@@ -44,15 +44,15 @@ fn check_fns(text: &str, fns: &[&str]) -> Vec<(String, String)> {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let files = [("/hello-world/src/main.rs".to_string(), text.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
-    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
-    let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
     let prepared = Prepares::new_in(Alloc::global());
-    let mut store = Store::new(front.index.lang("sized"), front.frame);
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let (mut buckets, mut consts) = (None, Consts::default());
     let mut got = Vec::new();
     for &n in fns {
@@ -143,4 +143,66 @@ fn main() {}
     // E0308 ..") or as `diags [..]`: either way the outcome names E0308.
     assert!(outcome("bad").contains("E0308"), "{}", lines.join("\n"));
     assert_eq!(outcome("good"), "clean", "{}", lines.join("\n"));
+}
+
+/// An inherent constant of a type that is not an integer, read inside a head's constant
+/// expression: time's `type JulianDay = ri32<{ Date::MIN.to_julian_day() }, ..>` (the Reference,
+/// "Constant evaluation": a constant expression may read a constant of any type and call a
+/// `const fn` on it). Its value is the whole expression's, so `R<{ Date::MIN.day() }>` is `R<7>`
+/// and never `R<8>`. Before the fix both heads were refused with `ConstPath("Date::MIN: the
+/// inherent constant ..: a path in a head has a value only at `bool`, `char` or an integer
+/// type ..")` (tempo census 7, 31 functions). Expected lines: "struct constant in head: low:
+/// clean" and "struct constant in head: high: .." holding E0308.
+#[test]
+fn a_struct_constant_read_in_a_head() {
+    const TEXT: &str = "struct Date { v: i32 }
+impl Date {
+    const MIN: Date = Date { v: 7 };
+    const fn day(self) -> i32 { self.v }
+}
+struct R<const A: i32>;
+type Low = R<{ Date::MIN.day() }>;
+fn low(r: Low) -> R<7> { r }
+fn high(r: Low) -> R<8> { r }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["low", "high"]);
+    let lines: Vec<String> = got.iter().map(|(n, o)| format!("struct constant in head: {n}: {o}")).collect();
+    for l in &lines {
+        println!("{l}");
+    }
+    let outcome = |n: &str| got.iter().find(|(m, _)| m == n).map(|(_, o)| o.as_str()).unwrap_or("");
+    assert_eq!(outcome("low"), "clean", "{}", lines.join("\n"));
+    assert!(outcome("high").contains("E0308"), "{}", lines.join("\n"));
+}
+
+/// `Self::NAME` in a head of a trait impl for a built-in type, where `NAME` is another trait's
+/// constant: itoa's `impl private::Sealed for i128 { type Buffer = [MaybeUninit<u8>;
+/// Self::MAX_STR_LEN]; .. }` (the Reference, "Paths", "`Self`": it "refers to the type being
+/// implemented", so the path is `u16::MAX_STR_LEN`, found through the trait in scope). The
+/// length is 5, so `[u8; 6]` is E0308. Before the fix the anonymous constant was refused with
+/// "E0425: `Self` (segment 0) not found in this scope" and every function reaching the impl
+/// was left out (tempo census 7, 19 + 1). Expected lines: "self in prim head: five: clean" and
+/// "self in prim head: six: .." holding E0308.
+#[test]
+fn self_of_a_builtin_type_in_an_impl_head() {
+    const TEXT: &str = "trait Integer { const MAX_STR_LEN: usize; }
+impl Integer for u16 { const MAX_STR_LEN: usize = 5; }
+trait Sealed { type Buffer; fn first(b: Self::Buffer) -> Self::Buffer; }
+impl Sealed for u16 {
+    type Buffer = [u8; Self::MAX_STR_LEN];
+    fn first(b: Self::Buffer) -> Self::Buffer { b }
+}
+fn five(b: [u8; 5]) -> [u8; 5] { <u16 as Sealed>::first(b) }
+fn six(b: [u8; 6]) -> [u8; 6] { <u16 as Sealed>::first(b) }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["five", "six"]);
+    let lines: Vec<String> = got.iter().map(|(n, o)| format!("self in prim head: {n}: {o}")).collect();
+    for l in &lines {
+        println!("{l}");
+    }
+    let outcome = |n: &str| got.iter().find(|(m, _)| m == n).map(|(_, o)| o.as_str()).unwrap_or("");
+    assert_eq!(outcome("five"), "clean", "{}", lines.join("\n"));
+    assert!(outcome("six").contains("E0308"), "{}", lines.join("\n"));
 }

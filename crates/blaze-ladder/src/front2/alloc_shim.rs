@@ -72,16 +72,40 @@
 //! allocator, which the language refuses too).
 //!
 //! A program with its own `#[global_allocator]` static (the names library files it in the lang
-//! rows under [`OWN_ALLOCATOR_ROW`], as it files `#[panic_handler]`) is refused by name
-//! ([`Refused::OwnAllocator`]): the binding is then to that static's `GlobalAlloc` methods,
-//! which the built-in attribute's expansion makes (rustc's `__rg_alloc` etc.), and blaze has
-//! no such expansion yet. Never bound to std's defaults then: that would quietly ignore the
-//! program's allocator.
+//! rows under [`OWN_ALLOCATOR_ROW`], as it files `#[panic_handler]`): the pinned alloc's
+//! comment above says what runs then, "the code expanding that attribute macro generates those
+//! functions". The built-in attribute (core/src/macros/mod.rs, `pub macro global_allocator(
+//! $item:item)`, `#[rustc_builtin_macro]`, `#[allow_internal_unstable(rustc_attrs,
+//! ptr_alignment_type)]`) keeps the static and writes, beside it in the static's crate, one
+//! `#[rustc_std_internal_symbol] unsafe fn` per ALLOCATOR method, named as alloc declares it,
+//! whose body calls the static's `GlobalAlloc` method:
+//! ```text
+//! #[rustc_std_internal_symbol]
+//! unsafe fn __rust_alloc(size: usize, align: ..) -> *mut u8 {
+//!     $crate::alloc::GlobalAlloc::alloc(&ALLOC, $crate::alloc::Layout::from_size_align..(size, align))
+//! }
+//! // `__rust_dealloc(ptr, size, align)` -> `GlobalAlloc::dealloc(&ALLOC, ptr, layout)`,
+//! // `__rust_realloc(ptr, old_size, align, new_size)` -> `GlobalAlloc::realloc(&ALLOC, ptr, layout, new_size)`,
+//! // `__rust_alloc_zeroed(size, align)` -> `GlobalAlloc::alloc_zeroed(&ALLOC, layout)`.
+//! ```
+//! So then a call of `__rust_alloc` (and the other three, [`Shim::of_allocator`]) IS a call of
+//! the fn of that name the expansion wrote: the one fn with a body named so, carrying
+//! `#[rustc_std_internal_symbol]`, in the static's crate ([`expansion_fn`]); the walk queues it
+//! like a default, and its body is an ordinary call of the impl's `GlobalAlloc` method. None
+//! there is [`Refused::NotExpanded`] (the names library did not expand the attribute), naming
+//! the static: never a binding to std's defaults, which would quietly ignore the program's
+//! allocator. The other two are not the allocator's: `__rust_alloc_error_handler` binds to
+//! alloc's `__rdl_alloc_error_handler` as with no `#[global_allocator]` (the comment at alloc.rs
+//! line 633: the default "if there is no `#[alloc_error_handler]`"), and the marker is built in
+//! place as nothing, with or without one.
 //!
-//! Not here: a `#[alloc_error_handler]` fn (unstable `alloc_error_handler`) is not looked
-//! for; a declaration that reaches one of these symbols only by `#[link_name]` under another
-//! name stays the foreign fn it is (the process lookup refuses it by name); a declaration
-//! named so with a `#[link_name]` naming another symbol is not bound.
+//! Not here: a `#[alloc_error_handler]` fn (unstable `alloc_error_handler`; the pinned std
+//! writes one, `std::alloc::rust_oom`, under `#[cfg(not(test))]`) is not looked for, so a std
+//! program's `__rust_alloc_error_handler` runs alloc's default, not std's hook-then-abort (a
+//! known gap: its message differs on an allocation failure); a declaration that reaches one of
+//! these symbols only by `#[link_name]` under another name stays the foreign fn it is (the
+//! process lookup refuses it by name); a declaration named so with a `#[link_name]` naming
+//! another symbol is not bound.
 
 use blaze_lower::head;
 use blaze_own::Alloc;
@@ -141,6 +165,16 @@ impl Shim {
         }
     }
 
+    /// Whether a `#[global_allocator]`'s expansion writes this declaration's fn (rustc's
+    /// ALLOCATOR methods: `alloc`, `dealloc`, `realloc`, `alloc_zeroed`): the four calls that go
+    /// to the program's allocator. The error handler and the marker are not its.
+    pub fn of_allocator(self) -> bool {
+        match self {
+            Shim::Alloc | Shim::Dealloc | Shim::Realloc | Shim::AllocZeroed => true,
+            Shim::ErrorHandler | Shim::Marker => false,
+        }
+    }
+
     fn of_symbol(symbol: &str) -> Option<Shim> {
         Shim::ALL.into_iter().find(|s| s.declared() == symbol)
     }
@@ -155,9 +189,13 @@ pub enum Refused {
     NoDefault { shim: Shim },
     /// Two fns with bodies are named its default.
     DefaultTwice { shim: Shim },
-    /// The graph has a `#[global_allocator]` static, at this path.
-    OwnAllocator { shim: Shim, static_path: Box<str> },
-    /// The default's key is another item's in the key map.
+    /// The graph has a `#[global_allocator]` static, at this path, and its crate holds no fn
+    /// of the attribute's expansion for the declaration (the names library did not expand it).
+    NotExpanded { shim: Shim, static_path: Box<str> },
+    /// The `#[global_allocator]` static's crate holds two fns of the declaration's name
+    /// carrying `#[rustc_std_internal_symbol]`: `first` and `second`, the two smallest by key.
+    ExpandedTwice { shim: Shim, first: Box<str>, second: Box<str> },
+    /// The default's key, or the expansion's fn's, is another item's in the key map.
     KeyClash { shim: Shim },
     /// The names source did not answer a fact the declaration needs (its crate's cfg or
     /// edition, or whether an `extern` block declares it): the error is in the source's log.
@@ -173,10 +211,13 @@ impl Refused {
                 "a call of an allocator declaration with no `#[global_allocator]` and no default allocator fn (std's `__rdl_*`) in the graph"
             }
             Refused::DefaultTwice { .. } => "a default allocator fn (`__rdl_*`) defined twice in the graph",
-            Refused::OwnAllocator { .. } => {
-                "a program with its own `#[global_allocator]` static: the built-in attribute's expansion (the `__rust_*` fns calling its `GlobalAlloc` methods) is not built by blaze yet"
+            Refused::NotExpanded { .. } => {
+                "a program with its own `#[global_allocator]` static whose crate holds no fn of the attribute's expansion (the `#[rustc_std_internal_symbol]` `__rust_*` fn calling its `GlobalAlloc` method): the names library did not expand the built-in attribute"
             }
-            Refused::KeyClash { .. } => "the default allocator fn's key is another item's in the key map",
+            Refused::ExpandedTwice { .. } => {
+                "two `#[rustc_std_internal_symbol]` fns of one allocator symbol in the crate of the `#[global_allocator]` static"
+            }
+            Refused::KeyClash { .. } => "the allocator fn's key (the default's or the expansion's) is another item's in the key map",
             Refused::Unanswered { .. } => "an allocator declaration (`extern \"Rust\"` `__rust_*`) about which the names records did not answer (the error is in the source's log)",
         }
     }
@@ -186,7 +227,8 @@ impl Refused {
         let (shim, extra) = match self {
             Refused::Attrs { shim } | Refused::KeyClash { shim } | Refused::Unanswered { shim } => (*shim, Box::<str>::from("")),
             Refused::NoDefault { shim } | Refused::DefaultTwice { shim } => (*shim, format!(" (`{}`)", shim.default_fn().unwrap_or("")).into_boxed_str()),
-            Refused::OwnAllocator { shim, static_path } => (*shim, format!(" (the static `{static_path}`)").into_boxed_str()),
+            Refused::NotExpanded { shim, static_path } => (*shim, format!(" (the static `{static_path}`)").into_boxed_str()),
+            Refused::ExpandedTwice { shim, first, second } => (*shim, format!(" (`{first}` and `{second}`)").into_boxed_str()),
         };
         format!("`{}`: {}{extra}", shim.declared(), self.class()).into_boxed_str()
     }
@@ -273,10 +315,97 @@ fn default_named<'n, S: NamesSource<'n>>(names: S, shim: Shim, name: &str) -> Re
     found.ok_or(Refused::NoDefault { shim })
 }
 
-/// The fn a call of the declaration `shim` runs: its default, or the refusal.
-fn target<'n, S: NamesSource<'n>>(names: S, index: &Index<'_>, shim: Shim) -> Result<Option<LibKey>, Refused> {
-    if let Some(own) = index.lang(OWN_ALLOCATOR_ROW) {
-        return Err(Refused::OwnAllocator { shim, static_path: path_of(names, own) });
+/// The attribute the expansion's fns carry (rustc's `AllocFnFactory::attrs`).
+const INTERNAL_SYMBOL: &str = "rustc_std_internal_symbol";
+
+/// Whether the fn `key` of crate `krate` is written as the `#[global_allocator]` expansion
+/// writes its fns: a fn item outside every `extern` block and every trait or impl (so it has a
+/// body), whose attributes, `cfg_attr` evaluated under the crate's cfg, hold
+/// `#[rustc_std_internal_symbol]`. `alloc` holds the signature's lowering, dropped on return.
+fn is_expansion_fn<'n, S: NamesSource<'n>>(names: S, krate: usize, key: LibKey, shim: Shim, alloc: Alloc<'_>) -> Result<bool, Refused> {
+    let unanswered = || Refused::Unanswered { shim };
+    if names.kind_of_item(key) != Some(blaze_surface::ItemKind::Function) || names.member_owner(key).is_some() {
+        return Ok(false);
+    }
+    match names.extern_abi(key) {
+        Some(None) => {}
+        Some(Some(_)) => return Ok(false),
+        None => return Err(unanswered()),
+    }
+    let text = names.text_of(key).ok_or_else(unanswered)?.text;
+    // The attribute is a word of the item's own text wherever it is written (an expansion's
+    // text included): a text without it carries none, and nothing is lowered for it.
+    if !text.contains(INTERNAL_SYMBOL) {
+        return Ok(false);
+    }
+    let refuse = || Refused::Attrs { shim };
+    let atoms = names.cfg_atoms(krate).ok_or_else(unanswered)?;
+    let edition = names.edition_of(krate).ok_or_else(unanswered)?;
+    let sig = blaze_lower::lower_signature(text, edition, &mut CrateCfg(atoms), alloc).map_err(|_| refuse())?;
+    let v = sig.view();
+    for &n in v.rows(v.list(head::ATTRS)).map_err(|_| refuse())? {
+        let a = v.attr(n).map_err(|_| refuse())?;
+        if v.text_at(a.path).map_err(|_| refuse())?.trim() == INTERNAL_SYMBOL {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The fn the `#[global_allocator]` static `own`'s expansion wrote for the declaration
+/// `shim` (one of [`Shim::of_allocator`]'s four): the one fn of the static's crate named as the
+/// declaration that [`is_expansion_fn`] says the expansion wrote. rustc's expansion writes it in
+/// the static's own crate, so no other crate is read. None is [`Refused::NotExpanded`]; two are
+/// [`Refused::ExpandedTwice`] naming the two smallest keys, the same in any walk order.
+fn expansion_fn<'n, S: NamesSource<'n>>(names: S, own: LibKey, shim: Shim, alloc: Alloc<'_>) -> Result<LibKey, Refused> {
+    let krate = names.crate_of(own).ok_or(Refused::Unanswered { shim })?;
+    let name = shim.declared();
+    let mut found: Option<LibKey> = None;
+    let mut second: Option<LibKey> = None;
+    let mut refused: Option<Refused> = None;
+    let read = names.each_item(krate, &mut |key, _| {
+        if refused.is_some() || names.name_of(key) != Some(name) {
+            return;
+        }
+        match is_expansion_fn(names, krate, key, shim, alloc) {
+            Err(why) => refused = Some(why),
+            Ok(false) => {}
+            Ok(true) => match found {
+                None => found = Some(key),
+                Some(f) if f == key => {}
+                Some(f) if key < f => {
+                    second = Some(f);
+                    found = Some(key);
+                }
+                Some(_) => {
+                    if second.is_none_or(|s| key < s) {
+                        second = Some(key);
+                    }
+                }
+            },
+        }
+    });
+    if !read {
+        return Err(Refused::Unanswered { shim });
+    }
+    if let Some(why) = refused {
+        return Err(why);
+    }
+    match (found, second) {
+        (Some(first), Some(second)) => Err(Refused::ExpandedTwice { shim, first: path_of(names, first), second: path_of(names, second) }),
+        (Some(first), None) => Ok(first),
+        (None, _) => Err(Refused::NotExpanded { shim, static_path: path_of(names, own) }),
+    }
+}
+
+/// The fn a call of the declaration `shim` runs: with a `#[global_allocator]` static in the
+/// graph, for the allocator's four the fn its expansion wrote; otherwise its default; or the
+/// refusal. `alloc` holds the lowerings [`expansion_fn`] reads, dropped on return.
+fn target<'n, S: NamesSource<'n>>(names: S, index: &Index<'_>, shim: Shim, alloc: Alloc<'_>) -> Result<Option<LibKey>, Refused> {
+    if let Some(own) = index.lang(OWN_ALLOCATOR_ROW)
+        && shim.of_allocator()
+    {
+        return expansion_fn(names, own, shim, alloc).map(Some);
     }
     match shim.default_fn() {
         None => Ok(None),
@@ -284,12 +413,13 @@ fn target<'n, S: NamesSource<'n>>(names: S, index: &Index<'_>, shim: Shim) -> Re
     }
 }
 
-/// The fn a call of `item` runs, when `item` is an allocator declaration with a default
-/// (not generic: no arguments). `None` for every other item, the marker, and a declaration
-/// [`reached`] refused (it is then in no table, and its caller is refused with that cause).
+/// The fn a call of `item` runs, when `item` is an allocator declaration with a default or a
+/// `#[global_allocator]` expansion's fn (not generic: no arguments). `None` for every other
+/// item, the marker, and a declaration [`reached`] refused (it is then in no table, and its
+/// caller is refused with that cause).
 pub fn bound<'n, S: NamesSource<'n>>(names: S, index: &Index<'_>, store: &Store<'_>, item: ItemKey, alloc: Alloc<'_>) -> Option<ItemKey> {
     match declares(names, store, item, alloc) {
-        Ok(Some(shim)) => target(names, index, shim).ok().flatten().map(checker_of),
+        Ok(Some(shim)) => target(names, index, shim, alloc).ok().flatten().map(checker_of),
         Ok(None) | Err(_) => None,
     }
 }
@@ -299,16 +429,17 @@ fn failed(why: &Refused) -> Reached {
 }
 
 /// The walk's outcome for `k`, a fn whose head says it has no body, when it is an allocator
-/// declaration: [`Reached::NoBody`] and its default to queue (its key filed; none for the
-/// marker), or the refusal naming why there is none. `None` for every other fn: the next
-/// binding's ([`super::panic_entry::reached`]) to say.
+/// declaration: [`Reached::NoBody`] and the fn to queue (its default, or the
+/// `#[global_allocator]` expansion's fn; its key filed; none for the marker), or the refusal
+/// naming why there is none. `None` for every other fn: the next binding's
+/// ([`super::panic_entry::reached`]) to say.
 pub fn reached(r: &mut Records<'_, '_>, k: ItemKey, alloc: Alloc<'_>) -> Option<(Reached, Option<ItemKey>)> {
     let shim = match declares(r.names, r.store, k, alloc) {
         Ok(None) => return None,
         Err(why) => return Some((failed(&why), None)),
         Ok(Some(shim)) => shim,
     };
-    Some(match target(r.names, r.index, shim) {
+    Some(match target(r.names, r.index, shim, alloc) {
         Err(why) => (failed(&why), None),
         Ok(None) => (Reached::NoBody, None),
         Ok(Some(lib)) => match r.keys.item(lib) {
@@ -342,5 +473,22 @@ mod tests {
         }
         assert_eq!(Shim::of_symbol("__rust_start_panic"), None);
         assert_eq!(Shim::of_symbol("malloc"), None);
+    }
+
+    /// With a `#[global_allocator]`, exactly rustc's four ALLOCATOR methods go to the
+    /// attribute's expansion; the error handler keeps alloc's default and the marker stays
+    /// nothing. A refusal for a missing expansion names the declaration and the static.
+    ///
+    /// Prints: `test front2::alloc_shim::tests::the_allocator_four_go_to_the_expansion ... ok`
+    #[test]
+    fn the_allocator_four_go_to_the_expansion() {
+        let own: Vec<&str> = Shim::ALL.into_iter().filter(|s| s.of_allocator()).map(Shim::declared).collect();
+        assert_eq!(own, ["__rust_alloc", "__rust_dealloc", "__rust_realloc", "__rust_alloc_zeroed"]);
+        assert_eq!(Shim::ErrorHandler.default_fn(), Some("__rdl_alloc_error_handler"));
+        assert!(!Shim::ErrorHandler.of_allocator() && !Shim::Marker.of_allocator());
+        let why = Refused::NotExpanded { shim: Shim::Alloc, static_path: Box::from("tempo::ALLOC") };
+        let detail = why.detail();
+        assert!(detail.starts_with("`__rust_alloc`: "), "{detail}");
+        assert!(detail.contains("`#[global_allocator]` static") && detail.ends_with("(the static `tempo::ALLOC`)"), "{detail}");
     }
 }

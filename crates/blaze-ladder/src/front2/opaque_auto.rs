@@ -85,13 +85,27 @@ pub struct HiddenTable<'a> {
     wanted: Option<ItemKey>,
 }
 
+/// Which opaques a world sees through to their hidden types (rustc's typing modes).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reveal {
+    /// Checking a body: an opaque is itself, except those in the running check's leak list
+    /// (rustc's analysis mode; the auto-trait leak of the module doc).
+    InBody,
+    /// A resolution at ground arguments after checking (an instance's `resolve_instance` or
+    /// `select_impl`, a constant's evaluation): every opaque is its hidden type (rustc's
+    /// post-analysis mode). A where-clause such as `<F as FnOnce<_>>::Output == U` with `F` a fn
+    /// returning `impl Trait` and `U` its revealed hidden type holds only so.
+    All,
+}
+
 /// What the world answers for an opaque.
 pub enum HiddenAnswer<'t> {
     /// Its defining body's hidden type.
     Known(Hidden<'t>),
-    /// Opaque to this check: not in its leak list.
+    /// Opaque to this check: not in its leak list (only under [`Reveal::InBody`]).
     Opaque,
-    /// In the leak list, and its defining body's row gives no hidden type for it.
+    /// Revealed (in the leak list, or [`Reveal::All`]), and no filed row of its defining body
+    /// gives a hidden type for it.
     NoneGiven,
 }
 
@@ -120,9 +134,13 @@ impl<'a> HiddenTable<'a> {
         }
     }
 
-    /// The hidden type of `opaque`, defined by fn `owner`, to the running check.
-    pub fn answer(&self, opaque: ItemKey, owner: ItemKey) -> HiddenAnswer<'_> {
-        if self.leaking.binary_search(&opaque).is_err() {
+    /// The hidden type of `opaque`, defined by fn `owner`, to a world that sees `reveal`.
+    pub fn answer(&self, opaque: ItemKey, owner: ItemKey, reveal: Reveal) -> HiddenAnswer<'_> {
+        let seen = match reveal {
+            Reveal::InBody => self.leaking.binary_search(&opaque).is_ok(),
+            Reveal::All => true,
+        };
+        if !seen {
             return HiddenAnswer::Opaque;
         }
         match self.rows.get(&owner).and_then(|row| row.hidden.iter().find(|h| h.0 == opaque)) {
@@ -302,7 +320,8 @@ pub(crate) fn file<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, body: &Bo
     if !r.store.hidden.wants(owner, done) {
         return Ok(());
     }
-    let exacts = exact_interiors(r, body, done, Alloc::global()).map_err(|error| CheckFail::Check { owner, error })?;
+    let alloc = r.store.tys.alloc();
+    let exacts = exact_interiors(r, body, done, alloc).map_err(|error| CheckFail::Check { owner, error })?;
     r.store.hidden.file_row(owner, &body.typeck.exprs, done, exacts.as_ref()).map_err(|f| gap(owner, f))
 }
 

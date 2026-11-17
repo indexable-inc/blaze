@@ -1,0 +1,14 @@
+{
+ "id": "variant-count-file-fact-1",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane LV (variant-count) on rebuild-1115",
+ "where": "crates/blaze-lint (lib.rs `lint`, units.rs, variants.rs) and crates/blaze-cli/src/lints.rs (`unit_source`, `parts`, `lint_units`)",
+ "what": "blaze-lint's contract is that a rule is a pure function of one item's text and its Scope, and the cli keys each Lint unit by exactly that. `variant-count` needs a fact of the whole file (the enums and their counts), which the enum's unit has and the literal's unit does not. Nothing in the crate had a seam for a file-level fact, so `lint` alone would have found nothing across units without saying so, and the unit keys would not have moved when an enum gained a variant.",
+ "cost": "about half the lane: designing the seam and its key before writing the rule",
+ "cause": "the item-alone design had no place for a fact read across items of one file",
+ "whys": "every earlier rule reads only its item; Scope is a fixed u64 bitfield; the cli's unit_source hashes only own bytes, holes and the scope key",
+ "class": "a rule reading anything outside its item silently finds nothing, or leaves stale records, unless its read joins the unit's key",
+ "prevention": "done: `Variants::gather` (one lex per file, capped tables) is the file's fact; `lint_in` takes it; `Variants::unit_key` is the unit's read of it, joined to the cli's unit_source only when a literal of the unit has an enum of its count; `lint` alone treats its unit as its whole file. Test `variant_count_reads_the_file_and_keys_the_unit`.",
+ "workaround": "none needed now",
+ "state": "fixed"
+}

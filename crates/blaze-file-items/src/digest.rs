@@ -19,7 +19,7 @@
 //! [`OneByOne`]), and the same as the definition the tests recompute with one streaming hasher
 //! per digest.
 
-use blaze_hash::ByHash;
+use blaze_hash::{BuildKeyHasher, Map, MapOpts};
 use blaze_ids::{ContentId, Domain, Hasher};
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_surface::{Item, ItemIndex, Range};
@@ -173,13 +173,13 @@ pub(crate) fn digest<C: Compress>(text: &str, edition: u8, out: &mut Outline<'_>
 /// messages of one batch. Cleared on each use, never freed.
 pub(crate) struct Scratch<'a> {
     bytes: AVec<'a, u8>,
-    siblings: ByHash<ContentId, u32, Alloc<'a>>,
+    siblings: Map<ContentId, u32, BuildKeyHasher, Alloc<'a>>,
 }
 
 impl<'a> Scratch<'a> {
     /// Empty: nothing is allocated until the first digest.
     pub(crate) fn new_in(alloc: Alloc<'a>) -> Scratch<'a> {
-        Scratch { bytes: Vec::new_in(alloc), siblings: ByHash::new_in(alloc) }
+        Scratch { bytes: Vec::new_in(alloc), siblings: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: alloc, capacity: None }) }
     }
 }
 
@@ -190,7 +190,7 @@ fn sibling_keys<C: Compress>(
     text: &str,
     out: &mut Outline<'_>,
     scratch: &mut AVec<'_, u8>,
-    siblings: &mut ByHash<ContentId, u32, Alloc<'_>>,
+    siblings: &mut Map<ContentId, u32, BuildKeyHasher, Alloc<'_>>,
 ) {
     let mut from = 0;
     while from < out.items.len() {
@@ -207,7 +207,7 @@ fn key_batch<C: Compress>(
     out: &mut Outline<'_>,
     batch: core::ops::Range<usize>,
     scratch: &mut AVec<'_, u8>,
-    siblings: &mut ByHash<ContentId, u32, Alloc<'_>>,
+    siblings: &mut Map<ContentId, u32, BuildKeyHasher, Alloc<'_>>,
 ) {
     let mut keyed = [Keyed { tag: 0, by: By::Position }; BATCH];
     for (keyed, item) in keyed.iter_mut().zip(&out.items[batch.clone()]) {

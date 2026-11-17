@@ -1,6 +1,7 @@
 //! Every fn reachable from a checked body, each lowered, converted and checked in its own env:
 //! a free fn or a member of a trait or an impl by [`lower_made`]. The walk is a
-//! work list over the checker's callees (no recursion), capped at [`MOST_FNS`]; each fn's
+//! work list over the checker's callees (no recursion), capped by the names it walks
+//! ([`cap_of`]); each fn's
 //! outcome is kept, a failure by its cause's class, so the census is one line and a grouped
 //! list. A call is walked to the body it runs ([`callee_target`]): a trait's method on a concrete
 //! receiver to the selected impl's method; on a parameter or `dyn`, nothing at the site.
@@ -43,7 +44,129 @@ use self::instances::Instances;
 /// the cap is met only by a walk that does not end (a bug). The hello world's walk reached
 /// 1,093 from `main` (list-AE); the entry program's reach was refused at the old 4,096.
 /// [`Census::queued`] says how many were still waiting when the cap stopped it.
+///
+/// Since 2026-11-17 this bounds ROUNDS only (an ADT row's, a lazy fill's): the walk's own cap
+/// is sized by the program's names at its start ([`cap_of`]), as a 1,084-crate program
+/// (tempo) holds far more fns than the toolchain's library.
 pub const MOST_FNS: usize = 65_536;
+
+/// The walk's cap per item its names hold ([`items_held`]): the walk tables each fn item, ctor
+/// and variant once, and beside them the fns declared in bodies (keys.rs `Keys::local`), which
+/// the names' tables do not list; twice the items is above both together.
+pub const NEED_FACTOR: usize = 2;
+
+/// The absolute ceiling of a walk's table, whatever the names hold (rule 18).
+pub const MOST_FNS_CEILING: usize = 1 << 23;
+
+/// How many fns a [`Census`] lists by path when the cap stopped it ([`capped_report`]).
+const MOST_WAITING: usize = 20;
+/// How many crates and repeated keys [`capped_report`] lists.
+const MOST_CRATES: usize = 15;
+const MOST_REPEATS: usize = 10;
+
+/// The class of a fn outside [`Within::crates`]: tabled from its head only, never lowered,
+/// checked or walked.
+pub const OUTSIDE: &str = "outside: not walked (its crate is not one the walk is limited to)";
+
+/// What a walk is limited to: the crates whose fns it lowers and checks (`None`: all), and a
+/// cap the caller sets in place of the one sized by need (`None`: [`cap_of`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Within<'a> {
+    pub crates: Option<&'a [usize]>,
+    pub most_fns: Option<usize>,
+}
+
+impl Within<'static> {
+    /// Every crate, the cap by need.
+    pub const ALL: Within<'static> = Within { crates: None, most_fns: None };
+}
+
+/// The items, members and enum variants `names` holds over every crate: the most distinct
+/// fns and ctors a walk over them can table but for body-declared fns ([`NEED_FACTOR`]). Read
+/// from each crate's tables' lengths (`Tables::texts`, `members`, `enums`): no item is read.
+pub fn items_held(names: &blaze_scope::resolve::Names<'_>) -> usize {
+    let mut n = 0usize;
+    for c in names.crates() {
+        n += c.tables.texts.len();
+        n += c.tables.members.values().map(|m| m.len()).sum::<usize>();
+        n += c.tables.enums.values().map(|v| v.len()).sum::<usize>();
+    }
+    n
+}
+
+/// The walk's cap over names holding `items` ([`items_held`]): [`NEED_FACTOR`] times them,
+/// under [`MOST_FNS_CEILING`]. A walk past it tables more fns than exist: it does not end.
+pub fn cap_of(items: usize) -> usize {
+    items.saturating_mul(NEED_FACTOR).clamp(1, MOST_FNS_CEILING)
+}
+
+/// The crate of checker key `k` (a member's is its container's), as `r`'s names place it.
+pub(crate) fn key_crate(r: &Records<'_, '_>, k: ItemKey) -> Option<usize> {
+    let lib = match r.keys.origin(k) {
+        Some(Origin::Member { container, .. }) => r.keys.library_in(r.names, *container)?,
+        _ => r.keys.library_in(r.names, k)?,
+    };
+    r.names.crate_of(lib)
+}
+
+/// The fns of `fns` by crate (`usize::MAX`: no crate known), most first, then by crate.
+pub(crate) fn by_crate(r: &Records<'_, '_>, fns: &[(ItemKey, Reached)]) -> Vec<(usize, usize), Global> {
+    let mut crates: Vec<usize, Global> = Vec::with_capacity_in(fns.len(), Global);
+    crates.extend(fns.iter().map(|(k, _)| key_crate(r, *k).unwrap_or(usize::MAX)));
+    crates.sort_unstable();
+    let mut out: Vec<(usize, usize), Global> = Vec::new_in(Global);
+    for c in crates {
+        match out.last_mut() {
+            Some((last, n)) if *last == c => *n += 1,
+            _ => out.push((c, 1)),
+        }
+    }
+    out.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out
+}
+
+/// A crate's name for a report.
+fn crate_shown(r: &Records<'_, '_>, c: usize) -> String {
+    match r.names.crates().get(c) {
+        Some(k) => String::from(k.name),
+        None => String::from("(no crate)"),
+    }
+}
+
+/// What a capped walk met, bounded: the [`MOST_CRATES`] crates with the most fns tabled, the
+/// [`MOST_REPEATS`] keys tabled more than once, and [`MOST_WAITING`] of the fns still queued by
+/// path: enough to tell a big program from an instance that repeats.
+pub(crate) fn capped_report(r: &Records<'_, '_>, census: &Census<'_>) -> String {
+    use core::fmt::Write as _;
+    let mut out = String::new();
+    let crates = by_crate(r, &census.fns);
+    let _ = writeln!(out, "REACHED BY CRATE ({} fns tabled in {} crates; the {} with the most)", census.fns.len(), crates.len(), crates.len().min(MOST_CRATES));
+    for &(c, n) in crates.iter().take(MOST_CRATES) {
+        let _ = writeln!(out, "  {n} {}", crate_shown(r, c));
+    }
+    let mut keys: Vec<ItemKey, Global> = Vec::with_capacity_in(census.fns.len(), Global);
+    keys.extend(census.fns.iter().map(|(k, _)| *k));
+    keys.sort_unstable();
+    let mut repeats: Vec<(usize, ItemKey), Global> = Vec::new_in(Global);
+    let mut i = 0;
+    while i < keys.len() {
+        let j = keys[i..].iter().position(|k| *k != keys[i]).map_or(keys.len(), |n| i + n);
+        if j - i > 1 {
+            repeats.push((j - i, keys[i]));
+        }
+        i = j;
+    }
+    repeats.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let _ = writeln!(out, "TABLED MORE THAN ONCE: {} keys", repeats.len());
+    for &(n, k) in repeats.iter().take(MOST_REPEATS) {
+        let _ = writeln!(out, "  {n} {}", fn_shown(r, k));
+    }
+    let _ = writeln!(out, "STILL QUEUED ({} waiting; {} shown, the next to be read first)", census.queued, census.waiting.len());
+    for &k in census.waiting.iter() {
+        let _ = writeln!(out, "  {}", fn_shown(r, k));
+    }
+    out
+}
 
 
 /// What became of one reachable fn.
@@ -76,10 +199,18 @@ pub struct Census<'n> {
     /// The state recipe of every async block of each checked body (coroutine_recipes.rs), made
     /// with its check from the same lowering and record (rule 77).
     pub recipes: Vec<super::coroutine_recipes::RecipeRow, Global>,
-    /// Whether [`MOST_FNS`] stopped the walk.
+    /// Whether the cap ([`Census::cap`]) stopped the walk.
     pub capped: bool,
-    /// The fns still waiting in the work list when [`MOST_FNS`] stopped it (0 when it ended).
+    /// The fns still waiting in the work list when the cap stopped it (0 when it ended).
     pub queued: usize,
+    /// The walk's cap: [`cap_of`] the names' [`Census::items`], or the caller's
+    /// ([`Within::most_fns`], then [`Census::forced`]).
+    pub cap: usize,
+    /// The items, members and variants the names held at the walk's start ([`items_held`]).
+    pub items: usize,
+    pub forced: bool,
+    /// When capped: the next [`MOST_WAITING`] fns the walk would have read, the next first.
+    pub waiting: Vec<ItemKey, Global>,
     /// The calls of bodies that did not check which only their types could name (a method
     /// call, a path through a type, a trait's fn, a qualified path): not followed.
     pub not_followed: usize,
@@ -149,7 +280,7 @@ fn queue_by_name(r: &mut Records<'_, '_>, body: &Body<'_>, scope: &BodyScope<'_>
         found.clear();
         by_type = view.exprs.iter().filter(|e| matches!(e, tc::Expr::MethodCall { .. })).count();
         let world = world_at(r, scope);
-        for bp in view.paths {
+        for (at, bp) in view.paths.iter().enumerate() {
             if bp.anchor.is_some() {
                 by_type += 1;
                 continue;
@@ -169,7 +300,7 @@ fn queue_by_name(r: &mut Records<'_, '_>, body: &Body<'_>, scope: &BodyScope<'_>
                     let (start, len) = (bp.segments.start as usize, bp.segments.len as usize);
                     let Some(segs) = view.segments.get(start..start + len) else { continue };
                     names.extend(segs.iter().map(|s| s.name));
-                    match world.path(bp.scope, &names) {
+                    match world.path(bp.scope, tc::PathIdx(at as u32), &names) {
                         Ok(Ok(p)) if p.consumed as usize == names.len() => Some(p.def),
                         // `Type::f`: the fn is found on the type's impls, by its type.
                         Ok(Ok(_)) => {
@@ -344,14 +475,17 @@ fn queue_targets(r: &mut Records<'_, '_>, scope: &BodyScope<'_>, owner: ItemKey,
 pub fn reach<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, owner: ItemKey, first: First<'_, '_, '_>, scope: &BodyScope<'_>) -> Census<'n> {
     let mut starts = Vec::with_capacity_in(1, Global);
     starts.push(Start { owner, first, scope });
-    reach_all(r, prepared, starts, &[])
+    reach_all(r, prepared, starts, &[], Within::ALL)
 }
 
 /// [`reach`] from MANY entries at once (a test suite's, program/suite.rs): one walk, so a fn two
 /// entries reach is lowered and checked once (rule 77); [`Census::edges`] keeps which entry
 /// reached what. `also` are roots with no body read here (a test's `Termination::report` fn,
-/// test_entry.rs), walked like any queued fn.
-pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: Vec<Start<'_, '_, '_, '_>, Global>, also: &[ItemKey]) -> Census<'n> {
+/// test_entry.rs), walked like any queued fn. `within` limits the crates walked (a fn of
+/// another is filed as [`OUTSIDE`], from its head only) and may set the cap.
+pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: Vec<Start<'_, '_, '_, '_>, Global>, also: &[ItemKey], within: Within<'_>) -> Census<'n> {
+    let items = items_held(r.names);
+    let cap = within.most_fns.unwrap_or_else(|| cap_of(items));
     let mut seen: HashMap<ItemKey, (), Global> = HashMap::new_in(Global);
     // Each entry is walked already: a call back to one is no new fn.
     for s in starts.iter() {
@@ -365,7 +499,7 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
             Err(clash) => (clash.key, Some(Reached::Failed { class: Box::from("key clash"), detail: format!("{clash}").into_boxed_str(), refusal: None })),
         });
     }
-    let mut census = Census { fns: Vec::new_in(Global), bodies: Vec::new_in(Global), recipes: Vec::new_in(Global), capped: false, queued: 0, not_followed: 0, edges: Vec::new_in(Global), instance_pairs: Vec::new_in(Global) };
+    let mut census = Census { fns: Vec::new_in(Global), bodies: Vec::new_in(Global), recipes: Vec::new_in(Global), capped: false, queued: 0, cap, items, forced: within.most_fns.is_some(), waiting: Vec::new_in(Global), not_followed: 0, edges: Vec::new_in(Global), instance_pairs: Vec::new_in(Global) };
     note_edges(&mut census.edges, AMBIENT, &queue, &[]);
     queue.extend(also.iter().map(|&k| (k, None)));
     // What the builder calls on its own for what the reached bodies write, queued as read.
@@ -397,7 +531,7 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
     // was queued or filed since is its edges, noted before the next pop.
     let mut reading: Option<(ItemKey, usize, usize)> = None;
     // Rounds: the work list drained, then the impl fns the back half's instances can resolve
-    // to, until a round adds none (each round adds a fn, so `MOST_FNS` bounds the rounds).
+    // to, until a round adds none (each round adds a fn, so the cap bounds the rounds).
     loop {
     while let Some((k, decided)) = {
         if let Some((from, q, f)) = reading.take() {
@@ -407,7 +541,10 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
     } {
         // A trait's provided fn met on a parameter or `dyn` is decided at the site; it is walked
         // as a body only when an instance resolves to it (an impl leaves it out: `Instances`),
-        // and its decided outcome is then replaced by the walk's.
+        // and its decided outcome is then replaced by the walk's. The site's decision is kept
+        // apart first (`Instances::note_decided`): neither that replacement nor `seen` below
+        // may stop the fn's instances from being asked.
+        instances.note_decided(k, decided.as_ref());
         let provided = decided.is_none() && instances.declared.remove(&k).is_some();
         if provided {
             census.fns.retain(|(f, _)| *f != k);
@@ -419,13 +556,24 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
         if matches!(decided, Some(Reached::AtInstance | Reached::AtObject)) {
             instances.declared.insert(k, ());
         }
-        if census.fns.len() == MOST_FNS {
+        if census.fns.len() >= census.cap {
             census.capped = true;
             census.queued = queue.len() + 1;
+            census.waiting.push(k);
+            census.waiting.extend(queue.iter().rev().take(MOST_WAITING - 1).map(|(q, _)| *q));
             break;
         }
         if let Some(outcome) = decided {
             census.fns.push((k, outcome));
+            continue;
+        }
+        // A fn of a crate the walk is not limited to: its head is the store's (made where a
+        // body that calls it was checked); it is neither lowered nor walked.
+        if let Some(crates) = within.crates
+            && !key_crate(r, k).is_some_and(|c| crates.contains(&c))
+        {
+            let detail = format!("`{}` is of a crate outside the walk's ({} crates named)", fn_shown(r, k), crates.len());
+            census.fns.push((k, Reached::Failed { class: Box::from(OUTSIDE), detail: detail.into_boxed_str(), refusal: None }));
             continue;
         }
         // A fn whose head says it has no body (a foreign fn's declaration, an intrinsic's):
@@ -438,13 +586,21 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
             // no body is `NoBody`.
             // Every other `extern "Rust"` `#[rustc_std_internal_symbol]` declaration runs its
             // one definition, the panic runtime's by the strategy ([`super::internal_symbol`]).
-            // P1 replaces this with the program's strategy.
-            let panic = blaze_build::Panic::Unwind;
-            let (outcome, callee) = match super::alloc_shim::reached(r, k, blaze_own::Alloc::global()) {
+            // The panic runtime's entries bind by the program's strategy, read from its inputs
+            // (crate 0's cfg: crate::panic_strategy::of_program). Only a declaration the
+            // runtime binds asks it; there an unreadable strategy is refused by name.
+            let alloc = r.store.tys.alloc();
+            let (outcome, callee) = match super::alloc_shim::reached(r, k, alloc) {
                 Some(bound) => bound,
-                None => match super::internal_symbol::reached(r, k, panic, blaze_own::Alloc::global()) {
-                    Some(bound) => bound,
-                    None => super::panic_entry::reached(r, k, blaze_own::Alloc::global()),
+                None => match crate::panic_strategy::of_program(r.names) {
+                    Ok(panic) => match super::internal_symbol::reached(r, k, panic, alloc) {
+                        Some(bound) => bound,
+                        None => super::panic_entry::reached(r, k, alloc),
+                    },
+                    Err(why) if super::internal_symbol::declares(r.names, &*r.store, k, alloc).is_ok_and(|d| d.is_some()) => {
+                        (Reached::Failed { class: why.class().into(), detail: why.to_string().into_boxed_str(), refusal: None }, None)
+                    }
+                    Err(_) => super::panic_entry::reached(r, k, alloc),
                 },
             };
             queue.extend(callee.map(|h| (h, None)));
@@ -481,8 +637,9 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
         };
         let scope = body.scope(&spell);
         // Each async block's state recipe is made with the check (coroutine_recipes.rs).
+        let alloc = r.store.tys.alloc();
         let done = check_body(r, &body, &scope).and_then(|c| {
-            super::coroutine_recipes::recipes_of(r, &body, &c, &mut census.recipes, blaze_own::Alloc::global())
+            super::coroutine_recipes::recipes_of(r, &body, &c, &mut census.recipes, alloc)
                 .map_err(|error| CheckFail::Check { owner: body.owner, error })?;
             Ok(c)
         });

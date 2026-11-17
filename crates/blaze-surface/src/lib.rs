@@ -65,6 +65,7 @@ mod lang_items;
 mod locals;
 mod macro_def;
 mod module_decls;
+mod module_links;
 mod module_scope;
 mod names;
 mod path;
@@ -108,15 +109,21 @@ pub use crate::lang_items::{
 };
 pub use crate::locals::{AnyItem, Local, LocalTable};
 pub use crate::macro_def::{
-    BuiltinAttr, BuiltinDerive, BuiltinFn, DOLLAR_CRATE, DefSite, DollarCrate, MacroDef,
-    MacroDefHead, MacroDefView, MacroKind, ProcKind, Transparency, dollar_crate_of,
+    BuiltinAttr, BuiltinDerive, BuiltinFn, DefSite, MacroDef, MacroDefHead, MacroDefView,
+    MacroKind, ProcKind, Transparency,
 };
 pub use crate::module_decls::{
     ChildModDecl, DeclaredItem, DeclsBuilder, ExpandedDecls, ExternCrateDecl, MacroCallDecl,
     MacroRulesDecl, ModuleDeclsView, ModuleInfo, UseDecl,
 };
+pub use crate::module_links::{
+    CellSeen, GLOB_LINKS_DOMAIN, GlobView, IMPORT_DOMAIN, IMPORTS_FORM, IMPORTS_MAGIC, ImportView, ImportsBuilder,
+    ImportsView, LINK_DOMAIN, LINKS_FORM, LINKS_MAGIC, LinkView, LinksBuilder, LinksView, Segments, TRAITS_CELL,
+    DECLARED_VIS, RowVis, mark_cell,
+    TRAITS_DOMAIN, Table, TableRefused, TargetView, imports_part, links_part,
+};
 pub use crate::module_scope::{
-    AnonImport, GlobEdge, RefusedWhy, ScopeBuilder, ScopeError, ScopeView, Site, TextualDef, TextualMark,
+    AnonImport, GlobEdge, Globs, RefusedWhy, ScopeBuilder, ScopeError, ScopeView, Site, TextualDef, TextualMark,
     Unresolved, UseSite, globs_digest, textual_digest, GLOBS_DOMAIN, TEXTUAL_DOMAIN,
 };
 pub use crate::names::{ModuleFile, ModuleFileView, TextualEntry, TextualEntryView};

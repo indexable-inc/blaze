@@ -15,7 +15,8 @@
 //! The design (the item layer's pull at item grain):
 //! 1. NEEDS ARE KNOWN BEFORE THE WALK. An instance (fn, ground args) needs exactly each row of
 //!    its body's `Checked::const_args` (a constant path and the arguments it is read at) and
-//!    each const block of the body, every argument grounded at the instance's ([`needs_of`]).
+//!    each const block and each promoted borrow (`Checked::promoted`) of the body, every
+//!    argument grounded at the instance's ([`needs_of`]).
 //! 2. THE LOOP PULLS THEM. The build's instance loop (run.rs `build_from`) asks the front end
 //!    for each need not held yet ([`pull`], the seam's `FrontEnd::const_at`), with the
 //!    program mutable: front2's evaluator, kept by the program after it is made, may check a
@@ -47,7 +48,7 @@ use blaze_ids::Hasher;
 use blaze_own::{Alloc, SortedMap, Vec};
 use blaze_typeck::{BodyView, Checked, Def, Expr, ExprId, ItemKey, List, PNode, PTy, PTys, PortableTys};
 
-use super::consts::ConstFail;
+use super::consts::{BodyRoot, ConstFail};
 use crate::seam::FrontEnd;
 
 /// One constant an instance's body reads.
@@ -59,14 +60,39 @@ pub enum ConstNeed {
     Item(ItemKey),
     /// `const { .. }` block `block` of `owner`'s body, at the owner's generic arguments.
     Block { owner: ItemKey, block: ExprId },
+    /// Promoted borrow `borrow` (`&operand` in `Checked::promoted`) of `owner`'s body, at the
+    /// owner's generic arguments: the operand's value, whose row the builder borrows
+    /// (blaze-build walk/promote.rs). Per instance as a const block is: the operand may name
+    /// the fn's generics (`&RawWakerVTable::new(clone_arc_raw::<W>, ..)`).
+    Promoted { owner: ItemKey, borrow: ExprId },
 }
 
 impl ConstNeed {
-    /// The table's order key: the need's kind, its item, its block.
+    /// The table's order key: the need's kind, its item, its expression.
     fn order(self) -> (u8, u128, u32) {
         match self {
             ConstNeed::Item(k) => (0, k.0, 0),
             ConstNeed::Block { owner, block } => (1, owner.0, block.0),
+            ConstNeed::Promoted { owner, borrow } => (2, owner.0, borrow.0),
+        }
+    }
+
+    /// The item a refusal of the need is about: the constant, or the fn whose body holds it.
+    pub fn item(self) -> ItemKey {
+        match self {
+            ConstNeed::Item(k) => k,
+            ConstNeed::Block { owner, .. } | ConstNeed::Promoted { owner, .. } => owner,
+        }
+    }
+
+    /// A need read from inside a body (a const block, a promoted borrow): its owner, where the
+    /// evaluator starts in the owner's body, and the key it keeps the constant under over the
+    /// owner's text `owner_text` ([`block_key`], [`promoted_key`]). `None` for a constant item.
+    pub fn in_body(self, owner_text: &str) -> Option<(ItemKey, BodyRoot, ItemKey)> {
+        match self {
+            ConstNeed::Item(_) => None,
+            ConstNeed::Block { owner, block } => Some((owner, BodyRoot::Block(block), block_key(owner, block, owner_text))),
+            ConstNeed::Promoted { owner, borrow } => Some((owner, BodyRoot::Promoted(borrow), promoted_key(owner, borrow, owner_text))),
         }
     }
 }
@@ -76,6 +102,7 @@ impl fmt::Display for ConstNeed {
         match self {
             ConstNeed::Item(k) => write!(f, "constant {:#x}", k.0),
             ConstNeed::Block { owner, block } => write!(f, "the const block at expression {} of fn {:#x}", block.0, owner.0),
+            ConstNeed::Promoted { owner, borrow } => write!(f, "the promoted borrow at expression {} of fn {:#x}", borrow.0, owner.0),
         }
     }
 }
@@ -151,8 +178,9 @@ impl<A: Allocator + Clone> Needs<A> {
 /// owner's generics in order), filed into `out` (cleared first): every constant path the check
 /// recorded arguments for (`Checked::const_args`, each grounded at `args` exactly as the
 /// builder's walk grounds it: blaze-build walk.rs `const_path_args`), and every const block,
-/// at `args`. A constant with no generics has no row: its one value is the program's own
-/// (`FrontEnd::const_record`), made when the program was.
+/// at `args`, and every promoted borrow (`Checked::promoted`), at `args`. A constant with no
+/// generics has no row: its one value is the program's own (`FrontEnd::const_record`), made
+/// when the program was.
 #[allow(clippy::too_many_arguments)]
 pub fn needs_of<A: Allocator + Clone>(
     view: &BodyView<'_>,
@@ -180,11 +208,32 @@ pub fn needs_of<A: Allocator + Clone>(
         }
         out.push(ConstNeed::Item(item), &grounded)?;
     }
+    // RFC 3681: each field a base-less `S { a: 1, .. }` takes from its default
+    // (`Checked::default_fields`), the default's constant at the struct type's ground
+    // arguments (its generics are the ADT's), as blaze-build walk.rs `init_defaults` reads it.
+    // A non-generic ADT's default is a row at no arguments: the program makes no record of it.
+    let mut last = None;
+    for (&e, &key) in done.default_fields.column::<0>().iter().zip(done.default_fields.column::<2>().iter()) {
+        if last != Some(e) {
+            let t = *done.expr_ty.get(e.0 as usize).ok_or(malformed("a struct expression with defaults past the record's types"))?;
+            let g = blaze_build::ground(types, t, args, ground, scratch, facts)?;
+            let PNode::Adt(_, list) = ground.view().node(g).map_err(|_| malformed("a grounded type past the ground table"))? else {
+                return Err(malformed("a struct expression with defaults of a type that is not an ADT"));
+            };
+            grounded.clear();
+            grounded.extend_from_slice(ground.view().list(list).map_err(|_| malformed("an ADT's arguments past the ground table"))?);
+            last = Some(e);
+        }
+        out.push(ConstNeed::Item(key), &grounded)?;
+    }
     for (i, x) in view.exprs.iter().enumerate() {
         if matches!(x, Expr::ConstBlock { .. }) {
             let block = ExprId(u32::try_from(i).map_err(|_| malformed("an expression index past a u32"))?);
             out.push(ConstNeed::Block { owner: view.owner, block }, args)?;
         }
+    }
+    for &borrow in done.promoted.iter() {
+        out.push(ConstNeed::Promoted { owner: view.owner, borrow }, args)?;
     }
     Ok(())
 }
@@ -233,9 +282,19 @@ pub fn pull<P: FrontEnd, A: Allocator + Clone>(program: &mut P, needs: &Needs<A>
 /// owner's key, the block's expression and the owner's text (rule 21: the text is in it, so a
 /// record of the block is never one of an older text).
 pub fn block_key(owner: ItemKey, block: ExprId, owner_text: &str) -> ItemKey {
-    let mut h = Hasher::new("blaze-ladder front2 const block");
+    in_body_key("blaze-ladder front2 const block", owner, block, owner_text)
+}
+
+/// The key the evaluator keeps promoted borrow `borrow` of `owner` under, as [`block_key`]
+/// keeps a const block, in a domain of its own: a borrow and a block never share a key.
+pub fn promoted_key(owner: ItemKey, borrow: ExprId, owner_text: &str) -> ItemKey {
+    in_body_key("blaze-ladder front2 promoted borrow", owner, borrow, owner_text)
+}
+
+fn in_body_key(domain: &'static str, owner: ItemKey, at: ExprId, owner_text: &str) -> ItemKey {
+    let mut h = Hasher::new(domain);
     h.update(&owner.0.to_le_bytes());
-    h.update(&block.0.to_le_bytes());
+    h.update(&at.0.to_le_bytes());
     h.update(owner_text.as_bytes());
     let id = h.finish();
     let mut low = [0u8; 16];

@@ -101,10 +101,12 @@ pub fn block_modules<'a>(krate: CrateItemKey, body: ItemKey, nested: &Nested<'_>
 /// The module text of the blocks of `text` (one item's whole text, scanned to `nested`) that
 /// hold an item that makes a module or a statement call, or a block that does; empty when no
 /// block holds one. Rendered by [`crate::expanded_blocks::render`], the one renderer of
-/// hand-written and expansion-written blocks.
-pub fn module_text<'a>(text: &str, nested: &Nested<'_>, alloc: Alloc<'a>) -> AString<'a> {
+/// hand-written and expansion-written blocks. `copied` is told each slice of `text` the module
+/// text copies (offsets in `text`): a body a macro wrote moves its marks' column with them
+/// (crate_roots `remapped`); a file's body passes `&mut |_| {}`.
+pub fn module_text<'a>(text: &str, nested: &Nested<'_>, copied: &mut dyn FnMut(crate::crate_roots::Copied), alloc: Alloc<'a>) -> AString<'a> {
     let written = written_blocks(nested, alloc);
-    crate::expanded_blocks::render(text, nested, &written, crate::expanded_blocks::Outer::Module, alloc)
+    crate::expanded_blocks::render(text, nested, &written, crate::expanded_blocks::Outer::Module, copied, alloc)
 }
 
 #[cfg(test)]
@@ -115,7 +117,7 @@ mod tests {
 
     fn made(text: &str) -> std::string::String {
         let alloc = Alloc::global();
-        module_text(text, &scan(text, alloc), alloc).as_str().into()
+        module_text(text, &scan(text, alloc), &mut |_| {}, alloc).as_str().into()
     }
 
     #[test]

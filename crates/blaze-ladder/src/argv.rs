@@ -162,12 +162,14 @@ mod tests {
     /// by a null: C17 5.1.2.2.1 ("argv[argc] shall be a null pointer").
     #[test]
     fn the_c_form_holds_the_same_strings_and_ends_in_null() {
-        let heap = blaze_own::testing::heap();
+        // The test's one allocator, made at its top: a frame, its memory from the OS.
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
         let rest = ["one", "", "three"];
-        let mut argv = Argv::new_in("ladder", &rest, heap.alloc()).unwrap_or_else(|e| panic!("ARGV: {e}"));
+        let mut argv = Argv::new_in("ladder", &rest, erased.handle()).unwrap_or_else(|e| panic!("ARGV: {e}"));
         let c = argv.c();
         assert_eq!(c.argc, 4);
-        let mut seen: Vec<&str, Alloc<'_>> = Vec::new_in(heap.alloc());
+        let mut seen: Vec<&str, Alloc<'_>> = Vec::new_in(erased.handle());
         for i in 0..=4usize {
             // SAFETY: `argv` holds `argc + 1` pointers (invariant 2), alive while `argv` is.
             let p = unsafe { *c.argv.as_ptr().add(i) };
@@ -180,7 +182,7 @@ mod tests {
             let s = unsafe { core::ffi::CStr::from_ptr(p.cast()) };
             seen.push(s.to_str().unwrap_or_else(|e| panic!("ARGV: {e}")));
         }
-        let strings: Vec<&str, Alloc<'_>> = Vec::from_iter_in(argv.strings(), heap.alloc());
+        let strings: Vec<&str, Alloc<'_>> = Vec::from_iter_in(argv.strings(), erased.handle());
         assert_eq!(seen.as_slice(), strings.as_slice());
         assert_eq!(strings.as_slice(), &["ladder", "one", "", "three"]);
         println!("ARGV: argc 4, the C strings equal the hosted ones, argv[4] null");
@@ -189,9 +191,11 @@ mod tests {
     /// A NUL inside an argument is refused by its index, never cut short.
     #[test]
     fn a_nul_in_an_argument_is_refused_by_index() {
-        let heap = blaze_own::testing::heap();
+        // The test's one allocator, made at its top: a frame, its memory from the OS.
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
         let rest = ["fine", "cut\0short"];
-        match Argv::new_in("ladder", &rest, heap.alloc()) {
+        match Argv::new_in("ladder", &rest, erased.handle()) {
             Err(error) => {
                 assert_eq!(error, ArgvError::Nul { index: 2 });
                 println!("ARGV NUL: {error}");

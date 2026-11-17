@@ -15,7 +15,7 @@ use std::ops::Range;
 
 use base_db::{Crate, Db};
 use blaze_format::leb;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::ContentId;
 use blaze_items::{ItemId, ItemKey, key::Resolved};
 use hir_def::StaticId;
@@ -170,7 +170,7 @@ impl Statics {
     /// from) reaches, but the sysroot's, each found as a static of the database by its item key.
     pub(crate) fn resolve(db: &Db, krate: Crate, list: &List) -> Result<Statics, String> {
         // Each crate it reaches by the first 8 bytes of its key, which an item key begins with.
-        let mut crates: HashMap<[u8; 8], Crate, Global> = HashMap::new_in(Global);
+        let mut crates: Map<[u8; 8], Crate, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         // alloc: once a module loaded, the crates to visit
         let mut stack = vec![krate];
         while let Some(it) = stack.pop() {

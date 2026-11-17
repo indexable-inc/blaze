@@ -4,47 +4,10 @@
 # list. Debt against the end state (results as flat records read in place). Only shrinks; a
 # crate with no row is held to 0. Checked by crates/blaze-memo/tests/owns.rs. The port's first
 # green head writes the rows.
-base-db	7
+# Rows of the old layer's crates (base-db, blaze-lints, hir-def, hir-expand, every hir-ty*) went
+# with those crates, deleted 2026-11-16: a row for a crate that is gone holds nothing.
 # Raised 0 -> 2, port 2026-11-14 (lane "kept values"): key.rs `crate_items` and
 # `crate_inner_items`, each a `KeyIndex` whose rows grow in place in a reserved region
 # (`RegionVec`) and are unmapped when the value drops. Flat, but kept slices would copy the
 # crate's largest session table into the arena once walked (twice its size at the peak).
 blaze-items	2
-blaze-lints	18
-# Raised 85 -> 95, port 2026-11-14 (lane "kept values"): `keep_owned` of real trees, a signature
-# with its expression store and a source map. signatures.rs (9): `Serve::with_map` (1); the
-# `signature_queries!` macro's `lowered`, `with_source_map` (2) and `relative` (4 sites, made for
-# 9 signatures); `VariantFields`' same four. deps/signatures.rs `served!` (1, the deps lane's).
-hir-def	95
-hir-expand	9
-# Raised 68 -> 69, port 2026-11-14: one `owns` added after this row was written (20:10, 11-13),
-# not identified from the tree (no record of the count by file). Candidates written since:
-# rpitit.rs `impl_rpitit_tys` (a `Box<[Result<_, RpititError>]>`, a flat list whose error holds
-# a `Box<str>` and a `Box<[u32]>`: the one to make kept), lower.rs, lower/batch.rs, infer.rs,
-# opaques.rs, consteval.rs, providers.rs, layout.rs, layout/bits.rs, representability.rs,
-# body_store/mir/tests.rs.
-# Raised 69 -> 70, port round 27 (lane T): main's merge brought lower.rs
-# `declared_trait_predicates_of` (implied bounds), a `TyLoweringResult<GenericPredicates>` as
-# its siblings `generic_predicates*` and `explicit_*_clauses` are, all `owns`: the predicates
-# and their diagnostics are a real tree until `GenericPredicates` is a flat record.
-# Raised 70 -> 71, merge of the item-store branch 2026-11-14: lower.rs `batched_field_types`, a
-# dependency variant's row of its crate's field-type batch copied out as a
-# `TyLoweringResult<ThinVec<FieldType>>`, as its sibling `field_types_of_variant` is, so a read
-# of it is a fact of the variant's ADT and not of the whole crate (rule 65).
-hir-ty	71
-hir-ty-borrowck	2
-# First counted 2026-11-14: its library is at the crate's top (`[lib] path = "mod.rs"`), which
-# the count of `src/` alone never saw.
-hir-ty-codegen	17
-hir-ty-identity	4
-hir-ty-matchck	1
-# Raised 12 -> 13, port round 27 (lane T): main's merge brought mir/loop_match.rs
-# `loop_match_check`, whose refusals hold a `StoredTy` (a reference count) and whose loops a
-# `Box<[u32]>`: owned until the refusal names its type by an arena id.
-hir-ty-mir	13
-# Raised 12 -> 14, port round 27 (lane T): main's merge brought trust.rs `edge` and
-# `toolchain_call`, each holding `Instance`s (their `StoredGenericArgs` are reference counts)
-# and `Done`'s `Box<str>` text: owned until an instance is an interned id of the arena.
-hir-ty-pure	14
-hir-ty-share	6
-hir-ty-wfcheck	1

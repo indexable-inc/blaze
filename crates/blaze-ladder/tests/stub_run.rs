@@ -252,3 +252,44 @@ fn a_static_of_fn_pointers_calls_through_its_words() {
     println!("STATIC FN POINTERS: status {strict} (strict), status {}, {} not built", ran.status, ran.not_built);
     assert_eq!((strict, ran.status, ran.not_built), (42, 42, 0));
 }
+
+/// `const F: fn() -> i32 = seven;` and `main` returns `F()`: no body names `seven` but the
+/// constant's. The evaluator's record of `F` is one word relocated to `seven`'s instance key;
+/// the builder asks the run's `Adts::const_fn_instance` which instance that is (run.rs
+/// `FrontAdts`, the program's non-generic fns keyed as the build loop keys them), files it in
+/// `main`'s `Built::refs`, and the loop reaches and builds it from there. Without the answer
+/// `main` is refused ("a constant's value holds a fn pointer to instance .., which the build's
+/// `Adts` does not give") and the strict run fails; if the reach did not follow `Built::refs`,
+/// `seven`'s slot would be a stub and the run would stop at the call.
+///
+/// Prints: `CONST FN POINTER: status 7 (strict), status 7, 0 not built` and
+/// `test a_constants_fn_pointer_is_built_and_called ... ok`
+#[test]
+fn a_constants_fn_pointer_is_built_and_called() {
+    let text = "#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+fn seven() -> i32 {
+    7
+}
+
+const F: fn() -> i32 = seven;
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    F()
+}
+";
+    let files = [SourceFile { path: "src/main.rs", text }];
+    let strict = run_with(&files, "src/main.rs", None, FrontChoice::New(NEW), blaze_own::testing::heap().shared()).unwrap_or_else(|e| panic!("CONST FN POINTER (strict): {e}"));
+    let ran = run_program(&files, "src/main.rs", None, NEW, blaze_own::testing::heap().shared()).unwrap_or_else(|e| panic!("CONST FN POINTER: {e}"));
+    println!("CONST FN POINTER: status {strict} (strict), status {}, {} not built", ran.status, ran.not_built);
+    assert_eq!((strict, ran.status, ran.not_built), (7, 7, 0));
+}

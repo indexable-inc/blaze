@@ -4,37 +4,31 @@
 
 #![feature(allocator_api)]
 
-use std::{path::PathBuf, pin::pin, sync::Arc, task::Poll};
+use std::{path::PathBuf, sync::Arc};
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_registry::{
     Context, IndexRegistry, SourceConfig, SourceDef, Sources,
     http::{Http, Response},
 };
 use blaze_resolve::{
-    DepKind, Dependency, IndexSummary, MemRegistry, PackageId, QueryKind, Registry, SourceId,
+    DepKind, Dependency, IndexSummary, Lookup, MemRegistry, PackageId, QueryKind, Registry,
+    SourceId,
 };
-
-/// `future` to its end on this thread through blaze-core's one `block_on`: a query of an
-/// index served from memory, held to a bound a test never nears.
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    let within = Some(std::time::Duration::from_secs(30));
-    blaze_core::wait::block_on("a test's query of an index in memory", within, future).unwrap()
-}
 use blaze_core::lock::Lock;
 use std::alloc::Global;
 
 const BASE: &str = "https://index.example.com/";
 
 struct Server {
-    files: Lock<HashMap<String, Vec<u8>, Global>>,
+    files: Lock<Map<String, Vec<u8>, FixedState, Global>>,
     asked: Lock<Vec<String>>,
 }
 
 impl Default for Server {
     fn default() -> Server {
         Server {
-            files: Lock::new("registry.test.query.files", HashMap::new_in(Global)),
+            files: Lock::new("registry.test.query.files", Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None })),
             asked: Lock::new("registry.test.query.asked", Vec::new()),
         }
     }
@@ -119,21 +113,47 @@ fn dep(name: &str, req: &str) -> Dependency {
     Dependency::parse(name, Some(req), SourceId::crates_io()).unwrap()
 }
 
-/// What `kind` offers for `dep`, as `status version` each.
-fn query(registry: &impl Registry, dep: &Dependency, kind: QueryKind) -> Vec<String> {
-    let mut found = Vec::new();
-    block_on(registry.query(dep, kind, &mut |s| {
-        let status = match &s {
-            IndexSummary::Candidate(_) => "candidate",
-            IndexSummary::Yanked(_) => "yanked",
-            IndexSummary::Unsupported(..) => "unsupported",
-            IndexSummary::Invalid(_) => "invalid",
-            IndexSummary::Offline(_) => "offline",
-        };
-        found.push(format!("{status} {} {}", s.package_id().name(), s.package_id().version()));
-    }))
-    .unwrap();
-    found
+/// `s` as `status name version`.
+fn said(s: &IndexSummary) -> String {
+    let status = match s {
+        IndexSummary::Candidate(_) => "candidate",
+        IndexSummary::Yanked(_) => "yanked",
+        IndexSummary::Unsupported(..) => "unsupported",
+        IndexSummary::Invalid(_) => "invalid",
+        IndexSummary::Offline(_) => "offline",
+    };
+    format!("{status} {} {}", s.package_id().name(), s.package_id().version())
+}
+
+/// What `kind` offers for `dep`, as `status version` each: the answer to a resolve's ask,
+/// its index files read now.
+fn query(registry: &IndexRegistry<'_, MemRegistry>, dep: &Dependency, kind: QueryKind) -> Vec<String> {
+    let found = registry.fetch_summaries(dep, kind, Global).unwrap();
+    found.iter().map(said).collect()
+}
+
+/// The resolver's own query never asks the server: a file this update has not read is
+/// `Unknown`, and once an ask's answer read it, the same query is answered from it with the
+/// ask's answer and nothing more asked. A trait query that fetched would show its requests in
+/// `take_asked` before the fetch; one that ignored what the fetch read would stay `Unknown`.
+#[test]
+fn the_resolvers_query_answers_only_from_files_read() {
+    let fixture = Fixture::new("held");
+    fixture.server.put("3/l/log", &[line("log", "0.4.0", ""), line("log", "0.4.1", "")]);
+    let sources = fixture.sources(false);
+    let registry = IndexRegistry::new(&sources, MemRegistry::default());
+    let wanted = dep("log", "0.4");
+    let mut before = Vec::new();
+    let unread = registry.query(&wanted, QueryKind::Exact, &mut |s| before.push(said(&s))).unwrap();
+    assert_eq!(unread, Lookup::Unknown);
+    assert_eq!(fixture.server.take_asked(), Vec::<String>::new());
+    let fetched = query(&registry, &wanted, QueryKind::Exact);
+    assert_eq!(fetched, ["candidate log 0.4.0", "candidate log 0.4.1"]);
+    assert_eq!(fixture.server.take_asked(), [format!("{BASE}config.json"), format!("{BASE}3/l/log")]);
+    let mut held = Vec::new();
+    let read = registry.query(&wanted, QueryKind::Exact, &mut |s| held.push(said(&s))).unwrap();
+    assert_eq!((read, held), (Lookup::Answered(()), fetched));
+    assert_eq!(fixture.server.take_asked(), Vec::<String>::new());
 }
 
 #[test]
@@ -168,12 +188,8 @@ fn summaries_and_statuses_as_cargo() {
         ]
     );
 
-    let mut first = None;
-    block_on(registry.query(&dep("serde", "=1.0.0"), QueryKind::Exact, &mut |s| {
-        first = Some(s.into_summary());
-    }))
-    .unwrap();
-    let summary = first.unwrap();
+    let found = registry.fetch_summaries(&dep("serde", "=1.0.0"), QueryKind::Exact, Global).unwrap();
+    let summary = found.into_iter().next().unwrap().into_summary();
     assert_eq!(summary.package_id().source_id(), SourceId::crates_io());
     assert_eq!(summary.checksum(), Some("aa"));
     assert_eq!(summary.links().as_deref(), Some("serde"));
@@ -306,29 +322,11 @@ fn queries_wait_for_one_read_of_a_file() {
     let sources = fixture.sources(false);
     let registry = IndexRegistry::new(&sources, MemRegistry::default());
     let wanted = dep("log", "0.4");
-    let (mut a, mut b) = (0, 0);
-    block_on(async {
-        let (mut count_a, mut count_b) = (|_| a += 1, |_| b += 1);
-        let first = registry.query(&wanted, QueryKind::Exact, &mut count_a);
-        let second = registry.query(&wanted, QueryKind::Exact, &mut count_b);
-        let (mut first, mut second) = (pin!(first), pin!(second));
-        let (mut one, mut two) = (None, None);
-        std::future::poll_fn(|cx| {
-            if one.is_none()
-                && let Poll::Ready(it) = first.as_mut().poll(cx)
-            {
-                one = Some(it);
-            }
-            if two.is_none()
-                && let Poll::Ready(it) = second.as_mut().poll(cx)
-            {
-                two = Some(it);
-            }
-            if one.is_some() && two.is_some() { Poll::Ready(()) } else { Poll::Pending }
-        })
-        .await;
-        one.unwrap().unwrap();
-        two.unwrap().unwrap();
+    // Two asks of one file on two threads at once, as a step loop answers a round's asks.
+    let (a, b) = std::thread::scope(|scope| {
+        let ask = || registry.fetch_summaries(&wanted, QueryKind::Exact, Global).unwrap().len();
+        let (first, second) = (scope.spawn(ask), scope.spawn(ask));
+        (first.join().unwrap(), second.join().unwrap())
     });
     assert_eq!((a, b), (1, 1));
     assert_eq!(

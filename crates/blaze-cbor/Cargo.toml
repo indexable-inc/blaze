@@ -20,6 +20,7 @@ blaze-data.workspace = true
 blaze-own.workspace = true
 
 [dev-dependencies]
+blaze-mem.workspace = true
 # The round trip against `Value`, with a planted-bug control.
 blaze-sim.workspace = true
 

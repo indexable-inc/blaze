@@ -17,22 +17,27 @@
 //! its macro path, whether it is D104's implicit `::std::main`, and the matcher's reason as
 //! blaze-expand's record of [`blaze_expand::Failed`] ([`NamesRecord::failed`]).
 //!
-//! The unit of decode is ONE MODULE's scope: the path walk asks for a module's scope
-//! (`World::scope`, a `&ScopeBuilder`) one segment at a time, and a body's paths touch a handful
-//! of modules of a handful of crates. Opening a record checks its header and section bounds and
-//! parses nothing; a row is found by binary search in place; a module's scope, chain, an enum's
-//! variants and the crate root are each turned into their working form the first time asked,
-//! then kept by that crate's reader for the rest of the command.
+//! A RECORD IS ITS OWN INDEX (D114 rule 1). The bytes are checked once in a process, whole:
+//! [`Verified::check`] reads every module's scope and the crate root with their own checks,
+//! and every row's ranges, and is the one way to a [`Verified`], the proof every reader takes
+//! (rule 74). [`NamesRecord::open`] of a proof is a copy of its header (O(1), no allocation);
+//! every answer after it is a binary search of the mapped bytes: a module's row, then its scope
+//! viewed in place ([`ScopeView::trusted`]) and searched in place, its chain a slice of the
+//! bytes, an enum's variants a run of rows, the crate root a view. Nothing is decoded, kept or
+//! counted per module: a fresh process answers its first lookup in the time of the searches.
 
-use core::cell::{Cell, OnceCell};
+use core::cell::OnceCell;
 
 use blaze_format::FormatError;
 use blaze_hash::HashMap;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_own::{AVec, Alloc};
-use blaze_surface::{BuildError, CrateRootBuilder, CrateRootView, RecordBytes, ScopeBuilder, ScopeView};
+use blaze_surface::{BuildError, CrateRootView, RecordBytes, ScopeView};
+#[cfg(test)]
+use blaze_surface::ScopeBuilder;
 
-use crate::names::World;
+use crate::facts::Name;
+use crate::names::{VariantHit, World};
 use crate::resolve::{CrateNames, ExpandNote, NamesNote};
 use crate::task::Variant;
 
@@ -41,7 +46,10 @@ const MAGIC: [u8; 4] = *b"BZNM";
 /// [`NamesRecordError::NotThisRecord`]: an old home's names are made again (rule 26).
 /// 3: row flag bit 1, a block's module (super-in-block-1, 2026-11-16); an older record has it
 /// clear everywhere and would read `super` in a block wrong.
-const VERSION: u32 = 3;
+/// Reading in place (D114 rule 1) changes no byte: the writer is the same, so the version stays.
+/// 4: the crate root it holds is form 4 (blaze-surface `CrateRootRoot`: the root's
+/// `#![feature(..)]` names); a version-3 record is not read, and its names are made again.
+const VERSION: u32 = 4;
 /// A failed call's row: call key, path at and length, record at and length, flags, padding.
 const FAILED_ROW: usize = 64;
 const FAILED_IMPLICIT: u32 = 1;
@@ -50,6 +58,7 @@ const HEADER: usize = 128;
 const ROW: usize = 48;
 const ENUM_ROW: usize = 40;
 const VARIANT_ROW: usize = 48;
+const KEY: usize = 32;
 const NONE: u32 = u32::MAX;
 const NO_IMPLICIT_PRELUDE: u16 = 1;
 const ANONYMOUS: u16 = 2;
@@ -65,10 +74,14 @@ pub enum NamesRecordError {
     Unaligned,
     /// Not `BZNM` and this version.
     NotThisRecord,
-    /// A section runs past the end of the record.
+    /// A section or a row's range runs past the end of its section.
     Short { what: &'static str, at: usize },
+    /// A table's rows are not in strictly increasing key order, which its search relies on.
+    OutOfOrder { what: &'static str, at: usize },
     /// A module's `ModuleScope` record did not read.
     Scope { module: ItemKey, error: FormatError },
+    /// A module row's scope is the scope of another module.
+    NotItsScope { module: ItemKey, found: ItemKey },
     /// The `CrateRoot` record did not read.
     Root(FormatError),
     /// A variant's name is not UTF-8.
@@ -161,6 +174,7 @@ pub(crate) mod plant {
 #[cfg(test)]
 fn planted<'s, 'n>(module: ItemKey, scope: &'s ScopeBuilder<'n, &'n str>, done: &mut bool) -> Option<ScopeBuilder<'n, &'n str>> {
     use blaze_surface::Visibility;
+    use core::cell::Cell;
     use plant::{PLANT, Plant};
     let plant = PLANT.with(Cell::get);
     if plant == Plant::None || *done || scope.bindings.is_empty() {
@@ -326,31 +340,20 @@ fn le16(bytes: &[u8], at: usize) -> u16 {
 }
 
 fn key_at(bytes: &[u8], at: usize) -> ItemKey {
-    let mut k = [0u8; 32];
-    k.copy_from_slice(&bytes[at..at + 32]);
+    let mut k = [0u8; KEY];
+    k.copy_from_slice(&bytes[at..at + KEY]);
     ItemKey(ContentId(k))
 }
 
-/// What a reader decoded so far: the measure of "decoded on demand".
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub struct Decoded {
-    /// Records opened (crates asked about).
-    pub crates: usize,
-    /// Records' bytes, opened.
-    pub bytes: usize,
-    /// Module scopes turned into their working form.
-    pub scopes: usize,
-    /// Their records' bytes.
-    pub scope_bytes: usize,
-}
-
-/// One crate's names record, read in place; each part decoded the first time it is asked.
-pub struct NamesRecord<'a> {
-    bytes: &'a [u8],
+/// What a record's header says: the sections' places and counts, checked to lie inside it.
+#[derive(Clone, Copy, Debug)]
+struct Head {
     key: CrateItemKey,
     root_module: ItemKey,
     modules: usize,
+    chain_keys: usize,
     enums: usize,
+    variants: usize,
     chains_at: usize,
     enums_at: usize,
     variants_at: usize,
@@ -358,116 +361,190 @@ pub struct NamesRecord<'a> {
     root_at: usize,
     root_len: usize,
     blob_at: usize,
+    blob_len: usize,
     /// The failed-calls section (version 2).
     failed_at: usize,
     failed_len: usize,
-    scopes: AVec<'a, OnceCell<ScopeBuilder<'a, &'a str>>>,
-    chains: AVec<'a, OnceCell<AVec<'a, ItemKey>>>,
-    variants: AVec<'a, OnceCell<AVec<'a, Variant<&'a str>>>>,
-    root: OnceCell<CrateRootBuilder<'a, &'a str>>,
-    decoded: Cell<Decoded>,
-    alloc: Alloc<'a>,
 }
 
-impl<'a> NamesRecord<'a> {
-    /// Checks the header and that every section lies inside `bytes`; parses nothing else.
-    pub fn open(bytes: &'a [u8], alloc: Alloc<'a>) -> Result<NamesRecord<'a>, NamesRecordError> {
-        if bytes.as_ptr() as usize % ALIGN != 0 {
+impl Head {
+    /// The header of `bytes`, every section checked to lie inside them: O(1).
+    fn read(bytes: &[u8]) -> Result<Head, NamesRecordError> {
+        if !(bytes.as_ptr() as usize).is_multiple_of(ALIGN) {
             return Err(NamesRecordError::Unaligned);
         }
         if bytes.len() < HEADER || bytes[..4] != MAGIC || le32(bytes, 4) != VERSION {
             return Err(NamesRecordError::NotThisRecord);
         }
         let f = |i: usize| le32(bytes, 8 + 4 * i) as usize;
-        let (modules, chain_keys, enums, variants) = (f(0), f(1), f(2), f(3));
-        let (chains_at, enums_at, variants_at, strings_at, root_at, root_len, blob_at, blob_len) = (f(4), f(5), f(6), f(7), f(8), f(9), f(10), f(11));
-        let (failed_at, failed_len) = (f(12), f(13));
-        let within = |what: &'static str, at: usize, len: usize| {
-            if at.checked_add(len).is_some_and(|end| end <= bytes.len()) { Ok(()) } else { Err(NamesRecordError::Short { what, at }) }
-        };
-        within("module rows", HEADER, modules * ROW)?;
-        within("chain keys", chains_at, chain_keys * 32)?;
-        within("enum rows", enums_at, enums * ENUM_ROW)?;
-        within("variant rows", variants_at, variants * VARIANT_ROW)?;
-        within("strings", strings_at, root_at.saturating_sub(strings_at))?;
-        within("crate root", root_at, root_len)?;
-        within("blob", blob_at, blob_len)?;
-        within("failed calls", failed_at, failed_len)?;
-        if failed_len < ALIGN || failed_at % ALIGN != 0 || failed_len < ALIGN + le32(bytes, failed_at) as usize * FAILED_ROW {
-            return Err(NamesRecordError::Short { what: "failed call rows", at: failed_at });
-        }
-        fn cells<'a, T>(n: usize, alloc: Alloc<'a>) -> AVec<'a, OnceCell<T>> {
-            let mut v = AVec::with_capacity_in(n, alloc);
-            v.resize_with(n, OnceCell::new);
-            v
-        }
-        let decoded = Decoded { crates: 1, bytes: bytes.len(), ..Decoded::default() };
-        Ok(NamesRecord {
-            bytes,
+        let head = Head {
             key: CrateItemKey(key_at(bytes, HEADER - 64).0),
             root_module: key_at(bytes, HEADER - 32),
-            modules,
-            enums,
-            chains_at,
-            enums_at,
-            variants_at,
-            strings_at,
-            root_at,
-            root_len,
-            blob_at,
-            failed_at,
-            failed_len,
-            scopes: cells(modules, alloc),
-            chains: cells(modules, alloc),
-            variants: cells(enums, alloc),
-            root: OnceCell::new(),
-            decoded: Cell::new(decoded),
-            alloc,
-        })
+            modules: f(0),
+            chain_keys: f(1),
+            enums: f(2),
+            variants: f(3),
+            chains_at: f(4),
+            enums_at: f(5),
+            variants_at: f(6),
+            strings_at: f(7),
+            root_at: f(8),
+            root_len: f(9),
+            blob_at: f(10),
+            blob_len: f(11),
+            failed_at: f(12),
+            failed_len: f(13),
+        };
+        let within = |what: &'static str, at: usize, count: usize, width: usize| match count.checked_mul(width).and_then(|len| at.checked_add(len)) {
+            Some(end) if end <= bytes.len() => Ok(()),
+            _ => Err(NamesRecordError::Short { what, at }),
+        };
+        within("module rows", HEADER, head.modules, ROW)?;
+        within("chain keys", head.chains_at, head.chain_keys, KEY)?;
+        within("enum rows", head.enums_at, head.enums, ENUM_ROW)?;
+        within("variant rows", head.variants_at, head.variants, VARIANT_ROW)?;
+        if head.strings_at > head.root_at {
+            return Err(NamesRecordError::Short { what: "strings", at: head.strings_at });
+        }
+        within("strings", head.strings_at, head.root_at - head.strings_at, 1)?;
+        within("crate root", head.root_at, head.root_len, 1)?;
+        within("blob", head.blob_at, head.blob_len, 1)?;
+        within("failed calls", head.failed_at, head.failed_len, 1)?;
+        if head.failed_len < ALIGN
+            || !head.failed_at.is_multiple_of(ALIGN)
+            || (le32(bytes, head.failed_at) as usize).checked_mul(FAILED_ROW).is_none_or(|rows| head.failed_len < ALIGN + rows)
+        {
+            return Err(NamesRecordError::Short { what: "failed call rows", at: head.failed_at });
+        }
+        Ok(head)
+    }
+}
+
+/// A names record checked whole, once in this process: the proof every reader takes (rule 74).
+/// Made only by [`Verified::check`]; a `Copy` of a pointer and the header.
+///
+/// The check is O(the record): the header, each table's key order, every row's ranges, every
+/// module's `ModuleScope` record and the `CrateRoot` record by their own checks
+/// ([`ScopeView::read`], [`CrateRootView::read`]), each variant name as UTF-8. The command makes
+/// it where the bytes enter the process (front_load.rs's one call, or a store fetch whose digest
+/// was checked: the store's `Checked` proof, once it lands, plus this form check), and keeps it
+/// as long as the bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct Verified<'m> {
+    bytes: &'m [u8],
+    head: Head,
+}
+
+impl<'m> Verified<'m> {
+    /// `bytes` checked whole as a names record.
+    pub fn check(bytes: &'m [u8]) -> Result<Verified<'m>, NamesRecordError> {
+        let head = Head::read(bytes)?;
+        let increasing = |what: &'static str, at: usize, count: usize, width: usize| {
+            for i in 1..count {
+                let (a, b) = (at + (i - 1) * width, at + i * width);
+                if bytes[a..a + KEY] >= bytes[b..b + KEY] {
+                    return Err(NamesRecordError::OutOfOrder { what, at: b });
+                }
+            }
+            Ok(())
+        };
+        increasing("module rows", HEADER, head.modules, ROW)?;
+        increasing("enum rows", head.enums_at, head.enums, ENUM_ROW)?;
+        for i in 0..head.modules {
+            let row = HEADER + i * ROW;
+            let module = key_at(bytes, row);
+            let at = le32(bytes, row + 32);
+            if at != NONE {
+                let (start, len) = (at as usize, le32(bytes, row + 36) as usize);
+                if start.checked_add(len).is_none_or(|end| end > head.blob_len) {
+                    return Err(NamesRecordError::Short { what: "a module scope", at: head.blob_at + start });
+                }
+                let start = head.blob_at + start;
+                let view = ScopeView::read(&bytes[start..start + len]).map_err(|error| NamesRecordError::Scope { module, error })?;
+                if view.module() != module {
+                    return Err(NamesRecordError::NotItsScope { module, found: view.module() });
+                }
+            }
+            let first = le32(bytes, row + 40);
+            if first != NONE {
+                let len = usize::from(le16(bytes, row + 44));
+                if (first as usize).checked_add(len).is_none_or(|end| end > head.chain_keys) {
+                    return Err(NamesRecordError::Short { what: "a module's chain", at: row });
+                }
+            }
+        }
+        let strings_len = head.root_at - head.strings_at;
+        for i in 0..head.enums {
+            let row = head.enums_at + i * ENUM_ROW;
+            let owner = key_at(bytes, row);
+            let (first, count) = (le32(bytes, row + 32) as usize, le32(bytes, row + 36) as usize);
+            if first.checked_add(count).is_none_or(|end| end > head.variants) {
+                return Err(NamesRecordError::Short { what: "an enum's variant rows", at: row });
+            }
+            for k in first..first + count {
+                let v = head.variants_at + k * VARIANT_ROW;
+                let (at, len) = (le32(bytes, v + 32) as usize, le32(bytes, v + 36) as usize);
+                if at.checked_add(len).is_none_or(|end| end > strings_len) {
+                    return Err(NamesRecordError::Short { what: "a variant name", at: v });
+                }
+                let start = head.strings_at + at;
+                core::str::from_utf8(&bytes[start..start + len]).map_err(|_| NamesRecordError::Name { owner })?;
+            }
+        }
+        CrateRootView::read(&bytes[head.root_at..head.root_at + head.root_len]).map_err(NamesRecordError::Root)?;
+        // The failed calls: rows by increasing call key, each path a UTF-8 range of the paths
+        // and each reason a range of the section. The reason's own record is read when asked
+        // ([`NamesRecord::failed`], blaze-expand's check of its record).
+        let s = &bytes[head.failed_at..head.failed_at + head.failed_len];
+        let count = le32(s, 0) as usize;
+        increasing("failed call rows", head.failed_at + ALIGN, count, FAILED_ROW)?;
+        let paths_at = ALIGN + count * FAILED_ROW;
+        for i in 0..count {
+            let row = ALIGN + i * FAILED_ROW;
+            let call = key_at(s, row);
+            let (path_at, path_len) = (le32(s, row + 32) as usize, le32(s, row + 36) as usize);
+            let (record_at, record_len) = (le32(s, row + 40) as usize, le32(s, row + 44) as usize);
+            let path = paths_at.checked_add(path_at).and_then(|start| Some(start..start.checked_add(path_len)?)).and_then(|r| s.get(r));
+            let path = path.ok_or(NamesRecordError::Short { what: "a failed call's path", at: head.failed_at + row })?;
+            core::str::from_utf8(path).map_err(|_| NamesRecordError::FailedPath { call })?;
+            if record_at.checked_add(record_len).is_none_or(|end| end > s.len()) {
+                return Err(NamesRecordError::Short { what: "a failed call's record", at: head.failed_at + row });
+            }
+        }
+        Ok(Verified { bytes, head })
+    }
+
+    /// The crate the record is of.
+    pub fn key(self) -> CrateItemKey {
+        self.head.key
+    }
+
+    /// How many bytes the record is.
+    pub fn byte_len(self) -> usize {
+        self.bytes.len()
+    }
+}
+
+/// One crate's names record, read in place: a `Copy` of the proof's pointer and header. Every
+/// answer is a binary search of the bytes; nothing is decoded or kept.
+#[derive(Clone, Copy, Debug)]
+pub struct NamesRecord<'m> {
+    bytes: &'m [u8],
+    head: Head,
+}
+
+impl<'m> NamesRecord<'m> {
+    /// The record the proof is of: O(1), no allocation, nothing read.
+    pub fn open(proof: Verified<'m>) -> NamesRecord<'m> {
+        NamesRecord { bytes: proof.bytes, head: proof.head }
     }
 
     pub fn key(&self) -> CrateItemKey {
-        self.key
+        self.head.key
     }
 
     pub fn root_module(&self) -> ItemKey {
-        self.root_module
-    }
-
-    /// The failed call of this crate under `call` (a [`crate::names::Why::Refused`]'s `call`):
-    /// its path, whether it is D104's implicit `::std::main`, and the matcher's reason, read back
-    /// equal to the solve's [`ExpandNote::Failed`]. `None`: no call of this crate failed under
-    /// that key. Found by binary search in place; the reason is decoded into the reader's alloc.
-    pub fn failed(&self, call: ItemKey) -> Result<Option<FailedRow<'a>>, NamesRecordError> {
-        let s = &self.bytes[self.failed_at..self.failed_at + self.failed_len];
-        let count = le32(s, 0) as usize;
-        let paths_at = ALIGN + count * FAILED_ROW;
-        let (mut lo, mut hi) = (0usize, count);
-        let row = loop {
-            if lo >= hi {
-                return Ok(None);
-            }
-            let mid = lo + (hi - lo) / 2;
-            let at = ALIGN + mid * FAILED_ROW;
-            match key_at(s, at).cmp(&call) {
-                core::cmp::Ordering::Less => lo = mid + 1,
-                core::cmp::Ordering::Greater => hi = mid,
-                core::cmp::Ordering::Equal => break at,
-            }
-        };
-        let (path_at, path_len) = (le32(s, row + 32) as usize, le32(s, row + 36) as usize);
-        let (record_at, record_len) = (le32(s, row + 40) as usize, le32(s, row + 44) as usize);
-        let flags = le32(s, row + 48);
-        let short = |what: &'static str, at: usize| NamesRecordError::Short { what, at: self.failed_at + at };
-        let raw = s.get(paths_at + path_at..paths_at + path_at + path_len).ok_or(short("a failed call's path", paths_at + path_at))?;
-        let path = core::str::from_utf8(raw).map_err(|_| NamesRecordError::FailedPath { call })?;
-        let record = s.get(record_at..record_at + record_len).ok_or(short("a failed call's record", record_at))?;
-        let failed = blaze_expand::Failed::read_record(record, self.alloc).map_err(|error| NamesRecordError::FailedRecord { call, error })?;
-        Ok(Some(FailedRow { call, path, implicit: flags & FAILED_IMPLICIT != 0, failed }))
-    }
-
-    pub fn decoded(&self) -> Decoded {
-        self.decoded.get()
+        self.head.root_module
     }
 
     /// Binary search of fixed-width rows of `width` bytes at `at`, keyed by their first 32.
@@ -476,7 +553,7 @@ impl<'a> NamesRecord<'a> {
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let row = at + mid * width;
-            match self.bytes[row..row + 32].cmp(&key.0.0[..]) {
+            match self.bytes[row..row + KEY].cmp(&key.0.0[..]) {
                 core::cmp::Ordering::Less => lo = mid + 1,
                 core::cmp::Ordering::Greater => hi = mid,
                 core::cmp::Ordering::Equal => return Some(mid),
@@ -485,51 +562,43 @@ impl<'a> NamesRecord<'a> {
         None
     }
 
-    fn row(&self, module: ItemKey) -> Option<(usize, usize)> {
-        self.find(HEADER, ROW, self.modules, module).map(|i| (i, HEADER + i * ROW))
+    /// The module's row: where it starts in the bytes.
+    fn row(&self, module: ItemKey) -> Option<usize> {
+        self.find(HEADER, ROW, self.head.modules, module).map(|i| HEADER + i * ROW)
     }
 
-    /// The module's solved scope, decoded on first ask; `Ok(None)` for no such module or a failed
-    /// one.
-    pub fn scope(&self, module: ItemKey) -> Result<Option<&ScopeBuilder<'a, &'a str>>, NamesRecordError> {
-        let Some((i, row)) = self.row(module) else { return Ok(None) };
-        if let Some(scope) = self.scopes[i].get() {
-            return Ok(Some(scope));
-        }
-        let (at, len) = (le32(self.bytes, row + 32), le32(self.bytes, row + 36) as usize);
+    /// The module's solved scope, viewed in place; `None` for no such module or a failed one.
+    pub fn scope(&self, module: ItemKey) -> Option<ScopeView<'m>> {
+        let bytes: &'m [u8] = self.bytes;
+        let row = self.row(module)?;
+        let at = le32(bytes, row + 32);
         if at == NONE {
-            return Ok(None);
+            return None;
         }
-        let start = self.blob_at + at as usize;
-        let part = self.bytes.get(start..start + len).ok_or(NamesRecordError::Short { what: "a module scope", at: start })?;
-        let view = ScopeView::read(part).map_err(|error| NamesRecordError::Scope { module, error })?;
-        let mut d = self.decoded.get();
-        d.scopes += 1;
-        d.scope_bytes += len;
-        self.decoded.set(d);
-        Ok(Some(self.scopes[i].get_or_init(|| ScopeBuilder::from(&view, self.alloc))))
+        let start = self.head.blob_at + at as usize;
+        let part = &bytes[start..start + le32(bytes, row + 36) as usize];
+        // SAFETY: `Verified::check`, the one maker of the proof this record was opened from,
+        // ran `ScopeView::read` on exactly these bytes: the same row of the same immutable
+        // `'m` bytes gives the same range at the same address, and `read` returned `Ok`.
+        Some(unsafe { ScopeView::trusted(part) })
     }
 
-    /// The module's chain up to the root, itself first.
-    pub fn chain(&self, module: ItemKey) -> Option<&[ItemKey]> {
-        let (i, row) = self.row(module)?;
-        let first = le32(self.bytes, row + 40);
+    /// The module's chain up to the root, itself first: a slice of the bytes.
+    pub fn chain(&self, module: ItemKey) -> Option<&'m [ItemKey]> {
+        let bytes: &'m [u8] = self.bytes;
+        let row = self.row(module)?;
+        let first = le32(bytes, row + 40);
         if first == NONE {
             return None;
         }
-        let chain = self.chains[i].get_or_init(|| {
-            let len = usize::from(le16(self.bytes, row + 44));
-            let mut chain = AVec::with_capacity_in(len, self.alloc);
-            for k in 0..len {
-                chain.push(key_at(self.bytes, self.chains_at + (first as usize + k) * 32));
-            }
-            chain
-        });
-        Some(chain.as_slice())
+        let len = usize::from(le16(bytes, row + 44));
+        let start = self.head.chains_at + first as usize * KEY;
+        let (words, _) = bytes[start..start + len * KEY].as_chunks::<KEY>();
+        Some(ItemKey::slice_of(words))
     }
 
     fn no_implicit_prelude_here(&self, module: ItemKey) -> bool {
-        self.row(module).is_some_and(|(_, row)| le16(self.bytes, row + 46) & NO_IMPLICIT_PRELUDE != 0)
+        self.row(module).is_some_and(|row| le16(self.bytes, row + 46) & NO_IMPLICIT_PRELUDE != 0)
     }
 
     /// Whether `module` or an ancestor is `#[no_implicit_prelude]`.
@@ -539,37 +608,108 @@ impl<'a> NamesRecord<'a> {
 
     /// Whether `module` is a block's module (row flag bit 1).
     pub fn anonymous(&self, module: ItemKey) -> bool {
-        self.row(module).is_some_and(|(_, row)| le16(self.bytes, row + 46) & ANONYMOUS != 0)
+        self.row(module).is_some_and(|row| le16(self.bytes, row + 46) & ANONYMOUS != 0)
     }
 
-    /// The crate root record, decoded on first ask.
-    pub fn crate_root(&self) -> Result<&CrateRootBuilder<'a, &'a str>, NamesRecordError> {
-        if let Some(root) = self.root.get() {
-            return Ok(root);
-        }
-        let part = &self.bytes[self.root_at..self.root_at + self.root_len];
-        let view = CrateRootView::read(part).map_err(NamesRecordError::Root)?;
-        Ok(self.root.get_or_init(|| CrateRootBuilder::from(&view, self.alloc)))
+    /// The failed call of this crate under `call` (a [`crate::names::Why::Refused`]'s `call`):
+    /// its path, whether it is D104's implicit `::std::main`, and the matcher's reason, read back
+    /// equal to the solve's [`ExpandNote::Failed`]. `None`: no call of this crate failed under
+    /// that key. Found by binary search in place; the path is a slice of the bytes, and the
+    /// reason, the one part with a working form, is decoded into `alloc` (the caller's: the
+    /// record holds no allocator).
+    pub fn failed<'b>(&self, call: ItemKey, alloc: Alloc<'b>) -> Result<Option<FailedRow<'b>>, NamesRecordError>
+    where
+        'm: 'b,
+    {
+        let bytes: &'m [u8] = self.bytes;
+        let s = &bytes[self.head.failed_at..self.head.failed_at + self.head.failed_len];
+        let count = le32(s, 0) as usize;
+        let Some(i) = self.find(self.head.failed_at + ALIGN, FAILED_ROW, count, call) else { return Ok(None) };
+        let row = ALIGN + i * FAILED_ROW;
+        let paths_at = ALIGN + count * FAILED_ROW;
+        let (path_at, path_len) = (paths_at + le32(s, row + 32) as usize, le32(s, row + 36) as usize);
+        let (record_at, record_len) = (le32(s, row + 40) as usize, le32(s, row + 44) as usize);
+        // SAFETY: `Verified::check`, the one maker of this record's proof, checked this row's
+        // path range inside the section and its bytes UTF-8 (`str::from_utf8`), in the same
+        // immutable `'m` bytes.
+        let path: &'m str = unsafe { core::str::from_utf8_unchecked(&s[path_at..path_at + path_len]) };
+        let failed = blaze_expand::Failed::read_record(&s[record_at..record_at + record_len], alloc).map_err(|error| NamesRecordError::FailedRecord { call, error })?;
+        Ok(Some(FailedRow { call, path, implicit: le32(s, row + 48) & FAILED_IMPLICIT != 0, failed }))
     }
 
-    /// An enum's variants, or `Ok(None)` when `owner` is no enum of this crate.
-    pub fn variants(&self, owner: ItemKey) -> Result<Option<&[Variant<&'a str>]>, NamesRecordError> {
-        let Some(i) = self.find(self.enums_at, ENUM_ROW, self.enums, owner) else { return Ok(None) };
-        if let Some(v) = self.variants[i].get() {
-            return Ok(Some(v.as_slice()));
-        }
-        let row = self.enums_at + i * ENUM_ROW;
-        let (first, count) = (le32(self.bytes, row + 32) as usize, le32(self.bytes, row + 36) as usize);
-        let mut list = AVec::with_capacity_in(count, self.alloc);
-        for k in first..first + count {
-            let v = self.variants_at + k * VARIANT_ROW;
-            let (at, len) = (le32(self.bytes, v + 32) as usize, le32(self.bytes, v + 36) as usize);
-            let start = self.strings_at + at;
-            let raw: &'a [u8] = self.bytes.get(start..start + len).ok_or(NamesRecordError::Short { what: "a variant name", at: start })?;
-            let name = core::str::from_utf8(raw).map_err(|_| NamesRecordError::Name { owner })?;
-            list.push(Variant { name, key: key_at(self.bytes, v), record: self.bytes[v + 40] != 0 });
-        }
-        Ok(Some(self.variants[i].get_or_init(|| list).as_slice()))
+    /// The crate root, viewed in place.
+    pub fn crate_root(&self) -> CrateRootView<'m> {
+        let bytes: &'m [u8] = self.bytes;
+        let part = &bytes[self.head.root_at..self.head.root_at + self.head.root_len];
+        // SAFETY: `Verified::check` ran `CrateRootView::read` on exactly these bytes of the
+        // same immutable `'m` record, and it returned `Ok`.
+        unsafe { CrateRootView::trusted(part) }
+    }
+
+    /// An enum's variants, or `None` when `owner` is no enum of this crate.
+    pub fn variants(&self, owner: ItemKey) -> Option<Variants<'m>> {
+        let i = self.find(self.head.enums_at, ENUM_ROW, self.head.enums, owner)?;
+        let row = self.head.enums_at + i * ENUM_ROW;
+        let first = le32(self.bytes, row + 32) as usize;
+        Some(Variants {
+            bytes: self.bytes,
+            strings_at: self.head.strings_at,
+            rows_at: self.head.variants_at + first * VARIANT_ROW,
+            count: le32(self.bytes, row + 36) as usize,
+        })
+    }
+}
+
+/// An enum's variants as rows of the record, in declaration order.
+#[derive(Clone, Copy, Debug)]
+pub struct Variants<'m> {
+    bytes: &'m [u8],
+    strings_at: usize,
+    rows_at: usize,
+    count: usize,
+}
+
+impl<'m> Variants<'m> {
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    fn name_bytes(&self, row: usize) -> &'m [u8] {
+        let bytes: &'m [u8] = self.bytes;
+        let start = self.strings_at + le32(bytes, row + 32) as usize;
+        &bytes[start..start + le32(bytes, row + 36) as usize]
+    }
+
+    /// Variant `i` of `0..len()`.
+    fn at(&self, i: usize) -> Variant<&'m str> {
+        let row = self.rows_at + i * VARIANT_ROW;
+        // SAFETY: `Verified::check` ran `str::from_utf8` on exactly this range of the same
+        // immutable `'m` record, and it returned `Ok`.
+        let name = unsafe { core::str::from_utf8_unchecked(self.name_bytes(row)) };
+        Variant { name, key: key_at(self.bytes, row), record: self.bytes[row + 40] != 0 }
+    }
+
+    /// Variant `i`.
+    pub fn get(&self, i: usize) -> Option<Variant<&'m str>> {
+        (i < self.count).then(|| self.at(i))
+    }
+
+    /// Every variant, in declaration order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = Variant<&'m str>> + use<'m> {
+        let all = *self;
+        (0..all.count).map(move |i| all.at(i))
+    }
+
+    /// The variant named `name`, comparing the bytes in place.
+    pub fn find(&self, name: &str) -> Option<VariantHit> {
+        (0..self.count).map(|i| self.rows_at + i * VARIANT_ROW).find(|row| self.name_bytes(*row) == name.as_bytes()).map(|row| VariantHit {
+            key: key_at(self.bytes, row),
+            record: self.bytes[row + 40] != 0,
+        })
     }
 }
 
@@ -581,27 +721,39 @@ pub trait LoadNames<'a> {
     fn load(&self, krate: usize) -> Option<&'a [u8]>;
 }
 
-/// The full names of a set of crates, through their names records, each crate opened the first
-/// time something asks about it: the `World` the path walk ([`crate::names::path`]) takes, with
-/// the answers of the solved crates' own [`crate::resolve::Names`].
+/// What a reader opened so far: crates and their records' bytes. Nothing else is counted, as
+/// nothing is decoded.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Decoded {
+    /// Records opened (crates asked about), each checked once.
+    pub crates: usize,
+    /// Their bytes.
+    pub bytes: usize,
+}
+
+/// The full names of a set of crates, through their names records, each crate's record checked
+/// the first time something asks about it (its [`Verified`] kept: one pointer and a header a
+/// crate, the only state); every answer after is read in place. The `World` the path walk
+/// ([`crate::names::path`]) takes, with the answers of the solved crates' own
+/// [`crate::resolve::Names`], for any name type.
 pub struct RecordNames<'a, L> {
     keys: AVec<'a, CrateItemKey>,
     by_prefix: HashMap<[u8; 8], usize, Alloc<'a>>,
-    open: AVec<'a, OnceCell<Option<NamesRecord<'a>>>>,
+    proofs: AVec<'a, OnceCell<Option<Verified<'a>>>>,
     load: L,
-    alloc: Alloc<'a>,
 }
 
 impl<'a, L: LoadNames<'a>> RecordNames<'a, L> {
-    /// `keys`: each crate by index, as `load` knows them. Nothing is read here.
+    /// `keys`: each crate by index, as `load` knows them. Nothing is read here; the tables are
+    /// sized by the crates, never by their modules.
     pub fn new(keys: &[CrateItemKey], load: L, alloc: Alloc<'a>) -> RecordNames<'a, L> {
         let mut by_prefix = HashMap::new_in(alloc);
         for (i, k) in keys.iter().enumerate() {
             by_prefix.insert(k.prefix(), i);
         }
-        let mut open = AVec::with_capacity_in(keys.len(), alloc);
-        open.resize_with(keys.len(), OnceCell::new);
-        RecordNames { keys: AVec::from_slice_in(keys, alloc), by_prefix, open, load, alloc }
+        let mut proofs = AVec::with_capacity_in(keys.len(), alloc);
+        proofs.resize_with(keys.len(), OnceCell::new);
+        RecordNames { keys: AVec::from_slice_in(keys, alloc), by_prefix, proofs, load }
     }
 
     /// The crate whose key `key` (any item of it) begins with.
@@ -611,59 +763,60 @@ impl<'a, L: LoadNames<'a>> RecordNames<'a, L> {
         self.by_prefix.get(&p).copied()
     }
 
-    /// The crate's record, opened on first ask. A record that does not open is a writer's bug
-    /// (its bytes were verified when fetched): it fails this command, naming the crate.
-    pub fn record(&self, krate: usize) -> Option<&NamesRecord<'a>> {
-        self.open
-            .get(krate)?
-            .get_or_init(|| {
-                let bytes = self.load.load(krate)?;
-                Some(NamesRecord::open(bytes, self.alloc).unwrap_or_else(|e| panic!("the names record of crate {:?} did not open: {e:?}", self.keys[krate])))
-            })
-            .as_ref()
+    /// The crate's record, checked the first time asked. A record that does not check is a
+    /// writer's bug (its bytes were verified when fetched): it fails this command, naming the
+    /// crate.
+    pub fn record(&self, krate: usize) -> Option<NamesRecord<'a>> {
+        let proof = self.proofs.get(krate)?.get_or_init(|| {
+            let bytes = self.load.load(krate)?;
+            Some(Verified::check(bytes).unwrap_or_else(|e| panic!("the names record of crate {:?} does not check: {e:?}", self.keys[krate])))
+        });
+        proof.map(NamesRecord::open)
     }
 
-    /// What was decoded so far, summed over the crates opened.
+    /// What was opened so far, summed over the crates.
     pub fn decoded(&self) -> Decoded {
         let mut sum = Decoded::default();
-        for r in self.open.iter().filter_map(|c| c.get()).flatten() {
-            let d = r.decoded();
-            sum.crates += d.crates;
-            sum.bytes += d.bytes;
-            sum.scopes += d.scopes;
-            sum.scope_bytes += d.scope_bytes;
+        for proof in self.proofs.iter().filter_map(|c| c.get()).flatten() {
+            sum.crates += 1;
+            sum.bytes += proof.byte_len();
         }
         sum
     }
 
-    fn of(&self, key: ItemKey) -> Option<&NamesRecord<'a>> {
+    fn of(&self, key: ItemKey) -> Option<NamesRecord<'a>> {
         self.record(self.crate_of(key)?)
     }
 }
 
-impl<'a, L: LoadNames<'a>> World<&'a str> for RecordNames<'a, L> {
-    fn scope(&self, module: ItemKey) -> Option<&ScopeBuilder<'_, &'a str>> {
-        let r = self.of(module)?;
-        r.scope(module).unwrap_or_else(|e| panic!("a module scope of crate {:?} did not read: {e:?}", r.key()))
+impl<'a, N: Name, L: LoadNames<'a>> World<N> for RecordNames<'a, L> {
+    type Scope<'w>
+        = ScopeView<'w>
+    where
+        Self: 'w;
+    type Root<'w>
+        = CrateRootView<'w>
+    where
+        Self: 'w;
+
+    fn scope(&self, module: ItemKey) -> Option<ScopeView<'_>> {
+        self.of(module)?.scope(module)
     }
 
     fn chain(&self, module: ItemKey) -> Option<&[ItemKey]> {
         self.of(module)?.chain(module)
     }
 
-    fn root_of(&self, key: ItemKey) -> Option<&CrateRootBuilder<'_, &'a str>> {
-        let r = self.of(key)?;
-        Some(r.crate_root().unwrap_or_else(|e| panic!("the crate root of {:?} did not read: {e:?}", r.key())))
+    fn root_of(&self, key: ItemKey) -> Option<CrateRootView<'_>> {
+        Some(self.of(key)?.crate_root())
     }
 
-    fn root(&self, krate: CrateItemKey) -> Option<&CrateRootBuilder<'_, &'a str>> {
-        let r = self.record(*self.by_prefix.get(&krate.prefix())?)?;
-        Some(r.crate_root().unwrap_or_else(|e| panic!("the crate root of {:?} did not read: {e:?}", r.key())))
+    fn root(&self, krate: CrateItemKey) -> Option<CrateRootView<'_>> {
+        Some(self.record(*self.by_prefix.get(&krate.prefix())?)?.crate_root())
     }
 
-    fn variants(&self, owner: ItemKey) -> Option<&[Variant<&'a str>]> {
-        let r = self.of(owner)?;
-        r.variants(owner).unwrap_or_else(|e| panic!("the variants of {owner:?} did not read: {e:?}"))
+    fn variant(&self, owner: ItemKey, name: N) -> Option<Option<VariantHit>> {
+        Some(self.of(owner)?.variants(owner)?.find(name.as_ref()))
     }
 
     fn no_implicit_prelude(&self, module: ItemKey) -> bool {
@@ -672,5 +825,46 @@ impl<'a, L: LoadNames<'a>> World<&'a str> for RecordNames<'a, L> {
 
     fn anonymous(&self, module: ItemKey) -> bool {
         self.of(module).is_some_and(|r| r.anonymous(module))
+    }
+}
+
+/// One crate's record alone as a world: a walk through another crate's module stops with
+/// `Why::NotRead`. What a job that holds one crate's proof reads (body_types.rs), and the test.
+impl<'m, N: Name> World<N> for NamesRecord<'m> {
+    type Scope<'w>
+        = ScopeView<'w>
+    where
+        Self: 'w;
+    type Root<'w>
+        = CrateRootView<'w>
+    where
+        Self: 'w;
+
+    fn scope(&self, module: ItemKey) -> Option<ScopeView<'_>> {
+        NamesRecord::scope(self, module)
+    }
+
+    fn chain(&self, module: ItemKey) -> Option<&[ItemKey]> {
+        NamesRecord::chain(self, module)
+    }
+
+    fn root_of(&self, key: ItemKey) -> Option<CrateRootView<'_>> {
+        (key.crate_prefix() == self.head.key.prefix()).then(|| self.crate_root())
+    }
+
+    fn root(&self, krate: CrateItemKey) -> Option<CrateRootView<'_>> {
+        (krate == self.head.key).then(|| self.crate_root())
+    }
+
+    fn variant(&self, owner: ItemKey, name: N) -> Option<Option<VariantHit>> {
+        Some(self.variants(owner)?.find(name.as_ref()))
+    }
+
+    fn no_implicit_prelude(&self, module: ItemKey) -> bool {
+        NamesRecord::no_implicit_prelude(self, module)
+    }
+
+    fn anonymous(&self, module: ItemKey) -> bool {
+        NamesRecord::anonymous(self, module)
     }
 }

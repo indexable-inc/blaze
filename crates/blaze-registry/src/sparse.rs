@@ -155,13 +155,8 @@ impl SparseIndex {
         if on_disk().is_some_and(|it| it.auth_required) {
             self.auth_required.store(true, Ordering::Relaxed);
         }
-        // No bound of its own: the fetch ends by the HTTP client's deadlines, as `what` says.
-        let what = "a registry's config.json (bounded by the HTTP client's timeouts)";
-        let fetch = || {
-            blaze_core::wait::block_on(what, None, self.fetch(RegistryConfig::NAME, None))
-                .map_err(anyhow::Error::from)
-                .and_then(std::convert::identity)
-        };
+        // The fetch's waits are the HTTP client's, each with its own deadline.
+        let fetch = || self.fetch(RegistryConfig::NAME, None);
         let fetched = match fetch() {
             // The protocol's one second ask, with credentials (cargo's `auth-required`): not a
             // retry of a failure, the answer that says the registry needs them.
@@ -192,9 +187,9 @@ impl SparseIndex {
 
     /// An index file, `path` under the index's URL: [`LoadResponse::CacheValid`] when the
     /// cached copy of `index_version` is fresh or the server says it has not changed. Asked of
-    /// the server, it waits without holding the thread, so that the files of a resolver's round
-    /// are fetched together.
-    pub async fn load(
+    /// the server, it blocks this thread for the answer: a resolve's round fetches its files
+    /// on threads of its own ([`crate::IndexRegistry::fetch_summaries`] per ask).
+    pub fn load(
         &self,
         path: &str,
         index_version: Option<&str>,
@@ -216,10 +211,10 @@ impl SparseIndex {
                 "last-modified" => Some(("if-modified-since", value.trim())),
                 _ => None,
             });
-        self.fetch(path, condition).await
+        self.fetch(path, condition)
     }
 
-    async fn fetch(
+    fn fetch(
         &self,
         path: &str,
         condition: Option<(&str, &str)>,
@@ -235,21 +230,15 @@ impl SparseIndex {
         let mut headers = vec![("cargo-protocol", "version=1"), ("accept", "text/plain")];
         headers.extend(condition);
         headers.extend(token.as_deref().map(|it| ("authorization", it)));
-        let answer = self
-            .retry
-            .run_async(&*self.http, || {
-                let answer = self.http.get_async(&url, &headers);
-                async {
-                    let answer =
-                        answer.await.with_context(|| format!("download of {path} failed"))?;
-                    match answer.status {
-                        200 | 304 | 404 => Ok(answer),
-                        401 => Err(self.unauthorized(&url, &answer)?),
-                        _ => Err(HttpNotSuccessful::new(&url, &answer).into()),
-                    }
-                }
-            })
-            .await;
+        let answer = self.retry.run_on(&*self.http, || {
+            let answer =
+                self.http.get(&url, &headers).with_context(|| format!("download of {path} failed"))?;
+            match answer.status {
+                200 | 304 | 404 => Ok(answer),
+                401 => Err(self.unauthorized(&url, &answer)?),
+                _ => Err(HttpNotSuccessful::new(&url, &answer).into()),
+            }
+        });
         self.fresh.pin().insert(path.to_owned());
         let answer = answer?;
         Ok(match answer.status {

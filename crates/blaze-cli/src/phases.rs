@@ -8,6 +8,8 @@ use core::fmt;
 
 use bstd::clock::{Clock, Instant};
 
+pub(crate) mod byte_rows;
+
 /// The most phases one command marks.
 const MOST: usize = 16;
 
@@ -35,6 +37,12 @@ pub struct Phases {
     /// How many names worlds the request made (names.rs `world`: 0 or 1): an edit's check reads
     /// the crate list in place and makes none (D114 rule 1, graph_payload.rs).
     pub worlds: u32,
+    /// The records the request made, by kind, and the `CrateScope` records' sections: where
+    /// the bytes written are (work.rs `answer_batch`).
+    pub records: byte_rows::Records,
+    /// `blaze run`'s closing count of code records (run_parent.rs `Tally`), on every run that
+    /// started its program: the proof a repeat made nothing (its error-stream line is quiet then).
+    pub(crate) code_records: Option<crate::run_parent::Tally>,
     /// The command's own frame, by what took its bytes ([`Phases::mark_in`], [`Phases::took`]).
     held: Held,
 }
@@ -101,6 +109,8 @@ impl Phases {
             at_main: blaze_mem::syscalls::snapshot(),
             frames: None,
             worlds: 0,
+            records: byte_rows::Records::new(),
+            code_records: None,
             held: Held { phase_at: 0, kind_at: 0, kind_since: None, phases: [0; MOST], kinds: [("", 0, 0, 0); MOST_KINDS], len: 0, seen: (0, 0) },
         }
     }
@@ -223,9 +233,14 @@ impl fmt::Display for Phases {
         if let Some(h) = self.frames {
             writeln!(
                 f,
-                "frames       most held (bytes): request {} · a task's scratch {} · a batch's records {} · a record read back {} · a crate scope {} · a file's body job {}",
-                h.request, h.scratch, h.batch, h.got, h.scope, h.bodies
+                "frames       most held (bytes): request {} · a task's scratch {} · a batch's records {} · a crate scope {} · a file's body job {}",
+                h.request, h.scratch, h.batch, h.scope, h.bodies
             )?;
+            write!(f, "{}", h.tasks)?;
+        }
+        write!(f, "{}", self.records)?;
+        if let Some(tally) = self.code_records {
+            writeln!(f, "run          {tally}")?;
         }
         let held = &self.held;
         write!(f, "frame        the command's frame: {} of {} bytes used · by phase (bytes):", held.seen.0, held.seen.1)?;

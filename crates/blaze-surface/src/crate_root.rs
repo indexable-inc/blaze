@@ -20,6 +20,8 @@ use crate::column::{
 use crate::error::BuildError;
 use crate::kind::{Edition, MacroShapes};
 
+mod in_place;
+
 /// What a crate's root record says of the crate itself.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct CrateRootHead {
@@ -75,6 +77,9 @@ pub struct CrateRootBuilder<'a, N> {
     /// a one-segment attribute naming one is inert, and an attribute macro of a nearer scope
     /// shadowing one is ambiguous (rustc's built-in attribute scope).
     pub builtin_attrs: AVec<'a, N>,
+    /// The language features the root turns on (`#![feature(default_field_values)]`), sorted:
+    /// what a gate of the crate's code reads (front2's `field_default_allowed`).
+    pub features: AVec<'a, N>,
 }
 
 impl<'a, N> CrateRootBuilder<'a, N> {
@@ -88,6 +93,7 @@ impl<'a, N> CrateRootBuilder<'a, N> {
             macro_exports: AVec::new_in(alloc),
             tools: AVec::new_in(alloc),
             builtin_attrs: AVec::new_in(alloc),
+            features: AVec::new_in(alloc),
         }
     }
 }
@@ -101,6 +107,7 @@ impl<'b, N: PartialEq> PartialEq<CrateRootBuilder<'b, N>> for CrateRootBuilder<'
             && self.macro_exports[..] == other.macro_exports[..]
             && self.tools[..] == other.tools[..]
             && self.builtin_attrs[..] == other.builtin_attrs[..]
+            && self.features[..] == other.features[..]
     }
 }
 
@@ -135,7 +142,9 @@ blaze_format::record! {
 
 blaze_format::record! {
     #[derive(Clone, Copy, Debug)]
-    pub(crate) struct CrateRootRoot: 3 {
+    /// 4: `features`, the root's `#![feature(..)]` names (a version-3 record is refused by
+    /// `open`, and its crate's names are made again).
+    pub(crate) struct CrateRootRoot: 4 {
         pub(crate) krate: ContentId,
         pub(crate) root_module: ContentId,
         pub(crate) root_file: ContentId,
@@ -146,6 +155,7 @@ blaze_format::record! {
         pub(crate) macro_exports: Slice<ExportRow>,
         pub(crate) tools: Slice<Text>,
         pub(crate) builtin_attrs: Slice<Text>,
+        pub(crate) features: Slice<Text>,
         pub(crate) strings: Slice<u8>,
         pub(crate) edition: Edition,
         pub(crate) no_std: bool,
@@ -214,6 +224,7 @@ impl<N: AsRef<str>> CrateRootBuilder<'_, N> {
         };
         let tools = names(&self.tools, &mut strings)?;
         let builtin_attrs = names(&self.builtin_attrs, &mut strings)?;
+        let features = names(&self.features, &mut strings)?;
         let macro_use = Vec::from_iter_in(self.macro_use.iter().map(|key| key.0), alloc);
 
         let mut out = Writer::new_in(<CrateRootRoot as Record>::SCHEMA, alloc);
@@ -224,6 +235,7 @@ impl<N: AsRef<str>> CrateRootBuilder<'_, N> {
         let macro_exports = Column::push(&mut out, &macro_exports);
         let tools = Column::push(&mut out, &tools);
         let builtin_attrs = Column::push(&mut out, &builtin_attrs);
+        let features = Column::push(&mut out, &features);
         let head = self.head;
         Ok(finish_with(out, |at| CrateRootRoot {
             krate: head.krate.0,
@@ -236,6 +248,7 @@ impl<N: AsRef<str>> CrateRootBuilder<'_, N> {
             macro_exports: macro_exports.slice(at, offset_of!(CrateRootRoot, macro_exports)),
             tools: tools.slice(at, offset_of!(CrateRootRoot, tools)),
             builtin_attrs: builtin_attrs.slice(at, offset_of!(CrateRootRoot, builtin_attrs)),
+            features: features.slice(at, offset_of!(CrateRootRoot, features)),
             strings: text.slice(at, offset_of!(CrateRootRoot, strings)),
             edition: head.edition,
             no_std: head.no_std,
@@ -256,6 +269,7 @@ impl<'a, 'b> CrateRootBuilder<'b, &'a str> {
         out.macro_exports.extend(view.macro_exports());
         out.tools.extend(view.tools());
         out.builtin_attrs.extend(view.builtin_attrs());
+        out.features.extend(view.features());
         out
     }
 }
@@ -270,6 +284,7 @@ pub struct CrateRootView<'a> {
     macro_exports: &'a [ExportRow],
     tools: &'a [Text],
     builtin_attrs: &'a [Text],
+    features: &'a [Text],
     strings: &'a str,
 }
 
@@ -284,6 +299,7 @@ impl<'a> CrateRootView<'a> {
         let macro_exports = root.macro_exports.follow(buffer)?;
         let tools = root.tools.follow(buffer)?;
         let builtin_attrs = root.builtin_attrs.follow(buffer)?;
+        let features = root.features.follow(buffer)?;
         for row in externs {
             check_text(strings, row.name, row, buffer)?;
         }
@@ -293,7 +309,7 @@ impl<'a> CrateRootView<'a> {
         for row in deps {
             check_text(strings, row.name, row, buffer)?;
         }
-        for text in tools.iter().chain(builtin_attrs) {
+        for text in tools.iter().chain(builtin_attrs).chain(features) {
             check_text(strings, *text, text, buffer)?;
         }
         check_increasing(externs, buffer, "extern prelude out of order or repeated", |row| text_of(strings, row.name))?;
@@ -301,7 +317,7 @@ impl<'a> CrateRootView<'a> {
         check_increasing(macro_exports, buffer, "macro exports out of order or repeated", |row| {
             (text_of(strings, row.name), row.key)
         })?;
-        for names in [tools, builtin_attrs] {
+        for names in [tools, builtin_attrs, features] {
             check_increasing(names, buffer, "names out of order or repeated", |text| text_of(strings, *text))?;
         }
         Ok(CrateRootView {
@@ -321,6 +337,7 @@ impl<'a> CrateRootView<'a> {
             macro_exports,
             tools,
             builtin_attrs,
+            features,
             strings,
         })
     }
@@ -379,6 +396,19 @@ impl<'a> CrateRootView<'a> {
     pub fn builtin_attrs(&self) -> impl ExactSizeIterator<Item = &'a str> + use<'a> {
         let strings = self.strings;
         self.builtin_attrs.iter().map(move |text| text_of(strings, *text))
+    }
+
+    /// The language features the root turns on, sorted.
+    pub fn features(&self) -> impl ExactSizeIterator<Item = &'a str> + use<'a> {
+        let strings = self.strings;
+        self.features.iter().map(move |text| text_of(strings, *text))
+    }
+
+    /// Whether the root turns on the language feature `name` (`#![feature(name)]`), by one
+    /// binary search.
+    pub fn has_feature(&self, name: &str) -> bool {
+        let strings = self.strings;
+        self.features.binary_search_by(|text| text_of(strings, *text).cmp(name)).is_ok()
     }
 }
 

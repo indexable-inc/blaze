@@ -20,7 +20,7 @@ use blaze_file_items::{
     OneByOne, SideBySide, outline, outline_item, outline_with, part_digest, part_digests, resplit, speculate,
     split_top_level,
 };
-use blaze_hash::ByHash;
+use blaze_hash::{BuildKeyHasher, Map, MapOpts};
 use blaze_own::Alloc;
 use blaze_surface::{Edition, Range};
 
@@ -141,7 +141,7 @@ fn main() {
     // An edit to one part, every other part's outline in hand under its digest.
     let ranges = split_top_level(&text, heap.alloc());
     let digest = |part: &str| part_digest(part.as_bytes());
-    let mut index: ByHash<ContentId, usize, Alloc<'static>> = ByHash::new_in(heap.alloc());
+    let mut index: Map<ContentId, usize, BuildKeyHasher, Alloc<'static>> = Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: heap.alloc(), capacity: None });
     let mut cache: Vec<Outline<'static>, Global> = Vec::new_in(Global);
     for range in ranges.iter() {
         let part = &text[range.to_usize()];

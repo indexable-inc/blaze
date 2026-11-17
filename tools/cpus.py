@@ -16,7 +16,7 @@ CPU of a target and the `target_feature`s rustc gives it, from two sources:
 - the CPUs `rustc --print target-cpus` lists and the features `--print cfg -C target-cpu=<cpu>`
   prints, which harness/answers.py records (`cpus` and `cpu_features` of each target of
   crates/blaze-units/src/stdlib/rustc.json, and of blaze's own targets in own_targets.json);
-- the aliases of those CPUs in the LLVM `crates/hir-ty-codegen/llvm.json` pins
+- the aliases of those CPUs in the LLVM `crates/blaze-toolchain/pins/llvm.json` pins
   (crates/target-features/llvm_cpus.json). LLVM keeps an alias (`def : ProcessorAlias<"apple-m1",
   "apple-a14">;`) in a table of its own (`SubtargetSubTypeAliasKV`), which
   `MCSubtargetInfo::getAllProcessorDescriptions` and so rustc's list leave out, while
@@ -40,7 +40,7 @@ from typed_input import parse
 
 SCRIPT = "cpus.py"
 ROOT = Path(__file__).resolve().parent.parent
-PIN = ROOT / "crates/hir-ty-codegen/llvm.json"
+PIN = ROOT / "crates/blaze-toolchain/pins/llvm.json"
 ANSWERS = ROOT / "crates/blaze-units/src/stdlib/rustc.json"
 OWN = ROOT / "crates/blaze-units/src/stdlib/own_targets.json"
 ALIASES = ROOT / "crates/target-features/llvm_cpus.json"

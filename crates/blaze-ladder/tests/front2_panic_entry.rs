@@ -116,15 +116,15 @@ fn on_panic_too(info: &PanicInfo<'_>) -> ! {
 /// `None` when it is made.
 fn run_refusal(text: &str) -> Option<String> {
     let files = [SourceFile { path: "src/main.rs", text }];
-    let tc = Toolchain::none();
+    let tc = Toolchain::none(blaze_own::Alloc::global());
     let new = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
-    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc).unwrap_or_else(|e| panic!("the program's texts: {e}"));
+    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind).unwrap_or_else(|e| panic!("the program's texts: {e}"));
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the program's frame");
-    match Front2Program::new(&names, &frame, &files) {
+    match Front2Program::new(&names, &frame, &files, blaze_own::Alloc::global()) {
         Ok(_) => None,
         Err(e) => Some(format!("{e}")),
     }
@@ -142,16 +142,16 @@ fn run_refusal(text: &str) -> Option<String> {
 fn a_call_of_panic_impl_reaches_and_binds_the_handler() {
     let text = [HEAD, HANDLER, PANICS].concat();
     let files = [SourceFile { path: "src/main.rs", text: &text }];
-    let tc = Toolchain::none();
+    let tc = Toolchain::none(blaze_own::Alloc::global());
     let new = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
-    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc).unwrap_or_else(|e| panic!("the program's texts: {e}"));
+    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind).unwrap_or_else(|e| panic!("the program's texts: {e}"));
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the survey's frame");
     let mut left_out = Vec::new_in(Global);
-    let mut program = Front2Program::survey(&names, &frame, &files, &mut left_out).unwrap_or_else(|e| panic!("no survey: {e}"));
+    let mut program = Front2Program::survey(&names, &frame, &files, &mut left_out, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("no survey: {e}"));
     let left: Vec<String> = left_out.iter().map(|(f, class)| format!("{f}: {class}")).collect();
     assert!(left.is_empty(), "front2 tables every fn the walk reaches; left out: {left:?}");
     let rows: Vec<(String, bool, FnKind, String)> = (0..program.fn_count())
@@ -167,7 +167,7 @@ fn a_call_of_panic_impl_reaches_and_binds_the_handler() {
     let with_body = rows.iter().filter(|(_, body, ..)| *body).count();
     assert_eq!(with_body, 3, "`main`, `panic_fmt` and `on_panic` have bodies: {rows:?}");
     let mut refused = Vec::new_in(Global);
-    let counts = build_survey(&mut program, &mut refused, blaze_build::OverflowChecks::On).unwrap_or_else(|e| panic!("the survey stopped: {e}"));
+    let counts = build_survey(&mut program, &mut refused, blaze_build::OverflowChecks::On, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("the survey stopped: {e}"));
     let refusals: Vec<String> = refused.iter().map(|(f, class)| format!("{f}: {class}")).collect();
     assert!(refusals.is_empty(), "every body builds, `panic_fmt`'s call bound to `on_panic`: {refusals:?}");
     assert_eq!((counts.built, counts.tried), (3, 3), "`main`, `panic_fmt`, `on_panic`");

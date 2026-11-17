@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_manifest::config::RegistryConfig;
 use blaze_manifest::config::schema::FeatureUnification;
 use blaze_manifest::files::Disk;
@@ -35,10 +35,10 @@ use blaze_resolve::resolver::{
     CliFeatures, CompileKind, FeatureOpts, FeatureResolver, ForceAllTargets, HasDevUnits, Members,
     PackageTargets, ResolveBehavior, VersionOrdering, members_with_features,
 };
-use blaze_resolve::workspace_resolve::{PackageRegistry, resolve_ws};
 use blaze_resolve::{
-    Cfg, Dependency, IndexSummary, InternedString, MemRegistry, PackageId, PackageIdSpec, Platform,
-    QueryKind, Registry, ResolveVersion, RustVersion, SourceId, Summary, query_pinned,
+    Ask, Cfg, Dependency, Effect, Event, IndexSummary, InternedString, Lookup, MemRegistry,
+    PackageId, PackageIdSpec, Platform, QueryKind, Refused, Registry, ResolveError, ResolveVersion,
+    RustVersion, SourceId, Summary, query_pinned, resolving_ws,
 };
 use blaze_units::read::{self as summary, Package};
 use std::alloc::Global;
@@ -251,7 +251,7 @@ pub fn programs(asked: &Asked<'_>, targets: Targets<'_>) -> Result<(String, Vec<
     let Made { json, roots, unharnessed } = made(asked)?;
     let metadata: serde_json::Value = serde_json::from_str(&json)?;
     let nodes = metadata["resolve"]["nodes"].as_array().into_iter().flatten();
-    let features: HashMap<&str, Vec<&str>, Global> = nodes
+    let features: Map<&str, Vec<&str>, FixedState, Global> = nodes
         .filter_map(|node| {
             let on = node["features"].as_array()?.iter().filter_map(|it| it.as_str());
             Some((node["id"].as_str()?, on.collect()))
@@ -386,7 +386,7 @@ pub fn units(asked: &Asked<'_>, units: &Units<'_>) -> Result<blaze_units::UnitGr
         let features =
             FeatureResolver::resolve(&packages, resolve, &member_features, &kinds, opts)?;
         let roots = resolved.selected_ids(&specs);
-        let mut by_id = HashMap::new_in(Global);
+        let mut by_id = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for id in resolve.iter() {
             let manifest = resolved
                 .manifests
@@ -432,9 +432,9 @@ pub struct Resolved<'a> {
     /// `resolver.feature-unification`: which members the features are resolved for.
     pub unification: FeatureUnification,
     /// What was read of every package the lock file names.
-    pub packages: &'a HashMap<PackageId, Read, Global>,
+    pub packages: &'a Map<PackageId, Read, FixedState, Global>,
     /// The manifest of every package the lock file names.
-    pub manifests: &'a HashMap<PackageId, &'a Manifest, Global>,
+    pub manifests: &'a Map<PackageId, &'a Manifest, FixedState, Global>,
     /// The configuration the workspace was read with.
     pub config: &'a Config<Disk>,
 }
@@ -668,7 +668,7 @@ fn resolving_with<R>(
         }
         serialized.push(it);
     }
-    let mut reads = HashMap::new_in(Global);
+    let mut reads = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     let mut ids = Vec::with_capacity(serialized.len());
     for package in &serialized {
         let mut read = summary::read(package)?;
@@ -685,7 +685,7 @@ fn resolving_with<R>(
         registry.add(IndexSummary::Candidate(read.summary.clone()));
     }
     let patch = summary::patch_tables(&root_table)?;
-    let by_path: HashMap<SourceId, Summary, Global> = reads
+    let by_path: Map<SourceId, Summary, FixedState, Global> = reads
         .values()
         .filter(|it| it.summary.source_id().is_path())
         .map(|it| (it.summary.source_id(), it.summary.clone()))
@@ -740,14 +740,34 @@ fn resolving_with<R>(
         }
         FeatureUnification::Selected | FeatureUnification::Package => &specs,
     };
-    let (mut whole, targeted) = resolve_ws(
-        &mut PackageRegistry::new(Pinned(blaze_registry::IndexRegistry::new(&sources, registry))),
+    // The resolve as blaze-resolve's machine: each round's queries answered from what is held,
+    // the rest asked of this driver, which reads them (blocking, `AT_ONCE` threads at a time)
+    // and hands the answers back before the next round.
+    let mut machine = resolving_ws(
+        Pinned(blaze_registry::IndexRegistry::new(&sources, registry)),
         &resolving,
         lock.as_ref(),
         &cli_features,
         resolved_for,
         has_dev_units,
-    )?;
+        Global,
+    );
+    let mut effects = Vec::new_in(Global);
+    machine.step(Event::Start, &mut effects).map_err(Driving::Refused)?;
+    let (mut whole, targeted) = loop {
+        let effect = effects.pop().ok_or(Driving::NoEffect { rounds: machine.rounds() })?;
+        if !effects.is_empty() {
+            return Err(Driving::Several { rounds: machine.rounds() }.into());
+        }
+        match effect {
+            Effect::Done(done) => break done?,
+            Effect::Query { asks } => {
+                for (ask, answer) in answer_asks(machine.sources(), &asks)? {
+                    machine.step(Event::Answered { ask, answer }, &mut effects).map_err(Driving::Refused)?;
+                }
+            }
+        }
+    };
     if let Some(lock) = &lock {
         whole.merge_from(lock)?;
     }
@@ -792,7 +812,7 @@ fn resolving_with<R>(
         }
     }
     let unused_patches = whole.unused_patches().to_vec();
-    let manifests: HashMap<PackageId, &Manifest, Global> = ws
+    let manifests: Map<PackageId, &Manifest, FixedState, Global> = ws
         .members()
         .map(|(_, m)| m)
         .chain(path_packages.iter().chain(&fetched).chain(&picked).map(|it| &*it.manifest))
@@ -862,7 +882,7 @@ fn described(
     };
 
     // The packages the graph reaches, in the order of their ids, as cargo lists them.
-    let reached: HashMap<PackageId, usize, Global> =
+    let reached: Map<PackageId, usize, FixedState, Global> =
         ids.iter().enumerate().map(|(at, id)| (*id, at)).collect();
     let mut listed: Vec<(PackageId, usize)> = Vec::new();
     for node in &resolve.nodes {
@@ -892,7 +912,7 @@ struct Made {
 
 /// What the resolve graph and the feature resolver read of the packages.
 pub(crate) struct Packages<'a> {
-    reads: &'a HashMap<PackageId, Read, Global>,
+    reads: &'a Map<PackageId, Read, FixedState, Global>,
     platform: Option<&'a TargetPlatform<'a>>,
     /// The host's platform, for what is built for it, when it is not `platform`.
     host: Option<&'a TargetPlatform<'a>>,
@@ -979,7 +999,7 @@ fn locked_ids(lock: &blaze_resolve::Resolve) -> Vec<PackageId> {
 /// with `checksums` those of a lock file or resolve.
 fn fetch(
     ids: &[PackageId],
-    checksums: &HashMap<PackageId, Option<String>, Global>,
+    checksums: &Map<PackageId, Option<String>, FixedState, Global>,
     ctx: &Context<Disk>,
     sources: &blaze_registry::Sources,
 ) -> Result<Vec<Package>> {
@@ -1021,18 +1041,19 @@ fn fetch(
 struct Pinned<'a>(blaze_registry::IndexRegistry<'a, MemRegistry>);
 
 impl Registry for Pinned<'_> {
-    async fn query(
+    fn query(
         &self,
         dep: &Dependency,
         kind: QueryKind,
         f: &mut impl FnMut(IndexSummary),
-    ) -> Result<()> {
-        let registry = self.0.registry_of(dep.source_id())?;
+    ) -> std::result::Result<Lookup, ResolveError> {
+        let registry =
+            self.0.registry_of(dep.source_id()).map_err(|e| ResolveError::Registry(e.into()))?;
         let describe = |it: SourceId| self.describe_source(it);
-        if query_pinned(self.0.others(), registry.is_some(), dep, kind, f, describe).await? {
-            return Ok(());
+        if query_pinned(self.0.others(), registry.is_some(), dep, kind, f, describe)? {
+            return Ok(Lookup::Answered(()));
         }
-        self.0.query(dep, kind, f).await
+        self.0.query(dep, kind, f)
     }
 
     fn describe_source(&self, source: SourceId) -> String {
@@ -1043,6 +1064,65 @@ impl Registry for Pinned<'_> {
         self.0.is_replaced(source)
     }
 }
+
+/// How many of a round's asks are read at once, each blocking its thread for its index file:
+/// about as many as the HTTP client keeps in flight.
+const AT_ONCE: usize = 16;
+
+/// The answer to each of `asks`, its index files read now, [`AT_ONCE`] threads at a time.
+#[allow(clippy::type_complexity)]
+fn answer_asks(
+    sources: &Pinned<'_>,
+    asks: &[Ask],
+) -> Result<Vec<(Ask, std::result::Result<Vec<IndexSummary, Global>, ResolveError>), Global>> {
+    let chunk = asks.len().div_ceil(AT_ONCE).max(1);
+    std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity_in(AT_ONCE, Global);
+        for asks in asks.chunks(chunk) {
+            workers.push(scope.spawn(move || {
+                let mut answers = Vec::with_capacity_in(asks.len(), Global);
+                for ask in asks {
+                    let answer = sources.0.fetch_summaries(&ask.dep, ask.kind, Global);
+                    answers.push((ask.clone(), answer)); // clone: the ask the answer is handed back with
+                }
+                answers
+            }));
+        }
+        let mut answers = Vec::with_capacity_in(asks.len(), Global);
+        for worker in workers {
+            let answered = worker.join().map_err(|_| Driving::AskPanicked)?;
+            answers.extend(answered);
+        }
+        Ok(answers)
+    })
+}
+
+/// The resolve machine's driver going wrong: a bug here or in blaze-resolve, never in the
+/// workspace, named so it is not taken for a resolve error.
+#[derive(Debug)]
+enum Driving {
+    /// The machine refused a step this driver made.
+    Refused(Refused),
+    /// A step left no effect: the machine neither asked nor answered.
+    NoEffect { rounds: u32 },
+    /// A step left more than one effect, where the machine makes one at a time.
+    Several { rounds: u32 },
+    /// A thread reading a round's asks panicked.
+    AskPanicked,
+}
+
+impl std::fmt::Display for Driving {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Driving::Refused(refused) => write!(f, "blaze-resolve's resolve machine refused a step of blaze-metadata's driver: {refused}"),
+            Driving::NoEffect { rounds } => write!(f, "blaze-resolve's resolve machine left no effect after {rounds} rounds"),
+            Driving::Several { rounds } => write!(f, "blaze-resolve's resolve machine left more than one effect after {rounds} rounds"),
+            Driving::AskPanicked => write!(f, "a thread reading the index files of a resolve's asks panicked"),
+        }
+    }
+}
+
+impl std::error::Error for Driving {}
 
 /// The sources packages are fetched from, `[source]` replacing those it names unless not
 /// `respect_source_config`.

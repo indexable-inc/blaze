@@ -12,7 +12,7 @@ use blaze_hash::hash_map::Entry;
 use blaze_codegen::Arch;
 use blaze_format::cursor::Put;
 use blaze_graph::par;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::radix;
 use object::elf;
 use std::alloc::Global;
@@ -114,7 +114,7 @@ const NOTE_HEADER: u64 = 12 + 4;
 /// probe (entry API) per string and no allocation per string.
 pub(crate) struct Strings<'a> {
     pub(crate) bytes: Vec<u8>,
-    at: HashMap<&'a str, u32, Global>,
+    at: Map<&'a str, u32, FixedState, Global>,
 }
 
 impl<'a> Strings<'a> {
@@ -122,7 +122,7 @@ impl<'a> Strings<'a> {
     pub(crate) fn with_capacity(bytes: usize, strings: usize) -> Strings<'a> {
         let mut table = Vec::with_capacity(1 + bytes);
         table.push(0);
-        Strings { bytes: table, at: HashMap::with_capacity_in(strings, Global) }
+        Strings { bytes: table, at: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(strings) }) }
     }
 
     pub(crate) fn add(&mut self, string: &'a str) -> u32 {
@@ -351,8 +351,8 @@ impl Tables {
         let versioned =
             imports.iter().filter(|it| it.library.is_some() && it.version.is_some()).count();
         let mut needs: Vec<(u32, &str, u16)> = Vec::with_capacity(versioned);
-        let mut version_index: HashMap<(u32, &str), u16, Global> =
-            HashMap::with_capacity_in(versioned, Global);
+        let mut version_index: Map<(u32, &str), u16, FixedState, Global> =
+            Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(versioned) });
         let mut next = 2u16;
         for import in imports {
             let version = match (import.library, &import.version) {
@@ -1428,7 +1428,7 @@ fn fde_of(
 
 #[cfg(test)]
 mod tests {
-    use blaze_hash::HashMap;
+    use blaze_hash::{FixedState, Map, MapOpts};
     use blaze_ids::rng::SplitMix64;
     use gimli::UnwindSection;
     use std::alloc::Global;
@@ -1443,7 +1443,7 @@ mod tests {
         eh_frame.set_address_size(8);
         let bases = gimli::BaseAddresses::default().set_eh_frame(section);
         let mut entries = eh_frame.entries(&bases);
-        let mut cies = HashMap::new_in(Global);
+        let mut cies = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         let mut table = Vec::new();
         while let Some(entry) = entries.next().map_err(|it| it.to_string())? {
             match entry {

@@ -74,13 +74,14 @@ pub use replay::{Replay, replay};
 pub use instance::{ResolveError, Resolved, normalize_projection, resolve_instance, select_impl};
 pub use drop_impl::adt_drop_impl;
 pub use rules::async_fn::INTERIOR_GAP;
+pub use rules::args_inline::{ArgsMisuse, TypedFinding};
 pub use stalled::{Stalled, StalledError, check_deferring, decide_stalled, decide_stalled_listed};
 pub use asks::{Ask, AskLog, Clock, Order, QUESTION_KINDS, R_THRESHOLD, Restarts, Solve, Tally, entries_histogram, question_kind, restarts};
 pub use body::{
     Anchor, Arm, BinOp, BindAnn, BodyPath, BodyView, Capture, CoroutineKind, Expr, FieldInit, FieldPat, FmtTrait, FmtUse,
-    IntSuffix, Lit, Pat, Segment, Stmt, UnOp,
+    IntSuffix, Lit, Pat, Segment, Stmt, StructBase, UnOp,
 };
-pub use columns::{AdjustKind, Adjusts, Callees, CaptureKind, Captures, Checked, Closures, ConstArgs, ExprDefs, Fields, PatDefs};
+pub use columns::{AdjustKind, Adjusts, Callees, CaptureKind, Captures, Checked, Closures, ConstArgs, DefaultFields, ExprDefs, Fields, FruFields, PatDefs};
 pub use selected::{Projected, Selected};
 pub use diag::{Because, Diag, DiagCode, UnmetGoal};
 pub use asm::{ASM_NORETURN, AsmArch, AsmKind, AsmOperand, AsmPiece, AsmReg};
@@ -97,7 +98,7 @@ pub use ids::{
 pub use portable::{MAX_OBJECT_PREDS, MAX_PATTERN_RANGES, OwnTys, PNode, PTy, PTys, PortableTys, canonical_ranges, object_principal};
 pub use ty::{Cause, ClosureKind, FulfillError, FulfillErrorKind, Goal, Obligation, Ty, TyList, TyView, TypeCtx, Var, VarKind};
 pub use world::{
-    Adt, AdtKind, ArgsAfterSelf, SplitSelf, AssocGenerics, AssocItem, AssocKind, AssocParent, AssocTyDef, ClosureFacts, CoroutineFacts, ConstHolds, ConstParams, CtorKind, Def, Fetch, Field, FnSig,
+    Adt, AdtKind, AliasDef, ArgsAfterSelf, SplitSelf, AssocGenerics, AssocItem, AssocKind, AssocParent, AssocTyDef, ClosureFacts, CoroutineFacts, ConstHolds, ConstParams, CtorKind, Def, Fetch, Field, FnSig,
     Hidden, ImplHeader, ImplPolarity, Missing, Needs, PClause, PathRes, Predicates, Prim, Question, ReadList, Reads, RecordKind, Seal, Shape,
     TraitDef, TraitDefaults, TraitFlags, TraitMembers, TypeAttrs, DiscrRepr, Variant, World, ground_args_digest,
 };
@@ -229,5 +230,7 @@ fn walk<W: World, C: TypeCtx>(m: &mut Machine<'_, '_, '_, '_, W, C>) -> Result<(
     let output = m.start_body()?;
     m.run()?;
     m.finish_body(output)?;
-    m.end_sequence()
+    m.end_sequence()?;
+    // The typed lints, over the settled types (rules/args_inline.rs).
+    m.args_inline(output)
 }

@@ -18,6 +18,11 @@ pub fn show_message<P: Put + ?Sized>(rules: &RuleSet, item: &str, findings: &Fin
         _ => None,
     };
     let range = finding.range.of(item);
+    // A sequence's row: what to write instead of it.
+    let instead = || match args.first() {
+        Some(Arg::Int(row)) => crate::sequences::SEQS.get(*row as usize).map_or("?", |seq| seq.instead),
+        _ => "?",
+    };
     match finding.template {
         Template::CastToInt => {
             out.str("`").str(range).str("`: a bare cast to `").str(span(0).unwrap_or("?"));
@@ -98,5 +103,78 @@ pub fn show_message<P: Put + ?Sized>(rules: &RuleSet, item: &str, findings: &Fin
                 out.str("`").str(range).str("` was renamed");
             }
         },
+        Template::HeapReach => {
+            out.str("`").str(range).str("` reaches for the process's heap: take ").str(instead());
+        }
+        Template::HeapConstructor | Template::HeapMacro | Template::HeapMethod => {
+            // Text cannot see which `Vec` or which receiver this is: the finding says so.
+            out.str("`").str(range).str("` allocates in the global heap if it is std's: use ").str(instead());
+        }
+        Template::Async => {
+            out.str("`async` code: write the explicit state machine (blaze's own code is sans-IO state machines)");
+        }
+        Template::Await => {
+            out.str("`.await`: write the explicit state machine (blaze's own code is sans-IO state machines)");
+        }
+        Template::ReadClock
+        | Template::ReadEnv
+        | Template::ReadRandom
+        | Template::ReadHashSeed
+        | Template::ReadProcess => {
+            out.str("`").str(range).str("` reads the process's state where nothing passed it in: use ").str(instead());
+        }
+        Template::UndoneTodo | Template::UndoneUnimplemented => {
+            out.str("`").str(range).str("` is work left undone");
+        }
+        Template::UndoneDbg => {
+            out.str("`").str(range).str("` is a debugging print left in");
+        }
+        Template::UndoneUnreachable => {
+            out.str("`unreachable!()` with no message: say why it cannot be reached");
+        }
+        Template::WaitCall => {
+            out.str("`").str(range).str("` waits with no deadline: use ").str(instead());
+        }
+        Template::WaitLoop => {
+            out.str("`loop` with no `break`, `return` or `?`: bound it (a count, a deadline) or say what ends it");
+        }
+        Template::HasherStd => {
+            out.str("`").str(range).str("` is std's or hashbrown's table or hasher, its hasher not written: use ").str(instead());
+        }
+        Template::HasherDefault => {
+            out.str("`").str(range).str("` builds its hasher from `Default` (D125): write it, ").str(instead());
+        }
+        Template::VariantCount | Template::VariantCountMany => {
+            let names = || {
+                args.iter().filter_map(|arg| match arg {
+                    Arg::Text(run) => Some(findings.text_in(*run)),
+                    _ => None,
+                })
+            };
+            out.str("`").str(range).str("` is the number of variants of ");
+            for (at, name) in names().enumerate() {
+                out.str(if at == 0 { "`" } else { "`, `" }).str(name);
+            }
+            out.str("`");
+            if finding.template == Template::VariantCountMany {
+                out.str(": if it counts one of them, write `core::mem::variant_count::<E>()` with that enum (feature ");
+                out.str("`variant_count`) so a new variant cannot leave it stale");
+                return;
+            }
+            let name = names().next().unwrap_or("?");
+            out.str(": write `core::mem::variant_count::<").str(name).str(">()` (feature `variant_count`) so a new variant cannot leave it stale");
+            match args.first() {
+                Some(Arg::Int(crate::variants::ELSEWHERE)) => {
+                    out.str(" (not fixed: `").str(name).str("` is in another module or a block, so name its path)");
+                }
+                Some(Arg::Int(crate::variants::GENERIC)) => {
+                    out.str(" (not fixed: `").str(name).str("` is generic, so name its parameters)");
+                }
+                Some(Arg::Int(crate::variants::UNTYPED)) => {
+                    out.str(" (not fixed: the type here is not known to be `usize`, which the call returns)");
+                }
+                _ => {}
+            }
+        }
     }
 }

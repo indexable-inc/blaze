@@ -5,7 +5,7 @@
 //! adds them here.
 
 use anyhow::bail;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_resolve::{CRATES_IO_REGISTRY, SourceId, SourceKind};
 use std::alloc::Global;
 
@@ -18,12 +18,12 @@ struct Replacement {
 
 /// The sources cargo knows by name, and which of them replaces which.
 pub struct SourceMap {
-    by_name: HashMap<String, Replacement, Global>,
-    names: HashMap<SourceId, String, Global>,
+    by_name: Map<String, Replacement, FixedState, Global>,
+    names: Map<SourceId, String, FixedState, Global>,
     /// The `[registries]` a `replace-with` names, as cargo's `SourceId::alt_registry` reads
     /// them: one whose index is not configured, or is not a registry's URL, is not here, as
     /// cargo's `load` passes over a name `alt_registry` refuses.
-    registries: HashMap<String, SourceId, Global>,
+    registries: Map<String, SourceId, FixedState, Global>,
     crates_io: SourceId,
 }
 
@@ -31,9 +31,9 @@ impl SourceMap {
     /// crates.io alone, its packages read from `crates_io` (its git or its sparse index).
     pub fn new(crates_io: SourceId) -> SourceMap {
         let mut map = SourceMap {
-            by_name: HashMap::new_in(Global),
-            names: HashMap::new_in(Global),
-            registries: HashMap::new_in(Global),
+            by_name: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            names: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            registries: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             crates_io,
         };
         for id in [SourceId::crates_io(), crates_io] {

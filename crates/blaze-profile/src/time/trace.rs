@@ -30,7 +30,11 @@ pub fn events(model: &Model, us: impl Fn(i64) -> f64) -> Vec<Value> {
     // alloc: a trace's events, once a trace
     let mut out = Vec::new();
     // alloc: once a trace
-    let mut named = blaze_hash::HashSet::new_in(std::alloc::Global);
+    let mut named = blaze_hash::Set::new(blaze_hash::SetOpts {
+        hasher: blaze_hash::FixedState,
+        alloc: std::alloc::Global,
+        capacity: None,
+    });
     let mut name_track = |out: &mut Vec<Value>, pid: u32, tid: u64, name: String| {
         if named.insert((pid, tid)) {
             out.push(json!({"ph": "M", "name": "thread_name", "pid": pid, "tid": tid, "args": {"name": name}}));

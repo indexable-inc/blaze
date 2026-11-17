@@ -47,9 +47,13 @@
 //! move leaves no test in the tiered code, and a move under one branch leaves one block
 //! parameter, the run-time flag.
 //!
-//! Refused by name: a move out of the contents of a box that is not a local's place path (a
-//! temporary's box, `*make()`: its `hold_temp` entry is held by offset from the temporary,
-//! which a dereference breaks; or a box behind a reference: E0507); a dereference other than a
+//! A TEMPORARY box (`let x = *make();`) moves its contents by its `hold_temp` entry instead,
+//! made a `Held::Moved` with the part `[Deref]` (`move_temp_box_contents`): the box is found by
+//! the pointer `box_deref_builtin` recorded, since the contents' place is the data pointer.
+//!
+//! Refused by name: a move out of the contents of a box that is a place no local's field flags
+//! cover (a box behind a reference: E0507); `**make()` (a temporary reached by two box
+//! dereferences); a dereference other than a
 //! box's on the way (E0507); a moved part under a box other than through its contents; the
 //! contents of an unsized box (E0161, the checker's); more than 64 parts of one local; a match
 //! by tests moving out of `*b` (walk/moves.rs `scrutinee_in_place`: "out of a `Box`, not
@@ -58,11 +62,12 @@
 use core::alloc::Allocator;
 
 use blaze_lir::builder::MemAttrs;
+use blaze_lir::func::SlotKind;
 use blaze_lir::{Flags, Ty, Value};
 use blaze_own::Vec;
 use blaze_typeck::{AdjustKind, Expr, ExprId, LangItem, Mutbl, PNode, PTy, PatId, UnOp};
 
-use super::super::{NO_EXPR, Repr, Shape, TyErr, V, Walk, malformed, unsupported};
+use super::super::{Held, NO_EXPR, Repr, Shape, TyErr, V, Walk, malformed, unsupported};
 use super::{Do, Node, Step};
 use crate::{BuildError, Instance};
 
@@ -157,7 +162,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// through parentheses; and whether a container on the path implements `Drop` (E0509 for a
     /// move out; a box's contents are not such a field). `None` (`steps` as they were) for
     /// any other place. `e`'s own adjustments are the caller's (`derefs`).
-    fn path_steps(&mut self, e: ExprId, derefs: u32) -> Result<Option<(PatId, bool)>, BuildError> {
+    pub(super) fn path_steps(&mut self, e: ExprId, derefs: u32) -> Result<Option<(PatId, bool)>, BuildError> {
         let start = self.moves.steps.len();
         let mut drops = false;
         for _ in 0..derefs {
@@ -241,10 +246,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             return Err(unsupported(e, "a move out of a dereference whose type needs drop, other than of a `Box` (behind a reference or a pointer: E0507)"));
         }
         let Some((_, mask, start, len, drops)) = self.place_path(e, k)? else {
-            return Err(unsupported(
-                e,
-                "a move out of a `Box`'s contents whose box is not a place of a local with field flags (a temporary's box, `*make()`, or a box behind a reference: E0507) is not built to LIR yet",
-            ));
+            return self.move_temp_box_contents(e, n, at, repr);
         };
         if drops {
             self.moves.steps.truncate(start as usize);
@@ -254,6 +256,74 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             return Err(unsupported(e, "a move out of more than 64 parts of one local (its word)"));
         };
         self.clear_bit(mask, bit);
+        let tmp = self.temp(repr);
+        self.store(V::Place(at.0, at.1), repr, tmp)?;
+        Ok(V::Place(tmp.0, tmp.1))
+    }
+
+    /// `let x = *make();`, `let s = *Box::from_raw(p);`: `move_box_contents` when the box is a
+    /// TEMPORARY (`e`, a value expression whose one adjustment `n == 0` is the box's
+    /// dereference; the contents at `at`, held as `repr`). The Reference,
+    /// [expr.move.movable-place]: "Temporary values" and "The result of dereferencing an
+    /// expression with type `Box<T>` and that can also be moved out of"; "Temporary scopes":
+    /// the box lives to the end of its temporary scope, where it is dropped minus what moved:
+    /// its allocation is freed, its contents are not dropped again. Built as walk/moves.rs
+    /// `move_temp_field` builds a temporary's field: the box's `hold_temp` entry (the whole
+    /// `Held::Rest` that `Task::Spill` made) becomes a `Held::Moved` with a word of its own, all
+    /// held, and the bit of the part `[Deref]` is cleared; the scope's end then drops it by
+    /// `drop_moved`, where `box_node` tests the contents' bit (clear: not dropped) and frees
+    /// the allocation alone (`Do::BoxFree`). The box is found by the pointer to it that
+    /// `box_deref_builtin` recorded for `e` (`Moves::box_self`). Refused by name: a box that is
+    /// a place no local's field flags cover (behind a reference or a pointer: E0507, the
+    /// checker's), a box reached by more than one dereference (`**make()` of a
+    /// `Box<Box<T>>`), and a box held by no entry of its scope (an extended temporary).
+    fn move_temp_box_contents(&mut self, e: ExprId, n: u32, at: (Value, i32), repr: Repr) -> Result<V, BuildError> {
+        if self.is_place_expr(e)? {
+            return Err(unsupported(
+                e,
+                "a move out of a `Box`'s contents whose box is a place no local's field flags cover (behind a reference or a pointer: E0507)",
+            ));
+        }
+        if n != 0 {
+            return Err(unsupported(e, "a move out of the contents of a temporary `Box` reached by more than one dereference (`**make()`)"));
+        }
+        if !self.live {
+            // Unreachable code: nothing runs, nothing is held (`Task::Spill` held nothing).
+            let tmp = self.temp(repr);
+            self.store(V::Place(at.0, at.1), repr, tmp)?;
+            return Ok(V::Place(tmp.0, tmp.1));
+        }
+        let p = match self.moves.box_self {
+            Some((b, p)) if b == e => p,
+            _ => return Err(malformed("a move out of a temporary `Box`'s contents with no recorded dereference of the box")),
+        };
+        let found = self
+            .scope_pats
+            .iter()
+            .rposition(|h| matches!(*h, Held::Rest { at: a, variant: None, .. } | Held::Moved { at: a, .. } if a == (p, 0)));
+        let Some(i) = found else {
+            return Err(unsupported(e, "a move out of the contents of a temporary `Box` not held to its scope's end (an extended temporary)"));
+        };
+        let mask = match self.scope_pats[i] {
+            Held::Moved { mask, .. } => mask,
+            _ => {
+                let t = self.expr_ty(e)?;
+                let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
+                let slot = self.b.slot(8, 3, SlotKind::Named);
+                let fa = self.b.slot_addr(slot);
+                let all = self.b.iconst(Ty::I64, u128::from(u64::MAX));
+                self.b.store(Flags::NONE, all, fa, 0, MemAttrs::aligned(3));
+                self.scope_pats[i] = Held::Moved { at: (p, 0), g, mask: slot };
+                slot
+            }
+        };
+        let start = self.moves.steps.len() as u32;
+        self.moves.steps.push(Step::Deref);
+        let Some(bit) = self.part_bit(mask, start, 1, 0, Some(e))? else {
+            return Err(unsupported(e, "a move out of more than 64 parts of one temporary (its word)"));
+        };
+        self.clear_bit(mask, bit);
+        // Copied out first, as `move_field` does.
         let tmp = self.temp(repr);
         self.store(V::Place(at.0, at.1), repr, tmp)?;
         Ok(V::Place(tmp.0, tmp.1))
@@ -271,6 +341,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let off = self.box_data_word(g_self).map_err(|error| Self::ty_err(e, error))?;
         let v = self.pop()?;
         let p = self.scalar(v, Ty::PTR)?;
+        self.moves.box_self = Some((e, p));
         match rrepr {
             Repr::Ptr => {
                 let data = self.b.load(Ty::PTR, Flags::NONE, p, off, MemAttrs::aligned(3));
@@ -396,6 +467,9 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             Expr::Binary { op, lhs, rhs } if super::super::operators::comparison(op) => lhs.0 == c || rhs.0 == c,
             Expr::Match { scrutinee, .. } => scrutinee.0 == c,
             Expr::Let { init, .. } => init.0 == c,
+            // A struct update's base is a place: its taken fields move by
+            // walk/moves/struct_update.rs, not the whole.
+            Expr::Struct { base: blaze_typeck::StructBase::Expr(b), .. } => b.0 == c,
             _ => false,
         })
     }

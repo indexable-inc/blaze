@@ -17,7 +17,7 @@ use blaze_id::CrateItemKey;
 use blaze_manifest::lock::{Checksum, Lock, LockId, LockSource};
 #[cfg(feature = "procs-run")]
 use blaze_proc_macro::hook::{AddError, ProcMacros, Reached};
-use blaze_proc_macro::module::{ClosureError, CrateId, LockedPackages, ModuleError, Source, files_digest, package_files};
+use blaze_proc_macro::module::{ClosureError, CrateId, LockedPackages, ModuleError, Source};
 use blaze_unit_graph::Unit;
 
 /// Why a macro crate's module identity could not be made: its module is not looked up, one
@@ -101,46 +101,17 @@ pub fn git_folders(modules: &Path) -> Result<BTreeMap<String, String>, ProcsErro
 }
 
 /// The module identity of the macro crate `unit` of `lock` (its packages read once, `locked`):
-/// a registry checksum, a path package's files as they are now (its folder from `path_dir`), a
-/// git commit with the folder `git_folders` names.
-pub fn identify(
+/// a registry checksum, a git commit with the folder `git_folders` names, or a path package's
+/// files digest from `path_files`: the hex of `blaze_proc_macro::module::files_digest` over the
+/// package's files as the caller read them (blaze-cli: its `MacroFiles` leaf row, whose id the
+/// module lookup's key holds; [`register_macro_crates`]: the folder read here), or `None` for a
+/// path package it has no files of (then `PathWithoutFolder`, by name). Called at most once.
+pub fn identify<D: AsRef<str>>(
     lock: &Lock<'_>,
     locked: &LockedPackages<'_>,
     git_folders: &BTreeMap<String, String>,
     unit: &Unit<'_>,
-    path_dir: impl Fn(LockId) -> Option<PathBuf>,
-) -> Result<Result<MacroIdentity, Unidentified>, ProcsError> {
-    identify_by(lock, locked, git_folders, unit, |id| match path_dir(id) {
-        None => Ok(None),
-        Some(dir) => {
-            let mut listed = package_files(&dir).map_err(|error| ProcsError::Files { at: dir.clone(), error })?;
-            Ok(Some(files_digest(&mut listed)))
-        }
-    })
-}
-
-/// [`identify`], a path package's sources given as their digest: `path_files` is the hex of
-/// [`files_digest`] over the package's files, which the caller read through its own effects
-/// (blaze-cli's `MacroFiles` leaf row, whose id the module lookup's key already holds), or
-/// `None` for a path package it has no files of (then `PathWithoutFolder`, by name).
-pub fn identify_files(
-    lock: &Lock<'_>,
-    locked: &LockedPackages<'_>,
-    git_folders: &BTreeMap<String, String>,
-    unit: &Unit<'_>,
-    path_files: impl Fn(LockId) -> Option<String>,
-) -> Result<Result<MacroIdentity, Unidentified>, ProcsError> {
-    identify_by(lock, locked, git_folders, unit, |id| Ok(path_files(id)))
-}
-
-/// The one home of a macro crate's identity: [`identify`] and [`identify_files`] differ only in
-/// how a path package's files digest is had (`path_files`: `None` when it has none).
-fn identify_by(
-    lock: &Lock<'_>,
-    locked: &LockedPackages<'_>,
-    git_folders: &BTreeMap<String, String>,
-    unit: &Unit<'_>,
-    path_files: impl FnOnce(LockId) -> Result<Option<String>, ProcsError>,
+    path_files: impl FnOnce(LockId) -> Result<Option<D>, ProcsError>,
 ) -> Result<Result<MacroIdentity, Unidentified>, ProcsError> {
     let (package, version) = (unit.name.as_str(), unit.version.as_str());
     let named = || (package.to_string(), version.to_string());
@@ -158,7 +129,7 @@ fn identify_by(
             }
         },
         LockSource::Path => match path_files(unit.package)? {
-            Some(files_sha256) => OwnedSource::Path(files_sha256),
+            Some(files_sha256) => OwnedSource::Path(files_sha256.as_ref().to_string()),
             None => {
                 let (package, version) = named();
                 return Ok(Err(Unidentified::PathWithoutFolder { package, version }));
@@ -228,7 +199,15 @@ pub fn register_macro_crates<'u>(
     let locked = LockedPackages::read(lock_text);
     let mut made = Registered { keys: Vec::new(), unregistered: Vec::new() };
     for (index, unit) in crates {
-        let identity = match identify(lock, &locked, &git_folders, unit, &path_dir)? {
+        // A path package's files as they are now, from the folder `path_dir` gives.
+        let path_files = |id| match path_dir(id) {
+            None => Ok(None),
+            Some(dir) => {
+                let mut listed = blaze_proc_macro::module::package_files(&dir).map_err(|error| ProcsError::Files { at: dir.clone(), error })?;
+                Ok(Some(blaze_proc_macro::module::files_digest(&mut listed)))
+            }
+        };
+        let identity = match identify(lock, &locked, &git_folders, unit, path_files)? {
             Ok(identity) => identity,
             Err(why) => {
                 made.unregistered.push((index, Unregistered::Unidentified(why)));

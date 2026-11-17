@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 
 use blaze_core::{Cursor, FileName, Names, Stamp};
 use blaze_format::cursor::{self, Put as _, Reader, Wanted};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::ContentId;
 use std::alloc::Global;
 
@@ -208,12 +208,12 @@ pub(crate) struct Disk {
     pub(crate) root: Option<ContentId>,
     base: Option<Base>,
     /// Paths changed since `base`, by name under the driver's root: [`Stamp::GONE`] for one gone.
-    over: HashMap<Box<str>, Stamp, Global>,
+    over: Map<Box<str>, Stamp, FixedState, Global>,
 }
 
 impl Disk {
     pub(crate) fn new(dir: FileName) -> Disk {
-        Disk { dir, cursor: Cursor::None, root: None, base: None, over: HashMap::new_in(Global) }
+        Disk { dir, cursor: Cursor::None, root: None, base: None, over: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }) }
     }
 
     /// What `name` was when last seen, as the disk gave it ([`plain`]); `None` for a name not
@@ -394,7 +394,7 @@ impl Disk {
 /// Every watched head's [`Disk`].
 #[derive(Default)]
 pub(crate) struct Disks {
-    pub(crate) by_head: HashMap<Box<str>, Disk, Global>,
+    pub(crate) by_head: Map<Box<str>, Disk, FixedState, Global>,
 }
 
 impl Disks {
@@ -541,7 +541,7 @@ impl Disks {
                 }
                 last = stop;
             }
-            let disk = Disk { dir, cursor, root, base: Some(base), over: HashMap::new_in(Global) };
+            let disk = Disk { dir, cursor, root, base: Some(base), over: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }) };
             disks.by_head.insert(head.into(), disk);
         }
         Ok(disks)

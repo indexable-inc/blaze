@@ -20,7 +20,7 @@ use std::{
 };
 
 use base_db::{ConstEvalBudget, Crate, CrateOrigin, Db, Env};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_profile::span::{Ending, MacroExpand, MacroExpanded, Name as SpanName, Outcome};
 use hir_def::{AssocItemId, FunctionId, HasModule, ModuleDefId, StaticId, nameres::crate_def_map};
 use hir_expand::name::Name;
@@ -214,7 +214,7 @@ pub(crate) fn over_budget(error: &MirEvalError<'_>) -> Option<Over> {
 struct State<'e> {
     server: Server,
     os: Os<'e>,
-    shims: HashMap<FunctionId, Shim, Global>,
+    shims: Map<FunctionId, Shim, FixedState, Global>,
     /// Why a claimed call stopped the evaluation.
     stop: Option<Stop>,
     reply: Vec<u8>,
@@ -452,7 +452,7 @@ fn evaluate(
     let state = RefCell::new(State {
         server: Server::new(last.sites, last.contexts, last.edition, last.forced_keywords),
         os: Os::in_dir(env, cwd),
-        shims: HashMap::new_in(Global),
+        shims: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
         stop: None,
         // alloc: once per run, the replies' buffer
         reply: Vec::new(),

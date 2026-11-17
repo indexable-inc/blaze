@@ -19,11 +19,13 @@ use blaze_id::ItemKey as LibKey;
 use blaze_lower::machine::sig;
 use blaze_lower::{CfgAnswer, Lowered, View, form as lf, head};
 use blaze_own::Alloc;
+use blaze_scope::crate_roots::TextMarks;
 use blaze_surface::{ItemDetail, Range};
 use blaze_typeck as tc;
 use blaze_typeck::{ItemKey, List, Name, PClause, PNode, PTy, PortableTys};
 
 use super::dyn_ty::Member as DynMember;
+use super::item_site::MarksLost;
 use super::keys::{KeyClash, Keys, MemberKind, checker_of};
 use super::preds::Preds;
 use super::source::NamesSource;
@@ -31,7 +33,7 @@ use super::types::{Bounds, Builder, Env, Heads, ParamBound, SelfTy, TraitAliasHe
 use crate::resolve::Paths;
 
 mod member_fn;
-pub use member_fn::member_fn_want;
+pub use member_fn::{member_fn_want, member_head_want};
 
 /// The most steps one [`Store::ensure`] takes: past it the needs are a cycle.
 const MOST_STEPS: usize = 1 << 16;
@@ -258,6 +260,61 @@ impl Heads for Maps {
     }
 }
 
+/// Whether a field default (`a: u8 = 1`, RFC 3681 `default_field_values`) may be written on
+/// a field of `adt`'s variant of constructor `ctor`, at `r`:
+/// - only on a named field of a struct or an enum's struct variant: a tuple struct's or tuple
+///   variant's field and a union's field are refused, each by name (rustc's "default fields
+///   are not supported in tuple structs" and "unions cannot have default field values");
+/// - in a blaze edition (the crate's `std` is bstd) the feature is on unasked (D126); in a
+///   Rust edition it needs `#![feature(default_field_values)]` at the crate root (the crate
+///   root record's `features`, `NamesSource::has_feature`), refused naming the feature
+///   without it.
+pub(crate) fn field_default_allowed<'n, S: NamesSource<'n>>(names: S, adt: LibKey, kind: tc::AdtKind, ctor: tc::CtorKind, r: Range) -> Result<(), Why> {
+    if kind == tc::AdtKind::Union {
+        return Err(Why::Program(Box::from("a union's field may not have a default value (RFC 3681: unions cannot have default field values)"), r));
+    }
+    if ctor != tc::CtorKind::Braces {
+        return Err(Why::Program(Box::from("a tuple struct's or tuple variant's field may not have a default value (RFC 3681: only a named field has one)"), r));
+    }
+    let Some(krate) = names.crate_of(adt) else {
+        return Err(Why::Program(Box::from("a field default: the item's crate is not answered"), r));
+    };
+    match (names.std_is(krate), names.has_feature(krate, "default_field_values")) {
+        (Some(blaze_unit_graph::StdIs::Bstd(_)), _) | (Some(blaze_unit_graph::StdIs::Rust), Some(true)) => Ok(()),
+        (Some(blaze_unit_graph::StdIs::Rust), Some(false)) => Err(Why::Program(
+            Box::from("a field default needs `#![feature(default_field_values)]` at the crate root in a Rust edition (on unasked in a blaze edition)"),
+            r,
+        )),
+        (Some(blaze_unit_graph::StdIs::Rust), None) => Err(Why::Program(Box::from("a field default: the crate root's features are not answered"), r)),
+        (None, _) => Err(Why::Program(Box::from("a field default: the crate's edition (which `std` it names) is not answered"), r)),
+    }
+}
+
+/// An ADT head's own syntax errors (its lowering's `Syntax` findings) refuse it at their place
+/// (rule 3: a head is never made from text that does not parse). The parser takes `= value`
+/// only after a NAMED field (RFC 3681), so a tuple field's `u8 = 1` is a syntax error whose
+/// rest begins with `=`: refused by name as [`field_default_allowed`] refuses one.
+fn adt_syntax(v: &View<'_>) -> Result<(), Why> {
+    let Some(d) = v.diags().next() else { return Ok(()) };
+    let d = d?;
+    let r = v.site(d.range)?;
+    // The field the error is in: from the `(` or `,` before it to the `,` or `)` after it (the
+    // parser stops at the `=` or past its value, by how it recovers).
+    let text = v.item();
+    let at = (r.start as usize).min(text.len());
+    let from = text.get(..at).and_then(|t| t.rfind(['(', ','])).map_or(0, |i| i + 1);
+    let to = text.get(at..).and_then(|t| t.find([',', ')'])).map_or(text.len(), |i| at + i);
+    if let Some(eq) = text.get(from..to).and_then(|piece| piece.find('=')) {
+        let start = (from + eq) as u32;
+        return Err(Why::Program(
+            Box::from("a tuple struct's or tuple variant's field may not have a default value (RFC 3681: only a named field has one)"),
+            Range::new(start, to as u32),
+        ));
+    }
+    let near = text.get(from..to).unwrap_or("");
+    Err(Why::Program(format!("the item's text does not parse here ({:?}, in `{near}`)", d.kind).into_boxed_str(), r))
+}
+
 /// A struct, enum or union: the checker's `Adt` parts.
 pub struct AdtRow {
     pub kind: tc::AdtKind,
@@ -271,6 +328,16 @@ pub struct AdtRow {
     /// An enum's discriminant by variant, explicit or implicit, in its discriminant type
     /// ([`discr_ty`]); empty for a struct or union. Layout's `discriminant` answers from it.
     pub discrs: Vec<i128, Global>,
+    /// Marked `#[blaze::args]` (rule 83, D126): an options struct, a call's named arguments and
+    /// nothing else. The world answers it as [`tc::TypeAttrs::ARGS`] (world_items.rs `attrs`),
+    /// which the body check's `args-inline` reads (blaze-typeck rules/args_inline.rs); the head
+    /// record keeps it, so an ADT of any crate is known.
+    pub args: bool,
+}
+
+/// Whether an attribute's path, as written, is `blaze::args` (spaces around `::` allowed).
+fn is_args_attr(path: &str) -> bool {
+    path.split_once("::").is_some_and(|(tool, rest)| tool.trim() == "blaze" && rest.trim() == "args")
 }
 
 /// An enum's discriminant type (the Reference, "Enumerations", "Discriminants": "Under the
@@ -371,6 +438,21 @@ fn discriminants<'n, S: NamesSource<'n>>(b: &Builder<'_, Maps, S>, tys: &mut Por
     Ok(out)
 }
 
+/// `#[rustc_legacy_const_generics(..)]`'s arguments (`args`, the parenthesized list): the
+/// unsuffixed decimal positions, comma separated, appended to `out` in written order (the
+/// checker binds them to the own const parameters in that order). Any other form is refused.
+fn legacy_positions(args: &str, r: Range, out: &mut Vec<u32, Global>) -> Result<(), Why> {
+    let inner = args.trim().strip_prefix('(').and_then(|a| a.strip_suffix(')')).ok_or(Why::Unsupported("a `rustc_legacy_const_generics` attribute without a parenthesized list", r))?;
+    for part in inner.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        if !part.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(Why::Unsupported("a `rustc_legacy_const_generics` position that is not an unsuffixed decimal integer", r));
+        }
+        let k = part.parse::<u32>().map_err(|_| Why::Unsupported("a `rustc_legacy_const_generics` position past `u32::MAX`", r))?;
+        out.push(k);
+    }
+    Ok(())
+}
+
 /// A fn's signature: generics `0..parent` are its trait's or impl's, `parent..parent + own` its
 /// own; `text` is the item's text its body is lowered from.
 pub struct FnHead<'n> {
@@ -387,6 +469,10 @@ pub struct FnHead<'n> {
     pub header: tc::FnPtrHeader,
     /// A C-variadic foreign fn (`...` last): `inputs` are the declared parameters only.
     pub c_variadic: bool,
+    /// `#[rustc_legacy_const_generics(i, ..)]`'s positions, as written: the call argument at
+    /// each is the next own const generic argument (blaze-typeck rules/legacy_const.rs). Empty
+    /// for every other fn.
+    pub legacy_const_generics: Vec<u32, Global>,
     pub inputs: Vec<PTy, Global>,
     pub output: PTy,
     pub has_body: bool,
@@ -455,7 +541,7 @@ pub enum Want {
 
 impl Want {
     /// The library key it is made from: an impl's fn's is its impl's.
-    fn key(self) -> LibKey {
+    pub fn key(self) -> LibKey {
         match self {
             Want::Head(k) | Want::Adt(k) | Want::Impl(k) | Want::Fn(k) | Want::Members(k) | Want::MemberFn(k, _) => k,
         }
@@ -467,6 +553,12 @@ pub struct Store<'n> {
     pub tys: PortableTys<'static>,
     pub maps: Maps,
     pub adts: HashMap<ItemKey, AdtRow, Global>,
+    /// Each ADT's field defaults (`struct S { a: u8 = 1 }`, RFC 3681), made with its head in
+    /// `adts`: one per field of `AdtRow::fields`, the key of the default's head in `fns` (an
+    /// anonymous constant of the field's type over the ADT's generics), or `None`; empty when
+    /// no field has one. A head record carries them (head_record.rs, form 8); a row filed
+    /// without its entry is the world's gap `field_defaults`, never "no defaults".
+    pub field_defaults: HashMap<ItemKey, Vec<Option<ItemKey>, Global>, Global>,
     pub impls: HashMap<ItemKey, ImplHead, Global>,
     pub fns: HashMap<ItemKey, FnHead<'n>, Global>,
     /// Each ADT's, trait's, impl's and fn's where-clauses, own and inherited (a fn's from its
@@ -671,7 +763,8 @@ pub(super) fn own_generics<'n, S: NamesSource<'n>>(b: &Builder<'_, Maps, S>, tys
                 // core's `TransmuteFrom`), `const ORD: AtomicOrdering` (a fieldless enum),
                 // `const FIELDS: &'static str`. A VALUE of a non-scalar type is refused where it
                 // is read (types.rs `const_term`), never here.
-                if let Err(no) = super::const_param_ty::admits(tys, t, blaze_own::Alloc::global()) {
+                let scratch = tys.alloc();
+                if let Err(no) = super::const_param_ty::admits(tys, t, scratch) {
                     let r = v.site(v.row_range(list.start + k as u32)?)?;
                     return Err(Why::Unsupported(no.text(), r));
                 }
@@ -726,6 +819,9 @@ struct Member<'n> {
     name: &'n str,
     detail: ItemDetail,
     text: &'n str,
+    /// The macro call in the container's body whose expansion it is in (its tokens' marks are
+    /// that expansion's: front2 item_site.rs `member_marks`).
+    written_by: Option<LibKey>,
 }
 
 /// The members of trait or impl `key` from `Names::members`: those written in its body and
@@ -746,7 +842,7 @@ fn members<'n, S: super::source::NamesSource<'n>>(names: S, key: LibKey) -> Resu
             return;
         }
         match m.detail {
-            Some(detail) => out.push(Member { name: m.name.unwrap_or(""), detail, text: m.text }),
+            Some(detail) => out.push(Member { name: m.name.unwrap_or(""), detail, text: m.text, written_by: m.written_by }),
             None => {
                 names.gap("a member's outline detail beyond its kind (heads.rs: members)", Some(m.key));
                 no_detail = true;
@@ -763,11 +859,14 @@ impl<'n> Store<'n> {
     /// An empty store; `sized` is the program's `#[lang = "sized"]` trait (none in a
     /// `no_core` rung that declares none).
     /// `frame` is the command's ([`super::Front2::frame`]), where bodies' local items are kept.
-    pub fn new(sized: Option<LibKey>, frame: &'n blaze_mem::Frame) -> Store<'n> {
+    /// `alloc` is the check's allocator, handed down from the program's entry: the tables are
+    /// in it, and `tys.alloc()` gives it to everything the store keeps for the check.
+    pub fn new(sized: Option<LibKey>, frame: &'n blaze_mem::Frame, alloc: Alloc<'static>) -> Store<'n> {
         Store {
-            tys: PortableTys::new_in(Alloc::global()),
+            tys: PortableTys::new_in(alloc),
             maps: Maps::default(),
             adts: HashMap::new_in(Global),
+            field_defaults: HashMap::new_in(Global),
             impls: HashMap::new_in(Global),
             fns: HashMap::new_in(Global),
             preds: HashMap::new_in(Global),
@@ -779,9 +878,9 @@ impl<'n> Store<'n> {
             ctors: HashMap::new_in(Global),
             statics: HashMap::new_in(Global),
             opaques: HashMap::new_in(Global),
-            hidden: super::opaque_auto::HiddenTable::new_in(Alloc::global()),
+            hidden: super::opaque_auto::HiddenTable::new_in(alloc),
             locals: super::locals::Locals::new(frame),
-            lives: super::lifetimes::Lives::new_in(Alloc::global()),
+            lives: super::lifetimes::Lives::new_in(alloc),
             sources: None,
             reads: super::body_reads::Digests::new(),
             closures: super::foreign_closures::ClosureRows::new_in(Global),
@@ -792,6 +891,18 @@ impl<'n> Store<'n> {
     /// its members (where its supertraits are filed).
     pub fn need(&self, k: LibKey) -> Want {
         if self.maps.traits.contains_key(&k) { Want::Members(k) } else { Want::Head(k) }
+    }
+
+    /// The marks the tokens of `key`'s text `text` keep, which its head's paths resolve by
+    /// (front2 item_site.rs, token-mark-F1). An item declared in a body keeps its enclosing
+    /// body's marks when a macro wrote that body (locals.rs `LocalHead::marks`: bstd's `main!`
+    /// writes `static MANIFEST: $crate::grant::Manifest` in the user's `main`), read at its
+    /// block's module.
+    fn marks<S: NamesSource<'n>>(&self, names: S, key: LibKey, text: &str) -> Result<Option<TextMarks<'n>>, Why> {
+        if let Some(local) = self.locals.head(checker_of(key)) {
+            return Ok(local.marks);
+        }
+        super::item_site::item_marks(names, key, text).map_err(MarksLost::why)
     }
 
     /// Makes `want` and every head it needs, by a work list.
@@ -844,7 +955,7 @@ impl<'n> Store<'n> {
             };
         }
         let resolver = Paths { names };
-        // An item declared in a body: its row's text and its enclosing body's module.
+        // An item declared in a body: its row's text and its block's module (`Locals::head_of`).
         let (detail, text, module) = match self.locals.head_of(key) {
             Some(local) => local?,
             None => {
@@ -888,13 +999,15 @@ impl<'n> Store<'n> {
             // `Def::Const` through `fn_sig`); its body is lowered by `lower_fn` like a fn's.
             (Want::Fn(_), ItemDetail::Fn { .. } | ItemDetail::Const { .. }) => {
                 let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[] };
-                self.fn_head(names, key, ck, None, &env, 0, &[], &v, text)
+                let marks = self.marks(names, key, text).map_err(|why| HeadError::Item(key, why))?;
+                self.fn_head(names, key, ck, None, &env, 0, &[], &v, text, marks)
             }
             // A static's head is its type, as a const's, and its mutability (the Reference,
             // "Static items": "Mutable statics", `static mut`).
             (Want::Fn(_), ItemDetail::Static { .. }) => {
                 let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[] };
-                let made = self.fn_head(names, key, ck, None, &env, 0, &[], &v, text);
+                let marks = self.marks(names, key, text).map_err(|why| HeadError::Item(key, why))?;
+                let made = self.fn_head(names, key, ck, None, &env, 0, &[], &v, text, marks);
                 if made.is_ok() {
                     let m = if v.head[head::FLAGS] & sig::MUT != 0 { tc::Mutbl::Mut } else { tc::Mutbl::Not };
                     self.statics.insert(ck, m);
@@ -940,7 +1053,8 @@ impl<'n> Store<'n> {
         let whole = Range::new(0, 0);
         let mut ps = Vec::new_in(Global);
         let mut cs = Vec::new_in(Global);
-        let b = Builder { resolver: Paths { names }, heads: &self.maps };
+        let marks = self.marks(names, key, v.item())?;
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
         let own = own_generics(&b, &mut self.tys, module, v, 1, &mut ps, &mut cs)?;
         let me = intern(&mut self.tys, PNode::Param(0))?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Ty(me, None), self_assoc: &[], anon: &[], consts: &cs };
@@ -973,9 +1087,15 @@ impl<'n> Store<'n> {
     fn alias<S: NamesSource<'n>>(&mut self, names: S, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
         let mut ps = Vec::new_in(Global);
         let mut cs = Vec::new_in(Global);
-        let b = Builder { resolver: Paths { names }, heads: &self.maps };
+        let marks = self.marks(names, key, v.item())?;
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
         let generics = own_generics(&b, &mut self.tys, module, v, 0, &mut ps, &mut cs)?;
-        let t = v.head_opt(head::TY).ok_or(Why::Unsupported("a type alias with no type (`type T;`)", Range::new(0, 0)))?;
+        // A free `type T;` with no type is an extern type (the Reference has a free alias
+        // without a type as an error; core's `unsafe extern "C" { pub type Code; }`, the
+        // pointee of `FnPtr::as_ptr`'s `NonNull<Code>`). It is its own unsized nominal type,
+        // which the checker's portable form has no node for (`PNode` lacks `Foreign`, though
+        // blaze-ty's `TyKind::Foreign` and the solver's `Shape::Foreign` exist).
+        let t = v.head_opt(head::TY).ok_or(Why::Unsupported("an extern type (`extern { type T; }`): the checker's portable type has no foreign node", Range::new(0, 0)))?;
         // A bound on an alias's parameter is not checked where the alias is used, but it is
         // what `T::X` in the aliased type is read through (core's `ChangeOutputType`).
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &cs };
@@ -998,7 +1118,8 @@ impl<'n> Store<'n> {
     fn adt_head<S: NamesSource<'n>>(&mut self, names: S, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
         let mut ps = Vec::new_in(Global);
         let mut cs = Vec::new_in(Global);
-        let b = Builder { resolver: Paths { names }, heads: &self.maps };
+        let marks = self.marks(names, key, v.item())?;
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
         let g = own_generics(&b, &mut self.tys, module, v, 0, &mut ps, &mut cs)?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &cs };
         let mut defaults = Vec::new_in(Global);
@@ -1036,7 +1157,8 @@ impl<'n> Store<'n> {
         }
         let mut ps = Vec::new_in(Global);
         let mut cs = Vec::new_in(Global);
-        let b = Builder { resolver: Paths { names }, heads: &self.maps };
+        let marks = self.marks(names, key, v.item())?;
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
         let own = own_generics(&b, &mut self.tys, module, v, 1, &mut ps, &mut cs)?;
         // The trait's bounds are lowered after its head (they may name the trait): a default
         // written with `T::X` is refused as not yet readable, never as not found.
@@ -1110,7 +1232,8 @@ impl<'n> Store<'n> {
         let own = param_names(v, 1, &mut ps, Consts::Keep)?;
         let cs = self.maps.const_params.get(&key).cloned().ok_or(Why::Need(key))?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Trait(key), self_assoc: &[], anon: &[], consts: &cs };
-        let b = Builder { resolver: Paths { names }, heads: &self.maps };
+        let marks = self.marks(names, key, v.item())?;
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
         let mut bounds = Vec::new_in(Global);
         b.param_bounds(&mut self.tys, &env, v, 1, &mut bounds)?;
         let env = Env { bounds: Bounds::Done(&bounds), ..env };
@@ -1161,11 +1284,13 @@ impl<'n> Store<'n> {
             match m.detail {
                 ItemDetail::Fn { .. } => {
                     let mk = keys.member(ck, MemberKind::Fn, m.name).map_err(|c| Why::Program(format!("{c}").into_boxed_str(), whole))?;
-                    self.member_fn_head(names, key, mk, Some(ck), &env, own + 1, &inherited, &mv, m.text)?;
+                    let marks = super::item_site::member_marks(names, key, m.written_by, m.text).map_err(MarksLost::why)?;
+                    self.member_fn_head(names, key, mk, Some(ck), &env, own + 1, &inherited, &mv, m.text, marks)?;
                 }
                 ItemDetail::TypeAlias => {
                     let item = keys.member(ck, MemberKind::Type, m.name).map_err(|c| Why::Program(format!("{c}").into_boxed_str(), whole))?;
-                    let b = Builder { resolver: Paths { names }, heads: &self.maps };
+                    let marks = super::item_site::member_marks(names, key, m.written_by, m.text).map_err(MarksLost::why)?;
+                    let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
                     let default = match mv.head_opt(head::TY) {
                         Some(t) => Some(b.ty(&mut self.tys, &env, &mv, lf::TypeId(t))?),
                         None => None,
@@ -1233,7 +1358,8 @@ impl<'n> Store<'n> {
                     let at = Range::new(0, m.text.len() as u32);
                     let t = mv.head_opt(head::TY).ok_or(Why::Unsupported("an associated constant with no type", at))?;
                     consts.push((Name::of(m.name), mk));
-                    let b = Builder { resolver: Paths { names }, heads: &self.maps };
+                    let marks = super::item_site::member_marks(names, key, m.written_by, m.text).map_err(MarksLost::why)?;
+                    let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
                     // As a member fn's signature ([`Store::member_fn_head`]): a need is passed
                     // up; any other refusal of the constant's type is filed in `fn_gaps` and
                     // the trait's head goes on (core's `SizedTypeProperties` has six
@@ -1253,9 +1379,9 @@ impl<'n> Store<'n> {
                     let mut cp = Preds::new();
                     cp.clauses.extend_from_slice(&inherited);
                     self.preds.insert(mk, cp);
-                    let header = tc::FnPtrHeader { abi: tc::Abi::Rust, safety: tc::Safety::Safe };
+                    let header = tc::FnPtrHeader::RUST;
                     let has_body = mv.head[head::FLAGS] & sig::HAS_BODY != 0;
-                    let row = FnHead { lib: key, text: m.text, container: Some(ck), parent: own + 1, own: 0, declared: 0, self_param: false, header, c_variadic: false, inputs: Vec::new_in(Global), output, has_body, module, params: ps.clone(), consts: cs.clone(), bounds: own_bounds, self_: env.self_, self_assoc: Vec::new_in(Global) };
+                    let row = FnHead { lib: key, text: m.text, container: Some(ck), parent: own + 1, own: 0, declared: 0, self_param: false, header, c_variadic: false, legacy_const_generics: Vec::new_in(Global), inputs: Vec::new_in(Global), output, has_body, module, params: ps.clone(), consts: cs.clone(), bounds: own_bounds, self_: env.self_, self_assoc: Vec::new_in(Global) };
                     self.fns.insert(mk, row);
                 }
                 _ => {}
@@ -1272,13 +1398,15 @@ impl<'n> Store<'n> {
     #[expect(clippy::too_many_arguments, reason = "the item's parts, each read once by the caller")]
     fn adt<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>, detail: ItemDetail) -> Result<(), Why> {
         let ck = checker_of(key);
+        adt_syntax(v)?;
         let mut ps = Vec::new_in(Global);
         let generics = param_names(v, 0, &mut ps, Consts::Keep)?;
         let cs = self.maps.const_params.get(&key).cloned().ok_or(Why::Need(key))?;
         let pl = params(&mut self.tys, 0, generics, &cs)?;
         let self_ty = intern(&mut self.tys, PNode::Adt(ck, pl))?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Ty(self_ty, None), self_assoc: &[], anon: &[], consts: &cs };
-        let b = Builder { resolver: Paths { names }, heads: &self.maps };
+        let marks = self.marks(names, key, v.item())?;
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
         let mut bounds = Vec::new_in(Global);
         b.param_bounds(&mut self.tys, &env, v, 0, &mut bounds)?;
         let env = Env { bounds: Bounds::Done(&bounds), ..env };
@@ -1320,7 +1448,11 @@ impl<'n> Store<'n> {
         }
         let mut variants = Vec::new_in(Global);
         let mut fields = Vec::new_in(Global);
-        for &(vk, name, ctor, rows) in &shapes {
+        // Each field's default (RFC 3681), one per field, and the text of each written one:
+        // filed as an anonymous constant's head below, once the ADT's clauses are made.
+        let mut defaults: Vec<Option<ItemKey>, Global> = Vec::new_in(Global);
+        let mut default_heads: Vec<(ItemKey, &'n str, PTy), Global> = Vec::new_in(Global);
+        for (vi, &(vk, name, ctor, rows)) in shapes.iter().enumerate() {
             let start = fields.len() as u32;
             for (j, &n) in v.rows(rows)?.iter().enumerate() {
                 let f = lf::Field::decode(n)?;
@@ -1330,6 +1462,23 @@ impl<'n> Store<'n> {
                     None => Name::of_index(j as u32),
                 };
                 fields.push(tc::Field { name: fname, ty });
+                let Some(c) = f.default else {
+                    defaults.push(None);
+                    continue;
+                };
+                let at = v.const_range(c)?;
+                let r = v.site(at)?;
+                field_default_allowed(names, key, kind, ctor, r)?;
+                let ty_text = v.text_at(v.type_range(f.ty)?)?.trim();
+                let value_text = v.text_at(at)?.trim();
+                // Keyed by the ADT, the field's place and the default's text (rule 21: the
+                // text is the value's input; the ADT's generics are its head's).
+                let dk = keys
+                    .member(ck, MemberKind::Anon, &format!("field default {vi}.{j}: {ty_text} = {value_text}"))
+                    .map_err(|c| Why::Program(format!("{c}").into_boxed_str(), r))?;
+                let text: &'n str = self.locals.keep_text(&format!("const _: {ty_text} = {value_text};"));
+                defaults.push(Some(dk));
+                default_heads.push((dk, text, ty));
             }
             variants.push(tc::Variant { key: vk, name, ctor, fields: List { start, len: fields.len() as u32 - start } });
             if ctor == tc::CtorKind::Tuple {
@@ -1340,12 +1489,49 @@ impl<'n> Store<'n> {
         }
         let mut preds = Preds::new();
         b.predicates(&mut self.tys, &env, v, 0, None, self.sized, &mut preds)?;
+        // Each field default (RFC 3681): an anonymous constant of the field's type in a const
+        // context, generic over the ADT's parameters with its clauses (it may name `N` or
+        // `T`), evaluated at each use's ground arguments (the struct expression's type's).
+        for &(dk, text, output) in &default_heads {
+            let mut dp = Preds::new();
+            dp.clauses.extend_from_slice(&preds.clauses);
+            self.preds.insert(dk, dp);
+            let mut own_bounds = Vec::with_capacity_in(bounds.len(), Global);
+            own_bounds.extend_from_slice(&bounds);
+            let row = FnHead {
+                lib: key,
+                text,
+                container: None,
+                parent: 0,
+                own: generics,
+                declared: 0,
+                self_param: false,
+                header: tc::FnPtrHeader::RUST,
+                c_variadic: false,
+                legacy_const_generics: Vec::new_in(Global),
+                inputs: Vec::new_in(Global),
+                output,
+                has_body: true,
+                module,
+                params: ps.clone(),
+                consts: cs.clone(),
+                bounds: own_bounds,
+                self_: SelfTy::Ty(self_ty, None),
+                self_assoc: Vec::new_in(Global),
+            };
+            self.fns.insert(dk, row);
+        }
+        if defaults.iter().all(Option::is_none) {
+            defaults.clear();
+        }
+        self.field_defaults.insert(ck, defaults);
         self.preds.insert(ck, preds);
         // Its `#[repr(..)]`, read by the reader the old front reads with, and whether a
         // `rustc_layout_scalar_valid_range_*` narrows its range (the program refuses to lay
         // out such a type until the back half's `valid_range` reads it).
         let mut repr = blaze_build::layout::ReprAttrs::RUST;
         let mut narrowed = false;
+        let mut args = false;
         let attrs = v.list(head::ATTRS);
         for (i, &n) in v.rows(attrs)?.iter().enumerate() {
             let a = v.attr(n)?;
@@ -1355,9 +1541,10 @@ impl<'n> Store<'n> {
                 crate::front::repr_parts(v.text_at(a.args)?, &mut repr).map_err(|what| Why::Unsupported(what, r))?;
             }
             narrowed |= path.starts_with("rustc_layout_scalar_valid_range");
+            args |= is_args_attr(path);
         }
         let discrs = discriminants(&b, &mut self.tys, &env, v, repr, &written)?;
-        self.adts.insert(ck, AdtRow { kind, generics, variants, fields, repr, narrowed, discrs });
+        self.adts.insert(ck, AdtRow { kind, generics, variants, fields, repr, narrowed, discrs, args });
         Ok(())
     }
 
@@ -1372,7 +1559,8 @@ impl<'n> Store<'n> {
         let ck = checker_of(key);
         let mut ps = Vec::new_in(Global);
         let mut cs = Vec::new_in(Global);
-        let b = Builder { resolver: Paths { names }, heads: &self.maps };
+        let marks = self.marks(names, key, v.item())?;
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
         let generics = own_generics(&b, &mut self.tys, module, v, 0, &mut ps, &mut cs)?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &cs };
         // The self type FIRST, then the bounds with `Self` known: the Reference, "Paths",
@@ -1429,28 +1617,31 @@ impl<'n> Store<'n> {
                 }
                 ItemDetail::TypeAlias => {
                     let t = mv.head_opt(head::TY).ok_or(Why::Unsupported("an associated type with no type", whole))?;
+                    // The member's text is read with its own tokens' marks (item_site.rs).
+                    let marks = super::item_site::member_marks(names, key, m.written_by, m.text).map_err(MarksLost::why)?;
+                    let mb = Builder { resolver: Paths { names }, heads: &self.maps, marks };
                     // `type Out<X> = ..;` (a generic associated type's value): its own type
                     // and const parameters are in scope after the impl's, at the indices
                     // `generics..` (the checker's `ImplAssoc`: "over the impl's generics then
                     // the item's own"; a lifetime is no parameter of a portable type). Its
                     // where clauses are read and refused or kept by gat.rs.
                     let value = if mv.rows(mv.list(head::GENERICS))?.is_empty() {
-                        b.ty(&mut self.tys, &env, &mv, lf::TypeId(t))?
+                        mb.ty(&mut self.tys, &env, &mv, lf::TypeId(t))?
                     } else {
                         let mut own_ps = Vec::new_in(Global);
                         own_ps.extend_from_slice(&ps);
                         let mut own_cs = Vec::new_in(Global);
                         own_cs.extend_from_slice(&cs);
-                        own_generics(&b, &mut self.tys, module, &mv, generics, &mut own_ps, &mut own_cs)?;
+                        own_generics(&mb, &mut self.tys, module, &mv, generics, &mut own_ps, &mut own_cs)?;
                         let own_env = Env { params: &own_ps, consts: &own_cs, ..env };
-                        b.ty(&mut self.tys, &own_env, &mv, lf::TypeId(t))?
+                        mb.ty(&mut self.tys, &own_env, &mv, lf::TypeId(t))?
                     };
                     super::gat::member_where(&mv, m.name)?;
                     assoc.push((Name::of(m.name), value));
                 }
                 ItemDetail::Const { .. } => {
                     let mk = keys.member(ck, MemberKind::Const, m.name).map_err(|c| Why::Program(format!("{c}").into_boxed_str(), whole))?;
-                    const_texts.push((Name::of(m.name), mk, m.text));
+                    const_texts.push((Name::of(m.name), mk, m.text, m.written_by));
                 }
                 d => return Err(Why::Unsupported(crate::front::detail_name(d), whole)),
             }
@@ -1459,17 +1650,19 @@ impl<'n> Store<'n> {
         let mut preds = Preds::new();
         b.predicates(&mut self.tys, &env, v, 0, None, self.sized, &mut preds)?;
         let mut consts = Vec::with_capacity_in(const_texts.len(), Global);
-        for &(name, mk, text) in &const_texts {
+        for &(name, mk, text, written_by) in &const_texts {
             let low = lower(names, key, text).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
             let cv = low.view();
             let at = Range::new(0, text.len() as u32);
             let t = cv.head_opt(head::TY).ok_or(Why::Unsupported("an associated constant with no type", at))?;
-            let output = b.ty(&mut self.tys, &env, &cv, lf::TypeId(t))?;
+            let marks = super::item_site::member_marks(names, key, written_by, text).map_err(MarksLost::why)?;
+            let cb = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+            let output = cb.ty(&mut self.tys, &env, &cv, lf::TypeId(t))?;
             let mut own_bounds = Vec::new_in(Global);
             own_bounds.extend_from_slice(&bounds);
             let mut self_assoc = Vec::with_capacity_in(assoc.len(), Global);
             self_assoc.extend_from_slice(&assoc);
-            let header = tc::FnPtrHeader { abi: tc::Abi::Rust, safety: tc::Safety::Safe };
+            let header = tc::FnPtrHeader::RUST;
             let mut cp = Preds::new();
             cp.clauses.extend_from_slice(&preds.clauses);
             self.preds.insert(mk, cp);
@@ -1478,7 +1671,7 @@ impl<'n> Store<'n> {
             // is what the constant evaluator reads when another constant names it
             // (`usize::MAX >> 1`). Read from the text, never assumed.
             let has_body = cv.head[head::FLAGS] & sig::HAS_BODY != 0;
-            let row = FnHead { lib: key, text, container: Some(ck), parent: generics, own: 0, declared: 0, self_param: false, header, c_variadic: false, inputs: Vec::new_in(Global), output, has_body, module, params: ps.clone(), consts: cs.clone(), bounds: own_bounds, self_: env.self_, self_assoc };
+            let row = FnHead { lib: key, text, container: Some(ck), parent: generics, own: 0, declared: 0, self_param: false, header, c_variadic: false, legacy_const_generics: Vec::new_in(Global), inputs: Vec::new_in(Global), output, has_body, module, params: ps.clone(), consts: cs.clone(), bounds: own_bounds, self_: env.self_, self_assoc };
             self.fns.insert(mk, row);
             consts.push((name, mk));
         }
@@ -1496,8 +1689,8 @@ impl<'n> Store<'n> {
     /// `fn_gaps` and the container's head goes on (a need is passed up: the store makes the
     /// head it names and makes the container again).
     #[expect(clippy::too_many_arguments, reason = "the fn's parts and its container's")]
-    fn member_fn_head<S: NamesSource<'n>>(&mut self, names: S, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str) -> Result<(), Why> {
-        match self.fn_head(names, lib, key, container, outer, parent, inherited, v, text) {
+    fn member_fn_head<S: NamesSource<'n>>(&mut self, names: S, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str, marks: Option<TextMarks<'n>>) -> Result<(), Why> {
+        match self.fn_head(names, lib, key, container, outer, parent, inherited, v, text, marks) {
             Err(why @ (Why::Need(_) | Why::NeedConst(..))) => Err(why),
             Err(why) => {
                 self.fn_gaps.insert(key, why);
@@ -1511,15 +1704,16 @@ impl<'n> Store<'n> {
     }
 
     /// A fn's signature and clauses: `env` is its container's (its params `0..parent`),
-    /// `inherited` its container's clauses, `v` its own text's.
+    /// `inherited` its container's clauses, `v` its own text's, `marks` its text's tokens'
+    /// (front2 item_site.rs).
     #[expect(clippy::too_many_arguments, reason = "the fn's parts and its container's")]
-    fn fn_head<S: NamesSource<'n>>(&mut self, names: S, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str) -> Result<(), Why> {
+    fn fn_head<S: NamesSource<'n>>(&mut self, names: S, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str, marks: Option<TextMarks<'n>>) -> Result<(), Why> {
         let mut ps = Vec::new_in(Global);
         ps.extend_from_slice(outer.params);
         let mut cs = Vec::new_in(Global);
         cs.extend_from_slice(outer.consts);
         let declared = {
-            let b = Builder { resolver: Paths { names }, heads: &self.maps };
+            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
             own_generics(&b, &mut self.tys, outer.module, v, parent, &mut ps, &mut cs)?
         };
         // Each `impl Trait` parameter type is one more own type parameter, after the declared
@@ -1565,7 +1759,7 @@ impl<'n> Store<'n> {
                 rets.clear();
                 let r = v.site(v.type_range(t)?)?;
                 let ret_text = v.text_at(v.type_range(t)?)?;
-                let x = super::type_expand::expand_type_text(names, outer.module, ret_text, r)?;
+                let x = super::type_expand::expand_type_text(names, outer.module, ret_text, r, self.tys.alloc())?;
                 x.impls(ret_text, r, &mut rets)?;
                 Some(x)
             }
@@ -1589,7 +1783,10 @@ impl<'n> Store<'n> {
             return Err(Why::Program("a fn's container's bounds were not lowered before the fn".into(), Range::new(0, 0)));
         };
         bounds.extend_from_slice(outer_bounds);
-        let b = Builder { resolver: Paths { names }, heads: &self.maps };
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks };
+        // The return type's builder: an expanded return type is a text of its own, read at the
+        // fn's module; the item's marks are not its tokens'.
+        let rb = Builder { resolver: Paths { names }, heads: &self.maps, marks: if expanded.is_some() { None } else { marks } };
         let env = Env { module: outer.module, params: &ps, bounds: Bounds::Building(&[]), self_: outer.self_, self_assoc: outer.self_assoc, anon: &anon, consts: &cs };
         b.param_bounds(&mut self.tys, &env, v, parent, &mut bounds)?;
         let env = Env { bounds: Bounds::Done(&bounds), ..env };
@@ -1621,7 +1818,7 @@ impl<'n> Store<'n> {
             inputs.push(ty);
         }
         let written = match ret {
-            Some(t) => b.ty(&mut self.tys, &ret_env, &rv, t)?,
+            Some(t) => rb.ty(&mut self.tys, &ret_env, &rv, t)?,
             None => intern(&mut self.tys, PNode::Tuple(List::EMPTY))?,
         };
         let whole = Range::new(0, text.len() as u32);
@@ -1638,7 +1835,7 @@ impl<'n> Store<'n> {
         for (j, &(t, me)) in opaques.iter().enumerate() {
             let k = super::keys::opaque_key(key, first + j as u32);
             let mut op = Preds::new();
-            b.impl_bounds(&mut self.tys, &ret_env, &rv, &[(t, me)], self.sized, &mut op)?;
+            rb.impl_bounds(&mut self.tys, &ret_env, &rv, &[(t, me)], self.sized, &mut op)?;
             self.preds.insert(k, op);
             self.opaques.insert(k, (key, first + j as u32));
         }
@@ -1666,12 +1863,12 @@ impl<'n> Store<'n> {
         } else {
             written
         };
-        let header = tc::FnPtrHeader { abi: abi_of(v, whole)?, safety: if flags & sig::UNSAFE != 0 { tc::Safety::Unsafe } else { tc::Safety::Safe } };
+        let header = tc::FnPtrHeader { abi: abi_of(v, whole)?, safety: if flags & sig::UNSAFE != 0 { tc::Safety::Unsafe } else { tc::Safety::Safe }, c_variadic: false };
         // A fn an `extern` block in a body declares ([`super::foreign_locals`]): its own text
         // carries no ABI, its block's does, and it "is implicitly unsafe unless the safe
         // function qualifier is present" (the Reference, "External blocks").
         let header = match self.locals.foreign(key) {
-            Some(f) if f.kind == super::foreign_locals::ForeignKind::Fn => tc::FnPtrHeader { abi: super::types::fn_ptr_abi(f.abi, whole)?, safety: if f.safe { tc::Safety::Safe } else { tc::Safety::Unsafe } },
+            Some(f) if f.kind == super::foreign_locals::ForeignKind::Fn => tc::FnPtrHeader { abi: super::types::fn_ptr_abi(f.abi, whole)?, safety: if f.safe { tc::Safety::Safe } else { tc::Safety::Unsafe }, c_variadic: false },
             _ => header,
         };
         if c_variadic && !matches!(header.abi, tc::Abi::C | tc::Abi::CUnwind | tc::Abi::System | tc::Abi::SystemUnwind) {
@@ -1695,7 +1892,18 @@ impl<'n> Store<'n> {
         if container.is_none() {
             self.maps.const_params.insert(lib, cs.clone());
         }
-        self.fns.insert(key, FnHead { lib, text, container, parent, own, declared, self_param, header, c_variadic, inputs, output, has_body, module, params: ps, consts: cs, bounds, self_, self_assoc });
+        // `#[rustc_legacy_const_generics(1)]` (stdarch's `vget_lane_u64(v, 0)`): the positions
+        // of the call arguments that are the fn's own const generic arguments.
+        let mut legacy_const_generics = Vec::new_in(Global);
+        let attrs = v.list(head::ATTRS);
+        for (i, &n) in v.rows(attrs)?.iter().enumerate() {
+            let a = v.attr(n)?;
+            if v.text_at(a.path)?.trim() == "rustc_legacy_const_generics" {
+                let r = v.site(v.row_range(attrs.start + i as u32)?)?;
+                legacy_positions(v.text_at(a.args)?, r, &mut legacy_const_generics)?;
+            }
+        }
+        self.fns.insert(key, FnHead { lib, text, container, parent, own, declared, self_param, header, c_variadic, legacy_const_generics, inputs, output, has_body, module, params: ps, consts: cs, bounds, self_, self_assoc });
         Ok(())
     }
 }

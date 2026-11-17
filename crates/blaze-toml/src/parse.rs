@@ -68,18 +68,20 @@ impl<'t, A: Allocator + Clone> Document<'t, A> {
             arena: String::new_in(alloc.clone()),
             datetimes: Vec::new_in(alloc),
         };
-        doc.nodes.push(Node {
-            kind: Kind::Table,
-            origin: Origin::Header,
-            parent: NONE,
-            key: Text::EMPTY,
-            key_span: Span { start: 0, end: 0 },
-            span: Span { start: 0, end: narrow(text.len()) },
-            payload: 0,
-            first_child: NONE,
-            last_child: NONE,
-            next_sibling: NONE,
-        });
+        doc.nodes
+            .try_push(Node {
+                kind: Kind::Table,
+                origin: Origin::Header,
+                parent: NONE,
+                key: Text::EMPTY,
+                key_span: Span { start: 0, end: 0 },
+                span: Span { start: 0, end: narrow(text.len()) },
+                payload: 0,
+                first_child: NONE,
+                last_child: NONE,
+                next_sibling: NONE,
+            })
+            .map_err(|refused| Error { at: 0, what: What::Memory(refused.why) })?;
         Parser { text, b: text.as_bytes(), at: 0, limits, doc: &mut doc, table: 0, section: 0, depth: 0 }
             .document()?;
         Ok(doc)
@@ -395,18 +397,20 @@ impl<'t, A: Allocator> Parser<'t, '_, A> {
             return Err(Error { at: widen(span.start), what: What::TooManyNodes { most: self.limits.most_nodes } });
         }
         let id = narrow(nodes.len());
-        nodes.push(Node {
-            kind,
-            origin,
-            parent,
-            key: key.text,
-            key_span: key.span,
-            span,
-            payload,
-            first_child: NONE,
-            last_child: NONE,
-            next_sibling: NONE,
-        });
+        nodes
+            .try_push(Node {
+                kind,
+                origin,
+                parent,
+                key: key.text,
+                key_span: key.span,
+                span,
+                payload,
+                first_child: NONE,
+                last_child: NONE,
+                next_sibling: NONE,
+            })
+            .map_err(|refused| Error { at: widen(span.start), what: What::Memory(refused.why) })?;
         let last = nodes.last_children()[widen(parent)];
         match last {
             NONE => nodes.first_children_mut()[widen(parent)] = id,
@@ -556,6 +560,19 @@ impl<'t, A: Allocator> Parser<'t, '_, A> {
     }
 
 
+    /// The text's bytes `piece` appended to the arena; the allocator's refusal is the error at
+    /// the cursor, never a panic (rule 20: the caller's job fails, not the process).
+    fn arena_str(&mut self, piece: core::ops::Range<usize>) -> Result<(), Error> {
+        let at = self.at;
+        self.doc.arena.try_push_str(&self.text[piece]).map_err(|why| Error { at, what: What::Memory(why) })
+    }
+
+    /// `ch` appended to the arena, as [`Parser::arena_str`].
+    fn arena_char(&mut self, ch: char) -> Result<(), Error> {
+        let at = self.at;
+        self.doc.arena.try_push(ch).map_err(|why| Error { at, what: What::Memory(why) })
+    }
+
     /// A basic string (`"..."`, or `"""..."""` when `multi`) decoded into the arena.
     fn basic(&mut self, multi: bool) -> Result<Text, Error> {
         let arena_start = self.doc.arena.len();
@@ -569,7 +586,7 @@ impl<'t, A: Allocator> Parser<'t, '_, A> {
                 None => return Err(self.err(self.at, What::End { expected: Expected::Quote })),
                 Some(b'"') => {
                     if !multi {
-                        self.doc.arena.push_str(&self.text[run..self.at]);
+                        self.arena_str(run..self.at)?;
                         self.at += 1;
                         break;
                     }
@@ -581,12 +598,12 @@ impl<'t, A: Allocator> Parser<'t, '_, A> {
                     if quotes > 5 {
                         return Err(self.unexpected(self.at + 5, Expected::EndOfLine));
                     }
-                    self.doc.arena.push_str(&self.text[run..self.at + quotes - 3]);
+                    self.arena_str(run..self.at + quotes - 3)?;
                     self.at += quotes;
                     break;
                 }
                 Some(b'\\') => {
-                    self.doc.arena.push_str(&self.text[run..self.at]);
+                    self.arena_str(run..self.at)?;
                     self.escape(multi)?;
                     run = self.at;
                 }
@@ -648,7 +665,7 @@ impl<'t, A: Allocator> Parser<'t, '_, A> {
                 return Err(self.err(at + 1, What::BadEscape { found }));
             }
         };
-        self.doc.arena.push(ch);
+        self.arena_char(ch)?;
         self.at += 2;
         Ok(())
     }
@@ -665,7 +682,7 @@ impl<'t, A: Allocator> Parser<'t, '_, A> {
             value = value * 16 + d;
         }
         match char::from_u32(value) {
-            Some(ch) => self.doc.arena.push(ch),
+            Some(ch) => self.arena_char(ch)?,
             None => return Err(self.err(self.at, What::NotAScalar { value })),
         }
         self.at = start + digits;
@@ -685,7 +702,7 @@ impl<'t, A: Allocator> Parser<'t, '_, A> {
                 None => return Err(self.err(self.at, What::End { expected: Expected::Quote })),
                 Some(b'\'') => {
                     if !multi {
-                        self.doc.arena.push_str(&self.text[start..self.at]);
+                        self.arena_str(start..self.at)?;
                         self.at += 1;
                         break;
                     }
@@ -697,7 +714,7 @@ impl<'t, A: Allocator> Parser<'t, '_, A> {
                     if quotes > 5 {
                         return Err(self.unexpected(self.at + 5, Expected::EndOfLine));
                     }
-                    self.doc.arena.push_str(&self.text[start..self.at + quotes - 3]);
+                    self.arena_str(start..self.at + quotes - 3)?;
                     self.at += quotes;
                     break;
                 }
@@ -822,7 +839,8 @@ impl<'t, A: Allocator> Parser<'t, '_, A> {
             }
         }
         let index = self.doc.datetimes.len();
-        self.doc.datetimes.push(dt);
+        let at = self.at;
+        self.doc.datetimes.try_push(dt).map_err(|refused| Error { at, what: What::Memory(refused.why) })?;
         Ok(u64::try_from(index).unwrap_or_else(|_| unreachable!("an index fits")))
     }
 

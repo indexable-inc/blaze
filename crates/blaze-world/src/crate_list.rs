@@ -8,20 +8,41 @@
 //! this machine (rules 25, 71). Nothing of a crate's TEXT is here: a fact of a root file is read
 //! from that file's outline record by whoever needs it.
 //!
+//! THE TREES. A row's paths are `/<tree>/..`; tree 0 is the checkout and tree `k` (1 and up)
+//! is the world's `k`th pack ([`crate::Texts::packs`]). The tree table names each pack by
+//! content, as the world knew it when the list was made ([`crate::PackOrigin`]: a toolchain
+//! pack by its shelf digest, a fetched package's record by its store key), with the BLAKE3 of
+//! its files' listing (`PackView::tree`), which its opener checks: so a reader with no world (a
+//! body job, blaze-cli body_types.rs) opens the very packs the world read, in place, and serves
+//! every dependency's file text. The files read corrected (D58) follow: `(tree, path in it,
+//! corrected text)`, read in place of the pack's bytes as the world reads them.
+//!
 //! Form (little endian), checked whole once at [`CrateList::open`], then read without checks:
-//! a 32-byte header (magic, version, rows `n`, deps `d`, heap length, sysroot core, alloc, std,
-//! bstd as row indices or `NONE`), `n` rows of [`ROW`] bytes, `d` dependency entries of [`DEP`]
-//! bytes, then the string heap.
+//! a 44-byte header (magic, version, rows `n`, deps `d`, heap length, sysroot core, alloc, std,
+//! bstd as row indices or `NONE`, trees `t`, corrected files `c`), `n` rows of [`ROW`] bytes,
+//! `d` dependency entries of [`DEP`] bytes, `t` trees of [`TREE`] bytes, `c` corrected files of
+//! [`CORRECTED`] bytes, then the string heap.
 
 use blaze_id::{ContentId, CrateItemKey};
 use blaze_own::{AVec, Alloc};
 
-use crate::{Origin, Side, World};
+use crate::{Origin, PackOrigin, Side, World};
 
 const MAGIC: &[u8; 4] = b"BZCL";
-const VERSION: u16 = 1;
-/// magic 4, version 2, pad 2, `n` 4, `d` 4, heap 4, sysroot 16.
-pub const HEADER_LEN: usize = 36;
+/// 2: the tree table and the corrected files (a body job serves its dependencies' texts from
+/// them); a version-1 list is refused by name at [`CrateList::open`].
+pub const VERSION: u16 = 2;
+/// magic 4, version 2, pad 2, `n` 4, `d` 4, heap 4, sysroot 16, `t` 4, `c` 4.
+pub const HEADER_LEN: usize = 44;
+/// kind 1 ([`SHELF`] or [`SOURCE`]), pad 3, its name 32 (shelf digest or store key), its files'
+/// listing BLAKE3 32.
+pub const TREE: usize = 68;
+/// tree 4, path 8, text 8.
+pub const CORRECTED: usize = 20;
+/// A tree whose pack is on the toolchain's shelf ([`PackOrigin::Shelf`]).
+const SHELF: u8 = 1;
+/// A tree whose pack is a record of the sources store ([`PackOrigin::Source`]).
+const SOURCE: u8 = 2;
 /// key 32, name 8, root 8, shown_from 8, deps 8, side 1, flags 1, script kind 1, pad 1, script
 /// subject 32.
 pub const ROW: usize = 100;
@@ -88,11 +109,19 @@ pub enum ListError {
     TooLarge { what: &'static str },
     /// The bytes are not a list of this form: what was wrong, and at which byte.
     Form { what: &'static str, at: usize },
+    /// A list of another version of the form (one with no tree table is version 1).
+    Version { found: u16 },
+    /// The world's packs and their origins are not one to one (`Texts::origins`).
+    Origins { packs: usize, origins: usize },
 }
 
 impl core::fmt::Display for ListError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            ListError::Version { found } => {
+                write!(f, "a crate list of version {found}, not {VERSION} (crate_list.rs `VERSION`): written by another blaze, so its unit graph is made again")
+            }
+            ListError::Origins { packs, origins } => write!(f, "the world has {packs} packs and {origins} pack origins (blaze-world `Texts::origins`)"),
             ListError::SameKey { first, second } => write!(f, "crates {first} and {second} of the world have one key (rule 21: its key misses an input)"),
             ListError::TooLarge { what } => write!(f, "the crate list's {what} is past what its form holds"),
             ListError::Form { what, at } => write!(f, "not a crate list of this form: {what} (at byte {at})"),
@@ -171,7 +200,29 @@ pub fn encode<'a>(world: &World<'_>, script_of: &dyn Fn(usize) -> Option<[u8; 33
             }
         }
     }
-    let mut out: AVec<'a, u8> = AVec::with_capacity_in(HEADER_LEN + rows.len() + deps.len() + heap.len(), alloc);
+    // The trees past the checkout, in the world's order (tree `k` is pack `k - 1`).
+    let (packs, origins) = (world.texts.packs(), world.texts.origins());
+    if packs.len() != origins.len() {
+        return Err(ListError::Origins { packs: packs.len(), origins: origins.len() });
+    }
+    let mut trees: AVec<'_, u8> = AVec::with_capacity_in(packs.len() * TREE, alloc.clone());
+    for (pack, origin) in packs.iter().zip(origins.iter()) {
+        let (kind, name) = match origin {
+            PackOrigin::Shelf { digest } => (SHELF, *digest),
+            PackOrigin::Source { key } => (SOURCE, key.0),
+        };
+        trees.extend_from_slice(&[kind, 0, 0, 0]);
+        trees.extend_from_slice(&name);
+        trees.extend_from_slice(&pack.tree().0);
+    }
+    let corrected_files = world.texts.corrected();
+    let mut corrected: AVec<'_, u8> = AVec::with_capacity_in(corrected_files.len() * CORRECTED, alloc.clone());
+    for (tree, path, text_of) in corrected_files.iter() {
+        corrected.extend_from_slice(&tree.to_le_bytes());
+        corrected.extend_from_slice(&text(path, &mut heap)?);
+        corrected.extend_from_slice(&text(text_of, &mut heap)?);
+    }
+    let mut out: AVec<'a, u8> = AVec::with_capacity_in(HEADER_LEN + rows.len() + deps.len() + trees.len() + corrected.len() + heap.len(), alloc);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
     out.extend_from_slice(&[0, 0]);
@@ -182,10 +233,23 @@ pub fn encode<'a>(world: &World<'_>, script_of: &dyn Fn(usize) -> Option<[u8; 33
     for id in [s.core, s.alloc, s.std, s.bstd] {
         out.extend_from_slice(&id.map_or(NONE, |id| row_of.get(id.0 as usize).copied().unwrap_or(NONE)).to_le_bytes());
     }
+    out.extend_from_slice(&u32_of(packs.len(), "tree count")?.to_le_bytes());
+    out.extend_from_slice(&u32_of(corrected_files.len(), "corrected file count")?.to_le_bytes());
     out.extend_from_slice(&rows);
     out.extend_from_slice(&deps);
+    out.extend_from_slice(&trees);
+    out.extend_from_slice(&corrected);
     out.extend_from_slice(&heap);
     Ok(out)
+}
+
+/// Where tree `k` (1 and up) of a list is kept, and its files' identity.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TreeRow {
+    pub origin: PackOrigin,
+    /// The BLAKE3 of the pack's files' listing (`PackView::tree`): its opener checks the pack it
+    /// mapped is this one.
+    pub files: [u8; 32],
 }
 
 /// `s` into `heap`: its (offset, length), each a `u32`.
@@ -204,6 +268,8 @@ fn text(s: &str, heap: &mut AVec<'_, u8>) -> Result<[u8; 8], ListError> {
 pub struct CrateList<'b> {
     rows: &'b [u8],
     deps: &'b [u8],
+    trees: &'b [u8],
+    corrected: &'b [u8],
     heap: &'b str,
     n: usize,
     sysroot: [u32; 4],
@@ -223,18 +289,26 @@ impl<'b> CrateList<'b> {
         if bytes.len() < HEADER_LEN || &bytes[..4] != MAGIC {
             return Err(form("no magic", 0));
         }
-        if u16::from_le_bytes([bytes[4], bytes[5]]) != VERSION {
-            return Err(form("another version", 4));
+        let found = u16::from_le_bytes([bytes[4], bytes[5]]);
+        if found != VERSION {
+            return Err(ListError::Version { found });
         }
         let n = le32(bytes, 8) as usize;
         let d = le32(bytes, 12) as usize;
         let h = le32(bytes, 16) as usize;
-        let rows_end = HEADER_LEN.checked_add(n.checked_mul(ROW).ok_or(form("rows overflow", 8))?).ok_or(form("rows overflow", 8))?;
-        let deps_end = rows_end.checked_add(d.checked_mul(DEP).ok_or(form("deps overflow", 12))?).ok_or(form("deps overflow", 12))?;
-        if deps_end.checked_add(h) != Some(bytes.len()) {
+        let t = le32(bytes, 36) as usize;
+        let c = le32(bytes, 40) as usize;
+        let after = |start: usize, count: usize, size: usize, at: usize| {
+            count.checked_mul(size).and_then(|len| start.checked_add(len)).ok_or(form("a table's length overflows", at))
+        };
+        let rows_end = after(HEADER_LEN, n, ROW, 8)?;
+        let deps_end = after(rows_end, d, DEP, 12)?;
+        let trees_end = after(deps_end, t, TREE, 36)?;
+        let corrected_end = after(trees_end, c, CORRECTED, 40)?;
+        if corrected_end.checked_add(h) != Some(bytes.len()) {
             return Err(form("the lengths do not add up to the bytes", 16));
         }
-        let heap = core::str::from_utf8(&bytes[deps_end..]).map_err(|_| form("the string heap is not UTF-8", deps_end))?;
+        let heap = core::str::from_utf8(&bytes[corrected_end..]).map_err(|_| form("the string heap is not UTF-8", corrected_end))?;
         let mut sysroot = [NONE; 4];
         for (i, s) in sysroot.iter_mut().enumerate() {
             *s = le32(bytes, 20 + 4 * i);
@@ -242,7 +316,15 @@ impl<'b> CrateList<'b> {
                 return Err(form("a sysroot row past the rows", 20 + 4 * i));
             }
         }
-        let list = CrateList { rows: &bytes[HEADER_LEN..rows_end], deps: &bytes[rows_end..deps_end], heap, n, sysroot };
+        let list = CrateList {
+            rows: &bytes[HEADER_LEN..rows_end],
+            deps: &bytes[rows_end..deps_end],
+            trees: &bytes[deps_end..trees_end],
+            corrected: &bytes[trees_end..corrected_end],
+            heap,
+            n,
+            sysroot,
+        };
         let text_ok = |b: &[u8], at: usize| {
             let (off, len) = (le32(b, at) as usize, le32(b, at + 4) as usize);
             off.checked_add(len).is_some_and(|end| end <= heap.len() && heap.is_char_boundary(off) && heap.is_char_boundary(end))
@@ -271,7 +353,50 @@ impl<'b> CrateList<'b> {
                 return Err(form("a dependency names no row or no string", rows_end + e * DEP));
             }
         }
+        for k in 0..t {
+            let tree = &list.trees[k * TREE..(k + 1) * TREE];
+            if !matches!(tree[0], SHELF | SOURCE) || tree[1..4] != [0, 0, 0] {
+                return Err(form("a tree's kind is neither shelf nor source", deps_end + k * TREE));
+            }
+        }
+        for e in 0..c {
+            let file = &list.corrected[e * CORRECTED..(e + 1) * CORRECTED];
+            let tree = le32(file, 0) as usize;
+            if tree == 0 || tree > t {
+                return Err(form("a corrected file names no tree of the table", trees_end + e * CORRECTED));
+            }
+            if !text_ok(file, 4) || !text_ok(file, 12) {
+                return Err(form("a corrected file's string is outside the heap", trees_end + e * CORRECTED));
+            }
+        }
         Ok(list)
+    }
+
+    /// How many trees past the checkout the rows' paths name: tree `k` is `1..=trees()`.
+    pub fn trees(&self) -> usize {
+        self.trees.len() / TREE
+    }
+
+    /// Where tree `k` (1 and up) is kept, and its files' identity; none for the checkout (0) or
+    /// past the table.
+    pub fn tree(&self, k: usize) -> Option<TreeRow> {
+        let at = k.checked_sub(1)?.checked_mul(TREE)?;
+        let row = self.trees.get(at..at + TREE)?;
+        let mut name = [0; 32];
+        name.copy_from_slice(&row[4..36]);
+        let mut files = [0; 32];
+        files.copy_from_slice(&row[36..68]);
+        let origin = match row[0] {
+            SHELF => PackOrigin::Shelf { digest: name },
+            _ => PackOrigin::Source { key: ContentId(name) },
+        };
+        Some(TreeRow { origin, files })
+    }
+
+    /// The files read corrected (D58), in the world's order: `(tree, path in its pack, text)`,
+    /// read in place of the pack's bytes (`crate::Texts::corrected`).
+    pub fn corrected(&self) -> impl Iterator<Item = (u32, &'b str, &'b str)> + '_ {
+        self.corrected.chunks_exact(CORRECTED).map(|file| (le32(file, 0), self.text(file, 4), self.text(file, 12)))
     }
 
     fn row(&self, r: usize) -> &'b [u8] {
@@ -363,8 +488,8 @@ impl<'b> CrateGraph<'b> for CrateList<'b> {
 
 /// How many fields of `world`'s crates differ from `list`'s rows (each crate found by its key;
 /// a crate with no row counts once): 0 when the list is the world's. The fields: name, root,
-/// shown_from, side, proc_macro, toolchain, member, refused, sysroot, and each dependency's
-/// name and key.
+/// shown_from, side, proc_macro, toolchain, member, refused, sysroot, each dependency's name and
+/// key, each tree's origin and files, and each corrected file.
 pub fn differences(world: &World<'_>, list: &CrateList<'_>) -> usize {
     let mut differ = 0;
     if list.len() != world.crates.len() {
@@ -400,5 +525,18 @@ pub fn differences(world: &World<'_>, list: &CrateList<'_>) -> usize {
             differ += 1;
         }
     }
-    differ
+    let (packs, origins) = (world.texts.packs(), world.texts.origins());
+    differ += packs.len().abs_diff(list.trees());
+    for (k, (pack, origin)) in packs.iter().zip(origins.iter()).enumerate() {
+        if list.tree(k + 1) != Some(TreeRow { origin: *origin, files: pack.tree().0 }) {
+            differ += 1;
+        }
+    }
+    let mut corrected = list.corrected();
+    for (tree, path, text) in world.texts.corrected().iter() {
+        if corrected.next() != Some((*tree, *path, *text)) {
+            differ += 1;
+        }
+    }
+    differ + corrected.count()
 }

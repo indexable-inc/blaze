@@ -4,8 +4,10 @@
 //! row of the leaf table (sweep.rs). The root's units list each member's manifest as a part at
 //! `Locate::Source`, the digest of that member's share (its parts and findings), so an edit of
 //! one member's manifest re-makes that member's units and no other's; a member's units list its
-//! crate roots (`Locate::File` in the package's edition, each with its path), and each
-//! dependency not built yet is a finding on its key. A manifest the layout refuses is a finding
+//! crate roots (`Locate::File` in the package's edition, each with its path) and the units of
+//! each workspace member it depends on (normal and build dependencies, at the root's
+//! `Locate::Source` for that member: `run`'s closure follows them, blaze-drive run_scope.rs),
+//! and each dependency not built yet is a finding on its key. A manifest the layout refuses is a finding
 //! on the line it names, never a refusal of the whole workspace.
 
 use blaze_drive::{Locate, Name, Part, Task};
@@ -38,7 +40,8 @@ pub const TARGET_REFUSED: u16 = 15;
 /// The workspace's lock, at its root.
 const LOCK: &str = "Cargo.lock";
 
-const UNITS_OUT_DOMAIN: &str = "blaze-cli units out 3";
+/// 4: a member's units list the units of each workspace member it depends on (`member_units`).
+const UNITS_OUT_DOMAIN: &str = "blaze-cli units out 4";
 const MEMBER_SOURCE_DOMAIN: &str = "blaze-cli member source 1";
 /// Passes the layout may ask for: the depth of its search (root, globs, path dependencies,
 /// target directories), far under this on any workspace (rule 18).
@@ -79,6 +82,8 @@ pub fn lay<'f, 'l>(
     rows: &mut Rows<'_>,
     // The toolchain the command opens, given by `main`: in the units' output (rule 75).
     toolchain: blaze_toolchain::ToolchainId,
+    // The process's heap, handed from `main`: the lock and its plan are kept on it.
+    heap: &'static blaze_own::Heap,
     frame: &'f Frame,
     alloc: Alloc<'l>,
 ) -> Result<Laid<'f>, CliError> {
@@ -150,12 +155,24 @@ pub fn lay<'f, 'l>(
                 true => None,
                 false => Some(crate::graph::members_lock(&units, frame)),
             };
-            facts = Some((crate::graph::Members::of(&units), own));
+            facts = Some((crate::graph::Members::of(&units, heap), own));
             // Outside dependencies are read by the unit-graph job (unit_graph_task), which
-            // fetches what the roots reach: nothing is said of them here.
-            for member in units.members.iter() {
+            // fetches what the roots reach: nothing is said of them here. A member's units list
+            // the units of each member it depends on, at the source the root lists them by, so
+            // they are made dependencies first ([`deps_first`]).
+            let mut listed: Vec<Option<(Name, ContentId)>, &Frame> = Vec::with_capacity_in(units.members.len(), frame);
+            listed.extend(units.members.iter().map(|_| None));
+            let mut made_of: Vec<Option<Made<'f>>, &Frame> = Vec::with_capacity_in(units.members.len(), frame);
+            made_of.extend(units.members.iter().map(|_| None));
+            for k in deps_first(&units.members, frame).iter().copied() {
+                let member = &units.members[k];
                 let id = member.manifest.0 as usize;
-                let made = member_units(Name::manifest(paths.text(id).as_bytes()), member, texts.text(id), toolchain, frame);
+                let made = member_units(Name::manifest(paths.text(id).as_bytes()), member, texts.text(id), toolchain, (&units.members[..], &listed[..]), frame);
+                listed[k] = Some((made.name, member_source(&made)));
+                made_of[k] = Some(made);
+            }
+            for (member, made) in units.members.iter().zip(made_of.iter_mut()) {
+                let Some(made) = made.take() else { return Err(CliError::Text { what: "a member's units were not made in the layout's dependency order (units.rs `deps_first`)" }) };
                 root_made.parts.push(Part { name: made.name, locate: Locate::Source(member_source(&made)), place: 0 });
                 members.push((made.name, made));
                 // A member proc-macro crate's files, whole: its module key holds them, so they are
@@ -198,7 +215,7 @@ pub fn lay<'f, 'l>(
     };
     let lock = match lock_text {
         None => None,
-        Some(lock_text) => match crate::fetch::Lockfile::read(lock_text, frame) {
+        Some(lock_text) => match crate::fetch::Lockfile::read(lock_text, heap, frame) {
             Ok(lock) => Some(lock),
             Err(words) => {
                 root_made.find(crate::fetch::LOCK_UNREAD, (0, 0), &[words.as_str()]);
@@ -269,9 +286,77 @@ fn member_source(made: &Made<'_>) -> ContentId {
     h.finish()
 }
 
-/// A member's units: its crate roots, and a finding on a blaze-edition line naming the
-/// toolchain's crate.
-fn member_units<'f>(name: Name, member: &layout::Member<'_>, text: &str, toolchain: blaze_toolchain::ToolchainId, frame: &'f Frame) -> Made<'f> {
+/// The workspace members a member depends on as its code is built: its normal and build
+/// dependencies that are members ([`Source::Member`]), each by its index in the layout's
+/// members, in manifest order. Never a dev-dependency: a program does not reach its packages'
+/// tests' dependencies. Every one written is followed, an optional one and one under a
+/// `[target.'cfg(..)']` table too: which of them the features and the target turn on is the
+/// unit graph's to resolve, later, and a listing that holds one more member only checks more
+/// (`run`'s closure is a superset of what the program reaches, never a subset: run_scope.rs).
+fn member_deps<'m, 'a>(member: &'m layout::Member<'a>) -> impl Iterator<Item = (usize, &'m layout::Dependency<'a>)> + use<'m, 'a> {
+    member.dependencies.iter().filter(|dep| dep.kind != layout::DepKind::Dev).filter_map(|dep| match dep.source {
+        Source::Member(to) => Some((to, dep)),
+        _ => None,
+    })
+}
+
+/// The members' indices, each after every member it depends on ([`member_deps`]): a
+/// depth-first walk in the layout's order, each member placed when its dependencies are, so the
+/// order is the layout's alone (rule 25). A dependency back onto a member still being walked (a
+/// cycle, which Rust's packages cannot have outside dev-dependencies) is not followed; that
+/// member's units say so by a finding ([`member_units`]). COST: each member once, and each of
+/// its dependencies found again by its place (`nth`), so the sum of each member's dependency
+/// count squared: a few hundred steps on tempo's 60 members.
+fn deps_first<'f>(members: &[layout::Member<'_>], frame: &'f Frame) -> Vec<usize, &'f Frame> {
+    let mut order: Vec<usize, &'f Frame> = Vec::with_capacity_in(members.len(), frame);
+    // 0: not met, 1: being walked, 2: placed.
+    let mut state: Vec<u8, &Frame> = Vec::with_capacity_in(members.len(), frame);
+    state.extend(members.iter().map(|_| 0u8));
+    // Each member being walked, with how many of its dependencies were looked at.
+    let mut stack: Vec<(usize, usize), &Frame> = Vec::new_in(frame);
+    for start in 0..members.len() {
+        if state[start] != 0 {
+            continue;
+        }
+        state[start] = 1;
+        stack.push((start, 0));
+        while let Some((at, next)) = stack.last().copied() {
+            match member_deps(&members[at]).nth(next) {
+                Some((to, _)) => {
+                    if let Some(top) = stack.last_mut() {
+                        top.1 += 1;
+                    }
+                    if to < members.len() && state[to] == 0 {
+                        state[to] = 1;
+                        stack.push((to, 0));
+                    }
+                }
+                None => {
+                    stack.pop();
+                    state[at] = 2;
+                    order.push(at);
+                }
+            }
+        }
+    }
+    order
+}
+
+/// A member's units: its crate roots, the units of each member it depends on, and a finding on
+/// a blaze-edition line naming the toolchain's crate.
+///
+/// `(members, listed)`: the layout's members and, by the same index, each member's units name
+/// and source once made ([`deps_first`] makes a member's dependencies first). A dependency's
+/// part is at the source the root's units list it by (`member_source`), so both records name
+/// one part one way; one not made yet is a member this one is being walked from, a cycle.
+fn member_units<'f>(
+    name: Name,
+    member: &layout::Member<'_>,
+    text: &str,
+    toolchain: blaze_toolchain::ToolchainId,
+    (members, listed): (&[layout::Member<'_>], &[Option<(Name, ContentId)>]),
+    frame: &'f Frame,
+) -> Made<'f> {
     let mut made = Made::new_in(name, frame);
     let edition = syntax_of(member.edition.syntax).byte();
     // Every crate root the graph makes a unit of is a part: the library, the binaries, and the
@@ -285,6 +370,22 @@ fn member_units<'f>(name: Name, member: &layout::Member<'_>, text: &str, toolcha
         }
         made.parts.push(Part { name: file, locate: Locate::File { edition }, place: 0 });
         made.path(file, root.as_bytes(), false);
+    }
+    // Each workspace member it depends on, once (a dependency written in two tables is one
+    // part): `run`'s closure follows these from the program's package (blaze-drive run_scope.rs).
+    for (to, dep) in member_deps(member) {
+        match listed.get(to).copied().flatten() {
+            Some((units, source)) => {
+                if !made.parts.iter().any(|part| part.name == units) {
+                    made.parts.push(Part { name: units, locate: Locate::Source(source), place: 0 });
+                }
+            }
+            None => {
+                let back = members.get(to).map_or("", |to| to.name.as_str());
+                let words = bstd::mem::format_in!(frame, "the package `{}` depends on `{back}`, a workspace member that depends back on it: a cycle of dependencies (dev-dependencies aside)", member.name.as_str());
+                made.find(UNREAD, (dep.span.start, dep.span.end), &[words.as_str()]);
+            }
+        }
     }
     made.parts.sort_unstable_by_key(|part| part.name);
     if member.lib.is_none() && member.bins.is_empty() {
@@ -350,15 +451,18 @@ fn syntax_of(edition: edition::Edition) -> Edition {
     }
 }
 
-/// The units task `task`: the root's or a member's, from the request's layout.
+/// The units task `task`: the root's or a member's, from the request's layout, copied into
+/// `frame` (the batch's); a frame that refuses the copy fails the task as a hole.
 pub fn run<'f>(laid: &Laid<'_>, task: &Task<'_>, frame: &'f Frame) -> Result<Did<'f>, CliError> {
-    if task.name == Name::units() {
-        return Ok(Did::Done(laid.root.clone_in(frame)));
-    }
-    match laid.members.iter().find(|(name, _)| *name == task.name) {
-        Some((_, made)) => Ok(Did::Done(made.clone_in(frame))),
-        None => Err(CliError::Text { what: "a units task of a manifest the workspace's layout does not list" }),
-    }
+    let made = match laid.members.iter().find(|(name, _)| *name == task.name) {
+        _ if task.name == Name::units() => &laid.root,
+        Some((_, made)) => made,
+        None => return Err(CliError::Text { what: "a units task of a manifest the workspace's layout does not list" }),
+    };
+    Ok(match made.clone_in(frame) {
+        Ok(held) => Did::Done(held),
+        Err(_) => crate::work::held_refused(task.name),
+    })
 }
 
 impl<A: core::alloc::Allocator + Copy> crate::work::Record<A> {
@@ -400,7 +504,7 @@ mod tests {
         root.publish(&cx, &Path::new("Cargo.lock").expect("a path"), Content::bytes(b"version = 4\n"), Durable::No).expect("write");
         let erased = blaze_own::Erased::new(frame);
         let mut rows = Rows::new_in(frame);
-        let laid = lay(&cx, &root, &FromMeta { swept_at_ns: 0 }, &mut rows, blaze_toolchain::ToolchainId([0; 32]), frame, erased.handle()).expect("laid");
+        let laid = lay(&cx, &root, &FromMeta { swept_at_ns: 0 }, &mut rows, blaze_toolchain::ToolchainId([0; 32]), blaze_own::testing::heap(), frame, erased.handle()).expect("laid");
         assert_eq!(laid.root.findings.len(), 0, "{:?}", core::str::from_utf8(&laid.root.messages));
         // The members' own lock stands in for it (graph.rs `members_lock`): the graph and the
         // names world are made from the toolchain and the member alone.
@@ -438,7 +542,7 @@ mod tests {
         root.publish(&cx, &Path::new("Cargo.lock").expect("a path"), Content::bytes(b"version = 4\n"), Durable::No).expect("write");
         let erased = blaze_own::Erased::new(frame);
         let mut rows = Rows::new_in(frame);
-        let laid = lay(&cx, &root, &FromMeta { swept_at_ns: 0 }, &mut rows, blaze_toolchain::ToolchainId([0; 32]), frame, erased.handle()).expect("laid");
+        let laid = lay(&cx, &root, &FromMeta { swept_at_ns: 0 }, &mut rows, blaze_toolchain::ToolchainId([0; 32]), blaze_own::testing::heap(), frame, erased.handle()).expect("laid");
         let [(_, member)] = laid.members.as_slice() else { panic!("one member") };
         assert!(member.findings.is_empty());
         // An outside dependency is the unit-graph job's to read: nothing is said of it here, but
@@ -466,8 +570,114 @@ mod tests {
         put("b/src/lib.rs", "");
         let erased = blaze_own::Erased::new(frame);
         let mut rows = Rows::new_in(frame);
-        let laid = lay(&cx, &root, &FromMeta { swept_at_ns: 0 }, &mut rows, blaze_toolchain::ToolchainId([0; 32]), frame, erased.handle()).expect("laid");
+        let laid = lay(&cx, &root, &FromMeta { swept_at_ns: 0 }, &mut rows, blaze_toolchain::ToolchainId([0; 32]), blaze_own::testing::heap(), frame, erased.handle()).expect("laid");
         assert!(laid.members.iter().all(|(_, member)| member.findings.is_empty()));
         assert!(laid.root.findings.is_empty(), "{:?}", core::str::from_utf8(&laid.root.messages));
+    }
+
+    /// The workspace laid from `files` (path, text), in a simulated tree.
+    fn laid_of(files: &[(&str, &str)], check: impl FnOnce(&Laid<'_>)) {
+        let io = Io::simulated(SimWorld::new(1, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+        let frame = cx.frame();
+        let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("data").expect("a path")).expect("open");
+        for (path, text) in files {
+            root.publish(&cx, &Path::new(path).expect("a path"), Content::bytes(text.as_bytes()), Durable::No).expect("write");
+        }
+        let erased = blaze_own::Erased::new(frame);
+        let mut rows = Rows::new_in(frame);
+        let laid = lay(&cx, &root, &FromMeta { swept_at_ns: 0 }, &mut rows, blaze_toolchain::ToolchainId([0; 32]), blaze_own::testing::heap(), frame, erased.handle()).expect("laid");
+        check(&laid);
+    }
+
+    /// The `Units` parts of the member whose manifest is at `path`.
+    fn member_parts(laid: &Laid<'_>, path: &str) -> std::vec::Vec<Name> {
+        let (_, member) = laid.members.iter().find(|(name, _)| *name == Name::manifest(path.as_bytes())).expect("a member at the path");
+        member.parts.iter().filter(|part| part.name.kind == blaze_drive::Kind::Units).map(|part| part.name).collect()
+    }
+
+    fn package(name: &str, tail: &str) -> std::string::String {
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n{tail}")
+    }
+
+    /// `run`'s closure (blaze-drive run_scope.rs) follows these parts: `app` depends on `lib_a`
+    /// (a normal dependency), `lib_a` on `lib_b` (a build dependency), and `lib_c` is only
+    /// `app`'s dev-dependency, which a program does not reach. Each listed member is at the
+    /// source the root's units list it by, so the two records name one part one way.
+    #[test]
+    fn a_members_units_list_the_members_it_depends_on_and_no_dev_dependency() {
+        let app = package("app", "\n[dependencies]\nlib_a = { path = \"../lib_a\" }\n\n[dev-dependencies]\nlib_c = { path = \"../lib_c\" }\n");
+        let lib_a = package("lib_a", "\n[build-dependencies]\nlib_b = { path = \"../lib_b\" }\n");
+        let (lib_b, lib_c) = (package("lib_b", ""), package("lib_c", ""));
+        let files = [
+            ("Cargo.toml", "[workspace]\nmembers = [\"app\", \"lib_a\", \"lib_b\", \"lib_c\"]\n"),
+            ("app/Cargo.toml", app.as_str()),
+            ("app/src/main.rs", "fn main() {}"),
+            ("lib_a/Cargo.toml", lib_a.as_str()),
+            ("lib_a/src/lib.rs", ""),
+            ("lib_b/Cargo.toml", lib_b.as_str()),
+            ("lib_b/src/lib.rs", ""),
+            ("lib_c/Cargo.toml", lib_c.as_str()),
+            ("lib_c/src/lib.rs", ""),
+        ];
+        laid_of(&files, |laid| {
+            assert_eq!(member_parts(laid, "app/Cargo.toml"), [Name::manifest(b"lib_a/Cargo.toml")]);
+            assert_eq!(member_parts(laid, "lib_a/Cargo.toml"), [Name::manifest(b"lib_b/Cargo.toml")]);
+            assert_eq!(member_parts(laid, "lib_b/Cargo.toml"), std::vec::Vec::<Name>::new());
+            assert_eq!(member_parts(laid, "lib_c/Cargo.toml"), std::vec::Vec::<Name>::new());
+            for (_, member) in laid.members.iter() {
+                assert!(member.findings.is_empty(), "{:?}", core::str::from_utf8(&member.messages));
+                for part in member.parts.iter().filter(|part| part.name.kind == blaze_drive::Kind::Units) {
+                    let listed = laid.root.parts.iter().find(|root| root.name == part.name).expect("the root lists every member");
+                    assert_eq!(listed.locate, part.locate, "one part, one source");
+                }
+            }
+        });
+    }
+
+    /// Control of the order: the same workspace with `lib_b` listed first and `app` last lays to
+    /// the same member records (each member made after what it depends on, whatever the order).
+    #[test]
+    fn the_members_listing_does_not_depend_on_the_members_order() {
+        let app = package("app", "\n[dependencies]\nlib_a = { path = \"../lib_a\" }\n");
+        let lib_a = package("lib_a", "\n[dependencies]\nlib_b = { path = \"../lib_b\" }\n");
+        let lib_b = package("lib_b", "");
+        let tree = |members: &'static str| {
+            let mut sources = std::vec::Vec::new();
+            let files = [
+                ("Cargo.toml", members),
+                ("app/Cargo.toml", app.as_str()),
+                ("app/src/main.rs", "fn main() {}"),
+                ("lib_a/Cargo.toml", lib_a.as_str()),
+                ("lib_a/src/lib.rs", ""),
+                ("lib_b/Cargo.toml", lib_b.as_str()),
+                ("lib_b/src/lib.rs", ""),
+            ];
+            laid_of(&files, |laid| {
+                sources = laid.root.parts.iter().cloned().collect::<std::vec::Vec<Part>>();
+            });
+            sources
+        };
+        let forward = tree("[workspace]\nmembers = [\"app\", \"lib_a\", \"lib_b\"]\n");
+        let backward = tree("[workspace]\nmembers = [\"lib_b\", \"lib_a\", \"app\"]\n");
+        assert_eq!(forward, backward);
+    }
+
+    /// Two members that depend on each other (not a Rust workspace cargo builds) are a finding on
+    /// the dependency line that closes the cycle, never a hang or a part left out in silence.
+    #[test]
+    fn a_cycle_of_members_is_a_finding_on_its_line() {
+        let a = package("a", "\n[dependencies]\nb = { path = \"../b\" }\n");
+        let b = package("b", "\n[dependencies]\na = { path = \"../a\" }\n");
+        let files = [("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n"), ("a/Cargo.toml", a.as_str()), ("a/src/lib.rs", ""), ("b/Cargo.toml", b.as_str()), ("b/src/lib.rs", "")];
+        laid_of(&files, |laid| {
+            let findings: std::vec::Vec<&str> = laid
+                .members
+                .iter()
+                .flat_map(|(_, member)| member.findings.iter().map(|(_, _, _, at, to)| core::str::from_utf8(&member.messages[*at..*to]).expect("words")))
+                .collect();
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert!(findings[0].contains("depends back on it"), "{findings:?}");
+        });
     }
 }

@@ -95,7 +95,7 @@ pub(crate) struct CrateNative<'a> {
 /// Why the program's native library was refused; each names the package, the line or the name,
 /// and the rule (NATIVE.md 3.2), or carries the refusal of the stage that made it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum NativeError<'a> {
+pub enum NativeError<'a> {
     /// A `rustc-link-lib` text (or a `#[link]`'s name) not taken; `why` names the rule.
     LinkLine { package: &'a str, line: &'a str, why: &'static str },
     SearchOutsideOutDir { package: &'a str, path: &'a str },
@@ -119,7 +119,7 @@ pub(crate) fn word_names<'r>(record: &'r [u8], platform: Platform) -> Result<Nam
 
 /// What one record holds, for the run's report.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct NativeSummary {
+pub struct NativeSummary {
     pub inputs: u32,
     pub members: u32,
     pub words: u32,
@@ -572,7 +572,10 @@ mod tests {
 
     #[test]
     fn key_ignores_rust_bodies() {
-        let alloc = blaze_own::testing::heap().alloc();
+        // The test's one allocator, made at its top: a frame, its memory from the OS.
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
         let producers = Producers::for_tests(b"natives");
         let producer = producers.get::<Whole>();
         let before = "#[link(name = \"z\")]\nextern \"C\" { fn crc32(); }\n\
@@ -593,7 +596,10 @@ mod tests {
     /// Prints `test natives::tests::c_kzg_double_line_is_one_input ... ok`.
     #[test]
     fn c_kzg_double_line_is_one_input() {
-        let alloc = blaze_own::testing::heap().alloc();
+        // The test's one allocator, made at its top: a frame, its memory from the OS.
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
         let producers = Producers::for_tests(b"natives");
         let producer = producers.get::<Whole>();
         let printed = "cargo:rustc-link-lib=static=ckzg\ncargo:rustc-link-search=native=/out\ncargo:rustc-link-lib=ckzg\n";
@@ -617,7 +623,10 @@ mod tests {
     /// Prints `test natives::tests::search_outside_out_dir_refused ... ok`.
     #[test]
     fn search_outside_out_dir_refused() {
-        let alloc = blaze_own::testing::heap().alloc();
+        // The test's one allocator, made at its top: a frame, its memory from the OS.
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
         let producers = Producers::for_tests(b"natives");
         let producer = producers.get::<Whole>();
         let links = links("", alloc);
@@ -648,7 +657,10 @@ mod tests {
     /// Prints `test natives::tests::pthread_arg_accepted_others_refused ... ok`.
     #[test]
     fn pthread_arg_accepted_others_refused() {
-        let alloc = blaze_own::testing::heap().alloc();
+        // The test's one allocator, made at its top: a frame, its memory from the OS.
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
         let producers = Producers::for_tests(b"natives");
         let producer = producers.get::<Whole>();
         let links = links("", alloc);

@@ -10,7 +10,7 @@
 
 use std::alloc::Global;
 
-use blaze_hash::{HashMap, HashSet};
+use blaze_hash::{FixedState, Map, MapOpts, Set, SetOpts};
 
 use crate::batches::{self, Batch, BatchError, ImageRow, Process};
 
@@ -28,7 +28,7 @@ pub(crate) fn lookup(i: usize, pc: u64) -> u64 {
 /// address gets at least one name, `[code in no image]` at worst.
 pub(crate) fn frames<'a>(
     stacks: impl Iterator<Item = &'a [u64]>,
-) -> HashMap<u64, Vec<String>, Global> {
+) -> Map<u64, Vec<String>, FixedState, Global> {
     #[cfg(test)]
     ASKED.with(|it| it.set(it.get() + 1));
     // alloc: a flush's addresses, once a flush
@@ -36,7 +36,7 @@ pub(crate) fn frames<'a>(
         stacks.flat_map(|stack| stack.iter().enumerate().map(|(i, pc)| lookup(i, *pc))).collect();
     at.sort_unstable();
     at.dedup();
-    let mut frames = HashMap::new_in(Global);
+    let mut frames = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     frames.extend(ix_prof::symbols::functions(&at));
     frames
 }
@@ -44,7 +44,7 @@ pub(crate) fn frames<'a>(
 /// The named frames of `pcs` (innermost first, as the samplers and the panic ring keep them),
 /// outermost first, as `samples.stack` holds them: each address's function and those inlined
 /// into it, from `frames` ([`frames`]); an address it has none for, bare.
-pub(crate) fn stack(pcs: &[u64], frames: &HashMap<u64, Vec<String>, Global>) -> Vec<String> {
+pub(crate) fn stack(pcs: &[u64], frames: &Map<u64, Vec<String>, FixedState, Global>) -> Vec<String> {
     // alloc: a stack's names, once a row
     let mut out = Vec::new();
     for (i, pc) in pcs.iter().enumerate().rev() {
@@ -102,13 +102,13 @@ thread_local! {
 /// The code images a history has written rows of, so each is written once a process: by its
 /// load address and file (one unloaded and another loaded at its address is a new image).
 pub(crate) struct ImagesWritten {
-    written: HashSet<(u64, String), Global>,
+    written: Set<(u64, String), FixedState, Global>,
 }
 
 impl ImagesWritten {
     pub(crate) fn new() -> ImagesWritten {
         // alloc: once a history
-        ImagesWritten { written: HashSet::new_in(Global) }
+        ImagesWritten { written: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }) }
     }
 
     /// The `images` rows of the images `stacks`' addresses are in that this history has not

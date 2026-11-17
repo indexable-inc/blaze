@@ -117,7 +117,7 @@ fn toolchain() -> Toolchain {
 fn with_unit<R>(tc: &Toolchain, text: &str, test: bool, f: impl FnOnce(&Names<'_>, &[(&str, Option<&str>)], &[SourceFile<'_>]) -> R) -> R {
     let files = [("/suite/src/lib.rs".to_string(), text.to_string())];
     let edition = edition::PackageEdition::of_manifest("2024").expect("a known edition");
-    let user = UserCrate { name: "suite", dir: "/suite/", root: "/suite/src/lib.rs", files: &files, edition };
+    let user = UserCrate { name: "suite", dir: "/suite/", root: "/suite/src/lib.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let mut crates = inputs.crates();
     let cfg: Vec<(&str, Option<&str>)> = crates[0].cfg.iter().copied().chain(test.then_some(("test", None))).collect();
@@ -125,7 +125,7 @@ fn with_unit<R>(tc: &Toolchain, text: &str, test: bool, f: impl FnOnce(&Names<'_
     if test {
         crates[0].key = CrateItemKey(ContentId::of("blaze program crate test", SOURCE_NAME));
     }
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/lib.rs", text }];
     f(&names, &cfg, &sources)
 }

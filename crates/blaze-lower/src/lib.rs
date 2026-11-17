@@ -7,8 +7,8 @@
 //! `a_negative_impl_is_a_head`: impls, not pattern types; other lanes' WIP). Census NOT rerun.
 //! STEP 2 FIXED: `$crate` in a body expansion lost its crate at the text boundary: blaze-expand
 //! `body_words` wrote `$crate`, and the ladder's `to_path` read it as the BODY's crate. Now a
-//! marked `$crate` is written as `DollarCrate(mark.site.krate)` (`__dollar_crate_<hex>`; one home
-//! moved to blaze-surface macro_def.rs, re-exported by blaze-scope task/lower.rs); machine.rs
+//! marked `$crate` keeps its MARK (token-mark-1/-2, drive.md "A token keeps its mark"; no
+//! spelled token; one resolver, blaze-scope crate_roots `root_by_mark`); machine.rs
 //! `library_macro` accepts it. Fixture scoped_tests `a_value_path_a_nested_expansion_writes_
 //! names_the_defining_crate` failed without it (`$crate::deep::f` -> user's ItemKey(d1fa2cbf2a39),
 //! dep's is 5650bb2226d6); blaze-lower "113 passed", blaze-expand "56 passed" (mixcheck: blaze-
@@ -179,7 +179,7 @@
 //! readers already read `$crate` back: `task/lower.rs` `to_path`). NOT YET SENT to the names
 //! lane (this runner had no message tool): send acd2f3dd892b1b198 (check OWNERS.md) the two
 //! fixtures and the line. Body side done: `Scoped::resolve` reads blaze-scope's
-//! `__dollar_crate_<key>` identifier (another crate's `$crate` in item text) as that crate.
+//! item text's root by its first segment's mark (blaze-scope crate_roots, token-mark-2).
 //! Step 2 begun: `ByName` keeps the body's READ LIST (`ByName::reads`, blaze-expand `Reads`:
 //! every expansion's `env!`/`include*!` reads, eager inputs', attributes' and derives' too,
 //! reset in `begin_body`); test `an_environment_read_joins_the_body_s_read_list`. Not done:
@@ -432,10 +432,12 @@ mod fmt;
 pub mod form;
 mod lit;
 pub mod machine;
+pub mod mark_site;
 #[cfg(test)]
 mod plant;
 pub mod resolve;
 pub mod scoped;
+pub mod scope_origin;
 mod super_let;
 mod type_text;
 pub mod typeck;
@@ -530,8 +532,8 @@ pub trait ValueNames {
     /// `Some(ValueName::Need)` when the world cannot say yet. Asked before the block's item
     /// and the module ([`block_uses`], where the order's rule is quoted). The default is a
     /// world with no modules to import from (a fixture's): no `use` binds anything.
-    fn value_name_by_uses(&mut self, name: &str, uses: &[block_uses::BlockUse<'_>], locals: &[&str]) -> Option<ValueName> {
-        let _ = (name, uses, locals);
+    fn value_name_by_uses(&mut self, view: &View<'_>, name: &str, uses: &[block_uses::BlockUse<'_>], locals: &[&str]) -> Option<ValueName> {
+        let _ = (view, name, uses, locals);
         None
     }
 }
@@ -719,6 +721,30 @@ pub fn lower_body_expanding<'a, 't>(
     let input = lexed.to_input(pe);
     let output = parser::Reparser::top_level_item().parse(input.tokens());
     let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
+    expand.begin_body();
+    feed::feed_expanding(&mut m, &lexed, &output, 0, expand);
+    m.finish()
+}
+
+/// [`lower_body_expanding`] of an item a macro wrote, its text `marks.text()`: each of its own
+/// words keeps its mark beside the text ([`View::mark_of_path`]), so a path of it, and a macro
+/// call's name ([`BodyCall::path_mark`]), resolves where its mark says (`$crate`, written
+/// `crate` in an item text, as the crate its mark names; drive.md, "A token keeps its mark").
+pub fn lower_body_expanding_marked<'a, 't>(
+    marks: mark_site::ItemMarks<'t>,
+    edition: Edition,
+    cfg: &mut dyn Cfg,
+    values: &mut dyn ValueNames,
+    expand: &mut dyn Expand,
+    alloc: Alloc<'a>,
+) -> Result<Lowered<'a, 't>, Need<'a>> {
+    let text = marks.text();
+    let pe = parser_edition(edition);
+    let lexed = parser::LexedStr::new(pe, text);
+    let input = lexed.to_input(pe);
+    let output = parser::Reparser::top_level_item().parse(input.tokens());
+    let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
+    m.mark_item(marks);
     expand.begin_body();
     feed::feed_expanding(&mut m, &lexed, &output, 0, expand);
     m.finish()

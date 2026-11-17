@@ -32,9 +32,9 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let node = self.node_at(operand, t)?;
         Ok(match (node, from, to) {
             // A fn item: its instance's address, as a pointer or an integer.
-            (PNode::FnDef(item, args), Repr::None, Repr::Ptr) => V::Scalar(self.fn_addr(Instance { item, args })),
+            (PNode::FnDef(item, args), Repr::None, Repr::Ptr) => V::Scalar(self.reify_addr(e, Instance { item, args })?),
             (PNode::FnDef(item, args), Repr::None, Repr::Int { ty, .. }) => {
-                let p = self.fn_addr(Instance { item, args });
+                let p = self.reify_addr(e, Instance { item, args })?;
                 let addr = self.b.convert(Op::Expose, Flags::NONE, Ty::I64, p);
                 V::Scalar(self.resize(addr, Ty::I64, ty, false))
             }

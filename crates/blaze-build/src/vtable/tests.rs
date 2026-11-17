@@ -7,7 +7,7 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_own::Alloc;
 use blaze_typeck::{ItemKey, PNode, PortableTys, UintTy};
 
-use super::{HEADER_WORDS, ObjectMethod, ObjectTrait, Shape, Upcast, Vtable, VtableTarget, Word, vtable_key};
+use super::{ArgSpan, HEADER_WORDS, ObjectMethod, ObjectSuper, ObjectTrait, Shape, TraitArgs, Upcast, Vtable, VtableError, VtableTarget, Word, vtable_key};
 use crate::Instance;
 
 const Z: ItemKey = ItemKey(0x10);
@@ -42,14 +42,33 @@ impl Fixture {
         Fixture { z: [m(0x11, true)], a: [m(0x21, true), m(0x22, false)], b: [m(0x31, true), m(0x32, false)], c }
     }
     fn facts(&self, t: ItemKey) -> Option<ObjectTrait<'_>> {
+        const SZ: [ObjectSuper; 1] = [ObjectSuper::plain(Z)];
+        const SAB: [ObjectSuper; 2] = [ObjectSuper::plain(A), ObjectSuper::plain(B)];
         Some(match t {
-            Z => ObjectTrait { supers: &[], methods: &self.z, shape: id("z1") },
-            A => ObjectTrait { supers: &[Z], methods: &self.a, shape: id("a1 a2<U>; z1") },
-            B => ObjectTrait { supers: &[Z], methods: &self.b, shape: id("b1 b2:Sized; z1") },
-            C => ObjectTrait { supers: &[A, B], methods: &self.c, shape: id(if self.c.len() == 2 { "c1 c2; a; b" } else { "c1; a; b" }) },
+            Z => ObjectTrait { supers: &[], super_args: &[], methods: &self.z, shape: id("z1") },
+            A => ObjectTrait { supers: &SZ, super_args: &[], methods: &self.a, shape: id("a1 a2<U>; z1") },
+            B => ObjectTrait { supers: &SZ, super_args: &[], methods: &self.b, shape: id("b1 b2:Sized; z1") },
+            C => ObjectTrait { supers: &SAB, super_args: &[], methods: &self.c, shape: id(if self.c.len() == 2 { "c1 c2; a; b" } else { "c1; a; b" }) },
             _ => return None,
         })
     }
+}
+
+/// `words` with each method's arguments set to the principal's: what two shapes of one tree
+/// seen from different principals agree on (the trait and item of every word).
+fn items(words: &[Word]) -> Vec<Word> {
+    words
+        .iter()
+        .map(|w| match *w {
+            Word::Method { trait_, item, .. } => Word::Method { trait_, item, args: TraitArgs::Principal },
+            other => other,
+        })
+        .collect()
+}
+
+/// Method words of `item` in trait `trait_`, at the principal's arguments.
+fn method(trait_: ItemKey, item: u128) -> Word {
+    Word::Method { trait_, item: ItemKey(item), args: TraitArgs::Principal }
 }
 
 /// The order: supertraits depth first in declaration order, the principal last, a trait
@@ -60,17 +79,8 @@ impl Fixture {
 fn the_shape_follows_the_traits_text() {
     let f = Fixture::new(false);
     let s = Shape::of(C, |t| f.facts(t), Global).unwrap();
-    let words: Vec<Word> = s.words.iter().copied().collect();
-    assert_eq!(
-        words,
-        [
-            Word::Method { trait_: Z, item: ItemKey(0x11) },
-            Word::Method { trait_: A, item: ItemKey(0x21) },
-            Word::Method { trait_: B, item: ItemKey(0x31) },
-            Word::Super(B),
-            Word::Method { trait_: C, item: ItemKey(0x41) },
-        ]
-    );
+    assert_eq!(items(&s.words), [method(Z, 0x11), method(A, 0x21), method(B, 0x31), Word::Super(B), method(C, 0x41)]);
+    assert_eq!(s.words[4], method(C, 0x41), "the principal's own methods are at its whole argument list");
     assert_eq!((s.slot(ItemKey(0x11)), s.slot(ItemKey(0x21)), s.slot(ItemKey(0x31)), s.slot(ItemKey(0x41))), (Some(0), Some(1), Some(2), Some(4)));
     assert_eq!((s.slot(ItemKey(0x22)), s.slot(ItemKey(0x32))), (None, None), "no slot without dispatch");
     assert_eq!((s.upcast(A), s.upcast(Z), s.upcast(C)), (Some(Upcast::Prefix), Some(Upcast::Prefix), Some(Upcast::Prefix)));
@@ -78,7 +88,7 @@ fn the_shape_follows_the_traits_text() {
     assert_eq!(s.upcast(ItemKey(0x99)), None);
     // `A`'s own table is a prefix of `C`'s: an upcast keeps the pointer.
     let sa = Shape::of(A, |t| f.facts(t), Global).unwrap();
-    assert_eq!(&s.words[..sa.words.len()], &sa.words[..]);
+    assert_eq!(items(&s.words[..sa.words.len()]), items(&sa.words));
     assert!(Shape::of(ItemKey(0x99), |t| f.facts(t), Global).is_err(), "a trait with no facts is refused by name");
 }
 
@@ -124,6 +134,82 @@ fn the_record_is_bytes_and_relocations_and_its_key_covers_the_shape() {
     let sb = Shape::of(B, |t| f.facts(t), Global).unwrap();
     let sb2 = Shape::of(B, |t| f2.facts(t), Global).unwrap();
     assert_eq!(&sb.words[..], &sb2.words[..]);
+}
+
+const ONCE: ItemKey = ItemKey(0x50);
+const MUT: ItemKey = ItemKey(0x60);
+const FN: ItemKey = ItemKey(0x70);
+const PLAIN: ItemKey = ItemKey(0x80);
+const TWICE: ItemKey = ItemKey(0x90);
+const OFF: ItemKey = ItemKey(0xa0);
+const PAST: ItemKey = ItemKey(0xb0);
+
+/// core's Fn traits, which `Box<dyn FnMut()>`'s drop reaches (`Layout::for_value_raw::<dyn
+/// FnMut<()>>` asks the shape): `trait Once<Args> { fn once(self, a: Args); }` (no slot: `self`
+/// by value), `trait Mut<Args>: Once<Args> { fn call_mut(&mut self, a: Args); }`,
+/// `trait Fn_<Args>: Mut<Args> { fn call(&self, a: Args); }`; and three trees a table cannot
+/// carry: `trait Twice<P, Q>: Mut<P> + Mut<Q>`, `trait Off<P>: Plain + Mut<P>` (`Mut` off the
+/// first chain), and `Past`, whose facts name a supertrait argument past their pool.
+fn fn_facts(t: ItemKey) -> Option<ObjectTrait<'static>> {
+    const ONCE_M: [ObjectMethod; 1] = [ObjectMethod { item: ItemKey(0x51), dispatch: false }];
+    const MUT_M: [ObjectMethod; 1] = [ObjectMethod { item: ItemKey(0x61), dispatch: true }];
+    const FN_M: [ObjectMethod; 1] = [ObjectMethod { item: ItemKey(0x71), dispatch: true }];
+    const PLAIN_M: [ObjectMethod; 1] = [ObjectMethod { item: ItemKey(0x81), dispatch: true }];
+    // Each supertrait's one argument is the trait's own parameter 1 (`Args`), or 2 (`Q`).
+    const ARG1: ArgSpan = ArgSpan { at: 0, len: 1 };
+    const ARG2: ArgSpan = ArgSpan { at: 1, len: 1 };
+    const POOL: [u32; 2] = [1, 2];
+    const S_ONCE: [ObjectSuper; 1] = [ObjectSuper { trait_: ONCE, args: ARG1 }];
+    const S_MUT: [ObjectSuper; 1] = [ObjectSuper { trait_: MUT, args: ARG1 }];
+    const S_TWICE: [ObjectSuper; 2] = [ObjectSuper { trait_: MUT, args: ARG1 }, ObjectSuper { trait_: MUT, args: ARG2 }];
+    const S_OFF: [ObjectSuper; 2] = [ObjectSuper::plain(PLAIN), ObjectSuper { trait_: MUT, args: ARG1 }];
+    const S_PAST: [ObjectSuper; 1] = [ObjectSuper { trait_: MUT, args: ArgSpan { at: 5, len: 1 } }];
+    Some(match t {
+        ONCE => ObjectTrait { supers: &[], super_args: &[], methods: &ONCE_M, shape: id("once") },
+        MUT => ObjectTrait { supers: &S_ONCE, super_args: &POOL, methods: &MUT_M, shape: id("mut; once") },
+        FN => ObjectTrait { supers: &S_MUT, super_args: &POOL, methods: &FN_M, shape: id("fn; mut; once") },
+        PLAIN => ObjectTrait { supers: &[], super_args: &[], methods: &PLAIN_M, shape: id("plain") },
+        TWICE => ObjectTrait { supers: &S_TWICE, super_args: &POOL, methods: &[], shape: id("twice") },
+        OFF => ObjectTrait { supers: &S_OFF, super_args: &POOL, methods: &[], shape: id("off") },
+        PAST => ObjectTrait { supers: &S_PAST, super_args: &POOL, methods: &[], shape: id("past") },
+        _ => return None,
+    })
+}
+
+/// A supertrait with generic arguments (`Fn_<Args>: Mut<Args>: Once<Args>`) has a table: the
+/// first chain `Fn_, Mut, Once` is the prefix, `once` has no slot, and `call_mut`'s word is the
+/// instance at `[concrete, Args]` (the Reference, "Trait objects": the table holds T's
+/// implementation of each supertrait method, here `<T as Mut<Args>>::call_mut`), the same list
+/// as the principal's `call`; never at `[concrete]` alone, which names no impl of a generic
+/// trait. The three trees a table cannot carry are refused, each by its own name.
+/// Prints `fn traits: words [Method(0x61 at [u32, u64]), Method(0x71 at [u32, u64])]`.
+#[test]
+fn a_generic_supertrait_is_laid_out_at_the_principals_arguments() {
+    let s = Shape::of(FN, fn_facts, Global).expect("Fn_'s shape");
+    assert_eq!(items(&s.words), [method(MUT, 0x61), method(FN, 0x71)]);
+    assert_eq!(&s.prefix[..], &[ONCE, MUT, FN], "the whole tree is the first chain");
+    assert_eq!((s.upcast(MUT), s.upcast(ONCE)), (Some(Upcast::Prefix), Some(Upcast::Prefix)));
+    let mut g = PortableTys::new_in(Alloc::global());
+    let u32_ = g.intern(PNode::Uint(UintTy::U32)).unwrap();
+    let u64_ = g.intern(PNode::Uint(UintTy::U64)).unwrap();
+    let at_args = g.intern_list(&[u32_, u64_]).unwrap();
+    let table = Vtable::build(&s, u32_, &[u64_], 4, 4, None, &mut g, Global).expect("Fn_'s table at (u32, u64)");
+    let relocs: Vec<(u32, VtableTarget)> = table.relocs.iter().copied().collect();
+    let shown: Vec<String> = relocs
+        .iter()
+        .map(|(_, to)| match *to {
+            VtableTarget::Fn(i) if i.args == at_args => format!("Method({:#x} at [u32, u64])", i.item.0),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    let line = format!("fn traits: words [{}]", shown.join(", "));
+    println!("{line}");
+    assert_eq!(line, "fn traits: words [Method(0x61 at [u32, u64]), Method(0x71 at [u32, u64])]");
+
+    assert_eq!(Shape::of(TWICE, fn_facts, Global).err(), Some(VtableError::TwiceAtOtherArgs(MUT)));
+    // `Once<P>` under `Mut<P>` is laid out first, off the first chain: its word is refused.
+    assert_eq!(Shape::of(OFF, fn_facts, Global).err(), Some(VtableError::GenericSuper(ONCE)));
+    assert_eq!(Shape::of(PAST, fn_facts, Global).err(), Some(VtableError::SuperArg { trait_: PAST, super_: MUT }));
 }
 
 /// Places `(concrete, t)`'s table for the native run: the bytes as words, each method word a

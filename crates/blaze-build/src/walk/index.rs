@@ -12,15 +12,20 @@
 //! library's (`impl<T, I: SliceIndex<[T]>> Index<I> for [T]`), and the returned `&[T]` is a wide
 //! pointer, whose dereference is an unsized place (`V::Unsized`: walk.rs "Unsized places").
 //!
-//! Which method: the check (blaze-typeck rules/field.rs `expr_index`) selects `Index` only; its
-//! doc says "Omitted for now: `IndexMut` selection for mutable places (that is fixed up after
-//! the walk in rustc, `convert_place_derefs_to_mutable`)". It records no callee row and no
-//! mutability for the index expression. So the build calls `Index::index` (`Adts::index_fn`)
-//! in a place expression context that only reads or shares, and refuses BY NAME every mutable
-//! place expression context that reaches an overloaded index (an assignment's or a compound
-//! assignment's left side, `&mut`, `&raw mut`, a `&mut` autoref), never upgrading on its own:
-//! what is needed is the check's record, per index expression, that it is a mutable place
-//! (rustc's fix-up), and then `Adts::index_fn(Mutbl::Mut)` here.
+//! Which method: the check's, never the build's. blaze-typeck types every index with `Index`
+//! (rules/field.rs `expr_index`) and, after the walk, lists each overloaded index that is a
+//! mutable place and whose type implements `IndexMut` in `Checked::index_mut`
+//! (rules/mut_places.rs, rustc's `convert_place_derefs_to_mutable`); a mutable place through an
+//! index of a type without `IndexMut` is the check's E0596 there. So the call is
+//! `IndexMut::index_mut(&mut a, b)` (`Adts::index_fn(Mutbl::Mut)`) for a listed expression and
+//! `Index::index(&a, b)` for any other: `*index_mut(..)` is the place, written, borrowed or
+//! projected like any other (`v[i] = x`, `v[i] += 1` with the place evaluated once, `&mut
+//! m[k]`, `v[i].f = x`, `v[i][j] = x`, `v[i].bump()` with its `&mut` autoref, a `ref mut`
+//! binding). Each mutable place expression context (an assignment's or a compound
+//! assignment's left side, `&mut`, `&raw mut`, a `&mut` autoref) still checks its chain
+//! (`refuse_mut_through_overloaded_index`): an overloaded index on it the check did not list
+//! must sit below a raw pointer's dereference, else it is refused by name, never written
+//! through `Index::index`'s shared reference.
 //!
 //! The check's autoderef of an array base adds the array's slice as a last step
 //! (`steps.push(Step { ty: slice, .. })`) and, when `Index` holds only there, records it on the
@@ -41,16 +46,15 @@ use core::alloc::Allocator;
 use blaze_lir::Flags;
 use blaze_lir::Ty;
 use blaze_lir::builder::MemAttrs;
-use blaze_lir::func::RefKind;
 use blaze_typeck::{AdjustKind, Expr, ExprId, Mutbl, PNode, UintTy, UnOp};
 
-use super::{Callee, Task, V, Walk, malformed, unsupported};
+use super::{Task, V, Walk, malformed, unsupported};
 use crate::{BuildError, Instance};
 
 /// The refusal of a mutable place through an overloaded index (the module doc).
-const MUT_INDEX: &str = "a mutable place through an overloaded index: the check selects `Index` only and records no \
-                         `IndexMut::index_mut` (blaze-typeck rules/field.rs: `IndexMut` selection omitted); needed: the \
-                         check's record that this index expression is a mutable place";
+const MUT_INDEX: &str = "a mutable place through an overloaded index the check did not list as `IndexMut::index_mut` \
+                         (`Checked::index_mut`, blaze-typeck rules/mut_places.rs) and no raw pointer's dereference is \
+                         between: a write or `&mut` through `Index::index`'s shared reference (rustc's E0596/E0594)";
 
 impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// Whether index expression `e` is the builtin element of an array or a slice: the check's
@@ -79,7 +83,9 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         }
         // A `&mut` autoref of the index's own place (a `&mut self` method on `w[i]`).
         let rows = self.adjust_rows(e);
-        if self.checked.adjusts.column::<1>()[rows].iter().any(|k| matches!(k, AdjustKind::Borrow { mutbl: Mutbl::Mut, .. })) {
+        if !self.checked.index_is_mut(e)
+            && self.checked.adjusts.column::<1>()[rows].iter().any(|k| matches!(k, AdjustKind::Borrow { mutbl: Mutbl::Mut, .. }))
+        {
             return Err(unsupported(e, MUT_INDEX));
         }
         // Run first to last: `&base` (its autoderef steps applied), the index, the call, then
@@ -113,14 +119,15 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         Ok(true)
     }
 
-    /// The call of overloaded index `e`: `Index::index` at `[Self, Idx]` with `&Self` and the
-    /// index on top of the value stack (a thin `&[T; n]` widened to `&[T]` first when the
+    /// The call of overloaded index `e`: `Index::index` at `[Self, Idx]` with `&Self`, or
+    /// `IndexMut::index_mut` with `&mut Self` when the check listed `e` (the module doc), and
+    /// the index on top of the value stack (a thin `&[T; n]` widened to `&[T]` first when the
     /// check's array-to-slice step is on the base); leaves the reference it returns, thin or
     /// wide, for the `DerefPlace` after.
     pub(super) fn index_call(&mut self, e: ExprId) -> Result<(), BuildError> {
         let Expr::Index { base, index } = self.expr(e)? else { return Err(malformed("an index call's task on another expression")) };
-        let m = Mutbl::Not;
-        let item = self.adts.index_fn(m).ok_or(BuildError::NoLangFn { expr: Some(e), name: "index" })?;
+        let (m, name) = if self.checked.index_is_mut(e) { (Mutbl::Mut, "index_mut") } else { (Mutbl::Not, "index") };
+        let item = self.adts.index_fn(m).ok_or(BuildError::NoLangFn { expr: Some(e), name })?;
         let widen = match self.array_as_slice(base)? {
             false => None,
             true => {
@@ -160,24 +167,30 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let ipass = self.pass(g_idx, irepr, abi, Some(item))?;
         let rpass = self.pass(g_ret, rrepr, abi, Some(item))?;
         let args = self.ground.intern_list(&[g_self, g_idx]).map_err(|_| malformed("the ground table is full"))?;
-        let place = self.ref_place(Instance { item, args });
-        let reference = self.b.reference(RefKind::Func, place);
-        self.emit_call(Callee::Direct(reference), &[arepr, irepr], &[apass, ipass], rrepr, rpass)
+        // core's `impl Index<I> for [T]` is `#[track_caller]` (walk/track_caller.rs).
+        self.call_instance(Some(e), Instance { item, args }, &[arepr, irepr], &[apass, ipass], None, rrepr, rpass)
     }
 
     /// Refuses place expression `place`, met in a mutable place expression context, when an
-    /// overloaded index is on its path (through parentheses, fields, indexes and dereferences:
-    /// any of them makes the index's place one that is written or uniquely borrowed). Wider
-    /// than rustc's rule (a write through a `*mut T` read out of `v[0]` needs no `IndexMut`):
-    /// a refusal by name, never a wrong method.
+    /// overloaded index is on its path (through parentheses, fields, indexes and dereferences)
+    /// that the check did not list as `IndexMut::index_mut` and that no raw pointer's
+    /// dereference is above (`*v[0] = x` with `v[0]: *mut T` only reads `v[0]`, so
+    /// `Index::index` is right there): a refusal by name, never a write through a shared
+    /// reference.
     pub(super) fn refuse_mut_through_overloaded_index(&self, place: ExprId) -> Result<(), BuildError> {
         let mut e = place;
         loop {
             match self.expr(e)? {
                 Expr::Paren(x) | Expr::Field { base: x, .. } | Expr::TupleField { base: x, .. } => e = x,
-                Expr::Unary { op: UnOp::Deref, operand } => e = operand,
+                Expr::Unary { op: UnOp::Deref, operand } => {
+                    let t = self.adjusted_ty(operand)?;
+                    if matches!(self.types.node(t).map_err(|_| malformed("a type past the record's table"))?, PNode::Ptr(..)) {
+                        return Ok(());
+                    }
+                    e = operand;
+                }
                 Expr::Index { base, .. } => {
-                    if !self.index_builtin(e)? {
+                    if !self.index_builtin(e)? && !self.checked.index_is_mut(e) {
                         return Err(unsupported(e, MUT_INDEX));
                     }
                     e = base;

@@ -448,8 +448,9 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     }
 
     /// The bindings of pattern `root` (which matched) at `at`: each by its binding mode, a
-    /// reference to its part or a copy of it. An or-pattern whose alternatives bind was bound
-    /// by `test_pat`, on the pass of the alternative that matched.
+    /// reference to its part or a copy of it, a by-value one owned in declaration order. An
+    /// or-pattern whose alternatives bind was bound by `test_pat`, on the pass of the
+    /// alternative that matched.
     pub(super) fn bind_tested(&mut self, root: PatId, at: At) -> Result<(), BuildError> {
         self.bind_with(root, at, &[])
     }
@@ -511,7 +512,12 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     let a = self.peel(p, at)?;
                     parts.clear();
                     self.parts(p, a, &mut parts)?;
-                    for &x in parts.iter() {
+                    // Pushed last first, so they pop as written: each binding is owned (joins
+                    // `scope_pats`) in declaration order, pre-order and left to right as walk.rs
+                    // `own_pat` does, and the scope drops them in reverse ("Destructors": a
+                    // pattern's variables drop in reverse order of declaration; the switch's
+                    // walk.rs `bind_variant` and `own_pat` give the same order).
+                    for &x in parts.iter().rev() {
                         todo.push(x);
                     }
                 }

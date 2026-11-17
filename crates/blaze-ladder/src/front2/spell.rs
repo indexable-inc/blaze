@@ -5,12 +5,15 @@
 //! [`Unspelled`] refusal, never a guess.
 
 use std::alloc::Global;
+use std::boxed::Box;
 
 use blaze_hash::HashMap;
+use blaze_id::ItemKey as LibKey;
 use blaze_lower::View;
 use blaze_lower::form::NameIdx;
 use blaze_typeck::Name;
 
+use super::source::NamesSource;
 use super::types::Why;
 
 /// The path heads blaze-lower writes as synthetic segments (blaze-lower's `push_segments`).
@@ -60,4 +63,28 @@ impl<'b> Spelling<'b> {
     pub fn get(&self, n: Name) -> Result<&'b str, Unspelled> {
         self.by_name.get(&n).copied().ok_or(Unspelled(n))
     }
+}
+
+/// Why a name could not be spelled from an item's own text ([`spell_in_item`]).
+#[derive(Debug)]
+pub enum ItemUnspelled {
+    /// The names library holds no text for the item.
+    NoText(LibKey),
+    /// Its head did not lower (heads.rs `lower`).
+    Head(super::heads::HeadError),
+    /// Its lowering's names did not read back.
+    Names(Why),
+    /// Its lowering interns no such name.
+    Absent(LibKey, Unspelled),
+}
+
+/// The spelling of `n` in the head of `item` as its own text writes it: a name a finding
+/// carries that the body never wrote (E0063's unwritten field, named by the ADT's head). The
+/// item's head is lowered again from its text and read as a body's is ([`Spelling::of`]).
+pub fn spell_in_item<'n, S: NamesSource<'n>>(names: S, item: LibKey, n: Name) -> Result<Box<str>, ItemUnspelled> {
+    let text = names.text_of(item).ok_or(ItemUnspelled::NoText(item))?.text;
+    let low = super::heads::lower(names, item, text).map_err(ItemUnspelled::Head)?;
+    let view = low.view();
+    let spell = Spelling::of(&view).map_err(ItemUnspelled::Names)?;
+    spell.get(n).map(Box::from).map_err(|u| ItemUnspelled::Absent(item, u))
 }

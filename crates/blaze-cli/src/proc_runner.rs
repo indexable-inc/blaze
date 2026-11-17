@@ -42,6 +42,8 @@ use blaze_own::Alloc;
 pub(crate) struct MacroSide<'s, 'p, 'r> {
     pub lock: &'s crate::fetch::Lockfile<'s>,
     pub place: crate::macros::Place<'p, 'r>,
+    /// The process's heap, handed from `main` (`FetchEnv::heap`): the runtime's.
+    pub heap: &'static blaze_own::Heap,
 }
 
 /// Why the runner could not be made: names what and where (rule 19).
@@ -72,6 +74,9 @@ pub(crate) enum MakeError {
     EnvList { krate: std::string::String, why: blaze_proc_macro::package_env::PackageEnvError },
     /// A member whose dir no sandbox can mount at `/workspace/<dir>` (D96).
     MemberDir { krate: std::string::String, why: std::string::String },
+    /// The crate's environment gives a path variable another value than where its package's
+    /// files are served (D96: one mount row; blaze-proc-macro `Package::new`).
+    SeenMismatch { krate: std::string::String, why: blaze_proc_macro::sandbox::SeenMismatch },
 }
 
 impl core::fmt::Display for MakeError {
@@ -88,6 +93,7 @@ impl core::fmt::Display for MakeError {
             MakeError::GivenTwice { krate } => write!(f, "{krate}: the proc-macro runner was given two packages for this one crate"),
             MakeError::EnvList { krate, why } => write!(f, "{krate}: the variables a proc macro called in it is shown: {why}"),
             MakeError::MemberDir { krate, why } => write!(f, "{krate}: {why}"),
+            MakeError::SeenMismatch { krate, why } => write!(f, "{krate}: {why}"),
         }
     }
 }
@@ -109,7 +115,7 @@ mod with_sandbox {
     use blaze_proc_macro::module::{LockedPackages, ModuleError, module_key, read_module};
     use blaze_scope::resolve::SourceTexts;
     use blaze_world::procs::files::{PackageAt, sandbox_files};
-    use blaze_world::procs::{git_folders, identify_files};
+    use blaze_world::procs::{git_folders, identify};
 
     /// The runner: see the module's doc.
     pub(crate) struct ProcRunner<'r> {
@@ -159,9 +165,8 @@ mod with_sandbox {
         let text = core::str::from_utf8(side.lock.text).map_err(|_| MakeError::LockText)?;
         let locked = LockedPackages::read(text);
         let folders = git_folders(&modules).map_err(|e| MakeError::Store(e.to_string()))?;
-        // D102: blaze-cli's entry does not hand its heap down yet (program.rs says the same);
-        // the runtime takes the process heap, named here at the edge.
-        let runtime = blaze_proc_macro::host::Runtime::new(blaze_own::Heap::process()).map_err(|e| MakeError::Runtime(e.to_string()))?;
+        // The process's heap, handed from `main` through the side (D102, D120).
+        let runtime = blaze_proc_macro::host::Runtime::new(side.heap).map_err(|e| MakeError::Runtime(e.to_string()))?;
         let runtime: &'static blaze_proc_macro::host::Runtime = std::boxed::Box::leak(std::boxed::Box::new_in(runtime, Global));
         let records = blaze_proc_macro::record::DirStore::new(&modules.join("proc-macro/expansions"));
         let records: &'static blaze_proc_macro::record::DirStore = std::boxed::Box::leak(std::boxed::Box::new_in(records, Global));
@@ -189,14 +194,17 @@ mod with_sandbox {
             // a lib and a bin of one package are two callers (proc_env.rs, rule 21).
             let named = || std::format!("{} {} (crate {})", krate.package, krate.version, krate.input.name);
             let env = world.texts.crate_env(at).ok_or_else(|| MakeError::NoEnv { krate: named() })?;
-            let package = crate::proc_env::unit_package(env, files).map_err(|why| MakeError::EnvList { krate: named(), why })?;
+            let package = crate::proc_env::unit_package(env, files).map_err(|error| match error {
+                crate::proc_env::UnitPackageError::Env(why) => MakeError::EnvList { krate: named(), why },
+                crate::proc_env::UnitPackageError::Seen(why) => MakeError::SeenMismatch { krate: named(), why },
+            })?;
             callers.put(at, Arc::new(package)).map_err(|_| MakeError::GivenTwice { krate: named() })?;
             let blaze_world::Origin::Unit(unit) = krate.origin else { continue };
             if !krate.proc_macro {
                 continue;
             }
             let unit = &graph.units[unit.0 as usize];
-            let identity = identify_files(side.lock.lock, &locked, &folders, unit, |id| side.place.member_files(id)).map_err(|e| MakeError::Store(e.to_string()))?;
+            let identity = identify(side.lock.lock, &locked, &folders, unit, |id| Ok(side.place.member_files(id))).map_err(|e| MakeError::Store(e.to_string()))?;
             // No identity: the `MacroModule` task's failure names the crate; it gets no key.
             let Ok(identity) = identity else { continue };
             let (key, module) = identity.with_id(|id| (crate_key(&module_key(id)), read_module(&modules, id)));

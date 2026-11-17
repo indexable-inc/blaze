@@ -15,7 +15,6 @@ use std::vec::Vec;
 
 use blaze_id::ItemKey as LibKey;
 use super::body::Body;
-use blaze_own::Alloc;
 use blaze_scope::resolve::Names;
 use blaze_typeck as tc;
 use blaze_typeck::{BodyView, InferCtx, ItemKey, Name, Needs, Outcome, Question};
@@ -48,6 +47,9 @@ pub struct BodyScope<'s> {
     pub traits: &'s [ItemKey],
     /// The traits in scope at the body's blocks whose list is not `traits`.
     pub blocks: &'s super::block_traits::BlockTraits,
+    /// Parallel to the checked body's paths: each path's first word's mark (blaze-lower
+    /// `TypeckBody::path_marks`), where `BodyWorld::path` reads it.
+    pub path_marks: &'s [Option<blaze_lower::mark_site::TextMark>],
 }
 
 /// Why a body did not check.
@@ -81,7 +83,8 @@ pub enum CheckFail {
     Resolve { owner: ItemKey, item: ItemKey, error: tc::ResolveError, args: Box<str> },
     /// `owner`'s body, checked again in this run, read other answers than its first check:
     /// two read-list digests under one owner (front2 body_reads.rs `Digests::file`; rule 21).
-    ReadsDiffer { owner: ItemKey },
+    /// `diff` names the rows that differ (rule 19).
+    ReadsDiffer { owner: ItemKey, diff: Box<super::body_reads::ReadsDiff> },
 }
 
 impl core::fmt::Display for CheckFail {
@@ -109,7 +112,7 @@ impl core::fmt::Display for CheckFail {
                 Ok(())
             }
             CheckFail::Rounds { owner, last } => write!(f, "checking {owner:?}: still needs {last:?} after {MOST_ROUNDS} rounds"),
-            CheckFail::ReadsDiffer { owner } => write!(f, "checking {owner:?} again read other answers than its first check: two read-list digests under one body (rule 21)"),
+            CheckFail::ReadsDiffer { owner, diff } => write!(f, "checking {owner:?} again read other answers than its first check: two read-list digests under one body (rule 21): {diff}"),
             CheckFail::Resolve { owner, item, error, args } => write!(f, "in {owner:?}, the call of {item:?} at [{args}]: {error}"),
             CheckFail::Const { owner, key, shown, error } => write!(f, "checking {owner:?}: the constant {key:?} ({shown}) an array length names: {error:?}"),
         }
@@ -186,7 +189,9 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
     stalls: super::stalled_goals::Stalls,
 ) -> Result<tc::Checked<'static>, CheckFail> {
     let owner = body.typeck.owner;
-    let mut hints = Needs::new_in(Alloc::global());
+    // The store's allocator: the checked body outlives the round (`Checked<'static>`).
+    let alloc = r.store.tys.alloc();
+    let mut hints = Needs::new_in(alloc);
     let mut all_gaps: Vec<Gap, Global> = Vec::new_in(Global);
     // The opaques whose hidden types this check reads, grown only by its own gaps
     // (front2/opaque_auto.rs): its answers never depend on what was checked before it.
@@ -196,12 +201,12 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
         let tys = body.tys.view(&r.store.tys).map_err(|error| CheckFail::Check { owner, error })?;
         let view: BodyView<'_> = body.typeck.view(tys);
         let world = world_at(r, scope);
-        let mut cx = InferCtx::new_in(Alloc::global());
+        let mut cx = InferCtx::new_in(alloc);
         let out = match &mut count {
-            Some((tally, clock)) => tc::check_counted(&view, &world, &mut cx, &hints, tally, *clock, Alloc::global()),
+            Some((tally, clock)) => tc::check_counted(&view, &world, &mut cx, &hints, tally, *clock, alloc),
             // Stalled goals decided after the async bodies' flows (front2 stalled_goals.rs).
-            None if stalls == super::stalled_goals::Stalls::Decide => tc::check_deferring(&view, &world, &mut cx, &hints, Alloc::global()),
-            None => tc::check(&view, &world, &mut cx, &hints, Alloc::global()),
+            None if stalls == super::stalled_goals::Stalls::Decide => tc::check_deferring(&view, &world, &mut cx, &hints, alloc),
+            None => tc::check(&view, &world, &mut cx, &hints, alloc),
         };
         // An auto trait of another fn's opaque: its defining body filed (checked only if no
         // clean check of it is filed yet), the opaque leaked to this check, the round again.
@@ -250,11 +255,10 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
                     asked.finished = Some(done.reads.clone());
                 }
                 // Each filed where its tokens came from, before it leaves the task that made it
-                // (drive.md, ruled 20:57). `Alloc::global()` as this loop's other three: to be
-                // handed down with them.
+                // (drive.md, ruled 20:57), in the store's allocator as this loop's other three.
                 let lib = r.keys.library_in(r.names, owner);
                 let mut filed = Vec::with_capacity_in(diags.len(), Global);
-                filed.extend(diags.iter().map(|(_, at, _)| super::expansion_origin::file_range(r.names, lib, *at, Alloc::global())));
+                filed.extend(diags.iter().map(|(_, at, _)| super::expansion_origin::file_range(r.names, lib, *at, alloc)));
                 return Err(CheckFail::Diags { owner, diags, filed });
             }
             Outcome::Done(done) if !round_gaps => return Ok(done),
@@ -516,26 +520,44 @@ pub(super) fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, spell: 
                 tc::Because::NoSegment => String::from("the path written here (the body keeps no segment of it to name)"),
                 tc::Because::Unmet { .. } | tc::Because::NoLangItem(_) | tc::Because::Path(_) => format!("{other:?}"),
             };
-            node_about(Some(why), ty(d.found), ty(d.expected), spell, d.name)
+            node_about(Some(why), ty(d.found), ty(d.expected), d.name.map(|n| name_about(r, spell, tys, d.found, n)))
         }
-        None => node_about(None, ty(d.found), ty(d.expected), spell, d.name),
+        None => node_about(None, ty(d.found), ty(d.expected), d.name.map(|n| name_about(r, spell, tys, d.found, n))),
     };
     s.into_boxed_str()
 }
 
+/// The name a finding looked up, by its spelling: the body's where the body wrote it, else the
+/// found type's own head where that is an ADT (E0063's unwritten field: the ADT declares it,
+/// the body never wrote it; rule 19). Unspelled in both, it is said so with both whys.
+fn name_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, spell: &Spelling<'_>, tys: tc::PTys<'_>, found: Option<tc::PTy>, n: tc::Name) -> String {
+    let unspelled = match spell.get(n) {
+        Ok(text) => return format!("about `{text}`"),
+        Err(u) => u,
+    };
+    let adt = match found.map(|t| tys.node(t)) {
+        Some(Ok(tc::PNode::Adt(k, _))) => k,
+        _ => return format!("about {unspelled:?} (a name the body does not spell)"),
+    };
+    let Some(lib) = r.keys.library_in(r.names, adt) else {
+        return format!("about {unspelled:?} (a name the body does not spell, in {} which is no library item)", item_shown(r, adt));
+    };
+    match super::spell::spell_in_item(r.names, lib, n) {
+        Ok(text) => format!("about `{text}`"),
+        Err(why) => format!("about {unspelled:?} (a name neither the body nor {}'s head spells: {why:?})", item_shown(r, adt)),
+    }
+}
+
 /// A node's finding in words: its reason where it has one, then the type found, the type
-/// expected and the name looked up (by its spelling), each only where the finding holds it.
-/// A finding holding none of them is not built (blaze-typeck diag/about.rs); one met anyway
-/// is said to be empty, never printed as `None`s.
-fn node_about(why: Option<String>, found: Option<String>, expected: Option<String>, spell: &Spelling<'_>, name: Option<tc::Name>) -> String {
+/// expected and the name looked up (spelled by [`name_about`]), each only where the finding
+/// holds it. A finding holding none of them is not built (blaze-typeck diag/about.rs); one met
+/// anyway is said to be empty, never printed as `None`s.
+fn node_about(why: Option<String>, found: Option<String>, expected: Option<String>, name: Option<String>) -> String {
     let mut parts: Vec<String, Global> = Vec::new_in(Global);
     parts.extend(why);
     parts.extend(found.map(|t| format!("found `{t}`")));
     parts.extend(expected.map(|t| format!("expected `{t}`")));
-    parts.extend(name.map(|n| match spell.get(n) {
-        Ok(text) => format!("about `{text}`"),
-        Err(unspelled) => format!("about {unspelled:?} (a name the body does not spell)"),
-    }));
+    parts.extend(name);
     if parts.is_empty() {
         return String::from("a finding with nothing in it (no reason, type or name: a checker bug)");
     }
@@ -616,8 +638,10 @@ pub(super) fn world_at<'w, 'n, S: NamesSource<'n>>(r: &'w Records<'_, 'n, S>, sc
         spell: scope.spell,
         traits: scope.traits,
         blocks: scope.blocks,
+        path_marks: scope.path_marks,
         fills: core::cell::RefCell::new(Vec::new_in(Global)),
         gaps: core::cell::RefCell::new(Vec::new_in(Global)),
+        reveal: super::opaque_auto::Reveal::InBody,
     }
 }
 
@@ -667,9 +691,12 @@ pub fn callee_target<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,scope: &
     if holds_param(ground.view(), args).map_err(|error| CheckFail::Check { owner, error })? {
         return Ok(Target::AtInstance(item));
     }
+    let alloc = r.store.tys.alloc();
     for _ in 0..MOST_ROUNDS {
-        let world = world_at(r, scope);
-        let out = tc::resolve_instance(&world, item, args, ground, Alloc::global());
+        // A callee resolved at ground types after its body has checked is post-analysis: it
+        // sees every opaque's hidden type, not only the body's leak list.
+        let world = BodyWorld { reveal: super::opaque_auto::Reveal::All, ..world_at(r, scope) };
+        let out = tc::resolve_instance(&world, item, args, ground, alloc);
         let mut fills = world.fills.into_inner();
         if r.order == BuildOrder::Reversed {
             fills.reverse();
@@ -930,6 +957,22 @@ fn make_once<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> R
     match fill {
         Fill::Store(want) => r.store.ensure(r.names, r.keys, want).map_err(MakeFail::Head),
         Fill::Impls(trait_, shape) => {
+            // `trait_home` reads the trait's head when one is made (whether each parameter
+            // defaults to `Self`) and the text's count when none is. A head made only after a
+            // question's first answer gave a later answer of the same question another home,
+            // other candidates and another gap, so two checks of one body read two answers
+            // under one key (rule 21; census 7: k256's `<impl ProjectivePoint>::GENERATOR`).
+            // So the head is made first, and the home is the head's whenever it can be made. A
+            // head its text refuses (`TransmuteFrom`'s const parameter) is refused at every
+            // ask, so its question's home is the text's at every ask; one that waits on a
+            // constant goes up as any head's wait does (`make` evaluates it and asks again).
+            if let Some(lib) = r.keys.library_in(r.names, trait_) {
+                match r.store.ensure(r.names, r.keys, Want::Head(lib)) {
+                    Ok(()) => {}
+                    Err(wait @ HeadError::Item(_, Why::NeedConst(..))) => return Err(MakeFail::Head(wait)),
+                    Err(_refused_by_its_text) => {}
+                }
+            }
             // Only impls written where the orphan rules allow (`trait_home`) are candidates.
             let home = trait_home(r.names, r.keys, r.store, trait_, shape);
             let b = buckets_for(r.buckets, r.names, r.index, home);
@@ -945,14 +988,22 @@ fn make_once<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> R
             lower_heads(r.names, r.keys, r.store, b, candidates, r.order)?;
             b.answer(r.store, trait_, shape, home).map_err(MakeFail::Buckets)
         }
-        Fill::Inherent(shape) => {
+        Fill::Inherent(shape, name) => {
             // Only impls written in the type's own crate (`inherent_home`) are candidates.
             let home = inherent_home(r.names, r.keys, shape);
-            let b = buckets_for(r.buckets, r.names, r.index, home);
-            b.admit_asked(r.names, r.keys, home, super::buckets::Ask::Inherent(shape));
-            let candidates = b.inherent_candidates(shape, home);
-            lower_heads(r.names, r.keys, r.store, b, candidates, r.order)?;
-            b.answer_inherent(r.store, shape, home).map_err(MakeFail::Buckets)
+            let names = r.names;
+            let b = buckets_for(r.buckets, names, r.index, home);
+            b.admit_asked(names, r.keys, home, super::buckets::Ask::Inherent(shape));
+            // The name filters first, from the impls' member rows (no header made): an impl
+            // that declares no member of the name is never the answer, so its header is not
+            // lowered for it. rustc finds an inherent item by name before it unifies self
+            // types; without this filter `<U1792>::LIMBS` in the header of crypto-bigint's
+            // `impl Uint<{ <U1792>::LIMBS / 2 }> { fn concat .. }` made that very header
+            // (census 7: "an array length names: Nested", 169 fns).
+            let mut candidates = b.inherent_candidates(shape, home);
+            candidates.retain(|&k| super::member_names::may_declare(names, k, name));
+            lower_heads(names, r.keys, r.store, b, candidates.clone(), r.order)?;
+            b.answer_inherent(r.store, shape, name, &candidates).map_err(MakeFail::Buckets)
         }
     }
 }

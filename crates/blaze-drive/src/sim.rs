@@ -18,7 +18,7 @@ use blaze_own::{Alloc, Vec};
 use blaze_sim::{Broke, Config as SimConfig, Tape, check, control};
 
 use crate::Plant;
-use crate::answers::{read_last, read_page, read_root};
+use crate::answers::{PageView, read_last, read_root};
 use crate::condition::{Condition, Space, Var};
 use crate::key::{self, Key, Kind, Name, Tool};
 use crate::record::{Finding, Locate, Part, PathOf};
@@ -48,6 +48,8 @@ struct Item {
 struct Member {
     version: u64,
     files: StdVec<usize>,
+    /// The members it depends on: its record lists their `Units` (run_scope.rs).
+    deps: StdVec<usize>,
 }
 
 fn member_path(member: usize) -> StdVec<u8> {
@@ -66,7 +68,7 @@ fn units_source(files: &[FileEntry<'_>]) -> ContentId {
 }
 
 fn member_id(member: &Member) -> ContentId {
-    key::digest("sim member manifest", &member.version.to_le_bytes())
+    key::digest("sim member manifest", format!("{} {:?}", member.version, member.deps).as_bytes())
 }
 
 #[derive(Clone, Debug)]
@@ -104,6 +106,17 @@ struct World {
     edited_at_run: Option<usize>,
     /// The control's plant handed to `verified::verify` by the fake executor.
     verify_plant: Plant,
+    /// Some bodies' checks stop short: each holds a [`NOT_CHECKED_RULE`] finding, no error, as
+    /// blaze-cli's `types-not-checked` (the gate cases).
+    unchecked: bool,
+    /// The executor's own plant for the read-list case ([`ReadBug`]).
+    read_bug: ReadBug,
+    /// No manifest and no file holds a finding: only bodies do (the scope cases).
+    quiet: bool,
+    /// `run` is given member 0 as its program package ([`Request::with_member_closure`]).
+    closure: bool,
+    /// The files whose bodies the running program may want; `None`: any file's.
+    wants_from: Option<StdVec<usize>>,
 }
 
 /// A crate of the names step: its identity (what blaze-world's `UnitInput::key` hashes), the
@@ -333,6 +346,11 @@ impl World {
             failing_file: None,
             edited_at_run: None,
             verify_plant: Plant::None,
+            unchecked: false,
+            read_bug: ReadBug::None,
+            quiet: false,
+            closure: false,
+            wants_from: None,
         }
     }
 
@@ -458,10 +476,15 @@ fn execute(world: &World, task: &Task<'static>) -> Result<Answered, Broke> {
             }
             let mut parts: StdVec<Part> =
                 member.files.iter().map(|f| Part { name: file_name(*f), locate: Locate::File { edition: EDITION }, place: file_place(*f) }).collect();
+            // Each member it depends on, as the root lists it.
+            parts.extend(member.deps.iter().map(|d| Part { name: Name::manifest(&member_path(*d)), locate: Locate::File { edition: 0 }, place: 0 }));
             parts.sort_by_key(|part| part.name);
-            let out = key::digest("sim member out", format!("{k} {}", member.version).as_bytes());
+            let out = key::digest("sim member out", format!("{k} {} {:?}", member.version, member.deps).as_bytes());
             let line = u32::try_from(k).unwrap_or(u32::MAX);
-            let findings = std::vec![(2, line, line + 1, format!("member {k} version {}", member.version).into_bytes())];
+            let findings = match world.quiet {
+                true => StdVec::new(),
+                false => std::vec![(2, line, line + 1, format!("member {k} version {}", member.version).into_bytes())],
+            };
             done(out, StdVec::new(), parts, findings)
         }
         Kind::Units => {
@@ -526,13 +549,15 @@ fn execute(world: &World, task: &Task<'static>) -> Result<Answered, Broke> {
             let out = key::digest("sim file out", format!("{:?}", parts).as_bytes());
             // A file of an even count of items has a finding on its own text, at 1..2.
             let findings = match world.files[f].len() % 2 {
-                0 => std::vec![(1, 1, 2, format!("file {f}").into_bytes())],
+                0 if !world.quiet => std::vec![(1, 1, 2, format!("file {f}").into_bytes())],
                 _ => StdVec::new(),
             };
             done(out, StdVec::new(), parts, findings)
         }
         Kind::Signature | Kind::BodyCheck => {
-            let (f, i) = world.item_of(task.base).ok_or(Broke::Harness(format!("no item for {name}")))?;
+            // No file holds the item: the machine ran a name no home lists (one dropped and
+            // entered again, [`removals`]), its bug, not the harness's.
+            let (f, i) = world.item_of(task.base).ok_or(Broke::Oracle(format!("{name} ran, and no file holds its item: a dropped name entered again")))?;
             let item = &world.files[f][i];
             // Its cfg reads first: one the condition does not fix is `Need(Cfg(variable))`.
             let mut values = StdVec::new();
@@ -562,10 +587,14 @@ fn execute(world: &World, task: &Task<'static>) -> Result<Answered, Broke> {
                 Err(lacking) => Ok(Answered::Need(lacking)),
                 Ok(reads) => {
                     let out = item_out(value, &reads, &values);
-                    let findings = match finding(world, name.kind, &out) {
+                    let mut findings = match finding(world, name.kind, &out) {
                         Some(message) => std::vec![(7, 0, 1, message)],
                         None => StdVec::new(),
                     };
+                    // A body whose check stopped short says so (about 3 in 8 of them).
+                    if world.unchecked && name.kind == Kind::BodyCheck && out.0[1] < 96 {
+                        findings.push((NOT_CHECKED_RULE, 1, 2, b"not checked: the sim's checker stopped short".to_vec()));
+                    }
                     done(out, reads, StdVec::new(), findings)
                 }
             }
@@ -602,8 +631,16 @@ fn execute(world: &World, task: &Task<'static>) -> Result<Answered, Broke> {
             true => Ok(Answered::Failed(TaskFailure { name, why: Why::Refused { what: "a proc-macro module the store lacks", rule: "sim" } })),
             false => done(task.source, StdVec::new(), StdVec::new(), StdVec::new()),
         },
+        // The program's image (sim_natives.rs simulates what it reads): here it reads nothing,
+        // its out its source, so the gate cases start the program from its key.
+        Kind::Native if name == sim_native() => done(task.source, StdVec::new(), StdVec::new(), StdVec::new()),
         kind => Err(Broke::Harness(format!("the sim has no {} task", kind.name()))),
     }
+}
+
+/// The program `run` names in the gate cases: its image is a `Native` task of no reads.
+fn sim_native() -> Name {
+    Name::native(&key::digest("sim crate key", b"0"), b"aarch64-apple-darwin", b"dev")
 }
 
 // --- One request, driven ----------------------------------------------------------------------
@@ -613,6 +650,8 @@ struct Ended {
     error: Option<DriveError>,
     /// Runs emitted, by kind (in-place re-entries not counted: the coordinator never saw them).
     runs: BTreeMap<Kind, u32>,
+    /// Each task run, by name, in the order emitted.
+    ran: StdVec<Name>,
     prints: StdVec<(Name, u16, u32, u32, StdVec<u8>, Option<StdVec<u8>>, u32)>,
     last: Option<StdVec<u8>>,
     /// Records handed back in `Done` outcomes.
@@ -643,9 +682,18 @@ struct Setup {
 
 const SIM_TOOL: &[u8] = b"tool";
 
-/// Every finding is an error in the sim: `run` fails on lints too.
-fn every_rule(_: u16) -> bool {
-    true
+/// Every finding is an error in the sim (`run` fails on lints too), but the one that says its
+/// item was not checked, which is no error of the program (blaze-cli's `types-not-checked`).
+fn every_rule(rule: u16) -> bool {
+    rule != NOT_CHECKED_RULE
+}
+
+/// The rule of a body whose check stopped short ([`World::unchecked`]).
+const NOT_CHECKED_RULE: u16 = 0x0C18;
+
+/// The sim's not-checked policy ([`Request::with_not_checked`]).
+fn not_checked(rule: u16) -> bool {
+    rule == NOT_CHECKED_RULE
 }
 
 fn config(workers: u32, tool: &[u8]) -> Config {
@@ -678,7 +726,7 @@ fn config_moved(workers: u32, tool: &[u8], moved: Option<Kind>, split: Split) ->
     Config { tool: whole, tools, workers, most_entries: 32, most_jobs: 1 << 20, is_error: every_rule }
 }
 
-const ASK: Ask<'static> = Ask { command: Command::Check, args: b"", gate: Gate::Beside, space: Space::NONE };
+const ASK: Ask<'static> = Ask { command: Command::Check, args: b"", gate: Gate::Beside, space: Space::NONE, program: None, facts: &[] };
 
 /// 1, 2 or 16 workers, as the tape picks.
 fn workers(tape: &Tape) -> u32 {
@@ -728,6 +776,17 @@ fn work(world: &World, store: &Store, table: &Settled<Global>, tasks: StdVec<(Ti
                         continue;
                     }
                     answered.push((ticket, Answered::Need(left.iter().copied().collect()), in_place));
+                }
+                // The planted checker: each signature a body read is reported at a digest of
+                // its input's out and the store's record count, which moves as records are
+                // written (tempo's head digest, taken from a memo that depends on what the
+                // process checked before, 2026-11-17).
+                Answered::Done(mut made) if world.read_bug == ReadBug::ReadsFromStoreState && made.name.kind == Kind::BodyCheck => {
+                    let held = format!("{}", store.records.len());
+                    for (_, saw) in made.reads.iter_mut() {
+                        *saw = key::digest("sim read from store state", &[&saw.0[..], held.as_bytes()].concat());
+                    }
+                    answered.push((ticket, Answered::Done(made), in_place));
                 }
                 done => answered.push((ticket, done, in_place)),
             }
@@ -783,13 +842,18 @@ fn request_with(
         setup.ask,
         setup.plant,
         blaze_own::testing::heap().alloc(),
-    );
+    )
+    .with_not_checked(not_checked);
+    if world.closure {
+        req = req.with_member_closure(Name::manifest(&member_path(0)));
+    }
     let table: Settled<Global> = Settled::new_in(1 << 12, Global);
     let mut out: Vec<Effect<'static>, Alloc<'static>> = Vec::new_in(blaze_own::testing::heap().alloc());
     let mut ended = Ended {
         answer: None,
         error: None,
         runs: BTreeMap::new(),
+        ran: StdVec::new(),
         prints: StdVec::new(),
         last: None,
         delivered: 0,
@@ -806,8 +870,10 @@ fn request_with(
     let mut opens: StdVec<Name> = StdVec::new();
     // The program, once started: it wants a body now and then, and exits when the tape says.
     let mut running = false;
-    let bodies: StdVec<Name> =
-        (0..world.files.len()).flat_map(|f| (0..world.files[f].len()).map(move |i| body_name(f, i))).collect();
+    let bodies: StdVec<Name> = (0..world.files.len())
+        .filter(|f| world.wants_from.as_ref().is_none_or(|from| from.contains(f)))
+        .flat_map(|f| (0..world.files[f].len()).map(move |i| body_name(f, i)))
+        .collect();
     let graph = world.lock.as_ref().map(graph_source);
     let mut first = Some(Event::Start { files: &files, gone: &[], last, units, cold: false, graph });
     // The program's exit has been stepped: a stopped program's exit is an event too, not a
@@ -863,6 +929,7 @@ fn request_with(
                             name: made.name,
                             out: made.out,
                             reads: &made.reads,
+                            cells: &[],
                             parts: &made.parts,
                             paths,
                             findings,
@@ -931,6 +998,7 @@ fn request_with(
                             return Err(Broke::Oracle(format!("single flight: {} ran twice at once", task.name)));
                         }
                         *ended.runs.entry(task.name.kind).or_insert(0) += 1;
+                        ended.ran.push(task.name);
                         tasks.push((ticket, task));
                     }
                     batches.push((batch.id, tasks));
@@ -1011,19 +1079,20 @@ fn table(store: &Store, last: &[u8]) -> Result<Table, Broke> {
             continue;
         }
         let bytes = store.records.get(page_key).ok_or(Broke::Oracle(String::from("a page is not stored")))?;
-        for (name, row) in read_page(bytes, blaze_own::testing::heap().alloc()).map_err(wire)?.iter() {
+        let page = PageView::open(bytes).map_err(|error| Broke::Oracle(format!("a stored page is not one: {error}")))?;
+        for row in page.rows() {
             table.insert(
-                *name,
+                row.name(),
                 (
-                    row.key,
-                    row.at,
-                    row.source,
-                    row.out,
-                    row.home,
-                    row.place,
-                    row.reads.as_slice().to_vec(),
-                    row.parts.as_slice().to_vec(),
-                    row.readers.as_slice().to_vec(),
+                    row.key(),
+                    row.at(),
+                    row.source(),
+                    row.out(),
+                    row.home(),
+                    row.place(),
+                    row.reads().iter().collect(),
+                    row.parts().iter().collect(),
+                    row.readers().iter().collect(),
                 ),
             );
         }
@@ -1112,6 +1181,59 @@ fn an_incremental_answer_equals_a_fresh_build() {
     check(SimConfig::cases(300), |tape| edits(tape, Plant::None));
 }
 
+// --- A read list is a function of the text and the inputs ------------------------------------
+
+/// The executor's plant for the read-list case: none, or a body that reports each signature it
+/// read at a digest of what the store holds, not at the out it was handed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReadBug {
+    None,
+    ReadsFromStoreState,
+}
+
+/// The most entries a job settles within here: a run that asks its needs, the run handed them,
+/// and one more for each of two inputs re-made while it was out. A run asks each need once,
+/// since what it reads follows from its text and its inputs, never from the store, so its read
+/// list at a settle is the one it asked for: no entry finds a read it was not handed.
+const MOST_SETTLE_ENTRIES: usize = 4;
+
+/// The request ended with no error, and no job settled after more than [`MOST_SETTLE_ENTRIES`].
+fn within_bound(what: &str, ended: &Ended) -> Result<(), Broke> {
+    if let Some(error) = ended.error {
+        return Err(Broke::Oracle(format!("{what}: a task's read list is not a function of its text and inputs: {error}")));
+    }
+    let answer = ended.answer.ok_or(Broke::Harness(format!("{what}: no answer")))?;
+    let hist = answer.profile.entries_hist;
+    let over: u32 = hist[MOST_SETTLE_ENTRIES + 1..].iter().sum();
+    oracle(over == 0, || format!("{what}: {over} jobs settled after more than {MOST_SETTLE_ENTRIES} entries (by entries 0|1|2|3|4|5-8|9-16|more: {hist:?})"))
+}
+
+fn settles_within_bound(tape: &Tape, bug: ReadBug) -> Result<(), Broke> {
+    let mut world = World::draw(tape);
+    world.read_bug = bug;
+    let mut store = Store::default();
+    let first = request(tape, &world, None, &mut store, None, Plant::None)?;
+    within_bound("a first build", &first)?;
+    let next = edit(tape, &world, 0, tape.one_in(2, "body or signature"));
+    let second = request(tape, &next, Some(&world), &mut store, first.last.as_deref(), Plant::None)?;
+    within_bound("an edit", &second)
+}
+
+/// Every job settles within [`MOST_SETTLE_ENTRIES`] entries, cold and after an edit.
+/// Expected: "test sim::every_task_settles_within_its_bound ... ok".
+#[test]
+fn every_task_settles_within_its_bound() {
+    check(SimConfig::cases(300), |tape| settles_within_bound(tape, ReadBug::None));
+}
+
+/// A body whose read digests follow from the store's state, not its inputs, is refused by name
+/// (`ReadNotHanded`, or `Reentries` naming its last two entries), never left to loop.
+/// Expected: "test sim::control_a_read_list_from_store_state_is_caught ... ok".
+#[test]
+fn control_a_read_list_from_store_state_is_caught() {
+    control(SimConfig::cases(300), ReadBug::None, ReadBug::ReadsFromStoreState, "is not a function of its text and inputs", settles_within_bound);
+}
+
 #[test]
 fn control_a_skipped_changed_read_is_caught() {
     control(SimConfig::cases(2000), Plant::None, Plant::SkipChangedRead, "differs from a fresh build", edits);
@@ -1122,6 +1244,83 @@ fn control_a_skipped_changed_read_is_caught() {
 #[test]
 fn control_an_edition_kept_as_a_place_is_caught() {
     control(SimConfig::cases(2000), Plant::None, Plant::EditionAsPlace, "edition", edits);
+}
+
+// --- A dropped name is entered nothing again --------------------------------------------------
+
+/// An edit that removes the last item of a file whose body called other items, and moves the
+/// signature of each item that body called; every other item's use of the removed one goes
+/// with it. The removed body's reads move before or after its home drops it, in the order the
+/// tape completes them: blaze-cli's `records_outlive_the_packs_merge`, where a removed fn's body
+/// read its file's moved `Surface` and more, and the request stopped as a cycle of that one body
+/// (2026-11-17). `None`: no file has such an item.
+fn removal(tape: &Tape, world: &World, serial: u64) -> Option<World> {
+    let calling = |f: &usize| {
+        let items = &world.files[*f];
+        items.len() > 1 && items.last().is_some_and(|item| item.calls.iter().any(|call| *call != (*f, items.len() - 1)))
+    };
+    let candidates: StdVec<usize> = (0..world.files.len()).filter(calling).collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let f = candidates[tape.index(candidates.len(), "removal file")];
+    let mut files = world.files.clone();
+    let gone_at = (f, files[f].len() - 1);
+    let gone = files[f].pop()?;
+    for file in files.iter_mut() {
+        for item in file.iter_mut() {
+            item.calls.retain(|call| *call != gone_at);
+            if item.uses == Some(gone_at) {
+                item.uses = None;
+            }
+        }
+    }
+    let mut called: StdVec<(usize, usize)> = gone.calls.iter().copied().filter(|call| *call != gone_at).collect();
+    called.sort_unstable();
+    called.dedup();
+    if called.len() > 1 {
+        // Two reads of the dropped body move: the second dirties a job its drop settled.
+        tape.reached("a removed body read two signatures that moved");
+    }
+    for (cf, ci) in called {
+        files[cf][ci].sig = 2_000 + serial;
+    }
+    Some(World::new(files))
+}
+
+/// After each removal ([`removal`]) the request answers (no `NeedCycle`, no run of the removed
+/// body) and its table and findings equal a fresh build's.
+fn removals(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    let mut world = World::draw(tape);
+    let mut store = Store::default();
+    let (_, first) = finished(request(tape, &world, None, &mut store, None, plant)?)?;
+    let mut last = first.last;
+    for serial in 0..1 + tape.below(2, "removals") {
+        let Some(next) = removal(tape, &world, serial) else { return Ok(()) };
+        let ended = request(tape, &next, Some(&world), &mut store, last.as_deref(), plant)?;
+        if let Some(error) = ended.error {
+            return Err(Broke::Oracle(format!("a removal's request failed: {error}")));
+        }
+        let (_, ended) = finished(ended)?;
+        same_as_fresh(tape, &next, &store, &ended)?;
+        last = ended.last.clone();
+        world = next;
+    }
+    Ok(())
+}
+
+/// The invariant: a name its home dropped is never entered again by a read of it that moves;
+/// the request answers as a fresh build of the edited files does.
+#[test]
+fn a_removed_item_answers_as_a_fresh_build() {
+    check(SimConfig::cases(300).must_reach(&["a removed body read two signatures that moved"]), |tape| removals(tape, Plant::None));
+}
+
+/// The planted bug: `dirty` enters a dropped name again (the waiter of nothing, run as a part
+/// no home lists).
+#[test]
+fn the_oracle_catches_a_dropped_name_entered_again() {
+    control(SimConfig::cases(2000), Plant::None, Plant::DirtyDropped, "a dropped name entered again", removals);
 }
 
 fn flights(tape: &Tape, plant: Plant) -> Result<(), Broke> {
@@ -1284,7 +1483,8 @@ fn members_print_on_their_manifests(world: &World, ended: &Ended) -> Result<(), 
 fn a_member_manifest_edit_rereads_that_member_alone() {
     check(SimConfig::cases(300), |tape| {
         let mut world = World::draw(tape);
-        world.members = (0..3).map(|k| Member { version: 0, files: (0..world.files.len()).filter(|f| f % 3 == k).collect() }).collect();
+        world.members =
+            (0..3).map(|k| Member { version: 0, files: (0..world.files.len()).filter(|f| f % 3 == k).collect(), deps: StdVec::new() }).collect();
         let mut store = Store::default();
         let (_, first) = finished(request(tape, &world, None, &mut store, None, Plant::None)?)?;
         members_print_on_their_manifests(&world, &first)?;
@@ -1440,14 +1640,19 @@ fn control_a_need_answered_before_its_record_is_written_is_caught() {
 
 // --- The gate ---------------------------------------------------------------------------------
 
-/// `run` under `Beside` or `Before`: no success while an error exists or could still be found.
+/// `run` under `Beside` or `Before`: no success while an error exists or could still be found;
+/// under `Before` no `StartProgram` before a check that is clean AND complete (no item it could
+/// not check, run.md D124 "The gate is before the start"), and a clean complete one starts the
+/// program. Then the repeat with nothing changed: it stands on the certificate, runs no task,
+/// and starts exactly when the first was allowed to (the gate's answer found by key).
 fn gates(tape: &Tape, plant: Plant) -> Result<(), Broke> {
-    let world = World::draw(tape);
+    let mut world = World::draw(tape);
+    world.unchecked = tape.one_in(2, "items not checked");
     let gate = [Gate::Beside, Gate::Before][tape.index(2, "gate")];
     let mut store = Store::default();
     let setup = Setup {
         workers: workers(tape),
-        ask: Ask { command: Command::Run, args: b"", gate, space: Space::NONE },
+        ask: Ask { command: Command::Run, args: b"", gate, space: Space::NONE, program: Some(sim_native()), facts: &[] },
         plant,
         tool: SIM_TOOL,
         moved: None,
@@ -1456,18 +1661,51 @@ fn gates(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     };
     let (answer, ended) = finished(request_with(tape, &world, None, &mut store, None, setup)?)?;
     let (_, checked) = fresh(tape, &world)?;
-    let errors = checked.prints.len();
+    let errors = checked.prints.iter().filter(|print| every_rule(print.1)).count();
+    let unchecked = checked.prints.iter().filter(|print| not_checked(print.1)).count();
+    // What the gate allows: under `Before` a clean and complete check; under `Beside` no error
+    // (an unchecked item does not hold a start beside).
+    let may_start = errors == 0 && (gate == Gate::Beside || unchecked == 0);
+    let before_holds = |started: bool, when: &str| -> Result<(), Broke> {
+        if gate == Gate::Before && started {
+            oracle(errors == 0, || format!("{when}: `Before` started a program over errors"))?;
+            oracle(unchecked == 0, || format!("{when}: `Before` started a program over {unchecked} items not checked"))?;
+        }
+        Ok(())
+    };
+    before_holds(ended.started, "the first run")?;
+    // A clean (and, before, complete) check starts the program: the gate is no refusal of all.
+    oracle(!may_start || ended.started, || format!("the first run: a {gate:?} check clean of errors and of unchecked items did not start the program"))?;
+    if gate == Gate::Before {
+        oracle(ended.started == may_start, || String::from("the first run: `Before` started a program it was not allowed to"))?;
+    }
     match answer.verdict {
         Verdict::Passed | Verdict::ProgramFailed => {
-            oracle(errors == 0, || format!("a {:?} verdict over {errors} errors", answer.verdict))
+            oracle(errors == 0, || format!("a {:?} verdict over {errors} errors", answer.verdict))?;
+            oracle(gate == Gate::Beside || unchecked == 0, || format!("a {:?} verdict under `Before` over {unchecked} items not checked", answer.verdict))?;
         }
         Verdict::Failed { started, .. } => {
-            oracle(errors > 0, || String::from("a failed verdict with no error"))?;
+            oracle(errors > 0 || (gate == Gate::Before && unchecked > 0), || String::from("a failed verdict with no error and no item not checked"))?;
             oracle(gate == Gate::Beside || !started, || String::from("`Before` started a program over errors"))?;
-            oracle(started == ended.started, || String::from("the verdict's `started` is not what happened"))
+            oracle(started == ended.started, || String::from("the verdict's `started` is not what happened"))?;
         }
-        other => Err(Broke::Oracle(format!("`run` answered {other:?}"))),
+        other => return Err(Broke::Oracle(format!("`run` answered {other:?}"))),
     }
+    // The repeat, nothing changed: the certificate decides the start at its one read.
+    let repeat = request_with(tape, &world, Some(&world), &mut store, ended.last.as_deref(), setup)?;
+    match &repeat.error {
+        // The program wanted a body the certificate stood on and the walk did not settle: owed
+        // (see `commands`); the start was decided before it.
+        Some(DriveError::LateWant { .. }) | None => {}
+        Some(error) => return Err(Broke::Oracle(format!("the repeat stopped with an error: {error}"))),
+    }
+    before_holds(repeat.started, "the repeat")?;
+    oracle(repeat.runs.is_empty(), || format!("the repeat ran {:?}: the gate's answer is found by key", repeat.runs))?;
+    oracle(repeat.started == may_start, || format!("the repeat: started {}, and the gate allows {may_start}", repeat.started))?;
+    if let Some(again) = repeat.answer {
+        oracle(again.profile.certified, || String::from("the repeat did not stand on its certificate"))?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -1478,6 +1716,127 @@ fn no_success_is_reported_while_an_error_could_be_found() {
 #[test]
 fn control_a_success_before_the_gate_is_done_is_caught() {
     control(SimConfig::cases(2000), Plant::None, Plant::EarlySuccess, "could still find an error", gates);
+}
+
+/// A `run` under `Before` and one under `Beside` are two answers: neither takes the other's
+/// pointer or certificate (rule 21). `check` ignores the gate, so its shape holds none.
+#[test]
+fn a_run_under_each_gate_has_its_own_shape() {
+    let run = |gate| Ask { command: Command::Run, args: b"", gate, space: Space::NONE, program: Some(sim_native()), facts: &[] };
+    assert_ne!(crate::request::shape_of(&run(Gate::Beside)), crate::request::shape_of(&run(Gate::Before)));
+    let check = |gate| Ask { gate, ..ASK };
+    assert_eq!(crate::request::shape_of(&check(Gate::Beside)), crate::request::shape_of(&check(Gate::Before)));
+}
+
+/// `blaze run` of a hello world whose `main` was not checked (2026-11-17: `check` exited 4 and
+/// `run` ran it): under `Before` a start over an item the check could not check is caught.
+#[test]
+fn control_a_start_over_an_unchecked_item_is_caught() {
+    control(SimConfig::cases(2000), Plant::None, Plant::StartOverIncomplete, "items not checked", gates);
+}
+
+// --- `run`'s scope (run_scope.rs) ------------------------------------------------------------
+
+/// A workspace of up to four members over the drawn files, member 0 the program package, each
+/// member depending on some later ones (no cycle, as cargo's). No manifest or file holds a
+/// finding: only bodies do, so the start depends on which bodies are asked alone.
+fn scope_world(tape: &Tape) -> World {
+    let mut world = World::draw(tape);
+    world.quiet = true;
+    world.closure = true;
+    let files = world.files.len();
+    let n = (2 + tape.index(3, "members")).min(files);
+    world.members = (0..n)
+        .map(|k| Member {
+            version: 0,
+            files: (0..files).filter(|f| f % n == k).collect(),
+            deps: (k + 1..n).filter(|_| tape.one_in(2, "a dependency")).collect(),
+        })
+        .collect();
+    world.wants_from = Some(scope_files(&world).into_iter().collect());
+    world
+}
+
+/// The members `run` asks: member 0 and each member it depends on, transitively.
+fn closure_of(world: &World) -> BTreeSet<usize> {
+    let mut seen = BTreeSet::new();
+    let mut stack = std::vec![0];
+    while let Some(k) = stack.pop() {
+        if seen.insert(k) {
+            stack.extend(world.members[k].deps.iter().copied());
+        }
+    }
+    seen
+}
+
+/// The files of the members `run` asks.
+fn scope_files(world: &World) -> BTreeSet<usize> {
+    closure_of(world).iter().flat_map(|k| world.members[*k].files.iter().copied()).collect()
+}
+
+fn run_setup(tape: &Tape, plant: Plant) -> Setup {
+    let ask = Ask { command: Command::Run, args: b"", gate: Gate::Before, space: Space::NONE, program: Some(sim_native()), facts: &[] };
+    Setup { workers: workers(tape), ask, plant, tool: SIM_TOOL, moved: None, split: Split::PerKind, opens: tape.one_in(2, "open the files") }
+}
+
+/// The run made a job of no body outside `files` (its closure's), checked every body of `new`
+/// (those no earlier request made) before the start, and started exactly when the closure's
+/// bodies hold no error (`errors`).
+fn reached_checked(world: &World, ended: &Ended, files: &BTreeSet<usize>, new: &BTreeSet<usize>, errors: usize, when: &str) -> Result<(), Broke> {
+    for name in ended.ran.iter().filter(|name| name.kind == Kind::BodyCheck) {
+        let (f, _) = world.item_of(*name).ok_or(Broke::Harness(format!("no item for {name}")))?;
+        oracle(files.contains(&f), || format!("{when}: {name} of file {f}, which no member of the program's closure holds, was a job"))?;
+    }
+    for f in new.iter() {
+        for i in 0..world.files[*f].len() {
+            oracle(ended.ran.contains(&body_name(*f, i)), || format!("{when}: a body the program reaches ({f}/{i}) was not checked before the start"))?;
+        }
+    }
+    oracle(ended.started == (errors == 0), || format!("{when}: started {} over {errors} errors in the bodies the program reaches", ended.started))
+}
+
+/// `run` under `Before` with the program package's closure: a body of a member the program
+/// does not depend on is never a job and its error does not hold the start; an error in the
+/// closure does; a manifest edit that makes a member reached checks its bodies before the start.
+fn scopes(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    let world = scope_world(tape);
+    // Each file's body errors, from the whole check: a body's finding does not depend on the
+    // members, so it holds for the edited world too.
+    let (_, checked) = fresh(tape, &world)?;
+    let mut errors: BTreeMap<usize, usize> = BTreeMap::new();
+    for print in checked.prints.iter().filter(|print| print.0.kind == Kind::BodyCheck && every_rule(print.1)) {
+        let (f, _) = world.item_of(print.0).ok_or(Broke::Harness(format!("no item for {}", print.0)))?;
+        *errors.entry(f).or_insert(0) += 1;
+    }
+    let errors_in = |files: &BTreeSet<usize>| files.iter().map(|f| errors.get(f).copied().unwrap_or(0)).sum::<usize>();
+    let mut store = Store::default();
+    let (_, first) = finished(request_with(tape, &world, None, &mut store, None, run_setup(tape, plant))?)?;
+    let files = scope_files(&world);
+    reached_checked(&world, &first, &files, &files, errors_in(&files), "the first run")?;
+    // The package's manifest now depends on a member it did not reach.
+    let reached = closure_of(&world);
+    let unreached: StdVec<usize> = (0..world.members.len()).filter(|k| !reached.contains(k)).collect();
+    if unreached.is_empty() {
+        return Ok(());
+    }
+    let mut next = world.clone();
+    next.members[0].deps.push(unreached[tape.index(unreached.len(), "the member reached anew")]);
+    next.members[0].version += 1;
+    let now = scope_files(&next);
+    next.wants_from = Some(now.iter().copied().collect());
+    let added: BTreeSet<usize> = now.difference(&files).copied().collect();
+    let (_, again) = finished(request_with(tape, &next, Some(&world), &mut store, first.last.as_deref(), run_setup(tape, plant))?)?;
+    reached_checked(&next, &again, &now, &added, errors_in(&now), "the run after the edit")
+}
+
+#[test]
+fn a_run_checks_the_program_packages_closure_alone() {
+    check(SimConfig::cases(300), |tape| scopes(tape, Plant::None));
+}
+
+#[test]
+fn control_a_reached_member_left_out_is_caught() {
+    control(SimConfig::cases(2000), Plant::None, Plant::ReachedSkipped, "the program reaches", scopes);
 }
 
 /// Commands and edits in any order on one store, each walking forward from the one before, as
@@ -1501,7 +1860,9 @@ fn commands(tape: &Tape, plant: Plant) -> Result<(), Broke> {
             continue;
         }
         let command = [Command::Check, Command::Run, Command::Test][tape.index(3, "command")];
-        let setup = Setup { ask: Ask { command, args: b"", gate: Gate::Beside, space: Space::NONE }, ..setup(tape, plant) };
+        // `test` names the image too: under `Plant::TestStartsProgram` it starts one.
+        let program = (!matches!(command, Command::Check)).then(sim_native);
+        let setup = Setup { ask: Ask { command, args: b"", gate: Gate::Beside, space: Space::NONE, program, facts: &[] }, ..setup(tape, plant) };
         let ended = request_with(tape, &world, before.as_ref(), &mut store, last.as_deref(), setup)?;
         match &ended.error {
             Some(DriveError::LateWant { .. }) => return Ok(()),
@@ -1629,7 +1990,7 @@ fn fifo(world: &World, ask: Ask<'_>) -> Result<Fifo, Broke> {
                 let outputs: StdVec<Output<'_>> = made
                     .iter()
                     .zip(held.iter())
-                    .map(|(m, findings)| Output { name: m.name, out: m.out, reads: &m.reads, parts: &m.parts, paths: &[], findings, payload: b"" })
+                    .map(|(m, findings)| Output { name: m.name, out: m.out, reads: &m.reads, cells: &[], parts: &m.parts, paths: &[], findings, payload: b"" })
                     .collect();
                 let mut at = 0;
                 let mut results = StdVec::new();
@@ -1725,7 +2086,7 @@ fn eval_body(world: &World, f: usize, i: usize, config: &[u16]) -> ContentId {
 fn whole_space_equals_each(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let world = draw_cfg(tape, plant);
     let space = Space { values: &world.values, implications: &[] };
-    let ask = Ask { command: Command::Check, args: b"", gate: Gate::Beside, space };
+    let ask = Ask { command: Command::Check, args: b"", gate: Gate::Beside, space, program: None, facts: &[] };
     let run = fifo(&world, ask)?;
     let mut configs: StdVec<StdVec<u16>> = std::vec![StdVec::new()];
     for count in &world.values {
@@ -1786,7 +2147,7 @@ fn an_item_past_the_cap_is_a_finding() {
         world.values = (0..3).map(|_| 5 + tape.index(2, "values past the cap") as u16).collect();
         world.files[0][0].cfg = std::vec![0, 1, 2];
         let space = Space { values: &world.values, implications: &[] };
-        let run = fifo(&world, Ask { command: Command::Check, args: b"", gate: Gate::Beside, space })?;
+        let run = fifo(&world, Ask { command: Command::Check, args: b"", gate: Gate::Beside, space, program: None, facts: &[] })?;
         oracle(run.prints.iter().any(|(_, _, message)| message.windows(7).any(|w| w == b"past 64")), || {
             format!("no over-cap finding among {} printed", run.prints.len())
         })

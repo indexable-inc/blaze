@@ -40,8 +40,7 @@
 
 use core::alloc::Allocator;
 
-use blaze_lir::builder::Variadic;
-use blaze_lir::func::{BlockKind, Conv, FnAttrs, RefKind, SigId};
+use blaze_lir::func::{BlockKind, FnAttrs, RefKind, SigId};
 use blaze_lir::{Block, Flags, Ty, Value};
 use blaze_typeck::{ItemKey, List};
 
@@ -137,10 +136,13 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let item = self.adts.lang_fn(CANNOT_UNWIND_FN).ok_or(BuildError::NoLangFn { expr: None, name: CANNOT_UNWIND_FN })?;
         self.begin(pad);
         let _exception = self.b.param(Ty::PTR);
-        let place = self.ref_place(Instance { item, args: List::EMPTY });
+        // One pad serves the whole body, so no expression is its place: a tracked entry point
+        // is refused by name (walk/track_caller.rs); the pinned one is not tracked.
+        let callee = Instance { item, args: List::EMPTY };
+        let (sig, values) = self.lang_call_sig(None, callee, &[], &[])?;
+        let place = self.ref_place(callee);
         let reference = self.b.reference(RefKind::Func, place);
-        let sig = self.b.sig(Conv::C, Variadic::No, &[], &[]);
-        self.b.call(Flags::NONE, reference, sig, &[]);
+        self.b.call(Flags::NONE, reference, sig, &values);
         self.b.unreachable();
         Ok(())
     }

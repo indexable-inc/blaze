@@ -1,0 +1,88 @@
+# The constructors that already take the hasher become `new(Opts)` (D126). Not inside a `const`
+# or `static`: `new` is not a `const fn` (it may allocate), and `Map::with_hasher_in` and
+# `Set::with_hasher_in` are, so a table made in a `static` keeps them.
+id: explicit-hasher-map-with-hasher-in
+language: rust
+severity: hint
+message: "D126: `Map::new(MapOpts { hasher, alloc, capacity: None })`"
+rule:
+  any:
+    - pattern: Map::with_hasher_in($H, $A)
+    - pattern: HashMap::with_hasher_in($H, $A)
+    - pattern: KeyedMap::with_hasher_in($H, $A)
+    - pattern: ByHash::with_hasher_in($H, $A)
+  not:
+    inside:
+      any: [{ kind: const_item }, { kind: static_item }]
+      stopBy: end
+fix: "Map::new(MapOpts { hasher: $H, alloc: $A, capacity: None })"
+---
+id: explicit-hasher-map-with-capacity-and-hasher-in
+language: rust
+severity: hint
+message: "D126: `Map::new(MapOpts { hasher, alloc, capacity: Some(n) })`"
+rule:
+  any:
+    - pattern: Map::with_capacity_and_hasher_in($N, $H, $A)
+    - pattern: HashMap::with_capacity_and_hasher_in($N, $H, $A)
+    - pattern: KeyedMap::with_capacity_and_hasher_in($N, $H, $A)
+    - pattern: ByHash::with_capacity_and_hasher_in($N, $H, $A)
+fix: "Map::new(MapOpts { hasher: $H, alloc: $A, capacity: Some($N) })"
+---
+id: explicit-hasher-set-with-hasher-in
+language: rust
+severity: hint
+message: "D126: `Set::new(SetOpts { hasher, alloc, capacity: None })`"
+rule:
+  any:
+    - pattern: Set::with_hasher_in($H, $A)
+    - pattern: HashSet::with_hasher_in($H, $A)
+    - pattern: KeyedSet::with_hasher_in($H, $A)
+    - pattern: ByHashSet::with_hasher_in($H, $A)
+  not:
+    inside:
+      any: [{ kind: const_item }, { kind: static_item }]
+      stopBy: end
+fix: "Set::new(SetOpts { hasher: $H, alloc: $A, capacity: None })"
+---
+id: explicit-hasher-set-with-capacity-and-hasher-in
+language: rust
+severity: hint
+message: "D126: `Set::new(SetOpts { hasher, alloc, capacity: Some(n) })`"
+rule:
+  any:
+    - pattern: Set::with_capacity_and_hasher_in($N, $H, $A)
+    - pattern: HashSet::with_capacity_and_hasher_in($N, $H, $A)
+    - pattern: KeyedSet::with_capacity_and_hasher_in($N, $H, $A)
+    - pattern: ByHashSet::with_capacity_and_hasher_in($N, $H, $A)
+fix: "Set::new(SetOpts { hasher: $H, alloc: $A, capacity: Some($N) })"
+---
+id: explicit-hasher-order-map-with-hasher-in
+language: rust
+severity: hint
+message: "D126: `OrderMap::new(OrderMapOpts { hasher, alloc, capacity: None })`"
+rule:
+  any:
+    - pattern: OrderMap::with_hasher_in($H, $A)
+    - pattern: IndexMap::with_hasher_in($H, $A)
+fix: "OrderMap::new(OrderMapOpts { hasher: $H, alloc: $A, capacity: None })"
+---
+id: explicit-hasher-order-map-with-capacity-and-hasher-in
+language: rust
+severity: hint
+message: "D126: `OrderMap::new(OrderMapOpts { hasher, alloc, capacity: Some(n) })`"
+rule:
+  any:
+    - pattern: OrderMap::with_capacity_and_hasher_in($N, $H, $A)
+    - pattern: IndexMap::with_capacity_and_hasher_in($N, $H, $A)
+fix: "OrderMap::new(OrderMapOpts { hasher: $H, alloc: $A, capacity: Some($N) })"
+---
+id: explicit-hasher-order-set-with-hasher-in
+language: rust
+severity: hint
+message: "D126: `OrderSet::new(OrderSetOpts { hasher, alloc, capacity: None })`"
+rule:
+  any:
+    - pattern: OrderSet::with_hasher_in($H, $A)
+    - pattern: IndexSet::with_hasher_in($H, $A)
+fix: "OrderSet::new(OrderSetOpts { hasher: $H, alloc: $A, capacity: None })"

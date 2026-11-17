@@ -247,15 +247,15 @@ fn head_census() {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let files = [("/hello-world/src/main.rs".to_string(), MAIN.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
-    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names: Names<'_> = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names: Names<'_> = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let crate_names: Vec<&str> = crates.iter().map(|c| c.name).collect();
     let mut out = format!("head census: names resolved in {:?}\n", start.elapsed());
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
-        let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+        let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|info| {
         if let Ok(mut at) = PANIC_AT.lock() {
@@ -337,7 +337,7 @@ fn census_crate<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, krate: usize, 
     ordered.sort_by(|a, b| a.0.cmp(&b.0));
 
     let prepared = Prepares::new_in(Alloc::global());
-    let mut store = Store::new(front.index.lang("sized"), front.frame);
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let mut buckets = None;
     let mut consts = Consts::default();
     let mut rows: Vec<Row> = Vec::new();

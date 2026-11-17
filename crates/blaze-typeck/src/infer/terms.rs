@@ -179,18 +179,18 @@ pub(crate) fn b_val_ty(t: s::ValTy) -> Ty {
 }
 
 /// blaze-ty's fn pointer header from the solver's: the ABI's numbering is
-/// `FnPtrHeader::bits`'s low bits (blaze-ty: "the ABI's numbering is the front end's").
-/// Lifetimes are erased here: no bound variables; no C variadic fn pointer is made.
+/// `FnPtrHeader::bits`'s low six bits (blaze-ty: "the ABI's numbering is the front end's").
+/// Lifetimes are erased here: no bound variables.
 pub(crate) fn b_header(h: s::FnPtrHeader) -> FnHeader {
-    FnHeader::new(h.bits() & 0x7f, h.safety == s::Safety::Unsafe, false, 0)
+    FnHeader::new(h.bits() & 0x3f, h.safety == s::Safety::Unsafe, h.c_variadic, 0)
 }
 
-/// The inverse of [`b_header`]. A header this crate never made (an unknown ABI number, a C
-/// variadic) is a broken invariant of the arena, not an input.
+/// The inverse of [`b_header`]. A header this crate never made (an unknown ABI number) is a
+/// broken invariant of the arena, not an input.
 pub(crate) fn s_header(h: FnHeader) -> s::FnPtrHeader {
-    let bits = h.abi() | if h.is_unsafe() { 0x80 } else { 0 };
+    let bits = h.abi() | if h.c_variadic() { 0x40 } else { 0 } | if h.is_unsafe() { 0x80 } else { 0 };
     match s::FnPtrHeader::from_bits(bits) {
-        Some(x) if !h.c_variadic() => x,
+        Some(x) if h.abi() < 0x40 => x,
         _ => panic!("blaze-typeck: a fn pointer header it never made: {h:?}"),
     }
 }

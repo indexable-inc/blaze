@@ -28,6 +28,11 @@ use super::*;
 use crate::FnTrait;
 use crate::layout::LayoutFacts;
 
+// The other function the language makes with no text: a tuple struct's or variant's ctor.
+#[path = "ctor_fn.rs"]
+mod ctor_fn;
+pub(crate) use ctor_fn::build_ctor_fn;
+
 /// The closures of `body` with their ORDINALS: a closure's position among its owner body's
 /// closures in expression order (typeck.md, "A closure's identity"). The one place the builder
 /// derives an ordinal, as the checker will record it; the expression id is a fact local to one
@@ -99,15 +104,11 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         self.closure_parts(g).map_err(|error| Self::ty_err(e, error))
     }
 
-    /// Closure `e`'s captures in the checker's order: the binding and how.
+    /// Closure or `async` block `e`'s captures in the checker's order: the binding and how. The
+    /// one list its environment's fields are (`layout::captures`).
     pub(super) fn captures_of(&self, e: ExprId, out: &mut Vec<(PatId, CaptureKind), A>) {
         out.clear();
-        let caps = &self.checked.captures;
-        for row in 0..caps.len() {
-            if caps.column::<0>()[row] == e {
-                out.push((caps.column::<1>()[row], caps.column::<2>()[row]));
-            }
-        }
+        out.extend(crate::layout::captures(self.checked, e));
     }
 
     /// The offset of field `j` of the struct or tuple laid out as row `l`.
@@ -117,6 +118,29 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         };
         let rows = self.layout_fields.get(first as usize..(first + len) as usize).ok_or(malformed("a layout's fields past their table"))?;
         rows.iter().find(|f| f.0 == Name(j as u64)).map(|f| f.1).ok_or(malformed("a capture past its environment's fields"))
+    }
+
+    /// The invariant of `layout::captures`, checked where the walk reads an environment: ground
+    /// environment `env` of closure or `async` block `e` has exactly `n` fields, one per capture
+    /// row. A world whose facts came from another record of the owner breaks it; a debug build
+    /// stops naming the block, its owner and both counts, a release one refuses it by name.
+    pub(super) fn env_holds(&self, e: ExprId, env: PTy, n: usize) -> Result<(), BuildError> {
+        let fields = match self.ground_node(env) {
+            Ok(PNode::Tuple(l)) => self.ground.view().list(l).map(<[PTy]>::len).map_err(|_| malformed("a list past the ground table"))?,
+            _ => return Err(malformed("an environment that is not a tuple")),
+        };
+        debug_assert_eq!(
+            fields, n,
+            "closure or async block {e:?} of {:?}: its environment has {fields} fields, its capture list (`Checked::captures`) {n} rows",
+            self.body.owner
+        );
+        if fields != n {
+            return Err(BuildError::Unsupported {
+                expr: e,
+                what: "an environment whose field count is not its capture list's (the world's facts and the walk read two records of the owner)",
+            });
+        }
+        Ok(())
     }
 
     /// Where each capture's field is inside a value of closure type `g` (its one field, the
@@ -129,7 +153,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let parts = self.parts_at(e, g)?;
         let lc = self.layout(g).map_err(|error| Self::ty_err(e, error))?;
         let le = self.layout(parts.env).map_err(|error| Self::ty_err(e, error))?;
-        let base = self.field_offset(lc, 0)?;
+        self.env_holds(e, parts.env, n)?;
+        let base = self.field_offset(lc, 0).map_err(|_| malformed("a closure type's layout without its one field, the environment"))?;
         for j in 0..n {
             out.push(base + self.field_offset(le, j)?);
         }
@@ -274,9 +299,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let gr = self.ground_ty(ty).map_err(|error| Self::ty_err(e, error))?;
         let rrepr = self.repr_at(e, ty)?;
         let rpass = self.pass(gr, rrepr, Abi::Rust, None)?;
-        let place = self.ref_place(instance);
-        let reference = self.b.reference(RefKind::Func, place);
-        self.emit_call(Callee::Direct(reference), &reprs, &passes, rrepr, rpass)?;
+        self.call_instance(Some(e), instance, &reprs, &passes, None, rrepr, rpass)?;
         if let PNode::Never = self.node_at(e, ty)? {
             self.pop_val();
             self.b.unreachable();
@@ -378,10 +401,15 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         for (i, &repr) in reprs.iter().enumerate().skip(1) {
             let p = self.body.params[i - 1];
             match self.take_passed(repr, passes[i], &mut next)? {
-                V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { .. }) => self.bind_at(p, (at, off))?,
-                v => self.bind_value(p, v)?,
+                V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { .. }) => {
+                    self.bind_at(p, (at, off))?;
+                    self.own_pat(p)?;
+                }
+                // The parameter's own type (`|Foo { a }: &Foo| ..` is recorded at the peeled
+                // one); bound and owned as a fn's parameter is (walk/matches/irrefutable.rs
+                // `bind_param`: `|_: String| ..` holds its argument to the closure's end).
+                v => self.bind_param(p, v, inputs[i - 1])?,
             }
-            self.own_pat(p)?;
         }
         self.walk_root()
     }
@@ -571,6 +599,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let me = self.take_passed(reprs[0], passes[0], &mut next)?;
         let callee_ref = match target {
             Some(instance) => {
+                self.refuse_tracked_shim(instance)?;
                 let place = self.ref_place(instance);
                 Callee::Direct(self.b.reference(RefKind::Func, place))
             }
@@ -634,6 +663,10 @@ fn empty_record(a: Alloc<'_>) -> Checked<'_> {
         stalled: blaze_own::Vec::new_in(a),
         awaited: blaze_own::Vec::new_in(a),
         selected: blaze_own::Vec::new_in(a),
+        fru_fields: blaze_own::Soa::new_in(a),
+        default_fields: blaze_own::Soa::new_in(a),
+        index_mut: blaze_own::Vec::new_in(a),
+        findings: blaze_own::Vec::new_in(a),
     }
 }
 
@@ -651,7 +684,22 @@ pub(crate) fn build_fn_shim<A: Allocator + Clone>(
 ) -> Result<Built<A>, BuildError> {
     let owner = adts.fn_trait_method(which).ok_or(BuildError::NoLangFn { expr: None, name: method_name(which) })?;
     let checked = empty_record(subst.scratch);
-    let body = BodyView {
+    let body = empty_view(owner, checked.types.view());
+    let mut w = Walk::new(&body, &checked, subst, adts, alloc);
+    w.run_fn_shim(callee, tuple, which, sig)?;
+    let Walk { b, refs, statics, thread_locals, vtables, .. } = w;
+    let func = b.finish().map_err(|error| match error {
+        blaze_lir::BuildError::Verify(v) => BuildError::Verify(v),
+        other => BuildError::Lir(other),
+    })?;
+    blaze_lir::verify(func.view()).map_err(BuildError::Verify)?;
+    Ok(Built { func, refs, statics, thread_locals, vtables })
+}
+
+/// The body of a function the language makes, with no text of its own (a fn shim, a ctor's fn:
+/// ctor_fn.rs), named by `owner`: nothing in it, so its walk reads none of it.
+fn empty_view(owner: ItemKey, types: PTys<'_>) -> BodyView<'_> {
+    BodyView {
         owner,
         edition: Edition::E2024,
         params: &[],
@@ -670,7 +718,7 @@ pub(crate) fn build_fn_shim<A: Allocator + Clone>(
         paths: &[],
         segments: &[],
         segment_ranges: &[],
-        types: checked.types.view(),
+        types,
         type_lists: &[],
         type_list_ranges: &[],
         method_name_ranges: &[],
@@ -682,14 +730,6 @@ pub(crate) fn build_fn_shim<A: Allocator + Clone>(
         asm_operands: &[],
         asm_clobbers: &[],
         asm_text: "",
-    };
-    let mut w = Walk::new(&body, &checked, subst, adts, alloc);
-    w.run_fn_shim(callee, tuple, which, sig)?;
-    let Walk { b, refs, statics, thread_locals, vtables, .. } = w;
-    let func = b.finish().map_err(|error| match error {
-        blaze_lir::BuildError::Verify(v) => BuildError::Verify(v),
-        other => BuildError::Lir(other),
-    })?;
-    blaze_lir::verify(func.view()).map_err(BuildError::Verify)?;
-    Ok(Built { func, refs, statics, thread_locals, vtables })
+        call_arg_ints: &[],
+    }
 }

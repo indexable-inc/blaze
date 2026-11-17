@@ -78,7 +78,7 @@ impl Input for Wrapped {
 }
 
 /// The host the native mode builds for; the only one with a pinned clang and a sysroot today
-/// (crates/hir-ty-codegen/clang.json: Linux's sysroot is not pinned).
+/// (crates/blaze-toolchain/pins/clang.json: Linux's sysroot is not pinned).
 const HOST: &str = "aarch64-apple-darwin";
 
 /// `native`: the scripts are built as host binaries (no process shim: they really start the

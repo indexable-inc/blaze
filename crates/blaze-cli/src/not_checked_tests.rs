@@ -4,9 +4,9 @@ use blaze_drive::{Kind, Name, TaskFailure, Why};
 use blaze_ids::ContentId;
 
 use super::lines;
-use crate::work::Failed;
+use crate::work::Failures;
 
-fn said(failures: &[TaskFailure], failed: &[Failed<'_>]) -> std::vec::Vec<std::string::String> {
+fn said(failures: &[TaskFailure], failed: &Failures<'_>) -> std::vec::Vec<std::string::String> {
     let frame = bstd::mem::Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("a test frame");
     let mut out = std::vec::Vec::new();
     lines(failures, failed, None, &frame, &mut |line| {
@@ -35,7 +35,8 @@ fn not_checked_lines_name_each_cause_once() {
         TaskFailure { name: reader, why: Why::Waited { on: scope } },
         TaskFailure { name: orphan, why: Why::Waited { on: dropped } },
     ];
-    let failed = [Failed { path: Some("src/lib.rs"), failure: failures[0], detail: None }];
+    let mut failed = Failures::new_in(blaze_own::testing::heap().alloc());
+    failed.keep(failures[0], Some(b"src/lib.rs"), None).expect("the test heap takes one failure");
     // Groups come in cause order (`Failed` before `Dropped`).
     let want = vec![
         format!("not checked because {} of `src/lib.rs` failed: 2 task(s)", Kind::Surface.name()),

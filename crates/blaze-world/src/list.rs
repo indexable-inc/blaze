@@ -42,7 +42,7 @@ use blaze_toolchain::{Shelf, ToolchainId, ToolchainView};
 use blaze_unit_graph::{StdIs, Unit, UnitGraph, UnitKind};
 
 use crate::{
-    Corrected, Crate, Needs, Origin, Packages, Place, Script, Texts, Toolchain, Tree, World, WorldError, alloc_free_debug, correct_pack, implicit_key,
+    Corrected, Crate, Needs, Origin, PackOrigin, Packages, Place, Script, Texts, Toolchain, Tree, World, WorldError, alloc_free_debug, correct_pack, implicit_key,
     join, keep, keep_slice, push_u32,
 };
 
@@ -335,10 +335,16 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
 
     // The trees: the toolchain's packs (1..=t), then each fetched package's record and each
     // macro-side toolchain pack in the order its first crate is placed.
+    // Beside each pack, where it is kept (the crate list's tree table, crate_list.rs).
     let mut packs: AVec<'w, PackView<'w>> = AVec::with_capacity_in(tc.len(), alloc.clone());
+    let mut origins: AVec<'w, PackOrigin> = AVec::with_capacity_in(tc.len(), alloc.clone());
     for c in tc {
-        packs.push(PackView::open_verified(toolchain.pack(c)).map_err(|_| WorldError::Pack { krate: c.name })?);
+        let bytes = toolchain.pack(c);
+        packs.push(PackView::open_verified(bytes).map_err(|_| WorldError::Pack { krate: c.name })?);
+        origins.push(PackOrigin::Shelf { digest: footer(bytes).ok_or(WorldError::Pack { krate: c.name })? });
     }
+    // The lock's fetch plan, made at the first fetched package placed: which record holds it.
+    let mut fetch_plan: Option<blaze_fetch::Plan<'w, 'w>> = None;
     let mut placed: BTreeMap<u32, (u32, &'w str), Alloc<'w>> = BTreeMap::new_in(alloc.clone());
 
     let mut crates: AVec<'w, Crate<'w>> = AVec::with_capacity_in(tc.len() + pending.len(), alloc.clone());
@@ -394,7 +400,9 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                         let it = match place {
                             Place::Checkout { dir } => (0, dir),
                             Place::Pack { view, dir } => {
+                                let key = source_key(&mut fetch_plan, view, lock, unit.package, &unit.name, alloc.clone())?;
                                 packs.push(view);
+                                origins.push(PackOrigin::Source { key });
                                 let tree = packs.len() as u32;
                                 if let Some(row) = corrections.find_text(&unit.name, &unit.version) {
                                     correct_pack(row, view, tree, dir, unit, &mut corrected, &mut used, alloc.clone())?;
@@ -439,6 +447,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                 // A macro-side toolchain crate: a tree of its own, its pack read by `open_list`.
                 let (bytes, version) = listed.side_pack(pend.at).ok_or(WorldError::ToolchainCrateNotOpened { krate: c.name })?;
                 packs.push(PackView::open_verified(bytes).map_err(|_| WorldError::Pack { krate: c.name })?);
+                origins.push(PackOrigin::Shelf { digest: footer(bytes).ok_or(WorldError::Pack { krate: c.name })? });
                 let tree = packs.len() as u32;
                 let inner = c.root.as_str().strip_prefix(c.shown_from.as_str()).ok_or(WorldError::ToolchainRoot { krate: c.name, root: c.root.as_str() })?;
                 let mut base = AString::with_capacity_in(12, alloc.clone());
@@ -512,7 +521,42 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
     refused.sort_unstable_by_key(|r| r.krate);
     let role = |i: Option<usize>| i.map(|i| CrateId(i as u32));
     let sysroot = Sysroot { core: role(toolchain.core()), alloc: role(toolchain.alloc()), std: role(toolchain.std()), bstd: role(toolchain.bstd()) };
-    Ok(World { crates, texts: Texts { checkout, packs, corrected, envs }, sysroot, toolchain_crates: t, crate_of_unit, corrections: used, refused })
+    Ok(World { crates, texts: Texts { checkout, packs, origins, corrected, envs }, sysroot, toolchain_crates: t, crate_of_unit, corrections: used, refused })
+}
+
+/// The BLAKE3 a toolchain pack is named by on the shelf: its 32-byte footer, which
+/// `blaze_toolchain::shelf::open_pack` checked is its bytes' digest and its manifest row's name.
+fn footer(pack: &[u8]) -> Option<[u8; 32]> {
+    let at = pack.len().checked_sub(32)?;
+    pack[at..].try_into().ok()
+}
+
+/// The key of the sources store's record a fetched package's files were placed from (`view`,
+/// for locked package `package`, named `name`): the lock's fetch plan's unit of it, the one home
+/// of which record holds a package (`blaze_fetch::plan`: a crate's own record, a git package's
+/// commit's), whose key is `SourceId::key`. The view is that record (`StoreSources::files`
+/// opened it under the same plan and checked its source), so a crate's unit is found by its
+/// package and a git package's by the view's commit (a git record's source is its commit and
+/// 12 zero bytes). The plan is made once, at the first ask. The key is a name, not a proof:
+/// the opener checks the record it finds holds these files (`TreeRow::files`).
+fn source_key<'w>(
+    fetch_plan: &mut Option<blaze_fetch::Plan<'w, 'w>>,
+    view: PackView<'w>,
+    lock: &'w Lock<'w>,
+    package: blaze_manifest::lock::LockId,
+    name: &'w str,
+    alloc: Alloc<'w>,
+) -> Result<ContentId, WorldError<'w>> {
+    if fetch_plan.is_none() {
+        *fetch_plan = Some(blaze_fetch::plan::plan(lock, alloc).map_err(|_| WorldError::SourceRecord { package: name })?);
+    }
+    let plan = fetch_plan.as_ref().ok_or(WorldError::SourceRecord { package: name })?;
+    let own = plan.units.iter().find(|u| matches!(u, blaze_fetch::Unit::Crate { package: p, .. } if *p == package));
+    let unit = own.or_else(|| {
+        let commit = view.source().get(..20)?;
+        plan.units.iter().find(|u| matches!(u, blaze_fetch::Unit::Git { commit: c, .. } if c.0[..] == *commit))
+    });
+    unit.map(|u| u.key()).ok_or(WorldError::SourceRecord { package: name })
 }
 
 /// The parts of a unit crate's key the world adds to the list's.

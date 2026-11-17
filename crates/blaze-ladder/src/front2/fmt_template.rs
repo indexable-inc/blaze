@@ -9,8 +9,8 @@
 //! literal's (the Reference, "String literals": `\n`, `\t`, `\\`, `\"`, `\x7F`, `\u{..}`, a
 //! line continuation), in a raw one (`r"..."`, `r#"..."#`) there are none; in both `{{` is one
 //! `{` and `}}` one `}` (core::fmt's doc, "Escaping"). Which it is is read from the expression's
-//! text: the template is its first string token. A placeholder is plain when its spec is
-//! empty or names only the trait (`?`, `x`, `X`, `o`, `b`, `e`, `E`, `p`).
+//! text: the template is its first string token. A placeholder's spec (its text after `:`)
+//! is unescaped the same way and handed on whole; the builder encodes its options.
 //!
 //! A template this cannot make (an escape the unescaper refuses, a text that is not UTF-8, a
 //! range the view does not hold, a template not found as the expression's first string) has
@@ -116,7 +116,7 @@ pub(crate) fn templates(body: &Body<'_>) -> Vec<(ExprId, Template), Global> {
 /// A piece before its text is placed: a range of the joined text, or a placeholder.
 enum Part {
     Text(usize, usize),
-    Arg { plain: bool },
+    Arg(usize, usize),
 }
 
 fn template(view: &View<'_>, id: ExprId) -> Option<Template> {
@@ -136,8 +136,10 @@ fn template(view: &View<'_>, id: ExprId) -> Option<Template> {
                 }
             }
             LPiece::Arg { spec, .. } => {
-                let spec = view.text_at(spec).ok()?;
-                parts.push(Part::Arg { plain: matches!(spec, "" | "?" | "x" | "X" | "o" | "b" | "e" | "E" | "p") });
+                // The spec's escapes are the template string's, processed the same way.
+                let start = text.len();
+                push_text(view.text_at(spec).ok()?, raw, &mut text)?;
+                parts.push(Part::Arg(start, text.len()));
             }
         }
     }
@@ -156,7 +158,12 @@ fn template(view: &View<'_>, id: ExprId) -> Option<Template> {
                 // below owns unchanged for as long as it holds `pieces` (its field doc).
                 FmtPiece::Text(unsafe { &*piece })
             }
-            Part::Arg { plain } => FmtPiece::Arg { plain },
+            Part::Arg(s, e) => {
+                let spec: *const str = text.get(s..e)?;
+                // SAFETY: as for `Text` above: `spec` points into `text`'s heap buffer, which
+                // the `Template` made below owns unchanged for as long as it holds `pieces`.
+                FmtPiece::Arg { spec: unsafe { &*spec } }
+            }
         });
     }
     Some(Template { pieces: pieces.into_boxed_slice(), text })

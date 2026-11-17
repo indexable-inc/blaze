@@ -173,9 +173,9 @@ pub const WORDINGS: &[Wording] = &[
         area: Area::Cli,
         number: 18,
         name: "types-not-checked",
-        headline: "this body's types were not checked: {0}",
+        headline: "item `{0}` was not checked: {1}{2}",
         label: "not a pass: the check stopped here",
-        args: 1,
+        args: 3,
     },
     // A body's move or borrow finding (blaze-cli body_types.rs `BORROWS`): the code and its
     // words. A note until the borrow check is trusted (`BORROWS_ARE_ERRORS`).
@@ -195,6 +195,36 @@ pub const WORDINGS: &[Wording] = &[
         name: "borrows-not-checked",
         headline: "this body's moves and borrows were not checked: {0}",
         label: "not a pass: the borrow check stopped here",
+        args: 1,
+    },
+    // An include read outside its own package, inside the workspace (blaze-cli
+    // names/include_outside.rs, decision D111): allowed, a warning.
+    Wording {
+        area: Area::Cli,
+        number: 21,
+        name: "include-outside-package",
+        headline: "{code:0} reads {code:1}, outside its package {code:2}",
+        label: "allowed inside the workspace; a dependency could not read it",
+        args: 3,
+    },
+    // A macro call of the project's own code whose expansion failed (blaze-cli
+    // names/failed_call.rs): the call, then the matcher's reason. An error.
+    Wording {
+        area: Area::Cli,
+        number: 22,
+        name: "macro-call-failed",
+        headline: "{0} failed: {1}",
+        label: "this call wrote nothing: what it would have written is not there",
+        args: 2,
+    },
+    // A task not run because an input it reads could not be made (blaze-cli work.rs
+    // `NOT_RUN`): never drawn; print.rs gathers them into one line per cause.
+    Wording {
+        area: Area::Cli,
+        number: 23,
+        name: "not-run",
+        headline: "{0}",
+        label: "not run: an input it reads could not be made",
         args: 1,
     },
     Wording {

@@ -47,7 +47,7 @@ fn launch<R: crate::entry::Outcome>(
     let a = alloc();
     let fd3 = delivery(&spec(grants, a), a);
     let mut said = std::string::String::new();
-    let status = launch_in(manifest, Some(&fd3), io, &mut said, a, body);
+    let status = launch_in(manifest, Some(&fd3), io, &mut said, body);
     (status, said)
 }
 
@@ -123,10 +123,10 @@ static CAMERA_ORDINARY: Manifest = Manifest::new(&[Param::of::<Camera>("camera")
 fn an_ordinary_start_takes_the_process_s_device() {
     let body = || crate::launch_body!(takes_camera; camera: Camera);
     let mut said = std::string::String::new();
-    let status = launch_in(&CAMERA_ORDINARY, None, Io::sim(1), &mut said, alloc(), body());
+    let status = launch_in(&CAMERA_ORDINARY, None, Io::sim(1), &mut said, body());
     assert_eq!((status, said.as_str()), (Status(9), ""));
     let mut said = std::string::String::new();
-    let status = launch_in(&CAMERA_ORDINARY, None, Io::sim_with(1, Offers::NATIVE), &mut said, alloc(), body());
+    let status = launch_in(&CAMERA_ORDINARY, None, Io::sim_with(1, Offers::NATIVE), &mut said, body());
     assert_eq!(status, Status::REFUSED, "{said}");
     assert!(said.contains("this host offers no `camera`"), "{said}");
 }

@@ -14,7 +14,7 @@ pub mod anon;
 mod async_output;
 mod back_needs;
 pub mod block_crates;
-pub mod expansion_blocks;
+pub mod scope_table;
 pub mod expansion_origin;
 pub mod block_traits;
 pub mod body;
@@ -115,9 +115,13 @@ mod path_miss_shown;
 mod adt_paths;
 mod static_shown;
 mod written;
+/// A token keeps its mark, in an item's head and types (token-mark-F1).
+pub mod item_site;
 pub mod header_written;
 pub mod item_shown;
 pub mod row_path;
+/// WHY a census row is left out: the evidence under a build census's `SPLIT` rows.
+pub mod census_why;
 
 use blaze_scope::resolve::Names;
 
@@ -162,12 +166,9 @@ pub struct Front2<'n, S = &'n Names<'n>> {
 impl<'n> Front2<'n> {
     /// The front end over `names`, the program's crate at index 0 and its files `user` as the
     /// caller gave them: [`Front2::for_program`] for the program crate 0 links. `frame` is the
-    /// caller's, alive for the command.
-    pub fn new(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>]) -> Result<Front2<'n>, FrontError> {
-        // The closure is a bitmap for this call alone; this constructor takes no allocator
-        // (its callers' signature), so the program's top allocator is named here (owed: one
-        // handed down).
-        let linked = linked::Linked::of(names, &[0], blaze_own::Alloc::global()).map_err(FrontError::Roots)?;
+    /// caller's, alive for the command; `alloc` holds the link closure, a bitmap for this call.
+    pub fn new(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], alloc: blaze_own::Alloc<'_>) -> Result<Front2<'n>, FrontError> {
+        let linked = linked::Linked::of(names, &[0], alloc).map_err(FrontError::Roots)?;
         Self::for_program(names, frame, user, &linked)
     }
 

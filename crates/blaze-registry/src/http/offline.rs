@@ -7,7 +7,7 @@ use std::{fmt, sync::Arc, time::Duration};
 
 use http::Method;
 
-use super::{Bounds, Http, Pending, Response, Sink, Watch};
+use super::{Bounds, Http, Response, Sink, Watch};
 
 /// A request this blaze can't send: it is built without blaze-registry's `net` feature.
 #[derive(Clone, Debug)]
@@ -79,15 +79,14 @@ impl HyperHttp {
     }
 
     /// [`NoNet`] for `url`.
-    pub fn get_from_async(
+    pub fn get_from(
         &self,
         url: &str,
         _headers: &[(&str, &str)],
         _from: u64,
         _what: &str,
-    ) -> Pending<anyhow::Result<Response>> {
-        let refused = NoNet { url: url.to_owned() }; // alloc: an error's address
-        Box::pin(async move { Err(refused.into()) })
+    ) -> anyhow::Result<Response> {
+        Err(NoNet { url: url.to_owned() }.into())
     }
 }
 

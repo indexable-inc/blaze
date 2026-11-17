@@ -36,7 +36,7 @@ use std::{
     },
 };
 
-use blaze_hash::{HashMap, HashSet};
+use blaze_hash::{FixedState, Map, MapOpts, Set, SetOpts};
 
 use crate::{
     lease::{self, Taken},
@@ -731,7 +731,7 @@ pub(crate) fn size(path: &Path, problems: &mut Vec<String>) -> Result<u64, Strin
     };
     let device = device_of(&root);
     // alloc: a walk, one a file with more than one link
-    let mut linked: HashSet<u64, Global> = HashSet::new_in(Global);
+    let mut linked: Set<u64, FixedState, Global> = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
     let mut bytes = 0u64;
     // alloc: a walk, its directories to go
     let mut todo = vec![path.to_path_buf()];
@@ -844,7 +844,7 @@ fn other_device(area: &Path, sub: &Path) -> Result<Option<String>, String> {
 /// driver's own, kept between scans (the daemon moves it into each scan's job and back), never
 /// shared.
 pub struct Sizes {
-    known: HashMap<String, Measured, Global>,
+    known: Map<String, Measured, FixedState, Global>,
 }
 
 struct Measured {
@@ -868,7 +868,7 @@ impl Sizes {
     pub const KEPT_NS: u64 = 60 * 60 * 1_000_000_000;
 
     pub fn new() -> Sizes {
-        Sizes { known: HashMap::new_in(Global) }
+        Sizes { known: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }) }
     }
 
     /// The bytes under `dir` ([`size`]), from the last measure when nothing says it changed.

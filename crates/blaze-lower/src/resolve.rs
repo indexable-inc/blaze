@@ -35,9 +35,11 @@ pub enum Answer {
 
 /// The world's names, as blaze-scope answers them.
 pub trait Names {
-    /// The item `segments` names from the module the body is in, in `ns` (for the last
-    /// segment; the others are in the type namespace).
-    fn lookup(&mut self, ns: Ns, absolute: bool, segments: &[&str]) -> Answer;
+    /// The item `segments` names, in `ns` (for the last segment; the others are in the type
+    /// namespace), read where `crate::mark_site::site_of` of `mark` (the first word's mark,
+    /// [`View::mark_of_path`]) says: the body's module unless an expansion's mark says
+    /// otherwise.
+    fn lookup(&mut self, ns: Ns, absolute: bool, segments: &[&str], mark: Option<crate::mark_site::TextMark>) -> Answer;
     /// The item that is `lang`.
     fn lang(&mut self, lang: LangItem) -> Answer;
 }
@@ -202,7 +204,7 @@ pub fn resolve<'a>(v: &View<'_>, names: &mut dyn Names, alloc: Alloc<'a>) -> Res
                 out.paths.push(Resolved { path: p, ns: n, target: Target::LocalItem(row) });
                 continue;
             }
-            let answer = names.lookup(n, path.absolute, &segs);
+            let answer = names.lookup(n, path.absolute, &segs, v.mark_of_path(p)?);
             (answer, Read::Path { path: p, ns: n, answer })
         };
         match target {

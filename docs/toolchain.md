@@ -87,7 +87,7 @@ the standard library is part of a compiler.
 
 ## The LLVM blaze is built with
 
-Building blaze itself takes one more pinned piece, LLVM: `crates/hir-ty-codegen/llvm.json` names
+Building blaze itself takes one more pinned piece, LLVM: `crates/blaze-toolchain/pins/llvm.json` names
 its commit and version (23.1.4, our fork's `ix/23.x`) and the sha256 of each target's release
 archive. blaze fetches it itself, by that sha256, and hands it to the build scripts that link
 it: the root `Cargo.toml` declares it a pinned native input

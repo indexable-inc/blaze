@@ -7,7 +7,7 @@ use blaze_ids::radix;
 
 use crate::edit_distance::{closest, edit_distance};
 use crate::interning::InternedString;
-use crate::registry::{IndexSummary, QueryKind};
+use crate::registry::{IndexSummary, Lookup, QueryKind};
 use crate::resolver::CargoResult;
 use crate::version::OptVersionReq;
 use crate::{Dependency, PackageId, Registry, ResolveError, Summary};
@@ -404,9 +404,10 @@ fn alt_versions(registry: &impl Registry, dep: &Dependency) -> Option<CargoResul
     let mut wild_dep = dep.clone();
     wild_dep.set_version_req(OptVersionReq::Any);
 
-    let what = "the registry's every version of a dependency, for an error's hint (bounded by the HTTP client's timeouts)";
-    let candidates = match crate::poll::answer(what, registry.query_vec(&wild_dep, QueryKind::Exact)) {
-        Ok(candidates) => candidates,
+    // Unknown: no hint this round, which the resolve machine throws away once it is answered.
+    let candidates = match registry.query_vec(&wild_dep, QueryKind::Exact) {
+        Ok(Lookup::Answered(candidates)) => candidates,
+        Ok(Lookup::Unknown) => return None,
         Err(e) => return Some(Err(e)),
     };
     let mut candidates: Vec<_> = candidates
@@ -425,12 +426,11 @@ fn rejected_versions(
     registry: &impl Registry,
     dep: &Dependency,
 ) -> Option<CargoResult<Vec<IndexSummary>>> {
-    let what = "the registry's rejected versions of a dependency, for an error's hint (bounded by the HTTP client's timeouts)";
-    let mut version_candidates =
-        match crate::poll::answer(what, registry.query_vec(dep, QueryKind::RejectedVersions)) {
-            Ok(candidates) => candidates,
-            Err(e) => return Some(Err(e)),
-        };
+    let mut version_candidates = match registry.query_vec(dep, QueryKind::RejectedVersions) {
+        Ok(Lookup::Answered(candidates)) => candidates,
+        Ok(Lookup::Unknown) => return None,
+        Err(e) => return Some(Err(e)),
+    };
     version_candidates
         .sort_unstable_by(|a, b| a.package_id().version().cmp(b.package_id().version()));
     if version_candidates.is_empty() { None } else { Some(Ok(version_candidates)) }
@@ -445,12 +445,11 @@ fn alt_names(
     let mut wild_dep = dep.clone();
     wild_dep.set_version_req(OptVersionReq::Any);
 
-    let what = "the registry's names near a dependency's, for an error's hint (bounded by the HTTP client's timeouts)";
-    let name_candidates =
-        match crate::poll::answer(what, registry.query_vec(&wild_dep, QueryKind::AlternativeNames)) {
-            Ok(candidates) => candidates,
-            Err(e) => return Some(Err(e)),
-        };
+    let name_candidates = match registry.query_vec(&wild_dep, QueryKind::AlternativeNames) {
+        Ok(Lookup::Answered(candidates)) => candidates,
+        Ok(Lookup::Unknown) => return None,
+        Err(e) => return Some(Err(e)),
+    };
     let mut name_candidates: Vec<_> = name_candidates
         .into_iter()
         .map(|s| match s {

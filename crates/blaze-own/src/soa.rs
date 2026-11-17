@@ -454,7 +454,7 @@ tuple_columns!(0 T0, 1 T1, 2 T2, 3 T3, 4 T4, 5 T5, 6 T6, 7 T7, 8 T8, 9 T9);
 tuple_columns!(0 T0, 1 T1, 2 T2, 3 T3, 4 T4, 5 T5, 6 T6, 7 T7, 8 T8, 9 T9, 10 T10);
 tuple_columns!(0 T0, 1 T1, 2 T2, 3 T3, 4 T4, 5 T5, 6 T6, 7 T7, 8 T8, 9 T9, 10 T10, 11 T11);
 
-/// A struct-of-arrays vector of rows `C` (a tuple of field types) in `A`.
+/// A struct-of-arrays vector of rows `C` (a tuple of field types) in `A`: one block, one packed column a field, so a pass over one field reads only that field's bytes.
 ///
 /// # Invariants
 ///

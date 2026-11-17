@@ -192,6 +192,16 @@ pub(super) struct Instances {
     /// The trait fns decided at the site ([`Reached::AtInstance`], [`Reached::AtObject`]) and
     /// not walked as a body yet.
     pub(super) declared: HashMap<ItemKey, (), Global>,
+    /// Every trait fn a call site decided at an instance or on `dyn` (bits of [`Met::how`]),
+    /// kept for the whole walk whatever became of the fn's census row. A PROVIDED trait fn is
+    /// also a body (a concrete call whose impl leaves it out runs it, the Reference, Traits,
+    /// "Associated functions"): walked as one, it is in `seen`, so a later site deciding it at
+    /// an instance is dropped by the walk's pop, and an earlier site's `AtInstance` row is
+    /// replaced by `Checked`. Read from the census alone, such a fn was never asked at its
+    /// instances' shapes, and the impls overriding it were never reached (hello's stubs 15 and
+    /// 220: `integer_min`/`integer_max` at `usize` reach `<impl PartialOrd for usize>::lt`;
+    /// core calls `PartialOrd::lt` as a body through every derived `PartialOrd`).
+    decided: HashMap<ItemKey, u8, Global>,
     /// How many of the census's bodies (and whether `firsts`) were read already.
     bodies_read: usize,
     first_read: bool,
@@ -208,6 +218,23 @@ pub(super) struct Instances {
 }
 
 impl Instances {
+    /// Notes `k` popped from the work list with the outcome `decided` at its site: a trait fn
+    /// decided at an instance or on `dyn` is asked about in every round from now on
+    /// ([`Instances::decided`]), whether or not the walk files this row.
+    pub(super) fn note_decided(&mut self, k: ItemKey, decided: Option<&Reached>) {
+        let how = match decided {
+            Some(Reached::AtInstance) => AT_INSTANCE,
+            Some(Reached::AtObject) => AT_OBJECT,
+            _ => return,
+        };
+        match self.decided.get_mut(&k) {
+            Some(h) => *h |= how,
+            None => {
+                self.decided.insert(k, how);
+            }
+        }
+    }
+
     /// The pairs asked, sorted: [`Census::instance_pairs`].
     pub(super) fn into_pairs(self) -> Vec<(ItemKey, Shape), Global> {
         let mut out: Vec<(ItemKey, Shape), Global> = Vec::with_capacity_in(self.asked.len(), Global);
@@ -338,6 +365,13 @@ impl Instances {
                 Reached::AtObject => AT_OBJECT,
                 _ => continue,
             };
+            if let Some(Origin::Member { container, kind: MemberKind::Fn, name }) = r.keys.origin(*k) {
+                fns.push(Met { trait_: *container, f: *k, name: name.clone(), how });
+            }
+        }
+        // The sites' decisions the census no longer holds (a provided fn walked as a body too):
+        // merged with the rows above by key below.
+        for (k, &how) in self.decided.iter() {
             if let Some(Origin::Member { container, kind: MemberKind::Fn, name }) = r.keys.origin(*k) {
                 fns.push(Met { trait_: *container, f: *k, name: name.clone(), how });
             }

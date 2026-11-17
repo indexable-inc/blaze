@@ -564,13 +564,13 @@ pub struct Served {
     /// The check key ([`bodies_key`] filed by its bodies' reads) of each crate asked whose
     /// bodies part was found: what its dependents' keys and its constants' values
     /// (`hir_ty::consteval::deps`) are made from. Its bodies were given to the database.
-    pub keys: HashMap<CrateKey, ContentId, Global>,
-    outcomes: HashMap<CrateKey, ImageBuf, Global>,
+    pub keys: Map<CrateKey, ContentId, FixedState, Global>,
+    outcomes: Map<CrateKey, ImageBuf, FixedState, Global>,
     /// The bodies part of each crate of `keys`: what the database was given.
-    parts: HashMap<CrateKey, ImageBuf, Global>,
+    parts: Map<CrateKey, ImageBuf, FixedState, Global>,
     /// What each crate asked was looked up under: its base key ([`bodies_key`]) and its outcome's
     /// key, so asking it again under the same is no lookup.
-    asked: HashMap<CrateKey, (ContentId, Option<ContentId>), Global>,
+    asked: Map<CrateKey, (ContentId, Option<ContentId>), FixedState, Global>,
     /// What the searches of the crates' read-filing slots came to, as `blaze_record` counted
     /// them (`hir_def::deps::find_by_reads`), added by every [`serve`] until the driver takes
     /// them to report: one lookup a crate fetched whose bodies part is not under its base key
@@ -592,14 +592,14 @@ impl Served {
 fn layers(
     db: &Db,
     crates: impl Iterator<Item = Crate>,
-    known: &HashMap<CrateKey, ContentId, Global>,
+    known: &Map<CrateKey, ContentId, FixedState, Global>,
 ) -> (Vec<Vec<Crate>>, Vec<(Crate, Crate)>) {
     fn depth(
         db: &Db,
         krate: Crate,
-        asked: &HashSet<Crate, Global>,
-        memo: &mut HashMap<Crate, Result<usize, Crate>, Global>,
-        known: &HashMap<CrateKey, ContentId, Global>,
+        asked: &Set<Crate, FixedState, Global>,
+        memo: &mut Map<Crate, Result<usize, Crate>, FixedState, Global>,
+        known: &Map<CrateKey, ContentId, FixedState, Global>,
     ) -> Result<usize, Crate> {
         if let Some(&it) = memo.get(&krate) {
             return it;
@@ -628,8 +628,8 @@ fn layers(
         it
     }
     // alloc: setup: once per session
-    let asked: HashSet<Crate, Global> = crates.collect();
-    let mut memo = HashMap::new_in(Global);
+    let asked: Set<Crate, FixedState, Global> = crates.collect();
+    let mut memo = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     // alloc: setup: once per session
     let mut layers: Vec<Vec<Crate>> = Vec::new();
     // alloc: setup: once per session
@@ -657,7 +657,7 @@ fn layers(
 fn dep_keys(
     db: &Db,
     krate: Crate,
-    keys: &HashMap<CrateKey, ContentId, Global>,
+    keys: &Map<CrateKey, ContentId, FixedState, Global>,
 ) -> Option<Vec<ContentId>> {
     // alloc: once per crate per session
     (krate.data(db).dependencies.iter())
@@ -703,7 +703,7 @@ pub fn serve(
     served: &mut Served,
 ) -> Result<(), String> {
     // alloc: setup: once per serve
-    let images: HashMap<Crate, (ContentId, Inputs<'_>), Global> = crates
+    let images: Map<Crate, (ContentId, Inputs<'_>), FixedState, Global> = crates
         .iter()
         .filter_map(|&(krate, inputs)| Some((krate, (image_key(db, krate)?, inputs))))
         // alloc: setup: once per serve
@@ -773,7 +773,7 @@ pub fn serve(
     if changed {
         // Each part to its crate of this snapshot: the crates of the world, so a key whose
         // crate the world no longer has is given nothing, as `set_served` gives only those.
-        let mut parts = HashMap::new_in(Global);
+        let mut parts = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for &krate in base_db::all_crates(db).iter() {
             if let Some(part) = served.parts.get(&krate.key(db)) {
                 // clone: one handle a crate, once per serve that changed a part
@@ -878,7 +878,7 @@ pub struct Stored {
     /// The check key of each crate whose bodies part was kept, besides those [`Served::keys`]
     /// has: what its constants' values are filed under. By the crate's key, as
     /// [`Served::keys`] is, which the driver adds them to.
-    pub keys: HashMap<CrateKey, ContentId, Global>,
+    pub keys: Map<CrateKey, ContentId, FixedState, Global>,
     /// Each crate with a value not kept, and why: with no key, nothing of it is kept; with one,
     /// its bodies part is, and the reason is its outcome's.
     pub refused: Vec<(Crate, Refused)>,
@@ -909,7 +909,7 @@ pub fn store(
 ) -> Result<Stored, String> {
     let mut stored = Stored::default();
     // alloc: setup: once per session
-    let by_crate: HashMap<Crate, &Checked<'_>, Global> =
+    let by_crate: Map<Crate, &Checked<'_>, FixedState, Global> =
         checked.iter().map(|it| (it.krate, it)).collect();
     let (layers, left) = layers(db, by_crate.keys().copied(), &served.keys);
     for (krate, dep) in left {

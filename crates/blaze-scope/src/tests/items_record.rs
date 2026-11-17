@@ -210,13 +210,14 @@ fn ask(fresh: &Names<'static>, read: &RecordItems<'static, Loaded>, all: &[&'sta
                 (Some(a), Some(b)) => {
                     same(a.len(), b.len(), &format!("{what}: member list length"))?;
                     for (m, row) in a.iter().zip(b.iter()) {
+                        let row = rec(row, "a member row")?;
                         let what = format!("{what}: member `{}`", m.name.unwrap_or("(unnamed)"));
                         same((m.key, m.name, m.item, m.detail.kind(), m.written_by), (row.key, row.name, row.outline, row.kind, row.written_by), &what)?;
                         same(format!("{:?}", m.detail).contains("body_holds_items: true"), row.body_holds_items, &format!("{what}: body holds items"))?;
-                        same(m.text, rec(read.member_text(key, row), "a member's text")?, &format!("{what}: text"))?;
+                        same(m.text, rec(read.member_text(key, &row), "a member's text")?, &format!("{what}: text"))?;
                     }
                 }
-                (a, b) => return Err(differs(format!("{what}: members: fresh {:?}, record {:?}", a.map(<[_]>::len), b.map(<[_]>::len)))),
+                (a, b) => return Err(differs(format!("{what}: members: fresh {:?}, record {:?}", a.map(<[_]>::len), b.map(|m| m.len())))),
             }
         }
         same(count, r.items(), &format!("`{c}`'s items"))?;

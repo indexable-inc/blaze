@@ -552,7 +552,7 @@ static CONTROLS: Once = Once::new();
 #[test]
 fn a_command_answers_as_a_fresh_state_does() {
     CONTROLS.call_once(each_planted_bug_is_caught);
-    blaze_sim::check(SimConfig::cases(200), |tape| {
+    blaze_sim::check_kept(SimConfig::cases(200), blaze_sim::sim_kept!(), |tape| {
         let seed = tape.next_u64("sim seed");
         let coarse = tape.bool("coarse");
         let ops: Vec<Op> = tape.vec(0..=30, "ops", op);

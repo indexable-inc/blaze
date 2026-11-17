@@ -37,7 +37,8 @@ pub enum ResolveError {
     /// outside this crate box theirs here).
     // dyn: an implementor's own error type, on the error path.
     Registry(Box<dyn core::error::Error + Send + Sync>),
-    /// The wait for a registry's answer did not end.
+    /// A driver's wait for a registry's answer did not end (an answer of
+    /// [`Event::Answered`](crate::resolving::Event::Answered) may be this).
     Wait(Unfinished),
 
     // Names.
@@ -139,6 +140,8 @@ pub enum ResolveError {
     LinksTwice { links: InternedString },
     CrateNamedTwice { from: PackageId, to: PackageId },
     NotPinned { dep: InternedString, source: String },
+    /// The resolve machine ran its most rounds and still met queries no answer held.
+    Unsettled { rounds: u32, asks: usize },
 
     // `[replace]`.
     OverrideNotFound { spec: PackageIdSpec, source: SourceId, req: OptVersionReq },
@@ -471,6 +474,11 @@ unable to verify that `{package}` is the same as when the lockfile was generated
                 f,
                 "`{dep}` of {source} is not pinned by Cargo.lock, and blaze reads that source \
                  only at the versions Cargo.lock pins"
+            ),
+            E::Unsettled { rounds, asks } => write!(
+                f,
+                "the resolve still asked the registry for {asks} more answers after {rounds} \
+                 rounds of them (blaze-resolve's `resolving::MOST_ROUNDS`, rule 18)"
             ),
 
             E::OverrideNotFound { spec, source, req } => write!(

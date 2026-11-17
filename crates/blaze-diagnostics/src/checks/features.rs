@@ -34,7 +34,7 @@ mod library;
 
 use std::ops::ControlFlow;
 
-use blaze_hash::HashSet;
+use blaze_hash::{FixedState, Set, SetOpts};
 use blaze_items::Fact;
 use hir::{HirFileId, InFile};
 use std::alloc::Global;
@@ -122,7 +122,7 @@ pub(crate) struct Features {
     pub(crate) lang: Vec<Enabled>,
     /// The rest, which rustc takes for library features, in the order written.
     pub(crate) lib: Vec<Enabled>,
-    names: HashSet<String, Global>,
+    names: Set<String, FixedState, Global>,
     /// rustc's `sess.unstable_features.is_nightly_build()`: what its feature errors suggest.
     pub(crate) nightly: bool,
     /// rustc's `sess.opts.unstable_features.is_nightly_build()`: whether `#![feature]` may be

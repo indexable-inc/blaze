@@ -214,8 +214,11 @@ impl Pattern {
                     }
                 }
                 Token::AnyRecursiveSequence => {
-                    // Matches empty, or a run ending just after a separator.
-                    let mut any = false;
+                    // Matches empty, a run ending just after a separator, or the whole rest of
+                    // the text: glob's loop, finding no separator it can stop after, runs off
+                    // the end and hands the tokens after it the empty rest, so a trailing `**`
+                    // (or `**/`) takes `a/b/c` and `a` alike.
+                    let mut any = next[n];
                     for p in (0..=n).rev() {
                         rest[p] = next[p] || any;
                         if p > 0 && is_separator(chars[p - 1]) {

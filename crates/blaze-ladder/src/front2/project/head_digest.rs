@@ -10,8 +10,9 @@
 //! (`Want::MemberFn`); a type alias or trait alias (`Want::Head`).
 //!
 //! Its DIGEST ([`ProjectWorld::want_digest`]) is the head records (head_record.rs) of every head
-//! the want makes, each by [`head_record::digest`], in a fixed order: a head made again equal
-//! moves nobody. What the record form leaves out by name (head_record.rs's header: a fn's and
+//! the want makes, each by [`head_record::reader_digest`] (the record without a fn's text slot:
+//! what it means, not how it is spelled), in a fixed order: a head made again equal, or only
+//! respaced or commented, moves nobody. What the record form leaves out by name (head_record.rs's header: a fn's and
 //! an ADT's lifetime part, an impl's const parameters) is the command's to cover beside it.
 //!
 //! Its PLACE ([`ProjectWorld::want_place`]): the crate, file and outline entry the want's item
@@ -95,6 +96,7 @@ pub const fn reads_a_head(kind: FactKind) -> bool {
             | FactKind::Attrs
             | FactKind::ConstParams
             | FactKind::AssocGenerics
+            | FactKind::TypeAlias
     )
 }
 
@@ -178,8 +180,9 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         h.update(&(heads.len() as u64).to_le_bytes());
         for at in heads.iter().copied() {
             let head = head_record::from_store(&self.store, at, None, None).map_err(|error| HeadDigestError::Record { want, at, error })?;
-            let bytes = head_record::encode(head, self.store.tys.view(), alloc).map_err(|error| HeadDigestError::Record { want, at, error })?;
-            h.update(&head_record::digest(&bytes).0);
+            // What the head means, not how it is spelled: a reformat moves no reader.
+            let digest = head_record::reader_digest(head, self.store.tys.view(), alloc).map_err(|error| HeadDigestError::Record { want, at, error })?;
+            h.update(&digest.0);
         }
         Ok(h.finish())
     }

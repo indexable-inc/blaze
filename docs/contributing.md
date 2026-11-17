@@ -456,7 +456,7 @@ profiles pinned today are cargo's, which the script refuses with that error.
 ## LLVM
 
 blaze builds against one LLVM, 23.1.4 with our fixes, built by blaze for each target it ships on
-and pinned by its commit, version and per-target sha256 in `crates/hir-ty-codegen/llvm.json`.
+and pinned by its commit, version and per-target sha256 in `crates/blaze-toolchain/pins/llvm.json`.
 Every native build of blaze links it (blaze-engine's default `native` feature, through
 hir-ty-codegen's `llvm`): std and every opt-level 2/3 unit are LLVM's, and `blaze-stencil`'s
 build script has it make the stencils. Only the seed (`--no-default-features --features seed`)

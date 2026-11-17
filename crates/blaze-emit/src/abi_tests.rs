@@ -226,7 +226,9 @@ fn two_returns_go_in_x0_and_x1_both_ways() {
     assert_eq!(f(0xffff_ffff, 0x1_0000_0102), Two(0x101, 0x02), "each narrowed to its type");
 }
 
-/// More than eight named integer arguments and a C-variadic DEFINITION stay refused by name; a
+/// More than eight named integer arguments are built (pass/stack.rs; runs in stack_tests.rs:
+/// judge-changed 2026-11-17 by lane TE, it said "refused" while the stack was not built); a
+/// C-variadic DEFINITION stays refused by name; a
 /// C-variadic CALL is built (pass/variadic.rs; its words and a run against `snprintf` are in
 /// variadic_tests.rs). Judge-changed from "variadic calls are refused": that encoded the
 /// tier's old gap, not the convention: AAPCS64 places a variadic call's arguments by stage C
@@ -243,8 +245,8 @@ fn stack_arguments_and_variadic_definitions_are_refused() {
     let out = b.call(Flags::NONE, callee, callee_sig, &[v[0]; 9]);
     b.ret(&[out]);
     let func = b.finish_checked().expect("builds");
-    let refused = emitted(func.view(), &[Via::Address]).err();
-    assert!(matches!(refused, Some(EmitError::Unsupported { op: Op::Call, .. })), "{refused:?}");
+    let built = emitted(func.view(), &[Via::Address]);
+    assert!(built.is_ok(), "nine integer arguments are built: {:?}", built.err());
 
     // A variadic callee given only its declared argument: the call is a plain one on both
     // platforms (only the `...` values move), and it is built.

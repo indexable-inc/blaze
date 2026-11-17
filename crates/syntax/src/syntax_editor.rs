@@ -12,7 +12,7 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use std::alloc::Global;
 use syntax_tree::TextRange;
 
@@ -218,7 +218,7 @@ pub struct SyntaxEdit {
     old_root: SyntaxNode,
     new_root: SyntaxNode,
     changed_elements: Vec<SyntaxElement>,
-    annotations: HashMap<SyntaxAnnotation, Vec<SyntaxElement>, Global>,
+    annotations: Map<SyntaxAnnotation, Vec<SyntaxElement>, FixedState, Global>,
 }
 
 impl SyntaxEdit {

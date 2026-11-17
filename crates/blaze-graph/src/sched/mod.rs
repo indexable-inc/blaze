@@ -1372,7 +1372,7 @@ pub(crate) struct World {
     own_now: u64,
     /// By world id: each job's last give-way while it may ask again ([`giveway`]), dropped as
     /// it ends.
-    gave_way: blaze_hash::HashMap<u32, GaveWay, std::alloc::Global>, // alloc: the world's, for its life
+    gave_way: blaze_hash::Map<u32, GaveWay, blaze_hash::FixedState, std::alloc::Global>, // alloc: the world's, for its life
 }
 
 fn find<T>(rows: &[(u32, T)], member: u32) -> Option<&T> {
@@ -1405,7 +1405,11 @@ impl World {
             stopped: Vec::new(),
             own_timers: None,
             own_now: 0,
-            gave_way: blaze_hash::HashMap::new_in(std::alloc::Global), // alloc: the world's, for its life
+            gave_way: blaze_hash::Map::new(blaze_hash::MapOpts {
+                hasher: blaze_hash::FixedState,
+                alloc: std::alloc::Global,
+                capacity: None,
+            }), // alloc: the world's, for its life
         }
     }
 

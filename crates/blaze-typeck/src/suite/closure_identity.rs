@@ -17,7 +17,7 @@
 use std::vec::Vec;
 
 use super::check_body;
-use crate::body::IntSuffix;
+use crate::body::{Expr, IntSuffix};
 use crate::columns::CaptureKind;
 use crate::fixture::{Bb, Fx};
 use crate::ids::{Abi, FnPtrHeader, ItemKey, LangItem, List, Mutbl, Safety, UintTy};
@@ -35,6 +35,12 @@ struct Items {
     main: ItemKey,
     /// `fn kinds(x: u8, s: S, t: S) -> u8`
     kinds: ItemKey,
+    /// `fn own(x: u8) -> u8`: a caller whose own closure is selected at its call.
+    own: ItemKey,
+    /// `impl<F: Fn() -> u8> Next for Map<F> { type Out = u8; }`
+    next_map: ItemKey,
+    /// `fn if_let(o: Option<u32>)`: a closure whose `if let` binds what its block uses.
+    if_let: ItemKey,
 }
 
 /// `with_facts`: whether the world answers `Question::Closure` (the change's key part).
@@ -45,7 +51,7 @@ fn world(with_facts: bool) -> (Fx, Items) {
     let copy = fx.tr("Copy", 1, Vec::new(), &[]);
     fx.lang(LangItem::Copy, copy);
     let (p0, p1) = (fx.param(0), fx.param(1));
-    let rust_call = FnPtrHeader { abi: Abi::RustCall, safety: Safety::Safe };
+    let rust_call = FnPtrHeader { abi: Abi::RustCall, safety: Safety::Safe, c_variadic: false };
     let fn_once = fx.tr("FnOnce", 2, Vec::new(), &["Output"]);
     fx.lang(LangItem::FnOnce, fn_once);
     let out = fx.alias(fn_once, "Output", &[p0, p1]);
@@ -116,8 +122,29 @@ fn world(with_facts: bool) -> (Fx, Items) {
     fx.func("peek", 0, &[r_s], u8_, Vec::new());
     let main = fx.func("main", 0, &[u8_], u8_, Vec::new());
     let kinds = fx.func("kinds", 0, &[u8_, s, s], u8_, Vec::new());
+
+    // trait Next { type Out; }   impl<F: Fn() -> u8> Next for Map<F> { type Out = u8; }
+    // fn run<T: Next>(t: T) -> <T as Next>::Out   fn own(x: u8) -> u8
+    let next = fx.tr("Next", 1, Vec::new(), &["Out"]);
+    let unit = fx.tuple(&[]);
+    let b = fx.bound(fn_, &[p0, unit]);
+    let ret = fx.proj(fn_once, &[p0, unit], "Output", u8_);
+    let next_map = fx.imp("impl Next for Map", 1, map_f, Some((next, &[])), &[("Out", u8_)], std::vec![b, ret]);
+    let out_t = fx.alias(next, "Out", &[p0]);
+    let b = fx.bound(next, &[p0]);
+    fx.func("run", 1, &[p0], out_t, std::vec![b]);
+    let own = fx.func("own", 0, &[u8_], u8_, Vec::new());
+
+    // enum Option<T> { None, Some(T) }   fn if_let(o: Option<u32>)
+    let (option, _) = fx.enum_("Option", 1, &[("None", &[]), ("Some", &[p0])]);
+    fx.lang_def(LangItem::OptionNone, crate::world::Def::Ctor { adt: option, variant: 0, kind: crate::world::CtorKind::Unit });
+    fx.lang_def(LangItem::OptionSome, crate::world::Def::Ctor { adt: option, variant: 1, kind: crate::world::CtorKind::Tuple });
+    let u32_ = fx.u32();
+    let opt_u32 = fx.adt(option, &[u32_]);
+    let unit = fx.unit();
+    let if_let = fx.func("if_let", 0, &[opt_u32], unit, Vec::new());
     fx.finish();
-    (fx, Items { make, gen_, main, kinds })
+    (fx, Items { make, gen_, main, kinds, own, next_map, if_let })
 }
 
 fn closure_of(c: &crate::Checked<'_>, t: PTy) -> Option<(ItemKey, u32, Vec<PTy>)> {
@@ -202,6 +229,40 @@ fn a_closure_stored_in_an_adaptor_meets_the_impls_bound() {
     let PNode::Adt(_, l) = c.types.view().node(c.expr_ty[wrapped.ix()]).unwrap() else { panic!("Map<..>") };
     let f = c.types.view().list(l).unwrap()[0];
     assert_eq!(closure_of(&c, f), Some((it.make, 0, Vec::new())));
+}
+
+/// ```text
+/// fn own(x: u8) -> u8 { run(wrap(|| x)) }   // run<T: Next>(t: T) -> <T as Next>::Out
+/// ```
+/// core's `char_count_general_case` shape (`s.iter().filter(|&&b| ..).count()`): a callee's
+/// signature names a projection whose arguments hold a closure of the body being checked. Its
+/// writeback selects the impl at that call (`Checked::selected`) with the closure's facts from
+/// this check's own closure rows: the world holds no record of `own` yet, and asking it was the
+/// stop `Malformed(BodyTypeInRecord(Closure(own, 0)))`. The impl's `F: Fn() -> u8` holds only
+/// with the closure's real kind and signature, so a source that dropped them selects nothing.
+/// Should print: "test suite::closure_identity::a_call_selects_its_impl_over_the_bodys_own_closure ... ok".
+#[test]
+fn a_call_selects_its_impl_over_the_bodys_own_closure() {
+    let (fx, it) = world(true);
+    let mut b = Bb::new();
+    let x = b.param("x");
+    let lx = b.local(x);
+    let cl = b.closure(&[], lx);
+    let wrap = b.path(&["wrap"]);
+    let wrapped = b.call(wrap, &[cl]);
+    let run = b.path(&["run"]);
+    let ran = b.call(run, &[wrapped]);
+    let root = b.block(&[], Some(ran));
+    let c = check_body(&fx, &b, it.own, root, Plant::None, InferPlant::None);
+    let d: Vec<_> = c.diags.iter().map(|d| (d.code, d.at)).collect();
+    assert_eq!(d, Vec::new());
+    assert_eq!(closure_of(&c, c.expr_ty[cl.ix()]), Some((it.own, 0, Vec::new())));
+    let rows = c.selected_at(ran);
+    assert_eq!(rows.len(), 1, "one projection in `run`'s signature: {rows:?}");
+    assert!(
+        matches!(rows[0].selected, crate::selected::Selected::Impl { imp, .. } if imp == it.next_map),
+        "`<Map<{{closure#0 of own}}> as Next>::Out` is `impl Next for Map`'s: {rows:?}"
+    );
 }
 
 /// ```text
@@ -307,4 +368,40 @@ fn the_kinds_and_captures_are_recorded_by_ordinal() {
         (cls[4], t, CaptureKind::ByValue),
     ];
     assert_eq!(caps, want, "captures: (closure, binding, mode)");
+}
+
+/// ```text
+/// fn if_let(o: Option<u32>) { let c = move || { if let Some(s) = o { s } else { 0 } }; }
+/// ```
+/// std's `panic_handler` shape: the `if let`'s binding `s` is bound inside the closure, so the
+/// only capture is `o` (by value: `move`). A walk that visits `then` before `cond`'s `let`
+/// also records `(c, s, ..)`, and the builder then stops on "a binding captured before its
+/// binding". Should print:
+/// "test suite::closure_identity::an_if_let_binding_in_a_closure_is_not_a_capture ... ok".
+#[test]
+fn an_if_let_binding_in_a_closure_is_not_a_capture() {
+    let (fx, it) = world(true);
+    let mut b = Bb::new();
+    let o = b.param("o");
+    let s = b.bind("s");
+    let some = b.lang_variant_pat(LangItem::OptionSome, &[s]);
+    let lo = b.local(o);
+    let cond = b.e(Expr::Let { pat: some, init: lo });
+    let ls = b.local(s);
+    let then = b.block(&[], Some(ls));
+    let zero = b.int(None);
+    let else_ = b.block(&[], Some(zero));
+    let iff = b.e(Expr::If { cond, then, else_: Some(else_) });
+    let body = b.block(&[], Some(iff));
+    let cl = b.move_closure(&[], body);
+    let p = b.bind("c");
+    let s0 = b.let_(p, None, cl);
+    let root = b.block(&[s0], None);
+    let c = check_body(&fx, &b, it.if_let, root, Plant::None, InferPlant::None);
+    let d: Vec<_> = c.diags.iter().map(|d| (d.code, d.at)).collect();
+    assert_eq!(d, Vec::new());
+    let caps: Vec<_> = (0..c.captures.len())
+        .map(|i| (c.captures.column::<0>()[i], c.captures.column::<1>()[i], c.captures.column::<2>()[i]))
+        .collect();
+    assert_eq!(caps, std::vec![(cl, o, CaptureKind::ByValue)], "captures: (closure, binding, mode)");
 }

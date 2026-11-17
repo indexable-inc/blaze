@@ -2264,3 +2264,56 @@ go in the same piece. Tests: the first fix's cases; `const_eval_select`; a bare 
 body resolves at its definition; an item name written by a `macro_rules!` resolves at the CALL (the control
 resolves it at the definition and must fail); a local written by a `macro_rules!` does not capture the
 caller's.
+
+
+### An expansion is its token record (D122, 2026-11-17 00:15; the coordinator's design; not built)
+
+The owner, 2026-11-17 00:03: "fix 'macro expansions are rendered to text and lexed again' properly". Read first
+(the fact lane's report, rounds/wave-2311/G3-expansion-text-facts.md in the coordinator's notes): the parser takes
+words, never text (`parser::Tokens`); an expansion in BODY position is already parsed straight from its words
+(blaze-lower feed.rs); each expansion already has a token record (blaze-expand record.rs: tokens, contexts,
+origins); `blaze_file_items::outline_tokens` exists, is proven equal to the text outliner, and no production path
+calls it. The round trip is only in ITEM position: blaze-scope `expand_decls` renders the tokens to text
+(`render_with`), lexes that text to outline it, rewrites a statement call's text into a second text, lexes a nested
+call's input again out of its parent's rendered text, and front2 lexes the rendered text once more for every head
+and body of an item an expansion made. Three defects of one night came from it (an integer glued to a dot and read
+back as a float; `$crate` spelled into the text; marks found by the ADDRESS of a slice of that text).
+
+END STATE. The token record is the expansion; nothing parses a rendering of it.
+
+1. The record holds, per token: its kind, whether it is joined to the next (a flag of the token, never read off
+   spacing), its lexeme by index into the record's own table of distinct lexemes, its mark, and where it came
+   from (the call's input or the macro's template, by token index). No column holds a rendered text.
+2. A position inside an expansion is a TOKEN RANGE of its record. Origins, findings, an item's extent and a
+   body's extent in an expansion are token ranges; they are turned into a file place only when printed, by the
+   rule already ruled ("a finding inside an expansion is reported where its tokens came from").
+3. An expansion's items are outlined FROM ITS TOKENS (`outline_tokens`, made the production path): names from
+   the lexeme table, attributes as token ranges. A statement call's items get their enclosing block's module as
+   a node of the outline, not as text wrapped around them.
+4. A call written inside an expansion takes its input as a sub-range of its parent's tokens.
+5. Heads and bodies of items an expansion made are lowered from their token range: the same word feed body
+   expansions use. A mark is read at a token's index.
+6. Digests of expansion-made things are over TOKENS, by one function (kind, lexeme bytes, joined, mark, in
+   order): the expansion's id, an item's outline, signature and body digests, the names digest. Item keys
+   already need no text. A FILE's digests stay over its bytes (a file's identity is its text, and bytes are
+   compared without lexing).
+7. Text of an expansion exists in one function, `shown(record, range)`, for a person: diagnostics and
+   `blaze explain`. Nothing lexes its output; a test fails if anything under crates/ passes it to a lexer.
+8. The scope record's `expansions` section names each expansion's record by key (a link, D116), never a copy of
+   its text.
+
+Pieces (interfaces first; each beside the old path until its reader switches):
+E0 the form itself, as one small crate every reader can depend on (blaze-tokens, unless blaze-expand already sits
+   below blaze-file-items and blaze-lower): the view read in place, token ranges, the token digest, `shown`.
+E1 blaze-expand: the record's form (the joined flag, the lexeme table, token ranges, the token digest, `shown`).
+E2 blaze-file-items: `outline_tokens` in production form (no text argument), with its equality test against the
+   text outliner on files kept as the control.
+E3 blaze-scope: `expand_decls` outlines from tokens; nested inputs as sub-ranges; statement items by an outline
+   node; origins by token index; `render_with` leaves the parse path.
+E4 blaze-lower: `lower_signature` and `lower_body_expanding` over a token range; `signature_key` and `body_key`
+   of expansion-made items over tokens.
+E5 blaze-ladder front2: heads and bodies of expansion-made items through E4; marks by token index (replacing
+   the lookup by address).
+E6 blaze-cli: the `expansions` section as links; the record's form number moves.
+Proof: every x0 rung and the std census print the same through the token path as through the text path while
+both exist (rule 78); the three defects above each have a rung that fails on the text path.

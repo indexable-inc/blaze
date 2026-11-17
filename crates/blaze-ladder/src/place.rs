@@ -46,6 +46,54 @@ pub struct Body {
     pub tls: Vec<u32, Global>,
     /// By `Vtable` reference place: the program's table ([`Vtables`]) the word is the address of.
     pub vtables: Vec<u32, Global>,
+    /// Per row of `code.positions`, in order: the line or the column written there, resolved
+    /// from the front end when the body was readied ([`resolve_positions`]). The code's bytes
+    /// hold zero there, so its record id does not move with a line (rule 71).
+    pub positions: Vec<u32, Global>,
+}
+
+/// Why a body's source position could not be placed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PositionError {
+    /// The front end gave no line and column for byte `site` of item `item`.
+    Unplaced { item: u128, site: u32, gap: crate::seam::PositionGap },
+    /// A body's resolved values do not match its code's position rows one for one.
+    Count { slot: u32, rows: usize, values: usize },
+    /// A position field past the code's end.
+    Past { slot: u32, at: u32 },
+}
+
+impl core::fmt::Display for PositionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            PositionError::Unplaced { item, site, gap } => {
+                write!(f, "the `#[track_caller]` location at byte {site} of item {item:#x}: {gap}")
+            }
+            PositionError::Count { slot, rows, values } => {
+                write!(f, "slot {slot}: {rows} source position fields and {values} resolved values (place.rs `resolve_positions`)")
+            }
+            PositionError::Past { slot, at } => write!(f, "slot {slot}: a source position field at {at} is past the code's end"),
+        }
+    }
+}
+
+impl core::error::Error for PositionError {}
+
+/// The value of each of `code`'s source position fields, in order, from `position` (the front
+/// end's `source_position`): the line or the column it gives.
+pub fn resolve_positions(
+    code: &Code<Global>,
+    position: &dyn Fn(u128, u32) -> Result<(u32, u32), crate::seam::PositionGap>,
+) -> Result<Vec<u32, Global>, PositionError> {
+    let mut out = Vec::with_capacity_in(code.positions.len(), Global);
+    for p in code.positions.iter() {
+        let (line, col) = position(p.item, p.site).map_err(|gap| PositionError::Unplaced { item: p.item, site: p.site, gap })?;
+        out.push(match p.field {
+            blaze_lir::PositionField::Line => line,
+            blaze_lir::PositionField::Col => col,
+        });
+    }
+    Ok(out)
 }
 
 /// What one word of a vtable becomes: a slot's entry thunk (a method, the drop glue) or another
@@ -182,6 +230,8 @@ pub enum PlaceError {
     ShimInProcess,
     /// The run could not be watched for traps, or a trap could not be placed (crate::trap).
     Trap(crate::trap::TrapError),
+    /// A `#[track_caller]` location's line or column could not be placed.
+    Position(PositionError),
 }
 
 impl core::fmt::Display for PlaceError {
@@ -217,6 +267,7 @@ impl core::fmt::Display for PlaceError {
             PlaceError::NotThisMachine => write!(f, "the program's code is AArch64 and this machine is not: the skeleton runs a program only where it was emitted for"),
             PlaceError::ShimInProcess => write!(f, "the C entry shim `main(argc, argv)` reads two registers and the in-process call sets one: a Rust-edition program runs only in its own process (run.md piece 6)"),
             PlaceError::Trap(error) => write!(f, "the trap watch: {error}"),
+            PlaceError::Position(error) => write!(f, "{error}"),
         }
     }
 }
@@ -410,6 +461,16 @@ impl Records for Table<'_> {
                 None => return Err(format!("slot {slot}: an address word at {at} is past the code's end")),
             }
         }
+        if body.positions.len() != body.code.positions.len() {
+            return Err(PositionError::Count { slot, rows: body.code.positions.len(), values: body.positions.len() }.to_string());
+        }
+        for (p, &value) in body.code.positions.iter().zip(body.positions.iter()) {
+            let at = p.at as usize;
+            match into.get_mut(at..at + 4) {
+                Some(field) => field.copy_from_slice(&value.to_le_bytes()),
+                None => return Err(PositionError::Past { slot, at: p.at }.to_string()),
+            }
+        }
         Ok(())
     }
 
@@ -454,6 +515,12 @@ fn write_statics(image: &StaticImage<Global>, base: u64, fns: &[(InstanceKey, u3
 }
 
 
+/// The record id `code` is bound under: its bytes' content id, so a body whose bytes did not
+/// change keeps its record (its source position fields are zero in the bytes).
+pub fn record_id(code: &Code<Global>) -> RecordId {
+    RecordId(blaze_ids::ContentId::of("blaze-ladder code 1", &code.bytes).0)
+}
+
 /// Places `bodies`, body `n` in slot `n`, in one edit. `image` is the program's statics and the
 /// memory reserved for them ([`load_statics`]), written here once the slots are declared, each
 /// fn pointer in it the thunk of the slot `static_fns` gives its instance (sorted by key);
@@ -483,7 +550,7 @@ pub fn place(
     }
     let mut binds = Vec::with_capacity_in(bodies.len(), Global);
     for (n, body) in bodies.iter().enumerate() {
-        let id = blaze_ids::ContentId::of("blaze-ladder code 1", &body.code.bytes).0;
+        let RecordId(id) = record_id(&body.code);
         binds.push(wire::Bind {
             slot: Slot(n as u32),
             record: RecordId(id),
@@ -524,6 +591,10 @@ pub enum Entry {
     /// i32` calling `lang_start::<T>` (blaze-build start.rs `c_main_shim`): run only in the
     /// program's own process (run.md piece 6); [`Placed::call`] refuses it.
     CMainShim,
+    /// A C `main`, `extern "C" fn(argc: i32, argv: *const *const c_char) -> i32` (C17
+    /// 5.1.2.2.1): called with the run's argument vector (crate::argv `Argv::c`, whose `Argv`
+    /// the caller keeps alive across the call); the status is its low 8 bits.
+    Main(crate::argv::CArgs),
 }
 
 impl Placed {
@@ -536,8 +607,8 @@ impl Placed {
     /// Calls the function in `slot` on this thread: the process status it ends with, or the
     /// stub it called (a function that is not built: the program is left there, crate::stub).
     pub fn call(&self, slot: u32, entry: Entry) -> Result<Ended, PlaceError> {
-        // The shim reads `argc` in `w0` and `argv` in `x1`; `Stops::run` sets only `x0`, so a
-        // call here would hand `lang_start` whatever `x1` held. Refused before anything starts.
+        // A Rust program's start runs only in its own process (run.md piece 6, D103): its
+        // `process::exit` would end this one. Refused before anything starts.
         if let Entry::CMainShim = entry {
             return Err(PlaceError::ShimInProcess);
         }
@@ -546,11 +617,13 @@ impl Placed {
             _ => return Err(PlaceError::NoEntry { slot }),
         };
         let me = self.shared.birth().begin();
-        // The one argument: the host's table for a hosted entry; the other entries take none
-        // and do not read `x0`.
-        let argument = match entry {
-            Entry::Unit | Entry::I32 => core::ptr::null(),
-            Entry::Hosted(table) => table.as_ptr().cast_const(),
+        // The entry's words, in `x0` and `x1` (stub.rs `enter`): the host's table for a hosted
+        // entry; `argc` and `argv` for a C `main` (`argc` zero-extended: never negative,
+        // crate::argv invariant 4); zero where the entry takes nothing (it reads neither).
+        let (first, second) = match entry {
+            Entry::Unit | Entry::I32 => (0, 0),
+            Entry::Hosted(table) => (table.as_ptr() as usize, 0),
+            Entry::Main(args) => (args.argc as u32 as usize, args.argv.as_ptr() as usize),
             // Refused at the top of this function.
             Entry::CMainShim => return Err(PlaceError::ShimInProcess),
         };
@@ -560,11 +633,15 @@ impl Placed {
         let armed = watch.arm().map_err(PlaceError::Trap)?;
         // SAFETY: `at` is the slot's word: the address of a body this module placed (`place`),
         // emitted by blaze-emit in the C convention for a function of no parameters (`Unit`,
-        // `I32`) or one pointer parameter in `x0` (`Hosted`: the host's table, alive for this
-        // call: the caller holds the `Hosting` it points into), in a mapping never unmapped
-        // (`sys::Code`); the program's stubs were placed with `self.stops`' address, and
-        // `&self` is one run at a time on this thread.
-        let left = unsafe { self.stops.run(at, argument) }.ok_or(PlaceError::NotThisMachine)?;
+        // `I32`), one pointer parameter in `x0` (`Hosted`: the host's table, alive for this
+        // call: the caller holds the `Hosting` it points into) or a C `main`'s two (`Main`:
+        // `argc` in `w0`, `argv` in `x1`, alive for this call: the caller holds the `Argv` it
+        // points into; the program may write its strings and array, as C17 5.1.2.2.1 allows,
+        // and nothing reads them during the call), in a mapping never unmapped (`sys::Code`);
+        // `run_built`'s `entry_shape` matched the entry's signature to the variant; the
+        // program's stubs were placed with `self.stops`' address, and `&self` is one run at a
+        // time on this thread.
+        let left = unsafe { self.stops.run(at, first, second) }.ok_or(PlaceError::NotThisMachine)?;
         let caught = armed.disarm();
         me.safepoint();
         if let Some(caught) = caught {
@@ -578,7 +655,7 @@ impl Placed {
             // `fn()`: nothing is returned.
             Entry::Unit => 0,
             // An `i32` in `w0`: its low 8 bits, as the C runtime's `exit` takes it.
-            Entry::I32 | Entry::Hosted(_) => left.value as u8,
+            Entry::I32 | Entry::Hosted(_) | Entry::Main(_) => left.value as u8,
             // Never called here (refused at the top); a C `main`'s `i32` would be read the same.
             Entry::CMainShim => left.value as u8,
         }))

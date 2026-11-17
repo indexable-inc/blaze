@@ -28,7 +28,7 @@ pub fn main(out: &Path) {
     let prefix = env::var_os(PREFIX).filter(|it| !it.is_empty()).unwrap_or_else(|| {
         panic!(
             "blaze-stencil's stencils are made by the pinned LLVM, and {PREFIX} is unset: blaze \
-             sets it to the LLVM crates/hir-ty-codegen/llvm.json pins, laid out under its home, \
+             sets it to the LLVM crates/blaze-toolchain/pins/llvm.json pins, laid out under its home, \
              for every package `[workspace.metadata.blaze.native.llvm]` in the root Cargo.toml \
              names (docs/cargo.md, \"Pinned native inputs\"); build with blaze"
         )

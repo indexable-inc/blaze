@@ -81,12 +81,15 @@ impl<A: Allocator + Clone> ClosureRows<A> {
         ClosureRows { owners: Vec::new_in(alloc.clone()), rows: Vec::new_in(alloc) }
     }
 
-    /// Files each closure of `checked`, the clean record of `owner`'s body, its signature
-    /// copied into `into` (the head store's table). An owner already filed keeps its first
-    /// rows: a body checked again in one command read the same answers (its check reads the
-    /// same records whatever was checked before it: check.rs), so its closures are the same.
-    /// The copy's scratch is `into`'s own allocator, handed down by the table's maker (D102).
-    pub fn file(&mut self, owner: ItemKey, checked: &tc::Checked<'_>, into: &mut PortableTys<'_>) {
+    /// Files each closure of `checked`, the clean record of `body` (its owner `body.owner`), its
+    /// signature copied as written into `into` (the head store's table; an `async` block the
+    /// closure returns is its identity, which needs the body's expressions). An owner already
+    /// filed keeps its first rows: a body checked again in one command read the same answers
+    /// (its check reads the same records whatever was checked before it: check.rs), so its
+    /// closures are the same. The copy's scratch is `into`'s own allocator, handed down by the
+    /// table's maker (D102).
+    pub fn file(&mut self, body: &tc::BodyView<'_>, checked: &tc::Checked<'_>, into: &mut PortableTys<'_>) {
+        let owner = body.owner;
         let at = match self.owners.binary_search_by_key(&owner, |o| o.0) {
             Ok(_) => return,
             Err(at) => at,
@@ -97,7 +100,7 @@ impl<A: Allocator + Clone> ClosureRows<A> {
         let first = self.rows.len() as u32;
         let kinds = checked.closures.column::<1>();
         for ordinal in 0..count {
-            let got = match blaze_build::layout::closure_facts(checked, ordinal, generics, into, scratch) {
+            let got = match blaze_build::layout::closure_facts(body, checked, ordinal, generics, into, scratch) {
                 Ok((_, sig, _)) => Ok((kinds[ordinal as usize], sig)),
                 Err(e) => Err(RowRefusal::Copy(build_error_text(&e))),
             };
@@ -139,12 +142,12 @@ fn param_count(v: tc::PTys<'_>) -> u32 {
     n
 }
 
-/// The refusal's static text: `BuildError::Malformed` carries one; any other is named by its
-/// kind (a closure's facts are copied with no layout facts, so no other arises today).
+/// The refusal's static text: `copy_written` refuses with `Malformed` or `UnsupportedSig`, each
+/// carrying one; any other is named by its kind.
 fn build_error_text(e: &blaze_build::BuildError) -> &'static str {
     match e {
-        blaze_build::BuildError::Malformed { what } => what,
-        _ => "blaze-build refused a node of the signature or a capture (not `Malformed`)",
+        blaze_build::BuildError::Malformed { what } | blaze_build::BuildError::UnsupportedSig { what } => what,
+        _ => "blaze-build refused a node of the signature or a capture (not `Malformed` or `UnsupportedSig`)",
     }
 }
 

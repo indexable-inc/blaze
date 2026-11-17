@@ -424,6 +424,11 @@ impl<'f, 'n, 'c, 'o, 'a> Emit<'f, 'n, 'c, 'o, 'a> {
             let id = DataId(d as u32);
             let bytes = view.data_bytes_of(id);
             let relocs = view.data_relocs_of(id);
+            if !view.data_positions_of(id).is_empty() {
+                // The module would hold the line and column themselves, absolute positions in a
+                // code record (rule 71); the LLVM tier has no position fixup yet.
+                return Err(self.refuse(None, "a data row holding a source position (a `#[track_caller]` `Location`'s line or column)"));
+            }
             write!(self.out, "@d{}_{d} = private unnamed_addr constant <{{ ", self.index)?;
             let mut at = 0usize;
             let mut first = true;

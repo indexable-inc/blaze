@@ -200,20 +200,26 @@ pub enum Safety {
     Unsafe,
 }
 
-/// A fn pointer's header: its ABI and safety. Part of the type: two fn pointers relate only
-/// when their headers are equal; a safe one coerces to the unsafe one of the same ABI
-/// (`UnsafeFnPointer`).
+/// A fn pointer's header: its ABI, safety and whether it is C-variadic. Part of the type: two
+/// fn pointers relate only when their headers are equal; a safe one coerces to the unsafe one
+/// of the same ABI (`UnsafeFnPointer`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FnPtrHeader {
     pub abi: Abi,
     pub safety: Safety,
+    /// `...` as the last parameter (the Reference, "Function pointer types": "Variadic
+    /// parameters can only be specified with extern function types with the "C" or "cdecl"
+    /// calling convention"): `unsafe extern "C" fn(A, ...)` and `unsafe extern "C" fn(A)` are
+    /// two types; the inputs list only the named parameters.
+    pub c_variadic: bool,
 }
 
 impl FnPtrHeader {
     /// `fn(..)`: the safe Rust ABI.
-    pub const RUST: FnPtrHeader = FnPtrHeader { abi: Abi::Rust, safety: Safety::Safe };
+    pub const RUST: FnPtrHeader = FnPtrHeader { abi: Abi::Rust, safety: Safety::Safe, c_variadic: false };
 
-    /// One byte: the ABI in the low bits, `unsafe` in bit 7 (a key's and a canonical form's).
+    /// One byte: the ABI in the low six bits, C-variadic in bit 6, `unsafe` in bit 7 (a key's
+    /// and a canonical form's; blaze-typeck's `FnSig` hash already gives bit 6 that meaning).
     pub const fn bits(self) -> u8 {
         let abi = match self.abi {
             Abi::Rust => 0,
@@ -224,6 +230,7 @@ impl FnPtrHeader {
             Abi::RustCall => 5,
             Abi::LlvmIntrinsic => 6,
         };
+        let abi = if self.c_variadic { abi | 0x40 } else { abi };
         match self.safety {
             Safety::Safe => abi,
             Safety::Unsafe => abi | 0x80,
@@ -232,7 +239,7 @@ impl FnPtrHeader {
 
     /// The inverse of [`FnPtrHeader::bits`]; `None` for a byte it never writes.
     pub const fn from_bits(b: u8) -> Option<FnPtrHeader> {
-        let abi = match b & 0x7f {
+        let abi = match b & 0x3f {
             0 => Abi::Rust,
             1 => Abi::C,
             2 => Abi::CUnwind,
@@ -243,7 +250,7 @@ impl FnPtrHeader {
             _ => return None,
         };
         let safety = if b & 0x80 != 0 { Safety::Unsafe } else { Safety::Safe };
-        Some(FnPtrHeader { abi, safety })
+        Some(FnPtrHeader { abi, safety, c_variadic: b & 0x40 != 0 })
     }
 }
 

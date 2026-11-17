@@ -10,10 +10,27 @@ use blaze_lex::{Cpu, FrontmatterAllowed, LiteralKind, TokenKind, tokenize};
 use blaze_memchr::{memchr, memrchr};
 use blaze_own::{AVec, Alloc};
 
+use crate::matcher::{Live, NO_SEQ};
+use crate::sequences::{
+    ArgOf, BANG, BAR, BRACE, CLOSE, Cut, DOT, DOTDOT, Guard, NE, NO_WORD, OPEN, OTHER, SEP, SEQS, TRIE, WORD,
+};
 use crate::{
     Arg, Block, Finding, Findings, Fix, LintError, Linted, Mark, ONLY_OWN, Owner, Rule, RuleSet, Run, Scope, Span,
     Template, TestBits, Unit, Walk, count,
 };
+
+/// The rules that have sequences in `sequences::SEQS`: when none of them runs, the matcher's
+/// pass is not made.
+const SEQUENCE_RULES: [Rule; 8] = [
+    Rule::Stops,
+    Rule::FormatMacro,
+    Rule::AmbientHeap,
+    Rule::NoAsync,
+    Rule::AmbientRead,
+    Rule::LeftUndone,
+    Rule::UnboundedWait,
+    Rule::AmbientHasher,
+];
 
 /// A token's kind, as the rules tell kinds apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +55,9 @@ struct Tok {
     start: u32,
     end: u32,
     k: K,
+    /// An identifier's number in the rules' word table (`sequences::WORDS`), found once while
+    /// lexing; `NO_WORD` for every other token and for a word no rule reads.
+    word: u8,
 }
 
 /// A `{` open, and what opened it.
@@ -73,6 +93,8 @@ enum Plan {
     /// The method name at `name` becomes row `row`'s new name, and when the row has a suffix,
     /// it goes at `after` (the call's `)` end).
     Rename { row: u32, name: Span, after: u32 },
+    /// These four tokens deleted, each a whole token (`dbg`, `!`, `(`, `)` around a value).
+    Strip { tokens: [Span; 4] },
 }
 
 /// A finding before test code is known.
@@ -117,10 +139,16 @@ const NOT_BEFORE_INDEX: [&str; 22] = [
     "in", "let", "return", "break", "mut", "for", "where", "impl", "dyn", "as", "else", "match", "if", "while", "move", "yield",
     "unsafe", "const", "static", "ref", "box", "type",
 ];
-const COLLECTIONS: [&str; 11] =
+pub(crate) const COLLECTIONS: [&str; 11] =
     ["Vec", "Box", "String", "Rc", "Arc", "BTreeMap", "BTreeSet", "VecDeque", "BinaryHeap", "HashMap", "HashSet"];
-const DEFINING: [&str; 5] = ["struct", "enum", "union", "trait", "type"];
-const FORMAT_MACROS: [&str; 8] = ["format", "format_args", "write", "writeln", "print", "println", "eprint", "eprintln"];
+pub(crate) const DEFINING: [&str; 5] = ["struct", "enum", "union", "trait", "type"];
+/// The formatting macros `format-macro` finds (its sequences are in `sequences::SEQS`).
+pub(crate) const FORMAT_MACROS: [&str; 8] =
+    ["format", "format_args", "write", "writeln", "print", "println", "eprint", "eprintln"];
+/// Every word [`Pass::on_word`] matches on by name: each must be in `sequences::WORDS`, which a
+/// compile-time check there holds, since a word not in the table is never dispatched.
+pub(crate) const DISPATCHED: [&str; 16] =
+    ["use", "as", "clone", "Global", "fn", "type", "impl", "trait", "mod", "for", "self", "unwrap", "expect", "std", "alloc", "unsafe"];
 
 pub(crate) fn run<'a>(rules: &RuleSet, unit: &Unit<'_>, alloc: Alloc<'a>, out: &mut Findings<'a>) -> Result<Linted<'a>, LintError> {
     if u32::try_from(unit.text.len()).is_err() {
@@ -147,6 +175,9 @@ pub(crate) fn run<'a>(rules: &RuleSet, unit: &Unit<'_>, alloc: Alloc<'a>, out: &
     };
     pass.lex(unit.holes)?;
     pass.walk();
+    if SEQUENCE_RULES.iter().any(|rule| rules.runs(*rule)) {
+        pass.sequences();
+    }
     let test_at_end = pass.test_at(unit.text.len().saturating_sub(1) as u32);
     let from = count(out.list.len())?;
     pass.emit(out)?;
@@ -202,7 +233,7 @@ impl<'u, 'a> Pass<'u, 'a> {
                 return Err(LintError::BadHole { index, hole: *hole });
             }
             self.lex_run(at, start);
-            self.toks.push(Tok { start: hole.start, end: hole.end, k: K::Hole });
+            self.toks.push(Tok { start: hole.start, end: hole.end, k: K::Hole, word: NO_WORD });
             at = end;
         }
         self.lex_run(at, len);
@@ -259,7 +290,15 @@ impl<'u, 'a> Pass<'u, 'a> {
                 TokenKind::Percent => K::P(b'%'),
                 _ => K::Other,
             };
-            self.toks.push(Tok { start, end, k });
+            // The one probe per identifier: its number in the rules' word table, or none.
+            let word = match k {
+                K::Ident => match WORD.index(&self.bytes[start as usize..end as usize]) {
+                    Some(at) => at as u8,
+                    None => NO_WORD,
+                },
+                _ => NO_WORD,
+            };
+            self.toks.push(Tok { start, end, k, word });
         }
     }
 
@@ -561,6 +600,15 @@ impl<'u, 'a> Pass<'u, 'a> {
 
     fn on_word(&mut self, i: usize, t: Tok) {
         let w = self.str_of(t);
+        if t.word == NO_WORD {
+            // No rule reads this word (every word below is in the table, a compile-time check
+            // in sequences.rs): only a recursive call can be its use.
+            self.defining = false;
+            if self.rules.runs(Rule::Recursion) {
+                self.recursion_name(i, t, w);
+            }
+            return;
+        }
         let was_defining = core::mem::replace(&mut self.defining, DEFINING.contains(&w));
         let rules = self.rules;
         match w {
@@ -589,18 +637,13 @@ impl<'u, 'a> Pass<'u, 'a> {
                     self.fns[sig.item as usize].has_self = true;
                 }
             }
-            "unwrap" | "expect" | "panic" | "unreachable" | "todo" | "unimplemented" if rules.runs(Rule::Stops) => {
-                self.stop(i, t, w);
-            }
+            "unwrap" | "expect" if rules.runs(Rule::Stops) => self.stop(i, t, w),
             "std" | "alloc" if rules.runs(Rule::Ambient) => self.ambient_head(i, t, w),
             "unsafe" if rules.runs(Rule::UnsafeComment) => self.unsafe_word(i, t),
             _ => {}
         }
         if rules.runs(Rule::Ambient) && COLLECTIONS.contains(&w) && !self.in_use && !was_defining {
             self.collection(i, t, w);
-        }
-        if rules.runs(Rule::FormatMacro) && FORMAT_MACROS.contains(&w) {
-            self.format_macro(i, t);
         }
         if rules.runs(Rule::Renamed) && rules.renames().iter().any(|r| r.old == w) {
             self.renamed(i, t, w);
@@ -1206,8 +1249,8 @@ impl<'u, 'a> Pass<'u, 'a> {
 
     // ---- stops --------------------------------------------------------------------------
 
-    /// stops.rs: `.unwrap()`, `.expect(`, and `panic!`, `unreachable!`, `todo!`,
-    /// `unimplemented!` (not after `.`, not `!=`).
+    /// stops.rs: `.unwrap()` and `.expect(`. Its macros (`panic!`, `unreachable!`, `todo!`,
+    /// `unimplemented!`, not after `.`, not `!=`) are sequences (`sequences::SEQS`).
     fn stop(&mut self, i: usize, t: Tok, w: &str) {
         let next = self.tok(i + 1);
         let method = self.method(i);
@@ -1221,22 +1264,6 @@ impl<'u, 'a> Pass<'u, 'a> {
             }
             "expect" if method && matches!(next, Some(n) if n.k == K::P(b'(')) => {
                 self.push(Template::StopExpect, t.start, t.end, None);
-            }
-            "panic" | "unreachable" | "todo" | "unimplemented" if !method => {
-                let Some(bang) = next else { return };
-                if bang.k != K::P(b'!') {
-                    return;
-                }
-                if matches!(self.tok(i + 2), Some(e) if e.k == K::P(b'=') && e.start == bang.end) {
-                    return;
-                }
-                let template = match w {
-                    "panic" => Template::StopPanic,
-                    "unreachable" => Template::StopUnreachable,
-                    "todo" => Template::StopTodo,
-                    _ => Template::StopUnimplemented,
-                };
-                self.push(template, t.start, bang.end, None);
             }
             _ => {}
         }
@@ -1348,18 +1375,192 @@ impl<'u, 'a> Pass<'u, 'a> {
         }
     }
 
-    // ---- formatting macros --------------------------------------------------------------
+    // ---- the sequences ------------------------------------------------------------------
 
-    fn format_macro(&mut self, i: usize, t: Tok) {
-        if self.method(i) {
-            return;
+    /// The symbol of token `i` for the matcher, and how many tokens it takes: `::`, `..` and
+    /// `!=` are one symbol of two adjacent tokens.
+    #[inline]
+    fn symbol(&self, i: usize, t: Tok) -> (u8, usize) {
+        let joined = |c: u8| matches!(self.tok(i + 1), Some(n) if n.k == K::P(c) && n.start == t.end);
+        match t.k {
+            K::Ident if t.word != NO_WORD => (t.word, 1),
+            K::P(b':') if joined(b':') => (SEP, 2),
+            K::P(b'.') if joined(b'.') => (DOTDOT, 2),
+            K::P(b'!') if joined(b'=') => (NE, 2),
+            K::P(b'.') => (DOT, 1),
+            K::P(b'(') => (OPEN, 1),
+            K::P(b')') => (CLOSE, 1),
+            K::P(b'!') => (BANG, 1),
+            K::P(b'{') => (BRACE, 1),
+            K::P(b'|') => (BAR, 1),
+            // A hole is here too: no sequence matches across a child item.
+            _ => (OTHER, 1),
         }
-        let Some(bang) = self.tok(i + 1) else { return };
-        if bang.k != K::P(b'!') || matches!(self.tok(i + 2), Some(e) if e.k == K::P(b'=') && e.start == bang.end) {
-            return;
+    }
+
+    /// Every sequence of `sequences::SEQS` found in one walk over the tokens: the live trie
+    /// states advanced by each token's symbol, each sequence that ends handed to
+    /// [`Pass::on_sequence`] with its first and last token.
+    ///
+    /// One finding per site where two rules' sequences overlap on one table: a std or hashbrown
+    /// path (`collections::HashMap`, `hash_map::RandomState`, `ambient-hasher`'s `std-table`)
+    /// is the more specific finding, so a constructor sequence that starts at its last token
+    /// (`HashMap::new(`, `RandomState::default(` of `ambient-read`; `HashMap::new_in(` of
+    /// `ambient-hasher`) is not pushed after it. Where `ambient-hasher` does not run, the path
+    /// is no finding and the constructor's is.
+    fn sequences(&mut self) {
+        let n = self.toks.len();
+        let mut live = Live::new();
+        // The last token of the latest `std-table` finding pushed; none yet.
+        let mut std_table_at = usize::MAX;
+        let mut i = 0;
+        // Bounded: each turn moves `i` forward by one or two tokens.
+        while i < n {
+            let t = self.toks[i];
+            let (sym, width) = self.symbol(i, t);
+            let last = i + width - 1;
+            i += width;
+            if live.is_empty() && !TRIE.starts(sym) {
+                continue;
+            }
+            live.step(&TRIE, sym, (i - width) as u32);
+            // Bounded: one turn per live state (the longest sequence's length at most), and
+            // within it one per sequence that ends at its node.
+            for at in 0..live.len() {
+                let (node, start) = live.state(at);
+                let mut seq = TRIE.first_end(node);
+                while seq != NO_SEQ {
+                    let template = SEQS[seq as usize].template;
+                    let covered = start as usize == std_table_at
+                        && matches!(template, Template::ReadHashSeed | Template::HasherDefault);
+                    if !covered && self.on_sequence(seq as usize, start as usize, last) && template == Template::HasherStd {
+                        std_table_at = last;
+                    }
+                    seq = TRIE.next_end(seq);
+                }
+            }
         }
-        // `macro_rules! format` defines one: the name is not followed by `!`, so it is not here.
-        self.push(Template::FormatMacro, t.start, bang.end, Some(Arg::Span(Span::new(t.start, t.end))));
+    }
+
+    /// Sequence `row` matched from token `first` to token `last`: its guard read, its finding
+    /// pushed when its rule runs. Whether it was pushed.
+    fn on_sequence(&mut self, row: usize, first: usize, last: usize) -> bool {
+        let seq = &SEQS[row];
+        if !self.rules.runs(seq.template.rule()) {
+            return false;
+        }
+        let pass = match seq.guard {
+            Guard::None => true,
+            Guard::NotMethod => !self.method(first) && !self.is_word(self.back(first, 1), "fn"),
+            Guard::Unbounded => self.unbounded(last),
+        };
+        if !pass {
+            return false;
+        }
+        let (from, to) = match seq.cut {
+            Cut::Whole => (first, last),
+            Cut::DropLast => (first, last - 1),
+            Cut::DropFirst => (first + 1, last),
+            Cut::Inner => (first + 1, last - 1),
+        };
+        let (a, b) = (self.toks[from], self.toks[to]);
+        let arg = match seq.arg {
+            ArgOf::None => None,
+            ArgOf::Row => Some(Arg::Int(row as u32)),
+            ArgOf::FirstToken => {
+                let head = self.toks[first];
+                Some(Arg::Span(Span::new(head.start, head.end)))
+            }
+        };
+        let plan = match seq.template {
+            Template::UndoneDbg => self.dbg_fix(first),
+            _ => Plan::None,
+        };
+        self.cands.push(Cand { template: seq.template, range: Span::new(a.start, b.end), arg, plan });
+        true
+    }
+
+    /// `loop {` with its `{` at `brace`: whether nothing between the braces leaves it (no
+    /// `break`, `return` or `?`; a child item, a hole, is not read). A `break` of an inner loop
+    /// or a `return` in a closure counts too: text cannot tell them apart, so the rule says less,
+    /// never more. A brace that never closes in this item reports nothing.
+    fn unbounded(&self, brace: usize) -> bool {
+        let Some(close) = self.closing(brace) else { return false };
+        // Bounded: one turn per token of the loop's body.
+        !(brace + 1..close).any(|k| {
+            let t = self.toks[k];
+            t.k == K::P(b'?') || (t.k == K::Ident && matches!(self.str_of(t), "break" | "return"))
+        })
+    }
+
+    /// The fix of `dbg!(..)` whose `dbg` is token `at`: the four tokens `dbg`, `!`, `(`, `)`
+    /// deleted, which leaves the value and drops the print. Only where the argument is a value
+    /// whose meaning does not change without the macro around it ([`Pass::is_value`]): a call or
+    /// a literal. `dbg!(x)` of a place moves `x` where `x` alone may borrow it, and an operator
+    /// inside would bind to its neighbours: those are left for a person.
+    fn dbg_fix(&self, at: usize) -> Plan {
+        let (Some(name), Some(bang), Some(open)) = (self.tok(at), self.tok(at + 1), self.tok(at + 2)) else {
+            return Plan::None;
+        };
+        if open.k != K::P(b'(') {
+            return Plan::None;
+        }
+        let Some(close) = self.closing(at + 2) else { return Plan::None };
+        if !self.is_value(at + 3, close) {
+            return Plan::None;
+        }
+        let shut = self.toks[close];
+        let span = |t: Tok| Span::new(t.start, t.end);
+        Plan::Strip { tokens: [span(name), span(bang), span(open), span(shut)] }
+    }
+
+    /// Tokens `from..to` are one value expression that keeps its meaning without brackets
+    /// around it: a literal alone, or a path or method chain (words, `.`, `::`) whose last part
+    /// is a call's or a macro's group, or a `?` or `.await` after one. An operator, a `<`, a
+    /// brace, a comma, a reference or a bare place (a name, a field, an index) is not one.
+    fn is_value(&self, from: usize, to: usize) -> bool {
+        if to == from + 1 {
+            return matches!(self.tok(from), Some(t) if matches!(t.k, K::Int | K::Float | K::Lit));
+        }
+        let mut value = false;
+        let mut k = from;
+        // Bounded: each turn moves `k` forward, past a whole group at a bracket.
+        while k < to {
+            let Some(t) = self.tok(k) else { return false };
+            let before = self.back(k, 1).filter(|_| k > from);
+            match t.k {
+                K::Ident => {
+                    let w = self.str_of(t);
+                    if matches!(
+                        w,
+                        "as" | "move" | "if" | "match" | "loop" | "while" | "for" | "unsafe" | "return" | "break"
+                            | "let" | "async" | "ref" | "mut" | "dyn" | "impl" | "box"
+                    ) {
+                        return false;
+                    }
+                    value = w == "await" && matches!(before, Some(b) if b.k == K::P(b'.'));
+                }
+                K::Raw => value = false,
+                K::Int | K::Float | K::Lit if k == from => value = true,
+                K::P(b'.') => value = false,
+                K::P(b':') if self.colons_at(k) || self.colons_before(k + 1) => value = false,
+                K::P(b'!') if matches!(before, Some(b) if b.k == K::Ident && b.end == t.start) => value = false,
+                K::P(b'(' | b'[') => {
+                    let call = matches!(before, Some(b) if matches!(b.k, K::Ident | K::Raw | K::P(b')' | b'!')));
+                    let macro_group = matches!(before, Some(b) if b.k == K::P(b'!'));
+                    let Some(shut) = self.closing(k) else { return false };
+                    if shut >= to {
+                        return false;
+                    }
+                    value = (t.k == K::P(b'(') && call) || macro_group;
+                    k = shut;
+                }
+                K::P(b'?') => value = true,
+                _ => return false,
+            }
+            k += 1;
+        }
+        value
     }
 
     // ---- renamed ------------------------------------------------------------------------
@@ -1563,14 +1764,24 @@ impl<'u, 'a> Pass<'u, 'a> {
             }
             let args = Run { from: args_from, to: count(out.args.len())? };
             let fixes_from = count(out.fixes.len())?;
-            if let Plan::Rename { row, name, after } = c.plan {
-                let rename = renames[row as usize];
-                let edits_from = count(out.edits.len())?;
-                out.push_edit(name, rename.new)?;
-                if after != u32::MAX {
-                    out.push_edit(Span::new(after, after), rename.suffix)?;
+            match c.plan {
+                Plan::None => {}
+                Plan::Rename { row, name, after } => {
+                    let rename = renames[row as usize];
+                    let edits_from = count(out.edits.len())?;
+                    out.push_edit(name, rename.new)?;
+                    if after != u32::MAX {
+                        out.push_edit(Span::new(after, after), rename.suffix)?;
+                    }
+                    out.fixes.push(Fix { edits: Run { from: edits_from, to: count(out.edits.len())? } });
                 }
-                out.fixes.push(Fix { edits: Run { from: edits_from, to: count(out.edits.len())? } });
+                Plan::Strip { tokens } => {
+                    let edits_from = count(out.edits.len())?;
+                    for token in tokens {
+                        out.push_edit(token, "")?;
+                    }
+                    out.fixes.push(Fix { edits: Run { from: edits_from, to: count(out.edits.len())? } });
+                }
             }
             let fixes = Run { from: fixes_from, to: count(out.fixes.len())? };
             out.list.push(Finding { template: c.template, range: c.range, args, fixes });

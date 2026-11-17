@@ -7,9 +7,13 @@
 //!
 //! The allocator has no default: a table that lives within one task is in its frame
 //! (`HashMap<K, V, &Frame>`, from `blaze_mem::frame::current`), a longer one in the request,
-//! revision or image allocator, and one on the global heap names `Global`. A table is made with
-//! [`Map::new_in`], [`Map::with_capacity_in`] or [`Map::from_iter_in`], which take the
-//! allocator and build the hasher, so no caller names one.
+//! revision or image allocator, and one on the global heap names `Global`. The hasher is named
+//! too (decision D125), and both are fields of the one constructor's options (D126, rule 83):
+//! `Map::new(MapOpts { hasher: FixedState, alloc: frame, capacity: None })`, `Some(n)` to
+//! reserve.
+//! A map of an iterator's pairs is `new` then `extend`. The older names (`new_in`,
+//! `with_capacity_in`, `from_iter_in`, `with_hasher_in`, `with_capacity_and_hasher_in`) are
+//! calls of `new` and go at the sweep.
 //!
 //! The methods are the ones the tree uses of the hashbrown map this replaces, with the same
 //! names and meanings; its iteration order is the table's slot order, a function of the inserts,
@@ -37,43 +41,96 @@ pub struct Map<K, V, S, A: Allocator> {
 fn by_key<K, V, S: KeyHash<K>>(hasher: &S) -> impl Fn(&(K, V)) -> u64 + '_ {
     move |entry| hasher.hash_key(&entry.0)
 }
-impl<K, V, S: Default, A: Allocator> Map<K, V, S, A> {
-    /// An empty map in `alloc`; it allocates nothing until the first insert.
+/// What a [`Map`] is made from ([`Map::new`], rule 83 options-struct): every field is written at
+/// every use, the hasher too (D125): `Map::new(MapOpts { hasher: FixedState, alloc: frame,
+/// capacity: None })`.
+///
+/// A call's named arguments: write it as a literal in the call that takes it (rule 83).
+#[blaze::args]
+#[derive(Clone, Copy, Debug)]
+pub struct MapOpts<S, A> {
+    /// The hasher, as a value: `FixedState` for ordinary keys, a [`SipKey`] for keys an
+    /// outsider picks, `BuildKeyHasher::default()` for keys that are hashes already.
+    ///
+    /// [`SipKey`]: crate::SipKey
+    pub hasher: S,
+    /// The allocator the table's memory is in.
+    pub alloc: A,
+    /// Entries room is made for at once: `None` allocates nothing until the first insert,
+    /// `Some(n)` reserves room for `n`.
+    pub capacity: Option<usize>,
+}
+
+impl<K, V, S, A: Allocator> Map<K, V, S, A> {
+    /// The map `opts` describe: empty, on `opts.hasher` in `opts.alloc`, with room for
+    /// `opts.capacity` entries; a refused allocation is a panic naming it ([`Map::try_new`]
+    /// returns it). A map of an iterator's pairs is `new` then [`Extend::extend`].
     #[inline]
-    pub fn new_in(alloc: A) -> Self {
-        Map::with_hasher_in(S::default(), alloc)
+    pub fn new(opts: MapOpts<S, A>) -> Self {
+        let table = RawTable::with_capacity_in(opts.capacity.unwrap_or(0), opts.alloc);
+        Map { table, hasher: opts.hasher }
     }
 
-    /// An empty map in `alloc` with room for `capacity` entries.
+    /// [`Map::new`], with a refused allocation of `opts.capacity` returned.
+    #[inline]
+    pub fn try_new(opts: MapOpts<S, A>) -> Result<Self, AllocFailure> {
+        let table = RawTable::try_with_capacity_in(opts.capacity.unwrap_or(0), opts.alloc)?;
+        Ok(Map { table, hasher: opts.hasher })
+    }
+}
+
+impl<K, V, S: Default, A: Allocator> Map<K, V, S, A> {
+    /// An empty map in `alloc` on `S::default()`.
+    ///
+    /// D126: goes at the sweep; write `Map::new(MapOpts { hasher, alloc, capacity: None })`.
+    #[inline]
+    pub fn new_in(alloc: A) -> Self {
+        Map::new(MapOpts { hasher: S::default(), alloc, capacity: None })
+    }
+
+    /// An empty map in `alloc` on `S::default()` with room for `capacity` entries.
+    ///
+    /// D126: goes at the sweep; write `Map::new(MapOpts { hasher, alloc, capacity: Some(n) })`.
     #[inline]
     pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
-        Map::with_capacity_and_hasher_in(capacity, S::default(), alloc)
+        Map::new(MapOpts { hasher: S::default(), alloc, capacity: Some(capacity) })
     }
 }
 
 impl<K: Eq, V, S: KeyHash<K> + Default, A: Allocator> Map<K, V, S, A> {
-    /// The map of `iter`'s pairs in `alloc`, a later pair replacing an earlier one's value:
-    /// what `collect()` makes, with the allocator named.
+    /// The map of `iter`'s pairs in `alloc` on `S::default()`, a later pair replacing an
+    /// earlier one's value.
+    ///
+    /// D126: goes at the sweep; write `Map::new(MapOpts { hasher, alloc, capacity })`, then
+    /// `extend`.
     #[inline]
     pub fn from_iter_in<I: IntoIterator<Item = (K, V)>>(iter: I, alloc: A) -> Self {
         let iter = iter.into_iter();
-        let mut map = Map::with_capacity_in(iter.size_hint().0, alloc);
+        let capacity = Some(iter.size_hint().0);
+        let mut map = Map::new(MapOpts { hasher: S::default(), alloc, capacity });
         map.extend(iter);
         map
     }
 }
 
 impl<K, V, S, A: Allocator> Map<K, V, S, A> {
-    /// An empty map on `hasher` in `alloc`, in a `const` too.
+    /// An empty map on `hasher` in `alloc`, in a `const` too. Its own body, not a call of
+    /// [`Map::new`], because `new` is not `const` (it may allocate) and a `static` may be made
+    /// by this one.
+    ///
+    /// D126: goes at the sweep where it is not in a `const`; write
+    /// `Map::new(MapOpts { hasher, alloc, capacity: None })`.
     #[inline]
     pub const fn with_hasher_in(hasher: S, alloc: A) -> Self {
         Map { table: RawTable::new_in(alloc), hasher }
     }
 
     /// An empty map on `hasher` in `alloc` with room for `capacity` entries.
+    ///
+    /// D126: goes at the sweep; write `Map::new(MapOpts { hasher, alloc, capacity: Some(n) })`.
     #[inline]
     pub fn with_capacity_and_hasher_in(capacity: usize, hasher: S, alloc: A) -> Self {
-        Map { table: RawTable::with_capacity_in(capacity, alloc), hasher }
+        Map::new(MapOpts { hasher, alloc, capacity: Some(capacity) })
     }
 
     #[inline]

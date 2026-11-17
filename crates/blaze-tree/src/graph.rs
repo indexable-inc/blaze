@@ -12,7 +12,7 @@ use blaze_hash::hash_map::Entry;
 use std::cmp::Ordering;
 use std::ops::Range;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_resolve::resolver::{CliFeatures, CompileKind, FeaturesFor, ResolvedFeatures};
 use blaze_resolve::{
     DepKind, Dependency, FeatureMap, FeatureValue, InternedString, PackageId, Resolve, Summary,
@@ -204,7 +204,7 @@ pub(crate) struct Graph<'a> {
     slots: Vec<NodeId>,
     stride: usize,
     /// The feature nodes by `(package node, name)`.
-    feature_index: HashMap<(NodeId, usize), NodeId, Global>,
+    feature_index: Map<(NodeId, usize), NodeId, FixedState, Global>,
     /// After [`Graph::restrict`], the nodes still in the graph.
     live: Option<Bits>,
 }
@@ -237,10 +237,7 @@ impl<'a> Graph<'a> {
             dep_names: Vec::with_capacity(names),
             slots,
             stride,
-            feature_index: HashMap::with_capacity_in(
-                if graph_features { nodes } else { 0 },
-                Global,
-            ),
+            feature_index: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(if graph_features { nodes } else { 0 }) }),
             live: None,
         }
     }

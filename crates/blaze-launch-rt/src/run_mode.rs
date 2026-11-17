@@ -32,16 +32,21 @@
 //! thread-local (statics come with the run record, piece 8); a record whose pads land placed
 //! before the parent's `Down::Personality` named the program's personality routine
 //! ([`EhError::NoPersonality`]; run_mode/personality.rs); an outside name the process
-//! does not have; a hosted entry (`bstd`'s host table); run mode on x86-64 (code records are
-//! AArch64). A parent's `Failed` stops the program with [`STOPPED`] (D86) naming the function.
+//! does not have; an entry form none of `unit`, `c-main` and `hosted` ([`Start::parse`]); run
+//! mode on x86-64 (code records are AArch64). A parent's `Failed` stops the program with
+//! [`STOPPED`] (D86) naming the function.
+//!
+//! **A hosted entry** (`hosted:<symbol>`, bstd's `bstd_hosted_start`; run.md, "Every program
+//! runs in the child") is called with bstd's host table, which the launcher makes in this
+//! process over its own world before [`run`] ([`Handed::Hosted`]); this crate never names bstd.
 //!
 //! **TO VERIFY BY A TEST** (listed in the piece's report): (1) the two-view code area
 //! (`sys::Code`) runs placed code under the launcher's current signature (run.md, "Executable
 //! memory": ad hoc signed runs, the hardened runtime kills it); (2) an unwind entry's length does
 //! not depend on the addresses it is made for (eh.rs writes every address as an 8-byte absptr),
 //! which [`RunMode::place`] relies on to size the entry before it has its address; (3) the
-//! hello-world rung's entry is `extern "C" fn()` or C `main(argc, argv)`, the two forms
-//! [`EntryForm`] has.
+//! hello-world rung's entry is `extern "C" fn()`, C `main(argc, argv)` or bstd's hosted
+//! `extern "C" fn(*const HostTable) -> i32`, the three forms [`EntryForm`] has.
 //!
 //! The simulation (run_mode/tests.rs) prints "run_mode: one need, one placement; plant
 //! StoreBeforeRegister caught".
@@ -840,6 +845,10 @@ pub enum EntryForm {
     Unit,
     /// C `main`: `extern "C" fn(c_int, *const *const c_char) -> c_int`.
     CMain,
+    /// bstd's hosted entry, `extern "C" fn(*const HostTable) -> i32` (`bstd_hosted_start`,
+    /// crates/blaze-std entry.rs; the table is bstd's `wire::HostTable`, which the launcher makes
+    /// in this process over its own world: run.md, "Every program runs in the child").
+    Hosted,
 }
 
 /// What the program starts at.
@@ -847,6 +856,33 @@ pub enum EntryForm {
 pub struct Start {
     pub entry: CodeSymbol,
     pub form: EntryForm,
+}
+
+/// The address of bstd's host table (`bstd::wire::HostTable`) a hosted entry is called with.
+/// Made only by [`HostTableAt::new`], whose contract is the table's life.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HostTableAt(core::ptr::NonNull<core::ffi::c_void>);
+
+impl HostTableAt {
+    /// # Safety
+    /// `table` is a `bstd::wire::HostTable` made by a `bstd::hosting::Hosting` of this process,
+    /// and both live, unmoved, until [`run`] returns or the process ends: the program calls the
+    /// table's entries, which read the `Hosting` behind its `host` pointer, at any time it runs.
+    pub unsafe fn new(table: core::ptr::NonNull<core::ffi::c_void>) -> HostTableAt {
+        HostTableAt(table)
+    }
+}
+
+/// What the entry is handed, by its form: [`EntryForm`] with a hosted entry's table. The launcher
+/// makes it from [`Start::form`] (one `match`, so a form never meets another's arguments).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Handed {
+    /// [`EntryForm::Unit`]: nothing.
+    Unit,
+    /// [`EntryForm::CMain`]: the process's `argc` and `argv`, made in [`run`].
+    CMain,
+    /// [`EntryForm::Hosted`]: the host's table.
+    Hosted(HostTableAt),
 }
 
 /// Why `BLAZE_LAUNCH_ENTRY`'s text names no entry.
@@ -857,21 +893,24 @@ pub struct EntryRefused {
 
 impl fmt::Display for EntryRefused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "BLAZE_LAUNCH_ENTRY is `<form>:<64 hex digits of the entry's symbol>` with the form `unit` or `c-main`: {}", self.why)
+        write!(
+            f,
+            "BLAZE_LAUNCH_ENTRY is `<form>:<64 hex digits of the entry's symbol>` with the form `unit`, `c-main` or `hosted`: {}",
+            self.why
+        )
     }
 }
 
 impl Start {
-    /// Reads the parent's `BLAZE_LAUNCH_ENTRY`: `unit:<symbol>` or `c-main:<symbol>`, the symbol
-    /// in 64 lowercase or uppercase hex digits. `hosted` (bstd's host table) is refused by name.
+    /// Reads the parent's `BLAZE_LAUNCH_ENTRY`: `unit:<symbol>`, `c-main:<symbol>` or
+    /// `hosted:<symbol>` (bstd's hosted entry, `bstd_hosted_start`), the symbol in 64 lowercase
+    /// or uppercase hex digits. Any other form is refused by name.
     pub fn parse(text: &[u8]) -> Result<Start, EntryRefused> {
         let (form, hex) = match text {
             [b'u', b'n', b'i', b't', b':', hex @ ..] => (EntryForm::Unit, hex),
             [b'c', b'-', b'm', b'a', b'i', b'n', b':', hex @ ..] => (EntryForm::CMain, hex),
-            [b'h', b'o', b's', b't', b'e', b'd', b':', ..] => {
-                return Err(EntryRefused { why: "a hosted entry needs bstd's host table, which the run mode does not make yet" });
-            }
-            _ => return Err(EntryRefused { why: "the form is neither `unit` nor `c-main`" }),
+            [b'h', b'o', b's', b't', b'e', b'd', b':', hex @ ..] => (EntryForm::Hosted, hex),
+            _ => return Err(EntryRefused { why: "the form is none of `unit`, `c-main` and `hosted`" }),
         };
         if hex.len() != 64 {
             return Err(EntryRefused { why: "the symbol is not 64 hex digits" });
@@ -1269,9 +1308,10 @@ fn format_errno(call: &str, errno: i32) -> String {
 }
 
 /// Runs the program under its parent, the socket at `fd`: maps the run's memory, starts the
-/// control thread and the socket's reader, numbers the entry, and calls it on this thread (the
-/// process's first). Returns only when the program could not be started; else the process ends
-/// through `exit` with the program's status, or with [`STOPPED`] when blaze stops it.
+/// control thread and the socket's reader, numbers the entry `entry`, and calls it on this
+/// thread (the process's first) with what `handed` holds. Returns only when the program could not
+/// be started; else the process ends through `exit` with the program's status, or with
+/// [`STOPPED`] when blaze stops it.
 ///
 /// `alloc` crosses to the control thread, so it is a [`blaze_own::SharedAlloc`]; it lives for
 /// the process, because the run's unwind registry is made in it and the system's unwinder keeps
@@ -1279,7 +1319,8 @@ fn format_errno(call: &str, errno: i32) -> String {
 pub fn run<S: RecordSource + Sync>(
     fd: std::os::fd::OwnedFd,
     source: &S,
-    start: Start,
+    entry: CodeSymbol,
+    handed: Handed,
     alloc: blaze_own::SharedAlloc<'static>,
 ) -> RunModeError {
     use std::os::fd::AsRawFd;
@@ -1292,7 +1333,7 @@ pub fn run<S: RecordSource + Sync>(
     std::thread::scope(|scope| {
         let control = std::thread::Builder::new()
             .name("blaze-run-control".to_owned())
-            .spawn_scoped(scope, || control(raw, source, start, alloc, &ready));
+            .spawn_scoped(scope, || control(raw, source, entry, alloc, &ready));
         if control.is_err() {
             return RunModeError::Thread { what: "control" };
         }
@@ -1306,7 +1347,7 @@ pub fn run<S: RecordSource + Sync>(
             Ok(me) => me,
             Err(_) => stop_with(format_args!("blaze: the program could not start: pthread_key_create failed")),
         };
-        let status = call_entry(thunk, start.form);
+        let status = call_entry(thunk, handed);
         // The main thread stays a mutator to the end: `exit` runs the program's `atexit`
         // functions, which are its code.
         core::mem::forget(me);
@@ -1316,13 +1357,27 @@ pub fn run<S: RecordSource + Sync>(
     })
 }
 
-/// Calls the entry's thunk on this thread with the process's arguments, as its form says.
-fn call_entry(thunk: u64, form: EntryForm) -> i32 {
-    use core::ffi::{c_char, c_int};
+/// Calls the entry's thunk on this thread with what `handed` holds: the `i32` the process
+/// exits with. Every form's status is the same rule (the in-process runner's, blaze-ladder
+/// place.rs `Placed::call`): `fn()` gives 0, and an `i32`-returning entry's value is handed to
+/// `exit` whole, whose status the parent sees as its low 8 bits. A hosted program that calls its
+/// table's `exit` never returns here: the host's `exit` (bstd hosting.rs) writes what its
+/// streams hold and ends the process with that status, the same low 8 bits.
+fn call_entry(thunk: u64, handed: Handed) -> i32 {
+    use core::ffi::{c_char, c_int, c_void};
     use std::os::unix::ffi::OsStringExt;
 
-    match form {
-        EntryForm::Unit => {
+    match handed {
+        Handed::Hosted(table) => {
+            // SAFETY: `thunk` is the entry slot's thunk, in a mapping never unmapped (or, in a
+            // test, a function of this form); the function there is bstd's hosted entry,
+            // `extern "C" fn(*const HostTable) -> i32` (the form the parent named, `hosted:`),
+            // compiled when this first call fires its stub. `table` lives across the call and
+            // every later reach of the program (`HostTableAt::new`'s contract).
+            let entry: extern "C" fn(*const c_void) -> c_int = unsafe { core::mem::transmute(thunk as usize) };
+            entry(table.0.as_ptr().cast_const())
+        }
+        Handed::Unit => {
             // SAFETY: `thunk` is the entry slot's thunk, in a mapping never unmapped; the
             // function there is `extern "C" fn()` (the form the parent named), compiled when
             // this first call fires its stub.
@@ -1330,7 +1385,7 @@ fn call_entry(thunk: u64, form: EntryForm) -> i32 {
             entry();
             0
         }
-        EntryForm::CMain => {
+        Handed::CMain => {
             // The program's `argv`, leaked for its life (it is the process's).
             let mut args: std::vec::Vec<*const c_char> = std::vec::Vec::new_in(blaze_launch::KEPT);
             for arg in std::env::args_os() {
@@ -1364,7 +1419,7 @@ type Ready = Result<(u64, std::sync::Arc<crate::table::Shared>), RunModeError>;
 fn control<S: RecordSource>(
     fd: i32,
     source: &S,
-    start: Start,
+    entry: CodeSymbol,
     alloc: blaze_own::SharedAlloc<'static>,
     ready: &crate::sys::Handoff<Ready>,
 ) {
@@ -1390,7 +1445,7 @@ fn control<S: RecordSource>(
     }
     let mut mode = RunMode::new(alloc);
     let mut acts: AVec<'_, Act> = Vec::new_in(alloc);
-    let entry = match mode.start(start.entry, &mut acts) {
+    let entry = match mode.start(entry, &mut acts) {
         Ok(entry) => entry,
         Err(why) => return ready.put(Err(why)),
     };
@@ -1504,6 +1559,8 @@ impl fmt::Display for WhyText {
 mod native;
 mod personality;
 
+#[cfg(test)]
+mod entry_tests;
 #[cfg(test)]
 mod personality_tests;
 #[cfg(test)]

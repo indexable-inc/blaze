@@ -42,16 +42,27 @@ pub struct Shown<'f> {
     /// How many bodies said their types were not checked (body_types.rs): the types stage then
     /// did not run, whatever else was found (main.rs `close`).
     pub types_unchecked: u32,
+    /// Each item the check could not check, with its cause (not_checked/items.rs `keep`): the
+    /// cause lines, the summary line and the exit status (main.rs `close`). Its words are the
+    /// listed finding's, borrowed: a row here is three borrows, nothing copied.
+    pub unchecked: Vec<crate::not_checked::items::Unchecked<'f>, &'f Frame>,
     /// How many bodies said their moves and borrows were not checked (body_types.rs
     /// `BORROWS_NOT_CHECKED`): with `BORROWS_ARE_ERRORS`, the borrows stage then did not run.
     pub borrows_unchecked: u32,
+    /// Each task not run because an input it reads could not be made (work.rs `NOT_RUN`), with
+    /// its cause (not_checked/tasks.rs `keep`): one line a cause and the exit status (main.rs
+    /// `close`); never drawn or counted one by one.
+    pub not_run: Vec<crate::not_checked::tasks::NotRun<'f>, &'f Frame>,
+    /// The command's lint step (lints.rs `lints_of`): a lint finding's level is its levels' at
+    /// print time (rule 81), never stored. `Step::Rust` until the command sets it.
+    pub lints: blaze_lint::Step,
 }
 
 impl<'f> Shown<'f> {
     /// The plain views are lines whatever the terminal draws: their bytes are the same anywhere.
     pub fn new(caps: Caps, view: View, root: &'f str, frame: &'f Frame) -> Shown<'f> {
         let caps = if view == View::Person { caps } else { Caps::LINES };
-        Shown { caps, counts: Counts::default(), view, quiet: false, listed: Vec::new_in(frame), fixes: Vec::new_in(frame), root, files: Vec::new_in(frame), types_unchecked: 0, borrows_unchecked: 0 }
+        Shown { caps, counts: Counts::default(), view, quiet: false, listed: Vec::new_in(frame), fixes: Vec::new_in(frame), root, files: Vec::new_in(frame), types_unchecked: 0, unchecked: Vec::new_in(frame), borrows_unchecked: 0, not_run: Vec::new_in(frame), lints: blaze_lint::Step::Rust }
     }
 
     fn file(&mut self, path: &str) {
@@ -77,6 +88,15 @@ pub fn file_of<'f>(req: &Request<'_>, found: &crate::sweep::Found<'_>, finding: 
 /// `path` is the file it is drawn in ([`file_of`]), `place` its item's start there and
 /// `message` its words' pieces (the finding's own, but for a finding that carries its place in
 /// its message: names.rs `placed`).
+/// A finding's code (`syntax`, `E0425`, a lint's name): blaze-report's wording's, or for a lint
+/// (lints.rs, numbered past `LINT_BASE`) its rule's name, which blaze-report has no row of.
+pub(crate) fn code_of(area: Area, rule: u16) -> &'static str {
+    match crate::lints::rule_of(rule) {
+        Some(lint) => lint.name(),
+        None => words::wording(area, rule).map_or("", |wording| wording.name),
+    }
+}
+
 /// The area a request's finding's rule is numbered in.
 pub fn area_of(finding: &Print<'_>) -> Area {
     match finding.rule {
@@ -89,7 +109,7 @@ pub fn area_of(finding: &Print<'_>) -> Area {
 /// `grammar` the file's outline when it is Rust, `read` the text's digest.
 fn placed_in<'f>(path: &'f str, text: &str, read: blaze_ids::ContentId, grammar: Option<&blaze_file_items::Outline<'_>>, place: u32, message: &'f [u8], finding: &Print<'_>) -> Result<Listed<'f>, CliError> {
     let area = area_of(finding);
-    let code = words::wording(area, finding.rule).map_or("", |wording| wording.name);
+    let code = code_of(area, finding.rule);
     let start = place.saturating_add(finding.start).min(text.len() as u32);
     let end = place.saturating_add(finding.end).clamp(start, text.len() as u32);
     let (item, item_end, chain) = crate::fix::item_in(grammar, text, start);
@@ -108,7 +128,7 @@ fn placed_in<'f>(path: &'f str, text: &str, read: blaze_ids::ContentId, grammar:
 /// is of the name. `one` holds the name's text while the id is made.
 fn unplaced<'f>(message: &'f [u8], finding: &Print<'_>, one: &Frame) -> Listed<'f> {
     let area = area_of(finding);
-    let code = words::wording(area, finding.rule).map_or("", |wording| wording.name);
+    let code = code_of(area, finding.rule);
     let about = format_in!(one, "{}", finding.name);
     let id = Id::of(about.as_bytes(), 0, &[], code, (finding.start, finding.end));
     Listed { path: None, about: finding.name, read: crate::fix::text_id(&[]), area, rule: finding.rule, words: message, item: 0, start: finding.start, end: finding.end, id, fix: None }
@@ -300,7 +320,7 @@ pub fn list<'f>(cx: &Cx, root: &Dir<ReadWrite>, prints: &[Print<'_>], wanted: &[
 /// One file's listed findings (`which`, their indices in `shown.listed`), printed: the file
 /// read once into `scratch` and checked to be the text they were placed in, each finding drawn
 /// in a frame emptied for it. `path` is `None` for the findings of no file.
-pub fn file_findings(cx: &Cx, root: &Dir<ReadWrite>, path: Option<&str>, which: impl Iterator<Item = usize>, shown: &mut Shown<'_>, scratch: &mut Scratch, out: &Out) -> Result<(), CliError> {
+pub fn file_findings<'f>(cx: &Cx, root: &Dir<ReadWrite>, path: Option<&str>, which: impl Iterator<Item = usize>, shown: &mut Shown<'f>, scratch: &mut Scratch, out: &Out) -> Result<(), CliError> {
     // `--fix`'s first check prints nothing: nothing is read for it either.
     let Some(path) = path.filter(|_| !shown.quiet) else {
         for at in which {
@@ -340,7 +360,18 @@ pub fn file_findings(cx: &Cx, root: &Dir<ReadWrite>, path: Option<&str>, which: 
 /// terminal its line), or the agent's or JSON's plain lines. Its rule's words come from
 /// blaze-report's table, its arguments the message's pieces between 0x1F bytes. `text` is its
 /// file's, as it was listed in (unread for a finding of no file, or a quiet command).
-pub fn finding(cx: &Cx, l: &Listed<'_>, text: &[u8], shown: &mut Shown<'_>, frame: &Frame, out: &Out) -> Result<(), CliError> {
+pub fn finding<'f>(cx: &Cx, l: &Listed<'f>, text: &[u8], shown: &mut Shown<'f>, frame: &Frame, out: &Out) -> Result<(), CliError> {
+    // A task not run because an input it reads could not be made: the input's own finding is
+    // the error, printed once; this one is kept by cause for one line (not_checked/tasks.rs),
+    // its cause borrowed from the listed finding's words, never copied again.
+    // A body not run had its types unchecked too: the closing line says "NOT checked: types".
+    if l.area == Area::Cli && l.rule == crate::work::NOT_RUN {
+        crate::not_checked::tasks::keep(&mut shown.not_run, l.about.kind, l.words)?;
+        if l.about.kind == blaze_drive::Kind::BodyCheck {
+            shown.types_unchecked += 1;
+        }
+        return Ok(());
+    }
     if l.fix.is_some() {
         shown.fixes.push(l.id);
     }
@@ -351,9 +382,28 @@ pub fn finding(cx: &Cx, l: &Listed<'_>, text: &[u8], shown: &mut Shown<'_>, fram
     // always a note; a finding is one until the check is trusted (`BORROWS_ARE_ERRORS`).
     let borrows_unchecked = l.area == Area::Cli && l.rule == crate::body_types::BORROWS_NOT_CHECKED;
     let borrows_note = borrows_unchecked || (l.area == Area::Cli && l.rule == crate::body_types::BORROWS && !crate::body_types::BORROWS_ARE_ERRORS);
-    let severity = if unchecked || borrows_note { Severity::Note } else { Severity::Error };
+    // An include read outside its package inside the workspace (names/include_outside.rs,
+    // D111): allowed, a warning; never an error (main.rs `every_rule`).
+    let outside = l.area == Area::Cli && l.rule == crate::names::include_outside::INCLUDE_OUTSIDE_PACKAGE;
+    // A lint finding: the level the step's levels give its rule, now (rule 81). Advice is a
+    // warning, and no step's is an error today (main.rs `every_rule`); an `Off` rule is not
+    // drawn or counted.
+    let lint = crate::lints::rule_of(l.rule).map(|_| crate::lints::level_of(shown.lints, l.rule));
+    if lint == Some(blaze_lint::Level::Off) {
+        return Ok(());
+    }
+    let severity = if unchecked || borrows_note {
+        Severity::Note
+    } else if lint == Some(blaze_lint::Level::Error) {
+        Severity::Error
+    } else if outside || lint.is_some() {
+        Severity::Warning
+    } else {
+        Severity::Error
+    };
     if unchecked {
         shown.types_unchecked += 1;
+        crate::not_checked::items::keep(&mut shown.unchecked, l.path, l.words)?;
     }
     if borrows_unchecked {
         shown.borrows_unchecked += 1;
@@ -455,10 +505,17 @@ fn draw(
     }
     let mut headline = AString::new_in(alloc);
     let mut label = AString::new_in(alloc);
-    let name = words::say(area, rule, &args[..count], &mut headline, &mut label).map_err(|error| match error {
-        WordsError::NoWording { .. } => CliError::Text { what: "a finding's rule has no words in blaze_report::frame::words::WORDINGS" },
-        WordsError::Arguments { .. } => CliError::Text { what: "a finding's arguments do not match its rule's words" },
-    })?;
+    // A lint's message is whole, in blaze-lint's words (lints.rs `record`): its headline as it is.
+    let name = match crate::lints::rule_of(rule) {
+        Some(lint) => {
+            headline.push_str(message);
+            lint.name()
+        }
+        None => words::say(area, rule, &args[..count], &mut headline, &mut label).map_err(|error| match error {
+            WordsError::NoWording { .. } => CliError::Text { what: "a finding's rule has no words in blaze_report::frame::words::WORDINGS" },
+            WordsError::Arguments { .. } => CliError::Text { what: "a finding's arguments do not match its rule's words" },
+        })?,
+    };
     // Why the fix is the fix: a help's words (blaze-report `HELPS`).
     let mut reason = AString::new_in(alloc);
     if let Some((_, change)) = fix {
@@ -646,10 +703,13 @@ mod tests {
             (Area::Cli, crate::units::TARGET_REFUSED),
             (Area::Cli, crate::work::MODULE_AT_BOTH),
             (Area::Cli, crate::names::UNRESOLVED),
+            (Area::Cli, crate::names::failed_call::FAILED_CALL),
+            (Area::Cli, crate::names::include_outside::INCLUDE_OUTSIDE_PACKAGE),
             (Area::Cli, crate::body_types::TYPES),
             (Area::Cli, crate::body_types::TYPES_NOT_CHECKED),
             (Area::Cli, crate::body_types::BORROWS),
             (Area::Cli, crate::body_types::BORROWS_NOT_CHECKED),
+            (Area::Cli, crate::work::NOT_RUN),
             (Area::Drive, OVER_CAP_RULE),
             (Area::Drive, blaze_drive::request::MODULE_FILE_MISSING_RULE),
             (Area::Drive, blaze_drive::request::PATH_FILE_MISSING_RULE),

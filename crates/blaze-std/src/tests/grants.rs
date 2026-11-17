@@ -113,7 +113,7 @@ fn launch_cat(io: &Io, fd3: Option<&[u8]>) -> (Status, StdString, bool) {
     RAN.with(|ran| ran.set(false));
     let mut said = StdString::new();
     let manifest = manifest!(out: Out, data: Dir<ReadOnly>);
-    let status = launch_in(manifest, fd3, io.clone(), &mut said, blaze_own::testing::heap().shared(),crate::launch_body!(cat; out: Out, data: Dir<ReadOnly>));
+    let status = launch_in(manifest, fd3, io.clone(), &mut said, crate::launch_body!(cat; out: Out, data: Dir<ReadOnly>));
     (status, said, RAN.with(Cell::get))
 }
 
@@ -124,7 +124,7 @@ fn every_shape_of_main_is_filled_and_runs() {
     let io = Io::sim(2);
     let manifest = manifest!(out: Out, err: Out, args: Args, clock: Clock);
     let body = crate::launch_body!(streams; out: Out, err: Out, args: Args, clock: Clock);
-    assert_eq!(launch_in(manifest, None, io.clone(), &mut said, blaze_own::testing::heap().shared(),body), Status::OK);
+    assert_eq!(launch_in(manifest, None, io.clone(), &mut said, body), Status::OK);
     assert_eq!(written(&io), "to out\n0\n");
     assert_eq!(io.script(|host| host.err.clone()).expect("a simulated world"), b"to err\n");
 
@@ -145,7 +145,7 @@ fn every_shape_of_main_is_filled_and_runs() {
     let io = Io::sim(5);
     let spec = bare();
     let mut said = StdString::new();
-    let status = launch_in(manifest!(out: Out, spec: Spec), Some(&delivered(&spec)), io.clone(), &mut said, blaze_own::testing::heap().shared(),crate::launch_body!(own_spec; out: Out, spec: Spec));
+    let status = launch_in(manifest!(out: Out, spec: Spec), Some(&delivered(&spec)), io.clone(), &mut said, crate::launch_body!(own_spec; out: Out, spec: Spec));
     assert_eq!((status, said.as_str()), (Status::OK, ""));
     assert_eq!(written(&io), std::format!("{}\n", spec.digest(a())));
 
@@ -156,7 +156,7 @@ fn every_shape_of_main_is_filled_and_runs() {
     spec.put_grant(granted("api", Scope::Net { at: text("example.com:443"), listen: false }));
     let manifest = manifest!(out: Out, cache: Dir<ReadWrite>, api: Net);
     let mut said = StdString::new();
-    let status = launch_in(manifest, Some(&delivered(&spec)), io.clone(), &mut said, blaze_own::testing::heap().shared(),crate::launch_body!(writes; out: Out, cache: Dir<ReadWrite>, api: Net));
+    let status = launch_in(manifest, Some(&delivered(&spec)), io.clone(), &mut said, crate::launch_body!(writes; out: Out, cache: Dir<ReadWrite>, api: Net));
     assert_eq!((status, said.as_str(), written(&io).as_str()), (Status::OK, "", "wrote\n"));
 }
 
@@ -183,6 +183,83 @@ fn the_hello_world_manifest_is_out_alone() {
     assert!(Kind::Out.fills_itself());
     let json = manifest.write(a());
     assert_eq!(json.as_str(), "{\"params\":[{\"fills_itself\":true,\"kind\":\"out\",\"name\":\"out\"}],\"version\":1}");
+}
+
+/// A value whose drop counts itself in the cell it borrows.
+struct Counted<'c>(&'c Cell<u32>);
+
+impl Drop for Counted<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+    }
+}
+
+/// A `main` that names the heap: a value boxed in it and a future pinned in it, both dropped,
+/// each drop counted. 7 when both dropped once, and the future ran to its value.
+fn boxes(_cx: &Cx, heap: crate::mem::Heap) -> Status {
+    let dropped = Cell::new(0);
+    let boxed = crate::boxed::Box::new_in(Counted(&dropped), heap);
+    let counted = Counted(&dropped);
+    let mut pinned = crate::boxed::Box::pin_in(
+        async move {
+            let _counted = counted;
+            3u8
+        },
+        heap,
+    );
+    let mut context = core::task::Context::from_waker(core::task::Waker::noop());
+    let ran = core::future::Future::poll(pinned.as_mut(), &mut context);
+    drop((boxed, pinned));
+    match (ran, dropped.get()) {
+        (core::task::Poll::Ready(3), 2) => Status(7),
+        _ => Status::FAILED,
+    }
+}
+
+/// `main(cx, heap: Heap)` is handed the heap its entry took (D120): what it boxes and pins in
+/// it is dropped, once each. The heap fills itself, so no spec grants it, and the manifest
+/// says so. Prints `test tests::grants::a_main_that_names_the_heap_is_handed_it ... ok`.
+#[test]
+fn a_main_that_names_the_heap_is_handed_it() {
+    let manifest = manifest!(heap: crate::mem::Heap);
+    assert_eq!(manifest.params, &[Param::new("heap", Kind::Heap)]);
+    assert_eq!(
+        manifest.write(a()).as_str(),
+        "{\"params\":[{\"fills_itself\":true,\"kind\":\"heap\",\"name\":\"heap\"}],\"version\":1}"
+    );
+    let mut said = StdString::new();
+    let status = launch_in(manifest, None, Io::sim(9), &mut said, crate::launch_body!(boxes; heap: crate::mem::Heap));
+    assert_eq!((status, said.as_str()), (Status(7), ""));
+}
+
+/// A `main` that does not name the heap is started as before: its manifest lists no heap,
+/// and it runs with what it named. Prints
+/// `test tests::grants::a_main_without_the_heap_is_handed_none ... ok`.
+#[test]
+fn a_main_without_the_heap_is_handed_none() {
+    fn hello(cx: &Cx, out: Out) -> Result<(), Error> {
+        out.line(cx, "no heap")?;
+        Ok(())
+    }
+    let manifest = manifest!(out: Out);
+    assert!(manifest.params.iter().all(|param| param.kind != Kind::Heap));
+    let io = Io::sim(10);
+    let mut said = StdString::new();
+    let status = launch_in(manifest, None, io.clone(), &mut said, crate::launch_body!(hello; out: Out));
+    assert_eq!((status, said.as_str(), written(&io).as_str()), (Status::OK, "", "no heap\n"));
+}
+
+/// The names table lists the heap: `heap`, of type `Heap`, filling itself, meeting no fault,
+/// no scope to grant. Prints `test tests::grants::the_names_table_lists_the_heap ... ok`.
+#[test]
+fn the_names_table_lists_the_heap() {
+    assert_eq!(Kind::Heap.name(), "heap");
+    assert_eq!(<crate::mem::Heap as Grant>::KIND, Kind::Heap);
+    assert!(Kind::Heap.fills_itself());
+    assert!(Kind::fills_itself_named(b"heap"));
+    assert!(Kind::FILLS_ITSELF.contains(&Kind::Heap));
+    assert_eq!(Kind::Heap.scope_form(), "");
+    assert_eq!(crate::test::reach(Kind::Heap), 0);
 }
 
 /// Each refusal: `main` never runs, nothing is written, the status is `REFUSED`, and the words
@@ -252,7 +329,7 @@ fn a_grant_never_widens_and_an_unbuilt_provider_is_refused() {
     let launch = |spec: &RunSpec<LaunchAlloc>| {
         let mut said = StdString::new();
         let body = crate::launch_body!(writes; out: Out, cache: Dir<ReadWrite>, api: Net);
-        (launch_in(manifest, Some(&delivered(spec)), io.clone(), &mut said, blaze_own::testing::heap().shared(),body), said)
+        (launch_in(manifest, Some(&delivered(spec)), io.clone(), &mut said, body), said)
     };
     let mut spec = bare();
     spec.put_grant(granted("cache", dir_scope("cache", false)));

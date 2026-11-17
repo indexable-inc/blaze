@@ -24,7 +24,7 @@
 use std::{alloc::Global, fmt::Write as _, time::Duration};
 
 use blaze_arrow_ipc::{IpcError, StreamReader, StreamWriter};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 
 use crate::{
     batches::{self, Process},
@@ -444,7 +444,7 @@ impl Thread {
 /// The client's view of the feed, folded from each frame.
 #[derive(Default, Debug)]
 pub struct Top {
-    threads: HashMap<u32, Thread, Global>,
+    threads: Map<u32, Thread, FixedState, Global>,
     at_ns: i64,
     /// Spans closed a second, over the last frame.
     rate: f64,

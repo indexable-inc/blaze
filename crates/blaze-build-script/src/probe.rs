@@ -5,19 +5,22 @@
 //!   nightly's text, `host:` the build's host. Every version probe of tempo's scripts is one of
 //!   these.
 //! - A try-compile (a snippet given by file or stdin, with `--emit`, `--crate-type` and the
-//!   like): [`Request::Compile`], keyed by its arguments and the snippet's bytes
-//!   ([`compile_key`]); answered by blaze's front end once it can, until then by a table of
-//!   answers for the pinned nightly ([`Table`]). A probe neither answers is
-//!   [`Refused::CannotAnswerYet`], which fails that one script naming the probe.
-//! - Any other program (a C compiler, `git`, `cmake`, `pkg-config`) is [`Request::Other`]:
-//!   the runner answers it by the C mode or refuses it. A spawn is never answered with an
-//!   error the script could swallow: a version probe that fails is taken by most scripts as
-//!   "an old compiler" (`.output().ok()?`).
+//!   like): read by [`crate::probe_ask::classify`], keyed by what its verdict depends on
+//!   ([`crate::probe_ask::Compile::key`]) and answered by [`crate::probe_ask::answer`]: decided
+//!   by blaze from the snippet where it can, else by a table of answers for the pinned nightly
+//!   ([`Table`]). A probe neither answers is the runtime's `CannotAnswerYet`, which fails that
+//!   one script naming the probe.
+//! - Any other program (a C compiler, `git`, `cmake`, `pkg-config`) is routed by the runner
+//!   (blaze-proc-macro `spawn_route`): answered by the C mode or refused. A spawn is never
+//!   answered with an error the script could swallow: a version probe that fails is taken by
+//!   most scripts as "an old compiler" (`.output().ok()?`).
 
 #![blaze::sans_io]
 
 use blaze_ids::{ContentId, Hasher};
 use blaze_own::{AString, Alloc, String};
+
+use crate::probe_ask::{Ask, classify};
 
 /// What `rustc -V` of the pinned nightly prints (crates/blaze-cargo/src/toolchain/pins.txt's
 /// `rustc` line; a test holds them equal).
@@ -28,19 +31,6 @@ pub const RELEASE: &str = "1.101.0-nightly";
 /// `LLVM version:` of `rustc -vV` of nightly-2026-10-27 (read once from the pinned toolchain
 /// on 2026-11-16; the pin bump records it from then on). portable-atomic reads it.
 pub const LLVM: &str = "23.1.4";
-
-/// What a spawn asks.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Request<'s> {
-    /// `rustc` asked its version; `verbose` for `-vV`.
-    Version { verbose: bool },
-    /// `rustc` asked to compile a snippet: the arguments as given.
-    Compile,
-    /// `rustc --print ...`: not answered yet ([`Refused::RustcArgs`]).
-    Print,
-    /// Another program.
-    Other { program: &'s str },
-}
 
 /// The programs of a C toolchain a script spawns through `cc`, `cmake` or by hand: answered
 /// by the C mode ([`crate::key::CMode`]), never refused, never run in `check`.
@@ -68,34 +58,6 @@ pub fn is_deferred_tool(program: &str, args: &[&str]) -> bool {
         || (matches!(name, "sh" | "bash") && args.first().is_some_and(|script| script.rsplit('/').next() == Some("configure")))
 }
 
-/// Why a spawn is not answered: the script stops, naming the package and this.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Refused<'a> {
-    /// A try-compile no answer exists for yet: its key, the snippet's first line.
-    CannotAnswerYet { key: ContentId, first_line: AString<'a> },
-    /// `rustc` with arguments that are neither a version nor a compile (`--print`, say).
-    RustcArgs { args: AString<'a> },
-    /// A program the sandbox does not answer.
-    Program { program: AString<'a> },
-}
-
-/// Reads a spawn: `program` and its arguments.
-pub fn request<'s>(program: &'s str, args: &[&str]) -> Request<'s> {
-    if program != "rustc" {
-        return Request::Other { program };
-    }
-    let has = |want: &str| args.contains(&want);
-    if args.iter().any(|a| *a == "--print" || a.starts_with("--print=")) {
-        return Request::Print;
-    }
-    let only_version = args.iter().all(|a| matches!(*a, "--version" | "-V" | "-vV" | "-Vv" | "--verbose" | "-v"));
-    if only_version && !args.is_empty() {
-        let verbose = has("-vV") || has("-Vv") || has("--verbose") || has("-v");
-        return Request::Version { verbose };
-    }
-    Request::Compile
-}
-
 /// The text `rustc` prints for a version request.
 pub fn version<'a>(verbose: bool, host: &str, alloc: Alloc<'a>) -> AString<'a> {
     let mut out = String::from_str_in(VERSION, alloc);
@@ -118,95 +80,6 @@ pub fn version<'a>(verbose: bool, host: &str, alloc: Alloc<'a>) -> AString<'a> {
     out
 }
 
-/// The flags of `rustc` that take their value as the next argument.
-const VALUED: &[&str] = &[
-    "--out-dir", "-o", "--emit", "--crate-name", "--crate-type", "--edition", "--cfg", "--check-cfg", "--target", "-L", "-l", "--extern", "-C",
-    "-Z", "-A", "-W", "-D", "-F", "--cap-lints", "--error-format", "--json", "--color", "--sysroot", "--diagnostic-width", "--explain",
-    "--remap-path-prefix",
-];
-
-/// The flags that say only where and how the output goes, never whether the snippet is
-/// accepted: left out of a probe's key, so the configuration's `OUT_DIR` and autocfg's
-/// numbered crate names do not split one question into many.
-const OUTPUT_ONLY: &[&str] = &["--out-dir", "-o", "--emit", "--crate-name", "--error-format", "--json", "--color", "--diagnostic-width"];
-
-/// Where a try-compile's snippet comes from.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Snippet<'s> {
-    /// `-`: the bytes written to its stdin.
-    Stdin,
-    /// A path: the file's bytes (in `OUT_DIR` or the package).
-    File(&'s str),
-}
-
-/// The snippet argument of a try-compile: its index and where it comes from. `None` when the
-/// arguments name no input.
-pub fn snippet<'s>(args: &[&'s str]) -> Option<(usize, Snippet<'s>)> {
-    let mut found = None;
-    let mut at = 0;
-    while at < args.len() {
-        let arg = args[at];
-        if VALUED.contains(&arg) {
-            at += 2;
-            continue;
-        }
-        if arg == "-" {
-            found = Some((at, Snippet::Stdin));
-        } else if !arg.starts_with('-') {
-            found = Some((at, Snippet::File(arg)));
-        }
-        at += 1;
-    }
-    found
-}
-
-/// The arguments a probe's key holds, in order: every one but the snippet and the output-only
-/// flags with their values.
-pub fn kept<'s>(args: &[&'s str], snippet_arg: Option<usize>, mut each: impl FnMut(&'s str)) {
-    let mut at = 0;
-    while at < args.len() {
-        let arg = args[at];
-        let flag = arg.split_once('=').map_or(arg, |(flag, _)| flag);
-        let dropped = OUTPUT_ONLY.contains(&flag);
-        let joined = arg.contains('=') && arg.starts_with("--");
-        if dropped {
-            at += if joined || !VALUED.contains(&arg) { 1 } else { 2 };
-            continue;
-        }
-        if Some(at) != snippet_arg {
-            each(arg);
-        }
-        if VALUED.contains(&arg) && at + 1 < args.len() {
-            each(args[at + 1]);
-            at += 1;
-        }
-        at += 1;
-    }
-}
-
-/// The key of a probe from its kept arguments ([`kept`]) and the snippet's bytes.
-pub fn probe_key<'s>(target: &str, kept_args: impl IntoIterator<Item = &'s str>, snippet: &[u8]) -> ContentId {
-    let mut hasher = Hasher::new("blaze v2 build-script probe 2");
-    hasher.part(VERSION.as_bytes()).part(target.as_bytes());
-    for arg in kept_args {
-        hasher.part(arg.as_bytes());
-    }
-    hasher.part(b"<snippet>").part(snippet);
-    hasher.finish()
-}
-
-/// The key of a try-compile: the pinned compiler, the target, the arguments without the
-/// snippet and the output-only flags ([`kept`]), and the snippet's bytes.
-pub fn compile_key(target: &str, args: &[&str], snippet_arg: Option<usize>, snippet: &[u8]) -> ContentId {
-    let mut hasher = Hasher::new("blaze v2 build-script probe 2");
-    hasher.part(VERSION.as_bytes()).part(target.as_bytes());
-    kept(args, snippet_arg, |arg| {
-        hasher.part(arg.as_bytes());
-    });
-    hasher.part(b"<snippet>").part(snippet);
-    hasher.finish()
-}
-
 /// One answer of the table: did the pinned nightly accept the snippet.
 #[derive(Clone, Copy, Debug)]
 pub struct Row {
@@ -220,26 +93,42 @@ pub struct Row {
 pub struct Known {
     /// The script and the question, for people.
     pub probe: &'static str,
-    /// The kept arguments ([`kept`]), in order.
+    /// The arguments its verdict depends on, as the script gives them, without the input, the
+    /// output paths and `--target`: the row is keyed for the target it is made for
+    /// ([`pinned_rows`]), so its reason must hold for any target that ships [`Known::needs`].
     pub args: &'static [&'static str],
     pub snippet: &'static str,
     pub accepted: bool,
     pub why: &'static str,
+    /// The toolchain crates the reason rests on (`core`, `std`, `proc_macro`): the row is made
+    /// for a target only when its sysroot holds each.
+    pub needs: &'static [&'static str],
 }
 
-/// The table's rows for `target`, sorted by key.
+/// The table's rows for `target`, sorted by key: each known probe's key as
+/// [`crate::probe_ask::Compile::key`] makes it for a probe of `target` with its arguments.
+///
+/// Panics when a row's arguments are not a try-compile: they are fixed text, each row read by
+/// `pinned_rows_read_as_try_compiles` (tests.rs).
 pub fn pinned_rows<'a>(target: &str, known: &[Known], alloc: Alloc<'a>) -> blaze_own::AVec<'a, Row> {
-    let mut rows = blaze_own::Vec::with_capacity_in(known.len(), alloc);
+    let mut rows = blaze_own::Vec::with_capacity_in(known.len(), alloc.clone());
     for k in known {
-        rows.push(Row { key: probe_key(target, k.args.iter().copied(), k.snippet.as_bytes()), accepted: k.accepted });
+        let mut args = blaze_own::Vec::with_capacity_in(k.args.len() + 1, alloc.clone());
+        args.extend_from_slice(k.args);
+        args.push("-");
+        let key = match classify(&args, alloc.clone()) {
+            Ok(Ask::Compile(compile)) => compile.key(target, k.snippet.as_bytes()),
+            other => panic!("the pinned probe `{}` is not a try-compile: {other:?}", k.probe),
+        };
+        rows.push(Row { key, accepted: k.accepted });
     }
     rows.sort_by(|a, b| a.key.cmp(&b.key));
     rows
 }
 
-/// The answers for the pinned nightly, sorted by key ([`pinned_rows`] of the known probes). A
-/// try-compile no row answers is [`Refused::CannotAnswerYet`] until blaze's front end answers
-/// probes itself.
+/// The answers for the pinned nightly, sorted by key: [`pinned_rows`] of the known probes and
+/// the [`crate::probe_ask::ships_key`] facts of the side's sysroot. A try-compile neither blaze
+/// nor a row answers is the runtime's `CannotAnswerYet`.
 #[derive(Clone, Copy, Debug)]
 pub struct Table<'t> {
     pub rows: &'t [Row],
@@ -260,8 +149,9 @@ impl Table<'_> {
 
 /// The identity of everything a spawn can be answered with.
 pub fn answers_id(table: &Table<'_>) -> ContentId {
-    let mut hasher = Hasher::new("blaze v2 build-script answers 1");
+    let mut hasher = Hasher::new("blaze v2 build-script answers 2");
     hasher.part(VERSION.as_bytes()).part(COMMIT_HASH.as_bytes()).part(LLVM.as_bytes());
+    hasher.part(crate::probe_ask::DECIDER.as_bytes());
     for row in table.rows {
         hasher.id(&row.key).update(&[u8::from(row.accepted)]);
     }

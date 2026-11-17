@@ -1,0 +1,14 @@
+{
+ "id": "front2-member-key-two-keys",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane TL (census classes A, B, C) under rebuild-1115",
+ "where": "crates/blaze-ladder/src/front2/body.rs `lower_member_into`, keys.rs `member_key`, item_site.rs `head_marks`; tests/front2_token_mark_bodies.rs",
+ "what": "A member's body found its member again with `checker_of(m.key) == key`. `m.key` is the names library's member key, and `key` is front2's own member key (keys.rs `member_key`: container, kind, name, hashed under its own domain). The two are never equal, so `written_by` was always None. A member written by a call nested in its container's body (core's `min_max_impl!` in `ord_impl!`) was read with the outer expansion's marks (505 fns `lower: Record`, NotInText). When the container was written in a file, the nested call's marks were dropped silently. One test (`a_derived_body_checks_in_its_derive_s_crate`) made the same mistake: it asked `lower_member` with `checker_of(library member key)`, a key front2 never filed.",
+ "cost": "a census class of 505 fns, plus a silent mis-resolution for every nested-call member of a file-written impl",
+ "cause": "two key spaces for one member (the library's and front2's), and a comparison across them that type-checks because both are 16-byte checker keys",
+ "whys": "front2 keys members itself (the library keys no member as an item); `checker_of` takes any library key; `MemberOf.key` and front2's member key are both `blaze_typeck::ItemKey` after `checker_of`; nothing says which space a key is from",
+ "class": "a key compared with a key of another space type-checks and never matches, and the miss is taken for 'none'",
+ "prevention": "done: the member is found by what front2's key is made of (`Keys::origin`: container, kind, name), with its text where several share them (item_site.rs `head_marks`), and the existing test asks by `Keys::filed_member`. Wanted: a distinct type for front2's member keys (not `blaze_typeck::ItemKey`), so `checker_of(m.key) == member` does not compile",
+ "workaround": "find a member by `Keys::filed_member(container, kind, name)`, never by `checker_of(MemberOf.key)`",
+ "state": "fixed (uncompiled when written); type split open"
+}

@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use blaze_hash::{HashMap, HashSet};
+use blaze_hash::{FixedState, Map, MapOpts, Set};
 use std::alloc::Global;
 
 use super::{Dependency, DependencyError};
@@ -153,7 +153,7 @@ pub(super) fn build_summary_features(
         }
     }
 
-    let mut dep_map: HashMap<&str, bool, Global> = HashMap::new_in(Global);
+    let mut dep_map: Map<&str, bool, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     for dep in dependencies {
         *dep_map.entry(dep.name_in_toml()).or_insert(false) |= dep.optional;
     }
@@ -165,7 +165,7 @@ pub(super) fn build_summary_features(
         })
         .collect();
 
-    let explicitly_listed: HashSet<String, Global> =
+    let explicitly_listed: Set<String, FixedState, Global> =
         map.values().flatten().filter_map(|fv| fv.explicit_dep_name()).map(str::to_owned).collect();
 
     for dep in dependencies {
@@ -241,7 +241,7 @@ pub(super) fn build_summary_features(
         }
     }
 
-    let used: HashSet<&str, Global> = map
+    let used: Set<&str, FixedState, Global> = map
         .values()
         .flatten()
         .filter_map(|fv| match fv {

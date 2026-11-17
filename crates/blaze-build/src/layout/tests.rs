@@ -8,7 +8,7 @@ use blaze_sim::{Broke, Config, Tape};
 use blaze_typeck::{Adt, AdtKind, CtorKind, Field, IntTy, ItemKey, List, Mutbl, Name, PNode, PTy, PortableTys, UintTy, Variant};
 
 use super::{
-    IntRepr, LayoutCx, LayoutFacts, LayoutId, Layouts, Prim, Refusal, ReprAttrs, Scalar, TagEncoding, Tail, ValidRange, Variants,
+    DynPrefix, IntRepr, LayoutCx, LayoutFacts, LayoutId, Layouts, Prim, Refusal, ReprAttrs, Scalar, TagEncoding, Tail, ValidRange, Variants,
 };
 
 /// One ADT of the test world: its own type table, its variants' field types in it.
@@ -258,8 +258,8 @@ fn null_pointer_optimisation_holds_for_every_guaranteed_type() {
 /// niche of `Option<&dyn Tr>` and `Option<Box<dyn Tr>>` is the data word (the guaranteed
 /// null-pointer optimisation, std's `option` "Representation"), as a thin pointer's; a raw one
 /// has none. `dyn Tr + Send` lays out as `dyn Tr`. `dyn Tr` itself is unsized ([`Tail::Dyn`]):
-/// no static size (`size_of_val` is the vtable's), and a struct ending in one is refused by
-/// name until its tail's run-time offset is built.
+/// no static size (`size_of_val` is the vtable's); a struct ending in one keeps its prefix's
+/// end (`dyn_tails_keep_the_prefix_end_unrounded`).
 #[test]
 fn trait_object_pointers_are_two_words_with_the_niche_in_the_data_word() {
     let mut w = World::default();
@@ -304,11 +304,81 @@ fn trait_object_pointers_are_two_words_with_the_niche_in_the_data_word() {
     let did = lay(&w, &mut g, &mut ls, dyn_tr).unwrap();
     assert_eq!(ls.get(did).tail, Tail::Dyn, "dyn Tr is unsized");
     assert_eq!(ls.size_of_val(did, 0), None, "dyn Tr's size is its vtable's, never the type's");
+    assert_eq!(ls.dyn_prefix(did), Some(DynPrefix { tail_at: 0, align: 0 }), "a bare dyn Tr is the empty prefix");
     let ends_in_dyn = g.adt(tail, &[dyn_tr]);
-    let refused = lay(&w, &mut g, &mut ls, ends_in_dyn).unwrap_err();
-    assert!(matches!(refused.why, Refusal::Unsupported(what) if what.contains("trait object")), "{refused:?}");
     let r = g.r(ends_in_dyn);
     assert!(lay(&w, &mut g, &mut ls, r).is_ok(), "a pointer to it is still two words: it lays out no tail");
+    dyn_tails_keep_the_prefix_end_unrounded(&mut w, &mut g, &mut ls, tail, dyn_tr);
+}
+
+/// "Type layout": a struct ending in a trait object (`ArcInner<dyn Tr>`) places its sized fields
+/// at static offsets, and the trait object at the prefix's end rounded up to the vtable's
+/// alignment, a run-time value (crate::dyn_tail). Its row keeps the end unrounded and the
+/// prefix's alignment: `S<dyn Tr> { a: u8, t: dyn Tr }` ends at 1 aligned to 1; `ArcInner<dyn
+/// Tr> { strong: u64, weak: u8, data: dyn Tr }` ends at 9 aligned to 8 (not 16: the rounding is
+/// the vtable's). A struct whose last field is itself such a struct, and a packed one, are
+/// refused by name. A wrong version that rounded the prefix's end to its own alignment would
+/// give 16 for the second; one that kept the old refusal fails the first `unwrap`.
+fn dyn_tails_keep_the_prefix_end_unrounded(w: &mut World, g: &mut G, ls: &mut Layouts<Global>, tail: ItemKey, dyn_tr: PTy) {
+    let ends_in_dyn = g.adt(tail, &[dyn_tr]);
+    let id = lay(w, g, ls, ends_in_dyn).unwrap();
+    assert_eq!(ls.get(id).tail, Tail::Dyn, "S<dyn Tr> ends in a trait object");
+    assert_eq!(ls.dyn_prefix(id), Some(DynPrefix { tail_at: 1, align: 0 }), "S<dyn Tr>: the u8 ends at 1");
+    assert_eq!(ls.size_of_val(id, 0), None, "its size is the vtable's, read at run time");
+    let arc_inner = w.strukt(1, &[F::Leaf(U64), F::Leaf(U8), F::P(0)], ReprAttrs::RUST);
+    let t = g.adt(arc_inner, &[dyn_tr]);
+    let id = lay(w, g, ls, t).unwrap();
+    assert_eq!(ls.field_offset(id, 0), Some(0), "the u64 first");
+    assert_eq!(ls.field_offset(id, 1), Some(8), "then the u8");
+    assert_eq!(ls.dyn_prefix(id), Some(DynPrefix { tail_at: 9, align: 3 }), "ArcInner<dyn Tr>: ends at 9, aligned to 8");
+    let outer = w.strukt(1, &[F::Leaf(U8), F::AdtP(tail, 0)], ReprAttrs::RUST);
+    let t = g.adt(outer, &[dyn_tr]);
+    let refused = lay(w, g, ls, t).unwrap_err();
+    assert!(matches!(refused.why, Refusal::Unsupported(what) if what.contains("itself a struct ending in a trait object")), "{refused:?}");
+    let packed = w.strukt(1, &[F::Leaf(U8), F::P(0)], ReprAttrs { packed: Some(0), ..ReprAttrs::RUST });
+    let t = g.adt(packed, &[dyn_tr]);
+    let refused = lay(w, g, ls, t).unwrap_err();
+    assert!(matches!(refused.why, Refusal::Unsupported(what) if what.contains("packed")), "{refused:?}");
+}
+
+/// rustc's `size_and_align_of_dst` for a slice or `str` tail: `round_up(tail_at + len * stride,
+/// align)`, where `tail_at` is the tail field's own offset and `align` includes the element's.
+/// The row's `size` is that offset, unrounded: `P { a: u64, b: u8, t: [u8] }` keeps 9 (not 16),
+/// so lengths 0, 3, 7, 8 are 16, 16, 16, 24; `Q { a: u8, t: [u32] }` has its tail at 4 and length
+/// 2 is 12; a bare `[u16]` of 5 is 10. Nesting adds offsets: `Outer { a: u8, p: P<[u8]> }` has
+/// `p` at 8 and its tail at 17, so length 3 is 24; a `repr(transparent)` wrapper of `P` keeps
+/// 9, so length 3 is 16 (the last field's offset, 0, would give 8). A version that rounded the
+/// prefix first gives 24 for `P` of 3. Prints nothing; a failure names the case.
+#[test]
+fn slice_tails_round_once_from_the_tails_offset() {
+    let mut w = World::default();
+    let s3 = w.strukt(1, &[F::Leaf(U64), F::Leaf(U8), F::P(0)], ReprAttrs::RUST);
+    let s2 = w.strukt(1, &[F::Leaf(U8), F::P(0)], ReprAttrs::RUST);
+    let outer = w.strukt(1, &[F::Leaf(U8), F::AdtP(s3, 0)], ReprAttrs::RUST);
+    let wrap = w.strukt(1, &[F::AdtP(s3, 0)], ReprAttrs { transparent: true, ..ReprAttrs::RUST });
+    let mut g = G::new();
+    let mut ls = Layouts::new_in(Global);
+    let (u8_, u16_, u32_) = (g.n(U8), g.n(U16), g.n(U32));
+    let (bytes, halves, words) = (g.n(PNode::Slice(u8_)), g.n(PNode::Slice(u16_)), g.n(PNode::Slice(u32_)));
+    let p = g.adt(s3, &[bytes]);
+    let pid = lay(&w, &mut g, &mut ls, p).unwrap();
+    assert_eq!((ls.field_offset(pid, 2), ls.get(pid).size, ls.get(pid).align_bytes()), (Some(9), 9, 8), "P: the tail at 9, unrounded, aligned to 8");
+    for (len, want) in [(0, 16), (3, 16), (7, 16), (8, 24)] {
+        assert_eq!(ls.size_of_val(pid, len), Some(want), "P of length {len}");
+    }
+    let q = g.adt(s2, &[words]);
+    let qid = lay(&w, &mut g, &mut ls, q).unwrap();
+    assert_eq!(ls.field_offset(qid, 1), Some(4), "Q: the [u32] at 4");
+    assert_eq!(ls.size_of_val(qid, 2), Some(12), "Q of length 2");
+    let hid = lay(&w, &mut g, &mut ls, halves).unwrap();
+    assert_eq!(ls.size_of_val(hid, 5), Some(10), "[u16] of length 5");
+    let o = g.adt(outer, &[bytes]);
+    let oid = lay(&w, &mut g, &mut ls, o).unwrap();
+    assert_eq!((ls.field_offset(oid, 1), ls.get(oid).size), (Some(8), 17), "Outer: p at 8, its tail at 17");
+    assert_eq!(ls.size_of_val(oid, 3), Some(24), "Outer of length 3");
+    let t = g.adt(wrap, &[bytes]);
+    let tid = lay(&w, &mut g, &mut ls, t).unwrap();
+    assert_eq!(ls.size_of_val(tid, 3), Some(16), "transparent P of length 3");
 }
 
 /// Pattern types (typeck.md, "Pattern types") narrow their base's valid range, so an enclosing

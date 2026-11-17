@@ -68,8 +68,11 @@ pub mod head {
 
 blaze_format_core::record! {
     /// A lowering's record: a slice per column, the lang items read and the head.
+    /// Format 2: a block scope's row holds its `{` offset (`d`) and the expansion that wrote
+    /// it (`e`, NONE for the item's own text) ([`crate::scope_origin`]).
+    /// Format 3: the marks of the expansions' words (`mark_starts`, `mark_bytes`).
     #[derive(Clone, Copy, Debug)]
-    pub struct LoweredRoot: 1 {
+    pub struct LoweredRoot: 3 {
         pub langs: u64,
         pub exprs: Slice<Node>,
         pub expr_ranges: Slice<Range>,
@@ -103,6 +106,12 @@ blaze_format_core::record! {
         /// ... and where its words start in `expanded`: expansions are appended whole, in
         /// order, so the one holding an offset is the last starting at or before it.
         pub expansion_starts: Slice<u32>,
+        /// The marks of the expansions' words (blaze-expand `BodyWord::mark`, drive.md "A token
+        /// keeps its mark"): where each marked word starts in the body's text (past the item's
+        /// length; ascending, as the words are appended) ...
+        pub mark_starts: Slice<u32>,
+        /// ... and its mark, `origin_column::MARK` bytes a row (`TextMark::to_bytes`).
+        pub mark_bytes: Slice<u8>,
         pub head: [u32; 32],
     }
 }
@@ -133,6 +142,8 @@ pub struct Columns<'a> {
     pub(crate) expansion_calls: AVec<'a, Range>,
     pub(crate) expansion_keys: AVec<'a, ContentId>,
     pub(crate) expansion_starts: AVec<'a, u32>,
+    pub(crate) mark_starts: AVec<'a, u32>,
+    pub(crate) mark_bytes: AVec<'a, u8>,
     pub(crate) langs: u64,
     pub(crate) head: Head,
 }
@@ -164,6 +175,8 @@ impl<'a> Columns<'a> {
             expansion_calls: Vec::new_in(alloc),
             expansion_keys: Vec::new_in(alloc),
             expansion_starts: Vec::new_in(alloc),
+            mark_starts: Vec::new_in(alloc),
+            mark_bytes: Vec::new_in(alloc),
             langs: 0,
             head: [NONE; HEAD_WORDS],
         }
@@ -199,6 +212,8 @@ impl<'a> Columns<'a> {
             expanded: &self.expanded,
             expansion_calls: &self.expansion_calls,
             expansion_keys: &self.expansion_keys,
+            mark_starts: &self.mark_starts,
+            mark_bytes: &self.mark_bytes,
             langs: self.langs,
             head: self.head,
         }
@@ -230,6 +245,8 @@ impl<'a> Columns<'a> {
         let expansion_calls = Column::push(&mut out, &self.expansion_calls);
         let expansion_keys = Column::push(&mut out, &self.expansion_keys);
         let expansion_starts = Column::push(&mut out, &self.expansion_starts);
+        let mark_starts = Column::push(&mut out, &self.mark_starts);
+        let mark_bytes = Column::push(&mut out, &self.mark_bytes);
         let at = out.next::<LoweredRoot>();
         let root = LoweredRoot {
             langs: self.langs,
@@ -257,6 +274,8 @@ impl<'a> Columns<'a> {
             expansion_calls: expansion_calls.slice(at, offset_of!(LoweredRoot, expansion_calls)),
             expansion_keys: expansion_keys.slice(at, offset_of!(LoweredRoot, expansion_keys)),
             expansion_starts: expansion_starts.slice(at, offset_of!(LoweredRoot, expansion_starts)),
+            mark_starts: mark_starts.slice(at, offset_of!(LoweredRoot, mark_starts)),
+            mark_bytes: mark_bytes.slice(at, offset_of!(LoweredRoot, mark_bytes)),
             head: self.head,
         };
         let written = out.push(&root);
@@ -341,6 +360,8 @@ pub fn open<'b>(buffer: &'b [u8], item: &'b str) -> Result<View<'b>, Open> {
         expanded,
         expansion_calls: root.expansion_calls.follow(buffer)?,
         expansion_keys: root.expansion_keys.follow(buffer)?,
+        mark_starts: root.mark_starts.follow(buffer)?,
+        mark_bytes: root.mark_bytes.follow(buffer)?,
         langs: root.langs,
         head: root.head,
     })
@@ -479,6 +500,8 @@ pub struct View<'b> {
     expansion_calls: &'b [Range],
     pub expansion_keys: &'b [ContentId],
     expansion_starts: &'b [u32],
+    mark_starts: &'b [u32],
+    mark_bytes: &'b [u8],
     pub langs: u64,
     pub head: Head,
 }
@@ -609,6 +632,43 @@ impl<'b> View<'b> {
         self.ranged("path_ranges", self.path_ranges, p.0)
     }
 
+    /// The mark of the word the path `p` starts at (blaze-expand `BodyWord::mark`; drive.md,
+    /// "A token keeps its mark"): `None` for a path of the item's own text or one whose first
+    /// word no expansion marked. Where the path resolves is `crate::mark_site::site_of` of
+    /// it. A mark row whose bytes are no mark is a [`BadRow`], never `None`.
+    pub fn mark_of_path(&self, p: PathIdx) -> Result<Option<crate::mark_site::TextMark>, BadRow> {
+        use blaze_expand::origin_column::MARK;
+        let start = at("path_ranges", self.path_ranges, p.0)?.start;
+        let Ok(i) = self.mark_starts.binary_search(&start) else { return Ok(None) };
+        let bad = BadRow { column: "mark_bytes", tag: u16::MAX };
+        let bytes = self.mark_bytes.get(i * MARK..(i + 1) * MARK).ok_or(bad)?;
+        crate::mark_site::TextMark::from_bytes(bytes).map(Some).ok_or(bad)
+    }
+
+    /// Each marked word that starts inside `r` (a range of this view): its start relative to
+    /// `r`'s start, so a place in [`View::text_at`] of `r`, and its mark, ascending. What a copy
+    /// of an expansion's text out of the record keeps its marks by (blaze-ladder front2
+    /// locals.rs: a local item a call in the body wrote; [`crate::mark_site::column_of_copy`]).
+    /// A range of another view is `TextAt::OtherView`; a mark row whose bytes are no mark a
+    /// `TextAt::Row`.
+    pub fn marks_in<'x>(&self, r: BodyRange, alloc: Alloc<'x>) -> Result<AVec<'x, (u32, crate::mark_site::TextMark)>, TextAt> {
+        use blaze_expand::origin_column::MARK;
+        if r.lens != self.lens {
+            return Err(TextAt::OtherView(r));
+        }
+        let raw = r.raw();
+        let first = self.mark_starts.partition_point(|&s| s < raw.start);
+        let past = self.mark_starts.partition_point(|&s| s < raw.end);
+        let mut out = AVec::with_capacity_in(past.saturating_sub(first), alloc);
+        for i in first..past {
+            let bad = TextAt::Row(BadRow { column: "mark_bytes", tag: u16::MAX });
+            let bytes = self.mark_bytes.get(i * MARK..(i + 1) * MARK).ok_or(bad)?;
+            let mark = crate::mark_site::TextMark::from_bytes(bytes).ok_or(bad)?;
+            out.push((self.mark_starts[i] - raw.start, mark));
+        }
+        Ok(out)
+    }
+
     /// The range of the row at `i` of the `rows` column (a list's `start + k`).
     pub fn row_range(&self, i: u32) -> Result<BodyRange, BadRow> {
         self.ranged("row_ranges", self.row_ranges, i)
@@ -711,6 +771,42 @@ impl<'b> View<'b> {
 
     pub fn scope(&self, s: ScopeId) -> Result<Scope, BadRow> {
         Scope::decode(at("scopes", self.scopes, s.0)?)
+    }
+
+    /// Which text wrote the block scope `s`, and where its `{` is in it
+    /// ([`crate::scope_origin`]).
+    pub fn scope_origin(&self, s: ScopeId) -> Result<crate::scope_origin::ScopeOrigin, BadRow> {
+        Ok(crate::scope_origin::ScopeOrigin::read(&at("scopes", self.scopes, s.0)?))
+    }
+
+    /// The text of expansion `j` alone: its words as appended, with the spaces between them.
+    /// An offset of a [`crate::scope_origin::ScopeOrigin::Expansion`] or a
+    /// [`crate::scope_origin::CallAt::Expansion`] is of this text.
+    pub fn expansion_text(&self, j: u32) -> Result<&'b str, TextAt> {
+        let bad = TextAt::Row(BadRow { column: "expansion_starts", tag: u16::MAX });
+        let start = *self.expansion_starts.get(j as usize).ok_or(bad)? as usize;
+        let end = self.expansion_starts.get(j as usize + 1).map_or(self.expanded.len(), |e| *e as usize);
+        let bytes = self.expanded.get(start..end).ok_or(bad)?;
+        core::str::from_utf8(bytes).map_err(|_| bad)
+    }
+
+    /// Where the call that made expansion `j` stands: in the item's own text, or in the text of
+    /// the earlier expansion that wrote it. Expansions are appended whole and in order, so the
+    /// text holding a byte past the item's is the last expansion starting at or before it:
+    /// that is which appended text the call's bytes ARE, not a guess among calls. A call is
+    /// read before the expansion it makes, so its writer's index is below `j`.
+    pub fn expansion_call_at(&self, j: u32) -> Result<crate::scope_origin::CallAt, TextAt> {
+        use crate::scope_origin::CallAt;
+        let bad = TextAt::Row(BadRow { column: "expansion_calls", tag: u16::MAX });
+        let call = *self.expansion_calls.get(j as usize).ok_or(bad)?;
+        let item = self.lens.item_len;
+        if call.end <= item {
+            return Ok(CallAt::Item { start: call.start });
+        }
+        let offset = call.start.checked_sub(item).ok_or(bad)?;
+        let held = self.expansion_starts.partition_point(|s| *s <= offset);
+        let writer = held.checked_sub(1).filter(|w| *w < j as usize).ok_or(bad)?;
+        Ok(CallAt::Expansion { expansion: writer as u32, start: offset - self.expansion_starts[writer] })
     }
 
     pub fn unhandled(&self) -> impl Iterator<Item = Unhandled> + 'b {

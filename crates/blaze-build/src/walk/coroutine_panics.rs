@@ -14,9 +14,8 @@
 
 use core::alloc::Allocator;
 
-use blaze_lir::builder::Variadic;
 use blaze_lir::coroutine::Panics;
-use blaze_lir::func::{Conv, RefKind};
+use blaze_lir::func::RefKind;
 use blaze_lir::{Block, Flags};
 use blaze_typeck::List;
 
@@ -46,10 +45,14 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let block = self.create();
         self.reached[block.index()] = true;
         self.begin(block);
-        let place = self.ref_place(Instance { item, args: List::EMPTY });
+        // The pinned entry points are `#[track_caller]`; the place is the coroutine body's, as
+        // rustc's transform gives (walk/track_caller.rs).
+        let callee = Instance { item, args: List::EMPTY };
+        let root = self.body.root;
+        let (sig, values) = self.lang_call_sig(Some(root), callee, &[], &[])?;
+        let place = self.ref_place(callee);
         let reference = self.b.reference(RefKind::Func, place);
-        let sig = self.b.sig(Conv::C, Variadic::No, &[], &[]);
-        self.b.call(Flags::NONE, reference, sig, &[]);
+        self.b.call(Flags::NONE, reference, sig, &values);
         self.b.unreachable();
         if let Some(error) = self.b.error() {
             return Err(BuildError::Lir(error.clone()));

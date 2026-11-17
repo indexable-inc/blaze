@@ -20,9 +20,11 @@ use blaze_own::{AVec, Alloc, Vec};
 
 use blaze_format::{FormatError, Part, Record, SchemaHash, Slice, Writer, leb};
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
+use blaze_tokens::{OpenError, Tokens};
 
 use crate::{
     error::StreamError,
+    token_record::{OriginMaps, TokenRecordError},
     expansion::{
         Diagnostic, Expansion, Hole, HoleOf, IncludeFailure, NestedCall, NestedKind, TokenOrigin,
         PathScope, ProcLevel, Range, ReadAnswer, ReadKind,
@@ -86,16 +88,25 @@ impl RecordColumn {
 
 pub(crate) const COLUMNS: usize = 14;
 
-/// The root: each column's bytes.
+/// A stream record's root: each column's bytes.
 type Root = [Slice<u8>; COLUMNS];
+
+/// An expansion record's root: each column's bytes, then its token record
+/// ([`crate::token_record`], a blaze-tokens buffer of [`blaze_tokens::TOKENS_SCHEMA`] at a
+/// multiple of 16 bytes, opened where it is).
+type ExpansionRoot = [Slice<u8>; COLUMNS + 1];
+
+/// The root slot an expansion record's token record is in.
+const TOKENS_SLOT: usize = COLUMNS;
 
 /// The record's schema: its name, its version and the root's layout.
 pub const EXPANSION_SCHEMA: SchemaHash = blaze_format::schema_of(&[
     Part::Str("blaze-expand Expansion"),
-    // 2: `NoRuleMatched` holds the closest rule (`closest`), 2026-11-16. A version-1 record
-    // fails `open_as` and is made again (rule 26).
-    Part::U64(2),
-    Part::Schema(<Root as Record>::SCHEMA),
+    // 2: `NoRuleMatched` holds the closest rule (`closest`), 2026-11-16.
+    // 3: the root's last slot is the expansion's token record (drive.md D122), 2026-11-17. A
+    // record of an earlier version fails `open_as` and is made again (rule 26).
+    Part::U64(3),
+    Part::Schema(<ExpansionRoot as Record>::SCHEMA),
 ]);
 
 /// Why bytes are not an expansion record.
@@ -108,6 +119,11 @@ pub enum RecordError {
     /// The tokens or contexts do not make a stream (a context not yet in the table, a table
     /// past `u32::MAX`).
     Stream { column: RecordColumn, error: StreamError },
+    /// The record's token record does not open.
+    Tokens { error: OpenError },
+    /// The record's token record holds `tokens` tokens where the stream's columns make `words`
+    /// parser words.
+    TokenCount { tokens: u32, words: u32 },
 }
 
 impl From<FormatError> for RecordError {
@@ -126,6 +142,11 @@ impl fmt::Display for RecordError {
             RecordError::Stream { column, error } => {
                 write!(f, "an expansion record's {column:?} column: {error}")
             }
+            RecordError::Tokens { error } => write!(f, "an expansion record's token record: {error}"),
+            RecordError::TokenCount { tokens, words } => write!(
+                f,
+                "an expansion record's token record holds {tokens} tokens where its stream makes {words} parser words"
+            ),
         }
     }
 }
@@ -245,11 +266,18 @@ impl<'a> Columns<'a> {
 }
 
 impl Expansion<'_> {
-    /// The expansion as a record: one blaze-format buffer of [`EXPANSION_SCHEMA`] in `alloc`.
-    /// Equal expansions give equal bytes.
-    pub fn write_record<'b>(&self, alloc: Alloc<'b>) -> RecordBytes<'b> {
+    /// The expansion as a record: one blaze-format buffer of [`EXPANSION_SCHEMA`] in `alloc`,
+    /// its columns and its token record ([`Expansion::token_record`], its origins counted in
+    /// record tokens of the sources `maps` gives). Equal expansions with equal maps give equal
+    /// bytes; a token whose source `maps` lacks is refused by name.
+    pub fn write_record<'b>(
+        &self,
+        maps: &OriginMaps<'_>,
+        alloc: Alloc<'b>,
+    ) -> Result<RecordBytes<'b>, TokenRecordError> {
+        let tokens = self.token_record(maps, alloc)?;
         let c = Columns { columns: self.write_columns(alloc) };
-        finish_columns(&c, EXPANSION_SCHEMA, alloc)
+        Ok(finish_expansion(&c, &tokens, alloc))
     }
 
     /// The record's columns, each its own bytes in `alloc`, before any root: what a kept
@@ -405,16 +433,45 @@ fn finish_columns<'b>(
     schema: SchemaHash,
     alloc: Alloc<'b>,
 ) -> RecordBytes<'b> {
+    let slots: [&[u8]; COLUMNS] = core::array::from_fn(|i| &c.columns[i][..]);
+    finish_slots(&slots, None, schema, alloc)
+}
+
+/// An expansion's columns and its token record `tokens` as one buffer of [`EXPANSION_SCHEMA`].
+fn finish_expansion<'b>(c: &Columns<'_>, tokens: &[u8], alloc: Alloc<'b>) -> RecordBytes<'b> {
+    let slots: [&[u8]; COLUMNS + 1] = core::array::from_fn(|i| match i == TOKENS_SLOT {
+        true => tokens,
+        false => &c.columns[i][..],
+    });
+    finish_slots(&slots, Some(TOKENS_SLOT), EXPANSION_SCHEMA, alloc)
+}
+
+/// `slots` as one buffer of `schema`: each non-empty slot's bytes, then the root of one
+/// [`Slice`] per slot. Slot `buffer` is a blaze-format buffer of its own, written at a multiple
+/// of 16 bytes so that it opens where it is.
+fn finish_slots<'b, const N: usize>(
+    slots: &[&[u8]; N],
+    buffer: Option<usize>,
+    schema: SchemaHash,
+    alloc: Alloc<'b>,
+) -> RecordBytes<'b>
+where
+    [Slice<u8>; N]: Record,
+{
     let mut out = Writer::new_in(schema, alloc);
-    let mut places = [(0u64, 0usize); COLUMNS];
-    for (place, bytes) in places.iter_mut().zip(c.columns.iter()) {
+    let mut places = [(0u64, 0usize); N];
+    for (i, (place, bytes)) in places.iter_mut().zip(slots.iter()).enumerate() {
         if !bytes.is_empty() {
-            *place = (out.push_slice(&bytes[..]), bytes.len());
+            let at = match buffer == Some(i) {
+                true => out.push_buffer(bytes),
+                false => out.push_slice(bytes),
+            };
+            *place = (at, bytes.len());
         }
     }
-    let root_at = out.next::<Root>();
+    let root_at = out.next::<[Slice<u8>; N]>();
     let field = wide(size_of::<Slice<u8>>());
-    let root: Root = core::array::from_fn(|i| match places[i] {
+    let root: [Slice<u8>; N] = core::array::from_fn(|i| match places[i] {
         (_, 0) => Slice::EMPTY,
         (at, len) => Slice::between(root_at + wide(i) * field, at, len),
     });
@@ -425,14 +482,40 @@ fn finish_columns<'b>(
 
 /// A buffer of `schema` opened: each column's bytes, none read yet.
 fn open_columns(buffer: &[u8], schema: SchemaHash) -> Result<Reader<'_>, RecordError> {
-    let root = blaze_format::open_as::<Root>(buffer, schema)?;
-    let mut bytes: [&[u8]; COLUMNS] = [&[]; COLUMNS];
+    Ok(reader(open_slots::<COLUMNS>(buffer, schema)?))
+}
+
+/// An expansion record opened: each column's bytes, none read yet, and its token record's.
+fn open_expansion(buffer: &[u8]) -> Result<(Reader<'_>, &[u8]), RecordError> {
+    let slots = open_slots::<{ COLUMNS + 1 }>(buffer, EXPANSION_SCHEMA)?;
+    let columns: [&[u8]; COLUMNS] = core::array::from_fn(|i| slots[i]);
+    Ok((reader(columns), slots[TOKENS_SLOT]))
+}
+
+/// Each slot's bytes of a buffer of `schema` whose root is `N` slices.
+fn open_slots<const N: usize>(buffer: &[u8], schema: SchemaHash) -> Result<[&[u8]; N], RecordError>
+where
+    [Slice<u8>; N]: Record,
+{
+    let root = blaze_format::open_as::<[Slice<u8>; N]>(buffer, schema)?;
+    let mut bytes: [&[u8]; N] = [&[]; N];
     for (place, slice) in bytes.iter_mut().zip(root.iter()) {
         *place = slice.follow(buffer)?;
     }
-    Ok(Reader {
-        columns: core::array::from_fn(|i| Col { column: RecordColumn::ALL[i], bytes: bytes[i], at: 0 }),
-    })
+    Ok(bytes)
+}
+
+fn reader(bytes: [&[u8]; COLUMNS]) -> Reader<'_> {
+    Reader { columns: core::array::from_fn(|i| Col { column: RecordColumn::ALL[i], bytes: bytes[i], at: 0 }) }
+}
+
+/// The token record of an expansion record ([`Expansion::write_record`]'s bytes), opened where
+/// it is and checked once by blaze-tokens: what a reader of the expansion's tokens (an outline,
+/// a lowering) takes, with no stream read and nothing rendered. The buffer is 16-aligned, as
+/// every expansion record.
+pub fn expansion_tokens(buffer: &[u8]) -> Result<Tokens<'_>, RecordError> {
+    let slots = open_slots::<{ COLUMNS + 1 }>(buffer, EXPANSION_SCHEMA)?;
+    Tokens::open(slots[TOKENS_SLOT]).map_err(|error| RecordError::Tokens { error })
 }
 
 fn write_diagnostic(c: &mut Columns<'_>, diagnostic: Diagnostic) {
@@ -682,11 +765,22 @@ pub(crate) fn ctx_of(raw: u64, nodes: &[Ctx]) -> Option<Ctx> {
 
 impl<'a> Expansion<'a> {
     /// The expansion a [`Expansion::write_record`] buffer holds, in `alloc`, checked once:
-    /// equal to the expansion written, and refused with the column and byte otherwise. The
-    /// buffer is aligned as blaze-format buffers are (to 4 bytes at least).
+    /// equal to the expansion written, and refused with the column and byte otherwise. Its
+    /// token record is opened by blaze-tokens and must hold one token per parser word of the
+    /// stream read ([`RecordError::TokenCount`]); the expansion read holds no copy of it (read
+    /// it in place: [`expansion_tokens`]). The buffer is 16-aligned, as blaze-format buffers
+    /// are, so the token record inside it opens where it is.
     pub fn read_record(buffer: &[u8], alloc: Alloc<'a>) -> Result<Expansion<'a>, RecordError> {
-        let mut r = open_columns(buffer, EXPANSION_SCHEMA)?;
+        let (mut r, token_record) = open_expansion(buffer)?;
         let tokens = read_tokens(&mut r, alloc)?;
+        let record = Tokens::open(token_record).map_err(|error| RecordError::Tokens { error })?;
+        let words = crate::body::parser_words(&tokens, alloc).words.len() - parser::Tokens::PAD;
+        if record.len() != words {
+            return Err(RecordError::TokenCount {
+                tokens: crate::tokens::index(record.len()),
+                words: crate::tokens::index(words),
+            });
+        }
         Expansion::read_rest(r, tokens, alloc)
     }
 

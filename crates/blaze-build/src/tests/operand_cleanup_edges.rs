@@ -353,7 +353,7 @@ fn operand_cleanup_a_half_built_literal_is_refused_by_name() {
         let start = b.field_inits.len() as u32;
         b.field_inits.push(FieldInit { name: Name::of("g"), expr: gl });
         b.field_inits.push(FieldInit { name: Name::of("n"), expr: fc });
-        let lit = b.e(Expr::Struct { path, fields: List { start, len: 2 }, base: None });
+        let lit = b.e(Expr::Struct { path, fields: List { start, len: 2 }, base: blaze_typeck::StructBase::None });
         let stmts = [Stmt::Let { pat: h, ty: None, init: Some(lit), else_: None }];
         let root = b.block(&stmts, None);
         build_main(&w, &b, root)

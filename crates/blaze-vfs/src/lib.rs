@@ -50,7 +50,7 @@ pub mod watch;
 use std::{borrow::Cow, fmt};
 
 use blaze_core::{Completion, Effect, FileName, Stamp, Tag};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::{ContentId, Idx};
 use serde::{Deserialize, Serialize};
 use std::alloc::Global;
@@ -326,7 +326,7 @@ pub struct Ticket(pub u64);
 /// through effects.
 pub struct Vfs {
     tree: Tree,
-    heads: HashMap<Box<str>, NodeId, Global>,
+    heads: Map<Box<str>, NodeId, FixedState, Global>,
     /// By view: its root while it is open. A closed view's number is not given out again.
     views: Vec<Option<NodeId>>,
     journal: Journal,
@@ -875,6 +875,9 @@ pub(crate) enum Plant {
     TagIgnored,
     /// A file over [`MOST_FILE_BYTES`] is read, as before 2026-11-13.
     TooLargeRead,
+    /// The journal tells its tickets durable once its file is synced, its directory never
+    /// synced, so a crash may undo the append that made the file, as before 2026-11-17.
+    NameUnsynced,
 }
 
 #[cfg(test)]

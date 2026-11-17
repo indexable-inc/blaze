@@ -59,7 +59,7 @@
 //! It should print (numbers are the run's), and writes the lines from `front2 records:` on to
 //! the file `FRONT2_RECORDS_OUT` names, when set:
 //! `RECORDS: 11 items, every answer equal over both sources`
-//! `RECORDS: first item <t>, tenth item <t>; names records opened <n> (<b> bytes), scopes decoded <n> (<b> bytes); items records opened <n> (<b> bytes), member lists <n>, texts read <n> (<b> bytes)`
+//! `RECORDS: first item <t>, tenth item <t>; names records opened <n> (<b> bytes); items records opened <n> (<b> bytes), texts read <n> (<b> bytes)`
 //! `PLANT caught: core's impl rows withheld: bool: Clone has <n> candidates over records, <m> solved`
 //! `NO RECORD: no items record for crate `core` (crate <k>)`
 //! `front2 records: bodies 11 equal`
@@ -138,8 +138,23 @@ struct Kept {
     items: Vec<&'static [u8]>,
     files: Vec<HashMap<String, &'static str>>,
     expansions: Vec<HashMap<ItemKey, &'static str>>,
+    /// Each expansion's origin column ([`made_origins`]): a macro-written item's words resolve by
+    /// their marks over records as over the solved names.
+    origins: Vec<HashMap<ItemKey, &'static [u8]>>,
     /// The crate whose items record is not kept (the third reader's).
     no_items: Option<usize>,
+}
+
+/// The origin column an expansion's text keeps, as a loader serves it: empty for a text that
+/// keeps none by design (blaze-scope `OriginsError::Rewritten`, `Unplaced`). Any other error is
+/// the solve's, and the test stops on it.
+fn made_origins(call: ItemKey, origins: &Result<&[u8], blaze_scope::expansion_origins::OriginsError>) -> &'static [u8] {
+    use blaze_scope::expansion_origins::OriginsError;
+    match origins {
+        Ok(bytes) => Box::leak(bytes.to_vec().into_boxed_slice()),
+        Err(OriginsError::Rewritten { .. } | OriginsError::Unplaced { .. }) => &[],
+        Err(e) => panic!("the origins of expansion {call:x}: {e:?}"),
+    }
 }
 
 impl Load<'static> for Kept {
@@ -162,9 +177,8 @@ impl Load<'static> for Kept {
         self.expansions.get(krate)?.get(&call).copied()
     }
 
-    /// This loader keeps texts, not their origins: a finding in one is filed `NotServed`.
-    fn expansion_origins(&self, _krate: usize, _call: ItemKey) -> Option<&'static [u8]> {
-        None
+    fn expansion_origins(&self, krate: usize, call: ItemKey) -> Option<&'static [u8]> {
+        self.origins.get(krate)?.get(&call).copied()
     }
 }
 
@@ -221,7 +235,7 @@ fn answers<'n, S: NamesSource<'n>>(names: S, item: ItemKey) -> String {
         }
     }
     for name in ["println", "vec", "no_such_macro_anywhere"] {
-        out.push_str(&format!("macro {name}: {:?}\n", paths.macro_body(module, false, &[name]).map(|b| b.is_some())));
+        out.push_str(&format!("macro {name}: {:?}\n", paths.macro_body(module, false, &[name], blaze_own::Alloc::global()).map(|b| b.is_some())));
     }
     out
 }
@@ -243,7 +257,7 @@ fn lang_answers<'n, S: NamesSource<'n>>(names: S, index: &Index<'_>) -> String {
 /// `Buckets::lazy`, which `admit` then fills for each question's home).
 fn impl_answers<'n, S: NamesSource<'n>>(names: S, sized: Option<ItemKey>, frame: &'n blaze_mem::Frame, root: ItemKey, b: &mut Buckets) -> (String, usize) {
     let mut keys = Keys::new();
-    let store = Store::new(sized, frame);
+    let store = Store::new(sized, frame, blaze_own::Alloc::global());
     let clone = Paths { names }.path(root, false, &["Clone"], Ns::Type).unwrap_or_else(|e| panic!("`Clone` from the program's root: {e}"));
     assert_eq!(clone.kind, Kind::Trait, "`Clone` names a trait");
     keys.item(clone.key).unwrap_or_else(|e| panic!("filing `Clone`: {e}"));
@@ -482,7 +496,7 @@ fn records_answer_what_the_solved_names_answer() {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let files = [("/hello-world/src/main.rs".to_string(), MAIN.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
-    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
     let crate_names: &'static [&'static str] = Vec::leak(crates.iter().map(|c| leak(c.name)).collect());
@@ -496,7 +510,7 @@ fn records_answer_what_the_solved_names_answer() {
     // solved names leaves this block.
     let g = Alloc::global();
     let make = |names: &blaze_scope::resolve::Names<'_>, no_items: Option<usize>| -> Kept {
-        let mut kept = Kept { names: Vec::new(), items: Vec::new(), files: Vec::new(), expansions: Vec::new(), no_items };
+        let mut kept = Kept { names: Vec::new(), items: Vec::new(), files: Vec::new(), expansions: Vec::new(), origins: Vec::new(), no_items };
         for c in names.crates().iter() {
             kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), g));
             // The bucket index resolved by the whole graph's names (`encode_with`): every impl
@@ -505,14 +519,15 @@ fn records_answer_what_the_solved_names_answer() {
             // By each file's path in its package: what the items record asks for (D96).
             kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), leak(f.text))).collect());
             kept.expansions.push(c.expansions.iter().filter_map(|(call, e)| e.made.map(|m| (*call, leak(m.text)))).collect());
+            kept.origins.push(c.expansions.iter().filter_map(|(call, e)| e.made.as_ref().map(|m| (*call, made_origins(*call, &m.origins)))).collect());
         }
         kept
     };
     let (kept, kept_planted, kept_no_core, chosen, root, solved_items, solved_langs, solved_impls, solved_candidates, kept_bodies, kept_bodies_planted, kept_question, kept_question_text, solved_bodies, (io, out_ty), solved_heads) = {
-        let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
         let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
-        let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+        let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
         let root = names.root(0);
         let main = Paths { names: &names }.path(root, false, &["main"], Ns::Value).unwrap_or_else(|e| panic!("`main` from his crate root: {e}")).key;
         // Ten fns of blaze's own standard library, chosen by key: the ten least.
@@ -534,7 +549,7 @@ fn records_answer_what_the_solved_names_answer() {
         // `Out`: the type `main`'s signature names (D104), for the planted bug.
         let out_ty = Paths { names: &names }.path(root, false, &["Out"], Ns::Type).unwrap_or_else(|e| panic!("`Out` from his crate root: {e}")).key;
         let prepared = Prepares::new_in(Alloc::global());
-        let (mut store, mut body_buckets, mut consts) = (Store::new(front.index.lang("sized"), front.frame), None, Consts::default());
+        let (mut store, mut body_buckets, mut consts) = (Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global()), None, Consts::default());
         let mut solved_bodies: Vec<String> = Vec::new();
         for key in chosen.iter() {
             solved_bodies.push(body_checked(&names, prepared, &mut front.keys, &front.index, &mut store, &mut body_buckets, &mut consts, *key));
@@ -581,8 +596,8 @@ fn records_answer_what_the_solved_names_answer() {
     assert!(errors.is_empty(), "the records filed {errors:?}");
     println!("RECORDS: {} items, every answer equal over both sources", chosen.len());
     println!(
-        "RECORDS: first item {:?}, tenth item {:?}; names records opened {} ({} bytes), scopes decoded {} ({} bytes); items records opened {} ({} bytes), member lists {}, texts read {} ({} bytes)",
-        times[0], times[9], opened.names.crates, opened.names.bytes, opened.names.scopes, opened.names.scope_bytes, opened.items.crates, opened.items.bytes, opened.items.member_lists, opened.items.texts, opened.items.text_bytes
+        "RECORDS: first item {:?}, tenth item {:?}; names records opened {} ({} bytes); items records opened {} ({} bytes), texts read {} ({} bytes)",
+        times[0], times[9], opened.names.crates, opened.names.bytes, opened.items.crates, opened.items.bytes, opened.items.texts, opened.items.text_bytes
     );
 
     // The planted bug: core's impl rows withheld. `impl Clone for bool` is core's, so the
@@ -611,7 +626,7 @@ fn records_answer_what_the_solved_names_answer() {
     let (body_records, body_frame) = reader(keys, crate_names, kept_bodies);
     let mut body_front = Front2::from_records(body_records, body_frame, &lang_crates).unwrap_or_else(|e| panic!("front2 over the bodies' records: {e}"));
     let prepared = Prepares::new_in(Alloc::global());
-    let (mut store, mut body_buckets, mut consts) = (Store::new(body_front.index.lang("sized"), body_frame), None, Consts::default());
+    let (mut store, mut body_buckets, mut consts) = (Store::new(body_front.index.lang("sized"), body_frame, blaze_own::Alloc::global()), None, Consts::default());
     let mut body_times = Vec::new();
     // Per body: its phases and what it opened beyond the bodies before it (the first body's
     // line says where its time goes).
@@ -681,7 +696,7 @@ fn records_answer_what_the_solved_names_answer() {
     withheld.plant_no_item(out_ty);
     let mut withheld_front = Front2::from_records(withheld, withheld_frame, &lang_crates).unwrap_or_else(|e| panic!("front2 over the withheld records: {e}"));
     let withheld_prepared = Prepares::new_in(Alloc::global());
-    let (mut withheld_store, mut withheld_buckets, mut withheld_consts) = (Store::new(withheld_front.index.lang("sized"), withheld_frame), None, Consts::default());
+    let (mut withheld_store, mut withheld_buckets, mut withheld_consts) = (Store::new(withheld_front.index.lang("sized"), withheld_frame, blaze_own::Alloc::global()), None, Consts::default());
     let withheld_main = body_checked(withheld, withheld_prepared, &mut withheld_front.keys, &withheld_front.index, &mut withheld_store, &mut withheld_buckets, &mut withheld_consts, chosen[0]);
     assert_ne!(withheld_main, solved_bodies[0], "the planted bug (the item row of `Out` withheld) was not caught: `main` checks the same");
 
@@ -696,7 +711,7 @@ fn records_answer_what_the_solved_names_answer() {
     let before_alone = asked.opened();
     let (alone_opened, alone_rows, alone_text, alone_index, alone_asked, alone_reads, alone_home, clone_lib, alone_candidates) = {
         let mut alone_keys = Keys::new();
-        let alone_store = Store::new(asked_front.index.lang("sized"), asked_frame);
+        let alone_store = Store::new(asked_front.index.lang("sized"), asked_frame, blaze_own::Alloc::global());
         let clone = Paths { names: asked }.path(root, false, &["Clone"], Ns::Type).unwrap_or_else(|e| panic!("`Clone` from the program's root over records: {e}"));
         alone_keys.item(clone.key).unwrap_or_else(|e| panic!("filing `Clone`: {e}"));
         let home = trait_home(asked, &alone_keys, &alone_store, checker_of(clone.key), Shape::Bool);
@@ -775,17 +790,14 @@ fn records_answer_what_the_solved_names_answer() {
             // Where the first body's time goes, and what it opened beyond the reader's start.
             let ([lower, spell, check], b, a) = body_phases[0];
             format!(
-                "first body phases: lower {} us, spell+scope {} us, check {} us; opened: names records {} ({} bytes), scopes {} ({} bytes), items records {} ({} bytes), member lists {}, texts {} ({} bytes)",
+                "first body phases: lower {} us, spell+scope {} us, check {} us; opened: names records {} ({} bytes), items records {} ({} bytes), texts {} ({} bytes)",
                 lower.as_micros(),
                 spell.as_micros(),
                 check.as_micros(),
                 a.names.crates - b.names.crates,
                 a.names.bytes - b.names.bytes,
-                a.names.scopes - b.names.scopes,
-                a.names.scope_bytes - b.names.scope_bytes,
                 a.items.crates - b.items.crates,
                 a.items.bytes - b.items.bytes,
-                a.items.member_lists - b.items.member_lists,
                 a.items.texts - b.items.texts,
                 a.items.text_bytes - b.items.text_bytes
             )
@@ -850,7 +862,7 @@ fn records_answer_what_the_solved_names_answer() {
     let mut display_keys = Keys::new();
     display_keys.item(display.key).unwrap_or_else(|e| panic!("filing `Display`: {e}"));
     display_keys.item(io).unwrap_or_else(|e| panic!("filing `Io`: {e}"));
-    let display_store = Store::new(asked_front.index.lang("sized"), asked_frame);
+    let display_store = Store::new(asked_front.index.lang("sized"), asked_frame, blaze_own::Alloc::global());
     let (display_trait, io_shape) = (checker_of(display.key), Shape::Adt(checker_of(io)));
     let display_home = trait_home(asked, &display_keys, &display_store, display_trait, io_shape);
     let before_display = asked.opened();

@@ -121,7 +121,7 @@ fn every_written_body_is_checked_over_records() {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let placed: Vec<(String, String)> = vec![("/project/src/main.rs".to_string(), MAIN.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
-    let user = UserCrate { name: "project", dir: "/project/", root: "/project/src/main.rs", files: &placed, edition };
+    let user = UserCrate { name: "project", dir: "/project/", root: "/project/src/main.rs", files: &placed, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
     let crate_names: &'static [&'static str] = Vec::leak(crates.iter().map(|c| leak(c.name)).collect());
@@ -133,7 +133,7 @@ fn every_written_body_is_checked_over_records() {
 
     // The records the solve writes: what the command reads.
     let kept = {
-        let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
         let mut kept = Kept { names: Vec::new(), items: Vec::new(), files: Vec::new(), expansions: Vec::new() };
         for c in names.crates().iter() {
             kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), g));

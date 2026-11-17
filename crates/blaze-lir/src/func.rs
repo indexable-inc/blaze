@@ -483,7 +483,7 @@ blaze_format::record! {
 blaze_format::record! {
     /// Data of the function's own, by content: `data_bytes[bytes_first..][..bytes_len]`,
     /// aligned to `1 << align`, with `data_relocs[relocs_first..][..relocs_len]` the addresses
-    /// in it.
+    /// in it and `data_positions[positions_first..][..positions_len]` the source positions.
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
     pub struct DataRec: 1 {
         pub bytes_first: u32,
@@ -491,6 +491,64 @@ blaze_format::record! {
         pub relocs_first: u32,
         pub relocs_len: u32,
         pub align: u32,
+        pub positions_first: u32,
+        pub positions_len: u32,
+    }
+}
+
+/// Which number of a source position a [`DataPositionRec`] fills.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
+pub enum PositionField {
+    /// The line, from 1 (rustc's `Location::line`).
+    Line,
+    /// The column in chars, from 1 (rustc's `Location::column`).
+    Col,
+}
+
+impl PositionField {
+    pub const ALL: [PositionField; 2] = [PositionField::Line, PositionField::Col];
+
+    pub const fn from_word(word: u32) -> Option<PositionField> {
+        match (word as usize) < PositionField::ALL.len() {
+            true => Some(PositionField::ALL[word as usize]),
+            false => None,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            PositionField::Line => "line",
+            PositionField::Col => "col",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<PositionField> {
+        PositionField::ALL.into_iter().find(|it| it.name() == name)
+    }
+}
+
+blaze_format::record! {
+    /// A source position in data (rule 71: records hold item-relative positions): at byte
+    /// `offset`, a little-endian `u32` that placement fills with the line or the column
+    /// (`field`, a [`PositionField`]) of byte `site` of item `item`'s text, counted from the
+    /// item's first byte. `item` is the item's key, 16 bytes little-endian. The bytes there hold
+    /// 0 until placed, so the function's record does not change when the item moves in its
+    /// file: only placement, which knows where the item is now, writes the number.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+    pub struct DataPositionRec: 1 {
+        pub item: [u8; 16],
+        pub offset: u32,
+        pub site: u32,
+        /// A [`PositionField`].
+        pub field: u32,
+    }
+}
+
+impl DataPositionRec {
+    /// The item's key.
+    pub fn item_key(&self) -> u128 {
+        u128::from_le_bytes(self.item)
     }
 }
 
@@ -776,6 +834,7 @@ macro_rules! columns {
             datas: DataRec,
             data_bytes: u8,
             data_relocs: DataRelocRec,
+            data_positions: DataPositionRec,
             /// Target intrinsics.
             intrinsics: IntrinsicRec,
             /// Stack slots.
@@ -991,6 +1050,12 @@ impl<'a> View<'a> {
     pub fn data_relocs_of(&self, id: DataId) -> &'a [DataRelocRec] {
         let rec = self.datas[id.index()];
         &self.data_relocs[rec.relocs_first as usize..][..rec.relocs_len as usize]
+    }
+
+    /// The source positions in data row `id`, by offset.
+    pub fn data_positions_of(&self, id: DataId) -> &'a [DataPositionRec] {
+        let rec = self.datas[id.index()];
+        &self.data_positions[rec.positions_first as usize..][..rec.positions_len as usize]
     }
 
     pub fn intrinsic_name(&self, id: IntrinsicId) -> &'a [u8] {

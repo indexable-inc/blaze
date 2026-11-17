@@ -77,13 +77,13 @@ fn shared_records_hold_no_body_type() {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let files = [("/hello-world/src/main.rs".to_string(), BODY.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
-    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: BODY }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
-        let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+        let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
     let key = |n: &str| {
         let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &[n] }, Alloc::global())
             .unwrap_or_else(|e| panic!("`{n}`: {e}"));
@@ -94,7 +94,7 @@ fn shared_records_hold_no_body_type() {
     let sized = front.index.lang("sized");
     // Each fn of `order` lowered and checked in turn over one store; the outcomes by fn.
     let mut run = |order: &[blaze_id::ItemKey]| -> Vec<(blaze_id::ItemKey, String)> {
-        let (mut store, mut buckets, mut consts) = (Store::new(sized, front.frame), None, Consts::default());
+        let (mut store, mut buckets, mut consts) = (Store::new(sized, front.frame, blaze_own::Alloc::global()), None, Consts::default());
         let mut got = Vec::new();
         for &k in order {
             let body = lower_fn(&names, prepared, &mut front.keys, &mut store, k).unwrap_or_else(|e| panic!("lowering {k:x}: {e}"));
@@ -131,18 +131,18 @@ fn a_macro_written_member_checks() {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let files = [("/hello-world/src/main.rs".to_string(), BODY.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
-    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: BODY }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
-        let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+        let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
     assert!(names.notes(0).is_empty(), "crate 0's notes: {:?}", names.notes(0));
     let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &["most"] }, Alloc::global())
         .unwrap_or_else(|e| panic!("`most`: {e}"));
     let main = found.whole(1).unwrap_or_else(|| panic!("`most` not named")).key;
-    let mut store = Store::new(front.index.lang("sized"), front.frame);
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let mut buckets = None;
     let prepared = Prepares::new_in(Alloc::global());
     let body = lower_fn(&names, prepared, &mut front.keys, &mut store, main).unwrap_or_else(|e| panic!("lowering `most`: {e}"));
@@ -179,10 +179,10 @@ fn a_plain_main_is_std_mains_input() {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let files = [("/hello-world/src/main.rs".to_string(), BODY.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
-    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     assert!(names.notes(0).is_empty(), "crate 0's notes: {:?}", names.notes(0));
     let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &["main"] }, Alloc::global())
         .unwrap_or_else(|e| panic!("`main` after std::main: {e}"));
@@ -208,10 +208,10 @@ fn his_main_through_the_checker() {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let files = [("/hello-world/src/main.rs".to_string(), MAIN.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
-    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let resolved = start.elapsed();
     let crate_names: Vec<&str> = crates.iter().map(|c| c.name).collect();
 
@@ -272,8 +272,8 @@ impl<'n> WalkHooks<'n> for HisMain<'n> {
         let first = outcome(checked);
         {
             // The command's one frame (the names' lifetime is the frame's).
-            let mut front_r = Front2::new(names, self.frame, self.sources).unwrap_or_else(|e| panic!("front2 (reversed): {e}"));
-            let mut store_r = Store::new(front_r.index.lang("sized"), front_r.frame);
+            let mut front_r = Front2::new(names, self.frame, self.sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2 (reversed): {e}"));
+            let mut store_r = Store::new(front_r.index.lang("sized"), front_r.frame, blaze_own::Alloc::global());
             let mut buckets_r = None;
             let body_r = lower_fn(names, prepared, &mut front_r.keys, &mut store_r, main).unwrap_or_else(|e| panic!("lowering main again: {e}"));
             let view_r = body_r.lowered.view();
@@ -577,13 +577,13 @@ fn second() {
 }
 ";
     let files = [SourceFile { path: "src/main.rs", text: PROGRAM }];
-    let tc = Toolchain::none();
+    let tc = Toolchain::none(blaze_own::Alloc::global());
     let new = blaze_ladder::run::NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
-    let texts = blaze_ladder::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc).unwrap_or_else(|e| panic!("the program's texts: {e}"));
+    let texts = blaze_ladder::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind).unwrap_or_else(|e| panic!("the program's texts: {e}"));
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let crate_names: Vec<&str> = crates.iter().map(|c| c.name).collect();
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the walk's frame");
     let survey_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the survey's frame");
@@ -640,7 +640,7 @@ fn the_entry_programs_as_far_as_each_gets() {
     let mut missed: Vec<String> = Vec::new();
     for (shape, text) in programs {
         let files = [SourceFile { path: "src/main.rs", text }];
-        let got = build_new(&files, "src/main.rs", NewFront { package: "entry", edition: EDITION, shelf: Some(&shelf), overflow: blaze_build::OverflowChecks::On });
+        let got = build_new(&files, "src/main.rs", NewFront { package: "entry", edition: EDITION, shelf: Some(&shelf), overflow: blaze_build::OverflowChecks::On }, blaze_own::Alloc::global());
         let line = match &got {
             Ok(_) => "BUILT (front, checker and builder: no refusal)".to_string(),
             Err(e) => format!("REFUSED: {e}"),

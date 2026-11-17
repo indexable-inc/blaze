@@ -1,0 +1,14 @@
+{
+ "id": "anon-const-module-marks",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane TC (constants in heads) under rebuild-1115",
+ "where": "crates/blaze-ladder/src/front2/body.rs lower_member_into (member_marks of head.lib) for anonymous constants (front2/anon.rs); front2/types.rs const_want",
+ "what": "Five census classes that read as five different evaluator gaps (`nlimbs(64)`, `size_of::<usize>()`, `size_of::<Self>()`, `1 << 0`, `(32 - 1) - 1 ..`, plus BodyConst AnonInBody) all ended in the same inner text, 'a body it needs: fn <hex>: its lowered record: item .. has a text and no place': the hex is the anonymous constant's MODULE (BodyError::Record's item is head.lib), not a callee. The census row's 'fn <hex>' reads like a callee's key, and ItemKey's Debug prints only 12 hex digits, so it took decoding the decimal constant key against the hex prefix to see it.",
+ "cost": "about an hour of reading before the shared cause was clear",
+ "cause": "token-mark-F1 made every member body ask its container's marks; an anonymous constant's container is a module with no place over records (and its text is made by front2, a slice of no expansion)",
+ "whys": "anon constants are filed as module members to reuse lower_member; the marks piece did not know a member can have a made text",
+ "class": "a made text (no source place) routed through a path that assumes a written one",
+ "prevention": "proposed: lower_member_into skips marks for MemberKind::Anon (OLD/NEW in lane TC's report); owed: carry the head's marks into the made text so a def-site macro's head constant resolves where it was written; BodyError::Record should print which member asked, not only the container",
+ "workaround": "none",
+ "state": "open"
+}

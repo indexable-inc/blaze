@@ -2,7 +2,7 @@
 //! takes the op; an edit of a range that does not meet what changed is moved to where that
 //! range is now; anything else is refused with the path, so the agent decides.
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use std::alloc::Global;
 
 use crate::{
@@ -18,7 +18,7 @@ pub(crate) fn rebase(
     head: NodeId,
     ops: &[Op],
 ) -> Result<Vec<Option<Op>>, CommitError> {
-    let mut touched: HashMap<&str, usize, Global> = HashMap::new_in(Global);
+    let mut touched: Map<&str, usize, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     for op in ops {
         for path in op_paths(op) {
             *touched.entry(path).or_default() += 1;

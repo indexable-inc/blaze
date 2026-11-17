@@ -1,0 +1,14 @@
+{
+ "id": "tb-red-tests-test-helpers-assume",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane TB (red unit tests) on rebuild-1115",
+ "where": "crates/blaze-build/src/tests.rs has_call_sig and g_drops; crates/blaze-flow-lower/src/impl_call_tests.rs world; crates/blaze-body-flow/src/tests.rs STRAIGHT; crates/blaze-consteval/src/tests/closure_fn_ptr.rs",
+ "what": "Five of twelve red tests were red because of the test, not the code: has_call_sig skipped the head's signature though blaze-lir makes each signature once (a tracked fn calling a tracked fn of its shape names the head's); a trait fixture declared with 0 generics (the count includes Self); a 'clean' body with a subset to a placeholder (not clean under RFC 2094); a use-after-move body that never wrote _0; closures using `+` in a world with no Add lang item. g_drops panicked at code placement on a glue it lacked, hiding which case and which type.",
+ "cost": "about an hour across five crates; the runner does not show a passing or failing test's stdout, so a panic in a loop of cases cannot be told apart without changing the harness",
+ "cause": "tests written without being run (D119 crates) and helpers whose assumptions were never stated",
+ "whys": "the authors did not compile; a helper that reads 'every signature but the head' instead of the call's operand; a native run that panics instead of returning the case's error",
+ "class": "a test helper that encodes an assumption about the code under test instead of reading what it produced",
+ "prevention": "done: has_call_sig reads each call's signature operand; g_drops returns an error naming the type it has no glue for. Wanted: the runner prints a failing test's captured stdout",
+ "workaround": "turn a placement panic into a per-case error so the case loop reports it",
+ "state": "partly fixed"
+}

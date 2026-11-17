@@ -156,7 +156,8 @@ impl Buckets {
             return 0;
         }
         // Every field: a new kind of home is a compile error here, not a crate left unasked.
-        let Homes { all, bare, blanket } = home;
+        // `local` judges filed impls, never which crates are asked.
+        let Homes { all, bare, blanket, local: _ } = home;
         let mut reads: Vec<BucketRead, Global> = Vec::new_in(Global);
         if [all, bare, blanket].contains(&Home::Incoherent) {
             match names.incoherent_crates() {
@@ -174,8 +175,12 @@ impl Buckets {
                 None => names.gap("which crates may write an incoherent inherent impl (the records were named no lang crates: `Records::name_lang_crates`)", None),
             }
         }
-        // The buckets asked of each crate, and how an impl found in each is filed.
-        let mut wanted: Vec<(BucketKey, Under), Global> = Vec::new_in(Global);
+        // The buckets asked of each crate, how an impl found in each is filed, and whether the
+        // bucket is the "any" head's (where a self path the writer read to no constructor is:
+        // `PathSelf`).
+        let mut wanted: Vec<(BucketKey, Under, bool), Global> = Vec::new_in(Global);
+        // The asked trait's crate (`PathSelf::Trait`).
+        let mut trait_krate = None;
         let (trait_, shape) = match ask {
             Ask::Trait(t, shape) => (Some(t), shape),
             Ask::Inherent(shape) => (None, shape),
@@ -193,10 +198,11 @@ impl Buckets {
                     names.gap("the library key of the trait an impl question is about", None);
                     return 0;
                 };
-                wanted.extend(all_heads.map(|(head, of)| (BucketKey::of_trait(lib, head), Under::Trait(of))));
-                wanted.push((BucketKey::negatives(lib), Under::Negative));
+                trait_krate = names.crate_of(lib);
+                wanted.extend(all_heads.map(|(head, of)| (BucketKey::of_trait(lib, head), Under::Trait(of), head == Head::Any)));
+                wanted.push((BucketKey::negatives(lib), Under::Negative, false));
             }
-            None => wanted.extend(all_heads.map(|(head, of)| (BucketKey::inherent(head), Under::Inherent(of)))),
+            None => wanted.extend(all_heads.map(|(head, of)| (BucketKey::inherent(head), Under::Inherent(of), head == Head::Any))),
         }
         let mut filed = 0usize;
         for krate in 0..self.lazy_filed.len() {
@@ -225,7 +231,7 @@ impl Buckets {
                 }
             };
             reads.push(BucketRead { krate: krate_id, bucket: UNFILED_LIST, answer: unfiled });
-            for (key, under) in wanted.iter() {
+            for (key, under, any_head) in wanted.iter() {
                 let digest = match self.indexed.filed.get(&(krate, *key)).copied() {
                     Some(digest) => digest,
                     None => {
@@ -236,13 +242,17 @@ impl Buckets {
                             if it.blanket {
                                 self.blanket.push(it.key);
                             }
-                            let how = match (*under, trait_) {
-                                (Under::Trait(of), Some(t)) => Filed::Trait(t, of, it.bare),
-                                (Under::Negative, Some(t)) => Filed::Negative(t),
-                                (Under::Inherent(of), _) | (Under::Trait(of), None) => Filed::Inherent(of),
+                            let (how, path_self) = match (*under, trait_) {
+                                (Under::Trait(of), Some(t)) => (Filed::Trait(t, of, it.bare), Some(PathSelf::Trait { of: trait_krate, bare: it.bare })),
+                                (Under::Negative, Some(t)) => (Filed::Negative(t), None),
+                                (Under::Inherent(of), _) | (Under::Trait(of), None) => (Filed::Inherent(of), Some(PathSelf::Inherent)),
                                 (Under::Negative, None) => continue,
                             };
                             self.put(it.key, how, false);
+                            // A self path under the "any" head that is no parameter: the writer
+                            // read it to no constructor, as `file_row` reads `SelfAt::Unread`.
+                            let read_to_nothing = *any_head && it.self_path && !it.blanket;
+                            self.bound(names, it.key, krate, path_self.filter(|_| read_to_nothing));
                             self.indexed.from_index += 1;
                         }
                         filed += got.len();
@@ -276,20 +286,21 @@ impl Buckets {
         for (row, why) in rows.iter() {
             self.indexed.not_filed[*why as usize] += 1;
             match file_row(names, row, &mut kept) {
-                Ok((filed, blanket)) => {
+                Ok((filed, blanket, path_self)) => {
                     if blanket {
                         self.blanket.push(row.key);
                     }
                     self.put(row.key, filed, false);
+                    self.bound(names, row.key, krate, path_self);
                     self.filed_from_rows += 1;
                 }
                 Err(miss) => {
                     self.row_misses[miss as usize] += 1;
                     match names.impl_with_header(krate, row.key, row.module) {
                         Some(at) => impls.push(at),
-                        // Its text did not read (the source filed why): unread, a candidate
-                        // of every question, as `file` files an impl with no text.
-                        None => self.put(row.key, Filed::Unread(Unread::NoText, None), false),
+                        // Its text did not read (the source filed why): unread, filed by
+                        // what its row read (`Buckets::put_textless`).
+                        None => self.put_textless(names, row, &mut kept),
                     }
                 }
             }

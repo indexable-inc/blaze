@@ -81,8 +81,10 @@ fn quad_and_half_encodings() {
     }
 }
 
-/// An `f128` add that reaches the tier unlegalized is refused naming the `fadd` (rule 3: never
-/// computed here, never a fallback), and so is an `f128` sign flip.
+/// An `f128` add given to the literal-word form is legalized there as in the record form, and
+/// with no routine bound it is refused naming `__addtf3` (rule 3: never computed here, never a
+/// fallback). Judge-changed 2026-11-17 by lane TE: it expected the pass's own `fadd` refusal,
+/// from when `emit` skipped legalize.
 ///
 /// Prints: `test quad_tests::unlegalized_f128_arithmetic_is_refused_by_name ... ok`
 #[test]
@@ -90,7 +92,7 @@ fn unlegalized_f128_arithmetic_is_refused_by_name() {
     let mut code = Code::new_in(Global);
     let refused = emit(add_f128().view(), &[], ISA, &mut code);
     assert!(
-        matches!(refused, Err(EmitError::Unsupported { op: Op::Fadd, .. })),
+        matches!(refused, Err(EmitError::Legalize(blaze_lir::legalize::LegalizeError::NoRoutine(r))) if r.symbol() == "__addtf3"),
         "an unlegalized f128 add: {refused:?}"
     );
 }

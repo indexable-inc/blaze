@@ -1,0 +1,12 @@
+{
+ "id": "census-why-text-refusals",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane CW (census WHY and --only) on rebuild-1115",
+ "where": "crates/blaze-ladder/src/front2/census_why.rs reading front2 world_items.rs Gap::RefusedImpl, body.rs refused_head, consts.rs chains; front2/program.rs make_from",
+ "what": "To print why a census row is left out, the evidence had to be parsed back out of refusal TEXT: Gap::RefusedImpl.why holds the PathError as Debug text (its module key cut to 12 hex digits, so the module is found by formatting every module's key), body.rs refused_head puts the member's checker key and the Unsupported range into a Why::Program string, and a constant's chain is one string joined by ': a body it needs: '. Separately, Front2Program::survey_from stops the whole survey when ONE root does not lower (program.rs line 752, `.map_err(Front2Refusal::Lower)?`), so `--only <crate>` with every free fn of a crate as a root can stop on its first bad fn, and the walk has no crate limit, so a per-crate run still checks every dependency fn it reaches.",
+ "cost": "about an hour of reading to find which facts are typed and which are only words; the --only flag cannot yet skip the dependency work it was asked to skip",
+ "cause": "refusals were made to be printed, not read: typed parts were formatted into a string where they were filed",
+ "whys": "Gap and Why::Program carry Box<str>; the survey's root loop was written for one `main`, where stopping is right",
+ "class": "a typed error flattened to text at its filing site loses what a later reader needs",
+ "prevention": "wanted: Gap::RefusedImpl keeps the typed PathError (module: ItemKey); BodyError::Head for a member keeps the member's LibKey and the refused Range; ConstFail chains keep a typed list of links; survey_from files a root that does not lower as a LeftOut row (OLD/NEW in lane CW's report); reach_all takes a crate set to stop at"
+}

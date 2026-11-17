@@ -9,7 +9,8 @@
 //! ```
 //!
 //! - Resolves, per target, the sysroot's units with blaze-unit-graph: `sysroot` (its default
-//!   features) on `library/Cargo.lock`, and `blaze-std` (its default features) on the tree's
+//!   features and `SYSROOT_FEATURES`, as rustc's own build of std asks them) on
+//!   `library/Cargo.lock`, and `blaze-std` (its default features) on the tree's
 //!   `Cargo.lock`. A target's cfgs are those rustc printed for it, as `harness/answers.py`
 //!   recorded them in `crates/blaze-units/src/stdlib/rustc.json` (no compiler is asked).
 //! - Packs: one of `library/` (kind 3), one of the blaze crates beneath bstd (kind 3, each
@@ -233,7 +234,7 @@ fn answer(side: &mut Side, id: LockId, registry: &Path, alloc: Alloc<'static>) -
         (LockSource::Registry { .. }, Origin::Library) => {
             let dir = side.dir.join("vendor").join(format!("{name}-{version}"));
             let units = layout(&Files::Disk(dir.clone()), "", alloc).unwrap_or_else(|e| fail(&format!("{what}: {}: {e}", dir.display())));
-            member_named(&units, name).unwrap_or_else(|| fail(&format!("{what}: {} holds no package `{name}`", dir.display())))
+            member_named(&units, name, alloc).unwrap_or_else(|| fail(&format!("{what}: {} holds no package `{name}`", dir.display())))
         }
         (LockSource::Registry { .. }, Origin::Workspace) => {
             let Checksum::Sha256(hex) = &p.checksum else { fail(&format!("{what}: the lock has no checksum")) };
@@ -250,33 +251,33 @@ fn answer(side: &mut Side, id: LockId, registry: &Path, alloc: Alloc<'static>) -
             let view = PackView::open_verified(pack).unwrap_or_else(|e| fail(&format!("{what}: {}", blaze_text::Shown(&e))));
             let units = layout(&Files::Pack(view), "", alloc).unwrap_or_else(|e| fail(&format!("{what}: {e}")));
             side.packs.insert(id, pack);
-            member_named(&units, name).unwrap_or_else(|| fail(&format!("{what}: its `.crate` holds no package `{name}`")))
+            member_named(&units, name, alloc).unwrap_or_else(|| fail(&format!("{what}: its `.crate` holds no package `{name}`")))
         }
         (LockSource::Git { .. }, _) => fail(&format!("{what}: a git package beneath the toolchain; the toolchain takes registry and path packages only")),
         (LockSource::Path, _) => {
             // A path package that is no member (a `[patch]`, or a path dependency of one): the
             // one folder under the tree whose manifest is that package.
-            let Some(dir) = patched(&side.dir, name).or_else(|| package_folder(&side.dir, name)) else {
+            let Some(dir) = patched(&side.dir, name, alloc).or_else(|| package_folder(&side.dir, name, alloc)) else {
                 fail(&format!("{what}: a path package outside its workspace's layout, its `[patch]` tables and its folders"))
             };
             // Read anchored at its own folder: a patch is no member of the root's workspace.
             let units = layout(&Files::Disk(side.dir.join(&dir)), "", alloc).unwrap_or_else(|e| fail(&format!("{what}: {dir}: {e}")));
             side.folders.insert(id, dir.clone());
-            member_named(&units, name).unwrap_or_else(|| fail(&format!("{what}: {dir} holds no package `{name}`")))
+            member_named(&units, name, alloc).unwrap_or_else(|| fail(&format!("{what}: {dir} holds no package `{name}`")))
         }
     }
 }
 
 /// The one folder under `root` (outside `vendor`, `target` and dot folders) whose `Cargo.toml`
 /// has `[package] name = "<name>"`; two such folders stop the tool.
-fn package_folder(root: &Path, name: &str) -> Option<String> {
+fn package_folder(root: &Path, name: &str, alloc: Alloc<'_>) -> Option<String> {
     let mut found = Vec::new();
     let mut stack = vec![String::new()];
     while let Some(dir) = stack.pop() {
         let at = root.join(&dir);
         let manifest = at.join("Cargo.toml");
         if let Ok(text) = std::fs::read_to_string(&manifest)
-            && let Ok(doc) = blaze_toml::Document::parse_in(&text, blaze_toml::Limits::CARGO, Alloc::global())
+            && let Ok(doc) = blaze_toml::Document::parse_in(&text, blaze_toml::Limits::CARGO, alloc)
             && doc.root().get("package").and_then(|p| p.get("name")).and_then(|n| n.as_str()) == Some(name)
         {
             found.push(dir.clone());
@@ -298,21 +299,32 @@ fn package_folder(root: &Path, name: &str) -> Option<String> {
 }
 
 /// The folder (relative to `root`) a `[patch.<source>]` table of `root/Cargo.toml` gives `name`.
-fn patched(root: &Path, name: &str) -> Option<String> {
+fn patched(root: &Path, name: &str, alloc: Alloc<'_>) -> Option<String> {
     let path = root.join("Cargo.toml");
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
-    let doc = blaze_toml::Document::parse_in(&text, blaze_toml::Limits::CARGO, Alloc::global()).unwrap_or_else(|e| fail(&format!("{}: {}", path.display(), e.display(&text))));
+    let doc = blaze_toml::Document::parse_in(&text, blaze_toml::Limits::CARGO, alloc).unwrap_or_else(|e| fail(&format!("{}: {}", path.display(), e.display(&text))));
     let patches = doc.root().get("patch")?;
     let found = patches.children().find_map(|source| source.get(name)?.get("path")?.as_str().map(str::to_string));
     found.map(|dir| dir.trim_start_matches("./").trim_end_matches('/').to_string())
 }
 
-fn member_named(units: &Units<'static>, name: &str) -> Option<Package<'static>> {
-    units.members.iter().find(|m| m.name.as_str() == name).map(|m| Package::from_member(m, Alloc::global()))
+fn member_named(units: &Units<'static>, name: &str, alloc: Alloc<'static>) -> Option<Package<'static>> {
+    units.members.iter().find(|m| m.name.as_str() == name).map(|m| Package::from_member(m, alloc))
 }
 
-/// `root`'s unit graph on `side` for `target`: what the sysroot's part from that tree is.
-fn resolve(side: &mut Side, root: &str, target: &'static TargetDesc<'static>, registry: &Path, alloc: Alloc<'static>) -> UnitGraph<'static> {
+/// The features asked of `sysroot` beyond its default (`panic-unwind`): those rustc's own build of
+/// the prebuilt std turns on for every target (bootstrap's `std_features`: `backtrace` while
+/// `rust.backtrace` is on, its default). std has no `default` feature of its own, so only an ask
+/// turns `backtrace` on; it is `std/backtrace`, whose `addr2line/rustc-dep-of-std`,
+/// `object/rustc-dep-of-std` and `miniz_oxide/rustc-dep-of-std` turn on those optional
+/// dependencies (and through them `gimli` and `adler2`). Without it std's
+/// `backtrace_rs::symbolize::gimli` names `addr2line`, which its extern prelude lacks.
+/// `compiler-builtins-c` is left off: it compiles C, which the cut does not.
+const SYSROOT_FEATURES: &[&str] = &["backtrace"];
+
+/// `root`'s unit graph on `side` for `target`, with `features` asked of it besides its
+/// default ones: what the sysroot's part from that tree is.
+fn resolve(side: &mut Side, root: &str, features: &[&str], target: &'static TargetDesc<'static>, registry: &Path, alloc: Alloc<'static>) -> UnitGraph<'static> {
     let written = side.units.resolver.as_ref().map(|(r, _)| r.as_str());
     let resolver = Resolver::of(written, side.units.root_edition).unwrap_or_else(|_| fail(&format!("{}: an unknown resolver {written:?}", side.dir.display())));
     let lock = side.lock;
@@ -328,7 +340,11 @@ fn resolve(side: &mut Side, root: &str, target: &'static TargetDesc<'static>, re
     if roots.is_empty() {
         fail(&format!("{}: no member `{root}` in its lock", side.dir.display()));
     }
-    let ask: &'static Ask<'static> = Box::leak(Box::new(Ask { roots, features: AVec::new_in(alloc), all_features: false, no_default_features: false, tests: false }));
+    let mut asked = AVec::new_in(alloc);
+    for f in features {
+        asked.push(blaze_own::String::from_str_in(f, alloc));
+    }
+    let ask: &'static Ask<'static> = Box::leak(Box::new(Ask { roots, features: asked, all_features: false, no_default_features: false, tests: false }));
     let mut res = Resolution::new(lock, target, target, ask, resolver, alloc);
     for (id, p) in members {
         res.member(id, p).unwrap_or_else(|e| fail(&format!("{}: {e}", side.dir.display())));
@@ -609,7 +625,13 @@ fn place(shelf: &Path, digest: &[u8; 32], bytes: &[u8]) -> bool {
 fn main() {
     let argument = std::env::args().nth(1).unwrap_or_else(|| fail("usage: toolchain_cut <json>"));
     let args: Args = input::parse(&argument, SCRIPT);
-    let alloc = Alloc::global();
+    // An entry that takes no grant yet (a plain `fn main`): the run's memory is one frame
+    // taken from the OS here, kept for the process's life since the graphs below are
+    // `'static`, and handed down.
+    let frame: &'static blaze_mem::Frame =
+        Box::leak(Box::new(blaze_mem::Frame::with_reserve(1 << 36, blaze_mem::Tag::Other).unwrap_or_else(|e| fail(&format!("the entry's frame: {e:?}")))));
+    let erased: &'static blaze_own::Erased<&'static blaze_mem::Frame> = Box::leak(Box::new(blaze_own::Erased::new(frame)));
+    let alloc: Alloc<'static> = erased.handle();
     let started = Instant::now();
     let tree = PathBuf::from(&args.tree);
     let registry = PathBuf::from(&args.registry);
@@ -628,8 +650,8 @@ fn main() {
         let (desc, atoms) = target_desc(&tree, triple, alloc);
         target_cfgs.push(atoms);
         let target: &'static TargetDesc<'static> = Box::leak(Box::new(desc));
-        let lib_graph = resolve(&mut library, "sysroot", target, &registry, alloc);
-        let ws_graph = resolve(&mut workspace, "blaze-std", target, &registry, alloc);
+        let lib_graph = resolve(&mut library, "sysroot", SYSROOT_FEATURES, target, &registry, alloc);
+        let ws_graph = resolve(&mut workspace, "blaze-std", &[], target, &registry, alloc);
         let units = cut_target(&[(Origin::Library, &lib_graph, &library), (Origin::Workspace, &ws_graph, &workspace)], &mut facts);
         cut.push((triple.to_string(), units));
     }
@@ -803,5 +825,55 @@ fn main() {
     if args.write_pin {
         std::fs::write(&pinned_path, format!("{id}\n")).unwrap_or_else(|e| fail(&format!("{}: {e}", pinned_path.display())));
         println!("pinned        {}", pinned_path.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tree's `library/` resolved as the cut resolves it, for `triple`, with `features`
+    /// asked of `sysroot`: std's target library unit's dependency names, and every unit's
+    /// package name.
+    fn std_deps(features: &[&str], triple: &str) -> (Vec<String>, Vec<String>) {
+        // The test's one frame (memory from the OS), kept for the process's life since the
+        // graph is `'static`.
+        let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::with_reserve(1 << 34, blaze_mem::Tag::Other).expect("the test's frame")));
+        let erased: &'static blaze_own::Erased<&'static blaze_mem::Frame> = Box::leak(Box::new(blaze_own::Erased::new(frame)));
+        let alloc: Alloc<'static> = erased.handle();
+        let tree = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("scripts/ is a folder of the tree");
+        let mut library = side(Origin::Library, &tree.join("library"), alloc);
+        let (desc, _) = target_desc(tree, triple, alloc);
+        let target: &'static TargetDesc<'static> = Box::leak(Box::new(desc));
+        // The library side reads its registry crates from `library/vendor`, never the registry.
+        let graph = resolve(&mut library, "sysroot", features, target, Path::new("/registry-unused"), alloc);
+        let std = graph
+            .units
+            .iter()
+            .find(|u| u.name.as_str() == "std" && matches!(u.kind, GraphKind::Lib) && !u.for_host)
+            .expect("the sysroot graph has std's library unit");
+        let deps = std.deps.iter().map(|d| d.name.to_string()).collect();
+        let names = graph.units.iter().map(|u| u.name.to_string()).collect();
+        (deps, names)
+    }
+
+    /// The cut's ask turns on std's `backtrace`, so std's library unit depends on `addr2line`,
+    /// `miniz_oxide` and `object`, and `gimli` and `adler2` are in the graph; the default ask
+    /// alone (the cause removed) has none of them. Prints, per triple,
+    /// `<triple>: std -> addr2line, miniz_oxide, object; gimli, adler2 in the graph; none without backtrace`.
+    #[test]
+    fn sysroot_ask_brings_std_backtrace_crates() {
+        for triple in ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "wasm32-wasip1"] {
+            let (deps, names) = std_deps(SYSROOT_FEATURES, triple);
+            for dep in ["addr2line", "miniz_oxide", "object"] {
+                assert!(deps.iter().any(|d| d == dep), "{triple}: std has no dependency `{dep}`: {deps:?}");
+            }
+            for unit in ["gimli", "adler2"] {
+                assert!(names.iter().any(|n| n == unit), "{triple}: no `{unit}` unit: {names:?}");
+            }
+            let (bare, _) = std_deps(&[], triple);
+            assert!(!bare.iter().any(|d| d == "addr2line"), "{triple}: std has `addr2line` with `backtrace` off: {bare:?}");
+            println!("{triple}: std -> addr2line, miniz_oxide, object; gimli, adler2 in the graph; none without backtrace");
+        }
     }
 }

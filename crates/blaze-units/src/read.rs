@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use blaze_hash::HashSet;
+use blaze_hash::{FixedState, Set, SetOpts};
 use blaze_manifest::config::schema::{
     CargoResolverConfig, FeatureUnification, IncompatibleRustVersions,
 };
@@ -294,7 +294,7 @@ pub fn path_packages<F: Files>(
     ctx: &Context<F>,
 ) -> Result<Vec<Package>> {
     // alloc: the directories seen, once per load
-    let mut seen: HashSet<PathBuf, Global> =
+    let mut seen: Set<PathBuf, FixedState, Global> =
         ws.members().filter_map(|(path, _)| path.parent().map(Path::to_owned)).collect();
     let mut queue = patch_paths(root);
     queue.extend(replace_paths(replace));

@@ -67,11 +67,23 @@ fn quanta_cntvct() {
     assert_eq!(view.asms.len(), 1, "one `asm!` block:\n{text}");
     // The one output is the instruction's result, an `i64`, with no inputs.
     assert_eq!(view.ty(Value(asms[0] as u32)), Ty::I64, "{text}");
-    assert!(view.operands(asms[0]).values().is_empty(), "no inputs:\n{text}");
+    // Operands are read field by field, as each op's layout (blaze-lir op.rs) lays them out:
+    // `asm` is its block's row, then the list of its inputs.
+    let mut asm_operands = view.operands(asms[0]);
+    asm_operands.asm();
+    assert!(asm_operands.values().is_empty(), "no inputs:\n{text}");
     let block = "asm a0 = options [nomem nostack] clobbers \"\" pieces [\"mrs \", {0}, \", cntvct_el0\"] operands [out class \"reg\" 0]";
     assert!(text.contains(block), "the block is not `{block}`:\n{text}");
-    // The output is written to `t`: a store after the `asm` whose value is its result.
-    let stored = (asms[0] + 1..view.ops.len()).any(|i| view.op(i) == Op::Store && view.operands(i).values().iter().next() == Some(Value(asms[0] as u32)));
+    // The output is written to `t`: after the `asm`, a store of its result through the
+    // address of the slot the tail `t` is loaded from. `store` is value, pointer, offset;
+    // `load` is pointer, offset; `slot_addr` holds its slot.
+    let slot_of = |ptr: Value| (view.op(ptr.index()) == Op::SlotAddr).then(|| view.operands(ptr.index()).slot());
+    let tail = (asms[0] + 1..view.ops.len()).rev().find(|&i| view.op(i) == Op::Load).unwrap_or_else(|| panic!("no load of `t` after the `asm`:\n{text}"));
+    let t_slot = slot_of(view.operands(tail).value()).unwrap_or_else(|| panic!("the tail `t` is not loaded from a slot:\n{text}"));
+    let stored = (asms[0] + 1..tail).any(|i| {
+        let mut o = view.operands(i);
+        view.op(i) == Op::Store && o.value() == Value(asms[0] as u32) && slot_of(o.value()) == Some(t_slot)
+    });
     assert!(stored, "the output is not stored to `t`:\n{text}");
     println!("asm \"mrs {{0}}, cntvct_el0\": one out(reg) output of i64, options [nomem nostack], stored to t");
 }

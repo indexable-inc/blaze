@@ -96,12 +96,12 @@ impl<'a> Content<'a> {
 pub(crate) struct Contents<'a> {
     first: PieceId,
     fresh: FrameVec<'a, Option<Content<'a>>>,
-    other: HashMap<PieceId, Content<'a>, Global>,
+    other: Map<PieceId, Content<'a>, FixedState, Global>,
 }
 
 impl<'a> Contents<'a> {
     pub fn new(first: PieceId, arena: &'a Frame) -> Contents<'a> {
-        Contents { first, fresh: Vec::new_in(arena), other: HashMap::new_in(Global) }
+        Contents { first, fresh: Vec::new_in(arena), other: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }) }
     }
 
     #[inline]
@@ -150,7 +150,7 @@ pub(crate) struct Stage<'a> {
     pub writer: &'a Formats,
     pub plan: &'a Plan,
     pub symbols: &'a mut Symbols,
-    pub objects: &'a mut HashMap<Obj, crate::native::Read, Global>,
+    pub objects: &'a mut Map<Obj, crate::native::Read, FixedState, Global>,
     /// Each native input's bytes, borrowed for the stage ([`crate::native`]).
     pub native: crate::native::Pass<'a>,
     pub old: &'a State,
@@ -794,12 +794,12 @@ impl<'a> Stage<'a> {
         }
         // The index in `State::makes` of each way of making already there; new ones are added.
         // alloc: once a stage that adds functions, an entry a distinct way of making (a few hundred)
-        let mut makes: HashMap<Made, u32, Global> = HashMap::new_in(Global);
+        let mut makes: Map<Made, u32, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for (at, it) in self.new.makes.iter().enumerate() {
             makes.insert(*it, at as u32);
         }
         let arena = self.arena;
-        let mut seen: HashSet<&InstanceKey, Global> = HashSet::new_in(Global);
+        let mut seen: Set<&InstanceKey, FixedState, Global> = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
         seen.reserve(added.len());
         let mut todo: FrameVec<'a, &'a CompiledFunction> =
             Vec::with_capacity_in(added.len(), arena);

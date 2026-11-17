@@ -24,7 +24,7 @@ use std::cmp::Ordering;
 use std::fmt::Write as _;
 
 use anyhow::{Context as _, Result, bail};
-use blaze_hash::HashSet;
+use blaze_hash::{FixedState, Set, SetOpts};
 use blaze_manifest::Workspace;
 use blaze_manifest::config::schema::FeatureUnification;
 use blaze_manifest::files::Disk;
@@ -49,7 +49,7 @@ pub struct Options {
     /// The platform to filter for.
     pub target: Target,
     /// The dependency kinds to display.
-    pub edge_kinds: HashSet<EdgeKind, Global>,
+    pub edge_kinds: Set<EdgeKind, FixedState, Global>,
     pub invert: Vec<String>,
     /// The packages to prune from the display of the dependency tree.
     pub pkgs_to_prune: Vec<String>,

@@ -951,7 +951,7 @@ mod tests {
                 },
                 NativePin {
                     name: "llvm".to_owned(),
-                    pin: "crates/hir-ty-codegen/llvm.json".to_owned(),
+                    pin: "crates/blaze-toolchain/pins/llvm.json".to_owned(),
                     targets: vec![
                         ("x86_64-unknown-linux-gnu".to_owned(), "c".repeat(64)),
                         ("aarch64-apple-darwin".to_owned(), "a".repeat(64)),

@@ -79,7 +79,7 @@ pub fn pages(model: &Model) -> Pages {
         css: format!("static.files/blaze-{}.css", hash(CSS)),
         js: format!("static.files/blaze-{}.js", hash(JS)),
     };
-    let names: HashSet<&str, Global> = model.crates.iter().map(|it| it.name.as_str()).collect();
+    let names: Set<&str, FixedState, Global> = model.crates.iter().map(|it| it.name.as_str()).collect();
     let page = |path: String, text: String| Page { path, bytes: text.into_bytes() };
     let mut files =
         vec![page(statics.css.clone(), CSS.to_owned()), page(statics.js.clone(), JS.to_owned())];
@@ -272,7 +272,7 @@ fn search_index(krate: &CrateDoc) -> String {
 
 pub(crate) struct Writer<'a> {
     model: &'a Model,
-    names: &'a HashSet<&'a str, Global>,
+    names: &'a Set<&'a str, FixedState, Global>,
     statics: &'a Statics,
     k: usize,
     /// From the page's directory up to the documentation root: `../../`.
@@ -284,7 +284,7 @@ impl<'a> Writer<'a> {
     /// The writer of a page `depth` directories below the documentation root.
     fn new(
         model: &'a Model,
-        names: &'a HashSet<&'a str, Global>,
+        names: &'a Set<&'a str, FixedState, Global>,
         statics: &'a Statics,
         k: usize,
         depth: usize,
@@ -1143,7 +1143,7 @@ impl<'a> Writer<'a> {
         out.push_str("<main><div class=\"width-limiter\">");
         out.push_str(&self.topbar());
         out.push_str("<section id=\"main-content\" class=\"content\"><div class=\"main-heading\"><h1>List of all items</h1></div>");
-        let mut by_kind: HashMap<Kind, Vec<(String, String)>, Global> = HashMap::new_in(Global);
+        let mut by_kind: Map<Kind, Vec<(String, String)>, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for item in &krate.items {
             if item.kind == Kind::Module && item.name.is_empty() {
                 continue;

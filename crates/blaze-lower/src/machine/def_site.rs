@@ -65,13 +65,18 @@ pub(super) fn keyed(hash: u64, hygiene: u64) -> u64 {
     }
 }
 
-/// The rules of a body's `macro_rules!` (the text inside its delimiters), read from the
-/// machine's text: `None` when its text has no such tree. One home for the reading
-/// [`Machine::local_macros`] hands the expander and [`Machine::note_templates`] matches.
-pub(super) fn rules_of<'s>(text: &'s str, l: &LocalMacroAt) -> Option<&'s str> {
+/// The definition of a body's macro read from the machine's text: a `macro_rules!`'s rules
+/// (the text inside its delimiters), a `macro`'s trees after its name; `None` when its text
+/// has no such tree. One home for the reading [`Machine::local_macros`] hands the expander
+/// and [`Machine::note_templates`] matches.
+pub(super) fn form_of<'s>(text: &'s str, l: &LocalMacroAt) -> Option<crate::driver::LocalForm<'s>> {
+    use crate::driver::LocalForm;
     let after = text.get(l.name.end as usize..l.item.end as usize)?.trim();
+    if l.macro2 {
+        return (!after.is_empty()).then_some(LocalForm::Macro2(after));
+    }
     let tree = after.strip_suffix(';').map_or(after, str::trim_end);
-    tree.get(1..tree.len().checked_sub(1)?)
+    tree.get(1..tree.len().checked_sub(1)?).map(LocalForm::Rules)
 }
 
 impl Machine<'_, '_, '_> {
@@ -81,7 +86,7 @@ impl Machine<'_, '_, '_> {
     fn local_macro_of(&self, request: &Request) -> Option<LocalMacroAt> {
         let text = self.text();
         let path = request.path_range.of(text).trim();
-        self.local_macros.iter().rev().find(|l| l.name.of(text) == path && rules_of(text, l).is_some()).copied()
+        self.local_macros.iter().rev().find(|l| l.name.of(text) == path && form_of(text, l).is_some()).copied()
     }
 
     /// Notes the definition site of each local hygiene `words` (an expansion of `request`,

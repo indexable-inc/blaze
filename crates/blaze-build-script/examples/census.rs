@@ -603,7 +603,13 @@ fn main() {
         std::process::exit(2);
     };
     let detail = args.iter().any(|a| a == "--detail");
-    let alloc = Alloc::global();
+    // An entry that takes no grant yet (a plain `fn main`): the run's memory is one frame
+    // taken from the OS here, kept for the process's life since the lock and the resolution
+    // below are `'static`, and handed down.
+    let frame: &'static blaze_mem::Frame =
+        Box::leak(Box::new(blaze_mem::Frame::with_reserve(1 << 36, blaze_mem::Tag::Other).expect("the entry's frame")));
+    let erased: &'static blaze_own::Erased<&'static blaze_mem::Frame> = Box::leak(Box::new(blaze_own::Erased::new(frame)));
+    let alloc = erased.handle();
 
     let bytes = std::fs::read(root.join("Cargo.lock")).unwrap_or_else(|e| panic!("{}: {e}", root.join("Cargo.lock").display()));
     let lock: &'static Lock<'static> = match Lock::read(&bytes, alloc) {

@@ -14,37 +14,85 @@ use blaze_own::AllocFailure;
 
 use crate::{
     Equivalent, KeyHash,
-    hash_map::{self, Entry, Map},
+    hash_map::{self, Entry, Map, MapOpts},
 };
 
 /// A set on the hasher `S`, in the allocator `A`, hashed through [`KeyHash`] as [`Map`] is.
 pub struct Set<T, S, A: Allocator>(Map<T, (), S, A>);
 
-impl<T, S: Default, A: Allocator> Set<T, S, A> {
-    /// An empty set in `alloc`; it allocates nothing until the first insert.
+/// What a [`Set`] is made from ([`Set::new`], rule 83 options-struct), as [`MapOpts`] for a
+/// map: `Set::new(SetOpts { hasher: FixedState, alloc: frame, capacity: None })`.
+///
+/// A call's named arguments: write it as a literal in the call that takes it (rule 83).
+///
+/// [`MapOpts`]: crate::hash_map::MapOpts
+#[blaze::args]
+#[derive(Clone, Copy, Debug)]
+pub struct SetOpts<S, A> {
+    /// The hasher, as a value (D125).
+    pub hasher: S,
+    /// The allocator the set's memory is in.
+    pub alloc: A,
+    /// Elements room is made for at once: `None` allocates nothing until the first insert,
+    /// `Some(n)` reserves room for `n`.
+    pub capacity: Option<usize>,
+}
+
+impl<T, S, A: Allocator> Set<T, S, A> {
+    /// The set `opts` describe: empty, on `opts.hasher` in `opts.alloc`, with room for
+    /// `opts.capacity` elements; a refused allocation is a panic naming it ([`Set::try_new`]
+    /// returns it). A set of an iterator's elements is `new` then [`Extend::extend`].
     #[inline]
-    pub fn new_in(alloc: A) -> Self {
-        Set(Map::new_in(alloc))
+    pub fn new(opts: SetOpts<S, A>) -> Self {
+        Set(Map::new(MapOpts { hasher: opts.hasher, alloc: opts.alloc, capacity: opts.capacity }))
     }
 
-    /// An empty set in `alloc` with room for `capacity` elements.
+    /// [`Set::new`], with a refused allocation of `opts.capacity` returned.
+    #[inline]
+    pub fn try_new(opts: SetOpts<S, A>) -> Result<Self, AllocFailure> {
+        Ok(Set(Map::try_new(MapOpts {
+            hasher: opts.hasher,
+            alloc: opts.alloc,
+            capacity: opts.capacity,
+        })?))
+    }
+}
+
+impl<T, S: Default, A: Allocator> Set<T, S, A> {
+    /// An empty set in `alloc` on `S::default()`.
+    ///
+    /// D126: goes at the sweep; write `Set::new(SetOpts { hasher, alloc, capacity: None })`.
+    #[inline]
+    pub fn new_in(alloc: A) -> Self {
+        Set::new(SetOpts { hasher: S::default(), alloc, capacity: None })
+    }
+
+    /// An empty set in `alloc` on `S::default()` with room for `capacity` elements.
+    ///
+    /// D126: goes at the sweep; write `Set::new(SetOpts { hasher, alloc, capacity: Some(n) })`.
     #[inline]
     pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
-        Set(Map::with_capacity_in(capacity, alloc))
+        Set::new(SetOpts { hasher: S::default(), alloc, capacity: Some(capacity) })
     }
 }
 
 impl<T, S, A: Allocator> Set<T, S, A> {
-    /// An empty set on `hasher` in `alloc`, in a `const` too.
+    /// An empty set on `hasher` in `alloc`, in a `const` too: its own body, as
+    /// [`Map::with_hasher_in`]'s, since [`Set::new`] is not `const`.
+    ///
+    /// D126: goes at the sweep where it is not in a `const`; write
+    /// `Set::new(SetOpts { hasher, alloc, capacity: None })`.
     #[inline]
     pub const fn with_hasher_in(hasher: S, alloc: A) -> Self {
         Set(Map::with_hasher_in(hasher, alloc))
     }
 
     /// An empty set on `hasher` in `alloc` with room for `capacity` elements.
+    ///
+    /// D126: goes at the sweep; write `Set::new(SetOpts { hasher, alloc, capacity: Some(n) })`.
     #[inline]
     pub fn with_capacity_and_hasher_in(capacity: usize, hasher: S, alloc: A) -> Self {
-        Set(Map::with_capacity_and_hasher_in(capacity, hasher, alloc))
+        Set::new(SetOpts { hasher, alloc, capacity: Some(capacity) })
     }
 
     #[inline]
@@ -97,12 +145,15 @@ impl<T, S, A: Allocator> Set<T, S, A> {
 }
 
 impl<T: Eq, S: KeyHash<T> + Default, A: Allocator> Set<T, S, A> {
-    /// The set of `iter`'s elements in `alloc`: what `collect()` makes, with the allocator
-    /// named.
+    /// The set of `iter`'s elements in `alloc` on `S::default()`.
+    ///
+    /// D126: goes at the sweep; write `Set::new(SetOpts { hasher, alloc, capacity })`, then
+    /// `extend`.
     #[inline]
     pub fn from_iter_in<I: IntoIterator<Item = T>>(iter: I, alloc: A) -> Self {
         let iter = iter.into_iter();
-        let mut set = Set::with_capacity_in(iter.size_hint().0, alloc);
+        let capacity = Some(iter.size_hint().0);
+        let mut set = Set::new(SetOpts { hasher: S::default(), alloc, capacity });
         set.extend(iter);
         set
     }

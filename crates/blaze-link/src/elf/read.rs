@@ -19,7 +19,7 @@ use blaze_hash::hash_map::Entry;
 use std::fmt;
 
 use blaze_codegen::Arch;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use object::Endianness;
 use object::SectionIndex;
 use object::elf;
@@ -786,12 +786,12 @@ struct Added {
     module: Option<u32>,
     got: Option<u32>,
     /// By the ELF symbol whose size each holds.
-    sizes: HashMap<u32, u32, std::alloc::Global>,
+    sizes: Map<u32, u32, FixedState, std::alloc::Global>,
 }
 
 impl Added {
     fn new(empty: Name) -> Added {
-        Added { empty, module: None, got: None, sizes: HashMap::new_in(std::alloc::Global) }
+        Added { empty, module: None, got: None, sizes: Map::new(MapOpts { hasher: FixedState, alloc: std::alloc::Global, capacity: None }) }
     }
 
     fn push(symbols: &mut Vec<Symbol>, symbol: Symbol) -> u32 {

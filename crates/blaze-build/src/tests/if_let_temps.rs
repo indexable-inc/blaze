@@ -32,7 +32,7 @@ fn g_of(b: &mut BodyBuf, value: ExprId) -> ExprId {
     let path = b.path("G");
     let start = b.field_inits.len() as u32;
     b.field_inits.push(FieldInit { name: Name::of("x"), expr: value });
-    b.e(Expr::Struct { path, fields: List { start, len: 1 }, base: None })
+    b.e(Expr::Struct { path, fields: List { start, len: 1 }, base: blaze_typeck::StructBase::None })
 }
 
 /// `let <name> = G { x: v };` as a statement.
@@ -80,7 +80,7 @@ fn place_scrutinee(taken: bool) -> Vec<i32, Global> {
     let start = b.field_inits.len() as u32;
     b.field_inits.push(FieldInit { name: Name::of("failed"), expr: p5 });
     b.field_inits.push(FieldInit { name: Name::of("len"), expr: one });
-    let s_init = b.e(Expr::Struct { path: s_path, fields: List { start, len: 2 }, base: None });
+    let s_init = b.e(Expr::Struct { path: s_path, fields: List { start, len: 2 }, base: blaze_typeck::StructBase::None });
     let s = bind_mut(&mut b, "s");
     let s_l = b.local(s);
     let r_init = b.e(Expr::Ref { mutbl: Mutbl::Mut, operand: s_l });

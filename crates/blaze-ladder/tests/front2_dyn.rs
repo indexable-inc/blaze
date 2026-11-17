@@ -45,14 +45,14 @@ fn dyn_types_through_front2() {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let files = [("/dyns/src/main.rs".to_string(), MAIN.to_string())];
     let edition = edition::PackageEdition::of_manifest("blaze-2026.11").expect("a known edition");
-    let user = UserCrate { name: "dyns", dir: "/dyns/", root: "/dyns/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "dyns", dir: "/dyns/", root: "/dyns/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
-        let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"), front.frame);
+        let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let sized_key = checker_of(front.index.lang("sized").expect("core's `Sized` is a lang item"));
     let root = names.root(0);
     let lib = |name: &'static str| {
@@ -226,13 +226,13 @@ fn typed_receivers_through_front2() {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let files = [("/rcvs/src/main.rs".to_string(), RECEIVERS.to_string())];
     let edition = edition::PackageEdition::of_manifest("blaze-2026.11").expect("a known edition");
-    let user = UserCrate { name: "rcvs", dir: "/rcvs/", root: "/rcvs/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "rcvs", dir: "/rcvs/", root: "/rcvs/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: RECEIVERS }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
-    let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
     let pointers = blaze_ladder::front2::receiver::Pointers::find(&front.index, front.resolver);
     println!("pointers: {pointers:?}");
     // A library key's `Debug` prints only its crate: prove `Box`, `Rc` and `Arc` are three items.
@@ -241,7 +241,7 @@ fn typed_receivers_through_front2() {
         let (Pointer::At(b), Pointer::At(r), Pointer::At(a)) = (pointers.boxed, pointers.rc, pointers.arc) else { panic!("alloc's Box, Rc and Arc are all found: {pointers:?}") };
         assert!(b != r && b != a && r != a, "`Box`, `Rc` and `Arc` are three different items");
     }
-    let mut store = Store::new(front.index.lang("sized"), front.frame);
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     store.pointers = pointers;
     let root = names.root(0);
     let lib = |name: &'static str| {
@@ -294,7 +294,7 @@ fn typed_receivers_through_front2() {
 
     // The control: the cause removed. A store that never looked up `Box`, `Rc`, `Arc` and `Pin`
     // reads no typed receiver, so `dyn Recv` is the checker's named gap again.
-    let mut bare = Store::new(front.index.lang("sized"), front.frame);
+    let mut bare = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let mut bare_buckets = None;
     let k = lib("use_recv");
     bare.ensure(&names, &mut front.keys, Want::Fn(k)).unwrap_or_else(|e| panic!("use_recv's head over the bare store: {e:?}"));

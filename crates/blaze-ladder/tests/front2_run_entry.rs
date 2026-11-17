@@ -57,13 +57,13 @@ fn main() {}
 /// `text`'s names, solved, given to `each` with the key of the root's `main` by path.
 fn with_names(text: &'static str, each: impl FnOnce(&blaze_scope::resolve::Names<'_>, blaze_id::ItemKey)) {
     let files = [SourceFile { path: "src/main.rs", text }];
-    let tc = Toolchain::none();
+    let tc = Toolchain::none(blaze_own::Alloc::global());
     let new = blaze_ladder::run::NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
-    let texts = blaze_ladder::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc).unwrap_or_else(|e| panic!("the program's texts: {e}"));
+    let texts = blaze_ladder::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind).unwrap_or_else(|e| panic!("the program's texts: {e}"));
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let written = Written { kind: PathKind::Plain, segments: &["main"] };
     let found = names::path(&names, names.root(0), Namespace::Values, written, Alloc::global()).unwrap_or_else(|e| panic!("`main` by path: {e:?}"));
     let main = found.whole(1).unwrap_or_else(|| panic!("`main` resolves whole")).key;
@@ -99,6 +99,16 @@ fn blaze_edition_without_export_is_refused() {
         Err(EntryRefusal::NoHostedStart) => {}
         other => panic!("a blaze-edition root with no `bstd_hosted_start` is refused by name, got {other:?}"),
     });
-    // A Rust program with std is refused by name too: its entry is a generic instance.
     assert_eq!(RootStart::of(blaze_unit_graph::StdIs::Rust, false, false), RootStart::LangStart);
+}
+
+/// A Rust program with std is no longer refused (D124): its entry names the root's `main`,
+/// run through `lang_start::<T>` (run/special.rs `roots` makes the shim and both instances).
+#[test]
+fn a_rust_start_names_its_main() {
+    with_names(DIRECT, |names, main| {
+        let entry = run_entry(names, RootStart::LangStart).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(entry.how, EntryHow::LangStart);
+        assert_eq!(entry.lib, main, "the Rust start's `main` is the root's `main` by path");
+    });
 }

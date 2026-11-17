@@ -29,7 +29,6 @@ use std::alloc::Global;
 use std::vec::Vec;
 
 use blaze_build::BuildError;
-use blaze_own::Alloc;
 use blaze_typeck as tc;
 use blaze_typeck::{ItemKey, PTy, PortableTys};
 
@@ -92,7 +91,7 @@ pub(super) fn drop_impl<'n, S: NamesSource<'n>>(
     let drop_trait = checker_of(drop_lib);
     let spell = Spelling::fixed();
     // An empty block list, as const_select.rs's: no block's `use` is in the trait's scope.
-    let blocks = BlockTraits::module(Alloc::global());
+    let blocks = BlockTraits::module(store.tys.alloc());
     let self_ = SelfTy::None;
     let world = BodyWorld {
         names,
@@ -108,8 +107,12 @@ pub(super) fn drop_impl<'n, S: NamesSource<'n>>(
         spell: &spell,
         traits: &[],
         blocks: &blocks,
+        path_marks: &[],
         fills: RefCell::new(Vec::new_in(Global)),
         gaps: RefCell::new(Vec::new_in(Global)),
+        // A constant's evaluation is after analysis (rustc's CTFE runs post-analysis): every
+        // opaque reached is its hidden type.
+        reveal: super::opaque_auto::Reveal::All,
     };
     // The scratch lives in the ground table's allocator: the caller's, handed down (D102).
     let solved = tc::adt_drop_impl(&world, drop_trait, adt, ground.alloc());

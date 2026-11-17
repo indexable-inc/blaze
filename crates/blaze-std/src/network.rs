@@ -67,7 +67,7 @@ mod tests {
     fn an_ordinary_start_fills_the_whole_network() {
         let alloc = blaze_own::testing::heap().shared();
         let mut said = std::string::String::new();
-        let status = launch_in(&MANIFEST, None, Io::sim(1), &mut said, alloc, crate::launch_body!(reach; web: Network));
+        let status = launch_in(&MANIFEST, None, Io::sim(1), &mut said, crate::launch_body!(reach; web: Network));
         assert_eq!((status, said.as_str()), (Status::OK, ""));
 
         // Control: started with a spec that grants nothing, the same program is refused.
@@ -79,7 +79,7 @@ mod tests {
         );
         let fd3 = crate::spec::delivery(&spec, alloc);
         let mut said = std::string::String::new();
-        let status = launch_in(&MANIFEST, Some(fd3.as_slice()), Io::sim(1), &mut said, alloc, crate::launch_body!(reach; web: Network));
+        let status = launch_in(&MANIFEST, Some(fd3.as_slice()), Io::sim(1), &mut said, crate::launch_body!(reach; web: Network));
         assert_eq!(status, Status::REFUSED, "{said}");
     }
 }

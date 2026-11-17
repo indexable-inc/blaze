@@ -120,9 +120,10 @@ pub enum StartError {
 pub(crate) struct Run {
     pub(crate) table: HostTable,
     limits: Limits,
-    /// The program's heap, taken by [`start`], the hosted program's entry (D102): the
-    /// escape's encodings are made in it.
-    heap: &'static blaze_own::Heap,
+    /// The program's heap, taken by [`start`], the hosted program's entry, from bstd's
+    /// (`entry::process_heap`, D120): the escape's encodings are made in it, and a `heap: Heap`
+    /// parameter of `main` is handed it ([`heap`]).
+    heap: crate::mem::Heap,
     /// Made in place at the first use ([`Run::later`]); initialised exactly when `made`.
     later: UnsafeCell<MaybeUninit<Later>>,
     made: Cell<bool>,
@@ -680,7 +681,7 @@ pub(crate) mod codec {
 }
 
 /// The run over `table`, checked: its version, size and exchange; its allocations in `heap`.
-fn checked(table: *const HostTable, heap: &'static blaze_own::Heap) -> Result<Run, StartError> {
+fn checked(table: *const HostTable, heap: crate::mem::Heap) -> Result<Run, StartError> {
     if table.is_null() {
         return Err(StartError::NoTable);
     }
@@ -714,8 +715,9 @@ const MAIN_UNBOUNDED: bool = MAIN_BUDGET.as_secs() == Duration::MAX.as_secs() &&
 /// hosted [`Io`] (a marker), and the root context, whose placement the run holds. The command
 /// line, the escape's world and the root's frame are made at their first use.
 pub fn start(table: *const HostTable, run: fn(&Cx, Io) -> Status) -> i32 {
-    // The hosted program's entry: where its heap is taken (D102), as `rt::run`'s is.
-    let this = match checked(table, blaze_own::Heap::process()) {
+    // The hosted program's entry: its heap is taken from bstd's entry (D120), as the native
+    // start's is.
+    let this = match checked(table, crate::entry::process_heap()) {
         Ok(this) => this,
         Err(_) => return i32::from(Status::FAILED.0),
     };
@@ -727,6 +729,16 @@ pub fn start(table: *const HostTable, run: fn(&Cx, Io) -> Status) -> i32 {
     let deadline = if MAIN_UNBOUNDED { None } else { Some(Deadline::after(io.now(), MAIN_BUDGET)) };
     let cx = Cx::hosted_root(deadline, io.clone());
     i32::from(run(&cx, io).0)
+}
+
+/// The heap of the run the calling thread is inside: what [`start`] was handed, for a
+/// `heap: Heap` parameter of a hosted `main` (`Grant::hosted`).
+///
+/// # Panics
+///
+/// Outside a run, as every reach of a hosted world does ([`Run::current`]).
+pub(crate) fn heap() -> crate::mem::Heap {
+    Run::current().heap
 }
 
 /// The grant `name` of type `T`, asked of the host: `None` when it refuses, and the program's
@@ -749,6 +761,17 @@ pub fn grant<T: Grant>(io: &Io, name: &'static str) -> Option<T> {
 pub fn finish<R: Outcome>(io: &Io, ran: R) -> Status {
     let mut said = Said { io, wrote: false, failed: false };
     let status = ran.status(&mut said);
+    // A world with a buffer (one over the escape, not the hosted reach, which holds none)
+    // writes what it holds before the run ends, as the native entry does; a refusal is said
+    // after the failure, if any, and fails the run.
+    let status = match io.flush_streams("main") {
+        Ok(()) => status,
+        Err(error) => {
+            let after = if said.wrote { "; " } else { "" };
+            let _ = core::fmt::Write::write_fmt(&mut said, format_args!("{after}{error}"));
+            Status::FAILED
+        }
+    };
     if said.wrote && !said.failed && io.write_out(Stream::Err, &[b"\n"]).is_err() {
         return Status::FAILED;
     }

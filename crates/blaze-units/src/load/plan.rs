@@ -43,9 +43,9 @@ pub(crate) struct PlanInput<'a, F: Files> {
     /// The standard library's units' plans, made by its own load; `None` for every other unit.
     pub std_plans: &'a [Option<UnitPlan>],
     /// Every package of the units, by the unit's `pkg_id`.
-    pub packages: &'a HashMap<String, (PackageId, Package<'a>), Global>,
+    pub packages: &'a Map<String, (PackageId, Package<'a>), FixedState, Global>,
     /// Every package's manifest path, by its id.
-    pub manifests: &'a HashMap<PackageId, (&'a Path, &'a Manifest), Global>,
+    pub manifests: &'a Map<PackageId, (&'a Path, &'a Manifest), FixedState, Global>,
     /// The graph's roots, as indexes of `units`.
     pub roots: &'a [usize],
     pub config: &'a Config<F>,
@@ -86,7 +86,7 @@ pub(crate) struct PlanInput<'a, F: Files> {
     pub jobs: Option<u32>,
     /// The packages, by the unit's `pkg_id`, whose build scripts run outside the sandbox
     /// (`UnitPlan::unsandboxed`).
-    pub unsandboxed: &'a HashSet<&'a str, Global>,
+    pub unsandboxed: &'a Set<&'a str, FixedState, Global>,
 }
 
 pub(crate) struct PlanOutput {
@@ -546,8 +546,8 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
     for &at in input.roots {
         roots[at] = true;
     }
-    let mut per_package: HashMap<&str, PackageFlags, Global> =
-        HashMap::with_capacity_in(input.packages.len(), Global);
+    let mut per_package: Map<&str, PackageFlags, FixedState, Global> =
+        Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(input.packages.len()) });
     let artifact_dir = !matches!(input.intent, Intent::Check { .. } | Intent::Doc { .. });
 
     let mut plans = Vec::with_capacity(units.len());
@@ -773,7 +773,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
 fn one_unit_per_path(units: &[Unit], plans: &[Option<UnitPlan>]) -> Result<(), LoadError> {
     let count = plans.iter().flatten().map(|it| it.outputs.len()).sum();
     // alloc: once per plan, a key per output path, dropped when checked
-    let mut owner: HashMap<&str, usize, Global> = HashMap::with_capacity_in(count, Global);
+    let mut owner: Map<&str, usize, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(count) });
     for (at, plan) in plans.iter().enumerate() {
         let Some(plan) = plan else { continue };
         for path in &plan.outputs {

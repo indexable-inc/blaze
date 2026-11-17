@@ -28,7 +28,7 @@
 
 use core::fmt;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_own::{ADeque, ASortedMap, AVec, Alloc, SortedMap, Vec, VecDeque, soa};
 
 use crate::{CodeId, CodeRef, CompileError, InstanceKey, Made, Plant, RecordKey, SlotId, Snapshot, Why};
@@ -214,7 +214,7 @@ pub struct Tier<'a> {
     records: ASortedMap<'a, SlotId, Optimized<'a>>,
     /// Hashed, not sorted: every record adds a key for each body it absorbed, in no order, so a
     /// sorted vector would shift its tail on almost every insert.
-    inlined_into: HashMap<CodeId, AVec<'a, SlotId>, Alloc<'a>>,
+    inlined_into: Map<CodeId, AVec<'a, SlotId>, FixedState, Alloc<'a>>,
     /// Each record being made, and the jobs that lack it: the few in flight.
     making: ASortedMap<'a, RecordKey, AVec<'a, SlotId>>,
 }
@@ -236,7 +236,7 @@ impl<'a> Tier<'a> {
             running: 0,
             snapshot,
             records: SortedMap::new_in(alloc),
-            inlined_into: HashMap::new_in(alloc),
+            inlined_into: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             making: SortedMap::new_in(alloc),
             alloc,
         })

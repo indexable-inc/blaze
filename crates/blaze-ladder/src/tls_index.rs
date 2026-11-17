@@ -37,7 +37,7 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_typeck::ItemKey;
 
-use crate::code_records::{Callee, CodeRecordError, Declared, InstanceNames, KeyParts, Met, RecordRun, code_key, make_entry};
+use crate::code_records::{Callee, CodeRecordError, Declared, InstanceNames, KeyParts, RecordRun, make_entry};
 use crate::place::PlaceError;
 use crate::run::RunError;
 use crate::seam::FrontEnd;
@@ -52,7 +52,7 @@ const ENDER_SYMBOL_DOMAIN: &str = "blaze-ladder thread-local ender symbol 1";
 /// changes, as the getter's `GETTER_DOMAIN` is for `tls::index::getter`.
 const ENDER_DOMAIN: &str = "blaze-ladder thread-local ender body 1";
 
-/// How a walk's [`Met`] names the thread-local ender.
+/// How a walk's [`crate::code_records::Met`] names the thread-local ender.
 pub const ENDER_NAME: &str = "the thread-local ender";
 
 /// The run's numbering of its thread-locals: `order[i]` is the thread-local of index `i`.
@@ -302,17 +302,11 @@ pub fn make_ender_entry<'a>(isa: blaze_emit::Isa, alloc: Alloc<'a>) -> Result<AV
 impl RecordRun<'_> {
     /// The thread-local ender's entry ([`ender_parts`]): found in the store, or made and put;
     /// met as [`ENDER_NAME`]. Nothing calls it by a site: the run's key names it as its
-    /// destructor ([`create_key`]).
-    pub fn ender(&mut self) -> Result<(), CodeRecordError> {
-        let parts = ender_parts();
-        let key = code_key(&parts, &self.builder);
-        let found = self.store.get(key).map_err(CodeRecordError::Store)?.is_some();
-        if !found {
-            let entry = make_ender_entry(self.builder.isa, Alloc::global())?;
-            self.store.put(key, &entry).map_err(CodeRecordError::Store)?;
-        }
-        self.met.push(Met { symbol: parts.symbol, key, parts, function: ENDER_NAME.into(), found });
-        Ok(())
+    /// destructor ([`create_key`]). `alloc` is the caller's scratch for the entry until it is
+    /// put.
+    pub fn ender(&mut self, alloc: Alloc<'_>) -> Result<(), CodeRecordError> {
+        // The one find-or-make of the run's special records (run/special.rs).
+        self.special(crate::run::special::Special::Ender, alloc)
     }
 }
 

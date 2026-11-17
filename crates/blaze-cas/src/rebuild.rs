@@ -27,7 +27,7 @@
 use std::{alloc::Global, sync::Arc};
 
 use blaze_core::Effect;
-use blaze_hash::ByHashSet;
+use blaze_hash::{BuildKeyHasher, Set, SetOpts};
 use blaze_reclaim::enter;
 
 use crate::{
@@ -96,7 +96,7 @@ impl IndexBuild {
         // alloc: once an index table built, on its worker: the rows it holds
         let mut entries: Vec<(Key, Loc)> = Vec::new();
         // alloc: once an index table built, on its worker: the keys the delta gave
-        let mut taken: ByHashSet<Key, Global> = ByHashSet::new_in(Global);
+        let mut taken: Set<Key, BuildKeyHasher, Global> = Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: None });
         let mut rows = 0u64;
         for (_, spot) in self.delta.iter(held) {
             rows += 1;

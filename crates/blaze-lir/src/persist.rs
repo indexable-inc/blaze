@@ -19,7 +19,7 @@ use blaze_format::{FormatError, Part, Persist, Placed, Record, SchemaHash, Slice
 use blaze_format::SpanRef;
 
 use crate::func::{
-    AsmOperandRec, AsmPieceRec, AsmRec, CompoundRec, DataRec, DataRelocRec, InlinedRec, IntrinsicRec,
+    AsmOperandRec, AsmPieceRec, AsmRec, CompoundRec, DataPositionRec, DataRec, DataRelocRec, InlinedRec, IntrinsicRec,
     MemAttrsRec, ParamFactsRec, ParamRec, RangeRec, RefRec, SigRec, SlotRec, VarRec,
 };
 use crate::{

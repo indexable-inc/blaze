@@ -26,8 +26,9 @@ impl<'t> Library<'t> {
     /// The names of every crate of `crates` (`inputs.crates()`) but the program's (index 0),
     /// on this thread (`Serial`: no thread is started). `inputs`' program crate is a stand-in:
     /// its name and edition are read, its files are not.
-    pub fn solve(inputs: &'t Inputs<'t>, crates: &[CrateInput<'t>]) -> Result<Library<'t>, ApartError<'t>> {
-        let apart = Apart::solve(crates, 0, inputs.sysroot, &inputs.texts, &Serial, First::Prefetch, Alloc::global())?;
+    /// The names are held in `alloc`, the caller's, alive as long as the library.
+    pub fn solve(inputs: &'t Inputs<'t>, crates: &[CrateInput<'t>], alloc: Alloc<'t>) -> Result<Library<'t>, ApartError<'t>> {
+        let apart = Apart::solve(crates, 0, inputs.sysroot, &inputs.texts, &Serial, First::Prefetch, alloc)?;
         Ok(Library { inputs, apart })
     }
 

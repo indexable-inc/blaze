@@ -25,10 +25,14 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use blaze_core::{Driver as _, Waker, lock::Lock};
+use blaze_core::{
+    Driver as _, Waker,
+    chan::{self, Receiver, Sender},
+    lock::Lock,
+};
 use blaze_http::{
     h3::{self, Endpoint, Identity, ServerConfig, Transport, driver::Loop},
-    mailbox::{self, Rx, Tx},
+    mailbox,
 };
 use blaze_queue::SegQueue;
 use serde_json::Value;
@@ -85,7 +89,7 @@ struct Shared {
 pub struct Explorer {
     shared: Arc<Shared>,
     /// Ends (its sender dropped) as the explorer's thread ends, however it ends.
-    ended: Option<Rx<()>>,
+    ended: Option<Receiver<()>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -113,7 +117,7 @@ impl Drop for Explorer {
         let Some(ended) = self.ended.take() else { return };
         // The loop ends at most SHUTDOWN after it sees the stop; past twice that it is stuck,
         // and is left rather than joined.
-        let waited = mailbox::block_on("the explorer's thread to close its sessions", Some(SHUTDOWN * 2), ended.recv());
+        let waited = mailbox::answer("the explorer's thread to close its sessions", &ended, SHUTDOWN * 2);
         if let Err(why) = waited {
             eprintln!("{}: the explorer's thread was left running: {why}", self.shared.name);
             return;
@@ -161,8 +165,8 @@ pub fn serve(config: Config) -> Result<Explorer, StartError> {
     let cert = Cert::make(rotation.current(), config.name).map_err(StartError::Cert)?;
     let identity = cert.identity().map_err(StartError::Cert)?;
     let served = Served { hash: cert.hash, not_after_s: cert.validity.not_after_s };
-    let (ready_to, ready) = mailbox::channel::<Result<Arc<Shared>, StartError>>(Some(1));
-    let (ended_to, ended) = mailbox::channel::<()>(Some(1));
+    let (ready_to, ready) = chan::bounded::<Result<Arc<Shared>, StartError>>(1);
+    let (ended_to, ended) = chan::bounded::<()>(1);
     let name = config.name;
     let thread = std::thread::Builder::new()
         .name(name.replace(' ', "-"))
@@ -172,7 +176,7 @@ pub fn serve(config: Config) -> Result<Explorer, StartError> {
             start(config, identity, served, rotation, &ready_to);
         })
         .map_err(StartError::Thread)?;
-    let started = mailbox::block_on("the explorer's thread to bind its socket", Some(START_WAIT + SHUTDOWN), ready.recv());
+    let started = mailbox::answer("the explorer's thread to bind its socket", &ready, START_WAIT + SHUTDOWN);
     match started {
         Ok(Some(Ok(shared))) => Ok(Explorer { shared, ended: Some(ended), thread: Some(thread) }),
         Ok(Some(Err(why))) => {
@@ -201,7 +205,7 @@ fn server_config(identity: Identity) -> ServerConfig {
 }
 
 /// The explorer's thread: its driver, its endpoint bound, then the loop.
-fn start(config: Config, identity: Identity, served: Served, rotation: Rotation, ready_to: &Tx<Result<Arc<Shared>, StartError>>) {
+fn start(config: Config, identity: Identity, served: Served, rotation: Rotation, ready_to: &Sender<Result<Arc<Shared>, StartError>>) {
     // A caller that went away wants no answer.
     let refuse = |why: StartError| {
         _ = ready_to.send(Err(why));

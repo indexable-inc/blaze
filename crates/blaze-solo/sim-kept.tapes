@@ -1,0 +1,6 @@
+# blaze-solo's kept failing tapes (docs/v2/plan/design/test.md, piece S3), compiled in by
+# `blaze_sim::sim_kept!()` and replayed first by `blaze_sim::check_kept`.
+# One line a tape, as a failure's report prints it after `blaze-sim keep: `:
+#   <test path> v<primitives version> <tape>  # <date> <one line why>
+# Lines are only added; a line whose test is renamed moves to the new path.
+tests::a_command_answers_as_a_fresh_state_does v1 7424157817344609039 0 1 0*2 12 1 0*2 12 1 0*2 12 1 0*4 1 5 0*3 1 1 0*3 1 2 0*3 1 0*2 10 10  # 2026-11-16 seed 7424157817344609039, coarse false: a crash after the table's rename kept the name and tore the part's bytes the barrier ordered before it: st/table 11 bytes

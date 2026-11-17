@@ -3,7 +3,7 @@
 //! blaze-metadata's.
 
 use blaze_format::SchemaHash;
-use blaze_hash::HashSet;
+use blaze_hash::{FixedState, Set, SetOpts};
 use blaze_ids::ContentId;
 use blaze_manifest::files::Files;
 use blaze_query::{Cancelled, Cx, Database, Query, QueryKind};
@@ -82,7 +82,7 @@ impl Versioned for Printed {
 impl TreeAsk {
     /// The options of `cargo tree`, made once per query from its key, which it outlives.
     fn options(&self) -> Options {
-        let edge_kinds: HashSet<EdgeKind, Global> = self
+        let edge_kinds: Set<EdgeKind, FixedState, Global> = self
             .edges
             .iter()
             .map(|it| match it {

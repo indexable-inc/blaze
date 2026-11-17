@@ -2,9 +2,10 @@
 //! side's cfg (decision D115, ruling (2)).
 
 use blaze_build_script::pinned::TEMPO;
-use blaze_build_script::probe::{Table, probe_key};
+use blaze_build_script::probe::Table;
+use blaze_build_script::probe_ask::{Ask, By, Verdict, answer, classify};
 use blaze_manifest::lock::LockId;
-use blaze_own::{AVec, Alloc};
+use blaze_own::AVec;
 use blaze_unit_graph::{Resolver, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
 use blaze_world::Side;
 use edition::PackageEdition;
@@ -85,22 +86,46 @@ fn scripts_a_runs_links_closure_holds_its_inputs_and_whats_upstream_of_them() {
     assert!(links_closure(&both, UnitId(1)).is_empty(), "c's script reads no run");
 }
 
-/// The runtime keys a try-compile by the run's TARGET (blaze-proc-macro script_sandbox.rs,
-/// `probe::compile_key(&self.script.target, ..)`), and a macro-side run's TARGET is
-/// wasm32-wasip1: proc-macro2's `proc_macro_span` probe (a macro-side crate of every proc macro
-/// that uses syn) asked for that triple is answered by the macro side's table, and NOT by the
-/// target side's, whose rows are keyed for the host triple.
+/// The runtime keys a try-compile by its `--target` (blaze-proc-macro script_sandbox.rs,
+/// `probe_ask::answer`), and a macro-side run's cargo passes `--target wasm32-wasip1`:
+/// proc-macro2's `proc_macro_span` probe (a macro-side crate of every proc macro that uses
+/// syn), with the exact line tempo's `blaze check` printed, is answered by the macro side's
+/// table, and NOT by the target side's, whose rows are keyed for the host triple. A row whose
+/// `needs` a side's sysroot lacks is not made for it.
 /// Prints "ok". Control: in `pinned_table`, key the macro side's rows by `crate::graph::TRIPLE`
 /// and it fails with "the macro side's table does not answer a wasm32-wasip1 probe".
 #[test]
 fn scripts_the_macro_sides_table_answers_its_probes_for_wasm32_wasip1() {
     let row = TEMPO.iter().find(|known| known.probe.starts_with("proc-macro2") && known.probe.contains("proc_macro_span (")).expect("pinned.rs holds proc-macro2's proc_macro_span probe");
-    let key = probe_key(MACRO_TARGET, row.args.iter().copied(), row.snippet.as_bytes());
-    let macro_rows = pinned_table(Side::Macro, Alloc::global());
-    let target_rows = pinned_table(Side::Target, Alloc::global());
-    assert_eq!(Table { rows: &macro_rows }.answer(&key), Some(row.accepted), "the macro side's table does not answer a wasm32-wasip1 probe");
-    assert_eq!(Table { rows: &target_rows }.answer(&key), None, "the target side's table answers a wasm32-wasip1 probe: a row of another triple answered it");
-    assert_eq!(macro_rows.len(), TEMPO.len(), "one row a known probe");
+    let line = [
+        "--cfg=procmacro2_build_probe",
+        "--edition=2021",
+        "--crate-name=proc_macro2",
+        "--crate-type=lib",
+        "--cap-lints=allow",
+        "--emit=dep-info,metadata",
+        "--out-dir",
+        "/target/debug/build/proc-macro2-0f3c/out/probe",
+        "src/probe/proc_macro_span.rs",
+        "--target",
+        MACRO_TARGET,
+    ];
+    // The test's one frame, made at its top (its memory the OS's), handed down as a handle.
+    let frame = bstd::mem::Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let Ok(Ask::Compile(compile)) = classify(&line, erased.handle()) else { panic!("proc-macro2's line is not a try-compile") };
+    let sysroot = ["alloc", "core", "proc_macro", "std"];
+    let macro_rows = pinned_table(Side::Macro, sysroot.iter().copied(), erased.handle());
+    let target_rows = pinned_table(Side::Target, sysroot.iter().copied(), erased.handle());
+    let on = |rows: &[blaze_build_script::probe::Row]| answer(&compile, crate::graph::TRIPLE, row.snippet.as_bytes(), &Table { rows }).verdict;
+    assert_eq!(on(&macro_rows), Verdict::Accepted(By::Table), "the macro side's table does not answer a wasm32-wasip1 probe");
+    assert!(matches!(on(&target_rows), Verdict::Unanswered(_)), "the target side's table answers a wasm32-wasip1 probe: a row of another triple answered it");
+    assert_eq!(macro_rows.len(), TEMPO.len() + sysroot.len(), "one row a known probe and one a shipped crate");
+    // A sysroot of core alone (no std, no proc_macro) gets only the rows that rest on core.
+    let core_only = pinned_table(Side::Macro, ["core"].iter().copied(), erased.handle());
+    let resting_on_core = TEMPO.iter().filter(|known| known.needs == ["core"]).count();
+    assert_eq!(core_only.len(), resting_on_core + 1, "a row was made for a sysroot that lacks what it needs");
+    assert!(matches!(on(&core_only), Verdict::Unanswered(_)), "proc_macro_span answered where proc_macro is not shipped");
 }
 
 /// A world row's cfg becomes the script's atoms in the same order, each value kept: the
@@ -111,7 +136,10 @@ fn scripts_the_macro_sides_table_answers_its_probes_for_wasm32_wasip1() {
 #[test]
 fn scripts_a_side_cfg_atom_list_keeps_the_rows_order_and_values() {
     let row: [(&str, Option<&str>); 4] = [("debug_assertions", None), ("feature", Some("std")), ("target_arch", Some("wasm32")), ("target_os", Some("wasi"))];
-    let atoms = side_atoms(&row, Alloc::global());
+    // The test's one frame, made at its top (its memory the OS's), handed down as a handle.
+    let frame = bstd::mem::Frame::with_reserve(1 << 16, bstd::mem::Tag::Other).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let atoms = side_atoms(&row, erased.handle());
     assert_eq!(atoms.len(), row.len(), "one atom a row atom");
     for ((name, value), atom) in row.iter().zip(atoms.iter()) {
         assert_eq!(atom.name.as_str(), *name, "the atoms are not in the row's order");

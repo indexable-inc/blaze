@@ -27,7 +27,7 @@
 //! stops, naming the file.
 
 use blaze_core::{Done, Effect, FileName};
-use blaze_hash::{HashMap, HashSet};
+use blaze_hash::{FixedState, Map, MapOpts, Set, SetOpts};
 use blaze_ids::ContentId;
 use std::alloc::Global;
 
@@ -68,9 +68,9 @@ pub(crate) struct Peers {
     /// Its own directory.
     own: FileName,
     /// The tier of each other writer's directory.
-    tier_of: HashMap<FileName, usize, Global>, // alloc: the store's view of the other writers, for its life
+    tier_of: Map<FileName, usize, FixedState, Global>, // alloc: the store's view of the other writers, for its life
     /// Failed tries of each tier since it last opened.
-    tries: HashMap<usize, u32, Global>, // alloc: the store's view of the other writers, for its life
+    tries: Map<usize, u32, FixedState, Global>, // alloc: the store's view of the other writers, for its life
     look: Option<Looking>,
     /// A look asked for while one was in flight, whose listing may have come before what the
     /// asker missed was committed.
@@ -86,7 +86,7 @@ struct Looking {
     /// The roots whose listing has not come.
     unlisted: usize,
     /// The tiers whose heads it read that are not yet open as those heads say.
-    waiting: HashSet<usize, Global>, // alloc: the store's view of the other writers, for its life
+    waiting: Set<usize, FixedState, Global>, // alloc: the store's view of the other writers, for its life
 }
 
 impl Peers {
@@ -104,8 +104,8 @@ impl Peers {
             roots,
             shared,
             own,
-            tier_of: HashMap::new_in(Global), // alloc: the store's view of the other writers, for its life
-            tries: HashMap::new_in(Global), // alloc: the store's view of the other writers, for its life
+            tier_of: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: the store's view of the other writers, for its life
+            tries: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: the store's view of the other writers, for its life
             look: None,
             again: false,
             // alloc: empty, allocates nothing
@@ -198,7 +198,7 @@ impl Store {
         }
         let peers = self.peers.as_mut().expect("a look is of a shared store");
         peers.asked += 1;
-        peers.look = Some(Looking { unlisted: roots, waiting: HashSet::new_in(Global) }); // alloc: the store's view of the other writers, for its life
+        peers.look = Some(Looking { unlisted: roots, waiting: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }) }); // alloc: the store's view of the other writers, for its life
         peers.asked
     }
 

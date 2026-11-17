@@ -20,6 +20,9 @@ producer = ["body-checker", "code-builder"]
 doctest = false
 
 [dependencies]
+# The profile's `panic` as the root manifest writes it (`layout::panic::ProfilePanic`):
+# `panic_strategy::of_profile` maps it to the builder's strategy. The bare reader only.
+blaze-manifest = { workspace = true, default-features = false }
 # `outline`: each file's items, and the parser's events for bodies and signatures.
 blaze-file-items.workspace = true
 blaze-surface.workspace = true
@@ -78,6 +81,9 @@ blaze-expand.workspace = true
 blaze-core.workspace = true
 
 [dev-dependencies]
+# The store the command keeps records in (`plain::Driven`, `plain::Lent`), for the tests that
+# write and read records through it.
+blaze-cas.workspace = true
 blaze-sim.workspace = true
 # tests/hosted.rs: the host table a hosted rung is started with, its calls recorded.
 blaze-std.workspace = true

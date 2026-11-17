@@ -9,8 +9,8 @@
 
 use core::alloc::Allocator;
 
-use blaze_lir::builder::{MemAttrs, Param, Variadic};
-use blaze_lir::func::{Conv, RefKind};
+use blaze_lir::builder::{MemAttrs, Param};
+use blaze_lir::func::RefKind;
 use blaze_lir::{Flags, Ty};
 use blaze_own::String;
 use blaze_typeck::{ExprId, List, Mutbl, PNode};
@@ -62,11 +62,13 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let len = self.b.iconst(Ty::I64, text.len() as u128);
         self.b.store(Flags::NONE, len, at.0, at.1 + 8, MemAttrs::aligned(3));
         let arg = self.address(at);
-        let place = self.ref_place(Instance { item, args: List::EMPTY });
+        // A `#[track_caller]` entry point is passed the location last (walk/track_caller.rs).
+        let callee = Instance { item, args: List::EMPTY };
+        let (sig, values) = self.lang_call_sig(Some(e), callee, &[Param::of(Ty::PTR)], &[arg])?;
+        let place = self.ref_place(callee);
         let reference = self.b.reference(RefKind::Func, place);
-        let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
         // `panic_nounwind` is `#[rustc_nounwind]` and returns `!`: a plain call, then nothing.
-        self.b.call(Flags::NONE, reference, sig, &[arg]);
+        self.b.call(Flags::NONE, reference, sig, &values);
         self.b.unreachable();
         self.dead_block();
         self.push_val(V::None, None);

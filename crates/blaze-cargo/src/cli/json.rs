@@ -18,7 +18,7 @@ use blaze_api::{
 use blaze_hash::FixedState;
 use std::alloc::Global;
 
-use super::print::ByHash;
+use super::print::{BuildKeyHasher, Map, MapOpts};
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -819,11 +819,11 @@ impl Sources {
     /// `root` is the checkout's: a relative file name is looked for no higher.
     pub fn new(root: &Path) -> Sources {
         Sources {
-            named: ByHash::with_capacity_in(FILES, Global),
+            named: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: Some(FILES) }),
             texts: Texts {
                 // alloc: once a request.
                 root: root.to_owned(),
-                at: ByHash::with_capacity_in(FILES, Global),
+                at: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: Some(FILES) }),
                 files: Vec::with_capacity(FILES),
                 text: String::new(), // alloc: none until the first file is read.
                 starts: Vec::new(),  // alloc: none until the first file is read.

@@ -104,6 +104,11 @@ pub enum Question {
     /// The generics of a trait's associated type, by its trait and name (as a projection
     /// names it): the trait's count and its own ([`AssocGenerics`]).
     AssocGenerics(ItemKey, Name),
+    /// A type alias's definition, as a body path through it reads it ([`AliasDef`]).
+    TypeAlias(ItemKey),
+    /// The default values of an ADT's fields (`struct S { a: u8 = 1 }`, RFC 3681), as a
+    /// base-less struct expression `S { .. }` reads them ([`World::field_defaults`]).
+    FieldDefaults(ItemKey),
 }
 
 /// Whether a question's record is made from items alone or from another body's check.
@@ -141,7 +146,9 @@ impl Question {
             | Question::TraitDef(_)
             | Question::AssocParent(_)
             | Question::ConstParams(_)
-            | Question::AssocGenerics(..) => RecordKind::Item,
+            | Question::AssocGenerics(..)
+            | Question::TypeAlias(_)
+            | Question::FieldDefaults(_) => RecordKind::Item,
         }
     }
 }
@@ -279,6 +286,11 @@ pub struct FnSig<'w> {
     /// Reference, "External blocks", [items.extern.variadic]): `inputs` are the declared
     /// parameters, and a call may pass more (rules/c_variadic.rs).
     pub c_variadic: bool,
+    /// `#[rustc_legacy_const_generics(i, ..)]` (stdarch's `vget_lane_u64<const IMM5: i32>(v)`):
+    /// the argument positions of a call at which the fn's own const parameters may be passed as
+    /// value arguments, as the attribute lists them; empty for every other fn
+    /// (rules/legacy_const.rs). `inputs` hold only the real parameters.
+    pub legacy_const_generics: &'w [u32],
     pub inputs: &'w [PTy],
     pub output: PTy,
     pub types: PTys<'w>,
@@ -460,6 +472,16 @@ pub enum Def {
     /// of its own, so this answer holds no type. An ADT's `Self` stays [`Def::Adt`], which
     /// constructor and struct paths take.
     SelfTy,
+    /// A type alias whose aliased type no [`Def::Adt`] or [`Def::Prim`] names as written: an
+    /// ADT with arguments the alias fixes (`type InnerSized<T, const N: usize> =
+    /// PolymorphicIter<[MaybeUninit<T>; N]>`), a projection (`type Scalar<C> = <C as
+    /// CurveArithmetic>::Scalar`), any other type. The Reference, "Type aliases": "A type alias
+    /// defines a new name for an existing type", so a path through it means the aliased type
+    /// with the alias's parameters replaced by the arguments written on the alias's segment
+    /// (fresh variables where none are; defaults where some are left out): `A::new()`,
+    /// `A::CONST`, `A::Variant`, `A { .. }` (rules/alias_path.rs). The type is the world's
+    /// [`World::type_alias`] answer, a read of its own.
+    Alias(ItemKey),
 }
 
 /// A built-in type a path can name: the first segment of `u32::MAX`, `str::len`,
@@ -501,6 +523,10 @@ impl TypeAttrs {
     /// `#[target_feature(..)]` on a fn (rules/target_feature.rs): a SAFE such fn is a safe fn
     /// pointer only in a body that enables its features. Bit 32.
     pub const TARGET_FEATURE: u32 = 32;
+    /// `#[blaze::args]` on a struct (rule 83, decision D126): an options struct, a call's named
+    /// arguments and nothing else. Typing reads nothing of it; the body check's `args-inline`
+    /// (rules/args_inline.rs) does. Bit 64.
+    pub const ARGS: u32 = 64;
     /// Bits 8..12: an enum's discriminant type ([`DiscrRepr`]); 0 is `Unread`.
     const DISCR: u32 = 0xf << 8;
 
@@ -537,6 +563,20 @@ pub enum DiscrRepr {
     Unread,
     Int(IntTy),
     Uint(UintTy),
+}
+
+/// A type alias's definition (`type A<T, const N: usize = 4> = B<[T; N]>;`): what a body path
+/// through it names ([`Def::Alias`]). The Reference, "Type aliases": "A type alias defines a
+/// new name for an existing type". `ty` is the aliased type over the alias's own parameters
+/// (`Param(i)`, `ConstParam(i)`, `i < generics`; type and const parameters together, in
+/// declaration order, lifetimes not counted), every alias in it already expanded; `defaults`
+/// holds one entry per parameter (`None` where none is written), over the parameters before it.
+#[derive(Clone, Copy, Debug)]
+pub struct AliasDef<'w> {
+    pub generics: u32,
+    pub defaults: &'w [Option<PTy>],
+    pub ty: PTy,
+    pub types: PTys<'w>,
 }
 
 /// An opaque type's hidden type.
@@ -639,6 +679,25 @@ pub trait World {
     fn assoc_generics(&self, seal: Seal, trait_: ItemKey, name: Name) -> Fetch<Option<AssocGenerics>> {
         let (_, _, _) = (seal, trait_, name);
         Ok(None)
+    }
+    /// The definition of type alias `item` ([`AliasDef`], `Question::TypeAlias`): `None` when
+    /// `item` is no type alias. The default is the gap (`Missing`): only a world that answers a
+    /// path with [`Def::Alias`] is asked it, and that world answers it (blaze-ladder front2).
+    /// DEFAULTED so no other world breaks.
+    fn type_alias(&self, seal: Seal, item: ItemKey) -> Fetch<Option<AliasDef<'_>>> {
+        let (_, _) = (seal, item);
+        Err(Missing)
+    }
+    /// The default value of each field of ADT `adt` (`Question::FieldDefaults`), in the order
+    /// of [`Adt::fields`] (every variant's fields, concatenated): the key of the field's
+    /// default, an anonymous constant of the field's type over the ADT's generics, or `None`
+    /// for a field with no default. An empty slice: no field of `adt` has one. The default is
+    /// the gap (`Missing`): only a base-less struct expression (`S { a: 1, .. }`) asks it, and
+    /// the world that files ADT heads answers it (blaze-ladder front2). DEFAULTED so no other
+    /// world breaks.
+    fn field_defaults(&self, seal: Seal, adt: ItemKey) -> Fetch<&[Option<ItemKey>]> {
+        let (_, _) = (seal, adt);
+        Err(Missing)
     }
     /// The questions the last check of this body asked, before the walk starts: fetch them in
     /// one batch. Answers nothing.
@@ -1040,6 +1099,10 @@ impl Tabled for FnSig<'_> {
         h.u32(self.declared_count);
         h.tag(u8::from(self.self_param));
         h.tag(self.header.bits() | if self.c_variadic { 0x40 } else { 0 });
+        h.u64(self.legacy_const_generics.len() as u64);
+        for &i in self.legacy_const_generics {
+            h.u32(i);
+        }
         h.u64(self.inputs.len() as u64);
     }
 }
@@ -1129,6 +1192,39 @@ impl ContentHash for CoroutineFacts<'_> {
     }
 }
 
+impl Tabled for AliasDef<'_> {
+    fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
+        roots.push(Root::Ty(self.ty));
+        roots.extend(self.defaults.iter().filter_map(|d| *d).map(Root::Ty));
+        Some(self.types)
+    }
+    fn hash_shape(&self, h: &mut StableHasher) {
+        h.u32(self.generics);
+        h.u64(self.defaults.len() as u64);
+        for d in self.defaults {
+            h.tag(u8::from(d.is_some()));
+        }
+    }
+}
+
+impl ContentHash for AliasDef<'_> {
+    fn hash_into(&self, h: &mut StableHasher) {
+        h.u32(self.generics);
+        h.u32(self.ty.0);
+        h.u64(self.defaults.len() as u64);
+        for d in self.defaults {
+            match d {
+                Some(t) => {
+                    h.tag(1);
+                    h.u32(t.0);
+                }
+                None => h.tag(0),
+            }
+        }
+        self.types.hash_into(h);
+    }
+}
+
 impl Tabled for Hidden<'_> {
     fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
         roots.push(Root::Ty(self.ty));
@@ -1156,6 +1252,12 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     /// The recorder for one run.
     pub(crate) fn new_in(world: &'w W, alloc: Alloc<'a>) -> Reads<'w, 'a, W> {
         Self::made(world, None, None, alloc)
+    }
+
+    /// The allocator this run's recorder lives in (D102): a walk inside the run takes its
+    /// scratch here rather than fetching an allocator of its own.
+    pub(crate) fn alloc(&self) -> Alloc<'a> {
+        *self.entries.allocator()
     }
 
     /// The recorder with its log and tally, each optional: the one place a `Reads` is built.
@@ -1358,6 +1460,10 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
                 }
                 Def::Trait(k) => second.push(Question::TraitDef(k)),
                 Def::Const(k) | Def::Static(k, _) => second.push(Question::FnSig(k)),
+                Def::Alias(k) => {
+                    second.push(Question::TypeAlias(k));
+                    second.push(Question::ConstParams(k));
+                }
                 Def::TyParam(_) | Def::Prim(_) | Def::SelfTy => {}
             }
         }
@@ -1531,6 +1637,20 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         self.record(Question::AssocGenerics(trait_, name), got, asked_at)
     }
 
+    /// A type alias's definition ([`World::type_alias`]).
+    pub fn type_alias(&mut self, item: ItemKey) -> Result<Option<AliasDef<'w>>, Stop> {
+        let asked_at = self.stamp();
+        let got = self.world.type_alias(Self::seal(), item);
+        self.record_tabled(Question::TypeAlias(item), got, asked_at)
+    }
+
+    /// The default value of each field of ADT `adt` ([`World::field_defaults`]).
+    pub fn field_defaults(&mut self, adt: ItemKey) -> Result<&'w [Option<ItemKey>], Stop> {
+        let asked_at = self.stamp();
+        let got = self.world.field_defaults(Self::seal(), adt);
+        self.record(Question::FieldDefaults(adt), got, asked_at)
+    }
+
     /// The test build's one backdoor: an ADT read that is not recorded. Only the planted bug
     /// of the read-list property calls it, to show the oracle catches what the seal prevents.
     #[cfg(test)]
@@ -1581,6 +1701,10 @@ impl ContentHash for FnSig<'_> {
         h.u32(self.own_count);
         h.tag(u8::from(self.self_param));
         h.tag(self.header.bits() | if self.c_variadic { 0x40 } else { 0 });
+        h.u64(self.legacy_const_generics.len() as u64);
+        for &i in self.legacy_const_generics {
+            h.u32(i);
+        }
         self.inputs.hash_into(h);
         h.u32(self.output.0);
         self.types.hash_into(h);
@@ -1666,6 +1790,12 @@ impl ContentHash for Adt<'_> {
 }
 
 impl ContentHash for &[ItemKey] {
+    fn hash_into(&self, h: &mut StableHasher) {
+        (**self).hash_into(h);
+    }
+}
+
+impl ContentHash for &[Option<ItemKey>] {
     fn hash_into(&self, h: &mut StableHasher) {
         (**self).hash_into(h);
     }
@@ -1775,6 +1905,10 @@ impl ContentHash for Def {
                 }
             }
             Def::SelfTy => h.tag(8),
+            Def::Alias(k) => {
+                h.tag(9);
+                h.u128(k.0);
+            }
         }
     }
 }

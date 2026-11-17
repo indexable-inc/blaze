@@ -35,7 +35,7 @@ use std::fmt::Write as _;
 
 use blaze_codegen::Backend;
 use blaze_codegen::plan::Origin;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 
 use crate::model::{Class, Writer};
 use crate::stage::Stage;
@@ -210,7 +210,7 @@ fn code(class: &Class) -> bool {
 
 /// `sums` as rows by name, the most bytes first, then by name: one order whatever the map's.
 fn ranked<K>(
-    sums: HashMap<K, Sum, Global>,
+    sums: Map<K, Sum, FixedState, Global>,
     name: impl Fn(K) -> Cow<'static, str>,
 ) -> Vec<(Cow<'static, str>, Sum)> {
     // alloc: once a stage, a row a backend or crate
@@ -342,9 +342,9 @@ impl Stage<'_> {
     /// piece of code; an incremental stage's, only those it made.
     fn record_code(&self) {
         // alloc: once a stage, a few backends
-        let mut backends: HashMap<Kind, Sum, Global> = HashMap::new_in(Global);
+        let mut backends: Map<Kind, Sum, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         // alloc: once a stage, an entry a crate
-        let mut crates: HashMap<Owner, Sum, Global> = HashMap::new_in(Global);
+        let mut crates: Map<Owner, Sum, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         let mut add = |piece: PieceRef<'_>| {
             if !code(piece.class()) {
                 return;

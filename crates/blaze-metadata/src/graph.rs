@@ -16,9 +16,9 @@ use crate::Packages;
 /// Unordered while the walk fills it; [`of_build`] sorts each part once when it writes the node.
 #[derive(Default)]
 struct Node {
-    features: HashSet<InternedString, Global>,
+    features: Set<InternedString, FixedState, Global>,
     /// Each dependency's name and its kinds, a kind once per edge it passes on.
-    deps: HashMap<PackageId, (InternedString, Vec<DepKindInfo>), Global>,
+    deps: Map<PackageId, (InternedString, Vec<DepKindInfo>), FixedState, Global>,
 }
 
 /// Whether a `cargo build` of the member `pkg` builds anything: its library, or a binary
@@ -27,7 +27,7 @@ struct Node {
 fn builds_anything(
     pkg: PackageId,
     features: &ResolvedFeatures,
-    reads: &HashMap<PackageId, Read, Global>,
+    reads: &Map<PackageId, Read, FixedState, Global>,
 ) -> bool {
     let Some(read) = reads.get(&pkg) else { return false };
     let on =
@@ -47,12 +47,12 @@ pub(crate) fn of_build(
     features: &ResolvedFeatures,
     roots: &[PackageId],
     dev_units: bool,
-    reads: &HashMap<PackageId, Read, Global>,
+    reads: &Map<PackageId, Read, FixedState, Global>,
     packages: &Packages<'_>,
     root: Option<PackageId>,
 ) -> Result<MetadataResolve> {
-    let mut nodes: HashMap<PackageId, Node, Global> = HashMap::new_in(Global);
-    let mut seen = HashSet::new_in(Global);
+    let mut nodes: Map<PackageId, Node, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
+    let mut seen = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
     let mut queue = Vec::new();
     for &member in roots {
         if !dev_units && !builds_anything(member, features, reads) {
@@ -107,7 +107,7 @@ pub(crate) fn of_build(
 
 /// The nodes as `cargo metadata` writes them: by package, each one's dependencies by package,
 /// a dependency's kinds sorted and each once, its features sorted.
-fn written(nodes: HashMap<PackageId, Node, Global>) -> Vec<MetadataResolveNode> {
+fn written(nodes: Map<PackageId, Node, FixedState, Global>) -> Vec<MetadataResolveNode> {
     let mut nodes: Vec<(PackageId, Node)> = nodes.into_iter().collect();
     nodes.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
     nodes
@@ -217,7 +217,7 @@ mod tests {
             (c, &[], &[(d, "zed", &[(DepKind::Normal, unix), (DepKind::Normal, None)])]),
             (b, &["x"], &[]),
         ];
-        let mut nodes: HashMap<PackageId, Node, Global> = HashMap::new_in(Global);
+        let mut nodes: Map<PackageId, Node, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for (pkg, features, deps) in input {
             let node = nodes.entry(*pkg).or_default();
             node.features.extend(features.iter().map(|it| InternedString::new(it)));

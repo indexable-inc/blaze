@@ -15,7 +15,7 @@ use crate::{
     sched::{self, CounterId, Wait},
 };
 
-type ByKey<V> = blaze_hash::ByHash<Key, V, std::alloc::Global>; // alloc: a shard's table, for the pump's life
+type ByKey<V> = blaze_hash::Map<Key, V, blaze_hash::BuildKeyHasher, std::alloc::Global>; // alloc: a shard's table, for the pump's life
 
 const RUNNING: u8 = 0;
 const DONE: u8 = 1;
@@ -54,7 +54,18 @@ impl<V: Clone + Send + Sync + 'static> Sharded<V> {
             .next_power_of_two()
             .max(64);
         Sharded {
-            shards: (0..count).map(|_| Shard(Lock::new("graph.flights.shard", ByKey::default()))).collect(),
+            shards: (0..count)
+                .map(|_| {
+                    Shard(Lock::new(
+                        "graph.flights.shard",
+                        ByKey::new(blaze_hash::MapOpts {
+                            hasher: blaze_hash::BuildKeyHasher::default(),
+                            alloc: std::alloc::Global,
+                            capacity: None,
+                        }),
+                    ))
+                })
+                .collect(),
             mask: count - 1,
         }
     }

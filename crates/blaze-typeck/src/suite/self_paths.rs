@@ -389,7 +389,7 @@ fn check_view(fx: &Fx, v: &crate::body::BodyView<'_>) -> crate::columns::Checked
 fn struct_expr(b: &mut Bb, sp: &mut StructBody, path: &[&str], one: ExprId) -> (ExprId, [crate::body::FieldInit; 1]) {
     let p = sp.path(path);
     let fields = crate::ids::List { start: 0, len: 1 };
-    let s = b.e(crate::body::Expr::Struct { path: p, fields, base: None });
+    let s = b.e(crate::body::Expr::Struct { path: p, fields, base: crate::body::StructBase::None });
     (s, [crate::body::FieldInit { name: crate::ids::Name::of_index(0), expr: one }])
 }
 

@@ -22,22 +22,25 @@
 //!    the instance (`blaze_build::instance_key_normalized` over the item's identity, never its
 //!    text), so an edited `type Item` of an impl changes the instances that see it;
 //! 4. the TARGET: the triple and the core's features the emitter reads (`Isa`);
-//! 5. the TIER (`blaze_run::Tier`);
+//! 5. the TIER whose emitter made the code (`blaze_tier::TierName`, [`EMITTING`]: today the
+//!    Reference emitter's, whatever tier the command asked for);
 //! 6. the builder's SETTINGS that change code ([`Settings`]: overflow checks, debug
 //!    assertions, the panic strategy);
 //! 7. the TOOLCHAIN's identity (`blaze_toolchain::ToolchainId`);
 //! 8. the FORM's version ([`ENTRY_FORM`] and blaze-code's `MAGIC`).
 //!
+//! Then the code builder's identity (D105 `ProducerId<CodeBuilder>`) and the program
+//! package's edition ([`Builder`]).
+//!
 //! Nothing of the machine: no path, time, address, host name, slot or ground-table index.
 //!
-//! NOT IN THE KEY, said rather than guessed (rule 3): what the BUILD reads beyond the checked
-//! body (the layouts of the argument types' ADTs a generic instance lowers with, the values of
-//! constants and the bytes of statics' initializers, vtable shapes) and what the LOWERING read
-//! that the checker's list does not hold (front2 reads.rs `NotListed`: macro definitions, the
-//! crate's edition). They are the record's READ LIST, checked against today's facts when a
-//! record is found (run.md: "Key: symbol, body digest, target, tier, settings, toolchain; read
-//! list for the rest"): piece 8 files and checks it. Until then a record found by this key is
-//! stale after an edit of only those inputs.
+//! NOT IN THE KEY: what the BUILD reads beyond the checked body (the layouts of the ADTs an
+//! instance lowers with, constant values, the impl a call resolves to, vtable shapes). That is
+//! the entry's READ LIST ([`reads`]): rows of (question, answer digest), recorded around the
+//! world the builder is handed and checked against today's facts when the entry is found
+//! (run.md: "Key: symbol, body digest, target, tier, settings, toolchain; read list for the
+//! rest"). What neither holds is said in [`reads`]' module doc (macro definitions, the editions
+//! of the program's other crates, lang items and attributes of workspace crates).
 //!
 //! THE STORE is [`CodeStore`] (`get`, `put`): the run's parent implements it over the home's
 //! packs; [`MemoryStore`] is the in-memory one the tests use. Two different values under one key
@@ -51,11 +54,13 @@ use std::boxed::Box;
 use blaze_build::tls;
 use blaze_code::record::{CodeView, DecodeError, MAGIC, RecordError, Symbol};
 use blaze_emit::{AddressWord, Isa, Named, Names, Os, Outside, RecordEmitError, emit_record_measured, no_address_word};
+use blaze_ids::producer::{CodeBuilder, ProducerId};
 use blaze_ids::{ContentId, Hasher};
 use blaze_lir::Func;
 use blaze_own::{AVec, Alloc, Vec};
-use blaze_run::Tier;
+pub use blaze_tier::TierName;
 use blaze_toolchain::ToolchainId;
+use edition::PackageEdition;
 use blaze_typeck::ItemKey;
 
 use crate::front2::body_reads::ReadsDigest;
@@ -63,14 +68,19 @@ use parser::{Edition, LexedStr};
 
 use crate::symbols::{SymbolError, tls_desc_symbol, tls_getter_symbol};
 
+#[path = "code_reads.rs"]
+pub mod reads;
+
+use reads::ReadList;
+
 /// The version of the entry form and of what a key means: stepped when either changes, so an
 /// old store's entries are never found (and never misread) by a new blaze.
-pub const ENTRY_FORM: u32 = 2;
+pub const ENTRY_FORM: u32 = 3;
 
 /// The first eight bytes of every entry.
 pub const ENTRY_MAGIC: [u8; 8] = *b"bzcent01";
 
-const KEY_DOMAIN: &str = "blaze-ladder code record key 1";
+const KEY_DOMAIN: &str = "blaze-ladder code record key 2";
 const BODY_DOMAIN: &str = "blaze-ladder checked body 1";
 
 /// A code record's key in the store ([`code_key`]).
@@ -102,21 +112,58 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// What the baseline tier builds at `overflow_checks`: no debug assertions and no unwinding
-    /// (the emitter refuses `Invoke` and `Resume`). A record keyed by other settings of those
-    /// two is built by the same code today: over-keyed, never stale.
-    pub const fn baseline(overflow_checks: blaze_build::OverflowChecks) -> Settings {
-        Settings { overflow_checks, debug_assertions: false, panic: PanicStrategy::Abort }
+    /// What the baseline tier builds at `overflow_checks` with the program's panic strategy
+    /// `panic` (UNWIND.md 3.1; no default: the caller names it), no debug assertions. On the
+    /// record path this IS where the program's strategy lives: the walk and the program's
+    /// inputs are made from it (run.rs `build_records_new`). Debug assertions are keyed but
+    /// not built differently today: over-keyed, never stale.
+    pub const fn baseline(overflow_checks: blaze_build::OverflowChecks, panic: blaze_build::Panic) -> Settings {
+        Settings { overflow_checks, debug_assertions: false, panic: crate::panic_strategy::strategy(panic) }
     }
 }
+
+/// The tier whose emitter makes every entry: [`make_entry`] calls the Reference emitter
+/// (`blaze_emit::emit_record_measured`) and no other, so this is the one tier a [`Builder`]
+/// may name; a run whose builder names another is refused before its first entry is made
+/// ([`Builder::emits`]).
+pub const EMITTING: TierName = TierName::Reference;
 
 /// What every record of one run is built for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Builder {
     pub isa: Isa,
-    pub tier: Tier,
+    /// The tier whose emitter makes the code: the byte the key holds is the emitter that ran,
+    /// never the tier the command asked for ([`EMITTING`]).
+    pub tier: TierName,
     pub settings: Settings,
     pub toolchain: ToolchainId,
+    /// The code builder's own identity (D105 `Row::CodeBuilder`): the digest of the code that
+    /// builds and emits the entry, so a blaze whose builder changed finds none of an older one's.
+    pub producer: ProducerId<CodeBuilder>,
+    /// The program package's edition (its manifest's `edition`, read once by
+    /// `PackageEdition::of_manifest`): the lowering reads it beyond the checker's list (front2
+    /// reads.rs `NotListed`). The editions of the run's other crates are not in it: the front
+    /// end gives no instance its own crate's edition (said in [`code_key`]'s doc).
+    pub edition: PackageEdition,
+}
+
+/// A builder naming a tier whose emitter [`make_entry`] does not call.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NotEmitting {
+    pub named: TierName,
+}
+
+impl fmt::Display for NotEmitting {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "the code builder names the {} tier, but every entry is made by the {} emitter: a key naming {} would hold code it did not make", self.named.as_str(), EMITTING.as_str(), self.named.as_str())
+    }
+}
+
+impl Builder {
+    /// The builder, refused when its tier is not the one whose emitter makes entries.
+    pub fn emits(self) -> Result<Builder, NotEmitting> {
+        if self.tier == EMITTING { Ok(self) } else { Err(NotEmitting { named: self.tier }) }
+    }
 }
 
 /// The target triple of the code `isa` describes (the emitter makes AArch64 code only).
@@ -145,10 +192,18 @@ pub enum KeyPlant {
     WithoutTier,
     /// The overflow setting left out of the key: a dev and a release record would share it.
     WithoutOverflow,
+    /// The code builder's identity left out: two blazes' builders would share a key.
+    WithoutProducer,
+    /// The edition left out: a 2021 and a 2024 program's record would share a key.
+    WithoutEdition,
 }
 
 /// The key of the code record of `parts` built by `builder`: the eight parts of the module doc,
-/// each length-prefixed in that order.
+/// then the code builder's identity and the program package's edition, each length-prefixed
+/// in that order. The tier byte is `TierName`'s own (`Reference` 0, `Fast` 1, `Optimized` 2):
+/// the emitter that made the code. The edition of a crate other than the program's is not in
+/// it (the front end names no instance's crate edition): an edition edit of a dependency
+/// alone moves no key, a gap the read list does not close either.
 pub fn code_key(parts: &KeyParts, builder: &Builder) -> CodeKey {
     code_key_planted(parts, builder, KeyPlant::None)
 }
@@ -162,11 +217,7 @@ pub fn code_key_planted(parts: &KeyParts, builder: &Builder, plant: KeyPlant) ->
     h.part(triple(builder.isa).as_bytes());
     h.part(&[u8::from(builder.isa.lse)]);
     if plant != KeyPlant::WithoutTier {
-        let tier: u8 = match builder.tier {
-            Tier::Fast => 0,
-            Tier::Optimized => 1,
-        };
-        h.part(&[tier]);
+        h.part(&[builder.tier as u8]);
     }
     let s = builder.settings;
     let panic: u8 = match s.panic {
@@ -176,6 +227,16 @@ pub fn code_key_planted(parts: &KeyParts, builder: &Builder, plant: KeyPlant) ->
     let overflow = s.overflow_checks.on() && plant != KeyPlant::WithoutOverflow;
     h.part(&[u8::from(overflow), u8::from(s.debug_assertions), panic]);
     h.part(&builder.toolchain.0);
+    if plant != KeyPlant::WithoutProducer {
+        h.id(builder.producer.id());
+    }
+    if plant != KeyPlant::WithoutEdition {
+        let blaze = match builder.edition.blaze {
+            None => 0,
+            Some(edition) => 1 + edition as u8,
+        };
+        h.part(&[builder.edition.syntax as u8, blaze]);
+    }
     h.part(&ENTRY_FORM.to_le_bytes());
     h.part(&MAGIC);
     CodeKey(h.finish())
@@ -323,9 +384,15 @@ pub enum CodeRecordError {
     Getter(blaze_lir::BuildError),
     /// The thread-local ender (blaze-build `tls::index::ender`) did not build.
     Ender(blaze_lir::BuildError),
+    /// The C entry shim (blaze-build `start::c_main_shim`, run/special.rs) did not build.
+    Shim(blaze_build::BuildError),
     /// An `f128` operation needs a soft-float routine the program's compiler_builtins does
     /// not give (front2/builtins_shim.rs).
     Routine(crate::front2::builtins_shim::BuiltinsRefused),
+    /// The build's read list could not be made, or a found entry's could not be asked again.
+    Reads(reads::ReadsError),
+    /// The run's builder names a tier whose emitter does not make entries.
+    NotEmitting(NotEmitting),
 }
 
 impl fmt::Display for CodeRecordError {
@@ -340,7 +407,10 @@ impl fmt::Display for CodeRecordError {
             CodeRecordError::NoReads { item } => write!(f, "fn {:#x} has a checked body but no read-list digest was filed for it (front2 body_reads.rs): its record's key would miss what its check read", item.0),
             CodeRecordError::Getter(why) => write!(f, "the thread-local getter did not build: {why}"),
             CodeRecordError::Ender(why) => write!(f, "the thread-local ender did not build: {why}"),
+            CodeRecordError::Shim(why) => write!(f, "the C entry shim did not build: {why}"),
             CodeRecordError::Routine(why) => why.fmt(f),
+            CodeRecordError::Reads(why) => why.fmt(f),
+            CodeRecordError::NotEmitting(why) => why.fmt(f),
         }
     }
 }
@@ -355,12 +425,27 @@ impl core::error::Error for CodeRecordError {}
 /// The form, little-endian: [`ENTRY_MAGIC`], [`ENTRY_FORM`] (4), the bytes of instructions at
 /// the code's start (4), the record's length (4) and bytes (blaze-code `Sealed::encode`), the
 /// count of declared instances (4), and each: its tabled fn's key (16), its name's length (4)
-/// and bytes, sorted by (tabled, name) and each once.
+/// and bytes, sorted by (tabled, name) and each once; then the count of read-list rows (4) and
+/// each: its question's length (4) and bytes, and its answer's digest (32), sorted by question
+/// and each once ([`reads`]). An entry made here reads nothing beyond its key: no row.
 pub fn make_entry<'a, 'd>(
     func: &Func<Global>,
     names: &InstanceNames<'_>,
     routines: crate::front2::builtins_shim::Routines<'d>,
     declared: &mut AVec<'_, Declared<'d>>,
+    isa: Isa,
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, u8>, CodeRecordError> {
+    make_entry_reading(func, names, routines, declared, &ReadList::empty(), isa, alloc)
+}
+
+/// [`make_entry`] with the build's read list `reads` ([`reads::ReadLog::seal`]).
+pub fn make_entry_reading<'a, 'd>(
+    func: &Func<Global>,
+    names: &InstanceNames<'_>,
+    routines: crate::front2::builtins_shim::Routines<'d>,
+    declared: &mut AVec<'_, Declared<'d>>,
+    reads: &ReadList,
     isa: Isa,
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, u8>, CodeRecordError> {
@@ -371,7 +456,7 @@ pub fn make_entry<'a, 'd>(
     for r in called.iter() {
         declared.push(routines.declared(r)?);
     }
-    // No landing pads or unwind word yet: the emitter refuses `Invoke` and `Resume` (piece 11).
+    // The record form carries landing pads and the unwind word (blaze-emit pass/unwind.rs).
     let sealed = record.seal().map_err(CodeRecordError::Seal)?;
     let mut code: AVec<'_, u8> = Vec::new_in(alloc);
     sealed.encode(&mut code);
@@ -389,6 +474,12 @@ pub fn make_entry<'a, 'd>(
         out.extend_from_slice(&d.tabled.0.to_le_bytes());
         out.extend_from_slice(&len(d.name.len(), "declared instance's name")?.to_le_bytes());
         out.extend_from_slice(d.name);
+    }
+    out.extend_from_slice(&len(reads.len(), "entry's read list")?.to_le_bytes());
+    for (question, answer) in reads.rows() {
+        out.extend_from_slice(&len(question.len(), "read-list question")?.to_le_bytes());
+        out.extend_from_slice(question);
+        out.extend_from_slice(&answer.0);
     }
     Ok(out)
 }
@@ -434,8 +525,10 @@ pub enum EntryError {
     Form { found: u32 },
     /// The entry ends inside a part (`what`).
     Truncated { what: &'static str },
-    /// Bytes after the last declared instance.
+    /// Bytes after the last read-list row.
     Trailing,
+    /// Read-list rows not sorted by question, or one question twice.
+    ReadsOrder,
     /// The record inside does not read.
     Record(DecodeError),
     /// The instructions' length is past the record's code.
@@ -449,7 +542,8 @@ impl fmt::Display for EntryError {
             EntryError::Magic => write!(f, "not {rule}: its first bytes are not the entry's magic"),
             EntryError::Form { found } => write!(f, "{rule} of form {found}, and this blaze reads form {ENTRY_FORM}: the store is from another blaze"),
             EntryError::Truncated { what } => write!(f, "{rule} ends inside its {what}"),
-            EntryError::Trailing => write!(f, "{rule} has bytes after its last declared instance"),
+            EntryError::Trailing => write!(f, "{rule} has bytes after its last read-list row"),
+            EntryError::ReadsOrder => write!(f, "{rule}'s read list is not sorted by question, each once"),
             EntryError::Record(why) => write!(f, "{rule}'s record does not read: {why}"),
             EntryError::Instructions(why) => write!(f, "{rule}: {why}"),
         }
@@ -466,6 +560,9 @@ pub struct EntryView<'b> {
     /// The declared instances' bytes (checked whole by [`EntryView::read`]).
     declared: &'b [u8],
     count: u32,
+    /// The read list's rows' bytes (checked whole and in order by [`EntryView::read`]).
+    reads: &'b [u8],
+    reads_count: u32,
 }
 
 struct Cursor<'b> {
@@ -492,6 +589,13 @@ impl<'b> Cursor<'b> {
         let name = self.take(len, "declared instance's name")?;
         Ok(Declared { tabled: ItemKey(u128::from_le_bytes(wide)), name })
     }
+    fn read_row(&mut self) -> Result<(&'b [u8], ContentId), EntryError> {
+        let len = self.u32("read-list question's length")? as usize;
+        let question = self.take(len, "read-list question")?;
+        let mut answer = [0u8; 32];
+        answer.copy_from_slice(self.take(32, "read-list answer")?);
+        Ok((question, ContentId(answer)))
+    }
 }
 
 impl<'b> EntryView<'b> {
@@ -517,10 +621,32 @@ impl<'b> EntryView<'b> {
         for _ in 0..count {
             c.declared()?;
         }
+        let declared = &bytes[start..c.at];
+        let reads_count = c.u32("count of read-list rows")?;
+        let reads_start = c.at;
+        let mut last: Option<&[u8]> = None;
+        for _ in 0..reads_count {
+            let (question, _) = c.read_row()?;
+            if last.is_some_and(|before| before >= question) {
+                return Err(EntryError::ReadsOrder);
+            }
+            last = Some(question);
+        }
         if c.at != bytes.len() {
             return Err(EntryError::Trailing);
         }
-        Ok(EntryView { insts, record, declared: &bytes[start..], count })
+        Ok(EntryView { insts, record, declared, count, reads: &bytes[reads_start..], reads_count })
+    }
+
+    /// The count of read-list rows.
+    pub fn reads_count(&self) -> u32 {
+        self.reads_count
+    }
+
+    /// Each read-list row (question, answer digest), in the entry's order.
+    pub fn reads(&self) -> impl Iterator<Item = Result<(&'b [u8], ContentId), EntryError>> + 'b {
+        let mut c = Cursor { bytes: self.reads, at: 0 };
+        (0..self.reads_count).map(move |_| c.read_row())
     }
 
     /// The count of declared instances.
@@ -565,17 +691,50 @@ impl fmt::Display for StoreError {
 impl core::error::Error for StoreError {}
 
 /// Where code records are kept by key: the run's parent implements it over the home's packs.
+///
+/// Two forms. A PLAIN entry is put under its key once ([`CodeStore::put`]): the thread-local
+/// getter and ender, made from no text, read nothing beyond their keys and are never stale. An
+/// instance's entry has a read list and may be stale after an edit its key does not cover: it
+/// is put under its CONTENT key ([`content_key`]), and its code key is a POINTER naming that
+/// content key ([`CodeStore::point`]), replaced when the entry is built again. Two different
+/// values under one plain key stay [`StoreError::TwoValues`], the alarm that a key missed an
+/// input (rule 21).
 pub trait CodeStore {
     /// The entry under `key`, if any.
     fn get(&self, key: CodeKey) -> Result<Option<&[u8]>, StoreError>;
     /// Writes `bytes` under `key` once; equal bytes again are no write; different bytes are
     /// [`StoreError::TwoValues`].
     fn put(&mut self, key: CodeKey, bytes: &[u8]) -> Result<(), StoreError>;
+    /// The content key the pointer `key` names, if any.
+    fn pointed(&self, key: CodeKey) -> Result<Option<CodeKey>, StoreError>;
+    /// The pointer `key` names `content` from now on, whatever it named before.
+    fn point(&mut self, key: CodeKey, content: CodeKey) -> Result<(), StoreError>;
 }
 
-/// The in-memory [`CodeStore`]: entries sorted by key in the caller's allocator.
+const CONTENT_DOMAIN: &str = "blaze-ladder code entry content 1";
+
+/// The key an instance's entry is put under: the digest of its bytes, so two entries never
+/// share one.
+pub fn content_key(entry: &[u8]) -> CodeKey {
+    CodeKey(ContentId::of(CONTENT_DOMAIN, entry))
+}
+
+/// The entry `key` names: through its pointer when it is one, else the plain entry under it.
+/// A pointer naming no entry is the store's failure, named.
+pub fn entry_of(store: &dyn CodeStore, key: CodeKey) -> Result<Option<&[u8]>, StoreError> {
+    match store.pointed(key)? {
+        Some(content) => match store.get(content)? {
+            Some(bytes) => Ok(Some(bytes)),
+            None => Err(StoreError::Failed { key, what: "a code key's pointer names a content key with no entry" }),
+        },
+        None => store.get(key),
+    }
+}
+
+/// The in-memory [`CodeStore`]: entries and pointers sorted by key in the caller's allocator.
 pub struct MemoryStore<'a> {
     rows: AVec<'a, (CodeKey, AVec<'a, u8>)>,
+    pointers: AVec<'a, (CodeKey, CodeKey)>,
     alloc: Alloc<'a>,
     /// Writes made (equal rewrites are not counted).
     pub puts: usize,
@@ -583,7 +742,7 @@ pub struct MemoryStore<'a> {
 
 impl<'a> MemoryStore<'a> {
     pub fn new_in(alloc: Alloc<'a>) -> MemoryStore<'a> {
-        MemoryStore { rows: Vec::new_in(alloc), alloc, puts: 0 }
+        MemoryStore { rows: Vec::new_in(alloc), pointers: Vec::new_in(alloc), alloc, puts: 0 }
     }
 
     /// The count of entries.
@@ -614,6 +773,20 @@ impl CodeStore for MemoryStore<'_> {
             }
         }
     }
+
+    fn pointed(&self, key: CodeKey) -> Result<Option<CodeKey>, StoreError> {
+        Ok(self.pointers.binary_search_by(|row| row.0.cmp(&key)).ok().map(|at| self.pointers[at].1))
+    }
+
+    fn point(&mut self, key: CodeKey, content: CodeKey) -> Result<(), StoreError> {
+        match self.pointers.binary_search_by(|row| row.0.cmp(&key)) {
+            Ok(at) => self.pointers[at].1 = content,
+            Err(at) => {
+                self.pointers.insert_shift(at, (key, content));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One instance the record walk met.
@@ -629,6 +802,16 @@ pub struct Met {
     pub found: bool,
 }
 
+/// What a census walk ([`RecordRun::census`]) hands each instance it builds to, in the walk's
+/// order, IN PLACE of making its record: the instance's LIR exactly as [`make_entry`] would get
+/// it, and the names of what it references. The census emits it itself (examples/fast_census.rs:
+/// every tier over every reached body); the walk puts nothing in the store for it.
+pub trait LirSeen {
+    /// Instance `function` (as the program names it; its symbol `symbol`), built as `func`, its
+    /// references named by `names`.
+    fn seen(&mut self, function: &str, symbol: Symbol, func: &Func<Global>, names: &InstanceNames<'_>);
+}
+
 /// A record walk's state (run.rs `build_records`): the store, what the records are built for,
 /// and what was met.
 pub struct RecordRun<'s> {
@@ -636,25 +819,46 @@ pub struct RecordRun<'s> {
     pub builder: Builder,
     /// Each instance met, in the walk's order.
     pub met: std::vec::Vec<Met>,
+    /// A census walk's receiver ([`LirSeen`]): `None` on the run path, which makes every record.
+    pub seen: Option<&'s mut dyn LirSeen>,
+    /// What the instance being built read beyond its key ([`reads::Recorded`]), cleared before
+    /// each build and sealed into its entry.
+    pub reads: reads::ReadLog,
+    /// Entries found and then built again because a read-list row answered otherwise.
+    pub stale: usize,
 }
 
 impl<'s> RecordRun<'s> {
-    pub fn new(store: &'s mut dyn CodeStore, builder: Builder) -> RecordRun<'s> {
-        RecordRun { store, builder, met: std::vec::Vec::new() }
+    /// A walk over `store` for `builder`, refused when the builder names a tier whose emitter
+    /// does not make entries ([`Builder::emits`]).
+    pub fn new(store: &'s mut dyn CodeStore, builder: Builder) -> Result<RecordRun<'s>, NotEmitting> {
+        RecordRun::planted(store, builder, reads::ReadPlant::None)
+    }
+
+    /// [`RecordRun::new`] with `plant` in its recorder.
+    pub fn planted(store: &'s mut dyn CodeStore, builder: Builder, plant: reads::ReadPlant) -> Result<RecordRun<'s>, NotEmitting> {
+        Ok(RecordRun { store, builder: builder.emits()?, met: std::vec::Vec::new(), seen: None, reads: reads::ReadLog::new(plant), stale: 0 })
+    }
+
+    /// A census walk: as [`RecordRun::new`], but each instance built is handed to `seen` and no
+    /// record is made for it (the thread-local getter and ender, made from no text, still are).
+    pub fn census(store: &'s mut dyn CodeStore, builder: Builder, seen: &'s mut dyn LirSeen) -> Result<RecordRun<'s>, NotEmitting> {
+        Ok(RecordRun { store, builder: builder.emits()?, met: std::vec::Vec::new(), seen: Some(seen), reads: reads::ReadLog::new(reads::ReadPlant::None), stale: 0 })
+    }
+
+    /// The special record `which` (run/special.rs: the shim, the getter, the ender): found in
+    /// the store, or made and put, by the one find-or-make (`special::make_special`); met under
+    /// its name. `alloc` is the caller's scratch for the entry until it is put.
+    pub fn special(&mut self, which: crate::run::special::Special<'_>, alloc: Alloc<'_>) -> Result<(), CodeRecordError> {
+        let made = crate::run::special::make_special(which, &self.builder, &mut *self.store, alloc)?;
+        self.met.push(Met { symbol: made.symbol, key: made.key, parts: made.parts, function: Box::from(which.name()), found: made.found });
+        Ok(())
     }
 
     /// The thread-local getter's entry ([`getter_parts`]): found in the store, or made and put;
-    /// met as [`GETTER_NAME`].
-    pub fn getter(&mut self) -> Result<(), CodeRecordError> {
-        let parts = getter_parts();
-        let key = code_key(&parts, &self.builder);
-        let found = self.store.get(key).map_err(CodeRecordError::Store)?.is_some();
-        if !found {
-            let entry = make_getter_entry(self.builder.isa, Alloc::global())?;
-            self.store.put(key, &entry).map_err(CodeRecordError::Store)?;
-        }
-        self.met.push(Met { symbol: parts.symbol, key, parts, function: Box::from(GETTER_NAME), found });
-        Ok(())
+    /// met as [`GETTER_NAME`]. `alloc` is the caller's scratch for the entry until it is put.
+    pub fn getter(&mut self, alloc: Alloc<'_>) -> Result<(), CodeRecordError> {
+        self.special(crate::run::special::Special::Getter, alloc)
     }
 
     /// Instances whose entries were made by this walk.

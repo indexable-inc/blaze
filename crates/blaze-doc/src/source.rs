@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use base_db::Db;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use hir::{HirFileId, InFile};
 use std::alloc::Global;
 use syntax::{TextRange, TextSize, view as ast};
@@ -15,18 +15,18 @@ use crate::{
 
 pub(crate) struct Files {
     /// For each file: its crate's index, its index there and where its lines start.
-    by_file: HashMap<base_db::FileId, (usize, usize, Arc<[u32]>), Global>,
+    by_file: Map<base_db::FileId, (usize, usize, Arc<[u32]>), FixedState, Global>,
     /// Each crate's files, in the order of their indices.
     pub(crate) per_crate: Vec<Vec<SourceFile>>,
     /// The absolute path of every file, for warnings.
-    paths: HashMap<base_db::FileId, String, Global>,
+    paths: Map<base_db::FileId, String, FixedState, Global>,
 }
 
 impl Files {
     pub(crate) fn new(db: &Db, places: &Places) -> Files {
-        let mut by_file = HashMap::new_in(Global);
+        let mut by_file = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         let mut per_crate = vec![];
-        let mut paths = HashMap::new_in(Global);
+        let mut paths = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for (krate, documented) in places.crates.iter().enumerate() {
             let root_file = documented.krate.root_file(db);
             let base = path_of(db, root_file)

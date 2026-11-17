@@ -50,13 +50,16 @@ pub struct Profile {
     /// (blaze-cas `report().sealed` / `.checked`, store-next.md): the caller's to fill.
     pub segments_sealed: u32,
     pub segments_checked: u32,
-    /// The machine store under the home (remote-read.md, "One chain of stores"): records
-    /// found in it and written to it, its packs, and those read whole this command (their
-    /// first open in this boot). The caller's to fill.
-    pub machine_found: u32,
-    pub machine_put: u32,
-    pub machine_packs: u32,
-    pub machine_read_whole: u32,
+    /// The one store (drive.md, "The store under the command"): the open's nanoseconds, the
+    /// segments its head names and those mapped by the answer, and the probes gets made
+    /// (`store_probes` over `store_probe_gets` gets, `store_probes_most` the most one made).
+    /// The caller's to fill.
+    pub store_open_ns: u64,
+    pub store_named: u32,
+    pub store_mapped: u32,
+    pub store_probe_gets: u64,
+    pub store_probes: u64,
+    pub store_probes_most: u32,
     /// Scheduling (drive.md, "Scheduling on many cores"): tasks emitted, batches answered,
     /// coordinator steps, re-entries a worker made in place from the settled table.
     pub tasks: u32,
@@ -156,8 +159,13 @@ impl fmt::Display for Profile {
         )?;
         writeln!(
             f,
-            "machine      found {} written {}; packs {} read whole {}",
-            self.machine_found, self.machine_put, self.machine_packs, self.machine_read_whole,
+            "store open   {:.3} ms; segments mapped {} of {} named; probes a get {:.2} mean, {} most ({} gets)",
+            self.store_open_ns as f64 / 1e6,
+            self.store_mapped,
+            self.store_named,
+            if self.store_probe_gets == 0 { 0.0 } else { self.store_probes as f64 / self.store_probe_gets as f64 },
+            self.store_probes_most,
+            self.store_probe_gets,
         )?;
         writeln!(
             f,

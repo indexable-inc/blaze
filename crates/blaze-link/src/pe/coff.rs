@@ -22,7 +22,7 @@ use std::fmt::{self, Write as _};
 use blaze_bytes::le::{get_u16 as u16_at, get_u32 as u32_at, get_u64 as u64_at};
 use blaze_core::decimal::decimal;
 use blaze_graph::par;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::radix;
 use blaze_mem::scratch::{self, Lent};
 use object::LittleEndian as LE;
@@ -66,7 +66,7 @@ const NONE: u32 = u32::MAX;
 const ASSOCIATIVE: u32 = u32::MAX - 1;
 
 /// The DLL of each `__IMPORT_DESCRIPTOR_<lib>`, by that name.
-pub(crate) type Descriptors = HashMap<String, String, std::alloc::Global>;
+pub(crate) type Descriptors = Map<String, String, FixedState, std::alloc::Global>;
 
 /// What errors call an input: a file, or a member of an archive (`lib(member)`). Formatted only
 /// when an error is.

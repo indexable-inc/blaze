@@ -44,6 +44,9 @@ blaze-hash.workspace = true
 blaze-std = { workspace = true, features = ["requests"] }
 # `outline`: a file's text to its items, the `FileItems` task's work.
 blaze-file-items.workspace = true
+# `tokenize`: the literal `include_str!`/`include_bytes!` calls a file's outline lists as data
+# parts (data_include.rs).
+blaze-lex.workspace = true
 # A body's parse for its `BodyCheck` task: the entry blaze-lower's `lower_body` parses with.
 parser.workspace = true
 # `Edition`, `ItemDetail`, `ItemKind`: the outline's value types.
@@ -65,6 +68,9 @@ blaze-ladder.workspace = true
 # The run parent (run_parent.rs): the run wire to the launcher's run mode, the records' ISA, and
 # the BLAKE3 a record's file is named by (blaze-launch-rt `run_mode::Folder`).
 blaze-launch.workspace = true
+# `record::Symbol`: the entry line's symbol (blaze-ladder run/special.rs `EntryLine`), kept in
+# the start list's head (start_list.rs) and rebuilt from it.
+blaze-code = { path = "../blaze-code" }
 blaze-emit.workspace = true
 blaze-blake3.workspace = true
 # The shared cache's read path (remote-read.md): a named origin folder read by range, checked
@@ -110,6 +116,10 @@ blaze-http = { workspace = true, optional = true }
 blaze-core.workspace = true
 # A unit's and a refusal's words (`Show`), as blaze-fetch writes them.
 blaze-text.workspace = true
+# `check`'s lints (lints.rs): the rules over a file's lint units, their findings and words; the
+# root manifest's `[workspace.metadata.blaze] lints` step read with blaze-toml.
+blaze-lint.workspace = true
+blaze-toml.workspace = true
 
 [features]
 default = ["fetch", "sandbox"]

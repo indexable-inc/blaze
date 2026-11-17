@@ -17,7 +17,7 @@
 //! the global cache; else a frame is pushed. A fact the world does not have yet stops the whole
 //! evaluation (`Stop::Need`): every snapshot is rolled back and the caller retries the root.
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_own::{Alloc, Vec};
 
 use crate::assembly::{AStep, Added, Cand, Clause, Cx, Done, EnvId, Goal, Langs, Merger, Rule as CandRule, Source, Step, Via};
@@ -176,7 +176,7 @@ pub struct Solver<'a> {
     pub(crate) resps: Responses<'a>,
     env_clauses: Vec<Clause, Alloc<'a>>,
     env_rows: Vec<(u32, u32), Alloc<'a>>,
-    env_map: HashMap<u64, u32, Alloc<'a>>,
+    env_map: Map<u64, u32, FixedState, Alloc<'a>>,
     env_next: Vec<u32, Alloc<'a>>,
     env_words: Vec<u32, Alloc<'a>>,
     env_word_rows: Vec<(u32, u32), Alloc<'a>>,
@@ -199,7 +199,7 @@ pub struct Solver<'a> {
     universe: u32,
     limit: u32,
     /// The ground fast path's reads, by (term, marker trait) (solve.md (c)).
-    marker_reads: HashMap<(u32, u8), (u32, u32), Alloc<'a>>,
+    marker_reads: Map<(u32, u8), (u32, u32), FixedState, Alloc<'a>>,
     marker_pool: Vec<Read, Alloc<'a>>,
     /// Counters for the cost example and the tests.
     pub stats: Stats,
@@ -246,7 +246,7 @@ impl<'a> Solver<'a> {
             resps: Responses::new_in(alloc),
             env_clauses: Vec::new_in(alloc),
             env_rows: Vec::new_in(alloc),
-            env_map: HashMap::new_in(alloc),
+            env_map: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             env_next: Vec::new_in(alloc),
             env_words: Vec::new_in(alloc),
             env_word_rows: Vec::new_in(alloc),
@@ -268,7 +268,7 @@ impl<'a> Solver<'a> {
             langs: Langs::new(),
             universe: 0,
             limit: RECURSION_LIMIT,
-            marker_reads: HashMap::new_in(alloc),
+            marker_reads: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             marker_pool: Vec::new_in(alloc),
             stats: Stats::default(),
         }

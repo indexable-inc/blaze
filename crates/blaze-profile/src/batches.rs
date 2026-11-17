@@ -6,7 +6,7 @@
 use std::{alloc::Global, sync::OnceLock, time::Instant};
 
 use blaze_columns::{ColumnError, Texts, Values};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_own::Vec as Buf;
 
 pub use crate::columns::{Batch, BatchError};
@@ -54,13 +54,13 @@ fn options<T: blaze_columns::Native>(values: impl IntoIterator<Item = Option<T>>
 /// A dictionary column being built: each distinct number given a key the first time, its
 /// string looked up then.
 struct Dict {
-    keys_of: HashMap<u64, u32, Global>,
+    keys_of: Map<u64, u32, FixedState, Global>,
     values: Texts<Global>,
 }
 
 impl Dict {
     fn new() -> Dict {
-        Dict { keys_of: HashMap::new_in(Global), values: Texts::new_in(Global) }
+        Dict { keys_of: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), values: Texts::new_in(Global) }
     }
 
     fn key<T: AsRef<str>>(&mut self, number: u64, text: impl FnOnce() -> T) -> u32 {
@@ -80,13 +80,13 @@ impl Dict {
 
 /// A dictionary column being built over text: each distinct text given a key the first time.
 struct TextDict<'t> {
-    keys_of: HashMap<&'t str, u32, Global>,
+    keys_of: Map<&'t str, u32, FixedState, Global>,
     values: Texts<Global>,
 }
 
 impl<'t> TextDict<'t> {
     fn new() -> TextDict<'t> {
-        TextDict { keys_of: HashMap::new_in(Global), values: Texts::new_in(Global) }
+        TextDict { keys_of: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), values: Texts::new_in(Global) }
     }
 
     fn key(&mut self, text: &'t str) -> u32 {
@@ -313,7 +313,7 @@ fn nearest_tasks(open: &[OpenSpan]) -> impl Iterator<Item = Option<u64>> + '_ {
 /// ([`crate::symbols::frames`]).
 fn stack_columns<'s>(
     stacks: impl Iterator<Item = &'s [u64]>,
-    frames: &HashMap<u64, Vec<String>, Global>,
+    frames: &Map<u64, Vec<String>, FixedState, Global>,
 ) -> Result<[Column; 2], ColumnError> {
     let mut names = TextDict::new();
     // alloc: a batch's two list columns, once a read
@@ -349,7 +349,7 @@ fn stack_columns<'s>(
 /// ([`crate::clock::mono_ns`]).
 pub(crate) fn samples(
     samples: &[Sample],
-    frames: &HashMap<u64, Vec<String>, Global>,
+    frames: &Map<u64, Vec<String>, FixedState, Global>,
     at: (Instant, i64),
     process: Process<'_>,
 ) -> Result<Batch, BatchError> {
@@ -381,7 +381,7 @@ pub(crate) fn samples(
 /// of both clocks, as for [`samples`].
 pub(crate) fn alloc_samples(
     samples: &[crate::heap::HeapSample],
-    frames: &HashMap<u64, Vec<String>, Global>,
+    frames: &Map<u64, Vec<String>, FixedState, Global>,
     at: (Instant, i64),
     process: Process<'_>,
 ) -> Result<Batch, BatchError> {
@@ -392,7 +392,7 @@ pub(crate) fn alloc_samples(
 /// ([`crate::heap::held`]): [`alloc_samples`]' columns of each, then the reading's time.
 pub(crate) fn held_samples(
     samples: &[crate::heap::HeapSample],
-    frames: &HashMap<u64, Vec<String>, Global>,
+    frames: &Map<u64, Vec<String>, FixedState, Global>,
     at: (Instant, i64),
     read_ns: i64,
     process: Process<'_>,
@@ -406,7 +406,7 @@ fn heap_samples(
     table: &'static schema::Table,
     read_ns: Option<i64>,
     samples: &[crate::heap::HeapSample],
-    frames: &HashMap<u64, Vec<String>, Global>,
+    frames: &Map<u64, Vec<String>, FixedState, Global>,
     at: (Instant, i64),
     process: Process<'_>,
 ) -> Result<Batch, BatchError> {
@@ -905,7 +905,7 @@ mod tests {
             job: 5 << 32 | 3,
             fiber: 2,
         };
-        let frames: HashMap<u64, Vec<String>, Global> = [
+        let frames: Map<u64, Vec<String>, FixedState, Global> = [
             (0x10, &["typeck", "typeck::inlined"][..]),
             (0x20, &["build"][..]),
             (0x30, &["main"][..]),
@@ -945,7 +945,7 @@ mod tests {
             fiber: 0,
         };
         let process = Process { pid: 7, name: "blaze serve", commit: None };
-        let batch = samples(&[sample], &HashMap::new_in(Global), (now, 1_000), process).unwrap();
+        let batch = samples(&[sample], &Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), (now, 1_000), process).unwrap();
         for name in ["span_id", "build_id", "job", "fiber"] {
             assert!(column(&batch, &schema::SAMPLES, name).is_null(0), "{name}");
         }

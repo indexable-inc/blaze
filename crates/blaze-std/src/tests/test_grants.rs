@@ -216,3 +216,42 @@ fn a_test_run_once_replays_with_no_seed() {
     assert!(text.contains("\ntakes: cx alone\n") && text.contains("\nrun once: "), "{text}");
     assert_eq!(text.lines().last(), Some("replay: blaze test -p blaze-std tests::test_grants::pure -- --exact"));
 }
+
+/// A value whose drop counts itself in the cell it borrows.
+struct Counted<'c>(&'c Cell<u32>);
+
+impl Drop for Counted<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+    }
+}
+
+/// A test takes the heap as it takes any grant (D120): a blaze-own `Vec` grows in
+/// `heap.alloc()`, and a future pinned in `heap` itself runs to its value; both are dropped,
+/// each value once. The heap meets no fault, so the test runs once.
+/// Prints `test tests::test_grants::a_test_is_handed_the_heap_and_pins_a_future_in_it ... ok`.
+#[crate::test]
+fn a_test_is_handed_the_heap_and_pins_a_future_in_it(_cx: &Cx, heap: crate::mem::Heap) {
+    let dropped = Cell::new(0);
+    let mut values = crate::vec::Vec::new_in(heap.alloc());
+    values.push(Counted(&dropped));
+    values.push(Counted(&dropped));
+    assert_eq!(values.len(), 2);
+    drop(values);
+    assert_eq!(dropped.get(), 2, "the vector dropped each value once");
+
+    let counted = Counted(&dropped);
+    let mut pinned: core::pin::Pin<crate::boxed::Box<dyn Future<Output = u32> + '_, crate::mem::Heap>> =
+        crate::boxed::Box::pin_in(
+            async move {
+                let _counted = counted;
+                5u32
+            },
+            heap,
+        );
+    let mut context = core::task::Context::from_waker(core::task::Waker::noop());
+    assert_eq!(pinned.as_mut().poll(&mut context), core::task::Poll::Ready(5));
+    assert_eq!(dropped.get(), 3, "the future dropped what it held as it finished");
+    drop(pinned);
+    assert_eq!(dropped.get(), 3, "nothing is dropped twice");
+}

@@ -41,7 +41,7 @@ struct World {
 
 impl World {
     fn add(&mut self, fx: &Fx, item: ItemKey, text: &str, inputs: &[PTy], output: PTy) {
-        let adt = |_: ItemKey| Some(false);
+        let adt = |_: ItemKey| Some(0);
         let mut buf = SigBuf::new_in(alloc());
         if let Err(why) = read_signature(text, fx.t.view(), inputs, output, &adt, &mut buf, alloc()) {
             panic!("`{text}` was not read: {why:?}");
@@ -52,7 +52,7 @@ impl World {
 
 impl Facts for World {
     fn adt(&self, _: ItemKey) -> Option<AdtFacts> {
-        Some(AdtFacts { copy: self.copy, drop_impl: false, needs_drop: false, lifetimes: false, union: false, is_enum: false, is_box: false })
+        Some(AdtFacts { copy: self.copy, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: false, is_box: false })
     }
     fn callee(&self, k: ItemKey) -> Option<CalleeFacts> {
         Some(CalleeFacts { writes_lifetimes: k == self.keep, self_ref: false })

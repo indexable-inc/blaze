@@ -13,6 +13,8 @@ use crate::ty::{Ty, TyList, TyView, TypeCtx};
 use crate::world::World;
 
 pub(crate) mod adt;
+pub(crate) mod alias_path;
+pub(crate) mod args_inline;
 pub(crate) mod assoc_args;
 pub(crate) mod async_fmt;
 pub(crate) mod await_impl;
@@ -34,6 +36,7 @@ pub(crate) mod coroutine;
 pub(crate) mod expect_inputs;
 pub(crate) mod fallback;
 pub(crate) mod field;
+pub(crate) mod legacy_const;
 pub(crate) mod lit_path;
 pub(crate) mod method;
 pub(crate) mod obligation_site;

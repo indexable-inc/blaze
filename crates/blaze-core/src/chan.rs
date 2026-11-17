@@ -18,8 +18,9 @@
 //! kernel compares it in the step that blocks. The senders' and receivers' counts are
 //! `SeqCst`, so a disconnect is seen by a waiter's second look or wakes it.
 //!
-//! A wait is the signal span of the channel, named by its value type ([`signal_span`]), with
-//! its row in the wait-for graph. A rendezvous (capacity 0) is a slot under a [`raw::Mutex`]
+//! A wait is the signal span of the channel, named by its value type ([`signal_span`]), or by
+//! what the caller says it waits for ([`Receiver::recv_timeout_named`]), with its row in the
+//! wait-for graph. A rendezvous (capacity 0) is a slot under a [`raw::Mutex`]
 //! and a [`raw::Cond`]: it is for gates and handshakes, not throughput.
 //!
 //! Under `--cfg blaze_check` the atomics and the word's wait are the model checker's;
@@ -247,11 +248,13 @@ impl<T> Shared<T> {
         }
     }
 
-    fn recv(&self, deadline: Option<Instant>) -> Result<T, RecvTimeoutError> {
+    /// A receive whose wait's span is `name` ([`Shared::name`] unless the caller says what it
+    /// waits for).
+    fn recv(&self, name: &'static str, deadline: Option<Instant>) -> Result<T, RecvTimeoutError> {
         if let Flavor::Zero(zero) = &self.flavor {
-            return self.take_over(zero, deadline);
+            return self.take_over(zero, name, deadline);
         }
-        let got = self.sent.wait(Self::name(), deadline, || {
+        let got = self.sent.wait(name, deadline, || {
             if let Some(value) = self.pop() {
                 return Some(Ok(value));
             }
@@ -306,9 +309,14 @@ impl<T> Shared<T> {
     }
 
     /// A rendezvous receive: takes the slot's value, waiting for a send to put one.
-    fn take_over(&self, zero: &Rendezvous<T>, deadline: Option<Instant>) -> Result<T, RecvTimeoutError> {
+    fn take_over(
+        &self,
+        zero: &Rendezvous<T>,
+        name: &'static str,
+        deadline: Option<Instant>,
+    ) -> Result<T, RecvTimeoutError> {
         let left = deadline.map(|at| at.saturating_duration_since(Instant::now()));
-        signal_span(Self::name(), left, || {
+        signal_span(name, left, || {
             let mut hand = zero.hand.lock();
             hand.receiving += 1;
             let got = loop {
@@ -545,7 +553,7 @@ impl<T> Receiver<T> {
     /// The next value, waiting for one; refused once the channel is empty and every sender is
     /// gone.
     pub fn recv(&self) -> Result<T, RecvError> {
-        self.shared.recv(None).map_err(|_| RecvError)
+        self.shared.recv(Shared::<T>::name(), None).map_err(|_| RecvError)
     }
 
     /// The next value, if one is there now.
@@ -581,7 +589,13 @@ impl<T> Receiver<T> {
 
     /// [`Receiver::recv`], waiting until `deadline`.
     pub fn recv_deadline(&self, deadline: Instant) -> Result<T, RecvTimeoutError> {
-        self.shared.recv(Some(deadline))
+        self.shared.recv(Shared::<T>::name(), Some(deadline))
+    }
+
+    /// [`Receiver::recv_timeout`], its wait's span named `what` (what the caller waits for)
+    /// instead of the value's type (rule every-wait-says-what).
+    pub fn recv_timeout_named(&self, what: &'static str, within: Duration) -> Result<T, RecvTimeoutError> {
+        self.shared.recv(what, Some(Instant::now() + within))
     }
 
     /// Each value as it arrives, until the channel is disconnected.

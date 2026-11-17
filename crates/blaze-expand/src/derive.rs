@@ -244,47 +244,9 @@ struct W<'w, 'c, 'a> {
 type Written = Result<(), ExpandError>;
 
 impl<'a> W<'_, '_, 'a> {
-    /// Writes `code`, made: a run of letters, digits, `_` and `$` is an identifier (`$crate`
-    /// one), each other character a punct, joined to the next when that is a punct too, and a
-    /// bracket a group's delimiter. Spaces only separate. `code` is ASCII.
+    /// Writes `code`, made def-site ([`Out::made_code`]).
     fn code(&mut self, code: &str) -> Written {
-        let bytes = code.as_bytes();
-        let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$';
-        let delim = |byte: u8| b"()[]{}".contains(&byte);
-        let mut at = 0;
-        while let Some(&byte) = bytes.get(at) {
-            if byte == b' ' {
-                at += 1;
-                continue;
-            }
-            if word(byte) {
-                let start = at;
-                while bytes.get(at).is_some_and(|&it| word(it)) {
-                    at += 1;
-                }
-                let ident = TokenKind::Ident { raw: Raw::No, spacing: Spacing::Alone };
-                self.out.made(ident, &code[start..at], MADE)?;
-                continue;
-            }
-            let kind = match byte {
-                b'(' => TokenKind::Open(Delim::Paren),
-                b')' => TokenKind::Close(Delim::Paren),
-                b'[' => TokenKind::Open(Delim::Bracket),
-                b']' => TokenKind::Close(Delim::Bracket),
-                b'{' => TokenKind::Open(Delim::Brace),
-                b'}' => TokenKind::Close(Delim::Brace),
-                _ => {
-                    let joined = bytes.get(at + 1).is_some_and(|&next| {
-                        next.is_ascii_punctuation() && !word(next) && !delim(next)
-                    });
-                    let spacing = if joined { Spacing::Joint } else { Spacing::Alone };
-                    TokenKind::Punct { char: char::from(byte), spacing }
-                }
-            };
-            self.out.made(kind, "", MADE)?;
-            at += 1;
-        }
-        Ok(())
+        self.out.made_code(code, MADE)
     }
 
     /// The item's token at `at`.
@@ -644,7 +606,21 @@ impl<'a> W<'_, '_, 'a> {
         };
         self.header("$crate::default::Default", bound, false)?;
         self.code("{ fn default() -> Self {")?;
-        self.variant(v, |w, _| w.code("$crate::default::Default::default()"))?;
+        let fields = &adt.fields[v.fields.clone()];
+        if v.kind == FieldsKind::Record && fields.iter().any(|f| f.defaulted) {
+            // A field's declared default is its value (RFC 3681, as rustc's derive): each other
+            // field is `Default::default()`, and `..` with no base takes the declared ones.
+            self.path(v)?;
+            self.code("{")?;
+            // A record field always has its name (adt.rs `fields` refuses one without).
+            for name in fields.iter().filter(|f| !f.defaulted).filter_map(|f| f.name) {
+                self.input(name)?;
+                self.code(": $crate::default::Default::default(),")?;
+            }
+            self.code(".. }")?;
+        } else {
+            self.variant(v, |w, _| w.code("$crate::default::Default::default()"))?;
+        }
         self.code("} }")
     }
 

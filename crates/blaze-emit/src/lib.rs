@@ -52,7 +52,12 @@
 //! A compound of two integer or pointer members (the result of an overflow operation, of
 //! `cmpxchg`, or of a call returning two integers) lives in its 16-byte cell: member `k` at
 //! byte `8 * k`, each zero-extended as above. `project` loads one member. A block argument of
-//! such a type moves both words. Any other compound is refused by name.
+//! such a type moves both words.
+//!
+//! A wide pair, `{i128, iN}` with N at most 64 (the result of a 128-bit overflow operation),
+//! takes 24 bytes: the `i128` in its cell (pass/wide.rs), member 1 in a third word placed
+//! after all the cells, one 16-byte step per wide pair. A block argument of it moves all three
+//! words. Any other compound is refused by name.
 //!
 //! # Calls and signatures (AAPCS64; Apple's variant on macOS)
 //!
@@ -148,7 +153,7 @@
 //! Promise and hint flags are dropped (they only allow UB or say nothing); `volatile` on a
 //! load, store or atomic is honoured (each is one access of its width), atomic orderings as
 //! above. Refused by name: floats, vectors, `i128`, compounds other than integer pairs,
-//! more than 8 integer arguments (the rest go on the stack), a C-variadic definition, a
+//! (arguments past `x7`/`v7` go on the stack, both ways: pass/stack.rs), a C-variadic definition, a
 //! variable argument narrower than 32 bits, an `f32`, an `i128` or a compound, more than 510
 //! stacked or stacked under an `invoke`, more than two returns, a `volatile` bulk
 //! operation, `memcmp`, `uninit`, `invoke` and unwinding, tail calls, `asm!`, target
@@ -213,6 +218,10 @@ mod abi_tests;
 
 #[cfg(test)]
 mod variadic_tests;
+
+/// Arguments past the registers, both sides (pass/stack.rs).
+#[cfg(test)]
+mod stack_tests;
 
 #[cfg(test)]
 mod tls_tests;
@@ -410,17 +419,39 @@ pub struct Reloc {
     pub addend: i64,
 }
 
+/// A 4-byte field of the code that placement fills with a source position (rule 71: the code
+/// holds zero there, and the item and the byte in its text, never a line or a column): the
+/// line or the column (each from 1, the column in chars) of byte `site` of item `item`'s
+/// text, little-endian. A data row's `DataPositionRec`, placed with the row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PositionFix {
+    /// The field's offset from the code's first byte (4-byte aligned only if its row put it so).
+    pub at: u32,
+    /// The item's key (blaze-typeck `ItemKey`).
+    pub item: u128,
+    /// The byte offset in the item's text.
+    pub site: u32,
+    pub field: blaze_lir::PositionField,
+}
+
 /// One function's machine code.
 pub struct Code<A: Allocator> {
     pub bytes: Vec<u8, A>,
     pub fixups: Vec<Fixup, A>,
     /// Absolute address words placement fills (after the fixups, in any order).
     pub relocs: Vec<Reloc, A>,
+    /// Source position fields placement fills, by offset.
+    pub positions: Vec<PositionFix, A>,
 }
 
 impl<A: Allocator + Clone> Code<A> {
     pub fn new_in(alloc: A) -> Code<A> {
-        Code { bytes: Vec::new_in(alloc.clone()), fixups: Vec::new_in(alloc.clone()), relocs: Vec::new_in(alloc) }
+        Code {
+            bytes: Vec::new_in(alloc.clone()),
+            fixups: Vec::new_in(alloc.clone()),
+            relocs: Vec::new_in(alloc.clone()),
+            positions: Vec::new_in(alloc),
+        }
     }
 }
 
@@ -440,6 +471,11 @@ pub enum EmitError {
     /// The record form ([`emit_record`]) has no import site or relro word for something the
     /// function names: refused, never emitted as a literal word.
     Record { why: &'static str },
+    /// blaze-lir's legalize refused the function before the pass: the literal-word form
+    /// ([`emit`]) takes legalized LIR as the record form does (a vector made scalar, `f16`
+    /// widened), and binds no soft-float routine, so an `f128` operation is refused here naming
+    /// its routine ([`blaze_lir::legalize::LegalizeError::NoRoutine`]).
+    Legalize(blaze_lir::legalize::LegalizeError),
 }
 
 impl fmt::Display for EmitError {
@@ -453,6 +489,7 @@ impl fmt::Display for EmitError {
             EmitError::Signature { why } => write!(f, "the function's signature: the baseline tier does not emit {why}"),
             EmitError::Data { row, why } => write!(f, "data row {row}: the baseline tier does not place {why}"),
             EmitError::Record { why } => write!(f, "the code record form (run.md, \"The code record\") does not emit {why}"),
+            EmitError::Legalize(why) => why.fmt(f),
         }
     }
 }
@@ -478,5 +515,17 @@ pub(crate) fn emit_inline_up_to<A: Allocator>(
     out.bytes.clear();
     out.fixups.clear();
     out.relocs.clear();
-    pass::run(func, via, isa, inline_most, &mut out.bytes, &mut out.fixups, &mut out.relocs, None)
+    out.positions.clear();
+    // The pass takes legalized LIR in both forms (record.rs `emit_record_up_to` does the same
+    // with the caller's routines): a function holding a vector, `f16` or `f128` value is made
+    // scalar on a copy first, in `Global` (the scratch the pass names for its own rows). No
+    // routine is bound here, and legalize adds no reference row, so `via` (one entry per
+    // reference place) still covers every reference of the copy.
+    let heap = blaze_own::Erased::new(std::alloc::Global);
+    let (legal, _none) = routines::legalized(func, &RoutinePlaces::NONE, heap.handle()).map_err(EmitError::Legalize)?;
+    let func = match &legal {
+        None => func,
+        Some(owned) => owned.view(),
+    };
+    pass::run(func, via, isa, inline_most, &mut out.bytes, &mut out.fixups, &mut out.relocs, &mut out.positions, None)
 }

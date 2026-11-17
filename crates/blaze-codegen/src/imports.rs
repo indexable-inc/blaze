@@ -104,8 +104,8 @@ impl std::error::Error for ImportError {}
 /// not of the function), so a build that does not close its summaries gets no whole-program
 /// facts, never wrong ones.
 pub fn close(
-    summaries: &mut HashMap<InstanceKey, Summary, Global>,
-    outside: &HashSet<InstanceKey, Global>,
+    summaries: &mut Map<InstanceKey, Summary, FixedState, Global>,
+    outside: &Set<InstanceKey, FixedState, Global>,
 ) {
     for (key, summary) in summaries {
         summary.external = outside.contains(key);
@@ -124,9 +124,9 @@ pub fn close(
 /// whatever the map's history. Each importer's imports are chosen on its own, in parallel,
 /// into the worker's scratch.
 pub fn decide(
-    summaries: &HashMap<InstanceKey, Summary, Global>,
+    summaries: &Map<InstanceKey, Summary, FixedState, Global>,
     limits: &Limits,
-) -> Result<HashMap<InstanceKey, Imports, Global>, ImportError> {
+) -> Result<Map<InstanceKey, Imports, FixedState, Global>, ImportError> {
     let graph = Graph::of(summaries)?;
     let attrs = graph.attrs();
     let constants = graph.constants();
@@ -205,7 +205,7 @@ struct Graph<'a> {
 impl<'a> Graph<'a> {
     /// The columns of `summaries`, checking each as it goes, in key order: the first
     /// inconsistency in that order is the error.
-    fn of(summaries: &'a HashMap<InstanceKey, Summary, Global>) -> Result<Graph<'a>, ImportError> {
+    fn of(summaries: &'a Map<InstanceKey, Summary, FixedState, Global>) -> Result<Graph<'a>, ImportError> {
         let len = summaries.len();
         assert!(len < NONE as usize, "more than 2^32 - 1 summaries");
         // alloc: one exact-size column per build
@@ -663,11 +663,11 @@ mod tests {
         }
     }
 
-    fn build(summaries: Vec<Summary>) -> HashMap<InstanceKey, Summary, Global> {
+    fn build(summaries: Vec<Summary>) -> Map<InstanceKey, Summary, FixedState, Global> {
         summaries.into_iter().map(|it| (it.key, it)).collect()
     }
 
-    fn decided(summaries: Vec<Summary>) -> HashMap<InstanceKey, Imports, Global> {
+    fn decided(summaries: Vec<Summary>) -> Map<InstanceKey, Imports, FixedState, Global> {
         decide(&build(summaries), &Limits::default()).unwrap()
     }
 
@@ -802,7 +802,13 @@ mod tests {
             decide(&summaries, &Limits::default()).unwrap()[&key(2)].constants,
             vec![(0, int(4))]
         );
-        close(&mut summaries, &HashSet::from_iter_in([key(2)], Global));
+        close(&mut summaries, &{
+            let iter = IntoIterator::into_iter([key(2)]);
+            let capacity = Some(iter.size_hint().0);
+            let mut set = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity });
+            set.extend(iter);
+            set
+        });
         assert!(summaries[&key(2)].external && !summaries[&key(1)].external);
         assert_eq!(decide(&summaries, &Limits::default()).unwrap()[&key(2)].constants, vec![]);
     }
@@ -929,13 +935,13 @@ mod tests {
         }
         let forward = decided(summaries.clone());
         summaries.reverse();
-        let mut map = HashMap::new_in(Global);
+        let mut map = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for it in summaries.iter().cloned() {
             map.insert(it.key, it);
         }
         let backward = decide(&map, &Limits::default()).unwrap();
         // Another capacity, so another iteration order of the same keys.
-        let mut wide = HashMap::with_capacity_in(4_096, Global);
+        let mut wide = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(4_096) });
         wide.extend(summaries.iter().map(|it| (it.key, it.clone())));
         let widened = decide(&wide, &Limits::default()).unwrap();
         assert_eq!(forward, backward);
@@ -957,7 +963,7 @@ mod tests {
             }
             summaries.push(it);
         }
-        let mut map = HashMap::with_capacity_in(1_024, Global);
+        let mut map = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(1_024) });
         map.extend(summaries.into_iter().map(|it| (it.key, it)));
         assert_eq!(
             decide(&map, &Limits::default()),
@@ -1078,7 +1084,7 @@ mod tests {
         let mut decided = 0;
         for case in 0..2_000 {
             let (summaries, limits) = random(&mut seeded);
-            let hashed: HashMap<InstanceKey, Summary, Global> =
+            let hashed: Map<InstanceKey, Summary, FixedState, Global> =
                 summaries.iter().map(|(key, it)| (*key, it.clone())).collect();
             let new = decide(&hashed, &limits).map(|it| it.into_iter().collect::<BTreeMap<_, _>>());
             let old = model::decide(&summaries, &limits);

@@ -17,7 +17,7 @@
 //! (`NoAssociatedItem`, `CandidateTraitNote`) and `compiler/rustc_parse/src/parser/item.rs`
 //! (`inject_use_span`) (MIT or Apache-2.0).
 
-use blaze_hash::HashSet;
+use blaze_hash::{FixedState, Set, SetOpts};
 use blaze_items::{Fact, ItemId};
 use hir::{AsAssocItem as _, HasVisibility as _, InFile};
 use std::alloc::Global;
@@ -259,8 +259,8 @@ impl TraitIndex {
 
     /// The traits with an associated item whose name is within `max_dist` edits of `lookup`
     /// and is not `lookup`: the only traits whose items [`similar_candidate`] keeps.
-    fn with_item_close_to(&self, lookup: &str, max_dist: usize) -> HashSet<hir_def::TraitId, Global> {
-        let mut close = HashSet::new_in(Global);
+    fn with_item_close_to(&self, lookup: &str, max_dist: usize) -> Set<hir_def::TraitId, FixedState, Global> {
+        let mut close = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
         for (name, traits) in &self.by_item {
             if edit_distance_with_substrings(lookup, name.as_str(), max_dist)
                 .is_some_and(|it| it > 0)
@@ -977,7 +977,7 @@ fn trait_applies<'db>(
         return false;
     }
     // alloc: the error's parts, for an error hir found
-    let traits: HashSet<hir_def::TraitId, Global> = std::iter::once(t.into()).collect();
+    let traits: Set<hir_def::TraitId, FixedState, Global> = std::iter::once(t.into()).collect();
     let of_trait = |item: hir::AssocItem| {
         (item.container_or_implemented_trait(cx.db) == Some(t)).then_some(())
     };

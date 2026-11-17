@@ -14,40 +14,20 @@ compiles is parked: it stays on disk, unedited but for dependency lines on delet
 listed in the root Cargo.toml's `exclude`. A crate leaves this list when it compiles again on
 the new layer; delete its line here then.
 
+On 2026-11-16 the old layer's crates themselves were deleted (every `crates/hir-*`, base-db, mbe,
+proc-macro-api, blaze-unitkey, cfg, syntax-bridge, tt, and then blaze-codegen-code); their rows
+are gone from this list and they are in git history. The LLVM and clang pins that lived in
+hir-ty-codegen are now `crates/blaze-toolchain/pins/llvm.json` and
+`crates/blaze-toolchain/pins/clang.json`. Ten parked crates below, blaze-cargo,
+blaze-diagnostics, blaze-doc, blaze-global, blaze-item-hash, blaze-items, blaze-macro-eval,
+blaze-shader, blaze-stencil and blaze-usercode, depended on the deleted crates and cannot build
+as they are: each is to be rewritten on the new layer, not reconnected.
+
 Many of them used blaze-query only for its fact kinds (`QueryKind`, `QueryKey`) or its `carry`;
-those uses wait on the records of the new layer's keys. A test that linked `hir` for hir-ty-mir's
-MIR table links hir-ty-mir itself now.
+those uses wait on the records of the new layer's keys.
 
 ## Waiting on the new item layer (Items, Source; design/bottom.md)
 
-- `crates/base-db`: rewritten over the records (design/reconnect.md): the task's `Db`,
-  `Records`, `Need`, the `Crate` input, gifts and the include table; awaiting its first compile.
-- `crates/hir-expand`: its lib, files, attrs, proc-macro and cfg modules restored and moved onto
-  the new `Db` (no expansion-read log, no edit, proc macros as gifts); its first compile's 13
-  errors (batch 13) fixed against mbe without `db` and `Crate::proc_macro_cwd`, a base-db
-  input; the hygiene and span-map tests are `cfg(any())` until `fixture::db` over an in-memory
-  `Records` exists.
-- `crates/hir-def`: on the records: ids from item keys (`key`), the `nameres` facade (scope
-  probes, path resolution, extern prelude and lang items from `CrateGraph`/`LangItems`), the
-  resolver and expression scopes, trait and impl items (the `KeyIndex` stand-in), module
-  impls, crate attributes, signatures and bodies from text with a typed stop for a crate
-  without it, def-site hygiene with the context table passed in. Awaiting its first compile.
-  Stops, each naming a missing record (design/reconnect.md): block scopes, expansions, the
-  textual macro scope at a position, `as _` imports, attributes and signatures of a crate
-  without text, diagnostic items outside module scopes. Parked tests: the persisted-tree
-  test that read the deleted signature table (item_tree/persist.rs).
-- `crates/mbe`: takes `&base_db::Db`; waits on base-db's replacement.
-- `crates/proc-macro-api`: the expansion store and bridge blaze-macro-eval speaks; on base-db,
-  hir-expand.
-- `crates/hir-lint-levels`: lint levels that change what a program does (const eval), read by
-  hir-ty-mir and hir-ty-unsafeck; on base-db, hir-def, hir-expand.
-- `crates/hir-ty` and every checker on it (`crates/hir-ty-borrowck`, `crates/hir-ty-coherence`,
-  `crates/hir-ty-comptime`, `crates/hir-ty-identity`, `crates/hir-ty-lean`, `crates/hir-ty-linear`,
-  `crates/hir-ty-matchck`, `crates/hir-ty-mir`, `crates/hir-ty-print`, `crates/hir-ty-pure`,
-  `crates/hir-ty-share`, `crates/hir-ty-specialization`, `crates/hir-ty-suspend`,
-  `crates/hir-ty-tailck`, `crates/hir-ty-ub`, `crates/hir-ty-unsafeck`, `crates/hir-ty-wfcheck`):
-  hir-def, hir-expand and blaze-query's fact kinds; to ask through `Items` and `Source`.
-- `crates/hir-ty-codegen`: hir-ty, blaze-codegen, blaze-stencil, blaze-query.
 - `crates/blaze-items`: item keys, layouts and code hashes that hir-ty-identity, hir-ty-pure,
   hir-ty-share, hir-ty-codegen, blaze-codegen and the launcher crates read; on hir-def, hir-ty,
   blaze-query. Its keys move to blaze-id; what codegen keys on stays until then.

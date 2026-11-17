@@ -340,6 +340,52 @@ fn a_field_moved_out_of_a_box_drops_the_rest_then_frees() {
     assert_eq!(run(&planted, moved).as_slice(), &[5, 6], "control: the box never freed");
 }
 
+/// The contents moved out of a TEMPORARY box (`let x = *mk(3);`, bytes' `let shared =
+/// *Box::from_raw(shared);`): the box is freed alone at its statement's end (its temporary
+/// scope), the contents dropped once, by their new owner, at the block's end.
+/// ```text
+/// (a) { let x = *mk(3); let k = G{9}; }       the free, then k (9), then x (3)    [100, 9, 3]
+/// (b) { let x = *mk(3); let y = *mk(4); }     each box freed at its own statement's end:
+///        free, free, then y (4), x (3)                                        [100, 100, 4, 3]
+/// ```
+/// CONTROLS: `Planted::MovedBoxDroppedWhole` (the temporary box dropped by its whole glue)
+/// gives (a) `[3, 100, 9, 3]`, a double drop of what moved out; `Planted::MovedBoxNotFreed`
+/// gives (a) `[9, 3]`, a leak. Prints nothing; passes as
+/// "test tests::box_moves::a_temporary_box_moved_out_frees_at_its_statement_end ... ok".
+#[test]
+fn a_temporary_box_moved_out_frees_at_its_statement_end() {
+    let (w, _) = box_world(false);
+    // `*mk(<x>)`.
+    let star_mk = |b: &mut BodyBuf, x: u128| {
+        let lit = b.int(x, None);
+        let call = b.call("mk", &[lit]);
+        b.e(Expr::Unary { op: blaze_typeck::UnOp::Deref, operand: call })
+    };
+    let then_k = |b: &mut BodyBuf| {
+        let mut stmts: Vec<Stmt, Global> = Vec::new_in(Global);
+        let s = star_mk(b, 3);
+        stmts.push(let_(b, "x", s));
+        let g9 = g_lit(b, 9);
+        stmts.push(let_(b, "k", g9));
+        b.block(&stmts, None)
+    };
+    assert_eq!(run(&w, then_k).as_slice(), &[FREED, 9, 3], "(a) a temporary box moved out");
+    let two = |b: &mut BodyBuf| {
+        let mut stmts: Vec<Stmt, Global> = Vec::new_in(Global);
+        let s = star_mk(b, 3);
+        stmts.push(let_(b, "x", s));
+        let s = star_mk(b, 4);
+        stmts.push(let_(b, "y", s));
+        b.block(&stmts, None)
+    };
+    assert_eq!(run(&w, two).as_slice(), &[FREED, FREED, 4, 3], "(b) two temporary boxes moved out");
+    let mut planted = box_world(false).0;
+    planted.planted = crate::Planted::MovedBoxDroppedWhole;
+    assert_eq!(run(&planted, then_k).as_slice(), &[3, FREED, 9, 3], "control: the temporary box dropped whole");
+    planted.planted = crate::Planted::MovedBoxNotFreed;
+    assert_eq!(run(&planted, then_k).as_slice(), &[9, 3], "control: the temporary box never freed");
+}
+
 /// The cleanup of a call that unwinds after a move out of a box drops what the normal exit
 /// drops at that point, by the same walk: `{ let b = mk(3); let x = *b; f(); }` under
 /// `Panic::Unwind`. In `main`'s LIR: `drop_in_place::<Box<G>>` is never named (the box is

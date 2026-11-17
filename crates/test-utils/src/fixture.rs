@@ -64,7 +64,7 @@
 
 use std::iter;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use std::alloc::Global;
 use stdx::trim_indent;
 
@@ -119,7 +119,7 @@ pub struct Fixture {
     /// Specifies environment variables.
     ///
     /// Syntax: `env:PATH=/bin,RUST_LOG=debug`
-    pub env: HashMap<String, String, Global>,
+    pub env: Map<String, String, FixedState, Global>,
     /// Specifies extra crate-level attributes injected at the top of the crate root file.
     /// This must be used with `crate` meta.
     ///
@@ -304,7 +304,7 @@ impl FixtureWithProjectMeta {
         let mut extern_prelude = None;
         let mut edition = None;
         let mut cfgs = Vec::new();
-        let mut env = HashMap::new_in(Global);
+        let mut env = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         let mut introduce_new_source_root = None;
         let mut library = false;
         let mut lang = false;

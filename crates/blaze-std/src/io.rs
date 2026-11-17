@@ -312,6 +312,10 @@ struct World {
     /// What standard output and standard error are drawn on, read through the backend at the
     /// first ask ([`Io::tty`]) and kept.
     ttys: [Option<crate::term::Tty>; 2],
+    /// What was said on standard output and standard error and not yet written, in that
+    /// order ([`crate::out`], "Buffering"): inline, so the buffer is part of the world's one
+    /// allocation, and one a world, so every `Out` of it keeps its lines in order.
+    pending: [crate::out::Pending; 2],
     /// How many folders above the root were granted ([`Io::above_most`]).
     above: u8,
     /// The simulated host behind the capabilities blaze-core has no effect for: `None` in a
@@ -736,6 +740,78 @@ impl Io {
     }
 }
 
+/// A world's standard error as a `core::fmt::Write`, each piece one raw write: what an exit
+/// says a refused flush with, allocating nothing.
+struct RawErr<'a>(&'a Io);
+
+impl core::fmt::Write for RawErr<'_> {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        match self.0.write_out(Stream::Err, &[text.as_bytes()]) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(core::fmt::Error),
+        }
+    }
+}
+
+/// Where `stream`'s per-stream state sits in a world's pairs (`ttys`, `pending`,
+/// `SimHost::writes`).
+fn stream_at(stream: Stream) -> usize {
+    match stream {
+        Stream::Out => 0,
+        Stream::Err => 1,
+    }
+}
+
+/// Whether `stream` is drawn on a terminal, from a world's borrowed parts: what [`Io::tty`]
+/// answers, for a caller that holds the lock already.
+fn is_terminal(
+    driver: &mut Backend,
+    hosted: &Option<Box<SimHost>>,
+    ttys: &mut [Option<crate::term::Tty>; 2],
+    stream: Stream,
+) -> bool {
+    let at = stream_at(stream);
+    let tty = match hosted.as_deref() {
+        Some(host) => host.ttys[at],
+        None => *ttys[at].get_or_insert_with(|| driver.tty(stream)),
+    };
+    matches!(tty, crate::term::Tty::Terminal(_))
+}
+
+/// `parts` on `stream` as one write, with nothing before it: the simulated host keeps and
+/// counts it ([`SimHost::writes`]), a real world's backend makes it.
+fn emit(driver: &mut Backend, hosted: &mut Option<Box<SimHost>>, stream: Stream, parts: &[&[u8]]) -> Result<(), String> {
+    match hosted.as_deref_mut() {
+        Some(host) => {
+            host.writes[stream_at(stream)] += 1;
+            let kept = match stream {
+                Stream::Out => &mut host.out,
+                Stream::Err => &mut host.err,
+            };
+            for part in parts {
+                kept.extend_from_slice(part);
+            }
+            Ok(())
+        }
+        None => driver.write_out(stream, parts),
+    }
+}
+
+/// A buffer's write ([`crate::out::Pending`]): recorded as the span `bstd.out.write` opened
+/// inside `parent`, then made. Recorded here, under the lock the write holds, so an append
+/// that writes nothing records nothing and takes the lock once.
+fn written(
+    driver: &mut Backend,
+    hosted: &mut Option<Box<SimHost>>,
+    trace: &mut Trace,
+    stream: Stream,
+    parent: &'static str,
+    parts: &[&[u8]],
+) -> Result<(), String> {
+    trace.push(Record { at: driver.now(), span: "bstd.out.write", kind: RecordKind::Opened { parent } });
+    emit(driver, hosted, stream, parts)
+}
+
 impl World {
     fn new(start: Start) -> World {
         let Start { driver, seed, above, env: _, args: _, host, offers: _, limits, hosted, disk, plant: _ } = start;
@@ -762,6 +838,7 @@ impl World {
             host,
             exited: None,
             ttys: [None; 2],
+            pending: [crate::out::Pending::new(), crate::out::Pending::new()],
             hosted,
             disk,
         }
@@ -983,7 +1060,8 @@ impl Io {
         }
     }
 
-    /// `parts`, in order, on this world's `stream`, as one write: kept by the simulated host
+    /// `parts`, in order, on this world's `stream`, now: what the stream's buffer holds is
+    /// written first (one write), then `parts` as one write. Kept by the simulated host
     /// ([`SimHost::out`], [`SimHost::err`]), or written to the process's by `rt`.
     /// A hosted run's goes straight to its host's `write` ([`crate::guest::write_to`]).
     pub(crate) fn write_out(&self, stream: Stream, parts: &[&[u8]]) -> Result<(), String> {
@@ -995,20 +1073,63 @@ impl Io {
             };
         }
         let mut world = self.world().lock();
-        let World { driver, hosted, .. } = &mut *world;
-        match hosted.as_deref_mut() {
-            Some(host) => {
-                let kept = match stream {
-                    Stream::Out => &mut host.out,
-                    Stream::Err => &mut host.err,
-                };
-                for part in parts {
-                    kept.extend_from_slice(part);
-                }
-                Ok(())
+        let World { driver, hosted, pending, trace, .. } = &mut *world;
+        pending[stream_at(stream)]
+            .flush(&mut |held: &[&[u8]]| written(&mut *driver, &mut *hosted, &mut *trace, stream, "bstd.io.write_out", held))?;
+        emit(driver, hosted, stream, parts)
+    }
+
+    /// `bytes` appended to `stream`'s buffer ([`crate::out`], "Buffering"), which is written
+    /// when full; `end` when they end a call, which writes it when the stream is a terminal.
+    /// Each write is recorded as the span `bstd.out.write` inside `parent`. A hosted run holds
+    /// no buffer: its bytes go to its host as they come, as one write each.
+    pub(crate) fn put_out(&self, stream: Stream, parent: &'static str, bytes: &[u8], end: bool) -> Result<(), String> {
+        if let Reach::Hosted = self.reach {
+            if bytes.is_empty() {
+                return Ok(());
             }
-            None => driver.write_out(stream, parts),
+            return self.write_out(stream, &[bytes]);
         }
+        let at = stream_at(stream);
+        let mut world = self.world().lock();
+        let World { driver, hosted, ttys, pending, trace, .. } = &mut *world;
+        let terminal = end && is_terminal(&mut *driver, &*hosted, &mut *ttys, stream);
+        let mut write =
+            |parts: &[&[u8]]| -> Result<(), String> { written(&mut *driver, &mut *hosted, &mut *trace, stream, parent, parts) };
+        pending[at].put(bytes, &mut write)?;
+        if terminal {
+            pending[at].flush(&mut write)?;
+        }
+        Ok(())
+    }
+
+    /// What `stream`'s buffer holds, written now as one write (recorded inside `parent`);
+    /// nothing when it is empty or the world is a hosted run's, which holds none.
+    pub(crate) fn flush_out(&self, stream: Stream, parent: &'static str) -> Result<(), String> {
+        if let Reach::Hosted = self.reach {
+            return Ok(());
+        }
+        let mut world = self.world().lock();
+        let World { driver, hosted, pending, trace, .. } = &mut *world;
+        pending[stream_at(stream)].flush(&mut |parts: &[&[u8]]| written(&mut *driver, &mut *hosted, &mut *trace, stream, parent, parts))
+    }
+
+    /// Both streams' buffers written, standard output first; both are tried, and the first
+    /// refusal is the error. What the entry calls when `main` ends, and [`Io::exit`].
+    pub(crate) fn flush_streams(&self, parent: &'static str) -> Result<(), crate::out::OutError> {
+        let out = self.flush_out(Stream::Out, parent);
+        let err = self.flush_out(Stream::Err, parent);
+        match (out, err) {
+            (Err(said), _) => Err(crate::out::OutError { stream: Stream::Out, why: crate::out::OutWhy::Host(said) }),
+            (Ok(()), Err(said)) => Err(crate::out::OutError { stream: Stream::Err, why: crate::out::OutWhy::Host(said) }),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    /// How many bytes `stream`'s buffer holds: a test's view of what is not written yet.
+    #[cfg(test)]
+    pub(crate) fn held_out(&self, stream: Stream) -> usize {
+        self.world().lock().pending[stream_at(stream)].held()
     }
 
     /// What `stream` is drawn on, read through the backend once and kept: a simulated world's
@@ -1263,9 +1384,34 @@ impl Io {
 
     /// `f` on the simulated host, for a test to script what its devices will say and read
     /// what was done to them, and for the capabilities it answers; `None` in a real world,
-    /// which has no provider for them.
+    /// which has no provider for them. What the streams' buffers hold is handed to the host
+    /// first (a write each, as a flush makes), so `f` reads all that was said, in order.
     pub fn script<R>(&self, f: impl FnOnce(&mut SimHost) -> R) -> Option<R> {
-        self.world().lock().hosted.as_deref_mut().map(f)
+        let mut world = self.world().lock();
+        let World { driver, hosted, pending, trace, .. } = &mut *world;
+        let host = hosted.as_deref_mut()?;
+        for stream in [Stream::Out, Stream::Err] {
+            let held = &mut pending[stream_at(stream)];
+            if held.held() == 0 {
+                continue;
+            }
+            // A simulated host takes every write, so this flush cannot fail: the closure says
+            // so in its type.
+            let kept: Result<(), core::convert::Infallible> = held.flush(&mut |parts: &[&[u8]]| {
+                trace.push(Record { at: driver.now(), span: "bstd.out.write", kind: RecordKind::Opened { parent: "bstd.io.script" } });
+                host.writes[stream_at(stream)] += 1;
+                let kept = match stream {
+                    Stream::Out => &mut host.out,
+                    Stream::Err => &mut host.err,
+                };
+                for part in parts {
+                    kept.extend_from_slice(part);
+                }
+                Ok(())
+            });
+            let Ok(()) = kept;
+        }
+        Some(f(host))
     }
 
     /// `f` on the simulation, for a test to change the world (advance the clock, fail syncs,
@@ -1320,12 +1466,22 @@ impl Io {
     }
 
     /// The process ends with `status`: a real one exits; the simulated one remembers it and
-    /// unwinds the calling task with an [`Exit`] payload.
+    /// unwinds the calling task with an [`Exit`] payload. What the streams' buffers hold is
+    /// written first; a refused write turns a status of 0 into 1, said on standard error.
     pub(crate) fn exit(&self, status: i32) -> ! {
         // A hosted program's run is ended by its host: its table's `exit` does not return.
         if let Reach::Hosted = self.reach {
             crate::guest::exit_to(&crate::guest::Run::current().table, status);
         }
+        let status = match self.flush_streams("bstd.host.exit") {
+            Ok(()) => status,
+            Err(error) => {
+                // The stream that refused may be standard error itself: nothing is left to
+                // say it on then, and the status still says the run failed.
+                let _unsaid = core::fmt::write(&mut RawErr(self), format_args!("{error}\n"));
+                if status == 0 { 1 } else { status }
+            }
+        };
         let simulated = {
             let mut world = self.world().lock();
             let simulated = world.driver.sim().is_some();

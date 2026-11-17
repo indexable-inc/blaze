@@ -5,8 +5,10 @@
 //! [`SigLife`] is the shape the lowering takes, whoever makes it. The front end's heads erase
 //! lifetimes today, so [`read_signature`] is a STAND-IN that reads them from the fn's own text
 //! and lines them up with the erased types' positions. It refuses by name whatever it cannot line
-//! up exactly (an alias to a type with references, two different lifetimes of one ADT, a default
-//! object bound it cannot know); it never guesses a region. Its known limits are in flow.md.
+//! up exactly (an alias to a type with references, an ADT written with some but not all of its
+//! lifetime arguments, a default object bound it cannot know); it never guesses a region. An
+//! ADT has one origin position per lifetime parameter its head declares (blaze-ladder front2
+//! lifetimes.rs `Grain::PerParam`). Its known limits are in flow.md.
 //!
 //! The rules it applies are the Reference's "Lifetime elision": "Each elided lifetime in the
 //! parameters becomes a distinct lifetime parameter"; "If there is exactly one lifetime used in
@@ -98,13 +100,11 @@ pub enum SigRefusal {
     /// The written type and the erased type are not the same form (an alias, a qualified path,
     /// a default argument): positions cannot be lined up.
     Unaligned { at: u32 },
-    /// An ADT's lifetimes are one origin until the heads say more: two different ones written.
-    TwoLifetimesOneOrigin { at: u32 },
     /// An elided output lifetime that neither rule of the Reference decides.
     ElisionUndecided { at: u32 },
     /// A trait object whose default lifetime depends on a type's declared bounds.
     ObjectDefault { at: u32 },
-    /// The world did not say whether an ADT has lifetimes, or a type node is missing.
+    /// The world did not say how many lifetimes an ADT has, or a type node is missing.
     Unknown,
     /// A closure or coroutine type in a signature.
     TypeNode,
@@ -337,7 +337,7 @@ struct Pair {
 struct Reader<'t, 'w, A: Allocator + Clone> {
     text: &'t str,
     tys: PTys<'w>,
-    adt_lifetimes: &'w dyn Fn(ItemKey) -> Option<bool>,
+    adt_lifetimes: &'w dyn Fn(ItemKey) -> Option<u32>,
     toks: Vec<Tok, A>,
     /// Per token, its closing or opening bracket's index (`u32::MAX` for the rest).
     mate: Vec<u32, A>,
@@ -467,7 +467,7 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
     }
 
     /// The number of origin positions of `t`, as the lowering counts them: one per reference,
-    /// one per ADT with lifetimes, one per opaque, alias or trait object.
+    /// one per lifetime parameter of an ADT, one per opaque, alias or trait object.
     fn count(&self, t: PTy) -> Result<u32, SigRefusal> {
         let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
         stack.push(t);
@@ -486,9 +486,7 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
                 PNode::Array(i, _) => stack.push(i),
                 PNode::Tuple(l) => stack.extend_from_slice(self.tys.list(l).map_err(|_| SigRefusal::Unknown)?),
                 PNode::Adt(k, l) => {
-                    if (self.adt_lifetimes)(k).ok_or(SigRefusal::Unknown)? {
-                        n += 1;
-                    }
+                    n += (self.adt_lifetimes)(k).ok_or(SigRefusal::Unknown)?;
                     stack.extend_from_slice(self.tys.list(l).map_err(|_| SigRefusal::Unknown)?);
                 }
                 PNode::Opaque(_, _) | PNode::Alias { .. } | PNode::Dynamic(_) => n += 1,
@@ -622,20 +620,17 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
                         Some((lo, hi)) => self.pieces(lo, hi, &mut parts),
                         None => parts.clear(),
                     }
+                    // One position per lifetime parameter the ADT's head declares, in order.
                     let has = (self.adt_lifetimes)(k).ok_or(SigRefusal::Unknown)?;
-                    // The written lifetimes: all one region, or none (elided).
-                    let mut own: Option<Region> = None;
-                    let mut wrote = false;
+                    // The written lifetime arguments' tokens: one per parameter, or none (each
+                    // elided: the Reference, "Lifetime elision", "Each elided lifetime in the
+                    // parameters becomes a distinct lifetime parameter").
+                    let mut lifes: Vec<u32, A> = Vec::new_in(self.alloc.clone());
                     let mut types: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
                     for j in 0..parts.len() {
                         let (lo, hi) = parts[j];
                         if hi == lo + 1 && self.is(lo, hi, Tk::Life) {
-                            let r = self.named(lo);
-                            if wrote && r != own {
-                                return Err(SigRefusal::TwoLifetimesOneOrigin { at: self.at(lo) });
-                            }
-                            wrote = true;
-                            own = r;
+                            lifes.push(lo);
                         } else {
                             // `Name = Type` is a binding, not an argument: only in bounds.
                             if self.is(lo + 1, hi, Tk::P(b'=')) {
@@ -644,26 +639,33 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
                             types.push((lo, hi));
                         }
                     }
-                    let mut off = p.base;
-                    if has {
-                        let r = match own {
+                    // Written lifetimes are all of the parameters, or none (E0107 otherwise).
+                    if !lifes.is_empty() && lifes.len() as u32 != has {
+                        return Err(unaligned);
+                    }
+                    for q in 0..has {
+                        let written = match lifes.get(q as usize) {
+                            Some(&t) => self.named(t),
+                            None => None,
+                        };
+                        let r = match written {
                             Some(r) => r,
                             None => self.elided(mode, p.lo)?,
                         };
-                        regions[p.base as usize] = r;
-                        off += 1;
+                        regions[(p.base + q) as usize] = r;
                     }
+                    let mut off = p.base + has;
                     let elems = self.tys.list(l).map_err(|_| SigRefusal::Unknown)?;
                     if types.len() != elems.len() {
                         // Defaults or const arguments: fine only when no argument has a position.
-                        if n != u32::from(has) {
+                        if n != has {
                             return Err(unaligned);
                         }
                         continue;
                     }
                     for (j, &t) in elems.iter().enumerate() {
                         let (lo, hi) = types[j];
-                        work.push(Pair { ty: t, lo, hi, base: off, ctx: Ctx::Adt(has), whole_self: false });
+                        work.push(Pair { ty: t, lo, hi, base: off, ctx: Ctx::Adt(has > 0), whole_self: false });
                         off += self.count(t)?;
                     }
                 }
@@ -732,14 +734,14 @@ enum Receiver {
 }
 
 /// Reads the lifetime part of the fn whose text is `text` and whose erased inputs and output are
-/// `inputs` and `output` in `tys`. `adt_lifetimes` says whether an ADT's head declares lifetime
-/// parameters. On `Ok`, `out` holds one region per origin position, in the lowering's order.
+/// `inputs` and `output` in `tys`. `adt_lifetimes` says how many lifetime parameters an ADT's
+/// head declares. On `Ok`, `out` holds one region per origin position, in the lowering's order.
 pub fn read_signature<A: Allocator + Clone>(
     text: &str,
     tys: PTys<'_>,
     inputs: &[PTy],
     output: PTy,
-    adt_lifetimes: &dyn Fn(ItemKey) -> Option<bool>,
+    adt_lifetimes: &dyn Fn(ItemKey) -> Option<u32>,
     out: &mut SigBuf<A>,
     alloc: A,
 ) -> Result<(), SigRefusal> {
@@ -755,7 +757,7 @@ fn read_signature_in<'t, A: Allocator + Clone>(
     tys: PTys<'_>,
     inputs: &[PTy],
     output: PTy,
-    adt_lifetimes: &dyn Fn(ItemKey) -> Option<bool>,
+    adt_lifetimes: &dyn Fn(ItemKey) -> Option<u32>,
     out: &mut SigBuf<A>,
     alloc: A,
 ) -> Result<(), SigRefusal> {

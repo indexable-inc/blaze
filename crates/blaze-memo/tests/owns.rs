@@ -76,7 +76,7 @@ fn attribute_sites(text: &str) -> usize {
 }
 
 /// The directory of `krate`'s library source: that of its `[lib] path` where its `Cargo.toml`
-/// names one (hir-ty-codegen's is `mod.rs`, at the crate's top, which a walk of `src/` alone
+/// names one (a `[lib] path = "mod.rs"` puts it at the crate's top, which a walk of `src/` alone
 /// would never count), else `src/`; `None` for a directory with no manifest or no library (a
 /// workspace of its own, as `crates/harness`).
 fn lib_root(krate: &Path) -> Option<PathBuf> {

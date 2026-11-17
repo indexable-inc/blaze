@@ -11,14 +11,35 @@
 //! Division and remainder, and conversions to and from floats, are calls of the runtime's
 //! routines (pass/runtime.rs: `__udivti3` and kin, `__floattidf` and kin).
 //!
-//! Refused by name: the overflow and saturating forms, rotations and the bit counts.
+//! The overflow operations give a wide pair (lib.rs, "Pairs"): the wrapped result in the
+//! cell, the flag in the third word past the cells. The flag: an add's carry or signed
+//! overflow out of the high word; a subtract's borrow or signed overflow; an unsigned multiply
+//! overflowed when the product's bits from 128 up are not all zero, the standard cross-product
+//! test over the 64-bit halves (`a1·b1`, the high halves of `a0·b1` and `a1·b0`, and the
+//! carries of the middle sum); a signed multiply is the unsigned one of the magnitudes, the
+//! sign put back, and overflowed also when the signed result's sign is not the product's.
+//!
+//! The saturating adds and subtracts pick their bound by the flags (`wide`); the bit counts and
+//! reversals work word by word (`wide_bits`). Refused by name: rotations, min and max, the high
+//! multiplies (no reached function asks: the census of 2026-11-17).
 
 use std::alloc::Allocator;
 
-use blaze_lir::{IntCond, Op, Ty, Value};
+use blaze_lir::{IntCond, Op, Scalar, Ty, Value, View, func::NONE};
 
 use super::{EmitError, Pass, unsupported};
-use crate::enc::{self, Cond, Reg, Size, X0, X1, X2, X9};
+use crate::enc::{self, Cond, Reg, Size, X0, X1, X2, X9, X10, X11};
+
+/// Whether `ty` is a wide pair (lib.rs, "Pairs"): `{i128, iN}` with N at most 64, the result
+/// of a 128-bit overflow operation.
+pub(super) fn is_wide_pair(view: View<'_>, ty: Ty) -> bool {
+    if ty.compound_row().is_none() {
+        return false;
+    }
+    let members = view.members(ty);
+    let narrow = |t: Ty| t.is_scalar() && matches!(t.elem(), Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32 | Scalar::I64);
+    members.len() == 2 && Ty(members[0]) == Ty::I128 && narrow(Ty(members[1]))
+}
 
 const X3: Reg = 3;
 const X4: Reg = 4;
@@ -242,7 +263,223 @@ impl<A: Allocator> Pass<'_, '_, A> {
             }
             // The runtime's routines (pass/runtime.rs), after the zero and overflow checks.
             Op::Udiv | Op::Sdiv | Op::Urem | Op::Srem => return self.wide_div(inst, op),
-            _ => return Err(unsupported(inst, op, "this `i128` operation (overflow, saturating, rotate, bit count, float conversion)")),
+            // The flags of the two-word add or subtract pick the bound: `hs` (a carry) for an
+            // unsigned add, `lo` (a borrow) for an unsigned subtract, `vs` for a signed one,
+            // whose bound has `a`'s sign (a signed sum or difference overflows only toward the
+            // side `a` is on: with `m` all ones when `a < 0`, `MAX`'s words are `!m`, `!m ^ 2⁶³`
+            // when `a ≥ 0` and `MIN`'s are `0`, `2⁶³` when not, which `!m`, `!m ^ 2⁶³` are too).
+            // Nothing between the `adcs`/`sbcs` and the `csel`s sets the flags.
+            Op::UaddSat | Op::UsubSat | Op::SaddSat | Op::SsubSat => {
+                let (a, b) = (o.value(), o.value());
+                self.ld2(X0, X1, a);
+                self.ld2(X2, X3, b);
+                let (lo, hi, cond) = match op {
+                    Op::UaddSat => {
+                        self.put(enc::movn(X4, 0, 0));
+                        (X4, X4, Cond::Hs)
+                    }
+                    Op::UsubSat => (enc::ZR, enc::ZR, Cond::Lo),
+                    _ => {
+                        self.put(enc::asr_imm(X5, X1, 63));
+                        self.put(enc::mvn(X6, X5));
+                        self.mov_imm(X7, 1 << 63);
+                        self.put(enc::eor(X7, X6, X7));
+                        (X6, X7, Cond::Vs)
+                    }
+                };
+                match op {
+                    Op::UaddSat | Op::SaddSat => {
+                        self.put(enc::adds(X0, X0, X2));
+                        self.put(enc::adcs(X1, X1, X3));
+                    }
+                    _ => {
+                        self.put(enc::subs(X0, X0, X2));
+                        self.put(enc::sbcs(X1, X1, X3));
+                    }
+                }
+                self.put(enc::csel(X0, lo, X0, cond));
+                self.put(enc::csel(X1, hi, X1, cond));
+                self.st2(X0, X1, inst);
+            }
+            _ => return Err(unsupported(inst, op, "this `i128` operation (a rotate, a min or max, a high multiply)")),
+        }
+        Ok(())
+    }
+
+    /// `clz`, `ctz`, `popcnt`, `bswap`, `bitrev` of an `i128` (`x0:x1`): the counts from the
+    /// two words' (the high word's count when it is not all zeros for `clz`, else 64 plus the
+    /// low's; `ctz` the other way round; `popcnt` the sum), stored as the result's type is (an
+    /// `i128`'s high word 0); the reversals swap the words and reverse each.
+    pub(super) fn wide_bits(&mut self, inst: usize, op: Op) -> Result<(), EmitError> {
+        let a = self.view.operands(inst).value();
+        self.ld2(X0, X1, a);
+        match op {
+            Op::Bswap | Op::Bitrev => {
+                let each = |rd, rn| match op {
+                    Op::Bswap => enc::rev(rd, rn),
+                    _ => enc::rbit(rd, rn),
+                };
+                self.put(each(X2, X1));
+                self.put(each(X1, X0));
+                self.st2(X2, X1, inst);
+                return Ok(());
+            }
+            Op::Clz => {
+                self.put(enc::clz(X2, X1));
+                self.put(enc::clz(X3, X0));
+                self.put(enc::add_imm(X3, X3, 64, false));
+                self.put(enc::cmp_imm(X1, 0));
+                self.put(enc::csel(X0, X2, X3, Cond::Ne));
+            }
+            Op::Ctz => {
+                self.put(enc::rbit(X2, X0));
+                self.put(enc::clz(X2, X2));
+                self.put(enc::rbit(X3, X1));
+                self.put(enc::clz(X3, X3));
+                self.put(enc::add_imm(X3, X3, 64, false));
+                self.put(enc::cmp_imm(X0, 0));
+                self.put(enc::csel(X0, X2, X3, Cond::Ne));
+            }
+            Op::Popcnt => {
+                for (word, count) in [(X0, X2), (X1, X3)] {
+                    self.put(enc::fmov_to_d(0, word));
+                    self.put(enc::cnt_8b(0, 0));
+                    self.put(enc::addv_8b(0, 0));
+                    self.put(enc::fmov_from_d(count, 0));
+                }
+                self.put(enc::add(X0, X2, X3));
+            }
+            _ => return Err(unsupported(inst, op, "an `i128` bit operation that is not a count or a reversal")),
+        }
+        let result = self.view.ty(Value(inst as u32));
+        match Self::is_wide(result) {
+            true => self.st2(X0, enc::ZR, inst),
+            // At most 128: it fits any integer result of 8 bits or more.
+            false => {
+                let width = self.result_width(inst, op)?;
+                if width < 8 {
+                    return Err(unsupported(inst, op, "an `i128` count into an integer narrower than 8 bits"));
+                }
+                self.st(X0, inst);
+            }
+        }
+        Ok(())
+    }
+
+    /// A 128-bit overflow operation: the wrapped result in its cell, the flag (0 or 1) in its
+    /// third word.
+    pub(super) fn wide_overflow(&mut self, inst: usize, op: Op) -> Result<(), EmitError> {
+        let side = self.wide_pair_at[inst];
+        if side == NONE {
+            return Err(unsupported(inst, op, "a 128-bit overflow operation whose result is not `{i128, i1}`"));
+        }
+        let mut o = self.view.operands(inst);
+        let (a, b) = (o.value(), o.value());
+        if !Self::is_wide(self.view.ty(b)) {
+            return Err(unsupported(inst, op, "an overflow operation over an `i128` and a value of another type"));
+        }
+        self.ld2(X0, X1, a);
+        self.ld2(X2, X3, b);
+        match op {
+            Op::UaddOverflow | Op::SaddOverflow => {
+                self.put(enc::adds(X0, X0, X2));
+                self.put(enc::adcs(X1, X1, X3));
+                self.put(enc::cset(X9, if op == Op::UaddOverflow { Cond::Hs } else { Cond::Vs }));
+            }
+            Op::UsubOverflow | Op::SsubOverflow => {
+                self.put(enc::subs(X0, X0, X2));
+                self.put(enc::sbcs(X1, X1, X3));
+                self.put(enc::cset(X9, if op == Op::UsubOverflow { Cond::Lo } else { Cond::Vs }));
+            }
+            Op::UmulOverflow => self.umul_wide(),
+            Op::SmulOverflow => {
+                // x7: all ones when the product is negative. Each operand becomes its
+                // magnitude (`(v ^ m) - m`; `MIN`'s is 2¹²⁷, which fits unsigned).
+                self.put(enc::asr_imm(X7, X1, 63));
+                self.negate_if(X0, X1, X7);
+                self.put(enc::asr_imm(X10, X3, 63));
+                self.negate_if(X2, X3, X10);
+                self.put(enc::eor(X7, X7, X10));
+                self.umul_wide();
+                // a·b ≡ ±|a|·|b| (mod 2¹²⁸).
+                self.negate_if(X0, X1, X7);
+                // Within 128 unsigned bits it still overflowed when the result's sign is not the
+                // product's, unless the result is 0 (whose sign is both).
+                self.put(enc::eor(X10, X1, X7));
+                self.put(enc::lsr_imm(X10, X10, 63));
+                self.put(enc::orr(X11, X0, X1));
+                self.put(enc::cmp_imm(X11, 0));
+                self.put(enc::cset(X11, Cond::Ne));
+                self.put(enc::and(X10, X10, X11));
+                self.put(enc::orr(X9, X9, X10));
+            }
+            _ => return Err(unsupported(inst, op, "an `i128` operation that is not an overflow operation")),
+        }
+        self.st2(X0, X1, inst);
+        self.st_sp(X9, side);
+        Ok(())
+    }
+
+    /// `lo:hi = (lo:hi ^ m) - m` over both words, `m` 0 or all ones: the negation when `m` is.
+    fn negate_if(&mut self, lo: Reg, hi: Reg, m: Reg) {
+        self.put(enc::eor(lo, lo, m));
+        self.put(enc::eor(hi, hi, m));
+        self.put(enc::subs(lo, lo, m));
+        self.put(enc::sbc(hi, hi, m));
+    }
+
+    /// `x0:x1 = (x0:x1 · x2:x3) mod 2¹²⁸`, `x9` = whether the product reached 2¹²⁸. Takes
+    /// `x4`, `x5`, `x6`, `x10`, `x11`; keeps `x7`.
+    ///
+    /// (a1·2⁶⁴ + a0)(b1·2⁶⁴ + b0) = a1·b1·2¹²⁸ + (a0·b1 + a1·b0 + umulh(a0, b0))·2⁶⁴ + (a0·b0
+    /// mod 2⁶⁴): it fits 128 bits exactly when `a1·b1` is 0 (not both high halves non-zero),
+    /// neither cross product reaches 2⁶⁴ (`umulh` of each is 0) and the middle sum of three
+    /// 64-bit words does not carry.
+    fn umul_wide(&mut self) {
+        self.put(enc::umulh(X4, X0, X2));
+        self.put(enc::mul(X5, X0, X3));
+        self.put(enc::mul(X6, X1, X2));
+        self.put(enc::adds(X4, X4, X5));
+        self.put(enc::cset(X9, Cond::Hs));
+        self.put(enc::adds(X4, X4, X6));
+        self.put(enc::cset(X10, Cond::Hs));
+        self.put(enc::orr(X9, X9, X10));
+        self.put(enc::umulh(X5, X0, X3));
+        self.put(enc::umulh(X6, X1, X2));
+        self.put(enc::orr(X5, X5, X6));
+        self.put(enc::cmp_imm(X5, 0));
+        self.put(enc::cset(X10, Cond::Ne));
+        self.put(enc::orr(X9, X9, X10));
+        self.put(enc::cmp_imm(X1, 0));
+        self.put(enc::cset(X10, Cond::Ne));
+        self.put(enc::cmp_imm(X3, 0));
+        self.put(enc::cset(X11, Cond::Ne));
+        self.put(enc::and(X10, X10, X11));
+        self.put(enc::orr(X9, X9, X10));
+        self.put(enc::mul(X0, X0, X2));
+        self.put(enc::mov(X1, X4));
+    }
+
+    /// `project` of a wide pair: member 0 the `i128` in its cell, member 1 the narrow integer
+    /// in its third word.
+    pub(super) fn wide_project(&mut self, inst: usize, pair: Value, k: u32) -> Result<(), EmitError> {
+        let result = self.view.ty(Value(inst as u32));
+        match k {
+            0 if Self::is_wide(result) => {
+                self.ld2(X0, X1, pair);
+                self.st2(X0, X1, inst);
+            }
+            1 if self.width(result).is_some() => {
+                self.ld_sp(X9, self.wide_pair_at[pair.index()]);
+                self.st(X9, inst);
+            }
+            _ => {
+                return Err(unsupported(
+                    inst,
+                    Op::Project,
+                    "a member of an `{i128, iN}` pair other than its `i128` (0) or its narrow integer (1)",
+                ));
+            }
         }
         Ok(())
     }

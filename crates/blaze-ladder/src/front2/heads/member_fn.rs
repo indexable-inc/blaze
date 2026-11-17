@@ -64,6 +64,23 @@ pub fn member_fn_want<'n, S: NamesSource<'n>>(names: S, keys: &Keys, key: ItemKe
     }
 }
 
+/// The want that makes the head of the member `key` (a fn or a constant of a trait or an impl)
+/// with its container's first: an impl's fn its own [`Want::MemberFn`] (its impl's head first,
+/// `Store::step`), an impl's constant its impl's head ([`Want::Impl`]: made with it), a
+/// trait's fn or constant its trait's members ([`Want::Members`]: its head first). `None`: the
+/// key is no such member front2 filed (its container's head was never made, so no key was
+/// derived for it), or its container is no trait or impl.
+pub fn member_head_want<'n, S: NamesSource<'n>>(names: S, keys: &Keys, key: ItemKey) -> Option<Want> {
+    let Some(Origin::Member { container, kind, .. }) = keys.origin(key) else { return None };
+    let lib = keys.library_in(names, *container)?;
+    match (names.detail_of(lib)?, kind) {
+        (ItemDetail::Impl, MemberKind::Fn) => Some(Want::MemberFn(lib, key)),
+        (ItemDetail::Impl, MemberKind::Const) => Some(Want::Impl(lib)),
+        (ItemDetail::Trait, MemberKind::Fn | MemberKind::Const) => Some(Want::Members(lib)),
+        _ => None,
+    }
+}
+
 impl<'n> Store<'n> {
     /// Makes the signature of `fn_`, a fn of impl `impl_` whose head is made: in the impl's
     /// kept frame, with its associated types and its clauses, as `Store::member_fn_head` (a
@@ -100,7 +117,8 @@ impl<'n> Store<'n> {
             let mut inherited: Vec<PClause, Global> = Vec::with_capacity_in(clauses.clauses.len(), Global);
             inherited.extend_from_slice(&clauses.clauses);
             let env = Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts };
-            return self.member_fn_head(names, impl_, fn_, Some(ck), &env, generics, &inherited, &v, m.text);
+            let marks = super::super::item_site::member_marks(names, impl_, m.written_by, m.text).map_err(super::super::item_site::MarksLost::why)?;
+            return self.member_fn_head(names, impl_, fn_, Some(ck), &env, generics, &inherited, &v, m.text, marks);
         }
         Err(Why::Program(format!("impl {ck:?} holds no fn `{name}` its crate's cfg keeps").into_boxed_str(), whole))
     }

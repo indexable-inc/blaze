@@ -13,7 +13,6 @@
 //! answers with.
 
 use core::cell::UnsafeCell;
-use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// The bytes of one stub.
@@ -67,35 +66,51 @@ pub struct Left {
     pub stopped: u64,
 }
 
-/// Calls `function(argument)` (C convention) after keeping the caller's preserved registers
-/// in `jump`, and gives what it returned.
+/// Calls `function(first, second)` (C convention, two integer-class words) after keeping the
+/// caller's preserved registers in `jump`, and gives what it returned.
+///
+/// The registers, by AAPCS64, which arm64 macOS (Apple's arm64 ABI) and arm64 Linux both follow
+/// for integer and pointer arguments: the arguments in `x0`, `x1`, .. in order, an integer
+/// result in `x0` (`w0` for an `int`), a 16-byte composite result ([`Left`]) in `x0` and `x1`.
+/// So this function is entered with `function` in `x0`, `first` in `x1`, `second` in `x2`,
+/// `jump` in `x3`, and calls `function` with `first` in `x0` and `second` in `x1`. One `enter`
+/// serves every entry: `fn()` reads neither register, bstd's hosted entry reads the table in
+/// `x0` only, a C `main(argc, argv)` reads `argc` in `w0` and `argv` in `x1`. An `int` is read
+/// from `w0`: AAPCS64 leaves the upper 32 bits of `x0` unspecified, and Apple's ABI asks the
+/// caller to extend only values narrower than 32 bits, so a non-negative `argc` passed
+/// zero-extended is read right on both.
 ///
 /// # Safety
 ///
-/// `function` is the address of code that follows the C convention for one pointer argument
-/// (or none); `jump` is writable and stays so until this returns. A [`leave`] with the same
-/// `jump` may run only while this call has not returned, on the same thread.
+/// `function` is the address of code that follows the C convention for at most two
+/// integer-class parameters, each given its word here; `jump` is writable and stays so until
+/// this returns. A [`leave`] with the same `jump` may run only while this call has not
+/// returned, on the same thread.
 #[cfg(target_arch = "aarch64")]
 #[unsafe(naked)]
-unsafe extern "C" fn enter(function: usize, argument: *const c_void, jump: *mut Jump) -> Left {
+unsafe extern "C" fn enter(function: usize, first: usize, second: usize, jump: *mut Jump) -> Left {
     core::arch::naked_asm!(
-        "stp x19, x20, [x2, #0]",
-        "stp x21, x22, [x2, #16]",
-        "stp x23, x24, [x2, #32]",
-        "stp x25, x26, [x2, #48]",
-        "stp x27, x28, [x2, #64]",
-        "stp x29, x30, [x2, #80]",
+        "stp x19, x20, [x3, #0]",
+        "stp x21, x22, [x3, #16]",
+        "stp x23, x24, [x3, #32]",
+        "stp x25, x26, [x3, #48]",
+        "stp x27, x28, [x3, #64]",
+        "stp x29, x30, [x3, #80]",
         "mov x9, sp",
-        "str x9, [x2, #96]",
-        "stp d8, d9, [x2, #104]",
-        "stp d10, d11, [x2, #120]",
-        "stp d12, d13, [x2, #136]",
-        "stp d14, d15, [x2, #152]",
+        "str x9, [x3, #96]",
+        "stp d8, d9, [x3, #104]",
+        "stp d10, d11, [x3, #120]",
+        "stp d12, d13, [x3, #136]",
+        "stp d14, d15, [x3, #152]",
         // A frame record of its own, so a walk of the stack by records goes on through it.
         "stp x29, x30, [sp, #-16]!",
         "mov x29, sp",
+        // `x9` is a scratch register (AAPCS64: x9-x15 are not preserved), free here: the
+        // function's address. The two words move down one register each, `first` before
+        // `second` so neither is overwritten before it is read.
         "mov x9, x0",
         "mov x0, x1",
+        "mov x1, x2",
         "blr x9",
         // The entry returned: `Left { value: x0, stopped: 0 }`.
         "mov x1, #0",
@@ -157,29 +172,31 @@ impl Stops {
         self.jump.get()
     }
 
-    /// Calls the program's entry `function(argument)` on this thread: what it returned, or
-    /// the stub that stopped it. `None` on a machine the stubs' code is not for.
+    /// Calls the program's entry `function(first, second)` on this thread (stub.rs `enter`:
+    /// `first` in `x0`, `second` in `x1`): what it returned, or the stub that stopped it.
+    /// `None` on a machine the stubs' code is not for.
     ///
     /// # Safety
     ///
-    /// `function` is the address of placed code following the C convention for one pointer
-    /// argument or none, whose stubs were placed with this `Stops`' address; one run at a
-    /// time uses a `Stops`.
-    pub unsafe fn run(&self, function: usize, argument: *const c_void) -> Option<Left> {
+    /// `function` is the address of placed code following the C convention for at most two
+    /// integer-class parameters (none, bstd's host table, or a C `main`'s `argc` and `argv`),
+    /// whose stubs were placed with this `Stops`' address; whatever `first` and `second` point
+    /// to stays alive until this returns; one run at a time uses a `Stops`.
+    pub unsafe fn run(&self, function: usize, first: usize, second: usize) -> Option<Left> {
         #[cfg(target_arch = "aarch64")]
         {
             // SAFETY: `pthread_self` has no precondition.
             self.thread.store(unsafe { libc::pthread_self() } as usize, Ordering::Release);
-            // SAFETY: the caller's contract for `function`; `jump` is this `Stops`' own
-            // buffer, written only here (one run at a time) and read only by a `leave` under
-            // this call.
-            let left = unsafe { enter(function, argument, self.jump.get()) };
+            // SAFETY: the caller's contract for `function` and the two words; `jump` is this
+            // `Stops`' own buffer, written only here (one run at a time) and read only by a
+            // `leave` under this call.
+            let left = unsafe { enter(function, first, second, self.jump.get()) };
             self.thread.store(0, Ordering::Release);
             Some(left)
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
-            let _ = (function, argument, &self.jump);
+            let _ = (function, first, second, &self.jump);
             None
         }
     }
@@ -219,6 +236,8 @@ pub extern "C" fn stopped(stops: *const Stops, stub: u64) -> ! {
 
 #[cfg(test)]
 mod tests {
+    use core::ffi::c_void;
+
     use super::*;
 
     /// The words of `code`, decoded: the stub number is split over `movz`/`movk`, and each
@@ -248,14 +267,30 @@ mod tests {
             stopped(stops.cast::<Stops>(), 41)
         }
         let stops = Stops::new(Box::from([]));
-        // SAFETY: both are C-convention functions of one pointer argument; `stops_at_41` is
-        // given this `Stops`, which it passes to `stopped` under this `run`.
-        let (plain, stub) = unsafe {
-            (stops.run(returns as usize, core::ptr::null()), stops.run(stops_at_41 as usize, (&raw const stops).cast()))
-        };
+        // SAFETY: both are C-convention functions of one pointer argument (the second word is
+        // not read); `stops_at_41` is given this `Stops`, which it passes to `stopped` under
+        // this `run`.
+        let (plain, stub) = unsafe { (stops.run(returns as usize, 0, 0), stops.run(stops_at_41 as usize, (&raw const stops) as usize, 0)) };
         let (plain, stub) = (plain.expect("an AArch64 host"), stub.expect("an AArch64 host"));
         assert_eq!((plain.value as i32, plain.stopped), (7, 0));
         assert_eq!((stub.value, stub.stopped), (41, 1));
         println!("STOPS: a returning entry gave 7; a stopped one gave stub 41");
+    }
+
+    /// `enter` hands its two words to the entry in `x0` and `x1` (AAPCS64), as a C `main` takes
+    /// `argc` in `w0` and `argv` in `x1`. Without `enter`'s `mov x1, x2`, `x1` still holds the
+    /// first word and this gives 44, not 42; with `mov x0, x1` and `mov x1, x2` swapped, `x0`
+    /// would be the second word too and it gives 22.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn an_entry_of_two_words_gets_both_in_order() {
+        extern "C" fn tens_and_ones(argc: i32, argv: usize) -> i32 {
+            argc * 10 + argv as i32
+        }
+        let stops = Stops::new(Box::from([]));
+        // SAFETY: a C-convention function of two integer-class parameters that calls no stub.
+        let left = unsafe { stops.run(tens_and_ones as usize, 4, 2) }.expect("an AArch64 host");
+        assert_eq!((left.value as i32, left.stopped), (42, 0));
+        println!("TWO WORDS: 4 and 2 reached the entry in order: 42");
     }
 }

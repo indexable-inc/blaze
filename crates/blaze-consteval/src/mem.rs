@@ -31,7 +31,8 @@ pub struct Pointer {
 }
 
 impl Pointer {
-    pub(crate) fn at(self, delta: u64) -> Pointer {
+    /// The address `delta` bytes on, in the same allocation.
+    pub fn at(self, delta: u64) -> Pointer {
         Pointer { alloc: self.alloc, offset: self.offset.wrapping_add(delta) }
     }
 }
@@ -62,10 +63,10 @@ pub struct Allocation {
     /// Where its bytes start in `Memory::heap`.
     start: u64,
     len: u64,
-    pub(crate) align_log2: u8,
+    pub align_log2: u8,
     pub(crate) mutable: bool,
     pub(crate) live: bool,
-    pub(crate) origin: Origin,
+    pub origin: Origin,
     /// A static's bytes have been read from its record.
     pub(crate) loaded: bool,
 }
@@ -103,7 +104,8 @@ pub struct Memory<A: Allocator + Clone> {
 }
 
 impl<A: Allocator + Clone> Memory<A> {
-    pub(crate) fn new_in(limit: u64, alloc: A) -> Memory<A> {
+    /// An empty memory holding at most `limit` live bytes, its vectors in `alloc`.
+    pub fn new_in(limit: u64, alloc: A) -> Memory<A> {
         Memory {
             allocs: Vec::new_in(alloc.clone()),
             relocs: Vec::new_in(alloc.clone()),
@@ -157,7 +159,7 @@ impl<A: Allocator + Clone> Memory<A> {
     }
 
     /// Zeroes the bytes of `out` (a copy of allocation `id`'s) that were never written.
-    pub(crate) fn zero_unwritten(&self, id: AllocId, out: &mut [u8]) {
+    pub fn zero_unwritten(&self, id: AllocId, out: &mut [u8]) {
         let Some(a) = self.allocs.get(id.0 as usize) else { return };
         if self.all_init(a.start, a.start + a.len) {
             return;
@@ -211,7 +213,7 @@ impl<A: Allocator + Clone> Memory<A> {
     }
 
     /// A new allocation of `size` bytes, none written.
-    pub(crate) fn allocate(&mut self, size: u64, align_log2: u8, mutable: bool, origin: Origin) -> Result<AllocId, Refusal<'static>> {
+    pub fn allocate(&mut self, size: u64, align_log2: u8, mutable: bool, origin: Origin) -> Result<AllocId, Refusal<'static>> {
         let live = self.live_bytes.saturating_add(size);
         if live > self.limit {
             return Err(Refusal::MemoryLimit { limit: self.limit });
@@ -229,7 +231,7 @@ impl<A: Allocator + Clone> Memory<A> {
 
     /// Ends an allocation: later uses of a pointer into it are `Dangling`. Dead regions at the
     /// heap's end go back to it.
-    pub(crate) fn kill(&mut self, id: AllocId) {
+    pub fn kill(&mut self, id: AllocId) {
         if let Some(a) = self.allocs.get_mut(id.0 as usize) {
             if a.live {
                 self.live_bytes = self.live_bytes.saturating_sub(a.len);
@@ -248,12 +250,12 @@ impl<A: Allocator + Clone> Memory<A> {
     }
 
     /// The pointer slots of allocation `id`, sorted by offset.
-    pub(crate) fn relocs(&self, id: AllocId) -> Result<&[(u64, AllocId)], Refusal<'static>> {
+    pub fn relocs(&self, id: AllocId) -> Result<&[(u64, AllocId)], Refusal<'static>> {
         self.relocs.get(id.0 as usize).map(|r| r.as_slice()).ok_or(Refusal::Malformed { what: "a pointer to no allocation" })
     }
 
     /// The bytes of a live allocation.
-    pub(crate) fn bytes(&self, id: AllocId) -> Result<&[u8], Refusal<'static>> {
+    pub fn bytes(&self, id: AllocId) -> Result<&[u8], Refusal<'static>> {
         let a = self.get(id)?;
         if !a.live {
             return Err(Refusal::Dangling);
@@ -261,7 +263,8 @@ impl<A: Allocator + Clone> Memory<A> {
         Ok(&self.heap[a.start as usize..(a.start + a.len) as usize])
     }
 
-    pub(crate) fn get(&self, id: AllocId) -> Result<&Allocation,Refusal<'static>> {
+    /// Allocation `id`, live or ended.
+    pub fn get(&self, id: AllocId) -> Result<&Allocation,Refusal<'static>> {
         self.allocs.get(id.0 as usize).ok_or(Refusal::Malformed { what: "a pointer to no allocation" })
     }
 
@@ -287,7 +290,7 @@ impl<A: Allocator + Clone> Memory<A> {
     }
 
     /// Reads a scalar of `size` bytes at `p`. A pointer slot read whole at size 8 is a pointer.
-    pub(crate) fn read(&self, p: Pointer, size: u64) -> Result<Scalar, Refusal<'static>> {
+    pub fn read(&self, p: Pointer, size: u64) -> Result<Scalar, Refusal<'static>> {
         let a = self.checked(p, size)?;
         let end = p.offset + size;
         if !self.all_init(a.start + p.offset, a.start + end) {
@@ -336,7 +339,7 @@ impl<A: Allocator + Clone> Memory<A> {
     }
 
     /// Writes scalar `v` in `size` bytes at `p`.
-    pub(crate) fn write(&mut self, p: Pointer, size: u64, v: Scalar) -> Result<(), Refusal<'static>> {
+    pub fn write(&mut self, p: Pointer, size: u64, v: Scalar) -> Result<(), Refusal<'static>> {
         let start = self.writable(p, size)?;
         let end = p.offset + size;
         let r = &mut self.relocs[p.alloc.0 as usize];
@@ -369,8 +372,21 @@ impl<A: Allocator + Clone> Memory<A> {
         Ok(())
     }
 
+    /// Marks `size` bytes at `p` never written and drops the pointers in them: a later read is
+    /// `Uninit` (MIR's `Deinit`).
+    pub fn deinit(&mut self, p: Pointer, size: u64) -> Result<(), Refusal<'static>> {
+        if size == 0 {
+            return Ok(());
+        }
+        let start = self.writable(p, size)?;
+        let end = p.offset + size;
+        self.relocs[p.alloc.0 as usize].retain(|&(at, _)| at + PTR <= p.offset || at >= end);
+        self.set_init(start + p.offset, start + end, false);
+        Ok(())
+    }
+
     /// Copies `size` bytes from `src` to `dst`, with which were written and the pointers in them.
-    pub(crate) fn copy(&mut self, src: Pointer, dst: Pointer, size: u64) -> Result<(), Refusal<'static>> {
+    pub fn copy(&mut self, src: Pointer, dst: Pointer, size: u64) -> Result<(), Refusal<'static>> {
         if size == 0 {
             return Ok(());
         }
@@ -407,7 +423,7 @@ impl<A: Allocator + Clone> Memory<A> {
     }
 
     /// Fills an allocation's bytes from a record: every byte written, the pointer slots given.
-    pub(crate) fn fill(&mut self, id: AllocId, bytes: &[u8], relocs: &[(u64, AllocId)]) -> Result<(), Refusal<'static>> {
+    pub fn fill(&mut self, id: AllocId, bytes: &[u8], relocs: &[(u64, AllocId)]) -> Result<(), Refusal<'static>> {
         let (start, len) = {
             let a = self.get(id)?;
             (a.start, a.len)

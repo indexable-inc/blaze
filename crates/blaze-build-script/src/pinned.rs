@@ -44,7 +44,7 @@ const _: Option<&str> = option_env!("RUSTC_BOOTSTRAP");
 "#;
 
 /// thiserror's `build/probe.rs` at 2.0.21 (`no_std`, `core::error::Request`).
-const THISERROR_2_PROBE: &str = r#"// This code exercises the surface area that we expect of the Error generic
+pub(crate) const THISERROR_2_PROBE: &str = r#"// This code exercises the surface area that we expect of the Error generic
 // member access API. If the current toolchain is able to compile it, then
 // thiserror is able to provide backtrace support.
 
@@ -256,26 +256,39 @@ pub fn column(this: &Span) -> usize {
 }
 "#;
 
-/// proc-macro2 1.0.107's probe arguments (`--crate-name`, `--emit`, `--out-dir` are
-/// output-only; the probe file is the snippet).
-const PROC_MACRO2: &[&str] = &["--cfg=procmacro2_build_probe", "--edition=2021", "--crate-type=lib", "--cap-lints=allow", "--target", "aarch64-apple-darwin"];
+/// The arguments dtolnay's probes (anyhow, thiserror, proc-macro2) give besides their own:
+/// metadata only (`--emit=dep-info,metadata`; `--crate-name` and `--out-dir` say only where
+/// the output goes; the probe file is the snippet).
+const DTOLNAY_EMIT: &str = "--emit=dep-info,metadata";
 
-/// autocfg 1.5.1's arguments (its `--crate-name`, `--out-dir` and `--emit` are output-only; the
-/// snippet comes on stdin).
-const AUTOCFG: &[&str] = &["--crate-type=lib", "--target", "aarch64-apple-darwin"];
+/// proc-macro2 1.0.107's probe arguments.
+const PROC_MACRO2: &[&str] = &["--cfg=procmacro2_build_probe", "--edition=2021", "--crate-type=lib", "--cap-lints=allow", DTOLNAY_EMIT];
 
-/// rustix 1.1.5's `can_compile` arguments (`--emit` and `-o` are output-only; stdin).
-const RUSTIX: &[&str] = &["--crate-type=rlib", "--target", "aarch64-apple-darwin"];
+/// autocfg 1.5.1's arguments: `--emit=llvm-ir`, so code is generated (its `--crate-name` and
+/// `--out-dir` say where; the snippet comes on stdin).
+const AUTOCFG: &[&str] = &["--crate-type=lib", "--emit=llvm-ir"];
 
-/// The rows for tempo on `aarch64-apple-darwin`: the kept arguments carry the `--target`
-/// cargo passes, so another target's rows are their own.
+/// rustix 1.1.5's `can_compile` arguments (`-o` says where; stdin).
+const RUSTIX: &[&str] = &["--crate-type=rlib", "--emit=metadata"];
+
+/// The crates most rows rest on.
+const STD: &[&str] = &["core", "std"];
+const CORE: &[&str] = &["core"];
+const ALLOC: &[&str] = &["alloc", "core", "std"];
+const PROC_MACRO: &[&str] = &["alloc", "core", "proc_macro", "std"];
+
+/// The rows for tempo, made for each side's target (`probe::pinned_rows`): no row's reason
+/// rests on a target-gated item (none of the items named is under a `#[cfg(target_..)]`), so
+/// each holds for every target whose toolchain ships its [`Known::needs`]: the host
+/// (`aarch64-apple-darwin`) and the macro side's `wasm32-wasip1`.
 pub const TEMPO: &[Known] = &[
     Known {
         probe: "anyhow 1.0.104: error_generic_member_access with std::backtrace (src/nightly.rs)",
-        args: &["--cfg=anyhow_build_probe", "--edition=2018", "--crate-type=lib", "--cap-lints=allow", "--target", "aarch64-apple-darwin"],
+        args: &["--cfg=anyhow_build_probe", "--edition=2018", "--crate-type=lib", "--cap-lints=allow", DTOLNAY_EMIT],
         snippet: ANYHOW_PROBE,
         accepted: true,
-        why: "as thiserror's: core/src/error.rs `Request` (588), `Error::provide` (260), `Request::provide_ref` (687) and `request_ref` (473) under error_generic_member_access, which the probe's cfg_attr turns on; std/src/backtrace.rs is #![stable(feature = \"backtrace\", since = \"1.65.0\")]",
+        why: "as thiserror's: core/src/error.rs `Request` (588), `Error::provide` (260), `Request::provide_ref` (687) and `request_ref` (473) under error_generic_member_access, which the probe's cfg_attr turns on; std/src/backtrace.rs is #![stable(feature = \"backtrace\", since = \"1.65.0\")] for every std target (unsupported platforms capture nothing)",
+        needs: STD,
     },
     Known {
         probe: "proc-macro2 1.0.107: proc_macro_span (src/probe/proc_macro_span.rs)",
@@ -283,6 +296,7 @@ pub const TEMPO: &[Known] = &[
         snippet: PROC_MACRO2_SPAN,
         accepted: true,
         why: "proc_macro/src/lib.rs: Span::byte_range (661), Span::join (716) and Literal::subspan (1584) under the unstable proc_macro_span, which the probe's cfg_attr turns on; start/end/line/column (667-689) stable as proc_macro_span_location and file/local_file (698, 708) as proc_macro_span_file, since 1.88.0",
+        needs: PROC_MACRO,
     },
     Known {
         probe: "proc-macro2 1.0.107: proc_macro_span_file (src/probe/proc_macro_span_file.rs)",
@@ -290,6 +304,7 @@ pub const TEMPO: &[Known] = &[
         snippet: PROC_MACRO2_SPAN_FILE,
         accepted: true,
         why: "proc_macro/src/lib.rs: Span::file (698) and Span::local_file (708), #[stable(feature = \"proc_macro_span_file\", since = \"1.88.0\")]",
+        needs: PROC_MACRO,
     },
     Known {
         probe: "proc-macro2 1.0.107: proc_macro_span_location (src/probe/proc_macro_span_location.rs)",
@@ -297,20 +312,23 @@ pub const TEMPO: &[Known] = &[
         snippet: PROC_MACRO2_SPAN_LOCATION,
         accepted: true,
         why: "proc_macro/src/lib.rs: Span::start (667), end (673), line (681), column (689), #[stable(feature = \"proc_macro_span_location\", since = \"1.88.0\")]",
+        needs: PROC_MACRO,
     },
     Known {
         probe: "autocfg 1.5.1 (eyre, memoffset, num-traits): the empty crate, autocfg's sanity check that std links",
         args: AUTOCFG,
         snippet: "",
         accepted: true,
-        why: "an empty library crate with the std prelude compiles on every Rust; the pinned toolchain ships std for aarch64-apple-darwin",
+        why: "an empty library crate with the std prelude compiles on every Rust whose toolchain ships std for the target (blaze also decides it itself: probe_ask::decide)",
+        needs: STD,
     },
     Known {
         probe: "autocfg 1.5.1 (eyre, memoffset, num-traits): `#![no_std]`",
         args: AUTOCFG,
         snippet: "#![no_std]",
         accepted: true,
-        why: "`#![no_std]` is a stable crate attribute (since 1.6) and the empty no_std crate needs only core, which the toolchain ships",
+        why: "`#![no_std]` is a stable crate attribute (since 1.6) and the empty no_std crate needs only core (blaze also decides it itself: probe_ask::decide)",
+        needs: CORE,
     },
     Known {
         probe: "eyre 0.6.14 (autocfg): `std::panic::Location::caller` (track_caller)",
@@ -318,6 +336,7 @@ pub const TEMPO: &[Known] = &[
         snippet: "pub fn probe() { let _ = std::panic::Location::caller; }",
         accepted: true,
         why: "core/src/panic/location.rs:184 `pub const fn caller`, #[stable(feature = \"track_caller\", since = \"1.46.0\")], re-exported as std::panic::Location",
+        needs: STD,
     },
     Known {
         probe: "num-traits 0.2.19 (autocfg): `f64::total_cmp`",
@@ -325,13 +344,15 @@ pub const TEMPO: &[Known] = &[
         snippet: "pub fn probe() { let _ = 1f64.total_cmp(&2f64); }",
         accepted: true,
         why: "core/src/num/f64.rs:1578 `pub const fn total_cmp`, #[stable(feature = \"total_cmp\", since = \"1.62.0\")]",
+        needs: STD,
     },
     Known {
         probe: "eyre 0.6.14: error_generic_member_access (std::error::Request, provide_ref)",
-        args: &["--target", "aarch64-apple-darwin", "--edition=2018", "--crate-type=lib"],
+        args: &["--edition=2018", "--crate-type=lib", "--emit=metadata"],
         snippet: EYRE_PROBE,
         accepted: true,
         why: ERROR_GENERIC_MEMBER_ACCESS,
+        needs: STD,
     },
     Known {
         probe: "rustix 1.1.5: #![feature(core_c_str)]",
@@ -339,6 +360,7 @@ pub const TEMPO: &[Known] = &[
         snippet: "#![allow(stable_features)]\n#![feature(core_c_str)]\n",
         accepted: true,
         why: "core/src/ffi/c_str.rs:94 #[stable(feature = \"core_c_str\", since = \"1.64.0\")]; a stabilized library feature named in #![feature] only warns (stable_features, allowed by the snippet)",
+        needs: STD,
     },
     Known {
         probe: "rustix 1.1.5: #![feature(core_ffi_c)]",
@@ -346,6 +368,7 @@ pub const TEMPO: &[Known] = &[
         snippet: "#![allow(stable_features)]\n#![feature(core_ffi_c)]\n",
         accepted: true,
         why: "core/src/ffi/primitives.rs:13 #[stable(feature = \"core_ffi_c\", since = \"1.64.0\")]; a stabilized library feature named in #![feature] only warns (stable_features, allowed by the snippet)",
+        needs: STD,
     },
     Known {
         probe: "rustix 1.1.5: #![feature(alloc_c_string)]",
@@ -353,6 +376,7 @@ pub const TEMPO: &[Known] = &[
         snippet: "#![allow(stable_features)]\n#![feature(alloc_c_string)]\n",
         accepted: true,
         why: "alloc/src/ffi/mod.rs:84 #[stable(feature = \"alloc_c_string\", since = \"1.64.0\")]; a stabilized library feature named in #![feature] only warns (stable_features, allowed by the snippet)",
+        needs: ALLOC,
     },
     Known {
         probe: "rustix 1.1.5: #![feature(alloc_ffi)]",
@@ -360,6 +384,7 @@ pub const TEMPO: &[Known] = &[
         snippet: "#![allow(stable_features)]\n#![feature(alloc_ffi)]\n",
         accepted: true,
         why: "alloc/src/ffi/mod.rs:81 #![stable(feature = \"alloc_ffi\", since = \"1.64.0\")]; a stabilized library feature named in #![feature] only warns (stable_features, allowed by the snippet)",
+        needs: ALLOC,
     },
     Known {
         probe: "rustix 1.1.5: #![feature(error_in_core)]",
@@ -367,6 +392,7 @@ pub const TEMPO: &[Known] = &[
         snippet: "#![allow(stable_features)]\n#![feature(error_in_core)]\n",
         accepted: true,
         why: "core/src/error.rs:2 #![stable(feature = \"error_in_core\", since = \"1.81.0\")]; a stabilized library feature named in #![feature] only warns (stable_features, allowed by the snippet)",
+        needs: STD,
     },
     Known {
         probe: "rustix 1.1.5: the diagnostic attribute namespace",
@@ -374,6 +400,7 @@ pub const TEMPO: &[Known] = &[
         snippet: "#[diagnostic::on_unimplemented()] trait Foo {}\n",
         accepted: true,
         why: "the `diagnostic` namespace is stable (core uses #[diagnostic::on_unimplemented(..)] at core/src/cmp.rs:247 and core/src/lib.rs enables no feature for it); empty arguments are a lint warning, and rustix passes no -D",
+        needs: STD,
     },
     Known {
         probe: "rustix 1.1.5: `LowerExp` for `NonZeroI32`",
@@ -381,19 +408,22 @@ pub const TEMPO: &[Known] = &[
         snippet: "fn a(x: &core::num::NonZeroI32, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { core::fmt::LowerExp::fmt(x, f) }\n",
         accepted: true,
         why: "core/src/num/nonzero.rs:145 implements LowerExp for NonZero<T> under #[stable(feature = \"nonzero_fmt_exp\", since = \"1.84.0\")]; NonZeroI32 is the stable alias of NonZero<i32>",
+        needs: STD,
     },
     Known {
         probe: "thiserror 1.0.69: error_generic_member_access (std)",
-        args: &["--edition=2018", "--crate-type=lib", "--cap-lints=allow", "--target", "aarch64-apple-darwin"],
+        args: &["--edition=2018", "--crate-type=lib", "--cap-lints=allow", DTOLNAY_EMIT],
         snippet: THISERROR_1_PROBE,
         accepted: true,
         why: ERROR_GENERIC_MEMBER_ACCESS,
+        needs: STD,
     },
     Known {
         probe: "thiserror 2.0.21: error_generic_member_access (core, no_std)",
-        args: &["--edition=2018", "--crate-type=lib", "--cap-lints=allow", "--target", "aarch64-apple-darwin"],
+        args: &["--edition=2018", "--crate-type=lib", "--cap-lints=allow", DTOLNAY_EMIT],
         snippet: THISERROR_2_PROBE,
         accepted: true,
         why: ERROR_GENERIC_MEMBER_ACCESS,
+        needs: CORE,
     },
 ];

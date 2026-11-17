@@ -1,0 +1,14 @@
+{
+ "id": "scr-native-module-lookup-1",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane SCR",
+ "where": "crates/blaze-cli/src/script_modules.rs (the MacroModule lookup of a build script) and names.rs (its subject)",
+ "what": "tempo's check refused libproc, reth-mdbx-sys and librocksdb-sys with 'a build-script module the store lacks' while the store held their records: those scripts are placed native (D112, NATIVE_EVERY_MODE) and their records are host binaries (`target aarch64-apple-darwin`, `bin-sha256`), but the lookup always asked `module_of` (wasm modules only, no `target` line). The message printed only name, version and features, which all matched, so the differing line could not be seen from the output.",
+ "cost": "a coordinator investigation and one lane",
+ "cause": "the placement (D112's one choice point) fed the Script run but not the lookup that names the run's module",
+ "whys": "piece 2c added the lookup for wasm modules; native placement came by another path (native_unit) that found its record itself; the subject held no placement, so nothing forced the two to agree",
+ "class": "a lookup keyed by fewer fields than the record it must find, and a refusal that does not show which field differs",
+ "prevention": "done: the subject holds the placement, the lookup asks `module_of_native` for a native run and reads `bin-sha256`; a refusal prints the asked identity lines and the nearest same-name-and-version record's differing lines; test `a_lookup_names_the_line_that_differs`",
+ "workaround": "none needed now",
+ "state": "fixed"
+}

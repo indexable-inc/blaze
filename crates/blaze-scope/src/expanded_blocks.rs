@@ -143,7 +143,20 @@ pub(crate) fn written<'a>(nested: &Nested<'_>, alloc: Alloc<'a>) -> AVec<'a, boo
 /// statement and statement call of the block, in text order
 /// (a `macro_rules!` before its uses). With [`Outer::Inline`] the outermost block (block 0,
 /// the calling block) has no `mod` line: its items and calls are written at the top level.
-pub(crate) fn render<'a>(text: &str, nested: &Nested<'_>, written: &[bool], outer: Outer, alloc: Alloc<'a>) -> AString<'a> {
+///
+/// `copied` is told each slice of `text` written into the result (token-mark-2: the origin
+/// column moves with them, crate::crate_roots::remap).
+pub(crate) fn render<'a>(
+    text: &str,
+    nested: &Nested<'_>,
+    written: &[bool],
+    outer: Outer,
+    copied: &mut dyn FnMut(crate::crate_roots::Copied),
+    alloc: Alloc<'a>,
+) -> AString<'a> {
+    let mut copy = |out: &AString<'_>, from: u32, len: u32| {
+        copied(crate::crate_roots::Copied { from, to: u32::try_from(out.len()).unwrap_or(u32::MAX), len });
+    };
     let mut out = AString::new_in(alloc);
     let is_written = |b: u32| written.get(b as usize).copied().unwrap_or(false);
     let mut events: AVec<'a, (u32, Event)> = AVec::new_in(alloc);
@@ -186,6 +199,7 @@ pub(crate) fn render<'a>(text: &str, nested: &Nested<'_>, written: &[bool], oute
                 // inner `#![..]` at the start of the block around is that block's own.
                 let outer_attr = attrs.strip_prefix('#').is_some_and(|rest| rest.trim_start().starts_with('['));
                 if outer_attr {
+                    copy(&out, block.attrs.start, block.attrs.end - block.attrs.start);
                     out.push_str(attrs);
                     out.push_str("\n");
                 }
@@ -199,12 +213,14 @@ pub(crate) fn render<'a>(text: &str, nested: &Nested<'_>, written: &[bool], oute
             Event::Close => out.push_str("}\n"),
             Event::Item(i) => {
                 let r = nested.items[i as usize].range;
+                copy(&out, r.start, r.end - r.start);
                 out.push_str(&text[r.start as usize..r.end as usize]);
                 out.push_str("\n");
             }
             Event::Call(i) => {
                 let r = nested.calls[i as usize].range;
                 let call = &text[r.start as usize..r.end as usize];
+                copy(&out, r.start, r.end - r.start);
                 out.push_str(call);
                 // The Reference, "Macro invocation": an item-position call with `(..)` or
                 // `[..]` ends with `;`; one with `{..}` takes none.
@@ -215,18 +231,73 @@ pub(crate) fn render<'a>(text: &str, nested: &Nested<'_>, written: &[bool], oute
     out
 }
 
+/// Where an expansion's own text starts in the text it is scanned as ([`wrapped`]): after the
+/// one `{` that stands for the calling block. An offset of the expansion's text is this much
+/// more in the scan.
+pub const WRAP_OPEN: u32 = 1;
+
+/// The text a statement call's expansion `text` is scanned as. The Reference, "Macro
+/// invocation", "Statements": the expansion is the statements of the calling block, so one
+/// `{ .. }` around it stands for that block (block 0 of the scan).
+fn wrapped<'a>(text: &str, alloc: Alloc<'a>) -> AString<'a> {
+    let mut wrapped = AString::new_in(alloc);
+    wrapped.push_str("{");
+    wrapped.push_str(text);
+    wrapped.push_str("\n}");
+    wrapped
+}
+
+/// Each block's ordinal among an expansion's written blocks, as [`render`] names them with
+/// [`Outer::Inline`]: block 0 (the calling block) is inlined and has none, and every other
+/// written block takes the next number in the order of its `{` (the scan pushes blocks in
+/// that order, and `render` opens them sorted by offset). `None` for a block not written.
+fn ordinals<'a>(written: &[bool], alloc: Alloc<'a>) -> AVec<'a, Option<u32>> {
+    let mut out: AVec<'a, Option<u32>> = AVec::with_capacity_in(written.len(), alloc);
+    let mut next = 0u32;
+    for (b, w) in written.iter().enumerate() {
+        if b > 0 && *w {
+            out.push(Some(next));
+            next += 1;
+        } else {
+            out.push(None);
+        }
+    }
+    out
+}
+
+/// The blocks of a statement call's expansion as the names library files them: the scan of
+/// the wrapped text (block 0 stands for the calling block; an offset of the expansion's text
+/// is [`WRAP_OPEN`] more there) and each block's ordinal among the written blocks
+/// ([`expansion_block_name`] takes it). A reader that keys a block of the expansion it lowered
+/// (blaze-ladder front2 scope_table.rs) numbers it here, so both layers agree by construction.
+pub struct ExpansionBlocks<'a> {
+    pub nested: Nested<'a>,
+    pub ordinals: AVec<'a, Option<u32>>,
+}
+
+/// [`ExpansionBlocks`] of the expansion text `text`.
+pub fn expansion_blocks<'a>(text: &str, alloc: Alloc<'a>) -> Result<ExpansionBlocks<'a>, StatementsRefused> {
+    let wrapped = wrapped(text, alloc);
+    let nested = scan(wrapped.as_str(), alloc);
+    if nested.end != NestedEnd::Whole {
+        return Err(StatementsRefused::Unbalanced);
+    }
+    let kept = written(&nested, alloc);
+    let ordinals = ordinals(&kept, alloc);
+    Ok(ExpansionBlocks { nested, ordinals })
+}
+
 /// The expansion `text` of the statement call `call`, which does not read as items, read as
 /// statements of the calling block: the item text the driver lowers as the call's fragment
 /// (its top-level items and calls, and a `mod` per written block inside it), `None` when it
 /// declares nothing and calls nothing in statement position (`assert!(..)`, `println!(..)`:
 /// nothing of it is a name).
-pub(crate) fn statements_as_items<'a>(text: &str, call: ItemKey, alloc: Alloc<'a>) -> Result<Option<AString<'a>>, StatementsRefused> {
-    // The Reference, "Macro invocation", "Statements": the expansion is the statements of the
-    // calling block; one `{ .. }` around it stands for that block in the scan.
-    let mut wrapped = AString::new_in(alloc);
-    wrapped.push_str("{");
-    wrapped.push_str(text);
-    wrapped.push_str("\n}");
+///
+/// With the slices of `text` it copied (offsets in `text`, not in the wrapped scan text).
+#[allow(clippy::type_complexity)]
+pub(crate) fn statements_as_items<'a>(text: &str, call: ItemKey, alloc: Alloc<'a>) -> Result<Option<(AString<'a>, AVec<'a, crate::crate_roots::Copied>)>, StatementsRefused> {
+    // The calling block in the scan ([`wrapped`], where the rule is quoted).
+    let wrapped = wrapped(text, alloc);
     let nested = scan(wrapped.as_str(), alloc);
     if nested.end != NestedEnd::Whole {
         return Err(StatementsRefused::Unbalanced);
@@ -239,8 +310,18 @@ pub(crate) fn statements_as_items<'a>(text: &str, call: ItemKey, alloc: Alloc<'a
     if let Some(first) = kept.first_mut() {
         *first = true;
     }
-    let out = render(wrapped.as_str(), &nested, &kept, Outer::Inline { call }, alloc);
-    Ok((!out.is_empty()).then_some(out))
+    // The scan text is `{` + `text` + `\n}`: a slice of it at `from` is `text`'s at `from - 1`;
+    // only slices inside `text` are copied (items, calls and attributes of blocks within it).
+    let mut copies: AVec<'a, crate::crate_roots::Copied> = AVec::new_in(alloc);
+    let out = render(
+        wrapped.as_str(),
+        &nested,
+        &kept,
+        Outer::Inline { call },
+        &mut |c| copies.push(crate::crate_roots::Copied { from: c.from.saturating_sub(WRAP_OPEN), ..c }),
+        alloc,
+    );
+    Ok((!out.is_empty()).then_some((out, copies)))
 }
 
 #[cfg(test)]
@@ -266,7 +347,7 @@ mod tests {
             "mod {EXPANSION_BLOCK}{:016x}_0 {{\nuse super::*;\nmod __tokio_select_util {{ pub(super) type Mask = u8; }}\n}}\n",
             tag(call())
         );
-        assert_eq!(got.as_ref().map(|s| s.as_str()), Some(want.as_str()));
+        assert_eq!(got.as_ref().map(|(s, _)| s.as_str()), Some(want.as_str()));
     }
 
     /// A statement expansion's top-level items and statement calls are the calling block's
@@ -275,7 +356,32 @@ mod tests {
     fn top_level_items_are_the_calling_blocks() {
         let alloc = blaze_own::testing::heap().alloc();
         let got = statements_as_items("struct S; let x = S; inner!(x);", call(), alloc).unwrap_or_else(|e| panic!("read: {e}"));
-        assert_eq!(got.as_ref().map(|s| s.as_str()), Some("struct S;\ninner!(x);\n"));
+        assert_eq!(got.as_ref().map(|(s, _)| s.as_str()), Some("struct S;\ninner!(x);\n"));
+    }
+
+    /// The ordinals [`super::expansion_blocks`] gives are the numbers in the names `render`
+    /// writes, a written block inside a written block included (`_1` inside `_0`), and the
+    /// calling block and a block that declares nothing have none. A numbering that counted
+    /// the unwritten `{ let y = 1; }` or the calling block would give `_2` to the last block and
+    /// fail. Prints nothing.
+    #[test]
+    fn ordinals_are_the_rendered_names() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let text = "{ mod a { } { struct S; } } { let y = 1; } { struct T; }";
+        let blocks = super::expansion_blocks(text, alloc).unwrap_or_else(|e| panic!("scan: {e}"));
+        let got: std::vec::Vec<Option<u32>> = blocks.ordinals.iter().copied().collect();
+        // Blocks: 0 the calling block, 1 `{ mod a .. }`, 2 `{ struct S; }` inside it, 3 `{ let
+        // y = 1; }`, 4 `{ struct T; }` (`mod a`'s braces are its item's: not scanned).
+        assert_eq!(got, std::vec![None, Some(0), Some(1), None, Some(2)]);
+        let (rendered, _) = statements_as_items(text, call(), alloc).unwrap_or_else(|e| panic!("read: {e}")).expect("it declares items");
+        let tag = std::format!("{:016x}", tag(call()));
+        let zero = rendered.find(&std::format!("mod {EXPANSION_BLOCK}{tag}_0 {{")).expect("block 1 is `_0`");
+        let one = rendered.find(&std::format!("mod {EXPANSION_BLOCK}{tag}_1 {{")).expect("block 2 is `_1`");
+        let two = rendered.find(&std::format!("mod {EXPANSION_BLOCK}{tag}_2 {{")).expect("block 4 is `_2`");
+        assert!(zero < one && one < two);
+        assert!(!rendered.contains(&std::format!("{tag}_3")));
+        // `_1` is inside `_0`: no line `}` (a written block's close) between `_0`'s open and `_1`'s.
+        assert!(!rendered[zero..one].lines().any(|l| l == "}"));
     }
 
     /// An expression with no item and no statement call declares nothing. Prints nothing.

@@ -21,9 +21,10 @@
 //!   (`kept`, any of `0..=all`) and may have landed in part up to `upto` (any of
 //!   `whole..=all`): every pair is enumerated ([`pairs_of`]);
 //! - the barriers' promise raises `whole` (and `upto` with it) to what a barrier of an earlier
-//!   epoch than the newest change kept covers, in rounds, until nothing moves: the same rule,
-//!   the same bound of rounds, the same planted bug honoured ([`close`]); stamps not yet given
-//!   are the epoch now, as `Sim::stamp_epochs` gives them;
+//!   epoch than the newest change kept covers, a change of a name the crash does not undo
+//!   counted as kept, in rounds, until nothing moves: not a mirror but the same function
+//!   (`sim.rs`'s `keep_ordered`), the same planted bug honoured ([`close`]); stamps not yet
+//!   given are the epoch now, as `Sim::stamp_epochs` gives them;
 //! - where `upto > whole` the file's length is ANY value between the two files' lengths (the
 //!   random crash draws the longer, the shorter, or one uniform between), and the sectors
 //!   under it are ANY vector of landed bits (the random crash draws all landed one time in
@@ -42,9 +43,11 @@
 //!
 //! Bounded: the caller passes a cap on crash points; the count is made before any disk is
 //! built, and past the cap the answer is [`Refused::TooMany`] naming the count, never a
-//! sample. The order is deterministic: moments in order; in a moment, the cut tuples sorted,
-//! then the lengths ascending, the landed bits counted up from none, then the names undone
-//! sorted. The random crash stays for long sequences.
+//! sample. The order is deterministic: moments in order; in a moment, the choices of names
+//! undone grouped by the newest epoch of the changes of names they keep, ascending (none
+//! first, [`groups`]); in a group, the cut tuples sorted, then the lengths ascending, the
+//! landed bits counted up from none, then the names undone sorted. The random crash stays for
+//! long sequences.
 //!
 //! # What `Sim` injects (checked against the code, 2026-11-16)
 //!
@@ -92,7 +95,7 @@
 use core::fmt;
 
 use super::host::Plant;
-use super::{Duration, Global, Named, Op, Rng, Sim, SimFile};
+use super::{Duration, Global, NameChange, Named, Op, Rng, Sim, SimFile, keep_ordered};
 use crate::world::disk::{SECTOR, mixed, sectors};
 use crate::{Completion, DirName, Done, Driver, Effect, FileName, Tag, wait::Deadline};
 
@@ -360,8 +363,8 @@ impl fmt::Display for Refused {
 struct DiskCopy {
     /// Every file, by name.
     files: Vec<(FileName, SimFile)>,
-    /// The changes of names not synced, oldest first.
-    names: Vec<Named>,
+    /// The changes of names not synced, oldest first, each with its epoch.
+    names: Vec<NameChange>,
     /// The epoch now: the stamp of every change not stamped yet.
     epoch: u64,
     /// The planted bug of the barriers' promise, honoured as `crash_cut` honours it.
@@ -396,7 +399,11 @@ fn copy_file(file: &SimFile) -> SimFile {
     }
 }
 
-fn copy_named(named: &Named) -> Named {
+fn copy_named(change: &NameChange) -> NameChange {
+    NameChange { named: copy_change_of_name(&change.named), epoch: change.epoch }
+}
+
+fn copy_change_of_name(named: &Named) -> Named {
     // clone: refcounts of names and a copy of the disk at a moment.
     match named {
         Named::Put { file, was } => Named::Put { file: file.clone(), was: was.as_ref().map(copy_file) },
@@ -513,7 +520,7 @@ impl Steps<'_> {
             return Err(Refused::MappedForWriting { after });
         }
         if self.sim.made_under(&DirName::Root).next().is_some()
-            || self.sim.names.iter().any(|named| named.dir_changed().is_some())
+            || self.sim.names.iter().any(|change| change.named.dir_changed().is_some())
         {
             return Err(Refused::DirectoriesMade { after });
         }
@@ -618,40 +625,48 @@ fn pairs_of(all: usize) -> Vec<(usize, usize)> {
     pairs
 }
 
-/// The barriers' promise on one cut tuple, as `crash_cut` keeps it: a change kept of an
-/// epoch later than a barrier keeps what the barrier covers whole, in rounds until none moves.
-fn close(disk: &DiskCopy, stamps: &[Vec<u64>], cut: &mut [(usize, usize)]) {
-    let rounds: usize = disk.files.iter().map(|(_, file)| file.barriers.len()).sum();
-    for _ in 0..=rounds {
-        let mut newest: Option<u64> = None;
-        for ((kept, upto), stamps) in cut.iter().zip(stamps) {
-            let reach = (*upto).max(*kept).min(stamps.len());
-            if let Some(most) = stamps[..reach].iter().max().copied() {
-                newest = Some(newest.map_or(most, |it| it.max(most)));
-            }
-        }
-        let Some(newest) = newest else { break };
-        if disk.barriers_not_kept {
-            break;
-        }
-        let mut forced = false;
-        for ((_, file), (kept, upto)) in disk.files.iter().zip(cut.iter_mut()) {
-            let covered =
-                file.barriers.iter().filter(|(_, epoch)| *epoch < newest).map(|(covers, _)| *covers).max().unwrap_or(0);
-            if covered > *kept {
-                *kept = covered;
-                *upto = (*upto).max(covered);
-                forced = true;
-            }
-        }
-        if !forced {
-            break;
-        }
-    }
+/// The barriers' promise on one cut tuple, by the rule `crash_cut` keeps it by
+/// ([`keep_ordered`], the rule's one home), with `names` the newest epoch of the changes of
+/// names the crash keeps.
+fn close(disk: &DiskCopy, stamps: &[Vec<u64>], names: Option<u64>, cut: &mut [(usize, usize)]) {
+    let mut files: Vec<(&[u64], &[(usize, u64)])> = Vec::with_capacity_in(disk.files.len(), Global);
+    files.extend(disk.files.iter().zip(stamps).map(|((_, file), stamps)| (&stamps[..], &file.barriers[..])));
+    keep_ordered(&files, names, disk.barriers_not_kept, cut);
 }
 
-/// Every cut tuple of a moment after the barriers closed it, sorted, each once.
-fn closed_tuples(moment: &Moment) -> Result<Vec<Vec<(usize, usize)>>, Refused> {
+/// The newest epoch of the changes of names a crash that undoes `undone` keeps: none where it
+/// keeps none.
+fn names_kept(disk: &DiskCopy, undone: &[bool]) -> Option<u64> {
+    disk.names.iter().zip(undone).filter(|(_, undone)| !**undone).map(|(change, _)| change.epoch).max()
+}
+
+/// The crash points of a moment in groups: the choices of names undone ([`undone_sets`]) by
+/// the newest epoch of the changes of names they keep, ascending (none first), each group with
+/// every cut tuple the barriers close to under that epoch ([`closed_tuples`]). The closing
+/// depends on the names undone only through that epoch, so each tuple is closed once a group.
+fn groups(moment: &Moment) -> Result<Vec<(Vec<Vec<(usize, usize)>>, Vec<Vec<bool>>)>, Refused> {
+    let mut by_newest: Vec<(Option<u64>, Vec<Vec<bool>>)> = Vec::new_in(Global);
+    for set in undone_sets(moment)? {
+        let newest = names_kept(&moment.disk, &set);
+        match by_newest.binary_search_by(|(it, _)| it.cmp(&newest)) {
+            Ok(at) => by_newest[at].1.push(set),
+            Err(at) => {
+                let mut sets = Vec::new_in(Global);
+                sets.push(set);
+                by_newest.insert(at, (newest, sets));
+            }
+        }
+    }
+    let mut out = Vec::with_capacity_in(by_newest.len(), Global);
+    for (newest, sets) in by_newest {
+        out.push((closed_tuples(moment, newest)?, sets));
+    }
+    Ok(out)
+}
+
+/// Every cut tuple of a moment after the barriers closed it, the changes of names kept of an
+/// epoch up to `names`, sorted, each once.
+fn closed_tuples(moment: &Moment, names: Option<u64>) -> Result<Vec<Vec<(usize, usize)>>, Refused> {
     let disk = &moment.disk;
     let mut lists = Vec::with_capacity_in(disk.files.len(), Global);
     let mut tuples: u128 = 1;
@@ -672,7 +687,7 @@ fn closed_tuples(moment: &Moment) -> Result<Vec<Vec<(usize, usize)>>, Refused> {
         for (list, at) in lists.iter().zip(&index) {
             cut.push(list[*at]);
         }
-        close(disk, &stamps, &mut cut);
+        close(disk, &stamps, names, &mut cut);
         closed.push(cut);
         // The next tuple: the last file's pair moves fastest.
         let mut file = lists.len();
@@ -701,7 +716,7 @@ fn undone_sets(moment: &Moment) -> Result<Vec<Vec<bool>>, Refused> {
     for choice in 0u32..(1u32 << names.len()) {
         let mut undone = Vec::with_capacity_in(names.len(), Global);
         for i in 0..names.len() {
-            let forced = (0..i).any(|earlier| undone[earlier] && names[earlier].shares(&names[i]));
+            let forced = (0..i).any(|earlier| undone[earlier] && names[earlier].named.shares(&names[i].named));
             undone.push(forced || (choice >> i) & 1 == 1);
         }
         sets.push(undone);
@@ -738,14 +753,15 @@ fn tear_count(file: &SimFile, kept: usize, upto: usize) -> u128 {
 
 /// How many crash points a moment has, made before any disk is built.
 fn count(moment: &Moment) -> Result<u128, Refused> {
-    let undone = undone_sets(moment)?.len() as u128;
     let mut total: u128 = 0;
-    for cut in closed_tuples(moment)? {
-        let mut points = undone;
-        for ((_, file), (kept, upto)) in moment.disk.files.iter().zip(&cut) {
-            points = points.saturating_mul(tear_count(file, *kept, *upto));
+    for (tuples, sets) in groups(moment)? {
+        for cut in tuples {
+            let mut points = sets.len() as u128;
+            for ((_, file), (kept, upto)) in moment.disk.files.iter().zip(&cut) {
+                points = points.saturating_mul(tear_count(file, *kept, *upto));
+            }
+            total = total.saturating_add(points);
         }
-        total = total.saturating_add(points);
     }
     Ok(total)
 }
@@ -807,11 +823,11 @@ fn left_by(disk: &DiskCopy, files: &[FileCut], undone: &[bool]) -> AfterCrash {
         // clone: a refcount.
         left.push(Left { name: name.clone(), link: file.link, bytes });
     }
-    for (named, undo) in disk.names.iter().zip(undone).rev() {
+    for (change, undo) in disk.names.iter().zip(undone).rev() {
         if !*undo {
             continue;
         }
-        match named {
+        match &change.named {
             Named::Put { file, was } => {
                 take(&mut left, file);
                 if let Some(was) = was {
@@ -839,41 +855,42 @@ fn left_by(disk: &DiskCopy, files: &[FileCut], undone: &[bool]) -> AfterCrash {
 /// Every crash point of a moment with the disk it leaves, in the module's order.
 fn enumerate(moment: &Moment) -> Result<Vec<(CrashPoint, AfterCrash)>, Refused> {
     let disk = &moment.disk;
-    let undone = undone_sets(moment)?;
     let mut out = Vec::new_in(Global);
-    for cut in closed_tuples(moment)? {
-        let mut lists = Vec::with_capacity_in(cut.len(), Global);
-        for ((_, file), (kept, upto)) in disk.files.iter().zip(&cut) {
-            lists.push(tears_of(file, *kept, *upto));
-        }
-        let mut index = Vec::with_capacity_in(lists.len(), Global);
-        index.resize(lists.len(), 0usize);
-        loop {
-            let mut files = Vec::with_capacity_in(lists.len(), Global);
-            for ((((name, file), (kept, _)), list), at) in disk.files.iter().zip(&cut).zip(&lists).zip(&index) {
-                // clone: a refcount and the point's own copy of its tear.
-                files.push(FileCut { name: name.clone(), changes: file.ops.len(), whole: *kept, tear: list[*at].clone() });
+    for (tuples, undone) in groups(moment)? {
+        for cut in tuples {
+            let mut lists = Vec::with_capacity_in(cut.len(), Global);
+            for ((_, file), (kept, upto)) in disk.files.iter().zip(&cut) {
+                lists.push(tears_of(file, *kept, *upto));
             }
-            for set in &undone {
-                let left = left_by(disk, &files, set);
-                // clone: the point's own copies.
-                let point = CrashPoint { after: moment.after, step: moment.step, files: files.clone(), undone: set.clone() };
-                out.push((point, left));
-            }
-            // The next combination of tears: the last file's moves fastest; done when all wrap.
-            let mut file = lists.len();
-            let mut moved = false;
-            while file > 0 {
-                file -= 1;
-                index[file] += 1;
-                if index[file] < lists[file].len() {
-                    moved = true;
+            let mut index = Vec::with_capacity_in(lists.len(), Global);
+            index.resize(lists.len(), 0usize);
+            loop {
+                let mut files = Vec::with_capacity_in(lists.len(), Global);
+                for ((((name, file), (kept, _)), list), at) in disk.files.iter().zip(&cut).zip(&lists).zip(&index) {
+                    // clone: a refcount and the point's own copy of its tear.
+                    files.push(FileCut { name: name.clone(), changes: file.ops.len(), whole: *kept, tear: list[*at].clone() });
+                }
+                for set in &undone {
+                    let left = left_by(disk, &files, set);
+                    // clone: the point's own copies.
+                    let point = CrashPoint { after: moment.after, step: moment.step, files: files.clone(), undone: set.clone() };
+                    out.push((point, left));
+                }
+                // The next combination of tears: the last file's moves fastest; done when all wrap.
+                let mut file = lists.len();
+                let mut moved = false;
+                while file > 0 {
+                    file -= 1;
+                    index[file] += 1;
+                    if index[file] < lists[file].len() {
+                        moved = true;
+                        break;
+                    }
+                    index[file] = 0;
+                }
+                if !moved {
                     break;
                 }
-                index[file] = 0;
-            }
-            if !moved {
-                break;
             }
         }
     }
@@ -1082,6 +1099,96 @@ mod tests {
             Err(other) => panic!("refused otherwise: {other}"),
             Ok(swept) => panic!("swept {} crash points over a cap of 10", swept.cuts),
         }
+    }
+
+    /// The old table and the new: two sectors of the new one, no byte of either zero, so a
+    /// tear is told from both.
+    fn tables() -> (Vec<u8>, Vec<u8>) {
+        (vec![0xEE; 300], (0..600u32).map(|at| (at % 250) as u8 + 1).collect())
+    }
+
+    /// A table committed by its name, as blaze-solo commits its table: the old table durable
+    /// under its name, the new one written beside it with no sync, a barrier of it, and the
+    /// rename over the old with no sync either.
+    fn table_steps() -> Vec<(&'static str, Effect)> {
+        let (table, part) = (name("st/table"), name("st/table.part"));
+        let (old, new) = tables();
+        vec![
+            ("write the old table", Effect::Write { file: table.clone(), bytes: old, tag: Tag(1) }),
+            ("sync the tables' names", Effect::SyncDir { dir: name("st").into(), tag: Tag(2) }),
+            ("write the new table beside it", Effect::WriteUnsynced { file: part.clone(), bytes: new, tag: Tag(3) }),
+            ("barrier the new table", Effect::Barrier { file: part.clone(), tag: Tag(4) }),
+            ("rename it over the old", Effect::RenameUnsynced { from: part, to: table, tag: Tag(5) }),
+        ]
+    }
+
+    /// What a crash left under the table's name that is neither table.
+    #[derive(Debug)]
+    enum TableBroken {
+        /// No file under the name, once the old table was written.
+        Gone,
+        /// A file of this many bytes that is neither the old table nor the whole new one.
+        Torn { len: usize },
+    }
+
+    fn sweep_table(plant: bool) -> Result<Swept<TableBroken>, Refused> {
+        let mut sim = Sim::new(13, Faults::default());
+        if plant {
+            sim.plant(Plant::BarriersNotKept);
+        }
+        let table = name("st/table");
+        every_cut(
+            &mut sim,
+            Sweep { cap: 1 << 20, recovery_seed: 14 },
+            |steps| {
+                for (what, effect) in table_steps() {
+                    steps.step(what, effect)?;
+                }
+                Ok(())
+            },
+            |sim, point| {
+                if point.after == 0 {
+                    return Ok(());
+                }
+                if !sim.exists(&table) {
+                    return Err(TableBroken::Gone);
+                }
+                let bytes = sim.contents(&table);
+                let (old, new) = tables();
+                match bytes == old || bytes == new {
+                    true => Ok(()),
+                    false => Err(TableBroken::Torn { len: bytes.len() }),
+                }
+            },
+        )
+    }
+
+    /// A barrier orders what it covers before a later change of a name: at every crash point
+    /// of the commit, the table's name holds the old table or the whole new one. Prints
+    /// "every cut of the table's commit: <n> crash points, 0 failures" (n to verify by the
+    /// run).
+    #[test]
+    fn every_crash_point_of_a_rename_after_a_barrier_holds_a_whole_table() {
+        let swept = sweep_table(false).unwrap_or_else(|refused| panic!("{refused}"));
+        eprintln!("every cut of the table's commit: {} crash points, {} failures", swept.points, swept.failures.len());
+        if let Some((point, broken)) = swept.failures.first() {
+            panic!("the table's name held a broken table at {point}: {broken:?}");
+        }
+        assert_eq!(swept.moments, 6);
+    }
+
+    /// The planted-bug control: with the barriers keeping nothing, a crash after the rename
+    /// leaves a torn table under the name. Prints "the planted bug: first at after step 5
+    /// ...: Torn { len: .. }" (the point to verify by the run).
+    #[test]
+    fn every_cut_finds_a_torn_table_where_the_barriers_keep_nothing() {
+        let swept = sweep_table(true).unwrap_or_else(|refused| panic!("{refused}"));
+        let Some((point, broken)) = swept.failures.first() else {
+            panic!("the planted bug passed every one of {} crash points", swept.points);
+        };
+        eprintln!("the planted bug: first at {point}: {broken:?}");
+        assert_eq!(point.after, 5, "only a kept rename shows the new table's bytes under its name: {point}");
+        assert!(matches!(broken, TableBroken::Torn { .. }), "{broken:?}");
     }
 
     /// The seeds the random side of (c) may take for one moment before it calls a disk of the

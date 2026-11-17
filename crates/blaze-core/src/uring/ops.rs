@@ -437,7 +437,7 @@ pub(super) fn arena_of(hot: &Hot) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use blaze_hash::HashMap;
+    use blaze_hash::{FixedState, Map, MapOpts};
     use std::alloc::Global;
 
     use super::*;
@@ -449,7 +449,7 @@ mod tests {
         for seed in 0..32 {
             let mut rng = crate::sim::Rng::new(seed);
             let mut ops = Ops::new(1 << 12).unwrap();
-            let mut model: HashMap<u64, (Id, u64, Vec<u8>, u64), Global> = HashMap::new_in(Global);
+            let mut model: Map<u64, (Id, u64, Vec<u8>, u64), FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
             for next in 0..2_000u64 {
                 if model.is_empty() || (model.len() < 128 && rng.below(3) != 0) {
                     let bytes = next.to_le_bytes().to_vec();

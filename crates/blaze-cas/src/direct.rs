@@ -781,7 +781,7 @@ pub enum Residency {
 
 /// [`Residency::Model`]'s pages: `(file, page)` of [`MODEL_PAGE`] bytes each.
 pub struct Model {
-    pages: blaze_hash::HashSet<(FileName, u64), Global>,
+    pages: blaze_hash::Set<(FileName, u64), blaze_hash::FixedState, Global>,
 }
 
 /// The page of [`Residency::Model`].
@@ -790,7 +790,13 @@ pub const MODEL_PAGE: u64 = 4 << 10;
 impl Residency {
     /// A model of a page cache that holds nothing yet.
     pub fn model() -> Residency {
-        Residency::Model(Model { pages: blaze_hash::HashSet::new_in(Global) })
+        Residency::Model(Model {
+            pages: blaze_hash::Set::new(blaze_hash::SetOpts {
+                hasher: blaze_hash::FixedState,
+                alloc: Global,
+                capacity: None,
+            }),
+        })
     }
 
     /// Whether every page of `record`, the bytes at `at` of `file` (a slice of its mapping), is

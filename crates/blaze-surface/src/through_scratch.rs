@@ -16,7 +16,7 @@
 //! and their bound are the same. A map's order never reaches an answer: the key index is a
 //! lookup only. The memo lives for one call; the scratch holds no answer between calls.
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_id::{CrateItemKey, ItemKey};
 use blaze_own::{AVec, Alloc, Vec};
 
@@ -44,7 +44,7 @@ pub struct ThroughScratch<'a> {
     /// Slot -> the source's key, in the order the walk reached them (slot 0: the asked source).
     keys: AVec<'a, ItemKey>,
     /// Key -> slot, filled only once more than [`LINEAR`] sources are reached; a lookup only.
-    index: HashMap<ItemKey, u32, Alloc<'a>>,
+    index: Map<ItemKey, u32, FixedState, Alloc<'a>>,
     /// Slot -> what the source is.
     slots: AVec<'a, Slot>,
     /// Every walked node's glob edges, copied once when the node is reached, node after node.
@@ -65,7 +65,7 @@ impl<'a> ThroughScratch<'a> {
     pub fn new_in(alloc: Alloc<'a>) -> ThroughScratch<'a> {
         ThroughScratch {
             keys: Vec::new_in(alloc),
-            index: HashMap::new_in(alloc),
+            index: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             slots: Vec::new_in(alloc),
             edges: Vec::new_in(alloc),
             edge_slots: Vec::new_in(alloc),
@@ -123,7 +123,7 @@ impl<'a> ThroughScratch<'a> {
             }
             Node::Edges { edges, krate, chain } => {
                 let e0 = u32::try_from(self.edges.len()).ok()?;
-                self.edges.extend_from_slice(edges);
+                self.edges.extend(edges.iter());
                 let e1 = u32::try_from(self.edges.len()).ok()?;
                 let c0 = u32::try_from(self.chains.len()).ok()?;
                 self.chains.extend_from_slice(chain);
@@ -161,6 +161,12 @@ pub fn through_in<'w, W: Sources<'w>>(
     let first = sources.node(source).map_err(Through::Stop)?;
     if let Node::Value(v) = first {
         return Ok(v);
+    }
+    // A source with no binding and no glob edge holds nothing under the name: the walk below
+    // would read no other node and answer `None`. Answered here, the scratch is not touched, so a
+    // miss in a glob-free module (a lexical layer passed through) allocates nothing (D114 rule 1).
+    if matches!(first, Node::Edges { edges, .. } if edges.is_empty()) {
+        return Ok(None);
     }
     scratch.clear();
     scratch.add(source.key, first).ok_or(Through::Unbounded)?;

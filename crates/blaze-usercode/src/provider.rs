@@ -15,7 +15,7 @@
 
 use std::{alloc::Global, ffi::OsStr, ffi::OsString};
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::{ContentId, Hasher};
 
 use crate::{RunKey, RunKind};
@@ -179,14 +179,14 @@ pub struct Answers {
     seed: Seed,
     /// How many bytes of its `getrandom` stream each stream has given, by its seed (the run's
     /// or a scope's) and its number under it.
-    taken: HashMap<(Seed, u64), u64, Global>,
+    taken: Map<(Seed, u64), u64, FixedState, Global>,
     /// How many opens of a random device each stream has answered, keyed as `taken` is.
-    opened: HashMap<(Seed, u64), u64, Global>,
+    opened: Map<(Seed, u64), u64, FixedState, Global>,
     /// The place of each process of a scope in it, by the scope's seed and the process's id
     /// as the supervisor sees it.
-    places: HashMap<(Seed, u64), u64, Global>,
+    places: Map<(Seed, u64), u64, FixedState, Global>,
     /// How many processes of each scope have a place, by the scope's seed.
-    placed: HashMap<Seed, u64, Global>,
+    placed: Map<Seed, u64, FixedState, Global>,
     /// Test-only: the bug to plant.
     plant: Plant,
 }
@@ -228,10 +228,10 @@ impl Answers {
     pub fn planted(provider: &Provider, plant: Plant) -> Answers {
         Answers {
             seed: provider.seed,
-            taken: HashMap::new_in(Global),
-            opened: HashMap::new_in(Global),
-            places: HashMap::new_in(Global),
-            placed: HashMap::new_in(Global),
+            taken: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            opened: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            places: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            placed: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             plant,
         }
     }

@@ -200,31 +200,9 @@ impl Plain {
                 if (!every && seg.namespace != *space) || self.dropped.contains(&seg.id) {
                     continue;
                 }
-                if let Some(&map) = self.by_id.get(&seg.id) {
-                    self.probes.probes += 1;
-                    if let Some((_, entry)) = self.probe(map, key) {
-                        return Ok(Probe::Hit(Found { key: *key, tag: entry.tag, namespace: seg.namespace, at: At::Mapped { map, entry } }));
-                    }
-                    continue;
+                if let Some(probe) = self.probe_row(row, key, now_ns, effects)? {
+                    return Ok(probe);
                 }
-                if let Some(parked) = self.unchecked.get(&seg.id) {
-                    self.probes.probes += 1;
-                    if !parked.names(key) {
-                        // A miss in an unproved run is a miss: nothing of it is served.
-                        continue;
-                    }
-                    // Its first hit: the one full check, now.
-                    self.check_parked(seg.id);
-                    if let Some(map) = self.mapped_row(row)
-                        && let Some((_, entry)) = self.probe(map, key)
-                    {
-                        return Ok(Probe::Hit(Found { key: *key, tag: entry.tag, namespace: seg.namespace, at: At::Mapped { map, entry } }));
-                    }
-                    // Lost by its check (reported), or its proved index does not hold the key.
-                    continue;
-                }
-                self.ask_map(row, now_ns, effects)?;
-                return Ok(Probe::Map);
             }
             if every {
                 break;
@@ -238,6 +216,76 @@ impl Plain {
         Ok(Probe::Absent)
     }
 
+    /// One row of a lookup, `row` not lost: `Some(Hit)`; `Some(Map)` when it is not mapped yet
+    /// (one `Effect::Map` pushed for it alone); `None` when it does not hold `key` (a miss in a
+    /// parked run is a miss; a parked run that names it is checked whole now, its first hit).
+    fn probe_row(&mut self, row: usize, key: &Key, now_ns: u64, effects: &mut Vec<Effect>) -> Result<Option<Probe>, StoreError> {
+        let seg = self.manifest.segments[row];
+        let hit = |map: usize, entry: Entry| Probe::Hit(Found { key: *key, tag: entry.tag, namespace: seg.namespace, at: At::Mapped { map, entry } });
+        if let Some(&map) = self.by_id.get(&seg.id) {
+            self.probes.probes += 1;
+            return Ok(self.probe(map, key).map(|(map, entry)| hit(map, entry)));
+        }
+        if let Some(parked) = self.unchecked.get(&seg.id) {
+            self.probes.probes += 1;
+            if !parked.names(key) {
+                // A miss in an unproved run is a miss: nothing of it is served.
+                return Ok(None);
+            }
+            // Its first hit: the one full check, now. Lost by its check (reported), or its
+            // proved index does not hold the key: a miss.
+            self.check_parked(seg.id);
+            return Ok(self.mapped_row(row).and_then(|map| self.probe(map, key)).map(|(map, entry)| hit(map, entry)));
+        }
+        self.ask_map(row, now_ns, effects)?;
+        Ok(Some(Probe::Map))
+    }
+
+    /// The rows a replaceable record's read walks: `space`'s rows held here, NEWEST first (the
+    /// manifest's order is the commit order: a commit appends its rows, a commit of bytes named
+    /// already moves that row to the end, and a merge replaces a contiguous run of a
+    /// namespace's rows in place: `build` and `plan`). Not [`Plain::order_view`]'s order
+    /// (largest first), which serves content-keyed records, equal in every row.
+    fn newest_rows(&self, space: Namespace) -> impl Iterator<Item = usize> + '_ {
+        let rows = self.manifest.segments.len();
+        let oldest = self.plant() == Plant::PointerOldest;
+        (0..rows).map(move |i| if oldest { i } else { rows - 1 - i }).filter(move |&row| {
+            let seg = &self.manifest.segments[row];
+            seg.local && seg.namespace == space && !self.dropped.contains(&seg.id)
+        })
+    }
+
+    /// The NEWEST record under `key` in `space`: what this process holds uncommitted, then the
+    /// rows of `space` newest first ([`Plain::newest_rows`]), the first that holds it answering;
+    /// a row is mapped at its first probe, as [`Plain::find`] maps. What a pointer is read by
+    /// ([`super::POINTER_TAG`]): its newer value lies in a later row. At most one probe a row,
+    /// so at most [`super::SEGMENTS_MOST`] (and the rows since the last merge) a read.
+    pub fn find_newest(&mut self, space: Namespace, key: &Key, now_ns: u64, effects: &mut Vec<Effect>) -> Result<Probe, StoreError> {
+        if let Some(why) = &self.broken {
+            return Err(why.clone());
+        }
+        if !self.ready() {
+            return Err(StoreError::Busy { phase: self.what() });
+        }
+        if let Some((_, entry)) = self.held_in(space, key) {
+            return Ok(Probe::Hit(Found { key: *key, tag: entry.tag, namespace: space, at: At::Held }));
+        }
+        let mut rows: Vec<usize> = Vec::new_in(std::alloc::Global);
+        rows.extend(self.newest_rows(space));
+        for row in rows {
+            if let Some(probe) = self.probe_row(row, key, now_ns, effects)? {
+                return Ok(probe);
+            }
+        }
+        Ok(Probe::Absent)
+    }
+
+    /// [`Plain::find_newest`] over the mapped rows alone, committed records only: the map index
+    /// and the entry. The commit's layout and compaction ask it, over a whole store.
+    pub(crate) fn newest_mapped(&self, space: Namespace, key: &Key) -> Option<(usize, Entry)> {
+        self.newest_rows(space).filter_map(|row| self.mapped_row(row)).find_map(|at| self.probe(at, key))
+    }
+
     /// The bytes of what [`Plain::find`] found, in place: no check (a mapped segment is
     /// proved; a held record is this process's own).
     pub fn got(&self, found: Found) -> Got<'_> {
@@ -249,7 +297,9 @@ impl Plain {
                 }
                 // Committed since it was found: a commit maps what it wrote (a commit needs a
                 // whole store, and a whole store maps every generation it adopts).
-                self.find_in(std::slice::from_ref(&found.namespace), &found.key).expect("a record found held is still held, or committed into a segment this process mapped after its flip")
+                // A pointer's value is its newest row's.
+                let committed = if found.tag == super::POINTER_TAG { self.newest_mapped(found.namespace, &found.key) } else { self.find_in(std::slice::from_ref(&found.namespace), &found.key) };
+                committed.expect("a record found held is still held, or committed into a segment this process mapped after its flip")
             }
         };
         let mut checks = self.checks.get();

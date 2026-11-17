@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use blaze_graph::par;
-use blaze_hash::HashSet;
+use blaze_hash::{FixedState, Set, SetOpts};
 use blaze_ids::radix;
 use blaze_mem::align::align_up_u64;
 use std::alloc::Global;
@@ -487,7 +487,7 @@ impl<'a> Stage<'a> {
     /// export ([`crate::native::Resolved::exports`]: `/EXPORT` directives, and what an ELF
     /// executable defines that a shared library it links names), the live descriptor.
     pub fn exports(&self) -> FrameVec<'a, Asked<'_>> {
-        let mut seen: HashSet<&str, Global> = HashSet::new_in(Global);
+        let mut seen: Set<&str, FixedState, Global> = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
         let mut out: FrameVec<'a, Asked<'_>> = Vec::new_in(self.arena);
         if let crate::OutputKind::Shared { exports, .. } = &self.output.kind {
             out.reserve(exports.len());

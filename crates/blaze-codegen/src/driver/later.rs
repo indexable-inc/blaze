@@ -84,13 +84,13 @@ pub struct Later<I, S> {
     /// once this is gone.
     pub(super) nodes: std::sync::Arc<Sorted<InstanceKey, FnNode<I, S>>>,
     /// The shape of each function whose IR was built for its check.
-    pub(super) shapes: HashMap<InstanceKey, ContentId, Global>,
+    pub(super) shapes: Map<InstanceKey, ContentId, FixedState, Global>,
 }
 
 impl<I, S> Default for Later<I, S> {
     fn default() -> Self {
         // alloc: once per build, an empty walk
-        Later { nodes: std::sync::Arc::new(Sorted::default()), shapes: HashMap::new_in(Global) }
+        Later { nodes: std::sync::Arc::new(Sorted::default()), shapes: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }) }
     }
 }
 
@@ -107,7 +107,7 @@ pub(super) struct Lazily {
     pub(super) walked: Vec<Walked>,
     pub(super) entry: Vec<InstanceKey>,
     /// The shape of each function whose IR was built for its check.
-    pub(super) shapes: HashMap<InstanceKey, ContentId, Global>,
+    pub(super) shapes: Map<InstanceKey, ContentId, FixedState, Global>,
 }
 
 /// Where a compile's template came from.
@@ -691,7 +691,7 @@ impl<B: Prepare> Build<'_, B> {
             .filter(|it| it.described.section.as_deref().is_some_and(runs_at_start))
             .flat_map(|it| it.refs.iter().filter_map(callee));
         // alloc: per build, its entry and start functions
-        let ahead: HashSet<InstanceKey, Global> =
+        let ahead: Set<InstanceKey, FixedState, Global> =
             entry_keys.iter().copied().chain(started).collect();
         // alloc: per build, its entry and start functions
         let mut ahead: Vec<InstanceKey> = ahead.into_iter().collect();
@@ -729,7 +729,7 @@ impl<B: Prepare> Build<'_, B> {
                 // The IR is let go here, on the thread that built it: only its shape is kept.
                 (*key, made.map(|(shape, _)| shape.key()))
             });
-        let mut shapes = HashMap::with_capacity_in(checked.len(), Global);
+        let mut shapes = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(checked.len()) });
         for (key, shape) in checked {
             match shape {
                 Ok(shape) => {

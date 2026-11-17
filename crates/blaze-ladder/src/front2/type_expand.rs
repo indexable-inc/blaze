@@ -33,13 +33,13 @@ use super::source::NamesSource;
 use super::types::{Why, return_impls};
 
 /// A type's own text lowered with every macro call in it expanded, and the type it is.
-pub(super) struct Expanded<'t> {
-    lowered: Lowered<'static, 't>,
+pub(super) struct Expanded<'a, 't> {
+    lowered: Lowered<'a, 't>,
     /// The expanded type, in [`Expanded::view`].
     pub root: lf::TypeId,
 }
 
-impl<'t> Expanded<'t> {
+impl<'a, 't> Expanded<'a, 't> {
     /// The expansion's own view: [`Expanded::root`] and every type id from it are ids of this
     /// view alone.
     pub(super) fn view(&self) -> View<'_> {
@@ -64,14 +64,14 @@ impl<'t> Expanded<'t> {
 
 /// The type written as `text` (a signature's type, read from its view) in module `module`, with
 /// every macro call in it expanded by the names of that module and its crate's cfg and edition;
-/// `r` is the written type's place in the item, for a refusal.
-pub(super) fn expand_type_text<'n, 't, S: NamesSource<'n>>(names: S, module: LibKey, text: &'t str, r: Range) -> Result<Expanded<'t>, Why> {
+/// `r` is the written type's place in the item, for a refusal; the expansion is made in `alloc`.
+pub(super) fn expand_type_text<'n, 'a, 't, S: NamesSource<'n>>(names: S, module: LibKey, text: &'t str, r: Range, alloc: Alloc<'a>) -> Result<Expanded<'a, 't>, Why> {
     let krate = names.crate_of(module).ok_or_else(|| Why::TypeMacro(format!("`{text}`: the crate of module {module:x} is not read").into_boxed_str(), r))?;
     let atoms = names.cfg_atoms(krate).ok_or_else(|| Why::TypeMacro(format!("`{text}`: the cfg of the crate of module {module:x} is not read").into_boxed_str(), r))?;
     let edition = names.edition_of(krate).ok_or_else(|| Why::TypeMacro(format!("`{text}`: the edition of the crate of module {module:x} is not read").into_boxed_str(), r))?;
     let scoped = ScopedBy { names, module, prepared: None };
-    let mut expand = ByName::with_names(&scoped, NoHost, Alloc::global());
-    let lowered = blaze_lower::lower_type_text_expanding(text, edition, &mut CrateCfg(atoms), &mut expand, Alloc::global())
+    let mut expand = ByName::with_names(&scoped, NoHost, alloc);
+    let lowered = blaze_lower::lower_type_text_expanding(text, edition, &mut CrateCfg(atoms), &mut expand, alloc)
         .map_err(|e| Why::TypeMacro(format!("`{text}`: {e}").into_boxed_str(), r))?;
     let root = lowered.view().type_root().ok_or_else(|| Why::TypeMacro(format!("`{text}` expanded to no type").into_boxed_str(), r))?;
     Ok(Expanded { lowered, root })

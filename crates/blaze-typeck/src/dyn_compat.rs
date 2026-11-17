@@ -281,6 +281,7 @@ pub enum Verdict {
 /// [`MAX_SUPERTRAITS`] traits (a supertrait is a `PClause::Trait` on `Param(0)`); a supertrait
 /// that is the `Sized` lang item is [`DynRule::SizedSupertrait`].
 pub(crate) fn verdict<W: World>(reads: &mut Reads<'_, '_, W>, trait_: ItemKey) -> Result<Verdict, Stop> {
+    let alloc = reads.alloc();
     let mut list = [ItemKey(0); MAX_SUPERTRAITS];
     list[0] = trait_;
     let mut len = 1usize;
@@ -304,7 +305,7 @@ pub(crate) fn verdict<W: World>(reads: &mut Reads<'_, '_, W>, trait_: ItemKey) -
             if def.types.node(first)? != PNode::Param(0) {
                 continue;
             }
-            if names_self(def.types, rest)? {
+            if names_self(def.types, rest, alloc)? {
                 return Ok(Verdict::Gap { trait_, by: t, why: GapWhy::SelfInSupertraitArgs });
             }
             if reads.trait_def(st)?.is_some_and(|d| d.lang == Some(LangItem::Sized)) {
@@ -396,12 +397,12 @@ pub fn item_dyn_findings<W: World>(world: &W, item: ItemKey, out: &mut Vec<crate
 
 /// Whether `Param(0)` is in any of the types `l` of `t`: a bounded walk over the node table,
 /// whose children come before their parents (each node is visited once).
-pub(crate) fn names_self(t: PTys<'_>, l: &[PTy]) -> Result<bool, Stop> {
-    let mut seen: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(t.len(), Alloc::global());
+pub(crate) fn names_self(t: PTys<'_>, l: &[PTy], alloc: Alloc<'_>) -> Result<bool, Stop> {
+    let mut seen: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(t.len(), alloc);
     seen.resize(t.len(), false);
-    let mut todo: Vec<PTy, Alloc<'_>> = Vec::with_capacity_in(l.len(), Alloc::global());
+    let mut todo: Vec<PTy, Alloc<'_>> = Vec::with_capacity_in(l.len(), alloc);
     todo.extend_from_slice(l);
-    let mut kids: Vec<PTy, Alloc<'_>> = Vec::new_in(Alloc::global());
+    let mut kids: Vec<PTy, Alloc<'_>> = Vec::new_in(alloc);
     while let Some(p) = todo.pop() {
         let Some(s) = seen.get_mut(p.0 as usize) else { return Err(CheckError::Malformed(Malformed::TypeOrder { node: p.0, child: p.0 }).into()) };
         if core::mem::replace(s, true) {

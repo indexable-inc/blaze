@@ -11,9 +11,8 @@
 
 use crate::edit_distance::closest_msg;
 use crate::interning::InternedString;
-use crate::poll::LocalPollAdapter;
 use crate::registry::IndexSummary;
-use crate::registry::QueryKind;
+use crate::registry::{Lookup, QueryKind};
 use crate::resolver::CargoResult;
 use crate::resolver::context::ResolverContext;
 use crate::resolver::errors::describe_path_in_context;
@@ -24,36 +23,74 @@ use crate::resolver::{
 };
 use crate::{Dependency, FeatureValue, PackageId, PackageIdSpec, Registry, ResolveError, Summary};
 
-use crate::resolver::{HashMap, HashSet};
+use crate::resolver::{FixedState, Map, MapOpts, Set, SetOpts};
 use blaze_ids::radix;
 use std::alloc::Global;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::rc::Rc;
-use std::task::Poll;
 use blaze_trace::debug;
 
-pub(super) struct RegistryQueryerAsync<'a, T: Registry> {
-    pub registry: &'a T,
+type QueryKey = (Dependency, Option<VersionOrdering>);
+
+/// The registry as the resolver queries it: `[replace]` applied, each dependency's candidates
+/// sorted and kept, and a cache of the dependencies a summary needs.
+pub(super) struct RegistryQueryer<'a, T: Registry> {
+    registry: &'a T,
     replacements: &'a [(PackageIdSpec, Dependency)],
     version_prefs: &'a VersionPreferences,
     /// all the cases we ended up using a supplied replacement
-    used_replacements: RefCell<HashMap<PackageId, Summary, Global>>,
+    used_replacements: RefCell<Map<PackageId, Summary, FixedState, Global>>,
+    /// Each query's candidates, once answered. A failure is not kept: the registry is asked
+    /// again and answers it again.
+    candidates: Map<QueryKey, Rc<[Summary]>, FixedState, Global>,
+
+    /// a cache of `Dependency`s that are required for a `Summary`
+    ///
+    /// HACK: `first_version` is not kept in the cache key is it is 1:1 with
+    /// `parent.is_none()` (the first element of the cache key) as it doesn't change through
+    /// execution. An entry made while a query was [`Lookup::Unknown`] lacks that dependency;
+    /// it stands for this round only, which the resolve machine throws away.
+    summary_cache: Map<(Option<PackageId>, Summary, ResolveOpts), Rc<(Set<InternedString, FixedState, Global>, Rc<[DepInfo]>)>, FixedState, Global>,
 }
 
-impl<'a, T: Registry> RegistryQueryerAsync<'a, T> {
+impl<'a, T: Registry> RegistryQueryer<'a, T> {
     pub(super) fn new(
         registry: &'a T,
         replacements: &'a [(PackageIdSpec, Dependency)],
         version_prefs: &'a VersionPreferences,
     ) -> Self {
-        RegistryQueryerAsync {
+        RegistryQueryer {
             registry,
             replacements,
             version_prefs,
-            used_replacements: RefCell::new(HashMap::new_in(Global)),
+            used_replacements: RefCell::new(Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None })),
+            candidates: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            summary_cache: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
         }
+    }
+
+    pub(super) fn registry(&self) -> &T {
+        self.registry
+    }
+
+    /// The candidates for `dep`, sorted, from the cache or the registry.
+    pub(super) fn query(
+        &mut self,
+        dep: &Dependency,
+        first_version: Option<VersionOrdering>,
+    ) -> CargoResult<Lookup<Rc<[Summary]>>> {
+        let key = (dep.clone(), first_version);
+        if let Some(found) = self.candidates.get(&key) {
+            return Ok(Lookup::Answered(Rc::clone(found)));
+        }
+        let found = match self.ask(&key)? {
+            Lookup::Answered(found) => found,
+            Lookup::Unknown => return Ok(Lookup::Unknown),
+        };
+        self.candidates.insert(key, Rc::clone(&found));
+        Ok(Lookup::Answered(found))
     }
 
     /// Queries the `registry` to return a list of candidates for `dep`.
@@ -62,13 +99,11 @@ impl<'a, T: Registry> RegistryQueryerAsync<'a, T> {
     /// any candidates are returned which match an override then the override is
     /// applied by performing a second query for what the override should
     /// return.
-    async fn query(
-        &self,
-        key: &(Dependency, Option<VersionOrdering>),
-    ) -> CargoResult<Rc<[Summary]>> {
+    fn ask(&self, key: &QueryKey) -> CargoResult<Lookup<Rc<[Summary]>>> {
         let (dep, first_version) = key;
         let mut summaries = Vec::new();
-        self.registry
+        let asked = self
+            .registry
             .query(dep, QueryKind::Exact, &mut |s| match s {
                 IndexSummary::Candidate(summary) => summaries.push(summary),
                 // Prefer yanked only when
@@ -86,8 +121,10 @@ impl<'a, T: Registry> RegistryQueryerAsync<'a, T> {
                     }
                 }
                 _ => {}
-            })
-            .await?;
+            })?;
+        if asked == Lookup::Unknown {
+            return Ok(Lookup::Unknown);
+        }
 
         for summary in summaries.iter() {
             let mut potential_matches =
@@ -98,13 +135,14 @@ impl<'a, T: Registry> RegistryQueryerAsync<'a, T> {
             };
             debug!("found an override for {} {}", dep.package_name(), dep.version_req());
 
-            let mut summaries =
-                self.registry.query_vec(dep, QueryKind::Exact).await?.into_iter().filter_map(|s| {
-                    match s {
-                        IndexSummary::Candidate(s) => Some(s),
-                        _ => None,
-                    }
-                });
+            let replacing = match self.registry.query_vec(dep, QueryKind::Exact)? {
+                Lookup::Answered(replacing) => replacing,
+                Lookup::Unknown => return Ok(Lookup::Unknown),
+            };
+            let mut summaries = replacing.into_iter().filter_map(|s| match s {
+                IndexSummary::Candidate(s) => Some(s),
+                _ => None,
+            });
             let s = summaries.next().ok_or_else(|| ResolveError::OverrideNotFound {
                 spec: spec.clone(), // clone: error path
                 source: dep.source_id(),
@@ -158,94 +196,15 @@ impl<'a, T: Registry> RegistryQueryerAsync<'a, T> {
         }
 
         self.version_prefs.sort_summaries(&mut summaries, *first_version);
-        Ok(summaries.into())
-    }
-}
-
-type QueryKey = (Dependency, Option<VersionOrdering>);
-type Candidates = CargoResult<Rc<[Summary]>>;
-
-/// One query of a [`RegistryQueryer`] in flight: the future of [`start_query`].
-pub(super) trait Query: Future<Output = (QueryKey, Candidates)> {}
-
-impl<Q: Future<Output = (QueryKey, Candidates)>> Query for Q {}
-
-async fn start_query<T: Registry>(
-    inner: Rc<RegistryQueryerAsync<'_, T>>,
-    key: QueryKey,
-) -> (QueryKey, Candidates) {
-    let candidates = inner.query(&key).await;
-    (key, candidates)
-}
-
-/// Wrapper around RegistryQueryerAsync that provides
-/// caching and a Poll based interface using `LocalPollAdapter`.
-pub(super) struct RegistryQueryer<'a, T: Registry, Q> {
-    inner: Rc<RegistryQueryerAsync<'a, T>>,
-    poller: LocalPollAdapter<Rc<RegistryQueryerAsync<'a, T>>, QueryKey, Candidates, Q>,
-
-    /// a cache of `Dependency`s that are required for a `Summary`
-    ///
-    /// HACK: `first_version` is not kept in the cache key is it is 1:1 with
-    /// `parent.is_none()` (the first element of the cache key) as it doesn't change through
-    /// execution.
-    summary_cache: HashMap<
-        (Option<PackageId>, Summary, ResolveOpts),
-        (Rc<(HashSet<InternedString, Global>, Rc<[DepInfo]>)>, bool),
-        Global,
-    >,
-}
-
-/// The [`RegistryQueryer`] over `registry`.
-pub(super) fn registry_queryer<'a, T: Registry>(
-    registry: &'a T,
-    replacements: &'a [(PackageIdSpec, Dependency)],
-    version_prefs: &'a VersionPreferences,
-) -> RegistryQueryer<'a, T, impl Query> {
-    let inner = Rc::new(RegistryQueryerAsync::new(registry, replacements, version_prefs));
-    RegistryQueryer {
-        inner: Rc::clone(&inner),
-        poller: LocalPollAdapter::new(inner, start_query::<T>),
-        summary_cache: HashMap::new_in(Global),
-    }
-}
-
-impl<'a, T: Registry, Q: Query> RegistryQueryer<'a, T, Q> {
-    pub(super) fn registry(&self) -> &T {
-        self.inner.registry
-    }
-
-    pub(super) fn query(
-        &mut self,
-        dep: &Dependency,
-        first_version: Option<VersionOrdering>,
-    ) -> Poll<CargoResult<Rc<[Summary]>>> {
-        self.poller.poll((dep.clone(), first_version))
-    }
-
-    pub(super) fn wait(&mut self) -> CargoResult<bool> {
-        let pending = self.poller.pending_count();
-        // Have all outstanding registry requests been completed?
-        let mut all_ready = self.poller.wait()?;
-        debug!(target: "cargo::resolver::restarting", pending);
-
-        // Remove cached summaries that we produced with incomplete information.
-        self.summary_cache.retain(|_, (_, r)| {
-            if !*r {
-                all_ready = false;
-            }
-            *r
-        });
-
-        Ok(all_ready)
+        Ok(Lookup::Answered(summaries.into()))
     }
 
     pub(super) fn used_replacement_for(&self, p: PackageId) -> Option<(PackageId, PackageId)> {
-        self.inner.used_replacements.borrow().get(&p).map(|r| (p, r.package_id()))
+        self.used_replacements.borrow().get(&p).map(|r| (p, r.package_id()))
     }
 
     pub(super) fn replacement_summary(&self, p: PackageId) -> Option<Summary> {
-        self.inner.used_replacements.borrow().get(&p).cloned()
+        self.used_replacements.borrow().get(&p).cloned()
     }
 
     /// Find out what dependencies will be added by activating `candidate`,
@@ -259,11 +218,11 @@ impl<'a, T: Registry, Q: Query> RegistryQueryer<'a, T, Q> {
         candidate: &Summary,
         opts: &ResolveOpts,
         first_version: Option<VersionOrdering>,
-    ) -> ActivateResult<Rc<(HashSet<InternedString, Global>, Rc<[DepInfo]>)>> {
+    ) -> ActivateResult<Rc<(Set<InternedString, FixedState, Global>, Rc<[DepInfo]>)>> {
         // if we have calculated a result before, then we can just return it,
         // as it is a "pure" query of its arguments.
         if let Some(out) = self.summary_cache.get(&(parent, candidate.clone(), opts.clone())) {
-            return Ok(Rc::clone(&out.0));
+            return Ok(Rc::clone(out));
         }
         // First, figure out our set of dependencies based on the requested set
         // of features. This also calculates what features we're going to enable
@@ -272,18 +231,13 @@ impl<'a, T: Registry, Q: Query> RegistryQueryer<'a, T, Q> {
 
         // Next, transform all dependencies into a list of possible candidates
         // which can satisfy that dependency.
-        let mut all_ready = true;
         let mut deps = deps
             .into_iter()
             .filter_map(|(dep, features)| match self.query(&dep, first_version) {
-                Poll::Ready(Ok(candidates)) => Some(Ok((dep, candidates, features))),
-                Poll::Pending => {
-                    all_ready = false;
-                    // we can ignore Pending deps, resolve will be repeatedly called
-                    // until there are none to ignore
-                    None
-                }
-                Poll::Ready(Err(e)) => Some(Err(ResolveError::DependencyQuery {
+                Ok(Lookup::Answered(candidates)) => Some(Ok((dep, candidates, features))),
+                // Left out: the resolve machine asks for it and throws this round away.
+                Ok(Lookup::Unknown) => None,
+                Err(e) => Some(Err(ResolveError::DependencyQuery {
                     dep: dep.package_name(),
                     path: describe_path_in_context(cx, &candidate.package_id()),
                     cause: Box::new(e),
@@ -301,8 +255,7 @@ impl<'a, T: Registry, Q: Query> RegistryQueryer<'a, T, Q> {
 
         // If we succeed we add the result to the cache so we can use it again next time.
         // We don't cache the failure cases as they don't impl Clone.
-        self.summary_cache
-            .insert((parent, candidate.clone(), opts.clone()), (Rc::clone(&out), all_ready));
+        self.summary_cache.insert((parent, candidate.clone(), opts.clone()), Rc::clone(&out));
 
         Ok(out)
     }
@@ -314,7 +267,7 @@ pub(super) fn resolve_features<'b>(
     parent: Option<PackageId>,
     s: &'b Summary,
     opts: &'b ResolveOpts,
-) -> ActivateResult<(HashSet<InternedString, Global>, Vec<(Dependency, FeaturesSet)>)> {
+) -> ActivateResult<(Set<InternedString, FixedState, Global>, Vec<(Dependency, FeaturesSet)>)> {
     // First, filter by dev-dependencies.
     let deps = s.dependencies();
     let deps = deps.iter().filter(|d| d.is_transitive() || opts.dev_deps);
@@ -322,7 +275,7 @@ pub(super) fn resolve_features<'b>(
     let reqs = build_requirements(parent, s, opts)?;
     let mut ret = Vec::new();
     let default_dep = BTreeSet::new();
-    let mut valid_dep_names = HashSet::new_in(Global);
+    let mut valid_dep_names = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
 
     // Next, collect all actually enabled dependencies and their features.
     for dep in deps {
@@ -419,10 +372,10 @@ struct Requirements<'a> {
     /// The resolver will activate all of these dependencies, with the given
     /// features enabled.
     // BTreeSet: each becomes a `FeaturesSet`, part of the `DepsCache` key.
-    deps: HashMap<InternedString, BTreeSet<InternedString>, Global>,
+    deps: Map<InternedString, BTreeSet<InternedString>, FixedState, Global>,
     /// The set of features enabled on this package which is later used when
     /// compiling to instruct the code what features were enabled.
-    features: HashSet<InternedString, Global>,
+    features: Set<InternedString, FixedState, Global>,
 }
 
 /// An error for a requirement.
@@ -443,10 +396,10 @@ enum RequirementError {
 
 impl Requirements<'_> {
     fn new(summary: &Summary) -> Requirements<'_> {
-        Requirements { summary, deps: HashMap::new_in(Global), features: HashSet::new_in(Global) }
+        Requirements { summary, deps: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), features: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }) }
     }
 
-    fn into_features(self) -> HashSet<InternedString, Global> {
+    fn into_features(self) -> Set<InternedString, FixedState, Global> {
         self.features
     }
 

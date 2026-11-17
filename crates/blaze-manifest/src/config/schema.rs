@@ -7,7 +7,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::path::Path;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use serde::Deserialize;
 use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
 use serde::de::{self, Unexpected, Visitor};
@@ -349,7 +349,7 @@ impl EnvConfigValue {
     }
 }
 
-pub type EnvConfig = HashMap<String, EnvConfigValue, Global>;
+pub type EnvConfig = Map<String, EnvConfigValue, FixedState, Global>;
 
 /// A token or key, which `Debug` does not show.
 #[derive(Clone, Deserialize)]

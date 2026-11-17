@@ -13,15 +13,19 @@ use core::alloc::Allocator;
 use blaze_build::{InstanceKey, instance_key};
 use blaze_ids::ContentId;
 use blaze_own::{Alloc, Vec};
-use blaze_typeck::{BinOp, FloatTy, IntTy, ItemKey, List, PNode, PTy, PTys, PortableTys, UintTy, UnOp};
+use blaze_typeck::{BinOp, FloatTy, IntTy, ItemKey, List, PNode, PTy, PTys, PortableTys, UnOp};
 
 pub use code::Codes;
 use code::{EnumFacts, Meta, Num, Op, Reg, TyInfo, Valid};
 
+// The rules on bits live in `arith` (rule 30); `code`, `late` and the tests reach them here.
+pub(crate) use crate::arith::{Plant, int_binop, int_info, mask, sext};
+use crate::arith::{int_bits, smax, smin, umax};
 use crate::error::{At, ConstError, Op as Arith, PanicPart, Refusal};
 use crate::layout::{self, IntRepr, Layout, LayoutCx};
 use crate::mem::{AllocId, Memory, Origin, PTR, Pointer, Scalar};
 use crate::record::{ConstRecord, DataAlloc, DataRecord, DataReloc, DataTarget, RecordKey};
+use crate::soft::Format;
 use crate::{ConstWorld, Intrinsic, Limits};
 
 /// What a record or body an evaluation lacks is.
@@ -156,170 +160,6 @@ pub fn eval_discriminant<'a, W: ConstWorld>(world: &W, adt: ItemKey, variant: u3
         Err(Stop::Need(n)) => Ok(Answer::Need(n)),
         Err(Stop::Refused(refusal)) => Err(ConstError { constant: adt, at: None, refusal }),
     }
-}
-
-/// Bits, signedness of an integer type (`bool` and `char` as unsigned 8 and 32).
-fn int_info(n: PNode) -> Option<(u32, bool)> {
-    Some(match n {
-        PNode::Int(i) => (int_bits(i), true),
-        PNode::Uint(u) => (uint_bits(u), false),
-        PNode::Bool => (8, false),
-        PNode::Char => (32, false),
-        _ => return None,
-    })
-}
-
-fn int_bits(i: IntTy) -> u32 {
-    match i {
-        IntTy::I8 => 8,
-        IntTy::I16 => 16,
-        IntTy::I32 => 32,
-        IntTy::I64 | IntTy::Isize => 64,
-        IntTy::I128 => 128,
-    }
-}
-
-fn uint_bits(u: UintTy) -> u32 {
-    match u {
-        UintTy::U8 => 8,
-        UintTy::U16 => 16,
-        UintTy::U32 => 32,
-        UintTy::U64 | UintTy::Usize => 64,
-        UintTy::U128 => 128,
-    }
-}
-
-pub(crate) fn mask(v: u128, bits: u32) -> u128 {
-    if bits >= 128 { v } else { v & ((1u128 << bits) - 1) }
-}
-
-pub(crate) fn sext(v: u128, bits: u32) -> i128 {
-    if bits >= 128 {
-        v as i128
-    } else {
-        let s = 128 - bits;
-        ((v << s) as i128) >> s
-    }
-}
-
-fn smin(bits: u32) -> i128 {
-    if bits >= 128 { i128::MIN } else { -(1i128 << (bits - 1)) }
-}
-
-fn smax(bits: u32) -> i128 {
-    if bits >= 128 { i128::MAX } else { (1i128 << (bits - 1)) - 1 }
-}
-
-fn umax(bits: u32) -> u128 {
-    mask(u128::MAX, bits)
-}
-
-fn op_of(op: BinOp) -> Arith {
-    match op {
-        BinOp::Sub => Arith::Sub,
-        BinOp::Mul => Arith::Mul,
-        BinOp::Div => Arith::Div,
-        BinOp::Rem => Arith::Rem,
-        BinOp::Shl => Arith::Shl,
-        BinOp::Shr => Arith::Shr,
-        _ => Arith::Add,
-    }
-}
-
-/// Integer arithmetic as a constant context defines it (the Reference, "Arithmetic and Logical
-/// Binary Operators" and "Constant evaluation"): overflow, division by zero and a shift past
-/// the width are errors, not wraps. `planted` is the test's control (`Plant`).
-pub(crate) fn int_binop<'a>(op: BinOp, a: u128, b: u128, bits: u32, signed: bool, rhs: (u32, bool), plant: Plant) -> Result<u128, Refusal<'a>> {
-    let overflow = Refusal::Overflow { op: op_of(op) };
-    let fit_s = |r: Option<i128>| -> Result<u128, Refusal<'a>> {
-        match r {
-            Some(r) if r >= smin(bits) && r <= smax(bits) => Ok(mask(r as u128, bits)),
-            Some(r) if plant == Plant::WrapOnOverflow => Ok(mask(r as u128, bits)),
-            _ => Err(overflow.clone_kind()),
-        }
-    };
-    let fit_u = |r: Option<u128>| -> Result<u128, Refusal<'a>> {
-        match r {
-            Some(r) if r <= umax(bits) => Ok(r),
-            Some(r) if plant == Plant::WrapOnOverflow => Ok(mask(r, bits)),
-            _ => Err(overflow.clone_kind()),
-        }
-    };
-    let (x, y) = (sext(a, bits), sext(b, bits));
-    Ok(match op {
-        BinOp::Add if signed => fit_s(x.checked_add(y))?,
-        BinOp::Add => fit_u(a.checked_add(b))?,
-        BinOp::Sub if signed => fit_s(x.checked_sub(y))?,
-        BinOp::Sub => fit_u(a.checked_sub(b).or(if plant == Plant::WrapOnOverflow { Some(a.wrapping_sub(b)) } else { None }))?,
-        BinOp::Mul if signed => fit_s(x.checked_mul(y))?,
-        BinOp::Mul => fit_u(a.checked_mul(b))?,
-        BinOp::Div | BinOp::Rem => {
-            if b == 0 {
-                return Err(if op == BinOp::Div { Refusal::DivByZero } else { Refusal::RemByZero });
-            }
-            if signed {
-                if x == smin(bits) && y == -1 {
-                    return Err(overflow);
-                }
-                let r = if op == BinOp::Div { x / y } else { x % y };
-                mask(r as u128, bits)
-            } else if op == BinOp::Div {
-                a / b
-            } else {
-                a % b
-            }
-        }
-        BinOp::Shl | BinOp::Shr => {
-            let (rbits, rsigned) = rhs;
-            let amount: i128 = if rsigned { sext(b, rbits) } else if b > i128::MAX as u128 { i128::MAX } else { b as i128 };
-            if amount < 0 || amount >= i128::from(bits) {
-                return Err(Refusal::ShiftTooFar { amount, bits });
-            }
-            let s = amount as u32;
-            if op == BinOp::Shl {
-                mask(a << s, bits)
-            } else if signed {
-                mask((x >> s) as u128, bits)
-            } else {
-                a >> s
-            }
-        }
-        BinOp::BitAnd => a & b,
-        BinOp::BitOr => a | b,
-        BinOp::BitXor => a ^ b,
-        BinOp::Eq => u128::from(a == b),
-        BinOp::Ne => u128::from(a != b),
-        BinOp::Lt => u128::from(if signed { x < y } else { a < b }),
-        BinOp::Le => u128::from(if signed { x <= y } else { a <= b }),
-        BinOp::Gt => u128::from(if signed { x > y } else { a > b }),
-        BinOp::Ge => u128::from(if signed { x >= y } else { a >= b }),
-        BinOp::And | BinOp::Or => return Err(Refusal::Malformed { what: "a short-circuit operator as arithmetic" }),
-    })
-}
-
-impl Refusal<'_> {
-    /// A copy of a refusal with no owned parts (an arithmetic one).
-    fn clone_kind<'b>(&self) -> Refusal<'b> {
-        match self {
-            Refusal::Overflow { op } => Refusal::Overflow { op: *op },
-            _ => Refusal::Malformed { what: "a refusal copied that has parts" },
-        }
-    }
-}
-
-/// Planted bugs, for the tests' controls (rule 23); `None` outside tests.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Plant {
-    None,
-    /// Arithmetic overflow wraps instead of refusing.
-    WrapOnOverflow,
-    /// Pointers of two allocations compare by offset instead of being refused.
-    ComparePointers,
-    /// A discriminant is taken from the variant before the one asked.
-    DiscriminantOffByOne,
-    /// The old behaviour: a pending refusal met while compiling is kept as if final, so its
-    /// code stays complete (machine/late.rs `Late::makes_incomplete`).
-    KeepPendingCode,
 }
 
 /// The discriminant of `variant` of `adt` (`eval_discriminant`'s rule), reading explicit
@@ -883,6 +723,18 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 }
                 self.set(b, dst, Out::P(Place::of(pl.ptr.at(size * i as u64))));
             }
+            Op::FromEnd { dst, src, size, back } => {
+                let pl = self.place(b, src)?;
+                let len = pl.meta.ok_or(malformed("a slice place with no length"))?;
+                let i = len.checked_sub(back).ok_or(malformed("a slice pattern's element past a slice its length test let through"))?;
+                self.set(b, dst, Out::P(Place::of(pl.ptr.at(size * i))));
+            }
+            Op::Subslice { dst, src, size, from, back } => {
+                let pl = self.place(b, src)?;
+                let len = pl.meta.ok_or(malformed("a slice place with no length"))?;
+                let left = len.checked_sub(from + back).ok_or(malformed("a slice pattern's `..` past a slice its length test let through"))?;
+                self.set(b, dst, Out::P(Place { ptr: pl.ptr.at(size * from), meta: Some(left) }));
+            }
             Op::Build { dst, k } => {
                 let build = code.builds[k as usize];
                 let p = self.temp_i(code.tys[build.ty as usize])?;
@@ -1010,9 +862,10 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                     return Ok(Flow::Goto(fail));
                 }
             }
-            Op::IfLen { place, len, fail } => {
+            Op::IfLen { place, len, at_least, fail } => {
                 let pl = self.place(b, place)?;
-                if pl.meta.ok_or(malformed("a slice place with no length"))? != len {
+                let have = pl.meta.ok_or(malformed("a slice place with no length"))?;
+                if if at_least { have < len } else { have != len } {
                     return Ok(Flow::Goto(fail));
                 }
             }
@@ -1089,7 +942,9 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
             PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) => Repr::Scalar(layout::int_size(self.node(t)?).ok_or(malformed("an int size"))?),
             PNode::Float(FloatTy::F32) => Repr::Scalar(4),
             PNode::Float(FloatTy::F64) => Repr::Scalar(8),
-            PNode::Float(_) => return Err(unsupported("`f16` and `f128` in a constant")),
+            // binary16 and binary128: size and alignment their width (the targets' ABIs).
+            PNode::Float(FloatTy::F16) => Repr::Scalar(2),
+            PNode::Float(FloatTy::F128) => Repr::Scalar(16),
             PNode::Ref(_, p) | PNode::Ptr(_, p) => {
                 if layout::is_unsized(self.world, self.ground, p, self.alloc)? {
                     Repr::Pair
@@ -1155,14 +1010,6 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
     fn resolve(&mut self, item: ItemKey, args: List) -> R<'a, (ItemKey, List)> {
         let world = self.world;
         world.resolve(item, args, self.ground, self.alloc).ok_or(Stop::Refused(Refusal::Missing { what: "impl for an associated item", item }))
-    }
-
-    fn float_val(&self, f: FloatTy, v: f64) -> R<'a, Val> {
-        Ok(Val::S(Scalar::Int(match f {
-            FloatTy::F32 => u128::from((v as f32).to_bits()),
-            FloatTy::F64 => u128::from(v.to_bits()),
-            _ => return Err(unsupported("`f16` and `f128` in a constant")),
-        })))
     }
 
     // ---- Memory ----
@@ -1417,6 +1264,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
             (UnOp::Not, _) => return Err(malformed("`!` of a type that is not an integer")),
             (UnOp::Neg, Num::Float(FloatTy::F32)) => a ^ (1 << 31),
             (UnOp::Neg, Num::Float(FloatTy::F64)) => a ^ (1 << 63),
+            (UnOp::Neg, Num::Float(f)) => a ^ Format::of(f).sign(),
             (UnOp::Neg, Num::Int { bits, signed }) => {
                 if !signed {
                     return Err(malformed("`-` of an unsigned integer"));
@@ -1449,7 +1297,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
             _ => return Err(unsupported("an operator on a type that is not a scalar (a const trait)")),
         };
         let (bits, signed) = match num {
-            Num::Float(f) => return self.float_binop(op, f, a, b),
+            Num::Float(f) => return Ok(Val::S(Scalar::Int(crate::arith::float_binop(op, f, a, b)?))),
             Num::Int { bits, signed } => (bits, signed),
             Num::Bool => (8, false),
             Num::Other => return Err(unsupported("an operator on this type")),
@@ -1462,52 +1310,8 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
         Ok(Val::S(Scalar::Int(int_binop(op, a, b, bits, signed, rhs, self.plant)?)))
     }
 
-    /// `f32`/`f64` arithmetic: IEEE 754 with round-to-nearest, as the host's are and as run
-    /// time's are (the Reference: floats follow IEEE 754-2008).
-    fn float_binop(&self, op: BinOp, f: FloatTy, a: u128, b: u128) -> R<'a, Val> {
-        let cmp = |r: bool| Ok(Val::S(Scalar::Int(u128::from(r))));
-        match f {
-            FloatTy::F64 => {
-                let (x, y) = (f64::from_bits(a as u64), f64::from_bits(b as u64));
-                let r = match op {
-                    BinOp::Add => x + y,
-                    BinOp::Sub => x - y,
-                    BinOp::Mul => x * y,
-                    BinOp::Div => x / y,
-                    BinOp::Rem => x % y,
-                    BinOp::Eq => return cmp(x == y),
-                    BinOp::Ne => return cmp(x != y),
-                    BinOp::Lt => return cmp(x < y),
-                    BinOp::Le => return cmp(x <= y),
-                    BinOp::Gt => return cmp(x > y),
-                    BinOp::Ge => return cmp(x >= y),
-                    _ => return Err(malformed("a bit operator on a float")),
-                };
-                Ok(Val::S(Scalar::Int(u128::from(r.to_bits()))))
-            }
-            FloatTy::F32 => {
-                let (x, y) = (f32::from_bits(a as u32), f32::from_bits(b as u32));
-                let r = match op {
-                    BinOp::Add => x + y,
-                    BinOp::Sub => x - y,
-                    BinOp::Mul => x * y,
-                    BinOp::Div => x / y,
-                    BinOp::Rem => x % y,
-                    BinOp::Eq => return cmp(x == y),
-                    BinOp::Ne => return cmp(x != y),
-                    BinOp::Lt => return cmp(x < y),
-                    BinOp::Le => return cmp(x <= y),
-                    BinOp::Gt => return cmp(x > y),
-                    BinOp::Ge => return cmp(x >= y),
-                    _ => return Err(malformed("a bit operator on a float")),
-                };
-                Ok(Val::S(Scalar::Int(u128::from(r.to_bits()))))
-            }
-            _ => Err(unsupported("`f16` and `f128` in a constant")),
-        }
-    }
-
-    /// `as` (the Reference, "Type cast expressions").
+    /// `as` (the Reference, "Type cast expressions"): pointers here, every number in
+    /// [`crate::arith::num_cast`].
     fn cast(&mut self, v: Val, from: PTy, to: PTy) -> R<'a, Val> {
         let (fnode, tnode) = (self.node(from)?, self.node(to)?);
         match (fnode, tnode) {
@@ -1528,54 +1332,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
             _ => {}
         }
         let Val::S(Scalar::Int(a)) = v else { return Err(Stop::Refused(Refusal::PointerAsInt)) };
-        let out = match (fnode, tnode) {
-            (PNode::Float(ff), PNode::Float(tf)) => {
-                let x = self.float_in(ff, a)?;
-                return self.float_val(tf, x);
-            }
-            (PNode::Float(ff), _) => {
-                // Saturating, NaN to 0.
-                let (bits, signed) = int_info(tnode).ok_or(malformed("a float cast to this type"))?;
-                let x = self.float_in(ff, a)?;
-                if signed {
-                    let r: i128 = if bits == 128 { x as i128 } else { (x as i128).clamp(smin(bits), smax(bits)) };
-                    mask(r as u128, bits)
-                } else {
-                    let r: u128 = if bits == 128 { x as u128 } else { (x as u128).min(umax(bits)) };
-                    r
-                }
-            }
-            (_, PNode::Float(tf)) => {
-                let (bits, signed) = int_info(fnode).ok_or(malformed("a cast to a float from this type"))?;
-                return Ok(Val::S(Scalar::Int(match tf {
-                    FloatTy::F32 => u128::from(if signed { sext(a, bits) as f32 } else { a as f32 }.to_bits()),
-                    FloatTy::F64 => u128::from(if signed { sext(a, bits) as f64 } else { a as f64 }.to_bits()),
-                    _ => return Err(unsupported("`f16` and `f128` in a constant")),
-                })));
-            }
-            (_, PNode::Char) => {
-                if fnode != PNode::Uint(UintTy::U8) {
-                    return Err(malformed("a cast to `char` from other than `u8`"));
-                }
-                a
-            }
-            (_, PNode::Ptr(..)) => a,
-            _ => {
-                let (fbits, fsigned) = int_info(fnode).ok_or(malformed("a cast from this type"))?;
-                let (tbits, _) = int_info(tnode).ok_or(malformed("a cast to this type"))?;
-                let wide = if fsigned { sext(a, fbits) as u128 } else { a };
-                mask(wide, tbits)
-            }
-        };
-        Ok(Val::S(Scalar::Int(out)))
-    }
-
-    fn float_in(&self, f: FloatTy, a: u128) -> R<'a, f64> {
-        match f {
-            FloatTy::F32 => Ok(f64::from(f32::from_bits(a as u32))),
-            FloatTy::F64 => Ok(f64::from_bits(a as u64)),
-            _ => Err(unsupported("`f16` and `f128` in a constant")),
-        }
+        Ok(Val::S(Scalar::Int(crate::arith::num_cast(fnode, tnode, a)?)))
     }
 
     // ---- Calls ----
@@ -1753,6 +1510,11 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
             // The pinned core (intrinsics/mod.rs, `ub_checks`): "In consteval, this function
             // currently returns `true`."
             Intrinsic::UbChecks => s(1),
+            // The pinned core (intrinsics/mod.rs, `overflow_checks`): "In consteval, this
+            // function currently returns `true`. This is because the value of the
+            // `overflow_checks` configuration can differ across crates", so a constant never
+            // reads the build's setting.
+            Intrinsic::OverflowChecks => s(1),
             Intrinsic::PtrMetadata => {
                 let &(v, t) = vals.first().ok_or(malformed("`ptr_metadata` argument"))?;
                 let v = match v {
@@ -1807,6 +1569,61 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 self.mem.get_mut(id)?.mutable = false;
                 Ok(Val::Pair(Scalar::Ptr(Pointer { alloc: id, offset: 0 }), Scalar::Int(u128::from(len))))
             }
+            // The pinned core, library/core/src/intrinsics/reflection.rs: "Gets an identifier which
+            // is globally unique to the specified type". The one function the builder calls too
+            // (blaze-build instance.rs `type_id_hash`), its 128 bits laid out as `TypeId`'s two
+            // `data` words, little-endian, so `TypeId::as_u128` reads them back whole.
+            Intrinsic::TypeId => {
+                let t = *targs.first().ok_or(malformed("`type_id` with no type"))?;
+                let bits = blaze_build::instance::type_id_hash(t, self.ground.view(), self.alloc)
+                    .map_err(|_| unsupported("`type_id` of a type that is not ground (an alias, parameter or inference variable left)"))?;
+                let info = self.tyinfo(rt)?;
+                if info.repr != Repr::Mem(16) {
+                    return Err(malformed("a `type_id` result that is not `TypeId`'s 16 bytes"));
+                }
+                let p = self.temp_i(info)?;
+                self.mem.write(p, 8, Scalar::Int(bits & u128::from(u64::MAX)))?;
+                self.mem.write(p.at(8), 8, Scalar::Int(bits >> 64))?;
+                Ok(Val::Mem(p))
+            }
+            // blaze's `blaze_int_cast::<S, D>(x)` (library/core/src/intrinsics/mod.rs): "`x as D`
+            // between two integer types of any width ... it truncates to `D`'s width, or extends
+            // by `S`'s sign": the one rule (blaze-build intrinsics.rs `int_cast_bits`).
+            Intrinsic::BlazeIntCast => {
+                let (&from, &to) = (targs.first().ok_or(malformed("`blaze_int_cast` types"))?, targs.get(1).ok_or(malformed("`blaze_int_cast` types"))?);
+                let ((fb, fs), (tb, _)) = (info(self, from)?, info(self, to)?);
+                s(blaze_build::intrinsics::int_cast_bits(int(0)?, fb, fs, tb))
+            }
+            // `raw_eq::<T>(a, b)` ("Determines whether the raw bytes of the two values are
+            // equal") and `compare_bytes(left, right, bytes)` ("Lexicographically compare ... as
+            // unsigned bytes"): the bytes read one at a time, so an uninitialized byte or one of
+            // a pointer ("At compile-time, it is furthermore UB to call this if any of the bytes
+            // ... have provenance") is refused by name, then the one rule (blaze-build
+            // intrinsics.rs `byte_order`). Every byte of both ranges is read ("this applies to
+            // the whole range, not just until the first byte that differs").
+            Intrinsic::RawEq | Intrinsic::CompareBytes => {
+                let (a, b) = (vals.first().ok_or(malformed("a byte comparison's arguments"))?.0, vals.get(1).ok_or(malformed("a byte comparison's arguments"))?.0);
+                let n = match i {
+                    Intrinsic::RawEq => self.size_align(*targs.first().ok_or(malformed("`raw_eq` with no type"))?)?.0,
+                    _ => u64::try_from(int(2)?).map_err(|_| malformed("a `usize` past 64 bits"))?,
+                };
+                let (pa, pb) = (self.deref(a)?.ptr, self.deref(b)?.ptr);
+                let mut left: Vec<u8, Alloc<'a>> = Vec::new_in(self.alloc);
+                let mut right: Vec<u8, Alloc<'a>> = Vec::new_in(self.alloc);
+                for k in 0..n {
+                    for (p, out) in [(pa, &mut left), (pb, &mut right)] {
+                        match self.read(p.at(k), 1)? {
+                            Scalar::Int(byte) => out.push(byte as u8),
+                            Scalar::Ptr(_) => return Err(Stop::Refused(Refusal::PointerAsInt)),
+                        }
+                    }
+                }
+                let order = blaze_build::intrinsics::byte_order(&left, &right);
+                match i {
+                    Intrinsic::RawEq => s(u128::from(order == 0)),
+                    _ => s(u128::from(order as u32)),
+                }
+            }
             // A row of the table the evaluator does not compute: refused by its name.
             other => Err(unsupported(other.entry().name)),
         }
@@ -1828,6 +1645,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
             (Val::S(Scalar::Int(x)), Val::S(Scalar::Int(y))) => match self.node(t)? {
                 PNode::Float(FloatTy::F64) => f64::from_bits(x as u64) == f64::from_bits(y as u64),
                 PNode::Float(FloatTy::F32) => f32::from_bits(x as u32) == f32::from_bits(y as u32),
+                PNode::Float(f @ (FloatTy::F16 | FloatTy::F128)) => Format::of(f).compare(x, y) == Some(core::cmp::Ordering::Equal),
                 _ => x == y,
             },
             (Val::Pair(p, Scalar::Int(n)), Val::Pair(q, Scalar::Int(m))) => {

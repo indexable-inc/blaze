@@ -552,7 +552,7 @@ fn heads<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, krate: usize, cname: 
     ordered.truncate(cap);
 
     let prepared = Prepares::new_in(Alloc::global());
-    let mut store = Store::new(front.index.lang("sized"), front.frame);
+    let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
     store.pointers = Pointers::find(&front.index, front.resolver);
     let mut buckets = None;
     let mut consts = Consts::default();
@@ -774,7 +774,7 @@ struct Recs<'n> {
 
 impl<'n> Recs<'n> {
     fn new(sized: Option<blaze_id::ItemKey>, pointers: Pointers, frame: &'n blaze_mem::Frame) -> Recs<'n> {
-        let mut store = Store::new(sized, frame);
+        let mut store = Store::new(sized, frame, Alloc::global());
         store.pointers = pointers;
         Recs { store, buckets: None, consts: Consts::default(), heads: BTreeMap::new(), blocked: (Vec::new(), false) }
     }

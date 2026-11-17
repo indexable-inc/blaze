@@ -155,7 +155,7 @@ impl<'b, 'n, H: Heads, S: super::source::NamesSource<'n>> Builder<'b, H, S> {
         for &ty in &bounds {
             let lf::TypeRef::Path(p) = v.ty(ty)? else { continue };
             let (abs, texts, segs, pr) = path_texts_of(v, p, true)?;
-            let key = match self.bound_target(env, abs, &texts, pr)? {
+            let key = match self.bound_target(env, v, p, abs, &texts, pr)? {
                 Bounded::Trait(key) => key,
                 // A trait alias stands for bounds whose arguments are over the alias's own
                 // parameters: one that declares the name is refused by name, never guessed.

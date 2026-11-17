@@ -246,6 +246,7 @@ impl<W: Watch> Run<W> {
                     it,
                     Effect::Append { .. }
                         | Effect::Sync { .. }
+                        | Effect::SyncDir { .. }
                         | Effect::Write { .. }
                         | Effect::Truncate { .. }
                 )

@@ -16,7 +16,7 @@ use blaze_id::{CrateItemKey, ItemKey};
 use blaze_own::Alloc;
 
 use crate::kind::{AmbiguityKind, BindingState, Def, Visibility};
-use crate::module_scope::GlobEdge;
+use crate::module_scope::Globs;
 use crate::through_scratch::{ThroughScratch, through_in};
 
 /// Who is asking: a module, its crate and its chain of modules from itself up to its crate's
@@ -108,7 +108,7 @@ pub enum Node<'w> {
     Value(Option<Passed>),
     /// It binds nothing of its own under the name: its glob edges, and who it is (its crate
     /// and its chain of modules up to its crate's root, itself first).
-    Edges { edges: &'w [GlobEdge], krate: CrateItemKey, chain: &'w [ItemKey] },
+    Edges { edges: Globs<'w>, krate: CrateItemKey, chain: &'w [ItemKey] },
 }
 
 /// The sources a lookup reads, one name at a time.

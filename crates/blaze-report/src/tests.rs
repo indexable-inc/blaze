@@ -25,7 +25,7 @@ fn example() -> Report {
                 .words(" (")
                 .hash("e152d9fa3c71b2d4")
                 .words("), pinned in ")
-                .path("/w/crates/hir-ty-codegen/llvm.json"),
+                .path("/w/crates/blaze-toolchain/pins/llvm.json"),
         )
         .fact("found", Text::new().var("LLVM_SYS_231_PREFIX").words(" is not set"))
         .blocks(Blocks {
@@ -47,7 +47,7 @@ fn example_piped() {
     let expected = "\
 error: llvm-sys can't find LLVM  [llvm: pin]
   ┌ build script of llvm-sys 231.0.1  (vendor/llvm-sys/build.rs)
-  │ needs LLVM 23.1.4 (e152d9fa), pinned in crates/hir-ty-codegen/llvm.json
+  │ needs LLVM 23.1.4 (e152d9fa), pinned in crates/blaze-toolchain/pins/llvm.json
   │ `LLVM_SYS_231_PREFIX` is not set
   └ blocks 247 packages, including blaze-engine
 
@@ -68,7 +68,7 @@ error: llvm-sys can't find LLVM  [llvm: pin]
   ┌ build script of llvm-sys 231.0.1
   │ (vendor/llvm-sys/build.rs)
   │ needs LLVM 23.1.4 (e152d9fa), pinned in
-  │ crates/hir-ty-codegen/llvm.json
+  │ crates/blaze-toolchain/pins/llvm.json
   │ `LLVM_SYS_231_PREFIX` is not set
   └ blocks 247 packages, including blaze-engine
 
@@ -89,7 +89,7 @@ fn example_as_json() {
         r#"{"Plain":"  ("},{"Path":"/w/vendor/llvm-sys/build.rs"},{"Plain":")"}],"#,
         r#""log":"/home/u/.cache/blaze/workers/67e8ace3/log","rule":"llvm:pin","#,
         r#""facts":[{"key":"needs","text":[{"Plain":"needs LLVM "},{"Version":"23.1.4"},{"Plain":" ("},"#,
-        r#"{"Hash":"e152d9fa3c71b2d4"},{"Plain":"), pinned in "},{"Path":"/w/crates/hir-ty-codegen/llvm.json"}]},"#,
+        r#"{"Hash":"e152d9fa3c71b2d4"},{"Plain":"), pinned in "},{"Path":"/w/crates/blaze-toolchain/pins/llvm.json"}]},"#,
         r#"{"key":"found","text":[{"Var":"LLVM_SYS_231_PREFIX"},{"Plain":" is not set"}]}],"#,
         r#""fixes":[{"note":null,"lines":["nix develop"]},{"note":null,"lines":["#,
         r#""python3 .github/scripts/llvm.py '{\"command\": \"fetch\", \"target\": \"aarch64-apple-darwin\", \"dir\": \"~/.blaze/llvm\"}'","#,

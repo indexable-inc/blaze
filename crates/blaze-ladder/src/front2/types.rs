@@ -410,7 +410,7 @@ fn arg_types(v: &View<'_>, s: &lf::Segment, r: Range, out: &mut Vec<lf::TypeId, 
 /// How many of a segment's generic arguments are types or constants (a lifetime is erased; an
 /// associated item constraint is no argument): how many entries the segment has in
 /// [`Builder::path_args`]' answer.
-fn written_type_args(v: &View<'_>, s: &lf::Segment) -> Result<usize, Why> {
+pub(super) fn written_type_args(v: &View<'_>, s: &lf::Segment) -> Result<usize, Why> {
     if !s.has_args {
         return Ok(0);
     }
@@ -534,6 +534,9 @@ fn int_literal(text: &str) -> Option<(u128, &str)> {
 pub struct Builder<'b, H: Heads, S> {
     pub resolver: Paths<S>,
     pub heads: &'b H,
+    /// The marks of the tokens of the text this builder reads paths from (front2 item_site.rs,
+    /// token-mark-F1): `None` for a text written in a file, or one that keeps no column.
+    pub marks: Option<blaze_scope::crate_roots::TextMarks<'b>>,
 }
 
 impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
@@ -766,8 +769,17 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
 
     /// The declared type of the const parameter that argument `index` of the path `texts`
     /// fills (its item's head, [`Heads::const_params`]; a trait's arguments follow `Self`).
-    fn const_want(&self, env: &Env<'_>, abs: bool, texts: &[&str], index: u32, r: Range) -> Result<PTy, Why> {
-        let found = self.resolver.path(env.module, abs, texts, Ns::Type).map_err(|e| Why::Resolve(e, r))?;
+    /// `texts` (a prefix of the written path `p` of `v`, or the whole trait path of a qualified
+    /// path) resolves where the path's first token's mark says, exactly as [`Builder::path_ty`]
+    /// and [`Builder::trait_at`] resolve that same path ([`super::item_site::resolve_written`]):
+    /// never again at `env.module` alone. alloy-rlp's `impl_max_encoded_len!` writes
+    /// `unsafe impl $crate::MaxEncodedLen<{ $len }> for $t {}`, whose `$crate` an expansion's
+    /// text spells `crate` with alloy-rlp's mark; resolved at alloy-primitives' module, the
+    /// parameter's type was `NotFound` and the impl a candidate "unread as written" (tempo
+    /// census r16, `check gap: UnreadImpl`, 41 of 53).
+    #[expect(clippy::too_many_arguments, reason = "one path's resolution: the path, its view and the argument's place")]
+    fn const_want(&self, env: &Env<'_>, v: &View<'_>, p: PathIdx, abs: bool, texts: &[&str], index: u32, r: Range) -> Result<PTy, Why> {
+        let found = super::item_site::resolve_written(&self.resolver, self.marks, env.module, v, p, abs, texts, Ns::Type, r)?;
         if found.consumed as usize != texts.len() {
             return Err(Why::Unsupported("a const argument on an associated item's path", r));
         }
@@ -788,8 +800,9 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         let path = v.path(p)?;
         let mut out = Vec::with_capacity_in(kids.len(), Global);
         let mut next = kids.iter().copied();
-        // Each segment whose arguments are listed, with the path its arguments are for.
-        let mut work: Vec<(lf::Segment, bool, Vec<&str, Global>), Global> = Vec::new_in(Global);
+        // Each segment whose arguments are listed, with the path its arguments are for (the
+        // written path whose first token's mark says where it resolves: `const_want`).
+        let mut work: Vec<(lf::Segment, PathIdx, bool, Vec<&str, Global>), Global> = Vec::new_in(Global);
         let (abs, texts, segs, _) = path_texts_of(v, p, true)?;
         for (k, s) in segs.iter().enumerate() {
             if s.kind == lf::SegKind::Anchor {
@@ -798,15 +811,15 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 let lf::TypeRef::Path(tp) = v.ty(tr)? else { return Err(program(format!("a trait that is no path"), r)) };
                 let (tabs, ttexts, tsegs, _) = path_texts(v, tp)?;
                 for ts in tsegs {
-                    work.push((ts, tabs, ttexts.clone()));
+                    work.push((ts, tp, tabs, ttexts.clone()));
                 }
             } else {
                 let mut upto = Vec::new_in(Global);
                 upto.extend_from_slice(&texts[..=k]);
-                work.push((*s, abs, upto));
+                work.push((*s, p, abs, upto));
             }
             // Arguments are lowered segment by segment, in the order `children` lists them.
-            for (s, sabs, stexts) in work.drain(..) {
+            for (s, spath, sabs, stexts) in work.drain(..) {
                 if !s.has_args {
                     continue;
                 }
@@ -818,30 +831,32 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                             Some(name) => {
                                 let param = env.params.iter().find(|(n, _)| *n == Name::of(name)).map(|&(_, i)| i);
                                 let is_const = param.is_some_and(|i| env.consts.iter().any(|(c, _)| *c == i));
+                                let lf::TypeRef::Path(tp) = v.ty(t)? else { return Err(program(format!("a one-name argument that is no path"), r)) };
+                                let ar = place(v, v.type_range(t))?;
+                                // The name resolves where its token's mark says, as the
+                                // argument's own type would (`path_ty`): never at the module
+                                // alone when a macro wrote it.
+                                let at_mark = |ns: Ns| super::item_site::resolve_written(&self.resolver, self.marks, env.module, v, tp, false, &[name], ns, ar);
                                 // A type if a type parameter, or the names library's answer in
                                 // the type namespace is a type (a constant item answers there
                                 // too, as the library files it: then it is a constant).
-                                let names_a_type = || match self.resolver.path(env.module, false, &[name], Ns::Type) {
+                                let names_a_type = || match at_mark(Ns::Type) {
                                     Ok(f) => f.consumed == 1 && matches!(f.kind, Kind::Struct | Kind::Enum | Kind::Union | Kind::TypeAlias | Kind::Builtin(_) | Kind::WideInt { .. }),
                                     Err(_) => false,
                                 };
                                 let is_type = !is_const && (param.is_some() || names_a_type());
-                                let lf::TypeRef::Path(tp) = v.ty(t)? else { return Err(program(format!("a one-name argument that is no path"), r)) };
                                 if is_type {
                                     self.path_ty(tys, env, v, tp, &[])?
                                 } else {
-                                    let ar = place(v, v.type_range(t))?;
                                     // A name that is no parameter, no type and no value here
                                     // names nothing: refused as unresolved, never guessed to be
                                     // a constant (zerocopy's `HasField<Client, value, ..>`, whose
                                     // `value` is an enum of the impl's own block, was refused
                                     // "argument 2 of `HasField` is a constant").
                                     if param.is_none() && name != "true" && name != "false" {
-                                        if let Err(e) = self.resolver.path(env.module, false, &[name], Ns::Value) {
-                                            return Err(Why::Resolve(e, ar));
-                                        }
+                                        at_mark(Ns::Value)?;
                                     }
-                                    let want = |_: &mut PortableTys<'_>| self.const_want(env, sabs, &stexts, index, ar);
+                                    let want = |_: &mut PortableTys<'_>| self.const_want(env, v, spath, sabs, &stexts, index, ar);
                                     self.const_term(tys, env, name, ar, &want)?
                                 }
                             }
@@ -850,7 +865,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                             let at = v.const_range(c)?;
                             let ar = v.site(at)?;
                             let text = v.text_at(at)?;
-                            let want = |_: &mut PortableTys<'_>| self.const_want(env, sabs, &stexts, index, ar);
+                            let want = |_: &mut PortableTys<'_>| self.const_want(env, v, spath, sabs, &stexts, index, ar);
                             self.const_term(tys, env, text, ar, &want)?
                         }
                         _ => continue,
@@ -902,16 +917,20 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 intern(tys, PNode::Array(kids[0], n))
             }
             // `[unsafe] [extern "abi"] fn(A, B) -> R`: the inputs, then the output (`()` when
-            // none is written), as `children` listed them; a C-variadic one is refused.
+            // none is written), as `children` listed them. A C-variadic one (`fn(A, ...)`) lists
+            // its named inputs and says `...` in its header: the Reference, "Function pointer
+            // types", allows `...` last on an extern fn pointer type of a calling convention
+            // that has variadics ([items.extern.variadic.conventions], the set `heads` checks
+            // for a fn item's `...`); any other ABI is the language's E0045.
             lf::TypeRef::FnPtr { ret, abi, unsafety, extern_, variadic, .. } => {
-                if variadic {
-                    return Err(Why::Unsupported("a C-variadic fn pointer type", r));
-                }
                 let abi = match (abi, extern_) {
                     (None, false) => tc::Abi::Rust,
                     (None, true) => tc::Abi::C,
                     (Some(at), _) => fn_ptr_abi(v.text_at(at)?, r)?,
                 };
+                if variadic && !matches!(abi, tc::Abi::C | tc::Abi::CUnwind | tc::Abi::System | tc::Abi::SystemUnwind) {
+                    return Err(program(format!("`...` on a fn pointer type of the {abi:?} ABI: C-variadic fn pointers take \"C\", \"C-unwind\", \"system\" or \"system-unwind\" (E0045)"), r));
+                }
                 let safety = if unsafety { tc::Safety::Unsafe } else { tc::Safety::Safe };
                 let mut l = Vec::with_capacity_in(kids.len() + 1, Global);
                 l.extend_from_slice(kids);
@@ -920,7 +939,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     l.push(intern(tys, PNode::Tuple(unit))?);
                 }
                 let l = intern_list(tys, &l)?;
-                intern(tys, PNode::FnPtr(l, tc::FnPtrHeader { abi, safety }))
+                intern(tys, PNode::FnPtr(l, tc::FnPtrHeader { abi, safety, c_variadic: variadic }))
             }
             lf::TypeRef::Macro(_) => self.macro_ty(tys, env, v, t, r),
             lf::TypeRef::Pat { pat, .. } => self.pat_ty(tys, env, v, kids[0], pat, r),
@@ -981,7 +1000,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                         args.push(intern(tys, PNode::Param(i))?);
                     }
                     let args = intern_list(tys, &args)?;
-                    self.self_assoc(tys, tr, args, Name::of(texts[1]), r, shown)
+                    self.trait_self_assoc(tys, env, tr, args, Name::of(texts[1]), r, shown)
                 }
                 // The impl's own associated type; else, in a trait impl, the one its trait or a
                 // supertrait declares (the Reference, "Paths", "`Self`" and "Paths in types":
@@ -1022,12 +1041,9 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 return self.param_assoc(tys, env, v, i, Name::of(texts[1]), kids, r, shown);
             }
         }
-        let found = match self.resolver.path(env.module, abs, &texts, Ns::Type) {
-            Ok(f) => f,
-            // A built-in type is the names library's answer (`Kind::Builtin`): front2 has no
-            // lookup rule of its own for one.
-            Err(e) => return Err(Why::Resolve(e, r)),
-        };
+        // A built-in type is the names library's answer (`Kind::Builtin`): front2 has no lookup
+        // rule of its own for one. Where the path resolves is its first token's mark.
+        let found = super::item_site::resolve_written(&self.resolver, self.marks, env.module, v, p, abs, &texts, Ns::Type, r)?;
         if found.consumed as usize != texts.len() {
             return Err(Why::Unsupported("an associated type of a type (`T::X`)", r));
         }
@@ -1074,6 +1090,36 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         match self.assoc_owner(tys, tr, args, name, r, shown)? {
             Some((t, a)) => self.alias(tys, t, name, a, r, shown),
             None => Err(program(format!("`{shown}` names no associated type of the trait or its supertraits"), r)),
+        }
+    }
+
+    /// `Self::name` written in the trait `tr` (its arguments `args`) or one of its members: the
+    /// one trait declaring `name` among every bound on `Self` in scope, as for a type parameter
+    /// ([`Self::param_assoc`]): `Self: Tr<args>` itself with its supertraits, and the bounds on
+    /// `Self` in `env` (`Param(0)`'s: the trait's `where Self: ..` and the member's own, tap's
+    /// `fn try_conv<T>(self) -> Result<T, Self::Error> where Self: TryInto<T>`, where `Error`
+    /// is `TryInto<T>`'s). Two distinct traits declaring it are ambiguous (rustc's E0221).
+    fn trait_self_assoc(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, tr: LibKey, args: List, name: Name, r: Range, shown: &str) -> Result<PTy, Why> {
+        let mut found: Vec<(LibKey, List), Global> = Vec::new_in(Global);
+        if let Some(owner) = self.assoc_owner(tys, tr, args, name, r, shown)? {
+            found.push(owner);
+        }
+        let (Bounds::Building(bounds) | Bounds::Done(bounds)) = env.bounds;
+        for b in bounds.iter().filter(|b| b.param == 0) {
+            if let Some(owner) = self.assoc_owner(tys, b.trait_, b.args, name, r, shown)? {
+                if !found.contains(&owner) {
+                    found.push(owner);
+                }
+            }
+        }
+        match found.as_slice() {
+            &[(t, a)] => self.alias(tys, t, name, a, r, shown),
+            [] => Err(program(format!("`{shown}` names no associated type of the trait, its supertraits or a bound on `Self` in scope"), r)),
+            many => {
+                let mut traits = Vec::with_capacity_in(many.len(), Global);
+                traits.extend(many.iter().map(|&(t, _)| t));
+                Err(Why::AssocAmbiguous(Box::from(shown), traits, r))
+            }
         }
     }
 
@@ -1221,20 +1267,22 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         given: &[PTy],
     ) -> Result<(LibKey, List), Why> {
         let (abs, texts, _, r) = path_texts(v, p)?;
-        self.trait_at(tys, env, abs, &texts, r, self_ty, given)
+        self.trait_at(tys, env, v, p, abs, &texts, r, self_ty, given)
     }
 
     /// [`Self::trait_path`] over the path's texts.
-    pub(super) fn trait_at(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, abs: bool, texts: &[&str], r: Range, self_ty: PTy, given: &[PTy]) -> Result<(LibKey, List), Why> {
-        match self.bound_target(env, abs, texts, r)? {
+    #[expect(clippy::too_many_arguments, reason = "the path, its view and the trait's arguments")]
+    pub(super) fn trait_at(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, p: PathIdx, abs: bool, texts: &[&str], r: Range, self_ty: PTy, given: &[PTy]) -> Result<(LibKey, List), Why> {
+        match self.bound_target(env, v, p, abs, texts, r)? {
             Bounded::Trait(key) => self.trait_args(tys, key, r, self_ty, given),
             Bounded::Alias(_) => Err(program(format!("`{}` is a trait alias, which stands for bounds, not one trait (an impl's trait, a `T::X` bound)", texts.join("::")), r)),
         }
     }
 
-    /// What a bound's path names, by the names library: a trait or a trait alias.
-    pub(super) fn bound_target(&self, env: &Env<'_>, abs: bool, texts: &[&str], r: Range) -> Result<Bounded, Why> {
-        let found = self.resolver.path(env.module, abs, texts, Ns::Type).map_err(|e| Why::Resolve(e, r))?;
+    /// What a bound's path `p` of `v` names, by the names library where its first token's mark
+    /// says (front2 item_site.rs): a trait or a trait alias.
+    pub(super) fn bound_target(&self, env: &Env<'_>, v: &View<'_>, p: PathIdx, abs: bool, texts: &[&str], r: Range) -> Result<Bounded, Why> {
+        let found = super::item_site::resolve_written(&self.resolver, self.marks, env.module, v, p, abs, texts, Ns::Type, r)?;
         match found.kind {
             _ if found.consumed as usize != texts.len() => Err(program(format!("this path is not a trait"), r)),
             Kind::Trait => Ok(Bounded::Trait(found.key)),
@@ -1502,9 +1550,19 @@ pub(super) fn children(v: &View<'_>, t: lf::TypeId, out: &mut Vec<lf::TypeId, Gl
             }
         }
         lf::TypeRef::Never | lf::TypeRef::Infer => {}
+        // A C-variadic `fn(A, ...)`'s `...` is no input: the header says it (`make`). It may
+        // only be the last parameter (the language's "`...` must be the last argument of a
+        // C-variadic function").
         lf::TypeRef::FnPtr { params, ret, .. } => {
-            for &n in v.rows(params)? {
+            let rows = v.rows(params)?;
+            for (i, &n) in rows.iter().enumerate() {
                 let p = lf::Param::decode(n)?;
+                if p.variadic {
+                    if i + 1 != rows.len() {
+                        return Err(program(format!("`...` must be the last parameter of a C-variadic fn pointer type"), r));
+                    }
+                    continue;
+                }
                 out.push(p.ty.ok_or(Why::Unsupported("a fn pointer parameter with no type", r))?);
             }
             out.extend(ret);

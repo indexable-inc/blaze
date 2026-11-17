@@ -348,6 +348,8 @@ struct LocalMacroAt {
     /// labels its template sees (def_site.rs).
     locals: u32,
     entries: u32,
+    /// A `macro` (2.0) item, not a `macro_rules!`.
+    macro2: bool,
 }
 
 /// A body's macro call waiting for its expansion: the call's range, its path's and its
@@ -524,6 +526,23 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         self.alloc
     }
 
+    /// Which text wrote the block whose `{` is at `open` of the machine's text
+    /// (crate::scope_origin): the item's own, or the expansion whose word the `{` is. Every byte
+    /// past the item's text is a word of an expansion or the space before one
+    /// (`append_expansion`), and a `{` is a word, which carries its expansion's index; the
+    /// words are appended in text order.
+    fn origin_of_block(&self, open: u32) -> crate::scope_origin::ScopeOrigin {
+        use crate::scope_origin::ScopeOrigin;
+        let item = idx(self.text.len());
+        if open < item {
+            return ScopeOrigin::Item { open };
+        }
+        let at = self.words.binary_search_by_key(&open, |w| w.start).expect("a block's `{` past the item's text is a word of an expansion");
+        let expansion = self.words[at].expansion;
+        let start = self.out.expansion_starts[expansion as usize];
+        ScopeOrigin::Expansion { expansion, open: open - item - start }
+    }
+
     /// The local hygiene of the token at `start`: 0 in the item's own text.
     fn hygiene_at(&self, start: u32) -> u64 {
         if (start as usize) < self.text.len() || self.words.is_empty() {
@@ -560,13 +579,13 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         self.request.take()
     }
 
-    /// The `macro_rules!` in textual scope here, in the order written: each one's name and
-    /// its rules (the text inside the definition's delimiters).
+    /// The `macro_rules!` and `macro` the body wrote that are in scope here, in the order
+    /// written: each one's name and its definition's text ([`def_site::form_of`]).
     pub(crate) fn local_macros(&self) -> impl Iterator<Item = crate::driver::LocalMacro<'_>> + '_ {
         let text = self.text();
         self.local_macros
             .iter()
-            .filter_map(move |l| def_site::rules_of(text, l).map(|rules| crate::driver::LocalMacro { name: l.name.of(text), rules }))
+            .filter_map(move |l| def_site::form_of(text, l).map(|form| crate::driver::LocalMacro { name: l.name.of(text), form }))
     }
 
     /// Where `request`'s input is: the item's text, or tokens of an expansion lowered here.
@@ -585,6 +604,32 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             },
             _ => crate::driver::CallInput::Text(r.of(self.text())),
         }
+    }
+
+    /// Puts the marks of the item's own words beside its text (drive.md, "A token keeps its
+    /// mark"): the item a macro wrote keeps each word's mark at the word's start, before any
+    /// expansion's (whose starts are past the item's text), so the starts ascend. Called once,
+    /// before the feed. `marks` is of this machine's text: [`ItemMarks::of`] proved it a slice
+    /// of the expansion's text, and the lowering takes its text from it.
+    ///
+    /// [`ItemMarks::of`]: crate::mark_site::ItemMarks::of
+    pub(crate) fn mark_item(&mut self, marks: crate::mark_site::ItemMarks<'_>) {
+        debug_assert!(core::ptr::eq(marks.text(), self.text), "the item's marks are of its own text");
+        debug_assert!(self.out.mark_starts.is_empty(), "the item's marks come before any expansion's");
+        for (start, mark) in marks.marked() {
+            self.out.mark_starts.push(start);
+            self.out.mark_bytes.extend_from_slice(&mark.to_bytes());
+        }
+    }
+
+    /// The mark of the word that starts at `start` (the item's own text or an expansion lowered
+    /// in place): `None` for a word no macro wrote.
+    pub(crate) fn mark_at(&self, start: u32) -> Option<crate::mark_site::TextMark> {
+        use blaze_expand::origin_column::MARK;
+        let i = self.out.mark_starts.binary_search(&start).ok()?;
+        let bytes = &self.out.mark_bytes[i * MARK..(i + 1) * MARK];
+        // The machine wrote these bytes with `TextMark::to_bytes`, and only it.
+        Some(crate::mark_site::TextMark::from_bytes(bytes).expect("a mark the machine wrote reads back"))
     }
 
     /// Appends an expansion's words to the text: each word's text, its first token and its
@@ -611,6 +656,12 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             grown.push_str(&out.words.text[w.text.0 as usize..w.text.1 as usize]);
             let end = idx(grown.len());
             ranges.push(Range::new(start, end));
+            // The word's mark beside the text (drive.md, "A token keeps its mark"): starts
+            // ascend, as the words are appended in order.
+            if let Some(mark) = w.mark {
+                self.out.mark_starts.push(start);
+                self.out.mark_bytes.extend_from_slice(&mark.to_bytes());
+            }
             self.words.push(ExpWord { start, hygiene: w.hygiene, expansion, token: w.token, end: w.end });
         }
         self.note_templates(request, &out.words.words);
@@ -831,10 +882,15 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 node.a = self.skip_name.start;
                 node.b = self.skip_name.end;
                 self.vals.push(Val { v: V::Skipped(top.kind), id: NONE, node, range });
-                if top.kind == MACRO_RULES && self.skip_name.start != NONE {
+                // A `macro` item is in scope in its whole block (path-based scope, the
+                // Reference's "Macros By Example", Scoping), a `macro_rules!` from here on; the
+                // events come in text order, so a call written above a `macro` of its block is
+                // resolved as if the block had none (a gap: it needs the block's items first).
+                if matches!(top.kind, MACRO_RULES | MACRO_DEF) && self.skip_name.start != NONE {
                     let depth = idx(self.scopes.len());
                     let (locals, entries) = (idx(self.locals.len()), idx(self.entries.len()));
-                    self.local_macros.push(LocalMacroAt { name: self.skip_name, item: range, depth, locals, entries });
+                    let macro2 = top.kind == MACRO_DEF;
+                    self.local_macros.push(LocalMacroAt { name: self.skip_name, item: range, depth, locals, entries, macro2 });
                 }
                 self.after_child();
                 return;
@@ -3030,9 +3086,12 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             rows.push((item.encode(ROW_LOCAL_ITEM), *range));
         }
         let item_rows = self.put_rows_of(&rows);
+        // Which text wrote the block (crate::scope_origin): `r` starts at its `{`.
+        let origin = self.origin_of_block(r.start);
         let s = &mut self.out.scopes[scope.0 as usize];
         s.b = item_rows.start;
         s.c = item_rows.len;
+        origin.write(s);
         // The statements, and the tail: the last expression with nothing after it.
         let last_stmt = self.vals[f.base as usize..]
             .iter()
@@ -3221,10 +3280,22 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         let text = |name: NameIdx| self.out.name_ranges[name.0 as usize].of(self.text());
         match path.segments.len {
             1 => {}
-            // An expansion writes its `$crate` as its crate's one identifier
-            // (blaze-expand's `body_words`).
-            2 | 3 if matches!(text(self.segment_name(p, 0)?), "$crate" | "core" | "std")
-                || text(self.segment_name(p, 0)?).starts_with(blaze_surface::DOLLAR_CRATE) => {}
+            // An expansion's body word keeps `$crate` as written, its crate in its mark
+            // (blaze-expand's `body_words`); a macro-written item's text writes another crate's
+            // `$crate` as `crate`, its crate in that word's mark (blaze-scope crate_roots
+            // `root_mark`, read by the one rule `root_by_mark`).
+            2 | 3 => {
+                let first = self.segment_name(p, 0)?;
+                let word = text(first);
+                let root_of_a_crate = word == "crate"
+                    && matches!(
+                        blaze_scope::crate_roots::root_by_mark(word, self.mark_at(self.out.name_ranges[first.0 as usize].start)),
+                        blaze_scope::crate_roots::Root::Crate(_)
+                    );
+                if !(matches!(word, "$crate" | "core" | "std") || root_of_a_crate) {
+                    return None;
+                }
+            }
             _ => return None,
         }
         let name = text(self.segment_name(p, usize::MAX)?);

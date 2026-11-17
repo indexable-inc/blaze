@@ -24,6 +24,31 @@ use blaze_typeck::{
 use crate::front::{At, FnKind, FnLang, Front, LitTexts};
 use crate::run::{Named, RunError};
 
+/// Why [`FrontEnd::source_position`] gave no line and column.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PositionGap {
+    /// The front end does not answer the question (the old front).
+    Unanswered,
+    /// The item is not one the front end places: not tabled, or no first byte today.
+    NoItem,
+    /// The item's text is not in a file of its crate (a macro's expansion), or the file is not
+    /// one the front end holds.
+    NoFile,
+    /// The site is past the end of the file's text, or not on a char's first byte.
+    PastText,
+}
+
+impl core::fmt::Display for PositionGap {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            PositionGap::Unanswered => "this front end does not place source positions (`FrontEnd::source_position`)",
+            PositionGap::NoItem => "the front end places no such item today",
+            PositionGap::NoFile => "the item's text is in no file the front end holds (a macro's expansion, or an unknown file)",
+            PositionGap::PastText => "the site is past its file's text, or inside a char",
+        })
+    }
+}
+
 /// The fns the back half calls on its own account, with no call any checked body recorded:
 /// the one list both front ends answer from, so each tables the same set. A front end that
 /// tables only what it walks starts its walk at each one the program's world declares.
@@ -124,6 +149,13 @@ pub trait FrontEnd {
         let _ = key;
         None
     }
+    /// For fn `key` under `#[rustc_legacy_const_generics(i, ..)]`, the listed argument
+    /// positions (blaze-build `Adts::legacy_const_generics`); empty for any other fn. The old
+    /// front reads no such attribute, so its answer is empty.
+    fn legacy_const_generics(&self, key: ItemKey) -> &[u32] {
+        let _ = key;
+        &[]
+    }
     fn entry(&self) -> Option<usize>;
     /// The program's one type table: signatures' and bodies' types.
     fn types(&self) -> PTys<'_>;
@@ -202,6 +234,29 @@ pub trait FrontEnd {
     /// old front); the builder then refuses an `extern` body under `panic = unwind` by name.
     fn nounwind(&self, _key: ItemKey) -> Option<bool> {
         None
+    }
+    /// Whether fn `key` is `#[track_caller]`: its own signature says so, or it is a trait
+    /// impl's method whose trait declares the method so (the Reference, "The `track_caller`
+    /// attribute": an impl's method inherits it). `None`: not tabled, the trait's declaration
+    /// not tabled, or a front end that does not answer; blaze-build then passes no location and
+    /// refuses what depends on one by name.
+    fn track_caller(&self, _key: ItemKey) -> Option<bool> {
+        None
+    }
+    /// Where the call at `expr` of `owner`'s body is, item-relative (rule 71): the file as the
+    /// program sees it, `owner`, and the expression's first byte from the item's first, or the
+    /// outermost macro call's when the call is in an expansion. `None`: `owner` not tabled with
+    /// a body, or a front end that does not answer.
+    fn caller_site(&self, _owner: ItemKey, _expr: blaze_typeck::ExprId) -> Option<blaze_build::CallerSite<'_>> {
+        None
+    }
+    /// The line and the column (each from 1; the column in chars) of byte `site` of item
+    /// `item`'s text, from the item's present first byte in today's text of its file and that
+    /// file's line starts: what a `#[track_caller]` `Location`'s line and column are when the
+    /// program is placed (rule 71: the code record holds only `item` and `site`). The default
+    /// answers nothing ([`PositionGap::Unanswered`]).
+    fn source_position(&self, _item: ItemKey, _site: u32) -> Result<(u32, u32), PositionGap> {
+        Err(PositionGap::Unanswered)
     }
     /// The program's Rust start (front2/start.rs): `Some` for a Rust-edition root with a root
     /// `fn main() -> T`, which starts through the library's `#[lang = "start"]` item
@@ -360,12 +415,12 @@ impl FrontEnd for Front<'_> {
     }
 
     fn resolve(&self, i: usize, item: ItemKey, args: List, ground: &mut PortableTys<'_>) -> Result<(ItemKey, List), ResolveError> {
-        let r = resolve_instance(&Front::world(self, i), item, args, ground, Alloc::global())?;
+        let r = resolve_instance(&Front::world(self, i), item, args, ground, self.alloc)?;
         Ok((r.item, r.args))
     }
 
     fn selects(&self, i: usize, trait_: ItemKey, ty: PTy, ground: &mut PortableTys<'_>) -> Result<bool, ResolveError> {
-        Ok(select_impl(&Front::world(self, i), trait_, &[ty], ground, Alloc::global())?.is_some())
+        Ok(select_impl(&Front::world(self, i), trait_, &[ty], ground, self.alloc)?.is_some())
     }
 
     fn adt_drop_impl(&self, i: usize, drop_trait: ItemKey, adt: ItemKey, alloc: Alloc<'_>) -> Result<Option<ItemKey>, ResolveError> {
@@ -382,7 +437,7 @@ impl FrontEnd for Front<'_> {
 
     /// The old front's checks keep their lists (its `check_all` does not file them out).
     fn body_reads(&self, _i: usize, checked: &Checked<'static>) -> Option<crate::front2::body_reads::ReadsDigest> {
-        Some(crate::front2::body_reads::ReadsDigest::of(&checked.reads, Alloc::global()))
+        Some(crate::front2::body_reads::ReadsDigest::of(&checked.reads, self.alloc))
     }
 
     /// Every body checked once, generically, in its own world.
@@ -397,8 +452,8 @@ impl FrontEnd for Front<'_> {
             let name = || Named { path: function.path.clone(), at: function.at };
             let view = body.body.view(types);
             let world = Front::world(self, i);
-            let mut cx = InferCtx::new_in(Alloc::global());
-            let done = match blaze_typeck::check(&view, &world, &mut cx, &Needs::new_in(Alloc::global()), Alloc::global()) {
+            let mut cx = InferCtx::new_in(self.alloc);
+            let done = match blaze_typeck::check(&view, &world, &mut cx, &Needs::new_in(self.alloc), self.alloc) {
                 Ok(Outcome::Done(done)) => done,
                 Ok(Outcome::Need(_)) => return Err(RunError::Need { function: name() }),
                 Err(error) => return Err(RunError::Check { function: name(), error }),

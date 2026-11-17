@@ -336,7 +336,7 @@ struct Names {
     /// Where each name ends in `text`, by its id.
     ends: Vec<u32>,
     /// The last name of each hash; [`Names::next`] has the others of that hash before it.
-    first: HashMap<u64, u32, Global>,
+    first: Map<u64, u32, FixedState, Global>,
     next: Vec<u32>,
 }
 
@@ -416,7 +416,7 @@ const LINE: usize = 512;
 pub struct Recorder {
     names: Names,
     /// Every line seen, kept or not: one seen before is not looked at again.
-    noted: HashSet<Noted, Global>,
+    noted: Set<Noted, FixedState, Global>,
     /// The lines kept, in the order they were first seen.
     lines: Vec<Noted>,
     /// The live record, each new line appended before the call it notes goes on.
@@ -431,10 +431,10 @@ pub struct Recorder {
     /// The scope each thread runs in, by the thread's id, as [`MARK`] said or as the thread
     /// that forked its process had it.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    threads: HashMap<u64, u32, Global>,
+    threads: Map<u64, u32, FixedState, Global>,
     /// Every thread seen, scoped or not: one not seen yet is new.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    known: HashSet<u64, Global>,
+    known: Set<u64, FixedState, Global>,
     /// Whether the processes load the interposer: one that ran a program and never said it
     /// loaded is an `X` line ([`Recorder::ended`]).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -443,11 +443,11 @@ pub struct Recorder {
     /// process id: the ids of the program's name and of the scope it ran in. Walked in process
     /// id order once, as the run ends ([`Recorder::ended`]).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pending: HashMap<u64, (u32, u32), Global>,
+    pending: Map<u64, (u32, u32), FixedState, Global>,
     reads: bool,
     /// What is no input of the run's own process: the program it is, read again by a test
     /// that runs it, is an input of that test ([`Recorder::input`]).
-    not_inputs: HashSet<String, Global>,
+    not_inputs: Set<String, FixedState, Global>,
     /// What is the sandbox's and no input of any line: the interposer.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     ours: Vec<String>,
@@ -501,16 +501,16 @@ impl Recorder {
         names.intern("");
         Recorder {
             names,
-            noted: HashSet::new_in(Global),
+            noted: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }),
             lines: Vec::with_capacity(LINES),
             live: None,
             live_failed: None,
             appending: Vec::with_capacity(LINE),
             text: String::with_capacity(LINE),
-            threads: HashMap::new_in(Global),
-            known: HashSet::new_in(Global),
+            threads: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            known: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }),
             interposed: false,
-            pending: HashMap::new_in(Global),
+            pending: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             // alloc: once per sandbox; a run that makes no such call keeps it empty.
             calls: Vec::new(),
             execs: 0,

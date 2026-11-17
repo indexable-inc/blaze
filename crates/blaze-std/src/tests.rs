@@ -26,6 +26,8 @@
 //!   typed `NoParallelism` before anything waits, where `may_overlap` runs it inline into its
 //!   deadline; and `may_overlap` gives one result under one worker and many.
 //! - [`flat`]: what the `AnyAddress` walk clears and refuses, decided as the crate compiles.
+//! - [`forms`]: each cost-explicit form (D120) built by the bstd path its module's table names,
+//!   in a task's frame, with one operation: not a simulation test, a check of the exports.
 //! - `unfinished` (rustc debug builds only): a must-finish value dropped unfinished stops,
 //!   naming its type and where it was made; one finished, or dropped by an unwind, does not.
 //! - [`cell`]: one token reads and writes every cell of its kind, behind one lock across
@@ -105,6 +107,7 @@ mod eval;
 mod explicit;
 mod flat;
 mod flight;
+mod forms;
 mod freeze;
 mod hosted;
 mod inflight;
@@ -122,6 +125,7 @@ mod names;
 mod narrowing;
 mod narrows;
 mod native_root;
+mod out_buffer;
 mod overlap;
 mod own;
 mod par;

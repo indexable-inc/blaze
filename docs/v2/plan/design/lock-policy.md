@@ -68,7 +68,7 @@ guessed at):
     newest = "2026-11-04T10:12:00Z"
 
     [native.llvm]
-    pin = "crates/hir-ty-codegen/llvm.json"
+    pin = "crates/blaze-toolchain/pins/llvm.json"
 
     [native.llvm.targets]
     aarch64-apple-darwin = "e95fc3b4…"

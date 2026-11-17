@@ -166,7 +166,7 @@ static PIECE: Domain = Domain::new(PIECE_DOMAIN);
 /// The pieces one direction of a connection sent, as the receiver holds them.
 #[derive(Default)]
 pub(crate) struct SendWindow {
-    by_hash: ByHash<ContentId, u64, Global>,
+    by_hash: Map<ContentId, u64, BuildKeyHasher, Global>,
     held: VecDeque<(ContentId, u32)>,
     first: u64,
     bytes: u64,

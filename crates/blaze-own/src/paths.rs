@@ -102,7 +102,7 @@ fn write_dir<'n>(d: u32, parent: &impl Fn(u32) -> u32, name: &impl Fn(u32) -> &'
 // ---------------------------------------------------------------------------------------------
 // Paths: the form to build.
 
-/// Directories and files as rows, interned through a table ([module](self)).
+/// Directories and files as rows, interned through a table ([module](self)): each name stored once for its directory, a lookup one probe per component.
 pub struct Paths<A: Allocator + Clone> {
     /// Directory `d`'s parent; the root's is itself.
     dir_parent: Vec<u32, A>,

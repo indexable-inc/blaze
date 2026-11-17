@@ -260,6 +260,12 @@ impl<'a> Paths<'a> {
         Ok(Paths { rows, segments, strings })
     }
 
+    /// The paths of a record [`Paths::read`] accepted before in this process, with no check
+    /// (the in-place views' `trusted`, D114 rule 1).
+    pub(crate) fn trusted(rows: &'a [PathRow], segments: &'a [Text], strings: &'a str) -> Paths<'a> {
+        Paths { rows, segments, strings }
+    }
+
     /// Whether `index` is a path of the record, or [`NONE`] when `optional`.
     pub(crate) fn check<T: blaze_format::Record>(
         &self,

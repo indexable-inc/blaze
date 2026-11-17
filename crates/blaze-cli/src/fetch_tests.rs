@@ -78,6 +78,7 @@ fn env(io: &Io, checkout: &'static str) -> FetchEnv<'static> {
         fs: io.need_fs().expect("files"),
         sdk: None,
         exe_dir: Err(crate::fetch::ExeDirWhy::NotRead),
+        heap: blaze_own::testing::heap(),
     }
 }
 
@@ -109,7 +110,7 @@ fn held_bytes(cx: &Cx, dir: &Dir<ReadWrite>, unit: &Unit<'_, '_>) -> Option<OwnV
 /// One command's `Fetch` task of the unit `c` over the lock `lock`, in the checkout `checkout`:
 /// what it did.
 fn fetch_c<'b>(io: &Io, cx: &Cx, checkout: &'static str, lock: &[u8], held: &'b bstd::mem::Frame) -> (Did<'b>, blaze_ids::ContentId) {
-    let mut lockfile = match Lockfile::read(lock, cx.frame()) {
+    let mut lockfile = match Lockfile::read(lock, blaze_own::testing::heap(), cx.frame()) {
         Ok(lockfile) => lockfile,
         Err(words) => panic!("the lock is refused: {}", words.as_str()),
     };
@@ -158,7 +159,7 @@ fn a_unit_in_cargos_cache_is_adopted_by_the_locks_pin_and_held() {
         Did::Need(_) => panic!("a `Fetch` task needs nothing"),
     }
 
-    let lockfile = match Lockfile::read(lock.as_str().as_bytes(), cx.frame()) {
+    let lockfile = match Lockfile::read(lock.as_str().as_bytes(), blaze_own::testing::heap(), cx.frame()) {
         Ok(lockfile) => lockfile,
         Err(words) => panic!("the lock is refused: {}", words.as_str()),
     };
@@ -198,7 +199,7 @@ fn a_tampered_archive_in_cargos_cache_is_refused_and_named() {
     write(&io, &cx, "one/Cargo.lock", lock.as_str().as_bytes());
 
     let root = store(&io, &cx);
-    let lockfile = match Lockfile::read(lock.as_str().as_bytes(), cx.frame()) {
+    let lockfile = match Lockfile::read(lock.as_str().as_bytes(), blaze_own::testing::heap(), cx.frame()) {
         Ok(lockfile) => lockfile,
         Err(words) => panic!("the lock is refused: {}", words.as_str()),
     };
@@ -261,7 +262,7 @@ fn a_second_worktree_fetches_and_adopts_nothing() {
     let (did, subject) = fetch_c(&io, &cx, "one", lock.as_str().as_bytes(), cx.frame());
     assert!(answered_held(&did, subject), "worktree one adopts `c` from cargo's cache");
 
-    let lockfile = match Lockfile::read(lock.as_str().as_bytes(), cx.frame()) {
+    let lockfile = match Lockfile::read(lock.as_str().as_bytes(), blaze_own::testing::heap(), cx.frame()) {
         Ok(lockfile) => lockfile,
         Err(words) => panic!("the lock is refused: {}", words.as_str()),
     };

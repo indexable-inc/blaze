@@ -57,6 +57,7 @@ fn prefix_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, p: tc::PathPrefi
             tc::Def::TyParam(i) => format!("the generic parameter #{i}"),
             tc::Def::Prim(prim) => format!("the built-in type {prim:?}"),
             tc::Def::SelfTy => "`Self`".to_string(),
+            tc::Def::Alias(k) => format!("the type alias {}", item_shown(r, k)),
         },
     }
 }

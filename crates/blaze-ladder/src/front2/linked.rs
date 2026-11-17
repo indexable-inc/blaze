@@ -74,49 +74,82 @@ impl<'a> Linked<'a> {
     /// program of no crate), never a guessed root.
     pub fn of(names: &Names<'_>, roots: &[usize], alloc: Alloc<'a>) -> Result<Linked<'a>, RootsError> {
         let crates = names.crates();
+        let graph = names.graph();
+        let closure = Linked::closure(
+            crates.len(),
+            roots,
+            alloc,
+            |at, link| {
+                let c = crates[at];
+                let externs = graph.externs(CrateId(at as u32), c.root_attrs);
+                for dep in externs.prelude.iter() {
+                    link(dep.krate.index());
+                }
+                // `extern crate name;` in any module (lowered under the crate's cfg): `name` is
+                // what `extern crate` may name (`externs.deps`); one it cannot is the names
+                // library's refusal, already made. `extern crate self` links nothing new.
+                for (_, (_, decls)) in c.decls.iter() {
+                    for e in decls.extern_crates.iter() {
+                        if let ExternTarget::Dep(name) = &e.target {
+                            if let Some(dep) = externs.deps.iter().find(|d| d.name == *name) {
+                                link(dep.krate.index());
+                            }
+                        }
+                    }
+                }
+                Ok::<(), core::convert::Infallible>(())
+            },
+            |i| Ok(crates[i].implicit.proc_macro),
+        );
+        match closure {
+            Ok(linked) => linked,
+            Err(never) => match never {},
+        }
+    }
+
+    /// The link closure over ANY reading of each crate's links (the one work list, rule 30):
+    /// `links(at, link)` calls `link(i)` for each crate `at` names (its extern prelude and each
+    /// `extern crate` it writes), `proc_macro(i)` says whether crate `i` is a proc-macro unit.
+    /// A reader that cannot answer stops the closure with its own error `E` (the records'
+    /// reader, front2 source.rs, files why in its log); a link past `crates` is
+    /// [`RootsError::NoSuchCrate`].
+    pub fn closure<E>(
+        crates: usize,
+        roots: &[usize],
+        alloc: Alloc<'a>,
+        mut links: impl FnMut(usize, &mut dyn FnMut(usize)) -> Result<(), E>,
+        proc_macro: impl Fn(usize) -> Result<bool, E>,
+    ) -> Result<Result<Linked<'a>, RootsError>, E> {
         let mut sorted: OwnVec<usize, Alloc<'a>> = OwnVec::with_capacity_in(roots.len(), alloc);
         for &krate in roots {
-            if krate >= crates.len() {
-                return Err(RootsError::NoSuchCrate { krate, crates: crates.len() });
+            if krate >= crates {
+                return Ok(Err(RootsError::NoSuchCrate { krate, crates }));
             }
             sorted.push(krate);
         }
         sorted.sort_unstable();
         sorted.dedup();
-        let mut linked: OwnVec<bool, Alloc<'a>> = OwnVec::from_elem_in(false, crates.len(), alloc);
+        let mut linked: OwnVec<bool, Alloc<'a>> = OwnVec::from_elem_in(false, crates, alloc);
         let mut work: OwnVec<usize, Alloc<'a>> = OwnVec::with_capacity_in(sorted.len(), alloc);
         for &krate in sorted.iter() {
             linked[krate] = true;
             work.push(krate);
         }
-        let graph = names.graph();
         while let Some(at) = work.pop() {
-            let c = crates[at];
-            let externs = graph.externs(CrateId(at as u32), c.root_attrs);
-            let mut link = |krate: CrateId| {
-                let i = krate.index();
-                if !linked[i] && links_unit(false, crates[i].implicit.proc_macro) {
+            // What `at` names, gathered first: `proc_macro` is asked of each outside the reader.
+            let mut named: OwnVec<usize, Alloc<'a>> = OwnVec::new_in(alloc);
+            links(at, &mut |i| named.push(i))?;
+            for i in named {
+                if i >= crates {
+                    return Ok(Err(RootsError::NoSuchCrate { krate: i, crates }));
+                }
+                if !linked[i] && links_unit(false, proc_macro(i)?) {
                     linked[i] = true;
                     work.push(i);
                 }
-            };
-            for dep in externs.prelude.iter() {
-                link(dep.krate);
-            }
-            // `extern crate name;` in any module (lowered under the crate's cfg): `name` is
-            // what `extern crate` may name (`externs.deps`); one it cannot is the names
-            // library's refusal, already made. `extern crate self` links nothing new.
-            for (_, (_, decls)) in c.decls.iter() {
-                for e in decls.extern_crates.iter() {
-                    if let ExternTarget::Dep(name) = &e.target {
-                        if let Some(dep) = externs.deps.iter().find(|d| d.name == *name) {
-                            link(dep.krate);
-                        }
-                    }
-                }
             }
         }
-        Ok(Linked { roots: sorted, linked })
+        Ok(Ok(Linked { roots: sorted, linked }))
     }
 
     /// The link closure of the crates of the root fns `roots` (each a library key, of any

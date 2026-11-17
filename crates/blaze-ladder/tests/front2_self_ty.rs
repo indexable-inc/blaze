@@ -154,14 +154,14 @@ fn self_of_any_type_and_assoc_type_paths_through_front2() {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let files = [("/sty/src/main.rs".to_string(), MAIN.to_string())];
     let edition = edition::PackageEdition::of_manifest("blaze-2026.11").expect("a known edition");
-    let user = UserCrate { name: "sty", dir: "/sty/", root: "/sty/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "sty", dir: "/sty/", root: "/sty/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
-    let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"), front.frame);
+    let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let prepared = Prepares::new_in(Alloc::global());
     // The evaluator: core's inherent impls of `u32` and `u16` have heads whose array lengths
     // name constants, and `Self::f()` in `impl Tr for u32` reads them (inherent items first).

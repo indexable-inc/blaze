@@ -16,7 +16,7 @@ use blaze_file_items::Outline;
 use blaze_id::ItemKey;
 use blaze_lower::{AttrMeta, Lowered, head};
 use blaze_own::{AVec, Alloc};
-use blaze_scope::resolve::{At, ExpansionText, Names};
+use blaze_scope::resolve::{At, CrateNames, ExpansionText, Names};
 use blaze_surface::{Edition, Item, ItemDetail, ItemIndex, Range};
 
 use super::heads::CrateCfg;
@@ -85,11 +85,18 @@ pub enum LinksError<'a> {
 /// The link facts of crate `krate`: every file of the crate, then every item macro's expansion
 /// (ordered by the call's key, never by the map), each walked over its outline.
 pub(crate) fn crate_links<'a>(names: &Names<'a>, krate: usize, alloc: Alloc<'a>) -> Result<CrateLinks<'a>, LinksError<'a>> {
-    let c = names.krate(krate);
-    let mut gather = Gather::new(c.name, names.edition(krate), c.cfg.atoms(), alloc);
+    scope_links(names.krate(krate), alloc)
+}
+
+/// The link facts of ONE resolved crate `c`: what its `CrateScope` job already holds (its
+/// files, its cfg, its item keys by place and every expansion), so the job files the table
+/// with nothing made again (native_links.rs `scope_table`, rule 77). Each file, then each item
+/// macro's expansion ordered by the call's key, never by the map.
+pub(crate) fn scope_links<'a>(c: &CrateNames<'a>, alloc: Alloc<'a>) -> Result<CrateLinks<'a>, LinksError<'a>> {
+    let mut gather = Gather::new(c.name, c.edition, c.cfg.atoms(), alloc);
     for (n, file) in c.files.iter().enumerate() {
         let at = At::File(n as u32);
-        gather.text(file.text, &file.outline, &|item| names.key_at(krate, at, item))?;
+        gather.text(file.text, &file.outline, &|item| c.tables.by_place.get(&(at, item)).copied())?;
     }
     // An extern block written by an item macro (ring's `prefixed_extern!`) declares roots too.
     let mut made: AVec<'a, (ItemKey, &'a ExpansionText<'a>)> = AVec::new_in(alloc);
@@ -101,7 +108,7 @@ pub(crate) fn crate_links<'a>(names: &Names<'a>, krate: usize, alloc: Alloc<'a>)
     made.sort_unstable_by_key(|it| it.0);
     for &(call, m) in made.iter() {
         let at = At::Expansion(call);
-        gather.text(m.text, &m.outline, &|item| names.key_at(krate, at, item))?;
+        gather.text(m.text, &m.outline, &|item| c.tables.by_place.get(&(at, item)).copied())?;
     }
     gather.finish()
 }

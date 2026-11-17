@@ -192,7 +192,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// Whether `block`, an `async move` block of this body, captures by value a variable whose
     /// type does not implement `trait_` and holds no future itself: a value the state always
     /// holds, so the future does not implement the auto trait whatever is live.
-    fn moved_capture_fails(&mut self, block: ExprId, trait_: ItemKey) -> Result<bool, Stop> {
+    pub(super) fn moved_capture_fails(&mut self, block: ExprId, trait_: ItemKey) -> Result<bool, Stop> {
         // A future of another body (a hidden type's) has no rows here.
         if !self.futures.iter().any(|f| f.expr == block) {
             return Ok(false);

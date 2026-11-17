@@ -2,7 +2,7 @@
 # .github/blaze-version names, installed by site/install.sh into ~/.cargo/bin with the Rust it builds
 # with (its own toolchain, ~/.blaze/toolchains, docs/v2/plan.md: no rustup), and an empty
 # store at BLAZE_CACHE. With `llvm: true`, also the LLVM blaze pins
-# (crates/hir-ty-codegen/llvm.json), fetched by its sha256 and named by LLVM_SYS_231_PREFIX, for
+# (crates/blaze-toolchain/pins/llvm.json), fetched by its sha256 and named by LLVM_SYS_231_PREFIX, for
 # a build of blaze, which links it (blaze-engine's default `native`). No Nix: the C compiler and linker are the runner's own (gcc and
 # glibc on Ubuntu, Xcode's clang on macOS), so what the build links runs on the runner as it is.
 # No shared remote: the v2 blaze pinned since 0.20261105.0 has no `blaze cache build|pull|push`
@@ -141,7 +141,7 @@ runs:
           Linux-X64) triple=x86_64-unknown-linux-gnu ;;
           Linux-ARM64) triple=aarch64-unknown-linux-gnu ;;
           macOS-ARM64) triple=aarch64-apple-darwin ;;
-          *) echo "::error::crates/hir-ty-codegen/llvm.json has no LLVM for $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
+          *) echo "::error::crates/blaze-toolchain/pins/llvm.json has no LLVM for $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
         esac
         sudo mkdir -p /usr/local/lib/blaze-llvm
         sudo chown "$(id -u):$(id -g)" /usr/local/lib/blaze-llvm

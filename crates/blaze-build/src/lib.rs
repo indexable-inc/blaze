@@ -187,14 +187,26 @@
 //! [`intrinsics::build`]: its generic arguments grounded, each argument a scalar (a
 //! one-scalar aggregate's scalar too), an aggregate's address, or nothing for a zero-sized
 //! one; its result a scalar, a `(T, bool)` pair written at the tuple's offsets, a value at an
-//! address copied into a temporary, nothing, or divergence. No call site is passed:
-//! `caller_location` is refused by name. An error is [`BuildError::Intrinsic`].
+//! address copied into a temporary, nothing, or divergence. `caller_location` is its site:
+//! the location a `#[track_caller]` fn was passed, else a `Location` of the call's own place
+//! (walk/track_caller.rs, "`#[track_caller]`" there). An error is [`BuildError::Intrinsic`].
+//!
+//! # `#[track_caller]`
+//!
+//! A fn [`Adts::track_caller`] says is tracked takes one hidden last parameter, a pointer to
+//! its caller's `Location`: a call from an untracked fn passes a data row of the call's own
+//! place ([`Adts::caller_site`]), a call from a tracked fn forwards what it was given (the
+//! Reference, "The `track_caller` attribute", [attributes.codegen.track_caller]). A tracked
+//! fn taken as a fn pointer is refused by name ([`BuildError::TrackCaller`]: its shim, which
+//! passes the fn's own definition site, is not built).
 
 #![feature(allocator_api)]
 
+pub mod abi;
 pub mod cabi;
 pub mod data;
 pub mod drop_facts;
+mod dyn_tail;
 pub mod imports;
 pub mod instance;
 pub mod intrinsics;
@@ -220,7 +232,7 @@ use std::alloc::Global;
 use blaze_lir::{Func, VerifyError};
 use blaze_typeck::{Adt, BodyView, Checked, Expr, ExprId, FmtTrait, FnSig, ItemKey, LangItem, List, Mutbl, PTy, PTys, PatId, PortableTys};
 
-pub use instance::{Instance, InstanceKey, ground, instance_key, instance_key_normalized};
+pub use instance::{Instance, InstanceKey, closure_method_key_args, copy_written, ground, instance_key, instance_key_normalized};
 pub use walk::arith_checks::PanicConst;
 pub use walk::coroutine::{CoroutineFacts, CoroutineOf, StateShape, coroutine_facts, coroutine_of, coroutines_in, identity as coroutine_identity};
 pub use coroutine_niche::{NicheRefused, StateNiche, niche_of, row_niche};
@@ -414,6 +426,17 @@ pub trait Adts {
         None
     }
 
+    /// For fn item `item` with `#[rustc_legacy_const_generics(i, ..)]` (stdarch's
+    /// `vget_lane_u64(v, 0)`), the positions of a call's arguments that are its own const
+    /// generic arguments: the checker made them the callee's generic arguments (blaze-typeck
+    /// rules/legacy_const.rs), so the call passes only the arguments at the other positions.
+    /// Empty for any other fn; a world that does not know the attribute (the default) never
+    /// sees such a call checked, as the checker refuses its count (E0061).
+    fn legacy_const_generics(&self, item: ItemKey) -> &[u32] {
+        let _ = item;
+        &[]
+    }
+
     /// The text of string literal `expr` of the body of `owner` (its escapes processed).
     fn str_lit(&self, owner: ItemKey, expr: ExprId) -> Option<&str> {
         let _ = (owner, expr);
@@ -484,6 +507,19 @@ pub trait Adts {
         None
     }
 
+    /// The fn instance that key `key` names in an evaluated constant's record (a
+    /// `DataTarget::Fn(key)` of a [`Adts::const_value`] or [`Adts::const_block_value`] answer:
+    /// `const F: fn() = f::<u8>;`), its arguments interned in `ground`. The fn is named in the
+    /// constant's body, not the function being built, so only the evaluator's side knows which
+    /// instance it keyed; the walk files the answer as a `Func` reference, as a direct fn-item
+    /// to fn-pointer coercion does (walk/promote.rs `data_rows`, which also asks it for a
+    /// promoted record's fn target its operand does not name). No answer is refused with
+    /// [`BuildError::NoConstFnInstance`].
+    fn const_fn_instance(&self, key: InstanceKey, ground: &mut PortableTys<'_>) -> Option<Instance> {
+        let _ = (key, ground);
+        None
+    }
+
     /// The template of `format_args!` expression `expr` of the body of `owner`: its literal
     /// texts (escapes and `{{`/`}}` processed) and placeholders in order, one placeholder per
     /// row of the expression's `fmt_uses` that is not a count (walk/fmt.rs). The checker's
@@ -505,6 +541,40 @@ pub trait Adts {
     /// The struct `core::fmt::rt::Argument` (lang `format_argument`). No answer is refused
     /// with [`BuildError::NoLangFn`] naming `format_argument`.
     fn fmt_argument_adt(&self) -> Option<ItemKey> {
+        None
+    }
+
+    /// Whether the fn `instance` resolves to (its arguments in `ground`; a trait method's call
+    /// resolved to the impl's fn, as the program builds it) is `#[track_caller]`. The
+    /// Reference, "The `track_caller` attribute": "When applied to a function in a trait
+    /// declaration, the attribute applies to all implementations. If the trait provides a
+    /// default implementation with the attribute, then the attribute also applies to override
+    /// implementations." Such a fn takes one hidden last parameter, its caller's
+    /// `&'static Location<'static>` (walk/track_caller.rs), so the builder of the fn and every
+    /// caller ask this one question and agree. `None`: not said; then no location is passed,
+    /// and a `caller_location` or a forwarded location that depends on the answer is refused
+    /// by name ([`BuildError::TrackCaller`]), never given a wrong place.
+    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<bool> {
+        let _ = (instance, ground);
+        None
+    }
+
+    /// Where expression `expr` of the body of `owner` is, in the form a code record may hold
+    /// ([`CallerSite`]: the file's name as the program observes it, the item, and the
+    /// expression's byte offset from the item's start), never a line and column: those are
+    /// absolute, so a line inserted above the item would change the record of every tracked
+    /// call below it (rule 71). The expression is the one rustc's `Location` reports (a call's,
+    /// an operator's, an index's, a `caller_location` call's own), and for one inside a macro's
+    /// expansion its outermost call's. Asked only when a `Location` is made for it
+    /// (walk/track_caller.rs). No answer is refused with [`BuildError::TrackCaller`].
+    fn caller_site(&self, owner: ItemKey, expr: ExprId) -> Option<CallerSite<'_>> {
+        let _ = (owner, expr);
+        None
+    }
+
+    /// The struct `core::panic::Location` (lang `panic_location`), the hidden parameter's
+    /// pointee. No answer is refused with [`BuildError::NoLangFn`] naming `panic_location`.
+    fn location_adt(&self) -> Option<ItemKey> {
         None
     }
 
@@ -537,15 +607,29 @@ pub(crate) enum Planted {
     MovedBoxNotFreed,
 }
 
+/// Where an expression is, item-relative ([`Adts::caller_site`]; rule 71). A `Location`'s line
+/// and column are made from it only when the program is placed: from the item's present start
+/// in its file and that file's line starts, so the code record that names it is the same
+/// wherever the item moves in its file.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct CallerSite<'a> {
+    /// The file's path as the program observes it (`file!()`).
+    pub file: &'a str,
+    /// The item whose text holds the expression (the body's owner).
+    pub item: ItemKey,
+    /// The expression's first byte, counted from the item's first byte.
+    pub offset: u32,
+}
+
 /// One piece of a `format_args!` template ([`Adts::format_template`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FmtPiece<'a> {
     /// Literal text, written as is.
     Text(&'a str),
-    /// A placeholder formatting the next of the expression's non-count uses. `plain`: written
-    /// with no fill, alignment, sign, `#`, `0`, width or precision (`{}`, `{x:?}`); the build
-    /// refuses the others by name.
-    Arg { plain: bool },
+    /// A placeholder formatting the next of the expression's non-count uses. `spec`: its format
+    /// spec, the text after the `:` (empty with none; `#018x` for `{:#018x}`), its string
+    /// escapes processed as the template's texts are; walk/fmt.rs encodes its options.
+    Arg { spec: &'a str },
 }
 
 /// A `static` item's kind.
@@ -713,6 +797,9 @@ pub enum BuildError {
     /// Path `expr` in a promoted operand names fn `item`, whose instance key
     /// [`Adts::promoted_fn_key`] does not give.
     NoPromotedFnKey { expr: ExprId, item: ItemKey },
+    /// The value of constant path or const block `expr` holds a fn pointer to instance `key`,
+    /// which [`Adts::const_fn_instance`] does not give.
+    NoConstFnInstance { expr: ExprId, key: InstanceKey },
     /// Path pattern `pat` names const `item`, whose value [`Adts::const_value`] does not hold.
     NoPatConstValue { pat: PatId, item: ItemKey },
     /// A layout read a record that is not made yet: `item`'s (an enum's explicit discriminant).
@@ -749,6 +836,11 @@ pub enum BuildError {
     /// through ADT `adt` (none: at the pointer itself), `why`: a struct where no field or more
     /// than one field holding bytes differs, a union, an enum, a nesting past `UNSIZE_DEPTH`.
     Unsize { expr: ExprId, adt: Option<ItemKey>, why: &'static str, rule: &'static str },
+    /// A `#[track_caller]` location (walk/track_caller.rs) at `expr` (none: a call the build
+    /// inserted with no expression of its own) for fn `item` was not made, named by `why`: the
+    /// world does not say where `expr` is or whether a fn is tracked, or a tracked fn is taken
+    /// where its shim would be needed (a fn pointer, a vtable slot).
+    TrackCaller { expr: Option<ExprId>, item: ItemKey, why: &'static str },
 }
 
 /// What an `.await` and a coroutine's entries need of the library: the answer of
@@ -843,6 +935,9 @@ impl fmt::Display for BuildError {
             BuildError::NoPromotedFnKey { expr, item } => {
                 write!(f, "expression {}: fn {:#x} in a promoted value has no instance key in the build's `Adts`", expr.0, item.0)
             }
+            BuildError::NoConstFnInstance { expr, key } => {
+                write!(f, "expression {}: a constant's value holds a fn pointer to instance {key:?}, which the build's `Adts` does not give", expr.0)
+            }
             BuildError::NoPatConstValue { pat, item } => {
                 write!(f, "pattern {}: const item {:#x} has no evaluated value in the build's `Adts`", pat.0, item.0)
             }
@@ -880,6 +975,12 @@ impl fmt::Display for BuildError {
             BuildError::Unsize { expr, adt: None, why, rule } => write!(f, "expression {}: an unsizing coercion: {why} ({rule})", expr.0),
             BuildError::NoCleanup { what } => {
                 write!(f, "a call that may unwind (panic = unwind): its cleanup is not built exactly: {what} (blaze-build walk/unwind.rs)")
+            }
+            BuildError::TrackCaller { expr: Some(expr), item, why } => {
+                write!(f, "expression {}: the `#[track_caller]` location for fn {:#x}: {why}", expr.0, item.0)
+            }
+            BuildError::TrackCaller { expr: None, item, why } => {
+                write!(f, "a call the build inserted: the `#[track_caller]` location for fn {:#x}: {why}", item.0)
             }
         }
     }
@@ -982,6 +1083,24 @@ pub fn build_fn_shim<A: Allocator + Clone>(
     alloc: A,
 ) -> Result<Built<A>, BuildError> {
     walk::build_fn_shim(callee, tuple, which, sig, subst, adts, alloc)
+}
+
+/// Builds the CTOR FN `ctor` of variant `variant` (a struct's is 0) of a tuple struct or tuple
+/// variant at the instance `subst` names: the function the ctor's name is as a VALUE (the
+/// Reference, "Structs" and "Enumerations": a tuple-like struct or variant "defines a
+/// constructor function"; "Function item types"), its parameters the fields in order, its
+/// result the value. `sig` is the ctor's signature. A call written with the ctor's path as its
+/// callee is built in place and never calls this; a call through a parenthesized path, a fn
+/// item value, a fn pointer or a `Fn*` shim does (ctor_fn.rs).
+pub fn build_ctor_fn<A: Allocator + Clone>(
+    ctor: ItemKey,
+    variant: u32,
+    sig: &FnSig<'_>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    walk::build_ctor_fn(ctor, variant, sig, subst, adts, alloc)
 }
 
 /// What the instance `subst` names of `body` reads of trait shapes, before it is built: its

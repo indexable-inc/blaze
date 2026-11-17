@@ -5,7 +5,7 @@
 #![feature(allocator_api)]
 
 use blaze_expand::{
-    AlsoCopy, BuiltinDerive, BuiltinFn, Call, CallKind, CallShape, CallSite, Constness, Ctx, DefAt,
+    AlsoCopy, BuiltinAttr, BuiltinDerive, BuiltinFn, Call, CallKind, CallShape, CallSite, Constness, Ctx, DefAt,
     DefSite, Delim, DeriveFacts, Diagnostic, Eager, Edition, ExpandCx, ExpandError, Expanded,
     Expansion, Export, Hole, HoleOf, HostAsk, HostError, HostWhy, IncludeAs, Included, Inside,
     LitKind, LocalInner, MacroDefinition, MarkOf, NestedKind, TokenOrigin, Place, PlaceOf, ProcCall, ProcDiagnostic,
@@ -818,6 +818,64 @@ fn derive_with(which: BuiltinDerive, item: &str, facts: DeriveFacts) -> Expansio
     done(expand(&def, &call, &cx, blaze_own::testing::heap().alloc()))
 }
 
+/// `#[global_allocator]` keeps the static as written and writes beside it the four symbols of
+/// the pinned alloc's `unsafe extern "Rust"` block, with its signatures exactly (`Alignment`,
+/// `NonNull<u8>`), each calling the static's `GlobalAlloc` method; the static's name is the
+/// item's own token. An item that is no static is refused with rustc's words and nothing else.
+///
+/// Prints: `test global_allocator_keeps_the_static_and_writes_the_four_symbols ... ok`
+#[test]
+fn global_allocator_keeps_the_static_and_writes_the_four_symbols() {
+    let cx = TestCx::new();
+    let def = MacroDefinition::builtin_attr(BuiltinAttr::GlobalAllocator, at(1), blaze_own::testing::heap().alloc());
+    let item = tokens("static A: T = T;");
+    let exp = done(expand(&def, &Call::attr(None, &item, site()), &cx, blaze_own::testing::heap().alloc()));
+    assert!(exp.diagnostics.is_empty());
+    let text = show(&exp.tokens);
+    let layout = "$crate :: alloc :: Layout :: from_size_alignment_unchecked";
+    let align = "align : $crate :: mem :: Alignment";
+    let ptr = "ptr : $crate :: ptr :: NonNull < u8 >";
+    let want = [
+        "static A : T = T ;".to_owned(),
+        format!(
+            "# [ rustc_std_internal_symbol ] unsafe fn __rust_alloc ( size : usize , {align} ) -> * mut u8 \
+             {{ unsafe {{ $crate :: alloc :: GlobalAlloc :: alloc ( & A , {layout} ( size , align ) ) }} }}"
+        ),
+        format!(
+            "# [ rustc_std_internal_symbol ] unsafe fn __rust_dealloc ( {ptr} , size : usize , {align} ) \
+             {{ unsafe {{ $crate :: alloc :: GlobalAlloc :: dealloc ( & A , $crate :: ptr :: NonNull :: as_ptr ( ptr ) , \
+             {layout} ( size , align ) ) }} }}"
+        ),
+        format!(
+            "# [ rustc_std_internal_symbol ] unsafe fn __rust_realloc ( {ptr} , old_size : usize , {align} , new_size : usize ) \
+             -> * mut u8 {{ unsafe {{ $crate :: alloc :: GlobalAlloc :: realloc ( & A , $crate :: ptr :: NonNull :: as_ptr ( ptr ) , \
+             {layout} ( old_size , align ) , new_size ) }} }}"
+        ),
+        format!(
+            "# [ rustc_std_internal_symbol ] unsafe fn __rust_alloc_zeroed ( size : usize , {align} ) -> * mut u8 \
+             {{ unsafe {{ $crate :: alloc :: GlobalAlloc :: alloc_zeroed ( & A , {layout} ( size , align ) ) }} }}"
+        ),
+    ]
+    .join(" ");
+    assert_eq!(text, want);
+    assert_eq!(text.matches("unsafe fn").count(), 4, "{text}");
+    // The static's name in each body is the item's own token, not one the expansion made.
+    let a_inputs = exp
+        .tokens
+        .tokens()
+        .iter()
+        .zip(exp.origins.iter())
+        .filter(|(token, origin)| exp.tokens.text_of(token) == "A" && matches!(origin, TokenOrigin::Input(_)))
+        .count();
+    assert_eq!(a_inputs, 5, "the static's name and the four `&A`: {text}");
+    // A fn is no allocator.
+    let item = tokens("fn f() {}");
+    let exp = done(expand(&def, &Call::attr(None, &item, site()), &cx, blaze_own::testing::heap().alloc()));
+    assert!(exp.tokens.tokens().is_empty());
+    assert_eq!(exp.diagnostics.len(), 1);
+    assert!(matches!(exp.diagnostics[0], Diagnostic::Builtin { .. }));
+}
+
 #[test]
 fn clone_of_a_copy_type_without_type_parameters_is_star_self() {
     let copy = DeriveFacts { copy: AlsoCopy::Yes, constness: Constness::NotConst };
@@ -920,6 +978,23 @@ fn default_takes_the_marked_variant_and_refuses_without_one() {
         refused.diagnostics
     );
     assert!(refused.tokens.is_empty());
+}
+
+/// RFC 3681: `#[derive(Default)]` takes a field's declared default (as rustc's derive): the
+/// other fields are `Default::default()` and `..` with no base fills the declared ones. A
+/// struct with no declared default is unchanged. Expected: `test
+/// default_takes_the_declared_field_defaults ... ok`.
+#[test]
+fn default_takes_the_declared_field_defaults() {
+    let exp = derive(BuiltinDerive::Default, "struct O { a: u8, b: u8 = 40, c: Vec<u8> = Vec::new() }");
+    let text = show(&exp.tokens);
+    assert!(text.contains("fn default ( ) -> Self { O { a : $crate :: default :: Default :: default ( ) , .. } } }"), "{text}");
+    let variant = derive(BuiltinDerive::Default, "enum E { A, #[default] R { w: u32 = 1, h: u32 } }");
+    let text = show(&variant.tokens);
+    assert!(text.contains("E :: R { h : $crate :: default :: Default :: default ( ) , .. }"), "{text}");
+    let plain = derive(BuiltinDerive::Default, "struct P { a: u8 }");
+    let text = show(&plain.tokens);
+    assert!(text.contains("P { a : $crate :: default :: Default :: default ( ) , }"), "{text}");
 }
 
 #[test]
@@ -1148,13 +1223,30 @@ fn varied_expansions() -> Vec<Expansion<'static>> {
     ]
 }
 
+/// Each source token `n` as record token `n`: the maps of sources with no lifetime and no
+/// invisible group. For a test of a record's bytes, which reads no origin back as a place.
+static SAME: [u32; 512] = {
+    let mut map = [0; 512];
+    let mut n = 0;
+    while n < map.len() {
+        map[n] = n as u32;
+        n += 1;
+    }
+    map
+};
+
+fn same_maps() -> blaze_expand::OriginMaps<'static> {
+    blaze_expand::OriginMaps { input: Some(&SAME), attr_args: Some(&SAME), body: Some(&SAME), params: Some(&SAME) }
+}
+
 #[test]
 fn an_expansion_record_reads_back_equal_and_rewrites_equal_bytes() {
     for exp in varied_expansions() {
-        let bytes = exp.write_record(blaze_own::testing::heap().alloc());
+        let bytes = exp.write_record(&same_maps(), blaze_own::testing::heap().alloc()).expect("its tokens make a token record");
         let read = Expansion::read_record(&bytes, blaze_own::testing::heap().alloc()).expect("a written record reads back");
         assert!(read == exp, "{exp:?} read back as {read:?}");
-        assert_eq!(read.write_record(blaze_own::testing::heap().alloc())[..], bytes[..]);
+        let again = read.write_record(&same_maps(), blaze_own::testing::heap().alloc()).expect("its tokens make a token record");
+        assert_eq!(again[..], bytes[..]);
         // A buffer cut short is refused, never read.
         let cut = Expansion::<'static>::read_record(&bytes[..bytes.len() - 1], blaze_own::testing::heap().alloc());
         assert!(cut.is_err());
@@ -1212,7 +1304,7 @@ fn a_macro_definition_reads_back_from_its_records() {
 #[test]
 fn an_expansion_record_refuses_a_token_entry_it_does_not_write() {
     let exp = call_fn(&builtin(BuiltinFn::Stringify), "a", &TestCx::new());
-    let mut bytes = exp.write_record(blaze_own::testing::heap().alloc());
+    let mut bytes = exp.write_record(&same_maps(), blaze_own::testing::heap().alloc()).expect("its tokens make a token record");
     // The one token, an unsuffixed string literal standing alone: tag 2, kind 4 at bit 5.
     let word = (2u32 | 4 << 5).to_le_bytes();
     let at = bytes

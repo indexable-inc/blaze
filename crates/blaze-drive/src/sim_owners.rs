@@ -307,7 +307,7 @@ fn config(workers: u32) -> Config {
     Config { tool: Tool(key::digest("sim owners tool", b"")), tools, workers, most_entries: 32, most_jobs: 1 << 16, is_error: is_bad }
 }
 
-const ASK: Ask<'static> = Ask { command: Command::Check, args: b"", gate: Gate::Beside, space: Space::NONE };
+const ASK: Ask<'static> = Ask { command: Command::Check, args: b"", gate: Gate::Beside, space: Space::NONE, program: None, facts: &[] };
 
 fn request(
     tape: &Tape,
@@ -370,6 +370,7 @@ fn request(
                             name: m.name,
                             out: m.out,
                             reads: &m.reads,
+                            cells: &[],
                             parts: &m.parts,
                             paths,
                             findings,

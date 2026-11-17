@@ -955,3 +955,102 @@ fn a_type_edit_keeps_the_surface_and_a_name_edit_moves_it() {
     }
     println!("names digest: {} edits kept the surface, {} moved it", keeps.len() + 1, moves.len());
 }
+
+/// `text` lexed and written as a token record, every token made (an expansion's form, with no
+/// source): what `outline_token_record` reads.
+fn token_record_of(text: &str) -> Aligned {
+    let alloc = blaze_own::testing::heap().alloc();
+    let stream = blaze_expand::lex(text, Edition::E2024, alloc).expect("the fixture lexes");
+    let origins = vec![blaze_expand::TokenOrigin::Made(blaze_expand::Transparency::Transparent); stream.len()];
+    let record = blaze_expand::token_record(&stream, &origins, &blaze_expand::OriginMaps::NONE, alloc)
+        .expect("a lexed fixture makes a token record");
+    Aligned::copy_from(&record)
+}
+
+/// Each named entry as its name and its parent's name, in order; then, for every entry, its
+/// parent's index and its descendants' end.
+type Shape = (Vec<(String, Option<String>)>, Vec<(Option<u32>, u32)>);
+
+fn text_shape(text: &str) -> (Shape, bool) {
+    let outline = parse(text);
+    let items = outline.items();
+    let name = |item: &Item| item.name.map(|it| item.text(text, it).to_owned());
+    let named = items
+        .iter()
+        .filter(|item| item.name.is_some())
+        .map(|item| (name(item).expect("named"), item.parent.and_then(|p| name(&items[p.at()]))))
+        .collect();
+    let nesting = items.iter().map(|item| (item.parent.map(|p| p.0), item.end.0)).collect();
+    ((named, nesting), outline.errors().is_empty())
+}
+
+fn token_shape(text: &str) -> Shape {
+    let bytes = token_record_of(text);
+    let tokens = blaze_tokens::Tokens::open(&bytes).expect("the record opens");
+    let outline = blaze_file_items::outline_token_record(tokens, blaze_own::testing::heap().alloc())
+        .expect("a whole record has an outline");
+    let entries = outline.entries();
+    let name = |entry: &blaze_file_items::TokenEntry| outline.name(entry, tokens).map(str::to_owned);
+    let named = entries
+        .iter()
+        .filter(|entry| entry.name.is_some())
+        .map(|entry| (name(entry).expect("named"), entry.parent.and_then(|p| name(&entries[p as usize]))))
+        .collect();
+    let nesting = entries.iter().map(|entry| (entry.parent, entry.end)).collect();
+    (named, nesting)
+}
+
+/// For every fixture of these tests, the outline of its token record names the same items
+/// with the same nesting as the outline of its text: every entry's parent and extent in
+/// entries where the text parses, the named entries and their parents' names where it does not
+/// (the text outline lists an unreadable stretch as an error entry; the token outline lists
+/// what the grammar made). A token outline that took a name from a rendered text, counted an
+/// item inside a body, or lost a list's nesting fails. Prints "token outline: N fixtures, M
+/// named entries as the text outline's".
+#[test]
+fn a_token_outline_names_the_items_of_the_text_outline() {
+    let fixtures = [
+        FORMS,
+        BROKEN,
+        "fn k() { unsafe { core::arch::asm!(\"nop\") } }\nfn m() { #[allow(unused)] let y = unsafe { 1 }; }\nfn n() { let r#unsafe = 1; let unsafe_code = r#\"unsafe\"#; }\n",
+        "mod a { /// one\n pub struct S { pub x: u8, y: (u16, u32) } enum E { A(u8), B { c: u8 } } }\nimpl a::S { fn new() -> Self { loop {} } }\ntrait T { type U; const C: u8; fn f(&self); }\nextern \"C\" { fn g(); static H: u8; }\nmacro_rules! m { () => {} }\nm!();\n",
+    ];
+    let mut named = 0;
+    for text in fixtures {
+        let ((text_named, text_nesting), parses) = text_shape(text);
+        let (token_named, token_nesting) = token_shape(text);
+        assert_eq!(token_named, text_named, "the named entries of:\n{text}");
+        if parses {
+            assert_eq!(token_nesting, text_nesting, "the nesting of:\n{text}");
+        }
+        named += text_named.len();
+    }
+    println!("token outline: {} fixtures, {named} named entries as the text outline's", fixtures.len());
+}
+
+/// Each entry's token digest in order.
+fn token_digests(text: &str) -> Vec<ContentId> {
+    let bytes = token_record_of(text);
+    let tokens = blaze_tokens::Tokens::open(&bytes).expect("the record opens");
+    let outline = blaze_file_items::outline_token_record(tokens, blaze_own::testing::heap().alloc())
+        .expect("a whole record has an outline");
+    outline.entries().iter().map(|entry| entry.digest).collect()
+}
+
+/// An entry's token digest is of its tokens: spaces and comments of the text they came from
+/// leave every digest equal, a changed token changes its own entry's digest (and its
+/// ancestors') and no other's, even when the change moves the other entry's tokens. Prints
+/// "token digests: spaces and comments kept 4 digests, an edit to `f` moved 1 of 2".
+#[test]
+fn a_token_digest_is_of_its_entrys_tokens_alone() {
+    let tight = "fn f() { a + b } // c\nstruct S { x: u8, y: Vec<u8> }\n";
+    let loose = "fn  f( ) {\n    a+b\n}\n/* other */ struct S{x:u8,y:Vec< u8 > }";
+    let (a, b) = (token_digests(tight), token_digests(loose));
+    assert_eq!(a.len(), 4, "f, S and its two fields");
+    assert_eq!(a, b, "spaces and comments moved a digest");
+    let before = token_digests("fn f() { 1 }\nfn g() { 2 }\n");
+    let after = token_digests("fn f() { 1 + 1 }\nfn g() { 2 }\n");
+    assert_ne!(before[0], after[0], "an edit to `f` left its digest");
+    assert_eq!(before[1], after[1], "an edit to `f` moved `g`'s digest");
+    println!("token digests: spaces and comments kept {} digests, an edit to `f` moved 1 of 2", a.len());
+}

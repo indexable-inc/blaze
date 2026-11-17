@@ -32,6 +32,7 @@ const KNOWN: &[Known] = &[Known {
     snippet: "fn f() {}",
     accepted: true,
     why: "an empty function item is Rust since 1.0",
+    needs: &["core", "std"],
 }];
 
 fn main() {
@@ -40,7 +41,11 @@ fn main() {
         eprintln!("usage: script_run <store> <module.wasm> <package folder> <name> <version>");
         std::process::exit(2);
     };
-    let alloc = Alloc::global();
+    // An entry that takes no grant yet (a plain `fn main`): the run's memory is one frame
+    // taken from the OS here and handed down.
+    let frame = blaze_mem::Frame::with_reserve(1 << 36, blaze_mem::Tag::Usercode).expect("the entry's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc: Alloc<'_> = erased.handle();
     let wasm = std::fs::read(module).unwrap_or_else(|e| panic!("{module}: {e}"));
     let package = PackageFacts { name, version, ..PackageFacts::default() };
     // The folder is a package's copy: it runs as a dependency, at `/package` (D96).

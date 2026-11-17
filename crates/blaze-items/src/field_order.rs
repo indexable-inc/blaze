@@ -14,7 +14,7 @@
 use std::{alloc::Global, fmt, fmt::Write as _};
 
 use base_db::Db;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::ContentId;
 use hir_def::AdtId;
 use hir_expand::name::Name;
@@ -108,7 +108,7 @@ pub fn decode(db: &Db, bytes: &[u8]) -> Result<Decoded, DecodeError> {
             ));
         }
     }
-    let mut by_key: HashMap<ContentId, AdtPlan, Global> = HashMap::new_in(Global);
+    let mut by_key: Map<ContentId, AdtPlan, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     let mut unresolved = 0;
     // alloc: the decoded plan's, one entry per stale ADT
     let mut stale = Vec::new();

@@ -124,19 +124,149 @@ fn lib_path<'n, S: NamesSource<'n>>(names: S, lib: LibKey) -> Option<String> {
     }
     match names.name_of(owner) {
         Some(n) => out.push_str(n),
-        // An impl has no name: its header as written, whole.
-        None => {
-            let header = names.text_of(owner)?.impl_header?;
-            out.push('<');
-            out.push_str(header.trim());
-            out.push('>');
-        }
+        // An impl has no name: its header as written, from its first token.
+        None => out.push_str(&impl_shown(names.text_of(owner)?.impl_header?)),
     }
     if let Some(l) = last {
         out.push_str("::");
         out.push_str(l);
     }
     Some(out)
+}
+
+/// An impl as a path segment shows it (here and in row_path.rs, a row's path): `<` its header
+/// `>`, from its first modifier (`const`, `unsafe`) or the keyword `impl`, on one line. The
+/// header's span starts after the impl's outer attributes but not after a comment written
+/// between them and the header (core's `// FIXME(fee1-dead): ..` line above
+/// `const impl<T, A: ..> RawVec<T, A>`, which hello's stops printed as the path), so the
+/// comments, doc comments and attributes before the first token are left out, and each run of
+/// whitespace and comments inside it is one space: a path is one line whatever the header's
+/// layout. A string literal (an attribute's, a const argument's) is read whole, so a `//` or
+/// `]` in it is neither a comment nor an attribute's end. A loop over bytes that cuts only at
+/// ASCII bytes, so every slice is on a char boundary.
+pub(crate) fn impl_shown(header: &str) -> String {
+    let bytes = header.as_bytes();
+    let mut out = String::with_capacity(header.len() + 2);
+    out.push('<');
+    let mut at = 0usize;
+    // Whitespace or a comment stands since the last token byte copied.
+    let mut gap = false;
+    // No token is copied yet: an attribute here is an outer one, left out.
+    let mut lead = true;
+    while at < bytes.len() {
+        let c = bytes[at];
+        if c.is_ascii_whitespace() {
+            at += 1;
+            gap = true;
+            continue;
+        }
+        if c == b'/' && bytes.get(at + 1) == Some(&b'/') {
+            while at < bytes.len() && bytes[at] != b'\n' {
+                at += 1;
+            }
+            gap = true;
+            continue;
+        }
+        if c == b'/' && bytes.get(at + 1) == Some(&b'*') {
+            at = block_comment_end(bytes, at);
+            gap = true;
+            continue;
+        }
+        if lead && c == b'#' {
+            if let Some(end) = attribute_end(bytes, at) {
+                at = end;
+                gap = true;
+                continue;
+            }
+        }
+        if gap && !lead {
+            out.push(' ');
+        }
+        gap = false;
+        lead = false;
+        let start = at;
+        if c == b'"' {
+            at = string_end(bytes, at);
+        } else {
+            at += 1;
+            while at < bytes.len() && !bytes[at].is_ascii_whitespace() && bytes[at] != b'/' && bytes[at] != b'"' {
+                at += 1;
+            }
+        }
+        out.push_str(&header[start..at]);
+    }
+    out.push('>');
+    out
+}
+
+/// The byte after the string literal whose opening `"` is at `at` (its escapes skipped); the
+/// text's end when it is not closed.
+fn string_end(bytes: &[u8], at: usize) -> usize {
+    let mut i = at + 1;
+    while i < bytes.len() && bytes[i] != b'"' {
+        i += if bytes[i] == b'\\' { 2 } else { 1 };
+    }
+    (i + 1).min(bytes.len())
+}
+
+/// The byte after the block comment opened at `at` (`/*`), nested ones counted as Rust nests
+/// them; the text's end when it is not closed.
+fn block_comment_end(bytes: &[u8], at: usize) -> usize {
+    let mut i = at + 2;
+    let mut depth = 1usize;
+    while i < bytes.len() && depth > 0 {
+        match (bytes[i], bytes.get(i + 1)) {
+            (b'/', Some(b'*')) => {
+                depth += 1;
+                i += 2;
+            }
+            (b'*', Some(b'/')) => {
+                depth -= 1;
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    i
+}
+
+/// The byte after the attribute whose `#` is at `at` (`#[..]` or `#![..]`, spaced as an
+/// expansion prints it: `# [doc = ".."]`), its brackets balanced outside string literals;
+/// `None`: no attribute starts there.
+fn attribute_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut i = at + 1;
+    let skip_space = |mut i: usize| {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    i = skip_space(i);
+    if bytes.get(i) == Some(&b'!') {
+        i = skip_space(i + 1);
+    }
+    if bytes.get(i) != Some(&b'[') {
+        return None;
+    }
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i = string_end(bytes, i);
+                continue;
+            }
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// What a want asks for, by name: `the head of a::B (key ..)`.
@@ -180,5 +310,25 @@ pub fn head_error_shown<'n, S: NamesSource<'n>>(names: S, e: &HeadError) -> Stri
         ),
         HeadError::Key(c) => format!("{c}"),
         HeadError::Item(k, why) => format!("item {}: {why:?}", item(*k)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::impl_shown;
+
+    /// core's RawVec impl as its header span holds it (a comment line before `const impl`), an
+    /// impl with a doc comment, an attribute whose string holds `]`, nested block comments and
+    /// a where clause over three lines, and an expansion's spaced `# [doc = "//"]`: each is
+    /// shown from its first modifier or `impl`, on one line, an attribute inside the generics
+    /// kept. Prints nothing; before the fix the first was shown as `<// FIXME(fee1-dead): ..`.
+    #[test]
+    fn an_impl_is_shown_from_its_first_token_on_one_line() {
+        let raw_vec = "// FIXME(fee1-dead): temporary measure before rustfmt is bumped\nconst impl<T, A: [const] Allocator + [const] Destruct> RawVec<T, A>";
+        assert_eq!(impl_shown(raw_vec), "<const impl<T, A: [const] Allocator + [const] Destruct> RawVec<T, A>>");
+        let boxed = "/// docs\n#[rustc_const_unstable(feature = \"a]b\")] /* x /* y */ */ unsafe impl<#[may_dangle] T> Drop for Box<T>\nwhere\n    T: Sized, // why\n";
+        assert_eq!(impl_shown(boxed), "<unsafe impl<#[may_dangle] T> Drop for Box<T> where T: Sized,>");
+        assert_eq!(impl_shown("# [doc = \"//\"] impl Default for Stat"), "<impl Default for Stat>");
+        assert_eq!(impl_shown("impl Default for stat"), "<impl Default for stat>");
     }
 }

@@ -72,7 +72,7 @@ const EDITION: Edition = Edition::E2024;
 // The world, timed: every question the checker asks, counted and timed by kind, then answered
 // by the front end's world. Harness counters only; the checker is unchanged.
 
-const KINDS: usize = 22;
+const KINDS: usize = 24;
 
 fn kind_of(q: &Question) -> usize {
     match q {
@@ -97,13 +97,15 @@ fn kind_of(q: &Question) -> usize {
         Question::Closure(..) => 19,
         Question::AssocGenerics(..) => 20,
         Question::Coroutine(..) => 21,
+        Question::TypeAlias(_) => 22,
+        Question::FieldDefaults(_) => 23,
     }
 }
 
 const KIND_NAMES: [&str; KINDS] = [
     "FnSig", "Predicates", "Adt", "ImplsOf", "ImplHeader", "Inherent", "AssocItem", "TraitsInScope", "Path", "Lang",
     "LangPath", "Const", "Opaque", "Attrs", "TraitDef", "AssocParent", "ConstHolds", "ConstParams", "prefetch", "Closure", "AssocGenerics",
-    "Coroutine",
+    "Coroutine", "TypeAlias", "FieldDefaults",
 ];
 
 struct Tally {
@@ -452,7 +454,7 @@ fn run_crate(dir: &Path, census: &mut Census, costs: &mut Vec<Cost>, restart: &m
         let refusal = {
             let sources: Vec<SourceFile<'_>> = files.iter().map(|f| SourceFile { path: &f.rel, text: &f.text }).collect();
             let mut attrs = BlazeAttrs::default();
-            match Front::new(&sources, &root, &mut attrs) {
+            match Front::new(&sources, &root, &mut attrs, Alloc::global()) {
                 Ok(_) => None,
                 Err(r) => Some(r),
             }
@@ -511,7 +513,7 @@ fn run_crate(dir: &Path, census: &mut Census, costs: &mut Vec<Cost>, restart: &m
     }
     let sources: Vec<SourceFile<'_>> = files.iter().map(|f| SourceFile { path: &f.rel, text: &f.text }).collect();
     let mut attrs = BlazeAttrs::default();
-    let Ok(front) = Front::new(&sources, &root, &mut attrs) else {
+    let Ok(front) = Front::new(&sources, &root, &mut attrs, Alloc::global()) else {
         println!("  {name}: the front refused the program it took a moment ago");
         return;
     };
@@ -611,7 +613,7 @@ fn run_crate(dir: &Path, census: &mut Census, costs: &mut Vec<Cost>, restart: &m
             for _ in 0..threads {
                 s.spawn(|| {
                     let mut attrs = BlazeAttrs::default();
-                    let own = Front::new(sources, root, &mut attrs).ok();
+                    let own = Front::new(sources, root, &mut attrs, Alloc::global()).ok();
                     gate.wait();
                     let t = Instant::now();
                     if let Some(front) = own {

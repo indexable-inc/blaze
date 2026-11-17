@@ -25,6 +25,8 @@ blaze-git-fetch.workspace = true
 blaze-text.workspace = true
 # proc_macro_modules: the source corrections' allocator and the lexer's vector width (D58).
 blaze-own = { workspace = true, features = ["std"] }
+# A plain `fn main`'s one frame (memory from the OS), handed down in place of a heap from nowhere.
+blaze-mem.workspace = true
 blaze-lex.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
 # toolchain_cut: the toolchain record it writes and the reader it checks against; the sysroot's

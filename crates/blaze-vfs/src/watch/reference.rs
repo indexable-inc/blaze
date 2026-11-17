@@ -9,7 +9,7 @@ use std::{collections::VecDeque, sync::Arc};
 use blaze_core::{
     Completion, Cursor, Done, Effect, FileName, IoError, Listing, Lost, Names, S_IFMT, Stamp, Tag,
 };
-use blaze_hash::{HashMap, HashSet};
+use blaze_hash::{FixedState, Map, MapOpts, Set, SetOpts};
 use blaze_ids::ContentId;
 use blaze_mem::Slab;
 use std::alloc::Global;
@@ -82,7 +82,7 @@ struct Batch {
     slots: Vec<Slot>,
     /// Each slot by name, once a listing may add names to it (the swept names are found in
     /// `names`).
-    index: HashMap<Box<str>, usize, Global>,
+    index: Map<Box<str>, usize, FixedState, Global>,
     /// Stamps and listings in flight: it commits once none is and every slot is looked at.
     open: u32,
     /// The slots read whose stamps are to be taken again, and those written in place across
@@ -94,7 +94,7 @@ struct Batch {
     /// The directory a [`Lost::Unnamed`] lists alone: its slots are what was in it.
     relist: Option<FileName>,
     /// Each gone file the head had, by its inode: a name new to the batch with its stamp is it.
-    gone: HashMap<u64, usize, Global>,
+    gone: Map<u64, usize, FixedState, Global>,
     /// The journal's place once this is committed, and whether it then has told everything
     /// from before the watch.
     cursor: Option<Cursor>,
@@ -115,7 +115,7 @@ impl Batch {
             // alloc: none unless a path changed.
             forced: Vec::new(),
             slots,
-            index: HashMap::new_in(Global),
+            index: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             open: 1,
             // alloc: none until a file is read.
             verify: Vec::new(),
@@ -123,7 +123,7 @@ impl Batch {
             unsure: Vec::new(),
             rescan,
             relist,
-            gone: HashMap::new_in(Global),
+            gone: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             cursor: None,
             caught_up: false,
             // alloc: none until a tag prunes a directory.
@@ -250,7 +250,7 @@ pub struct Watcher {
     /// Looks in flight, by their tag past `tags + FIRST`: a slot is reused once its look is in.
     pending: Slab<Pending>,
     /// What this watcher's commits left at each path, while batches told before them wait.
-    ours: HashMap<String, Seen, Global>,
+    ours: Map<String, Seen, FixedState, Global>,
     /// The cache directories out of the view, relative to `dir`.
     caches: Caches,
 }
@@ -273,7 +273,7 @@ impl Watcher {
             first: 0,
             pending: Slab::new(MOST_IN_FLIGHT, blaze_mem::Tag::Vfs)
                 .unwrap_or_else(|error| panic!("the looks in flight of a watch: {error}")),
-            ours: HashMap::new_in(Global),
+            ours: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             caches: Caches::default(),
         }
     }
@@ -675,7 +675,7 @@ impl Watcher {
         let below = self.below.len();
         // alloc: none unless a path changed.
         let mut slots: Vec<Slot> = Vec::new();
-        let mut index: HashMap<Box<str>, usize, Global> = HashMap::new_in(Global);
+        let mut index: Map<Box<str>, usize, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         if let Some(disk) = self.disk(vfs) {
             disk.children(dir.as_str(), |name, saved| {
                 let file = FileName::new(name).expect("a column's name is a name");
@@ -1042,7 +1042,8 @@ impl Watcher {
             let Some(batch) = self.batch(number) else { unreachable!("a listing of no batch") };
             batch.open -= 1;
             if batch.relist.as_ref() == Some(dir) {
-                let mut there: HashMap<String, Stamp, Global> = HashMap::default();
+                let mut there: Map<String, Stamp, FixedState, Global> =
+                    Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
                 // alloc: once per batch.
                 there.extend((0..entries.len()).map(|at| (entries.file(at).as_str().to_owned(), entries.stamp(at))));
                 for (at, slot) in
@@ -1269,7 +1270,7 @@ impl Watcher {
         let mut again = Vec::new();
         // alloc: none unless a path changed.
         let mut renames: Vec<(String, String)> = Vec::new();
-        let mut renamed = HashSet::new_in(Global);
+        let mut renamed = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
         for (at, from) in moves {
             let (target, source) = (&batch.slots[at], &batch.slots[from]);
             let Some((id, mode)) = source.was else {

@@ -201,7 +201,7 @@ use tests::{external, output};
 /// that share its hash.
 #[derive(Default)]
 struct Chains {
-    heads: HashMap<u64, u32, Global>,
+    heads: Map<u64, u32, FixedState, Global>,
     /// The entry before each in its chain.
     next: Vec<u32>,
 }
@@ -242,7 +242,7 @@ impl Chains {
 #[derive(Default)]
 struct Names {
     all: Vec<InternedString>,
-    ids: HashMap<usize, u32, Global>,
+    ids: Map<usize, u32, FixedState, Global>,
 }
 
 impl Names {
@@ -465,7 +465,7 @@ struct PkgDep<'a> {
     id: PackageId,
     /// Whether the dependent depends on it publicly (cargo's `public_dependencies`).
     public: bool,
-    deps: &'a HashSet<Dependency, Global>,
+    deps: &'a Set<Dependency, FixedState, Global>,
 }
 
 /// What decides which of a package's dependencies a unit builds with (cargo's `State::deps`).
@@ -625,7 +625,7 @@ struct Shared {
     /// The dependencies of the units being shared, a stack of each one's.
     scratch: Vec<Dep>,
     /// A profile with `strip` lowered and its debuginfo settled, by the profile and how.
-    adjusted: HashMap<(u32, u8), u32, Global>,
+    adjusted: Map<(u32, u8), u32, FixedState, Global>,
     /// Whether the target's units become the host's (no `--target`).
     to_host: bool,
 }
@@ -660,13 +660,13 @@ struct State<'r, 'a> {
     /// Each kind as a profile reads it.
     profile_kinds: [ProfileKind; 4],
     pkgs: Vec<Pkg<'a>>,
-    pkg_index: HashMap<PackageId, u32, Global>,
+    pkg_index: Map<PackageId, u32, FixedState, Global>,
     pkg_deps: Vec<PkgDep<'a>>,
     target_lists: Vec<u32>,
     public: Vec<PackageId>,
 
     units: Vec<Row>,
-    by_key: HashMap<Key, u32, Global>,
+    by_key: Map<Key, u32, FixedState, Global>,
     /// Each unit's edges in `built`, in the order computed; [`NONE`] until it is walked.
     ranges: Vec<(u32, u32)>,
     built: Vec<Dep>,
@@ -674,7 +674,7 @@ struct State<'r, 'a> {
 
     profiles: Profiles,
     /// The profile of a package's unit for a use and kind (cargo's `get_profile`).
-    profile_of: HashMap<(u32, UnitFor, Kind), u32, Global>,
+    profile_of: Map<(u32, UnitFor, Kind), u32, FixedState, Global>,
     /// The profile of the run of a build script, by the profile of the unit it runs for.
     run_profile_of: Vec<u32>,
     features: FeatureSets,
@@ -682,11 +682,11 @@ struct State<'r, 'a> {
     features_of: Vec<u32>,
     /// cargo's `resolve_all_features` less the package's own: `(dep, feature)` for each
     /// feature on in each dependency, by package, whether dev-dependencies count, and kind.
-    dep_features: HashMap<(u32, bool, Kind), (u32, u32), Global>,
+    dep_features: Map<(u32, bool, Kind), (u32, u32), FixedState, Global>,
     dep_feature_pairs: Vec<(InternedString, InternedString)>,
     names: Names,
     /// The names a package calls another's target by (cargo's `extern_crate_name_and_dep_name`).
-    extern_names: HashMap<(u32, u32, u32), (u32, u32), Global>,
+    extern_names: Map<(u32, u32, u32), (u32, u32), FixedState, Global>,
     ranks: Ranks,
 }
 
@@ -760,7 +760,7 @@ impl<'r, 'a> State<'r, 'a> {
         sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         let targets: usize = sorted.iter().map(|it| it.2.manifest.targets.len()).sum();
         let mut pkgs = Vec::with_capacity(n);
-        let mut pkg_index = HashMap::with_capacity_in(n, Global);
+        let mut pkg_index = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(n) });
         let mut target_lists = Vec::with_capacity(targets);
         for (_, id, package) in sorted {
             pkg_index.insert(id, pkgs.len() as u32);
@@ -818,20 +818,20 @@ impl<'r, 'a> State<'r, 'a> {
             target_lists,
             public: Vec::with_capacity(4),
             units: Vec::with_capacity(units),
-            by_key: HashMap::with_capacity_in(units, Global),
+            by_key: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(units) }),
             ranges: Vec::with_capacity(units),
             built: Vec::with_capacity(units * 4),
             stack: Vec::with_capacity(64),
             profiles: Profiles::default(),
-            profile_of: HashMap::with_capacity_in(n * 2, Global),
+            profile_of: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(n * 2) }),
             run_profile_of: Vec::with_capacity(8),
             features: FeatureSets::default(),
             // alloc: a column per build.
             features_of: vec![NONE; n * 2],
-            dep_features: HashMap::new_in(Global),
+            dep_features: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             dep_feature_pairs: Vec::with_capacity(16),
             names: Names::default(),
-            extern_names: HashMap::with_capacity_in(n * 4, Global),
+            extern_names: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(n * 4) }),
             ranks: Ranks::new(n),
         }
     }
@@ -1749,7 +1749,7 @@ impl<'r, 'a> State<'r, 'a> {
             // alloc: a column per build.
             memo: vec![NONE; n],
             scratch: Vec::with_capacity(64),
-            adjusted: HashMap::new_in(Global),
+            adjusted: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             to_host: self.request.target.is_none(),
         };
         shared.offsets.push(0);

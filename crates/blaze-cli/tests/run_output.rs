@@ -11,12 +11,12 @@ use std::time::{Duration, Instant};
 
 use support::fresh_home;
 
-/// The names and lengths in the owner's `~/.blaze/v2/shared`, read only: a test compares
+/// The names and lengths in the owner's one store, `~/.blaze/v2/store`, read only: a test compares
 /// them before and after to show it wrote nothing there. Another blaze the owner runs at the
 /// same moment would change them too: the assertion names what changed.
 fn real_shared_listing() -> Vec<(String, u64)> {
     let Some(home) = std::env::var_os("HOME") else { return Vec::new() };
-    let Ok(entries) = std::fs::read_dir(Path::new(&home).join(".blaze/v2/shared")) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(Path::new(&home).join(".blaze/v2/store")) else { return Vec::new() };
     let mut listed: Vec<(String, u64)> = entries
         .filter_map(Result::ok)
         .map(|entry| (entry.file_name().to_string_lossy().into_owned(), entry.metadata().map(|meta| meta.len()).unwrap_or(0)))
@@ -56,7 +56,7 @@ fn build_is_no_command_and_names_run_and_export() {
 }
 
 /// Run with `HOME` at an empty temporary folder (its toolchain shelf hard-linked in): the run
-/// passes, its machine store lands in that folder, and the owner's `~/.blaze/v2/shared` lists
+/// passes, its one store lands in that folder, and the owner's `~/.blaze/v2/store` lists
 /// the same names and lengths before and after (read only). Expected: passes; with `HOME`
 /// left to the owner's, the last assertion fails ("the temporary home's shared store").
 #[test]
@@ -98,7 +98,7 @@ fn a_clean_run_prints_only_its_program() {
         assert_eq!(String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(stdout), "{rung}: standard output");
         assert_eq!(String::from_utf8_lossy(&output.stderr), "", "{rung}: a clean run says nothing");
     }
-    assert_eq!(real_shared_listing(), before, "the owner's ~/.blaze/v2/shared changed while the test ran (another blaze of the owner's, or this test writing there)");
-    assert!(home.join(".blaze/v2/shared").is_dir() || home.join(".blaze/v2/own").is_dir(), "the temporary home's shared store: the run kept its machine records there");
+    assert_eq!(real_shared_listing(), before, "the owner's ~/.blaze/v2/store changed while the test ran (another blaze of the owner's, or this test writing there)");
+    assert!(home.join(".blaze/v2/store").is_dir(), "the temporary home's shared store: the run kept its records there");
     let _ = std::fs::remove_dir_all(&base);
 }

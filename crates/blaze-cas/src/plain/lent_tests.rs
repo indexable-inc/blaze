@@ -112,3 +112,36 @@ fn the_planted_one_buffer_arena_moves_a_lend() {
     assert_ne!(first, now, "the one growing buffer did not move: the plant was not exercised");
     println!("lent, planted OneBuffer: caught (a lent address moved)");
 }
+
+/// Equal bytes under one key are one value, whether the key is held by an earlier commit or by
+/// this command's own put; other bytes, or another tag, are refused, naming both records'
+/// lengths and the first differing byte. Prints
+/// `lent, one key: equal bytes kept over two commits and the arena; refused at byte 3 (committed), at 140 (own), equal bytes of another tag refused`.
+#[test]
+fn equal_bytes_under_one_key_are_kept_and_other_bytes_refused_by_offset() {
+    use super::LentError;
+    use blaze_keyed::store::Put;
+    let lent = lent(23, LentPlant::None);
+    // Committed by the first commit and by the second: equal bytes are the same value.
+    for n in [5u32, 15] {
+        assert!(matches!(lent.put(&key(n), Namespace::LOCAL, TAG, &value(n)), Ok(Put::Same)), "equal bytes of committed key {n} refused");
+    }
+    let mut other = value(5);
+    other[3] ^= 1;
+    let refused = lent.put(&key(5), Namespace::LOCAL, TAG, &other).expect_err("other bytes under a committed key were kept");
+    let LentError::TwoValues { len, held_len, held_own, differs_at, .. } = refused else { panic!("not a two-values refusal: {refused}") };
+    assert_eq!((len, held_len, held_own, differs_at), (other.len(), value(5).len(), false, Some(3)), "{refused}");
+    assert!(refused.to_string().contains("first differing byte at 3"), "{refused}");
+    // This command's own put: once written, the same bytes again are the same value.
+    assert!(matches!(lent.put(&key(1000), Namespace::LOCAL, TAG, &value(1000)), Ok(Put::Written)));
+    assert!(matches!(lent.put(&key(1000), Namespace::LOCAL, TAG, &value(1000)), Ok(Put::Same)));
+    let mut longer = value(1000);
+    let own_len = longer.len();
+    longer.push(0);
+    let refused = lent.put(&key(1000), Namespace::LOCAL, TAG, &longer).expect_err("a longer value under an own key was kept");
+    let LentError::TwoValues { held_own, differs_at, .. } = refused else { panic!("not a two-values refusal: {refused}") };
+    assert_eq!((held_own, differs_at), (true, Some(own_len)), "{refused}");
+    let refused = lent.put(&key(1000), Namespace::LOCAL, Tag(2), &value(1000)).expect_err("equal bytes of another tag were kept");
+    let LentError::TwoValues { differs_at: None, .. } = refused else { panic!("equal bytes not said equal: {refused}") };
+    println!("lent, one key: equal bytes kept over two commits and the arena; refused at byte 3 (committed), at {own_len} (own), equal bytes of another tag refused");
+}

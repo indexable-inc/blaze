@@ -469,7 +469,7 @@ fn check_shared(shared: &Shared) -> Result<(), String> {
 /// Whether the line, by its inputs' `names`, has what a linker script names as `wanted`: a
 /// path as written or ending in `/wanted`, `-lNAME` as an input whose file is `libNAME.so` or
 /// `libNAME.a`, `-l:FILE` as one whose file is `FILE`.
-fn line_has(names: &HashSet<&str, std::alloc::Global>, wanted: &str) -> bool {
+fn line_has(names: &Set<&str, FixedState, std::alloc::Global>, wanted: &str) -> bool {
     fn file(it: &str) -> &str {
         it.rsplit('/').next().unwrap_or(it)
     }
@@ -1096,8 +1096,8 @@ impl Exports {
             }
             orders.resize(flat.len(), *order);
         }
-        let mut first: HashMap<&str, u32, std::alloc::Global> =
-            HashMap::with_capacity_in(flat.len(), std::alloc::Global);
+        let mut first: Map<&str, u32, FixedState, std::alloc::Global> =
+            Map::new(MapOpts { hasher: FixedState, alloc: std::alloc::Global, capacity: Some(flat.len()) });
         let mut canonical: Vec<u32> = Vec::with_capacity(flat.len());
         canonical.extend(
             flat.iter()
@@ -1119,8 +1119,8 @@ impl Exports {
         let mut symbols: Vec<Export> = Vec::with_capacity(count);
         let distinct: usize = flat.iter().map(|it| it.0.versions.len()).sum();
         let mut versions: Vec<String> = Vec::with_capacity(distinct);
-        let mut version_of: HashMap<&str, u32, std::alloc::Global> =
-            HashMap::with_capacity_in(distinct, std::alloc::Global);
+        let mut version_of: Map<&str, u32, FixedState, std::alloc::Global> =
+            Map::new(MapOpts { hasher: FixedState, alloc: std::alloc::Global, capacity: Some(distinct) });
         for (at, (shared, _)) in flat.iter().enumerate() {
             for symbol in &shared.symbols {
                 let name = shared.symbol_name(symbol);
@@ -1272,8 +1272,8 @@ pub(crate) struct Graph {
     #[cfg_attr(not(test), allow(dead_code))]
     id: u64,
     loads: Vec<Load>,
-    by_obj: HashMap<Obj, u32, std::alloc::Global>,
-    slot_of: HashMap<Sym, u32, std::alloc::Global>,
+    by_obj: Map<Obj, u32, FixedState, std::alloc::Global>,
+    slot_of: Map<Sym, u32, FixedState, std::alloc::Global>,
     slots: Vec<Slot>,
     /// Sections (flat) of a group that lost.
     discarded: CowFlags,
@@ -1297,10 +1297,10 @@ pub(crate) struct Graph {
     /// refers to ([`Stage::export_for_libraries`]).
     asked: Arc<Vec<Exported>>,
     /// wasm: what objects say a name is imported as, and the input saying it.
-    wasm: HashMap<Sym, (u32, blaze_codegen::wasm::Import), std::alloc::Global>,
+    wasm: Map<Sym, (u32, blaze_codegen::wasm::Import), FixedState, std::alloc::Global>,
     entry: Option<Sym>,
     /// Of each [`OUTSIDE`] slot, what the image beside defines it as.
-    outside: HashMap<u32, Def, std::alloc::Global>,
+    outside: Map<u32, Def, FixedState, std::alloc::Global>,
 }
 
 impl Graph {
@@ -1311,8 +1311,8 @@ impl Graph {
             id: GRAPHS.fetch_add(1, Ordering::Relaxed),
             // alloc: none (an empty `Vec`); the loads, once per graph built
             loads: Vec::new(),
-            by_obj: HashMap::new_in(std::alloc::Global),
-            slot_of: HashMap::new_in(std::alloc::Global),
+            by_obj: Map::new(MapOpts { hasher: FixedState, alloc: std::alloc::Global, capacity: None }),
+            slot_of: Map::new(MapOpts { hasher: FixedState, alloc: std::alloc::Global, capacity: None }),
             // alloc: none (an empty `Vec`); the slots, once per graph built
             slots: Vec::new(),
             discarded: CowFlags::default(),
@@ -1329,9 +1329,9 @@ impl Graph {
             archives: Vec::new(),
             exports: Arc::default(),
             asked: Arc::default(),
-            wasm: HashMap::new_in(std::alloc::Global),
+            wasm: Map::new(MapOpts { hasher: FixedState, alloc: std::alloc::Global, capacity: None }),
             entry: None,
-            outside: HashMap::new_in(std::alloc::Global),
+            outside: Map::new(MapOpts { hasher: FixedState, alloc: std::alloc::Global, capacity: None }),
         }
     }
 
@@ -1930,7 +1930,7 @@ pub(crate) struct Resolved {
     /// ([`Resolved::open`]).
     pub inputs: Arc<Vec<Input>>,
     pub names: Arc<BTreeMap<NameId, crate::state::RustName>>,
-    wasm: Arc<HashMap<NameId, blaze_codegen::wasm::Import, std::alloc::Global>>,
+    wasm: Arc<Map<NameId, blaze_codegen::wasm::Import, FixedState, std::alloc::Global>>,
     graph: Option<Arc<Graph>>,
     marks: Marks,
     /// Of each name resolved, by [`Symbols::dense`]: `O_*` bits.
@@ -2009,17 +2009,17 @@ struct Build {
     graph: Graph,
     /// Slots to look for in the archives after the round.
     queue: Vec<u32>,
-    pulled: HashSet<(u32, u32), std::alloc::Global>,
+    pulled: Set<(u32, u32), FixedState, std::alloc::Global>,
     /// COMDAT groups by name: the winner's `(load, group)` in `group_list`.
     groups: Table,
     group_list: Vec<(u32, u32)>,
-    mismatches: HashMap<String, (String, u32), std::alloc::Global>,
-    asked: HashSet<String, std::alloc::Global>,
+    mismatches: Map<String, (String, u32), FixedState, std::alloc::Global>,
+    asked: Set<String, FixedState, std::alloc::Global>,
     /// The line's shared libraries: file, `as_needed`, place on the line.
     shared: Vec<(Arc<NativeFile>, bool, u32)>,
     /// Import libraries' members, in load order, and their archive's place on the line.
     members: Vec<(Arc<NativeFile>, u32)>,
-    commons: HashMap<u32, (u64, u64), std::alloc::Global>,
+    commons: Map<u32, (u64, u64), FixedState, std::alloc::Global>,
 }
 
 impl Build {
@@ -2028,17 +2028,17 @@ impl Build {
             graph: Graph::new(),
             // alloc: none (an empty `Vec`); it grows once per graph built
             queue: Vec::new(),
-            pulled: HashSet::new_in(std::alloc::Global),
+            pulled: Set::new(SetOpts { hasher: FixedState, alloc: std::alloc::Global, capacity: None }),
             groups: Table::default(),
             // alloc: none (an empty `Vec`); it grows once per graph built
             group_list: Vec::new(),
-            mismatches: HashMap::new_in(std::alloc::Global),
-            asked: HashSet::new_in(std::alloc::Global),
+            mismatches: Map::new(MapOpts { hasher: FixedState, alloc: std::alloc::Global, capacity: None }),
+            asked: Set::new(SetOpts { hasher: FixedState, alloc: std::alloc::Global, capacity: None }),
             // alloc: none (an empty `Vec`); it grows once per graph built
             shared: Vec::new(),
             // alloc: none (an empty `Vec`); it grows once per graph built
             members: Vec::new(),
-            commons: HashMap::new_in(std::alloc::Global),
+            commons: Map::new(MapOpts { hasher: FixedState, alloc: std::alloc::Global, capacity: None }),
         }
     }
 
@@ -2152,8 +2152,8 @@ impl<'a> Stage<'a> {
         }
         // An archive or library twice on the line is searched once (lld searches every
         // archive whatever its place); an object twice is an error.
-        let mut given: HashMap<blaze_ids::ContentId, usize, std::alloc::Global> =
-            HashMap::with_capacity_in(change.natives.len(), std::alloc::Global);
+        let mut given: Map<blaze_ids::ContentId, usize, FixedState, std::alloc::Global> =
+            Map::new(MapOpts { hasher: FixedState, alloc: std::alloc::Global, capacity: Some(change.natives.len()) });
         let mut natives = Vec::with_capacity(change.natives.len());
         for (at, native) in change.natives.iter().enumerate() {
             match given.entry(native.id) {
@@ -2171,13 +2171,13 @@ impl<'a> Stage<'a> {
                 Entry::Occupied(_) => {}
             }
         }
-        let mut removed: HashSet<blaze_ids::ContentId, std::alloc::Global> =
-            HashSet::with_capacity_in(change.removed_natives.len(), std::alloc::Global);
+        let mut removed: Set<blaze_ids::ContentId, FixedState, std::alloc::Global> =
+            Set::new(SetOpts { hasher: FixedState, alloc: std::alloc::Global, capacity: Some(change.removed_natives.len()) });
         removed.extend(change.removed_natives.iter().copied());
         let inputs = Arc::make_mut(&mut self.new.inputs);
         inputs.retain(|it| !removed.contains(&it.id));
-        let mut have: HashMap<blaze_ids::ContentId, usize, std::alloc::Global> =
-            HashMap::with_capacity_in(inputs.len(), std::alloc::Global);
+        let mut have: Map<blaze_ids::ContentId, usize, FixedState, std::alloc::Global> =
+            Map::new(MapOpts { hasher: FixedState, alloc: std::alloc::Global, capacity: Some(inputs.len()) });
         have.extend(inputs.iter().enumerate().map(|(at, it)| (it.id, at)));
         let mut fresh = Vec::with_capacity(natives.len());
         for at in natives {
@@ -2202,8 +2202,8 @@ impl<'a> Stage<'a> {
                 .map_err(|it| error(None, format!("{}: {it}", native.name)))?;
             Ok(file)
         });
-        let mut bytes: HashMap<blaze_ids::ContentId, &'a [u8], std::alloc::Global> =
-            HashMap::with_capacity_in(inputs.len() + fresh.len(), std::alloc::Global);
+        let mut bytes: Map<blaze_ids::ContentId, &'a [u8], FixedState, std::alloc::Global> =
+            Map::new(MapOpts { hasher: FixedState, alloc: std::alloc::Global, capacity: Some(inputs.len() + fresh.len()) });
         inputs.reserve(fresh.len());
         for (at, file) in fresh.iter().zip(files) {
             let native = &change.natives[*at];
@@ -2220,8 +2220,8 @@ impl<'a> Stage<'a> {
             bytes.insert(native.id, &native.bytes[..]);
         }
         inputs.sort_by_key(|it| (it.order, it.id));
-        let mut names: HashSet<&str, std::alloc::Global> =
-            HashSet::with_capacity_in(inputs.len(), std::alloc::Global);
+        let mut names: Set<&str, FixedState, std::alloc::Global> =
+            Set::new(SetOpts { hasher: FixedState, alloc: std::alloc::Global, capacity: Some(inputs.len()) });
         names.extend(inputs.iter().map(|it| &*it.name));
         // A Mach-O library is on the line by its install name too, which is where an SDK's
         // `.tbd` stands for the `/usr/lib` dylib another library re-exports.
@@ -2266,8 +2266,8 @@ impl<'a> Stage<'a> {
         self.native.bytes.extend(inputs.iter().map(|it| bytes[&it.id]));
         self.native.filled = true;
         if !removed.is_empty() {
-            let mut gone: HashSet<u32, std::alloc::Global> =
-                HashSet::with_capacity_in(removed.len(), std::alloc::Global);
+            let mut gone: Set<u32, FixedState, std::alloc::Global> =
+                Set::new(SetOpts { hasher: FixedState, alloc: std::alloc::Global, capacity: Some(removed.len()) });
             gone.extend(
                 removed
                     .iter()
@@ -3979,7 +3979,7 @@ impl<'a> Stage<'a> {
                 wanted.push(it.sym);
             }
         }
-        let mut cells: HashSet<Sym, std::alloc::Global> = HashSet::new_in(std::alloc::Global);
+        let mut cells: Set<Sym, FixedState, std::alloc::Global> = Set::new(SetOpts { hasher: FixedState, alloc: std::alloc::Global, capacity: None });
         for sym in &wanted {
             if kind_of(*sym).is_some() {
                 continue;
@@ -4084,8 +4084,8 @@ impl<'a> Stage<'a> {
                 library_orders.push(exports.orders[at]);
             }
         }
-        let mut current: HashMap<Sym, Import, std::alloc::Global> =
-            HashMap::with_capacity_in(imports.len(), std::alloc::Global);
+        let mut current: Map<Sym, Import, FixedState, std::alloc::Global> =
+            Map::new(MapOpts { hasher: FixedState, alloc: std::alloc::Global, capacity: Some(imports.len()) });
         for (sym, mut import, library) in imports {
             import.library =
                 (library != NONE).then(|| index[library as usize]).filter(|it| *it != NONE);

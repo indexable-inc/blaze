@@ -1,6 +1,6 @@
 [package]
 name = "blaze-std"
-description = "bstd, blaze's own capability-based standard library (docs/v2/plan/design/std.md): one Io over blaze-core's drivers and its simulation, capabilities made only from it or by narrowing, a task context (Cx) with a deadline, cancellation, a span and a frame, and memory from named allocators; and the facade over blaze's piece crates (mem, bytes, map, id, sync, cell, sort, digest, record, report, quic, http, test)"
+description = "bstd, blaze's own capability-based standard library (docs/v2/plan/design/std.md): one Io over blaze-core's drivers and its simulation, capabilities made only from it or by narrowing, a task context (Cx) with a deadline, cancellation, a span and a frame, and memory from named allocators; and the facade over blaze's piece crates (mem, vec, boxed, rows, soa, text, bits, paths, bytes, map, set, id, sync, cell, sort, digest, record, report, quic, http, test)"
 publish = false
 
 version.workspace = true
@@ -43,6 +43,9 @@ blaze-json.workspace = true
 blaze-cbor.workspace = true
 # `sync`'s new primitives and `par`: Vec, VecDeque, Box, Arc with an allocator always named.
 blaze-own.workspace = true
+# `id::Table`, `bits::ChunkedBitSet`, `vec::InlineVec` and the rest of the forms (D120). blaze-kit
+# sits on blaze-own, blaze-hash and blaze-int alone, none of which depends on bstd.
+blaze-kit.workspace = true
 # `out::Held` is a `blaze_text::Put`: `Out::line_with` takes a chain of typed writers.
 blaze-text.workspace = true
 blaze-phf.workspace = true

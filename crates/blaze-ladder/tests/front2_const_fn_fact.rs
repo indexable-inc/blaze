@@ -16,9 +16,12 @@
 //! Expected lines (stderr, and the file `FRONT2_WORK_LIST` names):
 //!   "tuple ctor: ok"
 //!   "other crate's const fn: ok"
+//!   "const fn declared in a body: ok"
+//!   "const fn a macro declared in a body: ok"
 //!   "not const: refused, naming three"
 //!   "ctor rows absent: struct P and variant E::A answered as ctors"
 //!   "gap: Missing(Origin): it has no library item, no member origin and no signature row"
+//!   "intrinsic with a body: ok"
 //! Needs `$HOME/.blaze/v2/toolchain`. NEVER RUN by its writer.
 
 use blaze_consteval::{Fact, FnKind};
@@ -57,12 +60,12 @@ fn build(text: &str) -> Result<(), String> {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let files = [SourceFile { path: "src/main.rs", text }];
     let new = NewFront { package: "fnfact", edition: "blaze-2026.11", shelf: Some(&shelf), overflow: blaze_build::OverflowChecks::On };
-    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc).unwrap_or_else(|e| panic!("the program's texts: {e}"));
+    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind).unwrap_or_else(|e| panic!("the program's texts: {e}"));
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
-    build_stubbed(&names, &files, &texts).map(|_| ()).map_err(|e| format!("{e}").replace('\n', " "))
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    build_stubbed(&names, &files, &texts, blaze_own::Alloc::global()).map(|_| ()).map_err(|e| format!("{e}").replace('\n', " "))
 }
 
 /// `P(3)` in a body static: a tuple struct's constructor is const.
@@ -80,6 +83,30 @@ fn body_static_calls_another_crates_const_fn() {
     let got = build("fn main() {\n    static L: std::grant::Param = std::grant::Param::new(\"out\", std::grant::Kind::Out);\n    let _kept = &L;\n}\n");
     note(&format!("other crate's const fn: {}", got.as_ref().map_or_else(|e| e.as_str(), |()| "ok")));
     assert_eq!(got, Ok(()), "`Param::new` is a `const fn` of bstd");
+}
+
+/// A static calls a `const fn` whose body calls a `const fn` DECLARED IN that body: the shape of
+/// core's `const fn gcd` in `<[T]>::align_to_offsets` and of `precondition_check` in
+/// `Layout::from_size_align_unchecked` (reached from `Vec::new()` through `T::LAYOUT`). The
+/// inner fn's key is a body-local item's (`Keys::local`, an `Origin::Item`), which the names
+/// library holds no text for; without const_fn_fact.rs's local arm the call was refused as
+/// "its kind is not known: its head was not read: no text is held for it".
+#[test]
+fn static_calls_a_const_fn_declared_in_a_body() {
+    let got = build("const fn three() -> u8 {\n    const fn inner() -> u8 {\n        3\n    }\n    inner()\n}\n\nstatic L: u8 = three();\n\nfn main() {\n    let _kept = &L;\n}\n");
+    note(&format!("const fn declared in a body: {}", got.as_ref().map_or_else(|e| e.as_str(), |()| "ok")));
+    assert_eq!(got, Ok(()), "a `const fn` declared in a body is const");
+}
+
+/// The same with the inner fn in a block a `macro_rules!` call wrote, as
+/// `assert_unsafe_precondition!` writes `const fn precondition_check` (core ub_checks.rs).
+#[test]
+fn static_calls_a_const_fn_a_macro_declared_in_a_body() {
+    let got = build(
+        "macro_rules! checked {\n    ($e:expr) => {{\n        const fn check(x: u8) -> u8 {\n            x\n        }\n        check($e)\n    }};\n}\n\nconst fn three() -> u8 {\n    checked!(3)\n}\n\nstatic L: u8 = three();\n\nfn main() {\n    let _kept = &L;\n}\n",
+    );
+    note(&format!("const fn a macro declared in a body: {}", got.as_ref().map_or_else(|e| e.as_str(), |()| "ok")));
+    assert_eq!(got, Ok(()), "a `const fn` a macro call declared in a body is const");
 }
 
 /// Control, the old form: `three()`'s head was read and has no `const`: refused as not const,
@@ -104,14 +131,14 @@ fn ctors_without_rows_and_a_missing_fact() {
     let text = "struct P(u8);\n\nenum E {\n    A(u8),\n}\n\nfn main() {}\n";
     let files = [SourceFile { path: "src/main.rs", text }];
     let new = NewFront { package: "fnfact", edition: "blaze-2026.11", shelf: Some(&shelf), overflow: blaze_build::OverflowChecks::On };
-    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc).unwrap_or_else(|e| panic!("the program's texts: {e}"));
+    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind).unwrap_or_else(|e| panic!("the program's texts: {e}"));
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
-    let mut front = Front2::new(&names, &frame, &files).unwrap_or_else(|e| panic!("front2: {e}"));
-    let store = Store::new(front.index.lang("sized"), front.frame);
+    let mut front = Front2::new(&names, &frame, &files, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let heap = blaze_own::testing::heap();
     let root = names.root(0);
     let lib = |name: &'static str| {
@@ -142,4 +169,20 @@ fn ctors_without_rows_and_a_missing_fact() {
     let got = fn_fact(&names, &front.keys, &front.index, &store, nobody, alloc);
     assert_eq!(got, FnKind::Missing(Fact::Origin), "a key nothing files is the gap Origin, never `NotConst`");
     note(&format!("gap: {got:?}: {}", Fact::Origin));
+}
+
+/// An array length that calls core's `is_val_statically_known`, an intrinsic the table does not
+/// hold whose body is written (`{ false }`): the shape of fmt/num.rs's
+/// `[MaybeUninit::<u8>::uninit(); MAX_DIG_N]`, `MAX_DIG_N = $Unsigned::MAX.ilog(BASE) as usize + 1`,
+/// whose `checked_ilog` asks it. The body is the intrinsic's value in a constant, as rustc's
+/// const evaluator runs it: `false`, so the second array is empty. Before const_fn_fact.rs ran
+/// the body, both lengths were refused: "fn .. is the intrinsic `is_val_statically_known`,
+/// which blaze's intrinsics table does not hold".
+#[test]
+fn array_length_calls_an_intrinsic_with_a_body() {
+    let got = build(
+        "#![feature(core_intrinsics)]\n\nfn main() {\n    static D: [u8; u32::MAX.ilog(16) as usize + 1] = [0; 8];\n    static K: [u8; core::intrinsics::is_val_statically_known(3u8) as usize] = [];\n    let _kept = (&D, &K);\n}\n",
+    );
+    note(&format!("intrinsic with a body: {}", got.as_ref().map_or_else(|e| e.as_str(), |()| "ok")));
+    assert_eq!(got, Ok(()), "an intrinsic with a body is that body in a constant");
 }

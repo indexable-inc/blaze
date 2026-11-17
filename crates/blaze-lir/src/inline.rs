@@ -218,11 +218,12 @@ fn each_successor(view: View<'_>, at: usize, f: &mut impl FnMut(u32)) -> Result<
 }
 
 /// Whether a reference stays meaningful in another function: the body's own data, with no
-/// relocations (a relocation names another reference, by the body's place).
+/// relocations (a relocation names another reference, by the body's place) and no source
+/// positions (which the splice does not carry).
 fn carried(view: View<'_>, reference: RefId) -> bool {
     let rec = view.reference(reference);
     rec.kind == RefKind::Data as u32
-        && view.datas.get(rec.place as usize).is_some_and(|data| data.relocs_len == 0)
+        && view.datas.get(rec.place as usize).is_some_and(|data| data.relocs_len == 0 && data.positions_len == 0)
 }
 
 /// Whether every reference node `n` keeps in the output is carried (see the module's
@@ -678,6 +679,7 @@ impl<A: Allocator + Clone> Emit<'_, '_, A> {
             it.kind == RefKind::Data as u32
                 && out.datas.get(it.place as usize).is_some_and(|have| {
                     have.relocs_len == 0
+                        && have.positions_len == 0
                         && have.align == data.align
                         && &out.data_bytes[have.bytes_first as usize..][..have.bytes_len as usize] == bytes
                 })
@@ -688,7 +690,16 @@ impl<A: Allocator + Clone> Emit<'_, '_, A> {
                 let place = row(out.datas.len(), "datas")?;
                 let bytes_first = row(out.data_bytes.len(), "data_bytes")?;
                 let relocs_first = row(out.data_relocs.len(), "data_relocs")?;
-                out.datas.push(DataRec { bytes_first, bytes_len: data.bytes_len, relocs_first, relocs_len: 0, align: data.align });
+                let positions_first = row(out.data_positions.len(), "data_positions")?;
+                out.datas.push(DataRec {
+                    bytes_first,
+                    bytes_len: data.bytes_len,
+                    relocs_first,
+                    relocs_len: 0,
+                    align: data.align,
+                    positions_first,
+                    positions_len: 0,
+                });
                 out.data_bytes.extend_from_slice(bytes);
                 out.refs.push(RefRec { place, kind: RefKind::Data as u32 });
                 out.refs.len() - 1

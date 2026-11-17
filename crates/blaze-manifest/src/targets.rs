@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use blaze_hash::HashSet;
+use blaze_hash::{FixedState, Set, SetOpts};
 use serde::Serialize;
 use std::alloc::Global;
 
@@ -1181,8 +1181,8 @@ fn toml_targets_and_inferred(
             let target_path =
                 |target: &TomlTarget| target.path.clone().map(|p| package_root.join(p.0));
 
-            let mut seen_names = HashSet::new_in(Global);
-            let mut seen_paths = HashSet::new_in(Global);
+            let mut seen_names = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
+            let mut seen_paths = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
             for target in targets.iter() {
                 seen_names.insert(target.name.clone());
                 seen_paths.insert(target_path(target));
@@ -1254,7 +1254,7 @@ fn inferred_to_toml_targets(inferred: &[(String, PathBuf)]) -> Vec<TomlTarget> {
 }
 
 fn validate_unique_names(targets: &[TomlTarget], target_kind: &str) -> Result<(), ManifestError> {
-    let mut seen = HashSet::new_in(Global);
+    let mut seen = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
     for name in targets.iter().map(name_or_panic) {
         if !seen.insert(name) {
             return Err(TargetError::DuplicateName {

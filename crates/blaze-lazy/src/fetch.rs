@@ -105,11 +105,11 @@ pub struct Fetcher {
     target: Vec<u64>,
     queues: [VecDeque<LazyId>; PRIORITIES],
     /// The first and last waiter of each function being asked for.
-    waiters: HashMap<u32, (Handle<Waiting>, Handle<Waiting>), Global>,
+    waiters: Map<u32, (Handle<Waiting>, Handle<Waiting>), FixedState, Global>,
     waiting: Slab<Waiting>,
-    failures: HashMap<u32, Arc<str>, Global>,
+    failures: Map<u32, Arc<str>, FixedState, Global>,
     /// Whether a failed function was asked for: stopped once.
-    stopped: HashSet<u32, Global>,
+    stopped: Set<u32, FixedState, Global>,
     workers: u32,
     running: u32,
     running_background: u32,
@@ -129,10 +129,10 @@ impl Fetcher {
             priority: vec![Priority::Idle; count], // alloc: setup, a column per run
             target: vec![0; count],          // alloc: setup, a column per run
             queues: Default::default(),
-            waiters: HashMap::new_in(Global),
+            waiters: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             waiting,
-            failures: HashMap::new_in(Global),
-            stopped: HashSet::new_in(Global),
+            failures: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            stopped: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }),
             workers: workers.max(1),
             running: 0,
             running_background: 0,

@@ -86,7 +86,7 @@ fn a_folder_grant_is_opened_once() {
 
     OPENED.store(0, Ordering::SeqCst);
     let mut said = std::string::String::new();
-    let status = launch_in(&WATCHED, Some(fd3.as_slice()), Io::sim(1), &mut said, alloc, crate::launch_body!(reach; data: Watched));
+    let status = launch_in(&WATCHED, Some(fd3.as_slice()), Io::sim(1), &mut said, crate::launch_body!(reach; data: Watched));
     assert_eq!((status, said.as_str(), OPENED.load(Ordering::SeqCst)), (Status::OK, "", 1), "one opening, and `main` ran");
 
     // Control, the planted bug: the old launcher's second making put back after the check.
@@ -104,7 +104,7 @@ fn a_folder_grant_is_opened_once() {
         Ok(Status::OK)
     };
     let mut said = std::string::String::new();
-    let status = launch_in(&WATCHED, Some(fd3.as_slice()), Io::sim(1), &mut said, alloc, twice);
+    let status = launch_in(&WATCHED, Some(fd3.as_slice()), Io::sim(1), &mut said, twice);
     assert_eq!((status, OPENED.load(Ordering::SeqCst), second), (Status::OK, 2, Some(true)), "{said}");
 }
 
@@ -161,7 +161,6 @@ fn a_refused_start_unmakes_what_it_made_in_order() {
         Some(fd3.as_slice()),
         Io::sim(1),
         &mut said,
-        alloc,
         crate::launch_body!(never; a: Noted, b: Noted, c: Dir<ReadOnly>, d: Noted),
     );
     assert_eq!(status, Status::REFUSED, "{said}");

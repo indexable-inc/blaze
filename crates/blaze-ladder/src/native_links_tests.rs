@@ -39,7 +39,10 @@ const ONE_LINK: &str = "#[link(name = \"z\")]\nextern \"C\" { fn deflate(); }\n\
 /// Prints `native_links: table of one crate: link z (Dylib), foreign [deflate], exports [rust_cb]`.
 #[test]
 fn a_links_table_holds_link_z_and_a_no_mangle_export() {
-    let alloc = blaze_own::testing::heap().alloc();
+    // The test's one allocator, made at its top: a frame, its memory from the OS.
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
     let table = table_of(ONE_LINK, alloc);
     let links = links_of(&table, alloc);
     assert_eq!(links.decls.len(), 1, "one #[link]");
@@ -64,7 +67,10 @@ fn a_links_table_holds_link_z_and_a_no_mangle_export() {
 /// Prints `native_links: digest equal after a body edit and a private fn; moved by a private #[no_mangle] fn (exports [hidden, rust_cb])`.
 #[test]
 fn a_private_no_mangle_fn_moves_the_table_a_body_edit_does_not() {
-    let alloc = blaze_own::testing::heap().alloc();
+    // The test's one allocator, made at its top: a frame, its memory from the OS.
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
     let body = "#[link(name = \"z\")]\nextern \"C\" { fn deflate(); }\n\
                 #[unsafe(no_mangle)] pub extern \"C\" fn rust_cb() -> i32 { let two = 2; two - 1 }\n";
     let private_fn = "#[link(name = \"z\")]\nextern \"C\" { fn deflate(); }\n\
@@ -89,7 +95,10 @@ fn a_private_no_mangle_fn_moves_the_table_a_body_edit_does_not() {
 /// Prints `native_links: a program with no C input: 0 inputs, <n> bytes, key <16 hex>`.
 #[test]
 fn a_program_with_no_c_input_gets_a_system_only_image() {
-    let alloc = blaze_own::testing::heap().alloc();
+    // The test's one allocator, made at its top: a frame, its memory from the OS.
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
     let producers = Producers::for_tests(b"native_links");
     let producer = producers.get::<Whole>();
     let plain = "pub fn main() { let _ = 1 + 1; }\n";
@@ -100,7 +109,7 @@ fn a_program_with_no_c_input_gets_a_system_only_image() {
     let crates = [ProgramCrate { package: "app", outputs: None, links }];
     let key = program_key(&crates, Platform::MacosArm64, &producer, alloc).unwrap_or_else(|e| panic!("the key: {e:?}"));
     let mut bytes = AVec::new_in(alloc);
-    let summary = program_image(&crates, Platform::MacosArm64, &producer, FixedState::with_seed(0), &mut bytes, alloc)
+    let summary = program_image(&crates, Platform::MacosArm64, &producer, FixedState, &mut bytes, alloc)
         .unwrap_or_else(|e| panic!("a program with no C input is refused: {e:?}"));
     assert_eq!(summary.inputs, 0, "no archive or object on the link line");
     assert!(!bytes.is_empty(), "no empty case: the image is written");

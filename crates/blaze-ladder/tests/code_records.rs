@@ -36,13 +36,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use blaze_code::record::{Space, Symbol};
 use blaze_emit::{Isa, Os};
 use blaze_ladder::code_records::{
-    Builder, CodeKey, CodeStore, EntryView, KeyPlant, MemoryStore, Met, RecordRun, Settings, code_key, code_key_planted, getter_parts,
+    Builder, CodeKey, CodeStore, EntryView, InstanceNames, KeyPlant, LirSeen, MemoryStore, Met, RecordRun, Settings, code_key, code_key_planted,
+    getter_parts,
 };
 use blaze_ladder::refusal::SourceFile;
 use blaze_ladder::run::{NewFront, OverflowChecks, build_records_new};
 use blaze_ladder::symbols::{decode_instance, encode_instance, fn_symbol_of_name};
 use blaze_own::{AVec, Alloc, Vec as OwnVec};
-use blaze_run::Tier;
+use blaze_ladder::code_records::TierName;
+use blaze_ladder::code_records::reads::ReadPlant;
 use blaze_toolchain::ToolchainId;
 use blaze_typeck::PortableTys;
 use rungs::{RUNNING, SUPPORT, ladder, sources};
@@ -88,8 +90,20 @@ pub extern \"C\" fn main() -> i32 {
 ";
 
 /// What every test builds for: a fixed target and toolchain, nothing of this machine.
-fn builder(tier: Tier, overflow: OverflowChecks) -> Builder {
-    Builder { isa: Isa { lse: true, os: Os::MacOs }, tier, settings: Settings::baseline(overflow), toolchain: ToolchainId([7; 32]) }
+fn builder(tier: TierName, overflow: OverflowChecks) -> Builder {
+    builder_of(tier, overflow, "2024")
+}
+
+/// As [`builder`], for a package of `edition`, with a fixed code builder's identity.
+fn builder_of(tier: TierName, overflow: OverflowChecks, edition: &str) -> Builder {
+    Builder {
+        isa: Isa { lse: true, os: Os::MacOs },
+        tier,
+        settings: Settings::baseline(overflow, blaze_build::Panic::Unwind),
+        toolchain: ToolchainId([7; 32]),
+        producer: blaze_ids::producer::Producers::for_tests(b"code records test builder").get::<blaze_ids::producer::CodeBuilder>(),
+        edition: edition::PackageEdition::of_manifest(edition).expect("the package's edition is one blaze knows"),
+    }
 }
 
 /// The overflow setting `PROGRAM` builds with and its records are keyed by: off, as a no_core
@@ -100,21 +114,28 @@ const PROGRAM_OVERFLOW: OverflowChecks = OverflowChecks::Off;
 
 /// The instances `files` (rooted at `src/main.rs`, of `edition`) reach, built into `store`
 /// with overflow checks `overflow` (the walk and the records' key agree on it).
-fn walk(files: &[(String, String)], edition: &str, store: &mut dyn CodeStore, tier: Tier, overflow: OverflowChecks) -> Result<(Vec<Met>, String), String> {
+fn walk(files: &[(String, String)], edition: &str, store: &mut dyn CodeStore, tier: TierName, overflow: OverflowChecks) -> Result<(Vec<Met>, String), String> {
+    walk_reading(files, edition, store, tier, overflow, ReadPlant::None).map(|(met, summary, _)| (met, summary))
+}
+
+/// As [`walk`], its recorder planted with `plant`: also the count of entries found stale (their
+/// read list answered otherwise today) and built again.
+fn walk_reading(files: &[(String, String)], edition: &str, store: &mut dyn CodeStore, tier: TierName, overflow: OverflowChecks, plant: ReadPlant) -> Result<(Vec<Met>, String, usize), String> {
     let views: Vec<SourceFile<'_>> = files.iter().map(|(path, text)| SourceFile { path, text }).collect();
     let shelf = edition.starts_with("blaze-").then(|| format!("{}/.blaze/v2/toolchain", std::env::var("HOME").expect("HOME")));
     let new = NewFront { package: "ladder", edition, shelf: shelf.as_deref(), overflow };
-    let mut run = RecordRun::new(store, builder(tier, overflow));
-    build_records_new(&views, "src/main.rs", new, &mut run).map_err(|e| e.to_string())?;
+    let mut run = RecordRun::planted(store, builder_of(tier, overflow, edition), plant).map_err(|e| e.to_string())?;
+    build_records_new(&views, "src/main.rs", new, &mut run, blaze_own::Alloc::global()).map_err(|e| e.to_string())?;
     let summary = run.summary();
-    Ok((run.met, summary))
+    let stale = run.stale;
+    Ok((run.met, summary, stale))
 }
 
 fn program(text: &str) -> Vec<(String, String)> {
     vec![("src/main.rs".to_string(), text.to_string())]
 }
 
-fn walk_program(text: &str, store: &mut dyn CodeStore, tier: Tier) -> (Vec<Met>, String) {
+fn walk_program(text: &str, store: &mut dyn CodeStore, tier: TierName) -> (Vec<Met>, String) {
     walk(&program(text), "2024", store, tier, PROGRAM_OVERFLOW).unwrap_or_else(|e| panic!("the program's records were not built: {e}"))
 }
 
@@ -209,7 +230,7 @@ fn check_entry(rung: &str, store: &dyn CodeStore, met: &Met, all: &[Met]) -> Res
 fn hello_records_name_targets_by_symbol() {
     let dir = ladder().join("3-hello");
     let mut store = MemoryStore::new_in(Alloc::global());
-    let (met, _) = walk(&sources(&dir), &edition_of(&dir), &mut store, Tier::Fast, rungs::x::overflow_of(&dir)).unwrap_or_else(|e| panic!("3-hello: {e}"));
+    let (met, _) = walk(&sources(&dir), &edition_of(&dir), &mut store, TierName::Reference, rungs::x::overflow_of(&dir)).unwrap_or_else(|e| panic!("3-hello: {e}"));
     let mut by_symbol = 0;
     let mut c_names = Vec::new();
     for m in &met {
@@ -241,7 +262,7 @@ fn every_rung_records_name_targets_by_symbol() {
     for rung in RUNNING.iter().chain(SUPPORT) {
         let dir = ladder().join(rung);
         let mut store = MemoryStore::new_in(Alloc::global());
-        let met = match walk(&sources(&dir), &edition_of(&dir), &mut store, Tier::Fast, rungs::x::overflow_of(&dir)) {
+        let met = match walk(&sources(&dir), &edition_of(&dir), &mut store, TierName::Reference, rungs::x::overflow_of(&dir)) {
             Ok((met, _)) => met,
             Err(e) => {
                 refused.push(format!("{rung}: {e}"));
@@ -283,15 +304,15 @@ fn keys(met: &[Met]) -> Vec<(String, CodeKey)> {
 #[test]
 fn a_second_build_makes_nothing() {
     let mut store = MemoryStore::new_in(Alloc::global());
-    let (first, made) = walk_program(PROGRAM, &mut store, Tier::Fast);
+    let (first, made) = walk_program(PROGRAM, &mut store, TierName::Reference);
     assert_eq!(made, format!("built {n} of {n}: 0 found", n = first.len()), "the first build makes every instance");
     let puts = store.puts;
-    let (second, summary) = walk_program(PROGRAM, &mut store, Tier::Fast);
+    let (second, summary) = walk_program(PROGRAM, &mut store, TierName::Reference);
     assert_eq!(keys(&first), keys(&second), "a second build meets the same instances under the same keys");
     assert_eq!(store.puts, puts, "a second build writes nothing");
     // A build into an empty store elsewhere writes equal bytes under equal keys (rule 25).
     let mut other = MemoryStore::new_in(Alloc::global());
-    let (third, _) = walk_program(PROGRAM, &mut other, Tier::Fast);
+    let (third, _) = walk_program(PROGRAM, &mut other, TierName::Reference);
     assert_eq!(keys(&first), keys(&third));
     for m in &first {
         assert_eq!(store.get(m.key).expect("reads"), other.get(m.key).expect("reads"), "`{}`: two builders of one key write equal bytes", m.function);
@@ -317,17 +338,17 @@ fn moved(before: &[Met], after: &[Met]) -> Vec<String> {
 /// Prints `body edit: 1 of 6 keys moved (alpha); comment edit: 0 of 6 moved`.
 #[test]
 fn an_edit_moves_exactly_its_keys() {
-    let (base, _) = walk_program(PROGRAM, &mut MemoryStore::new_in(Alloc::global()), Tier::Fast);
+    let (base, _) = walk_program(PROGRAM, &mut MemoryStore::new_in(Alloc::global()), TierName::Reference);
     let edited = PROGRAM.replace("fn alpha() -> i32 {\n    1\n}", "fn alpha() -> i32 {\n    5\n}");
     assert_ne!(edited, PROGRAM);
-    let (body, _) = walk_program(&edited, &mut MemoryStore::new_in(Alloc::global()), Tier::Fast);
+    let (body, _) = walk_program(&edited, &mut MemoryStore::new_in(Alloc::global()), TierName::Reference);
     let body_moved = moved(&base, &body);
     // Comments inside a body and between items: no token, no read changes.
     let commented = PROGRAM
         .replace("fn beta() -> i32 {\n    alpha()\n}", "fn beta() -> i32 {\n    // the one call\n    alpha() /* inline */\n}")
         .replace("fn hello()", "// prints a line\nfn hello()");
     assert_ne!(commented, PROGRAM);
-    let (comment, _) = walk_program(&commented, &mut MemoryStore::new_in(Alloc::global()), Tier::Fast);
+    let (comment, _) = walk_program(&commented, &mut MemoryStore::new_in(Alloc::global()), TierName::Reference);
     let comment_moved = moved(&base, &comment);
     let names: Vec<&str> = body_moved.iter().map(|f| if f.contains("alpha") { "alpha" } else { f.as_str() }).collect();
     let line = format!(
@@ -342,21 +363,25 @@ fn an_edit_moves_exactly_its_keys() {
     assert_eq!(line, "body edit: 1 of 6 keys moved (alpha); comment edit: 0 of 6 moved", "moved by the body edit: {body_moved:?}; by the comment edit: {comment_moved:?}");
 }
 
+/// The key holds the emitting tier's byte: the walk (which only the Reference emitter makes
+/// entries for, `Builder::emits`) keys its instances under `TierName::Reference`, and the same
+/// parts under `TierName::Optimized` are other keys. A walk naming another tier is refused.
 /// Prints `tier: 6 of 6 keys moved; the planted key without the tier: caught (6 of 6 equal across tiers)`.
 #[test]
 fn the_tier_moves_every_key() {
-    let (fast, _) = walk_program(PROGRAM, &mut MemoryStore::new_in(Alloc::global()), Tier::Fast);
-    let (optimized, _) = walk_program(PROGRAM, &mut MemoryStore::new_in(Alloc::global()), Tier::Optimized);
-    let moved = moved(&fast, &optimized).len();
+    let (fast, _) = walk_program(PROGRAM, &mut MemoryStore::new_in(Alloc::global()), TierName::Reference);
+    let mut store = MemoryStore::new_in(Alloc::global());
+    assert!(RecordRun::new(&mut store, builder(TierName::Optimized, PROGRAM_OVERFLOW)).is_err(), "a walk keyed as Optimized was let make Reference code");
+    let moved = fast.iter().filter(|m| code_key(&m.parts, &builder(TierName::Optimized, PROGRAM_OVERFLOW)) != m.key).count();
     for m in &fast {
-        assert_eq!(code_key(&m.parts, &builder(Tier::Fast, PROGRAM_OVERFLOW)), m.key, "`{}`: the walk's key is `code_key` of its parts", m.function);
+        assert_eq!(code_key(&m.parts, &builder(TierName::Reference, PROGRAM_OVERFLOW)), m.key, "`{}`: the walk's key is `code_key` of its parts", m.function);
     }
     // The planted bug: the same oracle over keys made without the tier finds them equal.
     let equal = fast
         .iter()
         .filter(|m| {
-            code_key_planted(&m.parts, &builder(Tier::Fast, PROGRAM_OVERFLOW), KeyPlant::WithoutTier)
-                == code_key_planted(&m.parts, &builder(Tier::Optimized, PROGRAM_OVERFLOW), KeyPlant::WithoutTier)
+            code_key_planted(&m.parts, &builder(TierName::Reference, PROGRAM_OVERFLOW), KeyPlant::WithoutTier)
+                == code_key_planted(&m.parts, &builder(TierName::Optimized, PROGRAM_OVERFLOW), KeyPlant::WithoutTier)
         })
         .count();
     let caught = if equal > 0 { "caught" } else { "MISSED" };
@@ -370,8 +395,8 @@ fn the_tier_moves_every_key() {
 /// Prints `overflow: 6 of 6 keys moved; the planted key without it: caught (6 of 6 equal)`.
 #[test]
 fn the_overflow_setting_moves_every_key() {
-    let (met, _) = walk_program(PROGRAM, &mut MemoryStore::new_in(Alloc::global()), Tier::Fast);
-    let with = |overflow| builder(Tier::Fast, overflow);
+    let (met, _) = walk_program(PROGRAM, &mut MemoryStore::new_in(Alloc::global()), TierName::Reference);
+    let with = |overflow| builder(TierName::Reference, overflow);
     let (on, off) = (with(OverflowChecks::On), with(OverflowChecks::Off));
     let moved = met.iter().filter(|m| code_key(&m.parts, &on) != code_key(&m.parts, &off)).count();
     // The planted bug: the same oracle over keys made without the setting finds them equal.
@@ -380,4 +405,119 @@ fn the_overflow_setting_moves_every_key() {
     let line = format!("overflow: {moved} of {} keys moved; the planted key without it: {caught} ({equal} of {} equal)", met.len(), met.len());
     println!("{line}");
     assert_eq!(line, "overflow: 6 of 6 keys moved; the planted key without it: caught (6 of 6 equal)");
+}
+
+/// What a census walk handed over: each instance's symbol and its LIR's instruction count.
+struct Seen(Vec<(Symbol, usize)>);
+
+impl LirSeen for Seen {
+    fn seen(&mut self, _function: &str, symbol: Symbol, func: &blaze_lir::Func<std::alloc::Global>, _names: &InstanceNames<'_>) {
+        self.0.push((symbol, func.view().len()));
+    }
+}
+
+/// The census walk (`RecordRun::census`, examples/fast_census.rs): every instance the record
+/// walk builds is handed over, in the walk's order, with its LIR, and no record is made.
+/// Prints `census: 6 of 6 instances handed over in the walk's order, every one with LIR; 0 records made`.
+#[test]
+fn a_census_walk_hands_over_every_instance_and_makes_no_record() {
+    let (made, _) = walk_program(PROGRAM, &mut MemoryStore::new_in(Alloc::global()), TierName::Reference);
+    let mut store = MemoryStore::new_in(Alloc::global());
+    let mut seen = Seen(Vec::new());
+    let files = program(PROGRAM);
+    {
+        let views: Vec<SourceFile<'_>> = files.iter().map(|(path, text)| SourceFile { path, text }).collect();
+        let new = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: PROGRAM_OVERFLOW };
+        let mut run = RecordRun::census(&mut store, builder(TierName::Reference, PROGRAM_OVERFLOW), &mut seen).expect("the builder names the emitting tier");
+        build_records_new(&views, "src/main.rs", new, &mut run, Alloc::global()).unwrap_or_else(|e| panic!("the census walk: {e}"));
+    }
+    let in_order = seen.0.iter().map(|s| s.0).eq(made.iter().map(|m| m.symbol));
+    let with_lir = seen.0.iter().filter(|s| s.1 > 0).count();
+    let line = format!(
+        "census: {} of {} instances handed over{}, {}; {} records made",
+        seen.0.len(),
+        made.len(),
+        if in_order { " in the walk's order" } else { " OUT OF THE WALK'S ORDER" },
+        if with_lir == seen.0.len() { "every one with LIR".to_string() } else { format!("{with_lir} with LIR") },
+        store.len(),
+    );
+    println!("{line}");
+    assert_eq!(line, "census: 6 of 6 instances handed over in the walk's order, every one with LIR; 0 records made");
+}
+
+/// The no_core preamble of the stale-answer programs.
+const PREAMBLE: &str = "#![feature(no_core, lang_items)]\n#![no_core]\n#![no_main]\n\n#[lang = \"sized\"]\ntrait Sized {}\n\n#[lang = \"copy\"]\ntrait Copy {}\n\n";
+
+/// What three walks over ONE store saw: the second's (made, stale) and the third's (made, found).
+struct ThreeWalks {
+    second_made: usize,
+    second_stale: usize,
+    third_made: usize,
+    third_found: usize,
+}
+
+/// Walk 1 over `before` makes the entries; walk 2 over `after` (an edit whose instance's key
+/// does not move, only an answer its entry read) must find the entry stale and build it again;
+/// walk 3 over `after` finds every entry and builds nothing. `plant` is the recorder's.
+fn three_walks(before: &str, after: &str, plant: ReadPlant) -> ThreeWalks {
+    let mut store = MemoryStore::new_in(Alloc::global());
+    let mut go = |text: &str| {
+        let (met, _, stale) = walk_reading(&program(&format!("{PREAMBLE}{text}")), "2024", &mut store, TierName::Reference, PROGRAM_OVERFLOW, plant)
+            .unwrap_or_else(|e| panic!("the program's records were not built: {e}"));
+        (met.iter().filter(|m| !m.found).count(), stale, met.iter().filter(|m| m.found).count())
+    };
+    go(before);
+    let (second_made, second_stale, _) = go(after);
+    let (third_made, _, third_found) = go(after);
+    ThreeWalks { second_made, second_stale, third_made, third_found }
+}
+
+/// One stale-answer case: asserts walk 2 found a stale entry and walk 3 built nothing, and
+/// returns the line it prints.
+fn stale_case(what: &str, before: &str, after: &str) -> String {
+    let w = three_walks(before, after, ReadPlant::None);
+    let line = format!("{what}: walk 2 made {} ({} stale); walk 3 made {}, found {}", w.second_made, w.second_stale, w.third_made, w.third_found);
+    println!("{line}");
+    assert!(w.second_stale >= 1, "{what}: the edit changed an answer an entry read and no entry was found stale: stale code was served ({line})");
+    assert!(w.second_made >= w.second_stale, "{what}: an entry found stale was not built again ({line})");
+    assert_eq!(w.third_made, 0, "{what}: the entry built again after the stale one was not found by the next walk ({line})");
+    line
+}
+
+/// `take::<S>`'s key holds `S` by name, not its layout: a field added to `S` moves the offset
+/// of the tuple's second field, and only the entry's `Adt`/layout rows see it. The planted
+/// recorder that records no layouts finds the stale entry holding: caught.
+/// Prints `layout: walk 2 made N (1 stale); walk 3 made 0, found M` and `layout planted
+/// (SkipsLayouts): walk 2 found the stale entry holding: caught`.
+#[test]
+fn a_struct_gaining_a_field_rebuilds_its_generic_users() {
+    let tail = "fn take<T>(x: &(T, i32)) -> i32 {\n    x.1\n}\n\n#[unsafe(no_mangle)]\npub extern \"C\" fn main() -> i32 {\n";
+    let before = format!("struct S {{\n    a: i32,\n}}\n\n{tail}    let t = (S {{ a: 1 }}, 3);\n    take(&t)\n}}\n");
+    let after = format!("struct S {{\n    a: i32,\n    z: i64,\n}}\n\n{tail}    let t = (S {{ a: 1, z: 0 }}, 3);\n    take(&t)\n}}\n");
+    stale_case("layout", &before, &after);
+    let planted = three_walks(&before, &after, ReadPlant::SkipsLayouts);
+    let caught = if planted.second_stale == 0 { "found the stale entry holding: caught" } else { "found it stale: the plant changed nothing, MISSED" };
+    let line = format!("layout planted (SkipsLayouts): walk 2 {caught}");
+    println!("{line}");
+    assert_eq!(line, "layout planted (SkipsLayouts): walk 2 found the stale entry holding: caught");
+}
+
+/// `f`'s text and check read `N`'s type, not its value: the value is the entry's `Const` row.
+/// Prints `const: walk 2 made N (1 stale); walk 3 made 0, found M`.
+#[test]
+fn a_const_changing_value_rebuilds_its_readers() {
+    let tail = "fn f() -> i32 {\n    N\n}\n\n#[unsafe(no_mangle)]\npub extern \"C\" fn main() -> i32 {\n    f()\n}\n";
+    stale_case("const", &format!("const N: i32 = 1;\n\n{tail}"), &format!("const N: i32 = 2;\n\n{tail}"));
+}
+
+/// `call::<A>` checks against the trait, never an impl: the impl `x.v()` runs is the entry's
+/// `Resolve` row, and a blanket impl replacing `A`'s own moves it.
+/// Prints `impl: walk 2 made N (1 stale); walk 3 made 0, found M`.
+#[test]
+fn the_impl_a_generic_call_resolves_to_changing_rebuilds_the_caller() {
+    let head = "trait T {\n    fn v(&self) -> i32;\n}\n\nstruct A;\n\n";
+    let tail = "fn call<X: T>(x: &X) -> i32 {\n    x.v()\n}\n\n#[unsafe(no_mangle)]\npub extern \"C\" fn main() -> i32 {\n    call(&A)\n}\n";
+    let before = format!("{head}impl T for A {{\n    fn v(&self) -> i32 {{\n        1\n    }}\n}}\n\n{tail}");
+    let after = format!("{head}impl<Y> T for Y {{\n    fn v(&self) -> i32 {{\n        2\n    }}\n}}\n\n{tail}");
+    stale_case("impl", &before, &after);
 }

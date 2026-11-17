@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use blaze_codegen::{InstanceKey, Line, Made};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::{ContentId, radix};
 use smallvec::SmallVec;
 use std::alloc::Global;
@@ -522,7 +522,7 @@ pub(crate) struct State {
     /// wasm: what codegen's live functions and statics say each name is imported as, the one
     /// import every live piece declaring it agrees on ([`State::declare_wasm`]); a name no
     /// live piece declares has none.
-    pub wasm_imports: Arc<HashMap<NameId, blaze_codegen::wasm::Import, Global>>,
+    pub wasm_imports: Arc<Map<NameId, blaze_codegen::wasm::Import, FixedState, Global>>,
     pub inputs: Arc<Vec<Input>>,
     pub resolved: Arc<Resolved>,
     /// The jump table: slots given out, and how many there are room for.

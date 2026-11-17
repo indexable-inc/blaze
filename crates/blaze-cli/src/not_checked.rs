@@ -15,7 +15,7 @@ use blaze_drive::{Kind, Name, TaskFailure};
 use bstd::mem::Frame;
 
 use crate::names::Names;
-use crate::work::Failed;
+use crate::work::Failures;
 use crate::CliError;
 
 /// The most crates named under one cause; the count past them stays exact.
@@ -27,7 +27,7 @@ pub(crate) const CRATES_SHOWN: usize = 20;
 /// command's names step, `None` when it did not run (then crates are not named, only counted).
 pub(crate) fn lines(
     failures: &[TaskFailure],
-    failed: &[Failed<'_>],
+    failed: &Failures<'_>,
     names: Option<&Names<'_>>,
     frame: &Frame,
     each: &mut dyn FnMut(&str) -> Result<(), CliError>,
@@ -83,7 +83,7 @@ pub(crate) fn lines(
 
 /// The failed task `cause` named by its item: a crate's scope by its crate, a build script by
 /// its file and the crate that reads it, any other by its kind and file, else the drive's name.
-fn cause_words(words: &mut bstd::mem::String<impl core::alloc::Allocator>, cause: Name, failed: &[Failed<'_>], names: Option<&Names<'_>>) -> Result<(), CliError> {
+fn cause_words(words: &mut bstd::mem::String<impl core::alloc::Allocator>, cause: Name, failed: &Failures<'_>, names: Option<&Names<'_>>) -> Result<(), CliError> {
     let text = |_: core::fmt::Error| CliError::Text { what: "a not-checked line's words" };
     match (cause.kind, names) {
         (Kind::CrateScope, Some(names)) => {
@@ -119,6 +119,12 @@ fn cause_words(words: &mut bstd::mem::String<impl core::alloc::Allocator>, cause
         None => core::fmt::write(words, format_args!("`{cause}`")).map_err(text),
     }
 }
+
+/// The items the check could not check, by cause: the same line, the same cap.
+pub(crate) mod items;
+
+/// The tasks not run because an input they read could not be made, by cause: one line a cause.
+pub(crate) mod tasks;
 
 #[cfg(test)]
 #[path = "not_checked_tests.rs"]

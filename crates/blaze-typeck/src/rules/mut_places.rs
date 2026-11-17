@@ -1,5 +1,6 @@
 //! Mutable places: an overloaded dereference that a place used mutably goes through calls
-//! `DerefMut::deref_mut`, not `Deref::deref`.
+//! `DerefMut::deref_mut`, not `Deref::deref`, and an overloaded index `IndexMut::index_mut`,
+//! not `Index::index`: one rule for which of each pair a place takes.
 //!
 //! Follows rustc_hir_typeck/src/place_op.rs (`convert_place_derefs_to_mutable`, called there
 //! from method confirmation, assignment, `&mut` and `ref mut` bindings); here it is one pass
@@ -30,59 +31,103 @@
 //! code builder refuses by name meanwhile (blaze-build walk.rs `deref_call`). A world with no
 //! `DerefMut` lang item has no type implementing it: the same.
 //!
-//! Not here: choosing `IndexMut::index_mut` for an overloaded index in a mutable place (the
-//! record has no column naming the index method; the builder's `refuse_mut_through_overloaded_index`
-//! refuses it by name). The derefs of the indexed base ARE upgraded: `b[0] = 2` through a
-//! `DerefMut` wrapper records `*DerefMut` on `b`.
+//! IndexMut. The same rule for an index: the Reference, "Array and slice indexing
+//! expressions": "For other types an index expression a[b] is equivalent to
+//! *std::ops::Index::index(&a, b), or *std::ops::IndexMut::index_mut(&mut a, b) in a mutable
+//! place expression context." The walk types every index with `Index` (rules/field.rs
+//! `expr_index`); here each overloaded index on a mutable place's chain (its base after its
+//! adjustments not an array or slice indexed by `usize`) asks `Self: IndexMut<Idx>` at the
+//! types the walk chose, and where it may hold registers it and lists the expression in
+//! `Checked::index_mut`, which the builder reads (blaze-build walk/index.rs). Where it cannot
+//! hold, the program writes or uniquely borrows through `Index::index`'s shared reference:
+//! E0596 (rustc's borrow check: "cannot borrow data in an index of `T` as mutable"), except
+//! below a raw pointer's dereference (`*v[0] = x` with `v[0]: *mut T`), where the index's place
+//! is only read for the pointer and `Index::index` is right, as rustc's
+//! `try_mutable_overloaded_place_op` leaves it there. The derefs of the indexed base are
+//! upgraded too: `b[0] = 2` through a `DerefMut` wrapper records `*DerefMut` on `b`.
 //!
-//! Linear in the body: each expression joins the chain at most once (a marked expression's
-//! chain below is marked already), and the adjustments are scanned once. No recursion: work
-//! lists.
+//! Linear in the body: each expression joins a chain at most twice (once below a raw pointer,
+//! once directly; a marked expression's chain below is marked already, as strongly), and the
+//! adjustments are scanned once. No recursion: work lists.
 
 use blaze_own::{Alloc, Vec};
 
 use crate::body::{Expr, Pat, Stmt, UnOp};
 use crate::columns::AdjustKind;
+use crate::diag::{About, At, DiagCode};
 use crate::error::{CheckError, Malformed, Stop};
-use crate::ids::{ExprId, ItemKey, LangItem, Mutbl, PatId};
+use crate::ids::{ExprId, ItemKey, LangItem, Mutbl, PatId, UintTy};
 use crate::machine::Machine;
-use crate::ty::{Cause, Goal, Ty, TypeCtx};
+use crate::ty::{Cause, Goal, Ty, TyView, TypeCtx};
 use crate::world::World;
+
+/// An expression no mutable place goes through.
+const UNUSED: u8 = 0;
+/// Part of a mutable place only below a raw pointer's dereference (`*p` with `p: *mut T` read
+/// out of it): the place itself is only read, for the pointer.
+const THROUGH_RAW: u8 = 1;
+/// Part of a mutable place with no raw pointer's dereference between it and the root: written
+/// or uniquely borrowed itself.
+const DIRECT: u8 = 2;
 
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// Upgrades every overloaded dereference a mutable place goes through to `DerefMut` (the
     /// module doc).
     pub(crate) fn mut_places(&mut self) -> Result<(), Stop> {
         let shared_deref = AdjustKind::Deref { overloaded: Some(Mutbl::Not) };
-        if !self.adjust.column::<1>().contains(&shared_deref) {
+        let any_deref = self.adjust.column::<1>().contains(&shared_deref);
+        let any_index = self.body.exprs.iter().any(|x| matches!(x, Expr::Index { .. }));
+        if !any_deref && !any_index {
             return Ok(());
         }
         let n = self.body.exprs.len();
-        let mut mutable: Vec<bool, Alloc<'a>> = Vec::new_in(self.alloc);
+        // Per expression: `UNUSED`, `THROUGH_RAW` (a mutable place only below a raw pointer's
+        // dereference) or `DIRECT` (the module doc's "IndexMut").
+        let mut mutable: Vec<u8, Alloc<'a>> = Vec::new_in(self.alloc);
         for _ in 0..n {
-            mutable.push(false);
+            mutable.push(UNUSED);
         }
         let mut roots: Vec<ExprId, Alloc<'a>> = Vec::new_in(self.alloc);
         self.mutable_roots(&mut roots)?;
         while let Some(root) = roots.pop() {
             let mut x = root;
+            let mut how = DIRECT;
             loop {
                 let node = self.body.expr(x)?;
-                if mutable[x.ix()] {
-                    // Its chain below was walked from it already.
+                if mutable[x.ix()] >= how {
+                    // Its chain below was walked from it already, as strongly.
                     break;
                 }
-                mutable[x.ix()] = true;
+                mutable[x.ix()] = how;
                 match node {
                     Expr::Paren(base)
                     | Expr::Field { base, .. }
                     | Expr::TupleField { base, .. }
-                    | Expr::Index { base, .. }
-                    | Expr::Unary { op: UnOp::Deref, operand: base } => x = base,
+                    | Expr::Index { base, .. } => x = base,
+                    Expr::Unary { op: UnOp::Deref, operand } => {
+                        // `*p` of a raw pointer: the place below is only read for the pointer.
+                        let t = self.try_structurally_resolve(self.expr_ty[operand.ix()])?;
+                        if matches!(self.view(t), TyView::Ptr(..)) {
+                            how = THROUGH_RAW;
+                        }
+                        x = operand
+                    }
                     _ => break,
                 }
             }
         }
+        let adjusted = self.mut_derefs(&mutable)?;
+        if any_index {
+            self.mut_indexes(&mutable, &adjusted)?;
+        }
+        Ok(())
+    }
+
+    /// The overloaded dereferences of the mutable places become `DerefMut` (the module doc).
+    /// Gives each expression's type after its adjustments, when it has any.
+    fn mut_derefs(&mut self, mutable: &[u8]) -> Result<Vec<Option<Ty>, Alloc<'a>>, Stop> {
+        let shared_deref = AdjustKind::Deref { overloaded: Some(Mutbl::Not) };
+        let n = self.body.exprs.len();
         // Each expression's adjustments, in order: the type an adjustment starts from is the
         // expression's own for its first, else the one the adjustment before it made.
         let mut last: Vec<Option<Ty>, Alloc<'a>> = Vec::new_in(self.alloc);
@@ -103,7 +148,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 None => self.expr_ty[e.ix()],
             };
             *prev = Some(target);
-            if kind != shared_deref || !mutable[e.ix()] {
+            if kind != shared_deref || mutable[e.ix()] == UNUSED {
                 continue;
             }
             let tr = match deref_mut {
@@ -122,6 +167,60 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             if self.ty.may_hold(Goal::Trait { trait_: tr, args }, &mut self.reads)? {
                 self.register_trait(tr, args, Cause::Expr(e))?;
                 self.adjust.column_mut::<1>()[i] = AdjustKind::Deref { overloaded: Some(Mutbl::Mut) };
+            }
+        }
+        Ok(last)
+    }
+
+    /// Each overloaded index that is a mutable place calls `IndexMut::index_mut` where `Self:
+    /// IndexMut<Idx>` may hold (that goal registered, the expression listed in `index_mut`);
+    /// where it does not, a `DIRECT` one is E0596 and one `THROUGH_RAW` stays `Index::index`
+    /// (the module doc).
+    fn mut_indexes(&mut self, mutable: &[u8], adjusted: &[Option<Ty>]) -> Result<(), Stop> {
+        let body = self.body;
+        // The `IndexMut` lang item, read only when a mutable place meets an overloaded index.
+        let mut index_mut: Option<Option<ItemKey>> = None;
+        for (ix, &node) in body.exprs.iter().enumerate() {
+            let Expr::Index { base, index } = node else { continue };
+            let how = mutable[ix];
+            if how == UNUSED {
+                continue;
+            }
+            let e = ExprId(ix as u32);
+            let self_ty = adjusted[base.ix()].unwrap_or(self.expr_ty[base.ix()]);
+            let self_ty = self.try_structurally_resolve(self_ty)?;
+            let idx_ty = adjusted[index.ix()].unwrap_or(self.expr_ty[index.ix()]);
+            let idx_ty = self.try_structurally_resolve(idx_ty)?;
+            if self.is_err(self_ty) || self.is_err(idx_ty) {
+                continue;
+            }
+            // The builtin element (rules/field.rs `builtin_index`, which made an integer
+            // variable index `usize`): no method.
+            let builtin = matches!(self.view(self_ty), TyView::Array(..) | TyView::Slice(_))
+                && matches!(self.view(idx_ty), TyView::Uint(UintTy::Usize));
+            if builtin {
+                continue;
+            }
+            let tr = match index_mut {
+                Some(known) => known,
+                None => {
+                    let got = self.lang(LangItem::IndexMut)?;
+                    index_mut = Some(got);
+                    got
+                }
+            };
+            let Some(tr) = tr else {
+                if how == DIRECT {
+                    self.missing_lang(LangItem::IndexMut, At::Expr(e));
+                }
+                continue;
+            };
+            let args = self.mk_list(&[self_ty, idx_ty])?;
+            if self.ty.may_hold(Goal::Trait { trait_: tr, args }, &mut self.reads)? {
+                self.register_trait(tr, args, Cause::Expr(e))?;
+                self.index_mut.push(e);
+            } else if how == DIRECT {
+                self.diag(DiagCode::IndexNotMut, At::Expr(e), About::found(self_ty));
             }
         }
         Ok(())

@@ -27,7 +27,8 @@ use std::sync::Arc;
 
 use blaze_build_script::key::{CMode, RunLimits};
 use blaze_build_script::git::{self, GitFiles};
-use blaze_build_script::probe::{self, Request, Row, Snippet, Table};
+use blaze_build_script::probe::{self, Row, Table};
+use blaze_build_script::probe_ask::{self, Ask, Snippet, Verdict};
 use blaze_expand::seen::{MemberDirError, SeenRoot};
 use blaze_ids::ContentId;
 use blaze_own::Alloc;
@@ -228,8 +229,12 @@ pub enum SpawnRefusal {
     /// can be written (with its reason) from this, and the target its key was made for (a
     /// macro-side run asks for wasm32-wasip1: a row of another target never answers it).
     CannotAnswerYet { key: ContentId, args: Vec<String>, snippet: String, target: String },
-    /// `rustc` asked something that is neither a version nor a compile (`--print`).
+    /// `rustc` asked something that is neither a version nor a compile (`--print`), or a
+    /// compile whose input file is not in the script's view.
     RustcArgs { args: Vec<String> },
+    /// `rustc` with a line blaze's reader of a probe refuses (`probe_ask::classify`): the
+    /// argument at `at` (the line's end for a missing input) and why.
+    RustcLine { args: Vec<String>, at: usize, why: probe_ask::Why },
     /// A program the sandbox does not run (a shell command, a tool in a build, ...).
     Program { program: String, args: Vec<String> },
     /// A `git` question blaze does not answer from the checkout (D53): the command after `git`.
@@ -286,6 +291,10 @@ impl std::fmt::Display for SpawnRefusal {
                 )
             }
             SpawnRefusal::RustcArgs { args } => write!(f, "asked the compiler `rustc {}`, which blaze does not answer", args.join(" ")),
+            SpawnRefusal::RustcLine { args, at, why } => match args.get(*at) {
+                Some(arg) => write!(f, "asked the compiler `rustc {}`: its argument {at}, `{arg}`, is {why}", args.join(" ")),
+                None => write!(f, "asked the compiler `rustc {}`: {why}", args.join(" ")),
+            },
             SpawnRefusal::Program { program, args } => write!(f, "spawned `{program} {}`, a program a build script may not run", args.join(" ")),
             SpawnRefusal::Git { command, why } => write!(f, "asked `git {command}`, which blaze does not answer from the checkout: {why}"),
             SpawnRefusal::Malformed(why) => write!(f, "made a spawn request blaze cannot read: {why}"),
@@ -722,30 +731,34 @@ impl ScriptSandbox {
         let name = program.rsplit('/').next().unwrap_or(program);
         let routed = crate::spawn_route::route(name, &args_text, self.script.c_mode, self.script.spawner.is_some());
         let (code, stdout, stderr): (i32, Vec<u8>, Vec<u8>) = match routed {
-            crate::spawn_route::Route::Rustc => match probe::request("rustc", &args_text) {
-                Request::Version { verbose } => (0, probe::version(verbose, &self.script.host, Alloc::global()).as_bytes().to_vec(), Vec::new()),
-                Request::Compile => {
-                    let found = probe::snippet(&args_text);
+            crate::spawn_route::Route::Rustc => match probe_ask::classify(&args_text, Alloc::global()) {
+                Err(refused) => return Err(self.refuse(Refusal::Spawn(SpawnRefusal::RustcLine { args: owned(), at: refused.at, why: refused.why }))),
+                Ok(Ask::Version { verbose }) => (0, probe::version(verbose, &self.script.host, Alloc::global()).as_bytes().to_vec(), Vec::new()),
+                // `--print cfg` and the rest: the target's cfg rows are the toolchain record's,
+                // not handed to the script host yet; refused by name, never guessed.
+                Ok(Ask::Print { .. }) => return Err(self.refuse(Refusal::Spawn(SpawnRefusal::RustcArgs { args: owned() }))),
+                Ok(Ask::Compile(compile)) => {
                     let cwd = spawned.cwd.clone().unwrap_or_else(|| self.script.cwd());
-                    let bytes = match found {
-                        Some((_, Snippet::Stdin)) => Some(spawned.stdin.clone()),
-                        Some((_, Snippet::File(path))) => self.snippet_file(&cwd, path)?,
-                        None => None,
+                    let bytes = match compile.input {
+                        Snippet::Stdin => Some(spawned.stdin.clone()),
+                        Snippet::File(path) => self.snippet_file(&cwd, path)?,
                     };
                     let Some(bytes) = bytes else {
                         return Err(self.refuse(Refusal::Spawn(SpawnRefusal::RustcArgs { args: owned() })));
                     };
-                    let key = probe::compile_key(&self.script.target, &args_text, found.map(|(at, _)| at), &bytes);
-                    match (Table { rows: &self.script.table }).answer(&key) {
-                        Some(true) => (0, Vec::new(), Vec::new()),
-                        Some(false) => (1, Vec::new(), b"error: the pinned nightly rejects this probe (blaze's table of answers)\n".to_vec()),
-                        None => {
+                    // probe_ask.rs: no output file is written; every probe of tempo's reads
+                    // only the status.
+                    let answered = probe_ask::answer(&compile, &self.script.host, &bytes, &Table { rows: &self.script.table });
+                    match answered.verdict {
+                        Verdict::Accepted(_) => (0, Vec::new(), Vec::new()),
+                        Verdict::Rejected(rejection) => (1, Vec::new(), rejection.stderr(&compile, Alloc::global()).as_bytes().to_vec()),
+                        Verdict::Unanswered(_) => {
                             let snippet = String::from_utf8_lossy(&bytes).into_owned();
-                            return Err(self.refuse(Refusal::Spawn(SpawnRefusal::CannotAnswerYet { key, args: owned(), snippet, target: self.script.target.clone() })));
+                            let (key, target) = (answered.key, answered.target.to_owned());
+                            return Err(self.refuse(Refusal::Spawn(SpawnRefusal::CannotAnswerYet { key, args: owned(), snippet, target })));
                         }
                     }
                 }
-                Request::Print | Request::Other { .. } => return Err(self.refuse(Refusal::Spawn(SpawnRefusal::RustcArgs { args: owned() }))),
             },
             crate::spawn_route::Route::Git => {
                 let Some(owned_words) = git_words(name, &args_text) else {

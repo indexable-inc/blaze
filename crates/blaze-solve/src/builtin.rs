@@ -487,6 +487,7 @@ pub(crate) fn callable<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, self_ty: Ty,
         // `FnSig::is_fn_trait_compatible`: "!self.c_variadic() && self.safety().is_safe() &&
         // self.abi().is_fn_trait_compatible()"; `ExternAbi::is_fn_trait_compatible` is false
         // for the internal "rust-call" (and uncallable ABIs, which have no `Abi` here).
+        TyKind::FnPtr(_, h) if h.c_variadic => Ok(Callable::No),
         TyKind::FnPtr(io, h) => match (h.safety, h.abi) {
             (_, crate::term::Abi::RustCall) | (Safety::Unsafe, _) => Ok(Callable::No),
             (Safety::Safe, _) => split_sig(cx, io),
@@ -1257,15 +1258,19 @@ fn step_struct_unsize<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) 
     let adt = cx.adt(def)?;
     let Some(tail) = adt.sized_tail else { return Ok(Step::No) };
     // `unsizing_params_for_adt`: the type and const parameters of the tail field, less those of
-    // every other field.
+    // every other field. The other fields are the ones before the last by POSITION: a field of
+    // the same type as the tail (`struct Twice<D: ?Sized> { first: D, data: D }`) is one node
+    // of the portable table, so comparing types would skip it and let `D` change.
     let n = adt.generics as usize;
     let mut in_tail: Vec<bool, Alloc<'_>> = Vec::from_elem_in(false, n, cx.alloc);
     let mut elsewhere: Vec<bool, Alloc<'_>> = Vec::from_elem_in(false, n, cx.alloc);
     portable_params(adt.portable, tail, &mut in_tail, cx.alloc)?;
-    for &f in adt.fields {
-        if f != tail {
-            portable_params(adt.portable, f, &mut elsewhere, cx.alloc)?;
-        }
+    let Some((&last, before)) = adt.fields.split_last() else { return Err(malformed()) };
+    if last != tail {
+        return Err(malformed());
+    }
+    for &f in before {
+        portable_params(adt.portable, f, &mut elsewhere, cx.alloc)?;
     }
     let mut any = false;
     for i in 0..n {

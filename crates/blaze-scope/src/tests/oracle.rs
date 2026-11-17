@@ -1662,6 +1662,14 @@ struct Records<'s> {
 }
 
 impl crate::names::World<N> for Records<'_> {
+    type Scope<'w>
+        = &'w crate::ScopeBuilder<'w, N>
+    where
+        Self: 'w;
+    type Root<'w>
+        = &'w crate::CrateRootBuilder<'w, N>
+    where
+        Self: 'w;
     fn scope(&self, module: ItemKey) -> Option<&crate::ScopeBuilder<'_, N>> {
         self.s.by.get(&module).map(|r| &r.scope)
     }
@@ -1674,7 +1682,7 @@ impl crate::names::World<N> for Records<'_> {
     fn root(&self, krate: CrateItemKey) -> Option<&crate::CrateRootBuilder<'_, N>> {
         self.w.roots.get(&krate)
     }
-    fn variants(&self, _owner: ItemKey) -> Option<&[crate::task::Variant<N>]> {
+    fn variant(&self, _owner: ItemKey, _name: N) -> Option<Option<crate::names::VariantHit>> {
         None
     }
     fn no_implicit_prelude(&self, module: ItemKey) -> bool {

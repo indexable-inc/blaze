@@ -33,9 +33,9 @@
 //!
 //! What is here: the ABI's spelling and the ONE reading of such a declaration's symbol
 //! ([`symbol`]), used where a fn's row is tabled (program/tabled.rs `row`), for module-level
-//! and body-level declarations alike. What the builder does with the symbol is blaze-build's
-//! `Intrinsic::Target` (intrinsics/target.rs); until it exists, the row is refused as "a
-//! target intrinsic" ([`super::program::Front2Refusal::TargetIntrinsic`]).
+//! and body-level declarations alike. A symbol in blaze-build's set (intrinsics/target.rs
+//! `named`) is tabled as `Intrinsic::Target` and built in place by the walk; any other is
+//! refused as "a target intrinsic" ([`super::program::Front2Refusal::TargetIntrinsic`]).
 
 /// The ABI string of the block, as written between its quotes.
 pub const ABI: &str = "llvm-intrinsic";

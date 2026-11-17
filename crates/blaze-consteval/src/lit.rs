@@ -50,6 +50,8 @@ pub(crate) fn int(text: &str) -> Result<u128, LitError> {
             b'A'..=b'F' if radix == 16 => u32::from(b - b'A') + 10,
             // The suffix (`u8`, `i32`, ...) starts with a letter no digit of the radix is.
             b'i' | b'u' => break,
+            // A float suffix on a decimal integer (`1f32`, `0f128`); in hex `f` is a digit.
+            b'f' if radix == 10 => break,
             _ => return Err(LitError::NotThatKind),
         };
         if d >= radix {

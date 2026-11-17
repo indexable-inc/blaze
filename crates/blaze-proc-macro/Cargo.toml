@@ -62,6 +62,8 @@ libc.workspace = true
 [dev-dependencies]
 # `blaze_own::testing::heap()`: a test's root allocator (D102).
 blaze-own = { workspace = true, features = ["std", "testing"] }
+# The examples' entry frame and each test's top frame: memory from the OS, handed down.
+blaze-mem.workspace = true
 # `clang_shelf`: the pinned C toolchain's archive fetched over HTTPS, streamed (D69).
 blaze-http.workspace = true
 # A test's table of source corrections, read with the lexer's scalar width.

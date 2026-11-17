@@ -13,6 +13,7 @@
 #![feature(allocator_api)]
 #![feature(thread_local)]
 
+pub mod argv;
 pub mod body_ids;
 mod class_chain;
 pub mod code_records;
@@ -26,6 +27,8 @@ pub mod front;
 pub mod front2;
 pub mod library_set;
 mod natives;
+pub mod native_links;
+pub mod panic_strategy;
 pub mod personality;
 pub mod place;
 pub mod program_texts;

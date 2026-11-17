@@ -28,7 +28,7 @@ use crate::{
 
 /// The answers a runner sent, by client and sequence number, and the stops it asked for.
 pub(crate) struct Mailbox {
-    answers: Lock<HashMap<(u32, u32), (Kind, Vec<u8>), Global>>,
+    answers: Lock<Map<(u32, u32), (Kind, Vec<u8>), FixedState, Global>>,
     arrived: Signal,
     stops: Lock<Vec<(Option<(InstanceKey, ItemKey)>, String)>>,
 }
@@ -145,7 +145,7 @@ impl Counting {
 }
 
 /// Places each function at the address its key was given.
-pub(crate) struct Addresses(pub(crate) HashMap<InstanceKey, u64, Global>);
+pub(crate) struct Addresses(pub(crate) Map<InstanceKey, u64, FixedState, Global>);
 
 impl Placer for Addresses {
     fn place(&mut self, function: &CompiledFunction) -> Result<u64, String> {
@@ -407,7 +407,7 @@ const CODE_MEMORY: bool = cfg!(any(
 struct Slots {
     addresses: Addresses,
     cells: u64,
-    replaced: HashSet<InstanceKey, Global>,
+    replaced: Set<InstanceKey, FixedState, Global>,
 }
 
 impl Slots {
@@ -461,7 +461,7 @@ fn hot_cells_tier_a_function_up_and_its_late_asks_get_the_new_code() {
         session(&functions),
         &[],
         compiler.clone(),
-        Slots { addresses: addresses(3), cells, replaced: HashSet::new_in(Global) },
+        Slots { addresses: addresses(3), cells, replaced: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }) },
         Mail(Arc::clone(&mail)),
         Config { workers: 1, idle: false },
         Some(up),
@@ -514,7 +514,7 @@ fn a_failed_tier_up_leaves_the_first_code_and_is_reported() {
         session(&[function(0)]),
         &[],
         compiler.clone(),
-        Slots { addresses: addresses(1), cells, replaced: HashSet::new_in(Global) },
+        Slots { addresses: addresses(1), cells, replaced: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }) },
         Mail(Arc::clone(&mail)),
         Config { workers: 1, idle: false },
         Some(up),

@@ -65,7 +65,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 // under `type Out<T: Clone>` is E0277. OPEN: rustc's wfcheck asks every signature
                 // type (an ADT's where-clauses at `S<NotClone>`); the rebuilt layer has no
                 // item-level check yet, and this asks only types with a projection.
-                for &t in sig.inputs.iter().chain(core::iter::once(&sig.output)) {
+                // Each obligation is filed at the type's place in the body (`sig_place`: the
+                // parameter, or the body for the output), so a failure is a finding with a place.
+                let n_inputs = sig.inputs.len();
+                for (k, &t) in sig.inputs.iter().chain(core::iter::once(&sig.output)).enumerate() {
                     // Whether `t` mentions an alias: a work list over its nodes, bounded (rule 18).
                     let mut todo: blaze_own::Vec<u32, Alloc<'a>> = blaze_own::Vec::new_in(self.alloc);
                     todo.push(t.0);
@@ -88,13 +91,18 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     if !alias {
                         continue;
                     }
-                    let w = self.lower(sig.types, t, Lower::Assumed, Cause::Body)?;
-                    self.ty.register(crate::ty::Obligation { goal: Goal::WellFormed(w), cause: Cause::Body })?;
+                    let cause = self.sig_place(k, n_inputs);
+                    #[cfg(test)]
+                    let cause = if self.plant == crate::machine::Plant::ObligationsWithoutPlace { Cause::Body } else { cause };
+                    let w = self.lower(sig.types, t, Lower::Assumed, cause)?;
+                    self.ty.register(crate::ty::Obligation { goal: Goal::WellFormed(w), cause })?;
                 }
                 let mut inputs: blaze_own::Vec<Ty, Alloc<'a>> = blaze_own::Vec::with_capacity_in(sig.inputs.len(), self.alloc);
-                for &t in sig.inputs {
-                    inputs.push(self.lower_sig_ty(sig.types, t)?);
+                for (k, &t) in sig.inputs.iter().enumerate() {
+                    let cause = self.sig_place(k, n_inputs);
+                    inputs.push(self.lower_sig_ty(sig.types, t, cause)?);
                 }
+                let out_cause = self.sig_place(n_inputs, n_inputs);
                 // Each opaque the output names is this body's to define (rules/opaque_def.rs).
                 // An async fn whose root is its `async move` block (the Reference, "Async
                 // functions": `fn f() -> impl Future<Output = T> { async move { .. } }`, what
@@ -103,14 +111,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 // async block (the hand-built fixtures' older form) is checked against the
                 // written type, below.
                 let output = if self.body.coroutine.is_none() || self.async_root()? {
-                    let t = self.lower_defining_output(sig.types, sig.output)?;
+                    let t = self.lower_defining_output(sig.types, sig.output, out_cause)?;
                     // rustc's order (`replace_opaque_types_with_inference_vars`): the
                     // bounds are obligations from the start, so a returned closure is
                     // typed from its `Fn` bound.
                     self.close_opaques()?;
                     t
                 } else {
-                    self.lower_sig_ty(sig.types, sig.output)?
+                    self.lower_sig_ty(sig.types, sig.output, out_cause)?
                 };
                 (inputs, output, sig.header.abi == crate::ids::Abi::RustCall)
             }

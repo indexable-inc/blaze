@@ -26,6 +26,7 @@ mod asked_digest;
 mod attr_after_derive;
 mod attr_value;
 mod attrs;
+mod derive_where_shape;
 mod blocks;
 mod block_cfg;
 mod macro_blocks;
@@ -41,6 +42,9 @@ mod include_roots;
 mod expansions;
 mod exports;
 mod fixtures;
+mod global_allocator;
+mod helper_in_taker_output;
+mod nested_input_tokens;
 mod items;
 mod items_attr_text;
 mod items_record;
@@ -48,11 +52,14 @@ mod items_grain;
 mod items_head_free;
 mod items_owners;
 mod items_buckets;
+mod impl_roots;
 mod more;
 mod builtin_attrs_reach_cells;
 mod names_attr_3;
 mod names_attr_4;
 mod names_record;
+mod no_spelled_dollar_crate;
+mod names_inplace;
 mod name_rules;
 mod oracle;
 /// The reference solver's seam a solver core is compared through (oracle.rs).
@@ -64,7 +71,9 @@ mod written_module;
 mod proc_left_package;
 mod procs;
 mod records;
+mod module_links;
 mod refused;
+mod rendered_int_dot;
 mod rules;
 mod tests_record;
 
@@ -271,7 +280,10 @@ impl World {
         self.use_leaf(at, p, UseForm::Named { rename: Rename::To(to), types_only: false }, vis);
     }
 
+    /// `use p::*;`: `p` is the source module's path, without the `*` (a `UseDecl`'s path, as
+    /// the lowering writes it); a `*` segment would be looked up as a name and find nothing.
     pub(crate) fn glob(&mut self, at: ItemKey, p: &'static str, vis: V) {
+        assert!(!p.split("::").any(|s| s == "*"), "the glob path `{p}` spells its `*`: name the source module alone");
         self.use_leaf(at, p, UseForm::Glob, vis);
     }
 
@@ -410,7 +422,7 @@ impl Solved {
                 if let Some(b) = r.scope.get(ns, name) {
                     return Ok(crate::Node::Value(Some(crate::Passed { def: b.def, vis: b.vis, state: b.state })));
                 }
-                Ok(crate::Node::Edges { edges: &r.scope.globs, krate: s.krate[&source.key], chain: &s.chain[&source.key] })
+                Ok(crate::Node::Edges { edges: blaze_surface::Globs::of(&r.scope.globs), krate: s.krate[&source.key], chain: &s.chain[&source.key] })
             }
         }
         crate::through(&mut Records(self, ns, name), Def::module(m), Alloc::global()).expect("every module is solved")

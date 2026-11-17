@@ -254,7 +254,6 @@ pub(crate) fn parse<'w, 'a>(words: &'w [&'w str], alloc: Alloc<'a>) -> Result<Te
 
 #[cfg(test)]
 mod tests {
-    use blaze_own::Alloc;
     use blaze_run::Nanos;
     use blaze_run::plan::{Filter, Ignored};
     use blaze_run::report::Format;
@@ -303,6 +302,10 @@ mod tests {
     /// blaze-cli test test_args`: `test test_args::tests::the_argument_table ... ok`.
     #[test]
     fn the_argument_table() {
+        // The test's one frame, made at its top (its memory the OS's), handed down as a handle.
+        let frame = bstd::mem::Frame::with_reserve(1 << 16, bstd::mem::Tag::Other).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
         let rows = [
             Row { words: &[], want: Ok(PLAIN) },
             Row { words: &["parse"], want: Ok(Want { filter: Filter::Substring("parse"), ..PLAIN }) },
@@ -351,7 +354,7 @@ mod tests {
             Row { words: &["--nocapture", "--test-threads", "4"], want: Err(TestArgsError::NocaptureThreads { threads: 4 }) },
         ];
         for row in rows {
-            let got = parse(row.words, Alloc::global()).map(|args| {
+            let got = parse(row.words, alloc).map(|args| {
                 let config = args.config(8).expect("a parsed width is at least 1");
                 Want {
                     // `args.filter` is `Filter<'static>`; `config.filter` would borrow `args`,
@@ -372,11 +375,11 @@ mod tests {
         }
         // Every word is handed on as given, for a `harness = false` target's key.
         let words: &'static [&'static str] = &["x", "--list"];
-        let args = parse(words, Alloc::global()).unwrap_or_else(|e| panic!("{e}"));
+        let args = parse(words, alloc).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(args.passed, words);
         // A refusal's words name the flag.
-        let refused = parse(&["--shuffle"], Alloc::global()).map(|_| ()).unwrap_err();
-        let mut text = blaze_own::Vec::new_in(Alloc::global());
+        let refused = parse(&["--shuffle"], alloc).map(|_| ()).unwrap_err();
+        let mut text = blaze_own::Vec::new_in(alloc);
         core::fmt::write(&mut Utf8(&mut text), format_args!("{refused}")).unwrap_or_else(|_| panic!("a refusal's words"));
         let text = core::str::from_utf8(text.as_slice()).unwrap_or_else(|_| panic!("UTF-8"));
         assert!(text.starts_with("`blaze test` does not take `--shuffle`"), "{text}");

@@ -67,8 +67,9 @@ pub enum BorrowRefused {
     /// A fact the lowering needs about an ADT is not known: whether it is `Copy` (an unknown
     /// taken as not `Copy` makes false move findings) or implements `Drop` (an unknown taken
     /// as no `Drop` would accept a move out of such a type's field): the ADT's checker key and
-    /// which trait.
-    FactUnknown { adt: tc::ItemKey, fact: &'static str },
+    /// which trait, the ADT's library item when its key begins one, and why the selection gave
+    /// no answer (the refused candidate impl, by key and crate, for a gap).
+    FactUnknown { adt: tc::ItemKey, item: Option<blaze_id::ItemKey>, fact: &'static str, why: ImplsUnknown },
     /// The body's types over the store's table could not be viewed.
     TypeTable(tc::CheckError),
     /// The lowering refused a form, by name, at an item-relative range.
@@ -84,6 +85,11 @@ pub enum BorrowRefused {
     /// such ADT of the body by checker key, why its row was not made, and how many others of
     /// the body were not made either (borrows_unmade.rs).
     AdtNotMade { adt: tc::ItemKey, why: AdtUnmade, others: u32, start: u32, end: u32 },
+    /// The lowering refused a call of `callee`, whose head writes lifetimes, at the
+    /// item-relative `start..end` because the head's lifetime part was not read from its text
+    /// (`Form::CallWritesLifetimes` lacking `CallLacks::Sig`): the callee by checker key and
+    /// library item, its head's first words, and why its text was not read.
+    CallSigUnread { callee: tc::ItemKey, item: Option<blaze_id::ItemKey>, head: Words, why: SigRefusal, start: u32, end: u32 },
 }
 
 impl BorrowRefused {
@@ -98,6 +104,7 @@ impl BorrowRefused {
             BorrowRefused::Bound(_) => "the check went past its bound",
             BorrowRefused::NestedOutlives { .. } => "a closure or async block needs a lifetime relation its owner must prove (not built)",
             BorrowRefused::AdtNotMade { .. } => "an ADT the body moves or drops could not be made from the records",
+            BorrowRefused::CallSigUnread { .. } => "a callee's signature writes lifetimes its text was not read for",
         }
     }
 
@@ -107,6 +114,7 @@ impl BorrowRefused {
             BorrowRefused::Lower(r) => Some((r.range.start, r.range.end)),
             BorrowRefused::NestedOutlives { start, end } => Some((*start, *end)),
             BorrowRefused::AdtNotMade { start, end, .. } => Some((*start, *end)),
+            BorrowRefused::CallSigUnread { start, end, .. } => Some((*start, *end)),
             _ => None,
         }
     }
@@ -173,6 +181,8 @@ pub struct BorrowFacts<'a> {
     /// Each ADT whose `Copy` or `Drop` answer was not known (the census takes it as `false`;
     /// the command refuses the body: [`BorrowRefused::FactUnknown`]).
     unknown: AVec<'a, (u128, &'static str)>,
+    /// Why each of `unknown` was not known, in its order.
+    unknown_why: AVec<'a, ImplsUnknown>,
     /// Each ADT of the body's types whose row the store could not make, and why, sorted by
     /// checker key (borrows_unmade.rs; the lowering refuses such an ADT as `UnknownAdt`).
     unmade: AVec<'a, (u128, AdtUnmade)>,
@@ -194,6 +204,7 @@ impl<'a> BorrowFacts<'a> {
             shapes: AVec::new_in(alloc),
             items: AVec::new_in(alloc),
             unknown: AVec::new_in(alloc),
+            unknown_why: AVec::new_in(alloc),
             unmade: AVec::new_in(alloc),
             reads: AVec::new_in(alloc),
         }
@@ -218,6 +229,11 @@ impl<'a> BorrowFacts<'a> {
     /// Each ADT whose `Copy` or `Drop` answer was not known, and which.
     pub fn unknown(&self) -> &[(u128, &'static str)] {
         &self.unknown
+    }
+
+    /// Why each of [`BorrowFacts::unknown`] was not known, in its order.
+    pub fn unknown_why(&self) -> &[ImplsUnknown] {
+        &self.unknown_why
     }
 
     /// Each ADT whose row was not made, and why, by checker key.
@@ -272,12 +288,69 @@ fn writes_lifetime(text: &str) -> bool {
     (0..b.len()).any(|i| b[i] == b'\'' && b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_') && b.get(i + 2) != Some(&b'\''))
 }
 
-/// Whether an ADT's head declares lifetimes: a `'` in its head's text before its body.
-fn adt_head_lifetimes<'n, S: NamesSource<'n>>(keys: &Keys, names: S, adt: tc::ItemKey) -> bool {
+/// How many lifetime parameters an ADT's head declares ([`declared_lifetimes`] of its text):
+/// one origin position each (blaze-flow-lower `AdtFacts::lifetimes`).
+fn adt_head_lifetimes<'n, S: NamesSource<'n>>(keys: &Keys, names: S, adt: tc::ItemKey) -> u32 {
     // The head after its docs and attributes (head_text.rs): `Rc`'s docs say "'Rc' stands for ..".
     keys.library_in(names, adt)
         .and_then(|lib| names.text_of(lib))
-        .is_some_and(|t| super::head_text::after_outer_trivia(t.text).split(['{', '(', ';']).next().unwrap_or("").contains('\''))
+        .map_or(0, |t| declared_lifetimes(super::head_text::after_outer_trivia(t.text)))
+}
+
+/// The lifetime parameters of a `struct`, `enum` or `union` head's generics list: the entries
+/// of `<..>` right after the name that begin with a lifetime (`struct Checking<'c, 'g, M>`: 2).
+/// No generics list: 0. A `>` of a `->` (a fn pointer in a default) closes nothing.
+fn declared_lifetimes(head: &str) -> u32 {
+    let b = head.as_bytes();
+    let word_at = |i: usize, w: &str| {
+        head.get(i..).is_some_and(|s| s.starts_with(w))
+            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+            && b.get(i + w.len()).is_some_and(|c| c.is_ascii_whitespace())
+    };
+    let Some(kw) = (0..b.len()).find(|&i| ["struct", "enum", "union"].iter().any(|w| word_at(i, w))) else { return 0 };
+    let mut i = kw;
+    while i < b.len() && !b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] >= 0x80) {
+        i += 1;
+    }
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if b.get(i) != Some(&b'<') {
+        return 0;
+    }
+    let (mut depth, mut entry, mut n) = (0u32, true, 0u32);
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b'<' => depth += 1,
+            b'>' if i > 0 && b[i - 1] == b'-' => {}
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            b',' if depth == 1 => entry = true,
+            _ if c.is_ascii_whitespace() => {}
+            b'\'' if depth == 1 && entry => {
+                n += 1;
+                entry = false;
+            }
+            _ => {
+                if depth == 1 {
+                    entry = false;
+                }
+            }
+        }
+        i += 1;
+    }
+    n
 }
 
 /// Asks the store for one head, evaluating the array lengths it names, at most [`MOST_LENS`];
@@ -317,10 +390,108 @@ fn container_head<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, lib: blaze
     wants.iter().all(|&w| ensure_one(r, w))
 }
 
-/// Whether `trait_` has an impl for the ADT `adt`: `None` when the question could not be
-/// answered (no such lang item, or the selection could not be made).
-fn has_impl<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, trait_: Option<tc::ItemKey>, adt: tc::ItemKey) -> Option<bool> {
-    answer_impls(r, trait_?, tc::Shape::Adt(adt)).map(|v| !v.is_empty())
+/// Whether `trait_` has an impl for the ADT `adt`: refused when the question could not be
+/// answered (no such lang item, or the selection could not be made), with why.
+fn has_impl<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, trait_: Option<tc::ItemKey>, adt: tc::ItemKey) -> Result<bool, ImplsUnknown> {
+    let trait_ = trait_.ok_or(ImplsUnknown::NoLangItem)?;
+    let shape = tc::Shape::Adt(adt);
+    if let Some(v) = answer_impls(r, trait_, shape) {
+        return Ok(!v.is_empty());
+    }
+    // Why: the question's gap (a refused candidate) when it was answered, else its fill.
+    let b = r.buckets.as_ref().ok_or(ImplsUnknown::NotAnswered)?;
+    // An impl READ to be of `trait_` at this shape answers YES whatever the refused candidates
+    // are: a refused one can add an impl, never take the read one away (an existing impl is
+    // not undone by another; a negative impl of the trait overlapping it is a coherence error,
+    // the Reference, "Trait implementation coherence"). Only NO needs every candidate read.
+    if b.impls_of(trait_, shape).is_some_and(|got| !got.is_empty()) {
+        return Ok(true);
+    }
+    match b.trait_gap(trait_, shape) {
+        Some((candidate, why)) => {
+            use core::fmt::Write;
+            let mut said = Words::EMPTY;
+            let _ = write!(said, "candidate {candidate:x}, header `");
+            match r.names.text_of(candidate) {
+                Some(t) => {
+                    for (i, word) in t.impl_header.unwrap_or(t.text).split_whitespace().take(24).enumerate() {
+                        let _ = write!(said, "{}{word}", if i == 0 { "" } else { " " });
+                    }
+                }
+                None => {
+                    let _ = write!(said, "(no text)");
+                }
+            }
+            let _ = write!(said, "`: {why}");
+            Err(ImplsUnknown::RefusedCandidate { candidate, krate: b.krate(candidate), why: said })
+        }
+        None => Err(ImplsUnknown::NotAnswered),
+    }
+}
+
+/// At most [`Words::MOST`] bytes of a refusal's words, kept inline so the refusal stays a
+/// `Copy` value; words past the bound are cut at a character's boundary and marked `...`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Words {
+    len: u16,
+    cut: bool,
+    bytes: [u8; Words::MOST],
+}
+
+impl Words {
+    pub const MOST: usize = 400;
+    pub const EMPTY: Words = Words { len: 0, cut: false, bytes: [0u8; Words::MOST] };
+
+    pub fn as_str(&self) -> &str {
+        // Only whole characters are ever written ([`Words::write_str`]): always UTF-8.
+        core::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("")
+    }
+}
+
+impl core::fmt::Write for Words {
+    /// Appends as much of `s` as fits before the last three bytes, cut at a character's
+    /// boundary; a cut writes `...` there and keeps the rest out.
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        if self.cut {
+            return Ok(());
+        }
+        let at = self.len as usize;
+        let room = (Words::MOST - 3).saturating_sub(at);
+        let mut end = s.len().min(room);
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.bytes[at..at + end].copy_from_slice(&s.as_bytes()[..end]);
+        let mut len = at + end;
+        if end < s.len() {
+            self.bytes[len..len + 3].copy_from_slice(b"...");
+            len += 3;
+            self.cut = true;
+        }
+        self.len = len as u16;
+        Ok(())
+    }
+}
+
+impl core::fmt::Debug for Words {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:?}", self.as_str())
+    }
+}
+
+/// Why the selection gave no answer to "does this ADT implement this trait": each a named
+/// refusal, never an empty answer taken as no.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImplsUnknown {
+    /// The program has no lang item for the trait asked about (`copy`, `drop`).
+    NoLangItem,
+    /// The question was not answered: the trait's head or the question's fill (the
+    /// candidates' headers lowered, then the answer) refused.
+    NotAnswered,
+    /// A candidate impl of the trait at the asked shape was refused, so the answer may miss
+    /// it: the least such candidate by key, the crate it is written in when known, and the
+    /// candidate's key, header and why it was refused, in words.
+    RefusedCandidate { candidate: blaze_id::ItemKey, krate: Option<usize>, why: Words },
 }
 
 /// The facts of the body of `owner` checked as `c`, gathered before it is lowered: per ADT its
@@ -371,13 +542,22 @@ pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owne
             g.variants.push((k, vi as u32, first, g.fields.len() as u32 - first));
         }
         let copy = has_impl(r, langs.copy, key);
-        let drop_impl = has_impl(r, langs.drop, key);
-        if copy.is_none() {
+        // A `Copy` type has no `Drop` impl: the Reference, "Special types and traits", `Copy`:
+        // "Copy cannot be implemented for types that implement Drop" (rustc E0184), so YES to
+        // `Copy` is NO to `Drop` without asking (an unread candidate cannot be its `Drop`).
+        let drop_impl = match copy {
+            Ok(true) => Ok(false),
+            _ => has_impl(r, langs.drop, key),
+        };
+        if let Err(why) = copy {
             g.unknown.push((k, "Copy"));
+            g.unknown_why.push(why);
         }
-        if drop_impl.is_none() {
+        if let Err(why) = drop_impl {
             g.unknown.push((k, "Drop"));
+            g.unknown_why.push(why);
         }
+        let (copy, drop_impl) = (copy.ok(), drop_impl.ok());
         let copy_taken = copy.unwrap_or(false);
         let facts = AdtFacts {
             copy: copy_taken,
@@ -543,6 +723,32 @@ fn invalidated_words<A: Allocator>(flow: &Flow<A>, at: Point, loan: Loan) -> (&'
     }
 }
 
+/// A call of a head that writes lifetimes refused because the head's text was not read
+/// (`CallWritesLifetimes` lacking `Sig`): the callee and why, by name (rule 19), from the facts'
+/// `sig_refused`. `None` for any other refusal.
+fn sig_unread<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, facts: &BorrowFacts<'_>, refusal: Refusal) -> Option<BorrowRefused> {
+    let blaze_flow_lower::Form::CallWritesLifetimes { callee, lacks: blaze_flow_lower::CallLacks::Sig } = refusal.form else {
+        return None;
+    };
+    let &(_, why) = facts.sig_refused().iter().find(|(k, _)| *k == callee.0)?;
+    let mut head = Words::EMPTY;
+    if let Some(f) = r.store.fns.get(&callee) {
+        use core::fmt::Write;
+        let text = super::head_text::after_outer_trivia(f.text);
+        for (i, word) in text.split('{').next().unwrap_or(text).split_whitespace().take(24).enumerate() {
+            let _ = write!(head, "{}{word}", if i == 0 { "" } else { " " });
+        }
+    }
+    Some(BorrowRefused::CallSigUnread {
+        callee,
+        item: r.keys.library_in(r.names, callee),
+        head,
+        why,
+        start: refusal.range.start,
+        end: refusal.range.end,
+    })
+}
+
 /// The move and borrow check of `body`, whose type check gave `done`: the facts gathered, the
 /// body lowered to its flow, then the move check and the loans tiers.
 fn borrows_of<'n, 'a, S: NamesSource<'n>>(
@@ -563,8 +769,9 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
     // Everything below reads these facts, a refusal included: all of them are the body's reads.
     reads.extend_from_slice(facts.reads());
     reads.extend_from_slice(facts.calls.reads());
-    if let Some(&(adt, fact)) = facts.unknown().first() {
-        verdict.refused = Some(BorrowRefused::FactUnknown { adt: tc::ItemKey(adt), fact });
+    if let (Some(&(adt, fact)), Some(&why)) = (facts.unknown().first(), facts.unknown_why().first()) {
+        let item = r.keys.library_in(r.names, tc::ItemKey(adt));
+        verdict.refused = Some(BorrowRefused::FactUnknown { adt: tc::ItemKey(adt), item, fact, why });
         return verdict;
     }
     let tys = match body.tys.view(&r.store.tys) {
@@ -596,7 +803,7 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
                         start: refusal.range.start,
                         end: refusal.range.end,
                     },
-                    _ => BorrowRefused::Lower(refusal),
+                    _ => sig_unread(r, &facts, refusal).unwrap_or(BorrowRefused::Lower(refusal)),
                 });
                 break;
             }

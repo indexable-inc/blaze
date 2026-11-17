@@ -6,8 +6,8 @@ use core::alloc::Allocator;
 
 use std::alloc::Global;
 
-use blaze_lir::builder::{DataReloc, Facts, MemAttrs, Param, Variadic};
-use blaze_lir::func::{BlockKind, Conv, Ext, ParamKind, RefId, RefKind, SlotId, SlotKind};
+use blaze_lir::builder::{MemAttrs, Param, Variadic};
+use blaze_lir::func::{BlockKind, Conv, Ext, RefId, RefKind, SlotId, SlotKind};
 use blaze_lir::{Block, Builder, Flags, Full, IntCond, Op, Ty, Value};
 use blaze_own::Alloc;
 use blaze_typeck::{
@@ -15,8 +15,9 @@ use blaze_typeck::{
     Name, PNode, PTy, PTys, Pat, PatId, PortableTys, Stmt, StmtId, UintTy, UnOp,
 };
 
+use crate::abi::Pass;
 use crate::cabi::{self, CAbiError, Class};
-use crate::data::{DataRecord, DataTarget};
+use crate::data::DataRecord;
 use crate::intrinsics::{self, Arg, Call, GenericArg, IntrinsicCx, IntrinsicError, Out, Which};
 use crate::layout::{LayoutCx, LayoutError, LayoutId, Layouts, Prim, Refusal, Tail, Variants};
 use crate::vtable::ObjectRead;
@@ -24,7 +25,7 @@ use crate::{Abi, Adts, BuildError, Built, Instance, Intrinsic, Subst, ground};
 
 #[path = "closure.rs"]
 mod closure;
-pub(crate) use closure::{build_fn_shim, closures_in};
+pub(crate) use closure::{build_ctor_fn, build_fn_shim, closures_in};
 #[path = "coroutine.rs"]
 pub(crate) mod coroutine;
 
@@ -61,6 +62,7 @@ mod await_spill;
 mod state_names;
 mod validity;
 mod wide_cmp;
+mod track_caller;
 
 /// The target's pointer width: the ladder runs on AArch64.
 const PTR_BITS: u32 = 64;
@@ -395,6 +397,12 @@ enum Task {
     Cast(ExprId),
     /// Store the value on top into the aggregate place under it, `off` bytes in.
     InitAt { off: u32, repr: Repr },
+    /// Base-less struct expression `e` (`S { a: 1, .. }`, RFC 3681), its place on top, every
+    /// written field stored: each unwritten field stored from its default's value.
+    InitDefaults(ExprId),
+    /// Struct update `e`'s base place on top, its new value's place under it: the fields it
+    /// does not name taken from the base (walk/moves/struct_update.rs).
+    StructBase(ExprId),
     Field(ExprId),
     FieldPlace(ExprId),
     /// The place under the index on top: the element, after the bounds check.
@@ -535,6 +543,8 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     owed: Vec<unwind_ladder::DropStep, A>,
     /// Where a drop call made now goes (walk/unwind_ladder.rs `drop_call`).
     rung: unwind_ladder::Rung,
+    /// What the body was given of its caller's place (walk/track_caller.rs).
+    track: track_caller::Track,
 }
 
 fn unsupported(expr: ExprId, what: &'static str) -> BuildError {
@@ -594,25 +604,6 @@ fn abi_param(repr: Repr, ty: Ty) -> Param {
 /// The integer types of 1, 2, 4 and 8 bytes, by log2 of the size.
 const WIDTHS: [Ty; 4] = [Ty::I8, Ty::I16, Ty::I32, Ty::I64];
 
-/// How one value crosses a call (lib.rs, "Rust ABI" and "The C ABI"). It is one plan for
-/// both sides: the caller's arguments and results and the callee's parameters and return.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Pass {
-    /// Nothing: a value-less type, or a C zero-sized one.
-    Ignore,
-    /// One register of `ty`, widened by `ext`. `agg`: the walk holds it as a one-scalar
-    /// aggregate (a C newtype), read and written at its offset 0.
-    Scalar { ty: Ty, ext: Ext, agg: bool },
-    /// Rust: an aggregate by the address of the caller's copy; a result by a hidden pointer
-    /// first.
-    Ref,
-    /// C: a composite past 16 bytes by the address of a copy (`byval`), a result through
-    /// `sret`.
-    Memory { size: u32, align: u8 },
-    /// C: a composite of `size` (1 to 16) bytes in `size.div_ceil(8)` `i64` registers, the
-    /// last read at a width inside the size.
-    Words { size: u32 },
-}
 
 /// What a call calls.
 #[derive(Clone, Copy)]
@@ -770,6 +761,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         terminate: None,
         owed: Vec::new_in(alloc.clone()),
         rung: unwind_ladder::Rung::Off,
+        track: track_caller::Track::No,
     }
     }
 
@@ -842,10 +834,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
         let types = self.types;
         // An `async` block of this body, still named by its expression: its identity here
-        // (coroutine.rs `own_block`); every other type through `ground`.
+        // (coroutine.rs `own_block`), at the top or inside another type (a callee's `Fut`
+        // argument, a closure returning the block); every other node as `ground` maps it.
         let g = match coroutine::own_block(types, t) {
             Some(block) => self.own_coroutine_ty(block)?,
-            None => self.ground_in(types, t)?,
+            None => crate::instance::ground_own(types, t, self.args, self.body, self.ground, self.scratch, self.adts.facts()).map_err(ground_err)?,
         };
         self.grounded[at] = g;
         Ok(g)
@@ -1147,8 +1140,21 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             let mut missing = None;
             for &(_, pt) in parts.iter() {
-                if self.is_agg(pt)? && self.find_layout(pt).is_none() {
-                    missing = Some(pt);
+                // A pattern type is held as its base (`repr`): a wide pointer under one
+                // (core's `NonNull<dyn T>` holds `pattern_type!(*const dyn T is !null)`) is laid
+                // out first too, so no row is made between this row's fields below.
+                let held = match self.ground_node(pt)? {
+                    PNode::Pat(base, _) => base,
+                    _ => pt,
+                };
+                // Every part whose `repr` makes a layout row is laid out first: an aggregate,
+                // and a closure that captures nothing (not an aggregate, but `repr` lays it out
+                // to see it is zero-sized). One laid out below, between this row's fields, would
+                // put its own fields inside this row's (core's `read_separator`: a `move`
+                // closure holding a captureless closure, census class 66).
+                let lays_out = self.is_agg(held)? || matches!(self.ground_node(held)?, PNode::Closure { .. });
+                if lays_out && self.find_layout(held).is_none() {
+                    missing = Some(held);
                     break;
                 }
             }
@@ -1226,12 +1232,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             let lt = *self.ls.get(id);
             // A struct or tuple ending in a slice or `str` (walk/unsized_tail.rs): a row of its
             // fields at `ls`'s offsets, the tail's with no representation; `repr` refuses it by
-            // value. A `dyn` tail's offset is the vtable's alignment's, a run-time value.
+            // value. A `dyn` tail's row holds the prefix's end, rounded up to the vtable's
+            // alignment where the tail is reached (crate::dyn_tail).
             let unsized_tail = match lt.tail {
                 Tail::Sized => false,
-                Tail::Slice { .. } if !is_enum && !is_union && array_len.is_none() => true,
-                Tail::Slice { .. } => return Err(TyErr::Malformed("an enum, union or array with an unsized tail")),
-                Tail::Dyn => return Err(TyErr::Unsupported("a struct with a `dyn` tail: its tail's offset needs the vtable's alignment")),
+                Tail::Slice { .. } | Tail::Dyn if !is_enum && !is_union && array_len.is_none() => true,
+                Tail::Slice { .. } | Tail::Dyn => return Err(TyErr::Malformed("an enum, union or array with an unsized tail")),
             };
             let size = u32::try_from(lt.size).ok().filter(|&s| s <= i32::MAX as u32).ok_or_else(too_big)?;
             let align = lt.align;
@@ -1315,6 +1321,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         leaves = leaves.saturating_add(self.leaves(repr));
                     }
                     let len = parts.len() as u32;
+                    // A row's fields are contiguous: no part's `repr` made a row between them
+                    // (the pre-pass above lays out every part that has one).
+                    if self.layout_fields.len() as u32 != first + len {
+                        return Err(TyErr::Malformed("a part laid out between its aggregate's fields (a row's fields not contiguous)"));
+                    }
                     if unsized_tail {
                         self.unsized_tails.push(self.layouts.len() as u32);
                     }
@@ -1795,6 +1806,27 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         Ok((Home::Slot(slot), repr))
     }
 
+    /// Whether irrefutable pattern `p` peels references off the type it is matched against
+    /// (the Reference, "Binding modes": "each time a reference is matched using a
+    /// non-reference pattern, it will automatically dereference the value"): a tuple, a
+    /// struct or tuple-struct, a slice or a path pattern. The check records such a pattern at
+    /// its peeled type (blaze-typeck rules/pat.rs `step_pat`).
+    fn peels_refs(&self, p: PatId) -> Result<bool, BuildError> {
+        Ok(matches!(self.pat(p)?, Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Slice { .. } | Pat::Path(_)))
+    }
+
+    /// Binds `v`, a value of ground type `g` (its binder's: a `let` initializer's adjusted
+    /// type, a parameter's, a field's), to pattern `p`. A pattern that peels references off a
+    /// reference `g` is the irrefutable binder's at `g` (`let Ending { fw, stream } = &*p;`,
+    /// `let World { driver, .. } = &mut *world;`): its recorded type is the peeled one, which
+    /// is not the value's. Every other pattern's recorded type is `g`: [`Self::bind_value`].
+    fn bind_value_of(&mut self, p: PatId, v: V, g: PTy) -> Result<(), BuildError> {
+        if self.peels_refs(p)? && matches!(self.ground_node(g).map_err(|error| Self::pat_ty_err(p, error))?, PNode::Ref(..)) {
+            return self.bind_irrefutable_at(p, v, g);
+        }
+        self.bind_value(p, v)
+    }
+
     /// Binds `v` to pattern `p`: a binding (the value stored into its slot), `_` (dropped), a
     /// tuple pattern or an array pattern (`[a, _, b]`) taken apart from the aggregate's place,
     /// by a work list; every other irrefutable pattern (a struct or only-variant pattern, `&p`,
@@ -1918,6 +1950,20 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     }
                     None => V::None,
                 };
+                // A part whose pattern peels references off it (`let (Foo { a }, n) = (&foo, 1);`)
+                // is bound at the part's own type (`bind_value_of`).
+                if r == Repr::Ptr && self.peels_refs(sub)? {
+                    let pg = match (repr, node) {
+                        (Repr::Agg(l), PNode::Tuple(_)) => match self.layouts[l as usize].shape {
+                            Shape::Fields { first, .. } => self.layout_field_tys[first as usize + k],
+                            _ => return Err(malformed("a tuple not laid out as fields")),
+                        },
+                        (_, PNode::Array(elem, _)) => elem,
+                        _ => return Err(malformed("a tuple or array pattern of a type of another shape")),
+                    };
+                    self.bind_value_of(sub, part, pg)?;
+                    continue;
+                }
                 todo.push((sub, part));
             }
         }
@@ -1956,10 +2002,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// A drop call of `instance`, a fn of one pointer parameter and no result, with `p`: plain,
     /// or an `invoke` when an unwind ladder says so (walk/unwind_ladder.rs `drop_call`).
     fn call_ptr(&mut self, instance: Instance, p: Value) -> Result<(), BuildError> {
+        // A tracked `Drop::drop` has no call expression to be the place: refused by name.
+        let (sig, values) = self.lang_call_sig(None, instance, &[Param::of(Ty::PTR)], &[p])?;
         let place = self.ref_place(instance);
         let reference = self.b.reference(RefKind::Func, place);
-        let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
-        self.drop_call(Callee::Direct(reference), sig, &[p])
+        self.drop_call(Callee::Direct(reference), sig, &values)
     }
 
     /// Binding `p`, just bound (`init`) or declared without a value, joins the innermost drop
@@ -2290,10 +2337,16 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                                 kids.extend(init.map(|c| (c, false)));
                                 kids.extend(else_.map(|c| (c, true)));
                                 pats.push(pat);
-                                // A `let`-`else` owns its scrutinee as a match does: a field of a
-                                // local gets the local field flags (walk/moves/field_scrutinee.rs).
-                                if let (Some(i), Some(_)) = (init, else_) {
+                                // A `let`-`else`, and a `let` that owns its initializer's parts
+                                // (matches/irrefutable.rs `let_owns_parts`), owns its scrutinee as
+                                // a match does: a local, or a field of one, gets the local's field
+                                // flags (walk/moves.rs `scan_local_scrutinee`,
+                                // walk/moves/field_scrutinee.rs).
+                                if let Some(i) = init
+                                    && (else_.is_some() || self.let_owns_parts(pat, i)?)
+                                {
                                     self.scan_field_scrutinee(i, pat)?;
+                                    self.scan_local_scrutinee(i, pat)?;
                                 }
                             }
                             Stmt::Expr { expr, .. } => kids.push((expr, false)),
@@ -2314,6 +2367,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     kids.push((init, false));
                     pats.push(pat);
                     self.scan_field_scrutinee(init, pat)?;
+                    self.scan_local_scrutinee(init, pat)?;
                 }
                 Expr::Match { scrutinee, arms } => {
                     kids.push((scrutinee, false));
@@ -2392,7 +2446,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 Expr::Struct { fields, base, .. } => {
                     let inits = body.field_inits.get(fields.range()).ok_or(malformed("a struct literal's fields past `field_inits`"))?;
                     kids.extend(inits.iter().map(|f| (f.expr, false)));
-                    kids.extend(base.map(|c| (c, false)));
+                    kids.extend(base.expr().map(|c| (c, false)));
                 }
                 Expr::Closure { body: c, .. } => kids.push((c, true)),
                 Expr::FormatArgs { args, .. } => kids.extend(list(args)?.iter().map(|&c| (c, false))),
@@ -2441,6 +2495,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     Expr::Match { scrutinee, .. } => scrutinee.0 == c,
                     // A `let` condition's scrutinee likewise (walk/lets.rs: nothing moves out).
                     Expr::Let { init, .. } => init.0 == c,
+                    // A struct update's base: a place, only its taken fields move
+                    // (walk/moves/struct_update.rs).
+                    Expr::Struct { base: blaze_typeck::StructBase::Expr(b), .. } => b.0 == c,
                     _ => false,
                 };
             if in_place {
@@ -2463,6 +2520,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         // A part moved out by a place expression (a field, a box's contents) gives its local
         // field flags (walk/moves/boxes.rs).
         self.scan_part_moves(&parent)?;
+        // A field taken out of a struct update's base likewise (walk/moves/struct_update.rs).
+        self.scan_update_moves()?;
         self.expr_parent = parent;
         self.scan_temp_scopes()
     }
@@ -2636,6 +2695,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         };
         self.ret = self.repr(g).map_err(sig_err)?;
         self.ret_pass = self.pass(g, self.ret, abi, Some(owner))?;
+        // A `#[track_caller]` fn's hidden last parameter, its caller's `Location`
+        // (walk/track_caller.rs); no parameter of the body binds it.
+        let tracked = kind == Kind::Body && self.own_tracked()?;
+        if tracked {
+            passes.push(track_caller::PASS);
+        }
         let (params, rets) = self.sig_of(&passes, self.ret_pass);
         let own = self.b.sig(Conv::C, Variadic::No, &params, &rets);
         self.b.set_signature(own);
@@ -2646,6 +2711,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let mut values = Vec::with_capacity_in(params.len(), self.alloc.clone());
         for p in params.iter() {
             values.push(self.b.param(p.ty));
+        }
+        if tracked {
+            let loc = *values.last().ok_or(malformed("a `#[track_caller]` fn without its location parameter"))?;
+            self.track = track_caller::Track::Passed(loc);
         }
         let mut next = values.iter().copied();
         if let Pass::Ref | Pass::Memory { .. } = self.ret_pass {
@@ -2679,6 +2748,26 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 }
                 return Ok(());
             }
+            // `drop_glue::<S>` of a struct or tuple whose last field is unsized (core's `CStr`,
+            // std's `OsStr` and `Path`, `ArcInner<[T]>`): its parameter is the wide pointer, by
+            // reference (walk/unsized_tail.rs). The Reference, "Destructors": a type with no
+            // `Drop` impl and no part that needs drop runs nothing, so its glue is empty; one
+            // whose parts need drop is refused by name until its parts' glue is built.
+            if let (&[Repr::Agg(_)], Repr::None, &[_]) = (reprs.as_slice(), self.ret, values.as_slice()) {
+                let l = self.layout(g).map_err(sig_err)?;
+                if self.has_unsized_tail(l) {
+                    if self.needs_drop(g).map_err(sig_err)? {
+                        return Err(BuildError::UnsupportedSig {
+                            what: "the drop glue of a struct or tuple with an unsized tail that needs drop (its prefix fields, then its slice tail's elements or its `dyn` tail at the vtable's alignment)",
+                        });
+                    }
+                    self.b.ret(&[]);
+                    if let Some(error) = self.b.error() {
+                        return Err(BuildError::Lir(error.clone()));
+                    }
+                    return Ok(());
+                }
+            }
             let (&[Repr::Ptr], Repr::None, &[p]) = (reprs.as_slice(), self.ret, values.as_slice()) else {
                 return Err(malformed("a `drop_glue` parameter that is neither a thin pointer, a slice, `str` nor `dyn`"));
             };
@@ -2707,19 +2796,33 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     V::Place(at.0, at.1)
                 };
                 match v {
-                    V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { .. }) => self.bind_at(p, (at, off))?,
-                    v => self.bind_value(p, v)?,
+                    V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { .. }) => {
+                        self.bind_at(p, (at, off))?;
+                        self.own_pat(p)?;
+                    }
+                    // walk/matches/irrefutable.rs `bind_param`: binds and owns.
+                    v => {
+                        let g = self.ground_in(sig.types, sig.inputs[i]).map_err(sig_err)?;
+                        self.bind_param(p, v, g)?
+                    }
                 }
-                self.own_pat(p)?;
                 continue;
             }
             // The caller's copy (or the one a C parameter's registers are written to) is the
             // callee's to keep: a binding lives in it.
             match self.take_passed(repr, passes[i], &mut next)? {
-                V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { .. }) => self.bind_at(p, (at, off))?,
-                v => self.bind_value(p, v)?,
+                V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { .. }) => {
+                    self.bind_at(p, (at, off))?;
+                    self.own_pat(p)?;
+                }
+                v => {
+                    // The parameter's own type: a pattern that peels a reference
+                    // (`fn f(Foo { a }: &Foo)`) is recorded at the peeled one. Bound and
+                    // owned by walk/matches/irrefutable.rs `bind_param` (`_: String` too).
+                    let g = self.ground_in(sig.types, sig.inputs[i]).map_err(sig_err)?;
+                    self.bind_param(p, v, g)?
+                }
             }
-            self.own_pat(p)?;
         }
         self.walk_root()
     }
@@ -2895,34 +2998,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// The lowered signature of passes `inputs` and `ret`: a result pointer first (Rust's plain
     /// pointer, C's `sret`), then each input's registers.
     fn sig_of(&self, inputs: &[Pass], ret: Pass) -> (Vec<Param, A>, Vec<Param, A>) {
-        let mut params = Vec::with_capacity_in(inputs.len() + 1, self.alloc.clone());
-        let mut rets = Vec::with_capacity_in(2, self.alloc.clone());
-        let memory = |kind, size, align| Param { kind, facts: Facts { size, align, ..Param::of(Ty::PTR).facts }, ..Param::of(Ty::PTR) };
-        match ret {
-            Pass::Ignore => {}
-            Pass::Ref => params.push(Param::of(Ty::PTR)),
-            Pass::Memory { size, align } => params.push(memory(ParamKind::Sret, size, align)),
-            Pass::Scalar { ty, ext, .. } => rets.push(Param { ext, ..Param::of(ty) }),
-            Pass::Words { size } => {
-                for _ in 0..size.div_ceil(8) {
-                    rets.push(Param::of(Ty::I64));
-                }
-            }
-        }
-        for &p in inputs {
-            match p {
-                Pass::Ignore => {}
-                Pass::Ref => params.push(Param::of(Ty::PTR)),
-                Pass::Memory { size, align } => params.push(memory(ParamKind::Byval, size, align)),
-                Pass::Scalar { ty, ext, .. } => params.push(Param { ext, ..Param::of(ty) }),
-                Pass::Words { size } => {
-                    for _ in 0..size.div_ceil(8) {
-                        params.push(Param::of(Ty::I64));
-                    }
-                }
-            }
-        }
-        (params, rets)
+        crate::abi::sig_of_in(inputs, ret, self.alloc.clone())
     }
 
     /// The `size` (1 to 8) bytes at `at`, `start` bytes into a value aligned to `align`, as a
@@ -3175,6 +3251,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Task::TempEnd => self.temp_end()?,
             Task::TempScopeEnd(e) => self.temp_close(e)?,
             Task::PushNone => self.push_val(V::None, None),
+            // The same answer `stmt` had: `v` is the initializer as a scrutinee, owned with its
+            // parts (walk/matches/irrefutable.rs `let_owns_parts`); the bindings own themselves.
+            Task::Let(p, Some(init)) if self.let_owns_parts(p, init)? => {
+                let v = self.pop()?;
+                let from = self.bind_let_owned(p, init, v)?;
+                self.place_super_let(p, from)?;
+            }
             Task::Let(p, init) => {
                 let v = self.pop()?;
                 // The same answer `stmt` had: `v` is the initializer's place (walk/matches/ref_bind.rs).
@@ -3190,7 +3273,16 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 match fresh {
                     Some(at) => self.bind_at(p, at)?,
                     None if borrows => self.bind_let_place(p, v)?,
-                    None => self.bind_value(p, v)?,
+                    // The initializer's own type: a pattern that peels a reference is recorded
+                    // at the peeled one (`bind_value_of`).
+                    None => match init {
+                        Some(e) => {
+                            let t = self.adjusted_ty(e)?;
+                            let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
+                            self.bind_value_of(p, v, g)?
+                        }
+                        None => self.bind_value(p, v)?,
+                    },
                 }
                 let from = self.scope_pats.len();
                 self.own_pat(p)?;
@@ -3446,7 +3538,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let l = self.scalar(l, ty)?;
                 let rty = rrepr.scalar().ok_or(unsupported(e, "a compound assignment of a non-scalar"))?;
                 let r = self.scalar(r, rty)?;
-                let x = self.arith(e, op, l, r, lrepr, rrepr)?;
+                // The Reference, "Compound assignment expressions": for primitive types `a op= b`
+                // is `a = a op b` once, so a float's is its IEEE operator (walk/numbers.rs), as
+                // core's `impl DivAssign for f32` (`*self /= other`) needs.
+                let x = match lrepr {
+                    Repr::Float(_) => self.float_binary(e, op, l, r)?,
+                    _ => self.arith(e, op, l, r, lrepr, rrepr)?,
+                };
                 self.store(V::Scalar(x), lrepr, (p, off))?;
                 self.push_val(V::None, None);
             }
@@ -3458,6 +3556,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 };
                 self.store(v, repr, (p, at + off as i32))?;
             }
+            Task::StructBase(e) => self.struct_update_base(e)?,
+            Task::InitDefaults(e) => self.init_defaults(e)?,
             // A field of an unsized place: of a struct ending in a slice or `str`, reached
             // through its wide pointer (walk/unsized_tail.rs).
             Task::Field(e) | Task::FieldPlace(e) if matches!(self.vals.last(), Some(V::Unsized(..))) => {
@@ -3668,8 +3768,20 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let g_arg =self.ground.intern(PNode::Ref(m, g_self)).map_err(|_| malformed("the ground table is full"))?;
         let g_ret = self.ground.intern(PNode::Ref(m, g_target)).map_err(|_| malformed("the ground table is full"))?;
         let arepr = self.repr(g_arg).map_err(|error| Self::ty_err(e, error))?;
-        if arepr != Repr::Ptr {
-            return Err(unsupported(e, "an overloaded dereference of an unsized `Self`"));
+        // An unsized `Self` (`struct Bytes([u8])` with `impl Deref for Bytes`, winnow's
+        // `SliceLen for &Bytes`): `&Self` is a wide pointer, an aggregate, on top as the place of
+        // its memory (`Task::Ref` of the unsized place, or the loaded pointer of the step
+        // before). It is passed as every aggregate argument is, from the caller's own copy
+        // (`Task::ArgCopy`'s rule), so the callee's parameter is never the place it came from.
+        match arepr {
+            Repr::Ptr => {}
+            Repr::Agg(_) => {
+                let v = self.pop()?;
+                let at = self.temp(arepr);
+                self.store(v, arepr, at)?;
+                self.push_val(V::Place(at.0, at.1), None);
+            }
+            _ => return Err(malformed("a reference to a `Deref` `Self` that is neither a thin nor a wide pointer")),
         }
         // A wide `rrepr` (an aggregate) comes back as `V::Place` of its temporary: the memory
         // `DerefPlace` keeps as the unsized place (`take_passed`, every aggregate pass).
@@ -3678,9 +3790,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let apass = self.pass(g_arg, arepr, abi, Some(item))?;
         let rpass = self.pass(g_ret, rrepr, abi, Some(item))?;
         let args = self.ground.intern_list(&[g_self]).map_err(|_| malformed("the ground table is full"))?;
-        let place = self.ref_place(Instance { item, args });
-        let reference = self.b.reference(RefKind::Func, place);
-        self.emit_call(Callee::Direct(reference), &[arepr], &[apass], rrepr, rpass)
+        self.call_instance(Some(e), Instance { item, args }, &[arepr], &[apass], None, rrepr, rpass)
     }
 
     /// Applies `e`'s adjustments from its `from`th on, all coercions, to the value on top, in
@@ -3724,7 +3834,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     let PNode::FnDef(item, args) = self.node_at(e, before)? else {
                         return Err(malformed("a fn pointer made of other than a fn item"));
                     };
-                    let p = self.fn_addr(Instance { item, args });
+                    let p = self.reify_addr(e, Instance { item, args })?;
                     self.push_val(V::Scalar(p), None);
                 }
                 AdjustKind::Unsize => self.unsize(e, n)?,
@@ -3832,9 +3942,14 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
         let rows = self.adjust_rows(base);
         let kinds = &self.checked.adjusts.column::<1>()[rows];
-        // A struct's slice tail (`p.body[i]`, `body: [u8]` last): its place is an unsized
-        // place, held as its wide pointer (walk/unsized_tail.rs).
-        if kinds.is_empty() && matches!(self.expr(base)?, Expr::Field { .. } | Expr::TupleField { .. }) {
+        // A slice place written out with no adjustment: a struct's slice tail (`p.body[i]`,
+        // `body: [u8]` last; walk/unsized_tail.rs), or an explicit dereference of a wide pointer
+        // (`(*slice)[i]` with `slice: &mut [T]`, core's `SliceIndex<[T]> for usize`). An
+        // unsized type is never a value, so the base is a place expression (the Reference,
+        // "Index expressions": "For other types an index expression `a[b]` is equivalent to
+        // `*std::ops::Index::index(&a, b)`" applies only past the builtin `[T]`), and its place
+        // is held as its wide pointer (`V::Unsized`).
+        if kinds.is_empty() && self.is_place_expr(base)? {
             self.work.push(Task::Place(base));
             return Ok(());
         }
@@ -3890,14 +4005,16 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let inside = self.b.icmp(IntCond::Ult, i, n);
         self.br(inside, (ok, &[]), (fail, &[]));
         self.begin(fail);
-        let place = self.ref_place(Instance { item: bounds, args: List::EMPTY });
-        let reference = self.b.reference(RefKind::Func, place);
+        let callee = Instance { item: bounds, args: List::EMPTY };
         let usize_ = Param::of(Ty::I64);
-        let sig = self.b.sig(Conv::C, Variadic::No, &[usize_, usize_], &[]);
+        // core's `panic_bounds_check` is `#[track_caller]`: the location is passed last.
+        let (sig, values) = self.lang_call_sig(Some(e), callee, &[usize_, usize_], &[i, n])?;
+        let place = self.ref_place(callee);
+        let reference = self.b.reference(RefKind::Func, place);
         // In this block `i` and `n` are the values the branch compared. The panic may unwind:
         // called as every unwinding call is, so the live values are dropped on the way out
         // (walk/unwind.rs; the Reference, "Panic": unwinding runs destructors).
-        self.call_unwinding(Callee::Direct(reference), sig, &[i, n])?;
+        self.call_unwinding(Callee::Direct(reference), sig, &values)?;
         self.b.unreachable();
         self.begin(ok);
         let (stride, _) = self.size_align(elem);
@@ -3993,9 +4110,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
         let rrepr = self.repr(g_ret).map_err(|error| Self::ty_err(e, error))?;
         let rpass = self.pass(g_ret, rrepr, abi, Some(item))?;
-        let place = self.ref_place(Instance { item, args });
-        let reference = self.b.reference(RefKind::Func, place);
-        self.emit_call(Callee::Direct(reference), &reprs, &passes, rrepr, rpass)
+        self.call_instance(Some(e), Instance { item, args }, &reprs, &passes, None, rrepr, rpass)
     }
 
     /// Intrinsic call `e`, its arguments on top (lib.rs, "Intrinsics").
@@ -4008,10 +4123,6 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             // generic float function (walk/target_intr.rs).
             Intrinsic::Target(t) => return self.target_intrinsic(e, list, t),
         };
-        // No site is passed: a `#[track_caller]` location is not built.
-        if which == Which::CallerLocation {
-            return Err(BuildError::Intrinsic { expr: e, which, why: "`caller_location` (a `#[track_caller]` site)", unsupported: true });
-        }
         // The generic arguments, grounded: a type stays a type; a const argument is a
         // `ConstValue` (portable.rs) and reaches `build` as its value (intrinsics.rs, "The
         // seam"): a `bool`, integer or `char` as its bits; a fieldless enum's value (under
@@ -4074,6 +4185,15 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             let at = self.adjusted_ty(a)?;
             let g = self.ground_ty(at).map_err(|error| Self::ty_err(a, error))?;
             let repr = self.repr_at(a, at)?;
+            // `simd_shuffle`'s indices ("`U` must be a **const** vector of `u32`s", stdarch's
+            // `const { SimdShuffleIdx(..) }`): the address of the constant's own data row, which
+            // intrinsics/simd_vec.rs reads them from, never the copy the operand was built as.
+            if which == Which::Simd(intrinsics::simd::SimdOp::Shuffle) && i == 2 {
+                if let Some(row) = self.const_operand_row(a)? {
+                    cargs.push(Arg::Place(row));
+                    continue;
+                }
+            }
             cargs.push(match repr {
                 Repr::None => Arg::None,
                 Repr::Agg(_) => {
@@ -4098,7 +4218,16 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             _ => false,
         };
         let needs_drop = move |_: PTy| answer;
-        let call = Call { which, generics: &generics, args: &cargs, ret, site: None };
+        // `caller_location`: the location this fn was passed, or one of this call's place
+        // (walk/track_caller.rs); its result is `&'static Location<'static>`.
+        let site = match which {
+            Which::CallerLocation => match self.ground_node(ret).map_err(|error| Self::ty_err(e, error))? {
+                PNode::Ref(_, loc_ty) => Some((self.caller_location_site(e)?, loc_ty)),
+                _ => return Err(BuildError::Intrinsic { expr: e, which, why: "`caller_location` whose result is not a reference", unsupported: false }),
+            },
+            _ => None,
+        };
+        let call = Call { which, generics: &generics, args: &cargs, ret, site };
         let adts = self.adts;
         let built = {
             let mut lcx = LayoutCx { ground: &mut *self.ground, facts: adts.facts(), scratch: self.scratch };
@@ -4168,6 +4297,30 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         self.const_record_value(e, record)
     }
 
+    /// The value of const generic parameter `index` of the body's item, named by path `e` (the
+    /// Reference, "Const generics": "const parameters may be used ... as a standalone
+    /// expression"; core's `as_chunks::<N>` reads `N != 0`). It is the instance's argument at
+    /// that index, a `ConstValue` of the ground table: a `bool`, integer or `char` is its bits
+    /// as a scalar constant. A fieldless enum's value (`adt_const_params`) is refused by name.
+    fn const_param_value(&mut self, e: ExprId, index: u32) -> Result<V, BuildError> {
+        let g = *self.args.get(index as usize).ok_or(malformed("a const parameter past the instance's arguments"))?;
+        let PNode::ConstValue { bits, .. } = self.ground_node(g).map_err(|error| Self::ty_err(e, error))? else {
+            return Err(malformed("a const parameter's argument that is not a value in the ground table"));
+        };
+        match self.expr_repr(e)? {
+            Repr::None => Ok(V::None),
+            Repr::Agg(_) => Err(unsupported(e, "a const generic parameter of an enum type (`adt_const_params`) as a value")),
+            scalar => {
+                let ty = scalar.scalar().ok_or(malformed("a scalar of no type"))?;
+                // The bits past the type's width are 0 (`const_scalar`): a negative value
+                // written sign-extended is cut to the type.
+                let width = ty.bits(PTR_BITS);
+                let value = if width >= 128 { bits } else { bits & ((1u128 << width) - 1) };
+                Ok(V::Scalar(self.const_scalar(ty, value)?))
+            }
+        }
+    }
+
     /// The generic arguments the check recorded for constant path `e`, grounded at this
     /// instance's arguments (as [`Self::method_callee`] grounds a callee's); empty for a path
     /// with no row (a constant with no generics).
@@ -4183,15 +4336,47 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         Ok(grounded)
     }
 
+    /// The address of the data row of the constant operand `e` (parentheses peeled): a
+    /// `const { .. }` block's record or a constant path's, as `Expr::ConstBlock` and
+    /// [`Self::const_value`] read them. `None` for any other expression.
+    fn const_operand_row(&mut self, e: ExprId) -> Result<Option<Value>, BuildError> {
+        let mut x = e;
+        while let Expr::Paren(inner) = self.expr(x)? {
+            x = inner;
+        }
+        let adts = self.adts;
+        let record = match self.expr(x)? {
+            Expr::ConstBlock { .. } => {
+                let owner = self.body.owner;
+                adts.const_block_value(owner, x, self.args).ok_or(BuildError::NoConstBlockValue { expr: x, owner })?
+            }
+            Expr::Path(_) => match self.expr_def(x) {
+                Some(Def::Const(item)) => {
+                    let args = self.const_path_args(x)?;
+                    adts.const_value(item, &args[..]).ok_or(BuildError::NoConstValue { expr: x, item })?
+                }
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        Ok(Some(self.data_rows(x, record, &[])?))
+    }
+
     /// The value of expression `e` from evaluated record `record` (lib.rs, "Consts"): a constant
     /// path's or a `const { .. }` block's (one home for both): a scalar is a constant of the
     /// root's bytes, little-endian at the type's width; anything else is the place of the root's
     /// data row, its relocations to the record's other allocations (each a data row of its own),
     /// to statics and to fns.
     fn const_record_value(&mut self, e: ExprId, record: &DataRecord<Global>) -> Result<V, BuildError> {
+        let repr = self.expr_repr(e)?;
+        self.const_record_value_as(e, repr, record)
+    }
+
+    /// [`Self::const_record_value`] of a value held as `repr` (a field default's, the field's
+    /// representation), read for expression `e`.
+    fn const_record_value_as(&mut self, e: ExprId, repr: Repr, record: &DataRecord<Global>) -> Result<V, BuildError> {
         let bad = |why| BuildError::Malformed { what: why };
         record.check().map_err(|_| bad("a const's record that breaks the data form"))?;
-        let repr = self.expr_repr(e)?;
         let root = record.allocs.first().ok_or(bad("a const's record with no allocation"))?;
         match repr {
             Repr::None => return Ok(V::None),
@@ -4200,7 +4385,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let ty = scalar.scalar().ok_or(malformed("a scalar of no type"))?;
                 if !root.relocs.is_empty() {
                     // A pointer to data: the root's own row holds it, read as any place.
-                    let at = self.const_rows(e, record)?;
+                    let at = self.data_rows(e, record, &[])?;
                     return Ok(self.load(scalar, (at, 0)));
                 }
                 let width = (ty.bits(PTR_BITS) / 8) as usize;
@@ -4212,81 +4397,47 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 return Ok(V::Scalar(self.const_scalar(ty, value)?));
             }
         }
-        let at = self.const_rows(e, record)?;
+        let at = self.data_rows(e, record, &[])?;
         // A copy, as any use of a const is a fresh value: its row is never written.
         let to = self.temp(repr);
         self.copy(repr, (at, 0), to)?;
         Ok(V::Place(to.0, to.1))
     }
 
-    /// Each allocation of `record` as a data row of the function, its relocations resolved;
-    /// returns the root's address. Rows are made targets first, by an explicit stack; a cycle
-    /// among the allocations is refused.
-    fn const_rows(&mut self, e: ExprId, record: &DataRecord<Global>) -> Result<Value, BuildError> {
-        const TODO: u8 = 0;
-        const OPEN: u8 = 1;
-        let n = record.allocs.len();
-        let mut state = Vec::with_capacity_in(n, self.alloc.clone());
-        state.resize(n, TODO);
-        let mut rows: Vec<Option<RefId>, A> = Vec::with_capacity_in(n, self.alloc.clone());
-        rows.resize(n, None);
-        let mut stack = Vec::new_in(self.alloc.clone());
-        stack.push(0usize);
-        let mut relocs = Vec::new_in(self.alloc.clone());
-        while let Some(&k) = stack.last() {
-            if rows[k].is_some() {
-                stack.pop();
-                continue;
+    /// `Task::InitDefaults(e)`: the place of base-less struct expression `e` (RFC 3681) on
+    /// top, its written fields stored. Each field it does not write (`Checked::default_fields`)
+    /// is stored from its default: a constant over the ADT's generics, whose value at the
+    /// expression's type's ground arguments was pulled before the walk (front2 const_at.rs
+    /// `needs_of`) and is read as a constant path's is ([`Adts::const_value`]).
+    fn init_defaults(&mut self, e: ExprId) -> Result<(), BuildError> {
+        let Some(&V::Place(p, at)) = self.vals.last() else {
+            return Err(malformed("a struct expression's defaults without its place"));
+        };
+        let Repr::Agg(l) = self.expr_repr(e)? else {
+            return Err(malformed("a struct expression's defaults of a value held as other than an aggregate"));
+        };
+        let variant = Self::def_variant(self.expr_def(e)).ok_or(malformed("a struct literal the check did not resolve to a struct or variant"))?;
+        let (first, len, _) = self.variant_rows(l, variant)?;
+        let t = self.expr_ty(e)?;
+        let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
+        let PNode::Adt(_, list) = self.ground_node(g).map_err(|error| Self::ty_err(e, error))? else {
+            return Err(malformed("a struct expression with defaults of a type that is not an ADT"));
+        };
+        let mut args: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        args.extend_from_slice(self.ground.view().list(list).map_err(|_| malformed("an ADT's arguments past the ground table"))?);
+        let checked: &'x Checked<'c> = self.checked;
+        let adts = self.adts;
+        let (idx, keys) = checked.default_fields_of(e);
+        for (&i, &key) in idx.iter().zip(keys.iter()) {
+            if i >= len {
+                return Err(malformed("a field default past its variant's fields"));
             }
-            let a = &record.allocs[k];
-            if state[k] == TODO {
-                state[k] = OPEN;
-                for r in a.relocs.iter() {
-                    if let DataTarget::Local(t) = r.target {
-                        let t = t as usize;
-                        match (rows.get(t), state.get(t)) {
-                            (Some(Some(_)), _) => {}
-                            (Some(None), Some(&OPEN)) => {
-                                return Err(unsupported(e, "a const whose allocations point at each other in a cycle"));
-                            }
-                            (Some(None), _) => stack.push(t),
-                            (None, _) => return Err(malformed("a const's relocation to an allocation past its record")),
-                        }
-                    }
-                }
-                continue;
-            }
-            // Every local target is made: this allocation's row.
-            relocs.clear();
-            for r in a.relocs.iter() {
-                let off = r.offset as usize;
-                let word = a.bytes.get(off..off + 8).ok_or(malformed("a const's relocation past its bytes"))?;
-                let addend = i64::from_le_bytes(word.try_into().map_err(|_| malformed("a relocation word not of 8 bytes"))?);
-                let target = match r.target {
-                    DataTarget::Local(t) => rows[t as usize].ok_or(malformed("a const's row made before its target"))?,
-                    DataTarget::Static(s) => {
-                        let place = self.static_place(s, false)?;
-                        self.b.reference(RefKind::Static, place)
-                    }
-                    DataTarget::Fn(_) => return Err(unsupported(e, "a const holding a fn pointer (its instance is not a reference of this function)")),
-                    DataTarget::Vtable(_) => return Err(unsupported(e, "a const holding a `&dyn Trait` (its vtable is not a reference of this function)")),
-                };
-                relocs.push(DataReloc { offset: r.offset, target, addend });
-            }
-            let mut bytes = Vec::with_capacity_in(a.bytes.len(), self.alloc.clone());
-            bytes.extend_from_slice(&a.bytes);
-            // The word's addend is in the relocation: the row's bytes hold zero there.
-            for r in relocs.iter() {
-                bytes[r.offset as usize..r.offset as usize + 8].fill(0);
-            }
-            if a.mutable {
-                return Err(unsupported(e, "a const with a mutable allocation"));
-            }
-            rows[k] = Some(self.b.data(&bytes, u32::from(a.align), &relocs));
-            stack.pop();
+            let (_, off, frepr) = self.layout_fields[(first + i) as usize];
+            let record = adts.const_value(key, &args[..]).ok_or(BuildError::NoConstValue { expr: e, item: key })?;
+            let v = self.const_record_value_as(e, frepr, record)?;
+            self.store(v, frepr, (p, at + off as i32))?;
         }
-        let root = rows[0].ok_or(malformed("a const's root row not made"))?;
-        Ok(self.b.data_addr(root))
+        Ok(())
     }
 
     /// The address of the static path `e` names (lib.rs, "Statics"): `data_addr` of its
@@ -4477,17 +4628,20 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 // value (walk/matches/ref_bind.rs).
                 if self.let_borrows_place(pat, init)? {
                     self.work.push(Task::Place(init));
+                } else if self.let_owns_parts(pat, init)? {
+                    // A pattern leaving a part that needs drop unbound (`let (a, _) = pair;`):
+                    // the initializer as a scrutinee, a local in place (walk/lets.rs
+                    // `push_scrutinee`; walk/matches/irrefutable.rs `bind_let_owned`).
+                    self.push_scrutinee(init)?;
                 } else {
                     self.work.push(Task::Eval(init));
                 }
             }
+            // `let x;`, `let (a, b);`: walk/matches/irrefutable.rs `declare_let`.
             Stmt::Let { pat, init: None, else_: None, .. } => {
-                if !matches!(self.pat(pat)?, Pat::Wild) {
-                    self.bind(pat)?;
-                    let from = self.scope_pats.len();
-                    self.own(pat, false)?;
-                    self.place_super_let(pat, from)?;
-                }
+                let from = self.scope_pats.len();
+                self.declare_let(pat)?;
+                self.place_super_let(pat, from)?;
             }
             // An expression statement's value is a temporary dropped at its end.
             Stmt::Expr { expr, .. } => {
@@ -4519,6 +4673,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     (PNode::FnDef(..), _) => self.push_val(V::None, None),
                     (_, Some(Def::Const(item))) => {
                         let v = self.const_value(e, item)?;
+                        self.push_val(v, None);
+                    }
+                    // A const generic parameter: the instance's argument.
+                    (_, Some(Def::TyParam(index))) => {
+                        let v = self.const_param_value(e, index)?;
                         self.push_val(v, None);
                     }
                     // A static by value: a copy read from its memory.
@@ -4734,8 +4893,14 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     }
                     return Ok(());
                 }
+                // A `#[rustc_legacy_const_generics]` argument is the callee's const generic, not a
+                // value it is passed (`Self::legacy_listed`).
+                let listed = self.legacy_listed(callee, item, list.len())?;
                 self.work.push(Task::Call(e));
-                for &a in list.iter().rev() {
+                for (k, &a) in list.iter().enumerate().rev() {
+                    if listed.contains(&(k as u32)) {
+                        continue;
+                    }
                     // An aggregate argument gets its caller's copy at once, before the next
                     // argument runs.
                     if let Repr::Agg(_) = self.adjusted_repr(a)? {
@@ -4843,8 +5008,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.work.push(Task::Cast(e));
                 self.work.push(Task::Eval(operand));
             }
-            Expr::Struct { base: Some(_), .. } => return Err(unsupported(e, "a struct update (`..base`)")),
-            Expr::Struct { fields, base: None, .. } => {
+            Expr::Struct { base: blaze_typeck::StructBase::Expr(_), .. } => self.struct_update(e)?,
+            // `S { a: 1, .. }` (RFC 3681) is built as `S { a: 1, b: B_DEFAULT }` would be: the
+            // written fields in written order, then each unwritten field from its default's
+            // value at this instance (`Task::InitDefaults`: `Checked::default_fields`, each a
+            // constant pulled before the walk by front2 const_at.rs `needs_of`).
+            Expr::Struct { fields, base: base @ (blaze_typeck::StructBase::None | blaze_typeck::StructBase::Defaults), .. } => {
+                let defaults = base == blaze_typeck::StructBase::Defaults;
                 let repr = self.expr_repr(e)?;
                 let inits = self.body.field_inits.get(fields.range()).ok_or(malformed("a struct literal's fields past `field_inits`"))?;
                 match repr {
@@ -4862,7 +5032,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         let (first, len, tag) = self.variant_rows(l, variant)?;
                         // A union literal names exactly one field (the reference, "Unions").
                         let named = if self.layouts[l as usize].is_union { 1 } else { len as usize };
-                        if inits.len() != named {
+                        // With defaults: the fields written and those taken from defaults.
+                        let taken = if defaults { self.checked.default_fields_of(e).0.len() } else { 0 };
+                        if inits.len() + taken != named {
                             return Err(malformed("a struct literal that does not name every field, or a union literal not one"));
                         }
                         let at = self.temp(repr);
@@ -4871,6 +5043,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         // when a stored field may need drop (walk/val_stack.rs).
                         let parts = Self::literal_place(self.fields_need_drop(first, len));
                         self.push_val(V::Place(at.0, at.1), parts);
+                        // Runs last: the defaults are constants, stored once every written
+                        // field's expression has run (as their operands are in MIR).
+                        if defaults {
+                            self.work.push(Task::InitDefaults(e));
+                        }
                         for init in inits.iter().rev() {
                             let row = (first..first + len)
                                 .find(|&i| self.layout_fields[i as usize].0 == init.name)
@@ -5140,6 +5317,37 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
     }
 
+    /// The positions of the arguments of call `callee(..)` (`n` of them, of fn item `item`)
+    /// that are the callee's own const generic arguments under
+    /// `#[rustc_legacy_const_generics(i, ..)]` (`Adts::legacy_const_generics`): the checker's
+    /// test (blaze-typeck rules/legacy_const.rs `legacy_sig`) on the callee as written, a path
+    /// with no qualified-self anchor and no lang item, naming `item` itself, whose last segment
+    /// writes no generic arguments, with every listed position below `n`. Empty when the rule
+    /// does not apply: the call then passes every argument. A listed argument is a constant
+    /// (a literal, a const parameter, a constant item), so leaving it unevaluated drops no
+    /// effect.
+    fn legacy_listed(&self, callee: ExprId, item: ItemKey, n: usize) -> Result<&'x [u32], BuildError> {
+        let adts: &'x dyn Adts = self.adts;
+        let listed = adts.legacy_const_generics(item);
+        if listed.is_empty() {
+            return Ok(&[]);
+        }
+        let Expr::Path(p) = self.expr(callee)? else { return Ok(&[]) };
+        let path = *self.body.paths.get(p.0 as usize).ok_or(malformed("a callee's path past `paths`"))?;
+        if path.anchor.is_some() || path.lang.is_some() || self.expr_def(callee) != Some(Def::Fn(item)) {
+            return Ok(&[]);
+        }
+        let segs = self.body.segments.get(path.segments.range()).ok_or(malformed("a callee's path segments past `segments`"))?;
+        match segs.last() {
+            Some(last) if !last.has_args => {}
+            _ => return Ok(&[]),
+        }
+        if listed.iter().any(|&i| i as usize >= n) {
+            return Ok(&[]);
+        }
+        Ok(listed)
+    }
+
     fn call(&mut self, e: ExprId) -> Result<(), BuildError> {
         // The arguments in order (a method's receiver first) and the callee instance: its item
         // and its call's arguments, grounded at this instance's.
@@ -5153,7 +5361,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let t = self.adjusted_ty(callee)?;
                 match self.node_at(callee, t)? {
                     PNode::FnDef(item, args) => {
-                        list.extend_from_slice(written);
+                        // Only the value arguments: the listed ones were not evaluated (`expr`'s
+                        // `Expr::Call` arm), they are in `args` as const generics.
+                        let listed = self.legacy_listed(callee, item, written.len())?;
+                        list.extend(written.iter().enumerate().filter(|&(k, _)| !listed.contains(&(k as u32))).map(|(_, &a)| a));
                         Instance { item, args }
                     }
                     PNode::FnPtr(_, header) => {
@@ -5180,10 +5391,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             _ => return Err(malformed("a call task on another expression")),
         };
         if let Some((_, slot)) = self.dyn_slot(e, instance)? {
-            if !overloaded && self.adts.abi(instance.item) == Some(Abi::RustCall) {
-                return Err(unsupported(e, "a \"rust-call\" method of a trait object called with its tuple written whole (not spread yet)"));
-            }
-            return self.dyn_call(e, instance, &list, slot);
+            self.refuse_tracked_slot(e, instance)?;
+            // A "rust-call" method called with its tuple written whole (`(**self).call_mut(args)`
+            // in core's `impl FnMut<A> for &mut F` at `F = dyn FnMut(..)`): the slot's fn takes
+            // the tuple's fields apart, as a direct call does (`spread_tuple`).
+            let spread = !overloaded && self.adts.abi(instance.item) == Some(Abi::RustCall);
+            return self.dyn_call(e, instance, &list, slot, spread);
         }
         let item = instance.item;
         let abi = self.adts.abi(item).ok_or(BuildError::NoAbi { item })?;
@@ -5212,9 +5425,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let g = self.ground_ty(ty).map_err(|error| Self::ty_err(e, error))?;
         let rrepr = self.repr_at(e, ty)?;
         let rpass = self.pass(g, rrepr, abi, Some(item))?;
-        let place = self.ref_place(instance);
-        let reference = self.b.reference(RefKind::Func, place);
-        self.emit_call_from(Callee::Direct(reference), &reprs, &passes, declared, rrepr, rpass)?;
+        self.call_instance(Some(e), instance, &reprs, &passes, declared, rrepr, rpass)?;
         if let PNode::Never = self.node_at(e, ty)? {
             self.pop_val();
             self.b.unreachable();
@@ -5269,8 +5480,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// receiver, a wide pointer, is the `list.len()`-th value from the top; `f = load [vtable +
     /// 8 * (3 + slot)]`, then `f(data, args..)`. The callee is the impl's method at the concrete
     /// type, so the receiver is passed in its thin form (`DispatchFromDyn`): `&self` and `&mut
-    /// self` as a pointer, `self: Box<Self>` as a `Box` of a sized type.
-    fn dyn_call(&mut self, e: ExprId, instance: Instance, list: &[ExprId], slot: u32) -> Result<(), BuildError> {
+    /// self` as a pointer, `self: Box<Self>` as a `Box` of a sized type. With `spread`, the
+    /// last argument is a "rust-call" method's tuple written whole, passed as its fields.
+    fn dyn_call(&mut self, e: ExprId, instance: Instance, list: &[ExprId], slot: u32, spread: bool) -> Result<(), BuildError> {
         let item = instance.item;
         let abi = self.adts.abi(item).ok_or(BuildError::NoAbi { item })?;
         let n = list.len();
@@ -5293,6 +5505,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let rrepr = self.repr_at(e, ty)?;
         let rpass = self.pass(g, rrepr, abi, Some(item))?;
         let at = self.vals.len().checked_sub(n).ok_or(malformed("a dynamic call's receiver missing from the value stack (a build bug)"))?;
+        if spread {
+            if n < 2 {
+                return Err(malformed("a \"rust-call\" method of a trait object called without its tuple of arguments"));
+            }
+            self.spread_tuple(&mut reprs, &mut passes)?;
+        }
         let v = core::mem::replace(&mut self.vals[at], V::None);
         let place = self.place(v, wide)?;
         let data = self.load(Repr::Ptr, place);
@@ -5539,7 +5757,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 }
             }
             let v = self.load(repr, part);
-            self.bind_value(sub, v)?;
+            // The field's own type: a subpattern that peels a reference field
+            // (`Some(Foo { a })` over `Option<&Foo>`) is recorded at the peeled one.
+            let g = self.layout_field_tys[row];
+            self.bind_value_of(sub, v, g)?;
             self.own_pat(sub)?;
         }
         Ok(moved)

@@ -29,17 +29,25 @@ use bstd::cx::Cx;
 use crate::CliError;
 use crate::work::{Did, Made, held_str};
 
-const SUBJECT_DOMAIN: &str = "blaze-cli build-script module subject 1";
+use crate::scripts::RanAs;
+
+// "2": the subject holds the run's placement (a native script's record is a host binary,
+// `target <host>` in its identity and `bin-sha256` its digest; tempo 2026-11-17: libproc,
+// reth-mdbx-sys and librocksdb-sys, placed native, were looked up as wasm modules and refused
+// while their native records stood in the store).
+const SUBJECT_DOMAIN: &str = "blaze-cli build-script module subject 2";
 const SOURCE_DOMAIN: &str = "blaze-cli build-script module source 1";
-const OUT_DOMAIN: &str = "blaze-cli build-script module out 1";
+const OUT_DOMAIN: &str = "blaze-cli build-script module out 2";
 
 /// The rule a lookup's failure names.
 pub(crate) const RULE: &str = "script_modules.rs";
 
-/// What a build script's module is named by: the script unit's package, version and features
-/// (sorted and without repeats, as the graph holds them), each field length-prefixed.
-pub(crate) fn subject(package: &str, version: &str, features: &[&str]) -> ContentId {
+/// What a build script's module is named by: the run's placement (D112: a wasm module or a
+/// host binary), the script unit's package, version and features (sorted and without repeats,
+/// as the graph holds them), each field length-prefixed.
+pub(crate) fn subject(ran_as: RanAs, package: &str, version: &str, features: &[&str]) -> ContentId {
     let mut text = std::vec::Vec::new_in(std::alloc::Global);
+    text.push(ran_as as u8);
     for field in [package, version].into_iter().chain(features.iter().copied()) {
         text.extend_from_slice(&(field.len() as u64).to_le_bytes());
         text.extend_from_slice(field.as_bytes());
@@ -67,20 +75,26 @@ pub(crate) fn part_source(graph_source: ContentId, subject: ContentId) -> Conten
 pub(crate) struct ScriptModule {
     pub subject: ContentId,
     pub crate_at: usize,
+    pub ran_as: RanAs,
     pub package: &'static str,
     pub version: &'static str,
     pub features: std::vec::Vec<&'static str, std::alloc::Global>,
 }
 
-/// What one lookup is for: the script unit's package, version and features.
+/// What one lookup is for: the run's placement and the script unit's package, version and
+/// features.
 pub(crate) struct Wanted<'w> {
+    pub ran_as: RanAs,
     pub package: &'w str,
     pub version: &'w str,
     pub features: &'w [&'w str],
 }
 
 /// One build-script module lookup: the record `<home>/.blaze/v2/build-script/modules/<key>`
-/// whose identity names `wanted`, its out the module's `wasm-sha256`.
+/// whose identity names `wanted`: for a wasm run a module (no `target` line), its out the
+/// module's `wasm-sha256`; for a native run (D112) the host binary built for the pinned host
+/// (`target <host>`), its out the binary's `bin-sha256`. The same record the `Script` run
+/// then reads (blaze-proc-macro `script_unit::prepare` or `native_unit::native_outputs`).
 pub(crate) fn run<'b>(cx: &Cx, home: Option<&str>, wanted: Wanted<'_>, task: &Task<'_>, held: &'b bstd::mem::Frame) -> Result<Did<'b>, CliError> {
     let _cx = cx.span("script module: look the module up");
     let name = task.name;
@@ -89,19 +103,43 @@ pub(crate) fn run<'b>(cx: &Cx, home: Option<&str>, wanted: Wanted<'_>, task: &Ta
         return Ok(Did::Hole(refused("no home: the module store is under it"), "the build-script module store is under the home, and HOME is not set"));
     };
     let store = std::path::Path::new(home).join(".blaze/v2");
-    let Wanted { package, version, features } = wanted;
-    let Some(record) = blaze_proc_macro::script_unit::module_of(&store, package, version, features) else {
+    let Wanted { ran_as, package, version, features } = wanted;
+    let host = crate::graph::TRIPLE;
+    let (found, digest_file) = match ran_as {
+        RanAs::Wasm => (blaze_proc_macro::script_unit::module_of(&store, package, version, features), "wasm-sha256"),
+        RanAs::Native => (blaze_proc_macro::script_unit::module_of_native(&store, package, version, features, host), "bin-sha256"),
+    };
+    let Some(record) = found else {
+        let asked = asked_lines(ran_as, package, version, features, host);
+        let nearest = blaze_proc_macro::script_unit::records_named(&store, package, version);
+        let mut beside = std::string::String::new();
+        match nearest.iter().min_by_key(|(_, identity)| differing(&asked, ran_as, identity.as_str()).count()) {
+            None => beside.push_str(" the store holds no record of this package and version;"),
+            Some((folder, identity)) => {
+                let key = folder.file_name().map(|it| it.to_string_lossy()).unwrap_or_default();
+                beside.push_str(&std::format!(" the nearest of the store's {} record(s) of {package} {version}, {key}, differs in:", nearest.len()));
+                for line in differing(&asked, ran_as, identity) {
+                    beside.push_str(&std::format!(" `{line}`"));
+                }
+                beside.push(';');
+            }
+        }
+        let how = match ran_as {
+            RanAs::Wasm => "build it with `toolrun.sh proc_macro_modules` in build-script mode",
+            RanAs::Native => "build it with `toolrun.sh proc_macro_modules` in build-script mode with `native` (D112)",
+        };
         let words = bstd::mem::format_in!(
             held,
-            "the build script of {package} {version}: no build-script module of {package} {version} with features [{}] in {}: build it with `toolrun.sh proc_macro_modules` in build-script mode",
+            "the build script of {package} {version}: no build-script module of {package} {version} with features [{}] in {}: asked for the identity lines {};{beside} {how}",
             features.join(","),
             store.join("build-script/modules").display(),
+            asked.iter().map(|line| std::format!("`{line}`")).collect::<std::vec::Vec<_>>().join(" "),
         );
         // Filed: the store's listing is in this part's source, so the failure stands until a
         // module comes or goes.
         return Ok(Did::FailedSaying(refused("a build-script module the store lacks"), held_str(words.as_str(), held)));
     };
-    let digest_at = record.join("wasm-sha256");
+    let digest_at = record.join(digest_file);
     let digest = match std::fs::read_to_string(&digest_at) {
         Ok(digest) => digest,
         Err(error) => {
@@ -112,4 +150,56 @@ pub(crate) fn run<'b>(cx: &Cx, home: Option<&str>, wanted: Wanted<'_>, task: &Ta
     let mut made = Made::new_in(name, held);
     made.out = ContentId::of(OUT_DOMAIN, digest.trim().as_bytes());
     Ok(Did::Done(made))
+}
+
+/// The identity lines a lookup asks a record for (what `script_unit::module_where` matches):
+/// name, version, the sorted features and, for a native run, `target <host>`.
+pub(crate) fn asked_lines(ran_as: RanAs, package: &str, version: &str, features: &[&str], host: &str) -> std::vec::Vec<std::string::String> {
+    let mut sorted = features.to_vec();
+    sorted.sort_unstable();
+    let mut lines = std::vec![std::format!("name {package}"), std::format!("version {version}"), std::format!("features {}", sorted.join(","))];
+    if ran_as == RanAs::Native {
+        lines.push(std::format!("target {host}"));
+    }
+    lines
+}
+
+/// What of `identity` keeps it from answering `asked`: each asked line it lacks, as the record
+/// has that line instead (`features ..`, `target ..`) or `(no <line>)`; and, for a wasm ask, the
+/// record's own `target` line (a native host binary is not a module).
+pub(crate) fn differing<'i>(asked: &'i [std::string::String], ran_as: RanAs, identity: &'i str) -> impl Iterator<Item = std::string::String> + 'i {
+    let lacking = asked.iter().filter(|want| !identity.lines().any(|line| line == want.as_str())).map(move |want| {
+        let field = want.split(' ').next().unwrap_or_default();
+        match identity.lines().find(|line| line.split(' ').next() == Some(field)) {
+            Some(has) => std::format!("{has} (asked: {want})"),
+            None => std::format!("no `{want}` line"),
+        }
+    });
+    let native_record = identity.lines().find(|line| ran_as == RanAs::Wasm && line.starts_with("target ")).map(|has| std::format!("{has} (a native host binary; asked: a wasm module)"));
+    lacking.chain(native_record)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RanAs, asked_lines, differing, subject};
+
+    /// tempo 2026-11-17: libproc's store record is a native host binary (`target` line). A wasm
+    /// ask is refused on that line, a native ask is answered by it; nix's record lacks the
+    /// `time` feature the ask names, and the refusal shows the record's own features line.
+    #[test]
+    fn a_lookup_names_the_line_that_differs() {
+        let libproc = "blaze build-script module 3\nname libproc\nversion 0.14.11\nfeatures \ntoolchain nightly-2026-10-27\ntarget aarch64-apple-darwin\nbuilder bootstrap\n";
+        let host = "aarch64-apple-darwin";
+        let native = asked_lines(RanAs::Native, "libproc", "0.14.11", &[], host);
+        assert_eq!(differing(&native, RanAs::Native, libproc).count(), 0);
+        let wasm = asked_lines(RanAs::Wasm, "libproc", "0.14.11", &[], host);
+        let said: std::vec::Vec<_> = differing(&wasm, RanAs::Wasm, libproc).collect();
+        assert_eq!(said, ["target aarch64-apple-darwin (a native host binary; asked: a wasm module)"]);
+        let nix = "blaze build-script module 3\nname nix\nversion 0.31.3\nfeatures default,ioctl,memoffset,socket\nbuilder bootstrap\n";
+        let asked = asked_lines(RanAs::Wasm, "nix", "0.31.3", &["time", "default", "ioctl", "memoffset", "socket"], host);
+        let said: std::vec::Vec<_> = differing(&asked, RanAs::Wasm, nix).collect();
+        assert_eq!(said, ["features default,ioctl,memoffset,socket (asked: features default,ioctl,memoffset,socket,time)"]);
+        // A native and a wasm ask of one script are two lookups.
+        assert_ne!(subject(RanAs::Native, "libproc", "0.14.11", &[]), subject(RanAs::Wasm, "libproc", "0.14.11", &[]));
+    }
 }

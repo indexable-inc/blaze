@@ -26,6 +26,8 @@
 
 use blaze_id::ItemKey;
 use blaze_scope::items_record::{ItemNow, ItemRow, ItemsRecordError, MemberRow, TextSpan};
+use blaze_scope::resolve::At;
+use blaze_surface::ItemIndex;
 
 use super::{Log, Records, SourceError};
 
@@ -77,33 +79,88 @@ impl<'n> Records<'n> {
         got
     }
 
-    /// The text of `member` of `owner` (crate `krate`): through its file's digest; when that
-    /// file changed, at item grain as the member's own item row ([`Records::row_now`]). A member
-    /// with no item row keeps the whole file's refusal, filed.
-    pub(super) fn member_text_now(&'n self, krate: usize, owner: ItemKey, member: &MemberRow<'n>) -> Option<&'n str> {
+    /// `member` of `owner` (crate `krate`) as it is now: its outline entry and its whole text.
+    /// Its file unchanged: the row as written, its text through the file's digest. Its file
+    /// changed: a member has no item row of its own, so it is read through its OWNER's row of
+    /// today ([`Records::row_now`]: the impl or trait found by its chain), as the one child of
+    /// the owner's entry in today's outline of its kind and name, the same rank among the
+    /// owner's members of that kind and name as the record's row (`cfg`'d twins keep their
+    /// order: a member added or removed moves the file's `Surface`, so the record is remade).
+    /// Its text is then the member's own, so a reader of a sibling never sees an edit of it.
+    /// Its owner gone today is that owner's [`SourceError::ItemStale`]; the member gone from a
+    /// present owner is `ItemsRecordError::Gone` of its file; each filed.
+    pub(super) fn member_now(&'n self, krate: usize, owner: ItemKey, member: &MemberRow<'n>) -> Option<(ItemIndex, &'n str)> {
         let error = match self.items.member_text(owner, member) {
-            Ok(text) => return Some(text),
+            Ok(text) => return Some((member.outline, text)),
             Err(error) => error,
         };
-        let file_changed = matches!(error, ItemsRecordError::Stale { file: Some(_), call: None, .. });
-        if !file_changed {
+        let file = match error {
+            ItemsRecordError::Stale { file: Some(file), call: None, .. } => file,
+            error => {
+                self.log.put(SourceError::Items { krate, name: self.log.name(krate), error });
+                return None;
+            }
+        };
+        let now = self.row_now(krate, owner)?;
+        let (Some(today), Some(TextSpan { at: At::File(owner_file), .. })) = (now.today, now.row.text) else {
+            // The owner reads as the record saw it while its member's file changed: they are
+            // not in one text, which a member written in its owner's body always is.
+            self.log.put(SourceError::Items { krate, name: self.log.name(krate), error });
+            return None;
+        };
+        if owner_file != file {
             self.log.put(SourceError::Items { krate, name: self.log.name(krate), error });
             return None;
         }
-        match self.items.item_now(member.key) {
-            Ok(None) => {
-                self.log.put(SourceError::Items { krate, name: self.log.name(krate), error });
-                None
+        let rank = self.member_rank(krate, owner, member)?;
+        let record = self.items_of(krate)?;
+        let mut outlines = self.outlines.borrow_mut();
+        if outlines.get(&(krate, file)).is_none() {
+            if outlines.len() >= super::MOST_OUTLINES {
+                drop(outlines);
+                self.log.put(SourceError::Gap { question: "a member of a changed file: more files outlined than the most one command keeps (source.rs `MOST_OUTLINES`)", key: Some(member.key) });
+                return None;
             }
-            answer => {
-                let now = self.now_of(krate, answer)?;
-                let Some(span) = now.row.text else {
-                    self.log.put(SourceError::Items { krate, name: self.log.name(krate), error: ItemsRecordError::NoPlace { key: member.key } });
-                    return None;
-                };
-                self.span_now(krate, &now, span)
+            outlines.insert((krate, file), blaze_file_items::outline(today, record.edition(), self.alloc));
+        }
+        let outline = outlines.get(&(krate, file))?;
+        let found = outline
+            .children(Some(now.row.outline))
+            .filter(|(_, child)| child.kind() == member.kind && child.name.map(|range| child.text(today, range)) == member.name)
+            .nth(rank)
+            .map(|(at, child)| (at, child.range.start, child.range.end));
+        drop(outlines);
+        let Some((at, start, end)) = found else {
+            let gone = match self.keys.get(krate) {
+                Some(key) => ItemsRecordError::Gone { krate: *key, file: Some(file), call: None },
+                None => ItemsRecordError::Short { what: "a crate with an items record", at: krate },
+            };
+            self.log.put(SourceError::Items { krate, name: self.log.name(krate), error: gone });
+            return None;
+        };
+        let Some(text) = today.get(start as usize..end as usize) else {
+            let range = match self.keys.get(krate) {
+                Some(key) => ItemsRecordError::Range { krate: *key, start, len: end.saturating_sub(start) },
+                None => ItemsRecordError::Short { what: "a crate with an items record", at: krate },
+            };
+            self.log.put(SourceError::Items { krate, name: self.log.name(krate), error: range });
+            return None;
+        };
+        Some((at, text))
+    }
+
+    /// How many members of `owner` written in its own text share `member`'s kind and name and
+    /// come before it (by the record's outline entries, the text's order).
+    fn member_rank(&'n self, krate: usize, owner: ItemKey, member: &MemberRow<'n>) -> Option<usize> {
+        let rows = self.read(krate, self.items.members(owner))??;
+        let mut rank = 0;
+        for row in rows.iter() {
+            let row = self.read(krate, row)?;
+            if row.written_by.is_none() && row.kind == member.kind && row.name == member.name && row.outline.0 < member.outline.0 {
+                rank += 1;
             }
         }
+        Some(rank)
     }
 
     /// The whole text of file `file` of crate `krate` as it is now, for a reader that reads

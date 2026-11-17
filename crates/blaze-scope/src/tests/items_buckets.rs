@@ -27,16 +27,18 @@
 //! blaze-scope test an_impl_question_is_one_search`:
 //! `test tests::items_buckets::an_impl_question_is_one_search ... ok`.
 
-use blaze_id::ItemKey;
+use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_own::{AVec, Alloc};
 use blaze_surface::ItemKind;
+use blaze_unit_graph::{Implicit, Prelude, StdIs};
 
 use super::entry::{Texts, input};
+use crate::builtin::builtin_type;
 use crate::crate_scope::{Ready, resolve_by_records};
-use crate::graph::Sysroot;
+use crate::graph::{CrateId, Sysroot};
 use crate::items_record::buckets::{BucketKey, F_BUCKETS_COUNT, F_UNFILED_AT, Head, NotFiled};
 use crate::items_record::{ItemsRecord, ItemsRecordError, encode};
-use crate::resolve::aligned;
+use crate::resolve::{CrateInput, aligned};
 use crate::task::Serial;
 
 const WAIT: core::time::Duration = core::time::Duration::from_secs(60);
@@ -207,4 +209,90 @@ fn an_impl_question_is_one_search() {
         "planted bug 2 (a why that is no reason) was not refused by name: {:?}",
         planted.unfiled_at(0)
     );
+}
+
+const PRIM_CORE: &str = "#![no_core]
+pub mod prelude {
+    pub mod v1 {}
+    pub mod rust_2021 { pub use super::v1::*; }
+}
+";
+const PRIM_DEP: &str = "#![no_core]
+pub struct Thing;
+";
+/// The impls at a builtin self type written outside core (num-bigint's `impl Rem<BigUint> for
+/// u64`): at the root, nothing nearer binds `u64`; in `globbed`, `use dep::*;` might; in `own`,
+/// a struct of the name does.
+const PRIM_USER: &str = "#![no_std]
+pub trait Tr<X> {}
+pub struct Big;
+impl Tr<Big> for u64 {}
+mod globbed {
+    use dep::*;
+    impl crate::Tr<crate::Big> for u64 {}
+}
+mod own {
+    pub struct u64;
+    impl crate::Tr<crate::Big> for u64 {}
+}
+";
+static PRIM_TEXTS: Texts = Texts(&[&[("/core/lib.rs", PRIM_CORE)], &[("/dep/lib.rs", PRIM_DEP)], &[("/user/lib.rs", PRIM_USER)]]);
+const PRIM_DEPS: &[(&str, usize)] = &[("dep", 1)];
+
+fn prim_input(name: &'static str, root: &'static str, deps: &'static [(&'static str, usize)]) -> CrateInput<'static> {
+    CrateInput {
+        name,
+        key: CrateItemKey(ContentId::of("blaze-scope test crate", name.as_bytes())),
+        edition: blaze_surface::Edition::E2021,
+        implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false },
+        root,
+        shown_from: "/",
+        features: &[],
+        deps,
+        cfg: &[],
+        script: None,
+    }
+}
+
+/// Rule (the Reference, "Names" / preludes: the standard prelude's names are shadowed by any
+/// nearer binding, and the builtin types are the last layer of the type namespace; no prelude
+/// binds a type named like a builtin): the items record of `user`, written with its OWN names
+/// only (core's prelude and `dep` not held), files `impl Tr<Big> for u64` at the root under
+/// (`Tr`, the builtin `u64`), the bucket core's own `impl Rem for u64` is in; keeps the same
+/// impl in a module with `use dep::*;` unfiled as `SelfNotRead` (the unread glob may bind
+/// `u64`); and files the one in a module that declares `struct u64;` under that struct.
+/// Expected: `test tests::items_buckets::a_builtin_self_outside_core_is_filed_at_the_builtin
+/// ... ok`. Before C05b: the root's impl is unfiled (`SelfNotRead`), "the root's impl at the
+/// builtin `u64`" fails.
+#[test]
+fn a_builtin_self_outside_core_is_filed_at_the_builtin() {
+    let g = blaze_own::testing::heap().alloc();
+    let inputs = [prim_input("core", "/core/lib.rs", &[]), prim_input("dep", "/dep/lib.rs", &[]), prim_input("user", "/user/lib.rs", PRIM_DEPS)];
+    let sys = Sysroot { core: Some(CrateId(0)), alloc: None, std: None, bstd: None };
+    let (solved, _) = resolve_by_records(&inputs, sys, &PRIM_TEXTS, &Serial, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("solve: {e:?}"));
+    let a = encode(solved[2].names, g).unwrap_or_else(|e| panic!("encode: {e:?}"));
+    let bytes: &'static [u8] = aligned(&a, g);
+    let record = ItemsRecord::open(bytes, g).unwrap_or_else(|e| panic!("open: {e:?}"));
+    let tr = key_of(&record, ItemKind::Trait, "Tr");
+    let local = key_of(&record, ItemKind::Struct, "u64");
+    let builtin = builtin_type("u64").unwrap_or_else(|| panic!("`u64` is a builtin type")).key;
+    assert!(local != builtin, "the struct `u64` has a key of its own");
+
+    let at_builtin = asked(&record, &BucketKey::of_trait(tr, Head::Named(builtin)));
+    assert!(at_builtin.len() == 1 && at_builtin[0].1 == Some("u64"), "the root's impl at the builtin `u64`: the index answers {at_builtin:?}");
+    let at_local = asked(&record, &BucketKey::of_trait(tr, Head::Named(local)));
+    assert!(at_local.len() == 1 && at_local[0].1 == Some("u64"), "`own`'s impl at its struct `u64`: the index answers {at_local:?}");
+
+    let mut unfiled = AVec::new_in(g);
+    let mut i = 0;
+    while let Some((it, why)) = record.unfiled_at(i).unwrap_or_else(|e| panic!("unfiled row {i}: {e:?}")) {
+        let row = record.impl_at(it.row).unwrap_or_else(|e| panic!("impl row {}: {e:?}", it.row)).unwrap_or_else(|| panic!("no impl row {}", it.row));
+        unfiled.push((row.self_path, why));
+        i += 1;
+    }
+    assert!(
+        unfiled[..] == [(Some("u64"), NotFiled::SelfNotRead)],
+        "`globbed`'s impl (behind `use dep::*;`, `dep` not held) is the one unfiled, as not read: {unfiled:?}"
+    );
+    assert!(record.impls() == 3 && record.bucket_rows() == 2, "{} filed + {} unfiled of {} impls", record.bucket_rows(), record.unfiled(), record.impls());
 }

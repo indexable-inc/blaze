@@ -3,8 +3,8 @@
 //! ([`driver`]), which does the IO for it on the native driver (io_uring, kqueue) or the
 //! simulation; and, behind the `h3` feature, HTTP/3 with WebTransport (`h3`), a core of the
 //! same shape over quinn-proto with its own driver contract and driver on the same effects.
-//! No runtime is under either: a caller's executor polls the handles' futures, or
-//! [`mailbox::block_on`] does on the calling thread.
+//! No runtime is under either: each driver's thread runs one plain blocking loop over its
+//! machine, and a caller waits for an answer with one timed receive ([`mailbox::answer`]).
 //!
 //! # The core
 //!
@@ -57,8 +57,9 @@
 //!    is first. Every request ends by its deadline, so no wait of the asker's is open.
 //!
 //! The core has no recorder. The driver's waits go through blaze-core: its loop's poll of the
-//! driver, and an asker's park in [`mailbox::block_on`], named by what it waits for
-//! (every-wait-says-what).
+//! driver to its deadline, and an asker's timed receive in [`mailbox::answer`], which takes
+//! how long it may wait and, when that passes, is [`mailbox::Unanswered::TimedOut`] naming what
+//! it waited for (every-wait-says-what).
 //!
 //! # What the core reads that is not its input
 //!

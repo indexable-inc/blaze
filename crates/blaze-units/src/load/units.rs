@@ -168,10 +168,10 @@ pub(crate) fn units(
         Ok(it) => it,
         Err(error) => return Ok(fail(error)),
     };
-    let members: HashSet<PackageId, Global> = resolved.member_ids.iter().copied().collect();
-    let mut by_id: HashMap<PackageId, Package<'_>, Global> =
-        HashMap::with_capacity_in(all_ids.len(), Global);
-    let mut packages_by_spec: BySpec<'_> = HashMap::with_capacity_in(all_ids.len(), Global);
+    let members: Set<PackageId, FixedState, Global> = resolved.member_ids.iter().copied().collect();
+    let mut by_id: Map<PackageId, Package<'_>, FixedState, Global> =
+        Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(all_ids.len()) });
+    let mut packages_by_spec: BySpec<'_> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(all_ids.len()) });
     for id in &all_ids {
         let Some((_, manifest)) = resolved.manifests.get(id) else { continue };
         let package = Package { manifest, is_member: members.contains(id) };
@@ -187,9 +187,9 @@ pub(crate) fn units(
         Ok(it) => it,
         Err(error) => return Ok(Staged::Failed(error)),
     };
-    let mut unsandboxed: HashSet<&str, Global> = HashSet::new_in(Global);
+    let mut unsandboxed: Set<&str, FixedState, Global> = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
     // A member's tests keys, by id: a dependency's own table is not read (it can't opt out).
-    let mut test_sandbox: HashMap<PackageId, TestSandbox, Global> = HashMap::new_in(Global);
+    let mut test_sandbox: Map<PackageId, TestSandbox, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     for (spec, (id, package)) in &packages_by_spec {
         let own = match package.is_member {
             true => match super::sandbox::package(
@@ -816,7 +816,7 @@ fn platforms(config: &blaze_manifest::Config<Snap>, spec: &Spec) -> Result<Platf
 
 /// What the feature resolver reads of the packages.
 struct Targets<'a> {
-    reads: &'a HashMap<PackageId, Read, Global>,
+    reads: &'a Map<PackageId, Read, FixedState, Global>,
     host: &'a Platformed,
     target: Option<&'a Platformed>,
 }
@@ -902,7 +902,7 @@ fn run_one(graph: &schema::UnitGraph, filter: &Filter) -> anyhow::Result<()> {
 }
 
 /// The packages by the spec a unit's `pkg_id` names them by.
-type BySpec<'a> = HashMap<String, (PackageId, Package<'a>), Global>;
+type BySpec<'a> = Map<String, (PackageId, Package<'a>), FixedState, Global>;
 
 /// The first unit that depends on an artifact dependency (`-Z bindeps`, #601), which blaze
 /// does not build: refused, naming both. Units that depend on none build.

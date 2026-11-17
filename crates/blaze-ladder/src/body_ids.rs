@@ -37,11 +37,16 @@
 //!
 //! THE WALK ([`Walk`]) is sans-IO: it asks the seam, the store ([`CodeStore`]), the maker
 //! ([`Make`]: checks, lowers, builds, emits and seals ONE instance) and the entry's form
-//! ([`Form`]) and holds only its table.
+//! ([`Form`]) and holds only its table. Its one step is [`Walk::one`]: ONE row keyed, found or
+//! made, and what its entry declares reached as rows with nothing done for them (D124: the
+//! `blaze run` parent answers one `Need` at a time with it and never walks ahead of what is
+//! asked). [`Walk::run`], the walk to a fixpoint, is [`Walk::root`] then `one` over the rows in
+//! order.
 //!
 //! THE TABLE is one copy, in the caller's allocator, as columns: per instance its symbol (32
-//! bytes), key (32), tabled fn (16), name range (8) and outcome (1): 89 bytes a row, the names
-//! in one arena. A found instance has no other content: no body, no checked tables. (Before:
+//! bytes), key (32), tabled fn (16), name range (8), outcome (1) and the range of the rows its
+//! entry declares (8): 97 bytes a row, the names in one arena, the declared rows in another (4
+//! bytes each). A found instance has no other content: no body, no checked tables. (Before:
 //! front2 program.rs `Tabled`, about 6 KB a row with a `Body` and a `Checked` inline, the same
 //! rows in three vectors.)
 //!
@@ -58,7 +63,6 @@ use blaze_ids::producer::{CodeBuilder, ProducerId};
 use blaze_ids::{ContentId, Hasher};
 use blaze_own::{AVec, Alloc, Vec};
 pub use blaze_run::parent::Read;
-use blaze_run::Tier;
 use blaze_typeck::ItemKey;
 
 use crate::code_records::{Builder, CodeKey, CodeStore, ENTRY_FORM, EntryError, EntryView, PanicStrategy, StoreError, triple};
@@ -104,11 +108,7 @@ pub fn record_key(symbol: Symbol, body: &BodyId<'_>, facts: &[Read], builder: &B
     }
     h.part(triple(builder.isa).as_bytes());
     h.part(&[u8::from(builder.isa.lse)]);
-    let tier: u8 = match builder.tier {
-        Tier::Fast => 0,
-        Tier::Optimized => 1,
-    };
-    h.part(&[tier]);
+    h.part(&[builder.tier as u8]);
     let s = builder.settings;
     let panic: u8 = match s.panic {
         PanicStrategy::Unwind => 0,
@@ -369,6 +369,11 @@ pub struct Walk<'a> {
     names: AVec<'a, (u32, u32)>,
     how: AVec<'a, How>,
     arena: AVec<'a, u8>,
+    /// Each row's (start, length) in `edges`: the rows its entry declares, set when the row
+    /// stops being [`How::Waiting`] (empty until then).
+    declares: AVec<'a, (u32, u32)>,
+    /// The declared rows of every row done, in each entry's order.
+    edges: AVec<'a, u32>,
     /// Open addressing over `symbols` by a symbol's first eight bytes (a symbol is a content
     /// digest: its bytes are the hash, so the table has no seed); 0 is empty, else the row + 1.
     /// A power of two long, at most half full.
@@ -376,6 +381,46 @@ pub struct Walk<'a> {
 }
 
 const NO_KEY: CodeKey = CodeKey(ContentId([0; 32]));
+
+/// The buffers one step of the walk ([`Walk::one`]) fills, made once by the caller and reused
+/// by every step, so a step allocates nothing once they have grown.
+pub struct Scratch<'a> {
+    /// The instance name of the row being done (copied out of the walk's arena).
+    name: AVec<'a, u8>,
+    /// The entry the maker made in the last step; empty when that step made nothing.
+    made: AVec<'a, u8>,
+    facts: AVec<'a, Read>,
+    items: AVec<'a, ItemKey>,
+    declared: DeclaredList<'a>,
+}
+
+impl<'a> Scratch<'a> {
+    pub fn new_in(alloc: Alloc<'a>) -> Scratch<'a> {
+        Scratch { name: Vec::new_in(alloc), made: Vec::new_in(alloc), facts: Vec::new_in(alloc), items: Vec::new_in(alloc), declared: DeclaredList::new_in(alloc) }
+    }
+
+    /// The entry bytes the maker made in the last [`Walk::one`], when its row's [`One::how`] is
+    /// [`How::Made`] or [`How::Unkeyed`] (an unkeyed instance is not put: these bytes are the
+    /// only copy of its record, and the caller serves them). Empty after a step that made
+    /// nothing ([`How::Found`], or a row already done); a made entry may itself be empty, so
+    /// the caller tells the cases by `how`, never by the length.
+    pub fn made(&self) -> &[u8] {
+        &self.made
+    }
+}
+
+/// What one step ([`Walk::one`]) holds for its row.
+#[derive(Clone, Copy, Debug)]
+pub struct One<'w> {
+    /// What was done for the row: never [`How::Waiting`].
+    pub how: How,
+    /// The row's key; `None` for an instance made without one ([`How::Unkeyed`]).
+    pub key: Option<CodeKey>,
+    /// The rows its entry declares, in the entry's order (an instance declared twice comes
+    /// twice). A row may be old (reached before, perhaps already done) or new
+    /// ([`How::Waiting`], nothing done for it).
+    pub declared: &'w [u32],
+}
 
 impl<'a> Walk<'a> {
     pub fn new_in(alloc: Alloc<'a>) -> Walk<'a> {
@@ -387,8 +432,32 @@ impl<'a> Walk<'a> {
             names: Vec::new_in(alloc),
             how: Vec::new_in(alloc),
             arena: Vec::new_in(alloc),
+            declares: Vec::new_in(alloc),
+            edges: Vec::new_in(alloc),
             slots: Vec::new_in(alloc),
         }
+    }
+
+    /// The rows row `row`'s entry declares, in the entry's order; empty while it is
+    /// [`How::Waiting`].
+    pub fn declared(&self, row: usize) -> &[u32] {
+        let (at, len) = self.declares[row];
+        &self.edges[at as usize..(at + len) as usize]
+    }
+
+    /// The row of the instance `symbol`, if the walk has reached it.
+    pub fn row_of(&self, symbol: &Symbol) -> Option<usize> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        self.find(symbol).ok()
+    }
+
+    /// The instance `entry` (its tabled fn and its instance name) reached as a root: its row,
+    /// new and [`How::Waiting`] with nothing done for it, or the row it has. At most `most`
+    /// instances in the table.
+    pub fn root<E>(&mut self, entry: (ItemKey, &[u8]), most: usize) -> Result<usize, WalkError<E>> {
+        self.reach(entry.0, entry.1, most)
     }
 
     /// Instances reached.
@@ -488,6 +557,7 @@ impl<'a> Walk<'a> {
                 self.names.push((self.arena.len() as u32, name.len() as u32));
                 self.arena.extend_from_slice(name);
                 self.how.push(How::Waiting);
+                self.declares.push((0, 0));
                 Ok(row)
             }
         }
@@ -496,7 +566,8 @@ impl<'a> Walk<'a> {
     /// The walk from the instance `entry` (its tabled fn and its instance name; called again
     /// with another root, it goes on from what it holds): each instance keyed before any work,
     /// found in `store` or made by `make` and put, and what its entry declares reached in the
-    /// entry's order. At most `most` instances.
+    /// entry's order. At most `most` instances. [`Walk::root`], then [`Walk::one`] over the
+    /// rows from the root's in order until none is [`How::Waiting`].
     pub fn run<M: Make>(
         &mut self,
         entry: (ItemKey, &[u8]),
@@ -508,68 +579,103 @@ impl<'a> Walk<'a> {
         form: &dyn Form,
         most: usize,
     ) -> Result<(), WalkError<M::Error>> {
-        let mut at = self.reach(entry.0, entry.1, most)?;
-        let mut name: AVec<'a, u8> = Vec::new_in(self.alloc);
-        let mut made: AVec<'a, u8> = Vec::new_in(self.alloc);
-        let mut facts: AVec<'a, Read> = Vec::new_in(self.alloc);
-        let mut items: AVec<'a, ItemKey> = Vec::new_in(self.alloc);
-        let mut declared = DeclaredList::new_in(self.alloc);
+        let mut at = self.root(entry, most)?;
+        let mut scratch = Scratch::new_in(self.alloc);
         while at < self.len() {
-            let row = at;
+            if self.how[at] == How::Waiting {
+                self.one(at, ids, store, builder, producer, make, form, most, &mut scratch)?;
+            }
             at += 1;
-            if self.how[row] != How::Waiting {
-                continue;
-            }
-            let tabled = self.tabled[row];
-            name.clear();
-            name.extend_from_slice(self.name(row));
-            let body = ids.body_check(tabled).ok_or(WalkError::NoBody { tabled })?;
-            // Whether the instance has a key: its fn's BodyCheck record is there and every read
-            // of it is today's.
-            let mut unkeyed = if body.reads.is_empty() { Some(Unkeyed::NoRecord) } else { None };
-            for read in body.reads {
-                if unkeyed.is_none() && ids.today(&read.fact) != Some(read.digest) {
-                    unkeyed = Some(Unkeyed::Stale { fact: read.fact });
-                }
-            }
-            declared.clear();
-            let mut found = false;
-            let mut key = NO_KEY;
-            if unkeyed.is_none() {
-                items.clear();
-                each_item(&name, |item| items.push(item)).map_err(|why| WalkError::Name { tabled, why })?;
-                facts.clear();
-                for &item in items.iter() {
-                    facts.push(ids.crate_fact(item).ok_or(WalkError::NoCrateFact { tabled, item })?);
-                }
-                facts.sort_unstable();
-                facts.dedup();
-                key = record_key(self.symbols[row], &body, &facts, builder, producer);
-                if let Some(bytes) = store.get(key).map_err(WalkError::Store)? {
-                    form.declared(bytes, &mut declared).map_err(|why| WalkError::Entry { tabled, found: true, why })?;
-                    found = true;
-                }
-            }
-            if !found {
-                made.clear();
-                make.make(tabled, &name, &mut made).map_err(|why| WalkError::Make { tabled, why })?;
-                form.declared(&made, &mut declared).map_err(|why| WalkError::Entry { tabled, found: false, why })?;
-                if unkeyed.is_none() {
-                    store.put(key, &made).map_err(WalkError::Store)?;
-                }
-            }
-            self.keys[row] = key;
-            self.how[row] = match (found, unkeyed) {
-                (true, _) => How::Found,
-                (false, None) => How::Made,
-                (false, Some(why)) => How::Unkeyed(why),
-            };
-            for i in 0..declared.len() {
-                let (callee, callee_name) = declared.row(i);
-                self.reach(callee, callee_name, most)?;
-            }
         }
         Ok(())
+    }
+
+    /// ONE step of the walk, for row `row` alone (a row this walk gave: [`Walk::root`],
+    /// [`Walk::row_of`] or a step's [`One::declared`]): the instance keyed from text and today's
+    /// facts before any work, its entry found in `store` or made by `make` (and put when keyed),
+    /// and each instance the entry declares reached as a row with nothing done for it. No other
+    /// row is keyed, looked up or made.
+    ///
+    /// Idempotent: a row that is not [`How::Waiting`] answers what it holds, with no store, seam
+    /// or maker call. After the step, [`Scratch::made`] holds the entry bytes when the
+    /// instance was made. At most `most` instances in the table. On an error the row stays
+    /// [`How::Waiting`] (a row its entry reached before the error stays reached).
+    pub fn one<'w, M: Make>(
+        &'w mut self,
+        row: usize,
+        ids: &dyn BodyIds,
+        store: &mut dyn CodeStore,
+        builder: &Builder,
+        producer: &ProducerId<CodeBuilder>,
+        make: &mut M,
+        form: &dyn Form,
+        most: usize,
+        scratch: &mut Scratch<'a>,
+    ) -> Result<One<'w>, WalkError<M::Error>> {
+        let Scratch { name, made, facts, items, declared } = scratch;
+        made.clear();
+        if self.how[row] != How::Waiting {
+            return Ok(One { how: self.how[row], key: self.key(row), declared: self.declared(row) });
+        }
+        let tabled = self.tabled[row];
+        name.clear();
+        name.extend_from_slice(self.name(row));
+        let body = ids.body_check(tabled).ok_or(WalkError::NoBody { tabled })?;
+        // Whether the instance has a key: its fn's BodyCheck record is there and every read of
+        // it is today's.
+        let mut unkeyed = if body.reads.is_empty() { Some(Unkeyed::NoRecord) } else { None };
+        for read in body.reads {
+            if unkeyed.is_none() && ids.today(&read.fact) != Some(read.digest) {
+                unkeyed = Some(Unkeyed::Stale { fact: read.fact });
+            }
+        }
+        declared.clear();
+        let mut found = false;
+        let mut key = NO_KEY;
+        if unkeyed.is_none() {
+            items.clear();
+            each_item(name.as_slice(), |item| items.push(item)).map_err(|why| WalkError::Name { tabled, why })?;
+            facts.clear();
+            for &item in items.iter() {
+                facts.push(ids.crate_fact(item).ok_or(WalkError::NoCrateFact { tabled, item })?);
+            }
+            facts.sort_unstable();
+            facts.dedup();
+            key = record_key(self.symbols[row], &body, facts.as_slice(), builder, producer);
+            if let Some(bytes) = store.get(key).map_err(WalkError::Store)? {
+                form.declared(bytes, declared).map_err(|why| WalkError::Entry { tabled, found: true, why })?;
+                found = true;
+            }
+        }
+        if !found {
+            make.make(tabled, name.as_slice(), made).map_err(|why| WalkError::Make { tabled, why })?;
+            form.declared(made.as_slice(), declared).map_err(|why| WalkError::Entry { tabled, found: false, why })?;
+            if unkeyed.is_none() {
+                store.put(key, made.as_slice()).map_err(WalkError::Store)?;
+            }
+        }
+        // The declared rows, reached in the entry's order; on a refusal the row's edges so far
+        // are dropped and the row stays waiting.
+        let start = self.edges.len();
+        for i in 0..declared.len() {
+            let (callee, callee_name) = declared.row(i);
+            match self.reach(callee, callee_name, most) {
+                Ok(callee_row) => self.edges.push(callee_row as u32),
+                Err(why) => {
+                    self.edges.truncate(start);
+                    return Err(why);
+                }
+            }
+        }
+        self.declares[row] = (start as u32, (self.edges.len() - start) as u32);
+        self.keys[row] = key;
+        let how = match (found, unkeyed) {
+            (true, _) => How::Found,
+            (false, None) => How::Made,
+            (false, Some(why)) => How::Unkeyed(why),
+        };
+        self.how[row] = how;
+        Ok(One { how, key: self.key(row), declared: self.declared(row) })
     }
 }
 
@@ -628,12 +734,12 @@ mod tests {
     }
 
     /// The maker: counts its calls (the model's `check_body` counter).
-    struct Model {
-        alloc: Alloc<'static>,
+    struct Model<'a> {
+        alloc: Alloc<'a>,
         calls: usize,
     }
 
-    impl Make for Model {
+    impl Make for Model<'_> {
         type Error = NameError;
         fn make(&mut self, tabled: ItemKey, _name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), NameError> {
             self.calls += 1;
@@ -722,15 +828,16 @@ mod tests {
     fn builder() -> Builder {
         Builder {
             isa: Isa { os: Os::MacOs, lse: true },
-            tier: Tier::Fast,
-            settings: Settings::baseline(blaze_build::OverflowChecks::On),
+            tier: crate::code_records::TierName::Reference,
+            settings: Settings::baseline(blaze_build::OverflowChecks::On, blaze_build::Panic::Unwind),
             toolchain: ToolchainId([7; 32]),
+            producer: blaze_ids::producer::Producers::for_tests(b"body ids test builder").get::<blaze_ids::producer::CodeBuilder>(),
+            edition: edition::PackageEdition::of_manifest("2024").expect("2024 is an edition"),
         }
     }
 
     /// One run of the model program over `store`: its counts and the maker's calls.
-    fn run_once(ids: &Ids, store: &mut MemoryStore<'_>) -> (Counts, usize) {
-        let alloc = blaze_own::testing::heap().alloc();
+    fn run_once(ids: &Ids, store: &mut MemoryStore<'_>, alloc: blaze_own::Alloc<'_>) -> (Counts, usize) {
         let mut walk = Walk::new_in(alloc);
         let mut model = Model { alloc, calls: 0 };
         let mut entry: AVec<'_, u8> = Vec::new_in(alloc);
@@ -746,14 +853,17 @@ mod tests {
     /// found 0 unkeyed 5 calls 5".
     #[test]
     fn a_second_run_finds_every_record_and_checks_no_body() {
-        let alloc = blaze_own::testing::heap().alloc();
+        // The test's one allocator, made at its top: a frame, its memory from the OS.
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
         let mut store = MemoryStore::new_in(alloc);
         let ids = Ids::new([0, 0]);
-        let (first, first_calls) = run_once(&ids, &mut store);
-        let (second, second_calls) = run_once(&ids, &mut store);
+        let (first, first_calls) = run_once(&ids, &mut store, alloc);
+        let (second, second_calls) = run_once(&ids, &mut store, alloc);
         let mut dropped = Ids::new([0, 0]);
         dropped.recorded = false;
-        let (control, control_calls) = run_once(&dropped, &mut store);
+        let (control, control_calls) = run_once(&dropped, &mut store, alloc);
         std::println!(
             "d106 twice: first found {} made {} calls {}; second found {} made {} calls {}; control found {} unkeyed {} calls {}",
             first.found,
@@ -780,15 +890,18 @@ mod tests {
     /// Prints "d106 edit: body edit found 4 made 1 calls 1; head edit found 1 made 4 calls 4".
     #[test]
     fn an_edited_body_is_the_one_instance_made_again() {
-        let alloc = blaze_own::testing::heap().alloc();
+        // The test's one allocator, made at its top: a frame, its memory from the OS.
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
         let mut store = MemoryStore::new_in(alloc);
         let mut ids = Ids::new([0, 0]);
-        run_once(&ids, &mut store);
+        run_once(&ids, &mut store, alloc);
         ids.text[4].1 = 1;
-        let (body, body_calls) = run_once(&ids, &mut store);
+        let (body, body_calls) = run_once(&ids, &mut store, alloc);
         let mut moved = Ids::new([0, 1]);
         moved.text[4].1 = 1;
-        let (head, head_calls) = run_once(&moved, &mut store);
+        let (head, head_calls) = run_once(&moved, &mut store, alloc);
         std::println!("d106 edit: body edit found {} made {} calls {}; head edit found {} made {} calls {}", body.found, body.made, body_calls, head.found, head.made, head_calls);
         assert_eq!((body.found, body.made, body_calls), (4, 1, 1));
         assert_eq!((head.found, head.made, head_calls), (1, 4, 4));
@@ -800,14 +913,17 @@ mod tests {
     /// Prints "d106 stale: found 1 made 3 stale 1 puts +3".
     #[test]
     fn a_stale_body_check_is_made_and_never_put() {
-        let alloc = blaze_own::testing::heap().alloc();
+        // The test's one allocator, made at its top: a frame, its memory from the OS.
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
         let mut store = MemoryStore::new_in(alloc);
-        run_once(&Ids::new([0, 0]), &mut store);
+        run_once(&Ids::new([0, 0]), &mut store, alloc);
         let before = store.puts;
         let old = Ids::new([0, 0]);
         let mut ids = Ids::new([0, 1]);
         ids.reads[3] = old.reads[3];
-        let (counts, calls) = run_once(&ids, &mut store);
+        let (counts, calls) = run_once(&ids, &mut store, alloc);
         std::println!("d106 stale: found {} made {} stale {} puts +{}", counts.found, counts.made, counts.stale, store.puts - before);
         assert_eq!((counts.found, counts.made, counts.stale, calls), (1, 3, 1, 4));
         assert_eq!(store.puts - before, 3);
@@ -817,7 +933,10 @@ mod tests {
     /// is refused by its byte.
     #[test]
     fn a_name_lists_its_items() {
-        let alloc = blaze_own::testing::heap().alloc();
+        // The test's one allocator, made at its top: a frame, its memory from the OS.
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
         let mut name: AVec<'_, u8> = Vec::new_in(alloc);
         name_of(TWICE, Some(APP), &mut name);
         let mut items: AVec<'_, ItemKey> = Vec::new_in(alloc);
@@ -825,5 +944,212 @@ mod tests {
         assert_eq!(items.as_slice(), &[ItemKey(TWICE), ItemKey(APP)]);
         name[20] = 99;
         assert_eq!(each_item(&name, |_| {}), Err(NameError::Tag { tag: 99, at: 20 }));
+    }
+
+    fn model_producer() -> ProducerId<CodeBuilder> {
+        blaze_ids::producer::Producers::for_tests(b"d106 walk model").get::<CodeBuilder>()
+    }
+
+    /// The rows not yet done, last first: the order the lazy tests ask in.
+    fn last_waiting(walk: &Walk<'_>) -> Option<usize> {
+        (0..walk.len()).rev().find(|&row| walk.how(row) == How::Waiting)
+    }
+
+    /// D124: one step for `main` alone makes `main` once and reaches its three callees as rows
+    /// with nothing done for them: `helper`, `twice::<App>` and `plain` are `Waiting`, the maker
+    /// was called once, the store holds one entry, and `leaf` (only their callee) is not in the
+    /// table at all. The control is `root` alone: a row, no maker call, no put.
+    #[test]
+    fn one_step_makes_its_row_and_nothing_ahead() {
+        // The test's one allocator, made at its top: a frame, its memory from the OS.
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let mut store = MemoryStore::new_in(alloc);
+        let ids = Ids::new([0, 0]);
+        let builder = builder();
+        let producer = model_producer();
+        let mut model = Model { alloc, calls: 0 };
+        let mut entry: AVec<'_, u8> = Vec::new_in(alloc);
+        name_of(MAIN, None, &mut entry);
+        let mut walk = Walk::new_in(alloc);
+        let mut scratch = Scratch::new_in(alloc);
+        let root = walk.root::<NameError>((ItemKey(MAIN), &entry), 64).expect("main is reached");
+        assert_eq!((root, walk.len(), walk.how(root), model.calls, store.puts), (0, 1, How::Waiting, 0, 0), "a root is a row and nothing else");
+        let one = walk.one(root, &ids, &mut store, &builder, &producer, &mut model, &Toy, 64, &mut scratch).expect("main is made");
+        let (how, key) = (one.how, one.key);
+        let declared = <[u32; 3]>::try_from(one.declared).expect("main declares three instances");
+        assert_eq!(how, How::Made);
+        assert_eq!(walk.key(root), key);
+        assert!(key.is_some(), "main is keyed");
+        assert_eq!(declared.map(|row| walk.tabled(row as usize).0), [HELPER, TWICE, PLAIN], "the entry's order");
+        let mut twice: AVec<'_, u8> = Vec::new_in(alloc);
+        name_of(TWICE, Some(APP), &mut twice);
+        assert_eq!(walk.name(declared[1] as usize), twice.as_slice(), "the second is twice::<App>");
+        assert!(declared.iter().all(|&row| walk.how(row as usize) == How::Waiting && walk.key(row as usize).is_none()));
+        assert_eq!((walk.len(), model.calls, store.puts, store.len()), (4, 1, 1, 1));
+        let mut leaf: AVec<'_, u8> = Vec::new_in(alloc);
+        name_of(LEAF, None, &mut leaf);
+        assert_eq!(walk.row_of(&fn_symbol_of_name(&leaf)), None, "leaf is not reached: nothing walked ahead");
+        assert_eq!(walk.row_of(&fn_symbol_of_name(&twice)), Some(declared[1] as usize));
+    }
+
+    /// Asking the rows one at a time in another order, from two roots (`plain` first, then
+    /// `main`; then always the last waiting row) ends with the table `run` from `main` makes:
+    /// the same five symbols, each with the same tabled fn, name, key and how, each declaring
+    /// the same symbols in the same order, the same maker calls, and a store with the same
+    /// entries under the same keys. Row numbers differ (`plain` is row 0 here), and `main`'s
+    /// step names `plain` as an old row.
+    #[test]
+    fn rows_asked_in_any_order_end_where_run_ends() {
+        // The test's one allocator, made at its top: a frame, its memory from the OS.
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let ids = Ids::new([0, 0]);
+        let builder = builder();
+        let producer = model_producer();
+        let mut main: AVec<'_, u8> = Vec::new_in(alloc);
+        name_of(MAIN, None, &mut main);
+        let mut plain: AVec<'_, u8> = Vec::new_in(alloc);
+        name_of(PLAIN, None, &mut plain);
+
+        let mut eager_store = MemoryStore::new_in(alloc);
+        let mut eager_model = Model { alloc, calls: 0 };
+        let mut eager = Walk::new_in(alloc);
+        eager.run((ItemKey(MAIN), &main), &ids, &mut eager_store, &builder, &producer, &mut eager_model, &Toy, 64).expect("the model program walks");
+
+        let mut lazy_store = MemoryStore::new_in(alloc);
+        let mut lazy_model = Model { alloc, calls: 0 };
+        let mut lazy = Walk::new_in(alloc);
+        let mut scratch = Scratch::new_in(alloc);
+        assert_eq!(lazy.root::<NameError>((ItemKey(PLAIN), &plain), 64).expect("plain is reached"), 0);
+        let main_row = lazy.root::<NameError>((ItemKey(MAIN), &main), 64).expect("main is reached");
+        assert_eq!(main_row, 1);
+        let one = lazy.one(main_row, &ids, &mut lazy_store, &builder, &producer, &mut lazy_model, &Toy, 64, &mut scratch).expect("main is made");
+        assert_eq!(one.declared[2], 0, "main's step names plain's old row");
+        let mut asked = 1;
+        while let Some(row) = last_waiting(&lazy) {
+            lazy.one(row, &ids, &mut lazy_store, &builder, &producer, &mut lazy_model, &Toy, 64, &mut scratch).expect("the row is done");
+            asked += 1;
+            assert!(asked <= 5, "five instances take five steps");
+        }
+        assert_eq!(asked, 5);
+        assert_eq!((lazy.len(), lazy_model.calls), (eager.len(), eager_model.calls));
+        assert_eq!(lazy.counts(), eager.counts());
+        for row in 0..eager.len() {
+            let symbol = eager.symbol(row);
+            let other = lazy.row_of(&symbol).expect("every instance run reached is reached");
+            assert_eq!((lazy.tabled(other), lazy.name(other), lazy.key(other), lazy.how(other)), (eager.tabled(row), eager.name(row), eager.key(row), eager.how(row)));
+            let eager_declared = eager.declared(row).iter().map(|&r| eager.symbol(r as usize));
+            let lazy_declared = lazy.declared(other).iter().map(|&r| lazy.symbol(r as usize));
+            assert!(eager_declared.eq(lazy_declared), "the same callees in the same order");
+            let key = eager.key(row).expect("every model instance is keyed");
+            assert_eq!(lazy_store.get(key).expect("a memory store reads"), eager_store.get(key).expect("a memory store reads"));
+        }
+        assert_eq!((lazy_store.len(), lazy_store.puts), (eager_store.len(), eager_store.puts));
+    }
+
+    /// A step asked twice is one maker call and one put: the second answers the same how, key
+    /// and declared rows, touches neither the maker nor the store, and leaves no made bytes in
+    /// the scratch (it made nothing).
+    #[test]
+    fn a_row_asked_twice_is_made_once() {
+        // The test's one allocator, made at its top: a frame, its memory from the OS.
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let mut store = MemoryStore::new_in(alloc);
+        let ids = Ids::new([0, 0]);
+        let builder = builder();
+        let producer = model_producer();
+        let mut model = Model { alloc, calls: 0 };
+        let mut entry: AVec<'_, u8> = Vec::new_in(alloc);
+        name_of(MAIN, None, &mut entry);
+        let mut walk = Walk::new_in(alloc);
+        let mut scratch = Scratch::new_in(alloc);
+        let root = walk.root::<NameError>((ItemKey(MAIN), &entry), 64).expect("main is reached");
+        let first = walk.one(root, &ids, &mut store, &builder, &producer, &mut model, &Toy, 64, &mut scratch).expect("main is made");
+        let first = (first.how, first.key, <[u32; 3]>::try_from(first.declared).expect("three callees"));
+        let second = walk.one(root, &ids, &mut store, &builder, &producer, &mut model, &Toy, 64, &mut scratch).expect("main is held");
+        let second = (second.how, second.key, <[u32; 3]>::try_from(second.declared).expect("three callees"));
+        assert_eq!(first, second);
+        assert_eq!((model.calls, store.puts, walk.len()), (1, 1, 4));
+        assert!(scratch.made().is_empty(), "the second step made nothing");
+        // A second root call for the same instance is its row, not a new one.
+        assert_eq!(walk.root::<NameError>((ItemKey(MAIN), &entry), 64).expect("main is reached"), root);
+    }
+
+    /// Over a store that already holds every entry (a `run` before), asking each row one at a
+    /// time makes nothing: every step is `Found`, the maker is never called, nothing is put,
+    /// and the scratch holds no made bytes after any step.
+    #[test]
+    fn rows_over_a_full_store_make_nothing() {
+        // The test's one allocator, made at its top: a frame, its memory from the OS.
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let mut store = MemoryStore::new_in(alloc);
+        let ids = Ids::new([0, 0]);
+        let (filled, _) = run_once(&ids, &mut store, alloc);
+        assert_eq!((filled.made, store.puts), (5, 5));
+        let builder = builder();
+        let producer = model_producer();
+        let mut model = Model { alloc, calls: 0 };
+        let mut entry: AVec<'_, u8> = Vec::new_in(alloc);
+        name_of(MAIN, None, &mut entry);
+        let mut walk = Walk::new_in(alloc);
+        let mut scratch = Scratch::new_in(alloc);
+        walk.root::<NameError>((ItemKey(MAIN), &entry), 64).expect("main is reached");
+        let mut asked = 0;
+        while let Some(row) = last_waiting(&walk) {
+            let one = walk.one(row, &ids, &mut store, &builder, &producer, &mut model, &Toy, 64, &mut scratch).expect("the row is found");
+            assert_eq!(one.how, How::Found);
+            assert!(scratch.made().is_empty(), "a found row makes no bytes");
+            asked += 1;
+            assert!(asked <= 5, "five instances take five steps");
+        }
+        assert_eq!((asked, walk.len(), walk.counts().found, model.calls, store.puts), (5, 5, 5, 0, 5));
+    }
+
+    /// An instance without a key (no BodyCheck record) is made and not put, and its entry is
+    /// readable from the scratch: the bytes equal what the maker makes for `main`, and the
+    /// store holds nothing. The control, keyed over another store: the scratch's bytes are the
+    /// entry the store now holds under the row's key.
+    #[test]
+    fn an_unkeyed_instance_is_served_from_the_scratch() {
+        // The test's one allocator, made at its top: a frame, its memory from the OS.
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let builder = builder();
+        let producer = model_producer();
+        let mut entry: AVec<'_, u8> = Vec::new_in(alloc);
+        name_of(MAIN, None, &mut entry);
+        let mut expected: AVec<'_, u8> = Vec::new_in(alloc);
+        Model { alloc, calls: 0 }.make(ItemKey(MAIN), &entry, &mut expected).expect("main's entry");
+        assert!(!expected.is_empty(), "main's entry declares its callees");
+
+        let mut dropped = Ids::new([0, 0]);
+        dropped.recorded = false;
+        let mut store = MemoryStore::new_in(alloc);
+        let mut model = Model { alloc, calls: 0 };
+        let mut walk = Walk::new_in(alloc);
+        let mut scratch = Scratch::new_in(alloc);
+        let root = walk.root::<NameError>((ItemKey(MAIN), &entry), 64).expect("main is reached");
+        let one = walk.one(root, &dropped, &mut store, &builder, &producer, &mut model, &Toy, 64, &mut scratch).expect("main is made");
+        assert_eq!((one.how, one.key, one.declared.len()), (How::Unkeyed(Unkeyed::NoRecord), None, 3));
+        assert_eq!(scratch.made(), expected.as_slice());
+        assert_eq!((store.len(), store.puts, model.calls), (0, 0, 1));
+
+        let ids = Ids::new([0, 0]);
+        let mut keyed_store = MemoryStore::new_in(alloc);
+        let mut keyed = Walk::new_in(alloc);
+        let root = keyed.root::<NameError>((ItemKey(MAIN), &entry), 64).expect("main is reached");
+        let one = keyed.one(root, &ids, &mut keyed_store, &builder, &producer, &mut model, &Toy, 64, &mut scratch).expect("main is made");
+        assert_eq!(one.how, How::Made);
+        let key = one.key.expect("main is keyed");
+        assert_eq!(keyed_store.get(key).expect("a memory store reads"), Some(scratch.made()));
+        assert_eq!(scratch.made(), expected.as_slice());
     }
 }

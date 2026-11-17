@@ -1,4 +1,4 @@
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_sim::{Config, Tape};
 use std::alloc::Global;
 
@@ -12,8 +12,8 @@ fn stream(tape: &Tape) -> Vec<(u64, u64)> {
     })
 }
 
-fn exact(stream: &[(u64, u64)]) -> HashMap<u64, u64, Global> {
-    let mut exact = HashMap::new_in(Global);
+fn exact(stream: &[(u64, u64)]) -> Map<u64, u64, FixedState, Global> {
+    let mut exact = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     for &(key, ticks) in stream {
         *exact.entry(key).or_default() += ticks;
     }
@@ -74,7 +74,7 @@ fn a_key_over_the_floor_is_listed_and_its_exact_ticks_are_never_over() {
             top.offer(key, estimate, ticks);
         }
         let exact = exact(&stream);
-        let listed: HashMap<u64, (u64, u64), Global> =
+        let listed: Map<u64, (u64, u64), FixedState, Global> =
             top.entries().map(|(key, estimate, ticks)| (key, (estimate, ticks))).collect();
         for (key, ticks) in &exact {
             if *ticks > top.floor() {

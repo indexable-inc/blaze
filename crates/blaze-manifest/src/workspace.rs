@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use blaze_core::home::NoHome;
 use blaze_data::Value;
-use blaze_hash::{HashMap, HashSet};
+use blaze_hash::{FixedState, Map, MapOpts, Set, SetOpts};
 use std::alloc::Global;
 
 use crate::error::{self, ManifestError, ResultExt};
@@ -185,13 +185,13 @@ fn find_root_iter<'a, F: Files>(
 pub struct Workspace<'c, F: Files> {
     ctx: &'c Context<F>,
     current_manifest: PathBuf,
-    packages: HashMap<PathBuf, EitherManifest, Global>,
+    packages: Map<PathBuf, EitherManifest, FixedState, Global>,
     root_manifest: Option<PathBuf>,
     target_dir: Option<PathBuf>,
     build_dir: Option<PathBuf>,
     /// In the order cargo finds them, which is the order `cargo metadata` prints them.
     members: Vec<PathBuf>,
-    member_set: HashSet<PathBuf, Global>,
+    member_set: Set<PathBuf, FixedState, Global>,
     default_members: Vec<PathBuf>,
     resolve_behavior: ResolveBehavior,
     custom_metadata: Option<Value<Global>>,
@@ -206,12 +206,12 @@ impl<'c, F: Files> Workspace<'c, F> {
         let mut ws = Workspace {
             ctx,
             current_manifest: manifest_path.to_owned(),
-            packages: HashMap::new_in(Global),
+            packages: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             root_manifest: None,
             target_dir: None,
             build_dir: None,
             members: Vec::new(),
-            member_set: HashSet::new_in(Global),
+            member_set: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }),
             default_members: Vec::new(),
             resolve_behavior: ResolveBehavior::V1,
             custom_metadata: None,
@@ -525,7 +525,7 @@ impl<'c, F: Files> Workspace<'c, F> {
     }
 
     fn validate_unique_names(&self) -> Result<(), WorkspaceError> {
-        let mut names = HashMap::new_in(Global);
+        let mut names = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for member in &self.members {
             let name = match self.get(member) {
                 EitherManifest::Real(m) => &m.package_id.name,

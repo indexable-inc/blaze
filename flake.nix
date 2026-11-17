@@ -33,15 +33,15 @@
         };
         # The one LLVM the `llvm` feature builds against, for every build of it: the dev shells
         # here, CI (`.#llvm`, .github/actions/toolchain), the flake's `dist` and the release.
-        # crates/hir-ty-codegen/llvm.json pins it: LLVM 23.1.4, built for each target by
+        # crates/blaze-toolchain/pins/llvm.json pins it: LLVM 23.1.4, built for each target by
         # .github/scripts/llvm.py (the llvm workflow) and fetched here by its sha256. Its static libraries, headers, llvm-config,
         # llvm-dwarfdump and llvm-pdbutil; LLVM_SYS_231_PREFIX names it, and
         # vendor/llvm-sys links it statically, and its build script (pin.rs) refuses any other. Its tools were
         # built on Ubuntu 22.04 with the C++ runtime linked in: on Linux they are pointed at the
         # store's libc.
-        llvmPin = builtins.fromJSON (builtins.readFile ./crates/hir-ty-codegen/llvm.json);
+        llvmPin = builtins.fromJSON (builtins.readFile ./crates/blaze-toolchain/pins/llvm.json);
         llvm =
-          let pin = llvmPin.targets.${triple} or (throw "crates/hir-ty-codegen/llvm.json has no LLVM for ${triple}: run the llvm workflow");
+          let pin = llvmPin.targets.${triple} or (throw "crates/blaze-toolchain/pins/llvm.json has no LLVM for ${triple}: run the llvm workflow");
           in pkgs.stdenv.mkDerivation {
             pname = "blaze-llvm";
             inherit (llvmPin) version;

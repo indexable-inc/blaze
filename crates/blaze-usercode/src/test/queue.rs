@@ -52,7 +52,7 @@
 
 use std::{borrow::Cow, ffi::OsString, io::Write as _, path::PathBuf, sync::Arc, time::Duration};
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use std::alloc::Global;
 
 use blaze_core::{
@@ -1642,7 +1642,7 @@ impl Queue {
     ) -> Result<(), String> {
         let cores = self.config.jobs;
         let bin = &mut self.bins[b];
-        let jobs: HashMap<&str, u32, Global> =
+        let jobs: Map<&str, u32, FixedState, Global> =
             bin.plan.jobs.iter().enumerate().map(|(j, it)| (it.name.as_str(), j as u32)).collect(); // alloc: setup, once per server: the hello
         let mut expected: Vec<u64> = Vec::with_capacity(bin.plan.jobs.len()); // alloc: setup, once per server: the hello
         expected.extend(bin.plan.jobs.iter().map(|it| nanos(it.expected)));

@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use blaze_codegen::Arch;
 use blaze_graph::par;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::radix;
 use std::alloc::Global;
 
@@ -2093,7 +2093,7 @@ impl<'a> Stage<'a> {
                 let from = chunk * DEBUG_CHUNK;
                 // alloc: once per task of DEBUG_CHUNK functions, its files (a few)
                 let mut met: Met<'_> = Vec::new();
-                let mut file_of: HashMap<(IdNo, u32), u32, Global> = HashMap::new_in(Global);
+                let mut file_of: Map<(IdNo, u32), u32, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
                 let mut last: Option<(&blaze_ids::ContentId, IdNo, &crate::position::Spans)> = None;
                 let mut at = 0;
                 for (info, _) in &functions[from..(from + DEBUG_CHUNK).min(functions.len())] {
@@ -2139,7 +2139,7 @@ impl<'a> Stage<'a> {
         ); // alloc: once per stage that makes debug info, a result per task
         // alloc: once per stage that makes debug info, the files and each task's numbers for its own
         let mut files: Vec<&str> = Vec::new();
-        let mut file_of: HashMap<(IdNo, u32), u32, Global> = HashMap::new_in(Global);
+        let mut file_of: Map<(IdNo, u32), u32, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         let mut renumber: Vec<Vec<u32>> = Vec::with_capacity(met.len());
         for met in met {
             let numbers = met?

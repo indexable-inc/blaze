@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use blaze_hash::{HashMap, HashSet};
+use blaze_hash::{FixedState, Map, MapOpts, Set};
 use std::alloc::Global;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -205,7 +205,7 @@ where
 {
     use FeatureValue::*;
     // Each name in `[dependencies]` and whether any entry of that name is optional.
-    let mut dep_map: HashMap<InternedString, bool, Global> = HashMap::new_in(Global);
+    let mut dep_map: Map<InternedString, bool, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     for dep in dependencies.clone() {
         // clone: an iterator over borrowed dependencies
         *dep_map.entry(dep.name_in_toml).or_insert(false) |= dep.optional;
@@ -218,7 +218,7 @@ where
 
     // The implicit feature of an optional dependency that no `dep:` names and no feature of
     // the same name replaces.
-    let explicitly_listed: HashSet<_, Global> =
+    let explicitly_listed: Set<_, FixedState, Global> =
         map.values().flatten().filter_map(|fv| fv.explicit_dep_name()).collect(); // alloc: once per package
     for dep in dependencies.clone() {
         // clone: an iterator over borrowed dependencies
@@ -301,7 +301,7 @@ where
     }
 
     // Every optional dependency is enabled by some feature.
-    let used: HashSet<_, Global> = map
+    let used: Set<_, FixedState, Global> = map
         .values()
         .flatten()
         .filter_map(|fv| match fv {

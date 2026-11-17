@@ -18,7 +18,7 @@ use crate::{
     vec::{Vec, out_of_bounds},
 };
 
-/// Rows of `T` in one item array and one array of row ends ([module](self)).
+/// Rows of `T` in one item array and one array of row ends ([module](self)): two blocks in all, 4 bytes a row past its items.
 pub struct Lists<T, A: Allocator> {
     items: Vec<T, A>,
     /// Where each row ends in `items`; row `i` is `ends[i - 1]..ends[i]` (`0..ends[0]` for the

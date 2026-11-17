@@ -164,6 +164,9 @@ pub enum What {
     Closed { first: usize },
     /// `[[a]]` where `a` is not an array of tables.
     NotAnArrayOfTables { first: usize },
+    /// The document's allocator refused memory for its columns: a fact of the caller's
+    /// allocator, not of the text, returned so the caller fails its own job (rule 20).
+    Memory(blaze_own::AllocFailure),
 }
 
 impl Show for What {
@@ -190,6 +193,12 @@ impl Show for What {
             What::NotATable { first } => out.str("the key at byte ").int(first).str(" is not a table"),
             What::Closed { first } => out.str("the inline table or array at byte ").int(first).str(" is closed once written"),
             What::NotAnArrayOfTables { first } => out.str("the key at byte ").int(first).str(" is not an array of tables"),
+            What::Memory(blaze_own::AllocFailure::Refused { what, layout }) => {
+                out.str("the allocator refused ").int(layout.size()).str(" bytes for the document's `").str(what).str("`")
+            }
+            What::Memory(blaze_own::AllocFailure::CapacityOverflow { what, .. }) => {
+                out.str("the document's `").str(what).str("` would pass the largest size an allocation may have")
+            }
         };
     }
 }

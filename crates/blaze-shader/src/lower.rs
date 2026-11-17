@@ -28,7 +28,7 @@
 use std::alloc::Global;
 
 use base_db::Db;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use hir_def::{AdtId, CallableDefId, EnumId, EnumVariantId, FunctionId, StaticId, VariantId};
 use hir_ty::{
     MemoryMap, ParamEnvAndCrate, PointerCast,
@@ -85,8 +85,8 @@ pub struct Device<'db> {
     pub(crate) stored: StoredParamEnvAndCrate,
     pub(crate) little_endian: bool,
     pub module: naga::Module,
-    types: HashMap<Ty<'db>, Lowered, Global>,
-    consts: HashMap<(Ty<'db>, Box<[u8]>), Handle<naga::Constant>, Global>,
+    types: Map<Ty<'db>, Lowered, FixedState, Global>,
+    consts: Map<(Ty<'db>, Box<[u8]>), Handle<naga::Constant>, FixedState, Global>,
     /// The next resource binding number; each resource of the module has its own, and each
     /// entry's MSL map sends its own to its slots.
     next_binding: u32,
@@ -186,8 +186,8 @@ struct Frame<'db> {
     /// the device's `i32` tag here.
     discriminants: Vec<m::LocalId>,
     /// What each block's call runs, decided once.
-    calls: HashMap<m::BasicBlockId, Target<'db>, Global>,
-    nodes: HashMap<m::BasicBlockId, u32, Global>,
+    calls: Map<m::BasicBlockId, Target<'db>, FixedState, Global>,
+    nodes: Map<m::BasicBlockId, u32, FixedState, Global>,
     /// The caller: its frame, where the value goes, and the node it returns to.
     caller: Option<(usize, m::StoredPlace, u32)>,
 }
@@ -241,12 +241,12 @@ struct EntryCx<'d, 'db> {
     frames: Vec<Frame<'db>>,
     nodes: Vec<Node>,
     /// The frame each inlined call site made, by its frame and block.
-    callees: HashMap<(usize, m::BasicBlockId), usize, Global>,
+    callees: Map<(usize, m::BasicBlockId), usize, FixedState, Global>,
     func: naga::Function,
     /// Snapshot variables of indices, by the statement that takes the reference and the step.
-    snapshots: HashMap<(usize, m::BasicBlockId, usize, usize), Handle<LocalVariable>, Global>,
+    snapshots: Map<(usize, m::BasicBlockId, usize, usize), Handle<LocalVariable>, FixedState, Global>,
     /// The statements that take a reference, with the snapshots each writes.
-    snapshot_writes: HashMap<(usize, m::BasicBlockId, usize), Vec<(Handle<LocalVariable>, m::LocalId)>, Global>,
+    snapshot_writes: Map<(usize, m::BasicBlockId, usize), Vec<(Handle<LocalVariable>, m::LocalId)>, FixedState, Global>,
     blocks: Vec<naga::Block>,
     flag: Option<Handle<LocalVariable>>,
     /// The entry's arguments and result: their naga types.

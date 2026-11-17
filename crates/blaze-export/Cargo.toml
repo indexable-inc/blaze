@@ -33,6 +33,8 @@ blaze-native = { path = "../blaze-native" }
 [dev-dependencies]
 # `Alloc::global()`, the handle the tests hand every function.
 blaze-own = { workspace = true, features = ["std", "testing"] }
+# The example's entry frame and each test's top frame: memory from the OS, handed down.
+blaze-mem.workspace = true
 # tests/native_run.rs: `FixedState`, the seed blaze-native's `resolve::plan` takes.
 blaze-hash.workspace = true
 # tests/native_run.rs: `toolchain::{PIN, clang_pin}`, the one home of the pinned clang's digest

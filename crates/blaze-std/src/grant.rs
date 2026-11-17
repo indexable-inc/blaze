@@ -96,6 +96,9 @@ pub enum Kind {
     Mem,
     /// The program's own run spec ([`Spec`]). Fills itself.
     Spec,
+    /// The process's heap ([`crate::mem::Heap`]), handed down by the entry (D120). Fills
+    /// itself: it reaches nothing outside the process.
+    Heap,
     /// A folder ([`Dir`]): read only, or read and write.
     Dir { write: bool },
     /// One network endpoint ([`crate::net::Net`]), connected to or listened on.
@@ -110,11 +113,11 @@ impl Kind {
     /// Whether a parameter of this kind is filled with no grant: it reaches nothing outside
     /// the process.
     pub const fn fills_itself(self) -> bool {
-        matches!(self, Kind::Args | Kind::Out | Kind::In | Kind::Clock | Kind::Mem | Kind::Spec)
+        matches!(self, Kind::Args | Kind::Out | Kind::In | Kind::Clock | Kind::Mem | Kind::Spec | Kind::Heap)
     }
 
     /// The kinds that fill themselves ([`Kind::fills_itself`]).
-    pub const FILLS_ITSELF: [Kind; 6] = [Kind::Args, Kind::Out, Kind::In, Kind::Clock, Kind::Mem, Kind::Spec];
+    pub const FILLS_ITSELF: [Kind; 7] = [Kind::Args, Kind::Out, Kind::In, Kind::Clock, Kind::Mem, Kind::Spec, Kind::Heap];
 
     /// Whether the kind named `name` in the manifest's JSON (and on the hosted wire) fills
     /// itself: what a host answers with no grant (crate::hosting's `grant`).
@@ -131,6 +134,7 @@ impl Kind {
             Kind::Clock => "clock",
             Kind::Mem => "mem",
             Kind::Spec => "spec",
+            Kind::Heap => "heap",
             Kind::Dir { .. } => "dir",
             Kind::Net => "net",
             Kind::Env => "env",
@@ -145,7 +149,7 @@ impl Kind {
             Kind::Net => "<host>:<port>",
             Kind::Env => "<NAME>,<NAME>",
             Kind::Whole(_) => "whole",
-            Kind::Args | Kind::Out | Kind::In | Kind::Clock | Kind::Mem | Kind::Spec => "",
+            Kind::Args | Kind::Out | Kind::In | Kind::Clock | Kind::Mem | Kind::Spec | Kind::Heap => "",
         }
     }
 
@@ -158,6 +162,7 @@ impl Kind {
             Kind::Clock => "Clock",
             Kind::Mem => "Mem",
             Kind::Spec => "Spec",
+            Kind::Heap => "Heap",
             Kind::Dir { write: false } => "Dir<ReadOnly>",
             Kind::Dir { write: true } => "Dir<ReadWrite>",
             Kind::Net => "Net",
@@ -246,7 +251,7 @@ impl Manifest {
                 Kind::Whole(capability) => {
                     map.insert(key("capability"), Value::Text(key(capability)));
                 }
-                Kind::Args | Kind::Out | Kind::In | Kind::Clock | Kind::Mem | Kind::Spec | Kind::Net | Kind::Env => {}
+                Kind::Args | Kind::Out | Kind::In | Kind::Clock | Kind::Mem | Kind::Spec | Kind::Heap | Kind::Net | Kind::Env => {}
             }
             compose::write_shape(param, &mut map, a.clone());
             params.push(Value::Map(map));
@@ -450,6 +455,11 @@ impl<'g> Granting<'g> {
         self.given.spec
     }
 
+    /// The process's heap, as the entry handed it to the launcher (D120).
+    pub fn heap(&self) -> crate::mem::Heap {
+        self.given.heap
+    }
+
     /// The process's world: where its command line, its output and its error are.
     pub fn process(&self) -> &'g Io {
         self.given.real
@@ -491,7 +501,7 @@ impl<'g> Granting<'g> {
     label = "not a capability `main` may take",
     note = "a `main` names each capability it uses; a whole world (`Io`) cannot be asked for. Write \
             `out: Out` (standard output), `err: Out` (standard error), `args: Args`, `clock: Clock`, \
-            `mem: Mem`, `spec: Spec` or `input: In` (standard input), which fill themselves; or, granted by name, `data: Dir<ReadOnly>` \
+            `mem: Mem`, `heap: Heap` (the process's heap), `spec: Spec` or `input: In` (standard input), which fill themselves; or, granted by name, `data: Dir<ReadOnly>` \
             or `Dir<ReadWrite>` (a folder), `api: Net` (one endpoint), `env: Env` (named variables), \
             or a whole capability (`Fs`, `Rng`, `Host`, `Http`, ...) (bstd::grant::Grant)"
 )]
@@ -572,6 +582,21 @@ impl Grant for Spec {
     fn grant(from: &Granting<'_>) -> Result<Spec, Want> {
         // clone: the spec's handle, a refcount.
         Ok(from.spec().clone())
+    }
+}
+
+/// The process's heap: the one the entry took and handed the launcher (D120), never a heap
+/// reached for here. A `main` that does not name it is handed none.
+impl Grant for crate::mem::Heap {
+    const KIND: Kind = Kind::Heap;
+
+    fn grant(from: &Granting<'_>) -> Result<crate::mem::Heap, Want> {
+        Ok(from.heap())
+    }
+
+    /// The hosted run's heap, which its start (`guest::start`) was handed by bstd's entry.
+    fn hosted(_io: &Io, _: &str) -> Option<crate::mem::Heap> {
+        Some(crate::guest::heap())
     }
 }
 
@@ -716,6 +741,8 @@ pub struct Given<'g> {
     spec: &'g Spec,
     started: Started,
     manifest: &'static Manifest,
+    /// The process's heap the entry handed down: what a `heap: Heap` parameter is (D120).
+    heap: crate::mem::Heap,
 }
 
 impl<'g> Given<'g> {
@@ -726,8 +753,9 @@ impl<'g> Given<'g> {
         spec: &'g Spec,
         started: Started,
         manifest: &'static Manifest,
+        heap: crate::mem::Heap,
     ) -> Given<'g> {
-        Given { cx, real, fake, spec, started, manifest }
+        Given { cx, real, fake, spec, started, manifest, heap }
     }
 }
 
@@ -792,12 +820,14 @@ fn needs_fake(spec: &RunSpec<LaunchAlloc>) -> bool {
 }
 
 /// `body`, the macro's filling and call of `main`, as the `main` the entry runs: its root
-/// context narrowed to the spec's time limit.
+/// context narrowed to the spec's time limit; `heap` is the entry's, what a `heap: Heap`
+/// parameter is handed.
 pub fn main_of<'p, R: Outcome>(
     manifest: &'static Manifest,
     spec: &'p Spec,
     started: Started,
     fake: Option<&'p Io>,
+    heap: crate::mem::Heap,
     body: impl FnOnce(&mut Given<'_>) -> Result<R, Refused> + 'p,
 ) -> impl FnOnce(&Cx, Io) -> Launched<R> + 'p {
     move |root: &Cx, io: Io| {
@@ -805,7 +835,7 @@ pub fn main_of<'p, R: Outcome>(
             root.until(blaze_core::wait::Deadline::after(io.now(), core::time::Duration::from_millis(ms)))
         });
         let cx = limited.as_ref().unwrap_or(root);
-        let mut given = Given::new(cx, &io, fake, spec, started, manifest);
+        let mut given = Given::new(cx, &io, fake, spec, started, manifest, heap);
         match body(&mut given) {
             Ok(ran) => Launched::Ran(ran),
             Err(refused) => Launched::Refused(refused),

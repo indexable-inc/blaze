@@ -25,8 +25,11 @@
 //!   ([`Ask::of_self`]; front2/const_open.rs, where the three states are told apart);
 //! - a type that is not `bool`, `char` or an integer ([`prim_name`]): the item text spells its
 //!   type, and only those are spelled the same in every module.
-//! OWED: the scope is the MODULE's, so an expression naming an item declared in a block is
-//! resolved at the module (as a plain constant path already is, types.rs `const_value_bits`).
+//! A BODY's expression that names an item declared in the body (`[0; 2 + SEP_LEN]`) is filed
+//! under the body and the block it is written in ([`Ask::in_body`]), its names read there
+//! first; every other expression is the module's. OWED: a block's glob `use` and a block's
+//! `use .. as _` trait are not seen from such a constant's body (front2/glob_uses.rs and
+//! front2/block_traits.rs walk local items' heads only).
 
 use std::alloc::Global;
 use std::boxed::Box;
@@ -61,6 +64,10 @@ pub struct Ask {
     /// ([`Ask::of_self`]): a type of the store's table (the enclosing head's own self type,
     /// made before the ask). `None`: the expression names no `Self`.
     pub self_ty: Option<tc::PTy>,
+    /// The body and the block (its `ScopeId`) the expression is written in, for one that names
+    /// an item declared in the body ([`Ask::in_body`]): its names are read there first, then
+    /// at the module. `None`: a constant of the module.
+    pub body: Option<(ItemKey, u32)>,
 }
 
 /// Why an asked anonymous constant could not be filed.
@@ -143,7 +150,28 @@ impl Ask {
         }
         let name = format!("{prim}: {text}").into_boxed_str();
         let need = need_key(anon_const_key(checker_of(module), &name));
-        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: None })
+        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: None, body: None })
+    }
+
+    /// The anonymous constant `text` of type `ty` written in block `scope` of the body `owner`
+    /// (in `module`), for an expression that names an item declared in the body (alloy's
+    /// `FixedBytes` `Display`: "const SEP_LEN: usize = '…'.len_utf8(); let mut buf = [0; 2 + 4 +
+    /// SEP_LEN + 4];"). The Reference, "Statements", "Item declarations": "Declaring an item
+    /// within a statement block restricts its scope to the block containing the statement",
+    /// so the constant's names are read in that block and the blocks around it before the
+    /// module ([`super::locals::Locals::find`], through `Locals::file_anon`). Its key is a
+    /// function of (the module, the type, the text, the body, the block): the block's id is
+    /// an ordinal of the body's lowering, a function of the body's text alone, as a local
+    /// item's key is. `None` as [`Ask::of`].
+    pub fn in_body(module: LibKey, ty: PNode, text: &str, owner: ItemKey, scope: u32) -> Option<Ask> {
+        let text = text.trim();
+        let prim = prim_name(ty)?;
+        if text.is_empty() {
+            return None;
+        }
+        let name = format!("{prim}: {text} in the body {:x} at block {scope}", owner.0).into_boxed_str();
+        let need = need_key(anon_const_key(checker_of(module), &name));
+        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: None, body: Some((owner, scope)) })
     }
 
     /// The anonymous constant `text` of type `ty` written in `module` where `Self` is the
@@ -168,7 +196,7 @@ impl Ask {
         }
         .into_boxed_str();
         let need = need_key(anon_const_key(checker_of(module), &name));
-        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: Some(self_ty) })
+        Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: Some(self_ty), body: None })
     }
 }
 
@@ -192,6 +220,21 @@ pub fn self_value<H: super::types::Heads + ?Sized>(heads: &H, module: LibKey, ty
     if heads.ask_anon(ask) { Err(Why::NeedConst(need, r)) } else { Err(Why::ConstPath(Box::from(text), r)) }
 }
 
+/// The value of the body's anonymous constant `ask` ([`Ask::in_body`]), read as
+/// [`self_value`] reads one: its bits once evaluated, the evaluator's refusal by the
+/// expression's name, [`Why::NeedConst`] naming it until the driver has filed and evaluated it.
+pub fn body_value<H: super::types::Heads + ?Sized>(heads: &H, ask: Ask, r: blaze_surface::Range) -> Result<u128, Why> {
+    if let Some(bits) = heads.const_bits(ask.need) {
+        return Ok(bits);
+    }
+    if let Some(why) = heads.anon_failed(ask.need) {
+        return Err(Why::ConstPath(format!("{}: {why}", ask.text).into_boxed_str(), r));
+    }
+    let need = ask.need;
+    let text = ask.text.clone();
+    if heads.ask_anon(ask) { Err(Why::NeedConst(need, r)) } else { Err(Why::ConstPath(text, r)) }
+}
+
 /// Files every anonymous constant the type builder asked for since the last call
 /// (`Maps::anon_asked`) as a constant item's head in `store.fns`, its key in `keys`: after
 /// this, `Consts::value(checker_of(ask.need))` lowers, checks and evaluates it. One already
@@ -205,13 +248,17 @@ pub fn file_asked<'n>(store: &mut Store<'n>, keys: &mut Keys) -> Result<Vec<LibK
         needs.push(a.need);
         let module = keys.item(a.module).map_err(FileFail::Clash)?;
         let key = keys.member(module, MemberKind::Anon, &a.name).map_err(FileFail::Clash)?;
+        // A body's constant reads its names in the block it is written in first.
+        if let Some((owner, scope)) = a.body {
+            store.locals.file_anon(key, owner, scope);
+        }
         if store.fns.contains_key(&key) {
             continue;
         }
         let prim = prim_name(a.ty).ok_or(FileFail::NoName(a.ty))?;
         let text: &'n str = store.locals.keep_text(&format!("const _: {prim} = {};", a.text));
         let output = intern(&mut store.tys, a.ty).map_err(FileFail::Type)?;
-        let header = tc::FnPtrHeader { abi: tc::Abi::Rust, safety: tc::Safety::Safe };
+        let header = tc::FnPtrHeader::RUST;
         store.preds.insert(key, Preds::new());
         store.fns.insert(
             key,
@@ -225,6 +272,7 @@ pub fn file_asked<'n>(store: &mut Store<'n>, keys: &mut Keys) -> Result<Vec<LibK
                 self_param: false,
                 header,
                 c_variadic: false,
+                legacy_const_generics: Vec::new_in(Global),
                 inputs: Vec::new_in(Global),
                 output,
                 has_body: true,

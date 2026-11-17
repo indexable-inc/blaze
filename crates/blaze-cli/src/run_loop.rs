@@ -1,7 +1,8 @@
 //! `blaze run`'s parent loop (docs/v2/plan/design/run.md, "Pieces" item 6; bottom.md section
 //! 11): the program started in a process of its own under the launcher's run mode
-//! ([`run_program`]), its first calls served from the records [`crate::run_parent::lay_out`]
-//! filed ([`drive`]), until it ends; its status is `blaze run`'s ([`status_of`]).
+//! ([`run_program`]), each first call answered through the [`Resolve`] seam
+//! ([`crate::run_parent::Lazy`]: one step of the record walk, the record filed before it is
+//! published) ([`drive`]), until it ends; its status is `blaze run`'s ([`status_of`]).
 //!
 //! What the parent forwards: nothing but the answers. The program's standard input, output and
 //! error are the command's own ([`Streams::INHERIT`]: `blaze run | consumer` sees the
@@ -42,7 +43,7 @@ use bstd::Cx;
 use bstd::Deadline;
 use bstd::procs::{ChannelError, Ended, GRACE, Held, Message, ParentDeath, ParentSignals, Relay, RelayAct, RunChild, RunError, RunFault, RunSpec, SignalError, Spawner, Streams};
 
-use crate::run_parent::{Needs, ParentError, TICK, WRITE_BOUND, status_of};
+use crate::run_parent::{Needs, ParentError, Resolve, TICK, WRITE_BOUND, status_of};
 
 /// The loop's bounds: how long one read waits before the child is looked at, how long a write
 /// of answers may take, the run's own deadline, and how long a program asked to end by a
@@ -92,7 +93,10 @@ pub(crate) struct Launch<'a> {
 /// Why the loop stopped without the program's status.
 #[derive(Debug)]
 pub enum LoopError {
-    /// Starting the child, or a step on it, failed.
+    /// The child could not be started (the launcher's spawn): own_process.rs names the launcher
+    /// it tried and whether the file is there.
+    Start(RunError),
+    /// A step on the started child failed.
     Child(RunError),
     /// A need could not be answered (a bad message, a slot never declared, the table full).
     Parent(ParentError),
@@ -105,6 +109,7 @@ pub enum LoopError {
 impl fmt::Display for LoopError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            LoopError::Start(error) => write!(f, "blaze run: the program's process did not start: {error}"),
             LoopError::Child(error) => write!(f, "blaze run: the program's process: {error}"),
             LoopError::Parent(error) => write!(f, "blaze run: answering the program: {error}"),
             LoopError::Deadline { at, killed } => {
@@ -137,11 +142,16 @@ enum Plant {
 /// start to the return ([`Held`]). Held after the start, not before: an ignored disposition
 /// survives `execve` and the start keeps it (blaze-core spawn.rs), so the program would never
 /// see its Ctrl-C (blaze-core run_signals.rs, the module's doc, names the window this leaves).
-pub(crate) fn run_program<'a>(
+/// `ahead` is written to the program right after the start, before any of its messages is
+/// read: today's start list placed (`Needs::place_ahead`), or nothing. Each need's symbol not
+/// resolved yet is asked of `resolve`.
+pub(crate) fn run_program<'a, R: Resolve + ?Sized>(
     cx: &Cx,
     spawner: &Spawner,
     launch: &Launch<'_>,
     needs: &mut Needs<'a>,
+    resolve: &mut R,
+    ahead: &[u8],
     alloc: Alloc<'a>,
 ) -> Result<Ran, LoopError> {
     let spec = RunSpec {
@@ -155,33 +165,39 @@ pub(crate) fn run_program<'a>(
         own_group: false,
         parent_death: ParentDeath::STRONGEST,
     };
-    let mut child = spawner.start_run(cx, &spec).map_err(LoopError::Child)?;
+    let mut child = spawner.start_run(cx, &spec).map_err(LoopError::Start)?;
     // A hold refused returns here: the child's drop kills and reaps it (bstd `Run`).
     let mut held = Held::hold().map_err(LoopError::Signals)?;
     let mut inbox = std::vec::Vec::new_in(alloc);
     let mut out = std::vec::Vec::new_in(alloc);
-    let ran = drive(&mut child, needs, &Bounds::run(), &mut held, &mut inbox, &mut out);
+    let ran = drive(&mut child, needs, resolve, ahead, &Bounds::run(), &mut held, &mut inbox, &mut out);
     // The dispositions back (on an unwind, the drop does the same), then the program's end.
     drop(held);
     ran
 }
 
-/// `child` served from `needs` until it ends, the parent's SIGTERM read from `signals`: see
-/// the module's doc.
-pub(crate) fn drive<C: RunChild, S: ParentSignals, A: Allocator>(
+/// `child` served from `needs` (asking `resolve`) until it ends, `ahead` written first, the
+/// parent's SIGTERM read from `signals`: see the module's doc.
+#[expect(clippy::too_many_arguments, reason = "the loop's edge: each argument one handle or buffer of it")]
+pub(crate) fn drive<C: RunChild, S: ParentSignals, R: Resolve + ?Sized, A: Allocator>(
     child: &mut C,
     needs: &mut Needs<'_>,
+    resolve: &mut R,
+    ahead: &[u8],
     bounds: &Bounds,
     signals: &mut S,
     inbox: &mut std::vec::Vec<u8, A>,
     out: &mut std::vec::Vec<u8, A>,
 ) -> Result<Ran, LoopError> {
-    drive_with(child, needs, bounds, signals, inbox, out, Plant::None)
+    drive_with(child, needs, resolve, ahead, bounds, signals, inbox, out, Plant::None)
 }
 
-fn drive_with<C: RunChild, S: ParentSignals, A: Allocator>(
+#[expect(clippy::too_many_arguments, reason = "`drive` and the test's plant")]
+fn drive_with<C: RunChild, S: ParentSignals, R: Resolve + ?Sized, A: Allocator>(
     child: &mut C,
     needs: &mut Needs<'_>,
+    resolve: &mut R,
+    ahead: &[u8],
     bounds: &Bounds,
     signals: &mut S,
     inbox: &mut std::vec::Vec<u8, A>,
@@ -192,6 +208,16 @@ fn drive_with<C: RunChild, S: ParentSignals, A: Allocator>(
     let mut served = 0u64;
     let mut torn = None;
     let mut relay = Relay::new(bounds.grace);
+    // Today's start list, before any of the program's messages is read (run.md D124).
+    if !ahead.is_empty() {
+        let by = Deadline::after(child.now(), bounds.write).min(bounds.until);
+        match child.send(ahead, by) {
+            Ok(()) => {}
+            // The child's end closed before it read them: its end is next.
+            Err(RunError { fault: RunFault::Channel(ChannelError::Hangup), .. }) => open = false,
+            Err(error) => return Err(LoopError::Child(error)),
+        }
+    }
     loop {
         let now = child.now();
         if bounds.until.passed(now) {
@@ -222,7 +248,7 @@ fn drive_with<C: RunChild, S: ParentSignals, A: Allocator>(
         if open {
             match child.recv_message(inbox, LONGEST_FRAME, tick) {
                 Ok(Message::Whole { .. }) => {
-                    let taken = needs.serve(&inbox[..], out).map_err(LoopError::Parent)?;
+                    let taken = needs.serve(resolve, &inbox[..], out).map_err(LoopError::Parent)?;
                     served += count(&inbox[..taken]);
                     match plant {
                         // The served prefix out, the rest kept in order (`drain` wants the
@@ -301,8 +327,10 @@ mod tests {
     use blaze_launch::Thread;
     use blaze_launch::wire::RecordId;
     use blaze_launch::wire::run::{Needed, Symbol, Up};
+    use blaze_ladder::code_records::CodeKey;
 
     use super::*;
+    use crate::run_parent::Resolved;
 
     const SEEDS: u64 = 64;
 
@@ -312,12 +340,23 @@ mod tests {
         out
     }
 
-    fn needs(alloc: Alloc<'_>) -> Needs<'_> {
-        let mut index = blaze_own::Vec::new_in(alloc);
-        for symbol in 1u8..=3 {
-            index.push(([symbol; 32], RecordId([symbol * 10; 32])));
+    /// The program's three functions: symbol `n` (every byte `n`, 1 to 3) has record `10 n`
+    /// and declares nothing; any other symbol is unknown. The loop's tests are about the loop,
+    /// so the resolver is a table (run_parent.rs's tests cover the lazy one).
+    struct Table;
+
+    impl Resolve for Table {
+        fn resolve(&mut self, symbol: &Symbol) -> Result<Resolved<'_>, ParentError> {
+            let n = symbol.0[0];
+            Ok(match (1..=3).contains(&n) && symbol.0 == [n; 32] {
+                true => Resolved::Record { key: CodeKey(blaze_ids::ContentId([n; 32])), record: RecordId([n * 10; 32]), declares: &[] },
+                false => Resolved::Unknown,
+            })
         }
-        Needs::new(index, alloc).expect("one record a symbol")
+    }
+
+    fn index(_alloc: Alloc<'_>) -> Table {
+        Table
     }
 
     fn bounds(until: Duration) -> Bounds {
@@ -325,13 +364,17 @@ mod tests {
     }
 
     fn run(acts: &[Act<'_>], seed: u64, until: Duration, plant: Plant) -> (Result<Ran, LoopError>, u32, bool, u64, Duration) {
-        let alloc = Alloc::global();
-        let mut needs = needs(alloc);
+        // One frame a case, made here (its memory the OS's), handed down as a handle.
+        let frame = bstd::mem::Frame::with_reserve(1 << 16, bstd::mem::Tag::Other).expect("the case's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let mut needs = Needs::new(alloc);
+        let mut index = index(alloc);
         let mut child = SimChild::new(acts, seed, ProcId(42));
         let mut inbox = std::vec::Vec::new();
         let mut out = std::vec::Vec::new();
         let mut signals = Scripted::new(&[]);
-        let ran = drive_with(&mut child, &mut needs, &bounds(until), &mut signals, &mut inbox, &mut out, plant);
+        let ran = drive_with(&mut child, &mut needs, &mut index, &[], &bounds(until), &mut signals, &mut inbox, &mut out, plant);
         (ran, child.answers(), child.killed(), child.trace(), child.now())
     }
 
@@ -349,13 +392,17 @@ mod tests {
     /// `acts` under the loop with `bounds`, the parent's signals arriving as `arrivals` say, the
     /// program answering a SIGTERM as `on` says.
     fn run_signalled(acts: &[Act<'_>], seed: u64, bounds: &Bounds, arrivals: &[(Duration, Arrived)], on: OnTerminate, plant: Plant) -> Seen {
-        let alloc = Alloc::global();
-        let mut needs = needs(alloc);
+        // One frame a case, made here (its memory the OS's), handed down as a handle.
+        let frame = bstd::mem::Frame::with_reserve(1 << 16, bstd::mem::Tag::Other).expect("the case's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let mut needs = Needs::new(alloc);
+        let mut index = index(alloc);
         let mut child = TermChild::new(SimChild::new(acts, seed, ProcId(42)), on, ProcId(42));
         let mut signals = Scripted::new(arrivals);
         let mut inbox = std::vec::Vec::new();
         let mut out = std::vec::Vec::new();
-        let ran = drive_with(&mut child, &mut needs, bounds, &mut signals, &mut inbox, &mut out, plant);
+        let ran = drive_with(&mut child, &mut needs, &mut index, &[], bounds, &mut signals, &mut inbox, &mut out, plant);
         Seen {
             ran,
             killed: child.inner().killed(),

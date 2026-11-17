@@ -9,9 +9,11 @@
 //! | [`bits`] | bit-packing: `n` values of `w` bits end to end, least significant bit first; `get(i)` is one unaligned load, a shift and a mask; eight values unpack by one 16-byte load and a byte shuffle (`swizzle_dyn`) a part |
 //! | [`block`] | the schemes of one block of 1,024 integers: frame of reference, frame against a line, run-length, delta, delta of delta; each block's scheme and parameters in a fixed 24-byte directory entry, its body only packed values |
 //! | [`ints`] | an integer column: blocks behind a directory, or a dictionary (distinct values in first-use order) over a column of codes; the chooser |
+//! | [`ef`] | a sorted list of distinct `u64` ids below a bound, in Elias-Fano form, read by value: `next_geq`, `contains`, a leapfrog intersection, about `2 + log2(u / n)` bits an id |
 //! | [`ids`] | a column of fixed-width ids (32-byte `ContentId`s): each distinct id once in a table, rows as bit-packed codes |
 //! | [`fsst`] | FSST's symbol table: up to 255 symbols of 1 to 8 bytes, an escape for any other byte |
 //! | [`strs`] | a string column: offsets and bytes, FSST codes, or a dictionary of whole strings; the chooser |
+//! | [`front`] | a sorted set of distinct strings, front-coded in buckets of 16: `get` reads one bucket, `find` searches the buckets' first strings in place, a string's index is its rank |
 //!
 //! Every column's bytes are little-endian, unaligned (a `Slice<u8>` has no alignment), and a
 //! pure function of the values and the policy (rule 25): the chooser breaks every tie by a
@@ -23,6 +25,8 @@
 
 pub mod bits;
 pub mod block;
+pub mod ef;
+pub mod front;
 pub mod fsst;
 pub mod ids;
 pub mod ints;

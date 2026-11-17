@@ -1,5 +1,5 @@
 //! Hash keys from the randomness capability: a [`SipKey`] for a table whose keys an attacker
-//! may pick (blaze-hash's `KeyedMap`, an adaptive table's standby key), drawn as one
+//! may pick (blaze-hash's `Map<K, V, SipKey, A>`, an adaptive table's standby key), drawn as one
 //! [`Effect::Random`] of sixteen bytes through the world's driver. On a native world that is
 //! the system's secure source, so the key is never known outside the process; in a simulation
 //! the bytes are the seeded world's, so a run keyed this way places every key alike when it is

@@ -6,7 +6,7 @@
 use std::{alloc::Global, ffi::OsString, io::IsTerminal as _, path::PathBuf};
 
 use blaze_core::exit::Exit;
-use blaze_hash::HashSet;
+use blaze_hash::{FixedState, Set, SetOpts};
 use blaze_tree::{
     DepKind, DisplayDepth, EdgeKind, Kinds, Options, Packages, Platformed, Prefix, Target,
 };
@@ -311,7 +311,7 @@ fn edge_kinds(
     read: &Read,
     // dyn: the warnings of a command line, a few at most.
     warn: &mut dyn FnMut(&str),
-) -> Result<(HashSet<EdgeKind, Global>, bool, bool), Refused> {
+) -> Result<(Set<EdgeKind, FixedState, Global>, bool, bool), Refused> {
     let given = read.values("--edges");
     let mut kinds: Vec<&str> = given.iter().flat_map(|it| it.split(',')).collect();
     if let Some(other) = kinds.iter().find(|it| !EDGES.contains(it)) {
@@ -331,7 +331,7 @@ fn edge_kinds(
         return Err(failure("`--edges public` requires `-Zunstable-options`"));
     }
     // alloc: the edge kinds, four at most
-    let mut result: HashSet<EdgeKind, Global> = HashSet::new_in(Global);
+    let mut result: Set<EdgeKind, FixedState, Global> = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
     let defaults = [
         EdgeKind::Dep(DepKind::Normal),
         EdgeKind::Dep(DepKind::Build),

@@ -168,7 +168,7 @@ pub(crate) struct Listed<'f> {
 impl Listed<'_> {
     /// Its rule's name (`syntax`, `E0425`): the code a selector names and a view prints.
     pub(crate) fn code(&self) -> &'static str {
-        blaze_report::frame::words::wording(self.area, self.rule).map_or("", |wording| wording.name)
+        crate::print::code_of(self.area, self.rule)
     }
 }
 

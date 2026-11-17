@@ -34,7 +34,7 @@
 use std::process::ExitCode;
 
 use blaze_launch_rt::zygote::{self, Asked, Monotonic, Suite, Waits};
-use blaze_own::{AVec, Alloc};
+use blaze_own::AVec;
 use blaze_run::child::Spec;
 use blaze_run::postings::FnName;
 use blaze_run::zygote::How;
@@ -73,6 +73,11 @@ impl Waits for Quiet {
 }
 
 fn main() -> ExitCode {
+    // An entry that takes no grant yet (a plain `fn main`): the run's memory is one frame
+    // taken from the OS here and handed down.
+    let frame = blaze_mem::Frame::with_reserve(1 << 30, blaze_mem::Tag::Other).expect("the entry's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
     let pid = std::process::id();
     // Canonical: `/tmp` is a link to `/private/tmp` on macOS.
     let base = if cfg!(target_os = "macos") { "/private/tmp" } else { "/tmp" };
@@ -96,7 +101,7 @@ fn main() -> ExitCode {
         println!("row {}: {line}", finished.row);
         expected += usize::from(fits);
     };
-    let result = zygote::run(&suite, &asked, 3, &Monotonic, &mut Quiet, Alloc::global(), &mut sink);
+    let result = zygote::run(&suite, &asked, 3, &Monotonic, &mut Quiet, alloc, &mut sink);
     for temp in &suite.temps {
         // The children's folders; a row that never made its folder has none to remove.
         let _ = std::fs::remove_dir_all(temp);

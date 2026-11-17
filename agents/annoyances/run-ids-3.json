@@ -1,0 +1,14 @@
+{
+ "id": "run-ids-3",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), write-only lane I, piece P1 (the RunIds table as a record) on rebuild-1115",
+ "where": "crates/blaze-cli/src/run_ids.rs (WorkspaceBody rows) against crates/blaze-cli/src/body_types.rs `FileTypes::check` and covered.rs `root_of`/`each_covered`",
+ "what": "The brief asked for the checker-key-to-body join (CrateScope item places x FileItems outline) inside run_ids.rs. The tree already makes that join, inside the BodyCheck task (covered.rs over a front2 world per file); a copy in run_ids.rs would duplicate covered.rs and cost a front2 world per owner per file at every walk. Its right home is a field of the BodyCheck record (the checker keys it covered), in body_types.rs, which lane R8 owns and this lane may not edit.",
+ "cost": "the join could not be written or tested in this piece; the test the brief asked for (a two-file fixture) is not there",
+ "cause": "the map from checker key to body is computed inside the check and not kept in its record",
+ "whys": "BodyCheck records were designed for findings and the checked body, before run ids needed to find a body by its checker key",
+ "class": "a fact computed in a task and dropped, then needed by a reader of its record",
+ "prevention": "BodyCheck's record lists the checker keys it covered (sorted, one each); run_ids reads them from the record it already loads",
+ "workaround": "WorkspaceBody rows stay the caller's to give; the module doc's OPEN (a) says where they come from",
+ "state": "open"
+}

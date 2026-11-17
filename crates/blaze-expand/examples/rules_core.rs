@@ -146,6 +146,13 @@ fn leak<T>(value: T) -> &'static T {
 }
 
 fn main() {
+    // An entry that takes no grant yet (a plain `fn main`): the run's memory is one frame
+    // taken from the OS here, kept for the process's life since the leaked rows below hold
+    // what it made, and handed down.
+    let frame: &'static blaze_mem::Frame =
+        leak(blaze_mem::Frame::with_reserve(1 << 36, blaze_mem::Tag::Expand).expect("the entry's frame"));
+    let erased: &'static blaze_own::Erased<&'static blaze_mem::Frame> = leak(blaze_own::Erased::new(frame));
+    let alloc: Alloc<'static> = erased.handle();
     // The panic and its frames on stdout, which the run prints whole.
     std::panic::set_hook(Box::new(|info| {
         let trace = std::backtrace::Backtrace::force_capture().to_string();
@@ -190,15 +197,15 @@ fn main() {
         files(&library.join(name).join("src"), &mut list);
         for path in list {
             let Ok(text) = std::fs::read_to_string(&path) else { continue };
-            let Ok(stream) = lex(&text, Edition::E2024, Alloc::global()) else { continue };
+            let Ok(stream) = lex(&text, Edition::E2024, alloc) else { continue };
             let stream: &'static TokenStream<'static> = leak(stream);
             let file = paths.len();
             paths.push(path);
-            let found = find_calls(stream, Alloc::global()).expect("the calls are listed");
+            let found = find_calls(stream, alloc).expect("the calls are listed");
             for call in found.iter() {
                 let inner = call.inner();
                 let input = stream
-                    .copy_in(inner.start as usize..inner.end as usize, Alloc::global())
+                    .copy_in(inner.start as usize..inner.end as usize, alloc)
                     .expect("a call's input copies");
                 match call.kind {
                     NestedKind::MacroRules => {
@@ -263,7 +270,7 @@ fn main() {
             }
             let def = &defs[idx];
             let fn_call = Call::fn_like(call.input, site());
-            let result = expand_prepared(&def.prepared, &fn_call, &NoCx, Alloc::global());
+            let result = expand_prepared(&def.prepared, &fn_call, &NoCx, alloc);
             pairs.push((idx, call.input));
             digests[idx] = compare::fnv(digests[idx], compare::render(&result).as_bytes());
             if let Err(error) = &result {
@@ -295,7 +302,7 @@ fn main() {
                     let Some(name) = last_ident(&exp.tokens, nested.path.start, nested.path.end) else { continue };
                     let inner = nested.inner();
                     let Ok(mut input) =
-                        exp.tokens.copy_in(inner.start as usize..inner.end as usize, Alloc::global())
+                        exp.tokens.copy_in(inner.start as usize..inner.end as usize, alloc)
                     else {
                         continue;
                     };
@@ -368,7 +375,7 @@ fn main() {
         for _ in 0..reps {
             for &(idx, input) in pairs {
                 let call = Call::fn_like(input, site());
-                let result = expand_prepared(&defs[idx].prepared, &call, &NoCx, Alloc::global());
+                let result = expand_prepared(&defs[idx].prepared, &call, &NoCx, alloc);
                 std::hint::black_box(&result);
                 drop(result);
                 n += 1;
@@ -392,7 +399,7 @@ fn main() {
         .iter()
         .map(|&(idx, input)| {
             let call = Call::fn_like(input, site());
-            expand_prepared(&defs[idx].prepared, &call, &NoCx, Alloc::global())
+            expand_prepared(&defs[idx].prepared, &call, &NoCx, alloc)
         })
         .collect();
     let start = Instant::now();
@@ -400,7 +407,7 @@ fn main() {
     for _ in 0..reps {
         for result in &results {
             if let Ok(Expanded::Expansion(exp)) = result {
-                let tokens = exp.tokens.copy_in(0..exp.tokens.len(), Alloc::global());
+                let tokens = exp.tokens.copy_in(0..exp.tokens.len(), alloc);
                 let origins = exp.origins.clone();
                 std::hint::black_box((&tokens, &origins));
             }

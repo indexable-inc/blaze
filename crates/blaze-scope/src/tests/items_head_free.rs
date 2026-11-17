@@ -107,6 +107,7 @@ fn facts<'a>(record: &ItemsRecord<'a>) -> std::vec::Vec<Fact<'a>> {
         out.push(Fact::Chain { key: row.key, chain: pieces.chain });
         if let Some(members) = record.members(row.key).unwrap_or_else(|e| panic!("members of row {i}: {e:?}")) {
             for m in members.iter() {
+                let m = m.unwrap_or_else(|e| panic!("a member row of row {i}: {e:?}"));
                 out.push(Fact::Member {
                     owner: row.key,
                     key: m.key,

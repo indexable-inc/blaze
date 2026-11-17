@@ -84,9 +84,56 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             return Ok(None);
         }
         if self.unsize_no_may_rest_on_interior(trait_, args)? {
+            // Known on the exact interior too: an `async move` block of this body that `a`
+            // holds captures by value a variable missing one of the target's auto traits. A
+            // by-value capture is in the state whatever is live at an `.await` (rules/async_fn.rs,
+            // 2), so the failure stands as the ordinary E0277.
+            if self.held_capture_misses_an_auto_trait(args)? {
+                return Ok(None);
+            }
             return Ok(Some(CheckError::Unported(INTERIOR_GAP)));
         }
         Ok(None)
+    }
+
+    /// For `args = [a, b]`: whether some async block's future inside `a` has a by-value capture
+    /// that misses an auto trait some object inside `b` names (rules/async_fn.rs
+    /// `moved_capture_fails`).
+    fn held_capture_misses_an_auto_trait(&mut self, args: TyList) -> Result<bool, Stop> {
+        if self.ty.list_len(args) != 2 {
+            return Ok(false);
+        }
+        let (a, b) = (self.ty.list_get(args, 0), self.ty.list_get(args, 1));
+        let mut autos: Vec<ItemKey, Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut blocks: Vec<crate::ids::ExprId, Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut work: Vec<Ty, Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut met = 0u32;
+        for (root, want_blocks) in [(b, false), (a, true)] {
+            work.clear();
+            work.push(root);
+            while let Some(x) = work.pop() {
+                met += 1;
+                if met > MOST_NODES {
+                    return Err(CheckError::Limit(Limit::Steps).into());
+                }
+                let x = self.ty.shallow_resolve(x);
+                let v = self.view(x);
+                match v {
+                    TyView::ExAuto(k) if !want_blocks && !autos.contains(&k) => autos.push(k),
+                    TyView::Future(block, _, _) if want_blocks && !blocks.contains(&block) => blocks.push(block),
+                    _ => {}
+                }
+                self.ty_children(v, &mut work);
+            }
+        }
+        for &block in blocks.iter() {
+            for &k in autos.iter() {
+                if self.moved_capture_fails(block, k)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Whether `t` is, or holds anywhere inside, a future whose interior may be a superset: an

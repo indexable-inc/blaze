@@ -47,6 +47,7 @@ impl<'a> CrateRootView<'a> {
             macro_exports: field!(root, CrateRootRoot, macro_exports).items().as_slice(),
             tools: field!(root, CrateRootRoot, tools).items().as_slice(),
             builtin_attrs: field!(root, CrateRootRoot, builtin_attrs).items().as_slice(),
+            features: field!(root, CrateRootRoot, features).items().as_slice(),
             strings,
         }
     }

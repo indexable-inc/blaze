@@ -203,7 +203,13 @@ fn main() {
         _ => (None, wanted),
     };
     let (root, store) = (PathBuf::from(checkout), PathBuf::from(store));
-    let alloc = Alloc::global();
+    // An entry that takes no grant yet (a plain `fn main`): the run's memory is one frame
+    // taken from the OS here, kept for the process's life since the lock and the resolution
+    // below are `'static`, and handed down.
+    let frame: &'static blaze_mem::Frame =
+        Box::leak(Box::new(blaze_mem::Frame::with_reserve(1 << 36, blaze_mem::Tag::Usercode).expect("the entry's frame")));
+    let erased: &'static blaze_own::Erased<&'static blaze_mem::Frame> = Box::leak(Box::new(blaze_own::Erased::new(frame)));
+    let alloc: Alloc<'static> = erased.handle();
     let bytes = std::fs::read(root.join("Cargo.lock")).unwrap_or_else(|e| panic!("{}: {e}", root.join("Cargo.lock").display()));
     let lock: &'static Lock<'static> = match Lock::read(&bytes, alloc) {
         Ok(lock) => Box::leak(Box::new(lock)),
@@ -489,10 +495,10 @@ fn main() {
             }
             println!("    reads {}: {}", ran.reads.len(), ran.reads.iter().map(|r| r.subject.as_str()).collect::<Vec<_>>().join(" "));
             if outline {
-                outline_root(&script, served, &ran.outputs);
+                outline_root(&script, served, &ran.outputs, alloc);
             }
             if let Some(dir) = &export {
-                let mut record = AVec::new_in(Alloc::global());
+                let mut record = AVec::new_in(alloc);
                 ran.outputs.encode(&mut record);
                 let side = if served.for_host { "host" } else { "target" };
                 let path = dir.join(format!("{}@{}@{side}.outputs", unit.name.as_str(), unit.version.as_str()));
@@ -507,7 +513,7 @@ fn main() {
 /// The served unit's root file lowered with the script's outputs laid over its host
 /// ([`ScriptCx`]) and its cfg joined with the script's: every item an expansion made (an
 /// `include!` of `OUT_DIR` among them) is printed with its first line.
-fn outline_root(script: &Script, served: &blaze_unit_graph::Unit<'_>, out: &blaze_build_script::Outputs<'_>) {
+fn outline_root(script: &Script, served: &blaze_unit_graph::Unit<'_>, out: &blaze_build_script::Outputs<'_>, alloc: Alloc<'_>) {
     let root = served.root.as_str();
     let folder = script.root.seen().folder();
     let rel = if folder.is_empty() { root.to_owned() } else { format!("{folder}/{root}") };
@@ -546,7 +552,7 @@ fn outline_root(script: &Script, served: &blaze_unit_graph::Unit<'_>, out: &blaz
     };
     let rules: &[(&str, blaze_expand::Prepared<'_>)] = &[];
     // The outputs as their record's bytes, read in place: what a reader of the store is given.
-    let mut record = AVec::new_in(Alloc::global());
+    let mut record = AVec::new_in(alloc);
     out.encode(&mut record);
     let opened = match blaze_build_script::outputs::OutputsRef::open(&record) {
         Ok(opened) => opened,
@@ -555,20 +561,20 @@ fn outline_root(script: &Script, served: &blaze_unit_graph::Unit<'_>, out: &blaz
             return;
         }
     };
-    let mut by_name = ByName::new(rules, at, ScriptCx { inner: host, out: opened }, Alloc::global());
+    let mut by_name = ByName::new(rules, at, ScriptCx { inner: host, out: opened }, alloc);
     let mut sink = Made(0, true);
-    let stats = lower_file(&text, edition, &mut cfg, &mut blaze_lower::NoModule, &mut by_name, &mut sink, Alloc::global());
+    let stats = lower_file(&text, edition, &mut cfg, &mut blaze_lower::NoModule, &mut by_name, &mut sink, alloc);
     println!("  outline of {rel}: {} items, {} made by expansions", stats.items, sink.0);
     // The control: the same file over the same host with no outputs laid over it.
-    let mut empty = AVec::new_in(Alloc::global());
-    blaze_build_script::Outputs::new_in(script.out_dir(), Alloc::global()).encode(&mut empty);
+    let mut empty = AVec::new_in(alloc);
+    blaze_build_script::Outputs::new_in(script.out_dir(), alloc).encode(&mut empty);
     let Ok(none) = blaze_build_script::outputs::OutputsRef::open(&empty) else {
         println!("  outline: an empty outputs record does not read back");
         return;
     };
-    let mut by_name = ByName::new(rules, at, ScriptCx { inner: Bare { env: script.env.clone() }, out: none }, Alloc::global());
+    let mut by_name = ByName::new(rules, at, ScriptCx { inner: Bare { env: script.env.clone() }, out: none }, alloc);
     let mut quiet = Made(0, false);
-    let stats = lower_file(&text, edition, &mut cfg, &mut blaze_lower::NoModule, &mut by_name, &mut quiet, Alloc::global());
+    let stats = lower_file(&text, edition, &mut cfg, &mut blaze_lower::NoModule, &mut by_name, &mut quiet, alloc);
     println!("  control without the outputs: {} items, {} made by expansions", stats.items, quiet.0);
 }
 

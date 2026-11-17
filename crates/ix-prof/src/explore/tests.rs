@@ -22,9 +22,8 @@ use blaze_http::{
     h3::{
         ClientConfig, Closed, Direction, Endpoint, Event, ServerConfig, SessionId, StreamRef,
         Transport, Trust,
-        driver::{self as h3_driver, Driver, Loop, Session as Connection},
+        driver::{self as h3_driver, AskError, Driver, Loop, Session as Connection},
     },
-    mailbox,
 };
 use blaze_sim::{Broke, Tape};
 use serde_json::Value;
@@ -398,7 +397,7 @@ fn explorer(dev_origin: bool) -> Explorer {
 }
 
 /// A client pinning the explorer's certificate, as the page does, on a driver thread of its
-/// own; its handles' futures are polled by the runtime the test awaits them on.
+/// own; each of its handles' calls waits on this thread at most [`WITHIN`].
 fn client(explorer: &Explorer) -> Driver {
     let raw = blaze_base64::URL_SAFE_NO_PAD
         .decode_in(explorer.certhash().as_bytes(), std::alloc::Global)
@@ -413,14 +412,6 @@ fn client(explorer: &Explorer) -> Driver {
 /// How long a real-socket test waits for any one thing: loopback answers in milliseconds.
 const WITHIN: Duration = Duration::from_secs(10);
 
-/// `future` polled on this thread to its end within [`WITHIN`], waiting for `what`.
-fn wait<F: std::future::Future>(what: &'static str, future: F) -> F::Output {
-    match mailbox::block_on(what, Some(WITHIN), future) {
-        Ok(it) => it,
-        Err(why) => panic!("{why}"),
-    }
-}
-
 fn connect(
     client: &Driver,
     explorer: &Explorer,
@@ -430,22 +421,24 @@ fn connect(
     let url = format!("https://127.0.0.1:{}{path}", explorer.port());
     let to = SocketAddr::from((Ipv4Addr::LOCALHOST, explorer.port()));
     let headers: Vec<(&str, &str)> = origin.map(|it| ("origin", it)).into_iter().collect();
-    wait("the explorer's answer to a CONNECT", client.connect(to, &url, &headers))
+    match client.connect(to, &url, &headers, WITHIN) {
+        Ok(it) => Ok(it),
+        Err(AskError::Failed(closed)) => Err(closed),
+        Err(AskError::Unanswered(why)) => panic!("the explorer's answer to a CONNECT: {why}"),
+    }
 }
 
 /// The header and the IPC of the answer to `request`.
 fn ask(connection: &Connection, request: &str) -> (Value, Vec<u8>) {
-    let bytes = wait("the explorer's answer to a request", async {
-        let (mut send, mut recv) = connection.open_bi().await.unwrap();
-        send.write_all(request.as_bytes()).await.unwrap();
-        send.finish();
-        let mut bytes = Vec::new();
-        let mut chunk = [0u8; 4096];
-        while let Some(n) = recv.read(&mut chunk).await.unwrap() {
-            bytes.extend_from_slice(&chunk[..n]);
-        }
-        bytes
-    });
+    let (mut send, mut recv) = connection.open_bi(WITHIN).unwrap();
+    send.write_all(request.as_bytes(), WITHIN).unwrap();
+    send.finish();
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    // Bounded: each read waits at most WITHIN, and the answer is a few KiB.
+    while let Some(n) = recv.read(&mut chunk, WITHIN).unwrap() {
+        bytes.extend_from_slice(&chunk[..n]);
+    }
     let (header, ipc) = answer(&bytes).unwrap();
     (header, ipc.to_vec())
 }
@@ -536,16 +529,17 @@ fn a_session_is_refused_until_hello_then_answered_and_fed() {
     assert_eq!(header["error"]["kind"], "unknown_op", "{header}");
     assert_eq!(header["error"]["op"], "frobnicate", "{header}");
 
-    let mut live = wait("the explorer's live stream", connection.accept_uni()).unwrap();
-    let (header, ipc) = wait("the live stream's first frame", async {
+    let mut live = connection.accept_uni(WITHIN).unwrap();
+    let (header, ipc) = {
         let (mut bytes, mut got, mut chunk) = (Vec::new(), Vec::new(), [0u8; 4096]);
+        // Bounded: each read waits at most WITHIN, and the first frame is a few KiB.
         while got.is_empty() {
-            let n = live.read(&mut chunk).await.unwrap().unwrap();
+            let n = live.read(&mut chunk, WITHIN).unwrap().unwrap();
             bytes.extend_from_slice(&chunk[..n]);
             frames(&mut bytes, &mut got).unwrap();
         }
         got.swap_remove(0)
-    });
+    };
     let (op, table) = (header["op"].as_str(), header["table"].as_str());
     assert_eq!((op, table), (Some("live"), Some("spans")), "{header}");
     assert_eq!(header["rows"], 2, "{header}");
@@ -559,7 +553,7 @@ fn a_session_is_refused_until_hello_then_answered_and_fed() {
     };
     let (header, _) = ask(&other, &format!(r#"{{"op":"hello","token":"{wrong}"}}"#));
     assert_eq!(header["error"]["kind"], "bad_token", "{header}");
-    let closed = wait("bad_token to close the session", other.closed());
+    let closed = other.closed(WITHIN).unwrap();
     assert!(matches!(closed, Closed::ByPeer { code: CLOSE_BAD_TOKEN, .. }), "{closed}");
     let (header, _) = ask(&connection, r#"{"op":"count","n":1}"#);
     assert_eq!(header["op"], "count", "another session's bad token leaves this one open");
@@ -580,7 +574,7 @@ fn dropping_the_explorer_closes_its_sessions() {
     let client = client(&explorer);
     let connection = connect(&client, &explorer, link::PATH, Some(link::ORIGIN)).unwrap();
     drop(explorer);
-    let closed = wait("the stop to close the session", connection.closed());
+    let closed = connection.closed(WITHIN).unwrap();
     assert!(matches!(closed, Closed::ByPeer { code: CLOSE_STOPPED, .. }), "{closed}");
 }
 

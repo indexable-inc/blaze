@@ -28,15 +28,15 @@ fn check_fns(text: &str, fns: &[&str]) -> Vec<(String, String)> {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let files = [("/hello-world/src/main.rs".to_string(), text.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
-    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
-        let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+        let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
     let prepared = Prepares::new_in(Alloc::global());
-    let mut store = Store::new(front.index.lang("sized"), front.frame);
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let (mut buckets, mut consts) = (None, Consts::default());
     let mut got = Vec::new();
     for &n in fns {
@@ -339,7 +339,9 @@ fn main() {}
 /// the aliased type's arguments on the alias's segment, world_paths.rs `AliasPaths::expand`),
 /// as `P<u16>` and never a looser `P<_>`: `loose`, which wants a `P<u8>` from it, is E0308.
 /// An alias of a type that is no ADT with a path after it (`type Tup = (u8, u8)`,
-/// `Tup::default()`) stays the gap naming the alias. Before the fixes each was "gap TypeAlias".
+/// `Tup::default()`) is `Def::Alias`: the checker reads the aliased type and finds `default` on
+/// `(u8, u8)` as on the type written, so it is clean too. Before the fixes each was "gap
+/// TypeAlias" ("aliases a type with fixed arguments").
 #[test]
 fn a_type_alias_in_a_body_path_is_its_type() {
     const TEXT: &str = "struct P<T> { x: T }
@@ -362,7 +364,7 @@ fn main() {}
     println!("alias paths: {got:?}");
     all_clean("alias paths", &got[..4]);
     assert!(got[4].1.contains("diagnostics") && got[4].1.contains("E0308"), "{got:?}");
-    assert!(got[5].1.contains("aliases a type with fixed arguments"), "{got:?}");
+    assert_eq!(got[5].1, "clean", "`Tup::default()` through `type Tup = (u8, u8)`: {got:?}");
 }
 
 /// A negative impl is a head with its polarity (rustc's `negative_impls`, which core uses for
@@ -774,15 +776,15 @@ fn adt_rows(text: &str, adts: &[&str]) -> Vec<(String, String)> {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let files = [("/hello-world/src/main.rs".to_string(), text.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
-    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
-    let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
     let prepared = Prepares::new_in(Alloc::global());
-    let mut store = Store::new(front.index.lang("sized"), front.frame);
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let (mut buckets, mut consts) = (None, Consts::default());
     let mut got = Vec::new();
     for &n in adts {
@@ -1091,4 +1093,33 @@ fn main() {}
     let len: Option<u64> = row.strip_suffix("] discrs []").and_then(|r| r.rsplit_once(" len ")).and_then(|(_, n)| n.parse().ok());
     let n = len.unwrap_or_else(|| panic!("the row has no array length that is a value: {got:?}"));
     assert!(n >= 5 && n % 4 == 0, "size_of::<S>() = {n}: {got:?}");
+}
+
+/// An inherent item is found by its name before any impl's self type is read (the Reference,
+/// "Paths", "Qualified paths" and "Method call expressions": the candidates are the type's
+/// inherent items OF THAT NAME): crypto-bigint's macro-made `impl Uint<{ <U1792>::LIMBS / 2 }>
+/// { fn concat .. }` (uint/macros.rs `impl_uint_concat_split_even`). The header's anonymous
+/// constant reads the inherent constant `LIMBS`, which only `impl<const L: usize> Uint<L>`
+/// declares, so the impl whose header is being evaluated is no candidate of `LIMBS` and is
+/// never needed to answer it. Before the fix every inherent question on `Uint` made every
+/// inherent impl's header, that one included, and `lo` and `half` were "not checked" with
+/// "an array length names: Nested" (tempo census 7, 169 fns). Expected lines:
+/// `inherent by name: lo: clean` and `inherent by name: half: clean`.
+#[test]
+fn an_inherent_item_is_found_by_name_before_headers() {
+    const TEXT: &str = "struct Uint<const L: usize> { limbs: [u64; L] }
+impl<const L: usize> Uint<L> {
+    const LIMBS: usize = L;
+    fn lo(&self) -> u64 { self.limbs[0] }
+}
+type U4 = Uint<4>;
+impl Uint<{ <U4>::LIMBS / 2 }> {
+    fn concat(&self) -> u64 { self.limbs[1] }
+}
+fn lo(u: &Uint<4>) -> u64 { u.lo() }
+fn half(u: &Uint<2>) -> u64 { u.concat() }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["lo", "half"]);
+    all_clean("inherent by name", &got);
 }

@@ -91,6 +91,17 @@ pub fn lang_name(item: LangItem) -> Option<&'static str> {
     }
 }
 
+/// The lang trait and the method name of `which` (`FnOnce::call_once`): the one map the run's
+/// builder world (run.rs `FrontAdts`) and both constant evaluator worlds (`ConstsWorld`,
+/// run.rs `FrontConsts`) answer `fn_trait_method` by, so all three name one item (rule 30).
+pub fn fn_trait_method(which: blaze_build::FnTrait) -> (LangItem, &'static str) {
+    match which {
+        blaze_build::FnTrait::Fn => (LangItem::Fn, "call"),
+        blaze_build::FnTrait::FnMut => (LangItem::FnMut, "call_mut"),
+        blaze_build::FnTrait::FnOnce => (LangItem::FnOnce, "call_once"),
+    }
+}
+
 /// Why a lang item has no answer: a gap, never the program's "no such lang item".
 pub type NoAnswer = &'static str;
 

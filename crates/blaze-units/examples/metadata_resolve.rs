@@ -18,14 +18,14 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_resolve::lockfile::{self, PathDeps};
 use blaze_resolve::metadata::{MetadataPackages, resolve_graph};
 use blaze_resolve::resolver::{CliFeatures, CompileKind, HasDevUnits, Members, VersionOrdering};
 use blaze_resolve::workspace_resolve::{PackageRegistry, Patch, Workspace, resolve_ws};
 use blaze_resolve::{
-    DepKind, Dependency, IndexSummary, InternedString, MemRegistry, PackageId, PackageIdSpec,
-    Platform, QueryKind, Registry, ResolveVersion, SourceId, Summary,
+    DepKind, Dependency, IndexSummary, InternedString, Lookup, MemRegistry, PackageId,
+    PackageIdSpec, Platform, QueryKind, Registry, ResolveVersion, SourceId, Summary,
 };
 use blaze_units::read::{self, Root};
 use serde_json::Value;
@@ -86,23 +86,17 @@ fn patch_tables(root: &Path, registry: &MemRegistry) -> Result<Vec<(Url, Vec<Pat
     for (_, patches) in &mut tables {
         let mut kept = Vec::with_capacity(patches.len());
         for patch in patches.drain(..) {
-            if !ready(registry.query_vec(&patch.dep, QueryKind::Exact))?.is_empty() {
+            // A table in memory answers every query.
+            let Lookup::Answered(found) = registry.query_vec(&patch.dep, QueryKind::Exact)? else {
+                return Err(anyhow!("the packages listed did not answer `{}`", patch.dep.package_name()));
+            };
+            if !found.is_empty() {
                 kept.push(patch);
             }
         }
         *patches = kept;
     }
     Ok(tables)
-}
-
-/// The output of a future that is ready at once, as [`MemRegistry`]'s are.
-fn ready<T>(future: impl std::future::Future<Output = T>) -> T {
-    let mut future = std::pin::pin!(future);
-    let cx = &mut std::task::Context::from_waker(std::task::Waker::noop());
-    match future.as_mut().poll(cx) {
-        std::task::Poll::Ready(output) => output,
-        std::task::Poll::Pending => unreachable!("a MemRegistry query is ready at once"),
-    }
 }
 
 struct Packages {
@@ -193,7 +187,7 @@ fn main() -> Result<()> {
     }
 
     let workspace_root = Path::new(str_of(&metadata, "workspace_root")?);
-    let path_packages: HashMap<SourceId, Summary, Global> = by_spec
+    let path_packages: Map<SourceId, Summary, FixedState, Global> = by_spec
         .values()
         .filter(|s| s.source_id().is_path())
         .map(|s| (s.source_id(), s.clone()))

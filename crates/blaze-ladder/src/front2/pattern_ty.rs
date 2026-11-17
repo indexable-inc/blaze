@@ -37,7 +37,7 @@ impl<'n, H: Heads, S: NamesSource<'n>> Builder<'_, H, S> {
     /// `env.module`: its text expanded and lowered, then read as a type.
     pub(super) fn macro_ty(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, r: Range) -> Result<PTy, Why> {
         let text = v.text_at(v.type_range(t)?)?;
-        let x = super::type_expand::expand_type_text(self.resolver.names, env.module, text, r)?;
+        let x = super::type_expand::expand_type_text(self.resolver.names, env.module, text, r, tys.alloc())?;
         // A fn's return type with a macro in it is expanded whole by `heads.rs` `fn_head`
         // before its opaques are numbered, so no return opaque arrives here. An `impl Trait`
         // a type macro writes anywhere else (a parameter's type, a field, an alias) is refused
@@ -48,7 +48,10 @@ impl<'n, H: Heads, S: NamesSource<'n>> Builder<'_, H, S> {
         if !impls.is_empty() {
             return Err(Why::Unsupported("an `impl Trait` a type macro writes outside a fn's return type", r));
         }
-        self.ty(tys, &Env { anon: &[], ..*env }, &x.view(), x.root)
+        // The expansion is a text of its own, read at `env.module`: the item's marks are not
+        // its tokens' (front2 item_site.rs).
+        let own = Builder { resolver: crate::resolve::Paths { names: self.resolver.names }, heads: self.heads, marks: None };
+        own.ty(tys, &Env { anon: &[], ..*env }, &x.view(), x.root)
     }
 
     /// The pattern type over `base` (already built) with the pattern `pat` of `v`.

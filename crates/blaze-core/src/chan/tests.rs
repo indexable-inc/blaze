@@ -128,6 +128,26 @@ mod threads {
         assert_eq!(recv.try_recv(), Err(TryRecvError::Empty));
     }
 
+    /// A named timed receive takes what is there, times out on an empty channel, and is
+    /// disconnected once the senders are gone, for every flavor. Prints nothing.
+    #[test]
+    fn chan_named_timed_receive_is_the_timed_receive() {
+        for cap in [Some(0), Some(1), None] {
+            let (send, recv) = match cap {
+                Some(cap) => bounded::<u32>(cap),
+                None => unbounded::<u32>(),
+            };
+            let what = "the test's named value";
+            assert_eq!(recv.recv_timeout_named(what, Duration::from_millis(5)), Err(RecvTimeoutError::Timeout));
+            if cap != Some(0) {
+                send.send(3).expect("room");
+                assert_eq!(recv.recv_timeout_named(what, Duration::from_secs(5)), Ok(3));
+            }
+            drop(send);
+            assert_eq!(recv.recv_timeout_named(what, Duration::from_secs(5)), Err(RecvTimeoutError::Disconnected));
+        }
+    }
+
     /// A rendezvous send with no receiver times out with its value back.
     #[test]
     fn chan_rendezvous_send_times_out_untaken() {

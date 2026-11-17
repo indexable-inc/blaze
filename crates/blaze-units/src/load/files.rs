@@ -23,7 +23,7 @@ use std::marker::PhantomData;
 use std::path::{Component, Path};
 
 use blaze_format::{FormatError, Persist, SchemaHash, Slice, Writer};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::ContentId;
 use blaze_manifest::files::{FileKind, Files};
 use blaze_query::{Cancelled, Cx, Query, QueryKind};
@@ -561,7 +561,7 @@ fn dir_through<'a>(
             let prefix: Cow<'_, str> =
                 if path == "/" { Cow::Borrowed("/") } else { Cow::Owned(format!("{path}/")) };
             let prefix = prefix.as_bytes();
-            let mut names: HashMap<&str, bool, Global> = HashMap::new_in(Global);
+            let mut names: Map<&str, bool, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
             let first = partition(table.mounts(), |at| table.mount_at(at) < prefix);
             for at in
                 (first..table.mounts()).take_while(|&at| table.mount_at(at).starts_with(prefix))
@@ -958,7 +958,7 @@ pub(crate) struct Reader<'r, 'db> {
     /// The key of a [`TomlFile`] or a manifest.
     keyed: RefCell<PathKey>,
     /// Each listing read so far, decoded once.
-    dirs: RefCell<HashMap<String, Found<Vec<(&'db str, bool)>>, Global>>,
+    dirs: RefCell<Map<String, Found<Vec<(&'db str, bool)>>, FixedState, Global>>,
     /// A read was cancelled: every read after it is too, without asking.
     cancelled: Cell<bool>,
     /// Every path read that is under no mount, in the order read, each with whether it was
@@ -987,7 +987,7 @@ impl<'r, 'db> Reader<'r, 'db> {
             fixed,
             // clone: the configuration, once a step, into the key its reads reuse.
             keyed: RefCell::new(PathKey { path: String::new(), config: config.clone() }),
-            dirs: RefCell::new(HashMap::new_in(Global)),
+            dirs: RefCell::new(Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None })),
             cancelled: Cell::new(false),
             // alloc: none until a path is under no mount.
             unmounted: RefCell::new(Vec::new()),

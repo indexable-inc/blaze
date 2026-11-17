@@ -129,12 +129,13 @@ pub fn write<'a>(
     Ok(Box::leak(out.into_boxed_slice()))
 }
 
-/// The column of `call`'s expansion from the renderer's places (`(token, start, end)` in token
-/// order: blaze-scope resolve.rs `render_with`) and the expansion's origins, input indexes carried
-/// into the call's text as written by `input`.
+/// The column of `call`'s expansion from the renderer's places (`(token, start, end, root)` in
+/// token order: blaze-scope resolve.rs `render_with`; `root`: the `crate` written for that
+/// crate's `$crate`, whose row carries [`crate::crate_roots::root_mark`]) and the expansion's
+/// origins, input indexes carried into the call's text as written by `input`.
 pub fn column_of<'a>(
     call: ItemKey,
-    places: &[(usize, usize, usize)],
+    places: &[(usize, usize, usize, Option<blaze_id::CrateItemKey>)],
     origins: &[blaze_expand::TokenOrigin],
     input: blaze_expand::origin_column::InputIndex<'_>,
     // Each token's innermost mark (drive.md, "A token keeps its mark": the same column):
@@ -144,10 +145,16 @@ pub fn column_of<'a>(
 ) -> Result<OriginColumn<'a>, OriginsError> {
     let mut column = OriginColumn::new_in(alloc);
     let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
-    for &(token, start, end) in places {
+    for &(token, start, end, root) in places {
         let origin = origins.get(token).copied().ok_or(OriginsError::Places { call, tokens: count(origins.len()), places: count(places.len()) })?;
+        // A root row is only placed for a marked `$crate` (the renderer's `dollar` is that mark's
+        // crate): its edition is that mark's.
+        let mark = match root {
+            Some(krate) => marks(token).map(|m| crate::crate_roots::root_mark(krate, m.edition)),
+            None => marks(token),
+        };
         column
-            .push(start, end, blaze_expand::origin_column::text_origin(origin, input), marks(token))
+            .push(start, end, blaze_expand::origin_column::text_origin(origin, input), mark)
             .map_err(|error| OriginsError::Column { call: Some(call), error })?;
     }
     Ok(column)

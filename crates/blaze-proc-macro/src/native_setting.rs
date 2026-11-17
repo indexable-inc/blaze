@@ -10,7 +10,7 @@
 //! never looks anywhere else (rule 3).
 //!
 //! - The shelf is `<home>/.blaze/v2/toolchain/clang/<sha256 hex>`, the hex being the host's row of
-//!   the clang pin table ([`PIN`], `crates/hir-ty-codegen/clang.json`); its folder name is the
+//!   the clang pin table ([`PIN`], `crates/blaze-toolchain/pins/clang.json`); its folder name is the
 //!   compiler's digest in a native run's key, so the resolved folder must keep that name.
 //! - The SDK is the folder the command was given (its own argument, or the edge's reading of the
 //!   machine), resolved once; its `SDKSettings.json` must give a `Version`, which the run key

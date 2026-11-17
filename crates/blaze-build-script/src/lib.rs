@@ -38,12 +38,16 @@ pub mod outputs;
 pub mod outputs4;
 pub mod pinned;
 pub mod probe;
+pub mod probe_ask;
+pub mod shelf_pins;
 pub mod toolchain;
 
 #[cfg(test)]
 mod c_request_tests;
 #[cfg(test)]
 mod nm_row_tests;
+#[cfg(test)]
+mod shelf_pins_tests;
 #[cfg(test)]
 mod fact_pins_tests;
 #[cfg(test)]
@@ -54,6 +58,8 @@ mod git_attributes_tests;
 mod git_link_tests;
 #[cfg(test)]
 mod git_tests;
+#[cfg(test)]
+mod probe_ask_tests;
 #[cfg(test)]
 mod tests;
 

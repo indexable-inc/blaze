@@ -88,7 +88,7 @@ use std::{
     },
 };
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_core::lock::{Lock, LockGuard};
 use std::alloc::Global;
 use stdx::file_lock::Locked;
@@ -1449,7 +1449,7 @@ impl Found {
             streams,
             kept: &kept,
             // alloc: once a postmortem, a kept name its rows hold
-            kept_syms: HashMap::new_in(Global),
+            kept_syms: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             lost: 0,
             failed: false,
         };
@@ -1531,9 +1531,9 @@ impl Found {
 
     /// The names the logs hold, newest first winning: a [`Sym`] given again after its
     /// generation came round names what it named last.
-    fn names(&self, header: &[u8]) -> Result<HashMap<Sym, String, Global>, PostmortemError> {
+    fn names(&self, header: &[u8]) -> Result<Map<Sym, String, FixedState, Global>, PostmortemError> {
         // alloc: once a postmortem, a name a dead process gave
-        let mut names = HashMap::new_in(Global);
+        let mut names = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for log in 0..LOGS {
             let head = word(header, (H_LOG_HEADS + log) * 8);
             if head == 0 {
@@ -1683,7 +1683,7 @@ impl Found {
         recovered: &mut Recovered,
     ) -> Result<(), PostmortemError> {
         // alloc: once a postmortem, a site its rows hold
-        let mut site_of: HashMap<u16, u16, Global> = HashMap::new_in(Global);
+        let mut site_of: Map<u16, u16, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         let mut sites_lost = 0;
         let mut sites_failed = false;
         let mut site = |old: u16| -> u16 {
@@ -1751,8 +1751,8 @@ fn row_at(store: &[u8], i: u64) -> [u64; WORDS] {
 /// kept log, each as [`super::recovered`] numbers it for the postmortem's session.
 struct DeadNamer<'a> {
     streams: names::Streams,
-    kept: &'a HashMap<Sym, String, Global>,
-    kept_syms: HashMap<Sym, Sym, Global>,
+    kept: &'a Map<Sym, String, FixedState, Global>,
+    kept_syms: Map<Sym, Sym, FixedState, Global>,
     /// Kept names the log no longer held.
     lost: u64,
     /// Past [`super::RECOVERED_MAX`] names.

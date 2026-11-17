@@ -565,7 +565,7 @@ impl<T: Keyed> Drop for Table<T> {
 #[cfg(test)]
 #[cfg(not(blaze_check))]
 mod tests {
-    use blaze_hash::HashMap;
+    use blaze_hash::{FixedState, Map, MapOpts};
     use std::alloc::Global;
 
     use super::*;
@@ -623,16 +623,16 @@ mod tests {
         assert!(table.replace(held, value(6, 0)).is_err());
     }
 
-    /// The table against a `HashMap` model across many levels, every commit step of its regions
+    /// The table against a `Map` model across many levels, every commit step of its regions
     /// and every kind of operation: inserts of new and present keys, replaces of present and
     /// absent keys, collects, lookups, flags and rotations give the answers the model gives.
     #[test]
     fn the_table_answers_as_a_map_does_across_growth() {
         let table: Table<Value> = Table::new(64, 2);
         let held = Held::writer(&table);
-        let mut model: HashMap<u64, u64, Global> = HashMap::new_in(Global); // alloc: a test's model
-        let mut rows: HashMap<u64, u64, Global> = HashMap::new_in(Global); // alloc: a test's model
-        let mut flags: HashMap<u64, [bool; 2], Global> = HashMap::new_in(Global); // alloc: a test's model
+        let mut model: Map<u64, u64, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }); // alloc: a test's model
+        let mut rows: Map<u64, u64, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }); // alloc: a test's model
+        let mut flags: Map<u64, [bool; 2], FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }); // alloc: a test's model
         let mut rng = blaze_ids::rng::SplitMix64::new(11);
         for step in 0..200_000u64 {
             let key = rng.next_u64() % 60_000;

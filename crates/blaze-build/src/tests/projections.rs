@@ -78,7 +78,7 @@ fn a_projection_in_a_signature_a_local_and_a_field_is_normalized() {
     let start = b.field_inits.len() as u32;
     b.field_inits.push(FieldInit { name: Name::of("v"), expr: x_e });
     b.field_inits.push(FieldInit { name: Name::of("k"), expr: one_ });
-    let lit = b.e(Expr::Struct { path, fields: List { start, len: 2 }, base: None });
+    let lit = b.e(Expr::Struct { path, fields: List { start, len: 2 }, base: blaze_typeck::StructBase::None });
     let h_e = b.local(h);
     let hv = b.e(Expr::Field { base: h_e, name: Name::of("v") });
     let root = b.block(&[Stmt::Let { pat: h, ty: None, init: Some(lit), else_: None }], Some(hv));
@@ -94,7 +94,7 @@ fn a_projection_in_a_signature_a_local_and_a_field_is_normalized() {
     let n = m.int(1, Some(IntSuffix::Uint(UintTy::U8)));
     let start = m.field_inits.len() as u32;
     m.field_inits.push(FieldInit { name: Name::of("n"), expr: n });
-    let wrap_lit = m.e(Expr::Struct { path, fields: List { start, len: 1 }, base: None });
+    let wrap_lit = m.e(Expr::Struct { path, fields: List { start, len: 1 }, base: blaze_typeck::StructBase::None });
     let v = m.int(700, Some(IntSuffix::Uint(UintTy::U16)));
     let path = m.path("first");
     let callee = m.e(Expr::Path(path));

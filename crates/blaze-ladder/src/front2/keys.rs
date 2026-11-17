@@ -119,6 +119,39 @@ impl Keys {
     }
 }
 
+/// The key [`Keys::member`] files member `name` of kind `kind` of `container` under, computed
+/// without filing it: what a reader that holds the member's library row (its container and its
+/// name) asks the key map by, before the container's head is made (the lazy program's search,
+/// front2/program/lazy/locate.rs; a trait fn's lang item, lazy/front_end.rs `lang_item`).
+pub fn member_key_of(container: ItemKey, kind: MemberKind, name: &str) -> ItemKey {
+    member_key(container, kind, name)
+}
+
+/// The checker key library item `lib` is asked by: a member of a trait or an impl the library
+/// keys (a `#[lang]` member: `Future::poll`, `IntoFuture::into_future`, `Coroutine::resume`,
+/// `Future::Output`) is filed by its container's head under its MEMBER key ([`Keys::member`],
+/// heads.rs), never under its library key's first 16 bytes, so it is asked by that; any other
+/// item by [`checker_of`]. A member whose kind no head keys is asked by [`checker_of`] (and
+/// found under no head, refused where it is read).
+pub fn asked_key<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey) -> ItemKey {
+    let Some((owner, name)) = names.member_owner(lib) else { return checker_of(lib) };
+    let mut kind = None;
+    names.each_member(owner, &mut |m| {
+        if m.key == lib {
+            kind = match m.kind {
+                blaze_surface::ItemKind::Function => Some(MemberKind::Fn),
+                blaze_surface::ItemKind::Const => Some(MemberKind::Const),
+                blaze_surface::ItemKind::TypeAlias => Some(MemberKind::Type),
+                _ => None,
+            };
+        }
+    });
+    match kind {
+        Some(kind) => member_key(checker_of(owner), kind, name),
+        None => checker_of(lib),
+    }
+}
+
 /// A member's key: a function of its container, kind and name alone.
 fn member_key(container: ItemKey, kind: MemberKind, name: &str) -> ItemKey {
     let mut bytes = std::vec::Vec::with_capacity(17 + name.len());

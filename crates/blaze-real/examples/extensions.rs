@@ -201,7 +201,7 @@ fn probe(name: &str, fixture: &str) {
     // Names, check, build (the ladder).
     let files = [SourceFile { path: "src/main.rs", text: &text }];
     // `blaze run`'s setting: the dev profile's overflow checks (D101).
-    let refusals = blaze_ladder::run::refusals(&files, "src/main.rs", blaze_ladder::run::OverflowChecks::On);
+    let refusals = blaze_ladder::run::refusals(&files, "src/main.rs", blaze_ladder::run::OverflowChecks::On, alloc);
     match refusals.first() {
         Some(r) => {
             let at = (r.place + r.start) as usize;

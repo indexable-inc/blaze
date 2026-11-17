@@ -4,7 +4,7 @@ use blaze_core::{
     Completion, Done, Driver, Effect, FileName, IoError, Tag,
     sim::{Faults, Rng, Sim},
 };
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::{ContentId, Hasher};
 use std::alloc::Global;
 
@@ -1177,16 +1177,16 @@ fn journal_run(seed: u64) {
     let mut effects = Vec::new();
     let mut done = Vec::new();
     // Each head move's sequence number, and the head and files it moved to.
-    let mut moves: HashMap<u64, (String, BTreeMap<String, Vec<u8>>), Global> =
-        HashMap::new_in(Global);
+    let mut moves: Map<u64, (String, BTreeMap<String, Vec<u8>>), FixedState, Global> =
+        Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     // Each ticket's head, sequence and whether it removed the head.
-    let mut tickets: HashMap<Ticket, (String, u64, bool), Global> = HashMap::new_in(Global);
+    let mut tickets: Map<Ticket, (String, u64, bool), FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     // By head: the latest record acknowledged durable, and whether it was a removal.
-    let mut acknowledged: HashMap<String, (u64, bool), Global> = HashMap::new_in(Global);
+    let mut acknowledged: Map<String, (u64, bool), FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     // By head: the sequence of each removal, acknowledged or not. A crash keeps a random prefix
     // of what was appended and not synced, so an unacknowledged removal can survive one while
     // a later one of the same head (after it was made again) is cut.
-    let mut removed: HashMap<String, Vec<u64>, Global> = HashMap::new_in(Global);
+    let mut removed: Map<String, Vec<u64>, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     let mut old_bases: Vec<ContentId> = Vec::new();
 
     for step in 0..300 {
@@ -1315,6 +1315,17 @@ fn the_journal_survives_crashes_and_failures() {
     for seed in first..first + seeds {
         journal_run(seed);
     }
+}
+
+/// The control of [`the_journal_survives_crashes_and_failures`]: a journal that tells its
+/// tickets durable once its file is synced, never its directory, loses at some cut the file an
+/// append made and every record acknowledged in it, and the oracle says so.
+#[test]
+fn the_oracle_catches_a_journal_whose_name_was_never_synced() {
+    crate::PLANT.with(|it| it.set(crate::Plant::NameUnsynced));
+    let caught = (0..256u64).find(|&seed| std::panic::catch_unwind(|| journal_run(seed)).is_err());
+    crate::PLANT.with(|it| it.set(crate::Plant::None));
+    assert!(caught.is_some(), "no seed of 256 lost an acknowledged record with the name unsynced");
 }
 
 /// A torn record left at the end must be cut off before the next append: followed by new records
@@ -1491,7 +1502,8 @@ fn the_journal_round_trips_without_faults() {
     let one = vfs.commit("w", empty, &[write("a/b", "1"), write("c", "2")]).unwrap();
     let two = vfs.commit("w", one.root, &[edit("c", 0, 1, "3")]).unwrap();
     let three = vfs.commit("other", empty, &[write("a/b", "1")]).unwrap();
-    assert!(!vfs.owns(Tag(9)) && vfs.owns(Tag(10)) && !vfs.owns(Tag(14)));
+    // The journal's five tags: append, sync, cut, rewrite and its directory's sync.
+    assert!(!vfs.owns(Tag(9)) && vfs.owns(Tag(14)) && !vfs.owns(Tag(15)));
     let durable = settle(&mut sim, &mut vfs, &mut Vec::new());
     assert_eq!(durable, vec![one.ticket, two.ticket, three.ticket]);
     let bytes = sim.contents(&file);

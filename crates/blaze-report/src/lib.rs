@@ -9,7 +9,7 @@
 //! ```text
 //! error: llvm-sys can't find LLVM  [llvm: pin]
 //!   ┌ build script of llvm-sys 231.0.1  (vendor/llvm-sys)
-//!   │ needs LLVM 23.1.4 (e152d9fa), pinned in crates/hir-ty-codegen/llvm.json
+//!   │ needs LLVM 23.1.4 (e152d9fa), pinned in crates/blaze-toolchain/pins/llvm.json
 //!   │ LLVM_SYS_231_PREFIX is not set
 //!   └ blocks 247 packages, including blaze-engine
 //!

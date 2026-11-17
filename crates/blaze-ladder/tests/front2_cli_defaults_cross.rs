@@ -170,8 +170,8 @@ impl<'t> SourceTexts<'t> for WithDep<'t> {
 /// must, and one note per body.
 fn outcomes<'n>(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &str) -> (Vec<String>, Vec<String>) {
     let sources = [SourceFile { path: "src/main.rs", text: user }];
-    let mut front = Front2::new(names, frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"), front.frame);
+    let mut front = Front2::new(names, frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let heap = blaze_own::testing::heap();
     let prepared = Prepares::new_in(heap.alloc());
     let mut buckets = None;
@@ -240,10 +240,10 @@ fn cross_crate_value_path_args_are_inferred_not_defaulted() {
     // CONTROL: `DEP` as the module `dep` of the one crate.
     let one = format!("{USER}\nmod dep {{\n{DEP}\n}}\n");
     let one_files = [("/zone/src/main.rs".to_string(), one.clone())];
-    let one_user = UserCrate { name: "zone", dir: "/zone/", root: "/zone/src/main.rs", files: &one_files, edition };
+    let one_user = UserCrate { name: "zone", dir: "/zone/", root: "/zone/src/main.rs", files: &one_files, edition, panic: blaze_build::Panic::Unwind };
     let one_inputs = Inputs::new(&one_user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let one_crates = one_inputs.crates();
-    let one_names = one_inputs.resolve(&one_crates).unwrap_or_else(|e| panic!("resolve_crates (one crate): {e}"));
+    let one_names = one_inputs.resolve(&one_crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates (one crate): {e}"));
     let one_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
     let (one_failed, one_notes) = outcomes(&one_names, &one_frame, &one);
     assert!(one_failed.is_empty(), "CONTROL one crate: bodies did not check as they must: {one_failed:?}\n{}", one_notes.join("\n"));
@@ -252,7 +252,7 @@ fn cross_crate_value_path_args_are_inferred_not_defaulted() {
     // CROSS: `DEP` as the library crate `dep`, the user crate's dependency.
     let user_files = [("/zone/src/main.rs".to_string(), USER.to_string())];
     let dep_files = [("/dep/src/lib.rs".to_string(), DEP.to_string())];
-    let user = UserCrate { name: "zone", dir: "/zone/", root: "/zone/src/main.rs", files: &user_files, edition };
+    let user = UserCrate { name: "zone", dir: "/zone/", root: "/zone/src/main.rs", files: &user_files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let mut crates: Vec<CrateInput<'_>> = inputs.crates();
     // The sysroot `Inputs::resolve` gives, by the units' library names (the crate's index is

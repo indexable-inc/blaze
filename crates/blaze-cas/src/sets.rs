@@ -41,7 +41,7 @@
 use std::{alloc::Global, sync::Arc};
 
 use blaze_core::lock::Lock;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::ContentId;
 
 use crate::{Handle, Key, Kind, Mismatch, Store, Ticket, Tickets, enter, sealed};
@@ -235,7 +235,7 @@ struct Members {
     sealed: Vec<(Key, sealed::Header)>,
     /// `Some` for a set written sealed at once: what was put under it and is in no sealed
     /// set yet, by key.
-    held: Option<HashMap<Key, Vec<u8>, Global>>,
+    held: Option<Map<Key, Vec<u8>, FixedState, Global>>,
     /// A root adopted ([`Sets::adopt`]) whose leaves are not read into `keys` yet.
     base: Option<Key>,
     /// How many listings in a row found its members as they were.
@@ -308,7 +308,7 @@ pub struct Listed {
 /// listings that keep them ([`Sets::list`]). Shared by every worker.
 pub struct Sets {
     // alloc: the daemon's own tables, for its life
-    shards: Vec<Lock<HashMap<ContentId, Members, Global>>>,
+    shards: Vec<Lock<Map<ContentId, Members, FixedState, Global>>>,
     /// Held by a listing and by a seal from end to end: one of them at a time.
     listing: Lock<()>,
 }
@@ -346,7 +346,7 @@ impl Sets {
         // alloc: the daemon's own tables, for its life
         Arc::new(Sets {
             shards: (0..SHARDS)
-                .map(|_| Lock::new("store.sets.members", HashMap::new_in(Global)))
+                .map(|_| Lock::new("store.sets.members", Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None })))
                 // alloc: the daemon's own tables, for its life
                 .collect(),
             listing: Lock::new("store.sets.listing", ()),
@@ -424,7 +424,7 @@ impl Sets {
         let mut shard = self.shards[set.0[0] as usize % SHARDS].lock();
         let members = shard.entry(*set).or_default();
         if members.held.is_none() {
-            members.held = Some(HashMap::new_in(Global));
+            members.held = Some(Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }));
         }
     }
 

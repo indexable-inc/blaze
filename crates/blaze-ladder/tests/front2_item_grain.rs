@@ -175,7 +175,7 @@ struct Outcome {
 fn check_all(records: &'static Records<'static>, frame: &'static blaze_mem::Frame, lang_crates: &[usize], fns: &[ItemKey]) -> Vec<Outcome> {
     let mut front = Front2::from_records(records, frame, lang_crates).unwrap_or_else(|e| panic!("front2 over records: {e}"));
     let prepared = Prepares::new_in(Alloc::global());
-    let (mut store, mut buckets, mut consts) = (Store::new(front.index.lang("sized"), frame), None, Consts::default());
+    let (mut store, mut buckets, mut consts) = (Store::new(front.index.lang("sized"), frame, blaze_own::Alloc::global()), None, Consts::default());
     let mut out = Vec::new();
     for key in fns.iter() {
         let body = match lower_fn(records, prepared, &mut front.keys, &mut store, *key) {
@@ -198,7 +198,7 @@ fn check_all(records: &'static Records<'static>, frame: &'static blaze_mem::Fram
         out.push(match check_body(&mut r, &body, &scope) {
             Ok(done) => Outcome { text: format!("checked: {done:?}"), diags: Some(done.diags.len()) },
             // A check that finished with errors is returned as `CheckFail::Diags` (check.rs).
-            Err(CheckFail::Diags { owner, diags }) => Outcome { text: format!("reported: {owner:?} {diags:?}"), diags: Some(diags.len()) },
+            Err(CheckFail::Diags { owner, diags, filed: _ }) => Outcome { text: format!("reported: {owner:?} {diags:?}"), diags: Some(diags.len()) },
             Err(e @ CheckFail::Gap { .. }) => Outcome { text: format!("gaps: {e:?}"), diags: None },
             Err(e) => Outcome { text: format!("not checked: {e:?}"), diags: None },
         });
@@ -217,7 +217,7 @@ fn an_edited_body_is_checked_over_the_old_records() {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let files = [("/hello-world/src/main.rs".to_string(), BEFORE.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
-    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
     let crate_names: &'static [&'static str] = Vec::leak(crates.iter().map(|c| leak(c.name)).collect());
@@ -229,7 +229,7 @@ fn an_edited_body_is_checked_over_the_old_records() {
     // The solve and the records written from it; nothing of the solved names leaves the block.
     let g = Alloc::global();
     let (kept, first, second) = {
-        let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
         let root = names.root(0);
         let key = |name: &str| Paths { names: &names }.path(root, false, &[name], Ns::Value).unwrap_or_else(|e| panic!("`{name}` from the crate root: {e}")).key;
         let mut kept = Kept { names: Vec::new(), items: Vec::new(), files: Vec::new(), expansions: Vec::new() };

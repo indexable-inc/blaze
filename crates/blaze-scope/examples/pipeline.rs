@@ -2809,7 +2809,7 @@ fn scope_type(base: &Base<'_>, done: &Done, m: ItemKey, name: N) -> Option<Bindi
                 return Ok(Node::Value(Some(Passed { def: b.def, vis: b.vis, state: b.state })));
             }
             let Some(chain) = self.chains.get(&source.key) else { return Err(()) };
-            Ok(Node::Edges { edges: &r.scope.globs, krate: self.krate, chain })
+            Ok(Node::Edges { edges: blaze_surface::Globs::of(&r.scope.globs), krate: self.krate, chain })
         }
     }
     if let Some(b) = done.get(&m).and_then(|r| r.scope.get(Namespace::Types, name).copied()) {

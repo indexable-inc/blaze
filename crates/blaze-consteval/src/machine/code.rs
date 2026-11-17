@@ -31,6 +31,7 @@ use crate::layout::{self, Layout};
 use crate::lit;
 use crate::mem::{PTR, Scalar};
 use crate::record::RecordKey;
+use crate::soft::Format;
 use crate::{ConstWorld, FnKind, Intrinsic, Typed};
 
 // `let` in a condition: `if let`, `while let`, let chains (machine/lets.rs).
@@ -144,8 +145,15 @@ pub(super) enum Op {
     IfVariant { place: Reg, e: u32, variant: u32, fail: u32 },
     /// Jump unless two values of type `ty` are equal; `konst`: the left is a constant's.
     IfSame { a: Reg, b: Reg, ty: PTy, konst: bool, fail: u32 },
-    /// Jump unless the slice at `place` has `len` elements.
-    IfLen { place: Reg, len: u64, fail: u32 },
+    /// Jump unless the slice at `place` has `len` elements (`at_least`: `len` or more, a slice
+    /// pattern with `..`).
+    IfLen { place: Reg, len: u64, at_least: bool, fail: u32 },
+    /// The place of the element `back` from the end (`back` at least 1) of the slice at `src`,
+    /// its elements `size` bytes apart: a slice pattern's element after its `..`.
+    FromEnd { dst: Reg, src: Reg, size: u64, back: u64 },
+    /// The subslice of the slice at `src` without its first `from` and last `back` elements: a
+    /// slice pattern's `..`, which a length test before it has made at least `from + back` long.
+    Subslice { dst: Reg, src: Reg, size: u64, from: u64, back: u64 },
     /// A binding by value into memory: `size` bytes from place `src` to place `dst`.
     Copy { dst: Reg, src: Reg, size: u64 },
     /// Stop: `Code::lates[k]`.
@@ -893,6 +901,30 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
         self.ground.intern_list(&all).map_err(|_| malformed("the ground table is full"))
     }
 
+    /// The value of const generic parameter `i` at this instance: its ground argument, a
+    /// `ConstValue` whose bits are the scalar (blaze-typeck portable.rs: little-endian as
+    /// this evaluator writes them). An argument that is not a value is malformed: the
+    /// evaluation runs at ground arguments, and the checker typed the path as a value only
+    /// for a const parameter.
+    fn const_param_value(&mut self, cc: &Cc<'w, '_>, i: u32) -> R<'a, Val> {
+        let arg = *cc.args.get(i as usize).ok_or(malformed("a const parameter past the instance's arguments"))?;
+        let PNode::ConstValue { ty, bits } = self.node(arg)? else {
+            return Err(malformed("a const parameter whose argument at the instance is not a value"));
+        };
+        let node = self.node(ty)?;
+        Ok(match node {
+            PNode::Bool | PNode::Char => Val::S(Scalar::Int(bits)),
+            PNode::Int(_) | PNode::Uint(_) => {
+                let (width, _) = int_info(node).ok_or(malformed("a const parameter's integer type with no size"))?;
+                Val::S(Scalar::Int(mask(bits, width)))
+            }
+            // Under `adt_const_params` the bits are a fieldless enum's variant index, not its
+            // stored tag: building that value is not written yet.
+            PNode::Adt(..) => return Err(unsupported("a const parameter of an enum type (`adt_const_params`) as a value in a constant")),
+            _ => return Err(malformed("a const parameter's value of a type that is not bool, char, an integer or an enum")),
+        })
+    }
+
     fn pat_def_c(&self, cc: &Cc<'w, '_>, p: PatId) -> Option<Def> {
         let t = &cc.typed;
         rows(t.pat_defs.0, p).next().map(|i| t.pat_defs.1[i])
@@ -1040,7 +1072,8 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
             Lit::Int(_) => {
                 let v = lit::int(src).map_err(Refusal::Literal)?;
                 match node {
-                    PNode::Float(f) => self.float_val(f, if neg { -(v as f64) } else { v as f64 })?,
+                    // Rounded once from the integer, at every float width.
+                    PNode::Float(f) => Val::S(Scalar::Int(Format::of(f).from_int(neg, v))),
                     _ => {
                         let (bits, _) = int_info(node).ok_or(malformed("an integer literal of a type that is not an integer"))?;
                         Val::S(Scalar::Int(mask(if neg { v.wrapping_neg() } else { v }, bits)))
@@ -1049,14 +1082,15 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
             }
             Lit::Float(_) => {
                 let PNode::Float(f) = node else { return Err(malformed("a float literal of a type that is not a float")) };
-                let wide = match f {
-                    FloatTy::F32 => false,
-                    FloatTy::F64 => true,
-                    _ => return Err(unsupported("`f16` and `f128` in a constant")),
+                let fm = Format::of(f);
+                let bits = match f {
+                    FloatTy::F32 => u128::from(lit::float(src, false).map_err(Refusal::Literal)?),
+                    FloatTy::F64 => u128::from(lit::float(src, true).map_err(Refusal::Literal)?),
+                    // The host parses neither: converted once from the digits (soft.rs).
+                    FloatTy::F16 | FloatTy::F128 => fm.parse(src, self.alloc).map_err(Refusal::Literal)?,
                 };
-                let bits = lit::float(src, wide).map_err(Refusal::Literal)?;
-                let sign = if neg { if wide { 1u64 << 63 } else { 1 << 31 } } else { 0 };
-                Val::S(Scalar::Int(u128::from(bits ^ sign)))
+                let sign = if neg { fm.sign() } else { 0 };
+                Val::S(Scalar::Int(bits ^ sign))
             }
             Lit::Char => Val::S(Scalar::Int(u128::from(lit::char(src).map_err(Refusal::Literal)?))),
             Lit::Str | Lit::ByteStr(_) => {
@@ -1271,8 +1305,10 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 let Expr::Struct { fields, base, .. } = self.expr_c(cc, e)? else { return Err(malformed("a struct task")) };
                 let t = self.ety_c(cc, e)?;
                 let base_r = match base {
-                    Some(_) => Some(self.pop_r(cc)?),
-                    None => None,
+                    blaze_typeck::StructBase::Expr(_) => Some(self.pop_r(cc)?),
+                    // `S { a: 1, .. }` (RFC 3681) builds as a literal; its unwritten fields
+                    // are added below from their defaults.
+                    blaze_typeck::StructBase::None | blaze_typeck::StructBase::Defaults => None,
                 };
                 let inits = body.field_inits.get(fields.range()).ok_or(malformed("field inits past their column"))?;
                 let at = cc.rs.len().checked_sub(inits.len()).ok_or(malformed("the value stack ran out"))?;
@@ -1293,6 +1329,25 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                     vals.push((idx as u32, r, PTy(0)));
                 }
                 cc.rs.truncate(at);
+                // RFC 3681: each field `S { a: 1, .. }` does not write is its default
+                // (`Typed::default_fields`), a constant of the field's type over the ADT's
+                // generics, read at this expression's type's ground arguments as a constant
+                // path is read (`Op::Const`, the record evaluated first by the work list).
+                if base == blaze_typeck::StructBase::Defaults {
+                    let PNode::Adt(_, args) = self.node(t)? else { return Err(malformed("a struct expression of a type that is not an ADT")) };
+                    let typed = cc.typed;
+                    for i in rows(typed.default_fields.0, e) {
+                        let (idx, k) = (typed.default_fields.1[i], typed.default_fields.2[i]);
+                        if idx as usize >= names.len() || vals.iter().any(|&(f, _, _)| f == idx) {
+                            return Err(malformed("a field default past its variant, or of a field the expression writes"));
+                        }
+                        let key = RecordKey::of(self.instance(k, args)?);
+                        code.consts.push((k, args, key));
+                        let dst = self.reg(cc, Kind::P);
+                        self.emit(code, cc, Op::Const { dst, k: code.consts.len() as u32 - 1 });
+                        vals.push((idx, dst, PTy(0)));
+                    }
+                }
                 let dst = match base_r {
                     Some(b) => {
                         let ty = self.ty(code, t)?;
@@ -1626,6 +1681,18 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                         let r = self.build(cc, code, t, variant, &[], false)?;
                         cc.rs.push(r);
                     }
+                    // A const generic parameter as a value (the Reference, "Const generics":
+                    // "const parameters may be used ... as a standalone expression"): its
+                    // value is this instance's argument at the parameter's index, a ground
+                    // `ConstValue` (`CAP` in `const LAP: usize = CAP + 1` of
+                    // `impl<T, const CAP: usize>`, `N` in a const block of a fn generic over
+                    // `const N`).
+                    Some(Def::TyParam(i)) => {
+                        let v = self.const_param_value(cc, i)?;
+                        let dst = self.reg(cc, Kind::V);
+                        self.emit(code, cc, Op::Imm { dst, v });
+                        cc.rs.push(dst);
+                    }
                     _ => match self.node(t)? {
                         PNode::FnDef(..) => {
                             let dst = self.reg(cc, Kind::V);
@@ -1779,7 +1846,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
             }
             Expr::Struct { fields, base, .. } => {
                 cc.tasks.push(C::Struct(e));
-                if let Some(b) = base {
+                if let Some(b) = base.expr() {
                     cc.tasks.push(C::Eval(b, Mode::Place));
                 }
                 let inits = body.field_inits.get(fields.range()).ok_or(malformed("field inits past their column"))?;
@@ -1792,7 +1859,31 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 cc.tasks.push(C::Eval(index, Mode::Value));
                 cc.tasks.push(C::Eval(base, Mode::Place));
             }
-            Expr::Closure { .. } => return Err(unsupported("a closure in a constant")),
+            // A closure's value is its environment, one field per capture (codegen.md,
+            // "Closures and the Fn traits"). One the checker coerced to a fn pointer captures
+            // nothing (the Reference, "Type coercions": "Non capturing closures to `fn`
+            // pointers"; rules/coerce.rs makes `ClosureFnPointer` only then), so its value is
+            // zero-sized and its adjustment (`Self::adjust`) makes the pointer; that needs no
+            // closure facts of the world (`thread_local!`'s `LocalKey::new(const { |_| .. })`).
+            // Any other closure is zero-sized exactly when its layout says so, and a zero-sized
+            // value has no bytes to make. A closure holding bytes of a capture would need the
+            // captured bindings, which `Typed` does not carry: refused by name.
+            Expr::Closure { is_async, .. } => {
+                if is_async {
+                    return Err(unsupported("an `async` closure in a constant"));
+                }
+                let coerced = rows(typed.adjusts.0, e).any(|i| typed.adjusts.1[i] == AdjustKind::ClosureFnPointer);
+                if !coerced {
+                    let t = self.ety_c(cc, e)?;
+                    let ty = self.ty(code, t)?;
+                    if code.tys[ty as usize].repr != Repr::Zst {
+                        return Err(unsupported("a closure whose captures hold bytes in a constant"));
+                    }
+                }
+                let dst = self.reg(cc, Kind::V);
+                self.emit(code, cc, Op::Imm { dst, v: Val::Zst });
+                cc.rs.push(dst);
+            }
             // An `if` condition's `let` links are compiled by machine/lets.rs; a `let` reached
             // here is not a condition operand (inside parentheses, under `||`).
             Expr::Let { .. } => return Err(unsupported("`let` outside an `if` or `while` condition's `&&` chain")),
@@ -1865,8 +1956,39 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                     self.emit(code, cc, Op::FnPtr { dst, k: code.fns.len() as u32 - 1 });
                     dst
                 }
+                // The pointer is the closure's `FnOnce::call_once` at `[C, (A..)]`, the one
+                // instance blaze-build's `closure_fn_addr` takes for the same coercion, so the
+                // record's fn word names the function the build makes. The arguments' tuple is
+                // the target pointer's inputs: the checker unified that pointer with the
+                // closure's signature (rules/coerce.rs), so no closure facts are read. The
+                // trait method is a trait's, never resolved: a closure has no impl to select.
                 AdjustKind::ClosureFnPointer => {
-                    return Err(unsupported("a closure that captures nothing as a fn pointer"));
+                    let PNode::Closure { owner, .. } = self.node(ty)? else {
+                        return Err(malformed("a closure's fn pointer made of a value that is not a closure"));
+                    };
+                    let PNode::FnPtr(sig, _) = self.node(next)? else { return Err(malformed("a closure coerced to a type that is not a fn pointer")) };
+                    let call_once = self
+                        .world
+                        .fn_trait_method(blaze_build::FnTrait::FnOnce)
+                        .ok_or(unsupported("a closure as a fn pointer in a world that names no `FnOnce::call_once` (ConstWorld::fn_trait_method)"))?;
+                    let mut inputs: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
+                    let all = self.ground.view().list(sig).map_err(|_| malformed("a list past the ground table"))?;
+                    let (_, ins) = all.split_last().ok_or(malformed("a fn pointer type without its output"))?;
+                    inputs.extend_from_slice(ins);
+                    let list = self.ground.intern_list(&inputs).map_err(|_| malformed("the ground table is full"))?;
+                    let tuple = self.ground.intern(PNode::Tuple(list)).map_err(|_| malformed("the ground table is full"))?;
+                    // Keyed over the owner's code identity by the one form the run keys a
+                    // closure's method instance by (`blaze_build::closure_method_key_args`), so
+                    // the image's fill finds the slot the run built.
+                    let own = self.ground.intern_list(&[ty, tuple]).map_err(|_| malformed("the ground table is full"))?;
+                    let method = blaze_build::Instance { item: call_once, args: own };
+                    let args = blaze_build::closure_method_key_args(method, self.ground, self.alloc)
+                        .map_err(|_| malformed("a closure's `call_once` instance past the ground table"))?;
+                    let key = self.instance(owner, args)?;
+                    code.fns.push(key);
+                    let dst = self.reg(cc, Kind::V);
+                    self.emit(code, cc, Op::FnPtr { dst, k: code.fns.len() as u32 - 1 });
+                    dst
                 }
                 AdjustKind::Unsize => {
                     let src = self.as_value(cc, code, out, ty)?;
@@ -1927,6 +2049,10 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 let ct = self.final_ty_c(cc, callee)?;
                 match self.node(ct)? {
                     PNode::FnDef(k, l) => (k, l),
+                    // Only a `const` closure may be called in a constant (E0015 otherwise; the
+                    // unstable `const_closures`): its body is part of its owner's, compiled
+                    // with its captures as the environment's fields, which is not built.
+                    PNode::Closure { .. } => return Err(unsupported("a call of a `const` closure in a constant")),
                     _ => return Err(unsupported("a call through a fn pointer in a constant")),
                 }
             }
@@ -2165,31 +2291,63 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                         work.push(P::Pat { p: fp.pat, place: fpl, ty: ft, fail });
                     }
                 }
-                Pat::Slice { rest: Some(_), .. } => return Err(unsupported("a slice pattern with `..` in a constant")),
-                Pat::Slice { elems, rest: None } => {
+                // The Reference, "Slice patterns": the elements before a `..` at their index,
+                // those after it counted from the end, and the `..` itself (a wildcard, or the
+                // pattern a `rest @ ..` binding is over) the part between, of the checker's type
+                // for it: `[T]` over a slice, `[T; n - k]` over an array of `n` with `k` other
+                // elements.
+                Pat::Slice { elems, rest } => {
                     let (el, len) = match node {
                         PNode::Array(el, n) => (el, Some(self.len(n)?)),
                         PNode::Slice(el) => (el, None),
                         _ => return Err(malformed("a slice pattern of a type that is not an array or slice")),
                     };
+                    let count = u64::from(elems.len);
+                    let rest = rest.map(u64::from);
+                    if rest.is_some_and(|r| r >= count) {
+                        return Err(malformed("a slice pattern's `..` past its elements"));
+                    }
+                    let fixed = count - u64::from(rest.is_some());
                     match len {
-                        Some(n) if n != u64::from(elems.len) => {
+                        Some(n) if n < fixed || (rest.is_none() && n != fixed) => {
                             let j = self.jump(code, cc);
                             self.to_list(cc, fail, j);
                             continue;
                         }
                         Some(_) => {}
                         None => {
-                            let j = self.emit(code, cc, Op::IfLen { place: pl, len: u64::from(elems.len), fail: u32::MAX });
+                            let j = self.emit(code, cc, Op::IfLen { place: pl, len: fixed, at_least: rest.is_some(), fail: u32::MAX });
                             self.to_list(cc, fail, j);
                         }
                     }
                     let (size, _) = self.size_align(el)?;
                     let pats = body.pat_lists.get(elems.range()).ok_or(malformed("patterns past their column"))?;
                     for (k, &sp) in pats.iter().enumerate().rev() {
+                        let k = k as u64;
                         let q = self.reg(cc, Kind::P);
-                        self.emit(code, cc, Op::Field { dst: q, src: pl, off: size * k as u64 });
-                        work.push(P::Pat { p: sp, place: q, ty: el, fail });
+                        let ty = match rest {
+                            Some(r) if k == r => {
+                                let back = count - 1 - r;
+                                match len {
+                                    Some(_) => self.emit(code, cc, Op::Field { dst: q, src: pl, off: size * k }),
+                                    None => self.emit(code, cc, Op::Subslice { dst: q, src: pl, size, from: k, back }),
+                                };
+                                self.cg(cc, *typed.pat_ty.get(sp.ix()).ok_or(malformed("a pattern with no type"))?)?
+                            }
+                            Some(r) if k > r => {
+                                let back = count - k;
+                                match len {
+                                    Some(n) => self.emit(code, cc, Op::Field { dst: q, src: pl, off: size * (n - back) }),
+                                    None => self.emit(code, cc, Op::FromEnd { dst: q, src: pl, size, back }),
+                                };
+                                el
+                            }
+                            _ => {
+                                self.emit(code, cc, Op::Field { dst: q, src: pl, off: size * k });
+                                el
+                            }
+                        };
+                        work.push(P::Pat { p: sp, place: q, ty, fail });
                     }
                 }
                 Pat::Or { alts } => {
@@ -2352,7 +2510,7 @@ fn shape<'a>(task: C, typed: &Typed<'_>) -> R<'a, (u32, bool)> {
             _ => (0, true),
         },
         C::Struct(e) => match expr(e)? {
-            Expr::Struct { fields, base, .. } => (fields.len + u32::from(base.is_some()), true),
+            Expr::Struct { fields, base, .. } => (fields.len + u32::from(base.expr().is_some()), true),
             _ => (0, true),
         },
         C::Call(e) => match expr(e)? {

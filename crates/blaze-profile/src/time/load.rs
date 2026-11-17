@@ -1247,13 +1247,22 @@ fn events(batches: &[Batch], fields: &[Batch]) -> Result<Vec<EventIn>, TimeError
 fn event_fields(
     batches: &[Batch],
 ) -> Result<
-    blaze_hash::HashMap<(u32, u64), Vec<(String, crate::logs::Value)>, std::alloc::Global>,
+    blaze_hash::Map<
+        (u32, u64),
+        Vec<(String, crate::logs::Value)>,
+        blaze_hash::FixedState,
+        std::alloc::Global,
+    >,
     TimeError,
 > {
     use crate::logs::Value;
     const T: &str = "event_fields";
     // alloc: the build's event fields, once a report
-    let mut out = blaze_hash::HashMap::new_in(std::alloc::Global);
+    let mut out = blaze_hash::Map::new(blaze_hash::MapOpts {
+        hasher: blaze_hash::FixedState,
+        alloc: std::alloc::Global,
+        capacity: None,
+    });
     for batch in batches {
         let (process, event_id, key, kind) = (
             ints(batch, T, "process")?,

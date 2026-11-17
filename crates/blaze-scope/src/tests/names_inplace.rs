@@ -61,8 +61,10 @@ static TEXTS: Texts = Texts(&[&[("/k0/lib.rs", K0)], &[("/k1/lib.rs", K1)]]);
 
 struct Loaded(Vec<&'static [u8]>);
 
-impl LoadNames<'static> for Loaded {
-    fn load(&self, krate: usize) -> Option<&'static [u8]> {
+// For any `'a`, not only `'static`: the reader's lifetime is its allocator's, and the counting
+// allocator below lives on this test's stack.
+impl<'a> LoadNames<'a> for Loaded {
+    fn load(&self, krate: usize) -> Option<&'a [u8]> {
         self.0.get(krate).copied()
     }
 }

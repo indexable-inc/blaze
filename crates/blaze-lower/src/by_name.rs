@@ -13,13 +13,13 @@
 
 use blaze_expand::{
     BuiltinDerive, BuiltinFn, Call, CallSite, Ctx, DefAt, DefSite, DeriveFacts, Eager, ExpandCx, Expanded, Export, Inside, LocalInner,
-    LexError, MacroDefinition, Mark, NestedKind, Prepared, ProcKind, Reads, StreamError, TokenKind, TokenStream, call_key, expand, expand_prepared, lex, prepare,
+    LexError, MacroDefinition, NestedKind, Prepared, ProcKind, Reads, StreamError, TokenKind, TokenStream, call_key, expand, expand_prepared, lex, prepare,
 };
 use blaze_ids::ContentId;
 use blaze_own::{AString, AVec, Alloc, Vec};
 use blaze_surface::Edition;
 
-use crate::driver::{BodyCall, BodyOut, CallInput, Expand, Expansion, LocalMacro};
+use crate::driver::{BodyCall, BodyOut, CallInput, Expand, Expansion, LocalForm, LocalMacro};
 
 /// How deep eager inputs nest (`concat!(concat!(..))`) before the call is refused.
 pub const EAGER_DEPTH: u32 = 8;
@@ -55,8 +55,9 @@ pub trait MacroNames<'d> {
 pub enum NoMacro<'a> {
     /// No macro of its last name in [`Lists`] (the stand-in with no names).
     NotListed,
-    /// `$crate` written where no expansion's mark says which crate it is (the body's own text).
-    UnmarkedDollarCrate,
+    /// Its mark gives the path no site (`crate::mark_site::site_of`): `$crate` no expansion
+    /// wrote, or a relative path under a def-site mark with no module.
+    Site(crate::mark_site::SiteRefused),
     /// The path as written is not a path (an empty segment, `$crate` past the first segment).
     NotAPath,
     /// A `macro_rules!` of the body names it, and the resolver gives no crate to define it in.
@@ -70,7 +71,7 @@ impl core::fmt::Display for NoMacro<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             NoMacro::NotListed => f.write_str("no macro of this name in the stand-in lists"),
-            NoMacro::UnmarkedDollarCrate => f.write_str("`$crate` outside an expansion"),
+            NoMacro::Site(why) => write!(f, "{why}"),
             NoMacro::NotAPath => f.write_str("not a path"),
             NoMacro::LocalWithoutCrate => f.write_str("a `macro_rules!` of the body, and the resolver names no crate for it"),
             NoMacro::Names(blaze_scope::resolve::MacroDefError::Path(e)) => write!(f, "{e}"),
@@ -121,6 +122,8 @@ pub enum Failure<'a> {
     Stream(StreamError),
     /// The call's input has no delimiters around it.
     NoDelimiters,
+    /// The body's `macro` it names is neither `macro m(params) { body }` nor `macro m { arms }`.
+    Macro2Shape,
     /// The call's input is in an expansion this body has not made.
     NoExpansion { expansion: u32 },
     /// An eager macro's input holds a call that is not function-like.
@@ -137,6 +140,7 @@ impl core::fmt::Display for Failure<'_> {
             Failure::Lex(e) => write!(f, "its input does not lex: {e:?}"),
             Failure::Stream(e) => write!(f, "its input could not be copied: {e}"),
             Failure::NoDelimiters => f.write_str("its input has no delimiters"),
+            Failure::Macro2Shape => f.write_str("the body's `macro` it names is neither `macro m(..) {..}` nor `macro m {..}`"),
             Failure::NoExpansion { expansion } => write!(f, "its input is in expansion {expansion}, which this body has not made"),
             Failure::EagerNotFnLike { kind } => write!(f, "an eager input holds a {kind:?} call"),
             Failure::EagerAgain { depth } => write!(f, "an eager macro asked for its input's calls again (eager depth {depth}, bound {EAGER_DEPTH})"),
@@ -214,12 +218,14 @@ impl core::fmt::Display for NotExpanded<'_> {
     }
 }
 
-/// Where a call's path is written: in the body's own text (`mark: None`, resolved in the body's
-/// module), or in an expansion, whose tokens carry the mark of the macro that wrote them: its
-/// crate is what `$crate` names, and an opaque mark (`macro`) resolves at its module.
+/// Where a call's path is written: in a file's text (`mark: None`, resolved in the body's
+/// module), or by a macro, whose words carry its mark: an expansion lowered in the body, or the
+/// text of an item a macro wrote ([`BodyCall::path_mark`]). Its crate is what `$crate` (or the
+/// `crate` an item text writes for it) names, and an opaque mark (`macro`) resolves at its
+/// module.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PathAt {
-    pub mark: Option<Mark>,
+    pub mark: Option<crate::mark_site::TextMark>,
 }
 
 impl PathAt {
@@ -237,13 +243,13 @@ impl PathAt {
                 _ => break,
             }
         }
-        PathAt { mark: first.and_then(|it| stream.hygiene(tokens[it].ctx).mark) }
+        PathAt { mark: first.and_then(|it| stream.hygiene(tokens[it].ctx).mark).map(crate::mark_site::TextMark::of) }
     }
 
     /// The first token of `start..end` (a nested call's path) in `stream`.
     fn of(stream: &TokenStream<'_>, start: u32) -> PathAt {
         let mark = stream.tokens().get(start as usize).and_then(|t| stream.hygiene(t.ctx).mark);
-        PathAt { mark }
+        PathAt { mark: mark.map(crate::mark_site::TextMark::of) }
     }
 }
 
@@ -400,8 +406,8 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
         }
     }
 
-    /// The `macro_rules!` of the body a single-name `path` names (the last written of the
-    /// name in textual scope), as a definition in the body's crate at `edition`.
+    /// The `macro_rules!` or `macro` of the body a single-name `path` names (the last written
+    /// of the name in scope), as a definition in the body's crate at `edition`.
     fn local(&self, path: &str, locals: &[LocalMacro<'_>], edition: Edition) -> Option<Result<MacroDefinition<'a>, Refused<'a>>> {
         let name = path.trim();
         let written = locals.iter().rev().find(|l| l.name == name)?;
@@ -411,13 +417,20 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
         };
         let Some(site) = site else { return Some(Err(Refused::Unknown(NoMacro::LocalWithoutCrate))) };
         let at = DefAt { site, edition, export: Export::Local, local_inner: LocalInner::No, transparency: None };
-        Some(lex(written.rules, edition, self.alloc).map(|body| MacroDefinition::rules(body, at)).map_err(|e| Refused::Failed(Failure::Lex(e))))
+        Some(match written.form {
+            LocalForm::Rules(rules) => {
+                lex(rules, edition, self.alloc).map(|body| MacroDefinition::rules(body, at)).map_err(|e| Refused::Failed(Failure::Lex(e)))
+            }
+            LocalForm::Macro2(trees) => macro2_of(trees, at, self.alloc).map_err(Refused::Failed),
+        })
     }
 
-    /// Where the path of the call whose input is `input` is written.
-    fn path_at(&self, input: CallInput<'_>) -> PathAt {
-        match input {
-            CallInput::Text(_) => PathAt::default(),
+    /// Where the path of `call` is written: a call in text takes its first word's mark from the
+    /// lowering (the item's own words keep theirs when a macro wrote the item: a `$crate` it
+    /// wrote is the word `crate` there, its crate only in the mark).
+    fn path_at(&self, call: &BodyCall<'_>) -> PathAt {
+        match call.input {
+            CallInput::Text(_) => PathAt { mark: call.path_mark },
             CallInput::Expanded { expansion, start, .. } => {
                 self.expansions.get(expansion as usize).map_or(PathAt::default(), |(_, tokens)| PathAt::before(tokens, start))
             }
@@ -533,6 +546,30 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
     }
 }
 
+/// The body's `macro` whose trees after its name are `trees`, defined `at`: `(params) { body }`
+/// one function-like rule, `{ arms }` arms as a `macro_rules!` has; the params and the body
+/// are the tokens inside their delimiters, as blaze-scope makes a module's `macro`
+/// (task/lower.rs, `ItemDetail::MacroDef`).
+fn macro2_of<'a>(trees: &str, at: DefAt, alloc: Alloc<'a>) -> Result<MacroDefinition<'a>, Failure<'a>> {
+    use blaze_expand::Delim;
+    let lexed = lex(trees, at.edition, alloc).map_err(Failure::Lex)?;
+    let tokens = lexed.tokens();
+    let group = |open: usize, delim: Delim| match tokens.get(open).map(|t| t.kind) {
+        Some(TokenKind::Open(d)) if d == delim => lexed.close_of(open),
+        _ => None,
+    };
+    let inside = |open: usize, close: usize| lexed.copy_in(open + 1..close, alloc).map_err(Failure::Stream);
+    let (params, body_open) = match group(0, Delim::Paren) {
+        Some(close) => (Some(inside(0, close)?), close + 1),
+        None => (None, 0),
+    };
+    let body_close = group(body_open, Delim::Brace).ok_or(Failure::Macro2Shape)?;
+    if body_close + 1 != tokens.len() {
+        return Err(Failure::Macro2Shape);
+    }
+    Ok(MacroDefinition::macro2(params, inside(body_open, body_close)?, at))
+}
+
 /// [`expand_prepared`] of a definition prepared once, else [`expand`].
 fn expand_with<'a>(
     def: &MacroDefinition<'_>,
@@ -603,10 +640,19 @@ fn last_name(path: &str) -> Option<&str> {
 }
 
 impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
-    fn expand(&mut self, path: &str, input: &str, edition: Edition, cfg: &mut dyn crate::Cfg, out: &mut BodyOut<'_>) -> Expansion {
+    fn expand(
+        &mut self,
+        path: &str,
+        path_mark: Option<crate::mark_site::TextMark>,
+        input: &str,
+        edition: Edition,
+        cfg: &mut dyn crate::Cfg,
+        out: &mut BodyOut<'_>,
+    ) -> Expansion {
+        let at = PathAt { mark: path_mark };
         let result = self
             .input(CallInput::Text(input), edition)
-            .and_then(|input| self.call(path, PathAt::default(), &input, edition, Inside::Plain, 0, &[], Some(cfg)));
+            .and_then(|input| self.call(path, at, &input, edition, Inside::Plain, 0, &[], Some(cfg)));
         match result {
             Ok((key, tokens)) => {
                 out.key = key;
@@ -620,7 +666,7 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
     }
 
     fn expand_body(&mut self, call: BodyCall<'_>, cfg: &mut dyn crate::Cfg, out: &mut BodyOut<'_>) -> Expansion {
-        let at = self.path_at(call.input);
+        let at = self.path_at(&call);
         let before = self.reads.list().len();
         let result = self
             .input(call.input, call.edition)
@@ -665,8 +711,16 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
 
     /// An attribute macro (a `macro_rules!` `attr(..)` arm, as `#[bstd::main]`, or a proc
     /// macro); a path that names none is no attribute macro (`#[inline]`, `#[allow(..)]`).
-    fn attr(&mut self, path: &str, args: Option<&TokenStream<'_>>, item: &TokenStream<'_>, edition: Edition, out: &mut BodyOut<'_>) -> Expansion {
-        let Ok(resolved) = self.resolve(path, PathAt::default(), ProcKind::Attr) else { return Expansion::Unsupported };
+    fn attr(
+        &mut self,
+        path: &str,
+        path_mark: Option<crate::mark_site::TextMark>,
+        args: Option<&TokenStream<'_>>,
+        item: &TokenStream<'_>,
+        edition: Edition,
+        out: &mut BodyOut<'_>,
+    ) -> Expansion {
+        let Ok(resolved) = self.resolve(path, PathAt { mark: path_mark }, ProcKind::Attr) else { return Expansion::Unsupported };
         let def;
         let own;
         let prepared = match resolved {
@@ -702,8 +756,16 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
     /// A derive: the language's (`Clone`, `Copy`, `Debug`, `Default`, `PartialEq`, `Eq`,
     /// `PartialOrd`, `Ord`, `Hash`, `ConstParamTy`, written by blaze-expand's `derive` as the
     /// Reference specifies them), or a proc macro's.
-    fn derive(&mut self, path: &str, item: &TokenStream<'_>, facts: DeriveFacts, edition: Edition, out: &mut BodyOut<'_>) -> Expansion {
-        let def = match self.resolve(path, PathAt::default(), ProcKind::Derive) {
+    fn derive(
+        &mut self,
+        path: &str,
+        path_mark: Option<crate::mark_site::TextMark>,
+        item: &TokenStream<'_>,
+        facts: DeriveFacts,
+        edition: Edition,
+        out: &mut BodyOut<'_>,
+    ) -> Expansion {
+        let def = match self.resolve(path, PathAt { mark: path_mark }, ProcKind::Derive) {
             Ok(Resolved::Def(def)) => def,
             // A `macro_rules!` is no derive.
             Ok(Resolved::Prepared(_)) => return Expansion::Failed,

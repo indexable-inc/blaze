@@ -26,8 +26,8 @@ pub use blaze_format_core::{
     Part, Persist, Placed, Record, Rel, RelSpan, SCHEMA_DOMAIN, SchemaHash, Slice, SpanRef, Str,
     Text, Unfit, Verified, WordTable, WordTables, WriteBuffer, Writer, WriterIn, buffer_id,
     bytes_of_slice, check_field, check_field_shallow, declared, field, field_columns, header,
-    open, open_as, open_verified, read_verified, record, record_at, row_words, schema, schema_of,
-    to_bytes,
+    open, open_as, open_verified, read_verified, record, record_at, reopen, row_words, rows, schema,
+    schema_of, to_bytes,
 };
 
 record! {

@@ -243,7 +243,6 @@ macro_rules! test {
                     setup: &SETUP,
                     planned: PLANNED,
                 },
-                $crate::entry::Heap::process(),
                 $crate::__test_body!($cx : $cxty $(, $param : $ty)* ; $(-> $returns)? $body),
             )
         }

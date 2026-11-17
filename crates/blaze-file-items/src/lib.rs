@@ -253,6 +253,12 @@ pub fn outline_tokens<'a>(
 
 pub use walk::rows::{TokenColumns, TokensRefused};
 
+/// The outline of an expansion's token record (drive.md D122 rule 3), with no text: names are
+/// lexemes, every extent a `TokenRange`, every digest the record's token digest
+/// (crate::walk::token_outline). [`outline_tokens`], its text and token columns, goes once its
+/// callers read token records.
+pub use walk::token_outline::{TokenEntry, TokenOutline, TokenOutlineRefused, outline_token_record};
+
 /// The outline of one part of a file ([`split_top_level`]), from its bytes and the edition
 /// alone: [`outline`] of the part's text, so positions are relative to the part's start, and
 /// the top-level disambiguators count only the part's entries until [`Assembled`] recounts

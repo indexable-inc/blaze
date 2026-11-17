@@ -10,9 +10,9 @@ use blaze_ids::ContentId;
 use crate::{
     flags::{self, AtomicRmw, FloatCond, IntCond},
     func::{
-        AsmOperandKind, AsmOperandRec, AsmPieceRec, AsmRec, BlockKind, CompoundRec, Conv, DataRec,
-        DataRelocRec, Ext, FnAttrs, Func, Head, Inline, InlinedRec, IntrinsicRec, MemAttrsRec, NONE,
-        ParamFactsRec, ParamKind, ParamRec, RangeRec, RefKind, RefRec, SigRec, SlotKind, SlotRec,
+        AsmOperandKind, AsmOperandRec, AsmPieceRec, AsmRec, BlockKind, CompoundRec, Conv, DataPositionRec,
+        DataRec, DataRelocRec, Ext, FnAttrs, Func, Head, Inline, InlinedRec, IntrinsicRec, MemAttrsRec, NONE,
+        ParamFactsRec, ParamKind, ParamRec, PositionField, RangeRec, RefKind, RefRec, SigRec, SlotKind, SlotRec,
         VarRec,
     },
     op::{Field, Layout, Op},
@@ -571,12 +571,31 @@ fn table(keyword: &str, line: &mut Line<'_, '_>, func: &mut Func<Global>) -> Res
                 func.data_relocs.push(DataRelocRec { addend, offset, target });
                 Ok(())
             })?;
+            let positions_first = func.data_positions.len() as u32;
+            if line.is_keyword("positions") {
+                line.at += 1;
+                line.list('[', ']', |line| {
+                    let offset = line.number("a source position's offset")?;
+                    let field = line.word("a source position's field")?;
+                    let field = PositionField::from_name(field).ok_or_else(|| {
+                        line.at -= 1;
+                        line.err("a source position's field (`line` or `col`)")
+                    })?;
+                    let words = line.hex_words(4)?;
+                    let item = words.iter().rev().fold(0u128, |it, &word| (it << 32) | u128::from(word));
+                    let site = line.number("a source position's site")?;
+                    func.data_positions.push(DataPositionRec { item: item.to_le_bytes(), offset, site, field: field as u32 });
+                    Ok(())
+                })?;
+            }
             func.datas.push(DataRec {
                 bytes_first,
                 bytes_len: func.data_bytes.len() as u32 - bytes_first,
                 relocs_first,
                 relocs_len: func.data_relocs.len() as u32 - relocs_first,
                 align,
+                positions_first,
+                positions_len: func.data_positions.len() as u32 - positions_first,
             });
         }
         "intrinsic" => {

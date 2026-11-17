@@ -88,6 +88,10 @@ pub struct SimHost {
     pub out: Vec<u8>,
     /// Everything written to standard error, in order.
     pub err: Vec<u8>,
+    /// How many writes standard output and standard error were handed, in that order: each
+    /// is one system call in a native world, so a test counts what the buffer of
+    /// [`crate::out`] saves.
+    pub writes: [u64; 2],
     /// What standard output and standard error are drawn on, in that order: what
     /// `Out::is_terminal` and `Out::size` read. Not terminals unless a test says so.
     pub ttys: [crate::term::Tty; 2],
@@ -147,6 +151,7 @@ impl SimHost {
             // alloc: none, nothing written yet.
             out: Vec::new(),
             err: Vec::new(),
+            writes: [0; 2],
             ttys: [crate::term::Tty::NotTerminal; 2],
             term: SimTerm::new(),
             // alloc: none, the simulated host's empty tables (this and each below).

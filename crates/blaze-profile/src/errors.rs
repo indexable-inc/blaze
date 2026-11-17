@@ -11,7 +11,7 @@
 use std::alloc::Global;
 
 use blaze_columns::{ColumnError, Texts};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 
 use crate::{
     columns::{self, Batch, BatchError, Column},
@@ -359,7 +359,7 @@ fn header<'a>(line: &'a str, level: &str) -> Option<(Option<&'a str>, &'a str)> 
 pub(crate) fn dict<'a>(values: impl Iterator<Item = Option<&'a str>>) -> Result<Column, ColumnError> {
     // alloc: a column's distinct texts and their keys, once a flush
     let mut texts = Texts::new_in(Global);
-    let mut keys_of: HashMap<&'a str, u32, Global> = HashMap::new_in(Global);
+    let mut keys_of: Map<&'a str, u32, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     let mut keys = Vec::new(); // alloc: a column's keys, once a flush
     for value in values {
         let key = match value {

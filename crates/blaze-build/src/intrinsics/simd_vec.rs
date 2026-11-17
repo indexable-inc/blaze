@@ -591,6 +591,7 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
         | SimdOp::Splat
         | SimdOp::Extract
         | SimdOp::Insert
-        | SimdOp::Select => return Err(shape("a lane-by-lane `simd_*` row sent to the vector builder")),
+        | SimdOp::Select
+        | SimdOp::SelectBitmask => return Err(shape("a lane-by-lane `simd_*` row sent to the vector builder")),
     })
 }

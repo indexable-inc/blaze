@@ -13,7 +13,7 @@ use blaze_lower::{View, form as lf, head};
 use blaze_surface::Range;
 use blaze_typeck::{List, Name, PClause, PNode, PTy, PortableTys};
 
-use super::types::{Bounded, Bounds, Builder, Env, Heads, ParamBound, Why, intern, intern_list, path_texts, path_texts_of, subst_clause};
+use super::types::{Bounded, Bounds, Builder, Env, Heads, ParamBound, SelfTy, Why, intern, intern_list, path_texts, path_texts_of, subst_clause};
 
 /// What one bound says of its type's sizedness ([`Builder::bound`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,7 +187,7 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
         let (abs, texts, segs, pr) = path_texts_of(v, p, true)?;
         // What the path names comes first: the trait's head says which of the written
         // arguments are constants (`Uint<LO>: Concat<HI>`; const_args_in_bounds.rs).
-        let target = self.bound_target(env, abs, &texts, pr)?;
+        let target = self.bound_target(env, v, p, abs, &texts, pr)?;
         let (given, binds, nested) = match segs.last() {
             Some(last) => self.bound_segment_args(tys, env, v, target, last, pr)?,
             None => (Vec::new_in(Global), Vec::new_in(Global), Vec::new_in(Global)),
@@ -328,7 +328,15 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
             let lf::TypeRef::Path(p) = v.ty(ty)? else { continue };
             let (abs, texts, _, _) = path_texts(v, p)?;
             let (false, [t]) = (abs, texts.as_slice()) else { continue };
-            let Some(&(_, param)) = env.params.iter().find(|(n, _)| *n == Name::of(t)) else { continue };
+            // `where Self: Tr` in a trait or one of its members: `Self` is `Param(0)` there, and
+            // a bound on it is what `Self::X` is looked up through beside the trait itself (the
+            // Reference, "Paths", "`Self`"; tap's `fn try_conv<T>(self) -> Result<T,
+            // Self::Error> where Self: TryInto<T>`). In an impl `Self` is no parameter.
+            let param = match env.params.iter().find(|(n, _)| *n == Name::of(t)) {
+                Some(&(_, p)) => p,
+                None if *t == "Self" && matches!(env.self_, SelfTy::Trait(_)) => 0,
+                None => continue,
+            };
             for &b in v.rows(bounds)? {
                 self.param_bound(tys, env, v, lf::Bound::decode(b)?, param, out)?;
             }
@@ -345,7 +353,7 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
         let lf::TypeRef::Path(p) = v.ty(ty)? else { return Ok(()) };
         let e = Env { bounds: Bounds::Building(out), ..*env };
         let (abs, texts, segs, pr) = path_texts_of(v, p, true)?;
-        let target = self.bound_target(&e, abs, &texts, pr)?;
+        let target = self.bound_target(&e, v, p, abs, &texts, pr)?;
         let given = match segs.last() {
             Some(last) => self.bound_segment_args(tys, &e, v, target, last, pr)?.0,
             None => Vec::new_in(Global),

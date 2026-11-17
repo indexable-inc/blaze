@@ -12,6 +12,7 @@
 //! 128 bits: a collision among a module's cells is a refusal by the record's writer (two names
 //! under one key, rule 21), never a quiet merge.
 
+use blaze_id::ItemKey;
 use blaze_ids::{ContentId, Domain, Hasher};
 use blaze_surface::Namespace;
 
@@ -33,6 +34,24 @@ pub struct CellKey(pub [u8; 16]);
 /// use.
 pub fn cell_key(ns: Namespace, name: &str) -> CellKey {
     let id: ContentId = Hasher::of(&CELL).update(&[ns as u8]).part(name.as_bytes()).finish();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&id.0[..16]);
+    CellKey(out)
+}
+
+/// The BLAKE3 domain of a `Textual` table's cut cell ([`textual_cut_key`]).
+pub const TEXTUAL_CUT_DOMAIN: &str = "blaze v2 names textual cut cell 1";
+
+static TEXTUAL_CUT: Domain = Domain::new(TEXTUAL_CUT_DOMAIN);
+
+/// The cell of a `Textual` table's CUT row for the macro `name` at `child`'s `mod` line: the
+/// last definition of `name` before that line, written only where the name's row (its last
+/// definition) is after the line and its first before it, so a child's lookup reads one cell
+/// more and never leaves the name undecided (links.rs `lookup_textual`). Keyed by the child's
+/// whole key and the name, in its own domain: a collision with a name or mark cell is the
+/// writer's `Twice` (rule 21).
+pub fn textual_cut_key(child: ItemKey, name: &str) -> CellKey {
+    let id: ContentId = Hasher::of(&TEXTUAL_CUT).id(&child.0).part(name.as_bytes()).finish();
     let mut out = [0u8; 16];
     out.copy_from_slice(&id.0[..16]);
     CellKey(out)

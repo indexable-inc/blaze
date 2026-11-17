@@ -69,6 +69,17 @@ pub type Captures<'a> = Soa<(ExprId, PatId, CaptureKind), Alloc<'a>>;
 /// (`PNode::Closure`: closure expressions in `ExprId` order): its expression, its kind (the
 /// strongest `Fn*` trait it implements, from its captures) and its signature (a `FnPtr`).
 pub type Closures<'a> = Soa<(ExprId, ClosureKind, PTy), Alloc<'a>>;
+/// rustc's `fru_field_types`: each field a struct update `S { a: x, ..base }` takes from its
+/// base (every field not written), sorted by the struct expression, each expression's rows in
+/// field order: the expression, the field's index in the struct, its type at the struct's
+/// arguments. Read with [`Checked::fru_fields_of`].
+pub type FruFields<'a> = Soa<(ExprId, u32, PTy), Alloc<'a>>;
+/// Each field a base-less struct expression `S { a: 1, .. }` (RFC 3681) takes from its
+/// default, sorted by expression then field: the expression, the field's index in the
+/// variant, the default's key (an anonymous constant of the field's type over the ADT's
+/// generics, evaluated at the expression's type arguments). Each such field also has its
+/// [`FruFields`] row (its type). Read with [`Checked::default_fields_of`].
+pub type DefaultFields<'a> = Soa<(ExprId, u32, ItemKey), Alloc<'a>>;
 /// The record of one body.
 pub struct Checked<'a> {
     /// Every type the record names.
@@ -123,6 +134,22 @@ pub struct Checked<'a> {
     /// hidden input (`x: T::Out`) through the chosen impl's `type` text (blaze-flow-lower
     /// impl_call.rs).
     pub selected: Vec<crate::selected::Projected, Alloc<'a>>,
+    /// The fields each struct update takes from its base (rules/adt.rs `record_fru_fields`):
+    /// what the flow lowering projects out of a place base, one move or copy per field.
+    pub fru_fields: FruFields<'a>,
+    /// The fields each base-less struct expression takes from its defaults (rules/adt.rs
+    /// `record_default_fields`).
+    pub default_fields: DefaultFields<'a>,
+    /// Each overloaded index expression (`a[b]` on a type that is not an array or slice indexed
+    /// by `usize`) that is a mutable place, sorted (rules/mut_places.rs): its place is
+    /// `*IndexMut::index_mut(&mut a, b)`; every other overloaded index's is
+    /// `*Index::index(&a, b)` (the Reference, "Array and slice indexing expressions"). Read
+    /// with [`Checked::index_is_mut`].
+    pub index_mut: Vec<ExprId, Alloc<'a>>,
+    /// The typed lints' findings (rules/args_inline.rs `args-inline`), sorted: no type error,
+    /// so a body with findings and no `diags` still lowers and builds; each has no level
+    /// (rule 81) and an item-relative range (rule 71).
+    pub findings: Vec<crate::rules::args_inline::TypedFinding, Alloc<'a>>,
 }
 
 /// Two two-column tables are equal column by column.
@@ -185,6 +212,30 @@ impl<'a> Checked<'a> {
         &self.selected[lo..hi]
     }
 
+    /// The fields the struct update at `e` takes from its base, as `(field index, type)` in
+    /// field order: two parallel slices, empty for an expression that is no struct update.
+    pub fn fru_fields_of(&self, e: ExprId) -> (&[u32], &[PTy]) {
+        let col = self.fru_fields.column::<0>();
+        let lo = col.partition_point(|&x| x < e);
+        let hi = col.partition_point(|&x| x <= e);
+        (&self.fru_fields.column::<1>()[lo..hi], &self.fru_fields.column::<2>()[lo..hi])
+    }
+
+    /// The fields the base-less struct expression at `e` takes from its defaults, as
+    /// `(field index, default's key)` in field order: empty for any other expression.
+    pub fn default_fields_of(&self, e: ExprId) -> (&[u32], &[ItemKey]) {
+        let col = self.default_fields.column::<0>();
+        let lo = col.partition_point(|&x| x < e);
+        let hi = col.partition_point(|&x| x <= e);
+        (&self.default_fields.column::<1>()[lo..hi], &self.default_fields.column::<2>()[lo..hi])
+    }
+
+    /// Whether overloaded index expression `e` calls `IndexMut::index_mut` (a mutable place),
+    /// not `Index::index`.
+    pub fn index_is_mut(&self, e: ExprId) -> bool {
+        self.index_mut.binary_search(&e).is_ok()
+    }
+
     /// Equal results ignoring the read list and needs: what the read-list property compares.
     pub fn same_result(&self, other: &Checked<'a>) -> bool {
         self.types == other.types
@@ -206,6 +257,9 @@ impl<'a> Checked<'a> {
             && self.stalled == other.stalled
             && self.awaited == other.awaited
             && self.selected == other.selected
+            && soa3_eq(&self.fru_fields, &other.fru_fields)
+            && soa3_eq(&self.default_fields, &other.default_fields)
+            && self.index_mut == other.index_mut
     }
 }
 
@@ -236,6 +290,9 @@ impl<'a> core::fmt::Debug for Checked<'a> {
             .field("stalled", &self.stalled)
             .field("awaited", &self.awaited)
             .field("selected", &self.selected)
+            .field("fru_fields", &self.fru_fields)
+            .field("default_fields", &self.default_fields)
+            .field("index_mut", &self.index_mut)
             .field("reads", &self.reads)
             .field("needs", &self.needs)
             .finish()

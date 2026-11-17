@@ -38,6 +38,8 @@
 //! test a_call_of_rust_alloc_binds_the_default ... ok
 //! OWN ALLOCATOR: front2: `..`, reached from `main`, is not checked (..`#[global_allocator]` static..): ..
 //! test a_global_allocator_is_refused_by_name ... ok
+//! OWN ALLOCATOR SHIM: `__rust_alloc` and `__rust_dealloc` of the `#[global_allocator]` expansion tabled with their bodies, `Counting`'s `alloc` and `dealloc` reached; no `__rdl_*`; BUILDS: N of N instances (0 refused)
+//! test a_global_allocator_binds_its_expansion ... ok
 //! ```
 //! What a wrong fix fails: a declaration left tabled as a foreign fn (the process asked for
 //! `__rust_alloc`, today's stop) fails the first test's `no foreign symbol` assertion; one
@@ -131,15 +133,15 @@ static MINE: Mine = Mine;
 /// when it is made.
 fn run_refusal(text: &str) -> Option<String> {
     let files = [SourceFile { path: "src/main.rs", text }];
-    let tc = Toolchain::none();
+    let tc = Toolchain::none(blaze_own::Alloc::global());
     let new = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
-    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc).unwrap_or_else(|e| panic!("the program's texts: {e}"));
+    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind).unwrap_or_else(|e| panic!("the program's texts: {e}"));
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the program's frame");
-    match Front2Program::new(&names, &frame, &files) {
+    match Front2Program::new(&names, &frame, &files, blaze_own::Alloc::global()) {
         Ok(_) => None,
         Err(e) => Some(format!("{e}")),
     }
@@ -158,16 +160,16 @@ fn run_refusal(text: &str) -> Option<String> {
 fn a_call_of_rust_alloc_binds_the_default() {
     let text = [HEAD, DEFAULTS, MAIN].concat();
     let files = [SourceFile { path: "src/main.rs", text: &text }];
-    let tc = Toolchain::none();
+    let tc = Toolchain::none(blaze_own::Alloc::global());
     let new = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
-    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc).unwrap_or_else(|e| panic!("the program's texts: {e}"));
+    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind).unwrap_or_else(|e| panic!("the program's texts: {e}"));
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the survey's frame");
     let mut left_out = Vec::new_in(Global);
-    let mut program = Front2Program::survey(&names, &frame, &files, &mut left_out).unwrap_or_else(|e| panic!("no survey: {e}"));
+    let mut program = Front2Program::survey(&names, &frame, &files, &mut left_out, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("no survey: {e}"));
     let left: Vec<String> = left_out.iter().map(|(f, class)| format!("{f}: {class}")).collect();
     assert!(left.is_empty(), "front2 tables every fn the walk reaches; left out: {left:?}");
     let rows: Vec<(String, bool, FnKind, String)> = (0..program.fn_count())
@@ -188,7 +190,7 @@ fn a_call_of_rust_alloc_binds_the_default() {
     let with_body = rows.iter().filter(|(_, body, ..)| *body).count();
     assert_eq!(with_body, 3, "`main`, `__rdl_alloc` and `__rdl_dealloc` have bodies: {rows:?}");
     let mut refused = Vec::new_in(Global);
-    let counts = build_survey(&mut program, &mut refused, blaze_build::OverflowChecks::On).unwrap_or_else(|e| panic!("the survey stopped: {e}"));
+    let counts = build_survey(&mut program, &mut refused, blaze_build::OverflowChecks::On, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("the survey stopped: {e}"));
     let refusals: Vec<String> = refused.iter().map(|(f, class)| format!("{f}: {class}")).collect();
     assert!(refusals.is_empty(), "every body builds, each `__rust_*` call bound or built in place: {refusals:?}");
     assert_eq!((counts.built, counts.tried), (3, 3), "`main`, `__rdl_alloc`, `__rdl_dealloc`");
@@ -213,4 +215,189 @@ fn a_global_allocator_is_refused_by_name() {
     assert!(refusal.contains("MINE"), "the static is named: {refusal}");
     // Without it the same program is made.
     assert_eq!(run_refusal(&[HEAD, DEFAULTS, MAIN].concat()), None);
+}
+
+/// A program with its own allocator, as core and alloc give one to a program: the built-in
+/// attribute macro as core defines it (`$crate` is this crate, so the expansion's
+/// `$crate::alloc::..` and `$crate::mem::..` paths name the two modules here, as in core they
+/// name core's), core's `GlobalAlloc` and `Layout` (both of `Layout`'s unchecked constructors,
+/// whichever the expansion calls), alloc's declarations, and a counting allocator that records
+/// the size it was asked for (a `#![no_core]` program has no `Add`, so the record is the size
+/// itself). NO `__rdl_*` is defined: a binding to the defaults is refused for want of one.
+const OWN_HEAD: &str = "#![feature(no_core, lang_items, rustc_attrs, decl_macro)]
+#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+#[rustc_builtin_macro]
+pub macro global_allocator($item:item) {}
+
+pub mod mem {
+    #[repr(transparent)]
+    pub struct Alignment {
+        pub value: usize,
+    }
+}
+
+pub mod ptr {
+    #[repr(transparent)]
+    pub struct NonNull<T> {
+        pub pointer: *const T,
+    }
+
+    impl<T> NonNull<T> {
+        pub const fn as_ptr(self) -> *mut T {
+            self.pointer as *mut T
+        }
+    }
+}
+
+pub mod alloc {
+    pub struct Layout {
+        pub size: usize,
+        pub align: usize,
+    }
+
+    impl Layout {
+        pub const unsafe fn from_size_align_unchecked(size: usize, align: usize) -> Layout {
+            Layout { size, align }
+        }
+
+        pub const unsafe fn from_size_alignment_unchecked(size: usize, alignment: super::mem::Alignment) -> Layout {
+            Layout { size, align: alignment.value }
+        }
+    }
+
+    pub unsafe trait GlobalAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8;
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout);
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8;
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8;
+    }
+}
+
+unsafe extern \"Rust\" {
+    #[rustc_std_internal_symbol]
+    fn __rust_alloc(size: usize, align: mem::Alignment) -> *mut u8;
+    #[rustc_std_internal_symbol]
+    fn __rust_dealloc(ptr: ptr::NonNull<u8>, size: usize, align: mem::Alignment);
+    #[rustc_std_internal_symbol]
+    fn __rust_no_alloc_shim_is_unstable_v2();
+}
+
+unsafe extern \"C\" {
+    fn malloc(size: usize) -> *mut u8;
+    fn calloc(count: usize, size: usize) -> *mut u8;
+    fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+}
+
+static mut ASKED: usize = 0;
+
+pub struct Counting;
+
+unsafe impl alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: alloc::Layout) -> *mut u8 {
+        unsafe {
+            ASKED = layout.size;
+            malloc(layout.size)
+        }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: alloc::Layout) {
+        unsafe { free(ptr) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: alloc::Layout) -> *mut u8 {
+        unsafe { calloc(1, layout.size) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, _layout: alloc::Layout, new_size: usize) -> *mut u8 {
+        unsafe { realloc(ptr, new_size) }
+    }
+}
+
+#[global_allocator]
+static COUNTING: Counting = Counting;
+";
+
+/// `Box::new(1u8)` as `alloc::alloc::alloc` and `dealloc` make it (`exchange_malloc` calls
+/// `alloc`, which calls the marker and then `__rust_alloc(layout.size(), layout.alignment())`),
+/// answering the size the allocator was asked for: 1 when the call went through `Counting`.
+const OWN_MAIN: &str = "
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    unsafe {
+        __rust_no_alloc_shim_is_unstable_v2();
+        let p = __rust_alloc(1, mem::Alignment { value: 1 });
+        *p = 1;
+        __rust_dealloc(ptr::NonNull { pointer: p as *const u8 }, 1, mem::Alignment { value: 1 });
+        ASKED as i32
+    }
+}
+";
+
+/// With a `#[global_allocator]` static, a call of `__rust_alloc` (and `__rust_dealloc`) is a
+/// call of the fn of that name the attribute's expansion wrote beside the static, and that
+/// fn's body calls `Counting`'s `GlobalAlloc` method: the walk tables both expansion fns WITH
+/// BODIES and reaches `Counting`'s `alloc` and `dealloc`, nothing is left out, no foreign row is
+/// a `__rust_*` symbol, and every body builds. A binding to std's defaults fails (no `__rdl_*`
+/// is defined, so it is refused `NoDefault`), and so does a refusal of the program for having
+/// its own allocator (`NotExpanded`, today's stop until the names library expands the
+/// attribute: blaze-expand's `BuiltinAttr::GlobalAllocator`).
+///
+/// Prints: `OWN ALLOCATOR SHIM: `__rust_alloc` and `__rust_dealloc` of the
+/// `#[global_allocator]` expansion tabled with their bodies, `Counting`'s `alloc` and `dealloc`
+/// reached; no `__rdl_*`; BUILDS: N of N instances (0 refused)` and
+/// `test a_global_allocator_binds_its_expansion ... ok`
+#[test]
+fn a_global_allocator_binds_its_expansion() {
+    let text = [OWN_HEAD, OWN_MAIN].concat();
+    let files = [SourceFile { path: "src/main.rs", text: &text }];
+    let tc = Toolchain::none(blaze_own::Alloc::global());
+    let new = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
+    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind).unwrap_or_else(|e| panic!("the program's texts: {e}"));
+    let user = texts.user();
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the survey's frame");
+    let mut left_out = Vec::new_in(Global);
+    let mut program = Front2Program::survey(&names, &frame, &files, &mut left_out, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("no survey: {e}"));
+    let left: Vec<String> = left_out.iter().map(|(f, class)| format!("{f}: {class}")).collect();
+    assert!(left.is_empty(), "front2 tables every fn the walk reaches, the expansion's included; left out: {left:?}");
+    let rows: Vec<(String, bool, FnKind, String)> = (0..program.fn_count())
+        .map(|i| {
+            let f = program.function(i);
+            (f.path.to_string(), f.body.is_some(), f.kind, f.symbol.to_string())
+        })
+        .collect();
+    for shim in ["__rust_alloc", "__rust_dealloc"] {
+        let written = rows.iter().any(|(path, body, kind, _)| path.ends_with(shim) && *body && *kind == FnKind::Free);
+        assert!(written, "`{shim}` of the expansion tabled with its body: {rows:?}");
+    }
+    for method in ["::alloc", "::dealloc"] {
+        let reached = rows.iter().any(|(path, body, kind, _)| path.ends_with(method) && *body && matches!(kind, FnKind::Impl(_)));
+        assert!(reached, "`Counting`'s `{method}` reached through the expansion: {rows:?}");
+    }
+    let defaults: Vec<&String> = rows.iter().map(|(path, ..)| path).filter(|path| path.contains("__rdl_")).collect();
+    assert!(defaults.is_empty(), "no default is reached: {defaults:?}");
+    let foreign_shims: Vec<&String> = rows.iter().filter(|(_, _, kind, symbol)| *kind == FnKind::Foreign && symbol.starts_with("__rust_")).map(|(_, _, _, symbol)| symbol).collect();
+    assert!(foreign_shims.is_empty(), "no `__rust_*` declaration is asked of the process: {foreign_shims:?}");
+    let mut refused = Vec::new_in(Global);
+    let counts = build_survey(&mut program, &mut refused, blaze_build::OverflowChecks::On, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("the survey stopped: {e}"));
+    let refusals: Vec<String> = refused.iter().map(|(f, class)| format!("{f}: {class}")).collect();
+    assert!(refusals.is_empty(), "every body builds, each `__rust_*` call bound to the expansion or built in place: {refusals:?}");
+    assert_eq!(counts.built, counts.tried, "every instance built");
+    println!(
+        "OWN ALLOCATOR SHIM: `__rust_alloc` and `__rust_dealloc` of the `#[global_allocator]` expansion tabled with their bodies, `Counting`'s `alloc` and `dealloc` reached; no `__rdl_*`; BUILDS: {} of {} instances ({} refused)",
+        counts.built,
+        counts.tried,
+        refusals.len()
+    );
 }

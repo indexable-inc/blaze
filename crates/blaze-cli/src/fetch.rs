@@ -103,17 +103,17 @@ impl<'f> Lockfile<'f> {
     ///
     /// The lock and the plan are kept in the command's frame for the command: the machine
     /// borrows the units, and both live as long as the request does. Their owners are on the
-    /// global heap (the machine's allocator must be the units'), so they go with the process.
-    pub fn read(text: &'f [u8], frame: &'f Frame) -> Result<Lockfile<'f>, bstd::mem::String<&'f Frame>> {
-        let lock = match Lock::read(text, Alloc::global()) {
+    /// process's `heap` (the machine's allocator must be the units'), so they go with the process.
+    pub fn read(text: &'f [u8], heap: &'static blaze_own::Heap, frame: &'f Frame) -> Result<Lockfile<'f>, bstd::mem::String<&'f Frame>> {
+        let lock = match Lock::read(text, heap.alloc()) {
             Ok(lock) => lock,
             Err(refused) => return Err(bstd::mem::format_in!(frame, "{refused}")),
         };
         let lock: &'f Lock<'static> = std::boxed::Box::leak(std::boxed::Box::new_in(lock, frame));
-        let planned = match plan::plan(lock, Alloc::global()) {
+        let planned = match plan::plan(lock, heap.alloc()) {
             Ok(planned) => planned,
             Err(refused) => {
-                let mut words = blaze_own::String::new_in(Alloc::global());
+                let mut words = blaze_own::String::new_in(heap.alloc());
                 blaze_text::Writes::show(&mut words, &refused);
                 return Err(bstd::mem::String::from_str_in(words.as_str(), frame));
             }
@@ -124,7 +124,7 @@ impl<'f> Lockfile<'f> {
             text,
             lock,
             units,
-            index: fetch_task::index(units, Alloc::global()),
+            index: fetch_task::index(units, heap.alloc()),
             cargo: CargoCache { looked: None },
             sources: None,
             #[cfg(feature = "fetch")]
@@ -188,6 +188,10 @@ pub struct FetchEnv<'f> {
     /// the fact shim (`blaze-fact-shim`) is looked for beside it (scripts.rs). A native script
     /// is refused naming why when it is not known.
     pub exe_dir: Result<&'f str, ExeDirWhy>,
+    /// The process's heap, handed from `main` (D102, D120; never reached for deeper): what the
+    /// command keeps beyond a task's frame (the lock, its plan, the fetch machine) and what a
+    /// task hands to the store is made on it.
+    pub heap: &'static blaze_own::Heap,
 }
 
 /// Why the running blaze's own folder is not known (FetchEnv::exe_dir).
@@ -241,7 +245,7 @@ pub(crate) fn run<'b>(
         // what they gave is named beside the network's outcome when no place gave the unit.
         match net.outcome(&cx, root, &mut lockfile.cargo, env, units, &lockfile.index, at)? {
             Ok(outcome) => {
-                let mut made = fetch_task::made(unit, &outcome, Alloc::global()).ok_or(CliError::Text { what: "the fetch machine stopped with a unit pending" })?;
+                let mut made = fetch_task::made(unit, &outcome, env.heap.alloc()).ok_or(CliError::Text { what: "the fetch machine stopped with a unit pending" })?;
                 if let fetch_task::Made::Failed { message, .. } = &mut made
                     && let Some(tried) = net.tried(at)
                 {
@@ -250,7 +254,7 @@ pub(crate) fn run<'b>(
                 made
             }
             Err(untrusted) => {
-                let mut words = blaze_own::String::new_in(Alloc::global());
+                let mut words = blaze_own::String::new_in(env.heap.alloc());
                 words.show(unit);
                 if let Some(tried) = net.tried(at) {
                     words.str(" (before the network: ").str(tried).str(")");
@@ -268,12 +272,12 @@ pub(crate) fn run<'b>(
     let made = match held_record(&cx, root, unit)? {
         true => fetch_task::Made::Held { out: fetch_task::source(unit), down: 0 },
         false => {
-            let mut tries = blaze_own::Vec::new_in(Alloc::global());
+            let mut tries = blaze_own::Vec::new_in(env.heap.alloc());
             tries.push(Try { place: STORE_PLACE, miss: Miss::Absent });
             match adopt_local(&cx, root, &mut lockfile.cargo, env, unit, &mut tries)? {
                 true => fetch_task::Made::Held { out: fetch_task::source(unit), down: 0 },
                 false => {
-                    let mut message = blaze_own::String::new_in(Alloc::global());
+                    let mut message = blaze_own::String::new_in(env.heap.alloc());
                     message.show(&local::Tried { unit, tries: tries.as_slice() }).str("; this build cannot fetch (built without `fetch`)");
                     fetch_task::Made::Failed { message, lasting: false }
                 }
@@ -393,7 +397,8 @@ impl CargoCache {
 
 impl Looked {
     fn open(cx: &Cx, env: &FetchEnv<'_>) -> Result<Looked, CliError> {
-        let global = Alloc::global();
+        // Kept for the command (the `CargoCache` is the lock's): on the process's heap.
+        let global = env.heap.alloc();
         let mut shown = blaze_own::String::new_in(global);
         let Some(home) = env.cargo_home else {
             shown.str("cargo's archive cache (neither CARGO_HOME nor HOME is set)");
@@ -492,7 +497,7 @@ fn adopt_local<'c>(
             tries.push(Try { place, miss: Miss::Unreadable });
             continue;
         }
-        match local::adopt(unit, bytes.as_slice(), &blaze_fetch::fetch::Limits::REAL.unpack, Alloc::global()) {
+        match local::adopt(unit, bytes.as_slice(), &blaze_fetch::fetch::Limits::REAL.unpack, env.heap.alloc()) {
             Ok((record, _)) => {
                 write_record(cx, root, &record_path(&unit.key())?, record.as_slice())?;
                 return Ok(true);
@@ -576,8 +581,8 @@ mod net {
         /// graph reaches it ([`Lockfile::want_ahead`]) or its task asks ([`Net::outcome`]), so
         /// a lock entry nothing reaches is never looked up or fetched.
         pub(super) fn new(units: &'f [Unit<'f, 'static>], env: &FetchEnv<'_>) -> Net<'f> {
-            let machine = Machine::wanting(units, Limits::REAL, Alloc::global());
-            let (to, answers) = mailbox::channel::<(u64, Fetched)>(None);
+            let machine = Machine::wanting(units, Limits::REAL, env.heap.alloc());
+            let (to, answers) = blaze_core::chan::unbounded::<(u64, Fetched)>();
             // The sources store beneath the home (`sources_native`). Empty with no home: then
             // every reservation fails as the store's, though `run` has stopped the command
             // first (`sources_dir` refuses no home).
@@ -600,7 +605,7 @@ mod net {
                     sources,
                     cert_file: env.cert_file.map(std::ffi::OsString::from),
                     cert_dir: env.cert_dir.map(std::ffi::OsString::from),
-                    tried: blaze_own::Vec::new_in(Alloc::global()),
+                    tried: blaze_own::Vec::new_in(env.heap.alloc()),
                 },
                 steps: 0,
             }
@@ -656,8 +661,8 @@ mod net {
         clock: bstd::clock::Clock,
         /// Made at the first request, never when every unit's record stands.
         client: Option<Result<Handle, Untrusted>>,
-        to: mailbox::Tx<(u64, Fetched)>,
-        answers: mailbox::Rx<(u64, Fetched)>,
+        to: blaze_core::chan::Sender<(u64, Fetched)>,
+        answers: blaze_core::chan::Receiver<(u64, Fetched)>,
         /// The answer the last wait gave: its unit and body.
         last: Option<(u32, std::vec::Vec<u8>)>,
         /// Answers kept for a reservation, by unit, until it is made.
@@ -713,12 +718,12 @@ mod net {
                     return false;
                 }
             }
-            let mut tries = blaze_own::Vec::new_in(Alloc::global());
+            let mut tries = blaze_own::Vec::new_in(self.env.heap.alloc());
             tries.push(Try { place: STORE_PLACE, miss: Miss::Absent });
             match adopt_local(self.cx, self.root, &mut *self.cargo, self.env, unit, &mut tries) {
                 Ok(true) => true,
                 Ok(false) => {
-                    let mut words = blaze_own::String::new_in(Alloc::global());
+                    let mut words = blaze_own::String::new_in(self.env.heap.alloc());
                     blaze_text::Writes::show(&mut words, &Tried { unit, tries: tries.as_slice() });
                     drop(tries);
                     self.io.tried.retain(|(unit, _)| *unit != at);
@@ -769,8 +774,8 @@ mod net {
             if matches!(self.io.client, Some(Err(_))) {
                 return Woke::Other;
             }
-            let wait = Some(Duration::from_nanos(until_ns.map_or(STEP_MOST_NS, |at| at.saturating_sub(self.now()))));
-            match mailbox::block_on("a dependency's HTTPS answer", wait, self.io.answers.recv()) {
+            let wait = Duration::from_nanos(until_ns.map_or(STEP_MOST_NS, |at| at.saturating_sub(self.now())));
+            match mailbox::answer("a dependency's HTTPS answer", &self.io.answers, wait) {
                 Ok(Some((key, fetched))) => {
                     let ask = Ask { unit: (key >> 32) as u32, seq: key as u32 };
                     let at = self.now();

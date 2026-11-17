@@ -353,15 +353,15 @@ fn census_with_the_world() {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let files = [("/hello-world/src/main.rs".to_string(), MAIN.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
-    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names: Names<'_> = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names: Names<'_> = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let crate_names: Vec<&str> = crates.iter().map(|c| c.name).collect();
     let mut out = format!("census with the world: names resolved in {:?}; crates {crate_names:?}\n", start.elapsed());
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
-        let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+        let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
     // A comma-separated list of crates, each its own census and table, in the order given.
     let list = want.unwrap_or_else(|| if crate_names.contains(&"bstd") { "bstd".to_string() } else { "blaze_std".to_string() });
     for w in list.split(',') {
@@ -486,7 +486,7 @@ fn census_crate<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, krate: usize, 
     let mut ex_idx: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     let prepared = Prepares::new_in(Alloc::global());
     let sized = front.index.lang("sized");
-    let mut shared_store = Store::new(sized, front.frame);
+    let mut shared_store = Store::new(sized, front.frame, blaze_own::Alloc::global());
     let mut shared_buckets = None;
     let mut shared_consts = Consts::default();
     let mut heads: BTreeMap<String, Result<(), (String, String)>> = BTreeMap::new();
@@ -505,7 +505,7 @@ fn census_crate<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, krate: usize, 
         }
         let got = if fresh {
             heads.clear();
-            let (mut fs, mut fb, mut fc) = (Store::new(sized, front.frame), None, Consts::default());
+            let (mut fs, mut fb, mut fc) = (Store::new(sized, front.frame, blaze_own::Alloc::global()), None, Consts::default());
             one(names, front, &mut fs, &mut fb, &mut fc, prepared, &mut heads, e.target)
         } else {
             one(names, front, &mut shared_store, &mut shared_buckets, &mut shared_consts, prepared, &mut heads, e.target)
@@ -546,7 +546,7 @@ fn census_crate<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, krate: usize, 
             let mut other = Vec::new();
             for &i in idx {
                 heads.clear();
-                let (mut fs, mut fb, mut fc) = (Store::new(sized, front.frame), None, Consts::default());
+                let (mut fs, mut fb, mut fc) = (Store::new(sized, front.frame, blaze_own::Alloc::global()), None, Consts::default());
                 match one(names, front, &mut fs, &mut fb, &mut fc, prepared, &mut heads, entries[i].target) {
                     Err((c, _)) if &c == class => same += 1,
                     Err((c, _)) => other.push(c),

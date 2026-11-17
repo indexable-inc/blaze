@@ -8,11 +8,15 @@
 use std::time::Instant;
 
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
-use blaze_own::Alloc;
 use blaze_scope::names::{self, Written};
 use blaze_surface::{Namespace, PathKind};
 
 fn main() {
+    // The program's one allocator, made at its top and handed down: a frame, whose memory comes
+    // from the OS (no global heap).
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).unwrap_or_else(|e| panic!("names: the frame: {e}"));
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
     let mut args = std::env::args().skip(1);
     let Some(dir) = args.next() else {
         eprintln!("usage: names <project dir> [<path>...]");
@@ -47,7 +51,7 @@ fn main() {
     }
     let root = format!("{dir}/src/main.rs");
     let shown_from = format!("{dir}/");
-    let user = UserCrate { name: &name, dir: &shown_from, root: &root, files: &files, edition };
+    let user = UserCrate { name: &name, dir: &shown_from, root: &root, files: &files, edition, panic: blaze_build::Panic::Unwind };
     let home = std::env::var("HOME").expect("HOME");
     let t0 = Instant::now();
     let tc = Toolchain::open(&mut DirShelf::new(format!("{home}/.blaze/v2/toolchain"))).unwrap_or_else(|e| {
@@ -61,7 +65,7 @@ fn main() {
     });
     let crates = inputs.crates();
     println!("program crate: edition {:?}, implicit {:?}, deps {:?}", crates[0].edition, crates[0].implicit, crates[0].deps);
-    let names = match inputs.resolve(&crates) {
+    let names = match inputs.resolve(&crates, alloc) {
         Ok(n) => n,
         Err(e) => {
             println!("Names refused: {e}");
@@ -81,7 +85,7 @@ fn main() {
     for p in &paths {
         let segs: Vec<&str> = p.split("::").collect();
         for ns in [Namespace::Types, Namespace::Values] {
-            match names::path(&names, module, ns, Written { kind: PathKind::Plain, segments: &segs }, Alloc::global()) {
+            match names::path(&names, module, ns, Written { kind: PathKind::Plain, segments: &segs }, alloc) {
                 Ok(r) => {
                     // Where the definition is: its crate, its module's path and its own name.
                     let krate = names.crate_of(r.def.key);

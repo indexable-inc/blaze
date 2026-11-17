@@ -9,7 +9,7 @@ use std::ops::Range;
 use std::str::FromStr;
 
 use anyhow::{Context as _, bail};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_resolve::{
     DepKind, Dependency, IndexSummary, InternedString, PackageId, Platform, RustVersion, SourceId,
     Summary,
@@ -36,7 +36,7 @@ pub struct IndexEntry {
     pub deps: Vec<IndexDependency>,
     /// `features` with `features2` added, as cargo adds them. Unordered: the summary made of
     /// the entry sorts them.
-    pub features: HashMap<String, Vec<String>, Global>,
+    pub features: Map<String, Vec<String>, FixedState, Global>,
     /// The sha256 of the `.crate` file, in hex.
     pub checksum: String,
     pub links: Option<String>,
@@ -110,8 +110,8 @@ struct IndexPackage {
     vers: Version,
     deps: Vec<RegistryDependency>,
     #[serde(default)]
-    features: HashMap<String, Vec<String>, Global>,
-    features2: Option<HashMap<String, Vec<String>, Global>>,
+    features: Map<String, Vec<String>, FixedState, Global>,
+    features2: Option<Map<String, Vec<String>, FixedState, Global>>,
     cksum: String,
     yanked: Option<bool>,
     links: Option<String>,
@@ -233,7 +233,7 @@ pub fn parse_line(line: &[u8]) -> anyhow::Result<IndexLine> {
                 name,
                 version: vers,
                 deps: Vec::new(),
-                features: HashMap::new_in(Global),
+                features: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
                 checksum: String::new(),
                 links: None,
                 rust_version,

@@ -110,6 +110,13 @@ fn leak<T>(value: T) -> &'static T {
 }
 
 fn main() {
+    // An entry that takes no grant yet (a plain `fn main`): the run's memory is one frame
+    // taken from the OS here, kept for the process's life since the leaked rows below hold
+    // what it made, and handed down.
+    let frame: &'static blaze_mem::Frame =
+        leak(blaze_mem::Frame::with_reserve(1 << 36, blaze_mem::Tag::Expand).expect("the entry's frame"));
+    let erased: &'static blaze_own::Erased<&'static blaze_mem::Frame> = leak(blaze_own::Erased::new(frame));
+    let alloc: Alloc<'static> = erased.handle();
     let mut args = std::env::args().skip(1);
     let mut folder: Option<PathBuf> = None;
     let mut names: Vec<String> = Vec::new();
@@ -141,13 +148,13 @@ fn main() {
     let mut refused_defs = 0usize;
     for path in &list {
         let Ok(text) = std::fs::read_to_string(path) else { continue };
-        let Ok(stream) = lex(&text, Edition::E2021, Alloc::global()) else { continue };
+        let Ok(stream) = lex(&text, Edition::E2021, alloc) else { continue };
         let stream: &'static TokenStream<'static> = leak(stream);
-        let found = find_calls(stream, Alloc::global()).expect("the calls are listed");
+        let found = find_calls(stream, alloc).expect("the calls are listed");
         for call in found.iter() {
             let inner = call.inner();
             let input = stream
-                .copy_in(inner.start as usize..inner.end as usize, Alloc::global())
+                .copy_in(inner.start as usize..inner.end as usize, alloc)
                 .expect("a call's input copies");
             match call.kind {
                 NestedKind::MacroRules => {
@@ -196,7 +203,7 @@ fn main() {
         }
         let def = &defs[idx];
         let fn_call = Call::fn_like(call.input, site());
-        let result = expand_prepared(&def.prepared, &fn_call, &NoCx, Alloc::global());
+        let result = expand_prepared(&def.prepared, &fn_call, &NoCx, alloc);
         pairs += 1;
         digest = compare::fnv(digest, def.name.as_bytes());
         digest = compare::fnv(digest, compare::render(&result).as_bytes());
@@ -222,7 +229,7 @@ fn main() {
                     }
                     let Some(name) = last_ident(&exp.tokens, nested.path.start, nested.path.end) else { continue };
                     let inner = nested.inner();
-                    let Ok(mut input) = exp.tokens.copy_in(inner.start as usize..inner.end as usize, Alloc::global()) else {
+                    let Ok(mut input) = exp.tokens.copy_in(inner.start as usize..inner.end as usize, alloc) else {
                         continue;
                     };
                     input.seal(key.0);
@@ -258,7 +265,7 @@ fn main() {
     let once = |list: &[(usize, &'static TokenStream<'static>)]| {
         for &(idx, input) in list {
             let call = Call::fn_like(input, site());
-            let result = expand_prepared(&defs[idx].prepared, &call, &NoCx, Alloc::global());
+            let result = expand_prepared(&defs[idx].prepared, &call, &NoCx, alloc);
             std::hint::black_box(&result);
         }
     };
@@ -303,13 +310,13 @@ fn main() {
         let results: Vec<_> = row
             .calls
             .iter()
-            .map(|&(idx, input)| expand_prepared(&defs[idx].prepared, &Call::fn_like(input, site()), &NoCx, Alloc::global()))
+            .map(|&(idx, input)| expand_prepared(&defs[idx].prepared, &Call::fn_like(input, site()), &NoCx, alloc))
             .collect();
         let start = Instant::now();
         for _ in 0..reps {
             for result in &results {
                 if let Ok(Expanded::Expansion(exp)) = result {
-                    let tokens = exp.tokens.copy_in(0..exp.tokens.len(), Alloc::global());
+                    let tokens = exp.tokens.copy_in(0..exp.tokens.len(), alloc);
                     let origins = exp.origins.clone();
                     std::hint::black_box((&tokens, &origins));
                 }

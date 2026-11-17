@@ -50,7 +50,7 @@ use blaze_lir::{Op, Scalar, Ty};
 
 use super::{EmitError, Loc, Pass, Regs, unsupported};
 use crate::Os;
-use crate::enc::{self, SP, Size, X9};
+use crate::enc::{Size, X9};
 
 /// Why a function whose OWN signature is variadic is not emitted (pass.rs, `emit`): a C-variadic
 /// definition in Rust (`unsafe extern "C" fn f(x: i32, mut args: ...)`, the unstable
@@ -145,7 +145,19 @@ impl<A: Allocator> Pass<'_, '_, A> {
     /// the callee's address is loaded (the call site follows, unbroken); every `sp`-relative
     /// access after it is the returned `area` off until [`Pass::close_varargs`], called right
     /// after `blr`. Writes only `x9` (and `x12` for a far cell) besides the argument registers.
-    pub(super) fn place_varargs(&mut self, inst: usize, op: Op, regs: Regs, extra: Values<'_>) -> Result<u32, EmitError> {
+    ///
+    /// `named` are the named arguments past the registers (pass/stack.rs), taking the area's
+    /// first `named_end` bytes; the stacked variable arguments follow from there rounded up to
+    /// 8, and the named ones are stored first once the area is open.
+    pub(super) fn place_varargs(
+        &mut self,
+        inst: usize,
+        op: Op,
+        regs: Regs,
+        extra: Values<'_>,
+        named: &[super::stack::StackedArg],
+        named_end: u32,
+    ) -> Result<u32, EmitError> {
         let view = self.view;
         let os = self.isa.os;
         // Every place is known before the first instruction: a refusal leaves no half call.
@@ -154,9 +166,13 @@ impl<A: Allocator> Pass<'_, '_, A> {
         for value in extra.iter() {
             place_of(os, &mut walk, &mut slots, view.ty(value)).map_err(|why| unsupported(inst, op, why.why()))?;
         }
-        let area = area_of(slots);
-        if area != 0 && op == Op::Invoke {
-            return Err(unsupported(inst, op, "an `invoke` with variable arguments on the stack (a landing pad would see `sp` lowered; a \"C\" callee is called with `call`)"));
+        if slots != 0 && matches!(op, Op::Invoke | Op::InvokeIndirect) {
+            return Err(unsupported(inst, op, "an `invoke` with variable arguments on the stack (a \"C\" callee is called with `call`)"));
+        }
+        let base = named_end.next_multiple_of(8);
+        let area = (base + area_of(slots)).next_multiple_of(16);
+        if area >= super::stack::MOST_AREA || view.len() as u64 * 16 + u64::from(area) >= super::FRAME_LIMIT {
+            return Err(EmitError::TooLarge { what: "a call's stacked arguments (1 MiB, and every cell below 16 MiB while they are open)" });
         }
         // The registers, while every cell is still at its own offset.
         let (mut walk, mut slots) = (regs, 0u32);
@@ -172,9 +188,9 @@ impl<A: Allocator> Pass<'_, '_, A> {
         if area == 0 {
             return Ok(0);
         }
-        // `area` <= 4080 by `MOST_STACKED` and a multiple of 16: one immediate, and `sp` stays
-        // 16-aligned at the `blr`.
-        self.put(enc::sub_imm(SP, SP, area, false));
+        // `area` a multiple of 16 below 1 MiB: `sp` stays 16-aligned at the `blr`.
+        self.open_area(area);
+        self.store_stacked(named, area);
         let (mut walk, mut slots) = (regs, 0u32);
         for value in extra.iter() {
             if let VarLoc::Slot(offset) =
@@ -185,7 +201,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 // reads the slot's low 4 bytes (little-endian), of a `long`, a pointer or a
                 // `double` all 8.
                 self.ld_sp(X9, value.0 * 16 + area);
-                self.put(enc::str(Size::X, X9, SP, offset / 8));
+                self.st_sp_sized(Size::X, X9, base + offset);
             }
         }
         Ok(area)
@@ -193,8 +209,6 @@ impl<A: Allocator> Pass<'_, '_, A> {
 
     /// Closes the outgoing area [`Pass::place_varargs`] opened: `add sp, sp, #area`.
     pub(super) fn close_varargs(&mut self, area: u32) {
-        if area != 0 {
-            self.put(enc::add_imm(SP, SP, area, false));
-        }
+        self.close_area(area);
     }
 }

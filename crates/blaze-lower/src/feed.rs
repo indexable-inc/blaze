@@ -166,6 +166,7 @@ fn run<'a>(m: &mut Machine<'_, '_, 'a>, output: &Output, toks: Toks<'_, '_, 'a>,
         locals.extend(m.local_macros());
         let call = BodyCall {
             path: request.path_range.of(m.text()),
+            path_mark: m.mark_at(request.path_range.start),
             input: m.call_input(&request),
             range: request.range,
             fragment: request.fragment,

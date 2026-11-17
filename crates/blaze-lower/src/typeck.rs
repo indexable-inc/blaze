@@ -89,6 +89,16 @@ pub trait Types {
         }
     }
 
+    /// [`Types::const_term`] for a const argument written on a segment of a body PATH, with
+    /// where it is ([`ArgAt`]): the Reference, "Constant evaluation", "Const context": a const
+    /// generic argument is a const context, its type the declared type of the parameter it
+    /// fills, so a caller that resolves the path can type an anonymous constant (`f::<{ A -
+    /// 16 }>()`) and evaluate it. The default ignores `at`.
+    fn const_term_at(&mut self, view: &View<'_>, c: ConstIdx, at: ArgAt, tys: &mut PortableTys<'_>) -> Result<ConstTerm, Refused> {
+        let _ = at;
+        self.const_term(view, c, tys)
+    }
+
     /// The repeat length `len` of `[x; len]` as a const term (the Reference, "Array
     /// expressions": "the length operand must be either an inferred const or a constant
     /// expression of type `usize` (e.g. a literal or a constant item)", and a const parameter
@@ -147,9 +157,63 @@ impl ConstGapWhy {
         match self {
             ConstGapWhy::NoEvaluator => NO_CONST_ARG,
             ConstGapWhy::OverGeneric => "a constant expression over a generic parameter",
-            ConstGapWhy::AnonInBody => "an anonymous constant in a body",
+            ConstGapWhy::AnonInBody(_) => "an anonymous constant in a body",
             ConstGapWhy::NegativeNoSuffix => "a negative const argument with no suffix",
         }
+    }
+}
+
+/// The text of an [`ConstGapWhy::AnonInBody`] gap: the constant as written and, when the
+/// caller's evaluator refused it, why (`{ A + 1 }: no impl ..`). Kept inline so the gap stays
+/// `Copy` (it is a column of the conversion's record, blaze-lower is `no_std` and holds no
+/// allocator here): a text past [`GapText::MOST`] bytes is cut at a char boundary, and
+/// [`GapText::cut`] says so, so a reader never takes a part for the whole.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GapText {
+    len: u8,
+    cut: bool,
+    bytes: [u8; GapText::MOST],
+}
+
+impl GapText {
+    /// The most bytes kept.
+    pub const MOST: usize = 120;
+
+    /// An empty text: the converter knew no more than the gap's kind.
+    pub const EMPTY: GapText = GapText { len: 0, cut: false, bytes: [0; GapText::MOST] };
+
+    /// `text`, its first [`GapText::MOST`] bytes at most, cut at a char boundary.
+    pub fn of(text: &str) -> GapText {
+        let mut end = text.len().min(GapText::MOST);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut bytes = [0; GapText::MOST];
+        bytes[..end].copy_from_slice(&text.as_bytes()[..end]);
+        GapText { len: end as u8, cut: end < text.len(), bytes }
+    }
+
+    /// The text kept.
+    pub fn text(&self) -> &str {
+        // The bytes are a prefix of a `str` cut at a char boundary (`of`).
+        core::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or("")
+    }
+
+    /// Whether the text was cut at [`GapText::MOST`] bytes.
+    pub fn cut(&self) -> bool {
+        self.cut
+    }
+}
+
+impl core::fmt::Debug for GapText {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:?}{}", self.text(), if self.cut { " (cut)" } else { "" })
+    }
+}
+
+impl core::fmt::Display for GapText {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}{}", self.text(), if self.cut { " (cut at 120 bytes)" } else { "" })
     }
 }
 
@@ -173,11 +237,25 @@ pub enum ConstGapWhy {
     OverGeneric,
     /// An anonymous constant in a body (`{ A + 1 }`, `{ u32::MAX }`, `Ty::LEN`) whose type is
     /// not known where the body is converted (the parameter it is an argument of is the
-    /// checker's to find), so no constant item can be made of it.
-    AnonInBody,
+    /// checker's to find: a method call's, an associated fn's; a path's item's parameter is
+    /// the caller's, [`Types::const_term_at`]), so no constant item can be made of it, or that
+    /// the caller's evaluator refused. Its text: the constant as written, and the refusal.
+    AnonInBody(GapText),
     /// A negated literal with no suffix (`Foo::<-1>`): its bits depend on the width of the
     /// parameter's type, which the checker finds.
     NegativeNoSuffix,
+}
+
+/// Where a const argument of a body path is written ([`Types::const_term_at`]): the path of
+/// the view, the segment it is an argument of (an index into the path's segment rows, a
+/// qualified path's anchor counted), and its place among that segment's type and const
+/// arguments (lifetimes not counted: a portable type holds no region, so a generic parameter's
+/// index counts types and constants only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArgAt {
+    pub path: PathIdx,
+    pub segment: u32,
+    pub index: u32,
 }
 
 /// Where a const term of a body is written.
@@ -246,6 +324,10 @@ pub struct TypeckBody<'a> {
     pub field_inits: AVec<'a, tc::FieldInit>,
     pub field_pats: AVec<'a, tc::FieldPat>,
     pub paths: AVec<'a, tc::BodyPath>,
+    /// Parallel to `paths`: the mark of each path's first word ([`View::mark_of_path`]),
+    /// where the world resolves it (blaze-ladder front2 `BodyWorld::path`, by
+    /// `crate::mark_site::site_of`); `None` for a lang path and for the item's own text.
+    pub path_marks: AVec<'a, Option<crate::mark_site::TextMark>>,
     pub segments: AVec<'a, tc::Segment>,
     /// Where each of `segments` is written; short or empty = not known (`BodyView::segment_ranges`).
     pub segment_ranges: AVec<'a, tc::Range>,
@@ -261,6 +343,10 @@ pub struct TypeckBody<'a> {
     pub asm_operands: AVec<'a, tc::AsmOperand>,
     pub asm_clobbers: AVec<'a, (u32, u32)>,
     pub asm_text: blaze_own::AString<'a>,
+    /// The value of each integer literal that is a call's argument, or the operand of a `-`
+    /// that is one, as written without a sign; ascending by the literal's id
+    /// (`BodyView::call_arg_ints`: a `#[rustc_legacy_const_generics]` callee's const argument).
+    pub call_arg_ints: AVec<'a, (ExprId, u128)>,
     pub coroutine: Option<tc::CoroutineKind>,
     /// The `super let` statements, ascending (super_let.rs).
     pub super_lets: AVec<'a, StmtId>,
@@ -303,6 +389,7 @@ impl<'a> TypeckBody<'a> {
             asm_operands: &self.asm_operands,
             asm_clobbers: &self.asm_clobbers,
             asm_text: self.asm_text.as_str(),
+            call_arg_ints: &self.call_arg_ints,
         }
     }
 }
@@ -455,6 +542,35 @@ fn int_suffix_node(s: Option<IntSuffix>) -> Option<tc::PNode> {
     }
 }
 
+/// The value of integer literal `lit` as written, with no sign (decimal, `0x`, `0o` or `0b`,
+/// `_` separators, an optional suffix: `0x1f`, `1_000u16`), and its suffix; `None` when `lit`
+/// is no integer literal or its value does not fit `u128`. The one reader of an integer
+/// literal's text here ([`const_literal`], [`Conv::call_arg_ints`]).
+fn int_literal(lit: &str) -> Option<(u128, Option<IntSuffix>)> {
+    let Some(Lit::Int(suffix)) = crate::lit::lit_of(parser::SyntaxKind::INT_NUMBER, lit) else { return None };
+    let (digits, radix) = match lit.get(..2) {
+        Some("0x" | "0X") => (&lit[2..], 16),
+        Some("0o" | "0O") => (&lit[2..], 8),
+        Some("0b" | "0B") => (&lit[2..], 2),
+        _ => (lit, 10),
+    };
+    let mut value: u128 = 0;
+    let mut any = false;
+    for ch in digits.chars() {
+        if ch == '_' {
+            continue;
+        }
+        // The suffix starts at the first character that is no digit of the radix.
+        let Some(d) = ch.to_digit(radix) else { break };
+        value = value.checked_mul(u128::from(radix))?.checked_add(u128::from(d))?;
+        any = true;
+    }
+    if !any {
+        return None;
+    }
+    Some((value, suffix))
+}
+
 /// The value of `text` as a literal constant (`true`, `'x'`, `4`, `0xffu8`, `-1i32`); `None`
 /// for anything else. A negative value is the two's complement at its suffix's width; a
 /// pointer-sized one (`isize`) has no width without the target and is `None`, as is a value
@@ -477,26 +593,7 @@ fn const_literal(text: &str) -> Option<ConstLit> {
         Some(rest) => (true, rest.trim_start()),
         None => (false, text),
     };
-    let Some(Lit::Int(suffix)) = crate::lit::lit_of(parser::SyntaxKind::INT_NUMBER, lit) else { return None };
-    let (digits, radix) = match lit.get(..2) {
-        Some("0x" | "0X") => (&lit[2..], 16),
-        Some("0o" | "0O") => (&lit[2..], 8),
-        Some("0b" | "0B") => (&lit[2..], 2),
-        _ => (lit, 10),
-    };
-    let mut value: u128 = 0;
-    let mut any = false;
-    for ch in digits.chars() {
-        if ch == '_' {
-            continue;
-        }
-        let Some(d) = ch.to_digit(radix) else { break };
-        value = value.checked_mul(u128::from(radix))?.checked_add(u128::from(d))?;
-        any = true;
-    }
-    if !any {
-        return None;
-    }
+    let (value, suffix) = int_literal(lit)?;
     let width = match suffix {
         None => 128,
         Some(IntSuffix::Int(IntTy::Isize) | IntSuffix::Uint(UintTy::Usize)) if negative => return None,
@@ -570,6 +667,34 @@ impl Conv<'_, '_, '_, '_, '_> {
         t.map(|t| self.ty(t)).transpose()
     }
 
+    /// Each of call arguments `args` that is an integer literal, or a `-` whose operand is one
+    /// (through parentheses, as blaze-typeck rules/legacy_const.rs `legacy_term` reads it):
+    /// the literal's id and its value as written, without the sign, into `call_arg_ints`. A
+    /// literal whose value does not fit `u128` is not recorded; the checker names the gap where
+    /// it needs the value. Pushed in conversion order; `to_typeck` sorts the column once.
+    fn call_arg_ints(&mut self, args: List) -> Result<(), Refused> {
+        for &a in self.v.ids(args)? {
+            let mut x = ExprId(a);
+            let mut negated = false;
+            loop {
+                match self.v.expr(x)? {
+                    Expr::Paren(inner) => x = inner,
+                    Expr::Unary { op: UnOp::Neg, operand } if !negated => {
+                        negated = true;
+                        x = operand;
+                    }
+                    _ => break,
+                }
+            }
+            let Expr::Lit(Lit::Int(_)) = self.v.expr(x)? else { continue };
+            let text = self.v.text_at(self.v.expr_range(x)?)?.trim();
+            if let Some((value, _)) = int_literal(text) {
+                self.out.call_arg_ints.push((x, value));
+            }
+        }
+        Ok(())
+    }
+
     fn exprs(&mut self, l: List) -> Result<List, Refused> {
         let ids = self.v.ids(l)?;
         let start = len(self.out.expr_lists.len());
@@ -595,13 +720,18 @@ impl Conv<'_, '_, '_, '_, '_> {
     ///
     /// Lifetime arguments are dropped: the checker erases regions (rustc's typeck sees none),
     /// and a list of lifetimes alone leaves the types to inference, as `Cow::<'a>::from`
-    /// does in Rust (lifetimes may be written without the types after them).
-    fn type_args(&mut self, l: List, r: BodyRange) -> Result<(List, bool), Refused> {
+    /// does in Rust (lifetimes may be written without the types after them). `on`: the path
+    /// and segment the arguments are written on (`None` for a method call's), so a const
+    /// argument there is asked with its place ([`Types::const_term_at`]).
+    fn type_args(&mut self, l: List, r: BodyRange, on: Option<(PathIdx, u32)>) -> Result<(List, bool), Refused> {
         let rows = self.v.rows(l)?;
         let mut at: AVec<'_, PTy> = Vec::new_in(*self.out.type_lists.allocator());
         // Where each argument in `at` is written (BodyView::type_list_ranges), index for index.
         let mut ranges: AVec<'_, tc::Range> = Vec::new_in(*self.out.type_list_ranges.allocator());
         for &n in rows {
+            // The argument's place among the segment's type and const arguments: `at` holds
+            // exactly those made before it.
+            let index = len(at.len());
             match GenericArg::decode(n)? {
                 // One plain name (`foo::<N>()`, `W::<SIZE>`) parses as a type and is a type
                 // or a constant by what it resolves to: the caller's ([`Types::name_arg`]).
@@ -619,7 +749,8 @@ impl Conv<'_, '_, '_, '_, '_> {
                 GenericArg::Lifetime(_) => {}
                 GenericArg::Const(c) => {
                     ranges.push(range(self.v.site(self.v.const_range(c)?)?));
-                    at.push(self.const_arg(c)?);
+                    let place = on.map(|(path, segment)| ArgAt { path, segment, index });
+                    at.push(self.const_arg(c, place)?);
                 }
                 _ => return self.refuse("an associated item constraint", r),
             }
@@ -657,12 +788,16 @@ impl Conv<'_, '_, '_, '_, '_> {
     /// `ConstValue`. An unsuffixed integer's type is a hole the checker fills from the
     /// parameter's declared type. A block or a path is the caller's ([`Types::const_term`]);
     /// what it cannot value, and a negated literal without a suffix, is a hole with its gap
-    /// listed ([`Conv::term`]), never the body's refusal.
-    fn const_arg(&mut self, c: ConstIdx) -> Result<PTy, Refused> {
+    /// listed ([`Conv::term`]), never the body's refusal. `place`: where on a path it is
+    /// written ([`Types::const_term_at`]); `None` on a method call.
+    fn const_arg(&mut self, c: ConstIdx, place: Option<ArgAt>) -> Result<PTy, Refused> {
         let r = self.v.const_range(c)?;
         let text = self.v.text_at(r)?.trim();
         let Some(value) = const_literal(text) else {
-            let term = self.types.const_term(self.v, c, self.tys)?;
+            let term = match place {
+                Some(at) => self.types.const_term_at(self.v, c, at, self.tys)?,
+                None => self.types.const_term(self.v, c, self.tys)?,
+            };
             return self.term(term, ConstSite::Arg, r);
         };
         let ty = match value.ty {
@@ -687,6 +822,7 @@ impl Conv<'_, '_, '_, '_, '_> {
             let Some(scope) = path.scope else { return self.refuse("a path with no scope", r) };
             let at = PathIdx(len(self.out.paths.len()));
             self.out.paths.push(tc::BodyPath { scope, segments: List::EMPTY, lang: Some(lang(l)), anchor: None });
+            self.out.path_marks.push(None);
             return Ok(at);
         }
         let Some(scope) = path.scope else { return self.refuse("a path with no scope", r) };
@@ -731,7 +867,7 @@ impl Conv<'_, '_, '_, '_, '_> {
             anchor = Some(tc::Anchor { ty, trait_, ty_range });
             rest = after;
         }
-        self.push_segments(rest, r, &mut segs, &mut seg_ranges)?;
+        self.push_segments(p, rest, r, &mut segs, &mut seg_ranges)?;
         // A segment naming a type alias whose aliased type fixes arguments takes the aliased
         // type's arguments ([`Types::alias_args`]: the alias expanded at the path).
         if anchor.is_none() {
@@ -760,7 +896,9 @@ impl Conv<'_, '_, '_, '_, '_> {
         self.out.segment_ranges.extend_from_slice(&seg_ranges);
         let at = PathIdx(len(self.out.paths.len()));
         let segments = List { start, len: len(segs.len()) };
+        let mark = self.v.mark_of_path(p)?;
         self.out.paths.push(tc::BodyPath { scope, segments, lang: None, anchor });
+        self.out.path_marks.push(mark);
         Ok(at)
     }
 
@@ -778,27 +916,36 @@ impl Conv<'_, '_, '_, '_, '_> {
             seg_ranges.push(tc::Range::default());
         }
         let rows = self.v.segments(path)?;
-        self.push_segments(rows, r, &mut segs, &mut seg_ranges)?;
+        self.push_segments(p, rows, r, &mut segs, &mut seg_ranges)?;
         let start = len(self.out.segments.len());
         self.out.segments.extend_from_slice(&segs);
         self.out.segment_ranges.resize(start as usize, tc::Range::default());
         self.out.segment_ranges.extend_from_slice(&seg_ranges);
         let at = PathIdx(len(self.out.paths.len()));
         let segments = List { start, len: len(segs.len()) };
+        let mark = self.v.mark_of_path(p)?;
         self.out.paths.push(tc::BodyPath { scope: path.scope.unwrap_or(scope), segments, lang: None, anchor: None });
+        self.out.path_marks.push(mark);
         Ok(at)
     }
 
     /// Named segments (no anchor) onto `segs`, and where each is written onto `ranges` (empty
     /// for a keyword segment: `self`, `super`, `crate`, `Self`, `$crate` have no name row).
+    /// `rows` are the last segment rows of the path `p` (after its anchor, if any).
     fn push_segments(
         &mut self,
+        p: PathIdx,
         rows: &[Node],
         r: BodyRange,
         segs: &mut AVec<'_, tc::Segment>,
         ranges: &mut AVec<'_, tc::Range>,
     ) -> Result<(), Refused> {
-        for &n in rows {
+        // Each row's index among ALL of `p`'s segment rows ([`ArgAt::segment`]): `rows` is a
+        // suffix of them.
+        let all = self.v.segments(self.v.path(p)?)?.len();
+        let Some(skip) = all.checked_sub(rows.len()) else { return self.refuse("a path's segments past its rows", r) };
+        for (k, &n) in rows.iter().enumerate() {
+            let segment = len(skip + k);
             let s = Segment::decode(n)?;
             let written = match (s.kind, s.name) {
                 (SegKind::Ident, Some(n)) => range(self.v.site(self.v.name_range(n)?)?),
@@ -817,7 +964,7 @@ impl Conv<'_, '_, '_, '_, '_> {
             if s.parenthesized || s.return_notation {
                 return self.refuse("parenthesized arguments in a body path", r);
             }
-            let (generic_args, has_args) = if s.has_args { self.type_args(s.args, r)? } else { (List::EMPTY, false) };
+            let (generic_args, has_args) = if s.has_args { self.type_args(s.args, r, Some((p, segment)))? } else { (List::EMPTY, false) };
             segs.push(tc::Segment { name, generic_args, has_args });
             ranges.push(written);
         }
@@ -876,10 +1023,13 @@ impl Conv<'_, '_, '_, '_, '_> {
             Expr::Return { value } => tc::Expr::Return { value },
             Expr::Become { .. } => return self.refuse("`become`", r),
             Expr::Yield { .. } => return self.refuse("`yield`", r),
-            Expr::Call { callee, args } => tc::Expr::Call { callee, args: self.exprs(args)? },
+            Expr::Call { callee, args } => {
+                self.call_arg_ints(args)?;
+                tc::Expr::Call { callee, args: self.exprs(args)? }
+            }
             Expr::MethodCall { row, scope } => {
                 let m = MethodCall::decode(self.v.row(row)?)?;
-                let generic_args = if m.has_args { self.type_args(m.generic_args, r)?.0 } else { List::EMPTY };
+                let generic_args = if m.has_args { self.type_args(m.generic_args, r, None)?.0 } else { List::EMPTY };
                 // Ascending: expressions are converted in id order (`to_typeck`). An entry out of
                 // order is never misread: blaze-typeck's binary search returns only `e`'s own.
                 self.out.method_name_ranges.push((e, range(self.v.site(self.v.name_range(m.name)?)?)));
@@ -920,9 +1070,9 @@ impl Conv<'_, '_, '_, '_, '_> {
             }
             Expr::Struct { path, fields, base } => {
                 let base = match base {
-                    StructBase::None => None,
-                    StructBase::Expr(b) => Some(b),
-                    StructBase::Defaults => return self.refuse("struct field defaults (`..`)", r),
+                    StructBase::None => tc::StructBase::None,
+                    StructBase::Expr(b) => tc::StructBase::Expr(b),
+                    StructBase::Defaults => tc::StructBase::Defaults,
                 };
                 let path = self.path(path, false)?;
                 let start = len(self.out.field_inits.len());
@@ -1139,6 +1289,7 @@ pub fn to_typeck<'a>(
         field_inits: Vec::new_in(alloc),
         field_pats: Vec::new_in(alloc),
         paths: Vec::new_in(alloc),
+        path_marks: Vec::new_in(alloc),
         segments: Vec::new_in(alloc),
         segment_ranges: Vec::new_in(alloc),
         type_lists: Vec::new_in(alloc),
@@ -1150,6 +1301,7 @@ pub fn to_typeck<'a>(
         asm_operands: Vec::new_in(alloc),
         asm_clobbers: Vec::new_in(alloc),
         asm_text: blaze_own::AString::new_in(alloc),
+        call_arg_ints: Vec::new_in(alloc),
         coroutine: None,
         super_lets: crate::super_let::super_lets(view, alloc),
         const_gaps: Vec::new_in(alloc),
@@ -1193,6 +1345,23 @@ pub fn to_typeck<'a>(
         let e = c.expr(ExprId(len(i)))?;
         c.out.exprs.push(e);
     }
+    // `[x; _]`'s `_` is no expression of the checker's body: its repeat has no count
+    // (`Conv::expr`, `Expr::Repeat`), so the walk never reaches the node, and a node never
+    // reached that is not a hole is the lowering's fault to the writeback
+    // (`Malformed::Unreached`). It is a hole that carries no value, as a node a desugaring
+    // orphans is (blaze-typeck writeback.rs, `Recs::holes`).
+    for i in 0..view.exprs.len() {
+        if let Some(tc::Expr::Repeat { count: None, .. }) = c.out.exprs.get(i)
+            && let Expr::Repeat { len: at, .. } = view.expr(ExprId(len(i)))?
+            && let Some(slot) = c.out.exprs.get_mut(at.0 as usize)
+        {
+            *slot = tc::Expr::Missing;
+        }
+    }
+    // A call's arguments may have smaller ids than an earlier-converted call's; the checker
+    // binary-searches the column (`BodyView::call_arg_int`). One literal is the argument of
+    // one call, so no id repeats.
+    c.out.call_arg_ints.sort_unstable_by_key(|&(x, _)| x);
     for i in 0..view.pats.len() {
         let p = c.pat(PatId(len(i)))?;
         c.out.pats.push(p);

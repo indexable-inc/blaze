@@ -1,0 +1,14 @@
+{
+ "id": "runner-cuts-at-the-front-of-the-queue",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane DF2 (default field values) in blaze-fresh-1115",
+ "where": "/Volumes/Projects/blaze-int-1112-notes/runner.py ask (the build queue)",
+ "what": "A request names paths, but the runner copies those files from disk when the request reaches the front of the queue, not when it is filed. With seven requests ahead, an edit made to a named file while waiting (the next piece's gate, calling a trait method whose file was not in the request) went into the cut and failed the check with E0599; the same request had to be filed again after reverting the edit. Separately, a lane's file list given by the coordinator missed one file (crates/blaze-cli/src/tests/lints_tests.rs) whose on-disk copy the cut needed, so a test failed on green's old expectation.",
+ "cost": "two wasted runs, about ten minutes in the queue",
+ "cause": "the cut is taken late and from the live directory that several lanes write in",
+ "whys": "one directory for every lane; the queue snapshots at run time; nothing tells the asker when the snapshot is taken except the `cut:` line",
+ "class": "a snapshot taken later than the asker thinks picks up edits made after asking",
+ "prevention": "wanted: snapshot the named paths at `ask` time (copy them into the request), and print the snapshot's digest; until then, edit no file named in a queued request until its `cut:` line is printed",
+ "workaround": "wait for the `cut:` line before touching any named file",
+ "state": "open"
+}

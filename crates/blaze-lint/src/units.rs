@@ -7,7 +7,7 @@
 use blaze_own::{AVec, Alloc};
 use blaze_surface::Item;
 
-use crate::{Findings, LintError, Run, RuleSet, Scope, Span, TestBits, Unit, count, lint};
+use crate::{Findings, LintError, Rule, Run, RuleSet, Scope, Span, TestBits, Unit, Variants, count, lint_in};
 
 /// One unit: its range of the file, and its children (in [`Units::holes`] and
 /// [`Units::children`], the same run of both).
@@ -111,9 +111,14 @@ impl<'a> Units<'a> {
     ) -> Result<(), LintError> {
         scratch.clear();
         scratch.resize(self.list.len(), file);
+        // The file's one fact `variant-count` reads, gathered once for all its units.
+        let variants = match rules.runs(Rule::VariantCount) {
+            true => Variants::gather(text, alloc)?,
+            false => Variants::new_in(alloc),
+        };
         for at in 0..self.list.len() {
             let scope = scratch[at];
-            let linted = lint(rules, &self.unit(at, text, scope), alloc, out)?;
+            let linted = lint_in(rules, &self.unit(at, text, scope), &variants, self.list[at].base, alloc, out)?;
             for (child, given) in self.children_of(at).iter().zip(linted.children.iter()) {
                 scratch[*child as usize] = *given;
             }

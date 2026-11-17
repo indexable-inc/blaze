@@ -1,10 +1,21 @@
-//! Records by key (drive.md, "The system side", "Store"). The trait is the seam the plain store
-//! (blaze-cas `plain::Driven`, store-next.md) plugs into once it has a bstd driver: its
-//! `open(root, settings)` then `machine(&[checkout, home])`, `get_into` by `locate` and one
-//! `pread`, and after the answer `seal()` then `compact(n)`, its `report()` into the profile.
-//! [`PackStore`] is the stand-in: one pack a command under `.blaze/v2/packs/`, written whole
-//! and never rewritten (a key holds one value, rule 21). An old home's `.blaze/v2/records/`
-//! (one file a record, before 2026-11-16) is not read: its first command rebuilds.
+//! Records by key (drive.md, "The system side", "Store"; "D114 rulings", "The store under the
+//! command"): ONE store a user, blaze-cas's plain store at `<home>/.blaze/v2/store`, read and
+//! written by every checkout and worktree, records read IN PLACE ([`plain_place`]). A get is
+//! a probe of the segments the head names, each mapped at its first probe; the request's first
+//! pool task maps the rest ([`Store::map_all`]); a put is copied once into the command's arena;
+//! the commit, the seal and a bounded compaction come after the answer is printed
+//! ([`plain_place::after_answer`], called by main.rs's outer function).
+//!
+//! A key missed by the store is asked of a named origin when one is named; what comes back is
+//! checked by the read path against the signed head's chain of digests, put, then answered.
+//! What is not fetched is a typed miss: one line on stderr says what and why for each kind, and
+//! the request computes the record locally. That is not a fallback (remote-read.md, "Not
+//! fetched"): the local computation is the record's definition and the origin a cache of it.
+//!
+//! THE OLD HOME. The stand-in's folders (the home's `.blaze/v2/shared` and `.blaze/v2/own`, a
+//! checkout's `.blaze/v2/packs`) are an old form: looked for once (a root records the look),
+//! reported by name ([`old_home`]), never read, migrated or deleted; their records are made
+//! again (rule 26).
 
 use blaze_drive::profile::Profile;
 use blaze_drive::record::Stored;
@@ -14,13 +25,15 @@ use blaze_ids::ContentId;
 use core::fmt;
 use core::time::Duration;
 
+use blaze_cas::plain::{Lent, Settings};
+use blaze_core::Driver;
 use blaze_own::Alloc;
 use blaze_remote::PublicKey;
 use blaze_remote::read::{Answer, BatchError, Ed25519Keys, HeadCheck, Limits, Namespace, Object, Origin, OriginError, Reader, SignatureWhy, Unfetched, fetch};
 use bstd::Stopped;
 use bstd::clock::Clock;
 use bstd::cx::Cx;
-use bstd::fs::{Content, Dir, Durable, File, Fs, FsError, FsKind, ReadOnly, ReadWrite};
+use bstd::fs::{Dir, Fs, FsError, FsKind, ReadWrite};
 use std::alloc::Global;
 use bstd::mem::Bytes;
 use bstd::out::Out;
@@ -34,751 +47,739 @@ use bstd::roots::Roots;
 
 use crate::CliError;
 
-pub trait Store {
-    /// The record at `key` into `into`; `false` when there is none.
-    fn get_into(&mut self, cx: &Cx, key: Key, into: &mut Bytes) -> Result<bool, CliError>;
-    /// `bytes` at `key`. A key already held is left as it is: two builders of one key write
-    /// equal bytes (rule 25).
+/// The command's store on blaze-cas's plain store: `Lent`, `PlainPlace`, the proof.
+pub(crate) mod plain_place;
+pub use plain_place::{AfterAnswer, Checked, Counts, Facts, Held, PlaceError, PlainPlace};
+
+/// The seam the request reads and writes records through. `'m` is the borrow of the command's
+/// [`Lent`]: a [`Held<'m>`] outlives every later get and put (blaze-cas plain/lent.rs).
+pub trait Store<'m> {
+    /// The record at `key`, in place; `None` when there is none.
+    fn get(&mut self, cx: &Cx, key: Key) -> Result<Option<Held<'m>>, CliError>;
+    /// The record at `key` copied into `into`, for a reader whose bytes must live in its own
+    /// frame (a pool job's); `false` when there is none.
+    fn get_into(&mut self, cx: &Cx, key: Key, into: &mut Bytes) -> Result<bool, CliError> {
+        match self.get(cx, key)? {
+            Some(held) => {
+                into.try_extend(held.bytes).map_err(|stopped| CliError::Store(StoreFailure::Copy(stopped)))?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+    /// `bytes` at `key`. A key already held with equal bytes is left as it is (rule 25); other
+    /// bytes are refused (rule 21).
     fn put(&mut self, cx: &Cx, key: Key, bytes: &[u8]) -> Result<(), CliError>;
-    /// Every record put so far to disk, before anything that names them (the answer's
-    /// pointer) is written.
-    fn seal(&mut self, cx: &Cx) -> Result<(), CliError>;
-    /// After the answer is printed: the plain store seals and compacts here and reports into
-    /// `profile`. Never waited on by the answer.
+    /// Every segment the head names mapped, and every parked one checked: asked once, when the
+    /// request's first pool task is about to start (work.rs `run_batches`); later asks do
+    /// nothing.
+    fn map_all(&mut self, cx: &Cx) -> Result<(), CliError>;
+    /// Once the request has its answer: the store's facts into `profile` (the commit itself
+    /// comes after the answer is printed, [`plain_place::after_answer`]).
     fn after_answer(&mut self, cx: &Cx, profile: &mut Profile) -> Result<(), CliError>;
     /// The `CrateScope` subjects of crates whose records hold nothing of a project (the
-    /// toolchain's), told by the names step once its world is made: their records are put in
-    /// the machine store (remote-read.md, "One chain of stores").
+    /// toolchain's), told by the names step once its world is made: a trusted builder puts
+    /// their records in the public namespace.
     fn public_crates(&mut self, subjects: &[ContentId]);
 }
 
-/// The project's store, under the checkout.
-const PACKS: &str = ".blaze/v2/packs";
-/// The machine store, under the user's home (remote-read.md, "One chain of stores"): records
-/// this machine computed whose key holds nothing of a project. Beneath [`HOME_FOLDER`]. The
-/// only store an origin is sealed from (remote-read.md, "Shared across worktrees").
-pub(crate) const SHARED: &str = "v2/shared";
-/// The user's own store, under the same home: every other drive record of every project and
-/// every worktree on this machine, found by key whoever made it (remote-read.md, "Shared across
-/// worktrees (2026-11-16)"). Never sealed into an origin, never read by anything but this user.
-pub(crate) const OWN: &str = "v2/own";
 /// blaze's folder in the user's home, made by the first file made in it.
 const HOME_FOLDER: &str = ".blaze";
-/// A store's record of the boot its packs were last known whole in, in its folder.
-const BOOT: &str = "boot";
-const BOOT_MAGIC: &[u8; 4] = b"BLZB";
-/// A pack's last bytes: `BLZP`, the format, the record count (u32), the producer count (u32),
-/// the index's offset, the digest of the payloads (every byte before the index, the producer
-/// table included: store/producers.rs).
-const FOOTER: usize = 56;
-const MAGIC: &[u8; 4] = b"BLZP";
-/// 3 since 2026-11-16 (each row names its record's producer: store/producers.rs). A pack of an
-/// older format with a valid footer of its own (1 or 2) is refused by name at the open
-/// (`PackError::OldFormat`) and kept as it is: never read, merged from, removed or rewritten
-/// (another installed blaze may read it; the collector removes dead ones). A torn pack is
-/// removed by the open as before, a torn format word included.
-const FORMAT: u32 = 3;
-/// One index row: the key, the payload's offset (u64) and length (u32), the index of its
-/// producer in the pack's producer table (u16), two zero bytes.
-const ROW: usize = 48;
-/// Past this many packs, the store merges them all into one after the answer.
-pub(crate) const PACKS_MOST: usize = 8;
 
-/// The boot this command runs in: a driver fact (macOS `kern.bootsessionuuid`, Linux
-/// `/proc/sys/kernel/random/boot_id`), passed in, never in a key. A power cut makes a new
-/// boot; everything a boot wrote and nothing lost power since is whole in the page cache, so a
-/// pack sealed in this boot is trusted as written, and one from another is read whole once.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Boot {
-    Known([u8; 16]),
-    /// The driver has no fact for it (`Io::boot` refused): no pack is trusted unread, each
-    /// command verifies.
-    Unknown,
+/// The stand-in's folders under blaze's folder in the home: an old home when either is there.
+pub(crate) const OLD_HOME: [&str; 2] = ["v2/shared", "v2/own"];
+/// The stand-in's forms under a checkout: its packs folder and its `last` pointer file (the
+/// last answer and leaf table are now a root of the one store, drive.md ruling 3).
+pub(crate) const OLD_CHECKOUT: [&str; 2] = [".blaze/v2/packs", ".blaze/v2/at"];
+/// The roots that say the old forms were looked for: the home's once, each checkout's once
+/// (its name ends in the digest of the checkout's path, drive.md ruling 3).
+const OLD_HOME_LOOKED: &str = "blaze.old-home-looked";
+const OLD_CHECKOUT_LOOKED: &str = "blaze.old-packs-looked.";
+
+/// Compaction slices run after the answer, each bounded by blaze-cas `SLICE_BYTES`.
+pub(crate) const AFTER_ANSWER_SLICES: u32 = 1;
+
+/// Why the command's store stopped it, by name (rule 19).
+#[derive(Debug)]
+pub enum StoreFailure {
+    /// The environment names no home: the store is under it, and there is no other.
+    NoHome,
+    /// The home could not be opened, bstd saying why (and naming it).
+    Home(bstd::fs::HomeError),
+    /// The plain store refused.
+    Place(PlaceError),
+    /// A record could not be copied into a reader's frame.
+    Copy(Stopped),
+    /// Looking for an old form's folder failed.
+    Look { folder: &'static str, error: FsError },
+    /// A put of other bytes under a key the store holds (rule 21): the store's refusal, and
+    /// the two records opened, so the refusal names the record and where they differ.
+    TwoValues { key: Key, lent: blaze_cas::plain::LentError, clash: Clash },
 }
 
-/// A planted bug of the store's simulation tests (`tests` below): each is one the oracle
-/// must catch. [`StorePlant::None`] outside tests.
+/// A drive record's form, as [`record::open`](blaze_drive::record::open) reads it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum StorePlant {
+pub enum Form {
+    /// A whole record (at a task key with no reads, or at a value key).
+    Whole,
+    /// A shape: the read names of the records under one task key.
+    Shape,
+    /// Bytes that are no drive record (another writer's under a drive key).
+    NotARecord,
+}
+
+impl Form {
+    fn word(self) -> &'static str {
+        match self {
+            Form::Whole => "whole record",
+            Form::Shape => "shape",
+            Form::NotARecord => "bytes that are no drive record",
+        }
+    }
+}
+
+/// Two records under one drive key, opened (rule 19): the record's name, each side's form, the
+/// first field they differ in, and the first names that differ when the field is a list of
+/// reads (a shape's read names, a whole record's reads or parts), or the first differing byte
+/// of the payload. `label` is the crate or file the name is of, filled by the command where it
+/// knows the crate list ([`Clash::label_with`]).
+#[derive(Debug)]
+pub struct Clash {
+    pub name: Option<Name>,
+    pub held: Form,
+    pub put: Form,
+    /// The first field that differs: `form`, `name`, `source`, `out`, `split`, `reads`,
+    /// `cells`, `parts`, `paths`, `findings` or `payload`; `none` when the records are equal
+    /// (the store refused on its tag or namespace).
+    pub field: &'static str,
+    /// The first differing entry of a list field, held then put (`None` past a side's end).
+    pub names: Option<(Option<Name>, Option<Name>)>,
+    /// The first differing payload byte.
+    pub payload_at: Option<usize>,
+    /// When the read lists differ: the names only the held record read and only the put one
+    /// did, so a read list that is not a function of the key's inputs shows which reads moved.
+    pub apart: Option<Apart>,
+    /// The file a whole record's own path entry names.
+    pub path: Option<blaze_own::String<Global>>,
+    pub label: Option<blaze_own::String<Global>>,
+}
+
+/// How many names of each side [`Apart`] keeps.
+pub const APART_NAMES: usize = 16;
+
+/// The read names only one side of a [`Clash`] holds: up to [`APART_NAMES`] a side, in name
+/// order, and how many more.
+#[derive(Debug)]
+pub struct Apart {
+    pub held: blaze_own::Vec<Name, Global>,
+    pub put: blaze_own::Vec<Name, Global>,
+    pub more_held: usize,
+    pub more_put: usize,
+}
+
+impl Apart {
+    /// `held` and `put`, each sorted by name (a record's reads are): one merge.
+    fn of(held: impl Iterator<Item = Name>, put: impl Iterator<Item = Name>) -> Apart {
+        let mut apart = Apart { held: blaze_own::Vec::new_in(Global), put: blaze_own::Vec::new_in(Global), more_held: 0, more_put: 0 };
+        let keep = |list: &mut blaze_own::Vec<Name, Global>, more: &mut usize, name: Name| match list.len() < APART_NAMES {
+            true => list.push(name),
+            false => *more += 1,
+        };
+        let (mut held, mut put) = (held.peekable(), put.peekable());
+        loop {
+            match (held.peek().copied(), put.peek().copied()) {
+                (None, None) => return apart,
+                (Some(h), Some(p)) if h == p => {
+                    held.next();
+                    put.next();
+                }
+                (Some(h), Some(p)) if h < p => {
+                    held.next();
+                    keep(&mut apart.held, &mut apart.more_held, h);
+                }
+                (Some(h), None) => {
+                    held.next();
+                    keep(&mut apart.held, &mut apart.more_held, h);
+                }
+                (_, Some(p)) => {
+                    put.next();
+                    keep(&mut apart.put, &mut apart.more_put, p);
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Display for Apart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let side = |f: &mut fmt::Formatter<'_>, what: &str, names: &[Name], more: usize| -> fmt::Result {
+            write!(f, "; read only by the {what} record ({}):", names.len() + more)?;
+            if names.is_empty() {
+                f.write_str(" none")?;
+            }
+            for name in names.iter() {
+                // A name prints as its kind and its subject's first bytes (key.rs `Display`).
+                write!(f, " {name}")?;
+            }
+            if more > 0 {
+                write!(f, " and {more} more")?;
+            }
+            Ok(())
+        };
+        side(f, "held", &self.held, self.more_held)?;
+        side(f, "put", &self.put, self.more_put)
+    }
+}
+
+/// The first place two lists differ: their entries there (`None` past a side's end).
+fn first_apart<T: PartialEq>(mut a: impl Iterator<Item = T>, mut b: impl Iterator<Item = T>) -> Option<(Option<T>, Option<T>)> {
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return None,
+            (x, y) if x == y => {}
+            (x, y) => return Some((x, y)),
+        }
+    }
+}
+
+impl Clash {
+    /// The records `held` (what the key holds; `None` when the store lends nothing there) and
+    /// `put` (the refused bytes), opened and compared field by field.
+    pub fn of(held: Option<&[u8]>, put: &[u8]) -> Clash {
+        use blaze_drive::WireError;
+        use blaze_drive::record::{Stored, open};
+        fn form(stored: &Result<Stored<'_>, WireError>) -> Form {
+            match stored {
+                Ok(Stored::Whole(_)) => Form::Whole,
+                Ok(Stored::Shape(_)) => Form::Shape,
+                Err(_) => Form::NotARecord,
+            }
+        }
+        fn name_of(stored: &Result<Stored<'_>, WireError>) -> Option<Name> {
+            match stored {
+                Ok(Stored::Whole(view)) => Some(view.name),
+                Ok(Stored::Shape(view)) => Some(view.name),
+                Err(_) => None,
+            }
+        }
+        let held = held.map(open);
+        let new = open(put);
+        let mut clash = Clash {
+            name: name_of(&new).or_else(|| held.as_ref().and_then(name_of)),
+            held: held.as_ref().map_or(Form::NotARecord, form),
+            put: form(&new),
+            field: "form",
+            names: None,
+            payload_at: None,
+            apart: None,
+            path: None,
+            label: None,
+        };
+        if let Ok(Stored::Whole(view)) = &new {
+            if let Some(own) = view.paths().find(|path| path.name == view.name) {
+                let mut path = blaze_own::String::new_in(Global);
+                path.push_str(core::str::from_utf8(own.path).unwrap_or("a path not UTF-8"));
+                clash.path = Some(path);
+            }
+        }
+        match (held, new) {
+            (Some(Ok(Stored::Whole(a))), Ok(Stored::Whole(b))) => {
+                clash.field = if a.name != b.name {
+                    "name"
+                } else if a.source != b.source {
+                    "source"
+                } else if a.out != b.out {
+                    "out"
+                } else if a.split != b.split {
+                    "split"
+                } else if let Some((x, y)) = first_apart(a.reads(), b.reads()) {
+                    clash.names = Some((x.map(|(name, _)| name), y.map(|(name, _)| name)));
+                    clash.apart = Some(Apart::of(a.reads().map(|(name, _)| name), b.reads().map(|(name, _)| name)));
+                    "reads"
+                } else if let Some((x, y)) = first_apart(a.cells(), b.cells()) {
+                    clash.names = Some((x.map(|read| read.name), y.map(|read| read.name)));
+                    "cells"
+                } else if let Some((x, y)) = first_apart(a.parts(), b.parts()) {
+                    clash.names = Some((x.map(|part| part.name), y.map(|part| part.name)));
+                    "parts"
+                } else if let Some((x, y)) = first_apart(a.paths(), b.paths()) {
+                    clash.names = Some((x.map(|path| path.name), y.map(|path| path.name)));
+                    "paths"
+                } else if first_apart(a.findings(), b.findings()).is_some() {
+                    "findings"
+                } else if let Some(at) = blaze_cas::plain::first_difference(a.payload, b.payload) {
+                    clash.payload_at = Some(at);
+                    "payload"
+                } else {
+                    "none"
+                };
+            }
+            (Some(Ok(Stored::Shape(a))), Ok(Stored::Shape(b))) => {
+                clash.field = if a.name != b.name {
+                    "name"
+                } else if let Some(apart) = first_apart(a.names(), b.names()) {
+                    clash.names = Some(apart);
+                    clash.apart = Some(Apart::of(a.names(), b.names()));
+                    "reads"
+                } else if let Some((x, y)) = first_apart(a.cells(), b.cells()) {
+                    clash.names = Some((x.map(|(name, _)| name), y.map(|(name, _)| name)));
+                    "cells"
+                } else {
+                    "none"
+                };
+            }
+            _ => {}
+        }
+        clash
+    }
+
+    /// The crate the record's name is of, from the command's crate list: a `CrateScope`, its
+    /// `Links`, or any task named by a crate's subject (work.rs `tally`'s labels).
+    pub(crate) fn label_with(&mut self, names: Option<&crate::names::Names<'_>>) {
+        let Some(name) = self.name else { return };
+        let Some((krate, macro_side)) = names.and_then(|names| names.crate_at(name.subject).map(|at| names.crate_label(at))) else { return };
+        let mut label = blaze_own::String::new_in(Global);
+        label.push_str("crate ");
+        label.push_str(krate);
+        if macro_side {
+            label.push_str(" (macro side)");
+        }
+        self.label = Some(label);
+    }
+}
+
+impl fmt::Display for Clash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.name {
+            Some(name) => write!(f, "{name}")?,
+            None => f.write_str("a record of no drive name")?,
+        }
+        if let Some(label) = &self.label {
+            write!(f, " ({label})")?;
+        }
+        if let Some(path) = &self.path {
+            write!(f, " ({path})")?;
+        }
+        write!(f, ": held {}, put {}", self.held.word(), self.put.word())?;
+        match self.field {
+            "none" => f.write_str(", equal fields")?,
+            field => write!(f, ", first differing in {field}")?,
+        }
+        if let Some((held, put)) = self.names {
+            let side = |f: &mut fmt::Formatter<'_>, name: Option<Name>| match name {
+                Some(name) => write!(f, "{name}"),
+                None => f.write_str("(none)"),
+            };
+            f.write_str(" (held ")?;
+            side(f, held)?;
+            f.write_str(", put ")?;
+            side(f, put)?;
+            f.write_str(")")?;
+        }
+        if let Some(at) = self.payload_at {
+            write!(f, " at payload byte {at}")?;
+        }
+        if let Some(apart) = &self.apart {
+            write!(f, "{apart}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for StoreFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StoreFailure::NoHome => f.write_str("HOME is not set: blaze's one store is under the home's .blaze/v2/store (rule: store.rs)"),
+            StoreFailure::Home(error) => write!(f, "the home: {error}"),
+            StoreFailure::Place(error) => write!(f, "{error}"),
+            StoreFailure::Copy(stopped) => write!(f, "a record read from the store: {stopped}"),
+            StoreFailure::Look { folder, error } => write!(f, "looking for the old store folder {folder}: {error}"),
+            StoreFailure::TwoValues { key, lent, clash } => write!(f, "{clash}; the store under the home's .blaze/v2/store refused its put at {key}: {lent}"),
+        }
+    }
+}
+
+impl From<PlaceError> for CliError {
+    fn from(error: PlaceError) -> CliError {
+        CliError::Store(StoreFailure::Place(error))
+    }
+}
+
+/// blaze's folder in the home, passed in from the command's start (rule 75) and reached
+/// through the effect layer as a second tree ([`Fs::home`]), wherever it is.
+pub struct Home {
+    dir: Dir<ReadWrite>,
+}
+
+impl Home {
+    /// From `HOME` as main.rs read it (absolute). No home is a typed refusal: the one store is
+    /// under it.
+    pub fn of(cx: &Cx, fs: &Fs, home: Option<&str>) -> Result<Home, CliError> {
+        let Some(home) = home else { return Err(CliError::Store(StoreFailure::NoHome)) };
+        match fs.home(cx, home, &Path::new(HOME_FOLDER)?) {
+            Ok(dir) => Ok(Home { dir }),
+            Err(error) => Err(CliError::Store(StoreFailure::Home(error))),
+        }
+    }
+
+    pub fn dir(&self) -> &Dir<ReadWrite> {
+        &self.dir
+    }
+
+    /// The command's store, opened lazily on the world's driver lent to [`plain_place::STORE_DIR`]
+    /// (one driver a process, drive.md ruling 5): nothing is mapped until a get probes.
+    pub fn open_store(&self, settings: &Settings, facts: Facts) -> Result<Lent<bstd::io::LentDriver, Global>, CliError> {
+        let driver = self.dir.lend(&Path::new(plain_place::STORE_DIR)?);
+        let dir = driver.dir().clone();
+        Ok(plain_place::open(driver, plain_place::config(dir, settings, facts))?)
+    }
+}
+
+/// The old forms' folders, each reported by name once (one line a folder), never read, migrated
+/// or deleted. Looked for once in the home's life and once in each checkout's: the look is
+/// recorded as a root, committed with this command's records after the answer.
+pub fn old_home<D: Driver>(cx: &Cx, home: &Home, root: &Dir<ReadWrite>, checkout: &str, lent: &Lent<D, Global>, err: &Out) -> Result<u32, CliError> {
+    let roots = lent.roots();
+    let mut checkout_root = std::string::String::with_capacity(OLD_CHECKOUT_LOOKED.len() + 16);
+    checkout_root.push_str(OLD_CHECKOUT_LOOKED);
+    for byte in &ContentId::of("blaze-cli old packs look", checkout.as_bytes()).0[..8] {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        checkout_root.push(char::from(HEX[usize::from(byte >> 4)]));
+        checkout_root.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+    let looked = |name: &str| roots.iter().any(|(it, _)| it == name);
+    let mut found = 0;
+    let say = |cx: &Cx, place: &str, folder: &str| {
+        err.line(cx, format_args!("blaze: an old store under {place}{folder} is not read by this blaze: its records are made again; delete it when no older blaze needs it"))
+    };
+    if !looked(OLD_HOME_LOOKED) {
+        for folder in OLD_HOME {
+            if home.dir.stat(cx, &Path::new(folder)?).map_err(|error| CliError::Store(StoreFailure::Look { folder, error }))?.is_some() {
+                say(cx, "the home's .blaze/", folder)?;
+                found += 1;
+            }
+        }
+        lent.root(OLD_HOME_LOOKED, &[]).map_err(|error| CliError::Store(StoreFailure::Place(PlaceError::Lent(error))))?;
+    }
+    if !looked(&checkout_root) {
+        for old in OLD_CHECKOUT {
+            if root.stat(cx, &Path::new(old)?).map_err(|error| CliError::Store(StoreFailure::Look { folder: old, error }))?.is_some() {
+                say(cx, "the checkout's ", old)?;
+                found += 1;
+            }
+        }
+        lent.root(&checkout_root, &[]).map_err(|error| CliError::Store(StoreFailure::Place(PlaceError::Lent(error))))?;
+    }
+    Ok(found)
+}
+
+/// Where records go (drive.md ruling 2): the one seam where the choice is made (rule 78). The
+/// command's is [`ToolchainCrates`].
+pub trait Sharing {
+    /// The crates whose records hold nothing of a project, by their `CrateScope` subjects.
+    fn add_public(&mut self, subjects: &[ContentId]);
+    /// Whether `bytes`, a record about to be put, holds only public names: it goes to the
+    /// public namespace when this machine is a trusted builder, else to `LOCAL`.
+    fn all_names_public(&self, bytes: &[u8]) -> bool;
+}
+
+/// A drive record's names are all public when its name and every name it reads are on a
+/// POSITIVE LIST BY SUBJECT (main's ruling, D115): `add_public` takes `CrateScope` subjects and
+/// `Script` subjects; the cli adds a script's subject only when its crate is public (the
+/// toolchain's, a checksummed registry archive's: target.md, "Namespaces") AND it is placed on
+/// the wasm path, so a native script, and every record reading it, stays LOCAL (forgetting one
+/// makes it local: the safe direction). Sharing never reads how a script ran. A `Fetch` record
+/// stands for the home's sources folder (fetch.rs `SOURCES`): this machine's, never public
+/// (D78). Anything not a drive record (a certificate, a root, a page) is not public.
+pub struct ToolchainCrates {
+    /// Sorted, without repeats.
+    subjects: std::vec::Vec<ContentId, Global>,
+}
+
+impl ToolchainCrates {
+    pub fn new() -> ToolchainCrates {
+        ToolchainCrates { subjects: std::vec::Vec::new_in(Global) }
+    }
+}
+
+impl Sharing for ToolchainCrates {
+    fn add_public(&mut self, subjects: &[ContentId]) {
+        self.subjects.extend_from_slice(subjects);
+        self.subjects.sort_unstable();
+        self.subjects.dedup();
+    }
+
+    fn all_names_public(&self, bytes: &[u8]) -> bool {
+        let public = |name: Name| matches!(name.kind, Kind::CrateScope | Kind::Script) && self.subjects.binary_search(&name.subject).is_ok();
+        let (name, all_public) = match blaze_drive::record::open(bytes) {
+            // A cell read names its record as a whole read does, so both must be public.
+            Ok(Stored::Whole(view)) => (
+                view.name,
+                public(view.name) && view.reads().all(|(name, _)| public(name)) && view.cells().all(|read| public(read.name)),
+            ),
+            Ok(Stored::Shape(view)) => (view.name, public(view.name) && view.names().all(public) && view.cells().all(|(name, _)| public(name))),
+            // Not a drive record (a certificate, a root, a page): this machine's.
+            Err(_) => return false,
+        };
+        match (name.kind, all_public) {
+            // Fetched and adopted sources are this machine's (D78): never the shared namespace.
+            (Kind::Fetch, _) => false,
+            (_, all_public) => all_public,
+        }
+    }
+}
+
+/// The command's store: the plain store's handle, where records go, and a named origin.
+pub struct CommandStore<'m, 'r, D: Driver, S: Sharing = ToolchainCrates> {
+    place: PlainPlace<'m, D>,
+    sharing: S,
+    remote: Option<Remote<'r>>,
+    mapped_all: bool,
+    /// The open's time, for the profile and `--stats`.
+    open_ns: u64,
+}
+
+impl<'m, 'r, D: Driver> CommandStore<'m, 'r, D, ToolchainCrates> {
+    /// The handle over `lent`, opened in `open_ns`, then `origin` when one is named. Past
+    /// [`plain_place::SEGMENTS_NAMED_MOST`] segments named, one line says compaction is behind.
+    #[expect(clippy::too_many_arguments, reason = "the store's edge: each argument one handle or fact of it")]
+    pub fn new(cx: &Cx, lent: &'m Lent<D, Global>, public_writer: bool, open_ns: u64, origin: Option<&'r NamedOrigin>, clock: Clock, err: &'r Out, alloc: Alloc<'r>) -> Result<CommandStore<'m, 'r, D>, CliError> {
+        let remote = origin.map(|named| Remote {
+            named,
+            reader: Reader::new_in(Namespace::PUBLIC, &named.check, Limits::DEFAULT, alloc),
+            clock,
+            err,
+            alloc,
+            spent_ns: 0,
+            said: 0,
+        });
+        let (_, named) = lent.mapped_of_named();
+        if named > plain_place::SEGMENTS_NAMED_MOST {
+            err.line(cx, format_args!("blaze: the store under the home's .blaze/{} names {named} segments, past {}: its compaction is behind", plain_place::STORE_DIR, plain_place::SEGMENTS_NAMED_MOST))?;
+        }
+        Ok(CommandStore { place: PlainPlace::new(lent, public_writer), sharing: ToolchainCrates::new(), remote, mapped_all: false, open_ns })
+    }
+}
+
+/// The command's store: the plain store on the world's lent driver.
+pub type CommandLent = Lent<bstd::io::LentDriver, Global>;
+
+/// The one store as the command's function holds it, from before the request to after the
+/// answer is printed.
+pub struct Opened {
+    pub home: Home,
+    pub lent: CommandLent,
+    /// The open's nanoseconds (the profile's `store open` line).
+    pub open_ns: u64,
+}
+
+/// The one store a user, opened as a command opens it (drive.md, "The store under the
+/// command"): the home from `HOME` (none: the typed refusal), the boot fact (none: one line,
+/// and every segment of an earlier command is checked once), the nonce from the granted `Rng`;
+/// the open maps nothing. Then the old forms are reported once ([`old_home`]).
+pub fn open_for_command(cx: &Cx, io: &bstd::io::Io, home: Option<&str>, checkout_root: &Dir<ReadWrite>, checkout: &str, clock: &Clock, err: &Out) -> Result<Opened, CliError> {
+    let home = Home::of(cx, &io.need_fs()?, home)?;
+    let boot = match io.boot() {
+        Ok(boot) => {
+            let mut first = [0u8; 8];
+            first.copy_from_slice(&boot.0[..8]);
+            Some(u64::from_le_bytes(first))
+        }
+        Err(why) => {
+            err.line(cx, format_args!("blaze: no boot fact ({why}): each segment an earlier command wrote is checked once"))?;
+            None
+        }
+    };
+    let nonce = nonce(&mut io.need_rng()?);
+    let ns = |clock: &Clock| u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX);
+    let began = ns(clock);
+    let lent = home.open_store(&Settings::default(), Facts { boot, nonce })?;
+    let open_ns = ns(clock).saturating_sub(began);
+    old_home(cx, &home, checkout_root, checkout, &lent, err)?;
+    Ok(Opened { home, lent, open_ns })
+}
+
+/// After the answer is printed, once every handle over `lent` is gone: the ONE commit of this
+/// command's records and roots ([`plain_place::after_answer`]), and with `stats` its line on
+/// `err`: the commit's time, and the time from the answer's last byte to the store's last
+/// effect (the process exits right after).
+pub fn after_answer_printed(cx: &Cx, lent: CommandLent, stats: bool, clock: &Clock, err: &Out) -> Result<(), CliError> {
+    let ns = |clock: &Clock| u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX);
+    let answered = ns(clock);
+    let after = plain_place::after_answer(&lent, AFTER_ANSWER_SLICES)?;
+    let commit_ns = ns(clock).saturating_sub(answered);
+    drop(lent);
+    if stats {
+        err.line(
+            cx,
+            format_args!(
+                "blaze: store after the answer: commit {} segments, sealed {}, slices {}, {:.3} ms; answer's last byte to exit {:.3} ms",
+                after.segments_written,
+                after.sealed,
+                after.compaction_slices,
+                commit_ns as f64 / 1e6,
+                ns(clock).saturating_sub(answered) as f64 / 1e6,
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+/// A planted bug of the nonce's test (`store/nonce_tests.rs`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NoncePlant {
     None,
-    /// The merge removes the old packs before the merged one is published.
-    MergeRemovesFirst,
-    /// A pack from an earlier boot is taken without its once-a-boot read.
-    VerifySkipped,
-    /// A pack vouches for itself: its index matching its name stands for the boot record.
-    SelfVouching,
-    /// The chain puts every record in the public machine store ([`SHARED`]), a project's too
-    /// ([`Layered`]).
-    PrivateIntoMachine,
-    /// The chain puts a record about the checkout (a certificate, a page) in the user's own
-    /// store ([`OWN`]), where another checkout would take it as its own answer.
-    CheckoutIntoOwn,
-    /// The seal makes the pack's name hold its index and footer, and the boot record vouch for
-    /// it, before the payloads are written (store/chunks.rs, `seal_records`).
-    IndexBeforePayloads,
-    /// The merge removes the old-format packs the open refused, as a merge that took them for
-    /// its own would (store/producers.rs `planted_remove_old`): another blaze's live records.
-    OldPackMerged,
+    /// Every open takes one constant: two processes would name a segment alike.
+    Constant,
 }
 
-/// A command's own records before the seal: bytes that never move, rows sorted once.
-mod chunks;
-/// When a layer's packs are merged, and the merge's typed refusal.
-mod compact;
-/// Who made each record of a pack (pack format 3), and an old pack's refusal by name.
-mod producers;
-pub use producers::PackError;
-use blaze_own::alloc_ref::SharedAlloc;
-/// The store at a real home's size: what a get reads, what a repeated command writes, the
-/// compaction's crash proof.
-#[cfg(test)]
-mod scale_tests;
-
-/// A pack's index, read once at the open: rows sorted by key.
-struct Pack {
-    file: File<ReadOnly>,
-    rows: std::vec::Vec<(Key, u64, u32), Global>,
-    /// Removed by another command's merge since this one listed it ([`PackStore::get_into`]).
-    gone: bool,
-    /// Bytes the open read of it: its footer, its index and footer, and its payloads when it
-    /// was verified (store/scale_tests.rs counts them).
-    read: u64,
-    /// Entries in its producer table, which starts at `table_at` and ends at the index; read
-    /// only when asked (`Pack::producers`, store/producers.rs).
-    producers: u32,
-    table_at: u64,
-    /// Each row's producer's index in that table, beside `rows` (one each, same order).
-    producer_of: blaze_own::Vec<u16, SharedAlloc<'static>>,
+/// The store's nonce ([`Facts::nonce`]): the next draw of the granted generator (bstd `Rng`,
+/// seeded once from the system's secure source on a real driver, from the world's generator in
+/// the simulation; main's ruling 21:3x: no second randomness grant). Taken where the store is
+/// opened, from a generator handed in (rule 75).
+pub fn nonce(rng: &mut bstd::rng::Rng) -> u64 {
+    draw_nonce(rng, NoncePlant::None)
 }
 
-impl Pack {
-    /// Whether its name is gone: asked after a read that failed or came back short, to tell a
-    /// pack another command's merge removed (a miss) from one cut short (refused by name).
-    fn removed(&self, cx: &Cx) -> Result<bool, CliError> {
-        match self.file.len(cx) {
-            Ok(_) => Ok(false),
-            Err(error) if error.kind == FsKind::NotFound => Ok(true),
+pub(crate) fn draw_nonce(rng: &mut bstd::rng::Rng, plant: NoncePlant) -> u64 {
+    match plant {
+        NoncePlant::None => rng.next_u64(),
+        NoncePlant::Constant => 0x6e6f_6e63_6521,
+    }
+}
+
+/// The root a checkout's last answer for one request shape hangs from (drive.md ruling 3):
+/// `last.<16 hex of H(checkout path)>.<the pointer's 16 hex of H(tool, shape)>`. The one place a
+/// digest of a machine's path stands: a root is `LOCAL`, never sealed or published.
+pub fn last_root(checkout: &str, pointer: &blaze_drive::pointers::PointerName) -> std::string::String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut name = std::string::String::with_capacity(5 + 16 + 1 + 16);
+    name.push_str("last.");
+    for byte in &ContentId::of("blaze-cli last root checkout", checkout.as_bytes()).0[..8] {
+        name.push(char::from(HEX[usize::from(byte >> 4)]));
+        name.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+    name.push('.');
+    for &byte in pointer.bytes() {
+        name.push(char::from(byte));
+    }
+    name
+}
+
+/// The checkout's last answer and leaf table for one request shape, in place: the one record the
+/// root `root` ([`last_root`]) names (main.rs seals it with `seal::seal`). Read before the
+/// request's handle is made and never asked of an origin: a root is `LOCAL`. `None`: no root
+/// yet, or a root naming no single record (the request answers in full).
+pub fn last<'m, D: Driver>(lent: &'m Lent<D, Global>, root: &str) -> Result<Option<Held<'m>>, CliError> {
+    let place = PlainPlace::new(lent, false);
+    let Some(named) = place.root(root)? else { return Ok(None) };
+    let Ok(key) = <[u8; 32]>::try_from(named.bytes) else { return Ok(None) };
+    Ok(place.get(Key(ContentId(key)))?)
+}
+
+impl<'m, D: Driver, S: Sharing> CommandStore<'m, '_, D, S> {
+    /// `sealed` as the checkout's last answer for one request shape: put under its content key
+    /// and named by the root `root`. Both ride the ONE commit after the answer is printed
+    /// ([`plain_place::after_answer`]): no generation names a pointer whose record is absent
+    /// (blaze-cas plain/root_commit_tests.rs).
+    pub fn set_last(&mut self, cx: &Cx, root: &str, sealed: &[u8]) -> Result<(), CliError> {
+        let key = Key(ContentId::of("blaze-cli last answer record", sealed));
+        self.put(cx, key, sealed)?;
+        Ok(self.place.pin(root, &[key])?)
+    }
+}
+
+impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
+    fn public_crates(&mut self, subjects: &[ContentId]) {
+        self.sharing.add_public(subjects);
+    }
+
+    fn get(&mut self, cx: &Cx, key: Key) -> Result<Option<Held<'m>>, CliError> {
+        if let Some(held) = self.place.get(key)? {
+            return Ok(Some(held));
+        }
+        let Some(remote) = &mut self.remote else { return Ok(None) };
+        let began = remote.now_ns();
+        let clock = remote.clock.clone();
+        let mut now = || u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX);
+        // A batch of one key: the request asks one record at a time (blaze-drive's `Get`).
+        // `BatchError` is only a batch past `keys_most` or one begun mid-batch: neither can be.
+        let fetched = match &remote.named.at {
+            OriginAt::Folder(folder) => fetch(&mut remote.reader, &mut FolderOrigin { cx, folder }, &mut now, core::slice::from_ref(&key.0), remote.alloc),
+            OriginAt::Http(at) => fetch(&mut remote.reader, &mut HttpOrigin::new(cx, at, &clock), &mut now, core::slice::from_ref(&key.0), remote.alloc),
+        };
+        fetched.map_err(|error| CliError::Remote(RemoteError::Batch(error)))?;
+        let found = match remote.reader.answer(0) {
+            Answer::Found { .. } => {
+                let bytes = remote.reader.found(0).unwrap_or(&[]);
+                // Put before it is answered, and answered from the arena: lent for `'m`.
+                self.place.put(key, false, bytes)?;
+                self.place.get(key)?
+            }
+            Answer::Absent | Answer::Pending => None,
+            Answer::Unfetched(why) => {
+                remote.say(cx, key, &why)?;
+                None
+            }
+        };
+        if let Some(remote) = &mut self.remote {
+            remote.spent_ns += remote.now_ns().saturating_sub(began);
+        }
+        Ok(found)
+    }
+
+    fn put(&mut self, _cx: &Cx, key: Key, bytes: &[u8]) -> Result<(), CliError> {
+        let public = self.sharing.all_names_public(bytes);
+        match self.place.put(key, public, bytes) {
+            Ok(()) => Ok(()),
+            Err(PlaceError::Lent(lent @ blaze_cas::plain::LentError::TwoValues { .. })) => {
+                let held = self.place.get(key)?;
+                let clash = Clash::of(held.map(|held| held.bytes), bytes);
+                Err(CliError::Store(StoreFailure::TwoValues { key, lent, clash }))
+            }
             Err(error) => Err(error.into()),
         }
     }
 
-    fn find(&self, key: Key) -> Option<(u64, u32)> {
-        let at = self.rows.binary_search_by(|row| row.0.cmp(&key)).ok()?;
-        Some((self.rows[at].1, self.rows[at].2))
-    }
-}
-
-/// The local store: one pack a command (drive.md, "The system side", "Store"). A command's
-/// records leave in ONE file, written with one create, one write and one rename after its
-/// last record and before its answer's pointer, never one file a record (708 renames were
-/// 105 ms of tempo's cold check, 148 µs each). A pack is the records sorted by key, then an
-/// index of [`ROW`]s sorted by key, then a [`FOOTER`]: equal record sets make equal bytes
-/// (rule 25), and a pack is named by the digest of its index and footer, so two commands
-/// sealing at once on one home never write one name with two contents (a key holds one value,
-/// rule 21: the index says the whole pack). The open lists the folder once and reads each
-/// pack's footer and index with two `pread`s; a home with no pack is cold, known from that one
-/// listing: no lookup asks the disk. A get asks this command's records first, then each pack.
-/// Past `packs_most` packs, `after_answer` merges them into one.
-///
-/// What a crash may do, and what it may not (the simulation tests below). The home is a cache
-/// of records the driver can make again: it must never hand back wrong bytes, and it need not
-/// survive a power cut. Nothing on a command's path is synced: a pack, the boot record and
-/// `last` are published unsynced. A record lost is made again (a cert, a root or a page the
-/// driver does not get is work, not an error). A record is never read torn: the footer holds
-/// the digest of the payloads, and the name the digest of the index and footer, and a pack
-/// sealed in another boot than this one is read whole and checked against both once, at its
-/// first open in this boot, then named in the boot record ([`BOOT`]); one that fails is
-/// removed, said, and its records made again. A pack sealed in this boot is trusted as
-/// written: no power was lost since, so the page cache holds what was written.
-pub struct PackStore {
-    packs_dir: Dir<ReadWrite>,
-    /// With their names' numbers (for the merge), in the listing's order.
-    packs: std::vec::Vec<(u64, Pack), Global>,
-    /// This command's records: bytes in chunks that never move, rows in put order, sorted
-    /// once at the seal (store/chunks.rs).
-    own: chunks::Records,
-    /// Packs the open found torn or foreign and removed: said by the caller, and made again.
-    pub(crate) refused: u32,
-    /// Packs read whole and checked at this open (their first in this boot).
-    pub(crate) verified: u32,
-    /// Bytes this store read from its packs since the open, the open's included: footers,
-    /// indexes, payloads verified, records got (not the merge's copy).
-    pub(crate) read: u64,
-    /// Its folder under its root ([`PACKS`], [`SHARED`] or [`OWN`]): what its errors name.
-    folder: &'static str,
-    boot: Boot,
-    packs_most: usize,
-    plant: StorePlant,
-    /// Reads of footers and indexes, reset after each.
-    scratch: bstd::mem::Frame,
-    /// The tool its seals name as each record's producer's (store/producers.rs): `None` until
-    /// the command names it (`PackStore::name_tool`), written as the unnamed id.
-    tool: Option<blaze_drive::Tool>,
-    /// Packs of an older format the open refused by name: never read, merged from, removed or
-    /// rewritten (store/producers.rs); said once by `Layered::open_chain`.
-    old: blaze_own::Vec<PackError, SharedAlloc<'static>>,
-}
-
-/// A pack's name, from its index and footer: the first 8 bytes of their digest, in hex. The
-/// footer holds the payloads' digest, so the name stands for every byte.
-fn index_number(index_and_footer: &[u8]) -> u64 {
-    let digest = blaze_ids::ContentId::of("blaze-cli pack index", index_and_footer);
-    le_u64(&digest.0[..8])
-}
-
-/// The payloads' digest of a pack built whole ([`pack_bytes`]); the open streams it.
-#[cfg(test)]
-fn payloads_digest(payloads: &[u8]) -> [u8; 32] {
-    blaze_ids::ContentId::of(chunks::PAYLOADS, payloads).0
-}
-
-/// The boot record: `BLZB`, the boot, then the numbers of the packs known whole in it, sorted.
-/// Read as nothing trusted when it is absent, malformed, of another boot, or the boot unknown.
-fn read_boot(cx: &Cx, packs_dir: &Dir<ReadWrite>, boot: Boot, scratch: &bstd::mem::Frame) -> Result<std::vec::Vec<u64, Global>, CliError> {
-    let mut trusted = std::vec::Vec::new_in(Global);
-    let Boot::Known(now) = boot else { return Ok(trusted) };
-    let mut bytes = Bytes::new_in(scratch, "the boot record");
-    match packs_dir.read_all(cx, &Path::new(BOOT)?, &mut bytes) {
-        Ok(_) => {}
-        Err(error) if error.kind == FsKind::NotFound => return Ok(trusted),
-        Err(error) => return Err(error.into()),
-    }
-    let bytes = bytes.as_slice();
-    if bytes.len() < 20 || &bytes[..4] != BOOT_MAGIC || bytes[4..20] != now || (bytes.len() - 20) % 8 != 0 {
-        return Ok(trusted);
-    }
-    trusted.extend(bytes[20..].chunks_exact(8).map(le_u64));
-    if !trusted.is_sorted() {
-        trusted.clear();
-    }
-    Ok(trusted)
-}
-
-fn pack_name(number: u64) -> Result<Path, CliError> {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut name = [0u8; 16];
-    for (at, slot) in name.iter_mut().enumerate() {
-        *slot = HEX[((number >> ((15 - at) * 4)) & 15) as usize];
-    }
-    let name = core::str::from_utf8(&name).map_err(|_| CliError::Text { what: "a pack's hex" })?;
-    Ok(Path::new(name)?)
-}
-
-fn le_u32(bytes: &[u8]) -> u32 {
-    let mut word = [0u8; 4];
-    word.copy_from_slice(&bytes[..4]);
-    u32::from_le_bytes(word)
-}
-
-fn le_u64(bytes: &[u8]) -> u64 {
-    let mut word = [0u8; 8];
-    word.copy_from_slice(&bytes[..8]);
-    u64::from_le_bytes(word)
-}
-
-/// Why a pack was not taken: torn or foreign (removed and made again), or gone (another
-/// command's merge removed it after this one listed it: its records are in that merge's pack).
-enum Untaken {
-    Refused,
-    /// A pack of an older format with a valid footer of its own: refused by name, never read,
-    /// kept as it is ([`PackError::OldFormat`], store/producers.rs `old_or_torn`).
-    Old(PackError),
-    Gone,
-    Failed(CliError),
-}
-
-impl From<FsError> for Untaken {
-    fn from(error: FsError) -> Untaken {
-        match error.kind {
-            FsKind::NotFound => Untaken::Gone,
-            _ => Untaken::Failed(CliError::Fs(error)),
+    fn map_all(&mut self, _cx: &Cx) -> Result<(), CliError> {
+        if !self.mapped_all {
+            self.place.map_all()?;
+            self.mapped_all = true;
         }
-    }
-}
-
-impl PackStore {
-    /// The folder need not exist: the first pack written makes it.
-    pub fn open(cx: &Cx, root: &Dir<ReadWrite>, boot: Boot) -> Result<PackStore, CliError> {
-        PackStore::open_with(cx, root, boot, PACKS_MOST, StorePlant::None)
-    }
-
-    /// [`PackStore::open`], merging past `packs_most` packs, with `plant`'s bug planted.
-    pub(crate) fn open_with(cx: &Cx, root: &Dir<ReadWrite>, boot: Boot, packs_most: usize, plant: StorePlant) -> Result<PackStore, CliError> {
-        PackStore::open_in(cx, root, PACKS, boot, packs_most, plant)
-    }
-
-    /// The pack store in `folder` under `root`: the project's ([`PACKS`] under the checkout)
-    /// or the machine's ([`SHARED`] under the home). One kind of store, one set of rules.
-    pub(crate) fn open_in(cx: &Cx, root: &Dir<ReadWrite>, folder: &'static str, boot: Boot, packs_most: usize, plant: StorePlant) -> Result<PackStore, CliError> {
-        let cx = cx.span("store open");
-        let named = folder;
-        let folder = Path::new(folder)?;
-        let packs_dir = root.subdir(&folder);
-        let mut scratch = bstd::mem::Frame::with_reserve(bstd::mem::TASK_FRAME, bstd::mem::Tag::Other)
-            .map_err(|_| CliError::Text { what: "the store's frame could not be reserved" })?;
-        let trusted = read_boot(&cx, &packs_dir, boot, &scratch)?;
-        scratch.reset();
-        let mut store = PackStore {
-            packs_dir,
-            packs: std::vec::Vec::new_in(Global),
-            own: chunks::Records::new(chunks::CHUNK_HERE),
-            refused: 0,
-            verified: 0,
-            read: 0,
-            folder: named,
-            boot,
-            packs_most,
-            plant,
-            scratch,
-            tool: None,
-            old: blaze_own::Vec::new_in(SharedAlloc::global()),
-        };
-        if let Some(entries) = root.entries(&cx, &folder)? {
-            for i in 0..entries.len() {
-                let name = entries.name(i);
-                let number = match (name.len(), u64::from_str_radix(name, 16)) {
-                    (16, Ok(number)) => number,
-                    // The boot record, or a publish's temporary file (one in flight, or a
-                    // crash's leftover): never a pack until its rename names it.
-                    _ => continue,
-                };
-                let known = trusted.binary_search(&number).is_ok();
-                let taken = PackStore::read_pack(&cx, &store.packs_dir, named, number, !known, &store.scratch, plant);
-                store.scratch.reset();
-                match taken {
-                    Ok(pack) => {
-                        store.verified += u32::from(!known);
-                        store.read += pack.read;
-                        store.packs.push((number, pack));
-                    }
-                    Err(Untaken::Gone) => {}
-                    // An older format, whole by its own footer: refused by name and kept as it
-                    // is; another installed blaze may read it (store/producers.rs).
-                    Err(Untaken::Old(old)) => {
-                        let entries = store.old.len() + 1;
-                        store.old.try_push(old).map_err(|_| producers::pack_refused(PackError::NoRoom { folder: named, what: "the list of old packs refused", entries }))?;
-                    }
-                    // Torn or foreign: never read around. It is removed, said, and its records
-                    // made again; the rest of the home stands, each pack checked on its own.
-                    Err(Untaken::Refused) => {
-                        store.packs_dir.remove(&cx, &pack_name(number)?, Durable::No)?;
-                        store.refused += 1;
-                    }
-                    Err(Untaken::Failed(error)) => return Err(error),
-                }
-            }
-        }
-        if store.verified > 0 || store.refused > 0 || store.packs.len() != trusted.len() {
-            store.write_boot(&cx)?;
-        }
-        Ok(store)
-    }
-
-    /// The boot record as this store holds it: every pack it took, known whole in this boot.
-    /// Unsynced: a power cut makes a new boot, which reads a record of the old as nothing.
-    fn write_boot(&self, cx: &Cx) -> Result<(), CliError> {
-        let Boot::Known(now) = self.boot else { return Ok(()) };
-        let mut numbers: std::vec::Vec<u64, Global> = std::vec::Vec::with_capacity_in(self.packs.len(), Global);
-        numbers.extend(self.packs.iter().map(|(number, _)| *number));
-        numbers.sort_unstable();
-        numbers.dedup();
-        let mut bytes = std::vec::Vec::with_capacity_in(20 + numbers.len() * 8, Global);
-        bytes.extend_from_slice(BOOT_MAGIC);
-        bytes.extend_from_slice(&now);
-        for number in numbers {
-            bytes.extend_from_slice(&number.to_le_bytes());
-        }
-        self.packs_dir.publish(cx, &Path::new(BOOT)?, Content::bytes(&bytes), Durable::No)?;
         Ok(())
     }
 
-    /// Pack `number`'s index, checked at the open: the footer's magic and format, its count
-    /// and index offset against the file's length (the index ends where the footer begins),
-    /// each row's payload inside the payloads, and the rows sorted by key. With `verify` (a
-    /// pack not known whole in this boot), every byte too, once: the index and footer against
-    /// the name, the payloads against the footer's digest. A pack that fails any is
-    /// [`Untaken::Refused`].
-    fn read_pack(cx: &Cx, dir: &Dir<ReadWrite>, folder: &'static str, number: u64, verify: bool, scratch: &bstd::mem::Frame, plant: StorePlant) -> Result<Pack, Untaken> {
-        let name = pack_name(number).map_err(Untaken::Failed)?;
-        let file = dir.open_read(cx, &name)?;
-        let len = file.len(cx)?;
-        if len < FOOTER as u64 {
-            return Err(Untaken::Refused);
-        }
-        let mut footer = Bytes::new_in(scratch, "a pack's footer");
-        file.read_at(cx, len - FOOTER as u64, FOOTER, &mut footer)?;
-        let footer = footer.as_slice();
-        if footer.len() != FOOTER || &footer[..4] != MAGIC {
-            return Err(Untaken::Refused);
-        }
-        match le_u32(&footer[4..]) {
-            FORMAT => {}
-            // Old (a valid footer of its own format: refused by name, kept) or a format 3 pack
-            // with a torn word (refused as torn): store/producers.rs `old_or_torn`.
-            1 | 2 => return Err(producers::old_or_torn(cx, &file, len, footer, folder, number, scratch)),
-            _ => return Err(Untaken::Refused),
-        }
-        let (count, producers, index_at) = (u64::from(le_u32(&footer[8..])), le_u32(&footer[12..]), le_u64(&footer[16..]));
-        if producers as usize > producers::PRODUCERS_MOST {
-            return Err(Untaken::Refused);
-        }
-        // The producer table ends the payloads: it lies before the index, under the digest.
-        let Some(table_at) = index_at.checked_sub(producers::table_len(producers)) else {
-            return Err(Untaken::Refused);
-        };
-        let mut digest = [0u8; 32];
-        digest.copy_from_slice(&footer[24..56]);
-        let rows_len = count.checked_mul(ROW as u64).filter(|bytes| index_at.checked_add(*bytes) == Some(len - FOOTER as u64));
-        let Some(rows_len) = rows_len.and_then(|bytes| usize::try_from(bytes).ok()) else {
-            return Err(Untaken::Refused);
-        };
-        // The index and the footer in one read: the name is their digest.
-        let mut index = Bytes::new_in(scratch, "a pack's index");
-        file.read_at(cx, index_at, rows_len + FOOTER, &mut index)?;
-        if index.len() != rows_len + FOOTER {
-            return Err(Untaken::Refused);
-        }
-        let mut read = (FOOTER + rows_len + FOOTER) as u64;
-        if verify {
-            let vouched = match plant {
-                StorePlant::VerifySkipped => true,
-                // The pack's own index standing for its payloads.
-                StorePlant::SelfVouching => index_number(index.as_slice()) == number,
-                _ => {
-                    // Streamed through one piece of `chunks::PART` bytes, cleared each turn:
-                    // a pack of any size is verified in bounded memory (2026-11-16: a merged
-                    // pack of ten 24 MB packs read whole passed the 64 MiB frame at the next
-                    // boot's open). Each turn reads a whole piece or refuses: bounded.
-                    let mut hasher = blaze_ids::Hasher::new(chunks::PAYLOADS);
-                    let mut piece = Bytes::new_in(scratch, "a piece of a pack's payloads, read once a boot");
-                    let mut done = 0u64;
-                    while done < index_at {
-                        let want = (index_at - done).min(chunks::PART as u64) as usize;
-                        piece.clear();
-                        file.read_at(cx, done, want, &mut piece)?;
-                        if piece.len() != want {
-                            return Err(Untaken::Refused);
-                        }
-                        hasher.update(piece.as_slice());
-                        done += want as u64;
-                    }
-                    read += index_at;
-                    index_number(index.as_slice()) == number && hasher.finish().0 == digest
-                }
-            };
-            if !vouched {
-                return Err(Untaken::Refused);
-            }
-        }
-        let mut rows = std::vec::Vec::with_capacity_in(rows_len / ROW, Global);
-        let no_room = |_| Untaken::Failed(producers::pack_refused(PackError::NoRoom { folder, what: "a pack's producer indexes", entries: rows_len / ROW }));
-        let mut producer_of: blaze_own::Vec<u16, SharedAlloc<'static>> = blaze_own::Vec::try_with_capacity_in(rows_len / ROW, SharedAlloc::global()).map_err(no_room)?;
-        for row in index.as_slice()[..rows_len].chunks_exact(ROW) {
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&row[..32]);
-            let (at, size) = (le_u64(&row[32..]), le_u32(&row[40..]));
-            let producer = u16::from_le_bytes([row[44], row[45]]);
-            // A payload ends before the producer table; a row names an entry of the table; the
-            // row's last two bytes are zero (one encoding).
-            if at.checked_add(u64::from(size)).is_none_or(|end| end > table_at) || u32::from(producer) >= producers || row[46..48] != [0, 0] {
-                return Err(Untaken::Refused);
-            }
-            rows.push((Key(blaze_ids::ContentId(key)), at, size));
-            // Within the capacity reserved above: nothing allocated.
-            producer_of.push(producer);
-        }
-        if !rows.is_sorted_by(|a, b| a.0 < b.0) {
-            return Err(Untaken::Refused);
-        }
-        Ok(Pack { file, rows, gone: false, read, producers, table_at, producer_of })
-    }
-
-    /// This command's records as one pack, if it wrote any: sorted by key, one publish (one
-    /// create, write and rename, nothing synced), then the boot record naming it, before the
-    /// answer's pointer is written. A command that made no record writes nothing.
-    pub fn seal(&mut self, cx: &Cx) -> Result<(), CliError> {
-        // A gathered write of the records where they lie; no pack is built in memory first.
-        self.seal_records(cx)
-    }
-
-    fn held(&self, key: Key) -> bool {
-        self.own.find(key).is_some() || self.packs.iter().any(|(_, pack)| pack.find(key).is_some())
-    }
-
-    /// Every pack merged into one (a key's records are equal, rule 21), published, named in the
-    /// boot record, and only then the old ones removed: nothing synced; a crash between keeps
-    /// both, equal records twice, or loses records the driver makes again, never tears one.
-    fn merge(&mut self, cx: &Cx) -> Result<(), CliError> {
-        let cx = cx.span("store merge");
-        // The merge's memory is the packs' indexes (held since the open) and one piece of one
-        // record, never the packs' sum (2026-11-16: eight packs of 23 MB passed the store's
-        // frame, and every command in that home then failed here). Two passes over the records
-        // in the merged order: the first hashes them for the footer's digest, which names the
-        // pack; the second is the publish, which copies each range file to file
-        // ([`Content::parts_of`]). A pack another command's merge removes meanwhile ends this
-        // merge with nothing changed: that merge's pack holds its records, and the next
-        // command merges what is left.
-        // Every table below is reserved before it is filled: a refused allocation is a typed
-        // error naming the folder and the rows (store/compact.rs `no_room`), never a panic.
-        let all_rows: usize = self.packs.iter().map(|(_, pack)| pack.rows.len()).sum();
-        if self.packs.is_empty() {
-            return Ok(());
-        }
-        // Each pack's producer table (one positioned read each), and the merged table: every
-        // (kind, tool) once, sorted. A pack another command's merge removed meanwhile ends this
-        // merge with nothing changed, as below.
-        let folder = self.folder;
-        let mut tables: blaze_own::Vec<blaze_own::Vec<producers::Producer, SharedAlloc<'static>>, SharedAlloc<'static>> = blaze_own::Vec::try_with_capacity_in(self.packs.len(), SharedAlloc::global()).map_err(|_| self.no_room(all_rows))?;
-        let mut table: blaze_own::Vec<producers::Producer, SharedAlloc<'static>> = blaze_own::Vec::new_in(SharedAlloc::global());
-        for (number, pack) in self.packs.iter() {
-            let read = pack.producers(&cx, &self.scratch, folder, *number);
-            self.scratch.reset();
-            let Some(one) = read? else { return Ok(()) };
-            let entries = table.len() + one.len();
-            table.try_extend_from_slice(one.as_slice()).map_err(|_| producers::pack_refused(PackError::NoRoom { folder, what: "the merged producer table", entries }))?;
-            // Within the capacity reserved above.
-            tables.push(one);
-        }
-        table.sort_unstable();
-        table.dedup();
-        if table.len() > producers::PRODUCERS_MOST {
-            return Err(producers::pack_refused(PackError::TooManyProducers { folder, producers: table.len() }));
-        }
-        let mut rows: std::vec::Vec<(Key, usize, u64, u32, u16), Global> = std::vec::Vec::new_in(Global);
-        rows.try_reserve_exact(all_rows).map_err(|_| self.no_room(all_rows))?;
-        let mut merged = std::vec::Vec::new_in(Global);
-        merged.try_reserve_exact(self.packs.len()).map_err(|_| self.no_room(all_rows))?;
-        for (at, (number, pack)) in self.packs.iter().enumerate() {
-            let own = &tables[at];
-            for ((key, offset, len), index) in pack.rows.iter().zip(pack.producer_of.iter()) {
-                let bad = |why| producers::pack_refused(PackError::BadTable { folder, pack: *number, why });
-                let producer = own.get(*index as usize).ok_or_else(|| bad("a row names an entry past its end"))?;
-                // Every entry of every pack's table is in the merged one, which holds at most
-                // `PRODUCERS_MOST`: its index fits a u16.
-                let into = table.binary_search(producer).map_err(|_| bad("an entry missing from the merged table"))?;
-                rows.push((*key, at, *offset, *len, into as u16));
-            }
-            merged.push(*number);
-        }
-        // Stable: of a key in two packs (equal bytes, rule 21), the first pack's stays.
-        rows.sort_by_key(|row| row.0);
-        rows.dedup_by_key(|row| row.0);
-        let count = u32::try_from(rows.len()).map_err(|_| producers::pack_refused(PackError::TooManyRows { folder, rows: rows.len() }))?;
-        let table_len = producers::table_len(table.len() as u32) as usize;
-        let mut tail: std::vec::Vec<u8, Global> = std::vec::Vec::new_in(Global);
-        tail.try_reserve_exact(table_len + rows.len() * ROW + FOOTER).map_err(|_| self.no_room(all_rows))?;
-        // The tail is the producer table (the payloads' end), the index, the footer.
-        let Ok(()) = producers::write_table::<core::convert::Infallible>(table.as_slice(), &mut |piece: &[u8]| {
-            tail.extend_from_slice(piece);
-            Ok(())
-        });
-        let mut hasher = blaze_ids::Hasher::new(chunks::PAYLOADS);
-        let mut index_at = 0u64;
-        for (key, pack_at, offset, len, producer) in rows.iter() {
-            let pack = &self.packs[*pack_at].1;
-            // A payload and the zeros that pad it to 8 bytes, as its pack holds them.
-            let padded = u64::from(*len).next_multiple_of(8);
-            let mut done = 0u64;
-            // Each turn hashes a whole piece toward `padded`, or returns: bounded.
-            while done < padded {
-                let piece = (padded - done).min(chunks::PART as u64) as usize;
-                let whole = {
-                    let mut bytes = Bytes::new_in(&self.scratch, "a piece of a record being merged");
-                    let read = pack.file.read_at(&cx, *offset + done, piece, &mut bytes);
-                    if matches!(read, Ok(_)) && bytes.len() == piece {
-                        hasher.update(bytes.as_slice());
-                        Ok(())
-                    } else {
-                        Err(read)
-                    }
-                };
-                self.scratch.reset();
-                if let Err(read) = whole {
-                    if pack.removed(&cx)? {
-                        return Ok(());
-                    }
-                    read?;
-                    return Err(CliError::Text { what: "a pack under .blaze/v2/packs is shorter than its index" });
-                }
-                done += piece as u64;
-            }
-            tail.extend_from_slice(&key.0.0);
-            tail.extend_from_slice(&index_at.to_le_bytes());
-            tail.extend_from_slice(&len.to_le_bytes());
-            tail.extend_from_slice(&producer.to_le_bytes());
-            tail.extend_from_slice(&[0; 2]);
-            index_at += padded;
-        }
-        // The rows' offsets are the payloads'; the table follows them, under the digest.
-        hasher.update(&tail[..table_len]);
-        let index_at = index_at + table_len as u64;
-        tail.extend_from_slice(MAGIC);
-        tail.extend_from_slice(&FORMAT.to_le_bytes());
-        tail.extend_from_slice(&count.to_le_bytes());
-        tail.extend_from_slice(&(table.len() as u32).to_le_bytes());
-        tail.extend_from_slice(&index_at.to_le_bytes());
-        tail.extend_from_slice(&hasher.finish().0);
-        // The name is the digest of the index and footer, as `read_pack` checks it.
-        let number = index_number(&tail[table_len..]);
-        let removes_first = self.plant == StorePlant::MergeRemovesFirst;
-        if removes_first {
-            for gone in merged.iter() {
-                self.packs_dir.remove(&cx, &pack_name(*gone)?, Durable::No)?;
-            }
-        }
-        let published = {
-            let mut parts: std::vec::Vec<bstd::fs::FilePart<'_>, Global> = std::vec::Vec::new_in(Global);
-            parts.try_reserve_exact(rows.len()).map_err(|_| self.no_room(all_rows))?;
-            for (_, pack_at, offset, len, _) in rows.iter().filter(|row| row.3 > 0) {
-                parts.push(bstd::fs::FilePart { of: &self.packs[*pack_at].1.file, at: *offset, len: u64::from(*len).next_multiple_of(8) });
-            }
-            let chunk = core::num::NonZero::new(chunks::PART).unwrap_or(core::num::NonZero::<usize>::MIN);
-            self.packs_dir.publish(&cx, &pack_name(number)?, Content::parts_of(&parts, &tail, chunk), Durable::No).map(|_| ())
-        };
-        if let Err(error) = published {
-            for (_, pack) in self.packs.iter() {
-                if pack.removed(&cx)? {
-                    return Ok(());
-                }
-            }
-            return Err(error.into());
-        }
-        let old = core::mem::replace(&mut self.packs, std::vec::Vec::new_in(Global));
-        self.take_pack(&cx, number)?;
-        self.write_boot(&cx)?;
-        if !removes_first {
-            // A pack whose records equal the merge's has its name: it is the merge, kept.
-            for gone in merged.iter().filter(|gone| **gone != number) {
-                self.packs_dir.remove(&cx, &pack_name(*gone)?, Durable::No)?;
-            }
-        }
-        if self.plant == StorePlant::OldPackMerged {
-            self.planted_remove_old(&cx)?;
-        }
-        drop(old);
-        Ok(())
-    }
-
-    /// Every record the open's packs hold, once a key, sorted by key, each read whole into
-    /// `scratch` and handed to `each`: what an origin is sealed from (remote-read.md, "One chain
-    /// of stores": the public machine store only). A pack read short is refused by name; one a
-    /// merge removed since the open is skipped (its records are in the merge's pack, which the
-    /// next open lists).
-    pub(crate) fn each_record(&self, cx: &Cx, scratch: &bstd::mem::Frame, each: &mut dyn FnMut(Key, &[u8]) -> Result<(), CliError>) -> Result<u32, CliError> {
-        let mut rows: std::vec::Vec<(Key, usize, u64, u32), Global> = std::vec::Vec::new_in(Global);
-        for (at, (_, pack)) in self.packs.iter().enumerate() {
-            rows.extend(pack.rows.iter().map(|(key, offset, len)| (*key, at, *offset, *len)));
-        }
-        rows.sort_by_key(|row| row.0);
-        rows.dedup_by_key(|row| row.0);
-        let mut handed = 0u32;
-        for (key, at, offset, len) in rows.iter() {
-            let pack = &self.packs[*at].1;
-            let mut bytes = Bytes::new_in(scratch, "a record sealed into an origin");
-            let read = pack.file.read_at(cx, *offset, *len as usize, &mut bytes);
-            if matches!(read, Ok(_)) && bytes.len() == *len as usize {
-                each(*key, bytes.as_slice())?;
-                handed += 1;
-                continue;
-            }
-            if pack.removed(cx)? {
-                continue;
-            }
-            read?;
-            return Err(CliError::Text { what: "a pack of the machine store is shorter than its index" });
-        }
-        Ok(handed)
-    }
-}
-
-/// A pack's bytes from records sorted by key: each payload at an 8-aligned offset, the
-/// index, the footer. The layout's one statement, built whole in memory: what the tests hold
-/// the seal's and the merge's streamed packs equal to (store/chunks_tests.rs); no command
-/// path builds a pack this way.
-#[cfg(test)]
-fn pack_bytes<'b>(records: impl Iterator<Item = (Key, &'b [u8])> + Clone, count: usize) -> Result<std::vec::Vec<u8, Global>, CliError> {
-    let too_big = || CliError::Text { what: "a record past 4 GiB" };
-    // One tool (none named: the unnamed id, as a store named none seals), each kind seen.
-    let mut kinds = producers::OneTool::new();
-    for (_, bytes) in records.clone() {
-        kinds.see(producers::kind_of(bytes));
-    }
-    kinds.rank();
-    let table_len = producers::table_len(kinds.count()) as usize;
-    let payloads: usize = records.clone().map(|(_, bytes)| bytes.len().next_multiple_of(8)).sum();
-    let mut out = std::vec::Vec::with_capacity_in(payloads + table_len + count * ROW + FOOTER, Global);
-    let mut rows = std::vec::Vec::with_capacity_in(count * ROW, Global);
-    for (key, bytes) in records {
-        let at = out.len() as u64;
-        out.extend_from_slice(bytes);
-        out.resize(out.len().next_multiple_of(8), 0);
-        rows.extend_from_slice(&key.0.0);
-        rows.extend_from_slice(&at.to_le_bytes());
-        rows.extend_from_slice(&u32::try_from(bytes.len()).map_err(|_| too_big())?.to_le_bytes());
-        rows.extend_from_slice(&kinds.index(producers::kind_of(bytes)).to_le_bytes());
-        rows.extend_from_slice(&[0; 2]);
-    }
-    let Ok(()) = kinds.write::<core::convert::Infallible>(None, &mut |piece: &[u8]| {
-        out.extend_from_slice(piece);
-        Ok(())
-    });
-    let index_at = out.len() as u64;
-    let digest = payloads_digest(&out);
-    out.extend_from_slice(&rows);
-    out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&FORMAT.to_le_bytes());
-    out.extend_from_slice(&u32::try_from(count).map_err(|_| too_big())?.to_le_bytes());
-    out.extend_from_slice(&kinds.count().to_le_bytes());
-    out.extend_from_slice(&index_at.to_le_bytes());
-    out.extend_from_slice(&digest);
-    Ok(out)
-}
-
-impl Store for PackStore {
-    fn get_into(&mut self, cx: &Cx, key: Key, into: &mut Bytes) -> Result<bool, CliError> {
-        if let Some(bytes) = self.own.find(key) {
-            into.try_extend(bytes).map_err(|stopped| CliError::Remote(RemoteError::Copy(stopped)))?;
-            return Ok(true);
-        }
-        for (_, pack) in self.packs.iter_mut().filter(|(_, pack)| !pack.gone) {
-            if let Some((at, len)) = pack.find(key) {
-                let start = into.len();
-                let read = pack.file.read_at(cx, at, len as usize, into);
-                self.read += (into.len() - start) as u64;
-                if matches!(read, Ok(_)) && into.len() - start == len as usize {
-                    return Ok(true);
-                }
-                into.truncate(start);
-                // Another command's merge removed it since the open: its records are in a pack
-                // this one did not list, so this key is a miss, made again.
-                if pack.removed(cx)? {
-                    pack.gone = true;
-                    continue;
-                }
-                read?;
-                return Err(CliError::Text { what: "a pack under .blaze/v2/packs is shorter than its index" });
-            }
-        }
-        Ok(false)
-    }
-
-    fn put(&mut self, _cx: &Cx, key: Key, bytes: &[u8]) -> Result<(), CliError> {
-        // One copy of the record to where it stays; its row appended, sorted at the seal.
-        self.put_record(key, bytes)
-    }
-
-    fn seal(&mut self, cx: &Cx) -> Result<(), CliError> {
-        PackStore::seal(self, cx)
-    }
-
-    /// One pack store alone keeps every record: nothing to route.
-    fn public_crates(&mut self, _subjects: &[ContentId]) {}
-
-    fn after_answer(&mut self, cx: &Cx, _profile: &mut Profile) -> Result<(), CliError> {
-        self.seal(cx)?;
-        // Past `packs_most` packs, or past one byte in `compact::DEAD_SHARE` held twice.
-        if self.compaction()? != compact::Compact::Not {
-            self.merge(cx)?;
+    fn after_answer(&mut self, cx: &Cx, profile: &mut Profile) -> Result<(), CliError> {
+        // Facts of the run, not news: the profile's rows (and `--stats`), never plain stderr.
+        let counts = self.place.counts();
+        profile.store_open_ns = self.open_ns;
+        profile.store_named = counts.named;
+        profile.store_mapped = counts.mapped;
+        profile.store_probe_gets = counts.probes.gets;
+        profile.store_probes = counts.probes.probes;
+        profile.store_probes_most = counts.probes.most;
+        if let Some(remote) = &self.remote {
+            let r = remote.reader.report();
+            remote.err.line(
+                cx,
+                format_args!(
+                    "blaze: origin: {} keys asked, {} found, {} absent, {} not fetched; {} range reads (head {}, manifest {}, summary {}, index {}, payload {}), {} late; {} bytes fetched for {} used; {:.3} ms",
+                    r.keys,
+                    r.found,
+                    r.absent,
+                    r.unfetched,
+                    r.asks,
+                    r.head_asks,
+                    r.manifest_asks,
+                    r.summary_asks,
+                    r.page_asks,
+                    r.payload_asks,
+                    r.late,
+                    r.bytes_fetched,
+                    r.bytes_used,
+                    remote.spent_ns as f64 / 1e6,
+                ),
+            )?;
         }
         Ok(())
     }
@@ -847,9 +848,6 @@ pub enum RemoteError {
     Batch(BatchError),
     /// A fetched record could not be copied into the request's buffer.
     Copy(Stopped),
-    /// The command's own store refused a put or a seal (store/chunks.rs): not an origin's
-    /// error; it rides here until `CliError` has a variant of its own.
-    Put(chunks::PutError),
 }
 
 impl core::fmt::Display for RemoteError {
@@ -857,7 +855,6 @@ impl core::fmt::Display for RemoteError {
         match self {
             RemoteError::Batch(error) => write!(f, "the origin's read path: {error}"),
             RemoteError::Copy(stopped) => write!(f, "a record fetched from the origin: {stopped}"),
-            RemoteError::Put(error) => write!(f, "{error}"),
         }
     }
 }
@@ -992,148 +989,6 @@ impl HttpOrigin<'_> {
     }
 }
 
-/// Where a record is put (remote-read.md, "Shared across worktrees (2026-11-16)"). A get looks
-/// in every store of the chain whatever the place: the place decides only where it is written,
-/// and so who else finds it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Place {
-    /// The checkout's own store: what is about this checkout and no other (a certificate that
-    /// this request was answered over these files, its pages, a unit's sources fetched into this
-    /// checkout's folder).
-    Checkout,
-    /// The user's own store under the home ([`OWN`]): a record keyed by text alone, found by
-    /// every project and worktree of this user on this machine; never sealed into an origin.
-    Own,
-    /// The public machine store ([`SHARED`]): a record whose names are all public (target.md,
-    /// "Namespaces"); the only store an origin is sealed from.
-    Public,
-}
-
-/// Where records go (remote-read.md, "One chain of stores", "Shared across worktrees"): the
-/// one seam where the choice is made (rule 78). The command's is [`ToolchainCrates`].
-pub trait Sharing {
-    /// The crates whose records hold nothing of a project, by their `CrateScope` subjects.
-    fn add_public(&mut self, subjects: &[ContentId]);
-    /// Where `bytes`, a record about to be put, belongs.
-    fn place(&self, bytes: &[u8]) -> Place;
-}
-
-/// A drive record is [`Place::Public`] when its name and every name it reads are the
-/// `CrateScope` of a public crate (the toolchain's, a checksummed registry archive's: target.md,
-/// "Namespaces"); any other drive record is [`Place::Own`]: its key is from text alone (rules 25
-/// and 71: no path of the checkout, no stamp), so another worktree with the same text finds it.
-/// A `Fetch` record stands for the home's sources folder (fetch.rs `SOURCES`), so it is
-/// [`Place::Own`]: this machine's, never public (D78). Anything not a drive record (a
-/// certificate, a root, a page) is [`Place::Checkout`].
-pub struct ToolchainCrates {
-    /// Sorted, without repeats.
-    subjects: std::vec::Vec<ContentId, Global>,
-}
-
-impl ToolchainCrates {
-    pub fn new() -> ToolchainCrates {
-        ToolchainCrates { subjects: std::vec::Vec::new_in(Global) }
-    }
-}
-
-impl Sharing for ToolchainCrates {
-    fn add_public(&mut self, subjects: &[ContentId]) {
-        self.subjects.extend_from_slice(subjects);
-        self.subjects.sort_unstable();
-        self.subjects.dedup();
-    }
-
-    fn place(&self, bytes: &[u8]) -> Place {
-        let public = |name: Name| name.kind == Kind::CrateScope && self.subjects.binary_search(&name.subject).is_ok();
-        // A `Script` record run natively (D112's runner: the machine's tools) says so in its own
-        // bytes (scripts.rs `RanAs`, D71): never public. A record reading it is not public either,
-        // because its read names a name that is not public.
-        let native = |view: &blaze_drive::record::WholeView<'_>| {
-            view.name.kind == Kind::Script && matches!(crate::scripts::payload_parts(view.payload), Some((crate::scripts::RanAs::Native, _)))
-        };
-        let (name, all_public, ran_native) = match blaze_drive::record::open(bytes) {
-            Ok(Stored::Whole(view)) => (view.name, public(view.name) && view.reads().all(|(name, _)| public(name)), native(&view)),
-            Ok(Stored::Shape(view)) => (view.name, public(view.name) && view.names().all(public), false),
-            // Not a drive record (a certificate, a root, a page): the checkout's.
-            Err(_) => return Place::Checkout,
-        };
-        match (name.kind, all_public) {
-            // Fetched and adopted sources are this machine's (D78): never the shared namespace.
-            (Kind::Fetch, _) => Place::Own,
-            // A natively run build script's outputs are this machine's (D71): never shared.
-            (Kind::Script, _) if ran_native => Place::Own,
-            (_, true) => Place::Public,
-            (_, false) => Place::Own,
-        }
-    }
-}
-
-/// Where the machine store is this command: the home is passed in from the command's start
-/// (rule 75) and reached through the effect layer as a second tree ([`Fs::home`]), wherever
-/// it is.
-pub enum Machine {
-    /// blaze's folder in the home ([`HOME_FOLDER`]): the machine store is [`SHARED`] in it.
-    Home(Dir<ReadWrite>),
-    /// No machine store this command, and why (said once by [`Layered::open`]).
-    Off(MachineOff),
-}
-
-/// Why a command has no machine store.
-#[derive(Debug)]
-pub enum MachineOff {
-    /// The environment names no home.
-    NoHome,
-    /// The home could not be opened, bstd saying why (and naming it).
-    Home(bstd::fs::HomeError),
-}
-
-impl fmt::Display for MachineOff {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            MachineOff::NoHome => f.write_str("HOME is not set"),
-            MachineOff::Home(error) => write!(f, "{error}"),
-        }
-    }
-}
-
-impl Machine {
-    /// From `HOME` as main.rs read it (absolute): blaze's folder in it, wherever it is.
-    pub fn of(cx: &Cx, fs: &Fs, home: Option<&str>) -> Result<Machine, CliError> {
-        let Some(home) = home else { return Ok(Machine::Off(MachineOff::NoHome)) };
-        match fs.home(cx, home, &Path::new(HOME_FOLDER)?) {
-            Ok(dir) => Ok(Machine::Home(dir)),
-            Err(error) => Ok(Machine::Off(MachineOff::Home(error))),
-        }
-    }
-}
-
-/// The chain of stores a get goes down (remote-read.md, "One chain of stores"): the project's
-/// store, then the machine store, then a named origin. A key missed by both stores is asked of
-/// the origin; what comes back is checked by the read path against the signed head's chain of
-/// digests, written through to the project's store, then answered. What is not fetched (the
-/// origin unreadable, late, refused, short) is a typed miss: one line on stderr says what and
-/// why for each kind, and the request computes the record locally. That is not a fallback
-/// (remote-read.md, "Not fetched"): the local computation is the record's definition and the
-/// origin a cache of it byte for byte, so both routes give equal bytes. A put goes where
-/// [`Sharing::place`] says: the public machine store, the user's own store (every other record
-/// keyed by text, found by every worktree), or the checkout's (what is about this checkout).
-/// The machine stores hold only what this machine computed; with no home, all is the
-/// checkout's.
-pub struct Layered<'r, S: Sharing = ToolchainCrates> {
-    local: PackStore,
-    /// [`SHARED`]: public records only.
-    machine: Option<PackStore>,
-    /// [`OWN`]: this user's records of any project, opened beside `machine`.
-    own: Option<PackStore>,
-    sharing: S,
-    plant: StorePlant,
-    err: &'r Out,
-    /// Records the machine store answered and took this command.
-    machine_found: u32,
-    machine_put: u32,
-    remote: Option<Remote<'r>>,
-}
-
 struct Remote<'r> {
     named: &'r NamedOrigin,
     reader: Reader<'r>,
@@ -1144,60 +999,6 @@ struct Remote<'r> {
     spent_ns: u64,
     /// One bit for each kind of "not fetched" already said.
     said: u8,
-}
-
-impl<'r> Layered<'r, ToolchainCrates> {
-    /// The project's store under `root`, then the machine store, then `origin` when one is
-    /// named. The read path's tables live in `alloc`, the command's frame.
-    #[allow(clippy::too_many_arguments)]
-    pub fn open(cx: &Cx, root: &Dir<ReadWrite>, machine: &Machine, boot: Boot, origin: Option<&'r NamedOrigin>, clock: Clock, err: &'r Out, alloc: Alloc<'r>) -> Result<Layered<'r>, CliError> {
-        let remote = origin.map(|named| Remote {
-            named,
-            reader: Reader::new_in(Namespace::PUBLIC, &named.check, Limits::DEFAULT, alloc),
-            clock,
-            err,
-            alloc,
-            spent_ns: 0,
-            said: 0,
-        });
-        let home = match machine {
-            Machine::Home(home) => Some(home),
-            Machine::Off(why) => {
-                err.line(cx, format_args!("blaze: machine store off: {why}; every record is kept in the project's store, found by no other worktree"))?;
-                None
-            }
-        };
-        Layered::open_chain(cx, root, home, boot, ToolchainCrates::new(), PACKS_MOST, StorePlant::None, err, remote)
-    }
-}
-
-impl<'r, S: Sharing> Layered<'r, S> {
-    #[allow(clippy::too_many_arguments)]
-    fn open_chain(cx: &Cx, root: &Dir<ReadWrite>, home: Option<&Dir<ReadWrite>>, boot: Boot, sharing: S, packs_most: usize, plant: StorePlant, err: &'r Out, remote: Option<Remote<'r>>) -> Result<Layered<'r, S>, CliError> {
-        // A planted bug is the machine store's (the project's has its own tests above).
-        let local = PackStore::open_in(cx, root, PACKS, boot, packs_most, StorePlant::None)?;
-        if local.refused > 0 {
-            err.line(cx, format_args!("blaze: {} torn pack(s) under {PACKS} (a crash while one was written?): removed; their records are made again", local.refused))?;
-        }
-        if let Some((count, bytes)) = local.old_note() {
-            err.line(cx, format_args!("blaze: {count} packs of an older store format ({bytes} bytes) are not read by this blaze, under {PACKS}"))?;
-        }
-        let mut machines = [None, None];
-        if let Some(home) = home {
-            for (at, folder) in [SHARED, OWN].into_iter().enumerate() {
-                let store = PackStore::open_in(cx, home, folder, boot, packs_most, plant)?;
-                if store.refused > 0 {
-                    err.line(cx, format_args!("blaze: {} torn pack(s) under the home's {folder} (a crash while one was written?): removed; their records are made again", store.refused))?;
-                }
-                if let Some((count, bytes)) = store.old_note() {
-                    err.line(cx, format_args!("blaze: {count} packs of an older store format ({bytes} bytes) are not read by this blaze, under the home's {folder}"))?;
-                }
-                machines[at] = Some(store);
-            }
-        }
-        let [machine, own] = machines;
-        Ok(Layered { local, machine, own, sharing, plant, err, machine_found: 0, machine_put: 0, remote })
-    }
 }
 
 impl Remote<'_> {
@@ -1230,133 +1031,6 @@ impl Remote<'_> {
     }
 }
 
-impl<S: Sharing> Store for Layered<'_, S> {
-    fn public_crates(&mut self, subjects: &[ContentId]) {
-        self.sharing.add_public(subjects);
-    }
-
-    fn get_into(&mut self, cx: &Cx, key: Key, into: &mut Bytes) -> Result<bool, CliError> {
-        if self.local.get_into(cx, key, into)? {
-            return Ok(true);
-        }
-        for store in [&mut self.machine, &mut self.own].into_iter().flatten() {
-            if store.get_into(cx, key, into)? {
-                self.machine_found += 1;
-                return Ok(true);
-            }
-        }
-        let Some(remote) = &mut self.remote else { return Ok(false) };
-        let began = remote.now_ns();
-        let clock = remote.clock.clone();
-        let mut now = || u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX);
-        // A batch of one key: the request asks one record at a time (blaze-drive's `Get`).
-        // `BatchError` is only a batch past `keys_most` or one begun mid-batch: neither can be.
-        let fetched = match &remote.named.at {
-            OriginAt::Folder(folder) => fetch(&mut remote.reader, &mut FolderOrigin { cx, folder }, &mut now, core::slice::from_ref(&key.0), remote.alloc),
-            OriginAt::Http(at) => fetch(&mut remote.reader, &mut HttpOrigin::new(cx, at, &clock), &mut now, core::slice::from_ref(&key.0), remote.alloc),
-        };
-        fetched.map_err(|error| CliError::Remote(RemoteError::Batch(error)))?;
-        let answer = remote.reader.answer(0);
-        let found = match answer {
-            Answer::Found { .. } => {
-                let bytes = remote.reader.found(0).unwrap_or(&[]);
-                // Written through before it is answered: the next command finds it here.
-                self.local.put(cx, key, bytes)?;
-                into.try_extend(bytes).map_err(|stopped| CliError::Remote(RemoteError::Copy(stopped)))?;
-                true
-            }
-            Answer::Absent | Answer::Pending => false,
-            Answer::Unfetched(why) => {
-                remote.say(cx, key, &why)?;
-                false
-            }
-        };
-        remote.spent_ns += remote.now_ns().saturating_sub(began);
-        Ok(found)
-    }
-
-    fn put(&mut self, cx: &Cx, key: Key, bytes: &[u8]) -> Result<(), CliError> {
-        // A key any layer this command reads already holds is not written again (rule 21: one
-        // value a key; rule 77: work once), in whichever layer it is: the get finds it there.
-        // A command that changed nothing so puts nothing and seals no pack.
-        if self.local.held(key) || [&self.machine, &self.own].into_iter().flatten().any(|store| store.held(key)) {
-            return Ok(());
-        }
-        let place = match (self.plant, self.sharing.place(bytes)) {
-            (StorePlant::PrivateIntoMachine, _) => Place::Public,
-            (StorePlant::CheckoutIntoOwn, Place::Checkout) => Place::Own,
-            (_, place) => place,
-        };
-        let store = match place {
-            Place::Public => self.machine.as_mut(),
-            Place::Own => self.own.as_mut(),
-            Place::Checkout => None,
-        };
-        match store {
-            Some(store) => {
-                // A key already held is not written (rule 21): the profile counts only new ones.
-                if !store.held(key) {
-                    self.machine_put += 1;
-                }
-                store.put(cx, key, bytes)
-            }
-            // No home: every record is the checkout's.
-            None => self.local.put(cx, key, bytes),
-        }
-    }
-
-    /// Every store before anything names their records: the answer's pointer names checkout
-    /// records whose reads may be the machine stores'.
-    fn seal(&mut self, cx: &Cx) -> Result<(), CliError> {
-        for store in [&mut self.machine, &mut self.own].into_iter().flatten() {
-            store.seal(cx)?;
-        }
-        self.local.seal(cx)
-    }
-
-    fn after_answer(&mut self, cx: &Cx, profile: &mut Profile) -> Result<(), CliError> {
-        self.local.after_answer(cx, profile)?;
-        if self.machine.is_some() || self.own.is_some() {
-            let (mut packs, mut read_whole) = (0usize, 0u32);
-            for store in [&mut self.machine, &mut self.own].into_iter().flatten() {
-                store.after_answer(cx, profile)?;
-                packs += store.packs.len();
-                read_whole = read_whole.saturating_add(store.verified);
-            }
-            // Facts of the run, not news: the profile's rows (and `--stats`), never plain stderr.
-            // Both machine stores together: found and written in either.
-            profile.machine_found = self.machine_found;
-            profile.machine_put = self.machine_put;
-            profile.machine_packs = u32::try_from(packs).unwrap_or(u32::MAX);
-            profile.machine_read_whole = read_whole;
-        }
-        if let Some(remote) = &self.remote {
-            let r = remote.reader.report();
-            remote.err.line(
-                cx,
-                format_args!(
-                    "blaze: origin: {} keys asked, {} found, {} absent, {} not fetched; {} range reads (head {}, manifest {}, summary {}, index {}, payload {}), {} late; {} bytes fetched for {} used; {:.3} ms",
-                    r.keys,
-                    r.found,
-                    r.absent,
-                    r.unfetched,
-                    r.asks,
-                    r.head_asks,
-                    r.manifest_asks,
-                    r.summary_asks,
-                    r.page_asks,
-                    r.payload_asks,
-                    r.late,
-                    r.bytes_fetched,
-                    r.bytes_used,
-                    remote.spent_ns as f64 / 1e6,
-                ),
-            )?;
-        }
-        Ok(())
-    }
-}
-
 /// The http origin's proof: the folder's records byte-equal over HTTP, a liar refused.
 #[cfg(test)]
 #[path = "store_http_tests.rs"]
@@ -1367,526 +1041,18 @@ mod http_tests;
 #[path = "store_worktree_tests.rs"]
 mod worktree_tests;
 
-/// The pack store's proof (rule 43): simulations, never review. Each record's bytes are a
-/// function of its key, so any bytes a get returns are checked without a model. A witness
-/// file, written unsynced after each seal with the boot it was written in, names the keys
-/// sealed: within one boot (no power lost) none of them may be lost; after a power cut any may.
+/// The old home's report and the no-home refusal, on bstd's simulated world.
 #[cfg(test)]
-mod tests {
-    use blaze_sim::{Broke, Config, Tape, check as sim_check};
-    use bstd::io::{Io, Limits, SimWorld};
-    use bstd::mem::TASK_FRAME;
-    use bstd::test::{BUDGET, Given, Seeds, seeded};
+#[path = "store/old_home_tests.rs"]
+mod old_home_tests;
 
-    use super::*;
+/// The nonce: equal under one simulation seed, different under two, and different for two opens
+/// of one process (control: a constant).
+#[cfg(test)]
+#[path = "store/nonce_tests.rs"]
+mod nonce_tests;
 
-    /// The keys a test draws from.
-    const KEYS: u32 = 40;
-    const WITNESS: &str = "witness";
-
-    /// The simulated machine's boot: a new one at every power cut, as the kernel's.
-    fn boot_of(io: &Io) -> Boot {
-        let cuts = io.with_sim(|sim| sim.counts().cuts).unwrap_or(0);
-        let mut boot = [0u8; 16];
-        boot[..8].copy_from_slice(&cuts.to_le_bytes());
-        boot[8] = 1;
-        Boot::Known(boot)
-    }
-
-    fn boot_bytes(boot: Boot) -> [u8; 16] {
-        match boot {
-            Boot::Known(bytes) => bytes,
-            Boot::Unknown => [0; 16],
-        }
-    }
-
-    fn key(k: u32) -> Key {
-        Key(blaze_ids::ContentId::of("blaze-cli store test", &k.to_le_bytes()))
-    }
-
-    /// Key `k`'s one value (rule 21): its length and bytes from `k`, some empty, some past a
-    /// sector.
-    fn payload(k: u32) -> std::vec::Vec<u8> {
-        let len = (k as usize * 131) % 700;
-        (0..len).map(|i| (k as usize * 7 + i * 13) as u8).collect()
-    }
-
-    /// Every key: a get is the key's value or a miss, never other bytes; each in `witnessed`
-    /// is held. A finding panics: it fails the seed (an error would be a restart).
-    fn oracle(cx: &Cx, store: &mut impl Store, witnessed: &[u32]) -> Result<std::vec::Vec<u32>, CliError> {
-        let frame = cx.frame();
-        let mut held = std::vec::Vec::new();
-        for k in 0..KEYS {
-            let mut into = Bytes::new_in(frame, "a record read back");
-            if store.get_into(cx, key(k), &mut into)? {
-                assert!(into.as_slice() == payload(k).as_slice(), "store oracle: key {k} read back as other bytes ({} for {})", into.len(), payload(k).len());
-                held.push(k);
-            } else {
-                assert!(!witnessed.contains(&k), "store oracle: key {k}, which a witness stands on, is lost");
-            }
-        }
-        Ok(held)
-    }
-
-    /// The keys the witness names, when it was written in `boot`; none from another boot.
-    fn read_witness(cx: &Cx, root: &Dir<ReadWrite>, boot: Boot) -> Result<std::vec::Vec<u32>, CliError> {
-        let mut bytes = Bytes::new_in(cx.frame(), "the witness");
-        match root.read_all(cx, &Path::new(WITNESS)?, &mut bytes) {
-            Ok(_) => {}
-            Err(error) if error.kind == FsKind::NotFound => return Ok(std::vec::Vec::new()),
-            Err(error) => return Err(error.into()),
-        }
-        let bytes = bytes.as_slice();
-        if bytes.len() < 16 || bytes[..16] != boot_bytes(boot) {
-            return Ok(std::vec::Vec::new());
-        }
-        Ok(bytes[16..].chunks_exact(4).map(le_u32).collect())
-    }
-
-    /// One start of the program the runner cuts and restarts, as a command is: the oracle on
-    /// what the home holds, then rounds of puts, a seal, the witness (unsynced, as `last`)
-    /// and a merge past two packs.
-    fn program(cx: &Cx, io: &Io, plant: StorePlant) -> Result<(), CliError> {
-        let root = io.need_fs().map_err(CliError::Missing)?.root();
-        let boot = boot_of(io);
-        let witnessed = read_witness(cx, &root, boot)?;
-        let mut store = PackStore::open_with(cx, &root, boot, 2, plant)?;
-        oracle(cx, &mut store, &witnessed)?;
-        for round in 0..8u32 {
-            for k in round * 4..(round * 4 + 7).min(KEYS) {
-                store.put(cx, key(k), &payload(k))?;
-            }
-            store.seal(cx)?;
-            let held = oracle(cx, &mut store, &witnessed)?;
-            let mut witness = std::vec::Vec::from(boot_bytes(boot));
-            witness.extend(held.iter().flat_map(|k| k.to_le_bytes()));
-            root.publish(cx, &Path::new(WITNESS)?, Content::bytes(&witness), Durable::No)?;
-            let mut profile = Profile::default();
-            store.after_answer(cx, &mut profile)?;
-            let witnessed = read_witness(cx, &root, boot)?;
-            oracle(cx, &mut store, &witnessed)?;
-        }
-        Ok(())
-    }
-
-    fn crashes(count: u32, plant: StorePlant) -> Result<bstd::test::Passed, bstd::test::Failed> {
-        seeded("blaze-cli", module_path!(), "pack_store_crashes", Seeds::DEFAULT.from(0, count), Given::NOTHING, |cx: &Cx, io: Io| {
-            program(cx, &io, plant)
-        })
-    }
-
-    /// (1) and (2): power cut at effects drawn by each seed (several a seed, the program
-    /// started again after each, in a new boot), I/O failures injected, delays, nothing synced:
-    /// no get returns bytes other than its record's, none a witness of this boot names is
-    /// lost, and the healed last start answers.
-    #[test]
-    fn a_crash_or_failure_anywhere_keeps_each_record_whole_or_absent() {
-        match crashes(1000, StorePlant::None) {
-            Ok(passed) => {
-                // Proof the faults ran (rule 61).
-                assert!(passed.counts.cuts > 500, "too few power cuts: {:?}", passed.counts);
-                assert!(passed.counts.failures > 500, "too few failures: {:?}", passed.counts);
-            }
-            Err(failed) => panic!("{failed}"),
-        }
-    }
-
-    fn caught(plant: StorePlant, says: &str) {
-        match crashes(1000, plant) {
-            Ok(passed) => panic!("the planted {plant:?} was not caught in {} starts", passed.starts),
-            Err(failed) => {
-                let said = std::format!("{failed}");
-                assert!(said.contains(says), "the planted {plant:?} failed otherwise: {said}");
-            }
-        }
-    }
-
-    #[test]
-    fn the_oracle_catches_a_merge_that_removes_first() {
-        caught(StorePlant::MergeRemovesFirst, "is lost");
-    }
-
-    /// The seal's order (store/chunks.rs `seal_records`): a failure between the planted first
-    /// publish (index and footer over a hole, vouched for in the boot record) and the payloads
-    /// restarts the command in the same boot, which trusts the pack and reads zeros.
-    /// Expected: passes, `caught` having seen "store oracle" (a key read back as other bytes).
-    #[test]
-    fn the_oracle_catches_an_index_published_before_its_payloads() {
-        caught(StorePlant::IndexBeforePayloads, "store oracle");
-    }
-
-    // The two below need a power cut that keeps an unsynced rename and leaves the pack's
-    // footer whole over wrong payloads: the disk model tears each unsynced sector on its own
-    // (blaze-core `world::disk::Torn::Sectors`, 2026-11-16), so a pack's end may survive while
-    // its middle is a hole of zeros.
-    #[test]
-    fn the_oracle_catches_a_skipped_verification_after_a_power_cut() {
-        caught(StorePlant::VerifySkipped, "store oracle");
-    }
-
-    #[test]
-    fn the_oracle_catches_a_pack_vouching_for_itself_after_a_power_cut() {
-        caught(StorePlant::SelfVouching, "store oracle");
-    }
-
-    /// The chain's test sharing: a record's place is a function of its length, so of its key,
-    /// so the oracle knows which store each belongs in.
-    struct EvenLengths;
-
-    /// Public when even; the user's own when one past a multiple of four; the checkout's when
-    /// three past.
-    fn place_of(len: usize) -> Place {
-        match len % 4 {
-            0 | 2 => Place::Public,
-            1 => Place::Own,
-            _ => Place::Checkout,
-        }
-    }
-
-    impl Sharing for EvenLengths {
-        fn add_public(&mut self, _subjects: &[ContentId]) {}
-
-        fn place(&self, bytes: &[u8]) -> Place {
-            place_of(bytes.len())
-        }
-    }
-
-    /// The user's home, absolute, outside the project's folder.
-    const HOME: &str = "/home/sim";
-    /// The project's folder, beneath the simulation's root.
-    const PROJECT: &str = "work/project";
-
-    /// A home with a file where blaze's folder should be: no machine store, and the one line
-    /// [`Layered::open`] says names the home.
-    #[test]
-    fn a_home_that_cannot_be_made_turns_the_machine_store_off_by_name() {
-        let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
-        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
-        let fs = io.need_fs().expect("fs");
-        fs.root().publish(&cx, &Path::new("home/sim/.blaze").expect("a path"), Content::bytes(b"in the way"), Durable::No).expect("a file in the way");
-        match Machine::of(&cx, &fs, Some(HOME)).expect("no harness error") {
-            Machine::Home(_) => panic!("a file at the home's folder was taken as the folder"),
-            Machine::Off(why) => {
-                let said = std::format!("{why}");
-                assert!(said.contains(HOME) && said.contains("directory"), "the line names the home: {said}");
-            }
-        }
-    }
-
-    /// The machine stores as another command finds them: no record of a project in the public
-    /// one, no record about a checkout in the user's own.
-    fn machine_alone(cx: &Cx, home: &Dir<ReadWrite>, boot: Boot, plant: StorePlant) -> Result<(), CliError> {
-        let mut machine = PackStore::open_in(cx, home, SHARED, boot, 2, plant)?;
-        let mut own = PackStore::open_in(cx, home, OWN, boot, 2, plant)?;
-        for k in 0..KEYS {
-            let mut into = Bytes::new_in(cx.frame(), "a machine record read back");
-            if machine.get_into(cx, key(k), &mut into)? {
-                assert!(place_of(payload(k).len()) == Place::Public, "machine oracle: key {k}, a project's record, is in the machine store");
-            }
-            let mut into = Bytes::new_in(cx.frame(), "an own record read back");
-            if own.get_into(cx, key(k), &mut into)? {
-                assert!(place_of(payload(k).len()) == Place::Own, "own oracle: key {k}, placed {:?}, is in the user's own store", place_of(payload(k).len()));
-            }
-        }
-        Ok(())
-    }
-
-    /// One start of a command whose chain is the project's store and the machine store under
-    /// `home` (remote-read.md, "One chain of stores"): every get through the chain is its
-    /// record or a miss and none a witness names is lost, and the machine store holds no
-    /// project record, before and after rounds of puts, seals and merges.
-    fn chained(cx: &Cx, io: &Io, plant: StorePlant) -> Result<(), CliError> {
-        // The project's folder and the home apart, as on a real machine: the home reached
-        // only as `Machine::of` reaches it, from its absolute path.
-        let fs = io.need_fs().map_err(CliError::Missing)?;
-        let root = fs.root().subdir(&Path::new(PROJECT)?);
-        let home = match Machine::of(cx, &fs, Some(HOME))? {
-            Machine::Home(home) => home,
-            // A failure the simulation injected into the home's open ends this start as any
-            // failed effect does (a real command goes on with the store off and says so).
-            Machine::Off(MachineOff::Home(bstd::fs::HomeError { why: bstd::fs::HomeWhy::Fs(error), .. })) => return Err(error.into()),
-            Machine::Off(why) => panic!("the simulation's home was refused: {why}"),
-        };
-        let err = io.need_err().map_err(CliError::Missing)?;
-        let boot = boot_of(io);
-        let witnessed = read_witness(cx, &root, boot)?;
-        machine_alone(cx, &home, boot, plant)?;
-        let mut store = Layered::open_chain(cx, &root, Some(&home), boot, EvenLengths, 2, plant, &err, None)?;
-        oracle(cx, &mut store, &witnessed)?;
-        for round in 0..8u32 {
-            for k in round * 4..(round * 4 + 7).min(KEYS) {
-                store.put(cx, key(k), &payload(k))?;
-            }
-            store.seal(cx)?;
-            let held = oracle(cx, &mut store, &witnessed)?;
-            let mut witness = std::vec::Vec::from(boot_bytes(boot));
-            witness.extend(held.iter().flat_map(|k| k.to_le_bytes()));
-            root.publish(cx, &Path::new(WITNESS)?, Content::bytes(&witness), Durable::No)?;
-            let mut profile = Profile::default();
-            store.after_answer(cx, &mut profile)?;
-            let witnessed = read_witness(cx, &root, boot)?;
-            oracle(cx, &mut store, &witnessed)?;
-        }
-        drop(store);
-        machine_alone(cx, &home, boot, plant)
-    }
-
-    fn chain_crashes(count: u32, plant: StorePlant) -> Result<bstd::test::Passed, bstd::test::Failed> {
-        seeded("blaze-cli", module_path!(), "pack_store_chain", Seeds::DEFAULT.from(0, count), Given::NOTHING, |cx: &Cx, io: Io| {
-            chained(cx, &io, plant)
-        })
-    }
-
-    /// Power cuts, failures and delays anywhere in a chain of two pack stores: each record
-    /// whole or absent through the chain, none a witness of this boot names lost, and the
-    /// machine store holding only what is public.
-    #[test]
-    fn a_crash_anywhere_in_the_chain_keeps_records_whole_and_the_machine_store_public() {
-        match chain_crashes(1000, StorePlant::None) {
-            Ok(passed) => {
-                // Proof the faults ran (rule 61).
-                assert!(passed.counts.cuts > 500, "too few power cuts: {:?}", passed.counts);
-                assert!(passed.counts.failures > 500, "too few failures: {:?}", passed.counts);
-            }
-            Err(failed) => panic!("{failed}"),
-        }
-    }
-
-    fn chain_caught(plant: StorePlant, says: &str) {
-        match chain_crashes(1000, plant) {
-            Ok(passed) => panic!("the planted {plant:?} was not caught in {} starts", passed.starts),
-            Err(failed) => {
-                let said = std::format!("{failed}");
-                assert!(said.contains(says), "the planted {plant:?} failed otherwise: {said}");
-            }
-        }
-    }
-
-    #[test]
-    fn the_chain_oracle_catches_a_project_record_in_the_machine_store() {
-        chain_caught(StorePlant::PrivateIntoMachine, "machine oracle");
-    }
-
-    /// A certificate in the user's own store would answer another checkout from this one's
-    /// leaf table: the own store's oracle must see it.
-    #[test]
-    fn the_chain_oracle_catches_a_checkout_record_in_the_own_store() {
-        chain_caught(StorePlant::CheckoutIntoOwn, "own oracle");
-    }
-
-    /// The machine store's packs are published unsynced like the project's: taking one from
-    /// an earlier boot without its once-a-boot read hands back torn bytes.
-    #[test]
-    fn the_chain_oracle_catches_a_machine_pack_taken_unverified() {
-        chain_caught(StorePlant::VerifySkipped, "store oracle");
-    }
-
-    fn sim(tape: &Tape) -> Result<(Io, Cx), Broke> {
-        let io = Io::simulated(SimWorld::new(tape.below(1 << 30, "seed") as u64, Limits::USUAL));
-        let cx = io.cx(BUDGET, TASK_FRAME).map_err(|e| Broke::Harness(std::format!("{e}")))?;
-        Ok((io, cx))
-    }
-
-    fn harness(what: &'static str) -> impl Fn(CliError) -> Broke {
-        move |error| Broke::Harness(std::format!("{what}: {error}"))
-    }
-
-    /// The open's checks in the boot after the one that sealed: a pack cut to any length, or
-    /// with any bit of its payloads or footer changed (what a power cut leaves of an unsynced
-    /// write), is refused, removed and said; nothing is read from it; the other packs stand.
-    fn torn(tape: &Tape, plant: StorePlant) -> Result<(), Broke> {
-        let (io, cx) = sim(tape)?;
-        let root = io.need_fs().map_err(|e| Broke::Harness(std::format!("{e}")))?.root();
-        let sealed_in = Boot::Known([1; 16]);
-        let mut store = PackStore::open_with(&cx, &root, sealed_in, PACKS_MOST, plant).map_err(harness("open"))?;
-        for k in 0..KEYS / 2 {
-            store.put(&cx, key(k), &payload(k)).map_err(harness("put"))?;
-        }
-        store.seal(&cx).map_err(harness("seal"))?;
-        for k in KEYS / 2..KEYS {
-            store.put(&cx, key(k), &payload(k)).map_err(harness("put"))?;
-        }
-        store.seal(&cx).map_err(harness("seal"))?;
-        let victim = store.packs[tape.below(2, "which pack") as usize].0;
-        let leaf = pack_name(victim).map_err(harness("name"))?;
-        let name = Path::new(&std::format!("{PACKS}/{}", leaf.as_str())).map_err(|e| Broke::Harness(std::format!("{e}")))?;
-        let mut bytes = Bytes::new_in(cx.frame(), "the pack");
-        root.read_all(&cx, &name, &mut bytes).map_err(|e| Broke::Harness(std::format!("{e}")))?;
-        let mut bytes = bytes.as_slice().to_vec();
-        let index_at = le_u64(&bytes[bytes.len() - FOOTER + 16..]) as usize;
-        match tape.below(3, "how torn") {
-            0 => bytes.truncate(tape.below(bytes.len() as u64, "cut at") as usize),
-            1 => {
-                let at = bytes.len() - FOOTER + tape.below(FOOTER as u64, "footer byte") as usize;
-                bytes[at] ^= 1 << tape.below(8, "bit");
-            }
-            _ if index_at > 0 => {
-                let at = tape.below(index_at as u64, "payload byte") as usize;
-                bytes[at] ^= 1 << tape.below(8, "bit");
-            }
-            _ => bytes.truncate(0),
-        }
-        root.publish(&cx, &name, Content::bytes(&bytes), Durable::No).map_err(|e| Broke::Harness(std::format!("{e}")))?;
-        drop(store);
-        let mut store = match PackStore::open_with(&cx, &root, Boot::Known([2; 16]), PACKS_MOST, plant) {
-            Ok(store) => store,
-            Err(error) => return Err(Broke::Oracle(std::format!("store oracle: a torn pack refused the open: {error}"))),
-        };
-        let frame = cx.frame();
-        let mut held = 0;
-        for k in 0..KEYS {
-            let mut into = Bytes::new_in(frame, "a record read back");
-            match store.get_into(&cx, key(k), &mut into) {
-                Ok(true) if into.as_slice() == payload(k).as_slice() => held += 1,
-                Ok(true) => return Err(Broke::Oracle(std::format!("store oracle: key {k} read back as other bytes"))),
-                Ok(false) => {}
-                Err(error) => return Err(Broke::Oracle(std::format!("store oracle: a get after a torn pack failed: {error}"))),
-            }
-        }
-        if store.refused != 1 || held != KEYS / 2 {
-            return Err(Broke::Oracle(std::format!("store oracle: {} refused, {held} held: one pack refused and the other whole", store.refused)));
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn a_torn_pack_is_refused_and_the_rest_stands() {
-        sim_check(Config::cases(500), |tape| torn(tape, StorePlant::None));
-    }
-
-    #[test]
-    fn the_torn_oracle_catches_a_skipped_verification() {
-        blaze_sim::control(Config::cases(2000), StorePlant::None, StorePlant::VerifySkipped, "store oracle", torn);
-    }
-
-    #[test]
-    fn the_torn_oracle_catches_a_pack_vouching_for_itself() {
-        blaze_sim::control(Config::cases(2000), StorePlant::None, StorePlant::SelfVouching, "store oracle", torn);
-    }
-
-    /// A pack sealed in this boot is taken without a read of its payloads; one from another
-    /// boot is read once and then named in the boot record, so the next open reads none.
-    #[test]
-    fn a_pack_is_read_whole_once_a_boot() {
-        sim_check(Config::cases(50), |tape| {
-            let (io, cx) = sim(tape)?;
-            let root = io.need_fs().map_err(|e| Broke::Harness(std::format!("{e}")))?.root();
-            let (one, two) = (Boot::Known([1; 16]), Boot::Known([2; 16]));
-            let mut store = PackStore::open_with(&cx, &root, one, PACKS_MOST, StorePlant::None).map_err(harness("open"))?;
-            for k in 0..KEYS {
-                store.put(&cx, key(k), &payload(k)).map_err(harness("put"))?;
-            }
-            store.seal(&cx).map_err(harness("seal"))?;
-            let counts = |boot| PackStore::open_with(&cx, &root, boot, PACKS_MOST, StorePlant::None).map(|store| (store.verified, store.packs.len())).map_err(harness("open again"));
-            let seen = [counts(one)?, counts(two)?, counts(two)?, counts(Boot::Unknown)?];
-            if seen != [(0, 1), (1, 1), (0, 1), (1, 1)] {
-                return Err(Broke::Oracle(std::format!("store oracle: (verified, packs) at the opens {seen:?}")));
-            }
-            Ok(())
-        });
-    }
-
-    /// (3) Two commands on one home, their steps interleaved: puts, seals, gets, merges and
-    /// opens again, each drawn. Every get is the key's value or a miss; a fresh open at the end
-    /// holds every key either sealed.
-    fn two(tape: &Tape, plant: StorePlant) -> Result<(), Broke> {
-        let (io, cx) = sim(tape)?;
-        let root = io.need_fs().map_err(|e| Broke::Harness(std::format!("{e}")))?.root();
-        let open = || PackStore::open_with(&cx, &root, Boot::Known([1; 16]), 2, plant).map_err(harness("open"));
-        let mut stores = [open()?, open()?];
-        let mut sealed = [false; KEYS as usize];
-        let mut put = [std::vec::Vec::new(), std::vec::Vec::new()];
-        let frame = cx.frame();
-        for _ in 0..tape.below(60, "steps") {
-            let who = tape.below(2, "which command") as usize;
-            let store = &mut stores[who];
-            match tape.below(5, "step") {
-                0 => {
-                    let k = tape.below(KEYS as u64, "key") as u32;
-                    store.put(&cx, key(k), &payload(k)).map_err(harness("put"))?;
-                    put[who].push(k);
-                }
-                1 => {
-                    store.seal(&cx).map_err(harness("seal"))?;
-                    for k in put[who].drain(..) {
-                        sealed[k as usize] = true;
-                    }
-                }
-                2 => {
-                    let k = tape.below(KEYS as u64, "key") as u32;
-                    let mut into = Bytes::new_in(frame, "a record read back");
-                    let got = store.get_into(&cx, key(k), &mut into).map_err(|e| Broke::Oracle(std::format!("store oracle: a get beside another command failed: {e}")))?;
-                    if got && into.as_slice() != payload(k).as_slice() {
-                        return Err(Broke::Oracle(std::format!("store oracle: key {k} read back as other bytes")));
-                    }
-                }
-                3 => {
-                    store.seal(&cx).map_err(harness("seal"))?;
-                    for k in put[who].drain(..) {
-                        sealed[k as usize] = true;
-                    }
-                    if store.packs.len() > 1 {
-                        store.merge(&cx).map_err(|e| Broke::Oracle(std::format!("store oracle: a merge beside another command failed: {e}")))?;
-                    }
-                }
-                _ => {
-                    put[who].clear();
-                    *store = open()?;
-                }
-            }
-        }
-        let mut fresh = open()?;
-        for k in 0..KEYS {
-            let mut into = Bytes::new_in(frame, "a record read back");
-            let got = fresh.get_into(&cx, key(k), &mut into).map_err(harness("get"))?;
-            if got && into.as_slice() != payload(k).as_slice() {
-                return Err(Broke::Oracle(std::format!("store oracle: key {k} read back as other bytes")));
-            }
-            if sealed[k as usize] && !got {
-                return Err(Broke::Oracle(std::format!("store oracle: key {k}, sealed by one command, lost beside the other")));
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn two_commands_on_one_home_lose_nothing() {
-        sim_check(Config::cases(1000), |tape| two(tape, StorePlant::None));
-    }
-
-    /// (2) A full disk at the seal: a typed failure; the home still opens, holds every record
-    /// sealed before, and none other.
-    #[test]
-    fn a_full_disk_at_the_seal_fails_by_name_and_keeps_the_home() {
-        sim_check(Config::cases(200), |tape| {
-            let (io, cx) = sim(tape)?;
-            let root = io.need_fs().map_err(|e| Broke::Harness(std::format!("{e}")))?.root();
-            let mut store = PackStore::open_with(&cx, &root, Boot::Known([1; 16]), PACKS_MOST, StorePlant::None).map_err(harness("open"))?;
-            for k in 0..KEYS / 2 {
-                store.put(&cx, key(k), &payload(k)).map_err(harness("put"))?;
-            }
-            store.seal(&cx).map_err(harness("seal"))?;
-            for k in KEYS / 2..KEYS {
-                store.put(&cx, key(k), &payload(k)).map_err(harness("put"))?;
-            }
-            let packs = blaze_core::FileName::new(PACKS).ok_or(Broke::Harness(std::string::String::from("the packs' folder as a name")))?;
-            let room = tape.below(4096, "room");
-            io.with_sim(|sim| sim.fill(packs, room));
-            match store.seal(&cx) {
-                Err(CliError::Fs(error)) if matches!(error.kind, FsKind::Driver(..)) || std::format!("{error}").contains("space") => {}
-                Err(other) => return Err(Broke::Oracle(std::format!("store oracle: a full disk failed the seal as {other}"))),
-                Ok(()) => return Err(Broke::Oracle(std::string::String::from("store oracle: a seal past a full disk succeeded"))),
-            }
-            let mut store = PackStore::open_with(&cx, &root, Boot::Known([1; 16]), PACKS_MOST, StorePlant::None).map_err(harness("open after"))?;
-            let frame = cx.frame();
-            for k in 0..KEYS {
-                let mut into = Bytes::new_in(frame, "a record read back");
-                let got = store.get_into(&cx, key(k), &mut into).map_err(harness("get"))?;
-                if got != (k < KEYS / 2) || (got && into.as_slice() != payload(k).as_slice()) {
-                    return Err(Broke::Oracle(std::format!("store oracle: key {k} after a full disk: held {got}")));
-                }
-            }
-            Ok(())
-        });
-    }
-}
+/// A natively run build script's record and its reader stay `LOCAL` (D115; the scripts lane's).
+#[cfg(test)]
+#[path = "store/sharing_tests.rs"]
+mod sharing_tests;

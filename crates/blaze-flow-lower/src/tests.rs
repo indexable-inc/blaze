@@ -22,7 +22,7 @@ struct Plain;
 
 impl Facts for Plain {
     fn adt(&self, _: ItemKey) -> Option<AdtFacts> {
-        Some(AdtFacts { copy: false, drop_impl: false, needs_drop: true, lifetimes: false, union: false, is_enum: false, is_box: false })
+        Some(AdtFacts { copy: false, drop_impl: false, needs_drop: true, lifetimes: 0, union: false, is_enum: false, is_box: false })
     }
     fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
         Some(CalleeFacts { writes_lifetimes: false, self_ref: false })
@@ -56,7 +56,7 @@ impl Sigs {
     /// Reads `text` as the signature of `item`, whose erased types are `inputs` and `output`.
     fn add(&mut self, fx: &Fx, item: ItemKey, text: &str, inputs: &[PTy], output: PTy) {
         let mut buf = SigBuf::new_in(Alloc::global());
-        match read_signature(text, fx.t.view(), inputs, output, &|_| Some(false), &mut buf, Alloc::global()) {
+        match read_signature(text, fx.t.view(), inputs, output, &|_| Some(0), &mut buf, Alloc::global()) {
             Ok(()) => self.sigs.push((item, buf)),
             Err(why) => panic!("`{text}` was not read: {why:?}"),
         }
@@ -260,7 +260,7 @@ fn sig_base() -> (Fx, PTy, PTy) {
 
 fn read(fx: &Fx, text: &str, inputs: &[PTy], output: PTy) -> Result<(vec::Vec<Region>, vec::Vec<u32>, vec::Vec<(Region, Region)>), SigRefusal> {
     let mut buf = SigBuf::new_in(Alloc::global());
-    read_signature(text, fx.t.view(), inputs, output, &|_| Some(false), &mut buf, Alloc::global())?;
+    read_signature(text, fx.t.view(), inputs, output, &|_| Some(0), &mut buf, Alloc::global())?;
     Ok((buf.regions.iter().copied().collect(), buf.ends.iter().copied().collect(), buf.bounds.iter().copied().collect()))
 }
 
@@ -653,7 +653,7 @@ fn callable_parameter_types_are_read() {
     fx.finish();
     let read = |text: &str, inputs: &[PTy], output: PTy| -> Result<(vec::Vec<Region>, vec::Vec<u32>), CallableRefusal> {
         let mut buf = SigBuf::new_in(Alloc::global());
-        read_callable_param(text, fx.t.view(), 0, inputs, output, &|_| Some(false), &mut buf, Alloc::global())?;
+        read_callable_param(text, fx.t.view(), 0, inputs, output, &|_| Some(0), &mut buf, Alloc::global())?;
         Ok((buf.regions.iter().copied().collect(), buf.ends.iter().copied().collect()))
     };
     let got = read("fn a(f: fn(&'static S), s: S) { f(&s); }", &[rs], unit);
@@ -685,7 +685,7 @@ impl Wide {
     fn add(&mut self, fx: &Fx, item: ItemKey, text: &str, inputs: &[PTy], output: PTy) {
         let life = self.life;
         let mut buf = SigBuf::new_in(Alloc::global());
-        match read_signature(text, fx.t.view(), inputs, output, &|k| Some(Some(k) == life), &mut buf, Alloc::global()) {
+        match read_signature(text, fx.t.view(), inputs, output, &|k| Some(u32::from(Some(k) == life)), &mut buf, Alloc::global()) {
             Ok(()) => self.sigs.sigs.push((item, buf)),
             Err(why) => panic!("`{text}` was not read: {why:?}"),
         }
@@ -694,7 +694,7 @@ impl Wide {
 
 impl Facts for Wide {
     fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
-        Plain.adt(k).map(|f| AdtFacts { lifetimes: Some(k) == self.life, ..f })
+        Plain.adt(k).map(|f| AdtFacts { lifetimes: u32::from(Some(k) == self.life), ..f })
     }
     fn callee(&self, k: ItemKey) -> Option<CalleeFacts> {
         self.sigs.callee(k)
@@ -979,4 +979,146 @@ fn a_closure_call_is_a_use_of_the_closure() {
     let (got, flow) = findings_and_flow(&fx, &b, f, root, &facts, Plant::None);
     std::println!("a_closure_call_is_a_use_of_the_closure: {got:?}");
     assert!(got.as_ref().is_ok_and(|g| g.iter().any(|l| l.starts_with("borrow Invalidated"))), "{got:?}; the flow:\n{flow}");
+}
+
+// ---------------------------------------------------------------- struct update expressions
+
+/// Every ADT of the fixtures `Copy`, needing no drop.
+struct CopyAll;
+
+impl Facts for CopyAll {
+    fn adt(&self, _: ItemKey) -> Option<AdtFacts> {
+        Some(AdtFacts { copy: true, drop_impl: false, needs_drop: false, lifetimes: 0, union: false, is_enum: false, is_box: false })
+    }
+    fn callee(&self, k: ItemKey) -> Option<CalleeFacts> {
+        Plain.callee(k)
+    }
+    fn field(&self, _: ItemKey, _: u32, _: Name) -> Option<u32> {
+        None
+    }
+    fn field_count(&self, _: ItemKey, _: u32) -> Option<u32> {
+        None
+    }
+    fn param_copy(&self, _: u32) -> bool {
+        false
+    }
+}
+
+/// `struct S; struct P { a: S, c: S }; fn mk() -> P; fn h(_: P); fn g(_: S); fn f(p: P, s: S)`.
+fn update_world() -> (Fx, ItemKey) {
+    let mut fx = Fx::new();
+    let s = fx.strukt("S", 0, &[]);
+    let st = fx.adt(s, &[]);
+    let p = fx.strukt("P", 0, &[("a", st), ("c", st)]);
+    let pt = fx.adt(p, &[]);
+    let unit = fx.unit();
+    let _mk = fx.func("mk", 0, &[], pt, vec![]);
+    let _h = fx.func("h", 0, &[pt], unit, vec![]);
+    let _g = fx.func("g", 0, &[st], unit, vec![]);
+    let f = fx.func("f", 0, &[pt, st], unit, vec![]);
+    fx.finish();
+    (fx, f)
+}
+
+/// The written field of every update below: `a: <expr>`, `field_inits[0..1]` of the view.
+const WRITES_A: blaze_typeck::List = blaze_typeck::List { start: 0, len: 1 };
+
+/// `P { a: <field_inits[0]>, ..base }`: the fixture has no struct-expression builder, so the
+/// expression takes the slot (and range) of a path expression `P` made for it; its one written
+/// field is the view's `field_inits[0]` ([`update_findings`]).
+fn update(b: &mut Bb, base: ExprId) -> ExprId {
+    let at = b.path(&["P"]);
+    let blaze_typeck::Expr::Path(path) = b.exprs[at.ix()] else { panic!("`Bb::path` made other than a path expression") };
+    b.exprs[at.ix()] = blaze_typeck::Expr::Struct { path, fields: WRITES_A, base: blaze_typeck::StructBase::Expr(base) };
+    at
+}
+
+/// `base.name`: the fixture has no field-access builder, so it takes the slot of a read of `p`.
+fn field(b: &mut Bb, p: blaze_typeck::PatId, base: ExprId, name: &str) -> ExprId {
+    let at = b.local(p);
+    b.exprs[at.ix()] = blaze_typeck::Expr::Field { base, name: Name::of(name) };
+    at
+}
+
+/// The findings of one body whose view's `field_inits` are `inits`, checked by the real type
+/// checker (so `Checked::fru_fields` is its own), under `facts`; or the refusal.
+fn update_findings<F: Facts>(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId, inits: &[blaze_typeck::FieldInit], facts: &F) -> Result<vec::Vec<String>, Refusal> {
+    let mut view = b.view(owner, root);
+    view.field_inits = inits;
+    let mut cx = InferCtx::new_in(Alloc::global());
+    let c = match blaze_typeck::check(&view, fx, &mut cx, &Needs::new_in(Alloc::global()), Alloc::global()) {
+        Ok(Outcome::Done(c)) => c,
+        Ok(Outcome::Need(n)) => panic!("the world missed {:?}", n.questions),
+        Err(e) => panic!("{e:?}"),
+    };
+    assert!(c.diags.is_empty(), "the fixture type-checks clean: {:?}", c.diags);
+    let lowered = lower_planted(&view, &c, facts, Plant::None, Alloc::global())?;
+    let rec = check(&lowered.flow, Alloc::global()).expect("bounded");
+    let mut out = vec::Vec::new();
+    for m in rec.moves.iter() {
+        out.push(format!("move {:?} at {:?} span {}..{}", m.kind, m.at, m.span.lo, m.span.hi));
+    }
+    for f in rec.borrows.iter() {
+        out.push(format!("borrow {f:?}"));
+    }
+    Ok(out)
+}
+
+/// One body of `fn f(p: P, s: S)`: `let q = P { a: s, ..<base> }; <after>(<arg>);`, where
+/// `base` is `p` or `mk()` and `arg` is `q`, `p`, `p.a` or `p.c` as `use_` says.
+fn update_body(fx: &Fx, f: ItemKey, temporary: bool, after: &str, use_: Option<&str>, whole: bool, facts: &impl Facts) -> Result<vec::Vec<String>, Refusal> {
+    let mut b = Bb::new();
+    let p = b.param("p");
+    let s = b.param("s");
+    let q = b.bind("q");
+    let ls = b.local(s);
+    let base = if temporary {
+        let mk = b.path(&["mk"]);
+        b.call(mk, &[])
+    } else {
+        b.local(p)
+    };
+    let up = update(&mut b, base);
+    let st1 = b.let_(q, None, up);
+    let callee = b.path(&[after]);
+    let arg = match (use_, whole) {
+        (Some(name), _) => {
+            let lp = b.local(p);
+            field(&mut b, p, lp, name)
+        }
+        (None, true) => b.local(p),
+        (None, false) => b.local(q),
+    };
+    let c = b.call(callee, &[arg]);
+    let st2 = b.semi(c);
+    let root = b.block(&[st1, st2], None);
+    let inits = [blaze_typeck::FieldInit { name: Name::of("a"), expr: ls }];
+    update_findings(fx, &b, f, root, &inits, facts)
+}
+
+/// The Reference, "Functional update syntax": the update "moves or copies the remaining fields
+/// from the base expression"; "Moved and copied types": a value whose type implements `Copy`
+/// is copied, and a move out of a field of a local moves only that field. Four bodies of
+/// `fn f(p: P, s: S)` with `struct P { a: S, c: S }`, each `let q = P { a: s, ..base }; ..`:
+/// 1. base `mk()`, then `h(q)`: the temporary's `c` moves into `q`: no finding.
+/// 2. base `p`, every type `Copy`, then `h(p)`: `p.c` is copied, `p` still usable: no finding.
+/// 3. base `p`, then `g(p.a)`: `a` was written, so the update took only `p.c`; `p.a` is still
+///    there to move: no finding.
+/// 4. base `p`, then `g(p.c)`: the update moved `p.c` out: a use of a moved value.
+/// A version that moves the base whole finds `UseOfMoved` in 2 (under `Copy` it would be a
+/// copy, so in 3); one that copies it whole, or takes no field, accepts 4. Prints
+/// "struct_update_bases: temporary Ok([]), copy Ok([]), written Ok([]), taken Ok([\"move UseOfMoved at ..\"])"
+/// (the finding's place and span in place of `..`).
+#[test]
+fn struct_update_bases() {
+    let (fx, f) = update_world();
+    let temporary = update_body(&fx, f, true, "h", None, false, &Plain);
+    assert!(temporary.as_ref().is_ok_and(|g| g.is_empty()), "{temporary:?}");
+    let copy = update_body(&fx, f, false, "h", None, true, &CopyAll);
+    assert!(copy.as_ref().is_ok_and(|g| g.is_empty()), "{copy:?}");
+    let written = update_body(&fx, f, false, "g", Some("a"), false, &Plain);
+    assert!(written.as_ref().is_ok_and(|g| g.is_empty()), "{written:?}");
+    let taken = update_body(&fx, f, false, "g", Some("c"), false, &Plain);
+    std::println!("struct_update_bases: temporary {temporary:?}, copy {copy:?}, written {written:?}, taken {taken:?}");
+    assert!(taken.as_ref().is_ok_and(|g| g.iter().any(|l| l.contains("UseOfMoved"))), "{taken:?}");
 }

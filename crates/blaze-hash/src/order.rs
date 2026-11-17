@@ -11,8 +11,9 @@
 //!
 //! How it differs from the `indexmap` crate it replaces in blaze's own code:
 //!
-//! - The allocator is in the type and has no default, as for every table here
-//!   ([`OrderMap::new_in`], [`OrderMap::with_capacity_in`]); there is no `new()`.
+//! - The allocator is in the type and has no default, as for every table here, and the hasher
+//!   is named as a value (D125); both are fields of the one constructor's options (D126):
+//!   `OrderMap::new(OrderMapOpts { hasher: FixedState, alloc: frame, capacity: None })`.
 //! - The table holds `u32` indices, not `usize`: half the table's memory, and a lookup's probe
 //!   reads half as many cache lines of it. A map holds at most `u32::MAX` entries, and one
 //!   more is a panic that says so.
@@ -70,50 +71,92 @@ fn held(at: usize) -> u32 {
     }
 }
 
+/// What an [`OrderMap`] is made from ([`OrderMap::new`], rule 83 options-struct): every field is
+/// written at every use, the hasher too (D125):
+/// `OrderMap::new(OrderMapOpts { hasher: FixedState, alloc: frame, capacity: None })`.
+///
+/// A call's named arguments: write it as a literal in the call that takes it (rule 83).
+#[blaze::args]
+#[derive(Clone, Copy, Debug)]
+pub struct OrderMapOpts<S, A> {
+    /// The hasher, as a value (`FixedState` for ordinary keys, a [`SipKey`](crate::SipKey) for
+    /// keys an outsider picks). It decides no iteration order: that is the inserts'.
+    pub hasher: S,
+    /// The allocator the entries and the index table are in.
+    pub alloc: A,
+    /// Entries room is made for at once: `None` allocates nothing until the first insert,
+    /// `Some(n)` makes two allocations with room for `n` and none after until it holds more.
+    pub capacity: Option<usize>,
+}
+
+impl<K, V, S, A: Allocator + Clone> OrderMap<K, V, S, A> {
+    /// The map `opts` describe: empty, on `opts.hasher` in `opts.alloc`, with room for
+    /// `opts.capacity` entries. A map of an iterator's pairs is `new` then [`Extend::extend`]
+    /// (a key given twice keeps its first place and its last value).
+    #[inline]
+    pub fn new(opts: OrderMapOpts<S, A>) -> Self {
+        let capacity = opts.capacity.unwrap_or(0);
+        OrderMap {
+            // clone: the allocator's handle, once per map: the entries and the table each hold one.
+            entries: Vec::with_capacity_in(capacity, opts.alloc.clone()),
+            table: RawTable::with_capacity_in(capacity, opts.alloc),
+            hasher: opts.hasher,
+        }
+    }
+}
+
 impl<K, V, S: Default, A: Allocator + Clone> OrderMap<K, V, S, A> {
-    /// An empty map in `alloc`: no allocation until the first insert.
+    /// An empty map in `alloc` on `S::default()`.
+    ///
+    /// D126: goes at the sweep; write
+    /// `OrderMap::new(OrderMapOpts { hasher, alloc, capacity: None })`.
     #[inline]
     pub fn new_in(alloc: A) -> Self {
-        Self::with_hasher_in(S::default(), alloc)
+        OrderMap::new(OrderMapOpts { hasher: S::default(), alloc, capacity: None })
     }
 
-    /// An empty map in `alloc` with room for `capacity` entries: two allocations, and none
-    /// after until it holds more.
+    /// An empty map in `alloc` on `S::default()` with room for `capacity` entries.
+    ///
+    /// D126: goes at the sweep; write
+    /// `OrderMap::new(OrderMapOpts { hasher, alloc, capacity: Some(n) })`.
     #[inline]
     pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
-        Self::with_capacity_and_hasher_in(capacity, S::default(), alloc)
+        OrderMap::new(OrderMapOpts { hasher: S::default(), alloc, capacity: Some(capacity) })
     }
 }
 
 impl<K: Eq + Hash, V, S: BuildHasher + Default, A: Allocator + Clone> OrderMap<K, V, S, A> {
-    /// The map of `iter`'s pairs in `alloc`, in `iter`'s order; a key given twice keeps its
-    /// first place and its last value.
+    /// The map of `iter`'s pairs in `alloc` on `S::default()`, in `iter`'s order; a key given
+    /// twice keeps its first place and its last value.
+    ///
+    /// D126: goes at the sweep; write `OrderMap::new(OrderMapOpts { hasher, alloc, capacity })`,
+    /// then `extend`.
     pub fn from_iter_in<I: IntoIterator<Item = (K, V)>>(iter: I, alloc: A) -> Self {
         let iter = iter.into_iter();
-        let mut map = Self::with_capacity_in(iter.size_hint().0, alloc);
+        let capacity = Some(iter.size_hint().0);
+        let mut map = OrderMap::new(OrderMapOpts { hasher: S::default(), alloc, capacity });
         map.extend(iter);
         map
     }
 }
 
 impl<K, V, S, A: Allocator + Clone> OrderMap<K, V, S, A> {
-    /// An empty map in `alloc` whose keys are hashed by `hasher`: how a map of keys an attacker
-    /// may pick is made, with a [`SipKey`](crate::SipKey).
+    /// An empty map on `hasher` in `alloc`.
+    ///
+    /// D126: goes at the sweep; write
+    /// `OrderMap::new(OrderMapOpts { hasher, alloc, capacity: None })`.
     #[inline]
     pub fn with_hasher_in(hasher: S, alloc: A) -> Self {
-        // clone: the allocator's handle, once per map: the entries and the table each hold one.
-        OrderMap { entries: Vec::new_in(alloc.clone()), table: RawTable::new_in(alloc), hasher }
+        OrderMap::new(OrderMapOpts { hasher, alloc, capacity: None })
     }
 
-    /// [`OrderMap::with_capacity_in`] with `hasher`.
+    /// An empty map on `hasher` in `alloc` with room for `capacity` entries.
+    ///
+    /// D126: goes at the sweep; write
+    /// `OrderMap::new(OrderMapOpts { hasher, alloc, capacity: Some(n) })`.
     #[inline]
     pub fn with_capacity_and_hasher_in(capacity: usize, hasher: S, alloc: A) -> Self {
-        OrderMap {
-            // clone: the allocator's handle, once per map.
-            entries: Vec::with_capacity_in(capacity, alloc.clone()),
-            table: RawTable::with_capacity_in(capacity, alloc),
-            hasher,
-        }
+        OrderMap::new(OrderMapOpts { hasher, alloc, capacity: Some(capacity) })
     }
 
     #[inline]
@@ -546,36 +589,78 @@ impl<K, V, S, A: Allocator + Clone> Index<usize> for OrderMap<K, V, S, A> {
 /// allocator `A`: an [`OrderMap`] of its values to nothing.
 pub struct OrderSet<T, S, A: Allocator + Clone>(OrderMap<T, (), S, A>);
 
+/// What an [`OrderSet`] is made from ([`OrderSet::new`]), as [`OrderMapOpts`] for a map:
+/// `OrderSet::new(OrderSetOpts { hasher: FixedState, alloc: frame, capacity: None })`.
+///
+/// A call's named arguments: write it as a literal in the call that takes it (rule 83).
+#[blaze::args]
+#[derive(Clone, Copy, Debug)]
+pub struct OrderSetOpts<S, A> {
+    /// The hasher, as a value (D125); it decides no iteration order.
+    pub hasher: S,
+    /// The allocator the values and the index table are in.
+    pub alloc: A,
+    /// Values room is made for at once: `None` allocates nothing until the first insert,
+    /// `Some(n)` reserves room for `n`.
+    pub capacity: Option<usize>,
+}
+
+impl<T, S, A: Allocator + Clone> OrderSet<T, S, A> {
+    /// The set `opts` describe: empty, on `opts.hasher` in `opts.alloc`, with room for
+    /// `opts.capacity` values. A set of an iterator's values is `new` then [`Extend::extend`]
+    /// (each value at the place it first came).
+    #[inline]
+    pub fn new(opts: OrderSetOpts<S, A>) -> Self {
+        OrderSet(OrderMap::new(OrderMapOpts {
+            hasher: opts.hasher,
+            alloc: opts.alloc,
+            capacity: opts.capacity,
+        }))
+    }
+}
+
 impl<T, S: Default, A: Allocator + Clone> OrderSet<T, S, A> {
-    /// An empty set in `alloc`: no allocation until the first insert.
+    /// An empty set in `alloc` on `S::default()`.
+    ///
+    /// D126: goes at the sweep; write
+    /// `OrderSet::new(OrderSetOpts { hasher, alloc, capacity: None })`.
     #[inline]
     pub fn new_in(alloc: A) -> Self {
-        OrderSet(OrderMap::new_in(alloc))
+        OrderSet::new(OrderSetOpts { hasher: S::default(), alloc, capacity: None })
     }
 
-    /// An empty set in `alloc` with room for `capacity` values: two allocations, and none
-    /// after until it holds more.
+    /// An empty set in `alloc` on `S::default()` with room for `capacity` values.
+    ///
+    /// D126: goes at the sweep; write
+    /// `OrderSet::new(OrderSetOpts { hasher, alloc, capacity: Some(n) })`.
     #[inline]
     pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
-        OrderSet(OrderMap::with_capacity_in(capacity, alloc))
+        OrderSet::new(OrderSetOpts { hasher: S::default(), alloc, capacity: Some(capacity) })
     }
 }
 
 impl<T: Eq + Hash, S: BuildHasher + Default, A: Allocator + Clone> OrderSet<T, S, A> {
-    /// The set of `iter`'s values in `alloc`, each at the place it first came.
+    /// The set of `iter`'s values in `alloc` on `S::default()`, each at the place it first came.
+    ///
+    /// D126: goes at the sweep; write `OrderSet::new(OrderSetOpts { hasher, alloc, capacity })`,
+    /// then `extend`.
     pub fn from_iter_in<I: IntoIterator<Item = T>>(iter: I, alloc: A) -> Self {
         let iter = iter.into_iter();
-        let mut set = Self::with_capacity_in(iter.size_hint().0, alloc);
+        let capacity = Some(iter.size_hint().0);
+        let mut set = OrderSet::new(OrderSetOpts { hasher: S::default(), alloc, capacity });
         set.extend(iter);
         set
     }
 }
 
 impl<T, S, A: Allocator + Clone> OrderSet<T, S, A> {
-    /// An empty set in `alloc` whose values are hashed by `hasher`.
+    /// An empty set on `hasher` in `alloc`.
+    ///
+    /// D126: goes at the sweep; write
+    /// `OrderSet::new(OrderSetOpts { hasher, alloc, capacity: None })`.
     #[inline]
     pub fn with_hasher_in(hasher: S, alloc: A) -> Self {
-        OrderSet(OrderMap::with_hasher_in(hasher, alloc))
+        OrderSet::new(OrderSetOpts { hasher, alloc, capacity: None })
     }
 
     #[inline]

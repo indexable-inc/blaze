@@ -38,7 +38,12 @@ pub type BuildKeyHasher = core::hash::BuildHasherDefault<KeyHasher>;
 
 /// A map on hashes, indexed by the hash itself, in the allocator `A`, which every use names
 /// (`ByHash::new_in(frame)`).
+///
+/// D125: goes at the sweep; write the hasher: `Map<K, V, BuildKeyHasher, A>`, made by
+/// `Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None })`.
 pub type ByHash<K, V, A> = crate::Map<K, V, BuildKeyHasher, A>;
 
 /// A set of hashes, indexed by the hash itself, in the allocator `A`, which every use names.
+///
+/// D125: goes at the sweep; write the hasher: `Set<K, BuildKeyHasher, A>`.
 pub type ByHashSet<K, A> = crate::Set<K, BuildKeyHasher, A>;

@@ -29,7 +29,7 @@ mod tests;
 
 use std::alloc::Global;
 
-use blaze_hash::{HashMap, HashSet};
+use blaze_hash::{FixedState, Map, MapOpts, Set, SetOpts};
 use serde_derive::Serialize;
 
 use crate::time::{
@@ -777,8 +777,8 @@ struct Ctx<'a> {
 impl<'a> Ctx<'a> {
     fn new(model: &'a Model, path: &'a Path, facts: &'a Facts) -> Ctx<'a> {
         let (start, end) = (model.bounds.start_ns, model.bounds.end_ns);
-        let named: HashSet<(u32, u32), Global> = {
-            let mut it = HashSet::new_in(Global);
+        let named: Set<(u32, u32), FixedState, Global> = {
+            let mut it = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
             it.extend(
                 facts
                     .threads
@@ -789,7 +789,7 @@ impl<'a> Ctx<'a> {
             it
         };
         // A worker: a thread a pool job ran on, or one named as the pool names its threads.
-        let mut stretches: HashMap<(u32, u32), Vec<(i64, i64)>, Global> = HashMap::new_in(Global);
+        let mut stretches: Map<(u32, u32), Vec<(i64, i64)>, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for lane in &model.lanes {
             for it in &lane.intervals {
                 let State::Running { thread, core, .. } = it.state else { continue };
@@ -873,7 +873,7 @@ impl<'a> Ctx<'a> {
             spans: Vec<usize>,
             roots: Vec<(String, i64)>,
         }
-        let mut groups: HashMap<&str, Group, Global> = HashMap::new_in(Global);
+        let mut groups: Map<&str, Group, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for &(from, to, span, _) in &self.path_ran {
             let ns = to - from;
             let name = span.map_or("inside no span", |it| model.spans[it].name.as_str());
@@ -967,7 +967,7 @@ impl<'a> Ctx<'a> {
 
     /// Workers the OS gave much less CPU per running second than the others.
     fn starved_workers(&self, out: &mut Vec<Finding>) {
-        let mut cpu: HashMap<(u32, u32), i64, Global> = HashMap::new_in(Global);
+        let mut cpu: Map<(u32, u32), i64, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         let mut counted = false;
         for it in self.facts.thread_cpu.iter().filter(|it| it.counted > 0) {
             counted = true;
@@ -1115,7 +1115,7 @@ impl<'a> Ctx<'a> {
                 path_of_wait[w].push((link.from_ns, link.to_ns));
             }
         }
-        let mut classes: HashMap<String, Class, Global> = HashMap::new_in(Global);
+        let mut classes: Map<String, Class, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         // Waits the record never ends: their time runs to its end, summed over every one
         // (65,439 of them made millions of seconds of one build), so they are told apart.
         let mut unended = Class::default();
@@ -1313,8 +1313,8 @@ impl<'a> Ctx<'a> {
     /// The same query key run more than once in the build.
     fn redone(&self, out: &mut Vec<Finding>) {
         let model = self.model;
-        let queries: HashSet<&str, Global> = {
-            let mut it = HashSet::new_in(Global);
+        let queries: Set<&str, FixedState, Global> = {
+            let mut it = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
             it.extend(
                 self.facts
                     .span_kinds
@@ -1324,8 +1324,8 @@ impl<'a> Ctx<'a> {
             );
             it
         };
-        let mut keys: HashMap<(&str, Option<&str>, &str), (u64, i64, i64), Global> =
-            HashMap::new_in(Global);
+        let mut keys: Map<(&str, Option<&str>, &str), (u64, i64, i64), FixedState, Global> =
+            Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for (i, it) in model.spans.iter().enumerate() {
             let Some(function) = it.function.as_deref() else { continue };
             if !(it.name.ends_with("_query") || queries.contains(it.name.as_str())) {
@@ -1340,8 +1340,8 @@ impl<'a> Ctx<'a> {
             entry.0 += 1;
             entry.1 += running;
         }
-        let mut by_query: HashMap<&str, (u64, u64, i64, Vec<(String, i64)>), Global> =
-            HashMap::new_in(Global);
+        let mut by_query: Map<&str, (u64, u64, i64, Vec<(String, i64)>), FixedState, Global> =
+            Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for ((name, krate, function), (runs, running, first)) in keys {
             if runs < 2 {
                 continue;
@@ -1639,7 +1639,7 @@ impl<'a> Ctx<'a> {
     fn blind_spots(&self, out: &mut Vec<BlindSpot>) {
         let model = self.model;
         // The path's lost time.
-        let mut lost: HashMap<String, i64, Global> = HashMap::new_in(Global);
+        let mut lost: Map<String, i64, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for link in self.path.links.iter().filter(|it| it.kind == LinkKind::Unrecorded) {
             let lane = &model.lanes[link.lane];
             let why = match lane.intervals[link.interval].state {
@@ -1929,7 +1929,7 @@ impl<'a> Ctx<'a> {
             })
             .filter(|it| it.ns > 0)
             .collect();
-        let mut phases: HashMap<&str, i64, Global> = HashMap::new_in(Global);
+        let mut phases: Map<&str, i64, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for &(from, to, span, _) in &self.path_ran {
             let name =
                 span.map_or("inside no span", |it| model.spans[model.root_of(it)].name.as_str());

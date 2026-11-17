@@ -15,13 +15,17 @@
 //! | [`fetch_task`] | the `Fetch` task: one lock entry's sources, its name, record and finding |
 //! | [`run`] | blaze-run's compiles and records as drive names |
 //!
+//! What a command gives the machine (a file's content read by path, a fact such as an
+//! environment variable) is a [`Kind::Given`] name like any other ([`key::content_of`],
+//! [`key::fact_of`], [`Ask::facts`]), found by its name, never an ambient input.
+//!
 //! # Collections
 //!
 //! blaze-own's, every one made in the allocator the caller passed; `alloc` is not linked and
 //! `Global` is named only in the tests.
 
 #![no_std]
-#![feature(allocator_api, register_tool, custom_inner_attributes)]
+#![feature(allocator_api, register_tool, custom_inner_attributes, variant_count)]
 #![register_tool(blaze)]
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
@@ -31,6 +35,7 @@
 extern crate std;
 
 pub mod answers;
+pub mod cells;
 pub mod condition;
 pub mod fetch_task;
 pub mod items;
@@ -43,6 +48,7 @@ pub mod profile;
 pub mod record;
 pub mod request;
 pub mod run;
+mod run_scope;
 pub mod settled;
 pub mod table;
 pub mod unit_graph_task;
@@ -53,10 +59,19 @@ mod wire;
 #[cfg(test)]
 mod sim;
 #[cfg(test)]
+mod sim_cells;
+#[cfg(test)]
+mod sim_given;
+#[cfg(test)]
+mod sim_lints;
+#[cfg(test)]
 mod sim_owners;
 #[cfg(test)]
 mod sim_scripts;
+#[cfg(test)]
+mod sim_natives;
 
+pub use crate::cells::{Cell, CellOf, CellRead, CellRefused, Cells, Seen};
 pub use crate::condition::{Condition, ConditionError, Space, Var};
 pub use crate::key::{Key, Kind, Name, Tool};
 pub use crate::record::{Finding, Locate, Part, PathOf};
@@ -102,6 +117,13 @@ pub enum Plant {
     PublishBeforePut,
     /// A program's success is reported at its exit, before the gate's check is done.
     EarlySuccess,
+    /// Under `Gate::Before` the program starts over a check that left an item unchecked (a
+    /// `types-not-checked` finding): only an error or a failed task holds the start.
+    StartOverIncomplete,
+    /// `run`'s member closure ([`Request::with_member_closure`]) does not follow the first
+    /// dependency it meets: a member the program reaches is left out, and its bodies are not
+    /// checked before the start.
+    ReachedSkipped,
     /// A record is stored under the condition its job began at, not the one it read: an asker
     /// that does not imply what it read is served it.
     RanUnderCondition,
@@ -136,4 +158,16 @@ pub enum Plant {
     OwnersDropListedElsewhere,
     /// Every part of a record is made a job: a dependency's bodies run under `check` unasked.
     EveryPartAJob,
+    /// A changed record's cell readers are never checked: a reader whose cell moved stands on
+    /// what it saw (cells.rs).
+    CellMovedNotDirtied,
+    /// Every cell reader of a changed record is dirtied, its cell moved or not: part reads
+    /// worth nothing over whole reads.
+    CellsAsWhole,
+    /// A changed or gone file seeds no `Given` job (key.rs `Kind::Given`): a reader of the file
+    /// by content only (`key::content_of`) stands on the bytes it read before the edit.
+    GivenNotSeeded,
+    /// A name its home dropped this run is entered again when a read of it moves: its job,
+    /// settled with no record, is decided and run as a part no home lists (request.rs `dirty`).
+    DirtyDropped,
 }

@@ -25,7 +25,7 @@ use blaze_build_script::outputs::OutputsRef;
 use blaze_hash::FixedState;
 use blaze_ids::producer::{ProducerId, Whole};
 use blaze_ids::{ContentId, Hasher};
-use blaze_native::Platform;
+pub use blaze_native::Platform;
 use blaze_own::{AVec, Alloc};
 use blaze_scope::resolve::CrateNames;
 use blaze_surface::ItemIndex;

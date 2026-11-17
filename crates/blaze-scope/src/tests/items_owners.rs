@@ -67,6 +67,7 @@ fn listed(record: &ItemsRecord<'static>) -> AVec<'static, (ItemKey, ItemKey, &'s
         }
         let members = record.members(row.key).unwrap_or_else(|e| panic!("the members of {:?}: {e:?}", row.key)).unwrap_or_else(|| panic!("owner {:?} has no member row", row.key));
         for m in members.iter() {
+            let m = m.unwrap_or_else(|e| panic!("a member row of {:?}: {e:?}", row.key));
             if let Some(name) = m.name {
                 out.push((m.key, row.key, name));
             }

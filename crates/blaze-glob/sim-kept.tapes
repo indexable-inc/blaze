@@ -1,0 +1,6 @@
+# blaze-glob's kept failing tapes (docs/v2/plan/design/test.md, piece S3), compiled in by
+# `blaze_sim::sim_kept!()` and replayed first by `blaze_sim::check_kept`.
+# One line a tape, as a failure's report prints it after `blaze-sim keep: `:
+#   <test path> v<primitives version> <tape>  # <date> <one line why>
+# Lines are only added; a line whose test is renamed moves to the new path.
+tests::the_table_is_the_backtracker v1 1 6 0 1  # 2026-11-16 assertion `left == right` failed: "**/" on "a"

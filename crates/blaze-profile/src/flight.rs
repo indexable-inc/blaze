@@ -39,7 +39,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use blaze_hash::{FixedHasher, HashMap, HashSet};
+use blaze_hash::{FixedHasher, FixedState, Map, MapOpts, Set, SetOpts};
 use blaze_core::lock::{Lock, LockGuard};
 use std::alloc::Global;
 
@@ -245,7 +245,7 @@ static FOREIGN: [OnceLock<SiteText>; FOREIGN_MAX] = [const { OnceLock::new() }; 
     blaze::process_static,
     reason = "indexes the FOREIGN slots, so at most FOREIGN_MAX entries in all"
 )]
-static FOREIGN_BY_TEXT: Lock<(usize, Option<HashMap<u64, Vec<u16>, Global>>)> =
+static FOREIGN_BY_TEXT: Lock<(usize, Option<Map<u64, Vec<u16>, FixedState, Global>>)> =
     Lock::unrecorded("profile.flight.foreign_by_text", (0, None));
 
 fn foreign_key(name: &str, target: &str, level: &str) -> u64 {
@@ -268,7 +268,7 @@ pub(crate) fn foreign_site(name: &str, target: &str, level: &str) -> Option<u16>
     let key = foreign_key(name, target, level);
     let mut guard = lock(&FOREIGN_BY_TEXT);
     let (taken, by_text) = &mut *guard;
-    let bucket = by_text.get_or_insert_with(|| HashMap::new_in(Global)).entry(key).or_default();
+    let bucket = by_text.get_or_insert_with(|| Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None })).entry(key).or_default();
     let same = |site: &u16| {
         site_text(*site)
             .is_some_and(|it| it.name == name && it.target == target && it.level == level)
@@ -321,7 +321,7 @@ const READER_EPOCHS: u32 = 1 << 6;
 /// thread that records.
 #[derive(Default)]
 struct Table {
-    ids: HashMap<std::sync::Arc<str>, Sym, Global>,
+    ids: Map<std::sync::Arc<str>, Sym, FixedState, Global>,
     names: Vec<std::sync::Arc<str>>,
 }
 
@@ -4966,7 +4966,7 @@ pub(crate) fn part(window: Duration) -> Part {
     let mut read = Read::default();
     self::window(window, &mut read);
     let mut part = Part { pid: std::process::id(), command: crate::command(), ..Part::default() };
-    let mut named: HashSet<u32, Global> = HashSet::new_in(Global);
+    let mut named: Set<u32, FixedState, Global> = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
     for span in &read.spans {
         if named.insert(span.thread) {
             // alloc: a dump, on demand
@@ -5294,10 +5294,13 @@ mod tests {
         assert_eq!(row("flight never named").function, 0);
     }
 
-    /// The waits of `thread` in `read` for a key, refusing any other. A test's threads are in a
-    /// scheduler of their own, which no other test's pools or drivers lock, and the tests order
-    /// their threads' ends so that neither waits on the other's lock: a wait for the scheduler's
-    /// lock here would be one the test made.
+    /// The waits of `thread` in `read` for a key, refusing any other but the tests' own
+    /// handshakes. A test's threads are in a scheduler of their own, which no other test's
+    /// pools or drivers lock, and the tests order their threads' ends so that neither waits on
+    /// the other's lock: a wait for the scheduler's lock here would be one the test made. The
+    /// handshakes are `blaze_core::chan` channels of `()`, whose receives are waits too (a
+    /// channel's wait is its signal span, `signal ()`), so those are passed over; a channel of
+    /// any other value is no handshake of these tests and is refused.
     fn key_waits(read: &Read, thread: u32) -> Vec<&SpanRow> {
         use blaze_graph::wait::WaitKind;
         // alloc: a test's rows
@@ -5307,6 +5310,7 @@ mod tests {
             let awaits = wait.fields.awaits.text();
             match wait.fields.on {
                 WaitKind::Key => keys.push(row),
+                WaitKind::Channel if awaits.as_deref() == Some("signal ()") => {}
                 other => panic!("thread {thread} waited on {other:?} {awaits:?}, not a key"),
             }
         }

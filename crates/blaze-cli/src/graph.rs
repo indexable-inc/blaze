@@ -23,7 +23,7 @@ use blaze_fetch::pack::PackView;
 use blaze_ids::ContentId;
 use blaze_manifest::layout;
 use blaze_manifest::lock::{Lock, LockId, LockSource};
-use blaze_own::{Alloc, Vec};
+use blaze_own::{AVec, Alloc, Vec};
 use blaze_unit_graph::{Ask, CfgAtom, NoResolver, Package, Records, Resolver, TargetDesc};
 use bstd::cx::Cx;
 use bstd::fs::Fs;
@@ -112,16 +112,16 @@ pub struct Members {
 }
 
 impl Members {
-    /// The facts of `units`' members, on the global heap (they live as long as the command).
-    pub fn of(units: &layout::Units<'_>) -> Members {
+    /// The facts of `units`' members, on the process's `heap` (they live as long as the command).
+    pub fn of(units: &layout::Units<'_>, heap: &'static blaze_own::Heap) -> Members {
         let mut packages = std::vec::Vec::with_capacity_in(units.members.len(), std::alloc::Global);
-        let mut dirs = Vec::with_capacity_in(units.members.len(), Alloc::global());
+        let mut dirs = Vec::with_capacity_in(units.members.len(), heap.alloc());
         for member in units.members.iter() {
-            let mut package = Package::from_member(member, Alloc::global());
+            let mut package = Package::from_member(member, heap.alloc());
             let blaze = member.edition.blaze.is_some();
             package.deps.retain(|dep| !toolchain_line(blaze, dep.key.as_str(), dep.package.as_str()));
             packages.push(package);
-            dirs.push(blaze_unit_graph::Text::from_str_in(member.dir.as_str(), Alloc::global()));
+            dirs.push(blaze_unit_graph::Text::from_str_in(member.dir.as_str(), heap.alloc()));
         }
         let written = units.resolver.as_ref().map(|(text, _)| text.as_str());
         Members { packages, dirs, resolver: Resolver::of(written, units.root_edition), written: written.map(std::string::String::from) }
@@ -131,7 +131,8 @@ impl Members {
     pub fn locked(self, lock: &Lock<'_>) -> Result<Parts, Unlocked> {
         let resolver = self.resolver.map_err(|NoResolver| Unlocked::Resolver { written: self.written.unwrap_or_default() })?;
         let mut members = std::vec::Vec::with_capacity_in(self.packages.len(), std::alloc::Global);
-        let mut dirs = Vec::with_capacity_in(self.packages.len(), Alloc::global());
+        // On the allocator the members' directories were made on (`Members::of`'s heap).
+        let mut dirs = Vec::with_capacity_in(self.packages.len(), *self.dirs.allocator());
         for (package, dir) in self.packages.into_iter().zip(self.dirs) {
             let mut ids = lock.named(package.name.as_str()).filter(|id| matches!(lock.package(*id).source, LockSource::Path));
             let found = (ids.next(), ids.next());
@@ -194,15 +195,18 @@ pub struct Graph<'f> {
 }
 
 impl<'f> Graph<'f> {
-    /// The job of `parts` over `lockfile`, for `target`; `workspace_read` is the units' source.
-    pub fn new(parts: Parts, lockfile: &Lockfile<'f>, workspace_read: ContentId, target: TargetDesc<'static>, tests: bool, frame: &'f Frame) -> Graph<'f> {
-        let mut roots = Vec::with_capacity_in(parts.members.len(), Alloc::global());
+    /// The job of `parts` over `lockfile`, for `target` and, for the host's units (build
+    /// scripts), `host` (both from [`target`], each asked for its unit's kind); `workspace_read`
+    /// is the units' source.
+    pub fn new(parts: Parts, lockfile: &Lockfile<'f>, workspace_read: ContentId, target: TargetDesc<'static>, host: TargetDesc<'static>, tests: bool, heap: &'static blaze_own::Heap, frame: &'f Frame) -> Graph<'f> {
+        let mut roots = Vec::with_capacity_in(parts.members.len(), heap.alloc());
         roots.extend(parts.members.iter().map(|(id, _)| *id));
-        let ask = Ask { roots, features: Vec::new_in(Alloc::global()), all_features: false, no_default_features: false, tests };
+        let ask = Ask { roots, features: Vec::new_in(heap.alloc()), all_features: false, no_default_features: false, tests };
         let members: &'f [(LockId, Package<'static>)] = std::boxed::Box::leak(std::boxed::Box::new_in(parts.members, frame));
         let target: &'f TargetDesc<'static> = std::boxed::Box::leak(std::boxed::Box::new_in(target, frame));
+        let host: &'f TargetDesc<'static> = std::boxed::Box::leak(std::boxed::Box::new_in(host, frame));
         let ask: &'f Ask<'static> = std::boxed::Box::leak(std::boxed::Box::new_in(ask, frame));
-        let inputs = UnitGraphInputs { lock: lockfile.text, workspace_read, members, resolver: parts.resolver, target, host: target, ask };
+        let inputs = UnitGraphInputs { lock: lockfile.text, workspace_read, members, resolver: parts.resolver, target, host, ask };
         Graph { source: unit_graph_task::source(&inputs), inputs, mapped: Vec::new_in(frame), dirs: parts.dirs }
     }
 
@@ -214,7 +218,11 @@ impl<'f> Graph<'f> {
 
 /// This build's target as the pinned toolchain states it: its cfg atoms, read from the
 /// toolchain's manifest on the shelf under `home`, reached from the start folder `start`.
-pub fn target(cx: &Cx, env: &crate::fetch::FetchEnv<'_>, frame: &Frame) -> Result<TargetDesc<'static>, CliError> {
+/// For a target-side unit of `kind`: its `cfg(panic)` is derived from the program's profile
+/// fact `program` by blaze-world `panic::unit_panic` (the one home of a unit's strategy: the
+/// profile's for a library or binary, `unwind` for a test or bench, the run target's cut for a
+/// build script), in place of the toolchain list's atom.
+pub fn target(cx: &Cx, env: &crate::fetch::FetchEnv<'_>, program: blaze_manifest::layout::panic::ProfilePanic, kind: &blaze_unit_graph::UnitKind<'_>, frame: &Frame) -> Result<TargetDesc<'static>, CliError> {
     if TRIPLE.is_empty() {
         return Err(CliError::Text { what: "this build's machine has no target triple the toolchain is cut for" });
     }
@@ -226,15 +234,25 @@ pub fn target(cx: &Cx, env: &crate::fetch::FetchEnv<'_>, frame: &Frame) -> Resul
     let manifest = blaze_toolchain::shelf::open_manifest(&mut shelf, id).map_err(CliError::Toolchain)?;
     let view = blaze_toolchain::ToolchainView::open(manifest.as_ref(), id)
         .map_err(|_| CliError::Text { what: "the pinned toolchain's manifest is refused by its reader" })?;
+    let refused = |why: &dyn core::fmt::Display| CliError::Program(blaze_ladder::run::RunError::Manifest { why: Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) });
+    // The build script's run target is this machine's (the unit graph's host today).
+    let cuts = blaze_world::panic::Cuts::read(view, TRIPLE).map_err(|e| refused(&e))?;
+    let panic = blaze_world::panic::unit_panic(program, blaze_world::Side::Target, kind, &cuts).map_err(|e| refused(&e))?;
     let atoms = view.cfg(TRIPLE).ok_or(CliError::Text { what: "the pinned toolchain was not cut for this machine's target" })?;
-    let mut cfg = Vec::new_in(Alloc::global());
+    // Kept for the command (the graph's inputs): on the process's heap.
+    let heap = env.heap.alloc();
+    let mut cfg = Vec::new_in(heap);
     for (name, value) in atoms {
+        if name == blaze_world::panic::CFG_KEY {
+            continue;
+        }
         cfg.push(match value {
-            Some(value) => CfgAtom::pair(name, value, Alloc::global()),
-            None => CfgAtom::flag(name, Alloc::global()),
+            Some(value) => CfgAtom::pair(name, value, heap),
+            None => CfgAtom::flag(name, heap),
         });
     }
-    Ok(TargetDesc::new(TRIPLE, cfg, Alloc::global()))
+    cfg.push(CfgAtom::pair(blaze_world::panic::CFG_KEY, blaze_world::panic::cfg_value(panic), heap));
+    Ok(TargetDesc::new(TRIPLE, cfg, heap))
 }
 
 /// The records of the `Fetch` jobs the task was handed, mapped from `<home>/.blaze/v2/sources/` once a
@@ -305,7 +323,7 @@ pub(crate) fn run<'f, 'b>(cx: &Cx, lockfile: &mut Lockfile<'f>, graph: &mut Grap
     let mut unmapped = None;
     let records = Mapped { handed: &handed, mapped: &mut graph.mapped, folder: folder.as_str(), frame, error: &mut unmapped };
     let unheld = Unheld { failed: &failed, refused: &refused };
-    let entry = unit_graph_task::run(&graph.inputs, lockfile.lock, records, PackView::open_source_put, unheld, Alloc::global());
+    let entry = unit_graph_task::run(&graph.inputs, lockfile.lock, records, PackView::open_source_put, unheld, env.heap.alloc());
     if let Some(error) = unmapped {
         let words = bstd::mem::format_in!(held, "a fetched source record could not be mapped: {error}");
         return Ok(Did::Hole(
@@ -329,10 +347,10 @@ pub(crate) fn run<'f, 'b>(cx: &Cx, lockfile: &mut Lockfile<'f>, graph: &mut Grap
         }
         Ok(Entry::Made(made)) => {
             let mut record = Made::new_in(name, held);
-            record.out = ContentId::of(GRAPH_OUT_DOMAIN, &made.record);
-            record.payload.extend_from_slice(&made.record);
+            hand_graph(&mut record, made.record)?;
+            record.out = ContentId::of(GRAPH_OUT_DOMAIN, record.payload_bytes());
             // One `MacroModule` part per proc-macro crate (macros.rs): the module lookups.
-            match crate::macros::parts(graph.source, &made.record) {
+            match crate::macros::parts(graph.source, record.payload_bytes(), env.heap.alloc()) {
                 Ok(parts) => record.parts.extend(parts.iter().map(|(name, source)| Part { name: *name, locate: Locate::Source(*source), place: 0 })),
                 Err(refused) => {
                     let words = bstd::mem::format_in!(held, "the dependency graph's own record does not decode at byte {}: {}", refused.at, refused.why);
@@ -351,5 +369,54 @@ pub(crate) fn run<'f, 'b>(cx: &Cx, lockfile: &mut Lockfile<'f>, graph: &mut Grap
             let words = bstd::mem::format_in!(held, "the dependency graph: {error}");
             Ok(Did::FailedSaying(TaskFailure { name, why: Why::Refused { what: "the dependency graph could not be resolved", rule: "unit_graph_task" } }, held_str(words.as_str(), held)))
         }
+    }
+}
+
+/// Hands the graph's record `bytes` to its task's record `record` where the resolution made
+/// them, on the heap, moved, never copied into the task's frame (rules 11 and 51): a
+/// workspace's graph (tempo's 1,072 crates) is then bounded by the record, not by the frame, as
+/// `core`'s 76 MB scope payload met its 64 MiB frame (2026-11-16 23:11). Bytes made over any
+/// allocator but the heap's handle are refused (rule 3), never copied to the heap.
+fn hand_graph(record: &mut Made<'_>, bytes: AVec<'_, u8>) -> Result<(), CliError> {
+    let Ok(bytes) = bytes.into_global() else {
+        return Err(CliError::Text { what: "the dependency graph's record was not made on the heap, so it cannot be handed whole to its task's record (graph.rs `hand_graph`)" });
+    };
+    record.hand(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    /// A graph record larger than its task's frame is handed to the task's record, not copied:
+    /// the record reads the graph's exact bytes at the address the resolution made them, the
+    /// frame grew by 0, and bytes made over another allocator (here `Global` in an `Erased` of
+    /// its own) are refused, never copied. CONTROL: the copy this replaced
+    /// (`record.payload.extend_from_slice(&made.record)`) panics here, the frame refusing the
+    /// bytes; a copy onto the heap instead fails the address check. Prints
+    /// `graph record handed: 1048576 bytes, frame grew by 0`.
+    #[test]
+    fn a_graph_record_larger_than_the_task_frame_is_handed_not_copied() {
+        use bstd::mem::{Frame, Tag};
+        use std::alloc::Global;
+        const FRAME: usize = 64 << 10;
+        const LEN: usize = 1 << 20;
+        let bytes: std::vec::Vec<u8> = (0..LEN).map(|i| (i * 31 % 251) as u8).collect();
+        let heap = blaze_own::testing::heap();
+        let graph = blaze_own::Vec::from_slice_in(&bytes, heap.alloc());
+        let at = graph.as_ptr();
+        let frame = Frame::with_reserve(FRAME, Tag::Other).expect("a test frame");
+        assert!(LEN > frame.reserved(), "the record ({LEN} bytes) is larger than the frame ({} bytes)", frame.reserved());
+        let name = blaze_drive::Name::unit_graph();
+        let mut made = crate::work::Made::new_in(name, &frame);
+        let before = frame.used();
+        super::hand_graph(&mut made, graph).expect("the graph's record handed");
+        let grew = frame.used() - before;
+        assert!(made.payload_bytes() == &bytes[..], "the record reads the graph's exact bytes");
+        assert_eq!(made.payload_bytes().as_ptr(), at, "the record reads the graph where it was made: it was copied");
+        assert_eq!(grew, 0, "the task's frame grew by the graph's record");
+        let other = blaze_own::Erased::new(Global);
+        let mut refused = crate::work::Made::new_in(name, &frame);
+        assert!(super::hand_graph(&mut refused, blaze_own::Vec::from_slice_in(&bytes[..16], other.handle())).is_err(), "bytes over another allocator were taken");
+        assert!(refused.payload_bytes().is_empty(), "a refused hand holds no payload");
+        println!("graph record handed: {} bytes, frame grew by {grew}", made.payload_bytes().len());
     }
 }

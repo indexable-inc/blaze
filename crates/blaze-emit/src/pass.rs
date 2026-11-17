@@ -11,7 +11,7 @@ use blaze_lir::{
 };
 
 use crate::{
-    EmitError, Fixup, Isa, Reloc, RelocTo, Via,
+    EmitError, Fixup, Isa, PositionFix, Reloc, RelocTo, Via,
     enc::{self, Cond, FP, Field, LR, Reg, SP, Size, X0, X1, X8, X9, X10, X11, X12, X16, ZR},
 };
 
@@ -23,6 +23,7 @@ mod int;
 pub(crate) mod probe;
 mod runtime;
 pub(crate) mod sites;
+pub(crate) mod stack;
 mod target;
 mod tls_index;
 pub(crate) mod unwind;
@@ -74,6 +75,8 @@ struct Pass<'a, 'c, A: Allocator> {
     fixups: &'c mut Vec<Fixup, A>,
     /// The absolute address words, filled as the literal words and data are placed.
     relocs: &'c mut Vec<Reloc, A>,
+    /// The source position fields of the placed data rows, filled as the data is placed.
+    positions: &'c mut Vec<PositionFix, A>,
     /// The literal words placement fills, other than the fixups': each once, in order.
     words: Vec<RelocTo, Global>,
     /// The `add`s that make an address in the stretch of the frame where a call's `byval`
@@ -95,6 +98,9 @@ struct Pass<'a, 'c, A: Allocator> {
     placed: Vec<u32, Global>,
     /// Per stack slot, its offset from `sp`.
     slot_at: Vec<u32, Global>,
+    /// Per value, the offset from `sp` of the third word of a wide pair (lib.rs, "Pairs": an
+    /// `i128` and a narrow integer, 24 bytes, past its 16-byte cell); `NONE` for any other.
+    wide_pair_at: Vec<u32, Global>,
     /// Where the staging words of a block's arguments start, from `sp`.
     staging_at: u32,
     /// The most staging words an edge took.
@@ -102,6 +108,10 @@ struct Pass<'a, 'c, A: Allocator> {
     /// The record form's rows (pass/sites.rs): `Some` makes every outside reference an
     /// import site and places no address word; `None` is the literal-word form.
     record: Option<&'c mut sites::Form<A>>,
+    /// The most alignment a slot asks (at least 16): the prologue rounds `sp` down to it.
+    most_align: u64,
+    /// Where each landing block's `sp` restore starts (pass/stack.rs), patched with the frame.
+    sp_fixes: Vec<u32, Global>,
 }
 
 /// Runs the pass (see [`crate::emit`]).
@@ -113,6 +123,7 @@ pub(crate) fn run<A: Allocator>(
     bytes: &mut Vec<u8, A>,
     fixups: &mut Vec<Fixup, A>,
     relocs: &mut Vec<Reloc, A>,
+    positions: &mut Vec<PositionFix, A>,
     record: Option<&mut sites::Form<A>>,
 ) -> Result<(), EmitError> {
     if view.head.ptr_bits != 64 {
@@ -126,10 +137,24 @@ pub(crate) fn run<A: Allocator>(
     check_sig(view, isa, view.sigs[view.head.sig as usize], sig.params, sig.rets)
         .map_err(|why| EmitError::Signature { why })?;
 
-    // The frame: a 16-byte cell per value, then each slot at its alignment, then the staging
-    // words; `sp` aligned to the most any slot asks.
+    // The frame: a 16-byte cell per value, then the third word of each wide pair (in 16-byte
+    // steps, so every cell stays 16-aligned), then each slot at its alignment, then the
+    // staging words; `sp` aligned to the most any slot asks.
     let cells = view.len() as u64 * 16;
     let mut at = cells;
+    let mut wide_pair_at = Vec::with_capacity_in(view.len(), Global);
+    for value in 0..view.len() {
+        match wide::is_wide_pair(view, view.ty(Value(value as u32))) {
+            true => {
+                wide_pair_at.push(at as u32);
+                at += 16;
+                if at >= FRAME_LIMIT {
+                    return Err(EmitError::TooLarge { what: "the frame (16 MiB)" });
+                }
+            }
+            false => wide_pair_at.push(NONE),
+        }
+    }
     let mut most_align: u64 = 16;
     let mut slot_at = Vec::with_capacity_in(view.slots.len(), Global);
     for slot in view.slots {
@@ -164,6 +189,7 @@ pub(crate) fn run<A: Allocator>(
         code: bytes,
         fixups,
         relocs,
+        positions,
         words: Vec::new_in(Global),
         byval_fixes: Vec::new_in(Global),
         byval_most: 0,
@@ -174,9 +200,12 @@ pub(crate) fn run<A: Allocator>(
         data_index,
         placed: Vec::new_in(Global),
         slot_at,
+        wide_pair_at,
         staging_at: staging_at as u32,
         staging: 0,
         record,
+        most_align,
+        sp_fixes: Vec::new_in(Global),
     };
 
     // The prologue; the frame's size is patched in at the end, when the staging is known.
@@ -194,8 +223,10 @@ pub(crate) fn run<A: Allocator>(
     }
     // The parameters arrive in x0..x7, their bits above the width unspecified; an `sret`
     // pointer in x8, a `byval` one as the next integer parameter.
-    // A float in the next `v` register, an `i128` in an even pair (`Regs`).
+    // A float in the next `v` register, an `i128` in an even pair (`Regs`); past the
+    // registers, the caller's stacked area at `x29 + 16` (pass/stack.rs).
     let mut regs = Regs::new(isa.os);
+    let mut nsaa = stack::Nsaa::new(isa.os);
     for (inst, param) in view.params(Block(0)).zip(sig.params) {
         let ty = view.ty(Value(inst as u32));
         let reg = match param.kind == ParamKind::Sret as u8 {
@@ -210,7 +241,11 @@ pub(crate) fn run<A: Allocator>(
                     pass.v_in(v, inst, w);
                     continue;
                 }
-                None => return Err(EmitError::Signature { why: "an entry parameter past the registers" }),
+                None => {
+                    let slot = nsaa.place(ty).ok_or(EmitError::Signature { why: "a stacked entry parameter that is not a scalar" })?;
+                    pass.stacked_in(inst, ty, slot)?;
+                    continue;
+                }
             },
         };
         let width = pass.width(ty).ok_or(EmitError::Signature {
@@ -252,11 +287,16 @@ fn check_sig(view: View<'_>, isa: Isa, rec: SigRec, params: &[ParamRec], rets: &
     if srets > 1 {
         return Err("more than one `sret` parameter");
     }
+    // Past the registers, the stacked area (pass/stack.rs), bounded by one `sub sp` pair.
     let mut regs = Regs::new(isa.os);
+    let mut nsaa = stack::Nsaa::new(isa.os);
     for param in params.iter().filter(|it| it.kind != ParamKind::Sret as u8) {
-        if regs.next(Ty(param.ty)).is_none() {
-            return Err("more than 8 integer or 8 float parameters past an `sret` (the rest go on the stack)");
+        if regs.next(Ty(param.ty)).is_none() && nsaa.place(Ty(param.ty)).is_none() {
+            return Err("a stacked parameter that is not a scalar");
         }
+    }
+    if nsaa.end() >= stack::MOST_AREA {
+        return Err("stacked parameters past 1 MiB");
     }
     let mut regs = Regs::new(isa.os);
     for ret in rets {
@@ -640,13 +680,24 @@ impl<A: Allocator> Pass<'_, '_, A> {
         ty.compound_row().is_some() && members.len() == 2 && members.iter().all(|&it| self.width(Ty(it)).is_some())
     }
 
-    /// How many 8-byte words of its cell a value of `ty` takes: 2 for a pair, else 1.
+    /// How many 8-byte words a value takes: 3 for a wide pair, 2 for a pair, an `i128` or an
+    /// `f128`, else 1. Word `w` is at [`Self::value_word_at`].
     fn words_of(&self, value: Value) -> u32 {
         let ty = self.view.ty(value);
         match ty.compound_row() {
+            Some(_) if self.wide_pair_at[value.index()] != NONE => 3,
             Some(_) => 2,
             None if Self::is_wide(ty) => 2,
             None => FloatWidth::of(ty).map_or(1, FloatWidth::words),
+        }
+    }
+
+    /// The offset from `sp` of word `w` of value `value`: words 0 and 1 in its cell, word 2 (a
+    /// wide pair's member 1) past the cells.
+    fn value_word_at(&self, value: usize, w: u32) -> u32 {
+        match w {
+            0 | 1 => value as u32 * 16 + 8 * w,
+            _ => self.wide_pair_at[value],
         }
     }
 
@@ -661,34 +712,38 @@ impl<A: Allocator> Pass<'_, '_, A> {
             let at = arg.index();
             at >= start && at < start + n && at - start < k
         });
-        // A pair moves both of its words.
+        // A pair moves both of its words, a wide pair all three; a parameter has its
+        // argument's type, so its words are where the argument's are in its own cell.
         match clobbered {
             false => {
                 for (k, arg) in to.args.iter().enumerate() {
                     if arg.index() != start + k {
                         for w in 0..self.words_of(arg) {
-                            self.ld_sp(X9, arg.0 * 16 + 8 * w);
-                            self.st_sp(X9, (start + k) as u32 * 16 + 8 * w);
+                            self.ld_sp(X9, self.value_word_at(arg.index(), w));
+                            self.st_sp(X9, self.value_word_at(start + k, w));
                         }
                     }
                 }
             }
             true => {
-                let words = u32::try_from(2 * n).map_err(|_| EmitError::TooLarge { what: "a block's arguments" })?;
+                // Each argument's staging stretch holds its most words (two unless a wide pair
+                // is among them).
+                let most = to.args.iter().map(|arg| self.words_of(arg)).max().unwrap_or(2).max(2);
+                let words = u32::try_from(most as usize * n).map_err(|_| EmitError::TooLarge { what: "a block's arguments" })?;
                 if u64::from(self.staging_at) + 8 * u64::from(words) >= FRAME_LIMIT {
                     return Err(EmitError::TooLarge { what: "the frame (16 MiB)" });
                 }
                 self.staging = self.staging.max(words);
                 for (k, arg) in to.args.iter().enumerate() {
                     for w in 0..self.words_of(arg) {
-                        self.ld_sp(X9, arg.0 * 16 + 8 * w);
-                        self.st_sp(X9, self.staging_at + 16 * k as u32 + 8 * w);
+                        self.ld_sp(X9, self.value_word_at(arg.index(), w));
+                        self.st_sp(X9, self.staging_at + 8 * most * k as u32 + 8 * w);
                     }
                 }
                 for (k, arg) in to.args.iter().enumerate() {
                     for w in 0..self.words_of(arg) {
-                        self.ld_sp(X9, self.staging_at + 16 * k as u32 + 8 * w);
-                        self.st_sp(X9, (start + k) as u32 * 16 + 8 * w);
+                        self.ld_sp(X9, self.staging_at + 8 * most * k as u32 + 8 * w);
+                        self.st_sp(X9, self.value_word_at(start + k, w));
                     }
                 }
             }
@@ -784,11 +839,18 @@ impl<A: Allocator> Pass<'_, '_, A> {
             | Op::Sext
             | Op::Freeze
             | Op::Select
+            | Op::UaddSat
+            | Op::UsubSat
+            | Op::SaddSat
+            | Op::SsubSat
                 if Self::is_wide(result) =>
             {
                 return self.wide(inst, op);
             }
             Op::Store | Op::Trunc if Self::is_wide(view.ty(first(view))) => return self.wide(inst, op),
+            Op::Clz | Op::Ctz | Op::Popcnt | Op::Bswap | Op::Bitrev if Self::is_wide(view.ty(first(view))) => {
+                return self.wide_bits(inst, op);
+            }
             Op::Icmp => {
                 let mut ops = view.operands(inst);
                 ops.int_cond();
@@ -958,6 +1020,9 @@ impl<A: Allocator> Pass<'_, '_, A> {
             }
             Op::Project => {
                 let (pair, k) = (o.value(), o.imm());
+                if self.wide_pair_at[pair.index()] != NONE {
+                    return self.wide_project(inst, pair, k);
+                }
                 self.result_width(inst, op)?;
                 if !self.is_pair(view.ty(pair)) || k > 1 {
                     return Err(unsupported(inst, op, "a member of a compound that is not a pair of integers or pointers"));
@@ -1306,13 +1371,33 @@ impl<A: Allocator> Pass<'_, '_, A> {
         }
         self.byval_most = self.byval_most.max(area);
         let mut regs = Regs::new(isa.os);
+        let mut nsaa = stack::Nsaa::new(isa.os);
+        let mut stacked: Vec<stack::StackedArg, Global> = Vec::new_in(Global);
         let mut copy = copies.iter();
         for (arg, param) in args.iter().zip(sig.params) {
             if param.kind == ParamKind::Sret as u8 {
                 self.ld(X8, arg);
                 continue;
             }
-            let at = regs.next(Ty(param.ty)).ok_or(unsupported(inst, op, "an argument past the registers"))?;
+            let Some(at) = regs.next(Ty(param.ty)) else {
+                // Past the registers: stored once the area is open (pass/stack.rs).
+                let slot = nsaa.place(Ty(param.ty)).ok_or(unsupported(inst, op, "a stacked argument that is not a scalar"))?;
+                let byval = match ParamKind::from_byte(param.kind) {
+                    Some(ParamKind::Byval) => {
+                        let Some(&at) = copy.next() else {
+                            return Err(unsupported(inst, op, "a `byval` argument without its copy"));
+                        };
+                        Some(at)
+                    }
+                    _ => None,
+                };
+                let sext = match param.ext == Ext::Sext as u8 && byval.is_none() {
+                    true => self.width_of(inst, op, arg)?,
+                    false => 0,
+                };
+                stacked.push(stack::StackedArg { value: arg, slot, sext, byval });
+                continue;
+            };
             match (ParamKind::from_byte(param.kind), at) {
                 (Some(ParamKind::Byval), Loc::X(gpr)) => {
                     let Some(&at) = copy.next() else {
@@ -1336,10 +1421,11 @@ impl<A: Allocator> Pass<'_, '_, A> {
         // HERE, before the callee is loaded: the record's call site `adrp x16; ldr x16; blr x16`
         // has nothing between its words (pass/sites.rs, `import_callee`). While the area is
         // open every cell is `area` bytes higher above `sp`.
-        let area = match variadic {
-            true => self.place_varargs(inst, op, regs, blaze_lir::op::Values(&args.0[sig.params.len()..]))?,
-            false => 0,
+        let extra = match variadic {
+            true => &args.0[sig.params.len()..],
+            false => &[][..],
         };
+        let area = self.place_varargs(inst, op, regs, blaze_lir::op::Values(extra), &stacked, nsaa.end())?;
         match (callee, indirect) {
             (Some((literal, via)), _) => {
                 self.put_to(enc::ldr_lit(X16, 0), Field::Imm19, Label::Literal(literal));
@@ -1390,6 +1476,8 @@ impl<A: Allocator> Pass<'_, '_, A> {
         // First: the tail is instructions, so it precedes every literal word and data row
         // (the record form counts `insts` from here on).
         self.place_frame(frame_at, most_align)?;
+        let frame = self.frame_bytes(most_align)?;
+        self.patch_restores(frame);
         if self.in_record() {
             // The record form places no literal word (pass/sites.rs).
             return self.finish_record();
@@ -1420,6 +1508,18 @@ impl<A: Allocator> Pass<'_, '_, A> {
             let start = self.here();
             data_at.push(start);
             self.code.extend_from_slice(self.view.data_bytes_of(DataId(row)));
+            for p in self.view.data_positions_of(DataId(row)) {
+                if u64::from(p.offset) + 4 > u64::from(rec.bytes_len) {
+                    return Err(EmitError::Data { row, why: "a source position past its row's end" });
+                }
+                let Some(field) = blaze_lir::PositionField::from_word(p.field) else {
+                    return Err(EmitError::Data { row, why: "a source position of no known field" });
+                };
+                let at = start + p.offset;
+                // Placement writes the field: the code's bytes there are zero whatever the row held.
+                self.code[at as usize..at as usize + 4].fill(0);
+                self.positions.push(PositionFix { at, item: p.item_key(), site: p.site, field });
+            }
             for r in self.view.data_relocs_of(DataId(row)) {
                 if u64::from(r.offset) + 8 > u64::from(rec.bytes_len) {
                     return Err(EmitError::Data { row, why: "a relocation past its row's end" });

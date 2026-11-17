@@ -35,7 +35,7 @@ use blaze_typeck::ItemKey;
 use super::check::Records;
 use super::fill::FillError;
 use super::heads::{HeadError, Store};
-use super::item_shown::{ItemShown, head_error_shown};
+use super::item_shown::{ItemShown, head_error_shown, impl_shown};
 use super::keys::{Keys, MemberKind, Origin};
 use super::locals::LocalKind;
 use super::source::NamesSource;
@@ -132,7 +132,7 @@ impl RowPath {
             }
             match names.text_of(lib).and_then(|t| t.impl_header) {
                 // An impl: its header as written.
-                Some(header) => segments.push(format!("<{}>", header.trim())),
+                Some(header) => segments.push(impl_shown(header)),
                 // A nameless item that is no impl (`const _: () = { .. }`, an extern block):
                 // its kind as its row says it, `{const}`.
                 None => {
@@ -190,7 +190,7 @@ fn local_impl_segment(text: &str) -> Option<String> {
         let after = head[i + 4..].chars().next();
         before.is_none_or(|c| !(c.is_alphanumeric() || c == '_')) && after.is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
     })?;
-    Some(format!("<{}>", head[at..].trim()))
+    Some(impl_shown(&head[at..]))
 }
 
 /// The word a nameless body-local item's segment is written with (`{const}`), as blaze-surface

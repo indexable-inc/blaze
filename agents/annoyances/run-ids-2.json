@@ -1,0 +1,14 @@
+{
+ "id": "run-ids-2",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), write-only lane I, piece P0 (RunIds at the StartProgram site) on rebuild-1115",
+ "where": "crates/blaze-cli/src/run_ids.rs `for_run` against crates/blaze-drive/src/request.rs (`settled_input`, `certified`) and answers.rs (`read_root`)",
+ "what": "At StartProgram a warm `blaze run` that stood on its certificate holds no answer row: request.rs loads no root and no page on a certificate hit, so `settled_input` knows only the ask's facts. RunIds needs each body's UnitGraph and Owners outs and its record's reads, so it can key nothing there. blaze-drive's root and certificate readers are pub(crate), so blaze-cli cannot read a row by name without copying the page logic.",
+ "cost": "an hour of reading request.rs and answers.rs to establish what the request holds at the start",
+ "cause": "the certificate fast path starts the program before any row is read, and the drive exposes no row-by-name read",
+ "whys": "the certificate was designed for 'nothing changed: start now'; D124's per-body check-first gate came after it",
+ "class": "a fast path that skips the data a later gate needs",
+ "prevention": "wanted: a pub blaze-drive read of one answer row by name (root at the certificate's root key, then `answers::page_of`'s page), or one record per answer keyed by the certificate holding (checker key, body name, text, file, at)",
+ "workaround": "`for_run` refuses a request with no UnitGraph row by name (`RunIdsError::StoodUnread`)",
+ "state": "open"
+}

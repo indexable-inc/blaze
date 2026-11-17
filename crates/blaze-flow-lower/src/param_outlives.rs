@@ -127,7 +127,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                     }
                 }
                 PNode::Adt(k, l) => {
-                    let lifetimes = u32::from(self.adt_facts(k, e)?.lifetimes);
+                    let lifetimes = self.adt_facts(k, e)?.lifetimes;
                     let mut off = at + lifetimes;
                     for &x in self.list(l, e)? {
                         stack.push((x, off, under, in_adt || lifetimes > 0));

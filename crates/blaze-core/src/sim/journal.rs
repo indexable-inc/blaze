@@ -5,7 +5,7 @@
 //! resets, truncates or loses parts of it to check that a watcher names each loss and looks
 //! again only where it was.
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use std::alloc::Global;
 
 use super::SimFile;
@@ -50,7 +50,7 @@ pub(super) struct Disk {
     wall_ns: u64,
     next_ino: u64,
     /// Every file and directory there, by name.
-    inodes: HashMap<FileName, Inode, Global>,
+    inodes: Map<FileName, Inode, FixedState, Global>,
     /// The journal's ID, the sequence number of its oldest entry kept, and its entries.
     id: u64,
     first: u64,
@@ -103,7 +103,7 @@ impl Disk {
     pub(super) fn touched(
         &mut self,
         file: &FileName,
-        files: &HashMap<FileName, SimFile, Global>,
+        files: &Map<FileName, SimFile, FixedState, Global>,
     ) -> Cursor {
         let there = files.contains_key(file);
         let now = self.tick();
@@ -163,7 +163,7 @@ impl Disk {
 
     /// A name under the directories above `name` went: those left with nothing go too, and
     /// the first left with something has a name fewer.
-    fn left(&mut self, name: &FileName, files: &HashMap<FileName, SimFile, Global>) {
+    fn left(&mut self, name: &FileName, files: &Map<FileName, SimFile, FixedState, Global>) {
         // clone: a name of the simulated disk's, walked up.
         let mut at = name.clone();
         while let Some(up) = parent(&at) {
@@ -200,7 +200,7 @@ impl Disk {
     /// count's change does; `to`'s touch, which comes next, moves its change time only, as a
     /// rename's. Every later change of either name is the other's ([`Disk::share`]). A name
     /// of the pair removed leaves the other its inode.
-    pub(super) fn linked(&mut self, from: &FileName, to: &FileName, files: &HashMap<FileName, SimFile, Global>) {
+    pub(super) fn linked(&mut self, from: &FileName, to: &FileName, files: &Map<FileName, SimFile, FixedState, Global>) {
         // The source's inode, made if it was never looked at.
         self.stamp(from, files);
         let mut inode = self.inodes[from];
@@ -242,7 +242,7 @@ impl Disk {
         &mut self,
         name: &FileName,
         modified_ns: u64,
-        files: &HashMap<FileName, SimFile, Global>,
+        files: &Map<FileName, SimFile, FixedState, Global>,
     ) -> bool {
         if self.stamp(name, files) == Stamp::GONE {
             return false;
@@ -280,7 +280,7 @@ impl Disk {
     pub(super) fn stamp(
         &mut self,
         name: &FileName,
-        files: &HashMap<FileName, SimFile, Global>,
+        files: &Map<FileName, SimFile, FixedState, Global>,
     ) -> Stamp {
         if let Some(file) = files.get(name) {
             if !self.inodes.contains_key(name) {
@@ -319,7 +319,7 @@ impl Disk {
     pub(super) fn entries(
         &mut self,
         dir: &crate::DirName,
-        files: &HashMap<FileName, SimFile, Global>,
+        files: &Map<FileName, SimFile, FixedState, Global>,
     ) -> Option<crate::Listing> {
         if dir.name().is_some_and(|name| files.contains_key(name)) {
             return None;

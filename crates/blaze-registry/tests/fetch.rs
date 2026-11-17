@@ -10,7 +10,7 @@ use std::{
     sync::Arc,
 };
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_registry::{
     Context, Locked, Package, Registry, SourceConfig, SourceDef, Sources,
     download::{From, checksum, crate_url, unpack_package_in},
@@ -27,14 +27,14 @@ const BASE: &str = "https://index.example.com/";
 
 /// Files by URL, each with an ETag, and every request asked of it.
 struct Server {
-    files: Lock<HashMap<String, (Vec<u8>, String), Global>>,
+    files: Lock<Map<String, (Vec<u8>, String), FixedState, Global>>,
     asked: Lock<Vec<(String, Vec<(String, String)>)>>,
 }
 
 impl Default for Server {
     fn default() -> Server {
         Server {
-            files: Lock::new("registry.test.fetch.files", HashMap::new_in(Global)),
+            files: Lock::new("registry.test.fetch.files", Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None })),
             asked: Lock::new("registry.test.fetch.asked", Vec::new()),
         }
     }

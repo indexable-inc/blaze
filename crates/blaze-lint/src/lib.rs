@@ -20,9 +20,13 @@
 //! # The floor (rule 67)
 //!
 //! A lint pass must read every byte of the item's own text once: the floor is one lex of those
-//! bytes. The pass adds a walk over the significant tokens (whitespace and comments dropped
-//! while lexing) with a few comparisons per word, and short forward scans at a handful of
-//! words (`fn`, `type`, `[`, a test attribute). The example (`examples/run.rs`) prints the lex
+//! bytes, plus one table probe per identifier. Each identifier gets its word number while it is
+//! lexed, one probe of a perfect hash fixed at compile time (`sequences::WORDS`); a word no rule
+//! reads costs nothing more. Every rule that looks for a token sequence (`todo !`, `. await`,
+//! `Vec :: new (`) shares one trie built at compile time (`matcher`): per token, one load for
+//! the root and one per live state (at most the longest sequence's length, usually none), the
+//! same for one sequence rule or fifty. The other rules keep their dispatch on the word, with
+//! short forward scans at a handful of words (`fn`, `type`, `[`, a test attribute, `loop {`). The example (`examples/run.rs`) prints the lex
 //! of the same bytes beside the lint, and their ratio. Measured 2026-11-16 on the integration
 //! tree's `crates/` (4,767 files, 89 MB, 290,858 units, one thread): lint 492 ms, lex 161 ms, a
 //! ratio of 3.05; with no rule enabled 379 ms. So the distance to the floor is per unit (scratch
@@ -37,15 +41,18 @@
 //! kinds; only [`Input::Text`] is built.
 
 #![no_std]
-#![feature(allocator_api)]
+#![feature(allocator_api, variant_count)]
 
 #[cfg(test)]
 extern crate std;
 
 mod engine;
 mod fix;
+mod matcher;
 mod message;
+mod sequences;
 mod units;
+mod variants;
 
 #[cfg(test)]
 mod tests;
@@ -55,6 +62,7 @@ use blaze_own::{AVec, Alloc};
 pub use fix::{FixError, apply, apply_all};
 pub use message::show_message;
 pub use units::{UnitLinted, UnitPlan, Units};
+pub use variants::Variants;
 
 /// A byte range of an item's text, relative to the item's first byte (rule 71).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -136,10 +144,67 @@ pub enum Rule {
     FormatMacro = 9,
     /// A name that moved: an old method name of blaze-own's collections.
     Renamed = 10,
+    /// A heap reached for instead of handed down: the process's allocator (`Alloc::global()`,
+    /// `Heap::process()`), or std's heap with no allocator named (`Vec::new()`, `format!`,
+    /// `.to_string()`).
+    AmbientHeap = 11,
+    /// `async` code: blaze's own code is explicit state machines (`async fn`, `async {`,
+    /// `.await`).
+    NoAsync = 12,
+    /// A read of process state not passed in (rule 75): the clock, the environment, randomness,
+    /// a hash seed, the process itself.
+    AmbientRead = 13,
+    /// Work left undone: `todo!`, `unimplemented!`, `dbg!`, and `unreachable!()` with no message.
+    LeftUndone = 14,
+    /// A wait with no deadline (rule 18): `.recv()`, `.join()`, `.wait()`, `.lock()` with no
+    /// argument, and a `loop` with no `break`, `return` or `?`.
+    UnboundedWait = 15,
+    /// A hash table whose hasher is not written at the use (decision D125): std's or hashbrown's
+    /// tables and hashers (`std::collections::HashMap`, `hash_map::RandomState`,
+    /// `DefaultHasher`), and the constructors that build the hasher from `Default`
+    /// (`HashMap::new_in(`, `IndexSet::with_capacity_in(`).
+    AmbientHasher = 16,
+    /// An integer literal equal to the number of variants of an enum of its file, where a count
+    /// is meant (a `const`'s whole value, an array's length, a range's end): written
+    /// `core::mem::variant_count::<E>()` it cannot go stale (variants.rs). The one rule that
+    /// reads its file, through [`Variants`].
+    VariantCount = 17,
+    /// An options struct (`#[blaze::args]`, rule 83, D126) written other than as a literal
+    /// directly in the call that takes it: a TYPED rule, decided by the body check (blaze-typeck
+    /// rules/args_inline.rs), never by this crate's token pass ([`Rule::typed`]). On from
+    /// [`Step::Edition`] (advice), an error in [`Step::Strict`] ([`Step::levels`]).
+    ArgsInline = 18,
 }
 
 impl Rule {
-    pub const ALL: [Rule; 10] = [
+    /// How many rules there are: the largest id.
+    pub const COUNT: usize = core::mem::variant_count::<Rule>();
+
+    /// Every rule, by id.
+    pub const ALL: [Rule; Rule::COUNT] = [
+        Rule::Casts,
+        Rule::Clones,
+        Rule::Allocs,
+        Rule::Untyped,
+        Rule::Recursion,
+        Rule::Stops,
+        Rule::Ambient,
+        Rule::UnsafeComment,
+        Rule::FormatMacro,
+        Rule::Renamed,
+        Rule::AmbientHeap,
+        Rule::NoAsync,
+        Rule::AmbientRead,
+        Rule::LeftUndone,
+        Rule::UnboundedWait,
+        Rule::AmbientHasher,
+        Rule::VariantCount,
+        Rule::ArgsInline,
+    ];
+
+    /// The ten rules ported from blaze's scripts: what [`Step::Strict`] runs. The rules after
+    /// them run only where a workspace names them ([`Rule::from_name`], [`RuleSet::with`]).
+    pub const HOUSE: [Rule; 10] = [
         Rule::Casts,
         Rule::Clones,
         Rule::Allocs,
@@ -169,7 +234,28 @@ impl Rule {
             Rule::UnsafeComment => "unsafe-comment",
             Rule::FormatMacro => "format-macro",
             Rule::Renamed => "renamed",
+            Rule::AmbientHeap => "ambient-heap",
+            Rule::NoAsync => "no-async",
+            Rule::AmbientRead => "ambient-read",
+            Rule::LeftUndone => "left-undone",
+            Rule::UnboundedWait => "unbounded-wait",
+            Rule::AmbientHasher => "ambient-hasher",
+            Rule::VariantCount => "variant-count",
+            Rule::ArgsInline => "args-inline",
         }
+    }
+
+    /// Whether the rule is typed: decided by the body check from types (its findings are the
+    /// `BodyCheck` task's records, filed whatever the step, rule 81), never by the token pass.
+    /// A typed rule is in no [`RuleSet`] a step makes, so a token record's key never moves with
+    /// it; the step turns it on through its level alone ([`Step::levels`]).
+    pub const fn typed(self) -> bool {
+        matches!(self, Rule::ArgsInline)
+    }
+
+    /// The rule configuration names `name` ([`Rule::name`]'s spelling), if any.
+    pub fn from_name(name: &str) -> Option<Rule> {
+        Rule::ALL.into_iter().find(|rule| rule.name() == name)
     }
 
     /// The rule's version: raised whenever what it finds changes, so a record of the old one is
@@ -185,12 +271,13 @@ impl Rule {
 
     /// The test code a site in exempts it from this rule: allocs.rs reads only `#[cfg(test)]`
     /// (and test files), every other rule test functions (`#[test]`, `#[x::test]`) too; an
-    /// `unsafe` needs its comment in tests as anywhere.
+    /// `unsafe` needs its comment in tests as anywhere, and a count goes stale in a test as
+    /// anywhere.
     #[inline]
     pub const fn exempt(self) -> TestBits {
         match self {
             Rule::Allocs => TestBits::CFG,
-            Rule::UnsafeComment => TestBits::NONE,
+            Rule::UnsafeComment | Rule::VariantCount => TestBits::NONE,
             _ => TestBits::ANY,
         }
     }
@@ -255,6 +342,55 @@ pub enum Template {
     /// An old name only blaze-own has, on a receiver of unknown type: for a person; argument:
     /// the row.
     RenamedReport = 81,
+    /// The process's heap reached for (`Alloc::global(`, `Heap::process(`); argument: the row of
+    /// the sequence table, whose words say what to take instead.
+    HeapReach = 90,
+    /// A std constructor that allocates with no allocator named (`Vec::new(`); argument: the
+    /// row. Whether the type is std's is not known from text (a user type may be named `Vec`).
+    HeapConstructor = 91,
+    /// An allocating macro (`vec!`, `format!`); argument: the row.
+    HeapMacro = 92,
+    /// An allocating method (`.to_string(`, `.to_owned(`, `.to_vec(`); argument: the row.
+    HeapMethod = 93,
+    /// `async` before `fn`, `unsafe`, `move`, `{` or `|`.
+    Async = 100,
+    /// `.await`.
+    Await = 101,
+    /// The clock read (`Instant::now(`); argument: the row.
+    ReadClock = 110,
+    /// The environment read (`env::var(`); argument: the row.
+    ReadEnv = 111,
+    /// Randomness read (`thread_rng(`); argument: the row.
+    ReadRandom = 112,
+    /// A hash seed drawn from the process (`HashMap::new(`); argument: the row.
+    ReadHashSeed = 113,
+    /// The process's own state (`process::exit(`, `process::id(`); argument: the row.
+    ReadProcess = 114,
+    UndoneTodo = 120,
+    UndoneUnimplemented = 121,
+    /// `dbg!`; fixed, by taking the macro away, where its argument is a value (a call, a
+    /// literal), so the program keeps the value and loses only the print.
+    UndoneDbg = 122,
+    /// `unreachable!()` with no message.
+    UndoneUnreachable = 123,
+    /// A wait call with no argument (`.recv()`, `.join()`, `.wait()`, `.lock()`); argument: the
+    /// row.
+    WaitCall = 130,
+    /// A `loop` whose braces hold no `break`, `return` or `?`.
+    WaitLoop = 131,
+    /// A std or hashbrown table or hasher named by its path (`collections::HashMap`,
+    /// `hash_map::RandomState`, `hashbrown::HashSet`); argument: the row.
+    HasherStd = 140,
+    /// A constructor that builds its table's hasher from `Default` (`HashMap::new_in(`);
+    /// argument: the row, whose words are the explicit form.
+    HasherDefault = 141,
+    /// A literal that is the variant count of one enum of the file; arguments: why it is not
+    /// fixed (`variants::FIXED` when it is) and the enum's name. Fixed to
+    /// `core::mem::variant_count::<E>()` where the bare name reaches it and the type is `usize`.
+    VariantCount = 150,
+    /// A literal that is the variant count of two or more enums of the file: which it counts is
+    /// for a person; arguments: a placeholder, then each enum's name.
+    VariantCountMany = 151,
 }
 
 impl Template {
@@ -269,7 +405,14 @@ impl Template {
             50..=52 => Rule::Ambient,
             60 => Rule::UnsafeComment,
             70 => Rule::FormatMacro,
-            _ => Rule::Renamed,
+            80..=81 => Rule::Renamed,
+            90..=93 => Rule::AmbientHeap,
+            100..=101 => Rule::NoAsync,
+            110..=114 => Rule::AmbientRead,
+            120..=123 => Rule::LeftUndone,
+            130..=131 => Rule::UnboundedWait,
+            140..=141 => Rule::AmbientHasher,
+            _ => Rule::VariantCount,
         }
     }
 
@@ -305,15 +448,38 @@ impl Template {
             Template::FormatMacro => "format",
             Template::RenamedFixed => "fixed",
             Template::RenamedReport => "for-a-person",
+            Template::HeapReach => "reach",
+            Template::HeapConstructor => "constructor",
+            Template::HeapMacro => "macro",
+            Template::HeapMethod => "method",
+            Template::Async => "async",
+            Template::Await => "await",
+            Template::ReadClock => "clock",
+            Template::ReadEnv => "env",
+            Template::ReadRandom => "random",
+            Template::ReadHashSeed => "hash-seed",
+            Template::ReadProcess => "process",
+            Template::UndoneTodo => "todo",
+            Template::UndoneUnimplemented => "unimplemented",
+            Template::UndoneDbg => "dbg",
+            Template::UndoneUnreachable => "unreachable-no-message",
+            Template::WaitCall => "call",
+            Template::WaitLoop => "loop",
+            Template::HasherStd => "std-table",
+            Template::HasherDefault => "default-hasher",
+            Template::VariantCount => "count",
+            Template::VariantCountMany => "count-many",
         }
     }
 }
 
-/// One argument of a message: a range of the item's text, or an integer (a table row).
+/// One argument of a message: a range of the item's text, an integer (a table row), or text
+/// from outside the item (a name the file declares elsewhere), a run of [`Findings::text`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Arg {
     Span(Span),
     Int(u32),
+    Text(Run),
 }
 
 /// One finding of one rule in one item (rule 81): no level, an item-relative range.
@@ -391,10 +557,16 @@ impl<'a> Findings<'a> {
 
     /// The replacement text of `edit`.
     pub fn text_of(&self, edit: &Edit) -> &str {
-        // The text column holds only whole `&str`s pushed by the rules (`push_edit`).
-        match core::str::from_utf8(&self.text[edit.text.range()]) {
-            Ok(text) => text,
-            Err(_) => unreachable_text(),
+        self.text_in(edit.text)
+    }
+
+    /// The run `run` of the text column: an edit's replacement or an [`Arg::Text`].
+    pub fn text_in(&self, run: Run) -> &str {
+        // The text column holds only whole `&str`s pushed by the rules (`push_edit`,
+        // variants.rs's names, copied from the file's text at token bounds).
+        match self.text.get(run.range()).map(core::str::from_utf8) {
+            Some(Ok(text)) => text,
+            _ => unreachable_text(),
         }
     }
 
@@ -668,6 +840,11 @@ impl RuleSet {
         RuleSet { enabled, renames: &RENAMES }
     }
 
+    /// `self` and `rule`: how a workspace adds a rule its step does not run.
+    pub const fn with(self, rule: Rule) -> RuleSet {
+        RuleSet { enabled: self.enabled | rule.bit(), renames: self.renames }
+    }
+
     #[inline]
     pub const fn runs(&self, rule: Rule) -> bool {
         self.enabled & rule.bit() != 0
@@ -710,11 +887,11 @@ pub enum Level {
 
 /// A level per rule: the configuration's, read at print time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Levels(pub [Level; 10]);
+pub struct Levels(pub [Level; Rule::COUNT]);
 
 impl Levels {
     /// Everything advice: the scripts' ratchets are counts that go down, not errors yet.
-    pub const ADVICE: Levels = Levels([Level::Advice; 10]);
+    pub const ADVICE: Levels = Levels([Level::Advice; Rule::COUNT]);
 
     pub const fn of(&self, rule: Rule) -> Level {
         self.0[rule as usize - 1]
@@ -734,15 +911,21 @@ pub enum Step {
     Suggest,
     /// And what the blaze edition makes an error later: stops, casts, clones; still advice.
     Edition,
-    /// Every rule, at blaze's own levels.
+    /// The ten house rules ([`Rule::HOUSE`]), at blaze's own levels, and `variant-count`, which
+    /// every step from [`Step::Suggest`] runs. The other rules after them (`ambient-heap`,
+    /// `no-async`, `ambient-read`, `left-undone`, `unbounded-wait`, `ambient-hasher`) are on only
+    /// where a workspace names them: a step adds them with [`RuleSet::with`].
     Strict,
 }
 
 impl Step {
-    /// The rules of [`Step::Suggest`].
-    pub const SUGGEST: [Rule; 3] = [Rule::UnsafeComment, Rule::Untyped, Rule::Recursion];
+    /// The rules of [`Step::Suggest`]. `variant-count` is a defect class in any Rust (a count
+    /// that a new variant leaves stale); its fix names a nightly feature, which blaze's own
+    /// toolchain has.
+    pub const SUGGEST: [Rule; 4] = [Rule::UnsafeComment, Rule::Untyped, Rule::Recursion, Rule::VariantCount];
     /// The rules of [`Step::Edition`].
-    pub const EDITION: [Rule; 6] = [Rule::UnsafeComment, Rule::Untyped, Rule::Recursion, Rule::Stops, Rule::Casts, Rule::Clones];
+    pub const EDITION: [Rule; 7] =
+        [Rule::UnsafeComment, Rule::Untyped, Rule::Recursion, Rule::VariantCount, Rule::Stops, Rule::Casts, Rule::Clones];
 
     /// The step as configuration writes it (`rust`, `suggest`, `edition`, `strict`).
     pub fn from_name(name: &str) -> Option<Step> {
@@ -770,13 +953,22 @@ impl Step {
             Step::Rust => RuleSet::only(&[]),
             Step::Suggest => RuleSet::only(&Step::SUGGEST),
             Step::Edition => RuleSet::only(&Step::EDITION),
-            Step::Strict => RuleSet::ALL,
+            Step::Strict => RuleSet::only(&Rule::HOUSE).with(Rule::VariantCount),
         }
     }
 
-    /// The levels this step prints its findings at: advice below [`Step::Strict`].
+    /// The levels this step prints its findings at: advice for every token rule (one a step
+    /// does not run makes no finding). A typed rule ([`Rule::typed`]) files its findings at
+    /// every step, so its level is what turns it on: `args-inline` is off below
+    /// [`Step::Edition`] (a blaze-edition API rule), advice there, an error in [`Step::Strict`].
     pub const fn levels(self) -> Levels {
-        Levels::ADVICE
+        let mut levels = Levels::ADVICE.0;
+        levels[Rule::ArgsInline as usize - 1] = match self {
+            Step::Rust | Step::Suggest => Level::Off,
+            Step::Edition => Level::Advice,
+            Step::Strict => Level::Error,
+        };
+        Levels(levels)
     }
 }
 
@@ -810,6 +1002,8 @@ pub enum LintError {
     BadHole { index: usize, hole: Span },
     /// A column would hold more entries than a `u32` counts.
     TooMany,
+    /// A file's table would pass its cap (rule 18): what it counts, and the cap.
+    Capped { what: &'static str, cap: u32 },
 }
 
 #[inline]
@@ -817,11 +1011,35 @@ fn count(n: usize) -> Result<u32, LintError> {
     u32::try_from(n).map_err(|_| LintError::TooMany)
 }
 
-/// Lints one item: every rule of `rules` in one pass over the tokens of `unit`'s own bytes,
-/// findings pushed onto `out`, scratch in `alloc` (freed on return). No recursion, no allocation
-/// per token.
+/// Lints one item that is its whole file (a test's text, a one-item file): [`lint_in`] with the
+/// file's [`Variants`] gathered from `unit.text` itself, when `variant-count` runs. A driver
+/// linting the units of a larger file calls [`lint_in`] with the file's fact, gathered once.
 pub fn lint<'a>(rules: &RuleSet, unit: &Unit<'_>, alloc: Alloc<'a>, out: &mut Findings<'a>) -> Result<Linted<'a>, LintError> {
-    engine::run(rules, unit, alloc, out)
+    let variants = match rules.runs(Rule::VariantCount) {
+        true => Variants::gather(unit.text, alloc)?,
+        false => Variants::new_in(alloc),
+    };
+    lint_in(rules, unit, &variants, 0, alloc, out)
+}
+
+/// Lints one item of a file: every rule of `rules` in one pass over the tokens of `unit`'s own
+/// bytes, findings pushed onto `out`, scratch in `alloc` (freed on return); no recursion, no
+/// allocation per token. `variant-count` reads `variants`, the fact of the file `unit` is the
+/// range from `base` of ([`Variants::gather`]); its findings follow the pass's.
+pub fn lint_in<'a>(
+    rules: &RuleSet,
+    unit: &Unit<'_>,
+    variants: &Variants<'_>,
+    base: u32,
+    alloc: Alloc<'a>,
+    out: &mut Findings<'a>,
+) -> Result<Linted<'a>, LintError> {
+    let mut linted = engine::run(rules, unit, alloc, out)?;
+    if rules.runs(Rule::VariantCount) {
+        variants.find(unit, base, out)?;
+        linted.findings.to = count(out.list.len())?;
+    }
+    Ok(linted)
 }
 
 /// The tokens of a whole text, counted: what the floor of a lint pass over it is (one lex). The

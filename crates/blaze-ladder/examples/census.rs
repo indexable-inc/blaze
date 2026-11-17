@@ -203,7 +203,7 @@ fn seen(lowered: &Lowered<'_, '_>, item_start: u32) -> Seen {
     if out.is_empty() { Seen::Clean } else { Seen::Refused(out) }
 }
 
-fn tally(root: &Path) -> Tally {
+fn tally(root: &Path, alloc: Alloc<'_>) -> Tally {
     let mut t = Tally::default();
     for path in rust_files(root) {
         let shown = path.display().to_string();
@@ -215,7 +215,7 @@ fn tally(root: &Path) -> Tally {
             }
         };
         t.files += 1;
-        let outline = blaze_file_items::outline(&text, EDITION, Alloc::global());
+        let outline = blaze_file_items::outline(&text, EDITION, alloc);
         let errors = outline.errors();
         t.unparsed += usize::from(!errors.is_empty());
         for item in outline.items() {
@@ -244,8 +244,8 @@ fn tally(root: &Path) -> Tally {
                 let stages: &[Stage] = if has_body { &[Stage::Signature, Stage::Body] } else { &[Stage::Signature] };
                 for &stage in stages {
                     let lowered = match stage {
-                        Stage::Body => blaze_lower::lower_body(item_text, EDITION, &mut HostCfg, &mut blaze_lower::NoModule, Alloc::global()),
-                        _ => blaze_lower::lower_signature(item_text, EDITION, &mut HostCfg, Alloc::global()),
+                        Stage::Body => blaze_lower::lower_body(item_text, EDITION, &mut HostCfg, &mut blaze_lower::NoModule, alloc),
+                        _ => blaze_lower::lower_signature(item_text, EDITION, &mut HostCfg, alloc),
                     };
                     let lowered = match lowered {
                         Ok(lowered) => lowered,
@@ -424,7 +424,7 @@ struct Found {
 }
 
 /// The first refusal of one fn item's text, or `None` when it lowers clean.
-fn first_refusal(shown: &str, text: &str, item: &blaze_surface::Item, outline_ok: bool) -> Option<(&'static str, String, String)> {
+fn first_refusal(shown: &str, text: &str, item: &blaze_surface::Item, outline_ok: bool, alloc: Alloc<'_>) -> Option<(&'static str, String, String)> {
     let start = item.range.start;
     if !outline_ok {
         return Some(("outline", "a syntax error in the file".to_string(), place(shown, text, start)));
@@ -432,8 +432,8 @@ fn first_refusal(shown: &str, text: &str, item: &blaze_surface::Item, outline_ok
     let item_text = item.range.of(text);
     for stage in [Stage::Signature, Stage::Body] {
         let lowered = match stage {
-            Stage::Body => blaze_lower::lower_body(item_text, EDITION, &mut HostCfg, &mut blaze_lower::NoModule, Alloc::global()),
-            _ => blaze_lower::lower_signature(item_text, EDITION, &mut HostCfg, Alloc::global()),
+            Stage::Body => blaze_lower::lower_body(item_text, EDITION, &mut HostCfg, &mut blaze_lower::NoModule, alloc),
+            _ => blaze_lower::lower_signature(item_text, EDITION, &mut HostCfg, alloc),
         };
         let Ok(lowered) = lowered else {
             return Some(("lowering", "a `cfg` this census does not answer".to_string(), place(shown, text, start)));
@@ -449,7 +449,7 @@ fn first_refusal(shown: &str, text: &str, item: &blaze_surface::Item, outline_ok
 }
 
 /// The census of one measured list: per function, the first stage that refuses it and why.
-fn functions(list: &Path, roots: &[String]) {
+fn functions(list: &Path, roots: &[String], alloc: Alloc<'_>) {
     let Ok(list) = std::fs::read_to_string(list) else {
         eprintln!("census: cannot read {}", list.display());
         std::process::exit(2);
@@ -462,7 +462,7 @@ fn functions(list: &Path, roots: &[String]) {
             files.push((path.display().to_string(), text));
         }
     }
-    let outlines: Vec<_> = files.iter().map(|(_, text)| blaze_file_items::outline(text, EDITION, Alloc::global())).collect();
+    let outlines: Vec<_> = files.iter().map(|(_, text)| blaze_file_items::outline(text, EDITION, alloc)).collect();
     let mut found: Vec<Found> = Vec::new();
     for w in &wanted {
         let mut hit = None;
@@ -500,7 +500,7 @@ fn functions(list: &Path, roots: &[String]) {
                     continue;
                 }
                 let at = place(shown, text, item.range.start);
-                hit = Some(match first_refusal(shown, text, item, ok) {
+                hit = Some(match first_refusal(shown, text, item, ok, alloc) {
                     Some((stage, cause, at)) => Found { at, stage, cause },
                     None => Found {
                         at,
@@ -545,13 +545,18 @@ fn main() {
         eprintln!("usage: census <crate dir or .rs file>... | census --fns <list> <crate dir or .rs file>...");
         std::process::exit(2);
     }
+    // The program's one allocator, made here at its top and handed down: a frame, whose memory
+    // comes from the OS (no global heap).
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).unwrap_or_else(|e| panic!("census: the frame: {e}"));
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
     if args[0] == "--fns" && args.len() > 2 {
-        functions(Path::new(&args[1]), &args[2..]);
+        functions(Path::new(&args[1]), &args[2..], alloc);
         return;
     }
     let mut all = Tally::default();
     for a in &args {
-        let t = tally(Path::new(a));
+        let t = tally(Path::new(a), alloc);
         t.print(a);
         all.add(&t);
     }

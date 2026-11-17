@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_manifest::config::schema::FeatureUnification;
 use blaze_manifest::files::Files;
 use blaze_manifest::manifest::{EitherManifest, Manifest, read_manifest};
@@ -21,8 +21,7 @@ use blaze_resolve::resolver::{
 };
 use blaze_resolve::workspace_resolve::{PackageRegistry, resolve_ws};
 use blaze_resolve::{
-    Dependency, IndexSummary, MemRegistry, PackageId, PackageIdSpec, QueryKind, Registry, Resolve,
-    ResolveVersion, RustVersion, SourceId, Summary,
+    Dependency, IndexSummary, MemRegistry, PackageId, PackageIdSpec, Resolve, ResolveVersion, RustVersion, SourceId, Summary,
 };
 use std::alloc::Global;
 
@@ -55,9 +54,9 @@ pub(crate) struct Resolved<'a> {
     pub new_cli_feature_behavior: bool,
     pub behavior: ResolveBehavior,
     pub has_dev_units: HasDevUnits,
-    pub reads: HashMap<PackageId, Read, Global>,
+    pub reads: Map<PackageId, Read, FixedState, Global>,
     /// The manifest of every package of the resolve, and where it is.
-    pub manifests: HashMap<PackageId, (&'a Path, &'a Manifest), Global>,
+    pub manifests: Map<PackageId, (&'a Path, &'a Manifest), FixedState, Global>,
     pub lock: Option<LockWrite>,
     /// What cargo warns of while selecting the packages.
     pub warnings: Vec<String>,
@@ -152,7 +151,7 @@ pub(crate) fn resolved<'r, 'db, R>(
     }
     let members: Vec<(&Path, &Manifest)> = ws.members().collect();
     let known = members.len() + owned.len();
-    let mut reads: HashMap<PackageId, Read, Global> = HashMap::with_capacity_in(known, Global);
+    let mut reads: Map<PackageId, Read, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(known) });
     // Of each of `members` then `owned`, in order, its id.
     let mut ids: Vec<PackageId> = Vec::with_capacity(known);
     let all = members.iter().map(|(path, m)| (*path, *m, None)).chain(
@@ -175,7 +174,7 @@ pub(crate) fn resolved<'r, 'db, R>(
     for read in reads.values() {
         pinned.add(IndexSummary::Candidate(read.summary.clone()));
     }
-    let by_path: HashMap<SourceId, Summary, Global> = reads
+    let by_path: Map<SourceId, Summary, FixedState, Global> = reads
         .values()
         .filter(|it| it.summary.source_id().is_path())
         .map(|it| (it.summary.source_id(), it.summary.clone()))
@@ -250,7 +249,7 @@ pub(crate) fn resolved<'r, 'db, R>(
     let (result, index_fetches) = files.with_cx(|cx| {
         let index = Index::new(&sources, cx, pinned);
         let result = resolve_ws(
-            &mut PackageRegistry::new(Through(&index)),
+            &mut PackageRegistry::new(&index),
             &resolving,
             lock.as_ref(),
             &cli_features,
@@ -326,7 +325,7 @@ pub(crate) fn resolved<'r, 'db, R>(
         .iter()
         .map(|(path, m)| (*path, *m))
         .chain(owned.iter().map(|it| (it.manifest_path.as_path(), &*it.manifest)));
-    let manifests: HashMap<PackageId, (&Path, &Manifest), Global> =
+    let manifests: Map<PackageId, (&Path, &Manifest), FixedState, Global> =
         ids.iter().copied().zip(all).collect();
     if let Some(missing) = targeted.iter().find(|id| !manifests.contains_key(id)) {
         return Ok(fail(anyhow::anyhow!("no manifest of `{missing}` was read")));
@@ -348,28 +347,6 @@ pub(crate) fn resolved<'r, 'db, R>(
         warnings,
         pins: sources.pins().clone(),
     })
-}
-
-/// A [`Registry`] by reference: the resolve borrows the index, which is finished after it.
-struct Through<'i, R>(&'i R);
-
-impl<R: Registry> Registry for Through<'_, R> {
-    async fn query(
-        &self,
-        dep: &Dependency,
-        kind: QueryKind,
-        f: &mut impl FnMut(IndexSummary),
-    ) -> anyhow::Result<()> {
-        self.0.query(dep, kind, f).await
-    }
-
-    fn describe_source(&self, source: SourceId) -> String {
-        self.0.describe_source(source)
-    }
-
-    fn is_replaced(&self, source: SourceId) -> bool {
-        self.0.is_replaced(source)
-    }
 }
 
 struct Prepared {
@@ -435,7 +412,7 @@ fn locate_all(
     ctx: &Context<Snap<'_, '_>>,
     sources: &Sources,
     ids: &[PackageId],
-    checksums: &HashMap<PackageId, Option<String>, Global>,
+    checksums: &Map<PackageId, Option<String>, FixedState, Global>,
 ) -> Result<Staged<Vec<Package>>, Cancelled> {
     let files = *ctx.files();
     let mut here = Vec::new();

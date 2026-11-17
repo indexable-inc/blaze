@@ -114,6 +114,12 @@ pub enum FactKind {
     /// lifetime part read from its text, whether it writes a lifetime, whether it takes
     /// `&self`. `key`: the fn; `detail`: 0. Listed only by `ProjectWorld::check_borrows`.
     BorrowHead = 24,
+    /// A type alias's definition (`Question::TypeAlias`: its generics, defaults and aliased
+    /// type), read by a body path through it. `key`: the alias.
+    TypeAlias = 25,
+    /// The default values of an ADT's fields (`Question::FieldDefaults`), read by a
+    /// base-less struct expression `S { a: 1, .. }`. `key`: the ADT.
+    FieldDefaults = 26,
 }
 
 /// One fact a body's check asked for (module docs). Ordered as its bytes are
@@ -351,6 +357,8 @@ pub fn fact_of(q: Question, module: tc::ItemKey, paths: &[BodyPath], segments: &
         Question::Closure(owner, ordinal) => about(FactKind::Closure, owner, u64::from(ordinal)),
         Question::Coroutine(owner, ordinal) => about(FactKind::Coroutine, owner, u64::from(ordinal)),
         Question::AssocGenerics(trait_, name) => about(FactKind::AssocGenerics, trait_, name.0),
+        Question::TypeAlias(item) => about(FactKind::TypeAlias, item, 0),
+        Question::FieldDefaults(adt) => about(FactKind::FieldDefaults, adt, 0),
     })
 }
 

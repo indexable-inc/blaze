@@ -12,11 +12,12 @@ use blaze_typeck::{Adt, ExprId, InferCtx, ItemKey, LangItem, Mutbl, Needs, Outco
 
 use super::{Tables, run_native_vt};
 use crate::layout::{LayoutFacts, Missing, ReprAttrs, ValidRange};
-use crate::vtable::{ObjectMethod, ObjectTrait};
+use crate::vtable::{ObjectMethod, ObjectSuper, ObjectTrait};
 use crate::{Abi, Adts, Built, Intrinsic, Subst};
 
 mod boxed_slice;
 mod nested_unsize;
+mod rust_call;
 
 /// ```text
 /// #[lang = "sized"] trait Sized {}  #[lang = "unsize"] trait Unsize<U: ?Sized> {}
@@ -29,7 +30,7 @@ mod nested_unsize;
 /// ```
 struct World {
     fx: Fx,
-    traits: StdVec<(ItemKey, StdVec<ItemKey>, StdVec<ObjectMethod>)>,
+    traits: StdVec<(ItemKey, StdVec<ObjectSuper>, StdVec<ObjectMethod>)>,
     /// (trait method, concrete type of `fx.t`, impl fn, the value its body returns).
     impls: StdVec<(ItemKey, PTy, ItemKey, u128)>,
     intrinsics: StdVec<(ItemKey, Intrinsic)>,
@@ -43,6 +44,8 @@ struct World {
     u64_: PTy,
     u8_: PTy,
     boxes: Boxes,
+    /// The fns of `extern "rust-call"` (a submodule's own items; none in the base world).
+    rust_call: StdVec<ItemKey>,
 }
 
 fn id(s: &str) -> ContentId {
@@ -52,6 +55,21 @@ fn id(s: &str) -> ContentId {
 }
 
 fn world() -> World {
+    world_with(BoxField::Ptr)
+}
+
+/// Where the world's `Box<T>` holds its pointer: a plain `*const T`, or core's own shape on the
+/// pinned nightly, `NonNull<T> { pointer: pattern_type!(*const T is !null) }`
+/// (core/src/ptr/non_null.rs), whose field coerces by core/src/pat.rs's `impl<T, U>
+/// CoerceUnsized<pattern_type!(*const U is !null)> for pattern_type!(*const T is !null) where
+/// T: Unsize<U>`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BoxField {
+    Ptr,
+    NonNull,
+}
+
+fn world_with(field: BoxField) -> World {
     let mut fx = Fx::new();
     let sized = fx.tr("Sized", 1, Vec::new(), &[]);
     fx.lang(LangItem::Sized, sized);
@@ -91,17 +109,17 @@ fn world() -> World {
     }
     let main = fx.func("main", 0, &[], u64_, Vec::new());
     let main_us = fx.func("main_us", 0, &[], usize_, Vec::new());
-    let boxes = boxes(&mut fx, p0, u64_, &mut impls);
+    let boxes = boxes(&mut fx, p0, u64_, &mut impls, field);
     fx.finish();
     let method = |item| ObjectMethod { item, dispatch: true };
     let traits = std::vec![
         (tr, StdVec::new(), std::vec![method(m)]),
-        (sub, std::vec![tr], std::vec![method(n)]),
+        (sub, std::vec![ObjectSuper::plain(tr)], std::vec![method(n)]),
         (other, StdVec::new(), std::vec![method(o)]),
-        (both, std::vec![tr, other], StdVec::new()),
+        (both, std::vec![ObjectSuper::plain(tr), ObjectSuper::plain(other)], StdVec::new()),
         (boxes.ob, StdVec::new(), std::vec![method(boxes.get), method(boxes.take)]),
     ];
-    World { fx, traits, impls, intrinsics, main, main_us, tr, sub, other, both, u64_, u8_, boxes }
+    World { fx, traits, impls, intrinsics, main, main_us, tr, sub, other, both, u64_, u8_, boxes, rust_call: StdVec::new() }
 }
 
 /// The boxed part of the world:
@@ -132,14 +150,27 @@ struct Boxes {
     concrete: [(ItemKey, PTy); 3],
 }
 
-fn boxes(fx: &mut Fx, p0: PTy, u64_: PTy, impls: &mut StdVec<(ItemKey, PTy, ItemKey, u128)>) -> Boxes {
+fn boxes(fx: &mut Fx, p0: PTy, u64_: PTy, impls: &mut StdVec<(ItemKey, PTy, ItemKey, u128)>, field: BoxField) -> Boxes {
     let unsize = fx.key_of("Unsize");
     let coerce = fx.tr("CoerceUnsized", 2, Vec::new(), &[]);
     fx.lang(LangItem::CoerceUnsized, coerce);
     let deref = fx.tr("Deref", 1, Vec::new(), &["Target"]);
     fx.lang(LangItem::Deref, deref);
     let ptr_t = fx.ty(PNode::Ptr(Mutbl::Not, p0));
-    let box_k = fx.strukt("Box", 1, &[("p", ptr_t)]);
+    let field_t = match field {
+        BoxField::Ptr => ptr_t,
+        BoxField::NonNull => {
+            // `!null` is the address range `1 ..= usize::MAX` (typeck.md, "Pattern types").
+            let usize_ = fx.usize();
+            let lo = fx.ty(PNode::ConstValue { ty: usize_, bits: 1 });
+            let hi = fx.ty(PNode::ConstValue { ty: usize_, bits: u128::from(u64::MAX) });
+            let not_null = fx.t.intern_list(&[lo, hi]).expect("the world's table is full");
+            let pat = fx.ty(PNode::Pat(ptr_t, not_null));
+            let non_null = fx.strukt("NonNull", 1, &[("pointer", pat)]);
+            fx.adt(non_null, &[p0])
+        }
+    };
+    let box_k = fx.strukt("Box", 1, &[("p", field_t)]);
     fx.lang(LangItem::OwnedBox, box_k);
     let (box_t, p1) = (fx.adt(box_k, &[p0]), fx.param(1));
     let box_u = fx.adt(box_k, &[p1]);
@@ -306,9 +337,9 @@ impl World {
             seen.push(k);
             let (_, s, m) = self.traits.iter().find(|(x, _, _)| *x == k)?;
             text.push_str(&std::format!("{k:?} {s:?} {m:?};"));
-            stack.extend(s.iter().rev());
+            stack.extend(s.iter().rev().map(|x| x.trait_));
         }
-        Some(ObjectTrait { supers, methods, shape: id(&text) })
+        Some(ObjectTrait { supers, super_args: &[], methods, shape: id(&text) })
     }
 }
 
@@ -362,7 +393,7 @@ impl Adts for FxAdts<'_> {
     }
 
     fn abi(&self, item: ItemKey) -> Option<Abi> {
-        self.w.fx.sig_of(item).map(|_| Abi::Rust)
+        self.w.fx.sig_of(item).map(|_| if self.w.rust_call.contains(&item) { Abi::RustCall } else { Abi::Rust })
     }
 
     fn drop_impl(&self, ty: PTy, ground: &mut PortableTys<'_>) -> Result<Option<ItemKey>, crate::BuildError> {
@@ -644,6 +675,32 @@ fn a_box_moved_into_a_self_box_call_is_dropped_by_the_callee() {
     });
     assert_eq!(got, 21);
     assert_eq!(logged(), [1, 108]);
+}
+
+/// core's own `Box` shape on the pinned nightly: the pointer is held in `NonNull<T> { pointer:
+/// pattern_type!(*const T is !null) }` (`BoxField::NonNull`), so `Box<A>` to `Box<dyn Ob>`
+/// passes through a pattern type on its way to the pointer: core/src/pat.rs's
+/// `CoerceUnsized` impl for `pattern_type!(*const T is !null)` coerces it as its base (tempo:
+/// der's `BytesOwned::default`, `Box::new([])` to `Box<[u8]>`, and every `Box`, `Rc`, `Arc`
+/// unsizing through `NonNull`). `x0.take()` runs A's `take` (21) through the table the
+/// coercion wrote, and the callee drops the box (A, then the free); a `Box<dyn Ob>` of B left
+/// to scope drops B through its table (2) and frees (108).
+/// Prints `test tests::objects::a_box_over_a_pattern_typed_pointer_unsizes_and_dispatches ... ok`.
+/// Fails without walk/unsize_nested.rs's pattern-type step, and without walk.rs `layout`
+/// laying out a pattern type's wide base before the row that holds it (run 042632-UZ: the
+/// target `NonNull<dyn Ob>`'s row then began at the wide pointer's address field): the build
+/// of `main` is refused ("an unsizing of other than a pointer or a struct holding one").
+#[test]
+fn a_box_over_a_pattern_typed_pointer_unsizes_and_dispatches() {
+    let w = world_with(BoxField::NonNull);
+    let got = run_boxes(&w, &["mk_a"], |b, p| {
+        let x = b.local(p[0]);
+        (b.method(x, "take", &[]), StdVec::new())
+    });
+    assert_eq!(got, 21);
+    assert_eq!(logged(), [1, 108]);
+    assert_eq!(run_boxes(&w, &["mk_b"], five), 5);
+    assert_eq!(logged(), [2, 108]);
 }
 
 /// std's `Box`: a zero-sized `T` is never allocated; the box holds a dangling, aligned pointer

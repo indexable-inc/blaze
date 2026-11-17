@@ -24,7 +24,11 @@
 //! crate's own names ([`OwnNames`]): a path that leaves the crate (a prelude name, `fmt::Debug`
 //! of another crate) is [`NotFiled::TraitNotRead`] or [`NotFiled::SelfNotRead`], never guessed
 //! (the walk stops with `Why::NotRead` at the first scope not held, so it answers as the whole
-//! graph's names would or not at all). [`super::encode_with`] takes the names of the whole
+//! graph's names would or not at all). One case is decided without the prelude: a one-segment
+//! self path naming a builtin type, where the walk's only layer not held is the standard
+//! prelude ([`crate::names::Unheld::Prelude`]), is that builtin, since the prelude binds no type
+//! of such a name; so `impl Rem<BigUint> for u64` outside core is filed under `u64` as core's
+//! own `impl Rem for u64` is. [`super::encode_with`] takes the names of the whole
 //! graph (`Names`), where every path is walked to its end.
 //!
 //! THE FORM. Additive: after everything the record held before (no existing field or row
@@ -38,13 +42,13 @@
 
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_own::{AVec, Alloc};
-use blaze_surface::{CrateRootBuilder, DefKind, ItemKind, Namespace, RecordBytes, ScopeBuilder};
+use blaze_surface::{CrateRootBuilder, DefKind, ItemKind, Namespace, PathKind, RecordBytes, ScopeBuilder};
 
 use super::{BARE, HAS_TRAIT, ItemsRecord, ItemsRecordError, SelfHead, T_IMPLS, key_at, le32, pad, path_and_bare, put32, u32_of};
 use crate::builtin::is_builtin_type;
-use crate::names::{self, PathError, Resolved, Why, World, Written};
+use crate::names::{self, PathError, Resolved, Unheld, VariantHit, Why, World, Written, variant_in};
 use crate::resolve::{CrateNames, Names};
-use crate::task::{Variant, parse_path};
+use crate::task::parse_path;
 
 /// The header field holding how many rows the bucket table has.
 pub(crate) const F_BUCKETS_COUNT: usize = 31;
@@ -272,6 +276,15 @@ impl<'n, 'a> OwnNames<'n, 'a> {
 }
 
 impl<'n, 'a> World<&'a str> for OwnNames<'n, 'a> {
+    type Scope<'w>
+        = &'w ScopeBuilder<'w, &'a str>
+    where
+        Self: 'w;
+    type Root<'w>
+        = &'w CrateRootBuilder<'w, &'a str>
+    where
+        Self: 'w;
+
     fn scope(&self, module: ItemKey) -> Option<&ScopeBuilder<'_, &'a str>> {
         self.0.done.get(&module).map(|r| &r.scope)
     }
@@ -288,8 +301,8 @@ impl<'n, 'a> World<&'a str> for OwnNames<'n, 'a> {
         (krate == self.0.key).then_some(&self.0.crate_root)
     }
 
-    fn variants(&self, owner: ItemKey) -> Option<&[Variant<&'a str>]> {
-        self.0.tables.enums.get(&owner).map(|v| v.as_slice())
+    fn variant(&self, owner: ItemKey, name: &'a str) -> Option<Option<VariantHit>> {
+        Some(variant_in(self.0.tables.enums.get(&owner)?.as_slice(), name))
     }
 
     fn no_implicit_prelude(&self, module: ItemKey) -> bool {
@@ -320,9 +333,16 @@ impl HeadNames for OwnNames<'_, '_> {
 }
 
 /// `text` (a path as a header writes it, without arguments) walked in `module` of crate
-/// `krate`: `None` when its tokens are no simple path.
-fn walked<H: HeadNames>(heads: &H, krate: CrateItemKey, module: ItemKey, text: &str, alloc: Alloc<'_>) -> Option<(Result<Resolved, PathError>, usize)> {
-    let path = parse_path(text, krate, alloc)?;
+/// `krate`: `None` when its tokens are no simple path. `root`: the crate its first segment names
+/// when an expansion wrote `crate` for another crate's `$crate` (the impl row's root,
+/// token-mark-2 R2), never read as `krate`'s.
+fn walked<H: HeadNames>(heads: &H, krate: CrateItemKey, module: ItemKey, text: &str, root: Option<CrateItemKey>, alloc: Alloc<'_>) -> Option<(Result<Resolved, PathError>, usize)> {
+    let mut path = parse_path(text, krate, alloc)?;
+    // A root is kept only for a first segment `crate`/`$crate` (items_record.rs `root_of_path`,
+    // by `root_by_mark`), which `parse_path` reads as one of these two kinds.
+    if let (Some(k), PathKind::Crate | PathKind::DollarCrate(_)) = (root, path.kind) {
+        path.kind = PathKind::DollarCrate(k);
+    }
     let written = Written { kind: path.kind, segments: &path.segments };
     Some((heads.type_path(module, written, alloc), path.segments.len()))
 }
@@ -344,6 +364,8 @@ pub(super) fn filing<H: HeadNames>(
     negative: bool,
     head: SelfHead,
     self_path: Option<&str>,
+    trait_root: Option<CrateItemKey>,
+    self_root: Option<CrateItemKey>,
     alloc: Alloc<'_>,
 ) -> Filing {
     let head = match head {
@@ -358,10 +380,15 @@ pub(super) fn filing<H: HeadNames>(
         SelfHead::Never => Head::Never,
         SelfHead::Tuple(n) => Head::Tuple(n),
         SelfHead::Path => {
-            let Some((found, len)) = self_path.and_then(|text| walked(heads, krate, module, text, alloc)) else {
+            let Some((found, len)) = self_path.and_then(|text| walked(heads, krate, module, text, self_root, alloc)) else {
                 return Filing::Not(NotFiled::SelfNotPath);
             };
             match found {
+                // `u64` where every nearer layer is read and binds no type of the name, and only
+                // the standard prelude is not held: the builtin type. The prelude binds no type
+                // named like a builtin, and its contents are the toolchain's, which every key
+                // covers. A glob not held (`use dep::*;`) may bind the name, so stays not read.
+                Err(PathError { at: 0, why: Why::NotRead { layer: Unheld::Prelude { builtin: Some(builtin) }, .. }, .. }) if len == 1 => Head::Named(builtin),
                 Err(PathError { why: Why::NotRead { .. }, .. }) => return Filing::Not(NotFiled::SelfNotRead),
                 Err(_) => Head::Any,
                 Ok(r) if r.consumed != len => Head::Any,
@@ -381,7 +408,7 @@ pub(super) fn filing<H: HeadNames>(
     };
     let Some(trait_) = trait_ else { return Filing::At(BucketKey::inherent(head)) };
     let (text, _) = path_and_bare(trait_);
-    let Some((found, len)) = walked(heads, krate, module, text, alloc) else { return Filing::Not(NotFiled::TraitNotPath) };
+    let Some((found, len)) = walked(heads, krate, module, text, trait_root, alloc) else { return Filing::Not(NotFiled::TraitNotPath) };
     match found {
         Ok(r) if r.def.kind == DefKind::Trait && r.consumed == len => {
             Filing::At(if negative { BucketKey::negative(r.def.key, head) } else { BucketKey::of_trait(r.def.key, head) })
@@ -440,6 +467,11 @@ pub struct BucketImpl {
     pub bare: bool,
     /// A trait impl whose self type is one of its own parameters (`impl<T> Tr for T`).
     pub blanket: bool,
+    /// Its self type is written as a path ([`SelfHead::Path`]): under [`Head::Any`], a path the
+    /// writer resolved to no constructor (not found, a prefix only, a trait, a module), which
+    /// the coherence rules still bound to the impl's crate's local types (the reader's
+    /// `Buckets` files it so).
+    pub self_path: bool,
 }
 
 impl<'a> ItemsRecord<'a> {
@@ -496,7 +528,8 @@ impl<'a> ItemsRecord<'a> {
         }
         let r = self.row(T_IMPLS, row);
         let (head, marks) = (self.bytes[r + 56], self.bytes[r + 57]);
-        Ok(BucketImpl { key: key_at(self.bytes, r), row, bare: marks & BARE != 0, blanket: marks & HAS_TRAIT != 0 && head == 1 })
+        // The head byte is `SelfHead`'s (items_record.rs `SelfHead::byte`): 0 a path, 1 a parameter.
+        Ok(BucketImpl { key: key_at(self.bytes, r), row, bare: marks & BARE != 0, blanket: marks & HAS_TRAIT != 0 && head == 1, self_path: head == 0 })
     }
 
     /// The digest of what `key` answers: the key asked, and each row under it (the rest of its

@@ -30,6 +30,7 @@ use blaze_id::ItemKey as LibKey;
 use blaze_lower::{Range, RowIdx, ScopeId, View};
 use blaze_mem::Frame;
 use blaze_own::Alloc;
+use blaze_scope::crate_roots::TextMarks;
 use super::source::NamesSource;
 use blaze_surface::{ItemDetail, Rename, UseForm};
 use blaze_typeck::ItemKey;
@@ -234,19 +235,42 @@ pub struct BodyLocals<'n> {
     /// offset of the body's text is read at the LAST of these that holds the offset (the
     /// innermost), else at the body's module (body.rs `BodyTypes::env_at`).
     pub blocks: &'n [BlockModule],
+    /// Each block scope's module, by `ScopeId` (super::scope_table): the one answer to "which
+    /// module is this block" for every reader.
+    pub scopes: &'n [super::scope_table::ScopeAt],
 }
 
-/// What a local item's head is made from: its text, its module (its enclosing body's) and
-/// where it is declared (the body and block whose names its own body sees beyond its own).
+/// What a local item's head is made from: its text, its module (its enclosing body's), the
+/// module its head's names are read at, and where it is declared (the body and block whose
+/// names its own body sees beyond its own).
 #[derive(Clone, Copy, Debug)]
 pub struct LocalHead<'n> {
     pub lib: LibKey,
     pub kind: LocalKind,
     pub text: &'n str,
+    /// The enclosing body's module: where the item's own body is lowered (its `module_path!()`,
+    /// its macro host), its names found first among the blocks around it ([`Locals::find`]).
     pub module: LibKey,
+    /// The module of the block it is declared in (super::scope_table `ScopeAt::module`): where
+    /// the names its HEAD writes are read. The Reference, "Statements", "Item declarations":
+    /// the item's scope is the block, and "Names", "Scopes", "Item scopes": a block's items are
+    /// in scope in the whole block, so `unsafe fn do_call<F, R>(data: *mut Data<F, R>)` beside
+    /// `union Data<F, R>` in one fn body (the pinned std's `panicking::catch_unwind`) names the
+    /// block's `Data`, which the body's module does not hold.
+    pub names_at: LibKey,
     pub enclosing: ItemKey,
     pub scope: u32,
     pub range: Range,
+    /// The marks of `text`'s words when a macro wrote the enclosing item (front2 item_site.rs):
+    /// the enclosing body's own ([`Enclosing::marks`]), of which `text` is a slice. Its head,
+    /// its generics and its own body read every path by them, so a `$crate` the expansion
+    /// wrote as `crate` names the macro's crate (bstd's `main!` writes `static MANIFEST:
+    /// $crate::grant::Manifest` and `fn hosted(cx: &$crate::Cx, ..)` in the user's `main`).
+    /// A row a macro call INSIDE the body wrote is a copy: its column is made with it from the
+    /// lowered body's marks of the words it copies (`View::marks_in`,
+    /// `mark_site::column_of_copy`). `None` for a text of a file, and for a copy with no
+    /// marked word.
+    pub marks: Option<TextMarks<'n>>,
 }
 
 /// A body names a local item of a form whose record this front end does not make yet: the
@@ -275,6 +299,9 @@ pub struct Enclosing<'n> {
     pub module: LibKey,
     /// The text the body was lowered from.
     pub text: &'n str,
+    /// The marks of `text`'s words when a macro wrote the body's item (`Site::marks` in
+    /// body.rs; `text` is a slice of their text); `None` for a text of a file.
+    pub marks: Option<TextMarks<'n>>,
 }
 
 /// The local items of every body lowered in this command, kept in the command's frame.
@@ -285,11 +312,42 @@ pub struct Locals<'n> {
     /// The fns and statics of `extern` blocks declared in bodies, by checker key: each one's
     /// block's ABI and its safety ([`super::foreign_locals`]). Each is in `heads` too.
     foreign: HashMap<ItemKey, LocalForeign<'n>, &'n Frame>,
+    /// The anonymous constants written in a body that name its items ([`super::anon::Ask::in_body`]),
+    /// by checker key: the body and the block the expression is written in. A name in the
+    /// constant's own body continues there ([`Locals::find`]), as a local item's does; the
+    /// constant is no item, so it is not in `heads`.
+    anons: HashMap<ItemKey, (ItemKey, u32), &'n Frame>,
+    /// The scope table's planted bug, for the test that must catch it; `Planted::None` else.
+    planted: super::scope_table::Planted,
 }
 
 impl<'n> Locals<'n> {
     pub fn new(frame: &'n Frame) -> Locals<'n> {
-        Locals { frame, bodies: HashMap::new_in(frame), heads: HashMap::new_in(frame), foreign: HashMap::new_in(frame) }
+        Locals { frame, bodies: HashMap::new_in(frame), heads: HashMap::new_in(frame), foreign: HashMap::new_in(frame), anons: HashMap::new_in(frame), planted: super::scope_table::Planted::None }
+    }
+
+    /// Files the anonymous constant `key` as written in block `scope` of the body `owner`
+    /// ([`super::anon::file_asked`]). Its key says both ([`super::anon::Ask::in_body`]), so one
+    /// key is never filed at two places.
+    pub(super) fn file_anon(&mut self, key: ItemKey, owner: ItemKey, scope: u32) {
+        self.anons.insert(key, (owner, scope));
+    }
+
+    /// Plants the scope table's bug for every body kept after this (tests only:
+    /// tests/front2_macro_block_mods.rs must catch it).
+    pub fn plant(&mut self, planted: super::scope_table::Planted) {
+        self.planted = planted;
+    }
+
+    /// The scope table's planted bug (`Planted::None` but in that test).
+    pub fn planted(&self) -> super::scope_table::Planted {
+        self.planted
+    }
+
+    /// Where the names written in block `scope` of the body `owner` are read
+    /// (super::scope_table); `None` when the body kept no local items.
+    pub fn scope_at(&self, owner: ItemKey, scope: u32) -> Option<super::scope_table::ScopeAt> {
+        self.bodies.get(&owner)?.scopes.get(scope as usize).copied()
     }
 
     /// The local item whose checker key is `key`, when an `extern` block in a body declares
@@ -357,6 +415,12 @@ impl<'n> Locals<'n> {
             Some(body) if nested.end == blaze_file_items::nested::NestedEnd::Whole => Some(blaze_scope::blocks::block_modules(crate_key, body, &nested, alloc)),
             _ => None,
         };
+        // The module of each block scope of the body, by the scope (super::scope_table): built
+        // once, here, and kept with the body. A refusal names the whole item: the table is the
+        // body's.
+        let whole = Range::new(0, at.text.len() as u32);
+        let table = super::scope_table::build(crate_key, at.module, view, &nested, modules.as_deref(), self.planted, alloc)
+            .map_err(|r| bad(Why::Unsupported(r.form(), whole)))?;
         // The blocks whose module is known to exist: one that binds a kept item's name, and
         // the blocks around it.
         let mut known: blaze_own::AVec<'_, bool> = blaze_own::AVec::new_in(alloc);
@@ -366,6 +430,13 @@ impl<'n> Locals<'n> {
         for (s, slot) in parents.iter_mut().enumerate() {
             let scope = view.scope(ScopeId(s as u32)).map_err(|b| bad(Why::from(b)))?;
             *slot = scope.parent.map(|p| p.0);
+            // Where a head written in this block reads its names: the block's module (its own
+            // items, then the blocks around it through that module's `use super::*`, then the
+            // body's module), the scope table's one answer for the scope ([`LocalHead::names_at`]).
+            let names_at = table
+                .at(s as u32)
+                .map(super::scope_table::ScopeAt::module)
+                .ok_or_else(|| bad(Why::Unsupported("a block scope of a body that its scope table does not hold", whole)))?;
             for i in scope.items.start..scope.items.start + scope.items.len {
                 let row = view.row(RowIdx(i)).map_err(|b| bad(Why::from(b)))?;
                 let it = view.local_item(row).map_err(|b| bad(Why::from(b)))?;
@@ -373,9 +444,27 @@ impl<'n> Locals<'n> {
                 let range = view.site(it.range).map_err(|t| bad(Why::from(t)))?;
                 // The text: the enclosing item's own where written there, else (an
                 // expansion's) a copy into the frame, kept for the command.
-                let text: &'n str = match view.item_relative(it.range) {
-                    Some(r) => at.text.get(r.start as usize..r.end as usize).ok_or_else(|| bad(Why::from(blaze_lower::TextAt::Malformed(it.range))))?,
-                    None => frame.alloc_str(view.text_at(it.range).map_err(|t| bad(Why::from(t)))?),
+                // Its words' marks: the enclosing text's, of which a row written there is a
+                // slice ([`LocalHead::marks`]); a copy's, made with it from the lowered body's
+                // marks of the expansion words it copies (`View::marks_in`), since no column
+                // reaches from the copy back to a marked text.
+                let (text, marks): (&'n str, Option<TextMarks<'n>>) = match view.item_relative(it.range) {
+                    Some(r) => (at.text.get(r.start as usize..r.end as usize).ok_or_else(|| bad(Why::from(blaze_lower::TextAt::Malformed(it.range))))?, at.marks),
+                    None => {
+                        let copy: &'n str = frame.alloc_str(view.text_at(it.range).map_err(|t| bad(Why::from(t)))?);
+                        let marked = view.marks_in(it.range, alloc).map_err(|t| bad(Why::from(t)))?;
+                        let marks = match marked.is_empty() {
+                            true => None,
+                            false => {
+                                let unwritten = |_| bad(Why::Unsupported("a local item's copied text whose marks' column cannot be written", range));
+                                let bytes = blaze_lower::mark_site::column_of_copy(copy, &marked, alloc).map_err(unwritten)?;
+                                let bytes: &'n [u8] = frame.alloc_slice_copy(&bytes);
+                                let (column, _) = blaze_expand::origin_column::OriginsRef::open(bytes).map_err(unwritten)?;
+                                Some(TextMarks { text: copy, column })
+                            }
+                        };
+                        (copy, marks)
+                    }
                 };
                 let name: &'n str = match it.name {
                     Some(n) => frame.alloc_str(view.name_text(n).map_err(|t| bad(Why::from(t)))?),
@@ -445,50 +534,44 @@ impl<'n> Locals<'n> {
                         let key = super::nested_exports::local_key(crate_key, parent, kind.tag(), d.name, ordinal);
                         rows.push(Row { scope: s as u32, kind, name: d.name, key, range, path: &[], abs: false, module: None });
                         let ck = keys.local(key, kind).map_err(HeadError::Key)?;
-                        self.heads.insert(ck, LocalHead { lib: key, kind, text: d.text, module: at.module, enclosing: at.owner, scope: s as u32, range });
+                        self.heads.insert(ck, LocalHead { lib: key, kind, text: d.text, module: at.module, names_at, enclosing: at.owner, scope: s as u32, range, marks });
                         self.foreign.insert(ck, LocalForeign { kind: d.kind, abi, safe: d.safe });
                     }
                     continue;
                 }
-                // A struct, enum, union or alias written in the body's text is an item of
-                // its block's module: the block the scan found its statement in, when the
-                // library's module there binds its name.
+                // A struct, enum, union, alias, trait, `mod` or `extern crate` is an item of its
+                // block's module (the Reference, "Statements", "Item declarations": its scope is
+                // "the block containing the statement", whichever text wrote the block): the
+                // module the scope table gives the row's scope as its OWN, when that module binds
+                // the name. None: the names library filed no module for the block; a path naming
+                // the item is refused by name (`LocalKind::unplaced`), never read at another
+                // block.
                 let mut in_module = None;
-                // Written by an expansion of a statement call (no item-relative range): the block
-                // module the names library filed for it (super::expansion_blocks), found by the
-                // call whose range holds the row's site; the blocks around the call are known.
-                if let (true, None, Some(ms)) = (kind.in_block_module(), view.item_relative(it.range), modules.as_ref()) {
-                    let found = super::expansion_blocks::module_of(names, frame, crate_key, &nested, ms, range.start, blaze_surface::Namespace::Types, name, alloc)
-                        .map_err(|r| bad(Why::Unsupported(r.form(), range)))?;
-                    if let Some(m) = found {
-                        in_module = Some(m);
-                        let mut b = nested.calls.iter().find(|c| c.range.start <= range.start && range.start < c.range.end).map(|c| c.block);
-                        // A chain is at most as long as the body's blocks.
-                        for _ in 0..nested.blocks.len() {
-                            let Some(here) = b else { break };
-                            if core::mem::replace(&mut known[here as usize], true) {
-                                break;
-                            }
-                            b = nested.blocks[here as usize].parent;
+                if kind.in_block_module()
+                    && let Some(m) = table.at(s as u32).and_then(|a| a.own())
+                    && names.binds(m, blaze_surface::Namespace::Types, name)
+                {
+                    in_module = Some(m);
+                    // The nearest scope at or around the row's that is a block of the body's own
+                    // text, and every block around it, are known: a type written there reads at
+                    // them (body.rs `env_at`). A chain is at most as long as the body's scopes.
+                    let mut sc = Some(s as u32);
+                    let mut b = None;
+                    for _ in 0..=scopes {
+                        let Some(here) = sc else { break };
+                        if let Some(hb) = table.hand_blocks.get(here as usize).copied().flatten() {
+                            b = Some(hb);
+                            break;
                         }
+                        sc = view.scope(ScopeId(here)).ok().and_then(|x| x.parent).map(|p| p.0);
                     }
-                }
-                if let (true, Some(r), Some(ms)) = (kind.in_block_module(), view.item_relative(it.range), modules.as_ref()) {
-                    let stmt = nested.items.iter().find(|i| i.range.start <= r.start && r.start < i.range.end);
-                    let module = stmt.and_then(|i| ms.get(i.block as usize).copied().flatten());
-                    if let (Some(i), Some(m)) = (stmt, module) {
-                        if names.binds(m, blaze_surface::Namespace::Types, name) {
-                            in_module = Some(m);
-                            let mut b = Some(i.block);
-                            // A chain is at most as long as the body's blocks.
-                            for _ in 0..nested.blocks.len() {
-                                let Some(here) = b else { break };
-                                if core::mem::replace(&mut known[here as usize], true) {
-                                    break;
-                                }
-                                b = nested.blocks[here as usize].parent;
-                            }
+                    // A chain is at most as long as the body's blocks.
+                    for _ in 0..nested.blocks.len() {
+                        let Some(here) = b else { break };
+                        if core::mem::replace(&mut known[here as usize], true) {
+                            break;
                         }
+                        b = nested.blocks[here as usize].parent;
                     }
                 }
                 rows.push(Row { scope: s as u32, kind, name, key: parent, range, path: &[], abs: false, module: in_module });
@@ -500,7 +583,7 @@ impl<'n> Locals<'n> {
                 let key = super::nested_exports::local_key(crate_key, parent, kind.tag(), name, ordinal);
                 rows[last].key = key;
                 let ck = keys.local(key, kind).map_err(HeadError::Key)?;
-                self.heads.insert(ck, LocalHead { lib: key, kind, text, module: at.module, enclosing: at.owner, scope: s as u32, range });
+                self.heads.insert(ck, LocalHead { lib: key, kind, text, module: at.module, names_at, enclosing: at.owner, scope: s as u32, range, marks });
             }
         }
         let rows: &'n [Row<'n>] = frame.alloc_slice_copy(&rows);
@@ -513,7 +596,8 @@ impl<'n> Locals<'n> {
             }
         }
         let blocks: &'n [BlockModule] = frame.alloc_slice_copy(&blocks);
-        self.bodies.insert(at.owner, BodyLocals { parents, rows, blocks });
+        let scopes: &'n [super::scope_table::ScopeAt] = frame.alloc_slice_copy(&table.scopes);
+        self.bodies.insert(at.owner, BodyLocals { parents, rows, blocks, scopes });
         Ok(())
     }
 
@@ -542,8 +626,9 @@ impl<'n> Locals<'n> {
     pub fn find(&self, owner: ItemKey, scope: Option<u32>, name: &str, ns: LocalNs) -> Option<Row<'n>> {
         let mut body = owner;
         let mut at = scope;
-        // Each step out leaves a local item's body: at most as many steps as local items.
-        for _ in 0..=self.heads.len() {
+        // Each step out leaves a local item's body or a body's anonymous constant: at most as
+        // many steps as there are of both.
+        for _ in 0..=self.heads.len() + self.anons.len() {
             if let Some(b) = self.bodies.get(&body) {
                 let mut s = at;
                 // A chain is at most as long as the body's blocks.
@@ -556,18 +641,22 @@ impl<'n> Locals<'n> {
                     s = b.parents.get(here as usize).copied().flatten();
                 }
             }
-            let h = self.heads.get(&body)?;
-            body = h.enclosing;
-            at = Some(h.scope);
+            let (enclosing, scope) = match self.heads.get(&body) {
+                Some(h) => (h.enclosing, h.scope),
+                None => *self.anons.get(&body)?,
+            };
+            body = enclosing;
+            at = Some(scope);
         }
         None
     }
 
-    /// The local item's head, if `key` is one: its kind's outline entry, text and module.
+    /// The local item's head, if `key` is one: its kind's outline entry, text and the module
+    /// its head's names are read at ([`LocalHead::names_at`]: its block's).
     pub fn head_of(&self, key: LibKey) -> Option<Result<(ItemDetail, &'n str, LibKey), HeadError>> {
         let h = self.heads.get(&checker_of(key))?;
         Some(match h.kind.detail() {
-            Some(d) => Ok((d, h.text, h.module)),
+            Some(d) => Ok((d, h.text, h.names_at)),
             None => Err(HeadError::Item(key, Why::Unsupported(h.kind.form(), h.range))),
         })
     }

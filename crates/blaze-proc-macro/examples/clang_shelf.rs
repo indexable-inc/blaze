@@ -1,7 +1,7 @@
 //! D69: fetches the pinned C toolchain archive for this host to blaze's shelf, once.
 //!
 //! `clang_shelf <shelf>`: `<shelf>` is `<home>/.blaze/v2/toolchain/clang` (made by the caller).
-//! The archive named by `crates/hir-ty-codegen/clang.json`'s row for this host is asked over
+//! The archive named by `crates/blaze-toolchain/pins/clang.json`'s row for this host is asked over
 //! HTTPS with blaze-http (redirects followed, HTTPS only, the body held to the pinned size and
 //! streamed, never whole in memory) into `incoming/<sha256>.tar.xz.part` through the effect
 //! layer, its SHA-256 computed as it comes. The size and the digest are checked BEFORE the file
@@ -20,6 +20,8 @@ const HOST: &str = "aarch64-apple-darwin";
 const PIECE: usize = 8 << 20;
 /// Each append's budget.
 const APPEND_BUDGET: Duration = Duration::from_secs(60);
+/// How long one wait for the download's next event may last: past it, the download is stuck.
+const WITHIN: Duration = Duration::from_secs(60);
 
 fn hex(bytes: &[u8]) -> std::string::String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -59,7 +61,7 @@ fn main() -> ExitCode {
     let mut got: u64 = 0;
     let mut told: u64 = 0;
     loop {
-        let event = answer.wait().unwrap_or_else(|blocked| panic!("{url}: {blocked}"));
+        let event = answer.next(WITHIN).unwrap_or_else(|unanswered| panic!("{url}: {unanswered}"));
         match event {
             Some(Event::Head { url: at, status, .. }) => {
                 println!("answered by {at}: {status}");

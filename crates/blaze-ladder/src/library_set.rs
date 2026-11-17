@@ -37,14 +37,19 @@ const NAMEABLE: [&str; 3] = ["core", "alloc", "std"];
 /// What the program of `files` rooted at `root` is given, by its root's attributes under the
 /// target's cfg (a `cfg_attr(.., no_core)` counts as written when its predicate holds).
 /// `alloc` holds the root's outline for the length of the call.
-pub fn library_of(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>, alloc: Alloc<'_>) -> Result<Library, RunError> {
+/// `panic` is the program's strategy (its inputs' carrier): the root's `cfg(panic)` is derived
+/// from it, never the target list's.
+pub fn library_of(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>, panic: blaze_build::Panic, alloc: Alloc<'_>) -> Result<Library, RunError> {
     if new.shelf.is_none() {
         return Ok(Library::None);
     }
     let file = files.iter().find(|f| f.path == root).ok_or(RunError::NoMain)?;
     let edition = edition::PackageEdition::of_manifest(new.edition).map_err(|_| RunError::Edition { written: new.edition.into() })?;
     let target = blaze_scope::task::Target::AARCH64_APPLE_DARWIN;
-    let cfg = blaze_scope::task::Cfg::of(&target, &[], alloc.clone());
+    let target_cfg = blaze_scope::task::Cfg::of(&target, &[], alloc.clone());
+    let mut atoms: Vec<(&str, Option<&str>)> = target_cfg.atoms().to_vec();
+    crate::panic_strategy::derive_cfg(&mut atoms, panic);
+    let cfg = blaze_scope::task::Cfg::from_atoms(&atoms, alloc.clone());
     Ok(if root_names_toolchain(file.text, syntax_of(edition), &cfg, alloc) { Library::Shelf } else { Library::None })
 }
 
@@ -62,10 +67,10 @@ pub fn root_names_toolchain(text: &str, edition: blaze_surface::Edition, cfg: &b
 }
 
 /// The toolchain [`library_of`] decides: opened from `new.shelf` only for [`Library::Shelf`].
-pub fn toolchain_for(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>, alloc: Alloc<'_>) -> Result<Toolchain, RunError> {
-    match (library_of(files, root, new, alloc)?, new.shelf) {
+pub fn toolchain_for(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>, panic: blaze_build::Panic, alloc: Alloc<'_>) -> Result<Toolchain, RunError> {
+    match (library_of(files, root, new, panic, alloc)?, new.shelf) {
         (Library::Shelf, Some(shelf)) => Toolchain::open(&mut DirShelf::new(shelf.into())).map_err(RunError::Crates),
-        _ => Ok(Toolchain::none()),
+        _ => Ok(Toolchain::none(alloc)),
     }
 }
 
@@ -84,7 +89,8 @@ mod tests {
 
     fn of(text: &str, shelf: Option<&str>) -> Library {
         let files = [SourceFile { path: "src/main.rs", text }];
-        library_of(&files, "src/main.rs", new(shelf), Alloc::global()).expect("decided")
+        // The roots here write no `cfg(panic)`: the strategy is named, Rust's default.
+        library_of(&files, "src/main.rs", new(shelf), blaze_build::Panic::Unwind, Alloc::global()).expect("decided")
     }
 
     /// A `#![no_core]` root that names no toolchain crate is given none, even with a shelf

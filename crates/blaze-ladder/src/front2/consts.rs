@@ -112,6 +112,10 @@ pub enum ConstFail {
     /// Expression `block` of `owner`'s body, as this evaluator lowered it, is not the
     /// `const { .. }` block an instance's build asked the value of (const_at.rs).
     NotConstBlock { owner: ItemKey, block: ExprId },
+    /// Expression `borrow` of `owner`'s body, as this evaluator lowered and checked it, is not
+    /// a `&operand` its check lists in `Checked::promoted`: the promoted borrow an instance's
+    /// build asked the value of (const_at.rs).
+    NotPromoted { owner: ItemKey, borrow: ExprId },
     /// A type `item`'s evaluation lays out or grounds (a field's type: `Atomic<T>`'s
     /// `UnsafeCell<T::Storage>`) holds a projection the checker's solver did not normalize:
     /// that type has no ground form (front2/const_project.rs).
@@ -153,6 +157,7 @@ impl core::fmt::Display for ConstFail {
             ConstFail::QPathDepth { need, most } => write!(f, "the qualified constant {need:?}: more than {most} are answered inside one another"),
             ConstFail::QPathKey { need, clash } => write!(f, "the qualified constant {need:?}: two origins under one checker key: {clash:?}"),
             ConstFail::NotConstBlock { owner, block } => write!(f, "fn {owner:?}: expression {} of its body as the evaluator lowered it is not a `const {{ .. }}` block", block.0),
+            ConstFail::NotPromoted { owner, borrow } => write!(f, "fn {owner:?}: expression {} of its body as the evaluator lowered and checked it is not a promoted borrow (`&operand` in `Checked::promoted`)", borrow.0),
             ConstFail::Projection { item, refused } => write!(f, "constant {item:?}: a type it lays out: {refused}"),
             ConstFail::SelectConst { refused } => write!(f, "{refused}"),
             ConstFail::NotConstFn { shown, .. } => write!(f, "a call of {shown}, which is not a `const fn` (its head was read and has no `const`)"),
@@ -245,9 +250,21 @@ struct ConstBody<'n> {
     tys: tc::OwnTys<'static>,
     checked: Checked<'static>,
     lits: LitTable,
-    /// `Some(block)`: the body of a `const { .. }` block (front2/const_at.rs): its owner's body
-    /// read from `block` as its root, with no parameters; `key` is the block's own key.
+    /// `Some(at)`: a constant read from inside its owner's body ([`BodyRoot`], front2/const_at.rs):
+    /// the owner's body read from expression `at` as its root, with no parameters (a const
+    /// block, or a promoted borrow's operand); `key` is that constant's own key.
     root: Option<ExprId>,
+}
+
+/// Where in its owner's body a constant read from inside a body starts (front2/const_at.rs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyRoot {
+    /// A `const { .. }` block: the block expression itself.
+    Block(ExprId),
+    /// A promoted borrow `&operand` (`Checked::promoted`): the value is the OPERAND's, and the
+    /// builder takes its row's address (blaze-build walk/promote.rs). The Reference, "Constant
+    /// promotion": the expression "could be written in a constant and borrowed".
+    Promoted(ExprId),
 }
 
 /// The constants' state of one build: the bodies checked and the records made.
@@ -453,6 +470,88 @@ impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
     fn manually_drop(&self) -> Option<Option<ItemKey>> {
         super::const_drop::manually_drop(self.names, self.index, &self.project)
     }
+
+    /// The item paths `type_name` prints (the `TypeNames` impl below).
+    fn type_names(&self) -> Option<&dyn blaze_build::type_name::TypeNames> {
+        Some(self)
+    }
+
+    /// The `Fn*` lang trait's method by the one map (front2/langs.rs `fn_trait_method`), as the
+    /// run answers the builder (program.rs `lang_trait_fn`: the trait `#[lang]` names, its
+    /// member filed with its head), so a closure's fn pointer here names the instance the run
+    /// builds. A member is filed only once its trait's head is made: until then the head is
+    /// noted as a fill (its want's refusal as a gap) in `project`, which [`Consts::value`]
+    /// makes before it evaluates the need again, or refuses by name. `None` with nothing noted:
+    /// the library declares no such lang trait, and the evaluator refuses the coercion by name.
+    fn fn_trait_method(&self, which: blaze_build::FnTrait) -> Option<ItemKey> {
+        let (lang, name) = super::langs::fn_trait_method(which);
+        let lib = self.index.lang(super::langs::lang_name(lang)?)?;
+        let trait_ = super::keys::checker_of(lib);
+        if let Some(method) = self.keys.filed_member(trait_, super::keys::MemberKind::Fn, name) {
+            return Some(method);
+        }
+        let mut fills = Vec::new_in(Global);
+        let mut gaps = Vec::new_in(Global);
+        match super::fill::want_of_item(self.names, lib) {
+            Ok(want) => fills.push(super::world_items::Fill::Store(want)),
+            Err(e) => gaps.push(super::world_items::Gap::Fill(e)),
+        }
+        self.project.note(fills, gaps);
+        None
+    }
+}
+
+/// `core::any::type_name`'s item paths over the names source ([`type_name_path`]).
+impl<'n, S: NamesSource<'n>> blaze_build::type_name::TypeNames for ConstsWorld<'_, 'n, S> {
+    fn item_path(&self, item: ItemKey, out: &mut dyn FnMut(&str)) -> bool {
+        type_name_path(self.names, self.keys, item, out)
+    }
+}
+
+/// The path `type_name` prints checker key `item` by, as rustc prints a def path: the
+/// declaring module's path from its crate's name (`core::option`, never a re-export's
+/// `std::option`) and the item's name; a trait's member as its trait's path and its name
+/// (`core::iter::Iterator::next`). `false`, with `out` not called (the printer then refuses
+/// naming the item: never a path made up): a member of an impl (rustc prints
+/// `<Self as Trait>::name`, which needs the impl's self type printed, not done here), an item
+/// in a block's module (rustc prints the enclosing fn's path and `{{closure}}`-like parts), or
+/// an item the source names no module or name for.
+fn type_name_path<'n, S: NamesSource<'n>>(names: S, keys: &Keys, item: ItemKey, out: &mut dyn FnMut(&str)) -> bool {
+    if let Some(super::keys::Origin::Member { container, name, .. }) = keys.origin(item) {
+        return match keys.library_in(names, *container) {
+            Some(owner) => type_name_member(names, owner, name, out),
+            None => false,
+        };
+    }
+    let Some(lib) = keys.library_in(names, item) else { return false };
+    match names.member_owner(lib) {
+        Some((owner, name)) => type_name_member(names, owner, name, out),
+        None => type_name_item(names, lib, out),
+    }
+}
+
+/// Member `name` of library item `owner`: printed only when `owner` is a trait (an impl has no
+/// name of its own: [`type_name_path`]).
+fn type_name_member<'n, S: NamesSource<'n>>(names: S, owner: LibKey, name: &str, out: &mut dyn FnMut(&str)) -> bool {
+    if names.name_of(owner).is_none() || !type_name_item(names, owner, out) {
+        return false;
+    }
+    out("::");
+    out(name);
+    true
+}
+
+/// A module-level library item: its module's path, `::`, its name; `out` is called only once
+/// all three are known.
+fn type_name_item<'n, S: NamesSource<'n>>(names: S, lib: LibKey, out: &mut dyn FnMut(&str)) -> bool {
+    let (Some(home), Some(name)) = (names.home_of(lib), names.name_of(lib)) else { return false };
+    let Some(path) = names.module_path(home) else { return false };
+    if !path.is_empty() {
+        out(path);
+        out("::");
+    }
+    out(name);
+    true
 }
 
 /// Where an evaluation starts ([`Consts::value_at`]): `item` at no arguments; a trait's
@@ -490,27 +589,28 @@ impl<'n> Consts<'n> {
     /// evaluator's own table first; every constant the value needs is evaluated first by the
     /// same work list as [`Consts::value`]'s (a cycle is the evaluator's typed refusal).
     pub fn value_with_args<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, from: tc::PTys<'_>, args: &[tc::PTy], scratch: Alloc<'_>) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
-        let list = self.args_in_unit(item, from, args, scratch)?;
+        let list = self.args_in_unit(item, from, args, r.store.tys.alloc(), scratch)?;
         self.value_at(r, prepared, item, Root::Args(list))
     }
 
-    /// The record of `const { .. }` block `block` of `owner`'s body at the owner's ground
-    /// arguments `args` (types of `from`): the owner's body is lowered and checked for this
-    /// evaluator once per block, under the block's key `key` (const_at.rs `block_key`), and
-    /// read from the block as its root ([`ConstBody::root`]); then evaluated as any constant.
+    /// The record of the constant at `root` of `owner`'s body (a `const { .. }` block, or a
+    /// promoted borrow's operand) at the owner's ground arguments `args` (types of `from`): the
+    /// owner's body is lowered and checked for this evaluator once per such constant, under its
+    /// key `key` (const_at.rs `block_key` / `promoted_key`), and read from the root expression
+    /// ([`ConstBody::root`]); then evaluated as any constant.
     #[allow(clippy::too_many_arguments)]
-    pub fn block_value<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, owner: ItemKey, block: ExprId, key: ItemKey, from: tc::PTys<'_>, args: &[tc::PTy], scratch: Alloc<'_>) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
+    pub fn body_value<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, owner: ItemKey, root: BodyRoot, key: ItemKey, from: tc::PTys<'_>, args: &[tc::PTy], scratch: Alloc<'_>) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
         if !self.bodies.iter().any(|b| b.key == key) {
-            self.check_as(r, prepared, owner, key, Some(block))?;
+            self.check_as(r, prepared, owner, key, Some(root))?;
         }
-        let list = self.args_in_unit(key, from, args, scratch)?;
+        let list = self.args_in_unit(key, from, args, r.store.tys.alloc(), scratch)?;
         self.value_at(r, prepared, key, Root::Args(list))
     }
 
     /// `args` (types of `from`, all ground) copied into this evaluator's own type table, as
     /// one list of it.
-    fn args_in_unit(&mut self, item: ItemKey, from: tc::PTys<'_>, args: &[tc::PTy], scratch: Alloc<'_>) -> Result<List, ConstFail> {
-        let alloc = Alloc::global();
+    /// `alloc` is the store's: the unit's tables are kept with the evaluator.
+    fn args_in_unit(&mut self, item: ItemKey, from: tc::PTys<'_>, args: &[tc::PTy], alloc: Alloc<'static>, scratch: Alloc<'_>) -> Result<List, ConstFail> {
         let (mut ground, layout, codes) = self.unit.take().unwrap_or_else(|| (PortableTys::new_in(alloc), Layouts::new_in(alloc), Codes::new_in(alloc)));
         let list = super::const_at::copy_ground(from, args, &mut ground, scratch).map_err(|why| ConstFail::Eval(format!("constant {item:?}: its arguments: {why}").into_boxed_str()));
         self.unit = Some((ground, layout, codes));
@@ -641,7 +741,7 @@ impl<'n> Consts<'n> {
     /// One evaluation of [`Consts::value_at`]'s root: the key of its record (kept in
     /// `self.records`), or the refusal.
     fn value_key<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, root: Root) -> Result<RecordKey, ConstFail> {
-        let alloc = Alloc::global();
+        let alloc = r.store.tys.alloc();
         let (mut ground, mut layout, mut codes) = self.unit.take().unwrap_or_else(|| (PortableTys::new_in(alloc), Layouts::new_in(alloc), Codes::new_in(alloc)));
         let root = match root {
             Root::Plain => Ok((item, List::EMPTY)),
@@ -794,9 +894,10 @@ impl<'n> Consts<'n> {
     }
 
     /// [`Consts::check_one`] of `item`'s body, kept under `key`: `item`'s own key, or, with
-    /// `root` a `const { .. }` block of that body, the block's key (const_at.rs `block_key`).
-    /// A `root` that is not a const block of the body as lowered here is refused by name.
-    fn check_as<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, key: ItemKey, root: Option<ExprId>) -> Result<(), ConstFail> {
+    /// `root` a constant inside that body ([`BodyRoot`]), that constant's key (const_at.rs
+    /// `block_key` / `promoted_key`). A `root` that is not a const block, or not a borrow the
+    /// check here lists as promoted, of the body as lowered here is refused by name.
+    fn check_as<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, key: ItemKey, root: Option<BodyRoot>) -> Result<(), ConstFail> {
         // A constant declared in a body has its head made first (const_open.rs `local_head`).
         super::const_open::local_head(r, item)?;
         let lowered = match r.keys.library_in(r.names, item) {
@@ -815,11 +916,19 @@ impl<'n> Consts<'n> {
             let lits = LitTable::of(&view, &lowered.typeck, item)?;
             (checked, lits)
         };
-        if let Some(block) = root
-            && !matches!(lowered.typeck.exprs.get(block.0 as usize), Some(tc::Expr::ConstBlock { .. }))
-        {
-            return Err(ConstFail::NotConstBlock { owner: item, block });
-        }
+        let root = match root {
+            None => None,
+            Some(BodyRoot::Block(block)) => match lowered.typeck.exprs.get(block.0 as usize) {
+                Some(tc::Expr::ConstBlock { .. }) => Some(block),
+                _ => return Err(ConstFail::NotConstBlock { owner: item, block }),
+            },
+            // The operand is evaluated; the builder borrows its row. Only a borrow THIS check
+            // promoted: one it did not is a runtime temporary, never a constant.
+            Some(BodyRoot::Promoted(borrow)) => match lowered.typeck.exprs.get(borrow.0 as usize) {
+                Some(&tc::Expr::Ref { mutbl: tc::Mutbl::Not, operand }) if checked.promoted.binary_search_by_key(&borrow.0, |x| x.0).is_ok() => Some(operand),
+                _ => return Err(ConstFail::NotPromoted { owner: item, borrow }),
+            },
+        };
         let text = match (r.store.locals.head(item), r.keys.library_in(r.names, item)) {
             // An item declared in a body: its kept text (the names library holds none for
             // it; body.rs `lower_fn_into` lowered it from the same text).

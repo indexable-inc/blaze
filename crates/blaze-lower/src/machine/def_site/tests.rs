@@ -138,6 +138,34 @@ fn a_template_sees_the_labels_at_its_definition() {
     assert_eq!(kinds, vec![DiagKind::UndeclaredLabel], "the loop opens after the definition");
 }
 
+/// A `macro` (2.0) the body writes is a body macro too, in both its forms, its template seeing
+/// the locals at its definition (def-site hygiene, the Reference's "Hygiene"). The case: std's
+/// `OsString::push` (library/std/src/ffi/os_str.rs), whose `macro spec_str($T:ty) { impl
+/// SpecPushTo for $T { .. } }` is written in the fn and called as `spec_str!(str);`: the
+/// call's path was resolved in the module, "segment 0: not found", and the call left out
+/// (`Unhandled { syntax: MACRO_CALL, why: NotExpanded }`).
+///
+/// Prints: `test machine::def_site::tests::a_body_macro_2_expands ... ok`. A wrong version
+/// (MACRO_DEF not kept among the body's macros, or its params read as rules) leaves the
+/// calls unhandled and `lowered` fails with "unhandled [..]".
+#[test]
+fn a_body_macro_2_expands() {
+    // std's shape: items written by a `macro m(params) { body }`, called twice.
+    let text = "fn f() { trait T { fn t(&self); } macro m($T:ty) { impl T for $T { fn t(&self) {} } } m!(str); m!(u8); }";
+    let l = lowered(text);
+    assert_eq!(l.view().expansion_keys.len(), 2, "both calls expanded\n{}", dump_of(&l));
+    // The parameter form's template sees the local at its definition.
+    let text = "fn f(a: u8) -> u8 { macro m($e:expr) { $e + a } m!(1) }";
+    let l = lowered(text);
+    let v = l.view();
+    assert_eq!(locals(&v), binds(&v, "a"), "the template's `a` is the parameter\n{}", dump_of(&l));
+    // The arms form.
+    let text = "fn f(a: u8) -> u8 { macro twice { ($x:expr) => { $x * 2 } } twice!(a) }";
+    let l = lowered(text);
+    let v = l.view();
+    assert_eq!(locals(&v), binds(&v, "a"), "`$x` is the caller's `a`\n{}", dump_of(&l));
+}
+
 /// A template's own `let` of a name the definition also sees is the one its uses find: its
 /// own hygiene's key is asked before the definition's.
 #[test]

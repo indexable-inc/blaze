@@ -2,9 +2,10 @@
 //! its sans-IO HTTP/1.1 client (`blaze_http::Client`: connections kept between requests by
 //! origin, redirects, gzip, TLS through rustls on ring with the machine's roots, every timeout
 //! a deadline) driven on blaze-core's effects by `blaze_http::driver`, on a thread of this
-//! client's own. No async runtime is under it: a caller's executor polls the futures
-//! [`Http::get_async`] gives, and the blocking calls park this thread on them
-//! (`blaze_http::mailbox::block_on`, each wait named). Every request goes through the proxy
+//! client's own. No future is under it: an asker reads its request's events with timed
+//! receives (`Answer::next`), each bounded by the client's own deadlines or ticking the
+//! download's stall bound, and a download's ranges run on scoped threads of their own
+//! ([`Requests::ranged`]). Every request goes through the proxy
 //! the environment names for its origin, as curl and cargo read it (`blaze_http::proxy`), read
 //! once as the client is made: a variable that can't be used fails the client, naming it.
 //!
@@ -13,24 +14,31 @@
 
 use std::{
     alloc::Global,
-    collections::VecDeque,
-    pin::Pin,
-    sync::Arc,
-    task::Poll,
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
 use anyhow::Context as _;
+use blaze_core::chan;
 use blaze_http::{
     Client, Config, Event, Kind, Request,
     driver::{Answer, Handle},
-    mailbox::{self, Either},
+    mailbox::{self, Unanswered},
 };
 use http::Method;
 
 use blaze_fetch::{redact, scrub};
 
-use super::{Bounds, Http, Pending, Refused, Response, Sink, Stalled, Transport, Watch};
+use super::{Bounds, Http, Refused, Response, Sink, Stalled, Transport, Watch};
+
+/// How far past the client's own deadline an asker waits for its driver: the driver ends a
+/// request that gets nothing for the client's timeout, and fires a timer at its time, so a
+/// wait this much longer than either is the driver's bug, said as one.
+const SLACK: Duration = Duration::from_secs(5);
 
 /// How many requests the driver has in flight at once, each on a connection of its own
 /// (HTTP/1), and so the most idle connections the client keeps; the rest wait their turn in
@@ -54,11 +62,14 @@ pub struct HyperHttp {
     made: std::sync::OnceLock<Result<Requests, String>>,
 }
 
-/// What one request needs, cheap to clone into any future.
+/// What one request needs, cheap to clone onto a range's thread.
 #[derive(Clone)] // clone: a handle on the one driver, once per range of a download
 struct Requests {
     /// The driver of the process's one client: its connections, shared by every clone.
     http: Handle,
+    /// The longest one event of a request is waited for: the client's timeout, after which
+    /// the driver itself ends the request, and [`SLACK`].
+    within: Duration,
 }
 
 impl HyperHttp {
@@ -94,15 +105,8 @@ impl Requests {
             Config { idle_most: IN_FLIGHT, proxies, ..Config::new(tls, user_agent, timeout) };
         let http = Handle::spawn(Client::new(config), IN_FLIGHT)
             .context("starting blaze-http's driver thread")?;
-        Ok(Requests { http })
+        Ok(Requests { http, within: timeout.saturating_add(SLACK) })
     }
-}
-
-/// Runs `work` to its end on this thread, parked between its steps; `what` names the wait.
-/// Unbounded here: every request ends by its own deadlines (the client's timeouts, the stall
-/// bound), which the driver reaches.
-fn block<T>(what: &'static str, work: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
-    mailbox::block_on(what, None, work).context("waiting for blaze-http's driver")?
 }
 
 /// `headers` as the client takes them.
@@ -139,7 +143,7 @@ impl HyperHttp {
     ) -> anyhow::Result<Response> {
         let made = self.made()?;
         let answer = made.ask(method, url, headers, body, Bounds::NONE);
-        block("an HTTP answer", collect(answer, url, Bounds::NONE))
+        collect(answer, url, Bounds::NONE, made.within)
     }
 
     /// [`Http::get`] of `url` held to `bounds`: a body past `bounds.most` stops being read, and
@@ -152,7 +156,7 @@ impl HyperHttp {
     ) -> anyhow::Result<Response> {
         let made = self.made()?;
         let answer = made.ask(Method::GET, url, headers, Vec::new(), bounds);
-        block("a bounded HTTP answer", collect(answer, url, bounds))
+        collect(answer, url, bounds, made.within)
     }
 
     /// `url`'s body from byte `from` into `sink`, in order, each piece with its offset in the
@@ -172,55 +176,43 @@ impl HyperHttp {
         watch: Watch<'_>,
     ) -> anyhow::Result<Response> {
         let made = self.made()?;
-        block("a download's ranges", made.ranged(url, headers, from, bounds, sink, what, watch))
+        made.ranged(url, headers, from, bounds, sink, what, watch)
     }
-}
 
-impl HyperHttp {
-    /// `url`'s body from byte `from`, collected, as a future any executor polls (its requests
-    /// go as it is first polled): [`HyperHttp::stream_watched`]'s ranges, progress (said in
-    /// blaze-fetch's downloads as `what`) and stall bound. The answer's body is the bytes from
-    /// `from` on, whether the server kept to the range (206) or sent the whole (200).
-    pub fn get_from_async(
+    /// `url`'s body from byte `from`, collected: [`HyperHttp::stream_watched`]'s ranges,
+    /// progress (said in blaze-fetch's downloads as `what`) and stall bound. The answer's body
+    /// is the bytes from `from` on, whether the server kept to the range (206) or sent the
+    /// whole (200).
+    pub fn get_from(
         &self,
         url: &str,
         headers: &[(&str, &str)],
         from: u64,
         what: &str,
-    ) -> Pending<anyhow::Result<Response>> {
-        let made = match self.made() {
-            Ok(made) => made.clone(), // clone: the driver's handle, moved into the future
-            Err(e) => return Box::pin(std::future::ready(Err(e))),
-        };
-        let (url, what) = (url.to_owned(), what.to_owned());
-        let headers = owned(headers);
-        Box::pin(async move {
-            let mut views = Vec::with_capacity_in(headers.len(), Global);
-            views.extend(headers.iter().map(|(name, value)| (name.as_str(), value.as_str())));
-            // The body kept, and the offset of its first byte: `from`, or 0 once the server
-            // sends the whole.
-            let (mut body, mut base) = (Vec::new_in(Global), from);
-            let mut sink = |offset: u64, bytes: &[u8]| -> std::io::Result<()> {
-                if offset != base + body.len() as u64 {
-                    if offset != 0 {
-                        return Err(std::io::Error::other(format!(
-                            "a piece at byte {offset} came after byte {}",
-                            base + body.len() as u64
-                        )));
-                    }
-                    (body, base) = (Vec::new_in(Global), 0);
+    ) -> anyhow::Result<Response> {
+        let made = self.made()?;
+        // The body kept, and the offset of its first byte: `from`, or 0 once the server sends
+        // the whole.
+        let (mut body, mut base) = (Vec::new_in(Global), from);
+        let mut sink = |offset: u64, bytes: &[u8]| -> std::io::Result<()> {
+            if offset != base + body.len() as u64 {
+                if offset != 0 {
+                    return Err(std::io::Error::other(format!(
+                        "a piece at byte {offset} came after byte {}",
+                        base + body.len() as u64
+                    )));
                 }
-                body.extend_from_slice(bytes);
-                Ok(())
-            };
-            let mut answer =
-                made.ranged(&url, &views, from, Bounds::NONE, &mut sink, &what, &mut |_| {}).await?;
-            if matches!(answer.status, 200 | 206) {
-                let skip = usize::try_from(from.saturating_sub(base)).unwrap_or(usize::MAX);
-                answer.body = body.split_off(skip.min(body.len()));
+                (body, base) = (Vec::new_in(Global), 0);
             }
-            Ok(answer)
-        })
+            body.extend_from_slice(bytes);
+            Ok(())
+        };
+        let mut answer = made.ranged(url, headers, from, Bounds::NONE, &mut sink, what, &mut |_| {})?;
+        if matches!(answer.status, 200 | 206) {
+            let skip = usize::try_from(from.saturating_sub(base)).unwrap_or(usize::MAX);
+            answer.body = body.split_off(skip.min(body.len()));
+        }
+        Ok(answer)
     }
 }
 
@@ -258,11 +250,12 @@ impl Requests {
 }
 
 /// `answer`, read whole: its head and its body, held to `bounds.most`; `url` is the address
-/// asked.
-async fn collect(mut answer: Answer, url: &str, bounds: Bounds) -> anyhow::Result<Response> {
+/// asked; each event is waited for at most `within` ([`Requests::within`]).
+fn collect(mut answer: Answer, url: &str, bounds: Bounds, within: Duration) -> anyhow::Result<Response> {
+    let wait = &mut Wait::Bounded(within);
     // `said`, with no userinfo, query or fragment (a redirect's `X-Amz-Signature`), is the
     // only form of the address that answered any message holds.
-    let (said, status, headers) = match next(&mut answer, url).await? {
+    let (said, status, headers) = match next(&mut answer, url, wait)? {
         Event::Head { url, status, headers, .. } => (redact(&url), status, headers),
         Event::Failed { error, .. } => return Err(failed(error)),
         Event::Body { .. } | Event::Done { .. } => {
@@ -271,7 +264,7 @@ async fn collect(mut answer: Answer, url: &str, bounds: Bounds) -> anyhow::Resul
     };
     let room = usize::try_from(bounds.most).unwrap_or(usize::MAX);
     let mut bytes = Vec::new_in(Global);
-    while let Some(piece) = next_piece(&mut answer, &said).await? {
+    while let Some(piece) = next_piece(&mut answer, &said, wait)? {
         if piece.len() > room.saturating_sub(bytes.len()) {
             // The client holds the body to `most` itself; past it is its bug, said here.
             let refused =
@@ -325,51 +318,46 @@ fn content_range(value: &str) -> Option<(Option<(u64, u64)>, u64)> {
     Some((Some((start.trim().parse().ok()?, end.trim().parse().ok()?)), total))
 }
 
-/// One range of a download in flight: polled with the others ([`front`]) until it has its
-/// bytes. Dropping it cancels its request.
-enum Range {
-    // dyn: one per range of a download (at most `PARALLEL` at once), each a request that costs
-    // far more than its box.
-    Running(Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send, Global>>),
-    Done(anyhow::Result<Vec<u8>>),
+/// How an asker waits for its request's next event.
+enum Wait<'t> {
+    /// One wait of at most this long ([`Requests::within`]): the driver ends a request that
+    /// gets nothing for the client's timeout, so a wait past it is the driver's bug.
+    Bounded(Duration),
+    /// Waits of [`TICK`], with `tick` run after each that passes; its error (the stall bound, a
+    /// cancel) ends the wait, so the waits are no more than the stall bound has ticks.
+    // dyn: one download's tick, called once a TICK.
+    Ticking(&'t mut dyn FnMut() -> anyhow::Result<()>),
 }
 
-/// Polls every range in `flying`, so all of them move at once, and gives the front one's
-/// outcome once it has one (`None` when none is in flight): the ranges are handed on in
-/// order.
-fn front(
-    flying: &mut VecDeque<(u64, Range), Global>,
-) -> impl Future<Output = Option<(u64, anyhow::Result<Vec<u8>>)>> + '_ {
-    std::future::poll_fn(move |cx| {
-        for (_, range) in flying.iter_mut() {
-            if let Range::Running(work) = range
-                && let Poll::Ready(done) = work.as_mut().poll(cx)
-            {
-                *range = Range::Done(done);
-            }
-        }
-        match flying.front() {
-            None => Poll::Ready(None),
-            Some((_, Range::Running(_))) => Poll::Pending,
-            Some((_, Range::Done(_))) => match flying.pop_front() {
-                Some((start, Range::Done(done))) => Poll::Ready(Some((start, done))),
-                _ => unreachable!("the front was looked at just above"),
-            },
-        }
-    })
+/// A range of a download stopped because the download ended first (another range failed, or
+/// the stall bound passed): the download's own error is the one said.
+#[derive(Debug)]
+struct RangeCancelled {
+    from: u64,
+    to: u64,
 }
+
+impl std::fmt::Display for RangeCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "bytes {}-{}: stopped, as the download they are part of ended first", self.from, self.to)
+    }
+}
+
+impl std::error::Error for RangeCancelled {}
 
 impl Requests {
     /// A GET of `url` asking for bytes `from..=to` (`to` open when `None`), not encoded, held to
     /// `bounds`; with `if_range` (the first answer's `ETag`), a body that changed meanwhile comes
-    /// whole as a 200, which the caller refuses.
-    async fn open(
+    /// whole as a 200, which the caller refuses. Its head is waited for as `wait` says.
+    #[expect(clippy::too_many_arguments, reason = "one ranged request's every input, said once")]
+    fn open(
         &self,
         url: &str,
         headers: &[(String, String)],
         (from, to): (u64, Option<u64>),
         if_range: Option<&str>,
         bounds: Bounds,
+        wait: &mut Wait<'_>,
     ) -> anyhow::Result<Opened> {
         let mut asked = Vec::with_capacity_in(headers.len() + 2, Global);
         asked.extend_from_slice(headers);
@@ -391,7 +379,7 @@ impl Requests {
             https_only: bounds.https_only,
         };
         let mut answer = self.http.ask(request);
-        match next(&mut answer, url).await? {
+        match next(&mut answer, url, wait)? {
             Event::Head { url, status, headers, .. } => {
                 Ok(Opened { said: redact(&url), status, headers, answer })
             }
@@ -404,35 +392,46 @@ impl Requests {
 
     /// One range `from..=to` of `url`, collected, asked again from where it stopped when the
     /// transfer is lost, at most [`PIECE_TRIES`] times. A 200 (the body changed since the first
-    /// answer, as `if_range` says) or a range other than asked is refused.
+    /// answer, as `if_range` says) or a range other than asked is refused. Run on a range's
+    /// own thread ([`Requests::ranged`]); once `cancel` is set (the download ended) it stops
+    /// within a [`TICK`] with [`RangeCancelled`].
     #[expect(
         blaze::retry,
         reason = "a range whose transfer is lost is asked again from where it stopped, up to PIECE_TRIES times: the first lost transfer must be the fetch's typed error"
     )]
-    async fn piece(
-        self,
-        url: String,
-        headers: Vec<(String, String)>,
+    #[expect(clippy::too_many_arguments, reason = "one range's every input, said once")]
+    fn piece(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
         (from, to): (u64, u64),
-        if_range: Option<String>,
+        if_range: Option<&str>,
         bounds: Bounds,
         counter: blaze_fetch::downloads::Counter<'static>,
+        cancel: &AtomicBool,
     ) -> anyhow::Result<Vec<u8>> {
         let len = usize::try_from(to - from + 1).unwrap_or(usize::MAX);
         // One range of a download, at most `PIECE` bytes.
         let mut got = Vec::with_capacity_in(len, Global);
         let mut tries = 0;
+        let mut cancelled = || -> anyhow::Result<()> {
+            match cancel.load(Ordering::Acquire) {
+                true => Err(RangeCancelled { from, to }.into()),
+                false => Ok(()),
+            }
+        };
+        let wait = &mut Wait::Ticking(&mut cancelled);
         loop {
             let at = from + got.len() as u64;
-            let tried: anyhow::Result<()> = async {
+            let tried: anyhow::Result<()> = (|| {
                 // The range is asked for alone, and the piece is held to the first answer's
                 // `ETag` here: what `If-Range` is for, without relying on the server to honour
                 // it. static.crates.io's CDN does not (2026-11-11: 200 with the whole body to
                 // a `Range` with a matching `If-Range`, 206 to the `Range` alone), and a whole
                 // body answered and then dropped mid-transfer is a request this client would
                 // have to cancel cleanly for nothing.
-                let mut opened = self.open(&url, &headers, (at, Some(to)), None, bounds).await?;
-                if let Some(first) = if_range.as_deref()
+                let mut opened = self.open(url, headers, (at, Some(to)), None, bounds, wait)?;
+                if let Some(first) = if_range
                     && opened.header("etag") != Some(first)
                 {
                     anyhow::bail!(
@@ -453,15 +452,14 @@ impl Requests {
                     );
                     return Err(error);
                 }
-                while let Some(bytes) = next_piece(&mut opened.answer, &opened.said).await? {
+                while let Some(bytes) = next_piece(&mut opened.answer, &opened.said, wait)? {
                     let room = len - got.len();
                     let bytes = &bytes[..bytes.len().min(room)];
                     got.extend_from_slice(bytes);
                     counter.got(bytes.len() as u64);
                 }
                 Ok(())
-            }
-            .await;
+            })();
             match tried {
                 Ok(()) if got.len() == len => return Ok(got),
                 Ok(()) => {}
@@ -469,7 +467,7 @@ impl Requests {
                 Err(error) if tries + 1 >= PIECE_TRIES => {
                     return Err(error.context(format!(
                         "bytes {from}-{to} of {}: given up after {PIECE_TRIES} tries",
-                        redact(&url)
+                        redact(url)
                     )));
                 }
                 Err(_) => {}
@@ -478,7 +476,7 @@ impl Requests {
             if tries >= PIECE_TRIES {
                 anyhow::bail!(
                     "bytes {from}-{to} of {} ended short {PIECE_TRIES} times, at {} of {len} bytes",
-                    redact(&url),
+                    redact(url),
                     got.len()
                 );
             }
@@ -492,7 +490,7 @@ impl Requests {
     /// downloads as `what` for the status line and the stall bound, `watch`ed every [`TICK`],
     /// and stopped as [`Stalled`] when no byte comes for the stall bound.
     #[expect(clippy::too_many_arguments, reason = "one download's every input, said once")]
-    async fn ranged(
+    fn ranged(
         &self,
         url: &str,
         headers: &[(&str, &str)],
@@ -517,11 +515,10 @@ impl Requests {
             }
             Ok(())
         };
-        let mut opened = self
-            .tick_until(self.open(url, &owned, (from, Some(first_to)), None, bounds), || {
-                ticked(&download, watch, url)
-            })
-            .await?;
+        let mut opened = {
+            let mut tick = || ticked(&download, &mut *watch, url);
+            self.open(url, &owned, (from, Some(first_to)), None, bounds, &mut Wait::Ticking(&mut tick))?
+        };
         let length = opened.header("content-length").and_then(|it| it.trim().parse::<u64>().ok());
         let (at, total) = match opened.status {
             200 => (0, length),
@@ -548,7 +545,8 @@ impl Requests {
                 // An error's body, for its message: its first `ERROR_BODY_MOST` bytes.
                 let room = usize::try_from(ERROR_BODY_MOST).unwrap_or(usize::MAX);
                 let mut body = Vec::new_in(Global);
-                while let Some(piece) = next_piece(&mut opened.answer, &opened.said).await? {
+                let wait = &mut Wait::Bounded(self.within);
+                while let Some(piece) = next_piece(&mut opened.answer, &opened.said, wait)? {
                     body.extend_from_slice(&piece[..piece.len().min(room - body.len())]);
                     if body.len() >= room {
                         break;
@@ -570,9 +568,10 @@ impl Requests {
         // The first answer's body: the whole of a 200, or the first range.
         let mut offset = at;
         loop {
-            let piece = self
-                .tick_until(next_piece(&mut opened.answer, &said), || ticked(&download, watch, &said))
-                .await?;
+            let piece = {
+                let mut tick = || ticked(&download, &mut *watch, &said);
+                next_piece(&mut opened.answer, &said, &mut Wait::Ticking(&mut tick))?
+            };
             let Some(piece) = piece else { break };
             if offset.saturating_add(piece.len() as u64) > bounds.most {
                 let refused = Refused::TooBig { url: said, most: bounds.most, said: None, decoded: false };
@@ -590,66 +589,75 @@ impl Requests {
                 return Ok(Response { status, headers: head, body: Vec::new_in(Global) });
             }
         };
-        // The rest, `PARALLEL` ranges in flight and polled together, handed on in order:
-        // memory holds at most `PARALLEL` ranges. Returning early drops those in flight, which
-        // cancels their requests.
-        let mut next_from = offset;
-        let mut flying = VecDeque::with_capacity_in(PARALLEL, Global);
-        while next_from < total || !flying.is_empty() {
-            while flying.len() < PARALLEL && next_from < total {
-                let to = next_from.saturating_add(PIECE - 1).min(total - 1);
-                let work = self.clone().piece(
-                    url.to_owned(),
-                    owned.clone(), // clone: each range asks with the download's headers
-                    (next_from, to),
-                    tag.clone(), // clone: as above
-                    bounds,
-                    download.counter(),
-                );
-                flying.push_back((next_from, Range::Running(Box::pin(work))));
-                next_from = to + 1;
-            }
-            let joined = self
-                .tick_until(
-                    async {
-                        let front = front(&mut flying).await;
-                        Ok(front)
-                    },
-                    || ticked(&download, watch, &said),
-                )
-                .await?;
-            let Some((start, bytes)) = joined else { break };
-            let bytes = bytes?;
-            debug_assert_eq!(start, offset);
-            sink(offset, &bytes).with_context(|| format!("keeping the body of {said}"))?;
-            offset += bytes.len() as u64;
-        }
+        // The rest, each range on a thread of its own (a blocking request has no other way to
+        // be in flight beside another), handed on in order: ranges in flight and those done
+        // ahead of the front are at most `PARALLEL`, so memory holds at most `PARALLEL`
+        // ranges. This thread ticks the download's stall bound while it waits; once it ends,
+        // early or not, `cancel` stops every range still in flight within a TICK, and the
+        // scope joins them before this returns.
+        let cancel = AtomicBool::new(false);
+        let (done_to, done) = chan::unbounded::<(u64, anyhow::Result<Vec<u8>>)>();
+        std::thread::scope(|scope| -> anyhow::Result<()> {
+            let ended = (|| -> anyhow::Result<()> {
+                let mut next_from = offset;
+                let mut flying = 0_usize;
+                let mut held = BTreeMap::new();
+                while next_from < total || flying > 0 || !held.is_empty() {
+                    while flying + held.len() < PARALLEL && next_from < total {
+                        let (at, to) = (next_from, next_from.saturating_add(PIECE - 1).min(total - 1));
+                        let (done_to, counter, cancel) = (done_to.clone(), download.counter(), &cancel);
+                        let (owned, tag) = (&owned, tag.as_deref());
+                        std::thread::Builder::new()
+                            .name("blaze-registry.range".to_owned())
+                            .spawn_scoped(scope, move || {
+                                let got = self.piece(url, owned, (at, to), tag, bounds, counter, cancel);
+                                // `done` outlives the scope, so this send is never refused.
+                                assert!(done_to.send((at, got)).is_ok(), "a download's ranges are read until the scope joins them");
+                            })
+                            .with_context(|| format!("starting a thread for bytes {at}-{to} of {said}"))?;
+                        flying += 1;
+                        next_from = to + 1;
+                    }
+                    if let Some(bytes) = held.remove(&offset) {
+                        let bytes: Vec<u8> = bytes;
+                        sink(offset, &bytes).with_context(|| format!("keeping the body of {said}"))?;
+                        offset += bytes.len() as u64;
+                        continue;
+                    }
+                    match mailbox::answer("a download's next range", &done, TICK) {
+                        Ok(Some((start, got))) => {
+                            flying -= 1;
+                            held.insert(start, got?);
+                        }
+                        Ok(None) => anyhow::bail!("{said}: a download's ranges ended unsaid, though this thread holds their sender"),
+                        Err(Unanswered::TimedOut { .. }) => ticked(&download, &mut *watch, &said)?,
+                    }
+                }
+                Ok(())
+            })();
+            cancel.store(true, Ordering::Release);
+            ended
+        })?;
         watch(&download.line());
         Ok(Response { status: 206, headers: head, body: Vec::new_in(Global) })
     }
-
-    /// `work`, with `tick` run every [`TICK`] (on the driver's timer) while it is not done; an
-    /// error of `tick` (the stall bound) ends the wait with it, dropping `work`.
-    async fn tick_until<T>(
-        &self,
-        work: impl Future<Output = anyhow::Result<T>>,
-        mut tick: impl FnMut() -> anyhow::Result<()>,
-    ) -> anyhow::Result<T> {
-        let mut work = std::pin::pin!(work);
-        // Each pass ends with `work` done or one tick, which ends the wait once the stall bound
-        // passes: no more passes than the stall bound has ticks.
-        loop {
-            match mailbox::race(work.as_mut(), self.http.sleep(TICK)).await {
-                Either::First(done) => return done,
-                Either::Second(()) => tick()?,
-            }
-        }
-    }
 }
 
-/// `answer`'s next event; `url` is the address asked, said only redacted.
-async fn next(answer: &mut Answer, url: &str) -> anyhow::Result<Event> {
-    answer.next().await.with_context(|| {
+/// `answer`'s next event, waited for as `wait` says; `url` is the address asked, said only
+/// redacted.
+fn next(answer: &mut Answer, url: &str, wait: &mut Wait<'_>) -> anyhow::Result<Event> {
+    let event = match wait {
+        Wait::Bounded(within) => answer.next(*within).with_context(|| format!("asking {}", redact(url)))?,
+        // Each pass ends with an event or one tick, and the tick's error (the stall bound, a
+        // cancel) ends the wait: no more passes than the stall bound has ticks.
+        Wait::Ticking(tick) => loop {
+            match answer.next(TICK) {
+                Ok(event) => break event,
+                Err(Unanswered::TimedOut { .. }) => tick()?,
+            }
+        },
+    };
+    event.with_context(|| {
         format!(
             "asking {}: blaze-http's driver ended before the answer did (its thread stopped, or its loop panicked)",
             redact(url)
@@ -658,8 +666,8 @@ async fn next(answer: &mut Answer, url: &str) -> anyhow::Result<Event> {
 }
 
 /// The next piece of `answer`'s body, `None` at its end; `said` is the address that answered.
-async fn next_piece(answer: &mut Answer, said: &str) -> anyhow::Result<Option<Vec<u8>>> {
-    match next(answer, said).await? {
+fn next_piece(answer: &mut Answer, said: &str, wait: &mut Wait<'_>) -> anyhow::Result<Option<Vec<u8>>> {
+    match next(answer, said, wait)? {
         Event::Body { bytes, .. } => Ok(Some(bytes)),
         Event::Done { .. } => Ok(None),
         Event::Failed { error, .. } => Err(failed(error)),
@@ -713,26 +721,18 @@ impl Http for HyperHttp {
         self.stream_watched(url, headers, from, Bounds::NONE, sink, named(url), &mut |_| {})
     }
 
-    fn get_async(&self, url: &str, headers: &[(&str, &str)]) -> Pending<anyhow::Result<Response>> {
-        let made = match self.made() {
-            Ok(made) => made,
-            Err(e) => return Box::pin(std::future::ready(Err(e))),
-        };
-        // Sent now: the driver holds it in order behind the `IN_FLIGHT` in flight.
-        let answer = made.ask(Method::GET, url, headers, Vec::new_in(Global), Bounds::NONE);
-        let url = url.to_owned();
-        Box::pin(async move { collect(answer, &url, Bounds::NONE).await })
-    }
-
-    fn sleep(&self, duration: Duration) -> Pending<()> {
+    fn sleep(&self, duration: Duration) -> anyhow::Result<()> {
         // A sleep only ever follows a request's spurious failure, which only a client made can
         // give: one not made has no driver to wait on, so the wait holds this thread, as
         // [`Http::sleep`]'s does.
         let Ok(made) = self.made() else {
             super::wait_out(duration);
-            return Box::pin(std::future::ready(()));
+            return Ok(());
         };
-        Box::pin(made.http.sleep(duration))
+        match mailbox::answer("a retry's sleep", &made.http.sleep(duration), duration.saturating_add(SLACK))? {
+            Some(()) => Ok(()),
+            None => anyhow::bail!("a retry's sleep: blaze-http's driver stopped before its timer fired"),
+        }
     }
 }
 

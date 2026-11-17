@@ -208,10 +208,13 @@ pub fn format<A: Allocator>(alloc: A, args: fmt::Arguments<'_>) -> String<A> {
     if let Some(text) = args.as_str() {
         return String::from_str_in(text, alloc);
     }
-    let mut out = String::new_in(alloc);
+    // Room reserved once, by `format!`'s own estimate (twice the literal bytes; none when the
+    // text starts with a placeholder and its literals are under 16 bytes), so the common text
+    // grows its buffer at most rarely instead of once per doubling.
+    let mut out = String::with_capacity_in(args.estimated_capacity(), alloc);
     if fmt::Write::write_fmt(&mut out, args).is_err() {
         panic!(
-            "format_in!: a formatting trait implementation returned an error when writing to a string, which never fails"
+            "format_in!:a formatting trait implementation returned an error when writing to a string, which never fails"
         );
     }
     out

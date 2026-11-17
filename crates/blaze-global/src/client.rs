@@ -87,7 +87,7 @@ pub struct Client<C: Channels = TlsClient> {
     /// In [`Client::fetch_many`]: what the store asks waits to be asked together.
     batching: bool,
     /// The records of verified manifests.
-    listed: ByHash<Key, Record, Global>,
+    listed: Map<Key, Record, BuildKeyHasher, Global>,
     published: Vec<Published>,
     got: Vec<GotBundle>,
     /// The store's completions that came of a call with no completions to return (a fetch
@@ -190,7 +190,7 @@ impl<C: Channels> Client<C> {
             bundles: VecDeque::new(),
             allowed: None,
             batching: false,
-            listed: ByHash::new_in(Global),
+            listed: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: None }),
             // alloc: setup: once a client.
             published: Vec::new(),
             // alloc: setup: once a client.
@@ -733,7 +733,7 @@ fn answer(
     asked: Asked,
     body: &[u8],
     trust: &Trust,
-    listed: &mut ByHash<Key, Record, Global>,
+    listed: &mut Map<Key, Record, BuildKeyHasher, Global>,
     window: &mut RecvWindow,
     fetches: &mut VecDeque<(Tag, Key)>,
     outcomes: &mut Outcomes<'_>,
@@ -861,7 +861,7 @@ fn fetched(
     answered: &mut usize,
     reader: &mut Reader<'_>,
     trust: &Trust,
-    listed: &ByHash<Key, Record, Global>,
+    listed: &Map<Key, Record, BuildKeyHasher, Global>,
     window: &mut RecvWindow,
     fetches: &mut VecDeque<(Tag, Key)>,
     outcomes: &mut Outcomes<'_>,

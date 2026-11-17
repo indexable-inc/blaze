@@ -47,7 +47,7 @@ use bstd::path::{Path, PathError};
 mod tests;
 
 /// The roster's folder beneath blaze's folder in the home (store.rs `HOME_FOLDER`, `.blaze`),
-/// beside [`crate::store::SHARED`] and [`crate::store::OWN`].
+/// beside the one store (`v2/store`, [`crate::store::Home::open_store`]).
 pub(crate) const ROSTER: &str = "v2/roster";
 /// An entry lives while its binary ran within this many days (remote-read.md section 3).
 pub const WINDOW_DAYS: u32 = 30;

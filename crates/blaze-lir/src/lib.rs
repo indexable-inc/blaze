@@ -80,7 +80,8 @@ pub mod simplify;
 pub mod ty;
 pub mod verify;
 
-pub use builder::{BuildError, Builder, Full, Requests, RequestsOnly, Sink};
+pub use builder::{BuildError, Builder, DataPosition, Full, Requests, RequestsOnly, Sink};
+pub use func::PositionField;
 pub use flags::{AtomicRmw, FlagClass, FlagKind, Flags, FloatCond, IntCond, Ordering};
 pub use func::{Block, BlockKind, Func, Head, Value, View};
 pub use op::{End, Field, Info, Layout, Op, Operands, Res};
@@ -91,8 +92,10 @@ pub use verify::{VerifyError, verify};
 
 /// The version of what LIR's bytes mean: its operations, their operands and flags, its types
 /// and tables. Part of the record's schema ([`persist::SCHEMA`]) and of every key of a LIR, so
-/// a change to any of them is a new version.
-pub const VERSION: u64 = 2;
+/// a change to any of them is a new version. 3: data rows hold source positions
+/// (`DataRec::positions_first`/`positions_len`, the `data_positions` column), filled when the
+/// program is placed (rule 71); 2 had none.
+pub const VERSION: u64 = 3;
 
 #[cfg(test)]
 mod coroutine_tests;

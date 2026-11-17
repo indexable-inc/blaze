@@ -46,7 +46,7 @@ use std::rc::Rc;
 use crate::platform::Platform;
 
 use super::types::{FeaturesSet, ResolveBehavior};
-use super::{CargoResult, HashMap, HashSet};
+use super::{CargoResult, FixedState, Map, MapOpts, Set, SetOpts};
 use crate::dependency::{DepKind, Dependency};
 use crate::interning::InternedString;
 use crate::package_id::PackageId;
@@ -77,7 +77,7 @@ pub enum CompileKind {
 pub type PackageFeaturesKey = (PackageId, FeaturesFor);
 /// Map of activated features.
 // BTreeSet: grown while resolving and read in order by every `activated_features` call.
-pub type ActivateMap = HashMap<PackageFeaturesKey, BTreeSet<InternedString>, Global>;
+pub type ActivateMap = Map<PackageFeaturesKey, BTreeSet<InternedString>, FixedState, Global>;
 
 /// Set of all activated features for all packages in the resolve graph.
 pub struct ResolvedFeatures {
@@ -387,7 +387,7 @@ pub struct FeatureResolver<'a, T> {
     activated_dependencies: ActivateMap,
     /// Keeps track of which packages have had its dependencies processed.
     /// Used to avoid cycles, and to speed up processing.
-    processed_deps: HashSet<PackageFeaturesKey, Global>,
+    processed_deps: Set<PackageFeaturesKey, FixedState, Global>,
     /// If this is `true`, then a non-default `feature_key` needs to be tracked while
     /// traversing the graph.
     ///
@@ -405,7 +405,7 @@ pub struct FeatureResolver<'a, T> {
     /// dependency will trigger the addition of new features. The value is the
     /// set of features to activate.
     deferred_weak_dependencies:
-        HashMap<(PackageId, FeaturesFor, InternedString), HashSet<InternedString, Global>, Global>,
+        Map<(PackageId, FeaturesFor, InternedString), Set<InternedString, FixedState, Global>, FixedState, Global>,
 }
 
 impl<'a, T: PackageTargets> FeatureResolver<'a, T> {
@@ -427,11 +427,11 @@ impl<'a, T: PackageTargets> FeatureResolver<'a, T> {
             requested_targets,
             resolve,
             opts,
-            activated_features: HashMap::new_in(Global),
-            activated_dependencies: HashMap::new_in(Global),
-            processed_deps: HashSet::new_in(Global),
+            activated_features: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            activated_dependencies: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            processed_deps: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }),
             track_for_host,
-            deferred_weak_dependencies: HashMap::new_in(Global),
+            deferred_weak_dependencies: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
         };
         r.do_resolve(member_features)?;
         blaze_trace::debug!("features={:#?}", r.activated_features);

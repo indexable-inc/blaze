@@ -1166,13 +1166,13 @@ fn plan_app_with(
             false,
         ),
     ];
-    let packages: HashMap<String, (PackageId, Package<'_>), Global> = ids
+    let packages: Map<String, (PackageId, Package<'_>), FixedState, Global> = ids
         .iter()
         .map(|(key, id, manifest, _, is_member)| {
             ((*key).to_owned(), (*id, Package { manifest: *manifest, is_member: *is_member }))
         })
         .collect();
-    let manifests: HashMap<PackageId, (&Path, &Manifest), Global> =
+    let manifests: Map<PackageId, (&Path, &Manifest), FixedState, Global> =
         ids.iter().map(|(_, id, manifest, path, _)| (*id, (*path, *manifest))).collect();
 
     let units = app_units(target);
@@ -1188,7 +1188,7 @@ fn plan_app_with(
         ..BaseProfile::default()
     };
     let target_dir = ws.join("target");
-    let unsandboxed: HashSet<&str, Global> = ["app"].into_iter().collect();
+    let unsandboxed: Set<&str, FixedState, Global> = ["app"].into_iter().collect();
     let ws_metadata =
         Some(toml::Value::Table(toml::from_str("[blaze.lints]\nhot_alloc = \"warn\"\n").unwrap()));
     let input = PlanInput {

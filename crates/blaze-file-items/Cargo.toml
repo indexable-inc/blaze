@@ -38,9 +38,14 @@ blaze-mem.workspace = true
 blaze-lex.workspace = true
 # `memchr`: the end of a shebang line.
 blaze-memchr.workspace = true
+# `Tokens`, `TokenRange`: an expansion's token record, outlined in place with no text
+# (`outline_token_record`, drive.md D122).
+blaze-tokens.workspace = true
 
 [dev-dependencies]
 blaze-own = { workspace = true, features = ["testing"] }
+# `lex`, `token_record`: a test text's tokens as a token record, to outline both ways.
+blaze-expand.workspace = true
 blaze-sim.workspace = true
 # `Aligned`: a record's bytes at the alignment its view reads them at.
 blaze-format.workspace = true

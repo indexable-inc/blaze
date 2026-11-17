@@ -2,7 +2,7 @@
 //! items where rustdoc puts them, each signature as code pieces whose names link, the docs
 //! with their intra-doc links resolved, and the impls of every type and trait.
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use std::alloc::Global;
 
 /// Every crate documented in one run.
@@ -427,9 +427,9 @@ pub struct Doc {
     pub markdown: String,
     /// Keyed by the link's destination as the docs write it (`Foo::bar`, `crate::Baz`), or its
     /// text for a shortcut link (`[Foo]`).
-    pub links: HashMap<String, Target, Global>,
+    pub links: Map<String, Target, FixedState, Global>,
     /// What a link whose text is the link itself shows instead: `[struct@Foo]` shows `Foo`.
-    pub texts: HashMap<String, String, Global>,
+    pub texts: Map<String, String, FixedState, Global>,
 }
 
 impl Doc {

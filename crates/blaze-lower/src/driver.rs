@@ -83,6 +83,10 @@ pub enum CallInput<'s> {
 pub struct BodyCall<'s> {
     /// The path as written (in an expansion, its words with a space between each two).
     pub path: &'s str,
+    /// The mark of the path's first word: of an expansion lowered here, or of the item's own
+    /// text when a macro wrote the item ([`crate::lower_body_expanding_marked`]); `None` for a
+    /// word as written in a file. Where the name is looked up is `mark_site::site_of` of it.
+    pub path_mark: Option<crate::mark_site::TextMark>,
     pub input: CallInput<'s>,
     /// The whole call's range in the body's text (past the item's length: in an expansion
     /// appended to it), for a finding about it.
@@ -90,16 +94,26 @@ pub struct BodyCall<'s> {
     /// What its position takes; the expansion is parsed as this.
     pub fragment: blaze_expand::Fragment,
     pub edition: Edition,
-    /// The `macro_rules!` the body defines that are in textual scope at the call, in the
+    /// The `macro_rules!` and `macro` the body defines that are in scope at the call, in the
     /// order written (the last of a name wins): tried before any path-based resolution.
     pub locals: &'s [LocalMacro<'s>],
 }
 
-/// A `macro_rules!` written in a body: its name and its rules (inside its delimiters).
+/// A `macro_rules!` or `macro` written in a body: its name and its definition's text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LocalMacro<'s> {
     pub name: &'s str,
-    pub rules: &'s str,
+    pub form: LocalForm<'s>,
+}
+
+/// The text of a macro a body defines, by its kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalForm<'s> {
+    /// `macro_rules! m { rules }`: the rules, inside the delimiters.
+    Rules(&'s str),
+    /// `macro m(params) { body }` or `macro m { arms }`: the trees after the name, their
+    /// delimiters kept (blaze-lower by_name.rs `macro2_of` splits them).
+    Macro2(&'s str),
 }
 
 /// What a body macro call expanded to, as the expander writes it: the expansion's words
@@ -117,13 +131,26 @@ impl<'a> BodyOut<'a> {
 }
 
 /// Macro expansion: blaze-expand's, through the caller, who resolves each call's path.
+///
+/// Every call form takes the mark of its path's first word (`path_mark`, [`BodyCall::path_mark`]
+/// for a body call): `None` for a word as written in a file, the word's mark when a macro wrote
+/// it. A `$crate` a macro wrote names the macro's crate only through that mark; where the name is
+/// looked up is `mark_site::site_of` of it, never the text alone.
 pub trait Expand {
     /// Expands the item call of `path` (as written) on `input` (its token tree's text,
     /// delimiters included) into `out`: its words, which the driver lowers in place of a text
     /// lexed again. `cfg` is the set the file is lowered under: a `cfg!` or `cfg_select!` of
     /// the call is answered by it, as the items' `#[cfg]`s are ([`crate::cfg_outcome`]), the
     /// one home of that answer in item and body position alike, never the expander's host.
-    fn expand(&mut self, path: &str, input: &str, edition: Edition, cfg: &mut dyn crate::Cfg, out: &mut BodyOut<'_>) -> Expansion;
+    fn expand(
+        &mut self,
+        path: &str,
+        path_mark: Option<crate::mark_site::TextMark>,
+        input: &str,
+        edition: Edition,
+        cfg: &mut dyn crate::Cfg,
+        out: &mut BodyOut<'_>,
+    ) -> Expansion;
 
     /// Expands a macro call in a body into `out`. A new body's calls start when
     /// [`Expand::begin_body`] is called. `cfg` is the set the body is lowered under: a `cfg!`
@@ -133,13 +160,29 @@ pub trait Expand {
     /// Expands the derive of `path` (as written in `#[derive(..)]`) on `item`, the struct, enum
     /// or union as a derive sees it (blaze-expand's `Derives::input`), into `out`: items, an
     /// impl for a builtin derive.
-    fn derive(&mut self, path: &str, item: &TokenStream<'_>, facts: blaze_expand::DeriveFacts, edition: Edition, out: &mut BodyOut<'_>) -> Expansion;
+    fn derive(
+        &mut self,
+        path: &str,
+        path_mark: Option<crate::mark_site::TextMark>,
+        item: &TokenStream<'_>,
+        facts: blaze_expand::DeriveFacts,
+        edition: Edition,
+        out: &mut BodyOut<'_>,
+    ) -> Expansion;
     /// Expands the attribute macro of `path` (as written) with `args` (inside the attribute's
     /// delimiters, `None` for `#[path]`) on `item`, the item without that attribute
     /// (blaze-expand's `ItemAttrs::attr_call`), into `out`: what replaces the item.
     /// [`Expansion::Unsupported`] when `path` names no attribute macro (`#[inline]`, a tool
     /// attribute): the walk goes on to the next attribute.
-    fn attr(&mut self, path: &str, args: Option<&TokenStream<'_>>, item: &TokenStream<'_>, edition: Edition, out: &mut BodyOut<'_>) -> Expansion;
+    fn attr(
+        &mut self,
+        path: &str,
+        path_mark: Option<crate::mark_site::TextMark>,
+        args: Option<&TokenStream<'_>>,
+        item: &TokenStream<'_>,
+        edition: Edition,
+        out: &mut BodyOut<'_>,
+    ) -> Expansion;
 
     /// A new body's lowering starts: the expansions of the last are no longer asked for.
     fn begin_body(&mut self) {}
@@ -239,11 +282,13 @@ struct Job<'a> {
     root: Option<u32>,
 }
 
-/// An item macro's expansion as words: the parser's words (no `EOF` padding) and each one's
-/// range in the expansion's text.
+/// An item macro's expansion as words: the parser's words (no `EOF` padding), each one's
+/// range in the expansion's text, and each one's mark ([`blaze_expand::BodyWord::mark`]): the
+/// text alone says `$crate` but not whose, so a call's path in it is resolved by its mark.
 struct ExpansionWords<'a> {
     words: AVec<'a, u32>,
     ranges: AVec<'a, Range>,
+    marks: AVec<'a, Option<crate::mark_site::TextMark>>,
 }
 
 impl<'a> ExpansionWords<'a> {
@@ -255,6 +300,7 @@ impl<'a> ExpansionWords<'a> {
         let mut words = Vec::with_capacity_in(n, alloc);
         words.extend_from_slice(&out.words.parser.words[..n]);
         let mut ranges = Vec::with_capacity_in(n, alloc);
+        let mut marks = Vec::with_capacity_in(n, alloc);
         let mut text = String::with_capacity_in(out.words.text.len() + n, alloc);
         for w in out.words.words.iter() {
             if w.space_before && !text.is_empty() {
@@ -263,8 +309,9 @@ impl<'a> ExpansionWords<'a> {
             let start = u32::try_from(text.len()).expect("an expansion under 4 GiB");
             text.push_str(&out.words.text[w.text.0 as usize..w.text.1 as usize]);
             ranges.push(Range::new(start, u32::try_from(text.len()).expect("an expansion under 4 GiB")));
+            marks.push(w.mark);
         }
-        (text, ExpansionWords { words, ranges })
+        (text, ExpansionWords { words, ranges, marks })
     }
 
     /// The words inside `range` of the text, their ranges in `range`'s own text.
@@ -273,11 +320,55 @@ impl<'a> ExpansionWords<'a> {
         let past = self.ranges.partition_point(|r| r.end <= range.end);
         let mut words = Vec::with_capacity_in(past.saturating_sub(first) + parser::Tokens::PAD, alloc);
         let mut ranges = Vec::with_capacity_in(past.saturating_sub(first), alloc);
+        let mut marks = Vec::with_capacity_in(past.saturating_sub(first), alloc);
         if first < past {
             words.extend_from_slice(&self.words[first..past]);
             ranges.extend(self.ranges[first..past].iter().map(|r| Range::new(r.start - range.start, r.end - range.start)));
+            marks.extend_from_slice(&self.marks[first..past]);
         }
-        ExpansionWords { words, ranges }
+        ExpansionWords { words, ranges, marks }
+    }
+
+    /// The mark of the word holding byte `at` of the text; `None` for a byte between words.
+    /// The outline reads `$crate` as ` crate` (same bytes, [`ExpansionWords::outline_text`]),
+    /// so a path's range may start one byte into its first word.
+    fn mark_at(&self, at: u32) -> Option<crate::mark_site::TextMark> {
+        let i = self.ranges.partition_point(|r| r.end <= at);
+        match self.ranges.get(i) {
+            Some(r) if r.start <= at => self.marks[i],
+            _ => None,
+        }
+    }
+
+    /// Whether any word carries a mark: when none does, every path in the text is as written
+    /// in a file and the driver reads no marks.
+    fn any_marked(&self) -> bool {
+        self.marks.iter().any(Option::is_some)
+    }
+
+    /// The tokens of `text` (this words' text) as blaze-expand lexes them, each in a context
+    /// carrying its word's mark: a probe walked beside the item's own tokens (same attributes,
+    /// same `cfg_attr`s applied, so the same token indices) to read the mark of an attribute's
+    /// or a derive's path. The probe is never a macro's input: a [`crate::mark_site::TextMark`]
+    /// has no expansion key, so the contexts here say only where each token resolves.
+    fn probe(&self, text: &str, edition: Edition, alloc: Alloc<'a>) -> Option<TokenStream<'a>> {
+        let lexed = blaze_expand::lex(text, edition, alloc).ok()?;
+        let places = blaze_expand::origin_column::input_places(text, blaze_expand::origin_column::InputShape::Whole, edition, alloc).ok()?;
+        if places.len() != lexed.len() {
+            return None;
+        }
+        let mut probe = TokenStream::new_in(alloc);
+        for (t, &(start, _)) in lexed.tokens().iter().zip(places.iter()) {
+            let ctx = match self.mark_at(start) {
+                None => t.ctx,
+                Some(m) => {
+                    let mark = blaze_expand::Mark { of: blaze_expand::MarkOf::This, transparency: m.transparency, edition: m.edition, site: m.site };
+                    probe.context(blaze_expand::CtxNode { parent: t.ctx, mark }).ok()?
+                }
+            };
+            probe.push(t.kind, lexed.text_of(t), ctx).ok()?;
+        }
+        Some(probe)
     }
 
     /// The words, padded for the parser.
@@ -301,6 +392,49 @@ impl<'a> ExpansionWords<'a> {
         out.push_str(&text[at..]);
         out
     }
+}
+
+/// The mark of the first identifier at or after token `from` of `stream` (a path's first
+/// segment, past a leading `::`).
+fn first_word_mark(stream: &TokenStream<'_>, from: usize) -> Option<crate::mark_site::TextMark> {
+    let tokens = stream.tokens();
+    let at = (from..tokens.len()).find(|&i| matches!(tokens[i].kind, blaze_expand::TokenKind::Ident { .. }))?;
+    stream.hygiene(tokens[at].ctx).mark.map(crate::mark_site::TextMark::of)
+}
+
+/// The marks of the item's derive paths, in the order blaze-expand's `ItemAttrs::derives` lists
+/// them: `probe` walked as `derives` walks (each `cfg_attr` and true `cfg` applied), then each
+/// `#[derive(..)]`/`#[derive_const(..)]` read in order. `None` when the item's `cfg` is false or
+/// an attribute is refused (the derives are not run then either).
+fn derive_marks<'a>(probe: TokenStream<'a>, cfg: &mut dyn Cfg, alloc: Alloc<'a>) -> Option<AVec<'a, Option<crate::mark_site::TextMark>>> {
+    let mut walk = blaze_expand::ItemAttrs::new(probe);
+    loop {
+        let next = walk.next(&mut |name, value| match cfg.atom(name, value) {
+            CfgAnswer::Yes => Ok(true),
+            CfgAnswer::No => Ok(false),
+            CfgAnswer::Need => Err(()),
+        });
+        match next {
+            Ok(blaze_expand::NextAttr::End) => break,
+            Ok(blaze_expand::NextAttr::Call { .. }) => {}
+            Ok(blaze_expand::NextAttr::Removed) | Err(_) => return None,
+        }
+    }
+    let item = walk.item();
+    let tokens = item.tokens();
+    let mut marks = Vec::new_in(alloc);
+    let mut at = 0usize;
+    loop {
+        let hash = matches!(tokens.get(at).map(|t| t.kind), Some(blaze_expand::TokenKind::Punct { char: '#', .. }));
+        let bracket = matches!(tokens.get(at + 1).map(|t| t.kind), Some(blaze_expand::TokenKind::Open(blaze_expand::Delim::Bracket)));
+        let Some(close) = (hash && bracket).then(|| item.close_of(at + 1)).flatten() else { break };
+        let attr = item.copy_in(at..close + 1, alloc).ok()?;
+        if let Some((_, paths)) = blaze_expand::derive_attr(&attr, alloc) {
+            marks.extend(paths.iter().map(|p| first_word_mark(&attr, p.start as usize)));
+        }
+        at = close + 1;
+    }
+    Some(marks)
 }
 
 struct Driver<'d, 'a> {
@@ -456,14 +590,18 @@ impl<'a> Driver<'_, 'a> {
                     continue;
                 }
                 ItemKind::MacroCall => {
-                    self.macro_call(&at, source, expand, jobs);
+                    let own = words.map(|w| w.slice(item.range, self.alloc));
+                    self.macro_call(&at, own.as_ref(), source, expand, jobs);
                     i = past;
                     continue;
                 }
                 _ => {}
             }
+            // The item's own words when a macro wrote it: their marks say where each path a
+            // call, an attribute or a derive names is read.
+            let own = words.map(|w| w.slice(item.range, self.alloc));
             // An attribute macro takes the item: its expansion is lowered in its place.
-            if self.attr_macro(&at, outline.attrs(item), source, expand, jobs) {
+            if self.attr_macro(&at, own.as_ref(), outline.attrs(item), source, expand, jobs) {
                 i = past;
                 continue;
             }
@@ -479,7 +617,6 @@ impl<'a> Driver<'_, 'a> {
                 _ => item_text,
             };
             let key = signature_key(key_text, self.edition, has_body);
-            let own = words.map(|w| w.slice(item.range, self.alloc));
             let padded = own.as_ref().map(|w| w.padded(self.alloc));
             let item_words = own.as_ref().zip(padded.as_ref()).map(|(o, p)| ItemWords { words: p, ranges: &o.ranges });
             let result = match item_words {
@@ -495,7 +632,7 @@ impl<'a> Driver<'_, 'a> {
                 continue;
             }
             if matches!(item.kind(), ItemKind::Struct | ItemKind::Enum | ItemKind::Union) {
-                self.derives(&at, outline.attrs(item), source, expand, jobs);
+                self.derives(&at, own.as_ref(), outline.attrs(item), source, expand, jobs);
             }
             if has_body {
                 let key = body_key(item_text, self.edition);
@@ -516,7 +653,15 @@ impl<'a> Driver<'_, 'a> {
     /// `#[cfg_attr(pred, ..)]` is applied under the unit's cfg set first, its derives read in
     /// its place; one whose predicate meets a cfg atom not known yet is counted unsupported.
     /// The item's `cfg`s are the signature's, already true here.
-    fn derives(&mut self, at: &ItemRef<'_>, attrs: &[Attr], source: Source, expand: &mut dyn Expand, jobs: &mut AVec<'a, Job<'a>>) {
+    fn derives(
+        &mut self,
+        at: &ItemRef<'_>,
+        own: Option<&ExpansionWords<'a>>,
+        attrs: &[Attr],
+        source: Source,
+        expand: &mut dyn Expand,
+        jobs: &mut AVec<'a, Job<'a>>,
+    ) {
         let depth = match source {
             Source::Expansion { depth } => depth + 1,
             Source::File | Source::BodyItem => 1,
@@ -526,6 +671,20 @@ impl<'a> Driver<'_, 'a> {
             return;
         }
         let Ok(tokens) = blaze_expand::lex(text, self.edition, self.alloc) else { return };
+        // Each derive path's mark, when a macro wrote the item: walked over a probe of the same
+        // tokens, so the n-th mark is the n-th use's. A probe that cannot be made, or that
+        // disagrees in count, stops the item's derives (counted failed): a derive is never
+        // resolved without the mark its text was written with.
+        let marks = match own.filter(|w| w.any_marked()) {
+            None => None,
+            Some(w) => match w.probe(text, self.edition, self.alloc).and_then(|p| derive_marks(p, &mut *self.cfg, self.alloc)) {
+                Some(marks) => Some(marks),
+                None => {
+                    self.stats.macro_calls_failed += 1;
+                    return;
+                }
+            },
+        };
         let cfg = &mut *self.cfg;
         let derives = blaze_expand::ItemAttrs::new(tokens).derives(&mut |name, value| match cfg.atom(name, value) {
             CfgAnswer::Yes => Ok(true),
@@ -543,13 +702,18 @@ impl<'a> Driver<'_, 'a> {
                 return;
             }
         };
-        for u in derives.uses.iter() {
+        if marks.as_ref().is_some_and(|m| m.len() != derives.uses.len()) {
+            self.stats.macro_calls_failed += 1;
+            return;
+        }
+        for (n, u) in derives.uses.iter().enumerate() {
             if let Some(bound) = self.bound(depth) {
                 self.refuse(at, &u.path, bound);
                 continue;
             }
+            let path_mark = marks.as_ref().and_then(|m| m[n]);
             let mut out = BodyOut::new_in(self.alloc);
-            let expansion = expand.derive(&u.path, &derives.input, derives.facts(u), self.edition, &mut out);
+            let expansion = expand.derive(&u.path, path_mark, &derives.input, derives.facts(u), self.edition, &mut out);
             self.queue_expansion(expansion, &out, depth, jobs);
         }
     }
@@ -557,12 +721,34 @@ impl<'a> Driver<'_, 'a> {
     /// The first outer attribute of `at` that is an attribute macro, expanded on the item
     /// without it and queued: whether one took the item (expanded, or refused, which leaves
     /// nothing of the item to lower). The attributes after it are the expansion's to meet.
-    fn attr_macro(&mut self, at: &ItemRef<'_>, attrs: &[Attr], source: Source, expand: &mut dyn Expand, jobs: &mut AVec<'a, Job<'a>>) -> bool {
+    fn attr_macro(
+        &mut self,
+        at: &ItemRef<'_>,
+        own: Option<&ExpansionWords<'a>>,
+        attrs: &[Attr],
+        source: Source,
+        expand: &mut dyn Expand,
+        jobs: &mut AVec<'a, Job<'a>>,
+    ) -> bool {
         if !attrs.iter().any(|a| !a.inner && matches!(a.kind, AttrKind::Other | AttrKind::CfgAttr)) {
             return false;
         }
         let Ok(tokens) = blaze_expand::lex(at.item_text(), self.edition, self.alloc) else { return false };
         let mut walk = blaze_expand::ItemAttrs::new(tokens);
+        // When a macro wrote the item, a probe of the same tokens carrying their marks, walked in
+        // step with `walk` (the same `cfg_attr`s applied, so the same indices): an attribute's
+        // path is read by its first word's mark. A probe that cannot be made or that leaves step
+        // stops the item (counted failed), never resolves the path without its mark.
+        let mut probe = match own.filter(|w| w.any_marked()) {
+            None => None,
+            Some(w) => match w.probe(at.item_text(), self.edition, self.alloc) {
+                Some(p) => Some(blaze_expand::ItemAttrs::new(p)),
+                None => {
+                    self.stats.macro_calls_failed += 1;
+                    return true;
+                }
+            },
+        };
         loop {
             let cfg = &mut *self.cfg;
             let next = walk.next(&mut |name, value| match cfg.atom(name, value) {
@@ -574,6 +760,25 @@ impl<'a> Driver<'_, 'a> {
             let (path, attr) = match next {
                 Ok(blaze_expand::NextAttr::Call { path, attr }) => (path, attr),
                 Ok(blaze_expand::NextAttr::End | blaze_expand::NextAttr::Removed) | Err(_) => return false,
+            };
+            let path_mark = match probe.as_mut() {
+                None => None,
+                Some(p) => {
+                    let cfg = &mut *self.cfg;
+                    let stepped = p.next(&mut |name, value| match cfg.atom(name, value) {
+                        CfgAnswer::Yes => Ok(true),
+                        CfgAnswer::No => Ok(false),
+                        CfgAnswer::Need => Err(()),
+                    });
+                    match stepped {
+                        // `#`, `[`, then the path.
+                        Ok(blaze_expand::NextAttr::Call { attr: same, .. }) if same == attr => first_word_mark(p.item(), attr.start as usize + 2),
+                        _ => {
+                            self.stats.macro_calls_failed += 1;
+                            return true;
+                        }
+                    }
+                }
             };
             let depth = match source {
                 Source::Expansion { depth } => depth + 1,
@@ -590,13 +795,24 @@ impl<'a> Driver<'_, 'a> {
                 return true;
             }
             let mut out = BodyOut::new_in(self.alloc);
-            match expand.attr(&path, call.args.as_ref(), &call.item, self.edition, &mut out) {
+            match expand.attr(&path, path_mark, call.args.as_ref(), &call.item, self.edition, &mut out) {
                 Expansion::Unsupported => continue,
                 expansion => {
                     // The derives written before the macro ran first and are not in its input
                     // (blaze-expand `ItemAttrs::attr_call`): the first `derives_taken` of the
                     // item's derives, each on the item as a derive sees it.
                     if call.derives_taken > 0 {
+                        let marks = match probe.as_ref() {
+                            None => None,
+                            Some(p) => match derive_marks(p.item().clone(), &mut *self.cfg, self.alloc) {
+                                Some(marks) => Some(marks),
+                                None => {
+                                    self.stats.macro_calls_failed += 1;
+                                    self.queue_expansion(expansion, &out, depth, jobs);
+                                    return true;
+                                }
+                            },
+                        };
                         let cfg = &mut *self.cfg;
                         let derives = blaze_expand::ItemAttrs::new(walk.item().clone()).derives(&mut |name, value| match cfg.atom(name, value) {
                             CfgAnswer::Yes => Ok(true),
@@ -604,10 +820,14 @@ impl<'a> Driver<'_, 'a> {
                             CfgAnswer::Need => Err(()),
                         });
                         match derives {
+                            Ok(Some(derives)) if marks.as_ref().is_some_and(|m| m.len() != derives.uses.len()) => {
+                                self.stats.macro_calls_failed += 1;
+                            }
                             Ok(Some(derives)) => {
-                                for u in derives.uses.iter().take(call.derives_taken) {
+                                for (n, u) in derives.uses.iter().enumerate().take(call.derives_taken) {
+                                    let path_mark = marks.as_ref().and_then(|m| m[n]);
                                     let mut derived = BodyOut::new_in(self.alloc);
-                                    let made = expand.derive(&u.path, &derives.input, derives.facts(u), self.edition, &mut derived);
+                                    let made = expand.derive(&u.path, path_mark, &derives.input, derives.facts(u), self.edition, &mut derived);
                                     self.queue_expansion(made, &derived, depth, jobs);
                                 }
                             }
@@ -657,7 +877,9 @@ impl<'a> Driver<'_, 'a> {
         }
     }
 
-    fn macro_call(&mut self, at: &ItemRef<'_>, source: Source, expand: &mut dyn Expand, jobs: &mut AVec<'a, Job<'a>>) {
+    /// The item macro call `at`, expanded and queued. `own`, the item's words when a macro wrote
+    /// it, gives the path's first word its mark.
+    fn macro_call(&mut self, at: &ItemRef<'_>, own: Option<&ExpansionWords<'a>>, source: Source, expand: &mut dyn Expand, jobs: &mut AVec<'a, Job<'a>>) {
         let ItemDetail::MacroCall { path: Some(path), input: Some(input) } = at.item.detail else {
             self.stats.macro_calls_failed += 1;
             return;
@@ -672,7 +894,8 @@ impl<'a> Driver<'_, 'a> {
             return;
         }
         let mut out = BodyOut::new_in(self.alloc);
-        let expansion = expand.expand(path.of(text), input.of(text), self.edition, &mut *self.cfg, &mut out);
+        let path_mark = own.and_then(|w| w.mark_at(path.start));
+        let expansion = expand.expand(path.of(text), path_mark, input.of(text), self.edition, &mut *self.cfg, &mut out);
         self.queue_expansion(expansion, &out, depth, jobs);
     }
 }

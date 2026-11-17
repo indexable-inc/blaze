@@ -108,20 +108,20 @@ fn is_fn(f: &str, name: &str) -> bool {
 fn survey(tail: &str) -> (Vec<(String, String)>, Vec<(String, String)>, u64, u64) {
     let text = format!("{PRELUDE}{tail}");
     let files = [SourceFile { path: "src/main.rs", text: &text }];
-    let tc = Toolchain::none();
+    let tc = Toolchain::none(blaze_own::Alloc::global());
     let new = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
-    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc).unwrap_or_else(|e| panic!("the program's texts: {e}"));
+    let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind).unwrap_or_else(|e| panic!("the program's texts: {e}"));
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the survey's frame");
     let mut left_out = Vec::new_in(Global);
-    let mut program = Front2Program::survey(&names, &frame, &files, &mut left_out).unwrap_or_else(|e| panic!("BUILDS: no survey: {e}"));
+    let mut program = Front2Program::survey(&names, &frame, &files, &mut left_out, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("BUILDS: no survey: {e}"));
     let left: Vec<(String, String)> = left_out.iter().map(|(f, class)| (f.to_string(), class.to_string())).collect();
     println!("LEFT OUT: {left:?}");
     let mut refused = Vec::new_in(Global);
-    let counts = build_survey(&mut program, &mut refused, blaze_build::OverflowChecks::On).unwrap_or_else(|e| panic!("BUILDS: the survey stopped: {e}"));
+    let counts = build_survey(&mut program, &mut refused, blaze_build::OverflowChecks::On, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("BUILDS: the survey stopped: {e}"));
     let rows: Vec<(String, String)> = refused.iter().map(|(f, class)| (f.to_string(), class.to_string())).collect();
     let shown: Vec<String> = rows.iter().map(|(f, class)| format!("{f}: {class}")).collect();
     println!("BUILDS: {} of {} instances ({} refused: {})", counts.built, counts.tried, rows.len(), shown.join("; "));

@@ -23,6 +23,8 @@ use blaze_own::{Alloc, String as OwnString};
 use blaze_text::Writes as _;
 
 const USER_AGENT: &str = concat!("blaze/", env!("CARGO_PKG_VERSION"));
+/// How long one wait lasts when no deadline is due (blaze-cli's fetch has the same bound).
+const STEP_MOST_NS: u64 = 1_000_000_000;
 
 /// Where the footprint goes (rule 16): every allocation of the process counted, its live bytes'
 /// high-water mark kept, overall and per phase of the main thread (what it was doing when the
@@ -255,7 +257,11 @@ fn main() {
         }
     };
     let started = Instant::now();
-    let alloc = Alloc::global();
+    // An entry that takes no grant yet (a plain `fn main`): the run's memory is one frame
+    // taken from the OS here and handed down.
+    let frame = blaze_mem::Frame::with_reserve(1 << 36, blaze_mem::Tag::Other).expect("the entry's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
     let bytes = std::fs::read(lock_path).unwrap_or_else(|e| fail(&format!("reading {lock_path}: {e}")));
     let lock = Lock::read(&bytes, alloc).unwrap_or_else(|e| fail(&format!("{lock_path}: {e}")));
     let mut plan = plan::plan(&lock, alloc).unwrap_or_else(|e| fail(&shown(&e)));
@@ -302,7 +308,7 @@ fn main() {
     let config = Config::new(tls, USER_AGENT, Duration::from_secs(60));
     let handle = Handle::spawn(Client::new(config), limits.in_flight_most as usize)
         .unwrap_or_else(|e| fail(&format!("starting blaze-http's driver: {e}")));
-    let (to, answers) = mailbox::channel::<(u64, Fetched)>(None);
+    let (to, answers) = blaze_core::chan::unbounded::<(u64, Fetched)>();
 
     let mut machine = Machine::new(&plan.units, limits, alloc);
     let git: std::vec::Vec<bool> = plan.units.iter().map(|unit| matches!(unit, Unit::Git { .. })).collect();
@@ -392,8 +398,8 @@ struct Io<'r> {
     records: &'r std::path::Path,
     disk: &'r mut blaze_core::Native,
     handle: &'r Handle,
-    to: &'r mailbox::Tx<(u64, Fetched)>,
-    answers: &'r mailbox::Rx<(u64, Fetched)>,
+    to: &'r blaze_core::chan::Sender<(u64, Fetched)>,
+    answers: &'r blaze_core::chan::Receiver<(u64, Fetched)>,
     /// Per unit, whether it is a git commit (for the footprint's phase).
     git: &'r [bool],
     /// The answer the last wait gave: its unit and body.
@@ -457,8 +463,8 @@ impl FetchIo for Io<'_> {
         if let Some((_, body)) = self.last.take() {
             footprint::HELD.fetch_sub(body.len(), std::sync::atomic::Ordering::Relaxed);
         }
-        let wait = until_ns.map(|at| Duration::from_nanos(at.saturating_sub(self.now())));
-        match mailbox::block_on("a dependency's HTTPS answer", wait, self.answers.recv()) {
+        let wait = Duration::from_nanos(until_ns.map_or(STEP_MOST_NS, |at| at.saturating_sub(self.now())));
+        match mailbox::answer("a dependency's HTTPS answer", self.answers, wait) {
             Ok(Some((key, fetched))) => {
                 footprint::OPEN.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 if let Fetched::Answered { body, .. } = &fetched {

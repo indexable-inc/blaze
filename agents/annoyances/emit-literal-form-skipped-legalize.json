@@ -1,0 +1,14 @@
+{
+ "id": "emit-literal-form-skipped-legalize",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane TE under the tempo lanes of 2026-11-17",
+ "where": "crates/blaze-emit/src/lib.rs `emit_inline_up_to` (the literal-word form) against record.rs `emit_record_up_to`; the tempo census (crates/blaze-real/examples/tempo_build.rs through blaze-ladder run.rs `blaze_emit::emit`)",
+ "what": "The census counted 51 `load` refusals of vectors and about 70 f16/f128 refusals (`fcmp`, `fptosi`, `fptoui`, `uitofp`, `fadd`..) in the Reference tier, though blaze-lir's legalize already makes vectors scalar, widens f16 and calls compiler_builtins for f128. Only the record form legalized; the literal-word form, which the census and the in-process run use, handed raw LIR to the pass. Also: an ask whose paths named crates/blaze-emit/src/lib.rs failed twice at `git rm --cached` (the queue's snapshot-at-ask cut, 04:22-04:26; fixed by the main agent). And one test was appended to num_tests.rs by a shell heredoc instead of Edit (rule 72), noted here.",
+ "cost": "about half an hour to see that two forms of one entry differed in their input",
+ "cause": "two public entries into one pass, each preparing its input itself",
+ "whys": "legalize was added to the record form when f128 routines were bound; the literal form had no routine table, so nobody wired it; no test fed the literal form a vector or f16",
+ "class": "two entries to one pass that prepare its input apart drift: one form refuses what the other builds",
+ "prevention": "done: `emit_inline_up_to` legalizes through `routines::legalized` with `RoutinePlaces::NONE`, so an f128 operation is refused naming its routine (`EmitError::Legalize`, quad_tests `unlegalized_f128_arithmetic_is_refused_by_name`); wanted: one private `prepare` both forms call, so the next input step cannot be added to one form alone",
+ "workaround": "none needed now",
+ "state": "fixed"
+}

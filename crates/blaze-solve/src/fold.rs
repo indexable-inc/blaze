@@ -2,7 +2,7 @@
 //! the arena with some subterms replaced, and importing a term of a portable answer into the
 //! arena with its generic parameters instantiated.
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_own::{Alloc, Vec};
 
 use crate::error::{Limit, Malformed, SolveError};
@@ -19,16 +19,16 @@ pub struct Scratch<'a> {
     out: Vec<Ty, Alloc<'a>>,
     /// The import's memo: a portable node to its arena handle, for the nodes one import
     /// reaches (a record's table may hold many terms; only the root's are walked).
-    memo: HashMap<u32, Ty, Alloc<'a>>,
+    memo: Map<u32, Ty, FixedState, Alloc<'a>>,
     /// Which generics of an impl are const parameters, one bit each, by the impl and its
     /// header's digest (coherence.rs `fresh_for_impl`): found once per solver, not once per
     /// candidate.
-    masks: HashMap<(crate::term::Def, u64), u64, Alloc<'a>>,
+    masks: Map<(crate::term::Def, u64), u64, FixedState, Alloc<'a>>,
 }
 
 impl<'a> Scratch<'a> {
     pub fn new_in(alloc: Alloc<'a>) -> Scratch<'a> {
-        Scratch { work: Vec::new_in(alloc), out: Vec::new_in(alloc), memo: HashMap::new_in(alloc), masks: HashMap::new_in(alloc) }
+        Scratch { work: Vec::new_in(alloc), out: Vec::new_in(alloc), memo: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }), masks: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }) }
     }
 
     /// The const-parameter mask kept for `impl_` with the header digest `digest`.

@@ -32,7 +32,7 @@ blaze on PATH (the stage 0 `.github/blaze-version` names), for this machine's ta
 That build has the LLVM backend (the release profile's, [below](#backends)) and the LLVM tiers, as the
 installer's binaries do, linking the LLVM 23 blaze pins in statically ([which
 LLVM](contributing.md#llvm)). blaze itself fetches that LLVM, by the sha256
-`crates/hir-ty-codegen/llvm.json` pins, and hands it to llvm-sys's build script: the root
+`crates/blaze-toolchain/pins/llvm.json` pins, and hands it to llvm-sys's build script: the root
 manifest declares it a [pinned native input](#pinned-native-inputs), so a plain
 `blaze build -p blaze-engine --release` on a clean Mac or Linux machine needs no Nix and no
 variable. A stage 0 from before that change does not read the table, and still needs
@@ -655,7 +655,7 @@ workspace's root manifest, pinned by its digest, in place of a variable each mac
 
 ```toml
 [workspace.metadata.blaze.native.llvm]
-pin = "crates/hir-ty-codegen/llvm.json"     # the pin file, relative to the root manifest
+pin = "crates/blaze-toolchain/pins/llvm.json"     # the pin file, relative to the root manifest
 env = "LLVM_SYS_231_PREFIX"                 # the variable the script reads the directory from
 packages = ["llvm-sys", "blaze-stencil/llvm-stencils"]
 ```

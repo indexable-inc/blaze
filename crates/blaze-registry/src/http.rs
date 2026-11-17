@@ -6,8 +6,6 @@
 
 use std::{
     fmt,
-    future::Future,
-    pin::Pin,
     time::{Duration, SystemTime},
 };
 
@@ -70,10 +68,6 @@ impl std::fmt::Display for Stalled {
 
 impl std::error::Error for Stalled {}
 
-/// Work started at once and finished on whichever thread does it, awaited from any executor.
-// dyn: what `dyn Http` returns, one per network request, which costs far more than its box.
-pub type Pending<T> = Pin<Box<dyn Future<Output = T> + Send>>;
-
 /// Where a streamed body goes, a piece at a time with its offset in the whole body
 /// ([`Http::stream`]); an error stops the transfer.
 pub type Sink<'s> = &'s mut (dyn FnMut(u64, &[u8]) -> std::io::Result<()> + Send);
@@ -82,12 +76,6 @@ pub type Sink<'s> = &'s mut (dyn FnMut(u64, &[u8]) -> std::io::Result<()> + Send
 /// again, as cargo tries a connection or a transfer that failed again.
 pub trait Http: Send + Sync {
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<Response>;
-
-    /// [`Http::get`], sent before this returns and answered when it is done, so that many
-    /// requests are in flight at once. By default it is asked and answered on this thread.
-    fn get_async(&self, url: &str, headers: &[(&str, &str)]) -> Pending<anyhow::Result<Response>> {
-        Box::pin(std::future::ready(self.get(url, headers)))
-    }
 
     /// [`Http::get`] of the body from byte `from`, which goes to `sink` as it comes, each piece
     /// with its offset in the whole body, instead of into the answer, whose `body` is then
@@ -118,10 +106,11 @@ pub trait Http: Send + Sync {
         Ok(answer)
     }
 
-    /// A wait that holds no thread; by default it holds this one ([`wait_out`]).
-    fn sleep(&self, duration: Duration) -> Pending<()> {
+    /// A retry's wait of `duration` on this thread: on the client's own timer where it has one,
+    /// by default [`wait_out`].
+    fn sleep(&self, duration: Duration) -> anyhow::Result<()> {
         wait_out(duration);
-        Box::pin(std::future::ready(()))
+        Ok(())
     }
 }
 
@@ -200,19 +189,18 @@ impl Retry {
         }
     }
 
-    /// [`Retry::run`] of an attempt that waits, sleeping with `http`, so that the thread runs
-    /// other requests in between.
-    pub async fn run_async<T, F: Future<Output = anyhow::Result<T>>>(
+    /// [`Retry::run`], sleeping between tries on `http`'s own timer ([`Http::sleep`]).
+    pub fn run_on<T>(
         &self,
         // dyn: the I/O driver, asked only to sleep between tries of a failed request.
         http: &dyn Http,
-        mut attempt: impl FnMut() -> F,
+        mut attempt: impl FnMut() -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
         let mut tried = 0;
         loop {
-            match attempt().await {
+            match attempt() {
                 Err(e) => match self.again(&mut tried, &e, SystemTime::now()) {
-                    Some(wait) => http.sleep(wait).await,
+                    Some(wait) => http.sleep(wait)?,
                     None => return Err(e),
                 },
                 it => return it,

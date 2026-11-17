@@ -8,7 +8,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use blaze_data::Value;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_resolve::{PackageIdSpec, PartialVersion, Platform, RustVersion};
 use blaze_semver::{Comparator, Op, Version, VersionReq};
 use std::alloc::Global;
@@ -38,12 +38,12 @@ use crate::workspace::find_workspace_root;
 /// Every file is read through the configuration's [`Files`].
 pub struct Context<F: Files> {
     pub config: Config<F>,
-    pub(crate) ws_roots: RefCell<HashMap<PathBuf, WorkspaceRootConfig, Global>>,
+    pub(crate) ws_roots: RefCell<Map<PathBuf, WorkspaceRootConfig, FixedState, Global>>,
 }
 
 impl<F: Files> Context<F> {
     pub fn new(config: Config<F>) -> Context<F> {
-        Context { config, ws_roots: RefCell::new(HashMap::new_in(Global)) }
+        Context { config, ws_roots: RefCell::new(Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None })) }
     }
 
     pub fn files(&self) -> &F {
@@ -336,7 +336,7 @@ pub struct Manifest {
     pub custom_metadata: Option<Value<Global>>,
     pub publish: Option<Vec<String>>,
     pub replace: Vec<(PackageIdSpec, Dependency)>,
-    pub patch: HashMap<Url, Vec<Dependency>, Global>,
+    pub patch: Map<Url, Vec<Dependency>, FixedState, Global>,
     pub workspace: WorkspaceConfig,
     pub unstable_features: Features,
     pub edition: Edition,
@@ -352,7 +352,7 @@ pub struct Manifest {
 #[derive(Debug)]
 pub struct VirtualManifest {
     pub replace: Vec<(PackageIdSpec, Dependency)>,
-    pub patch: HashMap<Url, Vec<Dependency>, Global>,
+    pub patch: Map<Url, Vec<Dependency>, FixedState, Global>,
     pub workspace: WorkspaceConfig,
     pub unstable_features: Features,
     pub resolve_behavior: Option<ResolveBehavior>,
@@ -1300,7 +1300,7 @@ fn to_real_manifest<F: Files>(
     let patch = patch(&normalized_toml, &mut manifest_ctx)?;
 
     {
-        let mut names_sources = HashMap::new_in(Global);
+        let mut names_sources = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for dep in &deps {
             let name = dep.name_in_toml();
             let prev = names_sources.insert(name, &dep.source_id);
@@ -1545,8 +1545,8 @@ fn replace<F: Files>(
 fn patch<F: Files>(
     me: &TomlManifest,
     manifest_ctx: &mut ManifestContext<'_, '_, F>,
-) -> Result<HashMap<Url, Vec<Dependency>, Global>, ManifestError> {
-    let mut patch = HashMap::new_in(Global);
+) -> Result<Map<Url, Vec<Dependency>, FixedState, Global>, ManifestError> {
+    let mut patch = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     for (toml_url, deps) in me.patch.iter().flatten() {
         let url = match &toml_url[..] {
             CRATES_IO_REGISTRY => CRATES_IO_INDEX.parse().unwrap(),

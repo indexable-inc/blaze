@@ -25,7 +25,7 @@ mod table;
 
 pub(crate) use cfg::{cfg_entry, target_compact, try_gate, try_gate_target};
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_items::Fact;
 use hir::{HirFileId, InFile};
 use std::alloc::Global;
@@ -152,7 +152,7 @@ pub(super) fn expansion(
     owners: &[Owner<'_>],
     features: &Features,
 ) -> Vec<Found> {
-    let calls: HashMap<InFile<SyntaxNodePtr>, &Owner<'_>, Global> =
+    let calls: Map<InFile<SyntaxNodePtr>, &Owner<'_>, FixedState, Global> =
         // alloc: setup, the macro calls' owners, once per check
         owners.iter().filter(|it| it.target == Target::MacroCall).map(|it| (it.at(), it)).collect();
     // alloc: empty, allocates only when a gate is hit

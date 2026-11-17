@@ -741,10 +741,11 @@ pub(crate) fn adopt(
     // alloc: once a history is adopted
     let named: Vec<Name> = parsed.iter().map(|it| it.1).collect();
     // A sorted array searched by halves, not a tree: `superseded` is ascending and `parsed`
-    // keeps `names`' order, so the positions stay ascending. Named here, the program's top
-    // for this path: `adopt` has no allocator passed in yet.
-    // to thread (bstd move): `adopt`'s callers pass their allocator.
-    let alloc = blaze_own::Alloc::global();
+    // keeps `names`' order, so the positions stay ascending. `gone` lives only in this call: a
+    // frame of its own, freed when it returns.
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Profile).expect("an adoption's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
     // alloc: once a history is adopted
     let mut gone = super::compact::superseded(&named, alloc);
     for at in gone.iter_mut() {

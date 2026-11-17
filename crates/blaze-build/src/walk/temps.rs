@@ -234,7 +234,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             }
             match self.expr(ExprId(up))? {
                 Expr::Ref { .. } | Expr::Paren(_) | Expr::Cast { .. } | Expr::Tuple { .. } | Expr::Array { .. } => {}
-                Expr::Struct { base, .. } if base.map(|b| b.0) != Some(c) => {}
+                Expr::Struct { base, .. } if base.expr().map(|b| b.0) != Some(c) => {}
                 Expr::Call { callee, .. }
                     if callee.0 != c && matches!(self.expr_def(callee), Some(Def::Ctor { kind: CtorKind::Tuple, .. })) => {}
                 Expr::Block { stmts, tail, .. } => {

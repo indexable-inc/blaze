@@ -204,7 +204,7 @@ impl<'e, 'a, N: Name> Sources<'e> for Live<'e, '_, 'a, N> {
             }
         }
         match at.cached(Read::Globs { module: source.key }, self.sink) {
-            Some(Cached::Globs { edges, krate, chain, .. }) => Ok(Node::Edges { edges, krate: *krate, chain }),
+            Some(Cached::Globs { edges, krate, chain, .. }) => Ok(Node::Edges { edges: blaze_surface::Globs::of(edges), krate: *krate, chain }),
             Some(Cached::Name(_) | Cached::Textual { .. } | Cached::Helpers { .. } | Cached::InProgress(_)) | None => {
                 Err(Stop::Answer)
             }
@@ -564,7 +564,7 @@ impl<'a, N: Name> Resolver<'a, N> {
         sink.stats.member_nodes += 1;
         sink.stats.member_edge_bytes += core::mem::size_of_val(edges) as u64;
         let asker = f.asker();
-        Ok(Node::Edges { edges, krate: asker.krate, chain: asker.chain })
+        Ok(Node::Edges { edges: blaze_surface::Globs::of(edges), krate: asker.krate, chain: asker.chain })
     }
 
     /// The binding of `name` in `ns` of the module or enum `def`, from this module.

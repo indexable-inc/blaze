@@ -24,7 +24,7 @@ use std::{
     time::Instant,
 };
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_mem::{Cache, MemError, Pooled, Slab, Tag as MemTag, frame};
 use blaze_protocol::events::{Event, Record};
 use blaze_core::chan::{Receiver, Sender, bounded, unbounded};
@@ -746,8 +746,8 @@ impl<W: Send + 'static> Scheduler<W> {
         let owner = Owner {
             plane,
             predict,
-            heard: HashMap::new_in(Global), // alloc: the executor's state, for its life
-            works: HashMap::new_in(Global), // alloc: the executor's state, for its life
+            heard: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: the executor's state, for its life
+            works: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: the executor's state, for its life
             ctx,
             table,
             later: VecDeque::new(),
@@ -818,9 +818,9 @@ struct Entry<W> {
 struct Owner<R: Runner, P, M> {
     plane: Plane<M>,
     predict: P,
-    heard: HashMap<RequestId, Sender<Heard>, Global>, // alloc: the executor's state, for its life
+    heard: Map<RequestId, Sender<Heard>, FixedState, Global>, // alloc: the executor's state, for its life
     /// The work of each node added and not settled.
-    works: HashMap<NodeId, Entry<R::Work>, Global>, // alloc: the executor's state, for its life
+    works: Map<NodeId, Entry<R::Work>, FixedState, Global>, // alloc: the executor's state, for its life
     ctx: &'static Ctx<R>,
     table: Table<R>,
     /// What the owner tells itself (a node it cannot run fails), taken after the message at
@@ -1174,7 +1174,7 @@ mod tests {
         time::Duration,
     };
 
-    use blaze_hash::{HashMap, HashSet};
+    use blaze_hash::{FixedState, Map, MapOpts, Set};
     use blaze_protocol::events::{Event, NodeKind, NodeState, Record};
     use blaze_core::chan::bounded;
     use blaze_core::lock::Lock;
@@ -1230,7 +1230,7 @@ mod tests {
 
     /// The database a test's work puts each key's value in before its `Done`, as real work
     /// does; the scheduler's memo reads it.
-    type Db = Arc<Lock<HashMap<Key, Outcome, Global>>>; // alloc: a test's model
+    type Db = Arc<Lock<Map<Key, Outcome, FixedState, Global>>>; // alloc: a test's model
 
     fn scheduler(workers: usize) -> (Scheduler<Work>, Db) {
         scheduler_on(&Topology::flat(workers)).0
@@ -1267,7 +1267,10 @@ mod tests {
         let pool: &'static Workers = Box::leak(Box::new(Workers::new(topology, false).unwrap()));
         let workers = pool.workers();
         let config = PlaneConfig { io: 1, work: workers };
-        let db: Db = Arc::new(Lock::new("graph.test.exec.db", HashMap::default()));
+        let db: Db = Arc::new(Lock::new(
+            "graph.test.exec.db",
+            Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+        ));
         let memo = {
             let db = Arc::clone(&db);
             move |key: Key| db.lock().get(&key).cloned()
@@ -1484,7 +1487,7 @@ mod tests {
             };
             assert!(drive(&mut machine, nodes, &work, &mut |_| {}, None).unwrap());
             let ran = ran.into_inner();
-            let on = |nodes: &[u32]| -> HashSet<ThreadId, Global> {
+            let on = |nodes: &[u32]| -> Set<ThreadId, FixedState, Global> {
                 // alloc: a test's model
                 ran.iter().filter(|(id, _)| nodes.contains(id)).map(|&(_, at)| at).collect()
             };
@@ -1505,8 +1508,11 @@ mod tests {
     #[test]
     fn shared_keys_run_once_for_two_requests() {
         let (scheduler, db) = scheduler(4);
-        let runs: Arc<Lock<HashMap<u8, u32, Global>>> =
-            Arc::new(Lock::new("graph.test.exec.runs", HashMap::default())); // alloc: a test's model
+        let runs: Arc<Lock<Map<u8, u32, FixedState, Global>>> =
+            Arc::new(Lock::new(
+                "graph.test.exec.runs",
+                Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            )); // alloc: a test's model
         let keyed = |id: u32, key: u8| {
             let (runs, db) = (Arc::clone(&runs), Arc::clone(&db));
             let work: Work = Arc::new(move || {

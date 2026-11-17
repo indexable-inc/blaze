@@ -312,7 +312,7 @@ fn children(body: &BodyView<'_>, e: Expr, out: &mut Vec<ExprId, Alloc<'_>>) -> R
             for f in body.field_init_list(fields)? {
                 out.push(f.expr);
             }
-            out.extend(base);
+            out.extend(base.expr());
         }
     }
     Ok(())

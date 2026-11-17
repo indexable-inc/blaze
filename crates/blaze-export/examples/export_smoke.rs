@@ -26,8 +26,7 @@ use blaze_own::{AVec, Alloc, Vec};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
-fn rec(code: &[u32], sites: &[(u32, SiteKind, Target)], outside: &[(u32, &str)]) -> AVec<'static, u8> {
-    let alloc = Alloc::global();
+fn rec<'a>(code: &[u32], sites: &[(u32, SiteKind, Target)], outside: &[(u32, &str)], alloc: Alloc<'a>) -> AVec<'a, u8> {
     let mut r = CodeRecord::new_in(alloc);
     for &inst in code {
         r.code.extend_from_slice(&inst.to_le_bytes());
@@ -61,7 +60,12 @@ fn main() -> ExitCode {
         eprintln!("export_smoke: this host is not arm64 macOS or arm64 Linux; nothing to run");
         return ExitCode::FAILURE;
     };
-    let func = |name: &str| Target { space: Space::Func, symbol: Symbol::of_name(name) };
+    // An entry that takes no grant yet (a plain `fn main`): the run's memory is one frame
+    // taken from the OS here and handed down.
+    let frame = blaze_mem::Frame::with_reserve(1 << 30, blaze_mem::Tag::Other).expect("the entry's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
+    let func =|name: &str| Target { space: Space::Func, symbol: Symbol::of_name(name) };
     // stp x29, x30, [sp, #-16]!; mov x29, sp; call second; call exit; ldp; ret.
     let main = rec(
         &[
@@ -70,9 +74,10 @@ fn main() -> ExitCode {
         ],
         &[(8, SiteKind::Call, func("second"))],
         &[(20, "exit")],
+        alloc,
     );
     // mov w0, #42; ret.
-    let second = rec(&[0x5280_0540, 0xD65F_03C0], &[], &[]);
+    let second = rec(&[0x5280_0540, 0xD65F_03C0], &[], &[], alloc);
     fn read(bytes: &[u8]) -> CodeView<'_> {
         match CodeView::read(bytes) {
             Ok(view) => view,
@@ -94,15 +99,15 @@ fn main() -> ExitCode {
         natives: None,
         exports: &[],
     };
-    let mut file = Vec::new_in(Alloc::global());
-    let exported = match export(&program, platform, &mut file, Alloc::global()) {
+    let mut file = Vec::new_in(alloc);
+    let exported = match export(&program, platform, &mut file, alloc) {
         Ok(exported) => exported,
         Err(error) => {
             eprintln!("export_smoke: {error}");
             return ExitCode::FAILURE;
         }
     };
-    let mut report = blaze_own::String::new_in(Alloc::global());
+    let mut report = blaze_own::String::new_in(alloc);
     if exported.report(&mut report).is_ok() {
         print!("{}", &*report);
     }

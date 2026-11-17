@@ -83,6 +83,11 @@ pub(super) struct BackNeeds {
     pub(super) overloaded_deref: bool,
     /// Whether the `deref` / `deref_mut` trait fns were queued as declared already.
     deref_declared: bool,
+    /// Whether the `Fn*` traits' fns were queued as declared already: a closure called
+    /// directly (`f()`, the Reference, "Call expressions": `Fn::call(&f, ())` for an `Fn`
+    /// closure) is built as its kind's method (blaze-build closure.rs `body_instance`,
+    /// `Adts::fn_trait_method`), which no checked body names unless a bound did.
+    fn_traits_declared: bool,
 }
 
 impl BackNeeds {
@@ -94,6 +99,7 @@ impl BackNeeds {
             index_declared: false,
             overloaded_deref: false,
             deref_declared: false,
+            fn_traits_declared: false,
         }
     }
 
@@ -103,9 +109,26 @@ impl BackNeeds {
     pub(super) fn read(&mut self, r: &mut Records<'_, '_>, owner: ItemKey, body: Option<&Body<'_>>, c: &Checked<'_>, queue: &mut Vec<(ItemKey, Option<Reached>), Global>, fns: &mut Vec<(ItemKey, Reached), Global>) {
         // A fn named as a value: walked like a callee (a trait's fn at the instance).
         for d in c.expr_defs.column::<1>().iter() {
-            let tc::Def::Fn(k) = *d else { continue };
-            let of_trait = matches!(r.keys.origin(k), Some(Origin::Member { container, kind: MemberKind::Fn, .. }) if !r.store.impls.contains_key(container));
-            queue.push((k, of_trait.then_some(Reached::AtInstance)));
+            match *d {
+                tc::Def::Fn(k) => {
+                    let of_trait = matches!(r.keys.origin(k), Some(Origin::Member { container, kind: MemberKind::Fn, .. }) if !r.store.impls.contains_key(container));
+                    queue.push((k, of_trait.then_some(Reached::AtInstance)));
+                }
+                // A tuple struct's or variant's ctor named as a value (`let f = E::A;`,
+                // `.map(Some)`, a fn pointer `= W`): the language's fn (the Reference,
+                // "Structs", "Enumerations"), tabled as a ctor as a call of it is
+                // (`callee_target`); the builder builds it (blaze-build ctor_fn.rs). A
+                // written call `W(..)` names it here too: the walk tables each key once.
+                tc::Def::Ctor { adt, variant, kind: tc::CtorKind::Tuple } => {
+                    let key = r.store.adts.get(&adt).and_then(|a| a.variants.get(variant as usize)).map(|v| v.key);
+                    if let Some(k) = key
+                        && r.store.ctors.contains_key(&k)
+                    {
+                        queue.push((k, Some(Reached::Ctor)));
+                    }
+                }
+                _ => {}
+            }
         }
         // An overloaded dereference (`*w`, autoderef through `Deref`): the builder names the
         // TRAIT's fn (`Adts::deref_fn`) and reads its ABI before resolving it to the impl's,
@@ -122,6 +145,20 @@ impl BackNeeds {
                     // overloaded dereference through it.
                     Ok(None) => {}
                     Err((at, why)) => fns.push((at, Reached::Failed { class: Box::from("deref lang fn"), detail: why, refusal: None })),
+                }
+            }
+        }
+        // A body that makes a closure: the builder calls it by its kind's `Fn*` method, and an
+        // entry of a weaker one, by name (`Adts::fn_trait_method`). Once per program.
+        if !self.fn_traits_declared && !c.closures.is_empty() {
+            self.fn_traits_declared = true;
+            for (lang, name) in [("fn", "call"), ("fn_mut", "call_mut"), ("fn_once", "call_once")] {
+                match lang_trait_fn(r, owner, lang, name) {
+                    Ok(Some(k)) => queue.push((k, Some(Reached::AtInstance))),
+                    // A program declaring no such lang trait has no closure: the checker
+                    // refused it already (`MissingLangItem`).
+                    Ok(None) => {}
+                    Err((at, why)) => fns.push((at, Reached::Failed { class: Box::from("fn trait lang fn"), detail: why, refusal: None })),
                 }
             }
         }

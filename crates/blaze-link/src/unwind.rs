@@ -13,7 +13,7 @@ use std::ops::Range;
 
 use blaze_format::cursor::{self, Put, Reader};
 use blaze_graph::par;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use smallvec::SmallVec;
 use std::alloc::Global;
 
@@ -531,7 +531,7 @@ enum Stop {
 /// naming it (each must be one a walk of the pieces before met); and how it ended.
 struct Walked {
     cies: SmallVec<[(usize, u8); 16]>,
-    foreign: HashMap<usize, (u8, usize), Global>,
+    foreign: Map<usize, (u8, usize), FixedState, Global>,
     stop: Result<Stop, String>,
 }
 
@@ -552,7 +552,7 @@ fn walk<T, F: Fn(usize, Frame, &mut Vec<T>) -> Result<(), String>>(
         // alloc: past 16 CIEs in one piece (one per native object), growing by doubling
         cies: SmallVec::new(),
         // alloc: only for a CIE another piece holds, once each
-        foreign: HashMap::new_in(Global),
+        foreign: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
         stop: Ok(Stop::End),
     };
     // The last CIE an FDE named: most FDEs name the one before's.

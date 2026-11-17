@@ -215,9 +215,40 @@ mod global {
     use std::alloc::Global;
 
     use super::{Alloc, Erased, SharedAlloc};
+    use crate::Vec;
 
     /// The global allocator, erased once for the whole program.
     static GLOBAL: Erased<Global> = Erased::new(Global);
+
+    impl Erased<Global> {
+        /// `vec`, made over this allocator's handle, as the same vector over `Global`, its
+        /// buffer kept where it is (nothing copied or allocated): a value built through an API
+        /// that takes `Alloc<'_>` can then be owned by a type that names `Global` and outlives
+        /// the handle's borrow (a task's record in blaze-cli). A vector over any other
+        /// allocator is given back unchanged, even one over another `Erased<Global>`: only this
+        /// value's handle is known here to free through `Global`.
+        pub fn adopt<'v, T>(&self, vec: Vec<T, Alloc<'v>>) -> Result<Vec<T, Global>, Vec<T, Alloc<'v>>> {
+            if !vec.allocator().same(self.handle()) {
+                return Err(vec);
+            }
+            let (ptr, len, cap, _this) = vec.into_raw_parts_with_alloc();
+            // SAFETY: the buffer was allocated, and is resized and freed, through this value's
+            // handle, whose every entry is `Global`'s method passed through unchanged (`Erased`'s
+            // `Allocator`), so `Global` is equivalent to that allocator for it
+            // (`RawBuf::from_raw_parts_in`); `ptr`, `len` and `cap` are the vector's own, moved
+            // out once by `into_raw_parts_with_alloc`.
+            Ok(unsafe { Vec::from_raw_parts_in(ptr, len, cap, Global) })
+        }
+    }
+
+    impl<'a, T> Vec<T, Alloc<'a>> {
+        /// The same vector over `Global`, its buffer kept where it is, when its handle is the
+        /// heap's ([`Heap::alloc`], or any other handle of the one heap); else given back
+        /// unchanged ([`Erased::adopt`] of the one heap).
+        pub fn into_global(self) -> Result<Vec<T, Global>, Vec<T, Alloc<'a>>> {
+            GLOBAL.adopt(self)
+        }
+    }
 
     impl Alloc<'static> {
         /// The global allocator's handle: named in tests and at a program's top only, which

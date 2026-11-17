@@ -29,7 +29,7 @@
 //!
 //! Iteration only: the worklist is a vector read from a cursor.
 
-use blaze_hash::{FixedState, Map};
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_own::{AVec, Alloc};
 
 use crate::Platform;
@@ -151,10 +151,10 @@ pub fn plan<'a>(
         platform,
         inputs,
         slots: AVec::new_in(alloc),
-        lazy: Map::with_hasher_in(seed, alloc),
-        rust: Map::with_hasher_in(seed, alloc),
-        names: Map::with_hasher_in(seed, alloc),
-        groups: Map::with_hasher_in(seed, alloc),
+        lazy: Map::new(MapOpts { hasher: seed, alloc: alloc, capacity: None }),
+        rust: Map::new(MapOpts { hasher: seed, alloc: alloc, capacity: None }),
+        names: Map::new(MapOpts { hasher: seed, alloc: alloc, capacity: None }),
+        groups: Map::new(MapOpts { hasher: seed, alloc: alloc, capacity: None }),
         queue: AVec::new_in(alloc),
         objects: AVec::new_in(alloc),
         dropped: AVec::new_in(alloc),

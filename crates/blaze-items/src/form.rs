@@ -247,7 +247,7 @@ struct Form {
     /// Distinct, in slot order.
     refs: Vec<ItemId>,
     /// The slot of each of `refs`, filled once there are more than [`SCAN`].
-    slots: HashMap<ItemId, u32, Global>,
+    slots: Map<ItemId, u32, FixedState, Global>,
     missed: Option<Missed>,
     /// The first walk of a body, which only finds the locals it uses: nothing is written, and
     /// what names no local (types, constants, allocations, variants) is not spelled.
@@ -262,7 +262,7 @@ struct FormBuffers {
     digest: Vec<u8>,
     spans: Vec<u8>,
     refs: Vec<ItemId>,
-    slots: HashMap<ItemId, u32, Global>,
+    slots: Map<ItemId, u32, FixedState, Global>,
 }
 
 /// What one worker keeps of finished forms and walks to write the next ones into: at most
@@ -540,7 +540,7 @@ pub enum Nested<'db> {
 #[derive(Default)]
 struct Nests<'db> {
     order: Vec<Nested<'db>>,
-    seen: HashSet<Nested<'db>, Global>,
+    seen: Set<Nested<'db>, FixedState, Global>,
 }
 
 impl<'db> Nests<'db> {
@@ -623,7 +623,7 @@ const NO_HIDDEN: u8 = 0xfd;
 #[cfg(test)]
 #[derive(Default)]
 struct Reference<'db> {
-    tys: RefCell<HashMap<Ty<'db>, Code, Global>>,
+    tys: RefCell<Map<Ty<'db>, Code, FixedState, Global>>,
     spelling: RefCell<Vec<Ty<'db>>>,
 }
 
@@ -2554,7 +2554,7 @@ impl<'db> Cx<'db> {
 
     fn spell_names(&self, f: &mut Form, mut found: Vec<Named>) {
         let db = self.db;
-        let mut seen = HashSet::new_in(Global);
+        let mut seen = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
         found.retain(|it| seen.insert(*it));
         f.len(found.len());
         for named in found {

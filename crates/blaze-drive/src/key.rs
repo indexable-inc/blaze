@@ -57,10 +57,36 @@ pub enum Kind {
     /// list names the `Script` records whose `links` metadata it was given. Its out is its
     /// outputs record, which the crate's readers read.
     Script = 17,
+    /// One crate's link table (run.md, "What a run takes from the request"): its `#[link]`
+    /// lines, its extern blocks' names and the items that export a C name. A part its crate's
+    /// `CrateScope` record lists, located by the table's digest, which is its out: a re-solve
+    /// that leaves the table equal moves no reader. Valid by its key alone.
+    Links = 18,
+    /// One program's native image (the BNL2 record): named by the program ([`Name::native`]:
+    /// its root crate, target and profile), made by the command from the request, never by a
+    /// shared record. It reads the crate list and, for each crate of the root's closure, its
+    /// `Links` and its `Script`; valid by that read list, so a repeat finds it by key and links
+    /// nothing.
+    Native = 19,
+    /// What the command GIVES the machine (drive.md, RUNNER 19 ruling (2)): a file's content
+    /// read by path ([`content_of`]) or a fact of the command ([`fact_of`]). Never a task or a
+    /// record: its job is answered before the store, from the ask's facts, today's sweep or the
+    /// bytes a task read this command. Its readers are kept by its watch row, whose `out` is
+    /// what it was when the answer was written, so a later command dirties them only when it
+    /// moved.
+    Given = 20,
+    /// One lint unit's findings (docs/v2/plan/design/lint.md): a file's root, its top-level
+    /// items left out as holes, or one item of its outline, its children left out. A part of
+    /// its file's `FileItems` record, keyed before the work by the unit's own bytes and holes,
+    /// the scope its parent's text gives it, and the rule set's id (in its kind's tool); it reads
+    /// nothing. Gated like a body: only the files an asked root owns are linted, so a
+    /// dependency's items never are.
+    Lint = 21,
 }
 
-/// How many kinds there are: the profile's table size.
-pub const KINDS: usize = 17;
+/// How many kinds there are: the profile's table size. Counted, so a new kind cannot leave it
+/// stale (lint `variant-count`).
+pub const KINDS: usize = core::mem::variant_count::<Kind>();
 
 impl Kind {
     pub const ALL: [Kind; KINDS] = [
@@ -81,6 +107,10 @@ impl Kind {
         Kind::Surface,
         Kind::Owners,
         Kind::Script,
+        Kind::Links,
+        Kind::Native,
+        Kind::Given,
+        Kind::Lint,
     ];
 
     /// The stage of the compiler this kind is, as a person reads it in a note: kinds of one
@@ -98,6 +128,9 @@ impl Kind {
             Kind::Code => "generate code",
             Kind::Test => "run tests",
             Kind::Script => "run build scripts",
+            Kind::Links | Kind::Native => "link native code",
+            Kind::Given => "read what the command gives",
+            Kind::Lint => "lint",
         }
     }
 
@@ -110,7 +143,10 @@ impl Kind {
     /// reader once for all the file's bodies), so a batch cut by the per-task mean (which
     /// includes that setup) would pay the setup once a task.
     pub const fn batches_by_home(self) -> bool {
-        matches!(self, Kind::BodyCheck)
+        // A `Signature` (D114) is a part of its file's `FileItems` record and runs in that
+        // file's body job, beside its bodies. A `Lint` unit runs in its file's lint job: the
+        // file read and outlined once for all its asked units.
+        matches!(self, Kind::BodyCheck | Kind::Signature | Kind::Lint)
     }
 
     /// Its index in [`Kind::ALL`].
@@ -137,6 +173,10 @@ impl Kind {
             Kind::Surface => "Surface",
             Kind::Owners => "Owners",
             Kind::Script => "Script",
+            Kind::Links => "Links",
+            Kind::Native => "Native",
+            Kind::Given => "Given",
+            Kind::Lint => "Lint",
         }
     }
 }
@@ -167,8 +207,25 @@ impl Name {
 
     /// Whether the name's subject is its source too, known from the name alone: a `Fetch`
     /// name's subject is its unit's record key (fetch_task.rs). A need of one is located by it.
+    /// A `Native`'s subject is its program, its only text: what it links is its read list.
     pub fn located_by_subject(self) -> bool {
-        matches!(self.kind, Kind::Fetch | Kind::Owners)
+        matches!(self.kind, Kind::Fetch | Kind::Owners | Kind::Native)
+    }
+
+    /// The program the command runs, as its native image's name: the root crate's key, the
+    /// target and the profile (the package and binary asked, made by the command from the
+    /// request). Never held by a shared record: the crate list and the unit graph are every
+    /// program's, so the name, not they, says which program (rule 21).
+    pub fn native(root: &ContentId, target: &[u8], profile: &[u8]) -> Name {
+        let mut h = Hasher::new(NATIVE_DOMAIN);
+        h.id(root).part(target).part(profile);
+        Name { kind: Kind::Native, subject: h.finish() }
+    }
+
+    /// The link table of the crate whose `CrateScope` is `scope`: one subject, so the scope's
+    /// record lists it and a reader names it from the crate list alone.
+    pub fn links_of(scope: Name) -> Name {
+        Name { kind: Kind::Links, subject: scope.subject }
     }
 
     /// The units of the manifest at `path` (its package): a `Units` name whose subject is the
@@ -220,12 +277,43 @@ impl core::fmt::Display for Key {
 pub struct Tool(pub ContentId);
 
 const UNITS_DOMAIN: &str = "blaze-drive units name 1";
+const NATIVE_DOMAIN: &str = "blaze-drive native image name 1";
 const FILE_NAME_DOMAIN: &str = "blaze-drive file name 1";
 const FILE_SOURCE_DOMAIN: &str = "blaze-drive file source 1";
 const TASK_DOMAIN: &str = "blaze-drive task key 1";
 const VALUE_DOMAIN: &str = "blaze-drive value key 1";
 const CERT_DOMAIN: &str = "blaze-drive certificate 1";
 const CONTENT_DOMAIN: &str = "blaze-drive content 1";
+
+const FACT_DOMAIN: &str = "blaze-drive fact name 1";
+const FACTS_DOMAIN: &str = "blaze-drive facts 1";
+
+/// The name a read of the content of the file at `path` (relative to the checkout,
+/// `/`-separated) is: a [`Kind::Given`] with the file's subject, so the sweep's row for the path
+/// answers it. What a task that reads a file by content only (a build script's
+/// `rerun-if-changed`, an `include_bytes!` target the sweep never listed) records; the read's
+/// digest is the bytes' content id, the sweep's form.
+pub fn content_of(path: &[u8]) -> Name {
+    Name { kind: Kind::Given, subject: Name::file(path).subject }
+}
+
+/// The name of a fact the command gives (an environment variable a task reads, the target, the
+/// profile): a [`Kind::Given`] whose subject is `what`'s digest. Its value is in
+/// [`crate::request::Ask::facts`]; never read from the machine by a task.
+pub fn fact_of(what: &[u8]) -> Name {
+    Name { kind: Kind::Given, subject: ContentId::of(FACT_DOMAIN, what) }
+}
+
+/// The digest of the ask's facts (sorted by name): part of the certificate's key, so a moved
+/// fact misses the certificate and its readers are walked.
+pub fn facts_digest(facts: &[(Name, ContentId)]) -> ContentId {
+    let mut h = Hasher::new(FACTS_DOMAIN);
+    h.update(&(facts.len() as u64).to_le_bytes());
+    for (name, value) in facts {
+        h.update(&[name.kind as u8]).id(&name.subject).id(value);
+    }
+    h.finish()
+}
 
 const CONDITION_DOMAIN: &str = "blaze-drive condition name 1";
 const SPACE_DOMAIN: &str = "blaze-drive space 1";
@@ -291,6 +379,43 @@ pub fn value_key(key: Key, reads: &[(Name, ContentId)]) -> Key {
     h.id(&key.0);
     for (name, saw) in reads {
         h.update(&[name.kind as u8]).id(&name.subject).id(saw);
+    }
+    Key(h.finish())
+}
+
+/// The key of a task of a file whose read NAMES follow from facts no text of its own holds (a
+/// `BodyCheck`, a `Signature`): it reads the `CrateScope` of every crate its file's owners'
+/// checks open, and a `CrateScope`'s name is its crate's key, so which names it reads follows
+/// from WHICH crates own the file (`owners`, the file's `Owners` name, `owners_out` its out:
+/// root files) and WHAT those crates are (`graph`, the `UnitGraph`'s out: the crate list, whose
+/// rows hold each crate's key, made from its features, cfg, dependencies' keys and side). Both
+/// are folded into `task` as reads, so one key never names two read lists (rule 21). Without the
+/// graph, `blaze run` then `blaze check` of one hello world (two asks, two crate lists, one
+/// `Owners` out) put two shapes of one `Signature` under one key ("held CrateScope(1e39..), put
+/// CrateScope(1e08..)", 2026-11-17). Every such task reads the `UnitGraph` already, so folding
+/// it moves no key a moved read would not have missed. `graph` is [`ABSENT`] in a command with
+/// no unit graph. The one derivation: the drive's (request.rs `locate`) and blaze-cli's
+/// (`body_types::body_check_key`, which hands `blaze run` a body's key) both call it.
+pub fn owned_key(task: Key, graph: ContentId, owners: Name, owners_out: ContentId) -> Key {
+    // Sorted by name, as a read list is: `UnitGraph` (2) before `Owners` (16).
+    value_key(task, &[(Name::unit_graph(), graph), (owners, owners_out)])
+}
+
+/// [`value_key`] of a record that also read cells (cells.rs): the whole reads, then each cell
+/// read in (name, cell) order with what it saw. With no cell read it is [`value_key`] itself.
+pub fn value_key_with_cells(key: Key, reads: &[(Name, ContentId)], cells: &[crate::cells::CellRead]) -> Key {
+    if cells.is_empty() {
+        return value_key(key, reads);
+    }
+    let mut h = Hasher::new(VALUE_DOMAIN);
+    h.id(&key.0);
+    for (name, saw) in reads {
+        h.update(&[name.kind as u8]).id(&name.subject).id(saw);
+    }
+    // A tag no kind byte is, so a cell read never hashes as a whole read.
+    h.update(&[0xCE]);
+    for read in cells {
+        h.update(&[read.name.kind as u8]).id(&read.name.subject).update(&read.cell.0).id(&read.saw);
     }
     Key(h.finish())
 }

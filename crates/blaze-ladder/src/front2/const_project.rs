@@ -139,7 +139,8 @@ impl<'w> ProjectAsk<'w> {
         };
         let Some(module) = keys.library_in(names, trait_) else { return refuse(ProjectionWhy::NoLibraryTrait) };
         let spell = Spelling::fixed();
-        let blocks = BlockTraits::module(Alloc::global());
+        let alloc = store.tys.alloc();
+        let blocks = BlockTraits::module(alloc);
         let self_ = SelfTy::None;
         let world = BodyWorld {
             names,
@@ -155,10 +156,14 @@ impl<'w> ProjectAsk<'w> {
             spell: &spell,
             traits: &[],
             blocks: &blocks,
+            path_marks: &[],
             fills: RefCell::new(Vec::new_in(Global)),
             gaps: RefCell::new(Vec::new_in(Global)),
+            // A constant's evaluation is after analysis (rustc's CTFE runs post-analysis):
+            // every opaque reached is its hidden type.
+            reveal: super::opaque_auto::Reveal::All,
         };
-        let out = tc::normalize_projection(&world, trait_, name, args, ground, Alloc::global());
+        let out = tc::normalize_projection(&world, trait_, name, args, ground, alloc);
         let fills = world.fills.into_inner();
         let gaps = world.gaps.into_inner();
         // Taken only when the world noted nothing to make or answer AND the answer is ground: while
@@ -203,8 +208,8 @@ impl<'w> ProjectAsk<'w> {
 fn unground_node(ground: &PortableTys<'_>, t: PTy) -> Option<tc::PNode> {
     let view = ground.view();
     // blaze-own's `Vec`: the type `each_child` fills.
-    let mut work: blaze_own::Vec<PTy, Alloc<'_>> = blaze_own::Vec::new_in(Alloc::global());
-    let mut children: blaze_own::Vec<PTy, Alloc<'_>> = blaze_own::Vec::new_in(Alloc::global());
+    let mut work: blaze_own::Vec<PTy, Alloc<'_>> = blaze_own::Vec::new_in(ground.alloc());
+    let mut children: blaze_own::Vec<PTy, Alloc<'_>> = blaze_own::Vec::new_in(ground.alloc());
     work.push(t);
     while let Some(at) = work.pop() {
         let Ok(node) = view.node(at) else { return Some(tc::PNode::Error) };

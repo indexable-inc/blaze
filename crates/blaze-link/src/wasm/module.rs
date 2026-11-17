@@ -17,7 +17,7 @@
 use blaze_hash::hash_map::Entry;
 
 use blaze_graph::par;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::radix;
 use std::alloc::Global;
 
@@ -372,14 +372,14 @@ fn check(placed: &Placed<'_>) -> Result<(), String> {
 /// lookup, through the entry API.
 struct Types<'a> {
     list: Vec<Sig<'a>>,
-    index: HashMap<Sig<'a>, u32, Global>,
+    index: Map<Sig<'a>, u32, FixedState, Global>,
 }
 
 impl<'a> Types<'a> {
     fn with_capacity(capacity: usize) -> Types<'a> {
         Types {
             list: Vec::with_capacity(capacity),
-            index: HashMap::with_capacity_in(capacity, Global),
+            index: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(capacity) }),
         }
     }
 
@@ -560,7 +560,7 @@ fn segment_name(class: &Class) -> &str {
 
 /// Adds an export, or checks that one of that name exports the same thing when `again` may.
 fn export<'n>(
-    named: &mut HashMap<&'n str, (u8, u32), Global>,
+    named: &mut Map<&'n str, (u8, u32), FixedState, Global>,
     list: &mut Vec<(&'n str, u8, u32)>,
     name: &'n str,
     kind: u8,
@@ -876,8 +876,8 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     // The core keeps one import per name: a function that says another must not call it.
     if par::any(&units, |it| it.header.is_some_and(|it| it.imports().next().is_some())) {
         let names = placed.imports.iter().map(|it| it.name.as_str());
-        let mut by_name: HashMap<&str, Imported<'_>, Global> =
-            HashMap::with_capacity_in(imports.len(), Global);
+        let mut by_name: Map<&str, Imported<'_>, FixedState, Global> =
+            Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(imports.len()) });
         by_name.extend(names.zip(imports.iter().copied()));
         let conflict = par::find_map_first(&units, |unit| {
             unit.header?.imports().find_map(|(name, module, field, ty)| {
@@ -979,7 +979,7 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         ("__stack_pointer", "__memory_base")
     );
     let mut exports: Vec<(&str, u8, u32)> = Vec::with_capacity(2 + placed.exports.len());
-    let mut named = HashMap::with_capacity_in(2 + placed.exports.len(), Global);
+    let mut named = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(2 + placed.exports.len()) });
     export(&mut named, &mut exports, "memory", EXPORT_MEMORY, 0, false)?;
     if wasm.memory64 {
         // The seed's runner switches `__stack_pointer` with each fiber and finds a fiber's
@@ -1035,7 +1035,7 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     by_addr.extend(regions.filter(|(_, it)| is_custom(it)).map(|(index, it)| (it.addr, index)));
     radix::sort_copy_by_key(&mut by_addr, |&(addr, index)| radix::pack_64(addr, index as u64));
     let mut groups: Vec<(&str, bool)> = Vec::with_capacity(customs);
-    let mut group_of: HashMap<&str, u32, Global> = HashMap::with_capacity_in(customs, Global);
+    let mut group_of: Map<&str, u32, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: Some(customs) });
     let mut parts: Vec<(u32, usize)> = Vec::with_capacity(customs);
     for &(_, index) in &by_addr {
         let Class::Named { name, .. } = &placed.regions[index].class else { continue };

@@ -48,12 +48,16 @@ use crate::{
     IntCond, Op,
     arith::mask,
     body::{Bodies, BodyId, DatumId, Target},
-    func::{DataId, RefId, RefKind, Sig, SigId},
+    func::{DataId, PositionField, RefId, RefKind, Sig, SigId},
 };
 
 /// The refusal of a call, direct or through a pointer, of a function outside the program.
 pub(super) const OUTSIDE: &str =
     "a call of a function the run's bodies do not give (an outside function: the harness decides; the run models one thread)";
+
+/// The refusal of a data row's source position in a run whose bodies place no source.
+pub(super) const NO_POSITION: &str =
+    "a source position (a `Location`'s line or column) the run's bodies do not place (`Bodies::position`)";
 
 /// The most alignment a datum may ask: `1 << 29`, Rust's largest (`#[repr(align)]`).
 const MOST_ALIGN: u32 = 29;
@@ -165,6 +169,18 @@ impl<'a, A: Allocator + Clone> Run<'a, A> {
                         let to = self.placed_or_queued(inst, target, &mut work)?;
                         self.write_pointer(inst, at, reloc.offset, to, reloc.addend)?;
                     }
+                    for position in self.view.data_positions_of(DataId(row)) {
+                        let bodies: &'a dyn Bodies = self.bodies;
+                        let Some((line, col)) = bodies.position(position.item_key(), position.site) else {
+                            return Err(self.refuse(inst, NO_POSITION));
+                        };
+                        let value = match PositionField::from_word(position.field) {
+                            Some(PositionField::Line) => line,
+                            Some(PositionField::Col) => col,
+                            None => return Err(self.refuse(inst, "a source position of no known field")),
+                        };
+                        self.write_u32(inst, at, position.offset, value)?;
+                    }
                 }
                 Placed::Given(datum) => {
                     let bodies: &'a dyn Bodies = self.bodies;
@@ -267,6 +283,23 @@ impl<'a, A: Allocator + Clone> Run<'a, A> {
         let first = alloc.start + offset;
         for (i, at) in (first..first + width).enumerate() {
             self.memory.bytes[at] = Byte { value: (bits >> (8 * i)) as u8, init: true, index: i as u8, prov: to };
+        }
+        Ok(())
+    }
+
+    /// Source position word of datum `datum` at byte `offset`: `value`, little-endian, plain
+    /// bytes (a number, no provenance).
+    fn write_u32(&mut self, inst: usize, datum: u32, offset: u32, value: u32) -> Result<(), EvalError> {
+        let Some(alloc) = self.memory.find(datum) else {
+            return Err(self.refuse(inst, "a source position of a datum the run did not place"));
+        };
+        let offset = offset as usize;
+        if offset + 4 > alloc.size as usize {
+            return Err(self.refuse(inst, "a source position past its datum's bytes"));
+        }
+        let first = alloc.start + offset;
+        for (i, byte) in value.to_le_bytes().into_iter().enumerate() {
+            self.memory.bytes[first + i] = plain(byte);
         }
         Ok(())
     }

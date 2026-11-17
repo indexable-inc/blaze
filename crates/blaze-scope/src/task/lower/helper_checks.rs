@@ -28,6 +28,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
     /// item's text (blaze-expand's `ItemAttrs::derives` takes the derives out of it).
     pub(super) fn derive_calls(&mut self, idx: ItemIndex, item: &Item, at: u32, derives: &[&'t str], input: &'t str) {
         let place = self.call_in_text(idx, item, input);
+        let tokens = self.call_tokens(input, crate::nested_input::InputCut::Whole);
         for &path in derives {
             let call = self.key(self.owner, "derive", path);
             let Some(parsed) = parse_path(path, self.krate, self.alloc) else {
@@ -36,7 +37,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             };
             let pos = self.next_pos();
             self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Derive, pos, item: Some(idx.0), role: CallRole::Call });
-            let src = CallSrc { module: self.module, owner: None, name: path, input, kind: CallShape::Derive, loc: self.loc(at), written: self.written, depth: self.depth, implicit: false, place };
+            let src = CallSrc { module: self.module, owner: None, name: path, input, kind: CallShape::Derive, loc: self.loc(at), written: self.written, depth: self.depth, implicit: false, place, tokens };
             self.out.calls.push((call, src));
         }
     }
@@ -59,7 +60,9 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
     }
 
     /// Item `item` (at `idx`, a struct, an enum or a union) has a derive and, written after it,
-    /// one-segment attributes `attrs.others` that are neither built in nor a tool's: rustc's
+    /// attributes `attrs.others` that are not built in (or, in an expansion, no derive of its
+    /// own and a one-segment name that may be the helper of a derive on the item the expansion
+    /// came from, read by the cells' `derive_helper`): rustc's
     /// `take_first_attr` takes the derive, then each of these in order, with the derive's helpers
     /// innermost: a helper is inert and the next is taken; an attribute macro takes the item.
     /// Sent, in this order, so the cells decide each from the ones before it
@@ -79,6 +82,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         let at = item.range.start;
         self.derive_calls(idx, item, at, &attrs.derives, whole);
         let place = self.call_in_text(idx, item, whole);
+        let tokens = self.call_tokens(whole, crate::nested_input::InputCut::Whole);
         let mut takers: AVec<'a, &'t str> = AVec::new_in(self.alloc);
         for (&name, &derives_before) in attrs.others.iter().zip(attrs.derives_before.iter()) {
             if takers.contains(&name) {
@@ -96,7 +100,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             let call = self.key(self.owner, "attr after derive", name);
             let pos = self.next_pos();
             self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: Some(idx.0), role });
-            let src = CallSrc { module: self.module, owner: None, name, input: whole, kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit: false, place };
+            let src = CallSrc { module: self.module, owner: None, name, input: whole, kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit: false, place, tokens };
             self.out.calls.push((call, src));
         }
         let Some(parsed) = parse_path(KEEP_PATH, self.krate, self.alloc) else {
@@ -106,7 +110,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         let call = self.key(self.owner, "kept after derive", KEEP_PATH);
         let pos = self.next_pos();
         self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: Some(idx.0), role: CallRole::Keep });
-        let src = CallSrc { module: self.module, owner: None, name: KEEP_PATH, input: whole, kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit: false, place };
+        let src = CallSrc { module: self.module, owner: None, name: KEEP_PATH, input: whole, kind: CallShape::Attr, loc: self.loc(at), written: self.written, depth: self.depth, implicit: false, place, tokens };
         self.out.calls.push((call, src));
         let mut uses: AVec<'a, (&'t str, u32)> = AVec::new_in(self.alloc);
         self.member_uses(idx, item, &takers, &mut uses);
@@ -140,7 +144,9 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
                 at = past;
                 continue;
             }
-            for &name in read.others.iter() {
+            // One-segment names alone: a helper is one segment, and a path on a member is an
+            // attribute macro in a field's place, not checked (the stated limit above).
+            for &name in read.others.iter().filter(|name| !name.contains("::")) {
                 if !sent.contains(&name) {
                     push_once(uses, name, member.range.start);
                 }
@@ -161,7 +167,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: Some(idx.0), role: CallRole::Call });
             // No input: a check is never expanded (`Cells::called` refuses an attribute macro in
             // a helper's place); only its place is read, for an error's location.
-            let src = CallSrc { module: self.module, owner: None, name, input: "", kind: CallShape::Attr, loc: self.loc(offset), written: self.written, depth: self.depth, implicit: false, place: None };
+            let src = CallSrc { module: self.module, owner: None, name, input: "", kind: CallShape::Attr, loc: self.loc(offset), written: self.written, depth: self.depth, implicit: false, place: None, tokens: crate::nested_input::CallTokens::Text };
             self.out.calls.push((call, src));
             // A check, not a call that can grow the textual scope (`Lower::attr_checks`' span).
             self.checks_sent += 1;

@@ -26,6 +26,9 @@ blaze-text.workspace = true
 # Properties: write then read gives a value back, and an edit changes only what it names;
 # with a planted-bug control.
 blaze-sim.workspace = true
+# `testing::every_failure`: each allocation of a parse refused in turn comes back as the
+# document's typed memory error, never a panic.
+blaze-own = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

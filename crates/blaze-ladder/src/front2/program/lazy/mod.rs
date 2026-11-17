@@ -35,6 +35,9 @@
 
 mod fill;
 mod front_end;
+mod locate;
+/// The per-fn seam rules both programs answer by (rule 30), `Front2Program`'s calls included.
+pub(in crate::front2::program) mod seam_rules;
 
 use super::*;
 
@@ -46,9 +49,11 @@ use crate::front2::source::NamesSource;
 /// Why the lazy program did not answer, naming the method or step and the item (rule 19).
 #[derive(Debug)]
 pub enum LazyRefusal {
-    /// `check_one` was asked about a key no row, item or filed member has: over records the key
-    /// map is filled as heads are made, so a member is known only once its container's head is.
-    UnknownKey { key: ItemKey },
+    /// A key the program was asked about that its crate's records do not hold (lazy/locate.rs):
+    /// no item, module or variant row, no member of its crate's containers, no item declared in
+    /// a body the search read or lowered. `krate` names the crate its prefix is of; `searched`
+    /// says what was read (rule 19).
+    NotFound { key: ItemKey, krate: Box<str>, searched: Box<str> },
     /// `check_one` asked twice of one key: the step asks each key once (piece X's contract).
     AskedTwice { key: ItemKey },
     /// The body's lowering refused (`lower_made`).
@@ -78,12 +83,18 @@ pub enum LazyRefusal {
     Unanswered { question: &'static str, item: Box<str> },
     /// The types table did not fork.
     Table { function: Box<str> },
+    /// The names records did not answer a question the make of the instance of fn `tabled`
+    /// asked (or an earlier make of this session asked): what was made over them is void
+    /// (source.rs module docs). `first` is the first error the records' log kept, as it names
+    /// itself (the crate, the record, the item); `kept` how many the log kept, `dropped` how
+    /// many past its bound it counted.
+    RecordsVoid { tabled: ItemKey, first: Box<str>, kept: usize, dropped: u32 },
 }
 
 impl core::fmt::Display for LazyRefusal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            LazyRefusal::UnknownKey { key } => write!(f, "front2 (lazy): no item, filed member or row has key {:032x}", key.0),
+            LazyRefusal::NotFound { key, krate, searched } => write!(f, "front2 (lazy): the key {:032x} of {krate} is no fn its records hold; searched {searched}", key.0),
             LazyRefusal::AskedTwice { key } => write!(f, "front2 (lazy): the body of the item with key {:032x} was asked for twice in one run", key.0),
             LazyRefusal::Lower { function, error } => write!(f, "front2 (lazy): `{function}`'s body did not lower: {error:?}"),
             LazyRefusal::Spell { function } => write!(f, "front2 (lazy): `{function}`'s names could not be spelled"),
@@ -96,6 +107,11 @@ impl core::fmt::Display for LazyRefusal {
             LazyRefusal::NeedsSolvedNames { helper, item } => write!(f, "front2 (lazy): `{helper}` (asked about `{item}`) reads only solved names, not each crate's records"),
             LazyRefusal::Unanswered { question, item } => write!(f, "front2 (lazy): the names source did not answer `{question}` about `{item}` (its error is in the source's log)"),
             LazyRefusal::Table { function } => write!(f, "front2 (lazy): the types table did not fork for `{function}`"),
+            LazyRefusal::RecordsVoid { tabled, first, kept, dropped } => write!(
+                f,
+                "front2 (lazy): the names records did not answer while the instance of fn {:032x} was made, so it is void: {first} ({kept} errors kept, {dropped} more counted)",
+                tabled.0
+            ),
         }
     }
 }
@@ -114,6 +130,13 @@ struct Rows<'n> {
     key: AVec<'n, ItemKey>,
     kind: AVec<'n, FnKind>,
     abi: AVec<'n, Abi>,
+    /// Whether the fn is nounwind ([`crate::seam::FrontEnd::nounwind`]): its written ABI's
+    /// unwind category (program/head_abi.rs `BuildAbi`, which [`Abi`] does not carry: "C" and
+    /// "C-unwind" are one calling convention) or `#[rustc_nounwind]`, as tabled.rs `row`.
+    nounwind: AVec<'n, bool>,
+    /// The fn's OWN `#[track_caller]` (program.rs `symbols_of`); the seam's answer adds its
+    /// trait's declaration's (program/seam_rules.rs `track_caller`).
+    track_caller: AVec<'n, bool>,
     at: AVec<'n, At>,
     path: AVec<'n, Span>,
     symbol: AVec<'n, Span>,
@@ -134,6 +157,8 @@ impl<'n> Rows<'n> {
             key: AVec::new_in(alloc),
             kind: AVec::new_in(alloc),
             abi: AVec::new_in(alloc),
+            nounwind: AVec::new_in(alloc),
+            track_caller: AVec::new_in(alloc),
             at: AVec::new_in(alloc),
             path: AVec::new_in(alloc),
             symbol: AVec::new_in(alloc),
@@ -191,7 +216,7 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     prepared: &'n Prepares<'n>,
     /// The head store's table forked, then each live body lowered again into it (module docs);
     /// `None` until the first `check_one` (the seam's `types` is then the empty table).
-    /// `'static` (so `Alloc::global()` at the fork) because `lower_again` takes that table type.
+    /// `'static` (so the store's allocator at the fork) because `lower_again` takes that table type.
     tys: Option<PortableTys<'static>>,
     rows: Rows<'n>,
     live: AVec<'n, Option<Live<'n>>>,
@@ -205,11 +230,22 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     /// supertrait under it, made once per trait: the seam's `object_trait` (fill.rs
     /// `body_objects`).
     objects: HashMap<ItemKey, ObjectTable, Global>,
+    /// Each async block's state recipe, made with its owner body's check (front2
+    /// coroutine_recipes.rs `recipes_of`, as `Front2Program` makes them), sorted by (owner,
+    /// ordinal): the seam's `coroutine_recipe`. Kept past `done` (a later instance's state of the
+    /// same block is laid from it); a few words a block.
+    recipes: Vec<crate::front2::coroutine_recipes::RecipeRow, Global>,
+    /// Where the process starts (front2 start.rs `Entry2`), decided by [`LazyProgram::decide_start`]
+    /// (program.rs `start_of`, the one start rule): the seam's `rust_start`. `None` until then.
+    start: Option<crate::front2::start::Entry2>,
     /// The seam's own lang answers ([`SEAM_LANGS`]), looked up when the program is made.
     langs: [(LangItem, Option<ItemKey>); SEAM_LANGS.len()],
     /// The program's entry row: set by the first `check_one` of the key given as the entry.
     entry_key: Option<ItemKey>,
     projection_why: RefCell<Option<Box<str>>>,
+    /// Each crate's members keyed as their containers' heads key them, made the first time a
+    /// key of the crate is asked that the key map does not know (lazy/locate.rs).
+    member_rows: HashMap<usize, locate::MemberIndex<'n>, Global>,
     counts: LazyCounts,
     alloc: Alloc<'n>,
 }
@@ -217,8 +253,9 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
 impl<'n> LazyProgram<'n> {
     /// Over the names this command solved: `entry` is the key of the fn the process starts at
     /// (`main`, or the exported entry), which nothing here lowers until `check_one` asks it.
-    pub fn new(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], entry: Option<ItemKey>, alloc: Alloc<'n>) -> Result<LazyProgram<'n>, Front2Refusal> {
-        let front = Front2::new(names, frame, user).map_err(Front2Refusal::Front)?;
+    /// `alloc` is `'static` because the head store's tables are (`Store::new`).
+    pub fn new(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], entry: Option<ItemKey>, alloc: Alloc<'static>) -> Result<LazyProgram<'n>, Front2Refusal> {
+        let front = Front2::new(names, frame, user, alloc).map_err(Front2Refusal::Front)?;
         Self::over(front, entry, alloc)
     }
 }
@@ -234,16 +271,24 @@ impl<'n> LazyProgram<'n, &'n crate::front2::source::Records<'n>> {
         frame: &'n blaze_mem::Frame,
         lang_crates: &[usize],
         entry: Option<ItemKey>,
-        alloc: Alloc<'n>,
+        alloc: Alloc<'static>,
     ) -> Result<LazyProgram<'n, &'n crate::front2::source::Records<'n>>, Front2Refusal> {
         let front = Front2::from_records(records, frame, lang_crates).map_err(Front2Refusal::Front)?;
         Self::over(front, entry, alloc)
     }
+
+    /// The run's sources a body's macro calls expand with (the crate's environment, texts and
+    /// proc-macro runner: [`crate::front2::body_host::BodySources`]), set once by the maker
+    /// before any body, as `ProjectWorld::set_body_sources`; until then every body `env!`,
+    /// include and proc macro is refused by name.
+    pub fn set_body_sources(&mut self, sources: &'n dyn crate::front2::body_host::BodySources) {
+        self.store.sources = Some(sources);
+    }
 }
 
 impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
-    fn over(front: Front2<'n, S>, entry: Option<ItemKey>, alloc: Alloc<'n>) -> Result<LazyProgram<'n, S>, Front2Refusal> {
-        let mut store = Store::new(front.index.lang("sized"), front.frame);
+    fn over(front: Front2<'n, S>, entry: Option<ItemKey>, alloc: Alloc<'static>) -> Result<LazyProgram<'n, S>, Front2Refusal> {
+        let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
         store.pointers = super::super::receiver::Pointers::find(&front.index, front.resolver);
         let mut langs = [(LangItem::Drop, None); SEAM_LANGS.len()];
         for (slot, item) in langs.iter_mut().zip(SEAM_LANGS) {
@@ -263,9 +308,12 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             const_values: AVec::new_in(alloc),
             statics: crate::front2::statics::Statics { values: Vec::new_in(Global), kinds: Vec::new_in(Global) },
             objects: HashMap::new_in(Global),
+            recipes: Vec::new_in(Global),
+            start: None,
             langs,
             entry_key: entry,
             projection_why: RefCell::new(None),
+            member_rows: HashMap::new_in(Global),
             counts: LazyCounts::default(),
             alloc,
         })

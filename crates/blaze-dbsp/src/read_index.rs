@@ -1,6 +1,6 @@
 use std::hash::Hash;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use std::alloc::Global;
 
 /// [`ReadIndex::forget_many`] sweeps once the readers it forgets hold at least one in this many
@@ -20,12 +20,12 @@ pub struct ReadIndex<K, R> {
     by_key: Side<K, R>,
     by_reader: Side<R, K>,
     /// (key row, reader row) -> (place in the key's list, place in the reader's list).
-    pairs: HashMap<(u32, u32), (u32, u32), Global>,
+    pairs: Map<(u32, u32), (u32, u32), FixedState, Global>,
 }
 
 #[derive(Debug)]
 struct Side<A, B> {
-    slot: HashMap<A, u32, Global>,
+    slot: Map<A, u32, FixedState, Global>,
     rows: Vec<Row<A, B>>,
     free: Vec<u32>,
 }
@@ -39,7 +39,7 @@ struct Row<A, B> {
 
 impl<A: Copy + Eq + Hash, B: Copy> Side<A, B> {
     fn new() -> Self {
-        Side { slot: HashMap::new_in(Global), rows: Vec::new(), free: Vec::new() } // alloc: setup: empty buffers, grown once and kept
+        Side { slot: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), rows: Vec::new(), free: Vec::new() } // alloc: setup: empty buffers, grown once and kept
     }
 
     #[expect(
@@ -96,7 +96,7 @@ impl<K: Copy + Eq + Hash, R: Copy + Eq + Hash> Default for ReadIndex<K, R> {
 
 impl<K: Copy + Eq + Hash, R: Copy + Eq + Hash> ReadIndex<K, R> {
     pub fn new() -> Self {
-        ReadIndex { by_key: Side::new(), by_reader: Side::new(), pairs: HashMap::new_in(Global) }
+        ReadIndex { by_key: Side::new(), by_reader: Side::new(), pairs: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }) }
     }
 
     pub fn add(&mut self, key: K, reader: R) {

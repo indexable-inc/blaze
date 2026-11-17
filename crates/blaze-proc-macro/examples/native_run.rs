@@ -44,7 +44,11 @@ fn main() -> ExitCode {
         eprintln!("usage: native_run <script> <package A> <out A> <package B> <out B> <shelf> <sdk> <name> <version> [links]");
         return ExitCode::from(2);
     };
-    let alloc = Alloc::global();
+    // An entry that takes no grant yet (a plain `fn main`): the run's memory is one frame
+    // taken from the OS here and handed down.
+    let frame = blaze_mem::Frame::with_reserve(1 << 36, blaze_mem::Tag::Usercode).expect("the entry's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc: Alloc<'_> = erased.handle();
     let settings = std::string::String::from_utf8(read(sdk, "SDKSettings.json")).expect("a UTF-8 SDKSettings.json");
     let sdk_version = settings.split("\"Version\":\"").nth(1).and_then(|v| v.split('"').next()).expect("SDKSettings.json's Version");
     let sysroot_key = format!("macos-sdk {sdk_version}");

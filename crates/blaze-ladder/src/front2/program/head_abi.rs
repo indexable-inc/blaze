@@ -49,20 +49,45 @@ pub(super) struct BuildAbi {
 /// constructor is a safe Rust fn. Refused by name: no head ([`Front2Refusal::NoHead`]), an
 /// unplaced head ([`Front2Refusal::Unplaced`]), an ABI with no reading
 /// ([`Front2Refusal::Abi`]). `function` names the fn in the refusal.
-pub(super) fn head_abi<'n>(names: &Names<'n>, store: &Store<'n>, key: ItemKey, function: impl Fn() -> Box<str>) -> Result<BuildAbi, Front2Refusal> {
+/// Generic over the names source: the lazy program over records asks it too (lazy/fill.rs
+/// `row`, program/seam_rules.rs `fn_abi`).
+pub(super) fn head_abi<'n, S: crate::front2::source::NamesSource<'n>>(names: S, store: &Store<'n>, key: ItemKey, function: impl Fn() -> Box<str>) -> Result<BuildAbi, Front2Refusal> {
     if store.ctors.get(&key).is_some() {
         return Ok(BuildAbi { abi: Abi::Rust, nounwind: false });
     }
     let Some(head) = store.fns.get(&key) else {
         return Err(Front2Refusal::NoHead { function: function() });
     };
-    let (_, foreign) = placed(names, head.lib).map_err(|_| Front2Refusal::Unplaced { function: function() })?;
+    let (_, foreign) = placed_fn(names, store, key, head.lib).map_err(|_| Front2Refusal::Unplaced { function: function() })?;
     let foreign = foreign.or_else(|| crate::front2::panic_entry::local_abi(store, key));
     let read = match foreign {
         None => of_head(head.header.abi),
         Some(block) => of_block(block),
     };
     read.ok_or_else(|| Front2Refusal::Abi { function: function(), abi: head.header.abi })
+}
+
+/// [`placed`] of fn `key` (library key `lib`), the one rule every row and ABI reads it by: a
+/// fn declared in a BODY (its head is the store's local head, locals.rs) is no item the names
+/// place, so it is at `{0, 0}` (owed, as a ctor) and no module-level `extern` block declares it;
+/// a block in its body is its local head's (front2/panic_entry.rs `local_abi`, which every
+/// caller asks next). Asked of the names source, a local's key is no row of the items record
+/// (the solved names answer "none declares it", the records no answer), so it is never asked.
+pub(super) fn placed_fn<'n, S: crate::front2::source::NamesSource<'n>>(names: S, store: &Store<'n>, key: ItemKey, lib: LibKey) -> Result<(At, Option<&'n str>), Unplaced> {
+    if store.locals.head(key).is_some() {
+        return Ok((At { file: 0, place: 0 }, None));
+    }
+    placed(names, lib)
+}
+
+/// Where constructor `key` is placed, the one rule the eager program (program.rs `make_from`)
+/// and the lazy one (lazy/fill.rs `row`) table it by: a tuple variant's constructor at its
+/// variant's text ([`item_at`]); a tuple struct's, a member key with no library key, at `{0, 0}`
+/// (owed, placed with its struct). No `extern` block is asked: the Reference ("Enumerations",
+/// "Structs") makes a constructor of the variant or struct itself, never a declaration of an
+/// external block, so its ABI is the Rust ABI ([`head_abi`]) with no question to a names source.
+pub(super) fn placed_ctor<'n, S: crate::front2::source::NamesSource<'n>>(names: S, lib: Option<LibKey>) -> At {
+    lib.map_or(At { file: 0, place: 0 }, |lib| item_at(names, lib))
 }
 
 /// The ABI a fn's own head is written with (front2 heads.rs `abi_of`, read by types.rs

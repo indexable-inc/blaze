@@ -46,6 +46,8 @@ blaze-lex.workspace = true
 blaze-sim.workspace = true
 # `Alloc::global()`, at the example's top and in tests.
 blaze-own = { workspace = true, features = ["std", "testing"] }
+# The examples' entry frame and each test's top frame: memory from the OS, handed down.
+blaze-mem.workspace = true
 # The example's HTTPS: blaze-http's client on its driver thread, the machine's roots.
 blaze-http.workspace = true
 # The example's store: records made in place (`blaze_core::reserve`) on the native driver.

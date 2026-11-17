@@ -26,9 +26,18 @@ fn value(n: u32) -> Vec<u8> {
     (0..1 + (n as usize * 37) % 300).map(|i| (n as usize).wrapping_mul(131).wrapping_add(i) as u8).collect()
 }
 
-/// Process `n` of one boot over `sim`, with the store's cap at `cap_bytes`.
+/// Process `n` of the first boot over `sim`, with the store's cap at `cap_bytes`.
 fn process(sim: Sim, n: u64, cap_bytes: u64) -> Lent<Sim, Global> {
-    let mut cfg = config(FileName::new("store").expect("a name"), &Settings::default(), Facts { boot: Some(1), nonce: 9000 + n });
+    process_in_boot(sim, n, cap_bytes, 1)
+}
+
+/// Process `n` of boot `boot` over `sim`. A `Sim::crash` is a power cut, so the process after
+/// it is of the next boot: the boot fact is the driver's, and a machine that lost power boots
+/// again (blaze-cas plain/tests.rs takes `boot + 1` after each crash). Opened in the same boot,
+/// the store takes its own segments as proved by their rows (no byte read) and a torn one is
+/// `StoreError::Changed` (something outside blaze changed it), not a loss.
+fn process_in_boot(sim: Sim, n: u64, cap_bytes: u64, boot: u64) -> Lent<Sim, Global> {
+    let mut cfg = config(FileName::new("store").expect("a name"), &Settings::default(), Facts { boot: Some(boot), nonce: 9000 + n });
     cfg.cap_bytes = cap_bytes;
     open(sim, cfg).expect("the store opens")
 }
@@ -72,6 +81,43 @@ fn records_are_read_in_place_and_reach_the_next_process_by_the_commit_after_the_
     println!("plain place: 100 records read in place from the arena, then from a segment in the next process; two values refused");
 }
 
+/// A refused put names the record (rule 19): its kind and subject as the drive prints names,
+/// each side's form, the first field the two differ in and, for a payload, its first differing
+/// byte; a read list that differs names its first differing read. Prints
+/// `plain place: a refused put names CrateScope(020202020202): payload at byte 2, reads at UnitGraph(050505050505)`.
+#[test]
+fn a_refused_put_names_its_record_and_where_the_two_differ() {
+    use crate::store::{Clash, Form};
+    use blaze_drive::record::write_plain;
+    use blaze_drive::{Kind, Name};
+    let frame = bstd::mem::Frame::with_reserve(1 << 16, bstd::mem::Tag::Other).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
+    let name = Name::new(Kind::CrateScope, ContentId([2; 32]));
+    let graph = Name::new(Kind::UnitGraph, ContentId([5; 32]));
+    let held = write_plain(name, ContentId([6; 32]), ContentId([7; 32]), &[], &[1, 2, 3, 4], alloc);
+    let other = write_plain(name, ContentId([6; 32]), ContentId([7; 32]), &[], &[1, 2, 9, 4], alloc);
+    let lent = process(Sim::new(3, Faults::default()), 1, u64::MAX);
+    let mut place = PlainPlace::new(&lent, false);
+    place.put(key(1), false, &held).expect("the first put");
+    place.put(key(1), false, &held).expect("equal bytes under a held key are left as they are");
+    match place.put(key(1), false, &other) {
+        Err(PlaceError::Lent(LentError::TwoValues { held_own: true, differs_at: Some(_), .. })) => {}
+        put => panic!("other bytes under an own key were not refused with both sides: {put:?}"),
+    }
+    let kept = place.get(key(1)).expect("a get").map(|held| held.bytes);
+    let clash = Clash::of(kept, &other);
+    assert_eq!((clash.name, clash.held, clash.put, clash.field, clash.payload_at), (Some(name), Form::Whole, Form::Whole, "payload", Some(2)), "{clash}");
+    let shown = clash.to_string();
+    assert!(shown.starts_with(&std::format!("{name}")) && shown.contains("first differing in payload at payload byte 2"), "{shown}");
+    // Two reads lists under one key: the first read apart is named.
+    let a = write_plain(name, ContentId([6; 32]), ContentId([7; 32]), &[(graph, ContentId([8; 32]))], &[], alloc);
+    let b = write_plain(name, ContentId([6; 32]), ContentId([7; 32]), &[], &[], alloc);
+    let reads = Clash::of(Some(&a[..]), &b);
+    assert_eq!((reads.field, reads.names), ("reads", Some((Some(graph), None))), "{reads}");
+    println!("plain place: a refused put names {name}: payload at byte 2, reads at {graph}");
+}
+
 /// A crash at any point of a run of commands (the simulation's crash tears unsynced writes):
 /// every key the next process holds has its own value, never other bytes. Many seeds.
 #[test]
@@ -93,7 +139,7 @@ fn a_crash_loses_a_commands_records_but_never_serves_other_bytes() {
             sim = back(lent);
         }
         sim.crash();
-        let lent = process(sim, 99, u64::MAX);
+        let lent = process_in_boot(sim, 99, u64::MAX, 2);
         let place = PlainPlace::new(&lent, false);
         for n in 0..80 {
             match read(&place, n) {
@@ -120,8 +166,8 @@ fn pinned_after_compaction(plant: PlacePlant) -> (Vec<u32>, usize) {
     place.pin("program", &pinned).expect("a pin");
     place.commit().expect("the first commit");
     // More generations than the compaction's window, each a commit of its own.
-    for gen in 0..20u32 {
-        for n in 1000 + gen * 4..1004 + gen * 4 {
+    for round in 0..20u32 {
+        for n in 1000 + round * 4..1004 + round * 4 {
             place.put(key(n), false, &value(n)).expect("a put");
         }
         place.commit().expect("a later commit");

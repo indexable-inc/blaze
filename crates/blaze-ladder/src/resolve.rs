@@ -7,12 +7,10 @@
 //! A written path's leading `crate`, `self`, `super` and `::` are read by the library's
 //! `to_path`, so a path means here what it means to the library.
 
-use std::alloc::Global;
-use std::vec::Vec;
 
 use blaze_id::{CrateItemKey, ItemKey};
 use blaze_own::Alloc;
-use blaze_scope::names::{PathError, Why, Written};
+use blaze_scope::names::{PathError, Unheld, Why, Written};
 use blaze_scope::resolve::Names;
 use blaze_scope::task::to_path;
 use blaze_surface::{Def, DefKind, ItemDetail, ItemKind, Namespace};
@@ -100,8 +98,24 @@ impl<'n, S: NamesSource<'n>> Paths<S> {
     /// `segments` written in `module` (with a leading `::` when `abs`), its last segment looked
     /// up in `ns` and then in the other namespace.
     pub fn path(&self, module: ItemKey, abs: bool, segments: &[&str], ns: Ns) -> Result<Target, ResolveError> {
-        let krate = self.krate_key(module)?;
-        let written = to_path(abs, segments, krate, Alloc::global());
+        self.path_with(module, None, abs, segments, ns)
+    }
+
+    /// [`Self::path`], a first segment `$crate` (or the `crate` an item text writes for it)
+    /// naming `dollar` (the crate of its token's
+    /// mark: blaze-lower `mark_site::site_of`'s `dollar_crate`); `None`: the crate `module`
+    /// is in, the only answer a path of no expansion has.
+    pub fn path_with(&self, module: ItemKey, dollar: Option<CrateItemKey>, abs: bool, segments: &[&str], ns: Ns) -> Result<Target, ResolveError> {
+        let krate = match dollar {
+            Some(k) => k,
+            None => self.krate_key(module)?,
+        };
+        let mut written = to_path(abs, segments, krate, Alloc::global());
+        // token-mark-2: an item text writes `crate` for another crate's `$crate`; its mark's crate
+        // is `dollar` (blaze-lower `site_of` via blaze-scope `crate_roots::root_by_mark`).
+        if let (Some(k), false, Some(&"crate")) = (dollar, abs, segments.first()) {
+            written.kind = blaze_surface::PathKind::DollarCrate(k);
+        }
         let w = Written { kind: written.kind, segments: &written.segments };
         let first = match ns {
             Ns::Type => Namespace::Types,
@@ -211,18 +225,17 @@ impl<'n, S: NamesSource<'n>> Paths<S> {
     }
 
     /// The traits method resolution may use in `module`, sorted.
-    pub fn traits_in_scope(&self, module: ItemKey) -> Result<Vec<ItemKey, Global>, ResolveError> {
-        let found = self.names.traits_in_scope(module, Alloc::global()).map_err(ResolveError::Path)?;
-        let mut out = Vec::with_capacity_in(found.len(), Global);
-        out.extend_from_slice(&found);
-        Ok(out)
+    /// They are held in `alloc`, the caller's.
+    pub fn traits_in_scope<'b>(&self, module: ItemKey, alloc: Alloc<'b>) -> Result<blaze_own::AVec<'b, ItemKey>, ResolveError> {
+        self.names.traits_in_scope(module, alloc).map_err(ResolveError::Path)
     }
 
     /// The definition the macro path `segments` written in `module` names, as the names
     /// library holds it (`None`: a definition with no source record).
-    pub fn macro_body(&self, module: ItemKey, abs: bool, segments: &[&str]) -> Result<Option<blaze_scope::task::MacroBody<'n>>, ResolveError> {
+    /// `alloc` is the caller's scratch for the path as written.
+    pub fn macro_body(&self, module: ItemKey, abs: bool, segments: &[&str], alloc: Alloc<'_>) -> Result<Option<blaze_scope::task::MacroBody<'n>>, ResolveError> {
         let krate = self.krate_key(module)?;
-        let written = to_path(abs, segments, krate, Alloc::global());
+        let written = to_path(abs, segments, krate, alloc);
         let w = Written { kind: written.kind, segments: &written.segments };
         self.names.macro_body_of(module, w).map_err(ResolveError::Path)
     }
@@ -230,7 +243,7 @@ impl<'n, S: NamesSource<'n>> Paths<S> {
     /// The crate key of the crate `module` is in; a module of no crate the names hold is the
     /// library's `NotRead`.
     fn krate_key(&self, module: ItemKey) -> Result<CrateItemKey, ResolveError> {
-        let not_read = ResolveError::Path(PathError { module, at: 0, why: Why::NotRead { module } });
+        let not_read = ResolveError::Path(PathError { module, at: 0, why: Why::NotRead { module, layer: Unheld::Step } });
         match self.names.crate_of(module) {
             Some(c) => self.names.crate_key(c).ok_or(not_read),
             None => Err(not_read),

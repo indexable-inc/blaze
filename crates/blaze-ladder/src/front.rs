@@ -693,7 +693,7 @@ impl Names {
                     },
                 };
                 let safety = if unsafety { tc::Safety::Unsafe } else { tc::Safety::Safe };
-                let header = tc::FnPtrHeader { abi, safety };
+                let header = tc::FnPtrHeader { abi, safety, c_variadic: false };
                 let mut l: Vec<PTy, Global> = Vec::with_capacity_in(kids.len() + 1, Global);
                 l.extend_from_slice(kids);
                 if ret.is_none() {
@@ -1364,8 +1364,8 @@ impl Types for BodyTypes<'_> {
     }
 }
 
-fn lower_sig<'f>(text: &'f str, at: At, r: Range) -> Result<Lowered<'static, 'f>, Refusal> {
-    let lowered = blaze_lower::lower_signature(text, EDITION, &mut NoCfg, Alloc::global())
+fn lower_sig<'f>(text: &'f str, at: At, r: Range, alloc: Alloc<'static>) -> Result<Lowered<'static, 'f>, Refusal> {
+    let lowered = blaze_lower::lower_signature(text, EDITION, &mut NoCfg, alloc)
         .map_err(|need| Why::Unsupported("`cfg`", need.atoms.first().copied().unwrap_or(r)).at(at))?;
     check_lowered(&lowered.view(), at)?;
     Ok(lowered)
@@ -1416,6 +1416,9 @@ pub struct Front<'f> {
     pub entry: Option<usize>,
     /// The `blaze::` attributes read; handed to the caller by [`Front::new`].
     blaze_attrs: BlazeAttrs,
+    /// The program's allocator, from [`Front::new`]'s caller: its outlines, type table and
+    /// lowered bodies live in it, and a `where const` condition's scratch (`run::condition_holds`).
+    pub(crate) alloc: Alloc<'static>,
 }
 
 /// The shape an impl's self type is bucketed by; `None` for a blanket impl.
@@ -1449,10 +1452,11 @@ fn shape_of(t: PTys<'_>, p: PTy) -> Option<Shape> {
 impl<'f> Front<'f> {
     /// The program whose crate root is `root` among `files`, or the first refusal. Either way
     /// `blaze` gets the `blaze::` attributes read up to there (all of them when it is a program).
-    pub fn new(files: &'f [SourceFile<'f>], root: &str, blaze: &mut BlazeAttrs) -> Result<Front<'f>, Refusal> {
+    /// `alloc` is the caller's, handed down from its entry; the program's tables live in it.
+    pub fn new(files: &'f [SourceFile<'f>], root: &str, blaze: &mut BlazeAttrs, alloc: Alloc<'static>) -> Result<Front<'f>, Refusal> {
         let mut outlines: Vec<Outline<'static>, Global> = Vec::with_capacity_in(files.len(), Global);
         for (i, f) in files.iter().enumerate() {
-            let o = blaze_file_items::outline(f.text, EDITION, Alloc::global());
+            let o = blaze_file_items::outline(f.text, EDITION, alloc);
             if let Some(e) = o.errors().first() {
                 return Err(Refusal {
                     file: Some(i as u32),
@@ -1479,7 +1483,7 @@ impl<'f> Front<'f> {
         })?;
         let mut front = Front {
             files,
-            tys: PortableTys::new_in(Alloc::global()),
+            tys: PortableTys::new_in(alloc),
             names: Names {
                 modules: Vec::new_in(Global),
                 scope: HashMap::new_in(Global),
@@ -1504,6 +1508,7 @@ impl<'f> Front<'f> {
             inherent: HashMap::new_in(Global),
             entry: None,
             blaze_attrs: BlazeAttrs::default(),
+            alloc,
         };
         let filled = front.fill(&outlines, root_file as u32);
         *blaze = core::mem::take(&mut front.blaze_attrs);
@@ -1595,6 +1600,7 @@ impl<'f> Front<'f> {
 
     /// Every item of every module: its key, its name bound, its signature lowered.
     fn collect(&mut self, outlines: &[Outline<'static>]) -> Result<Collected<'f>, Refusal> {
+        let alloc = self.alloc;
         let mut c = Collected {
             adts: Vec::new_in(Global),
             traits: Vec::new_in(Global),
@@ -1619,7 +1625,7 @@ impl<'f> Front<'f> {
                     ItemDetail::Fn { .. } => {
                         let name = name.unwrap_or("");
                         let key = kind_key(1, name, item.disambiguator);
-                        let sig = lower_sig(item_text, at, whole)?;
+                        let sig = lower_sig(item_text, at, whole, alloc)?;
                         let row = self.fn_row(key, name, self.item_path(m, name), at, item_text, FnKind::Free, None, Env::new(m), 0, sig)?;
                         let i = self.fns.len() as u32;
                         self.fns.push(row);
@@ -1628,7 +1634,7 @@ impl<'f> Front<'f> {
                     ItemDetail::Const { .. } => {
                         let name = name.unwrap_or("");
                         let key = kind_key(6, name, item.disambiguator);
-                        let sig = lower_sig(item_text, at, whole)?;
+                        let sig = lower_sig(item_text, at, whole, alloc)?;
                         let row = self.fn_row(key, name, self.item_path(m, name), at, item_text, FnKind::Const, None, Env::new(m), 0, sig)?;
                         let i = self.fns.len() as u32;
                         self.fns.push(row);
@@ -1637,7 +1643,7 @@ impl<'f> Front<'f> {
                     ItemDetail::Static { .. } => {
                         let name = name.unwrap_or("");
                         let key = kind_key(8, name, item.disambiguator);
-                        let sig = lower_sig(item_text, at, whole)?;
+                        let sig = lower_sig(item_text, at, whole, alloc)?;
                         let row = self.fn_row(key, name, self.item_path(m, name), at, item_text, FnKind::Static, None, Env::new(m), 0, sig)?;
                         let i = self.fns.len() as u32;
                         self.fns.push(row);
@@ -1646,7 +1652,7 @@ impl<'f> Front<'f> {
                     ItemDetail::Struct | ItemDetail::Enum => {
                         let name = name.unwrap_or("");
                         let key = kind_key(2, name, item.disambiguator);
-                        let sig = lower_sig(item_text, at, whole)?;
+                        let sig = lower_sig(item_text, at, whole, alloc)?;
                         let a = self.adt_head(key, name, &sig.view(), at)?;
                         let i = self.names.adts.len() as u32;
                         self.names.adts.push(a);
@@ -1656,7 +1662,7 @@ impl<'f> Front<'f> {
                     ItemDetail::Trait => {
                         let name = name.unwrap_or("");
                         let key = kind_key(3, name, item.disambiguator);
-                        let sig = lower_sig(item_text, at, whole)?;
+                        let sig = lower_sig(item_text, at, whole, alloc)?;
                         let v = sig.view();
                         if v.head[head::FLAGS] & (sig::AUTO | sig::TRAIT_ALIAS) != 0 {
                             return Err(Why::Unsupported("an auto trait or a trait alias", whole).at(at));
@@ -1690,7 +1696,7 @@ impl<'f> Front<'f> {
                             match child.detail {
                                 ItemDetail::Fn { .. } => {
                                     let ckey = member_key(key, 1, cname);
-                                    let csig = lower_sig(ctext, cat, cwhole)?;
+                                    let csig = lower_sig(ctext, cat, cwhole, alloc)?;
                                     let path = self.item_path(m, &format!("{name}::{cname}"));
                                     let row = self.fn_row(ckey, cname, path, cat, ctext, FnKind::Trait(ti), Some(key), env.clone(), own + 1, csig)?;
                                     head_.fns.push((Name::of(cname), ckey));
@@ -1699,7 +1705,7 @@ impl<'f> Front<'f> {
                                     self.members.insert((key, Name::of(cname)), i);
                                 }
                                 ItemDetail::TypeAlias => {
-                                    let csig = lower_sig(ctext, cat, cwhole)?;
+                                    let csig = lower_sig(ctext, cat, cwhole, alloc)?;
                                     let cv = csig.view();
                                     if cv.head_opt(head::TY).is_some() {
                                         return Err(Why::Unsupported("an associated type's default", cwhole).at(cat));
@@ -1719,7 +1725,7 @@ impl<'f> Front<'f> {
                     ItemDetail::Impl => {
                         let key = kind_key(4, "", impls_seen);
                         impls_seen += 1;
-                        let sig = lower_sig(item_text, at, whole)?;
+                        let sig = lower_sig(item_text, at, whole, alloc)?;
                         let v = sig.view();
                         if v.head[head::FLAGS] & sig::NEGATIVE != 0 {
                             return Err(Why::Unsupported("a negative impl", whole).at(at));
@@ -1741,7 +1747,7 @@ impl<'f> Front<'f> {
                             match child.detail {
                                 ItemDetail::Fn { .. } => {
                                     let ckey = member_key(key, 1, cname);
-                                    let csig = lower_sig(ctext, cat, cwhole)?;
+                                    let csig = lower_sig(ctext, cat, cwhole, alloc)?;
                                     let row = self.fn_row(ckey, cname, cname.into(), cat, ctext, FnKind::Impl(ii), Some(key), env.clone(), generics, csig)?;
                                     let i = self.fns.len() as u32;
                                     fns.push(i);
@@ -1749,7 +1755,7 @@ impl<'f> Front<'f> {
                                     self.members.insert((key, Name::of(cname)), i);
                                 }
                                 ItemDetail::TypeAlias => {
-                                    let csig = lower_sig(ctext, cat, cwhole)?;
+                                    let csig = lower_sig(ctext, cat, cwhole, alloc)?;
                                     assoc.push((Name::of(cname), Pending { at: cat, text: ctext, sig: csig, module: m }));
                                 }
                                 _ => return Err(Why::Unsupported(detail_name(child.detail), cwhole).at(cat)),
@@ -1777,7 +1783,7 @@ impl<'f> Front<'f> {
                                 return Err(Why::Unsupported(detail_name(child.detail), cwhole).at(cat));
                             };
                             let ckey = kind_key(5, cname, child.disambiguator);
-                            let csig = lower_sig(ctext, cat, cwhole)?;
+                            let csig = lower_sig(ctext, cat, cwhole, alloc)?;
                             let mut row = self.fn_row(ckey, cname, self.item_path(m, cname), cat, ctext, FnKind::Foreign, None, Env::new(m), 0, csig)?;
                             row.abi = abi;
                             let i = self.fns.len() as u32;
@@ -1835,7 +1841,7 @@ impl<'f> Front<'f> {
             },
         };
         let safety = if flags & sig::UNSAFE != 0 { tc::Safety::Unsafe } else { tc::Safety::Safe };
-        let header = tc::FnPtrHeader { abi: type_abi, safety };
+        let header = tc::FnPtrHeader { abi: type_abi, safety, c_variadic: false };
         let export = match (attrs.export_name, attrs.no_mangle) {
             (Some(e), _) => Some(e.into()),
             (None, true) => Some(name.into()),
@@ -2498,14 +2504,14 @@ impl<'f> Front<'f> {
             // world); until then an identifier pattern here binds (front2 answers: body.rs
             // `ModuleValues`).
             let lowered = match row.condition {
-                Some(r) => blaze_lower::lower_anon_const(text, r, EDITION, &mut NoCfg, &mut blaze_lower::NoModule, Alloc::global()),
-                None => blaze_lower::lower_body(text, EDITION, &mut NoCfg, &mut blaze_lower::NoModule, Alloc::global()),
+                Some(r) => blaze_lower::lower_anon_const(text, r, EDITION, &mut NoCfg, &mut blaze_lower::NoModule, self.alloc),
+                None => blaze_lower::lower_body(text, EDITION, &mut NoCfg, &mut blaze_lower::NoModule, self.alloc),
             }
             .map_err(|need| Why::Unsupported("`cfg`", need.atoms.first().copied().unwrap_or(whole)).at(at))?;
             let view = lowered.view();
             check_lowered(&view, at)?;
             let mut types = BodyTypes { names: &self.names, env: &self.fns[i].env, failed: None };
-            let body = match to_typeck(&view, key, &mut self.tys, &mut types, Alloc::global()) {
+            let body = match to_typeck(&view, key, &mut self.tys, &mut types, self.alloc) {
                 Ok(b) => b,
                 Err(Refused::Form { what, range }) => {
                     return Err(match types.failed.take() {
@@ -2653,6 +2659,7 @@ impl<'f> Front<'f> {
             self_param: f.self_param,
             header: f.header,
             c_variadic: false,
+            legacy_const_generics: &[],
             inputs: &f.inputs,
             output: f.output,
             types: self.tys.view(),

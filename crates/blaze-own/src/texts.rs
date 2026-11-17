@@ -16,7 +16,7 @@ use crate::{
 /// The type named in a refusal, saying the limit.
 const WHAT: &str = "Texts bytes (ends are u32: at most u32::MAX bytes)";
 
-/// Strings end to end in one buffer, in push order ([module](self)).
+/// Strings end to end in one buffer, in push order ([module](self)): two blocks in all, 4 bytes a string past its text.
 pub struct Texts<A: Allocator> {
     /// Every string's bytes, end to end; each run between two ends is UTF-8.
     bytes: Vec<u8, A>,

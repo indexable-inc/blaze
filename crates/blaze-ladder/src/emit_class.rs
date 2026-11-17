@@ -19,6 +19,14 @@ pub(crate) fn emit_class(error: &EmitError) -> Box<str> {
         EmitError::Record { why } => format!("emit: Record: {why}"),
         EmitError::TooLarge { what } => format!("emit: TooLarge: {what}"),
         EmitError::NoVia { place: _ } => "emit: NoVia".to_owned(),
+        // By the op and the form legalize names, or the routine: never the instruction number.
+        EmitError::Legalize(why) => match why {
+            blaze_lir::legalize::LegalizeError::Refused { inst: _, op, what } => format!("emit: Legalize: `{}`: {what}", op.name()),
+            blaze_lir::legalize::LegalizeError::NoRoutine(r) => format!("emit: Legalize: the routine `{}` is not bound", r.symbol()),
+            blaze_lir::legalize::LegalizeError::Scalable => "emit: Legalize: a scalable vector".to_owned(),
+            blaze_lir::legalize::LegalizeError::Full { table } => format!("emit: Legalize: the output's {table} is full"),
+            blaze_lir::legalize::LegalizeError::Verify(_) => "emit: Legalize: its output is not LIR".to_owned(),
+        },
     }
     .into_boxed_str()
 }

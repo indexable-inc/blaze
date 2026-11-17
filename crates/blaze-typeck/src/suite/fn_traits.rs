@@ -48,7 +48,7 @@ fn world() -> (Fx, Items) {
     let sized = fx.tr("Sized", 1, Vec::new(), &[]);
     fx.lang(LangItem::Sized, sized);
     let (p0, p1) = (fx.param(0), fx.param(1));
-    let rust_call = FnPtrHeader { abi: Abi::RustCall, safety: Safety::Safe };
+    let rust_call = FnPtrHeader { abi: Abi::RustCall, safety: Safety::Safe, c_variadic: false };
 
     let fn_once = fx.tr("FnOnce", 2, Vec::new(), &["Output"]);
     fx.lang(LangItem::FnOnce, fn_once);
@@ -90,7 +90,7 @@ fn world() -> (Fx, Items) {
 
     fx.func("k", 0, &[u8_], u16_, Vec::new());
     let u = fx.func("u", 0, &[u8_], u16_, Vec::new());
-    fx.set_header(u, FnPtrHeader { abi: Abi::Rust, safety: Safety::Unsafe });
+    fx.set_header(u, FnPtrHeader { abi: Abi::Rust, safety: Safety::Unsafe, c_variadic: false });
     let rc = fx.func("rc", 0, &[args], u16_, Vec::new());
     fx.set_header(rc, rust_call);
     let main = fx.func("main", 0, &[], unit, Vec::new());

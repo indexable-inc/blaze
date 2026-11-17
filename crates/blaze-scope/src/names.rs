@@ -19,26 +19,39 @@ use core::fmt;
 use blaze_id::{CrateItemKey, ItemKey};
 use blaze_own::{AVec, Alloc};
 use blaze_surface::{
-    BindingState, CrateRootBuilder, Def, DefKind, Edition, Namespace, Node, Passed, PathKind, RefusedWhy, ScopeBuilder, ScopeError,
-    Sources, Through, Visibility, through,
+    BindingState, Def, DefKind, Edition, Namespace, Node, Passed, PathKind, RefusedWhy, Sources, Through, Visibility, through,
 };
 
 use crate::builtin::builtin_type_in;
 use crate::facts::Name;
-use crate::task::Variant;
 
-/// The finished records a path is read through.
+mod seam;
+pub use seam::{RootRead, ScopeRead, VariantHit, variant_in};
+
+/// The finished records a path is read through: the working forms of a fresh solve
+/// (`&ScopeBuilder`, `&CrateRootBuilder`) or a names record's views of its own bytes
+/// (`ScopeView`, `CrateRootView`, made in O(1) and searched in place, D114 rule 1). One walk
+/// reads both ([`seam`]).
 pub trait World<N> {
+    /// A module's scope as this world holds it.
+    type Scope<'w>: ScopeRead<'w, N>
+    where
+        Self: 'w;
+    /// A crate's root as this world holds it.
+    type Root<'w>: RootRead<N>
+    where
+        Self: 'w;
     /// The module's finished scope, or `None` when no record of it is held.
-    fn scope(&self, module: ItemKey) -> Option<&ScopeBuilder<'_, N>>;
+    fn scope(&self, module: ItemKey) -> Option<Self::Scope<'_>>;
     /// The module's chain up to its crate's root, itself first.
     fn chain(&self, module: ItemKey) -> Option<&[ItemKey]>;
     /// The root record of the crate `key` (any item of it) is of.
-    fn root_of(&self, key: ItemKey) -> Option<&CrateRootBuilder<'_, N>>;
+    fn root_of(&self, key: ItemKey) -> Option<Self::Root<'_>>;
     /// The root record of the crate.
-    fn root(&self, krate: CrateItemKey) -> Option<&CrateRootBuilder<'_, N>>;
-    /// An enum's variants, or `None` when `owner` is no enum held.
-    fn variants(&self, owner: ItemKey) -> Option<&[Variant<N>]>;
+    fn root(&self, krate: CrateItemKey) -> Option<Self::Root<'_>>;
+    /// The variant of the enum `owner` named `name`: `None` when `owner` is no enum held,
+    /// `Some(None)` when it is one with no such variant.
+    fn variant(&self, owner: ItemKey, name: N) -> Option<Option<VariantHit>>;
     /// Whether `module` or an ancestor is `#[no_implicit_prelude]`.
     fn no_implicit_prelude(&self, module: ItemKey) -> bool;
     /// Whether `module` is a block's module ([`crate::blocks::is_block_module`]): anonymous,
@@ -60,7 +73,7 @@ fn written_up<N: Name, W: World<N>>(world: &W, chain: &[ItemKey], n: u8) -> Opti
 /// front2 block_traits.rs). `NotRead`: `module`'s chain is not held; `SuperPastRoot`: past
 /// the crate's root.
 pub fn written_module<N: Name, W: World<N>>(world: &W, module: ItemKey, n: u8) -> Result<ItemKey, PathError> {
-    let chain = world.chain(module).ok_or(PathError { module, at: 0, why: Why::NotRead { module } })?;
+    let chain = world.chain(module).ok_or(PathError { module, at: 0, why: Why::NotRead { module, layer: Unheld::Step } })?;
     written_up::<N, W>(world, chain, n).ok_or(PathError { module, at: 0, why: Why::SuperPastRoot })
 }
 
@@ -78,16 +91,37 @@ pub enum Why {
     /// `super` past the crate's root.
     SuperPastRoot,
     /// The records a step needs are not held: a crate whose source is not read yet (a
-    /// dependency not fetched), never the user's error.
-    NotRead { module: ItemKey },
+    /// dependency not fetched), never the user's error. `module` is the one not held; `layer`
+    /// is which of the walk's layers it was.
+    NotRead { module: ItemKey, layer: Unheld },
     /// A lookup through globs past its bound (rule 18).
     Unbounded,
     /// The path has no segments.
     Empty,
     /// No binding of the segment in `module`, whose macro call `call` was refused (its scope
-    /// holds [`ScopeError::Refused`]): the name may be one the call would have written, so it
+    /// holds [`blaze_surface::ScopeError::Refused`]): the name may be one the call would have written, so it
     /// is unknown because of that call, never "not found" (rules 3 and 19).
     Refused { module: ItemKey, call: ItemKey, why: RefusedWhy },
+}
+
+/// Which layer of a walk met records not held ([`Why::NotRead`]). A reader that knows what a
+/// layer can bind decides by it what the answer would have been (the items record's writer:
+/// the standard prelude binds no type named like a builtin, buckets.rs `filing`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unheld {
+    /// A module or enum the walk stands in or steps into: the module the path is written in, a
+    /// module or enum a segment names, a `$crate`'s root.
+    Step,
+    /// A module a glob import reaches (`use dep::*;`, `dep` not read): it may bind any name, so
+    /// nothing at or after this layer is known.
+    Glob,
+    /// A `#[macro_use]` crate's root (a macro path's layer).
+    MacroUse,
+    /// The standard prelude (the crate root's prelude module, or a module its globs reach),
+    /// with every nearer layer read and binding nothing of the name. `builtin`: the builtin
+    /// type the name is in the one layer after the prelude, the builtin types (a first segment
+    /// looked up in the type namespace that names one), else `None`.
+    Prelude { builtin: Option<ItemKey> },
 }
 
 /// A path that did not resolve: the module it is written in, the failing segment, and why.
@@ -121,10 +155,8 @@ impl fmt::Display for PathError {
 
 /// The first refused macro call of `module`'s scope (none held: `None`), as [`Why::Refused`].
 fn refused_in<N: Name, W: World<N>>(world: &W, module: ItemKey) -> Option<Why> {
-    world.scope(module)?.errors.iter().find_map(|e| match e {
-        ScopeError::Refused { call, why, .. } => Some(Why::Refused { module, call: *call, why: *why }),
-        _ => None,
-    })
+    let (call, why) = world.scope(module)?.refused()?;
+    Some(Why::Refused { module, call, why })
 }
 
 /// A path as written: how it begins and its segments.
@@ -187,13 +219,14 @@ pub fn path<N: Name, W: World<N>>(world: &W, module: ItemKey, ns: Namespace, pat
 fn walk<N: Name, W: World<N>>(world: &W, module: ItemKey, ns: Namespace, path: Written<'_, N>, alloc: Alloc<'_>) -> Result<Resolved, PathError> {
     let fail = |at: usize, why: Why| PathError { module, at, why };
     let last = path.segments.len().checked_sub(1).ok_or(fail(0, Why::Empty))?;
-    let chain = world.chain(module).ok_or(fail(0, Why::NotRead { module }))?;
-    let root = world.root_of(module).ok_or(fail(0, Why::NotRead { module }))?;
+    let chain = world.chain(module).ok_or(fail(0, Why::NotRead { module, layer: Unheld::Step }))?;
+    let root = world.root_of(module).ok_or(fail(0, Why::NotRead { module, layer: Unheld::Step }))?;
+    let head = root.head();
     // Where the walk starts: a module named by the path's head, or the lexical layers.
     let (mut current, first) = match path.kind {
         // `::x` in edition 2015 is the crate root's `x`.
-        PathKind::Abs if root.head.edition == Edition::E2015 => (Some(root.head.root_module), 0),
-        PathKind::Crate => (Some(root.head.root_module), 0),
+        PathKind::Abs if head.edition == Edition::E2015 => (Some(head.root_module), 0),
+        PathKind::Crate => (Some(head.root_module), 0),
         // A written `self` or `super` passes over blocks' modules ([`written_up`]).
         PathKind::SelfMod => match written_up::<N, W>(world, chain, 0) {
             Some(m) => (Some(m), 0),
@@ -204,17 +237,14 @@ fn walk<N: Name, W: World<N>>(world: &W, module: ItemKey, ns: Namespace, path: W
             None => return Err(fail(0, Why::SuperPastRoot)),
         },
         PathKind::DollarCrate(krate) => match world.root(krate) {
-            Some(r) => (Some(r.head.root_module), 0),
-            None => return Err(fail(0, Why::NotRead { module })),
+            Some(r) => (Some(r.head().root_module), 0),
+            None => return Err(fail(0, Why::NotRead { module, layer: Unheld::Step })),
         },
-        PathKind::Abs => {
-            let name = path.segments[0];
-            match root.extern_prelude.binary_search_by(|(n, _)| n.cmp(&name)) {
-                Ok(at) if last > 0 => (Some(root.extern_prelude[at].1), 1),
-                Ok(at) => return Ok(Resolved { def: Def::module(root.extern_prelude[at].1), consumed: 1 }),
-                Err(_) => return Err(fail(0, Why::NotFound)),
-            }
-        }
+        PathKind::Abs => match root.extern_crate(path.segments[0]) {
+            Some(krate_root) if last > 0 => (Some(krate_root), 1),
+            Some(krate_root) => return Ok(Resolved { def: Def::module(krate_root), consumed: 1 }),
+            None => return Err(fail(0, Why::NotFound)),
+        },
         PathKind::Plain => (None, 0),
     };
     for at in first..=last {
@@ -228,14 +258,14 @@ fn walk<N: Name, W: World<N>>(world: &W, module: ItemKey, ns: Namespace, path: W
                 // a whole one-segment path in the type namespace is a type position; as a prefix
                 // (`str::from_utf8`) the module stands. A struct, enum, alias or trait of the name
                 // still shadows the built-in (Reference, "Preludes": prelude names may be shadowed).
-                match builtin_type_in(name.as_ref(), root.head.arbitrary_ints) {
+                match builtin_type_in(name.as_ref(), head.arbitrary_ints) {
                     Some(builtin) if last == 0 && ns == Namespace::Types && def.kind == DefKind::Module => builtin,
                     _ => def,
                 }
             }
             Some(m) => match name.as_ref() {
                 "super" => {
-                    let c = world.chain(m).ok_or(fail(at, Why::NotRead { module: m }))?;
+                    let c = world.chain(m).ok_or(fail(at, Why::NotRead { module: m, layer: Unheld::Step }))?;
                     Def::module(written_up::<N, W>(world, c, 1).ok_or(fail(at, Why::SuperPastRoot))?)
                 }
                 "self" => Def::module(m),
@@ -245,7 +275,7 @@ fn walk<N: Name, W: World<N>>(world: &W, module: ItemKey, ns: Namespace, path: W
                         Some(p) => p,
                         None => return Err(fail(at, refused_in(world, m).unwrap_or(Why::NotFound))),
                     };
-                    if !visible(p.vis, chain, root.head.krate) {
+                    if !visible(p.vis, chain, head.krate) {
                         return Err(fail(at, Why::Private));
                     }
                     p.def
@@ -261,9 +291,9 @@ fn walk<N: Name, W: World<N>>(world: &W, module: ItemKey, ns: Namespace, path: W
             DefKind::Enum => {
                 // `Enum::Variant` when the next segment is a variant; else `Enum::assoc`, the
                 // type checker's.
-                let variants = world.variants(def.key).ok_or(fail(at, Why::NotRead { module: def.key }))?;
+                let hit = world.variant(def.key, path.segments[at + 1]).ok_or(fail(at, Why::NotRead { module: def.key, layer: Unheld::Step }))?;
                 let next_ns = if at + 1 == last { ns } else { Namespace::Types };
-                return Ok(match variant(variants, next_ns, path.segments[at + 1]) {
+                return Ok(match hit.and_then(|v| fits(v, next_ns)) {
                     Some(v) => Resolved { def: v, consumed: at + 2 },
                     None => here,
                 });
@@ -280,11 +310,11 @@ pub fn macro_path<N: Name, W: World<N>>(world: &W, module: ItemKey, written: Wri
     match path(world, module, Namespace::Macros, written, alloc).map(|r| r.whole(written.segments.len())) {
         Ok(None) => MacroRes::NotFound,
         Ok(Some(def)) => match world.root_of(def.key) {
-            Some(r) => MacroRes::Found { krate: r.head.krate, item: def.key },
+            Some(r) => MacroRes::Found { krate: r.head().krate, item: def.key },
             None => MacroRes::NotRead { module: def.key },
         },
         Err(PathError { why: Why::Ambiguous, .. }) => MacroRes::Ambiguous,
-        Err(PathError { why: Why::NotRead { module }, .. }) => MacroRes::NotRead { module },
+        Err(PathError { why: Why::NotRead { module, .. }, .. }) => MacroRes::NotRead { module },
         Err(_) => MacroRes::NotFound,
     }
 }
@@ -298,7 +328,7 @@ pub fn traits_in_scope<'a, N: Name, W: World<N>>(world: &W, module: ItemKey, all
     let mut stack: AVec<'a, ItemKey> = AVec::new_in(alloc.clone());
     stack.push(module);
     if !world.no_implicit_prelude(module) {
-        if let Some(prelude) = world.root_of(module).and_then(|r| r.head.prelude) {
+        if let Some(prelude) = world.root_of(module).and_then(|r| r.head().prelude) {
             stack.push(prelude);
         }
     }
@@ -309,19 +339,12 @@ pub fn traits_in_scope<'a, N: Name, W: World<N>>(world: &W, module: ItemKey, all
         seen.push(m);
         let Some(scope) = world.scope(m) else {
             if m == module {
-                return Err(PathError { module, at: 0, why: Why::NotRead { module } });
+                return Err(PathError { module, at: 0, why: Why::NotRead { module, layer: Unheld::Step } });
             }
             continue;
         };
-        for entry in scope.bindings.iter() {
-            if entry.ns == Namespace::Types && entry.binding.def.kind == DefKind::Trait {
-                out.push(entry.binding.def.key);
-            }
-        }
-        for anon in scope.traits.iter() {
-            out.push(anon.def.key);
-        }
-        for edge in scope.globs.iter() {
+        scope.each_trait(&mut |key| out.push(key));
+        for edge in scope.globs().iter() {
             if edge.source.kind == DefKind::Module {
                 stack.push(edge.source.key);
             }
@@ -333,17 +356,18 @@ pub fn traits_in_scope<'a, N: Name, W: World<N>>(world: &W, module: ItemKey, all
 }
 
 /// The first segment of a plain path: the lexical layers, in order.
-fn lexical<N: Name, W: World<N>>(
-    world: &W,
+fn lexical<'w, N: Name, W: World<N>>(
+    world: &'w W,
     module: ItemKey,
     chain: &[ItemKey],
-    root: &CrateRootBuilder<'_, N>,
+    root: W::Root<'w>,
     ns: Namespace,
     name: N,
     alloc: Alloc<'_>,
 ) -> Result<Def, Why> {
+    let head = root.head();
     match name.as_ref() {
-        "crate" => return Ok(Def::module(root.head.root_module)),
+        "crate" => return Ok(Def::module(head.root_module)),
         "self" => return written_up::<N, W>(world, chain, 0).map(Def::module).ok_or(Why::SuperPastRoot),
         "super" => return written_up::<N, W>(world, chain, 1).map(Def::module).ok_or(Why::SuperPastRoot),
         _ => {}
@@ -354,12 +378,8 @@ fn lexical<N: Name, W: World<N>>(
         let mut child: Option<ItemKey> = None;
         for m in chain.iter() {
             if let Some(scope) = world.scope(*m) {
-                let end = match child {
-                    None => scope.textual.len(),
-                    Some(c) => scope.marks.iter().find(|mark| mark.child == c).map_or(0, |mark| mark.len as usize),
-                };
-                if let Some(def) = scope.textual[..end.min(scope.textual.len())].iter().rev().find(|d| d.name == name) {
-                    return Ok(Def { key: def.def, kind: DefKind::Macro(def.shapes) });
+                if let Some((key, shapes)) = scope.textual(child, name) {
+                    return Ok(Def { key, kind: DefKind::Macro(shapes) });
                 }
             }
             child = Some(*m);
@@ -369,31 +389,39 @@ fn lexical<N: Name, W: World<N>>(
         return Ok(p.def);
     }
     if ns == Namespace::Macros {
-        for krate_root in root.macro_use.iter() {
-            let Some(other) = world.root_of(*krate_root) else { return Err(Why::NotRead { module: *krate_root }) };
-            if let Ok(at) = other.macro_exports.binary_search_by(|(n, _, _)| n.as_ref().cmp(name.as_ref())) {
-                let (_, key, shapes) = other.macro_exports[at];
+        let mut i = 0;
+        while let Some(krate_root) = root.macro_use(i) {
+            let Some(other) = world.root_of(krate_root) else { return Err(Why::NotRead { module: krate_root, layer: Unheld::MacroUse }) };
+            if let Some((key, shapes)) = other.macro_export(name) {
                 return Ok(Def { key, kind: DefKind::Macro(shapes) });
             }
+            i += 1;
         }
     }
     if ns == Namespace::Types {
-        if let Ok(at) = root.extern_prelude.binary_search_by(|(n, _)| n.as_ref().cmp(name.as_ref())) {
-            return Ok(Def::module(root.extern_prelude[at].1));
+        if let Some(krate_root) = root.extern_crate(name) {
+            return Ok(Def::module(krate_root));
         }
     }
+    let builtin = if ns == Namespace::Types { builtin_type_in(name.as_ref(), head.arbitrary_ints) } else { None };
     if !world.no_implicit_prelude(module) {
-        if let Some(prelude) = root.head.prelude {
+        if let Some(prelude) = head.prelude {
+            let unheld = Unheld::Prelude { builtin: builtin.map(|d| d.key) };
             if world.scope(prelude).is_none() {
-                return Err(Why::NotRead { module: prelude });
+                return Err(Why::NotRead { module: prelude, layer: unheld });
             }
-            if let Some(p) = in_source(world, Def::module(prelude), ns, name, alloc)? {
+            let found = in_source(world, Def::module(prelude), ns, name, alloc).map_err(|why| match why {
+                // A glob of the prelude's into a module not held is still the prelude's layer.
+                Why::NotRead { module, .. } => Why::NotRead { module, layer: unheld },
+                why => why,
+            })?;
+            if let Some(p) = found {
                 return Ok(p.def);
             }
         }
     }
     if ns == Namespace::Types {
-        if let Some(def) = builtin_type_in(name.as_ref(), root.head.arbitrary_ints) {
+        if let Some(def) = builtin {
             return Ok(def);
         }
     }
@@ -411,32 +439,34 @@ fn in_source<N: Name, W: World<N>>(world: &W, source: Def, ns: Namespace, name: 
     impl<'w, N: Name + 'w, W: World<N>> Sources<'w> for Records<'w, N, W> {
         type Stop = ItemKey;
         fn node(&mut self, source: Def) -> Result<Node<'w>, ItemKey> {
+            let world: &'w W = self.world;
             if source.kind == DefKind::Enum {
-                let variants = self.world.variants(source.key).ok_or(source.key)?;
-                let found = variant(variants, self.ns, self.name);
+                let hit = world.variant(source.key, self.name).ok_or(source.key)?;
+                let found = hit.and_then(|v| fits(v, self.ns));
                 return Ok(Node::Value(found.map(|def| Passed { def, vis: Visibility::Public, state: BindingState::Determined })));
             }
-            let scope = self.world.scope(source.key).ok_or(source.key)?;
+            let scope = world.scope(source.key).ok_or(source.key)?;
             if let Some(b) = scope.get(self.ns, self.name) {
                 return Ok(Node::Value(Some(Passed { def: b.def, vis: b.vis, state: b.state })));
             }
-            let chain = self.world.chain(source.key).ok_or(source.key)?;
-            let krate = self.world.root_of(source.key).ok_or(source.key)?.head.krate;
-            Ok(Node::Edges { edges: &scope.globs, krate, chain })
+            let chain = world.chain(source.key).ok_or(source.key)?;
+            let krate = world.root_of(source.key).ok_or(source.key)?.head().krate;
+            Ok(Node::Edges { edges: scope.globs(), krate, chain })
         }
     }
     let mut sources = Records { world, ns, name };
     match through(&mut sources, source, alloc) {
         Ok(Some(p)) if matches!(p.state, BindingState::Ambiguous(_)) => Err(Why::Ambiguous),
         Ok(found) => Ok(found),
-        Err(Through::Stop(module)) => Err(Why::NotRead { module }),
+        // `source` itself not held is the walk's own step; a module behind its globs is a glob's.
+        Err(Through::Stop(module)) => Err(Why::NotRead { module, layer: if module == source.key { Unheld::Step } else { Unheld::Glob } }),
         Err(Through::Unbounded) => Err(Why::Unbounded),
     }
 }
 
-/// A variant of `variants` by name: a record variant is a type only, any other a value too.
-fn variant<N: Name>(variants: &[Variant<N>], ns: Namespace, name: N) -> Option<Def> {
-    let v = variants.iter().find(|v| v.name.as_ref() == name.as_ref())?;
+/// A variant found by name, as a definition in `ns`: a record variant is a type only, any other
+/// a value too.
+fn fits(v: VariantHit, ns: Namespace) -> Option<Def> {
     let fits = match ns {
         Namespace::Types => true,
         Namespace::Values => !v.record,

@@ -33,6 +33,8 @@ blaze-ed25519.workspace = true
 ring = { workspace = true, optional = true }
 # The HTTP driver: blaze-http's sans-IO client on its driver on blaze-core's effects.
 blaze-http = { workspace = true, optional = true }
+# blaze's one channel (`chan`), on which the HTTP driver hands back each ask's answer.
+blaze-core = { workspace = true, optional = true }
 # The allocator as a value (`Alloc<'_>`) and the owning types the read path keeps its tables in.
 blaze-own.workspace = true
 # Settings and the commands' typed input.
@@ -45,7 +47,7 @@ blaze-json.workspace = true
 # brings no TLS or QUIC stack (remote-read.md).
 default = ["bucket"]
 # A bucket's drivers sign every request (SigV4) and a pusher signs what it pushes.
-bucket = ["dep:blaze-http", "blaze-http/h3", "sign"]
+bucket = ["dep:blaze-http", "dep:blaze-core", "blaze-http/h3", "sign"]
 # Code that holds a secret key: `Signer`, pushing (`push`, `cmd`, `settings`, `s3`), the
 # encoders of signed objects, and `read::publish`. Off, nothing of `ring` is linked; every
 # verification is on in both shapes.

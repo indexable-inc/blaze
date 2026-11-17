@@ -261,7 +261,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 for fi in b.field_init_list(fields)? {
                     exprs.push(fi.expr);
                 }
-                exprs.extend(base);
+                exprs.extend(base.expr());
             }
             Expr::Index { base, index } => {
                 exprs.push(base);

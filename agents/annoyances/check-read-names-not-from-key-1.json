@@ -1,0 +1,14 @@
+{
+ "id": "check-read-names-not-from-key-1",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), write-only lane R8 (`blaze check` correct on hello world and tempo)",
+ "where": "crates/blaze-drive/src/request.rs (the BodyCheck/Signature key fold), crates/blaze-cli/src/body_types/heads.rs, crates/blaze-ladder/src/front2/{project/head_digest.rs,borrows.rs,check.rs}",
+ "what": "Two TwoValues refusals of one class: a BodyCheck's or Signature's READ NAMES are not a function of its task key. B (hello world run then check): the CrateScope names follow from the crate list, which the key did not hold (fixed: the UnitGraph out is folded in, key.rs `owned_key`). C (tempo, fresh home): the head reads of a body differ between its first (stale) and second run in one command, under one key, so the set of heads listed depends on what the job made before (head_digest `heads_of` filters by what the store holds). Each fix crosses into a file another lane owns (request.rs, blaze-ladder) and a write-only lane cannot run the command to see which head was left out.",
+ "cost": "C is diagnosed to a mechanism, not to the one missing head; the coordinator must run tempo with the profile on and diff the two read lists",
+ "cause": "the drive stores a record's read-name SHAPE at its task key and refuses a second shape (rule 21), while a body's head reads are found by its check, which reads the store's present contents",
+ "whys": "the head facts a body reads come from the check's records (`Records`), which hold what this job's earlier bodies asked for; a body checked twice in one command sees two stores; the shape is the first writer's",
+ "class": "a task whose read names come from a computation that reads mutable job state, keyed only by text",
+ "prevention": "wanted: the head set of a body is a function of its text and its key's reads only (head_digest lists every candidate head from the names, never filtered by what the store holds); a DST that checks one body before and after another in one job and asserts one read list",
+ "workaround": "none; B is fixed in the key, C needs the coordinator's run",
+ "state": "open"
+}

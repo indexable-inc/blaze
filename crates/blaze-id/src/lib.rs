@@ -149,9 +149,18 @@ portable_tuples! {
 /// ([`ItemKey::crate_prefix`]), the top bit of byte 8 says whether it is of something inside a
 /// body ([`ItemKey::is_inner`]), and the other 247 bits are the hash.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+#[repr(transparent)]
 pub struct ItemKey(pub ContentId);
 
 impl ItemKey {
+    /// 32-byte words viewed as keys in place, with no copy: what a record's key column is read as.
+    pub fn slice_of(words: &[[u8; 32]]) -> &[ItemKey] {
+        // SAFETY: `ItemKey` is `#[repr(transparent)]` over `ContentId`, itself
+        // `#[repr(transparent)]` over `[u8; 32]`: the same size (32) and alignment (1), and every
+        // bit pattern is valid. So `words` is `words.len()` keys at the same address, borrowed for
+        // the same lifetime.
+        unsafe { core::slice::from_raw_parts(words.as_ptr().cast::<ItemKey>(), words.len()) }
+    }
     /// The bit of byte 8 that says a key is of something inside a body: an item of a block,
     /// a block's module, a closure, an anonymous constant, an opaque type.
     pub const INNER: u8 = 0x80;

@@ -29,7 +29,7 @@ fn alloc() -> Alloc<'static> {
     blaze_own::testing::heap().alloc()
 }
 
-/// The fixtures' facts: the ADTs in `life` declare one lifetime; each head's lifetime part is
+/// The fixtures' facts: each ADT in `life` declares one lifetime per time it is listed; each head's lifetime part is
 /// read from its text (with its impl's text for a member); `self_ref` heads take `&self`.
 struct Lives {
     life: vec::Vec<ItemKey>,
@@ -44,7 +44,7 @@ impl Lives {
 
     fn read(&self, fx: &Fx, text: &str, imp: Option<ImplText<'_>>, inputs: &[PTy], output: PTy) -> Result<SigBuf<Alloc<'static>>, SigRefusal> {
         let life = &self.life;
-        let adt = |k: ItemKey| Some(life.contains(&k));
+        let adt = |k: ItemKey| Some(life.iter().filter(|x| **x == k).count() as u32);
         let mut buf = SigBuf::new_in(alloc());
         match imp {
             Some(i) => read_impl_signature(text, i, fx.t.view(), inputs, output, &adt, &mut buf, alloc())?,
@@ -63,7 +63,7 @@ impl Lives {
 
 impl Facts for Lives {
     fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
-        let lifetimes = self.life.contains(&k);
+        let lifetimes = self.life.iter().filter(|x| **x == k).count() as u32;
         Some(AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes, union: false, is_enum: false, is_box: false })
     }
     fn callee(&self, k: ItemKey) -> Option<CalleeFacts> {
@@ -386,4 +386,99 @@ fn self_assoc_forms_are_refused_by_name() {
     let read = hidden_facts.read(&fx2, GET, Some(it), &[rht, rs], proj).expect("a hidden position is read, not refused");
     assert!(read.life().holds_hidden(), "{:?}", regions(&read));
     std::println!("self_assoc_forms_are_refused_by_name: 5 refusals, 1 hidden");
+}
+
+/// bstd's hello world calls `impl<'g> Given<'g> { fn checking(&self) -> Checking<'_, 'g, ()> }`
+/// (blaze-std grant/made.rs). An ADT has one origin position per lifetime parameter, in
+/// declared order (`AdtFacts::lifetimes`, the Reference, "Generic parameters": each is a
+/// parameter of its own), so the head is read: `&self` is `[Anon(0), SelfTy(0)]`, the output
+/// `[Anon(0), SelfTy(0)]`. Before, one position stood for all of an ADT's lifetimes and the
+/// text was refused (`TwoLifetimesOneOrigin`), so hello world's borrows were not checked.
+/// CONTROL (rule 23): told `Checking` declares ONE lifetime, the same text is `Unaligned`.
+/// Prints `a_head_naming_two_lifetimes_of_one_adt_is_read: [Anon(0), SelfTy(0), Anon(0),
+/// SelfTy(0)]; one-position control Err(Unaligned ..)`.
+#[test]
+fn a_head_naming_two_lifetimes_of_one_adt_is_read() {
+    let mut fx = Fx::new();
+    let unit = fx.unit();
+    let gk = fx.strukt("Given", 0, &[]);
+    let gt = fx.adt(gk, &[]);
+    let rgt = fx.r(Mutbl::Not, gt);
+    let ck = fx.strukt("Checking", 1, &[]);
+    let ct = fx.adt(ck, &[unit]);
+    fx.finish();
+    const GIVEN_IMPL: &str = "impl<'g> Given<'g> {\n    pub fn checking(&self) -> Checking<'_, 'g, ()> { Checking::new(self) }\n}";
+    const CHECKING: &str = "pub fn checking(&self) -> Checking<'_, 'g, ()> { Checking::new(self) }";
+    let it = ImplText { text: GIVEN_IMPL, self_ty: gt, assoc: &[] };
+    let facts = Lives::new(&[gk, ck, ck]);
+    let read = facts.read(&fx, CHECKING, Some(it), &[rgt], ct).expect("two lifetimes of one ADT are two positions");
+    let got = regions(&read);
+    std::println!("a_head_naming_two_lifetimes_of_one_adt_is_read: {:?}", got.0);
+    assert_eq!(got.0, vec![Region::Anon(0), Region::SelfTy(0), Region::Anon(0), Region::SelfTy(0)]);
+    let one = Lives::new(&[gk, ck]);
+    let control = one.read(&fx, CHECKING, Some(it), &[rgt], ct).map(|b| regions(&b));
+    std::println!("a_head_naming_two_lifetimes_of_one_adt_is_read, one-position control: {control:?}");
+    assert!(matches!(control, Err(SigRefusal::Unaligned { .. })), "{control:?}");
+}
+
+/// `Two<'a, 'b>` holds two loans apart: `fn mk<'a, 'b>(x: &'a S, y: &'b S) -> Two<'a, 'b>`,
+/// `fn first<'a, 'b>(t: Two<'a, 'b>) -> &'a S`, and `fn f(s: S, k: S) { let t = mk(&s, &k);
+/// let r = first(t); <move>; g(r); }`. `r` borrows what `'a` holds, `s`, and not `k`: moving `s`
+/// while `r` is live is E0505 (`borrow Invalidated`), moving `k` is clean. The second is what
+/// one position per lifetime buys: under one position per ADT, `'a` and `'b` were one origin
+/// and `first`'s result held `k`'s loan too. Prints `two_lifetimes_of_one_adt_stay_apart: s
+/// moved [borrow Invalidated ..]; k moved []`.
+#[test]
+fn two_lifetimes_of_one_adt_stay_apart() {
+    let mut fx = Fx::new();
+    let s = fx.strukt("S", 0, &[]);
+    let st = fx.adt(s, &[]);
+    let rs = fx.r(Mutbl::Not, st);
+    let unit = fx.unit();
+    let tk = fx.strukt("Two", 0, &[]);
+    let tt = fx.adt(tk, &[]);
+    let mk = fx.func("mk", 0, &[rs, rs], tt, vec![]);
+    let first = fx.func("first", 0, &[tt], rs, vec![]);
+    let g = fx.func("g", 0, &[rs], unit, vec![]);
+    let h = fx.func("h", 0, &[st], unit, vec![]);
+    let f = fx.func("f", 0, &[st, st], unit, vec![]);
+    fx.finish();
+    let mut facts = Lives::new(&[tk, tk]);
+    facts.add(&fx, mk, "fn mk<'a, 'b>(x: &'a S, y: &'b S) -> Two<'a, 'b> { Two(x, y) }", None, &[rs, rs], tt);
+    facts.add(&fx, first, "fn first<'a, 'b>(t: Two<'a, 'b>) -> &'a S { t.0 }", None, &[tt], rs);
+    facts.add(&fx, g, "fn g(r: &S) {}", None, &[rs], unit);
+    facts.add(&fx, h, "fn h(s: S) {}", None, &[st], unit);
+    facts.add(&fx, f, "fn f(s: S, k: S) {}", None, &[st, st], unit);
+    let mut lines_of = [vec::Vec::new(), vec::Vec::new()];
+    for (i, move_s) in [true, false].into_iter().enumerate() {
+        let mut b = Bb::new();
+        let (ps, pk) = (b.param("s"), b.param("k"));
+        let (vt, vr) = (b.bind("t"), b.bind("r"));
+        let ls = b.local(ps);
+        let bs = b.borrow(Mutbl::Not, ls);
+        let lk = b.local(pk);
+        let bk = b.borrow(Mutbl::Not, lk);
+        let mkp = b.path(&["mk"]);
+        let made = b.call(mkp, &[bs, bk]);
+        let st1 = b.let_(vt, None, made);
+        let fp = b.path(&["first"]);
+        let lt = b.local(vt);
+        let got = b.call(fp, &[lt]);
+        let st2 = b.let_(vr, None, got);
+        let hp = b.path(&["h"]);
+        let moved = b.local(if move_s { ps } else { pk });
+        let mv = b.call(hp, &[moved]);
+        let gp = b.path(&["g"]);
+        let lr = b.local(vr);
+        let used = b.call(gp, &[lr]);
+        let (m, u) = (b.semi(mv), b.semi(used));
+        let root = b.block(&[st1, st2, m, u], None);
+        let (lines, stats) = run(&fx, &b, f, root, &facts).expect("lowered");
+        assert_eq!(stats.calls_by_signature, 4, "mk, first, h and g by their signatures: {stats:?}");
+        lines_of[i] = lines;
+    }
+    let [s_moved, k_moved] = lines_of;
+    std::println!("two_lifetimes_of_one_adt_stay_apart: s moved {s_moved:?}; k moved {k_moved:?}");
+    assert!(s_moved.iter().any(|l| l.starts_with("borrow Invalidated")), "{s_moved:?}");
+    assert!(k_moved.is_empty(), "`r` holds `'a`, `s`'s loan only: {k_moved:?}");
 }

@@ -1,0 +1,14 @@
+{
+ "id": "mx-red-tests-1117",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane MX (red tests of const-ast, blaze-watch, blaze-cas, ix-prof)",
+ "where": "crates/blaze-format-core/src/rows.rs (seek_from) and the lane brief",
+ "what": "Two things. (1) The brief said to read with Read/Grep/Glob, but this session has no Grep or Glob tool, and Bash is off-limits but for the runner; searching went through the REPL's rg/glob. (2) blaze-cas's page contract (a_lookup_reads_only_the_pages_its_probes_land_on) broke when the lookup moved to blaze_format::rows::seek_from without the old fences: guesses that all land on one side of a key leave the other end of the range at the run's end, and the bisection that follows reads a page a probe (11 pages where 6 is the bound).",
+ "cost": "about twenty minutes to find the cause in a crate outside the lane's",
+ "cause": "a lookup moved to its one home lost a piece (the fence) its old home had, and the contract test lives in the old crate, not with the code",
+ "whys": "rows.rs's own test checks averages (under 3 pages a lookup), not the worst lookup; the worst-case page test stayed in blaze-cas",
+ "class": "a move to one home that keeps the contract test behind in the caller",
+ "prevention": "proposed: rows.rs's a_million_even_keys_take_few_probes should also assert the most pages one lookup touches; the fence is in seek_from on disk (trial clean, not admitted by this lane)",
+ "workaround": "REPL rg for search",
+ "state": "open"
+}

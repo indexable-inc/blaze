@@ -45,13 +45,12 @@ pub struct BlockUse<'a> {
     pub depth: u32,
     /// The item's text, attributes and `;` included.
     pub text: &'a str,
-    /// Where the item starts in the enclosing item's text; `None` when an expansion wrote it.
-    pub at: Option<u32>,
-    /// Where its site starts in the enclosing item's text ([`View::site`]): `at` for a `use`
-    /// written there, the outermost macro call's start for one an expansion wrote (which
-    /// statement call's expansion declared it: the names library files that expansion's blocks
-    /// as modules under the call).
-    pub site: u32,
+    /// The block it is declared in: where its path is read is that block's (the world's scope
+    /// table, by the scope's [`crate::scope_origin::ScopeOrigin`]).
+    pub scope: ScopeId,
+    /// Where it is shown in the enclosing item ([`View::site`]), for a refusal's words only:
+    /// never a key, never a lookup.
+    pub shown: blaze_surface::Range,
 }
 
 /// What the `use`s around a pattern make of its name.
@@ -89,12 +88,7 @@ pub fn in_scope<'a, 'b>(v: &View<'b>, scope: ScopeId, name: u64, own_item: bool,
         for i in block.items.start..block.items.start + block.items.len {
             let item = v.local_item(v.row(RowIdx(i))?)?;
             if item.syntax == USE as u16 {
-                found.uses.push(BlockUse {
-                    depth,
-                    text: v.text_at(item.range)?,
-                    at: v.item_relative(item.range).map(|r| r.start),
-                    site: v.site(item.range)?.start,
-                });
+                found.uses.push(BlockUse { depth, text: v.text_at(item.range)?, scope: s, shown: v.site(item.range)? });
             } else if let Some(n) = item.name {
                 declares |= v.name(n)? == name;
                 found.locals.push(v.name_text(n)?);
@@ -119,7 +113,7 @@ pub fn ask<'a>(v: &View<'_>, scope: ScopeId, name: NameIdx, own_item: bool, name
     if found.uses.is_empty() {
         return Ok(Asked::NoUses);
     }
-    Ok(match names.value_name_by_uses(v.name_text(name)?, &found.uses, &found.locals) {
+    Ok(match names.value_name_by_uses(v, v.name_text(name)?, &found.uses, &found.locals) {
         Some(answer) => Asked::Bound(answer),
         None => Asked::Unbound,
     })

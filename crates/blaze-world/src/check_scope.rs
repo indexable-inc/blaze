@@ -5,9 +5,18 @@
 //! which the records path has before any crate's names are read.
 //!
 //! The rule:
-//! - An owner's bodies are checked on ONE side ([`check_side`]): a proc-macro crate's bodies are
-//!   built for and run on the macro side (D89, rule 10: `wasm32-wasip1`, in Wasmtime), so they
-//!   are checked against the macro side's crates; every other crate's on its own side.
+//! - An owner's bodies are checked on ONE side ([`check_side`]): the side of the crates it
+//!   links, which the list gives each crate on one side. A proc-macro crate's bodies are built
+//!   for and run on the macro side (D89, rule 10: `wasm32-wasip1`, in Wasmtime). So is a member
+//!   proc macro's library test harness (the same code, blaze-scope units/macro_crate.rs): the
+//!   list points its edges at the macro side's copies (units/macro_side.rs) while the world
+//!   files it among the target side's crates, so its side is read from its edges, never from
+//!   its row (tempo, 2026-11-17 03:49: `tempo-precompiles-macros`'s harness was checked on the
+//!   target side and its first edge refused, which failed 208 body tasks of the seven files the
+//!   proc macro and its harness own). A macro-side copy of a crate (a helper both sides build)
+//!   is a crate of its own, under a key of its own (the side's domain, units/macro_side.rs
+//!   `side_key`), so each side's copy is an owner with its own scope. An owner that links
+//!   nothing but proc macros is checked on its own side.
 //! - The owner sees its dependency closure on that side: its dependencies followed to the end
 //!   (a work list, no recursion), and, on the target side, the target's sysroot
 //!   ([`World::sysroot`]: core, alloc, std, bstd), which the Reference's extern prelude adds
@@ -18,9 +27,14 @@
 //!   is never linked into the owner's program (it runs at build time in the sandbox), so its
 //!   impls answer no question of the owner's, it adds no lang row, and its dependencies (the
 //!   macro side's crates) are not followed.
-//! - A crate of the other side reached any other way is a world that broke the list's promise
-//!   (list.rs: a member proc macro's dependencies are the macro side's, everything else the
-//!   target's): refused by name ([`ScopeError::OtherSide`]), never joined.
+//! - A crate of the other side reached any other way (an edge from a crate of the scope to a
+//!   crate of the other side, with no proc macro between) is a world that broke the list's
+//!   promise (list.rs: a member proc macro's dependencies are the macro side's, everything else
+//!   the target's): refused naming the owner and the edge's two crates
+//!   ([`ScopeError::OtherSide`]), never joined.
+//! - Build scripts are no owners: the world holds no crate of a build script or of its
+//!   build-dependencies (lib.rs: "Build scripts are not crates of the names set"), so neither
+//!   reaches this rule. Owed, stated: `blaze check` does not check a `build.rs` yet.
 //! - The lang crates (the crates whose `#[lang]` rows the owner's table files): the owner, and,
 //!   unless it is `#![no_core]`, every TOOLCHAIN crate of the check side it sees, chosen by id
 //!   and side, never by a name both sides share. So the two sides' cores never meet in one lang
@@ -33,17 +47,21 @@
 //! owner's `#![no_core]` (its names record's root head). The body job's read list holds the unit
 //! graph's out and every seen crate's `CrateScope` (name, out) (body_types.rs `FileTypes::new`),
 //! and the owner's `CrateScope` holds its root head: a change to any of them moves a read, and
-//! the body is checked again.
+//! the body is checked again. A file both sides build (a helper of a member proc macro and of
+//! a target crate) has an owner per side, each a crate under its own key (the macro side's
+//! under units/macro_side.rs `SIDE_DOMAIN`): the file's one body task checks each owner in its
+//! own scope (blaze-cli body_types.rs `prepare`, every crate whose root reaches the file), and
+//! its read list names each owner's `CrateScope` by that key, so the side is in what it reads.
 //!
 //! Owed, stated: the lang rows of a non-toolchain crate the owner links (a library's
 //! `#[global_allocator]` or `#[panic_handler]`) are not filed on the records path; the names
 //! path files every linked crate's (front2 linked.rs). Filing them here opens every seen
 //! crate's items record per owner, which the lazy records path avoids today.
 
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, AllocFailure};
 
 use crate::crate_list::CrateGraph;
-use crate::{Crate, Side, World};
+use crate::{Side, World};
 
 /// How an owner sees a crate of its scope.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -104,8 +122,14 @@ pub enum ScopeError<'w> {
     /// The owner is a crate the world could not make ([`World::refused`]: a member proc macro
     /// with no `wasm32-wasip1` cut on the shelf): its bodies have no side to be checked on.
     Refused { krate: &'w str },
-    /// The owner's walk reached a crate of the other side not through a proc macro.
-    OtherSide { owner: &'w str, krate: &'w str, side: Side },
+    /// The owner's scope holds an edge `from` -> `krate` to a crate of the other side than the
+    /// owner's check side `side`, with no proc macro between (`from` is the owner itself for its
+    /// own edges and the target's sysroot).
+    OtherSide { owner: &'w str, from: &'w str, krate: &'w str, side: Side },
+    /// The allocator the caller handed in refused the memory of the owner's scope (its
+    /// by-index marks, its work list or its readers): the caller's job fails with it (rule 20),
+    /// the process goes on.
+    Memory { owner: &'w str, why: AllocFailure },
 }
 
 impl core::fmt::Display for ScopeError<'_> {
@@ -115,10 +139,11 @@ impl core::fmt::Display for ScopeError<'_> {
             ScopeError::Refused { krate } => {
                 write!(f, "the crate `{krate}` was refused by the crate list (its refusal is in the world), so its bodies have no side to be checked on (blaze-world check_scope.rs)")
             }
-            ScopeError::OtherSide { owner, krate, side } => write!(
+            ScopeError::OtherSide { owner, from, krate, side } => write!(
                 f,
-                "the bodies of `{owner}` are checked on the {side:?} side, and its dependencies reach `{krate}` of the other side not through a proc macro: the crate list broke its promise (blaze-world check_scope.rs, list.rs)"
+                "the bodies of `{owner}` are checked on the {side:?} side, and the edge `{from}` -> `{krate}` reaches `{krate}` of the other side with no proc macro between: the crate list broke its promise (blaze-world check_scope.rs, list.rs)"
             ),
+            ScopeError::Memory { owner, why } => write!(f, "the check scope of `{owner}` could not be made: {why} (blaze-world check_scope.rs `check_scope_in`)"),
         }
     }
 }
@@ -130,25 +155,42 @@ impl ScopeError<'_> {
         match self {
             ScopeError::NoSuchCrate { .. } => "an owner past the world's crates (blaze-world check_scope.rs)",
             ScopeError::Refused { .. } => "the owner was refused by the crate list, so its bodies have no side to be checked on (blaze-world check_scope.rs)",
-            ScopeError::OtherSide { .. } => "an owner's dependencies reach the other side not through a proc macro (blaze-world check_scope.rs)",
+            ScopeError::OtherSide { .. } => "an edge of an owner's check scope crosses to the other side with no proc macro between (blaze-world check_scope.rs `OtherSide`)",
+            ScopeError::Memory { .. } => "the allocator refused the memory of an owner's check scope (blaze-world check_scope.rs `check_scope_in`)",
         }
     }
 }
 
-/// The side a crate's own bodies are checked on: a proc-macro crate's on the macro side (they
-/// are built for it and run there), any other crate's on its own.
-pub fn check_side(c: &Crate<'_>) -> Side {
-    if c.proc_macro { Side::Macro } else { c.side }
+/// The side `owner`'s bodies are checked on (the module's first rule): the side of the crates
+/// it links (its edges to crates that are not proc macros), all of which must be on one side;
+/// a proc-macro crate's is the macro side (rule 10), and its edges must be the macro side's
+/// too; an owner that links nothing is checked on its own side. Two edges to two sides are
+/// [`ScopeError::OtherSide`] naming the owner and the edge that differs.
+pub fn check_side<'n, G: CrateGraph<'n>>(graph: &G, owner: usize) -> Result<Side, ScopeError<'n>> {
+    let mut side = if graph.proc_macro(owner) { Some(Side::Macro) } else { None };
+    for dep in graph.deps(owner) {
+        if graph.proc_macro(dep) {
+            continue;
+        }
+        let of = graph.side(dep);
+        match side {
+            None => side = Some(of),
+            Some(side) if side != of => return Err(ScopeError::OtherSide { owner: graph.name(owner), from: graph.name(owner), krate: graph.name(dep), side }),
+            Some(_) => {}
+        }
+    }
+    Ok(side.unwrap_or(graph.side(owner)))
 }
 
-/// How the owner's walk sees crate `at`, reached from a crate of its scope: a proc macro for
-/// its macros; else a crate of `side`, a toolchain crate or not; else the refusal.
-fn seen_as<'n, G: CrateGraph<'n>>(graph: &G, owner: usize, at: usize, side: Side) -> Result<Seen, ScopeError<'n>> {
+/// How the owner's walk sees crate `at`, reached by an edge from `from`, a crate of its scope:
+/// a proc macro for its macros; else a crate of `side`, a toolchain crate or not; else the
+/// refusal naming the edge.
+fn seen_as<'n, G: CrateGraph<'n>>(graph: &G, owner: usize, from: usize, at: usize, side: Side) -> Result<Seen, ScopeError<'n>> {
     if graph.proc_macro(at) {
         return Ok(Seen::MacrosOnly);
     }
     if graph.side(at) != side {
-        return Err(ScopeError::OtherSide { owner: graph.name(owner), krate: graph.name(at), side });
+        return Err(ScopeError::OtherSide { owner: graph.name(owner), from: graph.name(from), krate: graph.name(at), side });
     }
     Ok(Seen::Linked { toolchain: graph.toolchain(at) })
 }
@@ -162,6 +204,12 @@ pub fn check_scope<'w, 'a>(world: &World<'w>, owner: usize, no_core: bool, alloc
 /// [`check_scope`] over any crate graph: the world made fresh, or the crate list read in place
 /// (crate_list.rs), whose indices are its rows. One rule, two inputs, tested equal
 /// (list_tests.rs `the_crate_list_reads_back_as_its_world`).
+///
+/// Memory: everything is made in `alloc`, each vector at its full size up front (the marks `n`
+/// bytes, the work list `8n`, the readers 16 bytes a crate seen), so nothing grows and nothing
+/// is copied; the marks and the work list are dropped at return. A caller on a bump frame
+/// therefore releases a call's bytes around it (blaze-cli body_types.rs `owner_wants`, a frame
+/// scope), or hands a heap that frees them. A refusal is [`ScopeError::Memory`], never a panic.
 pub fn check_scope_in<'n, 'a, G: CrateGraph<'n>>(graph: &G, owner: usize, no_core: bool, alloc: Alloc<'a>) -> Result<CheckScope<'a>, ScopeError<'n>> {
     let n = graph.len();
     if owner >= n {
@@ -170,11 +218,14 @@ pub fn check_scope_in<'n, 'a, G: CrateGraph<'n>>(graph: &G, owner: usize, no_cor
     if graph.refused(owner) {
         return Err(ScopeError::Refused { krate: graph.name(owner) });
     }
-    let side = if graph.proc_macro(owner) { Side::Macro } else { graph.side(owner) };
-    // By index, how each crate is seen (`None`: not seen); the work list in the order reached.
-    let mut seen: AVec<'a, Option<Seen>> = AVec::with_capacity_in(n, alloc.clone());
+    let side = check_side(graph, owner)?;
+    let memory = |why: AllocFailure| ScopeError::Memory { owner: graph.name(owner), why };
+    // By index, how each crate is seen (`None`: not seen); the work list in the order reached,
+    // which holds each crate at most once, so `n` slots and no growth (the pushes below and
+    // this `extend` stay within the capacity reserved here, so they allocate nothing).
+    let mut seen: AVec<'a, Option<Seen>> = AVec::try_with_capacity_in(n, alloc.clone()).map_err(memory)?;
     seen.extend((0..n).map(|_| None));
-    let mut order: AVec<'a, usize> = AVec::new_in(alloc.clone());
+    let mut order: AVec<'a, usize> = AVec::try_with_capacity_in(n, alloc.clone()).map_err(memory)?;
     seen[owner] = Some(Seen::Owner);
     order.push(owner);
     // The target side's sysroot, which the extern prelude adds (unless `#![no_core]`); the
@@ -182,7 +233,7 @@ pub fn check_scope_in<'n, 'a, G: CrateGraph<'n>>(graph: &G, owner: usize, no_cor
     if !no_core && side == Side::Target {
         for at in graph.sysroot().iter().flatten().copied() {
             if seen[at].is_none() {
-                seen[at] = Some(seen_as(graph, owner, at, side)?);
+                seen[at] = Some(seen_as(graph, owner, owner, at, side)?);
                 order.push(at);
             }
         }
@@ -196,14 +247,14 @@ pub fn check_scope_in<'n, 'a, G: CrateGraph<'n>>(graph: &G, owner: usize, no_cor
         }
         for dep in graph.deps(at) {
             if seen[dep].is_none() {
-                seen[dep] = Some(seen_as(graph, owner, dep, side)?);
+                seen[dep] = Some(seen_as(graph, owner, at, dep, side)?);
                 order.push(dep);
             }
         }
     }
     // The owner at 0, then the rest by index: the same graph gives the same order.
     order[1..].sort_unstable();
-    let mut readers: AVec<'a, (usize, Seen)> = AVec::with_capacity_in(order.len(), alloc);
+    let mut readers: AVec<'a, (usize, Seen)> = AVec::try_with_capacity_in(order.len(), alloc).map_err(memory)?;
     for at in order.iter().copied() {
         if let Some(how) = seen[at] {
             readers.push((at, how));

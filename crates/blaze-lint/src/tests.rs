@@ -13,8 +13,11 @@ use blaze_own::{String as OwnString};
 use blaze_sim::{Broke, Config, Tape};
 use blaze_surface::Edition;
 
+use crate::matcher::{LIVE, Live, NO_SEQ, Pattern, Trie, nodes_for};
+use crate::sequences::{OTHER, PATTERNS, TRIE};
 use crate::{
-    FixError, Findings, Rule, RuleSet, Scope, Span, Template, TestBits, Unit, apply, apply_all, lint, show_message,
+    FixError, Findings, Rule, RuleSet, Scope, Span, Step, Template, TestBits, Unit, Units, Variants, apply, apply_all, lint,
+    lint_in, show_message,
 };
 
 const FILE: Scope = Scope::file(TestBits::NONE, false, false);
@@ -231,6 +234,558 @@ fn format_macro() {
     ]);
 }
 
+#[test]
+fn ambient_heap() {
+    let rule = Rule::AmbientHeap;
+    let all = RuleSet::only(&[rule]);
+    assert_eq!(found(&all, "fn f() { let a = Alloc::global(); }", FILE), [("reach", "Alloc::global")]);
+    assert_eq!(kinds(rule, "fn f() { let h = blaze_own::Heap::process(); let t = testing::heap(); }"), ["reach", "reach"]);
+    assert_eq!(found(&all, "fn f() { let v = Vec::new(); }", FILE), [("constructor", "Vec::new")]);
+    assert_eq!(kinds(rule, "fn f() { let w = Vec::with_capacity(4); let b = Box::new(1); }"), ["constructor", "constructor"]);
+    assert_eq!(kinds(rule, "fn f() { let s = String::from(\"x\"); let r = std::rc::Rc::new(1); }"), [
+        "constructor",
+        "constructor"
+    ]);
+    assert_eq!(kinds(rule, "fn f() { let v = vec![1]; let s = format!(\"x\"); }"), ["macro", "macro"]);
+    assert_eq!(found(&all, "fn f() { let s = x.to_string(); }", FILE), [("method", "to_string")]);
+    assert_eq!(kinds(rule, "fn f() { let o = y.to_owned(); let v = z.to_vec(); }"), ["method", "method"]);
+    none(rule, &[
+        "fn f(al: Alloc<'_>) { let v = Vec::new_in(al); let b = Box::new_in(1, al); }",
+        "fn f(al: A) { let v = vec_in![al; 1]; let s = format_in!(al, \"x\"); }",
+        "fn f() { let g = Alloc::global; }",
+        "fn f() { let r = a..to_vec(); }",
+        "fn f() { let s = \"Vec::new() x.to_string()\"; }",
+        "fn f() {\n    // Vec::new()\n}",
+        "#[test]\nfn t() { let v = Vec::new(); }",
+        "#[cfg(test)]\nmod t {\n    fn h() { let a = Alloc::global(); }\n}",
+    ]);
+}
+
+#[test]
+fn no_async() {
+    let rule = Rule::NoAsync;
+    assert_eq!(found(&RuleSet::only(&[rule]), "async fn f() {}", FILE), [("async", "async")]);
+    assert_eq!(kinds(rule, "pub async unsafe fn f() {}"), ["async"]);
+    assert_eq!(kinds(rule, "fn f() { let a = async move { 1 }; let b = async { 2 }; let c = async |x| x; }"), [
+        "async", "async", "async"
+    ]);
+    assert_eq!(found(&RuleSet::only(&[rule]), "fn f() { let r = fut.await; }", FILE), [("await", "await")]);
+    none(rule, &[
+        "fn f() { let async_ = 1; let r = fut.r#await; }",
+        "fn f() { let r = x..await_all(); }",
+        "fn f() { let s = \"async fn .await\"; }",
+        "#[test]\nfn t() { let a = async { x.await }; }",
+    ]);
+}
+
+#[test]
+fn ambient_read() {
+    let rule = Rule::AmbientRead;
+    assert_eq!(found(&RuleSet::only(&[rule]), "fn f() { let t = Instant::now(); }", FILE), [("clock", "Instant::now")]);
+    assert_eq!(kinds(rule, "fn f() { let s = std::time::SystemTime::now(); }"), ["clock"]);
+    assert_eq!(kinds(rule, "fn f() { let v = std::env::var(\"X\"); let a = env::args(); let d = env::current_dir(); }"), [
+        "env", "env", "env"
+    ]);
+    assert_eq!(kinds(rule, "fn f() { let r = rand::thread_rng(); }"), ["random"]);
+    assert_eq!(kinds(rule, "fn f() { let m: HashMap<u8, u8> = HashMap::new(); let s = HashSet::with_capacity(4); }"), [
+        "hash-seed",
+        "hash-seed"
+    ]);
+    assert_eq!(kinds(rule, "fn f() { std::process::exit(1); let i = process::id(); }"), ["process", "process"]);
+    none(rule, &[
+        "fn f(clock: &C) { let t = clock.now(); }",
+        "fn thread_rng() -> R { R }",
+        "fn f() { let m = HashMap::with_hasher(seed); let t = Instant::from(x); }",
+        "fn f() { let v = env::var; }",
+        "#[cfg(test)]\nmod t {\n    fn h() { let t = Instant::now(); }\n}",
+    ]);
+}
+
+#[test]
+fn left_undone() {
+    let rule = Rule::LeftUndone;
+    assert_eq!(found(&RuleSet::only(&[rule]), "fn f() { todo!() }", FILE), [("todo", "todo!")]);
+    assert_eq!(kinds(rule, "fn f() { unimplemented!(\"later\") }"), ["unimplemented"]);
+    assert_eq!(found(&RuleSet::only(&[rule]), "fn f() { let a = dbg!(g(1)); }", FILE), [("dbg", "dbg!")]);
+    assert_eq!(found(&RuleSet::only(&[rule]), "fn f() { unreachable!() }", FILE), [(
+        "unreachable-no-message",
+        "unreachable!()"
+    )]);
+    none(rule, &[
+        "fn f() { unreachable!(\"the length was checked above\") }",
+        "fn f() { if todo != 1 {} }",
+        "fn f() { x.dbg(); }",
+        "fn todo() {}",
+        "#[test]\nfn t() { dbg!(x); todo!() }",
+    ]);
+}
+
+/// How many fixes `rule` offers in `text`.
+fn fix_count(rule: Rule, text: &str) -> usize {
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+    let unit = Unit { text, holes: &[], scope: FILE };
+    assert!(lint(&RuleSet::only(&[rule]), &unit, alloc, &mut out).is_ok());
+    out.list.iter().map(|f| out.fixes_of(f).len()).sum()
+}
+
+#[test]
+fn dbg_fix_keeps_the_value() {
+    assert_eq!(fixed("fn f() { let a = dbg!(g(1)); }"), "fn f() { let a = g(1); }");
+    assert_eq!(fixed("fn f() { let n = dbg!(a.len()?); }"), "fn f() { let n = a.len()?; }");
+    assert_eq!(fixed("fn f() { let v = dbg!(vec_in![al; 1]); }"), "fn f() { let v = vec_in![al; 1]; }");
+    // A place would be moved by the macro and borrowed without it; an operator would bind to
+    // its neighbours; a turbofish is not read: each is found, none fixed.
+    for text in [
+        "fn f() { dbg!(x); }",
+        "fn f() { let a = dbg!(a + b) * 2; }",
+        "fn f() { let a = dbg!(s.field); }",
+        "fn f() { let a = dbg!(v[0]); }",
+        "fn f() { let a = dbg!(f::<u8>()); }",
+        "fn f() { let a = dbg!(a, b); }",
+    ] {
+        assert_eq!(kinds(Rule::LeftUndone, text), ["dbg"], "{text}");
+        assert_eq!(fix_count(Rule::LeftUndone, text), 0, "{text}");
+    }
+}
+
+#[test]
+fn unbounded_wait() {
+    let rule = Rule::UnboundedWait;
+    assert_eq!(found(&RuleSet::only(&[rule]), "fn f() { let m = rx.recv(); }", FILE), [("call", "recv()")]);
+    assert_eq!(kinds(rule, "fn f() { let g = m.lock(); h.join(); c.wait(); }"), ["call", "call", "call"]);
+    assert_eq!(found(&RuleSet::only(&[rule]), "fn f() {\n    loop {\n        g();\n    }\n}", FILE), [("loop", "loop")]);
+    none(rule, &[
+        "fn f() { let m = rx.recv_timeout(d); let g = m.lock(deadline); h.join(t); }",
+        "fn f() {\n    loop {\n        if g() {\n            break;\n        }\n    }\n}",
+        "fn f() -> R {\n    loop {\n        g()?;\n    }\n}",
+        "fn f() -> u8 {\n    loop {\n        return 1;\n    }\n}",
+        "fn f() { let r = 0..lock(); }",
+        "#[test]\nfn t() { rx.recv(); }",
+    ]);
+}
+
+#[test]
+fn ambient_hasher() {
+    let rule = Rule::AmbientHasher;
+    let only = RuleSet::only(&[rule]);
+    assert_eq!(found(&only, "use std::collections::HashMap;", FILE), [("std-table", "collections::HashMap")]);
+    assert_eq!(kinds(rule, "use std::collections::{hash_map::RandomState, HashSet};"), ["std-table"]);
+    assert_eq!(kinds(rule, "fn f() { let h = std::hash::DefaultHasher::new(); let s: hashbrown::HashSet<u8> = g(); }"), [
+        "std-table",
+        "std-table"
+    ]);
+    assert_eq!(found(&only, "fn f(a: A) { let m = HashMap::new_in(a); }", FILE), [("default-hasher", "HashMap::new_in")]);
+    assert_eq!(
+        kinds(rule, "fn f(a: A) { let s = IndexSet::with_capacity_in(4, a); let b = ByHash::from_iter_in(i, a); }"),
+        ["default-hasher", "default-hasher"]
+    );
+    none(rule, &[
+        "fn f(a: A) { let m = Map::new(MapOpts { hasher: FixedState, alloc: a, capacity: None }); }",
+        "fn f(a: A) { let m = HashMap::with_hasher_in(FixedState, a); }",
+        "use core::hash::{BuildHasher, Hash};",
+        "use blaze_hash::hash_map::Entry;",
+        "fn f() { let m: my_collections::HashMap = g(); let h = my_hash::RandomState; }",
+        "fn new_in(alloc: A) -> Self { g(alloc) }",
+        "fn f() { let s = \"std::collections::HashMap HashMap::new_in(a)\"; }",
+        "fn f() {\n    // HashMap::new_in(a)\n}",
+        "#[test]\nfn t() { let m = HashMap::new_in(a); }",
+        "#[cfg(test)]\nmod t {\n    use std::collections::HashMap;\n}",
+    ]);
+    // The message names the one constructor and its options (D126).
+    let alloc = blaze_own::testing::heap().alloc();
+    let text = "fn f(a: A) { let m = HashMap::with_capacity_in(8, a); }";
+    let mut out = Findings::new_in(alloc);
+    let unit = Unit { text, holes: &[], scope: FILE };
+    assert!(lint(&only, &unit, alloc, &mut out).is_ok());
+    let mut said = StdVec::new();
+    for finding in out.list.iter() {
+        let mut line = OwnString::new_in(alloc);
+        show_message(&only, text, &out, finding, &mut line);
+        said.push(line.as_str().to_string());
+    }
+    assert!(said.iter().any(|s| s.contains("Map::new(MapOpts { hasher: FixedState, alloc, capacity: Some(n) })")), "{said:?}");
+}
+
+/// Where a std path and a constructor overlap on one table, one finding: the std path's, the
+/// more specific; the constructor's only where `ambient-hasher` does not run.
+#[test]
+fn a_std_table_path_is_one_finding() {
+    let both = RuleSet::only(&[Rule::AmbientHasher, Rule::AmbientRead]);
+    assert_eq!(found(&both, "fn f() { let m = std::collections::HashMap::new(); }", FILE), [(
+        "std-table",
+        "collections::HashMap"
+    )]);
+    assert_eq!(found(&both, "fn f() { let s = hashbrown::HashSet::with_capacity(4); }", FILE), [(
+        "std-table",
+        "hashbrown::HashSet"
+    )]);
+    assert_eq!(found(&both, "fn f() { let r = std::hash::RandomState::new(); }", FILE), [(
+        "std-table",
+        "hash::RandomState"
+    )]);
+    assert_eq!(found(&both, "fn f(a: A) { let m = hashbrown::HashMap::new_in(a); }", FILE), [(
+        "std-table",
+        "hashbrown::HashMap"
+    )]);
+    // Not one site: each is its own finding.
+    assert_eq!(kinds(Rule::AmbientHasher, "use std::collections::HashMap;\nfn f(a: A) { let m = HashMap::new_in(a); }"), [
+        "std-table",
+        "default-hasher"
+    ]);
+    // Without ambient-hasher the constructor is ambient-read's finding, as before.
+    assert_eq!(kinds(Rule::AmbientRead, "fn f() { let m = std::collections::HashMap::new(); }"), ["hash-seed"]);
+}
+
+/// `variant-count`'s findings in `text` (one unit, its whole file): kind, range text, and the
+/// text after its fixes are applied.
+fn counted(text: &str) -> (StdVec<(&'static str, &str)>, StdString) {
+    let only = RuleSet::only(&[Rule::VariantCount]);
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+    let unit = Unit { text, holes: &[], scope: FILE };
+    if let Err(error) = lint(&only, &unit, alloc, &mut out) {
+        panic!("lint refused {text:?}: {error:?}");
+    }
+    let found = out.list.iter().map(|f| (f.template.kind(), f.range.of(text))).collect();
+    match apply_all(text, &out, alloc) {
+        Ok(new) => (found, new.as_str().to_string()),
+        Err(error) => panic!("fixes refused on {text:?}: {error:?}"),
+    }
+}
+
+/// `variant-count`'s messages in `text`.
+fn count_messages(text: &str) -> StdVec<StdString> {
+    let only = RuleSet::only(&[Rule::VariantCount]);
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+    let unit = Unit { text, holes: &[], scope: FILE };
+    assert!(lint(&only, &unit, alloc, &mut out).is_ok());
+    out.list
+        .iter()
+        .map(|finding| {
+            let mut line = OwnString::new_in(alloc);
+            show_message(&only, text, &out, finding, &mut line);
+            line.as_str().to_string()
+        })
+        .collect()
+}
+
+const KIND: &str = "enum Kind {\n    A,\n    B(u8),\n    #[default]\n    C { x: u8 } ,\n}\n";
+
+#[test]
+fn variant_count_finds_the_three_positions() {
+    // (a) a `const`'s whole initializer, fixed.
+    let text = format!("{KIND}pub const KINDS: usize = 3;\n");
+    let (found, fixed) = counted(&text);
+    assert_eq!(found, [("count", "3")]);
+    assert_eq!(fixed, format!("{KIND}pub const KINDS: usize = core::mem::variant_count::<Kind>();\n"));
+    let text = format!("{KIND}static S: usize = 0x3;\n");
+    assert_eq!(counted(&text).0, [("count", "0x3")]);
+    // (b) an array type's and a repeat's length, both `usize`, both fixed.
+    let text = format!("{KIND}fn f() -> [u8; 3] {{\n    [0; 3_usize]\n}}\n");
+    let (found, fixed) = counted(&text);
+    assert_eq!(found, [("count", "3"), ("count", "3_usize")]);
+    assert_eq!(
+        fixed,
+        format!("{KIND}fn f() -> [u8; core::mem::variant_count::<Kind>()] {{\n    [0; core::mem::variant_count::<Kind>()]\n}}\n")
+    );
+    // (c) a range's end: found, not fixed (its type is not known from text).
+    let text = format!("{KIND}fn f() {{\n    for i in 0..3 {{}}\n    let s = &v[..0b11];\n}}\n");
+    let (found, fixed) = counted(&text);
+    assert_eq!(found, [("count", "3"), ("count", "0b11")]);
+    assert_eq!(fixed, text);
+    // A `u32` constant and a suffixed literal are found, not fixed: the call is a `usize`.
+    let text = format!("{KIND}const N: u32 = 3;\nconst M: usize = 3u8;\n");
+    let (found, fixed) = counted(&text);
+    assert_eq!(found, [("count", "3"), ("count", "3u8")]);
+    assert_eq!(fixed, text);
+    // Test code is not exempt: a stale count is stale there too.
+    let text = format!("{KIND}#[cfg(test)]\nmod t {{\n    use super::*;\n    #[test]\n    fn t() {{ let a = [0; 3]; }}\n}}\n");
+    assert_eq!(counted(&text).0, [("count", "3")]);
+}
+
+#[test]
+fn variant_count_is_silent_off_its_positions() {
+    for case in [
+        // Two variants: too common a number.
+        "enum Two { A, B }\nconst N: usize = 2;",
+        // A `cfg`'d variant: the count is not one number.
+        "enum K { A, B, #[cfg(x)] C, D }\nconst N: usize = 3;\nconst M: usize = 4;",
+        "enum K { A, B, #[cfg_attr(x, cfg(y))] C }\nconst N: usize = 3;",
+        // Explicit discriminants are the enum's own literals.
+        "enum K { A = 3, B = 4, C = 5 }",
+        // A larger expression, either side.
+        "enum K { A, B, C }\nconst N: usize = 3 + 1;\nconst M: usize = 1 + 3;\nfn f() { let a = [0; 3 * 2]; let r = 0..3 + 1; }",
+        // An inclusive range, a different number, a float, a tuple index, a `let`, a compare.
+        "enum K { A, B, C }\nfn f() { let r = 0..=2; let s = 0..=3; let t = 0..4; let x = t.3; let y = 3; }\nconst F: f64 = 3.0;",
+        "enum K { A, B, C }\nfn f() { if a == 3 { g(); } b <= 3; }",
+        // An attribute, a macro_rules body.
+        "enum K { A, B, C }\n#[a([0; 3], x = 3)]\nfn f() {}\nmacro_rules! m { () => { [0; 3] } }",
+        // No enum in the file: the file is not lexed.
+        "const N: usize = 3;\nfn f() -> [u8; 3] { [0; 3] }",
+        // An enum inside an attribute or a macro body is no fact.
+        "macro_rules! m { () => { enum K { A, B, C } } }\nconst N: usize = 3;",
+    ] {
+        assert_eq!(counted(case).0, StdVec::<(&str, &str)>::new(), "variant-count fired on {case:?}");
+    }
+}
+
+#[test]
+fn variant_count_names_each_enum_and_fixes_only_by_a_bare_name() {
+    // Two enums of one count: both named, no fix.
+    let text = "enum A { X, Y, Z }\nenum B { P, Q, R }\nconst N: usize = 3;\n";
+    let (found, fixed) = counted(text);
+    assert_eq!(found, [("count-many", "3")]);
+    assert_eq!(fixed, text);
+    let said = count_messages(text);
+    assert!(said[0].starts_with("`3` is the number of variants of `A`, `B`: if it counts one of them"), "{said:?}");
+    // The one enum of the count, its message and fix.
+    let said = count_messages(&format!("{KIND}pub const KINDS: usize = 3;\n"));
+    assert_eq!(said, [
+        "`3` is the number of variants of `Kind`: write `core::mem::variant_count::<Kind>()` (feature `variant_count`) so a \
+         new variant cannot leave it stale"
+    ]);
+    // In another module: found, not fixed, the message says why.
+    let text = "mod m {\n    pub enum K { A, B, C }\n}\nconst N: usize = 3;\n";
+    let (found, fixed) = counted(text);
+    assert_eq!(found, [("count", "3")]);
+    assert_eq!(fixed, text);
+    assert!(count_messages(text)[0].contains("not fixed: `K` is in another module"), "{:?}", count_messages(text));
+    // In the same module, nested: fixed.
+    let text = "mod m {\n    pub enum K { A, B, C }\n    fn f() -> [u8; 3] { g() }\n}\n";
+    assert_eq!(counted(text).1, "mod m {\n    pub enum K { A, B, C }\n    fn f() -> [u8; core::mem::variant_count::<K>()] { g() }\n}\n");
+    // In a function body: not reached by a bare name from the module.
+    let text = "fn f() {\n    enum K { A, B, C }\n}\nconst N: usize = 3;\n";
+    assert_eq!(counted(text), (vec![("count", "3")], text.to_string()));
+    // Generic: not fixed.
+    let text = "enum K<T> { A(T), B, C }\nconst N: usize = 3;\n";
+    assert_eq!(counted(text), (vec![("count", "3")], text.to_string()));
+}
+
+/// The enum and the literal are different units: the file's fact joins them, and the literal's
+/// unit's key moves when the enum's count does, the enum's own unit's key never.
+#[test]
+fn variant_count_reads_the_file_and_keys_the_unit() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let rules = RuleSet::only(&[Rule::VariantCount]);
+    let find = |text: &str| {
+        let lines = outline(text, Edition::E2024, alloc);
+        let units = match Units::plan(lines.items(), text.len(), alloc) {
+            Ok(units) => units,
+            Err(error) => panic!("{error:?}"),
+        };
+        let mut out = Findings::new_in(alloc);
+        let mut scratch = blaze_own::AVec::new_in(alloc);
+        let mut by_unit = StdVec::new();
+        let linted = units.lint_all(&rules, text, FILE, alloc, &mut out, &mut scratch, |done| by_unit.push(done.findings.len()));
+        assert!(linted.is_ok(), "{linted:?}");
+        let variants = match Variants::gather(text, alloc) {
+            Ok(variants) => variants,
+            Err(error) => panic!("{error:?}"),
+        };
+        // The constant's unit (its text starts the line `pub const`), and every other's key.
+        let Some(at) = (0..units.list.len()).find(|u| text[units.list[*u].base as usize..].starts_with("pub const")) else {
+            panic!("no unit is the constant in {text:?}")
+        };
+        let key = |u: usize| {
+            let plan = units.list[u];
+            variants.unit_key(plan.base, plan.end - plan.base, units.holes_of(u))
+        };
+        let others_none = (0..units.list.len()).filter(|u| *u != at).all(|u| key(u).is_none());
+        let found: StdVec<&'static str> = out.list.iter().map(|f| f.template.kind()).collect();
+        (found, by_unit[at], key(at), others_none)
+    };
+    let three = "enum Kind { A, B, C }\npub const KINDS: usize = 3;\n";
+    let (found, in_const, key, others_none) = find(three);
+    // The finding is the constant's unit's; no other unit reads the enums.
+    assert_eq!(found, ["count"]);
+    assert_eq!(in_const, 1);
+    assert!(key.is_some() && others_none, "{key:?}");
+    // A fourth variant: the constant's unit's key moves (its text did not), and it finds nothing.
+    let (found, in_const, moved, _) = find("enum Kind { A, B, C, D }\npub const KINDS: usize = 3;\n");
+    assert_eq!((found.len(), in_const), (0, 0));
+    assert_eq!(moved, None);
+    // A renamed enum moves it too; an edit elsewhere that keeps the enums leaves it.
+    let (_, _, renamed, _) = find("enum Kinds { A, B, C }\npub const KINDS: usize = 3;\n");
+    assert!(renamed.is_some() && renamed != key);
+    let (_, _, kept, _) = find("enum Kind { A, B, C }\n\n\npub const KINDS: usize = 3;\n");
+    assert_eq!(kept, key);
+}
+
+#[test]
+fn variant_count_runs_from_suggest_up() {
+    let rule = Rule::VariantCount;
+    assert!(!Step::Rust.rules().runs(rule));
+    for step in [Step::Suggest, Step::Edition, Step::Strict] {
+        assert!(step.rules().runs(rule), "{} does not run {}", step.name(), rule.name());
+    }
+    assert_eq!(Rule::from_name("variant-count"), Some(rule));
+    assert_eq!(Template::VariantCount.rule(), rule);
+    assert_eq!(Template::VariantCountMany.rule(), rule);
+    assert_eq!(Template::HasherDefault.rule(), Rule::AmbientHasher);
+}
+
+/// The trie's size as the matcher's module doc states it: change both together.
+#[test]
+fn the_rule_trie_has_the_nodes_its_doc_says() {
+    assert_eq!(nodes_for(&PATTERNS), 207);
+}
+
+#[test]
+fn new_rules_are_off_until_named() {
+    for rule in [Rule::AmbientHeap, Rule::NoAsync, Rule::AmbientRead, Rule::LeftUndone, Rule::UnboundedWait, Rule::AmbientHasher] {
+        assert!(!Step::Strict.rules().runs(rule), "{} runs in strict", rule.name());
+        assert!(Step::Strict.rules().with(rule).runs(rule));
+        assert_eq!(Rule::from_name(rule.name()), Some(rule));
+        assert_ne!(Step::Strict.rules().with(rule).id(), Step::Strict.rules().id());
+    }
+    assert!(Rule::HOUSE.iter().all(|rule| Step::Strict.rules().runs(*rule)));
+    assert_eq!(Rule::from_name("no_async"), None);
+    assert_eq!(Rule::ALL.len(), Rule::COUNT);
+    assert!(Rule::ALL.iter().enumerate().all(|(at, rule)| rule.id() as usize == at + 1));
+}
+
+/// What `rules` finds in `text` with `holes` left out, as kinds and range texts.
+fn found_holed<'t>(rules: &RuleSet, text: &'t str, holes: &[Span]) -> StdVec<(&'static str, &'t str)> {
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut out = Findings::new_in(alloc);
+    let unit = Unit { text, holes, scope: FILE };
+    match lint(rules, &unit, alloc, &mut out) {
+        Ok(_) => out.list.iter().map(|f| (f.template.kind(), f.range.of(text))).collect(),
+        Err(error) => panic!("lint refused {text:?}: {error:?}"),
+    }
+}
+
+#[test]
+fn sequences_skip_comments_but_not_holes() {
+    let read = RuleSet::only(&[Rule::AmbientRead]);
+    // Comments and whitespace are not tokens: a sequence matches across them.
+    let split = "fn f() {\n    let t = Instant /* the clock */ :: // now\n        now();\n}";
+    assert_eq!(found(&read, split, FILE), [("clock", "Instant /* the clock */ :: // now\n        now")]);
+    // A child item is a token no sequence has: `todo` and `!` on either side of one are not
+    // `todo !`. With the same bytes as spaces instead of a hole, they are.
+    let undone = RuleSet::only(&[Rule::LeftUndone]);
+    let text = "fn f() {\n    todo\n    fn g() {}\n    !()\n}";
+    let start = text.find("fn g").map_or(0, |at| at as u32);
+    let hole = Span::new(start, start + "fn g() {}".len() as u32);
+    assert_eq!(found_holed(&undone, text, &[hole]), StdVec::<(&str, &str)>::new());
+    let blank = text.replace("fn g() {}", "         ");
+    assert_eq!(found(&undone, &blank, FILE).len(), 1);
+}
+
+// ---- the matcher against a scan per sequence ----------------------------------------------
+
+/// Overlapping sequences over the symbols 0 to 3 (4 is in none, so it ends every match): one a
+/// prefix of another, one starting inside another, two equal, a run of one symbol, one as long
+/// as a sequence may be.
+const TEST_PATTERNS: [Pattern; 8] = [
+    Pattern::of(&[0, 1]),
+    Pattern::of(&[0, 0, 1]),
+    Pattern::of(&[0, 1, 2]),
+    Pattern::of(&[1, 0]),
+    Pattern::of(&[2]),
+    Pattern::of(&[0, 1]),
+    Pattern::of(&[3, 3, 3]),
+    Pattern::of(&[0, 1, 2, 0, 1, 2, 0, 1]),
+];
+static TEST_TRIE: Trie<{ nodes_for(&TEST_PATTERNS) }, 5, 8> = Trie::build(&TEST_PATTERNS);
+
+/// A bug the matcher's control plants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MatchPlant {
+    None,
+    /// The live states dropped before each symbol: only one-symbol sequences are found.
+    RootOnly,
+}
+
+/// Every (sequence, first symbol, last symbol) the matcher finds in `syms`, sorted.
+fn matched<const N: usize, const S: usize, const Q: usize>(
+    trie: &Trie<N, S, Q>,
+    syms: &[u8],
+    plant: MatchPlant,
+) -> StdVec<(u16, u32, u32)> {
+    let mut live = Live::new();
+    let mut got = StdVec::new();
+    for (at, sym) in syms.iter().enumerate() {
+        if plant == MatchPlant::RootOnly {
+            live = Live::new();
+        }
+        live.step(trie, *sym, at as u32);
+        for state in 0..live.len() {
+            let (node, start) = live.state(state);
+            let mut seq = trie.first_end(node);
+            while seq != NO_SEQ {
+                got.push((seq, start, at as u32));
+                seq = trie.next_end(seq);
+            }
+        }
+    }
+    got.sort();
+    got
+}
+
+/// The oracle: each sequence compared at each position on its own.
+fn scanned(patterns: &[Pattern], syms: &[u8]) -> StdVec<(u16, u32, u32)> {
+    let mut got = StdVec::new();
+    for (row, pattern) in patterns.iter().enumerate() {
+        let pattern = pattern.as_slice();
+        for start in 0..syms.len() {
+            if syms[start..].starts_with(pattern) {
+                got.push((row as u16, start as u32, (start + pattern.len() - 1) as u32));
+            }
+        }
+    }
+    got.sort();
+    got
+}
+
+fn match_case(tape: &Tape, plant: MatchPlant) -> Result<(), Broke> {
+    let syms: StdVec<u8> = tape.vec(0..=48, "symbols", |t| t.int_in(0u8..=4, "symbol"));
+    let (want, got) = (scanned(&TEST_PATTERNS, &syms), matched(&TEST_TRIE, &syms, plant));
+    if want != got {
+        return Err(Broke::Oracle(format!("the matcher differs from the scan over {syms:?}:\nscan    {want:?}\nmatcher {got:?}")));
+    }
+    Ok(())
+}
+
+/// Passes printing nothing; a failure prints the symbols and both lists.
+#[test]
+fn matcher_equals_a_scan_per_sequence() {
+    blaze_sim::check(Config::cases(500), |tape| match_case(tape, MatchPlant::None));
+}
+
+/// Passes when the scan catches a matcher that keeps no live state ("plant RootOnly: caught at
+/// case k of n" on standard error).
+#[test]
+fn control_matcher_root_only() {
+    blaze_sim::control(Config::cases(500), MatchPlant::None, MatchPlant::RootOnly, "the matcher differs", match_case);
+}
+
+/// The rules' own table: streams made of whole sequences, their prefixes and `OTHER`, so the
+/// long ones and the shared prefixes are reached.
+#[test]
+fn rule_trie_equals_a_scan_per_sequence() {
+    blaze_sim::check(Config::cases(500), |tape| {
+        let pieces = tape.vec(0..=12, "pieces", |t| {
+            (t.below(PATTERNS.len() as u64, "pattern") as usize, t.below(LIVE as u64 + 1, "cut") as usize, t.coin("other"))
+        });
+        let mut syms = StdVec::new();
+        for (row, cut, other) in pieces {
+            let pattern = PATTERNS[row].as_slice();
+            syms.extend_from_slice(&pattern[..cut.min(pattern.len())]);
+            if other {
+                syms.push(OTHER);
+            }
+        }
+        let (want, got) = (scanned(&PATTERNS, &syms), matched(&TRIE, &syms, MatchPlant::None));
+        if want != got {
+            return Err(Broke::Oracle(format!("the rules' trie differs from the scan over {syms:?}:\nscan    {want:?}\ntrie    {got:?}")));
+        }
+        Ok(())
+    });
+}
+
 /// The fixes of `text`'s findings applied.
 fn fixed(text: &str) -> StdString {
     let alloc = blaze_own::testing::heap().alloc();
@@ -340,6 +895,11 @@ fn split(text: &str, scope: Scope) -> StdVec<Abs> {
     let mut scopes: StdVec<Option<Scope>> = vec![None; items.len()];
     let mut got = StdVec::new();
     let mut out = Findings::new_in(alloc);
+    // The file's one fact, gathered once, as a driver does.
+    let variants = match Variants::gather(text, alloc) {
+        Ok(variants) => variants,
+        Err(error) => panic!("the file's variants were refused: {error:?}"),
+    };
     // `None`: the root; then every entry in pre-order, its parent before it.
     let mut units: StdVec<Option<usize>> = vec![None];
     units.extend((0..items.len()).map(Some));
@@ -355,7 +915,7 @@ fn split(text: &str, scope: Scope) -> StdVec<Abs> {
             lines.children(parent).map(|(_, it)| Span::new(it.range.start - base, it.range.end - base)).collect();
         let unit = Unit { text: &text[base as usize..end as usize], holes: &holes, scope: unit_scope };
         out.clear();
-        let linted = match lint(&RuleSet::ALL, &unit, alloc, &mut out) {
+        let linted = match lint_in(&RuleSet::ALL, &unit, &variants, base, alloc, &mut out) {
             Ok(linted) => linted,
             Err(error) => panic!("lint refused unit {at:?}: {error:?}"),
         };
@@ -367,7 +927,13 @@ fn split(text: &str, scope: Scope) -> StdVec<Abs> {
     got
 }
 
-const STATEMENTS: [&str; 34] = [
+const STATEMENTS: [&str; 40] = [
+    "let r = [0u8; 3];",
+    "for i in 0..3 {\n    g(i);\n}",
+    "let d = dbg!(g(a));",
+    "dbg!(x);",
+    "let t = Instant /* now */ ::now(); let v = Vec::new();",
+    "loop {\n    rx.recv();\n}",
     "let a = x.clone();",
     "// clone: a refcount\nlet b = h.clone();",
     "let c = y.clone(); // clone: deep copy",
@@ -458,7 +1024,9 @@ fn gen_file(tape: &Tape) -> StdString {
     let mut names = 0u32;
     let count = tape.below(4, "items") + 1;
     for _ in 0..count {
-        match tape.below(9, "item") {
+        match tape.below(11, "item") {
+            9 => put_lines(&mut out, "", "enum E3 {\n    A,\n    B(u8),\n    C { x: u8 },\n}"),
+            10 => put_lines(&mut out, "", "const N: usize = 3;"),
             0 => gen_fn(tape, "", &mut names, &mut out),
             1 | 2 => {
                 let before = *tape.one_of(&BEFORE, "before");

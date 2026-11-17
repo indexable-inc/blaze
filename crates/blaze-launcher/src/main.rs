@@ -135,12 +135,24 @@ unsafe extern "C" {
     static environ: *const *const c_char;
 }
 
+/// The bytes of the exchange a hosted program's calls pass through (bstd `Hosting`): the size
+/// `blaze run`'s in-process host lends (blaze-cli program.rs `EXCHANGE`), which goes with that
+/// path (run.md piece 13), leaving this one.
+const EXCHANGE: usize = 4096;
+
+/// The threads the hosted world's native driver may run file calls on: one, since the hosted
+/// wire carries no file effect yet (run.md, "The hosted world": `Timer` and `Random` alone).
+const HOSTED_FILE_THREADS: usize = 1;
+
 /// The run path's mode (docs/v2/plan/design/run.md, piece 5): the parent, `blaze run`, set
 /// `BLAZE_LAUNCH_FD=3` (its socket pair's end), `BLAZE_LAUNCH_STORE` (the folder of code records)
-/// and `BLAZE_LAUNCH_ENTRY` (`<unit|c-main>:<symbol>`). Each is read once here and removed from
-/// the environment the program gets. Never returns: the program ends the process.
-fn run_mode(fd: OsString) -> ! {
-    use blaze_launch_rt::run_mode::{self, Folder, STOPPED, Start};
+/// and `BLAZE_LAUNCH_ENTRY` (`<unit|c-main|hosted>:<symbol>`), and for a hosted entry
+/// `BLAZE_LAUNCH_GRANTS` (blaze-launch grants.rs: the `(kind, name)` pairs the command line
+/// granted). Each is read once here and removed from the environment the program gets. Never
+/// returns: the program ends the process.
+fn run_mode(fd: OsString, os: &'static blaze_core::Os, shared: blaze_own::SharedAlloc<'static>) -> ! {
+    use blaze_launch::grants;
+    use blaze_launch_rt::run_mode::{self, EntryForm, Folder, Handed, STOPPED, Start};
     use std::os::fd::{FromRawFd, OwnedFd};
 
     if fd.as_encoded_bytes() != b"3" {
@@ -153,11 +165,32 @@ fn run_mode(fd: OsString) -> ! {
         stop(CANNOT_RUN, "BLAZE_LAUNCH_FD is set and BLAZE_LAUNCH_STORE (the folder of the run's code records) is not");
     };
     let Some(entry) = std::env::var_os("BLAZE_LAUNCH_ENTRY") else {
-        stop(CANNOT_RUN, "BLAZE_LAUNCH_FD is set and BLAZE_LAUNCH_ENTRY (`<unit|c-main>:<symbol>`) is not");
+        stop(CANNOT_RUN, "BLAZE_LAUNCH_FD is set and BLAZE_LAUNCH_ENTRY (`<unit|c-main|hosted>:<symbol>`) is not");
     };
     let start = match Start::parse(entry.as_encoded_bytes()) {
         Ok(start) => start,
         Err(why) => stop(CANNOT_RUN, &why.to_string()),
+    };
+    /// The entry's form with what only a hosted one has: its grants' text.
+    enum Form {
+        Unit,
+        CMain,
+        Hosted(OsString),
+    }
+    // Grants are a hosted program's alone: the parent sets the variable for a hosted entry
+    // (the empty text when the command line granted nothing) and for no other.
+    let form = match (start.form, std::env::var_os(grants::VAR)) {
+        (EntryForm::Unit, None) => Form::Unit,
+        (EntryForm::CMain, None) => Form::CMain,
+        (EntryForm::Hosted, Some(granted)) => Form::Hosted(granted),
+        (EntryForm::Hosted, None) => stop(
+            CANNOT_RUN,
+            &format!("BLAZE_LAUNCH_ENTRY names a hosted entry and {} (the grants of its command line) is not set", grants::VAR),
+        ),
+        (EntryForm::Unit | EntryForm::CMain, Some(_)) => stop(
+            CANNOT_RUN,
+            &format!("{} is set and BLAZE_LAUNCH_ENTRY names no hosted entry: grants are a hosted program's", grants::VAR),
+        ),
     };
     // SAFETY: one thread runs (nothing has been started yet), so nothing reads the environment
     // while it changes.
@@ -165,6 +198,7 @@ fn run_mode(fd: OsString) -> ! {
         std::env::remove_var("BLAZE_LAUNCH_FD");
         std::env::remove_var("BLAZE_LAUNCH_STORE");
         std::env::remove_var("BLAZE_LAUNCH_ENTRY");
+        std::env::remove_var(grants::VAR);
     }
     // SAFETY: asks whether descriptor 3 is open; changes nothing.
     if unsafe { libc::fcntl(3, libc::F_GETFD) } == -1 {
@@ -175,16 +209,88 @@ fn run_mode(fd: OsString) -> ! {
     let socket = unsafe { OwnedFd::from_raw_fd(3) };
     let store = store.into_vec();
     let folder = Folder::new(&store);
-    let why = run_mode::run(socket, &folder, start, blaze_own::SharedAlloc::global());
+    let why = match form {
+        // Nothing of the hosted world is made for these: the start stays the launcher's own.
+        Form::Unit => run_mode::run(socket, &folder, start.entry, Handed::Unit, shared),
+        Form::CMain => run_mode::run(socket, &folder, start.entry, Handed::CMain, shared),
+        Form::Hosted(granted) => {
+            let grants = match grants::parse(granted.as_encoded_bytes()) {
+                Ok(grants) => grants,
+                Err(why) => stop(CANNOT_RUN, &why.to_string()),
+            };
+            // The host's world, its arguments and grants, and the table into it: locals of this
+            // block, which `run` never leaves once the program starts (it ends the process), so
+            // they live, unmoved, until the process ends.
+            let host = make_host(os, &grants, shared);
+            let table = host.table();
+            // SAFETY: `table` is made by `host`, a `Hosting` of this process; both are locals of
+            // this block, never moved after this line, and dropped only after `run` returned,
+            // which it does only when the program could not start (its control thread joined,
+            // no program code ran): `HostTableAt::new`'s contract.
+            let at = unsafe { run_mode::HostTableAt::new(core::ptr::NonNull::from(&table).cast()) };
+            run_mode::run(socket, &folder, start.entry, Handed::Hosted(at), shared)
+        }
+    };
     stop(STOPPED, &format!("the program could not start: {why}"))
+}
+
+/// The host of a hosted program, made in its own process (run.md, "Every program runs in the
+/// child"): bstd's `Hosting` over this process's real world, giving the process's command line
+/// (the program's name first, as the parent spawned it: blaze-cli program.rs `argv`) and the
+/// command line's `grants`. The world is made with `os`, the root of real-OS authority `main`
+/// took, and is the native driver's over the start directory with no folder above it (a hosted
+/// program reaches no file yet), an empty environment (the environment is owed on the hosted
+/// wire: run.md, "The hosted world") and an empty command line of its own: the program's
+/// arguments are the host's, answered by the table's `arg`.
+fn make_host(
+    os: &'static blaze_core::Os,
+    grants: &blaze_launch::grants::Grants<'_>,
+    shared: blaze_own::SharedAlloc<'static>,
+) -> Box<bstd::hosting::Hosting> {
+    use bstd::args::ArgList;
+    use bstd::env::Vars;
+    use bstd::io::{Io, Limits, NativeWorld};
+
+    // bstd's host takes its arguments and grants as owned strings: once per run.
+    let mut args: Vec<String> = Vec::new();
+    for (at, arg) in std::env::args_os().enumerate() {
+        match arg.into_string() {
+            Ok(arg) => args.push(arg),
+            Err(_) => stop(CANNOT_RUN, &format!("argument {at} of this process is not UTF-8, and a hosted program's arguments are text")),
+        }
+    }
+    let grants: Vec<(String, String)> = grants.iter().map(|(kind, name)| (String::from(kind), String::from(name))).collect();
+    let world = NativeWorld {
+        root: std::path::Path::new("."),
+        threads: HOSTED_FILE_THREADS,
+        env: Vars::given(Vec::new()),
+        args: ArgList::given(Vec::new()),
+        host_name: std::sync::Arc::from(""),
+        // Drawn at the first `Io::rng`, not here: the start draws no randomness.
+        seed: None,
+        above: 0,
+        limits: Limits::USUAL,
+    };
+    let io = match Io::native_in(os, world) {
+        Ok(io) => io,
+        Err(why) => stop(CANNOT_RUN, &format!("the hosted program's world could not be made: {why}")),
+    };
+    bstd::hosting::Hosting::new(io, args, grants, EXCHANGE, shared)
 }
 
 fn main() {
     // Before any thread and any wait: a stub's wait and the control thread's use direct
     // system calls, which keep no per-thread state (THREADS.md D6; blaze_launch_rt::stub_wait).
     blaze_core::wait::choose(blaze_core::wait::Waits::Direct);
+    // An entry that takes no grant yet (a plain `fn main`), and the one heap here that must be
+    // shared across threads and freed: a frame is neither, so this stays the global heap's
+    // handle until the launcher's entry is handed one (lane H3's report).
+    let shared = blaze_own::SharedAlloc::global();
+    // The root of real-OS authority, taken once here, in the entry, and handed down: only a
+    // hosted program's world is made with it (`make_host`); taking it costs nothing.
+    let os = blaze_core::Os::process();
     if let Some(fd) = std::env::var_os("BLAZE_LAUNCH_FD") {
-        run_mode(fd);
+        run_mode(fd, os, shared);
     }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,

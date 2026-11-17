@@ -1,0 +1,13 @@
+{
+ "id": "run-closure-g3-1",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane G3 (run's member closure and program selection) on rebuild-1115",
+ "where": "crates/blaze-cli/src/tests/native_image_tests.rs, main.rs tests::a_clean_run_says_nothing_of_its_own, against green e773e1de38",
+ "what": "A trial of my piece showed four failing run tests (NoPart UnitGraph f96ae36bdec2, and the clean-run note). It took a second request with no change of mine (tree equal to green) to see they already fail on green: the runner admits on named tests only, so a red test outside every lane's filters stays red with no one told.",
+ "cost": "one queued request (about 4 minutes)",
+ "cause": "the runner's verdict covers the named tests, not a known-red list, so a lane cannot tell its breakage from the tree's without a control run",
+ "class": "a gate that tests only what each asker names lets a red test outlive the change that made it red",
+ "prevention": "wanted: the runner records which tests fail on the green tree (one run per admission) and marks them in each trial's output as already red",
+ "workaround": "ask once with a path whose content equals green as the control",
+ "state": "open"
+}

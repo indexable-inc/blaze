@@ -582,12 +582,13 @@ fn rust_files(dir: &FsPath, out: &mut Vec<PathBuf>) {
 }
 
 /// Real crates: the standard library's `core` and `alloc` (every kind of item, attribute and
-/// generic there is), the query engine (derives and generic code) and this crate.
+/// generic there is), the memo engine (derives and generic code; it took the place of the
+/// query engine, `crates/blaze-query`, deleted with the old item layer) and this crate.
 fn corpus() -> Vec<PathBuf> {
     let root = FsPath::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut files = Vec::new();
     for dir in
-        ["library/core/src", "library/alloc/src", "crates/blaze-query/src", "crates/const-ast/src"]
+        ["library/core/src", "library/alloc/src", "crates/blaze-memo/src", "crates/const-ast/src"]
     {
         rust_files(&root.join(dir), &mut files);
     }

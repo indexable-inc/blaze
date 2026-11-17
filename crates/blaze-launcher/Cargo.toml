@@ -16,13 +16,17 @@ path = "src/main.rs"
 test = false
 doctest = false
 
-# On `std`, not bstd, for the reason blaze-launch's documentation gives.
+# The launcher's own start is on `std`; a hosted program's host is bstd's (`Hosting` over the
+# process's world, run.md "Every program runs in the child"). The old reason for keeping bstd
+# out, that cargo could not build it, no longer holds: blaze-cli links blaze-std under cargo.
 [dependencies]
 blaze-launch.workspace = true
 blaze-launch-rt.workspace = true
+# A hosted entry's host table: `bstd::hosting::Hosting` over a native `Io`, made only for one.
+blaze-std.workspace = true
 # The process's wait driver, chosen first in `main` (direct system calls: THREADS.md D6).
 blaze-core.workspace = true
-# The run mode's allocator: the global one, named at the program's top (`SharedAlloc::global`).
+# The run mode's allocator, named once in `main` and handed down.
 blaze-own = { workspace = true, features = ["std"] }
 
 [target.'cfg(unix)'.dependencies]

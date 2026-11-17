@@ -46,28 +46,46 @@ fn a3() -> Raw<bool, char, u8> { Call::<bool, char>::new(true, 'x', 1) }
 fn a4(r: Call<bool, char>) -> bool { match r { Call { p, .. } => p } }
 fn bad1() -> Raw<bool, char, u16> { Call::new(true, 'x', 1) }
 fn bad2() -> Raw<bool, char, u16> { Call { p: true, c: 'x', n: 1 } }
+struct Wrap<T> { t: T }
+struct Poly<D> { alive: usize, data: D }
+impl<D> Poly<D> {
+    fn new(d: D) -> Self { Poly { alive: 0, data: d } }
+}
+type Inner<T, const N: usize> = Poly<[Wrap<T>; N]>;
+fn a5() -> Poly<[Wrap<bool>; 2]> { Inner::new([Wrap { t: true }, Wrap { t: false }]) }
+fn a6() -> Poly<[Wrap<bool>; 2]> { Inner { alive: 0, data: [Wrap { t: true }, Wrap { t: false }] } }
+fn bad3() -> Poly<[Wrap<u16>; 2]> { Inner::new([Wrap { t: true }, Wrap { t: false }]) }
 ";
 
 /// The bodies that must check clean, each with what it proves. `P` and `C` are different
 /// types in each: the two parameters left to inference are two variables, not one.
-const CLEAN: [(&str, &str); 4] = [
+const CLEAN: [(&str, &str); 6] = [
     ("a1", "`Call::new(..)`: an associated fn through the alias, no arguments written"),
     ("a2", "`Call { .. }`: a struct expression through the alias"),
     ("a3", "`Call::<bool, char>::new(..)`: the alias's own arguments written"),
     ("a4", "`Call { p, .. }`: a struct pattern through the alias"),
+    // core's `type InnerSized<T, const N: usize> = PolymorphicIter<[MaybeUninit<T>; N]>;`
+    // (library/core/src/array/iter.rs), reduced: one argument holds a type parameter and a
+    // const parameter as the array's length. Each becomes its own hole.
+    ("a5", "`Inner::new(..)`: two of the alias's parameters in one argument, `[Wrap<T>; N]`"),
+    ("a6", "`Inner { .. }`: a struct expression through that alias"),
 ];
 
 /// The bodies that must be a type mismatch (E0308): the alias fixes `Raw`'s third argument at
 /// `u8`, and each body returns a `Raw<_, _, u16>`. A fix that drops the fixed argument (a
 /// fresh variable there) passes them, the literal `1` taking `u16`.
-const MISMATCH: [(&str, &str); 2] = [
+const MISMATCH: [(&str, &str); 3] = [
     ("bad1", "`Call::new(true, 'x', 1)` is a `Raw<bool, char, u8>`, never a `Raw<_, _, u16>`"),
     ("bad2", "`Call { .. }` is a `Raw<bool, char, u8>`, never a `Raw<_, _, u16>`"),
+    ("bad3", "`Inner::new([Wrap { t: true }, ..])` is a `Poly<[Wrap<bool>; 2]>`, never one of `Wrap<u16>`"),
 ];
 
-/// Expected line: `test alias_path_keeps_the_fixed_argument ... ok`. Without the expansion
-/// every body here is `CheckFail::Gap` with `Gap::TypeAlias` ("the type alias .. named in a
-/// body path aliases a type with fixed arguments"), so the test fails on `a1`.
+/// Expected line: `test alias_path_keeps_the_fixed_argument ... ok`. Before the expansion
+/// every body here was `CheckFail::Gap` with `Gap::TypeAlias` ("the type alias .. named in a
+/// body path aliases a type with fixed arguments"). An alias the conversion does not expand is
+/// now `Def::Alias`, which the checker expands at the segment's arguments, so each body is
+/// still checked against the aliased type: an expansion that dropped the fixed argument (a
+/// looser `Raw<_, _, _>`) fails on `bad1`, one that lost `[Wrap<T>; N]`'s element on `bad3`.
 #[test]
 fn alias_path_keeps_the_fixed_argument() {
     let home = std::env::var("HOME").expect("HOME is set");
@@ -75,14 +93,14 @@ fn alias_path_keeps_the_fixed_argument() {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let files = [("/als/src/main.rs".to_string(), PATHS.to_string())];
     let edition = edition::PackageEdition::of_manifest("blaze-2026.11").expect("a known edition");
-    let user = UserCrate { name: "als", dir: "/als/", root: "/als/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "als", dir: "/als/", root: "/als/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: PATHS }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
-    let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"), front.frame);
+    let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let prepared = Prepares::new_in(Alloc::global());
     let mut buckets = None;
     let mut failed: Vec<String> = Vec::new();
@@ -167,14 +185,14 @@ fn alias_of_a_generic_associated_type_builds_its_impl() {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let files = [("/gat/src/main.rs".to_string(), GAT.to_string())];
     let edition = edition::PackageEdition::of_manifest("blaze-2026.11").expect("a known edition");
-    let user = UserCrate { name: "gat", dir: "/gat/", root: "/gat/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "gat", dir: "/gat/", root: "/gat/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: GAT }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
-    let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"), front.frame);
+    let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let mut built = Vec::new();
     let mut refused = Vec::new();
     for (k, _, _) in names.items(0) {

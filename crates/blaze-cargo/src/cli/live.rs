@@ -36,7 +36,7 @@ use std::{
 use blaze_api::{Artifact, ArtifactKind, Request, ResponseRef, TargetKind};
 use blaze_core::exit::Exit;
 use blaze_core::lock::Lock;
-use blaze_hash::HashSet;
+use blaze_hash::{FixedState, Set, SetOpts};
 use blaze_screen::{BinaryEnd, Caps, Event, Tally, Test, Verdict};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 
@@ -252,7 +252,7 @@ struct Runner {
     to_screen: Sender<Msg>,
     to_runner: Sender<Run>,
     binaries: Vec<Binary>,
-    seen: HashSet<PathBuf, Global>,
+    seen: Set<PathBuf, FixedState, Global>,
     queued: Vec<u32>,
     running: Vec<Running>,
     slots: usize,

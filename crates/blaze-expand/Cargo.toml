@@ -27,6 +27,9 @@ blaze-format.workspace = true
 # The schema's words (`Edition`, `CallShape`, `Range`, `MacroKind` and the builtin and proc
 # macro names) and the `MacroDef` record a `MacroDefinition` is written to and read from.
 blaze-surface.workspace = true
+# `TokensBuilder`, `Tokens`: an expansion's tokens as its token record (drive.md D122), written
+# beside its columns and opened where it is.
+blaze-tokens.workspace = true
 # `Vec`: every owning collection, in the allocator the caller names.
 blaze-own.workspace = true
 # `Hasher`: the keys and a definition's content hash.

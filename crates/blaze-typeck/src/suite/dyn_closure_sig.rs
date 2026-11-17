@@ -65,7 +65,7 @@ fn world() -> (Fx, [ItemKey; 3], [ItemKey; 2]) {
     let coerce = fx.tr("CoerceUnsized", 2, Vec::new(), &[]);
     fx.lang(LangItem::CoerceUnsized, coerce);
     let (p0, p1) = (fx.param(0), fx.param(1));
-    let rust_call = FnPtrHeader { abi: Abi::RustCall, safety: Safety::Safe };
+    let rust_call = FnPtrHeader { abi: Abi::RustCall, safety: Safety::Safe, c_variadic: false };
 
     // The `Fn*` traits as suite/fn_traits.rs declares them.
     let fn_once = fx.tr("FnOnce", 2, Vec::new(), &["Output"]);

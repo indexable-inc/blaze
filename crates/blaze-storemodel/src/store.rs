@@ -200,6 +200,13 @@ pub fn config() -> Config {
     Config { dir: FileName::new("store").expect("a name"), layers: Vec::new(), tags: 1 << 40, load_tags: (1 << 40) + (1 << 32), loader: blaze_cas::Loader::Pumped }
 }
 
+/// The windows a model's store reserves (`Store::open_reserving`): a scenario's store opens a
+/// few packs, and one search holds several stores at once (the run's, each restore's, its fresh
+/// build's and its restart's) on every test thread. At a store's own reservation (4 TiB each)
+/// a few dozen of them ran the process out of address space and every restore "did not open"
+/// (2026-11-17). A scenario that needs more stops naming the pool as full, never quietly.
+pub const WINDOWS: u32 = 16;
+
 /// Runs `effects` and what they lead to, each completing in the order asked, until none is
 /// in flight; more than `most` completions is a wait that does not end.
 pub fn drive(
@@ -231,7 +238,7 @@ pub fn drive(
 /// A store opened on `fs`, broken or not.
 pub fn open(fs: &mut CrashFs, bounds: &Bounds, what: &str) -> Result<Store, Failure> {
     let mut effects = Vec::new();
-    let mut store = Store::open(config(), &mut effects);
+    let mut store = Store::open_reserving(config(), WINDOWS, &mut effects);
     drive(fs, &mut store, &mut effects, bounds.steps, what)?;
     Ok(store)
 }
@@ -933,7 +940,7 @@ pub fn run_open(
     };
     let mut fs = model.on(disk);
     let mut effects = Vec::new();
-    let mut store = Store::open(config(), &mut effects);
+    let mut store = Store::open_reserving(config(), WINDOWS, &mut effects);
     fs.submit(&mut effects);
     let mut failures_left = model.failures;
     // The device died ([`Model::dies`]): every IO from here fails.

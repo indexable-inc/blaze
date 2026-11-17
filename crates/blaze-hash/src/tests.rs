@@ -596,3 +596,94 @@ fn get_or_insert_with_is_get_then_insert() {
         assert_eq!(tried.ok().map(|value| *value), Some(7));
     });
 }
+
+/// The keys a case inserts: up to 200, from a small range so that some repeat.
+fn keys_of(tape: &blaze_sim::Tape) -> Vec<u64> {
+    let count = tape.index(201, "keys");
+    (0..count).map(|_| tape.below(300, "key")).collect() // alloc: a case's keys
+}
+
+/// D126: `Map::new` and `Set::new` make what the constructors they replace made. With
+/// `capacity: None` it is `new_in`; with `Some(n)` it is `with_capacity_in(n, ..)`: the same
+/// capacity, and after the same inserts the same contents in the same iteration order, so the
+/// sweep from one to the other changes no program's output.
+#[test]
+fn new_with_options_is_the_old_constructors() {
+    use crate::{Map, MapOpts, Set, SetOpts};
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
+        let keys = keys_of(tape);
+        let room = if tape.coin("reserve") { Some(tape.index(500, "capacity")) } else { None };
+
+        let mut new: Map<u64, u64, FixedState, Global> =
+            Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: room });
+        let mut old: HashMap<u64, u64, Global> = match room {
+            None => HashMap::new_in(Global),
+            Some(n) => HashMap::with_capacity_in(n, Global),
+        };
+        assert_eq!(new.capacity(), old.capacity(), "capacity {room:?}");
+        if room.is_none() {
+            assert_eq!(new.capacity(), 0, "`capacity: None` reserves nothing");
+        }
+        let mut set: Set<u64, FixedState, Global> =
+            Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: room });
+        let mut old_set: crate::HashSet<u64, Global> = match room {
+            None => crate::HashSet::new_in(Global),
+            Some(n) => crate::HashSet::with_capacity_in(n, Global),
+        };
+        assert_eq!(set.capacity(), old_set.capacity(), "set capacity {room:?}");
+        for (step, &key) in keys.iter().enumerate() {
+            assert_eq!(new.insert(key, step as u64), old.insert(key, step as u64));
+            assert_eq!(set.insert(key), old_set.insert(key));
+        }
+        assert_eq!(new.capacity(), old.capacity());
+        assert!(new.iter().eq(old.iter()), "the same pairs in the same order");
+        assert!(set.iter().eq(old_set.iter()), "the same keys in the same order");
+
+        let tried: Map<u64, u64, FixedState, Global> =
+            Map::try_new(MapOpts { hasher: FixedState, alloc: Global, capacity: room })
+                .unwrap_or_else(|failure| panic!("{room:?}: {failure:?}"));
+        assert_eq!(tried.capacity(), old_capacity(room));
+    });
+}
+
+/// The capacity `with_capacity_in(n, ..)` gives, or `new_in`'s for `None`.
+fn old_capacity(room: Option<usize>) -> usize {
+    match room {
+        None => HashMap::<u64, u64, Global>::new_in(Global).capacity(),
+        Some(n) => HashMap::<u64, u64, Global>::with_capacity_in(n, Global).capacity(),
+    }
+}
+
+/// D125: a keyed table is made the same way, its key as the hasher; two tables under two
+/// different keys hold the same contents after the same inserts (their order may differ: it is
+/// the key's).
+#[test]
+fn a_keyed_table_takes_its_key_as_the_hasher() {
+    use crate::{Map, MapOpts, Set, SetOpts, SipKey};
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 128 }), |tape| {
+        let keys = keys_of(tape);
+        let first = SipKey::new(tape.int("k0"), tape.int("k1"));
+        let mut second = SipKey::new(tape.int("k2"), tape.int("k3"));
+        if second == first {
+            second = SipKey::new(first.words()[0] ^ 1, first.words()[1]);
+        }
+        let mut a: Map<u64, u64, SipKey, Global> =
+            Map::new(MapOpts { hasher: first, alloc: Global, capacity: None });
+        let mut b: Map<u64, u64, SipKey, Global> =
+            Map::new(MapOpts { hasher: second, alloc: Global, capacity: Some(keys.len()) });
+        let mut set: Set<u64, SipKey, Global> =
+            Set::new(SetOpts { hasher: second, alloc: Global, capacity: None });
+        for (step, &key) in keys.iter().enumerate() {
+            assert_eq!(a.insert(key, step as u64), b.insert(key, step as u64));
+            set.insert(key);
+        }
+        assert_eq!(a.len(), b.len());
+        assert_eq!(set.len(), a.len());
+        assert!(a.iter().all(|(key, value)| b.get(key) == Some(value) && set.contains(key)));
+        let mut a_pairs: Vec<(u64, u64)> = a.iter().map(|(k, v)| (*k, *v)).collect(); // alloc: the test's copy
+        let mut b_pairs: Vec<(u64, u64)> = b.iter().map(|(k, v)| (*k, *v)).collect(); // alloc: the test's copy
+        a_pairs.sort_unstable();
+        b_pairs.sort_unstable();
+        assert_eq!(a_pairs, b_pairs);
+    });
+}

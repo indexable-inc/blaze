@@ -12,7 +12,8 @@
 //! binary is in `deps/`, beside the `libbstd-<hash>.rlib` it was linked with and every crate
 //! bstd depends on; in the build directory's new layout each unit has its own
 //! `build/<package>/<hash>/out/`, and every one of them is searched. Each fixture gets
-//! `--extern bstd=<that rlib>` and `-L dependency=<dir>` for each, from which the compiler
+//! `--extern bstd=<that rlib>` and `-L dependency=<dir>` for each that holds a crate (in an
+//! argument file: the new layout's units outnumber what a command line holds), from which the compiler
 //! finds bstd's own dependencies by their hashes. Two `libbstd-*.rlib` (an older build of
 //! other features left in the same profile) are told apart by which was written last, the one
 //! this test's build made or kept, and the one chosen is named in every failure.
@@ -109,13 +110,22 @@ fn crate_dirs(exe: &Path) -> Vec<PathBuf> {
         }
         for unit in read(&package) {
             let unit = unit.unwrap_or_else(|error| panic!("{}: {error}", package.display())).path().join("out");
-            if unit.is_dir() {
+            if unit.is_dir() && holds_a_crate(&unit) {
                 dirs.push(unit);
             }
         }
     }
     dirs.sort();
     dirs
+}
+
+/// Whether a unit's `out/` holds a compiled crate (an `.rlib` or `.rmeta`): a build script's or
+/// a binary's unit holds none, and the compiler finds nothing in it.
+fn holds_a_crate(dir: &Path) -> bool {
+    fs::read_dir(dir).unwrap_or_else(|error| panic!("{}: {error}", dir.display())).any(|entry| {
+        let path = entry.unwrap_or_else(|error| panic!("{}: {error}", dir.display())).path();
+        path.extension().is_some_and(|it| it == "rlib" || it == "rmeta")
+    })
 }
 
 fn bstd() -> Bstd {
@@ -166,12 +176,20 @@ fn start(bstd: &Bstd, file: &Path, crate_name: &str) -> Started {
         .args(["--edition=2024", "--crate-type=lib", "--emit=link", "-Cdebuginfo=0", "--crate-name", crate_name])
         .arg("--extern")
         .arg(extern_bstd);
-    // The compiler finds each of bstd's dependencies by its hash among these.
+    // The compiler finds each of bstd's dependencies by its hash among these. In the build
+    // directory's layout they are one a compiled unit of the whole build, more than a command
+    // line holds (`Argument list too long`), so they go in an argument file (`@<file>`, one
+    // argument a line).
+    let mut search = String::new();
     for dir in &bstd.deps {
-        let mut deps = std::ffi::OsString::from("dependency=");
-        deps.push(dir);
-        command.arg("-L").arg(deps);
+        let dir = dir.to_str().unwrap_or_else(|| panic!("{}: not UTF-8, which an argument file cannot hold", dir.display()));
+        writeln!(search, "-L\ndependency={dir}").unwrap();
     }
+    let args = out.join("search.args");
+    fs::write(&args, search).unwrap_or_else(|error| panic!("{}: {error}", args.display()));
+    let mut at_args = std::ffi::OsString::from("@");
+    at_args.push(&args);
+    command.arg(at_args);
     command
         .arg("--out-dir")
         .arg(&out)

@@ -5,11 +5,11 @@
 use std::alloc::Global;
 use std::{path::{Path, PathBuf},
 sync::Arc,
-task::{Poll, Waker},};
+time::Duration,};
 
 use anyhow::{Context as _, bail};
-use blaze_core::lock::{Lock, LockGuard};
 use blaze_hash::SharedMap;
+use blaze_http::mailbox::{Latch, Setter, latch};
 use semver::{Version, VersionReq};
 
 use blaze_source::SourceId;
@@ -45,65 +45,43 @@ pub struct Registry {
     read: SharedMap<String, Arc<Read>, Global>,
 }
 
-/// One index file read once for every query that asks for it while it is read.
+/// The longest a query waits for another thread's read of the same index file: that read is
+/// one request (or a few, with the client's retries) each ended by the HTTP client's own
+/// deadlines, so a wait this long is a bug in the reader, said as one.
+const READ_WITHIN: Duration = Duration::from_secs(300);
+
+/// What one read of an index file ends in, for every query that waits for it: the error said
+/// whole, as each waiter reads its own copy.
+type Outcome = Result<Arc<Summaries>, String>;
+
+/// One index file read once for every query that asks for it while it is read: its reader
+/// holds the latch's setter ([`Reading`]).
 struct Read {
-    state: Lock<ReadState>,
+    done: Latch<Outcome>,
 }
 
-impl Default for Read {
-    fn default() -> Read {
-        Read { state: Lock::new("registry.index.read", ReadState::default()) }
-    }
-}
-
-enum ReadState {
-    /// Being read; the queries waiting for it.
-    Reading(Vec<Waker>),
-    Done(Result<Arc<Summaries>, String>),
-}
-
-impl Default for ReadState {
-    fn default() -> ReadState {
-        ReadState::Reading(Vec::new())
-    }
-}
-
-impl Read {
-    fn finish(&self, read: Result<Arc<Summaries>, String>) {
-        let state = std::mem::replace(&mut *self.lock(), ReadState::Done(read));
-        if let ReadState::Reading(waiting) = state {
-            waiting.into_iter().for_each(Waker::wake);
-        }
-    }
-
-    async fn wait(&self) -> anyhow::Result<Arc<Summaries>> {
-        std::future::poll_fn(|cx| match &mut *self.lock() {
-            ReadState::Reading(waiting) => {
-                waiting.push(cx.waker().clone());
-                Poll::Pending
-            }
-            ReadState::Done(read) => Poll::Ready(read.clone().map_err(anyhow::Error::msg)),
-        })
-        .await
-    }
-
-    fn lock(&self) -> LockGuard<'_, ReadState> {
-        self.state.lock()
-    }
-}
-
-/// Ends a [`Read`] whose reader stopped before it finished, so that no query waits for it.
+/// A [`Read`]'s reader: it sets the outcome, and one that stops before it does (a panic)
+/// forgets the read, so that no query after it waits for a read nobody is doing; the waiters
+/// already there read the setter's drop.
 struct Reading<'a> {
     registry: &'a Registry,
     name: &'a str,
     read: Arc<Read>,
+    set: Option<Setter<Outcome>>,
+}
+
+impl Reading<'_> {
+    fn finish(mut self, outcome: Outcome) {
+        if let Some(set) = self.set.take() {
+            set.set(outcome);
+        }
+    }
 }
 
 impl Drop for Reading<'_> {
     fn drop(&mut self) {
-        if matches!(*self.read.lock(), ReadState::Reading(_)) {
+        if self.set.is_some() {
             self.registry.forget(self.name, &self.read);
-            self.read.finish(Err(format!("the read of `{}`'s index file was dropped", self.name)));
         }
     }
 }
@@ -241,35 +219,41 @@ impl Registry {
     }
 
     /// The versions of `name` the index has, read once per update: a query that asks while
-    /// another reads the file waits for that read. An error is not kept.
-    pub async fn summaries(&self, name: &str) -> anyhow::Result<Arc<Summaries>> {
-        let (read, reader) = {
-            let open = self.read.pin();
-            match open.get(name) {
-                Some(read) => (read.clone(), false),
-                None => match open.try_insert(name.to_owned(), Arc::new(Read::default())) {
-                    Ok(read) => (read.clone(), true),
-                    Err(it) => (it.current.clone(), false),
+    /// another reads the file waits for that read, at most [`READ_WITHIN`]. An error is not
+    /// kept. It blocks this thread for the read (a request, when the cache is not good).
+    pub fn summaries(&self, name: &str) -> anyhow::Result<Arc<Summaries>> {
+        let (setter, waiters) = latch();
+        let (read, set) = {
+            let reads = self.read.pin();
+            match reads.get(name) {
+                Some(read) => (read.clone(), None),
+                None => match reads.try_insert(name.to_owned(), Arc::new(Read { done: waiters })) {
+                    Ok(read) => (read.clone(), Some(setter)),
+                    Err(it) => (it.current.clone(), None),
                 },
             }
         };
-        if !reader {
-            return read.wait().await;
-        }
-        let reading = Reading { registry: self, name, read };
-        let loaded = self.load_summaries(name).await.map(Arc::new);
+        let Some(set) = set else {
+            let what = "another query's read of a crate's index file";
+            return match read.done.wait(what, READ_WITHIN)? {
+                Some(outcome) => outcome.map_err(anyhow::Error::msg),
+                None => bail!("the read of `{name}`'s index file stopped before it ended (its reader panicked)"),
+            };
+        };
+        let reading = Reading { registry: self, name, read, set: Some(set) };
+        let loaded = self.load_summaries(name).map(Arc::new);
         if loaded.is_err() {
             self.forget(name, &reading.read);
         }
-        reading.read.finish(loaded.as_ref().map(Arc::clone).map_err(|e| format!("{e:#}")));
+        reading.finish(loaded.as_ref().map(Arc::clone).map_err(|e| format!("{e:#}")));
         loaded
     }
 
-    /// [`Registry::summaries`] on this thread.
-    pub fn summaries_blocking(&self, name: &str) -> anyhow::Result<Arc<Summaries>> {
-        // No bound of its own: the read ends by the HTTP client's deadlines, as `what` says.
-        let what = "a crate's index file (bounded by the HTTP client's timeouts)";
-        blaze_core::wait::block_on(what, None, self.summaries(name))?
+    /// `name`'s versions when this update has read them already, asking nothing: what a
+    /// resolve that must not block is answered from ([`crate::IndexRegistry`]).
+    pub fn held(&self, name: &str) -> Option<Arc<Summaries>> {
+        let read = self.read.pin().get(name)?.clone();
+        read.done.get()?.ok()
     }
 
     fn forget(&self, name: &str, read: &Arc<Read>) {
@@ -278,7 +262,7 @@ impl Registry {
 
     /// As cargo's `Summaries::parse`: the cache when the files say it is still good, else the
     /// file, whose cache is then written.
-    async fn load_summaries(&self, name: &str) -> anyhow::Result<Summaries> {
+    fn load_summaries(&self, name: &str) -> anyhow::Result<Summaries> {
         let lowered = name.to_lowercase();
         let relative = dep_path(&lowered, false);
         let cache_path = self.cache_root.join(&relative);
@@ -289,7 +273,7 @@ impl Registry {
         };
         let was_updated = self.is_updated();
         let response = match &self.files {
-            Files::Sparse(sparse) => sparse.load(&relative, index_version.as_deref()).await?,
+            Files::Sparse(sparse) => sparse.load(&relative, index_version.as_deref())?,
             Files::Local { root } => local_load(root, &relative)?,
             Files::Git(git) => git.load(&relative, index_version.as_deref())?,
         };
@@ -330,7 +314,7 @@ impl Registry {
     /// The versions of `name` that match `req`, as cargo's `query_inner`: offline, those whose
     /// `.crate` is on disk when there are any, and all of them when there are none.
     pub fn query(&self, name: &str, req: &VersionReq) -> anyhow::Result<Vec<IndexLine>> {
-        let summaries = self.summaries_blocking(name)?;
+        let summaries = self.summaries(name)?;
         let lines: Vec<IndexLine> = summaries.matching(req).collect();
         if !self.context.net.offline {
             return Ok(lines);
@@ -346,7 +330,7 @@ impl Registry {
     /// The checksum the index has for one version, which a download is checked against.
     pub fn checksum(&self, name: &str, version: &Version) -> anyhow::Result<String> {
         let exact = VersionReq::parse(&format!("={version}")).expect("a version is a requirement");
-        let summaries = self.summaries_blocking(name)?;
+        let summaries = self.summaries(name)?;
         let line = summaries.matching(&exact).find(|it| &it.entry.version == version);
         let line = line.with_context(|| format!("no hash listed for {name} v{version}"))?;
         if line.status == Status::Invalid || line.entry.checksum.is_empty() {

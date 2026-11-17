@@ -87,7 +87,7 @@ fn run_once(name: &str, pins: Option<&FactPins>) -> Run {
     vars.push(pair(CHILD, "1"));
     let env = Env { vars };
     let c = CInputs {
-        shelf: Shelf { dir: &shelf, clang_major: 23 },
+        shelf: Shelf { dir: &shelf, clang_major: "23" },
         sysroot: &sdk,
         out_dir: &out,
         package: &package,

@@ -99,6 +99,7 @@ impl BodyBuf {
             asm_operands: &[],
             asm_clobbers: &[],
             asm_text: "",
+            call_arg_ints: &[],
         }
     }
 }

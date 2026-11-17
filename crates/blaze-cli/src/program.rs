@@ -2,15 +2,21 @@
 //! handed to the walking skeleton's straight line (`blaze_ladder::run::run_program`: the new
 //! front end over the toolchain's shelf), which places the code in this process and calls
 //! `main` (crates/blaze-cli/tests/ladder/README.md, route (e)). A reached function this build
-//! cannot make is a stub: the program runs, and stops by name only if it calls one.
+//! cannot make is a stub: the program runs, and stops by name only if it calls one. Which
+//! process the program runs in is decided first, before anything is built
+//! (`blaze_ladder::run::entry_start`, the program's start as the launcher's form): every
+//! program goes to its own process (own_process.rs; run.md "Every program runs in the child")
+//! and is never built here. The in-process run (`run_in_process`) is dead, kept until the
+//! switch deletes it.
 
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use blaze_ladder::refusal::SourceFile;
 use blaze_ladder::run::{NewFront, OverflowChecks, RunError};
+use blaze_manifest::layout::panic;
 use blaze_manifest::layout::profile::{self, BuiltinProfile};
-use blaze_manifest::layout::{Entry, Layout, ManifestId, Need, Pass};
+use blaze_manifest::layout::ManifestId;
 use blaze_own::Vec;
 use bstd::Cx;
 use bstd::env::VarName;
@@ -23,16 +29,12 @@ use bstd::path::Path;
 use crate::CliError;
 use crate::sweep::{self, LeafKind, Rows};
 
-/// The crate root the skeleton runs: a binary package's.
-pub(crate) const ROOT: &str = "src/main.rs";
-
-/// Where the root package's sources are: the folder of [`ROOT`].
-const SOURCES: &str = "src/";
-
-/// What `blaze run` hands the program: the command's world, the grants named on its command line
-/// (`--grant name=value`, run.md), and the words after `--`.
+/// What `blaze run` hands the program: the command's world, which program (`-p`, `--bin`:
+/// run_package.rs), the grants named on its command line (`--grant name=value`, run.md), and
+/// the words after `--`.
 pub struct Launch<'a> {
     pub io: &'a Io,
+    pub select: crate::run_package::Select<'a>,
     pub grants: &'a [(&'a str, &'a str)],
     pub args: &'a [&'a str],
 }
@@ -40,34 +42,10 @@ pub struct Launch<'a> {
 /// The bytes of the exchange a hosted program's calls pass through (bstd `Hosting`).
 const EXCHANGE: usize = 4096;
 
-/// `blaze run` in a package with no binary at [`ROOT`], the one root the runner starts: the
-/// package by name and the binary targets it has (name, root), so the answer says what there is
-/// to run. Decided from the package's layout before a source file is read; never the front
-/// end's "no `main`", which a library's root would give without saying why.
-#[derive(Debug)]
-pub struct NoBinary {
-    pub package: std::boxed::Box<str, std::alloc::Global>,
-    /// Empty for a library alone.
-    pub bins: std::vec::Vec<(std::boxed::Box<str, std::alloc::Global>, std::boxed::Box<str, std::alloc::Global>), std::alloc::Global>,
-}
-
-impl core::fmt::Display for NoBinary {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let package = &self.package;
-        if self.bins.is_empty() {
-            return write!(f, "`blaze run`: the package `{package}` has no binary target (no `{ROOT}` and no `[[bin]]`): it is a library, so there is no program to run; `blaze check` and `blaze test` take it");
-        }
-        write!(f, "`blaze run`: the package `{package}` has no binary at `{ROOT}`, the one root `blaze run` starts yet; its binary targets:")?;
-        for (name, root) in self.bins.iter() {
-            write!(f, " `{name}` ({root})")?;
-        }
-        Ok(())
-    }
-}
-
 /// The program's source files, each path with its text, sorted by path: the files the
 /// request's walk opened (`rows`' slots that are present, from `Effect::Open` this command or
-/// the leaf table's rows on a repeat) under the root package's `src/`. Nothing is listed: what
+/// the leaf table's rows on a repeat) under `under`, the folder of the program's crate root
+/// (run_package.rs `Program::sources`: `src/` for the root package's). Nothing is listed: what
 /// else the checkout holds (a `target/` of a million entries) is never looked at, so the cost
 /// is the program's own files' (rule 77). The one home of the set, for the run and for the
 /// program's refusals (`main.rs`, `program_refusals`).
@@ -75,14 +53,14 @@ impl core::fmt::Display for NoBinary {
 /// `tables` are the rows to read them from: while the request runs (the program starts before
 /// the answer), the last answer's rows as followed and this command's opens, a file in both
 /// taken once; after the answer, the rows it kept. A row of a file no `mod` reaches any more is
-/// read and never used: the runner walks from [`ROOT`].
-pub fn sources<'f>(cx: &Cx, root: &Dir<ReadWrite>, tables: &[&Rows<'_>], frame: &'f Frame) -> Result<Vec<(&'f str, &'f str), &'f Frame>, CliError> {
+/// read and never used: the runner walks from the program's crate root.
+pub fn sources<'f>(cx: &Cx, root: &Dir<ReadWrite>, under: &str, tables: &[&Rows<'_>], frame: &'f Frame) -> Result<Vec<(&'f str, &'f str), &'f Frame>, CliError> {
     let mut paths: Vec<&'f str, &'f Frame> = Vec::new_in(frame);
     for rows in tables {
         for leaf in rows.of(LeafKind::Slot).filter(|leaf| !leaf.absent() && leaf.flags & sweep::BOTH == 0) {
             let real = sweep::real_path(rows.path(leaf), leaf.flags, frame);
             let path = core::str::from_utf8(real.leak()).map_err(|_| CliError::Text { what: "a path is not UTF-8" })?;
-            if path.starts_with(SOURCES) {
+            if path.starts_with(under) {
                 paths.push(path);
             }
         }
@@ -108,43 +86,81 @@ pub fn sources<'f>(cx: &Cx, root: &Dir<ReadWrite>, tables: &[&Rows<'_>], frame: 
 /// (`Gate::Beside`), before the walk has opened a file, so the walk's rows ([`sources`]) are
 /// not there yet on a first run. Only `src/` is listed, never the checkout: a `target/` of a
 /// million entries beside it costs nothing (it filled the command's frame when the whole
-/// checkout was listed). Owed (drive.md, "RUNNER 11"): the runner walks forward from [`ROOT`]
-/// through a loader, so a file no `mod` reaches is never read.
-pub fn run(cx: &Cx, root: &Dir<ReadWrite>, launch: &Launch<'_>, frame: &Frame) -> Result<u8, CliError> {
+/// checkout was listed). Owed (drive.md, "RUNNER 11"): the runner walks forward from the
+/// program's root (run_package.rs `Program::root`) through a loader, so a file no `mod` reaches
+/// is never read.
+///
+/// `picked` is the program `request` picked once (run_package.rs `pick`, main.rs): never picked
+/// again here, so the manifests are read once a command (rule 77).
+///
+/// `units` and `native` are the keys `Effect::StartProgram` carried: the units' record that
+/// names the entry and the `Native` record holding the program's image. They are taken here so
+/// the runner never reads them back from the request; nothing loads the image from the store
+/// yet (owed: the image path, A2b's ruling on A6b), so today's straight line does not read them.
+///
+/// `producer` is the code builder's identity from the command's producer table (D105): the
+/// record walk's code keys hold it.
+#[expect(unused_variables, reason = "`units` and `native` wait for the image path that loads the program from its records")]
+#[expect(clippy::too_many_arguments, reason = "the run's edge: each argument one handle or fact of it")]
+pub(crate) fn run<'h>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    launch: &Launch<'_>,
+    picked: &crate::run_package::Program<'_>,
+    units: blaze_drive::Key,
+    native: blaze_drive::Key,
+    producer: blaze_ids::producer::ProducerId<blaze_ids::producer::CodeBuilder>,
+    // The command's one store: a Rust program's code entries are found and kept there (own_process.rs).
+    lent: &crate::store::CommandLent,
+    // The request's certificate and the start list's name (start_list.rs): own_process.rs reads
+    // and writes the list under them.
+    today: crate::start_list::Today,
+    // The names records the roots and the maker read, opened on the first need of them, and
+    // the body ids (run_ids.rs) made on the first function stepped: main.rs's, each called at
+    // most once (run_parent.rs `CommandFront`).
+    names: &mut dyn FnMut() -> Result<blaze_ladder::run::make_one::NamesRecords<'h>, crate::run_parent::ParentError>,
+    ids: &mut dyn FnMut() -> Result<crate::run_ids::RunIds<'h>, crate::run_parent::ParentError>,
+    // The run's closing count, for the profile (own_process.rs `run_own`).
+    counted: &mut Option<crate::run_parent::Tally>,
+    heap: &'static blaze_own::Heap,
+    frame: &Frame,
+) -> Result<u8, CliError> {
     let cx = cx.span("blaze run: the program");
-    // First: whether the package has a binary to run at all (no source file is read for a
-    // library's `blaze run`).
-    let (package, edition) = package(&cx, root, frame)?;
-    let src = root.subdir(&Path::new(SOURCES.trim_end_matches('/'))?);
-    let listed = match src.list(&cx, frame) {
-        Ok(listed) => Some(listed),
-        // No `src/`: no file, and the runner says the crate root is not among them.
-        Err(error) if error.kind == bstd::fs::FsKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    let mut texts: Vec<(&str, &str), &Frame> = Vec::new_in(frame);
-    for (path, meta) in listed.iter().flatten() {
-        if meta.dir || !path.as_str().ends_with(".rs") {
-            continue;
-        }
-        let mut bytes = Bytes::new_in(frame, "a source file of the program");
-        src.read_all(&cx, path, &mut bytes)?;
-        // Both outlive the listing and the buffer: copied into the command's frame, freed with it.
-        let mut kept = Vec::with_capacity_in(SOURCES.len() + path.as_str().len(), frame);
-        kept.extend_from_slice(SOURCES.as_bytes());
-        kept.extend_from_slice(path.as_str().as_bytes());
-        let kept_path: &str = core::str::from_utf8(kept.leak()).map_err(|_| CliError::Text { what: "a path bstd listed is not UTF-8" })?;
-        let kept_text: &str = core::str::from_utf8(Vec::from_slice_in(bytes.as_slice(), frame).leak())
-            .map_err(|_| CliError::Text { what: "a source file of the program is not UTF-8" })?;
-        texts.push((kept_path, kept_text));
-    }
-    texts.sort_unstable_by(|a, b| a.0.cmp(b.0));
-    let mut files: Vec<SourceFile<'_>, &Frame> = Vec::with_capacity_in(texts.len(), frame);
-    for &(path, text) in texts.iter() {
-        files.push(SourceFile { path, text });
-    }
+    let (package, edition) = (picked.package, picked.edition);
+    // What the records are made for: the edition, the `dev` profile's overflow checks and
+    // panic strategy, the code builder (D105), this machine.
+    let overflow = dev_overflow(&cx, root, frame)?;
+    let panic = dev_panic(&cx, root, frame)?;
+    let isa = crate::run_parent::isa().map_err(|why| CliError::OwnProcess(crate::own_process::OwnError::Parent(why)))?;
+    let builder = crate::run_parent::builder_for(edition, overflow, panic, producer, isa).map_err(|why| CliError::OwnProcess(crate::own_process::OwnError::Parent(why)))?;
+    // EVERY program runs in its own process under the lazy parent (own_process.rs, D103, D124;
+    // run.md "Every program runs in the child"), and nothing of it is built here: its start
+    // (the roots: bstd's hosted entry, a C `main`, the shim of a Rust program with std, or
+    // `main` called directly) is read from the names records only when today's start list does
+    // not give it, and each function is found or made at its first call. Its status is the
+    // program's, unchanged; a failure of the parent's own is `CliError::OwnProcess`, which
+    // `run` ends with `NOT_RUN` (main.rs).
+    let roots = blaze_own::Erased::new(frame);
+    let front = crate::run_parent::CommandFront::new(names, ids, builder, heap.alloc(), roots.handle());
+    crate::own_process::run_own(&cx, launch, package, builder, front, lent, today, counted, frame).map_err(CliError::OwnProcess)
+}
+
+/// The in-process run of a program (blaze-ladder `run_program_given`): DEAD since every
+/// program runs in the launcher's child (run.md "Every program runs in the child"); kept, with
+/// what it builds (the argument vector, the host table over `launch`'s grants), until the
+/// switch deletes it with `run_program_given`.
+#[expect(dead_code, reason = "the in-process run, deleted at the switch to the lazy parent (run.md, \"Every program runs in the child\")")]
+fn run_in_process(cx: &Cx, launch: &Launch<'_>, files: &[SourceFile<'_>], program_root: &str, new: NewFront<'_>, package: &str, heap: &'static blaze_own::Heap, frame: &Frame) -> Result<u8, CliError> {
+    let shared = heap.shared();
+    // The program's command line, its name first (run.md "What a program is given"; bstd
+    // `Args`: "0 being the program's name"; the run parent's child gets `arg0: package` the
+    // same way), made once in the command's frame (D102): the one vector both starts read: a
+    // hosted program's `args` grant through the host, a C `main`'s `argc` and `argv` through
+    // the runner ([`blaze_ladder::run::Given`]). It lives until the program has returned.
+    let argv_alloc = blaze_own::Erased::new(frame);
+    let mut argv = blaze_ladder::argv::Argv::new_in(package, launch.args, argv_alloc.handle()).map_err(|e| CliError::Program(RunError::Args(e)))?;
     // bstd's host takes its arguments and grants as owned strings: once per run, Global.
-    let args = launch.args.iter().map(|arg| std::string::String::from(*arg)).collect();
+    let args = argv.strings().map(std::string::String::from).collect();
     // `--grant <name>=<value>` is the design's order; the host's list is `(kind, name)`
     // (host_grants.rs): read each, refusing a scope the hosted wire cannot carry.
     let grants = launch
@@ -158,30 +174,23 @@ pub fn run(cx: &Cx, root: &Dir<ReadWrite>, launch: &Launch<'_>, frame: &Frame) -
         .collect::<Result<std::vec::Vec<_>, _>>()
         .map_err(CliError::HostGrant)?;
     // clone: the command's world, a refcount.
-    // D102: blaze-cli's entry does not hand its heap down yet; this moves with blaze-cli.
-    let shared = blaze_own::SharedAlloc::global();
     let hosting = Hosting::new(launch.io.clone(), args, grants, EXCHANGE, shared);
     let table = hosting.table();
     let host = NonNull::from(&table).cast::<c_void>();
-    // The new front end's inputs: the package as its manifest names it, and the toolchain's
-    // shelf under the home the command was started with (read from the command's own `Io`).
-    let env = launch.io.env();
-    let home = match env.as_ref() {
-        Some(env) => env.get(&VarName::new("HOME").map_err(|_| CliError::Text { what: "`HOME` is no variable name" })?).ok().flatten(),
-        None => None,
-    };
-    let shelf = home.map(|home| bstd::mem::format_in!(frame, "{}/{}", home.trim_end_matches('/'), crate::toolchain::SHELF));
-    let overflow = dev_overflow(&cx, root, frame)?;
-    let new = NewFront { package, edition, shelf: shelf.as_ref().map(|shelf| shelf.as_str()), overflow };
-    let ran = blaze_ladder::run::run_program(&files, ROOT, Some(host), new, shared).map_err(CliError::Program);
-    // The table points into the host: both are dropped only after the program returned.
+    let given = blaze_ladder::run::Given { host: Some(host), args: Some(argv.c()) };
+    // Handed a Rust program with std, the runner refuses it by name (`RunError::OwnProcess`),
+    // an error here like any other: never a second route.
+    let ran = blaze_ladder::run::run_program_given(files, program_root, given, new, shared);
+    // The table points into the host, `given.args` into `argv`: all are dropped only after the
+    // program returned.
     drop(table);
     drop(hosting);
-    let ran = ran?;
+    drop(argv);
+    let ran = ran.map_err(CliError::Program)?;
     // The run's closing note, on the error stream (standard output is the program's alone): a
     // reached function that is not built is never passed over in silence, called or not.
     if ran.not_built > 0 {
-        launch.io.need_err()?.line(&cx, format_args!("note: {} of {} reachable functions are not built yet; none was called", ran.not_built, ran.reached))?;
+        launch.io.need_err()?.line(cx, format_args!("note: {} of {} reachable functions are not built yet; none was called", ran.not_built, ran.reached))?;
     }
     Ok(ran.status)
 }
@@ -193,13 +202,10 @@ pub fn run(cx: &Cx, root: &Dir<ReadWrite>, launch: &Launch<'_>, frame: &Frame) -
 /// through unchanged, and 101 stays a Rust program's panic.
 pub(crate) const NOT_RUN: u8 = 125;
 
-/// The passes the package's layout may take (units.rs `MOST_PASSES`; rule 18).
-const MOST_PASSES: usize = 64;
-
 /// The `dev` profile's `overflow-checks` (decision D101), which `blaze run` builds the program
 /// with and `blaze check` finds what that build refuses with: on, unless the workspace root's
-/// manifest (`Cargo.toml` at `root`, the checkout's root, which [`package`] requires to be the
-/// workspace's root) says otherwise under `[profile.dev]` (blaze-manifest `layout::profile`).
+/// manifest (`Cargo.toml` at `root`, the checkout's root, where the layout reads the workspace
+/// from; a member's own `[profile]` is not read, as cargo reads only the root's) says otherwise under `[profile.dev]` (blaze-manifest `layout::profile`).
 /// `blaze export` will take `BuiltinProfile::Release` the same way (off unless set).
 pub fn dev_overflow(cx: &Cx, root: &Dir<ReadWrite>, frame: &Frame) -> Result<OverflowChecks, CliError> {
     let refused = |why: &dyn core::fmt::Display| CliError::Program(RunError::Manifest { why: Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) });
@@ -211,70 +217,25 @@ pub fn dev_overflow(cx: &Cx, root: &Dir<ReadWrite>, frame: &Frame) -> Result<Ove
     Ok(if on { OverflowChecks::On } else { OverflowChecks::Off })
 }
 
+/// The `dev` profile's `panic` (UNWIND.md 3.1), the program's profile fact, from which every
+/// unit's strategy is derived (blaze-world `panic::unit_panic`): `unwind` unless the workspace
+/// root's manifest says `[profile.dev] panic = "abort"` (Rust's rule: no `panic` key unwinds;
+/// blaze-manifest `layout::panic`, which refuses any other value naming the manifest, the
+/// profile and the value). Not read for a test build (blaze-world `panic::TEST_PROFILE`).
+pub fn dev_profile_panic(cx: &Cx, root: &Dir<ReadWrite>, frame: &Frame) -> Result<panic::ProfilePanic, CliError> {
+    let refused = |why: &dyn core::fmt::Display| CliError::Program(RunError::Manifest { why: Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) });
+    let mut bytes = Bytes::new_in(frame, "the root manifest");
+    root.read_all(cx, &Path::new(ROOT_MANIFEST)?, &mut bytes)?;
+    let text = core::str::from_utf8(bytes.as_slice()).map_err(|_| CliError::Text { what: "the root manifest is not UTF-8" })?;
+    let erased = blaze_own::Erased::new(frame);
+    panic::panic_strategy(text, ManifestId(0), ROOT_MANIFEST, BuiltinProfile::Dev, erased.handle()).map_err(|e| refused(&e))
+}
+
+/// The program's strategy for the record run of `blaze run` (`own_process::run_own`'s caller
+/// passes it): the target-side program unit's, a binary, by blaze-world's one function.
+pub fn dev_panic(cx: &Cx, root: &Dir<ReadWrite>, frame: &Frame) -> Result<blaze_ladder::run::Panic, CliError> {
+    Ok(blaze_ladder::panic_strategy::of_profile(dev_profile_panic(cx, root, frame)?))
+}
+
 /// The workspace root's manifest, under the checkout's root.
 const ROOT_MANIFEST: &str = "Cargo.toml";
-
-/// The root package's name, and its edition as a manifest writes it (`2024`, `blaze-2026.11`):
-/// what the runner's front end is given ([`NewFront`]). Read by the workspace's one manifest
-/// reader (blaze-manifest `Layout`), so an inherited edition is the workspace's.
-///
-/// Owed (drive.md, "Run"): the request has laid the workspace before the program starts; when
-/// blaze-run's `Parent` starts the program from the units' record, this second read goes.
-fn package<'f>(cx: &Cx, root: &Dir<ReadWrite>, frame: &'f Frame) -> Result<(&'f str, &'f str), CliError> {
-    let refused = |why: &dyn core::fmt::Display| CliError::Program(RunError::Manifest { why: Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) });
-    let kept = |text: &str| -> Result<&'f str, CliError> {
-        core::str::from_utf8(Vec::from_slice_in(text.as_bytes(), frame).leak()).map_err(|_| CliError::Text { what: "the package's manifest is not UTF-8" })
-    };
-    let erased = blaze_own::Erased::new(frame);
-    let mut layout = Layout::new("", erased.handle()).map_err(|e| refused(&e))?;
-    for _ in 0..MOST_PASSES {
-        let needs = match layout.pass().map_err(|e| refused(&e))? {
-            Pass::Need(needs) => needs,
-            Pass::Done(units) => {
-                // The package `blaze run` runs is the checkout's root's own ([`ROOT`]).
-                let Some(member) = units.members.iter().find(|member| member.dir.as_str().is_empty()) else {
-                    return Err(refused(&"the checkout's root is a workspace with no package of its own, and `blaze run` runs the root's package"));
-                };
-                if !member.bins.iter().any(|bin| bin.root.as_str() == ROOT) {
-                    let owned = |text: &str| std::boxed::Box::<str, std::alloc::Global>::from(text);
-                    let mut bins = std::vec::Vec::new_in(std::alloc::Global);
-                    for bin in member.bins.iter() {
-                        bins.push((owned(bin.name.as_str()), owned(bin.root.as_str())));
-                    }
-                    return Err(CliError::NoBinary(NoBinary { package: owned(member.name.as_str()), bins }));
-                }
-                let edition = match member.edition.blaze {
-                    Some(blaze) => blaze.manifest(),
-                    None => kept(bstd::mem::format_in!(frame, "{}", member.edition.syntax).as_str())?,
-                };
-                return Ok((kept(member.name.as_str())?, edition));
-            }
-        };
-        for need in needs.iter() {
-            match need {
-                Need::Manifest(path) => {
-                    let mut bytes = Bytes::new_in(frame, "a manifest");
-                    let text = match root.read_all(cx, &Path::new(path.as_str())?, &mut bytes) {
-                        Ok(_) => Some(core::str::from_utf8(bytes.as_slice()).map_err(|_| CliError::Text { what: "a manifest is not UTF-8" })?),
-                        Err(error) if error.kind == bstd::fs::FsKind::NotFound => None,
-                        Err(error) => return Err(error.into()),
-                    };
-                    layout.manifest(path.as_str(), text).map_err(|e| refused(&e))?;
-                }
-                Need::Listing(dir) => {
-                    // `Dir::list` gives no entries for a directory that is not there.
-                    let listed = match dir.as_str() {
-                        "" => root.list(cx, frame)?,
-                        named => root.subdir(&Path::new(named)?).list(cx, frame)?,
-                    };
-                    let mut entries: Vec<Entry<'_>, &Frame> = Vec::with_capacity_in(listed.len(), frame);
-                    for (path, meta) in listed.iter() {
-                        entries.push(Entry { name: path.as_str(), is_dir: meta.dir });
-                    }
-                    layout.listing(dir.as_str(), Some(&entries));
-                }
-            }
-        }
-    }
-    Err(CliError::Text { what: "the package's layout asked for more than 64 passes" })
-}

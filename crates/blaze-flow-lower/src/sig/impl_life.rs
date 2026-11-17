@@ -145,7 +145,7 @@ pub fn read_impl_signature<'t, A: Allocator + Clone>(
     tys: PTys<'_>,
     inputs: &[PTy],
     output: PTy,
-    adt_lifetimes: &dyn Fn(ItemKey) -> Option<bool>,
+    adt_lifetimes: &dyn Fn(ItemKey) -> Option<u32>,
     out: &mut SigBuf<A>,
     alloc: A,
 ) -> Result<(), SigRefusal> {
@@ -234,7 +234,7 @@ fn writes_outer_lifetime<A: Allocator + Clone>(text: &str, alloc: A) -> Result<b
 fn impl_life<'t, A: Allocator + Clone>(
     imp: ImplText<'t>,
     tys: PTys<'_>,
-    adt_lifetimes: &dyn Fn(ItemKey) -> Option<bool>,
+    adt_lifetimes: &dyn Fn(ItemKey) -> Option<u32>,
     alloc: A,
 ) -> Result<ImplLife<'t, A>, AssocWhy> {
     let mut r = Reader {

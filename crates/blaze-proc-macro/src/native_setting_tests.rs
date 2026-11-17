@@ -32,7 +32,7 @@ use crate::{
 };
 
 const HOST: &str = "aarch64-apple-darwin";
-/// The aarch64-apple-darwin row's sha256 in crates/hir-ty-codegen/clang.json.
+/// The aarch64-apple-darwin row's sha256 in crates/blaze-toolchain/pins/clang.json.
 const PIN_HEX: &str = "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef";
 
 /// A fresh folder under the system's temporary one, by this process and `name`.

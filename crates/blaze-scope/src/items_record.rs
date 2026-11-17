@@ -36,9 +36,12 @@ pub mod grain;
 pub mod owners;
 pub mod variants;
 
-pub use grain::{ItemNow, ItemPieces, ItemToday};
+pub mod members;
 
-use core::cell::{Cell, OnceCell};
+pub use grain::{ItemNow, ItemPieces, ItemToday};
+pub use members::Members;
+
+use core::cell::{Cell, OnceCell, RefCell};
 
 use blaze_hash::HashMap;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
@@ -58,8 +61,10 @@ const MAGIC: [u8; 4] = *b"BZIT";
 /// record is refused the same way. 6: a built-in derive is its own body kind
 /// ([`BODY_BUILTIN_DERIVE`], its helpers in the strings: names-attr-4); a version-5 record is
 /// refused the same way. 7: the crate's `std` (header field [`F_STD`], [`ItemsRecord::std_is`]);
-/// a version-6 record is refused the same way.
-const VERSION: u32 = 7;
+/// a version-6 record is refused the same way. 8: an impl row keeps the crate each path's root
+/// names when an expansion wrote `crate` for another crate's `$crate` (token-mark-2 R2; row 128
+/// bytes); a version-7 record is refused the same way.
+const VERSION: u32 = 8;
 const ALIGN: usize = 16;
 const HEADER: usize = 256;
 const KEYS_AT: usize = 160;
@@ -72,7 +77,11 @@ const EXPANSION_ROW: usize = 72;
 const ITEM_ROW: usize = 72;
 const OWNER_ROW: usize = 40;
 const MEMBER_ROW: usize = 56;
-const IMPL_ROW: usize = 64;
+const IMPL_ROW: usize = 128;
+/// An impl row's roots word (+60): the trait path's root key is held (+64).
+const ROOT_TRAIT: u32 = 1;
+/// The self path's root key is held (+96).
+const ROOT_SELF: u32 = 2;
 const LANG_ROW: usize = 40;
 const MACRO_ROW: usize = 72;
 const MODULE_ROW: usize = 48;
@@ -197,6 +206,11 @@ pub enum ItemsRecordError {
     Range { krate: CrateItemKey, start: u32, len: u32 },
     /// File row `at`'s path is not a package-relative path (D96: a record holds no root).
     NotPackagePath { at: usize, why: NotPackagePath },
+    /// An impl header's path in an expansion text is no slice of the text its marks are of
+    /// (token-mark-2 R2): its root cannot be read, so the record is not written.
+    RootMark { impl_: ItemKey, miss: crate::crate_roots::MarkMiss },
+    /// An impl row's roots word holds bits no row has.
+    Roots { key: ItemKey, bits: u32 },
 }
 
 /// Header field [`F_STD`]: 0 for Rust's `std`, 1 + the edition's discriminant for bstd under a
@@ -355,6 +369,26 @@ impl SelfHead {
     }
 }
 
+/// The crate `path`'s first segment names when it is NOT `here` (token-mark-2 R2): a `crate` the
+/// renderer wrote for another crate's `$crate` carries that crate's root mark (crate_roots
+/// `root_mark`), read by the one resolver, [`crate::crate_roots::root_by_mark`]. `None`: no marks
+/// (a file, a kept item, a block text: read as the scope read them), an absolute path, a first
+/// segment that is no root, or this crate's root.
+fn root_of_path(marks: Option<crate::crate_roots::TextMarks<'_>>, path: &str, here: CrateItemKey, impl_: ItemKey) -> Result<Option<CrateItemKey>, ItemsRecordError> {
+    let Some(marks) = marks else { return Ok(None) };
+    let t = path.trim_start();
+    if t.starts_with("::") {
+        return Ok(None);
+    }
+    let end = t.find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$')).unwrap_or(t.len());
+    let first = &t[..end];
+    let mark = marks.mark_of(first).map_err(|miss| ItemsRecordError::RootMark { impl_, miss })?;
+    Ok(match crate::crate_roots::root_by_mark(first, mark) {
+        crate::crate_roots::Root::Crate(k) if k != here => Some(k),
+        _ => None,
+    })
+}
+
 /// Whether `s` is a path of plain segments: `a`, `a::b`, `::a::b`, `r#a`, a macro's
 /// `$crate::a`; no spaces, no arguments, no anchor.
 fn plain_path(s: &str) -> bool {
@@ -468,6 +502,10 @@ struct ImplOut<'s> {
     marks: u8,
     /// Where the bucket index files it ([`buckets::filing`]).
     filing: buckets::Filing,
+    /// The crate the trait path's / self path's first segment names, when not this one
+    /// ([`root_of_path`]).
+    trait_root: Option<CrateItemKey>,
+    self_root: Option<CrateItemKey>,
 }
 
 /// The items record of a solved crate. Its bytes are a function of the solve's answers: every
@@ -542,6 +580,8 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
                 head: SelfHead::Other,
                 marks: HEADER_UNREAD,
                 filing: buckets::Filing::Not(buckets::NotFiled::HeaderUnread),
+                trait_root: None,
+                self_root: None,
             },
             Ok(h) => {
                 let (head, self_path) = self_head(h.self_ty, h.params.as_slice());
@@ -562,8 +602,29 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
                     }
                 };
                 let negative = h.flags.bits() & ImplFlags::NEGATIVE.bits() != 0;
-                let filing = buckets::filing(heads, names.key, i.module, h.trait_, negative, head, self_path, alloc);
-                ImplOut { key: i.key, module: i.module, trait_path, self_path: self_path.unwrap_or(""), flags: h.flags.bits(), head, marks, filing }
+                // token-mark-2 R2: a path an expansion wrote with another crate's root keeps it;
+                // the row's text alone would read `crate` as this crate.
+                let trait_root = match h.trait_ {
+                    Some(t) => root_of_path(i.marks, path_and_bare(t).0, names.key, i.key)?,
+                    None => None,
+                };
+                let self_root = match self_path {
+                    Some(p) => root_of_path(i.marks, p, names.key, i.key)?,
+                    None => None,
+                };
+                let filing = buckets::filing(heads, names.key, i.module, h.trait_, negative, head, self_path, trait_root, self_root, alloc);
+                ImplOut {
+                    key: i.key,
+                    module: i.module,
+                    trait_path,
+                    self_path: self_path.unwrap_or(""),
+                    flags: h.flags.bits(),
+                    head,
+                    marks,
+                    filing,
+                    trait_root,
+                    self_root,
+                }
             }
         };
         impls.push(out);
@@ -640,7 +701,10 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
         }
         impl_rows.extend_from_slice(&[head, i.marks]);
         put16(&mut impl_rows, arity);
-        put32(&mut impl_rows, 0);
+        let roots = (if i.trait_root.is_some() { ROOT_TRAIT } else { 0 }) | (if i.self_root.is_some() { ROOT_SELF } else { 0 });
+        put32(&mut impl_rows, roots);
+        impl_rows.extend_from_slice(&i.trait_root.map_or([0; 32], |k| k.0.0));
+        impl_rows.extend_from_slice(&i.self_root.map_or([0; 32], |k| k.0.0));
     }
 
     // The items, by key.
@@ -961,14 +1025,15 @@ pub struct MemberRow<'a> {
 /// An impl of the crate, with what an impl index files it by, read from its header when the
 /// crate was solved: no text is read to file it (question 14, `Buckets::file`'s facts).
 ///
-/// Row, 64 bytes, sorted by (trait path as written, module, key), so the inherent impls come
+/// Row, 128 bytes, sorted by (trait path as written, module, key), so the inherent impls come
 /// first and each run of equal (trait path, module) is resolved once: key 32; module u32 (the
 /// module the two paths are resolved in); trait path at/len u32 (without its arguments and
 /// without a negative impl's `!`; empty: an inherent impl or an unread trait); self path at/len
 /// u32 (the self type's head path without arguments, for `Path` and `Param`); impl flags u32
 /// (`ImplFlags`: negative, unsafe, default, const); head u8 and arity u16 ([`SelfHead`]); marks
 /// u8 (has a trait; bare: the trait has no arguments, `Homes::bare`; header unread; trait not a
-/// plain path); pad.
+/// plain path); roots u32 ([`ROOT_TRAIT`], [`ROOT_SELF`]); trait root key 32 and self root key 32
+/// (zero unless its bit is set: token-mark-2 R2).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ImplRow<'a> {
     pub key: ItemKey,
@@ -988,6 +1053,11 @@ pub struct ImplRow<'a> {
     pub header_unread: bool,
     /// A trait impl whose trait is not a plain path.
     pub trait_unread: bool,
+    /// The crate `trait_path`'s first segment `crate` names when an expansion wrote it for
+    /// another crate's `$crate` (token-mark-2 R2); `None`: as the text reads in this crate.
+    pub trait_root: Option<CrateItemKey>,
+    /// The same for `self_path`.
+    pub self_root: Option<CrateItemKey>,
 }
 
 /// A module of the crate.
@@ -1039,8 +1109,6 @@ pub struct ItemsDecoded {
     pub crates: usize,
     /// Records' bytes, opened.
     pub bytes: usize,
-    /// Member lists turned into their working form.
-    pub member_lists: usize,
     /// Texts asked of the loader and checked against their digest.
     pub texts: usize,
     /// Their bytes (hashed once each).
@@ -1055,9 +1123,11 @@ enum Seen<'a> {
     Gone,
 }
 
-/// One crate's items record, read in place: a row is found by binary search and read from the
-/// bytes each time it is asked; a member list, the cfg atoms and each text are made or checked
-/// the first time asked, then kept for the rest of the command.
+/// One crate's items record, read in place (D114 rule 1, a record is its own index): a row, a
+/// file's rows, an owner's members ([`Members`]) and an expansion are each found by binary search
+/// and read from the bytes each time asked. Opening allocates nothing. The cfg atoms are made
+/// the first time asked, and each text is checked against its digest the first time asked; both
+/// are kept for the rest of the command.
 pub struct ItemsRecord<'a> {
     bytes: &'a [u8],
     key: CrateItemKey,
@@ -1065,10 +1135,10 @@ pub struct ItemsRecord<'a> {
     counts: [usize; TABLES],
     offsets: [usize; TABLES + 1],
     strings_len: usize,
-    members: AVec<'a, OnceCell<AVec<'a, MemberRow<'a>>>>,
     atoms: OnceCell<AVec<'a, (&'a str, Option<&'a str>)>>,
-    files_seen: AVec<'a, OnceCell<Seen<'a>>>,
-    expansions_seen: AVec<'a, OnceCell<Seen<'a>>>,
+    /// Each text asked, by where it is, as its one check saw it: empty, and unallocated, until
+    /// the first text is asked.
+    seen: RefCell<HashMap<At, Seen<'a>, Alloc<'a>>>,
     decoded: Cell<ItemsDecoded>,
     alloc: Alloc<'a>,
 }
@@ -1102,11 +1172,6 @@ impl<'a> ItemsRecord<'a> {
         within("strings", offsets[TABLES], Some(strings_len))?;
         Edition::from_byte(u8::try_from(f(F_EDITION)).unwrap_or(u8::MAX)).ok_or(ItemsRecordError::Byte { what: "an edition", byte: bytes[8 + 4 * F_EDITION] })?;
         std_of(le32(bytes, 8 + 4 * F_STD)).ok_or(ItemsRecordError::Byte { what: "the crate's std", byte: bytes[8 + 4 * F_STD] })?;
-        fn cells<'a, T>(n: usize, alloc: Alloc<'a>) -> AVec<'a, OnceCell<T>> {
-            let mut v = AVec::with_capacity_in(n, alloc);
-            v.resize_with(n, OnceCell::new);
-            v
-        }
         Ok(ItemsRecord {
             bytes,
             key: CrateItemKey(id_at(bytes, KEYS_AT)),
@@ -1114,10 +1179,8 @@ impl<'a> ItemsRecord<'a> {
             counts,
             offsets,
             strings_len,
-            members: cells(counts[T_OWNERS], alloc),
             atoms: OnceCell::new(),
-            files_seen: cells(counts[T_FILES], alloc),
-            expansions_seen: cells(counts[T_EXPANSIONS], alloc),
+            seen: RefCell::new(HashMap::new_in(alloc)),
             decoded: Cell::new(ItemsDecoded { crates: 1, bytes: bytes.len(), ..ItemsDecoded::default() }),
             alloc,
         })
@@ -1274,31 +1337,32 @@ impl<'a> ItemsRecord<'a> {
     /// time it is asked. A text that is not the one the record saw is refused
     /// ([`ItemsRecordError::Stale`]) every time it is asked.
     pub fn whole(&self, at: At, read: &dyn Fn(TextOf<'_>) -> Option<&'a str>) -> Result<&'a str, ItemsRecordError> {
-        let (cell, saw, file, call) = match at {
+        let (saw, ask, id_of, file, call): (ContentId, TextOf<'_>, fn(&str) -> ContentId, _, _) = match at {
             At::File(index) => {
                 let row = self.file(index)?.ok_or(ItemsRecordError::Short { what: "a file row", at: index as usize })?;
-                let cell = &self.files_seen[index as usize];
-                if cell.get().is_none() {
-                    let seen = self.check(read(TextOf::File { index, path: row.path }), row.id, crate::resolve::file_id);
-                    let _ = cell.set(seen);
-                }
-                (cell, row.id, Some(index), None)
+                (row.id, TextOf::File { index, path: row.path }, crate::resolve::file_id, Some(index), None)
             }
             At::Expansion(call) => {
                 let i = self.find(T_EXPANSIONS, call).ok_or(ItemsRecordError::Gone { krate: self.key, file: None, call: Some(call) })?;
                 let row = self.expansion_at(i).ok_or(ItemsRecordError::Short { what: "an expansion row", at: i })?;
-                let cell = &self.expansions_seen[i];
-                if cell.get().is_none() {
-                    let seen = self.check(read(TextOf::Expansion { call }), row.id, expansion_id);
-                    let _ = cell.set(seen);
-                }
-                (cell, row.id, None, Some(call))
+                (row.id, TextOf::Expansion { call }, expansion_id, None, Some(call))
             }
         };
-        match cell.get() {
-            Some(Seen::Fresh(text)) => Ok(*text),
-            Some(Seen::Stale(found)) => Err(ItemsRecordError::Stale { krate: self.key, file, call, saw, found: *found }),
-            Some(Seen::Gone) | None => Err(ItemsRecordError::Gone { krate: self.key, file, call }),
+        // The one check of the text, the first time it is asked. No borrow of the memo is held
+        // across `read`.
+        let known = self.seen.borrow().get(&at).copied();
+        let seen = match known {
+            Some(seen) => seen,
+            None => {
+                let seen = self.check(read(ask), saw, id_of);
+                self.seen.borrow_mut().insert(at, seen);
+                seen
+            }
+        };
+        match seen {
+            Seen::Fresh(text) => Ok(text),
+            Seen::Stale(found) => Err(ItemsRecordError::Stale { krate: self.key, file, call, saw, found }),
+            Seen::Gone => Err(ItemsRecordError::Gone { krate: self.key, file, call }),
         }
     }
 
@@ -1366,43 +1430,6 @@ impl<'a> ItemsRecord<'a> {
         }
     }
 
-    /// A trait's or an impl's members in declaration order (question 13), decoded on first
-    /// ask; `Ok(None)` when `owner` is no trait or impl the crate holds members of.
-    pub fn members(&self, owner: ItemKey) -> Result<Option<&[MemberRow<'a>]>, ItemsRecordError> {
-        let Some(i) = self.find(T_OWNERS, owner) else { return Ok(None) };
-        if let Some(list) = self.members[i].get() {
-            return Ok(Some(list.as_slice()));
-        }
-        let (b, r) = (self.bytes, self.row(T_OWNERS, i));
-        let (first, count) = (le32(b, r + 32) as usize, le32(b, r + 36) as usize);
-        if first.checked_add(count).is_none_or(|end| end > self.counts[T_MEMBERS]) {
-            return Err(ItemsRecordError::Short { what: "an owner's member rows", at: first });
-        }
-        let mut list = AVec::with_capacity_in(count, self.alloc);
-        for k in first..first + count {
-            let m = self.row(T_MEMBERS, k);
-            let flags = b[m + 55];
-            let text = self.span(le32(b, m + 32), le32(b, m + 36), le32(b, m + 40))?;
-            let written_by = match text {
-                Some(TextSpan { at: At::Expansion(call), .. }) if flags & CTOR_OR_WRITTEN_BY != 0 => Some(call),
-                _ => None,
-            };
-            list.push(MemberRow {
-                key: key_at(b, m),
-                name: if flags & NAMED != 0 { Some(self.str_at("a member's name", le32(b, m + 48), u32::from(le16(b, m + 52)))?) } else { None },
-                outline: ItemIndex(le32(b, m + 44)),
-                kind: ItemKind::from_byte(b[m + 54]).ok_or(ItemsRecordError::Byte { what: "a member's kind", byte: b[m + 54] })?,
-                body_holds_items: flags & BODY_HOLDS_ITEMS != 0,
-                text,
-                written_by,
-            });
-        }
-        let mut d = self.decoded.get();
-        d.member_lists += 1;
-        self.decoded.set(d);
-        Ok(Some(self.members[i].get_or_init(|| list).as_slice()))
-    }
-
     /// How many impls the crate writes (question 14): the impl index of the crate is rows
     /// `0..impls()`, in (trait path, module, key) order, read in place.
     pub fn impls(&self) -> usize {
@@ -1420,6 +1447,11 @@ impl<'a> ItemsRecord<'a> {
         let trait_path = self.str_at("an impl's trait path", le32(b, r + 36), le32(b, r + 40))?;
         let self_path = self.str_at("an impl's self path", le32(b, r + 44), le32(b, r + 48))?;
         let bits = le32(b, r + 52);
+        let roots = le32(b, r + 60);
+        if roots & !(ROOT_TRAIT | ROOT_SELF) != 0 {
+            return Err(ItemsRecordError::Roots { key, bits: roots });
+        }
+        let root = |flag: u32, at: usize| (roots & flag != 0).then(|| CrateItemKey(id_at(b, r + at)));
         Ok(Some(ImplRow {
             key,
             module: self.module_key(le32(b, r + 32))?,
@@ -1431,6 +1463,8 @@ impl<'a> ItemsRecord<'a> {
             self_path: (!self_path.is_empty()).then_some(self_path),
             header_unread: marks & HEADER_UNREAD != 0,
             trait_unread: marks & TRAIT_UNREAD != 0,
+            trait_root: root(ROOT_TRAIT, 64),
+            self_root: root(ROOT_SELF, 96),
         }))
     }
 
@@ -1460,6 +1494,19 @@ impl<'a> ItemsRecord<'a> {
             }
         }
         Ok(self.lang_at(lo)?.filter(|(n, _)| *n == name).map(|(_, k)| k))
+    }
+
+    /// How many macro definitions the crate has (question 21).
+    pub fn macros(&self) -> usize {
+        self.counts[T_MACROS]
+    }
+
+    /// Macro row `i`, in key order: [`ItemsRecord::macro_row`] of its key.
+    pub fn macro_at(&self, i: usize) -> Result<Option<MacroRow<'a>>, ItemsRecordError> {
+        if i >= self.counts[T_MACROS] {
+            return Ok(None);
+        }
+        self.macro_row(key_at(self.bytes, self.row(T_MACROS, i)))
     }
 
     /// The macro definition `def` (question 21): its name, module, export marks and where its
@@ -1640,7 +1687,6 @@ impl<'a, L: LoadItems<'a>> RecordItems<'a, L> {
             let d = r.decoded();
             sum.crates += d.crates;
             sum.bytes += d.bytes;
-            sum.member_lists += d.member_lists;
             sum.texts += d.texts;
             sum.text_bytes += d.text_bytes;
         }
@@ -1693,8 +1739,8 @@ impl<'a, L: LoadItems<'a>> RecordItems<'a, L> {
         self.text(krate, row.text.ok_or(ItemsRecordError::NoPlace { key })?).map(Some)
     }
 
-    /// A trait's or an impl's members (question 13): `Names::members`.
-    pub fn members(&self, owner: ItemKey) -> Result<Option<&[MemberRow<'a>]>, ItemsRecordError> {
+    /// A trait's or an impl's members (question 13): `Names::members`, read in place.
+    pub fn members(&self, owner: ItemKey) -> Result<Option<Members<'_, 'a>>, ItemsRecordError> {
         match self.of(owner) {
             Some((_, r)) => r.members(owner),
             None => Ok(None),

@@ -11,7 +11,7 @@ use blaze_sim::{Broke, Config, Tape};
 
 use super::{ThroughScratch, through_in};
 use crate::kind::{AmbiguityKind, BindingState, Def, Visibility};
-use crate::module_scope::GlobEdge;
+use crate::module_scope::{GlobEdge, Globs};
 use crate::through::{Asker, Node, Passed, SeenFrom, Sources, Through, merge};
 
 const K1: CrateItemKey = CrateItemKey(ContentId([1; 32]));
@@ -75,7 +75,7 @@ impl<'g> Sources<'g> for Reader<'g> {
             Spec::Value(v) => Ok(Node::Value(*v)),
             Spec::Halt(h) => Err(*h),
             Spec::Edges { edges, krate, chain } => {
-                Ok(Node::Edges { edges: edges.as_slice(), krate: *krate, chain: chain.as_slice() })
+                Ok(Node::Edges { edges: Globs::of(edges.as_slice()), krate: *krate, chain: chain.as_slice() })
             }
         }
     }

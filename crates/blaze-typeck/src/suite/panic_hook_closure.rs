@@ -83,7 +83,7 @@ fn world() -> (Fx, [ItemKey; 2]) {
     let sync = fx.tr("Sync", 1, Vec::new(), &[]);
     fx.auto(sync);
     let (p0, p1) = (fx.param(0), fx.param(1));
-    let rust_call = FnPtrHeader { abi: Abi::RustCall, safety: Safety::Safe };
+    let rust_call = FnPtrHeader { abi: Abi::RustCall, safety: Safety::Safe, c_variadic: false };
 
     // The `Fn*` traits as suite/fn_traits.rs declares them.
     let fn_once = fx.tr("FnOnce", 2, Vec::new(), &["Output"]);

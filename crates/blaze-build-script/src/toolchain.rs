@@ -2,7 +2,7 @@
 //! against, the environment that makes the `cc` and `bindgen` crates find only those, the
 //! headers a compile read (from clang's `-MD` files), and where a script runs in each mode.
 //!
-//! The pin's one home is `crates/hir-ty-codegen/clang.json`, beside llvm.json: per host target
+//! The pin's one home is `crates/blaze-toolchain/pins/clang.json`, beside llvm.json: per host target
 //! the LLVM project's release archive (23.1.4, the LLVM the pinned nightly reports), its size
 //! and SHA-256. The archive is fetched once to `<home>/.blaze/v2/toolchain/clang/` (by
 //! blaze-proc-macro's `clang_shelf` example: blaze-http, the digest checked before anything is
@@ -20,9 +20,9 @@ use crate::native::Runner;
 mod tests;
 
 /// The pin table's text, as checked in.
-pub const PIN: &str = include_str!("../../hir-ty-codegen/clang.json");
+pub const PIN: &str = include_str!("../../blaze-toolchain/pins/clang.json");
 /// The pin table's path, for errors.
-pub const PIN_PATH: &str = "crates/hir-ty-codegen/clang.json";
+pub const PIN_PATH: &str = "crates/blaze-toolchain/pins/clang.json";
 
 /// One target's pinned archive.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -107,7 +107,7 @@ pub(crate) fn scalar<'t>(body: &'t str, key: &str) -> Option<&'t str> {
     Some(value.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(value))
 }
 
-fn hex32(text: &str) -> Option<[u8; 32]> {
+pub(crate) fn hex32(text: &str) -> Option<[u8; 32]> {
     if text.len() != 64 {
         return None;
     }

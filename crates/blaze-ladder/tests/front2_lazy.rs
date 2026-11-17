@@ -151,13 +151,13 @@ fn differences(whole: &Front2Program<'_>, wi: usize, lazy: &LazyProgram<'_>, li:
 /// The program's names, solved once, and its files, for both programs.
 fn with_program(each: impl FnOnce(&blaze_scope::resolve::Names<'_>, &[SourceFile<'_>])) {
     let files = [SourceFile { path: "src/main.rs", text: PROGRAM }];
-    let tc = Toolchain::none();
+    let tc = Toolchain::none(blaze_own::Alloc::global());
     let new = blaze_ladder::run::NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
-    let texts = blaze_ladder::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc).unwrap_or_else(|e| panic!("the program's texts: {e}"));
+    let texts = blaze_ladder::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind).unwrap_or_else(|e| panic!("the program's texts: {e}"));
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     each(&names, &files);
 }
 
@@ -165,7 +165,7 @@ fn with_program(each: impl FnOnce(&blaze_scope::resolve::Names<'_>, &[SourceFile
 fn lazy_answers_as_the_whole_program() {
     with_program(|names, files| {
         let (whole_frame, lazy_frame) = (blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("a frame"), blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("a frame"));
-        let whole = Front2Program::new(names, &whole_frame, files).unwrap_or_else(|e| panic!("the whole program: {e}"));
+        let whole = Front2Program::new(names, &whole_frame, files, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("the whole program: {e}"));
         let entry = whole.function(whole.entry().expect("the whole program's entry")).key;
         let mut lazy = LazyProgram::new(names, &lazy_frame, files, Some(entry), blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the lazy program: {e}"));
         // The whole program's lang answers, asked of both before any body.
@@ -218,7 +218,7 @@ fn lazy_answers_as_the_whole_program() {
 fn one_body_checks_that_body_alone() {
     with_program(|names, files| {
         let (whole_frame, lazy_frame) = (blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("a frame"), blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("a frame"));
-        let whole = Front2Program::new(names, &whole_frame, files).unwrap_or_else(|e| panic!("the whole program: {e}"));
+        let whole = Front2Program::new(names, &whole_frame, files, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("the whole program: {e}"));
         let checked_whole = (0..whole.fn_count()).filter(|&i| whole.function(i).body.is_some()).count();
         let pick = (0..whole.fn_count()).map(|i| whole.function(i)).find(|f| f.path.ends_with("pick")).expect("`pick` tabled").key;
         let mut lazy = LazyProgram::new(names, &lazy_frame, files, None, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the lazy program: {e}"));

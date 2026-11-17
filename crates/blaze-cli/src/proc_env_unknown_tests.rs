@@ -78,15 +78,11 @@ fn truth<'e>(env: &'e CrateEnv<'_>, name: &str) -> EnvAnswer<'e> {
 #[test]
 fn a_macro_s_getenv_answers_each_name_as_env_does_and_refuses_an_unknown_one_by_name() {
     let env = integration_test();
-    let package = unit_package(&env, Files::Listed(Arc::from(std::vec::Vec::new()))).unwrap_or_else(|e| panic!("{e}"));
+    let package = unit_package(&env, member()).unwrap_or_else(|e| panic!("{e:?}"));
     for name in NAMES {
-        let shown = package.env.get(name);
-        match name {
-            // The one name the sandbox answers its own way: the root it SERVES the files at
-            // (proc_env.rs `unit_env`), set in both.
-            "CARGO_MANIFEST_DIR" => assert_eq!(shown, EnvAnswer::Set("/package"), "{name}"),
-            _ => assert_eq!(shown, truth(&env, name), "{name}: the macro's getenv and env! disagree"),
-        }
+        // Every name, `CARGO_MANIFEST_DIR` too: the member is served at the root its `CrateEnv`
+        // says (D96), so the macro's answer is `env!`'s.
+        assert_eq!(package.env.get(name), truth(&env, name), "{name}: the macro's getenv and env! disagree");
     }
     // The three truths are all met (the list is not vacuous).
     assert_eq!(package.env.get("CARGO_CRATE_NAME"), EnvAnswer::Set("app_it"));
@@ -103,7 +99,7 @@ fn a_macro_s_getenv_answers_each_name_as_env_does_and_refuses_an_unknown_one_by_
     assert_eq!(refused, Err(EnvRefused { name: String::from("CARGO_PRIMARY_PACKAGE"), krate: Some(String::from("app_it")) }));
 
     // The control: the set pairs alone answer the unknown name unset, where env! refuses it.
-    let old = Package { files: Files::Listed(Arc::from(std::vec::Vec::new())), env: PackageEnv::set_only(set_pairs(&env)).unwrap_or_else(|e| panic!("{e}")) };
+    let old = Package::new(member(), PackageEnv::set_only(set_pairs(&env)).unwrap_or_else(|e| panic!("{e}"))).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(old.env.get("CARGO_PRIMARY_PACKAGE"), EnvAnswer::Unset, "the planted set-only env refused an unknown name");
     assert_ne!(old.env.get("CARGO_PRIMARY_PACKAGE"), truth(&env, "CARGO_PRIMARY_PACKAGE"));
 
@@ -116,8 +112,14 @@ fn a_macro_s_getenv_answers_each_name_as_env_does_and_refuses_an_unknown_one_by_
 
 /// The set pairs as macro-env-per-unit's `unit_package` gave them (the control's env).
 fn set_pairs(env: &CrateEnv<'_>) -> std::vec::Vec<(String, String)> {
-    let files = Files::Listed(Arc::from(std::vec::Vec::new()));
     let mut out = std::vec::Vec::new();
-    out.extend(unit_env(env, &files));
+    out.extend(unit_env(env));
     out
+}
+
+/// The member `app` as the runner serves it (D96 (3)): its workspace at `/workspace`, the
+/// member at `app`, the dir `integration_test`'s `CrateEnv` was made with.
+fn member() -> Files {
+    let root = blaze_proc_macro::script_sandbox::ScriptRoot::member("app").unwrap_or_else(|e| panic!("{e}"));
+    Files::Member { workspace: std::path::PathBuf::from("/nonexistent-ws"), root }
 }

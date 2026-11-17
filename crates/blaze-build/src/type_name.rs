@@ -190,7 +190,7 @@ fn node<A: Allocator>(tys: PTys<'_>, t: PTy, out: &mut String<A>, seq: &mut Vec<
                 text(seq, "unsafe ");
             }
             // `FnPtrHeader::bits`'s ABI numbering (blaze-solve term.rs).
-            match bits & 0x7f {
+            match bits & 0x3f {
                 0 => {}
                 1 => text(seq, "extern \"C\" "),
                 2 => text(seq, "extern \"C-unwind\" "),
@@ -205,6 +205,10 @@ fn node<A: Allocator>(tys: PTys<'_>, t: PTy, out: &mut String<A>, seq: &mut Vec<
                     text(seq, ", ");
                 }
                 seq.push(Piece::Ty(p));
+            }
+            // A C-variadic pointer's `...` after its named inputs, as rustc's `type_name` prints it.
+            if header.c_variadic {
+                text(seq, if inputs.is_empty() { "..." } else { ", ..." });
             }
             text(seq, ")");
             let unit = matches!(tys.get(output), Some(PNode::Tuple(u)) if tys.list(*u).map_or(false, |x| x.is_empty()));

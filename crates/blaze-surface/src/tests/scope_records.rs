@@ -319,6 +319,7 @@ fn a_crate_root_reads_back_sorted_and_refuses_two_crates_of_one_name() {
         }
         out.extern_prelude.push(("me", key(200)));
         out.tools.extend_from_slice(&["blaze", "blaze"]);
+        out.features.extend_from_slice(&["never_type", "default_field_values", "never_type"]);
         out.macro_use.push(key(7));
         out.macro_exports.push(("m", key(30), MacroShapes::ATTR.with(CallShape::FnLike)));
         out
@@ -332,6 +333,9 @@ fn a_crate_root_reads_back_sorted_and_refuses_two_crates_of_one_name() {
     assert_eq!((view.extern_crate("core"), view.extern_crate("std")), (Some(key(7)), None));
     assert_eq!(view.dep("alloc"), Some(alloc));
     assert!(view.tools().eq(["blaze"]) && view.macro_use().eq([key(7)]));
+    // The root's `#![feature(..)]` names, sorted and once each, found by name.
+    assert!(view.features().eq(["default_field_values", "never_type"]));
+    assert!(view.has_feature("default_field_values") && !view.has_feature("let_chains"));
     let back = CrateRootBuilder::from(&view, blaze_own::testing::heap().alloc());
     assert_eq!(back.write(blaze_own::testing::heap().alloc()).expect("small"), bytes, "the decoded root writes other bytes");
 

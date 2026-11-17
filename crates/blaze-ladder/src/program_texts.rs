@@ -22,12 +22,17 @@ pub struct ProgramTexts {
     edition: PackageEdition,
     /// The profile's overflow setting ([`NewFront::overflow`]), which the build takes.
     pub(crate) overflow: OverflowChecks,
+    /// The program's one panic strategy, as its maker named it: what [`ProgramTexts::user`]
+    /// carries into the program's inputs ([`UserCrate::panic`]).
+    panic: blaze_build::Panic,
 }
 
 impl ProgramTexts {
     /// The texts of the program `files` rooted at `root`, package and edition as `new` says,
     /// read by the names library under `tc` (its cfg is the crate's, where the names read it).
-    pub fn new(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>, tc: &Toolchain) -> Result<ProgramTexts, RunError> {
+    /// `panic` is the program's strategy: the record path's key's (run.rs `build_records_new`),
+    /// or what the caller names; there is no default.
+    pub fn new(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>, tc: &Toolchain, panic: blaze_build::Panic) -> Result<ProgramTexts, RunError> {
         let _ = tc;
         let dir = format!("/{}/", new.package);
         let owned: Vec<(String, String)> = files.iter().map(|f| (format!("{dir}{}", f.path), f.text.into())).collect();
@@ -36,11 +41,11 @@ impl ProgramTexts {
         if !files.iter().any(|f| f.path == root) {
             return Err(RunError::NoMain);
         }
-        Ok(ProgramTexts { package: new.package.into(), dir, files: owned, root: root_at, edition, overflow: new.overflow })
+        Ok(ProgramTexts { package: new.package.into(), dir, files: owned, root: root_at, edition, overflow: new.overflow, panic })
     }
 
     /// The program's crate over these texts.
     pub fn user(&self) -> UserCrate<'_> {
-        UserCrate { name: &self.package, dir: &self.dir, root: &self.root, files: &self.files, edition: self.edition }
+        UserCrate { name: &self.package, dir: &self.dir, root: &self.root, files: &self.files, edition: self.edition, panic: self.panic }
     }
 }

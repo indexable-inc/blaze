@@ -472,7 +472,15 @@ impl Sink for Collect {
 struct NoMacros;
 
 impl Expand for NoMacros {
-    fn expand(&mut self, _: &str, _: &str, _: Edition, _: &mut dyn crate::Cfg, _: &mut crate::BodyOut<'_>) -> Expansion {
+    fn expand(
+        &mut self,
+        _: &str,
+        _: Option<crate::mark_site::TextMark>,
+        _: &str,
+        _: Edition,
+        _: &mut dyn crate::Cfg,
+        _: &mut crate::BodyOut<'_>,
+    ) -> Expansion {
         Expansion::Unsupported
     }
     fn expand_body(&mut self, _: crate::BodyCall<'_>, _: &mut dyn crate::Cfg, _: &mut crate::BodyOut<'_>) -> Expansion {
@@ -481,6 +489,7 @@ impl Expand for NoMacros {
     fn derive(
         &mut self,
         _: &str,
+        _: Option<crate::mark_site::TextMark>,
         _: &blaze_expand::TokenStream<'_>,
         _: blaze_expand::DeriveFacts,
         _: Edition,
@@ -491,6 +500,7 @@ impl Expand for NoMacros {
     fn attr(
         &mut self,
         _: &str,
+        _: Option<crate::mark_site::TextMark>,
         _: Option<&blaze_expand::TokenStream<'_>>,
         _: &blaze_expand::TokenStream<'_>,
         _: Edition,

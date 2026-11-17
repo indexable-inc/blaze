@@ -102,8 +102,9 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     }
 
     /// A `let`'s scrutinee as walk.rs's `match` pushes one: a local that needs drop is a
-    /// place expression, matched in place, not moved.
-    fn push_scrutinee(&mut self, init: ExprId) -> Result<(), BuildError> {
+    /// place expression, matched in place, not moved. Also walk.rs `stmt`'s, for a `let` that
+    /// owns its initializer's parts (matches/irrefutable.rs `let_owns_parts`).
+    pub(super) fn push_scrutinee(&mut self, init: ExprId) -> Result<(), BuildError> {
         let mut s = init;
         while let Expr::Paren(inner) = self.expr(s)? {
             s = inner;
@@ -133,8 +134,9 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         // where it is (a local by its own scope, a place behind a pointer by no one here); a
         // temporary that needs drop joins the condition's region (`hold_temp`, anchored by
         // lets/scope.rs `let_anchor`) with a word, and a by-value binding moves its part out.
-        // A whole local keeps the place it has (a move out of it is refused by `bind_tested`).
-        let local = self.adjust_rows(init).is_empty() && self.local_of(init)?.is_some();
+        // A whole local keeps the place it has and is the root's owner: a by-value binding
+        // moves its part out by the local's field flags (`if let Some(frame) = frame`; walk.rs
+        // `scan_flags` gave them, walk/moves.rs `scan_local_scrutinee`), as a `match` arm does.
         let m = self.matches.len() as u32;
         let at = self.owned_place(m, init, init, s, srepr)?;
         // A failed test drops what the region holds at this link, then goes to the `else`.
@@ -145,9 +147,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             self.link_fail_end(to, fail)?;
         }
         self.begin(pass);
-        if !local {
-            self.move_arm(m, pat, false);
-        }
+        self.move_arm(m, pat, false);
         let bound = self.bind_tested(pat, at);
         self.move_arm_end();
         bound
@@ -190,18 +190,15 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let srepr = self.adjusted_repr(init)?;
         // The scrutinee is owned like a match's (`owned_place`): a temporary that needs drop
         // joins the statement's temporaries with a word, and a binding by value moves its part
-        // out of it. A local scrutinee keeps the place it has (a move out of it is refused by
-        // `bind_tested`, as before).
-        let local = self.adjust_rows(init).is_empty() && self.local_of(init)?.is_some();
+        // out of it. A local scrutinee keeps the place it has; a binding by value moves its
+        // part out by the local's field flags (walk/moves.rs `scan_local_scrutinee`).
         let m = self.matches.len() as u32;
         let at = self.owned_place(m, init, init, v, srepr)?;
         let pass = self.create();
         let fail = self.create();
         self.test_pat(pat, at, pass, fail)?;
         self.begin(pass);
-        if !local {
-            self.move_arm(m, pat, false);
-        }
+        self.move_arm(m, pat, false);
         let bound = self.bind_tested(pat, at);
         self.move_arm_end();
         bound?;

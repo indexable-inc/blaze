@@ -1,0 +1,14 @@
+{
+ "id": "two-mutable-name-mechanisms",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane S of the D124 cut (start list and the parent's Resolve seam)",
+ "where": "crates/blaze-cas/src/plain/lent.rs `Lent::root` (named roots, store.rs `last_root`/`set_last`) and `Lent::point`/`pointed` (POINTER_TAG, code_store.rs); crates/blaze-cli/src/start_list.rs",
+ "what": "The brief said to use the ONE mechanism the command has for a mutable root, and the tree has two: a named root (a string in the manifest naming keys, kept by compaction, read by scanning `roots()` into a fresh Vec of Strings) and a pointer (a key naming one key, newest commit wins, its target NOT kept by compaction). The checkout's last answer uses the root; code keys use the pointer. The start list took the pointer (a hashed probe, no string scan) and so treats a target compaction let go as no list.",
+ "cost": "each new mutable root has to pick between two, and their compaction guarantees differ (a pointed start list can be pruned; a rooted last answer cannot)",
+ "cause": "roots came first for pinning; pointers were added for replaceable code keys without folding roots into them",
+ "class": "two mechanisms for one concept (rule 30)",
+ "prevention": "one mutable-name primitive in blaze-cas with a `keep: bool` for whether compaction keeps the target; roots and pointers both become it",
+ "workaround": "start_list.rs uses `point`/`pointed` with its own tag START_LIST_TAG = u16::MAX - 5 (blaze-cas core.rs's reserved-tag doc does not list it yet)",
+ "fix": "Wanted: merge roots and pointers in blaze-cas; add u16::MAX - 5 to POINTER_TAG's reserved list.",
+ "state": "open"
+}

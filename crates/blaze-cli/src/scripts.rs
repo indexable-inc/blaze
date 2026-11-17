@@ -63,9 +63,8 @@ use blaze_unit_graph::record::Decoded;
 use blaze_unit_graph::{CfgAtom, Records, StoreSources, Unit, UnitGraph, UnitId, UnitKind};
 use blaze_world::Side;
 use bstd::cx::Cx;
-use bstd::fs::{Dir, ReadOnly, ReadWrite};
-use bstd::mem::{Bytes, Frame};
-use bstd::path::Path;
+use bstd::fs::{Dir, ReadWrite};
+use bstd::mem::Frame;
 
 use crate::CliError;
 use crate::fetch::FetchEnv;
@@ -201,16 +200,36 @@ pub(crate) fn parts(keys: impl Iterator<Item = (ContentId, ContentId, RanAs)>) -
     parts
 }
 
-/// The probe table of `side`: the pinned rows (`pinned::TEMPO`) keyed for that side's triple, so
-/// a try-compile asked for it is answered by a row made for it (`probe::compile_key` holds the
-/// target), never by another triple's row, and a question no row answers is the runtime's
-/// refusal naming the triple (`SpawnRefusal::CannotAnswerYet`).
-pub(crate) fn pinned_table(side: Side, alloc: Alloc<'_>) -> std::vec::Vec<Row> {
+/// The probe table of `side`, sorted by key:
+/// - the pinned rows (`pinned::TEMPO`) whose `needs` the side's sysroot ships (`shipped`, the
+///   world's toolchain crates of that side), each keyed for the side's triple
+///   (`probe_ask::Compile::key` holds the target), so a try-compile is answered by a row made
+///   for its target, never by another triple's;
+/// - one ships fact per shipped crate (`probe_ask::ships_key`), which lets blaze decide a probe of
+///   no items itself (`probe_ask::decide`).
+///
+/// A question neither answers is the runtime's refusal naming the triple
+/// (`SpawnRefusal::CannotAnswerYet`).
+pub(crate) fn pinned_table<'s>(side: Side, shipped: impl Iterator<Item = &'s str> + Clone, alloc: Alloc<'_>) -> std::vec::Vec<Row> {
     let triple = match side {
         Side::Target => crate::graph::TRIPLE,
         Side::Macro => MACRO_TARGET,
     };
-    blaze_build_script::probe::pinned_rows(triple, blaze_build_script::pinned::TEMPO, alloc).to_vec()
+    let mut known = std::vec::Vec::new_in(Global);
+    for row in blaze_build_script::pinned::TEMPO {
+        if row.needs.iter().all(|needed| shipped.clone().any(|name| name == *needed)) {
+            known.push(*row);
+        }
+    }
+    let mut rows = blaze_build_script::probe::pinned_rows(triple, &known, alloc.clone()).to_vec();
+    rows.extend_from_slice(&blaze_build_script::probe_ask::ships_rows(triple, shipped, alloc));
+    rows.sort_by(|a, b| a.key.cmp(&b.key));
+    rows
+}
+
+/// The toolchain crates the world holds for `side` (its sysroot's), by library name.
+pub(crate) fn shipped<'r, 'w: 'r>(world: &'r blaze_world::World<'w>, side: Side) -> impl Iterator<Item = &'w str> + Clone + 'r {
+    world.crates.iter().filter(move |krate| matches!(krate.origin, blaze_world::Origin::Toolchain(_)) && krate.side == side).map(|krate| krate.input.name)
 }
 
 /// The cfg `cfg` (a world row's, sorted, each once) as the atoms a script's environment is made
@@ -264,6 +283,10 @@ pub(crate) struct Scripts<'f> {
     lock: &'f Lock<'f>,
     /// Each member's lock entry and folder, checkout-relative, copied into the request's frame.
     members: &'f [(LockId, &'f str)],
+    /// Each fetched package's files as first located ([`files_of`]), sorted by lock id: a
+    /// package's manifests are laid out once a command, not once for each job that runs its
+    /// script or is served by it as a `links` producer (rule 77).
+    files: std::vec::Vec<(LockId, Files<'f>), Global>,
 }
 
 /// Why the command's scripts could not be set up: every `Script` task fails with these
@@ -293,23 +316,29 @@ impl core::fmt::Display for SetupError {
     }
 }
 
-/// The fetched sources' records, `<home>/.blaze/v2/sources/<hex of the key>`, read whole into
-/// the request's frame (the reader names.rs's `Folder` is, at the request's lifetime: one
-/// concept, to be one type when names.rs leaves its `'static` frame; told to its lane).
+/// The fetched sources' records, `<home>/.blaze/v2/sources/<hex of the key>`, MAPPED read-only
+/// and read in place, as graph.rs `Mapped` does (rule 51): a package's record (a `-sys` crate's
+/// is megabytes) is never copied into the request's frame, which holds only the mapping's
+/// handle. `StoreSources` opens each record once a command.
 pub(crate) struct SourcesDir<'f> {
-    cx: &'f Cx,
-    root: Dir<ReadOnly>,
+    /// The sources store's folder as the machine names it (fetch.rs `sources_native`).
+    folder: &'f str,
     frame: &'f Frame,
 }
 
 impl<'f> Records<'f> for SourcesDir<'f> {
     fn record(&mut self, source: &blaze_fetch::SourceId<'_>) -> Option<&'f [u8]> {
         let hex = crate::fetch::key_hex(&source.key());
-        let at = Path::new(core::str::from_utf8(&hex).ok()?).ok()?;
-        let mut bytes = Bytes::new_in(self.frame, "a build script's fetched sources");
-        self.root.read_all(self.cx, &at, &mut bytes).ok()?;
-        let held: &'f Bytes<'f> = blaze_own::Box::leak(blaze_own::Box::new_in(bytes, self.frame));
-        Some(held.as_slice())
+        let mut path = std::string::String::with_capacity(self.folder.len() + 1 + hex.len());
+        path.push_str(self.folder);
+        path.push('/');
+        path.extend(hex.iter().map(|digit| char::from(*digit)));
+        // A record that cannot be mapped is the package's `NotFetched` (blaze-unit-graph
+        // `SourceError`), named by its package and key: the same answer a missing one gets.
+        let mapping = blaze_core::Mapping::map_file(std::path::Path::new(&path)).ok()?;
+        // Kept for the command: the view over its bytes is read by every later job.
+        let mapping: &'f blaze_core::Mapping = blaze_own::Box::leak(blaze_own::Box::new_in(mapping, self.frame));
+        Some(mapping.bytes())
     }
 }
 
@@ -344,10 +373,11 @@ fn said<'f>(frame: &'f Frame, words: core::fmt::Arguments<'_>) -> &'f str {
 impl<'f> Scripts<'f> {
     /// The command's scripts, made once: the graph record `graph_record` (held in `frame`),
     /// the lock, the members' folders and what `main` read at the edge (`env`: the home, the
-    /// SDK folder, the checkout).
+    /// SDK folder, the checkout). `world` names each side's sysroot ([`shipped`]).
     pub(crate) fn open(
         cx: &Cx,
         env: &FetchEnv<'_>,
+        world: &blaze_world::World<'_>,
         graph_record: &'f [u8],
         lock: Option<&'f Lock<'static>>,
         members: Option<&[(LockId, blaze_unit_graph::Text<'_>)]>,
@@ -361,9 +391,13 @@ impl<'f> Scripts<'f> {
             held.push((*id, crate::work::held_str(dir.as_str(), frame)));
         }
         let members: &'f [(LockId, &'f str)] = held.leak();
-        // The request's allocator for what lives to its end: the request's frame, erased once.
-        let erased: &'f Erased<&'f Frame> = blaze_own::Box::leak(blaze_own::Box::new_in(Erased::new(frame), frame));
-        let alloc: Alloc<'f> = erased.handle();
+        // The process's heap, handed from `main` (`FetchEnv::heap`), never the request's frame:
+        // the decoded graph and the setting live to the command's end, and the sources' lookup
+        // lays out a package's manifests on each call and frees them when it returns
+        // (blaze-unit-graph `StoreSources::locate`). In the request's bump frame, which never
+        // frees, those layouts grew with every job until the frame was full (tempo, 1,072
+        // crates: 49 MB at the 59th `Script` job, a panic in blaze-toml's parse).
+        let alloc: Alloc<'f> = env.heap.alloc();
         let decoded = blaze_unit_graph::record::decode(graph_record, alloc).map_err(SetupError::Graph)?;
         let decoded: &'f Decoded<'f> = blaze_own::Box::leak(blaze_own::Box::new_in(decoded, frame));
         let mut by_subject = std::vec::Vec::new_in(Global);
@@ -382,8 +416,8 @@ impl<'f> Scripts<'f> {
         store.push(STORE_UNDER_HOME);
         let runtime = ScriptRuntime::new(&store).map_err(|error| SetupError::Runtime(std::format!("{error}")))?;
         let host = crate::graph::TRIPLE;
-        let table = Arc::new(pinned_table(Side::Target, alloc.clone()));
-        let macro_table = Arc::new(pinned_table(Side::Macro, alloc.clone()));
+        let table = Arc::new(pinned_table(Side::Target, shipped(world, Side::Target), alloc.clone()));
+        let macro_table = Arc::new(pinned_table(Side::Macro, shipped(world, Side::Macro), alloc.clone()));
         let spawn = blaze_proc_macro::fact_pins::command_spawn_setting(host, alloc).map_err(|error| SetupError::SpawnSetting(std::format!("{error}")))?;
         // The native setting: only a script `placed` native needs it; without it that script
         // fails naming why ([`pooled`]), never run as wasm (D112).
@@ -415,11 +449,11 @@ impl<'f> Scripts<'f> {
         let checkout = PathBuf::from(if env.checkout.is_empty() { "." } else { env.checkout });
         let shared: &'f Shared<'f> = blaze_own::Box::leak(blaze_own::Box::new_in(Shared { runtime, store, checkout, table, macro_table, spawn: Arc::new(spawn), native, graph_record }, frame));
 
-        let cx: &'f Cx = blaze_own::Box::leak(blaze_own::Box::new_in(cx.until(cx.deadline()), frame));
-        let sources = crate::fetch::sources_dir(cx, env).map_err(|error| SetupError::Sources(std::format!("{error}")))?;
-        let dir = SourcesDir { cx, root: sources.read_only(), frame };
+        let _cx = cx.span("scripts: the fetched sources");
+        let folder = crate::fetch::sources_native(env, frame).ok_or(SetupError::NoHome)?;
+        let dir = SourcesDir { folder: crate::work::held_str(folder.as_str(), frame), frame };
         let sources = StoreSources::new(lock, dir, blaze_fetch::pack::PackView::open_source_put, alloc).map_err(|error| SetupError::Sources(std::format!("{error}")))?;
-        Ok(Scripts { shared, decoded, by_subject, sources, lock, members })
+        Ok(Scripts { shared, decoded, by_subject, sources, lock, members, files: std::vec::Vec::new_in(Global) })
     }
 
     fn unit_of(&self, name: Name) -> Option<(UnitId, Side)> {
@@ -428,6 +462,7 @@ impl<'f> Scripts<'f> {
 }
 
 /// Where a script's package files come from, as a job carries them to its worker.
+#[derive(Clone, Copy)]
 enum Files<'j> {
     /// A workspace member at `dir` (checkout-relative): its script sees `/workspace/<dir>`.
     Member { dir: &'j str },
@@ -490,18 +525,28 @@ fn links_closure<'g>(graph: &'g UnitGraph<'_>, script: UnitId) -> std::vec::Vec<
 }
 
 /// Where the package of `unit` has its files: a member's folder (checkout-relative), else its
-/// fetched record. `Err`: the job's refusal, naming the package.
+/// fetched record, located once a command and kept in `found` (its folder in `frame`). `Err`:
+/// the job's refusal, naming the package (a manifest of it refused, the manifest too).
 fn files_of<'f: 'j, 'j>(
     sources: &mut StoreSources<'f, 'f, 'f, SourcesDir<'f>>,
+    found: &mut std::vec::Vec<(LockId, Files<'f>), Global>,
     members: &'f [(LockId, &'f str)],
     lock: &'f Lock<'f>,
     unit: &Unit<'_>,
+    frame: &'f Frame,
     jobs: &'j Frame,
 ) -> Result<Files<'j>, Prepared<'j>> {
     if let Some((_, dir)) = members.iter().find(|(id, _)| *id == unit.package) {
         return Ok(Files::Member { dir });
     }
+    let at = match found.binary_search_by_key(&unit.package, |(id, _)| *id) {
+        Ok(at) => return Ok(found[at].1),
+        Err(at) => at,
+    };
     match sources.files(unit.package) {
+        Err(error @ blaze_unit_graph::SourceError::Layout { .. }) => {
+            Err(Prepared::Said { what: "a build script's package manifests were refused", words: said(jobs, format_args!("the build script of {} {}: {error}", unit.name.as_str(), unit.version.as_str())), hole: true })
+        }
         Ok((view, dir)) => {
             let git = match &lock.packages[unit.package.index()].source {
                 LockSource::Git { commit, .. } => match blaze_build_script::git::Oid::parse_hex(commit.as_bytes()) {
@@ -512,7 +557,9 @@ fn files_of<'f: 'j, 'j>(
                 },
                 LockSource::Path | LockSource::Registry { .. } => None,
             };
-            Ok(Files::Pack { view, dir: crate::work::held_str(dir.as_str(), jobs), git })
+            let files: Files<'f> = Files::Pack { view, dir: crate::work::held_str(dir.as_str(), frame), git };
+            found.insert(at, (unit.package, files));
+            Ok(files)
         }
         Err(error) => Err(Prepared::Said { what: "a build script's package has no fetched sources", words: said(jobs, format_args!("the build script of {} {}: {error}", unit.name.as_str(), unit.version.as_str())), hole: true }),
     }
@@ -549,7 +596,7 @@ pub(crate) enum Prepared<'j> {
 pub(crate) fn job<'f: 'j, 'j>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
-    store: &mut dyn Store,
+    store: &mut dyn Store<'_>,
     scripts: &mut Option<Scripts<'f>>,
     names: &mut Option<crate::names::Names<'f>>,
     env: &FetchEnv<'_>,
@@ -584,7 +631,8 @@ pub(crate) fn job<'f: 'j, 'j>(
         }
         if scripts.is_none() {
             let bytes: &'f [u8] = held_bytes(read.unit_graph(graph.name)?.graph, frame);
-            match Scripts::open(&cx, env, bytes, lock, members, frame) {
+            let world = names.as_ref().expect("made above").world();
+            match Scripts::open(&cx, env, world, bytes, lock, members, frame) {
                 Ok(opened) => *scripts = Some(opened),
                 Err(error) => return Ok(Prepared::Said { what: "the command's build scripts could not be set up", words: said(jobs, format_args!("{error}")), hole: true }),
             }
@@ -643,7 +691,7 @@ pub(crate) fn job<'f: 'j, 'j>(
             None => wants.push(Want { name: dep, home: Name::unit_graph() }),
             Some(handed) => {
                 let read = crate::work::payload(&cx, store, handed, jobs)?;
-                let files = match files_of(&mut scripts.sources, members, lock, &graph.units[input.index()], jobs) {
+                let files = match files_of(&mut scripts.sources, &mut scripts.files, members, lock, &graph.units[input.index()], frame, jobs) {
                     Ok(files) => files,
                     Err(refused) => return Ok(refused),
                 };
@@ -654,7 +702,7 @@ pub(crate) fn job<'f: 'j, 'j>(
     if !wants.is_empty() {
         return Ok(Prepared::Need(wants));
     }
-    let files = match files_of(&mut scripts.sources, members, lock, unit, jobs) {
+    let files = match files_of(&mut scripts.sources, &mut scripts.files, members, lock, unit, frame, jobs) {
         Ok(files) => files,
         Err(refused) => return Ok(refused),
     };
@@ -820,12 +868,20 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame) -> Ran {
     for producer in job.producers.iter() {
         made.reads.push((producer.name, producer.out));
     }
-    let mut bytes: AVec<'_, u8> = AVec::new_in(alloc);
-    outputs.encode(&mut bytes);
-    made.out = ContentId::of(OUT_DOMAIN, &bytes);
     // How it ran, then the outputs record ([`payload_parts`]); the out is the outputs' alone, so
-    // a reader moves only when what it reads moves.
-    made.payload.push(ran_as as u8);
-    made.payload.extend_from_slice(&bytes);
+    // a reader moves only when what it reads moves. Encoded on the heap and handed whole to the
+    // record, which outlives this worker's frame (rules 11 and 51): never encoded in the frame
+    // and copied out.
+    let heap = Erased::new(Global);
+    let mut payload: AVec<'_, u8> = AVec::new_in(heap.handle());
+    payload.push(ran_as as u8);
+    outputs.encode(&mut payload);
+    made.out = ContentId::of(OUT_DOMAIN, &payload[1..]);
+    let Ok(payload) = heap.adopt(payload) else {
+        return failed("a build script's outputs record was not made on its own heap handle", format_args!("the build script of {package}: its outputs record was not made over the handle `adopt` was asked of (scripts.rs `run`)"), false);
+    };
+    if let Err(error) = made.hand(payload) {
+        return failed("a build script's record refused its outputs", format_args!("the build script of {package}: {error}"), false);
+    }
     Ran::Made(made)
 }

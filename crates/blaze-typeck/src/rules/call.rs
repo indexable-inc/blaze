@@ -128,10 +128,19 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                                 // A C-variadic `k`: one fresh input per argument past the
                                 // declared ones (rules/c_variadic.rs).
                                 let inputs = self.c_variadic_inputs(k, inputs, arg_ids.len())?;
+                                // `#[rustc_legacy_const_generics]`: the const parameters' types at
+                                // the listed positions (rules/legacy_const.rs).
+                                let inputs = self.legacy_const_inputs(callee, k, inputs, arg_ids.len())?;
                                 Some((inputs, output))
                             }
                             None => None,
                         },
+                        // Calling through `unsafe extern "C" fn(A, ...)` needs the variable
+                        // arguments' promotions and the variadic call ABI on a fn pointer
+                        // callee (rules/c_variadic.rs reads them from a fn item's signature).
+                        TyView::FnPtr(_, h) if h.c_variadic => {
+                            return Err(crate::error::CheckError::Unported("a call through a C-variadic fn pointer").into());
+                        }
                         TyView::FnPtr(l, _) => Some(self.fn_ptr_sig(l)?),
                         TyView::Closure(_, sig) | TyView::ClosureOf { sig, .. } => match self.view(sig) {
                             TyView::FnPtr(l, _) => {
@@ -188,6 +197,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
                 // Every argument is typed: the `...` ones are held to C's promotions (E0617).
                 self.check_c_variadic_args(e, arg_ids)?;
+                // The arguments at legacy const generic positions give the callee's constants.
+                self.bind_legacy_consts(e, callee, arg_ids)?;
                 Ok(Flow::Done(f.u))
             }
         }

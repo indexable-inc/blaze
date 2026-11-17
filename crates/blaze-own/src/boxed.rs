@@ -2,7 +2,8 @@
 //!
 //! The compiler's own box moves its value out with `*b`; this one moves it out with
 //! [`Box::into_inner`] (docs/v2/plan/design/bottom.md, "Known cost"). It unsizes as std's does
-//! (`Box<T, A>` to `Box<dyn Trait, A>`, `Box<[T; N], A>` to `Box<[T], A>`), and a `Box<dyn Fn()>`
+//! (`Box<T, A>` to `Box<dyn Trait, A>`, `Box<[T; N], A>` to `Box<[T], A>`, and pinned,
+//! `Pin<Box<T, A>>` to `Pin<Box<dyn Trait, A>>`, when `A` is a `StaticAllocator`), and a `Box<dyn Fn()>`
 //! is called as `b()` through `Deref`.
 //!
 //! A boxed closure called once: std's `Box<dyn FnOnce()>` moves the unsized closure out by the
@@ -23,7 +24,7 @@ use core::{
     marker::{PhantomData, Tuple, Unsize},
     mem::{DropGuard, ManuallyDrop, size_of},
     ops::{CoerceUnsized, Deref, DerefMut},
-    pin::Pin,
+    pin::{Pin, PinSafePointer},
     ptr::{self, NonNull},
 };
 
@@ -33,7 +34,7 @@ use crate::{
     vec::{Refused, Vec},
 };
 
-/// One `T` in `A`.
+/// One `T` in `A`: one block (none for a zero-sized `T`), one pointer word (two for a slice or `dyn`).
 ///
 /// # Invariants
 ///
@@ -56,6 +57,14 @@ unsafe impl<T: ?Sized + Sync, A: Allocator + Sync> Sync for Box<T, A> {}
 impl<T: ?Sized, A: Allocator> Unpin for Box<T, A> {}
 
 impl<T: ?Sized + Unsize<U>, U: ?Sized, A: Allocator> CoerceUnsized<Box<U, A>> for Box<T, A> {}
+
+// SAFETY: as std's `Box` (library/alloc/src/boxed.rs, the same bound). `deref` and `deref_mut`
+// always give the one value the box owns, at an address that does not change when the box
+// moves or is unsized, and neither they nor the drop move the value out. `&Box` is never taken
+// as evidence the value is not pinned. `Clone` makes a new value in a clone of the allocator,
+// which `Pin::clone` pins unchecked: sound because a `StaticAllocator` never invalidates that
+// block before the new box frees it, after the value's drop. `Debug` and `Display` read `&T`.
+unsafe impl<T: ?Sized, A: StaticAllocator> PinSafePointer for Box<T, A> {}
 
 impl<T, A: Allocator> Box<T, A> {
     /// `value` in `alloc`; panics with the [`AllocFailure`] when there is no memory.

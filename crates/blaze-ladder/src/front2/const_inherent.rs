@@ -31,12 +31,13 @@
 //!    evaluates it by its own key (`Consts::value`, the one route a constant item's body takes).
 //!
 //! A leaf the type's inherent impls declare no constant for (a variant `E::A`, a trait's
-//! constant) is NOT a leaf: the text keeps it and the anonymous constant reads it as written
-//! (with that machine's own refusal, by name, where it has none). Refused, each by name, filed
-//! TYPED in the table under the need key ([`InherentFail`], read by [`refusal`]; the head is
-//! refused naming the leaf and this): a
-//! refused inherent impl of the type (the constant may be in it), two inherent constants of
-//! one name, a constant whose type is not `bool`, `char` or an integer, its evaluation's own
+//! constant), and a constant whose type is not `bool`, `char` or an integer (`Date::MIN:
+//! Date` in `{ Date::MIN.to_julian_day() }`: no literal can stand for it), is NOT a leaf: the
+//! text keeps it and the anonymous constant reads it as written (with that machine's own
+//! refusal, by name, where it has none). Refused, each by name, filed TYPED in the table under
+//! the need key ([`InherentFail`], read by [`refusal`]; the head is refused naming the leaf and
+//! this): a refused inherent impl of the type (the constant may be in it), two inherent
+//! constants of one name, a constant with no head or no type node, its evaluation's own
 //! refusal, a leaf that needs itself. NOT taken (the head's refusal stays as before, by name):
 //! `Self` that is generic or not an ADT (`impl<T> W<T> { fn f() -> [u8; Self::N] }` needs an
 //! unevaluated const term in blaze-typeck's type form, which has none: owed), an absolute path.
@@ -433,7 +434,8 @@ pub enum InherentFail {
     NoAnswer { adt: ItemKey },
     /// Two inherent impls of the type declare a constant of the name (E0592).
     Two { adt: ItemKey, a: ItemKey, b: ItemKey },
-    /// The constant's type is not `bool`, `char` or an integer of at most 16 bytes.
+    /// The constant has no signature row, or its type no node (a constant of a type that is
+    /// not `bool`, `char` or an integer is no leaf at all: `find`).
     Type { constant: ItemKey },
     /// Its value is not an integer of at most 16 bytes.
     NotInteger { constant: ItemKey },
@@ -451,7 +453,7 @@ impl core::fmt::Display for InherentFail {
             InherentFail::RefusedImpl { adt, impl_ } => write!(f, "the inherent impl {impl_:?} of the type {adt:?} is refused (the impl index's gap of the type names why), and the constant may be declared there"),
             InherentFail::NoAnswer { adt } => write!(f, "the inherent impls of the type {adt:?} were made and the impl index holds no answer for it"),
             InherentFail::Two { adt, a, b } => write!(f, "two inherent impls of the type {adt:?} declare a constant of this name ({a:?}, {b:?}): E0592"),
-            InherentFail::Type { constant } => write!(f, "the inherent constant {constant:?}: a path in a head has a value only at `bool`, `char` or an integer type of at most 16 bytes"),
+            InherentFail::Type { constant } => write!(f, "the inherent constant {constant:?} has no signature row, or its type no node in the records' table"),
             InherentFail::NotInteger { constant } => write!(f, "the inherent constant {constant:?}: its value is not an integer of at most 16 bytes"),
             InherentFail::Eval { constant, error } => write!(f, "the inherent constant {constant:?}: {error}"),
             InherentFail::NoEvaluator { need } => write!(f, "the inherent constant leaf {need:?} is asked where no constant evaluator is at hand"),
@@ -473,14 +475,13 @@ fn find<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, e: Entry) -> Result<
         }
     }
     let shape = Shape::Adt(e.adt);
-    make_for(r, Fill::Inherent(shape), checker_of(e.need)).map_err(|error| InherentFail::Fill { adt: e.adt, error })?;
+    make_for(r, Fill::Inherent(shape, e.name), checker_of(e.need)).map_err(|error| InherentFail::Fill { adt: e.adt, error })?;
     let Some(b) = r.buckets.as_ref() else { return Err(InherentFail::NoAnswer { adt: e.adt }) };
-    if let Some((impl_, _)) = b.inherent_gap(shape) {
+    if let Some((impl_, _)) = b.inherent_gap(shape, e.name) {
         return Err(InherentFail::RefusedImpl { adt: e.adt, impl_ });
     }
     let items = b.inherent(shape, e.name).ok_or(InherentFail::NoAnswer { adt: e.adt })?;
-    // The index may list one impl's member more than once (one answer per inherent fill of
-    // the shape, `Buckets::answer_inherent`): a constant is counted by its key.
+    // A constant is counted by its key: two entries of one key are one constant.
     let mut consts = items.iter().filter(|a| matches!(a.kind, tc::AssocKind::Const));
     let Some(one) = consts.next() else { return Ok(None) };
     if let Some(other) = consts.find(|a| a.item != one.item) {
@@ -488,7 +489,15 @@ fn find<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, e: Entry) -> Result<
     }
     let constant = one.item;
     let head = r.store.fns.get(&constant).ok_or(InherentFail::Type { constant })?;
-    let ty = r.store.tys.view().node(head.output).ok().filter(|n| prim_name(*n).is_some()).ok_or(InherentFail::Type { constant })?;
+    let ty = r.store.tys.view().node(head.output).map_err(|_| InherentFail::Type { constant })?;
+    // A constant of any other type (time's `Date::MIN: Date` in `ri32<{
+    // Date::MIN.to_julian_day() }, ..>`) has no literal to stand in the text: it is no leaf, and
+    // the whole expression is the anonymous constant's, which reads the constant as a value of
+    // its type and goes on (the Reference, "Constant evaluation": a constant expression may
+    // read a constant of any type, call `const fn`s on it, and the result is the length's).
+    if prim_name(ty).is_none() {
+        return Ok(None);
+    }
     Ok(Some((constant, ty)))
 }
 

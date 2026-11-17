@@ -1010,11 +1010,11 @@ fn is_def_kind(kind: SyntaxKind) -> bool {
 struct Missing<'a> {
     test: bool,
     effective: &'a Effective,
-    uses: HashMap<(HirFileId, TextSize), UseId, Global>,
+    uses: Map<(HirFileId, TextSize), UseId, FixedState, Global>,
     /// The node of each of the crate's reachable definitions but its `use`s and its root, made
     /// the first time [`Missing::reachable`] asks: one probe per question, where mapping each
     /// node to its definition costs a `to_def`.
-    nodes: OnceCell<HashSet<InFile<SyntaxNodePtr>, Global>>,
+    nodes: OnceCell<Set<InFile<SyntaxNodePtr>, FixedState, Global>>,
 }
 
 impl<'a> Missing<'a> {
@@ -1024,7 +1024,7 @@ impl<'a> Missing<'a> {
     )]
     fn new(cx: &'a Cx<'_, '_>) -> Missing<'a> {
         let db = cx.db;
-        let mut uses = HashMap::new_in(Global);
+        let mut uses = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for module in crate::checks::modules(cx) {
             let id = hir_def::ModuleId::from(module);
             for use_ in id.def_map(db).module(db, id).scope(db).use_decls() {
@@ -1179,13 +1179,13 @@ impl<'a> Missing<'a> {
 fn reachable_nodes(
     cx: &Cx<'_, '_>,
     effective: &Effective,
-) -> HashSet<InFile<SyntaxNodePtr>, Global> {
+) -> Set<InFile<SyntaxNodePtr>, FixedState, Global> {
     fn ptr<'db, N: ast::AstNode<'db>>(it: Option<InFile<N>>) -> Option<InFile<SyntaxNodePtr>> {
         it.map(|it| it.map(|it| ast::ptr(it.syntax())))
     }
     let db = cx.db;
     // alloc: once per `staged_api` crate (the standard library), the reachable definitions
-    let mut nodes = HashSet::new_in(Global);
+    let mut nodes = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
     for def in effective.reachable_local() {
         let node = match def {
             EffectiveDef::Item(item) => match item {
@@ -1356,22 +1356,22 @@ struct Defs<'a, 'c, 'db> {
     parsed: &'a Lowered<'a>,
     crate_root: HirFileId,
     /// Each owner by its node.
-    index: HashMap<InFile<SyntaxNodePtr>, usize, Global>,
+    index: Map<InFile<SyntaxNodePtr>, usize, FixedState, Global>,
     /// The owner of a module file's root, when it has its own (its declaration has none).
-    file_roots: HashMap<HirFileId, usize, Global>,
+    file_roots: Map<HirFileId, usize, FixedState, Global>,
     /// The declaration of each module file, in a tree `cx.vsema` handed out.
-    declared: HashMap<HirFileId, InFile<ast::Node<'db>>, Global>,
+    declared: Map<HirFileId, InFile<ast::Node<'db>>, FixedState, Global>,
     /// The file each declaration of a module file declares.
-    declares: HashMap<InFile<SyntaxNodePtr>, HirFileId, Global>,
+    declares: Map<InFile<SyntaxNodePtr>, HirFileId, FixedState, Global>,
     /// `lookup_stability`: the owner whose `Stability` it is.
-    stability: HashMap<InFile<SyntaxNodePtr>, Option<usize>, Global>,
+    stability: Map<InFile<SyntaxNodePtr>, Option<usize>, FixedState, Global>,
     /// `lookup_deprecation_entry`: the owner whose `Deprecated` it is.
-    deprecation: HashMap<InFile<SyntaxNodePtr>, Option<usize>, Global>,
+    deprecation: Map<InFile<SyntaxNodePtr>, Option<usize>, FixedState, Global>,
     /// Each module, in the order its first definition comes.
-    modules: HashMap<InFile<SyntaxNodePtr>, usize, Global>,
+    modules: Map<InFile<SyntaxNodePtr>, usize, FixedState, Global>,
     /// [`Defs::parent`] of each definition asked about: `order_key`, the lookups and the
     /// annotation kind each ask it, so each definition's ancestors are walked once.
-    parents: RefCell<HashMap<InFile<SyntaxNodePtr>, Option<Def<'db>>, Global>>,
+    parents: RefCell<Map<InFile<SyntaxNodePtr>, Option<Def<'db>>, FixedState, Global>>,
 }
 
 impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
@@ -1381,16 +1381,16 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
         parsed: &'a Lowered<'a>,
         crate_root: HirFileId,
     ) -> Self {
-        let mut index = HashMap::new_in(Global);
-        let mut file_roots = HashMap::new_in(Global);
+        let mut index = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
+        let mut file_roots = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for (at, owner) in owners.iter().enumerate() {
             index.insert(owner.at(), at);
             if owner.node.value.kind() == SyntaxKind::SOURCE_FILE {
                 file_roots.insert(owner.node.file_id, at);
             }
         }
-        let mut declared = HashMap::new_in(Global);
-        let mut declares = HashMap::new_in(Global);
+        let mut declared = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
+        let mut declares = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for module in crate::checks::modules(cx) {
             if let Some(file) = module.as_source_file_id(cx.db)
                 && let Some(declaration) = module.declaration_source_view(cx.db)
@@ -1403,7 +1403,7 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
                 declared.insert(HirFileId::from(file), node);
             }
         }
-        let mut modules = HashMap::new_in(Global);
+        let mut modules = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         if let Some(krate) = owners.iter().find(|it| it.target == Target::Crate) {
             modules.insert(krate.at(), 0);
         }
@@ -1416,10 +1416,10 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
             file_roots,
             declared,
             declares,
-            stability: HashMap::new_in(Global),
-            deprecation: HashMap::new_in(Global),
+            stability: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            deprecation: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             modules,
-            parents: RefCell::new(HashMap::new_in(Global)),
+            parents: RefCell::new(Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None })),
         }
     }
 

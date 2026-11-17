@@ -147,13 +147,13 @@ pub const fn bit(fault: Fault) -> u8 {
 pub const ALL_FAULTS: u8 = bit(Fault::IoFailures) | bit(Fault::Delays) | bit(Fault::Crashes);
 
 /// The fault kinds a parameter of `kind` can meet, a bit each: what fills itself from inside
-/// the process (`Args`, `Out`, `Mem`, `Spec`, `Env`) meets none; a clock meets late
+/// the process (`Args`, `Out`, `Mem`, `Spec`, `Heap`, `Env`) meets none; a clock meets late
 /// completions; a folder read only and an endpoint meet failed effects and late ones; a folder
 /// that writes, a whole capability and any kind not named here meet every kind, a power cut
 /// that tears unsynced writes too. (`Kind::In`, standard input, falls in the last class until
 /// it is named beside `Net`: a follow-up once P7's `Kind::In` is in.)
 pub const fn reach(kind: Kind) -> u8 {
-    if matches!(kind, Kind::Args | Kind::Out | Kind::Mem | Kind::Spec | Kind::Env) {
+    if matches!(kind, Kind::Args | Kind::Out | Kind::Mem | Kind::Spec | Kind::Heap | Kind::Env) {
         0
     } else if matches!(kind, Kind::Clock) {
         bit(Fault::Delays)
@@ -664,7 +664,8 @@ fn refusal(refused: &Refused, out: &mut String<LaunchAlloc>) {
 /// One start of a test in `io`: a root context of [`BUDGET`], the launcher's [`Given`] over
 /// `io` and `spec`, and `body` (which fills the parameters and calls the test) under
 /// `catch_unwind`; how it ended ([`ended`]: a power cut's unwind, an exit, a panic, a refusal).
-/// The one start every world of a test goes through, the drawn half's too.
+/// The one start every world of a test goes through, the drawn half's too: a test's entry, so
+/// the heap a `heap: Heap` parameter is handed is the process's, from bstd's entry (D120).
 pub(crate) fn start<B, R>(io: &Io, spec: &Spec, manifest: &'static Manifest, alloc: LaunchAlloc, body: &B) -> Ended
 where
     B: Fn(&mut Given<'_>) -> Result<R, Refused>,
@@ -676,7 +677,7 @@ where
         Err(stopped) => return Ended::Panicked(alloc::format!("bstd::test: a start's root context: {stopped}")),
     };
     let ran = {
-        let mut given = Given::new(&cx, io, None, spec, Started::WithSpec, manifest);
+        let mut given = Given::new(&cx, io, None, spec, Started::WithSpec, manifest, crate::entry::process_heap());
         catch_unwind(AssertUnwindSafe(|| body(&mut given)))
     };
     drop(cx);
@@ -761,16 +762,18 @@ fn var<'e>(env: &'e crate::env::Env, name: &'static str) -> Result<Option<&'e st
 
 /// What `#[bstd::test]` expands to when its parameters are grants: `body` (the launcher's,
 /// [`launch_body!`](crate::launch_body)) run in each seed's world, or once (the module's doc);
-/// a failure panics with [`report`]'s block, which the test harness prints. `heap` is the
-/// test entry's heap (D102). It takes no `Os`: a simulated test touches no real OS, and a
-/// `real` one is rooted in `bstd::test`'s own native world, so the attribute's expansion
+/// a failure panics with [`report`]'s block, which the test harness prints. It is the test's
+/// entry, so it takes the process's heap from bstd's entry (`entry::process_heap`, D120): the
+/// runner's allocations are in it, and a `heap: Heap` parameter is handed it ([`start`]); the
+/// attribute's expansion names no heap. It takes no `Os`: a simulated test touches no real OS,
+/// and a `real` one is rooted in `bstd::test`'s own native world, so the attribute's expansion
 /// names no root of real-OS authority (tests/reach.rs keeps that to the driver's backends).
-pub fn granted<B, R>(test: Test, heap: &'static blaze_own::Heap, body: B)
+pub fn granted<B, R>(test: Test, body: B)
 where
     B: Fn(&mut Given<'_>, &super::param::Draws<'_>) -> Result<R, Refused>,
     R: Outcome,
 {
-    let alloc: LaunchAlloc = heap.shared();
+    let alloc: LaunchAlloc = crate::entry::process_heap().shared();
     // A test with drawn parameters: the drawn half's runner (simtest/drawn.rs). Without
     // `sim-draws` no type is drawn (no blanket impl), so `drawn` is 0.
     #[cfg(any(test, feature = "sim-draws"))]

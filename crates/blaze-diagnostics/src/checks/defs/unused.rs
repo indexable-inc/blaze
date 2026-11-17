@@ -10,7 +10,7 @@
 //! `identify_constrained_generic_params` over the lowered predicates, then `HasErrorDeep`) is
 //! hir-ty's `adt_unused_params`, through `hir::Adt::unused_params`.
 
-use blaze_hash::HashSet;
+use blaze_hash::{FixedState, Set, SetOpts};
 use blaze_items::{Fact, ItemId};
 use hir::PathResolution;
 use smallvec::SmallVec;
@@ -387,8 +387,8 @@ fn is_explicitly_bounded<'db>(
 /// name declared twice, whose every use is then an error, and a lifetime declared again or
 /// named `'static` or `'_`, whose name is `ParamName::Error`.
 struct Invalid {
-    names: HashSet<String, Global>,
-    lifetimes: HashSet<TextRange, Global>,
+    names: Set<String, FixedState, Global>,
+    lifetimes: Set<TextRange, FixedState, Global>,
 }
 
 impl Invalid {
@@ -398,7 +398,7 @@ impl Invalid {
         let mut names: SmallVec<[ast::Name<'t>; 4]> = SmallVec::new();
         // alloc: empty unless a parameter is declared twice, an error
         let mut invalid =
-            Invalid { names: HashSet::new_in(Global), lifetimes: HashSet::new_in(Global) };
+            Invalid { names: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }), lifetimes: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }) };
         for param in list.generic_params() {
             match param {
                 ast::GenericParam::LifetimeParam(it) => {
@@ -461,7 +461,13 @@ fn walk_fields(
     adt: hir::Adt,
     mut stop: impl FnMut(&hir::Type<'_>, Option<hir::Adt>) -> bool,
 ) {
-    let mut seen = HashSet::from_iter_in([adt], Global);
+    let mut seen = {
+        let iter = IntoIterator::into_iter([adt]);
+        let capacity = Some(iter.size_hint().0);
+        let mut set = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity });
+        set.extend(iter);
+        set
+    };
     // alloc: only for an ADT with a bivariant parameter
     let mut queue = vec![adt];
     while let Some(adt) = queue.pop() {

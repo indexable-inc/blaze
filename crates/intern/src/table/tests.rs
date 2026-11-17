@@ -53,7 +53,7 @@ fn each_table_draws_its_own_key() {
     assert_ne!(Table::new(shape()).overlay, Table::new(shape()).overlay);
 }
 
-/// The table against an `HashMap<Vec<u8>, u32>` over seeded values, many sharing a hash tag,
+/// The table against a `Map<Vec<u8>, u32, FixedState, _>` over seeded values, many sharing a hash tag,
 /// a home group or an order key: a value new to the map takes the next ID, a known one its own,
 /// and every ID reads back its bytes and key.
 #[test]
@@ -61,8 +61,12 @@ fn interning_agrees_with_a_map_model() {
     for seed in 0..3 {
         let mut rng = SplitMix64::new(0x5eed + seed);
         let table = Table::new(shape());
-        let mut model: blaze_hash::HashMap<Vec<u8>, u32, Global> =
-            blaze_hash::HashMap::new_in(Global); // alloc: a test's model
+        let mut model: blaze_hash::Map<Vec<u8>, u32, blaze_hash::FixedState, Global> =
+            blaze_hash::Map::new(blaze_hash::MapOpts {
+                hasher: blaze_hash::FixedState,
+                alloc: Global,
+                capacity: None,
+            }); // alloc: a test's model
         let mut next = table.end();
         // Short names, numbered ones, long runs, digits.
         let value = |rng: &mut SplitMix64| -> Vec<u8> {
@@ -77,7 +81,7 @@ fn interning_agrees_with_a_map_model() {
             }
         };
         let check = |table: &Table,
-                     model: &mut blaze_hash::HashMap<Vec<u8>, u32, Global>,
+                     model: &mut blaze_hash::Map<Vec<u8>, u32, blaze_hash::FixedState, Global>,
                      next: &mut u32,
                      bytes: Vec<u8>| {
             // alloc: a test's model

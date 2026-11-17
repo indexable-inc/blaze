@@ -6,8 +6,8 @@
 use blaze_expand::kept::{Asked, KeptEntry, KeptError, KeptSet, SetPlant, SetSource, write_entry, write_set, write_set_planted};
 use blaze_expand::{
     BuiltinFn, Call, CallKey, CallSite, Ctx, DefAt, DefSite, Edition, ExpandCx, Expanded, Expansion, Export, Held, HostAsk,
-    HostError, HostWhy, IncludeAs, Included, LocalInner, MacroDefinition, Place, PlaceOf, ProcCall, Produced, ReadKind,
-    TokenStream, call_key, expand, lex,
+    HostError, HostWhy, IncludeAs, Included, LocalInner, MacroDefinition, OriginMaps, Place, PlaceOf, ProcCall, Produced,
+    ReadKind, SourceIndexes, TokenStream, call_key, expand, lex,
 };
 use blaze_format::Aligned;
 use blaze_id::{ContentId, CrateItemKey};
@@ -99,7 +99,7 @@ fn entries() -> Vec<(CallKey, Vec<u8>)> {
                 asked.push("unix", None, true).expect("fits");
                 asked.push("feature", Some("std"), false).expect("fits");
             }
-            let entry = write_entry(&asked, &fn_like(&def, input, &CX), blaze_own::testing::heap().alloc()).expect("an entry");
+            let entry = write_entry(&asked, &fn_like(&def, input, &CX), &same_maps(), blaze_own::testing::heap().alloc()).expect("an entry");
             (key(input), entry.to_vec())
         })
         .collect()
@@ -118,8 +118,9 @@ fn reads_back(set: &KeptSet<'_>, made: &[(CallKey, Vec<u8>)]) -> bool {
         let want = put.expansion(blaze_own::testing::heap().alloc()).expect("a made entry reads");
         let Ok(Some(entry)) = set.find(key) else { return false };
         let Ok(got) = entry.expansion(blaze_own::testing::heap().alloc()) else { return false };
+        let record = |e: &Expansion<'_>| e.write_record(&same_maps(), blaze_own::testing::heap().alloc()).expect("its tokens make a token record");
         got == want
-            && got.write_record(blaze_own::testing::heap().alloc())[..] == want.write_record(blaze_own::testing::heap().alloc())[..]
+            && record(&got)[..] == record(&want)[..]
             && Iterator::eq(entry.asked(), put.asked())
     })
 }
@@ -246,7 +247,7 @@ fn derive_like(n: usize) -> Vec<(CallKey, Vec<u8>)> {
     (0..n)
         .map(|i| {
             let name = format!("Name{i}");
-            let entry = write_entry(&Asked::new_in(blaze_own::testing::heap().alloc()), &fn_like(&def, &name, &CX), blaze_own::testing::heap().alloc()).expect("an entry");
+            let entry = write_entry(&Asked::new_in(blaze_own::testing::heap().alloc()), &fn_like(&def, &name, &CX), &same_maps(), blaze_own::testing::heap().alloc()).expect("an entry");
             (derive_key(&name), entry.to_vec())
         })
         .collect()
@@ -347,7 +348,11 @@ fn a_set_of_derive_like_expansions_is_a_fraction_of_the_old_form() {
     let mut end = 0usize;
     for (_, bytes) in &made {
         let expansion = KeptEntry::open(bytes).expect("opens").expansion(blaze_own::testing::heap().alloc()).expect("reads");
-        end = end.next_multiple_of(16) + 16 + expansion.write_record(blaze_own::testing::heap().alloc())[..].len();
+        // The old form held the record's columns: the record less its token record.
+        let alloc = blaze_own::testing::heap().alloc();
+        let record = expansion.write_record(&same_maps(), alloc).expect("its tokens make a token record");
+        let tokens = expansion.token_record(&same_maps(), alloc).expect("its tokens make a token record");
+        end = end.next_multiple_of(16) + 16 + record.len() - tokens.len();
     }
     let old = (16 + made.len() * 40).next_multiple_of(16) + end;
     let ratio = set.len() as f64 / old as f64;
@@ -399,7 +404,9 @@ fn ask(
         let aligned = Aligned::copy_from(&set);
         let opened = KeptSet::open(&aligned).expect("the set opens");
         if let Some(entry) = opened.find(&key).expect("the entry opens") {
-            return entry.expansion(blaze_own::testing::heap().alloc()).expect("the kept expansion reads").write_record(blaze_own::testing::heap().alloc()).to_vec();
+            let sources = SourceIndexes::of(def, &call, blaze_own::testing::heap().alloc());
+            let expansion = entry.expansion(blaze_own::testing::heap().alloc()).expect("the kept expansion reads");
+            return expansion.write_record(&sources.maps(), blaze_own::testing::heap().alloc()).expect("its tokens make a token record").to_vec();
         }
     }
     *runs += 1;
@@ -407,9 +414,26 @@ fn ask(
         Expanded::Expansion(expansion) => expansion,
         Expanded::NeedsExpanded(_) => panic!("the call is not eager"),
     };
-    let entry = write_entry(&Asked::new_in(blaze_own::testing::heap().alloc()), &expansion, blaze_own::testing::heap().alloc()).expect("an entry");
+    let sources = SourceIndexes::of(def, &call, blaze_own::testing::heap().alloc());
+    let entry = write_entry(&Asked::new_in(blaze_own::testing::heap().alloc()), &expansion, &sources.maps(), blaze_own::testing::heap().alloc()).expect("an entry");
     kept.push((key, entry.to_vec()));
-    expansion.write_record(blaze_own::testing::heap().alloc()).to_vec()
+    expansion.write_record(&sources.maps(), blaze_own::testing::heap().alloc()).expect("its tokens make a token record").to_vec()
+}
+
+/// Each source token `n` as record token `n`: the maps of sources with no lifetime and no
+/// invisible group. For a comparison of two records' bytes, which reads no origin as a place.
+static SAME: [u32; 512] = {
+    let mut map = [0; 512];
+    let mut n = 0;
+    while n < map.len() {
+        map[n] = n as u32;
+        n += 1;
+    }
+    map
+};
+
+fn same_maps() -> OriginMaps<'static> {
+    OriginMaps { input: Some(&SAME), attr_args: Some(&SAME), body: Some(&SAME), params: Some(&SAME) }
 }
 
 /// One call, one key, one expansion. The names library keys a statement call from its source
@@ -439,4 +463,30 @@ fn a_call_asked_by_the_names_library_and_the_lowering_is_expanded_once() {
         assert_eq!(runs, want_runs, "expander runs for one call asked twice");
     }
     println!("one key: a call asked by the names library and the lowering is expanded once");
+}
+
+/// A kept entry carries its expansion's token record (D122): opened in place from a 16-aligned
+/// copy of the entry, it is byte for byte the expansion's own `token_record` with the call's
+/// maps, and its digest equals that record's. A byte of its padding changed is refused by name
+/// (`KeptError::TokenPad`). Prints "kept entry: token record of N tokens opens in place, equal".
+#[test]
+fn a_kept_entry_carries_its_token_record() {
+    let def = MacroDefinition::rules(tokens(BODY), at());
+    let input = tokens("Carried");
+    let call = Call::fn_like(&input, site());
+    let expansion = match expand(&def, &call, &CX, blaze_own::testing::heap().alloc()).expect("the call expands") {
+        Expanded::Expansion(expansion) => expansion,
+        Expanded::NeedsExpanded(_) => panic!("the call is not eager"),
+    };
+    let sources = SourceIndexes::of(&def, &call, blaze_own::testing::heap().alloc());
+    let entry = write_entry(&Asked::new_in(blaze_own::testing::heap().alloc()), &expansion, &sources.maps(), blaze_own::testing::heap().alloc()).expect("an entry");
+    let aligned = Aligned::copy_from(&entry);
+    let opened = KeptEntry::open(&aligned).expect("the entry opens");
+    let tokens = opened.tokens().expect("the token record opens in place");
+    let want = expansion.token_record(&sources.maps(), blaze_own::testing::heap().alloc()).expect("its tokens make a token record");
+    let want_view = blaze_tokens::Tokens::open(&Aligned::copy_from(&want)).map(|v| (v.len(), v.digest(v.all()))).expect("the record opens");
+    assert_eq!((tokens.len(), tokens.digest(tokens.all())), want_view, "the entry's token record is not the expansion's");
+    assert_eq!(opened.expansion(blaze_own::testing::heap().alloc()).expect("the expansion reads"), expansion);
+    assert_eq!((entry.len() - want.len()) % 16, 0, "the token record is not at a multiple of 16");
+    println!("kept entry: token record of {} tokens opens in place, equal", tokens.len());
 }

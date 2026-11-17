@@ -88,7 +88,9 @@ pub fn want_of<'n, S: super::source::NamesSource<'n>>(names: S, keys: &Keys, q: 
         | Question::AssocParent(k)
         | Question::Attrs(k)
         | Question::AssocItem(k, _)
-        | Question::AssocGenerics(k, _) => want_of_key(names, keys, k),
+        | Question::AssocGenerics(k, _)
+        | Question::TypeAlias(k)
+        | Question::FieldDefaults(k) => want_of_key(names, keys, k),
         _ => Err(FillError::NotAHead(q)),
     }
 }

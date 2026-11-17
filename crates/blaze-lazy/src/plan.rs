@@ -33,7 +33,7 @@
 //! the run starts, so a program rustc rejects is rejected here too.
 
 use blaze_codegen::{CompiledFunction, Init, InstanceKey, RelocKind, Static, Target};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::names;
 use blaze_items::{CodeHash, ItemKey};
 use std::alloc::Global;
@@ -84,7 +84,7 @@ pub struct Plan {
     ahead: Vec<(InstanceKey, Ahead)>,
     keys: Vec<InstanceKey>,
     items: Vec<ItemKey>,
-    index: HashMap<InstanceKey, LazyId, Global>,
+    index: Map<InstanceKey, LazyId, FixedState, Global>,
     /// Every lazy function's code hash, sorted, with its id.
     by_code: Vec<(CodeHash, LazyId)>,
 }
@@ -97,7 +97,7 @@ impl Plan {
         entry: &[InstanceKey],
         statics: &[Static],
     ) -> Result<Plan, PlanError> {
-        let mut ahead: HashMap<InstanceKey, Ahead, Global> = HashMap::new_in(Global);
+        let mut ahead: Map<InstanceKey, Ahead, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for key in entry {
             if !functions.iter().any(|it| it.key == *key) {
                 return Err(PlanError::Unknown(*key));
@@ -113,7 +113,7 @@ impl Plan {
             ahead: Vec::with_capacity(ahead.len()),
             keys: Vec::with_capacity(functions.len().saturating_sub(ahead.len())),
             items: Vec::with_capacity(functions.len().saturating_sub(ahead.len())),
-            index: HashMap::new_in(Global),
+            index: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             by_code: Vec::with_capacity(functions.len().saturating_sub(ahead.len())),
         };
         plan.index.reserve(functions.len());

@@ -1,0 +1,14 @@
+{
+ "id": "maker-over-records-1",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane M (one owned maker over names records) under rebuild-1115",
+ "where": "crates/blaze-ladder/src/front2/source.rs (`NamesSource::extern_abi` for `&Records`, `member_owner` for `&Names`)",
+ "what": "The lazy program over names records refused EVERY free fn row: `row()` asks `extern_abi` of each fn, and the records impl filed a gap for any Function or Static ('the items row's `foreign` field, NAMES runner 20'). So no records-backed run could make a single instance. Separately, `member_owner` over the solved `&Names` scans every crate's member table and cannot be given an index from blaze-ladder: `&Names` is a Copy reference with nowhere to keep one, and `Names`/`Tables` live in blaze-scope.",
+ "cost": "about an hour to trace from the brief's 'construct the lazy program over records' to the gap",
+ "cause": "the items row holds no foreign/abi field, and the records reader had no outline to read the extern block from",
+ "whys": "the items record was designed for name questions, not for the one codegen question (is this fn foreign, with which abi); the solved-names index was never given a home because `&Names` implements the trait directly",
+ "class": "a NamesSource question one impl answers from an outline the other impl does not hold",
+ "prevention": "interim (lane M): `Records::block_abi` answers from the fn's own text (a body ends in `}`) or a per-file outline cached once (MOST_OUTLINES). End form: an `abi` field on the items row (NAMES runner 20), and a member-to-owner map built in blaze-scope `join_members` beside `Tables.members` for `&Names`",
+ "workaround": "uncompiled: the coordinator's run decides",
+ "state": "open"
+}

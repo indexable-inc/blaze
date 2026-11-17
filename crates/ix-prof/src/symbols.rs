@@ -114,12 +114,25 @@ impl Table {
             std::str::from_utf8(data.get(at..end)?).ok()?;
             Some((u32::try_from(at).ok()?, u32::try_from(name.len()).ok()?))
         };
+        // An assembler's local label names no function: `.Lfunc_end<n>` marks where the
+        // function before it ends, which is the next function's start, and sorts before that
+        // function's name at the same address (`.` before `_`), so the dedup below kept the
+        // label (a naked function's end label reaches Mach-O's table on 2026-11 nightlies).
+        // A label starts with `.L` (ELF), or with `L` or `l` on Mach-O, where every C or Rust
+        // symbol starts with `_`; on ELF a C function may start with `l` (`lseek`), so that
+        // rule is Mach-O's alone.
+        let macho = object.format() == object::BinaryFormat::MachO;
+        let label = |name: &[u8]| name.starts_with(b".L") || (macho && matches!(name.first(), Some(b'L' | b'l')));
         // alloc: the symbols while they are sorted, once a process
         let mut symbols: Vec<(u64, u32, u32, u32)> = object
             .symbols()
             .filter(|it| it.kind() == SymbolKind::Text && it.address() != 0)
             .filter_map(|it| {
-                let (at, len) = place(it.name_bytes().ok()?)?;
+                let name = it.name_bytes().ok()?;
+                if label(name) {
+                    return None;
+                }
+                let (at, len) = place(name)?;
                 Some((it.address(), u32::try_from(it.size()).unwrap_or(u32::MAX), at, len))
             })
             .collect();

@@ -25,13 +25,18 @@
 #![forbid(unsafe_code)]
 
 mod body_types;
+// The code index over the home's store: run_parent.rs `Lazy` finds and keeps a program's code
+// entries there across commands.
+mod code_store;
 mod item_name;
 mod checkout;
+mod data_include;
 mod fetch;
 mod fix;
 mod front_load;
 mod home;
 mod job_texts;
+mod lints;
 mod macro_files;
 mod macros;
 mod proc_callers;
@@ -40,6 +45,7 @@ mod proc_env;
 mod proc_env_unknown_tests;
 mod proc_runner;
 mod names;
+mod native_image;
 mod script_modules;
 mod scripts;
 mod not_checked;
@@ -57,8 +63,16 @@ mod run_parent;
 // The run parent's driver loop over bstd's run child; `run_program` is called from program.rs `run` next.
 #[allow(dead_code, reason = "program.rs `run` calls run_program in the next step (wiring run-parent-io-1, 'Not wired')")]
 mod run_loop;
+mod run_ids;
+mod run_names;
+// `blaze run`'s program: `-p`, `--bin` and the workspace's defaults.
+mod run_package;
 mod roster;
 mod seal;
+// `blaze run`'s start list (run.md stage 7): one mutable root a (program, request shape).
+mod start_list;
+/// A head as a drive task (D114): its name, source and out.
+mod signature;
 mod store;
 mod sweep;
 mod graph;
@@ -74,7 +88,7 @@ use core::fmt;
 
 use blaze_drive::{
     Answer, Ask, Command, Config, DriveError, Effect, Event, FileEntry, Gate, Print, Request, Settled, Space, TableFull,
-    WireError, Why,
+    WireError,
 };
 use blaze_ladder::refusal::{Refusal, SourceFile};
 use blaze_ladder::run::RunError;
@@ -86,7 +100,7 @@ use bstd::entry::Status;
 use bstd::env::VarName;
 use bstd::fs::{Dir, FsError, ReadWrite};
 use bstd::io::Missing;
-use bstd::mem::{Bytes, Frame};
+use bstd::mem::Frame;
 use bstd::out::{Out, OutError};
 use bstd::path::{Path, PathError};
 use bstd::{Cx, Io, entry::Error};
@@ -132,14 +146,18 @@ pub enum CliError {
     /// The run parent could not start or serve the program in its own process (own_process.rs):
     /// blaze's own failure, so [`program::NOT_RUN`] (L6, D103).
     OwnProcess(own_process::OwnError),
-    /// `blaze run` in a package with no binary to run (program.rs): a failure before any
-    /// program starts, so [`program::NOT_RUN`] like every other one of `run` (L6).
-    NoBinary(program::NoBinary),
+    /// `blaze run` with no one program to run (run_package.rs: no such package or binary, a
+    /// library, or more than one and no `-p` or `--bin`): a failure before any program starts,
+    /// so [`program::NOT_RUN`] like every other one of `run` (L6).
+    RunPackage(run_package::PickError),
     /// A `--grant` that cannot reach a hosted program (host_grants.rs): before it starts, so
     /// [`program::NOT_RUN`] (L6).
     HostGrant(host_grants::HostGrantError),
     /// A named origin's read path stopped the command (store.rs; a miss is not this).
     Remote(store::RemoteError),
+    /// The one store under the home refused (store.rs `StoreFailure`: no `HOME`, the open, a
+    /// put, the commit).
+    Store(store::StoreFailure),
     /// The running binary carries no linker id, the tool identity every key starts from.
     BuildId(bstd::host::NoBuildId),
     /// The build's producer digests name other rows than this binary's table (producers.rs):
@@ -161,6 +179,17 @@ pub enum CliError {
     /// One file's findings could not be placed or drawn (print.rs `Scratch`): the file and the
     /// frames are named.
     Draw(print::DrawError),
+    /// The root manifest's lints could not be read (lints.rs `lints_of`): the key, its line and
+    /// an unknown rule's word are named.
+    Lints(lints::StepError),
+    /// `blaze run`'s names rows (run_names.rs): the program's crates, or their record at the
+    /// certificate, could not be had.
+    RunNames(run_names::RunNamesError),
+    /// The request stood on its certificate and the store holds no record of its program's names
+    /// rows (run_names.rs): the command drops it before the program starts and asks again in
+    /// full, once (`command`'s `ask`). `again`: it was already asked in full, which walks and
+    /// never stands, so this is blaze's bug.
+    AnswerInFull { again: bool },
 }
 
 impl fmt::Display for CliError {
@@ -183,9 +212,10 @@ impl fmt::Display for CliError {
             CliError::Program(error) => write!(f, "the program: {error}"),
             CliError::Ran { command, error } => write!(f, "blaze {command}: {error}"),
             CliError::OwnProcess(error) => write!(f, "{error}"),
-            CliError::NoBinary(no) => write!(f, "{no}"),
+            CliError::RunPackage(why) => write!(f, "{why}"),
             CliError::HostGrant(error) => write!(f, "{error}"),
             CliError::Remote(error) => write!(f, "{error}"),
+            CliError::Store(failure) => write!(f, "{failure}"),
             CliError::BuildId(error) => write!(f, "{error}: blaze keys every record by its own code and will not run without that id"),
             CliError::Producers(error) => write!(f, "{error}"),
             CliError::Pool(error) => write!(f, "{error}"),
@@ -194,6 +224,15 @@ impl fmt::Display for CliError {
             CliError::Toolchain(error) => write!(f, "the pinned toolchain: {error}"),
             CliError::Panicked { command } => write!(f, "blaze {command} panicked (its message is above); what it had done is in .blaze/v2/profile.txt"),
             CliError::Draw(error) => write!(f, "{error}"),
+            CliError::Lints(error) => write!(f, "{error}"),
+            CliError::RunNames(error) => write!(f, "{error}"),
+            CliError::AnswerInFull { again: false } => {
+                write!(f, "the run stood on its certificate and the store holds no record of its program's names rows (run_names.rs `stood`): it is asked again in full")
+            }
+            CliError::AnswerInFull { again: true } => write!(
+                f,
+                "asked again in full, the run stood on its certificate again with no record of its program's names rows (run_names.rs `found`): a request asked in full walks, so this is blaze's bug"
+            ),
         }
     }
 }
@@ -210,16 +249,21 @@ macro_rules! from {
     };
 }
 
-from!(Missing(Missing), Path(PathError), Fs(FsError), Out(OutError), Drive(DriveError), Table(TableFull), BuildId(bstd::host::NoBuildId), Producers(blaze_ids::producer::SourcesRefused));
+from!(Missing(Missing), Path(PathError), Fs(FsError), Out(OutError), Drive(DriveError), Table(TableFull), BuildId(bstd::host::NoBuildId), Producers(blaze_ids::producer::SourcesRefused), Lints(lints::StepError));
 
 /// `blaze run` and `test` fail on any finding, lints included (bottom.md 11); `check` reports.
 /// A body whose types were not checked (`body_types::TYPES_NOT_CHECKED`) says what the command
 /// left out, not what is wrong with the program: it is no error, and the closing line says
 /// "incomplete" for it (`check_coverage`).
 fn every_rule(rule: u16) -> bool {
-    rule != body_types::TYPES_NOT_CHECKED
+    // D111: an include outside its package inside the workspace is a warning, never an error.
+    rule != names::include_outside::INCLUDE_OUTSIDE_PACKAGE
+        && rule != body_types::TYPES_NOT_CHECKED
         && rule != body_types::BORROWS_NOT_CHECKED
         && (body_types::BORROWS_ARE_ERRORS || rule != body_types::BORROWS)
+        // A lint finding's level is the step's, decided when printed (rule 81): every step's is
+        // advice today, never an error, so no lint changes the exit status (lints.rs `level_of`).
+        && !lints::is_lint(rule)
 }
 
 /// What follows the command word.
@@ -240,6 +284,8 @@ struct Flags<'a> {
     view: Option<View>,
     /// `--fix <selector>...`: the arguments that are its selectors, `start..end` of the list.
     fix: Option<(usize, usize)>,
+    /// `-p <package>` and `--bin <name>`: which program `blaze run` runs (run_package.rs).
+    select: run_package::Select<'a>,
 }
 
 fn flags(args: &Args) -> Result<Flags<'_>, CliError> {
@@ -254,6 +300,7 @@ fn flags(args: &Args) -> Result<Flags<'_>, CliError> {
         grants: std::vec::Vec::new(),
         program: std::vec::Vec::new(),
         workers: None,
+        select: run_package::Select::NONE,
     };
     let mut at = 2;
     while let Some(arg) = args.get(at) {
@@ -267,7 +314,7 @@ fn flags(args: &Args) -> Result<Flags<'_>, CliError> {
         }
         let mut value = || {
             at += 1;
-            args.get(at - 1).ok_or(CliError::Usage("--color, --origin, --origin-key, --grant and --workers each take a value"))
+            args.get(at - 1).ok_or(CliError::Usage("--color, --origin, --origin-key, --grant, --workers, -p and --bin each take a value"))
         };
         match arg {
             "--view" => flags.view = Some(View::parse(value()?).ok_or(CliError::Usage("--view is person, agent or json"))?),
@@ -290,6 +337,10 @@ fn flags(args: &Args) -> Result<Flags<'_>, CliError> {
                 flags.grants.push(pair);
             }
             "--stats" => flags.stats = true,
+            "-p" | "--package" => flags.select.package = Some(value()?),
+            "--bin" => flags.select.bin = Some(value()?),
+            _ if arg.starts_with("--package=") => flags.select.package = Some(&arg["--package=".len()..]),
+            _ if arg.starts_with("--bin=") => flags.select.bin = Some(&arg["--bin=".len()..]),
             "--workers" => {
                 let n = value()?.parse::<core::num::NonZeroU32>().map_err(|_| CliError::Usage("--workers takes a count of at least 1"))?;
                 flags.workers = Some(n);
@@ -327,11 +378,14 @@ fn choice(word: &str) -> Result<Choice, CliError> {
 /// hosted) and reads no run spec on file descriptor 3 (no parent in the tree sets
 /// `BSTD_RUN_SPEC` for it).
 fn main() -> bstd::entry::Exit {
-    bstd::entry::run_with(bstd::entry::Os::process(), |cx, io| run(cx, io))
+    // The process's heap is a grant bstd's entry hands `main` (D102, D120), never reached for
+    // here or below: every allocator under the command is its handle, a frame, or an arena.
+    bstd::entry::run_with_heap(bstd::entry::Os::process(), |cx, io, heap| run(cx, io, heap))
 }
 
 /// The status: 0 for a check that passed; `blaze run`'s, the status its program's `main` ended with.
-fn run(cx: &Cx, io: Io) -> Result<Status, Error> {
+fn run(cx: &Cx, io: Io, heap: bstd::mem::Heap) -> Result<Status, Error> {
+    let heap = heap.root();
     let mut phases = Phases::new(io.need_clock()?);
     let out = io.need_out()?;
     let err = io.need_err()?;
@@ -341,7 +395,7 @@ fn run(cx: &Cx, io: Io) -> Result<Status, Error> {
     let starts_a_program = io.args().is_some_and(|args| matches!(args.get(1), Some("run" | "test")));
     // A failure of `check` or `explain` is printed in one place, bstd's exit path (`error: `
     // and its message), with status 1.
-    match command(cx, &io, &out, &err, &mut phases) {
+    match command(cx, &io, &out, &err, &mut phases, heap) {
         // A trap in the program's placed code (blaze-ladder trap.rs): the PROGRAM's failure,
         // said in its one line ("the program trapped (`brk #0xff02`, unreachable) in `f` +0x..,
         // called from ..") and ended with the program's status, never blaze's `NOT_RUN`.
@@ -374,7 +428,7 @@ fn words<'o>(command: Command, out: &'o Out, err: &'o Out) -> &'o Out {
 /// What `blaze build` is told: the two commands that do what it would.
 const NO_BUILD: &str = "`blaze run` compiles what the program reaches and runs it; `blaze export` (not built yet) writes the program as a file";
 
-fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Result<Status, CliError> {
+fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases, heap: &'static blaze_own::Heap) -> Result<Status, CliError> {
     let args = io.need_args()?;
     let (command, word) = match args.get(1) {
         Some("check") => (Command::Check, "check"),
@@ -387,6 +441,9 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
         Some(_) | None => return Err(CliError::Usage("the command is check, run, test or explain")),
     };
     let flags = flags(&args)?;
+    if command != Command::Run && flags.select != run_package::Select::NONE {
+        return Err(CliError::Usage("-p and --bin choose `blaze run`'s program"));
+    }
     let out = words(command, out, err);
     phases.mark("argument list");
     let frame = cx.frame();
@@ -433,7 +490,7 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
     phases.mark_in("open checkout", frame);
     let mut ran = None;
     let workers = flags.workers.map_or(u32::try_from(workers).unwrap_or(u32::MAX), |n| n.get());
-    let launch = program::Launch { io, grants: &flags.grants, args: &flags.program };
+    let launch = program::Launch { io, select: flags.select, grants: &flags.grants, args: &flags.program };
     // Cargo's home (D78), read here at the edge (rule 75): `CARGO_HOME`, else `<HOME>/.cargo`.
     // Its archive cache is the second place a dependency's bytes come from (fetch.rs).
     let cargo_home = match (var("CARGO_HOME"), var("HOME")) {
@@ -450,11 +507,25 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
             None => Err(fetch::ExeDirWhy::NotUtf8),
         },
     };
+    // The one store a user (drive.md, "The store under the command"), opened here, outside the
+    // request: every record lent from it outlives the request, and its ONE commit, carrying the
+    // records and the roots, comes after the answer is printed (below).
+    let opened = store::open_for_command(cx, io, var("HOME"), &root, checkout_at, phases.clock(), err)?;
     // The request as this command makes it; it takes what it prints into and gives it back.
     let mut ask = |mut shown, ran: &mut Option<u8>, phases: &mut Phases| {
         let exe_dir = exe_dir.as_ref().map(|dir| dir.as_str()).map_err(|why| *why);
-        let finished = request(cx, &root, (checkout_at, var("SSL_CERT_FILE"), var("SSL_CERT_DIR"), var("HOME"), cargo_home.as_ref().map(|cargo| cargo.as_str()), var("PWD"), blaze_toolchain::PINNED, var("SDKROOT"), exe_dir), origin.as_ref(), (command, word), workers, &producers, work::Sizes::USUAL, &launch, frame, out, err, ran, &mut shown, phases);
-        finished.map(|finished| (finished, shown))
+        // A run that stood on its certificate with no record of its program's names rows is
+        // dropped before its program starts and asked again in full, once (run_names.rs; a
+        // request asked in full walks, so a second one is blaze's bug, named).
+        let mut in_full = false;
+        loop {
+            let finished = request(cx, &root, (checkout_at, var("SSL_CERT_FILE"), var("SSL_CERT_DIR"), var("HOME"), cargo_home.as_ref().map(|cargo| cargo.as_str()), var("PWD"), blaze_toolchain::PINNED, var("SDKROOT"), exe_dir), origin.as_ref(), (&opened.home, &opened.lent, opened.open_ns), (command, word), workers, &producers, work::Sizes::USUAL, &launch, frame, out, err, ran, &mut shown, phases, heap, in_full);
+            if !in_full && matches!(finished, Err(CliError::AnswerInFull { .. })) {
+                in_full = true;
+                continue;
+            }
+            break finished.map(|finished| (finished, shown));
+        }
     };
     // The whole request, behind the command's one edge for a panic (rule 20): a command that
     // fails or panics still leaves its profile, so why it stopped is read, not guessed (rule 17).
@@ -474,7 +545,10 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
     });
     let (mut finished, shown) = match asked {
         Ok(Ok(Some(done))) => done,
-        Ok(Ok(None)) => return Ok(Status::FAILED),
+        Ok(Ok(None)) => {
+            store::after_answer_printed(cx, opened.lent, flags.stats, phases.clock(), err)?;
+            return Ok(Status::FAILED);
+        }
         Ok(Err(error)) => {
             print::profile_failed(cx, &root, &error, phases, frame)?;
             return Err(error);
@@ -506,6 +580,8 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
     phases.mark_in("answer printed", frame);
     // The answer is printed: the profile is written after it, in place, never synced.
     print::profile(cx, &root, &finished.answer, phases, frame)?;
+    // Then the store's one commit: this command's records and its roots in one flip.
+    store::after_answer_printed(cx, opened.lent, flags.stats, phases.clock(), err)?;
     status
 }
 
@@ -516,11 +592,28 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
 fn close(cx: &Cx, command: Command, finished: &Finished<'_>, shown: &print::Shown<'_>, ran: Option<u8>, in_main: u64, frame: &Frame, out: &Out) -> Result<Status, CliError> {
     let (ran_stages, not_stages) = check_coverage(finished.names_held, shown.types_unchecked == 0, shown.borrows_unchecked == 0, frame);
     let coverage = (command == Command::Check && !not_stages.is_empty()).then_some(blaze_report::frame::Coverage { ran: &ran_stages, not: &not_stages });
+    // How many items `check` could not check: also `run`'s when its program did not start, as
+    // its gate refuses a start over one (`Gate::Before`); 0 for `test`, and for a program that ran.
+    let mut unchecked = 0u32;
     if ran.is_none() {
         let tail = (command == Command::Test).then_some("tests are not run yet: this build of blaze checks them");
+        // The tasks not run because an input they read could not be made, one line a cause
+        // (not_checked/tasks.rs): the input's own finding was printed once, above.
+        not_checked::tasks::lines(&shown.not_run, frame, &mut |line| print::note(cx, line, shown, frame, out))?;
+        // The items `check` could not check, one line a cause (not_checked/items.rs), before
+        // the closing line.
+        if matches!(command, Command::Check | Command::Run) {
+            unchecked = not_checked::items::lines(&shown.unchecked, frame, &mut |line| print::note(cx, line, shown, frame, out))?;
+        }
         print::closing(cx, shown, finished.checked, in_main, Some(finished.answer.profile.runs()), tail, coverage, frame, out)?;
+        // Its own summary line, beside the closing line's counts (never "0 errors" beside it).
+        if unchecked > 0 {
+            print::note(cx, not_checked::items::summary(unchecked, frame).as_str(), shown, frame, out)?;
+        }
     }
-    if shown.counts.errors > 0 || finished.answer.failed > 0 {
+    // A task not run because an input failed is not counted as an error, but the command did not
+    // do what it was asked: it fails, whatever the input's own finding counted.
+    if shown.counts.errors > 0 || finished.answer.failed > 0 || !shown.not_run.is_empty() {
         // A program that did not run because of what was found is blaze's refusal (L6):
         // `NOT_RUN`, never 1, a status the program itself could have ended with.
         return Ok(match (command, ran) {
@@ -529,9 +622,15 @@ fn close(cx: &Cx, command: Command, finished: &Finished<'_>, shown: &print::Show
         });
     }
     match command {
+        // No error in the code it checked, but items it could not check: a failure of its own.
+        Command::Check if unchecked > 0 => Ok(UNCHECKED_ITEMS),
         // Nothing found, but a stage `check` is defined to run did not: not a pass.
         Command::Check if coverage.is_some() => Ok(INCOMPLETE),
         Command::Check => Ok(Status::OK),
+        // No error, and items the check could not check: the gate did not start the program
+        // (`Gate::Before`). blaze's refusal, as over an error (L6): never a status the program
+        // itself could have ended with.
+        Command::Run if ran.is_none() && unchecked > 0 => Ok(Status(program::NOT_RUN)),
         // The program ran at the machine's `StartProgram`: its status is the command's.
         Command::Run => ran.map(Status).ok_or(CliError::Drive(DriveError::Finished)),
         Command::Test => Ok(Status::FAILED),
@@ -587,12 +686,18 @@ fn fix_then_check<'f, W: fix::Writer + Default>(
 /// run: not 0, which only a complete check returns (`blaze explain 3`).
 pub(crate) const INCOMPLETE: Status = Status(3);
 
+/// The exit status of a `check` that found no error in the code it checked while it could not
+/// check some items (not_checked/items.rs names each, by cause): a failure, but not of the
+/// user's code (`blaze explain 4`). An error found wins: status 1, both summary lines printed.
+pub(crate) const UNCHECKED_ITEMS: Status = Status(4);
+
 /// The exit statuses `blaze` returns, each with what it means: `blaze explain <status>` prints
 /// one, `blaze explain` all.
-const STATUSES: [(u8, &str); 4] = [
+const STATUSES: [(u8, &str); 5] = [
     (0, "check: every stage `check` is defined to run ran and found nothing (run: the program's own status)"),
     (1, "check: an error was found, a task failed, or blaze itself failed (its message says which); run: the program's own status"),
     (3, "check: incomplete: the stages this build runs found nothing, but a stage `check` is defined to run is not built yet (the closing line's \"NOT checked\" names which); not a pass"),
+    (4, "check: blaze could not check some items (each named by its cause in the \"not checked because ..\" lines, counted in \"the check is incomplete: blaze could not check N items\"); the code it did check had no error; not a pass"),
     (125, "run and test: blaze did not start the program (the manifest, a finding, a build or the start failed; its message says which); no program returned it"),
 ];
 
@@ -641,8 +746,9 @@ struct Finished<'f> {
     checked: u32,
     /// The most each frame held: the profile's `frames` line.
     high: work::HighWater,
-    /// The tasks that failed, each with its file.
-    failed: Vec<work::Failed<'f>, &'f Frame>,
+    /// The tasks that failed, each with its file and words: one table on the command's heap,
+    /// freed with the answer once it is printed (never in the command's frame).
+    failed: work::Failures<'f>,
     /// The crates whose names this command resolved (names.rs): the closing note's count.
     resolved: u32,
     /// Whether the answer holds the crates' names: `false` when the stage did not run, which
@@ -697,6 +803,9 @@ fn request<'f>(
         Result<&'f str, fetch::ExeDirWhy>,
     ),
     origin: Option<&store::NamedOrigin>,
+    // The one store, opened by the command's function and committed by it after the answer is
+    // printed: its home folder, the lent every record is borrowed from, and the open's time.
+    (store_home, lent, open_ns): (&store::Home, &store::CommandLent, u64),
     (command, word): (Command, &'static str),
     workers: u32,
     // Every producer's id (D105), made once at the entry: the whole tool and each kind's below.
@@ -709,34 +818,61 @@ fn request<'f>(
     ran: &mut Option<u8>,
     shown: &mut print::Shown<'f>,
     phases: &mut Phases,
+    // The process's heap, handed from `main` (D120): the machine's, the work list's and every
+    // record that leaves for the store when its task ends are made on it.
+    heap: &'static blaze_own::Heap,
+    // Asked again in full (`CliError::AnswerInFull`): no last answer and no leaf table, so the
+    // request walks from the units down and never stands on its certificate.
+    in_full: bool,
 ) -> Result<Finished<'f>, CliError> {
     let cx = cx.span("blaze request");
     let began = phases.now();
     // The whole tool (the certificate, the pointer, the walk from the last answer, the store's
     // producer name) and each kind's (its tasks' keys): home.rs.
-    let (tool, tools) = (home::tool(producers), home::tools(producers));
-    // The pointer file (seal.rs): one read for the last answer and the leaf table. Missing,
-    // another form's or torn, it is absent: a note after the findings, and the request answers in full.
-    // It is this tool's, for this request's shape (`.blaze/v2/at/<name>`, blaze-drive
-    // pointers.rs): another build of blaze and another command each have their own, so neither
-    // takes the answer this one walks forward from.
-    let mut pointer = Bytes::new_in(frame, "the pointer file");
-    let ask = Ask { command, args: b"", gate: Gate::Beside, space: Space::NONE };
+    // `check` lints by the step and the added rules the root manifest names (lints.rs
+    // `lints_of`), read once a command; every other command runs no rule.
+    let lints = match command {
+        Command::Check => {
+            let mut manifest = bstd::mem::Bytes::new_in(frame, "the root manifest, for its lint step");
+            root.read_all(&cx, &Path::new("Cargo.toml")?, &mut manifest)?;
+            let text = core::str::from_utf8(manifest.as_slice()).map_err(|_| CliError::Text { what: "the root `Cargo.toml` is not UTF-8" })?;
+            lints::lints_of(text)?
+        }
+        _ => lints::Lints::NONE,
+    };
+    shown.lints = lints.step;
+    let (tool, tools) = (home::tool(producers), home::tools(producers, lints.rules));
+    // The last answer and the leaf table (drive.md ruling 3): one record, sealed (seal.rs), named
+    // by this checkout's root for this tool and request shape (`store::last_root`), read in
+    // place. Another build of blaze and another command each have their own root, so neither
+    // takes the answer this one walks forward from. No root, another form's or torn, it is
+    // absent: a note after the findings, and the request answers in full.
+    // `run`'s program is the picked binary (run_package.rs `Program::root`), named from its path
+    // before the layout is read: the shape holds it, so each program has its own pointer and
+    // certificate (native_image.rs `program_name`).
+    // Which program is chosen first (run_package.rs: `-p`, `--bin`, the workspace's defaults),
+    // so a run with no one program to run is refused before any work.
+    let picked = match command {
+        Command::Run => Some(run_package::pick(&cx, root, launch.select, frame)?),
+        Command::Check | Command::Test => None,
+    };
+    let program = picked.map(|picked| native_image::program_name(picked.root));
+    // No facts yet: no worker reads an environment variable through the machine (A2b item 5).
+    // `run` requires its check first (run.md D124, "The gate is before the start"): `Before`
+    // starts the program only over a check with no error and no item it could not check.
+    // `test` holds its verdicts until the check ends beside it (stage 4); `check` ignores it.
+    let gate = match command {
+        Command::Run => Gate::Before,
+        Command::Check | Command::Test => Gate::Beside,
+    };
+    let ask = Ask { command, args: b"", gate, space: Space::NONE, program, facts: &[] };
     let shape = blaze_drive::request::shape_of(&ask);
-    let pointer_at = seal::At::of(tool, &shape);
-    let pointer_path = pointer_at.path()?;
-    // No file there: writing it adds one to the folder, so the write first removes the
-    // pointers past the cap (seal.rs `write`).
-    let mut pointer_fresh = false;
+    let last_root = store::last_root(checkout_at, &blaze_drive::pointers::PointerName::of(tool, &shape));
     // Each a note after the findings (`draw`).
     let mut notices: Vec<Notice, &Frame> = Vec::new_in(frame);
-    let (last, leaves) = match root.read_all(&cx, &pointer_path, &mut pointer) {
-        Err(error) if error.kind == bstd::fs::FsKind::NotFound => {
-            pointer_fresh = true;
-            (None, Leaves::EMPTY)
-        }
-        Err(error) => return Err(error.into()),
-        Ok(_) => match home::current(seal::PATH, pointer.as_slice(), seal::SEAL_MAGIC) {
+    let (last, leaves) = match store::last(lent, &last_root)? {
+        None => (None, Leaves::EMPTY),
+        Some(held) => match home::current(seal::PATH, held.bytes, seal::SEAL_MAGIC) {
             Err(older) => {
                 notices.push(Notice::Older(older));
                 (None, Leaves::EMPTY)
@@ -774,21 +910,16 @@ fn request<'f>(
         Some(bytes) if !blaze_drive::request::walks_from(bytes, tool, &shape).map_err(|error| CliError::Drive(DriveError::LastFile(error)))? => (None, Leaves::EMPTY),
         _ => (last, leaves),
     };
+    let (last, leaves) = if in_full { (None, Leaves::EMPTY) } else { (last, leaves) };
     phases.mark_in("pointer read (last answer and leaf table)", frame);
     let stamps = FromMeta::now(phases.clock());
     let sweep_plant = match sizes.plant {
         work::Plant::Sweep(plant) => plant,
         _ => sweep::Plant::None,
     };
-    // The machine store under the home (remote-read.md, "One chain of stores"): its place
-    // from `HOME` as read at the edge (rule 75), a second tree wherever it is. Opened before the
-    // sweep: blaze's folder in the home holds a fact the answer reads (the proc-macro module
-    // store's listing, a `HomeListing` row).
-    let machine = store::Machine::of(&cx, &launch.io.need_fs()?, home)?;
-    let home_dir = match &machine {
-        store::Machine::Home(dir) => Some(dir),
-        store::Machine::Off(_) => None,
-    };
+    // blaze's folder in the home holds a fact the answer reads (the proc-macro module store's
+    // listing, a `HomeListing` row): the sweep follows it as a second tree.
+    let home_dir = Some(store_home.dir());
     let followed = sweep::Follow { stamps, plant: sweep_plant }.follow(&cx, root, home_dir, &leaves, frame)?;
     phases.mark_in("sweep", frame);
     // No table: nothing to follow; the layout discovers forward from the root manifest, and the
@@ -798,9 +929,9 @@ fn request<'f>(
     // of its own, so it is erased into one here, on this stack, for this request.
     let erased = blaze_own::Erased::new(frame);
     let alloc = erased.handle();
-    let mut facts = work::Facts { stamps, rows: Rows::new_in(frame), found: sweep::Found::new_in(frame), laid: None, plant: sizes.plant, workers, fetch_env: fetch::FetchEnv { clock: phases.clock().clone(), checkout: checkout_at, cert_file, cert_dir, home, cargo_home, start, toolchain, fs: launch.io.need_fs()?, sdk, exe_dir }, macros: None, names: None, bodies: body_types::Kept::default(), scripts: None };
+    let mut facts = work::Facts { stamps, rows: Rows::new_in(frame), found: sweep::Found::new_in(frame), laid: None, plant: sizes.plant, workers, fetch_env: fetch::FetchEnv { clock: phases.clock().clone(), checkout: checkout_at, cert_file, cert_dir, home, cargo_home, start, toolchain, fs: launch.io.need_fs()?, sdk, exe_dir, heap }, macros: None, names: None, bodies: body_types::Kept::default(), scripts: None, producer: producers.get::<blaze_ids::producer::Whole>(), lints: lints.rules };
     if cold || followed.layout_moved {
-        facts.laid = Some(units::lay(&cx, root, &stamps, &mut facts.rows, toolchain, frame, alloc)?);
+        facts.laid = Some(units::lay(&cx, root, &stamps, &mut facts.rows, toolchain, heap, frame, alloc)?);
         // The proc-macro module store's listing, read with the layout: in the units' source, so
         // a module that comes or goes moves the certificate and the dependency graph's source,
         // and with it each `MacroModule` part's (macros.rs).
@@ -821,8 +952,17 @@ fn request<'f>(
     if let Some(laid) = facts.laid.as_mut()
         && let (Some(lockfile), Some(parts)) = (laid.lock.as_ref(), laid.parts.take())
     {
-        let target = graph::target(&cx, &facts.fetch_env, frame)?;
-        laid.graph = Some(graph::Graph::new(parts, lockfile, units, target, matches!(command, Command::Test | Command::Check), frame));
+        // THE COMMAND'S PANIC STRATEGY, second spot (the unit graph's cfg): the program's
+        // profile fact, the same as run_parent.rs `builder_for`'s; each desc's `cfg(panic)` is
+        // derived from it by blaze-world `panic::unit_panic`. A test build unwinds throughout
+        // and does not read the profile (`panic::TEST_PROFILE`, Cargo profiles.html#panic).
+        let program = match command {
+            Command::Test => blaze_world::panic::TEST_PROFILE,
+            _ => program::dev_profile_panic(&cx, root, frame)?,
+        };
+        let target = graph::target(&cx, &facts.fetch_env, program, &blaze_unit_graph::UnitKind::Lib, frame)?;
+        let host = graph::target(&cx, &facts.fetch_env, program, &blaze_unit_graph::UnitKind::BuildScript, frame)?;
+        laid.graph = Some(graph::Graph::new(parts, lockfile, units, target, host, matches!(command, Command::Test | Command::Check), heap, frame));
         phases.mark_in("the target's cfg", frame);
     }
     let mut files: Vec<FileEntry<'_>, &Frame> = Vec::with_capacity_in(followed.now.rows.len(), frame);
@@ -851,7 +991,7 @@ fn request<'f>(
     gone.sort_unstable();
     gone.dedup();
     let config = Config { tool, tools, workers, most_entries: 64, most_jobs: 1 << 24, is_error: every_rule };
-    // The machine allocates from the global heap, named (rule 11): what it hands out to be
+    // The machine allocates from the process's heap, handed from `main` (rule 11): what it hands out to be
     // performed (a record's bytes to `Put`, a page) is freed once performed, so the request's
     // footprint is its keys, rows and findings, not every record it wrote (rule 51: a record
     // leaves for the store when its task ends). A frame would hold each until the command ended.
@@ -859,26 +999,21 @@ fn request<'f>(
         work::Plant::Drive(plant) => plant,
         _ => blaze_drive::Plant::None,
     };
-    let mut req = Request::planted_in(config, ask, drive_plant, Alloc::global());
+    // A body whose types were not checked is the item `check` counts for its status 4
+    // (not_checked/items.rs): the same finding keeps `run`'s program from starting.
+    let mut req = Request::planted_in(config, ask, drive_plant, heap.alloc()).with_not_checked(|rule| rule == body_types::TYPES_NOT_CHECKED);
+    // `run` checks only what its program reaches: the crate roots of its package's member
+    // closure (blaze-drive run_scope.rs; run.md "End state (D113)", stage 4).
+    if let Some(picked) = picked {
+        req = req.with_member_closure(picked.units());
+    }
     // Frames for the tasks and for records read back, made on first use (a repeat runs none).
     let mut frames: Option<work::Frames> = None;
-    let mut got = bstd::mem::Frame::with_reserve(bstd::mem::TASK_FRAME, bstd::mem::Tag::Other)
-        .map_err(|_| CliError::Text { what: "the frame for records read back could not be reserved" })?;
     let mut high = work::HighWater::default();
-    let mut failed: Vec<work::Failed<'_>, &Frame> = Vec::new_in(frame);
-    // The boot this command runs in, the driver's fact: a pack known whole in it is mapped
-    // unread; one from an earlier boot is read whole once. No fact: every open reads whole.
-    let boot = match launch.io.boot() {
-        Ok(boot) => store::Boot::Known(boot.0),
-        Err(why) => {
-            err.line(&cx, format_args!("blaze: no boot fact ({why}): each command reads the stores' packs whole"))?;
-            store::Boot::Unknown
-        }
-    };
-    // The machine store, opened before the sweep (above).
-    let mut store = store::Layered::open(&cx, root, &machine, boot, origin, phases.clock().clone(), err, alloc)?;
-    // Every record this command seals names this tool as its producer (store/producers.rs).
-    store.name_tool(tool);
+    let mut failed = work::Failures::new_in(heap.alloc());
+    // The command's handle on the one store: gets in place, puts into the lent's arena.
+    // `false`: this machine is no trusted builder (CI's setting comes with publishing).
+    let mut store = store::CommandStore::new(&cx, lent, false, open_ns, origin, phases.clock().clone(), err, alloc)?;
     // The workers' read side: today's tasks publish a file's outline and a manifest's units,
     // about one name a file, so 8 a file. A cold run starts with no files listed and opens them
     // as it goes: the table grows on a full one (`Settled::grown_in`), never stops. On the
@@ -890,8 +1025,8 @@ fn request<'f>(
     // the machine that fills them (above). Each grows and empties many times a command; over the
     // command's frame every outgrown buffer stayed until the command ended (the refusal of
     // 2026-11-16: "the allocator refused 2850816 bytes ... for `Effect`").
-    let mut effects: Vec<Effect<'_>, Alloc<'_>> = Vec::new_in(Alloc::global());
-    let mut todo: VecDeque<Effect<'_>, Alloc<'_>> = VecDeque::new_in(Alloc::global());
+    let mut effects: Vec<Effect<'_>, Alloc<'_>> = Vec::new_in(heap.alloc());
+    let mut todo: VecDeque<Effect<'_>, Alloc<'_>> = VecDeque::new_in(heap.alloc());
     let mut prints: Vec<Print<'_>, &Frame> = Vec::new_in(frame);
     // The batches handed out and not yet run: at most one a worker (the request's own cap).
     let mut batches = std::vec::Vec::new_in(std::alloc::Global);
@@ -978,23 +1113,23 @@ fn request<'f>(
         };
         match effect {
             Effect::Get { key } => {
-                // Read into a frame reset once the machine has taken what it keeps of it.
-                {
-                    let mut bytes = Bytes::new_in(&got, "a record");
-                    let found = store.get_into(&cx, key, &mut bytes)?;
-                    let bytes = found.then_some(bytes.as_slice());
-                    let stepped = phases.now();
-                    phases.request.gets += phases.since(at);
-                    phases.took(kind, frame);
-                    req.step(Event::Got { key, bytes }, &mut effects)?;
-                    phases.took(STEP, frame);
-                    phases.request.steps += phases.since(stepped);
-                }
-                high.got = high.got.max(got.peak());
-                got.reset();
+                // In place: the bytes are the lent's for the whole command (blaze-cas
+                // plain/lent.rs); nothing is copied and no frame is reset.
+                let held = store.get(&cx, key)?;
+                let stepped = phases.now();
+                phases.request.gets += phases.since(at);
+                phases.took(kind, frame);
+                req.step(Event::Got { key, bytes: held.map(|held| held.bytes) }, &mut effects)?;
+                phases.took(STEP, frame);
+                phases.request.steps += phases.since(stepped);
             }
             Effect::Put { key, bytes } => {
-                store.put(&cx, key, &bytes)?;
+                if let Err(mut error) = store.put(&cx, key, &bytes) {
+                    if let CliError::Store(crate::store::StoreFailure::TwoValues { clash, .. }) = &mut error {
+                        clash.label_with(facts.names.as_ref());
+                    }
+                    return Err(error);
+                }
                 phases.request.puts += phases.since(at);
             }
             Effect::Run { batch } => batches.push(batch),
@@ -1019,10 +1154,55 @@ fn request<'f>(
             // The walking skeleton's straight line, in this process and to its end before the
             // request goes on (tests/ladder/README.md); the design's route is blaze-run's Parent
             // taking the units' record and answering `Exited` when the child ends (drive.md, "Run").
-            Effect::StartProgram { .. } => {
+            Effect::StartProgram { units, native } => {
                 started = phases.since(began);
-                // The program's files are its package's `src/`, listed alone: never the checkout.
-                let ok = match program::run(&cx, root, launch, frame) {
+                // The program starts from the effect's keys: the units' record names its entry,
+                // the `Native` record at `native` holds its image (never read back from `req`).
+                // Its files are its package's `src/`, listed alone: never the checkout.
+                // The start list's certificate and name: today's request certificate, and this
+                // request shape's list (start_list.rs; run.md stage 7).
+                let today = start_list::Today { certificate: start_list::Certificate(req.certificate().0.0), name: start_list::ListName::of(&shape) };
+                // Where the program's names rows are, decided before it starts (run_names.rs): a
+                // walk finds its crates now and writes them at the certificate; a hit reads that
+                // record. A hit with none is dropped here, before the start, and asked in full.
+                // The program `request` picked once (run_package.rs `pick`), handed down whole:
+                // its root finds its crate, its package names the child (rule 77).
+                let picked = picked.ok_or(CliError::RunNames(run_names::RunNamesError::NonePicked))?;
+                let Some(found) = run_names::found(&cx, &req, picked.root, &mut store, &mut facts.bodies, heap, frame).map_err(CliError::RunNames)? else {
+                    return Err(CliError::AnswerInFull { again: in_full });
+                };
+                // The body ids (run_ids.rs), also decided before the start: a walk builds them
+                // from the answer, over the last answer's table, and writes them at the
+                // certificate; a hit reads the certificate's table, or, with none, is dropped
+                // here and asked in full. The parent takes them on its first function stepped.
+                let ids_refused = |error: run_ids::RunIdsError<'static>| {
+                    CliError::OwnProcess(own_process::OwnError::Parent(run_parent::ParentError::BodyIds { shown: Box::from(bstd::mem::format_in!(frame, "{error}").as_str()) }))
+                };
+                let made = match found.list() {
+                    Some(list) => {
+                        let previous = match last.map(blaze_drive::answers::read_last).transpose().map_err(|error| CliError::Drive(DriveError::LastFile(error)))? {
+                            Some(l) => run_ids::RunIds::from_record(&cx, &mut store, l.cert, toolchain, &tools, alloc).map_err(ids_refused)?,
+                            None => None,
+                        };
+                        run_ids::for_run(&cx, &req, toolchain, list, &tools, previous.as_ref(), &mut store, alloc).map_err(ids_refused)?
+                    }
+                    None => match run_ids::on_hit(&cx, &req, toolchain, &tools, &mut store, alloc).map_err(ids_refused)? {
+                        run_ids::OnHit::Ids(ids) => ids,
+                        run_ids::OnHit::AnswerInFull => return Err(CliError::AnswerInFull { again: in_full }),
+                    },
+                };
+                let mut made = Some(made);
+                // The front end the lazy parent makes on demand (run_parent.rs `CommandFront`):
+                // each closure is called at most once, and only when a first call needs it. The
+                // names records are made the one way `blaze check`'s are (run_names.rs).
+                let (fetch_env, procs) = (&facts.fetch_env, facts.names.as_ref().and_then(|names| names.procs()));
+                let (bodies, codes) = (&mut facts.bodies, &mut store);
+                let mut names = || {
+                    run_names::names_of(&cx, root, &found, picked.root, &mut *codes, &mut *bodies, fetch_env, procs, frame, heap)
+                        .map_err(|error| run_parent::ParentError::Names { shown: Box::from(bstd::mem::format_in!(frame, "{error}").as_str()) })
+                };
+                let mut ids = || made.take().ok_or_else(|| run_parent::ParentError::BodyIds { shown: Box::from("the body ids were asked a second time (run_parent.rs `CommandFront` asks once)") });
+                let ok = match program::run(&cx, root, launch, &picked, units, native, producers.get::<blaze_ids::producer::CodeBuilder>(), lent, today, &mut names, &mut ids, &mut phases.code_records, heap, frame) {
                     Ok(status) => {
                         *ran = Some(status);
                         status == 0
@@ -1044,14 +1224,11 @@ fn request<'f>(
             Effect::Stop { .. } => {}
             Effect::Print(finding) => prints.push(finding),
             Effect::WriteLast { bytes } => {
-                // The records it names first, in their one pack (puts only gather them).
-                store.seal(&cx)?;
-                phases.request.puts += phases.since(at);
-                // The leaf table rides in the same write: a crash keeps both or neither.
+                // The leaf table rides in the same record, named by this checkout's root: the root
+                // and every record it names are committed by the ONE flip after the answer is
+                // printed (blaze-cas plain/root_commit_tests.rs), so no pointer names an absent record.
                 let leaves = Leaves::bytes_in(&kept(&req, &followed, &facts.rows, frame), frame)?;
-                seal::write(&cx, root, &pointer_at, pointer_fresh, &seal::seal(&bytes, &leaves, frame)?, frame)?;
-                // A second write of this request's finds the file there.
-                pointer_fresh = false;
+                store.set_last(&cx, &last_root, &seal::seal(&bytes, &leaves, frame)?)?;
                 phases.request.write_last += phases.since(at);
             }
             Effect::Done(mut answer) => {
@@ -1082,9 +1259,9 @@ fn request<'f>(
     let rows = kept(&req, &followed, &facts.rows, frame);
     let at = phases.now();
     // `blaze run` with findings: the program's refusals too, from its lowering alone.
-    let program = match command == Command::Run && ran.is_none() && (refused || !prints.is_empty()) {
-        true => Some(program_refusals(&cx, root, &rows, frame)?),
-        false => None,
+    let program = match picked.filter(|_| ran.is_none() && (refused || !prints.is_empty())) {
+        Some(picked) => Some(program_refusals(&cx, root, &picked, &rows, heap, frame)?),
+        None => None,
     };
     // One file's findings at a time, in frames of a task's scratch size: freed a file and a
     // finding, and gone with the drawing.
@@ -1123,9 +1300,6 @@ const LAST: &str = "a pointer in .blaze/v2/at (its last answer)";
 /// effects list is counted here.
 pub(crate) const STEP: &str = "machine step (the effects list)";
 
-/// The crate root `blaze run` lowers (program.rs's): a binary package's.
-const PROGRAM_ROOT: &str = "src/main.rs";
-
 /// The program's files and every refusal of its lowering.
 struct Refused<'f> {
     texts: Vec<(&'f str, &'f str), &'f Frame>,
@@ -1138,9 +1312,11 @@ struct Refused<'f> {
 }
 
 /// The lowering's refusals of the files the answer holds, read at their real paths: what `blaze
-/// run` would refuse to run, drawn beside the findings that kept it from running.
-fn program_refusals<'f>(cx: &Cx, root: &Dir<ReadWrite>, rows: &Rows<'_>, frame: &'f Frame) -> Result<Refused<'f>, CliError> {
-    let texts = program::sources(cx, root, &[rows], frame)?;
+/// run` would refuse to run, drawn beside the findings that kept it from running. The lowering's
+/// tables live on `heap`, the process's, handed from `main`. The files are the program's
+/// (`picked`: its crate root and that root's folder, run_package.rs).
+fn program_refusals<'f>(cx: &Cx, root: &Dir<ReadWrite>, picked: &run_package::Program<'_>, rows: &Rows<'_>, heap: &'static blaze_own::Heap, frame: &'f Frame) -> Result<Refused<'f>, CliError> {
+    let texts = program::sources(cx, root, picked.sources(), &[rows], frame)?;
     let mut files: Vec<SourceFile<'_>, &Frame> = Vec::with_capacity_in(texts.len(), frame);
     for &(path, text) in texts.iter() {
         files.push(SourceFile { path, text });
@@ -1149,7 +1325,7 @@ fn program_refusals<'f>(cx: &Cx, root: &Dir<ReadWrite>, rows: &Rows<'_>, frame: 
     // beside it, the advice about `blaze::` attributes it read and the count nothing checks.
     // With the setting `blaze run` builds with (D101): it decides which lang fns are needed.
     let overflow = program::dev_overflow(cx, root, frame)?;
-    let (mut refusals, blaze) = blaze_ladder::run::findings(&files, PROGRAM_ROOT, overflow);
+    let (mut refusals, blaze) = blaze_ladder::run::findings(&files, picked.root, overflow, heap.alloc());
     let unchecked = blaze.note();
     refusals.extend(blaze.advice);
     Ok(Refused { texts, refusals, unchecked })
@@ -1169,7 +1345,7 @@ fn draw<'f>(
     found: &sweep::Found<'_>,
     prints: &[Print<'_>],
     program: Option<&Refused<'_>>,
-    failed: &[work::Failed<'_>],
+    failed: &work::Failures<'_>,
     names: Option<&crate::names::Names<'_>>,
     notices: &[Notice],
     shown: &mut print::Shown<'f>,
@@ -1196,7 +1372,10 @@ fn draw<'f>(
         Ok(copy.leak())
     };
     for finding in prints.iter() {
-        let (path, place, words) = match finding.rule == names::UNRESOLVED && finding.file.is_none() {
+        let placed = finding.rule == names::UNRESOLVED
+            || finding.rule == names::include_outside::INCLUDE_OUTSIDE_PACKAGE
+            || finding.rule == names::failed_call::FAILED_CALL;
+        let (path, place, words) = match placed && finding.file.is_none() {
             true => match names::place_pieces(&finding.message)? {
                 (Some((path, chain, edition)), words) => {
                     // A crate's findings come sorted by file: the path is kept once a run.
@@ -1229,7 +1408,9 @@ fn draw<'f>(
         }
     }
     let source = |path: Option<&str>| !path.is_some_and(|path| path == "Cargo.toml" || path.ends_with("/Cargo.toml"));
-    order.sort_by(|a, b| (source(a.0), a.0, a.1, a.2).cmp(&(source(b.0), b.0, b.1, b.2)));
+    // In a file, its lint findings after its type and borrow findings (lint.md: advice after).
+    let lint = |entry: &(Option<&str>, u32, bool, usize)| !entry.2 && lints::is_lint(prints[entry.3].rule);
+    order.sort_by(|a, b| (source(a.0), a.0, lint(a), a.1, a.2).cmp(&(source(b.0), b.0, lint(b), b.1, b.2)));
     // A file's findings are neighbours in that order: the file is read once for the run.
     let mut at = 0;
     while at < order.len() {
@@ -1247,39 +1428,9 @@ fn draw<'f>(
         print::file_findings(cx, root, path, run.iter().map(|&(_, _, _, i)| first + i), shown, scratch, out)?;
     }
     // A failed task is the tool's, not the code's: named with its file, and the command fails
-    // (its answer is not written, so the next command runs the task again).
-    // Failures of one kind past the first few are counted, never listed one by one (a lock
-    // whose 227 units could not be fetched is four lines and a count).
-    const SAME_SHOWN: usize = 4;
-    let mut same = 0usize;
-    // A task that failed only because one it needed failed prints nothing of its own: what
-    // was not checked is named below by cause, at crate grain (not_checked.rs, D115 (6)).
-    for (i, failure) in failed.iter().enumerate() {
-        if matches!(failure.failure.why, Why::Waited { .. }) {
-            continue;
-        }
-        let kind = |at: usize| (failed[at].failure.name.kind, failed[at].failure.why);
-        same = if i > 0 && kind(i) == kind(i - 1) { same + 1 } else { 0 };
-        let last_of_run = failed.get(i + 1).is_none_or(|_| kind(i + 1) != kind(i));
-        if same >= SAME_SHOWN {
-            if last_of_run {
-                let words = bstd::mem::format_in!(frame, "and {} more task(s) failed the same way", same + 1 - SAME_SHOWN);
-                print::note(cx, words.as_str(), shown, frame, out)?;
-            }
-            continue;
-        }
-        let mut words = bstd::mem::String::new_in(frame);
-        let written = match failure.path {
-            Some(path) => core::fmt::write(&mut words, format_args!("a task failed in {path}: {}", failure.failure)),
-            None => core::fmt::write(&mut words, format_args!("a task failed: {}", failure.failure)),
-        };
-        written.map_err(|_| CliError::Text { what: "a failed task's words" })?;
-        if let Some(detail) = failure.detail {
-            words.push_str(": ");
-            words.push_str(detail);
-        }
-        print::note(cx, words.as_str(), shown, frame, out)?;
-    }
+    // (its answer is not written, so the next command runs the task again). What was not
+    // checked because of it is named below by cause, at crate grain (not_checked.rs, D115 (6)).
+    work::failed_notes(failed, scratch.one(), &mut |line| print::note(cx, line, shown, frame, out))?;
     // Over the drive's whole list: the machine's own `Waited` failures (a part whose home
     // failed) are in it and not in `failed`.
     not_checked::lines(req.failures(), failed, names, frame, &mut |line| print::note(cx, line, shown, frame, out))?;
@@ -1393,7 +1544,7 @@ impl core::fmt::Display for Notice {
 mod tests {
     use std::fmt::Write as _;
 
-    use blaze_drive::TaskFailure;
+    use blaze_drive::{TaskFailure, Why};
     use bstd::fs::{Content, Durable};
     use bstd::io::{Io, Limits, SimWorld};
     use bstd::mem::TASK_FRAME;
@@ -1466,13 +1617,20 @@ mod tests {
 
     mod draw_tests;
     mod extra_roots_tests;
+    mod failed_call_tests;
     mod fix_tests;
     mod members_tests;
     mod names_records_tests;
+    mod native_image_tests;
+    mod include_data_tests;
+    mod include_outside_tests;
+    mod lints_tests;
     mod owners_tests;
     mod pooled_scope_tests;
     mod refused_targets_tests;
+    mod run_scope_tests;
     mod signature_grain_tests;
+    mod stale_facts_tests;
 
     fn write(io: &Io, path: &str, text: &str) {
         let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
@@ -1495,13 +1653,19 @@ mod tests {
         io
     }
 
+    /// The fixture shelf's cfg row for this machine's triple, as the real cut writes one
+    /// (scripts/src/bin/toolchain_cut.rs `target_desc`: rustc's printed cfgs plus the target's
+    /// `panic="<strategy>"`, sorted): blaze-world `panic::Cuts::read` refuses a row without the
+    /// `panic` atom. The one row every blaze-cli test shelf is cut with.
+    pub(crate) const SHELF_CFG: &[(&str, Option<&str>)] = &[("panic", Some("unwind")), ("target_os", Some("macos")), ("unix", None)];
+
     /// blaze-world's fixture toolchain, cut for this machine's triple, written on the shelf of
     /// the home `/h` (as `main` would be given `HOME=/h`, started in `/`): its id.
     fn shelf(io: &Io) -> blaze_toolchain::ToolchainId {
         let (id, files) = blaze_world::fixture::shelf(
             graph::TRIPLE,
             blaze_world::fixture::STD,
-            &[("target_os", Some("macos")), ("unix", None)],
+            SHELF_CFG,
             blaze_own::testing::heap().alloc(),
         );
         for (name, bytes) in files {
@@ -1560,7 +1724,7 @@ mod tests {
         let mut phases = Phases::new(io.need_clock().expect("a clock"));
         let shown = print::Shown::new(blaze_report::frame::Caps::LINES, view, "/ws", frame);
         let mut ran = None;
-        let launch = program::Launch { io, grants: &[], args: &[] };
+        let launch = program::Launch { io, select: run_package::Select::NONE, grants: &[], args: &[] };
         let said = words(command.0, &out, &err);
         let producers = match sizes.plant {
             work::Plant::Producer(row, older) => {
@@ -1569,9 +1733,10 @@ mod tests {
             _ => blaze_ids::producer::Producers::for_tests(b"test"),
         };
         let toolchain = shelf(io);
+        let opened = store::open_for_command(&cx, io, Some("/h"), &root, "ws", phases.clock(), &err)?;
         let mut run = |mut shown, ran: &mut Option<u8>, phases: &mut Phases| {
             let workers = WORKERS.with(core::cell::Cell::get);
-            let finished = request(&cx, &root, ("ws", None, None, Some("/h"), None, Some("/"), toolchain, None, Err(fetch::ExeDirWhy::NotRead)), None, command, workers, &producers, sizes, &launch, frame, said, &err, ran, &mut shown, phases);
+            let finished = request(&cx, &root, ("ws", None, None, Some("/h"), None, Some("/"), toolchain, None, Err(fetch::ExeDirWhy::NotRead)), None, (&opened.home, &opened.lent, opened.open_ns), command, workers, &producers, sizes, &launch, frame, said, &err, ran, &mut shown, phases, blaze_own::testing::heap(), false);
             finished.map(|finished| (finished, shown))
         };
         let (finished, shown) = match fix {
@@ -1583,8 +1748,9 @@ mod tests {
         };
         // The drive's count holds the parts it failed `Waited` itself (no task ran for them).
         assert!(finished.answer.failed as usize >= finished.failed.len());
-        // The closing line and the status, as `command` makes them.
+        // The closing line and the status, as `command` makes them; then the store's one commit.
         let status = close(&cx, command.0, &finished, &shown, ran, 0, frame, said).ok().map(|status| status.0);
+        store::after_answer_printed(&cx, opened.lent, false, phases.clock(), &err)?;
         Ok(Checked {
             status,
             // The causes: a task failed only because one it needed failed is not one.
@@ -1598,7 +1764,10 @@ mod tests {
             certified: finished.answer.profile.certified,
             checked: finished.checked,
             high: finished.high,
-            bodies: phases.times(work::BODIES),
+            // The `BodyCheck` tasks made, from the profile: work.rs's `BODIES` row also times
+            // each `Signature` job (`row_of`) and each entry again with handed inputs (a body
+            // first answers its `Need`s, D114's amendment), so its count is no body count.
+            bodies: u64::from(made(&finished.answer.profile.to_string(), "BodyCheck")),
             body_jobs: phases.times(work::BODY_JOBS),
             resolved: finished.resolved,
             profile: finished.answer.profile.to_string(),
@@ -1874,10 +2043,10 @@ mod tests {
     /// Piece 7 (body_types.rs): a body's types are checked in its `BodyCheck` task over the
     /// crates' records. `fn f() -> u32 { "x" }` is one `types` error (the Reference, "Function
     /// body": the block's type must be the declared return type), `g` beside it clean; the
-    /// repeat makes no `BodyCheck`; a signature edit of `g` in the same file re-checks both
-    /// bodies (their key holds the file around its bodies). Without the arm (work.rs
-    /// `run_batches` calling `prepare`) no type error is found and the status is 3.
-    /// Prints `body types: cold 1 error, repeat made 0, signature edit made 2`.
+    /// repeat makes no `BodyCheck`; a signature edit of `g` in the same file re-checks `g`'s
+    /// body alone (its key is its item's text; `f` reads no head of `g`, D114). Without the arm
+    /// (work.rs `run_batches` calling `prepare`) no type error is found and the status is 3.
+    /// Prints `body types: cold 1 error, repeat made 0, signature edit made 1`.
     #[test]
     fn a_body_type_error_is_found_over_records_and_kept() {
         let io = Io::simulated(SimWorld::new(8, Limits::USUAL));
@@ -1891,7 +2060,7 @@ mod tests {
         assert_eq!((repeat.errors, made(&repeat.profile, "BodyCheck")), (1, 0), "{}", repeat.profile);
         write(&io, "src/lib.rs", "pub fn f() -> u32 { \"x\" }\npub fn g() -> u64 { 1 }\n");
         let edited = check(&io, work::Sizes::USUAL);
-        assert_eq!(made(&edited.profile, "BodyCheck"), 2, "{}", edited.profile);
+        assert_eq!(made(&edited.profile, "BodyCheck"), 1, "{}", edited.profile);
         std::println!("body types: cold {} error, repeat made {}, signature edit made {}", cold.errors, made(&repeat.profile, "BodyCheck"), made(&edited.profile, "BodyCheck"));
     }
 
@@ -1994,7 +2163,9 @@ mod tests {
         let words = left_out_note(Command::Run, frame).expect("words").expect("run leaves stages out today");
         assert_eq!(
             words.as_str(),
-            "this build of blaze does not expand macros yet: `run` did read the manifests, fetch the dependencies' sources, run build scripts, parse and check the bodies' syntax and types, and its program runner did resolve names, check types and generate code in the subset of Rust its front end reads so far"
+            // Derived from the kinds the worker builds (`work::left_out`): `Signature` ("check
+            // types") and the native link are built now, so `run` names them as done.
+            "this build of blaze does not expand macros yet: `run` did read the manifests, fetch the dependencies' sources, run build scripts, parse, check types, check the bodies' syntax and types and link native code, and its program runner did resolve names, check types and generate code in the subset of Rust its front end reads so far"
         );
         for command in [Command::Check, Command::Run, Command::Test] {
             let left: std::vec::Vec<&str> = work::left_out(command).collect();
@@ -2013,7 +2184,7 @@ mod tests {
     /// run's certificate is its own, so it walks forward from the check's answer, and answers
     /// with the error, never stepping the machine past its answer (hello-world, 2026-11-16:
     /// "a step after the request answered"). The package is a library, so the error is
-    /// [`CliError::NoBinary`] naming it.
+    /// [`CliError::RunPackage`] naming it.
     #[test]
     fn run_after_check_answers_with_the_error() {
         let io = workspace(10);
@@ -2026,9 +2197,8 @@ mod tests {
         // `NoMain` (2026-11-16), and never the old front end's lowering refusal, which was an
         // accident of what it could not read (the test passed on it before the switch).
         match ran {
-            Err(CliError::NoBinary(no)) => {
-                assert_eq!(&*no.package, "wide");
-                assert!(no.bins.is_empty(), "a library has no binary target: {:?}", no.bins);
+            Err(CliError::RunPackage(no @ run_package::PickError::NoBinary { .. })) => {
+                assert_eq!(no, run_package::PickError::NoBinary { package: "wide".into() });
                 let shown = no.to_string();
                 assert!(shown.contains("`wide` has no binary target"), "{shown}");
             }
@@ -2036,21 +2206,9 @@ mod tests {
         }
     }
 
-    /// A clean `blaze run` says nothing of its own on either stream: no note, no closing line
-    /// (the 03:10 build printed the left-out note after rung 3's "hello", 2026-11-16). The
-    /// program writes with the C library's `write`, past the simulation: tests/run_output.rs
-    /// checks its bytes on the real streams.
-    #[test]
-    fn a_clean_run_says_nothing_of_its_own() {
-        let io = Io::simulated(SimWorld::new(7, Limits::USUAL));
-        write(&io, "Cargo.toml", include_str!("../tests/ladder/3-hello/Cargo.toml"));
-        write(&io, "src/main.rs", include_str!("../tests/ladder/3-hello/src/main.rs"));
-        let ran = ask(&io, (Command::Run, "run"), SMALL);
-        assert!(ran.as_ref().is_ok_and(|ran| ran.failed.is_empty()), "{:?}", ran.err());
-        let (out, err) = io.script(|host| (host.out.clone(), host.err.clone())).expect("a simulated host");
-        assert_eq!(std::str::from_utf8(&out), Ok(""), "blaze writes nothing on the program's standard output");
-        assert_eq!(std::str::from_utf8(&err), Ok(""), "a clean run says nothing");
-    }
+    // A clean `blaze run` saying nothing of its own on either stream is tests/run_output.rs
+    // `a_clean_run_prints_only_its_program`: the program runs by the launcher in its own
+    // process (own_process.rs), which a simulated host under `cargo test` has not beside it.
 
     /// The store keeps one pack a command and merges them past its cap: after more edits than
     /// the cap, each a pack, every record still answers (a repeat stands with no run, and an
@@ -2154,28 +2312,63 @@ mod tests {
         assert_eq!((body.runs, made(&body.profile, "BodyCheck")), (2, 1), "a body edit runs its file's outline and that one body:\n{}", body.profile);
         write(&io, "src/m3.rs", &functions(100).replace("fn f00003() {}", "fn f00003(_x: u8) { let _x = 1; }"));
         let signature = check(&io, SMALL);
-        // Every body of the edited file is checked again (piece 7): a body's key holds its
-        // file's text around the bodies (body_types.rs `around_bodies`), the cover for a
-        // sibling's signature it may read, until a body's reads are kept at signature grain.
+        // At signature grain (D114): the outline, the edited head's `Signature` and its own
+        // body (its text is its key). No other body reads `f00003`'s head, so none runs; until
+        // D114 every body of the file ran (101, 0, 0, 100), their keys holding the file's text
+        // around the bodies.
         assert_eq!(
-            (signature.runs, made(&signature.profile, "Surface"), made(&signature.profile, "CrateScope"), made(&signature.profile, "BodyCheck")),
-            (101, 0, 0, 100),
-            "a parameter edit runs its file's outline and its file's bodies:\n{}",
+            (
+                signature.runs,
+                made(&signature.profile, "Surface"),
+                made(&signature.profile, "CrateScope"),
+                made(&signature.profile, "Signature"),
+                made(&signature.profile, "BodyCheck")
+            ),
+            (3, 0, 0, 1, 1),
+            "a parameter edit runs its file's outline, that head and that one body:\n{}",
             signature.profile
         );
         let added = functions(100).replace("fn f00003() {}", "fn f00003(_x: u8) { let _x = 1; }") + "pub fn added() {}\n";
         write(&io, "src/m3.rs", &added);
         let item = check(&io, SMALL);
-        // Entries, not tasks: the outline, the surface, each of the two crates' `CrateScope`
-        // once (entered after the moved surface settled; 107 until 2026-11-16 17:40, when each
-        // first answered a `Need` of the surface: the order of entries is the schedule's), and
-        // every body of the file (its text around the bodies moved, as above).
+        // Made: the outline, the surface, the two crates' `CrateScope`, every head of the file
+        // (each `Signature`'s source holds its file's surface) and every body of the file (each
+        // reads its file's `Surface` whole, COARSE(D114 e)). Entries are those makes and the
+        // `Need`s answered on the way: since the Owners body side (2026-11-16 21:23) a body
+        // first answers one `Need` of its owners' crates when they moved (body_types.rs
+        // `prepare`), so the entries were 109 against 105 makes with "BodyCheck .. needs 4" in
+        // the profile, not a body made twice. How many `Need`s the schedule answers is its
+        // order's, so the entries are checked against the makes and needs the profile lists.
+        let makes = (
+            made(&item.profile, "FileItems"),
+            made(&item.profile, "Surface"),
+            made(&item.profile, "CrateScope"),
+            made(&item.profile, "Signature"),
+            made(&item.profile, "BodyCheck"),
+        );
+        assert_eq!(makes, (1, 1, 2, 101, 101), "a new item makes its file's outline, its surface, its two crates' names, its file's heads and its file's bodies:\n{}", item.profile);
+        let needs = needs(&item.profile);
         assert_eq!(
-            (item.runs, made(&item.profile, "Surface"), made(&item.profile, "CrateScope"), made(&item.profile, "BodyCheck")),
-            (105, 1, 2, 101),
-            "a new item runs its file's outline, its surface, its two crates' names (two entries each) and its file's bodies:\n{}",
+            item.runs,
+            makes.0 + makes.1 + makes.2 + makes.3 + makes.4 + needs,
+            "every entry is a make or a `Need` answered (no body made twice):\n{}",
             item.profile
         );
+        std::println!("a new item: made {makes:?}, needs {needs}, entries {}", item.runs);
+    }
+
+    /// The `needs` counts of every kind's profile row, summed: the entries that answered `Need`.
+    fn needs(profile: &str) -> u32 {
+        let mut sum = 0;
+        for line in profile.lines() {
+            let words: std::vec::Vec<&str> = line.split_whitespace().collect();
+            if !words.contains(&"entries") {
+                continue;
+            }
+            let at = words.iter().position(|word| *word == "needs").and_then(|at| words.get(at + 1)).and_then(|n| n.parse::<u32>().ok());
+            sum += at.unwrap_or(0);
+        }
+        sum
     }
 
     /// The project's own BINARY reruns its names after a signature edit (the stale answer of
@@ -2251,7 +2444,7 @@ mod tests {
 
     /// A stage that did not run is named, never passed over: a package that depends on a
     /// registry crate and has no `Cargo.lock` has no dependency graph, so no crate's names are
-    /// resolved; the closing line says "NOT checked: names, .." and the status is 3. (Before:
+    /// resolved; the closing line says "NOT checked: names, .." and the status is 4 (an item left unchecked). (Before:
     /// "NOT checked: types, borrows" alone, as if the names had been checked.) Control: the
     /// same package without the dependency names no `names` there.
     #[test]
@@ -2263,7 +2456,9 @@ mod tests {
         let out = stdout(&io);
         assert!(hollow.failed.is_empty(), "{:?}", hollow.failed);
         assert!(out.contains("NOT checked: names, types, borrows"), "{out}\n{}", hollow.profile);
-        assert_eq!(hollow.status, Some(3), "{out}");
+        // `f` is an item left unchecked (its crate has no unit graph), so the status is
+        // `UNCHECKED_ITEMS` (4), which `close` puts before `INCOMPLETE` (3).
+        assert_eq!(hollow.status, Some(4), "{out}");
         let seen = out.len();
         write(&io, "Cargo.toml", "[package]\nname = \"lockless\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
         let whole = check(&io, work::Sizes::USUAL);

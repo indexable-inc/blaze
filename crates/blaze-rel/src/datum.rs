@@ -10,7 +10,7 @@ use core::alloc::Allocator;
 use core::cmp::Ordering;
 use core::hash::{BuildHasher, Hasher};
 
-use blaze_hash::{FixedState, HashMap};
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_own::Vec;
 
 /// Interned text: an id into a [`Store`].
@@ -149,7 +149,7 @@ pub struct Store<A: Allocator + Copy> {
     /// Each symbol's bytes: start and length in `bytes`.
     spans: Vec<(u32, u32), A>,
     /// The first symbol of each hash; the rest of a chain through `next`.
-    index: HashMap<u64, u32, A>,
+    index: Map<u64, u32, FixedState, A>,
     next: Vec<u32, A>,
     lists: Vec<(u32, u32), A>,
     items: Vec<Datum, A>,
@@ -171,7 +171,7 @@ impl<A: Allocator + Copy> Store<A> {
         Store {
             bytes: Vec::new_in(alloc),
             spans: Vec::new_in(alloc),
-            index: HashMap::new_in(alloc),
+            index: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             next: Vec::new_in(alloc),
             lists: Vec::new_in(alloc),
             items: Vec::new_in(alloc),

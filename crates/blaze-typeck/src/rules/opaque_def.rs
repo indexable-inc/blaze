@@ -44,14 +44,14 @@ use crate::world::{PClause, World};
 
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// The owner's output `t` of `types` with each opaque it defines as its hidden-type
-    /// variable.
-    pub(crate) fn lower_defining_output(&mut self, types: PTys<'_>, t: PTy) -> Result<Ty, Stop> {
+    /// variable; a projection in it that fails is a finding at `cause`.
+    pub(crate) fn lower_defining_output(&mut self, types: PTys<'_>, t: PTy, cause: Cause) -> Result<Ty, Stop> {
         #[cfg(test)]
         if self.plant == crate::machine::Plant::OpaqueNotOpened {
-            return self.lower_sig_ty(types, t);
+            return self.lower_sig_ty(types, t, cause);
         }
         self.opening = true;
-        let got = self.lower_sig_ty(types, t);
+        let got = self.lower_sig_ty(types, t, cause);
         self.opening = false;
         got
     }

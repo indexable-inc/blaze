@@ -13,3 +13,6 @@ __pycache__/
 
 # a checkout's own blaze home: build output, never source
 .blaze/
+
+# The Hypervisor.framework sandbox experiment is kept out of the repository (the owner, 2026-11-16).
+/crates/blaze-hvbox/

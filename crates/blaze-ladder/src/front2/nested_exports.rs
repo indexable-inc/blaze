@@ -177,11 +177,25 @@ pub struct NestedExport<'a> {
     pub within: u32,
 }
 
+/// One fn, static or const declared inside the top item, exported or not: what
+/// [`walk_every`] lists (the lazy program's search for a body-local key it was asked about cold,
+/// front2/program/lazy/locate.rs). Its key is derived by the one rule ([`local_key`]).
+#[derive(Clone, Copy, Debug)]
+pub struct NestedLocal<'a> {
+    pub name: &'a str,
+    pub kind: LocalKind,
+    pub key: Result<LibKey, Unkeyed>,
+    /// The encloser it is declared in (an index of [`Walk::bodies`]).
+    pub within: u32,
+}
+
 /// The walk's answer: every text read, and every export found, in walk order (each body's
-/// exports in its row order; a body after the body it is declared in).
+/// exports in its row order; a body after the body it is declared in). `locals`: empty but in
+/// [`walk_every`].
 pub struct Walk<'a> {
     pub bodies: AVec<'a, Encloser<'a>>,
     pub exports: AVec<'a, NestedExport<'a>>,
+    pub locals: AVec<'a, NestedLocal<'a>>,
 }
 
 /// Why the walk stopped, naming the item by its whole path (`outer::inner::item`).
@@ -247,14 +261,33 @@ enum Bad {
 struct Walker<'a, 'c> {
     reading: Reading<'a, 'c>,
     library: Option<(CrateItemKey, LibKey)>,
+    /// [`walk_every`]: every fn, static and const of every block is listed and every body
+    /// walked into, not only the texts that can hold an export.
+    every: bool,
+    /// The top body's (item, checker key) its locals are derived under ([`body_key`]), when
+    /// it is not the top's own library key and its checker key: a member's body is derived
+    /// under its container and the member's key (locals.rs `Enclosing`).
+    top_body: Option<(LibKey, ItemKey)>,
     out: Walk<'a>,
 }
 
 /// Every export declared inside `top`, by a work list over the texts in it (module comment).
 pub fn walk<'a, 'c>(top: Top<'a>, reading: Reading<'a, 'c>) -> Result<Walk<'a>, NestedRefusal<'a>> {
+    walk_in(top, reading, false, None)
+}
+
+/// Every fn, static and const declared inside `top` ([`Walk::locals`], each keyed by the rule
+/// `Locals::keep` keys it by, or [`Unkeyed`] saying why the text cannot), and its exports, by
+/// the same work list into every body. `top_body`: for a member's body, its container's library
+/// key and the member's checker key (the body key's inputs); `None` for a free item's.
+pub fn walk_every<'a, 'c>(top: Top<'a>, top_body: Option<(LibKey, ItemKey)>, reading: Reading<'a, 'c>) -> Result<Walk<'a>, NestedRefusal<'a>> {
+    walk_in(top, reading, true, top_body)
+}
+
+fn walk_in<'a, 'c>(top: Top<'a>, reading: Reading<'a, 'c>, every: bool, top_body: Option<(LibKey, ItemKey)>) -> Result<Walk<'a>, NestedRefusal<'a>> {
     let alloc = reading.alloc;
-    let mut w = Walker { reading, library: top.library, out: Walk { bodies: AVec::new_in(alloc), exports: AVec::new_in(alloc) } };
-    if !mentions(top.text) {
+    let mut w = Walker { reading, library: top.library, every, top_body, out: Walk { bodies: AVec::new_in(alloc), exports: AVec::new_in(alloc), locals: AVec::new_in(alloc) } };
+    if !every && !mentions(top.text) {
         return Ok(w.out);
     }
     let key = match top.library {
@@ -311,8 +344,14 @@ impl<'a> Walk<'a> {
     /// The keys of the bodies around an export, outermost first (the top's library key first):
     /// each must be lowered, in this order, before the export's own head is kept.
     pub fn chain(&self, export: &NestedExport<'a>, alloc: Alloc<'a>) -> Result<Result<AVec<'a, LibKey>, Unkeyed>, NestedRefusal<'a>> {
+        self.chain_to(export.within, alloc)
+    }
+
+    /// The keys of the bodies from the top to encloser `within`, outermost first: what is
+    /// lowered, in this order, before an item declared in `within` is kept.
+    pub fn chain_to(&self, within: u32, alloc: Alloc<'a>) -> Result<Result<AVec<'a, LibKey>, Unkeyed>, NestedRefusal<'a>> {
         let mut keys: AVec<'a, LibKey> = AVec::new_in(alloc);
-        for &i in self.line(export.within, alloc)?.iter() {
+        for &i in self.line(within, alloc)?.iter() {
             match self.bodies[i as usize].key {
                 Ok(k) => keys.try_push(k).map_err(|_| NestedRefusal::Alloc)?,
                 Err(u) => return Ok(Err(u)),
@@ -404,10 +443,12 @@ impl<'a, 'c> Walker<'a, 'c> {
             _ => None,
         };
         // The key every local item of this body is derived under.
-        let parent = match (self.library, b.key) {
-            (Some((crate_key, _)), Ok(item)) => Ok((crate_key, body_key(crate_key, item, checker_of(item)))),
-            (None, _) => Err(Unkeyed::NoLibrary),
-            (_, Err(u)) => Err(u),
+        let top_body = if at == 0 { self.top_body } else { None };
+        let parent = match (self.library, b.key, top_body) {
+            (Some((crate_key, _)), Ok(_), Some((item, owner))) => Ok((crate_key, body_key(crate_key, item, owner))),
+            (Some((crate_key, _)), Ok(item), None) => Ok((crate_key, body_key(crate_key, item, checker_of(item)))),
+            (None, ..) => Err(Unkeyed::NoLibrary),
+            (_, Err(u), _) => Err(u),
         };
         // Row order: by block (the order the blocks' `{` is written: the lowering's scopes),
         // then by text.
@@ -459,7 +500,10 @@ impl<'a, 'c> Walker<'a, 'c> {
                     if let (Some(symbol), Some(form)) = (symbol, form) {
                         self.out.exports.try_push(NestedExport { symbol, form, name, text: item_text, key, within: at }).map_err(|_| NestedRefusal::Alloc)?;
                     }
-                    if entry.body.is_some() && mentions(item_text) {
+                    if self.every {
+                        self.out.locals.try_push(NestedLocal { name, kind, key, within: at }).map_err(|_| NestedRefusal::Alloc)?;
+                    }
+                    if entry.body.is_some() && (self.every || mentions(item_text)) {
                         self.out.bodies.try_push(Encloser { name, parent: Some(at), key, text: item_text, form: Form::Body }).map_err(|_| NestedRefusal::Alloc)?;
                     }
                 }
@@ -481,6 +525,8 @@ impl<'a, 'c> Walker<'a, 'c> {
                         rows.try_push((kind, d.name)).map_err(|_| NestedRefusal::Alloc)?;
                     }
                 }
+                // In `walk_every` too, only for exports: a member of a container written in a
+                // block is keyed by its container, not derived here ([`Unkeyed::InContainer`]).
                 NestedKind::Mod | NestedKind::Impl | NestedKind::Trait if !in_written && mentions(item_text) => {
                     let name = match item.kind {
                         NestedKind::Impl => "impl",

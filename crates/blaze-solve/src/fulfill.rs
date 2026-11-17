@@ -8,7 +8,7 @@
 //! and reads the arena's binding log from a cursor, so a pass costs what changed; [`Rescan`]
 //! evaluates every pending obligation on every pass, the reference's loop.
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_own::{Alloc, Vec};
 
 use crate::assembly::Goal;
@@ -63,7 +63,7 @@ pub struct Fulfill<'a, S: Strategy> {
     ready: Vec<u32, Alloc<'a>>,
     queued: Vec<bool, Alloc<'a>>,
     /// Variable index to the first wake entry; entries chain by `wait_next`.
-    wait_head: HashMap<u32, u32, Alloc<'a>>,
+    wait_head: Map<u32, u32, FixedState, Alloc<'a>>,
     wait_ob: Vec<(u32, u32), Alloc<'a>>,
     wait_next: Vec<u32, Alloc<'a>>,
     cursor: u32,
@@ -83,7 +83,7 @@ impl<'a, S: Strategy> Fulfill<'a, S> {
             stamp: Vec::new_in(alloc),
             ready: Vec::new_in(alloc),
             queued: Vec::new_in(alloc),
-            wait_head: HashMap::new_in(alloc),
+            wait_head: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             wait_ob: Vec::new_in(alloc),
             wait_next: Vec::new_in(alloc),
             cursor: 0,

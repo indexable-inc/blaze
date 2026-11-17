@@ -685,9 +685,17 @@ pub struct DecideCheck<'a, N> {
     /// log's `seen`) and index lookups (`explicit`, `vis_paths`).
     pub(crate) text_inserts: u64,
     pub(crate) text_lookups: u64,
+    /// D116 point 7: the records at module grain against the written scopes (cells/agree.rs),
+    /// checked before `check` re-decides the core; `None` where the solve did not run it.
+    pub(crate) links: Option<Result<super::Agreed, super::Disagreement<'a, N>>>,
 }
 
 impl<'a, N: crate::Name> DecideCheck<'a, N> {
+    /// The equality check of names at module grain, when the solve ran it.
+    pub fn links(&self) -> Option<&Result<super::Agreed, super::Disagreement<'a, N>>> {
+        self.links.as_ref()
+    }
+
     fn note(&mut self, core: &Cells<'_, N>, c: CellId, whole: Value, got: Decided) {
         let decided = match got {
             Decided::Value(v) if v == whole => return,
@@ -785,6 +793,7 @@ pub(crate) fn check<'a, 'o, N: crate::Name>(core: &mut Cells<'a, N>, now: &dyn F
         text_key_ns: 0,
         text_inserts: 0,
         text_lookups: 0,
+        links: None,
     };
     let mut rows = 0u64;
     for backward in [false, true] {

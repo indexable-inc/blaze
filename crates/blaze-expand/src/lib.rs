@@ -85,6 +85,7 @@ mod error;
 mod expand;
 mod expansion;
 mod failed;
+mod global_allocator;
 mod item;
 pub mod kept;
 pub mod kept_set;
@@ -98,14 +99,15 @@ mod origin_column_tests;
 mod record;
 mod rules;
 pub mod seen;
+mod token_record;
 mod tokens;
 
 pub use crate::attr_value::{AttrLiteralError, MOST_ATTR_VALUE_DEPTH, attr_literal};
 pub use crate::rules::{CopyPlant, rules_copy_plant, rules_oracle, rules_oracle_counts};
 pub use crate::{
     body::{
-        BodyWord, BodyWords, Fragment, ParserWords, body_words, local_hygiene, parser_words,
-        write_token, write_tokens,
+        BodyWord, BodyWords, Fragment, ParserWords, body_words, glued_in_text, local_hygiene,
+        parser_words, write_token, write_tokens,
     },
     call::{AlsoCopy, Call, CallKind, CallShape, CallSite, Constness, DeriveFacts, Eager, Inside},
     cfg::{CfgAttrError, CfgPredicateError, cfg_attr_metas, cfg_predicate, cfg_predicate_at},
@@ -133,8 +135,10 @@ pub use crate::{
     limit::{Depth, LimitReached, RecursionLimit},
     nested::find_calls,
     record::{
-        EXPANSION_SCHEMA, RecordBytes, RecordColumn, RecordError, STREAM_SCHEMA, stream_record_id,
+        EXPANSION_SCHEMA, RecordBytes, RecordColumn, RecordError, STREAM_SCHEMA, expansion_tokens,
+        stream_record_id,
     },
+    token_record::{OriginMaps, SourceIndexes, TokenRecordError, record_indexes, token_record},
     tokens::{
         Ctx, CtxNode, DefSite, Delim, Edition, LitKind, Mark, MarkOf, Raw, Sink, Spacing, Text,
         Token, TokenHygiene, TokenKind, TokenStream, Transparency, lex, lex_inside,

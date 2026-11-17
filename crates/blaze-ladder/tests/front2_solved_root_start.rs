@@ -90,7 +90,7 @@ fn a_blaze_root_with_no_hosted_entry_is_refused_on_the_solved_front() {
     assert!(start.unexported().is_err(), "a hosted root that exports nothing has no other start");
     let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame")));
     let sources = [SourceFile { path: "src/main.rs", text: ROOT }];
-    match Front2Program::new(names, frame, &sources) {
+    match Front2Program::new(names, frame, &sources, blaze_own::Alloc::global()) {
         Err(e @ Front2Refusal::NoHostedStart) => {
             let said = format!("{e}");
             println!("SOLVED ROOT START: {said}");
@@ -113,7 +113,7 @@ fn a_rust_root_without_std_still_starts_at_main() {
     assert_eq!(start.unexported(), Ok(Unhosted::LangStart));
     let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame")));
     let sources = [SourceFile { path: "src/main.rs", text: ROOT }];
-    let program = Front2Program::new(names, frame, &sources).unwrap_or_else(|e| panic!("a std-less Rust program is refused: {e}"));
+    let program = Front2Program::new(names, frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("a std-less Rust program is refused: {e}"));
     assert!(matches!(program.start(), Some(Entry2::Direct(_))), "a program that links no std starts at its `fn main`: {:?}", program.start());
 }
 
@@ -127,10 +127,10 @@ fn a_rust_root_with_std_starts_through_lang_start() {
     let tc = Toolchain::open(&mut DirShelf::new(place.clone())).unwrap_or_else(|e| panic!("the toolchain at {place}: {e}"));
     let files = [("/hello/src/main.rs".to_string(), text.to_string())];
     let edition = edition::PackageEdition::of_manifest("2024").expect("a known edition");
-    let user = UserCrate { name: "hello", dir: "/hello/", root: "/hello/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "hello", dir: "/hello/", root: "/hello/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names: Names<'_> = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names: Names<'_> = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let start = RootStart::of_names(&names).expect("the names hold crate 0");
     assert_eq!(start, RootStart::LangStart, "an edition-2024 root with std");
     assert_eq!(start.unexported(), Ok(Unhosted::LangStart));

@@ -62,13 +62,13 @@ fn read_documents(text: &str, arch: Arch, platform: u32) -> Result<Shared, Strin
     let (tape, docs, targets) = parse_all(text, &raw, raw.len() > 1 && text.len() >= PARALLEL)?;
 
     let view = tape.view(text);
-    let mut by_name = HashMap::new_in(Global);
+    let mut by_name = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     for (at, doc) in docs.iter().enumerate() {
         by_name.entry(view.str(doc.install_name)).or_insert(at);
     }
     let stream = Stream { view, docs: &docs, targets: &targets, by_name };
     let mut plan = Plan::default();
-    let mut seen = HashSet::new_in(Global);
+    let mut seen = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
     seen.insert(view.str(docs[0].install_name));
     stream.fold(0, arch, platform, &mut seen, &mut plan)?;
     let Exports { symbols, names, .. } = decode(view, &plan)?;
@@ -197,7 +197,7 @@ struct Stream<'s, 'd> {
     docs: &'d [Doc],
     targets: &'d [Target],
     /// The first document of each install name.
-    by_name: HashMap<&'s str, usize, Global>,
+    by_name: Map<&'s str, usize, FixedState, Global>,
 }
 
 /// The lists to decode, in the order their names are added, how many names they give at
@@ -243,7 +243,7 @@ impl<'s> Stream<'s, '_> {
         at: usize,
         arch: Arch,
         platform: u32,
-        seen: &mut HashSet<&'s str, Global>,
+        seen: &mut Set<&'s str, FixedState, Global>,
         plan: &mut Plan<'s>,
     ) -> Result<(), String> {
         let doc = &self.docs[at];
@@ -2699,13 +2699,13 @@ e:
                 continue;
             }
             let view = tape.view(&text);
-            let mut by_name = HashMap::new_in(Global);
+            let mut by_name = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
             for (at, doc) in docs.iter().enumerate() {
                 by_name.entry(view.str(doc.install_name)).or_insert(at);
             }
             let stream = Stream { view, docs: &docs, targets: &targets, by_name };
             let mut plan = Plan::default();
-            let mut seen = HashSet::new_in(Global);
+            let mut seen = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
             seen.insert(view.str(docs[0].install_name));
             if stream.fold(0, Arch::Aarch64, 1, &mut seen, &mut plan).is_err() {
                 continue;
@@ -2790,7 +2790,7 @@ e:
         for arch in [Arch::Aarch64, Arch::X86_64] {
             let shared = read(&path, &text, arch, 1).unwrap();
             assert_eq!(shared.name, "/usr/lib/libSystem.B.dylib");
-            let names: HashSet<&str, Global> = names(&shared).into_iter().collect();
+            let names: Set<&str, FixedState, Global> = names(&shared).into_iter().collect();
             for name in ["malloc", "printf", "pthread_create", "_tlv_bootstrap", binder.as_str()] {
                 assert!(names.contains(name), "{arch:?}: no `{name:?}` in {path}");
             }

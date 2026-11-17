@@ -4,18 +4,13 @@
 //!
 //!     cargo run -p blaze-registry --example query -- <Cargo.lock> <CARGO_HOME> [--one-at-a-time]
 
-use std::{
-    future::Future,
-    path::PathBuf,
-    pin::Pin,
-    sync::Arc,
-    task::Poll,
-    time::Instant,
-};
+#![feature(allocator_api)]
+
+use std::{alloc::Global, path::PathBuf, sync::Arc, time::Instant};
 
 use anyhow::{Context as _, bail};
 use blaze_registry::{Context, IndexRegistry, SourceConfig, Sources, http::HyperHttp};
-use blaze_resolve::{Dependency, MemRegistry, QueryKind, Registry, SourceId};
+use blaze_resolve::{Dependency, MemRegistry, QueryKind, SourceId};
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -50,48 +45,36 @@ fn main() -> anyhow::Result<()> {
 
     let registry = &registry;
     let started = Instant::now();
-    let mut offered = vec![0; deps.len()];
-    let queries = deps.iter().zip(&mut offered).map(|(dep, count)| {
-        Box::pin(async move { registry.query(dep, QueryKind::Exact, &mut |_| *count += 1).await })
-    });
-    if one_at_a_time {
-        for query in queries {
-            block_on(query)??;
+    // Each ask answered as a resolve's step loop answers it: read now, blocking its thread,
+    // `AT_ONCE` threads at a time unless `--one-at-a-time`.
+    let at_once = if one_at_a_time { 1 } else { AT_ONCE };
+    let chunk = deps.len().div_ceil(at_once).max(1);
+    let offered = std::thread::scope(|scope| -> anyhow::Result<usize> {
+        let workers: Vec<_> = deps
+            .chunks(chunk)
+            .map(|deps| {
+                scope.spawn(move || -> anyhow::Result<usize> {
+                    let mut count = 0;
+                    for dep in deps {
+                        count += registry.fetch_summaries(dep, QueryKind::Exact, Global)?.len();
+                    }
+                    Ok(count)
+                })
+            })
+            .collect();
+        let mut versions = 0;
+        for worker in workers {
+            versions += worker.join().map_err(|_| anyhow::anyhow!("a query's thread panicked"))??;
         }
-    } else {
-        block_on(join(queries.collect()))?.into_iter().collect::<anyhow::Result<()>>()?;
-    }
-    let versions: usize = offered.iter().sum();
+        Ok(versions)
+    })?;
     println!(
-        "{} packages, {versions} versions, {:.2}s",
+        "{} packages, {offered} versions, {:.2}s",
         names.len(),
         started.elapsed().as_secs_f64()
     );
     Ok(())
 }
 
-/// `future` to its end on this thread through blaze-core's one `block_on`, with no bound of
-/// its own: every request ends by the HTTP client's deadlines, as the wait's name says.
-fn block_on<F: Future>(future: F) -> anyhow::Result<F::Output> {
-    let what = "crates.io's index files (bounded by the HTTP client's timeouts)";
-    Ok(blaze_core::wait::block_on(what, None, future)?)
-}
-
-/// Each of `futures` polled together to its end, as blaze-resolve's resolver runs its queries.
-async fn join<F: Future + Unpin>(mut futures: Vec<F>) -> Vec<F::Output> {
-    let mut done: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
-    std::future::poll_fn(|cx| {
-        let mut left = 0;
-        for (future, out) in futures.iter_mut().zip(&mut done) {
-            if out.is_none() {
-                match Pin::new(future).poll(cx) {
-                    Poll::Ready(it) => *out = Some(it),
-                    Poll::Pending => left += 1,
-                }
-            }
-        }
-        if left == 0 { Poll::Ready(()) } else { Poll::Pending }
-    })
-    .await;
-    done.into_iter().map(|it| it.expect("every future ended")).collect()
-}
+/// How many asks are read at once: about as many as the HTTP client keeps in flight.
+const AT_ONCE: usize = 16;

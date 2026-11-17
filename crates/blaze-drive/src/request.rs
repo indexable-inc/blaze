@@ -13,12 +13,14 @@ use blaze_ids::Hasher;
 use blaze_own::{AVec, Alloc, CollectIn, SortedMap, SortedSet, Vec, VecDeque, soa};
 
 use crate::Plant;
-use crate::answers::{self, Last, Page, Root, Row};
+use crate::answers::{self, HeldPage, Last, PageError, PageRow, Root, Row, RowRef, RowView};
+use crate::cells::{Cell, CellAt, CellRead, CellReader, Cells, Seen};
 use crate::condition::{Condition, ConditionError, MOST_ATOMS, MOST_CONDITIONS, OVER_CAP_RULE, Space, Var};
 use crate::key::{self, ABSENT, Key, Kind, Name, Tool};
 use crate::owners::{self, Root as OwnerRoot};
 use crate::profile::Profile;
 use crate::record::{self, Finding, Locate, Part, PathOf, Stored, Whole, WholeView};
+use crate::run_scope::Closure;
 use crate::table::{Hashed, Set, Table, spread};
 use crate::wire::{NAME_BYTES, Reader, WireError, Writer};
 
@@ -61,10 +63,25 @@ pub enum Gate {
     /// program waits on; the first error stops it; no success is reported before the check is
     /// done.
     Beside,
-    /// The check is done before the program starts.
+    /// The check is done before the program starts (`run`, run.md D124): it starts only over a
+    /// check with no error, no failed task and no item it could not check
+    /// ([`Request::with_not_checked`]); a standing certificate decides that at its one read.
     Before,
     /// Only what runs is checked; the verdict says so.
     Reached,
+}
+
+impl Gate {
+    /// The gate in a `run`'s or `test`'s shape ([`shape_of`]): a program started under one gate
+    /// is another answer than under another (rule 21), so each has its own pointer and
+    /// certificate.
+    fn byte(self) -> u8 {
+        match self {
+            Gate::Beside => 1,
+            Gate::Before => 2,
+            Gate::Reached => 3,
+        }
+    }
 }
 
 /// What the command concluded.
@@ -95,7 +112,7 @@ impl Command {
     /// caller whose worker builds fewer says which stages it left out (blaze-cli's closing
     /// note), so the note shrinks as kinds are built and is gone when all are.
     pub fn needs(self) -> &'static [Kind] {
-        const CHECK: [Kind; 11] = [
+        const CHECK: [Kind; 12] = [
             Kind::Units,
             Kind::UnitGraph,
             Kind::Fetch,
@@ -107,8 +124,9 @@ impl Command {
             Kind::Signature,
             Kind::ImplBucket,
             Kind::BodyCheck,
+            Kind::Lint,
         ];
-        const RUN: [Kind; 12] = [
+        const RUN: [Kind; 14] = [
             Kind::Units,
             Kind::UnitGraph,
             Kind::Fetch,
@@ -121,11 +139,16 @@ impl Command {
             Kind::ImplBucket,
             Kind::BodyCheck,
             Kind::Code,
+            Kind::Links,
+            Kind::Native,
         ];
+        // Every kind before `Given`, which is no task (key.rs), and `Lint`, which only `check`
+        // asks: `ALL` lists the two last.
+        const TEST: &[Kind] = Kind::ALL.split_at(Kind::Given as usize - 1).0;
         match self {
             Command::Check => &CHECK,
             Command::Run => &RUN,
-            Command::Test => &Kind::ALL,
+            Command::Test => TEST,
         }
     }
 
@@ -148,6 +171,16 @@ pub struct Ask<'a> {
     /// Every configuration the request answers for at once (drive.md, "One check covers every
     /// configuration"): [`Space::NONE`] for one. Its implications are closed by the caller.
     pub space: Space<'a>,
+    /// For `run`: the program's native image ([`Name::native`], made by the command from the
+    /// package and binary asked), a job from the start so the program's first call finds it.
+    /// Part of the shape: an answer certifies one program's image. `None` for `check`, `test`.
+    pub program: Option<Name>,
+    /// What the command gives a task as a fact ([`key::fact_of`]: an environment variable, the
+    /// target), each with its value's digest, sorted by name (refused unsorted at `Start`).
+    /// Answered before the store: a reader of one sees this value, never an ambient input. Not
+    /// part of the shape: a moved fact misses the certificate (its key holds them) and walks
+    /// forward, rerunning only its readers.
+    pub facts: &'a [(Name, ContentId)],
 }
 
 /// One file of the checkout, as the sweep found it.
@@ -247,8 +280,12 @@ pub struct Output<'a> {
     pub name: Name,
     /// What a reader of it sees: the digest a read of it records.
     pub out: ContentId,
-    /// What it read, sorted by name, each with the out digest its input had.
+    /// What it read whole, sorted by name, each with the out digest its input had.
     pub reads: &'a [(Name, ContentId)],
+    /// What it read of one cell of a record (cells.rs), each with what the cell held: a
+    /// change of the record moves this reader only when its cell moved. Empty for a task of
+    /// whole reads only.
+    pub cells: &'a [CellRead],
     pub parts: &'a [Part],
     /// The path of each `Locate::File` part, so a walk can open it ([`PathOf`]).
     pub paths: &'a [PathOf<'a>],
@@ -404,9 +441,10 @@ pub enum Effect<'a> {
     Publish(Input),
     /// Clear the name's row of the settled table (`Settled::clear`): dirtied or dropped.
     Unpublish(Name),
-    /// Start the program whose entry the units' record at `units` names (blaze-run's Parent).
-    /// Answered by [`Event::Exited`].
-    StartProgram { units: Key },
+    /// Start the program whose entry the units' record at `units` names, from the native image
+    /// the `Native` record at `native` holds (blaze-run's Parent). Both keys are the effect's
+    /// own, so the runner never asks the request for either. Answered by [`Event::Exited`].
+    StartProgram { units: Key, native: Key },
     /// Stop the running program: the gate found `errors` error-level findings.
     Stop { errors: u32 },
     Print(Print<'a>),
@@ -438,10 +476,35 @@ pub enum Builder {
 }
 
 /// Why a request stopped. Each names the thing and the rule (rule 19).
+/// How many needs of one entry [`DriveError::Reentries`] names.
+pub const ENTRY_NEEDS: usize = 8;
+
+/// One entry of a job, as [`DriveError::Reentries`] reports it: the names its run was handed,
+/// then those its answer asked, each marked `true` when that entry asked it and was not handed it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct EntryNeeds {
+    /// The entry's number (1: the first run); 0: none recorded.
+    pub entry: u32,
+    pub needs: [Option<(Name, bool)>; ENTRY_NEEDS],
+    /// Needs past the first [`ENTRY_NEEDS`].
+    pub more: u32,
+}
+
+impl EntryNeeds {
+    fn push(&mut self, name: Name, new: bool) {
+        match self.needs.iter_mut().find(|slot| slot.is_none()) {
+            Some(slot) => *slot = Some((name, new)),
+            None => self.more += 1,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DriveError {
     /// Bytes at `key` are not the record they are stored as.
     Wire { key: Key, error: WireError },
+    /// Bytes at `key` are not an answer page of this form ([`answers::PageView::open`]).
+    Page { key: Key, error: PageError },
     /// The checkout's `last` file is not one.
     LastFile(WireError),
     /// The caller handed a list unsorted.
@@ -464,8 +527,14 @@ pub enum DriveError {
     /// An answer to a batch that is not out (answered twice, or never sent).
     UnknownBatch(BatchId),
     UnaskedGet(Key),
-    /// A job ran or settled more than `most_entries` times.
-    Reentries { name: Name, key: Key, entries: u32, last_needs: [Option<Name>; 4] },
+    /// A job ran or settled more than `most_entries` times: what its last two entries were
+    /// handed and asked (`entry` 0: not recorded).
+    Reentries { name: Name, key: Key, entries: u32, last: [EntryNeeds; 2] },
+    /// `by` reported reading `read` at `saw`, and its run was handed `read` at `handed`: a read's
+    /// digest is the out of the input it was handed, never one the task computed itself (rule
+    /// 21: a read list is a function of the text and the inputs). Such a task re-enters for ever,
+    /// its record stale against its own input (tempo's `BodyCheck`, 2026-11-17).
+    ReadNotHanded { by: Name, read: Name, saw: ContentId, handed: ContentId },
     /// Jobs that wait on each other and are not module scopes.
     NeedCycle { names: [Option<Name>; 8] },
     /// A task needed itself.
@@ -475,6 +544,9 @@ pub enum DriveError {
     Finished,
     /// `Exited` with no program started, or a second time.
     NoProgram,
+    /// A program to start whose native image has no key: the ask named none (`program:
+    /// None`), or the certificate holds no native slot for the program it names.
+    NoNativeImage { program: Option<Name> },
     /// The program wanted a name nothing settled after the check was done: code the check's
     /// walk does not reach is not built yet (drive.md, "The gate").
     LateWant { name: Name },
@@ -485,12 +557,25 @@ pub enum DriveError {
     SplitOnFixed { name: Name, var: Var },
     /// The request's space has implications that are not closed (`Space::closed`).
     SpaceNotClosed,
+    /// An ask's fact is not a [`Kind::Given`] name ([`key::fact_of`]).
+    NotGiven { name: Name },
+    /// `by` read the given `name` (a file's content, a fact) as `saw`, and this command holds
+    /// it as `held` (`None`: absent): the file moved while the command ran, or a path a task
+    /// read was not joined to the leaf table, so the sweep did not follow it. Never re-decided:
+    /// what a command gives is fixed for the command.
+    GivenDiffers { name: Name, by: Name, saw: ContentId, held: Option<ContentId> },
+    /// A task read a cell of `name`, whose kind has no cell lookup ([`Request::with_cells`]).
+    NoCells { name: Name, by: Name },
+    /// The record of `name` refused the lookup of a cell its reader read: its payload is not
+    /// of the form its kind's [`crate::CellOf`] reads.
+    CellRefused { name: Name, cell: Cell, what: &'static str },
 }
 
 impl fmt::Display for DriveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DriveError::Wire { key, error } => write!(f, "the record at {key}: {error}"),
+            DriveError::Page { key, error } => write!(f, "the record at {key}: {error}"),
             DriveError::LastFile(error) => write!(f, "the checkout's last answer (a pointer in .blaze/v2/at), of this build's form, is malformed: {error}"),
             DriveError::Unsorted { what } => write!(f, "{what} handed unsorted (drive.md: the sweep sorts by path)"),
             DriveError::NoFile { file, home } => write!(f, "{home} lists the file {file}, which is not in the checkout"),
@@ -506,13 +591,34 @@ impl fmt::Display for DriveError {
             DriveError::UnknownTicket(ticket) => write!(f, "an answer to run {}, which is not out in that batch", ticket.0),
             DriveError::UnknownBatch(batch) => write!(f, "an answer to batch {}, which is not out (a batch is answered once)", batch.0),
             DriveError::UnaskedGet(key) => write!(f, "an answer to a get of {key}, which is not out"),
-            DriveError::Reentries { name, key, entries, last_needs } => {
-                write!(f, "{name} (key {key}) was entered {entries} times (rule 18); its last needs:")?;
-                for need in last_needs.iter().flatten() {
-                    write!(f, " {need}")?;
+            DriveError::Reentries { name, key, entries, last } => {
+                write!(f, "{name} (key {key}) was entered {entries} times (rule 18)")?;
+                for entry in last.iter().filter(|entry| entry.entry > 0) {
+                    write!(f, "; entry {} needed", entry.entry)?;
+                    let mut any = false;
+                    for (need, new) in entry.needs.iter().flatten() {
+                        any = true;
+                        write!(f, " {need}{}", if *new { " (newly asked)" } else { "" })?;
+                    }
+                    if entry.more > 0 {
+                        write!(f, " and {} more", entry.more)?;
+                    }
+                    if !any {
+                        write!(f, " nothing")?;
+                    }
+                }
+                let recorded = last.iter().any(|entry| entry.entry > 0);
+                let asked = last.iter().any(|entry| entry.needs.iter().flatten().any(|(_, new)| *new));
+                if recorded && !asked {
+                    write!(f, "; neither entry asked a name it was not handed: each answer was decided again, so what the task reports reading is not a function of its text and inputs (rule 21)")?;
                 }
                 Ok(())
             }
+            DriveError::ReadNotHanded { by, read, saw, handed } => write!(
+                f,
+                "{by} read {read} as {:02x}{:02x}{:02x}{:02x}, and its run was handed {read} as {:02x}{:02x}{:02x}{:02x}: a read's digest is its input's out, never one the task computed (rule 21)",
+                saw.0[0], saw.0[1], saw.0[2], saw.0[3], handed.0[0], handed.0[1], handed.0[2], handed.0[3]
+            ),
             DriveError::NeedCycle { names } => {
                 write!(f, "tasks that need each other:")?;
                 for name in names.iter().flatten() {
@@ -524,6 +630,8 @@ impl fmt::Display for DriveError {
             DriveError::TooManyJobs { most, name } => write!(f, "more than {most} jobs, at {name} (rule 18)"),
             DriveError::Finished => write!(f, "a step after the request answered"),
             DriveError::NoProgram => write!(f, "a program's exit, with no program running"),
+            DriveError::NoNativeImage { program: None } => write!(f, "a program to start, and the ask names no native image (`Ask::program`)"),
+            DriveError::NoNativeImage { program: Some(name) } => write!(f, "the program {name} to start, and the certificate holds no native image for it"),
             DriveError::LateWant { name } => write!(f, "the program wanted {name} after the check was done; a late want is not built (drive.md, \"The gate\")"),
             DriveError::Condition { name, error } => write!(f, "the conditions of {name}: {error}"),
             DriveError::SplitOnFixed { name, var } => {
@@ -531,6 +639,21 @@ impl fmt::Display for DriveError {
             }
             DriveError::SpaceNotClosed => {
                 write!(f, "the request's feature implications are not transitively closed (drive.md, \"One check covers every configuration\")")
+            }
+            DriveError::NotGiven { name } => write!(f, "the ask's fact {name} is not a Given name (key::fact_of)"),
+            DriveError::GivenDiffers { name, by, saw, held } => {
+                write!(f, "{by} read {name} as {:02x}{:02x}{:02x}{:02x}, and this command gives ", saw.0[0], saw.0[1], saw.0[2], saw.0[3])?;
+                match held {
+                    Some(held) => write!(f, "{:02x}{:02x}{:02x}{:02x}", held.0[0], held.0[1], held.0[2], held.0[3])?,
+                    None => write!(f, "it absent")?,
+                }
+                write!(f, ": the file moved during the command, or a path a task read was not joined to the leaf table (rule 21)")
+            }
+            DriveError::NoCells { name, by } => {
+                write!(f, "{by} read a cell of {name}, and {} records have no cells (drive.md, \"Part reads\")", name.kind.name())
+            }
+            DriveError::CellRefused { name, cell, what } => {
+                write!(f, "the record of {name} refused the lookup of cell {:02x}{:02x}{:02x}{:02x}: {what}", cell.0[0], cell.0[1], cell.0[2], cell.0[3])
             }
         }
     }
@@ -584,6 +707,10 @@ struct Job<'a> {
     redo: bool,
     entries: u32,
     settles: u32,
+    /// Its last settle stood on its row ([`Request::stand`]), counted in the profile's
+    /// `standing`: a dirty after it takes the count back, so `standing` counts jobs that stood
+    /// to the end, never one decided again (sim_cells' `CellsAsWhole` control).
+    stood: bool,
     /// Bumped each time the job is queued or leaves the queue: a ring entry of another
     /// generation is stale.
     queue_gen: u32,
@@ -595,6 +722,8 @@ struct Job<'a> {
     needs: Vec<Name, Alloc<'a>>,
     /// The read names its value key is made of.
     shape: Vec<Name, Alloc<'a>>,
+    /// The cells its value key reads, sorted by (name, cell).
+    shape_cells: Vec<(Name, Cell), Alloc<'a>>,
     /// Jobs waiting on this one.
     waiters: Vec<Name, Alloc<'a>>,
     members: Vec<Name, Alloc<'a>>,
@@ -614,11 +743,15 @@ enum Purpose {
     /// A standing home's record read for its parts' locates: a part of it this run asks for
     /// (a body made a job only now, by a need) whose home was not re-made.
     Parts(Name),
+    /// A settled record read for the cells its readers' value keys read (cells.rs): one that
+    /// stood, so its bytes were not in hand when it settled.
+    Cells(Name),
 }
 
 enum PageState<'a> {
     Loading,
-    Loaded(Page<'a>),
+    /// Checked once as it came in, then read in place.
+    Loaded(HeldPage<'a>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -632,11 +765,18 @@ enum Phase {
     Answered,
 }
 
-/// A request's shape: its command, its arguments and the space it is checked under. A
-/// certificate and a last answer are one shape's; the machine walks forward only from its own.
+/// A request's shape: its command, its arguments, the space it is checked under and, for `run`
+/// and `test`, its gate. A certificate and a last answer are one shape's; the machine walks
+/// forward only from its own. `check` ignores the gate ([`Ask::gate`]), so its shape holds none.
 pub fn shape_of(ask: &Ask<'_>) -> ContentId {
     let mut h = Hasher::new(SHAPE_DOMAIN);
     h.update(&[ask.command.byte()]).part(ask.args).id(&key::space_digest(&ask.space));
+    if ask.command != Command::Check {
+        h.update(&[ask.gate.byte()]);
+    }
+    if let Some(program) = ask.program {
+        h.update(&[program.kind as u8]).id(&program.subject);
+    }
     h.finish()
 }
 
@@ -683,6 +823,8 @@ pub struct Request<'a> {
     alloc: Alloc<'a>,
     config: Config,
     command: Command,
+    /// The program's native image ([`Ask::program`]): seeded at `begin` when a program runs.
+    program_name: Option<Name>,
     shape_digest: ContentId,
     units_source: ContentId,
     plant: Plant,
@@ -735,11 +877,17 @@ pub struct Request<'a> {
     owners_waiting: AVec<'a, Name>,
     /// Each `Owners` name's roots known this run: computed here, or read from its record.
     owner_roots: Table<Name, AVec<'a, OwnerRoot>, Alloc<'a>>,
+    /// `Owners` jobs whose record the store lacked at its value key: computed again, it is
+    /// made (`owners`, `valued`).
+    owners_missed: Set<Name, Alloc<'a>>,
     /// `Owners` records being read for their roots, and the jobs waiting on each.
     roots_loading: Table<Name, AVec<'a, Name>, Alloc<'a>>,
     /// A file's body parts not made jobs yet, each with its home: made once the file's owners
     /// are known and one of them is asked (a member's); any other body runs only when Needed.
     gated: Table<Name, AVec<'a, (Name, Name)>, Alloc<'a>>,
+    /// `run`'s member closure ([`Request::with_member_closure`]): only the crate roots it lists
+    /// are asked. `None`: every member's are.
+    closure: Option<Closure<'a>>,
     /// Standing homes whose records are being read for their parts' locates, with the jobs
     /// waiting; and the homes read so.
     parts_loading: Table<Name, AVec<'a, Name>, Alloc<'a>>,
@@ -747,6 +895,22 @@ pub struct Request<'a> {
     /// Readers posted this run: read name to the names that read it (a name settled twice
     /// posts twice; `dirty_readers` dedups).
     posted: Table<Name, Vec<Name, Alloc<'a>>, Alloc<'a>>,
+    /// Cell readers posted this run: read name to (reader, cell, what it saw).
+    posted_cells: Table<Name, Vec<CellReader, Alloc<'a>>, Alloc<'a>>,
+    /// Each kind's cell lookup ([`Request::with_cells`]).
+    cells: Cells,
+    /// Today's digest of a name's cell, with the record (`at`) it was looked up in: valid while
+    /// the name is settled at that record.
+    cells_now: Table<CellAt, (Key, ContentId), Alloc<'a>>,
+    /// Settled records being read for cells (`Purpose::Cells`): the cells wanted and the jobs
+    /// waiting.
+    cells_loading: Table<Name, (AVec<'a, Cell>, AVec<'a, Name>), Alloc<'a>>,
+    /// The ask's facts ([`Ask::facts`]), owned; checked sorted at `Start`.
+    facts: AVec<'a, (Name, ContentId)>,
+    /// `Given` names settled with no answer yet (no fact, no sweep row, never joined to the leaf
+    /// table): a value key over one is a miss, never `ABSENT`; the first task's read of it this
+    /// command answers it (`given_read`).
+    given_unknown: Set<Name, Alloc<'a>>,
 
     jobs: Table<Name, Job<'a>, Alloc<'a>>,
     /// Jobs settled: `jobs.len() - settled` is how many are not (no scan).
@@ -754,6 +918,13 @@ pub struct Request<'a> {
     wake: VecDeque<Name, Alloc<'a>>,
     gets: Table<Key, Vec<Purpose, Alloc<'a>>, Alloc<'a>>,
     tickets: Table<Ticket, (Name, BatchId), Alloc<'a>>,
+    /// Each running job's inputs as `emit` handed them (base name, out), sorted: a read of a
+    /// handed name must be at the out it was handed (`made_split`, [`DriveError::ReadNotHanded`]).
+    /// Inserted at `emit`, removed when the run answers: it holds only what is out.
+    handed: Table<Name, Vec<(Name, ContentId), Alloc<'a>>, Alloc<'a>>,
+    /// The last two entries of each job within two of `most_entries` (and only those: no room
+    /// is spent on a job that settles early), for [`DriveError::Reentries`].
+    near_limit: Table<Name, [EntryNeeds; 2], Alloc<'a>>,
     next_ticket: u64,
     /// Queued jobs, one FIFO ring per (class, kind) in run order: the person's first, then by
     /// kind (files, scopes, signatures, bodies, code). An entry is (name, the job's queue
@@ -776,6 +947,9 @@ pub struct Request<'a> {
     old_findings: SortedMap<Name, Held<'a>, Alloc<'a>>,
     old_findings_loading: bool,
     units_at: Option<Key>,
+    /// The program's `Native` record (`program_name`'s), standing or made this run, or read from
+    /// the certificate: a repeat `run` takes the image at this key with no walk.
+    native_at: Option<Key>,
     /// Every `Units` job this run, in the order added: a file no answer holds and no record
     /// listed yet waits on one still open, as a member's units may list it.
     units_jobs: AVec<'a, Name>,
@@ -795,6 +969,13 @@ pub struct Request<'a> {
     held: Option<Answer>,
     /// Error-level findings settled this run.
     errors: u32,
+    /// The answer's findings that say an item was not checked ([`Request::with_not_checked`]),
+    /// counted with `errors` when the answer is printed: under `Before` one keeps the program
+    /// from starting ([`Request::may_start`]).
+    unchecked: u32,
+    /// Whether a finding of this rule says its item was not checked: the command's policy, beside
+    /// [`Config::is_error`] (findings carry no level, rule 81).
+    is_unchecked: fn(u16) -> bool,
     /// Tasks that failed this run, in the order they came (rule 20: each fails its own job).
     failures: Vec<TaskFailure, Alloc<'a>>,
 
@@ -831,12 +1012,18 @@ enum Program {
     Ended { ok: bool },
 }
 
+/// A request's not-checked rule before [`Request::with_not_checked`]: no finding says its item
+/// was not checked.
+fn no_rule(_: u16) -> bool {
+    false
+}
+
 /// The digest domain of a request's shape.
 const SHAPE_DOMAIN: &str = "blaze-drive request shape 1";
 const GROUP_DOMAIN: &str = "blaze-drive group 1";
 /// 2: each finding's item carries its base and condition.
-/// BDC3: the answer's root first. BDC2 had none.
-pub(crate) const CERT_MAGIC: &[u8; 4] = b"BDC3";
+/// BDC4: the program's `Native` record after the units'. BDC3 had none; BDC2 had no root.
+pub(crate) const CERT_MAGIC: &[u8; 4] = b"BDC4";
 
 impl<'a> Request<'a> {
     pub fn new_in(config: Config, ask: Ask<'_>, alloc: Alloc<'a>) -> Request<'a> {
@@ -861,6 +1048,7 @@ impl<'a> Request<'a> {
             conditioned: Table::new_in(a.clone()),
             config,
             command: ask.command,
+            program_name: ask.program,
             shape_digest,
             units_source: ABSENT,
             plant,
@@ -891,16 +1079,26 @@ impl<'a> Request<'a> {
             outlines_open: 0,
             owners_waiting: Vec::new_in(a.clone()),
             owner_roots: Table::new_in(a.clone()),
+            owners_missed: Set::new_in(a.clone()),
             roots_loading: Table::new_in(a.clone()),
             gated: Table::new_in(a.clone()),
+            closure: None,
             parts_loading: Table::new_in(a.clone()),
             parts_read: Set::new_in(a.clone()),
             posted: Table::new_in(a.clone()),
+            posted_cells: Table::new_in(a.clone()),
+            cells: Cells::NONE,
+            cells_now: Table::new_in(a.clone()),
+            cells_loading: Table::new_in(a.clone()),
+            facts: Vec::from_slice_in(ask.facts, a.clone()),
+            given_unknown: Set::new_in(a.clone()),
             jobs: Table::new_in(a.clone()),
             settled: 0,
             wake: VecDeque::new_in(a.clone()),
             gets: Table::new_in(a.clone()),
             tickets: Table::new_in(a.clone()),
+            handed: Table::new_in(a.clone()),
+            near_limit: Table::new_in(a.clone()),
             next_ticket: 0,
             ready: {
                 let mut rings = Vec::with_capacity_in(RINGS, a.clone());
@@ -919,6 +1117,7 @@ impl<'a> Request<'a> {
             old_findings: SortedMap::new_in(a.clone()),
             old_findings_loading: false,
             units_at: None,
+            native_at: None,
             units_jobs: Vec::new_in(a.clone()),
             unwalked: Vec::new_in(a.clone()),
             walked: Vec::new_in(a.clone()),
@@ -931,9 +1130,52 @@ impl<'a> Request<'a> {
             program: Program::Unstarted,
             held: None,
             errors: 0,
+            unchecked: 0,
+            is_unchecked: no_rule,
             failures: Vec::new_in(alloc.clone()),
             alloc,
         }
+    }
+
+    /// The request with the command's rule for a finding that says its item was not checked
+    /// (blaze-cli's `types-not-checked`, what makes `check` exit 4): under [`Gate::Before`] the
+    /// program starts only over an answer that holds none (`Request::may_start`). Without it
+    /// no finding says so: a caller whose check cannot leave an item unchecked (the sims of one
+    /// stage) gives none.
+    pub fn with_not_checked(mut self, is_unchecked: fn(u16) -> bool) -> Request<'a> {
+        self.is_unchecked = is_unchecked;
+        self
+    }
+
+    /// `run`'s scope (run_scope.rs): only the crates of `package` (the program package's `Units`
+    /// name, [`Name::manifest`] of its manifest) and of the workspace members it depends on,
+    /// as their `Units` records list them, are asked; any other member's bodies are never made,
+    /// and their errors do not hold the start. `check` and `test` ignore it: they ask every
+    /// member. Given only once the members' `Units` records list their member dependencies:
+    /// without those listings the closure is the package alone. Not in the shape: whether a
+    /// command gives it is fixed by the binary, and the whole tool is in every certificate's
+    /// and pointer's key, so no answer of one form is read by the other.
+    pub fn with_member_closure(mut self, package: Name) -> Request<'a> {
+        if self.command == Command::Run {
+            self.closure = Some(Closure::new_in(package, self.plant == Plant::ReachedSkipped, self.alloc));
+        }
+        self
+    }
+
+    /// The gate's one fact (rule 30): the program may start. No error-level finding, no failed
+    /// task, and under `Before` no item the check could not check: a check that left an item out
+    /// is not a check the program may start over. Under `Beside` and `Reached` an unchecked item
+    /// does not hold the start (the check runs beside, or only what runs is checked).
+    fn may_start(&self) -> bool {
+        let complete = self.gate != Gate::Before || self.unchecked == 0 || self.plant == Plant::StartOverIncomplete;
+        self.errors == 0 && self.failures.is_empty() && complete
+    }
+
+    /// The request with each kind's cell lookup (cells.rs): the kinds whose records are read by
+    /// part. Every kind not given is read whole only.
+    pub fn with_cells(mut self, cells: Cells) -> Request<'a> {
+        self.cells = cells;
+        self
     }
 
     /// The tasks that failed this run, in the order they came.
@@ -963,9 +1205,10 @@ impl<'a> Request<'a> {
         starts_program(self.command, self.plant)
     }
 
-    /// The units are known: under `Beside` and `Reached` the program starts now, unless an
-    /// error is already found.
-    fn units_known(&mut self, at: Key, out: &mut AVec<'_, Effect<'a>>) {
+    /// The units or the program's image settled: once both are known, under `Beside` and
+    /// `Reached` the program starts now, unless an error is already found.
+    fn program_known(&mut self, out: &mut AVec<'_, Effect<'a>>) {
+        let (Some(units), Some(native)) = (self.units_at, self.native_at) else { return };
         if self.runs_program()
             && self.gate != Gate::Before
             && self.program == Program::Unstarted
@@ -973,7 +1216,7 @@ impl<'a> Request<'a> {
             && self.failures.is_empty()
         {
             self.program = Program::Running;
-            out.push(Effect::StartProgram { units: at });
+            out.push(Effect::StartProgram { units, native });
         }
     }
 
@@ -1032,13 +1275,24 @@ impl<'a> Request<'a> {
             _ if self.errors > 0 || !self.failures.is_empty() => Verdict::Failed { errors: self.errors, started },
             // Only under the plant: a running program without an error is still waited for.
             (true, Program::Running | Program::Stopped) => return,
-            (true, Program::Unstarted) => {
+            // Before: the check is clean of errors and left an item unchecked (its findings are
+            // printed, each by cause): the program is not started over it.
+            (true, Program::Unstarted) if !self.may_start() => Verdict::Failed { errors: self.errors, started: false },
+            (true, Program::Unstarted) => match (answer.units, self.native_at) {
                 // Before: the check is clean, the program starts now.
-                let units = answer.units.unwrap_or_default();
-                self.program = Program::Running;
-                out.push(Effect::StartProgram { units });
-                return;
-            }
+                (Some(units), Some(native)) => {
+                    self.program = Program::Running;
+                    out.push(Effect::StartProgram { units, native });
+                    return;
+                }
+                // The walk is done and a key the start needs has no record: the run fails by
+                // name, never starts on a default key.
+                _ => {
+                    let name = self.program_name.unwrap_or_else(Name::units);
+                    self.failures.push(TaskFailure { name, why: Why::Refused { what: "a program to start whose units or native image has no record", rule: "run" } });
+                    Verdict::Failed { errors: self.errors, started: false }
+                }
+            },
             (true, Program::Ended { ok: true }) => Verdict::Passed,
             (true, Program::Ended { ok: false }) => Verdict::ProgramFailed,
         };
@@ -1117,13 +1371,27 @@ impl<'a> Request<'a> {
     /// the last answer's; `None` when no record holds it (never asked, or its task failed). How
     /// `test` reads its suites' `CrateScope` records after the check.
     pub fn settled_input(&self, name: Name) -> Option<Input> {
-        let now = self.now.get(&name).copied().or_else(|| self.old(name).map(|row| Now { at: row.at, out: row.out }))?;
+        let now = self.now.get(&name).copied().or_else(|| self.old(name).map(|row| Now { at: row.at(), out: row.out() }))?;
         Some(Input { name, at: now.at, out: now.out })
     }
 
     /// The request's certificate key, known after `Start`.
     pub fn certificate(&self) -> Key {
         self.cert
+    }
+
+    /// What cell `cell` of `name`'s record holds today (`Seen::digest`), when this run looked it
+    /// up in the record `name` stands at now; `None` otherwise.
+    pub fn cell_now(&self, name: Name, cell: Cell) -> Option<ContentId> {
+        let at = self.settled_input(name)?.at;
+        self.cells_now.get(&CellAt { name, cell }).filter(|(held, _)| *held == at).map(|(_, saw)| *saw)
+    }
+
+    /// The key of the program's native image (its `Native` record), once known: from the
+    /// certificate on a repeat, else when the record stands or is made. `None` for a request
+    /// that names no program.
+    pub fn native_image(&self) -> Option<Key> {
+        self.native_at
     }
 
     /// One event in; its effects pushed onto `out`.
@@ -1220,6 +1488,21 @@ impl<'a> Request<'a> {
         if !self.space_closed {
             return Err(DriveError::SpaceNotClosed);
         }
+        if self.facts.windows(2).any(|w| w[0].0 >= w[1].0) {
+            return Err(DriveError::Unsorted { what: "the ask's facts" });
+        }
+        if let Some((name, _)) = self.facts.iter().find(|(name, _)| name.kind != Kind::Given) {
+            return Err(DriveError::NotGiven { name: *name });
+        }
+        // A program starts from its units and its image (`Effect::StartProgram`): a request
+        // that would start one names the image it starts.
+        if self.runs_program() && self.program_name.is_none() {
+            return Err(DriveError::NoNativeImage { program: None });
+        }
+        // Answered before the store: a reader's value key holds the fact as the command gives it.
+        for (name, value) in self.facts.iter() {
+            self.now.insert(*name, Now { at: Key::default(), out: *value });
+        }
         for file in files {
             self.add_file(file.path, file.id, file.changed, file.manifest);
         }
@@ -1230,7 +1513,12 @@ impl<'a> Request<'a> {
         // cli found it today (each manifest, each manifest probed absent, each listing).
         self.units_source = units;
         self.cold = cold;
-        self.cert = self.cert_of(files.iter().map(|f| (f.path, &f.id)));
+        // Absence is omission: a gone path is in no certificate key, as an answer's absent read
+        // is in none (`finish`), so a key names exactly the files present.
+        let mut swept = Vec::with_capacity_in(files.len(), self.alloc);
+        swept.extend(files.iter().map(|f| (Name::file(f.path).subject, f.id)));
+        self.cert = self.cert_of(&mut swept);
+        drop(swept);
         self.last = match last {
             None => None,
             Some(bytes) => Some(answers::read_last(bytes).map_err(DriveError::LastFile)?),
@@ -1245,14 +1533,26 @@ impl<'a> Request<'a> {
         Ok(())
     }
 
-    /// The certificate key of `files` (sorted by path): the tool, the command and its shape, the
-    /// units' source, and each (path, id).
-    fn cert_of<'p>(&self, files: impl Iterator<Item = (&'p [u8], &'p ContentId)>) -> Key {
-        let mut command = [0u8; 65];
+    /// The certificate key of `files`, each a file's subject ([`Name::file`]) and its content id
+    /// (sorted here, by subject): the tool, the command and its shape, the units' source, the
+    /// ask's facts when it has any, and each (subject, id). By subject, not path, so a file the
+    /// answer read by content only ([`key::content_of`], a `Given` name: its subject and no
+    /// path) is keyed as the sweep's row of the same path is.
+    fn cert_of(&self, files: &mut [(ContentId, ContentId)]) -> Key {
+        files.sort_unstable_by(|x, y| x.0.cmp(&y.0));
+        let mut command = [0u8; 97];
         command[0] = self.command.byte();
         command[1..33].copy_from_slice(&self.shape_digest.0);
-        command[33..].copy_from_slice(&self.units_source.0);
-        key::cert_key(self.config.tool, &command, files)
+        command[33..65].copy_from_slice(&self.units_source.0);
+        // An ask with no facts keys as before they existed: its certificates stand.
+        let len = match self.facts.is_empty() {
+            true => 65,
+            false => {
+                command[65..].copy_from_slice(&key::facts_digest(&self.facts).0);
+                97
+            }
+        };
+        key::cert_key(self.config.tool, &command[..len], files.iter().map(|(subject, id)| (&subject.0[..], id)))
     }
 
     /// A file joins the table: `Start`'s, or an `Opened` one.
@@ -1284,7 +1584,9 @@ impl<'a> Request<'a> {
         if self.dropped.contains(&name) {
             return false;
         }
-        self.now.contains_key(&name) || !self.files.changeds()[i]
+        // A file read by content only (`key::content_of`) is held by its `Given` name: a changed
+        // one has no outline job, and dropping it would leave its readers' file unfollowed.
+        self.now.contains_key(&name) || self.now.contains_key(&Name::new(Kind::Given, name.subject)) || !self.files.changeds()[i]
     }
 
     /// The certificate missed: start the walk.
@@ -1318,6 +1620,18 @@ impl<'a> Request<'a> {
             for name in seeds.iter() {
                 self.add_job(*name, *name, None, true, self.walk)?;
             }
+            // What the command gives, each a `Given` seed: a changed or gone file's content (a
+            // reader by content only, `key::content_of`, is the same subject's) and every fact.
+            // Each compares today's with its watch row's `out` and dirties its readers only
+            // when it moved (`given`).
+            let mut given = Vec::with_capacity_in(seeds.len() + self.facts.len(), self.alloc);
+            if self.plant != Plant::GivenNotSeeded {
+                given.extend(seeds.iter().map(|seed| Name::new(Kind::Given, seed.subject)));
+            }
+            given.extend(self.facts.iter().map(|(name, _)| *name));
+            for name in given.iter() {
+                self.add_job(*name, *name, None, true, self.walk)?;
+            }
             // What the layout read moved: the units are read again (parts that stand cost no read).
             if self.last.is_some_and(|last| last.units != self.units_source) {
                 self.add_root_units()?;
@@ -1331,6 +1645,15 @@ impl<'a> Request<'a> {
             let name = Name::unit_graph();
             self.add_job(name, name, Some(Locate::Source(source)), false, Class::Foreground)?;
         }
+        // The program's native image (run.md, "What a run takes from the request"): the
+        // person's, as the program's first call waits on it. Located by its name; a repeat
+        // stands on its row, or is found by value from its reads (the crate list, each closure
+        // crate's `Links` and `Script`): only a moved read runs it.
+        if self.runs_program()
+            && let Some(native) = self.program_name
+        {
+            self.add_job(native, Name::unit_graph(), Some(Locate::Source(native.subject)), false, Class::Foreground)?;
+        }
         Ok(())
     }
 
@@ -1342,7 +1665,8 @@ impl<'a> Request<'a> {
     }
 
     fn certified(&mut self, bytes: &[u8], out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
-        let (root, units, held) = read_cert(bytes, self.alloc).map_err(|error| DriveError::Wire { key: self.cert, error })?;
+        let (root, units, native, held) = read_cert(bytes, self.alloc).map_err(|error| DriveError::Wire { key: self.cert, error })?;
+        self.native_at = native;
         self.profile.certified = true;
         // A `last` that names another answer (none, an older form's, or the tree's before an
         // undo) is replaced by this one's, so the next edit walks forward from this answer and
@@ -1352,20 +1676,23 @@ impl<'a> Request<'a> {
             let last = Last { tool, shape: self.shape_digest, units: self.units_source, cert: self.cert, root };
             out.push(Effect::WriteLast { bytes: answers::write_last(&last, self.alloc) });
         }
-        let (count, errors) = self.print(&held, out);
+        let (count, errors, unchecked) = self.print(&held, out);
         self.errors = errors;
+        self.unchecked = unchecked;
         self.units_at = units;
         // The repeat: the walk stands whole. A stored error refuses the start at this one read
-        // (every gate); a clean one starts the program now, nothing left to check beside it.
+        // (every gate), and under `Before` so does a stored unchecked item; a clean one starts
+        // the program now, nothing left to check beside it, no task run.
         self.held = Some(Answer { profile: self.profile, verdict: Verdict::Checked, findings: count, units, failed: 0 });
         self.phase = Phase::Held;
-        if self.runs_program() && self.errors == 0 {
-            match units {
-                Some(at) => {
+        if self.runs_program() && self.may_start() {
+            match (units, native) {
+                (Some(units), Some(native)) => {
                     self.program = Program::Running;
-                    out.push(Effect::StartProgram { units: at });
+                    out.push(Effect::StartProgram { units, native });
                 }
-                None => return Err(DriveError::NoProgram),
+                (None, _) => return Err(DriveError::NoProgram),
+                (Some(_), None) => return Err(DriveError::NoNativeImage { program: self.program_name }),
             }
         }
         self.conclude(out);
@@ -1409,7 +1736,7 @@ impl<'a> Request<'a> {
                 Purpose::OldCert => {
                     self.old_findings_loading = false;
                     if let Some(bytes) = bytes {
-                        self.old_findings = read_cert(bytes, self.alloc).map_err(|error| DriveError::Wire { key, error })?.2;
+                        self.old_findings = read_cert(bytes, self.alloc).map_err(|error| DriveError::Wire { key, error })?.3;
                     }
                 }
                 Purpose::Root => {
@@ -1437,8 +1764,8 @@ impl<'a> Request<'a> {
                 Purpose::Page(index) => {
                     self.profile.pages += 1;
                     let page = match bytes {
-                        Some(bytes) => answers::read_page(bytes, self.alloc).map_err(|error| DriveError::Wire { key, error })?,
-                        None => SortedMap::new_in(self.alloc),
+                        Some(bytes) => HeldPage::open_in(bytes, self.alloc).map_err(|error| DriveError::Page { key, error })?,
+                        None => HeldPage::empty(),
                     };
                     self.pages.insert(index, PageState::Loaded(page));
                     if let Some(waiters) = self.page_waiters.remove(&index) {
@@ -1451,6 +1778,7 @@ impl<'a> Request<'a> {
                 Purpose::Value(name) => self.valued(name, key, bytes, out)?,
                 Purpose::Roots(name) => self.roots_got(name, key, bytes, out)?,
                 Purpose::Parts(home) => self.parts_got(home, key, bytes)?,
+                Purpose::Cells(name) => self.cells_got(name, key, bytes)?,
             }
         }
         Ok(())
@@ -1458,14 +1786,31 @@ impl<'a> Request<'a> {
 
     fn ran(&mut self, ticket: Ticket, ran: &Ran<'_>, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         let (name, _) = self.tickets.remove(&ticket).ok_or(DriveError::UnknownTicket(ticket))?;
+        // Handed to this run only: the run is answered.
+        let handed = self.handed.remove(&name);
         if let Some(job) = self.jobs.get(&name)
             && job.entries > self.config.most_entries
         {
-            let mut last_needs = [None; 4];
-            for (slot, need) in last_needs.iter_mut().zip(job.needs.iter()) {
-                *slot = Some(*need);
+            let last = self.near_limit.get(&name).copied().unwrap_or_default();
+            return Err(DriveError::Reentries { name, key: job.key, entries: job.entries, last });
+        }
+        // Each read of a name it was handed is at the out it was handed (rule 21). A read of
+        // one that moved since is stale and decided again (`made_split`); a read at an out it
+        // was never handed is the task computing its input itself, which re-enters for ever.
+        if let (Ran::Done(outputs), Some(handed)) = (ran, handed.as_ref()) {
+            for output in outputs.iter().filter(|output| output.name == name) {
+                for (read, saw) in output.reads.iter() {
+                    if read.kind == Kind::Given {
+                        continue;
+                    }
+                    if let Ok(at) = handed.binary_search_by_key(read, |(handed, _)| *handed) {
+                        let was = handed[at].1;
+                        if was != *saw {
+                            return Err(DriveError::ReadNotHanded { by: name, read: *read, saw: *saw, handed: was });
+                        }
+                    }
+                }
             }
-            return Err(DriveError::Reentries { name, key: job.key, entries: job.entries, last_needs });
         }
         // A run of a name its home dropped while it was out answers for nothing in the build:
         // not an error, and not quietly kept (its record is not written, its row is gone).
@@ -1507,9 +1852,15 @@ impl<'a> Request<'a> {
             }
             Ran::Need(wants) => {
                 self.profile.of(name.kind).needs += 1;
+                // The needs it was handed: sorted at the last answer, untouched by `emit`.
+                let handed_needs = self.jobs.get(&name).map_or(0, |job| job.needs.len());
                 for want in wants {
                     if want.name == name {
                         return Err(DriveError::SelfNeed { name });
+                    }
+                    if let Some(last) = self.near_limit.get_mut(&name) {
+                        let new = self.jobs.get(&name).is_some_and(|job| job.needs[..handed_needs].binary_search(&want.name).is_err());
+                        last[1].push(want.name, new);
                     }
                     if !self.jobs.contains_key(&want.name) {
                         let class = self.jobs.get(&name).map_or(self.walk, |job| job.class);
@@ -1570,10 +1921,12 @@ impl<'a> Request<'a> {
                 redo: false,
                 entries: 0,
                 settles: 0,
+                stood: false,
                 queue_gen: 0,
                 parked: false,
                 needs: Vec::new_in(a.clone()),
                 shape: Vec::new_in(a.clone()),
+                shape_cells: Vec::new_in(a.clone()),
                 waiters: Vec::new_in(a.clone()),
                 members: Vec::new_in(a),
             },
@@ -1648,7 +2001,7 @@ impl<'a> Request<'a> {
         if let Some(at) = self.conditioned.get(&name) {
             return *at;
         }
-        match self.current(name).and_then(|row| row.cond) {
+        match self.current(name).and_then(|row| row.cond()) {
             Some(at) => at,
             None => (name, Condition::ANY),
         }
@@ -1699,7 +2052,7 @@ impl<'a> Request<'a> {
             if let Digest::Wait = self.digest(at, waiter, out) {
                 return Ok(Resolved::Wait);
             }
-            let Some(var) = self.current(at).and_then(|row| row.split) else { return Ok(Resolved::At) };
+            let Some(var) = self.current(at).and_then(|row| row.split()) else { return Ok(Resolved::At) };
             match self.fork_of(at, var, under)? {
                 Ok(next) => at = next,
                 // The planted bug: an asker that does not fix the variable is served the first
@@ -1721,7 +2074,7 @@ impl<'a> Request<'a> {
     fn resolve_settled(&self, need: Name, under: &Condition) -> Name {
         let mut at = need;
         for _ in 0..=MOST_ATOMS {
-            let Some(var) = self.current(at).and_then(|row| row.split) else { return at };
+            let Some(var) = self.current(at).and_then(|row| row.split()) else { return at };
             match self.fork_of(at, var, under) {
                 Ok(Ok(next)) => at = next,
                 Ok(Err(var)) if self.plant == Plant::RanUnderCondition => {
@@ -1754,6 +2107,7 @@ impl<'a> Request<'a> {
                 name,
                 out: key::digest("blaze-drive over cap 1", &message[..len]),
                 reads: &space_read,
+                cells: &[],
                 parts: &[],
                 paths: &[],
                 findings: &findings,
@@ -1772,7 +2126,7 @@ impl<'a> Request<'a> {
             parts.push(Part { name: *fork, locate, place });
             h.update(&[fork.kind as u8]).id(&fork.subject);
         }
-        let output = Output { name, out: h.finish(), reads: &space_read, parts: &parts, paths: &[], findings: &[], payload: &[] };
+        let output = Output { name, out: h.finish(), reads: &space_read, cells: &[], parts: &parts, paths: &[], findings: &[], payload: &[] };
         self.made_split(&output, Some(var), out)
     }
 
@@ -1855,7 +2209,7 @@ impl<'a> Request<'a> {
                 self.page_wait(index, waiter);
                 match key == Key::default() {
                     true => {
-                        self.pages.insert(index, PageState::Loaded(SortedMap::new_in(self.alloc)));
+                        self.pages.insert(index, PageState::Loaded(HeldPage::empty()));
                         self.wake.push_back(waiter);
                     }
                     false => self.get(key, Purpose::Page(index), out),
@@ -1880,24 +2234,30 @@ impl<'a> Request<'a> {
     }
 
     /// The old row of `name`, its page loaded; a watch row (readers only) is no row.
-    fn old(&self, name: Name) -> Option<&Row<'a>> {
+    fn old(&self, name: Name) -> Option<RowView<'_>> {
         self.old_or_watch(name).filter(|row| !row.watching())
     }
 
-    /// The old row of `name` or its watch row ([`Row::watching`]): for its readers.
-    fn old_or_watch(&self, name: Name) -> Option<&Row<'a>> {
+    /// The old row of `name` or its watch row ([`Row::watching`]): for its readers. In place in
+    /// its page: a search of the row table, no copy.
+    fn old_or_watch(&self, name: Name) -> Option<RowView<'_>> {
+        self.held_page(name)?.view().row(name)
+    }
+
+    /// The loaded page that holds `name`'s old row, if any.
+    fn held_page(&self, name: Name) -> Option<&HeldPage<'a>> {
         let root = self.root.as_ref()?;
         match self.pages.get(&answers::page_of(name, root.bits))? {
-            PageState::Loaded(page) => page.get(&name),
+            PageState::Loaded(page) => Some(page),
             PageState::Loading => None,
         }
     }
 
     /// The row this run knows for `name`: made this run, else the old one.
-    fn current(&self, name: Name) -> Option<&Row<'a>> {
+    fn current(&self, name: Name) -> Option<RowRef<'_, 'a>> {
         match self.new.get(&name) {
-            Some(row) => (!row.watching()).then_some(row),
-            None => self.old(name),
+            Some(row) => (!row.watching()).then_some(RowRef::Made(row)),
+            None => self.old(name).map(RowRef::Old),
         }
     }
 
@@ -1922,7 +2282,7 @@ impl<'a> Request<'a> {
         if !self.old_ready(read, waiter, out) {
             return Digest::Wait;
         }
-        Digest::Ready(self.old(read).map(|row| Now { at: row.at, out: row.out }))
+        Digest::Ready(self.old(read).map(|row| Now { at: row.at(), out: row.out() }))
     }
 
     fn file_index(&self, subject: &ContentId) -> Option<usize> {
@@ -2143,7 +2503,7 @@ impl<'a> Request<'a> {
             // Handed by its base name, with what the record the task's condition implies
             // holds (`gather` waited for every node on the way).
             let leaf = self.resolve_settled(*need, &condition);
-            match self.now.get(&leaf).copied().or_else(|| self.old(leaf).map(|row| Now { at: row.at, out: row.out })) {
+            match self.now.get(&leaf).copied().or_else(|| self.old(leaf).map(|row| Now { at: row.at(), out: row.out() })) {
                 Some(now) => inputs.push(Input { name: self.cond_of(*need).0, at: now.at, out: now.out }),
                 // Settled with no record: its task failed this command (rule 20).
                 None => failed.push(self.cond_of(*need).0),
@@ -2180,8 +2540,21 @@ impl<'a> Request<'a> {
             failed,
             members,
         };
+        let mut handed = Vec::with_capacity_in(task.inputs.len(), a.clone());
+        handed.extend(task.inputs.iter().map(|input| (input.name, input.out)));
+        self.handed.insert(name, handed);
         let job = self.jobs.get_mut(&name).expect("a queued job is a job");
         job.entries += 1;
+        // Within two of the limit, this entry's needs are kept for `Reentries`.
+        if job.entries.max(job.settles).saturating_add(2) >= self.config.most_entries {
+            let mut entry = EntryNeeds { entry: job.entries, ..EntryNeeds::default() };
+            for need in task.inputs.iter().map(|input| input.name).chain(task.failed.iter().copied()) {
+                entry.push(need, false);
+            }
+            let before = self.near_limit.get(&name).map_or(EntryNeeds::default(), |last| last[1]);
+            self.near_limit.insert(name, [before, entry]);
+        }
+        let job = self.jobs.get_mut(&name).expect("a queued job is a job");
         job.state = State::Running;
         self.profile.of(name.kind).entries += 1;
         self.profile.tasks += 1;
@@ -2211,6 +2584,9 @@ impl<'a> Request<'a> {
         if !self.old_ready(name, name, out) {
             return Ok(());
         }
+        if name.kind == Kind::Given {
+            return self.given(name);
+        }
         let job = self.jobs.get(&name).expect("advanced jobs are jobs");
         let (home, seed) = (job.home, job.seed);
         let mut locate = job.locate;
@@ -2238,7 +2614,7 @@ impl<'a> Request<'a> {
                 self.wake_waiters(name);
                 return Ok(());
             }
-            match self.old(name).map(|row| (row.source, row.place, row.home)) {
+            match self.old(name).map(|row| (row.source(), row.place(), row.home())) {
                 Some((source, at, by)) => {
                     // A file's text is found by today's sweep, never by the row's source.
                     locate = Some(match name.kind {
@@ -2284,6 +2660,21 @@ impl<'a> Request<'a> {
                     // alone, by name (rule 20); its waiters see it in `Task::failed`.
                     None if home != name && self.state(home) == Some(State::Settled) => {
                         self.failures.push(TaskFailure { name, why: Why::Refused { what: "a part its file's record does not list", rule: "keys-cover-every-input" } });
+                        self.now.remove(&name);
+                        self.set_state(name, State::Settled);
+                        self.wake_waiters(name);
+                        return Ok(());
+                    }
+                    // The dependency graph wanted (a `Native` task's first need) by a command
+                    // whose `Start` gave no graph source and whose last answer has no row of
+                    // it: no job can make it, so the want fails alone, by name (rule 20), and
+                    // the wanter stops `Waited` on it; never the whole request as a `NoPart` of
+                    // the graph by itself (native_image_tests.rs, 2026-11-17).
+                    None if name == Name::unit_graph() => {
+                        self.failures.push(TaskFailure {
+                            name,
+                            why: Why::Refused { what: "the dependency graph, which this command has no source for (`Start` gave no `graph`: no lock was read with the layout)", rule: "no-fallback" },
+                        });
                         self.now.remove(&name);
                         self.set_state(name, State::Settled);
                         self.wake_waiters(name);
@@ -2339,7 +2730,7 @@ impl<'a> Request<'a> {
         // text of its own holds: its key holds its file's `Owners` out, so one key never names
         // two read lists (rule 21) and a body whose owners moved is a new key.
         let key = match name.kind {
-            Kind::BodyCheck => {
+            Kind::BodyCheck | Kind::Signature => {
                 let home = self.jobs.get(&name).expect("a job").home;
                 // Its file's Surface remade this request: when it settles moved, its crates'
                 // scopes are dirtied (their jobs made) before this body reads them, so it never
@@ -2354,10 +2745,18 @@ impl<'a> Request<'a> {
                 if self.state(owned).is_none() {
                     self.add_job(owned, home, None, false, self.walk)?;
                 }
-                match self.digest(owned, name, out) {
+                let owners_out = match self.digest(owned, name, out) {
                     Digest::Wait => return Ok(()),
-                    Digest::Ready(now) => key::value_key(key, &[(owned, now.map_or(ABSENT, |now| now.out))]),
-                }
+                    Digest::Ready(now) => now.map_or(ABSENT, |now| now.out),
+                };
+                // Which crates those owners are: the crate list's out (key.rs `owned_key`).
+                // Asked after the Owners, whose roots are parts of the `UnitGraph` record, so a
+                // graph remade this request has settled; no graph this command: absent.
+                let graph = match self.digest(Name::unit_graph(), name, out) {
+                    Digest::Wait => return Ok(()),
+                    Digest::Ready(now) => now.map_or(ABSENT, |now| now.out),
+                };
+                key::owned_key(key, graph, owned, owners_out)
             }
             _ => key,
         };
@@ -2368,6 +2767,92 @@ impl<'a> Request<'a> {
         job.key = key;
         job.state = State::Decide;
         self.decide(name, out)
+    }
+
+    /// What the command gives for the `Given` name `name`, from what needs no page: a fact or a
+    /// task's read this command (`now`), the sweep's row of the file of its subject, a file gone
+    /// since the last answer. `Some(None)`: absent; `None`: not known from these.
+    fn given_known(&self, name: Name) -> Option<Option<ContentId>> {
+        if let Some(now) = self.now.get(&name) {
+            return Some(Some(now.out));
+        }
+        if let Some(index) = self.file_index(&name.subject) {
+            return Some(Some(self.files.ids()[index]));
+        }
+        if self.gone.contains(&name.subject) {
+            return Some(None);
+        }
+        None
+    }
+
+    /// [`Request::given_known`], then the old table (its page loaded): a name with a watch row
+    /// was read last time, so its file was joined to the leaf table, which the sweep follows
+    /// whole; not in today's sweep, it is absent. No row either: not known.
+    fn given_today(&self, name: Name) -> Option<Option<ContentId>> {
+        self.given_known(name).or_else(|| self.old_or_watch(name).map(|_| None))
+    }
+
+    /// A `Given` job (`Kind::Given`): never a task and never a record. It settles at once with
+    /// what the command gives ([`Request::given_today`]); one not known settles in
+    /// `given_unknown`. A seed (a changed or gone file, a fact) dirties its readers when that is
+    /// not what its watch row's `out` says the last answer read.
+    fn given(&mut self, name: Name) -> Result<(), DriveError> {
+        let seed = self.jobs.get(&name).expect("a job").seed;
+        let today = self.given_today(name);
+        match today {
+            Some(Some(out)) => {
+                self.now.insert(name, Now { at: Key::default(), out });
+            }
+            Some(None) => {
+                self.now.remove(&name);
+            }
+            None => {
+                self.given_unknown.insert(name);
+            }
+        }
+        self.set_state(name, State::Settled);
+        self.wake_waiters(name);
+        let was = self.old_or_watch(name).map(|row| row.out());
+        let moved = match (today, was) {
+            (Some(today), Some(was)) => today.unwrap_or(ABSENT) != was,
+            _ => false,
+        };
+        if seed && moved {
+            self.dirty_readers(name)?;
+        }
+        Ok(())
+    }
+
+    /// `by`'s task read the `Given` name `name` as `saw`. The first read this command of one
+    /// with no answer (`given_unknown`, or not asked yet: a run with no shape) answers it, so
+    /// every later reader this command sees the same bytes; any other read must be what the
+    /// command gives ([`DriveError::GivenDiffers`]), never decided again.
+    fn given_read(&mut self, name: Name, saw: ContentId, by: Name) -> Result<(), DriveError> {
+        // Its job, made now if nothing asked it (a run with no shape, a fact), settles before
+        // the finish, so the answer's watch row keeps what the command gave (`finish`).
+        if self.state(name).is_none() {
+            self.add_job(name, name, None, false, self.walk)?;
+        }
+        let settled = self.state(name) == Some(State::Settled);
+        // An absence read is held too (out `ABSENT`): the path was looked at, so the file's
+        // appearing moves the reader.
+        if settled && self.given_unknown.remove(&name) {
+            self.now.insert(name, Now { at: Key::default(), out: saw });
+            return Ok(());
+        }
+        let held = match settled {
+            true => Some(self.now.get(&name).map(|now| now.out)),
+            false => self.given_known(name),
+        };
+        match held {
+            Some(held) if held.unwrap_or(ABSENT) == saw => Ok(()),
+            Some(held) => Err(DriveError::GivenDiffers { name, by, saw, held }),
+            None => {
+                // Its job, when it locates, finds this answer first (`given_known`).
+                self.now.insert(name, Now { at: Key::default(), out: saw });
+                Ok(())
+            }
+        }
     }
 
     /// A module file its settled home lists, opened and found at neither of its places: by the
@@ -2404,7 +2889,7 @@ impl<'a> Request<'a> {
         // not there is no finding of the drive's: the expansion that reads it reports it at its
         // call, and a call the cfg turns off reads nothing and reports nothing, as rustc.
         let findings: &[Finding<'_>] = if edition == crate::record::DATA_FILE { &[] } else { &findings };
-        let output = Output { name, out: source, reads: &[], parts: &[], paths: &[], findings, payload: &[] };
+        let output = Output { name, out: source, reads: &[], cells: &[], parts: &[], paths: &[], findings, payload: &[] };
         self.made(&output, out)
     }
 
@@ -2420,7 +2905,7 @@ impl<'a> Request<'a> {
         // moved); else the machine computes it, never from the store: its parents are not in
         // its key, so a record found by value could be another checkout's tree.
         if name.kind == Kind::Owners {
-            if !recheck && self.current(name).is_some_and(|row| row.key == key) {
+            if !recheck && self.current(name).is_some_and(|row| row.key() == key) {
                 return self.stand(name, out);
             }
             self.set_state(name, State::Gather);
@@ -2431,17 +2916,17 @@ impl<'a> Request<'a> {
         // no job), so this is where that read is checked.
         let (space_name, space_digest) = (self.space_name, self.space_digest);
         let row = self.current(name).map(|row| {
-            let other_space = row
-                .reads
-                .binary_search_by_key(&space_name, |(n, _)| *n)
-                .is_ok_and(|at| row.reads[at].1 != space_digest);
-            (row.key, other_space, row.reads.iter().map(|(n, _)| *n).collect_in(self.alloc))
+            let reads = row.reads();
+            let other_space = reads.binary_search_by_key(&space_name, |(n, _)| n).is_ok_and(|at| reads.get(at).1 != space_digest);
+            let cells: AVec<'a, (Name, Cell)> = row.cells().iter().map(|read| (read.name, read.cell)).collect_in(self.alloc);
+            (row.key(), other_space, (reads.iter().map(|(n, _)| n).collect_in(self.alloc), cells))
         });
         match row {
             Some((held, false, _)) if held == key && !recheck => self.stand(name, out),
-            Some((held, _, reads)) if held == key && !reads.is_empty() => {
+            Some((held, _, (reads, cells))) if held == key && !(reads.is_empty() && cells.is_empty()) => {
                 let job = self.jobs.get_mut(&name).expect("a job");
                 job.shape = reads;
+                job.shape_cells = cells;
                 job.state = State::Value;
                 self.value(name, out)
             }
@@ -2467,25 +2952,78 @@ impl<'a> Request<'a> {
         // to go quiet ([`Request::walk_quiet`]); only then is an unlisted name absent today.
         let unanswered = self.current(name).is_none() && self.walked.binary_search(&name).is_err();
         let mut unlisted = false;
+        // A `Given` read with no answer yet makes the value key a miss: the task runs, and its
+        // read answers it (`given_read`). Never `ABSENT`: a file the sweep never saw may be there.
+        let mut miss = false;
+        let mut given_jobs = Vec::new_in(self.alloc);
         for read in shape.iter() {
+            if read.kind == Kind::Given {
+                match self.state(*read) {
+                    None => {
+                        given_jobs.push(*read);
+                        waiting = true;
+                    }
+                    Some(State::Settled) if self.given_unknown.contains(read) => miss = true,
+                    Some(State::Settled) => reads.push((*read, self.now.get(read).map_or(ABSENT, |now| now.out))),
+                    Some(_) => {
+                        self.wait_on(*read, name);
+                        waiting = true;
+                    }
+                }
+                continue;
+            }
             match self.digest(*read, name, out) {
                 Digest::Ready(None) if unanswered && *read != self.space_name && self.state(*read).is_none() && !self.dropped.contains(read) => unlisted = true,
                 Digest::Ready(now) => reads.push((*read, now.map_or(ABSENT, |now| now.out))),
                 Digest::Wait => waiting = true,
             }
         }
+        let shape_cells = core::mem::replace(&mut self.jobs.get_mut(&name).expect("a job").shape_cells, Vec::new_in(self.alloc));
+        let mut cells = Vec::with_capacity_in(shape_cells.len(), self.alloc);
+        for (read, cell) in shape_cells.iter() {
+            let now = match self.digest(*read, name, out) {
+                Digest::Ready(None) if unanswered && self.state(*read).is_none() && !self.dropped.contains(read) => {
+                    unlisted = true;
+                    continue;
+                }
+                Digest::Ready(now) => now,
+                Digest::Wait => {
+                    waiting = true;
+                    continue;
+                }
+            };
+            match self.cell_digest(*read, *cell, now, name, out) {
+                Ok(Some(saw)) => cells.push(CellRead { name: *read, cell: *cell, saw }),
+                Ok(None) => waiting = true,
+                Err(error) => {
+                    self.jobs.get_mut(&name).expect("a job").shape_cells = shape_cells;
+                    return Err(error);
+                }
+            }
+        }
         let job = self.jobs.get_mut(&name).expect("a job");
         job.shape = shape;
+        job.shape_cells = shape_cells;
         if waiting {
             job.state = State::Value;
+            for given in given_jobs.iter() {
+                self.add_job(*given, *given, None, false, self.walk)?;
+                self.wait_on(*given, name);
+            }
             return Ok(());
+        }
+        if miss {
+            if let Ok(released) = self.walked.binary_search(&name) {
+                self.walked.remove(released);
+            }
+            return self.to_run(name, out);
         }
         if unlisted {
             job.state = State::Value;
             self.unwalked.push(name);
             return Ok(());
         }
-        let at = key::value_key(job.key, &reads);
+        let at = key::value_key_with_cells(job.key, &reads, &cells);
         job.state = State::Valuing;
         if let Ok(released) = self.walked.binary_search(&name) {
             self.walked.remove(released);
@@ -2507,8 +3045,11 @@ impl<'a> Request<'a> {
                 }
                 let mut names = Vec::with_capacity_in(shape.names().len(), self.alloc);
                 names.extend(shape.names());
+                let mut cells = Vec::with_capacity_in(shape.cells().len(), self.alloc);
+                cells.extend(shape.cells());
                 let job = self.jobs.get_mut(&name).expect("a job");
                 job.shape = names;
+                job.shape_cells = cells;
                 job.state = State::Value;
                 self.value(name, out)
             }
@@ -2518,6 +3059,12 @@ impl<'a> Request<'a> {
     fn valued(&mut self, name: Name, key: Key, bytes: Option<&[u8]>, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         if self.state(name) != Some(State::Valuing) {
             return Ok(());
+        }
+        // An `Owners` record the store lacks is made by the machine, not run (`owners`).
+        if bytes.is_none() && name.kind == Kind::Owners {
+            self.owners_missed.insert(name);
+            self.set_state(name, State::Gather);
+            return self.owners(name, out);
         }
         let Some(bytes) = bytes else { return self.to_run(name, out) };
         match record::open(bytes).map_err(|error| DriveError::Wire { key, error })? {
@@ -2547,7 +3094,19 @@ impl<'a> Request<'a> {
         }
         // A read that found nothing is no hint: the task asks for it again if it still looks,
         // and a name that is not there would fail the run that was handed it.
-        let hints = self.current(name).map(|row| row.reads.iter().filter(|(_, saw)| *saw != ABSENT || self.plant == Plant::HintAbsentReads).map(|(n, _)| *n).collect_in(self.alloc));
+        let hints = self.current(name).map(|row| {
+            // What the command gives is no record to hand: the task reads it as given.
+            let mut hints: AVec<'a, Name> = row
+                .reads()
+                .iter()
+                .filter(|(n, saw)| n.kind != Kind::Given && (*saw != ABSENT || self.plant == Plant::HintAbsentReads))
+                .map(|(n, _)| n)
+                .collect_in(self.alloc);
+            // A cell read is of a record: the record is the hint, whatever the cell held (an
+            // absent cell of a record that is there is a read of that record).
+            hints.extend(row.cells().iter().filter(|read| read.saw != ABSENT || self.now.get(&read.name).is_some()).map(|read| read.name));
+            hints
+        });
         if let Some(hints) = hints {
             let job = self.jobs.get_mut(&name).expect("a job");
             job.needs.extend_from_slice(&hints);
@@ -2589,11 +3148,8 @@ impl<'a> Request<'a> {
             return Ok(());
         }
         if job.entries >= self.config.most_entries {
-            let mut last_needs = [None; 4];
-            for (slot, need) in last_needs.iter_mut().zip(job.needs.iter()) {
-                *slot = Some(*need);
-            }
-            return Err(DriveError::Reentries { name, key: job.key, entries: job.entries, last_needs });
+            let last = self.near_limit.get(&name).copied().unwrap_or_default();
+            return Err(DriveError::Reentries { name, key: job.key, entries: job.entries, last });
         }
         job.state = State::Queued;
         let class = job.class;
@@ -2603,6 +3159,7 @@ impl<'a> Request<'a> {
 
     fn stand(&mut self, name: Name, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         self.profile.of(name.kind).standing += 1;
+        self.jobs.get_mut(&name).expect("a job").stood = true;
         self.settle(name, None, false, out)
     }
 
@@ -2625,14 +3182,42 @@ impl<'a> Request<'a> {
         }
         reads.sort_unstable_by_key(|(read, _)| *read);
         reads.dedup_by_key(|(read, _)| *read);
+        // What the command gives, read by the task: the first read of one with no answer answers
+        // it; any other must agree.
+        for (read, saw) in reads.iter().filter(|(read, _)| read.kind == Kind::Given) {
+            self.given_read(*read, *saw, output.name)?;
+        }
         // A read whose digest is not today's makes a record valid for its own reads, stored,
         // but not the answer: the job is decided again.
         let mut stale = false;
         for (read, saw) in reads.iter() {
             match self.now.get(read) {
                 Some(now) if now.out == *saw => {}
-                None if *saw == ABSENT || self.old(*read).is_some_and(|row| row.out == *saw) => {}
+                None if *saw == ABSENT || self.old(*read).is_some_and(|row| row.out() == *saw) => {}
+                // Checked against what the command gives by `given_read` above.
+                _ if read.kind == Kind::Given => {}
                 _ => stale = true,
+            }
+        }
+        let mut cells = Vec::with_capacity_in(output.cells.len(), self.alloc);
+        for read in output.cells {
+            if self.cells.of(read.name.kind).is_none() {
+                return Err(DriveError::NoCells { name: read.name, by: output.name });
+            }
+            cells.push(CellRead { name: self.resolve_settled(read.name, &under), cell: read.cell, saw: read.saw });
+        }
+        cells.sort_unstable_by_key(|read| (read.name, read.cell));
+        cells.dedup_by_key(|read| (read.name, read.cell));
+        // A cell read is today's when the cell's digest was looked up in the record the name is
+        // settled at now; one not looked up yet is decided again, by value, which looks it up.
+        for read in cells.iter() {
+            let today = match self.now.get(&read.name) {
+                Some(now) => self.cells_now.get(&CellAt { name: read.name, cell: read.cell }).filter(|(at, _)| *at == now.at).map(|(_, saw)| *saw),
+                None if self.old(read.name).is_none() => Some(ABSENT),
+                None => None,
+            };
+            if today != Some(read.saw) {
+                stale = true;
             }
         }
         let whole = Whole {
@@ -2640,6 +3225,7 @@ impl<'a> Request<'a> {
             source,
             out: output.out,
             reads: &reads,
+            cells: &cells,
             parts: output.parts,
             paths: output.paths,
             findings: output.findings,
@@ -2647,16 +3233,16 @@ impl<'a> Request<'a> {
             split,
         };
         let bytes = record::write_whole(&whole, self.alloc);
-        let at = match reads.is_empty() {
+        let at = match reads.is_empty() && cells.is_empty() {
             true => key,
             // An `Owners` key holds no text its parents follow from, so its read names move
             // under one key: no shape there (it is never looked up by one, `decide`), only the
             // record at its value key, which its reads make unique.
-            false if output.name.kind == Kind::Owners => key::value_key(key, &reads),
+            false if output.name.kind == Kind::Owners => key::value_key_with_cells(key, &reads, &cells),
             false => {
-                let shape = record::write_shape(output.name, &reads, self.alloc);
+                let shape = record::write_shape(output.name, &reads, &cells, self.alloc);
                 self.put(key, shape, out);
-                key::value_key(key, &reads)
+                key::value_key_with_cells(key, &reads, &cells)
             }
         };
         // The view is of the bytes written: the same path as a found record (one home).
@@ -2679,7 +3265,7 @@ impl<'a> Request<'a> {
         out: &mut AVec<'_, Effect<'a>>,
     ) -> Result<(), DriveError> {
         let a = self.alloc;
-        let before = self.now.get(&name).copied().or_else(|| self.old(name).map(|row| Now { at: row.at, out: row.out }));
+        let before = self.now.get(&name).copied().or_else(|| self.old(name).map(|row| Now { at: row.at(), out: row.out() }));
         let job = self.jobs.get(&name).expect("a job");
         let (key, source, home, settles) = (job.key, job.source, job.home, job.settles);
         // A file's row keeps the edition it is read in (a repeat that does not run its home finds
@@ -2696,17 +3282,14 @@ impl<'a> Request<'a> {
             _ => (job.place, job.place),
         };
         if settles >= self.config.most_entries {
-            let mut last_needs = [None; 4];
-            for (slot, need) in last_needs.iter_mut().zip(job.needs.iter()) {
-                *slot = Some(*need);
-            }
-            return Err(DriveError::Reentries { name, key, entries: settles, last_needs });
+            let last = self.near_limit.get(&name).copied().unwrap_or_default();
+            return Err(DriveError::Reentries { name, key, entries: settles, last });
         }
         let mut parts_now = Vec::new_in(a.clone());
         let (base, condition) = self.cond_of(name);
         let cond = (condition != Condition::ANY).then_some((base, condition));
         let split = match &record {
-            None => self.current(name).and_then(|row| row.split),
+            None => self.current(name).and_then(|row| row.split()),
             Some((_, view)) => view.split,
         };
         if let Some(var) = split {
@@ -2716,16 +3299,24 @@ impl<'a> Request<'a> {
         let now = match &record {
             None => {
                 let row = self.current(name).expect("a standing job has a row");
-                parts_now.extend_from_slice(&row.parts);
-                Now { at: row.at, out: row.out }
+                parts_now.extend(row.parts().iter());
+                Now { at: row.at(), out: row.out() }
             }
             Some((at, view)) => {
                 let old = self.current(name);
-                // A name read absent before it existed keeps those readers (its watch row's).
-                let readers = self.new.get(&name).or_else(|| self.old_or_watch(name)).map(|row| row.readers.clone()).unwrap_or_else(|| Vec::new_in(a.clone()));
-                let old_parts = old.map(|row| row.parts.clone()).unwrap_or_else(|| Vec::new_in(a.clone()));
+                // A name read absent before it existed keeps those readers (its watch row's): the
+                // made row carries them to the page it is written into.
+                let held = self.new.get(&name).map(RowRef::Made).or_else(|| self.old_or_watch(name).map(RowRef::Old));
+                let readers = held.map(|row| row.readers().to_vec_in(a.clone())).unwrap_or_else(|| Vec::new_in(a.clone()));
+                let cell_readers = held.map(|row| row.cell_readers().to_vec_in(a.clone())).unwrap_or_else(|| Vec::new_in(a.clone()));
+                let old_parts = old.map(|row| row.parts().to_vec_in(a.clone())).unwrap_or_else(|| Vec::new_in(a.clone()));
                 let mut reads = Vec::with_capacity_in(view.reads().len(), a.clone());
                 reads.extend(view.reads());
+                let mut cells = Vec::with_capacity_in(view.cells().len(), a.clone());
+                cells.extend(view.cells());
+                // Today's digest of each cell its readers read, looked up once a cell while the
+                // bytes are in hand: what `dirty_readers` compares, and a value key reads.
+                self.look_up_cells(name, *at, view.payload, &cell_readers)?;
                 let mut parts = Vec::with_capacity_in(view.parts().len(), a.clone());
                 for part in view.parts() {
                     parts.push(part.name);
@@ -2754,6 +3345,12 @@ impl<'a> Request<'a> {
                                 continue;
                             }
                         }
+                        // A member's `Units` that another member's record lists (a dependency,
+                        // run_scope.rs) is the root units' part too: it goes only when the
+                        // root's listing drops it.
+                        if gone.kind == Kind::Units && name.kind == Kind::Units && name != Name::units() {
+                            continue;
+                        }
                         self.drop_name(*gone)?;
                     }
                 }
@@ -2776,6 +3373,17 @@ impl<'a> Request<'a> {
                         }
                     }
                 }
+                for read in cells.iter() {
+                    let entry = CellReader { reader: name, cell: read.cell, saw: read.saw };
+                    match self.posted_cells.get_mut(&read.name) {
+                        Some(list) => list.push(entry),
+                        None => {
+                            let mut list = Vec::new_in(a.clone());
+                            list.push(entry);
+                            self.posted_cells.insert(read.name, list);
+                        }
+                    }
+                }
                 let held = Held { file: if absent { home } else { file_of(base, home) }, place: held_place, base, condition, findings: hold(view, a.clone()) };
                 let is_error = self.config.is_error;
                 let errors = held.findings.iter().filter(|f| is_error(f.rule)).count();
@@ -2783,7 +3391,7 @@ impl<'a> Request<'a> {
                 self.found_errors(u32::try_from(errors).unwrap_or(u32::MAX), out);
                 self.new.insert(
                     name,
-                    Row { key, at: *at, source, out: view.out, home, place, reads, parts, readers, split, cond },
+                    Row { key, at: *at, source, out: view.out, home, place, reads, cells, parts, readers, cell_readers, split, cond },
                 );
                 Now { at: *at, out: view.out }
             }
@@ -2793,17 +3401,43 @@ impl<'a> Request<'a> {
         if name == Name::units() {
             // Standing or made, the root units' record is where the program's entry is.
             self.units_at = Some(now.at);
-            self.units_known(now.at, out);
+            self.program_known(out);
+        }
+        if Some(name) == self.program_name {
+            // Standing or made, the program's image: the certificate names it beside the units.
+            self.native_at = Some(now.at);
+            self.program_known(out);
         }
         self.note_parents(name, &parts_now);
+        // A `Units` record, standing or made, is one listing of `run`'s closure: a member it
+        // brings in releases the bodies held for it.
+        if name.kind == Kind::Units
+            && let Some(closure) = self.closure.as_mut()
+            && closure.listed(name, &parts_now)
+        {
+            self.release_held(out)?;
+        }
         // Every part of a record walked: a standing one stands on its row at no store read. A
-        // file's bodies wait for its owners: a job only under an asked root (`release`).
+        // file's bodies and lint units wait for its owners: a job only under an asked root
+        // (`release`), so a dependency's are never made.
         let gates = name.kind == Kind::FileItems && self.plant != Plant::EveryPartAJob;
         let file = self.cond_of(name).0;
         for part in parts_now.iter() {
+            // A part dropped earlier this run and listed again (its home made twice): it is a
+            // part again, entered from its start to find where it is now; a dropped name is
+            // otherwise never entered again (`dirty`).
+            let revived = self.plant != Plant::DirtyDropped && self.dropped.remove(part);
             match self.state(*part) {
-                None if gates && part.kind == Kind::BodyCheck => self.gate(file, *part, name),
+                None if gates && matches!(part.kind, Kind::BodyCheck | Kind::Signature | Kind::Lint) => self.gate(file, *part, name),
                 None => self.add_job(*part, name, None, false, self.walk)?,
+                Some(State::Settled) if revived => {
+                    self.set_state(*part, State::Start);
+                    let job = self.jobs.get_mut(part).expect("a job");
+                    job.recheck = true;
+                    job.locate = None;
+                    job.home = name;
+                    self.wake.push_back(*part);
+                }
                 Some(State::Start) => self.wake.push_back(*part),
                 Some(_) => {}
             }
@@ -2899,13 +3533,13 @@ impl<'a> Request<'a> {
             return true;
         }
         let name = owners::of(self.cond_of(file).0);
-        let other = |row: &Row<'a>| row.reads.iter().any(|(parent, _)| *parent != home && parent.kind != Kind::Owners);
+        let other = |row: RowRef<'_, 'a>| row.reads().iter().any(|(parent, _)| parent != home && parent.kind != Kind::Owners);
         if let Some(row) = self.new.get(&name) {
-            return other(row);
+            return other(RowRef::Made(row));
         }
         let Some(root) = self.root.as_ref() else { return false };
         match self.pages.get(&answers::page_of(name, root.bits)) {
-            Some(PageState::Loaded(page)) => page.get(&name).is_some_and(other),
+            Some(PageState::Loaded(page)) => page.view().row(name).is_some_and(|row| other(RowRef::Old(row))),
             _ => true,
         }
     }
@@ -2936,14 +3570,23 @@ impl<'a> Request<'a> {
             // It releases them as it settles.
             Some(_) => return Ok(()),
         }
-        let asked = match (self.now.get(&name).copied(), self.owner_roots.get(&name)) {
-            (None, _) => false,
-            (Some(_), Some(roots)) => roots.iter().any(|root| root.asked),
+        let closure = self.closure.as_ref();
+        let (asked, held) = match (self.now.get(&name).copied(), self.owner_roots.get(&name)) {
+            (None, _) => (false, false),
+            (Some(_), Some(roots)) => {
+                // Under `run`'s closure, a member's root it does not list yet is held: a record
+                // settled later may bring its member in (`release_held`).
+                let asked = roots.iter().any(|root| root.asked && closure.is_none_or(|closure| closure.asks(root.file)));
+                (asked, !asked && closure.is_some() && roots.iter().any(|root| root.asked))
+            }
             (Some(now), None) => {
                 self.load_roots(name, now.at, None, out);
                 return Ok(());
             }
         };
+        if held {
+            return Ok(());
+        }
         let bodies = self.gated.remove(&file).expect("checked above");
         if asked {
             for (body, home) in bodies.iter() {
@@ -2951,6 +3594,17 @@ impl<'a> Request<'a> {
                     self.add_job(*body, *home, None, false, self.walk)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// `run`'s closure grew: each file whose bodies are held is released again, in name order
+    /// (rule 25). Bounded: the closure grows at most once a member.
+    fn release_held(&mut self, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
+        let mut files: AVec<'a, Name> = self.gated.keys().copied().collect_in(self.alloc);
+        files.sort_unstable();
+        for file in files {
+            self.release(file, out)?;
         }
         Ok(())
     }
@@ -2996,7 +3650,7 @@ impl<'a> Request<'a> {
         home != name
             && self.state(home) == Some(State::Settled)
             && !self.parts_read.contains(&home)
-            && self.current(home).is_some_and(|row| row.parts.binary_search(&name).is_ok())
+            && self.current(home).is_some_and(|row| row.parts().binary_search(&name).is_ok())
     }
 
     fn read_parts(&mut self, home: Name, waiter: Name, out: &mut AVec<'_, Effect<'a>>) {
@@ -3013,7 +3667,7 @@ impl<'a> Request<'a> {
                     list.push(waiter);
                 }
                 self.parts_loading.insert(home, list);
-                let at = self.current(home).expect("checked by `parts_unread`").at;
+                let at = self.current(home).expect("checked by `parts_unread`").at();
                 self.get(at, Purpose::Parts(home), out);
             }
         }
@@ -3051,7 +3705,7 @@ impl<'a> Request<'a> {
             return self.drop_name(name);
         }
         let old_reads: Option<AVec<'a, Name>> =
-            self.current(name).map(|row| row.reads.iter().map(|(read, _)| *read).filter(|read| read.kind != Kind::Owners).collect_in(a));
+            self.current(name).map(|row| row.reads().iter().map(|(read, _)| read).filter(|read| read.kind != Kind::Owners).collect_in(a));
         // A first computation waits for the outline walk: the one barrier allowed (outlines
         // only, never a scope). A row's parents are known: no wait.
         if old_reads.is_none() && self.outlines_open > 0 {
@@ -3068,7 +3722,7 @@ impl<'a> Request<'a> {
             if let Some(reads) = &old_reads {
                 candidates.extend_from_slice(reads);
             }
-            let homes = [self.jobs.get(&file).map(|job| job.home), self.current(file).map(|row| row.home)];
+            let homes = [self.jobs.get(&file).map(|job| job.home), self.current(file).map(|row| row.home())];
             candidates.extend(homes.into_iter().flatten().filter(|home| *home != file));
         }
         candidates.sort_unstable();
@@ -3086,7 +3740,7 @@ impl<'a> Request<'a> {
                 Digest::Ready(None) => continue,
                 Digest::Ready(Some(now)) => now,
             };
-            if !self.current(parent).is_some_and(|row| row.parts.binary_search(&file).is_ok()) {
+            if !self.current(parent).is_some_and(|row| row.parts().binary_search(&file).is_ok()) {
                 continue;
             }
             listed = true;
@@ -3127,7 +3781,7 @@ impl<'a> Request<'a> {
         if waiting {
             return Ok(());
         }
-        if !listed && by_parent && self.current(file).is_some_and(|row| row.home != file) {
+        if !listed && by_parent && self.current(file).is_some_and(|row| row.home() != file) {
             // No home lists it any more: it goes, and its owners with it.
             self.drop_name(file)?;
             return self.drop_name(name);
@@ -3145,8 +3799,19 @@ impl<'a> Request<'a> {
         message.extend_from_slice(path);
         let finding = [Finding { rule: OWNERLESS_RULE, start: 0, end: 0, message: &message }];
         let findings: &[Finding<'_>] = if named { &finding } else { &[] };
-        let output = Output { name, out: owners::out_of(&roots), reads: &reads, parts: &[], paths: &[], findings, payload: &payload };
+        let output = Output { name, out: owners::out_of(&roots), reads: &reads, cells: &[], parts: &[], paths: &[], findings, payload: &payload };
         self.owner_roots.insert(name, roots.clone());
+        // Rule 77: the record these reads make may be in the store already (another worktree's
+        // walk of the same files, or this checkout's before an undo): its value key is its reads
+        // (`made_split`), so it is looked up there first and found, never written again. Only a
+        // miss makes it (`valued`). Written each time, a second worktree's cold check put its
+        // three `Owners` again (store_worktree_tests.rs, 2026-11-17).
+        if !self.owners_missed.remove(&name) && !reads.is_empty() {
+            let at = key::value_key_with_cells(self.jobs.get(&name).expect("a job").key, &reads, &[]);
+            self.set_state(name, State::Valuing);
+            self.get(at, Purpose::Value(name), out);
+            return Ok(());
+        }
         self.made(&output, out)
     }
 
@@ -3183,7 +3848,7 @@ impl<'a> Request<'a> {
                 continue;
             }
             if let Some(row) = self.current(gone) {
-                work.extend_from_slice(&row.parts);
+                work.extend(row.parts().iter());
             }
             self.gone_job(gone);
             self.dirty_readers(gone)?;
@@ -3207,39 +3872,215 @@ impl<'a> Request<'a> {
         self.wake_waiters(name);
     }
 
-    /// `name`'s out digest changed: every reader is checked again.
+    /// `name`'s out digest changed: every whole reader is checked again, and each cell reader
+    /// whose cell's digest today is not what it saw (cells.rs). A cell's digest today is the
+    /// one `look_up_cells` found in the record `name` is settled at; a name with no record
+    /// holds every cell `ABSENT`; one settled where no cell was looked up (it stood) dirties
+    /// every cell reader.
     fn dirty_readers(&mut self, name: Name) -> Result<(), DriveError> {
         if self.plant == Plant::SkipChangedRead {
             return Ok(());
         }
-        let mut readers = Vec::new_in(self.alloc);
-        if let Some(row) = self.old_or_watch(name) {
-            readers.extend_from_slice(&row.readers);
-        }
+        // The page is held by its count, not copied: the row's readers are walked in place while
+        // each one is dirtied (which may load other pages).
+        let page = self.held_page(name).cloned();
+        let row = page.as_ref().and_then(|page| page.view().row(name));
+        let settled_at = match self.dropped.contains(&name) {
+            true => None,
+            false => self.now.get(&name).map(|now| now.at),
+        };
+        // This run's few beside the row's: the readers posted, and each cell reader (the row's,
+        // in place, and those posted) whose cell moved; sorted once.
+        let mut more = Vec::new_in(self.alloc);
         if let Some(posted) = self.posted.get(&name) {
-            readers.extend_from_slice(posted);
+            more.extend_from_slice(posted);
         }
-        readers.sort_unstable();
-        readers.dedup();
-        for reader in readers.iter() {
-            if *reader != name {
-                self.dirty(*reader)?;
+        if let Some(row) = row {
+            for entry in row.cell_readers().iter() {
+                if self.cell_moved(name, settled_at, entry) {
+                    more.push(entry.reader);
+                }
+            }
+        }
+        if let Some(posted) = self.posted_cells.get(&name) {
+            for entry in posted.iter() {
+                if self.cell_moved(name, settled_at, *entry) {
+                    more.push(entry.reader);
+                }
+            }
+        }
+        more.sort_unstable();
+        more.dedup();
+        // The row's readers (sorted) and those, two sorted sequences merged: each distinct
+        // reader dirtied once, in name order.
+        let held = row.map(|row| row.readers());
+        let held_len = held.map_or(0, |held| held.len());
+        let (mut i, mut j) = (0, 0);
+        let mut last = None;
+        loop {
+            let h = match held {
+                Some(held) if i < held_len => Some(held.get(i)),
+                _ => None,
+            };
+            let next = match (h, more.get(j).copied()) {
+                (Some(h), Some(m)) if h == m => {
+                    i += 1;
+                    j += 1;
+                    h
+                }
+                (Some(h), Some(m)) if h < m => {
+                    i += 1;
+                    h
+                }
+                (Some(h), None) => {
+                    i += 1;
+                    h
+                }
+                (_, Some(m)) => {
+                    j += 1;
+                    m
+                }
+                (None, None) => break,
+            };
+            if last == Some(next) {
+                continue;
+            }
+            last = Some(next);
+            if next != name {
+                self.dirty(next)?;
             }
         }
         Ok(())
     }
 
+    /// Whether a cell reader of `name` saw other than what its cell holds today
+    /// ([`Request::dirty_readers`]); `settled_at` is the record `name` is settled at, `None` for
+    /// one with no record (every cell `ABSENT`).
+    fn cell_moved(&self, name: Name, settled_at: Option<Key>, entry: CellReader) -> bool {
+        let today = match settled_at {
+            None => Some(ABSENT),
+            Some(at) => self.cells_now.get(&CellAt { name, cell: entry.cell }).filter(|(held, _)| *held == at).map(|(_, saw)| *saw),
+        };
+        match self.plant {
+            Plant::CellMovedNotDirtied => false,
+            Plant::CellsAsWhole => true,
+            _ => today != Some(entry.saw),
+        }
+    }
+
+    /// Looks up, in the record of `name` at `at` (its payload in hand), each cell a reader of it
+    /// read: its old row's cell readers and those posted this run. Each distinct cell is looked
+    /// up once.
+    fn look_up_cells(&mut self, name: Name, at: Key, payload: &[u8], held: &[CellReader]) -> Result<(), DriveError> {
+        let mut wanted: AVec<'a, Cell> = held.iter().map(|entry| entry.cell).collect_in(self.alloc);
+        if let Some(posted) = self.posted_cells.get(&name) {
+            wanted.extend(posted.iter().map(|entry| entry.cell));
+        }
+        if let Some((cells, _)) = self.cells_loading.get(&name) {
+            wanted.extend_from_slice(cells);
+        }
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        wanted.sort_unstable();
+        wanted.dedup();
+        self.cells_in(name, at, payload, &wanted)
+    }
+
+    /// Each of `cells` of the record of `name` at `at`, by its kind's lookup, into `cells_now`.
+    fn cells_in(&mut self, name: Name, at: Key, payload: &[u8], cells: &[Cell]) -> Result<(), DriveError> {
+        let Some(of) = self.cells.of(name.kind) else {
+            return Err(DriveError::NoCells { name, by: name });
+        };
+        for cell in cells.iter() {
+            let seen = of(payload, *cell).map_err(|refused| DriveError::CellRefused { name, cell: *cell, what: refused.what })?;
+            self.cells_now.insert(CellAt { name, cell: *cell }, (at, seen.digest()));
+        }
+        Ok(())
+    }
+
+    /// Today's digest of `cell` of `read`, settled as `now`: `Ok(None)` while its record is read
+    /// for it (`Purpose::Cells`), `waiter` woken when it is in.
+    fn cell_digest(&mut self, read: Name, cell: Cell, now: Option<Now>, waiter: Name, out: &mut AVec<'_, Effect<'a>>) -> Result<Option<ContentId>, DriveError> {
+        let Some(now) = now else { return Ok(Some(Seen::Absent.digest())) };
+        match self.cells_now.get(&CellAt { name: read, cell }).copied() {
+            Some((at, saw)) if at == now.at => return Ok(Some(saw)),
+            _ => {}
+        }
+        if self.cells.of(read.kind).is_none() {
+            return Err(DriveError::NoCells { name: read, by: waiter });
+        }
+        let parked = self.park(waiter);
+        match self.cells_loading.get_mut(&read) {
+            Some((cells, waiters)) => {
+                cells.push(cell);
+                if parked {
+                    waiters.push(waiter);
+                }
+            }
+            None => {
+                let mut cells = Vec::new_in(self.alloc);
+                cells.push(cell);
+                let mut waiters = Vec::new_in(self.alloc);
+                if parked {
+                    waiters.push(waiter);
+                }
+                self.cells_loading.insert(read, (cells, waiters));
+                self.get(now.at, Purpose::Cells(read), out);
+            }
+        }
+        Ok(None)
+    }
+
+    fn cells_got(&mut self, name: Name, key: Key, bytes: Option<&[u8]>) -> Result<(), DriveError> {
+        // The name is settled at this record: the store lost it, which no rebuild here repairs.
+        let Some(bytes) = bytes else {
+            return Err(DriveError::Wire { key, error: WireError { what: "cell-read record", at: 0, why: crate::wire::WireWhy::Short } });
+        };
+        let view = match record::open(bytes).map_err(|error| DriveError::Wire { key, error })? {
+            Stored::Whole(view) if view.name == name => view,
+            Stored::Whole(view) => return Err(DriveError::WrongRecord { key, asked: name, held: view.name }),
+            Stored::Shape(shape) => return Err(DriveError::WrongRecord { key, asked: name, held: shape.name }),
+        };
+        let Some((mut cells, waiters)) = self.cells_loading.remove(&name) else { return Ok(()) };
+        cells.sort_unstable();
+        cells.dedup();
+        self.cells_in(name, key, view.payload, &cells)?;
+        for waiter in waiters.iter() {
+            self.wake.push_back(*waiter);
+        }
+        Ok(())
+    }
+
     fn dirty(&mut self, name: Name) -> Result<(), DriveError> {
+        // A name its home dropped this run is settled with no record, and its readers were
+        // dirtied as it went (`drop_name`): a read of its that moves enters nothing again. Entered
+        // again it was decided and run as a part no home lists, and its run's answer is for
+        // nothing (`ran`), so the job stayed out with nothing out: the request stopped as a
+        // `NeedCycle` of that one body (a removed fn's body, which read its file's moved
+        // `Surface` and another input, 2026-11-17). A home that lists it again revives it
+        // (`settle`).
+        if self.dropped.contains(&name) && self.plant != Plant::DirtyDropped {
+            return Ok(());
+        }
         match self.state(name) {
             None => {
-                let home = self.old(name).map_or(name, |row| row.home);
+                let home = self.old(name).map_or(name, |row| row.home());
                 self.add_job(name, home, None, false, self.walk)?;
                 if let Some(job) = self.jobs.get_mut(&name) {
                     job.recheck = true;
                 }
             }
             Some(State::Settled) => {
-                self.jobs.get_mut(&name).expect("a job").recheck = true;
+                let job = self.jobs.get_mut(&name).expect("a job");
+                job.recheck = true;
+                // A job that stood and is decided again did not stand: every part of a re-made
+                // home stands at once on its row, before the read that dirties it settles, so
+                // without this a dirtied reader found by value still counted as standing.
+                if core::mem::replace(&mut job.stood, false) {
+                    let counts = self.profile.of(name.kind);
+                    counts.standing = counts.standing.saturating_sub(1);
+                }
                 self.set_state(name, State::Decide);
                 self.unsettle(name);
                 self.wake.push_back(name);
@@ -3302,11 +4143,19 @@ impl<'a> Request<'a> {
     /// certificate and `last`, then print.
     fn finish(&mut self, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         let a = self.alloc;
+        // `run`'s closure never saw the program package's record: it asked nothing, so no check
+        // covers the program. A failure by name (rule 3), never a start over it.
+        if let Some(closure) = self.closure.as_ref()
+            && !closure.found()
+        {
+            let why = Why::Refused { what: "the program package, which no units record lists", rule: "run_scope.rs" };
+            self.failures.push(TaskFailure { name: closure.package(), why });
+        }
         // Items by how many conditions they were answered under: each settled record that is
         // not a split is one condition of its base.
         let mut per_item: Table<Name, u32, Alloc<'a>> = Table::new_in(a.clone());
         for (name, job) in self.jobs.iter() {
-            if job.state == State::Settled && name.kind != Kind::Group && self.current(*name).is_some_and(|row| row.split.is_none()) {
+            if job.state == State::Settled && name.kind != Kind::Group && self.current(*name).is_some_and(|row| row.split().is_none()) {
                 let base = self.cond_of(*name).0;
                 let n = per_item.get(&base).copied().unwrap_or(0);
                 per_item.insert(base, n + 1);
@@ -3322,22 +4171,51 @@ impl<'a> Request<'a> {
         for (name, row) in self.new.iter() {
             let old = self.old(*name);
             for (read, _) in row.reads.iter() {
-                if !old.is_some_and(|old| has(&old.reads, read)) {
+                if !old.is_some_and(|old| old.reads().binary_search_by_key(read, |(r, _)| r).is_ok()) {
                     updates.push((*read, *name, true));
                 }
             }
             if let Some(old) = old {
-                for (read, _) in old.reads.iter() {
-                    if !has(&row.reads, read) {
-                        updates.push((*read, *name, false));
+                for (read, _) in old.reads().iter() {
+                    if !has(&row.reads, &read) {
+                        updates.push((read, *name, false));
                     }
                 }
             }
         }
         for gone in self.dropped.iter() {
             if let Some(old) = self.old(*gone) {
-                for (read, _) in old.reads.iter() {
-                    updates.push((*read, *gone, false));
+                for (read, _) in old.reads().iter() {
+                    updates.push((read, *gone, false));
+                }
+            }
+        }
+        // The reverse index of part reads the same way, an entry being (reader, cell, what it
+        // saw): a reader that saw its cell move is one entry out and one in.
+        let mut cell_updates: Vec<(Name, CellReader, bool), Alloc<'a>> = Vec::new_in(a.clone());
+        let reader_of = |name: Name, read: &CellRead| (read.name, CellReader { reader: name, cell: read.cell, saw: read.saw });
+        for (name, row) in self.new.iter() {
+            let old = self.old(*name);
+            for read in row.cells.iter() {
+                if !old.is_some_and(|old| old.cells().binary_search(read).is_ok()) {
+                    let (target, entry) = reader_of(*name, read);
+                    cell_updates.push((target, entry, true));
+                }
+            }
+            if let Some(old) = old {
+                for read in old.cells().iter() {
+                    if row.cells.binary_search(&read).is_err() {
+                        let (target, entry) = reader_of(*name, &read);
+                        cell_updates.push((target, entry, false));
+                    }
+                }
+            }
+        }
+        for gone in self.dropped.iter() {
+            if let Some(old) = self.old(*gone) {
+                for read in old.cells().iter() {
+                    let (target, entry) = reader_of(*gone, &read);
+                    cell_updates.push((target, entry, false));
                 }
             }
         }
@@ -3359,7 +4237,7 @@ impl<'a> Request<'a> {
         match old_bits {
             Some(old_bits) if old_bits != bits => wanted.extend(0..(1u32 << old_bits)),
             Some(old_bits) => {
-                for name in self.new.keys().chain(self.dropped.iter()).chain(updates.iter().map(|(t, _, _)| t)) {
+                for name in self.new.keys().chain(self.dropped.iter()).chain(updates.iter().map(|(t, _, _)| t)).chain(cell_updates.iter().map(|(t, _, _)| t)) {
                     wanted.push(answers::page_of(*name, old_bits));
                 }
             }
@@ -3378,7 +4256,7 @@ impl<'a> Request<'a> {
         let mut loading = false;
         for (index, key) in requests.iter() {
             if *key == Key::default() {
-                self.pages.insert(*index, PageState::Loaded(SortedMap::new_in(a.clone())));
+                self.pages.insert(*index, PageState::Loaded(HeldPage::empty()));
             } else {
                 self.pages.insert(*index, PageState::Loading);
                 self.get(*key, Purpose::Page(*index), out);
@@ -3396,84 +4274,56 @@ impl<'a> Request<'a> {
                 if self.new.get(name).is_some_and(|row| row.watching()) {
                     continue;
                 }
-                let Some(was) = self.new.get(name).or_else(|| self.old_or_watch(*name)) else { continue };
-                if was.readers.is_empty() {
+                let Some(was) = self.new.get(name).map(RowRef::Made).or_else(|| self.old_or_watch(*name).map(RowRef::Old)) else { continue };
+                if was.readers().is_empty() && was.cell_readers().is_empty() {
                     continue;
                 }
-                let readers = was.readers.clone();
-                self.new.insert(*name, watch_row(*name, readers, a.clone()));
+                let (readers, cell_readers) = (was.readers().to_vec_in(a.clone()), was.cell_readers().to_vec_in(a.clone()));
+                self.new.insert(*name, watch_row(*name, readers, cell_readers, a.clone()));
             }
         }
-        // Apply the reverse index's updates: sorted by target once, then each target's readers
-        // rebuilt in one merge, so a name read by r readers costs O(r + its updates), never an
-        // insert per update.
+        // The reverse index's updates, sorted by target once: each target's slice is merged with
+        // its row's readers as its page is written (`answers::write_page`), so a name read by r
+        // readers costs O(r + its updates), and no old row is copied to take them.
         updates.sort_unstable();
-        let mut at = 0;
-        while at < updates.len() {
-            let target = updates[at].0;
-            let end = at + updates[at..].iter().take_while(|(t, _, _)| *t == target).count();
-            let group = &updates[at..end];
-            at = end;
-            // A target with no record (never made, or dropped this run) keeps its readers in a
-            // watch row: a read that found nothing is a read, so the name's appearing reruns
-            // them (rule 21). The planted bug forgets them.
-            let dropped = self.dropped.contains(&target);
-            if self.new.get(&target).is_none_or(|row| dropped && !row.watching()) {
-                let held = match dropped {
-                    false => self.old_or_watch(target).cloned(),
-                    true => None,
-                };
-                let row = match held {
-                    Some(row) => row,
-                    None if self.plant == Plant::ForgetAbsentReaders => continue,
-                    None => watch_row(target, Vec::new_in(a.clone()), a.clone()),
-                };
-                self.new.insert(target, row);
+        cell_updates.sort_unstable();
+        // A `Given` name's watch row keeps what the command gave this time as its `out`: the
+        // next command's seed of it dirties its readers only when that moved (`given`).
+        let given: Vec<(Name, ContentId), Alloc<'a>> = self
+            .jobs
+            .iter()
+            .filter(|(name, job)| name.kind == Kind::Given && job.state == State::Settled && !self.given_unknown.contains(name))
+            .map(|(name, _)| (*name, self.now.get(name).map_or(ABSENT, |now| now.out)))
+            .collect_in(a.clone());
+        for (name, today) in given.iter() {
+            if let Some(row) = self.new.get_mut(name) {
+                row.out = *today;
+                continue;
             }
-            let row = self.new.get_mut(&target).expect("inserted above");
-            let mut readers = Vec::with_capacity_in(row.readers.len() + group.len(), a.clone());
-            let (mut i, mut j) = (0, 0);
-            while i < row.readers.len() || j < group.len() {
-                let held = row.readers.get(i).copied();
-                let update = group.get(j).map(|(_, reader, add)| (*reader, *add));
-                match (held, update) {
-                    (Some(h), Some((u, add))) if u == h => {
-                        // Removed, or added again: an add keeps it once.
-                        if add {
-                            readers.push(h);
-                        }
-                        i += 1;
-                        j += 1;
-                    }
-                    (Some(h), Some((u, _))) if h < u => {
-                        readers.push(h);
-                        i += 1;
-                    }
-                    (Some(h), None) => {
-                        readers.push(h);
-                        i += 1;
-                    }
-                    (_, Some((u, add))) => {
-                        if add && readers.last() != Some(&u) {
-                            readers.push(u);
-                        }
-                        j += 1;
-                    }
-                    (None, None) => break,
+            let held = self.old_or_watch(*name).map(|row| (row.out() != *today).then(|| row.to_row(a.clone())));
+            match held {
+                Some(Some(mut row)) => {
+                    row.out = *today;
+                    self.new.insert(*name, row);
                 }
-            }
-            row.readers = readers;
-            // A watch row no one reads any more goes.
-            if row.watching() && row.readers.is_empty() {
-                self.new.remove(&target);
-                self.dropped.insert(target);
+                Some(None) => {}
+                // A name first read this run: the watch row its readers make carries today's out.
+                None if self.plant != Plant::ForgetAbsentReaders
+                    && (updates.binary_search_by_key(name, |(t, _, _)| *t).is_ok() || cell_updates.binary_search_by_key(name, |(t, _, _)| *t).is_ok()) =>
+                {
+                    let mut row = watch_row(*name, Vec::new_in(a.clone()), Vec::new_in(a.clone()), a.clone());
+                    row.out = *today;
+                    self.new.insert(*name, row);
+                }
+                None => {}
             }
         }
-        // The touched pages, rewritten whole, and the root.
+        // The touched pages, rewritten whole, and the root: those of the rows made or dropped
+        // and of each update's target; a page none of them is on is not rewritten.
         let mut touched = Vec::new_in(a.clone());
         match old_bits {
             Some(old_bits) if old_bits == bits => {
-                for name in self.new.keys().chain(self.dropped.iter()) {
+                for name in self.new.keys().chain(self.dropped.iter()).chain(updates.iter().map(|(t, _, _)| t)).chain(cell_updates.iter().map(|(t, _, _)| t)) {
                     touched.push(answers::page_of(*name, bits));
                 }
             }
@@ -3489,52 +4339,71 @@ impl<'a> Request<'a> {
                 keys
             }
         };
-        // Every row of a touched page, bucketed by page once: O(rows), not pages x rows.
-        let mut buckets: Table<u32, Vec<(Name, Row<'a>), Alloc<'a>>, Alloc<'a>> = Table::new_in(a.clone());
-        let bucket = |buckets: &mut Table<u32, Vec<(Name, Row<'a>), Alloc<'a>>, Alloc<'a>>, name: Name, row: &Row<'a>| {
-            let index = answers::page_of(name, bits);
-            if touched.binary_search(&index).is_err() {
-                return;
-            }
-            match buckets.get_mut(&index) {
-                Some(list) => list.push((name, row.clone())),
-                None => {
-                    let mut list = Vec::new_in(a.clone());
-                    list.push((name, row.clone()));
-                    buckets.insert(index, list);
-                }
-            }
-        };
+        // Every row of a touched page, bucketed by page once: O(rows), not pages x rows. Each is
+        // a base read in place (an old row is never copied) and its slices of the updates.
+        let mut buckets: Table<u32, Vec<PageRow<'_, 'a>, Alloc<'a>>, Alloc<'a>> = Table::new_in(a.clone());
         for state in self.pages.values() {
             if let PageState::Loaded(old) = state {
-                for (name, row) in old.iter() {
-                    if !self.dropped.contains(name) && !self.new.contains_key(name) {
-                        bucket(&mut buckets, *name, row);
+                for row in old.view().rows() {
+                    let name = row.name();
+                    if !self.dropped.contains(&name) && !self.new.contains_key(&name) {
+                        bucket_row(&mut buckets, &touched, bits, page_row(name, Some(RowRef::Old(row)), &updates, &cell_updates), a.clone());
                     }
                 }
             }
         }
         for (name, row) in self.new.iter() {
             if !self.dropped.contains(name) || row.watching() {
-                bucket(&mut buckets, *name, row);
+                bucket_row(&mut buckets, &touched, bits, page_row(*name, Some(RowRef::Made(row)), &updates, &cell_updates), a.clone());
             }
         }
+        // A target with no record (never made, or dropped this run) keeps its readers in a watch
+        // row: a read that found nothing is a read, so the name's appearing reruns them (rule
+        // 21). The planted bug forgets them. A target with a row above is the same row again.
+        let mut last = None;
+        for target in updates.iter().map(|(t, _, _)| *t).chain(cell_updates.iter().map(|(t, _, _)| *t)) {
+            if last == Some(target) {
+                continue;
+            }
+            last = Some(target);
+            let dropped = self.dropped.contains(&target);
+            let base = match self.new.get(&target) {
+                Some(row) if !(dropped && !row.watching()) => Some(RowRef::Made(row)),
+                _ => match (dropped, self.old_or_watch(target)) {
+                    (false, Some(view)) => Some(RowRef::Old(view)),
+                    _ if self.plant == Plant::ForgetAbsentReaders => continue,
+                    _ => None,
+                },
+            };
+            bucket_row(&mut buckets, &touched, bits, page_row(target, base, &updates, &cell_updates), a.clone());
+        }
+        // Written while the rows are borrowed; stored after.
+        let mut written: Vec<(u32, Option<AVec<'a, u8>>), Alloc<'a>> = Vec::with_capacity_in(touched.len(), a.clone());
+        let mut unread: Vec<Name, Alloc<'a>> = Vec::new_in(a.clone());
         for index in touched.iter() {
-            let mut rows = buckets.remove(index).unwrap_or_else(|| Vec::new_in(a.clone()));
-            rows.sort_unstable_by_key(|(name, _)| *name);
-            rows.dedup_by_key(|(name, _)| *name);
-            let page: Page<'a> = SortedMap::from_sorted(rows).expect("sorted and deduplicated above");
-            let key = match page.is_empty() {
-                true => Key::default(),
-                false => {
-                    let bytes = answers::write_page(page.iter(), a.clone());
+            let mut page_rows = buckets.remove(index).unwrap_or_else(|| Vec::new_in(a.clone()));
+            page_rows.sort_unstable_by_key(|row| row.name);
+            page_rows.dedup_by_key(|row| row.name);
+            // A watch row no one reads any more, whole or by cell, goes.
+            unread.extend(page_rows.iter().filter(|row| !row.kept()).map(|row| row.name));
+            written.push((*index, answers::write_page(&page_rows, a.clone())));
+        }
+        drop(buckets);
+        for target in unread.iter() {
+            self.new.remove(target);
+            self.dropped.insert(*target);
+        }
+        for (index, bytes) in written {
+            let key = match bytes {
+                None => Key::default(),
+                Some(bytes) => {
                     let key = key::content_key(&bytes);
                     self.profile.pages_written += 1;
                     self.put(key, bytes, out);
                     key
                 }
             };
-            page_keys[*index as usize] = key;
+            page_keys[index as usize] = key;
         }
         let root = Root { bits, rows, pages: page_keys };
         let root_bytes = answers::write_root(&root, a.clone());
@@ -3592,19 +4461,31 @@ impl<'a> Request<'a> {
                 }
             }
         }
-        let units = self.units_at.or_else(|| self.old(Name::units()).map(|row| row.at));
-        let cert = write_cert(&all, root_key, units, a.clone());
+        let units = self.units_at.or_else(|| self.old(Name::units()).map(|row| row.at()));
+        let native = self.native_at.or_else(|| self.program_name.and_then(|name| self.old(name)).map(|row| row.at()));
+        let cert = write_cert(&all, root_key, units, native, a.clone());
         // Keyed by the files this answer read, the leaf table the cli writes beside it: the next
         // request's `Start` hands exactly these when none changed (`Request::holds`).
         let mut held_files = Vec::with_capacity_in(self.files.len(), a.clone());
         for i in 0..self.files.len() {
             let path = self.path(i as u32);
             if self.holds(path) {
-                held_files.push((path, self.files.ids()[i]));
+                held_files.push((self.files.subjects()[i], self.files.ids()[i]));
             }
         }
-        held_files.sort_unstable_by(|x, y| x.0.cmp(y.0));
-        let read = self.cert_of(held_files.iter().map(|(path, id)| (*path, id)));
+        // A file read by content only that the sweep did not hand (its first read: the cli
+        // joins it to the leaf table beside this answer, and the next `Start` hands it) is a
+        // file this answer read, present as it saw it. Left out, the key named the checkout
+        // without it, so a later sweep with the file gone met this certificate and every reader
+        // of it stood (sim_given's removal case, `Some(1) to None`). An absent read is left out
+        // on both sides: absence is omission. The ask's facts are keyed by `facts_digest`.
+        for (name, now) in self.now.iter() {
+            let content = name.kind == Kind::Given && self.facts.binary_search_by(|(fact, _)| fact.cmp(name)).is_err();
+            if content && now.out != ABSENT && self.file_index(&name.subject).is_none() {
+                held_files.push((name.subject, now.out));
+            }
+        }
+        let read = self.cert_of(&mut held_files);
         drop(held_files);
         // A failed task leaves a hole in the answer: neither the certificate nor `last` is
         // written, so the next command walks from the last whole answer and runs it again.
@@ -3623,8 +4504,9 @@ impl<'a> Request<'a> {
         }
         // Every finding of the answer counts, the stood ones too: an unchanged item's error is
         // still an error of the scope. One finding held by two names counts once (`print`).
-        let (count, errors) = self.print(&all, out);
+        let (count, errors, unchecked) = self.print(&all, out);
         self.errors = errors;
+        self.unchecked = unchecked;
         if self.gate == Gate::Beside && self.program == Program::Running && self.errors > 0 {
             self.program = Program::Stopped;
             out.push(Effect::Stop { errors: self.errors });
@@ -3635,14 +4517,14 @@ impl<'a> Request<'a> {
         Ok(())
     }
 
-    /// `Print` effects for `held`, sorted by path and position; how many, and how many of them
-    /// are errors. An item's or a manifest's finding is its own: its name is where it is. A
-    /// crate's finding carries its file and item in its words, so it is its rule, range, words
+    /// `Print` effects for `held`, sorted by path and position; how many, how many of them are
+    /// errors, and how many say their item was not checked (`is_unchecked`). An item's or a
+    /// manifest's finding is its own: its name is where it is. A crate's finding carries its file and item in its words, so it is its rule, range, words
     /// and condition, whichever crate's record holds it: two crates holding one finding (a
     /// library and its test unit each resolve the same `use` of the same file) print it once
     /// and count it once, as the name first in the order. (Owed: `test` as a variable of one
     /// crate's condition, "One check covers every configuration", so there is one record.)
-    fn print(&self, held: &SortedMap<Name, Held<'a>, Alloc<'a>>, out: &mut AVec<'_, Effect<'a>>) -> (u32, u32) {
+    fn print(&self, held: &SortedMap<Name, Held<'a>, Alloc<'a>>, out: &mut AVec<'_, Effect<'a>>) -> (u32, u32, u32) {
         // (path, place, name, the finding's index in its record, file, the record's findings).
         let mut order = Vec::with_capacity_in(held.len(), self.alloc);
         for (name, entry) in held.iter() {
@@ -3680,7 +4562,8 @@ impl<'a> Request<'a> {
             }
         }
         let is_error = self.config.is_error;
-        let (mut count, mut errors) = (0, 0);
+        let is_unchecked = self.is_unchecked;
+        let (mut count, mut errors, mut unchecked) = (0, 0, 0);
         for (at, (_, place, _, nth, file, entry)) in order.iter().enumerate() {
             if again[at] {
                 continue;
@@ -3700,8 +4583,9 @@ impl<'a> Request<'a> {
             }));
             count += 1;
             errors += u32::from(is_error(finding.rule));
+            unchecked += u32::from(is_unchecked(finding.rule));
         }
-        (count, errors)
+        (count, errors, unchecked)
     }
 }
 
@@ -3747,7 +4631,7 @@ fn over_cap_message(buf: &mut [u8; MESSAGE_BYTES], span: u32, under: &Condition,
 }
 
 /// A watch row for `name` ([`Row::watching`]): no record, its readers only.
-fn watch_row<'a>(name: Name, readers: Vec<Name, Alloc<'a>>, alloc: Alloc<'a>) -> Row<'a> {
+fn watch_row<'a>(name: Name, readers: Vec<Name, Alloc<'a>>, cell_readers: Vec<CellReader, Alloc<'a>>, alloc: Alloc<'a>) -> Row<'a> {
     Row {
         key: Key::default(),
         at: Key::default(),
@@ -3756,10 +4640,40 @@ fn watch_row<'a>(name: Name, readers: Vec<Name, Alloc<'a>>, alloc: Alloc<'a>) ->
         home: name,
         place: 0,
         reads: Vec::new_in(alloc.clone()),
+        cells: Vec::new_in(alloc.clone()),
         parts: Vec::new_in(alloc),
         readers,
+        cell_readers,
         split: None,
         cond: None,
+    }
+}
+
+/// The slice of the sorted `all` whose target is `name`: binary searched, never scanned.
+fn updates_of<T>(all: &[(Name, T, bool)], name: Name) -> &[(Name, T, bool)] {
+    let start = all.partition_point(|(target, _, _)| *target < name);
+    let end = start + all[start..].partition_point(|(target, _, _)| *target == name);
+    &all[start..end]
+}
+
+/// `name`'s row of a page being written: `base` and its slices of the sorted updates.
+fn page_row<'r, 'x>(name: Name, base: Option<RowRef<'r, 'x>>, updates: &'r [(Name, Name, bool)], cell_updates: &'r [(Name, CellReader, bool)]) -> PageRow<'r, 'x> {
+    PageRow { name, base, readers: updates_of(updates, name), cell_readers: updates_of(cell_updates, name) }
+}
+
+/// `row` into its page's bucket, when that page is one of the `touched` (sorted).
+fn bucket_row<'r, 'x, 'b>(buckets: &mut Table<u32, Vec<PageRow<'r, 'x>, Alloc<'b>>, Alloc<'b>>, touched: &[u32], bits: u8, row: PageRow<'r, 'x>, alloc: Alloc<'b>) {
+    let index = answers::page_of(row.name, bits);
+    if touched.binary_search(&index).is_err() {
+        return;
+    }
+    match buckets.get_mut(&index) {
+        Some(list) => list.push(row),
+        None => {
+            let mut list = Vec::new_in(alloc);
+            list.push(row);
+            buckets.insert(index, list);
+        }
     }
 }
 
@@ -3790,12 +4704,15 @@ fn hold<'a>(view: &WholeView<'_>, alloc: Alloc<'a>) -> Vec<HeldFinding<'a>, Allo
 }
 
 /// The certificate: the answer's root (so one that stands can write `last` naming it), the
-/// units' record (so a repeat `run` starts at one read), then every finding of the answer.
-fn write_cert<'a>(held: &SortedMap<Name, Held<'a>, Alloc<'a>>, root: Key, units: Option<Key>, alloc: Alloc<'a>) -> Vec<u8, Alloc<'a>> {
+/// units' record (so a repeat `run` starts at one read), the program's `Native` record (so it
+/// takes its image with no walk), then every finding of the answer.
+fn write_cert<'a>(held: &SortedMap<Name, Held<'a>, Alloc<'a>>, root: Key, units: Option<Key>, native: Option<Key>, alloc: Alloc<'a>) -> Vec<u8, Alloc<'a>> {
     let mut w = Writer::new_in(CERT_MAGIC, alloc);
     w.raw(&root.0.0);
-    w.u32(u32::from(units.is_some()));
-    w.raw(&units.unwrap_or_default().0.0);
+    for at in [units, native] {
+        w.u32(u32::from(at.is_some()));
+        w.raw(&at.unwrap_or_default().0.0);
+    }
     w.count(held.len());
     for (name, entry) in held.iter() {
         w.name(*name);
@@ -3814,18 +4731,23 @@ fn write_cert<'a>(held: &SortedMap<Name, Held<'a>, Alloc<'a>>, root: Key, units:
     w.finish()
 }
 
-/// A certificate read: the answer's root, the units' record, the findings.
-type Cert<'a> = (Key, Option<Key>, SortedMap<Name, Held<'a>, Alloc<'a>>);
+/// A certificate read: the answer's root, the units' record, the program's `Native` record, the
+/// findings.
+type Cert<'a> = (Key, Option<Key>, Option<Key>, SortedMap<Name, Held<'a>, Alloc<'a>>);
 
 fn read_cert<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Result<Cert<'a>, WireError> {
     let mut r = Reader::new(bytes, CERT_MAGIC, "certificate")?;
     let mut root = [0u8; 32];
     root.copy_from_slice(r.take_bytes(32)?);
     let root = Key(ContentId(root));
-    let has_units = r.u32()? == 1;
-    let mut units = [0u8; 32];
-    units.copy_from_slice(r.take_bytes(32)?);
-    let units = has_units.then_some(Key(ContentId(units)));
+    let mut keys = [None; 2];
+    for at in keys.iter_mut() {
+        let has = r.u32()? == 1;
+        let mut key = [0u8; 32];
+        key.copy_from_slice(r.take_bytes(32)?);
+        *at = has.then_some(Key(ContentId(key)));
+    }
+    let [units, native] = keys;
     let n = r.count(NAME_BYTES * 3 + 1 + 8)?;
     let mut entries = Vec::with_capacity_in(n, alloc.clone());
     for _ in 0..n {
@@ -3849,5 +4771,5 @@ fn read_cert<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Result<Cert<'a>, WireError> 
     }
     r.done()?;
     let held = SortedMap::from_sorted(entries).map_err(|_| r.error(crate::wire::WireWhy::Unsorted))?;
-    Ok((root, units, held))
+    Ok((root, units, native, held))
 }

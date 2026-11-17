@@ -1,0 +1,14 @@
+{
+ "id": "op-bare-plain-name-arg",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane OP",
+ "where": "crates/blaze-ladder/src/front2/buckets.rs (file: the impl's `bare` flag) over types.rs children/arg_types",
+ "what": "Over solved names (the census path) `impl Rem<BigUint> for u64` in num-bigint was filed as written bare (its trait taking each default), so the question `u64: Rem<BigUint>` judged it by Homes::bare = core only and dropped it: false E0277/E0369 on `u64 % BigUint`, `u16 - BigInt` and the forwarding impls `Rem::rem(*self, other)`. Over records the row's own bare flag was right, so `blaze check` and a records fixture were clean while the census was not.",
+ "cost": "about an hour: the records-path fixture passed and the class showed only once the fixture went through Front2Program::survey_from",
+ "cause": "`bare` was `children(trait type)` being empty, and children passes over a plain-name generic argument (a type or a constant decided later), so `Rem<Big>` listed no child",
+ "whys": "children is a work list of the types to make, not a count of written arguments; it was reused for a different question",
+ "class": "a fact of the header read from a helper meant for another question; the two filing paths (names, records) computed one fact two ways",
+ "prevention": "done: `written_args` counts every type or const argument (written_type_args); tests front2_prim_self_ops (records and survey paths, control `u32: Rem<Big>` stays E0277)",
+ "workaround": "none needed now",
+ "state": "fixed"
+}

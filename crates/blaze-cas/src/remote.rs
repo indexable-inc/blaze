@@ -56,11 +56,11 @@ use std::collections::VecDeque;
 
 use blaze_core::{Address, Completion, Conn, Done, Effect, IoError, RECV_MOST, Tag, Tags};
 use blaze_format::cursor::{self, Put as _, Reader};
-use blaze_hash::{ByHashSet, HashMap};
+use blaze_hash::{BuildKeyHasher, FixedState, Map, MapOpts, Set, SetOpts};
 use blaze_ids::{ContentId, fuse::Fuse8, radix};
 use std::alloc::Global;
 
-use crate::{Asked, ByHash, Corrupt, Entry, Key, Kind, Remote, Store};
+use crate::{Asked, Corrupt, Entry, Key, Kind, Remote, Store};
 
 /// The most bytes of one value an answer may carry; a longer one is refused before it is read.
 pub const LONGEST_VALUE: u64 = 1 << 30;
@@ -397,7 +397,7 @@ pub struct Client {
     out: Vec<u8>,
     /// The fetch of each key asked on this connection and not yet answered (answers come in
     /// any order), and whether a filter said the server may hold it.
-    waiting: ByHash<Key, (Tag, bool), Global>, // alloc: a connection's or server's state, for its life
+    waiting: Map<Key, (Tag, bool), BuildKeyHasher, Global>, // alloc: a connection's or server's state, for its life
     /// Fetches of a key already waiting, not asked again: each gets a copy of its answer.
     again: Vec<(Key, Tag)>,
     /// Connects given up while in flight: a connection one of them makes is hung up.
@@ -444,7 +444,7 @@ impl Client {
             link: Link::Down,
             // alloc: empty, allocates nothing; once per client, setup.
             out: Vec::new(),
-            waiting: ByHash::new_in(Global), // alloc: a connection's or server's state, for its life
+            waiting: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: None }), // alloc: a connection's or server's state, for its life
             // alloc: empty, allocates nothing; once per client, setup.
             again: Vec::new(),
             // alloc: empty, allocates nothing; once per client, setup.
@@ -779,9 +779,9 @@ pub struct Server {
     closing: Vec<Tag>,
     failed: Option<IoError>,
     /// Sorted by connection once, where [`Server::stop`] hangs them up.
-    peers: HashMap<Conn, Peer, Global>, // alloc: a connection's or server's state, for its life
+    peers: Map<Conn, Peer, FixedState, Global>, // alloc: a connection's or server's state, for its life
     /// The connection of each send and receive in flight.
-    ops: HashMap<Tag, Conn, Global>, // alloc: a connection's or server's state, for its life
+    ops: Map<Tag, Conn, FixedState, Global>, // alloc: a connection's or server's state, for its life
     /// The frames of the filter of its store a peer is sent when it connects: a full one, then
     /// the deltas since. Empty until the first peer.
     filters: Vec<Vec<u8>>,
@@ -791,7 +791,7 @@ pub struct Server {
     delta_keys: usize,
     /// Keys a filter sent holds while they were readable and not yet packed: their packing,
     /// which [`Store::new_keys`] lists, sends them no second time.
-    announced: ByHashSet<Key, Global>, // alloc: a connection's or server's state, for its life
+    announced: Set<Key, BuildKeyHasher, Global>, // alloc: a connection's or server's state, for its life
 }
 
 #[derive(Default)]
@@ -833,13 +833,13 @@ impl Server {
             // alloc: empty, allocates nothing; once per server, setup.
             closing: Vec::new(),
             failed: None,
-            peers: HashMap::new_in(Global), // alloc: a connection's or server's state, for its life
-            ops: HashMap::new_in(Global),   // alloc: a connection's or server's state, for its life
+            peers: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: a connection's or server's state, for its life
+            ops: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),   // alloc: a connection's or server's state, for its life
             // alloc: empty, allocates nothing; once per server, setup.
             filters: Vec::new(),
             full_keys: 0,
             delta_keys: 0,
-            announced: ByHashSet::new_in(Global), // alloc: a connection's or server's state, for its life
+            announced: Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: None }), // alloc: a connection's or server's state, for its life
         })
     }
 

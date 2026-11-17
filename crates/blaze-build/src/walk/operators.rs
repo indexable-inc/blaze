@@ -52,11 +52,10 @@
 
 use core::alloc::Allocator;
 
-use blaze_lir::func::RefKind;
 use blaze_own::Vec;
 use blaze_typeck::{BinOp, Expr, ExprId, Mutbl, PNode, UnOp};
 
-use super::{Callee, Repr, Task, V, Walk, malformed};
+use super::{Repr, Task, V, Walk, malformed};
 use crate::BuildError;
 
 /// The operator as written, for an error.
@@ -237,9 +236,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let g = self.ground_ty(ty).map_err(|error| Self::ty_err(e, error))?;
         let rrepr = self.repr_at(e, ty)?;
         let rpass = self.pass(g, rrepr, abi, Some(item))?;
-        let place = self.ref_place(instance);
-        let reference = self.b.reference(RefKind::Func, place);
-        self.emit_call(Callee::Direct(reference), &reprs, &passes, rrepr, rpass)?;
+        self.call_instance(Some(e), instance, &reprs, &passes, None, rrepr, rpass)?;
         if let PNode::Never = self.node_at(e, ty)? {
             self.pop_val();
             self.b.unreachable();

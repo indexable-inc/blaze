@@ -38,6 +38,7 @@ fn encodings() {
         (enc::cmp_imm(9, 7), 0xf100_1d3f, "cmp x9, #7"),
         (enc::cmn_imm(10, 1), 0xb100_055f, "cmn x10, #1"),
         (enc::cmp(9, 10), 0xeb0a_013f, "cmp x9, x10"),
+        (enc::adcs(9, 9, 10), 0xba0a_0129, "adcs x9, x9, x10"),
         (enc::mul(9, 9, 10), 0x9b0a_7d29, "mul x9, x9, x10"),
         (enc::sdiv(11, 9, 10), 0x9aca_0d2b, "sdiv x11, x9, x10"),
         (enc::udiv(11, 9, 10), 0x9aca_092b, "udiv x11, x9, x10"),

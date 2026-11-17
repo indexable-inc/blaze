@@ -25,10 +25,10 @@
 //! handed, which this file makes the unit's.
 //!
 //! `CARGO_MANIFEST_DIR` and `CARGO_MANIFEST_PATH` name the folder the sandbox SERVES the
-//! package at (`Files::seen`), so a macro that opens `$CARGO_MANIFEST_DIR/Cargo.toml`
-//! (proc-macro-crate) finds it. Today the runner serves every package at `/package`
-//! (`sandbox_files`, `Files::Folder` and `Files::Listed`), while a member's `CrateEnv` says
-//! `/workspace/<dir>` (D96); once members are served as `Files::Member` the two are one value.
+//! package at, its mount row (`Files::seen`, D96): a member is served as `Files::Member` at
+//! `/workspace/<dir>`, the value its `CrateEnv` gives, so a macro that opens
+//! `$CARGO_MANIFEST_DIR/abi/x.json` (`sol!`) finds the member's file. The crate's values pass
+//! through unchanged; `Package::new` refuses one that differs from the row (never overwritten).
 
 use std::alloc::Global;
 use std::string::String;
@@ -36,41 +36,47 @@ use std::sync::Arc;
 use std::vec::Vec;
 
 use blaze_proc_macro::package_env::{PackageEnv, PackageEnvError};
-use blaze_proc_macro::sandbox::{Files, Package};
+use blaze_proc_macro::sandbox::{Files, Package, SeenMismatch};
 use blaze_scope::crate_env::CrateEnv;
 
-/// The variables a proc macro called in the crate whose environment is `env` may read, its
-/// files served as `files`: every variable `env` holds (cargo's `CARGO_*` for crates, the
-/// crate's own `CARGO_CRATE_NAME` and `CARGO_BIN_NAME`, `OUT_DIR` and the build script's
-/// `rustc-env` pairs), sorted by name as `CrateEnv::vars` gives them, with the manifest's folder
-/// and path where `files` serves them.
-pub(crate) fn unit_env(env: &CrateEnv<'_>, files: &Files) -> Vec<(String, String), Global> {
-    let dir = std::format!("{}", files.seen());
+/// The variables a proc macro called in the crate whose environment is `env` may read: every
+/// variable `env` holds (cargo's `CARGO_*` for crates, the crate's own `CARGO_CRATE_NAME` and
+/// `CARGO_BIN_NAME`, `OUT_DIR` and the build script's `rustc-env` pairs), unchanged, sorted by
+/// name as `CrateEnv::vars` gives them: the values `env!` reads in the crate. The path ones are
+/// checked against where the files are served by `Package::new` in [`unit_package`].
+pub(crate) fn unit_env(env: &CrateEnv<'_>) -> Vec<(String, String), Global> {
     let mut out = Vec::new_in(Global);
     for (name, value) in env.vars() {
-        let value = match name {
-            "CARGO_MANIFEST_DIR" => dir.clone(),
-            "CARGO_MANIFEST_PATH" => std::format!("{dir}/Cargo.toml"),
-            _ => String::from(value),
-        };
-        out.push((String::from(name), value));
+        out.push((String::from(name), String::from(value)));
     }
     out
+}
+
+/// Why a calling crate's package could not be made ([`unit_package`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum UnitPackageError {
+    /// The crate's environment named one variable both set and unknown (`PackageEnv::new`).
+    Env(PackageEnvError),
+    /// A path variable of the crate's environment is not where its files are served (D96).
+    Seen(SeenMismatch),
 }
 
 /// The package a proc macro called in the crate with environment `env` is shown: `files`, the
 /// variables [`unit_env`] gives, and the names `env` holds no value for that cargo sets
 /// (`CrateEnv::unknown`, `unknown_prefixes`): the macro's `getenv` of one is refused by name,
 /// as `env!` of it is, never answered unset (macro-env-unknown, rule 3). Every other name is
-/// unset. An error names a bug of `env` (a name both set and unknown).
-pub(crate) fn unit_package(env: &CrateEnv<'_>, files: Files) -> Result<Package, PackageEnvError> {
-    let vars = unit_env(env, &files);
+/// unset. An error names a bug of `env` (a name both set and unknown), or a path variable that
+/// is not where `files` are served (D96).
+pub(crate) fn unit_package(env: &CrateEnv<'_>, files: Files) -> Result<Package, UnitPackageError> {
+    let vars = unit_env(env);
     // `PackageEnv` takes blaze-proc-macro's prelude `Vec`: moved over, element by element.
     let mut set = std::vec::Vec::with_capacity(vars.len());
     set.extend(vars);
     let unknown = env.unknown().map(String::from).collect();
     let unknown_prefixes = env.unknown_prefixes().map(String::from).collect();
-    Ok(Package { files, env: PackageEnv::new(set, unknown, unknown_prefixes)? })
+    let env = PackageEnv::new(set, unknown, unknown_prefixes).map_err(UnitPackageError::Env)?;
+    // D96: the path variables equal where `files` are served, or the package is refused.
+    Package::new(files, env).map_err(UnitPackageError::Seen)
 }
 
 /// Each calling crate's package, by the crate's index in the names world: the key a call is
@@ -161,8 +167,11 @@ mod tests {
         CrateEnv::of(facts, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the environment of {crate_name}: {e}"))
     }
 
+    /// The member `app` as the runner serves it (D96 (3)): its workspace at `/workspace`, the
+    /// member at `app` in it, the same dir its `CrateEnv` was made with.
     fn served() -> Files {
-        Files::Listed(Arc::from(Vec::new()))
+        let root = blaze_proc_macro::script_sandbox::ScriptRoot::member("app").unwrap_or_else(|e| panic!("{e}"));
+        Files::Member { workspace: std::path::PathBuf::from("/nonexistent-ws"), root }
     }
 
     /// What the macro's `getenv` returns for `name` in `package` (sandbox.rs: the same lookup).
@@ -183,8 +192,13 @@ mod tests {
 
     #[test]
     fn a_lib_and_a_bin_of_one_package_read_their_own_crate_name() {
-        let lib = Arc::new(unit_package(&env_of("app", None), served()).unwrap_or_else(|e| panic!("{e}")));
-        let bin = Arc::new(unit_package(&env_of("app_cli", Some("app-cli")), served()).unwrap_or_else(|e| panic!("{e}")));
+        let lib = Arc::new(unit_package(&env_of("app", None), served()).unwrap_or_else(|e| panic!("{e:?}")));
+        let bin = Arc::new(unit_package(&env_of("app_cli", Some("app-cli")), served()).unwrap_or_else(|e| panic!("{e:?}")));
+        // D96: the member served as a plain listing at `/package` while its crate says
+        // `/workspace/app` is refused by name, never overwritten.
+        let at_package = unit_package(&env_of("app", None), Files::Listed(Arc::from(Vec::new())));
+        let Err(super::UnitPackageError::Seen(at_package)) = at_package else { panic!("a member served at /package was taken: {at_package:?}") };
+        assert_eq!((at_package.name.as_str(), at_package.given.as_str(), at_package.row.as_str()), ("CARGO_MANIFEST_DIR", "/workspace/app", "/package"));
         let mut callers = Callers::new();
         callers.put(LIB, Arc::clone(&lib)).expect("the lib, once");
         callers.put(BIN, Arc::clone(&bin)).expect("the bin, once");
@@ -196,9 +210,10 @@ mod tests {
         assert_eq!(read(bin_seen, "CARGO_CRATE_NAME"), Some("app_cli"), "the bin's call reads the bin's crate name");
         assert_eq!(read(lib_seen, "CARGO_BIN_NAME"), None, "a lib has no CARGO_BIN_NAME");
         assert_eq!(read(bin_seen, "CARGO_BIN_NAME"), Some("app-cli"), "the bin's call reads its binary name");
-        // The manifest's folder is where the files are served (`/package` for a listed package).
-        assert_eq!(read(lib_seen, "CARGO_MANIFEST_DIR"), Some("/package"));
-        assert_eq!(read(bin_seen, "CARGO_MANIFEST_PATH"), Some("/package/Cargo.toml"));
+        // The manifest's folder is where the files are served: the member's row, the value
+        // its `CrateEnv` (and `env!`) gives.
+        assert_eq!(read(lib_seen, "CARGO_MANIFEST_DIR"), Some("/workspace/app"));
+        assert_eq!(read(bin_seen, "CARGO_MANIFEST_PATH"), Some("/workspace/app/Cargo.toml"));
         assert!(callers.of(LIB + 100).is_none(), "a crate never given a package has one");
 
         // The key: a kept answer that read `CARGO_CRATE_NAME` holds for one crate only; one

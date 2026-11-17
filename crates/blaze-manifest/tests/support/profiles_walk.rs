@@ -6,7 +6,7 @@
 use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_manifest::config::{CompileKind, ConfigError};
 use blaze_manifest::diagnostic::report;
 use blaze_manifest::files::Disk;
@@ -386,7 +386,11 @@ fn profiles_of(
     if let Some(locked) = &locked {
         packages.extend(locked.iter());
     } else {
-        let mut seen = blaze_hash::HashSet::new_in(Global);
+        let mut seen = blaze_hash::Set::new(blaze_hash::SetOpts {
+            hasher: blaze_hash::FixedState,
+            alloc: Global,
+            capacity: None,
+        });
         for (unit, value) in parsed.iter().zip(units) {
             if seen.insert(value["pkg_id"].as_str()) {
                 packages.push(&unit.pkg);
@@ -399,7 +403,7 @@ fn profiles_of(
         let _ = writeln!(stderr, "warning: {warning}");
     }
     let mut walk =
-        Walk { units: &parsed, profiles, interned: Vec::new(), by_unit: HashMap::new_in(Global) };
+        Walk { units: &parsed, profiles, interned: Vec::new(), by_unit: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }) };
     let roots = graph["roots"].as_array().ok_or(WalkError::NoRoots)?;
     let is_test_command = matches!(command.name.as_str(), "test" | "bench");
     let requested = match &command.target {
@@ -464,7 +468,7 @@ struct Walk<'a> {
     units: &'a [Unit],
     profiles: &'a Profiles,
     interned: Vec<Interned>,
-    by_unit: HashMap<usize, Vec<usize>, Global>,
+    by_unit: Map<usize, Vec<usize>, FixedState, Global>,
 }
 
 impl Walk<'_> {

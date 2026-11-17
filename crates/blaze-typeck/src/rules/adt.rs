@@ -166,6 +166,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             Ok(r) => r.consumed as usize,
             Err(_) => 0,
         };
+        if let Ok(PathRes { def: Def::Alias(alias), consumed: c }) = res {
+            return self.alias_struct_path(at, alias, segs, c as usize, last);
+        }
         let (k, variant, def) = match res {
             Ok(r) if r.consumed as usize == segs.len() => match r.def {
                 Def::Adt(k) => (k, None, r.def),
@@ -224,6 +227,40 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         Ok(Some((k, variant, args)))
     }
 
+    /// A struct path through a type alias the world answered as [`Def::Alias`] (rules/
+    /// alias_path.rs): `A { .. }` is the struct or union the aliased type is, at the arguments
+    /// the alias gives it; `A::V { .. }` a variant of the enum it is ([`Self::struct_variant`]).
+    /// E0574 for an aliased type that is no ADT, an enum named whole, a struct or union with a
+    /// trailing segment, or more than one trailing segment.
+    fn alias_struct_path(&mut self, at: At, alias: ItemKey, segs: &[Segment], consumed: usize, last: Option<crate::ids::Name>) -> Result<Option<(ItemKey, u32, TyList)>, Stop> {
+        let (Some(&seg), true) = (consumed.checked_sub(1).and_then(|i| segs.get(i)), consumed + 1 >= segs.len()) else {
+            self.diag(DiagCode::NotAStruct, at, About::path(last));
+            return Ok(None);
+        };
+        let Some(t) = self.alias_path_ty(at, at.cause(), alias, seg)? else { return Ok(None) };
+        let TyView::Adt(k, args) = self.view(t) else {
+            self.diag(DiagCode::NotAStruct, at, About::path(last));
+            return Ok(None);
+        };
+        let Some(adt) = self.reads.adt(k)? else {
+            self.diag(DiagCode::NotAStruct, at, About::path(last));
+            return Ok(None);
+        };
+        let (variant, def) = match (segs.get(consumed), adt.kind) {
+            (None, AdtKind::Struct | AdtKind::Union) => (0, Def::Adt(k)),
+            (Some(&v), AdtKind::Enum) => match self.struct_variant(at, k, v)? {
+                Some(found) => found,
+                None => return Ok(None),
+            },
+            _ => {
+                self.diag(DiagCode::NotAStruct, at, About::path(last));
+                return Ok(None);
+            }
+        };
+        self.defs.push((at, def));
+        Ok(Some((k, variant, args)))
+    }
+
     /// The variant `seg` of the enum `k` that a type-relative struct path names (`Self::A`,
     /// `Alias::A`): its index and its definition, or `None` after E0574 naming `seg` (`k` no
     /// enum, or no variant of that name). Generic arguments on the variant's own segment of a
@@ -275,7 +312,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
 
     /// `check_expr_struct`. `f.t` is the struct's type, `f.l` its arguments, `f.c` the variant,
     /// `f.a` the next field, `f.b` 1 once the path failed.
-    pub(crate) fn expr_struct(&mut self, mut f: Frame, e: ExprId, path: PathIdx, fields: List, base: Option<ExprId>) -> Result<Flow, Stop> {
+    pub(crate) fn expr_struct(&mut self, mut f: Frame, e: ExprId, path: PathIdx, fields: List, base: crate::body::StructBase) -> Result<Flow, Stop> {
+        use crate::body::StructBase;
         let inits = self.body.field_init_list(fields)?;
         if f.state == 0 {
             f.a = 0;
@@ -316,16 +354,45 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 return Ok(Flow::Wait);
             }
             match base {
-                Some(b) => {
+                StructBase::Expr(b) => {
                     self.resume(f, 2)?;
                     self.push_has_type(b, f.t)?;
                     return Ok(Flow::Wait);
                 }
-                None if f.b == 0 => self.check_missing_fields(e, f.t, f.c, inits)?,
-                None => {}
+                StructBase::None if f.b == 0 => self.check_missing_fields(e, f.t, f.c, inits)?,
+                StructBase::Defaults if f.b == 0 => self.record_default_fields(e, f.t, f.c, f.l, inits)?,
+                StructBase::None | StructBase::Defaults => {}
             }
         }
+        if f.state == 2 && f.b == 0 {
+            self.record_fru_fields(e, f.t, f.l, inits)?;
+        }
         Ok(Flow::Done(f.t))
+    }
+
+    /// `fru_field_types`: after the base of `S { a: x, ..base }` unified with `S<args>`, one
+    /// row per field the update takes from the base (every field not written), in declaration
+    /// order, with its declared type at `args`. The flow lowering moves or copies each
+    /// `base.f` by that type (blaze-flow-lower, `Expr::Struct`), so a place base is moved out
+    /// of field by field, as `let x = base.f;` is. The Reference, "Struct expressions",
+    /// "Functional update syntax": the base must be a struct type, so a union or an enum
+    /// variant is refused by name (rustc's E0436, for which the checker has no code).
+    fn record_fru_fields(&mut self, e: ExprId, adt_ty: Ty, args: TyList, inits: &[crate::body::FieldInit]) -> Result<(), Stop> {
+        let TyView::Adt(k, _) = self.view(adt_ty) else { return Ok(()) };
+        let Some(adt) = self.reads.adt(k)? else { return Ok(()) };
+        if adt.kind != AdtKind::Struct {
+            return Err(CheckError::Unported("functional record update of a union or an enum variant (E0436)").into());
+        }
+        let Some(v) = adt.variants.first() else { return Ok(()) };
+        let declared = adt.fields.get(v.fields.range()).unwrap_or(&[]);
+        for (i, d) in declared.iter().enumerate() {
+            if inits.iter().any(|w| w.name == d.name) {
+                continue;
+            }
+            let t = self.lower(adt.types, d.ty, Lower::Args(args), crate::ty::Cause::Expr(e))?;
+            self.fru_fields.push((e, i as u32, t));
+        }
+        Ok(())
     }
 
     /// A field's declared type in variant `variant` of `adt_ty`, instantiated with `args`.
@@ -345,6 +412,40 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             Some(d) => Ok(Some(self.lower(adt.types, d.ty, Lower::Args(args), cause)?)),
             None => Ok(None),
         }
+    }
+
+    /// `S { a: 1, .. }` with no base (RFC 3681, `default_field_values`): each field of the
+    /// variant the expression does not write takes its default, the field's anonymous constant
+    /// at the expression's type arguments. A field the expression leaves out that has no
+    /// default is E0063 (`MissingFields`), one finding per such field, each naming it. Each
+    /// defaulted field gets a `fru_fields` row (its index in the variant and its type at
+    /// `args`, so the lowering sizes the aggregate as a struct update's) and a
+    /// `default_fields` row (the default's key, the value the lowering puts there). A union
+    /// has no defaults (the declaration is refused where its head is made), so every one of
+    /// its unwritten fields is simply unwritten, as `U { a: 1 }` is.
+    fn record_default_fields(&mut self, e: ExprId, adt_ty: Ty, variant: u32, args: TyList, inits: &[crate::body::FieldInit]) -> Result<(), Stop> {
+        let TyView::Adt(k, _) = self.view(adt_ty) else { return Ok(()) };
+        let Some(adt) = self.reads.adt(k)? else { return Ok(()) };
+        let Some(v) = adt.variants.get(variant as usize) else { return Ok(()) };
+        let defaults = self.reads.field_defaults(k)?;
+        let range = v.fields.range();
+        let first = range.start;
+        let declared = adt.fields.get(range).unwrap_or(&[]);
+        for (i, d) in declared.iter().enumerate() {
+            if inits.iter().any(|w| w.name == d.name) {
+                continue;
+            }
+            match defaults.get(first + i).copied().flatten() {
+                Some(key) => {
+                    let t = self.lower(adt.types, d.ty, Lower::Args(args), crate::ty::Cause::Expr(e))?;
+                    self.fru_fields.push((e, i as u32, t));
+                    self.default_fields.push((e, i as u32, key));
+                }
+                None if adt.kind == AdtKind::Union => {}
+                None => self.diag(DiagCode::MissingFields, At::Expr(e), About::found_named(adt_ty, d.name)),
+            }
+        }
+        Ok(())
     }
 
     fn check_missing_fields(&mut self, e: ExprId, adt_ty: Ty, variant: u32, inits: &[crate::body::FieldInit]) -> Result<(), Stop> {

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use blaze_file_items::outline;
-use blaze_lint::{Findings, Rule, RuleSet, Scope, Span, TestBits, Unit, lex_floor, lint};
+use blaze_lint::{Findings, Rule, RuleSet, Scope, Span, TestBits, Unit, Variants, lex_floor, lint_in};
 use blaze_own::Alloc;
 use blaze_surface::{Edition, ItemDetail, ItemIndex};
 
@@ -100,9 +100,14 @@ impl File {
         mut each: impl FnMut(usize, Scope, &Findings<'a>, blaze_lint::Run, blaze_lint::TestBits),
     ) -> Vec<Scope> {
         let mut scopes = vec![self.scope(); self.units.len()];
+        // `variant-count`'s fact of the file, gathered once (one lex where the file has `enum`).
+        let variants = match rules.runs(Rule::VariantCount) {
+            true => Variants::gather(&self.text, alloc).unwrap_or_else(|error| panic!("{}: {error:?}", self.path.display())),
+            false => Variants::new_in(alloc),
+        };
         for (at, unit) in self.units.iter().enumerate() {
             let input = Unit { text: &self.text[unit.base as usize..unit.end as usize], holes: &unit.holes, scope: scopes[at] };
-            let linted = match lint(rules, &input, alloc, out) {
+            let linted = match lint_in(rules, &input, &variants, unit.base, alloc, out) {
                 Ok(linted) => linted,
                 Err(error) => panic!("{}: unit {at}: {error:?}", self.path.display()),
             };
@@ -338,6 +343,8 @@ fn main() {
     let mut scopes = scopes;
     let mut relinted = 0;
     let start = Instant::now();
+    // The file's `variant-count` fact is gathered again: an edit's cost includes it.
+    let variants = Variants::gather(&after.text, alloc).unwrap_or_else(|error| panic!("{error:?}"));
     for (u, unit) in after.units.iter().enumerate() {
         if u > 0 && kept.contains(&(hashes[u - 1], scopes[u].key())) {
             // A hit: its findings and its children's scopes are the record's.
@@ -345,7 +352,7 @@ fn main() {
         }
         relinted += 1;
         let input = Unit { text: &after.text[unit.base as usize..unit.end as usize], holes: &unit.holes, scope: scopes[u] };
-        match lint(&RuleSet::ALL, &input, alloc, &mut out) {
+        match lint_in(&RuleSet::ALL, &input, &variants, unit.base, alloc, &mut out) {
             Ok(linted) => {
                 for (child, scope) in unit.children.iter().zip(linted.children.iter()) {
                     scopes[*child] = *scope;

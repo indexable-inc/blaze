@@ -27,8 +27,9 @@ blaze-hash = { path = "../blaze-hash" }
 testing = ["blaze-own/std", "blaze-own/testing"]
 
 [dev-dependencies]
-# `Alloc::global()`, which the tests and the cost example hand down.
 blaze-own = { workspace = true, features = ["std", "testing"] }
+# The cost example's entry frame and each test's top frame: memory from the OS, handed down.
+blaze-mem.workspace = true
 # `check`, `control`: the prefilter's property and its planted-bug control.
 blaze-sim.workspace = true
 

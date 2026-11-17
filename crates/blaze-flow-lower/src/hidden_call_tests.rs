@@ -37,7 +37,7 @@ struct Heads {
 
 impl Heads {
     fn add(&mut self, fx: &Fx, item: ItemKey, text: &str, inputs: &[PTy], output: PTy) {
-        let adt = |_: ItemKey| Some(false);
+        let adt = |_: ItemKey| Some(0);
         let mut buf = SigBuf::new_in(alloc());
         if let Err(why) = read_signature(text, fx.t.view(), inputs, output, &adt, &mut buf, alloc()) {
             panic!("`{text}` was not read: {why:?}");
@@ -52,7 +52,7 @@ impl Facts for Heads {
         // parameter's drop at the body's end is the access the live `'static` loan conflicts
         // with. (With `needs_drop: false` the run at 21:24 found nothing though the demand was
         // made: the parameter's `StorageDead` alone did not conflict; reported as its own gap.)
-        Some(AdtFacts { copy: false, drop_impl: false, needs_drop: true, lifetimes: false, union: false, is_enum: false, is_box: false })
+        Some(AdtFacts { copy: false, drop_impl: false, needs_drop: true, lifetimes: 0, union: false, is_enum: false, is_box: false })
     }
     fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
         Some(CalleeFacts { writes_lifetimes: false, self_ref: false })

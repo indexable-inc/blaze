@@ -24,7 +24,7 @@
 
 use std::{collections::VecDeque, fmt, ops::Range};
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use std::alloc::Global;
 
 use crate::pace::{FULL, Hysteresis, Levels, Pace, Slice, Volume};
@@ -795,16 +795,16 @@ pub struct Collector {
     /// `(agent, path)`, sorted.
     holds: Vec<(u64, String)>,
     /// Each workspace's last profiles built, oldest first, at most [`Config::keep_transactions`].
-    transactions: HashMap<String, VecDeque<String>, Global>,
+    transactions: Map<String, VecDeque<String>, FixedState, Global>,
     /// The epoch each path was last rooted or used at.
-    touched: HashMap<String, u64, Global>,
+    touched: Map<String, u64, FixedState, Global>,
     /// Each area's volume as last measured, less what was written since.
     volumes: Vec<Option<Volume>>,
     hysteresis: Hysteresis,
     /// The pressure slices are paced for now, permille ([`Hysteresis::step`]).
     paced: u32,
     /// What the lap saw, by path; and blaze's bytes in each area from it.
-    seen: HashMap<String, Seen, Global>,
+    seen: Map<String, Seen, FixedState, Global>,
     area_bytes: Vec<u64>,
     /// What its driver says blaze holds in each area that no scan lists: the daemon's state
     /// ([`Collector::holds`]). Counted in blaze's bytes on the volume, so the budget is the
@@ -949,12 +949,12 @@ impl Collector {
             pins: Vec::new(),
             next_pin: 0,
             holds: Vec::new(),
-            transactions: HashMap::new_in(Global),
-            touched: HashMap::new_in(Global),
+            transactions: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
+            touched: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             volumes: vec![None; areas], // alloc: once per collector, one an area
             hysteresis: Hysteresis::default(),
             paced: 0,
-            seen: HashMap::new_in(Global),
+            seen: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             area_bytes: vec![0; areas], // alloc: once per collector, one an area
             held_bytes: vec![0; areas], // alloc: once per collector, one an area
             cursor: None,
@@ -2694,7 +2694,7 @@ impl Collector {
 }
 
 /// `path` is no longer the lap's: dropped from what it saw, and from its area's bytes.
-fn forget(seen: &mut HashMap<String, Seen, Global>, area_bytes: &mut [u64], path: &str) {
+fn forget(seen: &mut Map<String, Seen, FixedState, Global>, area_bytes: &mut [u64], path: &str) {
     if let Some(it) = seen.remove(path)
         && let Some(bytes) = area_bytes.get_mut(usize::from(it.area))
     {

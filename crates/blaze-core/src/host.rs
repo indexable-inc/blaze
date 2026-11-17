@@ -159,7 +159,7 @@ mod unix {
         },
     };
 
-    use blaze_hash::HashMap;
+    use blaze_hash::{FixedState, Map, MapOpts};
     use crate::chan::{Receiver, Sender};
     use blaze_queue::SegQueue;
 
@@ -270,7 +270,7 @@ mod unix {
         /// Made with the first effect that waits.
         shared: Option<Arc<Shared>>,
         /// Each socket bound, by its [`Dgram`].
-        socks: HashMap<u64, Arc<Bound>, Global>,
+        socks: Map<u64, Arc<Bound>, FixedState, Global>,
         /// The next socket's name: from 1, never named twice.
         next: u64,
         /// The queues of the threads that write the standard output and error, and read the
@@ -286,7 +286,7 @@ mod unix {
             Host {
                 sink,
                 shared: None,
-                socks: HashMap::new_in(Global),
+                socks: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
                 next: 1,
                 stdout: None,
                 stderr: None,

@@ -1,0 +1,12 @@
+{
+ "id": "AI-args-inline-1",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane AI (args-inline)",
+ "where": "crates/blaze-ladder/src/front2/head_record.rs, build queue request 033234-AI-e6bfde",
+ "what": "Three lanes (AI, R8, DF2) edit head_record.rs in one directory. The runner cuts whole files from disk, so my ask carried DF2's half-finished `field_defaults` edit and failed on five of DF2's errors. None of the errors were on my lines.",
+ "cost": "one admission round, and my piece and R8's both wait on DF2",
+ "cause": "a cut takes a whole file; one file shared by three lanes cannot be admitted for one of them while another is mid-edit",
+ "workaround": "told main; wait for DF2's file to compile, then ask again unchanged",
+ "fix": "split head_record.rs per head kind (fn, adt, trait, ...) so that lanes touching different kinds hold different files, or let the queue cut hunks per lane",
+ "state": "open"
+}

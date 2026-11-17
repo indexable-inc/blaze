@@ -161,7 +161,7 @@ pub fn read_callable_param<A: Allocator + Clone>(
     param: u32,
     inputs: &[PTy],
     output: PTy,
-    adt_lifetimes: &dyn Fn(ItemKey) -> Option<bool>,
+    adt_lifetimes: &dyn Fn(ItemKey) -> Option<u32>,
     out: &mut SigBuf<A>,
     alloc: A,
 ) -> Result<(), CallableRefusal> {

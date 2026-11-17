@@ -191,3 +191,40 @@ pub(super) fn local_const<H: Heads + ?Sized>(locals: &Locals<'_>, owner: ItemKey
         _ => Err(Why::Unsupported("an array repeat length naming an item of the body that is not a constant", range)),
     }
 }
+
+/// What a generic argument written as ONE plain name means when an item declared in the body
+/// takes the name ([`Locals::find`], from the block the name is written in outwards).
+pub(super) enum LocalArg {
+    /// A type the body declares: the argument is a type (the Reference, "Generic parameters",
+    /// "Const generics": "When there is ambiguity if a generic argument could be resolved as
+    /// either a type or const argument, it is always resolved as a type.").
+    Type,
+    /// A `const` the body declares, by its evaluated bits (`foo::<CHUNK_SIZE>()` with `const
+    /// CHUNK_SIZE: usize = ..;` in the body: the pinned core's ptr::swap_nonoverlapping_bytes).
+    Const(u128),
+}
+
+/// The local item that the plain-name generic argument `t` (its text `name`, at `range`) of
+/// the body `owner` names. The type namespace is asked first: [`LocalArg::Type`] when a block
+/// around the argument declares a type of that name. Otherwise [`LocalArg::Const`] when one
+/// declares a `const`, once that constant is evaluated, and [`Why::NeedConst`] naming its key
+/// until then: the driver evaluates it and converts the body again, as [`local_const`] does.
+/// `Ok(None)`: no item of the body takes the name, and the caller reads the module's names.
+/// A local value item that is no `const` is refused by name, never looked up at the module,
+/// where the name would mean another item.
+pub(super) fn local_arg<H: Heads + ?Sized>(locals: &Locals<'_>, owner: ItemKey, heads: &H, view: &View<'_>, t: lf::TypeId, name: &str, range: Range) -> Result<Option<LocalArg>, Why> {
+    let lf::TypeRef::Path(p) = view.ty(t)? else { return Ok(None) };
+    let Some(scope) = view.path(p)?.scope else { return Ok(None) };
+    if locals.find(owner, Some(scope.0), name, LocalNs::Type).is_some() {
+        return Ok(Some(LocalArg::Type));
+    }
+    let Some(row) = locals.find(owner, Some(scope.0), name, LocalNs::Value) else { return Ok(None) };
+    match row.kind {
+        LocalKind::Const => match heads.const_bits(row.key) {
+            Some(bits) => Ok(Some(LocalArg::Const(bits))),
+            None => Err(Why::NeedConst(row.key, range)),
+        },
+        LocalKind::Use => Err(Why::Unsupported("a const argument named through a `use` declared in the body", range)),
+        _ => Err(Why::Unsupported("a const argument naming an item of the body that is not a constant", range)),
+    }
+}

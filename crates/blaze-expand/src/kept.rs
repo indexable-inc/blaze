@@ -6,24 +6,31 @@
 //! A re-solve of a crate after an edit finds every call whose key ([`crate::call_key`]) is unchanged in the set
 //! and expands only the calls the edit moved. One record a crate, never a file a call.
 //!
-//! An entry made this solve, little-endian, any alignment:
+//! An entry made this solve, little-endian:
 //!
 //! ```text
-//! asked count (u32)  asked length (u32)  asked  column lengths (u32 x 14)  the columns
+//! asked count (u32)  asked length (u32)  asked  column lengths (u32 x 14)
+//! token record length (u32)  the columns  zeros to a multiple of 16  the token record
 //! ```
 //!
 //! the columns being the expansion record's ([`Expansion::write_columns`]) without its root;
 //! one asked cfg atom: `answer (u8)  has value (u8)  name length (u16)  value length (u16)
-//! name  value`. Equal values give equal bytes.
+//! name  value`. The token record is the expansion's blaze-tokens record
+//! ([`Expansion::token_record`], D122): its own blaze-format buffer, placed at a multiple of 16
+//! bytes from the entry's start, so it opens where it is ([`KeptEntry::tokens`]) when the entry
+//! itself starts 16-aligned (a store's buffer does). Equal values give equal bytes.
 
 use core::fmt;
 
 use blaze_own::{AVec, Alloc, Vec};
 
+use blaze_tokens::{OpenError, Tokens};
+
 use crate::{
     expansion::Expansion,
     key::CallKey,
     record::{COLUMNS, RecordError},
+    token_record::{OriginMaps, TokenRecordError},
 };
 
 pub use crate::kept_set::{KeptSet, SetEntry, SetPlant, SetSource, write_set, write_set_planted};
@@ -67,6 +74,10 @@ pub enum KeptError {
     TwoValues { key: CallKey },
     /// More entries or bytes than the layout counts.
     TooLarge,
+    /// The expansion's tokens make no token record ([`Expansion::token_record`]).
+    TokenRecord { error: TokenRecordError },
+    /// The bytes between an entry's columns and its token record are not the zeros written.
+    TokenPad,
 }
 
 impl fmt::Display for KeptError {
@@ -86,6 +97,8 @@ impl fmt::Display for KeptError {
             KeptError::AtomTooLong => f.write_str("a cfg atom too long for a kept expansion (65535 bytes a name or a value)"),
             KeptError::TwoValues { key } => write!(f, "two expansions under one call key {:02x?} with different bytes (rule 21: the key misses an input)", &key.0.0[..8]),
             KeptError::TooLarge => f.write_str("a kept expansions set past what its layout counts"),
+            KeptError::TokenRecord { error } => write!(f, "a kept expansion whose tokens make no token record: {error}"),
+            KeptError::TokenPad => f.write_str("a kept expansion whose bytes before its token record are not the zeros written"),
         }
     }
 }
@@ -206,19 +219,26 @@ impl<'e> Iterator for AskedIter<'e> {
 pub struct KeptEntry<'e> {
     asked: AskedIter<'e>,
     columns: [&'e [u8]; COLUMNS],
+    /// The token record's bytes, at a multiple of 16 from the entry's start.
+    tokens: &'e [u8],
 }
 
+/// Where an entry's token record is placed: its blaze-format buffer's alignment.
+const TOKENS_ALIGN: usize = 16;
+
 impl<'e> KeptEntry<'e> {
-    /// The entry `bytes` hold, its asked atoms checked and its columns cut by their lengths.
+    /// The entry `bytes` hold, its asked atoms checked and its columns and token record cut by
+    /// their lengths. The token record is not opened here ([`KeptEntry::tokens`]).
     pub fn open(bytes: &'e [u8]) -> Result<KeptEntry<'e>, KeptError> {
         if bytes.len() < ENTRY_HEAD {
             return Err(KeptError::Short { what: "an entry's head" });
         }
         let (count, len) = (u32_at(bytes, 0), u32_at(bytes, 4));
         let lens_at = ENTRY_HEAD.checked_add(len).ok_or(KeptError::TooLarge)?;
-        let mut at = lens_at.checked_add(COLUMNS * 4).ok_or(KeptError::TooLarge)?;
+        let tokens_len_at = lens_at.checked_add(COLUMNS * 4).ok_or(KeptError::TooLarge)?;
+        let mut at = tokens_len_at.checked_add(4).ok_or(KeptError::TooLarge)?;
         if bytes.len() < at {
-            return Err(KeptError::Short { what: "an entry's asked atoms or column lengths" });
+            return Err(KeptError::Short { what: "an entry's asked atoms, column lengths or token record length" });
         }
         let asked = AskedIter::checked(&bytes[ENTRY_HEAD..lens_at], count)?;
         let mut columns: [&'e [u8]; COLUMNS] = [&[]; COLUMNS];
@@ -230,10 +250,25 @@ impl<'e> KeptEntry<'e> {
             *place = &bytes[at..end];
             at = end;
         }
-        if at != bytes.len() {
+        let tokens_at = at.checked_next_multiple_of(TOKENS_ALIGN).ok_or(KeptError::TooLarge)?;
+        let tokens_end = tokens_at.checked_add(u32_at(bytes, tokens_len_at)).ok_or(KeptError::TooLarge)?;
+        if tokens_end > bytes.len() {
+            return Err(KeptError::Short { what: "an entry's token record" });
+        }
+        if bytes[at..tokens_at].iter().any(|&b| b != 0) {
+            return Err(KeptError::TokenPad);
+        }
+        if tokens_end != bytes.len() {
             return Err(KeptError::Trailing);
         }
-        Ok(KeptEntry { asked, columns })
+        Ok(KeptEntry { asked, columns, tokens: &bytes[tokens_at..tokens_end] })
+    }
+
+    /// The expansion's token record (D122), opened where it is and checked once by
+    /// blaze-tokens. It opens in place when the entry's bytes start 16-aligned (a store's
+    /// buffer, `blaze_format::Aligned`); blaze-format refuses it otherwise, by name.
+    pub fn tokens(&self) -> Result<Tokens<'e>, OpenError> {
+        Tokens::open(self.tokens)
     }
 
     /// The cfg atoms the item walk asked when this was expanded, with their answers then.
@@ -253,14 +288,20 @@ impl<'e> KeptEntry<'e> {
 }
 
 /// `expansion` with the atoms `asked` as one entry's bytes, in `alloc` (every growth
-/// fallible). Equal values give equal bytes. No record root is built: the set keeps columns.
-pub fn write_entry<'b>(asked: &Asked<'_>, expansion: &Expansion<'_>, alloc: Alloc<'b>) -> Result<AVec<'b, u8>, KeptError> {
+/// fallible), its token record made with the origin maps `maps` of the call's sources
+/// ([`crate::SourceIndexes::of`]`(def, call, alloc).maps()`). Equal values give equal bytes. No
+/// record root is built: the set keeps columns.
+pub fn write_entry<'b>(asked: &Asked<'_>, expansion: &Expansion<'_>, maps: &OriginMaps<'_>, alloc: Alloc<'b>) -> Result<AVec<'b, u8>, KeptError> {
     let columns = expansion.write_columns(alloc);
+    let tokens = expansion.token_record(maps, alloc).map_err(|error| KeptError::TokenRecord { error })?;
     let asked_len = u32::try_from(asked.bytes.len()).map_err(|_| KeptError::TooLarge)?;
-    let mut total = ENTRY_HEAD + asked.bytes.len() + COLUMNS * 4;
+    let tokens_len = u32::try_from(tokens.len()).map_err(|_| KeptError::TooLarge)?;
+    let mut end = ENTRY_HEAD + asked.bytes.len() + COLUMNS * 4 + 4;
     for column in &columns {
-        total = total.checked_add(column.len()).ok_or(KeptError::TooLarge)?;
+        end = end.checked_add(column.len()).ok_or(KeptError::TooLarge)?;
     }
+    let tokens_at = end.checked_next_multiple_of(TOKENS_ALIGN).ok_or(KeptError::TooLarge)?;
+    let total = tokens_at.checked_add(tokens.len()).ok_or(KeptError::TooLarge)?;
     let mut out: AVec<'b, u8> = Vec::try_with_capacity_in(total, alloc).map_err(|_| KeptError::OutOfMemory)?;
     out.extend_from_slice(&asked.count.to_le_bytes());
     out.extend_from_slice(&asked_len.to_le_bytes());
@@ -269,9 +310,12 @@ pub fn write_entry<'b>(asked: &Asked<'_>, expansion: &Expansion<'_>, alloc: Allo
         let len = u32::try_from(column.len()).map_err(|_| KeptError::TooLarge)?;
         out.extend_from_slice(&len.to_le_bytes());
     }
+    out.extend_from_slice(&tokens_len.to_le_bytes());
     for column in &columns {
         out.extend_from_slice(column);
     }
+    out.resize(tokens_at, 0);
+    out.extend_from_slice(&tokens);
     Ok(out)
 }
 

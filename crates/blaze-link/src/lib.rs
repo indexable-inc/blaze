@@ -67,7 +67,7 @@ use std::path::PathBuf;
 
 use blaze_codegen::{CompiledFunction, InstanceKey, Made, Static, Target};
 use blaze_core::{Effect, FileName};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::ItemKey;
 use blaze_mem::Frame;
@@ -335,7 +335,7 @@ pub struct Image {
     writer: Formats,
     plan: Plan,
     symbols: Symbols,
-    objects: HashMap<Obj, native::Read, Global>,
+    objects: Map<Obj, native::Read, FixedState, Global>,
     state: State,
     history: VecDeque<Undo>,
     pending: Option<Pending>,
@@ -457,7 +457,7 @@ impl Image {
             plan,
             // alloc: error path
             symbols: Symbols::new().map_err(|error| fail(error.to_string()))?,
-            objects: HashMap::new_in(Global),
+            objects: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             state: State::new(),
             history: VecDeque::with_capacity(commit::HISTORY + 1),
             pending: None,

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use base_db::{Crate, Db, all_crates};
 use blaze_alloc_count::assert_at_most;
 use blaze_format::Aligned;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::ContentId;
 use blaze_items::{Fact, ItemId, auto_traits, const_value, implements, key, method, rpitit_tys};
 use hir_def::{
@@ -511,7 +511,7 @@ fn a_fact_of_this_crates_kind_that_names_nothing_has_no_value() {
 
 /// A store in memory.
 pub(super) struct Memory {
-    images: Lock<HashMap<ContentId, Arc<Aligned>, Global>>,
+    images: Lock<Map<ContentId, Arc<Aligned>, FixedState, Global>>,
 }
 
 impl Default for Memory {

@@ -38,7 +38,7 @@ fn slice_layout<T>(len: usize) -> Option<Layout> {
     Some(layout.pad_to_align())
 }
 
-/// A shared `T` in `A`, counted on one thread.
+/// A shared `T` in `A`, counted on one thread: one block for value and counts; a clone is a plain increment.
 ///
 /// # Invariants
 ///

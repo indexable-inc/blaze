@@ -1,6 +1,8 @@
 //! cargo 1.99.0's (5f94df4789) resolver tests, `crates/resolver-tests/tests/resolve.rs`.
 //! cargo is MIT or Apache-2.0.
 
+#![feature(allocator_api)]
+
 #[path = "resolver/helpers.rs"]
 mod helpers;
 

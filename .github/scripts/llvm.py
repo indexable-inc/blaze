@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The one LLVM blaze's `llvm` feature links: built here, fetched everywhere else.
 
-crates/hir-ty-codegen/llvm.json pins it: the source (a repository, a ref and its commit: our
+crates/blaze-toolchain/pins/llvm.json pins it: the source (a repository, a ref and its commit: our
 fork indexable-inc/llvm, branch ix/23.x, LLVM 23.1.4 with our fixes, at the commit wasm-host's
 ix-aot pins, so blaze and ix-aot run one LLVM), where the builds are (`release`: blaze's R2
 bucket, https://blaze-releases.ix.dev/native, which llvm.yaml fills with .github/scripts/r2.py),
@@ -56,14 +56,14 @@ sys.path.insert(0, str(ROOT / "tools" / "typed-input" / "src"))
 
 from typed_input import fail, parse
 
-PIN = ROOT / "crates" / "hir-ty-codegen" / "llvm.json"
+PIN = ROOT / "crates" / "blaze-toolchain" / "pins" / "llvm.json"
 MARKER = "blaze-llvm.json"
 # The sha256 of the archive a directory was unpacked from, written by `fetch`.
 UNPACKED = "blaze-llvm.sha256"
 # What the prefix has: `ninja install-distribution` installs these components.
 # D69: the C toolchain native build scripts run with comes from the same build: `clang` (also
 # `clang++`), its resource headers, `libclang` (bindgen loads it), `lld` (`ld64.lld`, the
-# linker the shelf's `clang.cfg` names) and `llvm-ar`. The pin in crates/hir-ty-codegen/clang.json
+# linker the shelf's `clang.cfg` names) and `llvm-ar`. The pin in crates/blaze-toolchain/pins/clang.json
 # moves to this archive once it carries them.
 COMPONENTS = [
     "llvm-libraries", "llvm-headers", "cmake-exports", "llvm-config", "llvm-dwarfdump", "llvm-pdbutil",

@@ -235,7 +235,9 @@ const SHARDS: usize = 128;
     clippy::disallowed_types,
     reason = "a shard of the process's index of flights: held to add, find or drop one key"
 )]
-type Shard = blaze_core::lock::Lock<blaze_hash::HashMap<Key, Arc<Cell>, std::alloc::Global>>;
+type Shard = blaze_core::lock::Lock<
+    blaze_hash::Map<Key, Arc<Cell>, blaze_hash::FixedState, std::alloc::Global>,
+>;
 
 /// The shard of the process's index of flights that has `key`: every key with a flight now,
 /// and the scheduler that has it (or one joined into it), so a key has one flight in all the
@@ -252,7 +254,11 @@ fn index(key: Key) -> &'static Shard {
             .map(|_| {
                 blaze_core::lock::Lock::new(
                     "sched.flights.index",
-                    blaze_hash::HashMap::with_capacity_in(4, std::alloc::Global),
+                    blaze_hash::Map::new(blaze_hash::MapOpts {
+                        hasher: blaze_hash::FixedState,
+                        alloc: std::alloc::Global,
+                        capacity: Some(4),
+                    }),
                 )
             })
             .collect()

@@ -234,8 +234,12 @@ impl PackageIdSpec {
 
 /// Of the ids `spec` matches, each by the least that tells it apart.
 fn minimize(msg: &mut String, ids: &[PackageId], spec: &PackageIdSpec) {
-    let mut version_cnt: blaze_hash::HashMap<&Version, usize, std::alloc::Global> =
-        Default::default();
+    let mut version_cnt: blaze_hash::Map<&Version, usize, blaze_hash::FixedState, std::alloc::Global> =
+        blaze_hash::Map::new(blaze_hash::MapOpts {
+            hasher: blaze_hash::FixedState,
+            alloc: std::alloc::Global,
+            capacity: None,
+        });
     for id in ids {
         *version_cnt.entry(id.version()).or_insert(0) += 1;
     }

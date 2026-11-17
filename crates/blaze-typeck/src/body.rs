@@ -115,8 +115,9 @@ pub enum Expr {
     /// constant expression ... of type `usize`") and its type recorded like any other's. It is
     /// a constant context: it captures nothing.
     Repeat { elem: ExprId, len: PTy, count: Option<ExprId> },
-    /// `fields` in `BodyView::field_inits`.
-    Struct { path: PathIdx, fields: List, base: Option<ExprId> },
+    /// `fields` in `BodyView::field_inits`; what the fields it does not write are taken from
+    /// in `base` ([`StructBase`]).
+    Struct { path: PathIdx, fields: List, base: StructBase },
     Index { base: ExprId, index: ExprId },
     /// `params` in `pat_lists`; `param_tys` in `BodyView::opt_types`, one per param.
     /// `is_async`: `async |..| body`, whose call returns a future of `body` (and `ret`, when
@@ -261,6 +262,31 @@ pub struct Arm {
     pub body: ExprId,
 }
 
+/// Where a struct expression's unwritten fields come from (the Reference, "Struct
+/// expressions"; RFC 3681 for `Defaults`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StructBase {
+    /// `S { a: 1 }`: every field is written.
+    None,
+    /// `S { a: 1, ..base }`: each unwritten field is moved or copied out of `base`
+    /// (`Checked::fru_fields`).
+    Expr(ExprId),
+    /// `S { a: 1, .. }` (`default_field_values`): each unwritten field is its default, the
+    /// field's anonymous constant at the expression's type arguments
+    /// (`Checked::default_fields`).
+    Defaults,
+}
+
+impl StructBase {
+    /// The base expression of a struct update, if this is one.
+    pub fn expr(self) -> Option<ExprId> {
+        match self {
+            StructBase::Expr(b) => Some(b),
+            StructBase::None | StructBase::Defaults => None,
+        }
+    }
+}
+
 /// `name: expr` in a struct expression.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FieldInit {
@@ -359,6 +385,12 @@ pub struct BodyView<'b> {
     pub asm_clobbers: &'b [(u32, u32)],
     /// Every text an `asm!` names: templates (cooked), class and register names, ABI names.
     pub asm_text: &'b str,
+    /// The value of each integer literal that is an argument of a call (`f(x, 0)`'s `0`), or the
+    /// operand of a `-` that is one (`f(x, -1)`'s `1`), as written without a sign; ascending by
+    /// the literal's id. A literal's value is no type, so only the argument a
+    /// `#[rustc_legacy_const_generics]` callee takes as a const generic reads it
+    /// (rules/legacy_const.rs); the lowering, which holds the text, fills it.
+    pub call_arg_ints: &'b [(ExprId, u128)],
 }
 
 fn slice<'b, T>(column: &'static str, all: &'b [T], l: List) -> Result<&'b [T], CheckError> {
@@ -466,6 +498,12 @@ impl<'b> BodyView<'b> {
     pub(crate) fn method_name_range(&self, e: ExprId) -> Option<Range> {
         let i = self.method_name_ranges.binary_search_by_key(&e, |&(x, _)| x).ok()?;
         self.method_name_ranges.get(i).map(|&(_, r)| r).filter(|r| r.end > r.start)
+    }
+
+    /// The value of the integer literal `e`, when the lowering gave it (`call_arg_ints`).
+    pub(crate) fn call_arg_int(&self, e: ExprId) -> Option<u128> {
+        let i = self.call_arg_ints.binary_search_by_key(&e, |&(x, _)| x).ok()?;
+        self.call_arg_ints.get(i).map(|&(_, v)| v)
     }
 
     /// The number of nodes, which sizes the frame column.

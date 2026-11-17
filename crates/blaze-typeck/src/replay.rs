@@ -143,6 +143,12 @@ fn ask<'w, 'a, W: World>(reads: &mut Reads<'w, 'a, W>, body: &BodyView<'_>, q: Q
         Question::AssocGenerics(trait_, name) => {
             reads.assoc_generics(trait_, name)?;
         }
+        Question::TypeAlias(item) => {
+            reads.type_alias(item)?;
+        }
+        Question::FieldDefaults(adt) => {
+            reads.field_defaults(adt)?;
+        }
     }
     Ok(Asked::Answered)
 }
@@ -223,6 +229,7 @@ mod tests {
             asm_operands: &[],
             asm_clobbers: &[],
             asm_text: "",
+            call_arg_ints: &[],
         }
     }
 

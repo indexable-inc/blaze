@@ -2,6 +2,7 @@
 //! ([`sim`]); the wire's bytes against blaze-protocol's check of the deterministic encoding
 //! ([`wire`]); and here, what one call of the core refuses and what the area gives back.
 
+mod grants;
 mod image;
 mod observe;
 mod record;

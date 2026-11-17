@@ -20,9 +20,9 @@ use crate::infer::InferPlant;
 use crate::machine::Plant;
 use crate::portable::{PNode, PTy};
 
-const UNSAFE: FnPtrHeader = FnPtrHeader { abi: Abi::Rust, safety: Safety::Unsafe };
-const C: FnPtrHeader = FnPtrHeader { abi: Abi::C, safety: Safety::Safe };
-const UNSAFE_C: FnPtrHeader = FnPtrHeader { abi: Abi::C, safety: Safety::Unsafe };
+const UNSAFE: FnPtrHeader = FnPtrHeader { abi: Abi::Rust, safety: Safety::Unsafe, c_variadic: false };
+const C: FnPtrHeader = FnPtrHeader { abi: Abi::C, safety: Safety::Safe, c_variadic: false };
+const UNSAFE_C: FnPtrHeader = FnPtrHeader { abi: Abi::C, safety: Safety::Unsafe, c_variadic: false };
 
 /// The world: `f`, `g`, `h`, and the owner `fn main(p: fn(u8) -> u8)`.
 fn world() -> (Fx, ItemKey) {

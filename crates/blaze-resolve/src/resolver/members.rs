@@ -7,7 +7,7 @@ use std::fmt::Write;
 use std::rc::Rc;
 
 use super::features::CliFeatures;
-use super::{CargoResult, HashMap, HashSet};
+use super::{CargoResult, FixedState, Map, MapOpts, Set};
 use crate::dependency::Dependency;
 use crate::edit_distance::{closest_msg, edit_distance};
 use crate::interning::InternedString;
@@ -69,11 +69,11 @@ fn collect_matching_features(
     let summary_features = member.features();
 
     // Dependency name -> dependency
-    let dependencies: HashMap<InternedString, &Dependency, Global> =
+    let dependencies: Map<InternedString, &Dependency, FixedState, Global> =
         member.dependencies().iter().map(|dep| (dep.name_in_toml(), dep)).collect();
 
     // Features that enable optional dependencies
-    let optional_dependency_names: HashSet<_, Global> = dependencies
+    let optional_dependency_names: Set<_, FixedState, Global> = dependencies
         .iter()
         .filter(|(_, dep)| dep.is_optional())
         .map(|(name, _)| name)
@@ -385,8 +385,8 @@ fn members_with_features_old<'a>(
 ) -> Vec<(&'a Summary, CliFeatures)> {
     // Split off any features with the syntax `member-name/feature-name` into a map
     // so that those features can be applied directly to those workspace-members.
-    let mut member_specific_features: HashMap<InternedString, BTreeSet<FeatureValue>, Global> =
-        HashMap::new_in(Global);
+    let mut member_specific_features: Map<InternedString, BTreeSet<FeatureValue>, FixedState, Global> =
+        Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     // Features for the member in the current directory.
     let mut cwd_features = BTreeSet::new();
     for feature in cli_features.features.iter() {

@@ -52,6 +52,8 @@ pub mod asked;
 pub mod blocks;
 pub mod expanded_blocks;
 pub mod expansion_origins;
+pub mod nested_input;
+pub mod crate_roots;
 mod builtin;
 // The cell core (bottom.md section 6): the names records' one writer.
 pub mod cell_key;
@@ -70,6 +72,8 @@ pub mod include_place;
 pub mod left_reads;
 pub mod included;
 pub mod items_record;
+// D116: names at module grain (tables of links, `Imports`, their part reads and the hop walk).
+pub mod links;
 mod lookup;
 pub mod names;
 pub mod names_record;

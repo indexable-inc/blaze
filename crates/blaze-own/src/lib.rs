@@ -54,6 +54,7 @@
 //! | `allocator_ext` | `AllocatorClone`, the bound for sharing one allocator between the owners of an [`Arc`] or [`Rc`] (each may free the block); `StaticAllocator`, the bound for pinning a [`Box`], [`Arc`] or [`Rc`] |
 //! | `coerce_unsized` | `Box<T, A>` to `Box<dyn Trait, A>` and `Box<[T; N], A>` to `Box<[T], A>`, the same for [`Arc`], [`Rc`] and their `Weak`s |
 //! | `unsize` | the `Unsize` bound of those impls |
+//! | `pin_coerce_unsized_trait` | `core::pin::PinSafePointer` for a [`Box`] in a `StaticAllocator`, so `Pin<Box<T, A>>` unsizes to `Pin<Box<dyn Trait, A>>` as std's does |
 //! | `dropck_eyepatch` | `#[may_dangle]` on the `Drop` of every owner, so a `Vec<&'a T, A>` may be dropped after `'a` ends, as std's may |
 //! | `fn_traits`, `unboxed_closures` | `FnOnce`, `FnMut` and `Fn` for a [`Box`] of a [`CallOnce`] closure, so a boxed one-shot closure is called as `b(x)` |
 //! | `tuple_trait` | the `Tuple` bound on those impls' argument lists |
@@ -80,7 +81,7 @@
 //! `Rc` and `rc::Weak` are neither.
 
 #![no_std]
-#![feature(allocator_ext, coerce_unsized, unsize, dropck_eyepatch)]
+#![feature(allocator_ext, coerce_unsized, unsize, dropck_eyepatch, pin_coerce_unsized_trait, fmt_internals)]
 #![feature(fn_traits, unboxed_closures, tuple_trait)]
 // The fast paths of `spec`: one block copy or one byte search where a generic method would go
 // element by element.

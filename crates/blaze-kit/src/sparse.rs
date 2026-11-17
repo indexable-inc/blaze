@@ -67,7 +67,7 @@ pub const COMPACT_FROM: usize = 32;
 /// positions are 32-bit.
 pub const MOST_DOMAIN: u32 = 1 << 31;
 
-/// A set of ids `I` below a domain, in `A` (see the module).
+/// A set of ids `I` below a domain, in `A` (see the module): insert, remove and contains O(1), a bit and 4 bytes an id of the domain plus 4 a member.
 pub struct SparseSet<I: Id, A: Allocator> {
     dense: Vec<u32, A>,
     /// A bit per id of the domain: whether it is in.

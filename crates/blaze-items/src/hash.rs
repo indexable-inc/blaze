@@ -41,7 +41,7 @@
 use std::{alloc::Allocator, fmt, fmt::Write as _};
 
 use base_db::Db;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::{ContentId, Hasher};
 use blaze_mem::{Frame, Tag, frame};
 use hir_def::AdtId;
@@ -1003,7 +1003,7 @@ struct Tarjan<'a, 'f> {
     krate: base_db::Crate,
     known: Option<Components<'a>>,
     // alloc: std's map takes no allocator; one per search.
-    index: HashMap<ItemId, usize, Global>,
+    index: Map<ItemId, usize, FixedState, Global>,
     low: Vec<usize, &'f Frame>,
     on_stack: Vec<bool, &'f Frame>,
     stack: Vec<ItemId, &'f Frame>,
@@ -1024,7 +1024,7 @@ impl<'a, 'f> Tarjan<'a, 'f> {
             graph,
             krate,
             known,
-            index: HashMap::new_in(Global),
+            index: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             low: Vec::new_in(frame),
             on_stack: Vec::new_in(frame),
             stack: Vec::new_in(frame),

@@ -61,7 +61,11 @@ mod tool_attrs {
         assert!(TOOLS.windows(2).all(|w| w[0] < w[1]), "TOOLS sorted, no name twice");
         assert!(TOOLS.contains(&BLAZE), "blaze is a registered tool");
         assert!(KNOWN.windows(2).all(|w| w[0].name < w[1].name), "KNOWN sorted, no name twice");
-        assert!(KNOWN.iter().all(|k| k.state == State::Unchecked), "no stage checks a blaze attribute in this build yet");
+        // `args` is the one a stage checks (the body check's `args-inline`, rule 83).
+        assert!(
+            KNOWN.iter().all(|k| k.state == State::Unchecked || (k.name == "args" && k.state == State::Checked(crate::tool_attrs::Stage::Syntax))),
+            "no stage checks a blaze attribute in this build yet but `args`"
+        );
     }
 
     #[test]

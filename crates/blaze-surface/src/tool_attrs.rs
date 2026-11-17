@@ -71,13 +71,16 @@ const fn known(name: &'static str, planned: Stage) -> KnownAttr {
 }
 
 /// Every `blaze::` attribute this build knows, sorted by name: the extensions ledger's section 3
-/// (2026-11-16), every one known and unchecked today. A stage that starts to check one, or the
+/// (2026-11-16), every one known and unchecked today but `args` (rule 83, 2026-11-17). A stage that starts to check one, or the
 /// verdict that removes one, changes its `state` here and nowhere else.
-pub const KNOWN: [KnownAttr; 49] = {
+pub const KNOWN: [KnownAttr; 50] = {
     use Stage::*;
     [
         known("answers_request", Effects),
         known("arbitrary_ints", Syntax),
+        // An options struct (AGENTS.md rule 83, D126): checked by the body check's `args-inline`
+        // (blaze-typeck rules/args_inline.rs), read from the ADT's head (front2 heads.rs).
+        KnownAttr { name: "args", state: State::Checked(Syntax), planned: Syntax },
         known("attr", Comptime),
         known("bits", Syntax),
         known("bounded_turn", Effects),

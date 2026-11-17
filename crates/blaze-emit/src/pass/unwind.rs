@@ -143,6 +143,9 @@ impl<A: Allocator> Pass<'_, '_, A> {
             form.unwind.current = block.index();
         }
         if view.block_kind(block).is_landing() {
+            // `sp` as at the call, lower when it had stacked arguments: put back first
+            // (pass/stack.rs); `x0` is untouched by it.
+            self.restore_sp();
             let param = view.params(block).start;
             self.st(X0, param);
         }

@@ -87,7 +87,7 @@ use core::alloc::Allocator;
 use core::fmt;
 
 use blaze_own::Alloc;
-use blaze_typeck::{Adt, AdtKind, FloatTy, IntTy, ItemKey, Name, PNode, PTy, PortableTys, UintTy};
+use blaze_typeck::{Adt, AdtKind, ExprId, FloatTy, IntTy, ItemKey, Name, PNode, PTy, PortableTys, UintTy};
 
 use crate::{BuildError, ground};
 
@@ -235,11 +235,15 @@ pub struct ClosureFacts<'a> {
     pub env: PTy,
 }
 
-/// The facts of closure `ordinal` of the body `checked` records, written into `out` (the seam's
-/// own table; `generics` the owner's parameter count, parents first): the kind and signature
-/// the checker recorded (`Checked::closures[ordinal]`), and the environment from its captures.
-/// The answer of [`LayoutFacts::closure`]; it holds no expression id of the body.
+/// The facts of closure `ordinal` of `body`, whose record is `checked`, written into `out` (the
+/// seam's own table; `generics` the owner's parameter count, parents first): the kind and
+/// signature the checker recorded (`Checked::closures[ordinal]`), and the environment from its
+/// captures ([`environment`]). Every type is copied AS WRITTEN ([`crate::copy_written`]): an
+/// `impl Trait` capture, a projection in the signature and an `async` block the closure returns
+/// stay what the record says, settled when an instance grounds them with the world's facts. The
+/// answer of [`LayoutFacts::closure`]; it holds no expression id of the body.
 pub fn closure_facts(
+    body: &blaze_typeck::BodyView<'_>,
     checked: &blaze_typeck::Checked<'_>,
     ordinal: u32,
     generics: u32,
@@ -257,25 +261,8 @@ pub fn closure_facts(
     for i in 0..generics {
         params.push(out.intern(PNode::Param(i)).map_err(full)?);
     }
-    let from = checked.types.view();
-    let sig = ground(from, sig, &params, out, scratch, &NoFacts)?;
-    let mut fields: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
-    let caps = &checked.captures;
-    for c in 0..caps.len() {
-        if caps.column::<0>()[c] != e {
-            continue;
-        }
-        let (p, by) = (caps.column::<1>()[c], caps.column::<2>()[c]);
-        let lt = *checked.local_ty.get(p.ix()).ok_or(BuildError::Malformed { what: "a captured binding without a type" })?;
-        let t = ground(from, lt, &params, out, scratch, &NoFacts)?;
-        fields.push(match by {
-            blaze_typeck::CaptureKind::ByRef => out.intern(PNode::Ref(blaze_typeck::Mutbl::Not, t)).map_err(full)?,
-            blaze_typeck::CaptureKind::ByMutRef => out.intern(PNode::Ref(blaze_typeck::Mutbl::Mut, t)).map_err(full)?,
-            blaze_typeck::CaptureKind::ByValue => t,
-        });
-    }
-    let l = out.intern_list(&fields).map_err(full)?;
-    let env = out.intern(PNode::Tuple(l)).map_err(full)?;
+    let sig = crate::copy_written(checked.types.view(), sig, &params, body, out, scratch)?;
+    let env = environment(body, checked, e, &params, out, scratch)?;
     let kind = match kind {
         blaze_typeck::ClosureKind::Fn => crate::FnTrait::Fn,
         blaze_typeck::ClosureKind::FnMut => crate::FnTrait::FnMut,
@@ -284,25 +271,43 @@ pub fn closure_facts(
     Ok((kind, sig, env))
 }
 
-/// Facts that answer nothing: copying a record's types keeps its projections as written.
-pub(crate) struct NoFacts;
+/// The captures of closure or `async` block `e` of the body `checked` records, in the checker's
+/// order (the rows of `Checked::captures` whose first column is `e`): the binding and how. THE
+/// ONE LIST an environment is made of. Field `j` of the environment IS capture `j` here: the
+/// facts' environment type ([`environment`], for [`closure_facts`] and `coroutine_facts`) and the
+/// walk's every write and read of a capture (closure.rs `captures_of`, coroutine.rs) take it from
+/// this function, so the two cannot disagree on a count or an order.
+pub fn captures<'c>(checked: &'c blaze_typeck::Checked<'_>, e: ExprId) -> impl Iterator<Item = (blaze_typeck::PatId, blaze_typeck::CaptureKind)> + 'c {
+    let caps = &checked.captures;
+    (0..caps.len()).filter(move |&c| caps.column::<0>()[c] == e).map(move |c| (caps.column::<1>()[c], caps.column::<2>()[c]))
+}
 
-impl LayoutFacts for NoFacts {
-    fn adt(&self, _: ItemKey) -> Option<Adt<'_>> {
-        None
+/// The ENVIRONMENT of closure or `async` block `e`: a tuple of one field per [`captures`] row,
+/// in its order (the Reference, "Closure types": "approximately equivalent to a struct which
+/// contains the captured values"), `&T` for `ByRef`, `&mut T` for `ByMutRef`, `T` for
+/// `ByValue`, each binding's type copied as written into `out` at `params`.
+pub(crate) fn environment(
+    body: &blaze_typeck::BodyView<'_>,
+    checked: &blaze_typeck::Checked<'_>,
+    e: ExprId,
+    params: &[PTy],
+    out: &mut PortableTys<'_>,
+    scratch: Alloc<'_>,
+) -> Result<PTy, BuildError> {
+    let full = |_| BuildError::Malformed { what: "an environment's facts table is full" };
+    let from = checked.types.view();
+    let mut fields: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
+    for (p, by) in captures(checked, e) {
+        let lt = *checked.local_ty.get(p.ix()).ok_or(BuildError::Malformed { what: "a captured binding without a type" })?;
+        let t = crate::copy_written(from, lt, params, body, out, scratch)?;
+        fields.push(match by {
+            blaze_typeck::CaptureKind::ByRef => out.intern(PNode::Ref(blaze_typeck::Mutbl::Not, t)).map_err(full)?,
+            blaze_typeck::CaptureKind::ByMutRef => out.intern(PNode::Ref(blaze_typeck::Mutbl::Mut, t)).map_err(full)?,
+            blaze_typeck::CaptureKind::ByValue => t,
+        });
     }
-
-    fn repr(&self, _: ItemKey) -> ReprAttrs {
-        ReprAttrs::RUST
-    }
-
-    fn discriminant(&self, _: ItemKey, _: u32) -> Result<Option<i128>, Missing> {
-        Ok(None)
-    }
-
-    fn valid_range(&self, _: ItemKey) -> ValidRange {
-        ValidRange::default()
-    }
+    let l = out.intern_list(&fields).map_err(full)?;
+    out.intern(PNode::Tuple(l)).map_err(full)
 }
 
 /// What a layout reads and where it grounds field types.
@@ -467,12 +472,23 @@ pub enum Tail {
     Dyn,
 }
 
+/// The static part of a layout ending in a trait object ([`Layouts::dyn_prefix`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DynPrefix {
+    /// Where the sized prefix ends: the trait object's offset before it is rounded up to the
+    /// vtable's alignment.
+    pub tail_at: u64,
+    /// log2 of the sized prefix's alignment (`repr(align)` included).
+    pub align: u8,
+}
+
 /// A type's layout.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Layout {
     /// The type (of the ground table); a variant's row holds its enum's type.
     pub ty: PTy,
-    /// The size; of an unsized layout, the offset where its tail starts.
+    /// The size; of an unsized layout, the offset where its tail starts, not rounded up to the
+    /// alignment (`Layouts::size_of_val` rounds once, after adding the tail).
     pub size: u64,
     /// log2 of the alignment.
     pub align: u8,
@@ -765,17 +781,39 @@ impl<A: Allocator + Clone> Layouts<A> {
     }
 
     /// The size of a value of layout `id` whose metadata (an unsized tail's length) is `len`.
-    /// `None` for a trait object: its size is its vtable's word 1, read at run time.
+    /// `None` for a trait object: its size is its vtable's word 1, read at run time. A slice or
+    /// `str` tail: rustc's `size_and_align_of_dst`, `round_up(tail_at + len * stride, align)`,
+    /// where `tail_at` is the row's unrounded `size` (`univariant`) and `align` already holds
+    /// the element's alignment.
     pub fn size_of_val(&self, id: LayoutId, len: u64) -> Option<u64> {
         let l = self.rows.get(id.0 as usize)?;
         match l.tail {
             Tail::Sized => Some(l.size),
             Tail::Slice { stride } => {
-                let end = stride.checked_mul(len)?.checked_add(l.size)?;
+                let tail_at = l.size;
+                let end = stride.checked_mul(len)?.checked_add(tail_at)?;
                 align_up(end, l.align).ok()
             }
             Tail::Dyn => None,
         }
+    }
+
+    /// What of a trait object or a struct ending in one (`ArcInner<dyn Tr>`) is static: the
+    /// tail's offset before it is rounded up to the vtable's alignment, and the alignment of
+    /// the sized prefix. `None` for a row that does not end in a trait object. A bare `dyn Tr`
+    /// is the empty prefix (offset 0, alignment 1). Its run-time size and alignment are
+    /// `dyn_tail::size_and_align`.
+    pub fn dyn_prefix(&self, id: LayoutId) -> Option<DynPrefix> {
+        let l = self.rows.get(id.0 as usize)?;
+        if l.tail != Tail::Dyn {
+            return None;
+        }
+        let tail_at = match l.fields {
+            Fields::Struct { len: 0, .. } => 0,
+            Fields::Struct { first, len } => *self.offsets.get((first + len - 1) as usize)?,
+            Fields::Primitive | Fields::Union { .. } | Fields::Array { .. } => return None,
+        };
+        Some(DynPrefix { tail_at, align: l.align })
     }
 
     fn slot(&mut self, t: PTy) -> &mut u32 {
@@ -1199,8 +1237,8 @@ impl<A: Allocator + Clone> Layouts<A> {
     }
 
     /// Fields `parts` (by declaration) placed in `order` from offset `start`, the alignment at
-    /// least `min_align`, with `attrs`' packing and alignment. The size is rounded up to the
-    /// alignment.
+    /// least `min_align`, with `attrs`' packing and alignment. A sized result's size is rounded
+    /// up to the alignment; an unsized one's is its tail's offset, unrounded.
     fn univariant(&mut self, parts: &[PTy], order: Order, attrs: ReprAttrs, start: u64, min_align: u8) -> Result<Uni, Refusal> {
         let mut ids: Vec<LayoutId, A> = Vec::with_capacity_in(parts.len(), self.alloc.clone());
         for &p in parts {
@@ -1238,9 +1276,23 @@ impl<A: Allocator + Clone> Layouts<A> {
         for &i in place.iter() {
             let l = *self.get(ids[i as usize]);
             if l.tail == Tail::Dyn {
-                // `struct S { a: u8, t: dyn Tr }` (`RcInner<dyn Tr>`): the tail's offset is
-                // rounded up to the vtable's alignment, a run-time value.
-                return Err(Refusal::Unsupported("a struct ending in a trait object (`dyn`): its tail's offset is read from the vtable"));
+                // `struct S { a: u8, t: dyn Tr }` (`ArcInner<dyn Tr>`): the trait object's offset
+                // is the prefix's end rounded up to the vtable's alignment, a run-time value
+                // (`dyn_tail`). Its row here is that end unrounded: `dyn`'s own alignment is 1
+                // and its size 0, so the plain placement below puts it there.
+                if !matches!(l.fields, Fields::Struct { len: 0, .. }) {
+                    // `struct Outer { a: u8, inner: S<dyn Tr> }`: `inner`'s own offset depends
+                    // on the vtable's alignment too, so a single rounding of a static offset
+                    // is not its place.
+                    return Err(Refusal::Unsupported(
+                        "a struct whose last field is itself a struct ending in a trait object (`dyn`): the nested tail's offset needs two run-time roundings",
+                    ));
+                }
+                if attrs.packed.is_some() {
+                    // The Reference, `[layout.repr.alignment.packed-fields]`: the vtable's
+                    // alignment would be capped by the packing, which `dyn_tail` does not read.
+                    return Err(Refusal::Unsupported("a `repr(packed)` struct ending in a trait object (`dyn`)"));
+                }
             }
             let a = field_align(&l);
             let off = align_up(at, a)?;
@@ -1259,7 +1311,12 @@ impl<A: Allocator + Clone> Layouts<A> {
         if let Some(raise) = attrs.align {
             align = align.max(raise);
         }
-        let size = align_up(at, align)?;
+        // An unsized layout's `size` is where its tail starts (`Layout::size`), never rounded:
+        // rustc's `size_and_align_of_dst` rounds `tail_at + len * stride` once, so rounding the
+        // prefix here first would answer 24, not 16, for `{ u64, u8, [u8] }` of length 3. The
+        // tail's own row has size 0, so `at` is its offset, or, for a struct ending in an unsized
+        // struct, that struct's offset plus its own tail's start.
+        let size = if tail == Tail::Sized { align_up(at, align)? } else { at };
         // A newtype (one field of the whole size at offset 0, the rest zero-sized) carries its
         // field's scalar or pair.
         let mut scalar = None;

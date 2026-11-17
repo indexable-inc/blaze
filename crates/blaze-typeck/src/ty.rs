@@ -210,6 +210,12 @@ pub trait TypeCtx {
     /// Makes `a` and `b` equal, binding variables. `Ok(false)`: they cannot be, and nothing was
     /// bound (the context rolls back its own partial work).
     fn unify(&mut self, a: Ty, b: Ty) -> Result<bool, CheckError>;
+    /// [`TypeCtx::unify`], where each projection goal the relation defers (an alias met by
+    /// another type, `<X as Tr>::A == u16`) is an obligation of `cause`: when it later fails,
+    /// the finding is at the place whose check related the two types, never at no place
+    /// (error.rs `DiagWithoutPlace`). `unify` is this at `Cause::Body`, for relations no
+    /// finding comes from (a probe rolled back, an instance's selection).
+    fn unify_at(&mut self, a: Ty, b: Ty, cause: Cause) -> Result<bool, CheckError>;
 
     /// Starts a snapshot.
     fn snapshot(&mut self) -> Self::Snapshot;

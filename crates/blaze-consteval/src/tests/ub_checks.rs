@@ -34,6 +34,28 @@ fn ub_checks_is_true_in_every_constant() {
     assert_eq!(eval_int(&mut w, "D"), Ok(1), "`ub_checks()` itself is `true`");
 }
 
+/// `overflow_checks()` is `true` in a constant, whatever the build's overflow setting: the
+/// pinned core's doc says "In consteval, this function currently returns `true`", as for
+/// `ub_checks`. imbl's `ITER_STACK_CAPACITY = HASH_WIDTH.div_ceil(HASH_SHIFT) + 1` reaches it
+/// through core's `div_ceil` (uint_macros.rs: `if intrinsics::overflow_checks() { .. }`); `f`
+/// is that form, the checked arm taken. Without the table row and the evaluator's arm the
+/// constants are refused as `UnknownIntrinsic`.
+/// Prints `test tests::ub_checks::overflow_checks_is_true_in_every_constant ... ok`.
+#[test]
+fn overflow_checks_is_true_in_every_constant() {
+    let mut w = world();
+    let b = w.fx.ty(PNode::Bool);
+    w.intrinsic("overflow_checks", 0, &[], b, Intrinsic::OverflowChecks);
+    w.const_fn("f", &[], "usize", "{ if overflow_checks() { 7 } else { 9 } }");
+    w.konst("CAP1", "usize", "f() + 1");
+    w.konst("CAP2", "usize", "f() + 1");
+    w.konst("O", "bool", "overflow_checks()");
+    w.build();
+    assert_eq!(eval_int(&mut w, "CAP1"), Ok(8), "the first root compiles `f` and runs it");
+    assert_eq!(eval_int(&mut w, "CAP2"), Ok(8), "the second root runs `f`'s kept code");
+    assert_eq!(eval_int(&mut w, "O"), Ok(1), "`overflow_checks()` itself is `true`");
+}
+
 /// A `#[rustc_intrinsic]` fn the table does not hold is refused as that, by item, in every
 /// root: the refusal is kept in `g`'s compiled code and the second root, which reuses it,
 /// names the same reason (never "not a `const fn`", and never the "kept refusal of a kind

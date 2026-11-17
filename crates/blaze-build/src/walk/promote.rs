@@ -22,7 +22,9 @@
 //! its [`InstanceKey`]. The walk can reference only an instance it names as an [`Instance`], so
 //! the candidates are the fn items the operand itself names (`clone_arc_raw::<W>` at this
 //! instance's arguments), each keyed by [`crate::Adts::promoted_fn_key`] exactly as the program
-//! keys instances; a relocation to any other instance is refused by name.
+//! keys instances; any other (`&SOME_TABLE`, a constant path whose value holds fn pointers) is
+//! the instance [`crate::Adts::const_fn_instance`] gives, as for a constant path's value, or is
+//! refused by name.
 
 use core::alloc::Allocator;
 
@@ -77,7 +79,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     let l = self.body.expr_lists.get(elems.range()).ok_or(malformed("a promoted literal's elements past `expr_lists`"))?;
                     work.extend_from_slice(l);
                 }
-                Expr::Struct { fields, base: None, .. } => {
+                Expr::Struct { fields, base: blaze_typeck::StructBase::None, .. } => {
                     let inits = self.body.field_inits.get(fields.range()).ok_or(malformed("a promoted struct literal's fields past `field_inits`"))?;
                     for f in inits {
                         work.push(f.expr);
@@ -107,9 +109,13 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     }
 
     /// Each allocation of `record` as a data row of the function, its relocations resolved;
-    /// returns the root's address. A fn target is one of `fns` (a promoted operand's), each a
-    /// `Func` reference of this function; a constant path passes none. Rows are made targets
-    /// first, by an explicit stack; a cycle among the allocations is refused.
+    /// returns the root's address: the one home of a promoted borrow's rows and of a constant
+    /// path's or a const block's (walk.rs `const_record_value`, which passes no `fns`). A fn
+    /// target is a `Func` reference of this function: one of `fns` (the fn items a promoted
+    /// operand names), else the instance [`crate::Adts::const_fn_instance`] says the evaluator
+    /// keyed (a fn the constant's own body names, or one a `const fn` it called made), else
+    /// refused with [`BuildError::NoConstFnInstance`]. Rows are made targets first, by an
+    /// explicit stack; a cycle among the allocations is refused.
     pub(super) fn data_rows(&mut self, e: ExprId, record: &DataRecord<std::alloc::Global>, fns: &[(InstanceKey, Instance)]) -> Result<Value, BuildError> {
         const TODO: u8 = 0;
         const OPEN: u8 = 1;
@@ -156,13 +162,20 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                         let place = self.static_place(s, false)?;
                         self.b.reference(RefKind::Static, place)
                     }
-                    DataTarget::Fn(key) => match fns.iter().find(|&&(k, _)| k == key) {
-                        Some(&(_, instance)) => {
-                            let place = self.ref_place(instance);
-                            self.b.reference(RefKind::Func, place)
-                        }
-                        None => return Err(unsupported(e, "a constant holding a fn pointer to an instance its own expression does not name")),
-                    },
+                    // It becomes a `Func` reference of this function exactly as a fn item
+                    // coerced to a fn pointer here does, so the run reaches it by `Built::refs`.
+                    DataTarget::Fn(key) => {
+                        let instance = match fns.iter().find(|&&(k, _)| k == key) {
+                            Some(&(_, instance)) => instance,
+                            None => {
+                                let adts = self.adts;
+                                adts.const_fn_instance(key, self.ground).ok_or(BuildError::NoConstFnInstance { expr: e, key })?
+                            }
+                        };
+                        self.refuse_tracked_pointer(e, instance)?;
+                        let place = self.ref_place(instance);
+                        self.b.reference(RefKind::Func, place)
+                    }
                     DataTarget::Vtable(_) => return Err(unsupported(e, "a const holding a `&dyn Trait` (its vtable is not a reference of this function)")),
                 };
                 relocs.push(DataReloc { offset: r.offset, target, addend });

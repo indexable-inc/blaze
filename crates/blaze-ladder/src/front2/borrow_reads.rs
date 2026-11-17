@@ -62,8 +62,8 @@ pub enum HeadAnswer<'s> {
         callee: CalleeFacts,
         /// The lifetime part `read_signature` read, or why it refused the text.
         sig: Result<SigLife<'s>, SigRefusal>,
-        /// Each ADT the reading asked about, sorted, with whether its head declares lifetimes.
-        adts: &'s [(u128, bool)],
+        /// Each ADT the reading asked about, sorted, with how many lifetimes its head declares.
+        adts: &'s [(u128, u32)],
     },
 }
 
@@ -97,7 +97,6 @@ fn refusal(h: &mut StableHasher, why: SigRefusal) {
         SigRefusal::NoFn => (1, 0, 0),
         SigRefusal::ParamCount { text, head } => (2, text, head),
         SigRefusal::Unaligned { at } => (3, at, 0),
-        SigRefusal::TwoLifetimesOneOrigin { at } => (4, at, 0),
         SigRefusal::ElisionUndecided { at } => (5, at, 0),
         SigRefusal::ObjectDefault { at } => (6, at, 0),
         SigRefusal::Unknown => (7, 0, 0),
@@ -120,9 +119,10 @@ pub fn adt_read(adt: u128, answer: AdtAnswer<'_>) -> Read {
             option_bool(&mut h, copy);
             option_bool(&mut h, drop_impl);
             let AdtFacts { copy: c, drop_impl: d, needs_drop, lifetimes, union, is_enum, is_box } = facts;
-            for v in [c, d, needs_drop, lifetimes, union, is_enum, is_box] {
+            for v in [c, d, needs_drop, union, is_enum, is_box] {
                 flag(&mut h, v);
             }
+            h.u32(lifetimes);
             h.u32(variant_lens.len() as u32);
             for &len in variant_lens {
                 h.u32(len);
@@ -171,7 +171,7 @@ pub fn head_read(item: u128, answer: HeadAnswer<'_>) -> Read {
             h.u32(adts.len() as u32);
             for &(adt, lifetimes) in adts {
                 h.u128(adt);
-                flag(&mut h, lifetimes);
+                h.u32(lifetimes);
             }
         }
     }
@@ -181,7 +181,7 @@ pub fn head_read(item: u128, answer: HeadAnswer<'_>) -> Read {
 /// A recorder of the ADTs `read_signature` asks about (its `adt_lifetimes` is a `&dyn Fn`):
 /// each asked ADT with the answer given.
 pub struct AskedAdts<'a> {
-    asked: RefCell<AVec<'a, (u128, bool)>>,
+    asked: RefCell<AVec<'a, (u128, u32)>>,
     alloc: Alloc<'a>,
 }
 
@@ -191,12 +191,12 @@ impl<'a> AskedAdts<'a> {
     }
 
     /// Notes that the reading asked about `adt` and was told `lifetimes`.
-    pub fn note(&self, adt: tc::ItemKey, lifetimes: bool) {
+    pub fn note(&self, adt: tc::ItemKey, lifetimes: u32) {
         self.asked.borrow_mut().push((adt.0, lifetimes));
     }
 
     /// Every ADT asked, sorted, each once; the recorder is left empty for the next head.
-    pub fn take_sorted(&self) -> AVec<'a, (u128, bool)> {
+    pub fn take_sorted(&self) -> AVec<'a, (u128, u32)> {
         let mut out = core::mem::replace(&mut *self.asked.borrow_mut(), AVec::new_in(self.alloc));
         out.sort_unstable();
         out.dedup();

@@ -426,6 +426,36 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
                 self.mk(TyView::Adt(k, args))?
             }
+            // `A::new()`, `A::Variant` through `type A<..> = X;` (rules/alias_path.rs): `X` at
+            // the alias's segment's arguments, then a variant of the enum it is, then an
+            // associated item of it, as for the type written.
+            Def::Alias(k) => {
+                let Some(t) = self.alias_path_ty(at, cause, k, segs[consumed - 1])? else {
+                    return Ok(self.common.err);
+                };
+                let seg = segs[consumed];
+                if let TyView::Adt(ak, args) = self.view(t) {
+                    if let Some(adt) = self.reads.adt(ak)? {
+                        if adt.kind == crate::world::AdtKind::Enum {
+                            if let Some((i, v)) = adt.variants.iter().enumerate().find(|(_, v)| v.name == seg.name) {
+                                if seg.has_args {
+                                    // rustc's E0109 on a variant's arguments after an alias
+                                    // that gave the enum's: refused by name.
+                                    return Err(CheckError::Unported("generic arguments on a variant named through a type alias").into());
+                                }
+                                let (vkey, ctor) = (v.key, v.ctor);
+                                let def = Def::Ctor { adt: ak, variant: i as u32, kind: ctor };
+                                let t = self.ctor_ty(at, ak, Some(vkey), ctor, args, Some(seg.name))?;
+                                if !self.is_err(t) {
+                                    self.defs.push((at, def));
+                                }
+                                return Ok(t);
+                            }
+                        }
+                    }
+                }
+                t
+            }
             Def::TyParam(i) => self.mk(TyView::Param(i))?,
             // The Reference, "Paths": a type-relative path may begin at a primitive type; its
             // items are its inherent impls' (core's `impl u32 { .. }`), then traits in scope.
@@ -657,7 +687,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 let empty = self.mk_list(&[])?;
                 self.lower(own.types, pt, Lower::Args(empty), cause)
             }
-            Def::Adt(_) | Def::Trait(_) | Def::Prim(_) | Def::SelfTy => {
+            Def::Adt(_) | Def::Trait(_) | Def::Prim(_) | Def::SelfTy | Def::Alias(_) => {
                 self.diag(DiagCode::NotAValue, at, About::path(name));
                 Ok(self.common.err)
             }

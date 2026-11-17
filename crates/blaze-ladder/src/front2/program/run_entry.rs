@@ -21,17 +21,16 @@
 //! ([`EntryRefusal::NoHostedStart`]), never started at its `main` directly (that would skip
 //! the grants `bstd::main` makes).
 //!
-//! A Rust-edition program with std starts through `#[lang = "start"]`: `lang_start::<()>`
-//! with `main` as its argument, a GENERIC instance; the record walk's entry is one
-//! non-generic fn (`walk_records` encodes `entry` with no arguments), so that program is
-//! refused by name ([`EntryRefusal::ThroughLangStart`]) until the walk takes an entry
-//! instance with arguments. `#![no_core]` / `#![no_std]` roots start at their `fn main`
+//! A Rust-edition program with std starts through `#[lang = "start"]`: `lang_start::<T>` with
+//! `main` as its argument, called by the C entry shim. [`run_entry`] names its `main`
+//! ([`EntryHow::LangStart`]); the walk's roots (the shim, `lang_start::<T>` and `main` as
+//! instances) are crates/blaze-ladder/src/run/special.rs `roots`, the one home of the run's
+//! special records (D124). `#![no_core]` / `#![no_std]` roots start at their `fn main`
 //! directly (start.rs `Entry2::Direct`), as the solved front does.
 
 use blaze_own::Alloc;
 use blaze_surface::{Edition, ItemKind};
 use blaze_typeck::ItemKey;
-use blaze_scope::resolve::Names;
 use blaze_unit_graph::StdIs;
 
 use super::{Front2Refusal, LibKey, exported_entry};
@@ -76,14 +75,20 @@ impl RootStart {
         RootStart::of(std, attrs.no_core, attrs.no_std)
     }
 
-    /// [`RootStart::of`] over the SOLVED names (program.rs `make_from`): crate 0's
-    /// `Implicit::std` and its root's own `#![no_core]`/`#![no_std]` as the solve read them
-    /// (blaze-scope `CrateNames::root_attrs`, by the same `file_attrs` [`RootStart::of_root`]
-    /// reads), so both fronts decide by one rule from the same facts. `None`: the names hold no
-    /// crate.
-    pub fn of_names(names: &Names<'_>) -> Option<RootStart> {
-        let root = names.crates().first()?;
-        Some(RootStart::of(root.implicit.std, root.root_attrs.no_core, root.root_attrs.no_std))
+    /// [`RootStart::of`] over any names source: crate 0's `Implicit::std` and its root's own
+    /// `#![no_core]`/`#![no_std]` as the solve read them (blaze-scope `CrateNames::root_attrs`,
+    /// by the same `file_attrs` [`RootStart::of_root`] reads), so both fronts decide by one rule
+    /// from the same facts. `None`: the source holds no crate, or did not answer one of the two
+    /// facts (over records the error is in its log).
+    ///
+    /// OWED by front2 source.rs (lane M): `NamesSource::root_attrs(self, krate: usize) ->
+    /// Option<blaze_scope::graph::RootAttrs>` (over the solved names `Some(names.crates()
+    /// .get(krate)?.root_attrs)`; over records, the names record's copy of the same fact).
+    pub fn of_names<'n, S: NamesSource<'n>>(names: S) -> Option<RootStart> {
+        let std = names.std_is(0)?;
+        // OWED: `NamesSource::root_attrs` (above).
+        let attrs = names.root_attrs(0)?;
+        Some(RootStart::of(std, attrs.no_core, attrs.no_std))
     }
 
     /// What a program that exports no entry of its own starts through: THE rule both fronts
@@ -142,6 +147,10 @@ pub enum EntryHow {
     CMain,
     /// The root's `fn main`, called directly (`#![no_core]`/`#![no_std]`).
     Direct,
+    /// A Rust-edition program with Rust's std: `key` is the root's `fn main`, run by
+    /// `lang_start::<T>` through the C entry shim. The walk's roots and the shim are
+    /// run/special.rs `roots`' (the one home of the special records); this names `main` only.
+    LangStart,
 }
 
 /// Why the run has no entry key.
@@ -153,9 +162,6 @@ pub enum EntryRefusal {
     /// A blaze-edition program exports no hosted entry: D104's `bstd::main` expansion should
     /// have made it from the root's `fn main`.
     NoHostedStart,
-    /// A Rust-edition program with std: `lang_start::<()>(main)` is a generic instance the
-    /// record walk cannot start at yet.
-    ThroughLangStart,
     /// A `#![no_core]`/`#![no_std]` root with no `fn main` at its top (Reference,
     /// crates-and-source-files.main: "a binary crate must have a function named `main`").
     NoMain,
@@ -168,10 +174,6 @@ impl core::fmt::Display for EntryRefusal {
         match self {
             EntryRefusal::Rule(r) => write!(f, "the run's entry: {r}"),
             EntryRefusal::NoHostedStart => write!(f, "the run's entry: {HostedStartMissing}"),
-            EntryRefusal::ThroughLangStart => write!(
-                f,
-                "the run's entry: a Rust program with std starts through `#[lang = \"start\"]` (`lang_start::<()>(main)`), a generic instance the record walk does not start at yet"
-            ),
             EntryRefusal::NoMain => write!(f, "the run's entry: no `fn main` at the top of the crate root (the Reference, crates-and-source-files.main)"),
             EntryRefusal::NoRows => write!(f, "the run's entry: the program crate's items record did not list its items"),
         }
@@ -187,13 +189,12 @@ pub fn run_entry<'n, S: NamesSource<'n>>(names: S, start: RootStart) -> Result<R
         // `exported_entry` answers only the two exported arms.
         Some(Entry2::Rust(_) | Entry2::Direct(_)) | None => {}
     }
-    match start.unexported().map_err(|HostedStartMissing| EntryRefusal::NoHostedStart)? {
-        Unhosted::LangStart => Err(EntryRefusal::ThroughLangStart),
-        Unhosted::Direct => {
-            let lib = root_main(names)?;
-            Ok(RunEntry { key: checker_of(lib), lib, how: EntryHow::Direct })
-        }
-    }
+    let how = match start.unexported().map_err(|HostedStartMissing| EntryRefusal::NoHostedStart)? {
+        Unhosted::LangStart => EntryHow::LangStart,
+        Unhosted::Direct => EntryHow::Direct,
+    };
+    let lib = root_main(names)?;
+    Ok(RunEntry { key: checker_of(lib), lib, how })
 }
 
 /// The fn `main` declared at the top of crate 0's root module: by its row (name, home, kind),

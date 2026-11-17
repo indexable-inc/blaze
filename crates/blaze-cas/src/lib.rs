@@ -103,7 +103,7 @@ use std::{borrow::Cow, collections::VecDeque, fmt, sync::Arc};
 use blaze_core::{Cache, Completion, Done, Durable, Effect, Extent, FileName, Mapping, Stamp, Tag};
 use blaze_format::SchemaHash;
 use blaze_format_tiers::BufferColumns;
-use blaze_hash::{ByHash, ByHashSet, HashMap, HashSet};
+use blaze_hash::{BuildKeyHasher, FixedState, Map, MapOpts, Set, SetOpts};
 use blaze_ids::{ContentId, Hasher};
 use blaze_reclaim::{Grace, Limbo};
 pub use blaze_reclaim::{Guard, enter};
@@ -451,7 +451,7 @@ impl Columns {
 
 /// The encodings the store was given, by schema. Each behind an `Arc` so publishing a new map
 /// copies no encoding (a [`blaze_format_tiers::ColdDictionary`] rebuilds its tables to clone).
-type Encodings = ByHash<SchemaHash, Arc<Columns>, Global>; // alloc: the store's own table, for its life
+type Encodings = Map<SchemaHash, Arc<Columns>, BuildKeyHasher, Global>; // alloc: the store's own table, for its life
 
 /// The encodings of the schema `bytes` are a buffer of, when the store was given them.
 fn encodings_of<'e>(encodings: &'e Encodings, bytes: &[u8]) -> Option<&'e Columns> {
@@ -1194,7 +1194,7 @@ pub struct Store {
     /// for (`record_home`). The record there, drained after, is a duplicate and never written
     /// to a pack (`drain_record`). At most one a key: a key stays where it is until a move is
     /// made, and a second record standing in from there is a duplicate too.
-    copy_homes: ByHash<Key, Seg, Global>, // alloc: the store's own table, for its life
+    copy_homes: Map<Key, Seg, BuildKeyHasher, Global>, // alloc: the store's own table, for its life
     next_batch: u64,
     commit: Option<Commit>,
     /// A flush asked for while a commit was in flight.
@@ -1219,29 +1219,29 @@ pub struct Store {
     limbo: Limbo,
     training: [Training; Kind::ALL.len()],
     problems: Vec<String>,
-    fetching: ByHash<Key, Tag, Global>, // alloc: the store's own table, for its life
+    fetching: Map<Key, Tag, BuildKeyHasher, Global>, // alloc: the store's own table, for its life
     fetched: Vec<(Key, Fetched)>,
     placed: Vec<Placed>,
     /// Each place asked and not yet answered: its span (`place`), open from [`Store::place`]
     /// to its [`Placed`], which says how the bytes got there and how many.
-    place_spans: HashMap<Tag, blaze_trace::Span, Global>, // alloc: the store's own table, for its life
+    place_spans: Map<Tag, blaze_trace::Span, FixedState, Global>, // alloc: the store's own table, for its life
     /// The outputs being made of a clone of their base with ranges written
     /// ([`Content::Patch`]), by the tag their place was asked with.
-    patching: HashMap<Tag, Patching, Global>, // alloc: the store's own table, for its life
+    patching: Map<Tag, Patching, FixedState, Global>, // alloc: the store's own table, for its life
     /// The outputs being written from the runs their maker holds ([`Content::Sparse`],
     /// [`Store::place_made`]), by the tag their place was asked with.
-    writing: HashMap<Tag, publish::Writing, Global>, // alloc: the store's own table, for its life
+    writing: Map<Tag, publish::Writing, FixedState, Global>, // alloc: the store's own table, for its life
     /// The paths a program is started from ([`Store::starts`]): a clone renamed onto one is
     /// first asked to hold in memory what the system holds of the path's file
     /// ([`Effect::Prewarm`]), whichever way it is placed.
-    started: HashSet<FileName, Global>, // alloc: the store's own table, a name an executable placed
+    started: Set<FileName, FixedState, Global>, // alloc: the store's own table, a name an executable placed
     /// The whole files of outputs placed by cloning ([`CLONE_FROM`]), by content.
-    files: ByHash<ContentId, PlacedFile, Global>, // alloc: the store's own table, for its life
+    files: Map<ContentId, PlacedFile, BuildKeyHasher, Global>, // alloc: the store's own table, for its life
     /// The whole files that are derived values' ([`Kind::Derived`]), each by its key's hash
     /// with its length: what tells its name ([`Store::placed_file`]) and how it is made from
     /// a file named for its content. Kept for the store's life, a few words a derived value
     /// placed or let go of.
-    derived: ByHash<ContentId, u64, Global>, // alloc: the store's own table, for its life
+    derived: Map<ContentId, u64, BuildKeyHasher, Global>, // alloc: the store's own table, for its life
     /// How many derived whole files are being begun inside one another, each for its base
     /// ([`Store::derive_file`]): bounded by [`derived::CHAIN_MOST`].
     derive_depth: u32,
@@ -1274,11 +1274,11 @@ pub struct Store {
     /// ([`Store::placed_file`]), by content: each takes its own name by one rename, once a
     /// sync of its bytes has completed, so a crash leaves a whole file under a content's name
     /// or none ([`Store::name_staged`]). Cloned from under the writing name meanwhile.
-    staged_files: ByHashSet<ContentId, Global>, // alloc: the store's own table, for its life
+    staged_files: Set<ContentId, BuildKeyHasher, Global>, // alloc: the store's own table, for its life
     /// The whole files this run synced before giving them their content's names
     /// ([`Store::name_staged`]): the gate of the rename, which needs this sync first. A home
     /// of one still syncs the file again under its name and `placed/` ([`crate::home`]).
-    synced_files: ByHashSet<ContentId, Global>, // alloc: the store's own table, for its life
+    synced_files: Set<ContentId, BuildKeyHasher, Global>, // alloc: the store's own table, for its life
     /// How an output's bytes get to a path, decided once as the store opens, before its look
     /// through `placed/` and so before any place ([`PlaceBy`], [`Store::ask_shares`]).
     place_by: Option<PlaceBy>,
@@ -1287,12 +1287,12 @@ pub struct Store {
     /// The second paths asked of places not yet begun ([`Store::place_also`]): by the first
     /// place's tag, the second's tag and path, taken into its `publish::Writing` as it
     /// begins, or answered as failed with the first.
-    also: HashMap<Tag, (Tag, FileName), Global>, // alloc: the store's own table, for its life
+    also: Map<Tag, (Tag, FileName), FixedState, Global>, // alloc: the store's own table, for its life
     /// What names each whole file of `placed/` ([`whole`]): the paths placed from it and the
     /// places in flight making it. Read from `placed/names` as the store opens.
     names: whole::Names,
     /// What each place in flight names ([`Naming`]), by its tag, until its answer.
-    naming: HashMap<Tag, Naming, Global>, // alloc: the store's own table, for its life
+    naming: Map<Tag, Naming, FixedState, Global>, // alloc: the store's own table, for its life
     /// Places answered whose change of `names` is not yet made: until the open's look read
     /// the listing, and otherwise until the step that ends the call ([`Store::names_step`]).
     renamed: Vec<(FileName, Naming, bool)>,
@@ -1305,7 +1305,7 @@ pub struct Store {
     /// The write of the listing of `names` (`placed/names`): in flight, and changed since.
     listing: Listing,
     /// The placed files being made their values' one home, by content ([`Store::home_placed`]).
-    homing: ByHash<ContentId, home::Homing, Global>, // alloc: the store's own table, a few words a placed output
+    homing: Map<ContentId, home::Homing, BuildKeyHasher, Global>, // alloc: the store's own table, a few words a placed output
     /// Asks of a home's syncs and mapping, and of a staged file's sync, so far: what tells a
     /// stale answer from the current.
     home_rounds: u64,
@@ -1318,7 +1318,7 @@ pub struct Store {
     /// Under the planted bug [`PlacePlant::PatchThroughLink`]: each path that is another
     /// name of a file of the store's, with that file.
     #[cfg(test)]
-    plant_linked: HashMap<FileName, FileName, Global>, // alloc: a test's
+    plant_linked: Map<FileName, FileName, FixedState, Global>, // alloc: a test's
     /// What its collector keeps: the mark of the last scan, the pins, the counts ([`collect`]).
     collecting: collect::Collecting,
     /// The unit of the packs records moved cold are written to, once one was: apart from the
@@ -1801,7 +1801,7 @@ impl ColdBatch {
         }
         if self.train && self.dictionary.is_none() {
             // Distinct raw values under `LONG_FROM`, as a put samples them.
-            let mut seen = ByHashSet::new_in(Global); // alloc: once per training batch
+            let mut seen = Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: None }); // alloc: once per training batch
             // alloc: once per training batch, the samples as slices for zstd
             let mut samples: Vec<&[u8]> = Vec::new();
             let mut bytes = 0u64;
@@ -1917,7 +1917,7 @@ pub(crate) enum Use {
 /// The tags a store asks with, and what each asked for.
 struct Tags {
     range: blaze_core::Tags,
-    ops: HashMap<Tag, Op, Global>, // alloc: the store's own table, for its life
+    ops: Map<Tag, Op, FixedState, Global>, // alloc: the store's own table, for its life
 }
 
 impl Tags {
@@ -2264,7 +2264,7 @@ struct Tier {
     delta: Arc<Table<Spot>>,
     /// The delta an index swap left, while a writer may still put into it.
     prev: Option<Arc<Table<Spot>>>,
-    externals: ByHash<ContentId, External, Global>, // alloc: the store's own table, for its life
+    externals: Map<ContentId, External, BuildKeyHasher, Global>, // alloc: the store's own table, for its life
     /// Whole files the head on disk lists as removed whose removal has not answered: a commit
     /// that would write one of them again waits for it ([`Store::start_commit`]), so no write
     /// of a name meets the removal of the same name.
@@ -2273,7 +2273,7 @@ struct Tier {
     dictionaries: Vec<Dictionary>,
     /// Each unit's crate version by its number less one, and the number of each.
     units: Vec<ContentId>,
-    unit_of: ByHash<ContentId, Unit, Global>, // alloc: the store's own table, for its life
+    unit_of: Map<ContentId, Unit, BuildKeyHasher, Global>, // alloc: the store's own table, for its life
     /// Another writer's store as it was last open, which readers read while it is opened again
     /// as its head now says.
     before: Option<Box<Tier>>,
@@ -2294,14 +2294,14 @@ impl Tier {
             // alloc: once per tier, at opening
             delta: Arc::new(Table::new(DELTA_FIRST, FLAGS)),
             prev: None,
-            externals: ByHash::new_in(Global), // alloc: the store's own table, for its life
+            externals: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: None }), // alloc: the store's own table, for its life
             // alloc: empty, allocates nothing
             removing: Vec::new(),
             // alloc: empty, allocates nothing
             dictionaries: Vec::new(),
             // alloc: empty, allocates nothing
             units: Vec::new(),
-            unit_of: ByHash::new_in(Global), // alloc: the store's own table, for its life
+            unit_of: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: None }), // alloc: the store's own table, for its life
             before: None,
         }
     }
@@ -2477,7 +2477,7 @@ struct Training {
     /// record, so what a dictionary is trained on does not depend on how many settles ran.
     samples: Vec<Vec<u8>>,
     /// The content of each sample.
-    sampled: ByHashSet<ContentId, Global>, // alloc: at most `SAMPLES_MOST` a kind, freed once it trains or gives up
+    sampled: Set<ContentId, BuildKeyHasher, Global>, // alloc: at most `SAMPLES_MOST` a kind, freed once it trains or gives up
     bytes: u64,
     /// No training before this many samples: doubled after one fails.
     after: usize,
@@ -2683,7 +2683,7 @@ impl Store {
         let staging = ContentId::of(STAGING_DOMAIN, config.dir.as_str().as_bytes());
         let staging = u64::from_le_bytes(staging.0[..8].try_into().expect("8 bytes"));
         let mut store = Store {
-            tags: Tags { range: blaze_core::Tags::new(config.tags), ops: HashMap::new_in(Global) }, // alloc: the store's own table, for its life
+            tags: Tags { range: blaze_core::Tags::new(config.tags), ops: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }) }, // alloc: the store's own table, for its life
             config,
             tiers,
             broken: None,
@@ -2696,7 +2696,7 @@ impl Store {
             drains,
             draining: Batch::default(),
             pending: VecDeque::new(),
-            copy_homes: ByHash::new_in(Global), // alloc: the store's own table, for its life
+            copy_homes: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: None }), // alloc: the store's own table, for its life
             next_batch: 0,
             commit: None,
             flush_wanted: false,
@@ -2709,17 +2709,17 @@ impl Store {
             training: Default::default(),
             // alloc: empty, allocates nothing
             problems: Vec::new(),
-            fetching: ByHash::new_in(Global), // alloc: the store's own table, for its life
+            fetching: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: None }), // alloc: the store's own table, for its life
             // alloc: empty, allocates nothing
             fetched: Vec::new(),
             // alloc: empty, allocates nothing
             placed: Vec::new(),
-            place_spans: HashMap::new_in(Global), // alloc: the store's own table, for its life
-            patching: HashMap::new_in(Global), // alloc: the store's own table, for its life
-            writing: HashMap::new_in(Global), // alloc: the store's own table, for its life
-            started: HashSet::new_in(Global), // alloc: the store's own table, for its life
-            files: ByHash::new_in(Global), // alloc: the store's own table, for its life
-            derived: ByHash::new_in(Global), // alloc: the store's own table, for its life
+            place_spans: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: the store's own table, for its life
+            patching: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: the store's own table, for its life
+            writing: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: the store's own table, for its life
+            started: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: the store's own table, for its life
+            files: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: None }), // alloc: the store's own table, for its life
+            derived: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: None }), // alloc: the store's own table, for its life
             derive_depth: 0,
             placed_on_open: PlacedOnOpen::default(),
             placed_looked: false,
@@ -2729,23 +2729,23 @@ impl Store {
             new_keys: None,
             epoch: 0,
             periods: 0,
-            staged_files: ByHashSet::new_in(Global), // alloc: the store's own table, for its life
-            synced_files: ByHashSet::new_in(Global), // alloc: the store's own table, for its life
+            staged_files: Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: None }), // alloc: the store's own table, for its life
+            synced_files: Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: None }), // alloc: the store's own table, for its life
             place_by: None,
             held_asks: Vec::new(), // alloc: empty, allocates nothing
-            also: HashMap::new_in(Global), // alloc: the store's own table, for its life
+            also: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: the store's own table, for its life
             names: whole::Names::default(),
-            naming: HashMap::new_in(Global), // alloc: the store's own table, for its life
+            naming: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: the store's own table, for its life
             renamed: Vec::new(), // alloc: empty, allocates nothing
             forgets: Vec::new(), // alloc: empty, allocates nothing
             forgot: false,
             listing: Listing::default(),
-            homing: ByHash::new_in(Global), // alloc: the store's own table, a few words a placed output
+            homing: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: None }), // alloc: the store's own table, a few words a placed output
             home_rounds: 0,
             homes_waiting: false,
             listing_held: None,
             #[cfg(test)]
-            plant_linked: HashMap::new_in(Global), // alloc: a test's
+            plant_linked: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: a test's
             collecting: collect::Collecting::new(),
             cold_unit: None,
             moves: None,
@@ -7927,8 +7927,8 @@ impl Store {
         // The moves and the keys taken live only while the entries are listed: a frame's.
         blaze_mem::frame::task(blaze_mem::Tag::Store, |frame| {
             // Each key's waiting moves, oldest batch first and in drain order, as they are made.
-            let mut moves: HashMap<Key, Vec<&Move, &blaze_mem::Frame>, &blaze_mem::Frame> =
-                HashMap::new_in(frame);
+            let mut moves: Map<Key, Vec<&Move, &blaze_mem::Frame>, FixedState, &blaze_mem::Frame> =
+                Map::new(MapOpts { hasher: FixedState, alloc: frame, capacity: None });
             for it in self.pending.iter().chain([&self.draining]).flat_map(|it| &it.moves) {
                 moves.entry(it.key).or_insert_with(|| Vec::new_in(frame)).push(it);
             }
@@ -7936,7 +7936,7 @@ impl Store {
             let own = &self.tiers[0];
             let indexed = own.index.as_ref().map_or(0, |it| it.table().count() as usize);
             let mut out = Vec::with_capacity(own.delta.len() + indexed);
-            let mut taken = HashSet::new_in(frame);
+            let mut taken = Set::new(SetOpts { hasher: FixedState, alloc: frame, capacity: None });
             for (_, spot) in own.delta.iter(held) {
                 let loc = match spot.place {
                     Place::Pack(loc) => Some(loc),
@@ -8494,7 +8494,7 @@ impl Store {
             })
             // alloc: opening, once per tier
             .collect();
-        let externals: ByHash<ContentId, External, Global> = head // alloc: the store's own table, for its life
+        let externals: Map<ContentId, External, BuildKeyHasher, Global> = head // alloc: the store's own table, for its life
             .externals
             .iter()
             .filter(|it| it.len != disk::EXTERNAL_REMOVED)

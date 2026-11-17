@@ -36,3 +36,52 @@ fn a_promoted_vtable_outlives_its_fn() {
     let refused = build(&w, &b, root).err().unwrap_or_default();
     assert!(refused.contains("has no promoted value"), "{refused}");
 }
+
+/// `const F: fn() -> u32 = seven; fn main() -> fn() -> u32 { *&F }`: the checker promotes `&F`
+/// (a constant path), and the evaluator's record of the operand is one word relocated to
+/// `seven`'s instance key. The operand names no fn item by path, so the walk's own candidates
+/// are none and the instance is the one `Adts::const_fn_instance` gives: `seven` is the
+/// function's one reference (`Built::refs`, which the run's reach follows). With no answer the
+/// build is refused by name (`NoConstFnInstance`). Before `data_rows` asked
+/// `const_fn_instance`, it refused every such borrow ("a constant holding a fn pointer to an
+/// instance its own expression does not name") and the first assertion failed.
+///
+/// Prints: `test tests::promote::a_promoted_constants_fn_pointer_is_a_reference_of_the_function ... ok`
+#[test]
+fn a_promoted_constants_fn_pointer_is_a_reference_of_the_function() {
+    use crate::data::{DataReloc, DataTarget};
+    let mut w = TestWorld::new();
+    let u32_ = w.ty(U32);
+    let io = w.types.intern_list(&[u32_]).expect("a list interns");
+    let fn_ptr = PNode::FnPtr(io, blaze_typeck::FnPtrHeader::RUST);
+    w.func(1, "main", &[], fn_ptr);
+    w.func(40, "seven", &[], U32);
+    w.func(41, "F", &[], fn_ptr);
+    let key = crate::InstanceKey(blaze_ids::ContentId::of("test fn", b"seven"));
+    let word = || {
+        let mut bytes = Vec::new_in(Global);
+        bytes.extend_from_slice(&[0u8; 8]);
+        let mut relocs = Vec::new_in(Global);
+        relocs.push(DataReloc { offset: 0, target: DataTarget::Fn(key) });
+        let mut allocs = Vec::new_in(Global);
+        allocs.push(DataAlloc { bytes, align: 3, mutable: false, relocs });
+        DataRecord { allocs }
+    };
+    w.consts.push((ItemKey(41), Some(word())));
+    let mut b = BodyBuf::new();
+    let f = b.path("F");
+    let f = b.e(Expr::Path(f));
+    let r = b.e(Expr::Ref { mutbl: Mutbl::Not, operand: f });
+    let root = b.e(Expr::Unary { op: blaze_typeck::UnOp::Deref, operand: r });
+    w.promoted.push((r, Some(word())));
+    let seven = Instance { item: ItemKey(40), args: List::EMPTY };
+    w.const_fns.push((key, seven));
+    let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(built.refs.as_slice(), &[seven], "`seven` is the function's one reference");
+    let text = blaze_lir::print(built.func.view());
+    assert!(text.contains("data_addr"), "`&F` is the address of its data row:\n{text}");
+
+    w.const_fns.clear();
+    let refused = build(&w, &b, root).err().unwrap_or_default();
+    assert!(refused.contains("holds a fn pointer to instance"), "{refused}");
+}

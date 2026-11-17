@@ -20,7 +20,7 @@
 
 use std::{alloc::Global, cmp::Reverse};
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map};
 
 use serde::{Deserialize, Serialize};
 
@@ -582,7 +582,7 @@ pub struct Fold {
     /// The tasks, in the order first said.
     tasks: Vec<Slot>,
     /// Each task's slot in `tasks`, by id. Asked, never iterated.
-    slots: HashMap<u64, u32, Global>,
+    slots: Map<u64, u32, FixedState, Global>,
     /// The daemon's release count at the build's first look ([`Memory::releases`]).
     releases_base: Option<u32>,
     /// When each task settled in the last [`RECENT_MS`], oldest first ([`Now::recent`]).
@@ -1125,7 +1125,7 @@ fn mentions(words: &str, word: &str) -> bool {
 /// blocker its worker's innermost span.
 fn blockers(
     tasks: &[Slot],
-    slots: &HashMap<u64, u32, Global>,
+    slots: &Map<u64, u32, FixedState, Global>,
     now_ns: u64,
     walk: &mut Walk,
     busy: &[Busy],

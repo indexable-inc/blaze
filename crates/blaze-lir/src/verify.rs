@@ -27,7 +27,7 @@ use crate::{
     flags::Ordering,
     func::{
         AsmOperandKind, AsmPieceRec, Block, BlockKind, Conv, Ext, MemAttrsRec, NONE, ParamKind,
-        ParamRec, RefKind, SCOPE_IN, SigId, SigRec, SlotKind, Value, View,
+        ParamRec, PositionField, RefKind, SCOPE_IN, SigId, SigRec, SlotKind, Value, View,
     },
     op::{End, Field, Layout, Op, Res, Values, WalkError, Word, walk},
     ty::{Form, Scalar, Ty},
@@ -357,6 +357,24 @@ fn structure_tables(view: &View<'_>) -> Result {
                 return Err(row("datas", r, "an address past its data or naming no reference"));
             }
         }
+        if !within(rec.positions_first, rec.positions_len, view.data_positions.len()) {
+            return Err(row("datas", r, "source positions past `data_positions`"));
+        }
+        let positions = &view.data_positions[rec.positions_first as usize..][..rec.positions_len as usize];
+        let mut end = 0u64;
+        for position in positions {
+            let at = position.offset as u64;
+            if PositionField::from_word(position.field).is_none() || at + 4 > rec.bytes_len as u64 {
+                return Err(row("datas", r, "a source position of no known field, or past its data"));
+            }
+            if at < end {
+                return Err(row("datas", r, "source positions not by ascending offset, or overlapping"));
+            }
+            end = at + 4;
+            if relocs.iter().any(|it| (it.offset as u64) < end && at < it.offset as u64 + ptr_bytes as u64) {
+                return Err(row("datas", r, "a source position overlapping an address"));
+            }
+        }
     }
     for (r, rec) in view.intrinsics.iter().enumerate() {
         if !within(rec.name_first, rec.name_len, view.names.len()) || rec.sig as usize >= view.sigs.len() {
@@ -448,7 +466,7 @@ fn tiles(ranges: impl Iterator<Item = (u32, u32)>, total: usize) -> bool {
 /// Each list table's rows lie one after another in their columns, in row order, and fill
 /// them: so one function has one encoding, and equal functions are equal bytes.
 fn canonical(view: &View<'_>) -> Result {
-    let checks: [(&'static str, bool); 8] = [
+    let checks: [(&'static str, bool); 9] = [
         ("compounds", tiles(view.compounds.iter().map(|it| (it.first, it.len)), view.compound_tys.len())),
         (
             "sigs",
@@ -459,6 +477,7 @@ fn canonical(view: &View<'_>) -> Result {
         ),
         ("datas", tiles(view.datas.iter().map(|it| (it.bytes_first, it.bytes_len)), view.data_bytes.len())),
         ("datas", tiles(view.datas.iter().map(|it| (it.relocs_first, it.relocs_len)), view.data_relocs.len())),
+        ("datas", tiles(view.datas.iter().map(|it| (it.positions_first, it.positions_len)), view.data_positions.len())),
         ("intrinsics", tiles(view.intrinsics.iter().map(|it| (it.name_first, it.name_len)), view.names.len())),
         ("asms", tiles(view.asms.iter().map(|it| (it.pieces_first, it.pieces_len)), view.asm_pieces.len())),
         ("asms", tiles(view.asms.iter().map(|it| (it.operands_first, it.operands_len)), view.asm_operands.len())),

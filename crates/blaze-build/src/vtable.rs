@@ -37,14 +37,59 @@ pub const HEADER_WORDS: u32 = 3;
 /// A trait as a trait object sees it, from the world (the checker's trait facts).
 #[derive(Clone, Copy, Debug)]
 pub struct ObjectTrait<'a> {
-    /// The supertraits, in declaration order. A supertrait with generic arguments is refused
-    /// by the world by name until its arguments are carried here.
-    pub supers: &'a [ItemKey],
+    /// The supertraits, in declaration order, each with where its generic arguments come from
+    /// (`Fn<Args>: FnMut<Args>`). A supertrait argument that is not one of the trait's own
+    /// arguments (`trait A<T>: B<Vec<T>>`) is refused by the world by name until a type tree
+    /// is carried here.
+    pub supers: &'a [ObjectSuper],
+    /// The pool [`ObjectSuper::args`] index: each entry the position, in this trait's own
+    /// arguments (`Self` 0, then its generic parameters in order), of one supertrait argument.
+    pub super_args: &'a [u32],
     /// The methods, in declaration order.
     pub methods: &'a [ObjectMethod],
     /// The hash of what the table's shape reads: this trait's methods (and whether each is
     /// dispatchable), its supertraits, and theirs, transitively. Part of every table's key.
     pub shape: ContentId,
+}
+
+/// A run of a position pool: `pool[at..at + len]`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ArgSpan {
+    pub at: u32,
+    pub len: u32,
+}
+
+impl ArgSpan {
+    fn of<'p>(self, pool: &'p [u32]) -> Option<&'p [u32]> {
+        let at = self.at as usize;
+        pool.get(at..at.checked_add(self.len as usize)?)
+    }
+}
+
+/// One supertrait of a trait as a trait object sees it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ObjectSuper {
+    pub trait_: ItemKey,
+    /// Its arguments after `Self`, in [`ObjectTrait::super_args`]: empty for a supertrait
+    /// with no generic arguments (its `Self` is always the trait's `Self`).
+    pub args: ArgSpan,
+}
+
+impl ObjectSuper {
+    /// A supertrait with no generic arguments (`trait Sub: Tr`).
+    pub const fn plain(trait_: ItemKey) -> ObjectSuper {
+        ObjectSuper { trait_, args: ArgSpan { at: 0, len: 0 } }
+    }
+}
+
+/// Which arguments a trait of a table's tree is instantiated at, as positions in the table's
+/// `[concrete, principal args..]`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TraitArgs {
+    /// The principal: the whole list.
+    Principal,
+    /// A supertrait: [`Shape::args`]`[span]`, `Self` (position 0) first.
+    At(ArgSpan),
 }
 
 /// One method of a trait.
@@ -60,8 +105,8 @@ pub struct ObjectMethod {
 /// A word after the header.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Word {
-    /// Method `item` of trait `trait_`.
-    Method { trait_: ItemKey, item: ItemKey },
+    /// Method `item` of trait `trait_`, an instance at `args`.
+    Method { trait_: ItemKey, item: ItemKey, args: TraitArgs },
     /// The address of the same type's table for supertrait `S`, off the first chain.
     Super(ItemKey),
 }
@@ -82,6 +127,15 @@ pub enum VtableError {
     NoTrait(ItemKey),
     /// A table past 2^32 words.
     TooLarge,
+    /// Supertrait `super_` of `trait_` names an argument position past `trait_`'s own
+    /// arguments, or a span past the pool: the world's facts are malformed.
+    SuperArg { trait_: ItemKey, super_: ItemKey },
+    /// A trait reached twice in one tree at different arguments (`trait X: A<u8> + A<u16>`):
+    /// a slot or an upcast named by the trait alone would be ambiguous.
+    TwiceAtOtherArgs(ItemKey),
+    /// A generic supertrait off the first chain: its word is the address of its own table,
+    /// which a [`Word::Super`] names by the trait alone, without arguments.
+    GenericSuper(ItemKey),
 }
 
 impl fmt::Display for VtableError {
@@ -89,6 +143,13 @@ impl fmt::Display for VtableError {
         match self {
             VtableError::NoTrait(t) => write!(f, "trait {:#x}: no trait-object facts (its methods and supertraits)", t.0),
             VtableError::TooLarge => write!(f, "a vtable of more than 2^32 words"),
+            VtableError::SuperArg { trait_, super_ } => {
+                write!(f, "trait {:#x}: its supertrait {:#x} names an argument past the trait's own (malformed trait-object facts)", trait_.0, super_.0)
+            }
+            VtableError::TwiceAtOtherArgs(t) => write!(f, "trait {:#x} is reached twice in one table's supertraits at different arguments, which a table does not carry", t.0),
+            VtableError::GenericSuper(t) => {
+                write!(f, "trait {:#x}: a supertrait with generic arguments off the first supertrait chain, whose table word does not carry arguments yet", t.0)
+            }
         }
     }
 }
@@ -99,39 +160,83 @@ pub struct Shape<A: Allocator> {
     pub words: Vec<Word, A>,
     /// The principal and its first supertrait chain: an upcast to one keeps the pointer.
     pub prefix: Vec<ItemKey, A>,
+    /// The pool [`TraitArgs::At`] spans index: positions in a table's `[concrete, principal
+    /// args..]`.
+    pub args: Vec<u32, A>,
 }
 
 impl<A: Allocator + Clone> Shape<A> {
     /// The shape of `principal`'s tables. `facts` is the world's [`ObjectTrait`] of a trait.
-    /// Depth first without recursion: a stack of (trait, next supertrait, on the first chain).
+    /// Depth first without recursion: a stack of (trait, next supertrait, on the first chain,
+    /// its arguments). A supertrait's arguments are its trait's, composed: `dyn Fn<(u8,)>`'s
+    /// `FnMut<Args>` is at `[concrete, (u8,)]`, positions `[0, 1]`.
     pub fn of<'f>(principal: ItemKey, facts: impl Fn(ItemKey) -> Option<ObjectTrait<'f>>, alloc: A) -> Result<Shape<A>, VtableError> {
         let mut words = Vec::new_in(alloc.clone());
         let mut prefix = Vec::new_in(alloc.clone());
-        let mut seen: Vec<ItemKey, A> = Vec::new_in(alloc.clone());
-        let mut stack: Vec<(ItemKey, usize, bool), A> = Vec::new_in(alloc);
-        seen.push(principal);
-        stack.push((principal, 0, true));
-        while let Some(&(t, next, first)) = stack.last() {
+        let mut args: Vec<u32, A> = Vec::new_in(alloc.clone());
+        let mut seen: Vec<(ItemKey, TraitArgs), A> = Vec::new_in(alloc.clone());
+        let mut stack: Vec<(ItemKey, usize, bool, TraitArgs), A> = Vec::new_in(alloc);
+        seen.push((principal, TraitArgs::Principal));
+        stack.push((principal, 0, true, TraitArgs::Principal));
+        while let Some(&(t, next, first, at)) = stack.last() {
             let o = facts(t).ok_or(VtableError::NoTrait(t))?;
             if let Some(&s) = o.supers.get(next) {
                 let top = stack.len() - 1;
                 stack[top].1 = next + 1;
                 let is_first = next == 0;
-                if !seen.contains(&s) {
-                    seen.push(s);
-                    stack.push((s, 0, first && is_first));
+                let bad = VtableError::SuperArg { trait_: t, super_: s.trait_ };
+                let written = s.args.of(o.super_args).ok_or(bad)?;
+                // `s`'s positions in the table's list: `Self` (the concrete type, 0), then each
+                // argument through `t`'s own positions.
+                let start = args.len();
+                args.push(0);
+                for &p in written {
+                    let q = match at {
+                        TraitArgs::Principal => p,
+                        TraitArgs::At(span) => *span.of(&args).and_then(|own| own.get(p as usize)).ok_or(bad)?,
+                    };
+                    args.push(q);
+                }
+                let span = ArgSpan {
+                    at: u32::try_from(start).map_err(|_| VtableError::TooLarge)?,
+                    len: u32::try_from(args.len() - start).map_err(|_| VtableError::TooLarge)?,
+                };
+                match seen.iter().find(|(k, _)| *k == s.trait_).map(|&(_, before)| before) {
+                    Some(before) => {
+                        // The principal as its own supertrait is a cycle the checker refuses
+                        // (E0391); it is met here only as already laid out.
+                        let same = match before {
+                            TraitArgs::Principal => true,
+                            TraitArgs::At(b) => b.of(&args) == span.of(&args),
+                        };
+                        args.truncate(start);
+                        if !same {
+                            return Err(VtableError::TwiceAtOtherArgs(s.trait_));
+                        }
+                    }
+                    None => {
+                        seen.push((s.trait_, TraitArgs::At(span)));
+                        stack.push((s.trait_, 0, first && is_first, TraitArgs::At(span)));
+                    }
                 }
                 continue;
             }
             stack.pop();
-            words.extend(o.methods.iter().filter(|m| m.dispatch).map(|m| Word::Method { trait_: t, item: m.item }));
+            words.extend(o.methods.iter().filter(|m| m.dispatch).map(|m| Word::Method { trait_: t, item: m.item, args: at }));
             match first {
                 true => prefix.push(t),
-                false => words.push(Word::Super(t)),
+                false => {
+                    if let TraitArgs::At(span) = at
+                        && span.len > 1
+                    {
+                        return Err(VtableError::GenericSuper(t));
+                    }
+                    words.push(Word::Super(t));
+                }
             }
         }
         u32::try_from(words.len()).ok().and_then(|n| n.checked_add(HEADER_WORDS)).ok_or(VtableError::TooLarge)?;
-        Ok(Shape { principal, words, prefix })
+        Ok(Shape { principal, words, prefix, args })
     }
 
     /// The slot (after the header) of method `item`, `None` when it has none.
@@ -251,16 +356,22 @@ impl<A: Allocator + Clone> Vtable<A> {
         if let Some(glue) = drop {
             relocs.push((0, VtableTarget::Fn(glue)));
         }
-        let mut with_args: Vec<PTy, A> = Vec::with_capacity_in(1 + args.len(), alloc);
+        let mut with_args: Vec<PTy, A> = Vec::with_capacity_in(1 + args.len(), alloc.clone());
         with_args.push(concrete);
         with_args.extend_from_slice(args);
         let principal_args = ground.intern_list(&with_args).map_err(|_| full())?;
-        let alone = ground.intern_list(&[concrete]).map_err(|_| full())?;
+        let mut picked: Vec<PTy, A> = Vec::new_in(alloc);
         for (i, w) in shape.words.iter().enumerate() {
             let offset = 8 * (HEADER_WORDS + i as u32);
             let to = match *w {
-                Word::Method { trait_, item } => {
-                    let args: List = if trait_ == shape.principal { principal_args } else { alone };
+                Word::Method { item, args: TraitArgs::Principal, .. } => VtableTarget::Fn(Instance { item, args: principal_args }),
+                Word::Method { item, args: TraitArgs::At(span), .. } => {
+                    let at = span.of(&shape.args).ok_or(BuildError::Malformed { what: "a vtable word's arguments past its shape's pool" })?;
+                    picked.clear();
+                    for &p in at {
+                        picked.push(*with_args.get(p as usize).ok_or(BuildError::Malformed { what: "a supertrait argument past the principal's arguments" })?);
+                    }
+                    let args: List = ground.intern_list(&picked).map_err(|_| full())?;
                     VtableTarget::Fn(Instance { item, args })
                 }
                 Word::Super(s) => VtableTarget::Super(s),

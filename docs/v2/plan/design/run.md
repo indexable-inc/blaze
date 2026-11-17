@@ -312,6 +312,66 @@ patched after an edit. **Cost to the program**: a call through a slot is a load 
 13. Delete: ladder place.rs's in-process run, blaze-code `Image` and its postings, the launcher's sidecar.
 14. Tier-up, then `blaze export`, then symbolize and the debug object.
 
+### The cut to the lazy parent (D124, 2026-11-17 02:20; the coordinator's spec)
+
+Measured 02:08 on tree 5ab37c9156 (release r17): hello world runs in 16.6 s, then 12.3 s on a repeat. Read in
+the code: a Rust program with std is built WHOLE in blaze's process (`run_program_given`), refused there
+(`RunError::OwnProcess`), then built whole AGAIN before the child starts (run_parent.rs `lay_out`, the eager
+walk `build_records_new` into a `MemoryStore`); every name of 79 crates is solved from source each time. None
+of that is improved: it is deleted. The parent makes nothing before the start.
+
+**The parent's loop** (run_parent.rs): the child is spawned at once; each `Need` is answered by ONE step of
+the D106 record walk (body_ids.rs `Walk::one`): the instance's key from text and today's facts, found in the
+home's one store (code_store.rs `HomeCodeStore`) or made by the maker and put, and what its entry declares
+reached as rows with nothing done for them. A symbol the table does not hold is one of the run's special
+records (the C entry shim, the thread-local getter and ender) or is refused by name. Nothing is walked ahead
+of the start; compiled-behind (piece 10) is the same step on idle workers, later.
+
+**Keys before any check** (the seam `BodyIds`, a NEW blaze-cli run_ids.rs): a workspace body by the drive's
+`BodyCheck` key and read list; a toolchain crate's body (core, alloc, std) by the toolchain's content id and
+its item, with the toolchain as its one fact (a coarse proof: the cut covers every input of that body's
+check); a locked dependency's body by its unit's key the same way. So std's instances are found by key on
+every run after the first, with no `BodyCheck` record needed for them.
+
+**The maker** (make_one.rs): one owned session, made on the first miss and not before, over names READ FROM
+RECORDS (front2 source.rs `Records`), never `resolve_crates` over source; `member_owner` by an index.
+
+**The entry** (ladder): which process, the roots of a Rust program with std (the shim, `lang_start::<T>`,
+`main`) and the special records, from names records, generic over `NamesSource`; no body read.
+
+**The start list** (stage 7; NEW blaze-cli start_list.rs): written at exit under the certificate; when the
+certificate is today's its rows are published as they are before `Begin`, nothing keyed or looked up.
+
+**Every program runs in the child** (corrected 02:25, after r18 measured no change: 15.3 s, then 12.9 s). The
+owner's hello world is a blaze-edition program (`fn main(cx: &Cx, out: Out)`), whose start is bstd's hosted
+entry, and that one runs IN blaze's process today (`run_program_given`, the whole program built first): the
+12 s. The launcher refuses a hosted entry by name. So: the launcher's run mode takes `hosted:<symbol>`, makes
+the host's world in the child (bstd `Hosting` over the child's own `Io`, its arguments, and the grants the
+command line gave, handed by the parent) and calls `bstd_hosted_start(table)`; `blaze run` routes every
+program to the child, and the in-process run (ladder place.rs, `run_program_given`) is deleted (piece 13).
+A program's crash, exit or stray write then cannot reach blaze's store, and there is one run path.
+
+**The gate is before the start** (stage 4; the owner, 02:24: "we need both check AND run to be fast and
+ideally run should require check happened first"). `run` asks with `Gate::Before` (the drive has it,
+simulated: sim.rs "`Before` started a program over errors"); today main.rs asks `Gate::Beside` for every
+command, and hello world runs while `check` says `main` was not checked. An error, or an item the check
+could not check, stops the run before the child is spawned, with the check's own findings. Behind the gate
+the parent takes the check as its proof: a WORKSPACE body with no clean `BodyCheck` record is refused by
+name at its first ask (never checked a second way, never built unchecked); a toolchain or dependency body
+is checked once, where its code is first made, and found by key after.
+
+Pieces, one writer each, all at once: G the gate (drive request.rs, cli main.rs's ask); H the hosted start in
+the child (launch-rt run_mode.rs, blaze-launcher); W `Walk::one` (ladder body_ids.rs); I `BodyIds` over the command's
+records (cli run_ids.rs); M the maker session over records (ladder make_one.rs, front2 source.rs, lazy/);
+E the entry and the special records (ladder run.rs, front2 start.rs, run_entry.rs, NEW run/special.rs);
+S the start list and the parent's `Resolve` seam (cli start_list.rs, run_parent.rs); then P, the parent's
+loop over W, I, M, E, S, and the deletions: `build_records_new`, `run_records`'s from-source front,
+`run_program_given` for a Rust program, `Needs`' prebuilt index. Not in this cut, each its own piece after:
+records read in place from store segments and the run segment (today a file a record in the records
+folder), compiled-behind, the std bundle. Checks: hello world twice in one scratch home; the second run's
+line reads `code records: reached R, found R, made 0, unkeyed 0` or names each unkeyed instance, its
+profile holds no check or resolve span, and it ends inside 100 ms (floor 5 ms: ratio to be quoted).
+
 ## The live picture (the run path's wire; the parent is `blaze run`, the socket a pair on descriptor 3)
 
 ```

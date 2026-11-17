@@ -241,11 +241,11 @@ fn write_cut(out: &mut dyn fmt::Write, what: &dyn fmt::Display, alloc: Alloc<'_>
 /// The walk of `world` from `ask`'s roots, its report written to `out` (module docs), `hooks`'
 /// lines where they belong; the counts returned. Returns early, after the roots' refusals and
 /// with nothing walked, when no root lowered and spelled.
-pub fn walk<'n>(world: &World<'_, 'n>, ask: &Ask<'_>, hooks: &mut dyn WalkHooks<'n>, out: &mut dyn fmt::Write, alloc: Alloc<'_>) -> Result<WalkCounts, WalkError> {
+pub fn walk<'n>(world: &World<'_, 'n>, ask: &Ask<'_>, hooks: &mut dyn WalkHooks<'n>, out: &mut dyn fmt::Write, alloc: Alloc<'static>) -> Result<WalkCounts, WalkError> {
     let names = world.names;
     let prepared = world.prepared;
-    let mut front = Front2::new(names, world.frame, world.sources).map_err(WalkError::Front)?;
-    let mut store = Store::new(front.index.lang("sized"), front.frame);
+    let mut front = Front2::new(names, world.frame, world.sources, alloc).map_err(WalkError::Front)?;
+    let mut store = Store::new(front.index.lang("sized"), front.frame, alloc);
     if world.receivers == Receivers::Found {
         store.pointers = crate::front2::receiver::Pointers::find(&front.index, front.resolver);
     }
@@ -345,7 +345,7 @@ pub fn walk<'n>(world: &World<'_, 'n>, ask: &Ask<'_>, hooks: &mut dyn WalkHooks<
                 Start { owner: body.owner, first, scope }
             })
             .collect();
-        reach_all(&mut records, prepared, starts, &[])
+        reach_all(&mut records, prepared, starts, &[], crate::front2::reach::Within::ALL)
     };
     let ok = census.fns.iter().filter(|(_, r)| matches!(r, Reached::Checked)).count();
     let no_body = census.fns.iter().filter(|(_, r)| matches!(r, Reached::NoBody)).count();
@@ -398,13 +398,13 @@ pub fn walk<'n>(world: &World<'_, 'n>, ask: &Ask<'_>, hooks: &mut dyn WalkHooks<
     // The survey's two lists are the global allocator's vectors of its API (program.rs, run.rs).
     let mut left_out = Default::default();
     let program = match ask.build_from {
-        BuildFrom::Main => Front2Program::survey(names, world.survey_frame, world.sources, &mut left_out),
+        BuildFrom::Main => Front2Program::survey(names, world.survey_frame, world.sources, &mut left_out, alloc),
         BuildFrom::Roots => {
             let mut from: AVec<'_, LibKey> = AVec::with_capacity_in(walked.len(), alloc);
             for &i in walked.iter() {
                 from.push(mains[i].item);
             }
-            Front2Program::make_from(names, world.survey_frame, world.sources, Some(&mut left_out), Starts::Tests(&from)).map(|made| made.program)
+            Front2Program::make_from(names, world.survey_frame, world.sources, Some(&mut left_out), Starts::Tests(&from), alloc).map(|made| made.program)
         }
     };
     match program {
@@ -413,7 +413,7 @@ pub fn walk<'n>(world: &World<'_, 'n>, ask: &Ask<'_>, hooks: &mut dyn WalkHooks<
             let mut refused = Default::default();
             // The survey builds as `blaze run` and `blaze test` do: the dev profile's overflow
             // checks (D101), which also makes it name a missing `panic_const_*` lang fn.
-            match crate::run::build_survey(&mut program, &mut refused, blaze_build::OverflowChecks::On) {
+            match crate::run::build_survey(&mut program, &mut refused, blaze_build::OverflowChecks::On, alloc) {
                 Err(e) => write!(out, "BUILDS: the survey stopped: {e}\n")?,
                 Ok(survey) => {
                     write!(

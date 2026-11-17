@@ -28,7 +28,7 @@
 use blaze_codegen::{Arch, CompiledFunction, InstanceKey, Static, Target};
 use blaze_core::FileName;
 use blaze_graph::par;
-use blaze_hash::HashSet;
+use blaze_hash::{FixedState, Set, SetOpts};
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 use blaze_mem::align::checked_align_up_u64;
@@ -710,7 +710,7 @@ fn binds(state: &State, symbols: &Symbols) -> Result<(Vec<Bind>, Vec<String>), L
         });
     }
     // alloc: the weakly defined natives and Rust names, once per prelink
-    let mut weak: HashSet<Sym, Global> =
+    let mut weak: Set<Sym, FixedState, Global> =
         state.resolved.native_defs(&state.inputs).filter(|it| it.weak).map(|it| it.sym).collect();
     for (name, it) in state.names.iter() {
         if it.weak && rust_takes(state, symbols, *name, it.target) {

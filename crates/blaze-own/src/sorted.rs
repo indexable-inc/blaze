@@ -1,5 +1,6 @@
 //! [`SortedMap`] and [`SortedSet`]: ordered by key, over one sorted [`Vec`] searched by halving.
-//! The first ordered map; a B-tree is not written yet.
+//! The flat ordered map, built once and read many times; the B-tree, for a map that changes
+//! after it is built, is [`crate::BTreeMap`].
 //!
 //! Costs, for `n` entries: a lookup is `O(log n)` comparisons over one contiguous array (a cache
 //! miss per halving at most, none once the array fits in cache); `insert` and `remove` are
@@ -23,7 +24,7 @@ use crate::{
     vec::{Refused, Vec},
 };
 
-/// A map ordered by key, one sorted vector of `(key, value)`.
+/// A map ordered by key, one sorted vector of `(key, value)`: lookup O(log n) on one array, insert and remove O(n) moves; build it once with `from_sorted`.
 ///
 /// # Invariants
 ///

@@ -55,15 +55,15 @@ fn check_fns(text: &str, fns: &[&str]) -> Vec<(String, String)> {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let files = [("/hello-world/src/main.rs".to_string(), text.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
-    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
-    let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
     let prepared = Prepares::new_in(Alloc::global());
-    let mut store = Store::new(front.index.lang("sized"), front.frame);
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let (mut buckets, mut consts) = (None, Consts::default());
     let mut got = Vec::new();
     for &n in fns {
@@ -242,6 +242,35 @@ fn main() {}
     expect("repeat size_of", &got, &[true, true, false]);
 }
 
+/// Wave 2311 C04 (tempo census 7, `check gap: BodyConst`: `Arg: AnonInBody` 61, `RepeatLen:
+/// AnonInBody` 22): an anonymous constant written in a body. The Reference, "Constant
+/// evaluation", "Const context": "Const generic arguments" and "Array repeat length
+/// expressions" are const contexts. (1) A const argument on a path to a fn takes its
+/// parameter's type: the pinned core's `enc_16lsd::<{ U128_MAX_DEC_N - 16 }>(buf, mod_1e16)`
+/// (library/core/src/fmt/num.rs, `impl u128`'s `_fmt_inner`) is a `usize` constant, which
+/// `arg_six` mirrors; it was a hole the check reported as a gap. (2) A repeat length that
+/// names a constant declared in the body is read in that block (the Reference, "Statements",
+/// "Item declarations"): alloy-primitives' `FixedBytes` `Display` writes "const SEP_LEN: usize
+/// = '…'.len_utf8(); let mut buf = [0; 2 + 4 + SEP_LEN + 4];", which `local_six` mirrors; read
+/// at the module, `SEP` named nothing and the evaluator refused it. A version that left either
+/// a gap makes the clean ones "not checked"; one that made either a hole makes `arg_seven` or
+/// `local_five` clean. Expected lines: "body anon: arg_six: clean", "body anon: arg_seven:
+/// diags [..]" (a `[u8; 7]` where `[u8; 6]` is the parameter's), "body anon: local_six:
+/// clean", "body anon: local_five: diags [..]" (a `[u8; 6]` where `[u8; 5]` is written).
+#[test]
+fn an_anonymous_constant_in_a_body_has_its_value() {
+    const TEXT: &str = "const BASE: usize = 7;
+fn take<const N: usize>(a: [u8; N]) -> usize { a.len() }
+fn arg_six() -> usize { take::<{ BASE - 1 }>([0u8; 6]) }
+fn arg_seven() -> usize { take::<{ BASE - 1 }>([0u8; 7]) }
+fn local_six() -> [u8; 6] { const SEP: usize = 2; [0u8; 2 + SEP + 2] }
+fn local_five() -> [u8; 5] { const SEP: usize = 2; [0u8; 2 + SEP + 2] }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["arg_six", "arg_seven", "local_six", "local_five"]);
+    expect("body anon", &got, &[true, false, true, false]);
+}
+
 /// Tempo census 13, brief 11 (`ConstFail::TraitConstNoSelf`: "the constant .. an array length
 /// names: TraitConstNoSelf"): a constant whose BODY reads a trait's constant by a qualified
 /// path. The Reference, "Paths", "Qualified paths": "Fully qualified paths allow for
@@ -347,4 +376,52 @@ fn main() {}
 ";
     let got = check_fns(TEXT, &["two", "three", "five"]);
     expect("generic impl", &got, &[true, false, true]);
+}
+
+/// Wave 2311 C09 (tempo census 7, "a written type" `NotFound`, form A): a turbofish argument
+/// that is a `const` declared in the body. The pinned core's `swap_nonoverlapping_bytes`
+/// (library/core/src/ptr/mod.rs) writes `const CHUNK_SIZE: usize = size_of::<*const ()>();`
+/// then `swap_nonoverlapping_chunks::<CHUNK_SIZE>(..)`; `g` mirrors it. It was refused as a
+/// written type: the name was looked up only at the module (front2/body.rs `name_arg`, now
+/// asking const_open.rs `local_arg` first). The Reference, "Generic parameters", "Const
+/// generics": "When there is ambiguity if a generic argument could be resolved as either a
+/// type or const argument, it is always resolved as a type", so in `typed` the module's
+/// `struct T` is the argument, not the body's `const T`; a version that read the local const
+/// first makes `typed` an error. A version that made `C` a hole makes `g_five` clean.
+/// Expected lines: "local const arg: g: clean", "local const arg: g_five: diags [..]" (a
+/// `[u8; 4]` where `[u8; 5]` is written), "local const arg: typed: clean".
+#[test]
+fn local_const_as_turbofish_argument() {
+    const TEXT: &str = "struct T;
+fn f<const N: usize>() -> [u8; N] { [0; N] }
+fn size<X>() -> usize { core::mem::size_of::<X>() }
+fn g() -> [u8; 4] { const C: usize = 4; f::<C>() }
+fn g_five() -> [u8; 5] { const C: usize = 4; f::<C>() }
+fn typed() -> usize { const T: usize = 4; size::<T>() }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["g", "g_five", "typed"]);
+    expect("local const arg", &got, &[true, false, true]);
+}
+
+/// Wave 2311 C09 (tempo census 7, "a written type" `NotFound`, form B): a type an expansion
+/// writes that names a type declared in the body. time 0.3.55 writes `struct Digits { .. }`
+/// then `core::mem::offset_of!(Digits, digit_1)` in a body (`h` mirrors it), and `type
+/// JulianDay = ..;` then `ensure_ranged!(JulianDay: julian_day)` (`k` mirrors it). The
+/// Reference, "Macros By Example", "Hygiene": macro_rules! "local variables are looked up at
+/// the macro definition site while other symbols are looked up at the macro invocation site",
+/// so the type is read at the call's block (front2/body.rs `env_at` through `View::site`);
+/// read at the body's module, `S` and `T` were `NotFound`. A version that made the type a hole
+/// makes `k_wide` clean. Expected lines: "expansion type: h: clean", "expansion type: k:
+/// clean", "expansion type: k_wide: diags [..]" (a `u8` where `u32` is written).
+#[test]
+fn expansion_type_reads_at_call_block() {
+    const TEXT: &str = "macro_rules! mk { ($t:ty) => { <$t>::default() } }
+fn h() -> usize { struct S { a: u8, b: u32 } core::mem::offset_of!(S, b) }
+fn k() -> u8 { type T = u8; mk!(T) }
+fn k_wide() -> u32 { type T = u8; mk!(T) }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["h", "k", "k_wide"]);
+    expect("expansion type", &got, &[true, true, false]);
 }

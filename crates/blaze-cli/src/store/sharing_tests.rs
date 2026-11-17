@@ -14,7 +14,6 @@ use crate::scripts::{self, RanAs};
 use blaze_drive::record::write_plain;
 use blaze_drive::{Kind, Name};
 use blaze_ids::ContentId;
-use blaze_own::Alloc;
 
 /// The seam as the cli fills it for one crate (`names::world`): the crate's `CrateScope` subject
 /// when it is public, and its script's subject when `run_is_public` says so.
@@ -32,7 +31,10 @@ fn sharing_for(crate_public: bool, ran_as: RanAs, crate_subject: ContentId, scri
 
 #[test]
 fn a_native_script_record_and_its_reader_stay_local() {
-    let alloc = Alloc::global();
+    // The test's one frame, made at its top (its memory the OS's), handed down as a handle.
+    let frame = bstd::mem::Frame::with_reserve(1 << 16, bstd::mem::Tag::Other).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
     let script_subject = ContentId([1; 32]);
     let crate_subject = ContentId([2; 32]);
     let dep_subject = ContentId([3; 32]);

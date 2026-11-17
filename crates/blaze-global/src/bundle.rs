@@ -289,7 +289,7 @@ enum State {
     /// `waiting`: each key fetched and not yet answered, with its length.
     Fetching {
         listed: usize,
-        waiting: ByHash<Key, u64, Global>,
+        waiting: Map<Key, u64, BuildKeyHasher, Global>,
         fetched: usize,
         bytes: u64,
         tickets: Vec<Ticket>,
@@ -341,7 +341,7 @@ impl Download {
                         // alloc: setup: once a bundle or its lock file, not a value.
                         manifest.entries.iter().map(|entry| Public::listed(entry.key, entry.kind)).collect();
                     // alloc: setup: once a bundle or its lock file, not a value.
-                    let lens: ByHash<Key, u64, Global> =
+                    let lens: Map<Key, u64, BuildKeyHasher, Global> =
                         manifest.entries.iter().map(|it| (it.key, it.len)).collect();
                     let waiting = client
                         .fetch_many(store, &publics, effects)

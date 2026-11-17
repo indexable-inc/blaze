@@ -340,3 +340,36 @@ fn a_pub_use_of_a_crate_renamed_is_a_public_re_export() {
     });
     assert_eq!(made.krate, 2, "`Made` is base's `Mul`");
 }
+
+/// Rule 3: a crate resolved while a dependency it names is not finished is refused by name
+/// (`NamesError::DepNotFinished`), never resolved with that name left out of its root. The
+/// wrong version (the dependency dropped from the extern prelude) resolves `user` and fails
+/// here with `resolved anyway`. Passes printing nothing.
+#[test]
+fn a_dependency_not_finished_is_refused_by_name() {
+    let crates = [input("user", "/user/lib.rs", &[("dep", 1)]), input("dep", "/dep/lib.rs", &[])];
+    let alloc = Alloc::global();
+    let graph = crate::resolve::graph_of(&crates, Sysroot::default(), alloc).unwrap_or_else(|e| panic!("the graph: {e}"));
+    // Nothing finished: `dep` is not resolved before `user`.
+    let finished: [Option<crate::crate_scope::Dep<'static>>; 2] = [None, None];
+    let by_prefix = blaze_hash::HashMap::new_in(alloc);
+    let built = crate::resolve::Built { crates: &finished, by_prefix: &by_prefix, asked: None };
+    let got = crate::resolve::resolve_one(
+        &graph,
+        &crates[0],
+        crate::graph::CrateId(0),
+        0,
+        &built,
+        &TEXTS,
+        &Serial,
+        crate::task::First::Prefetch,
+        crate::prepares::Prepares::new_in(alloc),
+        &crate::expansions::KeptExpansions::none(alloc),
+        alloc,
+    );
+    match got {
+        Err(crate::resolve::NamesError::DepNotFinished { krate, name, dep }) => assert_eq!((krate, name, dep), ("user", "dep", "dep")),
+        Err(e) => panic!("another refusal: {e}"),
+        Ok(_) => panic!("resolved anyway: `dep` left out of user's root"),
+    }
+}

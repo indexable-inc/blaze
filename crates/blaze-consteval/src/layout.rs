@@ -127,7 +127,7 @@ pub struct Tag {
 impl Tag {
     /// The variant whose tag reads `bits` (blaze-build's `Layouts::variant_of_tag`); a direct
     /// tag is matched against `discrs`, the enum's discriminants by variant.
-    pub(crate) fn variant(&self, bits: u128, discrs: &[i128]) -> Result<u32, Refusal<'static>> {
+    pub fn variant(&self, bits: u128, discrs: &[i128]) -> Result<u32, Refusal<'static>> {
         match self.decode {
             Decode::Single(v) => Ok(v),
             Decode::Direct { mask } => {
@@ -172,7 +172,7 @@ const TAIL_DEPTH: u32 = 64;
 /// whose last field is, followed through each struct's last field (the Reference, "Dynamically
 /// sized types": "a struct may contain a DST as the last field ... making the struct itself a
 /// DST"; core's `CStr { inner: [c_char] }`).
-pub(crate) fn is_unsized<W: LayoutFacts>(world: &W, g: &mut PortableTys<'_>, pointee: PTy, scratch: Alloc<'_>) -> Result<bool, Refusal<'static>> {
+pub fn is_unsized<W: LayoutFacts>(world: &W, g: &mut PortableTys<'_>, pointee: PTy, scratch: Alloc<'_>) -> Result<bool, Refusal<'static>> {
     let mut t = pointee;
     for _ in 0..TAIL_DEPTH {
         match g.view().node(t).map_err(|_| bad())? {

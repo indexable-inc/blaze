@@ -23,6 +23,44 @@
 //! comments, for what the head record form leaves out by name (a fn's and an ADT's lifetimes, an
 //! impl's const parameters, a trait's or impl's non-fn members). A reformat or a comment leaves
 //! the out equal; a type edit moves it, and with it each body that read it (body_types.rs).
+//!
+//! A HEAD A MACRO WROTE has no file entry of its own, but its call has one: the fn-like call at
+//! module level (`write_two!();`, an outline `MacroCall` entry), or the item an attribute or
+//! derive takes (`#[derive(Clone)] struct S`, a blaze edition's root `fn main`, which
+//! `bstd::main` takes unasked, D104). A call written by another expansion goes up its origins
+//! (blaze-scope expansion_origins.rs) to the file entry the outermost call is at. So ONE
+//! `Signature` per such file entry covers its own head and every head the expansions of calls
+//! at it write: its name is the entry's ([`signature_name`], from text, listed by the file's
+//! outline job before any expansion is made, as every other part), and its out is
+//! [`entry_out`]: the entry's own out, then, per call in call-key order, [`expansion_out`] (each
+//! head's want digest, and the expansion's heads' tokens). Two call sites of one macro are two
+//! entries, so two names; one call in two crates is two files' subjects; a rerun is the same
+//! name. A head is read by the entry its call is at (body_types/heads.rs `expansion_head`).
+//!
+//! Why the entry and not (call, entry in the expansion): a part is named before the work, from
+//! text (rule 65), and the job that lists a file's parts runs before the crate's expansions are
+//! made; the job that makes them, the crate's `CrateScope`, is no home a `Signature` can have
+//! (the drive keys a `Signature` by its home's `Owners` and `Surface`, request.rs `locate`, and
+//! the command runs one in its home FILE's body job, work.rs, `Kind::BodyCheck |
+//! Kind::Signature`). The grain is the call's entry: an edit of one head a call wrote reruns the
+//! readers of every head that call wrote (all of them, for one call writing one head).
+//! Only a WORKSPACE crate's such head is read so: another crate's heads are under its
+//! `CrateScope` identity.
+//!
+//! WHICH ENTRY COVERS A HEAD ([`covering_entry`]), for every head a workspace body can read:
+//! - an item in modules, or a fn of an impl in modules: its own entry;
+//! - a trait's member (fn, const, type, macro call): its trait's (the trait's want holds them);
+//! - an impl's const or type: its impl's; a member a macro call inside the impl block writes
+//!   (`impl T { some_macro!(..); }`): its impl's, whose out holds that call's expansion as a
+//!   module-level call's entry holds its own ([`entry_out`]; the call's text is the impl's
+//!   source, never its out);
+//! - a foreign fn or static: its `extern` block's, which is an entry of its own whose whole text
+//!   is its heads and whose out holds each foreign item's want digest ([`wants_digest`]);
+//! - a head an expansion wrote: the entry its (outermost) call is at, as above, so a call in an
+//!   impl block is covered by its impl;
+//! - a head inside a body: none. A body's items are named only inside it and checked in its
+//!   task (body_types/heads.rs `body_local`), covered by its text; the one way out of a body
+//!   (an impl written in it) is a finding by name ([`uncovered_why`]).
 
 use blaze_drive::{Kind, Name};
 use blaze_file_items::Outline;
@@ -72,16 +110,82 @@ fn in_modules_only(outline: &Outline<'_>, item: &Item) -> bool {
     true
 }
 
-/// Whether `item` of `outline` has a `Signature` task: a head of its own in modules only, or a
-/// fn of an impl that is. The one predicate: the file job makes a part for exactly these
-/// (work.rs `outline_file`), and a body names a head only when its entry passes it.
+/// Whether `item` of `outline` has a `Signature` task: a head of its own in modules only, a
+/// macro call in modules only (the heads its expansion writes, module docs), an `extern` block
+/// in modules only (its foreign items' heads: a foreign fn has no body, so the block's whole
+/// text is their heads), or a fn of an impl that is. The one predicate: the file job makes a
+/// part for exactly these (work.rs `outline_file`), and a body names a head by the entry
+/// [`covering_entry`] finds for it.
+///
+/// A fn of an impl is asked BEFORE the module-level rule: a fn is a head of its own too, and
+/// the module-level rule refused every impl fn (its parent is the impl), so no impl fn had a
+/// `Signature` and every body reading one, its own included, was not checked (tempo,
+/// 2026-11-17 03:55: 1,767 notes "a head it reads could not be named as a `Signature`", each
+/// at an impl fn or a caller of one).
 pub(crate) fn is_signature_entry(outline: &Outline<'_>, item: &Item) -> bool {
-    if own_head(item.kind()) {
+    if let Some(parent) = item.parent {
+        let up = outline.item(parent);
+        if item.kind() == ItemKind::Function && up.kind() == ItemKind::Impl {
+            return in_modules_only(outline, up);
+        }
+    }
+    if own_head(item.kind()) || matches!(item.kind(), ItemKind::MacroCall | ItemKind::ExternBlock) {
         return in_modules_only(outline, item);
     }
-    let Some(parent) = item.parent else { return false };
+    false
+}
+
+/// The entry whose `Signature` covers a head written at entry `at` of `outline`: the entry
+/// itself when it passes [`is_signature_entry`]; else its container's, when that is a trait, an
+/// impl or an `extern` block in modules only: a trait's members are its trait's head; an impl's
+/// const, type and macro call (whose expansion writes members) are its impl's; a foreign item is
+/// its block's. `None`: the entry is inside a body (an item of a body, an impl in a body, a
+/// macro call in one), or no head ([`uncovered_why`] says which).
+pub(crate) fn covering_entry(outline: &Outline<'_>, at: ItemIndex) -> Option<ItemIndex> {
+    let item = outline.items().get(at.0 as usize)?;
+    if is_signature_entry(outline, item) {
+        return Some(at);
+    }
+    let parent = item.parent?;
     let up = outline.item(parent);
-    item.kind() == ItemKind::Function && up.kind() == ItemKind::Impl && in_modules_only(outline, up)
+    (matches!(up.kind(), ItemKind::Trait | ItemKind::Impl | ItemKind::ExternBlock) && in_modules_only(outline, up)).then_some(parent)
+}
+
+/// Why no entry covers a head written at entry `at` ([`covering_entry`] is `None`).
+pub(crate) fn uncovered_why(outline: &Outline<'_>, at: ItemIndex) -> &'static str {
+    let Some(item) = outline.items().get(at.0 as usize) else {
+        return "a head's entry is not in its file as it is now (signature.rs `covering_entry`)";
+    };
+    let mut parent = item.parent;
+    while let Some(up) = parent {
+        let up = outline.item(up);
+        if !matches!(up.kind(), ItemKind::Module | ItemKind::Impl | ItemKind::Trait | ItemKind::ExternBlock) {
+            return "a head written inside a body is read from outside that body (an impl in a body, whose members are seen from outside it, or an item a body's macro call wrote): a body's items have no `Signature` (D114 FACTS (iii)), and its text covers them only for a body that holds them";
+        }
+        parent = up.parent;
+    }
+    "the entry at a head's place is no head of its own, and no trait, impl or `extern` block in modules holds it (signature.rs `covering_entry`)"
+}
+
+/// The domain of an entry's own wants' digest ([`wants_digest`]).
+const WANTS_DOMAIN: &str = "blaze-cli signature entry wants 1";
+
+/// The digest of an entry's own wants' digests, in its entries' order: [`NO_WANT`] for none,
+/// the one digest for one (every entry with one head keeps its out), else each after the count
+/// (an `extern` block: one want a foreign item).
+pub(crate) fn wants_digest(digests: &[ContentId]) -> ContentId {
+    match digests {
+        [] => NO_WANT,
+        [one] => *one,
+        _ => {
+            let mut h = Hasher::new(WANTS_DOMAIN);
+            h.update(&(digests.len() as u32).to_le_bytes());
+            for digest in digests {
+                h.update(&digest.0);
+            }
+            h.finish()
+        }
+    }
 }
 
 /// The subject of a file's `Signature`s: its real path in the checkout.
@@ -103,9 +207,11 @@ pub(crate) fn signature_name(file: ContentId, outline: &Outline<'_>, item: &Item
     Name::new(Kind::Signature, h.finish())
 }
 
-/// Whether an entry's fields or variants are its head: its whole text is.
+/// Whether an entry's fields or variants are its head: its whole text is. A macro call's whole
+/// text (its path and input) is what its expansion is made from: all of it is its head. An
+/// `extern` block's foreign items have no bodies: all of it is their heads.
 const fn whole_is_head(kind: ItemKind) -> bool {
-    matches!(kind, ItemKind::Struct | ItemKind::Enum | ItemKind::Union | ItemKind::TypeAlias | ItemKind::TraitAlias)
+    matches!(kind, ItemKind::Struct | ItemKind::Enum | ItemKind::Union | ItemKind::TypeAlias | ItemKind::TraitAlias | ItemKind::MacroCall | ItemKind::ExternBlock)
 }
 
 /// The digest of an entry's head bytes: its whole text where its fields are its head, else its
@@ -174,11 +280,27 @@ fn tokens(h: &mut Hasher, piece: &str, edition: Edition) {
 pub(crate) fn unencoded(outline: &Outline<'_>, at: ItemIndex, text: &str, edition: Edition) -> ContentId {
     let item = outline.item(at);
     let mut h = Hasher::new(TOKENS_DOMAIN);
-    let head = if whole_is_head(item.kind()) { item.range.of(text) } else { item.text(text, item.signature) };
+    // A macro call's own text is its source (`head_bytes`), not its out: what readers see of it
+    // is its expansion's heads (`expansion_out`), so an edit inside a body the call writes
+    // moves no reader.
+    let head = if item.kind() == ItemKind::MacroCall {
+        ""
+    } else if whole_is_head(item.kind()) {
+        item.range.of(text)
+    } else {
+        item.text(text, item.signature)
+    };
     tokens(&mut h, head, edition);
     if matches!(item.kind(), ItemKind::Trait | ItemKind::Impl) {
         let trait_ = item.kind() == ItemKind::Trait;
         for (_, member) in outline.children(Some(at)) {
+            // An impl's macro call is its source, not its out: what readers see of it is the
+            // members its expansion writes (`expansion_out`, body_types/heads.rs
+            // `make_expanded`), as for a module-level call. A trait's is kept whole: the
+            // trait's want digest is the one that holds its members.
+            if !trait_ && member.kind() == ItemKind::MacroCall {
+                continue;
+            }
             let piece = if member.kind() != ItemKind::Function {
                 member.range.of(text)
             } else if trait_ {
@@ -198,5 +320,45 @@ pub(crate) fn unencoded(outline: &Outline<'_>, at: ItemIndex, text: &str, editio
 pub(crate) fn signature_out(want_digest: ContentId, unencoded: ContentId) -> ContentId {
     let mut h = Hasher::new(OUT_DOMAIN);
     h.update(&want_digest.0).update(&unencoded.0);
+    h.finish()
+}
+
+/// The domain of an entry's out with the expansions at it ([`entry_out`]).
+const ENTRY_DOMAIN: &str = "blaze-cli signature entry with expansions 1";
+/// The domain of one expansion's heads ([`expansion_out`]).
+const EXPANSION_DOMAIN: &str = "blaze-cli signature expansion heads 1";
+
+/// The out of a file entry's `Signature`: `own` ([`signature_out`] of its own head) when no
+/// call at it wrote a head, so an entry no macro takes keeps the out it had; else `own` and
+/// each `expansions` out ([`expansion_out`], in call-key order).
+pub(crate) fn entry_out(own: ContentId, expansions: &[ContentId]) -> ContentId {
+    if expansions.is_empty() {
+        return own;
+    }
+    let mut h = Hasher::new(ENTRY_DOMAIN);
+    h.update(&own.0).update(&(expansions.len() as u32).to_le_bytes());
+    for out in expansions {
+        h.update(&out.0);
+    }
+    h.finish()
+}
+
+/// The out of the heads one expansion wrote: each head's want digest (`digests`, in the
+/// order its caller fixes: by want), then, over the expansion's `text` and its `outline` (in
+/// `edition`), each entry passing [`is_signature_entry`] by index with its [`unencoded`]
+/// tokens, for what the head records leave out. The expansion's bodies are not in it: an
+/// edit inside a body the macro wrote moves no reader of its heads.
+pub(crate) fn expansion_out(digests: &[ContentId], outline: &Outline<'_>, text: &str, edition: Edition) -> ContentId {
+    let mut h = Hasher::new(EXPANSION_DOMAIN);
+    h.update(&(digests.len() as u32).to_le_bytes());
+    for digest in digests {
+        h.update(&digest.0);
+    }
+    for (index, item) in outline.items().iter().enumerate() {
+        if is_signature_entry(outline, item) {
+            let at = ItemIndex(index as u32);
+            h.update(&at.0.to_le_bytes()).update(&unencoded(outline, at, text, edition).0);
+        }
+    }
     h.finish()
 }

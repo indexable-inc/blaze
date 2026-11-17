@@ -21,6 +21,17 @@
 //!     Line it prints (and asserts): `dyn: reached A::speak B::speak; pairs speak@A speak@B`.
 //! (c) tests/front2_reach_statics.rs's program: its reached set is unchanged.
 //!     Line it prints (and asserts): `statics: a Checked, b Checked, c Checked`.
+//! (d) `trait Greet` with a PROVIDED fn `hi`; `A`'s impl overrides it, `B`'s leaves it out.
+//!     `run` calls `B.hi()` (a concrete call: the trait's own body runs, the Reference,
+//!     Traits, "Associated functions") and `via(&A)`, where `via<T: Greet>` calls `t.hi()`
+//!     (decided at the instance). So `Greet::hi` is walked as a body AND decided at an
+//!     instance, and the instance `via::<A>` runs `A::hi`. Before, the walk's pop dropped the
+//!     instance decision of a fn already walked as a body (or replaced it by `Checked`), so
+//!     `hi` was never asked at `A` and `A::hi` was never reached: the hello path's stubs
+//!     "`integer_min` at [Uint(Usize)] reaches item .. which no fn row tables" (core's
+//!     `<impl PartialOrd for usize>::lt`, `PartialOrd::lt` being a body through every derived
+//!     `PartialOrd`). A wrong version prints `provided: reached ; pairs `.
+//!     Line it prints (and asserts): `provided: reached A::hi; pairs hi@A hi@B hi@Param`.
 //!
 //! Needs the installed toolchain under `$HOME/.blaze/v2/toolchain`, as tests/front2_clone.rs
 //! does. NOT RUN by the writer (a write-only lane).
@@ -147,6 +158,34 @@ fn run() -> i32 {
 }
 ";
 
+const GREET: &str = "fn main(cx: &Cx, io: Io) -> Result<(), Error> {
+    Ok(())
+}
+
+trait Greet {
+    fn hi(&self) -> i32 {
+        0
+    }
+}
+
+struct A;
+struct B;
+
+impl Greet for A {
+    fn hi(&self) -> i32 { 1 }
+}
+
+impl Greet for B {}
+
+fn via<T: Greet>(t: &T) -> i32 {
+    t.hi()
+}
+
+fn run() -> i32 {
+    B.hi() + via(&A)
+}
+";
+
 /// What one walk from `run` reached, shown by name.
 struct Walked {
     /// Each reached fn of an impl of the trait, `Type::fn`, sorted.
@@ -169,14 +208,14 @@ fn walk(krate: &'static str, src: &'static str, trait_name: Option<&'static str>
     let root = format!("/{krate}/src/main.rs");
     let files = [(root.clone(), src.to_string())];
     let edition = edition::PackageEdition::of_manifest("blaze-2026.11").expect("a known edition");
-    let user = UserCrate { name: krate, dir: &dir, root: &root, files: &files, edition };
+    let user = UserCrate { name: krate, dir: &dir, root: &root, files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: src }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
-    let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"), front.frame);
+    let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
     let lib = |ns: Namespace, name: &'static str| {
         names::path(&names, names.root(0), ns, Written { kind: PathKind::Plain, segments: &[name] }, Alloc::global())
             .ok()
@@ -271,6 +310,15 @@ fn dyn_reaches_only_the_coerced_types() {
     let line = format!("dyn: reached {}; pairs {}", w.impl_fns.join(" "), w.pairs.join(" "));
     eprintln!("{line}");
     assert_eq!(line, "dyn: reached A::speak B::speak; pairs speak@A speak@B");
+}
+
+#[test]
+fn provided_fn_walked_as_body_is_still_asked_at_its_instances() {
+    let w = walk("greet", GREET, Some("Greet"), &["A", "B"], &[]);
+    let line = format!("provided: reached {}; pairs {}", w.impl_fns.join(" "), w.pairs.join(" "));
+    eprintln!("{line}");
+    // `B` is written in `run`, so `hi` is asked there too (its impl answers with no `hi`).
+    assert_eq!(line, "provided: reached A::hi; pairs hi@A hi@B hi@Param");
 }
 
 #[test]

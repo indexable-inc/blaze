@@ -6,7 +6,7 @@ use std::alloc::Global;
 
 use blaze_lir::builder::{MemAttrs, Param, Variadic};
 use blaze_lir::eval::{Outcome, Val, run_in};
-use blaze_lir::func::{BlockKind, Conv, DataId, Func, SlotKind};
+use blaze_lir::func::{BlockKind, Conv, Func, SlotKind};
 use blaze_lir::{Builder, Flags, Full, Op, Ordering, Ty, Value};
 use blaze_own::Alloc;
 use blaze_typeck::{AdtKind, IntTy, PNode, PTy, UintTy};
@@ -238,6 +238,77 @@ fn type_queries_are_the_layout() {
     assert_eq!(eval(&f, &[0]), [0, 2]);
 }
 
+/// `size_of_val` / `align_of_val` of `&S<dyn Tr>`, `struct S<T: ?Sized> { a: u64, b: u8, t: T }`
+/// (`ArcInner<dyn Tr>`'s shape), through a vtable of size `vs` and alignment `va` (words 1 and
+/// 2): rustc's `size_and_align_of_dst`, the Reference's "Type layout": the trait object at the
+/// prefix's end (9) rounded up to `va`, the alignment the larger of 8 and `va`, the size its end
+/// rounded up to that. A bare `&dyn Tr` answers the vtable's words. A version that took the
+/// prefix's size rounded to its own alignment (16) as the tail's offset gives 24, not 16, for
+/// `(4, 4)`.
+#[test]
+fn values_ending_in_a_trait_object_measure_by_their_vtable() {
+    let mut env = Env::new();
+    let s = env.w.strukt(1, &[F::Leaf(U64), F::Leaf(U8), F::P(0)], ReprAttrs::RUST);
+    let principal = env.g.n(PNode::ExTrait(blaze_typeck::ItemKey(0x77), blaze_typeck::List::EMPTY));
+    let l = env.g.t.intern_list(&[principal]).unwrap();
+    let dyn_tr = env.g.n(PNode::Dynamic(l));
+    let s_dyn = env.g.adt(s, &[dyn_tr]);
+    let usize_ = env.g.n(USIZE);
+    for (t, cases) in [
+        (s_dyn, [(4u128, 4u128, [16u128, 8u128]), (1, 1, [16, 8]), (24, 8, [40, 8]), (16, 16, [32, 16])]),
+        (dyn_tr, [(4, 4, [4, 4]), (1, 1, [1, 1]), (24, 8, [24, 8]), (16, 16, [16, 16])]),
+    ] {
+        let f = func(&[Ty::I64, Ty::I64], &[Ty::I64, Ty::I64], |b, a| {
+            let vt_slot = b.slot(24, 3, SlotKind::Temp);
+            let vt = b.slot_addr(vt_slot);
+            b.store(Flags::NONE, a[0], vt, 8, MemAttrs::aligned(3));
+            b.store(Flags::NONE, a[1], vt, 16, MemAttrs::aligned(3));
+            let wide_slot = b.slot(16, 3, SlotKind::Temp);
+            let wide = b.slot_addr(wide_slot);
+            b.store(Flags::NONE, vt, wide, 0, MemAttrs::aligned(3));
+            b.store(Flags::NONE, vt, wide, 8, MemAttrs::aligned(3));
+            let mut q = |which| scalar(env.call(b, &Call { which, generics: &[GenericArg::Ty(t)], args: &[Arg::Place(wide)], ret: usize_, site: None }).unwrap());
+            vec![q(Which::SizeOfVal), q(Which::AlignOfVal)]
+        });
+        for (vs, va, want) in cases {
+            assert_eq!(eval(&f, &[vs, va]), want, "a vtable of size {vs} and alignment {va}");
+        }
+    }
+}
+
+/// `size_of_val` / `align_of_val` of `&T` for a `T` ending in a slice: rustc's
+/// `size_and_align_of_dst`, `round_up(tail_at + len * stride, align)`, rounded once from the
+/// tail's own offset. `P { a: u64, b: u8, t: [u8] }` (the tail at 9, aligned to 8) of lengths 0,
+/// 3, 7, 8 is 16, 16, 16, 24; `Q { a: u8, t: [u32] }` (the tail at 4, aligned to 4) of length 2
+/// is 12; a bare `[u16]` of 5 is 10. A version that took the prefix rounded to its alignment
+/// (16) as the tail's start gives 24 for `P` of length 3. Prints nothing; a failure names the
+/// case ("P of length 3").
+#[test]
+fn values_ending_in_a_slice_round_once_from_the_tails_offset() {
+    let mut env = Env::new();
+    let s3 = env.w.strukt(1, &[F::Leaf(U64), F::Leaf(U8), F::P(0)], ReprAttrs::RUST);
+    let s2 = env.w.strukt(1, &[F::Leaf(U8), F::P(0)], ReprAttrs::RUST);
+    let (u8_, u16_, u32_) = (env.g.n(U8), env.g.n(U16), env.g.n(U32));
+    let (bytes, halves, words) = (env.g.n(PNode::Slice(u8_)), env.g.n(PNode::Slice(u16_)), env.g.n(PNode::Slice(u32_)));
+    let p = env.g.adt(s3, &[bytes]);
+    let q = env.g.adt(s2, &[words]);
+    let usize_ = env.g.n(USIZE);
+    let cases: [(&str, PTy, &[(u128, u128)], u128); 3] =
+        [("P", p, &[(0, 16), (3, 16), (7, 16), (8, 24)], 8), ("Q", q, &[(2, 12)], 4), ("[u16]", halves, &[(5, 10)], 2)];
+    for (name, t, lens, align) in cases {
+        let f = func(&[Ty::I64], &[Ty::I64, Ty::I64], |b, a| {
+            let slot = b.slot(16, 3, SlotKind::Temp);
+            let at = b.slot_addr(slot);
+            b.store(Flags::NONE, a[0], at, 8, MemAttrs::aligned(3));
+            let mut ask = |which| scalar(env.call(b, &Call { which, generics: &[GenericArg::Ty(t)], args: &[Arg::Place(at)], ret: usize_, site: None }).unwrap());
+            vec![ask(Which::SizeOfVal), ask(Which::AlignOfVal)]
+        });
+        for &(len, want) in lens {
+            assert_eq!(eval(&f, &[len]), [want, align], "{name} of length {len}");
+        }
+    }
+}
+
 /// `write_via_move` then `read_via_copy` of a `u32`, `arith_offset` between, and a transmute of
 /// the bytes in memory to the `u32` they hold.
 #[test]
@@ -406,10 +477,15 @@ fn atomics_carry_their_orderings() {
     assert_eq!(env.call(&mut b, &c).unwrap_err().to_string(), "intrinsic `atomic_fence`: a relaxed fence (core panics on one)");
 }
 
-/// "Gets a reference to a static `Location` indicating where it was called.": a data row of
-/// the `Location` by its layout, its filename a pointer to the path's bytes and a NUL.
+/// "Gets a reference to a static `Location` indicating where it was called.": the site is
+/// item-relative (`CallerSite`: file, item, offset), and the row's line and column are source
+/// positions placed with the program (rule 71). The function holds two rows: the path and a
+/// NUL, and the `Location`, whose filename is an address of the path's row and its length, and
+/// whose `line` and `col` are one source position each of (item 9, byte 30), their bytes zero.
+/// A builder that wrote an absolute line fails the zero-bytes assert; one that dropped a
+/// position, the positions assert. A malformed `Location` is named as such. Passes silently.
 #[test]
-fn caller_location_is_a_location_in_data() {
+fn caller_location_is_a_row_of_source_positions() {
     let mut env = Env::new();
     // `Location<'a> { filename: NonNull<str>, line: u32, col: u32, .. }`, the pointer modelled
     // as `*const str`.
@@ -417,18 +493,39 @@ fn caller_location_is_a_location_in_data() {
     let str_ = env.g.n(PNode::Str);
     let loc_ty = env.g.adt(loc, &[str_]);
     let r = env.g.r(loc_ty);
+    let site = crate::CallerSite { file: "src/main.rs", item: blaze_typeck::ItemKey(9), offset: 30 };
     let f = func(&[], &[Ty::PTR], |b, _| {
-        let c = Call { which: Which::CallerLocation, generics: &[], args: &[], ret: r, site: Some((Site::Here { file: "src/main.rs", line: 7, col: 5 }, loc_ty)) };
-        vec![scalar(env.call(b, &c).unwrap())]
+        let c = Call { which: Which::CallerLocation, generics: &[], args: &[], ret: r, site: Some((Site::Here(site), loc_ty)) };
+        match env.call(b, &c) {
+            Ok(Out::Scalar(at)) => vec![at],
+            Ok(_) => panic!("a `Location`'s address is one pointer"),
+            Err(e) => panic!("{e}"),
+        }
     });
-    let v = f.view();
-    assert_eq!(v.data_bytes_of(DataId(0)), b"src/main.rs\0");
-    let row = v.data_bytes_of(DataId(1));
-    assert_eq!(row.len(), 24, "a wide pointer and two u32s");
-    assert_eq!(&row[8..16], &11u64.to_le_bytes(), "the length leaves the NUL out");
-    assert_eq!((&row[16..20], &row[20..24]), (&7u32.to_le_bytes()[..], &5u32.to_le_bytes()[..]), "line, then col");
-    let relocs = v.data_relocs_of(DataId(1));
-    assert_eq!((relocs.len(), relocs[0].offset), (1, 0), "the filename's address is a relocation");
+    let view = f.view();
+    let text = blaze_lir::print(view);
+    use blaze_lir::func::DataId;
+    assert_eq!(view.datas.len(), 2, "the path's row and the `Location`'s: {text}");
+    assert_eq!(view.data_bytes_of(DataId(0)), b"src/main.rs\0", "{text}");
+    assert!(view.data_positions_of(DataId(0)).is_empty(), "{text}");
+    let relocs = view.data_relocs_of(DataId(1));
+    assert_eq!(relocs.len(), 1, "the filename's address: {text}");
+    let row = view.data_bytes_of(DataId(1));
+    let f_at = relocs[0].offset as usize;
+    assert_eq!(&row[f_at + 8..f_at + 16], &11u64.to_le_bytes(), "the path's length after its address: {text}");
+    let positions = view.data_positions_of(DataId(1));
+    let fields: std::vec::Vec<_> = positions.iter().map(|p| (p.item_key(), p.site, blaze_lir::PositionField::from_word(p.field))).collect();
+    assert_eq!(fields.len(), 2, "{text}");
+    assert!(fields.contains(&(9, 30, Some(blaze_lir::PositionField::Line))) && fields.contains(&(9, 30, Some(blaze_lir::PositionField::Col))), "{text}");
+    for p in positions {
+        assert_eq!(&row[p.offset as usize..p.offset as usize + 4], &[0; 4], "no absolute line or column in the row: {text}");
+    }
+    let bad = env.w.strukt(0, &[F::Leaf(U32)], ReprAttrs::RUST);
+    let bad_ty = env.g.adt(bad, &[]);
+    let bad_r = env.g.r(bad_ty);
+    let mut b = Builder::<Global, Full>::new_in(64, Global);
+    let c = Call { which: Which::CallerLocation, generics: &[], args: &[], ret: bad_r, site: Some((Site::Here(site), bad_ty)) };
+    assert_eq!(env.call(&mut b, &c).unwrap_err().to_string(), "intrinsic `caller_location`: `Location` without its fields (filename, line, col)");
 }
 
 /// `three_way_compare`: "Does a three-way comparison between the two arguments, which must be
@@ -518,4 +615,118 @@ fn slice_get_unchecked_projects_without_a_check() {
     );
 }
 
+/// `type_id::<T>()`'s hash (instance.rs `type_id_hash`): one type gives one value however its
+/// table was filled (a second table, other types interned first, the type's index another:
+/// what an alias resolved to the same type, or another crate's build, sees), two types two
+/// values, and lifetimes are not in it (a ground `&T` holds no region).
+#[test]
+fn type_id_is_one_value_per_type() {
+    use crate::instance::type_id_hash;
+    let mut a = G::new();
+    let (u8a, u32a) = (a.n(U8), a.n(U32));
+    let pair_a = a.tuple(&[u8a, u32a]);
+    let mut b = G::new();
+    let filler = b.n(PNode::Bool);
+    let _ = b.r(filler);
+    let (u32b, u8b) = (b.n(U32), b.n(U8));
+    let pair_b = b.tuple(&[u8b, u32b]);
+    assert_ne!(pair_a, pair_b, "the control: the type's index differs between the tables");
+    let h = |g: &G, t: PTy| type_id_hash(t, g.t.view(), Alloc::global()).expect("a ground type");
+    assert_eq!(h(&a, pair_a), h(&a, pair_a), "one type asked twice");
+    assert_eq!(h(&a, pair_a), h(&b, pair_b), "one type in two tables (an alias of it, another build)");
+    assert_eq!(h(&a, u8a), h(&b, u8b));
+    let swapped = b.tuple(&[u32b, u8b]);
+    let i8b = b.n(I8);
+    let rb = b.r(u8b);
+    let pb = b.n(PNode::Ptr(blaze_typeck::Mutbl::Not, u8b));
+    let (arr2, arr3) = (b.array(u8b, 2), b.array(u8b, 3));
+    let all = [pair_b, swapped, u8b, i8b, u32b, rb, pb, arr2, arr3];
+    for (i, &x) in all.iter().enumerate() {
+        for &y in &all[i + 1..] {
+            assert_ne!(h(&b, x), h(&b, y), "{:?} and {:?} are two types", b.t.view().get(x), b.t.view().get(y));
+        }
+    }
+    println!("type_id::<(u8, u32)>() = {:#034x} in both tables; 9 types, 9 values", h(&a, pair_a));
+}
+
+/// The built `type_id::<T>()` (a run-time call: core makes it in `TypeId::of`'s `const` block,
+/// blaze-consteval tests/type_id.rs) is `type_id_hash`'s 128 bits as two little-endian words,
+/// so it equals the constant evaluator's value, which is made from the same function.
+#[test]
+fn type_id_is_the_one_hash_at_run_time() {
+    let mut env = Env::new();
+    let (u8_, u32_, u64_) = (env.g.n(U8), env.g.n(U32), env.g.n(U64));
+    let pair = env.g.tuple(&[u8_, u32_]);
+    let tid = env.g.array(u64_, 2);
+    for t in [u8_, pair] {
+        let want = crate::instance::type_id_hash(t, env.g.t.view(), Alloc::global()).expect("a ground type");
+        let f = func(&[], &[Ty::I64, Ty::I64], |b, _| {
+            let c = Call { which: Which::TypeId, generics: &[GenericArg::Ty(t)], args: &[], ret: tid, site: None };
+            let Out::At(at) = env.call(b, &c).expect("builds") else { panic!("`TypeId` is returned in memory") };
+            let lo = b.load(Ty::I64, Flags::NONE, at, 0, MemAttrs::aligned(3));
+            let hi = b.load(Ty::I64, Flags::NONE, at, 8, MemAttrs::aligned(3));
+            vec![lo, hi]
+        });
+        let got = eval(&f, &[]);
+        assert_eq!(got[0] | (got[1] << 64), want, "{t:?}");
+    }
+    let mut b = Builder::<Global, Full>::new_in(64, Global);
+    let c = Call { which: Which::TypeId, generics: &[GenericArg::Ty(u8_)], args: &[], ret: u64_, site: None };
+    assert_eq!(env.call(&mut b, &c).unwrap_err().to_string(), "intrinsic `type_id`: a result that is not `TypeId`'s 16 bytes");
+}
+
+/// `float_to_int_unchecked::<F, I>(x)`: truncation toward zero, `fptosi` or `fptoui` by `I`'s
+/// signedness, at each integer width. Its undefined inputs (NaN, infinities, out of range) are
+/// left out: blaze's operations saturate there, a defined value where Rust's is undefined.
+#[test]
+fn float_to_int_unchecked_truncates_toward_zero() {
+    use blaze_typeck::FloatTy;
+    let (f32_, f64_) = (PNode::Float(FloatTy::F32), PNode::Float(FloatTy::F64));
+    let i16_ = PNode::Int(IntTy::I16);
+    let (i64_, i128_, u128_) = (PNode::Int(IntTy::I64), PNode::Int(IntTy::I128), PNode::Uint(UintTy::U128));
+    let f = |x: f32| u128::from(x.to_bits());
+    let d = |x: f64| u128::from(x.to_bits());
+    let cases: &[(PNode, Ty, u128, PNode, Ty, u128)] = &[
+        (f32_, Ty::F32, f(3.9), I32, Ty::I32, 3),
+        (f32_, Ty::F32, f(-3.9), I32, Ty::I32, 0xffff_fffd),
+        (f32_, Ty::F32, f(-0.5), I32, Ty::I32, 0),
+        (f32_, Ty::F32, f(255.9), U8, Ty::I8, 255),
+        (f32_, Ty::F32, f(-128.0), I8, Ty::I8, 0x80),
+        (f32_, Ty::F32, f(300.25), i16_, Ty::I16, 300),
+        (f64_, Ty::F64, d(-1.5), i64_, Ty::I64, u128::from(u64::MAX)),
+        (f64_, Ty::F64, d(4_294_967_295.75), U32, Ty::I32, 0xffff_ffff),
+        (f64_, Ty::F64, d(1e20), u128_, Ty::I128, 100_000_000_000_000_000_000),
+        (f64_, Ty::F64, d(-(2f64.powi(100))), i128_, Ty::I128, (-(1i128 << 100)) as u128),
+    ];
+    for &(fl, fty, x, int, ity, want) in cases {
+        let mut env = Env::new();
+        let (fp, ip) = (env.g.n(fl), env.g.n(int));
+        let func_ = func(&[fty], &[ity], |b, a| {
+            let c = Call { which: Which::FloatToIntUnchecked, generics: &[GenericArg::Ty(fp), GenericArg::Ty(ip)], args: &[Arg::Scalar(a[0])], ret: ip, site: None };
+            vec![scalar(env.call(b, &c).expect("builds"))]
+        });
+        let signed = matches!(int, PNode::Int(_));
+        assert!(ops(&func_).contains(&(if signed { Op::FptoSi } else { Op::FptoUi }, Flags::NONE)), "{int:?}");
+        assert_eq!(eval(&func_, &[x]), [want], "float_to_int_unchecked::<{fl:?}, {int:?}>({x:#x})");
+    }
+    // f16 and f128 build the same operation (blaze-lir's legalize makes them, not the evaluator).
+    for (fl, fty) in [(PNode::Float(FloatTy::F16), Ty::F16), (PNode::Float(FloatTy::F128), Ty::scalar(blaze_lir::Scalar::F128))] {
+        let mut env = Env::new();
+        let (fp, ip) = (env.g.n(fl), env.g.n(U64));
+        let func_ = func(&[fty], &[Ty::I64], |b, a| {
+            let c = Call { which: Which::FloatToIntUnchecked, generics: &[GenericArg::Ty(fp), GenericArg::Ty(ip)], args: &[Arg::Scalar(a[0])], ret: ip, site: None };
+            vec![scalar(env.call(b, &c).expect("builds"))]
+        });
+        assert!(ops(&func_).contains(&(Op::FptoUi, Flags::NONE)), "{fl:?}");
+    }
+    // An integer as the float, or a float as the integer, is not the intrinsic's signature.
+    let mut env = Env::new();
+    let (fp, ip) = (env.g.n(f32_), env.g.n(U8));
+    let mut b = Builder::<Global, Full>::new_in(64, Global);
+    let x = b.fconst(Ty::F32, 0);
+    let c = Call { which: Which::FloatToIntUnchecked, generics: &[GenericArg::Ty(ip), GenericArg::Ty(fp)], args: &[Arg::Scalar(x)], ret: fp, site: None };
+    assert_eq!(env.call(&mut b, &c).unwrap_err().to_string(), "intrinsic `float_to_int_unchecked`: a first type argument that is not a float");
+}
+
+mod bytes;
 mod offsets;

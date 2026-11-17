@@ -3,7 +3,7 @@
 //! ids, the global cache per input, the provisional cache, and the path kinds and cycle heads
 //! the stack entries carry. The stack itself is the engine's frames (eval.rs).
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_own::{Alloc, Vec};
 
 use crate::canon::RespId;
@@ -135,7 +135,7 @@ pub struct Inputs<'a> {
     pub words: Vec<u32, Alloc<'a>>,
     rows: Vec<(u32, u32), Alloc<'a>>,
     /// Hash of the words to the first row with it; `next` chains rows of equal hash.
-    map: HashMap<u64, u32, Alloc<'a>>,
+    map: Map<u64, u32, FixedState, Alloc<'a>>,
     next: Vec<u32, Alloc<'a>>,
     /// Per input: its global cache entry.
     pub success: Vec<Option<Entry>, Alloc<'a>>,
@@ -165,7 +165,7 @@ impl<'a> Inputs<'a> {
         Inputs {
             words: Vec::new_in(alloc),
             rows: Vec::new_in(alloc),
-            map: HashMap::new_in(alloc),
+            map: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             next: Vec::new_in(alloc),
             success: Vec::new_in(alloc),
             overflow: Vec::new_in(alloc),

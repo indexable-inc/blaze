@@ -38,7 +38,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use blaze_hash::{FixedState, HashMap};
+use blaze_hash::{FixedState, Map};
 use blaze_ids::{bits::BitArray, radix};
 use blaze_mem::{Frame, Tag, frame, scratch::Scratch};
 use std::alloc::Global;
@@ -519,7 +519,7 @@ fn block_expr_ast_id(
 /// The next index of each kind and hash value, keyed by both in one word (`kind << 16 | hash`),
 /// so a key hashes with one multiply.
 #[derive(Default)]
-struct ErasedAstIdNextIndexMap(HashMap<u32, u32, Global>);
+struct ErasedAstIdNextIndexMap(Map<u32, u32, FixedState, Global>);
 
 impl ErasedAstIdNextIndexMap {
     #[inline]
@@ -1602,7 +1602,7 @@ mod tests {
         sync::Arc,
     };
 
-    use blaze_hash::{FixedState, HashMap, HashSet};
+    use blaze_hash::{FixedState, Map, Set};
     use blaze_ids::rng::SplitMix64;
     use std::alloc::Global;
     use syntax::{
@@ -1849,9 +1849,9 @@ fn foo() {
             let full = full_of(&text);
             let full_map = AstIdMap::from_view(full.root());
             let want = ids(&full_map);
-            let distinct: HashSet<_, Global> = want.iter().map(|&(_, id)| id).collect();
+            let distinct: Set<_, FixedState, Global> = want.iter().map(|&(_, id)| id).collect();
             assert_eq!(distinct.len(), want.len(), "{path}: two nodes have one id");
-            let with_id: HashSet<_, Global> = want.iter().map(|&(ptr, _)| ptr).collect();
+            let with_id: Set<_, FixedState, Global> = want.iter().map(|&(ptr, _)| ptr).collect();
             for node in full.root().descendants() {
                 let ptr = view::ptr(node);
                 if ErasedFileAstId::should_alloc(node.kind()).is_some() {
@@ -1895,9 +1895,9 @@ fn foo() {
                     });
                 }
             });
-            let got: HashMap<_, _, Global> = ids(&map).into_iter().collect();
+            let got: Map<_, _, FixedState, Global> = ids(&map).into_iter().collect();
             assert!(
-                got == want.into_iter().collect::<HashMap<_, _, Global>>(),
+                got == want.into_iter().collect::<Map<_, _, FixedState, Global>>(),
                 "{path}: `ptrs` differ"
             );
         }
@@ -1952,7 +1952,7 @@ fn foo() {
         let want = ids(&full_map);
         assert_eq!(count(&want, SyntaxKind::FN), 5000);
         assert_eq!(count(&want, SyntaxKind::MACRO_CALL), 3 * 5000);
-        let distinct: HashSet<_, Global> = want.iter().map(|&(_, id)| id).collect();
+        let distinct: Set<_, FixedState, Global> = want.iter().map(|&(_, id)| id).collect();
         assert_eq!(distinct.len(), want.len());
         let map = AstIdMap::from_view(outline_of(&text).root());
         for &(ptr, id) in want.iter().rev() {
@@ -2227,7 +2227,7 @@ fn foo() {
     }
 
     /// The indexes give what hash maps of the stored ids give (the layout before, which kept
-    /// `HashMap`s by node and by id), for every node of a file and for ids no node has.
+    /// `Map`s by node and by id), for every node of a file and for ids no node has.
     #[test]
     fn lookups_agree_with_maps_of_the_stored_ids() {
         for (path, text) in corpus() {
@@ -2236,8 +2236,8 @@ fn foo() {
             let outline = outline_of(&text);
             for map in [AstIdMap::from_view(full.root()), AstIdMap::from_view(outline.root())] {
                 let stored = stored(&map);
-                let by_ptr: HashMap<_, _, Global> = stored.iter().copied().collect();
-                let by_id: HashMap<_, _, Global> =
+                let by_ptr: Map<_, _, FixedState, Global> = stored.iter().copied().collect();
+                let by_id: Map<_, _, FixedState, Global> =
                     stored.iter().map(|&(ptr, id)| (id, ptr)).collect();
                 assert_eq!(by_ptr.len(), stored.len(), "{path}: a node is kept twice");
                 assert_eq!(by_id.len(), stored.len(), "{path}: an id is kept twice");
@@ -2310,7 +2310,7 @@ fn foo() {
         use super::{ErasedAstIdNextIndexMap, ErasedFileAstIdKind as Kind, INDEX_BITS, pack};
 
         #[derive(Default)]
-        struct Pairs(HashMap<(Kind, u16), u32, Global>);
+        struct Pairs(Map<(Kind, u16), u32, FixedState, Global>);
 
         impl Pairs {
             fn new_id(&mut self, kind: Kind, data: u64) -> ErasedFileAstId {
@@ -2461,9 +2461,9 @@ fn foo() {
     fn by_node(
         ids: Vec<(SyntaxNodePtr, ErasedFileAstId)>,
         what: &str,
-    ) -> HashMap<SyntaxNodePtr, ErasedFileAstId, Global> {
+    ) -> Map<SyntaxNodePtr, ErasedFileAstId, FixedState, Global> {
         let len = ids.len();
-        let map: HashMap<_, _, Global> = ids.into_iter().collect();
+        let map: Map<_, _, FixedState, Global> = ids.into_iter().collect();
         assert_eq!(map.len(), len, "{what}: a node is kept twice");
         map
     }

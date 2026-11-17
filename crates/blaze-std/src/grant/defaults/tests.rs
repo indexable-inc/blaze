@@ -132,7 +132,7 @@ fn the_start_folder_is_granted_as_dot() {
     let a = alloc();
     let mut said = std::string::String::new();
     let body = crate::launch_body!(takes_here; data: Dir<ReadOnly>);
-    let status = crate::entry::launch_in(&HERE, None, crate::io::Io::sim(1), &mut said, a, body);
+    let status = crate::entry::launch_in(&HERE, None, crate::io::Io::sim(1), &mut said, body);
     assert_eq!((status, said.as_str()), (crate::entry::Status(11), ""));
     let mut spec = bare(a);
     assert!(matches!(ordinary_grants(&HERE, &["prog", "--grant", "data=a/./b"], &mut spec, a), Err(OrdinaryError::Argument { .. })));

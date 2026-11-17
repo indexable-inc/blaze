@@ -64,13 +64,13 @@ fn main() {
 
 fn with_program(each: impl FnOnce(&blaze_scope::resolve::Names<'_>, &[SourceFile<'_>])) {
     let files = [SourceFile { path: "src/main.rs", text: PROGRAM }];
-    let tc = Toolchain::none();
+    let tc = Toolchain::none(blaze_own::Alloc::global());
     let new = blaze_ladder::run::NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
-    let texts = blaze_ladder::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc).unwrap_or_else(|e| panic!("the program's texts: {e}"));
+    let texts = blaze_ladder::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind).unwrap_or_else(|e| panic!("the program's texts: {e}"));
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names = inputs.resolve(&crates, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     each(&names, &files);
 }
 
@@ -98,7 +98,7 @@ fn trait_shown<P: FrontEnd>(p: &P, k: blaze_typeck::ItemKey) -> String {
 fn lazy_statics_answer_as_the_whole() {
     with_program(|names, files| {
         let (wf, lf) = (blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("a frame"), blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("a frame"));
-        let whole = Front2Program::new(names, &wf, files).unwrap_or_else(|e| panic!("the whole program: {e}"));
+        let whole = Front2Program::new(names, &wf, files, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("the whole program: {e}"));
         let main = key_of(names, Namespace::Values, "main");
         let mut lazy = LazyProgram::new(names, &lf, files, Some(main), blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the lazy program: {e}"));
         lazy.check_one(main).unwrap_or_else(|e| panic!("check_one(main): {e}")).expect("main is a fn");
@@ -125,7 +125,7 @@ fn lazy_statics_answer_as_the_whole() {
 fn lazy_objects_answer_as_the_whole() {
     with_program(|names, files| {
         let (wf, lf) = (blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("a frame"), blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("a frame"));
-        let whole = Front2Program::new(names, &wf, files).unwrap_or_else(|e| panic!("the whole program: {e}"));
+        let whole = Front2Program::new(names, &wf, files, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("the whole program: {e}"));
         let main = key_of(names, Namespace::Values, "main");
         let mut lazy = LazyProgram::new(names, &lf, files, Some(main), blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("the lazy program: {e}"));
         lazy.check_one(main).unwrap_or_else(|e| panic!("check_one(main): {e}")).expect("main is a fn");

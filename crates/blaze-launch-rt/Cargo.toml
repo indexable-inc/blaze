@@ -40,8 +40,9 @@ blaze-core.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
-# examples/fork_smoke: `Alloc::global()`, the handle a test program hands the zygote.
 blaze-own = { workspace = true, features = ["std", "testing"] }
+# examples/fork_smoke: its entry's frame (memory from the OS), handed to the zygote.
+blaze-mem.workspace = true
 # sample/tests.rs: the frame check's property and planted-bug control, the pace's property.
 blaze-sim.workspace = true
 # stub_wait_tests.rs: the stub path's allocation count (`#[global_allocator]` of the test binary).

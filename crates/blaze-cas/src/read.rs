@@ -33,7 +33,7 @@ use crate::sync::{
     atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
 };
 use crate::{
-    ByHash, Columns, Corrupt, Encodings, Entry, Heat, Key, Kind, Origin, Ticket, Use, cold,
+    BuildKeyHasher, Columns, Corrupt, Map, MapOpts, Encodings, Entry, Heat, Key, Kind, Origin, Ticket, Use, cold,
     disk::{
         self, Form, Loc, NO_DICTIONARY, RECORD_HEADER, RecordHeader, SCHEMA_PREFIX, Sealed, content_of,
     },
@@ -77,7 +77,7 @@ pub(crate) struct Shared {
     /// has not seen written back: what [`crate::Reader::derivable`] refuses as a base, since
     /// a clone of one waits for its write-back. Written by the store alone, as a file's
     /// state changes; held for one insert, remove or lookup.
-    unflushed: blaze_core::lock::Lock<crate::ByHashSet<ContentId, Global>>,
+    unflushed: blaze_core::lock::Lock<crate::Set<ContentId, crate::BuildKeyHasher, Global>>,
     /// The store's side of its buffer pool: what a read of a pack's bytes pins through.
     /// `None` when the pool could not be made: the store is broken, and has no pack to read.
     side: Option<Arc<Side>>,
@@ -89,7 +89,7 @@ pub(crate) struct Shared {
     /// end that reads a record a part at a time for its whole life), each with how many keep
     /// it: roots of the collector, whatever their flags of use. Held for one insert, remove
     /// or copy.
-    kept: blaze_core::lock::Lock<ByHash<Key, u32, Global>>,
+    kept: blaze_core::lock::Lock<Map<Key, u32, BuildKeyHasher, Global>>,
     /// Counts every key kept, ever: a mark of the collector made before one is stale.
     kept_changes: std::sync::atomic::AtomicU64,
     /// The store's clock as it was last told ([`crate::Store::clock`]), in seconds: what a
@@ -141,7 +141,7 @@ impl Shared {
             bound: Lock::new("store.pool.pinned", ()),
             unpinned: Signal::new("store.pool.unpinned"),
             // alloc: empty, allocates nothing until a key is kept
-            kept: blaze_core::lock::Lock::new("store.kept", ByHash::new_in(Global)),
+            kept: blaze_core::lock::Lock::new("store.kept", Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: None })),
             kept_changes: std::sync::atomic::AtomicU64::new(0),
             tick: std::sync::atomic::AtomicU64::new(0),
             // alloc: once per store opened, the view readers load
@@ -152,7 +152,14 @@ impl Shared {
             segments: (0..SEGMENTS_MOST).map(|_| OnceLock::new()).collect(),
             orphans: AtomicPtr::new(ptr::null_mut()),
             // alloc: empty, allocates nothing until a whole file is written
-            unflushed: blaze_core::lock::Lock::new("store.unflushed", crate::ByHashSet::new_in(Global)),
+            unflushed: blaze_core::lock::Lock::new(
+                "store.unflushed",
+                crate::Set::new(crate::SetOpts {
+                    hasher: crate::BuildKeyHasher::default(),
+                    alloc: Global,
+                    capacity: None,
+                }),
+            ),
         }
     }
 
@@ -401,7 +408,7 @@ pub(crate) struct TierView {
     /// it before the delta, so two claims of one key meet in it (`Own::claim`).
     pub(crate) prev: Option<Arc<Table<Spot>>>,
     pub(crate) packs: Vec<PackView>,
-    pub(crate) externals: ByHash<ContentId, ExternalView, Global>, // alloc: a published view's, freed with the view
+    pub(crate) externals: Map<ContentId, ExternalView, BuildKeyHasher, Global>, // alloc: a published view's, freed with the view
     pub(crate) dictionaries: Vec<(Kind, Result<Arc<cold::Prepared>, String>)>,
 }
 
@@ -956,7 +963,11 @@ impl<'a> Look<'a> {
         let it = &view.tiers[tier];
         // The keys seen live only while the rows are walked: a frame's.
         blaze_mem::frame::task(blaze_mem::Tag::Store, |frame| {
-            let mut shadow = blaze_hash::HashSet::new_in(frame);
+            let mut shadow = blaze_hash::Set::new(blaze_hash::SetOpts {
+                hasher: blaze_hash::FixedState,
+                alloc: frame,
+                capacity: None,
+            });
             for table in std::iter::once(&it.delta).chain(&it.prev) {
                 for (row, spot) in table.iter(self.held) {
                     // A record forgotten alone shadows the index's older one of its key, and

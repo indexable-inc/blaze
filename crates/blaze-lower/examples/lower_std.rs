@@ -54,7 +54,15 @@ impl Cfg for Host {
 struct NoExpand;
 
 impl Expand for NoExpand {
-    fn expand(&mut self, _: &str, _: &str, _: Edition, _: &mut dyn Cfg, _: &mut blaze_lower::BodyOut<'_>) -> Expansion {
+    fn expand(
+        &mut self,
+        _: &str,
+        _: Option<blaze_lower::mark_site::TextMark>,
+        _: &str,
+        _: Edition,
+        _: &mut dyn Cfg,
+        _: &mut blaze_lower::BodyOut<'_>,
+    ) -> Expansion {
         Expansion::Unsupported
     }
     fn expand_body(&mut self, _: blaze_lower::BodyCall<'_>, _: &mut dyn Cfg, _: &mut blaze_lower::BodyOut<'_>) -> Expansion {
@@ -63,6 +71,7 @@ impl Expand for NoExpand {
     fn derive(
         &mut self,
         _: &str,
+        _: Option<blaze_lower::mark_site::TextMark>,
         _: &blaze_expand::TokenStream<'_>,
         _: blaze_expand::DeriveFacts,
         _: Edition,
@@ -73,6 +82,7 @@ impl Expand for NoExpand {
     fn attr(
         &mut self,
         _: &str,
+        _: Option<blaze_lower::mark_site::TextMark>,
         _: Option<&blaze_expand::TokenStream<'_>>,
         _: &blaze_expand::TokenStream<'_>,
         _: Edition,

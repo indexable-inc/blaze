@@ -89,7 +89,7 @@ use std::sync::Arc;
 
 use blaze_cas::Key;
 use blaze_codegen::StaticId;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_ids::ContentId;
 use blaze_items::CodeHash;
 use blaze_launch::image as placed;
@@ -188,11 +188,11 @@ pub type Refusal = String;
 /// The daemon's state of one program. See the module's documentation.
 pub struct Program {
     /// By slot identity: its slot.
-    pub(crate) slots: HashMap<ContentId, u32, Global>,
+    pub(crate) slots: Map<ContentId, u32, FixedState, Global>,
     /// By slot: its identity.
     pub(crate) identities: Vec<ContentId>,
     /// By slot identity: its record, when held, and its bind key.
-    pub(crate) functions: HashMap<ContentId, Function, Global>,
+    pub(crate) functions: Map<ContentId, Function, FixedState, Global>,
     /// The program's own symbols, sorted by name.
     pub(crate) symbols: Vec<(String, Names)>,
     /// By number: each static and its record, in the order first given.
@@ -309,9 +309,9 @@ fn called(bound: &Bound) -> String {
 impl Program {
     pub fn new() -> Program {
         Program {
-            slots: HashMap::new_in(Global),
+            slots: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             identities: Vec::new(), // alloc: the program's tables, for as long as it is held
-            functions: HashMap::new_in(Global),
+            functions: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             symbols: Vec::new(), // alloc: as above
             statics: Vec::new(), // alloc: as above
             numbers: Vec::new(), // alloc: as above
@@ -464,7 +464,7 @@ impl Program {
     fn apply(&mut self, piece: Piece) -> Applied {
         // alloc (each below): once a piece
         let mut applied = Applied { fresh: Vec::new(), moved: Vec::new() };
-        let names = |bound: &Bound, functions: &mut HashMap<ContentId, Function, Global>| {
+        let names = |bound: &Bound, functions: &mut Map<ContentId, Function, FixedState, Global>| {
             for names in &bound.names {
                 if let Names::Function { slot, bind, ask, .. } = names {
                     functions.entry(*slot).or_insert(Function::NONE).named(*bind, ask);
@@ -771,7 +771,7 @@ impl Program {
 
     /// The slot of `identity`: the one it has, or the next, given now.
     fn slot_for(
-        slots: &mut HashMap<ContentId, u32, Global>,
+        slots: &mut Map<ContentId, u32, FixedState, Global>,
         identities: &mut Vec<ContentId>,
         identity: ContentId,
     ) -> u32 {

@@ -43,8 +43,6 @@
 //! `Alloc<'static>`: `CoroutineTable::of`, lay_states.rs). `Global` is named only where run.rs's
 //! existing types fix it (`Bodies::const_at`, `BuiltParts::args`, blaze-build's `Built<Global>`).
 
-use core::cell::OnceCell;
-
 use super::*;
 
 use blaze_ids::producer::{CodeBuilder, ProducerId};
@@ -52,8 +50,9 @@ use blaze_own::AVec;
 
 use crate::body_ids::{BodyIds, Counts, EntryForm, Make, Walk, WalkError, each_item};
 use crate::code_records::{Builder, Callee, CodeRecordError, CodeStore, Declared, InstanceNames, make_entry};
-use crate::front2::const_at::{ConstNeed, ConstTable, Needs};
+use crate::front2::const_at::{ConstTable, Needs};
 use crate::front2::coroutines::{CoroutineTable, Coroutines};
+use crate::front2::program::lazy::LazyRefusal;
 use super::lay_states::{Lay, lay_and_build, roots_of_instance, unchecked_owner};
 use crate::symbols::{decode_instance, encode_instance, fn_symbol_of_name, static_symbol, tls_symbol, vtable_symbol};
 
@@ -90,6 +89,8 @@ struct Work {
     alloc: Alloc<'static>,
     isa: Isa,
     overflow: OverflowChecks,
+    /// The program's panic strategy: the records' key's (`Maker::new`).
+    panic: blaze_build::Panic,
     langs: BackLangs,
     ground: PortableTys<'static>,
     layouts: Layouts<Alloc<'static>>,
@@ -120,6 +121,10 @@ enum Step {
     /// The lay of a coroutine state met owner fn `.0` not checked yet (lay_states.rs
     /// `Lay::Unchecked`): check it, then make the instance again.
     Check(ItemKey),
+    /// Fns the build's references resolved to that no row tables yet ([`Named1::Untabled`]):
+    /// check each (which tables its row), then make the instance again; each with the refusal
+    /// given when its check tables none.
+    Table(Vec<(ItemKey, RunError), Global>),
 }
 
 fn tables_gone(key: ItemKey) -> RunError {
@@ -129,7 +134,7 @@ fn tables_gone(key: ItemKey) -> RunError {
 impl MakerState {
     /// The state for `program`, before its first instance. Refuses a front end that evaluates
     /// constants for the whole program only (`evaluates_at_args` false), naming `first`.
-    pub fn new<P: FrontEnd>(program: &P, first: ItemKey, isa: Isa, overflow: OverflowChecks, alloc: Alloc<'static>) -> Result<MakerState, RunError> {
+    pub fn new<P: FrontEnd>(program: &P, first: ItemKey, isa: Isa, overflow: OverflowChecks, panic: blaze_build::Panic, alloc: Alloc<'static>) -> Result<MakerState, RunError> {
         if !program.evaluates_at_args() {
             return Err(RunError::OneBody {
                 key: first,
@@ -139,7 +144,7 @@ impl MakerState {
         let langs = BackLangs::of(program)?;
         let empty: &[Option<Checked<'static>>] = &[];
         let tables = Tables {
-            closures: ClosureTable::of(program, empty),
+            closures: ClosureTable::of(program, empty, alloc),
             coroutines: Coroutines::of(program, empty, alloc),
             const_at: ConstTable::new_in(Global),
         };
@@ -152,6 +157,7 @@ impl MakerState {
             alloc,
             isa,
             overflow,
+            panic,
             langs,
             ground,
             layouts: Layouts::new_in(alloc),
@@ -173,7 +179,7 @@ impl MakerState {
         const MOST_OWNERS: usize = 4096;
         let first = self.ensure_one(program, key, checks)?;
         let mut todo: AVec<'_, ItemKey> = blaze_own::Vec::new_in(self.work.alloc);
-        self.owners_named(key, &mut todo);
+        self.owners_named(&*program, key, &mut todo);
         let mut steps = 0;
         while let Some(owner) = todo.pop() {
             if self.asked.binary_search_by_key(&owner, |r| r.0).is_ok() {
@@ -184,21 +190,30 @@ impl MakerState {
                 return Err(RunError::OneBody { key, why: "more closure owners named than the most one ensure follows" });
             }
             self.ensure_one(program, owner, checks)?;
-            self.owners_named(owner, &mut todo);
+            self.owners_named(&*program, owner, &mut todo);
         }
         Ok(first)
     }
 
-    /// Each closure owner other than `key` that `key`'s checked body's types name, pushed on
-    /// `todo` (in node order: deterministic for one body).
-    fn owners_named(&self, key: ItemKey, todo: &mut AVec<'_, ItemKey>) {
+    /// Each fn other than `key` whose check `key`'s checked body's types read, pushed on `todo`
+    /// (in node order: deterministic for one body): a closure's owner (its facts are in its
+    /// body), and an `impl Trait` type's defining fn (the seam's `opaque_of`: its hidden type is
+    /// in that fn's check, front2/coroutines.rs `opaque_hidden`), an `async fn`'s future among
+    /// them.
+    fn owners_named<P: FrontEnd>(&self, program: &P, key: ItemKey, todo: &mut AVec<'_, ItemKey>) {
         let Some(Some(i)) = self.asked.binary_search_by_key(&key, |r| r.0).ok().map(|n| self.asked[n].1) else { return };
         let Some(Some(done)) = self.checked.get(i) else { return };
         let view = done.types.view();
         for n in view.nodes() {
-            if let blaze_typeck::PNode::Closure { owner, .. } = *n
-                && owner != key
-            {
+            let owner = match *n {
+                blaze_typeck::PNode::Closure { owner, .. } => owner,
+                blaze_typeck::PNode::Opaque(opaque, _) => match program.opaque_of(opaque) {
+                    Some((owner, _)) => owner,
+                    None => continue,
+                },
+                _ => continue,
+            };
+            if owner != key {
                 todo.push(owner);
             }
         }
@@ -226,8 +241,13 @@ impl MakerState {
                 self.checked[i] = Some(done);
                 if refresh {
                     let tables = self.tables.as_mut().ok_or_else(|| tables_gone(key))?;
-                    tables.closures = ClosureTable::of(&*program, &self.checked);
+                    tables.closures = ClosureTable::of(&*program, &self.checked, self.work.alloc);
                     tables.coroutines.table = CoroutineTable::of(&*program, &self.checked, self.work.alloc);
+                    // The library's async items, read again with the rows made so far: before the
+                    // first check a lazy front end has no `Poll` row yet, so `MakerState::new`'s
+                    // reading is `None` (front2/coroutines.rs `async_items`).
+                    tables.coroutines.items = crate::front2::coroutines::async_items(&*program);
+                    tables.coroutines.poll = crate::front2::coroutines::future_poll(&*program);
                 }
                 Some(i)
             }
@@ -272,7 +292,7 @@ pub fn make_instance<P: FrontEnd>(
     loop {
         let MakerState { checked, tables, work, .. } = &mut *state;
         let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
-        let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow };
+        let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, panic: work.panic, alloc: work.alloc };
         let step = build_one(&*program, &bodies, work, i, instance, entry);
         *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
         match step? {
@@ -287,9 +307,22 @@ pub fn make_instance<P: FrontEnd>(
                     return Err(unchecked_owner(&*program, i, owner));
                 }
             }
+            Step::Table(keys) => {
+                for (key, refusal) in keys {
+                    owners += 1;
+                    // Asked before: its check tabled no row, so the build met it untabled again.
+                    if owners > MOST_HELD_COROUTINES || state.asked.binary_search_by_key(&key, |r| r.0).is_ok() {
+                        return Err(refusal);
+                    }
+                    state.ensure(program, key, checks)?;
+                }
+            }
         }
     }
-    program.done(i);
+    // No `done` here: the walk may reach another instance of this fn at other arguments (a
+    // generic fn, `pick` at `i32` then at `u8`), whose make reads the same lowered body, and a
+    // body is checked once a run (the lazy program refuses a second `check_one`). The body is
+    // held for the run beside its checked result (`MakerState::checked`, held for the run too).
     Ok(())
 }
 
@@ -308,7 +341,7 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
     let mut args: AVec<'_, PTy> = blaze_own::Vec::new_in(work.alloc);
     args.extend_from_slice(work.ground.view().list(instance.args).map_err(malformed)?);
     let t = tables.take().ok_or_else(|| tables_gone(function.key))?;
-    let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow };
+    let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, panic: work.panic, alloc: work.alloc };
     let view = body.view(program.types());
     let facts = FrontAdts(&*program, i, &[], &work.langs, &bodies);
     let found = crate::front2::const_at::needs_of(&view, done, &args, &mut work.ground, &facts, work.alloc, &mut work.needs);
@@ -320,10 +353,7 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
     let named = function.named();
     let table = tables.as_mut().ok_or_else(|| tables_gone(instance.item))?;
     if let Err(refusal) = crate::front2::const_at::pull(&mut *program, &work.needs, work.ground.view(), &mut table.const_at) {
-        let item = match refusal.need {
-            ConstNeed::Item(k) => k,
-            ConstNeed::Block { owner, .. } => owner,
-        };
+        let item = refusal.need.item();
         let path = program.item_named(item);
         return Err(RunError::ConstAt { function: named, refusal, path });
     }
@@ -365,8 +395,12 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
     };
     let mut args: AVec<'_, PTy> = blaze_own::Vec::new_in(work.alloc);
     args.extend_from_slice(work.ground.view().list(owner_args).map_err(malformed)?);
-    // One of a coroutine's three functions: its instance is built once for all three.
-    let from_coroutine = match coroutine {
+    // One of a coroutine's three functions: its instance is built once for all three. The part
+    // is READ in the stash, (stash row, part) here, and leaves it only when its entry is made
+    // (the end of this fn): a make that stops first (`Step::Table`, `Step::Check`) is made again
+    // and reads the same part.
+    let twice = || RunError::Build { function: name(), error: BuildError::Malformed { what: "a coroutine's function its instance's build did not leave (asked for twice)" }, range: None };
+    let from_coroutine: Option<(usize, usize)> = match coroutine {
         None => None,
         Some((of, part)) => {
             let find = |stash: &[BuiltParts]| stash.iter().position(|b| b.owner == of.owner && b.ordinal == of.ordinal && b.args[..] == args[..]);
@@ -381,11 +415,10 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
                 let error = BuildError::Malformed { what: "a coroutine laid out and built whose functions are not in the stash (lay_states.rs)" };
                 return Err(RunError::Build { function: name(), error, range: None });
             };
-            let Some(taken) = work.stash[at].parts[part.index()].take() else {
-                let error = BuildError::Malformed { what: "a coroutine's function its instance's build did not leave (asked for twice)" };
-                return Err(RunError::Build { function: name(), error, range: None });
-            };
-            Some(taken)
+            if work.stash[at].parts[part.index()].is_none() {
+                return Err(twice());
+            }
+            Some((at, part.index()))
         }
     };
     // The states this instance's own types hold, laid out from types and each coroutine built
@@ -399,11 +432,11 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
         }
     }
     let view = body.view(types);
-    let built = {
+    let own = if from_coroutine.is_some() {
+        None
+    } else {
         let mut subst = Subst { args: &args, ground: &mut work.ground, scratch: work.alloc };
-        if let Some(taken) = from_coroutine {
-            Ok(taken)
-        } else if let Some(s) = shim {
+        let made = if let Some(s) = shim {
             match s.item {
                 Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, &adts, Global),
                 None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, &adts, Global),
@@ -414,21 +447,33 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
             blaze_build::build_drop_glue(&view, done, &program.sig(i), &mut subst, &adts, Global)
         } else {
             blaze_build::build(&view, done, &program.sig(i), &mut subst, &adts, Global)
-        }
+        };
+        Some(made.map_err(|error| build_refusal(program, name(), body, error))?)
     };
-    let built = match built {
-        Ok(b) => b,
-        Err(error) => return Err(build_refusal(program, name(), body, error)),
+    let built: &blaze_build::Built<Global> = match (&own, from_coroutine) {
+        (Some(b), _) => b,
+        (None, Some((at, part))) => work.stash[at].parts[part].as_ref().ok_or_else(twice)?,
+        (None, None) => return Err(twice()),
     };
     // Every reference named; each instance it reaches declared by (tabled fn, name).
     work.thread_locals |= !built.thread_locals.is_empty();
     let mut reach = Reach::new_in(work.alloc);
     let mut funcs: AVec<'_, Callee<'_>> = blaze_own::Vec::with_capacity_in(built.refs.len(), work.alloc);
+    let mut untabled: Vec<(ItemKey, RunError), Global> = Vec::new_in(Global);
     for &called in built.refs.iter() {
         match name_ref(program, &adts, &mut work.ground, work.alloc, &mut reach, i, instance.args, called)? {
             Named1::Instance(symbol) => funcs.push(Callee::Symbol(symbol)),
             Named1::C(c_name) => funcs.push(Callee::C(c_name)),
+            Named1::Untabled(key, refusal) => {
+                if !untabled.iter().any(|(k, _)| *k == key) {
+                    untabled.push((key, refusal));
+                }
+            }
         }
+    }
+    // Every untabled callee of this build at once: checked, then the instance made again.
+    if !untabled.is_empty() {
+        return Ok(Step::Table(untabled));
     }
     for &want in built.vtables.iter() {
         vtable_rows(program, &adts, &mut work.ground, &mut work.layouts, work.alloc, &mut reach, i, instance.args, want)?;
@@ -453,6 +498,10 @@ fn build_one<P: FrontEnd>(program: &P, bodies: &Bodies<'_>, work: &mut Work, i: 
     }
     let made = make_entry(&built.func, &names, routines, &mut declared, work.isa, work.alloc).map_err(|error| RunError::CodeRecord { function: name(), error })?;
     entry.extend_from_slice(&made);
+    // The coroutine's part leaves the stash with its entry made, not before.
+    if let Some((at, part)) = from_coroutine {
+        work.stash[at].parts[part] = None;
+    }
     Ok(Step::Entry)
 }
 
@@ -522,6 +571,11 @@ impl<'a> Reach<'a> {
 enum Named1<'p> {
     Instance(blaze_code::record::Symbol),
     C(&'p str),
+    /// The fn a trait's fn resolved to (the selected impl's) is tabled by no row yet: a lazy
+    /// front end tables a body's callees as the body names them, and an impl's fn a call
+    /// reaches only at ground arguments (`Future::poll` of an `.await`ed future) is named by
+    /// no body. [`Step::Table`] has it checked; `.1` is the refusal if that tables no row.
+    Untabled(ItemKey, RunError),
 }
 
 /// build_from's reference loop for one reference, by name: a closure's, a coroutine's or a
@@ -542,30 +596,65 @@ fn name_ref<'p, P: FrontEnd>(
     let name = || function.named();
     let sym = |e| RunError::CodeRecord { function: name(), error: CodeRecordError::Symbol(e) };
     // A fn item of a trait's method as an `Fn*` value: resolved first (fn_item_resolve.rs).
-    let called = crate::fn_item_resolve::resolved_shim_self(program, adts, i, called, ground)
-        .map_err(|error| RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), error })?;
+    let called = match crate::fn_item_resolve::resolved_shim_self(program, adts, i, called, ground) {
+        Ok(c) => c,
+        Err(error) => {
+            let at = crate::callee_shown::self_form(ground.view(), called.args);
+            return Err(RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), at, error });
+        }
+    };
     let tabled_as = crate::front2::coroutines::owner_of(program, adts, called, ground)
         .or_else(|| closure_owner(program, adts, called, ground))
         .or_else(|| crate::fn_shim::fn_shim_owner(program, adts, called, ground, i));
     if let Some(c) = tabled_as {
         return reach.declare(program.function(c).key, called, ground, alloc).map(Named1::Instance).map_err(sym);
     }
-    let (item, resolved) = program
-        .resolve(i, called.item, called.args, ground)
-        .map_err(|error| RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), error })?;
+    // A ctor is no trait's fn: it runs as itself, with no world asked (build_from's refs loop).
+    let is_ctor = program.fn_index(called.item).is_some_and(|c| program.function(c).kind == FnKind::Ctor);
+    let selected = match is_ctor {
+        true => Ok((called.item, called.args)),
+        false => program.resolve(i, called.item, called.args, ground),
+    };
+    let (item, resolved) = match selected {
+        Ok(r) => r,
+        Err(error) => {
+            let at = crate::callee_shown::self_form(ground.view(), called.args);
+            return Err(RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), at, error });
+        }
+    };
     let callee = Instance { item, args: resolved };
     // `at`: the arguments of the instance whose body makes this call (its `Self` first).
     let Some(c) = program.fn_index(callee.item) else {
-        return Err(callee_refusal(program, name(), at, callee, crate::callee_shown::CalleeGap::NotTabled, ground.view()));
+        let refusal = callee_refusal(program, name(), at, callee, crate::callee_shown::CalleeGap::NotTabled, ground.view());
+        if callee.item == called.item {
+            // The call's own item: its caller's check tabled every callee it names, so no row
+            // is owed by a check of it.
+            return Err(refusal);
+        }
+        return Ok(Named1::Untabled(callee.item, refusal));
     };
     let target = program.function(c);
-    if target.body.is_some() {
-        return reach.declare(target.key, callee, ground, alloc).map(Named1::Instance).map_err(sym);
-    }
     if target.kind == FnKind::Foreign {
         return Ok(Named1::C(target.symbol));
     }
+    if bodied(program, adts.4.checked, c) {
+        return reach.declare(target.key, callee, ground, alloc).map(Named1::Instance).map_err(sym);
+    }
     Err(callee_refusal(program, name(), at, callee, crate::callee_shown::CalleeGap::NoBody, ground.view()))
+}
+
+/// Whether fn row `c` is made as an instance of its own: its body is held now, or this run
+/// checked it (a made body `done` dropped), or it is owed one: a row no `check_one` of this
+/// run was asked of yet, neither an outside fn nor an intrinsic. A front end that tables every
+/// body up front holds each now; the lazy program (front2/program/lazy) tables a callee's row
+/// from its head and makes the body when the walk reaches the callee's own instance, whose
+/// make checks it ([`MakerState::ensure`]) and refuses by name a fn with no body to check.
+fn bodied<P: FrontEnd>(program: &P, checked: &[Option<Checked<'static>>], c: usize) -> bool {
+    let f = program.function(c);
+    if f.body.is_some() || checked.get(c).is_some_and(Option::is_some) {
+        return true;
+    }
+    f.kind != FnKind::Foreign && program.intrinsic(f.key).is_none()
 }
 
 /// build_from's vtable loop for one vtable the body names, by name: the method words and the
@@ -626,11 +715,15 @@ fn vtable_rows<P: FrontEnd>(
             }
             let (item, args) = match Some(f.item) == glue_item {
                 true => (f.item, f.args),
-                false => program
-                    .resolve(i, f.item, f.args, &mut *ground)
-                    .map_err(|error| RunError::Resolve { function: name(), callee: f.item, path: program.item_named(f.item), error })?,
+                false => match program.resolve(i, f.item, f.args, &mut *ground) {
+                    Ok(r) => r,
+                    Err(error) => {
+                        let at = crate::callee_shown::self_form(ground.view(), f.args);
+                        return Err(RunError::Resolve { function: name(), callee: f.item, path: program.item_named(f.item), at, error });
+                    }
+                },
             };
-            let Some(c) = program.fn_index(item).filter(|&c| program.function(c).body.is_some()) else {
+            let Some(c) = program.fn_index(item).filter(|&c| bodied(program, adts.4.checked, c)) else {
                 return Err(callee_refusal(program, name(), at, Instance { item, args }, crate::callee_shown::CalleeGap::VtableWord, ground.view()));
             };
             reach.declare(program.function(c).key, Instance { item, args }, ground, alloc).map_err(sym)?;
@@ -639,24 +732,73 @@ fn vtable_rows<P: FrontEnd>(
     Ok(())
 }
 
-/// The record walk's maker over a program constructed ON THE FIRST MISS only: a run that finds
-/// every record constructs no program and resolves no names. One type for both instantiations
-/// of D106 (today's `Front2Program`, piece Y's lazy program): only `P` and `construct` differ.
-pub struct OnFirstMiss<P, C> {
-    construct: C,
-    made: Option<(P, MakerState)>,
+/// What the command hands the [`Maker`]: every crate's names READ FROM RECORDS, nothing solved
+/// in this command. The same four things `blaze check` hands its world (blaze-cli
+/// body_types.rs `checker`: a `StoreLoad` over each crate's `CrateScope` record, a `Log` over
+/// the crates' names, `Records::new(load.keys(g), load, log, frame, g)`, and
+/// `ProjectWorld::from_records(records, frame, owner.lang, g)` with `set_body_sources`), so the
+/// command makes them ONE way for both. All borrowed for `'n`, the command's life: the maker
+/// holds no input of its own, so nothing in it borrows itself.
+#[derive(Clone, Copy)]
+pub struct NamesRecords<'n> {
+    /// Each crate's names and items records, the program's own at index 0, opened on the first
+    /// question about each (`Records::new`: nothing is read when it is made).
+    pub records: &'n crate::front2::source::Records<'n>,
+    /// The command's frame: what a body's lowering keeps for the command (`Front2::frame`).
+    pub frame: &'n blaze_mem::Frame,
+    /// The crates that can declare a lang item, by index among `records`' crates: the
+    /// program's own (0), core, alloc, std, and bstd under a blaze edition
+    /// (`Front2::from_records` reads only their lang rows).
+    pub lang_crates: &'n [usize],
+    /// The sources a body's macro calls expand with (environment, texts, proc-macro runner:
+    /// front2 body_host.rs); `None`: every body `env!`, include and proc macro is refused by
+    /// name.
+    pub body_sources: Option<&'n dyn crate::front2::body_host::BodySources>,
+}
+
+/// The one lazy program the maker makes: over the names records.
+pub type RecordsProgram<'n> = crate::front2::program::lazy::LazyProgram<'n, &'n crate::front2::source::Records<'n>>;
+
+/// THE RECORD WALK'S MAKER, held by the parent for the whole program (D124): one owned session
+/// over the names READ FROM RECORDS. [`Maker::new`] resolves, reads and checks nothing; the
+/// first [`Make::make`] constructs the lazy program over the records (no `resolve_crates`
+/// anywhere under it), and every make after it checks only the bodies its instance needs
+/// (`check_one`). A run that finds every record constructs no program and reads no record.
+///
+/// What the records could not answer is in their log (front2 source.rs): after each make the
+/// log is read, and a make over a log that is not empty is refused
+/// ([`LazyRefusal::RecordsVoid`]), as is every make after it (the session is void).
+pub struct Maker<'n> {
+    names: NamesRecords<'n>,
+    entry: Option<ItemKey>,
+    made: Option<(RecordsProgram<'n>, MakerState)>,
     isa: Isa,
     overflow: OverflowChecks,
+    panic: blaze_build::Panic,
     alloc: Alloc<'static>,
     checks: CheckCount,
 }
 
-impl<P: FrontEnd, C: FnMut() -> Result<P, RunError>> OnFirstMiss<P, C> {
-    pub fn new(construct: C, isa: Isa, overflow: OverflowChecks, alloc: Alloc<'static>) -> OnFirstMiss<P, C> {
-        OnFirstMiss { construct, made: None, isa, overflow, alloc, checks: CheckCount::default() }
+impl<'n> Maker<'n> {
+    /// The maker over `names`. `entry`: the checker key of the fn the process starts at, as
+    /// `LazyProgram::from_records` takes it (nothing lowers it until a make asks). `builder`:
+    /// the records' builder; its ISA, overflow setting and panic strategy are the makes' (rule
+    /// 21: one source, nothing to compare). `alloc`: the `'static` heap the lazy program's
+    /// tables live in (`Store::new`, `MakerState`). Cheap: reads, resolves and checks nothing.
+    pub fn new(names: NamesRecords<'n>, entry: Option<ItemKey>, builder: &Builder, alloc: Alloc<'static>) -> Maker<'n> {
+        Maker {
+            names,
+            entry,
+            made: None,
+            isa: builder.isa,
+            overflow: builder.settings.overflow_checks,
+            panic: crate::panic_strategy::of_strategy(builder.settings.panic),
+            alloc,
+            checks: CheckCount::default(),
+        }
     }
 
-    /// Whether an instance made in this run touched a thread-local. A FOUND record's use of
+    /// Whether an instance made in this session touched a thread-local. A FOUND record's use of
     /// one is said by bzcode03's declared rows (kinds 4 and 5); until that form lands the
     /// caller makes the getter's and ender's records when this is true or its own records say so.
     pub fn made_thread_locals(&self) -> bool {
@@ -668,115 +810,64 @@ impl<P: FrontEnd, C: FnMut() -> Result<P, RunError>> OnFirstMiss<P, C> {
         self.checks
     }
 
-    /// The program, once a miss made it.
-    pub fn program(&self) -> Option<&P> {
+    /// The lazy program, once a miss made it.
+    pub fn program(&self) -> Option<&RecordsProgram<'n>> {
         self.made.as_ref().map(|(p, _)| p)
     }
-}
 
-impl<P: FrontEnd, C: FnMut() -> Result<P, RunError>> Make for OnFirstMiss<P, C> {
-    type Error = RunError;
+    /// The refusal of a make over records whose log is not empty, naming its first error.
+    fn void(&self, tabled: ItemKey) -> Option<RunError> {
+        let log = self.names.records.log();
+        let errors = log.errors();
+        let first = errors.first()?;
+        let first = std::format!("{first}").into_boxed_str();
+        Some(RunError::Front2(Front2Refusal::Lazy(LazyRefusal::RecordsVoid { tabled, first, kept: errors.len(), dropped: log.dropped() })))
+    }
 
-    fn make(&mut self, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+    /// The program made on the first call, then the one instance.
+    fn make_over(&mut self, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
         if self.made.is_none() {
-            let program = (self.construct)()?;
+            let NamesRecords { records, frame, lang_crates, body_sources } = self.names;
+            let mut program = RecordsProgram::from_records(records, frame, lang_crates, self.entry, self.alloc).map_err(RunError::Front2)?;
+            if let Some(sources) = body_sources {
+                program.set_body_sources(sources);
+            }
+            // The start, by the one rule run/special.rs `roots` takes (the seam's `rust_start`):
+            // a refusal here is the parent's own roots refusal, met again, never passed over.
+            program.decide_start().map_err(RunError::Roots)?;
             self.checks.constructed += 1;
+            // A lazy program holds no checked body when made: 0, counted as the claim reads it.
             self.checks.by_construction += (0..program.fn_count()).filter(|&c| program.function(c).body.is_some()).count();
-            let state = MakerState::new(&program, tabled, self.isa, self.overflow, self.alloc)?;
+            let state = MakerState::new(&program, tabled, self.isa, self.overflow, self.panic, self.alloc)?;
             self.made = Some((program, state));
         }
         let Some((program, state)) = self.made.as_mut() else {
-            return Err(RunError::OneBody { key: tabled, why: "the maker's program was not made (make_one.rs `OnFirstMiss::make`)" });
+            return Err(RunError::OneBody { key: tabled, why: "the maker's program was not made (make_one.rs `Maker::make`)" });
         };
         make_instance(program, state, &mut self.checks, tabled, name, entry)
     }
 }
 
-/// The constructor of today's `Front2Program`, made only when the first miss calls it (the
-/// order `build_records_new` makes its inputs in), handed to `then`: a run that finds every
-/// record reads no toolchain and resolves no names. Each input is a local here, declared before
-/// what borrows it, so nothing borrows itself; `construct` makes the program once and refuses a
-/// second call by name.
-pub fn with_front2<R>(
-    files: &[SourceFile<'_>],
-    root: &str,
-    new: NewFront<'_>,
-    alloc: Alloc<'static>,
-    then: impl for<'c> FnOnce(&mut dyn FnMut() -> Result<Front2Program<'c>, RunError>) -> R,
-) -> R {
-    let tc_cell: OnceCell<Toolchain> = OnceCell::new();
-    let texts_cell: OnceCell<ProgramTexts> = OnceCell::new();
-    let user_cell = OnceCell::new();
-    let inputs_cell = OnceCell::new();
-    let crates_cell = OnceCell::new();
-    let names_cell = OnceCell::new();
-    let frame_cell: OnceCell<blaze_mem::Frame> = OnceCell::new();
-    let (tc_cell, texts_cell, user_cell, inputs_cell, crates_cell, names_cell, frame_cell) =
-        (&tc_cell, &texts_cell, &user_cell, &inputs_cell, &crates_cell, &names_cell, &frame_cell);
-    let mut construct = move || -> Result<Front2Program<'_>, RunError> {
-        if tc_cell.get().is_some() {
-            return Err(RunError::OneBody { key: ItemKey(0), why: "the program was asked for twice in one run (make_one.rs `with_front2`)" });
+impl Make for Maker<'_> {
+    type Error = RunError;
+
+    fn make(&mut self, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+        if let Some(void) = self.void(tabled) {
+            return Err(void);
         }
-        let tc = crate::library_set::toolchain_for(files, root, new, alloc)?;
-        let tc = tc_cell.get_or_init(|| tc);
-        let texts = ProgramTexts::new(files, root, new, tc)?;
-        let texts = texts_cell.get_or_init(|| texts);
-        let user = user_cell.get_or_init(|| texts.user());
-        let inputs = Inputs::new(user, tc).map_err(RunError::Crates)?;
-        let inputs = inputs_cell.get_or_init(|| inputs);
-        let crates = crates_cell.get_or_init(|| inputs.crates());
-        let names = inputs.resolve(crates).map_err(|e| RunError::Names { shown: std::format!("{e}").into_boxed_str() })?;
-        let names = names_cell.get_or_init(|| names);
-        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).map_err(|e| RunError::Names { shown: std::format!("the command's frame: {e}").into_boxed_str() })?;
-        let frame = frame_cell.get_or_init(|| frame);
-        Front2Program::new(names, frame, files).map_err(RunError::Front2)
-    };
-    then(&mut construct)
-}
-
-/// What one record walk of `blaze run` did.
-pub struct RecordsWalked {
-    /// The walk's rows (symbol, key, tabled fn, name, how), for the launcher.
-    pub walk: Walk<'static>,
-    pub counts: Counts,
-    pub checks: CheckCount,
-    /// An instance made in this run touched a thread-local (`OnFirstMiss::made_thread_locals`).
-    pub made_thread_locals: bool,
-}
-
-/// `blaze run`'s records by D106 over today's front2, the program made only on the first miss:
-/// the run path when the command hands over its [`BodyIds`] (with none, the command keeps
-/// calling `build_records_new`, unchanged). `entry` is `main`'s checker key, from crate 0's
-/// names record (the command's; `exported_entry` over the records names source when piece Y
-/// lands).
-#[allow(clippy::too_many_arguments)]
-pub fn run_records(
-    files: &[SourceFile<'_>],
-    root: &str,
-    new: NewFront<'_>,
-    entry: ItemKey,
-    ids: &dyn BodyIds,
-    store: &mut dyn CodeStore,
-    builder: &Builder,
-    producer: &ProducerId<CodeBuilder>,
-    alloc: Alloc<'static>,
-) -> Result<RecordsWalked, RecordWalkError> {
-    let key = builder.settings.overflow_checks;
-    if new.overflow != key {
-        return Err(RecordWalkError::Setup(RunError::OverflowDisagrees { walk: new.overflow, key }));
+        let made = self.make_over(tabled, name, entry);
+        // The log first: a refusal or an entry made over an unanswered question is void, and
+        // the records' error is its cause.
+        if let Some(void) = self.void(tabled) {
+            return Err(void);
+        }
+        made
     }
-    with_front2(files, root, new, alloc, |construct| {
-        let mut maker = OnFirstMiss::new(construct, builder.isa, key, alloc);
-        let (walk, counts) = walk_records(entry, ids, store, builder, producer, &mut maker, alloc)?;
-        Ok(RecordsWalked { walk, counts, checks: maker.checks(), made_thread_locals: maker.made_thread_locals() })
-    })
 }
 
 /// Why the record walk over `blaze run`'s records stopped.
 #[derive(Debug)]
 pub enum RecordWalkError {
-    /// The walk's inputs disagree (its overflow setting and its records' key).
-    Setup(RunError),
     /// The entry's name could not be made.
     Entry(crate::symbols::SymbolError),
     /// The walk, the store or one make refused.
@@ -786,7 +877,6 @@ pub enum RecordWalkError {
 impl core::fmt::Display for RecordWalkError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            RecordWalkError::Setup(e) => e.fmt(f),
             RecordWalkError::Entry(e) => write!(f, "the record walk's entry: {e}"),
             RecordWalkError::Walk(e) => e.fmt(f),
         }

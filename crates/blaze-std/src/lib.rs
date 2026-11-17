@@ -72,10 +72,16 @@
 //!
 //! | module | what | from |
 //! |---|---|---|
-//! | [`mem`] | allocators by lifetime | blaze-mem |
-//! | [`bytes`], [`text`] | held bytes and UTF-8 text, lent and never copied | blaze-bytes |
-//! | [`map`], [`set`], [`hash`] | one map and set per need (hashed, by hash, by content, insertion-ordered, sorted, keyed, shared), and their hashers | blaze-hash, blaze-hashcons, `alloc` |
-//! | [`id`] | content ids, dense indices, the interner | blaze-ids |
+//! | [`mem`] | allocators by lifetime, and the handle a function takes ([`mem::Alloc`]) | blaze-mem, blaze-own |
+//! | [`vec`], [`boxed`], [`rows`], [`soa`] | the vectors (growable, inline, segmented, packed), one value in a block, rows in two arrays, a struct of arrays | blaze-own, blaze-kit |
+//! | [`bytes`], [`text`] | held bytes and UTF-8 text, lent and never copied; many strings in one buffer | blaze-bytes, blaze-own |
+//! | [`map`], [`set`], [`hash`] | one map and set per need (hashed, by hash, by content, insertion-ordered, flat sorted, B-tree, keyed, shared), and their hashers | blaze-hash, blaze-hashcons, blaze-own |
+//! | [`id`] | content ids, dense indices, the interner; typed ids and the tables they index | blaze-ids, blaze-kit |
+//! | [`bits`], [`paths`] | the bit set and the sparse set of ids; paths as a table | blaze-kit, blaze-own |
+//!
+//! Each form of [`vec`], [`boxed`], [`rows`], [`soa`], [`text`], [`map`], [`set`], [`id`],
+//! [`bits`], [`paths`] and [`mem`] is in a table in its module: what to reach for it instead of,
+//! and its cost (D120: one form per need, its cost said, its allocator named).
 //! | [`sync`], [`cell`] | `Shared`, named and ranked locks, `Swap`, `Frozen`, `Flight`, the bounded `Chan`, named atomics, one-thread cells, token cells, the spin, reclamation | blaze-core, blaze-own, blaze-spin, blaze-reclaim, new |
 //! | [`par`] | `for_each`, `map_into`, `reduce` over disjoint chunks, deterministic in any schedule | new, over [`task::Scope`] |
 //! | [`own`] | ownership properties derived by reflection (`Acyclic`), `Shared` and `Shares` | new |
@@ -296,40 +302,176 @@ pub mod bytes {
     pub use blaze_bytes::{Bytes, le};
 }
 
-/// UTF-8 text held without a copy: [`bytes::Bytes`] checked once (blaze-bytes). Owned text in
-/// an allocator is [`mem::String`].
+/// Text. Held without a copy: [`text::Text`], [`bytes::Bytes`] checked once (blaze-bytes). One
+/// owned string in an allocator is [`mem::String`]. Many strings are one of these (blaze-own):
+///
+/// | form | reach for it instead of | cost |
+/// |---|---|---|
+/// | [`text::Texts`] | `Vec<String>` | one byte buffer and one array of `u32` ends: two blocks in all, 4 bytes a string past its text (`Vec<String>` is 24 bytes and a block a string) |
+/// | [`text::SortedTexts`] | a sorted `Vec<String>` searched by hand, a `HashSet<String>` built once | the same two blocks, sorted and each once; `contains` and `find` are O(log n) compares |
+/// | [`text::FixedString`] | a `String` for a short text with a known bound | `N` bytes inline, no allocation; a write past `N` is refused and the refusal stays ([`text::Overflow`]) |
 pub mod text {
     pub use blaze_bytes::{Text, text_of};
+    pub use blaze_own::{FixedString, Overflow, SortedTexts, Texts};
 }
 
-/// The maps, one per need (docs/v2/plan/design/std.md, "Collections"); every one is made with
-/// `new_in(alloc)` or `with_capacity_in(n, alloc)`, and none has a `new()`.
+/// The vectors, one per need (blaze-own, blaze-kit); every one is made in an allocator the
+/// caller names (`Vec::new_in(cx.frame())`), and none has a `new()` but the inline ones.
+///
+/// | form | reach for it instead of | cost |
+/// |---|---|---|
+/// | [`vec::Vec`], [`vec_in!`](vec::vec_in!) | `alloc`'s `Vec<T>` on the global heap | one block; index and push O(1), a push past capacity copies every value once; `remove_shift`, `insert_shift` and `scan_for` say they are linear |
+/// | [`vec::FixedVec`] | a `Vec` that never holds more than `N` | `N` values inline, no allocation; a push past `N` is refused with the value handed back ([`vec::Full`]) |
+/// | [`vec::InlineVec`] | `smallvec`, a `Vec` that is short nearly always | `N` values inline, then one block of the allocator |
+/// | [`vec::Segs`] | one `Vec` grown to gigabytes, a `Vec` whose values must not move | segments that double and never move: a push copies nothing, an index is two shifts and one load |
+/// | [`vec::SharedSegs`], [`vec::Appender`] | a `Vec` behind a lock that readers read while one thread pushes | as [`vec::Segs`], read without a lock; one appender at a time |
+/// | [`vec::Packed`] | a `Vec` of an enum whose widest variant sets every element's size | each value its own bytes end to end; iterated, not indexed; a seek starts from a checkpoint every `K` values |
+/// | [`rows::Lists`] | `Vec<Vec<T>>` | see [`rows`] |
+pub mod vec {
+    pub use blaze_kit::InlineVec;
+    pub use blaze_own::{Appender, CollectIn, FixedVec, Full, Pack, Packed, Refused, Segs, SharedSegs, Vec, vec_in};
+}
+
+/// One value in a block (blaze-own): [`boxed::Box`] owns it, [`boxed::Rc`] and [`boxed::Arc`]
+/// share it, each in an allocator the caller names (`Box::new_in(value, alloc)`).
+///
+/// | form | reach for it instead of | cost |
+/// |---|---|---|
+/// | [`boxed::Box`] | `alloc`'s `Box<T>` on the global heap | one block (none for a zero-sized value), one pointer word |
+/// | [`boxed::Rc`] | a value shared on one thread | one block for the value and its counts; a clone is a plain increment |
+/// | [`boxed::Arc`] | a value shared between threads | one block; every clone and drop writes the one shared count: a value many workers read is borrowed from a scope instead (std.md, "What std makes easy to get slow") |
+pub mod boxed {
+    pub use blaze_own::arc::Weak as WeakArc;
+    pub use blaze_own::rc::Weak as WeakRc;
+    pub use blaze_own::{Arc, Box, CallOnce, Rc};
+}
+
+/// Rows of items in two arrays (blaze-own's [`rows::Lists`]): every item end to end in one, and
+/// where each row ends in the other.
+///
+/// | form | reach for it instead of | cost |
+/// |---|---|---|
+/// | [`rows::Lists`] | `Vec<Vec<T>>`; a `HashMap<K, Vec<V>>` keyed by a dense index (`Lists::from_pairs_in`) | two blocks in all, 4 bytes a row past its items (`Vec<Vec<T>>` is a block and 24 bytes a row); a row is pushed whole or opened and filled, and cannot grow once a later one is pushed |
+pub mod rows {
+    pub use blaze_own::Lists;
+    pub use blaze_own::lists::OpenRow;
+}
+
+/// A struct-of-arrays vector (blaze-own's [`soa::Soa`], and [`soa!`](soa::soa!), which names the
+/// columns of a struct).
+///
+/// | form | reach for it instead of | cost |
+/// |---|---|---|
+/// | [`soa::Soa`] | a `Vec` of a struct whose passes each read one or two fields | one block, one packed column a field: a pass over one field reads only that field's bytes, and no field pads another |
+pub mod soa {
+    pub use blaze_own::soa::{ColumnAt, Columns};
+    pub use blaze_own::{Soa, soa};
+}
+
+/// The bit set, one: blaze-kit's [`bits::ChunkedBitSet`], and beside it the sparse set of ids.
+/// Of the three bit sets in the tree, blaze-ids' `Bits` keeps its words in `alloc`'s `Vec<u64>`
+/// on the global heap (no allocator named) and blaze-flow's `Bits` is rows of a dataflow's
+/// matrix above bstd; `ChunkedBitSet` names its allocator and is the one a set copied at every
+/// block entry needs. A plain bit per id of a table is [`id::TableSet`].
+///
+/// | form | reach for it instead of | cost |
+/// |---|---|---|
+/// | [`bits::ChunkedBitSet`] | a bit set copied per block, a `HashSet<u32>` over a large domain | 8 bytes a uniform chunk of 2,048 ids, 264 a mixed one shared by its copies; `contains` reads one or two lines; a copy costs a word a chunk |
+/// | [`bits::SparseSet`] | a worklist as a `Vec<u32>` beside a `Vec<bool>` of marks | insert, remove and contains O(1), a clear costs its members; a bit and 4 bytes an id of the domain, plus 4 a member |
+pub mod bits {
+    pub use blaze_kit::{ChunkedBitSet, SparseSet};
+}
+
+/// Paths as a table (blaze-own's [`paths::Paths`]): directories as (parent, name) rows and files
+/// as (directory, name) rows.
+///
+/// | form | reach for it instead of | cost |
+/// |---|---|---|
+/// | [`paths::Paths`] | `Vec<PathBuf>`, `Vec<String>` of paths, a `HashMap<String, V>` keyed by a path | each name stored once for its directory; a [`paths::PathId`] is 4 bytes; a lookup in a directory is one probe, a whole path's one probe a component |
+/// | [`paths::SealedPaths`], [`paths::PathsView`] | a path table rebuilt from text on every read | sealed once, its columns stored as they are and read in place, checked once |
+pub mod paths {
+    pub use blaze_own::paths::{BadColumns, PathColumns, Remap};
+    pub use blaze_own::{DirId, PathId, Paths, PathsView, SealedPaths};
+}
+
+/// The maps, one per need (docs/v2/plan/design/std.md, "Collections"); none has a `new()` that
+/// takes nothing.
+///
+/// A hash table names its hasher, in its type and as a value when it is made, as it names its
+/// allocator (decision D125), and it is made by one constructor taking one options struct whose
+/// every field is written (D126): `Map<K, V, FixedState, A>` made by
+/// `Map::new(MapOpts { hasher: FixedState, alloc: frame, capacity: None })` (`Some(n)` to
+/// reserve room for `n`), [`map::OrderMap`] by `OrderMap::new(OrderMapOpts { .. })` the same
+/// way, and a shared one by `SharedMap::new(SharedMapOpts { name, hasher, alloc, capacity })`.
+/// A map of an iterator's pairs is `new` then `extend`. The hashers are in [`hash`]
+/// (`FixedState` for ordinary keys, `SipKey` from [`crate::io::Io::sip_key`] for keys an
+/// outsider picks, `BuildKeyHasher` for keys that are hashes already). The aliases below that
+/// hide the hasher (`HashMap`, `IndexMap`, `ByHash`, `KeyedMap`) and the older constructors
+/// (`new_in`, `with_capacity_in`, `from_iter_in`, `with_hasher_in`) go at D125's sweep.
 ///
 /// | need | type |
 /// |---|---|
-/// | ordinary keys | [`map::HashMap`] |
-/// | keys that are hashes already | [`map::ByHash`] |
+/// | ordinary keys | [`map::Map`] on [`hash::FixedState`] (was [`map::HashMap`]) |
+/// | keys that are hashes already | [`map::Map`] on [`hash::BuildKeyHasher`] (was [`map::ByHash`]) |
 /// | values stored once, found by their content | [`map::ContentMap`] (one owner), [`id::Sharded`] (shared, dense indices) |
-/// | iteration in insertion order, lookup by position | [`map::IndexMap`] |
-/// | sorted keys, ranges | [`map::SortedMap`] |
+/// | iteration in insertion order, lookup by position | [`map::OrderMap`] on [`hash::FixedState`] (was [`map::IndexMap`]) |
+/// | sorted keys, built once, then read | [`map::FlatMap`] |
+/// | sorted keys, changed after the build, ranges | [`map::BTreeMap`] |
+/// | dense ids as keys | [`id::TableMap`] |
 /// | dense ids with a generation | [`mem::Slab`] and [`mem::Handle`] |
-/// | keys an attacker may pick | [`map::KeyedMap`], made with a [`hash::SipKey`] |
+/// | keys an attacker may pick | [`map::Map`] on a [`hash::SipKey`] (was [`map::KeyedMap`]) |
 /// | shared between threads | [`map::SharedMap`], [`map::SharedByHash`] |
+///
+/// The ordered ones and their costs (blaze-own), against what code writes without them:
+///
+/// | form | reach for it instead of | cost |
+/// |---|---|---|
+/// | [`map::FlatMap`] | a sorted `Vec<(K, V)>` searched with `binary_search_by_key` | one sorted array: lookup O(log n) compares, iteration a slice walk, one block; insert and remove O(n) moves, so build it once from sorted entries (`FlatMap::from_sorted`) |
+/// | [`map::BTreeMap`] | `alloc`'s `BTreeMap`, a sorted `Vec` with inserts after the build | a B-tree of up to 15 entries a node, keys and values in separate columns, a node on a cache line: lookup, insert and remove O(log n), ranges |
+/// | a [`map::HashMap`] keyed by an [`id::Sharded`] id, or [`paths::Paths`] | a `HashMap<String, V>` | the key text stored once, the key a 4-byte id: a hit allocates nothing and compares an integer |
 pub mod map {
-    /// Sorted by key, with range queries: `alloc`'s B-tree, which takes its allocator on this
-    /// nightly (`SortedMap::new_in(alloc)`).
-    pub use alloc::collections::BTreeMap as SortedMap;
+    /// Sorted by key, built once: blaze-own's `SortedMap`, one sorted array (lookup O(log n),
+    /// insert O(n)).
+    pub use blaze_own::SortedMap as FlatMap;
+    /// Sorted by key, changed after it is built, with ranges: blaze-own's B-tree.
+    pub use blaze_own::BTreeMap;
+    pub use blaze_own::sorted::NotSorted;
     pub use blaze_core::{SharedByHash, SharedMap};
     pub use blaze_hash::{ByHash, Equivalent, HashMap, IndexMap, KeyedMap, OrderMap, hash_map::Entry};
+    /// The single-owner hash map, its hasher named in the type and at construction (D125), and
+    /// what it is made from: `Map::new(MapOpts { hasher, alloc, capacity: None })` (D126).
+    pub use blaze_hash::{Map, MapOpts, OrderMapOpts};
+    /// The shared tables' options: `SharedMap::new(SharedMapOpts { name, hasher, alloc,
+    /// capacity: None })` (D126).
+    pub use blaze_hash::SharedMapOpts;
+    /// The hashers, here too so that a map's whole explicit form is under one path.
+    pub use blaze_hash::{BuildKeyHasher, FixedState, SipKey};
     pub use blaze_hashcons::{Consed as Content, ContentMap, Mismatch, content_of};
 }
 
-/// The sets, as [`map`].
+/// The sets, as [`map`]; a set of dense ids is [`id::TableSet`] or one of [`bits`]. A hash set
+/// names its hasher as a map does (D125): `Set<T, FixedState, A>` made by
+/// `Set::new(SetOpts { hasher: FixedState, alloc, capacity: None })` (D126), and the same on
+/// [`set::OrderSet`] (`OrderSetOpts`) and a shared set (`SharedSetOpts`, with its locks' name);
+/// the aliases that hide it (`HashSet`, `IndexSet`, `ByHashSet`, `KeyedSet`) and the older
+/// constructors go at the sweep.
+///
+/// | form | reach for it instead of | cost |
+/// |---|---|---|
+/// | [`set::FlatSet`] | a sorted, deduplicated `Vec<T>` searched by hand | one sorted array: `contains` O(log n) compares, one block; insert O(n) moves, so build it once (`FlatSet::from_sorted`) |
+/// | [`set::BTreeSet`] | `alloc`'s `BTreeSet` | a [`map::BTreeMap`] of the values to `()`: insert, remove and `contains` O(log n), ranges |
 pub mod set {
-    /// Sorted, with range queries: `alloc`'s B-tree set, in a named allocator.
-    pub use alloc::collections::BTreeSet as SortedSet;
+    /// Sorted, built once: blaze-own's `SortedSet`, one sorted array.
+    pub use blaze_own::SortedSet as FlatSet;
+    /// Sorted, changed after it is built, with ranges: blaze-own's B-tree set.
+    pub use blaze_own::BTreeSet;
     pub use blaze_core::SharedSet;
     pub use blaze_hash::{ByHashSet, HashSet, IndexSet, KeyedSet, OrderSet};
+    /// The single-owner hash set, its hasher named in the type and at construction (D125), and
+    /// what the sets are made from (D126).
+    pub use blaze_hash::{OrderSetOpts, Set, SetOpts, SharedSetOpts};
+    /// The hashers, as in [`super::map`].
+    pub use blaze_hash::{BuildKeyHasher, FixedState, SipKey};
 }
 
 /// The hashers behind [`map`] and [`set`]: the fixed seed, the identity hasher for keys that are
@@ -347,10 +489,23 @@ pub mod hash {
 /// [`id::Idx`] a dense `u32` index into one arena, and [`id::Sharded`] the interner between them
 /// (blaze-ids). The interner is blaze-ids'; `intern` and `blaze-hashcons` are not merged into it
 /// yet, and are not re-exported.
+///
+/// Typed ids and the tables they index (blaze-kit): an id of one table cannot index another.
+/// blaze-ids' [`id::Idx`] and blaze-kit's [`id::Id`] are two homes of one concept, to merge
+/// (D120 (2)); both are here until then.
+///
+/// | form | reach for it instead of | cost |
+/// |---|---|---|
+/// | [`id::Id`], [`id!`](id::id!), [`id::NonMax`] | a `usize` or `u32` index into anything | 4 bytes, and an `Option` of an [`id!`](id::id!) type is 4 bytes too |
+/// | [`id::Table`] | a `Vec<T>` indexed by `usize` | one block; a push gives the new id, a read by id is O(1) and indexes only its own table |
+/// | [`id::TableSet`] | a `Vec<bool>` of marks, a `HashSet<u32>` of dense ids | one bit an id, up to the largest inserted |
+/// | [`id::TableMap`] | a `HashMap<u32, V>` (or `usize`, `u64`) of dense ids | a slot an id up to the largest inserted: a read is one index, no hash |
 pub mod id {
     pub use blaze_ids::{
         ContentId, Domain, Fingerprint, Hasher as ContentHasher, Idx, Interner, Sharded, index_key,
     };
+    pub use blaze_kit::table::{Branded, Ix};
+    pub use blaze_kit::{Id, NonMax, Table, TableMap, TableSet, id};
 }
 
 /// The stable radix sort (blaze-radix), on workers named at the call ([`sort::on`], with
@@ -466,11 +621,16 @@ pub mod prelude {
     /// The prelude of `edition = "blaze-2026.11"`: `core`'s prelude of Rust 2024, the types
     /// a `main` names (`Cx`, the entry's `Error`, and every grant: `Out`, `Args`, `Clock`,
     /// `Dir<ReadOnly>`, `Net`, `Env`, the whole capabilities), and `core`'s macros that Rust's `std` hands on from its
-    /// root. The collections are here by their types, to be made in an allocator the code
-    /// was handed (`Vec::new_in(cx.frame())`, `Box::new_in(value, alloc)`); `String` is
-    /// bstd's, which is made in one, with `format_in!` in place of `format!`. `vec!` and
-    /// `format!`, which reach the global heap by themselves, are not (std.md, "Memory is
-    /// explicit").
+    /// root. Nothing here reaches the global heap (D120): the collections are blaze-own's
+    /// `Vec` and `Box`, which have no `new()` and are made in an allocator the code was handed
+    /// from `main` down (`Vec::new_in(cx.frame())`, `Box::new_in(value, alloc)`); `Frame` (what
+    /// `cx.frame()` is) and `Alloc` (the one-word handle a function takes) are here so a
+    /// program can name the allocator in a type (`Box<dyn Area + '_, &Frame>`). `Heap` is the
+    /// process's heap, a grant `main` names (`heap: Heap`) for what outlives its tasks and for a
+    /// pinned box (`Box::pin_in(future, heap)`); nothing else hands it out. `String` is
+    /// blaze-own's, made in one, with `format_in!` in place of `format!`; the entry's `Error`
+    /// keeps its words inline. `vec!`, `format!`, `ToString` and `ToOwned`, which reach the
+    /// global heap by themselves, are not here (std.md, "Memory is explicit").
     pub mod blaze_2026_11 {
         pub use core::prelude::rust_2024::*;
         pub use core::{
@@ -478,12 +638,12 @@ pub mod prelude {
             unimplemented, unreachable, write, writeln,
         };
 
-        pub use alloc::{boxed::Box, vec::Vec};
-
         pub use crate::{
+            boxed::Box,
             cx::Cx,
             entry::Error,
-            mem::{String, format_in},
+            mem::{Alloc, Frame, Heap, String, format_in},
+            vec::Vec,
         };
 
         // Every type a `main` may take as a grant (crate::grant, each `impl Grant for`), so

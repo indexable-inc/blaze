@@ -15,7 +15,7 @@
 
 use core::mem;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_own::{AVec, ASoa, ASortedSet, Alloc, SortedSet, Soa, Vec};
 
 use crate::{CodeId, Plant, SlotId, TestId};
@@ -74,7 +74,7 @@ pub struct Tests<'a> {
     tests: ASoa<'a, (TestId, Option<Verdict>, AVec<'a, CodeId>)>,
     /// From each identity to the tests that entered it. Hashed: every record adds a posting for
     /// each body it entered, thousands in no order, which a sorted vector would shift for.
-    postings: HashMap<CodeId, ASortedSet<'a, TestId>, Alloc<'a>>,
+    postings: Map<CodeId, ASortedSet<'a, TestId>, FixedState, Alloc<'a>>,
     pub(crate) plant: Plant,
 }
 
@@ -82,7 +82,7 @@ impl<'a> Tests<'a> {
     pub fn new(alloc: Alloc<'a>) -> Tests<'a> {
         Tests {
             tests: Soa::new_in(alloc),
-            postings: HashMap::new_in(alloc),
+            postings: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             alloc,
             plant: Plant::None,
         }

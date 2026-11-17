@@ -24,6 +24,9 @@
 //!   walk steps into it. A field that differs and is zero-sized on both sides (core's
 //!   `PhantomData<T>`) holds no bytes, so there is nothing of it to move or coerce: whether it
 //!   may differ is the impl's legality, the checker's question, not the build's;
+//! - at a pattern type on both sides with the same pattern (core's `NonNull<T>` holds
+//!   `pattern_type!(*const T is !null)`; core/src/pat.rs makes it `CoerceUnsized` as its
+//!   base), the walk steps into the bases: a pattern type is laid out and held as its base;
 //! - at a reference or raw pointer on both sides, the pointee changes from `T` to `U`: the
 //!   thin address is kept and the second word made (the length of an array, the table of the
 //!   concrete type for a `dyn`, the upcast table of a `dyn`), as for a bare `&T` (walk.rs
@@ -149,6 +152,22 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 (PNode::Ref(_, f) | PNode::Ptr(_, f), PNode::Ref(_, g) | PNode::Ptr(_, g)) => {
                     let (from, to) = self.unsize_tails(e, f, g)?;
                     return Ok(UnsizeWalk { from, to, depth, at });
+                }
+                // A pattern type on both sides (core's `NonNull<T>` is `{ pointer:
+                // pattern_type!(*const T is !null) }`; core/src/pat.rs: `impl<T, U>
+                // CoerceUnsized<pattern_type!(*const U is !null)> for pattern_type!(*const T is
+                // !null) where T: Unsize<U>`): held as its base (walk.rs `repr`), at offset 0
+                // and with no other bytes, so the walk steps into the bases. The pattern itself
+                // must be the same: a coercion keeps the value, so it cannot widen or narrow it.
+                (PNode::Pat(bs, ps), PNode::Pat(bt, pt)) => {
+                    let full = || malformed("a pattern type's ranges past the ground table");
+                    let view = self.ground.view();
+                    if view.list(ps).map_err(|_| full())? != view.list(pt).map_err(|_| full())? {
+                        return Err(refused(e, None, "an unsizing between two pattern types of different patterns"));
+                    }
+                    s = bs;
+                    t = bt;
+                    continue;
                 }
                 (PNode::Adt(k, _), PNode::Adt(k2, _)) if k == k2 => k,
                 (PNode::Adt(k, _), PNode::Adt(..)) => {

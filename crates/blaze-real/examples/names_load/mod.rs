@@ -20,8 +20,8 @@ use blaze_unit_graph::{Ask, CfgAtom, Package, Pass, Records, Resolution, Resolve
 
 const TRIPLE: &str = "aarch64-apple-darwin";
 
+/// The target's cfg without `panic`: that atom is the program's strategy, added by [`mac`].
 const MAC_CFG: &[(&str, Option<&str>)] = &[
-    ("panic", Some("unwind")),
     ("target_abi", Some("")),
     ("target_arch", Some("aarch64")),
     ("target_endian", Some("little")),
@@ -153,7 +153,8 @@ fn leak_str(text: String) -> &'static str {
     Box::leak(text.into_boxed_str())
 }
 
-fn mac(alloc: Alloc<'static>) -> TargetDesc<'static> {
+/// The target's desc for the program's units, `panic` the program's strategy (its `cfg(panic)`).
+fn mac(alloc: Alloc<'static>, panic: blaze_ladder::run::Panic) -> TargetDesc<'static> {
     let mut cfg = AVec::new_in(alloc);
     for (name, value) in MAC_CFG {
         cfg.push(match value {
@@ -161,6 +162,7 @@ fn mac(alloc: Alloc<'static>) -> TargetDesc<'static> {
             None => CfgAtom::flag(name, alloc),
         });
     }
+    cfg.push(CfgAtom::pair(blaze_ladder::panic_strategy::CFG_KEY, blaze_ladder::panic_strategy::cfg_value(panic), alloc));
     TargetDesc::new(TRIPLE, cfg, alloc)
 }
 
@@ -499,7 +501,9 @@ pub fn load(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts:
     }
     let ask: &'static Ask<'static> =
         leak(Ask { roots, features: AVec::new_in(alloc), all_features: false, no_default_features: false, tests });
-    let target: &'static TargetDesc<'static> = leak(mac(alloc));
+    // The program's panic strategy: tempo's `[profile.dev]` writes no `panic`, and this loader
+    // reads no profile, so Rust's default, named (manifest-panic replaces it with the profile's).
+    let target: &'static TargetDesc<'static> = leak(mac(alloc, blaze_ladder::run::Panic::Unwind));
     let mut res = Resolution::new(lock, target, target, ask, resolver, alloc);
     for (id, p) in facts {
         res.member(id, p).map_err(|e| LoadError::Graph(e.to_string()))?;

@@ -1,0 +1,12 @@
+{
+ "id": "A-lazy-parent-names-records-1",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane P (the lazy parent, run.md D124)",
+ "where": "crates/blaze-cli/src/main.rs `Effect::StartProgram`; crates/blaze-cli/src/body_types.rs `checker`",
+ "what": "The lazy parent's maker and roots read the program's crates through make_one.rs `NamesRecords` (a `Records` over each crate's `CrateScope` record), and the only code in the tree that makes those records is body_types.rs `checker`, private to `blaze check`'s body job, built from a `TypesJob` owner. `blaze run` has no path to them, so the parent's names closure is an owed typed error; bstd `Cx::span` also takes only a static name, so a first call's span cannot name the function.",
+ "cost": "the first call of a program with no start list under today's certificate stops by name until the records are made one way for both commands",
+ "cause": "the records are made inside one command's job instead of one shared constructor",
+ "workaround": "none: the closure stops with `ParentError::Names`",
+ "fix": "move `checker`'s StoreLoad/Log/Records construction into one function both `blaze check` and `blaze run` call; give bstd a span with a dynamic field",
+ "state": "open"
+}

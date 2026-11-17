@@ -47,7 +47,9 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
     /// own header kept; an intrinsic is refused by name at `cause` (the module doc says why).
     pub(crate) fn reify_fn_item(&mut self, t: Ty, k: ItemKey, args: TyList, cause: Cause) -> Result<Reify, Stop> {
         let Some(sig) = self.reads.fn_sig(k)? else { return Ok(Reify::NoSig) };
-        let own = sig.header;
+        // A C-variadic item (`fn printf(f: *const c_char, ...)`) reifies to the C-variadic
+        // pointer of its named inputs (the Reference, "Function pointer types").
+        let own = FnPtrHeader { c_variadic: sig.c_variadic, ..sig.header };
         let attrs = self.reads.attrs(k)?;
         if attrs.0 & TypeAttrs::INTRINSIC != 0 {
             self.diag(DiagCode::IntrinsicToFnPointer, At::of(cause), About::found(t));

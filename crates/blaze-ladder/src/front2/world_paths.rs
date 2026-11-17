@@ -6,7 +6,7 @@
 use std::alloc::Global;
 use std::vec::Vec;
 
-use blaze_typeck::{Def, Fetch, MissWhy, Name, PNode, PTy, PathAnswer, PathMiss, PathRes, Prim, ScopeId};
+use blaze_typeck::{Def, Fetch, MissWhy, Name, PNode, PTy, PathAnswer, PathIdx, PathMiss, PathRes, Prim, ScopeId};
 
 use super::locals::{LocalGap, LocalKind, LocalNs};
 
@@ -19,7 +19,7 @@ use crate::resolve::{Kind, Ns, ResolveError};
 impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
     /// What `segments`, written in the body, name; when nothing, which segment failed, why,
     /// and what the segments before it named ([`Self::path_miss`]).
-    pub(super) fn path(&self, scope: ScopeId, segments: &[Name]) -> Fetch<PathAnswer> {
+    pub(super) fn path(&self, scope: ScopeId, p: PathIdx, segments: &[Name]) -> Fetch<PathAnswer> {
         let mut written = Vec::with_capacity_in(segments.len(), Global);
         for &s in segments {
             match self.spell.get(s) {
@@ -38,7 +38,19 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
                     // tuple, a reference): the Reference, "Paths", "`Self`": "In an
                     // implementation, it refers to the type being implemented." The checker
                     // reads the type from the impl's header (blaze-typeck rules/self_path.rs).
-                    Some(_) => Ok(PathRes { def: Def::SelfTy, consumed: 1 }),
+                    // A body that is no member of an impl yet has `Self` (an anonymous constant
+                    // of a head filed with a ground `Self`, anon.rs `Ask::of_self`: itoa's
+                    // `type Buffer = [MaybeUninit<u8>; Self::MAX_STR_LEN];` in `impl Sealed for
+                    // i128`, checked as `const _: usize = Self::MAX_STR_LEN;`) has no header to
+                    // read: there a built-in `Self` is the built-in type itself, as
+                    // `i128::MAX_STR_LEN` names it.
+                    Some(n) => {
+                        let no_impl = self.store.fns.get(&self.owner).is_some_and(|f| f.container.is_none());
+                        match prim_of(*n) {
+                            Some(p) if no_impl => Ok(PathRes { def: Def::Prim(p), consumed: 1 }),
+                            _ => Ok(PathRes { def: Def::SelfTy, consumed: 1 }),
+                        }
+                    }
                     None => Err(PathMiss::FIRST),
                 },
                 // `Self` outside an impl or trait: the first segment names nothing here.
@@ -53,7 +65,16 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
         let mut via_use = None;
         // The module the path is resolved at: the body's, or the block's module of the local
         // struct, enum, union or alias its first segment names.
-        let mut at_module = self.module;
+        // Where the module's names are read, by the path's first word's mark (drive.md, "A
+        // token keeps its mark"; the one rule, blaze-lower `mark_site::site_of`): a `macro`
+        // item's name at its definition's module, `$crate` as its mark's crate, every other
+        // path (a `macro_rules!` item name too) at the call, the body's module.
+        let Some(&mark) = self.path_marks.get(p.0 as usize) else { return self.gap(Gap::Site { path: p.0, why: None }) };
+        let site = match super::item_site::site_in(self.names, mark, first, first == "{{root}}", self.module) {
+            Ok(site) => site,
+            Err(why) => return self.gap(Gap::Site { path: p.0, why: Some(why) }),
+        };
+        let mut at_module = site.module;
         let mut local_type = None;
         let ns = if written.len() == 1 { LocalNs::Value } else { LocalNs::Type };
         let mut found = self.store.locals.find(self.owner, Some(scope.0), first, ns);
@@ -70,7 +91,7 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
         // (super::glob_uses, where the rules are quoted): the path then stands for `<the
         // glob's path>::<the name>..`, read where the glob's path is.
         let glob_ns = if ns == LocalNs::Value { Ns::Value } else { Ns::Type };
-        let via_glob = match super::glob_uses::before(&self.store.locals, &self.resolver(), self.module, self.owner, scope.0, first, glob_ns, found.as_ref(), blaze_own::Alloc::global()) {
+        let via_glob = match super::glob_uses::before(&self.store.locals, &self.resolver(), self.module, self.owner, scope.0, first, glob_ns, found.as_ref(), self.store.tys.alloc()) {
             Ok(hit) => hit,
             Err(gap) => return self.gap(Gap::Local(gap)),
         };
@@ -120,7 +141,7 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
         // Whether the path is read at the body's module exactly as written (no item of a
         // block, no local `use`, no `$crate`): the one case the body's conversion expands an
         // alias in ([`AliasPaths::expand`], which asks the same way).
-        let plain = via_use.is_none() && via_glob.is_none() && local_type.is_none() && !written.iter().any(|t| *t == "$crate");
+        let plain = via_use.is_none() && via_glob.is_none() && local_type.is_none() && site.module == self.module && !written.iter().any(|t| *t == "$crate");
         let mut shift = 0u32;
         if let Some(hit) = &via_glob {
             let mut through = Vec::with_capacity_in(hit.path.len() + written.len() + 1, Global);
@@ -142,6 +163,23 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
             through.extend(written[1..].iter().copied());
             shift = (through.len() - written.len()) as u32;
             written = through;
+            // The `use`'s path is read where the `use` is written (super::scope_table states the
+            // order): a first segment that is an item of a block around the `use` (`use
+            // __select_util::Out;` beside `mod __select_util { .. }` in the block an expansion
+            // wrote) is read at that item's block module, the scope table's for the item's
+            // scope (`Row::module`). Any other first segment is no block's: the body's module.
+            if let Some(&head) = row.path.first()
+                && !row.abs
+                && let Some(item) = self.store.locals.find(self.owner, Some(row.scope), head, LocalNs::Type).filter(|r| r.kind.in_block_module())
+            {
+                match item.module {
+                    Some(m) => {
+                        at_module = m;
+                        local_type = Some(item);
+                    }
+                    None => return self.gap(Gap::Local(LocalGap { item: item.key, form: item.kind.unplaced(), range: item.range })),
+                }
+            }
         }
         // `::x`: blaze-lower writes the global root as a first segment `{{root}}`.
         let (abs, rest) = match written.split_first() {
@@ -149,7 +187,7 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
             _ => (false, &written[..]),
         };
         let lead = (written.len() - rest.len()) as u32;
-        let target = match self.resolver().path(at_module, abs, rest, Ns::Value) {
+        let target = match self.resolver().path_with(at_module, site.dollar_crate, abs, rest, Ns::Value) {
             Ok(t) => t,
             // A block's item the body's lowering listed, which the name solver does not find
             // under its block's module (a later segment it cannot read): never "the program
@@ -158,7 +196,7 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
                 Some(row) if written.len() == 1 => return self.gap(Gap::Local(LocalGap { item: row.key, form: row.kind.unplaced(), range: row.range })),
                 // The program names nothing: the checker's own diagnostic, naming the segment
                 // the library stopped at (world_path_miss.rs).
-                _ => return self.path_miss(at_module, abs, rest, lead, shift, e),
+                _ => return self.path_miss(at_module, site.dollar_crate, abs, rest, lead, shift, e),
             },
             Err(e @ ResolveError::NoText { .. }) => return self.gap(Gap::Resolve(e)),
         };
@@ -197,7 +235,9 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
             // that type's constructor". A body path's alias is its aliased type when that type
             // is a path the checker names (`Def`): an ADT whose arguments are the alias's own
             // parameters in order (the segment's arguments then go to the ADT unchanged), or
-            // a built-in type. Any other aliased type is the gap naming the alias.
+            // a built-in type. Any other aliased type is `Def::Alias`: the checker reads the
+            // alias's definition (`World::type_alias`) and the segment's arguments as the
+            // alias's own (blaze-typeck rules/alias_path.rs).
             Kind::TypeAlias => match self.store.maps.aliases.get(&target.key) {
                 None => return self.fill(Fill::Store(Want::Head(target.key))),
                 Some(None) => {
@@ -210,11 +250,12 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
                     // body's conversion wrote on this segment ([`AliasPaths::expand`]: the
                     // alias's parameters substituted into `Raw`'s arguments, the fixed `u8`
                     // kept), so the checker reads them as `Raw`'s own. Only where that
-                    // conversion expanded it (`plain`, and [`fixed_alias`]'s shape): any other
-                    // alias stays the gap naming it.
+                    // conversion expanded it (`plain`, and [`fixed_alias`]'s shape): anywhere
+                    // else the segment's arguments are still the alias's own, so the path is
+                    // the alias itself.
                     None => match fixed_alias(self.store.tys.view(), generics, ty) {
                         Some((adt, _)) if plain => Def::Adt(adt),
-                        _ => return self.gap(Gap::TypeAlias(target.key)),
+                        _ => Def::Alias(k),
                     },
                 },
             },
@@ -253,17 +294,18 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
 }
 
 /// The most type nodes [`fixed_alias`] walks in one aliased type; a larger one is not expanded
-/// (it stays `Gap::TypeAlias`).
+/// (the path is then `Def::Alias`, which the checker expands itself).
 const MOST_ALIAS_NODES: u32 = 4096;
 
 /// The ADT and its arguments of an alias with `generics` parameters whose aliased type `ty`
 /// is `Adt<args>` where the arguments FIX something (`type Call<P, C> = Raw<P, C, u8>`,
 /// `type Sol<P, C, N> = Raw<P, PhantomData<C>, N>`): the shape a body path through the alias
-/// is expanded for. Each parameter of the alias is used at most once, and each argument holds
-/// at most one: then, where the path writes no arguments, one hole (`_`) per parameter is
-/// the whole of what the path says (a parameter used twice would need the two places held
-/// equal, and two holes in one argument are one node of the type table, which the checker
-/// lowers to one variable). An alias of an alias is already its aliased type here: the head
+/// is expanded for. Each parameter of the alias is used at most once, and a const parameter
+/// only as a whole argument or an array's length (where the checker's hole is a const
+/// variable): then, where the path writes no arguments, one hole (`_`) per parameter is the
+/// whole of what the path says (a parameter used twice would need the two places held equal;
+/// the checker lowers each written hole to its own variable, blaze-typeck machine.rs
+/// `lower_holes`, so several holes in one argument stay apart). An alias of an alias is already its aliased type here: the head
 /// of an alias is made with every alias in it substituted (types.rs `path_ty`). `None`: any
 /// other aliased type (a tuple, a reference, a projection), or one past [`MOST_ALIAS_NODES`].
 pub(super) fn fixed_alias(view: blaze_typeck::PTys<'_>, generics: u32, ty: PTy) -> Option<(blaze_typeck::ItemKey, Vec<PTy, Global>)> {
@@ -274,7 +316,6 @@ pub(super) fn fixed_alias(view: blaze_typeck::PTys<'_>, generics: u32, ty: PTy) 
     let mut work: Vec<PTy, Global> = Vec::new_in(Global);
     let mut steps = 0u32;
     for &arg in args {
-        let mut in_arg = 0u32;
         work.clear();
         work.push(arg);
         while let Some(t) = work.pop() {
@@ -282,16 +323,35 @@ pub(super) fn fixed_alias(view: blaze_typeck::PTys<'_>, generics: u32, ty: PTy) 
             if steps > MOST_ALIAS_NODES {
                 return None;
             }
-            match *view.get(t)? {
-                PNode::Param(i) | PNode::ConstParam(i) => {
-                    let slot = used.get_mut(i as usize)?;
-                    in_arg += 1;
-                    if *slot || in_arg > 1 {
-                        return None;
+            // A const parameter's hole is a const variable only as a whole argument
+            // (blaze-typeck rules/lit_path.rs) or as an array's length (`Machine::lower_holes`,
+            // the `Array` arm of `lower_node`); anywhere else the checker would make it a
+            // type variable, so such an alias is not expanded.
+            let param = match *view.get(t)? {
+                PNode::Param(i) => Some(i),
+                PNode::ConstParam(i) if t == arg => Some(i),
+                PNode::ConstParam(_) => return None,
+                PNode::Array(elem, len) => {
+                    work.push(elem);
+                    match *view.get(len)? {
+                        PNode::ConstParam(i) => Some(i),
+                        _ => {
+                            work.push(len);
+                            None
+                        }
                     }
-                    *slot = true;
                 }
-                _ => super::types::children_of(view, t, &mut work)?,
+                _ => {
+                    super::types::children_of(view, t, &mut work)?;
+                    None
+                }
+            };
+            if let Some(i) = param {
+                let slot = used.get_mut(i as usize)?;
+                if *slot {
+                    return None;
+                }
+                *slot = true;
             }
         }
     }
@@ -335,6 +395,13 @@ impl<'n, H: super::types::Heads, S: super::source::NamesSource<'n>> AliasPaths<'
             Err(why) => return Err(why),
         };
         let Some(&first) = texts.first() else { return Ok(None) };
+        // Only a path the world reads at the body's module as written (`plain` there): one an
+        // expansion's mark sends elsewhere (a `macro` item's name, `$crate`), or refuses, is
+        // converted as written and answered by `BodyWorld::path`.
+        match super::item_site::site_in(self.builder.resolver.names, view.mark_of_path(p)?, first, abs, self.env.module) {
+            Ok(site) if site.module == self.env.module && site.dollar_crate.is_none() => {}
+            _ => return Ok(None),
+        }
         if !abs {
             if first == "Self" || self.env.params.iter().any(|(n, _)| *n == Name::of(first)) {
                 return Ok(None);
@@ -350,7 +417,7 @@ impl<'n, H: super::types::Heads, S: super::source::NamesSource<'n>> AliasPaths<'
             // A first segment a block's glob import gives is not the module's reading either
             // (a refusal there is the world's gap, when it reads the same path).
             let glob_ns = if ns == LocalNs::Value { Ns::Value } else { Ns::Type };
-            if !matches!(super::glob_uses::before(self.locals, &self.builder.resolver, self.env.module, self.owner, scope.0, first, glob_ns, None, blaze_own::Alloc::global()), Ok(None)) {
+            if !matches!(super::glob_uses::before(self.locals, &self.builder.resolver, self.env.module, self.owner, scope.0, first, glob_ns, None, tys.alloc()), Ok(None)) {
                 return Ok(None);
             }
         }

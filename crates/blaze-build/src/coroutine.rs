@@ -35,7 +35,6 @@ use blaze_flow_lower::identity::{Identity, Role};
 use blaze_typeck::{BodyView, CaptureKind, Checked, Expr, ExprId, ItemKey, List, Mutbl, PNode, PTy, PTys, PortableTys};
 
 use crate::BuildError;
-use crate::layout::NoFacts;
 
 // The walk's own names (`Walk`, `Repr`, `V`, `Task`, `TyErr`...), as closure.rs takes them.
 use super::*;
@@ -142,24 +141,10 @@ pub fn coroutine_facts(
     let Ok(PNode::Future(_, output, _)) = from.node(t) else {
         return Err(BuildError::Malformed { what: "an async block whose type is not a future" });
     };
-    let output = crate::ground(from, output, &params, out, scratch, &NoFacts)?;
-    let mut fields: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
-    let caps = &checked.captures;
-    for c in 0..caps.len() {
-        if caps.column::<0>()[c] != e {
-            continue;
-        }
-        let (p, by) = (caps.column::<1>()[c], caps.column::<2>()[c]);
-        let lt = *checked.local_ty.get(p.ix()).ok_or(BuildError::Malformed { what: "a captured binding without a type" })?;
-        let t = crate::ground(from, lt, &params, out, scratch, &NoFacts)?;
-        fields.push(match by {
-            CaptureKind::ByRef => out.intern(PNode::Ref(Mutbl::Not, t)).map_err(full)?,
-            CaptureKind::ByMutRef => out.intern(PNode::Ref(Mutbl::Mut, t)).map_err(full)?,
-            CaptureKind::ByValue => t,
-        });
-    }
-    let l = out.intern_list(&fields).map_err(full)?;
-    let env = out.intern(PNode::Tuple(l)).map_err(full)?;
+    // As written (`copy_written`): an output or an upvar of `impl Trait`, projection or
+    // another block's future type is settled where an instance grounds it.
+    let output = crate::copy_written(from, output, &params, body, out, scratch)?;
+    let env = crate::layout::environment(body, checked, e, &params, out, scratch)?;
     Ok((env, output))
 }
 
@@ -412,6 +397,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         if !caps.is_empty() {
             let parts = self.coroutine_parts(g).map_err(err)?;
             let le = self.layout(parts.env).map_err(err)?;
+            self.env_holds(e, parts.env, caps.len())?;
             let base = self.field_offset(l, 0)?;
             for (j, &(p, by)) in caps.iter().enumerate() {
                 let (home, prepr) = self.slots.get(p.ix()).copied().flatten().ok_or(malformed("a binding captured before its binding"))?;
@@ -518,6 +504,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         self.captures_of(block, &mut caps);
         if !caps.is_empty() {
             let le = self.layout(parts.env).map_err(co_err)?;
+            self.env_holds(block, parts.env, caps.len())?;
             for (j, &(p, by)) in caps.iter().enumerate() {
                 let at = (state, self.field_offset(le, j)? as i32);
                 match by {

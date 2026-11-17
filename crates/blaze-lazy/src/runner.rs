@@ -38,7 +38,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use blaze_codegen::{CompiledFunction, InstanceKey};
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_inproc::CellView;
 use blaze_inproc::ask;
 use blaze_inproc::frame::Kind;
@@ -143,7 +143,7 @@ struct Tiered<C: Compiler, P: Placer, A: Answers> {
     /// Per function: bound to the runner, once its first code was published.
     bound: Vec<bool>,
     /// The tiers the daemon's history remembered for functions not bound yet.
-    remembered: HashMap<u32, Tier, Global>,
+    remembered: Map<u32, Tier, FixedState, Global>,
 }
 
 struct State {
@@ -275,7 +275,7 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
             *lock(&shared.tier) = Some(Tiered {
                 runner,
                 bound: vec![false; functions as usize], // alloc: setup, once per run
-                remembered: HashMap::new_in(Global),
+                remembered: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             });
         }
         let mut threads = Vec::with_capacity(workers as usize);

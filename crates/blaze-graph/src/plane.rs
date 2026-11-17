@@ -62,7 +62,7 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use blaze_hash::{ByHash, HashMap};
+use blaze_hash::{BuildKeyHasher, FixedState, Map, MapOpts};
 use blaze_kit::Heap4;
 use blaze_mem::{Handle, RegionVec, Slab, Tag as MemTag};
 use blaze_protocol::events::{Event, Level, NodeKind, NodeState, Record};
@@ -904,7 +904,7 @@ impl Batch {
 }
 
 /// Keys of tasks, by the key's own bits: a [`Key`] hashes as its first word.
-type ByKey<V> = ByHash<Key, V, Global>; // alloc: the plane's index, for the daemon's life
+type ByKey<V> = Map<Key, V, BuildKeyHasher, Global>; // alloc: the plane's index, for the daemon's life
 
 /// A node of an open request that has not settled ([`Plane::unsettled`]).
 #[derive(Clone, Copy, Debug)]
@@ -926,7 +926,7 @@ pub struct Plane<M = NoMemo> {
     keys: RegionVec<Key>,
     node_slots: Slots<NodeSlot>,
     /// Each node by its id: its slot, or while a batch is checked its [`place`].
-    index: HashMap<NodeId, NodeHandle, Global>, // alloc: the plane's index, for the daemon's life
+    index: Map<NodeId, NodeHandle, FixedState, Global>, // alloc: the plane's index, for the daemon's life
     /// The task columns, by slot, and which slots are live.
     tasks: RegionVec<TaskRow>,
     task_keys: RegionVec<Key>,
@@ -934,7 +934,7 @@ pub struct Plane<M = NoMemo> {
     /// Each request's room, by slot, and which slots are live.
     requests: RegionVec<Request>,
     request_slots: Slots<RequestSlot>,
-    request_index: HashMap<RequestId, RequestHandle, Global>, // alloc: the plane's index, for the daemon's life
+    request_index: Map<RequestId, RequestHandle, FixedState, Global>, // alloc: the plane's index, for the daemon's life
     next_seq: u64,
     /// The database's memo, asked once a keyed node is ready and its key is not in flight.
     memo: M,
@@ -999,16 +999,16 @@ impl<M: Memo> Plane<M> {
             states: column(MAX_NODES),
             keys: column(MAX_NODES),
             node_slots: Slots::new(MAX_NODES),
-            index: HashMap::new_in(Global), // alloc: the plane's index, for the daemon's life
+            index: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: the plane's index, for the daemon's life
             tasks: column(MAX_TASKS),
             task_keys: column(MAX_TASKS),
             task_slots: Slots::new(MAX_TASKS),
             requests: column(MAX_REQUESTS),
             request_slots: Slots::new(MAX_REQUESTS),
-            request_index: HashMap::new_in(Global), // alloc: the plane's index, for the daemon's life
+            request_index: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), // alloc: the plane's index, for the daemon's life
             next_seq: 0,
             memo,
-            flight: ByKey::default(),
+            flight: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: Global, capacity: None }),
             running: [0; 2],
             vclock: [0; 2],
             idle_vclock: [0; 2],
@@ -2297,7 +2297,7 @@ fn new_task(
 
 /// Takes the ids of the first `len` nodes of a batch refused back out of the index.
 fn unindex(
-    index: &mut HashMap<NodeId, NodeHandle, Global>,
+    index: &mut Map<NodeId, NodeHandle, FixedState, Global>,
     nodes: &(impl Given + ?Sized),
     len: usize,
 ) {

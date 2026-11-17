@@ -15,7 +15,7 @@
 use std::hash::Hash;
 
 use base_db::Db;
-use blaze_hash::HashSet;
+use blaze_hash::{FixedState, Set, SetOpts};
 use blaze_ids::{Domain, radix};
 use blaze_mem::{Frame, Tag, frame};
 use hir::check::bodies::Plan;
@@ -315,8 +315,8 @@ const DUPLICATE: &str = "duplicate diagnostic emitted due to `-Z deduplicate-dia
 /// `note_once` already written with another. rustc counts each one it writes for its closing
 /// lines, a duplicate kept included (`deduplicated_err_count`).
 fn finish(diags: Vec<Diag>, keep_duplicates: bool) -> Vec<Diag> {
-    let mut seen: HashSet<Key, Global> = HashSet::new_in(Global);
-    let mut once: HashSet<Key, Global> = HashSet::new_in(Global);
+    let mut seen: Set<Key, FixedState, Global> = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
+    let mut once: Set<Key, FixedState, Global> = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
     seen.reserve(diags.len());
     let mut written = Vec::with_capacity(diags.len());
     for mut diag in diags {

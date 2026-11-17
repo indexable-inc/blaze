@@ -7,7 +7,7 @@
 
 use std::{io::Write, path::PathBuf, sync::Arc};
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_registry::{
     Context, Locked, Package, SourceConfig, Sources,
     auth::{Auth, Shell},
@@ -26,7 +26,7 @@ const LOGIN: &str = "https://private.example.com/me";
 /// Files by URL, every one of which wants `authorization: <token>`, and what was asked.
 struct Server {
     token: String,
-    files: Lock<HashMap<String, Vec<u8>, Global>>,
+    files: Lock<Map<String, Vec<u8>, FixedState, Global>>,
     asked: Lock<Vec<(String, Option<String>)>>,
 }
 
@@ -110,18 +110,24 @@ impl Fixture {
         }
         let bytes = tarball("secret");
         let sum = checksum(&bytes);
-        let files = HashMap::from_iter_in([
-            (
-                format!("{BASE}config.json"),
-                format!(r#"{{"dl":"{DL}{{crate}}/{{version}}","auth-required":true}}"#).into_bytes(),
-            ),
-            (
-                format!("{BASE}se/cr/secret"),
-                format!(r#"{{"name":"secret","vers":"1.0.0","deps":[],"cksum":"{sum}","features":{{}}}}"#)
-                    .into_bytes(),
-            ),
-            (format!("{DL}secret/1.0.0"), bytes),
-        ], Global);
+        let files = {
+            let iter = IntoIterator::into_iter([
+                (
+                    format!("{BASE}config.json"),
+                    format!(r#"{{"dl":"{DL}{{crate}}/{{version}}","auth-required":true}}"#).into_bytes(),
+                ),
+                (
+                    format!("{BASE}se/cr/secret"),
+                    format!(r#"{{"name":"secret","vers":"1.0.0","deps":[],"cksum":"{sum}","features":{{}}}}"#)
+                        .into_bytes(),
+                ),
+                (format!("{DL}secret/1.0.0"), bytes),
+            ]);
+            let capacity = Some(iter.size_hint().0);
+            let mut map = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity });
+            map.extend(iter);
+            map
+        };
         let server = Arc::new(Server {
             token: token.to_owned(),
             files: Lock::new("registry.test.auth.files", files),

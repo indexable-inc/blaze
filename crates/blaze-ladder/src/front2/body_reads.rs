@@ -43,26 +43,108 @@ pub struct ReadsDigest(pub ContentId);
 impl ReadsDigest {
     /// The digest of `list`; `scratch` holds one question's bytes at a time.
     pub fn of(list: &ReadList<'_>, scratch: Alloc<'_>) -> ReadsDigest {
-        use core::hash::Hash;
-        let mut h = Hasher::new(READS_DOMAIN);
-        let questions = list.questions();
-        let answers = list.rows.column::<1>();
-        h.update(&(questions.len() as u64).to_le_bytes());
-        let mut bytes: AVec<'_, u8> = Vec::new_in(scratch);
-        for (q, answer) in questions.iter().zip(answers) {
-            bytes.clear();
-            q.hash(&mut crate::code_records::Fixed(&mut bytes));
-            h.part(&bytes);
-            h.update(&answer.to_le_bytes());
+        digest_rows(list, scratch, None)
+    }
+}
+
+/// The digest of `list` ([`ReadsDigest::of`]); with `keep`, also each row's [`KeptRow`]
+/// pushed there, in the list's (sorted) order.
+fn digest_rows(list: &ReadList<'_>, scratch: Alloc<'_>, mut keep: Option<&mut Vec<KeptRow, Global>>) -> ReadsDigest {
+    use core::hash::Hash;
+    let mut h = Hasher::new(READS_DOMAIN);
+    let questions = list.questions();
+    let answers = list.rows.column::<1>();
+    h.update(&(questions.len() as u64).to_le_bytes());
+    let mut bytes: AVec<'_, u8> = Vec::new_in(scratch);
+    for (q, answer) in questions.iter().zip(answers) {
+        bytes.clear();
+        q.hash(&mut crate::code_records::Fixed(&mut bytes));
+        h.part(&bytes);
+        h.update(&answer.to_le_bytes());
+        if let Some(keep) = keep.as_deref_mut() {
+            keep.push(KeptRow { question: question_print(&bytes), answer: *answer });
         }
-        ReadsDigest(h.finish())
+    }
+    ReadsDigest(h.finish())
+}
+
+const ROW_DOMAIN: &str = "blaze-ladder kept read-list row 1";
+
+/// A question's fingerprint, from its fixed-width bytes: in-process only, never written.
+fn question_print(bytes: &[u8]) -> u64 {
+    let id = Hasher::new(ROW_DOMAIN).update(bytes).finish();
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&id.0[..8]);
+    u64::from_le_bytes(first)
+}
+
+/// The most rows of a list whose rows [`Digests`] keeps beside its digest, so a second check
+/// that reads other answers names the first row that differs (rule 19). A constant's body
+/// (the class this exists for: tempo's census, "checking .. again read other answers") reads
+/// a few questions; 16 bytes a row, so at most 512 bytes a body, and nothing for a longer list.
+pub const MOST_KEPT_ROWS: usize = 32;
+
+/// One row of a kept list: its question's fingerprint and its answer's hash.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct KeptRow {
+    question: u64,
+    answer: u64,
+}
+
+/// What one owner's first check filed.
+#[derive(Clone, Copy)]
+struct FiledReads {
+    digest: ReadsDigest,
+    count: u32,
+    /// Its rows in `Digests::rows` (start, count), if the list had at most [`MOST_KEPT_ROWS`].
+    kept: Option<(u32, u32)>,
+}
+
+/// Where two checks of one body read differently ([`CheckFail::ReadsDiffer`]): the rows of
+/// the second check that the first did not read as it did, by question, and how many of the
+/// first check's questions the second did not ask. `first_kept` false: the first list was
+/// longer than [`MOST_KEPT_ROWS`] and only its row count is known.
+#[derive(Debug)]
+pub struct ReadsDiff {
+    pub first_rows: u32,
+    pub second_rows: u32,
+    pub first_kept: bool,
+    /// Each second-check row not in the first, in question order: the question, its answer
+    /// now, and the first check's answer to the same question (`None`: not asked then). At
+    /// most [`MOST_DIFF_ROWS`].
+    pub second_only: Vec<(tc::Question, u64, Option<u64>), Global>,
+    /// How many rows of the second check differ in all (`second_only` holds the first ones).
+    pub second_differ: u32,
+    /// How many of the first check's questions the second did not ask.
+    pub first_only: u32,
+}
+
+/// The most differing rows a [`ReadsDiff`] names.
+pub const MOST_DIFF_ROWS: usize = 4;
+
+impl core::fmt::Display for ReadsDiff {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "first check {} reads, second {}", self.first_rows, self.second_rows)?;
+        if !self.first_kept {
+            return write!(f, "; the first list was longer than {MOST_KEPT_ROWS} rows, not kept");
+        }
+        write!(f, "; {} second-check rows differ, {} first-check questions not asked again", self.second_differ, self.first_only)?;
+        for (q, now, then) in self.second_only.iter() {
+            match then {
+                Some(then) => write!(f, "; {q:?} answered {then:#018x} first, {now:#018x} second")?,
+                None => write!(f, "; {q:?} asked only by the second check (answer {now:#018x})")?,
+            }
+        }
+        Ok(())
     }
 }
 
 /// Each checked body's [`ReadsDigest`], by its owner: the run's one copy of what its bodies
-/// read, kept in the store ([`super::heads::Store::reads`]). 40 bytes a body.
+/// read, kept in the store ([`super::heads::Store::reads`]). About 50 bytes a body, and 16 a
+/// row for a list of at most [`MOST_KEPT_ROWS`] rows (the refusal's evidence).
 pub struct Digests {
-    by_owner: HashMap<ItemKey, ReadsDigest, Global>,
+    by_owner: HashMap<ItemKey, FiledReads, Global>,
+    rows: Vec<KeptRow, Global>,
 }
 
 impl Default for Digests {
@@ -73,25 +155,57 @@ impl Default for Digests {
 
 impl Digests {
     pub fn new() -> Digests {
-        Digests { by_owner: HashMap::new_in(Global) }
+        Digests { by_owner: HashMap::new_in(Global), rows: Vec::new_in(Global) }
     }
 
-    /// `digest` filed for `owner`'s body. A digest already filed for it must be the same:
-    /// another is [`CheckFail::ReadsDiffer`] and the first stays.
-    pub fn file(&mut self, owner: ItemKey, digest: ReadsDigest) -> Result<(), CheckFail> {
-        match self.by_owner.get(&owner) {
-            Some(had) if *had != digest => Err(CheckFail::ReadsDiffer { owner }),
-            Some(_) => Ok(()),
-            None => {
-                self.by_owner.insert(owner, digest);
-                Ok(())
+    /// `list`, read by a clean check of `owner`'s body, filed as its digest (and its rows, for
+    /// a list of at most [`MOST_KEPT_ROWS`]); `scratch` holds one question's bytes at a time.
+    /// A digest already filed for `owner` must be the same: another is
+    /// [`CheckFail::ReadsDiffer`], naming the rows that differ, and the first stays.
+    pub fn file(&mut self, owner: ItemKey, list: &ReadList<'_>, scratch: Alloc<'_>) -> Result<(), CheckFail> {
+        let count = list.questions().len();
+        if let Some(had) = self.by_owner.get(&owner).copied() {
+            if had.digest == ReadsDigest::of(list, scratch) {
+                return Ok(());
+            }
+            return Err(CheckFail::ReadsDiffer { owner, diff: Box::new(self.diff(had, list, scratch)) });
+        }
+        let filed = if count <= MOST_KEPT_ROWS {
+            let start = self.rows.len() as u32;
+            let digest = digest_rows(list, scratch, Some(&mut self.rows));
+            FiledReads { digest, count: count as u32, kept: Some((start, count as u32)) }
+        } else {
+            FiledReads { digest: ReadsDigest::of(list, scratch), count: count as u32, kept: None }
+        };
+        self.by_owner.insert(owner, filed);
+        Ok(())
+    }
+
+    /// How `list` differs from the first check's rows `had`.
+    fn diff(&self, had: FiledReads, list: &ReadList<'_>, scratch: Alloc<'_>) -> ReadsDiff {
+        let questions = list.questions();
+        let mut diff = ReadsDiff { first_rows: had.count, second_rows: questions.len() as u32, first_kept: had.kept.is_some(), second_only: Vec::new_in(Global), second_differ: 0, first_only: 0 };
+        let Some((start, len)) = had.kept else { return diff };
+        let first = &self.rows[start as usize..(start + len) as usize];
+        let mut now: Vec<KeptRow, Global> = Vec::with_capacity_in(questions.len(), Global);
+        let _ = digest_rows(list, scratch, Some(&mut now));
+        for (at, row) in now.iter().enumerate() {
+            let then = first.iter().find(|r| r.question == row.question);
+            if then.is_some_and(|t| t.answer == row.answer) {
+                continue;
+            }
+            diff.second_differ += 1;
+            if diff.second_only.len() < MOST_DIFF_ROWS {
+                diff.second_only.push((questions[at], row.answer, then.map(|t| t.answer)));
             }
         }
+        diff.first_only = first.iter().filter(|t| !now.iter().any(|r| r.question == t.question)).count() as u32;
+        diff
     }
 
     /// The digest filed for `owner`'s body, if it was checked clean in this run.
     pub fn get(&self, owner: ItemKey) -> Option<ReadsDigest> {
-        self.by_owner.get(&owner).copied()
+        self.by_owner.get(&owner).map(|f| f.digest)
     }
 
     /// How many bodies filed one.
@@ -122,12 +236,12 @@ pub fn check_body_asked<'n, S: NamesSource<'n>>(
     // Its opaques' hidden types, for an auto trait asked by another body (front2 opaque_auto.rs).
     super::opaque_auto::file(r, body, &done)?;
     let filed = done.file_out();
-    let digest = ReadsDigest::of(&filed.reads, Alloc::global());
+    let scratch = r.store.tys.alloc();
+    r.store.reads.file(body.typeck.owner, &filed.reads, scratch)?;
     drop(filed);
-    r.store.reads.file(body.typeck.owner, digest)?;
     // Its closures, for a body that names one outside its owner (front2 foreign_closures.rs).
     let store = &mut *r.store;
-    store.closures.file(body.typeck.owner, &done, &mut store.tys);
+    store.closures.file(&body.typeck.view(tc::PTys::EMPTY), &done, &mut store.tys);
     Ok(done)
 }
 
@@ -163,6 +277,42 @@ pub fn check_body_filed_as<'n, S: NamesSource<'n>>(
     // the same filing as `check_body_asked`'s, so a closure is found whichever path checked
     // its owner, and the owner is never checked again for it (rule 77).
     let store = &mut *r.store;
-    store.closures.file(body.typeck.owner, &done, &mut store.tys);
+    store.closures.file(&body.typeck.view(tc::PTys::EMPTY), &done, &mut store.tys);
     Ok((done, filed))
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_own::Soa;
+    use blaze_typeck::{ItemKey, LangItem, Question, ReadList};
+
+    use super::{CheckFail, Digests};
+
+    fn list<'a>(rows: &[(Question, u64)], alloc: blaze_own::Alloc<'a>) -> ReadList<'a> {
+        let mut out = Soa::new_in(alloc);
+        for &row in rows {
+            out.push(row);
+        }
+        ReadList { rows: out }
+    }
+
+    /// One owner filed twice: the same list is one digest; a list that answers one question
+    /// otherwise and asks one more is refused, naming both rows and the first's answer.
+    #[test]
+    fn reads_differ_names_the_rows() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let owner = ItemKey(7);
+        let (sig, sized, copy) = (Question::FnSig(ItemKey(9)), Question::Lang(LangItem::Sized), Question::Lang(LangItem::Copy));
+        let mut digests = Digests::new();
+        digests.file(owner, &list(&[(sig, 1), (sized, 2)], alloc), alloc).expect("first filing");
+        digests.file(owner, &list(&[(sig, 1), (sized, 2)], alloc), alloc).expect("the same list again is the same digest");
+        let mut rows = [(sig, 1), (sized, 3), (copy, 4)];
+        rows.sort_unstable();
+        let Err(CheckFail::ReadsDiffer { diff, .. }) = digests.file(owner, &list(&rows, alloc), alloc) else { panic!("another list under one owner was filed") };
+        assert_eq!((diff.first_rows, diff.second_rows, diff.second_differ, diff.first_only), (2, 3, 2, 0));
+        assert!(diff.second_only.contains(&(sized, 3, Some(2))), "{diff}");
+        assert!(diff.second_only.contains(&(copy, 4, None)), "{diff}");
+        let shown = format!("{diff}");
+        assert!(shown.contains("answered 0x0000000000000002 first, 0x0000000000000003 second"), "{shown}");
+    }
 }

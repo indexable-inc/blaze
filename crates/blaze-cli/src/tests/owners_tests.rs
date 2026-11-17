@@ -8,8 +8,9 @@ use super::*;
 /// Cold, both bodies are checked. Then `a` gains an item with no body (`pub struct Added`), which moves `a`'s
 /// `CrateScope` out and `a`'s file's text around its bodies: `a`'s body is checked again, and
 /// `b`'s is not, since `b`'s file's owners are `b`'s root alone and `b`'s check scope (its own
-/// dependency closure and the sysroot) holds no `a`. Expected: "BodyCheck made 1, in 1 file
-/// jobs": `a`'s one body, `b`'s none.
+/// dependency closure and the sysroot) holds no `a`. Expected: "BodyCheck made 1, in 2 file
+/// jobs": `a`'s one body and one job of `a`'s Signatures, the new entry `Added`'s among them
+/// (D114, amended 2026-11-17); `b`'s none.
 ///
 /// Control (run once, 2026-11-16 21:24, before the drive's wait on the moved `Surface`, when
 /// the fix read (2, 2)): with every member taken as an owner of every file (the "members" read
@@ -36,5 +37,19 @@ fn an_export_edit_in_one_member_reruns_no_body_of_another() {
     // `a`'s one body, entered once: it waits on its file's moved `Surface`, so its reads are
     // `a`'s remade scopes (DRIVER runner 19, 21:35; before it, (2, 2): entered over its last
     // reads first). `b`'s file is never prepared (RUNNER 7, 21:23).
-    assert_eq!((bodies, edit.body_jobs), (1, 1), "only `a`'s body is checked again; `b` reads no scope of `a`:\n{out}\n{}", edit.profile);
+    // The counts and the profile's rows on the first line: a runner quotes a failure's first lines.
+    let rows = edit.profile.lines().filter(|l| !l.starts_with("store") && !l.starts_with("gate")).collect::<std::vec::Vec<_>>().join(" / ");
+    // The body pool's jobs count `Signature` jobs too (work.rs `BODY_JOBS`), and since D114's
+    // amendment (2026-11-17) a Signature is one file entry's heads: `Added` is a new entry, so
+    // its Signature is made before `a`'s body reads it as handed, and `f`'s Signature, which
+    // reads `a`'s moved `CrateScope` whole, is made again beside it (Signature made 2, one job,
+    // 2026-11-17 04:31). That is `a`'s own work, not `b`'s: one job of `a`'s Signatures and one
+    // of its body. (`f`'s Signature reading the scope by cell would stand: a precision lead.)
+    let signatures = made(&edit.profile, "Signature");
+    assert_eq!(
+        (bodies, edit.body_jobs),
+        (1, 2),
+        "only `a`'s body is checked again and `Added`'s Signature made; `b` reads no scope of `a` (BodyCheck made {bodies}, Signature made {signatures}, in {} file jobs): {rows}\n{out}",
+        edit.body_jobs
+    );
 }

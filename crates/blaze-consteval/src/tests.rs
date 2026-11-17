@@ -14,10 +14,14 @@ use crate::machine::{Answer, Codes, Plant, discriminant_with_plant, int_binop, m
 use crate::record::DataTarget;
 use crate::{ConstError, Intrinsic, Layouts, Limits, Op, PanicPart, Refusal, eval_discriminant};
 
+mod byte_intrinsics;
+mod closure_fn_ptr;
 mod fn_fact;
 mod needs_drop;
 mod transmute_unchecked;
+mod type_id;
 mod ub_checks;
+mod wide_floats;
 
 /// A world with the intrinsics and the panic entry core's code reaches.
 fn world() -> World {
@@ -325,6 +329,26 @@ fn const_fn_recursion_up_to_the_bound() {
     assert_eq!(e.constant, w.key("SPIN"), "the refusal names the constant");
 }
 
+/// A const generic parameter is a value in a constant of the item it belongs to (the
+/// Reference, "Const generics": "const parameters may be used ... as a standalone
+/// expression"; "Associated constants": evaluated after monomorphization): `CAP` in
+/// `const LAP: usize = CAP + 1;` of `impl<T, const CAP: usize> SegQueue<T, CAP>` is the
+/// instance's argument, so each instance has its own value. A version that refuses the path
+/// (`a path with no definition`) or reads one instance's argument for another fails here.
+/// Prints `test tests::const_param_is_the_instance_argument ... ok`.
+#[test]
+fn const_param_is_the_instance_argument() {
+    let mut w = world();
+    w.generic_konst("LAP", "usize", ("CAP", "usize"), "CAP + 1");
+    w.generic_konst("WIDE", "usize", ("CAP", "usize"), "if CAP > 8 { CAP * 2 } else { 0 }");
+    w.build();
+    let at = |w: &mut World, name: &str, cap: u64| w.eval_at(name, &[cap]).map(int_of).map_err(|e| std::format!("{:?}", e.refusal));
+    assert_eq!(at(&mut w, "LAP", 31), Ok(32));
+    assert_eq!(at(&mut w, "LAP", 7), Ok(8), "another instance, another value");
+    assert_eq!(at(&mut w, "WIDE", 31), Ok(62));
+    assert_eq!(at(&mut w, "WIDE", 3), Ok(0));
+}
+
 /// Pointers in constants (the Reference, "Constant evaluation": comparison operators only on
 /// integers, floats, `bool` and `char`; `ptr_guaranteed_cmp`'s contract: 1 guaranteed equal,
 /// 0 guaranteed unequal, 2 unknown, never wrong). `==` is refused by name; the intrinsic
@@ -478,6 +502,31 @@ fn slice_of_a_constant_array() {
     assert_eq!(eval_int(&mut w, "M"), Ok(5));
     let st = w.eval("STR").expect("STR");
     assert_eq!(st.data.allocs[1].bytes.as_slice(), "h\u{e9}llo".as_bytes(), "a string literal's bytes, escapes decoded");
+}
+
+/// The Reference, "Slice patterns": with a `..`, the elements before it are at their index,
+/// those after it are counted from the end, the `..` (bound by `rest @ ..`) is the part between
+/// (`[T]` over a slice, `[T; n - k]` over an array), and a slice matches when it is at least as
+/// long as the other elements. A version that indexed the elements after `..` from the start,
+/// or tested the length for equality, gives other numbers here.
+#[test]
+fn slice_patterns_with_rest() {
+    let mut w = world();
+    w.konst("A", "[u16; 4]", "[1, 2, 3, 4]");
+    w.konst("S", "&[u16]", "&A");
+    w.konst("FIRST", "u16", "match S { [first, ..] => *first, _ => 0 }");
+    w.konst("LAST", "u16", "match S { [.., last] => *last, _ => 0 }");
+    w.konst("TAIL2", "u16", "match S { [.., y, z] => *y * 10 + *z, _ => 0 }");
+    w.konst("MID", "u16", "match S { [_, rest @ .., _] => rest[0] * 10 + rest[1], _ => 0 }");
+    w.konst("SHORT", "u16", "match S { [_, _, _, _, _, ..] => 1, [_, _, _, _, ..] => 2, _ => 3 }");
+    w.konst("ARR", "u16", "match A { [a, rest @ .., z] => a * 100 + rest[1] * 10 + z }");
+    w.build();
+    assert_eq!(eval_int(&mut w, "FIRST"), Ok(1), "[first, ..]");
+    assert_eq!(eval_int(&mut w, "LAST"), Ok(4), "[.., last]: the last element, not the first");
+    assert_eq!(eval_int(&mut w, "TAIL2"), Ok(34), "[.., y, z]: counted from the end");
+    assert_eq!(eval_int(&mut w, "MID"), Ok(23), "[_, rest @ .., _]: the subslice between");
+    assert_eq!(eval_int(&mut w, "SHORT"), Ok(2), "five fixed elements do not fit four; four with `..` do");
+    assert_eq!(eval_int(&mut w, "ARR"), Ok(134), "[a, rest @ .., z] over [u16; 4]: rest is [u16; 2]");
 }
 
 /// The Reference, "Constant evaluation": a panic during evaluation is a compile error whose

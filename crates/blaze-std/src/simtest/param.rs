@@ -314,6 +314,7 @@ param! {
     crate::args::Args,
     crate::clock::Clock,
     crate::mem::Mem,
+    crate::mem::Heap,
     grant::Spec,
     Dir<ReadOnly>,
     Dir<ReadWrite>,

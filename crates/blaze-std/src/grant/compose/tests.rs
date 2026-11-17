@@ -47,7 +47,7 @@ fn launch<R: crate::entry::Outcome>(
     body: impl FnOnce(&mut crate::grant::Given<'_>) -> Result<R, crate::grant::Refused>,
 ) -> (Status, std::string::String) {
     let mut said = std::string::String::new();
-    let status = launch_in(manifest, Some(fd3), Io::sim(1), &mut said, alloc(), body);
+    let status = launch_in(manifest, Some(fd3), Io::sim(1), &mut said, body);
     (status, said)
 }
 

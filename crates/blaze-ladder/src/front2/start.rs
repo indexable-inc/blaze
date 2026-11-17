@@ -34,7 +34,6 @@ use std::{boxed::Box, string::String};
 
 use blaze_id::ItemKey as LibKey;
 use blaze_own::Alloc;
-use blaze_scope::resolve::Names;
 use blaze_typeck as tc;
 use blaze_typeck::PTy;
 use blaze_unit_graph::StdIs;
@@ -43,9 +42,19 @@ use super::body::BodyError;
 use super::heads::{Store, Want};
 use super::keys::{Keys, checker_of};
 use super::program::Front2Refusal;
+use super::source::NamesSource;
 
 /// The `#[lang = ".."]` name of the library's Rust start (std rt.rs `lang_start`).
 pub const LANG_START: &str = "start";
+
+/// Whether a program crate whose `Implicit::std` is `std` can link a `#[lang = "start"]` at all:
+/// only under Rust's std ([`linked_lang_start`]'s first arm; a blaze edition's `std` is bstd
+/// and its entry is exported, D104). A fact of the package's edition, known before any name
+/// is resolved: `blaze run` reads it to decide, with no names solved, that a blaze-edition
+/// program never needs a process of its own (run.rs `entry_start`).
+pub fn may_link_lang_start(std: StdIs) -> bool {
+    matches!(std, StdIs::Rust)
+}
 
 /// A Rust program's start: `lang_start::<returns>(main as fn() -> returns, argc, argv, 0)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,37 +111,63 @@ impl Entry2 {
 /// - two different items declared `#[lang = "start"]`: [`Front2Refusal::Start`] naming both.
 ///
 /// `alloc` holds the walk's two lists for the call.
-pub fn linked_lang_start(names: &Names<'_>, alloc: Alloc<'_>) -> Result<Option<LibKey>, Front2Refusal> {
-    let crates = names.crates();
-    let Some(root) = crates.first() else { return Ok(None) };
-    if !matches!(root.implicit.std, StdIs::Rust) {
+///
+/// Generic over the names source (D124): `blaze run` asks it over the names records with
+/// nothing solved. It reads crate 0's `Implicit::std`, the crates crate 0 links, each linked
+/// crate's lang rows ([`NamesSource::each_lang`]) and which crate is Rust's `std`; no head, no
+/// body. A fact the source does not answer is [`Front2Refusal::StartFact`].
+///
+/// OWED by front2 source.rs (lane M), two methods this is written against:
+/// - `NamesSource::linked<'a>(self, roots: &[usize], alloc: Alloc<'a>) ->
+///   Option<Result<super::linked::Linked<'a>, super::linked::RootsError>>`: the crates the
+///   programs of `roots` link (linked.rs, the one reading of the link rule). Over the solved
+///   names `Some(Linked::of(self, roots, alloc))`; over records from each crate's externs as
+///   its names record holds them. `None`: not answered (filed in the log).
+/// - `NamesSource::sysroot_std(self) -> Option<Option<usize>>`: the index of Rust's `std` among
+///   the crates, if the program has one. Over the solved names
+///   `Some(self.graph().sysroot().std.map(|s| s.index()))`.
+pub fn linked_lang_start<'n, S: NamesSource<'n>>(names: S, alloc: Alloc<'_>) -> Result<Option<LibKey>, Front2Refusal> {
+    let count = names.crate_count();
+    if count == 0 {
+        return Ok(None);
+    }
+    let std = names.std_is(0).ok_or(Front2Refusal::StartFact { krate: 0, what: "its `Implicit::std`" })?;
+    if !may_link_lang_start(std) {
         return Ok(None);
     }
     // The crates crate 0 links: the one reading of the link rule (linked.rs).
-    let linked = super::linked::Linked::of(names, &[0], alloc).map_err(|e| Front2Refusal::Front(super::FrontError::Roots(e)))?;
-    // The `#[lang = "start"]` items of the linked crates (the names library's `tables.langs`,
-    // as [`super::index::Index::new`] gathers them), in crate order.
+    // OWED: `NamesSource::linked` (above).
+    let linked = names
+        .linked(&[0], alloc)
+        .ok_or(Front2Refusal::StartFact { krate: 0, what: "the crates it links" })?
+        .map_err(|e| Front2Refusal::Front(super::FrontError::Roots(e)))?;
+    // The `#[lang = "start"]` items of the linked crates (each crate's lang rows, as
+    // [`super::index::Index::new`] gathers them), in crate order.
     let mut found: Option<LibKey> = None;
-    for (i, c) in crates.iter().enumerate() {
+    let mut two: Option<(LibKey, LibKey)> = None;
+    for i in 0..count {
         if !linked.links(i) {
             continue;
         }
-        for l in c.tables.langs.iter() {
-            if l.name != LANG_START {
-                continue;
+        names.each_lang(i, &mut |name, key| {
+            if name != LANG_START || two.is_some() {
+                return;
             }
             match found {
-                Some(first) if first != l.key => {
-                    let mut item = shown(names, first);
-                    item.push_str("` and `");
-                    item.push_str(&shown(names, l.key));
-                    return Err(Front2Refusal::Start { item: item.into_boxed_str(), what: "are both declared `#[lang = \"start\"]`" });
-                }
-                _ => found = Some(l.key),
+                Some(first) if first != key => two = Some((first, key)),
+                _ => found = Some(key),
             }
+        });
+        if let Some((first, second)) = two {
+            let mut item = shown(names, first);
+            item.push_str("` and `");
+            item.push_str(&shown(names, second));
+            return Err(Front2Refusal::Start { item: item.into_boxed_str(), what: "are both declared `#[lang = \"start\"]`" });
         }
     }
-    let std_linked = names.graph().sysroot().std.is_some_and(|s| linked.links(s.index()));
+    // OWED: `NamesSource::sysroot_std` (above).
+    let std_index = names.sysroot_std().ok_or(Front2Refusal::StartFact { krate: 0, what: "which crate is Rust's `std`" })?;
+    let std_linked = std_index.is_some_and(|s| linked.links(s));
     match found {
         Some(key) => Ok(Some(key)),
         None if std_linked => Err(Front2Refusal::NoLangStart { shelf: searched(names) }),
@@ -149,7 +184,10 @@ pub fn linked_lang_start(names: &Names<'_>, alloc: Alloc<'_>) -> Result<Option<L
 ///
 /// The signature takes `store` and `keys` beside LADDER.md L1a's `(names, main)`: a `PTy` is an
 /// index into a type table, and only the program's store holds the one the back half reads.
-pub fn rust_start<'n>(names: &'n Names<'n>, lang_start: LibKey, main: LibKey, store: &mut Store<'n>, keys: &mut Keys) -> Result<RustStart, Front2Refusal> {
+///
+/// Generic over the names source: it reads `main`'s head and nothing else (run/special.rs
+/// `roots` asks it over records).
+pub fn rust_start<'n, S: NamesSource<'n>>(names: S, lang_start: LibKey, main: LibKey, store: &mut Store<'n>, keys: &mut Keys) -> Result<RustStart, Front2Refusal> {
     store.ensure(names, keys, Want::Fn(main)).map_err(|error| Front2Refusal::Lower(BodyError::Head { item: main, error }))?;
     let Some(head) = store.fns.get(&checker_of(main)) else {
         return Err(Front2Refusal::NoHead { function: shown(names, main).into_boxed_str() });
@@ -172,25 +210,29 @@ pub fn rust_start<'n>(names: &'n Names<'n>, lang_start: LibKey, main: LibKey, st
 
 /// `lib` for a message: front2 item_shown.rs `ItemShown`, the one printer of an item in a
 /// refusal (its whole path and its key).
-fn shown(names: &Names<'_>, lib: LibKey) -> String {
+fn shown<'n, S: NamesSource<'n>>(names: S, lib: LibKey) -> String {
     super::item_shown::ItemShown::of_lib(names, lib).to_string()
 }
 
-/// The crates looked in for `#[lang = "start"]`: each one's name and root file, in the names
-/// library's order (the program's crate first).
-fn searched(names: &Names<'_>) -> Box<str> {
+/// The crates looked in for `#[lang = "start"]`: each one's path (its root module's, the
+/// crate's name) in the source's order (the program's crate first); a proc-macro unit is
+/// never linked and is left out. A crate whose path the source does not answer is shown by
+/// its index.
+fn searched<'n, S: NamesSource<'n>>(names: S) -> Box<str> {
     let mut out = String::new();
-    for (i, c) in names.crates().iter().enumerate() {
-        if c.implicit.proc_macro {
+    let mut first = true;
+    for i in 0..names.crate_count() {
+        if names.proc_macro(i) == Some(true) {
             continue;
         }
-        if i != 0 {
+        if !first {
             out.push_str(", ");
         }
-        out.push_str(c.name);
-        out.push_str(" (");
-        out.push_str(c.files.first().map_or("no file", |f| f.path));
-        out.push(')');
+        first = false;
+        match names.root_module(i).and_then(|m| names.module_path(m)) {
+            Some(path) => out.push_str(path),
+            None => out.push_str(&std::format!("crate {i}")),
+        }
     }
     out.into_boxed_str()
 }

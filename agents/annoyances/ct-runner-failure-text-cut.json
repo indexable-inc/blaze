@@ -1,0 +1,12 @@
+{
+ "id": "CT-runner-failure-text-cut",
+ "date": "2026-11-17",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane CT",
+ "where": "/Volumes/Projects/blaze-int-1112-notes/runner.py ask",
+ "what": "The ask's output quotes only the first lines of a failing test's panic, so a count assertion whose message puts the profile after a newline (owners_tests.rs:39, store_worktree_tests.rs:200) showed no cause.",
+ "cost": "an edit per test putting the profile rows on the first line and another queued ask (about ten minutes each)",
+ "cause": "the runner trims each failure to its head lines",
+ "workaround": "put the evidence on the assertion message's first line",
+ "fix": "runner.py writes each failed test's whole panic text to a file it names in the ask's output",
+ "state": "open"
+}

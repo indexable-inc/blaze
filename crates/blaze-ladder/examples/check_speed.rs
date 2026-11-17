@@ -90,7 +90,7 @@ struct St<'n> {
 }
 
 impl<'n> St<'n> {
-    fn new(sized: Option<blaze_id::ItemKey>, frame: &'n blaze_mem::Frame) -> St<'n> { St { store: Store::new(sized, frame), buckets: None, consts: Consts::default(), containers: BTreeSet::new(), failed_containers: BTreeSet::new() } }
+    fn new(sized: Option<blaze_id::ItemKey>, frame: &'n blaze_mem::Frame, tables: blaze_own::Alloc<'static>) -> St<'n> { St { store: Store::new(sized, frame, tables), buckets: None, consts: Consts::default(), containers: BTreeSet::new(), failed_containers: BTreeSet::new() } }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -420,6 +420,14 @@ fn pass_lines(label: &str, recs: &[Rec], out: &mut String) {
 }
 
 fn main() {
+    // The program's one allocator, made at its top and handed down: a frame, whose memory comes
+    // from the OS (no global heap). Each worker thread makes its own (below).
+    let held = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the program's frame");
+    let held_erased = blaze_own::Erased::new(&held);
+    let alloc = held_erased.handle();
+    // The store's tables are `'static` (front2 heads.rs `Store::new`), which a frame made here is
+    // not: until a tool's main is handed its heap, the global allocator is the one it can name.
+    let tables = blaze_own::Alloc::global();
     let start = Instant::now();
     let args: Vec<String> = std::env::args().collect();
     let cname = args.get(1).cloned().unwrap_or_else(|| "bstd".to_string());
@@ -445,15 +453,15 @@ fn main() {
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
     let files = [("/hello-world/src/main.rs".to_string(), MAIN.to_string())];
     let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
-    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition };
+    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let crates = inputs.crates();
-    let names: Names<'_> = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let names: Names<'_> = inputs.resolve(&crates, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     out.push_str(&format!("phase names: toolchain opened and names resolved in {} (not the subject)\n", ms(ns(t0))));
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let t0 = Instant::now();
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
-        let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+        let mut front = Front2::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
     out.push_str(&format!("phase front2: Front2::new (keys filed, index) in {}\n", ms(ns(t0))));
     out.push_str(&format!(
         "sync: Names {} send {}; Front2 {} send {}; Store {} send {}; Buckets {} send {}; Consts {} send {}; Prepares {} send {}; Alloc {} send {}\n",
@@ -549,9 +557,9 @@ fn main() {
     out.clear();
 
     // Phase 1: every head of the crate, one shared store.
-    let prepared = Prepares::new_in(Alloc::global());
+    let prepared = Prepares::new_in(alloc);
     let sized = front.index.lang("sized");
-    let mut st = St::new(sized, front.frame);
+    let mut st = St::new(sized, front.frame, tables);
     let kinds_order = ["struct/enum/union", "trait", "trait alias", "impl", "fn", "const", "static", "type alias"];
     let mut by_kind: Vec<(u64, usize, usize)> = vec![(0, 0, 0); kinds_order.len()];
     let t0 = Instant::now();
@@ -648,7 +656,7 @@ fn main() {
     out.push_str("ten slowest checks of pass A (A check, B warm check, bytes, heads made in A; then alone from empty records: lower, check, heads in the store after):\n");
     for &i in idx.iter().take(10) {
         let e = &entries[i];
-        let mut fresh = St::new(sized, front.frame);
+        let mut fresh = St::new(sized, front.frame, tables);
         let f0 = Instant::now();
         let r = one(&names, &mut front, &mut fresh, &prepared, e.target);
         let all = ns(f0);
@@ -691,7 +699,7 @@ fn main() {
     let picks: Vec<(&str, usize)> = [("smallest clean", clean.first().copied()), ("median clean", clean.get(clean.len() / 2).copied())].into_iter().filter_map(|(l, i)| i.map(|i| (l, i))).collect();
     for (label, i) in picks {
         let e = &entries[i];
-        let mut fresh = St::new(sized, front.frame);
+        let mut fresh = St::new(sized, front.frame, tables);
         let f0 = Instant::now();
         let r = one(&names, &mut front, &mut fresh, &prepared, e.target);
         let all = ns(f0);
@@ -707,7 +715,7 @@ fn main() {
             fresh.buckets.is_some(),
             kinds(&fresh.store)
         ));
-        let mut pre = St::new(sized, front.frame);
+        let mut pre = St::new(sized, front.frame, tables);
         pre.buckets = Some(Buckets::new(&names, &front.index));
         let f0 = Instant::now();
         let r2 = one(&names, &mut front, &mut pre, &prepared, e.target);
@@ -756,19 +764,25 @@ fn main() {
                     .map(|t| {
                         s.spawn(move || {
                             let f0 = Instant::now();
+                            // This thread's own allocator, at its top: a frame is not `Sync`, so
+                            // main's cannot be shared.
+                            let held = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the thread's frame");
+                            let held_erased = blaze_own::Erased::new(&held);
+                            let alloc = held_erased.handle();
                             let tc = Toolchain::open(&mut DirShelf::new(shelf_r.clone())).unwrap_or_else(|e| panic!("the toolchain: {e}"));
                             let files = [("/hello-world/src/main.rs".to_string(), MAIN.to_string())];
                             let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
-                            let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition };
+                            let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
                             let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
                             let crates = inputs.crates();
-                            let names: Names<'_> = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+                            let names: Names<'_> = inputs.resolve(&crates, alloc).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
                             let srcs = [SourceFile { path: "src/main.rs", text: MAIN }];
                             let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
-                                let mut fr = Front2::new(&names, &frame, &srcs).unwrap_or_else(|e| panic!("front2: {e}"));
+                                let mut fr = Front2::new(&names, &frame, &srcs, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
                             let front_ns = ns(f0);
-                            let prep = Prepares::new_in(Alloc::global());
-                            let mut st = St::new(fr.index.lang("sized"), fr.frame);
+                            let prep = Prepares::new_in(alloc);
+                            // The handle is not `Send`: each thread names its own, as main does.
+                            let mut st = St::new(fr.index.lang("sized"), fr.frame, blaze_own::Alloc::global());
                             let (mut low, mut chk, mut done) = (0u64, 0u64, 0usize);
                             for (i, (k, name)) in entries_r.iter().enumerate() {
                                 if i % n != t {

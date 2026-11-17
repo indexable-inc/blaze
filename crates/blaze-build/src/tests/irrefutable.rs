@@ -67,7 +67,7 @@ fn let_takes_struct_variant_reference_and_rest_patterns_apart() {
     let start = b.field_inits.len() as u32;
     b.field_inits.push(FieldInit { name: Name::of("a"), expr: one_ });
     b.field_inits.push(FieldInit { name: Name::of("b"), expr: b_init });
-    let s_init = b.e(Expr::Struct { path: s_path, fields: List { start, len: 2 }, base: None });
+    let s_init = b.e(Expr::Struct { path: s_path, fields: List { start, len: 2 }, base: blaze_typeck::StructBase::None });
     stmts.push(let_stmt(s, s_init));
 
     // let S { a, b: (c, _) } = s;
@@ -140,4 +140,82 @@ fn let_takes_struct_variant_reference_and_rest_patterns_apart() {
     let root = b.block(&stmts, Some(sum));
     let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(run_native(&[(MAIN, &built)]), 1_245_679);
+}
+
+/// `name(v)` bound by `let name(x) = <its value>;`: the binding.
+fn let_variant(b: &mut BodyBuf, stmts: &mut Vec<Stmt, Global>, name: &str, v: u128) -> PatId {
+    let local = b.bind("r");
+    let lit = u32_lit(b, v);
+    let init = b.call(name, &[lit]);
+    stmts.push(let_stmt(local, init));
+    let x = plain(b, "x");
+    let path = b.path(name);
+    let xs = b.pats_list(&[x]);
+    let pat = b.pat(Pat::TupleStruct { path, elems: xs, rest: None });
+    let use_ = b.local(local);
+    stmts.push(let_stmt(pat, use_));
+    x
+}
+
+/// The Reference, "Patterns", "Refutability", with empty types: a variant pattern is
+/// irrefutable when every other variant of its enum is uninhabited, so `let Ok(x) = r;` over
+/// `Result<T, Infallible>` is plain Rust (hybrid-array's `Array::from_fn`: `let Ok(ret) =
+/// Self::try_from_fn::<Infallible>(..);`, 58 refusals in tempo's census of 04:02). Three
+/// shapes of the other variants: one holding the empty enum alone (a variant the layout drops,
+/// the enum laid out as its one present variant), one holding a `u32` beside it (present, with
+/// bytes, still no value), one holding a tuple holding it (empty through a tuple).
+/// ```text
+/// enum Never {}
+/// enum R { O(u32), E(Never) }
+/// enum S { Q(u32), F(u32, Never), T((u32, Never)) }
+/// fn main() -> u32 {
+///     let r = O(7); let O(x) = r;          // 7
+///     let s = Q(8); let Q(y) = s;          // 8
+///     x * 10 + y
+/// }
+/// ```
+/// Expected: 78. The control: `enum H { Y(u32), Z(u32) }`, `let Y(z) = Y(5);` stays refused
+/// by name (refutable: its `Z` has values). `cargo test -p blaze-build irrefutable` prints
+/// `test tests::irrefutable::let_takes_a_variant_whose_other_variants_are_uninhabited ... ok`.
+/// Before: the first `let` refused with "pattern N: a variant pattern of an enum of more than
+/// one variant in a `let` or parameter pattern (refutable: a `let` needs `else`)".
+#[test]
+fn let_takes_a_variant_whose_other_variants_are_uninhabited() {
+    let mut w = TestWorld::new();
+    w.func(1, "main", &[], U32);
+    w.enum_(200, &[]);
+    let never = PNode::Adt(ItemKey(200), List::EMPTY);
+    let with_never = w.tuple(&[U32, never]);
+    w.enum_(210, &[("O", CtorKind::Tuple, &[("0", U32)]), ("E", CtorKind::Tuple, &[("0", never)])]);
+    w.enum_(
+        220,
+        &[
+            ("Q", CtorKind::Tuple, &[("0", U32)]),
+            ("F", CtorKind::Tuple, &[("0", U32), ("1", never)]),
+            ("T", CtorKind::Tuple, &[("0", with_never)]),
+        ],
+    );
+    w.enum_(230, &[("Y", CtorKind::Tuple, &[("0", U32)]), ("Z", CtorKind::Tuple, &[("0", U32)])]);
+
+    let mut b = BodyBuf::new();
+    let mut stmts: Vec<Stmt, Global> = Vec::new_in(Global);
+    let x = let_variant(&mut b, &mut stmts, "O", 7);
+    let y = let_variant(&mut b, &mut stmts, "Q", 8);
+    let xv = b.local(x);
+    let ten = u32_lit(&mut b, 10);
+    let tens = b.bin(BinOp::Mul, xv, ten);
+    let yv = b.local(y);
+    let sum = b.bin(BinOp::Add, tens, yv);
+    let root = b.block(&stmts, Some(sum));
+    let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(run_native(&[(MAIN, &built)]), 78);
+
+    // The control: an enum whose other variant has values.
+    let mut b = BodyBuf::new();
+    let mut stmts: Vec<Stmt, Global> = Vec::new_in(Global);
+    let z = let_variant(&mut b, &mut stmts, "Y", 5);
+    let zv = b.local(z);
+    let root = b.block(&stmts, Some(zv));
+    let refused = build(&w, &b, root).err().unwrap_or_default();
+    assert!(refused.contains("a variant pattern of an enum of more than one variant"), "the refutable `let` was not refused: {refused:?}");
 }

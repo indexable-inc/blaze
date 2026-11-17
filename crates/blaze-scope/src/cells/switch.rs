@@ -116,8 +116,15 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
     added_externs.extend(c.outer.added.iter().map(|(&name, &root)| (name, root)));
     // D116: every cell decided again on demand over the frozen tables, after the scopes are
     // written (it leaves `c` re-decided; nothing reads `c` after it).
+    // D116 point 7: the records at module grain against the written scopes, before `decide`
+    // re-decides `c`.
+    let links = check.map(|_| c.links_agree(alloc, alloc));
     let decide = match check {
-        Some(now) => Some(super::decide::check(&mut c, now, alloc).map_err(Unwritten::Decide)?),
+        Some(now) => {
+            let mut d = super::decide::check(&mut c, now, alloc).map_err(Unwritten::Decide)?;
+            d.links = links;
+            Some(d)
+        }
         None => None,
     };
     Ok(Solved { done, added_externs, decide })

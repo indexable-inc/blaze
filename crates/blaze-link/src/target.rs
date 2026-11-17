@@ -1793,11 +1793,11 @@ struct Line<'a> {
     found: &'a Found,
     out: Vec<Located>,
     /// Each search directory's entry names, read once per link ([`listing`]).
-    listings: RefCell<HashMap<PathBuf, Option<Listing>, Global>>,
+    listings: RefCell<Map<PathBuf, Option<Listing>, FixedState, Global>>,
 }
 
 /// A directory's entry names, ASCII lowercased.
-type Listing = HashSet<Box<[u8]>, Global>;
+type Listing = Set<Box<[u8]>, FixedState, Global>;
 
 /// The entry names of `dir`, ASCII lowercased; none when it or an entry can't be read, which
 /// leaves every name of it to a stat, as a directory that can be searched but not listed is.

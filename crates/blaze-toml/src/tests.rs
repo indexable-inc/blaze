@@ -717,3 +717,24 @@ fn the_oracle_catches_a_short_body_end() {
     let run = |tape: &Tape, p: Plant| plant::with(p, || round_trip(tape));
     blaze_sim::control(Config::cases(400), Plant::Clean, Plant::BodyEndShort, "setting", run);
 }
+
+/// Every allocation and growth a manifest's parse makes (its node columns, its string arena,
+/// its datetimes), refused one at a time, comes back as the parse's own `What::Memory` error
+/// with nothing left live: never a panic. tempo's `blaze check` (2026-11-17) died in this parse
+/// when the allocator it was handed was full; the caller's job must fail, by the manifest's
+/// name, and the process go on (rule 20). Prints nothing when it passes; a wrong parse prints
+/// the run that broke it, e.g. "with allocation or growth #3 refused the run still succeeded:
+/// the refusal was swallowed", or the panic "a refused allocation read as another error: ...".
+#[test]
+fn every_refused_allocation_is_the_documents_memory_error() {
+    let text = "[package]\nname = \"big\"\nversion = \"0.1.0\"\nauthors = [\"a\\tb\", 'c', '''d''']\nwhen = 1979-05-27T07:32:00Z\n\n[dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\n\n[[bin]]\nname = \"x\\u00e9\"\n";
+    let events = blaze_own::testing::every_failure(&Global, |alloc| match Document::parse_in(text, Limits::CARGO, alloc) {
+        Ok(doc) => Ok(doc.nodes.len()),
+        Err(Error { what: What::Memory(_), .. }) => Err("the document's memory error"),
+        Err(other) => panic!("a refused allocation read as another error: {}", other.display(text)),
+    });
+    match events {
+        Ok(events) => assert!(events >= 3, "the parse asked for {events} allocations: its columns, arena and datetimes are three at least"),
+        Err(broke) => panic!("{broke}"),
+    }
+}

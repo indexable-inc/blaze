@@ -29,7 +29,7 @@ use crate::{
     spec::{CloneSlice, Find},
 };
 
-/// A growable array of `T` in `A`.
+/// A growable array of `T` in `A`: one block; index and push O(1), a push past capacity copies every value once into a block twice the size.
 ///
 /// # Invariants
 ///

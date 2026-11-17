@@ -36,7 +36,7 @@ use std::{
     },
 };
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 
 use crate::{Cache, FileName, fs, lock::Lock};
 
@@ -68,7 +68,7 @@ pub(crate) struct Descriptors {
 struct Kept {
     /// One descriptor a name and cache mode: `F_NOCACHE` (macOS) and `O_DIRECT` (Linux) are the
     /// descriptor's, so a bypassing read never shares a cached one.
-    files: HashMap<(FileName, Cache), Entry, Global>,
+    files: Map<(FileName, Cache), Entry, FixedState, Global>,
     /// Counts the reads, for which descriptor was read last.
     clock: u64,
 }
@@ -100,7 +100,7 @@ impl Descriptors {
                 "core.descriptors",
                 // Empty until the first read: a driver whose reads are elsewhere (io_uring's, on
                 // its ring) allocates nothing for it.
-                Kept { files: HashMap::new_in(Global), clock: 0 },
+                Kept { files: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }), clock: 0 },
             ),
             bound,
             opened: AtomicU64::new(0),

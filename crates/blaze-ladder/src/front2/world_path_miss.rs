@@ -19,7 +19,7 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
     /// The miss for the library's refusal `e` of `rest` (read at `module`, from the crate's
     /// root when `abs`), where `rest[0]` is segment `lead` of the path as read and the written
     /// path's segment `i` is segment `i + shift` of it (`shift` > 0: a `use` or glob in front).
-    pub(super) fn path_miss(&self, module: LibKey, abs: bool, rest: &[&str], lead: u32, shift: u32, e: PathError) -> Fetch<PathAnswer> {
+    pub(super) fn path_miss(&self, module: LibKey, dollar: Option<blaze_id::CrateItemKey>, abs: bool, rest: &[&str], lead: u32, shift: u32, e: PathError) -> Fetch<PathAnswer> {
         let why = match e.why {
             Why::NotFound => MissWhy::NotFound,
             Why::Private => MissWhy::Private,
@@ -45,7 +45,7 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
         // What the segments before the failing one named: the same prefix, read again (only on
         // this error's path), in the type namespace a prefix is read in.
         let Some(prefix) = rest.get(..at as usize) else { return Ok(Err(PathMiss::At { segment, after: None, why })) };
-        let target = match self.resolver().path(module, abs, prefix, Ns::Type) {
+        let target = match self.resolver().path_with(module, dollar, abs, prefix, Ns::Type) {
             Ok(t) => t,
             Err(err) => return self.gap(Gap::Resolve(err)),
         };

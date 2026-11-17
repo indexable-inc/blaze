@@ -41,7 +41,7 @@
 use blaze_id::ItemKey as LibKey;
 use blaze_own::{AVec, Alloc};
 use blaze_scope::names::{Why as PathWhy, Written};
-use blaze_scope::task::{DOLLAR_CRATE, to_path};
+use blaze_scope::task::to_path;
 use blaze_surface::{DefKind, Edition, Namespace, PathKind};
 use blaze_typeck::ItemKey;
 
@@ -165,7 +165,7 @@ fn prelude_rank(e: Edition) -> u8 {
 
 /// Whether `segment` is a path head the names library reads itself.
 fn is_head(segment: &str) -> bool {
-    matches!(segment, "self" | "super" | "crate" | "$crate") || segment.starts_with(DOLLAR_CRATE)
+    matches!(segment, "self" | "super" | "crate" | "$crate")
 }
 
 /// Where a body is, for reading its blocks' imports.
@@ -194,6 +194,9 @@ impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
         let mut abs = row.abs;
         let mut path: AVec<'_, &str> = AVec::new_in(alloc.clone());
         path.extend_from_slice(row.path);
+        // Where the path is walked: the body's module, or the block module of the block `mod`
+        // or `extern crate` its first segment names (the scope table's, `Row::module`).
+        let mut at = self.module;
         let mut steps = 0u32;
         loop {
             let first = match path.first() {
@@ -220,10 +223,16 @@ impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
                 // A block's type: only its variants are under it, never a trait. A block's
                 // trait: `use Tr as _;` names it, and it is in scope here already (its block
                 // is this row's or one around it: [`Self::declared`]); its associated items
-                // are no traits. A block's `mod` or `extern crate` may hold a trait: the path
-                // would be read at the block's module, which this reader does not do yet:
-                // refused by name, never dropped.
-                LocalKind::Mod | LocalKind::ExternCrate => return Err(LocalGap { item: local.key, form: THROUGH_LOCAL, range: row.range }),
+                // are no traits. A block's `mod` or `extern crate` may hold a trait: the path is
+                // walked at the block's module, where it is an item (super::scope_table); one
+                // whose block the library filed no module for is refused by name.
+                LocalKind::Mod | LocalKind::ExternCrate => match local.module {
+                    Some(m) => {
+                        at = m;
+                        break;
+                    }
+                    None => return Err(LocalGap { item: local.key, form: local.kind.unplaced(), range: row.range }),
+                },
                 k if k.in_block_module() => return Ok(()),
                 _ => return Err(LocalGap { item: local.key, form: THROUGH_LOCAL, range: row.range }),
             }
@@ -233,10 +242,10 @@ impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
         let written = to_path(abs, &path, krate_key, alloc.clone());
         let w = Written { kind: written.kind, segments: &written.segments };
         if row.name == GLOB {
-            return self.glob(row, w, krate, out, alloc);
+            return self.glob(row, w, krate, at, out, alloc);
         }
         let len = w.segments.len();
-        match self.names.walk(self.module, Namespace::Types, w) {
+        match self.names.walk(at, Namespace::Types, w) {
             Ok(r) if r.consumed == len => match r.def.kind {
                 DefKind::Trait => out.push(checker_of(r.def.key)),
                 DefKind::Other => {
@@ -251,8 +260,8 @@ impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
             Ok(_) => return Err(Self::gap(row, PARTIAL)),
             // No type of the name: a fn, a const, a macro (`use tracing::info;`) brings no trait.
             Err(e) if e.why == PathWhy::NotFound && e.at + 1 == len => {
-                let value = self.names.walk(self.module, Namespace::Values, w).is_ok_and(|r| r.consumed == len);
-                if !value && !self.names.walk(self.module, Namespace::Macros, w).is_ok_and(|r| r.consumed == len) {
+                let value = self.names.walk(at, Namespace::Values, w).is_ok_and(|r| r.consumed == len);
+                if !value && !self.names.walk(at, Namespace::Macros, w).is_ok_and(|r| r.consumed == len) {
                     return Err(Self::gap(row, UNRESOLVED));
                 }
             }
@@ -290,7 +299,7 @@ impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
     }
 
     /// The traits a glob row `use <w>::*;` brings into scope.
-    fn glob(&self, row: &Row<'n>, w: Written<'_, &str>, krate: usize, out: &mut AVec<'_, ItemKey>, alloc: Alloc<'_>) -> Result<(), LocalGap> {
+    fn glob(&self, row: &Row<'n>, w: Written<'_, &str>, krate: usize, at: LibKey, out: &mut AVec<'_, ItemKey>, alloc: Alloc<'_>) -> Result<(), LocalGap> {
         let target = if w.segments.is_empty() {
             // `self::*`, `super::*`, `crate::*`: the module the head names. `self` and `super`
             // as the names library reads a path's head: a block's module is passed over (the
@@ -303,7 +312,7 @@ impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
             }
         } else {
             let len = w.segments.len();
-            match self.names.walk(self.module, Namespace::Types, w) {
+            match self.names.walk(at, Namespace::Types, w) {
                 Ok(r) if r.consumed == len => match r.def.kind {
                     DefKind::Module => r.def.key,
                     DefKind::Enum => return Ok(()),

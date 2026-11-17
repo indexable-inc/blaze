@@ -15,7 +15,7 @@ doctest = false
 
 [dependencies]
 # Linked only (`use llvm_sys as _;`): vendor/llvm-sys's build script links the pinned LLVM 23.1.4
-# (crates/hir-ty-codegen/llvm.json, `LLVM_SYS_231_PREFIX`) and blaze's wrappers
+# (crates/blaze-toolchain/pins/llvm.json, `LLVM_SYS_231_PREFIX`) and blaze's wrappers
 # (wrappers/passes.cpp, which holds the remark stream's three functions: see
 # wiring/llvm-sys/blaze-llvm-remarks-1.md). Every function this crate calls it declares itself
 # (src/ffi.rs).

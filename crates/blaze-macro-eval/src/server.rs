@@ -12,7 +12,7 @@
 use std::{fmt::Write as _, ops::Bound};
 
 use base_db::Db;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_memo::ArenaId;
 use blaze_lower::{SubRequest, SubResponse};
 use intern::Symbol;
@@ -126,7 +126,7 @@ pub(crate) struct Server {
     /// `streams[h - 1]` is the stream of handle `h`, `None` once the client took it.
     streams: Vec<Option<Stream>>,
     spans: Vec<Span>,
-    span_handles: HashMap<Span, u32, Global>,
+    span_handles: Map<Span, u32, FixedState, Global>,
     /// `Span::save_span`'s, by the index it gave.
     saved: Vec<Span>,
     /// The def, call and mixed sites.
@@ -291,7 +291,7 @@ impl Server {
             // alloc: once per expansion, its tables, which grow with what it builds
             streams: Vec::new(),
             spans: Vec::new(), // alloc: once per expansion, as above
-            span_handles: HashMap::new_in(Global),
+            span_handles: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }),
             saved: Vec::new(), // alloc: once per expansion, as above
             sites,
             contexts,

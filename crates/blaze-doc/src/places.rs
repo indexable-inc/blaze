@@ -65,9 +65,9 @@ pub(crate) struct Places {
     pub(crate) crates: Vec<Documented>,
     /// Each crate's placements; `[0]` is its root module.
     pub(crate) placed: Vec<Vec<Placed>>,
-    canonical: HashMap<ModuleDef, (usize, usize), Global>,
+    canonical: Map<ModuleDef, (usize, usize), FixedState, Global>,
     /// Each crate's own page of the items it places, inlined ones of other crates included.
-    own: Vec<HashMap<ModuleDef, usize, Global>>,
+    own: Vec<Map<ModuleDef, usize, FixedState, Global>>,
     /// The page of an item of a crate not documented here, found once: on doc.rust-lang.org for
     /// the sysroot's crates, under its `html_root_url` for a crate that has one.
     elsewhere: SharedMap<ModuleDef, Option<ItemRef>, Global>,
@@ -446,11 +446,11 @@ pub(crate) fn place(db: &Db, crates: Vec<Documented>, test_only: TestOnly) -> Pl
     let placed: Vec<Vec<Placed>> = base_db::par_map(crates.len(), |at| {
         blaze_memo::attach(db, || Walker::new(db, &crates[at]).walk())
     });
-    let mut canonical: HashMap<ModuleDef, ((u8, usize), (usize, usize)), Global> =
-        HashMap::new_in(Global);
-    let mut own: Vec<HashMap<ModuleDef, usize, Global>> = vec![];
+    let mut canonical: Map<ModuleDef, ((u8, usize), (usize, usize)), FixedState, Global> =
+        Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
+    let mut own: Vec<Map<ModuleDef, usize, FixedState, Global>> = vec![];
     for (krate, list) in placed.iter().enumerate() {
-        let mut here: HashMap<ModuleDef, ((u8, usize), usize), Global> = HashMap::new_in(Global);
+        let mut here: Map<ModuleDef, ((u8, usize), usize), FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
         for (at, placed) in list.iter().enumerate() {
             let own = krate_of(db, placed.def) == Some(crates[krate].krate);
             let rank = match (own, placed.via.is_none()) {
@@ -494,7 +494,7 @@ struct Walker<'a> {
     private: bool,
     out: Vec<Placed>,
     /// Modules being walked, so a module that re-exports its parent does not loop.
-    walking: HashSet<Module, Global>,
+    walking: Set<Module, FixedState, Global>,
 }
 
 impl<'a> Walker<'a> {
@@ -504,7 +504,7 @@ impl<'a> Walker<'a> {
             krate: documented.krate,
             private: documented.private,
             out: vec![],
-            walking: HashSet::new_in(Global),
+            walking: Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None }),
         }
     }
 
@@ -564,7 +564,7 @@ impl<'a> Walker<'a> {
         let db = self.db;
         let id: hir_def::ModuleId = module.into();
         let scope = id.def_map(db).module(db, id).scope(db);
-        let mut seen_globs = HashSet::new_in(Global);
+        let mut seen_globs = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
         let entries: Vec<(hir::Name, PerNs)> =
             scope.entries().map(|(name, per_ns)| (name.clone(), per_ns)).collect();
         for (name, per_ns) in entries {
@@ -593,7 +593,7 @@ impl<'a> Walker<'a> {
                     item.vis == hir_def::visibility::Visibility::Public,
                 ));
             }
-            let mut done: HashSet<ModuleDef, Global> = HashSet::new_in(Global);
+            let mut done: Set<ModuleDef, FixedState, Global> = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
             for (def, import, public) in defs {
                 if !done.insert(def) {
                     continue;
@@ -615,7 +615,7 @@ impl<'a> Walker<'a> {
         def: ModuleDef,
         import: Option<ImportOrExternCrate>,
         public: bool,
-        seen_globs: &mut HashSet<hir_def::item_scope::GlobId, Global>,
+        seen_globs: &mut Set<hir_def::item_scope::GlobId, FixedState, Global>,
     ) {
         let db = self.db;
         if matches!(def, ModuleDef::BuiltinType(_) | ModuleDef::EnumVariant(_)) {
@@ -864,8 +864,8 @@ impl UseAttrs {
 impl Places {
     /// The crates a documented crate's docs may link to and list impls from: itself and every
     /// crate it depends on, directly or not, but for its tests alone.
-    pub(crate) fn upstream(&self, db: &Db, krate: Crate) -> HashSet<Crate, Global> {
-        let mut seen = HashSet::new_in(Global);
+    pub(crate) fn upstream(&self, db: &Db, krate: Crate) -> Set<Crate, FixedState, Global> {
+        let mut seen = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
         let mut stack = vec![krate];
         while let Some(it) = stack.pop() {
             if seen.insert(it) {
@@ -885,8 +885,8 @@ impl Places {
     /// compiler's own. Of the sysroot's crates, which rust-analyzer makes dependencies of every
     /// crate, `core` is linked; `std` and `alloc` unless the crate is `#![no_std]`, `proc_macro`
     /// for a crate of procedural macros, and any of them the crate names with `extern crate`.
-    pub(crate) fn linked(&self, db: &Db, krate: Crate) -> HashSet<Crate, Global> {
-        let mut seen = HashSet::new_in(Global);
+    pub(crate) fn linked(&self, db: &Db, krate: Crate) -> Set<Crate, FixedState, Global> {
+        let mut seen = Set::new(SetOpts { hasher: FixedState, alloc: Global, capacity: None });
         let mut stack = vec![krate];
         while let Some(it) = stack.pop() {
             if !seen.insert(it) {

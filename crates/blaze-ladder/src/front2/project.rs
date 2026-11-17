@@ -67,6 +67,19 @@ pub struct BodyDiagnostic<'a> {
     pub end: u32,
 }
 
+/// A finding of a typed lint in a body (blaze-typeck `TypedFinding`, `args-inline` the first):
+/// no error of the program's types; its level is the configuration's, at print time (rule 81).
+#[derive(Debug)]
+pub struct BodyLintFinding<'a> {
+    /// The lint's name (blaze-lint `Rule::name`'s spelling: `args-inline`).
+    pub lint: &'static str,
+    /// The whole message, naming the item it is about (rule 19).
+    pub text: AString<'a>,
+    /// Item-relative (rule 71).
+    pub start: u32,
+    pub end: u32,
+}
+
 /// Why a body was not checked to its end: each a refusal, never a pass.
 #[derive(Debug)]
 pub enum Refused {
@@ -113,6 +126,9 @@ impl Refused {
 pub struct BodyVerdict<'a> {
     /// The program's errors, sorted by range.
     pub diagnostics: AVec<'a, BodyDiagnostic<'a>>,
+    /// The typed lints' findings of a check that finished, sorted by range; none of them makes
+    /// the body unclean ([`BodyVerdict::is_clean`]).
+    pub findings: AVec<'a, BodyLintFinding<'a>>,
     /// The questions the world could not answer yet, each typed (the body is then not checked).
     pub gaps: AVec<'a, Gap>,
     /// The one refusal that stopped the body, if any.
@@ -154,10 +170,11 @@ pub struct ProjectWorld<'n, S = &'n Names<'n>> {
 
 impl<'n> ProjectWorld<'n> {
     /// The world over `names` (the program's crate at index 0, its files `user`), its frame
-    /// the caller's, alive for the command.
-    pub fn new(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], alloc: Alloc<'n>) -> Result<ProjectWorld<'n>, FrontError> {
-        let front = Front2::new(names, frame, user)?;
-        let mut store = Store::new(front.index.lang("sized"), frame);
+    /// the caller's, alive for the command; `alloc` is `'static` because the head store's
+    /// tables are (`Store::new`).
+    pub fn new(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], alloc: Alloc<'static>) -> Result<ProjectWorld<'n>, FrontError> {
+        let front = Front2::new(names, frame, user, alloc)?;
+        let mut store = Store::new(front.index.lang("sized"), frame, alloc);
         store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
         Ok(ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(alloc), alloc, by_chain: None })
     }
@@ -168,9 +185,9 @@ impl<'n> ProjectWorld<'n, &'n source::Records<'n>> {
     /// crate at index 0): `Front2::from_records`, which reads only the lang rows of
     /// `lang_crates`. What a record could not answer is in `records.errors()`: read it after
     /// each body, a verdict over a log that is not empty is void.
-    pub fn from_records(records: &'n source::Records<'n>, frame: &'n blaze_mem::Frame, lang_crates: &[usize], alloc: Alloc<'n>) -> Result<ProjectWorld<'n, &'n source::Records<'n>>, FrontError> {
+    pub fn from_records(records: &'n source::Records<'n>, frame: &'n blaze_mem::Frame, lang_crates: &[usize], alloc: Alloc<'static>) -> Result<ProjectWorld<'n, &'n source::Records<'n>>, FrontError> {
         let front = Front2::from_records(records, frame, lang_crates)?;
-        let mut store = Store::new(front.index.lang("sized"), frame);
+        let mut store = Store::new(front.index.lang("sized"), frame, alloc);
         store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
         Ok(ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(alloc), alloc, by_chain: None })
     }
@@ -244,7 +261,7 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         F: FnOnce(&mut Records<'_, 'n, S>, &Body<'n>, &blaze_typeck::Checked<'static>),
     {
         let mut verdict =
-            BodyVerdict { diagnostics: AVec::new_in(alloc), gaps: AVec::new_in(alloc), refused: None, reads: None, facts: Ok(BodyReads::not_checked(alloc)) };
+            BodyVerdict { diagnostics: AVec::new_in(alloc), findings: AVec::new_in(alloc), gaps: AVec::new_in(alloc), refused: None, reads: None, facts: Ok(BodyReads::not_checked(alloc)) };
         let prepared = self.prepared;
         let mut r = Records {
             names: self.front.names,
@@ -303,6 +320,9 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
                 for d in done.diags.iter() {
                     verdict.diagnostics.push(BodyDiagnostic { code: d.code.code(), text: AString::new_in(alloc), start: d.at.start, end: d.at.end });
                 }
+                for f in done.findings.iter() {
+                    verdict.findings.push(lint_finding(&r, f, alloc));
+                }
                 then(&mut r, &lowered, &done);
             }
             Err(CheckFail::Diags { diags, .. }) => {
@@ -320,6 +340,25 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         verdict.diagnostics.sort_by_key(|d| (d.start, d.end, d.code));
         verdict
     }
+}
+
+/// A typed lint's finding with its words, the struct named by its path (rule 19).
+fn lint_finding<'a, 'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, f: &blaze_typeck::TypedFinding, alloc: Alloc<'a>) -> BodyLintFinding<'a> {
+    let at = f.at();
+    let mut text = AString::new_in(alloc);
+    match *f {
+        blaze_typeck::TypedFinding::ArgsInline { misuse, adt, .. } => {
+            let shown = super::item_shown::ItemShown::of(r.names, &*r.keys, adt);
+            text.push_str("`");
+            match shown.path() {
+                Some(path) => text.push_str(path),
+                None => text.push_str(&shown.boxed()),
+            }
+            text.push_str("` is an options struct (`#[blaze::args]`), a call's named arguments and nothing else: it ");
+            text.push_str(misuse.says());
+        }
+    }
+    BodyLintFinding { lint: f.lint(), text, start: at.start, end: at.end }
 }
 
 /// Lowers `body` by [`lower_made`] (each head and constant its lowering needs made first); a

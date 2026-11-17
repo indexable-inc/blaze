@@ -35,7 +35,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_mem::{MemError, Slab, Tag as MemTag};
 use crate::chan::{Receiver, SendTimeoutError, Sender};
 use std::alloc::Global;
@@ -398,7 +398,7 @@ impl<T> LazySlab<T> {
 }
 
 /// `tags`, made at [`TAGS`] at its first use and grown past that only as a table grows.
-fn first_use<V>(tags: &mut HashMap<Tag, V, Global>) -> &mut HashMap<Tag, V, Global> {
+fn first_use<V>(tags: &mut Map<Tag, V, FixedState, Global>) -> &mut Map<Tag, V, FixedState, Global> {
     if tags.capacity() == 0 {
         // alloc: once per driver and table, at its first tag.
         tags.reserve(TAGS);
@@ -447,15 +447,15 @@ pub struct Kqueue {
     /// (`LazySlab`'s reason).
     timers: Option<Wheel<Tag>>,
     watches: LazySlab<fsevents::Watch<Watched>>,
-    watch_tags: HashMap<Tag, WatchId, Global>,
+    watch_tags: Map<Tag, WatchId, FixedState, Global>,
     /// Stopped, for the next watch.
     spare: Vec<fsevents::Watch<Watched>>,
     /// The flushes a stopping watch had not told.
     untold: Vec<Tag>,
     spawns: LazySlab<Spawned>,
-    spawn_tags: HashMap<Tag, SpawnId, Global>,
+    spawn_tags: Map<Tag, SpawnId, FixedState, Global>,
     listens: LazySlab<Listening>,
-    listen_tags: HashMap<Tag, ListenId, Global>,
+    listen_tags: Map<Tag, ListenId, FixedState, Global>,
     connecting: LazySlab<Connecting>,
     conns: LazySlab<Connection>,
     /// The file locks of [`Effect::Lock`], each taken as it is asked for.
@@ -532,8 +532,8 @@ impl Kqueue {
         // their first use, then made at their usual most at once (`LazySlab`'s reason: a
         // program that never watches, spawns or listens dirties none of their pages; measured
         // 2026-11-16, hello's footprint at exit).
-        fn tags<V>() -> HashMap<Tag, V, Global> {
-            HashMap::new_in(Global)
+        fn tags<V>() -> Map<Tag, V, FixedState, Global> {
+            Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None })
         }
         let spawn_dirs = root.join(".blaze-spawn"); // alloc: setup, once per driver.
         Ok(Kqueue {
@@ -2602,7 +2602,7 @@ mod tests {
     /// trigger's, never reused.
     struct OldOwners {
         next: u64,
-        owners: HashMap<u64, Owner, Global>,
+        owners: Map<u64, Owner, FixedState, Global>,
     }
 
     impl OldOwners {
@@ -2644,7 +2644,7 @@ mod tests {
         for seed in 0..300 {
             let mut rng = Rng::new(seed);
             let mut owners = Owners::new().unwrap();
-            let mut old = OldOwners { next: TRIGGER + 1, owners: HashMap::new_in(Global) };
+            let mut old = OldOwners { next: TRIGGER + 1, owners: Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None }) };
             // Each registration made: its id in each, and whether it is live.
             let mut made: Vec<(u64, u64, bool)> = Vec::new();
             for _ in 0..500 {

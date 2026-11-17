@@ -194,7 +194,7 @@ impl Scope {
 pub(super) fn check(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<Found> {
     // alloc: empty, allocates nothing until a conflict
     let mut found = Vec::new();
-    let mut seen: HashMap<String, InFile<TextRange>, Global> = HashMap::new_in(Global);
+    let mut seen: Map<String, InFile<TextRange>, FixedState, Global> = Map::new(MapOpts { hasher: FixedState, alloc: Global, capacity: None });
     let Some(&first) = scopes.first() else { return found };
     let root = cx.krate.root_module(cx.db);
     let extern_prelude = ExternPrelude::of(cx, root);
@@ -218,12 +218,12 @@ pub(super) fn check(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<Found> {
 
 /// The names of the crate's extern prelude, with whether an `extern crate` item put each there.
 struct ExternPrelude {
-    names: HashMap<String, bool, Global>,
+    names: Map<String, bool, FixedState, Global>,
 }
 
 impl ExternPrelude {
     fn of(cx: &Cx<'_, '_>, root: hir::Module) -> ExternPrelude {
-        let mut names: HashMap<String, bool, Global> = cx
+        let mut names: Map<String, bool, FixedState, Global> = cx
             .krate
             .dependencies_iter(cx.db)
             // alloc: setup, once per check: the crate's dependencies
@@ -255,7 +255,7 @@ fn plant(
     cx: &Cx<'_, '_>,
     scope: &mut Scope,
     extern_prelude: &ExternPrelude,
-    seen: &mut HashMap<String, InFile<TextRange>, Global>,
+    seen: &mut Map<String, InFile<TextRange>, FixedState, Global>,
     found: &mut Vec<Found>,
 ) {
     let mut planted = std::mem::take(&mut scope.planted);

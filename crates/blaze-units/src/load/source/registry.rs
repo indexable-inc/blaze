@@ -10,11 +10,11 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use anyhow::bail;
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, Map, MapOpts};
 use blaze_query::{Cancelled, Cx};
 use blaze_resolve::{
-    Dependency, IndexSummary, MemRegistry, OptVersionReq, QueryKind, Registry, SourceId,
-    query_pinned,
+    Dependency, IndexSummary, Lookup, MemRegistry, OptVersionReq, QueryKind, Registry,
+    ResolveError, SourceId, query_pinned,
 };
 use std::alloc::Global;
 
@@ -33,7 +33,7 @@ pub(crate) struct Index<'s, 'c, 'db> {
     cx: RefCell<&'c mut Cx<'db>>,
     pinned: MemRegistry,
     /// Each index file read, by its registry and the name asked for.
-    files: RefCell<HashMap<SourceId, HashMap<String, Rc<Lines>, Global>, Global>>,
+    files: RefCell<Map<SourceId, HashMap<String, Rc<Lines>, Global>, FixedState, Global>>,
     needs: RefCell<Vec<Fetch>>,
     cancelled: Cell<bool>,
 }
@@ -194,21 +194,24 @@ impl<'s, 'c, 'db> Index<'s, 'c, 'db> {
 }
 
 impl Registry for Index<'_, '_, '_> {
-    async fn query(
+    fn query(
         &self,
         dep: &Dependency,
         kind: QueryKind,
         f: &mut impl FnMut(IndexSummary),
-    ) -> anyhow::Result<()> {
+    ) -> Result<Lookup, ResolveError> {
         let source = dep.source_id();
-        let registry = self.sources.registry_of(source)?;
+        let registry = self.sources.registry_of(source).map_err(registry_error)?;
         let describe = |it: SourceId| self.describe_source(it);
-        if query_pinned(&self.pinned, registry.is_some(), dep, kind, f, describe).await? {
-            return Ok(());
+        if query_pinned(&self.pinned, registry.is_some(), dep, kind, f, describe)? {
+            return Ok(Lookup::Answered(()));
         }
         match registry {
-            Some(from) => self.query_registry(dep, kind, source, from, f),
-            None => self.pinned.query(dep, kind, f).await,
+            Some(from) => self
+                .query_registry(dep, kind, source, from, f)
+                .map(|()| Lookup::Answered(()))
+                .map_err(registry_error),
+            None => self.pinned.query(dep, kind, f),
         }
     }
 
@@ -219,4 +222,10 @@ impl Registry for Index<'_, '_, '_> {
     fn is_replaced(&self, source: SourceId) -> bool {
         self.sources.is_replaced(source)
     }
+}
+
+/// The index's own failure (a read, a cancelled load, an unknown `[source]`) as the resolver's
+/// error: the trait's error type, which boxes an implementor's failures in `Registry`.
+fn registry_error(error: anyhow::Error) -> ResolveError {
+    ResolveError::Registry(error.into())
 }

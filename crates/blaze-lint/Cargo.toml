@@ -26,6 +26,9 @@ blaze-blake3.workspace = true
 blaze-memchr.workspace = true
 # `Item`: an outline's entries, which `Units::plan` makes a file's lint units of.
 blaze-surface.workspace = true
+# `name_phf_table!`: the rules' words as a perfect hash fixed at compile time, one probe per
+# identifier.
+blaze-phf.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true

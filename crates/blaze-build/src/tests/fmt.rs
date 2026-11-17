@@ -30,6 +30,8 @@ const NEW_DISPLAY: ItemKey = ItemKey(62);
 const DISPLAY: ItemKey = ItemKey(63);
 const DISPLAY_U32: ItemKey = ItemKey(64);
 const TRANSMUTE: ItemKey = ItemKey(65);
+/// The stand-in `rt::Argument::from_usize` (`fn from_usize(x: &usize) -> Argument`).
+const FROM_USIZE: ItemKey = ItemKey(66);
 
 const U64: PNode = PNode::Uint(UintTy::U64);
 
@@ -192,7 +194,11 @@ impl Adts for FmtAdts<'_> {
     }
 
     fn fmt_argument_new(&self, trait_: blaze_typeck::FmtTrait) -> Option<ItemKey> {
-        (trait_ == blaze_typeck::FmtTrait::Display).then_some(NEW_DISPLAY)
+        match trait_ {
+            blaze_typeck::FmtTrait::Display => Some(NEW_DISPLAY),
+            blaze_typeck::FmtTrait::Count => Some(FROM_USIZE),
+            _ => None,
+        }
     }
 
     fn fmt_argument_adt(&self) -> Option<ItemKey> {
@@ -323,7 +329,7 @@ fn format_args_builds_the_pinned_arguments_from_one_display_argument() {
     );
     let _ = u8_;
 
-    let template = [crate::FmtPiece::Text("a"), crate::FmtPiece::Arg { plain: true }, crate::FmtPiece::Text("b")];
+    let template = [crate::FmtPiece::Text("a"), crate::FmtPiece::Arg { spec: "" }, crate::FmtPiece::Text("b")];
     let mut ground = PortableTys::new_in(Alloc::global());
     let main = build_fmt(&world, &b, &uses, &template, root, &mut ground).unwrap_or_else(|e| panic!("{e}"));
     assert!(main.refs.iter().any(|r| r.item == NEW_DISPLAY), "the constructor is called: {:?}", main.refs);
@@ -339,7 +345,7 @@ fn format_args_builds_the_pinned_arguments_from_one_display_argument() {
     let start = c.field_inits.len() as u32;
     c.field_inits.push(FieldInit { name: Name::of("value"), expr: value });
     c.field_inits.push(FieldInit { name: Name::of("code"), expr: one });
-    let lit = c.e(Expr::Struct { path, fields: List { start, len: 2 }, base: None });
+    let lit = c.e(Expr::Struct { path, fields: List { start, len: 2 }, base: blaze_typeck::StructBase::None });
     let croot = c.block(&[], Some(lit));
     let u32_g = ground.intern(U32).expect("a type interns");
     let ctor = build_instance(&world.w, &c, NEW_DISPLAY, croot, &[u32_g], &mut ground).unwrap_or_else(|e| panic!("{e}"));
@@ -350,6 +356,163 @@ fn format_args_builds_the_pinned_arguments_from_one_display_argument() {
         assert_eq!(run_native_with(&host, &[(NEW_DISPLAY, None, &ctor), (MAIN, None, &main)]), 1_111_192);
     }
     let _ = ctor;
+}
+
+/// A width read from an argument (std::fmt, "Width": `{:1$}` takes the width from argument 1,
+/// a `usize`):
+/// ```text
+/// fn from_usize(x: &usize) -> Argument { Argument { value: transmute(x), code: 2 } }
+/// fn main() -> u64 {
+///     let x = 5u32;
+///     let w = 7usize;
+///     let a = format_args!("{:1$}", x, w);
+///     let t: &[u8; 8] = transmute(a.template);
+///     let g: &[Argument; 2] = transmute(a.args);
+///     let v: usize = transmute(&w);
+///     (((*g)[1].value == v) as u64) * 1_000_000   // the count's entry borrows `w` in place
+///         + (*g)[0].code * 100_000                 // entry 0: the value's `new_display`
+///         + (*g)[1].code * 10_000                  // entry 1: the count's `from_usize`
+///         + ((*t)[5] as u64) * 1000                // the width field: entry 1
+///         + (*t)[0] as u64                         // the head: 0xD3 = 211 (flags, width, indirect)
+/// }
+/// ```
+/// 1_121_211. The template is `fmt::write`'s (module doc of walk/fmt.rs): head `0xC0 | 1 | 2 |
+/// 16`, flags `0x6800_0020` (fill ' ', width set, alignment unset), width field 1. A build that
+/// refuses the count, puts the count first (the value would format entry 0, a `Count`), or
+/// writes the width without its indirect bit fails it.
+#[test]
+fn format_args_reads_a_width_from_an_argument() {
+    let mut w = TestWorld::new();
+    w.func(1, "main", &[], U64);
+    w.bounds_fn();
+    let u8_ = w.ty(U8);
+    let arg_ty = w.ty(PNode::Adt(ARGUMENT, List::EMPTY));
+    w.strukt(ARGUMENTS.0, "Arguments", &[("template", PNode::Ptr(Mutbl::Not, u8_)), ("args", PNode::Ptr(Mutbl::Not, arg_ty))]);
+    w.strukt(ARGUMENT.0, "Argument", &[("value", USIZE), ("code", U64)]);
+    let t_param = w.ty(PNode::Param(0));
+    w.generic_func(NEW_DISPLAY.0, "new_display", 1, &[PNode::Ref(Mutbl::Not, t_param)], PNode::Adt(ARGUMENT, List::EMPTY));
+    let usize_w = w.ty(USIZE);
+    w.func(FROM_USIZE.0, "from_usize", &[PNode::Ref(Mutbl::Not, usize_w)], PNode::Adt(ARGUMENT, List::EMPTY));
+    w.generic_func(TRANSMUTE.0, "transmute", 2, &[PNode::Param(0)], PNode::Param(1));
+    w.intrinsics.push((TRANSMUTE, Intrinsic::Table(crate::intrinsics::Which::Transmute)));
+    let u32_ = w.ty(U32);
+    let world = FmtWorld { w, u32_ };
+
+    let mut b = BodyBuf::new();
+    let u8_b = b.types.intern(U8).expect("a type interns");
+    let u64_b = b.types.intern(U64).expect("a type interns");
+    let usize_b = b.types.intern(USIZE).expect("a type interns");
+    let eight = b.types.usize_value(8).expect("a length interns");
+    let arr = b.types.intern(PNode::Array(u8_b, eight)).expect("a type interns");
+    let arr_ref = b.types.intern(PNode::Ref(Mutbl::Not, arr)).expect("a type interns");
+    let argument_b = b.types.intern(PNode::Adt(ARGUMENT, List::EMPTY)).expect("a type interns");
+    let two = b.types.usize_value(2).expect("a length interns");
+    let args_arr = b.types.intern(PNode::Array(argument_b, two)).expect("a type interns");
+    let args_ref = b.types.intern(PNode::Ref(Mutbl::Not, args_arr)).expect("a type interns");
+    let (x, wd, a, t, g, v) = (b.bind("x"), b.bind("w"), b.bind("a"), b.bind("t"), b.bind("g"), b.bind("v"));
+    let x_init = b.int(5, Some(IntSuffix::Uint(UintTy::U32)));
+    let w_init = b.int(7, Some(IntSuffix::Uint(UintTy::Usize)));
+    let x_arg = b.local(x);
+    let w_arg = b.local(wd);
+    let fargs = b.exprs_list(&[x_arg, w_arg]);
+    let uses = [
+        blaze_typeck::FmtUse { arg: 1, trait_: blaze_typeck::FmtTrait::Count },
+        blaze_typeck::FmtUse { arg: 0, trait_: blaze_typeck::FmtTrait::Display },
+    ];
+    let a_init = b.e(Expr::FormatArgs { args: fargs, uses: List { start: 0, len: 2 } });
+    let a_e = b.local(a);
+    let tmpl = b.field(a_e, "template");
+    let t_init = b.call("transmute", &[tmpl]);
+    let a_e = b.local(a);
+    let argsp = b.field(a_e, "args");
+    let g_init = b.call("transmute", &[argsp]);
+    let w_e = b.local(wd);
+    let w_ref = b.e(Expr::Ref { mutbl: Mutbl::Not, operand: w_e });
+    let v_init = b.call("transmute", &[w_ref]);
+    let deref = |b: &mut BodyBuf, p: PatId| {
+        let e = b.local(p);
+        b.e(Expr::Unary { op: blaze_typeck::UnOp::Deref, operand: e })
+    };
+    let entry = |b: &mut BodyBuf, i: u128, name: &str| {
+        let base = deref(b, g);
+        let ix = b.int(i, None);
+        let at = b.index(base, ix);
+        b.field(at, name)
+    };
+    let byte = |b: &mut BodyBuf, i: u128| {
+        let base = deref(b, t);
+        let ix = b.int(i, None);
+        let at = b.index(base, ix);
+        b.e(Expr::Cast { operand: at, ty: u64_b })
+    };
+    let value = entry(&mut b, 1, "value");
+    let v_e = b.local(v);
+    let same = b.bin(BinOp::Eq, value, v_e);
+    let same = b.e(Expr::Cast { operand: same, ty: u64_b });
+    let k = b.int(1_000_000, None);
+    let s0 = b.bin(BinOp::Mul, same, k);
+    let code0 = entry(&mut b, 0, "code");
+    let k = b.int(100_000, None);
+    let s1 = b.bin(BinOp::Mul, code0, k);
+    let code1 = entry(&mut b, 1, "code");
+    let k = b.int(10_000, None);
+    let s2 = b.bin(BinOp::Mul, code1, k);
+    let b5 = byte(&mut b, 5);
+    let k = b.int(1000, None);
+    let s3 = b.bin(BinOp::Mul, b5, k);
+    let s4 = byte(&mut b, 0);
+    let sum = b.bin(BinOp::Add, s0, s1);
+    let sum = b.bin(BinOp::Add, sum, s2);
+    let sum = b.bin(BinOp::Add, sum, s3);
+    let sum = b.bin(BinOp::Add, sum, s4);
+    let root = b.block(
+        &[
+            Stmt::Let { pat: x, ty: None, init: Some(x_init), else_: None },
+            Stmt::Let { pat: wd, ty: None, init: Some(w_init), else_: None },
+            Stmt::Let { pat: a, ty: None, init: Some(a_init), else_: None },
+            Stmt::Let { pat: t, ty: Some(arr_ref), init: Some(t_init), else_: None },
+            Stmt::Let { pat: g, ty: Some(args_ref), init: Some(g_init), else_: None },
+            Stmt::Let { pat: v, ty: Some(usize_b), init: Some(v_init), else_: None },
+        ],
+        Some(sum),
+    );
+
+    let template = [crate::FmtPiece::Arg { spec: "1$" }];
+    let mut ground = PortableTys::new_in(Alloc::global());
+    let main = build_fmt(&world, &b, &uses, &template, root, &mut ground).unwrap_or_else(|e| panic!("{e}"));
+    assert!(main.refs.iter().any(|r| r.item == FROM_USIZE), "the count's constructor is called: {:?}", main.refs);
+
+    // new_display<T> at [u32], code 1; from_usize, code 2.
+    let ctor = |code: u128| {
+        let mut c = BodyBuf::new();
+        let xp = c.bind("x");
+        c.params.push(xp);
+        let path = c.path("Argument");
+        let x_e = c.local(xp);
+        let value = c.call("transmute", &[x_e]);
+        let k = c.int(code, None);
+        let start = c.field_inits.len() as u32;
+        c.field_inits.push(FieldInit { name: Name::of("value"), expr: value });
+        c.field_inits.push(FieldInit { name: Name::of("code"), expr: k });
+        let lit = c.e(Expr::Struct { path, fields: List { start, len: 2 }, base: blaze_typeck::StructBase::None });
+        let croot = c.block(&[], Some(lit));
+        (c, croot)
+    };
+    let (dc, droot) = ctor(1);
+    let u32_g = ground.intern(U32).expect("a type interns");
+    let display = build_instance(&world.w, &dc, NEW_DISPLAY, droot, &[u32_g], &mut ground).unwrap_or_else(|e| panic!("{e}"));
+    let (uc, uroot) = ctor(2);
+    let count = build_instance(&world.w, &uc, FROM_USIZE, uroot, &[], &mut ground).unwrap_or_else(|e| panic!("{e}"));
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let host = [(ItemKey(5), host_bounds as usize as u64)];
+        assert_eq!(
+            run_native_with(&host, &[(NEW_DISPLAY, None, &display), (FROM_USIZE, None, &count), (MAIN, None, &main)]),
+            1_121_211
+        );
+    }
+    let _ = (display, count);
 }
 
 /// `build_instance` for `MAIN` against [`FmtWorld`] and [`FmtAdts`], with the body's

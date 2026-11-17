@@ -25,8 +25,9 @@
 //!   for a primitive, the walked key for an ADT), or the unfiled list with why. Read from the
 //!   code: a primitive Self outside core walks past the module's own names to the PRELUDE
 //!   layer (blaze-scope names.rs: prelude before builtin types), which is core's module, not
-//!   held by the writer: `Why::NotRead` -> `NotFiled::SelfNotRead`. Expected
-//!   `unfiled(SelfNotRead)` for `prim_foreign` and `prim_root`, `bucket` for `adt_foreign`.
+//!   held by the writer: `Why::NotRead { layer: Unheld::Prelude { builtin: Some(..) } }`, which
+//!   `filing` files at the builtin (`Head::Named(builtin_type(..))`). Expected `bucket` for all
+//!   three cases.
 //! `STAGE walk <case>: <key matches|key DIFFERS|failed ..>`: the READER's walk of the self path
 //!   in the impl's module gives the bucket key the question asks (`heads_of`: builtin_type for a
 //!   primitive). Expected `key matches` for all three.

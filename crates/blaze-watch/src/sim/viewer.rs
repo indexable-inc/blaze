@@ -254,7 +254,10 @@ fn expected(tape: &Tape) -> (std::vec::Vec<u8>, Option<u16>, &'static str) {
             Some(431)
         }
         1 => {
-            for _ in 0..http::MOST_HEADERS {
+            // One past the limit whatever else was drawn: with no Host, Origin or
+            // Authorization, `MOST_HEADERS` lines alone are within it (`http::parse` refuses
+            // only `count > MOST_HEADERS`).
+            for _ in 0..=http::MOST_HEADERS {
                 headers.push(("X-Many", "b".to_string()));
             }
             Some(431)

@@ -15,7 +15,9 @@
 //!   `cargo metadata`'s ids.
 //! - [`Dependency`]: what a manifest or index entry asks for.
 //! - [`Summary`]: one version of a package, with its [`FeatureMap`] of [`FeatureValue`]s.
-//! - [`Registry`]: what the resolver asks of the sources.
+//! - [`Registry`]: what the resolver asks of the sources, answered at once or
+//!   [`Lookup::Unknown`]; [`Resolving`] is the resolve as a state machine that asks its driver
+//!   for the unknown ones.
 //!
 //! [`Resolve`] is a resolved graph, and [`lockfile`] reads and writes it as `Cargo.lock`.
 
@@ -31,10 +33,10 @@ mod package_id;
 mod package_id_spec;
 mod persistent;
 mod platform;
-mod poll;
 mod registry;
 mod resolve;
 pub mod resolver;
+pub mod resolving;
 mod summary;
 mod version;
 pub mod workspace_resolve;
@@ -54,7 +56,8 @@ pub use names::{
 };
 pub use package_id::PackageId;
 pub use package_id_spec::PackageIdSpec;
-pub use registry::{IndexSummary, MemRegistry, QueryKind, Registry, query_pinned};
+pub use registry::{IndexSummary, Lookup, MemRegistry, QueryKind, Registry, query_pinned};
+pub use resolving::{Ask, Effect, Event, Refused, Resolving, resolving_ws};
 pub use resolve::{LockfileMetadata, Resolve, ResolveVersion};
 pub use summary::{
     FeatureDep, FeatureMap, FeatureValue, MissingDependencyError, Summary, build_feature_map,

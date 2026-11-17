@@ -16,7 +16,7 @@ use blaze_own::Alloc;
 
 use super::entry::{Texts, input};
 use crate::graph::Sysroot;
-use crate::names_record::{NamesRecord, NamesRecordError, encode};
+use crate::names_record::{NamesRecord, NamesRecordError, Verified, encode};
 use crate::resolve::{CrateInput, ExpandNote, NamesNote, aligned, resolve_crates};
 use crate::task::Serial;
 
@@ -52,8 +52,8 @@ fn the_failed_calls_reason_round_trips_through_the_names_record() {
         .expect("`make!(struct foo)` failed, and the solve noted it");
     let written = encode(c, alloc).unwrap_or_else(|e| panic!("encode: {e:?}"));
     let bytes = aligned(&written, alloc);
-    let record = NamesRecord::open(bytes, alloc).unwrap_or_else(|e| panic!("open: {e:?}"));
-    let row = record.failed(call).unwrap_or_else(|e| panic!("failed: {e:?}")).expect("a failed call's row is in the record");
+    let record = NamesRecord::open(Verified::check(bytes).unwrap_or_else(|e| panic!("check: {e:?}")));
+    let row = record.failed(call, alloc).unwrap_or_else(|e| panic!("failed: {e:?}")).expect("a failed call's row is in the record");
     assert_eq!((row.call, row.path, row.implicit), (call, path, implicit));
     assert_eq!(row.path, "make");
     assert!(!row.implicit);
@@ -62,7 +62,7 @@ fn the_failed_calls_reason_round_trips_through_the_names_record() {
     assert!(format!("{}", row.failed).contains("no rule of the macro's 1 matched"), "{}", row.failed);
 
     // The control of the lookup: a key that is no failed call.
-    assert!(record.failed(c.root).unwrap_or_else(|e| panic!("failed: {e:?}")).is_none());
+    assert!(record.failed(c.root, alloc).unwrap_or_else(|e| panic!("failed: {e:?}")).is_none());
 
     // Deterministic: a second encode writes equal bytes.
     let again = encode(c, alloc).unwrap_or_else(|e| panic!("encode: {e:?}"));
@@ -72,5 +72,5 @@ fn the_failed_calls_reason_round_trips_through_the_names_record() {
     let mut old = std::vec::Vec::from(&written[..]);
     old[4..8].copy_from_slice(&1u32.to_le_bytes());
     let old = aligned(&old, alloc);
-    assert!(matches!(NamesRecord::open(old, alloc), Err(NamesRecordError::NotThisRecord)));
+    assert!(matches!(Verified::check(old), Err(NamesRecordError::NotThisRecord)));
 }

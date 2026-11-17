@@ -270,8 +270,9 @@ impl<K, V, A: Allocator, L: ShardLock> Shard<K, V, A, L> {
     }
 }
 
-/// A table shared between threads; see the module docs. Made by [`Map::new_in`] or
-/// [`Map::with_hasher_in`], in the allocator the caller passes: the shards, every table and
+/// A table shared between threads; see the module docs. Made by [`Map::new`] from a
+/// [`MapOpts`] (D126; the hasher is named as a value, D125), in the allocator the caller passes:
+/// the shards, every table and
 /// every entry are in it. A write retires what it unlinks into a limbo that may outlive the
 /// call, so the allocator is a cloneable handle that lives as long as the program
 /// (`Send + Sync + 'static` for a write): the global heap, or a region kept for the run.
@@ -292,24 +293,85 @@ unsafe impl<K: Send + Sync, V: Send + Sync, S: Send, A: Allocator + Clone + Send
 // the thread whose write unlinks them; any thread's write allocates through `&A`.
 unsafe impl<K: Send + Sync, V: Send + Sync, S: Sync, A: Allocator + Clone + Send + Sync, L: ShardLock> Sync for Map<K, V, S, A, L> {}
 
+/// What a shared [`Map`] is made from ([`Map::new`], rule 83 options-struct): every field is
+/// written at every use, the hasher too (D125):
+/// `Map::new(MapOpts { name: "cas.packs", hasher: FixedState, alloc: Global, capacity: None })`.
+///
+/// There is no shard count: it is [`SHARDS`], a constant so that a table is laid out the same on
+/// every machine, and the read path finds a key's shard by a shift of that constant; one value
+/// is right everywhere, so it is not a field.
+///
+/// A call's named arguments: write it as a literal in the call that takes it (rule 83).
+#[blaze::args]
+#[derive(Clone, Copy, Debug)]
+pub struct MapOpts<S, A> {
+    /// What a wait on one of the shards' writer locks is called in the profile: say what the
+    /// table holds (`"cas.packs"`).
+    pub name: &'static str,
+    /// The hasher, as a value: `FixedState` for ordinary keys, `BuildKeyHasher::default()` for
+    /// keys that are hashes already, a `SipKey` for keys an outsider picks.
+    pub hasher: S,
+    /// The allocator the shards, every table and every entry are in: a cloneable handle that
+    /// lives as long as the table (see [`Map`]).
+    pub alloc: A,
+    /// Entries room is made for at once: `None` makes each shard's table at its first insert;
+    /// `Some(n)` makes every shard's table now with room for its even part of `n` (`n / SHARDS`
+    /// rounded up, within three quarters full), so no shard grows while the keys spread evenly.
+    /// A shard that gets more than its part grows as it would have.
+    pub capacity: Option<usize>,
+}
+
+impl<K, V, S, A: Allocator + Clone, L: ShardLock> Map<K, V, S, A, L> {
+    /// The empty table `opts` describe: the shards, and their tables if `opts.capacity` asks for
+    /// room. A table of an iterator's pairs is `new`, then an insert of each through one
+    /// [`Map::pin`].
+    pub fn new(opts: MapOpts<S, A>) -> Map<K, V, S, A, L> {
+        let mut shards = Vec::with_capacity_in(SHARDS, opts.alloc.clone());
+        shards.resize_with(SHARDS, || Shard::new(opts.name));
+        let map = Map {
+            shards: shards.into_boxed_slice(),
+            hasher: opts.hasher,
+            alloc: opts.alloc,
+            _owns: PhantomData,
+        };
+        let capacity = opts.capacity.unwrap_or(0);
+        if capacity == 0 {
+            return map;
+        }
+        // `room` grows a table once `(used + 1) * 4 > slots * 3`: this many slots hold the
+        // shard's part with no growth.
+        let part = capacity.div_ceil(SHARDS);
+        let slots = (part * 4).div_ceil(3).next_power_of_two().max(SMALLEST);
+        for shard in &*map.shards {
+            let table = Table::new(slots, map.alloc.clone());
+            let (table, _) = Box::into_raw_with_allocator(Box::new_in(table, map.alloc.clone()));
+            // Relaxed: the map is this thread's alone until it is returned; whatever shares it
+            // after (a spawn, a channel, a `static`'s init) orders this store before any read.
+            shard.table.store(table, Ordering::Relaxed);
+        }
+        map
+    }
+}
+
 impl<K, V, S: Default, A: Allocator + Clone, L: ShardLock> Map<K, V, S, A, L> {
-    /// An empty table on a default hasher (the fixed seed's, for the crate's aliases) in `alloc`,
-    /// its shards' writer locks named `name` (what a wait on one is called: say what the table
-    /// holds, `"cas.packs"`).
+    /// An empty table on `S::default()` in `alloc`, its writer locks named `name`.
+    ///
+    /// D126: goes at the sweep; write `Map::new(MapOpts { name, hasher, alloc, capacity: None })`.
     pub fn new_in(name: &'static str, alloc: A) -> Map<K, V, S, A, L> {
-        Map::with_hasher_in(name, S::default(), alloc)
+        Map::new(MapOpts { name, hasher: S::default(), alloc, capacity: None })
     }
 }
 
 impl<K, V, S, A: Allocator + Clone, L: ShardLock> Map<K, V, S, A, L> {
-    /// An empty table on `hasher` in `alloc`, its writer locks named `name`: the shards, and no
-    /// slot until a first insert.
+    /// An empty table on `hasher` in `alloc`, its writer locks named `name`.
+    ///
+    /// D126: goes at the sweep; write `Map::new(MapOpts { name, hasher, alloc, capacity: None })`.
     pub fn with_hasher_in(name: &'static str, hasher: S, alloc: A) -> Map<K, V, S, A, L> {
-        let mut shards = Vec::with_capacity_in(SHARDS, alloc.clone());
-        shards.resize_with(SHARDS, || Shard::new(name));
-        Map { shards: shards.into_boxed_slice(), hasher, alloc, _owns: PhantomData }
+        Map::new(MapOpts { name, hasher, alloc, capacity: None })
     }
+}
 
+impl<K, V, S, A: Allocator + Clone, L: ShardLock> Map<K, V, S, A, L> {
     /// Lends the table to this thread's task: what it reads stays valid until the pin drops.
     /// The pin may be held across a wait (`blaze_reclaim::enter`).
     pub fn pin(&self) -> Pinned<'_, K, V, S, A, L> {
@@ -855,16 +917,50 @@ fn collect<K, V, A: Allocator, L: ShardLock>(shard: &Shard<K, V, A, L>, writer: 
 /// A set shared between threads: a [`Map`] to `()`.
 pub struct Set<K, S, A: Allocator + Clone, L: ShardLock>(Map<K, (), S, A, L>);
 
+/// What a shared [`Set`] is made from ([`Set::new`]), as [`MapOpts`] for a map:
+/// `Set::new(SetOpts { name: "names.seen", hasher: FixedState, alloc: Global, capacity: None })`.
+///
+/// A call's named arguments: write it as a literal in the call that takes it (rule 83).
+#[blaze::args]
+#[derive(Clone, Copy, Debug)]
+pub struct SetOpts<S, A> {
+    /// What a wait on one of the shards' writer locks is called: say what the set holds.
+    pub name: &'static str,
+    /// The hasher, as a value (D125).
+    pub hasher: S,
+    /// The allocator, as [`MapOpts::alloc`].
+    pub alloc: A,
+    /// Keys room is made for at once, as [`MapOpts::capacity`].
+    pub capacity: Option<usize>,
+}
+
+impl<K, S, A: Allocator + Clone, L: ShardLock> Set<K, S, A, L> {
+    /// The empty set `opts` describe, as [`Map::new`].
+    pub fn new(opts: SetOpts<S, A>) -> Set<K, S, A, L> {
+        Set(Map::new(MapOpts {
+            name: opts.name,
+            hasher: opts.hasher,
+            alloc: opts.alloc,
+            capacity: opts.capacity,
+        }))
+    }
+}
+
 impl<K, S: Default, A: Allocator + Clone, L: ShardLock> Set<K, S, A, L> {
-    /// An empty set on a default hasher in `alloc`, as [`Map::new_in`].
+    /// An empty set on `S::default()` in `alloc`, its writer locks named `name`.
+    ///
+    /// D126: goes at the sweep; write `Set::new(SetOpts { name, hasher, alloc, capacity: None })`.
     pub fn new_in(name: &'static str, alloc: A) -> Set<K, S, A, L> {
-        Set(Map::new_in(name, alloc))
+        Set::new(SetOpts { name, hasher: S::default(), alloc, capacity: None })
     }
 }
 
 impl<K, S, A: Allocator + Clone, L: ShardLock> Set<K, S, A, L> {
+    /// An empty set on `hasher` in `alloc`, its writer locks named `name`.
+    ///
+    /// D126: goes at the sweep; write `Set::new(SetOpts { name, hasher, alloc, capacity: None })`.
     pub fn with_hasher_in(name: &'static str, hasher: S, alloc: A) -> Set<K, S, A, L> {
-        Set(Map::with_hasher_in(name, hasher, alloc))
+        Set::new(SetOpts { name, hasher, alloc, capacity: None })
     }
 
     pub fn pin(&self) -> PinnedSet<'_, K, S, A, L> {
