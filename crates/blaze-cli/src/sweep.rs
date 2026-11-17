@@ -391,6 +391,13 @@ pub fn read_manifest(
 /// socket, a device or an entry gone since the listing is no name the layout reads.
 /// blaze's home in the checkout's root (`.blaze/v2/...`): not listed.
 pub const HOME: &str = ".blaze";
+/// git's entry in the checkout's root: a directory in a clone, a file (`gitdir: ...`) in a
+/// worktree or a submodule. Not listed, whichever it is.
+const GIT: &str = ".git";
+/// cargo's build directory in the checkout's root (`Workspace::default_target_dir`, the root
+/// joined with `target`; `cargo package` leaves it out of a package's files the same way): made
+/// by the first `cargo` run there, no package of the checkout's. Not listed.
+const CARGO_TARGET: &str = "target";
 
 pub fn list_dir<'f>(cx: &Cx, root: &Dir<ReadWrite>, dir: &str, frame: &'f Frame) -> Result<Option<Listing<'f>>, CliError> {
     let mut names: Texts<&'f Frame> = Texts::new_in(frame);
@@ -427,6 +434,12 @@ fn wanted(last: &str, name: &str, is_dir: bool) -> bool {
         // and a listing that held it would move the layout under the second (a certificate
         // missed after every cold run, the probe's "sometimes", 2026-11-16).
         ("", _) if name == HOME => false,
+        // The same for what git and cargo keep in the root: the listing is in the units'
+        // source (`units_source`), so a worktree (whose `.git` is a file, a clone's a
+        // directory) or a checkout where cargo made `target/` laid out its units again
+        // (`Units` and `UnitGraph` rerun on a second checkout's first check, 2026-11-17). No
+        // manifest is under either: a member glob that matched one named a missing manifest.
+        ("", _) if name == GIT || name == CARGO_TARGET => false,
         ("src", true) => name == "bin",
         ("src", false) => name == "lib.rs" || name == "main.rs",
         ("bin", false) => name.ends_with(".rs"),
@@ -1061,6 +1074,49 @@ mod tests {
         assert_eq!(id(), before, "the home moved the root's listing");
         write("crates2/b/Cargo.toml");
         assert_ne!(id(), before, "control: a new directory at the root moves its listing");
+    }
+
+    /// Two checkouts of one tree, a clone (`.git` a directory) where cargo has run (`target/`)
+    /// and a worktree (`.git` a file), give the layout the same root listing, so the same units'
+    /// source: the worktree's first check lays out nothing. Its controls: a `src/` or a member
+    /// folder made at the root, and a manifest read, move the source. Without the filter the
+    /// first assertion fails: the clone's listing holds `.git` and `target` as directories.
+    #[test]
+    fn git_and_cargo_entries_leave_the_units_source_equal() {
+        let io = Io::simulated(SimWorld::new(4, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+        let frame = cx.frame();
+        let fs = io.need_fs().expect("files");
+        let stamps = FromMeta { swept_at_ns: 0 };
+        let open = |at: &str| fs.open_dir(&cx, &Path::new(at).expect("a path")).expect("open");
+        let put = |dir: &Dir<ReadWrite>, path: &str| {
+            dir.publish(&cx, &Path::new(path).expect("a path"), Content::bytes(b"x"), Durable::No).expect("write");
+        };
+        let source = |dir: &Dir<ReadWrite>, manifests: &[&str]| {
+            let mut rows = Rows::new_in(frame);
+            let mut text = Bytes::new_in(frame, "a manifest");
+            for manifest in manifests {
+                read_manifest(&cx, dir, &stamps, manifest, &mut rows, &mut text).expect("the manifest");
+            }
+            read_listing(&cx, dir, &stamps, "", &mut rows, frame).expect("the root's listing");
+            units_source(rows.rows.iter().map(|leaf| (rows.path(leaf), leaf)), frame)
+        };
+        let (clone, worktree) = (open("clone"), open("worktree"));
+        for dir in [&clone, &worktree] {
+            put(dir, "Cargo.toml");
+            put(dir, "crates/a/Cargo.toml");
+        }
+        put(&clone, ".git/HEAD");
+        put(&clone, "target/debug/.cargo-lock");
+        put(&worktree, ".git");
+        let base = source(&worktree, &["Cargo.toml"]);
+        assert_eq!(source(&clone, &["Cargo.toml"]), base, "a clone's `.git` folder and cargo's `target/` moved the units' source");
+        assert_ne!(source(&worktree, &["Cargo.toml", "crates/b/Cargo.toml"]), base, "control: a manifest probed absent is in the source");
+        put(&worktree, "src/main.rs");
+        let with_src = source(&worktree, &["Cargo.toml"]);
+        assert_ne!(with_src, base, "control: a `src/` made at the root moves the source");
+        put(&worktree, "crates2/b/Cargo.toml");
+        assert_ne!(source(&worktree, &["Cargo.toml"]), with_src, "control: a member folder made at the root moves the source");
     }
 
     /// The proc-macro module store's listing under the home is a fact the answer reads: the
