@@ -25,8 +25,8 @@
 //! launcher `#[bstd::main]` makes reads it before `main` (see `crate::entry`). `bstd manifest\n`
 //! there instead asks the program for its manifest and runs nothing.
 //!
-//! Every value is in the allocator its maker names (`A`): the launcher's is the global heap,
-//! named once at the top ([`blaze_own::SharedAlloc::global`]).
+//! Every value is in the allocator its maker names (`A`): the launcher's is the process's
+//! heap, taken once by the entry ([`blaze_own::Heap::process`], D102) and handed down.
 
 use core::{alloc::Allocator, fmt};
 

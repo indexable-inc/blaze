@@ -1,0 +1,15 @@
+status 0
+stdout
+the 3
+and 2
+bird 1
+cat 1
+dog 1
+5 Some(3) None
+false
+[1, 2, 3]
+1: ["b", "e"]
+2: ["aa", "cc"]
+3: ["ddd"]
+1000 499500
+Some(999) None

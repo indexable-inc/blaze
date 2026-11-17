@@ -33,8 +33,9 @@ parser.workspace = true
 [dev-dependencies]
 # `check`, `control`: the scope property, the record-equality property, the plant's control.
 blaze-sim.workspace = true
-# `Alloc::global()`: the tests' and the example's handle.
-blaze-own = { workspace = true, features = ["std"] }
+# `Alloc::global()`: the older tests' and the example's handle; `testing`: `testing::heap()`,
+# the allocator tests/asm.rs takes.
+blaze-own = { workspace = true, features = ["std", "testing"] }
 # `fixture`: rung 7c's world, for `typeck_tests` (bodies from text checked by `InferCtx`).
 blaze-typeck = { workspace = true, features = ["testing"] }
 # `CrateItemKey`: the crate the tests' `macro_rules!` definitions are written in.

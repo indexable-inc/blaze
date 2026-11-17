@@ -133,5 +133,9 @@ pub struct ProgramIn<'r> {
     pub data: &'r [Data<'r>],
     pub entry: Entry,
     pub panic: Panic,
+    /// The program's personality routine (its `eh_personality` lang item: std's
+    /// `rust_eh_personality`), one of `functions`: named by the unwind tables' CIE when a row
+    /// lands. `None` refuses any landing row by name (`ExportError::NoPersonality`).
+    pub personality: Option<Symbol>,
     pub profile: Option<Profile<'r>>,
 }

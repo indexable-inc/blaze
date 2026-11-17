@@ -43,17 +43,22 @@ pub fn library_of(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>, alloc
     }
     let file = files.iter().find(|f| f.path == root).ok_or(RunError::NoMain)?;
     let edition = edition::PackageEdition::of_manifest(new.edition).map_err(|_| RunError::Edition { written: new.edition.into() })?;
-    let outline = blaze_file_items::outline(file.text, syntax_of(edition), alloc.clone());
     let target = blaze_scope::task::Target::AARCH64_APPLE_DARWIN;
     let cfg = blaze_scope::task::Cfg::of(&target, &[], alloc.clone());
-    let attrs = blaze_scope::task::file_attrs(&cfg, &outline, file.text, alloc);
+    Ok(if root_names_toolchain(file.text, syntax_of(edition), &cfg, alloc) { Library::Shelf } else { Library::None })
+}
+
+/// Whether a crate whose root file is `text` (of syntax `edition`, read under `cfg`) may name
+/// a toolchain crate: any root that is not `#![no_core]`, and a `no_core` root that writes
+/// `extern crate core|alloc|std`. The one rule [`library_of`] and blaze-cli's names task (which
+/// sysroot crates a workspace crate is handed) both take, so the run and the check agree.
+pub fn root_names_toolchain(text: &str, edition: blaze_surface::Edition, cfg: &blaze_scope::task::Cfg<'_, '_>, alloc: Alloc<'_>) -> bool {
+    let outline = blaze_file_items::outline(text, edition, alloc.clone());
+    let attrs = blaze_scope::task::file_attrs(cfg, &outline, text, alloc);
     if !attrs.no_core {
-        return Ok(Library::Shelf);
+        return true;
     }
-    let names_one = outline.items().iter().any(|item| {
-        item.kind() == ItemKind::ExternCrate && item.name.is_some_and(|name| NAMEABLE.contains(&item.text(file.text, name)))
-    });
-    Ok(if names_one { Library::Shelf } else { Library::None })
+    outline.items().iter().any(|item| item.kind() == ItemKind::ExternCrate && item.name.is_some_and(|name| NAMEABLE.contains(&item.text(text, name))))
 }
 
 /// The toolchain [`library_of`] decides: opened from `new.shelf` only for [`Library::Shelf`].

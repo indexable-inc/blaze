@@ -1,0 +1,10 @@
+status 0
+stdout
+2 true
+[1, 2, 3] [1, 2, 3, 4] false
+Ok([1, 2, 3])
+Some(9)
+None
+shared 2
+[1, 2, 3, 4]
+1

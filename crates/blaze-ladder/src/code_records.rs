@@ -44,7 +44,7 @@
 //! is a typed refusal ([`StoreError::TwoValues`], rule 21), never a second write.
 
 use core::fmt;
-use core::hash::{Hash, Hasher as _};
+use core::hash::Hasher as _;
 use std::alloc::Global;
 use std::boxed::Box;
 
@@ -56,14 +56,16 @@ use blaze_lir::Func;
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_run::Tier;
 use blaze_toolchain::ToolchainId;
-use blaze_typeck::{ItemKey, ReadList};
+use blaze_typeck::ItemKey;
+
+use crate::front2::body_reads::ReadsDigest;
 use parser::{Edition, LexedStr};
 
 use crate::symbols::{SymbolError, tls_desc_symbol, tls_getter_symbol};
 
 /// The version of the entry form and of what a key means: stepped when either changes, so an
 /// old store's entries are never found (and never misread) by a new blaze.
-pub const ENTRY_FORM: u32 = 1;
+pub const ENTRY_FORM: u32 = 2;
 
 /// The first eight bytes of every entry.
 pub const ENTRY_MAGIC: [u8; 8] = *b"bzcent01";
@@ -181,7 +183,7 @@ pub fn code_key_planted(parts: &KeyParts, builder: &Builder, plant: KeyPlant) ->
 
 /// A `core::hash::Hasher` that appends every integer little-endian at a fixed width (`usize`
 /// and `isize` as 8 bytes), so a derived `Hash` writes the same bytes on every machine.
-struct Fixed<'v, 'a>(&'v mut AVec<'a, u8>);
+pub(crate) struct Fixed<'v, 'a>(pub(crate) &'v mut AVec<'a, u8>);
 
 impl core::hash::Hasher for Fixed<'_, '_> {
     /// Never asked by a derived `Hash`; the bytes written are the value.
@@ -231,11 +233,13 @@ impl core::hash::Hasher for Fixed<'_, '_> {
 
 /// The digest of a fn's checked body (the module doc, part 2): `text` (the fn item's text) as
 /// its tokens without whitespace or comments, each length-prefixed, then whether it was checked
-/// and, if so, each question of its read list (sorted, as the checker keeps them) with its
-/// answer's digest. A fn with no checked body (a shim built from a signature alone) digests its
+/// and, if so, the digest of its read list ([`ReadsDigest`]: each question, sorted as the
+/// checker keeps them, with its answer's hash), filed when the body was checked (front2
+/// body_reads.rs). A fn with no checked body (a shim built from a signature alone) digests its
 /// text only. Tokens are lexed as edition 2024: which tokens are trivia does not depend on the
 /// edition, and the edition itself is a lowering input (the module doc, "Not in the key").
-pub fn body_digest(text: &str, reads: Option<&ReadList<'_>>, scratch: Alloc<'_>) -> ContentId {
+/// [`ENTRY_FORM`] 2: the list enters as its digest.
+pub fn body_digest(text: &str, reads: Option<ReadsDigest>) -> ContentId {
     let mut h = Hasher::new(BODY_DOMAIN);
     let lexed = LexedStr::new(Edition::Edition2024, text);
     let mut tokens: u64 = 0;
@@ -247,25 +251,9 @@ pub fn body_digest(text: &str, reads: Option<&ReadList<'_>>, scratch: Alloc<'_>)
     }
     h.update(&tokens.to_le_bytes());
     match reads {
-        None => {
-            h.update(&[0]);
-        }
-        Some(list) => {
-            h.update(&[1]);
-            let questions = list.questions();
-            h.update(&(questions.len() as u64).to_le_bytes());
-            let mut bytes: AVec<'_, u8> = Vec::new_in(scratch);
-            for q in questions {
-                bytes.clear();
-                q.hash(&mut Fixed(&mut bytes));
-                h.part(&bytes);
-                match list.hash_of(q) {
-                    Some(answer) => h.update(&[1]).update(&answer.to_le_bytes()),
-                    None => h.update(&[0]),
-                };
-            }
-        }
-    }
+        None => h.update(&[0]),
+        Some(list) => h.update(&[1]).update(&list.0.0),
+    };
     h.finish()
 }
 
@@ -328,8 +316,13 @@ pub enum CodeRecordError {
     Entry(EntryError),
     /// A found entry declares an instance tabled as `tabled`, which this program has no fn for.
     NoTabledFn { tabled: ItemKey },
-    /// The thread-local getter (blaze-build `tls::getter`) did not build.
+    /// A fn with a checked body whose read-list digest the front end did not file
+    /// ([`crate::seam::FrontEnd::body_reads`]).
+    NoReads { item: ItemKey },
+    /// The thread-local getter (blaze-build `tls::index::getter`) did not build.
     Getter(blaze_lir::BuildError),
+    /// The thread-local ender (blaze-build `tls::index::ender`) did not build.
+    Ender(blaze_lir::BuildError),
 }
 
 impl fmt::Display for CodeRecordError {
@@ -341,7 +334,9 @@ impl fmt::Display for CodeRecordError {
             CodeRecordError::Store(why) => why.fmt(f),
             CodeRecordError::Entry(why) => why.fmt(f),
             CodeRecordError::NoTabledFn { tabled } => write!(f, "a stored code record declares an instance of fn {:#x}, which the program does not have: the key missed an input (rule 21)", tabled.0),
+            CodeRecordError::NoReads { item } => write!(f, "fn {:#x} has a checked body but no read-list digest was filed for it (front2 body_reads.rs): its record's key would miss what its check read", item.0),
             CodeRecordError::Getter(why) => write!(f, "the thread-local getter did not build: {why}"),
+            CodeRecordError::Ender(why) => write!(f, "the thread-local ender did not build: {why}"),
         }
     }
 }
@@ -387,20 +382,21 @@ pub fn make_entry<'a>(
     Ok(out)
 }
 
-const GETTER_DOMAIN: &str = "blaze-ladder thread-local getter body 1";
+const GETTER_DOMAIN: &str = "blaze-ladder thread-local getter body 2";
 
 /// How a walk's [`Met`] names the thread-local getter.
 pub const GETTER_NAME: &str = "the thread-local getter";
 
 /// The thread-local getter's own key parts. One function a program, made by blaze-build's
-/// `tls::getter` from no text: its body digest is that generator's form (the domain, stepped
-/// when `tls::getter` changes) and the C functions it calls (`tls::IMPORTS`); it has no ground
-/// facts. Every record that touches a thread-local calls it by [`tls_getter_symbol`], so it is
-/// a program part the record walk makes once (run.rs `build_from`), not an instance a caller
-/// declares.
+/// `tls::index::getter` from no text: its body digest is that generator's form (the domain,
+/// stepped when `tls::index::getter` changes) and the C functions it calls
+/// (`tls::index::GETTER_IMPORTS`); it has no ground facts. Every record that touches a
+/// thread-local calls it by [`tls_getter_symbol`], so it is a program part the record walk
+/// makes once (run.rs `build_from`), not an instance a caller declares. Its twin for the key's
+/// destructor is `crate::tls_index::ender_parts`.
 pub fn getter_parts() -> KeyParts {
     let mut body = Hasher::new(GETTER_DOMAIN);
-    for name in tls::IMPORTS {
+    for name in tls::index::GETTER_IMPORTS {
         body.part(name.as_bytes());
     }
     let mut ground = Hasher::new(GETTER_DOMAIN);
@@ -411,8 +407,8 @@ pub fn getter_parts() -> KeyParts {
 /// The thread-local getter's entry: its LIR emitted with its calls named as the C functions
 /// they are, declaring no instance.
 pub fn make_getter_entry<'a>(isa: Isa, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, CodeRecordError> {
-    let func = tls::getter(Global).map_err(CodeRecordError::Getter)?;
-    let funcs = tls::IMPORTS.map(Callee::C);
+    let func = tls::index::getter(Global).map_err(CodeRecordError::Getter)?;
+    let funcs = tls::index::GETTER_IMPORTS.map(Callee::C);
     let names = InstanceNames { funcs: &funcs, statics: &[], vtables: &[], tls: &[] };
     let mut declared: AVec<'_, Declared<'_>> = Vec::new_in(alloc);
     make_entry(&func, &names, &mut declared, isa, alloc)

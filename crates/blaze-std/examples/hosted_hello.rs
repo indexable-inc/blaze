@@ -26,9 +26,9 @@ unsafe extern "C" {
 
 /// The host's side, outside the measured stretch: a world, the host over it, the call.
 #[inline(never)]
-fn host() -> (i32, Option<Vec<u8>>) {
+fn host(heap: &'static blaze_own::Heap) -> (i32, Option<Vec<u8>>) {
     let io = Io::sim(1);
-    let hosting = Hosting::new(io.clone(), vec![String::from("hello")], vec![(String::from("everything"), String::from("io"))], 4096);
+    let hosting = Hosting::new(io.clone(), vec![String::from("hello")], vec![(String::from("everything"), String::from("io"))], 4096, heap.shared());
     let table = hosting.table();
     #[expect(unsafe_code, reason = "the host's call of the program's start, as `blaze run` makes it")]
     // SAFETY: `table` is `hosting`'s, which lives across the call: the start's contract.
@@ -37,7 +37,8 @@ fn host() -> (i32, Option<Vec<u8>>) {
 }
 
 fn main() {
-    let (status, out) = host();
+    // The program's entry: where its heap is taken (D102).
+    let (status, out) = host(blaze_own::Heap::process());
     let out = out.unwrap_or_default();
     assert_eq!(status, 0, "the hosted hello ends 0");
     assert_eq!(out, b"Hello, world!\n", "the hosted hello writes its line to the host's standard output");

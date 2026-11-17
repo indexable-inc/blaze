@@ -16,8 +16,8 @@
 //! - a load of a function's address (a `fn` pointer, a vtable's entry) loads, and a relro word
 //!   holds, its **entry thunk**'s address, never a body: so a later tier or a freed body never
 //!   leaves a pointer to stale code;
-//! - a static, a vtable: a word holding its address; a thread-local: a word holding its offset in
-//!   a thread's block; a C name: a word holding the address `dlsym` gave once.
+//! - a static, a vtable: a word holding its address; a thread-local: a word holding its index in
+//!   the run's thread-local table; a C name: a word holding the address `dlsym` gave once.
 
 use core::fmt;
 
@@ -33,7 +33,8 @@ pub trait Words {
     /// function, the word holding its entry thunk's address).
     fn word(&mut self, target: Target, call: bool) -> Result<u64, ImageError>;
     /// The value a relro word naming `target` holds, before its addend: a function's entry
-    /// thunk, a static's or vtable's address, a thread-local's offset, a C name's address.
+    /// thunk, a static's or vtable's address, a thread-local's index in the run's thread-local
+    /// table, a C name's address.
     fn value(&mut self, target: Target) -> Result<u64, ImageError>;
 }
 

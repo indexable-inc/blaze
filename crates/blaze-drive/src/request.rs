@@ -1906,6 +1906,26 @@ impl<'a> Request<'a> {
         self.queued -= 1;
     }
 
+    /// The next live entry of ring `r`, left in the ring; stale ones before it dropped.
+    fn peek_ready(&mut self, r: usize) -> Option<Name> {
+        // Drops exactly what `pop_ready` would skip, the same way, so the `pop_ready` after a
+        // peek returns the peeked name.
+        while let Some(&(name, generation)) = self.ready[r].front() {
+            let current = self.jobs.get(&name).is_some_and(|job| job.queue_gen == generation);
+            if current && self.jobs.get(&name).is_some_and(|job| job.state == State::Queued) {
+                return Some(name);
+            }
+            self.ready[r].pop_front();
+            self.ready_ops += 1;
+            if current && let Some(job) = self.jobs.get_mut(&name) {
+                job.queue_gen = job.queue_gen.wrapping_add(1);
+                self.ready_live[r] -= 1;
+                self.queued -= 1;
+            }
+        }
+        None
+    }
+
     /// The next live entry of ring `r`, stale ones dropped.
     fn pop_ready(&mut self, r: usize) -> Option<Name> {
         while let Some((name, generation)) = self.ready[r].pop_front() {
@@ -1951,12 +1971,30 @@ impl<'a> Request<'a> {
             let kind = Kind::ALL[r % crate::key::KINDS];
             let free = workers - self.batches.len();
             let of_kind = self.ready_live[r] as usize;
-            let by_time = usize::try_from(TARGET_BATCH_NS / self.task_ns(kind)).unwrap_or(MOST_BATCH);
-            let size = by_time.clamp(1, MOST_BATCH).min(of_kind.div_ceil(free)).max(1);
-            let mut tasks = Vec::with_capacity_in(size, self.alloc);
-            while tasks.len() < size {
-                let Some(name) = self.pop_ready(r) else { break };
-                tasks.push(self.emit(name));
+            let mut tasks;
+            if kind.batches_by_home() {
+                // One home's ready tasks, whole (up to MOST_BATCH): the runner's per-home setup
+                // is paid once a batch, so the batch is cut where the home changes, not by time.
+                let Some(first) = self.pop_ready(r) else { return };
+                let home = self.jobs.get(&first).map(|job| job.home);
+                tasks = Vec::with_capacity_in(of_kind.min(MOST_BATCH), self.alloc);
+                tasks.push(self.emit(first));
+                while tasks.len() < MOST_BATCH {
+                    let Some(next) = self.peek_ready(r) else { break };
+                    if self.jobs.get(&next).map(|job| job.home) != home {
+                        break;
+                    }
+                    let Some(name) = self.pop_ready(r) else { break };
+                    tasks.push(self.emit(name));
+                }
+            } else {
+                let by_time = usize::try_from(TARGET_BATCH_NS / self.task_ns(kind)).unwrap_or(MOST_BATCH);
+                let size = by_time.clamp(1, MOST_BATCH).min(of_kind.div_ceil(free)).max(1);
+                tasks = Vec::with_capacity_in(size, self.alloc);
+                while tasks.len() < size {
+                    let Some(name) = self.pop_ready(r) else { break };
+                    tasks.push(self.emit(name));
+                }
             }
             if tasks.is_empty() {
                 // The live count said an entry was there: the counts are the machine's bug, and

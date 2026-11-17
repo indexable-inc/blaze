@@ -23,6 +23,7 @@ use blaze_ids::Hasher;
 use blaze_own::{AVec, Alloc, Vec};
 
 use crate::bytes;
+use crate::eh_out::EhSections;
 use crate::error::ExportError;
 use crate::layout::{FixTo, Laid, Plan};
 
@@ -31,8 +32,8 @@ pub const PAGE: u64 = 0x1_0000;
 const EHDR: u64 = 64;
 const PHDR: u64 = 56;
 /// Every program header at the most: PHDR, INTERP, NOTE, four LOADs, DYNAMIC, GNU_RELRO,
-/// GNU_STACK.
-const MAX_PHDRS: u64 = 10;
+/// GNU_EH_FRAME, GNU_STACK.
+const MAX_PHDRS: u64 = 11;
 const INTERP: &str = "/lib/ld-linux-aarch64.so.1";
 const INTERP_AT: u64 = EHDR + PHDR * MAX_PHDRS;
 const NOTE_AT: u64 = (INTERP_AT + INTERP.len() as u64 + 1 + 3) & !3;
@@ -45,6 +46,8 @@ const PT_DYNAMIC: u32 = 2;
 const PT_INTERP: u32 = 3;
 const PT_NOTE: u32 = 4;
 const PT_PHDR: u32 = 6;
+/// `.eh_frame_hdr`, which glibc's and libgcc's unwinders find through `dl_iterate_phdr`.
+const PT_GNU_EH_FRAME: u32 = 0x6474_E550;
 const PT_GNU_STACK: u32 = 0x6474_E551;
 const PT_GNU_RELRO: u32 = 0x6474_E552;
 const PF_X: u32 = 1;
@@ -104,7 +107,7 @@ fn phdr(out: &mut AVec<'_, u8>, kind: u32, flags: u32, offset: u64, vaddr: u64, 
 
 /// Writes `laid` as an ELF executable into `out` (its contents replaced). `seed` joins the
 /// content in the build id (the profile's digest, or zeros). Returns the build id.
-pub fn write<'a>(laid: &Laid<'_, '_>, seed: &[u8; 32], out: &mut AVec<'a, u8>, alloc: Alloc<'a>) -> Result<[u8; 16], ExportError> {
+pub fn write<'a>(laid: &Laid<'_, '_>, eh: &EhSections<'_>, seed: &[u8; 32], out: &mut AVec<'a, u8>, alloc: Alloc<'a>) -> Result<[u8; 16], ExportError> {
     let n = laid.imports.len();
     let has_data = !laid.data.is_empty() || laid.zero_len > 0;
     let const_mem = up(laid.konst.len() as u64, PAGE);
@@ -192,7 +195,8 @@ pub fn write<'a>(laid: &Laid<'_, '_>, seed: &[u8; 32], out: &mut AVec<'a, u8>, a
     let interp_len = INTERP.len() as u64 + 1;
     phdr(out, PT_INTERP, PF_R, INTERP_AT, INTERP_AT, interp_len, interp_len, 1);
     phdr(out, PT_NOTE, PF_R, NOTE_AT, NOTE_AT, NOTE_LEN, NOTE_LEN, 4);
-    phdr(out, PT_LOAD, PF_R | PF_X, 0, 0, laid.text_end(), laid.text_end(), PAGE);
+    // The executable load holds the code and, after it, the unwind tables (eh_out.rs).
+    phdr(out, PT_LOAD, PF_R | PF_X, 0, 0, eh.end(), eh.end(), PAGE);
     let konst = laid.konst.len() as u64;
     phdr(out, PT_LOAD, PF_R | PF_W, laid.const_at, laid.const_at, konst, const_mem, PAGE);
     if has_data {
@@ -203,6 +207,8 @@ pub fn write<'a>(laid: &Laid<'_, '_>, seed: &[u8; 32], out: &mut AVec<'a, u8>, a
     phdr(out, PT_LOAD, PF_R, meta_off, meta_at, meta_len, meta_len, PAGE);
     phdr(out, PT_DYNAMIC, PF_R | PF_W, laid.const_at, laid.const_at, DYN_COUNT * 16, DYN_COUNT * 16, 8);
     phdr(out, PT_GNU_RELRO, PF_R, laid.const_at, laid.const_at, konst, const_mem, 1);
+    let hdr_len = eh.eh_frame_hdr.len() as u64;
+    phdr(out, PT_GNU_EH_FRAME, PF_R, eh.eh_frame_hdr_at, eh.eh_frame_hdr_at, hdr_len, hdr_len, 4);
     phdr(out, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 16);
     out.resize(INTERP_AT as usize, 0);
     out.extend_from_slice(INTERP.as_bytes());
@@ -218,6 +224,12 @@ pub fn write<'a>(laid: &Laid<'_, '_>, seed: &[u8; 32], out: &mut AVec<'a, u8>, a
     // The loads' bytes at their offsets.
     out.resize(laid.text_at as usize, 0);
     out.extend_from_slice(&laid.text);
+    out.resize(eh.eh_frame_at as usize, 0);
+    out.extend_from_slice(&eh.eh_frame);
+    out.resize(eh.except_tab_at as usize, 0);
+    out.extend_from_slice(&eh.except_tab);
+    out.resize(eh.eh_frame_hdr_at as usize, 0);
+    out.extend_from_slice(&eh.eh_frame_hdr);
     out.resize(laid.const_at as usize, 0);
     out.extend_from_slice(&laid.konst);
     let entries = [

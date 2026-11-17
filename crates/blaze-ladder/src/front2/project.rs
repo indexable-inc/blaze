@@ -16,9 +16,10 @@ use blaze_scope::resolve::Names;
 
 use super::Front2;
 use super::FrontError;
-use super::body::{Body, BodyError, lower_fn, lower_member};
+use super::body::{Body, BodyError};
+use super::lower_made::{LowerTarget, lower_made};
 use super::buckets::Buckets;
-use super::check::{CheckFail, Records, BuildOrder, check_body_asked, eval_len};
+use super::check::{CheckFail, Records, BuildOrder, check_body_filed, eval_len};
 use super::consts::{ConstFail, Consts};
 use super::heads::{HeadError, Store, Want};
 use super::keys::{MemberKind, checker_of};
@@ -32,7 +33,7 @@ use crate::refusal::SourceFile;
 
 /// How many constants an array length in one body's heads may name before the body is
 /// refused ([`Refused::Lengths`]): reach.rs's and the census's `MOST_LENS`.
-const MOST_LENS: u32 = 64;
+pub(super) const MOST_LENS: u32 = 64;
 
 /// One body of the program's own crate: a free fn, or a fn member of an impl or a trait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -214,6 +215,16 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
     /// Checks one body: lowered, its heads made (an array length's constant evaluated as met),
     /// then checked over the command's records.
     pub fn check<'a>(&mut self, body: BodyRef<'n>, alloc: Alloc<'a>) -> BodyVerdict<'a> {
+        self.check_then(body, alloc, |_, _, _| {})
+    }
+
+    /// [`ProjectWorld::check`], then `then` over the records, the lowered body and its
+    /// `Checked` record when the check finished (front2/borrows.rs `check_borrows`: the move
+    /// and borrow check takes both, so nothing is lowered or type checked twice).
+    pub(super) fn check_then<'a, F>(&mut self, body: BodyRef<'n>, alloc: Alloc<'a>, then: F) -> BodyVerdict<'a>
+    where
+        F: FnOnce(&mut Records<'_, 'n, S>, &Body<'n>, &blaze_typeck::Checked<'static>),
+    {
         let mut verdict =
             BodyVerdict { diagnostics: AVec::new_in(alloc), gaps: AVec::new_in(alloc), refused: None, reads: None, facts: Ok(BodyReads::not_checked(alloc)) };
         let prepared = self.prepared;
@@ -249,7 +260,7 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         // no view of it is held here); a type read through this view is refused, never wrong.
         let written = lowered.typeck.view(blaze_typeck::PTys::EMPTY);
         let mut asked = Asked::new_in(alloc);
-        let checked = check_body_asked(&mut r, &lowered, &scope, None, Some(&mut asked));
+        let checked = check_body_filed(&mut r, &lowered, &scope, None, Some(&mut asked));
         // The buckets as the check left them: what each impl question read, per crate.
         let buckets = r.buckets.as_ref();
         let whole = |list: &blaze_typeck::ReadList<'_>| -> Result<BodyReads<'a>, ReadsError> {
@@ -257,7 +268,7 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
             Ok(BodyReads { rows, reach: Reach::Whole })
         };
         verdict.facts = match (&checked, &asked.finished) {
-            (Ok(done), _) => whole(&done.reads),
+            (Ok((_, filed)), _) => whole(&filed.reads),
             (Err(_), Some(list)) => whole(list),
             (Err(_), None) => {
                 facts_with_buckets(&asked.questions, None, module, written.paths, written.segments, buckets, alloc).map(|rows| BodyReads { rows, reach: Reach::Asked })
@@ -270,10 +281,11 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
             verdict.reads = Some(list.digest(alloc));
         }
         match checked {
-            Ok(done) => {
+            Ok((done, _)) => {
                 for d in done.diags.iter() {
                     verdict.diagnostics.push(BodyDiagnostic { code: d.code.code(), text: AString::new_in(alloc), start: d.at.start, end: d.at.end });
                 }
+                then(&mut r, &lowered, &done);
             }
             Err(CheckFail::Diags { diags, .. }) => {
                 for (code, at, about) in diags.iter() {
@@ -292,15 +304,12 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
     }
 }
 
-/// Lowers `body`, evaluating each constant an array length in its heads names, at most
-/// [`MOST_LENS`] of them; a member's container head is made first.
+/// Lowers `body` by [`lower_made`] (each head and constant its lowering needs made first); a
+/// member's container head is made first, each constant an array length in it names
+/// evaluated, at most [`MOST_LENS`] of them.
 fn lower<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, body: BodyRef<'n>) -> Result<Body<'n>, Refused> {
-    enum Target {
-        Free(LibKey),
-        Member(blaze_typeck::ItemKey),
-    }
     let target = match body {
-        BodyRef::Free(lib) => Target::Free(lib),
+        BodyRef::Free(lib) => LowerTarget::Free(lib),
         BodyRef::Member { container, is_trait, name } => {
             // One want, with each constant its heads' array lengths name evaluated, at most
             // `MOST_LENS` of them.
@@ -331,25 +340,15 @@ fn lower<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, prepared: &Prepares
             if r.store.fn_gaps.get(&k).is_some() {
                 return Err(Refused::MemberHead(k));
             }
-            Target::Member(k)
+            LowerTarget::Member(k)
         }
     };
-    let mut lens = 0;
-    loop {
-        let lowered = match target {
-            Target::Free(lib) => lower_fn(r.names, prepared, r.keys, r.store, lib),
-            Target::Member(k) => lower_member(r.names, prepared, r.keys, r.store, k),
-        };
-        let c = match &lowered {
-            Err(BodyError::Convert { why: Some(Why::NeedConst(c, _)), .. }) | Err(BodyError::Head { error: HeadError::Item(_, Why::NeedConst(c, _)), .. }) => *c,
-            Err(BodyError::NoBody(_)) => return Err(Refused::NoBody),
-            _ => return lowered.map_err(Refused::Lower),
-        };
-        if lens == MOST_LENS {
-            return Err(Refused::Lengths);
-        }
-        lens += 1;
-        eval_len(r, c).map_err(Refused::Length)?;
+    match lower_made(r, prepared, target) {
+        Ok(body) => Ok(body),
+        Err(BodyError::NoBody(_)) => Err(Refused::NoBody),
+        // The evaluator's refusal of a constant a length names: this module's class for it.
+        Err(BodyError::Const { error, .. }) => Err(Refused::Length(*error)),
+        Err(e) => Err(Refused::Lower(e)),
     }
 }
 

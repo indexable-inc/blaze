@@ -115,6 +115,12 @@ pub struct Target<'s> {
     pub debug_assertions: bool,
     /// rustc's `target_has_reliable_f16` (true on aarch64 but Windows).
     pub reliable_f16: bool,
+    /// rustc's `target_has_reliable_f128`: `f128` works as a type, its arithmetic and conversions
+    /// lowered by the back end or the library's soft-float routines.
+    pub reliable_f128: bool,
+    /// rustc's `target_has_reliable_f128_math`: the C math functions on `f128` exist too (false
+    /// on Apple aarch64, where `long double` is `double`).
+    pub reliable_f128_math: bool,
     /// The widths `target_has_atomic` holds (`"8"`, ..., `"ptr"`).
     pub atomic_widths: &'s [&'s str],
     /// The target features on.
@@ -133,8 +139,20 @@ impl Target<'static> {
         vendor: "apple",
         debug_assertions: true,
         reliable_f16: true,
+        // The pinned rustc's `--print cfg` for the target (crates/blaze-units/src/stdlib/rustc.json,
+        // `nightly_cfg`) holds `target_has_reliable_f128` and not `target_has_reliable_f128_math`.
+        reliable_f128: true,
+        reliable_f128_math: false,
         atomic_widths: &["8", "16", "32", "64", "ptr"],
-        target_features: &["neon", "fp-armv8", "aes", "sha2", "crc", "lse"],
+        // The features of CPU `apple-m1`, the target spec's `"cpu"`, sorted: the pinned rustc's
+        // `--print cfg` (rustc.json `cfg` and `nightly_cfg`), equal to `target_features::cpus`'s
+        // set of `apple-m1` (tests/target_facts.rs asserts it). `fp-armv8` is no cfg feature.
+        target_features: &[
+            "aes", "crc", "dit", "dotprod", "dpb", "dpb2", "fcma", "fhm", "flagm", "flagm2", "fp16",
+            "frintts", "jsconv", "lor", "lse", "lse2", "neon", "paca", "pacg", "pan", "pmuv3", "ras",
+            "rcpc", "rcpc2", "rdm", "sb", "sha2", "sha3", "ssbs", "v8.1a", "v8.2a", "v8.3a", "v8.4a",
+            "vh",
+        ],
     };
 }
 
@@ -180,6 +198,12 @@ impl<'s, 'a> Cfg<'s, 'a> {
         if target.reliable_f16 {
             atoms.push(("target_has_reliable_f16", None));
             atoms.push(("target_has_reliable_f16_math", None));
+        }
+        if target.reliable_f128 {
+            atoms.push(("target_has_reliable_f128", None));
+        }
+        if target.reliable_f128_math {
+            atoms.push(("target_has_reliable_f128_math", None));
         }
         let pairs: [(&'s str, &'s str); 11] = [
             ("target_os", target.os),
@@ -1525,10 +1549,13 @@ impl<'t> BodySrc<'t> {
         );
         // The words of the items that make a block a module
         // (`blaze_file_items::nested::NestedKind::makes_module`): a body without one costs
-        // six substring searches and no scan. A trait declared in a block makes one too
-        // (core's `Write::write_fmt` declares `trait SpecWriteFmt` in its body).
-        const WORDS: [&str; 6] = ["impl", "struct", "enum", "union", "type", "trait"];
-        (holds && WORDS.iter().any(|w| text.contains(w))).then_some(BodySrc { key, module, text, loc, depth, place })
+        // eight substring searches and no scan. A trait declared in a block makes one too
+        // (core's `Write::write_fmt` declares `trait SpecWriteFmt` in its body), and a `mod`
+        // and an `extern crate` (whose first word is `extern`).
+        const WORDS: [&str; 8] = ["impl", "struct", "enum", "union", "type", "trait", "mod", "extern"];
+        // A `!` too: a statement call may declare items (crate::expanded_blocks); the scan
+        // decides whether one is in statement position.
+        (holds && (text.contains('!') || WORDS.iter().any(|w| text.contains(w)))).then_some(BodySrc { key, module, text, loc, depth, place })
     }
 }
 

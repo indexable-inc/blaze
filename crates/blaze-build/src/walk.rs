@@ -29,7 +29,9 @@ pub(crate) use closure::{build_fn_shim, closures_in};
 pub(crate) mod coroutine;
 
 pub(crate) mod arith_checks;
+mod c_variadic;
 mod casts;
+mod const_scalar;
 mod fmt;
 #[cfg(test)]
 pub(crate) use fmt::encode_text as fmt_encode_text_for_tests;
@@ -37,15 +39,21 @@ mod discard;
 mod index;
 mod lets;
 mod matches;
+mod halfquad;
 mod numbers;
 mod operators;
+mod promote;
 mod moves;
 mod slice_glue;
 mod strs;
+mod super_let;
 mod temps;
 mod unsize_nested;
 mod unsized_tail;
+mod nounwind;
+mod coroutine_panics;
 mod unwind;
+mod val_stack;
 mod wide_cmp;
 
 /// The target's pointer width: the ladder runs on AArch64.
@@ -83,13 +91,33 @@ enum Repr {
 impl Repr {
     /// The LIR type of a scalar.
     fn scalar(self) -> Option<Ty> {
-        match self {
-            Repr::Int { ty, .. } | Repr::Float(ty) => Some(ty),
-            Repr::Bool => Some(Ty::I8),
-            Repr::Ptr => Some(Ty::PTR),
-            Repr::None | Repr::Agg(_) => None,
+        match self.kept() {
+            Kept::Scalar(ty) => Some(ty),
+            Kept::None | Kept::Agg(_) => None,
         }
     }
+
+    /// How a value of this repr is kept, three ways: a match on it has the scalar's LIR type
+    /// in hand, with no default for "not a scalar" (rule 3).
+    fn kept(self) -> Kept {
+        match self {
+            Repr::None => Kept::None,
+            Repr::Agg(l) => Kept::Agg(l),
+            Repr::Int { ty, .. } | Repr::Float(ty) => Kept::Scalar(ty),
+            Repr::Bool => Kept::Scalar(Ty::I8),
+            Repr::Ptr => Kept::Scalar(Ty::PTR),
+        }
+    }
+}
+
+/// A [`Repr`] by how it is kept ([`Repr::kept`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kept {
+    None,
+    /// An aggregate in memory, by its row of `layouts`.
+    Agg(u32),
+    /// A scalar of this LIR type.
+    Scalar(Ty),
 }
 
 /// At most this many scalar leaves are copied unrolled; an array of more is copied in a loop.
@@ -429,6 +457,9 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     break_target: Vec<bool, A>,
     work: Vec<Task, A>,
     vals: Vec<V, A>,
+    /// Beside each of `vals`, pushed and popped with it (walk/val_stack.rs): the ground type of
+    /// a value the walk owns whose type needs drop, else `None`.
+    val_tys: Vec<Option<PTy>, A>,
     targets: Vec<Target, A>,
     matches: Vec<MatchState, A>,
     arm_blocks: Vec<Block, A>,
@@ -460,6 +491,9 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     /// Per extending borrow under a branch, of a `let` being built: its temporary's drop flag
     /// (walk/temps.rs `ext_flags_for`).
     ext_flags: Vec<(u32, SlotId), A>,
+    /// `super let` bindings owned by a temporary scope (not extended): `temp_end` drops them
+    /// (walk/super_let.rs).
+    super_temps: Vec<PatId, A>,
     /// Per pattern: the binding, if its type needs drop.
     owned: Vec<Option<Owned>, A>,
     /// Per pattern: whether a binding without a flag is initialized here.
@@ -475,6 +509,10 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     co: Option<coroutine::Co>,
     /// While a landing block's drops are built (walk/unwind.rs): their calls are plain.
     cleanup: bool,
+    /// Whether the body may not unwind (walk/nounwind.rs `mark_nounwind`).
+    nounwind: bool,
+    /// The body's one `terminate` landing block, once a call needed it (walk/nounwind.rs).
+    terminate: Option<Block>,
 }
 
 fn unsupported(expr: ExprId, what: &'static str) -> BuildError {
@@ -678,6 +716,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         break_target,
         work: Vec::new_in(alloc.clone()),
         vals: Vec::new_in(alloc.clone()),
+        val_tys: Vec::new_in(alloc.clone()),
         targets: Vec::new_in(alloc.clone()),
         matches: Vec::new_in(alloc.clone()),
         arm_blocks: Vec::new_in(alloc.clone()),
@@ -696,6 +735,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         },
         temp_scopes: Vec::new_in(alloc.clone()),
         ext_flags: Vec::new_in(alloc.clone()),
+        super_temps: Vec::new_in(alloc.clone()),
         owned,
         init,
         scope_pats: Vec::new_in(alloc.clone()),
@@ -703,6 +743,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         moves: moves::Moves::new_in(alloc.clone()),
         co: None,
         cleanup: false,
+        nounwind: false,
+        terminate: None,
     }
     }
 
@@ -819,6 +861,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             PNode::Uint(u) => Repr::Int { ty: uint_ty(u)?, signed: false },
             PNode::Never | PNode::FnDef(..) => Repr::None,
             PNode::Tuple(l) if l.len == 0 => Repr::None,
+            PNode::Coroutine { .. } => {
+                return Err(TyErr::Unsupported(
+                    "an async block's future by identity (`PNode::Coroutine`): the builder grounds the `Future(ordinal, output, FnDef)` form (coroutine.rs) until it reads `World::coroutine`",
+                ));
+            }
             // A closure: a struct of one field, its environment (closure.rs). A coroutine: its
             // state, whose first bytes are its upvars (coroutine.rs).
             PNode::Adt(..) | PNode::Tuple(_) | PNode::Array(..) | PNode::Closure { .. } | PNode::Future(..) => {
@@ -1375,7 +1422,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     // Values.
 
     fn pop(&mut self) -> Result<V, BuildError> {
-        self.vals.pop().ok_or(malformed("the value stack ran out (a build bug)"))
+        if self.vals.is_empty() {
+            return Err(malformed("the value stack ran out (a build bug)"));
+        }
+        Ok(self.pop_val())
     }
 
     /// The scalar of `v`, of type `ty`; in unreachable code a value that diverged is `uninit`.
@@ -1429,10 +1479,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
 
     /// A join's parameter for a value of `repr`, as a value.
     fn join_param(&mut self, repr: Repr) -> V {
-        match repr {
-            Repr::None => V::None,
-            Repr::Agg(_) => V::Place(self.b.param(Ty::PTR), 0),
-            scalar => V::Scalar(self.b.param(scalar.scalar().unwrap_or(Ty::I8))),
+        match repr.kept() {
+            Kept::None => V::None,
+            Kept::Agg(_) => V::Place(self.b.param(Ty::PTR), 0),
+            Kept::Scalar(ty) => V::Scalar(self.b.param(ty)),
         }
     }
 
@@ -1441,12 +1491,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     }
 
     fn load(&mut self, repr: Repr, (p, off): (Value, i32)) -> V {
-        match repr {
-            Repr::None => V::None,
-            Repr::Agg(_) => V::Place(p, off),
-            scalar => {
-                let ty = scalar.scalar().unwrap_or(Ty::I8);
-                let attrs = self.mem(scalar);
+        match repr.kept() {
+            Kept::None => V::None,
+            Kept::Agg(_) => V::Place(p, off),
+            Kept::Scalar(ty) => {
+                let attrs = self.mem(repr);
                 V::Scalar(self.b.load(ty, Flags::NONE, p, off, attrs))
             }
         }
@@ -1470,6 +1519,25 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 Ok(())
             }
         }
+    }
+
+    /// Copies layout `l`'s `size` bytes from one place to another, whatever they hold, as one
+    /// `memcpy`. A union's bytes may be uninitialised past the field written, and may carry a
+    /// pointer's provenance: LIR's `memcpy` keeps both ("Bytes keep their provenance"), while
+    /// an integer load of an uninitialised byte is undefined and an integer drops provenance.
+    /// The backends lower a small `memcpy` of a known length to loads and stores themselves.
+    fn copy_bytes(&mut self, l: u32, from: (Value, i32), to: (Value, i32)) {
+        // The walk's `Layout::size` is a `u32`; its `align` and `MemAttrs::align` are both log2
+        // of the alignment in bytes.
+        let (size, align) = (self.layouts[l as usize].size, self.layouts[l as usize].align);
+        if size == 0 {
+            return;
+        }
+        let (src, dst) = (self.address(from), self.address(to));
+        let len = self.b.iconst(Ty::I64, u128::from(size));
+        let mut attrs = MemAttrs::aligned(align);
+        attrs.src_align = align;
+        self.b.bulk(Op::Memcpy, Flags::NONE, dst, src, len, attrs);
     }
 
     /// Copies a value of `repr` from one place to another, scalar leaf by scalar leaf (never
@@ -1501,12 +1569,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     continue;
                 }
             };
-            let l = match repr {
-                Repr::None => continue,
-                Repr::Agg(l) => l,
-                scalar => {
-                    let ty = scalar.scalar().unwrap_or(Ty::I8);
-                    let attrs = self.mem(scalar);
+            let l = match repr.kept() {
+                Kept::None => continue,
+                Kept::Agg(l) => l,
+                Kept::Scalar(ty) => {
+                    let attrs = self.mem(repr);
                     let x = self.b.load(ty, Flags::NONE, from.0, from.1, attrs);
                     self.b.store(Flags::NONE, x, to.0, to.1, attrs);
                     continue;
@@ -1515,6 +1582,14 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             // A coroutine's state is copied whole: what the pass keeps in it and its tag are no
             // field of its row (coroutine.rs `copy_state`).
             if self.copy_state(l, from, to) {
+                continue;
+            }
+            // A union is copied as its bytes, never by its fields and never switching on a tag:
+            // the layout does not know which field is live (the Reference, "Unions": reading a
+            // field reinterprets the bytes; the copy keeps every byte, uninitialised ones too).
+            // `MaybeUninit<T>` is one: `uninit()` leaves `value: ManuallyDrop<T>`'s bytes unwritten.
+            if self.layouts[l as usize].is_union {
+                self.copy_bytes(l, from, to);
                 continue;
             }
             match self.layouts[l as usize].shape {
@@ -1761,7 +1836,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                             let n = self.ground_len(n).map_err(|error| Self::pat_ty_err(p, error))?;
                             u32::try_from(n).map_err(|_| malformed("an array of 2^32 elements or more"))?
                         }
-                        _ => 0,
+                        // The match above let through only a tuple or an array.
+                        _ => return Err(malformed("a zero-sized tuple or array pattern of another type")),
                     };
                     parts.resize(n as usize, (0u32, Repr::None));
                 }
@@ -2196,6 +2272,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                                 kids.extend(init.map(|c| (c, false)));
                                 kids.extend(else_.map(|c| (c, true)));
                                 pats.push(pat);
+                                // A `let`-`else` owns its scrutinee as a match does: a field of a
+                                // local gets the local field flags (walk/moves/field_scrutinee.rs).
+                                if let (Some(i), Some(_)) = (init, else_) {
+                                    self.scan_field_scrutinee(i, pat)?;
+                                }
                             }
                             Stmt::Expr { expr, .. } => kids.push((expr, false)),
                             Stmt::Item => {}
@@ -2208,10 +2289,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     kids.push((then, true));
                     kids.extend(else_.map(|c| (c, true)));
                 }
-                // As a `let` statement: its initializer, then its pattern's bindings.
+                // As a `let` statement: its initializer, then its pattern's bindings. A field
+                // of an owned local as its scrutinee gets the local's field flags, as a
+                // `let`-`else`'s does (walk/moves/field_scrutinee.rs; walk/lets.rs `let_link`).
                 Expr::Let { pat, init } => {
                     kids.push((init, false));
                     pats.push(pat);
+                    self.scan_field_scrutinee(init, pat)?;
                 }
                 Expr::Match { scrutinee, arms } => {
                     kids.push((scrutinee, false));
@@ -2253,6 +2337,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                                 self.partial[x.ix()] = true;
                             }
                         }
+                        // A field of a local (`match self.failed`): field flags when an arm
+                        // may move a part out (walk/moves/field_scrutinee.rs).
+                        self.scan_field_scrutinee(scrutinee, arm.pat)?;
                         kids.extend(arm.guard.map(|g| (g, true)));
                         kids.push((arm.body, true));
                         // An arm's bindings are declared by its body (a use in its guard
@@ -2581,6 +2668,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let (params, rets) = self.sig_of(&passes, self.ret_pass);
         let own = self.b.sig(Conv::C, Variadic::No, &params, &rets);
         self.b.set_signature(own);
+        self.mark_nounwind(owner, abi, kind == Kind::Body)?;
         let entry = self.create();
         self.reached[entry.index()] = true;
         self.begin(entry);
@@ -2730,7 +2818,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let lost = || malformed("a \"rust-call\" call without its tuple of arguments");
         let repr = reprs.pop().ok_or_else(lost)?;
         passes.pop().ok_or_else(lost)?;
-        let v = self.vals.pop().ok_or_else(lost)?;
+        if self.vals.is_empty() {
+            return Err(lost());
+        }
+        let v = self.pop_val();
         let fields = self.rust_call_fields(repr)?;
         if fields.is_empty() {
             return Ok(());
@@ -2743,7 +2834,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 Repr::Agg(_) => V::Place(to.0, to.1),
                 _ => self.load(frepr, to),
             };
-            self.vals.push(fv);
+            self.push_val(fv, None);
             reprs.push(frepr);
             passes.push(Self::rust_pass(frepr)?);
         }
@@ -2801,7 +2892,23 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     }
                 }
             }
-            Class::Float { .. } => return Err(refuse("a float (the SIMD registers are not built)")),
+            // AAPCS64 6.8 C.1 and 6.9: a float (half, single, double or quad precision) takes
+            // one SIMD register, `v[NSRN]`, which the LIR float scalar of its type stands for
+            // at the call; a one-float newtype is its float, read and written at offset 0.
+            Class::Float { .. } => match repr {
+                Repr::Agg(_) => {
+                    let id = self.ls_of(g).map_err(|error| match error {
+                        TyErr::Unsupported(why) | TyErr::Malformed(why) => refuse(why),
+                        TyErr::Other(error) => error,
+                    })?;
+                    let s = self.ls.get(id).scalar.ok_or(malformed("a C float class of a type with no scalar"))?;
+                    Pass::Scalar { ty: prim_ty(s.prim), ext: Ext::None, agg: true }
+                }
+                _ => {
+                    let ty = repr.scalar().ok_or(malformed("a scalar of no type"))?;
+                    Pass::Scalar { ty, ext: Ext::None, agg: false }
+                }
+            },
             Class::Hfa { .. } => return Err(refuse("a homogeneous float aggregate (the SIMD registers are not built)")),
             Class::Composite { size, align } if size > 16 => {
                 let size = u32::try_from(size).map_err(|_| refuse("a composite past 4 GiB"))?;
@@ -2947,40 +3054,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// stack, of `reprs` passed as `passes`, for a result of `rrepr` passed as `rpass`; pushes
     /// the result.
     fn emit_call(&mut self, callee: Callee, reprs: &[Repr], passes: &[Pass], rrepr: Repr, rpass: Pass) -> Result<(), BuildError> {
-        let (params, rets) = self.sig_of(passes, rpass);
-        let mut values = Vec::with_capacity_in(params.len(), self.alloc.clone());
-        // The result's slot, the callee's to write.
-        let result = match rpass {
-            Pass::Ref | Pass::Memory { .. } => {
-                let at = self.temp(rrepr);
-                values.push(self.address(at));
-                Some(at)
-            }
-            _ => None,
-        };
-        let n = reprs.len();
-        let base = self.vals.len().checked_sub(n).ok_or(malformed("a call's arguments missing from the value stack (a build bug)"))?;
-        for i in 0..n {
-            let v = self.vals[base + i];
-            self.pass_arg(v, reprs[i], passes[i], &mut values)?;
-        }
-        self.vals.truncate(base);
-        let sig = self.b.sig(Conv::C, Variadic::No, &params, &rets);
-        let r = self.call_unwinding(callee, sig, &values)?;
-        let v = match (result, rets.len()) {
-            (Some(at), _) => V::Place(at.0, at.1),
-            (None, 0) => V::None,
-            (None, 1) => self.take_passed(rrepr, rpass, &mut core::iter::once(r))?,
-            (None, k) => {
-                let mut parts = Vec::with_capacity_in(k, self.alloc.clone());
-                for i in 0..k as u32 {
-                    parts.push(self.b.project(r, i));
-                }
-                self.take_passed(rrepr, rpass, &mut parts.iter().copied())?
-            }
-        };
-        self.vals.push(v);
-        Ok(())
+        self.emit_call_from(callee, reprs, passes, None, rrepr, rpass)
     }
 
     /// Returns `v` from the function: as the one result, through the result pointer, or as
@@ -3069,7 +3143,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     return Err(unsupported(e, "a move out of a dereference whose type needs drop"));
                 }
                 let v = self.load(repr, at);
-                self.vals.push(v);
+                self.push_val(v, None);
             }
             Task::SpillAdjusted(e) => {
                 let v = self.pop()?;
@@ -3087,7 +3161,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 if drop && self.live {
                     self.hold_temp(e, at, repr)?;
                 }
-                self.vals.push(V::Place(at.0, at.1));
+                self.push_val(V::Place(at.0, at.1), None);
             }
             Task::Place(e) => self.place_of(e)?,
             Task::PlaceDerefs(e, n) => self.place_derefs(e, n)?,
@@ -3119,11 +3193,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     }
                 }
                 self.scope_pats.truncate(mark);
-                self.vals.push(v);
+                self.push_val(v, None);
             }
             Task::TempEnd => self.temp_end()?,
             Task::TempScopeEnd(e) => self.temp_close(e)?,
-            Task::PushNone => self.vals.push(V::None),
+            Task::PushNone => self.push_val(V::None, None),
             Task::Let(p, init) => {
                 let v = self.pop()?;
                 let fresh = match (init, v, self.pat(p)?) {
@@ -3134,7 +3208,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     Some(at) => self.bind_at(p, at)?,
                     None => self.bind_value(p, v)?,
                 }
+                let from = self.scope_pats.len();
                 self.own_pat(p)?;
+                self.place_super_let(p, from)?;
             }
             Task::BlockExit(e) => {
                 let v = self.pop()?;
@@ -3143,7 +3219,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.jump(t.exit, arg.as_slice());
                 self.begin(t.exit);
                 let v = self.join_param(t.repr);
-                self.vals.push(v);
+                self.push_val(v, None);
             }
             Task::If { expr, then, else_ } => {
                 let c = self.pop()?;
@@ -3173,7 +3249,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         }
                         self.jump(join, &[]);
                         self.begin(join);
-                        self.vals.push(V::None);
+                        self.push_val(V::None, None);
                     }
                 }
             }
@@ -3184,7 +3260,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.jump(join, arg.as_slice());
                 self.begin(join);
                 let v = self.join_param(repr);
-                self.vals.push(v);
+                self.push_val(v, None);
             }
             Task::LetLink { expr, fail } => self.let_link(expr, fail)?,
             Task::CondLink(fail) => self.cond_link(fail)?,
@@ -3196,7 +3272,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.jump(header, &[]);
                 self.begin(t.exit);
                 let v = self.join_param(t.repr);
-                self.vals.push(v);
+                self.push_val(v, None);
             }
             Task::Break(target, has_value) => {
                 let v = if has_value { self.pop()? } else { V::None };
@@ -3212,13 +3288,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.drop_from(start)?;
                 self.jump(t.exit, arg.as_slice());
                 self.dead_block();
-                self.vals.push(V::None);
+                self.push_val(V::None, None);
             }
             Task::Return(has_value) => {
                 let v = if has_value { self.pop()? } else { V::None };
                 self.ret_value(v)?;
                 self.dead_block();
-                self.vals.push(V::None);
+                self.push_val(V::None, None);
             }
             Task::Match(e) => self.match_dispatch(e)?,
             Task::Arm { m, i } => self.arm(m, i)?,
@@ -3246,7 +3322,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.arm_blocks.truncate(st.first as usize);
                 self.begin(st.join);
                 let v = self.join_param(st.repr);
-                self.vals.push(v);
+                self.push_val(v, None);
             }
             Task::Call(e) => self.call(e)?,
             Task::OpCall(e) => self.operator_call(e)?,
@@ -3286,7 +3362,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     }
                     _ => return Err(unsupported(e, "this unary operator on this type")),
                 };
-                self.vals.push(V::Scalar(r));
+                self.push_val(V::Scalar(r), None);
             }
             Task::Deref(e) => {
                 let v = self.pop()?;
@@ -3296,7 +3372,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     return Err(unsupported(e, "a move out of a dereference whose type needs drop"));
                 }
                 let v = self.load(repr, (p, 0));
-                self.vals.push(v);
+                self.push_val(v, None);
             }
             Task::Binary(e, op) => self.binary(e, op)?,
             Task::Short { expr, op, rhs } => {
@@ -3325,7 +3401,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.jump(join, &[r]);
                 self.begin(join);
                 let p = self.b.param(Ty::I8);
-                self.vals.push(V::Scalar(p));
+                self.push_val(V::Scalar(p), None);
             }
             Task::Assign(e) => {
                 let to = self.pop()?;
@@ -3364,7 +3440,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 } else {
                     self.store(v, repr, at)?;
                 }
-                self.vals.push(V::None);
+                self.push_val(V::None, None);
             }
             Task::AssignOp(e, op) => {
                 let to = self.pop()?;
@@ -3382,7 +3458,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let r = self.scalar(r, rty)?;
                 let x = self.arith(e, op, l, r, lrepr, rrepr)?;
                 self.store(V::Scalar(x), lrepr, (p, off))?;
-                self.vals.push(V::None);
+                self.push_val(V::None, None);
             }
             Task::Cast(e) => self.cast(e)?,
             Task::InitAt { off, repr } => {
@@ -3408,7 +3484,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     Task::Field(_) => self.load(repr, at),
                     _ => V::Place(at.0, at.1),
                 };
-                self.vals.push(v);
+                self.push_val(v, None);
             }
             Task::IndexPlace(e) => self.index_place(e)?,
             Task::IndexCall(e) => self.index_call(e)?,
@@ -3420,7 +3496,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     return Err(unsupported(e, "a move out of an indexed element whose type needs drop"));
                 }
                 let v = self.load(repr, at);
-                self.vals.push(v);
+                self.push_val(v, None);
             }
             Task::DerefPlace => {
                 // A thin pointer is a scalar (`repr`); a wide one is an aggregate whose
@@ -3429,7 +3505,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     V::Place(p, off) => V::Unsized(p, off),
                     v => V::Place(self.scalar(v, Ty::PTR)?, 0),
                 };
-                self.vals.push(v);
+                self.push_val(v, None);
             }
             Task::Spill(e) => {
                 let v = self.pop()?;
@@ -3447,7 +3523,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 if drop && self.live {
                     self.hold_temp(e, at, repr)?;
                 }
-                self.vals.push(V::Place(at.0, at.1));
+                self.push_val(V::Place(at.0, at.1), None);
             }
             Task::ArgCopy(a) => {
                 let v = self.pop()?;
@@ -3460,7 +3536,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         V::Place(at.0, at.1)
                     }
                 };
-                self.vals.push(v);
+                // The caller's copy is the walk's own until the call takes it: a call that
+                // unwinds before then drops it (walk/val_stack.rs).
+                let owned = self.owned_arg(repr);
+                self.push_val(v, owned);
             }
             Task::Repeat(e) => self.repeat(e)?,
             Task::FormatArgs(e) => self.format_args_done(e)?,
@@ -3474,7 +3553,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         V::Scalar(self.address(at))
                     }
                 };
-                self.vals.push(v);
+                self.push_val(v, None);
             }
         }
         Ok(())
@@ -3615,18 +3694,26 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 AdjustKind::NeverToAny => {
                     let repr = self.repr_at(e, t)?;
                     let v = self.pop()?;
-                    let v = match repr {
-                        Repr::None => V::None,
-                        Repr::Agg(_) => {
+                    // core's primitive_docs.rs, the `!` type: "`!` represents the type of
+                    // diverging computations -- computations which never resolve to any value",
+                    // and "since `!` has no values (since it is uninhabited), it is a marker for
+                    // unreachable code". A `!` value reached in live code (a read of a `!`
+                    // place: `*self` of `self: &!`, core's `impl Debug for !`) means control
+                    // never gets here: the block ends, and the coerced value below is built in
+                    // the dead block after it (a call returning `!` already ended its block).
+                    if self.live {
+                        self.b.unreachable();
+                        self.dead_block();
+                    }
+                    let v = match repr.kept() {
+                        Kept::None => V::None,
+                        Kept::Agg(_) => {
                             let (p, off) = self.place(v, repr)?;
                             V::Place(p, off)
                         }
-                        scalar => {
-                            let ty = scalar.scalar().unwrap_or(Ty::I8);
-                            V::Scalar(self.scalar(v, ty)?)
-                        }
+                        Kept::Scalar(ty) => V::Scalar(self.scalar(v, ty)?),
                     };
-                    self.vals.push(v);
+                    self.push_val(v, None);
                 }
                 // A raw pointer's mutability, a fn pointer's `unsafe`: the same bits.
                 AdjustKind::MutToConstPointer | AdjustKind::UnsafeFnPointer => {}
@@ -3638,7 +3725,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         return Err(malformed("a fn pointer made of other than a fn item"));
                     };
                     let p = self.fn_addr(Instance { item, args });
-                    self.vals.push(V::Scalar(p));
+                    self.push_val(V::Scalar(p), None);
                 }
                 AdjustKind::Unsize => self.unsize(e, n)?,
                 // A closure that captures nothing to a pointer: its `call_once` (closure.rs
@@ -3647,7 +3734,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     self.pop()?;
                     let before = self.ty_before(e, n)?;
                     let p = self.closure_fn_addr(e, before)?;
-                    self.vals.push(V::Scalar(p));
+                    self.push_val(V::Scalar(p), None);
                 }
                 AdjustKind::Deref { .. } | AdjustKind::Borrow { .. } => {
                     return Err(malformed("a dereference or a borrow among the value adjustments"));
@@ -3822,7 +3909,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             let p = self.b.ptr_add(Flags::NONE, at.0, off);
             V::Place(p, at.1)
         };
-        self.vals.push(v);
+        self.push_val(v, None);
         Ok(())
     }
 
@@ -3845,7 +3932,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 }
                 let at = self.temp(repr);
                 self.write_tag(tag, variant, at);
-                self.vals.push(V::Place(at.0, at.1));
+                // Partly built while its arguments run (walk/val_stack.rs).
+                let parts = Self::literal_place(self.fields_need_drop(first, len));
+                self.push_val(V::Place(at.0, at.1), parts);
                 for (i, &a) in args.iter().enumerate().rev() {
                     let (_, off, repr) = self.layout_fields[first as usize + i];
                     self.work.push(Task::InitAt { off, repr });
@@ -3873,7 +3962,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         };
         let base = self.vals.len().checked_sub(n).ok_or(malformed("an intrinsic's arguments missing from the value stack (a build bug)"))?;
         let tuple = self.vals[base];
-        self.vals.truncate(base);
+        self.truncate_vals(base);
         let trepr = self.repr(g_arg).map_err(|error| Self::ty_err(e, error))?;
         let at = match trepr {
             Repr::Agg(_) => Some(self.place(tuple, trepr)?),
@@ -3894,9 +3983,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     let (_, off, frepr) = self.layout_fields[first as usize + i];
                     self.load(frepr, (at.0, at.1 + off as i32))
                 }
-                _ => V::None,
+                // A zero-sized tuple: no field holds a value. A tuple is never a scalar (`repr`).
+                (Repr::None, _) => V::None,
+                _ => return Err(malformed("`const_eval_select`'s argument tuple held as a scalar")),
             };
-            self.vals.push(v);
+            self.push_val(v, None);
             passes.push(self.pass(ft, repr, abi, Some(item))?);
             reprs.push(repr);
         }
@@ -3911,7 +4002,32 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     fn intrinsic(&mut self, e: ExprId, which: Intrinsic) -> Result<(), BuildError> {
         let Expr::Call { callee, args } = self.expr(e)? else { return Err(malformed("an intrinsic's task on another expression")) };
         let list = self.body.expr_lists.get(args.range()).ok_or(malformed("a call's arguments past `expr_lists`"))?;
-        let Intrinsic::Table(which) = which;
+        let which = match which {
+            Intrinsic::Table(which) => which,
+            // A target intrinsic (THREADS.md D1, intrinsics/target.rs): `fn(i32 imm)`, the
+            // immediate a constant (the library passes `arg::SY` and the like), no result.
+            Intrinsic::Target(t) => {
+                let &[arg] = list else {
+                    return Err(BuildError::Target { target: t, expr: Some(e), why: "a call of other than its one immediate argument" });
+                };
+                let base = self.vals.len().checked_sub(1).ok_or(malformed("an intrinsic's arguments missing from the value stack (a build bug)"))?;
+                let v = self.vals[base];
+                self.truncate_vals(base);
+                // After a diverging argument the call is unreachable: nothing to build.
+                if self.live {
+                    let at = self.adjusted_ty(arg)?;
+                    let repr = self.repr_at(arg, at)?;
+                    let ty = repr.scalar().ok_or(BuildError::Target { target: t, expr: Some(e), why: "an immediate that is not a scalar" })?;
+                    let imm = self.scalar(v, ty)?;
+                    intrinsics::target::build(&mut self.b, t, imm).map_err(|error| match error {
+                        BuildError::Target { target, why, .. } => BuildError::Target { target, expr: Some(e), why },
+                        other => other,
+                    })?;
+                }
+                self.push_val(V::None, None);
+                return Ok(());
+            }
+        };
         // No site is passed: a `#[track_caller]` location is not built.
         if which == Which::CallerLocation {
             return Err(BuildError::Intrinsic { expr: e, which, why: "`caller_location` (a `#[track_caller]` site)", unsupported: true });
@@ -3988,7 +4104,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 scalar => Arg::Scalar(self.scalar(v, scalar.scalar().ok_or(malformed("a scalar of no type"))?)?),
             });
         }
-        self.vals.truncate(base);
+        self.truncate_vals(base);
         let rt = self.expr_ty(e)?;
         let ret = self.ground_ty(rt).map_err(|error| Self::ty_err(e, error))?;
         let rrepr = self.repr_at(e, rt)?;
@@ -4052,7 +4168,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 scalar => self.load(scalar, (addr, 0)),
             },
         };
-        self.vals.push(v);
+        self.push_val(v, None);
         Ok(())
     }
 
@@ -4109,7 +4225,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 for (i, &byte) in bytes.iter().enumerate() {
                     value |= u128::from(byte) << (8 * i);
                 }
-                return Ok(V::Scalar(self.b.iconst(ty, value)));
+                return Ok(V::Scalar(self.const_scalar(ty, value)?));
             }
         }
         let at = self.const_rows(e, record)?;
@@ -4262,7 +4378,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let repr = self.expr_repr(e)?;
         let Repr::Agg(l) = repr else {
             // A zero-sized array: the element was evaluated, and has nowhere to go.
-            self.vals.push(V::None);
+            self.push_val(V::None, None);
             return Ok(());
         };
         let Shape::Array { elem, len, stride } = self.layouts[l as usize].shape else {
@@ -4282,7 +4398,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             self.jump(header, &[next]);
             self.begin(exit);
         }
-        self.vals.push(V::Place(to.0, to.1));
+        self.push_val(V::Place(to.0, to.1), None);
         Ok(())
     }
 
@@ -4325,11 +4441,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Expr::Local(p) => {
                 let (home, _) = self.slots.get(p.ix()).copied().flatten().ok_or(malformed("a local used before its binding"))?;
                 let at = self.home(home);
-                self.vals.push(V::Place(at.0, at.1));
+                self.push_val(V::Place(at.0, at.1), None);
             }
             Expr::Path(_) if matches!(self.expr_def(e), Some(Def::Static(..))) => {
                 let at = self.static_addr(e)?;
-                self.vals.push(V::Place(at, 0));
+                self.push_val(V::Place(at, 0), None);
             }
             Expr::Paren(inner) => self.work.push(Task::Place(inner)),
             Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
@@ -4357,6 +4473,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
 
     fn stmt(&mut self, s: StmtId) -> Result<(), BuildError> {
         let stmt = self.body.stmts.get(s.ix()).copied().ok_or(malformed("a statement past `stmts`"))?;
+        self.super_let_form(s, stmt)?;
         // A statement is a temporary scope: its end drops its borrowed temporaries, after its
         // own value and its `let`'s binding (walk/temps.rs).
         self.stmt_temps(stmt)?;
@@ -4376,7 +4493,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Stmt::Let { pat, init: None, else_: None, .. } => {
                 if !matches!(self.pat(pat)?, Pat::Wild) {
                     self.bind(pat)?;
+                    let from = self.scope_pats.len();
                     self.own(pat, false)?;
+                    self.place_super_let(pat, from)?;
                 }
             }
             // An expression statement's value is a temporary dropped at its end.
@@ -4401,15 +4520,15 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.moved(e, p)?;
                 let at = self.home(home);
                 let v = self.load(repr, at);
-                self.vals.push(v);
+                self.push_val(v, None);
             }
             Expr::Path(_) => {
                 let t = self.expr_ty(e)?;
                 match (self.node_at(e, t)?, self.expr_def(e)) {
-                    (PNode::FnDef(..), _) => self.vals.push(V::None),
+                    (PNode::FnDef(..), _) => self.push_val(V::None, None),
                     (_, Some(Def::Const(item))) => {
                         let v = self.const_value(e, item)?;
-                        self.vals.push(v);
+                        self.push_val(v, None);
                     }
                     // A static by value: a copy read from its memory.
                     (_, Some(Def::Static(..))) => {
@@ -4423,19 +4542,24 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                             }
                             _ => self.load(repr, (at, 0)),
                         };
-                        self.vals.push(v);
+                        self.push_val(v, None);
                     }
                     // A unit struct or unit variant: its tag, if it has one, in a temporary.
                     (PNode::Adt(..), Some(def @ (Def::Ctor { kind: CtorKind::Unit, .. } | Def::Adt(_)))) => {
-                        let variant = Self::def_variant(Some(def)).unwrap_or(0);
+                        let variant = match def {
+                            Def::Ctor { variant, .. } => variant,
+                            // A unit struct: its only variant.
+                            Def::Adt(_) => 0,
+                            _ => return Err(malformed("a unit value's path naming neither a ctor nor an ADT")),
+                        };
                         match self.expr_repr(e)? {
                             Repr::Agg(l) => {
                                 let (_, _, tag) = self.variant_rows(l, variant)?;
                                 let at = self.temp(Repr::Agg(l));
                                 self.write_tag(tag, variant, at);
-                                self.vals.push(V::Place(at.0, at.1));
+                                self.push_val(V::Place(at.0, at.1), None);
                             }
-                            Repr::None => self.vals.push(V::None),
+                            Repr::None => self.push_val(V::None, None),
                             _ => return Err(malformed("a unit struct or variant held as a scalar")),
                         }
                     }
@@ -4490,13 +4614,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let owner = self.body.owner;
                 let record = adts.const_block_value(owner, e, self.args).ok_or(BuildError::NoConstBlockValue { expr: e, owner })?;
                 let v = self.const_record_value(e, record)?;
-                self.vals.push(v);
+                self.push_val(v, None);
             }
             // Its value is the container's layout: a field's offset, which the code builder
             // does not compute yet.
             Expr::OffsetOf { ty, fields } => {
                 let v = self.offset_of(e, ty, fields)?;
-                self.vals.push(v);
+                self.push_val(v, None);
             }
             Expr::Match { scrutinee, .. } => {
                 self.work.push(Task::Match(e));
@@ -4524,6 +4648,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     // `match self.kind { .. }` with `self: &S`): matched in place; only a by-value
                     // binding would move (walk/moves.rs `scrutinee_in_place`).
                     _ if self.scrutinee_in_place(scrutinee)? => self.work.push(Task::Place(scrutinee)),
+                    // A field of an owned local that needs drop (`match self.failed`, `self:
+                    // Held`): a place the local owns, tested where it is; a by-value binding
+                    // moves its part by the local's field flags (walk/moves/field_scrutinee.rs).
+                    _ if self.owned_field_scrutinee(scrutinee)?.is_some() => self.work.push(Task::Place(scrutinee)),
                     _ => self.work.push(Task::Eval(scrutinee)),
                 }
             }
@@ -4557,7 +4685,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.drop_from(start)?;
                 self.jump(header, &[]);
                 self.dead_block();
-                self.vals.push(V::None);
+                self.push_val(V::None, None);
             }
             Expr::Return { value } => {
                 self.work.push(Task::Return(value.is_some()));
@@ -4708,6 +4836,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.work.push(Task::Place(lhs));
                 self.work.push(Task::Eval(rhs));
             }
+            // The Reference, "Constant promotion": a borrow the checker promoted is of a
+            // `'static` slot: the address of the value's constant row (walk/promote.rs).
+            Expr::Ref { operand, mutbl: Mutbl::Not } if self.is_promoted(e) => self.promoted_ref(e, operand)?,
             Expr::Ref { operand, mutbl } => {
                 if mutbl == Mutbl::Mut {
                     self.refuse_mut_through_overloaded_index(operand)?;
@@ -4743,7 +4874,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         }
                         let at = self.temp(repr);
                         self.write_tag(tag, variant, at);
-                        self.vals.push(V::Place(at.0, at.1));
+                        // Partly built while its fields run: refused by a call that may unwind
+                        // when a stored field may need drop (walk/val_stack.rs).
+                        let parts = Self::literal_place(self.fields_need_drop(first, len));
+                        self.push_val(V::Place(at.0, at.1), parts);
                         for init in inits.iter().rev() {
                             let row = (first..first + len)
                                 .find(|&i| self.layout_fields[i as usize].0 == init.name)
@@ -4771,7 +4905,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     Repr::Agg(l) => {
                         let shape = self.layouts[l as usize].shape;
                         let at = self.temp(repr);
-                        self.vals.push(V::Place(at.0, at.1));
+                        // Partly built while its elements run: a tuple or array needs drop exactly
+                        // when an element does (walk/val_stack.rs).
+                        let parts = Self::literal_place(self.layouts[l as usize].needs_drop);
+                        self.push_val(V::Place(at.0, at.1), parts);
                         for (i, &x) in list.iter().enumerate().rev() {
                             let (off, repr) = match shape {
                                 Shape::Fields { first, len } if (i as u32) < len => {
@@ -4831,22 +4968,22 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.b.store(Flags::NONE, p, at.0, at.1, MemAttrs::aligned(3));
                 let n = self.b.iconst(Ty::I64, len);
                 self.b.store(Flags::NONE, n, at.0, at.1 + 8, MemAttrs::aligned(3));
-                self.vals.push(V::Place(at.0, at.1));
+                self.push_val(V::Place(at.0, at.1), None);
                 return Ok(());
             }
             // strs.rs: a wide pointer over the bytes and their nul; a `char` as its `u32`.
             Lit::CStr | Lit::Char => {
                 let v = if matches!(lit, Lit::CStr) { self.c_str_lit(e)? } else { self.char_lit(e)? };
-                self.vals.push(v);
+                self.push_val(v, None);
                 return Ok(());
             }
             Lit::Float(_) => {
                 let v = self.float_lit(e)?;
-                self.vals.push(v);
+                self.push_val(v, None);
                 return Ok(());
             }
         };
-        self.vals.push(V::Scalar(v));
+        self.push_val(V::Scalar(v), None);
         Ok(())
     }
 
@@ -4923,7 +5060,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         // aggregate (walk/wide_cmp.rs: `==` and `!=` word by word).
         if matches!(lrepr, Repr::Agg(_)) || matches!(rrepr, Repr::Agg(_)) {
             let v = self.wide_ptr_binary(e, op, lhs, (l, lrepr), (r, rrepr))?;
-            self.vals.push(v);
+            self.push_val(v, None);
             return Ok(());
         }
         let lty = lrepr.scalar().ok_or(unsupported(e, "a binary operator on an operand of no value"))?;
@@ -4933,7 +5070,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         // walk/numbers.rs: IEEE comparisons and arithmetic.
         if let Repr::Float(_) = lrepr {
             let v = self.float_binary(e, op, l, r)?;
-            self.vals.push(V::Scalar(v));
+            self.push_val(V::Scalar(v), None);
             return Ok(());
         }
         let signed = matches!(lrepr, Repr::Int { signed: true, .. });
@@ -4956,7 +5093,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             None => self.arith(e, op, l, r, lrepr, rrepr)?,
         };
-        self.vals.push(V::Scalar(v));
+        self.push_val(V::Scalar(v), None);
         Ok(())
     }
 
@@ -4967,11 +5104,14 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let to = self.expr_repr(e)?;
         let out = match (from, to) {
             (Repr::None, Repr::None) => V::None,
-            (Repr::Int { .. } | Repr::Bool, Repr::Int { ty, .. }) => {
-                let fty = from.scalar().unwrap_or(Ty::I8);
+            (Repr::Int { ty: fty, signed }, Repr::Int { ty, .. }) => {
                 let x = self.scalar(v, fty)?;
-                let signed = matches!(from, Repr::Int { signed: true, .. });
                 V::Scalar(self.resize(x, fty, ty, signed))
+            }
+            // `bool as int` is 0 or 1, zero-extended (the Reference, "Numeric cast"): an `i8`.
+            (Repr::Bool, Repr::Int { ty, .. }) => {
+                let x = self.scalar(v, Ty::I8)?;
+                V::Scalar(self.resize(x, Ty::I8, ty, false))
             }
             (Repr::Bool, Repr::Bool) => V::Scalar(self.scalar(v, Ty::I8)?),
             (Repr::Ptr, Repr::Ptr) => V::Scalar(self.scalar(v, Ty::PTR)?),
@@ -4989,7 +5129,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             // A wide pointer, an enum, a fn item (walk/casts.rs).
             _ => self.cast_other(e, operand, v, from, to)?,
         };
-        self.vals.push(out);
+        self.push_val(out, None);
         Ok(())
     }
 
@@ -5057,12 +5197,20 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let n = list.len();
         let mut reprs = Vec::with_capacity_in(n, self.alloc.clone());
         let mut passes = Vec::with_capacity_in(n, self.alloc.clone());
-        for &a in list.iter() {
+        // A C-variadic callee: its declared count splits the arguments (walk/c_variadic.rs).
+        let declared = self.adts.c_variadic(item).map(|d| d as usize);
+        if declared.is_some() {
+            Self::c_variadic_abi(e, abi)?;
+        }
+        for (k, &a) in list.iter().enumerate() {
             let t = self.adjusted_ty(a)?;
             let g = self.ground_ty(t).map_err(|error| Self::ty_err(a, error))?;
             let repr = self.repr_at(a, t)?;
             reprs.push(repr);
-            passes.push(self.pass(g, repr, abi, Some(item))?);
+            passes.push(match declared {
+                Some(d) if k >= d => Self::vararg_pass(a, repr)?,
+                _ => self.pass(g, repr, abi, Some(item))?,
+            });
         }
         if abi == Abi::RustCall && !overloaded {
             self.spread_tuple(&mut reprs, &mut passes)?;
@@ -5073,12 +5221,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let rpass = self.pass(g, rrepr, abi, Some(item))?;
         let place = self.ref_place(instance);
         let reference = self.b.reference(RefKind::Func, place);
-        self.emit_call(Callee::Direct(reference), &reprs, &passes, rrepr, rpass)?;
+        self.emit_call_from(Callee::Direct(reference), &reprs, &passes, declared, rrepr, rpass)?;
         if let PNode::Never = self.node_at(e, ty)? {
-            self.vals.pop();
+            self.pop_val();
             self.b.unreachable();
             self.dead_block();
-            self.vals.push(V::None);
+            self.push_val(V::None, None);
         }
         Ok(())
     }
@@ -5092,7 +5240,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let Some(&self_ty) = view.list(instance.args).map_err(|_| malformed("a callee's arguments past the ground table"))?.first() else {
             return Ok(None);
         };
-        if !matches!(self.ground_node(self_ty), Ok(PNode::Dynamic(_))) {
+        if !matches!(self.ground_node(self_ty).map_err(|error| Self::ty_err(e, error))?, PNode::Dynamic(_)) {
             return Ok(None);
         }
         let Some((principal, _)) = self.principal(e, self_ty)? else {
@@ -5101,7 +5249,27 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let adts = self.adts;
         let shape = crate::vtable::Shape::of(principal, |t| adts.object_trait(t), self.alloc.clone())
             .map_err(|error| BuildError::Vtable { at: Some(e), error })?;
-        Ok(shape.slot(instance.item).map(|slot| (principal, slot)))
+        if let Some(slot) = shape.slot(instance.item) {
+            return Ok(Some((principal, slot)));
+        }
+        // No slot. A method of a trait on the object's own tree (the principal or a supertrait)
+        // with `Self` the object is still a dynamic call by the Reference ("Trait objects"; no
+        // impl of such a trait for the object type can be written, E0371): built as a direct
+        // call it would run the trait's default body, not the concrete type's. Such a method
+        // has no slot when the world marks it not dispatchable (`where Self: Sized`, generic,
+        // or `self` by value, which `unsized_fn_params` can call on `Box<dyn FnOnce>`): refused
+        // by name. A method of another trait (`impl Other for dyn Tr`) is an ordinary call.
+        let traits = shape.prefix.iter().copied().chain(shape.words.iter().filter_map(|w| match *w {
+            crate::vtable::Word::Super(s) => Some(s),
+            crate::vtable::Word::Method { .. } => None,
+        }));
+        for t in traits {
+            let o = adts.object_trait(t).ok_or(BuildError::Vtable { at: Some(e), error: crate::vtable::VtableError::NoTrait(t) })?;
+            if o.methods.iter().any(|m| m.item == instance.item) {
+                return Err(unsupported(e, "a method of the object's own trait with no vtable slot (`self` by value, `where Self: Sized` or generic) called on a trait object"));
+            }
+        }
+        Ok(None)
     }
 
     /// Dynamic call `e` of `instance` at vtable `slot` (codegen.md, "Trait objects"): the
@@ -5152,10 +5320,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let f = self.b.load(Ty::PTR, Flags::NONE, vt, off, MemAttrs::aligned(3));
         self.emit_call(Callee::Pointer(f), &reprs, &passes, rrepr, rpass)?;
         if let PNode::Never = self.node_at(e, ty)? {
-            self.vals.pop();
+            self.pop_val();
             self.b.unreachable();
             self.dead_block();
-            self.vals.push(V::None);
+            self.push_val(V::None, None);
         }
         Ok(())
     }
@@ -5215,14 +5383,14 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let rpass = self.pass(g, rrepr, abi, None)?;
         // The pointer is under the arguments: taken out, so the arguments are the top ones.
         let at = self.vals.len().checked_sub(reprs.len() + 1).ok_or(malformed("a call's pointer missing from the value stack (a build bug)"))?;
-        let p = self.vals.remove(at);
+        let p = self.remove_val(at);
         let p = self.scalar(p, Ty::PTR)?;
         self.emit_call(Callee::Pointer(p), &reprs, &passes, rrepr, rpass)?;
         if let PNode::Never = self.node_at(e, ty)? {
-            self.vals.pop();
+            self.pop_val();
             self.b.unreachable();
             self.dead_block();
-            self.vals.push(V::None);
+            self.push_val(V::None, None);
         }
         Ok(())
     }
@@ -5398,7 +5566,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         // A place behind a pointer that needs drop, matched in place (`Expr::Match` pushed its
         // place): by tests, whose bindings refuse a move out with no owner (walk/moves.rs
         // `scrutinee_in_place`); the switch below would own it as a temporary.
-        if !self.switch_takes(scrutinee, arms, srepr)? || self.scrutinee_in_place(scrutinee)? {
+        // A field of an owned local that needs drop alike: the match by tests owns it by the
+        // local's field flags (walk/moves.rs `own_scrutinee`); the switch would not.
+        if !self.switch_takes(scrutinee, arms, srepr)?
+            || self.scrutinee_in_place(scrutinee)?
+            || self.owned_field_scrutinee(scrutinee)?.is_some()
+        {
             return self.match_tested(e, scrutinee, arms, s, srepr);
         }
         // A reference to an enum, matched by variant patterns: the default binding mode (the

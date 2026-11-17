@@ -1,7 +1,6 @@
 //! The reader over a tree held in memory: what it asks for, how many passes, and that each
 //! span is the line it names.
 
-use blaze_own::Alloc;
 
 use super::{DepKind, Entry, Layout, LayoutError, Need, Pass, Source, Units};
 
@@ -47,7 +46,7 @@ impl<'f> Tree<'f> {
 
     /// [`Tree::read`], as the workspace the user builds (`test_targets`) or as a dependency.
     fn read_as(&self, start: &str, test_targets: bool) -> Result<(Units<'static>, usize), LayoutError<'static>> {
-        let alloc = Alloc::global();
+        let alloc = blaze_own::testing::heap().alloc();
         let mut layout = Layout::new(start, alloc)?;
         if test_targets {
             layout = layout.with_test_targets();

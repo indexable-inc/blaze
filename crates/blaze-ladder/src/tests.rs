@@ -85,30 +85,36 @@ fn the_real_context_refuses_an_unmet_bound() {
 
 /// A construct this build does not take is one refusal naming it, at its place, in the words
 /// a Rust programmer uses, whichever stage refuses it: the construct here passes the front
-/// end and the checker and is refused by the build. It is an underscore assignment
-/// (the Reference, "Destructuring assignments": `_ = e` is an assignee expression), which the
-/// build refuses by name (blaze-build walk: "`_` (`_ = e` is not built yet)"). The plain
-/// rendering says it on its line and closes with what this build runs today. Judge-changed
-/// 2026-11-16 (checks integrator, on the coordinator's decision): was
+/// end and the checker and is refused by the build. It is an or-pattern in a `let` (the
+/// Reference, "let statements": `let PatternNoTopAlt`, so the or-pattern is parenthesized,
+/// "Grouped patterns"; `let (A(x) | B(x)) = e;` is irrefutable), which the build refuses by
+/// name (blaze-build walk.rs, the `let` binder: "a pattern other than a binding, `_`, a tuple,
+/// .."), at the or-pattern inside the parentheses. The plain rendering says it on its line and closes with what this build runs
+/// today. Judge-changed 2026-11-16 (checks integrator, on the coordinator's decision): was
 /// `a_closure_is_a_named_refusal`; the build now builds an unused non-capturing closure, so a
 /// closure is no longer a refused construct. (An `f16` was tried first: the old front end
-/// refuses it as "the type `f16` names nothing" before the build sees it.)
+/// refuses it as "the type `f16` names nothing" before the build sees it.) Judge-changed again
+/// 2026-11-16 18:2x (run-path integrator B): was `an_underscore_assignment_is_a_named_refusal`;
+/// blaze-build walk/discard.rs builds `_ = e` since the 17:22 snapshot, so it is no longer a
+/// refused construct.
 #[test]
-fn an_underscore_assignment_is_a_named_refusal() {
-    let text = "struct S { a: u8 }\nfn main() { _ = 1u8; }";
+fn an_or_pattern_in_a_let_is_a_named_refusal() {
+    let text = "enum E { A(u8), B(u8) }\nfn main() { let (E::A(x) | E::B(x)) = E::A(1); }";
     let files = [SourceFile { path: "src/main.rs", text }];
     let all = refusals(&files, "src/main.rs", OverflowChecks::On);
     assert_eq!(all.len(), 1, "{all:?}");
     let r = &all[0];
     assert_eq!(r.rule, RefusalRule::Unsupported, "{r:?}");
-    assert!(r.construct.is_some_and(|c| c.contains("`_ = e`")), "{r:?}");
+    assert!(r.construct.is_some_and(|c| c.starts_with("a pattern other than a binding, `_`,")), "{r:?}");
     assert!(r.message.ends_with(NOT_YET), "{}", r.message);
     let at = (r.place + r.start) as usize;
-    assert!(text[at..].starts_with('_'), "{r:?}: at `{}`", &text[at..]);
+    // The or-pattern inside its grouping parentheses (line 2, column 18).
+    assert!(text[at..].starts_with("E::A(x) | E::B(x))"), "{r:?}: at `{}`", &text[at..]);
+    let column = at - text.find('\n').expect("two lines");
     let shown = crate::run::plain(&files, &all);
     let lines: Vec<&str> = shown.lines().collect();
     assert_eq!(lines.len(), 2, "{lines:?}");
-    assert!(lines[0].starts_with("src/main.rs:2:13: ") && lines[0].ends_with("is not supported by this build of blaze yet"), "{lines:?}");
+    assert!(lines[0].starts_with(&std::format!("src/main.rs:2:{column}: ")) && lines[0].ends_with("is not supported by this build of blaze yet"), "{lines:?}");
     assert_eq!(lines[1], crate::run::RUNS_TODAY);
 }
 

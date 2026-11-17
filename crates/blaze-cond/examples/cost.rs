@@ -386,7 +386,8 @@ fn random(alloc: Alloc<'static>) {
 }
 
 fn main() {
-    let alloc = Alloc::global();
+    let heap = blaze_own::Heap::process();
+    let alloc = heap.alloc();
     for path in env::args().skip(1) {
         measure(&path, alloc);
     }

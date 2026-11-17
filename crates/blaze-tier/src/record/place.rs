@@ -142,7 +142,8 @@ fn address(view: &RecordView<'_>, words: &mut dyn Words, at: At, r: Reloc) -> Re
 }
 
 /// The page offset of `to` in an `add` (scale 0) or a load or store of `1 << scale` bytes.
-fn page_offset(inst: u32, scale: u8, to: u64, off: u64, symbol: Symbol) -> Result<u32, PlaceError> {
+/// Public for blaze-export optimized.rs, which completes `PageOff12` the same way.
+pub fn page_offset(inst: u32, scale: u8, to: u64, off: u64, symbol: Symbol) -> Result<u32, PlaceError> {
     let is_add = inst & ADD64.0 == ADD64.1;
     let is_ldst = inst & LDST_UIMM.0 == LDST_UIMM.1;
     let fits = match (is_add, is_ldst) {
@@ -178,7 +179,8 @@ fn access_log2(inst: u32) -> u32 {
 }
 
 /// Whether the `ldr` at `ldr_at` loads x16 or x17 and the next instruction is `blr` of it.
-fn calls(code: &[u8], ldr_at: u32) -> bool {
+/// Public for blaze-export optimized.rs, which relaxes exactly these GOT pairs into `bl`.
+pub fn calls(code: &[u8], ldr_at: u32) -> bool {
     let ldr = read32(code, u64::from(ldr_at));
     let t = ldr & 0x1F;
     if t != 16 && t != 17 {

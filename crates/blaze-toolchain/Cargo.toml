@@ -24,7 +24,7 @@ blaze-text.workspace = true
 blaze-unit-graph.workspace = true
 
 [dev-dependencies]
-blaze-own = { workspace = true, features = ["std"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
 
 [lints]
 workspace = true

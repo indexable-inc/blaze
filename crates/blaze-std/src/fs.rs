@@ -76,7 +76,8 @@
 //!   change is made, and for a name change its directory's sync (`Effect::SyncDir`), and
 //!   waits for neither: their ends are dropped as they arrive. A write-back makes no file, so
 //!   one still in flight brings nothing back of a file removed or renamed away meanwhile.
-//! - A directory is there once a file under it is (no effect makes an empty one).
+//! - A directory is there once a file under it is, or once [`Dir::make_dir`] made it empty
+//!   (`Effect::MakeDir`); [`Dir::remove_dir`] removes one only when it is empty.
 //! - A read's bytes come back in a buffer the driver made (`Done::Read`), so
 //!   [`File::read_all`] and `copy_to` pass through one global allocation each read; the page
 //!   pool (std.md, S1f) replaces it with a view.
@@ -119,6 +120,11 @@ mod map_read;
 
 // A walk over folders, bounded by its caller: the visitor chooses each folder's sub-folders.
 mod walk;
+
+// Directories made empty and removed empty (`Dir::make_dir`, `Dir::remove_dir`).
+mod dirs;
+#[cfg(test)]
+pub(crate) use dirs::DirsPlant;
 #[cfg(test)]
 pub(crate) use walk::WalkPlant;
 pub use walk::{Enter, WalkError, WalkLimit, WalkLimits, Walked};
@@ -537,6 +543,8 @@ pub enum FsOp {
     Close,
     List,
     Entries,
+    MakeDir,
+    RemoveDir,
 }
 
 impl FsOp {
@@ -560,6 +568,8 @@ impl FsOp {
             FsOp::Close => "close",
             FsOp::List => "list",
             FsOp::Entries => "entries",
+            FsOp::MakeDir => "make_dir",
+            FsOp::RemoveDir => "remove_dir",
         }
     }
 }

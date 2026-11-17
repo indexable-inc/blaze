@@ -56,7 +56,7 @@ impl ExpandCx for NoCx {
 }
 
 fn tokens(text: &str) -> TokenStream<'static> {
-    lex(text, Edition::E2021, Alloc::global()).expect("the test's text lexes")
+    lex(text, Edition::E2021, blaze_own::testing::heap().alloc()).expect("the test's text lexes")
 }
 
 fn rules(body: &str) -> MacroDefinition<'static> {
@@ -115,7 +115,7 @@ fn run_cases(strict: bool) -> [u64; 5] {
                 panic_edition: Edition::E2021,
                 ctx: Ctx::root(Edition::E2021),
             };
-            let expanded = expand(&def, &Call::fn_like(&input, site), &NoCx, Alloc::global());
+            let expanded = expand(&def, &Call::fn_like(&input, site), &NoCx, blaze_own::testing::heap().alloc());
             if !strict {
                 continue;
             }

@@ -16,7 +16,6 @@ use std::{
     vec::Vec,
 };
 
-use blaze_own::Alloc;
 use blaze_rng::SplitMix64 as Rng;
 use blaze_sim::{Broke, Config, Tape};
 
@@ -255,14 +254,14 @@ fn kernels<T: Case>(v: &[T]) -> Result<(), Broke> {
     ensure(same_all(&got, &expect), || format!("sort differs for {n} {name}: {v:?} gave {got:?}"))?;
 
     let mut got = v.to_vec();
-    crate::sort_in(Alloc::global(), &mut got).map_err(|e| Broke::Harness(e.to_string()))?;
+    crate::sort_in(blaze_own::testing::heap().alloc(), &mut got).map_err(|e| Broke::Harness(e.to_string()))?;
     ensure(same_all(&got, &expect), || format!("sort_in differs (sort differs) for {n} {name}: {v:?} gave {got:?}"))?;
 
     // Stability: each key paired with its index; std's stable sort is the reference.
     let mut tagged: Vec<(T, u32)> = v.iter().enumerate().map(|(at, &k)| (k, at as u32)).collect();
     let mut stable = tagged.clone();
     stable.sort_by(|a, b| T::order(&a.0, &b.0));
-    crate::sort_by_key_in(Alloc::global(), &mut tagged, |pair| pair.0).map_err(|e| Broke::Harness(e.to_string()))?;
+    crate::sort_by_key_in(blaze_own::testing::heap().alloc(), &mut tagged, |pair| pair.0).map_err(|e| Broke::Harness(e.to_string()))?;
     ensure(tagged.iter().zip(&stable).all(|(a, b)| T::same(&a.0, &b.0) && a.1 == b.1), || {
         format!("sort_by_key differs from the stable sort for {n} {name}: {v:?} gave {tagged:?}")
     })?;
@@ -315,7 +314,7 @@ fn front_doors<T: Case + Ord>(v: &[T]) -> Result<(), Broke> {
     let mut expect = v.to_vec();
     expect.sort();
     let mut got = v.to_vec();
-    crate::sort_stable_in(Alloc::global(), &mut got).map_err(|e| Broke::Harness(e.to_string()))?;
+    crate::sort_stable_in(blaze_own::testing::heap().alloc(), &mut got).map_err(|e| Broke::Harness(e.to_string()))?;
     ensure(got == expect, || format!("sort_stable_in differs for {}", T::NAME))?;
     let mut got = v.to_vec();
     crate::sort_unstable(&mut got);
@@ -444,7 +443,7 @@ fn sort_by_key_moves_owned_values() {
             (0..n).map(|at| (rng.below(distinct) as u16, format!("value {at}"))).collect();
         let mut expect = v.clone();
         expect.sort_by_key(|pair| pair.0);
-        crate::sort_by_key_in(Alloc::global(), &mut v, |pair| pair.0).map_err(|e| Broke::Harness(e.to_string()))?;
+        crate::sort_by_key_in(blaze_own::testing::heap().alloc(), &mut v, |pair| pair.0).map_err(|e| Broke::Harness(e.to_string()))?;
         ensure(v == expect, || format!("sort_by_key differs on owned values ({n})"))
     });
 }
@@ -483,7 +482,7 @@ fn stable_sort_of_other_types_equals_std() {
         let mut expect = v.clone();
         expect.sort();
         let mut got = v.clone();
-        crate::sort_stable_in(Alloc::global(), &mut got).map_err(|e| Broke::Harness(e.to_string()))?;
+        crate::sort_stable_in(blaze_own::testing::heap().alloc(), &mut got).map_err(|e| Broke::Harness(e.to_string()))?;
         ensure(got == expect, || format!("the stable sort of {n} keyed values differs from std's"))?;
         let mut unstable = v.clone();
         crate::sort_unstable(&mut unstable);
@@ -500,7 +499,7 @@ fn a_panic_in_the_merge_keeps_every_value() {
             let mut sorted = v.clone();
             let mut calls = 0;
             let result = catch_unwind(AssertUnwindSafe(|| {
-                crate::sort_stable_by_in(Alloc::global(), &mut sorted, |a, b| {
+                crate::sort_stable_by_in(blaze_own::testing::heap().alloc(), &mut sorted, |a, b| {
                     calls += 1;
                     assert!(calls != stop, "planned panic");
                     a < b

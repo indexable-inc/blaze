@@ -213,15 +213,15 @@ mod tests {
 
     /// A `.crate`: a gzip of a tar whose every entry is under `c-1.0.0/`.
     fn archive(lib: &[u8]) -> OwnVec<u8, Alloc<'static>> {
-        let mut tar = OwnVec::new_in(Alloc::global());
+        let mut tar = OwnVec::new_in(blaze_own::testing::heap().alloc());
         let mut w = Writer::new();
         w.entry("c-1.0.0", Make::Dir, &[], &mut tar).expect("a folder entry");
         w.entry("c-1.0.0/Cargo.toml", Make::File { exec: false }, b"[package]\nname = \"c\"\nversion = \"1.0.0\"\n", &mut tar)
             .expect("a manifest entry");
         w.entry("c-1.0.0/src/lib.rs", Make::File { exec: false }, lib, &mut tar).expect("a source entry");
         w.finish(&mut tar).expect("the tar's end");
-        let mut gz = OwnVec::new_in(Alloc::global());
-        blaze_deflate::gzip(tar.as_slice(), blaze_deflate::Level::Fast, Alloc::global(), &mut gz).expect("gzip");
+        let mut gz = OwnVec::new_in(blaze_own::testing::heap().alloc());
+        blaze_deflate::gzip(tar.as_slice(), blaze_deflate::Level::Fast, blaze_own::testing::heap().alloc(), &mut gz).expect("gzip");
         gz
     }
 
@@ -237,15 +237,15 @@ mod tests {
         let pinned = archive(b"pub fn a() {}\n");
         let other = archive(b"pub fn b() {}\n");
         let sha256 = blaze_sha256::digest(pinned.as_slice());
-        let mut version = OwnString::new_in(Alloc::global());
+        let mut version = OwnString::new_in(blaze_own::testing::heap().alloc());
         version.str("1.0.0");
         let unit = Unit::Crate { package: LockId(0), name: "c", version, sha256 };
         let limits = Limits::REAL;
 
         assert_eq!(archive_name(&unit).expect("a crate's file name").as_str(), "c-1.0.0.crate");
 
-        let (record, made) = adopt(&unit, pinned.as_slice(), &limits, Alloc::global()).expect("the lock's archive is adopted");
-        let (network, _) = unpack::crate_record("c", "1.0.0", sha256, pinned.as_slice(), &limits, Alloc::global())
+        let (record, made) = adopt(&unit, pinned.as_slice(), &limits, blaze_own::testing::heap().alloc()).expect("the lock's archive is adopted");
+        let (network, _) = unpack::crate_record("c", "1.0.0", sha256, pinned.as_slice(), &limits, blaze_own::testing::heap().alloc())
             .expect("the network path's record of the same bytes");
         assert_eq!(record.as_slice(), network.as_slice(), "an adopted record is the network path's, byte for byte");
         assert_eq!(made.files, 2);
@@ -255,7 +255,7 @@ mod tests {
         let got = blaze_sha256::digest(other.as_slice());
         assert_ne!(got, sha256);
         assert_eq!(
-            adopt(&unit, other.as_slice(), &limits, Alloc::global()).map(|(_, made)| made),
+            adopt(&unit, other.as_slice(), &limits, blaze_own::testing::heap().alloc()).map(|(_, made)| made),
             Err(AdoptRefused::Mismatch { want: sha256, got }),
             "another archive under the lock's name is refused before it is inflated"
         );
@@ -265,7 +265,7 @@ mod tests {
             Try { place: "index.crates.io-1949cf8c6b5b557f", miss: Miss::Absent },
             Try { place: "github.com-1ecc6299db9ec823", miss: Miss::Refused(AdoptRefused::NotACrate) },
         ];
-        let mut words = OwnString::new_in(Alloc::global());
+        let mut words = OwnString::new_in(blaze_own::testing::heap().alloc());
         words.show(&Tried { unit: &unit, tries: &tries });
         assert_eq!(
             words.as_str(),
@@ -290,7 +290,7 @@ mod tests {
         let git = Unit::Git { repo: "https://example.com/r", commit: blaze_git_fetch::Oid([0; 20]), packages: 1 };
         assert_eq!(archive_name(&git).map(|name| name.len), Err(AdoptRefused::NotACrate));
 
-        let mut version = OwnString::new_in(Alloc::global());
+        let mut version = OwnString::new_in(blaze_own::testing::heap().alloc());
         version.str("1.0.0/../x");
         let escape = Unit::Crate { package: LockId(0), name: "c", version, sha256: [0; 32] };
         assert_eq!(archive_name(&escape).map(|name| name.len), Err(AdoptRefused::Name));

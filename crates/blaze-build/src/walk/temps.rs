@@ -45,6 +45,7 @@ use blaze_lir::{Flags, IntCond, Ty, Value};
 use blaze_own::Vec;
 use blaze_typeck::{BinOp, CtorKind, Def, Edition, Expr, ExprId, Stmt, UnOp};
 
+use super::lets::scope::LetAnchor;
 use super::{Held, NO_EXPR, Repr, Task, Walk, malformed, unsupported};
 use crate::BuildError;
 
@@ -103,7 +104,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// Puts `h` at `pos` of `scope_pats`; the scopes opened after it (the temporary scopes from
     /// `temps` on, the drop scopes from `depth` on), which all start at or past `pos`, move up
     /// by one.
-    fn insert_held(&mut self, pos: usize, temps: usize, depth: usize, h: Held) {
+    pub(super) fn insert_held(&mut self, pos: usize, temps: usize, depth: usize, h: Held) {
         self.scope_pats.insert(pos, h);
         for m in self.temp_marks.iter_mut().skip(temps) {
             if *m as usize >= pos {
@@ -118,7 +119,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     }
 
     /// The innermost open temporary scope anchored at expression `anchor`.
-    fn temp_scope_index(&self, anchor: u32) -> Option<usize> {
+    pub(super) fn temp_scope_index(&self, anchor: u32) -> Option<usize> {
         self.temp_scopes.iter().rposition(|&(a, _)| a == anchor)
     }
 
@@ -126,7 +127,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// that is a temporary scope of its own (`temp_here`) or a statement's (an expression
     /// statement's expression, a `let`'s initializer). An edition-2021 block tail is not one:
     /// the walk goes on past its block.
-    fn temp_anchor(&self, e: ExprId) -> Result<u32, BuildError> {
+    pub(super) fn temp_anchor(&self, e: ExprId) -> Result<u32, BuildError> {
         let body = self.body;
         let mut c = e.0;
         loop {
@@ -139,10 +140,17 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             }
             let parent = self.expr(ExprId(up))?;
             if let Expr::Let { .. } = parent {
-                // Its scope is "The pattern-matching condition(s) and consequent body of `if`"
-                // (edition 2024): ended before the `else` block, which walk/lets.rs does not
-                // build.
-                return Err(unsupported(e, "a borrowed temporary whose type needs drop in an `if let` or `while let` scrutinee"));
+                // "The pattern-matching condition(s) and consequent body of `if`" (edition
+                // 2024): the condition's region walk/lets/scope.rs opens. Before 2024 the
+                // `if let` was a `match`, whose scrutinee is not a temporary scope: the search
+                // goes on from the `if`.
+                match self.let_anchor(ExprId(up))? {
+                    LetAnchor::Cond(a) => return Ok(a),
+                    LetAnchor::Above(iff) => {
+                        c = iff.0;
+                        continue;
+                    }
+                }
             }
             if let Expr::Block { stmts, .. } = parent {
                 let ss = body.stmt_lists.get(stmts.range()).ok_or(malformed("a block's statements past `stmt_lists`"))?;
@@ -181,7 +189,6 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// scope." `Some((borrow, init, branch))`: the extending borrow, the `let`'s initializer,
     /// and whether an `if` branch or a `match` arm lies between (its drop needs a flag).
     fn extended_by(&self, e: ExprId) -> Result<Option<(u32, u32, bool)>, BuildError> {
-        let body = self.body;
         let up_of = |c: u32| -> Result<u32, BuildError> {
             Ok(self.expr_parent.get(c as usize).ok_or(malformed("an expression past `exprs`"))?.0)
         };
@@ -203,8 +210,20 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             c = up;
         }
         let Some(borrow) = borrow else { return Ok(None) };
-        // Up from it through extending expressions, to a `let`'s initializer.
-        let mut c = borrow;
+        Ok(self.extending_init(borrow)?.map(|(init, branch)| (borrow, init, branch)))
+    }
+
+    /// Up from expression `from` through extending expressions (the Reference's "Extending
+    /// based on expressions", as `extended_by` quotes it), to a `let`'s initializer:
+    /// `Some((init, branch))`, `branch` when an `if` branch or a `match` arm lies between; `None`
+    /// when `from` is not extending. Also the rule of a `super let` binding's scope, with `from`
+    /// its block (walk/super_let.rs).
+    pub(super) fn extending_init(&self, from: u32) -> Result<Option<(u32, bool)>, BuildError> {
+        let body = self.body;
+        let up_of = |c: u32| -> Result<u32, BuildError> {
+            Ok(self.expr_parent.get(c as usize).ok_or(malformed("an expression past `exprs`"))?.0)
+        };
+        let mut c = from;
         let mut branch = false;
         loop {
             let up = up_of(c)?;
@@ -224,7 +243,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                                 body.stmts.get(s.ix()).copied().ok_or(malformed("a statement past `stmts`"))?
                                 && i.0 == c
                             {
-                                return Ok(Some((borrow, c, branch)));
+                                return Ok(Some((c, branch)));
                             }
                         }
                         return Ok(None);
@@ -405,7 +424,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             let v = self.pop()?;
             let repr = self.adjusted_repr(e)?;
             let v = self.settle(v, repr, mark)?;
-            self.vals.push(v);
+            self.push_val(v, None);
         }
         self.temp_end()
     }
@@ -423,6 +442,9 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             // `Held::Moved`: a temporary scrutinee a match by tests moves out of (walk/moves.rs).
             if let Held::Rest { .. } | Held::Moved { .. } = h {
                 self.drop_held(h, true)?;
+                self.scope_pats.remove(i);
+            } else if self.super_let_ends_here(h)? {
+                // A `super let` binding of a block in this scope (walk/super_let.rs).
                 self.scope_pats.remove(i);
             }
         }

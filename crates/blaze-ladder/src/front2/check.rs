@@ -30,6 +30,7 @@ use super::consts::{ConstFail, Consts, int_of};
 use super::types::{SelfTy, Why};
 use blaze_lower::scoped::Prepares;
 use super::world_items::{BodyWorld, Fill, Gap};
+pub use super::body_reads::{check_body_asked, check_body_filed};
 
 /// The most checks of one body: each round makes at least one record, so past this the
 /// fills do not converge.
@@ -76,6 +77,9 @@ pub enum CheckFail {
     /// Instance resolution of the call of `item` in `owner` failed (no impl, overlap, not
     /// ground, or a question the world could not make a record for).
     Resolve { owner: ItemKey, item: ItemKey, error: tc::ResolveError, args: Box<str> },
+    /// `owner`'s body, checked again in this run, read other answers than its first check:
+    /// two read-list digests under one owner (front2 body_reads.rs `Digests::file`; rule 21).
+    ReadsDiffer { owner: ItemKey },
 }
 
 impl core::fmt::Display for CheckFail {
@@ -100,6 +104,7 @@ impl core::fmt::Display for CheckFail {
                 Ok(())
             }
             CheckFail::Rounds { owner, last } => write!(f, "checking {owner:?}: still needs {last:?} after {MOST_ROUNDS} rounds"),
+            CheckFail::ReadsDiffer { owner } => write!(f, "checking {owner:?} again read other answers than its first check: two read-list digests under one body (rule 21)"),
             CheckFail::Resolve { owner, item, error, args } => write!(f, "in {owner:?}, the call of {item:?} at [{args}]: {error}"),
             CheckFail::Const { owner, key, shown, error } => write!(f, "checking {owner:?}: the constant {key:?} ({shown}) an array length names: {error:?}"),
         }
@@ -148,12 +153,13 @@ pub fn check_body_counted<'n, S: NamesSource<'n>>(
     check_body_asked(r, body, scope, count, None)
 }
 
-/// `check_body_counted` that also leaves, in `asked`, what a check that did NOT end in a
-/// clean `Checked` asked of the world (front2 reads.rs: every body has a read list): the read
-/// list of a run that finished but is returned as a failure (diagnostics, or a gap answered as
-/// missing), and the questions of the last round that ended in a need. A clean check's list is
-/// in its `Checked`. What is left is a report, never an input to the outcome.
-pub fn check_body_asked<'n, S: NamesSource<'n>>(
+/// The check loop itself: `body` checked round by round, leaving in `asked` what a check that
+/// did NOT end in a clean `Checked` asked of the world (front2 reads.rs: every body has a read
+/// list): the read list of a run that finished but is returned as a failure (diagnostics, or a
+/// gap answered as missing), and the questions of the last round that ended in a need. A clean
+/// check's list is still in its `Checked`: only [`check_body_asked`] and [`check_body_filed`]
+/// (front2 body_reads.rs) call this, and each files the list out before the `Checked` is kept.
+pub(crate) fn check_rounds<'n, S: NamesSource<'n>>(
     r: &mut Records<'_, 'n, S>,
     body: &Body<'_>,
     scope: &BodyScope<'_>,
@@ -516,7 +522,7 @@ fn holds_param(v: tc::PTys<'_>, args: tc::List) -> Result<bool, tc::CheckError> 
             | tc::PNode::Infer
             | tc::PNode::Error
             | tc::PNode::ExAuto(_) => None,
-            tc::PNode::Closure { args: l, .. } => Some(l),
+            tc::PNode::Closure { args: l, .. } | tc::PNode::Coroutine { args: l, .. } => Some(l),
             tc::PNode::Ref(_, a) | tc::PNode::Ptr(_, a) | tc::PNode::Slice(a) | tc::PNode::ConstValue { ty: a, .. } => {
                 work.push(a);
                 None

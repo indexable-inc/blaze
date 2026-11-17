@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use blaze_ids::ContentId;
 use blaze_manifest::lock::LockId;
-use blaze_own::{AVec, Alloc, String as OwnString, Vec as OwnVec};
+use blaze_own::{AVec, String as OwnString, Vec as OwnVec};
 use blaze_sim::{Broke, Config, Tape};
 use blaze_tar::{Make, Writer};
 use blaze_text::Writes as _;
@@ -43,15 +43,15 @@ struct Drawn {
 
 /// A `.crate`: a gzip of a tar whose every entry is under `folder/`.
 fn archive_of(folder: &str, files: &[(std::string::String, std::vec::Vec<u8>)]) -> std::vec::Vec<u8> {
-    let mut tar = OwnVec::new_in(Alloc::global());
+    let mut tar = OwnVec::new_in(blaze_own::testing::heap().alloc());
     let mut w = Writer::new();
     w.entry(folder, Make::Dir, &[], &mut tar).expect("a folder entry");
     for (path, bytes) in files {
         w.entry(&format!("{folder}/{path}"), Make::File { exec: false }, bytes, &mut tar).expect("a file entry");
     }
     w.finish(&mut tar).expect("the tar's end");
-    let mut gz = OwnVec::new_in(Alloc::global());
-    blaze_deflate::gzip(tar.as_slice(), blaze_deflate::Level::Fast, Alloc::global(), &mut gz).expect("gzip");
+    let mut gz = OwnVec::new_in(blaze_own::testing::heap().alloc());
+    blaze_deflate::gzip(tar.as_slice(), blaze_deflate::Level::Fast, blaze_own::testing::heap().alloc(), &mut gz).expect("gzip");
     gz.as_slice().to_vec()
 }
 
@@ -70,7 +70,7 @@ fn draw(tape: &Tape, at: usize, limits: &unpack::Limits) -> Drawn {
     files[0].1.push(b'!');
     let tampered = archive_of(&folder, &files);
     let sha256 = blaze_sha256::digest(&archive);
-    let (truth, _) = unpack::crate_record(&name, &version, sha256, &archive, limits, Alloc::global()).expect("an honest crate's record");
+    let (truth, _) = unpack::crate_record(&name, &version, sha256, &archive, limits, blaze_own::testing::heap().alloc()).expect("an honest crate's record");
     Drawn { name, version, archive, tampered, sha256, truth: truth.as_slice().to_vec() }
 }
 
@@ -180,7 +180,7 @@ impl FetchIo for CargoIo<'_> {
 
 /// One command: the machine over every unit, driven by [`drive::step`] until done.
 fn command<'p, 'l>(units: &'p [Unit<'l, 'static>], io: &mut CargoIo<'_>, limits: Limits) -> Result<Machine<'p, 'l, 'static>, Broke> {
-    let mut machine = Machine::new(units, limits, Alloc::global());
+    let mut machine = Machine::new(units, limits, blaze_own::testing::heap().alloc());
     for _ in 0..1_000 {
         if machine.is_done() {
             if let Some(broke) = io.broke.take() {
@@ -218,7 +218,7 @@ fn case_inner(crates: &[Drawn], tampered: usize, limits: Limits) -> Result<(), B
         .iter()
         .enumerate()
         .map(|(at, c)| {
-            let mut version = OwnString::new_in(Alloc::global());
+            let mut version = OwnString::new_in(blaze_own::testing::heap().alloc());
             version.str(&c.version);
             Unit::Crate { package: LockId(at as u32), name: &c.name, version, sha256: c.sha256 }
         })

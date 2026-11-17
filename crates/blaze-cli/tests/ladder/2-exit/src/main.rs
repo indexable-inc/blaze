@@ -10,6 +10,19 @@ trait Sized {}
 #[lang = "copy"]
 trait Copy {}
 
+// What a remainder by zero, and a signed remainder of `MIN` by `-1`, call: the checks are in
+// every build (the Reference, "Arithmetic and Logical Binary Operators": integer division by
+// zero panics, and so does an overflowing `%`; the pinned core's `panic_const`); never return.
+#[lang = "panic_const_rem_by_zero"]
+fn panic_const_rem_by_zero() -> ! {
+    loop {}
+}
+
+#[lang = "panic_const_rem_overflow"]
+fn panic_const_rem_overflow() -> ! {
+    loop {}
+}
+
 /// The sum of 1 to `n`.
 fn sum_to(n: i32) -> i32 {
     let mut total = 0;

@@ -412,6 +412,12 @@ impl ScriptRuntime {
 
     /// `script` run by `loaded`, nothing looked up or kept: its outputs and reads.
     pub(crate) fn fresh<'a>(&self, loaded: &LoadedScript, script: Arc<Script>, base: ContentId, alloc: Alloc<'a>) -> Result<ScriptRun<'a>, ScriptError> {
+        // A spawn's clock and randomness are seeded by the run's base key (W2): the copy is
+        // made only when the caller's `Script` does not hold it yet.
+        let mut script = script;
+        if script.step != base {
+            Arc::make_mut(&mut script).step = base;
+        }
         let package = script.package.clone();
         let named = |why: ScriptWhy| ScriptError { package: package.clone(), why };
         let limits = script.limits;

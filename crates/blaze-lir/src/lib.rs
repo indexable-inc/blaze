@@ -66,6 +66,9 @@ pub mod func;
 /// The trivial inliner (D98's first point): small loop-free bodies and `#[inline(always)]`
 /// spliced in front of the fast tier.
 pub mod inline;
+/// Legalize (INTRINSICS.md 3.2, 3.5): vectors to scalars, `f16` widened, `f128` to
+/// compiler_builtins calls, in front of the Reference and Fast tiers only.
+pub mod legalize;
 pub mod op;
 pub mod parse;
 pub mod persist;

@@ -36,7 +36,7 @@ testing = ["blaze-own/std", "dep:blaze-lower", "blaze-typeck/testing"]
 
 [dev-dependencies]
 blaze-consteval = { path = ".", features = ["testing"] }
-blaze-own = { workspace = true, features = ["std"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
 # `read_back`: code the builder emits reads a constant's record back (layout cannot drift).
 blaze-build = { workspace = true, features = ["testing"] }
 # `check`, `control`: the arithmetic property and its planted bugs.

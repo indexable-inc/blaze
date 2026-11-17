@@ -813,7 +813,7 @@ fn traps_stop_with_sigtrap() {
 
 // Random programs.
 
-mod random {
+pub(crate) mod random {
     use std::alloc::Global;
 
     use blaze_lir::{
@@ -1066,7 +1066,7 @@ mod random {
     }
 
     /// A random program and its arguments, each its parameter's bits.
-    pub(super) fn program(tape: &Tape) -> Result<(Func<Global>, Vec<Val>), BuildError> {
+    pub(crate) fn program(tape: &Tape) -> Result<(Func<Global>, Vec<Val>), BuildError> {
         let params: Vec<Ty> = tape.vec(0..=4, "parameters", |tape| ty(tape, "parameter"));
         let n = tape.int_in(1usize..=6, "blocks");
         let mut b = Builder::<Global, Full>::new_in(64, Global);

@@ -356,12 +356,18 @@ pub fn lang_item(l: Lang) -> LangItem {
         Lang::ManuallyDrop => LangItem::ManuallyDrop,
         Lang::Future => LangItem::Future,
         Lang::FutureOutput => LangItem::FutureOutput,
+        Lang::AsyncFn => LangItem::AsyncFn,
+        Lang::AsyncFnMut => LangItem::AsyncFnMut,
+        Lang::AsyncFnOnce => LangItem::AsyncFnOnce,
+        Lang::AsyncFnOnceOutput => LangItem::AsyncFnOnceOutput,
+        Lang::CallOnceFuture => LangItem::CallOnceFuture,
+        Lang::CallRefFuture => LangItem::CallRefFuture,
     }
 }
 
 /// The solver's lang item of typeck's, for the ones the solver knows.
 fn solver_lang(l: LangItem) -> Option<Lang> {
-    const ALL: [Lang; 29] = [
+    const ALL: [Lang; 35] = [
         Lang::Sized,
         Lang::MetaSized,
         Lang::PointeeSized,
@@ -391,6 +397,12 @@ fn solver_lang(l: LangItem) -> Option<Lang> {
         Lang::ManuallyDrop,
         Lang::Future,
         Lang::FutureOutput,
+        Lang::AsyncFn,
+        Lang::AsyncFnMut,
+        Lang::AsyncFnOnce,
+        Lang::AsyncFnOnceOutput,
+        Lang::CallOnceFuture,
+        Lang::CallRefFuture,
     ];
     ALL.into_iter().find(|&s| lang_item(s) == l)
 }
@@ -733,7 +745,7 @@ impl<'a> FactCache<'a> {
                     K::ExProj(SDef(d), list(args)?, ty(term)?)
                 }
                 PNode::ExAuto(k) => K::ExAuto(SDef(k.0)),
-                PNode::Closure { .. } | PNode::Future(..) | PNode::Infer => {
+                PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } | PNode::Infer => {
                     return Err(CheckError::Malformed(Malformed::BodyTypeInRecord(q)).into());
                 }
             };
@@ -1098,19 +1110,61 @@ impl<'a> FactCache<'a> {
         let hidden = reads.opaque_hidden(k)?;
         let bounds = reads.predicates(k)?;
         let por = self.start();
+        // An async fn's hidden type is its block's future by identity (`PNode::Coroutine`,
+        // writeback): the solver's `Coroutine(coroutine_def(owner, ordinal), [output,
+        // interior])` from the owner's facts. Its `args` are the defining fn's own parameters
+        // (writeback writes them so), the same parameters the facts are in, so no substitution;
+        // any other `args` is refused by name.
         let hidden_ty = match hidden {
-            Some(h) => {
-                let c = self.table(q, h.types);
-                Some(self.ty(c, h.ty)?)
-            }
+            Some(h) => match h.types.node(h.ty).map_err(Stop::from)? {
+                PNode::Coroutine { owner, ordinal, args } => {
+                    let mut identity = true;
+                    for i in args.range() {
+                        let p = h.types.list_slot(i as usize).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))?;
+                        identity &= matches!(h.types.node(p).map_err(Stop::from)?, PNode::Param(j) if j as usize == i as usize - args.start as usize);
+                    }
+                    if !identity {
+                        return Err(CheckError::Unported("an opaque's hidden coroutine at arguments other than its owner's own").into());
+                    }
+                    let cq = Question::Coroutine(owner, ordinal);
+                    let Some(facts) = reads.coroutine(owner, ordinal)? else {
+                        return Err(CheckError::Malformed(Malformed::BodyTypeInRecord(cq)).into());
+                    };
+                    let c = self.table(cq, facts.types);
+                    let o = self.ty(c, facts.output)?;
+                    let i = self.ty(c, facts.interior)?;
+                    let start = self.lists.len() as u32;
+                    self.lists.push(o);
+                    self.lists.push(i);
+                    let t = STy(self.nodes.len() as u32);
+                    self.nodes.push(K::Coroutine(SDef(crate::coroutine_id::coroutine_def(owner, ordinal)), SList { start, len: 2 }));
+                    Some(t)
+                }
+                _ => {
+                    let c = self.table(q, h.types);
+                    Some(self.ty(c, h.ty)?)
+                }
+            },
             None => None,
         };
         let bc = self.table(Question::Predicates(k), bounds.types);
         let start = self.preds.len();
         self.clauses(bounds.clauses, bc)?;
+        // Each written bound with its trait's supertraits, transitively (`impl FnMut(u8) -> u16`
+        // is filed as `Opaque: FnMut<(u8,)>` and `<Opaque as FnOnce<(u8,)>>::Output == u16`,
+        // and `FnMut<Args>: FnOnce<Args>`): the solver reads a rigid alias's bounds as they are
+        // given (blaze-solve alias.rs `push_alias_bounds`), as for an associated type's item
+        // bounds (`item_bounds::elaborate_item_bounds`). The Reference, "Traits",
+        // "Supertraits": "anywhere a generic or trait object is bounded by a trait, it has
+        // access to the associated items of its supertraits".
+        let supers_read = self.elaborate_item_bounds(start, reads)?;
         let mut d = digest("blaze-typeck opaque bounds", &reads.digest(Question::Predicates(k))?);
-        if hidden.is_some() {
+        d ^= digest("blaze-typeck opaque bound supertraits", &supers_read);
+        if let Some(h) = hidden {
             d ^= digest("blaze-typeck opaque hidden", &reads.digest(q)?);
+            if let PNode::Coroutine { owner, ordinal, .. } = h.types.node(h.ty).map_err(Stop::from)? {
+                d ^= digest("blaze-typeck opaque hidden coroutine", &reads.digest(Question::Coroutine(owner, ordinal))?);
+            }
         }
         let row = OpaqueRow { bounds: Span::of(&self.preds, start), hidden: hidden_ty, por: self.end(por), digest: d };
         self.opaques.insert(k.0, row);

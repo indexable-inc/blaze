@@ -1,0 +1,4 @@
+[package]
+name = "ladder-s7-time-06-monotonic"
+version = "0.1.0"
+edition = "2024"

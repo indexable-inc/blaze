@@ -29,6 +29,9 @@ use core::hash::{BuildHasher, Hash, Hasher};
 
 use blaze_swiss::sync::Once;
 
+/// [`LazyKey::get_or`]: a lazy key filled from a key its caller drew.
+mod drawn;
+
 // libc's door to the operating system's randomness (POSIX 2024; macOS 10.12, glibc 2.25, musl,
 // wasi-libc): fills `len` bytes, at most 256, and returns 0, or -1 with `errno` set.
 unsafe extern "C" {
@@ -52,6 +55,11 @@ impl SipKey {
     /// kernel's `getrandom` on Linux, `getentropy` on macOS, `random_get` on WASI), drawn
     /// afresh for each key, so no two calls give related keys. A refusal is a panic naming it
     /// (rule no-fallback): there is no weaker source to fall back to.
+    ///
+    /// Ambient (rule 75, nothing-ambient): it reads the operating system from inside a library
+    /// call, so no simulation repeats a table keyed by it. The capability form is bstd's
+    /// `Io::sip_key` (one `Effect::Random` through the world's driver), its key handed to the
+    /// table's maker. Deleted by batch P4-random once its callers take a key from their maker.
     pub fn random() -> SipKey {
         let mut bytes = [0_u8; 16];
         // SAFETY: `bytes` is 16 writable bytes, within `getentropy`'s limit of 256, and it
@@ -111,6 +119,10 @@ impl LazyKey {
     }
 
     /// The key, drawn now if this is the first ask.
+    ///
+    /// Ambient: draws by [`SipKey::random`] inside the ask. The capability form is
+    /// [`LazyKey::get_or`] with the caller's draw. Deleted by batch P4-lazy once its callers
+    /// have moved.
     #[inline]
     pub fn get(&self) -> SipKey {
         *self.0.get_or_init(SipKey::random)

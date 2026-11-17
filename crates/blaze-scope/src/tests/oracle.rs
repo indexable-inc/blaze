@@ -20,8 +20,8 @@ use std::{format, vec};
 use blaze_id::{CrateItemKey, ItemKey};
 use blaze_sim::{Broke, Config, Tape};
 
-use super::{N, Solved, V, World, solve};
-use crate::resolver::Plant;
+use super::{N, Solved, V, World, solve, solve_planted};
+use crate::cells::CellPlant as Plant;
 use crate::{
     CallShape, Def, DefKind, Edition, Namespace, PathKind, Rename, ScopeError, Unresolved, UseForm, Visibility,
     WrittenVis,
@@ -1934,13 +1934,13 @@ fn compare_known(w: &World, root: ItemKey, s: &Solved, bug: Option<Bug>) -> Resu
 
 fn cold_case(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let (w, root) = draw(tape);
-    let s = solve(&w, None, plant).map_err(|e| Broke::Oracle(format!("the solver failed: {e}")))?;
+    let s = solve_planted(&w, plant).map_err(|e| Broke::Oracle(format!("the solver failed: {e}")))?;
     compare(&w, root, &s).map_err(|e| Broke::Oracle(format!("differs from the reference: {e}")))
 }
 
 /// The failed imports and calls the reference gives, and the comparison with the solver.
 fn failures(w: &World, root: ItemKey) -> (Vec<(ItemKey, u32, Unresolved)>, Vec<(ItemKey, Unresolved)>) {
-    let s = solve(w, None, Plant::None).expect("solves");
+    let s = solve(w, None).expect("solves");
     compare(w, root, &s).expect("equals the reference");
     let mut r = Ref::new(w, root);
     r.run();
@@ -2231,7 +2231,7 @@ fn replay_one_tape() {
     let mut r = Ref::new(&w, root);
     r.run();
     report.push_str(&format!("ref imports {:?}\nref calls {:?}\n", r.imports, r.calls));
-    let s = solve(&w, None, Plant::None);
+    let s = solve(&w, None);
     report.push_str(&format!("compare: {:?}\n", s.map(|s| compare(&w, root, &s))));
     // `ORACLE_OUT=<file>` keeps the whole report (a checker may cut the test's output).
     if let Ok(out) = std::env::var("ORACLE_OUT") {
@@ -2285,7 +2285,7 @@ fn dist_case(tape: &Tape, calls: bool, bug: Option<Bug>) -> Result<(), Broke> {
 }
 
 fn world_case((w, root): (World, ItemKey), bug: Option<Bug>) -> Result<(), Broke> {
-    let s = match solve(&w, None, Plant::None) {
+    let s = match solve(&w, None) {
         Ok(s) => s,
         // r3b (`known_run`): no answer to compare a planted reference against.
         Err(e) if e.contains(R3B) && super::name_rules::KNOWN.iter().any(|(n, _)| *n == "r3b") => return Ok(()),
@@ -2320,7 +2320,7 @@ fn known_run(label: &str, calls: bool) {
     // takes it, for `replay_one_tape` (with `ORACLE_DIST={label}`).
     let verdict = blaze_sim::search(Config::cases(CASES), |tape| {
         let (w, root) = if label == "deep" { draw_deep(tape) } else { reference_world(tape, true, calls) };
-        let s = match solve(&w, None, Plant::None) {
+        let s = match solve(&w, None) {
             Ok(s) => s,
             // r3b (name_rules.rs `KNOWN`): the solver's own group check fails, no answer.
             Err(e) if e.contains(R3B) && super::name_rules::KNOWN.iter().any(|(n, _)| *n == "r3b") => {

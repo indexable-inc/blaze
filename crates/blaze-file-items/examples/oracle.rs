@@ -27,7 +27,6 @@
 use std::{alloc::Global, collections::BTreeMap, path::PathBuf, time::Instant};
 
 use blaze_file_items::{Bodies, Outline, TokenColumns, chain_at, outline, outline_tokens, outline_with};
-use blaze_own::Alloc;
 use blaze_surface::{Edition, ErrorOrigin, ItemIndex};
 
 #[path = "../tests/render/mod.rs"]
@@ -57,6 +56,7 @@ fn tokens_proof(
     columns: &mut TokenColumns<'_>,
     written: &mut Vec<(u32, u32, u32)>,
     proof: &mut TokensProof,
+    heap: &'static blaze_own::Heap,
 ) {
     if let Err(why) = render::rerender(text, edition, again, columns, written) {
         proof.refused += 1;
@@ -68,7 +68,7 @@ fn tokens_proof(
         println!("TOKENS: the text written lexes to other tokens: {}", file.display());
         return;
     }
-    let from_tokens = match outline_tokens(again, columns, edition, Alloc::global()) {
+    let from_tokens = match outline_tokens(again, columns, edition, heap.alloc()) {
         Ok(outline) => outline,
         Err(why) => {
             proof.refused += 1;
@@ -76,7 +76,7 @@ fn tokens_proof(
             return;
         }
     };
-    let from_text = outline(again, edition, Alloc::global());
+    let from_text = outline(again, edition, heap.alloc());
     let parser_said = |of: &Outline<'_>| {
         let all: Vec<(u32, u32, String)> = of
             .errors()
@@ -113,16 +113,16 @@ enum Refused {
 }
 
 /// The definition: the outline with every body parsed with the rest.
-fn reference(text: &str, edition: Edition) -> Outline<'static> {
-    outline_with(text, edition, Bodies::Parsed, Alloc::global())
+fn reference(text: &str, edition: Edition, heap: &'static blaze_own::Heap) -> Outline<'static> {
+    outline_with(text, edition, Bodies::Parsed, heap.alloc())
 }
 
 /// The path under test.
-fn candidate(text: &str, edition: Edition) -> Result<Outline<'static>, Refused> {
+fn candidate(text: &str, edition: Edition, heap: &'static blaze_own::Heap) -> Result<Outline<'static>, Refused> {
     if u32::try_from(text.len()).is_err() {
         return Err(Refused::TooLong);
     }
-    Ok(outline(text, edition, Alloc::global()))
+    Ok(outline(text, edition, heap.alloc()))
 }
 
 /// The edition of the package a file is in, for `--own-edition`: the `edition` of the nearest
@@ -227,6 +227,7 @@ fn derived_equal(old: &Outline<'_>, new: &Outline<'_>, text: &str) -> bool {
 }
 
 fn main() {
+    let heap = blaze_own::Heap::process();
     let mut files: Vec<PathBuf, Global> = Vec::new_in(Global);
     let mut stack: Vec<PathBuf, Global> = Vec::new_in(Global);
     let mut own = false;
@@ -270,7 +271,7 @@ fn main() {
     let (mut reference_time, mut candidate_time) = (0f64, 0f64);
     let mut proof = TokensProof::default();
     let (mut again, mut written) = (String::new(), Vec::new());
-    let mut columns = TokenColumns::new_in(Alloc::global());
+    let mut columns = TokenColumns::new_in(heap.alloc());
     for file in &files {
         let Ok(text) = std::fs::read_to_string(file) else {
             not_utf8 += 1;
@@ -284,15 +285,15 @@ fn main() {
         };
         by_edition[edition as usize] += 1;
         let start = Instant::now();
-        let old = reference(&text, edition);
+        let old = reference(&text, edition, heap);
         reference_time += start.elapsed().as_secs_f64();
         entries += old.items().len();
         findings += old.errors().len();
         let start = Instant::now();
-        let new = candidate(&text, edition);
+        let new = candidate(&text, edition, heap);
         candidate_time += start.elapsed().as_secs_f64();
         if new.is_ok() {
-            tokens_proof(file, &text, edition, &mut again, &mut columns, &mut written, &mut proof);
+            tokens_proof(file, &text, edition, &mut again, &mut columns, &mut written, &mut proof, heap);
         }
         // Every key the candidate made, folded in order into one digest the run prints: two
         // runs over the same files print the same fold exactly when every entry's digest,

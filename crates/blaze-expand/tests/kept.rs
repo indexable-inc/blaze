@@ -1,13 +1,13 @@
-//! A crate's kept expansions as one set (`blaze_expand::kept`), the key a call's text makes
-//! (`text_key`), and a read list asked again (`Reads::hold`).
+//! A crate's kept expansions as one set (`blaze_expand::kept`), the one key of a call's
+//! expansion (`call_key`), and a read list asked again (`Reads::hold`).
 
 #![feature(allocator_api)]
 
 use blaze_expand::kept::{Asked, KeptEntry, KeptError, KeptSet, SetPlant, SetSource, write_entry, write_set, write_set_planted};
 use blaze_expand::{
-    BuiltinFn, Call, CallShape, CallSite, Ctx, DefAt, DefSite, DefText, Edition, ExpandCx, Expanded, Expansion, Export, Held,
-    HostAsk, HostError, HostWhy, IncludeAs, Included, LocalInner, MacroDefinition, Place, PlaceOf, ProcCall, Produced, ReadKind,
-    TextCall, TextKey, TokenStream, expand, lex, text_key,
+    BuiltinFn, Call, CallKey, CallSite, Ctx, DefAt, DefSite, Edition, ExpandCx, Expanded, Expansion, Export, Held, HostAsk,
+    HostError, HostWhy, IncludeAs, Included, LocalInner, MacroDefinition, Place, PlaceOf, ProcCall, Produced, ReadKind,
+    TokenStream, call_key, expand, lex,
 };
 use blaze_format::Aligned;
 use blaze_id::{ContentId, CrateItemKey};
@@ -58,13 +58,13 @@ fn at() -> DefAt {
 }
 
 fn tokens(text: &str) -> TokenStream<'static> {
-    lex(text, Edition::E2021, Alloc::global()).expect("the test's text lexes")
+    lex(text, Edition::E2021, blaze_own::testing::heap().alloc()).expect("the test's text lexes")
 }
 
 fn fn_like(def: &MacroDefinition<'static>, args: &str, cx: &Cx) -> Expansion<'static> {
     let input = tokens(args);
     let site = CallSite { edition: Edition::E2021, panic_edition: Edition::E2021, ctx: Ctx::root(Edition::E2021) };
-    match expand(def, &Call::fn_like(&input, site), cx, Alloc::global()).expect("the call expands") {
+    match expand(def, &Call::fn_like(&input, site), cx, blaze_own::testing::heap().alloc()).expect("the call expands") {
         Expanded::Expansion(expansion) => expansion,
         Expanded::NeedsExpanded(_) => panic!("the call is not eager"),
     }
@@ -72,53 +72,54 @@ fn fn_like(def: &MacroDefinition<'static>, args: &str, cx: &Cx) -> Expansion<'st
 
 const BODY: &str = "($name:ident) => { pub struct $name; impl $name { pub fn new() -> $name { $name } } };";
 
-fn call(input: &'static str) -> TextCall<'static> {
-    TextCall {
-        def: DefText::Rules { body: BODY },
-        def_name: "make",
-        def_krate: krate(1),
-        def_edition: Edition::E2021,
-        export: Export::Local,
-        local_inner: LocalInner::No,
-        shape: CallShape::FnLike,
-        attr: "",
-        edition: Edition::E2021,
-        input,
-    }
+/// The call site of every call here: a 2021 call written in source (the root context).
+fn site() -> CallSite {
+    CallSite { edition: Edition::E2021, panic_edition: Edition::E2021, ctx: Ctx::root(Edition::E2021) }
+}
+
+/// The key of `name!(input)` where `name` is `macro_rules! name { body }` at [`at`].
+fn key_of(body: &str, input: &str) -> CallKey {
+    let def = MacroDefinition::rules(tokens(body), at());
+    call_key(&def, &Call::fn_like(&tokens(input), site()))
+}
+
+/// The key of a call of [`BODY`].
+fn key(input: &str) -> CallKey {
+    key_of(BODY, input)
 }
 
 /// Three calls' entries, one with asked atoms.
-fn entries() -> Vec<(TextKey, Vec<u8>)> {
+fn entries() -> Vec<(CallKey, Vec<u8>)> {
     let def = MacroDefinition::rules(tokens(BODY), at());
     ["One", "Two", "Three"]
         .into_iter()
         .map(|input| {
-            let mut asked = Asked::new_in(Alloc::global());
+            let mut asked = Asked::new_in(blaze_own::testing::heap().alloc());
             if input == "Two" {
                 asked.push("unix", None, true).expect("fits");
                 asked.push("feature", Some("std"), false).expect("fits");
             }
-            let entry = write_entry(&asked, &fn_like(&def, input, &CX), Alloc::global()).expect("an entry");
-            (text_key(&call(input)), entry.to_vec())
+            let entry = write_entry(&asked, &fn_like(&def, input, &CX), blaze_own::testing::heap().alloc()).expect("an entry");
+            (key(input), entry.to_vec())
         })
         .collect()
 }
 
 /// `made`'s entries as [`write_set`] takes them.
-fn sources(made: &[(TextKey, Vec<u8>)]) -> Vec<(TextKey, SetSource<'_>)> {
+fn sources(made: &[(CallKey, Vec<u8>)]) -> Vec<(CallKey, SetSource<'_>)> {
     made.iter().map(|(key, bytes)| (*key, SetSource::Entry(&bytes[..]))).collect()
 }
 
 /// Whether every one of `made` reads back from `set` as it was put: found under its key, its
 /// asked atoms equal, its expansion equal (`==`, and the same record written again).
-fn reads_back(set: &KeptSet<'_>, made: &[(TextKey, Vec<u8>)]) -> bool {
+fn reads_back(set: &KeptSet<'_>, made: &[(CallKey, Vec<u8>)]) -> bool {
     made.iter().all(|(key, bytes)| {
         let put = KeptEntry::open(bytes).expect("a made entry opens");
-        let want = put.expansion(Alloc::global()).expect("a made entry reads");
+        let want = put.expansion(blaze_own::testing::heap().alloc()).expect("a made entry reads");
         let Ok(Some(entry)) = set.find(key) else { return false };
-        let Ok(got) = entry.expansion(Alloc::global()) else { return false };
+        let Ok(got) = entry.expansion(blaze_own::testing::heap().alloc()) else { return false };
         got == want
-            && got.write_record(Alloc::global())[..] == want.write_record(Alloc::global())[..]
+            && got.write_record(blaze_own::testing::heap().alloc())[..] == want.write_record(blaze_own::testing::heap().alloc())[..]
             && Iterator::eq(entry.asked(), put.asked())
     })
 }
@@ -131,11 +132,11 @@ fn reads_back(set: &KeptSet<'_>, made: &[(TextKey, Vec<u8>)]) -> bool {
 fn a_set_is_order_free_and_reads_every_entry_back() {
     let made = entries();
     let mut forward = sources(&made);
-    let mut backward: Vec<(TextKey, SetSource<'_>)> = forward.iter().rev().copied().collect();
+    let mut backward: Vec<(CallKey, SetSource<'_>)> = forward.iter().rev().copied().collect();
     // The same call made twice (two calls of one text in a crate) is one entry.
     backward.push(forward[0]);
-    let set = write_set(&mut forward, Alloc::global()).expect("a set");
-    assert_eq!(set[..], write_set(&mut backward, Alloc::global()).expect("a set")[..]);
+    let set = write_set(&mut forward, blaze_own::testing::heap().alloc()).expect("a set");
+    assert_eq!(set[..], write_set(&mut backward, blaze_own::testing::heap().alloc()).expect("a set")[..]);
     let aligned = Aligned::copy_from(&set);
     let opened = KeptSet::open(&aligned).expect("the set opens");
     assert_eq!(opened.len(), 3);
@@ -143,12 +144,12 @@ fn a_set_is_order_free_and_reads_every_entry_back() {
     for (key, _) in &made {
         let entry = opened.find(key).expect("the entry opens").expect("the key is in the set");
         let asked: Vec<(&str, Option<&str>, bool)> = entry.asked().map(|a| (a.name, a.value, a.answer)).collect();
-        match *key == text_key(&call("Two")) {
+        match *key == self::key("Two") {
             true => assert_eq!(asked, [("unix", None, true), ("feature", Some("std"), false)]),
             false => assert!(asked.is_empty()),
         }
     }
-    assert!(opened.find(&text_key(&call("Four"))).expect("nothing to open").is_none());
+    assert!(opened.find(&key("Four")).expect("nothing to open").is_none());
 }
 
 /// Two expansions under one key are refused by name (rule 21), never one of them picked: two
@@ -158,14 +159,14 @@ fn a_set_is_order_free_and_reads_every_entry_back() {
 fn two_values_under_one_key_and_a_cut_set_are_refused() {
     let made = entries();
     let mut clash = vec![(made[0].0, SetSource::Entry(&made[0].1[..])), (made[0].0, SetSource::Entry(&made[1].1[..]))];
-    assert_eq!(write_set(&mut clash, Alloc::global()).err(), Some(KeptError::TwoValues { key: made[0].0 }));
-    let set = write_set(&mut sources(&made), Alloc::global()).expect("a set");
+    assert_eq!(write_set(&mut clash, blaze_own::testing::heap().alloc()).err(), Some(KeptError::TwoValues { key: made[0].0 }));
+    let set = write_set(&mut sources(&made), blaze_own::testing::heap().alloc()).expect("a set");
     let opened = KeptSet::open(&set).expect("the set opens");
     let kept = opened.find(&made[0].0).expect("opens").expect("found");
     let mut mixed = vec![(made[0].0, SetSource::Kept(kept)), (made[0].0, SetSource::Entry(&made[1].1[..]))];
-    assert_eq!(write_set(&mut mixed, Alloc::global()).err(), Some(KeptError::TwoValues { key: made[0].0 }));
+    assert_eq!(write_set(&mut mixed, blaze_own::testing::heap().alloc()).err(), Some(KeptError::TwoValues { key: made[0].0 }));
     let mut agreeing = vec![(made[0].0, SetSource::Kept(kept)), (made[0].0, SetSource::Entry(&made[0].1[..]))];
-    assert!(write_set(&mut agreeing, Alloc::global()).is_ok(), "a kept entry and a made one of one value are one");
+    assert!(write_set(&mut agreeing, blaze_own::testing::heap().alloc()).is_ok(), "a kept entry and a made one of one value are one");
     assert!(matches!(KeptSet::open(&set[..set.len() - 1]).err(), Some(KeptError::Short { .. })));
     let mut other = set.to_vec();
     other[0] ^= 1;
@@ -174,30 +175,35 @@ fn two_values_under_one_key_and_a_cut_set_are_refused() {
     assert_eq!(KeptSet::open(&other).err(), Some(KeptError::OldForm));
 }
 
-/// Every input a text key names moves it: the definition's text, name, crate and edition, its
-/// export and `local_inner_macros`, the call's shape, attribute, edition and input.
+/// Every input `call_key` names moves it (rule 21): the definition's tokens, crate (what
+/// `$crate` names), def-site module, edition, export and `local_inner_macros`; the call's
+/// shape, edition, panic edition and input tokens. What is not an input does not: a comment or
+/// a space in the definition or the input.
 #[test]
-fn every_input_of_a_text_call_moves_its_key() {
-    let base = call("One");
+fn every_input_of_a_call_moves_its_key() {
+    let def_at = |at: DefAt, body: &str| MacroDefinition::rules(tokens(body), at);
+    let fn_like = |def: &MacroDefinition<'_>, input: &str, site: CallSite| call_key(def, &Call::fn_like(&tokens(input), site));
+    let base = def_at(at(), BODY);
+    let module = blaze_id::ItemKey(ContentId([9; 32]));
     let moved = [
-        TextCall { def: DefText::Rules { body: "() => {};" }, ..base },
-        TextCall { def: DefText::BuiltinDerive, ..base },
-        TextCall { def_name: "other", ..base },
-        TextCall { def_krate: krate(2), ..base },
-        TextCall { def_edition: Edition::E2018, ..base },
-        TextCall { export: Export::Exported, ..base },
-        TextCall { local_inner: LocalInner::Yes, ..base },
-        TextCall { shape: CallShape::Attr, ..base },
-        TextCall { attr: "path::attr", ..base },
-        TextCall { edition: Edition::E2018, ..base },
-        TextCall { input: "Two", ..base },
+        fn_like(&def_at(at(), "() => {};"), "One", site()),
+        fn_like(&def_at(DefAt { site: DefSite { krate: krate(2), module: None }, ..at() }, BODY), "One", site()),
+        fn_like(&def_at(DefAt { site: DefSite { krate: krate(1), module: Some(module) }, ..at() }, BODY), "One", site()),
+        fn_like(&def_at(DefAt { edition: Edition::E2018, ..at() }, BODY), "One", site()),
+        fn_like(&def_at(DefAt { export: Export::Exported, ..at() }, BODY), "One", site()),
+        fn_like(&def_at(DefAt { local_inner: LocalInner::Yes, ..at() }, BODY), "One", site()),
+        call_key(&base, &Call::attr(None, &tokens("One"), site())),
+        fn_like(&base, "One", CallSite { edition: Edition::E2018, ..site() }),
+        fn_like(&base, "One", CallSite { panic_edition: Edition::E2018, ..site() }),
+        fn_like(&base, "Two", site()),
     ];
-    let mut keys: Vec<TextKey> = moved.iter().map(text_key).collect();
-    keys.push(text_key(&base));
+    let mut keys: Vec<CallKey> = moved.to_vec();
+    keys.push(key("One"));
     keys.sort();
     keys.dedup();
     assert_eq!(keys.len(), moved.len() + 1, "two of the calls share a key");
-    assert_eq!(text_key(&base), text_key(&call("One")));
+    let spaced = BODY.replace("=>", " /* arm */  =>");
+    assert_eq!(fn_like(&def_at(at(), &spaced), "One /* the name */", site()), key("One"), "a comment or a space moved the key");
 }
 
 /// A read list holds while every read is answered as it was, names the first read answered
@@ -205,13 +211,13 @@ fn every_input_of_a_text_call_moves_its_key() {
 /// read it cannot ask again (an included file).
 #[test]
 fn a_read_list_is_asked_again_and_names_what_moved() {
-    let env = MacroDefinition::builtin_fn(BuiltinFn::Env, at(), Alloc::global());
-    let cfg = MacroDefinition::builtin_fn(BuiltinFn::Cfg, at(), Alloc::global());
-    let include = MacroDefinition::builtin_fn(BuiltinFn::IncludeStr, at(), Alloc::global());
+    let env = MacroDefinition::builtin_fn(BuiltinFn::Env, at(), blaze_own::testing::heap().alloc());
+    let cfg = MacroDefinition::builtin_fn(BuiltinFn::Cfg, at(), blaze_own::testing::heap().alloc());
+    let include = MacroDefinition::builtin_fn(BuiltinFn::IncludeStr, at(), blaze_own::testing::heap().alloc());
     let mut reads = fn_like(&env, "\"VAR\"", &CX).reads;
     reads.extend(&fn_like(&cfg, "unix", &CX).reads).expect("fits");
     assert_eq!(reads.list().iter().map(|r| r.kind).collect::<Vec<_>>(), [ReadKind::Env, ReadKind::Cfg]);
-    let hold = |cx: &Cx| reads.hold(cx, Edition::E2021, Alloc::global()).expect("the host answers");
+    let hold = |cx: &Cx| reads.hold(cx, Edition::E2021, blaze_own::testing::heap().alloc()).expect("the host answers");
     assert_eq!(reads.askable(), Ok(()));
     assert_eq!(hold(&CX), Held::Holds);
     assert_eq!(hold(&Cx { var: Some("two"), ..CX }), Held::Moved { read: 0 });
@@ -219,7 +225,7 @@ fn a_read_list_is_asked_again_and_names_what_moved() {
     assert_eq!(hold(&Cx { cfg: "windows", ..CX }), Held::Moved { read: 1 });
     let included = fn_like(&include, "\"a.txt\"", &CX).reads;
     assert_eq!(included.askable(), Err((0, ReadKind::IncludeStr)));
-    assert_eq!(included.hold(&CX, Edition::E2021, Alloc::global()), Ok(Held::NotAskable { read: 0, kind: ReadKind::IncludeStr }));
+    assert_eq!(included.hold(&CX, Edition::E2021, blaze_own::testing::heap().alloc()), Ok(Held::NotAskable { read: 0, kind: ReadKind::IncludeStr }));
 }
 
 /// A derive-like definition: three impls over the same forty-odd identifiers and punctuation,
@@ -230,17 +236,17 @@ const DERIVE: &str = "($name:ident) => { \
     impl ::core::cmp::PartialEq for $name { #[inline] fn eq(&self, other: &$name) -> bool { let _ = other; true } } \
 };";
 
-fn derive_key(name: &str) -> TextKey {
-    text_key(&TextCall { def: DefText::Rules { body: DERIVE }, input: name, ..call("") })
+fn derive_key(name: &str) -> CallKey {
+    key_of(DERIVE, name)
 }
 
 /// `n` calls of [`DERIVE`] on `Name0`, `Name1`, ..., each with its key and entry.
-fn derive_like(n: usize) -> Vec<(TextKey, Vec<u8>)> {
+fn derive_like(n: usize) -> Vec<(CallKey, Vec<u8>)> {
     let def = MacroDefinition::rules(tokens(DERIVE), at());
     (0..n)
         .map(|i| {
             let name = format!("Name{i}");
-            let entry = write_entry(&Asked::new_in(Alloc::global()), &fn_like(&def, &name, &CX), Alloc::global()).expect("an entry");
+            let entry = write_entry(&Asked::new_in(blaze_own::testing::heap().alloc()), &fn_like(&def, &name, &CX), blaze_own::testing::heap().alloc()).expect("an entry");
             (derive_key(&name), entry.to_vec())
         })
         .collect()
@@ -254,7 +260,7 @@ fn derive_like(n: usize) -> Vec<(TextKey, Vec<u8>)> {
 fn every_entry_of_a_large_set_reads_back_as_it_was_put() {
     let mut made = derive_like(1000);
     made.extend(entries());
-    let set = write_set(&mut sources(&made), Alloc::global()).expect("a set");
+    let set = write_set(&mut sources(&made), blaze_own::testing::heap().alloc()).expect("a set");
     let opened = KeptSet::open(&set).expect("the set opens");
     assert_eq!(opened.len(), made.len());
     assert!(reads_back(&opened, &made), "an entry read back otherwise than it was put");
@@ -272,14 +278,14 @@ fn two_making_orders_and_a_rewrite_from_the_set_give_equal_bytes() {
     let mut forward = sources(&made);
     let n = forward.len();
     // 7919 is prime and does not divide 200: a permutation.
-    let mut shuffled: Vec<(TextKey, SetSource<'_>)> = (0..n).map(|i| forward[(i * 7919) % n]).collect();
-    let set = write_set(&mut forward, Alloc::global()).expect("a set");
-    assert_eq!(set[..], write_set(&mut shuffled, Alloc::global()).expect("a set")[..]);
+    let mut shuffled: Vec<(CallKey, SetSource<'_>)> = (0..n).map(|i| forward[(i * 7919) % n]).collect();
+    let set = write_set(&mut forward, blaze_own::testing::heap().alloc()).expect("a set");
+    assert_eq!(set[..], write_set(&mut shuffled, blaze_own::testing::heap().alloc()).expect("a set")[..]);
     let opened = KeptSet::open(&set).expect("the set opens");
-    let mut found: Vec<(TextKey, SetSource<'_>)> =
+    let mut found: Vec<(CallKey, SetSource<'_>)> =
         (0..opened.len()).rev().map(|i| (opened.key(i), SetSource::Kept(opened.entry(i).expect("the entry opens")))).collect();
-    assert_eq!(set[..], write_set(&mut found, Alloc::global()).expect("a set")[..], "a set rewritten from itself is the same bytes");
-    let mut half: Vec<(TextKey, SetSource<'_>)> = made
+    assert_eq!(set[..], write_set(&mut found, blaze_own::testing::heap().alloc()).expect("a set")[..], "a set rewritten from itself is the same bytes");
+    let mut half: Vec<(CallKey, SetSource<'_>)> = made
         .iter()
         .enumerate()
         .map(|(i, (key, bytes))| match i % 2 {
@@ -287,7 +293,7 @@ fn two_making_orders_and_a_rewrite_from_the_set_give_equal_bytes() {
             _ => (*key, SetSource::Kept(opened.find(key).expect("the entry opens").expect("the key is in the set"))),
         })
         .collect();
-    assert_eq!(set[..], write_set(&mut half, Alloc::global()).expect("a set")[..], "half found, half made is the same bytes");
+    assert_eq!(set[..], write_set(&mut half, blaze_own::testing::heap().alloc()).expect("a set")[..], "half found, half made is the same bytes");
     println!("two making orders, a rewrite from the set and a half-found set: {} bytes each, equal", set.len());
 }
 
@@ -299,7 +305,7 @@ fn two_making_orders_and_a_rewrite_from_the_set_give_equal_bytes() {
 #[test]
 fn a_cut_or_changed_set_is_a_typed_refusal_never_a_panic() {
     let made = entries();
-    let set = write_set(&mut sources(&made), Alloc::global()).expect("a set");
+    let set = write_set(&mut sources(&made), blaze_own::testing::heap().alloc()).expect("a set");
     for len in 0..set.len() {
         let refused = KeptSet::open(&set[..len]).err();
         assert!(matches!(refused, Some(KeptError::Short { .. })), "the set cut at byte {len} of {}: {refused:?}", set.len());
@@ -315,7 +321,7 @@ fn a_cut_or_changed_set_is_a_typed_refusal_never_a_panic() {
         opened_after_change += 1;
         for index in 0..opened.len() {
             if let Ok(entry) = opened.entry(index) {
-                let _ = entry.expansion(Alloc::global());
+                let _ = entry.expansion(blaze_own::testing::heap().alloc());
                 let _ = entry.asked().count();
             }
         }
@@ -337,11 +343,11 @@ fn a_cut_or_changed_set_is_a_typed_refusal_never_a_panic() {
 #[test]
 fn a_set_of_derive_like_expansions_is_a_fraction_of_the_old_form() {
     let made = derive_like(1000);
-    let set = write_set(&mut sources(&made), Alloc::global()).expect("a set");
+    let set = write_set(&mut sources(&made), blaze_own::testing::heap().alloc()).expect("a set");
     let mut end = 0usize;
     for (_, bytes) in &made {
-        let expansion = KeptEntry::open(bytes).expect("opens").expansion(Alloc::global()).expect("reads");
-        end = end.next_multiple_of(16) + 16 + expansion.write_record(Alloc::global())[..].len();
+        let expansion = KeptEntry::open(bytes).expect("opens").expansion(blaze_own::testing::heap().alloc()).expect("reads");
+        end = end.next_multiple_of(16) + 16 + expansion.write_record(blaze_own::testing::heap().alloc())[..].len();
     }
     let old = (16 + made.len() * 40).next_multiple_of(16) + end;
     let ratio = set.len() as f64 / old as f64;
@@ -357,24 +363,80 @@ fn a_set_of_derive_like_expansions_is_a_fraction_of_the_old_form() {
 #[test]
 fn a_row_off_by_one_is_caught_by_the_round_trip() {
     let made = derive_like(3);
-    let set = write_set(&mut sources(&made), Alloc::global()).expect("a set");
+    let set = write_set(&mut sources(&made), blaze_own::testing::heap().alloc()).expect("a set");
     assert!(reads_back(&KeptSet::open(&set).expect("the set opens"), &made), "the unplanted set reads back");
-    let planted = write_set_planted(&mut sources(&made), SetPlant::RowOffByOne, Alloc::global()).expect("a planted set");
+    let planted = write_set_planted(&mut sources(&made), SetPlant::RowOffByOne, blaze_own::testing::heap().alloc()).expect("a planted set");
     let opened = KeptSet::open(&planted).expect("the planted set opens: its rows are in order");
     assert!(!reads_back(&opened, &made), "the planted row was not caught");
     println!("planted row off by one: caught by the round trip");
 }
 
-/// The hit's key: a definition digested once and each call keyed from the digest is the key
-/// `text_key` makes, and the planted variant without the definition's name moves it. Prints
-/// "def digest: 3 calls keyed from one digest equal text_key".
-#[test]
-fn a_key_from_the_definition_digest_is_the_text_key() {
-    let digest = blaze_expand::def_digest(&call("One"));
-    for input in ["One", "Two", "Three"] {
-        assert_eq!(blaze_expand::text_key_with(digest, &call(input)), text_key(&call(input)));
+/// How an asker of a call keys it: by [`call_key`] (both layers today), or the planted form of
+/// the two-key past, a key that also holds where the call is written.
+#[derive(Clone, Copy, PartialEq)]
+enum Keying {
+    One,
+    PlantedWithPlace,
+}
+
+/// One asker of a call: keys it, takes the kept expansion under its key when there is one, else
+/// expands it (counted in `runs`) and keeps it. Returns the expansion's record bytes.
+fn ask(
+    def: &MacroDefinition<'static>,
+    input: &TokenStream<'static>,
+    place: u8,
+    keying: Keying,
+    kept: &mut Vec<(CallKey, Vec<u8>)>,
+    runs: &mut u32,
+) -> Vec<u8> {
+    let call = Call::fn_like(input, site());
+    let mut key = call_key(def, &call);
+    if keying == Keying::PlantedWithPlace {
+        key.0.0[31] ^= place;
     }
-    let unnamed = blaze_expand::def_digest(&TextCall { def_name: "", ..call("One") });
-    assert_ne!(blaze_expand::text_key_with(unnamed, &call("One")), text_key(&call("One")));
-    println!("def digest: 3 calls keyed from one digest equal text_key");
+    if !kept.is_empty() {
+        let set = write_set(&mut sources(kept), blaze_own::testing::heap().alloc()).expect("a set");
+        let aligned = Aligned::copy_from(&set);
+        let opened = KeptSet::open(&aligned).expect("the set opens");
+        if let Some(entry) = opened.find(&key).expect("the entry opens") {
+            return entry.expansion(blaze_own::testing::heap().alloc()).expect("the kept expansion reads").write_record(blaze_own::testing::heap().alloc()).to_vec();
+        }
+    }
+    *runs += 1;
+    let expansion = match expand(def, &call, &CX, blaze_own::testing::heap().alloc()).expect("the call expands") {
+        Expanded::Expansion(expansion) => expansion,
+        Expanded::NeedsExpanded(_) => panic!("the call is not eager"),
+    };
+    let entry = write_entry(&Asked::new_in(blaze_own::testing::heap().alloc()), &expansion, blaze_own::testing::heap().alloc()).expect("an entry");
+    kept.push((key, entry.to_vec()));
+    expansion.write_record(blaze_own::testing::heap().alloc()).to_vec()
+}
+
+/// One call, one key, one expansion. The names library keys a statement call from its source
+/// text, lexed alone at the root context (blaze-scope resolve.rs `expand_decls`); the lowering
+/// keys the same call from the tokens of the body it lowers, copied out of the body's stream
+/// (blaze-lower by_name.rs `ByName::call`). Both key by `call_key`, so the call asked by the
+/// names library and then by the lowering is expanded ONCE (the counter of expander runs) and
+/// both see byte-equal output. The planted form (a key that also holds where the call is, as
+/// two layers' keys of one call differed before) runs it twice. Prints
+/// "one key: a call asked by the names library and the lowering is expanded once".
+#[test]
+fn a_call_asked_by_the_names_library_and_the_lowering_is_expanded_once() {
+    let def = MacroDefinition::rules(tokens(BODY), at());
+    let names_input = blaze_expand::lex_inside("Kept", Edition::E2021, blaze_own::testing::heap().alloc()).expect("the input lexes");
+    // The cause: the input lexed as a stream of its own ends `Alone`, not joint with the
+    // close delimiter the body's stream holds after it: another key.
+    assert_ne!(call_key(&def, &Call::fn_like(&tokens("Kept"), site())), call_key(&def, &Call::fn_like(&names_input, site())));
+    let body = tokens("fn f() { make!(Kept); }");
+    let at_name = (0..body.tokens().len()).find(|&i| body.text_at(i) == "Kept").expect("the body holds the call's input");
+    let lowering_input = body.copy_in(at_name..at_name + 1, blaze_own::testing::heap().alloc()).expect("the input copies");
+    for (keying, want_runs) in [(Keying::One, 1), (Keying::PlantedWithPlace, 2)] {
+        let mut kept = Vec::new();
+        let mut runs = 0;
+        let by_names = ask(&def, &names_input, 1, keying, &mut kept, &mut runs);
+        let by_lowering = ask(&def, &lowering_input, 2, keying, &mut kept, &mut runs);
+        assert_eq!(by_names, by_lowering, "the two layers saw different expansions of one call");
+        assert_eq!(runs, want_runs, "expander runs for one call asked twice");
+    }
+    println!("one key: a call asked by the names library and the lowering is expanded once");
 }

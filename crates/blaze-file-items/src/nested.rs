@@ -118,9 +118,15 @@ impl NestedKind {
     /// its one key, and its methods candidates at method calls in the block, where it is in
     /// scope: core's `Write::write_fmt` declares `trait SpecWriteFmt` and its impls in its
     /// body). A block's `fn`, `const`, `static` and `use` alone make none: the body's own
-    /// lowering resolves them.
+    /// lowering resolves them. A `mod` and an `extern crate` make one too (the same quote: a
+    /// module declared in a block, `mod __tokio_select_util { .. }`, and a crate bound in a
+    /// block, `extern crate alloc as __alloc;`, are names of that block, and a path through
+    /// them continues into what they hold: only the name solver at a module reads that).
     pub fn makes_module(self) -> bool {
-        matches!(self, NestedKind::Impl | NestedKind::Struct | NestedKind::Enum | NestedKind::Union | NestedKind::TypeAlias | NestedKind::Trait)
+        matches!(
+            self,
+            NestedKind::Impl | NestedKind::Struct | NestedKind::Enum | NestedKind::Union | NestedKind::TypeAlias | NestedKind::Trait | NestedKind::Mod | NestedKind::ExternCrate
+        )
     }
 }
 
@@ -486,11 +492,10 @@ pub fn scan<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
 #[cfg(test)]
 mod tests {
     use super::{NestedEnd, NestedKind, scan};
-    use blaze_own::Alloc;
 
     /// (kind, block, text) of each item found.
     fn items(text: &str) -> std::vec::Vec<(NestedKind, u32, &str)> {
-        let n = scan(text, Alloc::global());
+        let n = scan(text, blaze_own::testing::heap().alloc());
         assert_eq!(n.end, NestedEnd::Whole, "{text}");
         n.items.iter().map(|i| (i.kind, i.block, &text[i.range.start as usize..i.range.end as usize])).collect()
     }
@@ -504,7 +509,7 @@ mod tests {
         assert_eq!(got[1], (NestedKind::Fn, 1, "fn conv() {}"));
         assert_eq!(got[2].0, NestedKind::Impl);
         assert!(got[2].2.starts_with("#[automatically_derived]\n    impl alloy_sol_types::SolCall") && got[2].2.ends_with("} }"), "{}", got[2].2);
-        let n = scan(text, Alloc::global());
+        let n = scan(text, blaze_own::testing::heap().alloc());
         assert_eq!(n.blocks.len(), 2);
         assert_eq!((n.blocks[0].parent, n.blocks[1].parent), (None, Some(0)));
         assert_eq!(&text[n.blocks[1].open as usize..n.blocks[1].close as usize], "{ fn conv() {} }");
@@ -527,7 +532,7 @@ mod tests {
         let got = items("fn f() { let s = \"impl A for B {}\"; // impl C for D {}\n /* impl E for F {} */ m!{ impl G for H {} } v![impl I for J {}]; let x: &dyn Fn() -> Box<dyn K> = &|| todo!(); g(|| { impl L for M {} }); const { 1 }; unsafe { h() }; let y = S { a: 1 }; }");
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].2, "impl L for M {}");
-        let n = scan("fn f() { a::b!{ impl G for H {} } c!(); let x = d!(); if !(x) { e! { } } }", Alloc::global());
+        let n = scan("fn f() { a::b!{ impl G for H {} } c!(); let x = d!(); if !(x) { e! { } } }", blaze_own::testing::heap().alloc());
         assert!(n.items.is_empty());
         let text = "fn f() { a::b!{ impl G for H {} } c!(); let x = d!(); if !(x) { e! { } } }";
         let calls: std::vec::Vec<&str> = n.calls.iter().map(|c| &text[c.path.start as usize..c.path.end as usize]).collect();
@@ -558,7 +563,7 @@ mod tests {
         let kinds: std::vec::Vec<_> = got.iter().map(|g| (g.0, g.1)).collect();
         assert_eq!(kinds, [(NestedKind::ExternCrate, 0), (NestedKind::Impl, 0)], "{got:?}");
         assert_eq!(got[0].2, "#[allow(unused_extern_crates, clippy::useless_attribute)]\n    extern crate serde as _serde;");
-        let n = scan(text, Alloc::global());
+        let n = scan(text, blaze_own::testing::heap().alloc());
         assert_eq!(n.blocks.len(), 1, "the attribute's group and the impl's body are no blocks: {:?}", n.blocks);
         let calls: std::vec::Vec<&str> = n.calls.iter().map(|c| &text[c.range.start as usize..c.range.end as usize]).collect();
         assert_eq!(calls, ["_serde::__require_serde_not_serde_core!()"]);
@@ -608,15 +613,15 @@ mod tests {
     #[test]
     fn a_statement_call_has_its_whole_range() {
         let text = "fn f() { a::b!{ impl G for H {} } c!(1, (2)); let x = d!(); e![x]; }";
-        let n = scan(text, Alloc::global());
+        let n = scan(text, blaze_own::testing::heap().alloc());
         let calls: std::vec::Vec<&str> = n.calls.iter().map(|c| &text[c.range.start as usize..c.range.end as usize]).collect();
         assert_eq!(calls, ["a::b!{ impl G for H {} }", "c!(1, (2))", "e![x]"]);
     }
 
     #[test]
     fn an_unclosed_body_is_not_used() {
-        assert_eq!(scan("fn f() { impl A for B {", Alloc::global()).end, NestedEnd::Unbalanced);
-        assert_eq!(scan("fn f() { } }", Alloc::global()).end, NestedEnd::Unbalanced);
+        assert_eq!(scan("fn f() { impl A for B {", blaze_own::testing::heap().alloc()).end, NestedEnd::Unbalanced);
+        assert_eq!(scan("fn f() { } }", blaze_own::testing::heap().alloc()).end, NestedEnd::Unbalanced);
     }
 
     /// A trait declared in a block makes its block a module of the names library, alone (no
@@ -630,10 +635,10 @@ mod tests {
         let alone = "fn f() { trait T { fn m(&self) -> u8 { 1 } } 0u8.m(); }";
         let got = items(alone);
         assert_eq!(got, [(NestedKind::Trait, 0, "trait T { fn m(&self) -> u8 { 1 } }")]);
-        assert!(scan(alone, Alloc::global()).makes_module(), "a block's trait makes no module");
+        assert!(scan(alone, blaze_own::testing::heap().alloc()).makes_module(), "a block's trait makes no module");
         let write_fmt = "fn write_fmt(&mut self, args: Arguments<'_>) -> Result { trait SpecWriteFmt { fn spec_write_fmt(self, args: Arguments<'_>) -> Result; } impl<W: Write + ?Sized> SpecWriteFmt for &mut W { fn spec_write_fmt(self, args: Arguments<'_>) -> Result { write(self, args) } } self.spec_write_fmt(args) }";
         let kinds: std::vec::Vec<NestedKind> = items(write_fmt).iter().map(|i| i.0).collect();
         assert_eq!(kinds, [NestedKind::Trait, NestedKind::Impl]);
-        assert!(!scan("fn f() { fn g() {} g() }", Alloc::global()).makes_module());
+        assert!(!scan("fn f() { fn g() {} g() }", blaze_own::testing::heap().alloc()).makes_module());
     }
 }

@@ -414,6 +414,17 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             UnOp::Not | UnOp::Neg => {
                 let builtin = if op == UnOp::Not { self.is_integral(t) || self.is_bool(t) } else { self.is_neg_builtin(t) };
                 if builtin {
+                    // rustc's `check_expr_unop`: `-x` on an integer variable still owes `Neg`,
+                    // so a variable that later resolves to an unsigned type is refused when the
+                    // obligation is solved ([`NEG_UNSIGNED`]); the builtin type is kept for
+                    // inference. A concrete signed integer or float has core's impl: nothing owed.
+                    if false && op == UnOp::Neg
+                        && matches!(self.view(t), TyView::Infer(Var { kind: VarKind::Int, .. }))
+                        && let Some(tr) = self.lang(LangItem::Neg)?
+                    {
+                        let args = self.mk_list(&[t])?;
+                        self.register_trait(tr, args, Cause::Expr(e))?;
+                    }
                     return Ok(Flow::Done(t));
                 }
                 let item = if op == UnOp::Not { LangItem::Not } else { LangItem::Neg };

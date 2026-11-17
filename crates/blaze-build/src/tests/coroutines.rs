@@ -158,3 +158,155 @@ fn a_coroutine_is_named_by_owner_ordinal_and_arguments() {
     assert!(refused.contains("named by its expression"), "the refusal does not name the form: {refused}");
     println!("coroutine identity: owner {:#x} ordinal 0 read back; ordinals 0 and 1 differ; a future named by its expression refused", OWNER.0);
 }
+
+/// The key of `enum Option<T> { None, Some(T) }` in [`NicheWorld`].
+const OPTION: ItemKey = ItemKey(0x0f);
+
+/// A world with one coroutine, ordinal 0 of [`OWNER`]: its upvars `(u64,)`, its output `u64`,
+/// and the state the pass would lay out for a body of ONE point: 8 bytes of upvars, an `i8`
+/// tag at 8, 16 bytes aligned to 8 (tags `0..=3`: Unresumed 0, Returned 1, Panicked 2, point 0
+/// is 3). And `Option`. `niche`: what it answers for `coroutine_niche`.
+struct NicheWorld {
+    types: PortableTys<'static>,
+    env: PTy,
+    output: PTy,
+    state: StateShape,
+    niche: Option<crate::StateNiche>,
+    option_types: PortableTys<'static>,
+    option_variants: [blaze_typeck::Variant; 2],
+    option_fields: [blaze_typeck::Field; 1],
+}
+
+impl NicheWorld {
+    fn new(answer_niche: bool) -> NicheWorld {
+        let mut types = PortableTys::new_in(Alloc::global());
+        let wide = types.intern(PNode::Uint(UintTy::U64)).unwrap();
+        let fields = types.intern_list(&[wide]).unwrap();
+        let env = types.intern(PNode::Tuple(fields)).unwrap();
+        let layout = blaze_lir::coroutine::StateLayout { size: 16, align: 3, tag_offset: 8, tag_ty: Ty::I8, points: 1, fields: std::vec::Vec::new_in(Global) };
+        let state = StateShape::of(&layout);
+        let niche = answer_niche.then(|| crate::niche_of(&layout));
+        let mut option_types = PortableTys::new_in(Alloc::global());
+        let param = option_types.intern(PNode::Param(0)).unwrap();
+        let option_fields = [blaze_typeck::Field { name: blaze_typeck::Name(0), ty: param }];
+        let none = blaze_typeck::Variant {
+            key: ItemKey(OPTION.0 * 64),
+            name: blaze_typeck::Name(0),
+            ctor: blaze_typeck::CtorKind::Tuple,
+            fields: blaze_typeck::List { start: 0, len: 0 },
+        };
+        let some = blaze_typeck::Variant {
+            key: ItemKey(OPTION.0 * 64 + 1),
+            name: blaze_typeck::Name(1),
+            ctor: blaze_typeck::CtorKind::Tuple,
+            fields: blaze_typeck::List { start: 0, len: 1 },
+        };
+        NicheWorld { types, env, output: wide, state, niche, option_types, option_variants: [none, some], option_fields }
+    }
+}
+
+impl LayoutFacts for NicheWorld {
+    fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {
+        (key == OPTION).then(|| Adt {
+            kind: blaze_typeck::AdtKind::Enum,
+            generics: 1,
+            variants: &self.option_variants,
+            fields: &self.option_fields,
+            types: self.option_types.view(),
+        })
+    }
+
+    fn repr(&self, _: ItemKey) -> ReprAttrs {
+        ReprAttrs::RUST
+    }
+
+    fn discriminant(&self, _: ItemKey, _: u32) -> Result<Option<i128>, Missing> {
+        Ok(None)
+    }
+
+    fn valid_range(&self, _: ItemKey) -> ValidRange {
+        ValidRange::default()
+    }
+
+    fn coroutine(&self, owner: ItemKey, ordinal: u32) -> Option<CoroutineFacts<'_>> {
+        (owner == OWNER && ordinal == 0).then(|| CoroutineFacts { types: self.types.view(), env: self.env, output: self.output })
+    }
+
+    fn coroutine_state(&self, owner: ItemKey, ordinal: u32, args: &[PTy], _: PTys<'_>) -> Result<Option<StateShape>, Missing> {
+        Ok((owner == OWNER && ordinal == 0 && args.is_empty()).then_some(self.state))
+    }
+
+    fn coroutine_niche(&self, owner: ItemKey, ordinal: u32, args: &[PTy], _: PTys<'_>) -> Result<Option<crate::StateNiche>, Missing> {
+        Ok(if owner == OWNER && ordinal == 0 && args.is_empty() { self.niche } else { None })
+    }
+}
+
+/// A coroutine's tag holds only `0..=2 + points` (the pass, blaze_lir coroutine.rs: "`Unresumed`
+/// 0, `Returned` 1, `Panicked` 2, point `k` is `3 + k`"), so its other values are a niche, as
+/// layout.rs's module doc says of any scalar "whose valid values are a proper range", and an
+/// enum around the future encodes its other variants there. The Reference ("Type layout")
+/// leaves a future's layout unspecified, and core's option.rs ("Representation") guarantees
+/// `Option<T>` the size of `T` only for its listed `T` ("Rust guarantees to optimize the
+/// following types `T` such that [`Option<T>`] has the same size, alignment, and [function
+/// call ABI] as `T`"): a future is not listed, so this is blaze's layout choice, and right
+/// because no future value ever holds a tag past `2 + points`. A 16-byte state with one point
+/// and its `i8` tag at 8: `size_of::<Option<F>>() == size_of::<F>() == 16`, and `None` is the
+/// tag value 4 (the first after `0..=3`) at offset 8.
+///
+/// Controls: a world that does not answer the tag's range gives the tagged `Option` (24 bytes:
+/// the tag at 0, the future at 8); an answer about another tag than the state's (offset 0) is
+/// refused by name, never used. Without the `PNode::Future` arm filling the niche the first
+/// assertion fails: "Option<future> must use the tag's niche: 24 != 16".
+///
+/// Prints: `tag niche: future 16 bytes, niche at 8 valid 0..=3; Option<future> 16 bytes, None is 4 at 8; unanswered 24 bytes; another tag's answer refused`
+#[test]
+fn option_of_a_future_takes_the_tag_niche() {
+    use crate::layout::{Prim, TagEncoding, Variants, WrappingRange};
+
+    let world = NicheWorld::new(true);
+    let mut ground = PortableTys::new_in(Alloc::global());
+    let t = coroutine_ty(&mut ground);
+    let arg = ground.intern_list(&[t]).unwrap();
+    let option = ground.intern(PNode::Adt(OPTION, arg)).unwrap();
+    let mut ls = Layouts::new_in(Global);
+
+    let id = ls.of(t, &mut LayoutCx { ground: &mut ground, facts: &world, scratch: Alloc::global() }).unwrap_or_else(|error| panic!("the future was refused: {error}"));
+    let future = *ls.get(id);
+    assert_eq!((future.size, future.align), (16, 3));
+    let niche = future.niche.expect("a future's state must offer its tag's invalid values as a niche");
+    assert_eq!(niche.offset, 8, "the niche is not the tag's");
+    assert_eq!(niche.scalar.prim, Prim::Int { bytes: 1, signed: false });
+    assert_eq!(niche.scalar.valid, WrappingRange { start: 0, end: 3 }, "one point: tags 0..=3 are valid");
+
+    let id = ls.of(option, &mut LayoutCx { ground: &mut ground, facts: &world, scratch: Alloc::global() }).unwrap_or_else(|error| panic!("Option<future> was refused: {error}"));
+    let row = *ls.get(id);
+    assert!(row.size == 16, "Option<future> must use the tag's niche: {} != 16", row.size);
+    match row.variants {
+        Variants::Multiple { tag_offset: 8, encoding: TagEncoding::Niche { untagged: 1, first: 0, last: 0, start: 4 }, .. } => {}
+        other => panic!("None is not the tag value 4 at offset 8: {other:?}"),
+    }
+
+    // Control 1: no answer, no niche: the tagged form.
+    let plain = NicheWorld::new(false);
+    let mut ground = PortableTys::new_in(Alloc::global());
+    let t = coroutine_ty(&mut ground);
+    let arg = ground.intern_list(&[t]).unwrap();
+    let option = ground.intern(PNode::Adt(OPTION, arg)).unwrap();
+    let mut ls = Layouts::new_in(Global);
+    let id = ls.of(option, &mut LayoutCx { ground: &mut ground, facts: &plain, scratch: Alloc::global() }).unwrap_or_else(|error| panic!("Option<future> was refused: {error}"));
+    let unanswered = ls.get(id).size;
+    assert_eq!(unanswered, 24, "with no niche Option<future> is the tag at 0 then the 16-byte future at 8");
+
+    // Control 2: an answer about another tag than the state's is refused by name.
+    let mut other = NicheWorld::new(true);
+    other.niche = Some(crate::StateNiche { tag_offset: 0, tag_ty: Ty::I8, valid_end: 3 });
+    let mut ground = PortableTys::new_in(Alloc::global());
+    let t = coroutine_ty(&mut ground);
+    let mut ls = Layouts::new_in(Global);
+    let refused = match ls.of(t, &mut LayoutCx { ground: &mut ground, facts: &other, scratch: Alloc::global() }) {
+        Ok(_) => panic!("a niche about another tag than the state's was used"),
+        Err(error) => format!("{error}"),
+    };
+    assert!(refused.contains("another tag"), "the refusal does not name the rule: {refused}");
+    println!("tag niche: future 16 bytes, niche at 8 valid 0..=3; Option<future> {} bytes, None is 4 at 8; unanswered {unanswered} bytes; another tag's answer refused", row.size);
+}

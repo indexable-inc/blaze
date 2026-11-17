@@ -39,6 +39,8 @@ use blaze_scope::resolve::{Names, Place};
 use blaze_scope::task::{ItemText, MacroBody, MacroSrc, Variant};
 use blaze_surface::{Def, Edition, ItemDetail, ItemIndex, ItemKind, Namespace};
 
+mod item_grain;
+
 use super::index::ImplAt;
 
 /// The names as this command solved them: the first [`NamesSource`].
@@ -485,6 +487,11 @@ pub enum SourceError<'n> {
     /// key (a library key's first 16 bytes) would stand for both (`keys::KeyClash`, as the
     /// records path meets it: [`NamesSource::key_beginning`]).
     KeysBeginAlike { krate: usize, name: &'n str, first: ItemKey, second: ItemKey },
+    /// The item's file changed since its items record was written and the item's HEAD moved
+    /// (`found`: today's head) or no single entry of today's text has its chain (`found:
+    /// None`): this item's row is stale and no text of it is answered (item_grain.rs). The
+    /// crate's scope is remade by its own key.
+    ItemStale { krate: usize, name: &'n str, key: ItemKey, file: u32, saw: blaze_id::ContentId, found: Option<blaze_id::ContentId> },
 }
 
 impl core::fmt::Display for SourceError<'_> {
@@ -498,6 +505,12 @@ impl core::fmt::Display for SourceError<'_> {
             SourceError::Gap { question, key: None } => write!(f, "no record answers yet: {question}"),
             SourceError::KeysBeginAlike { krate, name, first, second } => {
                 write!(f, "the records of crate `{name}` (crate {krate}) hold two keys that begin with the same 16 bytes, {first:x} and {second:x}: one checker key would stand for both")
+            }
+            SourceError::ItemStale { krate, name, key, file, saw, found: Some(found) } => {
+                write!(f, "item {key:x} of crate `{name}` (crate {krate}), file {file}: its head changed since its items record was written (saw {saw:?}, today {found:?}): its crate's scope is remade by its own key")
+            }
+            SourceError::ItemStale { krate, name, key, file, saw, found: None } => {
+                write!(f, "item {key:x} of crate `{name}` (crate {krate}), file {file}: no single entry of the file as it is now has its place by names (head {saw:?} when written): its crate's scope is remade by its own key")
             }
         }
     }
@@ -680,6 +693,10 @@ impl<'n> Records<'n> {
     /// The whole text `at` of crate `krate`, as the loader has it today and the items record
     /// proves it (its digest): what a body's chain is computed in
     /// (`project_records::BodySource`). `None` with the reason filed in the log.
+    ///
+    /// The WHOLE text's digest is what this asks: a file with any byte changed is refused.
+    /// A reader that reads the items in a file one by one asks [`Records::file_now`]
+    /// (item_grain.rs) instead.
     pub fn whole_text(&'n self, krate: usize, at: blaze_scope::resolve::At) -> Option<&'n str> {
         self.items_of(krate)?;
         self.read(krate, self.items.whole(krate, at))
@@ -945,15 +962,19 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
             return None;
         }
         let krate = self.items.crate_of(key)?;
-        let record = self.items_of(krate)?;
-        let row = self.read(krate, record.item(key))??;
+        // No record: the loader filed `NoRecord` the one time it was asked.
+        self.items_of(krate)?;
+        // At item grain (item_grain.rs): an edit elsewhere in the file, or inside this item's
+        // body, leaves its row standing at today's place; a moved head is refused by name.
+        let now = self.row_now(krate, key)?;
+        let row = now.row;
         let Some(span) = row.text else {
             self.log.put(SourceError::Items { krate, name: self.log.name(krate), error: ItemsRecordError::NoPlace { key } });
             return None;
         };
-        let text = self.read(krate, self.items.text(krate, span))?;
+        let text = self.span_now(krate, &now, span)?;
         let impl_header = match row.impl_header {
-            Some(header) => Some(self.read(krate, self.items.text(krate, header))?),
+            Some(header) => Some(self.span_now(krate, &now, header)?),
             None => None,
         };
         Some(ItemText { key, module: row.module, item: row.outline, name: row.name, impl_header, text })
@@ -973,8 +994,10 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
 
     fn place_of(self, key: ItemKey) -> Option<Place> {
         let krate = self.items.crate_of(key)?;
-        let record = self.items_of(krate)?;
-        let row = self.read(krate, record.item(key))??;
+        self.items_of(krate)?;
+        // Today's outline entry (item_grain.rs): a body edit that adds or removes an item
+        // nested in a body moves the entries after it.
+        let row = self.row_now(krate, key)?.row;
         Some(Place { krate, at: row.text?.at, item: row.outline })
     }
 
@@ -1010,7 +1033,7 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         for row in rows.iter() {
             // A member whose text does not read is an error filed; the rest are still given,
             // and the log voids the result.
-            let Some(text) = self.read(krate, self.items.member_text(owner, row)) else { continue };
+            let Some(text) = self.member_text_now(krate, owner, row) else { continue };
             each(MemberOf {
                 key: row.key,
                 name: row.name,
@@ -1043,9 +1066,10 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         }
         for i in 0..record.impls() {
             let Some(Some(row)) = self.read(krate, record.impl_at(i)) else { continue };
-            let Some(Some(item)) = self.read(krate, record.item(row.key)) else { continue };
-            let header = match item.impl_header {
-                Some(span) => match self.read(krate, self.items.text(krate, span)) {
+            // At item grain (item_grain.rs): a body edit in the impl's file leaves its header.
+            let Some(now) = self.row_now(krate, row.key) else { continue };
+            let header = match now.row.impl_header {
+                Some(span) => match self.span_now(krate, &now, span) {
                     Some(text) => text,
                     None => continue,
                 },
@@ -1108,13 +1132,14 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
     }
 
     fn impl_with_header(self, krate: usize, key: ItemKey, module: ItemKey) -> Option<ImplAt<'n>> {
-        let record = self.items_of(krate)?;
-        let item = self.read(krate, record.item(key))??;
-        let Some(span) = item.impl_header else {
+        self.items_of(krate)?;
+        // At item grain (item_grain.rs), as `text_of`.
+        let now = self.row_now(krate, key)?;
+        let Some(span) = now.row.impl_header else {
             self.gap("an impl's header text (its item row has no header range)", Some(key));
             return None;
         };
-        let header = self.read(krate, self.items.text(krate, span))?;
+        let header = self.span_now(krate, &now, span)?;
         Some(ImplAt { krate, key, module, header })
     }
 

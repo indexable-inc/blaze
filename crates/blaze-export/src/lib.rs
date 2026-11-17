@@ -26,12 +26,14 @@
 
 mod bytes;
 pub mod check;
+pub mod eh_out;
 pub mod elf;
 pub mod error;
 pub mod export;
 pub mod input;
 pub mod layout;
 pub mod macho;
+pub mod optimized;
 mod plant;
 pub mod sign;
 pub mod start;
@@ -39,6 +41,9 @@ pub mod start;
 pub use error::ExportError;
 pub use export::{Exported, Panics, export};
 pub use input::{Data, DataPlace, DataWord, Entry, Function, Panic, Platform, Profile, ProgramIn, Tier};
+pub use optimized::{Function02, ProgramIn02, export_optimized, v1_to_v2};
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod optimized_tests;

@@ -1,0 +1,29 @@
+[package]
+name = "blaze-spawn"
+description = "The spawn seam as records: a build step's spawned command as a canonical request keyed from text (step key, personality, declared machine, pinned tools, sorted environment, read grant by content), the sandbox's answer as a canonical record, and the executor seam with its typed sandbox-off refusal (READINESS.md 1a, S1, S2, S5)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `Vec`, `String` and `Alloc`: every list and string of a record, in the allocator the caller names.
+blaze-own.workspace = true
+# `ContentId`: the step, the userland, every read's and present file's content, and the record keys.
+blaze-ids.workspace = true
+
+[dev-dependencies]
+# `Alloc::global()`, which the tests hand down (blaze-own's `std` feature).
+blaze-own = { workspace = true, features = ["std", "testing"] }
+# `check`: the round-trip and order properties.
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

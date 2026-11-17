@@ -14,7 +14,7 @@ use super::strs::{StrPolicy, StrScheme, encode_strs};
 use super::{IdView, IntView, StrView, encode_ids};
 
 fn global() -> Alloc<'static> {
-    Alloc::global()
+    blaze_own::testing::heap().alloc()
 }
 
 fn oracle(why: String) -> Broke {

@@ -37,6 +37,7 @@ use core::fmt;
 use core::fmt::Write as _;
 
 use blaze_build_script::OutputsRef;
+use blaze_expand::seen::{MemberDirError, SeenRoot};
 use blaze_id::{ContentId, CrateItemKey};
 use blaze_manifest::lock::{Lock, LockId};
 use blaze_own::{AVec, Alloc};
@@ -75,6 +76,32 @@ pub enum Origin {
     Toolchain { unit: u32, krate: u32 },
 }
 
+/// A workspace member: its package in the lock and its directory under the workspace, the
+/// one it sees itself at (`/workspace/<dir>`, D96 (3)).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Member<'m> {
+    id: LockId,
+    seen: SeenRoot<'m>,
+}
+
+impl<'m> Member<'m> {
+    /// The member `id` at `dir` under the workspace (`""` for the root package); a `dir` that
+    /// is not a plain path under it is refused by name.
+    pub fn new(id: LockId, dir: &'m str) -> Result<Member<'m>, MemberDirError<'m>> {
+        Ok(Member { id, seen: SeenRoot::member(dir)? })
+    }
+
+    /// Its package in the lock.
+    pub fn id(&self) -> LockId {
+        self.id
+    }
+}
+
+/// The root a unit of package `package` sees: its member's, else `/package` (D96).
+pub(crate) fn seen_of<'m>(members: &[Member<'m>], package: LockId) -> SeenRoot<'m> {
+    members.iter().find(|m| m.id == package).map_or(SeenRoot::Package, |m| m.seen)
+}
+
 /// One crate of the list.
 pub struct UnitCrate<'a> {
     pub name: &'a str,
@@ -83,7 +110,11 @@ pub struct UnitCrate<'a> {
     pub edition: Edition,
     pub implicit: Implicit,
     pub root: Text<'a>,
+    /// The folder its files are read under (`/package/<lock index>/`): the reader's path space.
     pub shown_from: Text<'a>,
+    /// The root the crate sees (D96): `/package` for a dependency or a toolchain crate,
+    /// `/workspace/<dir>` for a member ([`Member`]).
+    pub seen: SeenRoot<'a>,
     pub features: AVec<'a, &'a str>,
     /// The name it calls each dependency, and that crate's index in [`UnitCrates::crates`].
     pub deps: AVec<'a, (&'a str, usize)>,
@@ -252,7 +283,7 @@ impl fmt::Display for UnitsError<'_> {
 pub fn unit_crates<'a>(
     graph: &'a UnitGraph<'_>,
     lock: &'a Lock<'_>,
-    members: &[LockId],
+    members: &[Member<'a>],
     toolchain: ToolchainView<'a>,
     triple: &'a str,
     alloc: Alloc<'a>,
@@ -265,7 +296,7 @@ pub fn unit_crates<'a>(
     for (at, u) in units.iter().enumerate() {
         // A member's test unit is a root too (the graph makes one only when tests are asked:
         // `Ask::tests`): left out, `--tests` solved no unit with `test` in its cfg.
-        if members.contains(&u.package) && !u.for_host && matches!(u.kind, UnitKind::Lib | UnitKind::Bin(_) | UnitKind::Test { .. } | UnitKind::IntegrationTest(_) | UnitKind::Example(_) | UnitKind::Bench(_)) {
+        if members.iter().any(|m| m.id == u.package) && !u.for_host && matches!(u.kind, UnitKind::Lib | UnitKind::Bin(_) | UnitKind::Test { .. } | UnitKind::IntegrationTest(_) | UnitKind::Example(_) | UnitKind::Bench(_)) {
             todo.push(at);
         }
     }
@@ -338,6 +369,7 @@ pub fn unit_crates<'a>(
             implicit: implicit(u.edition, &u.kind),
             root,
             shown_from: base,
+            seen: seen_of(members, u.package),
             features,
             deps,
             cfg,
@@ -456,6 +488,7 @@ fn toolchain_crates<'a>(
             implicit: implicit(rust, if proc_macro { &UnitKind::ProcMacro } else { &UnitKind::Lib }),
             root,
             shown_from: base,
+            seen: SeenRoot::Package,
             features,
             deps,
             cfg,

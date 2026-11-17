@@ -113,7 +113,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
     }
 
     /// The value of `value` when an `iconst` defines it: the cell invariant's bits.
-    fn constant_of(&self, value: Value) -> Option<u64> {
+    pub(super) fn constant_of(&self, value: Value) -> Option<u64> {
         let at = value.index();
         if self.view.op(at) != Op::Iconst {
             return None;

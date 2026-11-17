@@ -22,6 +22,9 @@ extern crate std;
 mod asks;
 mod body;
 mod columns;
+/// A coroutine's identity across bodies: an async block's ordinal (the rule blaze-build's
+/// `coroutines_in` shares) and the solver def of `(owner, ordinal)`.
+pub mod coroutine_id;
 mod diag;
 /// Dyn compatibility: the rule's one home (facts in, verdict out).
 pub mod dyn_compat;
@@ -31,6 +34,7 @@ mod hash;
 mod ids;
 /// The real type context over blaze-ty and blaze-solve.
 pub mod infer;
+mod impl_kinds;
 mod instance;
 mod intern;
 mod machine;
@@ -78,7 +82,7 @@ pub use ids::{
 pub use portable::{MAX_OBJECT_PREDS, MAX_PATTERN_RANGES, OwnTys, PNode, PTy, PTys, PortableTys, canonical_ranges, object_principal};
 pub use ty::{Cause, ClosureKind, FulfillError, FulfillErrorKind, Goal, Obligation, Ty, TyList, TyView, TypeCtx, Var, VarKind};
 pub use world::{
-    Adt, AdtKind, ArgsAfterSelf, SplitSelf, AssocGenerics, AssocItem, AssocKind, AssocParent, AssocTyDef, ClosureFacts, ConstHolds, ConstParams, CtorKind, Def, Fetch, Field, FnSig,
+    Adt, AdtKind, ArgsAfterSelf, SplitSelf, AssocGenerics, AssocItem, AssocKind, AssocParent, AssocTyDef, ClosureFacts, CoroutineFacts, ConstHolds, ConstParams, CtorKind, Def, Fetch, Field, FnSig,
     Hidden, ImplHeader, ImplPolarity, Missing, Needs, PClause, PathRes, Predicates, Prim, Question, ReadList, Reads, RecordKind, Seal, Shape,
     TraitDef, TraitFlags, TraitMembers, TypeAttrs, DiscrRepr, Variant, World, ground_args_digest,
 };

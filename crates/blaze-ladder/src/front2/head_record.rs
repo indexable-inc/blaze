@@ -56,7 +56,8 @@ type Mem = Alloc<'static>;
 const MAGIC: [u8; 4] = *b"BZHD";
 /// Raised on any change of the form: an old record is then [`HeadRecordError::Version`].
 /// 2: an impl's record holds one `self` flag per fn (`ImplHead::fn_self`, brief 14).
-pub const VERSION: u32 = 2;
+/// 3: a fn's record holds its C-variadic flag after its body flag (`FnHead::c_variadic`).
+pub const VERSION: u32 = 3;
 /// The digest domains: the record's out digest and a fn text's check.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -430,6 +431,7 @@ pub fn encode<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>) -> Res
             o.tys_of(&head.inputs, "a fn's inputs")?;
             o.ty(head.output)?;
             o.flag(head.has_body);
+            o.flag(head.c_variadic);
             o.lib(head.module);
             o.count(head.params.len(), "a fn's parameters in scope")?;
             for &(n, i) in &head.params {
@@ -917,6 +919,7 @@ impl Out<'_, '_> {
             PNode::Infer => return Err(E::Unencoded { what: "an inference hole `_` (a body's type, never a head's)" }),
             PNode::Closure { .. } => return Err(E::Unencoded { what: "a closure type (a body's, never a head's)" }),
             PNode::Future(..) => return Err(E::Unencoded { what: "an async block's future type (a body's, never a head's)" }),
+            PNode::Coroutine { .. } => return Err(E::Unencoded { what: "an async block's future by identity (a body's hidden type, never a head's)" }),
         }
         if self.stack.len() + self.kids.len() > MOST_STACK {
             return Err(E::TooBig { what: "a term's walk" });
@@ -1073,6 +1076,7 @@ impl Out<'_, '_> {
             PNode::Infer => return Err(E::Unencoded { what: "an inference hole `_` (a body's type, never a head's)" }),
             PNode::Closure { .. } => return Err(E::Unencoded { what: "a closure type (a body's, never a head's)" }),
             PNode::Future(..) => return Err(E::Unencoded { what: "an async block's future type (a body's, never a head's)" }),
+            PNode::Coroutine { .. } => return Err(E::Unencoded { what: "an async block's future by identity (a body's hidden type, never a head's)" }),
         }
         Ok(())
     }
@@ -1445,6 +1449,7 @@ impl<'r> In<'r, '_, '_> {
         let inputs = self.many("a fn's inputs", |r| r.ty("a fn's input"))?;
         let output = self.ty("a fn's output")?;
         let has_body = self.flag("a fn's body flag")?;
+        let c_variadic = self.flag("a fn's C-variadic flag")?;
         let module = self.lib("a fn's module")?;
         let params = self.many("a fn's parameters in scope", |r| Ok((r.name("a parameter's name")?, r.u32("a parameter's index")?)))?;
         let consts = self.many("const parameters", |r| Ok((r.u32("a const parameter")?, r.ty("a const parameter's type")?)))?;
@@ -1473,6 +1478,7 @@ impl<'r> In<'r, '_, '_> {
             declared,
             self_param,
             header,
+            c_variadic,
             inputs,
             output,
             has_body,
@@ -1783,6 +1789,7 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(h1.inputs[..] == h2.inputs[..], "a fn's inputs");
             need!(h1.output == h2.output, "a fn's output");
             need!(h1.has_body == h2.has_body, "a fn's body flag");
+            need!(h1.c_variadic == h2.c_variadic, "a fn's C-variadic flag");
             need!(h1.module == h2.module, "a fn's module");
             need!(h1.params[..] == h2.params[..], "a fn's parameters in scope");
             need!(h1.consts[..] == h2.consts[..], "a fn's const parameters");

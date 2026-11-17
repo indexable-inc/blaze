@@ -3,10 +3,12 @@
 
 use core::fmt;
 
+use blaze_code::eh::EhError;
 use blaze_code::image::ImageError;
+use blaze_code::place::PlaceError;
 use blaze_code::record::{RecordError, Symbol, Target};
-
-use crate::input::Panic;
+use blaze_code::unwind::UnwindError;
+use blaze_tier::record::FormError;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ExportError {
@@ -45,15 +47,32 @@ pub enum ExportError {
     OutsideAddend { from: Symbol, target: Target },
     /// A word's address (its target's place plus its addend) is outside the image.
     WordOutside { from: Symbol, at: u64 },
-    /// The function has landing pads: an exported file carries no LSDA rows yet.
-    LandingPads { symbol: Symbol },
-    /// The function calls the unwinder (`name`), and the file carries no unwind tables yet: a
-    /// panic would end the program by `abort` where Rust's rule (`panic` given) says otherwise.
-    Unwinds { from: Symbol, name: &'static str, panic: Panic },
+    /// A function's unwind rows broke blaze-code's rules (unwind.rs `read`).
+    UnwindRows { symbol: Symbol, error: UnwindError },
+    /// A function's LSDA could not be written (blaze-code eh.rs `lsda_table`).
+    Lsda { symbol: Symbol, error: EhError },
+    /// A function's row lands, and the program names no personality routine to land it.
+    NoPersonality { symbol: Symbol },
+    /// The personality routine the program names is not among the functions placed.
+    PersonalityNotPlaced { personality: Symbol },
+    /// A placed function has no record among those the unwind tables were given: a bug here.
+    EhNoRecord { symbol: Symbol },
+    /// The unwind tables outgrew the room the layout kept for them: a bug in `eh_room`.
+    EhRoom { need: u64, room: u64 },
     /// The image grew past what one of its encodings can say (`what`).
     TooLarge { what: &'static str, len: u64 },
     /// A start record this crate makes broke the record's form: a bug here, named.
     StartRecord(RecordError),
+    /// A `bzcode02` record of `symbol` (a start record brought into the form by
+    /// optimized.rs `v1_to_v2`) broke the form's rules (blaze-tier record/form.rs).
+    Record { symbol: Symbol, error: FormError },
+    /// A relocation of a `bzcode02` record could not be completed by blaze-tier's placer rules
+    /// (a page offset's instruction or alignment, an x86-64 kind): its error, naming the
+    /// function and the record offset.
+    Place(PlaceError),
+    /// An address relocation (`Page21`, `PageOff12`, `Branch26` aside) names a C name: only the
+    /// loader knows its address, through its GOT word.
+    AddressOfOutside { from: Symbol, target: Target, at: u32 },
 }
 
 impl From<ImageError> for ExportError {
@@ -119,20 +138,33 @@ impl fmt::Display for ExportError {
             ExportError::WordOutside { from, at } => {
                 write!(f, "export: function {from}: the word at image offset {at:#x} points outside the image")
             }
-            ExportError::LandingPads { symbol } => write!(
+            ExportError::UnwindRows { symbol, error } => write!(f, "export: function {symbol}'s unwind rows are refused: {error}"),
+            ExportError::Lsda { symbol, error } => write!(f, "export: function {symbol}'s LSDA: {error}"),
+            ExportError::NoPersonality { symbol } => write!(
                 f,
-                "export: function {symbol} has landing pads, and an exported file carries no LSDA rows yet (run.md, \"Export (writer, 2026-11-16)\")"
+                "export: function {symbol} has a row that lands, and the program names no personality routine (its `eh_personality` lang item) for the unwind tables (blaze-export eh_out.rs)"
             ),
-            ExportError::Unwinds { from, name, panic: Panic::Unwind } => write!(
+            ExportError::PersonalityNotPlaced { personality } => {
+                write!(f, "export: the personality routine {personality} is not among the program's functions (blaze-export eh_out.rs)")
+            }
+            ExportError::EhNoRecord { symbol } => {
+                write!(f, "export: placed function {symbol} has no record among those given to the unwind tables (a bug in blaze-export eh_out.rs)")
+            }
+            ExportError::EhRoom { need, room } => write!(
                 f,
-                "export: function {from} calls `{name}`: the program can unwind (`panic = \"unwind\"`, Rust's default), and an exported file carries no unwind tables yet, so a panic would abort instead; refused, never exported wrong"
-            ),
-            ExportError::Unwinds { from, name, panic: Panic::Abort } => write!(
-                f,
-                "export: function {from} calls `{name}`: its record was made for `panic = \"unwind\"`, and the program's profile says `panic = \"abort\"`"
+                "export: the unwind tables need {need} bytes after the code and the layout kept {room} (a bug in blaze-export eh_out.rs `eh_room`)"
             ),
             ExportError::TooLarge { what, len } => write!(f, "export: the image is too large for {what} ({len} bytes)"),
             ExportError::StartRecord(error) => write!(f, "export: the start record blaze-export made is not a record: {error}"),
+            ExportError::Record { symbol, error } => {
+                write!(f, "export: function {symbol}: its bzcode02 record breaks the form (blaze-tier record/form.rs): {error}")
+            }
+            ExportError::Place(error) => write!(f, "export: {error}"),
+            ExportError::AddressOfOutside { from, target, at } => write!(
+                f,
+                "export: function {from}: the address relocation at byte {at} names the C name {}, whose address only the loader knows; a C name is reached through its GOT word (rule: export never leaves a hole (run.md, \"Export\"))",
+                target.symbol
+            ),
         }
     }
 }

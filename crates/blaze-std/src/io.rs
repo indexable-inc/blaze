@@ -85,6 +85,8 @@ use crate::{
 /// What a world reads and does without its lock: the native clock, inline file calls, lent
 /// writes (std.md, "End state: efficiency", pieces 6, 7 and 11).
 mod fast;
+/// [`Io::sip_key`]: a hash key from the world's random source.
+mod sip_key;
 #[cfg(test)]
 mod tests;
 
@@ -354,11 +356,12 @@ pub(crate) struct Escape(Lock<World>);
 
 impl Escape {
     /// The world over the host's `table`: a [`Backend::Guest`] with no environment, no
-    /// trace kept (a hosted run's spans are its host's to see), `limits`.
-    pub(crate) fn new(table: crate::wire::HostTable, limits: Limits) -> Escape {
+    /// trace kept (a hosted run's spans are its host's to see), `limits`; the escape's
+    /// encodings made in `alloc`, the run's heap.
+    pub(crate) fn new(table: crate::wire::HostTable, limits: Limits, alloc: blaze_own::SharedAlloc<'static>) -> Escape {
         let world = World::new(Start {
             // alloc: once per hosted run that sends an effect, the escape's driver.
-            driver: Backend::Guest(Box::new(crate::guest::Guest::new(table))),
+            driver: Backend::Guest(Box::new(crate::guest::Guest::new(table, alloc))),
             seed: None,
             // The hosted wire carries no folders above its root.
             above: 0,

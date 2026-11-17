@@ -336,6 +336,7 @@ pub fn copy_ground(from: PTys<'_>, args: &[PTy], into: &mut PortableTys<'_>, scr
                 PNode::FnPtr(l, header) => PNode::FnPtr(map_list(l, &mut list)?, header),
                 PNode::Closure { owner, ordinal, args } => PNode::Closure { owner, ordinal, args: map_list(args, &mut list)? },
                 PNode::Future(e, o, i) => PNode::Future(e, m(o)?, m(i)?),
+                PNode::Coroutine { owner, ordinal, args } => PNode::Coroutine { owner, ordinal, args: map_list(args, &mut list)? },
                 PNode::Dynamic(l) => PNode::Dynamic(map_list(l, &mut list)?),
                 PNode::ExTrait(key, l) => PNode::ExTrait(key, map_list(l, &mut list)?),
                 PNode::ExProj { trait_, name, args, term } => PNode::ExProj { trait_, name, args: map_list(args, &mut list)?, term: m(term)? },

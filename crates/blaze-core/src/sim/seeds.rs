@@ -173,6 +173,10 @@ impl Given {
     /// What the process's environment gives: the read a test's entry does once, before
     /// [`run`]. A variable that is not set gives nothing; one that is not text, or no number,
     /// is refused.
+    ///
+    /// Ambient (rule 75): reads this process's environment from nowhere. The capability form is
+    /// [`Given::parse`] of the two values its caller read from its `Env`. Deleted by batch
+    /// P5-seeds once its caller (bstd's `simtest`) has moved.
     #[expect(
         clippy::disallowed_methods,
         reason = "a test's entry reads its two settings here, once and typed: the test harness \

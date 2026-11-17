@@ -5,7 +5,6 @@
 //!
 //! Expected: `test own_tests::in_forms_write_the_bytes_the_old_forms_write ... ok`.
 
-use blaze_own::Alloc;
 
 use crate::cursor::Put;
 use crate::{hex, leb};
@@ -18,7 +17,7 @@ const SIGNED: [i64; 12] = [0, 63, 64, -64, -65, 8191, -8193, (1 << 55) - 1, -(1 
 
 #[test]
 fn in_forms_write_the_bytes_the_old_forms_write() {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     // `lead` bytes already written, the capacity exact or 16 over: whether the 8-byte store
     // has room turns on both.
     for lead in [0usize, 3, 9] {

@@ -35,7 +35,9 @@ use crate::resolve::{Built, CrateInput, CrateNames, NamesError, SourceTexts, res
 use crate::task::{First, MacroBody, MacroSrc, Par, Variant};
 
 const MAGIC: [u8; 4] = *b"BZCS";
-const VERSION: u32 = 1;
+// 2: a body block holding a statement-position macro call is a block module
+// (macro-block-modules-1, 2026-11-16): block ordinals and made modules change.
+const VERSION: u32 = 2;
 const ALIGN: usize = 16;
 const NO_CHAIN: u32 = u32::MAX;
 

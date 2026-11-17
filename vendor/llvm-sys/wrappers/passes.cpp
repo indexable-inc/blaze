@@ -44,6 +44,7 @@
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/LLVMRemarkStreamer.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm-c/Core.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/MC/MCSubtargetInfo.h>
@@ -872,5 +873,38 @@ void LLVMBlazeRemarksEnd(LLVMContextRef C, LLVMBlazeRemarkSink *Sink, const char
 
 /* Frees the sink and its buffer: only after LLVMBlazeRemarksEnd (no context points into it). */
 void LLVMBlazeRemarksDispose(LLVMBlazeRemarkSink *Sink) { delete Sink; }
+
+/* LLVM's own per-module default pipeline at level `Level` (1, 2 or 3; anything else is null),
+ * built for `Machine` (non-null; its target registered) with SLP vectorization as
+ * `SLPVectorization` says, and printed as `opt -print-pipeline-passes` prints it: class names
+ * mapped to the registered pass names. OWNERSHIP: the text is a fresh copy made by
+ * LLVMCreateMessage, owned by the caller and freed with LLVMDisposeMessage. `Machine` is only
+ * read during this call. No module or context is involved, so nothing outlives the call. */
+char *LLVMBlazeDefaultPipeline(LLVMTargetMachineRef Machine, unsigned Level,
+                               LLVMBool SLPVectorization) {
+  if (!Machine)
+    return nullptr;
+  OptimizationLevel Opt;
+  switch (Level) {
+  case 1: Opt = OptimizationLevel::O1; break;
+  case 2: Opt = OptimizationLevel::O2; break;
+  case 3: Opt = OptimizationLevel::O3; break;
+  default: return nullptr;
+  }
+  /* The callbacks must be handed to the builder so that it registers every class-to-name pair,
+   * which is what the printer maps through. */
+  PassInstrumentationCallbacks Callbacks;
+  PassBuilder Builder(reinterpret_cast<TargetMachine *>(Machine),
+                      tuning(SLPVectorization != 0), std::nullopt, &Callbacks);
+  ModulePassManager Manager = Builder.buildPerModuleDefaultPipeline(Opt);
+  std::string Text;
+  raw_string_ostream Out(Text);
+  Manager.printPipeline(Out, [&Callbacks](StringRef ClassName) {
+    StringRef Name = Callbacks.getPassNameForClassName(ClassName);
+    return Name.empty() ? ClassName : Name;
+  });
+  Out.flush();
+  return LLVMCreateMessage(Text.c_str());
+}
 
 } // extern "C"

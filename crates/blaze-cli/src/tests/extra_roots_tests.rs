@@ -30,7 +30,7 @@ fn tests_examples_and_benches_are_checked_with_their_modules() {
     write(&io, "Cargo.toml", "[workspace]\nmembers = [\"a\"]\nresolver = \"2\"\n");
     write(&io, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
     write(&io, "a/src/lib.rs", "pub fn f() -> u8 {\n    1\n}\n");
-    write(&io, "a/tests/a.rs", "mod common;\n#[test]\nfn one() {\n    assert_eq!(a::f(), 1);\n}\n");
+    write(&io, "a/tests/a.rs", "mod common;\n#[test]\nfn one() {\n    let _one: u8 = a::f();\n}\n");
     write(&io, "a/tests/common/mod.rs", "use a::in_common;\npub fn helper() -> u8 {\n    a::f()\n}\n");
     write(&io, "a/examples/e.rs", "use a::in_example;\nfn main() {\n    a::f();\n}\n");
     write(&io, "a/benches/x.rs", "use a::in_bench;\nfn main() {\n    a::f();\n}\n");

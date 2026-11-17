@@ -4,7 +4,6 @@
 
 use blaze_format::Aligned;
 use blaze_id::{ContentId, CrateItemKey, ItemKey, NoItem};
-use blaze_own::Alloc;
 use blaze_sim::{Broke, Config, Tape};
 
 use crate::testing::{Fact, MemSurface};
@@ -93,7 +92,7 @@ mod tool_attrs {
 #[test]
 fn a_key_index_answers_each_key_in_one_probe() {
     blaze_sim::check(Config::cases(300), |tape| {
-        let mut entries = Vec::new_in(Alloc::global());
+        let mut entries = Vec::new_in(blaze_own::testing::heap().alloc());
         for n in 0..u8::try_from(tape.below(24, "keys")).expect("below 24") {
             let index = ItemIndex(small(tape, 50, "index"));
             let place = match tape.coin("expanded") {
@@ -105,7 +104,7 @@ fn a_key_index_answers_each_key_in_one_probe() {
         }
         let turn = usize::try_from(tape.below(25, "turn")).expect("below 25").min(entries.len());
         let write = |rows: &[KeyEntry]| {
-            let mut out = KeyIndex::new_in(key(255), Alloc::global());
+            let mut out = KeyIndex::new_in(key(255), blaze_own::testing::heap().alloc());
             rows.iter().for_each(|row| out.entry(*row));
             out.finish().expect("distinct keys")
         };
@@ -126,7 +125,7 @@ fn a_key_index_answers_each_key_in_one_probe() {
 
 /// One module, `key(200)`, of one file, `file(0)`: `fn a() {}` and a struct a macro made.
 fn surface(rows: &[ScopeEntry<&str>]) -> MemSurface<'static> {
-    let mut surface = MemSurface::new_in(KRATE, Alloc::global());
+    let mut surface = MemSurface::new_in(KRATE, blaze_own::testing::heap().alloc());
     let items = FileItems {
         file: file(0),
         text: "fn a() {}",
@@ -137,9 +136,9 @@ fn surface(rows: &[ScopeEntry<&str>]) -> MemSurface<'static> {
         messages: &[],
         file_flags: crate::file_items::ItemFlags::NONE,
     };
-    surface.insert(Fact::FileItems, &items.write(Alloc::global()).expect("small")).expect("a written record");
+    surface.insert(Fact::FileItems, &items.write(blaze_own::testing::heap().alloc()).expect("small")).expect("a written record");
     surface.insert_text(file(0), "fn a() {}");
-    let mut page = KeyIndex::new_in(key(200), Alloc::global());
+    let mut page = KeyIndex::new_in(key(200), blaze_own::testing::heap().alloc());
     page.entry(KeyEntry {
         key: key(1),
         place: Place::File { file: file(0), index: ItemIndex(0) },
@@ -231,7 +230,7 @@ fn a_local_is_its_key_within_one_task() {
     };
     let rows = [ScopeEntry { ns: Namespace::Values, name: "a", binding }];
     let surface = surface(&rows);
-    let mut locals: LocalTable<'static, AnyItem> = LocalTable::new_in(Alloc::global());
+    let mut locals: LocalTable<'static, AnyItem> = LocalTable::new_in(blaze_own::testing::heap().alloc());
     let module = locals.intern(key(200)).expect("room");
     assert_eq!(locals.intern(key(200)), Ok(module));
     let found = surface.local_lookup(&mut locals, module, Namespace::Values, "a").expect("bound");
@@ -240,18 +239,18 @@ fn a_local_is_its_key_within_one_task() {
     assert_eq!(locals.key(item), Ok(key(1)));
     assert_eq!(surface.local_kind(&locals, item), Ok(ItemKind::Function));
     assert_eq!(surface.local_parent(&mut locals, item), Ok(Some(module)));
-    let mut other: LocalTable<'static, AnyItem> = LocalTable::new_in(Alloc::global());
+    let mut other: LocalTable<'static, AnyItem> = LocalTable::new_in(blaze_own::testing::heap().alloc());
     let foreign = other.intern(key(1)).and_then(|_| other.intern(key(2))).expect("room");
     assert_eq!(locals.len(), 2);
     assert_eq!(surface.local_kind(&locals, foreign), Ok(ItemKind::Function));
-    let mut third: LocalTable<'static, AnyItem> = LocalTable::new_in(Alloc::global());
+    let mut third: LocalTable<'static, AnyItem> = LocalTable::new_in(blaze_own::testing::heap().alloc());
     let far = (0..5).map(|n| third.intern(key(n + 10))).last().expect("five").expect("room");
     assert_eq!(locals.key(far), Err(SurfaceError::NoLocal { local: 4 }));
 }
 
 #[test]
 fn a_textual_entry_answers_the_last_definition_of_a_name() {
-    let mut out = TextualEntry::new_in(key(200), Alloc::global());
+    let mut out = TextualEntry::new_in(key(200), blaze_own::testing::heap().alloc());
     out.push("m", key(1)).expect("small");
     out.push("n", key(2)).expect("small");
     out.push("m", key(3)).expect("small");
@@ -263,7 +262,7 @@ fn a_textual_entry_answers_the_last_definition_of_a_name() {
 
 #[test]
 fn a_module_file_reads_back_with_its_absent_paths_sorted() {
-    let mut out = ModuleFile::new_in(key(200), file(1), "src/a.rs", None, Alloc::global()).expect("small");
+    let mut out = ModuleFile::new_in(key(200), file(1), "src/a.rs", None, blaze_own::testing::heap().alloc()).expect("small");
     out.absent("src/a/mod.rs").expect("small");
     out.absent("src/a.rs.in").expect("small");
     out.absent("src/a/mod.rs").expect("small");
@@ -291,7 +290,7 @@ fn a_macro_def_reads_back_with_its_helpers_in_order() {
         body: None,
         params: None,
     };
-    let mut out = MacroDef::new_in(head, Alloc::global());
+    let mut out = MacroDef::new_in(head, blaze_own::testing::heap().alloc());
     out.helper("serde").expect("small");
     out.helper("allow").expect("small");
     let buffer = Aligned::copy_from(&out.finish().expect("small"));
@@ -303,7 +302,7 @@ fn a_macro_def_reads_back_with_its_helpers_in_order() {
         kind: MacroKind::BuiltinDerive(BuiltinDerive::Clone),
         ..head
     };
-    let buffer = Aligned::copy_from(&MacroDef::new_in(builtin, Alloc::global()).finish().expect("small"));
+    let buffer = Aligned::copy_from(&MacroDef::new_in(builtin, blaze_own::testing::heap().alloc()).finish().expect("small"));
     assert_eq!(MacroDefView::read(&buffer).expect("a written record").head(), builtin);
 }
 

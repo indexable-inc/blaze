@@ -62,7 +62,7 @@ pub(crate) fn solve_and_write<'a, F: ScopeFacts<Name = &'a str>>(
     made: &dyn Fn(&mut AVec<'a, ItemKey>),
     alloc: Alloc<'a>,
 ) -> Result<HashMap<ItemKey, Resolved<'a, &'a str>, Alloc<'a>>, Unwritten> {
-    let deps = BuiltDeps { built, alloc, asks: true };
+    let deps = BuiltDeps { built, alloc, asks: true, through: core::cell::Cell::new(None) };
     let mut c = Cells::load_with(facts, root, Some(&deps), alloc).map_err(Unwritten::Load)?;
     c.enums = Some(enums);
     c.run(facts, expand, &[]).map_err(Unwritten::Run)?;

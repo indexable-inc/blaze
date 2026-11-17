@@ -27,7 +27,7 @@ blaze-columns.workspace = true
 blaze-parquet.workspace = true
 blaze-file-items.workspace = true
 blaze-surface.workspace = true
-blaze-own = { workspace = true, features = ["std"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
 
 [lints]
 workspace = true

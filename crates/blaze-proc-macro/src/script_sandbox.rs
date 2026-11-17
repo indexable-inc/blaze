@@ -37,7 +37,7 @@ pub use crate::sandbox::Read;
 pub const WORKSPACE: &str = "/workspace";
 
 /// How much of standard error is kept.
-const STDERR_TAIL: usize = 64 << 10;
+pub(crate) const STDERR_TAIL: usize = 64 << 10;
 
 /// The workspace's files.
 #[derive(Clone, Debug)]
@@ -121,8 +121,9 @@ impl Tree {
     }
 }
 
-/// One script's run, as the caller describes it.
-#[derive(Clone, Debug)]
+/// One script's run, as the caller describes it. (`Debug` is written by hand in
+/// spawn_route.rs: the executor is printed by its name.)
+#[derive(Clone)]
 pub struct Script {
     /// `name version`, for errors.
     pub package: String,
@@ -139,6 +140,15 @@ pub struct Script {
     pub limits: RunLimits,
     /// The answers for the pinned nightly, sorted by key.
     pub table: Arc<Vec<Row>>,
+    /// The deterministic sandbox's executor, chosen once per command by its setting; `None`:
+    /// the sandbox is off (D92, D94), and a spawn that needs it is refused by name.
+    pub spawner: Option<Arc<dyn blaze_spawn::Executor + Send + Sync>>,
+    /// The run's base key, which seeds a spawn's clock and randomness (`SpawnRequest::step`);
+    /// set by `ScriptRuntime::fresh` from the base it was handed.
+    pub step: ContentId,
+    /// What the command's setting says about spawns: whether hvbox is allowed (only which
+    /// refusal), the pinned tools, the guest userland, the derived facts' pins.
+    pub spawn_setting: Arc<crate::spawn_route::SpawnSetting>,
 }
 
 /// `env`'s variables owned, for [`Script::env`].
@@ -187,6 +197,17 @@ pub enum SpawnRefusal {
     Git { command: String, why: git::Refused },
     /// The spawn request is not the shim's encoding.
     Malformed(Malformed),
+    /// A program that runs only in the deterministic sandbox, which is off here (D92, D94).
+    NoSandbox { program: String, args: Vec<String>, why: blaze_spawn::NoSandbox },
+    /// The executor refused the spawn: its refusal's Display.
+    Executor(String),
+    /// A derived fact (pkg-config, `sw_vers`, a compiler's identity) not answered: why.
+    Fact { program: String, args: Vec<String>, why: String },
+    /// A spawn for the executor from a script whose workspace is a folder on disk, whose
+    /// digest the request's read grant needs and the router does not compute.
+    TreeOnDisk { program: String, args: Vec<String> },
+    /// A child's output sent somewhere the router does not take (a file, mode 3).
+    Mode { program: String, stream: &'static str, mode: u8 },
 }
 
 /// How a spawn request is not the shim's encoding.
@@ -224,6 +245,19 @@ impl std::fmt::Display for SpawnRefusal {
             SpawnRefusal::Program { program, args } => write!(f, "spawned `{program} {}`, a program a build script may not run", args.join(" ")),
             SpawnRefusal::Git { command, why } => write!(f, "asked `git {command}`, which blaze does not answer from the checkout: {why}"),
             SpawnRefusal::Malformed(why) => write!(f, "made a spawn request blaze cannot read: {why}"),
+            SpawnRefusal::NoSandbox { program, args, why } => write!(
+                f,
+                "spawned `{program} {}`, which runs only in the deterministic sandbox; the sandbox is off on this machine: {why} (D92). Not run natively (rule 3)",
+                args.join(" ")
+            ),
+            SpawnRefusal::Executor(why) => write!(f, "spawned a program the deterministic sandbox refused: {why}"),
+            SpawnRefusal::Fact { program, args, why } => write!(f, "spawned `{program} {}`, a derived fact blaze does not answer: {why}", args.join(" ")),
+            SpawnRefusal::TreeOnDisk { program, args } => write!(
+                f,
+                "spawned `{program} {}` from a workspace member's folder, whose tree digest a sandboxed spawn needs and blaze does not compute yet",
+                args.join(" ")
+            ),
+            SpawnRefusal::Mode { program, stream, mode } => write!(f, "spawned `{program}` with its {stream} sent to mode {mode} (a file), which blaze does not take"),
         }
     }
 }
@@ -240,11 +274,11 @@ enum Opened {
 
 /// One run's sandbox.
 pub struct ScriptSandbox {
-    script: Arc<Script>,
+    pub(crate) script: Arc<Script>,
     opened: Vec<Option<Opened>>,
     /// `OUT_DIR`'s contents by path from it: `None` a folder, else a file's bytes.
-    out: BTreeMap<String, Option<Vec<u8>>>,
-    out_bytes: u64,
+    pub(crate) out: BTreeMap<String, Option<Vec<u8>>>,
+    pub(crate) out_bytes: u64,
     pub(crate) stdout: Vec<u8>,
     line: u64,
     pub(crate) stderr: Vec<u8>,
@@ -374,13 +408,13 @@ impl ScriptSandbox {
         self.out.iter().filter_map(|(path, bytes)| bytes.as_deref().map(|b| (path.as_str(), b)))
     }
 
-    fn record(&mut self, subject: String, digest: Option<ContentId>) {
+    pub(crate) fn record(&mut self, subject: String, digest: Option<ContentId>) {
         if !self.reads.iter().any(|it| it.subject == subject) {
             self.reads.push(Read { subject, digest });
         }
     }
 
-    fn refuse(&mut self, refusal: Refusal) -> Stop {
+    pub(crate) fn refuse(&mut self, refusal: Refusal) -> Stop {
         let why = match &refusal {
             Refusal::Path(why) | Refusal::OutDir(why) | Refusal::Output(why) => why.clone(),
             Refusal::Spawn(spawn) => spawn.to_string(),
@@ -556,7 +590,7 @@ impl ScriptSandbox {
         Ok(Ok(()))
     }
 
-    fn count_file(&mut self, rel: &str) -> Result<(), Stop> {
+    pub(crate) fn count_file(&mut self, rel: &str) -> Result<(), Stop> {
         let limit = self.script.limits.out_dir_files;
         if self.out.len() > limit as usize {
             return Err(self.refuse(Refusal::OutDir(format!("made {rel} in OUT_DIR, past its limit of {limit} files and folders"))));
@@ -565,7 +599,7 @@ impl ScriptSandbox {
     }
 
     /// Admits `more` bytes into `OUT_DIR`.
-    fn grow(&mut self, more: u64) -> Result<(), Stop> {
+    pub(crate) fn grow(&mut self, more: u64) -> Result<(), Stop> {
         let limit = self.script.limits.out_dir_bytes;
         if self.out_bytes.saturating_add(more) > limit {
             return Err(self.refuse(Refusal::OutDir(format!("wrote more than {limit} bytes into OUT_DIR"))));
@@ -573,7 +607,7 @@ impl ScriptSandbox {
         Ok(())
     }
 
-    fn stdout_write(&mut self, bytes: &[u8]) -> Result<(), Stop> {
+    pub(crate) fn stdout_write(&mut self, bytes: &[u8]) -> Result<(), Stop> {
         let limits = self.script.limits;
         if self.stdout.len() as u64 + bytes.len() as u64 > limits.output {
             return Err(self.refuse(Refusal::Output(format!("printed more than {} bytes", limits.output))));
@@ -593,7 +627,7 @@ impl ScriptSandbox {
     }
 
     /// A file's bytes for a spawn's snippet: `path` as the script named it, from `cwd`.
-    fn snippet_file(&mut self, cwd: &str, path: &str) -> Result<Option<Vec<u8>>, Stop> {
+    pub(crate) fn snippet_file(&mut self, cwd: &str, path: &str) -> Result<Option<Vec<u8>>, Stop> {
         let full = if path.starts_with('/') { path.to_owned() } else { format!("{cwd}/{path}") };
         Ok(match self.place(full.as_bytes())? {
             Place::Out(rel) => self.out.get(&rel).cloned().flatten(),
@@ -618,7 +652,7 @@ impl ScriptSandbox {
     /// exit code and the two outputs, or the stop of the script.
     pub fn spawn(&mut self, request: &[u8]) -> Result<(), Stop> {
         self.spawns += 1;
-        let spawned = match decode(request) {
+        let spawned = match crate::spawn_route::decode_full(request) {
             Ok(spawned) => spawned,
             Err(why) => return Err(self.refuse(Refusal::Spawn(SpawnRefusal::Malformed(why)))),
         };
@@ -628,8 +662,9 @@ impl ScriptSandbox {
         let args_text: Vec<&str> = args.iter().map(String::as_str).collect();
         let owned = || args.to_vec();
         let name = program.rsplit('/').next().unwrap_or(program);
-        let (code, stdout, stderr): (i32, Vec<u8>, Vec<u8>) = if name == "rustc" {
-            match probe::request("rustc", &args_text) {
+        let routed = crate::spawn_route::route(name, &args_text, self.script.c_mode, self.script.spawner.is_some());
+        let (code, stdout, stderr): (i32, Vec<u8>, Vec<u8>) = match routed {
+            crate::spawn_route::Route::Rustc => match probe::request("rustc", &args_text) {
                 Request::Version { verbose } => (0, probe::version(verbose, &self.script.host, Alloc::global()).as_bytes().to_vec(), Vec::new()),
                 Request::Compile => {
                     let found = probe::snippet(&args_text);
@@ -653,60 +688,54 @@ impl ScriptSandbox {
                     }
                 }
                 Request::Print | Request::Other { .. } => return Err(self.refuse(Refusal::Spawn(SpawnRefusal::RustcArgs { args: owned() }))),
-            }
-        } else if let Some(owned_words) = git_words(name, &args_text) {
-            let words: Vec<&str> = owned_words.iter().map(String::as_str).collect();
-            let command = words.join(" ");
-            let folder = match &spawned.cwd {
-                None => Some(self.script.folder.clone()),
-                Some(cwd) if cwd == WORKSPACE => Some(String::new()),
-                Some(cwd) => cwd.strip_prefix(WORKSPACE).and_then(|rest| rest.strip_prefix('/')).map(str::to_owned),
-            };
-            let script = Arc::clone(&self.script);
-            let answered = match folder.as_deref().map(|folder| (folder, git_subject(folder, &words))) {
-                Some((folder, Some(subject))) => git_fact(&script.tree, folder, &words, Alloc::global()).map(|answer| (subject, answer)),
-                Some((_, None)) => Err(git::Refused::CannotAnswerYet),
-                None => Err(git::Refused::NoRepository),
-            };
-            match answered {
-                Ok((subject, answer)) => {
-                    self.record(subject, Some(answer_digest(&answer)));
-                    (answer.code, answer.stdout.as_bytes().to_vec(), answer.stderr.as_bytes().to_vec())
-                }
-                Err(why) => return Err(self.refuse(Refusal::Spawn(SpawnRefusal::Git { command, why }))),
-            }
-        } else if let (true, ["-c", command]) = (matches!(name, "sh" | "bash"), &args_text[..])
-            && let Some(rest) = command.strip_prefix("git ")
-        {
-            // A git command with quoting, a format or a glob (`log -1 --pretty=format:'%cI'`,
-            // `describe --match "v*"`): no row reads it yet.
-            return Err(self.refuse(Refusal::Spawn(SpawnRefusal::Git { command: rest.to_owned(), why: git::Refused::CannotAnswerYet })));
-        } else if probe::is_deferred_tool(name, &args_text) {
-            match self.script.c_mode {
-                CMode::Deferred => {
-                    self.c_requests.push(spawned.argv.join("\0"));
-                    (0, Vec::new(), Vec::new())
-                }
-                CMode::Built => {
-                    return Err(self.refuse(Refusal::Spawn(SpawnRefusal::Program { program: program.clone(), args: owned() })));
+            },
+            crate::spawn_route::Route::Git => {
+                let Some(owned_words) = git_words(name, &args_text) else {
+                    // A shell's `-c "git ..."` with quoting, a format or a glob (`log -1
+                    // --pretty=format:'%cI'`, `describe --match "v*"`): no row reads it yet.
+                    let rest = args_text.get(1).and_then(|command| command.strip_prefix("git ")).unwrap_or("");
+                    return Err(self.refuse(Refusal::Spawn(SpawnRefusal::Git { command: rest.to_owned(), why: git::Refused::CannotAnswerYet })));
+                };
+                let words: Vec<&str> = owned_words.iter().map(String::as_str).collect();
+                let command = words.join(" ");
+                let folder = match &spawned.cwd {
+                    None => Some(self.script.folder.clone()),
+                    Some(cwd) if cwd == WORKSPACE => Some(String::new()),
+                    Some(cwd) => cwd.strip_prefix(WORKSPACE).and_then(|rest| rest.strip_prefix('/')).map(str::to_owned),
+                };
+                let script = Arc::clone(&self.script);
+                let answered = match folder.as_deref().map(|folder| (folder, git_subject(folder, &words))) {
+                    Some((folder, Some(subject))) => git_fact(&script.tree, folder, &words, Alloc::global()).map(|answer| (subject, answer)),
+                    Some((_, None)) => Err(git::Refused::CannotAnswerYet),
+                    None => Err(git::Refused::NoRepository),
+                };
+                match answered {
+                    Ok((subject, answer)) => {
+                        self.record(subject, Some(answer_digest(&answer)));
+                        (answer.code, answer.stdout.as_bytes().to_vec(), answer.stderr.as_bytes().to_vec())
+                    }
+                    Err(why) => return Err(self.refuse(Refusal::Spawn(SpawnRefusal::Git { command, why }))),
                 }
             }
-        } else {
-            return Err(self.refuse(Refusal::Spawn(SpawnRefusal::Program { program: program.clone(), args: owned() })));
+            crate::spawn_route::Route::Fact(fact) => return self.spawn_fact(&fact, program, args, &spawned),
+            crate::spawn_route::Route::Deferred => {
+                self.c_requests.push(spawned.argv.join("\0"));
+                (0, Vec::new(), Vec::new())
+            }
+            crate::spawn_route::Route::Executor => return self.spawn_executor(program, args, &spawned),
+            crate::spawn_route::Route::Refused => {
+                let why = self.script.spawn_setting.no_sandbox();
+                return Err(self.refuse(Refusal::Spawn(SpawnRefusal::NoSandbox { program: program.clone(), args: owned(), why })));
+            }
         };
-        self.reply.clear();
-        self.reply.extend_from_slice(&code.to_le_bytes());
-        for bytes in [&stdout, &stderr] {
-            self.reply.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            self.reply.extend_from_slice(bytes);
-        }
+        self.set_reply(code, &stdout, &stderr);
         Ok(())
     }
 }
 
 /// `git`'s arguments when the spawn is `git ...` or a shell's `-c "git ..."` (how smolgen and
 /// vergen call it) with one plain git command; `None` for anything else.
-fn git_words(name: &str, args: &[&str]) -> Option<Vec<String>> {
+pub(crate) fn git_words(name: &str, args: &[&str]) -> Option<Vec<String>> {
     if name == "git" {
         return Some(args.iter().map(|arg| (*arg).to_owned()).collect());
     }
@@ -893,66 +922,6 @@ impl GitFiles for GitView<'_> {
         }
         rest.strip_prefix('/')
     }
-}
-
-/// One spawn, decoded.
-struct Spawned {
-    argv: Vec<String>,
-    cwd: Option<String>,
-    stdin: Vec<u8>,
-}
-
-/// The shim's request: argc, argv, env_clear u8, env count, (u8 set, key, value) each, cwd (u8
-/// has, string, empty without), stdin, stdout mode u8, stderr mode u8; numbers u32 LE, strings
-/// length-first. The environment a spawn sets is read past: blaze's answers do not depend on it.
-fn decode(bytes: &[u8]) -> Result<Spawned, Malformed> {
-    struct Cursor<'b> {
-        bytes: &'b [u8],
-        at: usize,
-    }
-    impl<'b> Cursor<'b> {
-        fn take(&mut self, n: usize) -> Result<&'b [u8], Malformed> {
-            let at = self.at;
-            let end = at.checked_add(n).filter(|end| *end <= self.bytes.len()).ok_or(Malformed::EndsAt(at))?;
-            self.at = end;
-            Ok(&self.bytes[at..end])
-        }
-        fn u32(&mut self) -> Result<u32, Malformed> {
-            let b = self.take(4)?;
-            Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        }
-        fn u8(&mut self) -> Result<u8, Malformed> {
-            Ok(self.take(1)?[0])
-        }
-        fn string(&mut self) -> Result<&'b [u8], Malformed> {
-            let len = self.u32()? as usize;
-            self.take(len)
-        }
-        fn text(&mut self, what: &'static str) -> Result<String, Malformed> {
-            let bytes = self.string()?;
-            String::from_utf8(bytes.to_vec()).map_err(|_| Malformed::NotUtf8(what))
-        }
-    }
-    let mut c = Cursor { bytes, at: 0 };
-    let argc = c.u32()?;
-    if argc > 1 << 16 {
-        return Err(Malformed::Arguments(argc));
-    }
-    let mut argv = Vec::new();
-    for _ in 0..argc {
-        argv.push(c.text("an argument")?);
-    }
-    let _env_clear = c.u8()?;
-    for _ in 0..c.u32()? {
-        c.u8()?;
-        c.string()?;
-        c.string()?;
-    }
-    let has_cwd = c.u8()? != 0;
-    let cwd = c.text("the folder")?;
-    let stdin = c.string()?.to_vec();
-    c.take(2)?;
-    Ok(Spawned { argv, cwd: has_cwd.then_some(cwd), stdin })
 }
 
 impl System for ScriptSandbox {

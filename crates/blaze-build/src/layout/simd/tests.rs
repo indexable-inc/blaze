@@ -7,8 +7,9 @@
 //! Expected: `test layout::simd::tests::vectors_are_their_array_at_the_vector_alignment ... ok`
 //! and `test layout::simd::tests::other_vectors_and_c_calls_of_vectors_are_refused_by_name ... ok`.
 //! A fix that keeps the array's own alignment (1 for `u8` lanes) fails the first on `U8x8`; a
-//! fix that lays out every size, or classifies a vector as a C composite (or a `f32x4` as an
-//! HFA of four registers), fails the second.
+//! fix that caps a 32-byte vector's alignment at 16, pads a packed `f32x3`, refuses a 4-byte
+//! vector, or classifies a vector as a C composite (or a `f32x4` as an HFA of four
+//! registers), fails the second. The size rule is rustc_abi's (layout/simd_rule.rs's doc).
 
 use std::alloc::Global;
 
@@ -54,6 +55,7 @@ fn vectors_are_their_array_at_the_vector_alignment() {
 fn other_vectors_and_c_calls_of_vectors_are_refused_by_name() {
     let mut w = World::default();
     let vector = w.strukt(1, &[F::P(0)], SIMD);
+    let packed_vector = w.strukt(1, &[F::P(0)], ReprAttrs { packed: Some(0), ..SIMD });
     let two_fields = w.strukt(0, &[F::Leaf(PNode::Uint(UintTy::U32)), F::Leaf(PNode::Uint(UintTy::U32))], SIMD);
     let mut g = G::new();
     let mut ls = Layouts::new_in(Global);
@@ -63,12 +65,20 @@ fn other_vectors_and_c_calls_of_vectors_are_refused_by_name() {
         let error = lay(w, g, ls, t).expect_err("refused");
         assert!(matches!(error.why, Refusal::Unsupported(what) if what.contains(part)), "{error}");
     };
+    // rustc_abi `vector_type_layout` (layout.rs:1500-1517 at the pinned commit): size rounded
+    // up to `rust_vector_align(size)` = `next_power_of_two` on aarch64-apple-darwin (no `v`
+    // entry in its data layout), uncapped; packed with a non-power-of-two count: the array's
+    // size at `max_aligned_factor(size)`.
+    let f32_ = g.n(PNode::Float(FloatTy::F32));
     let a4 = g.array(u8_, 4);
-    let t = g.adt(vector, &[a4]);
-    refused(&w, &mut g, &mut ls, t, "not 8 or 16 bytes");
     let a32 = g.array(u8_, 32);
-    let t = g.adt(vector, &[a32]);
-    refused(&w, &mut g, &mut ls, t, "not 8 or 16 bytes");
+    let f3 = g.array(f32_, 3);
+    for (adt, arr, shape) in [(vector, a4, (4, 4)), (vector, a32, (32, 32)), (vector, f3, (16, 16)), (packed_vector, f3, (12, 4)), (packed_vector, a32, (32, 32))] {
+        let t = g.adt(adt, &[arr]);
+        let id = lay(&w, &mut g, &mut ls, t).unwrap();
+        let l = *ls.get(id);
+        assert_eq!((l.size, l.align_bytes()), shape, "a vector's size and alignment");
+    }
     let b8 = g.array(bool_, 8);
     let t = g.adt(vector, &[b8]);
     refused(&w, &mut g, &mut ls, t, "element is not");

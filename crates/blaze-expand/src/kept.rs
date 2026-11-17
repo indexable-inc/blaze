@@ -3,7 +3,7 @@
 //! into it: the read list that is not in the key ([`Asked`]) and one expansion made this solve
 //! as an entry ([`write_entry`], opened by [`KeptEntry`]).
 //!
-//! A re-solve of a crate after an edit finds every call whose text key is unchanged in the set
+//! A re-solve of a crate after an edit finds every call whose key ([`crate::call_key`]) is unchanged in the set
 //! and expands only the calls the edit moved. One record a crate, never a file a call.
 //!
 //! An entry made this solve, little-endian, any alignment:
@@ -22,7 +22,7 @@ use blaze_own::{AVec, Alloc, Vec};
 
 use crate::{
     expansion::Expansion,
-    key::TextKey,
+    key::CallKey,
     record::{COLUMNS, RecordError},
 };
 
@@ -50,7 +50,7 @@ pub enum KeptError {
     /// The writer's allocator refused to grow.
     OutOfMemory,
     /// One of two expansions under `key` did not read back for comparing.
-    Unreadable { key: TextKey },
+    Unreadable { key: CallKey },
     /// The set's token atom table ([`crate::atoms`]) refused, or refused a token written to it.
     Atoms { error: crate::atoms::AtomsError },
     /// The buffer ends before `what` does.
@@ -64,7 +64,7 @@ pub enum KeptError {
     /// A cfg atom's name or value is longer than an entry holds.
     AtomTooLong,
     /// Two entries under `key` with different bytes: the key misses an input (rule 21).
-    TwoValues { key: TextKey },
+    TwoValues { key: CallKey },
     /// More entries or bytes than the layout counts.
     TooLarge,
 }
@@ -78,13 +78,13 @@ impl fmt::Display for KeptError {
             KeptError::Table { what, index } => write!(f, "a kept expansions set with {what} (at {index})"),
             KeptError::Trailing => f.write_str("a kept expansions set with bytes past its last column"),
             KeptError::OutOfMemory => f.write_str("a kept expansions set whose allocator refused to grow"),
-            KeptError::Unreadable { key } => write!(f, "an expansion under text key {:02x?} that did not read back to be compared", &key.0.0[..8]),
+            KeptError::Unreadable { key } => write!(f, "an expansion under call key {:02x?} that did not read back to be compared", &key.0.0[..8]),
             KeptError::Short { what } => write!(f, "a kept expansions set cut short in {what}"),
             KeptError::KeyOrder { index } => write!(f, "a kept expansions set whose key {index} is not above the one before"),
             KeptError::EntryEnd { index } => write!(f, "a kept expansions set whose entry {index} ends outside it"),
             KeptError::Asked { what } => write!(f, "a kept expansion whose asked atoms are not as written: {what}"),
             KeptError::AtomTooLong => f.write_str("a cfg atom too long for a kept expansion (65535 bytes a name or a value)"),
-            KeptError::TwoValues { key } => write!(f, "two expansions under one text key {:02x?} with different bytes (rule 21: the key misses an input)", &key.0.0[..8]),
+            KeptError::TwoValues { key } => write!(f, "two expansions under one call key {:02x?} with different bytes (rule 21: the key misses an input)", &key.0.0[..8]),
             KeptError::TooLarge => f.write_str("a kept expansions set past what its layout counts"),
         }
     }

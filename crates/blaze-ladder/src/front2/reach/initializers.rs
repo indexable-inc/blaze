@@ -46,11 +46,13 @@ pub(super) struct Initializers {
     /// How many of the census's bodies were read for names already.
     bodies_read: usize,
     firsts_read: bool,
+    /// The unsizing coercions to a `dyn` the initializers read make (reach/instances.rs).
+    pub(super) coerced: super::instances::Coerced,
 }
 
 impl Initializers {
     pub(super) fn new() -> Initializers {
-        Initializers { seen: Vec::new_in(Global), bodies_read: 0, firsts_read: false }
+        Initializers { seen: Vec::new_in(Global), bodies_read: 0, firsts_read: false, coerced: super::instances::Coerced::default() }
     }
 
     /// Notes each static and constant `c` names that is not noted yet, with the body that
@@ -116,6 +118,7 @@ impl Initializers {
             let (q, f) = (queue.len(), fns.len());
             queue_targets(r, &scope, body.owner, &mut c, queue);
             needs.read(r, body.owner, Some(&body), &c, queue, fns);
+            self.coerced.read(&c);
             note_edges(edges, k, &queue[q..], &fns[f..]);
             let mut more: Vec<(ItemKey, ItemKey), Global> = Vec::new_in(Global);
             self.note(k, &c, &mut more);

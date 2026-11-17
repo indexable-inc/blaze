@@ -58,6 +58,10 @@ Not now:
 - Until `blaze run` exists again, a merge's proof is the whole build and its tests, quoted (68).
 - Every command has a timeout; a hang is a bug to report, never one to wait out (69, 18).
 - Facts come from tool output in this session (61); verdicts from real projects, run first (7, 82).
+- A simple, exactly specified edit (one expression replaced by another across a crate, a rename) goes
+  to Codex, which is cheap and literal: `bunx @openai/codex@latest exec -m gpt-6.1-terra -c
+  model_reasoning_effort='"high"'`, one crate a job, with the files, the exact replacement and what
+  not to touch; then read its diff and compile it. Design and judgement stay with the lane.
 - Build, test and land: docs/contributing.md. Every doc: docs/README.md.
 
 ## Rules

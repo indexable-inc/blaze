@@ -4,27 +4,24 @@
 
 use core::fmt;
 
-use blaze_code::record::{Space, Symbol};
+use blaze_code::record::Symbol;
 use blaze_own::{AVec, Alloc, Vec};
 
+use crate::eh_out::{eh_room, eh_sections};
 use crate::error::ExportError;
 use crate::input::{Entry, Panic, Platform, ProgramIn, Tier};
 use crate::layout::{Member, lay_out};
 use crate::start::{main_of, start};
 use crate::{elf, macho};
 
-/// The C names through which a program starts unwinding (the Itanium C++ ABI's level-1 unwinder,
-/// which `panic_unwind` calls): a program whose records name none of them never unwinds.
-const UNWINDERS: [&str; 3] = ["_Unwind_RaiseException", "_Unwind_Resume", "_Unwind_ForcedUnwind"];
-
-/// What a panic does in the exported file, said in its report.
+/// What a panic does in the exported file, said in its report. Unwind tables are written under
+/// both strategies (eh_out.rs): std's backtraces walk them under `panic = "abort"` too.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Panics {
-    /// The program can unwind by its profile, and nothing in it calls the unwinder: no unwind
-    /// tables are needed, and none are written.
-    NothingUnwinds,
-    /// The profile says `panic = "abort"`, and nothing in it calls the unwinder.
-    Abort,
+    /// The program can unwind by its profile; `functions` placed functions have unwind entries.
+    Unwind { functions: u32 },
+    /// The profile says `panic = "abort"`; `functions` have unwind entries, for backtraces.
+    Abort { functions: u32 },
 }
 
 /// What one export wrote, for the command's report ([`Exported::report`]).
@@ -68,8 +65,10 @@ impl Exported {
             writeln!(f, "folded: {} functions share an equal function's code", self.folded)?;
         }
         match self.panics {
-            Panics::NothingUnwinds => writeln!(f, "panics: nothing in the program calls the unwinder, so the file needs no unwind tables")?,
-            Panics::Abort => writeln!(f, "panics: abort (the profile's `panic = \"abort\"`); the file has no unwind tables")?,
+            Panics::Unwind { functions } => writeln!(f, "panics: unwind tables for {functions} functions")?,
+            Panics::Abort { functions } => {
+                writeln!(f, "panics: abort (the profile's `panic = \"abort\"`); unwind tables for {functions} functions, for backtraces")?
+            }
         }
         match self.profile {
             None => writeln!(f, "profile: none; functions in call-graph order from the entry")?,
@@ -89,35 +88,17 @@ impl Exported {
     }
 }
 
-/// Refuses what an exported file cannot yet do right: landing pads (no LSDA rows are written)
-/// and any call of the unwinder (no unwind tables are written). Says what a panic does.
-fn panics(program: &ProgramIn<'_>) -> Result<Panics, ExportError> {
-    let unwinders = UNWINDERS.map(Symbol::of_name);
-    for function in program.functions {
-        let r = function.record;
-        if r.pads() > 0 {
-            return Err(ExportError::LandingPads { symbol: function.symbol });
-        }
-        for k in 0..r.targets() {
-            let t = r.target(k);
-            if t.space != Space::Outside {
-                continue;
-            }
-            if let Some(i) = unwinders.iter().position(|&u| u == t.symbol) {
-                return Err(ExportError::Unwinds { from: function.symbol, name: UNWINDERS[i], panic: program.panic });
-            }
-        }
+/// What a panic does in the file, with the count of functions given unwind entries.
+fn panics(program: &ProgramIn<'_>, functions: u32) -> Panics {
+    match program.panic {
+        Panic::Unwind => Panics::Unwind { functions },
+        Panic::Abort => Panics::Abort { functions },
     }
-    Ok(match program.panic {
-        Panic::Unwind => Panics::NothingUnwinds,
-        Panic::Abort => Panics::Abort,
-    })
 }
 
 /// Exports `program` for `platform`: the file's bytes replace `out`'s contents.
 pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a, u8>, alloc: Alloc<'a>) -> Result<Exported, ExportError> {
-    let panics = panics(program)?;
-    let has = |symbol: Symbol| program.functions.iter().any(|f| f.symbol == symbol);
+    let has =|symbol: Symbol| program.functions.iter().any(|f| f.symbol == symbol);
     let main = main_of(program.entry);
     if !matches!(program.entry, Entry::Hosted { .. }) && !has(main) {
         return Err(ExportError::NoEntry { symbol: main });
@@ -139,11 +120,14 @@ pub fn export<'a>(program: &ProgramIn<'_>, platform: Platform, out: &mut AVec<'a
         Platform::MacosArm64 => macho::plan(),
         Platform::LinuxArm64 => elf::plan(),
     };
-    let laid = lay_out(&members, program.data, start.entry, program.profile, plan, alloc)?;
+    let room = eh_room(&members, program.personality, platform, alloc)?;
+    let laid = lay_out(&members, program.data, start.entry, program.profile, plan, room, alloc)?;
+    let eh = eh_sections(&laid, &members, program.personality, platform, alloc)?;
+    let panics = panics(program, eh.functions);
     let seed = program.profile.map_or([0u8; 32], |p| p.digest);
     let identity = match platform {
-        Platform::MacosArm64 => macho::write(&laid, program.name, &seed, out, alloc)?,
-        Platform::LinuxArm64 => elf::write(&laid, &seed, out, alloc)?,
+        Platform::MacosArm64 => macho::write(&laid, &eh, program.name, &seed, out, alloc)?,
+        Platform::LinuxArm64 => elf::write(&laid, &eh, &seed, out, alloc)?,
     };
     let (mut functions, mut folded, mut fast, mut optimized, mut made) = (0u32, 0u32, 0u32, 0u32, 0u32);
     for p in laid.placed.iter() {

@@ -19,10 +19,13 @@ mod atomic;
 mod bulk;
 mod float;
 mod int;
+pub(crate) mod probe;
 mod runtime;
 pub(crate) mod sites;
-mod tls;
+mod target;
+mod tls_index;
 pub(crate) mod unwind;
+pub(crate) mod variadic;
 mod wide;
 
 /// `brk` immediates of the traps the pass makes itself; a LIR `trap`'s code is its own `brk`
@@ -114,6 +117,9 @@ pub(crate) fn run<A: Allocator>(
     }
     let sig = view.sigs.get(view.head.sig as usize).map(|_| view.sig(SigId(view.head.sig)));
     let Some(sig) = sig else { return Err(EmitError::Signature { why: "no signature row" }) };
+    if view.sigs[view.head.sig as usize].bits & SigRec::VARIADIC != 0 {
+        return Err(EmitError::Signature { why: variadic::VARIADIC_DEFINITION });
+    }
     check_sig(view, isa, view.sigs[view.head.sig as usize], sig.params, sig.rets)
         .map_err(|why| EmitError::Signature { why })?;
 
@@ -236,9 +242,9 @@ fn check_sig(view: View<'_>, isa: Isa, rec: SigRec, params: &[ParamRec], rets: &
     if rec.conv != Conv::C as u8 {
         return Err("a calling convention other than the target's C one");
     }
-    if rec.bits & SigRec::VARIADIC != 0 {
-        return Err("a variadic signature (Apple passes the variable arguments on the stack)");
-    }
+    // A variadic signature's `params` are its declared ones, checked below as any; a call's
+    // values past them are placed by pass/variadic.rs; a variadic definition is refused in
+    // `emit` (`variadic::VARIADIC_DEFINITION`).
     let srets = params.iter().filter(|it| it.kind == ParamKind::Sret as u8).count();
     if srets > 1 {
         return Err("more than one `sret` parameter");
@@ -304,6 +310,7 @@ pub(crate) enum Loc {
 }
 
 /// The next general and vector registers of one signature walk.
+#[derive(Clone, Copy)]
 pub(crate) struct Regs {
     x: Reg,
     v: u32,
@@ -965,7 +972,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
             Op::Clz | Op::Ctz | Op::Popcnt | Op::Bswap | Op::Bitrev => self.bits(inst, op)?,
             Op::AtomicLoad | Op::AtomicStore | Op::AtomicRmw | Op::Cmpxchg | Op::Fence => self.atomic(inst, op)?,
             Op::Memcpy | Op::Memmove | Op::Memset => self.bulk(inst, op)?,
-            Op::TlsAddr => self.tls_addr(inst, op)?,
+            Op::TlsAddr => self.tls_addr_indexed(inst, op)?,
             Op::Sext | Op::Trunc => {
                 let width = self.result_width(inst, op)?;
                 let a = o.value();
@@ -1216,7 +1223,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
             Op::Suspend | Op::Cancelled => {
                 return Err(unsupported(inst, op, "a suspend reached the emitter: the coroutine pass did not run"));
             }
-            Op::TargetIntrinsic => return Err(unsupported(inst, op, "a target intrinsic")),
+            Op::TargetIntrinsic => self.target_intrinsic(inst, op)?,
             Op::FrameAddress | Op::ReturnAddress | Op::StackPointer => {
                 return Err(unsupported(inst, op, "a machine register read (frame or return address, stack pointer)"));
             }
@@ -1254,7 +1261,8 @@ impl<A: Allocator> Pass<'_, '_, A> {
         let sig = view.sig(sig_id);
         let isa = self.isa;
         check_sig(view, isa, view.sigs[sig_id.index()], sig.params, sig.rets).map_err(|why| unsupported(inst, op, why))?;
-        if args.len() != sig.params.len() {
+        let variadic = view.sigs[sig_id.index()].bits & SigRec::VARIADIC != 0;
+        if args.len() < sig.params.len() || (!variadic && args.len() != sig.params.len()) {
             return Err(unsupported(inst, op, "arguments other than the signature's parameters"));
         }
         // The record form calls through the callee's import word; the literal-word form through
@@ -1309,6 +1317,15 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 (_, Loc::V(v)) => self.float_out(v, arg, Ty(param.ty) == Ty::F64),
             }
         }
+        // The `...` values (pass/variadic.rs): on Linux into the registers after the named
+        // ones; on Apple (and on Linux past x7/v7) into the outgoing area, opened and filled
+        // HERE, before the callee is loaded: the record's call site `adrp x16; ldr x16; blr x16`
+        // has nothing between its words (pass/sites.rs, `import_callee`). While the area is
+        // open every cell is `area` bytes higher above `sp`.
+        let area = match variadic {
+            true => self.place_varargs(inst, op, regs, blaze_lir::op::Values(&args.0[sig.params.len()..]))?,
+            false => 0,
+        };
         match (callee, indirect) {
             (Some((literal, via)), _) => {
                 self.put_to(enc::ldr_lit(X16, 0), Field::Imm19, Label::Literal(literal));
@@ -1316,7 +1333,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
                     self.put(enc::ldr(Size::X, X16, X16, 0));
                 }
             }
-            (None, Some(pointer)) => self.ld(X16, pointer),
+            (None, Some(pointer)) => self.ld_sp(X16, pointer.0 * 16 + area),
             (None, None) => match imported {
                 // A call site, which the `blr` below completes.
                 Some(place) => self.import_callee(RelocTo::Func(place)),
@@ -1325,6 +1342,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
         }
         self.call_row(self.here(), blocks);
         self.put(enc::blr(X16));
+        self.close_varargs(area);
         // Two returns are a pair in one cell (lib.rs, "Pairs"); one `i128` or float is the cell.
         let mut regs = Regs::new(isa.os);
         for (k, ret) in sig.rets.iter().enumerate() {
@@ -1351,12 +1369,16 @@ impl<A: Allocator> Pass<'_, '_, A> {
         self.put(enc::add_imm(rd, rd, 0, false));
     }
 
-    /// Places the literal words and the data after the code, patches every field and the
-    /// frame's size.
+    /// Writes the frame's size (and its stack-probe tail, right after the last instruction:
+    /// pass/probe.rs), then places the literal words and the data after the code and patches
+    /// every field.
     fn finish(mut self, frame_at: u32, most_align: u64) -> Result<(), EmitError> {
+        // First: the tail is instructions, so it precedes every literal word and data row
+        // (the record form counts `insts` from here on).
+        self.place_frame(frame_at, most_align)?;
         if self.in_record() {
             // The record form places no literal word (pass/sites.rs).
-            return self.finish_record(frame_at, most_align);
+            return self.finish_record();
         }
         self.pad_to(8);
         let literals_at = self.here();
@@ -1415,13 +1437,14 @@ impl<A: Allocator> Pass<'_, '_, A> {
         for &(word, index, addend) in inner.iter() {
             self.relocs.push(Reloc { at: word, to: RelocTo::Code(data_at[index as usize]), addend });
         }
-        self.settle(frame_at, most_align, literals_at, words_at, &data_at)
+        self.settle(literals_at, words_at, &data_at)
     }
 
-    /// Patches every field and the frame's size once everything after the instructions is
-    /// placed: the literal words from `literals_at` and `words_at`, data row `i` of the placed
-    /// at `data_at[i]` (the record form has no literal word and patches none).
-    fn settle(&mut self, frame_at: u32, most_align: u64, literals_at: u32, words_at: u32, data_at: &[u32]) -> Result<(), EmitError> {
+    /// Patches every field once everything after the instructions is placed: the literal words
+    /// from `literals_at` and `words_at`, data row `i` of the placed at `data_at[i]` (the record
+    /// form has no literal word and patches none). The frame's size was written by
+    /// `place_frame`, first in `finish`.
+    fn settle(&mut self, literals_at: u32, words_at: u32, data_at: &[u32]) -> Result<(), EmitError> {
         let too_far = EmitError::TooLarge { what: "a branch or PC-relative reference past its reach" };
         if self.code.len() > u32::MAX as usize / 2 {
             return Err(EmitError::TooLarge { what: "the code (2 GiB)" });
@@ -1441,25 +1464,15 @@ impl<A: Allocator> Pass<'_, '_, A> {
             let at = patch.at as usize;
             self.code[at..at + 4].copy_from_slice(&word.to_le_bytes());
         }
-        // The `byval` copies' stretch, after the staging words.
-        let byval_at = (u64::from(self.staging_at) + 8 * u64::from(self.staging)).next_multiple_of(16);
-        let used = byval_at + u64::from(self.byval_most);
-        if used >= FRAME_LIMIT {
-            return Err(EmitError::TooLarge { what: "the frame (16 MiB)" });
-        }
+        // The `byval` copies' stretch, after the staging words; under 16 MiB with the copies
+        // (`frame_bytes` refused it otherwise, in `place_frame`, before this).
+        let byval_at = self.byval_at();
         let fixes = core::mem::replace(&mut self.byval_fixes, Vec::new_in(Global));
         for &(at, rd, off) in fixes.iter() {
             let to = byval_at as u32 + off;
             self.set(at, enc::add_imm(rd, SP, to >> 12, true));
             self.set(at + 4, enc::add_imm(rd, rd, to & 0xfff, false));
         }
-        let frame = used.next_multiple_of(16) + (most_align - 16);
-        if frame >= FRAME_LIMIT {
-            return Err(EmitError::TooLarge { what: "the frame (16 MiB)" });
-        }
-        let frame = frame as u32;
-        self.set(frame_at, enc::sub_imm(SP, SP, frame >> 12, true));
-        self.set(frame_at + 4, enc::sub_imm(SP, SP, frame & 0xfff, false));
         Ok(())
     }
 

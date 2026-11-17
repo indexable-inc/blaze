@@ -241,10 +241,10 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let reference = self.b.reference(RefKind::Func, place);
         self.emit_call(Callee::Direct(reference), &reprs, &passes, rrepr, rpass)?;
         if let PNode::Never = self.node_at(e, ty)? {
-            self.vals.pop();
+            self.pop_val();
             self.b.unreachable();
             self.dead_block();
-            self.vals.push(V::None);
+            self.push_val(V::None, None);
         }
         Ok(())
     }

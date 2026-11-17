@@ -1,0 +1,9 @@
+status 0
+stdout
+[10, 20, 30, 40, 50, 60]
+210
+1 true
+Some("set once")
+[55, 55, 55] 101
+leaders 1
+true

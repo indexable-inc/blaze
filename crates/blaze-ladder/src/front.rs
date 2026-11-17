@@ -63,6 +63,13 @@ pub enum FnLang {
     /// `#[lang = "panic_const_*"]`: what a failed arithmetic check calls (blaze-build
     /// walk/arith_checks.rs).
     PanicConst(blaze_build::PanicConst),
+    /// `#[lang = "eh_personality"]`: the personality routine every unwind entry's CIE names
+    /// (std/src/sys/personality/gcc.rs `rust_eh_personality`); reached by no call, called by
+    /// the system's unwinder (crate::personality).
+    EhPersonality,
+    /// `#[lang = "panic_cannot_unwind"]`: what a nounwind body's terminate block calls when a
+    /// panic reaches it (core/src/panicking.rs; blaze-build walk/nounwind.rs).
+    PanicCannotUnwind,
 }
 
 /// The edition every file is read in (the blaze editions are 2024's syntax).
@@ -1431,7 +1438,7 @@ fn shape_of(t: PTys<'_>, p: PTy) -> Option<Shape> {
         PNode::FnDef(k, _) => Shape::FnDef(k),
         PNode::FnPtr(l, _) => Shape::FnPtr(l.len.saturating_sub(1)),
         PNode::Opaque(k, _) => Shape::Opaque(k),
-        PNode::Closure { .. } | PNode::Future(..) => Shape::Closure,
+        PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => Shape::Closure,
         PNode::Param(_) | PNode::Alias { .. } | PNode::Infer | PNode::Error => return None,
         PNode::ConstValue { .. } | PNode::ConstParam(_) => return None,
         PNode::Dynamic(l) => Shape::Dynamic(blaze_typeck::object_principal(t, l)),
@@ -2645,6 +2652,7 @@ impl<'f> Front<'f> {
             declared_count: f.own,
             self_param: f.self_param,
             header: f.header,
+            c_variadic: false,
             inputs: &f.inputs,
             output: f.output,
             types: self.tys.view(),

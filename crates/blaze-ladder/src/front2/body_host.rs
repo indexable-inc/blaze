@@ -30,9 +30,10 @@
 //! Every answer is a function of the crate, the body's file and the question: no machine path,
 //! no ambient environment (rule 75).
 
-use blaze_expand::{ExpandCx, HostAsk, HostError, HostWhy, IncludeAs, Included, MacroDefinition, Place, PlaceOf, ProcCall, Produced, ReadRoot, SourceOrigin, TokenStream, include_target};
+use blaze_expand::seen::SeenRoot;
+use blaze_expand::{ExpandCx, HostAsk, HostError, HostWhy, IncludeAs, Included, MacroDefinition, Place, PlaceOf, ProcCall, Produced, TokenStream};
 use blaze_id::ItemKey as LibKey;
-use blaze_own::{AString, Alloc};
+use blaze_own::Alloc;
 use blaze_scope::resolve::{At, SourceTexts};
 
 use super::heads::CrateCfg;
@@ -54,6 +55,12 @@ pub trait BodySources {
     fn env(&self, krate: usize, name: &str) -> Result<Option<&str>, HostError>;
     /// The crate's package folder with its trailing `/` (`/package/N/`): an include's bound.
     fn folder(&self, krate: usize) -> Option<&str>;
+    /// The root the crate sees (D96: `/package`, `/workspace/<dir>`): an absolute include path
+    /// under it is the package's file. `None`: no environment, and such a path is outside.
+    fn seen(&self, krate: usize) -> Option<SeenRoot<'_>> {
+        let _ = krate;
+        None
+    }
     /// The file at `path` when `path` is under the crate's build script's `OUT_DIR`: `Some` of
     /// the record's bytes or `Some(None)` when the record has no such file; `None` when the
     /// path is not under it (or the crate has no joined record).
@@ -77,7 +84,11 @@ impl<'s, 'a: 's, S: SourceTexts<'a>> BodySources for Sourced<'s, S> {
     }
 
     fn folder(&self, krate: usize) -> Option<&str> {
-        self.0.crate_env(krate).map(|env| env.folder())
+        self.0.crate_env(krate).map(|env| env.read_folder())
+    }
+
+    fn seen(&self, krate: usize) -> Option<SeenRoot<'_>> {
+        self.0.crate_env(krate).map(|env| env.seen())
     }
 
     fn script_file(&self, krate: usize, path: &str) -> Option<Option<&[u8]>> {
@@ -125,25 +136,6 @@ impl<'h> BodyHost<'h> {
     }
 }
 
-/// The absolute path of the file an include written in the file `calling` (under the package
-/// folder `package`) names by `written`, as blaze-scope's `included_file` makes it for an
-/// item: the calling file's folder joined with the written path, `.` and `..` taken by text
-/// ([`include_target`]). `None` when the calling file is not under the package or the path
-/// leaves it (decision D60).
-fn included_file<'a>(package: &str, calling: &str, written: &str, alloc: Alloc<'a>) -> Option<AString<'a>> {
-    let folder = calling.rsplit_once('/').map_or("", |(dir, _)| dir);
-    let folder = folder.strip_prefix(package.trim_end_matches('/'))?;
-    let root = ReadRoot { origin: SourceOrigin::Package, package: "" };
-    let target = include_target(root, folder, written, alloc).ok()?;
-    let mut path = AString::new_in(alloc);
-    path.push_str(package.trim_end_matches('/'));
-    for segment in target.iter() {
-        path.push_str("/");
-        path.push_str(segment);
-    }
-    Some(path)
-}
-
 impl ExpandCx for BodyHost<'_> {
     fn env(&self, name: &str) -> Result<Option<&str>, HostError> {
         self.sources.ok_or(refused(HostAsk::Env))?.env(self.krate, name)
@@ -161,7 +153,9 @@ impl ExpandCx for BodyHost<'_> {
         }
         let file = self.file.ok_or(refused(HostAsk::Include))?;
         let package = sources.folder(self.krate).ok_or(refused(HostAsk::Include))?;
-        let Some(path) = included_file(package, file.path, written, self.alloc) else {
+        // The one place an include's path is made, the item host's too (D96 (4): an absolute
+        // path under the root the crate sees is its package's).
+        let Some(path) = blaze_scope::included::included_file(package, sources.seen(self.krate), file.path, written, self.alloc) else {
             return Ok(Included::Outside);
         };
         Ok(sources.read(self.krate, path.as_str()).map_or(Included::Missing, |text| Included::Bytes(text.as_bytes())))
@@ -206,6 +200,9 @@ mod tests {
         fn folder(&self, krate: usize) -> Option<&str> {
             (krate == 0).then_some("/package/3/")
         }
+        fn seen(&self, krate: usize) -> Option<blaze_expand::seen::SeenRoot<'_>> {
+            (krate == 0).then_some(blaze_expand::seen::SeenRoot::Package)
+        }
         fn script_file(&self, _: usize, _: &str) -> Option<Option<&[u8]>> {
             None
         }
@@ -240,6 +237,10 @@ mod tests {
         assert_eq!(h.place(PlaceOf::ModulePath), Ok(Place::Text("tempo_node::rpc")));
         assert_eq!(h.include("abi.json", IncludeAs::Str), Ok(Included::Bytes(&b"[]"[..])));
         assert_eq!(h.include("../../outside.rs", IncludeAs::Str), Ok(Included::Outside));
+        // D96 (4): `include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/abi.json"))` reads the
+        // package's file; any other absolute path names the machine and stays outside.
+        assert_eq!(h.include("/package/src/abi.json", IncludeAs::Str), Ok(Included::Bytes(&b"[]"[..])));
+        assert_eq!(h.include("/etc/abi.json", IncludeAs::Str), Ok(Included::Outside));
     }
 
     /// REFUSED: a name the crate is compiled without is unset, which blaze-expand makes the

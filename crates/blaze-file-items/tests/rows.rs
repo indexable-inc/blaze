@@ -8,19 +8,18 @@
 #![feature(allocator_api)]
 
 use blaze_file_items::{Bodies, Outline, TokenColumns, TokensRefused, outline, outline_tokens, outline_with};
-use blaze_own::Alloc;
 use blaze_surface::{Edition, ErrorOrigin, Item, ItemDetail, ItemFlags, Range};
 
 mod render;
 
 /// The outline, bodies left unparsed.
 fn unparsed(text: &str) -> Outline<'static> {
-    outline(text, Edition::E2024, Alloc::global())
+    outline(text, Edition::E2024, blaze_own::testing::heap().alloc())
 }
 
 /// The outline with every body parsed with the rest.
 fn parsed(text: &str) -> Outline<'static> {
-    outline_with(text, Edition::E2024, Bodies::Parsed, Alloc::global())
+    outline_with(text, Edition::E2024, Bodies::Parsed, blaze_own::testing::heap().alloc())
 }
 
 /// The first entry named `name`.
@@ -128,10 +127,10 @@ fn parser_said(outline: &Outline<'_>) -> Vec<(Range, String)> {
 /// over and from the text written: the two outlines and the text they are of.
 fn both_ways(text: &str) -> (Outline<'static>, Outline<'static>, String) {
     let (mut again, mut written) = (String::new(), Vec::new());
-    let mut columns = TokenColumns::new_in(Alloc::global());
+    let mut columns = TokenColumns::new_in(blaze_own::testing::heap().alloc());
     render::rerender(text, Edition::E2024, &mut again, &mut columns, &mut written).expect("the lexer's own tokens are taken");
     assert!(render::lexes_back(&again, Edition::E2024, &written), "the text written lexes to other tokens than those written: {again:?}");
-    let from_tokens = outline_tokens(&again, &columns, Edition::E2024, Alloc::global()).expect("tokens inside their text");
+    let from_tokens = outline_tokens(&again, &columns, Edition::E2024, blaze_own::testing::heap().alloc()).expect("tokens inside their text");
     (from_tokens, unparsed(&again), again)
 }
 
@@ -189,7 +188,7 @@ fn the_tokens_handed_over_read_as_their_text() {
 fn tokens_that_are_not_a_texts_are_refused_by_name() {
     let ident = parser::word(parser::SyntaxKind::IDENT, parser::SyntaxKind::IDENT, parser::Edition::Edition2024);
     let word = |kind| parser::word(kind, parser::SyntaxKind::EOF, parser::Edition::Edition2024);
-    let mut columns = TokenColumns::new_in(Alloc::global());
+    let mut columns = TokenColumns::new_in(blaze_own::testing::heap().alloc());
     assert_eq!(columns.push(ident, 3, 3), Err(TokensRefused::Empty { token: 0, start: 3, end: 3 }));
     assert_eq!(columns.push(word(parser::SyntaxKind::WHITESPACE), 0, 1), Err(TokensRefused::NotAToken { token: 0, syntax: u16::from(parser::SyntaxKind::WHITESPACE) }));
     assert_eq!(columns.push(word(parser::SyntaxKind::EOF), 0, 1), Err(TokensRefused::NotAToken { token: 0, syntax: u16::from(parser::SyntaxKind::EOF) }));
@@ -202,12 +201,12 @@ fn tokens_that_are_not_a_texts_are_refused_by_name() {
     assert_eq!(columns.len(), 1);
     assert_eq!(columns.push(ident | parser::JOINT | parser::FRAGMENT, 4, 6), Ok(()));
     assert_eq!(columns.push(word(parser::SyntaxKind::SEMICOLON), 6, 7), Ok(()));
-    let outline = outline_tokens(text, &columns, Edition::E2024, Alloc::global()).expect("the text's tokens");
+    let outline = outline_tokens(text, &columns, Edition::E2024, blaze_own::testing::heap().alloc()).expect("the text's tokens");
     assert_eq!(named(&outline, text, "é").detail, ItemDetail::Mod { inline: false, path: None });
     assert_rows_equal(&outline, &unparsed(text));
-    assert_eq!(outline_tokens("mod é", &columns, Edition::E2024, Alloc::global()).err(), Some(TokensRefused::OutsideText { token: 2, end: 7, len: 6 }));
+    assert_eq!(outline_tokens("mod é", &columns, Edition::E2024, blaze_own::testing::heap().alloc()).err(), Some(TokensRefused::OutsideText { token: 2, end: 7, len: 6 }));
     columns.clear();
     assert_eq!(columns.push(word(parser::SyntaxKind::MOD_KW), 0, 3), Ok(()));
     assert_eq!(columns.push(ident, 4, 5), Ok(()));
-    assert_eq!(outline_tokens(text, &columns, Edition::E2024, Alloc::global()).err(), Some(TokensRefused::SplitsChar { token: 1, at: 5 }));
+    assert_eq!(outline_tokens(text, &columns, Edition::E2024, blaze_own::testing::heap().alloc()).err(), Some(TokensRefused::SplitsChar { token: 1, at: 5 }));
 }

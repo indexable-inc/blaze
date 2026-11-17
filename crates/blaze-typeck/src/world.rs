@@ -98,6 +98,9 @@ pub enum Question {
     ConstParams(ItemKey),
     /// The facts of closure `ordinal` of `owner`'s body ([`ClosureFacts`]): its owner's check.
     Closure(ItemKey, u32),
+    /// The facts of async block `ordinal` of `owner`'s body ([`CoroutineFacts`]): its owner's
+    /// check (`PNode::Coroutine`).
+    Coroutine(ItemKey, u32),
     /// The generics of a trait's associated type, by its trait and name (as a projection
     /// names it): the trait's count and its own ([`AssocGenerics`]).
     AssocGenerics(ItemKey, Name),
@@ -118,7 +121,11 @@ impl Question {
     /// The kind of record the question reads (typeck.md, "Item records and body records").
     pub const fn record_kind(self) -> RecordKind {
         match self {
-            Question::Opaque(_) | Question::Const(_) | Question::ConstHolds(..) | Question::Closure(..) => RecordKind::Body,
+            Question::Opaque(_)
+            | Question::Const(_)
+            | Question::ConstHolds(..)
+            | Question::Closure(..)
+            | Question::Coroutine(..) => RecordKind::Body,
             Question::FnSig(_)
             | Question::Predicates(_)
             | Question::Adt(_)
@@ -255,6 +262,10 @@ pub struct FnSig<'w> {
     /// The fn's ABI and safety (`unsafe fn`, `extern "C" fn`): the header of the fn pointer
     /// it reifies to.
     pub header: FnPtrHeader,
+    /// A C-variadic foreign fn (`fn printf(format: *const c_char, ...) -> c_int;`, the
+    /// Reference, "External blocks", [items.extern.variadic]): `inputs` are the declared
+    /// parameters, and a call may pass more (rules/c_variadic.rs).
+    pub c_variadic: bool,
     pub inputs: &'w [PTy],
     pub output: PTy,
     pub types: PTys<'w>,
@@ -465,6 +476,9 @@ pub struct TypeAttrs(pub u32);
 impl TypeAttrs {
     pub const NON_EXHAUSTIVE: u32 = 1;
     pub const FUNDAMENTAL: u32 = 2;
+    /// `#[rustc_promotable]` on a fn: a call of it with promotable arguments may be promoted
+    /// to a `'static` slot (rules/promote.rs; core/src/task/wake.rs `RawWakerVTable::new`).
+    pub const PROMOTABLE: u32 = 4;
     /// Bits 8..12: an enum's discriminant type ([`DiscrRepr`]); 0 is `Unread`.
     const DISCR: u32 = 0xf << 8;
 
@@ -520,6 +534,16 @@ pub struct ClosureFacts<'w> {
     pub types: PTys<'w>,
 }
 
+/// An async block's facts, from its owner's check (`PNode::Coroutine`): its output and its
+/// interior (the tuple of what it holds), both of `types` in the owner's parameters (`Param(i)`
+/// is the coroutine type's `args[i]`).
+#[derive(Clone, Copy, Debug)]
+pub struct CoroutineFacts<'w> {
+    pub output: PTy,
+    pub interior: PTy,
+    pub types: PTys<'w>,
+}
+
 /// Everything the driver may learn from outside the body. Implemented by the item layer over
 /// its records (`blaze-surface`'s `Items`), and by the tests' toy world. Each method answers
 /// one [`Question`], or `Missing`. It must be a function of the records: two calls with equal
@@ -560,6 +584,15 @@ pub trait World {
     /// The facts of closure `ordinal` of `owner`'s body (`Question::Closure`): `Missing` while
     /// the owner's body is not checked; `None` when its record has no such closure.
     fn closure(&self, seal: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<ClosureFacts<'_>>>;
+    /// The facts of async block `ordinal` of `owner`'s body (`Question::Coroutine`): `Missing`
+    /// while the owner's body is not checked; `None` when its record has no such block. The
+    /// default is the gap (`Missing`): a world that holds no body records cannot answer it, and
+    /// a `PNode::Coroutine` it meets stays unlowered (never guessed). DEFAULTED so no world
+    /// breaks; a world that holds body records answers it (blaze-ladder front2, the fixture).
+    fn coroutine(&self, seal: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<CoroutineFacts<'_>>> {
+        let (_, _, _) = (seal, owner, ordinal);
+        Err(Missing)
+    }
     fn attrs(&self, seal: Seal, item: ItemKey) -> Fetch<TypeAttrs>;
     /// The definition of trait `trait_` (`None`: not a trait).
     fn trait_def(&self, seal: Seal, trait_: ItemKey) -> Fetch<Option<TraitDef<'_>>>;
@@ -969,7 +1002,7 @@ impl Tabled for FnSig<'_> {
         h.u32(self.own_count);
         h.u32(self.declared_count);
         h.tag(u8::from(self.self_param));
-        h.tag(self.header.bits());
+        h.tag(self.header.bits() | if self.c_variadic { 0x40 } else { 0 });
         h.u64(self.inputs.len() as u64);
     }
 }
@@ -1036,6 +1069,25 @@ impl ContentHash for ClosureFacts<'_> {
     fn hash_into(&self, h: &mut StableHasher) {
         h.u32(self.kind as u32);
         h.u32(self.sig.0);
+        self.types.hash_into(h);
+    }
+}
+
+impl Tabled for CoroutineFacts<'_> {
+    fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
+        roots.push(Root::Ty(self.output));
+        roots.push(Root::Ty(self.interior));
+        Some(self.types)
+    }
+    fn hash_shape(&self, _h: &mut StableHasher) {
+        // Two handles and their table: all its content is the terms `parts` reaches.
+    }
+}
+
+impl ContentHash for CoroutineFacts<'_> {
+    fn hash_into(&self, h: &mut StableHasher) {
+        h.u32(self.output.0);
+        h.u32(self.interior.0);
         self.types.hash_into(h);
     }
 }
@@ -1399,6 +1451,12 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         let got = self.world.closure(Self::seal(), owner, ordinal);
         self.record_tabled(Question::Closure(owner, ordinal), got, asked_at)
     }
+
+    pub fn coroutine(&mut self, owner: ItemKey, ordinal: u32) -> Result<Option<CoroutineFacts<'w>>, Stop> {
+        let asked_at = self.stamp();
+        let got = self.world.coroutine(Self::seal(), owner, ordinal);
+        self.record_tabled(Question::Coroutine(owner, ordinal), got, asked_at)
+    }
     pub fn attrs(&mut self, item: ItemKey) -> Result<TypeAttrs, Stop> {
         let asked_at = self.stamp();
                 let got = self.world.attrs(Self::seal(), item);
@@ -1485,7 +1543,7 @@ impl ContentHash for FnSig<'_> {
         h.u32(self.parent_count);
         h.u32(self.own_count);
         h.tag(u8::from(self.self_param));
-        h.tag(self.header.bits());
+        h.tag(self.header.bits() | if self.c_variadic { 0x40 } else { 0 });
         self.inputs.hash_into(h);
         h.u32(self.output.0);
         self.types.hash_into(h);

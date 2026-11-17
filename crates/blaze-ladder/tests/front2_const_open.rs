@@ -315,3 +315,36 @@ fn main() {}
     assert!(o.starts_with("not "), "`cyc` must be refused, not clean and not a diagnostic: {o}");
     assert!(o.contains("Self::N"), "the refusal must name the length's constant by its text: {o}");
 }
+
+/// A trait's associated constant of a GENERIC impl is the solver's selection (front2/
+/// const_select.rs through `blaze_typeck::resolve_instance`). The Reference, "Associated
+/// Items", "Associated Constants": "Associated constants are constants associated with a
+/// type", and "An associated constant definition defines a constant associated with a type";
+/// its example "Using default values" (`impl ConstantIdDefault for Struct {}` gives
+/// `<Struct as ConstantIdDefault>::ID` the trait's `1`). So `<S<S<Z>> as U>::N` is the
+/// definition of the impl that holds for `S<S<Z>>` (`impl<T: U> U for S<T>`, at `T` =
+/// `S<Z>`), `<S<Z> as U>::N + 1`, again that impl at `T` = `Z`, `<Z as U>::N + 1 + 1`, which
+/// is `0 + 1 + 1` = 2; and `<S<Z> as D>::K` is the trait's default 5, the generic impl writing
+/// none. The selector before this took only an impl with no generics or `impl<T> Tr for T`
+/// and refused both with `NoImplConst`; a selector that took the first impl of the trait
+/// (`Z`'s, 0) or the trait's default in place of an impl's gives a length that is not 2, so
+/// `two` is not clean; one that made the length a hole makes `three` clean.
+/// Expected lines: "generic impl: two: clean", "generic impl: three: diags [..]" (a `[u8; 2]`
+/// returned where `[u8; 3]` is written), "generic impl: five: clean".
+#[test]
+fn a_constant_of_a_generic_impl_is_selected_by_the_solver() {
+    const TEXT: &str = "trait U { const N: usize; }
+trait D { const K: usize = 5; }
+struct Z;
+struct S<T>(T);
+impl U for Z { const N: usize = 0; }
+impl<T: U> U for S<T> { const N: usize = T::N + 1; }
+impl<T> D for S<T> {}
+fn two(a: [u8; <S<S<Z>> as U>::N]) -> [u8; 2] { a }
+fn three(a: [u8; <S<S<Z>> as U>::N]) -> [u8; 3] { a }
+fn five(a: [u8; <S<Z> as D>::K]) -> [u8; 5] { a }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["two", "three", "five"]);
+    expect("generic impl", &got, &[true, false, true]);
+}

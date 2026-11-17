@@ -2,10 +2,12 @@
 //! earlier solve's set read in place, and what this solve found again or expanded.
 //!
 //! A crate solved again after an edit expands only the calls the edit moved: a call's key is
-//! made from its TEXT before anything is lexed ([`blaze_expand::text_key`]: the definition's
-//! text and site, the call's shape, attribute, edition and input text, the expander's code),
-//! found in the earlier set by a binary search, and its read list (the cfg atoms the item walk
-//! asked, the expansion's own reads) asked again before the kept expansion is taken. What is
+//! the ONE key of an expansion, [`blaze_expand::call_key`] (the expander's code, the
+//! definition's content and site, the call's tokens as shaped: the lowering keys a body's call
+//! by the same function, so one call is one key in both layers), made once the call is lexed
+//! and shaped and before it is expanded, found in the earlier set by a binary search, and its
+//! read list (the cfg atoms the item walk asked, the expansion's own reads) asked again before
+//! the kept expansion is taken. What is
 //! taken is the [`blaze_expand::Expansion`]'s record read back: the same value a fresh
 //! expansion gives, so everything after it (the render, the outline, the lowering) does not
 //! know which it got.
@@ -28,7 +30,7 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use blaze_expand::TextKey;
+use blaze_expand::CallKey;
 use blaze_expand::kept::{KeptError, KeptSet, SetEntry, SetSource, write_set};
 use blaze_own::{AVec, Alloc};
 
@@ -53,11 +55,12 @@ pub struct KeptCounts {
     pub unkept: usize,
 }
 
-/// The planted bug of the tests: a key made without the attribute's and the definition's name.
+/// The planted bug of the tests: a key made without the definition's content (so two derives
+/// of one item share a key).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Planted {
     None,
-    KeyWithoutTheAttribute,
+    KeyWithoutTheDefinition,
 }
 
 /// One crate's kept expansions for one solve. Shared by the fill's threads: the lock is held
@@ -65,7 +68,7 @@ pub enum Planted {
 pub struct KeptExpansions<'k, 'a> {
     keeps: bool,
     earlier: Option<KeptSet<'k>>,
-    now: Mutex<AVec<'a, (TextKey, Now<'a>)>>,
+    now: Mutex<AVec<'a, (CallKey, Now<'a>)>>,
     found: AtomicUsize,
     made: AtomicUsize,
     moved: AtomicUsize,
@@ -126,7 +129,7 @@ impl<'k, 'a> KeptExpansions<'k, 'a> {
         }
     }
 
-    fn push(&self, key: TextKey, now: Now<'a>) {
+    fn push(&self, key: CallKey, now: Now<'a>) {
         match self.now.lock() {
             Ok(mut list) => list.push((key, now)),
             Err(_) => panic!("a fill thread panicked holding the kept expansions lock"),
@@ -134,7 +137,7 @@ impl<'k, 'a> KeptExpansions<'k, 'a> {
     }
 
     /// The earlier solve's entry under `key`, opened, with its index for [`Self::found`].
-    pub(crate) fn find(&self, key: &TextKey) -> Result<Option<(usize, SetEntry<'k>)>, KeptError> {
+    pub(crate) fn find(&self, key: &CallKey) -> Result<Option<(usize, SetEntry<'k>)>, KeptError> {
         let Some(set) = self.earlier else { return Ok(None) };
         match set.position(key) {
             Some(index) => Ok(Some((index, set.entry(index)?))),
@@ -144,13 +147,13 @@ impl<'k, 'a> KeptExpansions<'k, 'a> {
 
     /// The entry at `index` of the earlier set answered the call of `key`: it is this solve's
     /// too.
-    pub(crate) fn found(&self, key: TextKey, index: usize) {
+    pub(crate) fn found(&self, key: CallKey, index: usize) {
         self.found.fetch_add(1, Ordering::Relaxed);
         self.push(key, Now::Found(index));
     }
 
     /// The call of `key` was expanded: `entry` is its bytes.
-    pub(crate) fn made(&self, key: TextKey, entry: &'a [u8]) {
+    pub(crate) fn made(&self, key: CallKey, entry: &'a [u8]) {
         self.made.fetch_add(1, Ordering::Relaxed);
         self.push(key, Now::Made(entry));
     }
@@ -173,7 +176,7 @@ impl<'k, 'a> KeptExpansions<'k, 'a> {
             Ok(list) => list,
             Err(_) => panic!("a fill thread panicked holding the kept expansions lock"),
         };
-        let mut entries: AVec<'b, (TextKey, SetSource<'_>)> = AVec::with_capacity_in(list.len(), alloc);
+        let mut entries: AVec<'b, (CallKey, SetSource<'_>)> = AVec::with_capacity_in(list.len(), alloc);
         for &(key, now) in list.iter() {
             let source = match (now, self.earlier) {
                 (Now::Made(bytes), _) => SetSource::Entry(bytes),

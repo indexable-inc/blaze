@@ -12,16 +12,20 @@
 //!   tests record", piece 6), read through `TestsRecord::open`: one row per `#[test]` or
 //!   `#[bench]` function, from attributes alone. EMPTY for a unit without `test` in its cfg
 //!   (`NotATestUnit`): a plain library or binary has no tests record.
+//! - `expansions`: the text each macro call of the crate made ([`super::expansion_texts`],
+//!   piece 16), served to a body's check by front_load.rs `StoreLoad::expansion`. EMPTY for a
+//!   crate whose calls made no text.
 //!
 //! The head, [`HEAD`] bytes, little-endian: [`MAGIC`] (4), [`FORM`] (u32), the crate's
 //! unresolved count (u32), 4 zero bytes, then per section in the order above its place (u64)
 //! and its length (u64). Each section starts at the end of the one before (the head for the
 //! first) rounded up to 16, so a reader may map it 16-aligned; the padding is zero; the payload
-//! ends where the tests end (an empty tests section ends at its place). [`sections`] checks all
+//! ends where the last section ends (an empty one ends at its place). [`sections`] checks all
 //! of it and copies nothing.
 //!
 //! Older forms (the 16-byte head of exports then inner, before 2026-11-16; form 2, four
-//! sections without the tests) are records under other names: names.rs's subject and source
+//! sections without the tests; form 3, five without the expansions) are records under other
+//! names: names.rs's subject and source
 //! domains moved with each form, so an old home's records are never found and are made again;
 //! one read anyway is [`SectionsError::Form`].
 
@@ -30,12 +34,12 @@ use super::Global;
 /// The payload's first bytes.
 pub(crate) const MAGIC: [u8; 4] = *b"BZCS";
 /// This form's number. Bump it, and names.rs's domains, at any change of the layout.
-pub(crate) const FORM: u32 = 3;
+pub(crate) const FORM: u32 = 4;
 /// How many sections a payload of this form holds.
-const SECTIONS: usize = 5;
-/// Where the five (place, length) pairs start.
+pub(crate) const SECTIONS: usize = 6;
+/// Where the six (place, length) pairs start.
 const PLACES: usize = 16;
-/// The head's length: the fixed words, then five pairs of u64.
+/// The head's length: the fixed words, then six pairs of u64.
 pub(crate) const HEAD: usize = PLACES + SECTIONS * 16;
 /// What each section's place is rounded up to.
 const ALIGN: usize = 16;
@@ -48,10 +52,11 @@ pub(crate) enum Section {
     Names,
     Items,
     Tests,
+    Expansions,
 }
 
 impl Section {
-    pub(crate) const ALL: [Section; SECTIONS] = [Section::Exports, Section::Inner, Section::Names, Section::Items, Section::Tests];
+    pub(crate) const ALL: [Section; SECTIONS] = [Section::Exports, Section::Inner, Section::Names, Section::Items, Section::Tests, Section::Expansions];
 
     fn says(self) -> &'static str {
         match self {
@@ -60,6 +65,7 @@ impl Section {
             Section::Names => "the names record",
             Section::Items => "the items record",
             Section::Tests => "the tests record",
+            Section::Expansions => "the expansion texts",
         }
     }
 }
@@ -74,6 +80,8 @@ pub(crate) struct Sections<'p> {
     pub items: &'p [u8],
     /// The unit's tests record; empty when the unit is not compiled with `test`.
     pub tests: &'p [u8],
+    /// The texts its macro calls made ([`super::expansion_texts`]); empty when none did.
+    pub expansions: &'p [u8],
     /// The crate's unresolved paths, counted when it was made.
     pub unresolved: u32,
 }
@@ -89,7 +97,7 @@ pub(crate) enum SectionsError {
     Misplaced { section: Section, at: u64, want: u64 },
     /// A section runs past the payload's end: the payload was cut short.
     Short { section: Section, end: u64, len: usize },
-    /// Bytes after the tests record (the last section).
+    /// Bytes after the expansion texts (the last section).
     Trailing { end: u64, len: usize },
 }
 
@@ -107,7 +115,7 @@ impl core::fmt::Display for SectionsError {
                 write!(f, "a `CrateScope` payload of {len} bytes is cut short: {} ends at byte {end} (rule: names.rs)", section.says())
             }
             SectionsError::Trailing { end, len } => {
-                write!(f, "a `CrateScope` payload of {len} bytes goes on past its tests record's end at byte {end} (rule: names.rs)")
+                write!(f, "a `CrateScope` payload of {len} bytes goes on past its last section's end at byte {end} (rule: names.rs)")
             }
         }
     }
@@ -120,7 +128,7 @@ fn word(head: &[u8; HEAD], at: usize) -> u64 {
 }
 
 /// The payload of a crate's `CrateScope` record: the head, then `parts` (exports, inner, names,
-/// items, tests) each at a 16-aligned place. A function of its arguments only: the same crate
+/// items, tests, expansions) each at a 16-aligned place. A function of its arguments only: the same crate
 /// gives the same bytes on any machine.
 pub(crate) fn write(unresolved: u32, parts: [&[u8]; SECTIONS]) -> blaze_own::Vec<u8, Global> {
     let mut places = [(0usize, 0usize); SECTIONS];
@@ -146,7 +154,7 @@ pub(crate) fn write(unresolved: u32, parts: [&[u8]; SECTIONS]) -> blaze_own::Vec
     payload
 }
 
-/// The four sections of a `CrateScope` payload, every place and length checked against the
+/// The six sections of a `CrateScope` payload, every place and length checked against the
 /// payload's length; a payload cut short anywhere is refused naming the first section it cuts.
 pub(crate) fn sections(payload: &[u8]) -> Result<Sections<'_>, SectionsError> {
     let Some(head) = payload.first_chunk::<HEAD>() else {
@@ -182,8 +190,8 @@ pub(crate) fn sections(payload: &[u8]) -> Result<Sections<'_>, SectionsError> {
     if end != payload.len() as u64 {
         return Err(SectionsError::Trailing { end, len: payload.len() });
     }
-    let [exports, inner, names, items, tests] = parts;
-    Ok(Sections { exports, inner, names, items, tests, unresolved })
+    let [exports, inner, names, items, tests, expansions] = parts;
+    Ok(Sections { exports, inner, names, items, tests, expansions, unresolved })
 }
 
 /// Tests: the one crate whose dependency payload, as a dependent read it from the store, is

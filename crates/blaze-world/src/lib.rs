@@ -51,6 +51,7 @@ use blaze_fetch::PackView;
 use blaze_id::{ContentId, CrateItemKey};
 use blaze_manifest::lock::{Lock, LockId};
 use blaze_own::{AString, AVec, Alloc, BTreeMap, Box};
+use blaze_scope::crate_env::{CrateEnv, EnvFacts, MemberDirError, SeenRoot};
 use blaze_scope::graph::{CrateId, Sysroot};
 use blaze_scope::resolve::{CrateInput, Names, NamesError, SourceTexts, resolve_crates};
 use blaze_scope::task::Par;
@@ -285,6 +286,9 @@ pub struct Texts<'w> {
     /// Files read corrected (D58): `(tree, path in it, corrected text)`, read in place of the
     /// pack's bytes.
     corrected: AVec<'w, (u32, &'w str, &'w str)>,
+    /// Each crate's environment, by crate index ([`SourceTexts::crate_env`]): what its `env!`
+    /// reads, `CARGO_MANIFEST_DIR` the root it sees (D96).
+    envs: AVec<'w, CrateEnv<'w>>,
 }
 
 impl<'w> Texts<'w> {
@@ -314,6 +318,10 @@ impl<'w> SourceTexts<'w> for Texts<'w> {
             n => self.packs.get(n - 1)?.find(inner)?.bytes,
         };
         core::str::from_utf8(bytes).ok()
+    }
+
+    fn crate_env(&self, krate: usize) -> Option<&CrateEnv<'w>> {
+        self.envs.get(krate)
     }
 }
 
@@ -348,12 +356,18 @@ pub enum WorldError<'w> {
     /// A source correction (D58, `blaze_fetch::correct`) refused this package: the words say
     /// which file and why (a stale row, a missing file).
     Correction { package: &'w str, version: &'w str, why: &'w str },
+    /// A member's directory cannot be seen at `/workspace/<dir>` (D96).
+    MemberDir { package: &'w str, error: MemberDirError<'w> },
+    /// A crate's environment cannot be made (its version has not three parts).
+    Env(blaze_scope::crate_env::CrateEnvError<'w>),
 }
 
 impl fmt::Display for WorldError<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WorldError::Source(e) => write!(f, "{e}"),
+            WorldError::MemberDir { package, error } => write!(f, "the member `{package}`: {error}"),
+            WorldError::Env(e) => write!(f, "{e}"),
             WorldError::PathNotPlaced { package } => write!(f, "the path package `{package}` is in no directory the workspace's layout found"),
             WorldError::Correction { package, version, why } => write!(f, "{package} {version}: {why}"),
             WorldError::DependencyNotHeld { krate, dep, kind, for_host } => {
@@ -509,6 +523,8 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
     crate_of.extend((0..n).map(|_| None));
     let mut pending: AVec<'w, Pending<'w>> = AVec::new_in(alloc.clone());
     let mut by_key: BTreeMap<[u8; 32], u32, Alloc<'w>> = BTreeMap::new_in(alloc.clone());
+    // Path packages placed while keying (by lock index), each asked of `packages` once.
+    let mut early: BTreeMap<u32, Place<'w>, Alloc<'w>> = BTreeMap::new_in(alloc.clone());
     let mut keyed = 0usize;
     while let Some(u) = ready.pop() {
         let unit = &units[u as usize];
@@ -521,7 +537,25 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
             (Some(_), None) => Script::Missing,
         };
         let implicit_key = implicit_key(toolchain, implicit(unit.edition, &unit.kind))?;
-        let input = unit_input(graph, lock, id, &crate_of, &|c| pending[c as usize].key, implicit_key, served, &corrections, alloc.clone());
+        // A path package is placed now: a member's directory is what it sees as its root
+        // (`/workspace/<dir>`, D96 (3)), so it is in its key (rule 21).
+        let member = if lock.package(unit.package).source_text.is_empty() {
+            let place = match early.get(&unit.package.0) {
+                Some(&place) => place,
+                None => {
+                    let place = packages.place(unit.package)?;
+                    early.insert(unit.package.0, place);
+                    place
+                }
+            };
+            match place {
+                Place::Checkout { dir } => Some(dir),
+                Place::Pack { .. } => None,
+            }
+        } else {
+            None
+        };
+        let input = unit_input(graph, lock, id, &crate_of, &|c| pending[c as usize].key, implicit_key, served, member, &corrections, alloc.clone());
         keyed += 1;
         match by_key.get(&input.key.0.0) {
             Some(&c) => {
@@ -567,7 +601,20 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
     let mut placed: BTreeMap<u32, (u32, &'w str), Alloc<'w>> = BTreeMap::new_in(alloc.clone());
 
     let mut crates: AVec<'w, Crate<'w>> = AVec::with_capacity_in(tc.len() + pending.len(), alloc.clone());
+    let mut envs: AVec<'w, CrateEnv<'w>> = AVec::with_capacity_in(tc.len() + pending.len(), alloc.clone());
     for (i, c) in tc.iter().enumerate() {
+        // A toolchain crate is a dependency: it sees `/package` (D96); it has no lock entry.
+        let facts = EnvFacts {
+            crate_name: c.name,
+            package: None,
+            bin: None,
+            seen: SeenRoot::Package,
+            read_folder: c.shown_from,
+            build_script: false,
+            script: None,
+            test_or_bench: false,
+        };
+        envs.push(CrateEnv::of(facts, alloc.clone()).map_err(WorldError::Env)?);
         crates.push(Crate {
             input: CrateInput {
                 name: c.name,
@@ -596,7 +643,11 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
         let (tree, dir) = match placed.get(&unit.package.0) {
             Some(&it) => it,
             None => {
-                let it = match packages.place(unit.package)? {
+                let place = match early.get(&unit.package.0) {
+                    Some(&place) => place,
+                    None => packages.place(unit.package)?,
+                };
+                let it = match place {
                     Place::Checkout { dir } => (0, dir),
                     Place::Pack { view, dir } => {
                         packs.push(view);
@@ -632,6 +683,24 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
         }
         let mut features: AVec<'w, &'w str> = AVec::with_capacity_in(unit.features.len(), alloc.clone());
         features.extend(unit.features.iter().map(|f| f.as_str()));
+        // What the crate sees as its root (D96): a member (placed in the checkout, tree 0) its
+        // directory under the workspace, every fetched package the one root `/package`.
+        let seen = if tree == 0 { SeenRoot::member(dir).map_err(|error| WorldError::MemberDir { package: &unit.name, error })? } else { SeenRoot::Package };
+        let shown_from: &'w str = keep(&shown_from, alloc.clone());
+        let facts = EnvFacts {
+            crate_name: &unit.crate_name,
+            package: Some((&unit.name, &unit.version)),
+            bin: match &unit.kind {
+                UnitKind::Bin(name) => Some(name.as_str()),
+                _ => None,
+            },
+            seen,
+            read_folder: shown_from,
+            build_script: unit.build_script.is_some(),
+            script: p.outputs,
+            test_or_bench: matches!(unit.kind, UnitKind::IntegrationTest(_) | UnitKind::Bench(_)),
+        };
+        envs.push(CrateEnv::of(facts, alloc.clone()).map_err(WorldError::Env)?);
         crates.push(Crate {
             input: CrateInput {
                 name: &unit.crate_name,
@@ -639,7 +708,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
                 edition: edition_of(unit.edition.syntax),
                 implicit: implicit(unit.edition, &unit.kind),
                 root,
-                shown_from: keep(&shown_from, alloc.clone()),
+                shown_from,
                 features: features.leak(),
                 deps: deps.leak(),
                 cfg: p.cfg,
@@ -657,7 +726,7 @@ pub fn world<'w, P: Packages<'w>, B: AsRef<[u8]>>(
     crate_of_unit.extend(crate_of.iter().map(|c| c.map(|c| t + rank[c as usize])));
     let role = |i: Option<usize>| i.map(|i| CrateId(i as u32));
     let sysroot = Sysroot { core: role(toolchain.core()), alloc: role(toolchain.alloc()), std: role(toolchain.std()), bstd: role(toolchain.bstd()) };
-    Ok(World { crates, texts: Texts { checkout, packs, corrected }, sysroot, toolchain_crates: t, crate_of_unit, corrections: used })
+    Ok(World { crates, texts: Texts { checkout, packs, corrected, envs }, sysroot, toolchain_crates: t, crate_of_unit, corrections: used })
 }
 
 /// One package's source corrections (D58) applied: each corrected file's text kept under
@@ -778,7 +847,8 @@ pub fn implicit_key<'w, B: AsRef<[u8]>>(toolchain: &Toolchain<'w, B>, implicit: 
 /// `crate_key` gives each crate's key; `implicit_extern` is [`implicit_key`] of the unit's implicit
 /// externs; `script` is the build script's outputs when known: its atoms join the cfg and its
 /// [`Served::digest`] (everything of the record the crate can read: cfgs, env pairs, generated
-/// files) is in the key.
+/// files) is in the key; `member` is a workspace member's directory in the checkout (the root
+/// it sees, D96), in the key.
 ///
 /// The key is the crate's IDENTITY, never its text: its item ids are made from it, so a body
 /// or `pub fn` edit must leave it equal. Its text is pinned by its package's version and
@@ -793,6 +863,7 @@ pub fn unit_input<'w>(
     crate_key: &dyn Fn(u32) -> CrateItemKey,
     implicit_extern: CrateItemKey,
     script: Option<Served<'w>>,
+    member: Option<&str>,
     corrections: &blaze_fetch::correct::Table<Alloc<'w>>,
     alloc: Alloc<'w>,
 ) -> UnitInput<'w> {
@@ -849,6 +920,11 @@ pub fn unit_input<'w>(
     if let Some(served) = script {
         put(&mut bytes, b"\0script");
         put(&mut bytes, &served.digest.0);
+    }
+    // A member's directory: the root it sees is `/workspace/<dir>` (D96 (3), rule 21).
+    if let Some(dir) = member {
+        put(&mut bytes, b"\0member");
+        put(&mut bytes, dir.as_bytes());
     }
     // A package read corrected (D58) is keyed by the row too.
     if let Some(row) = corrections.find_text(&package.name, &unit.version) {

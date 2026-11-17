@@ -37,6 +37,14 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
+/// A child run under a parent that serves it: streams chosen, a channel on descriptor 3, the
+/// `RunChild` seam a driver loop is written against.
+pub mod run;
+/// The simulation's run child: a scripted `RunChild` on a virtual clock.
+pub mod sim_child;
+/// The simulation's answer to SIGTERM: a scripted child that heeds or ignores it (D103).
+pub mod sim_term;
+
 /// The span a linked child's wait is named by in a [`Stopped::Deadline`].
 const WAIT_SPAN: &str = "bstd::procs wait_linked";
 

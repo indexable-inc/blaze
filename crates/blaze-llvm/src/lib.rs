@@ -9,6 +9,8 @@
 //! - [`lower`] (D2): LIR to LLVM IR text, offered callees `available_externally`, every other
 //!   callee a declaration carrying exactly blaze's [`CalleeFacts`].
 //! - [`names`]: how a symbol is named in IR and read back from a remark.
+//! - [`read_lsda`] (P8b): LLVM's LSDA read back into blaze's unwind rows
+//!   (`blaze_code::unwind::Row`); blaze-code eh.rs makes the LSDA again at placement.
 //!
 //! The contract with LLVM: its own inliner decides inside the offered bodies; NO pass infers a
 //! fact about a callee from an offered body; blaze supplies the facts as attributes; the
@@ -24,11 +26,13 @@ use llvm_sys as _;
 pub mod compile;
 pub mod ffi;
 pub mod lower;
+pub mod lower_target;
 pub mod names;
 pub mod pipeline;
+pub mod read_lsda;
 pub mod remarks;
 
-pub use compile::{Linked, LlvmError, Severity, bitcode, compile, init, triple};
+pub use compile::{Linked, LlvmError, Severity, bitcode, compile, default_pipeline, init, triple};
 pub use lower::{CalleeFacts, LowerError, Lowered, Offered, lower};
 pub use pipeline::Pipeline;
 pub use remarks::{Remark, RemarkError};

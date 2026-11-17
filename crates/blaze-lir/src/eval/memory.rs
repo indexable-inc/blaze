@@ -30,12 +30,20 @@
 //! undefined behaviour by name; `noundef` asks what every scalar load already asks; an
 //! `invariant` load is refused, since the evaluator does not check that memory never changes.
 //!
+//! The program's data and functions (eval/data.rs) are allocations too, placed once per run
+//! with ids from the same count, their bytes before every stack slot's; no frame's return
+//! closes them. A function's allocation has no bytes: an access through it is undefined.
+//!
 //! Storage: the crate's present form, std `Vec` in the run's allocator `A` (blaze-lir does not
 //! depend on blaze-own); this file replaces eval.rs's `Memory` and its four `Vec` fields.
 
 use core::{alloc::Allocator, ops::Range};
 
-use super::{EvalError, Outcome, Run, Val, promises};
+use super::{
+    EvalError, Outcome, Run, Val,
+    data::{Data, Kind},
+    promises,
+};
 use crate::{
     IntCond, Op, Ty, Value, View,
     arith::{compare, mask, sext},
@@ -51,45 +59,51 @@ impl Val {
 /// One byte of memory.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct Byte {
-    value: u8,
-    init: bool,
+    pub(super) value: u8,
+    pub(super) init: bool,
     /// Its place in the pointer `prov` names; 0 for a byte of no pointer.
-    index: u8,
-    /// The slot of the pointer this byte is part of, or `Val::NO_SLOT`.
-    prov: u32,
+    pub(super) index: u8,
+    /// The allocation (slot, datum or function) of the pointer this byte is part of, or
+    /// `Val::NO_SLOT`.
+    pub(super) prov: u32,
 }
 
 const UNINIT: Byte = Byte { value: 0, init: false, index: 0, prov: Val::NO_SLOT };
 
 /// A byte no pointer wrote.
-const fn plain(value: u8) -> Byte {
+pub(super) const fn plain(value: u8) -> Byte {
     Byte { value, init: true, index: 0, prov: Val::NO_SLOT }
 }
 
-/// One stack slot of one frame.
+/// One allocation of a run: a stack slot of one frame, a datum or a function (eval/data.rs).
 #[derive(Clone, Copy, Debug)]
-struct Alloc {
-    id: u32,
+pub(super) struct Alloc {
+    pub(super) id: u32,
     /// Its first byte in `Memory::bytes`.
-    start: usize,
-    size: u32,
+    pub(super) start: usize,
+    pub(super) size: u32,
     /// The log2 of its alignment.
-    align: u8,
-    live: bool,
+    pub(super) align: u8,
+    pub(super) live: bool,
+    /// What it is: a datum is never dead and no frame's return closes it.
+    pub(super) kind: Kind,
 }
 
-/// The slots of every frame of a run, the innermost frame's last.
+/// The slots of every frame of a run, the innermost frame's last, and the data and functions
+/// the run placed (eval/data.rs), whose bytes come first.
 pub(super) struct Memory<A: Allocator> {
-    /// By id, ascending.
-    allocs: Vec<Alloc, A>,
-    bytes: Vec<Byte, A>,
-    /// The id the next slot opened takes: every id below it was used once.
-    next: u32,
+    /// The stack slots, by id ascending.
+    pub(super) allocs: Vec<Alloc, A>,
+    pub(super) bytes: Vec<Byte, A>,
+    /// The id the next slot, datum or function takes: every id below it was used once.
+    pub(super) next: u32,
+    /// The data and functions placed.
+    pub(super) data: Data<A>,
 }
 
 impl<A: Allocator + Clone> Memory<A> {
     pub(super) fn new_in(alloc: A) -> Memory<A> {
-        Memory { allocs: Vec::new_in(alloc.clone()), bytes: Vec::new_in(alloc), next: 0 }
+        Memory { allocs: Vec::new_in(alloc.clone()), bytes: Vec::new_in(alloc.clone()), next: 0, data: Data::new_in(alloc) }
     }
 
     /// Opens the slots of a frame of `view`, live and uninitialized: the id of its slot 0, or
@@ -100,7 +114,7 @@ impl<A: Allocator + Clone> Memory<A> {
         let end = base.checked_add(count).filter(|&end| end <= Val::NO_SLOT)?;
         let mut start = self.bytes.len();
         for (id, slot) in (base..end).zip(view.slots.iter()) {
-            self.allocs.push(Alloc { id, start, size: slot.size, align: slot.align, live: true });
+            self.allocs.push(Alloc { id, start, size: slot.size, align: slot.align, live: true, kind: Kind::Stack });
             start += slot.size as usize;
         }
         self.bytes.resize(start, UNINIT);
@@ -117,9 +131,13 @@ impl<A: Allocator + Clone> Memory<A> {
         self.allocs.truncate(first);
     }
 
-    fn find(&self, id: u32) -> Option<Alloc> {
-        let at = self.allocs.binary_search_by_key(&id, |it| it.id).ok()?;
-        Some(self.allocs[at])
+    /// The allocation `id` names: an open frame's slot, or a datum or function placed.
+    pub(super) fn find(&self, id: u32) -> Option<Alloc> {
+        if let Ok(at) = self.allocs.binary_search_by_key(&id, |it| it.id) {
+            return Some(self.allocs[at]);
+        }
+        let at = self.data.fixed.binary_search_by_key(&id, |it| it.id).ok()?;
+        Some(self.data.fixed[at])
     }
 }
 
@@ -127,7 +145,7 @@ impl<A: Allocator + Clone> Memory<A> {
 type Access = Result<Range<usize>, &'static str>;
 
 impl<A: Allocator + Clone> Run<'_, A> {
-    fn refuse(&self, inst: usize, what: &'static str) -> EvalError {
+    pub(super) fn refuse(&self, inst: usize, what: &'static str) -> EvalError {
         EvalError::Unsupported { inst, op: self.view.op(inst), what }
     }
 
@@ -142,6 +160,9 @@ impl<A: Allocator + Clone> Run<'_, A> {
     /// step ("`self` must be derived from a pointer to some allocation").
     pub(super) fn inbounds(&self, slot: u32, offset: i128, by: i128) -> Result<i128, &'static str> {
         match self.memory.find(slot) {
+            Some(alloc) if by != 0 && matches!(alloc.kind, Kind::Func { .. }) => {
+                Err("an `inbounds` step of a function pointer")
+            }
             Some(alloc) => promises::inbounds_step(offset, by, i128::from(alloc.size), alloc.live),
             None if by == 0 => Ok(offset),
             None if slot == Val::NO_SLOT => Err("an `inbounds` step of a pointer with no provenance"),
@@ -183,6 +204,9 @@ impl<A: Allocator + Clone> Run<'_, A> {
                 false => Err(self.refuse(inst, "a pointer to no slot of the run")),
             };
         };
+        if let Kind::Func { .. } = alloc.kind {
+            return Ok(Err("an access through a function pointer"));
+        }
         if !alloc.live {
             return Ok(Err("an access to a dead slot"));
         }
@@ -234,8 +258,10 @@ impl<A: Allocator + Clone> Run<'_, A> {
             None => (0, 0, 0, 0),
             Some(attrs) => (attrs.align, attrs.range, attrs.pointee_align, attrs.bits),
         };
-        if bits & MemAttrsRec::INVARIANT != 0 {
-            return Err(self.refuse(inst, "an `invariant` load: that memory never changes is not checked"));
+        // Read-only data never changes, so an `invariant` load of it (a vtable's) keeps its
+        // promise; elsewhere that the memory never changes is not checked.
+        if bits & MemAttrsRec::INVARIANT != 0 && !self.read_only(ptr) {
+            return Err(self.refuse(inst, "an `invariant` load of other than read-only data: that memory never changes is not checked"));
         }
         let span = match self.access(inst, ptr, at, size, align)? {
             Ok(it) => it,
@@ -282,6 +308,9 @@ impl<A: Allocator + Clone> Run<'_, A> {
             let (address, align) = match slot {
                 Val::NO_SLOT => (self.address(offset), u8::MAX),
                 _ => match self.memory.find(slot) {
+                    Some(alloc) if pointee != 0 && matches!(alloc.kind, Kind::Func { .. }) => {
+                        return Err(self.refuse(inst, "a pointee alignment promised of a function pointer"));
+                    }
                     Some(alloc) => (offset as u128, alloc.align),
                     None => return Err(self.refuse(inst, "a pointer's promise on a pointer to a returned call's slot")),
                 },
@@ -310,6 +339,9 @@ impl<A: Allocator + Clone> Run<'_, A> {
             Ok(it) => it,
             Err(why) => return Ok(Err(why)),
         };
+        if self.read_only(ptr) {
+            return Ok(Err("a write to read-only data"));
+        }
         let (bits, prov) = match value {
             Val::Int(bits) => (bits, Val::NO_SLOT),
             Val::Ptr { slot, offset } => (offset as u128, slot),
@@ -339,6 +371,9 @@ impl<A: Allocator + Clone> Run<'_, A> {
             Ok(it) => it,
             Err(why) => return Ok(Err(why)),
         };
+        if len != 0 && self.read_only(dst) {
+            return Ok(Err("a write to read-only data"));
+        }
         if op == Op::Memset {
             let (byte, _) = self.int(inst, src)?;
             self.memory.bytes[to].fill(plain(byte as u8));
@@ -422,6 +457,9 @@ impl<A: Allocator + Clone> Run<'_, A> {
         else {
             return Err(self.refuse(inst, "a pointer comparison of a value that is not a pointer"));
         };
+        if let Some(it) = self.func_compare(inst, cond, (sa, oa), (sb, ob)) {
+            return it;
+        }
         let width = self.view.head.ptr_bits;
         let equality = matches!(cond, IntCond::Eq | IntCond::Ne);
         let unsigned = matches!(cond, IntCond::Ult | IntCond::Ule | IntCond::Ugt | IntCond::Uge);
@@ -463,7 +501,18 @@ impl<A: Allocator + Clone> Run<'_, A> {
                 Ok(it) => it,
                 Err(why) => return undefined(why),
             },
+            // "The `i1` is true (`assume`, `assert_unchecked`): a promise": broken, it is undefined.
+            Op::Assume => {
+                let mut o = self.view.operands(inst);
+                let (holds, _) = self.int(inst, o.value())?;
+                return match holds {
+                    0 => undefined("an `assume` of false"),
+                    _ => Ok(Ok(None)),
+                };
+            }
             Op::Null | Op::PtrAddr | Op::Expose | Op::FromExposed | Op::PtrWithAddr => self.pointer(inst, op)?,
+            // The program's data and functions (eval/data.rs).
+            Op::DataAddr | Op::TlsAddr | Op::FuncAddr => self.address_of(inst)?,
             Op::Uninit => match self.view.ty(Value(inst as u32)).is_scalar() {
                 true => Val::Uninit,
                 false => return Err(self.refuse(inst, "an `uninit` of a vector or compound")),
@@ -473,6 +522,8 @@ impl<A: Allocator + Clone> Run<'_, A> {
             | Op::Fabs | Op::Sqrt | Op::Floor | Op::Ceil | Op::Ftrunc | Op::Nearest | Op::Fround
             | Op::Fma | Op::Fmuladd | Op::Fcmp | Op::Fpext | Op::Fptrunc | Op::FptoUi | Op::FptoSi
             | Op::UitoFp | Op::SitoFp | Op::Bitcast => self.float(inst, op)?,
+            // The aarch64 barriers and hints: no effect in the evaluator's machine (eval/target.rs).
+            Op::TargetIntrinsic => return self.target_intrinsic(inst),
             _ => return Err(self.refuse(inst, "this operation")),
         };
         Ok(Ok(Some(value)))

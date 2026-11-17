@@ -2,7 +2,9 @@
 //! conversions, by IEEE 754 through the host's own `f32` and `f64` operations, each of which
 //! Rust defines exactly (correctly rounded, or exact) on every host. A float is held as its bits
 //! in `Val::Int`, so it is stored, loaded, passed and returned as any scalar is. `f16` and `f128`
-//! constants, loads, stores and bitcasts are modeled; their arithmetic is refused by name.
+//! constants, loads, stores and bitcasts are modeled here; their two-operand arithmetic, `fcmp`
+//! and conversions between float types by soft IEEE (eval/float.rs); their other operations are
+//! refused by name.
 //!
 //! The one place the evaluator and machine code may differ is a NaN's payload and sign: IEEE
 //! 754 and Rust leave which NaN an operation gives open (only that it is a NaN), and the host's
@@ -18,7 +20,10 @@ use core::{
     ops::{Add, Div, Mul, Rem, Sub},
 };
 
-use super::{EvalError, Run, Val};
+use super::{
+    EvalError, Run, Val,
+    float::{float_bin, float_cmp, float_convert, placed},
+};
 use crate::{
     FloatCond, Op, Scalar, Ty, Value,
     arith::{mask, sext},
@@ -99,7 +104,7 @@ macro_rules! float {
 float!(f32, u32);
 float!(f64, u64);
 
-const NARROW: &str = "an f16 or f128 operation: only their bits are modeled";
+const NARROW: &str = "an f16 or f128 operation other than two-operand arithmetic, `fcmp` or a float conversion";
 
 /// A two-operand float operation.
 fn binary<F: Float>(op: Op, a: F, b: F) -> Result<F, &'static str> {
@@ -270,11 +275,11 @@ impl<A: Allocator + Clone> Run<'_, A> {
             | Op::Fminimum | Op::Fmaximum | Op::Fcopysign => {
                 let ((a, scalar), (b, _)) = (self.floats(inst, op, o.value())?, self.floats(inst, op, o.value())?);
                 match scalar {
-                    Scalar::F32 => binary(op, f32::of(a), f32::of(b)).map(Float::bits),
-                    Scalar::F64 => binary(op, f64::of(a), f64::of(b)).map(Float::bits),
-                    _ => Err(NARROW),
-                }
-                .map_err(refuse)?
+                    Scalar::F32 => binary(op, f32::of(a), f32::of(b)).map(Float::bits).map_err(refuse),
+                    Scalar::F64 => binary(op, f64::of(a), f64::of(b)).map(Float::bits).map_err(refuse),
+                    // f16 and f128 by soft IEEE (eval/float.rs).
+                    _ => float_bin(op, ty, a, b).map_err(|error| placed(error, inst)),
+                }?
             }
             Op::Fneg | Op::Fabs | Op::Sqrt | Op::Floor | Op::Ceil | Op::Ftrunc | Op::Nearest | Op::Fround => {
                 let (a, scalar) = self.floats(inst, op, o.value())?;
@@ -301,7 +306,7 @@ impl<A: Allocator + Clone> Run<'_, A> {
                 let holds = match scalar {
                     Scalar::F32 => fcmp(cond, f32::of(a), f32::of(b)),
                     Scalar::F64 => fcmp(cond, f64::of(a), f64::of(b)),
-                    _ => return Err(refuse(NARROW)),
+                    _ => float_cmp(cond, Ty::scalar(scalar), a, b).map_err(|error| placed(error, inst))?,
                 };
                 u128::from(holds)
             }
@@ -310,7 +315,9 @@ impl<A: Allocator + Clone> Run<'_, A> {
                 match (op, from, ty.elem()) {
                     (Op::Fpext, Scalar::F32, Scalar::F64) => (f32::of(a) as f64).bits(),
                     (Op::Fptrunc, Scalar::F64, Scalar::F32) => (f64::of(a) as f32).bits(),
-                    _ => return Err(refuse(NARROW)),
+                    // Any pair with f16 or f128 (the verifier admits only a widening `fpext` and a
+                    // narrowing `fptrunc`) by soft IEEE.
+                    _ => float_convert(op, Ty::scalar(from), ty, a).map_err(|error| placed(error, inst))?,
                 }
             }
             Op::FptoUi | Op::FptoSi => {

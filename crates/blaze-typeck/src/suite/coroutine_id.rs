@@ -27,6 +27,8 @@
 //! fn user_rc() { need_send(rf(..)); }       // E0277: `Rc<u32>` is not `Send`
 //! ```
 
+use std::format;
+use std::string::String;
 use std::vec::Vec;
 
 use super::{Want, check_body, differences};

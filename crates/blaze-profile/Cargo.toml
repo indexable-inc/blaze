@@ -42,6 +42,7 @@ libc.workspace = true
 windows-sys.workspace = true
 
 [dev-dependencies]
+blaze-own = { workspace = true, features = ["testing"] }
 blaze-sim.workspace = true
 
 [lints]

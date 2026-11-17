@@ -14,7 +14,6 @@
 
 #![feature(allocator_api)]
 
-use blaze_own::Alloc;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -215,7 +214,7 @@ fn graph_bytes(world: &World, order: &[usize], dep_order: &[Vec<usize>]) -> Resu
             deps: &deps[krate],
         })
         .collect();
-    let bytes = build_crate_graph(&inputs, Alloc::global()).map_err(harness)?;
+    let bytes = build_crate_graph(&inputs, blaze_own::testing::heap().alloc()).map_err(harness)?;
     Ok(Aligned::copy_from(&bytes))
 }
 
@@ -275,7 +274,7 @@ impl Store {
     fn of(world: &World) -> Result<Store, Broke> {
         let mut store = Store::default();
         for (krate, rows) in world.keys.iter().zip(&world.impls) {
-            let built = build_impl_index(*krate, rows, Alloc::global()).map_err(harness)?;
+            let built = build_impl_index(*krate, rows, blaze_own::testing::heap().alloc()).map_err(harness)?;
             store.crates.insert(*krate, Records::of(&built));
         }
         Ok(store)
@@ -508,7 +507,7 @@ fn an_inherent_const_impl_is_filed_and_a_refused_impl_fails_alone() {
     let twice = row(2, Some(item(krate, KIND_TRAIT, 0)), ImplFlags::NONE);
     let plain = row(3, Some(item(krate, KIND_TRAIT, 1)), ImplFlags::CONST);
     let rows = [twice, const_inherent, unsafe_inherent, plain, twice];
-    let built = build_impl_index(krate, &rows, Alloc::global())
+    let built = build_impl_index(krate, &rows, blaze_own::testing::heap().alloc())
         .unwrap_or_else(|error| panic!("one refused impl refused the crate's index: {error}"));
     let mut refused: Vec<ImplIndexError> = built.refused.iter().copied().collect();
     refused.sort_by_key(|it| format!("{it:?}"));
@@ -534,7 +533,7 @@ fn an_inherent_const_impl_is_filed_and_a_refused_impl_fails_alone() {
     assert_eq!(filed.len(), 2, "{filed:?}");
     // The same rows in another order write the same index and the same findings.
     let reversed: Vec<ImplRow> = rows.iter().rev().copied().collect();
-    let again = build_impl_index(krate, &reversed, Alloc::global()).expect("as above");
+    let again = build_impl_index(krate, &reversed, blaze_own::testing::heap().alloc()).expect("as above");
     assert_eq!(again.directory, built.directory);
     assert_eq!(again.refused[..], built.refused[..]);
 }
@@ -552,10 +551,10 @@ fn adding_an_impl_changes_its_one_bucket_and_the_directory() {
         let key = world.keys[krate];
         let rows = &world.impls[krate];
         let added = world.draw_impl(tape, krate, rows.len());
-        let before = build_impl_index(key, rows, Alloc::global()).map_err(harness)?;
+        let before = build_impl_index(key, rows, blaze_own::testing::heap().alloc()).map_err(harness)?;
         let mut more = rows.clone();
         more.push(added);
-        let after = build_impl_index(key, &more, Alloc::global()).map_err(harness)?;
+        let after = build_impl_index(key, &more, blaze_own::testing::heap().alloc()).map_err(harness)?;
         let changed = BucketKey::of(&added);
         let mut old = bucket_ids(&before);
         let mut new = bucket_ids(&after);
@@ -582,8 +581,8 @@ fn bytes_are_the_same_under_any_order() {
         for (krate, rows) in world.keys.iter().zip(&world.impls) {
             let mut shuffled = rows.clone();
             tape.shuffle(&mut shuffled, "rows");
-            let first = build_impl_index(*krate, rows, Alloc::global()).map_err(harness)?;
-            let second = build_impl_index(*krate, &shuffled, Alloc::global()).map_err(harness)?;
+            let first = build_impl_index(*krate, rows, blaze_own::testing::heap().alloc()).map_err(harness)?;
+            let second = build_impl_index(*krate, &shuffled, blaze_own::testing::heap().alloc()).map_err(harness)?;
             let same = first.directory == second.directory
                 && first.no_impls_of == second.no_impls_of
                 && first.buckets.len() == second.buckets.len()
@@ -615,13 +614,13 @@ enum Filter {
 fn no_impls_of_never_says_none(tape: &Tape, filter: Filter) -> Result<(), Broke> {
     let world = draw_world(tape);
     for (krate, rows) in world.keys.iter().zip(&world.impls) {
-        let built = build_impl_index(*krate, rows, Alloc::global()).map_err(harness)?;
+        let built = build_impl_index(*krate, rows, blaze_own::testing::heap().alloc()).map_err(harness)?;
         let filter_bytes = match (filter, tape.pick(rows, "dropped bucket")) {
             (Filter::DropsABucket, Some(dropped)) => {
                 let dropped = BucketKey::of(dropped);
                 let kept: Vec<ImplRow> =
                     rows.iter().copied().filter(|row| BucketKey::of(row) != dropped).collect();
-                build_impl_index(*krate, &kept, Alloc::global()).map_err(harness)?.no_impls_of
+                build_impl_index(*krate, &kept, blaze_own::testing::heap().alloc()).map_err(harness)?.no_impls_of
             }
             _ => built.no_impls_of.clone(),
         };
@@ -697,7 +696,7 @@ fn sysroot(extra_in_alloc: &[&str]) -> Sysroot {
         if at == 1 {
             items.extend(extra_in_alloc.iter().enumerate().map(|(n, name)| (lang(name), item(keys[at], KIND_LANG, 100 + n))));
         }
-        let bytes = match build_lang_items(keys[at], &items, Alloc::global()) {
+        let bytes = match build_lang_items(keys[at], &items, blaze_own::testing::heap().alloc()) {
             Ok(bytes) => bytes,
             Err(error) => panic!("the sysroot's lang items are refused: {error}"),
         };
@@ -722,7 +721,7 @@ fn sysroot(extra_in_alloc: &[&str]) -> Sysroot {
         CrateInput { key: keys[2], edition: Edition::E2024, flags: lang_items, deps: &std_deps },
         CrateInput { key: keys[1], edition: Edition::E2024, flags: lang_items, deps: &alloc_deps },
     ];
-    let graph = match build_crate_graph(&inputs, Alloc::global()) {
+    let graph = match build_crate_graph(&inputs, blaze_own::testing::heap().alloc()) {
         Ok(bytes) => Aligned::copy_from(&bytes),
         Err(error) => panic!("the sysroot's graph is refused: {error}"),
     };
@@ -773,7 +772,7 @@ fn a_long_lang_item_name_round_trips() {
     let names = ["panic_misaligned_pointer_dereference", "sized", "a", long.as_str()];
     let items: Vec<(LangName<'_>, ItemKey)> =
         names.iter().enumerate().map(|(n, name)| (lang(name), item(krate, KIND_LANG, n))).collect();
-    let bytes = match build_lang_items(krate, &items, Alloc::global()) {
+    let bytes = match build_lang_items(krate, &items, blaze_own::testing::heap().alloc()) {
         Ok(bytes) => Aligned::copy_from(&bytes),
         Err(error) => panic!("the long names are refused: {error}"),
     };
@@ -812,7 +811,7 @@ fn a_duplicate_lang_item_is_the_typed_error() {
     // Within one crate, the builder refuses it.
     let krate = crate_key(9);
     let (a, b) = (item(krate, KIND_LANG, 0), item(krate, KIND_LANG, 1));
-    let refused = build_lang_items(krate, &[(lang("copy"), b), (lang("copy"), a)], Alloc::global());
+    let refused = build_lang_items(krate, &[(lang("copy"), b), (lang("copy"), a)], blaze_own::testing::heap().alloc());
     let (first, second) = if a < b { (a, b) } else { (b, a) };
     assert_eq!(refused, Err(LangItemsError::Duplicate { krate, name: lang("copy"), first, second }));
 }

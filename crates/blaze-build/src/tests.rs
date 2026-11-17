@@ -216,6 +216,7 @@ impl BodyBuf {
             opt_types: &[],
             fmt_uses: &[],
             coroutine: None,
+            super_lets: &[],
         }
     }
 }
@@ -255,6 +256,8 @@ struct TestWorld {
     bounds: Option<ItemKey>,
     /// The `drop_in_place` lang item fn, if declared.
     drop_in_place: Option<ItemKey>,
+    /// The `panic_cannot_unwind` lang item fn, if declared (tests/nounwind.rs).
+    cannot_unwind: Option<ItemKey>,
     /// Per struct with a `Drop` impl: the struct, and the `Drop::drop` fn its drop calls.
     drops: Vec<(ItemKey, ItemKey), Global>,
     /// The fns declared `#[rustc_intrinsic]`, and which intrinsic each is.
@@ -265,6 +268,8 @@ struct TestWorld {
     statics: Vec<(ItemKey, StaticItem), Global>,
     /// The `const` items and their evaluated values (`None`: the evaluator gave none).
     consts: Vec<(ItemKey, Option<DataRecord<Global>>), Global>,
+    /// The promoted borrows and their evaluated values (`None`: the evaluator gave none).
+    promoted: Vec<(ExprId, Option<DataRecord<Global>>), Global>,
     /// `#[lang = "deref"] trait Deref { type Target; }` (`DEREF`) and its one impl (`DEREF_IMPL`):
     /// `impl Deref for <self> { type Target = <target>; }`, both types of this world's table.
     deref: Option<(PTy, PTy)>,
@@ -315,11 +320,13 @@ impl TestWorld {
             rust_call: Vec::new_in(Global),
             bounds: None,
             drop_in_place: None,
+            cannot_unwind: None,
             drops: Vec::new_in(Global),
             intrinsics: Vec::new_in(Global),
             reprs: Vec::new_in(Global),
             statics: Vec::new_in(Global),
             consts: Vec::new_in(Global),
+            promoted: Vec::new_in(Global),
             deref: None,
             deref_defs: Vec::new_in(Global),
             deref_assoc: Vec::new_in(Global),
@@ -452,6 +459,7 @@ impl TestWorld {
             declared_count: f.generics,
             self_param: false,
             header: blaze_typeck::FnPtrHeader::RUST,
+            c_variadic: false,
             inputs: &f.inputs,
             output: f.output,
             types: self.types.view(),
@@ -693,6 +701,10 @@ impl Adts for TestAdts<'_> {
         self.world.consts.iter().find(|(k, _)| *k == item).and_then(|(_, r)| r.as_ref())
     }
 
+    fn promoted_value(&self, _: ItemKey, borrow: ExprId, _: &[PTy]) -> Option<&DataRecord<Global>> {
+        self.world.promoted.iter().find(|(k, _)| *k == borrow).and_then(|(_, r)| r.as_ref())
+    }
+
     fn int_lit(&self, _: ItemKey, expr: ExprId) -> Option<u128> {
         self.body.lits.iter().find(|(e, _)| *e == expr).map(|&(_, v)| v)
     }
@@ -714,6 +726,7 @@ impl Adts for TestAdts<'_> {
         match name {
             "panic_bounds_check" => self.world.bounds,
             "drop_in_place" => self.world.drop_in_place,
+            "panic_cannot_unwind" => self.world.cannot_unwind,
             // The arithmetic checks' entry points (walk/arith_checks.rs): one fn for all; no
             // test of this world reaches one (tests/arith_panics.rs runs them).
             n if crate::PanicConst::ALL.iter().any(|p| p.lang() == n) => Some(PANIC_CONST),
@@ -777,6 +790,11 @@ impl Adts for TestAdts<'_> {
                 Abi::Rust
             }
         })
+    }
+
+    /// The world's `extern "C"` fns are "C" (non-unwinding); every other unwinds.
+    fn nounwind(&self, item: ItemKey) -> Option<bool> {
+        self.world.fns.iter().any(|f| f.key == item).then(|| self.world.c_abi.contains(&item))
     }
 }
 
@@ -2893,6 +2911,49 @@ extern "C" fn host_r_drop(r: *mut *const i32) {
     DROPPED.with(|d| d.borrow_mut().push(x + 1000));
 }
 
+/// Class M (hello-1116 stops-3-briefs.md): a union's bytes are copied whole, never field by
+/// field. The Reference, "Unions": "Unions have no notion of an 'active field'. Instead, every
+/// union access just interprets the storage as the type of the field used for the access", so a
+/// copy may not read any field's tag: the bytes past the written field are uninitialised.
+/// ```text
+/// enum E { A(u64), B(u32) }   union U { a: u8, b: E }
+/// fn main() -> u8 { let u = U { a: 7 }; let v = u; v.a }   // 7
+/// ```
+/// A copy that walked `b` switches on E's tag, read from bytes `U { a: 7 }` never wrote (the
+/// run's trap in a built `MaybeUninit::<Later>::uninit`): it fails here with the evaluator's
+/// refusal or the `unreachable` default. Prints "union copy: 7, no switch".
+#[test]
+fn a_union_copies_its_bytes_not_a_field() {
+    let mut w = TestWorld::new();
+    w.func(1, "main", &[], U8);
+    w.enum_(40, &[("A", CtorKind::Tuple, &[("0", PNode::Uint(UintTy::U64))]), ("B", CtorKind::Tuple, &[("0", PNode::Uint(UintTy::U32))])]);
+    let e = PNode::Adt(ItemKey(40), List::EMPTY);
+    w.strukt(60, "U", &[("a", U8), ("b", e)]);
+    w.structs.last_mut().expect("U").kind = AdtKind::Union;
+    let mut b = BodyBuf::new();
+    let (u, v) = (b.bind("u"), b.bind("v"));
+    let u_path = b.path("U");
+    let seven = b.int(7, None);
+    let start = b.field_inits.len() as u32;
+    b.field_inits.push(FieldInit { name: Name::of("a"), expr: seven });
+    let u_init = b.e(Expr::Struct { path: u_path, fields: List { start, len: 1 }, base: None });
+    let u_e = b.local(u);
+    let v_e = b.local(v);
+    let va = b.field(v_e, "a");
+    let root = b.block(
+        &[
+            Stmt::Let { pat: u, ty: None, init: Some(u_init), else_: None },
+            Stmt::Let { pat: v, ty: None, init: Some(u_e), else_: None },
+        ],
+        Some(va),
+    );
+    let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+    let text = blaze_lir::print(built.func.view());
+    assert!(!text.contains("switch") && !text.contains("unreachable"), "the copy switched on a tag:\n{text}");
+    assert_eq!(one(&built, &[]), 7, "{text}");
+    println!("union copy: 7, no switch");
+}
+
 /// lib.rs, "Drops": the glue of an enum drops its live variant's fields, in declaration order;
 /// a variant with nothing to drop (and a niche's empty variant) drops nothing; a union drops no
 /// field. With `G { x: i32 }` and `R { r: &i32 }` each with a host `Drop`:
@@ -3385,27 +3446,37 @@ mod places;
 mod casts;
 mod matches;
 mod guards;
+mod promote;
 #[cfg(target_arch = "aarch64")]
 mod operators;
 #[cfg(target_arch = "aarch64")]
 mod arith_panics;
 mod moves;
 mod moves_places;
+mod nounwind;
 mod unwind;
+mod operand_cleanup_edges;
 #[cfg(target_arch = "aarch64")]
 mod temps;
+#[cfg(target_arch = "aarch64")]
+mod super_let;
 #[cfg(target_arch = "aarch64")]
 mod zst_drops;
 #[cfg(target_arch = "aarch64")]
 mod temp_drops;
+#[cfg(target_arch = "aarch64")]
+mod if_let_temps;
 #[cfg(target_arch = "aarch64")]
 mod discard;
 mod lets;
 #[cfg(target_arch = "aarch64")]
 mod irrefutable;
 mod wide;
+mod halfquad;
 mod index;
 mod fmt;
 mod coroutines;
+mod coroutine_id_agree;
 #[cfg(target_arch = "aarch64")]
 mod coroutines_emit;
+mod never_reads;

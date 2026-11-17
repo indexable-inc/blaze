@@ -36,8 +36,13 @@
 //! - Operand numbers in fields: inputs 0..4, the result [`RESULT`], temporaries [`TEMP0`] and
 //!   [`TEMP1`] (the composer gives them from the description's scratch set).
 //!
-//! Not generated, by name: shifted-register operands (enc.rs has no such form but `ldr_lsl3`,
-//! a two-level tree a one-level [`blaze_tier::Inner`] cannot say), a shift left by an immediate
+//! - The composer's own instructions (frame steps, moves, float cells, `ret`, the poll), `xor` by
+//!   a logical immediate, shifted-register operands (`[a, None, b, Imm(amount)]` with the shift as
+//!   `inner` at operand 1) and `cbz` (`br` variant `BR_IF_ZERO`: the else edge) are
+//!   arm64_glue.rs's.
+//!
+//! Not generated, by name: a register-offset load (`ldr_lsl3`, a two-level tree a one-level
+//! [`blaze_tier::Inner`] cannot say), a shift left by an immediate
 //! (`lsl` is `ubfm` of `64 - s`: not linear in `s`, so no field holds it), the atomics, the
 //! 128-bit and overflow operations, and float compares and conversions. A pattern the table does
 //! not hold is `TableError::Missing` at the composer, which names it.

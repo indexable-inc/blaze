@@ -35,6 +35,18 @@ use core::{
     },
 };
 
+/// A test's root allocator capability: the process's [`Heap`](crate::Heap), for a test, which
+/// is its own entry (decision D102). The one constructor of a heap for tests, so the only name
+/// a test uses: `blaze_own::testing::heap().alloc()` where code took `Alloc::global()`, and
+/// `blaze_own::testing::heap().shared()` where it took `SharedAlloc::global()`; a crate turns
+/// it on in its dev-dependencies (`blaze-own = { workspace = true, features = ["testing"] }`).
+/// A use outside test code is a bug: the ratchet (tools/ratchets/alloc-global.txt) counts it
+/// as an ambient allocator, as it counts `Alloc::global()`; non-test code takes `&Heap` or an
+/// `Alloc<'_>` from its caller, up to the program's entry ([`Heap::process`](crate::Heap::process)).
+pub fn heap() -> &'static crate::Heap {
+    crate::Heap::for_tests()
+}
+
 /// The byte a fresh block is filled with.
 pub const POISON: u8 = 0xA5;
 

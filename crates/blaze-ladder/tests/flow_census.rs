@@ -20,15 +20,16 @@ use blaze_flow::flow::Flow;
 use blaze_flow::loans::{BorrowFinding, TierOne, facts, tier_one, tier_two};
 use blaze_flow::moves::check_moves_planted;
 use blaze_flow::record::Plant as FlowPlant;
-use blaze_flow_lower::{AdtFacts, CalleeFacts, Facts, Region as TextRegion, SigBuf, SigLife, lower, read_signature};
+use blaze_flow_lower::{Facts, Region as TextRegion, SigLife, lower};
+use blaze_ladder::front2::borrows::{BorrowFacts, BorrowLangs, gather_facts};
 use blaze_ladder::front2::lifetimes::{FnLife, Region as FrontRegion};
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::Front2;
 use blaze_ladder::front2::body::{BodyError, lower_fn, lower_member};
-use blaze_ladder::front2::check::{BuildOrder, Records, answer_impls, check_body, eval_len};
+use blaze_ladder::front2::check::{BuildOrder, Records, check_body, eval_len};
 use blaze_ladder::front2::consts::Consts;
-use blaze_ladder::front2::heads::{HeadError, Store, Want, member_fn_want};
-use blaze_ladder::front2::keys::{MemberKind, Origin, checker_of};
+use blaze_ladder::front2::heads::{HeadError, Store, Want};
+use blaze_ladder::front2::keys::{MemberKind, checker_of};
 use blaze_ladder::front2::spell::Spelling;
 use blaze_ladder::front2::types::Why;
 use blaze_ladder::refusal::SourceFile;
@@ -53,19 +54,14 @@ enum Target<'n> {
     Member { container: blaze_id::ItemKey, name: &'n str },
 }
 
-/// The facts of one body, gathered before it is lowered.
-#[derive(Default)]
+/// The facts of one body, gathered before it is lowered (front2/borrows.rs `gather_facts`, the
+/// one home the command shares), and the census's own counts beside them.
 struct Gathered {
-    adts: BTreeMap<u128, AdtFacts>,
-    callees: BTreeMap<u128, CalleeFacts>,
-    fields: BTreeMap<(u128, u32), Vec<tc::Name>>,
-    /// The lifetime part of each fn whose text `read_signature` could line up with its head
-    /// (the stand-in for question H1: read from the fn's own text, never guessed).
-    sigs: BTreeMap<u128, SigBuf<Alloc<'static>>>,
-    /// Why the others were not read, by the refusal's name.
+    facts: BorrowFacts<'static>,
+    /// Why the signatures not read were refused, by the refusal's name.
     sig_refused: BTreeMap<String, usize>,
     /// The front end's lifetime part (front2/lifetimes.rs, `Store::fn_life`) against the text's,
-    /// per signature, by outcome: a comparison only, the lowering still reads `sigs`.
+    /// per signature, by outcome: a comparison only, the lowering still reads the text's.
     front: BTreeMap<String, usize>,
     /// Each signature where both answered and the answers differ.
     front_lines: Vec<String>,
@@ -109,144 +105,22 @@ fn sigs_agree(text: SigLife<'_>, front: &FnLife) -> Result<(), String> {
     Ok(())
 }
 
-impl Facts for Gathered {
-    fn sig(&self, item: tc::ItemKey) -> Option<SigLife<'_>> {
-        self.sigs.get(&item.0).map(|s| s.life())
-    }
-    fn adt(&self, adt: tc::ItemKey) -> Option<AdtFacts> {
-        self.adts.get(&adt.0).copied()
-    }
-    fn callee(&self, item: tc::ItemKey) -> Option<CalleeFacts> {
-        self.callees.get(&item.0).copied()
-    }
-    fn field(&self, adt: tc::ItemKey, variant: u32, name: tc::Name) -> Option<u32> {
-        self.fields.get(&(adt.0, variant))?.iter().position(|n| *n == name).map(|i| i as u32)
-    }
-    fn field_count(&self, adt: tc::ItemKey, variant: u32) -> Option<u32> {
-        self.fields.get(&(adt.0, variant)).map(|v| v.len() as u32)
-    }
-    fn param_copy(&self, _: u32) -> bool {
-        false
-    }
-}
-
-/// Whether a head's text writes a lifetime before its body: a `'` followed by a letter or `_`
-/// before the first `{` (a stand-in for the heads' lifetime part; `'_` counts: it is written).
-fn writes_lifetime(text: &str) -> bool {
-    let head = text.split('{').next().unwrap_or(text);
-    let b = head.as_bytes();
-    (0..b.len()).any(|i| b[i] == b'\'' && b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_') && b.get(i + 2) != Some(&b'\''))
-}
-
-/// Asks the store for one head, evaluating the array lengths it names; `false` when it cannot
-/// be made (the fact then stays unknown, and the lowering says so by name where it matters).
-fn ensure_one(r: &mut Records<'_, '_>, w: Want) -> bool {
-    let mut lens = 0;
-    loop {
-        match r.store.ensure(r.names, r.keys, w) {
-            Ok(()) => return true,
-            Err(HeadError::Item(_, Why::NeedConst(c, _))) if lens < MOST_LENS => {
-                lens += 1;
-                if eval_len(r, c).is_err() {
-                    return false;
-                }
-            }
-            Err(_) => return false,
-        }
-    }
-}
-
 fn gather(r: &mut Records<'_, '_>, owner: tc::ItemKey, c: &tc::Checked<'_>, copy: Option<tc::ItemKey>, drop: Option<tc::ItemKey>, boxk: Option<tc::ItemKey>) -> Gathered {
-    let mut g = Gathered::default();
-    let mut adts: BTreeSet<u128> = BTreeSet::new();
-    for n in c.types.view().nodes() {
-        if let tc::PNode::Adt(k, _) = n {
-            adts.insert(k.0);
-        }
+    let facts = gather_facts(r, owner, c, BorrowLangs { copy, drop, owned_box: boxk }, Alloc::global());
+    let mut g = Gathered { facts, sig_refused: BTreeMap::new(), front: BTreeMap::new(), front_lines: Vec::new() };
+    for (_, why) in g.facts.sig_refused() {
+        let name = format!("{why:?}");
+        let name = name.split([' ', '{']).next().unwrap_or("").to_string();
+        *g.sig_refused.entry(name).or_default() += 1;
     }
-    for k in adts {
+    // The front end's answer for each signature, as a second source: compared only.
+    let refusal = |why: &dyn std::fmt::Debug| format!("{why:?}").split([' ', '{']).next().unwrap_or("").to_string();
+    for &k in g.facts.items() {
         let key = tc::ItemKey(k);
-        // The store holds only the ADTs something asked for: ask. One that cannot be made stays
-        // unknown here, and the lowering refuses its body by name (`UnknownAdt`).
-        if !r.store.adts.contains_key(&key)
-            && let Some(lib) = r.keys.library(key)
-        {
-            ensure_one(r, Want::Adt(lib));
-        }
-        let Some(row) = r.store.adts.get(&key) else { continue };
-        let (kind, variants) = (row.kind, row.variants.clone());
-        let fields = row.fields.clone();
-        for (vi, v) in variants.iter().enumerate() {
-            let names: Vec<tc::Name> = fields.get(v.fields.range()).unwrap_or(&[]).iter().map(|f| f.name).collect();
-            g.fields.insert((k, vi as u32), names);
-        }
-        let has = |r: &mut Records<'_, '_>, t: Option<tc::ItemKey>| t.and_then(|t| answer_impls(r, t, tc::Shape::Adt(key))).is_some_and(|v| !v.is_empty());
-        let is_copy = has(r, copy);
-        let drop_impl = has(r, drop);
-        let lifetimes = r.keys.library(key).and_then(|lib| r.names.item_text(lib)).is_some_and(|t| {
-            let head = t.text.split(['{', '(', ';']).next().unwrap_or("");
-            head.contains('\'')
-        });
-        g.adts.insert(k, AdtFacts {
-            copy: is_copy,
-            drop_impl,
-            needs_drop: !is_copy,
-            lifetimes,
-            union: kind == tc::AdtKind::Union,
-            is_enum: kind == tc::AdtKind::Enum,
-            is_box: Some(key) == boxk,
-        });
-    }
-    let mut items: BTreeSet<u128> = c.callees.column::<1>().iter().map(|k| k.0).collect();
-    items.insert(owner.0);
-    for k in items {
-        // A callee's head is made when something asks: ask, so its signature is read and not
-        // taken as unknown (a call of unknown signature is related coarsely, and cannot say
-        // that the callee demands `'static`). A member is made with its impl or its trait.
-        let key = tc::ItemKey(k);
-        if !r.store.fns.contains_key(&key) {
-            match r.keys.origin(key).cloned() {
-                Some(Origin::Item(lib)) => {
-                    ensure_one(r, Want::Fn(lib));
-                }
-                Some(Origin::Member { container, .. }) => {
-                    if let Some(lib) = r.keys.library(container)
-                        && !container_head(r, lib, false)
-                    {
-                        container_head(r, lib, true);
-                    }
-                    // An impl's fn's signature is its own want (heads.rs `Want::MemberFn`).
-                    if let Some(w) = member_fn_want(r.names, &*r.keys, key) {
-                        ensure_one(r, w);
-                    }
-                }
-                None => {}
-            }
-        }
-        let Some(f) = r.store.fns.get(&tc::ItemKey(k)) else { continue };
-        let self_ref = f.self_param && f.inputs.first().is_some_and(|&t| matches!(r.store.tys.view().node(t), Ok(tc::PNode::Ref(..))));
-        g.callees.insert(k, CalleeFacts { writes_lifetimes: writes_lifetime(f.text), self_ref });
-        // An ADT's lifetimes exactly as the ADT facts above say them: a `'` in its head's text.
-        let (keys, names) = (&*r.keys, r.names);
-        let adt_lifetimes = |a: tc::ItemKey| {
-            Some(keys.library(a).and_then(|lib| names.item_text(lib)).is_some_and(|t| t.text.split(['{', '(', ';']).next().unwrap_or("").contains('\'')))
-        };
-        let mut buf = SigBuf::new_in(Alloc::global());
-        let head_text = f.text.split('{').next().unwrap_or("").trim();
-        match read_signature(f.text, r.store.tys.view(), &f.inputs[..], f.output, &adt_lifetimes, &mut buf, Alloc::global()) {
-            Ok(()) => {
-                g.sigs.insert(k, buf);
-            }
-            Err(why) => {
-                let name = format!("{why:?}");
-                let name = name.split([' ', '{']).next().unwrap_or("").to_string();
-                *g.sig_refused.entry(name).or_default() += 1;
-            }
-        }
-        // The front end's answer for the same signature, as a second source: compared only.
-        let refusal = |why: &dyn std::fmt::Debug| format!("{why:?}").split([' ', '{']).next().unwrap_or("").to_string();
-        let outcome = match (g.sigs.get(&k), r.store.fn_life(r.names, &*r.keys, key)) {
-            (Some(t), Ok(front)) => match sigs_agree(t.life(), front) {
+        let Some(text) = r.store.fns.get(&key).map(|f| f.text) else { continue };
+        let head_text = text.split('{').next().unwrap_or("").trim();
+        let outcome = match (g.facts.sig(key), r.store.fn_life(r.names, &*r.keys, key)) {
+            (Some(t), Ok(front)) => match sigs_agree(t, front) {
                 Ok(()) => "agree".to_string(),
                 Err(what) => {
                     g.front_lines.push(format!("`{head_text}`: {what}"));
@@ -360,7 +234,7 @@ fn take<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, t: Target<'_>, lan
     let g = gather(r, body.owner, &done, langs.0, langs.1, langs.2);
     let tview = body.typeck.view(body.tys.view(&r.store.tys).expect("a body's types over the records' table it was lowered over"));
     let t0 = Instant::now();
-    let lowered = lower(&tview, &done, &g, Alloc::global());
+    let lowered = lower(&tview, &done, &g.facts, Alloc::global());
     let lower_t = t0.elapsed();
     match lowered {
         Err(refusal) => Got::Refused { form: format!("{:?}", refusal.form), range: refusal.range, text: snippet(&text, refusal.range.start, refusal.range.end) },

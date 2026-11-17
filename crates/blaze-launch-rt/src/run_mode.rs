@@ -27,10 +27,11 @@
 //! ([`RunMode`]'s two maps), and a need names the parent's slot when there is one, else the
 //! symbol (`Needed::Symbol`). The entry is numbered first: slot 0.
 //!
-//! **What is refused by name**, never guessed (rule 3): a record at the optimized tier (a later
-//! tier is published through `Slots`, piece 14); a target that is a static, a vtable or a
-//! thread-local (statics come with the run record, piece 8); a record whose pads land (no
-//! personality routine is named yet: [`EhError::NoPersonality`]); an outside name the process
+//! **What is refused by name**, never guessed (rule 3): a record at the optimized tier for a slot
+//! whose fast code is not bound yet (a bound one is promoted: [`Act::Promote`]); a target that is a static, a vtable or a
+//! thread-local (statics come with the run record, piece 8); a record whose pads land placed
+//! before the parent's `Down::Personality` named the program's personality routine
+//! ([`EhError::NoPersonality`]; run_mode/personality.rs); an outside name the process
 //! does not have; a hosted entry (`bstd`'s host table); run mode on x86-64 (code records are
 //! AArch64). A parent's `Failed` stops the program with [`STOPPED`] (D86) naming the function.
 //!
@@ -117,10 +118,21 @@ pub enum Act {
     Stub { slot: SlotId },
     /// Place `record` as `slot`'s body ([`RunMode::place`]).
     Place { slot: SlotId, record: RecordId },
+    /// Place `record`, `slot`'s optimized code, in the hot region and publish it by one store of
+    /// the slot word ([`RunMode::promote`]); no thread waits on it.
+    Promote { slot: SlotId, record: RecordId },
     /// Wake `thread`, waiting in `slot`'s stub, to load the word again: it names the body.
     Wake { thread: Thread, slot: SlotId },
     /// End the process with [`STOPPED`], saying why.
     Stop(Stop),
+}
+
+/// Where a record's code is placed: the area in first-call order, or the hot region in the order
+/// promotions come (D100 point 13).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Region {
+    Area,
+    Hot,
 }
 
 /// A safeguard taken out, for the simulation's planted-bug control (rule 43).
@@ -168,6 +180,9 @@ pub trait Memory {
     fn outside(&mut self, symbol: CodeSymbol, name: &str) -> Result<Outside, RunModeError>;
     /// `len` bytes of the code area on `align`: their run-view address.
     fn reserve(&mut self, len: usize, align: usize) -> Result<u64, RunModeError>;
+    /// `len` bytes of the hot region on `align`, where promoted code is laid out in the order the
+    /// parent publishes it (its sampled call edges' order, blaze-run promote.rs).
+    fn reserve_hot(&mut self, len: usize, align: usize) -> Result<u64, RunModeError>;
     /// One step of a publication (code_unwind's order).
     fn carry(&mut self, step: Step, placing: &Placing<'_>) -> Result<(), RunModeError>;
 }
@@ -221,6 +236,11 @@ pub enum RunModeError {
     Socket { call: &'static str, errno: i32 },
     /// A thread of the launcher's could not start.
     Thread { what: &'static str },
+    /// The parent sent a second `Personality` (this one naming `slot`): an entry names one
+    /// personality routine for the run.
+    PersonalityTwice { slot: Slot },
+    /// The run's unwind registry could not be made, installed or written (unwind_reg.rs).
+    Unwinder(crate::unwind_reg::RegError),
 }
 
 impl From<WireError> for RunModeError {
@@ -292,6 +312,12 @@ impl fmt::Display for RunModeError {
             RunModeError::Reach(why) => write!(f, "{why}"),
             RunModeError::Socket { call, errno } => write!(f, "{call} on the parent's socket failed with errno {errno}"),
             RunModeError::Thread { what } => write!(f, "the launcher's {what} thread did not start"),
+            RunModeError::PersonalityTwice { slot } => write!(
+                f,
+                "the parent named the personality routine a second time (slot {}): an unwind entry names one routine for the run (run wire, `Personality`)",
+                slot.0
+            ),
+            RunModeError::Unwinder(why) => write!(f, "the run's unwind registry: {why}"),
         }
     }
 }
@@ -360,6 +386,9 @@ pub struct RunMode<'a> {
     now: Nanos,
     closed: bool,
     stopped: bool,
+    /// The local slot of the program's `eh_personality` fn, once the parent's `Personality`
+    /// named it (run_mode/personality.rs); every entry made after names its entry thunk.
+    personality: Option<SlotId>,
     alloc: Alloc<'a>,
 }
 
@@ -381,6 +410,7 @@ impl<'a> RunMode<'a> {
             now: Nanos(0),
             closed: false,
             stopped: false,
+            personality: None,
             alloc,
         }
     }
@@ -491,9 +521,19 @@ impl<'a> RunMode<'a> {
             }
             Down::Publish { slot, tier, record } => {
                 if tier != Tier::Zero {
-                    return Err(RunModeError::NotBuilt {
-                        what: "a record at the optimized tier: a later tier is published through `Slots` (run.md piece 14)",
-                    });
+                    // A promotion (D100 point 13): the slot's fast code is bound, the optimized
+                    // record goes to the hot region and one store of the slot word publishes it.
+                    // The first-call machine's state stays `Bound`: no thread waits on it.
+                    let local = self.slots.local(slot)?;
+                    return match self.slots.first.state(local)? {
+                        first_call::State::Bound(_) => {
+                            out.push(Act::Promote { slot: local, record: RecordId(record.0) });
+                            Ok(())
+                        }
+                        _ => Err(RunModeError::NotBuilt {
+                            what: "a record at the optimized tier for a slot whose fast code is not bound yet",
+                        }),
+                    };
                 }
                 let local = self.slots.local(slot)?;
                 let code = CodeRef(record.0);
@@ -509,6 +549,7 @@ impl<'a> RunMode<'a> {
                 }
                 self.carry_dos(&dos, None, out)
             }
+            Down::Personality { slot } => self.bind_personality(slot),
             Down::Failed { need, why } => {
                 let local = match need {
                     Needed::Slot(slot) => self.slots.local(slot)?,
@@ -594,10 +635,44 @@ impl<'a> RunMode<'a> {
         plant: Plant,
         out: &mut AVec<'_, Act>,
     ) -> Result<(), RunModeError> {
+        self.lay(slot, record, source, memory, plant, Region::Area)?;
+        let mut dos: AVec<'_, Do> = Vec::new_in(self.alloc);
+        self.slots.first.published(slot, &mut dos)?;
+        self.carry_dos(&dos, None, out)
+    }
+
+    /// Carries [`Act::Promote`]: places `record` in the hot region and publishes it in
+    /// code_unwind's order (copy, cache maintenance, register, store): the store of the slot word
+    /// is the promotion. The fast body it replaces stays placed (the area is append-only), so a
+    /// frame still in it returns through code that is still there.
+    pub fn promote(
+        &mut self,
+        slot: SlotId,
+        record: RecordId,
+        source: &impl RecordSource,
+        memory: &mut impl Memory,
+        plant: Plant,
+    ) -> Result<(), RunModeError> {
+        self.lay(slot, record, source, memory, plant, Region::Hot)
+    }
+
+    /// Places `record` as `slot`'s code in `region` and publishes it.
+    fn lay(
+        &mut self,
+        slot: SlotId,
+        record: RecordId,
+        source: &impl RecordSource,
+        memory: &mut impl Memory,
+        plant: Plant,
+        region: Region,
+    ) -> Result<(), RunModeError> {
         let bytes = source.bytes(record)?;
         let view = CodeView::read(bytes).map_err(|why| RunModeError::Decode { record, why })?;
         let unwind = blaze_code::unwind::read(view).map_err(|why| RunModeError::Unwind { record, why })?;
-        let code_at = memory.reserve(view.code().len(), 16)?;
+        let code_at = match region {
+            Region::Area => memory.reserve(view.code().len(), 16)?,
+            Region::Hot => memory.reserve_hot(view.code().len(), 16)?,
+        };
         let relro_at = memory.reserve(view.relro().len(), 8)?;
         let mut code: AVec<'_, u8> = Vec::from_elem_in(0, view.code().len(), self.alloc);
         let mut relro: AVec<'_, u8> = Vec::from_elem_in(0, view.relro().len(), self.alloc);
@@ -611,15 +686,18 @@ impl<'a> RunMode<'a> {
             placed.map_err(|why| RunModeError::Place { record, why })?;
         }
         let mut entry_bytes: AVec<'_, u8> = Vec::new_in(self.alloc);
+        // The program's personality routine (its slot's entry thunk), once the parent named it;
+        // `None` before, and a record whose rows land is then `EhError::NoPersonality`.
+        let personality = self.personality_at(&*memory);
         let entry = match unwind.frame() {
             None => None,
             Some(_) => {
                 let eh = |why| RunModeError::Eh { record, why };
                 // Sized at address 0, then made at its own: an entry's length does not depend
                 // on its addresses (every one is an 8-byte absptr; TO VERIFY BY A TEST).
-                eh::entry(&unwind, Placed { entry_at: 0, code_at, personality: None }, &mut entry_bytes).map_err(eh)?;
+                eh::entry(&unwind, Placed { entry_at: 0, code_at, personality }, &mut entry_bytes).map_err(eh)?;
                 let entry_at = memory.reserve(entry_bytes.len(), 8)?;
-                let parts = eh::entry(&unwind, Placed { entry_at, code_at, personality: None }, &mut entry_bytes).map_err(eh)?;
+                let parts = eh::entry(&unwind, Placed { entry_at, code_at, personality }, &mut entry_bytes).map_err(eh)?;
                 Some((entry_at, parts))
             }
         };
@@ -640,9 +718,7 @@ impl<'a> RunMode<'a> {
         if let Some(why) = publication.failed {
             return Err(why);
         }
-        let mut dos: AVec<'_, Do> = Vec::new_in(self.alloc);
-        self.slots.first.published(slot, &mut dos)?;
-        self.carry_dos(&dos, None, out)
+        Ok(())
     }
 }
 
@@ -870,8 +946,13 @@ struct Layout {
     stubs: usize,
     thunks: usize,
     area: usize,
+    /// The hot region: `hot..whole`, the top [`HOT_BYTES`] of the reservation.
+    hot: usize,
     whole: usize,
 }
+
+/// The hot region's length: promoted code only, a small part of a run's code (D100 point 13).
+const HOT_BYTES: usize = 256 << 20;
 
 impl Layout {
     fn of(page: usize) -> Result<Layout, RunModeError> {
@@ -883,10 +964,11 @@ impl Layout {
         let thunks = (stubs + crate::arch::STUB_HEAD + slots * crate::arch::STUB).next_multiple_of(16);
         let area = (thunks + slots * crate::arch::THUNK).next_multiple_of(page);
         let whole = crate::drive::REACH as usize;
-        if area >= whole {
+        let hot = whole - HOT_BYTES;
+        if area >= hot {
             return Err(RunModeError::NotBuilt { what: "a slot table larger than the run's reservation" });
         }
-        Ok(Layout { words, address_words, outside, stubs, thunks, area, whole })
+        Ok(Layout { words, address_words, outside, stubs, thunks, area, hot, whole })
     }
 }
 
@@ -897,13 +979,18 @@ struct NativeMemory<'a> {
     base: u64,
     /// The next free byte of the area, from the mapping's base.
     next: usize,
+    /// The next free byte of the hot region, from the mapping's base.
+    hot_next: usize,
     /// The C names bound, sorted by symbol: each with its word's index.
     outside: AVec<'a, (CodeSymbol, u32)>,
     shared: std::sync::Arc<crate::table::Shared>,
+    /// The run's unwind registry's one writer (run_mode/personality.rs `run_registry`): every
+    /// placed record's entry is added through it at its publication's Register step.
+    unwind: crate::unwind_reg::Writer<'static>,
 }
 
 impl<'a> NativeMemory<'a> {
-    fn new(alloc: Alloc<'a>) -> Result<NativeMemory<'a>, RunModeError> {
+    fn new(alloc: Alloc<'a>, unwind: crate::unwind_reg::Writer<'static>) -> Result<NativeMemory<'a>, RunModeError> {
         let page = crate::sys::page().map_err(RunModeError::Sys)?;
         let layout = Layout::of(page)?;
         let mut code = crate::sys::Code::map(layout.whole).map_err(RunModeError::Sys)?;
@@ -914,6 +1001,7 @@ impl<'a> NativeMemory<'a> {
             base + layout.stubs,
             base + layout.thunks,
             base + layout.area..base + layout.whole,
+            crate::stub_wait::Waiters::reserve(crate::stub_wait::MOST_WAITERS).map_err(RunModeError::Sys)?,
         ));
         // The stubs hand this pointer to `table::resolve` for as long as the process runs
         // code: one count of the `Arc` is leaked for it (as `Driver::new` does).
@@ -921,7 +1009,8 @@ impl<'a> NativeMemory<'a> {
         let entry = crate::arch::resolver as usize as u64;
         code.write(layout.stubs, &crate::arch::stub_head(context, entry)).map_err(RunModeError::Sys)?;
         let next = layout.area;
-        Ok(NativeMemory { code, layout, base: base as u64, next, outside: Vec::new_in(alloc), shared })
+        let hot_next = layout.hot;
+        Ok(NativeMemory { code, layout, base: base as u64, next, hot_next, outside: Vec::new_in(alloc), shared, unwind })
     }
 
     fn at(&self, offset: usize) -> u64 {
@@ -993,11 +1082,21 @@ impl Memory for NativeMemory<'_> {
         Ok(Outside { word, value })
     }
 
+    fn reserve_hot(&mut self, len: usize, align: usize) -> Result<u64, RunModeError> {
+        let at = self.hot_next.next_multiple_of(align);
+        let end = at + len;
+        if end > self.layout.whole {
+            return Err(RunModeError::AreaFull { want: len as u64, left: (self.layout.whole - self.hot_next) as u64 });
+        }
+        self.hot_next = end;
+        Ok(self.at(at))
+    }
+
     fn reserve(&mut self, len: usize, align: usize) -> Result<u64, RunModeError> {
         let at = self.next.next_multiple_of(align);
         let end = at + len;
-        if end > self.layout.whole {
-            return Err(RunModeError::AreaFull { want: len as u64, left: (self.layout.whole - self.next) as u64 });
+        if end > self.layout.hot {
+            return Err(RunModeError::AreaFull { want: len as u64, left: (self.layout.hot - self.next) as u64 });
         }
         self.next = end;
         Ok(self.at(at))
@@ -1014,11 +1113,13 @@ impl Memory for NativeMemory<'_> {
             }
             Step::Flush => self.code.settle().map_err(RunModeError::Sys)?,
             Step::Register => {
-                if let Some((at, _, parts)) = placing.entry {
-                    // SAFETY: the entry's bytes were copied to `at` (Step::Copy) for exactly this
-                    // address and the code at `code_at`; the area is never rewritten or unmapped
-                    // in run mode (nothing is freed before tiers, piece 14).
-                    unsafe { code_unwind::register(at as usize, parts) };
+                if let Some(span) = personality::span_of(placing) {
+                    // SAFETY: `Writer::add`'s contract: the entry's bytes, made by eh.rs for
+                    // `span.eh_at` and the code at `span.code_lo`, were copied to `eh_at`
+                    // (Step::Copy) and the code to `code_lo` before this step; the area is never
+                    // rewritten or unmapped in run mode (nothing is freed before tiers, piece 14),
+                    // so both stay as they are for the process, and no `remove` is ever called.
+                    unsafe { self.unwind.add(span) }.map_err(RunModeError::Unwinder)?;
                 }
             }
             Step::Store => {
@@ -1152,12 +1253,14 @@ fn format_errno(call: &str, errno: i32) -> String {
 /// process's first). Returns only when the program could not be started; else the process ends
 /// through `exit` with the program's status, or with [`STOPPED`] when blaze stops it.
 ///
-/// `alloc` crosses to the control thread, so it is a [`blaze_own::SharedAlloc`].
+/// `alloc` crosses to the control thread, so it is a [`blaze_own::SharedAlloc`]; it lives for
+/// the process, because the run's unwind registry is made in it and the system's unwinder keeps
+/// the registry's finder until the process ends (run_mode/personality.rs `run_registry`).
 pub fn run<S: RecordSource + Sync>(
     fd: std::os::fd::OwnedFd,
     source: &S,
     start: Start,
-    alloc: blaze_own::SharedAlloc<'_>,
+    alloc: blaze_own::SharedAlloc<'static>,
 ) -> RunModeError {
     use std::os::fd::AsRawFd;
 
@@ -1242,13 +1345,20 @@ fn control<S: RecordSource>(
     fd: i32,
     source: &S,
     start: Start,
-    alloc: blaze_own::SharedAlloc<'_>,
+    alloc: blaze_own::SharedAlloc<'static>,
     ready: &crate::sys::Handoff<Ready>,
 ) {
-    use crate::table::{Bound, Event as Queued};
+    use crate::stub_wait::Answer;
+    use crate::table::Event as Queued;
 
+    // The one unwind registry, before any record is placed: the finder installed (macOS) and
+    // its writer kept by this thread, the one writer of code and words.
+    let unwind = match personality::run_registry(alloc) {
+        Ok(unwind) => unwind,
+        Err(why) => return ready.put(Err(why)),
+    };
     let alloc = alloc.local();
-    let mut memory = match NativeMemory::new(alloc) {
+    let mut memory = match NativeMemory::new(alloc, unwind) {
         Ok(memory) => memory,
         Err(why) => return ready.put(Err(why)),
     };
@@ -1272,16 +1382,17 @@ fn control<S: RecordSource>(
     }
     acts.clear();
     ready.put(Ok((memory.thunk(entry), std::sync::Arc::clone(&shared))));
-    // Threads waiting in a stub: the slot, the thread, and where its answer goes.
-    let mut waiting: AVec<'_, (SlotId, Thread, std::sync::Arc<crate::sys::Handoff<Bound>>)> = Vec::new_in(alloc);
+    // Threads waiting in a stub: the slot, the thread, and the stub waiters' row its answer
+    // goes to (`Waiters::answer`).
+    let mut waiting: AVec<'_, (SlotId, Thread, u32)> = Vec::new_in(alloc);
     loop {
         // The wait "run mode: the next event" (a stub, the parent's bytes, a tick): bounded by
         // the reader's tick, [`TICK_MS`].
         let event = shared.wait();
         let now = now();
         let told = match event {
-            Queued::Need { slot, thread, reply } => {
-                waiting.push((SlotId(slot.0), thread, reply));
+            Queued::Need { slot, thread, row } => {
+                waiting.push((SlotId(slot.0), thread, row));
                 mode.on(Event::Tick(now), &mut acts).and_then(|()| mode.on(Event::Fired { thread, slot: SlotId(slot.0) }, &mut acts))
             }
             Queued::Frame(bytes) if bytes.is_empty() => mode.on(Event::Tick(now), &mut acts),
@@ -1304,11 +1415,12 @@ fn control<S: RecordSource>(
             let carried = match act {
                 Act::Stub { slot } => memory.stub(slot),
                 Act::Place { slot, record } => mode.place(slot, record, source, &mut memory, Plant::None, &mut acts),
+                Act::Promote { slot, record } => mode.promote(slot, record, source, &mut memory, Plant::None),
                 Act::Wake { thread, slot } => {
                     match waiting.iter().position(|(at, who, _)| *at == slot && *who == thread) {
                         Some(index) => {
-                            let (_, _, reply) = waiting.remove_shift(index);
-                            reply.put(Bound::Code);
+                            let (_, _, row) = waiting.remove_shift(index);
+                            shared.waiters.answer(row, Answer::Bound);
                         }
                         None => stop_with(format_args!(
                             "blaze: the run mode woke thread {} in slot {}, which waits there no more: the control thread is out of step",
@@ -1364,5 +1476,9 @@ impl fmt::Display for WhyText {
     }
 }
 
+mod personality;
+
+#[cfg(test)]
+mod personality_tests;
 #[cfg(test)]
 mod tests;

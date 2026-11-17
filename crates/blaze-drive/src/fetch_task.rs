@@ -126,7 +126,7 @@ mod tests {
     /// finding naming the unit, lasting only when the bytes are at fault.
     #[test]
     fn a_fetch_name_is_its_units_and_its_reader_sees_the_key_however_it_came() {
-        let alloc = Alloc::global();
+        let alloc = blaze_own::testing::heap().alloc();
         let version = |text: &str| {
             let mut out = String::new_in(alloc);
             out.str(text);

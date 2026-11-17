@@ -9,7 +9,7 @@ use std::vec::Vec as StdVec;
 
 use blaze_file_items::outline;
 use blaze_lex::{Cpu, FrontmatterAllowed, TokenKind, tokenize};
-use blaze_own::{Alloc, String as OwnString};
+use blaze_own::{String as OwnString};
 use blaze_sim::{Broke, Config, Tape};
 use blaze_surface::Edition;
 
@@ -21,7 +21,7 @@ const FILE: Scope = Scope::file(TestBits::NONE, false, false);
 
 /// What `rules` finds in `text` linted as one unit: each finding's kind and range text.
 fn found<'t>(rules: &RuleSet, text: &'t str, scope: Scope) -> StdVec<(&'static str, &'t str)> {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let mut out = Findings::new_in(alloc);
     let unit = Unit { text, holes: &[], scope };
     match lint(rules, &unit, alloc, &mut out) {
@@ -233,7 +233,7 @@ fn format_macro() {
 
 /// The fixes of `text`'s findings applied.
 fn fixed(text: &str) -> StdString {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let mut out = Findings::new_in(alloc);
     let unit = Unit { text, holes: &[], scope: FILE };
     assert!(lint(&RuleSet::ALL, &unit, alloc, &mut out).is_ok());
@@ -266,7 +266,7 @@ fn renamed() {
 
 #[test]
 fn apply_refuses_overlaps() {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let text = "abcdef";
     let first = Span::new(1, 3);
     let second = Span::new(2, 4);
@@ -300,7 +300,7 @@ fn rule_set_identity() {
 
 #[test]
 fn messages() {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let text = "fn f(v: &mut AVec<'_, u8>) -> u32 {\n    v.contains(&1) as u32\n}";
     let mut out = Findings::new_in(alloc);
     let unit = Unit { text, holes: &[], scope: FILE };
@@ -322,7 +322,7 @@ type Abs = (Template, u32, u32);
 
 /// The file linted as one unit.
 fn whole(text: &str, scope: Scope) -> StdVec<Abs> {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let mut out = Findings::new_in(alloc);
     let unit = Unit { text, holes: &[], scope };
     match lint(&RuleSet::ALL, &unit, alloc, &mut out) {
@@ -334,7 +334,7 @@ fn whole(text: &str, scope: Scope) -> StdVec<Abs> {
 /// The file linted item by item, as a driver does: the root with its items as holes, then each
 /// item in its parent's scope for it, its own children as holes. Ranges made absolute.
 fn split(text: &str, scope: Scope) -> StdVec<Abs> {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let lines = outline(text, Edition::E2024, alloc);
     let items = lines.items();
     let mut scopes: StdVec<Option<Scope>> = vec![None; items.len()];
@@ -567,7 +567,7 @@ fn check_file(text: &str, scope: Scope, plant: Plant) -> Result<(), Broke> {
 /// Every first fix applied: each edit is one whole token (or a point after one), the result's
 /// tokens are the old ones with those replaced, it lexes, and the fixed rule reports nothing.
 fn check_fixes(text: &str, scope: Scope, plant: Plant) -> Result<(), Broke> {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let mut out = Findings::new_in(alloc);
     let unit = Unit { text, holes: &[], scope };
     if let Err(error) = lint(&RuleSet::ALL, &unit, alloc, &mut out) {
@@ -646,7 +646,7 @@ fn item_alone_equals_item_in_file() {
 fn units_plan_matches_outline_children() {
     blaze_sim::check(Config::cases(200), |tape| {
         let text = gen_file(tape);
-        let alloc = Alloc::global();
+        let alloc = blaze_own::testing::heap().alloc();
         let made = outline(&text, Edition::E2024, alloc);
         let units = crate::Units::plan(made.items(), text.len(), alloc).map_err(|e| Broke::Oracle(format!("{e:?}")))?;
         for unit in 0..units.list.len() {

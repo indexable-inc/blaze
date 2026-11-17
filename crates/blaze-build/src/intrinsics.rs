@@ -1046,6 +1046,7 @@ fn location<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
 
 mod element;
 pub mod simd;
+pub mod target;
 #[cfg(test)]
 mod tests;
 

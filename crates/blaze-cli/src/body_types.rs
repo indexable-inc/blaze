@@ -32,11 +32,12 @@ use core::cell::RefCell;
 use blaze_drive::{Input, Key, Name, Task, Want};
 use blaze_fetch::PackView;
 use blaze_ids::ContentId;
+use blaze_ladder::front2::borrows::BorrowRefused;
 use blaze_ladder::front2::project::ProjectWorld;
 use blaze_ladder::front2::project_records::{ByChain, Listed, index_by_chain};
-use blaze_ladder::front2::source::{Log, Records};
+use blaze_ladder::front2::source::{Log, Records, SourceError};
 use blaze_own::{AVec, Alloc, Vec};
-use blaze_scope::items_record::ItemsRecord;
+use blaze_scope::items_record::{ItemsRecord, ItemsRecordError};
 use blaze_scope::resolve::SourceTexts;
 use blaze_surface::ItemKind;
 use bstd::cx::Cx;
@@ -55,6 +56,23 @@ pub const TYPES: u16 = 17;
 /// The finding number of a body whose types were not checked to the end: its one argument says
 /// why. It is not an error of the program; it keeps `check` from saying `ok` (main.rs).
 pub const TYPES_NOT_CHECKED: u16 = 18;
+/// The finding number of a body's move or borrow finding (blaze-ladder front2/borrows.rs): its
+/// arguments are the code (`E0382`, `E0502`, .., or `outlives`) and the words; its range is
+/// item-relative. A NOTE while [`BORROWS_ARE_ERRORS`] is false (print.rs, main.rs `every_rule`).
+pub const BORROWS: u16 = 19;
+/// The finding number of a body whose moves and borrows were not checked to the end (the flow
+/// lowering refused a form, a trait fact was unknown, the checker hit its bound): its one
+/// argument says why. Always a note, never a pass: with the flip it keeps the borrows stage
+/// "NOT checked" (main.rs `check_coverage`).
+pub const BORROWS_NOT_CHECKED: u16 = 20;
+/// THE FLIP: whether a borrow finding ([`BORROWS`]) is an error of the program, and the
+/// borrows stage is counted as run when no body filed [`BORROWS_NOT_CHECKED`]. FALSE until the
+/// flow census on blaze's own standard layer (crates/blaze-ladder/tests/flow_census.rs, its head
+/// line's "findings N") reads 0 false findings: census 3 (docs/v2/plan/design/flow.md, 2026-11-16
+/// 12:44, tree 11d224a93a) read "findings 536 (in 206 bodies)", every one false. Change it only
+/// with that census's head line quoted from a run on the commit that flips it. Nothing else
+/// changes at the flip: every body's borrow verdict is already in its record.
+pub const BORROWS_ARE_ERRORS: bool = false;
 
 /// The domain of a body part's source ([`body_source`]).
 const SOURCE_DOMAIN: &str = "blaze-cli body check source 2";
@@ -76,7 +94,25 @@ const SOURCE_DOMAIN: &str = "blaze-cli body check source 2";
 /// through nested pointers; the impl prefilter.
 /// 2026-11-16.2: `Self::X` in an impl takes the impl's own arguments (hello-D-2); a block's
 /// final operand is chosen after cfg stripping (census14-F).
-pub const BODY_CHECKER: &str = "blaze body checker 2026-11-16.2";
+/// 2026-11-16.3: an async fn's hidden type is its block's future by identity
+/// (`PNode::Coroutine`, async P3).
+/// 2026-11-16.4: an opaque type's bounds elaborated with supertraits (walk AJ P2); an impl's
+/// generics instantiated by kind, const parameters as consts (walk AJ P1).
+/// 2026-11-16.5: constant promotion fills `Checked::promoted` (async P10); `AsyncFn*` bounds
+/// answered by the solver's builtin rule and an async closure's future named
+/// `PNode::Coroutine { ordinal: CLOSURE_BASE + n }` (async P9).
+/// 2026-11-16.6: `asm!` lowers to an `Expr::Asm` row (intr P9a): a body with `asm!` is
+/// refused by the checker's lowering bridge by name instead of at the macro call.
+/// 2026-11-16.7: a C-variadic foreign fn's call takes its `...` arguments, held to C's
+/// promotions (E0617, variadic-1).
+/// 2026-11-16.8: one key per expansion: a body's expansion scopes are keyed by
+/// `blaze_expand::call_key`, which now holds the expander's code (expansion key lane).
+/// 2026-11-16.9: the move and borrow check (blaze-flow-lower, blaze-flow; front2/borrows.rs)
+/// runs per body: its findings ([`BORROWS`]) and refusals ([`BORROWS_NOT_CHECKED`]) are in the
+/// body's record. From now on a change to blaze-flow or blaze-flow-lower bumps this too.
+/// 2026-11-16.10: `super let` kept on the lowered `let` row and lent as
+/// `BodyView::super_lets`; the builder gives its binding its block's temporary scope (async P11).
+pub const BODY_CHECKER: &str = "blaze body checker 2026-11-16.10";
 
 /// A body part's source: its item's text digest `item` and `around`, the digest of its file
 /// with every checked body cut out ([`around_bodies`]): what the body's check reads of its own
@@ -157,9 +193,19 @@ pub(crate) struct TypesJob<'j> {
     corrected: &'j [(u32, &'j str, &'j str)],
     /// The file's path in the checkout (tree 0), as the items records list it after `/0/`.
     path: &'j str,
-    /// The `UnitGraph` input (name, out): every body's first read.
-    graph: (Name, ContentId),
+    /// The `UnitGraph` input (name, out): every body's first read; `None` when the command has
+    /// no unit graph (no lock file to match), so no names and no types.
+    graph: Option<(Name, ContentId)>,
+    /// With no graph: the `UnitGraph` read as absent (`blaze_drive::ABSENT`), the body's one
+    /// read, so a manifest edit that gives the command a graph (a dependency taken out, a lock
+    /// written) moves the read and enters the body again instead of leaving its [`NO_GRAPH`]
+    /// note standing (rule 21: the note's input is whether there is a graph; the root's units
+    /// do not hold the dependencies, so their out does not move). `None` with a graph.
+    units: Option<(Name, ContentId)>,
 }
+
+/// The note of a body in a command with no unit graph.
+const NO_GRAPH: &str = "this command has no unit graph (no lock file to match), so no crate's names, so no types";
 
 /// What a `BodyCheck` task is, before its file's job.
 pub(crate) enum Prepared<'j> {
@@ -195,6 +241,16 @@ pub(crate) fn prepare<'f: 'j, 'j>(
     // The graph is always read and read-listed: a body edit's task is entered with it among
     // its last reads, so it makes the world without a second entry to ask for it.
     let Some(graph) = task.inputs.iter().find(|input| input.name == Name::unit_graph()) else {
+        if facts.laid.is_none() {
+            facts.laid = Some(crate::units::lay(&cx, root, &facts.stamps, &mut facts.rows, facts.fetch_env.toolchain, frame, alloc)?);
+        }
+        // No graph this command (main.rs gives the drive none to `Start`): the drive has no
+        // such task to answer a want of it; each body says so, reading nothing more.
+        if facts.laid.as_ref().is_some_and(|laid| laid.graph.is_none()) {
+            let units = Some((Name::unit_graph(), blaze_drive::key::ABSENT));
+            let job = TypesJob { owners: &[], packs: &[], corrected: &[], path: held_str(real, jobs), graph: None, units };
+            return Ok(Prepared::Ready(blaze_own::Box::leak(blaze_own::Box::new_in(job, jobs))));
+        }
         return Ok(Prepared::Need(need_one(Name::unit_graph())));
     };
     let graph_read = (graph.name, graph.out);
@@ -255,7 +311,10 @@ pub(crate) fn prepare<'f: 'j, 'j>(
         // A row holds the file's path in the member's package (D96): joined onto the member's
         // directory, past the checkout's tree `/0/`.
         let package = crates[at].input.shown_from;
-        let holds = (0..items.files()).any(|i| matches!(items.file(i as u32), Ok(Some(row)) if row.path.in_package(package, alloc).as_deref().and_then(|p| p.strip_prefix("/0/")) == Some(real)));
+        // Each joined path is freed as soon as compared (`Global`, named): this runs per body
+        // and member, and the command's frame must not grow with that (a 4,000-body check
+        // filled it: draw_tests, 2026-11-16).
+        let holds = (0..items.files()).any(|i| matches!(items.file(i as u32), Ok(Some(row)) if row.path.in_package(package, Alloc::global()).as_deref().and_then(|p| p.strip_prefix("/0/")) == Some(real)));
         if holds {
             owners.push(at);
         }
@@ -331,7 +390,7 @@ pub(crate) fn prepare<'f: 'j, 'j>(
     // the world is borrowed through `facts` here, the job outlives that borrow.
     let packs: &'j [PackView<'j>] = Vec::from_slice_in(world.texts.packs(), jobs).leak();
     let corrected: &'j [(u32, &'j str, &'j str)] = Vec::from_slice_in(world.texts.corrected(), jobs).leak();
-    let job = TypesJob { owners: built.leak(), packs, corrected, path: held_str(real, jobs), graph: graph_read };
+    let job = TypesJob { owners: built.leak(), packs, corrected, path: held_str(real, jobs), graph: Some(graph_read), units: None };
     Ok(Prepared::Ready(blaze_own::Box::leak(blaze_own::Box::new_in(job, jobs))))
 }
 
@@ -395,6 +454,10 @@ pub(crate) struct FileTypes<'n> {
     /// Every owner's crates' (`CrateScope` name, out), sorted: each body's read list.
     reads: std::vec::Vec<(Name, ContentId), Global>,
     frame: &'n Frame,
+    /// The command has no unit graph ([`NO_GRAPH`]).
+    graphless: bool,
+    /// The job's context: each body's check is a span of it.
+    cx: &'n Cx,
 }
 
 impl<'n> FileTypes<'n> {
@@ -402,15 +465,17 @@ impl<'n> FileTypes<'n> {
     pub(crate) fn new(cx: &'n Cx, root: &'n Dir<ReadWrite>, job: &'n TypesJob<'n>, text: &'n str, frame: &'n Frame) -> FileTypes<'n> {
         let g = Alloc::global();
         let mut reads: std::vec::Vec<(Name, ContentId), Global> = std::vec::Vec::new_in(Global);
-        reads.push(job.graph);
+        reads.extend(job.graph);
+        reads.extend(job.units);
         let mut owners = std::vec::Vec::with_capacity_in(job.owners.len(), Global);
         for owner in job.owners.iter() {
             reads.extend(owner.readers.iter().map(|r| (r.name, r.out)));
+            let _built = cx.span("body types: build a reader");
             owners.push(checker(cx, root, job, owner, text, frame, g));
         }
         reads.sort_unstable_by_key(|(name, _)| *name);
         reads.dedup_by_key(|(name, _)| *name);
-        FileTypes { owners, reads, frame }
+        FileTypes { owners, reads, frame, graphless: job.graph.is_none(), cx }
     }
 
     /// The types of the body at `item` of `outline` (over `text`) into `made`, its record so
@@ -418,7 +483,7 @@ impl<'n> FileTypes<'n> {
     pub(crate) fn check(&mut self, outline: &blaze_file_items::Outline<'_>, item: &blaze_surface::Item, text: &str, made: &mut Record<Global>) {
         made.reads.extend(self.reads.iter().copied());
         if self.owners.is_empty() {
-            made.find(TYPES_NOT_CHECKED, (0, 0), &["no crate's names record lists this file"]);
+            made.find(TYPES_NOT_CHECKED, (0, 0), &[if self.graphless { NO_GRAPH } else { "no crate's names record lists this file" }]);
             return;
         }
         if !matches!(item.kind(), ItemKind::Function) {
@@ -440,8 +505,30 @@ impl<'n> FileTypes<'n> {
                 continue;
             };
             let (errors, unserved) = (checker.records.errors().len(), checker.load.unserved().len());
-            let verdict = checker.world.check(body, g);
-            let new_error = checker.records.errors().get(errors).map(|error| bstd::mem::format_in!(self.frame, "the records did not answer: {error}"));
+            // The types, then (when they were checked clean) the moves and borrows over the same
+            // lowered body and `Checked` record (front2/borrows.rs `check_borrows`).
+            let (verdict, borrows) = {
+                let _checking = self.cx.span("body types: check a body");
+                checker.world.check_borrows(body, g)
+            };
+            let new_error = checker.records.errors().get(errors).map(|error| {
+                let asked = checker.load.unserved();
+                let asked = asked.get(unserved..).unwrap_or(&[]);
+                match error {
+                    SourceError::Items { error: ItemsRecordError::Gone { krate, file: None, call: Some(call) }, name, .. } => {
+                        // `ItemsRecord::whole` files `Gone` for an expansion in two places: no
+                        // row for the call, or the loader gave no text. The loader files every
+                        // call it was asked in `unserved`, so which one it is shows here.
+                        let which = if asked.iter().any(|(_, c)| c == call) {
+                            "the record has the call's expansion row but its expansion texts section holds no text for it (StoreLoad::expansion, names/expansion_texts.rs)"
+                        } else {
+                            "the record has no expansion row for the call (the loader was never asked)"
+                        };
+                        bstd::mem::format_in!(self.frame, "the records did not answer: the expansion text of macro call {call:x} in crate `{name}` ({krate:x}), read while checking item `{}`: {which}", item.name.map_or("<unnamed>", |r| text.get(r.start as usize..r.end as usize).unwrap_or("<cut>")))
+                    }
+                    _ => bstd::mem::format_in!(self.frame, "the records did not answer: {error}"),
+                }
+            });
             if let Some(words) = new_error {
                 made.find(TYPES_NOT_CHECKED, (0, 0), &[words.as_str()]);
                 continue;
@@ -462,13 +549,39 @@ impl<'n> FileTypes<'n> {
                 }
             }
             if checker.load.unserved().len() > unserved {
-                made.find(TYPES_NOT_CHECKED, (0, 0), &["a macro call's expansion is not a record yet (piece 16)"]);
+                made.find(TYPES_NOT_CHECKED, (0, 0), &["a macro call's expansion text is not in its crate's record (StoreLoad::expansion, names/expansion_texts.rs)"]);
             } else if let Some(refused) = &verdict.refused {
                 let words = bstd::mem::format_in!(self.frame, "{}: {refused:?}", refused.text());
                 made.find(TYPES_NOT_CHECKED, (0, 0), &[words.as_str()]);
             } else if let Some(gap) = verdict.gaps.first() {
                 let words = bstd::mem::format_in!(self.frame, "{} questions the front end cannot answer yet, the first {gap:?}", verdict.gaps.len());
                 made.find(TYPES_NOT_CHECKED, (0, 0), &[words.as_str()]);
+            }
+            // The move and borrow check's verdict, filed whatever `BORROWS_ARE_ERRORS` says
+            // (print.rs decides how it is shown), so the day it flips no body is made again. One
+            // finding per place and words, as the types' above. A body whose types were not
+            // checked clean was not borrow checked: its type errors or its `TYPES_NOT_CHECKED`
+            // note stand for it (the borrows of an ill-typed body are not asked), so no note
+            // repeats it.
+            for d in borrows.findings.iter() {
+                let said = made.findings.iter().any(|&(rule, start, end, from, to)| {
+                    let words = &made.messages[from..to];
+                    rule == BORROWS
+                        && (start, end) == (d.start, d.end)
+                        && words.len() == d.code.len() + 1 + d.text.len()
+                        && words.starts_with(d.code.as_bytes())
+                        && words.ends_with(d.text.as_bytes())
+                });
+                if !said {
+                    made.find(BORROWS, (d.start, d.end), &[d.code, "\x1f", d.text]);
+                }
+            }
+            if let Some(refused) = &borrows.refused
+                && !matches!(refused, BorrowRefused::Untyped(_))
+            {
+                let name = item.name.map_or("<unnamed>", |r| text.get(r.start as usize..r.end as usize).unwrap_or("<cut>"));
+                let words = bstd::mem::format_in!(self.frame, "body `{name}`: {}: {refused:?}", refused.text());
+                made.find(BORROWS_NOT_CHECKED, refused.range().unwrap_or((0, 0)), &[words.as_str()]);
             }
         }
     }
@@ -496,7 +609,10 @@ fn checker<'n>(cx: &'n Cx, root: &'n Dir<ReadWrite>, job: &'n TypesJob<'n>, owne
     let log: &'n Log<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(Log::new(crate_names, g), frame));
     let keys = load.keys(g);
     let records: &'n Records<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(Records::new(keys, load, log, frame, g), frame));
-    let world = ProjectWorld::from_records(records, frame, owner.lang, g).map_err(|e| words(format_args!("the front end over records: {e}")))?;
+    let world = {
+        let _from = cx.span("body types: the world from records");
+        ProjectWorld::from_records(records, frame, owner.lang, g).map_err(|e| words(format_args!("the front end over records: {e}")))?
+    };
     let world: &'n mut ProjectWorld<'n, &'n Records<'n>> = blaze_own::Box::leak(blaze_own::Box::new_in(world, frame));
     let own = owner.readers.first().ok_or("an owner with no crates")?;
     let items = ItemsRecord::open(own.records.items, g).map_err(|e| words(format_args!("the items record of `{}`: {e:?}", own.crate_name)))?;

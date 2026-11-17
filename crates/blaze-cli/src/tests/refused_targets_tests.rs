@@ -28,7 +28,7 @@ fn a_refused_test_target_is_one_finding_and_the_rest_is_checked() {
     write(&io, "Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n");
     write(&io, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[[test]]\nname = \"gone\"\npath = \"tests/gone.rs\"\n");
     write(&io, "a/src/lib.rs", "pub fn f() -> u8 {\n    1\n}\n");
-    write(&io, "a/tests/a.rs", "use a::nope;\n#[test]\nfn one() {\n    assert_eq!(a::f(), 1);\n}\n");
+    write(&io, "a/tests/a.rs", "use a::nope;\n#[test]\nfn one() {\n    let _one: u8 = a::f();\n}\n");
     write(&io, "b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\na = { path = \"../a\" }\n");
     write(&io, "b/src/lib.rs", "use a::g;\nuse a::f;\npub fn h() -> u8 {\n    f()\n}\n");
     let checked = check(&io, work::Sizes::USUAL);

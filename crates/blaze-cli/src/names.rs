@@ -50,13 +50,15 @@ use crate::fetch::FetchEnv;
 use crate::store::Store;
 use crate::work::{Did, Made, held_str};
 
+pub(crate) mod expansion_texts;
 pub(crate) mod sections;
 
-// The subject and source domains name the payload's form ([`sections::FORM`] 3): an old home's
-// records (form 1: exports then inner; form 2: no tests section) are under other names, never
-// found, made again.
-const SUBJECT_DOMAIN: &str = "blaze-cli crate scope 3";
-const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 3";
+// The subject and source domains name the payload's form ([`sections::FORM`] 4) and its producer:
+// an old home's records (form 1: exports then inner; form 2: no tests section; "3": form 3 by
+// the old name fill, before blaze-scope's cell core became the writer; "4": form 3, without the
+// expansion texts) are under other names, never found, made again.
+const SUBJECT_DOMAIN: &str = "blaze-cli crate scope 5";
+const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 5";
 const OUT_DOMAIN: &str = "blaze-cli crate scope out 1";
 /// The rule a refusal of this task names.
 const RULE: &str = "names.rs";
@@ -248,7 +250,10 @@ fn scope_record(done: &blaze_scope::crate_scope::CrateScope<'_>, crate_name: &st
         Some(bytes) => &bytes[..],
         None => &[],
     };
-    let payload = sections::write(unresolved, [&done.record[..], &done.inner[..], &names_record[..], &items_record[..], tests]);
+    // The texts the crate's macro calls made, beside the items rows that name them (piece 16):
+    // a body's check reads an item an expansion wrote from here.
+    let expansions = expansion_texts::write(done.names).map_err(|error| unwritten("expansion texts", std::format!("{error}")))?;
+    let payload = sections::write(unresolved, [&done.record[..], &done.inner[..], &names_record[..], &items_record[..], tests, &expansions[..]]);
     #[cfg(test)]
     sections::watch_tests(crate_name, &payload, tests);
     Ok(ScopeRecord { payload, findings, unresolved, tests_refused })
@@ -567,7 +572,10 @@ pub(crate) fn tell_public(store: &mut dyn Store, names: &Names<'_>) {
 }
 
 /// The `CrateScope` parts the graph's record names: one per crate of the world, by subject,
-/// its source the same key's digest.
+/// its source the same key's digest. Owed (drive.md, RUNNER 16): every part runs, so a
+/// `#![no_core]` workspace still resolves all 15 toolchain crates cold; a `Need` locates its
+/// name among its home's parts, so a toolchain crate cannot simply be left out here: the
+/// drive needs a part that is located but run only when wanted.
 pub(crate) fn parts(names: &Names<'_>) -> std::vec::Vec<(Name, ContentId), Global> {
     let mut parts = std::vec::Vec::with_capacity(names.world.crates.len());
     for krate in names.world.crates.iter() {
@@ -598,6 +606,11 @@ impl<'w> SourceTexts<'w> for Recording<'_, 'w> {
             }
         }
         text
+    }
+
+    /// The world's environment of the crate (D96: `CARGO_MANIFEST_DIR` the root it sees).
+    fn crate_env(&self, krate: usize) -> Option<&blaze_scope::crate_env::CrateEnv<'w>> {
+        self.inner.crate_env(krate)
     }
 }
 
@@ -773,10 +786,10 @@ pub(crate) fn run<'f, 'b>(
                         names.unresolved += u64::from(record.unresolved);
                         (ContentId::of(OUT_DOMAIN, &done.record), record.payload, record.findings, record.tests_refused)
                     }
-                    Err(unwritten) => (crate::work::failed_out(), sections::write(0, [&[][..]; 5]), blaze_own::Vec::new_in(Global), Some(std::format!("{unwritten}"))),
+                    Err(unwritten) => (crate::work::failed_out(), sections::write(0, [&[][..]; sections::SECTIONS]), blaze_own::Vec::new_in(Global), Some(std::format!("{unwritten}"))),
                 }
             }
-            Err(words) => (crate::work::failed_out(), sections::write(0, [&[][..]; 5]), blaze_own::Vec::new_in(Global), Some(words)),
+            Err(words) => (crate::work::failed_out(), sections::write(0, [&[][..]; sections::SECTIONS]), blaze_own::Vec::new_in(Global), Some(words)),
         };
         // The drive names a module file by its slot (`x.rs` for `x/mod.rs` too, sweep.rs): a
         // read of either place is a read of the slot's `Surface`.

@@ -226,9 +226,16 @@ fn two_returns_go_in_x0_and_x1_both_ways() {
     assert_eq!(f(0xffff_ffff, 0x1_0000_0102), Two(0x101, 0x02), "each narrowed to its type");
 }
 
-/// More than eight integer arguments and variadic calls stay refused by name.
+/// More than eight named integer arguments and a C-variadic DEFINITION stay refused by name; a
+/// C-variadic CALL is built (pass/variadic.rs; its words and a run against `snprintf` are in
+/// variadic_tests.rs). Judge-changed from "variadic calls are refused": that encoded the
+/// tier's old gap, not the convention: AAPCS64 places a variadic call's arguments by stage C
+/// as named ones, and Apple's arm64 ABI ("Writing ARM64 code for Apple platforms", "Update code
+/// that passes arguments to variadic functions") places the variable ones on the stack, so the
+/// call is defined on both. A definition (`unsafe extern "C" fn f(x: u64, mut args: ...)`, the
+/// unstable `c_variadic`) needs its `va_list` built per platform, which no rung does yet.
 #[test]
-fn stack_arguments_and_variadics_are_refused() {
+fn stack_arguments_and_variadic_definitions_are_refused() {
     let nine = [Param::of(Ty::I64); 9];
     let (mut b, v) = begin(&[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
     let callee_sig = sig(&mut b, &nine, &[Param::of(Ty::I64)]);
@@ -239,12 +246,30 @@ fn stack_arguments_and_variadics_are_refused() {
     let refused = emitted(func.view(), &[Via::Address]).err();
     assert!(matches!(refused, Some(EmitError::Unsupported { op: Op::Call, .. })), "{refused:?}");
 
+    // A variadic callee given only its declared argument: the call is a plain one on both
+    // platforms (only the `...` values move), and it is built.
     let (mut b, v) = begin(&[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
     let callee_sig = b.sig(Conv::C, Variadic::Yes, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
     let callee = b.reference(RefKind::Func, 0);
     let out = b.call(Flags::NONE, callee, callee_sig, &[v[0]]);
     b.ret(&[out]);
     let func = b.finish_checked().expect("builds");
+    let built = emitted(func.view(), &[Via::Address]);
+    assert!(built.is_ok(), "a variadic call is built: {:?}", built.err());
+
+    // A function whose own signature is variadic.
+    let mut b = Builder::<Global, Full>::new_in(64, Global);
+    let own = b.sig(Conv::C, Variadic::Yes, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+    b.set_signature(own);
+    let entry = b.create_block(BlockKind::Normal);
+    b.begin(entry);
+    let x = b.param(Ty::I64);
+    b.ret(&[x]);
+    let func = b.finish_checked().expect("builds");
     let refused = emitted(func.view(), &[Via::Address]).err();
-    assert!(matches!(refused, Some(EmitError::Unsupported { op: Op::Call, .. })), "{refused:?}");
+    assert_eq!(
+        refused,
+        Some(EmitError::Signature { why: crate::pass::variadic::VARIADIC_DEFINITION }),
+        "a variadic definition is refused by name"
+    );
 }

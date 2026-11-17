@@ -2,7 +2,7 @@
 //! `BLAZE_BLESS=1` writes them), the wording table's own check, and its properties on
 //! blaze-sim with a planted-bug control.
 
-use blaze_own::{AString, Alloc};
+use blaze_own::{AString};
 use blaze_sim::{Broke, Config, Tape};
 
 use super::text::Plant;
@@ -63,8 +63,8 @@ fn cases() -> Vec<Case> {
     cases.push(Case { name: "question", path: "src/main.rs", text: HELLO.as_bytes(), findings: vec![question, second] });
 
     // The owner's manifest: the dependency blaze cannot read yet.
-    let mut headline = AString::new_in(Alloc::global());
-    let mut label = AString::new_in(Alloc::global());
+    let mut headline = AString::new_in(blaze_own::testing::heap().alloc());
+    let mut label = AString::new_in(blaze_own::testing::heap().alloc());
     let name = say(Area::Cli, 2, &["bstd"], &mut headline, &mut label).expect("rule 2 has words");
     let headline = source(&headline);
     let label = source(&label);
@@ -173,8 +173,8 @@ fn draw(case: &Case, caps: Caps, plant: Plant) -> String {
     let sources = [Source { shown: case.path, absolute: "/work/hello world/src/main.rs", text: case.text }];
     // The goldens draw the day `--fix` exists; the spec tests draw both states.
     let input = Input { findings: &case.findings, sources: &sources, link: LINK_FILE, fixes: Fixes::Command, ids: &[] };
-    let mut out = AString::new_in(Alloc::global());
-    render_planted(&mut out, &input, caps, Alloc::global(), plant).expect("the case's ranges are in its file");
+    let mut out = AString::new_in(blaze_own::testing::heap().alloc());
+    render_planted(&mut out, &input, caps, blaze_own::testing::heap().alloc(), plant).expect("the case's ranges are in its file");
     out.as_str().to_string()
 }
 
@@ -216,7 +216,7 @@ fn goldens() {
     };
     for (_, caps) in levels().into_iter().chain([("lines", Caps::LINES)]) {
         for end in [failed, clean, mixed] {
-            let mut out = AString::new_in(Alloc::global());
+            let mut out = AString::new_in(blaze_own::testing::heap().alloc());
             closing(&mut out, &end, caps);
             ends.push_str(out.as_str());
         }
@@ -232,7 +232,7 @@ fn every_wording_is_whole() {
         assert!(!wording.headline.is_empty() && !wording.label.is_empty(), "{}: empty words", wording.name);
         let args: Vec<String> = (0..wording.args).map(|n| format!("<{n}>")).collect();
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let mut both = AString::new_in(Alloc::global());
+        let mut both = AString::new_in(blaze_own::testing::heap().alloc());
         fill(&mut both, wording.headline, &args);
         fill(&mut both, wording.label, &args);
         assert!(!both.contains('{'), "{}: a placeholder past its arguments", wording.name);
@@ -597,10 +597,10 @@ fn the_owners_case_says_why_b_and_draws_the_line_before_and_after() {
     let text = "fn add(a: u32, b: u32) -> u32 { a + c }\n";
     let hole = at(text, "c }", 0);
     let b = at(text, "b:", 0) as usize;
-    let mut words = AString::new_in(Alloc::global());
+    let mut words = AString::new_in(blaze_own::testing::heap().alloc());
     help_words(&mut words, HelpKind::NeverUsed, &["b", "u32"]).expect("two arguments");
     let fix = Edit { start: hole, end: hole + 1, insert: &text[b..b + 1] };
-    let mut out = AString::new_in(Alloc::global());
+    let mut out = AString::new_in(blaze_own::testing::heap().alloc());
     help(&mut out, words.as_str(), text.as_bytes(), Some(fix), Caps { width: 80, ..Caps::FRAMES }).expect("the fix is on one line");
     let want = "help: `b` is in scope, is a `u32`, and is never used\n\
                 1 - fn add(a: u32, b: u32) -> u32 { a + c }\n\

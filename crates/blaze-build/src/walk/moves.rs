@@ -46,6 +46,8 @@ use blaze_typeck::{AdjustKind, Expr, ExprId, PNode, PTy, Pat, PatId, UnOp};
 use super::{Held, NO_EXPR, Owner, Repr, Shape, V, Walk, malformed, unsupported};
 use crate::BuildError;
 
+mod field_scrutinee;
+
 /// One step down a value: a struct's or tuple's field (its row of `layout_fields`), a field of
 /// an enum's variant `v` (its row), an array's element `k`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -74,6 +76,9 @@ pub(super) struct Root {
     owner: Owner,
     mask: Option<SlotId>,
     g: PTy,
+    /// A scrutinee that is a field of its owning local (`Owner::Local`; `match self.failed`):
+    /// the steps to it start every moved part's path (field_scrutinee.rs).
+    field: Option<ExprId>,
 }
 
 /// The arm being bound: its pattern, its match's root, and whether it has a guard.
@@ -162,7 +167,13 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         if self.adjust_rows(scrutinee).is_empty()
             && let Some(x) = self.local_of(scrutinee)?
         {
-            self.moves.roots.push(Root { m, expr: e, owner: Owner::Local(x), mask: None, g });
+            self.moves.roots.push(Root { m, expr: e, owner: Owner::Local(x), mask: None, g, field: None });
+            return Ok(None);
+        }
+        // A field of an owned local (`match self.failed`, `self: Held`): matched in place, its
+        // parts moved by the local's field flags (field_scrutinee.rs).
+        if let Some(x) = self.owned_field_scrutinee(scrutinee)? {
+            self.moves.roots.push(Root { m, expr: e, owner: Owner::Local(x), mask: None, g, field: Some(scrutinee) });
             return Ok(None);
         }
         let (V::Place(p, off), Repr::Agg(_)) = (s, srepr) else {
@@ -177,7 +188,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let held = self.scope_pats.iter().rposition(|h| matches!(*h, Held::Rest { at, variant: None, .. } if at == (p, off)));
         let held = held.ok_or(malformed("a held temporary scrutinee missing from its scope"))?;
         self.scope_pats[held] = Held::Moved { at: (p, off), g, mask: slot };
-        self.moves.roots.push(Root { m, expr: e, owner: Owner::Temp, mask: Some(slot), g });
+        self.moves.roots.push(Root { m, expr: e, owner: Owner::Temp, mask: Some(slot), g, field: None });
         Ok(Some((p, off, g)))
     }
 
@@ -207,22 +218,43 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         if self.repr(g).map_err(|error| Self::pat_ty_err(p, error))? == Repr::None {
             return Err(BuildError::UnsupportedPat { pat: p, what: "a move out of a zero-sized part that needs drop" });
         }
-        let (start, len) = self.move_path(cx.pat, cx.root.g, p)?;
-        let mask = match cx.root.owner {
-            Owner::Local(x) if len == 0 => {
+        // A field scrutinee of its owning local (`match self.failed`): the steps from the local
+        // to it first, the pattern's path after them, one part's path in the local's word.
+        let prefix = match cx.root.field {
+            Some(s) => Some(self.field_scrutinee_prefix(s, p)?),
+            None => None,
+        };
+        let (start, len) = match self.move_path(cx.pat, cx.root.g, p) {
+            Ok(path) => path,
+            Err(error) => {
+                if let Some((_, pstart, _)) = prefix {
+                    self.moves.steps.truncate(pstart as usize);
+                }
+                return Err(error);
+            }
+        };
+        let (start, len) = match prefix {
+            Some((_, pstart, plen)) => (pstart, plen + len),
+            None => (start, len),
+        };
+        let mask = match (cx.root.owner, prefix) {
+            // The local's word (`scan_field_scrutinee` gave it): `field_path` found it.
+            (_, Some((mask, _, _))) => mask,
+            (Owner::Local(x), None) if len == 0 => {
                 // The whole local moves (its flag, set by `scan_flags`).
                 self.moves.steps.truncate(start as usize);
                 return self.moved(cx.root.expr, x);
             }
-            Owner::Local(x) => self.owned[x.ix()]
+            (Owner::Local(x), None) => self.owned[x.ix()]
                 .and_then(|o| o.rest)
                 .ok_or(malformed("a match by tests moving out of a local without field flags (`scan_flags`)"))?,
-            Owner::Temp => cx.root.mask.ok_or(malformed("a temporary scrutinee without its word"))?,
-            Owner::None => return Err(malformed("a part moved out of a scrutinee no one owns")),
+            (Owner::Temp, None) => cx.root.mask.ok_or(malformed("a temporary scrutinee without its word"))?,
+            (Owner::None, None) => return Err(malformed("a part moved out of a scrutinee no one owns")),
         };
-        // A local enum's switch owns its first `field_bit`s.
-        let base = match (cx.root.owner, self.layout(cx.root.g).map(|l| self.layouts[l as usize].shape)) {
-            (Owner::Local(_), Ok(Shape::Enum { first, len, .. })) => (0..len).map(|v| self.layout_variants[(first + v) as usize].1).sum(),
+        // A local enum's switch owns its first `field_bit`s (a whole local's only: a local with
+        // a field scrutinee is a struct or tuple, `field_path`'s `Shape::Fields`).
+        let base = match (cx.root.owner, prefix, self.layout(cx.root.g).map(|l| self.layouts[l as usize].shape)) {
+            (Owner::Local(_), None, Ok(Shape::Enum { first, len, .. })) => (0..len).map(|v| self.layout_variants[(first + v) as usize].1).sum(),
             _ => 0u32,
         };
         let Some(bit) = self.part_bit(mask, start, len, base, Some(cx.root.expr))? else {

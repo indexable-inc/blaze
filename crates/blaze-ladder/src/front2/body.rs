@@ -89,6 +89,10 @@ pub enum BodyError {
     /// The constant `item` an array length of the body (or of a head it needs) names has no
     /// value: the evaluator's refusal.
     Const { item: LibKey, error: Box<super::consts::ConstFail, Global> },
+    /// [`super::lower_made::lower_made`] made `need` and the lowering asked for it again at
+    /// once (no progress), or met [`super::lower_made::MOST_MADE`] makes: `after` is how many
+    /// heads and constants it had made for `item`.
+    Made { item: LibKey, need: super::lower_made::Needed, after: u32 },
 }
 
 impl core::fmt::Display for BodyError {
@@ -111,6 +115,7 @@ impl core::fmt::Display for BodyError {
             BodyError::Convert { item, refused, why } => write!(f, "fn {item:x}: to_typeck refused {refused:?} ({why:?})"),
             BodyError::Head { item, error } => write!(f, "fn {item:x}: {error}"),
             BodyError::Rounds { item, last } => write!(f, "fn {item:x}: still needs the head of {last:x} after {MOST_ROUNDS} conversions"),
+            BodyError::Made { item, need, after } => write!(f, "fn {item:x}: still needs {need:?} after {after} makes (at most {})", super::lower_made::MOST_MADE),
             BodyError::Traits { item, error } => write!(f, "fn {item:x}: the traits in scope at its module: {error}"),
             BodyError::Table { item, error } => write!(f, "fn {item:x}: its own type table: {error:?}"),
             BodyError::PatternName { item, error } => write!(f, "fn {item:x}: an identifier pattern's name at its module: {error:?}"),

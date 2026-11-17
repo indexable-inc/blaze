@@ -43,8 +43,8 @@ const TEST_FILES: [&str; 2] = ["tests.rs", "test.rs"];
 const BIN_DIRS: [&str; 2] = ["bin", "examples"];
 const ROOT_FILES: [&str; 4] = ["lib.rs", "main.rs", "mod.rs", "build.rs"];
 
-fn plan(path: PathBuf, parts: Vec<String>, text: String) -> File {
-    let alloc = Alloc::global();
+fn plan(path: PathBuf, parts: Vec<String>, text: String, heap: &'static blaze_own::Heap) -> File {
+    let alloc = heap.alloc();
     let lines = outline(&text, Edition::E2024, alloc);
     let items = lines.items();
     let mut units = Vec::with_capacity(items.len() + 1);
@@ -177,8 +177,8 @@ fn timed(files: &[File], threads: usize, work: &(dyn Fn(&File) -> usize + Sync))
     (fastest, total)
 }
 
-fn lint_file(file: &File) -> usize {
-    let alloc = Alloc::global();
+fn lint_file(file: &File, heap: &'static blaze_own::Heap) -> usize {
+    let alloc = heap.alloc();
     let mut out = Findings::new_in(alloc);
     file.lint_all(&RuleSet::ALL, &mut out, alloc, |_, _, _, _, _| {});
     out.list.len()
@@ -189,13 +189,14 @@ fn ms(seconds: f64) -> String {
 }
 
 fn main() {
+    let heap = blaze_own::Heap::process();
     let root = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| "crates".to_string()));
     let mut files: Vec<File> = walk(&root)
         .into_iter()
         .filter_map(|(path, parts)| {
             let bytes = std::fs::read(&path).ok()?;
             let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
-            Some(plan(path, parts, text))
+            Some(plan(path, parts, text, heap))
         })
         .collect();
 
@@ -206,7 +207,7 @@ fn main() {
     for _round in 0..16 {
         let mut marked = HashSet::new();
         for file in &files {
-            let alloc = Alloc::global();
+            let alloc = heap.alloc();
             let mut out = Findings::new_in(alloc);
             let mut test_mods = HashSet::new();
             file.lint_all(&none, &mut out, alloc, |at, scope, _, _, at_end| {
@@ -243,7 +244,7 @@ fn main() {
     for (number, file) in files.iter().enumerate() {
         bytes += file.text.len();
         units += file.units.len();
-        let alloc = Alloc::global();
+        let alloc = heap.alloc();
         let mut out = Findings::new_in(alloc);
         file.lint_all(&RuleSet::ALL, &mut out, alloc, |at, _, out, run, _| {
             let base = file.units[at].base as usize;
@@ -279,13 +280,13 @@ fn main() {
 
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     let (lex_one, tokens) = timed(&files, 1, &|f: &File| lex_floor(&f.text));
-    let (lint_one, found) = timed(&files, 1, &lint_file);
+    let (lint_one, found) = timed(&files, 1, &|f: &File| lint_file(f, heap));
     let (lex_all, _) = timed(&files, cores, &|f: &File| lex_floor(&f.text));
-    let (lint_all, _) = timed(&files, cores, &lint_file);
+    let (lint_all, _) = timed(&files, cores, &|f: &File| lint_file(f, heap));
     // The pass with no rule: the lex of every unit's own runs, the block and test tracking, the
     // children's scopes. What the rules add is the rest.
     let (bare_one, _) = timed(&files, 1, &|f: &File| {
-        let alloc = Alloc::global();
+        let alloc = heap.alloc();
         let mut out = Findings::new_in(alloc);
         f.lint_all(&none, &mut out, alloc, |_, _, _, _, _| {});
         0
@@ -312,7 +313,7 @@ fn main() {
     let Some(largest) = files.iter().filter(|f| !f.parts.iter().any(|p| p == "vendor")).max_by_key(|f| f.text.len()) else {
         return;
     };
-    let alloc = Alloc::global();
+    let alloc = heap.alloc();
     let before = outline(&largest.text, Edition::E2024, alloc);
     let mut kept: HashSet<(_, u64)> = HashSet::new();
     let mut out = Findings::new_in(alloc);
@@ -327,7 +328,7 @@ fn main() {
     let at = largest.units[target].end as usize - 1;
     let edited = format!("{}    let edit = x.clone();\n{}", &largest.text[..at], &largest.text[at..]);
     let start = Instant::now();
-    let after = plan(largest.path.clone(), largest.parts.clone(), edited);
+    let after = plan(largest.path.clone(), largest.parts.clone(), edited, heap);
     let outlined = start.elapsed().as_secs_f64();
     let new_outline = outline(&after.text, Edition::E2024, alloc);
     let hashes: Vec<_> = new_outline.items().iter().map(|item| item.hash).collect();

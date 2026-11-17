@@ -31,7 +31,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use blaze_ladder::front2::Front2;
-use blaze_ladder::front2::body::{BodyError, BodyFinding, lower_fn, lower_member};
+use blaze_ladder::front2::body::{BodyError, BodyFinding};
+use blaze_ladder::front2::lower_made::{LowerTarget, lower_made};
 use blaze_ladder::front2::buckets::Buckets;
 use blaze_ladder::front2::check::{BuildOrder, CheckFail, Records, check_body, eval_len};
 use blaze_ladder::front2::consts::Consts;
@@ -209,6 +210,7 @@ fn body_class(e: &BodyError) -> String {
         }
         BodyError::Head { error, .. } => format!("lower Head: {}", head_class(error)),
         BodyError::Rounds { .. } => "lower Rounds".into(),
+        BodyError::Made { need, .. } => format!("lower Made: {}", cls(&format!("{need:?}"))),
         BodyError::Table { error, .. } => format!("lower Table: {}", cls(&format!("{error:?}"))),
         BodyError::Traits { error, .. } => format!("lower Traits: {}", cls(&format!("{error:?}"))),
         BodyError::NoHead(_) => "lower NoHead".into(),
@@ -712,29 +714,22 @@ struct Entry<'n> {
 }
 
 fn take<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, t: Target<'_>, blocked: &mut (Vec<(blaze_id::ItemKey, String)>, bool)) -> Result<Option<()>, (String, String)> {
-    let mut lens = 0;
-    let lowered = loop {
-        let lowered = match t {
-            Target::Free(lib) => lower_fn(r.names, prepared, r.keys, r.store, lib),
-            Target::Member { container, name } => match r.keys.filed_member(checker_of(container), MemberKind::Fn, name) {
-                Some(k) => {
-                    if let Some(why) = r.store.fn_gaps.get(&k) {
-                        return Err((format!("member head refused: {}", why_class(why)), short(&format!("{why:?}"), 200)));
-                    }
-                    lower_member(r.names, prepared, r.keys, r.store, k)
+    let target = match t {
+        Target::Free(lib) => LowerTarget::Free(lib),
+        Target::Member { container, name } => match r.keys.filed_member(checker_of(container), MemberKind::Fn, name) {
+            Some(k) => {
+                if let Some(why) = r.store.fn_gaps.get(&k) {
+                    return Err((format!("member head refused: {}", why_class(why)), short(&format!("{why:?}"), 200)));
                 }
-                None => return Err(("member not filed (no key after the container's head)".into(), format!("member `{name}`"))),
-            },
-        };
-        let c = match &lowered {
-            Err(BodyError::Convert { why: Some(Why::NeedConst(c, _)), .. }) | Err(BodyError::Head { error: HeadError::Item(_, Why::NeedConst(c, _)), .. }) if lens < MOST_LENS => *c,
-            _ => break lowered,
-        };
-        lens += 1;
-        if let Err(e) = eval_len(r, c) {
-            return Err((format!("lower Const: {}", cls(&format!("{e:?}"))), short(&format!("{e:?}"), 200)));
-        }
+                LowerTarget::Member(k)
+            }
+            None => return Err(("member not filed (no key after the container's head)".into(), format!("member `{name}`"))),
+        },
     };
+    // Every head and constant the lowering needs is made first (front2/lower_made.rs); an
+    // evaluator's refusal is `BodyError::Const`, classed "lower Const: .." by `body_class` as
+    // this loop classed it before.
+    let lowered = lower_made(r, prepared, target);
     let body = match lowered {
         Ok(b) => b,
         Err(BodyError::NoBody(_)) => return Ok(None),

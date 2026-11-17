@@ -10,8 +10,7 @@
 //! the textual list with each child's mark, the `use .. as _` traits, and the `#[macro_export]`
 //! macros an expansion wrote (published to the root by the record writer, as before).
 //!
-//! Not written (counted by the seam's whole-scope comparison, c10-r17a): `WiderReexport`
-//! (lz4_flex's two, a lint at most), `Inconsistent`, `RestrictedNotAncestor` (a bad `pub(in ..)`
+//! Not written (counted by the seam's whole-scope comparison, c10-r17a): `Inconsistent`, `RestrictedNotAncestor` (a bad `pub(in ..)`
 //! refuses the cell core's load), a second item of one name (`Duplicate` of explicit entries:
 //! see `add_explicit`), and R6/R8's errors as `Ambiguous`.
 
@@ -19,7 +18,7 @@ use blaze_id::ItemKey;
 use blaze_own::{ABTreeMap, AVec, Alloc};
 use blaze_surface::{AnonImport, Binding, GlobEdge, Path, ScopeBuilder, ScopeEntry, ScopeError, TextualDef, TextualMark, Unresolved, UseSite};
 
-use super::{Cells, FragId, ItemId, NAMESPACES, Outcome, Slot, ns_at};
+use super::{CellPlant, Cells, FragId, ItemId, NAMESPACES, Outcome, Slot, ns_at};
 use crate::{BindingState, Def, DefKind, Namespace, Origin};
 
 /// One module's bindings and glob edges as the cell core decided them.
@@ -187,6 +186,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         // The walk: (fragment, next slot, next import, the module's own fragment or a
         // `#[macro_use]` child's carried out). Slots and imports merge by text position.
         let mut stack: AVec<'o, (FragId, usize, usize, bool)> = AVec::new_in(alloc);
+        // The fragment each `macro_exports` entry was written in (the plant's order only).
+        let mut export_frags: AVec<'o, FragId> = AVec::new_in(alloc);
         let text = self.modules[m as usize].text;
         stack.push((text, 0, 0, true));
         for &(ns, name, def) in ix.explicit[text as usize].iter() {
@@ -217,22 +218,33 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         let last = it.segments.len().saturating_sub(1) as u32;
                         out.errors.push(ScopeError::Import { site, path: path(i), segment: last, why: Unresolved::NotFound });
                     }
-                    Some(Outcome::Named(b)) => match it.binds {
-                        Some(name) => {
-                            for ns in NAMESPACES {
-                                if let Some((def, _)) = b[ns_at(ns)] {
-                                    bind(ns, name, def, &mut out.errors);
-                                }
+                    Some(Outcome::Named(b)) => {
+                        // E0364/E0365 (the Reference, `items.use.visibility`): a `use` re-exports
+                        // a binding at most as visible as the binding is. The outcome holds each
+                        // namespace's binding as the import makes it, its visibility the
+                        // narrower of the import's and the target's (an `extern crate` item's
+                        // under a `pub use` excepted, as rustc's `Resolver::import` does): one
+                        // narrower than the import's own is the error, beside the binding.
+                        let leaf = it.segments.last().copied().or(it.binds);
+                        for ns in NAMESPACES {
+                            let Some((def, vis)) = b[ns_at(ns)] else { continue };
+                            if let Some(name) = it.binds {
+                                bind(ns, name, def, &mut out.errors);
                             }
-                        }
-                        None => {
-                            if let Some((def, _)) = b[ns_at(Namespace::Types)]
-                                && def.kind == DefKind::Trait
+                            if vis != it.vis
+                                && self.plant != CellPlant::NoWiderReexport
+                                && let Some(name) = leaf
                             {
-                                out.traits.push(AnonImport { site, def, vis: it.vis });
+                                out.errors.push(ScopeError::WiderReexport { site, ns, name, def });
                             }
                         }
-                    },
+                        if it.binds.is_none()
+                            && let Some((def, _)) = b[ns_at(Namespace::Types)]
+                            && def.kind == DefKind::Trait
+                        {
+                            out.traits.push(AnonImport { site, def, vis: it.vis });
+                        }
+                    }
                     // `written` counted the named imports and globs; an `as _` import here.
                     Some(Outcome::Outside) | None if it.binds.is_none() && !it.glob => unknown += 1,
                     Some(Outcome::Outside | Outcome::Glob(_) | Outcome::Called(_)) | None => {}
@@ -248,6 +260,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     out.textual.push(d);
                     if own && export && d.expansion > 0 {
                         out.macro_exports.push(d);
+                        export_frags.push(f);
                     }
                 }
                 Slot::Mod(child, macro_use) => {
@@ -288,6 +301,20 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             }
         }
         out.marks.sort_unstable_by_key(|k| k.child);
+        // The `#[macro_export]` macros expansions wrote are listed in the walk's tree order: where
+        // each is written in the module's text with every call's expansion at the call, a
+        // function of the text alone (rule 25). Fragment ids are given as expansions are read,
+        // so the plant's order by fragment is the order the work happened to finish in.
+        if self.plant == CellPlant::ExportsByExpansionTime {
+            let mut by_frag: AVec<'o, (FragId, TextualDef<N>)> = AVec::with_capacity_in(export_frags.len(), alloc);
+            for (k, &f) in export_frags.iter().enumerate() {
+                by_frag.push((f, out.macro_exports[k]));
+            }
+            by_frag.sort_by_key(|&(f, _)| f);
+            for (k, &(_, d)) in by_frag.iter().enumerate() {
+                out.macro_exports[k] = d;
+            }
+        }
         Some((out, unknown))
     }
 }

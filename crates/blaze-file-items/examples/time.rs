@@ -8,15 +8,14 @@
 use std::{alloc::Global, path::PathBuf, time::Instant};
 
 use blaze_file_items::{Bodies, OneByOne, SideBySide, outline, outline_hashed_by};
-use blaze_own::Alloc;
 use blaze_surface::{Edition, ItemDetail};
 
 /// How many outlines of every file `--profile` runs.
 const PROFILE_ROUNDS: usize = 12;
 
 /// The entries `outline` makes of `text`.
-fn rows(text: &str) -> usize {
-    outline(text, Edition::E2024, Alloc::global()).items().len()
+fn rows(text: &str, heap: &'static blaze_own::Heap) -> usize {
+    outline(text, Edition::E2024, heap.alloc()).items().len()
 }
 
 /// The CPU time this thread has used, in seconds: what a round costs whatever else the machine
@@ -56,6 +55,7 @@ fn load() -> std::string::String {
 }
 
 fn main() {
+    let heap = blaze_own::Heap::process();
     let mut files: Vec<PathBuf, Global> = Vec::new_in(Global);
     let mut stack: Vec<PathBuf, Global> = Vec::new_in(Global);
     let mut profile = false;
@@ -103,7 +103,7 @@ fn main() {
         let mut items = 0usize;
         for _ in 0..PROFILE_ROUNDS {
             for text in &texts {
-                items += rows(text);
+                items += rows(text, heap);
             }
         }
         println!(
@@ -120,7 +120,7 @@ fn main() {
     let (mut best_cpu, mut count) = (f64::MAX, 0usize);
     for _ in 0..5 {
         let (start, start_cpu) = (Instant::now(), cpu());
-        count = texts.iter().map(|text| rows(text)).sum();
+        count = texts.iter().map(|text| rows(text, heap)).sum();
         let (took, took_cpu) = (start.elapsed().as_secs_f64(), cpu() - start_cpu);
         best_cpu = best_cpu.min(took_cpu);
         if took < best.0 {
@@ -140,7 +140,7 @@ fn main() {
         let (mut items, mut errors, mut unhandled) = (0usize, 0usize, 0usize);
         let start = Instant::now();
         for text in &texts {
-            let made = outline(text, Edition::E2024, Alloc::global());
+            let made = outline(text, Edition::E2024, heap.alloc());
             items += made.items().len();
             errors += made.errors().len();
             unhandled += made.items().iter().filter(|it| matches!(it.detail, ItemDetail::Unhandled { .. })).count();
@@ -165,8 +165,8 @@ fn main() {
             let mut items = 0usize;
             for text in &texts {
                 let made = match side_by_side {
-                    false => outline_hashed_by::<OneByOne>(text, Edition::E2024, Bodies::Skipped, Alloc::global()),
-                    true => outline_hashed_by::<SideBySide>(text, Edition::E2024, Bodies::Skipped, Alloc::global()),
+                    false => outline_hashed_by::<OneByOne>(text, Edition::E2024, Bodies::Skipped, heap.alloc()),
+                    true => outline_hashed_by::<SideBySide>(text, Edition::E2024, Bodies::Skipped, heap.alloc()),
                 };
                 items += made.items().len();
             }
@@ -183,7 +183,7 @@ fn main() {
     // at a time through a streaming hasher, one at a time in one shot, and 64 side by side.
     let mut inputs: Vec<&[u8], Global> = Vec::new_in(Global);
     for text in &texts {
-        let made = outline(text, Edition::E2024, Alloc::global());
+        let made = outline(text, Edition::E2024, heap.alloc());
         for item in made.items() {
             if item.range.len() <= 1024 {
                 inputs.push(&text.as_bytes()[item.range.to_usize()]);
@@ -238,7 +238,7 @@ fn main() {
     let mut by_flag = [0usize; 4];
     let mut fns = (0usize, 0usize);
     for text in &texts {
-        let made = outline(text, Edition::E2024, Alloc::global());
+        let made = outline(text, Edition::E2024, heap.alloc());
         clean_files += usize::from(made.flags().is_empty());
         own += usize::from(!made.own_flags().is_empty());
         for item in made.items() {
@@ -306,7 +306,7 @@ fn main() {
                         loop {
                             let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some(text) = texts.get(at) else { break };
-                            mine += outline(text, Edition::E2024, Alloc::global()).items().len();
+                            mine += outline(text, Edition::E2024, heap.alloc()).items().len();
                         }
                         made.fetch_add(mine, std::sync::atomic::Ordering::Relaxed);
                     });

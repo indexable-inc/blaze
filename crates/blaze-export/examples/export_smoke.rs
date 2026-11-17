@@ -89,6 +89,7 @@ fn main() -> ExitCode {
         data: &[],
         entry: Entry::CMain { main: Symbol::of_name("main") },
         panic: Panic::Unwind,
+        personality: None,
         profile: None,
     };
     let mut file = Vec::new_in(Alloc::global());

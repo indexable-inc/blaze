@@ -12,9 +12,13 @@
 //!   "Supertraits are declared by trait bounds on the `Self` type of a trait and transitively
 //!   the supertraits of the traits declared in those trait bounds."
 //!
-//! The solver assembles a rigid alias's bounds from `TraitDef::item_bounds` as they are given
-//! (blaze-solve alias.rs `push_alias_bounds`), and elaborates only a param env (eval.rs `env`):
-//! so the facts given here are the elaborated list, as a param env's clauses are. Without it a
+//! The solver assembles a rigid alias's bounds from `TraitDef::item_bounds` and an opaque
+//! type's from `OpaqueDef::bounds` as they are given (blaze-solve alias.rs
+//! `push_alias_bounds`), and elaborates only a param env (eval.rs `env`): so the facts given
+//! here are the elaborated list, as a param env's clauses are, for both alias kinds
+//! (facts.rs `fill_trait` for associated types, `fill_opaque` for opaque types: `impl
+//! FnMut(A) -> B` is filed with a `FnOnce` projection, and `FnMut<Args>: FnOnce<Args>` is
+//! what makes it a `FnOnce`; suite/opaque_supertraits.rs). Without it a
 //! call of a trait's fn by the trait's path, whose predicates are the trait's own clause and
 //! its supertrait clauses (`Self: Err2`, `Self: Sized`, `Self: Std`), is refused at
 //! `<A as Seq>::Error: Std`: tempo's "E0277: Error" (serde's `Deserialize` derive:

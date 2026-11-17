@@ -113,7 +113,7 @@ fn ops_match_tables(tape: &Tape, planted: Plant) -> Result<(), Broke> {
 }
 
 fn ops_case(tape: &Tape) -> Result<(), Broke> {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let n = 1 + tape.index(MOST_VARS, "variables");
     let space = switches(n, alloc);
     let cache_bits = 1 + tape.index(10, "cache bits") as u8;
@@ -338,7 +338,7 @@ fn eval_ops(ops: &[Op<'_>], n: usize, j: usize) -> bool {
 #[test]
 fn a_cfg_predicate_lowers_to_its_value_under_every_assignment() {
     check(Config::cases(400), |tape| {
-        let alloc = Alloc::global();
+        let alloc = blaze_own::testing::heap().alloc();
         let n = 1 + tape.index(7, "variables");
         let space = switches(n, alloc);
         let mut bdd = Bdd::new_in(n, Limits::TASK, alloc).map_err(harness)?;
@@ -360,7 +360,7 @@ fn a_cfg_predicate_lowers_to_its_value_under_every_assignment() {
 
 #[test]
 fn malformed_portable_rows_are_refused_by_name() {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let space = switches(3, alloc);
     let mut bdd = Bdd::new_in(3, Limits::TASK, alloc).unwrap();
     let (a, b) = (bdd.var(Var::new(0)).unwrap(), bdd.var(Var::new(1)).unwrap());
@@ -393,7 +393,7 @@ fn malformed_portable_rows_are_refused_by_name() {
 
 #[test]
 fn the_node_cap_is_a_typed_refusal() {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let mut bdd = Bdd::new_in(8, Limits { nodes: 6, cache_bits: 4 }, alloc).unwrap();
     let mut acc = Cond::FALSE;
     let mut refused = None;

@@ -23,7 +23,7 @@ mod hpack_rfc;
 
 /// The allocator every test passes in.
 pub(crate) fn alloc() -> Alloc<'static> {
-    Alloc::global()
+    blaze_own::testing::heap().alloc()
 }
 
 /// The bytes a hex string names; spaces are ignored.

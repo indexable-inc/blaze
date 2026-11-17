@@ -1,0 +1,9 @@
+status 0
+stdout
+5
+42
+hello async
+block: 2 7
+polls 2
+9
+15

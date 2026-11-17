@@ -72,7 +72,7 @@ const EDITION: Edition = Edition::E2024;
 // The world, timed: every question the checker asks, counted and timed by kind, then answered
 // by the front end's world. Harness counters only; the checker is unchanged.
 
-const KINDS: usize = 21;
+const KINDS: usize = 22;
 
 fn kind_of(q: &Question) -> usize {
     match q {
@@ -96,12 +96,14 @@ fn kind_of(q: &Question) -> usize {
         Question::ConstParams(_) => 17,
         Question::Closure(..) => 19,
         Question::AssocGenerics(..) => 20,
+        Question::Coroutine(..) => 21,
     }
 }
 
 const KIND_NAMES: [&str; KINDS] = [
     "FnSig", "Predicates", "Adt", "ImplsOf", "ImplHeader", "Inherent", "AssocItem", "TraitsInScope", "Path", "Lang",
     "LangPath", "Const", "Opaque", "Attrs", "TraitDef", "AssocParent", "ConstHolds", "ConstParams", "prefetch", "Closure", "AssocGenerics",
+    "Coroutine",
 ];
 
 struct Tally {

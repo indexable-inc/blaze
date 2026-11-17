@@ -48,7 +48,7 @@ fn vis(tape: &Tape) -> Visibility {
 
 /// A drawn scope's bindings: at most one per (namespace, name), in a drawn order.
 pub(super) fn bindings(tape: &Tape) -> StdVec<ScopeEntry<&'static str>, Alloc<'static>> {
-    let mut out = StdVec::new_in(Alloc::global());
+    let mut out = StdVec::new_in(blaze_own::testing::heap().alloc());
     for ns in SPACES {
         for name in NAMES {
             if !tape.coin("bound") {
@@ -82,17 +82,17 @@ pub(super) enum Plant {
 /// The `ModuleScope` record of `key(200)` with `rows` and two children's marks, given out of
 /// order.
 pub(super) fn write_scope(rows: &[ScopeEntry<&str>], plant: Plant) -> std::vec::Vec<u8, Alloc<'static>> {
-    let mut out = ScopeBuilder::new_in(key(200), Alloc::global());
+    let mut out = ScopeBuilder::new_in(key(200), blaze_own::testing::heap().alloc());
     out.bindings.extend_from_slice(rows);
     out.marks.extend_from_slice(&[TextualMark { child: key(202), len: 1 }, TextualMark { child: key(201), len: 0 }]);
-    out.write_sorted(matches!(plant, Plant::None), Alloc::global()).expect("a drawn scope holds one binding per slot")
+    out.write_sorted(matches!(plant, Plant::None), blaze_own::testing::heap().alloc()).expect("a drawn scope holds one binding per slot")
 }
 
 /// Two writers of one scope, given its bindings in two orders, write equal bytes; and the
 /// scope answers each binding by its name.
 fn scope_agrees(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let rows = bindings(tape);
-    let mut reversed = StdVec::with_capacity_in(rows.len(), Alloc::global());
+    let mut reversed = StdVec::with_capacity_in(rows.len(), blaze_own::testing::heap().alloc());
     reversed.extend(rows.iter().rev().copied());
     let bytes = write_scope(&rows, plant);
     if bytes != write_scope(&reversed, plant) {
@@ -136,7 +136,7 @@ fn path(tape: &Tape) -> Path<'static, &'static str> {
         4 => PathKind::Abs,
         _ => PathKind::DollarCrate(CrateItemKey(ContentId([7; 32]))),
     };
-    let mut segments = Vec::new_in(Alloc::global());
+    let mut segments = Vec::new_in(blaze_own::testing::heap().alloc());
     for _ in 0..tape.below(4, "segments") {
         segments.push(name(tape));
     }
@@ -151,7 +151,7 @@ fn site(tape: &Tape) -> UseSite {
 /// A drawn scope with every list filled: bindings, an error of each shape, textual
 /// definitions, marks, traits and expanded `#[macro_export]`s.
 fn full_scope(tape: &Tape) -> ScopeBuilder<'static, &'static str> {
-    let mut out = ScopeBuilder::new_in(key(200), Alloc::global());
+    let mut out = ScopeBuilder::new_in(key(200), blaze_own::testing::heap().alloc());
     out.bindings.extend_from_slice(&bindings(tape));
     for _ in 0..tape.below(6, "errors") {
         let (ns, name_) = (SPACES[usize::try_from(tape.below(3, "ns")).expect("below 3")], name(tape));
@@ -189,16 +189,16 @@ fn full_scope(tape: &Tape) -> ScopeBuilder<'static, &'static str> {
 fn a_scope_round_trips_through_its_record() {
     blaze_sim::check(Config::cases(300), |tape| {
         let mut scope = full_scope(tape);
-        let bytes = scope.write(Alloc::global()).map_err(|error| Broke::Oracle(error.to_string()))?;
+        let bytes = scope.write(blaze_own::testing::heap().alloc()).map_err(|error| Broke::Oracle(error.to_string()))?;
         let buffer = Aligned::copy_from(&bytes);
         let view = ScopeView::read(&buffer).map_err(|error| Broke::Oracle(error.to_string()))?;
-        let back = ScopeBuilder::from(&view, Alloc::global());
+        let back = ScopeBuilder::from(&view, blaze_own::testing::heap().alloc());
         scope.bindings.sort_unstable_by(|a, b| (a.ns, a.name).cmp(&(b.ns, b.name)));
         scope.marks.sort_unstable_by_key(|m| m.child);
         if back != scope {
             return Err(Broke::Oracle(format!("read back otherwise:\n wrote {scope:?}\n read {back:?}")));
         }
-        let again = back.write(Alloc::global()).map_err(|error| Broke::Oracle(error.to_string()))?;
+        let again = back.write(blaze_own::testing::heap().alloc()).map_err(|error| Broke::Oracle(error.to_string()))?;
         match again == bytes {
             true => Ok(()),
             false => Err(Broke::Oracle("the decoded scope writes other bytes".into())),
@@ -211,7 +211,7 @@ fn a_globs_digest_moves_with_every_input_and_nothing_else() {
     let edge = crate::GlobEdge { source: Def { key: key(3), kind: DefKind::Module }, vis: Visibility::Public, expansion: 0 };
     let krate = CrateItemKey(ContentId([7; 32]));
     let chain = [key(1), key(0)];
-    let digest = |edges: &[crate::GlobEdge], chain: &[ItemKey]| crate::globs_digest(edges, krate, chain, Alloc::global());
+    let digest = |edges: &[crate::GlobEdge], chain: &[ItemKey]| crate::globs_digest(edges, krate, chain, blaze_own::testing::heap().alloc());
     let base = digest(&[edge], &chain);
     assert_eq!(base, digest(&[edge], &chain), "a digest is a function of its inputs");
     assert_ne!(base, digest(&[crate::GlobEdge { vis: Visibility::Restricted(key(0)), ..edge }], &chain));
@@ -239,7 +239,7 @@ fn module_decls_round_trip_in_source_order() {
             1 => Rename::To(name(tape)),
             _ => Rename::Underscore,
         };
-        let mut decls = DeclsBuilder::new_in(Alloc::global());
+        let mut decls = DeclsBuilder::new_in(blaze_own::testing::heap().alloc());
         for _ in 0..tape.below(4, "items") {
             let ns = SPACES[usize::try_from(tape.below(3, "ns")).expect("below 3")];
             decls.items.push(DeclaredItem { name: name(tape), ns, def: def(tape), vis: written(tape) });
@@ -272,14 +272,14 @@ fn module_decls_round_trip_in_source_order() {
             decls.calls.push(MacroCallDecl { call: key(160 + n), path: path(tape), kind, pos: 30 + u32::from(n), item });
         }
         let info = ModuleInfo { krate: KRATE, parent: Some(key(199)), name: Some(name(tape)), no_implicit_prelude: tape.coin("nip") };
-        let bytes = decls.write(key(200), &info, Alloc::global()).map_err(|error| Broke::Oracle(error.to_string()))?;
+        let bytes = decls.write(key(200), &info, blaze_own::testing::heap().alloc()).map_err(|error| Broke::Oracle(error.to_string()))?;
         let buffer = Aligned::copy_from(&bytes);
         let view = ModuleDeclsView::read(&buffer).map_err(|error| Broke::Oracle(error.to_string()))?;
-        let back = DeclsBuilder::from(&view, Alloc::global());
+        let back = DeclsBuilder::from(&view, blaze_own::testing::heap().alloc());
         if view.module() != key(200) || view.info() != info || back != decls {
             return Err(Broke::Oracle(format!("read back otherwise:\n wrote {decls:?}\n read {back:?}")));
         }
-        match back.write(key(200), &view.info(), Alloc::global()) {
+        match back.write(key(200), &view.info(), blaze_own::testing::heap().alloc()) {
             Ok(again) if again == bytes => Ok(()),
             Ok(_) => Err(Broke::Oracle("the decoded declarations write other bytes".into())),
             Err(error) => Err(Broke::Oracle(error.to_string())),
@@ -302,7 +302,7 @@ fn a_crate_root_reads_back_sorted_and_refuses_two_crates_of_one_name() {
     let core = Dep { name: "core", krate: CrateItemKey(ContentId([7; 32])), root: key(7) };
     let alloc = Dep { name: "alloc", krate: CrateItemKey(ContentId([8; 32])), root: key(8) };
     let build = |deps: [Dep<&'static str>; 2]| {
-        let mut out = CrateRootBuilder::new_in(head, Alloc::global());
+        let mut out = CrateRootBuilder::new_in(head, blaze_own::testing::heap().alloc());
         for dep in deps {
             out.extern_prelude.push((dep.name, dep.root));
             out.deps.push(dep);
@@ -313,8 +313,8 @@ fn a_crate_root_reads_back_sorted_and_refuses_two_crates_of_one_name() {
         out.macro_exports.push(("m", key(30), MacroShapes::ATTR.with(CallShape::FnLike)));
         out
     };
-    let bytes = build([core, alloc]).write(Alloc::global()).expect("small");
-    assert_eq!(bytes, build([alloc, core]).write(Alloc::global()).expect("small"), "two orders, two records");
+    let bytes = build([core, alloc]).write(blaze_own::testing::heap().alloc()).expect("small");
+    assert_eq!(bytes, build([alloc, core]).write(blaze_own::testing::heap().alloc()).expect("small"), "two orders, two records");
     let buffer = Aligned::copy_from(&bytes);
     let view = CrateRootView::read(&buffer).expect("a written record");
     assert_eq!(view.head(), head);
@@ -322,10 +322,10 @@ fn a_crate_root_reads_back_sorted_and_refuses_two_crates_of_one_name() {
     assert_eq!((view.extern_crate("core"), view.extern_crate("std")), (Some(key(7)), None));
     assert_eq!(view.dep("alloc"), Some(alloc));
     assert!(view.tools().eq(["blaze"]) && view.macro_use().eq([key(7)]));
-    let back = CrateRootBuilder::from(&view, Alloc::global());
-    assert_eq!(back.write(Alloc::global()).expect("small"), bytes, "the decoded root writes other bytes");
+    let back = CrateRootBuilder::from(&view, blaze_own::testing::heap().alloc());
+    assert_eq!(back.write(blaze_own::testing::heap().alloc()).expect("small"), bytes, "the decoded root writes other bytes");
 
-    let mut twice = CrateRootBuilder::new_in(head, Alloc::global());
+    let mut twice = CrateRootBuilder::new_in(head, blaze_own::testing::heap().alloc());
     twice.extern_prelude.extend_from_slice(&[("core", key(7)), ("core", key(8))]);
-    assert!(matches!(twice.write(Alloc::global()).err(), Some(BuildError::Twice { .. })));
+    assert!(matches!(twice.write(blaze_own::testing::heap().alloc()).err(), Some(BuildError::Twice { .. })));
 }

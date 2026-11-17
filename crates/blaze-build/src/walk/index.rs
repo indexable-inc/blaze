@@ -152,8 +152,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             self.b.store(Flags::NONE, p, at.0, at.1, MemAttrs::aligned(3));
             let n = self.b.iconst(Ty::I64, u128::from(len));
             self.b.store(Flags::NONE, n, at.0, at.1 + 8, MemAttrs::aligned(3));
-            self.vals.push(V::Place(at.0, at.1));
-            self.vals.push(i);
+            self.push_val(V::Place(at.0, at.1), None);
+            self.push_val(i, None);
         }
         let abi = self.adts.abi(item).ok_or(BuildError::NoAbi { item })?;
         let apass = self.pass(g_arg, arepr, abi, Some(item))?;

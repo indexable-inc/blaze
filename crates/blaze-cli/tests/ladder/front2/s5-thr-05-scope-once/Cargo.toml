@@ -1,0 +1,4 @@
+[package]
+name = "ladder-s5-thr-05-scope-once"
+version = "0.1.0"
+edition = "2024"

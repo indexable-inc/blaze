@@ -39,7 +39,7 @@ use blaze_ladder::code_records::{
     Builder, CodeKey, CodeStore, EntryView, KeyPlant, MemoryStore, Met, RecordRun, Settings, code_key, code_key_planted, getter_parts,
 };
 use blaze_ladder::refusal::SourceFile;
-use blaze_ladder::run::{NewFront, build_records_new};
+use blaze_ladder::run::{NewFront, OverflowChecks, build_records_new};
 use blaze_ladder::symbols::{decode_instance, encode_instance, fn_symbol_of_name};
 use blaze_own::{AVec, Alloc, Vec as OwnVec};
 use blaze_run::Tier;
@@ -88,20 +88,23 @@ pub extern \"C\" fn main() -> i32 {
 ";
 
 /// What every test builds for: a fixed target and toolchain, nothing of this machine.
-fn builder(tier: Tier) -> Builder {
-    Builder { isa: Isa { lse: true, os: Os::MacOs }, tier, settings: Settings::baseline(OVERFLOW), toolchain: ToolchainId([7; 32]) }
+fn builder(tier: Tier, overflow: OverflowChecks) -> Builder {
+    Builder { isa: Isa { lse: true, os: Os::MacOs }, tier, settings: Settings::baseline(overflow), toolchain: ToolchainId([7; 32]) }
 }
 
-/// The overflow setting every walk here builds with and its records are keyed by: `blaze
-/// run`'s (the dev profile's, D101).
-const OVERFLOW: blaze_build::OverflowChecks = blaze_build::OverflowChecks::On;
+/// The overflow setting `PROGRAM` builds with and its records are keyed by: off, as a no_core
+/// rung not about overflow states in its `[profile.dev]` (D101): `PROGRAM` declares no
+/// `panic_const_*_overflow` lang fn, so its `+` cannot be checked. A rung walk takes the rung's
+/// own setting (`rungs::x::overflow_of`).
+const PROGRAM_OVERFLOW: OverflowChecks = OverflowChecks::Off;
 
-/// The instances `files` (rooted at `src/main.rs`, of `edition`) reach, built into `store`.
-fn walk(files: &[(String, String)], edition: &str, store: &mut dyn CodeStore, tier: Tier) -> Result<(Vec<Met>, String), String> {
+/// The instances `files` (rooted at `src/main.rs`, of `edition`) reach, built into `store`
+/// with overflow checks `overflow` (the walk and the records' key agree on it).
+fn walk(files: &[(String, String)], edition: &str, store: &mut dyn CodeStore, tier: Tier, overflow: OverflowChecks) -> Result<(Vec<Met>, String), String> {
     let views: Vec<SourceFile<'_>> = files.iter().map(|(path, text)| SourceFile { path, text }).collect();
     let shelf = edition.starts_with("blaze-").then(|| format!("{}/.blaze/v2/toolchain", std::env::var("HOME").expect("HOME")));
-    let new = NewFront { package: "ladder", edition, shelf: shelf.as_deref(), overflow: OVERFLOW };
-    let mut run = RecordRun::new(store, builder(tier));
+    let new = NewFront { package: "ladder", edition, shelf: shelf.as_deref(), overflow };
+    let mut run = RecordRun::new(store, builder(tier, overflow));
     build_records_new(&views, "src/main.rs", new, &mut run).map_err(|e| e.to_string())?;
     let summary = run.summary();
     Ok((run.met, summary))
@@ -112,7 +115,7 @@ fn program(text: &str) -> Vec<(String, String)> {
 }
 
 fn walk_program(text: &str, store: &mut dyn CodeStore, tier: Tier) -> (Vec<Met>, String) {
-    walk(&program(text), "2024", store, tier).unwrap_or_else(|e| panic!("the program's records were not built: {e}"))
+    walk(&program(text), "2024", store, tier, PROGRAM_OVERFLOW).unwrap_or_else(|e| panic!("the program's records were not built: {e}"))
 }
 
 fn edition_of(dir: &std::path::Path) -> String {
@@ -206,7 +209,7 @@ fn check_entry(rung: &str, store: &dyn CodeStore, met: &Met, all: &[Met]) -> Res
 fn hello_records_name_targets_by_symbol() {
     let dir = ladder().join("3-hello");
     let mut store = MemoryStore::new_in(Alloc::global());
-    let (met, _) = walk(&sources(&dir), &edition_of(&dir), &mut store, Tier::Fast).unwrap_or_else(|e| panic!("3-hello: {e}"));
+    let (met, _) = walk(&sources(&dir), &edition_of(&dir), &mut store, Tier::Fast, rungs::x::overflow_of(&dir)).unwrap_or_else(|e| panic!("3-hello: {e}"));
     let mut by_symbol = 0;
     let mut c_names = Vec::new();
     for m in &met {
@@ -238,7 +241,7 @@ fn every_rung_records_name_targets_by_symbol() {
     for rung in RUNNING.iter().chain(SUPPORT) {
         let dir = ladder().join(rung);
         let mut store = MemoryStore::new_in(Alloc::global());
-        let met = match walk(&sources(&dir), &edition_of(&dir), &mut store, Tier::Fast) {
+        let met = match walk(&sources(&dir), &edition_of(&dir), &mut store, Tier::Fast, rungs::x::overflow_of(&dir)) {
             Ok((met, _)) => met,
             Err(e) => {
                 refused.push(format!("{rung}: {e}"));
@@ -346,12 +349,15 @@ fn the_tier_moves_every_key() {
     let (optimized, _) = walk_program(PROGRAM, &mut MemoryStore::new_in(Alloc::global()), Tier::Optimized);
     let moved = moved(&fast, &optimized).len();
     for m in &fast {
-        assert_eq!(code_key(&m.parts, &builder(Tier::Fast)), m.key, "`{}`: the walk's key is `code_key` of its parts", m.function);
+        assert_eq!(code_key(&m.parts, &builder(Tier::Fast, PROGRAM_OVERFLOW)), m.key, "`{}`: the walk's key is `code_key` of its parts", m.function);
     }
     // The planted bug: the same oracle over keys made without the tier finds them equal.
     let equal = fast
         .iter()
-        .filter(|m| code_key_planted(&m.parts, &builder(Tier::Fast), KeyPlant::WithoutTier) == code_key_planted(&m.parts, &builder(Tier::Optimized), KeyPlant::WithoutTier))
+        .filter(|m| {
+            code_key_planted(&m.parts, &builder(Tier::Fast, PROGRAM_OVERFLOW), KeyPlant::WithoutTier)
+                == code_key_planted(&m.parts, &builder(Tier::Optimized, PROGRAM_OVERFLOW), KeyPlant::WithoutTier)
+        })
         .count();
     let caught = if equal > 0 { "caught" } else { "MISSED" };
     let line = format!("tier: {moved} of {} keys moved; the planted key without the tier: {caught} ({equal} of {} equal across tiers)", fast.len(), fast.len());
@@ -365,8 +371,8 @@ fn the_tier_moves_every_key() {
 #[test]
 fn the_overflow_setting_moves_every_key() {
     let (met, _) = walk_program(PROGRAM, &mut MemoryStore::new_in(Alloc::global()), Tier::Fast);
-    let with = |overflow| Builder { settings: Settings::baseline(overflow), ..builder(Tier::Fast) };
-    let (on, off) = (with(blaze_build::OverflowChecks::On), with(blaze_build::OverflowChecks::Off));
+    let with = |overflow| builder(Tier::Fast, overflow);
+    let (on, off) = (with(OverflowChecks::On), with(OverflowChecks::Off));
     let moved = met.iter().filter(|m| code_key(&m.parts, &on) != code_key(&m.parts, &off)).count();
     // The planted bug: the same oracle over keys made without the setting finds them equal.
     let equal = met.iter().filter(|m| code_key_planted(&m.parts, &on, KeyPlant::WithoutOverflow) == code_key_planted(&m.parts, &off, KeyPlant::WithoutOverflow)).count();

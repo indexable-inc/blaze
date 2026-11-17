@@ -37,7 +37,7 @@ fn hosted_hello(cx: &Cx, io: Io) -> Status {
 
 fn host(io: Io, grants: &[(&str, &str)]) -> Box<Hosting> {
     let grants = grants.iter().map(|(kind, name)| ((*kind).to_owned(), (*name).to_owned())).collect();
-    Hosting::new(io, vec!["hello".to_owned()], grants, EXCHANGE)
+    Hosting::new(io, vec!["hello".to_owned()], grants, EXCHANGE, blaze_own::testing::heap().shared())
 }
 
 #[test]

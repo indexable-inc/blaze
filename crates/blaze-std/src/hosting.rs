@@ -13,6 +13,7 @@ use alloc::{boxed::Box, string::String, vec::Vec};
 use core::{ffi::c_void, time::Duration};
 
 use blaze_core::{lock::Lock, wait::Deadline};
+use blaze_own::SharedAlloc;
 
 use crate::{
     io::Io,
@@ -204,9 +205,10 @@ impl Record {
     pub const BYTES_MOST: usize = 1 << 24;
 
     /// The record as deterministic CBOR: `[MAGIC, VERSION, [call..]]`, each call
-    /// `[entry, fields.., code, value, back]` with its entry's index first.
-    pub fn write(&self) -> Vec<u8> {
-        let mut out = blaze_own::Vec::new_in(blaze_own::SharedAlloc::global());
+    /// `[entry, fields.., code, value, back]` with its entry's index first; made in `alloc`,
+    /// the caller's (D102).
+    pub fn write<A: core::alloc::Allocator>(&self, alloc: A) -> blaze_own::Vec<u8, A> {
+        let mut out = blaze_own::Vec::new_in(alloc);
         blaze_cbor::array(&mut out, 3);
         blaze_cbor::text(&mut out, Record::MAGIC);
         blaze_cbor::uint(&mut out, Record::VERSION);
@@ -251,7 +253,7 @@ impl Record {
             blaze_cbor::uint(&mut out, called.value);
             blaze_cbor::bytes(&mut out, &called.back);
         }
-        out.as_slice().to_vec()
+        out
     }
 
     /// The record `bytes` hold: every length bounded, the magic, the version and each call's
@@ -381,19 +383,30 @@ pub struct Hosting {
     /// cells, because the program writes it through the table's pointer while this holds it.
     exchange: Box<[core::cell::UnsafeCell<u8>]>,
     exited: Lock<Option<i32>>,
+    /// Where the answers' encodings are made: the host's allocator, handed in by its caller
+    /// (D102).
+    alloc: SharedAlloc<'static>,
     /// A planted bug, only a test's control sets: `write` takes a stream handle it does not
     /// know for standard output.
     planted_stream_unchecked: bool,
 }
 
 impl Hosting {
-    /// A host over `io` giving `args` and `grants`, with an exchange of `exchange_len` bytes.
-    pub fn new(io: Io, args: Vec<String>, grants: Vec<(String, String)>, exchange_len: usize) -> Box<Hosting> {
-        Hosting::holding(io, args, grants, exchange_len, Holding::of(Hold::Real))
+    /// A host over `io` giving `args` and `grants`, with an exchange of `exchange_len` bytes;
+    /// its answers made in `alloc`.
+    pub fn new(io: Io, args: Vec<String>, grants: Vec<(String, String)>, exchange_len: usize, alloc: SharedAlloc<'static>) -> Box<Hosting> {
+        Hosting::holding(io, args, grants, exchange_len, Holding::of(Hold::Real), alloc)
     }
 
     /// [`Hosting::new`], its calls answered as `holding` says.
-    pub fn holding(io: Io, args: Vec<String>, grants: Vec<(String, String)>, exchange_len: usize, holding: Holding) -> Box<Hosting> {
+    pub fn holding(
+        io: Io,
+        args: Vec<String>,
+        grants: Vec<(String, String)>,
+        exchange_len: usize,
+        holding: Holding,
+        alloc: SharedAlloc<'static>,
+    ) -> Box<Hosting> {
         let Holding { hold, dry, ask, fakes } = holding;
         // alloc: once per run, the exchange.
         let exchange = (0..exchange_len).map(|_| core::cell::UnsafeCell::new(0)).collect();
@@ -418,6 +431,7 @@ impl Hosting {
             grants,
             exchange,
             exited: Lock::new("bstd.hosting.exited", None),
+            alloc,
             planted_stream_unchecked: false,
         })
     }
@@ -671,7 +685,7 @@ impl Hosting {
 
     /// `done` encoded at the exchange's start, as the escape answers.
     fn answer_done(&self, done: &blaze_core::Done) -> Answer {
-        let mut out = blaze_own::Vec::new_in(blaze_own::SharedAlloc::global());
+        let mut out = blaze_own::Vec::new_in(self.alloc);
         match crate::guest::codec::write_done(&mut out, done) {
             Some(()) => self.answer_with(&out),
             None => Answer::refused(code::FAILED),
@@ -794,8 +808,7 @@ unsafe extern "C" fn effect(host: *mut c_void, at: usize, len: usize, budget_ns:
             Ok(done) => done,
             Err(_) => return Answer::refused(code::FAILED),
         };
-        let alloc = blaze_own::SharedAlloc::global();
-        let mut out = blaze_own::Vec::new_in(alloc);
+        let mut out = blaze_own::Vec::new_in(hosting.alloc);
         match crate::guest::codec::write_done(&mut out, &done) {
             Some(()) => hosting.answer_with(&out),
             None => Answer::refused(code::FAILED),

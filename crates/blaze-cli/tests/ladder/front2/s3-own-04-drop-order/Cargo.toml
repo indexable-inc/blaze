@@ -1,0 +1,4 @@
+[package]
+name = "ladder-s3-own-04-drop-order"
+version = "0.1.0"
+edition = "2024"

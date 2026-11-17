@@ -45,9 +45,15 @@ pub mod script_unit;
 #[cfg(feature = "runtime")]
 pub mod server;
 #[cfg(feature = "runtime")]
+pub mod spawn_records;
+#[cfg(feature = "runtime")]
+pub mod spawn_route;
+#[cfg(feature = "runtime")]
 pub mod wire;
 
 #[cfg(all(test, feature = "runtime"))]
 mod script_tests;
+#[cfg(all(test, feature = "runtime"))]
+mod spawn_route_tests;
 #[cfg(all(test, feature = "runtime"))]
 mod tests;

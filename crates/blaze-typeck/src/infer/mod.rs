@@ -64,6 +64,8 @@ pub struct InferCtx<'a> {
     foreign: Vec<ForeignClosure, Alloc<'a>>,
     /// Each async block's future this body made, by its def: its expression.
     futures: HashMap<u128, ExprId, Alloc<'a>>,
+    /// Each future of another body this context made (`TyView::CoroutineOf`).
+    foreign_coroutines: Vec<ForeignCoroutine, Alloc<'a>>,
     /// Solver reads (the solver's own log; the body's read list is `Reads`).
     solver_reads: Vec<blaze_solve::Read, Alloc<'a>>,
     /// Solver calls repeated after a fact was filled: the Need rounds inside the context.
@@ -113,6 +115,20 @@ struct ForeignClosure {
     kind: crate::ty::ClosureKind,
 }
 
+/// An async block's future of another body as typeck sees it (`TyView::CoroutineOf`), by the
+/// solver type `mk` made for it: `view` gives it back (the identity's `args` are not in the
+/// solver's list, so the made term finds them, as `ForeignClosure` does).
+#[derive(Clone, Copy, Debug)]
+struct ForeignCoroutine {
+    /// The solver's term `mk` made for it.
+    made: blaze_ty::Ty,
+    owner: ItemKey,
+    ordinal: u32,
+    args: TyList,
+    output: Ty,
+    interior: Ty,
+}
+
 /// A snapshot of the context: the arena's tables and the obligation columns.
 #[derive(Clone, Copy, Debug)]
 pub struct InferSnapshot {
@@ -156,6 +172,7 @@ impl<'a> InferCtx<'a> {
             closures: HashMap::new_in(alloc),
             foreign: Vec::new_in(alloc),
             futures: HashMap::new_in(alloc),
+            foreign_coroutines: Vec::new_in(alloc),
             solver_reads: Vec::new_in(alloc),
             need_rounds: 0,
             #[cfg(test)]
@@ -566,6 +583,17 @@ impl<'a> TypeCtx for InferCtx<'a> {
                 self.foreign.push(ForeignClosure { made: t, owner, ordinal, args, sig, kind });
                 t
             }
+            // A future of another body: its def from its identity alone ("blaze-typeck
+            // coroutine def", coroutine_id.rs), so the owner's record and a caller reading it
+            // name one coroutine; its arguments `[output, interior]` as the body's own form.
+            TyView::CoroutineOf { owner, ordinal, args, output, interior } => {
+                let def = self.terms.bdef(SDef(crate::coroutine_id::coroutine_def(owner, ordinal)));
+                let (o, i) = (self.bty(output), self.bty(interior));
+                let l = self.terms.cx.tys.mk_list(&[o.arg(), i.arg()]);
+                let t = self.terms.cx.tys.coroutine(def, l);
+                self.foreign_coroutines.push(ForeignCoroutine { made: t, owner, ordinal, args, output, interior });
+                t
+            }
             // `Coroutine(def, [output, interior])`; its def a hash of the block's expression, as
             // a closure's (one per block of this body; the owner's key separates bodies).
             TyView::Future(e, output, interior) => {
@@ -694,6 +722,10 @@ impl<'a> TypeCtx for InferCtx<'a> {
             }
             TyKind::Coroutine(d, l) => {
                 let k = def_of(tys.item_key(d));
+                let made = self.bty(t);
+                if let Some(f) = self.foreign_coroutines.iter().find(|f| f.made == made) {
+                    return TyView::CoroutineOf { owner: f.owner, ordinal: f.ordinal, args: f.args, output: f.output, interior: f.interior };
+                }
                 let Some(&e) = self.futures.get(&k) else { panic!("blaze-typeck: a future this body did not make") };
                 if tys.list_len(l) != 2 {
                     panic!("blaze-typeck: a future without its output and interior")

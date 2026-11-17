@@ -85,6 +85,12 @@ pub struct Fx {
     /// Closures of other bodies (`PNode::Closure`): owner, ordinal, kind and signature (a
     /// `FnPtr` of `t` in the owner's parameters), as the owner's check records them.
     pub closures: Vec<(ItemKey, u32, crate::ty::ClosureKind, PTy)>,
+    /// Opaque types' hidden types, as their defining bodies' records hold them
+    /// (`Checked::hidden`): what `opaque_hidden` answers; an opaque without a row is `None`.
+    pub hidden: Vec<(ItemKey, PTy)>,
+    /// Async blocks of other bodies (`PNode::Coroutine`): owner, ordinal, output and
+    /// interior (of `t`, in the owner's parameters), as the owner's check records them.
+    pub coroutines: Vec<(ItemKey, u32, PTy, PTy)>,
     fns: Vec<FnRow>,
     adts: Vec<AdtRow>,
     traits: Vec<TraitRow>,
@@ -137,7 +143,7 @@ fn shape_of(t: PTys<'_>, p: PTy) -> Option<Shape> {
         PNode::FnDef(k, _) => Shape::FnDef(k),
         PNode::FnPtr(l, _) => Shape::FnPtr(l.len.saturating_sub(1)),
         PNode::Opaque(k, _) => Shape::Opaque(k),
-        PNode::Closure { .. } | PNode::Future(..) => Shape::Closure,
+        PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => Shape::Closure,
         PNode::Param(_) | PNode::Alias { .. } | PNode::Infer | PNode::Error => return None,
         PNode::ConstValue { .. } | PNode::ConstParam(_) => return None,
         PNode::Dynamic(l) => Shape::Dynamic(match t.list(l).ok().and_then(|r| r.first()) {
@@ -159,6 +165,8 @@ impl Fx {
             names: Vec::new(),
             opaques: Vec::new(),
             closures: Vec::new(),
+            hidden: Vec::new(),
+            coroutines: Vec::new(),
             fns: Vec::new(),
             adts: Vec::new(),
             traits: Vec::new(),
@@ -660,6 +668,7 @@ impl Fx {
     pub fn sig_of(&self, item: ItemKey) -> Option<FnSig<'_>> {
         self.fn_row(item).map(|f| FnSig { parent_count: f.parent, own_count: f.own, declared_count: f.own - f.anon, self_param: f.self_param,
         header: f.header,
+        c_variadic: false,
         inputs: &f.inputs,
         output: f.output,
         types: self.t.view(), })
@@ -866,6 +875,7 @@ impl World for Fx {
     fn fn_sig(&self, _: Seal, item: ItemKey) -> Fetch<Option<FnSig<'_>>> {
         Ok(self.fn_row(item).map(|f| FnSig { parent_count: f.parent, own_count: f.own, declared_count: f.own - f.anon, self_param: f.self_param,
         header: f.header,
+        c_variadic: false,
         inputs: &f.inputs,
         output: f.output,
         types: self.t.view(), }))
@@ -955,8 +965,16 @@ impl World for Fx {
         Ok(None)
     }
 
-    fn opaque_hidden(&self, _: Seal, _: ItemKey) -> Fetch<Option<Hidden<'_>>> {
-        Ok(None)
+    fn opaque_hidden(&self, _: Seal, item: ItemKey) -> Fetch<Option<Hidden<'_>>> {
+        Ok(self.hidden.iter().find(|r| r.0 == item).map(|r| Hidden { ty: r.1, types: self.t.view() }))
+    }
+    /// The [`Fx::coroutines`] row: the facts another body's check recorded.
+    fn coroutine(&self, _: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<crate::world::CoroutineFacts<'_>>> {
+        Ok(self.coroutines.iter().find(|r| r.0 == owner && r.1 == ordinal).map(|r| crate::world::CoroutineFacts {
+            output: r.2,
+            interior: r.3,
+            types: self.t.view(),
+        }))
     }
     /// The [`Fx::closures`] row: the facts another body's check recorded.
     fn closure(&self, _: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<crate::world::ClosureFacts<'_>>> {
@@ -1309,6 +1327,7 @@ impl Bb {
             opt_types: &self.opt_types,
             fmt_uses: &self.fmt_uses,
             coroutine: self.coroutine,
+            super_lets: &[],
         }
     }
 
@@ -1426,6 +1445,7 @@ pub fn show(fx: &Fx, t: PTys<'_>, p: PTy) -> String {
         }
         PNode::Closure { owner, ordinal, args } => format!("closure#{ordinal} of {}<{}>", fx.name_of(owner), list(args)),
         PNode::Future(e, o, i) => format!("future#{}<{}; {}>", e.0, show(fx, t, o), show(fx, t, i)),
+        PNode::Coroutine { owner, ordinal, args } => format!("coroutine#{ordinal} of {}<{}>", fx.name_of(owner), list(args)),
         PNode::Param(i) => format!("P{i}"),
         PNode::Alias { trait_, name, args } => format!("<{} as {}>::{:x}", list(args), fx.name_of(trait_), name.0),
         PNode::Opaque(k, _) => format!("impl {}", fx.name_of(k)),

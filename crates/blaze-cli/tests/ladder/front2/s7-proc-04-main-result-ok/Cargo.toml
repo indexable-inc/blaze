@@ -1,0 +1,4 @@
+[package]
+name = "ladder-s7-proc-04-main-result-ok"
+version = "0.1.0"
+edition = "2024"

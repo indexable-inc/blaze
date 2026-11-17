@@ -464,7 +464,7 @@ impl<'c, 'n> Reader<'c, 'n> {
                     stack.extend_from_slice(self.list(l)?);
                 }
                 PNode::Opaque(_, _) | PNode::Alias { .. } | PNode::Dynamic(_) => n += 1,
-                PNode::Closure { .. } | PNode::Future(..) => return Err(LifeRefusal::TypeNode),
+                PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => return Err(LifeRefusal::TypeNode),
                 _ => {}
             }
         }

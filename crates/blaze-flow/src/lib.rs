@@ -24,7 +24,10 @@ pub mod flow;
 pub mod loans;
 pub mod moves;
 pub mod record;
+pub mod suspend;
 
+#[cfg(test)]
+mod suspend_tests;
 #[cfg(test)]
 mod tests;
 
@@ -35,3 +38,4 @@ pub use flow::{
 pub use loans::{BorrowFinding, TierOne};
 pub use moves::{DropKind, MoveFinding, MoveFindingKind, MoveOut};
 pub use record::{Checked, Record, check};
+pub use suspend::{Saved, saved};

@@ -56,8 +56,10 @@
 //!
 //! # Refused by name
 //!
-//! Unwinding (`invoke`, `resume`, a landing block), `asm_br` and tail calls in a coroutine
-//! body; a cancel path that suspends, returns, or uses a poll's parameter other than the
+//! A `catch` landing block (`catch_unwind`), `asm_br` and tail calls in a coroutine body; a
+//! suspend in a cleanup path (coroutine_unwind.rs: unwinding through a poll, the `Panicked`
+//! tag stored before each `resume`); a cancel path that suspends, returns, or uses a poll's
+//! parameter other than the
 //! state; a resume path that reaches `cancelled`; a compound, scalable or bit-vector value
 //! live across a suspend.
 //!
@@ -75,11 +77,15 @@ use crate::{
     verify::{VerifyError, verify},
 };
 
+#[path = "coroutine_unwind.rs"]
+mod unwind;
+pub use unwind::{Panics, split_with};
+
 /// The tag of a state never polled.
 pub const UNRESUMED: u32 = 0;
 /// The tag of a state whose body returned.
 pub const RETURNED: u32 = 1;
-/// The tag of a state whose poll unwound. Reserved: nothing stores it yet (the design's D6).
+/// The tag of a state whose poll unwound: stored before every `resume` (coroutine_unwind.rs).
 pub const PANICKED: u32 = 2;
 /// The tag of point 0; point `k` is `FIRST_POINT + k`.
 pub const FIRST_POINT: u32 = 3;
@@ -164,6 +170,8 @@ pub enum Plant {
     TagAfterReturn,
     /// The tag of a point resumes at the next point's block.
     ResumeNext,
+    /// A `resume` without `Panicked` stored at the tag first.
+    NoPoisonOnUnwind,
 }
 
 /// Why a body is not split.
@@ -198,6 +206,8 @@ pub enum CoroutineError {
     NotCarried { value: u32, function: Which },
     /// The state, or an output, is past what a 32-bit offset or row names.
     TooLarge,
+    /// A block of [`Panics`] that is no block, the entry, or a landing block.
+    Panics { block: u32 },
 }
 
 impl fmt::Display for CoroutineError {
@@ -233,6 +243,10 @@ impl fmt::Display for CoroutineError {
                 write!(f, "v{value} is used in {function:?}, where nothing makes it and no suspend carries it")
             }
             CoroutineError::TooLarge => f.write_str("the coroutine's state or an output is past 32-bit offsets"),
+            CoroutineError::Panics { block } => write!(
+                f,
+                "block{block} cannot be where `poll` goes on a finished state: no such block, the entry, or a landing block"
+            ),
         }
     }
 }
@@ -242,7 +256,7 @@ impl std::error::Error for CoroutineError {}
 /// Splits the coroutine body `view` into its `poll`, its state's `drop` and the state's
 /// layout, every buffer in `alloc`.
 pub fn split<A: Allocator + Clone>(view: View<'_>, shape: Shape, alloc: A) -> Result<Split<A>, CoroutineError> {
-    split_planted(view, shape, Plant::None, alloc)
+    split_with(view, shape, Panics::NONE, alloc)
 }
 
 /// [`split`] with a planted bug, which only test builds act on.
@@ -252,8 +266,19 @@ pub fn split_planted<A: Allocator + Clone>(
     plant: Plant,
     alloc: A,
 ) -> Result<Split<A>, CoroutineError> {
+    split_planted_with(view, shape, Panics::NONE, plant, alloc)
+}
+
+/// [`split_with`] with a planted bug, which only test builds act on.
+pub fn split_planted_with<A: Allocator + Clone>(
+    view: View<'_>,
+    shape: Shape,
+    panics: Panics,
+    plant: Plant,
+    alloc: A,
+) -> Result<Split<A>, CoroutineError> {
     verify(view).map_err(CoroutineError::Verify)?;
-    let body = read(view, shape, &alloc)?;
+    let body = read(view, shape, panics, &alloc)?;
     let kept = kept_slots(&body, plant, &alloc);
     let crossing = crossing_values(&body, &alloc);
     let plan = plan(&body, &kept, &crossing, &alloc)?;
@@ -278,7 +303,8 @@ struct Body<'a, A: Allocator> {
     shape: Shape,
     /// How many entry parameters: the values `0..entry_params`.
     entry_params: usize,
-    /// Per instruction, its block.
+    /// Per instruction, the block its value is defined in: its own, or for an `invoke` its
+    /// normal block (the verifier's rule).
     block_of: Vec<u32, A>,
     /// Per block, whether `poll` holds it: reached from the entry by any edge but a
     /// suspend's cancel edge.
@@ -288,6 +314,12 @@ struct Body<'a, A: Allocator> {
     in_drop: Vec<bool, A>,
     /// The suspends `poll` holds, by point.
     suspends: Vec<SuspendAt, A>,
+    /// Where `poll` goes on a finished state.
+    panics: Panics,
+    /// The landing blocks of the body's `invoke`s, rising: the cleanup paths' entries.
+    landings: Vec<u32, A>,
+    /// Per block: the `invoke` whose normal block it is, [`NONE`] for another.
+    invoked: Vec<u32, A>,
 }
 
 fn filled<T: Clone, A: Allocator + Clone>(len: usize, item: T, alloc: &A) -> Vec<T, A> {
@@ -319,8 +351,15 @@ fn successors(view: &View<'_>, at: usize, mut f: impl FnMut(Block, bool)) {
             f(o.block(), false);
             f(o.block(), true);
         }
-        // `return`, `trap`, `unreachable`, `cancelled`: no edge. The terminators with other
-        // edges (`invoke`, `asm_br`) are refused by `read` before anything asks.
+        // The normal edge, then the unwind edge.
+        Op::Invoke | Op::InvokeIndirect => {
+            o.word();
+            o.sig();
+            f(o.block(), false);
+            f(o.block(), false);
+        }
+        // `return`, `trap`, `unreachable`, `cancelled`, `resume`: no edge. The one terminator
+        // with other edges (`asm_br`) is refused by `read` before anything asks.
         _ => {}
     }
 }
@@ -369,7 +408,12 @@ fn reach<A: Allocator + Clone>(view: &View<'_>, roots: &[u32], cancel_edges: boo
     seen
 }
 
-fn read<'a, A: Allocator + Clone>(view: View<'a>, shape: Shape, alloc: &A) -> Result<Body<'a, A>, CoroutineError> {
+fn read<'a, A: Allocator + Clone>(
+    view: View<'a>,
+    shape: Shape,
+    panics: Panics,
+    alloc: &A,
+) -> Result<Body<'a, A>, CoroutineError> {
     let blocks = view.blocks();
     let entry_params = view.params(Block(0)).len();
     if shape.state_param as usize >= entry_params || view.ty(Value(shape.state_param)) != Ty::PTR {
@@ -378,18 +422,13 @@ fn read<'a, A: Allocator + Clone>(view: View<'a>, shape: Shape, alloc: &A) -> Re
     if shape.unresumed.index() >= blocks || shape.unresumed.0 == 0 || shape.prefix_align >= 32 {
         return Err(CoroutineError::Shape { unresumed: shape.unresumed.0 });
     }
+    unwind::check_panics(&view, panics)?;
     let mut block_of = filled(view.len(), 0u32, alloc);
     for b in 0..blocks {
-        let range = view.block(Block(b as u32));
-        if view.block_kind(Block(b as u32)).is_landing() {
-            let inst = range.start;
-            return Err(CoroutineError::Refused { inst: inst as u32, op: view.op(inst), why: "a landing block: unwinding is not built" });
-        }
-        for at in range {
+        for at in view.block(Block(b as u32)) {
             block_of[at] = b as u32;
             let op = view.op(at);
             let why = match op {
-                Op::Invoke | Op::InvokeIndirect | Op::Resume => "unwinding is not built",
                 Op::AsmBr => "an `asm!` block with labels is not built",
                 Op::TailCall | Op::TailCallIndirect => "a tail call would return without the `Returned` tag stored",
                 _ => continue,
@@ -397,7 +436,15 @@ fn read<'a, A: Allocator + Clone>(view: View<'a>, shape: Shape, alloc: &A) -> Re
             return Err(CoroutineError::Refused { inst: at as u32, op, why });
         }
     }
-    let in_poll = reach(&view, &[0], false, alloc);
+    // After every instruction's block is set: an invoke's value is defined in its normal
+    // block. Every block reached from a landing block is a cleanup block, which may not
+    // suspend.
+    let unwind::Unwinds { landings, invoked } = unwind::unwinds(&view, &mut block_of, alloc)?;
+    let cleanup = reach(&view, &landings, true, alloc);
+    unwind::no_suspend_in_cleanup(&view, &cleanup)?;
+    // `poll` holds what the entry and the finished-state blocks reach.
+    let (roots, n) = unwind::poll_roots(panics);
+    let in_poll = reach(&view, &roots[..n], false, alloc);
     let mut suspends = Vec::new_in(alloc.clone());
     for b in 0..blocks {
         if !in_poll[b] {
@@ -436,7 +483,7 @@ fn read<'a, A: Allocator + Clone>(view: View<'a>, shape: Shape, alloc: &A) -> Re
             _ => {}
         }
     }
-    Ok(Body { view, shape, entry_params, block_of, in_poll, in_drop, suspends })
+    Ok(Body { view, shape, entry_params, block_of, in_poll, in_drop, suspends, panics, landings, invoked })
 }
 
 /// Per slot, whether the state keeps it: whether at some suspend its address may have been
@@ -523,6 +570,11 @@ fn crossing_values<A: Allocator + Clone>(body: &Body<'_, A>, alloc: &A) -> Vec<b
     for suspend in body.suspends.iter() {
         after[suspend.resume as usize] = true;
         after[suspend.cancel as usize] = true;
+    }
+    // A cleanup path's entry is counted as a cancel block is (ASYNC.md P5): a value live into
+    // it is kept, and loaded there from the state.
+    for &landing in body.landings.iter() {
+        after[landing as usize] = true;
     }
     // Predecessors, in CSR.
     let mut starts = filled(blocks + 1, 0u32, alloc);
@@ -1017,8 +1069,17 @@ impl<A: Allocator + Clone> Emit<'_, '_, A> {
         if op == Op::Return {
             self.store_tag(RETURNED, loc);
         }
+        // An unwind out of a poll leaves the state `Panicked` (coroutine_unwind.rs). Planted
+        // (test builds only): the store left out.
+        if op == Op::Resume && !(cfg!(test) && self.plant == Plant::NoPoisonOnUnwind) {
+            self.store_tag(PANICKED, loc);
+        }
         self.map[at] = self.copy(at);
-        self.spill(at);
+        // An invoke's value is defined in its normal block and stored there
+        // (`spill_invoked`): a store here would follow the terminator.
+        if !matches!(op, Op::Invoke | Op::InvokeIndirect) {
+            self.spill(at);
+        }
     }
 }
 
@@ -1124,9 +1185,17 @@ fn emit<A: Allocator + Clone>(
     let case = |words: &mut Vec<u32, A>, tag: u32, to: u32| words.extend_from_slice(&[tag, to, 0]);
     match which {
         Which::Poll => {
-            // Anything but a state to go on from: resumed after completion.
-            words.extend_from_slice(&[tag, tail, 0, 1 + body.suspends.len() as u32]);
+            // A finished state goes to its block of `Panics` when the builder passed one; it
+            // without one, and any tag that names no state, to the trap.
+            let finished = body.panics.by_tag();
+            let given = finished.iter().filter(|it| it.1.is_some()).count() as u32;
+            words.extend_from_slice(&[tag, tail, 0, 1 + given + body.suspends.len() as u32]);
             case(&mut words, UNRESUMED, e.block_map[0]);
+            for (code, block) in finished {
+                if let Some(block) = block {
+                    case(&mut words, code, e.block_map[block.index()]);
+                }
+            }
             for (i, suspend) in body.suspends.iter().enumerate() {
                 // Planted (test builds only): tag `k` resumes at the next point's block.
                 let from = match cfg!(test) && plant == Plant::ResumeNext {
@@ -1161,6 +1230,9 @@ fn emit<A: Allocator + Clone>(
             for at in params.clone() {
                 e.spill(at);
             }
+        }
+        if body.invoked[b] != NONE {
+            e.spill_invoked(body.invoked[b] as usize);
         }
         for at in params.end..view.block(Block(b as u32)).end {
             e.inst(at);

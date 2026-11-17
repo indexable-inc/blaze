@@ -2,7 +2,7 @@
 //! error, an unresolved import, and the type checker's unknown name with its fix, and of their
 //! closing lines.
 
-use blaze_own::{AString, Alloc};
+use blaze_own::{AString};
 
 use super::plain::{Plain, PlainClosing, View, agent, agent_closing, json, json_closing, view};
 use super::{Counts, Coverage, Edit};
@@ -63,19 +63,19 @@ fn import() -> Plain<'static> {
 }
 
 fn agent_of(plain: &Plain<'_>) -> String {
-    let mut out = AString::new_in(Alloc::global());
+    let mut out = AString::new_in(blaze_own::testing::heap().alloc());
     agent(&mut out, plain).expect("the fix is in its text");
     out.as_str().to_string()
 }
 
 fn json_of(plain: &Plain<'_>) -> String {
-    let mut out = AString::new_in(Alloc::global());
+    let mut out = AString::new_in(blaze_own::testing::heap().alloc());
     json(&mut out, plain).expect("the fix is in its text");
     out.as_str().to_string()
 }
 
 fn closing_of(errors: u32, fixes: &[&str], coverage: Option<Coverage<'_>>, as_json: bool) -> String {
-    let mut out = AString::new_in(Alloc::global());
+    let mut out = AString::new_in(blaze_own::testing::heap().alloc());
     let closing = PlainClosing { counts: Counts { errors, ..Counts::default() }, fixes, coverage, command: "blaze check" };
     match as_json {
         false => agent_closing(&mut out, &closing),

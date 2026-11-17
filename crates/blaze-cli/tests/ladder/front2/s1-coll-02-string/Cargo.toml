@@ -1,0 +1,4 @@
+[package]
+name = "ladder-s1-coll-02-string"
+version = "0.1.0"
+edition = "2024"

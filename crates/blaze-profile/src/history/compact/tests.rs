@@ -6,7 +6,7 @@ fn flushes(build: u64, seqs: std::ops::RangeInclusive<u64>) -> impl Iterator<Ite
 
 #[test]
 fn forty_flushes_make_two_merges_and_leave_eight() {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let files: std::vec::Vec<Name> = flushes(1, 1..=40).collect();
     let merges = plan(&files, None, alloc);
     assert_eq!(merges.len(), 2, "{merges:?}");
@@ -22,7 +22,7 @@ fn forty_flushes_make_two_merges_and_leave_eight() {
 
 #[test]
 fn a_builds_end_merges_each_of_its_tables_into_one_and_no_other_builds() {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let mut files: std::vec::Vec<Name> = flushes(2, 1..=3).collect();
     files.push(Name { build: 2, table: 0, first: 4, last: 19, level: 1 });
     files.extend(flushes(3, 20..=21));
@@ -44,5 +44,5 @@ fn a_merged_file_supersedes_the_lower_files_inside_its_range() {
     files.push(Name { build: 1, table: 0, first: 1, last: 2, level: 1 });
     files.push(Name { build: 1, table: 1, first: 1, last: 1, level: 0 });
     files.push(Name { build: 4, table: 0, first: 2, last: 2, level: 0 });
-    assert_eq!(superseded(&files, Alloc::global()).as_slice(), [0, 1]);
+    assert_eq!(superseded(&files, blaze_own::testing::heap().alloc()).as_slice(), [0, 1]);
 }

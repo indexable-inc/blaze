@@ -720,7 +720,7 @@ impl World {
     /// world's table) loaded through the unit's `Layouts`, depth first.
     #[cfg(test)]
     pub fn read_back(&mut self, name: &str, ty: PTy) -> Result<StdVec<u64>, blaze_build::read_back::ReadBackError> {
-        let alloc = Alloc::global();
+        let alloc = blaze_own::testing::heap().alloc();
         let key = self.eval(name).unwrap_or_else(|e| panic!("{name}: {e}")).key;
         let (mut ground, mut layouts, codes) = self.unit.take().expect("an evaluation made the unit");
         let g = blaze_build::ground(self.fx.t.view(), ty, &[], &mut ground, alloc, &*self).expect("a ground type");

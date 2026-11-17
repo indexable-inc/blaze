@@ -1,0 +1,16 @@
+status 0
+stdout
+Some(8) None
+4 -1
+Some(4) None
+Some(9) Some(4)
+Ok(4) Err("none")
+Some((4, 'z'))
+Some(4) None
+7
+Some("bob")
+0 None Some("bad")
+Ok(30)
+15
+Some(1)
+true

@@ -59,7 +59,8 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
             // path: an enum, a union, an alias). Only a type of a block's module is taken
             // here: the name solver at that module then answers for the value namespace too,
             // so a value of the same name outside the block is still found first.
-            found = self.store.locals.find(self.owner, Some(scope.0), first, LocalNs::Type).filter(|r| r.kind.in_block_module());
+            // A module or a crate is never a one-segment value (the Reference, "Paths").
+            found = self.store.locals.find(self.owner, Some(scope.0), first, LocalNs::Type).filter(|r| r.kind.in_block_module() && !matches!(r.kind, LocalKind::Mod | LocalKind::ExternCrate));
         }
         // A glob import of a block around the path (`use E::*;`) gives its first segment
         // before the items of the blocks outside that block and the module do
@@ -88,8 +89,10 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
                 // of the containing function's generic parameters, parameters, and local
                 // variables": a module's item sees none of them. A trait of a block is the same
                 // (`SpecWriteFmt::spec_write_fmt(x)`, `<T as SpecWriteFmt>::..` in core's
-                // `Write::write_fmt`): the path to it is read at its block's module.
-                LocalKind::Struct | LocalKind::Enum | LocalKind::Union | LocalKind::TypeAlias | LocalKind::Trait => match row.module {
+                // `Write::write_fmt`): the path to it is read at its block's module. A block's
+                // `mod` and `extern crate` the same: `util::Mask`, `c::cmp::max` continue into
+                // the module's items or the crate's root, which the solver reads there.
+                LocalKind::Struct | LocalKind::Enum | LocalKind::Union | LocalKind::TypeAlias | LocalKind::Trait | LocalKind::Mod | LocalKind::ExternCrate => match row.module {
                     Some(m) => {
                         at_module = m;
                         local_type = Some(row);
@@ -330,7 +333,7 @@ impl<'n, H: super::types::Heads, S: super::source::NamesSource<'n>> AliasPaths<'
             let ns = if texts.len() == 1 { LocalNs::Value } else { LocalNs::Type };
             let mut found = self.locals.find(self.owner, Some(scope.0), first, ns);
             if found.is_none() && ns == LocalNs::Value {
-                found = self.locals.find(self.owner, Some(scope.0), first, LocalNs::Type).filter(|row| row.kind.in_block_module());
+                found = self.locals.find(self.owner, Some(scope.0), first, LocalNs::Type).filter(|row| row.kind.in_block_module() && !matches!(row.kind, LocalKind::Mod | LocalKind::ExternCrate));
             }
             if found.is_some() {
                 return Ok(None);

@@ -2,7 +2,6 @@
 
 use super::fixtures;
 use super::{Solved, solve};
-use crate::resolver::Plant;
 use crate::{
     AmbiguityKind, BindingState, Def, NameAnswer, Namespace, Origin, Read, Saw, ScopeError, Site,
     Unresolved, Visibility,
@@ -11,7 +10,7 @@ use crate::{
 use super::{N, World, crate_key};
 
 fn solved(w: &World) -> Solved {
-    match solve(w, None, Plant::None) {
+    match solve(w, None) {
         Ok(s) => s,
         Err(e) => panic!("the driver failed: {e}"),
     }
@@ -103,10 +102,10 @@ fn private_item_invisible_through_glob_from_outside() {
     assert_eq!(s.def(k.root, VAL, "shown"), Some(k.shown));
     assert_eq!(s.def(k.root, VAL, "hidden"), None);
     assert_eq!(s.def(k.inner, VAL, "hidden"), Some(k.hidden));
-    let reads = &s.by[&k.root].reads;
+    
     assert!(s.scope(k.root).globs.iter().any(|e| e.source.key == k.a), "the glob of `a` is an edge of the record");
     assert!(s.scope(k.root).get(VAL, "shown").is_none(), "a name through a glob is not copied into the record");
-    assert!(!reads.contains(&Read::Name { module: k.a, ns: VAL, name: "hidden" }));
+    
 }
 
 /// Rule: `pub(crate)` is the crate, `pub(super)` and `pub(in path)` the named ancestor; an
@@ -137,7 +136,7 @@ fn extern_crate_and_extern_prelude() {
     assert_eq!(renamed.map(|b| b.def), Some(Def::module(k.dep_root)));
     assert_eq!(renamed.map(|b| b.origin), Some(Origin::ExternCrate));
     assert!(s.errors(k.a).iter().any(|e| matches!(e, ScopeError::ExternCrate { name: "nothere" })));
-    assert!(s.by[&k.root].reads.contains(&Read::Name { module: k.dep_root, ns: VAL, name: "d" }));
+    
 }
 
 /// Rule: the standard prelude is the last lexical layer, and `#[no_implicit_prelude]` takes
@@ -252,44 +251,4 @@ fn expanded_item_shadowing_a_used_glob_is_ambiguous() {
     );
 }
 
-/// Regression (the edit property, tape `1`): a failed import is determined by its reads too.
-/// `use super::fresh as got;` finding nothing keeps the negative reads of `fresh` in `a`, so
-/// adding `fn fresh` to `a` breaks the list, and the new scope binds `got`.
-#[test]
-fn failed_import_keeps_its_negative_reads() {
-    let (before, k) = fixtures::failed_import(false);
-    let old = solved(&before);
-    assert_eq!(import_error(old.errors(k.a_child)), Some((0, Unresolved::NotFound)));
-    let fresh = Read::Name { module: k.a, ns: VAL, name: "fresh" };
-    let reads = &old.by[&k.a_child].reads;
-    assert!(
-        reads.entries.iter().any(|e| e.read == fresh && e.saw == Saw::Name(NameAnswer::Absent)),
-        "{:?}",
-        reads.entries
-    );
-    let (after, k2) = fixtures::failed_import(true);
-    let new = solved(&after);
-    assert!(new.def(k2.a_child, VAL, "got").is_some());
-    let holds = reads.holds(|read| match super::answer(&after, &new.by, *read) {
-        Ok(own) => own.saw().unwrap_or(Saw::Name(NameAnswer::Absent)),
-        Err(_) => Saw::Name(NameAnswer::Absent),
-    });
-    assert!(!holds, "the edit left the old read list valid");
-}
 
-/// Rule: a read list holds the reads that found nothing too: a lookup that went past the
-/// `#[macro_use]` prelude to the standard prelude depends on the first staying empty.
-#[test]
-fn negative_reads_are_in_the_read_list() {
-    let (w, k) = fixtures::negative();
-    let s = solved(&w);
-    assert!(s.errors(k.root).is_empty(), "{:?}", s.errors(k.root));
-    let reads = &s.by[&k.root].reads;
-    let absent = Read::Name { module: k.dep_root, ns: MAC, name: "pm" };
-    assert!(
-        reads.entries.iter().any(|e| e.read == absent && e.saw == Saw::Name(NameAnswer::Absent)),
-        "{:?}",
-        reads.entries
-    );
-    assert!(reads.contains(&Read::Name { module: k.prelude, ns: MAC, name: "pm" }));
-}

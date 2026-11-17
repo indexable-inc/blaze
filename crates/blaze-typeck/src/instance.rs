@@ -171,6 +171,11 @@ fn import(cx: &mut InferCtx<'_>, src: &mut dyn ClosureSource, types: PTys<'_>, t
             return src.closure_of(cx, owner, ordinal, args, d);
         }
         PNode::Future(..) | PNode::Infer => return Err(CheckError::Limit(Limit::Export)),
+        // A future of another body imported at ground arguments: its facts are its owner's
+        // check, which this import does not read yet: refused by name, never guessed.
+        PNode::Coroutine { owner, ordinal, .. } => {
+            return Err(CheckError::Malformed(crate::error::Malformed::BodyTypeInRecord(Question::Coroutine(owner, ordinal))));
+        }
     };
     cx.mk(v)
 }
@@ -282,6 +287,10 @@ pub(crate) fn export(cx: &mut InferCtx<'_>, t: Ty, ground: &mut PortableTys<'_>,
             Some(args) => PNode::Closure { owner, ordinal, args },
             None => return Ok(None),
         },
+        TyView::CoroutineOf { owner, ordinal, args, .. } => match export_list(cx, args, ground, d)? {
+            Some(args) => PNode::Coroutine { owner, ordinal, args },
+            None => return Ok(None),
+        },
         TyView::Closure(..)
         | TyView::Future(..)
         | TyView::Param(_)
@@ -339,7 +348,7 @@ pub(crate) fn shape_of(v: TyView, cx: &InferCtx<'_>) -> Option<Shape> {
         TyView::Adt(k, _) => Shape::Adt(k),
         TyView::FnDef(k, _) => Shape::FnDef(k),
         TyView::FnPtr(l, _) => Shape::FnPtr(cx.list_len(l).saturating_sub(1)),
-        TyView::Closure(..) | TyView::ClosureOf { .. } | TyView::Future(..) => Shape::Closure,
+        TyView::Closure(..) | TyView::ClosureOf { .. } | TyView::Future(..) | TyView::CoroutineOf { .. } => Shape::Closure,
         TyView::Opaque(k, _) => Shape::Opaque(k),
         TyView::Dynamic(l) => Shape::Dynamic(principal(cx, l)),
         TyView::Param(_) | TyView::Alias { .. } | TyView::Infer(_) | TyView::Error => return None,
@@ -361,8 +370,11 @@ pub(crate) fn unify_header(
         return Ok(None);
     }
     let mut fresh: Vec<Ty, Alloc<'static>> = Vec::with_capacity_in(h.generics as usize, Alloc::global());
-    for _ in 0..h.generics {
-        fresh.push(cx.fresh(crate::ty::VarKind::Ty)?);
+    // A const parameter's argument is a const (the Reference, "Generic parameters"): each
+    // generic gets a variable of the kind its header uses it as (walk AJ P1).
+    let kinds = crate::impl_kinds::impl_var_kinds(h, Alloc::global())?;
+    for &k in kinds.iter() {
+        fresh.push(cx.fresh(k)?);
     }
     let self_ty = import(cx, &mut NoClosures, h.types,h.self_ty, &fresh, 0)?;
     if !cx.unify(self_ty, cx.list_get(args, 0))? {

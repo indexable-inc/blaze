@@ -2,7 +2,7 @@
 //! all, from the design (one loud thing, three colour places, quiet code, the enclosing scope as
 //! context, the label hung from its span); none is regenerated from the renderer.
 
-use blaze_own::{AString, Alloc};
+use blaze_own::{AString};
 
 use super::words::{Area, say};
 use super::{
@@ -52,8 +52,8 @@ fn draw_fixes(shown: &str, absolute: &str, text: &str, finding: Finding<'_>, cap
     let sources = [Source { shown, absolute, text: text.as_bytes() }];
     let findings = [finding];
     let input = Input { findings: &findings, sources: &sources, link: LINK_FILE, fixes, ids: &[] };
-    let mut out = AString::new_in(Alloc::global());
-    render(&mut out, &input, caps, Alloc::global()).expect("the finding's ranges are in its file");
+    let mut out = AString::new_in(blaze_own::testing::heap().alloc());
+    render(&mut out, &input, caps, blaze_own::testing::heap().alloc()).expect("the finding's ranges are in its file");
     out.as_str().to_string()
 }
 
@@ -68,8 +68,8 @@ fn finding<'a>(severity: Severity, rule: &'a str, message: &'a str, primary: Mar
 
 /// The owner's finding, worded by the table as the CLI words it.
 fn his(caps: Caps) -> String {
-    let mut headline = AString::new_in(Alloc::global());
-    let mut label = AString::new_in(Alloc::global());
+    let mut headline = AString::new_in(blaze_own::testing::heap().alloc());
+    let mut label = AString::new_in(blaze_own::testing::heap().alloc());
     let rule = say(Area::Cli, 2, &["bstd"], &mut headline, &mut label).expect("rule 2 has words");
     let start = MANIFEST.find("bstd").expect("bstd is in the manifest") as u32;
     let primary = Mark { start, end: start + 4, label: label.as_str() };
@@ -436,7 +436,7 @@ fn a_fix_names_a_command_only_where_one_applies_it() {
 
     let line = |fixes| {
         let counts = Counts { warnings: 1, files: 1, fixable: 1, ..Counts::default() };
-        let mut out = AString::new_in(Alloc::global());
+        let mut out = AString::new_in(blaze_own::testing::heap().alloc());
         closing(&mut out, &Closing { counts, checked: 1, nanos: 1_090_000, changed: None, fixes, coverage: None, fix_with: "" }, ansi(80));
         out.as_str().to_string()
     };

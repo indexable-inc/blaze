@@ -19,7 +19,7 @@ use crate::input::{Ask, Bin, CfgAtom, Dep, DepSource, FeatureDef, FeatureValue, 
 use crate::{Pass, Plant, Resolution, UnitError, UnitGraph, UnitKind, record};
 
 fn a() -> Alloc<'static> {
-    Alloc::global()
+    blaze_own::testing::heap().alloc()
 }
 
 fn t(s: &str) -> String<Alloc<'static>> {

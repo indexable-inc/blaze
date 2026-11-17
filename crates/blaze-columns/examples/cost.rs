@@ -61,9 +61,9 @@ fn indices(n: usize, count: usize) -> std::vec::Vec<usize> {
     (0..count).map(|_| rng.below(n)).collect()
 }
 
-fn deflated(bytes: &[u8]) -> usize {
-    let mut out = Vec::new_in(Alloc::global());
-    match blaze_deflate::deflate(bytes, blaze_deflate::Level::Default, Alloc::global(), &mut out) {
+fn deflated(bytes: &[u8], heap: &'static blaze_own::Heap) -> usize {
+    let mut out = Vec::new_in(heap.alloc());
+    match blaze_deflate::deflate(bytes, blaze_deflate::Level::Default, heap.alloc(), &mut out) {
         Ok(()) => out.len(),
         Err(_) => 0,
     }
@@ -74,7 +74,7 @@ fn ns(start: Instant, ops: usize) -> f64 {
     start.elapsed().as_secs_f64() * 1e9 / ops
 }
 
-fn ints_column(name: &str, values: &[u64]) {
+fn ints_column(name: &str, values: &[u64], heap: &'static blaze_own::Heap) {
     let n = values.len();
     let max = values.iter().copied().max().unwrap_or(0);
     let wide = max > u64::from(u32::MAX);
@@ -97,8 +97,8 @@ fn ints_column(name: &str, values: &[u64]) {
         "\n{name}: {n} values, max {max}; plain {} bytes ({} a value), get {plain_get:.2} ns; deflate {} bytes (ratio {:.2}, reference only)",
         plain_bytes.len(),
         if wide { 8 } else { 4 },
-        deflated(&plain_bytes),
-        plain_bytes.len() as f64 / deflated(&plain_bytes).max(1) as f64,
+        deflated(&plain_bytes, heap),
+        plain_bytes.len() as f64 / deflated(&plain_bytes, heap).max(1) as f64,
     );
     let (pfor, plain_for): (usize, usize) =
         values.chunks(BLOCK).map(pfor_estimate).fold((0, 0), |(a, b), (p, f)| (a + p, b + f));
@@ -119,9 +119,9 @@ fn ints_column(name: &str, values: &[u64]) {
     rows.push(("chosen".to_owned(), IntPolicy::RECORD));
     rows.push(("chosen const".to_owned(), IntPolicy::CONSTANT));
     for (label, policy) in rows {
-        let mut bytes = Vec::new_in(Alloc::global());
+        let mut bytes = Vec::new_in(heap.alloc());
         let start = Instant::now();
-        let choice = match encode_ints(values, policy, Alloc::global(), &mut bytes) {
+        let choice = match encode_ints(values, policy, heap.alloc(), &mut bytes) {
             Ok(choice) => choice,
             Err(e) => {
                 println!("  {label:<14} refused: {e}");
@@ -174,7 +174,7 @@ fn ints_column(name: &str, values: &[u64]) {
     }
 }
 
-fn strs_column(name: &str, strs: &[&[u8]]) {
+fn strs_column(name: &str, strs: &[&[u8]], heap: &'static blaze_own::Heap) {
     let n = strs.len();
     let total: usize = strs.iter().map(|s| s.len()).sum();
     let distinct = strs.iter().collect::<std::collections::HashSet<_>>().len();
@@ -188,7 +188,7 @@ fn strs_column(name: &str, strs: &[&[u8]]) {
     for s in strs {
         plain.extend_from_slice(s);
     }
-    let zipped = deflated(&plain);
+    let zipped = deflated(&plain, heap);
     println!(
         "\n{name}: {n} strings, {distinct} distinct, {total} bytes; plain {} bytes (u32 offsets and bytes); deflate {zipped} bytes (ratio {:.2}, reference only)",
         plain.len(),
@@ -206,9 +206,9 @@ fn strs_column(name: &str, strs: &[&[u8]]) {
     rows.push(("chosen".to_owned(), StrPolicy::RECORD));
     let mut buf = std::vec![0u8; 1 << 16];
     for (label, policy) in rows {
-        let mut bytes = Vec::new_in(Alloc::global());
+        let mut bytes = Vec::new_in(heap.alloc());
         let start = Instant::now();
-        let choice = match encode_strs(strs, policy, Alloc::global(), &mut bytes) {
+        let choice = match encode_strs(strs, policy, heap.alloc(), &mut bytes) {
             Ok(choice) => choice,
             Err(e) => {
                 println!("  {label:<14} refused: {e}");
@@ -261,7 +261,7 @@ fn random_id(rng: &mut Rng) -> [u8; 32] {
 /// bytes), synthetic: core's real shape from the scope pipeline's run (406 modules, 102,681
 /// bindings, 253 a module) with a model of repetition (stated in the output), written plain
 /// and as id dictionaries, a record at a time.
-fn scope_ids() {
+fn scope_ids(heap: &'static blaze_own::Heap) {
     const MODULES: usize = 406;
     const BINDINGS: usize = 102_681;
     let mut rng = Rng(0x5eed_0000_0000_0001);
@@ -297,8 +297,8 @@ fn scope_ids() {
         let (mut plain, mut dict) = (0usize, 0usize);
         for (defs, vis) in &records {
             let rows = if pick == 0 { defs } else { vis };
-            let mut bytes = Vec::new_in(Alloc::global());
-            if let Err(e) = encode_ids(rows, Alloc::global(), &mut bytes) {
+            let mut bytes = Vec::new_in(heap.alloc());
+            if let Err(e) = encode_ids(rows, heap.alloc(), &mut bytes) {
                 println!("  {label:<14} refused: {e}");
                 return;
             }
@@ -352,6 +352,7 @@ fn kind_id(kind: &TokenKind, ids: &mut HashMap<String, u64>) -> u64 {
 }
 
 fn main() {
+    let heap = blaze_own::Heap::process();
     let Some(dir) = std::env::args().nth(1) else {
         println!("usage: cost <directory of .rs files>");
         return;
@@ -387,9 +388,9 @@ fn main() {
         names.len(),
         lines.len()
     );
-    strs_column("identifier names", &names);
-    ints_column("identifier offsets", &offsets);
-    ints_column("line lengths", &lines);
-    ints_column("token kinds", &kinds);
-    scope_ids();
+    strs_column("identifier names", &names, heap);
+    ints_column("identifier offsets", &offsets, heap);
+    ints_column("line lengths", &lines, heap);
+    ints_column("token kinds", &kinds, heap);
+    scope_ids(heap);
 }

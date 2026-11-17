@@ -14,7 +14,6 @@ use std::fmt::Debug;
 use std::hint::black_box;
 use std::time::Instant;
 
-use blaze_own::Alloc;
 use blaze_rng::SplitMix64 as Rng;
 use blaze_sort::RadixKey;
 
@@ -130,8 +129,8 @@ fn row(kernel: &str, ty: &str, n: usize, unit: &str, core: f64, ours: f64) {
     println!("{kernel:<16} {ty:<10} {n:>10} {core:>10.2} {ours:>10.2} {:>7.2}x  ns/{unit}", core / ours);
 }
 
-fn table<T: Bench>(sizes: &[usize]) {
-    let alloc = Alloc::global();
+fn table<T: Bench>(sizes: &[usize], heap: &'static blaze_own::Heap) {
+    let alloc = heap.alloc();
     for &n in sizes {
         let mut rng = Rng::new(n as u64 ^ 0x5eed);
         let src: Vec<T> = (0..n).map(|_| T::make(&mut rng)).collect();
@@ -238,8 +237,8 @@ fn cmp_rows<T: Bench + Ord>(sizes: &[usize]) {
 }
 
 /// The sweep the thresholds were set from: each kernel at lengths around them.
-fn threshold<T: Bench>() {
-    let alloc = Alloc::global();
+fn threshold<T: Bench>(heap: &'static blaze_own::Heap) {
+    let alloc = heap.alloc();
     println!("{:<10} {:>6} {:>10} {:>10} {:>10} {:>10} {:>10}", "type", "n", "core", "core-img", "insertion", "msd", "lsd");
     for n in [4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 2048, 4096] {
         let mut rng = Rng::new(n as u64);
@@ -254,21 +253,22 @@ fn threshold<T: Bench>() {
 }
 
 fn main() {
+    let heap = blaze_own::Heap::process();
     let mode = std::env::args().nth(1).unwrap_or_default();
     if mode == "threshold" {
-        threshold::<u32>();
-        threshold::<u64>();
-        threshold::<(u32, u32)>();
+        threshold::<u32>(heap);
+        threshold::<u64>(heap);
+        threshold::<(u32, u32)>(heap);
         return;
     }
     let sizes: &[usize] =
         if mode == "quick" { &[16, 256, 4096, 100_000] } else { &[16, 256, 4096, 100_000, 10_000_000] };
     println!("{:<16} {:<10} {:>10} {:>10} {:>10} {:>8}", "kernel", "type", "n", "core", "blaze", "core/blaze");
-    table::<u32>(sizes);
-    table::<u64>(sizes);
-    table::<(u32, u32)>(sizes);
-    table::<f64>(sizes);
-    table::<Short>(sizes);
+    table::<u32>(sizes, heap);
+    table::<u64>(sizes, heap);
+    table::<(u32, u32)>(sizes, heap);
+    table::<f64>(sizes, heap);
+    table::<Short>(sizes, heap);
     cmp_rows::<u32>(sizes);
     cmp_rows::<u64>(sizes);
 }

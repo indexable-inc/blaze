@@ -120,6 +120,9 @@ pub enum StartError {
 pub(crate) struct Run {
     pub(crate) table: HostTable,
     limits: Limits,
+    /// The program's heap, taken by [`start`], the hosted program's entry (D102): the
+    /// escape's encodings are made in it.
+    heap: &'static blaze_own::Heap,
     /// Made in place at the first use ([`Run::later`]); initialised exactly when `made`.
     later: UnsafeCell<MaybeUninit<Later>>,
     made: Cell<bool>,
@@ -210,7 +213,7 @@ impl Run {
 
     /// The escape's world, made now if this is its first use.
     pub(crate) fn escape(&self) -> &Escape {
-        self.later().escape.get_or_init(|| Escape::new(self.table, self.limits))
+        self.later().escape.get_or_init(|| Escape::new(self.table, self.limits, self.heap.shared()))
     }
 
     /// Where the run's root task runs ([`Cx::hosted_root`]'s placement).
@@ -385,6 +388,8 @@ pub(crate) struct Guest {
     table: HostTable,
     // alloc: the escaped effects' completions, grown once to the most made between polls.
     done: Vec<Completion>,
+    /// Where an escaped effect's encoding is made: the run's heap ([`Run`]).
+    alloc: blaze_own::SharedAlloc<'static>,
 }
 
 // SAFETY: the table's pointers are the host's for the run. A `Guest` lives only in its run's
@@ -392,8 +397,8 @@ pub(crate) struct Guest {
 unsafe impl Send for Guest {}
 
 impl Guest {
-    pub(crate) fn new(table: HostTable) -> Guest {
-        Guest { table, done: Vec::new() }
+    pub(crate) fn new(table: HostTable, alloc: blaze_own::SharedAlloc<'static>) -> Guest {
+        Guest { table, done: Vec::new(), alloc }
     }
 
     pub(crate) fn write(&mut self, stream: Stream, parts: &[&[u8]]) -> Result<(), WireError> {
@@ -418,8 +423,7 @@ impl Guest {
     }
 
     fn escape(&mut self, effect: Effect) -> (blaze_core::Tag, Done) {
-        let alloc = blaze_own::SharedAlloc::global();
-        let mut bytes = blaze_own::Vec::new_in(alloc);
+        let mut bytes = blaze_own::Vec::new_in(self.alloc);
         let (tag, budget) = match codec::effect(&mut bytes, &effect) {
             Some(it) => it,
             None => return (effect.tag(), failed("this effect is not on the hosted wire yet")),
@@ -675,8 +679,8 @@ pub(crate) mod codec {
     }
 }
 
-/// The run over `table`, checked: its version, size and exchange.
-fn checked(table: *const HostTable) -> Result<Run, StartError> {
+/// The run over `table`, checked: its version, size and exchange; its allocations in `heap`.
+fn checked(table: *const HostTable, heap: &'static blaze_own::Heap) -> Result<Run, StartError> {
     if table.is_null() {
         return Err(StartError::NoTable);
     }
@@ -695,7 +699,7 @@ fn checked(table: *const HostTable) -> Result<Run, StartError> {
     if table.exchange.is_null() || table.exchange_len < EXCHANGE_LEAST {
         return Err(StartError::Exchange { len: table.exchange_len });
     }
-    Ok(Run { table, limits: Limits::USUAL, later: UnsafeCell::new(MaybeUninit::uninit()), made: Cell::new(false) })
+    Ok(Run { table, limits: Limits::USUAL, heap, later: UnsafeCell::new(MaybeUninit::uninit()), made: Cell::new(false) })
 }
 
 /// Whether `main`'s budget is unbounded: decided when bstd is compiled, so the start makes
@@ -710,7 +714,8 @@ const MAIN_UNBOUNDED: bool = MAIN_BUDGET.as_secs() == Duration::MAX.as_secs() &&
 /// hosted [`Io`] (a marker), and the root context, whose placement the run holds. The command
 /// line, the escape's world and the root's frame are made at their first use.
 pub fn start(table: *const HostTable, run: fn(&Cx, Io) -> Status) -> i32 {
-    let this = match checked(table) {
+    // The hosted program's entry: where its heap is taken (D102), as `rt::run`'s is.
+    let this = match checked(table, blaze_own::Heap::process()) {
         Ok(this) => this,
         Err(_) => return i32::from(Status::FAILED.0),
     };

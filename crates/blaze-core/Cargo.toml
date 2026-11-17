@@ -43,6 +43,11 @@ windows-sys = { workspace = true, features = ["Win32_Security_Authorization"] }
 [target.'cfg(blaze_check)'.dependencies]
 blaze-check.workspace = true
 
+[features]
+# `blaze_core::testing::os()` (os.rs): a test's root of real-OS authority, for the crates whose
+# tests make a native driver or world. Turned on in their dev-dependencies only.
+testing = []
+
 [lints]
 workspace = true
 

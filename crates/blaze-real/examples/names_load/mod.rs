@@ -14,7 +14,7 @@ use blaze_manifest::lock::{Lock, LockId, LockSource};
 use blaze_own::{AVec, Alloc};
 use blaze_scope::resolve::{Names, SourceTexts, resolve_crates};
 use blaze_scope::task::Serial;
-use blaze_scope::units::{Origin, UnitCrates, unit_crates};
+use blaze_scope::units::{Member, Origin, UnitCrates, unit_crates};
 use blaze_toolchain::{Shelf, ToolchainView};
 use blaze_unit_graph::{Ask, CfgAtom, Package, Pass, Records, Resolution, Resolver, StoreSources, TargetDesc};
 
@@ -468,12 +468,15 @@ pub fn load(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts:
     let resolver = Resolver::of(written, ws.root_edition).map_err(|_| LoadError::Layout(format!("unknown resolver {written:?}")))?;
     let mut roots = AVec::new_in(alloc);
     let mut member_ids: Vec<LockId> = Vec::new();
+    let mut members: Vec<Member<'static>> = Vec::new();
     let mut member_dirs: BTreeMap<u32, PathBuf> = BTreeMap::new();
     let mut facts = Vec::new();
     for m in ws.members.iter() {
         let Some(id) = lock.named(&m.name).find(|id| matches!(lock.package(*id).source, LockSource::Path)) else { continue };
         roots.push(id);
         member_ids.push(id);
+        let dir: &'static str = Box::leak(m.dir.as_str().to_owned().into_boxed_str());
+        members.push(Member::new(id, dir).map_err(|e| LoadError::Crates(e.to_string()))?);
         member_dirs.insert(id.0, root.join(m.dir.as_str()));
         facts.push((id, Package::from_member(m, alloc)));
     }
@@ -514,7 +517,7 @@ pub fn load(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts:
     // script's `rustc-cfg` atoms are part of the cfg the crate's names are resolved under
     // (nix's `apple_targets`, rustix's `libc`, curve25519-dalek's `curve25519_dalek_bits="64"`)
     // and of its key.
-    let mut unit_list = unit_crates(graph, lock, &member_ids, view, TRIPLE, alloc).map_err(|e| LoadError::Crates(e.to_string()))?;
+    let mut unit_list = unit_crates(graph, lock, &members, view, TRIPLE, alloc).map_err(|e| LoadError::Crates(e.to_string()))?;
     let script_list = script_records(scripts, graph, &unit_list)?;
     unit_list.join_scripts(&script_list).map_err(|e| LoadError::Crates(e.to_string()))?;
     let crates = leak(unit_list);

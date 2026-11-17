@@ -25,7 +25,7 @@ blaze-own.workspace = true
 
 [dev-dependencies]
 # `Alloc::global()`, for tests and the cost example.
-blaze-own = { workspace = true, features = ["std"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
 # `check` and `control`: the properties in `src/tests.rs`.
 blaze-sim.workspace = true
 

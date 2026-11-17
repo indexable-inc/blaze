@@ -223,7 +223,10 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let t = self.adjusted_ty(scrutinee)?;
         let g = self.ground_ty(t).map_err(|error| Self::ty_err(scrutinee, error))?;
         if self.needs_drop(g).map_err(|error| Self::ty_err(scrutinee, error))? {
-            let local = self.local_of(scrutinee)?.is_some() && self.adjust_rows(scrutinee).is_empty();
+            // A local, or a field of one it owns (walk/moves/field_scrutinee.rs): the local's
+            // place, dropped where the local is.
+            let local = (self.local_of(scrutinee)?.is_some() && self.adjust_rows(scrutinee).is_empty())
+                || self.owned_field_scrutinee(scrutinee)?.is_some();
             // A place behind a pointer is tested where it is and owned by no one here
             // (walk/moves.rs `scrutinee_in_place`; a by-value binding of a part that needs
             // drop is refused by `move_out`).

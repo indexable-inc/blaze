@@ -91,6 +91,8 @@ video = [
 
 [dev-dependencies]
 blaze-sim.workspace = true
+# `blaze_own::testing::heap()`: a test's root allocator capability (D102).
+blaze-own = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

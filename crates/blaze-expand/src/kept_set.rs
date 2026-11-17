@@ -9,7 +9,7 @@
 //! ```text
 //! head      magic (8)  count (u32)  atoms (u32)  atom text length (u32)  ids (u32)
 //!           each column's byte length (u32 x COLS)
-//! keys      count x 32: the text keys, ascending, no two equal
+//! keys      count x 32: the call keys, ascending, no two equal
 //! rows      count x COLS x u32: where entry i ends in each column (it starts where i-1 ends)
 //! atoms     the token atom table of [`crate::atoms`] (the one home of the token row form):
 //!           atoms x ATOM bytes (word, text end, suffix length), each distinct token once, in
@@ -44,7 +44,7 @@ use crate::{
     atoms::{ATOM, Atoms, AtomsBuilder, AtomsError},
     expansion::Expansion,
     kept::{AskedIter, KeptEntry, KeptError},
-    key::TextKey,
+    key::CallKey,
     record::{COLUMNS, RecordColumn, RecordError, ctx_of, edition_of, token_of},
     tokens::{Ctx, CtxNode, DefSite, Mark, MarkOf, TokenKind, TokenStream, Transparency, index},
 };
@@ -212,14 +212,14 @@ impl<'k> KeptSet<'k> {
     }
 
     /// The key at `index`, in ascending order.
-    pub fn key(&self, index: usize) -> TextKey {
+    pub fn key(&self, index: usize) -> CallKey {
         let mut key = [0u8; KEY];
         key.copy_from_slice(&self.keys[index * KEY..(index + 1) * KEY]);
-        TextKey(ContentId(key))
+        CallKey(ContentId(key))
     }
 
     /// Where `key` is in the key table: a binary search over the fixed-width keys.
-    pub fn position(&self, key: &TextKey) -> Option<usize> {
+    pub fn position(&self, key: &CallKey) -> Option<usize> {
         let (mut low, mut high) = (0usize, self.count);
         while low < high {
             let mid = low + (high - low) / 2;
@@ -261,7 +261,7 @@ impl<'k> KeptSet<'k> {
     }
 
     /// The entry kept under `key`.
-    pub fn find(&self, key: &TextKey) -> Result<Option<SetEntry<'k>>, KeptError> {
+    pub fn find(&self, key: &CallKey) -> Result<Option<SetEntry<'k>>, KeptError> {
         match self.position(key) {
             Some(index) => self.entry(index).map(Some),
             None => Ok(None),
@@ -510,7 +510,7 @@ fn gather<'s>(source: SetSource<'s>, index: usize, uses: &mut Uses<'_>) -> Resul
 
 /// Whether two expansions under one key are one value: equal entry bytes, one kept entry, or
 /// (a made one beside a kept one) equal asked atoms and equal expansions, decoded in `alloc`.
-fn same(key: TextKey, a: SetSource<'_>, b: SetSource<'_>, alloc: Alloc<'_>) -> Result<bool, KeptError> {
+fn same(key: CallKey, a: SetSource<'_>, b: SetSource<'_>, alloc: Alloc<'_>) -> Result<bool, KeptError> {
     match (a, b) {
         (SetSource::Entry(x), SetSource::Entry(y)) => return Ok(x == y),
         (SetSource::Kept(x), SetSource::Kept(y)) if x.index == y.index => return Ok(true),
@@ -594,18 +594,18 @@ fn put_leb(out: &mut AVec<'_, u8>, value: u64) -> Result<(), KeptError> {
 /// [`KeptError::OutOfMemory`]): sorted here by key, so the bytes do not depend on the order the
 /// entries were made in. Two entries of one key with one value are one; with different values,
 /// [`KeptError::TwoValues`].
-pub fn write_set<'b>(entries: &mut [(TextKey, SetSource<'_>)], alloc: Alloc<'b>) -> Result<AVec<'b, u8>, KeptError> {
+pub fn write_set<'b>(entries: &mut [(CallKey, SetSource<'_>)], alloc: Alloc<'b>) -> Result<AVec<'b, u8>, KeptError> {
     write_set_planted(entries, SetPlant::None, alloc)
 }
 
 /// [`write_set`] with a planted bug, for the test that must catch it.
 pub fn write_set_planted<'b>(
-    entries: &mut [(TextKey, SetSource<'_>)],
+    entries: &mut [(CallKey, SetSource<'_>)],
     plant: SetPlant,
     alloc: Alloc<'b>,
 ) -> Result<AVec<'b, u8>, KeptError> {
     entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    let mut keys: AVec<'b, TextKey> = Vec::new_in(alloc);
+    let mut keys: AVec<'b, CallKey> = Vec::new_in(alloc);
     let mut shapes: AVec<'b, Shape<'_>> = Vec::new_in(alloc);
     let mut uses = Uses {
         atoms: AtomsBuilder::new_in(alloc, ATOM_SEED),

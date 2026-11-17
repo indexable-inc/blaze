@@ -114,7 +114,7 @@ unsafe extern "C" fn enter(function: usize, argument: *const c_void, jump: *mut 
 /// own code, which this run abandons, and [`stopped`]'s, which holds nothing).
 #[cfg(target_arch = "aarch64")]
 #[unsafe(naked)]
-unsafe extern "C" fn leave(jump: *const Jump, value: u64) -> ! {
+pub(crate) unsafe extern "C" fn leave(jump: *const Jump, value: u64) -> ! {
     core::arch::naked_asm!(
         "ldp x19, x20, [x0, #0]",
         "ldp x21, x22, [x0, #16]",
@@ -149,6 +149,12 @@ pub struct Stops {
 impl Stops {
     pub fn new(said: Box<[Box<str>]>) -> Stops {
         Stops { jump: UnsafeCell::new(Jump([0; 21])), thread: AtomicUsize::new(0), said }
+    }
+
+    /// The buffer [`leave`] returns through: crate::trap's handler resumes a trapped run's
+    /// thread at `leave` with it, as a stub's stop does.
+    pub(crate) fn jump(&self) -> *mut Jump {
+        self.jump.get()
     }
 
     /// Calls the program's entry `function(argument)` on this thread: what it returned, or

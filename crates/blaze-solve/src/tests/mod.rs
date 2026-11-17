@@ -61,7 +61,7 @@ fn truth(g: &Fingerprint, cols: Columns<'_>) -> Vec<u32> {
 /// One prefilter case: random columns at a random offset into their buffer (every alignment),
 /// bytes from a small alphabet so matches and wildcards are common.
 fn prefilter_case(t: &Tape) -> Result<(), Broke> {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let len = t.below(300, "impls") as usize;
     let alphabet = 1 + t.below(4, "alphabet");
     let byte = |t: &Tape| -> u8 { t.below(alphabet + 1, "byte") as u8 };
@@ -116,7 +116,7 @@ fn control_prefilter_drops_wildcard() {
 /// Runs the staggered load under strategy `S`; returns each obligation's state and every
 /// chain variable's value.
 fn run_load<S: Strategy>(n: u32, waves: u32, picks: &[u32]) -> Result<(Vec<State>, Vec<u32>, u64), String> {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let mut s = staggered(n, waves, |i| picks[i as usize % picks.len()]).map_err(|e| format!("{e}"))?;
     let mut solver = Solver::new_in(alloc);
     let mut reads = blaze_own::Vec::new_in(alloc);

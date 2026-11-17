@@ -35,6 +35,9 @@ static KEY: AtomicUsize = AtomicUsize::new(0);
 struct Ending {
     me: Mutator,
     rounds: u8,
+    /// The thread's registration with the sampler (sample/register.rs), given back at its end
+    /// before its `Mutator` says it ended.
+    sampled: Option<crate::sample::register::Entered>,
 }
 
 /// The rounds a thread's end waits through: the program's destructors run in the earlier.
@@ -54,7 +57,10 @@ pub fn adopt(shared: &Arc<Shared>) -> Result<Mutator, i32> {
     KEY.store(key as usize + 1, Ordering::Release);
     // One count of the `Arc` is leaked: threads announce to it for the life of the process.
     SHARED.store(Arc::into_raw(Arc::clone(shared)).cast_mut(), Ordering::Release);
-    Ok(shared.birth().begin())
+    let me = shared.birth().begin();
+    // The main thread is sampled for the life of the process (D100 point 4).
+    crate::sample::register::enter_main(me.thread().0);
+    Ok(me)
 }
 
 /// The key's destructor: `ending` is the ending thread's [`Ending`].
@@ -74,7 +80,12 @@ unsafe extern "C" fn ended(ending: *mut c_void) {
     }
     // SAFETY: boxed in `run` and dropped once, here: the `Mutator`'s drop says the thread
     // ended.
-    drop(unsafe { Box::from_raw(ending) });
+    let Ending { me, rounds: _, sampled } = *unsafe { Box::from_raw(ending) };
+    // The sampler stops stopping this thread before the core is told it ended.
+    if let Some(entered) = sampled {
+        crate::sample::register::leave(entered);
+    }
+    drop(me);
 }
 
 /// What a new thread is started with.
@@ -88,8 +99,12 @@ struct Born {
 extern "C" fn run(born: *mut c_void) -> *mut c_void {
     // SAFETY: `born` is the `Born` `create` boxed for exactly this thread.
     let Born { birth, start, arg } = *unsafe { Box::from_raw(born.cast::<Born>()) };
+    let me = birth.begin();
+    // Registered with the sampler (its port or CPU timer, its stack bounds) before a byte of the
+    // program runs on this thread.
+    let sampled = crate::sample::register::enter(me.thread().0);
     // alloc: one `Ending` a thread, freed by the key's destructor as the thread ends.
-    let ending = Box::into_raw(Box::new(Ending { me: birth.begin(), rounds: 0 }));
+    let ending = Box::into_raw(Box::new(Ending { me, rounds: 0, sampled }));
     let key = (KEY.load(Ordering::Acquire) - 1) as libc::pthread_key_t;
     // SAFETY: the key was made by `adopt` before any thread could be created through
     // `create`; the value is this thread's own.

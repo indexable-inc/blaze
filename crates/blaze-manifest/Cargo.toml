@@ -60,7 +60,7 @@ url = { workspace = true, optional = true }
 
 [dev-dependencies]
 # `Alloc::global()` in tests (the `std` feature), and `expected.json` read for the layout's test.
-blaze-own = { workspace = true, features = ["std"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
 blaze-data.workspace = true
 blaze-json.workspace = true
 blaze-sim.workspace = true

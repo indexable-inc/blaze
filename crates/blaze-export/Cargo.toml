@@ -23,6 +23,9 @@ blaze-own.workspace = true
 blaze-ids = { path = "../blaze-ids" }
 # The code directory's page hashes (Mach-O's ad-hoc signature is SHA-256 by its format).
 blaze-sha256.workspace = true
+# The `bzcode02` code record (`RecordView`, `read`, `from_v1`) and its placer's two shared rules
+# (`page_offset`, `calls`): export at the optimized tier (optimized.rs).
+blaze-tier.workspace = true
 
 [dev-dependencies]
 # `Alloc::global()`, the handle the tests hand every function.

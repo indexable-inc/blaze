@@ -1,5 +1,5 @@
 //! Every fn reachable from a checked body, each lowered, converted and checked in its own env:
-//! a free fn by [`lower_fn`], a member of a trait or an impl by [`lower_member`]. The walk is a
+//! a free fn or a member of a trait or an impl by [`lower_made`]. The walk is a
 //! work list over the checker's callees (no recursion), capped at [`MOST_FNS`]; each fn's
 //! outcome is kept, a failure by its cause's class, so the census is one line and a grouped
 //! list. A call is walked to the body it runs ([`callee_target`]): a trait's method on a concrete
@@ -15,13 +15,13 @@ use blaze_hash::HashMap;
 use blaze_lower::scoped::Prepares;
 use blaze_typeck::{Checked, ItemKey};
 
-use super::body::{Body, BodyError, lower_fn, lower_member};
+use super::body::{Body, BodyError};
+use super::lower_made::{LowerTarget, lower_made};
 use super::check::{BodyScope, CheckFail, Records, Target, callee_target, check_body, item_shown};
-use super::check::{answer_impls, eval_len, make_all, world_at, MOST_ROUNDS};
+use super::check::{make_all, world_at, MOST_ROUNDS};
 use super::keys::checker_of;
 use super::langs::lang_name;
 use blaze_surface::ItemDetail;
-use super::buckets::shape_of;
 use super::heads::HeadError;
 use super::keys::{MemberKind, Origin};
 use blaze_typeck as tc;
@@ -32,6 +32,9 @@ use crate::front::FnLang;
 use super::back_needs::BackNeeds;
 
 mod initializers;
+mod instances;
+
+use self::instances::Instances;
 
 /// The most fns one walk visits (rule 18: a table has a cap), sized by need: a walk reaches
 /// only fns of the program's crates, and the toolchain's core alone holds 29,243 fn heads
@@ -42,8 +45,6 @@ mod initializers;
 /// [`Census::queued`] says how many were still waiting when the cap stopped it.
 pub const MOST_FNS: usize = 65_536;
 
-/// The most array-length constants one body may need evaluated before it lowers (rule 18).
-const MOST_LENS: u32 = 64;
 
 /// What became of one reachable fn.
 #[derive(Debug)]
@@ -82,6 +83,10 @@ pub struct Census<'n> {
     /// and an impl fn an instance resolves to from the trait's fn decided at the call. What a
     /// test's static reach is read from (program/suite.rs `Suite::reach_of`, test.md piece 13).
     pub edges: Vec<(ItemKey, ItemKey), Global>,
+    /// The `(trait fn, self shape)` pairs the instance questions asked, sorted
+    /// (reach/instances.rs): exactly the pairs the walk met, never every trait fn times every
+    /// shape.
+    pub instance_pairs: Vec<(ItemKey, tc::Shape), Global>,
 }
 
 /// The source of every edge the walk takes for the builder's own account (no body names the
@@ -346,7 +351,7 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
             Err(clash) => (clash.key, Some(Reached::Failed { class: Box::from("key clash"), detail: format!("{clash}").into_boxed_str() })),
         });
     }
-    let mut census = Census { fns: Vec::new_in(Global), bodies: Vec::new_in(Global), capped: false, queued: 0, not_followed: 0, edges: Vec::new_in(Global) };
+    let mut census = Census { fns: Vec::new_in(Global), bodies: Vec::new_in(Global), capped: false, queued: 0, not_followed: 0, edges: Vec::new_in(Global), instance_pairs: Vec::new_in(Global) };
     note_edges(&mut census.edges, AMBIENT, &queue, &[]);
     queue.extend(also.iter().map(|&k| (k, None)));
     // What the builder calls on its own for what the reached bodies write, queued as read.
@@ -425,23 +430,13 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
             census.fns.push((k, outcome));
             continue;
         }
-        // A length naming a constant (`[0; HELD]`, or one in a head the body needs) has it
-        // evaluated and the body lowered again, at most `MOST_LENS` times.
-        let mut lens = 0;
-        let lowered = loop {
-            let lowered = match r.keys.library(k) {
-                Some(lib) => lower_fn(r.names, prepared, r.keys, r.store, lib),
-                None => lower_member(r.names, prepared, r.keys, r.store, k),
-            };
-            let c = match &lowered {
-                Err(BodyError::Convert { why: Some(Why::NeedConst(c, _)), .. }) | Err(BodyError::Head { error: HeadError::Item(_, Why::NeedConst(c, _)), .. }) if lens < MOST_LENS => *c,
-                _ => break lowered,
-            };
-            lens += 1;
-            if let Err(e) = eval_len(r, c) {
-                break Err(BodyError::Const { item: c, error: Box::new_in(e, Global) });
-            }
+        // A head or a constant the lowering needs is made and the body lowered again
+        // (front2/lower_made.rs, the one home of that loop).
+        let target = match r.keys.library(k) {
+            Some(lib) => LowerTarget::Free(lib),
+            None => LowerTarget::Member(k),
         };
+        let lowered = lower_made(r, prepared, target);
         let body = match lowered {
             Ok(b) => b,
             Err(BodyError::NoBody(_)) => {
@@ -492,137 +487,10 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
     if !census.capped && inits.round(r, prepared, &firsts, &census.bodies, &mut needs, &mut queue, &mut census.fns, &mut census.edges) {
         continue;
     }
-    if census.capped || !instances.round(r, &firsts, &mut census, &needs, &mut queue) {
+    if census.capped || !instances.round(r, &firsts, &mut census, &needs, &inits.coerced, &mut queue) {
         break;
     }
     }
+    census.instance_pairs = instances.into_pairs();
     census
-}
-
-/// What the back half resolves at an instance, made before the build: for each trait fn the
-/// walk met on a parameter or `dyn` (and `Drop::drop`, which drop glue calls from the type
-/// alone), the impls answering `ImplsOf(trait, shape)` at every shape a checked body's types
-/// have, and each one's fn of that name, walked like any fn. An instance's self type is built
-/// from the types bodies write, so its shape is among theirs: the set is a function of the
-/// program, never of the order the back half asks in (rule 25), and every question it asks is
-/// answered in the same buckets the checker's own questions use.
-#[derive(Default)]
-struct Instances {
-    /// The `(trait, fn, shape)` questions answered so far.
-    asked: HashMap<(ItemKey, Box<str>, tc::Shape), (), Global>,
-    shapes: HashMap<tc::Shape, (), Global>,
-    /// The trait fns decided at the site ([`Reached::AtInstance`], [`Reached::AtObject`]) and
-    /// not walked as a body yet.
-    declared: HashMap<ItemKey, (), Global>,
-    /// How many of the census's bodies (and whether `first`) gave their shapes already.
-    bodies_read: usize,
-    first_read: bool,
-}
-
-impl Instances {
-    /// Queues the impl fns of the questions not asked yet; whether it queued any.
-    /// Each impl fn queued is an edge ([`Census::edges`]) from the trait's fn decided at the
-    /// call, or from [`AMBIENT`] for a question the builder asks on its own (drop glue, an
-    /// overloaded index, `.await`): every entry's reach holds those (a superset, named: drop
-    /// glue's impls are not yet narrowed to the types an entry's bodies hold).
-    fn round(&mut self, r: &mut Records<'_, '_>, firsts: &[&Checked<'_>], census: &mut Census<'_>, needs: &BackNeeds, queue: &mut Vec<(ItemKey, Option<Reached>), Global>) -> bool {
-        let mut add = |tys: tc::PTys<'_>, shapes: &mut HashMap<tc::Shape, (), Global>| {
-            for i in 0..tys.len() {
-                if let Some(s) = shape_of(tys, tc::PTy(i as u32)) {
-                    shapes.insert(s, ());
-                }
-            }
-        };
-        if !self.first_read {
-            self.first_read = true;
-            // A type parameter's question is answered by the blanket impls alone.
-            self.shapes.insert(tc::Shape::Param, ());
-            for first in firsts {
-                add(first.types.view(), &mut self.shapes);
-            }
-        }
-        for (_, c) in &census.bodies[self.bodies_read..] {
-            add(c.types.view(), &mut self.shapes);
-        }
-        self.bodies_read = census.bodies.len();
-        let mut traits: Vec<(ItemKey, Box<str>), Global> = Vec::new_in(Global);
-        for (k, outcome) in census.fns.iter() {
-            if let (Reached::AtInstance | Reached::AtObject, Some(Origin::Member { container, kind: MemberKind::Fn, name })) = (outcome, r.keys.origin(*k)) {
-                traits.push((*container, name.clone()));
-            }
-        }
-        // Every pair from here on is a question the builder asks on its own.
-        let decided = traits.len();
-        if let Some(Ok(drop)) = r.index.lang("drop").map(|lib| r.keys.item(lib)) {
-            traits.push((drop, Box::from("drop")));
-        }
-        // `a[b]` on a type that is not an array or a slice: the builder calls the selected
-        // `Index::index` / `IndexMut::index_mut` impl fn, which no checked body names
-        // (back_needs.rs). Asked only once a reached body writes one.
-        if needs.overloaded_index {
-            for (lang, name) in [("index", "index"), ("index_mut", "index_mut")] {
-                if let Some(Ok(tr)) = r.index.lang(lang).map(|lib| r.keys.item(lib)) {
-                    traits.push((tr, Box::from(name)));
-                }
-            }
-        }
-        // An overloaded dereference: the builder calls the selected `Deref::deref` /
-        // `DerefMut::deref_mut` impl fn (blaze-build walk.rs `deref_call`), which no checked
-        // body names (back_needs.rs `overloaded_deref`).
-        if needs.overloaded_deref {
-            for (lang, name) in [("deref", "deref"), ("deref_mut", "deref_mut")] {
-                if let Some(Ok(tr)) = r.index.lang(lang).map(|lib| r.keys.item(lib)) {
-                    traits.push((tr, Box::from(name)));
-                }
-            }
-        }
-        // `.await`: the builder calls the selected `Future::poll` impl fn of the held future
-        // (back_needs.rs `awaits`). A coroutine's own `poll` is the builder's, no impl's.
-        if needs.awaits
-            && let Some(Ok(tr)) = r.index.lang("future_trait").map(|lib| r.keys.item(lib))
-        {
-            traits.push((tr, Box::from("poll")));
-        }
-        // The questions the builder asks on its own: their impl fns are queued from `AMBIENT`.
-        let mut builder: Vec<(ItemKey, Box<str>), Global> = Vec::new_in(Global);
-        builder.extend(traits[decided..].iter().cloned());
-        traits.sort_unstable();
-        traits.dedup();
-        let mut shapes: Vec<(String, tc::Shape), Global> = Vec::new_in(Global);
-        shapes.extend(self.shapes.keys().map(|s| (format!("{s:?}"), *s)));
-        shapes.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let before = queue.len();
-        for (trait_, name) in traits.iter() {
-            let source = match builder.iter().any(|(t, n)| t == trait_ && n == name) {
-                true => AMBIENT,
-                false => r.keys.filed_member(*trait_, MemberKind::Fn, name).unwrap_or(AMBIENT),
-            };
-            for (_, shape) in shapes.iter() {
-                if self.asked.insert((*trait_, name.clone(), *shape), ()).is_some() {
-                    continue;
-                }
-                // A question whose candidates refused stays a gap: the back half's asking it
-                // refuses by name (`trait_gap`), so nothing here is dropped unseen.
-                let Some(impls) = answer_impls(r, *trait_, *shape) else { continue };
-                let mark = queue.len();
-                for imp in impls {
-                    match r.keys.filed_member(imp, MemberKind::Fn, name) {
-                        Some(m) => queue.push((m, None)),
-                        // The impl leaves the fn out: its instance runs the trait's provided
-                        // body with `Self` the impl's type (the Reference, Traits: "Associated
-                        // functions"), walked once as the trait's own member. A required fn
-                        // left out is the checker's E0046, never reached here.
-                        None => {
-                            let provided = r.keys.filed_member(*trait_, MemberKind::Fn, name);
-                            if let Some(d) = provided.filter(|d| self.declared.contains_key(d) && r.store.fns.get(d).is_some_and(|h| h.has_body)) {
-                                queue.push((d, None));
-                            }
-                        }
-                    }
-                }
-                note_edges(&mut census.edges, source, &queue[mark..], &[]);
-            }
-        }
-        queue.len() > before
-    }
 }

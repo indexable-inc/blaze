@@ -50,14 +50,10 @@ mod again;
 pub mod apart;
 pub mod asked;
 pub mod blocks;
+pub mod expanded_blocks;
 mod builtin;
-// The cell core, stage 1 (bottom.md section 6): no caller until stage 2's seam.
-#[cfg(feature = "cells")]
-#[cfg_attr(not(test), expect(dead_code, reason = "the cell core under construction: the seam comes later"))]
+// The cell core (bottom.md section 6): the names records' one writer.
 mod cells;
-/// The cell core's shadow seam: what its caller gives (a clock) and gets back (a typed report).
-#[cfg(feature = "cells")]
-pub use cells::{DIFFER_SHOWN, Differ as CellsDiffer, SCOPE_FIELDS as CELLS_SCOPE_FIELDS, Seam as CellsSeam, ShadowRefused as CellsRefused, Shadowed as CellsShadowed};
 pub mod crate_env;
 pub mod crate_scope;
 mod error;
@@ -66,7 +62,7 @@ mod facts;
 mod finish;
 pub mod graph;
 mod group;
-mod included;
+pub mod included;
 pub mod items_record;
 mod lookup;
 pub mod names;
@@ -90,14 +86,12 @@ pub use builtin::{BUILTIN_TYPES, Builtin, builtin_of, builtin_type, builtin_type
 pub use error::{GlobBug, ResolveError};
 pub use facts::{Name, RecordFacts, ScopeFacts};
 
-#[cfg(feature = "cells")]
 pub use cells::{ItemResult as CellResult, Outcome as CellOutcome};
 
 /// The cell core (bottom.md section 6) on one crate's module tree under `root`, for measuring
 /// it on real trees: `expand(call, def)` makes the call's expansion, which `facts.expansion`
 /// then hands back (the same hook and facts the old core's fill uses); `visit` is lent every
 /// import's and call's answer at the end.
-#[cfg(feature = "cells")]
 pub fn cells_count<'a, F: ScopeFacts>(
     facts: &F,
     root: blaze_id::ItemKey,

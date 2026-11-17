@@ -13,8 +13,10 @@
 //!   as a pointer to a caller's copy (B.4), and returned through the memory `x8` points to.
 //! - A zero-sized type takes nothing ([`Class::Ignore`]), as GNU C's empty struct.
 //! - Refused by name ([`CAbiError`]): a union, an enum with fields (C has neither in this
-//!   form; `repr(C)` enums of fields are a later piece), an unsized type, an `f128` or a
-//!   `repr(simd)` vector, alone or inside an aggregate (its SIMD register is not built).
+//!   form; `repr(C)` enums of fields are a later piece), an unsized type or a `repr(simd)`
+//!   vector, alone or inside an aggregate (its SIMD register is not built). An `f16` and an
+//!   `f128` are floats (AAPCS64 5.1.2: half and quad precision are fundamental floating-point
+//!   types, one `h` or `q` view of a `v` register each), and HFA members (5.9.5.1).
 //!
 //! # Assignment ([`assign`])
 //!
@@ -55,7 +57,7 @@ pub enum Class {
     Ignore,
     /// An integer or pointer of `size` bytes (1 to 16).
     Int { size: u8, signed: bool },
-    /// A float of `size` bytes (2, 4 or 8).
+    /// A float of `size` bytes (2, 4, 8 or 16).
     Float { size: u8 },
     /// `count` (1 to 4) floats of `size` bytes each.
     Hfa { count: u8, size: u8 },
@@ -97,6 +99,7 @@ fn float_size(p: Prim) -> Option<u8> {
         Prim::F16 => Some(2),
         Prim::F32 => Some(4),
         Prim::F64 => Some(8),
+        Prim::F128 => Some(16),
         _ => None,
     }
 }
@@ -138,13 +141,9 @@ pub fn class_of<A: Allocator + Clone>(ls: &mut Layouts<A>, ty: PTy, cx: &mut Lay
                 Some(AdtKind::Enum) if tl.scalar.is_none() => return Err(refused("an enum with fields")),
                 _ => {}
             },
-            Some(PNode::Float(_)) if tl.size == 16 => return Err(refused("an `f128`")),
             _ => {}
         }
         if let Some(s) = tl.scalar {
-            if s.prim == Prim::F128 {
-                return Err(refused("an `f128`"));
-            }
             members += 1;
             match (float_size(s.prim), float) {
                 (Some(f), None) if members == 1 => float = Some(f),

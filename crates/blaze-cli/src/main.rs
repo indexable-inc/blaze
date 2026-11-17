@@ -35,6 +35,14 @@ mod names;
 mod phases;
 mod print;
 mod program;
+// `blaze run` of a Rust-edition program: in its own process, under the run parent (D103).
+mod own_process;
+// The run parent's sans-IO half; its driver loop waits on the bstd surface its head names.
+#[allow(dead_code, reason = "called once the driver loop lands (run_parent.rs head, NOT HERE 1 to 3)")]
+mod run_parent;
+// The run parent's driver loop over bstd's run child; `run_program` is called from program.rs `run` next.
+#[allow(dead_code, reason = "program.rs `run` calls run_program in the next step (wiring run-parent-io-1, 'Not wired')")]
+mod run_loop;
 mod roster;
 mod seal;
 mod store;
@@ -100,8 +108,11 @@ pub enum CliError {
     Program(RunError),
     /// The program of the command typed did not run.
     Ran { command: &'static str, error: RunError },
-    /// `blaze run` in a package with no binary to run (program.rs): the person's request, not
-    /// blaze's failure to build, so not [`program::NOT_RUN`].
+    /// The run parent could not start or serve the program in its own process (own_process.rs):
+    /// blaze's own failure, so [`program::NOT_RUN`] (L6, D103).
+    OwnProcess(own_process::OwnError),
+    /// `blaze run` in a package with no binary to run (program.rs): a failure before any
+    /// program starts, so [`program::NOT_RUN`] like every other one of `run` (L6).
     NoBinary(program::NoBinary),
     /// A named origin's read path stopped the command (store.rs; a miss is not this).
     Remote(store::RemoteError),
@@ -142,6 +153,7 @@ impl fmt::Display for CliError {
             CliError::Table(full) => write!(f, "{full}"),
             CliError::Program(error) => write!(f, "the program: {error}"),
             CliError::Ran { command, error } => write!(f, "blaze {command}: {error}"),
+            CliError::OwnProcess(error) => write!(f, "{error}"),
             CliError::NoBinary(no) => write!(f, "{no}"),
             CliError::Remote(error) => write!(f, "{error}"),
             CliError::BuildId(error) => write!(f, "{error}: blaze keys every record by its own code and will not run without that id"),
@@ -175,6 +187,8 @@ from!(Missing(Missing), Path(PathError), Fs(FsError), Out(OutError), Drive(Drive
 /// "incomplete" for it (`check_coverage`).
 fn every_rule(rule: u16) -> bool {
     rule != body_types::TYPES_NOT_CHECKED
+        && rule != body_types::BORROWS_NOT_CHECKED
+        && (body_types::BORROWS_ARE_ERRORS || rule != body_types::BORROWS)
 }
 
 /// What follows the command word.
@@ -277,12 +291,24 @@ fn main(cx: &Cx, io: Io) -> Result<Status, Error> {
     let out = io.need_out()?;
     let err = io.need_err()?;
     phases.mark("output handles");
-    // A failure is printed in one place, bstd's exit path (`error: ` and its message).
+    // `run` and `test` start a program: every error of theirs is returned before it starts
+    // (the in-process run returns the program's status as `Ok`), so it is blaze's own.
+    let starts_a_program = io.args().is_some_and(|args| matches!(args.get(1), Some("run" | "test")));
+    // A failure of `check` or `explain` is printed in one place, bstd's exit path (`error: `
+    // and its message), with status 1.
     match command(cx, &io, &out, &err, &mut phases) {
-        // D86: the tool's own failure to build or start the program (or a stub that stopped
-        // it) exits `program::NOT_RUN`, apart from any status the program itself ends with.
-        // The line's form is bstd's exit path's: `error: ` and the message.
-        Err(error @ CliError::Ran { .. }) => {
+        // A trap in the program's placed code (blaze-ladder trap.rs): the PROGRAM's failure,
+        // said in its one line ("the program trapped (`brk #0xff02`, unreachable) in `f` +0x..,
+        // called from ..") and ended with the program's status, never blaze's `NOT_RUN`.
+        Err(CliError::Ran { error: RunError::Trapped { trap }, .. }) => {
+            err.line(cx, format_args!("{trap}")).map_err(|e| Error::from(CliError::Out(e)))?;
+            Ok(Status(blaze_ladder::trap::PROGRAM_TRAPPED))
+        }
+        // D86 and the ladder's L6: any failure of `run` or `test` before the program starts
+        // (manifest, check, build, start, or a stub that stopped it) exits `program::NOT_RUN`,
+        // never 1, which a program's `main` returning `Err` also exits with (std's
+        // `process.rs`, `Termination for Result`). The line's form is bstd's exit path's.
+        Err(error) if starts_a_program || matches!(error, CliError::Ran { .. }) => {
             err.line(cx, format_args!("error: {error}")).map_err(|e| Error::from(CliError::Out(e)))?;
             Ok(Status(program::NOT_RUN))
         }
@@ -431,14 +457,19 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
 /// `check` names what it did not check, and never says `ok` over it (decision D61 item 5).
 #[expect(clippy::too_many_arguments, reason = "the request's parts, each read once")]
 fn close(cx: &Cx, command: Command, finished: &Finished<'_>, shown: &print::Shown<'_>, ran: Option<u8>, in_main: u64, frame: &Frame, out: &Out) -> Result<Status, CliError> {
-    let (ran_stages, not_stages) = check_coverage(finished.names_held, shown.types_unchecked == 0, frame);
+    let (ran_stages, not_stages) = check_coverage(finished.names_held, shown.types_unchecked == 0, shown.borrows_unchecked == 0, frame);
     let coverage = (command == Command::Check && !not_stages.is_empty()).then_some(blaze_report::frame::Coverage { ran: &ran_stages, not: &not_stages });
     if ran.is_none() {
         let tail = (command == Command::Test).then_some("tests are not run yet: this build of blaze checks them");
         print::closing(cx, shown, finished.checked, in_main, Some(finished.answer.profile.runs()), tail, coverage, frame, out)?;
     }
     if shown.counts.errors > 0 || finished.answer.failed > 0 {
-        return Ok(Status::FAILED);
+        // A program that did not run because of what was found is blaze's refusal (L6):
+        // `NOT_RUN`, never 1, a status the program itself could have ended with.
+        return Ok(match (command, ran) {
+            (Command::Run | Command::Test, None) => Status(program::NOT_RUN),
+            _ => Status::FAILED,
+        });
     }
     match command {
         // Nothing found, but a stage `check` is defined to run did not: not a pass.
@@ -501,10 +532,11 @@ pub(crate) const INCOMPLETE: Status = Status(3);
 
 /// The exit statuses `blaze` returns, each with what it means: `blaze explain <status>` prints
 /// one, `blaze explain` all.
-const STATUSES: [(u8, &str); 3] = [
+const STATUSES: [(u8, &str); 4] = [
     (0, "check: every stage `check` is defined to run ran and found nothing (run: the program's own status)"),
-    (1, "an error was found, a task failed, or blaze itself failed (its message says which)"),
+    (1, "check: an error was found, a task failed, or blaze itself failed (its message says which); run: the program's own status"),
     (3, "check: incomplete: the stages this build runs found nothing, but a stage `check` is defined to run is not built yet (the closing line's \"NOT checked\" names which); not a pass"),
+    (125, "run and test: blaze did not start the program (the manifest, a finding, a build or the start failed; its message says which); no program returned it"),
 ];
 
 fn explain(cx: &Cx, asked: Option<&str>, out: &Out) -> Result<Status, CliError> {
@@ -527,11 +559,18 @@ fn explain(cx: &Cx, asked: Option<&str>, out: &Out) -> Result<Status, CliError> 
 /// build does not run, and the names stage when the answer holds no crate's names
 /// (`Finished::names_held`): never a pass printed over a stage that did not run.
 /// `types_whole`: no body said its types were not checked (`print::Shown::types_unchecked`).
-fn check_coverage(names_held: bool, types_whole: bool, frame: &Frame) -> (Vec<&'static str, &Frame>, Vec<&'static str, &Frame>) {
+/// `borrows_whole`: no body said its borrows were not checked (`print::Shown::borrows_unchecked`);
+/// the borrows stage also needs every body's types checked (an ill-typed body is not borrow
+/// checked), and is built only with `body_types::BORROWS_ARE_ERRORS` (work.rs `CHECK_STAGES`).
+fn check_coverage(names_held: bool, types_whole: bool, borrows_whole: bool, frame: &Frame) -> (Vec<&'static str, &Frame>, Vec<&'static str, &Frame>) {
     let mut ran = Vec::new_in(frame);
     let mut not = Vec::new_in(frame);
     for (stage, built) in work::CHECK_STAGES {
-        match built && (names_held || stage != work::NAMES_STAGE) && (types_whole || stage != work::TYPES_STAGE) {
+        match built
+            && (names_held || stage != work::NAMES_STAGE)
+            && (types_whole || stage != work::TYPES_STAGE)
+            && ((types_whole && borrows_whole) || stage != work::BORROWS_STAGE)
+        {
             true => ran.push(stage),
             false => not.push(stage),
         }
@@ -985,8 +1024,7 @@ fn request<'f>(
     // source files and no `CrateScope` standing, found, made or fetched checked no names (no
     // dependency graph's job: a lock that is not there, or a layout read after `Start`).
     let scopes = answer.profile.kinds[blaze_drive::Kind::CrateScope.index()];
-    let names_held = last.is_some() || answer.profile.certified || checked == 0 || scopes.standing + scopes.found + scopes.made + scopes.fetched > 0;
-    Ok(Finished { answer, checked: u32::try_from(checked).unwrap_or(u32::MAX), high, failed, resolved, names_held })
+    let names_held = last.is_some() || answer.profile.certified || checked == 0 || scopes.standing + scopes.found + scopes.made + scopes.fetched > 0;    Ok(Finished { answer, checked: u32::try_from(checked).unwrap_or(u32::MAX), high, failed, resolved, names_held })
 }
 
 const LAST: &str = "a pointer in .blaze/v2/at (its last answer)";
@@ -1781,7 +1819,8 @@ mod tests {
         let last = out.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("");
         assert!(last.contains("incomplete"), "{out}");
         // A narrow line keeps what was NOT checked and drops the rest (blaze-report `closing`).
-        assert!(last.contains("NOT checked: types, borrows") && !last.contains(" ok"), "{last}");
+        // Its bodies' types are checked over records (piece 7): only borrows are left out.
+        assert!(last.contains("NOT checked: borrows") && !last.contains("types") && !last.contains(" ok"), "{last}");
         let io = Io::simulated(SimWorld::new(6, Limits::USUAL));
         write(&io, "Cargo.toml", MANIFEST);
         write(&io, "src/lib.rs", "pub fn f() -> u8 { 1 }\nfn fn\n");
@@ -1808,7 +1847,7 @@ mod tests {
         let words = left_out_note(Command::Run, frame).expect("words").expect("run leaves stages out today");
         assert_eq!(
             words.as_str(),
-            "this build of blaze does not expand macros yet: `run` did read the manifests, fetch the dependencies' sources, parse and check the bodies' syntax, and its program runner did resolve names, check types and generate code in the subset of Rust its front end reads so far"
+            "this build of blaze does not expand macros yet: `run` did read the manifests, fetch the dependencies' sources, parse and check the bodies' syntax and types, and its program runner did resolve names, check types and generate code in the subset of Rust its front end reads so far"
         );
         for command in [Command::Check, Command::Run, Command::Test] {
             let left: std::vec::Vec<&str> = work::left_out(command).collect();
@@ -1935,9 +1974,15 @@ mod tests {
         let fixed = check(&io, SMALL);
         assert!(fixed.failed.is_empty(), "{:?}", fixed.failed);
         // As in `a_planted_panic_fails_one_task`: outline, surface, the names of the library and
-        // of its test unit (4 entries each), and the file's 10 bodies. (16 until 2026-11-16,
-        // when `check` took the test targets: the library's test unit is a crate of its own.)
-        assert_eq!((fixed.runs, made(&fixed.profile, "BodyCheck")), (20, 10), "only the failed file's task runs again, its new surface and its two crates' names:\n{}", fixed.profile);
+        // of its test unit, and every body of the crate: the first run checked none, its names
+        // having failed `Waited` on the oversize file (piece 7, 2026-11-16).
+        assert_eq!(made(&first.profile, "BodyCheck"), 0, "no body is checked over names that failed:\n{}", first.profile);
+        assert_eq!(
+            (made(&fixed.profile, "FileItems"), made(&fixed.profile, "CrateScope"), made(&fixed.profile, "BodyCheck")),
+            (1, 2, u32::try_from(MODULES * 100 + 10).expect("a small count")),
+            "only the failed file's task runs again, its new surface and its two crates' names, and the bodies first checked now:\n{}",
+            fixed.profile
+        );
         let again = check(&io, SMALL);
         assert!(again.certified && again.runs == 0);
     }
@@ -1975,11 +2020,12 @@ mod tests {
         write(&io, "src/m3.rs", &added);
         let item = check(&io, SMALL);
         // Entries, not tasks: the outline, the surface, each of the two crates' `CrateScope`
-        // twice (its first entry answers `Need` of the moved surface, the second resolves),
-        // and every body of the file (its text around the bodies moved, as above).
+        // once (entered after the moved surface settled; 107 until 2026-11-16 17:40, when each
+        // first answered a `Need` of the surface: the order of entries is the schedule's), and
+        // every body of the file (its text around the bodies moved, as above).
         assert_eq!(
             (item.runs, made(&item.profile, "Surface"), made(&item.profile, "CrateScope"), made(&item.profile, "BodyCheck")),
-            (107, 1, 2, 101),
+            (105, 1, 2, 101),
             "a new item runs its file's outline, its surface, its two crates' names (two entries each) and its file's bodies:\n{}",
             item.profile
         );
@@ -2019,16 +2065,19 @@ mod tests {
         let [(path, failure)] = first.failed.as_slice() else { panic!("one failure: {:?}", first.failed) };
         assert_eq!(path.as_deref(), Some("src/m3.rs"));
         assert!(matches!(failure.why, Why::Panicked { .. }), "{failure:?}");
+        // The panicked file's outline failed, so its crate's names (and its test unit's) failed
+        // `Waited`, and so did every body of the crate: a body's types read its crate's names
+        // (body_types.rs), so the first run checked none (since piece 7, 2026-11-16).
+        assert_eq!(made(&first.profile, "BodyCheck"), 0, "no body is checked over names that failed:\n{}", first.profile);
         let fixed = check(&io, SMALL);
         assert!(fixed.failed.is_empty());
-        // The file's outline, its surface, and the names of the library and of its test unit
-        // (a crate of its own since `check` took the test targets, 2026-11-16: 106 runs until
-        // then), failed `Waited` last time: each made fresh in 4 entries (`Need` of the graph,
-        // then of its files' surfaces); and the file's 100 bodies, never listed before.
+        // The file's outline, its surface, and the names of the library and of its test unit,
+        // failed `Waited` last time, are made fresh; and every body of the crate (40 files of
+        // 100 and `big.rs`'s 10), never checked before. No other file's outline is made again.
         assert_eq!(
-            (fixed.runs, made(&fixed.profile, "BodyCheck"), made(&fixed.profile, "FileItems"), made(&fixed.profile, "CrateScope")),
-            (110, 100, 1, 2),
-            "only the panicked file's task runs again, its surface and its two crates' names, never made:\n{}",
+            (made(&fixed.profile, "BodyCheck"), made(&fixed.profile, "FileItems"), made(&fixed.profile, "CrateScope")),
+            (u32::try_from(MODULES * 100 + 10).expect("a small count"), 1, 2),
+            "only the panicked file's task runs again, its surface and its two crates' names, never made, and the bodies first checked now:\n{}",
             fixed.profile
         );
     }
@@ -2073,7 +2122,10 @@ mod tests {
         let whole = check(&io, work::Sizes::USUAL);
         let out = stdout(&io);
         assert!(whole.failed.is_empty(), "{:?}", whole.failed);
-        assert!(out[seen..].contains("NOT checked: types, borrows") && !out[seen..].contains("NOT checked: names"), "{}", &out[seen..]);
+        // The body's record of the first run said "no unit graph" and read the root's units:
+        // the manifest edit moves them, so the body is checked again, not left standing with
+        // the old note (rule 21; the read in body_types.rs `TypesJob::units`).
+        assert!(out[seen..].contains("NOT checked: borrows") && !out[seen..].contains("NOT checked: names") && !out[seen..].contains("types"), "{}\n{}", &out[seen..], whole.profile);
     }
 
     /// A module whose items come from `include!("file")` (blaze-diff's `mod rules_gen {

@@ -14,7 +14,6 @@ use blaze_surface::testing::{Fact, MemSurface};
 use blaze_surface::{Items, NotBuilt, SurfaceError};
 
 use super::{World, fixtures, solve, solve_with};
-use crate::resolver::Plant;
 use crate::{RecordFacts, ResolveError, ScopeBuilder};
 
 /// Every record of `w`'s modules and crates: one surface per crate.
@@ -43,7 +42,7 @@ fn surfaces(w: &World) -> Result<Vec<(CrateItemKey, MemSurface<'static>)>, Strin
 #[test]
 fn every_resolved_scope_round_trips_through_its_record() {
     for (i, w) in fixtures::all().iter().enumerate() {
-        let solved = solve(w, None, Plant::None).unwrap_or_else(|e| panic!("fixture {i}: {e}"));
+        let solved = solve(w, None).unwrap_or_else(|e| panic!("fixture {i}: {e}"));
         let mut by_crate = surfaces(w).unwrap_or_else(|e| panic!("fixture {i}: {e}"));
         for (&module, resolved) in solved.by.iter() {
             let bytes = resolved.scope.write(Alloc::global()).unwrap_or_else(|e| panic!("fixture {i}: {module:x}: {e}"));
@@ -77,8 +76,8 @@ fn record_facts_resolve_as_the_working_forms_do() {
         // keeps the surface for the whole run.
         let mem: &'static MemSurface<'static> = Box::leak(Box::new(mem));
         let facts = RecordFacts::new_in(mem, Alloc::global());
-        let want = solve(w, None, Plant::None).unwrap_or_else(|e| panic!("fixture {i}: {e}"));
-        match solve_with(w, &facts, None, Plant::None) {
+        let want = solve(w, None).unwrap_or_else(|e| panic!("fixture {i}: {e}"));
+        match solve_with(w, &facts, None) {
             Ok(got) => {
                 assert!(got.by == want.by, "fixture {i}: the records resolve otherwise");
                 through_records += 1;
@@ -112,8 +111,8 @@ fn a_record_missing_a_declaration_is_seen() {
     mem.insert(Fact::ModuleDecls, &bytes).unwrap_or_else(|e| panic!("{e}"));
     let mem: &'static MemSurface<'static> = Box::leak(Box::new(mem));
     let facts = RecordFacts::new_in(mem, Alloc::global());
-    let want = solve(&w, None, Plant::None).unwrap_or_else(|e| panic!("{e}"));
-    let got = solve_with(&w, &facts, None, Plant::None).unwrap_or_else(|e| panic!("{e}"));
+    let want = solve(&w, None).unwrap_or_else(|e| panic!("{e}"));
+    let got = solve_with(&w, &facts, None).unwrap_or_else(|e| panic!("{e}"));
     assert!(got.by != want.by, "a record without `bar` resolved as the whole module");
     let bar = |by: &std::collections::BTreeMap<ItemKey, crate::Resolved<'static, super::N>>| {
         by[&k.root].scope.get(crate::Namespace::Values, "bar").map(|b| b.def.key)

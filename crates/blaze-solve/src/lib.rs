@@ -33,6 +33,7 @@ pub mod tys;
 
 // The helpers' modules (solve.md, "Candidates and merging").
 pub mod alias;
+pub mod async_fn;
 pub mod builtin;
 pub mod coherence;
 pub mod structural;

@@ -71,6 +71,7 @@ mod path;
 mod proof;
 mod shape;
 mod through;
+mod through_scratch;
 pub mod tool_attrs;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -126,6 +127,7 @@ pub use crate::shape::{
 pub use crate::through::{
     Asker, MAX_REACHED, Node, Passed, SeenFrom, Sources, Through, merge, through,
 };
+pub use crate::through_scratch::{ThroughScratch, through_in};
 
 #[cfg(test)]
 mod tests;

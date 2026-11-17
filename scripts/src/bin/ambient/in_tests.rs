@@ -193,7 +193,14 @@ pub(super) fn count_tests(root: &Path) -> Result<BTreeMap<String, Vec<TestSite>>
         let (parts, found) = &walked.scanned[at];
         let next: Vec<String> = if beside.contains(&at) {
             let dir = parts[..parts.len() - 1].join("/");
-            found.mods.iter().flat_map(|(name, _)| [format!("{dir}/{name}.rs"), format!("{dir}/{name}/mod.rs")]).collect()
+            found
+                .mods
+                .iter()
+                .flat_map(|decl| match &decl.path {
+                    Some(named) => vec![super::path_file(parts, named)],
+                    None => vec![format!("{dir}/{}.rs", decl.name), format!("{dir}/{}/mod.rs", decl.name)],
+                })
+                .collect()
         } else {
             walked.children.get(&parts.join("/")).cloned().unwrap_or_default()
         };

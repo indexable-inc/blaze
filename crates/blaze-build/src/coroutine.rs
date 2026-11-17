@@ -39,8 +39,10 @@ use crate::layout::NoFacts;
 use super::*;
 
 /// The async blocks of `body` with their ORDINALS: a block's position among its owner body's
-/// `async` blocks in expression order. The one place an ordinal is derived (closure.rs
-/// `closures_in` is its sibling); the expression id never leaves one body's walk.
+/// `async` blocks in expression order (closure.rs `closures_in` is its sibling); the
+/// expression id never leaves one body's walk. The checker names a hidden coroutine by the
+/// SAME rule (`blaze_typeck::coroutine_id::async_ordinal`, `PNode::Coroutine`); this loop is
+/// kept, and tests/coroutine_id_agree.rs asserts the two agree.
 pub fn coroutines_in<'b>(body: &'b BodyView<'_>) -> impl Iterator<Item = (u32, ExprId)> + 'b {
     // An `ExprId` is a `u32`, so every index of `exprs` fits one.
     let ids = body.exprs.iter().enumerate().filter(|(_, x)| matches!(x, Expr::AsyncBlock { .. })).map(|(i, _)| ExprId(i as u32));
@@ -451,7 +453,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let tag = self.b.iconst(shape.tag_ty, u128::from(blaze_lir::coroutine::UNRESUMED));
         // The tag's own alignment is the pass's; a store claims none.
         self.b.store(Flags::NONE, tag, at.0, at.1 + shape.tag_offset as i32, MemAttrs::aligned(0));
-        self.vals.push(V::Place(at.0, at.1));
+        self.push_val(V::Place(at.0, at.1), None);
         Ok(())
     }
 
@@ -689,7 +691,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let hrepr = self.repr(held).map_err(err)?;
         let tpass = Self::rust_pass(trepr)?;
         let hpass = Self::rust_pass(hrepr)?;
-        self.vals.push(v);
+        self.push_val(v, None);
         let place = self.ref_place(into);
         let reference = self.b.reference(RefKind::Func, place);
         self.emit_call(Callee::Direct(reference), &[trepr], &[tpass], hrepr, hpass)?;
@@ -740,8 +742,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let fut = self.address(at);
         let pa = self.b.slot_addr(pin_slot);
         self.store(V::Scalar(fut), Repr::Ptr, (pa, pin_off as i32))?;
-        self.vals.push(V::Place(pa, 0));
-        self.vals.push(V::Scalar(co.cx));
+        self.push_val(V::Place(pa, 0), None);
+        self.push_val(V::Scalar(co.cx), None);
         let place = self.ref_place(poll);
         let reference = self.b.reference(RefKind::Func, place);
         self.emit_call(Callee::Direct(reference), &[prepr, Repr::Ptr], &[ppass, cpass], rrepr, rpass)?;
@@ -791,7 +793,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         if held_drops {
             self.drop_at(held, at)?;
         }
-        self.vals.push(value);
+        self.push_val(value, None);
         Ok(())
     }
 }
@@ -825,11 +827,15 @@ pub(crate) fn build<A: Allocator + Clone>(
         let mut w = Walk::new(&view, checked, &mut *subst, adts, alloc.clone());
         w.scan_flags()?;
         let shape = w.run_coroutine(block)?;
+        // `poll` on a finished state: the library's two panics, when it declares them.
+        let panics = w.coroutine_panics()?;
         let Walk { b, refs, statics, thread_locals, vtables, .. } = w;
-        (b.finish().map_err(lir)?, shape, refs, statics, thread_locals, vtables)
+        (b.finish().map_err(lir)?, (shape, panics), refs, statics, thread_locals, vtables)
     };
-    let split = blaze_lir::coroutine::split(func.view(), shape, alloc.clone()).map_err(BuildError::Coroutine)?;
+    let (shape, panics) = shape;
+    let split = blaze_lir::coroutine::split_with(func.view(), shape, panics, alloc.clone()).map_err(BuildError::Coroutine)?;
     let state = StateShape::of(&split.layout);
+    let niche = crate::niche_of(&split.layout);
     let poll = {
         let mut w = Walk::new(&view, checked, &mut *subst, adts, alloc);
         w.run_poll_entry(block)?;
@@ -840,5 +846,5 @@ pub(crate) fn build<A: Allocator + Clone>(
     };
     let resume = Built { func: split.poll, refs: refs.clone(), statics: statics.clone(), thread_locals: thread_locals.clone(), vtables: vtables.clone() };
     let drop = Built { func: split.drop, refs, statics, thread_locals, vtables };
-    Ok(crate::BuiltCoroutine { poll, resume, drop, state })
+    Ok(crate::BuiltCoroutine { poll, resume, drop, state, niche })
 }

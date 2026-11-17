@@ -19,13 +19,13 @@
 //! - "Temporary scopes": "The pattern-matching condition(s) and consequent body of `if`", "The
 //!   pattern-matching condition and loop body of `while`".
 //!
-//! In a condition nothing needs a drop flag, so nothing is dropped on a failed link: a binding
-//! by value of a part that needs drop is refused by `bind_tested` (so no earlier link holds
-//! one), a scrutinee temporary that needs drop is refused by `tested_place`, and a borrowed
-//! temporary that needs drop in a condition is refused by walk/temps.rs `hold_temp`. A
-//! `let`-`else` owns its scrutinee as a match does (`owned_place`: a temporary joins the
-//! statement's temporaries, the one drop point every temporary has) and drops the statement's
-//! temporaries before its `else` block (`let_else_test`).
+//! A `let` link owns its scrutinee as a match does (`owned_place`: a place is tested where it
+//! is; a temporary that needs drop is held by walk/temps.rs `hold_temp` with a word, and a
+//! by-value binding moves its part out). Where they drop is the condition's region
+//! (lets/scope.rs): its bindings and, in edition 2024, its scrutinee temporaries, dropped after
+//! the consequent in reverse order of creation, or by each failed link before the `else`
+//! block; nothing needs a drop flag but a scrutinee's word. A `let`-`else` drops the
+//! statement's temporaries before its `else` block (`let_else_test`).
 
 use core::alloc::Allocator;
 
@@ -35,6 +35,8 @@ use blaze_typeck::{BinOp, Expr, ExprId, Stmt, StmtId};
 
 use super::{Held, Task, Walk, malformed, unsupported};
 use crate::BuildError;
+
+pub(super) mod scope;
 
 impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// Whether `if` condition `cond` holds a `let`: alone or as a link of an `&&` chain.
@@ -74,7 +76,15 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         }
         let else_block = self.create();
         let join = self.create();
+        // The condition's region (lets/scope.rs): its bindings and, in edition 2024, its
+        // scrutinee temporaries; dropped after the consequent (the region's `ScopeEnd`, then
+        // the temporary scope's end), or by each failed link before the `else` block.
+        let temps = self.if_let_open(e, cond, links.len())?;
         self.work.push(Task::IfThen { expr: e, else_, else_block, join });
+        if temps {
+            self.work.push(Task::TempScopeEnd(cond));
+        }
+        self.work.push(Task::ScopeEnd(then));
         self.work.push(Task::Eval(then));
         for &x in links.iter().rev() {
             match self.expr(x)? {
@@ -105,6 +115,9 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             // A place behind a pointer that needs drop (`if let Reach::Hosted = self.reach`):
             // matched in place, nothing moved (walk/moves.rs `scrutinee_in_place`).
             _ if self.scrutinee_in_place(init)? => self.work.push(Task::Place(init)),
+            // A field of an owned local that needs drop (`if let Some(e) = self.failed`):
+            // matched in place (walk/moves/field_scrutinee.rs).
+            _ if self.owned_field_scrutinee(init)?.is_some() => self.work.push(Task::Place(init)),
             _ => self.work.push(Task::Eval(init)),
         }
         Ok(())
@@ -116,19 +129,41 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let Expr::Let { pat, init } = self.expr(l)? else { return Err(malformed("a `let` link's task on another expression")) };
         let s = self.pop()?;
         let srepr = self.adjusted_repr(init)?;
-        let at = self.tested_place(init, s, srepr, "an `if let` or `while let` on a temporary that needs drop (its drop point is not built)")?;
+        // Owned as a `match`'s scrutinee (`owned_place`, as `let_else_test`): a place is tested
+        // where it is (a local by its own scope, a place behind a pointer by no one here); a
+        // temporary that needs drop joins the condition's region (`hold_temp`, anchored by
+        // lets/scope.rs `let_anchor`) with a word, and a by-value binding moves its part out.
+        // A whole local keeps the place it has (a move out of it is refused by `bind_tested`).
+        let local = self.adjust_rows(init).is_empty() && self.local_of(init)?.is_some();
+        let m = self.matches.len() as u32;
+        let at = self.owned_place(m, init, init, s, srepr)?;
+        // A failed test drops what the region holds at this link, then goes to the `else`.
+        let (to, undo) = self.link_fail(fail)?;
         let pass = self.create();
-        self.test_pat(pat, at, pass, fail)?;
+        self.test_pat(pat, at, pass, to)?;
+        if undo {
+            self.link_fail_end(to, fail)?;
+        }
         self.begin(pass);
-        self.bind_tested(pat, at)
+        if !local {
+            self.move_arm(m, pat, false);
+        }
+        let bound = self.bind_tested(pat, at);
+        self.move_arm_end();
+        bound
     }
 
-    /// `Task::CondLink`: a `bool` link's value on top; false to `fail`.
+    /// `Task::CondLink`: a `bool` link's value on top; false to `fail`, through a block that
+    /// drops what the condition's region holds at this link (lets/scope.rs `link_fail`).
     pub(super) fn cond_link(&mut self, fail: Block) -> Result<(), BuildError> {
         let v = self.pop()?;
         let c = self.cond(v)?;
         let next = self.create();
-        self.br(c, (next, &[]), (fail, &[]));
+        let (to, undo) = self.link_fail(fail)?;
+        self.br(c, (next, &[]), (to, &[]));
+        if undo {
+            self.link_fail_end(to, fail)?;
+        }
         self.begin(next);
         Ok(())
     }

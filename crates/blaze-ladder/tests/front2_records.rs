@@ -327,7 +327,8 @@ fn body_checked_timed<'n, S: NamesSource<'n>>(
     times[1] = start.elapsed();
     let start = Instant::now();
     let mut records = check::Records { names, keys, index, store, buckets, order: BuildOrder::AsAsked, consts: Some((consts, prepared)) };
-    let got = outcome(&check_body(&mut records, &body, &scope));
+    let checked = check_body(&mut records, &body, &scope);
+    let got = format!("{}\nreads filed: {:?}", outcome(&checked), records.store.reads.get(body.owner));
     times[2] = start.elapsed();
     (got, times)
 }

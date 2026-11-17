@@ -27,6 +27,10 @@ use std::{
 
 use crate::busy::while_busy;
 
+// A linked child's spawn: its streams as chosen, its argv[0], its kill at the parent's death.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) mod streams;
+
 #[cfg(test)]
 mod tests;
 
@@ -93,7 +97,7 @@ pub(super) fn spawn_with(
     {
         let procs = procs.map(|path| open(path, libc::O_WRONLY)).transpose()?;
         let joins = procs.as_ref().map_or(-1, |it| it.as_raw_fd());
-        let (pid, pidfd) = while_busy(|| clone(&plan, fds, joins, extra, group))?;
+        let (pid, pidfd) = while_busy(|| clone(&plan, fds, joins, extra, group, 0))?;
         Ok(Spawned { pid, pidfd, stdin, stdout, stderr })
     }
     #[cfg(target_os = "macos")]
@@ -170,10 +174,16 @@ struct Plan {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Plan {
-    /// As std's spawn makes them: `argv[0]` the program as named, the environment with a later
-    /// value of a name replacing an earlier one, in order of name. Its strings go in the
-    /// thread's byte buffer, so only the two arrays of pointers are made per spawn.
+    /// [`Plan::named`] with `argv[0]` the program as named.
     fn new(program: &Program<'_>) -> io::Result<Plan> {
+        Plan::named(program, None)
+    }
+
+    /// As std's spawn makes them: `argv[0]` `arg0` where given, else the program as named; the
+    /// environment with a later value of a name replacing an earlier one, in order of name. Its
+    /// strings go in the thread's byte buffer, so only the two arrays of pointers are made per
+    /// spawn.
+    fn named(program: &Program<'_>, arg0: Option<&OsStr>) -> io::Result<Plan> {
         let nul = |what: &str| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -203,7 +213,8 @@ impl Plan {
         let offset = ptr::without_provenance::<libc::c_char>;
         // alloc: once per spawn, the arguments as the system takes them.
         let mut argv = Vec::with_capacity(program.args.len() + 2);
-        argv.push(offset(push(&mut bytes, &[program.program.as_os_str().as_bytes()], "its name")?));
+        let name = arg0.unwrap_or(program.program.as_os_str());
+        argv.push(offset(push(&mut bytes, &[name.as_bytes()], "its name")?));
         for arg in program.args {
             argv.push(offset(push(&mut bytes, &[arg.as_bytes()], "an argument")?));
         }
@@ -367,6 +378,8 @@ struct Child<'a> {
     extra: &'a [(RawFd, RawFd)],
     /// Whether it leads a process group of its own.
     group: bool,
+    /// This process's pid where the child arms `PR_SET_PDEATHSIG(SIGKILL)`; 0: not armed.
+    parent: libc::pid_t,
     /// The step that failed (0: none) and its errno.
     step: u8,
     failed: libc::c_int,
@@ -379,6 +392,7 @@ fn clone(
     procs: RawFd,
     extra: &[(RawFd, RawFd)],
     group: bool,
+    parent: libc::pid_t,
 ) -> io::Result<(libc::pid_t, OwnedFd)> {
     blaze_mem::scratch::with_bytes(|stack| {
         // alloc: once per thread that spawns, kept: the child's stack, its room unwritten.
@@ -386,7 +400,7 @@ fn clone(
         // SAFETY: `reserve` made the capacity at least `STACK` bytes, so `STACK` bytes from
         // `as_mut_ptr()` are in the allocation, and the thread's byte buffer is lent to this
         // closure alone until it returns, after `clone_on` has.
-        unsafe { clone_on(stack.as_mut_ptr(), plan, fds, procs, extra, group) }
+        unsafe { clone_on(stack.as_mut_ptr(), plan, fds, procs, extra, group, parent) }
     })
 }
 
@@ -404,10 +418,11 @@ unsafe fn clone_on(
     procs: RawFd,
     extra: &[(RawFd, RawFd)],
     group: bool,
+    parent: libc::pid_t,
 ) -> io::Result<(libc::pid_t, OwnedFd)> {
     // It grows down from its end, which both ABIs (x86-64, AArch64) want on 16 bytes.
     let top = stack.wrapping_add(STACK).map_addr(|it| it & !15);
-    let mut child = Child { plan, fds, procs, extra, group, step: 0, failed: 0 };
+    let mut child = Child { plan, fds, procs, extra, group, parent, step: 0, failed: 0 };
     let mut pidfd: libc::c_int = -1;
     // SAFETY: all zeros is a valid `sigset_t`; the calls below fill it.
     let mut all: libc::sigset_t = unsafe { std::mem::zeroed() };
@@ -457,6 +472,8 @@ unsafe fn clone_on(
         3 => "changing to its directory",
         5 => "making it the leader of a process group of its own",
         6 => "giving it its inherited descriptors",
+        7 => "arming its kill at its parent's death (PR_SET_PDEATHSIG)",
+        8 => "finding its parent alive after arming its kill at the parent's death",
         _ => "running its program",
     };
     let error = io::Error::from_raw_os_error(failed);
@@ -524,6 +541,21 @@ extern "C" fn run(arg: *mut libc::c_void) -> libc::c_int {
     // SAFETY: a `sigset_t` to read; every handler is the default now, so an unblocked signal
     // runs nothing of the daemon's. Async-signal-safe.
     unsafe { libc::sigprocmask(libc::SIG_SETMASK, &none, ptr::null_mut()) };
+    // Killed when the thread that started it ends (prctl(2), PR_SET_PDEATHSIG: "the 'parent'
+    // in this case is considered to be the thread that created this process"). A parent killed
+    // before the arming has reparented the child, which `getppid` shows: then it ends now.
+    if child.parent != 0 {
+        // SAFETY: no pointers; one system call. Not in POSIX's async-signal-safe list (it is
+        // Linux's own), but glibc's and musl's `prctl` are a bare syscall wrapper taking no
+        // lock and touching no memory but errno, as the listed calls above.
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) } != 0 {
+            fail(child, 7);
+        }
+        // SAFETY: no arguments; async-signal-safe (POSIX.1-2017 section 2.4.3 lists `getppid`).
+        if unsafe { libc::getppid() } != child.parent {
+            fail(child, 8);
+        }
+    }
     // A group of its own, made before its program runs, so the parent (waiting, CLONE_VFORK)
     // can signal the group the moment `clone` returns.
     // SAFETY: no pointers; this process's own group set to its pid. Async-signal-safe

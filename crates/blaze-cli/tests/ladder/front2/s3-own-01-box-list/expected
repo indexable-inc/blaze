@@ -1,0 +1,14 @@
+status 0
+stdout
+Cons(1, Cons(2, Cons(3, Nil)))
+6
+I am boxed
+drop boxed
+28672
+[1, 2, 3] 3
+BOXED STR
+I am raw
+1
+end of main
+drop moved
+drop raw

@@ -1,0 +1,18 @@
+status 0
+stdout
+[   abc]
+[abc   ]
+[abc---]
+[**abc**]
+[**abc***]
+[ab]
+[   ab]
+[  héllo]
+"a\"b\n\tc"
+'x' '\''
+5
+4
+own-3
+aba
+{} ""
+"é\u{7f}"

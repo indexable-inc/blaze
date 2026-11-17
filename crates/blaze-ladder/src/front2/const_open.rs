@@ -52,17 +52,15 @@ use blaze_id::ItemKey as LibKey;
 use blaze_lower::View;
 use blaze_lower::form as lf;
 use blaze_surface::Range;
-use blaze_typeck as tc;
 use blaze_typeck::{ExprId, ItemKey, Name, PNode, PTy, PTys};
 
 use super::body::BodyError;
-use super::check::{CheckFail, Records, make_for};
+use super::check::{CheckFail, Records};
 use super::consts::ConstFail;
 use super::heads::{HeadError, Want};
 use super::locals::{LocalKind, LocalNs, Locals};
 use super::source::NamesSource;
 use super::types::{Env, Heads, SelfTy, Why};
-use super::world_items::Fill;
 
 /// The most constants one evaluation may have evaluated FIRST (`Consts::value_at`'s work
 /// list: each is a constant a head named while a body of the evaluation was checked).
@@ -95,34 +93,6 @@ pub(super) fn local_head<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, ite
         return Ok(());
     }
     r.store.ensure(r.names, &mut *r.keys, Want::Fn(lib)).map_err(|error| ConstFail::Body { item, error: BodyError::Head { item: lib, error } })
-}
-
-/// A (trait, ground `Self`) the constant evaluator's world selected no impl for among the
-/// impls made in the store (`ConstsWorld::impl_const`): the trait, `Self`'s node, and the
-/// shape its candidate impls are filed under (`None`: a type with no shape, which only a
-/// blanket impl already made could answer).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Wanted {
-    pub trait_: ItemKey,
-    pub self_ty: PNode,
-    pub shape: Option<tc::Shape>,
-}
-
-/// Makes the candidate impl headers of `wanted` (the body check's own fill, `Fill::Impls`,
-/// so the impls the evaluator's selection scans are the ones a body's goal would see), for
-/// the evaluation of `item` that read the trait's constant `constant`; the caller then
-/// evaluates the same need again. `last` is the pair made just before in this evaluation: the
-/// same pair missed again has no impl to select ([`ConstFail::NoImplConst`]), so each pair is
-/// made once and the loop ends (rule 18). A header that names a constant is refused by that
-/// name (`ConstFail::Nested` inside the check's refusal): the evaluator is busy with `item`.
-pub(super) fn impl_rows<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, last: &mut Option<Wanted>, item: ItemKey, constant: ItemKey, wanted: Wanted) -> Result<(), ConstFail> {
-    let refused = || ConstFail::NoImplConst { trait_: wanted.trait_, self_ty: wanted.self_ty, constant };
-    if *last == Some(wanted) {
-        return Err(refused());
-    }
-    let Some(shape) = wanted.shape else { return Err(refused()) };
-    *last = Some(wanted);
-    make_for(r, Fill::Impls(wanted.trait_, shape), item).map_err(|error| ConstFail::Check { item, error })
 }
 
 /// Whether `text` names one of `params` (the generic parameters in scope) as an identifier.

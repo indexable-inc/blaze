@@ -266,8 +266,10 @@ fn action_entries(unwind: &Unwind<'_>) -> (u64, u64) {
     (catch, terminate)
 }
 
-/// Appends the LSDA (the module's doc quotes each step it is read by).
-fn lsda_table(unwind: &Unwind<'_>, out: &mut AVec<'_, u8>) -> Result<(), EhError> {
+/// Appends the LSDA (the module's doc quotes each step it is read by). Every offset in it is
+/// relative to the function's start, so the bytes do not depend on where they are placed:
+/// blaze-export's eh_out.rs writes a file's `__gcc_except_tab` with it.
+pub fn lsda_table(unwind: &Unwind<'_>, out: &mut AVec<'_, u8>) -> Result<(), EhError> {
     let (catch, terminate) = action_entries(unwind);
     let typed = catch != 0 || terminate != 0;
     // The sizes after the type table's offset field, to know that offset first.

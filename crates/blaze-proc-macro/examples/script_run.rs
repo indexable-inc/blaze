@@ -58,6 +58,9 @@ fn main() {
         c_mode: CMode::Deferred,
         limits: RunLimits::STANDARD,
         table,
+        spawner: None,
+        step: blaze_ids::ContentId::default(),
+        spawn_setting: Arc::new(blaze_proc_macro::spawn_route::SpawnSetting::off()),
     });
     let runtime = script_runtime(Path::new(store));
     let started = Instant::now();

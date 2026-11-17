@@ -153,7 +153,7 @@ fn site() -> CallSite {
 }
 
 fn tokens(text: &str) -> TokenStream<'static> {
-    lex(text, Edition::E2021, Alloc::global()).expect("the test's text lexes")
+    lex(text, Edition::E2021, blaze_own::testing::heap().alloc()).expect("the test's text lexes")
 }
 
 fn rules(body: &str, krate: u8) -> MacroDefinition<'static> {
@@ -161,7 +161,7 @@ fn rules(body: &str, krate: u8) -> MacroDefinition<'static> {
 }
 
 fn builtin(which: BuiltinFn) -> MacroDefinition<'static> {
-    MacroDefinition::builtin_fn(which, at(1), Alloc::global())
+    MacroDefinition::builtin_fn(which, at(1), blaze_own::testing::heap().alloc())
 }
 
 fn done(expanded: Result<Expanded<'static>, ExpandError>) -> Expansion<'static> {
@@ -176,7 +176,7 @@ fn done(expanded: Result<Expanded<'static>, ExpandError>) -> Expansion<'static> 
 /// Expands `m!(args)` of `def` where it is written.
 fn call_fn(def: &MacroDefinition<'static>, args: &str, cx: &TestCx) -> Expansion<'static> {
     let input = tokens(args);
-    done(expand(def, &Call::fn_like(&input, site()), cx, Alloc::global()))
+    done(expand(def, &Call::fn_like(&input, site()), cx, blaze_own::testing::heap().alloc()))
 }
 
 /// The tokens as text, one space between each but between a joint punct and the punct it is
@@ -260,12 +260,12 @@ fn expand_in_source(
     cx: &TestCx,
 ) -> (Expansion<'static>, OwnVec<u8, Alloc<'static>>, blaze_expand::ExpansionKey) {
     let file = tokens(source);
-    let calls = find_calls(&file, Alloc::global()).expect("the file's calls are found");
+    let calls = find_calls(&file, blaze_own::testing::heap().alloc()).expect("the file's calls are found");
     let call = calls.iter().find(|it| it.kind == NestedKind::FnLike).expect("one call");
-    let input = file.copy_in(call.inner().to_usize(), Alloc::global()).expect("the args copy");
+    let input = file.copy_in(call.inner().to_usize(), blaze_own::testing::heap().alloc()).expect("the args copy");
     let call = Call::fn_like(&input, site());
-    let exp = done(expand(def, &call, cx, Alloc::global()));
-    let mut bytes = OwnVec::new_in(Alloc::global());
+    let exp = done(expand(def, &call, cx, blaze_own::testing::heap().alloc()));
+    let mut bytes = OwnVec::new_in(blaze_own::testing::heap().alloc());
     exp.encode(&mut bytes);
     let key = expansion_key(def, &call, &exp.reads);
     (exp, bytes, key)
@@ -330,10 +330,10 @@ fn a_ty_fragment_followed_by_as_matches() {
     // `u8` was joint with the `,` after it in the call; it is not joint with the `as` after it
     // here (a printer would write `u8as`, which `impl_int_cast!` matches no rule of).
     assert_no_glued_words(&exp.tokens);
-    let calls = find_calls(&exp.tokens, Alloc::global()).expect("the expansion's calls are found");
+    let calls = find_calls(&exp.tokens, blaze_own::testing::heap().alloc()).expect("the expansion's calls are found");
     assert_eq!(calls.len(), 2);
     for call in calls.iter() {
-        let mut input = exp.tokens.copy_in(call.inner().to_usize(), Alloc::global()).expect("the args copy");
+        let mut input = exp.tokens.copy_in(call.inner().to_usize(), blaze_own::testing::heap().alloc()).expect("the args copy");
         input.seal(ContentId([7; 32]));
         let inner = call_fn_tokens(&def, &input, &cx);
         assert!(inner.diagnostics.is_empty(), "{:?}: {:?}", show(&input), inner.diagnostics);
@@ -351,7 +351,7 @@ fn assert_no_glued_words(stream: &TokenStream<'_>) {
 }
 
 fn call_fn_tokens(def: &MacroDefinition<'static>, input: &TokenStream<'_>, cx: &TestCx) -> Expansion<'static> {
-    done(expand(def, &Call::fn_like(input, site()), cx, Alloc::global()))
+    done(expand(def, &Call::fn_like(input, site()), cx, blaze_own::testing::heap().alloc()))
 }
 
 /// `core`'s `fmt_refs!` and `bitop_impls!` (an anonymous lifetime `'_` in the transcribed
@@ -426,17 +426,17 @@ fn concat_is_eager() {
     let cx = TestCx::new();
     let def = builtin(BuiltinFn::Concat);
     let input = tokens("\"x\", stringify!(y z)");
-    let first = expand(&def, &Call::fn_like(&input, site()), &cx, Alloc::global()).expect("expands");
+    let first = expand(&def, &Call::fn_like(&input, site()), &cx, blaze_own::testing::heap().alloc()).expect("expands");
     let Expanded::NeedsExpanded(nested) = first else { panic!("concat! lists its nested call") };
     assert_eq!(nested.len(), 1);
-    let inner = input.copy_in(nested[0].inner().to_usize(), Alloc::global()).expect("copies");
+    let inner = input.copy_in(nested[0].inner().to_usize(), blaze_own::testing::heap().alloc()).expect("copies");
     let stringify = builtin(BuiltinFn::Stringify);
     let inner_call = Call {
         kind: CallKind::FnLike { args: &inner },
         site: site(),
         eager: Eager { inside: Inside::EagerInput, answers: &[] },
     };
-    let answer = done(expand(&stringify, &inner_call, &cx, Alloc::global()));
+    let answer = done(expand(&stringify, &inner_call, &cx, blaze_own::testing::heap().alloc()));
     let key = expansion_key(&stringify, &inner_call, &answer.reads);
     let mut sealed = answer.tokens.clone();
     sealed.seal(key.0);
@@ -447,14 +447,14 @@ fn concat_is_eager() {
         site: site(),
         eager: Eager { inside: Inside::Plain, answers: &unsealed },
     };
-    assert!(matches!(expand(&def, &refused, &cx, Alloc::global()), Err(ExpandError::Unsealed { .. })));
+    assert!(matches!(expand(&def, &refused, &cx, blaze_own::testing::heap().alloc()), Err(ExpandError::Unsealed { .. })));
     let answers = [&sealed];
     let again = Call {
         kind: CallKind::FnLike { args: &input },
         site: site(),
         eager: Eager { inside: Inside::Plain, answers: &answers },
     };
-    let exp = done(expand(&def, &again, &cx, Alloc::global()));
+    let exp = done(expand(&def, &again, &cx, blaze_own::testing::heap().alloc()));
     assert_eq!(show(&exp.tokens), "\"xy z\"");
 }
 
@@ -592,7 +592,7 @@ fn line_is_a_hole_or_a_read_in_eager_input() {
         site: site(),
         eager: Eager { inside: Inside::EagerInput, answers: &[] },
     };
-    let exp = done(expand(&builtin(BuiltinFn::Line), &call, &cx, Alloc::global()));
+    let exp = done(expand(&builtin(BuiltinFn::Line), &call, &cx, blaze_own::testing::heap().alloc()));
     assert_eq!(show(&exp.tokens), "12u32");
     assert!(exp.holes.is_empty());
     assert_eq!(exp.reads.list()[0].answer, ReadAnswer::Number(12));
@@ -627,6 +627,20 @@ fn derive(which: BuiltinDerive, item: &str) -> Expansion<'static> {
 /// an attribute macro is expanded first (rustc_expand `take_first_attr`), so it is not in the
 /// macro's input (else a macro that re-emits its item runs it twice); a helper before it stays.
 /// Expected: `test an_items_attributes_are_walked_in_order ... ok`.
+/// D104: the implicit call's item is the whole item, its `#[cfg_attr(unix, inline)]` applied
+/// to `#[inline]` and its `#[must_use]` kept; a planted walk that cut the first attribute (as
+/// `attr_call` does for a written one) loses `inline` and fails.
+#[test]
+fn implicit_call_takes_the_whole_item_with_cfg_attr_applied() {
+    let mut unix = |name: &str, _: Option<&str>| Ok::<bool, ()>(name == "unix");
+    let made = blaze_expand::ItemAttrs::new(tokens("#[cfg_attr(unix, inline)] #[must_use] fn main(cx: &Cx, out: Out) {}"))
+        .implicit_call(&mut unix)
+        .expect("the attributes read");
+    assert!(made.args.is_none(), "no arguments");
+    assert_eq!(made.derives_taken, 0);
+    assert_eq!(show(&made.item), "# [ inline ] # [ must_use ] fn main ( cx : & Cx , out : Out ) { }");
+}
+
 #[test]
 fn an_items_attributes_are_walked_in_order() {
     let mut unix = |name: &str, _: Option<&str>| Ok::<bool, ()>(name == "unix");
@@ -729,7 +743,7 @@ fn an_attribute_macro_sees_the_attributes_a_later_cfg_attr_leaves() {
 fn a_derive_attribute_names_its_paths() {
     let names = |attr: &str| {
         let t = tokens(attr);
-        blaze_expand::derive_attr(&t, Alloc::global()).map(|(constness, paths)| {
+        blaze_expand::derive_attr(&t, blaze_own::testing::heap().alloc()).map(|(constness, paths)| {
             let named: std::vec::Vec<String> = paths
                 .iter()
                 .map(|r| (r.start..r.end).map(|at| t.text_at(at as usize)).collect::<std::vec::Vec<_>>().concat())
@@ -751,7 +765,7 @@ fn a_derive_attribute_names_its_paths() {
 fn a_cfg_attr_leaves_its_attributes_when_its_predicate_holds() {
     let metas = |attr: &str| {
         let t = tokens(attr);
-        let got = blaze_expand::cfg_attr_metas(&t, Alloc::global(), &mut |name, value| -> Result<bool, ()> {
+        let got = blaze_expand::cfg_attr_metas(&t, blaze_own::testing::heap().alloc(), &mut |name, value| -> Result<bool, ()> {
             Ok(matches!((name, value), ("unix", None) | ("feature", Some("serde"))))
         });
         got.map(|ranges| {
@@ -772,9 +786,9 @@ fn a_cfg_attr_leaves_its_attributes_when_its_predicate_holds() {
     assert_eq!(metas("#[derive(Clone)]"), Err(blaze_expand::CfgAttrError::NotCfgAttr));
     // The derive it leaves, read in place.
     let t = tokens("#[cfg_attr(unix, derive(Debug, ::core::hash::Hash))]");
-    let ranges = blaze_expand::cfg_attr_metas(&t, Alloc::global(), &mut |_, _| -> Result<bool, ()> { Ok(true) })
+    let ranges = blaze_expand::cfg_attr_metas(&t, blaze_own::testing::heap().alloc(), &mut |_, _| -> Result<bool, ()> { Ok(true) })
         .expect("the predicate holds");
-    let (constness, paths) = blaze_expand::derive_meta(&t, ranges[0].clone(), Alloc::global()).expect("a derive");
+    let (constness, paths) = blaze_expand::derive_meta(&t, ranges[0].clone(), blaze_own::testing::heap().alloc()).expect("a derive");
     assert_eq!(constness, Constness::NotConst);
     assert_eq!(paths.len(), 2);
 }
@@ -786,7 +800,7 @@ fn a_cfg_attr_leaves_its_attributes_when_its_predicate_holds() {
 fn derive_named_by_its_prelude_path_is_a_derive() {
     let derives = |text: &str| {
         let t = tokens(text);
-        blaze_expand::derive_meta(&t, 2..(t.tokens().len() - 1) as u32, Alloc::global()).map(|(c, paths)| (c, paths.len()))
+        blaze_expand::derive_meta(&t, 2..(t.tokens().len() - 1) as u32, blaze_own::testing::heap().alloc()).map(|(c, paths)| (c, paths.len()))
     };
     assert_eq!(derives("#[::core::prelude::v1::derive(Clone)]"), Some((Constness::NotConst, 1)));
     assert_eq!(derives("#[std::prelude::rust_2021::derive(Clone, ::core::cmp::PartialEq)]"), Some((Constness::NotConst, 2)));
@@ -797,11 +811,11 @@ fn derive_named_by_its_prelude_path_is_a_derive() {
 
 fn derive_with(which: BuiltinDerive, item: &str, facts: DeriveFacts) -> Expansion<'static> {
     let cx = TestCx::new();
-    let def = MacroDefinition::builtin_derive(which, at(1), Alloc::global());
+    let def = MacroDefinition::builtin_derive(which, at(1), blaze_own::testing::heap().alloc());
     let item = tokens(item);
     let call =
         Call { kind: CallKind::Derive { item: &item, facts }, site: site(), eager: Eager::plain() };
-    done(expand(&def, &call, &cx, Alloc::global()))
+    done(expand(&def, &call, &cx, blaze_own::testing::heap().alloc()))
 }
 
 #[test]
@@ -819,7 +833,7 @@ fn clone_of_a_copy_type_without_type_parameters_is_star_self() {
     assert!(text.contains("$crate :: clone :: Clone :: clone ( a_self )"), "{text}");
     // The facts are in the key.
     let item = tokens("struct S { a: u8 }");
-    let def = MacroDefinition::builtin_derive(BuiltinDerive::Clone, at(1), Alloc::global());
+    let def = MacroDefinition::builtin_derive(BuiltinDerive::Clone, at(1), blaze_own::testing::heap().alloc());
     let call = |facts| Call {
         kind: CallKind::Derive { item: &item, facts },
         site: site(),
@@ -924,7 +938,7 @@ fn concat_reads_escapes() {
     assert_eq!(show(&exp.tokens), "\"aAB\\n'\"");
     // `"\x80"` is no Rust text (rustc's lexer refuses an escape past `\x7f` in a `str`), so
     // `lex` refuses it too; what `concat!` itself refuses is a byte string.
-    assert!(lex("\"\\x80\"", Edition::E2021, Alloc::global()).is_err());
+    assert!(lex("\"\\x80\"", Edition::E2021, blaze_own::testing::heap().alloc()).is_err());
     let bad = call_fn(&builtin(BuiltinFn::Concat), "b\"x\"", &cx);
     assert!(matches!(bad.diagnostics[..], [Diagnostic::Builtin { .. }]), "{:?}", bad.diagnostics);
 }
@@ -943,9 +957,9 @@ fn a_cfg_predicate_is_read_from_its_tokens() {
         })
     };
     let eval = |text: &str| {
-        let tokens = lex(text, Edition::E2021, Alloc::global()).expect("the predicate lexes");
+        let tokens = lex(text, Edition::E2021, blaze_own::testing::heap().alloc()).expect("the predicate lexes");
         let mut asked = Vec::new();
-        let out = cfg_predicate(&tokens, Alloc::global(), &mut |n, v| {
+        let out = cfg_predicate(&tokens, blaze_own::testing::heap().alloc(), &mut |n, v| {
             asked.push(n.to_string());
             set(n, v)
         });
@@ -980,11 +994,11 @@ fn a_cfg_predicate_is_read_from_its_tokens() {
 /// crossterm-0.29.0), and the tokens equal the LF file's.
 #[test]
 fn a_crlf_file_lexes_as_its_lf_form() {
-    let crlf = lex("let s = \"a \\\r\n   b\";\r\n", Edition::E2021, Alloc::global()).expect("CRLF is normalized");
-    let lf = lex("let s = \"a \\\n   b\";\n", Edition::E2021, Alloc::global()).expect("the LF form lexes");
+    let crlf = lex("let s = \"a \\\r\n   b\";\r\n", Edition::E2021, blaze_own::testing::heap().alloc()).expect("CRLF is normalized");
+    let lf = lex("let s = \"a \\\n   b\";\n", Edition::E2021, blaze_own::testing::heap().alloc()).expect("the LF form lexes");
     assert_eq!(show(&crlf), show(&lf));
-    let doc_crlf = lex("/// d\r\nfn f() {}", Edition::E2021, Alloc::global()).expect("a CRLF doc comment lexes");
-    let doc_lf = lex("/// d\nfn f() {}", Edition::E2021, Alloc::global()).expect("the LF form lexes");
+    let doc_crlf = lex("/// d\r\nfn f() {}", Edition::E2021, blaze_own::testing::heap().alloc()).expect("a CRLF doc comment lexes");
+    let doc_lf = lex("/// d\nfn f() {}", Edition::E2021, blaze_own::testing::heap().alloc()).expect("the LF form lexes");
     assert_eq!(show(&doc_crlf), show(&doc_lf));
 }
 
@@ -993,7 +1007,7 @@ fn an_attribute_call_takes_its_args_and_item() {
     let cx = TestCx::new();
     let krate = CrateItemKey(ContentId([9; 32]));
     let def =
-        MacroDefinition::proc_macro(krate, ProcKind::Attr, "echo", &[], at(9), Alloc::global()).expect("names fit");
+        MacroDefinition::proc_macro(krate, ProcKind::Attr, "echo", &[], at(9), blaze_own::testing::heap().alloc()).expect("names fit");
     let args = tokens("x");
     let item = tokens("fn f() {}");
     let call = Call {
@@ -1001,7 +1015,7 @@ fn an_attribute_call_takes_its_args_and_item() {
         site: site(),
         eager: Eager::plain(),
     };
-    let exp = done(expand(&def, &call, &cx, Alloc::global()));
+    let exp = done(expand(&def, &call, &cx, blaze_own::testing::heap().alloc()));
     assert_eq!(show(&exp.tokens), "fn f ( ) { }");
     assert!(
         exp.origins
@@ -1011,7 +1025,7 @@ fn an_attribute_call_takes_its_args_and_item() {
     );
     assert_eq!(exp.reads.list()[0].kind, ReadKind::ProcMacro);
 
-    let wrong = expand(&def, &Call::fn_like(&args, site()), &cx, Alloc::global());
+    let wrong = expand(&def, &Call::fn_like(&args, site()), &cx, blaze_own::testing::heap().alloc());
     assert!(matches!(
         wrong,
         Err(ExpandError::WrongCallKind { def: CallShape::Attr, call: CallShape::FnLike })
@@ -1023,9 +1037,9 @@ fn echo(emits: &'static [Emit]) -> Result<Expanded<'static>, ExpandError> {
     let cx = TestCx { emits, ..TestCx::new() };
     let krate = CrateItemKey(ContentId([9; 32]));
     let def =
-        MacroDefinition::proc_macro(krate, ProcKind::FnLike, "echo", &[], at(9), Alloc::global()).expect("names fit");
+        MacroDefinition::proc_macro(krate, ProcKind::FnLike, "echo", &[], at(9), blaze_own::testing::heap().alloc()).expect("names fit");
     let input = tokens("a b");
-    expand(&def, &Call::fn_like(&input, site()), &cx, Alloc::global())
+    expand(&def, &Call::fn_like(&input, site()), &cx, blaze_own::testing::heap().alloc())
 }
 
 #[test]
@@ -1121,12 +1135,12 @@ fn varied_expansions() -> Vec<Expansion<'static>> {
 #[test]
 fn an_expansion_record_reads_back_equal_and_rewrites_equal_bytes() {
     for exp in varied_expansions() {
-        let bytes = exp.write_record(Alloc::global());
-        let read = Expansion::read_record(&bytes, Alloc::global()).expect("a written record reads back");
+        let bytes = exp.write_record(blaze_own::testing::heap().alloc());
+        let read = Expansion::read_record(&bytes, blaze_own::testing::heap().alloc()).expect("a written record reads back");
         assert!(read == exp, "{exp:?} read back as {read:?}");
-        assert_eq!(read.write_record(Alloc::global())[..], bytes[..]);
+        assert_eq!(read.write_record(blaze_own::testing::heap().alloc())[..], bytes[..]);
         // A buffer cut short is refused, never read.
-        let cut = Expansion::<'static>::read_record(&bytes[..bytes.len() - 1], Alloc::global());
+        let cut = Expansion::<'static>::read_record(&bytes[..bytes.len() - 1], blaze_own::testing::heap().alloc());
         assert!(cut.is_err());
     }
 }
@@ -1141,48 +1155,48 @@ fn read_back(
     let body = records.body.as_ref().map(|(_, bytes)| Aligned::copy_from(bytes));
     let params = records.params.as_ref().map(|(_, bytes)| Aligned::copy_from(bytes));
     assert_eq!(view.head().content, def.content().0);
-    MacroDefinition::from(&view, body.as_deref(), params.as_deref(), Alloc::global())
+    MacroDefinition::from(&view, body.as_deref(), params.as_deref(), blaze_own::testing::heap().alloc())
 }
 
 #[test]
 fn a_macro_definition_reads_back_from_its_records() {
     let krate = CrateItemKey(ContentId([9; 32]));
     let derive =
-        MacroDefinition::proc_macro(krate, ProcKind::Derive, "Serialize", &["serde", "allow"], at(9), Alloc::global())
+        MacroDefinition::proc_macro(krate, ProcKind::Derive, "Serialize", &["serde", "allow"], at(9), blaze_own::testing::heap().alloc())
             .expect("names fit");
     let defs = [
         rules("($x:expr) => { $x + 1 }", 1),
         MacroDefinition::macro2(Some(tokens("$x:expr")), tokens("$x * 2"), at(2)),
         builtin(BuiltinFn::Concat),
-        MacroDefinition::builtin_derive(BuiltinDerive::Clone, at(1), Alloc::global()),
+        MacroDefinition::builtin_derive(BuiltinDerive::Clone, at(1), blaze_own::testing::heap().alloc()),
         derive,
     ];
     let item = ItemKey(ContentId([5; 32]));
     for def in &defs {
         let name = def.proc_name().unwrap_or("m");
-        let records = def.write(item, name, None, Alloc::global()).expect("a small definition");
+        let records = def.write(item, name, None, blaze_own::testing::heap().alloc()).expect("a small definition");
         let read = read_back(def, &records).expect("the records are one definition");
         assert_eq!(read.content(), def.content());
         assert_eq!((read.kind(), read.at(), read.transparency()), (def.kind(), def.at(), def.transparency()));
         assert!(read.helpers().eq(def.helpers()) && read.proc_name() == def.proc_name());
         // Written again, the records are the same bytes (rule 25).
-        let again = read.write(item, name, None, Alloc::global()).expect("a small definition");
+        let again = read.write(item, name, None, blaze_own::testing::heap().alloc()).expect("a small definition");
         assert_eq!(again.def[..], records.def[..]);
     }
     // Control: a body record of another stream is refused by its digest, never read as the body.
-    let mut records = defs[0].write(item, "m", None, Alloc::global()).expect("a small definition");
-    let other = tokens("() => {}").write_record(Alloc::global());
+    let mut records = defs[0].write(item, "m", None, blaze_own::testing::heap().alloc()).expect("a small definition");
+    let other = tokens("() => {}").write_record(blaze_own::testing::heap().alloc());
     records.body = Some((stream_record_id(&other), other));
     assert!(matches!(read_back(&defs[0], &records), Err(DefinitionError::Mismatch { .. })));
     // A proc macro written under a name that is not its export name is refused.
-    let renamed = defs[4].write(item, "Deserialize", None, Alloc::global());
+    let renamed = defs[4].write(item, "Deserialize", None, blaze_own::testing::heap().alloc());
     assert!(matches!(renamed.err(), Some(BuildError::Disagrees { .. })));
 }
 
 #[test]
 fn an_expansion_record_refuses_a_token_entry_it_does_not_write() {
     let exp = call_fn(&builtin(BuiltinFn::Stringify), "a", &TestCx::new());
-    let mut bytes = exp.write_record(Alloc::global());
+    let mut bytes = exp.write_record(blaze_own::testing::heap().alloc());
     // The one token, an unsuffixed string literal standing alone: tag 2, kind 4 at bit 5.
     let word = (2u32 | 4 << 5).to_le_bytes();
     let at = bytes
@@ -1191,7 +1205,7 @@ fn an_expansion_record_refuses_a_token_entry_it_does_not_write() {
         .expect("the string literal's entry is in the buffer");
     // Tag 7 names no token.
     bytes[at] = 7;
-    let refused = Expansion::<'static>::read_record(&bytes, Alloc::global());
+    let refused = Expansion::<'static>::read_record(&bytes, blaze_own::testing::heap().alloc());
     assert!(
         matches!(
             refused,
@@ -1223,8 +1237,8 @@ fn keys_follow_expansions(tape: &Tape, key_of: KeyOf) -> Result<(), Broke> {
     let call = Call::fn_like(&input, site());
     let run = |env: &'static [(&'static str, &'static str)]| {
         let cx = TestCx { env, files: &[], cfgs: &[], line: 1, emits: &[] };
-        let exp = done(expand(&def, &call, &cx, Alloc::global()));
-        let mut bytes = OwnVec::new_in(Alloc::global());
+        let exp = done(expand(&def, &call, &cx, blaze_own::testing::heap().alloc()));
+        let mut bytes = OwnVec::new_in(blaze_own::testing::heap().alloc());
         exp.encode(&mut bytes);
         let key = match key_of {
             KeyOf::Record => expansion_key(&def, &call, &exp.reads).0,
@@ -1261,7 +1275,7 @@ fn the_key_oracle_catches_a_key_blind_to_reads() {
 fn an_include_path_is_relative_to_the_calling_file_and_stays_in_its_root() {
     use blaze_expand::{OutsideRoot, ReadRoot, SourceOrigin};
     let target = |origin, package, folder, written| {
-        blaze_expand::include_target(ReadRoot { origin, package }, folder, written, Alloc::global())
+        blaze_expand::include_target(ReadRoot { origin, package }, folder, written, blaze_own::testing::heap().alloc())
             .map(|s| s.iter().copied().collect::<Vec<_>>().join("/"))
     };
     let member = |folder, written| target(SourceOrigin::Checkout, "crates/a", folder, written);
@@ -1295,8 +1309,8 @@ fn the_same_panic_takes_the_form_of_the_writing_crate_s_edition() {
     let def = builtin(BuiltinFn::Panic);
     let input = tokens("\"{}\", x");
     let at = |edition| CallSite { edition, panic_edition: edition, ctx: Ctx::root(edition) };
-    let old = done(expand(&def, &Call::fn_like(&input, at(Edition::E2018)), &cx, Alloc::global()));
-    let new = done(expand(&def, &Call::fn_like(&input, at(Edition::E2021)), &cx, Alloc::global()));
+    let old = done(expand(&def, &Call::fn_like(&input, at(Edition::E2018)), &cx, blaze_own::testing::heap().alloc()));
+    let new = done(expand(&def, &Call::fn_like(&input, at(Edition::E2021)), &cx, blaze_own::testing::heap().alloc()));
     assert_eq!(show(&old.tokens), "$crate :: panic :: panic_2015 ! ( \"{}\" , x )");
     assert_eq!(show(&new.tokens), "$crate :: panic :: panic_2021 ! ( \"{}\" , x )");
     // `assert!` with a message picks the same way (core's `assert!` is under `edition_panic`
@@ -1305,7 +1319,7 @@ fn the_same_panic_takes_the_form_of_the_writing_crate_s_edition() {
         &builtin(BuiltinFn::Assert),
         &Call::fn_like(&tokens("c, \"{}\", x"), at(Edition::E2018)),
         &cx,
-        Alloc::global(),
+        blaze_own::testing::heap().alloc(),
     ));
     assert_eq!(show(&assert.tokens), "if ! ( c ) { $crate :: panic :: panic_2015 ! ( \"{}\" , x ) }");
 }
@@ -1350,7 +1364,7 @@ fn asm_expands_to_the_parser_s_typed_form_with_each_operand_s_kind() {
     let exp = call_fn(&builtin(BuiltinFn::Asm), text, &cx);
     assert!(exp.diagnostics.is_empty(), "{:?}", exp.diagnostics);
     assert!(show(&exp.tokens).starts_with("builtin # asm ( \"mov {0}, {1}\" ,"), "{}", show(&exp.tokens));
-    let words = blaze_expand::parser_words(&exp.tokens, Alloc::global());
+    let words = blaze_expand::parser_words(&exp.tokens, blaze_own::testing::heap().alloc());
     let output = parser::PrefixEntryPoint::Expr.parse(parser::Tokens::new(&words.words, true));
     let (mut asm, mut options, mut abis) = (0, 0, 0);
     let mut operands: Vec<String> = Vec::new();
@@ -1418,7 +1432,7 @@ fn an_include_s_read_list_entry_is_root_relative() {
     let found = Rooted { inner: TestCx::new(), answer: ("crates/chainspec/src/genesis/dev.json", true) };
     for which in [BuiltinFn::IncludeStr, BuiltinFn::IncludeBytes] {
         let input = tokens(written);
-        let exp = done(expand(&builtin(which), &Call::fn_like(&input, site()), &found, Alloc::global()));
+        let exp = done(expand(&builtin(which), &Call::fn_like(&input, site()), &found, blaze_own::testing::heap().alloc()));
         assert!(exp.diagnostics.is_empty(), "{:?}", exp.diagnostics);
         let read = exp.reads.list()[0];
         let subject = exp.reads.subject(&read);
@@ -1429,7 +1443,7 @@ fn an_include_s_read_list_entry_is_root_relative() {
     // A missing file is recorded absent under its root-relative path: creating it reruns.
     let missing = Rooted { inner: TestCx::new(), answer: ("crates/chainspec/x.json", false) };
     let input = tokens(written);
-    let exp = done(expand(&builtin(BuiltinFn::IncludeStr), &Call::fn_like(&input, site()), &missing, Alloc::global()));
+    let exp = done(expand(&builtin(BuiltinFn::IncludeStr), &Call::fn_like(&input, site()), &missing, blaze_own::testing::heap().alloc()));
     let read = exp.reads.list()[0];
     assert_eq!((exp.reads.subject(&read), read.answer), ("crates/chainspec/x.json", ReadAnswer::Absent));
     assert!(matches!(exp.diagnostics[..], [Diagnostic::Include { .. }]), "{:?}", exp.diagnostics);
@@ -1437,7 +1451,7 @@ fn an_include_s_read_list_entry_is_root_relative() {
     for bad in ["/Users/me/tempo/crates/x.json", "crates/../x.json", "crates//x.json", ""] {
         let host = Rooted { inner: TestCx::new(), answer: (bad, true) };
         let input = tokens(written);
-        let refused = expand(&builtin(BuiltinFn::IncludeStr), &Call::fn_like(&input, site()), &host, Alloc::global());
+        let refused = expand(&builtin(BuiltinFn::IncludeStr), &Call::fn_like(&input, site()), &host, blaze_own::testing::heap().alloc());
         assert!(
             matches!(refused, Err(ExpandError::Host(HostError { ask: HostAsk::Include, why: HostWhy::Unreadable }))),
             "{bad:?}: {:?}",

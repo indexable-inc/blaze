@@ -319,6 +319,23 @@ pub enum LangItem {
     FutureOutput,
     /// `Try::from_output`, by a `try` block's tail. After the rest, for their hashes.
     TryTraitFromOutput,
+    /// The auto trait `Freeze` (`freeze`): no interior mutability (core/src/marker.rs).
+    /// Constant promotion asks it (rules/promote.rs). Last, for the earlier items' hashes.
+    Freeze,
+    // What an async closure's bounds ask (blaze-solve async_fn.rs; the library's
+    // core/src/ops/async_function.rs). After the rest, for their hashes.
+    /// The trait `AsyncFn` (`async_fn`).
+    AsyncFn,
+    /// The trait `AsyncFnMut` (`async_fn_mut`).
+    AsyncFnMut,
+    /// The trait `AsyncFnOnce` (`async_fn_once`).
+    AsyncFnOnce,
+    /// `AsyncFnOnce::Output` (`async_fn_once_output`).
+    AsyncFnOnceOutput,
+    /// `AsyncFnOnce::CallOnceFuture` (`call_once_future`).
+    CallOnceFuture,
+    /// `AsyncFnMut::CallRefFuture` (`call_ref_future`).
+    CallRefFuture,
 }
 
 impl LangItem {
@@ -333,6 +350,9 @@ impl LangItem {
         match self {
             LangItem::FnOnceOutput => Some((LangItem::FnOnce, "Output")),
             LangItem::FutureOutput => Some((LangItem::Future, "Output")),
+            LangItem::AsyncFnOnceOutput => Some((LangItem::AsyncFnOnce, "Output")),
+            LangItem::CallOnceFuture => Some((LangItem::AsyncFnOnce, "CallOnceFuture")),
+            LangItem::CallRefFuture => Some((LangItem::AsyncFnMut, "CallRefFuture")),
             LangItem::Discriminant => Some((LangItem::DiscriminantKind, "Discriminant")),
             LangItem::Metadata => Some((LangItem::Pointee, "Metadata")),
             _ => None,

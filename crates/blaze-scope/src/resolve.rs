@@ -64,7 +64,7 @@ use crate::task::{joined, pop_dir};
 use crate::task::ExpandPart;
 use crate::task::{ProcAttr, ProcDecls, ProcExport};
 use blaze_surface::ProcKind;
-use crate::{ExpandRequest, NameAnswer, Node, Passed, Resolved, ScopeFacts, through};
+use crate::{ExpandRequest, NameAnswer, Node, Passed, Resolved, ScopeFacts};
 use crate::crate_scope::Dep;
 use crate::prepares::{Kept, Prepares};
 
@@ -407,8 +407,7 @@ pub enum NamesError<'a> {
     RootRecord { krate: &'a str, error: RecordError },
     /// A crate the graph's waves never reached.
     NotResolved { krate: &'a str },
-    /// The cell core (feature `cells`, the switch) refused the crate.
-    #[cfg(feature = "cells")]
+    /// The cell core, the names records' writer, refused the crate.
     Cells { krate: &'a str, error: crate::cells::Unwritten },
 }
 
@@ -425,7 +424,6 @@ impl fmt::Display for NamesError<'_> {
             }
             NamesError::RootRecord { krate, error } => write!(f, "crate `{krate}`: its CrateRoot record: {error:?}"),
             NamesError::NotResolved { krate } => write!(f, "crate `{krate}`: not reached by the graph's waves"),
-            #[cfg(feature = "cells")]
             NamesError::Cells { krate, error } => write!(f, "crate `{krate}`: {error}"),
         }
     }
@@ -857,8 +855,15 @@ impl<'r, 'a> Built<'r, 'a> {
         }
     }
 
-    /// See [`Names::lookup`].
+    /// See [`Names::lookup`]: [`Built::lookup_in`] with a glob walk's scratch made for this one
+    /// call.
     pub(crate) fn lookup(&self, module: ItemKey, ns: Namespace, name: &'a str, alloc: Alloc<'_>) -> Option<Binding> {
+        self.lookup_in(module, ns, name, &mut blaze_surface::ThroughScratch::new_in(alloc))
+    }
+
+    /// [`Built::lookup`] with the glob walk in `scratch`, which a caller asking many names keeps
+    /// (the cell core's dependency reads, cells/deps.rs): the same answer from the same reads.
+    pub(crate) fn lookup_in(&self, module: ItemKey, ns: Namespace, name: &'a str, scratch: &mut blaze_surface::ThroughScratch<'_>) -> Option<Binding> {
         struct Records<'q, 'r, 'a> {
             built: &'q Built<'r, 'a>,
             ns: Namespace,
@@ -887,7 +892,7 @@ impl<'r, 'a> Built<'r, 'a> {
             return Some(b);
         }
         let mut sources = Records { built: self, ns, name };
-        let p = through(&mut sources, Def::module(module), alloc).ok()??;
+        let p = blaze_surface::through_in(&mut sources, Def::module(module), scratch).ok()??;
         Some(Binding { def: p.def, vis: p.vis, origin: Origin::Glob, expansion: 0, state: p.state })
     }
 }
@@ -1162,39 +1167,17 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
         let part = |part: ExpandPart, macro_name: &str, size: usize| par.expand_part(part, macro_name, size);
         let seen = |def: ItemKey, input: &str| par.expand_call(def, input);
         let cx = FillCx { base: &base, run: &run, facts: Facts { base: &base, run: &run }, mark: &mark, part: &part, seen: &seen };
-        // With a seam: the cell core on the same facts after the fill, timed by the caller's
-        // clock and compared, the report handed to the caller; the records stay the fill's.
-        // Without one (feature `cells`): the switch: the cell core solves and writes the scopes.
-        #[cfg(feature = "cells")]
-        let seam = par.cells_seam().map(|seam| (seam, seam.now()));
-        // The files' blocks that hold impls are modules before the fill starts: it is told
-        // of them as of any made module.
+        // The cell core solves and writes the scopes. The files' blocks that hold impls are
+        // modules before it starts: it is told of them as of any made module.
         par.stage(crate::task::Stage::Solve);
         make_blocks(&base, &run, &low.bodies);
-        #[cfg(feature = "cells")]
-        let by_cells = seam.is_none();
-        #[cfg(not(feature = "cells"))]
-        let by_cells = false;
-        if by_cells {
-            #[cfg(feature = "cells")]
-            {
-                let places = |m: ItemKey| held(run.block_places.lock(), "block places").get(&m).copied();
-                let expand = |call: ItemKey, def: Def| {
-                    let _ = crate::task::Expand::expand(&cx, ExpandRequest { call, def });
-                };
-                let made = |out: &mut AVec<'a, ItemKey>| out.extend(held(run.made.read(), "made modules").keys().copied());
-                fill.done = crate::cells::solve_and_write(&cx.facts, built, &cx.facts, &places, tree.modules[0].key, &expand, &made, alloc)
-                    .map_err(|error| NamesError::Cells { krate: input.name, error })?;
-            }
-        } else {
-            fill.run(&cx, par, &all);
-        }
-        #[cfg(feature = "cells")]
-        if let Some((seam, fill_start)) = seam {
-            let old = seam.now().saturating_sub(fill_start);
-            let places = |m: ItemKey| held(run.block_places.lock(), "block places").get(&m).copied();
-            seam.report(input.name, crate::cells::shadow(&cx.facts, built, &cx.facts, &places, tree.modules[0].key, &fill.done, old, seam, alloc));
-        }
+        let places = |m: ItemKey| held(run.block_places.lock(), "block places").get(&m).copied();
+        let expand = |call: ItemKey, def: Def| {
+            let _ = crate::task::Expand::expand(&cx, ExpandRequest { call, def });
+        };
+        let made = |out: &mut AVec<'a, ItemKey>| out.extend(held(run.made.read(), "made modules").keys().copied());
+        fill.done = crate::cells::solve_and_write(&cx.facts, built, &cx.facts, &places, tree.modules[0].key, &expand, &made, alloc)
+            .map_err(|error| NamesError::Cells { krate: input.name, error })?;
     }
     par.stage(crate::task::Stage::Publish);
     let mut done = core::mem::replace(&mut fill.done, HashMap::new_in(alloc));
@@ -1456,7 +1439,6 @@ struct Facts<'r, 'a, S> {
 }
 
 /// This crate's enums for the cell core: the lowered text's, then the expansions' so far.
-#[cfg(feature = "cells")]
 impl<'a, S> crate::cells::EnumNames<&'a str> for Facts<'_, 'a, S> {
     fn holds(&self, of: ItemKey) -> bool {
         self.base.tables.enums.contains_key(&of) || held(self.run.tables.read(), "tables").enums.contains_key(&of)
@@ -1652,7 +1634,8 @@ impl<'a, S: SourceTexts<'a>> ExpandCx for Host<'_, 'a, S> {
     /// needs the root from `SourceTexts`, not given yet.
     fn include(&self, written: &str, _: IncludeAs) -> Result<Included<'_>, HostError> {
         // The one place the path is made: the modules the file writes are found from it too.
-        let Some(path) = crate::included::included_file(self.package, self.path, written, self.alloc) else {
+        let seen = self.sources.crate_env(self.krate).map(|env| env.seen());
+        let Some(path) = crate::included::included_file(self.package, seen, self.path, written, self.alloc) else {
             return Ok(Included::Outside);
         };
         Ok(self.sources.read(self.krate, &path).map_or(Included::Missing, |text| Included::Bytes(text.as_bytes())))
@@ -1860,68 +1843,22 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
         alloc,
     };
     let cfg_atom = |name: &str, value: Option<&str>| base.cfg.atoms().binary_search(&(name, value)).is_ok();
-    // The crate's kept expansions ([`crate::expansions`]): the call's key from its TEXT, before
-    // anything is lexed or prepared ([`blaze_expand::TextCall`] lists every input). A
-    // function-like builtin has no key: it is expanded each solve.
+    // The crate's kept expansions ([`crate::expansions`]) are keyed by the ONE key of an
+    // expansion, [`blaze_expand::call_key`]: the definition's content and site and the call's
+    // tokens as shaped, made below once the call is (the body's lowering keys its calls by the
+    // same function, so one call is one key in both layers). A function-like builtin has no
+    // key: it is expanded each solve.
     let kept = base.kept;
     if kept.keeps() {
         part(ExpandPart::Kept, mac.name, src.input.len());
     }
-    let text_key = match mac.body {
-        _ if !kept.keeps() => None,
-        MacroBody::Rules(body) => Some(blaze_expand::DefText::Rules { body }),
-        MacroBody::Macro2 { params, body } => Some(blaze_expand::DefText::Macro2 { params, body, module: mac.module }),
-        MacroBody::BuiltinOther(CallShape::Derive) if src.kind == CallShape::Derive => Some(blaze_expand::DefText::BuiltinDerive),
-        MacroBody::Proc { kind, helpers } => runner.map(|runner| blaze_expand::DefText::Proc { runner, kind, helpers }),
-        MacroBody::BuiltinFn(_) | MacroBody::BuiltinOther(_) => None,
-    }
-    .map(|def| {
-        let named = kept.planted() != crate::expansions::Planted::KeyWithoutTheAttribute;
-        blaze_expand::text_key(&blaze_expand::TextCall {
-            def,
-            def_name: if named { mac.name } else { "" },
-            def_krate,
-            def_edition,
-            export: if mac.export { Export::Exported } else { Export::Local },
-            local_inner: if mac.local_inner { LocalInner::Yes } else { LocalInner::No },
-            shape: src.kind,
-            attr: if named && src.kind != CallShape::FnLike { src.name } else { "" },
-            edition,
-            input: src.input,
-        })
-    });
-    // A kept expansion is taken when its read list is answered today as it was: each cfg atom
-    // the item walk asked, then each read the expansion made.
-    let mut found: Option<blaze_expand::Expansion<'a>> = None;
-    if let Some(key) = text_key {
-        let entry = kept.find(&key).unwrap_or_else(|e| panic!("the kept expansion of a call of `{}` did not open: {e}", mac.name));
-        if let Some((index, entry)) = entry {
-            let mut taken = None;
-            if entry.asked().all(|asked| cfg_atom(asked.name, asked.value) == asked.answer) {
-                let expansion = entry.expansion(alloc).unwrap_or_else(|e| panic!("the kept expansion of a call of `{}` did not read: {e}", mac.name));
-                let held = match base.script {
-                    _ if expansion.reads.list().is_empty() => Ok(blaze_expand::Held::Holds),
-                    Some(out) => expansion.reads.hold(&ScriptCx { inner: host(), out }, edition, alloc),
-                    None => expansion.reads.hold(&host(), edition, alloc),
-                };
-                // A read that cannot be asked today is no answer: the call is expanded, and
-                // says so itself.
-                if held == Ok(blaze_expand::Held::Holds) {
-                    taken = Some(expansion);
-                }
-            }
-            match taken {
-                Some(expansion) => {
-                    kept.found(key, index);
-                    found = Some(expansion);
-                }
-                None => kept.moved(),
-            }
-        }
-    }
-    let expansion = match found {
-    Some(expansion) => expansion,
-    None => {
+    let keyed = kept.keeps()
+        && match mac.body {
+            MacroBody::Rules(_) | MacroBody::Macro2 { .. } => true,
+            MacroBody::BuiltinOther(CallShape::Derive) => src.kind == CallShape::Derive,
+            MacroBody::Proc { .. } => runner.is_some(),
+            MacroBody::BuiltinFn(_) | MacroBody::BuiltinOther(_) => false,
+        };
     part(ExpandPart::Define, mac.name, 0);
     let written;
     let def: Kept<'_> = match run.prepares.get(def_key).filter(|_| declarative) {
@@ -1939,7 +1876,20 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
         },
     };
     part(ExpandPart::LexInput, mac.name, src.input.len());
-    let input = lexed(src.input, Lexed::Input)?;
+    // A function-like call's input is the stream inside its delimiters, its last token joint
+    // with the closer when it touches it: the form the body's lowering copies out of the body
+    // (blaze_expand::lex_inside), so one call is one key in both layers. An item macro's input
+    // is the item, lexed as text of its own.
+    let input = match src.kind {
+        CallShape::FnLike => match blaze_expand::lex_inside(src.input, edition, alloc) {
+            Ok(stream) => stream,
+            Err(error) => {
+                note(ExpandNote::Lex { macro_name: mac.name, what: Lexed::Input, error });
+                return None;
+            }
+        },
+        CallShape::Attr | CallShape::Derive => lexed(src.input, Lexed::Input)?,
+    };
     part(ExpandPart::Shape, mac.name, 0);
     let input_tokens = input.len();
     // An item macro's input as its shape takes it: the item without the attribute (and the
@@ -1949,7 +1899,7 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     let mut asked_fits = true;
     let atom = &mut |name: &str, value: Option<&str>| {
         let answer = cfg_atom(name, value);
-        if text_key.is_some() && asked.push(name, value, answer).is_err() {
+        if keyed && asked.push(name, value, answer).is_err() {
             asked_fits = false;
         }
         Ok::<bool, Infallible>(answer)
@@ -2006,6 +1956,47 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
             Call::derive(&item, derive_facts, site)
         }
     };
+    // The call's one key, before the work: the definition's identity and the call as shaped
+    // (an attribute's item without it, a derive's item as it sees it: the cfg answers the walk
+    // took are in those tokens, and in the entry's asked list too).
+    let call_key = keyed.then(|| match kept.planted() {
+        crate::expansions::Planted::None => blaze_expand::call_key(def.def(), &call_of),
+        crate::expansions::Planted::KeyWithoutTheDefinition => {
+            blaze_expand::call_key_of(blaze_expand::MacroContent(blaze_id::ContentId([0; 32])), def.def().site(), &call_of)
+        }
+    });
+    // A kept expansion is taken when its read list is answered today as it was: each cfg atom
+    // the item walk asked, then each read the expansion made.
+    let mut found: Option<blaze_expand::Expansion<'a>> = None;
+    if let Some(key) = call_key {
+        let entry = kept.find(&key).unwrap_or_else(|e| panic!("the kept expansion of a call of `{}` did not open: {e}", mac.name));
+        if let Some((index, entry)) = entry {
+            let mut taken = None;
+            if entry.asked().all(|asked| cfg_atom(asked.name, asked.value) == asked.answer) {
+                let expansion = entry.expansion(alloc).unwrap_or_else(|e| panic!("the kept expansion of a call of `{}` did not read: {e}", mac.name));
+                let held = match base.script {
+                    _ if expansion.reads.list().is_empty() => Ok(blaze_expand::Held::Holds),
+                    Some(out) => expansion.reads.hold(&ScriptCx { inner: host(), out }, edition, alloc),
+                    None => expansion.reads.hold(&host(), edition, alloc),
+                };
+                // A read that cannot be asked today is no answer: the call is expanded, and
+                // says so itself.
+                if held == Ok(blaze_expand::Held::Holds) {
+                    taken = Some(expansion);
+                }
+            }
+            match taken {
+                Some(expansion) => {
+                    kept.found(key, index);
+                    found = Some(expansion);
+                }
+                None => kept.moved(),
+            }
+        }
+    }
+    let expansion = match found {
+    Some(expansion) => expansion,
+    None => {
     // A nested call of an eager builtin names a library builtin unless this crate defines a
     // macro of that name (then the name may be the crate's: refused, never guessed); the
     // library's own `#[rustc_builtin_macro]` definition (core's) is that builtin.
@@ -2031,7 +2022,7 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
         }
     };
     // Kept for the crate's next solve, unless a read of it cannot be asked again.
-    match text_key {
+    match call_key {
         Some(key) => {
             part(ExpandPart::Keep, mac.name, expansion.tokens.len());
             let entry = match expansion.reads.askable() {
@@ -2063,30 +2054,46 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     part(ExpandPart::Outline, mac.name, text.len());
     let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText { text, outline: outline(text, edition, alloc) }, alloc));
     part(ExpandPart::Lower, mac.name, text.len());
-    if let Some(error) = made.outline.errors().first() {
-        // A call a block's module holds ([`crate::blocks`]) stands in STATEMENT position: the
-        // Reference, "Macro invocation", "Statements": its expansion is statements, and one
-        // that is an expression or a `let` (`assert!(..)`, `println!(..)`) writes no item:
-        // nothing is lowered from it and nothing is wrong. One whose statements hold an item
-        // or a call beside what is not an item cannot be read by the item outline: refused by
-        // name below (never half read).
-        let in_block = held(run.made.read(), "made modules")
-            .get(&src.module)
-            .is_some_and(|m| m.info.name.is_some_and(|name| name.starts_with(crate::blocks::BLOCK_MODULE)));
-        if in_block {
-            let mut wrapped = AString::new_in(alloc);
-            wrapped.push_str("{");
-            wrapped.push_str(text);
-            wrapped.push_str("\n}");
-            let nested = blaze_file_items::nested::scan(wrapped.as_str(), alloc);
-            let plain = nested.end == blaze_file_items::nested::NestedEnd::Whole && nested.items.is_empty() && nested.calls.is_empty();
-            if !plain {
+    let (text, made): (&'a str, &'a ExpansionText<'a>) = match made.outline.errors().first() {
+        None => (text, made),
+        Some(error) => {
+            // A call a block's module holds ([`crate::blocks`]) stands in STATEMENT position:
+            // the Reference, "Macro invocation", "Statements": its expansion is statements of
+            // the calling block. One that is an expression or a `let` (`assert!(..)`,
+            // `println!(..)`) declares nothing: nothing is lowered from it. One whose
+            // statements hold items or statement calls beside what is not an item, or that is
+            // a block expression declaring items (`tokio::select!`), is read as statements
+            // (crate::expanded_blocks `statements_as_items`): its top-level items and calls,
+            // and a module per block inside it that holds one, are the call's fragment, lowered
+            // below like any expansion's items (one key, the call's; one record, its
+            // expansion). An expansion nested in it is a call of that fragment: the same step
+            // again, driven by the solve, `src.depth + 1` deep.
+            let in_block = held(run.made.read(), "made modules")
+                .get(&src.module)
+                .is_some_and(|m| m.info.name.is_some_and(|name| name.starts_with(crate::blocks::BLOCK_MODULE)));
+            if !in_block {
                 note(ExpandNote::NotItems { macro_name: mac.name, message: made.outline.message(error) });
+                (text, made)
+            } else {
+                match crate::expanded_blocks::statements_as_items(text, call, alloc) {
+                    Ok(None) => return Some((DeclsBuilder::new_in(alloc), None)),
+                    Ok(Some(items)) => {
+                        let items: &'a str = Box::leak(items.into_boxed_str());
+                        let again: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText { text: items, outline: outline(items, edition, alloc) }, alloc));
+                        if let Some(error) = again.outline.errors().first() {
+                            note(ExpandNote::NotItems { macro_name: mac.name, message: again.outline.message(error) });
+                            return Some((DeclsBuilder::new_in(alloc), None));
+                        }
+                        (items, again)
+                    }
+                    Err(refused) => {
+                        note(ExpandNote::NotItems { macro_name: mac.name, message: refused.message() });
+                        return Some((DeclsBuilder::new_in(alloc), None));
+                    }
+                }
             }
-            return Some((DeclsBuilder::new_in(alloc), None));
         }
-        note(ExpandNote::NotItems { macro_name: mac.name, message: made.outline.message(error) });
-    }
+    };
     let fragment = Fragment {
         module: src.module,
         owner: call,
@@ -2110,7 +2117,8 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     // `mod x;` in it is found from the INCLUDED file's folder, not the calling module's.
     let included_dir: Option<&'a str> = match mac.body {
         MacroBody::BuiltinFn("include") if !mods.is_empty() => {
-            crate::included::included_dir(base.shown_from, file.path, &expansion.reads, alloc).map(|dir| keep(&dir, alloc))
+            let seen = base.sources.crate_env(base.index).map(|env| env.seen());
+            crate::included::included_dir(base.shown_from, seen, file.path, &expansion.reads, alloc).map(|dir| keep(&dir, alloc))
         }
         _ => None,
     };
@@ -2142,10 +2150,11 @@ fn make_blocks<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, bo
     while let Some(body) = work.pop() {
         let nested = blaze_file_items::nested::scan(body.text, alloc);
         // An unbalanced body is the parser's error to report; nothing is read from it.
-        // A block is a module when it holds an impl, or a struct, enum, union or type alias
-        // (its head is made in the block's module by the ordinary code; front2's
-        // `Locals::keep` derives the same module key with `blocks::block_modules`).
-        if nested.end != blaze_file_items::nested::NestedEnd::Whole || !nested.makes_module() {
+        // A block is a module when it holds an item that makes one (its head is made in the
+        // block's module by the ordinary code; front2's `Locals::keep` derives the same module
+        // key with `blocks::block_modules`) or a statement call (what it declares is known
+        // once it is expanded: crate::expanded_blocks).
+        if nested.end != blaze_file_items::nested::NestedEnd::Whole || (!nested.makes_module() && nested.calls.is_empty()) {
             continue;
         }
         if body.depth >= MAX_BLOCK_DEPTH {

@@ -9,10 +9,11 @@
 //! the store's ctor rows; a fn `#[lang]` names as one of core's panic entries is `Panic`; a fn
 //! marked `#[rustc_intrinsic]` is `Intrinsic(Which::named(name))` (an unknown name is
 //! [`ConstFail::UnknownIntrinsic`] naming it); a `const fn` is interpreted from its checked
-//! body; any other fn is `NotConst`. A trait's member is not selected here (the checker's
-//! `resolve_instance` needs the records' mutable fill loop): [`ConstWorld::resolve`] answers
-//! `None` for it and the evaluation refuses, naming it. A trait's associated CONSTANT at a
-//! ground `Self` is selected (`impl_const`: the impl's definition, or the trait's default).
+//! body; any other fn is `NotConst`. A trait's fn is not selected here: [`ConstWorld::resolve`]
+//! answers `None` for it and the evaluation refuses, naming it. A trait's associated CONSTANT
+//! at ground arguments is selected by the checker's solver (const_select.rs, through
+//! `blaze_typeck::resolve_instance`: the impl's definition at the impl's arguments, or the
+//! trait's default); what that selection needs made is made and the step evaluated again.
 //! An ADT's layout (`size_of::<S>()`) reads the store's row of the ADT ([`LayoutFacts::adt`]);
 //! a row not made yet is made when the layout asks for it ([`adt_row`]): never a guessed
 //! layout.
@@ -90,10 +91,9 @@ pub enum ConstFail {
     /// asking [`ConstWorld::resolve`]. Refused by name: evaluating the trait's own text would
     /// give the DEFAULT where an impl overrides it. Owed in those two crates.
     TraitConstNoSelf { item: ItemKey, constant: ItemKey },
-    /// `<Self as Trait>::NAME` in a head ([`super::const_qpath`]): no impl of `trait_` for
-    /// `self_ty` was selected for the trait's constant `constant` (none is made in the store,
-    /// more than one is, or only the solver could choose: [`ConstsWorld::impl_const`]), or the
-    /// one selected neither writes the constant nor has a default in the trait.
+    /// A trait's constant `constant` of `trait_` at `Self` = `self_ty` (a qualified path in a
+    /// head, [`super::const_qpath`], or a path an evaluation reads): no impl of the trait
+    /// holds for that type by the checker's solver (front2/const_select.rs).
     NoImplConst { trait_: ItemKey, self_ty: tc::PNode, constant: ItemKey },
     /// `<Self as Trait>::NAME` in a head: the trait `trait_` declares no constant under the
     /// member key `constant`.
@@ -116,6 +116,10 @@ pub enum ConstFail {
     /// `UnsafeCell<T::Storage>`) holds a projection the checker's solver did not normalize:
     /// that type has no ground form (front2/const_project.rs).
     Projection { item: ItemKey, refused: super::const_project::ProjectionRefused },
+    /// A trait's constant the solver selected no definition for, for a reason other than no
+    /// impl (two impls hold, a question the world has no answer to, a trait declared in a
+    /// body): front2/const_select.rs.
+    SelectConst { refused: super::const_select::ConstSelectRefused },
 }
 
 impl core::fmt::Display for ConstFail {
@@ -134,7 +138,7 @@ impl core::fmt::Display for ConstFail {
             ConstFail::TooManyLengths { item, most } => write!(f, "constant {item:?}: one head named more than {most} array-length constants"),
             ConstFail::AdtRow { item, adt, why } => write!(f, "constant {item:?}: a layout it reads needs the row of ADT {adt:?}: {why}"),
             ConstFail::TraitConstNoSelf { item, constant } => write!(f, "constant {item:?}: the trait's constant {constant:?} is read with no `Self` (a checked body's constant path holds no arguments yet): no impl can be selected"),
-            ConstFail::NoImplConst { trait_, self_ty, constant } => write!(f, "no impl of trait {trait_:?} for the type {self_ty:?} gives its constant {constant:?} (rule: one impl with no generics and that self type, or `impl<T> Tr for T`, is selected; none made, several, or one only the solver can choose is not)"),
+            ConstFail::NoImplConst { trait_, self_ty, constant } => write!(f, "no impl of trait {trait_:?} holds for the type {self_ty:?} to give its constant {constant:?} (rule: the value is the definition in the impl the solver selects for the trait reference, or the trait's default where that impl writes none)"),
             ConstFail::NoTraitConst { trait_, constant } => write!(f, "trait {trait_:?} declares no constant under the key {constant:?}"),
             ConstFail::QPathType { constant } => write!(f, "the trait's constant {constant:?}: a qualified path in a head has a value only at `bool`, `char` or an integer type of at most 16 bytes"),
             ConstFail::QPathCycle { need } => write!(f, "the qualified constant {need:?} needs itself: an impl header of its own selection writes it"),
@@ -142,6 +146,7 @@ impl core::fmt::Display for ConstFail {
             ConstFail::QPathKey { need, clash } => write!(f, "the qualified constant {need:?}: two origins under one checker key: {clash:?}"),
             ConstFail::NotConstBlock { owner, block } => write!(f, "fn {owner:?}: expression {} of its body as the evaluator lowered it is not a `const {{ .. }}` block", block.0),
             ConstFail::Projection { item, refused } => write!(f, "constant {item:?}: a type it lays out: {refused}"),
+            ConstFail::SelectConst { refused } => write!(f, "{refused}"),
         }
     }
 }
@@ -247,10 +252,9 @@ struct ConstsWorld<'w, 'n, S> {
     store: &'w Store<'n>,
     bodies: &'w [ConstBody<'n>],
     records: &'w [ConstRecord<Alloc<'static>>],
-    /// The last (trait, ground `Self`) [`ConstsWorld::impl_const`] selected no impl for among
-    /// the impls made in the store: what [`Consts::value`] makes the candidates of before it
-    /// asks again (front2/const_open.rs `impl_rows`).
-    wanted: core::cell::Cell<Option<super::const_open::Wanted>>,
+    /// The last trait's constant [`ConstWorld::resolve`] asked the solver for and had refused
+    /// (const_select.rs): the step's typed refusal when the evaluation stops there.
+    selected: core::cell::Cell<Option<super::const_select::ConstSelectRefused>>,
     /// What the step's projections asked of the records ([`LayoutFacts::normalize`] below):
     /// [`Consts::value`] makes its fills and asks again, or refuses naming the projection.
     project: super::const_project::ProjectAsk<'w>,
@@ -321,95 +325,6 @@ impl<'n, S: NamesSource<'n>> ConstsWorld<'_, 'n, S> {
             super::keys::Origin::Member { container, kind: super::keys::MemberKind::Const, name } if self.store.trait_defs.contains_key(container) => Some((*container, tc::Name::of(name))),
             _ => None,
         }
-    }
-
-    /// The constant `name` of the impl of `trait_` for the ground type `args[0]`
-    /// (`<B4 as Specifier>::BITS`; the Reference, "Associated constants": the value is the
-    /// implementing type's definition). Selected here only where no solver is needed and the
-    /// answer cannot depend on one: the trait takes no argument but `Self`, `Self` is a
-    /// primitive (`bool`, `char`, an integer) or an ADT with no generic arguments, and EXACTLY
-    /// ONE impl of the trait made in the store has no generics and that very self type and
-    /// writes the constant or leaves it to the trait's default (`declared`, the trait's own
-    /// constant item, then evaluated at `args`). By coherence (the Reference, "Trait
-    /// implementation coherence": no two impls of a trait overlap) that impl is the one that
-    /// applies. One more form is selected, for any ground `Self`: the blanket impl `impl<T> Tr
-    /// for T` whose only clauses are `T: Sized` (see the loop). Anything else (another generic
-    /// impl of `Self`, an impl whose head is not made) is `None`:
-    /// the evaluation refuses, naming the item; never a guessed impl. The impls are scanned
-    /// whole and the answer is the only match, so the map's order does not reach it.
-    fn impl_const(&self, declared: ItemKey, trait_: ItemKey, name: tc::Name, args: List, ground: &mut PortableTys<'_>) -> Option<(ItemKey, List)> {
-        let asked = {
-            let g = ground.view();
-            let list = g.list(args).ok()?;
-            let [self_ty] = list else { return None };
-            match g.node(*self_ty).ok()? {
-                n @ (tc::PNode::Bool | tc::PNode::Char | tc::PNode::Int(_) | tc::PNode::Uint(_)) => (Some(n), None),
-                tc::PNode::Adt(k, l) if g.list(l).ok()?.is_empty() => (None, Some(k)),
-                // Any other ground type: only a blanket impl (below) can be selected for it.
-                _ => (None, None),
-            }
-        };
-        let s = self.store.tys.view();
-        let sized = self.store.sized.map(super::keys::checker_of);
-        let mut found: Option<ItemKey> = None;
-        let mut blanket = false;
-        for (ik, h) in self.store.impls.iter() {
-            if h.trait_ != Some(trait_) {
-                continue;
-            }
-            // A blanket impl `impl<T> Tr for T {}` (the pinned core, library/core/src/mem/
-            // mod.rs: "impl<T> SizedTypeProperties for T {}", through which `size_of::<T>()`
-            // is "<T as SizedTypeProperties>::SIZE"): it applies to every type its clauses
-            // admit. Selected only when those are nothing but `T: Sized` (the implied bound;
-            // the body that named the constant was checked, so `Self: Tr` holds and the type
-            // is sized); with any other clause the choice needs the solver: `None`.
-            if matches!(s.node(h.self_ty).ok()?, tc::PNode::Param(0)) {
-                let clauses = &self.store.preds.get(ik)?.clauses;
-                let only_sized = clauses.iter().all(|c| matches!(*c, tc::PClause::Trait { trait_: t, .. } if Some(t) == sized));
-                if h.generics != 1 || !only_sized {
-                    return None;
-                }
-                blanket = true;
-            } else {
-                if h.generics != 0 {
-                    continue;
-                }
-                let same = match (s.node(h.self_ty).ok()?, asked) {
-                    (tc::PNode::Adt(k, l), (None, Some(a))) => k == a && s.list(l).ok()?.is_empty(),
-                    (n, (Some(a), None)) => n == a,
-                    _ => false,
-                };
-                if !same {
-                    continue;
-                }
-            }
-            // The impl's own definition, or, where the impl writes none, the trait's default
-            // (the Reference, "Associated Items", "Associated Constants", its example "Using
-            // default values": `trait ConstantIdDefault { const ID: i32 = 1; }` with `impl
-            // ConstantIdDefault for Struct {}` gives `assert_eq!(1, <Struct as
-            // ConstantIdDefault>::ID)`). The default is the trait's own row (`declared`),
-            // evaluated at the asked `Self` (`args`); a trait constant with no default that
-            // the impl does not write is an error of the program (E0046): `None`.
-            let c = match h.consts.iter().find(|(n, _)| *n == name) {
-                Some(&(_, c)) => c,
-                None if self.store.fns.get(&declared).is_some_and(|f| f.has_body) => declared,
-                None => return None,
-            };
-            if found.replace(c).is_some() {
-                return None;
-            }
-        }
-        // The trait's default is generic over `Self`, and a blanket impl's own definition over
-        // its one parameter, which is `Self`: both are evaluated at `args`. A non-generic
-        // impl's definition has no parameters.
-        if found.is_none() {
-            // None among the impls MADE so far: the caller that can make headers
-            // ([`Consts::value`]) makes the candidates of (trait, `Self`) once and asks again.
-            let g = ground.view();
-            let self_ty = g.list(args).ok().and_then(|l| l.first().copied());
-            self.wanted.set(self_ty.and_then(|t| Some(super::const_open::Wanted { trait_, self_ty: g.node(t).ok()?, shape: super::buckets::shape_of(g, t) })));
-        }
-        found.map(|c| (c, if c == declared || blanket { args } else { List::EMPTY }))
     }
 
     /// Whether `item` is a member of a trait (its call is selected at the instance).
@@ -494,13 +409,26 @@ impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
         }
     }
 
-    fn resolve(&self, item: ItemKey, args: List, ground: &mut PortableTys<'_>, _: Alloc<'_>) -> Option<(ItemKey, List)> {
+    fn resolve(&self, item: ItemKey, args: List, ground: &mut PortableTys<'_>, alloc: Alloc<'_>) -> Option<(ItemKey, List)> {
         // A trait's constant first: it has a row in `Store::fns` whose container is the trait
-        // (heads.rs `trait_members`), which `of_trait` would take for a trait's fn.
-        if let Some((trait_, name)) = self.trait_const(item) {
-            // A default selected for a ground `Self` is the trait's own item at the same
-            // arguments: asked again, the answer is the same (the selection is idempotent).
-            return self.impl_const(item, trait_, name, args, ground);
+        // (heads.rs `trait_members`), which `of_trait` would take for a trait's fn. Selected by
+        // the checker's solver (const_select.rs); what it asks the records to make is noted
+        // with the projections' (`project`), its refusal kept in `selected`: either way `None`
+        // here, and [`Consts::value`] makes the fills and evaluates again, or refuses by name.
+        // A default selected is the trait's own item at the same arguments: asked again, the
+        // answer is the same (the selection is idempotent).
+        if let Some((trait_, _)) = self.trait_const(item) {
+            return match super::const_select::select_once(self.names, self.keys, self.index, self.store, self.project.buckets(), item, trait_, args, ground, alloc) {
+                super::const_select::Selection::Selected { item, args } => Some((item, args)),
+                super::const_select::Selection::Asked { fills, gaps } => {
+                    self.project.note(fills, gaps);
+                    None
+                }
+                super::const_select::Selection::Refused(refused) => {
+                    self.selected.set(Some(refused));
+                    None
+                }
+            };
         }
         if self.of_trait(item) {
             return None;
@@ -550,8 +478,8 @@ impl<'n> Consts<'n> {
     /// The record of `<Self as Trait>::NAME` for the ground type `self_ty` (a primitive, or
     /// an ADT with no generic arguments), where `declared` is the TRAIT's constant
     /// (front2/const_qpath.rs: a qualified path leaf of a head's constant expression). The
-    /// impl is selected by [`ConstsWorld::impl_const`] over the impls made in the store (the
-    /// caller makes the candidates of (trait, type) first), and what it selects (the impl's
+    /// impl is selected by the checker's solver (const_select.rs `select_made`, which makes
+    /// the candidates of (trait, type) it asks for), and what it selects (the impl's
     /// definition, or the trait's default at `[self_ty]`) is evaluated as [`Consts::value`]
     /// evaluates any constant. No impl selected: [`ConstFail::NoImplConst`].
     pub fn trait_const_value<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, declared: ItemKey, self_ty: tc::PNode) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
@@ -561,7 +489,7 @@ impl<'n> Consts<'n> {
     /// The record of constant `item` at the ground arguments `args` (types of `from`, the
     /// build's ground table: front2/const_at.rs): `[Self, trait args..]` for a trait's constant
     /// as declared, whose impl's definition (or the trait's default) is selected at that `Self`
-    /// ([`ConstsWorld::impl_const`], making the candidate impls first where none is made yet);
+    /// (const_select.rs `select_made`, the checker's solver, making the records it asks for);
     /// the impl's arguments for an inherent impl's. The arguments are copied into this
     /// evaluator's own table first; every constant the value needs is evaluated first by the
     /// same work list as [`Consts::value`]'s (a cycle is the evaluator's typed refusal).
@@ -594,43 +522,34 @@ impl<'n> Consts<'n> {
     }
 
     /// The root of an evaluation that starts at constant `item` at ground `args` (a list of
-    /// `ground`): a trait's constant is selected at `args[0]` ([`ConstsWorld::impl_const`]);
-    /// where no impl is made yet, the candidates of (trait, `Self`) are made once
-    /// (const_open.rs `impl_rows`, which refuses the same pair twice: rule 18) and it is
-    /// selected again. Any other constant is its own root.
-    fn select_args<S: NamesSource<'n>>(&self, r: &mut Records<'_, 'n, S>, item: ItemKey, args: List, ground: &mut PortableTys<'_>) -> Result<(ItemKey, List), ConstFail> {
-        let mut last: Option<super::const_open::Wanted> = None;
-        loop {
-            let world = ConstsWorld { names: r.names, keys: &*r.keys, index: r.index, store: &*r.store, bodies: &self.bodies, records: &self.records, wanted: core::cell::Cell::new(None), project: super::const_project::ProjectAsk::new(r.buckets.as_ref()) };
-            let Some((trait_, name)) = world.trait_const(item) else {
-                return Ok((item, args));
-            };
-            if let Some(found) = world.impl_const(item, trait_, name, args, ground) {
-                return Ok(found);
-            }
-            let wanted = world.wanted.take();
-            let Some(wanted) = wanted else {
-                let self_ty = ground.view().list(args).ok().and_then(|l| l.first().copied()).and_then(|t| ground.view().node(t).ok());
-                return Err(match self_ty {
-                    Some(self_ty) => ConstFail::NoImplConst { trait_, self_ty, constant: item },
-                    None => ConstFail::TraitConstNoSelf { item, constant: item },
-                });
-            };
-            super::const_open::impl_rows(r, &mut last, item, item, wanted)?;
-        }
+    /// `ground`): a trait's constant is selected by the checker's solver with the records'
+    /// fill loop (const_select.rs `select_made`): the impl's definition at the impl's
+    /// arguments, or the trait's default at `args`. Any other constant is its own root.
+    fn select_args<S: NamesSource<'n>>(&self, r: &mut Records<'_, 'n, S>, item: ItemKey, args: List, ground: &mut PortableTys<'_>, alloc: Alloc<'_>) -> Result<(ItemKey, List), ConstFail> {
+        let Some(trait_) = self.trait_of_const(&*r, item) else {
+            return Ok((item, args));
+        };
+        super::const_select::select_made(r, item, trait_, args, ground, alloc)
     }
 
     /// The root of an evaluation that starts at the trait's constant `declared` for the
-    /// ground `self_ty`: the selected item and its arguments (in `ground`).
-    fn select_root<S: NamesSource<'n>>(&self, r: &Records<'_, 'n, S>, declared: ItemKey, self_ty: tc::PNode, ground: &mut PortableTys<'_>) -> Result<(ItemKey, List), ConstFail> {
-        let world = ConstsWorld { names: r.names, keys: &*r.keys, index: r.index, store: &*r.store, bodies: &self.bodies, records: &self.records, wanted: core::cell::Cell::new(None), project: super::const_project::ProjectAsk::new(r.buckets.as_ref()) };
-        let Some((trait_, name)) = world.trait_const(declared) else {
+    /// ground `self_ty`: `[self_ty]` as the arguments, selected as [`Consts::select_args`]
+    /// selects them.
+    fn select_root<S: NamesSource<'n>>(&self, r: &mut Records<'_, 'n, S>, declared: ItemKey, self_ty: tc::PNode, ground: &mut PortableTys<'_>, alloc: Alloc<'_>) -> Result<(ItemKey, List), ConstFail> {
+        let Some(trait_) = self.trait_of_const(&*r, declared) else {
             return Err(ConstFail::TraitConstNoSelf { item: declared, constant: declared });
         };
         let full = |_| ConstFail::Eval(Box::from("the constant evaluator's type table is full"));
         let self_arg = ground.intern(self_ty).map_err(full)?;
         let args = ground.intern_list(&[self_arg]).map_err(full)?;
-        world.impl_const(declared, trait_, name, args, ground).ok_or(ConstFail::NoImplConst { trait_, self_ty, constant: declared })
+        super::const_select::select_made(r, declared, trait_, args, ground, alloc)
+    }
+
+    /// The trait that declares `item`, when `item` is a trait's associated constant
+    /// ([`ConstsWorld::trait_const`], over the records as they are now).
+    fn trait_of_const<S: NamesSource<'n>>(&self, r: &Records<'_, 'n, S>, item: ItemKey) -> Option<ItemKey> {
+        let world = ConstsWorld { names: r.names, keys: &*r.keys, index: r.index, store: &*r.store, bodies: &self.bodies, records: &self.records, selected: core::cell::Cell::new(None), project: super::const_project::ProjectAsk::new(r.buckets.as_ref()) };
+        world.trait_const(item).map(|(trait_, _)| trait_)
     }
 
     /// [`Consts::value`] (`self_ty` is `None`: `item` at no arguments), or
@@ -725,8 +644,8 @@ impl<'n> Consts<'n> {
         let (mut ground, mut layout, mut codes) = self.unit.take().unwrap_or_else(|| (PortableTys::new_in(alloc), Layouts::new_in(alloc), Codes::new_in(alloc)));
         let root = match root {
             Root::Plain => Ok((item, List::EMPTY)),
-            Root::SelfTy(node) => self.select_root(&*r, item, node, &mut ground),
-            Root::Args(list) => self.select_args(r, item, list, &mut ground),
+            Root::SelfTy(node) => self.select_root(r, item, node, &mut ground, alloc),
+            Root::Args(list) => self.select_args(r, item, list, &mut ground, alloc),
         };
         let (item, root_args) = match root {
             Ok(root) => root,
@@ -739,8 +658,6 @@ impl<'n> Consts<'n> {
         let mut last = None;
         let mut out = Ok(());
         let mut steps = 0u32;
-        // The (trait, `Self`) whose candidate impls were made last (const_open.rs `impl_rows`).
-        let mut impls_last: Option<super::const_open::Wanted> = None;
         while let Some(n) = settle.next() {
             steps += 1;
             if steps > MOST_STEPS {
@@ -767,9 +684,9 @@ impl<'n> Consts<'n> {
                 }
                 continue;
             }
-            let world = ConstsWorld { names: r.names, keys: r.keys, index: r.index, store: r.store, bodies: &self.bodies, records: &self.records, wanted: core::cell::Cell::new(None), project: super::const_project::ProjectAsk::new(r.buckets.as_ref()) };
+            let world = ConstsWorld { names: r.names, keys: r.keys, index: r.index, store: r.store, bodies: &self.bodies, records: &self.records, selected: core::cell::Cell::new(None), project: super::const_project::ProjectAsk::new(r.buckets.as_ref()) };
             let answer = value_of(&world, &mut layout, &mut codes, n.item, n.args, &mut ground, Limits::DEFAULT, alloc);
-            let wanted = world.wanted.take();
+            let selected = world.selected.take();
             let asked = world.project.into_asked();
             let step = match answer {
                 Ok(Answer::Done(rec)) => {
@@ -793,14 +710,13 @@ impl<'n> Consts<'n> {
                         Refusal::Missing { what: "ADT definition", item: adt } => Some(adt),
                         _ => None,
                     };
-                    // `<T as Trait>::NAME` reached at a ground `T` (`size_of::<usize>()` is
-                    // `<usize as SizedTypeProperties>::SIZE` in the pinned core) with no impl
-                    // of (trait, `T`) made in the store yet: `impl_const` left the pair in
-                    // `wanted`, the evaluator's code that met it is not kept (blaze-consteval
-                    // machine/code.rs, `Expr::Path`), the candidates are made now and the same
-                    // need is evaluated again. A pair is made once (`impl_rows`).
+                    // `<T as Trait>::NAME` reached at a ground `T` that the solver selected no
+                    // definition for (const_select.rs, kept in `selected` by `resolve`): the
+                    // step's refusal is that one, by name. A selection that asked for records
+                    // (the impls of (trait, `T`), a header) noted them with the projections'
+                    // and is answered below: made, and the same need evaluated again.
                     let no_impl = match e.refusal {
-                        Refusal::Missing { what: "impl for an associated item", item: constant } => wanted.map(|w| (constant, w)),
+                        Refusal::Missing { what: "impl for an associated item", .. } => selected,
                         _ => None,
                     };
                     // A call of a `#[rustc_intrinsic]` fn the table does not hold (`free_fn_kind`
@@ -823,10 +739,7 @@ impl<'n> Consts<'n> {
                             Ok(()) => continue,
                             Err(e) => Err(e),
                         },
-                        (None, None, Some((constant, w))) => match super::const_open::impl_rows(r, &mut impls_last, n.item, constant, w) {
-                            Ok(()) => continue,
-                            Err(e) => Err(e),
-                        },
+                        (None, None, Some(refused)) => Err(refused.into_fail()),
                         // A projection a type of the step holds (a field's `T::Storage`): the
                         // records its normalization needs are made now and the same need is
                         // evaluated again; one the solver refuses is named

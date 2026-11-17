@@ -17,9 +17,11 @@
 //! - Each section is copied once, 16-aligned, into the caller's allocator (the store's
 //!   `get_into` reads a record into a frame; the records' readers need 16-aligned bytes). It is
 //!   then read in place for the command: nothing decodes it whole and no second cache holds it.
-//! - A macro call's expansion is not a record yet (piece 16): [`StoreLoad::expansion`] answers
-//!   none and files the call in [`StoreLoad::unserved`], which the caller turns into a refusal
-//!   of the body ("not checked: types"), never a pass.
+//! - A macro call's expansion text (piece 16) is served from the same record's expansion texts
+//!   section ([`crate::names::expansion_texts`]), copied with the other two. A call the section
+//!   holds no text for (or a damaged row) is answered none and filed in
+//!   [`StoreLoad::unserved`], which the caller turns into a refusal of the body ("not checked:
+//!   types"), never a pass.
 
 use core::cell::RefCell;
 
@@ -35,6 +37,7 @@ use bstd::cx::Cx;
 use bstd::mem::{Bytes, Frame};
 
 use crate::CliError;
+use crate::names::expansion_texts::{ExpansionTexts, ExpansionTextsError};
 use crate::names::sections::{self, SectionsError};
 use crate::store::Store;
 
@@ -44,6 +47,8 @@ pub(crate) struct CrateRecords<'n> {
     pub key: CrateItemKey,
     pub names: &'n [u8],
     pub items: &'n [u8],
+    /// The texts its macro calls made, opened once at the read.
+    pub expansions: ExpansionTexts<'n>,
 }
 
 /// Why a crate's sections could not be served (rule: blaze-cli front_load.rs).
@@ -58,6 +63,8 @@ pub(crate) enum LoadError {
     /// A section does not open as its record.
     Names { name: Name, error: NamesRecordError },
     Items { name: Name, error: ItemsRecordError },
+    /// The expansion texts section does not open.
+    Expansions { name: Name, error: ExpansionTextsError },
     /// The record read under crate `asked`'s name holds crate `found`'s section `which`.
     OtherCrate { name: Name, asked: CrateItemKey, found: CrateItemKey, which: &'static str },
     /// The store could not be read.
@@ -72,6 +79,7 @@ impl core::fmt::Display for LoadError {
             LoadError::Sections { name, error } => write!(f, "the record of {name:?}: {error}"),
             LoadError::Names { name, error } => write!(f, "the names section of {name:?} does not open: {error:?} (rule: front_load.rs)"),
             LoadError::Items { name, error } => write!(f, "the items section of {name:?} does not open: {error:?} (rule: front_load.rs)"),
+            LoadError::Expansions { name, error } => write!(f, "the expansion texts of {name:?}: {error}"),
             LoadError::OtherCrate { name, asked, found, which } => {
                 write!(f, "the record of {name:?} holds the {which} section of crate {found:?}, not of {asked:?} (rule: front_load.rs)")
             }
@@ -86,6 +94,7 @@ pub(crate) fn crate_records<'n>(name: Name, payload: &[u8], key: CrateItemKey, a
     let parts = sections::sections(payload).map_err(|error| LoadError::Sections { name, error })?;
     let names = blaze_scope::resolve::aligned(parts.names, alloc);
     let items = blaze_scope::resolve::aligned(parts.items, alloc);
+    let expansions = ExpansionTexts::open(blaze_scope::resolve::aligned(parts.expansions, alloc)).map_err(|error| LoadError::Expansions { name, error })?;
     let found = NamesRecord::open(names, alloc).map_err(|error| LoadError::Names { name, error })?.key();
     if found != key {
         return Err(LoadError::OtherCrate { name, asked: key, found, which: "names" });
@@ -94,7 +103,7 @@ pub(crate) fn crate_records<'n>(name: Name, payload: &[u8], key: CrateItemKey, a
     if found != key {
         return Err(LoadError::OtherCrate { name, asked: key, found, which: "items" });
     }
-    Ok(CrateRecords { key, names, items })
+    Ok(CrateRecords { key, names, items, expansions })
 }
 
 /// The crate `key`'s sections from the record `input` names, read from `store` by its key
@@ -121,7 +130,7 @@ pub(crate) struct StoreLoad<'n> {
     /// `CrateInput::shown_from`): a record's package path is joined onto it to read (D96).
     packages: &'n [&'n str],
     texts: &'n dyn SourceTexts<'n>,
-    /// Each (crate, call) whose expansion was asked: none is served yet (piece 16).
+    /// Each (crate, call) whose expansion was asked and that crate's record holds no text for.
     unserved: RefCell<AVec<'n, (usize, ItemKey)>>,
     alloc: Alloc<'n>,
 }
@@ -159,8 +168,11 @@ impl<'n> Load<'n> for StoreLoad<'n> {
     }
 
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'n str> {
-        self.unserved.borrow_mut().push((krate, call));
-        None
+        let text = self.crates.get(krate).and_then(|c| c.expansions.text(call).ok().flatten());
+        if text.is_none() {
+            self.unserved.borrow_mut().push((krate, call));
+        }
+        text
     }
 }
 
@@ -185,7 +197,9 @@ mod tests {
     use blaze_unit_graph::{Implicit, Prelude, StdIs};
     use bstd::io::{Io, Limits, SimWorld};
 
-    const LIB: &str = "#![no_core]\npub mod m {\n    pub struct Thing;\n    pub fn make() -> Thing { Thing }\n}\npub use m::Thing;\nfn hidden() {}\n";
+    /// `made` and `Made` are written by a macro call (piece 16): their text is the call's
+    /// expansion, read through [`StoreLoad::expansion`] from the record's expansion texts.
+    const LIB: &str = "#![no_core]\npub mod m {\n    pub struct Thing;\n    pub fn make() -> Thing { Thing }\n}\npub use m::Thing;\nfn hidden() {}\nmacro_rules! write_two {\n    () => {\n        pub struct Made;\n        pub fn made() -> Made { Made }\n    };\n}\nwrite_two!();\n";
     const APP: &str = "#![no_core]\nuse lib::m::make;\npub struct Own;\nfn main() { let _ = make(); }\nmod inner { pub fn g() {} }\n";
 
     /// The files of the two crates, at their world paths.
@@ -227,12 +241,20 @@ mod tests {
 
     /// Each crate's `CrateScope` payload as names.rs `run` writes it.
     fn payloads(names: &Names<'_>) -> std::vec::Vec<blaze_own::Vec<u8, std::alloc::Global>> {
+        payloads_with(names, true)
+    }
+
+    /// The payloads, with each crate's expansion texts section, or (`texts` false: the planted
+    /// bug, the loader as before piece 16) with that section left empty.
+    fn payloads_with(names: &Names<'_>, texts: bool) -> std::vec::Vec<blaze_own::Vec<u8, std::alloc::Global>> {
         let g = Alloc::global();
         let mut out = std::vec::Vec::new();
         for c in names.crates().iter() {
             let n = blaze_scope::names_record::encode(c, g).unwrap_or_else(|e| panic!("names record of `{}`: {e:?}", c.name));
             let i = blaze_scope::items_record::encode(c, g).unwrap_or_else(|e| panic!("items record of `{}`: {e:?}", c.name));
-            out.push(sections::write(0, [&[], &[], &n[..], &i[..], &[]]));
+            let e = crate::names::expansion_texts::write(c).unwrap_or_else(|e| panic!("expansion texts of `{}`: {e}", c.name));
+            let e: &[u8] = if texts { &e[..] } else { &[] };
+            out.push(sections::write(0, [&[], &[], &n[..], &i[..], &[], e]));
         }
         out
     }
@@ -261,6 +283,53 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The answers in memory, the answers over the store load, whether the reader logged, and
+    /// how many calls' texts the load could not serve.
+    fn both(texts: bool) -> (std::vec::Vec<std::string::String>, std::vec::Vec<std::string::String>, bool, usize) {
+        let names = solved();
+        let solved_answers = answers(&names);
+        let keys: std::vec::Vec<CrateItemKey> = names.crates().iter().map(|c| c.key).collect();
+        let payloads = payloads_with(&names, texts);
+        let g = Alloc::global();
+        let read: std::vec::Vec<CrateRecords<'static>> = keys
+            .iter()
+            .zip(payloads.iter())
+            .map(|(key, payload)| crate_records(scope_name(*key), payload, *key, g).unwrap_or_else(|e| panic!("{e}")))
+            .collect();
+        let read: &'static [CrateRecords<'static>] = std::vec::Vec::leak(read);
+        let packages: &'static [&'static str] = std::vec::Vec::leak(keys.iter().map(|_| "/").collect());
+        let load: &'static StoreLoad<'static> = std::boxed::Box::leak(std::boxed::Box::new(StoreLoad::new(read, packages, &Files, g)));
+        let crate_names: &'static [&'static str] = std::vec::Vec::leak(names.crates().iter().map(|c| &*std::string::String::from(c.name).leak()).collect());
+        let log: &'static Log<'static> = std::boxed::Box::leak(std::boxed::Box::new(Log::new(crate_names, g)));
+        let frame: &'static Frame = std::boxed::Box::leak(std::boxed::Box::new(Frame::new(bstd::mem::Tag::Other).expect("a frame")));
+        let records: &'static Records<'static> = std::boxed::Box::leak(std::boxed::Box::new(Records::new(load.keys(g), load, log, frame, g)));
+        let over_store = answers(records);
+        let unserved = load.unserved().len();
+        (solved_answers, over_store, log.is_empty(), unserved)
+    }
+
+    /// Piece 16: an item a macro call wrote (`lib`'s `made`, `Made`) is read through the
+    /// command's loader from its crate's record, its text equal to the solve's; the loader
+    /// leaves no call unserved. CONTROL: the same records without the expansion texts section
+    /// (the loader before piece 16, which served none): the macro's items' answers differ (no
+    /// text) and their calls are unserved.
+    /// Prints `front load: N items equal over the store, M of them written by a macro call`.
+    #[test]
+    fn an_item_a_macro_call_wrote_is_read_through_the_store_load() {
+        let (solved_answers, over_store, quiet, unserved) = both(true);
+        let by_macro = solved_answers.iter().filter(|a| a.contains("pub fn made") || a.contains("pub struct Made")).count();
+        assert!(by_macro >= 2, "the macro's two items are among the answers: {solved_answers:?}");
+        assert!(quiet, "the reader logged over the records with texts");
+        assert_eq!(unserved, 0, "a call's text was not served");
+        assert_eq!(solved_answers, over_store, "an answer differs over the store");
+        let (_, without, _, unserved) = both(false);
+        let differ = solved_answers.iter().zip(without.iter()).filter(|(a, b)| a != b).count();
+        // The two items the call wrote (the crate's root text also holds the macro's rules, so
+        // `by_macro` counts more answers than the call's own).
+        assert!(differ >= 2 && unserved > 0, "CONTROL: without the texts section the macro's items still answered ({differ} differ, {unserved} unserved)");
+        println!("front load: {} items equal over the store, {by_macro} of them written by a macro call", over_store.len());
     }
 
     #[test]

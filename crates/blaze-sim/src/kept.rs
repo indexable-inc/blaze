@@ -11,10 +11,12 @@
 //! `#` comment lines and blank lines allowed. The file is an input of the build, never read at
 //! run time (rule 75): [`sim_kept!`](crate::sim_kept) expands to its `include_str!` at the call
 //! site, and [`check_kept`] replays this test's lines FIRST, in file order, before any search. A
-//! line that does not parse fails the test naming its line; a line of another primitives version
-//! is still replayed, and a failure says so beside it. A line whose test is gone is found by
-//! [`all_known`], which a crate calls from one test with the paths of all its sim tests. Lines
-//! are only added.
+//! line that does not parse fails the test naming its line. The `v<n>` of a line is its tape's
+//! format: the version of the draws that read it ([`PRIMITIVES`]). A line of another version is
+//! not replayed (other draws read its tape as another case, or as no case at all) and is no
+//! failure: it is a [`KeptRefusal`] printed by name, and the search finds the failure again under
+//! this build's draws, to be kept again. A line whose test is gone is found by [`all_known`],
+//! which a crate calls from one test with the paths of all its sim tests. Lines are only added.
 //!
 //! The test path is the one [`report`](crate::check::report) prints: the name of the test on the
 //! thread (libtest names the thread after the test), or `file:line` of the check when the thread
@@ -36,8 +38,8 @@ use crate::text::{self, TextError};
 /// The version of the draws a tape is read by. A tape is a list of choices; what a choice means
 /// is the primitives' business, so a tape kept under one version can draw other values under
 /// another. 1 is the draws of today; 2 is the edge-first draws (pieces S1 and S2, behind the
-/// cargo feature `edge-first`). A kept line of another version is still replayed; a failure
-/// says "kept under primitives v<n>" beside it.
+/// cargo feature `edge-first`). It is the `v<n>` a kept line is written with, its tape's format:
+/// a line of another version is not replayed but refused by name ([`KeptRefusal`]).
 pub const PRIMITIVES: u32 = if cfg!(feature = "edge-first") { 2 } else { 1 };
 
 /// The name of the file a crate keeps its lines in, beside its `Cargo.toml`.
@@ -283,11 +285,56 @@ pub fn unknown(file: File, known: &[&str]) -> Result<(), KeptError> {
 
 /// For a crate's ONE test that lists its sim tests: panics naming the first line of `file` that
 /// does not parse or is kept for a test not in `known` (a test renamed or removed). One test
-/// alone cannot see a line kept for no test; the crate's list can.
+/// alone cannot see a line kept for no test; the crate's list can. Prints each line kept under
+/// other primitives by name, as `check_kept` does: a refusal, not a failure.
 #[track_caller]
 pub fn all_known(file: File, known: &[&str]) {
     if let Err(error) = unknown(file, known) {
         panic!("{error}");
+    }
+    for line in file.lines().map_while(Result::ok) {
+        if let Some(refusal) = KeptRefusal::of(file, &line) {
+            say_refused(refusal);
+        }
+    }
+}
+
+/// A kept line this build does not replay. Never a failure: printed by name, and the search finds
+/// the failure again, to be kept again under this build's version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeptRefusal {
+    /// The line was kept under other primitives (`kept`) than this build's (`build`): other draws
+    /// read its tape as another case, so replaying it would test nothing it was kept for.
+    OtherPrimitives { krate: &'static str, line: usize, kept: u32, build: u32 },
+}
+
+impl KeptRefusal {
+    /// The refusal of `line` of `file`, when this build does not replay it.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn of(file: File, line: &Line) -> Option<KeptRefusal> {
+        match line.version == PRIMITIVES {
+            true => None,
+            false => Some(KeptRefusal::OtherPrimitives {
+                krate: file.krate,
+                line: line.number,
+                kept: line.version,
+                build: PRIMITIVES,
+            }),
+        }
+    }
+}
+
+impl fmt::Display for KeptRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            KeptRefusal::OtherPrimitives { krate, line, kept, build } => write!(
+                f,
+                "blaze-sim: line {line} of `{krate}`'s {FILE_NAME} kept under v{kept}, not replayed by this v{build} build: the search re-finds it"
+            ),
+        }
     }
 }
 
@@ -424,9 +471,9 @@ impl fmt::Display for Test<'_> {
 /// this test's, the one `report` names it by, each run alone on its tape in file order; then
 /// `check(config, body)`, the search (which ends in `check_given`), with what the person or the
 /// runner gave. A kept tape that does not pass panics with `kept tape replayed first: case <k> of
-/// <n>`, its line, and, when it was kept under another primitives version, `kept under
-/// primitives v<n>`; a line of the file that does not parse panics naming it. Reads no file at
-/// run time (rule 75).
+/// <n>` and its line; a line of the file that does not parse panics naming it; a line kept under
+/// other primitives is not replayed and is printed as a [`KeptRefusal`]. Reads no file at run time
+/// (rule 75).
 #[track_caller]
 pub fn check_kept<O: Outcome>(config: Config, kept: File, body: impl FnMut(&Tape) -> O) {
     let at = Location::caller();
@@ -443,13 +490,33 @@ pub(crate) enum Order {
     SearchFirst,
 }
 
+/// Which kept lines are replayed: this build's version alone (right), or every line (the planted
+/// bug a test catches: "replay anyway").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Versions {
+    This,
+    #[cfg(test)]
+    All,
+}
+
+impl Versions {
+    /// Whether `line` is replayed.
+    fn replays(self, line: &Line) -> bool {
+        match self {
+            Versions::This => line.version == PRIMITIVES,
+            #[cfg(test)]
+            Versions::All => true,
+        }
+    }
+}
+
 /// What the kept lines of a test came to when all passed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Replayed {
     /// This test's lines replayed.
     pub kept: usize,
-    /// Of those, the ones kept under another primitives version.
-    pub other_version: usize,
+    /// This test's lines not replayed, each a [`KeptRefusal`] printed by name.
+    pub refused: usize,
 }
 
 /// Why `check_kept` failed before or instead of its search.
@@ -500,13 +567,6 @@ impl fmt::Display for Said<'_, '_> {
             "blaze-sim: kept tape replayed first: case {} of {} kept for `{test}` (line {} of `{}`'s {FILE_NAME}",
             failed.case, failed.of, failed.line.number, failed.krate
         )?;
-        if failed.line.version != PRIMITIVES {
-            write!(
-                f,
-                ", kept under primitives v{}: this build draws under v{PRIMITIVES}",
-                failed.line.version
-            )?;
-        }
         write!(f, ")\n{}", report(&failed.verdict, test.at, test.name))
     }
 }
@@ -518,46 +578,59 @@ impl fmt::Display for Said<'_, '_> {
 pub(crate) fn kept_then_search<O: Outcome>(
     config: Config,
     file: File,
+    body: impl FnMut(&Tape) -> O,
+    order: Order,
+) -> Result<Replayed, KeptFailed> {
+    kept_then_search_with(config, file, body, order, Versions::This)
+}
+
+/// [`kept_then_search`], replaying the lines `versions` says.
+#[track_caller]
+pub(crate) fn kept_then_search_with<O: Outcome>(
+    config: Config,
+    file: File,
     mut body: impl FnMut(&Tape) -> O,
     order: Order,
+    versions: Versions,
 ) -> Result<Replayed, KeptFailed> {
     let at = Location::caller();
     match order {
         Order::KeptFirst => {
-            let replayed = replay(&config, file, at, &mut body)?;
+            let replayed = replay(&config, file, at, versions, &mut body)?;
             check(config, body);
             Ok(replayed)
         }
         #[cfg(test)]
         Order::SearchFirst => {
             check(config.clone(), &mut body);
-            replay(&config, file, at, &mut body)
+            replay(&config, file, at, versions, &mut body)
         }
     }
 }
 
-/// Replays this test's lines of `file` in file order. Every line of the file is read first, so
-/// a line that does not parse fails every test that reads the file.
+/// Replays this test's lines of `file` that `versions` replays, in file order; the others are
+/// refused by name. Every line of the file is read first, so a line that does not parse fails
+/// every test that reads the file.
 fn replay<O: Outcome>(
     config: &Config,
     file: File,
     at: &Location<'_>,
+    versions: Versions,
     body: &mut impl FnMut(&Tape) -> O,
 ) -> Result<Replayed, KeptFailed> {
     with_test_name(|name| {
         let test = Test { name, at };
         let mut of = 0;
         for line in file.lines() {
-            if test.is(line.map_err(KeptFailed::File)?.test) {
+            let line = line.map_err(KeptFailed::File)?;
+            if test.is(line.test) && versions.replays(&line) {
                 of += 1;
             }
         }
-        let (mut case, mut other_version) = (0, 0);
-        for line in file.lines().map_while(Result::ok).filter(|line| test.is(line.test)) {
+        let mine = |line: &Line| test.is(line.test) && versions.replays(line);
+        let mut case = 0;
+        for line in file.lines().map_while(Result::ok).filter(mine) {
             case += 1;
-            if line.version != PRIMITIVES {
-                other_version += 1;
-            }
             let tape = text::parse(line.tape).map_err(|error| {
                 KeptFailed::File(KeptError::Line {
                     krate: file.krate,
@@ -578,10 +651,8 @@ fn replay<O: Outcome>(
                 }));
             }
         }
-        if of > 0 {
-            say_replayed(test, of, other_version);
-        }
-        Ok(Replayed { kept: of, other_version })
+        let refused = say_replayed(file, test, of, versions);
+        Ok(Replayed { kept: of, refused })
     })
 }
 
@@ -595,10 +666,35 @@ fn replay<O: Outcome>(
     blaze::effect_breadth,
     reason = "one `println!`: std's `_print` brings IO, blocking, locking and allocating and its arguments' formatting panicking, so any function that prints a line has all five"
 )]
-fn say_replayed(test: Test<'_>, kept: usize, other_version: usize) {
-    println!(
-        "blaze-sim: {test}: {kept} kept tapes replayed first, all passed ({other_version} kept under another primitives version than v{PRIMITIVES})"
-    );
+fn say_replayed(file: File, test: Test<'_>, kept: usize, versions: Versions) -> usize {
+    let mut refused = 0;
+    for line in file.lines().map_while(Result::ok) {
+        if !test.is(line.test) || versions.replays(&line) {
+            continue;
+        }
+        if let Some(refusal) = KeptRefusal::of(file, &line) {
+            say_refused(refusal);
+            refused += 1;
+        }
+    }
+    if kept > 0 {
+        println!("blaze-sim: {test}: {kept} kept tapes replayed first, all passed");
+    }
+    refused
+}
+
+/// Prints a kept line this build does not replay, by name.
+#[expect(clippy::print_stdout, reason = "a refusal goes to the test's own output, beside its pass line")]
+#[expect(
+    blaze::std_use,
+    reason = "a refusal goes to the test's own output, which the test harness captures through `println!` alone"
+)]
+#[expect(
+    blaze::effect_breadth,
+    reason = "one `println!`: std's `_print` brings IO, blocking, locking and allocating and its arguments' formatting panicking, so any function that prints a line has all five"
+)]
+fn say_refused(refusal: KeptRefusal) {
+    println!("{refusal}");
 }
 
 // Declared after `sim_kept!` so the tests name it by textual scope: `crate::sim_kept!` is refused

@@ -35,6 +35,7 @@ struct Made(usize, Outline<'static>);
 unsafe impl Send for Made {}
 
 fn main() {
+    let heap = blaze_own::Heap::process();
     let mut files: Vec<PathBuf, Global> = Vec::new_in(Global);
     let mut stack: Vec<PathBuf, Global> = Vec::new_in(Global);
     stack.extend(std::env::args_os().skip(1).map(PathBuf::from));
@@ -76,10 +77,10 @@ fn main() {
     let mut items = 0;
     for _ in 0..3 {
         let start = Instant::now();
-        let whole = outline_with(&text, Edition::E2024, Bodies::Skipped, Alloc::global());
+        let whole = outline_with(&text, Edition::E2024, Bodies::Skipped, heap.alloc());
         best.0 = best.0.min(ms(start));
         let start = Instant::now();
-        let parts = outline(&text, Edition::E2024, Alloc::global());
+        let parts = outline(&text, Edition::E2024, heap.alloc());
         best.1 = best.1.min(ms(start));
         assert!(whole == parts, "the parts' outline is the whole file's");
         items = parts.items().len();
@@ -90,7 +91,7 @@ fn main() {
     // Cold on N threads: the split on N (speculate per chunk, then join), the parts on N, the
     // assembly on one.
     let most = std::thread::available_parallelism().map_or(1, |it| it.get());
-    let whole = outline_with(&text, Edition::E2024, Bodies::Skipped, Alloc::global());
+    let whole = outline_with(&text, Edition::E2024, Bodies::Skipped, heap.alloc());
     for threads in [1usize, 18] {
         if threads > most {
             println!("threads {threads}: this machine has {most}");
@@ -100,7 +101,7 @@ fn main() {
         let mut count = 0;
         for _ in 0..3 {
             let start = Instant::now();
-            let (ranges, _) = split_on(&text, threads);
+            let (ranges, _) = split_on(&text, threads, heap);
             let split = ms(start);
             let next = AtomicUsize::new(0);
             let made = std::sync::Mutex::new(Vec::<Made, Global>::with_capacity_in(ranges.len(), Global));
@@ -112,7 +113,7 @@ fn main() {
                         loop {
                             let at = next.fetch_add(1, Ordering::Relaxed);
                             let Some(range) = ranges.get(at) else { break };
-                            mine.push(Made(at, outline_item(&text[range.to_usize()], Edition::E2024, Alloc::global())));
+                            mine.push(Made(at, outline_item(&text[range.to_usize()], Edition::E2024, heap.alloc())));
                         }
                         made.lock().expect("no worker panics").extend(mine);
                     });
@@ -122,14 +123,14 @@ fn main() {
             let start_assemble = Instant::now();
             let mut made = made.into_inner().expect("no worker panics");
             made.sort_by_key(|it| it.0);
-            let assembled = Assembled::new(made.iter().map(|it| (ranges[it.0].start, &it.1)), Alloc::global());
+            let assembled = Assembled::new(made.iter().map(|it| (ranges[it.0].start, &it.1)), heap.alloc());
             let assemble_ms = ms(start_assemble);
             let total = ms(start);
             for (slot, value) in best.iter_mut().zip([total, split, parts_ms, assemble_ms]) {
                 *slot = slot.min(value);
             }
             count = ranges.len();
-            assert!(assembled.to_outline(Alloc::global()) == whole, "the cold outline from parts is the whole walk's");
+            assert!(assembled.to_outline(heap.alloc()) == whole, "the cold outline from parts is the whole walk's");
         }
         println!(
             "cold, {threads} threads: {:.1} ms best of 3 ({count} parts; split {:.1} ms, parts {:.1} ms, assemble {:.1} ms, each best of 3)",
@@ -138,14 +139,14 @@ fn main() {
     }
 
     // An edit to one part, every other part's outline in hand under its digest.
-    let ranges = split_top_level(&text, Alloc::global());
+    let ranges = split_top_level(&text, heap.alloc());
     let digest = |part: &str| part_digest(part.as_bytes());
-    let mut index: ByHash<ContentId, usize, Alloc<'static>> = ByHash::new_in(Alloc::global());
+    let mut index: ByHash<ContentId, usize, Alloc<'static>> = ByHash::new_in(heap.alloc());
     let mut cache: Vec<Outline<'static>, Global> = Vec::new_in(Global);
     for range in ranges.iter() {
         let part = &text[range.to_usize()];
         index.entry(digest(part)).or_insert(cache.len());
-        cache.push(outline_item(part, Edition::E2024, Alloc::global()));
+        cache.push(outline_item(part, Edition::E2024, heap.alloc()));
     }
     // The edit: a line added at the top of the middle part's last `fn` body.
     let middle = ranges[ranges.len() / 2];
@@ -181,7 +182,7 @@ fn main() {
     let mut rescanned = 0;
     for _ in 0..3 {
         let start = Instant::now();
-        let made = resplit(&text, &prev, &edited, Alloc::global());
+        let made = resplit(&text, &prev, &edited, heap.alloc());
         let split = ms(start);
         rescanned = made.rescanned.to_usize().len();
         assert!(made.synced, "a one-line edit inside a body meets an old cut");
@@ -199,7 +200,7 @@ fn main() {
         let start_make = Instant::now();
         let mut fresh: Vec<Outline<'static>, Global> = Vec::new_in(Global);
         for missing in found.iter().filter_map(|it| it.err()) {
-            fresh.push(outline_item(&edited[missing.to_usize()], Edition::E2024, Alloc::global()));
+            fresh.push(outline_item(&edited[missing.to_usize()], Edition::E2024, heap.alloc()));
         }
         let make = ms(start_make);
         missed = fresh.len();
@@ -217,14 +218,14 @@ fn main() {
             all.extend(parts);
             all
         };
-        let assembled = Assembled::new(parts.iter().copied(), Alloc::global());
+        let assembled = Assembled::new(parts.iter().copied(), heap.alloc());
         let assemble_ms = ms(start_assemble);
         let total = ms(start);
         for (slot, value) in best.iter_mut().zip([total, split, look, make, assemble_ms]) {
             *slot = slot.min(value);
         }
         assert!(
-            assembled.to_outline(Alloc::global()) == outline_with(&edited, Edition::E2024, Bodies::Skipped, Alloc::global()),
+            assembled.to_outline(heap.alloc()) == outline_with(&edited, Edition::E2024, Bodies::Skipped, heap.alloc()),
             "the edited file's outline from parts in hand is the whole walk's"
         );
     }
@@ -248,7 +249,7 @@ fn main() {
         let mut again = 0;
         for _ in 0..3 {
             let start = Instant::now();
-            let (ranges, times) = split_on(&text, threads);
+            let (ranges, times) = split_on(&text, threads, heap);
             again = times.again;
             let (speculated, joined) = (times.speculate, times.join);
             let start_digest = Instant::now();
@@ -268,7 +269,7 @@ fn main() {
             for (slot, value) in best.iter_mut().zip([ms(start), speculated, joined, digested]) {
                 *slot = slot.min(value);
             }
-            assert!(ranges[..] == split_top_level(&text, Alloc::global())[..], "the joined split is the split");
+            assert!(ranges[..] == split_top_level(&text, heap.alloc())[..], "the joined split is the split");
         }
         println!(
             "split and digest, {threads} threads, digests {}: {:.2} ms best of 3 (speculative scans {:.2} ms, join {:.2} ms with {again} bytes scanned again, digests {:.2} ms, each best of 3)",
@@ -289,10 +290,10 @@ struct SplitTimes {
 /// The top-level split of `text` on `threads`: each chunk scanned from its guessed start on a
 /// worker ([`speculate`]), then verified and mended at the seams on this thread ([`join`]). The
 /// ranges are copied into a column over the global heap, which is `Sync`, for the workers.
-fn split_on(text: &str, threads: usize) -> (Vec<Range, Global>, SplitTimes) {
+fn split_on(text: &str, threads: usize, heap: &'static blaze_own::Heap) -> (Vec<Range, Global>, SplitTimes) {
     let ms = |since: Instant| since.elapsed().as_secs_f64() * 1e3;
     let start = Instant::now();
-    let starts = chunk_starts(text, threads, Alloc::global());
+    let starts = chunk_starts(text, threads, heap.alloc());
     let mut bounds = Vec::<(u32, u32), Global>::with_capacity_in(starts.len(), Global);
     for (at, &chunk) in starts.iter().enumerate() {
         let until = starts.get(at + 1).copied().unwrap_or(u32::try_from(text.len()).expect("a file under 4 GiB"));
@@ -306,7 +307,7 @@ fn split_on(text: &str, threads: usize) -> (Vec<Range, Global>, SplitTimes) {
                 loop {
                     let at = next.fetch_add(1, Ordering::Relaxed);
                     let Some(&(chunk, until)) = bounds.get(at) else { break };
-                    let spec = Spec(at, speculate(text, chunk, until, Alloc::global()));
+                    let spec = Spec(at, speculate(text, chunk, until, heap.alloc()));
                     made.lock().expect("no worker panics").push(spec);
                 }
             });
@@ -318,7 +319,7 @@ fn split_on(text: &str, threads: usize) -> (Vec<Range, Global>, SplitTimes) {
     made.sort_by_key(|it| it.0);
     let mut chunks = Vec::with_capacity_in(made.len(), Global);
     chunks.extend(made.into_iter().map(|it| it.1));
-    let (parts, again) = join(text, &chunks, Alloc::global());
+    let (parts, again) = join(text, &chunks, heap.alloc());
     let mut ranges = Vec::<Range, Global>::with_capacity_in(parts.len(), Global);
     ranges.extend_from_slice(&parts);
     (ranges, SplitTimes { speculate: speculated, join: ms(start_join), again })

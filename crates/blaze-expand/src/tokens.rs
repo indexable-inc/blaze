@@ -919,6 +919,25 @@ fn doc_comment(
     Some(write(out))
 }
 
+/// The tokens inside a delimited group whose inner text is `text` (a function-like call's
+/// input as written between its delimiters): [`lex`] of the text, except that the last token
+/// is joint with the closing delimiter when it touches it (`Spacing::JointHidden`), as the
+/// group's own lexing makes it. This is the one form of a call's input: the names library lexes
+/// a call's text with it, and the body's lowering copies the same tokens out of the stream of
+/// the body around the call, so one call is one [`crate::call_key`] in both layers.
+pub fn lex_inside<'a>(
+    text: &str,
+    edition: Edition,
+    alloc: Alloc<'a>,
+) -> Result<TokenStream<'a>, LexError> {
+    let mut group = blaze_own::AString::new_in(alloc);
+    group.push('(');
+    group.push_str(text);
+    group.push(')');
+    let whole = lex(group.as_str(), edition, alloc)?;
+    Ok(whole.copy_in(1..whole.len() - 1, alloc)?)
+}
+
 /// The last identifier or literal pushed, and where its text ends: it is joint with the next
 /// token if that one starts there.
 type Pending = Option<(usize, usize)>;

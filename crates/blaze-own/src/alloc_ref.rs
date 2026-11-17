@@ -236,7 +236,62 @@ mod global {
             GLOBAL.shared()
         }
     }
+
+    /// The process's heap as a capability (decision D102, rule 75 "nothing ambient"): the
+    /// global allocator, reached only through a `&Heap` its holder was handed. Holding one is
+    /// the proof: the field is private, so no code makes a `Heap`; the one value is [`HEAP`],
+    /// and only two functions hand out a reference to it: [`Heap::process`], which the
+    /// program's entry calls, and [`crate::testing::heap`], a test's entry (the `testing`
+    /// feature). Every handle is borrowed from it ([`Heap::alloc`], [`Heap::shared`]); they are
+    /// handles of the one global allocator, so a block made through one may be freed through
+    /// any other (and through `Alloc::global()`'s, while that still exists).
+    pub struct Heap {
+        _only_here: (),
+    }
+
+    /// The one heap.
+    static HEAP: Heap = Heap { _only_here: () };
+
+    impl Heap {
+        /// The process's heap, for the program's entry only: `rt::run`, `rt::launch` and
+        /// `guest::start`'s caller in bstd, a plain binary's `fn main`. A library never calls
+        /// it; it takes `&Heap` or an `Alloc<'_>` from its caller. Which code may call it is
+        /// held by the ratchet (tools/ratchets/alloc-global.txt counts every call, per crate),
+        /// not by a flag at run time: the hosted start runs no atomic (guest.rs), and taking it
+        /// costs nothing.
+        #[inline]
+        pub const fn process() -> &'static Heap {
+            &HEAP
+        }
+
+        /// The heap for a test: [`crate::testing::heap`] is the one way to it.
+        #[cfg(any(test, feature = "testing"))]
+        pub(crate) fn for_tests() -> &'static Heap {
+            &HEAP
+        }
+
+        /// The heap's handle, borrowed from it: the kind every function takes.
+        #[inline]
+        pub fn alloc(&self) -> Alloc<'_> {
+            GLOBAL.handle()
+        }
+
+        /// The heap's handle that may cross threads, borrowed from it.
+        #[inline]
+        pub fn shared(&self) -> SharedAlloc<'_> {
+            GLOBAL.shared()
+        }
+    }
+
+    impl core::fmt::Debug for Heap {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("Heap")
+        }
+    }
 }
+
+#[cfg(any(test, feature = "std"))]
+pub use global::Heap;
 
 impl fmt::Debug for Alloc<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

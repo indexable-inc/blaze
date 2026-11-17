@@ -146,6 +146,7 @@ impl World for ToyWorld {
             declared_count: 0,
             self_param: false,
             header: crate::ids::FnPtrHeader::RUST,
+            c_variadic: false,
             inputs: &self.sig_inputs,
             output: self.sig_output,
             types: self.sig_types.view(),

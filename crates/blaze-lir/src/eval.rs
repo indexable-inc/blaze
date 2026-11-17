@@ -6,12 +6,21 @@
 //! build.
 //!
 //! It models scalar integers `i1` to `i128`, their arithmetic, bitwise, shift, rotate,
-//! min/max, saturating and overflow operations, `project` of an overflow pair, `icmp`,
-//! `select`, the conversions and `freeze`; stack slots with `slot_addr`, `ptr_add`, `load`,
-//! `store`, `slot_live` and `slot_dead`; and `jump`, `br`, `switch`, `return`, `trap` and
-//! `unreachable`; of the flags, `ptr_add inbounds`, its promise checked (eval/promises.rs).
-//! Anything else (a call, a float, a vector, an instruction with other flags, a memory
-//! promise) is refused with [`EvalError::Unsupported`], never guessed. Undefined behaviour is
+//! min/max, saturating and overflow operations, `project` of an overflow pair or of a call's
+//! values, `icmp` (of pointers where their slots decide it), `select`, the conversions and
+//! `freeze`; `f32` and `f64` (eval/floats.rs), `f16` and `f128` arithmetic, comparisons and
+//! float conversions by soft IEEE (eval/float.rs); fixed vectors of at most 128 bits, lane-wise
+//! and their lane operations (eval/vector.rs); `null`, `uninit`, `assume` and the pointer
+//! operations; memory as one run-wide store of bytes with provenance holding every frame's
+//! stack slots (eval/memory.rs): `slot_addr`, `ptr_add`, `load` and `store` of any scalar,
+//! `memcpy`, `memmove`, `memset`, `memcmp`, `slot_live` and `slot_dead`; direct calls
+//! (eval/calls.rs), pointers passed and returned; and `jump`, `br`, `switch`, `return`,
+//! `trap` and `unreachable`; of the flags, `ptr_add inbounds`, its promise checked
+//! (eval/promises.rs); the program's data and functions (eval/data.rs): `data_addr`,
+//! `tls_addr` and `func_addr`, placed once per run, and `call_indirect`. Anything else (a
+//! vector wider than 128 bits, an atomic, an outside function, an instruction with other flags)
+//! is refused with
+//! [`EvalError::Unsupported`], never guessed. Undefined behaviour is
 //! an outcome ([`Outcome::Undefined`]): a comparison of two backends says nothing of a case
 //! with one. Fuel bounds every run.
 
@@ -21,7 +30,6 @@ pub use crate::arith::Trap;
 use crate::{
     Block, Flags, Op, Value, View,
     arith::{binary, compare, convert, iconst_value, overflow, sext, unary, wide_value},
-    func::SlotId,
     op::Target,
 };
 
@@ -32,16 +40,41 @@ mod calls_tests;
 mod promises;
 #[cfg(test)]
 mod promises_tests;
+mod floats;
+pub use floats::agree;
+#[cfg(test)]
+mod floats_tests;
+mod float;
+#[cfg(test)]
+mod float_tests;
+mod vector;
+mod memory;
+use memory::Memory;
+mod target;
+#[cfg(test)]
+mod memory_tests;
+mod data;
+pub use crate::body::{Datum, DatumId, DatumReloc};
+#[cfg(test)]
+mod data_tests;
 
 /// A value as the evaluator holds it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Val {
-    /// An integer of its type's width, its bits above the width zero.
+    /// An integer of its type's width, its bits above the width zero; or a float's bits.
     Int(u128),
-    /// A pointer into stack slot `slot`, `offset` bytes from its start.
+    /// A pointer `offset` bytes from the start of stack slot `slot`: a run-wide id, the slot's
+    /// index in its frame plus the frame's base (eval/memory.rs), so a pointer means the same
+    /// in every frame (the root frame's base is 0). [`Val::NO_SLOT`] for a pointer of no
+    /// provenance, whose `offset` is its address.
     Ptr { slot: u32, offset: i128 },
     /// An overflow operation's `{T, i1}`.
     Pair(u128, bool),
+    /// `uninit`: bits LIR leaves open. Stored, it leaves the bytes uninitialized; any use but
+    /// passing it on is refused.
+    Uninit,
+    /// A call's several values: `len` of the run's `tuples` from `at`, which `project` reads.
+    Tuple { at: u32, len: u32 },
 }
 
 /// How a run ended.
@@ -103,20 +136,18 @@ impl std::fmt::Display for EvalError {
 
 impl std::error::Error for EvalError {}
 
-/// The stack slots of a run: their bytes, which are initialized, and which slots are live.
-struct Memory<A: Allocator> {
-    starts: Vec<usize, A>,
-    bytes: Vec<u8, A>,
-    init: Vec<bool, A>,
-    live: Vec<bool, A>,
-}
-
-/// One run of a function and the functions it calls: the running body's view, values and
-/// slots, and the callers waiting on a call.
+/// One run of a function and the functions it calls: the running body's view and values,
+/// every frame's slots, and the callers waiting on a call.
 struct Run<'a, A: Allocator + Clone> {
     view: View<'a>,
     values: Vec<Option<Val>, A>,
+    /// Every open frame's stack slots (eval/memory.rs).
     memory: Memory<A>,
+    /// The id of the running frame's slot 0 in `memory`.
+    base: u32,
+    /// The values of the calls that returned several, which a `Val::Tuple` names; kept for
+    /// the run, bounded by its fuel.
+    tuples: Vec<Val, A>,
     alloc: A,
     /// The running body, as `bodies` names it.
     body: BodyId,
@@ -201,6 +232,13 @@ impl<A: Allocator + Clone> Run<'_, A> {
                 inst = self.call(inst)?;
                 continue;
             }
+            if op == Op::CallIndirect {
+                match self.call_indirect(inst)? {
+                    Ok(next) => inst = next,
+                    Err(outcome) => return Ok(outcome),
+                }
+                continue;
+            }
             match self.step(inst, op)? {
                 Ok(Some(value)) => self.values[inst] = Some(value),
                 Ok(None) => {}
@@ -214,6 +252,11 @@ impl<A: Allocator + Clone> Run<'_, A> {
     fn step(&mut self, inst: usize, op: Op) -> Result<Result<Option<Val>, Outcome<A>>, EvalError> {
         let mut o = self.view.operands(inst);
         let undefined = |why| Ok(Err(Outcome::Undefined { inst, why }));
+        // A vector of at most 128 bits, or a lane-wise operation on one (eval/vector.rs); every
+        // other instruction goes on below.
+        if let Some(value) = self.vector(inst, op)? {
+            return Ok(Ok(Some(value)));
+        }
         let value = match op {
             Op::Iconst => {
                 let width = self.width(inst)?;
@@ -247,14 +290,25 @@ impl<A: Allocator + Clone> Run<'_, A> {
             Op::Project => match (self.get(inst, o.value())?, o.imm()) {
                 (Val::Pair(value, _), 0) => Val::Int(value),
                 (Val::Pair(_, flag), 1) => Val::Int(u128::from(flag)),
+                (Val::Tuple { at, len }, k) if k < len => self.tuples[at as usize + k as usize],
                 _ => {
-                    return Err(EvalError::Unsupported { inst, op, what: "a project of other than an overflow pair" });
+                    return Err(EvalError::Unsupported {
+                        inst,
+                        op,
+                        what: "a project of other than an overflow pair or a call's values",
+                    });
                 }
             },
             Op::Icmp => {
                 let cond = o.int_cond();
-                let ((a, width), (b, _)) = (self.int(inst, o.value())?, self.int(inst, o.value())?);
-                Val::Int(u128::from(compare(cond, a, b, width)))
+                let (a, b) = (o.value(), o.value());
+                match self.view.ty(a).is_ptr() {
+                    true => self.ptr_compare(inst, cond, a, b)?,
+                    false => {
+                        let ((a, width), (b, _)) = (self.int(inst, a)?, self.int(inst, b)?);
+                        Val::Int(u128::from(compare(cond, a, b, width)))
+                    }
+                }
             }
             Op::Select => {
                 let (cond, _) = self.int(inst, o.value())?;
@@ -266,13 +320,15 @@ impl<A: Allocator + Clone> Run<'_, A> {
                 let (a, from) = self.int(inst, o.value())?;
                 Val::Int(convert(op, a, from, width))
             }
-            Op::Freeze => self.get(inst, o.value())?,
-            Op::SlotAddr => Val::Ptr { slot: o.slot().0, offset: 0 },
+            Op::Freeze => match self.get(inst, o.value())? {
+                Val::Uninit => {
+                    return Err(EvalError::Unsupported { inst, op, what: "a `freeze` of `uninit`, whose bits LIR leaves open" });
+                }
+                it => it,
+            },
+            Op::SlotAddr => Val::Ptr { slot: self.base + o.slot().0, offset: 0 },
             Op::SlotLive | Op::SlotDead => {
-                let slot = o.slot();
-                let (start, end) = self.span(slot);
-                self.memory.init[start..end].fill(false);
-                self.memory.live[slot.index()] = op == Op::SlotLive;
+                self.restart(inst, o.slot(), op == Op::SlotLive)?;
                 return Ok(Ok(None));
             }
             Op::PtrAdd => {
@@ -284,90 +340,25 @@ impl<A: Allocator + Clone> Run<'_, A> {
                 if !self.view.flags(inst).contains(Flags::INBOUNDS) {
                     Val::Ptr { slot, offset: offset.wrapping_add(by) }
                 } else {
-                    let index = SlotId(slot).index();
-                    let size = i128::from(self.view.slots[index].size);
-                    match promises::inbounds_step(offset, by, size, self.memory.live[index]) {
+                    match self.inbounds(slot, offset, by) {
                         Ok(offset) => Val::Ptr { slot, offset },
                         Err(why) => return undefined(why),
                     }
                 }
             }
-            Op::Load => {
-                let width = self.width(inst)?;
-                let ptr = self.get(inst, o.value())?;
-                let at = i128::from(o.offset());
-                let range = match self.access(inst, op, ptr, at, width)? {
-                    Ok(it) => it,
-                    Err(why) => return undefined(why),
-                };
-                if !self.memory.init[range.clone()].iter().all(|&it| it) {
-                    return undefined("a load of uninitialized bytes");
-                }
-                let bytes = &self.memory.bytes[range];
-                Val::Int(bytes.iter().rev().fold(0u128, |it, &byte| (it << 8) | u128::from(byte)))
-            }
+            Op::Load => match self.load(inst)? {
+                Ok(it) => it,
+                Err(why) => return undefined(why),
+            },
             Op::Store => {
-                let stored = o.value();
-                let (value, width) = self.int(inst, stored)?;
-                let ptr = self.get(inst, o.value())?;
-                let at = i128::from(o.offset());
-                let range = match self.access(inst, op, ptr, at, width)? {
-                    Ok(it) => it,
-                    Err(why) => return undefined(why),
-                };
-                for (i, at) in range.enumerate() {
-                    self.memory.bytes[at] = (value >> (8 * i)) as u8;
-                    self.memory.init[at] = true;
+                if let Err(why) = self.store(inst)? {
+                    return undefined(why);
                 }
                 return Ok(Ok(None));
             }
-            _ => return Err(EvalError::Unsupported { inst, op, what: "this operation" }),
+            _ => return self.more(inst, op),
         };
         Ok(Ok(Some(value)))
-    }
-
-    /// The bytes of slot `slot` in the run's memory.
-    fn span(&self, slot: SlotId) -> (usize, usize) {
-        let start = self.memory.starts[slot.index()];
-        (start, start + self.view.slots[slot.index()].size as usize)
-    }
-
-    /// The bytes an access of `width` bits at `ptr` plus `at` touches, or why it is undefined.
-    fn access(
-        &self,
-        inst: usize,
-        op: Op,
-        ptr: Val,
-        at: i128,
-        width: u32,
-    ) -> Result<Result<std::ops::Range<usize>, &'static str>, EvalError> {
-        let Val::Ptr { slot, offset } = ptr else {
-            return Err(EvalError::Unsupported { inst, op, what: "an access not through a slot's pointer" });
-        };
-        if width % 8 != 0 {
-            return Err(EvalError::Unsupported { inst, op, what: "an access of a width not of whole bytes" });
-        }
-        let align = match self.view.mem_attrs(inst) {
-            None => 0,
-            Some(attrs) if attrs.range == 0 && attrs.bits == 0 && attrs.pointee_align == 0 => attrs.align,
-            Some(_) => return Err(EvalError::Unsupported { inst, op, what: "a memory promise past alignment" }),
-        };
-        let slot = SlotId(slot);
-        if !self.memory.live[slot.index()] {
-            return Ok(Err("an access to a dead slot"));
-        }
-        let size = i128::from(width / 8);
-        let offset = offset.wrapping_add(at);
-        let rec = self.view.slots[slot.index()];
-        if offset < 0 || offset + size > i128::from(rec.size) {
-            return Ok(Err("an access out of its slot"));
-        }
-        if align > rec.align || offset % (1i128 << align) != 0 {
-            return Ok(Err("an access less aligned than it says"));
-        }
-        let (start, _) = self.span(slot);
-        let first = start + offset as usize;
-        Ok(Ok(first..first + size as usize))
     }
 
     /// Block terminator `inst`: where the run goes, or how it ends.

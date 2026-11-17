@@ -29,7 +29,7 @@ mod place;
 mod v1;
 
 pub use form::{FormError, MAGIC, RecordView, Sealed, encode, read, seal};
-pub use place::place;
+pub use place::{calls, page_offset, place};
 pub use v1::from_v1;
 
 #[cfg(test)]
@@ -96,7 +96,8 @@ pub enum Place {
 /// One value live into a loop header.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Live {
-    /// The value's LIR index (a slot's index for [`Place::Slot`]).
+    /// The row's key: the value's LIR index; for [`Place::Slot`], the function's instruction
+    /// count plus the slot's index (one key space, so a header lists each key once).
     pub value: u32,
     pub place: Place,
 }

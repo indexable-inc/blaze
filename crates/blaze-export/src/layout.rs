@@ -139,18 +139,18 @@ fn find(members: &[Member<'_>], by_symbol: &[u32], symbol: Symbol) -> Option<usi
     by_symbol.binary_search_by(|&i| members[i as usize].symbol.cmp(&symbol)).ok().map(|k| by_symbol[k] as usize)
 }
 
-fn find_data(data: &[Data<'_>], by_target: &[u32], target: Target) -> Option<usize> {
+pub(crate) fn find_data(data: &[Data<'_>], by_target: &[u32], target: Target) -> Option<usize> {
     by_target.binary_search_by(|&i| data[i as usize].target.cmp(&target)).ok().map(|k| by_target[k] as usize)
 }
 
 /// Pads `bytes` with zeros until `region_at + bytes.len()` is a multiple of `align`.
-fn pad_to(bytes: &mut AVec<'_, u8>, region_at: u64, align: u64) {
+pub(crate) fn pad_to(bytes: &mut AVec<'_, u8>, region_at: u64, align: u64) {
     let len = up(region_at + bytes.len() as u64, align) - region_at;
     bytes.resize(len as usize, 0);
 }
 
 /// Checks every datum's form and returns their indices sorted by target.
-fn check_data<'a>(data: &[Data<'_>], page: u64, alloc: Alloc<'a>) -> Result<AVec<'a, u32>, ExportError> {
+pub(crate) fn check_data<'a>(data: &[Data<'_>], page: u64, alloc: Alloc<'a>) -> Result<AVec<'a, u32>, ExportError> {
     let mut by_target: AVec<'a, u32> = Vec::with_capacity_in(data.len(), alloc);
     for (i, d) in data.iter().enumerate() {
         if !matches!(d.target.space, Space::Static | Space::Vtable) {
@@ -253,6 +253,9 @@ pub fn lay_out<'a, 'r>(
     entry: Symbol,
     profile: Option<Profile<'_>>,
     plan: Plan,
+    // Bytes kept after the code, before the const region's page: the unwind tables
+    // (eh_out.rs `eh_room` measures them; `eh_sections` places them there).
+    tail: u64,
     alloc: Alloc<'a>,
 ) -> Result<Laid<'a, 'r>, ExportError> {
     let n = members.len();
@@ -339,7 +342,7 @@ pub fn lay_out<'a, 'r>(
     let import_of = |symbol: Symbol| imports.binary_search_by(|it| it.symbol.cmp(&symbol)).ok();
 
     // The const region: the writer's head, the GOT, relro parts, read-only data.
-    let const_at = up(text_end, page);
+    let const_at = up(text_end + tail, page);
     let mut konst: AVec<'a, u8> = Vec::new_in(alloc);
     konst.resize(plan.const_head as usize, 0);
     pad_to(&mut konst, const_at, 8);

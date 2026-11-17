@@ -5,10 +5,16 @@
 //! wiring).
 
 pub(crate) mod analysis;
-mod emit;
+pub(crate) mod emit;
 mod fast;
+pub(crate) mod loop_map;
+pub(crate) mod reserve;
 
 pub use fast::Fast;
 
 #[cfg(test)]
 mod analysis_tests;
+#[cfg(test)]
+mod fast_tests;
+#[cfg(test)]
+mod loop_map_tests;

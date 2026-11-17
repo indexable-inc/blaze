@@ -10,7 +10,7 @@ use core::ptr::NonNull;
 use std::alloc::Global;
 
 use blaze_build::data::{DataAlloc, DataError, DataRecord, ImageTarget, StaticImage};
-use blaze_build::tls::{self, TlsError, TlsLayout};
+use blaze_build::tls::{self, TlsError};
 use blaze_build::layout::{LayoutCx, LayoutFacts, Layouts, Missing, ReprAttrs, ValidRange};
 use blaze_build::vtable::{Shape, Vtable, VtableRef, VtableTarget, Word};
 use blaze_consteval::{
@@ -31,12 +31,13 @@ use blaze_typeck::{
 };
 
 use crate::front::{At, BlazeAttrs, FnKind, FnLang, Front, HOSTED_START};
-use crate::crates::{CratesError, DirShelf, Inputs, Toolchain};
+use crate::crates::{CratesError, Inputs, Toolchain};
 use crate::program_texts::ProgramTexts;
 use crate::front2::program::{Front2Program, Front2Refusal};
 use crate::seam::FrontEnd;
 use crate::refusal::{NOT_YET, Refusal, RefusalRule, SourceFile};
 use crate::place::{self, Body, Entry, PlaceError, Target, VtableImage, VtableWord};
+use crate::tls_index::{self, TlsVars};
 use crate::class_chain::class_chain;
 
 /// A function a stage refused: its path, for the words, and where its item is, for the finding.
@@ -120,6 +121,9 @@ pub enum RunError {
     Statics { error: DataError },
     /// The thread-locals do not form a template.
     Tls { error: TlsError },
+    /// The run numbered `cap` thread-locals and `thread_local` would be one more
+    /// (crate::tls_index, THREADS.md D2: the descriptor reserves `cap` rows).
+    TlsCap { thread_local: ItemKey, cap: u64 },
     /// The new front end refused the program, by what it cannot do yet.
     Front2(Front2Refusal),
     /// The new front end's crates: the toolchain or a pack.
@@ -148,6 +152,11 @@ pub enum RunError {
     /// walk did not reach: the image names it by key alone, so it is not built; its slot holds a
     /// stub, and only a call through the static stops the program here.
     StaticFn { static_: Option<ItemKey>, key: InstanceKey },
+    /// The program trapped in its placed code (a `brk`: LIR's `unreachable`, a division by zero
+    /// or overflow, a LIR `trap`) and was stopped there: the trap, the function, its callers,
+    /// in one line (crate::trap). The PROGRAM's failure: `blaze run` prints the line and exits
+    /// `trap::PROGRAM_TRAPPED`, not blaze's own status.
+    Trapped { trap: crate::trap::Trap },
 }
 
 /// The Itanium ABI's entry that starts an unwind (`_Unwind_RaiseException`): a call of it by a
@@ -225,6 +234,11 @@ impl core::fmt::Display for RunError {
             RunError::Const { constant, error } => write!(f, "`{constant}`: {error}"),
             RunError::Statics { error } => write!(f, "the program's statics: {error}"),
             RunError::Tls { error } => write!(f, "the program's thread-locals: {error}"),
+            RunError::TlsCap { thread_local, cap } => write!(
+                f,
+                "thread-local {:#x} would be past the run's {cap} thread-local rows (rule bounded-progress: the table has a cap)",
+                thread_local.0
+            ),
             RunError::Front2(refusal) => write!(f, "{refusal}"),
             RunError::Crates(error) => write!(f, "the new front end's crates: {error}"),
             RunError::Edition { written } => write!(f, "the edition `{written}` is none the names library knows"),
@@ -239,6 +253,7 @@ impl core::fmt::Display for RunError {
                 Some(s) => write!(f, "the static {:#x} points to fn instance {:?}, which no code of the program reaches, so it is not built yet", s.0, key.0),
                 None => write!(f, "a static points to fn instance {:?}, which no code of the program reaches, so it is not built yet", key.0),
             },
+            RunError::Trapped { trap } => write!(f, "{trap}"),
             RunError::UnwindRaised { function } => write!(
                 f,
                 "the program panicked and `{function}` raised the panic to unwind (`{UNWIND_RAISE}`): unwinding from code records is not registered yet (run.md piece 11, part C), so the run was stopped at the raise"
@@ -339,11 +354,13 @@ impl RunError {
             | RunError::Lang(_)
             | RunError::Statics { .. }
             | RunError::Tls { .. }
+            | RunError::TlsCap { .. }
             | RunError::Front2(_)
             | RunError::Crates(_)
             | RunError::Edition { .. }
             | RunError::Manifest { .. }
             | RunError::StaticFn { .. }
+            | RunError::Trapped { .. }
             | RunError::Names { .. } => None,
         }
     }
@@ -768,6 +785,7 @@ fn ground_list(ground: &mut PortableTys<'_>, args: &[PTy], types: PTys<'_>) -> O
             PNode::FnPtr(l, h) => PNode::FnPtr(ground_of_list(ground, types, &map, l)?, h),
             PNode::Closure { owner, ordinal, args } => PNode::Closure { owner, ordinal, args: ground_of_list(ground, types, &map, args)? },
             PNode::Future(e, o, i) => PNode::Future(e, *map.get(o.0 as usize)?, *map.get(i.0 as usize)?),
+            PNode::Coroutine { owner, ordinal, args } => PNode::Coroutine { owner, ordinal, args: ground_of_list(ground, types, &map, args)? },
             PNode::Alias { trait_, name, args } => PNode::Alias { trait_, name, args: ground_of_list(ground, types, &map, args)? },
             PNode::Opaque(k, l) => PNode::Opaque(k, ground_of_list(ground, types, &map, l)?),
             PNode::Dynamic(l) => PNode::Dynamic(ground_of_list(ground, types, &map, l)?),
@@ -989,6 +1007,10 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
         (i < self.0.fn_count()).then(|| self.0.function(i).abi)
     }
 
+    fn c_variadic(&self, item: ItemKey) -> Option<u32> {
+        self.0.c_variadic(item)
+    }
+
     fn static_item(&self, item: ItemKey) -> Option<StaticItem> {
         self.0.static_item(item)
     }
@@ -1093,10 +1115,12 @@ pub struct Built {
     vtables: Vec<VtableImage, Global>,
     start: Start,
     start_fn: Named,
-    /// Every static's first bytes, the thread-locals' template and descriptor among them.
+    /// Every static's first bytes, the thread-locals' templates and descriptor among them.
     image: Option<StaticImage<Global>>,
     /// With thread-locals: the getter's slot.
     getter: Option<u32>,
+    /// With thread-locals: the ender's slot (the key's destructor, crate::tls_index).
+    ender: Option<u32>,
     /// By stub number: why the instance in that stub's slot was not built (crate::stub).
     /// Empty unless the build stubbed its refusals ([`build_stubbed`]).
     refused: Vec<RunError, Global>,
@@ -1105,6 +1129,8 @@ pub struct Built {
     /// Each fn instance a static points at, sorted by key, and its slot ([`static_fn_slots`]):
     /// placement writes the slot's thunk into the static's word.
     static_fns: Vec<(InstanceKey, u32), Global>,
+    /// Each slot's function path, by slot: what a trap's line names (crate::trap).
+    paths: Vec<Box<str, Global>, Global>,
 }
 
 impl Built {
@@ -1133,44 +1159,57 @@ fn isa() -> Isa {
     }
 }
 
-/// The thread-locals' template static and descriptor static: not items of the program, so
-/// keys of their own, fixed, in the image beside the program's statics.
-const TLS_TEMPLATE: ItemKey = ItemKey(u128::from_be_bytes(*b"blaze-ladder tls"));
+/// The thread-locals' descriptor static: not an item of the program, so a key of its own,
+/// fixed, in the image beside the program's statics. Each thread-local's template has a key
+/// derived from its own (crate::tls_index).
 const TLS_DESC: ItemKey = ItemKey(u128::from_be_bytes(*b"blaze-ladder dsc"));
 
-/// The program's statics as one image, and where each thread-local is in a thread's block:
-/// each plain static's evaluated record, the thread-locals' template and its descriptor.
+/// The program's statics as one image, and the run's numbering of its thread-locals: each
+/// plain static's evaluated record, each thread-local's template and the descriptor
+/// (THREADS.md D2). This whole-program run numbers every thread-local in item-key order here,
+/// before any body is emitted, so each index a body names has its row in the image.
 fn static_image<P: FrontEnd>(
     program: &P,
     values: &[(ItemKey, DataRecord<Global>)],
-) -> Result<(Option<StaticImage<Global>>, Option<TlsLayout<Global>>), RunError> {
-    let mut tls = Vec::new_in(Global);
+) -> Result<(Option<StaticImage<Global>>, Option<TlsVars>), RunError> {
+    let mut keys = Vec::new_in(Global);
     // `eval_consts`'s records (the old front's tabled statics) and the front end's own
     // (front2's, `static_records`): never both for one front.
-    for (key, record) in values.iter().chain(program.static_records()) {
+    for (key, _) in values.iter().chain(program.static_records()) {
         if program.static_item(*key).is_some_and(|s| s.thread_local) {
-            tls.push((*key, record));
+            keys.push(*key);
         }
     }
-    let template = tls::template(&tls, Global).map_err(|error| RunError::Tls { error })?;
-    let desc = template.as_ref().map(|(_, layout)| tls::descriptor(TLS_TEMPLATE, layout, Global));
+    // A key with two records stays twice in neither list: `image_parts` refuses it by name.
+    keys.sort_unstable();
+    keys.dedup();
+    let mut vars = TlsVars::new();
+    for &key in keys.iter() {
+        vars.index_of(key)?;
+    }
+    let parts = match vars.is_empty() {
+        true => None,
+        false => Some(vars.image_parts(program, values)?),
+    };
     let mut plain = Vec::new_in(Global);
     for (key, record) in values.iter().chain(program.static_records()) {
         if program.static_item(*key).is_some_and(|s| !s.thread_local) {
             plain.push((*key, record));
         }
     }
-    if let (Some((record, _)), Some(desc)) = (&template, &desc) {
-        plain.push((TLS_TEMPLATE, record));
+    if let Some((desc, templates)) = &parts {
+        for (key, record) in templates.iter() {
+            plain.push((*key, record));
+        }
         plain.push((TLS_DESC, desc));
     }
     if plain.is_empty() {
         return Ok((None, None));
     }
-    // The image copies each record's bytes; the layout then moves out of the template.
+    // The image copies each record's bytes.
     let image = StaticImage::new(&plain, Global).map_err(|error| RunError::Statics { error })?;
     drop(plain);
-    Ok((Some(image), template.map(|(_, layout)| layout)))
+    Ok((Some(image), (!vars.is_empty()).then_some(vars)))
 }
 
 /// Runs the program of `files`, whose crate root is `root`, in this process: its status.
@@ -1234,7 +1273,7 @@ pub fn ran_built(mut built: Built, host: Option<NonNull<c_void>>) -> Result<Ran,
         None => None,
     };
     let tls = match (built.getter, image) {
-        (Some(getter), Some((image, base))) => {
+        (Some(getter), Some((image, base))) if built.ender.is_some() => {
             let at = image.static_at(TLS_DESC).ok_or(RunError::Place(PlaceError::NoDescriptor))?;
             // The key goes into the descriptor after `place` wrote the image (below).
             Some(place::Tls { desc: base + u64::from(at), getter })
@@ -1248,8 +1287,9 @@ pub fn ran_built(mut built: Built, host: Option<NonNull<c_void>>) -> Result<Ran,
     let raises = built.refused.iter().filter(|refusal| matches!(refusal, RunError::UnwindRaised { .. })).count();
     let not_built = u32::try_from(built.refused.len() - raises).map_err(|_| RunError::TooManyInstances)?;
     let placed = place::place(&built.bodies, &built.vtables, image, &built.static_fns, tls, said).map_err(RunError::Place)?;
-    if let Some(tls) = tls {
-        place::create_tls_key(tls.desc).map_err(RunError::Place)?;
+    if let (Some(tls), Some(ender)) = (tls, built.ender) {
+        let ender = placed.thunk(ender).ok_or(RunError::Place(PlaceError::NoEnder))?;
+        tls_index::create_key(tls.desc, ender).map_err(RunError::Place)?;
     }
     // The entry's instance was the first reached.
     match placed.call(0, entry).map_err(RunError::Place)? {
@@ -1261,6 +1301,10 @@ pub fn ran_built(mut built: Built, host: Option<NonNull<c_void>>) -> Result<Ran,
         }
         // A stub's number is its place in `refused`: one past it was never made.
         place::Ended::Stub(_) => Err(RunError::Place(PlaceError::NoEntry { slot: 0 })),
+        // A trap in the placed code: the program's own failure, by name (crate::trap).
+        place::Ended::Trap { code, slot, offset, callers } => Err(RunError::Trapped {
+            trap: crate::trap::Trap::new(code, slot, offset, &callers, &built.paths, blaze_own::SharedAlloc::global()),
+        }),
     }
 }
 
@@ -1296,10 +1340,7 @@ pub fn build(files: &[SourceFile<'_>], root: &str, overflow: OverflowChecks) -> 
 /// [`build`] through the new front end: the program's names resolved by the names library over
 /// the toolchain `new` names, then front2's answers to the back half.
 pub fn build_new(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>) -> Result<Built, RunError> {
-    let tc = match new.shelf {
-        Some(shelf) => Toolchain::open(&mut DirShelf::new(shelf.into())).map_err(RunError::Crates)?,
-        None => Toolchain::none(),
-    };
+    let tc = crate::library_set::toolchain_for(files, root, new, Alloc::global())?;
     let texts = ProgramTexts::new(files, root, new, &tc)?;
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).map_err(RunError::Crates)?;
@@ -1331,10 +1372,7 @@ pub fn build_over(names: &blaze_scope::resolve::Names<'_>, files: &[SourceFile<'
 /// called. `Ok` is the program's own status with the two counts the command's closing note
 /// prints ([`Ran`]); a called stub is [`RunError::NotBuilt`] naming that function's refusal.
 pub fn run_program(files: &[SourceFile<'_>], root: &str, host: Option<NonNull<c_void>>, new: NewFront<'_>) -> Result<Ran, RunError> {
-    let tc = match new.shelf {
-        Some(shelf) => Toolchain::open(&mut DirShelf::new(shelf.into())).map_err(RunError::Crates)?,
-        None => Toolchain::none(),
-    };
+    let tc = crate::library_set::toolchain_for(files, root, new, Alloc::global())?;
     let texts = ProgramTexts::new(files, root, new, &tc)?;
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).map_err(RunError::Crates)?;
@@ -1428,10 +1466,7 @@ pub fn build_records_new(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>
     if new.overflow != key {
         return Err(RunError::OverflowDisagrees { walk: new.overflow, key });
     }
-    let tc = match new.shelf {
-        Some(shelf) => Toolchain::open(&mut DirShelf::new(shelf.into())).map_err(RunError::Crates)?,
-        None => Toolchain::none(),
-    };
+    let tc = crate::library_set::toolchain_for(files, root, new, Alloc::global())?;
     let texts = ProgramTexts::new(files, root, new, &tc)?;
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).map_err(RunError::Crates)?;
@@ -1491,7 +1526,7 @@ fn filed(sink: &mut Sink<'_>, e: RunError) -> Result<(), RunError> {
             let shown = path.as_deref().map_or_else(|| format!("{:#x}", adt.0), |p| format!("`{p}`"));
             (function, format!("NoAdt: no row for the ADT {shown}").into_boxed_str())
         }
-        RunError::Emit { function, error } => (function, format!("emit: {}", class_of(&format!("{error:?}"))).into_boxed_str()),
+        RunError::Emit { function, error } => (function, crate::emit_class::emit_class(&error)),
         RunError::CodeRecord { function, error } => (function, format!("code record: {}", class_chain(&format!("{error:?}"), 2)).into_boxed_str()),
         // By the callee's key, so each fn the walk never reached is its own class.
         RunError::Callee { function, callee } => {
@@ -1716,8 +1751,10 @@ fn build_from<P: FrontEnd>(
         Some((refused, counts)) => (Some(refused), Some(counts)),
         None => (None, None),
     };
-    // Every build that runs has a stub table: a strict one for the raise's stop alone (D91).
-    let stubs = (stub_refusals || survey.is_none()).then(|| Stubs { refused: Vec::new_in(Global), slot: 0, last: None });
+    // Every build that runs has a stub table: a strict one for the raise's stop alone (D91). A
+    // build runs when it is neither a survey nor a record walk (a record walk only writes
+    // records and keeps no body, so it has no slots to stub).
+    let stubs = (stub_refusals || (survey.is_none() && records.is_none())).then(|| Stubs { refused: Vec::new_in(Global), slot: 0, last: None });
     let mut survey = Sink { survey, stubs, stub_refusals };
     let entry = match (program.entry(), survey.survey.is_some()) {
         (Some(main), _) => Some(main),
@@ -1742,7 +1779,9 @@ fn build_from<P: FrontEnd>(
     let program = &*program_mut;
     let consts = eval_consts(program, &checked)?;
     let langs = BackLangs::of(program)?;
-    let (image, tls_layout) = static_image(program, &consts)?;
+    let (image, mut tls_vars) = static_image(program, &consts)?;
+    // The rows the descriptor holds: a thread-local first numbered past them has none.
+    let tls_rows = tls_vars.as_ref().map_or(0, TlsVars::len);
     let mut ground = PortableTys::new_in(Alloc::global());
     // An item's code identity, until the item layer's records give one (shortcuts 2 and 12): its
     // key and its item's text. Never stale; coarse only in that a signature edit changes it too.
@@ -1900,7 +1939,7 @@ fn build_from<P: FrontEnd>(
         let function = program.function(i);
         let name = || function.named();
         let (Some((body, _)), Some(done)) = (function.body, checked[i].as_ref()) else {
-            return Err(RunError::Callee { function: name(), callee: instance.item });
+            return Err(callee_refusal(&*program, name(), instance.item));
         };
         // The record walk (`build_records`): the instance's full key, before the work. Found in
         // the store, the instances its entry declares are what the walk goes on to, and
@@ -1911,7 +1950,8 @@ fn build_from<P: FrontEnd>(
                 let fail = |error| RunError::CodeRecord { function: name(), error };
                 let symbol = crate::symbols::fn_symbol(instance.item, instance.args, ground.view(), Alloc::global())
                     .map_err(|e| fail(crate::code_records::CodeRecordError::Symbol(e)))?;
-                let body_digest = crate::code_records::body_digest(function.text, Some(&done.reads), Alloc::global());
+                let reads = program.body_reads(i, done).ok_or_else(|| fail(crate::code_records::CodeRecordError::NoReads { item: function.key }))?;
+                let body_digest = crate::code_records::body_digest(function.text, Some(reads));
                 let facts = key_with(program, crate::symbols::item_identity(function.key), i, instance, &mut ground, &keyer)?;
                 let parts = crate::code_records::KeyParts { symbol, body: body_digest, ground: facts.0 };
                 Some((parts, crate::code_records::code_key(&parts, &run.builder)))
@@ -1977,7 +2017,7 @@ fn build_from<P: FrontEnd>(
         let function = program.function(i);
         let name = || function.named();
         let Some((body, _)) = function.body else {
-            return Err(RunError::Callee { function: named, callee: instance.item });
+            return Err(callee_refusal(&*program, named, instance.item));
         };
         args.clear();
         let malformed = |_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None };
@@ -2007,7 +2047,7 @@ fn build_from<P: FrontEnd>(
                 .find(|&w| FrontAdts(program, i, &consts, &langs, &checked_bodies).fn_trait_method(w) == Some(instance.item));
             match (of, which) {
                 (Some(of), Some(which)) => Some((of, which)),
-                _ => return Err(RunError::Callee { function: name(), callee: instance.item }),
+                _ => return Err(callee_refusal(&*program, name(), instance.item)),
             }
         };
         let owner_args = match shim {
@@ -2280,7 +2320,7 @@ fn build_from<P: FrontEnd>(
                                 };
                                 let c = program.fn_index(item).filter(|&c| program.function(c).body.is_some());
                                 let Some(c) = c else {
-                                    return Err(RunError::Callee { function: name(), callee: item });
+                                    return Err(callee_refusal(&*program, name(), item));
                                 };
                                 let key = key_of(program, c, Instance { item, args }, &mut ground, &adts)?;
                                 VtableWord::Slot(reached.slot(Instance { item, args }, c, key)?)
@@ -2385,14 +2425,18 @@ fn build_from<P: FrontEnd>(
         }
         let mut tls_at = Vec::with_capacity_in(built.thread_locals.len(), Global);
         for &key in built.thread_locals.iter() {
-            let Some(offset) = tls_layout.as_ref().and_then(|l| l.offset(key)) else {
+            let index = match tls_vars.as_mut() {
+                Some(vars) => vars.index_of(key)?,
+                None => tls_rows,
+            };
+            if index >= tls_rows {
                 return Err(RunError::Build {
                     function: name(),
-                    error: BuildError::Malformed { what: "a thread-local the program's template does not hold" },
+                    error: BuildError::Malformed { what: "a thread-local the program's descriptor has no row for" },
                     range: None,
                 });
-            };
-            tls_at.push(offset);
+            }
+            tls_at.push(index);
         }
         bodies.push(Body { code, targets, statics: built.statics, tls: tls_at, vtables: table_of });
     }
@@ -2403,8 +2447,9 @@ fn build_from<P: FrontEnd>(
     // its record is made here, once. A record walk always has an entry: it takes no survey, so
     // a program with no `main` stopped at `RunError::NoMain` above.
     if let Some(run) = records.as_deref_mut() {
-        if let (Some(_), Some(main)) = (tls_layout.as_ref(), entry) {
+        if let (Some(_), Some(main)) = (tls_vars.as_ref(), entry) {
             run.getter().map_err(|error| RunError::CodeRecord { function: program.function(main).named(), error })?;
+            run.ender().map_err(|error| RunError::CodeRecord { function: program.function(main).named(), error })?;
         }
         return Ok(None);
     }
@@ -2440,31 +2485,49 @@ fn build_from<P: FrontEnd>(
         (Some(image), Some(stubs)) => static_fn_slots(image, &reached.keys, stubs, &mut bodies)?,
         _ => Vec::new_in(Global),
     };
-    // The thread-locals' getter, once, in the slot after every instance; it calls its imports
-    // directly.
-    let getter = match tls_layout {
-        None => None,
+    // The thread-locals' getter and ender (THREADS.md D2), once each, in the two slots after
+    // every instance; each calls its imports directly. The ender is the key's destructor:
+    // `ran_built` gives its thunk to `tls_index::create_key`.
+    let (getter, ender) = match tls_vars {
+        None => (None, None),
         Some(_) => {
             let named = || program.function(main).named();
-            let func = tls::getter(Global)
+            let getter = tls::index::getter(Global)
                 .map_err(|error| RunError::Build { function: named(), error: BuildError::Lir(error), range: None })?;
-            let mut via = Vec::with_capacity_in(tls::IMPORTS.len(), Global);
-            let mut targets = Vec::with_capacity_in(tls::IMPORTS.len(), Global);
-            for name in tls::IMPORTS {
-                via.push(Via::Address);
-                targets.push(Target::Symbol(name.into()));
+            let ender = tls::index::ender(Global)
+                .map_err(|error| RunError::Build { function: named(), error: BuildError::Lir(error), range: None })?;
+            for (func, imports) in [(&getter, &tls::index::GETTER_IMPORTS[..]), (&ender, &tls::index::ENDER_IMPORTS[..])] {
+                let mut via = Vec::with_capacity_in(imports.len(), Global);
+                let mut targets = Vec::with_capacity_in(imports.len(), Global);
+                for name in imports {
+                    via.push(Via::Address);
+                    targets.push(Target::Symbol((*name).into()));
+                }
+                let mut code = Code::new_in(Global);
+                blaze_emit::emit(func.view(), &via, isa(), &mut code).map_err(|error| RunError::Emit { function: named(), error })?;
+                bodies.push(Body { code, targets, statics: Vec::new_in(Global), tls: Vec::new_in(Global), vtables: Vec::new_in(Global) });
             }
-            let mut code = Code::new_in(Global);
-            blaze_emit::emit(func.view(), &via, isa(), &mut code).map_err(|error| RunError::Emit { function: named(), error })?;
-            bodies.push(Body { code, targets, statics: Vec::new_in(Global), tls: Vec::new_in(Global), vtables: Vec::new_in(Global) });
-            Some(u32::try_from(bodies.len() - 1).map_err(|_| RunError::TooManyInstances)?)
+            let ender = u32::try_from(bodies.len() - 1).map_err(|_| RunError::TooManyInstances)?;
+            (Some(ender - 1), Some(ender))
         }
     };
+    // Each slot's function path, by slot, for a trap's line (crate::trap): a reached
+    // instance's fn path (slot `n` is `reached.tabled[n]`'s); after them a static's fn stub
+    // ([`static_fn_slots`]) and the thread-locals' getter.
+    let mut paths: Vec<Box<str, Global>, Global> = Vec::with_capacity_in(bodies.len(), Global);
+    for slot in 0..bodies.len() {
+        paths.push(match reached.tabled.get(slot) {
+            Some(&tabled) if slot < reached.instances.len() => program.function(tabled).named().path,
+            _ if getter.is_some_and(|g| g as usize == slot) => Box::from("the thread-locals' getter (blaze's own)"),
+            _ if ender.is_some_and(|g| g as usize == slot) => Box::from("the thread-locals' ender (blaze's own)"),
+            _ => Box::from("a fn a static points to, reached by no call (its stub)"),
+        });
+    }
     // `reached` counts every slot before the getter's, built or stubbed; only the stub build
     // has any refusal to list.
     let reached = u32::try_from(reached.instances.len()).map_err(|_| RunError::TooManyInstances)?;
     let refused = survey.stubs.map_or_else(|| Vec::new_in(Global), |stubs| stubs.refused);
-    Ok(Some(Built { bodies, vtables: tables.images, start, start_fn: program.function(main).named(), image, getter, refused, reached, static_fns }))
+    Ok(Some(Built { bodies, vtables: tables.images, start, start_fn: program.function(main).named(), image, getter, ender, refused, reached, static_fns, paths }))
 }
 
 /// Each fn instance `image` points at (its `ImageTarget::Fn` words), sorted by key, with its

@@ -794,6 +794,11 @@ pub(crate) const NAMES_STAGE: &str = "names";
 /// (body_types.rs `TYPES_NOT_CHECKED`, counted by print.rs).
 pub(crate) const TYPES_STAGE: &str = "types";
 
+/// The borrows stage's word in [`CHECK_STAGES`]: built only once the borrow check is trusted
+/// (body_types.rs `BORROWS_ARE_ERRORS`); then not run when any body says its borrows were not
+/// checked (`BORROWS_NOT_CHECKED`, counted by print.rs).
+pub(crate) const BORROWS_STAGE: &str = "borrows";
+
 /// The one list of the stages `check` is defined to run, in order, and whether this build runs
 /// each, derived from the kinds this worker builds: the closing line's "NOT checked" and
 /// `blaze explain 3` read it. When all are `true`, `check` can say `ok`.
@@ -806,7 +811,9 @@ pub(crate) const CHECK_STAGES: [(&str, bool); 6] = [
     // in the task (body_types.rs). A body it could not check to the end is a
     // `TYPES_NOT_CHECKED` finding, which turns this stage to "NOT checked" (main.rs `close`).
     (TYPES_STAGE, builds(Kind::BodyCheck)),
-    ("borrows", whole(Kind::BodyCheck)),
+    // Each body's moves and borrows are checked in its `BodyCheck` task (body_types.rs), as
+    // notes until `BORROWS_ARE_ERRORS`: until then this stage is "NOT checked".
+    (BORROWS_STAGE, crate::body_types::BORROWS_ARE_ERRORS && builds(Kind::BodyCheck)),
 ];
 
 /// Whether `command`'s program runner (blaze_ladder) does `kind`'s work for the code the program

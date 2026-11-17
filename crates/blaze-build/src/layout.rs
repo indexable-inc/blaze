@@ -92,6 +92,7 @@ use blaze_typeck::{Adt, AdtKind, FloatTy, IntTy, ItemKey, Name, PNode, PTy, Port
 use crate::{BuildError, ground};
 
 pub mod simd;
+mod simd_rule;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -113,8 +114,8 @@ pub struct ReprAttrs {
     pub packed: Option<u8>,
     /// `repr(align(n))`: log2 of `n`.
     pub align: Option<u8>,
-    /// `repr(simd)`: a vector, its one array field at AAPCS64's short-vector alignment
-    /// (layout/simd.rs).
+    /// `repr(simd)`: a vector, its one array field at the vector alignment (layout/simd.rs,
+    /// layout/simd_rule.rs).
     pub simd: bool,
     /// The type hides its fields' niches: `UnsafeCell` (the `unsafe_cell` lang item) and
     /// `UnsafePinned`.
@@ -191,6 +192,17 @@ pub trait LayoutFacts {
     /// the layout refuses with [`Refusal::Missing`] and caches nothing, and is asked again
     /// once the record exists.
     fn coroutine_state(&self, owner: ItemKey, ordinal: u32, args: &[PTy], ground: blaze_typeck::PTys<'_>) -> Result<Option<crate::StateShape>, Missing> {
+        let _ = (owner, ordinal, args, ground);
+        Ok(None)
+    }
+
+    /// The tag's valid range in the state of that instance ([`crate::niche_of`] the layout the
+    /// pass returned, kept beside [`LayoutFacts::coroutine_state`]'s shape): its other values
+    /// are the state's niche, which an enclosing enum (`Option<impl Future>`) uses (ASYNC.md
+    /// D-A7). `Ok(None)`: not answered; the state then offers no niche. `Err(Missing)`: as
+    /// `coroutine_state`. A world answers both from one record or neither, so one type has one
+    /// layout in a build.
+    fn coroutine_niche(&self, owner: ItemKey, ordinal: u32, args: &[PTy], ground: blaze_typeck::PTys<'_>) -> Result<Option<crate::StateNiche>, Missing> {
         let _ = (owner, ordinal, args, ground);
         Ok(None)
     }
@@ -947,6 +959,11 @@ impl<A: Allocator + Clone> Layouts<A> {
             ),
             PNode::Never => zst(true),
             PNode::FnDef(..) => zst(false),
+            PNode::Coroutine { .. } => {
+                return Err(Refusal::Unsupported(
+                    "an async block's future by identity (`PNode::Coroutine`): the builder grounds the `Future(ordinal, output, FnDef)` form (coroutine.rs) until it reads `World::coroutine`",
+                ));
+            }
             PNode::FnPtr(..) => prim(Prim::Ptr, nonnull),
             // A pattern type (typeck.md, "Pattern types"): its base's layout, its scalar (a
             // pointer's address, for a wide one) valid only in the node's one canonical range;
@@ -1070,7 +1087,8 @@ impl<A: Allocator + Clone> Layouts<A> {
             PNode::Adt(key, _) => return self.adt(t, key, cx, parts),
             // A coroutine's state (coroutine.rs): a struct of one field, its upvars' tuple at
             // offset 0, in the size and alignment the pass gave the instance's built body. No
-            // scalar form and no niche: the bytes past the upvars are the pass's.
+            // scalar form: the bytes past the upvars are the pass's. Its niche is the tag's
+            // invalid values (coroutine_niche.rs), when the world answers the tag's range.
             PNode::Future(..) => {
                 let view = cx.ground.view();
                 let of = crate::coroutine_of(view, t).ok_or(Refusal::Unsupported("an async block's future named by its expression (it has no identity form: coroutine.rs)"))?;
@@ -1089,7 +1107,14 @@ impl<A: Allocator + Clone> Layouts<A> {
                 row.align = state.align;
                 row.scalar = None;
                 row.pair = None;
-                row.niche = None;
+                row.niche = match cx.facts.coroutine_niche(of.owner, of.ordinal, args, view) {
+                    Err(missing) => return Err(Refusal::Missing(missing)),
+                    Ok(None) => None,
+                    Ok(Some(n)) => match crate::coroutine_niche::state_row_niche(n, state) {
+                        Ok(niche) => niche,
+                        Err(refused) => return Err(Refusal::Malformed(refused.what())),
+                    },
+                };
                 row
             }
             // codegen.md "Trait objects": unsized, its size and alignment the vtable's words 1

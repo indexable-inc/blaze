@@ -20,8 +20,6 @@ blaze-own.workspace = true
 blaze-id = { path = "../blaze-id" }
 # `Hasher`: the BLAKE3 every key is. By path: the workspace entry turns on serde adapters.
 blaze-ids = { path = "../blaze-ids" }
-# `Resolver`: the ModuleScope task steps it (scope_task.rs).
-blaze-scope.workspace = true
 # `VersionKey`, `RecordKey`: run's compiles become Code names (run.rs).
 blaze-run.workspace = true
 # The record views the production `Items`/`Source` reads (items.rs).
@@ -43,8 +41,8 @@ blaze-text.workspace = true
 blaze-git-fetch.workspace = true
 # `check` and `control`: the request's simulation and its planted-bug controls.
 blaze-sim.workspace = true
-# `Alloc::global()`: the tests' handle.
-blaze-own = { workspace = true, features = ["std"] }
+# `blaze_own::testing::heap()`: the tests' root allocator capability (D102).
+blaze-own = { workspace = true, features = ["std", "testing"] }
 
 [lints]
 workspace = true

@@ -60,6 +60,9 @@ pub(crate) struct BuiltDeps<'q, 'r, 'a> {
     /// The cell core writes the crate (the switch): its reads are the crate's read list. The
     /// seam's shadow run asks nothing, so the old core's read list stays its own.
     pub(crate) asks: bool,
+    /// The glob walk's scratch, kept across every name read here (taken out for one
+    /// [`crate::resolve::Built::lookup_in`] and put back): made once in `alloc`.
+    pub(crate) through: core::cell::Cell<Option<blaze_surface::ThroughScratch<'q>>>,
 }
 
 impl<'a> DepNames<&'a str> for BuiltDeps<'_, '_, 'a> {
@@ -82,7 +85,9 @@ impl<'a> DepNames<&'a str> for BuiltDeps<'_, '_, 'a> {
     }
 
     fn name_in(&self, module: ItemKey, ns: Namespace, name: &'a str) -> DepAnswer {
-        let found = self.built.lookup(module, ns, name, self.alloc);
+        let mut scratch = self.through.take().unwrap_or_else(|| blaze_surface::ThroughScratch::new_in(self.alloc));
+        let found = self.built.lookup_in(module, ns, name, &mut scratch);
+        self.through.set(Some(scratch));
         // Every read of another crate is a question of this crate's read list (crate::asked):
         // the name's whole answer there (its own binding or its globs'), as `Kind::Lookup`.
         #[cfg(test)]

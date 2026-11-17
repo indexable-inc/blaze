@@ -6,7 +6,6 @@
 use std::string::String;
 use std::vec::Vec as StdVec;
 
-use blaze_own::Alloc;
 use blaze_sim::{Broke, Config, Tape, control};
 use blaze_typeck::{ItemKey, PNode, PortableTys};
 
@@ -395,7 +394,7 @@ fn hostile_constants_stop_by_their_bound() {
     }
     let me = w.key("SELF_REF");
     let e = w.eval("SELF_REF").expect_err("SELF_REF");
-    assert_eq!(std::format!("{:?}", e.refusal), std::format!("{:?}", Refusal::Cycle { chain: { let mut v = blaze_own::Vec::new_in(Alloc::global()); v.extend_from_slice(&[me, me]); v } }));
+    assert_eq!(std::format!("{:?}", e.refusal), std::format!("{:?}", Refusal::Cycle { chain: { let mut v = blaze_own::Vec::new_in(blaze_own::testing::heap().alloc()); v.extend_from_slice(&[me, me]); v } }));
     assert_eq!(e.constant, me);
 }
 
@@ -441,7 +440,7 @@ fn discriminants() {
     w.konst("PZ", "i64", "Plain::Z as i64");
     w.build();
     // The explicit discriminants' records first: the seam returns `Need` until they exist.
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     assert!(matches!(eval_discriminant(&w, e, 0, alloc), Ok(Answer::Need(_))), "an explicit discriminant not evaluated yet is a need");
     w.eval("E_A_DISC").expect("A");
     w.eval("E_C_DISC").expect("C");
@@ -550,7 +549,7 @@ fn refused_by_name() {
     assert_eq!(refusal(&mut w, "IB"), std::format!("{:?}", Refusal::InvalidBool { value: 2 }));
     assert_eq!(refusal(&mut w, "IC"), std::format!("{:?}", Refusal::InvalidChar { value: 0xD800 }));
     let (c1, c2) = (w.key("CY1"), w.key("CY2"));
-    assert_eq!(refusal(&mut w, "CY1"), std::format!("{:?}", Refusal::Cycle { chain: { let mut v = blaze_own::Vec::new_in(Alloc::global()); v.extend_from_slice(&[c1, c2, c1]); v } }));
+    assert_eq!(refusal(&mut w, "CY1"), std::format!("{:?}", Refusal::Cycle { chain: { let mut v = blaze_own::Vec::new_in(blaze_own::testing::heap().alloc()); v.extend_from_slice(&[c1, c2, c1]); v } }));
     w.limits.memory = 1 << 20;
     assert_eq!(refusal(&mut w, "MEM"), std::format!("{:?}", Refusal::MemoryLimit { limit: 1 << 20 }));
 }
@@ -844,7 +843,7 @@ fn eval_case(c: &Case, plant: Plant) -> Result<u128, String> {
     let mut w = world();
     let k = w.konst("C", c.ty, &case_text(c));
     w.build();
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let mut ground = PortableTys::new_in(alloc);
     let mut layout = Layouts::new_in(alloc);
     let mut codes = Codes::new_in(alloc);
@@ -896,7 +895,7 @@ fn control_pointer_comparison_answered_is_caught() {
         let op = *tape.pick(&["==", "!=", "<"], "op").expect("op");
         let k = w.konst("C", "bool", &std::format!("(&K{i} as *const u8) {op} (&K{j} as *const u8)"));
         w.build();
-        let alloc = Alloc::global();
+        let alloc = blaze_own::testing::heap().alloc();
         let mut ground = PortableTys::new_in(alloc);
         let mut layout = Layouts::new_in(alloc);
         let mut codes = Codes::new_in(alloc);
@@ -938,7 +937,7 @@ fn control_discriminant_of_the_wrong_variant_is_caught() {
             }
         }
         for (v, &want) in model.iter().enumerate() {
-            match discriminant_with_plant(&w, e, v as u32, plant, Alloc::global()) {
+            match discriminant_with_plant(&w, e, v as u32, plant, blaze_own::testing::heap().alloc()) {
                 Ok(Answer::Done(got)) if got == want => {}
                 Ok(Answer::Done(got)) => return Err(Broke::Oracle(std::format!("wrong discriminant for variant {v}: {got}, the rule gives {want}"))),
                 other => return Err(Broke::Harness(std::format!("{other:?}"))),

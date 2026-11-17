@@ -67,6 +67,7 @@ pub mod oscall;
 pub mod wire;
 pub mod zygote;
 pub mod offer;
+pub mod promote;
 
 #[cfg(test)]
 mod sim;
@@ -327,4 +328,6 @@ pub(crate) enum Plant {
     DeclareTwice,
     /// [`parent::Parent`] sends a record before telling the program its targets' slots.
     PublishBeforeTell,
+    /// [`promote::Promote`] keeps a batch after laying it out, and lays it out again.
+    PromoteTwice,
 }

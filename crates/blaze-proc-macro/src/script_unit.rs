@@ -202,6 +202,9 @@ pub fn prepare<'a>(
         c_mode: setting.c_mode,
         limits: RunLimits::STANDARD,
         table: Arc::clone(&setting.table),
+        spawner: None,
+        step: blaze_ids::ContentId::default(),
+        spawn_setting: Arc::new(crate::spawn_route::SpawnSetting::off()),
     });
     Ok(Prepared { loaded, script, env })
 }

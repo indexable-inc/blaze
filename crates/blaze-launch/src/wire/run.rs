@@ -27,7 +27,7 @@ use alloc::vec::Vec;
 use core::alloc::Allocator;
 
 use super::cbor::{Reader, Writer};
-use super::{LONGEST_FRAME, List, Listed, RecordId, WireError, id, tier, tier_name, variant};
+use super::{LONGEST_FRAME, List, Listed, RecordId, WireError, id, personality, tier, tier_name, variant};
 use crate::{Slot, Thread, Tier};
 
 /// The version of the run wire's bodies. A reader of another refuses the message by name
@@ -90,6 +90,10 @@ pub enum Down<'a> {
     Publish { slot: Slot, tier: Tier, record: RecordId },
     /// `need` has no code, for `why`: each thread waiting on it fails its call (rule 20).
     Failed { need: Needed, why: Failure<'a> },
+    /// `slot` is the program's `#[lang = "eh_personality"]` fn. Sent once, after the `Declare`
+    /// naming the program's `eh_personality` fn and before any `Publish`: every placed record's
+    /// unwind entry names that slot's entry thunk (wire/personality.rs).
+    Personality { slot: Slot },
 }
 
 impl Listed<'_> for Declared {
@@ -249,6 +253,7 @@ impl<'a> Down<'a> {
                 to.text("record");
                 to.bytes(&record.0);
             }
+            Down::Personality { slot } => personality::write(to, slot),
             Down::Failed { need, why } => {
                 variant(to, "Failed", 2);
                 to.text("why");
@@ -282,6 +287,7 @@ impl<'a> Down<'a> {
                 let record = RecordId(id(&mut from, "a record id is 32 bytes")?);
                 Down::Publish { slot, tier, record }
             }
+            personality::NAME => Down::Personality { slot: personality::read(&mut from)? },
             "Failed" => {
                 from.map(2, "Failed, a map of 2")?;
                 from.key("why")?;

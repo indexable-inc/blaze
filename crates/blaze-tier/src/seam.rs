@@ -11,7 +11,7 @@ use core::fmt;
 use blaze_lir::View;
 use blaze_own::Alloc;
 
-use crate::{Machine, Names, Outside, TableError, record::Emitted};
+use crate::{Machine, Names, Outside, TableError, record::Emitted, record::FormError};
 
 /// Which tier: the byte the record key holds (point 6).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -59,6 +59,9 @@ pub enum TierError {
     Table { tier: TierName, error: TableError },
     /// The function is past a size the tier's record can hold.
     TooLarge { tier: TierName, what: &'static str },
+    /// The tier's record broke a rule of the record form (the Reference tier: its `bzcode01`
+    /// record did not seal or read back in `record::from_v1`).
+    Record { tier: TierName, error: FormError },
 }
 
 impl fmt::Display for TierError {
@@ -76,6 +79,7 @@ impl fmt::Display for TierError {
             }
             TierError::Table { tier, error } => write!(f, "the {} tier's table: {error}", tier.as_str()),
             TierError::TooLarge { tier, what } => write!(f, "the {} tier: {what} is too large", tier.as_str()),
+            TierError::Record { tier, error } => write!(f, "the {} tier's record: {error}", tier.as_str()),
         }
     }
 }

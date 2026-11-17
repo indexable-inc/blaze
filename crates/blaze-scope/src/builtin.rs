@@ -110,7 +110,6 @@ mod tests {
     use blaze_id::ItemKey;
 
     use super::{BUILTIN_TYPES, Builtin, builtin_of, builtin_type, builtin_type_in};
-    use crate::resolver::Plant;
     use crate::tests::{V, World, solve};
     use crate::{DefKind, Edition, Namespace};
 
@@ -163,7 +162,7 @@ mod tests {
             let p = w.module(root, "p", V::Pub);
             w.use_(p, "i80", V::Pub);
             w.use_(p, "u24", V::Pub);
-            let s = match solve(&w, None, Plant::None) {
+            let s = match solve(&w, None) {
                 Ok(s) => s,
                 Err(e) => panic!("the driver failed: {e}"),
             };

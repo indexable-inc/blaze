@@ -49,8 +49,11 @@ edition.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true
+# tests/target_facts.rs: `cpus::features`, the pinned rustc's features of each CPU, which the
+# target's feature list must equal.
+target-features.workspace = true
 # `Alloc::global()`: the tests' allocator handle.
-blaze-own = { workspace = true, features = ["std"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
 # `testing::MemSurface`: the records the fixtures write, read back through `RecordFacts`.
 blaze-surface = { workspace = true, features = ["testing"] }
 # examples/crates.rs: the workspaces' manifests read through `layout::Layout` (sans-IO).
@@ -59,11 +62,6 @@ blaze-manifest = { workspace = true, default-features = false }
 blaze-fetch.workspace = true
 # examples/crates.rs: `PackageEdition`, `BlazeEdition::prelude`: what a blaze edition puts in scope.
 edition.workspace = true
-
-[features]
-# The cell core under construction (src/cells, bottom.md section 6): off by default, so a
-# half-built core never stops the crate's other lanes. Goes away when the crate switches to it.
-cells = []
 
 [lints]
 workspace = true

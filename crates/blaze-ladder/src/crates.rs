@@ -42,9 +42,20 @@ impl DirShelf {
     }
 }
 
+/// A file of the shelf mapped read-only and read in place: the pack's bytes are the file's
+/// pages, never a heap copy. The shelf's files are written once by the toolchain's install and
+/// only ever replaced by renaming another over them (`Mapping::map_file`'s contract).
+pub struct ShelfFile(blaze_core::Mapping);
+
+impl AsRef<[u8]> for ShelfFile {
+    fn as_ref(&self) -> &[u8] {
+        self.0.bytes()
+    }
+}
+
 impl Shelf for DirShelf {
     type Error = std::io::Error;
-    type Bytes = Vec<u8>;
+    type Bytes = ShelfFile;
 
     fn place(&self) -> &str {
         &self.place
@@ -58,8 +69,9 @@ impl Shelf for DirShelf {
         }
     }
 
-    fn read(&mut self, name: &str, _size: u64) -> Result<Vec<u8>, std::io::Error> {
-        std::fs::read(format!("{}/{name}", self.place))
+    fn read(&mut self, name: &str, _size: u64) -> Result<ShelfFile, std::io::Error> {
+        let path = format!("{}/{name}", self.place);
+        blaze_core::Mapping::map_file(std::path::Path::new(&path)).map(ShelfFile)
     }
 }
 
@@ -119,7 +131,8 @@ struct Unit {
     shown_from: String,
     features: Vec<String>,
     deps: Vec<(String, usize)>,
-    pack: Vec<u8>,
+    /// The pack, mapped from the shelf (read in place).
+    pack: ShelfFile,
     key: CrateItemKey,
     role: Role,
     /// A proc-macro unit: Rust's edition rule (`std` is Rust's, `proc_macro` in its prelude),
@@ -148,7 +161,7 @@ impl Toolchain {
     pub fn open(shelf: &mut DirShelf) -> Result<Toolchain, CratesError> {
         let id: ToolchainId = blaze_toolchain::PINNED;
         let manifest = blaze_toolchain::shelf::open_manifest(shelf, id).map_err(CratesError::Toolchain)?;
-        let view = ToolchainView::open(&manifest, id).expect("open_manifest checked it");
+        let view = ToolchainView::open(manifest.as_ref(), id).expect("open_manifest checked it");
         let sys = blaze_toolchain::sysroot(&view, TRIPLE, false).ok_or(CratesError::NoTarget)?;
         let all: Vec<_> = view.units(TRIPLE).ok_or(CratesError::NoTarget)?.collect();
         // The closure of bstd, core, alloc and Rust's std over dependencies, by a work list:
@@ -293,7 +306,7 @@ impl<'t> Inputs<'t> {
     pub fn new(user: &'t UserCrate<'t>, tc: &'t Toolchain) -> Result<Inputs<'t>, CratesError> {
         let mut packs = Vec::with_capacity(tc.units.len());
         for u in &tc.units {
-            packs.push(PackView::open_verified(&u.pack).map_err(|_| CratesError::Pack { krate: u.name.clone() })?);
+            packs.push(PackView::open_verified(u.pack.as_ref()).map_err(|_| CratesError::Pack { krate: u.name.clone() })?);
         }
         let role = |r: Role| tc.units.iter().position(|u| u.role == r).map(|i| CrateId(i as u32 + 1));
         let sysroot = Sysroot { core: role(Role::Core), alloc: role(Role::Alloc), std: role(Role::Std), bstd: role(Role::Bstd) };

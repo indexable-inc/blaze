@@ -1361,25 +1361,34 @@ pub fn children_of(t: blaze_typeck::PTys<'_>, ty: PTy, out: &mut Vec<PTy, Global
 /// associated type bindings (`impl Iterator<Item = impl Show>`: the `Iterator` one is 0, the
 /// `Show` one 1). The index is a function of the text alone, never of the order heads are
 /// built in. A work list, no recursion.
-pub(super) fn return_impls(v: &View<'_>, ret: lf::TypeId, out: &mut Vec<lf::TypeId, Global>) -> Result<(), Why> {
+///
+/// Returns whether a type macro is written anywhere in `ret` (at any depth, in an `impl`'s
+/// bounds' arguments too): its `impl`s are then not known from `ret`'s text, and the caller
+/// expands `ret` first and numbers the expansion's ([`super::type_expand::Expanded::impls`];
+/// the Reference, "Impl trait": an `impl Trait` a macro writes in the return type is one of the
+/// fn's opaques like a written one).
+pub(super) fn return_impls(v: &View<'_>, ret: lf::TypeId, out: &mut Vec<lf::TypeId, Global>) -> Result<bool, Why> {
     let mut todo: Vec<lf::TypeId, Global> = Vec::new_in(Global);
     let mut kids: Vec<lf::TypeId, Global> = Vec::new_in(Global);
+    let mut macros = false;
     todo.push(ret);
     while let Some(t) = todo.pop() {
         kids.clear();
-        if let lf::TypeRef::Impl(bounds) = v.ty(t)? {
-            out.push(t);
-            for &b in v.rows(bounds)? {
-                if let lf::Bound::Trait { ty, .. } = lf::Bound::decode(b)? {
-                    bound_arg_types(v, ty, &mut kids)?;
+        match v.ty(t)? {
+            lf::TypeRef::Impl(bounds) => {
+                out.push(t);
+                for &b in v.rows(bounds)? {
+                    if let lf::Bound::Trait { ty, .. } = lf::Bound::decode(b)? {
+                        bound_arg_types(v, ty, &mut kids)?;
+                    }
                 }
             }
-        } else {
-            children(v, t, &mut kids)?;
+            lf::TypeRef::Macro(_) => macros = true,
+            _ => children(v, t, &mut kids)?,
         }
         todo.extend(kids.iter().rev());
     }
-    Ok(())
+    Ok(macros)
 }
 
 /// The types written in a bound's trait path's arguments: type arguments, associated type

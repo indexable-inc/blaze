@@ -164,7 +164,7 @@ pub struct Langs {
     pub(crate) digests: [u64; LANGS],
 }
 
-pub(crate) const LANGS: usize = Lang::FutureOutput as usize + 1;
+pub(crate) const LANGS: usize = Lang::CallRefFuture as usize + 1;
 
 impl Langs {
     pub fn new() -> Langs {

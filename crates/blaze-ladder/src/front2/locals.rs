@@ -135,9 +135,11 @@ impl LocalKind {
         matches!(self, LocalKind::Fn | LocalKind::Const | LocalKind::Static | LocalKind::Struct | LocalKind::Use)
     }
 
-    /// Whether a name of this kind is in the type namespace (types, traits, modules).
+    /// Whether a name of this kind is in the type namespace (types, traits, modules, and the
+    /// name an `extern crate` binds: the Reference, "Extern crate declarations": "bound into
+    /// the declaring scope as the given identifier in the type namespace").
     fn in_types(self) -> bool {
-        matches!(self, LocalKind::Struct | LocalKind::Enum | LocalKind::Union | LocalKind::Trait | LocalKind::TypeAlias | LocalKind::Mod | LocalKind::Use)
+        matches!(self, LocalKind::Struct | LocalKind::Enum | LocalKind::Union | LocalKind::Trait | LocalKind::TypeAlias | LocalKind::Mod | LocalKind::ExternCrate | LocalKind::Use)
     }
 
     /// Whether an item of this kind is an item of its block's MODULE in the names library
@@ -146,9 +148,11 @@ impl LocalKind {
     /// the ordinary code ([`super::heads`]'s `Store::step`), and a path naming it is resolved
     /// by the one name solver at that module ([`Row::module`]). A trait's methods are also
     /// candidates at method calls in its block and the blocks inside it
-    /// ([`super::block_traits`]).
+    /// ([`super::block_traits`]). A `mod` and an `extern crate` are too: a path whose first
+    /// segment names one is read at the block's module, where the solver continues into the
+    /// module's items or the crate's root.
     pub fn in_block_module(self) -> bool {
-        matches!(self, LocalKind::Struct | LocalKind::Enum | LocalKind::Union | LocalKind::TypeAlias | LocalKind::Trait)
+        matches!(self, LocalKind::Struct | LocalKind::Enum | LocalKind::Union | LocalKind::TypeAlias | LocalKind::Trait | LocalKind::Mod | LocalKind::ExternCrate)
     }
 
     /// The gap's words for a struct, enum, union or alias whose block has no module in the
@@ -162,6 +166,8 @@ impl LocalKind {
             LocalKind::Union => "a union in a block that a macro call wrote or that is in a local item's body",
             LocalKind::TypeAlias => "a type alias in a block that a macro call wrote or that is in a local item's body",
             LocalKind::Trait => "a trait in a block that a macro call wrote or that is in a local item's body",
+            LocalKind::Mod => "a mod in a block that a macro call wrote or that is in a local item's body",
+            LocalKind::ExternCrate => "an extern crate in a block that a macro call wrote or that is in a local item's body",
             other => other.form(),
         }
     }
@@ -386,6 +392,18 @@ impl<'n> Locals<'n> {
                     Some(n) => frame.alloc_str(view.name_text(n).map_err(|t| bad(Why::from(t)))?),
                     None => "",
                 };
+                // An `extern crate`'s lowering row has no name (its crate is a NAME_REF and
+                // its `as` name is inside the rename): the name it binds is read from its
+                // text by the Reference's grammar (super::block_crates); `as _` binds none.
+                let name: &'n str = if kind == LocalKind::ExternCrate {
+                    match super::block_crates::extern_crate_binding(text) {
+                        Ok(super::block_crates::ExternBinding::Named(bound)) => bound,
+                        Ok(super::block_crates::ExternBinding::Unbound) => "",
+                        Err(unread) => return Err(bad(Why::Unsupported(unread.form(), range))),
+                    }
+                } else {
+                    name
+                };
                 if kind == LocalKind::Use {
                     // A `use` binds one name per leaf; each is a row of its own.
                     let tree = use_tree(text);
@@ -445,6 +463,25 @@ impl<'n> Locals<'n> {
                 // its block's module: the block the scan found its statement in, when the
                 // library's module there binds its name.
                 let mut in_module = None;
+                // Written by an expansion of a statement call (no item-relative range): the block
+                // module the names library filed for it (super::expansion_blocks), found by the
+                // call whose range holds the row's site; the blocks around the call are known.
+                if let (true, None, Some(ms)) = (kind.in_block_module(), view.item_relative(it.range), modules.as_ref()) {
+                    let found = super::expansion_blocks::module_of(names, frame, crate_key, &nested, ms, range.start, blaze_surface::Namespace::Types, name, alloc)
+                        .map_err(|r| bad(Why::Unsupported(r.form(), range)))?;
+                    if let Some(m) = found {
+                        in_module = Some(m);
+                        let mut b = nested.calls.iter().find(|c| c.range.start <= range.start && range.start < c.range.end).map(|c| c.block);
+                        // A chain is at most as long as the body's blocks.
+                        for _ in 0..nested.blocks.len() {
+                            let Some(here) = b else { break };
+                            if core::mem::replace(&mut known[here as usize], true) {
+                                break;
+                            }
+                            b = nested.blocks[here as usize].parent;
+                        }
+                    }
+                }
                 if let (true, Some(r), Some(ms)) = (kind.in_block_module(), view.item_relative(it.range), modules.as_ref()) {
                     let stmt = nested.items.iter().find(|i| i.range.start <= r.start && r.start < i.range.end);
                     let module = stmt.and_then(|i| ms.get(i.block as usize).copied().flatten());

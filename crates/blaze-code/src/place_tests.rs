@@ -84,7 +84,7 @@ fn inst(code: &[u8], at: usize) -> u32 {
 /// Prints `place: call reaches slot word 0, relro site reaches its byte 8, words hold g's thunk + 4 and the code`.
 #[test]
 fn a_placed_record_reaches_the_run_words() {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let bytes = record(alloc);
     let view = CodeView::read(&bytes).unwrap();
     let at = At { code: CODE + 0x40, relro: CODE + 0x8000 };
@@ -106,7 +106,7 @@ fn a_placed_record_reaches_the_run_words() {
 /// Prints `place: a word 8 GiB away is refused by name`.
 #[test]
 fn a_word_out_of_reach_is_refused() {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let bytes = record(alloc);
     let view = CodeView::read(&bytes).unwrap();
     let at = At { code: CODE, relro: CODE + 0x8000 };

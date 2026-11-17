@@ -102,6 +102,9 @@ pub struct Checked<'a> {
     /// order the signature names them. What the world's `opaque_hidden` answers from, so a
     /// caller's auto-trait goal on the opaque (`Send` "leaks" from the hidden type) is decided.
     pub hidden: Vec<(crate::ids::ItemKey, PTy), Alloc<'a>>,
+    /// Each `&expr` promoted to a `'static` slot (rules/promote.rs), sorted: the builder makes
+    /// it the address of a constant row, never a frame temporary.
+    pub promoted: Vec<crate::ids::ExprId, Alloc<'a>>,
 }
 
 /// Two two-column tables are equal column by column.
@@ -165,6 +168,7 @@ impl<'a> Checked<'a> {
             && self.diags == other.diags
             && self.suggests == other.suggests
             && self.hidden == other.hidden
+            && self.promoted == other.promoted
     }
 }
 
@@ -191,6 +195,7 @@ impl<'a> core::fmt::Debug for Checked<'a> {
             .field("diags", &self.diags)
             .field("suggests", &self.suggests)
             .field("hidden", &self.hidden)
+            .field("promoted", &self.promoted)
             .field("reads", &self.reads)
             .field("needs", &self.needs)
             .finish()

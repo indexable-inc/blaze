@@ -31,7 +31,7 @@ use crate::{
 const EXCHANGE: usize = 4096;
 
 fn host(io: Io, hold: Hold) -> Box<Hosting> {
-    Hosting::holding(io, vec!["toucher".to_owned()], vec![("everything".to_owned(), "io".to_owned())], EXCHANGE, Holding::of(hold))
+    Hosting::holding(io, vec!["toucher".to_owned()], vec![("everything".to_owned(), "io".to_owned())], EXCHANGE, Holding::of(hold), blaze_own::testing::heap().shared())
 }
 
 /// Every capability the hosted wire offers, touched once each.
@@ -116,7 +116,7 @@ fn a_program_touching_every_capability_leaves_each_touch_in_its_record() {
 fn a_replay_answers_from_the_record_and_stops_at_the_first_difference() {
     let recorded = host(Io::sim(2), Hold::Record);
     assert_eq!(guest::start(&recorded.table(), toucher), 0);
-    let record = Record::read(&recorded.record().write()).expect("the record reads back");
+    let record = Record::read(&recorded.record().write(blaze_own::testing::heap().alloc())).expect("the record reads back");
 
     let elsewhere = Io::sim(77);
     let replayed = host(elsewhere.clone(), Hold::Replay(record.clone()));
@@ -139,7 +139,7 @@ fn a_replay_answers_from_the_record_and_stops_at_the_first_difference() {
 fn a_record_of_another_version_or_cut_short_is_refused() {
     let hosting = host(Io::sim(3), Hold::Record);
     assert_eq!(guest::start(&hosting.table(), toucher), 0);
-    let bytes = hosting.record().write();
+    let bytes = hosting.record().write(blaze_own::testing::heap().alloc());
     assert_eq!(Record::read(&bytes), Ok(hosting.record()));
     assert!(Record::read(&bytes[..bytes.len() - 1]).is_err(), "a record cut short");
     let mut longer = bytes.clone();
@@ -244,7 +244,7 @@ fn run(plan: &(Vec<Step>, usize), plant: Plant) -> Result<(), String> {
         _ => host(Io::sim(5), Hold::Record),
     };
     let first = made(&recorder, steps);
-    let record = Record::read(&recorder.record().write()).map_err(|error| format!("the record does not read back: {error}"))?;
+    let record = Record::read(&recorder.record().write(blaze_own::testing::heap().alloc())).map_err(|error| format!("the record does not read back: {error}"))?;
     if record.calls.len() != steps.len() {
         return Err(format!("{} calls made, {} recorded", steps.len(), record.calls.len()));
     }

@@ -48,6 +48,9 @@ pub enum DiagCode {
     MissingFields,
     /// E0061: wrong number of arguments.
     ArgCount,
+    /// E0617: a variable argument C would promote (`f32`, `i8`, `i16`, `bool`, `u8`, `u16`) or
+    /// a fn item, passed to `...` uncast (rules/c_variadic.rs).
+    VariadicArg,
     /// E0107: wrong number of generic arguments.
     GenericArgCount,
     /// E0618: expected function, found something else.
@@ -151,6 +154,7 @@ impl DiagCode {
             DiagCode::NoSuchFieldInit => "E0560",
             DiagCode::MissingFields => "E0063",
             DiagCode::ArgCount => "E0061",
+            DiagCode::VariadicArg => "E0617",
             DiagCode::GenericArgCount => "E0107",
             DiagCode::NotCallable => "E0618",
             DiagCode::CallArgsNotTuple => "E0059",

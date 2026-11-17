@@ -20,6 +20,7 @@
 #![register_tool(blaze)]
 #![forbid(unsafe_code)]
 
+pub mod c_request;
 pub mod cx;
 pub mod env;
 pub mod facts;
@@ -30,10 +31,13 @@ pub mod instr;
 pub mod key;
 pub mod native;
 pub mod outputs;
+pub mod outputs4;
 pub mod pinned;
 pub mod probe;
 pub mod toolchain;
 
+#[cfg(test)]
+mod c_request_tests;
 #[cfg(test)]
 mod facts_tests;
 #[cfg(test)]

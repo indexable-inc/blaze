@@ -1,0 +1,21 @@
+status 0
+stdout
+Point { x: 1, y: -2 }
+Meters(5) Unit
+[Circle { r: 2 }, Square(3), Empty]
+(1, "a", 'c', 2.5, true, ())
+[Some(1), None]
+[] Ok(3)
+Line {
+    from: Point {
+        x: 0,
+        y: 0,
+    },
+    to: Point {
+        x: 1,
+        y: -2,
+    },
+    tag: Some(
+        "t",
+    ),
+}

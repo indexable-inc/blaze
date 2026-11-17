@@ -10,7 +10,6 @@ use blaze_sim::{Config, Tape};
 use crate::advisory::{Advisory, AdvisoryRefused, Database, MOST_ADVISORY_BYTES};
 use crate::audit::{DatabaseInput, Index, Input, audit, verify_database};
 use blaze_manifest::lock::Lock;
-use blaze_own::Alloc;
 use crate::date::Date;
 use crate::fetch::{Effect, Event, Fetch, Refused};
 use crate::pins::{DatabasePin, GitPin, SourcePins};
@@ -313,7 +312,7 @@ fn blocks() -> Vec<String> {
 
 /// `text` read by the one lock reader, in the global allocator.
 fn read_lock(text: &str) -> Lock<'static> {
-    Lock::read(text.as_bytes(), Alloc::global()).unwrap()
+    Lock::read(text.as_bytes(), blaze_own::testing::heap().alloc()).unwrap()
 }
 
 fn lock_of(order: &[usize]) -> Lock<'static> {

@@ -48,13 +48,6 @@ pub trait Par {
     fn expand_call(&self, def: ItemKey, input: &str) {
         let _ = (def, input);
     }
-
-    /// The cell core's shadow (feature `cells`): its clock and where its reports go. `None`, the
-    /// default, runs no shadow.
-    #[cfg(feature = "cells")]
-    fn cells_seam(&self) -> Option<&dyn crate::cells::Seam> {
-        None
-    }
 }
 
 /// The stretches of one crate's solve, in the order a solve passes them ([`Par::stage`]).

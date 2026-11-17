@@ -220,7 +220,10 @@ impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
                 // A block's type: only its variants are under it, never a trait. A block's
                 // trait: `use Tr as _;` names it, and it is in scope here already (its block
                 // is this row's or one around it: [`Self::declared`]); its associated items
-                // are no traits.
+                // are no traits. A block's `mod` or `extern crate` may hold a trait: the path
+                // would be read at the block's module, which this reader does not do yet:
+                // refused by name, never dropped.
+                LocalKind::Mod | LocalKind::ExternCrate => return Err(LocalGap { item: local.key, form: THROUGH_LOCAL, range: row.range }),
                 k if k.in_block_module() => return Ok(()),
                 _ => return Err(LocalGap { item: local.key, form: THROUGH_LOCAL, range: row.range }),
             }

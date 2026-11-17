@@ -32,7 +32,7 @@ blaze-blake3.workspace = true
 
 [dev-dependencies]
 # `Alloc::global()`, the handle the record tests hand `emit_record`.
-blaze-own = { workspace = true, features = ["std"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
 # `examples/gen_table.rs`: the files it writes, through bstd's effect layer.
 blaze-std.workspace = true
 # The reference evaluator every emitted function is compared with.

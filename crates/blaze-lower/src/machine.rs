@@ -1844,9 +1844,15 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let ty = self.first(f, V::Type).map(|v| TypeId(v.id));
                 let init = self.first(f, V::Expr).map(|v| ExprId(v.id));
                 let else_ = self.first(f, V::Else).map(|v| ExprId(v.id));
+                // `super let` (parser grammar/expressions.rs `let_stmt` eats the `super` as a
+                // token of this node): kept as a bit of the row (super_let.rs).
+                let is_super = self.has_tok(f, SUPER_KW);
                 self.done(f);
                 let pat = pat.unwrap_or_else(|| self.put_pat(Pat::Missing, r));
                 let s = self.put_stmt(Stmt::Let { pat, ty, init, else_ });
+                if is_super && let Some(row) = self.out.stmts.get_mut(s.0 as usize) {
+                    row.flags |= crate::super_let::LET_SUPER;
+                }
                 self.activate(f.pending);
                 self.push(V::Stmt, s.0, r);
             }
@@ -1904,6 +1910,8 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                     self.push(V::Guard, e.id, r);
                 }
             }
+            // `asm!`'s parts, each packed into one value its `ASM_EXPR` reads (`asm.rs`).
+            ASM_OPERAND_NAMED | ASM_CLOBBER_ABI | ASM_OPTIONS => self.asm_part(f, r),
             MACRO_CALL => self.macro_call(f, r),
             _ => self.expr_or_pat(f, r),
         }
@@ -2261,13 +2269,10 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 self.done(f);
                 Expr::Underscore
             }
-            ASM_EXPR => {
-                // `builtin # asm(..)`, the form blaze-expand writes for `asm!`: refused by name
-                // (`Why::Asm`) until `Expr::Asm` carries its operands' expressions.
-                self.done(f);
-                self.unhandled(f.kind, r, Why::Asm);
-                Expr::Asm
-            }
+            // `builtin # asm(..)`, the form blaze-expand writes for `asm!`: its templates
+            // parsed and its operands placed (`asm.rs`, which clears the frame's values);
+            // `global_asm!` and `naked_asm!` are refused by name (`Why::Asm`).
+            ASM_EXPR => self.asm_expr(f, r),
             OFFSET_OF_EXPR => {
                 // `builtin # offset_of(Ty, a.b.0)`: the type, then the field path's names; the
                 // lexer makes `0.1` one float, split here at its dot.
@@ -3137,8 +3142,9 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 Err(w) => why = w,
             }
         }
-        // Inline assembly has no lowering yet: refused by name, never expanded.
-        if self.library_macro(path, &["asm", "global_asm", "naked_asm"]).is_some() {
+        // `asm!` expands (blaze-expand's `builtin # asm(..)`, lowered by `asm.rs`);
+        // `global_asm!` and `naked_asm!` have no lowering yet: refused by name, never expanded.
+        if self.library_macro(path, &["global_asm", "naked_asm"]).is_some() {
             why = Why::Asm;
         }
         // A statement of a block, `m!(..);` among them, expands to statements (Rust's rule

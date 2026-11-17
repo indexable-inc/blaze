@@ -11,7 +11,6 @@
 //! | [`request`] | the request machine |
 //! | [`lines`] | a file's line table: `file:line:col` when printed |
 //! | [`profile`] | counts per task kind, on every command |
-//! | [`scope_task`] | the `ModuleScope` task over blaze-scope's machine |
 //! | [`items`] | the production `Items` and `Source` over the records a task holds |
 //! | [`fetch_task`] | the `Fetch` task: one lock entry's sources, its name, record and finding |
 //! | [`run`] | blaze-run's compiles and records as drive names |
@@ -42,7 +41,6 @@ pub mod profile;
 pub mod record;
 pub mod request;
 pub mod run;
-pub mod scope_task;
 pub mod settled;
 pub mod table;
 pub mod unit_graph_task;

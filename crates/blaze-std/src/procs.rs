@@ -175,4 +175,17 @@ impl fmt::Debug for Procs {
 #[cfg(unix)]
 mod linked;
 #[cfg(unix)]
-pub use self::linked::{BorrowedFd, Ended, Linked, LinkedSpec, Spawner};
+pub use self::linked::{
+    BorrowedFd, Ended, Linked, LinkedSpec, Spawner,
+    run::{
+        CHILD_FD, ChannelError, Input, Message, OutPipe, Output, PREFIX, ParentDeath, Read, Run, RunChild, RunError,
+        RunFault, RunSpec, RunStep, Streams, whole_messages,
+    },
+    sim_child::{Act, MOST_DELAY, SimChild},
+    sim_term::{OnTerminate, SIGTERM, TermChild},
+};
+/// The run parent's own signals while its program runs (decision D103): SIGINT and SIGQUIT
+/// ignored, SIGTERM forwarded and then the program's end waited for a bounded grace.
+pub use blaze_core::run_signals::{Arrived, GRACE, ParentSignals, Relay, RelayAct, Scripted, SignalError};
+#[cfg(unix)]
+pub use blaze_core::run_signals::Held;

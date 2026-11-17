@@ -14,6 +14,9 @@ use core::ffi::{c_char, c_void};
 use core::fmt;
 use core::ptr;
 use core::sync::atomic::{AtomicU8, Ordering};
+use core::time::Duration;
+
+use blaze_core::lock::Lock;
 
 use blaze_code::record::Symbol;
 use blaze_own::{AString, AVec, Alloc, String, Vec};
@@ -45,13 +48,15 @@ impl Severity {
 pub enum LlvmError<'a> {
     /// [`init`] has not finished: no target is registered.
     NotInitialized,
-    /// [`init`] was called while another thread was running it.
+    /// [`init`] waited `INIT_WAIT` for another thread's registration and it did not finish.
     InitRacing,
+    /// LLVM built no default pipeline at this level (only 1, 2 and 3 exist).
+    DefaultPipeline { level: u8 },
     /// The CPU is `native` or empty (D100 point 14), or holds a NUL byte.
     Cpu { what: &'static str },
     /// `machine.features` holds a bit this crate does not name for its arch.
     Features { arch: Arch, bits: u64 },
-    /// The pipeline has no pass text yet (pipeline.rs `BLAZE_O2_PASSES` says why).
+    /// The pipeline's text for this arch is empty (no pipeline in pipeline.rs is today).
     NoPipeline { pipeline: &'static str },
     /// LLVM has no target for the triple.
     Target { triple: &'static str, message: AString<'a> },
@@ -79,11 +84,12 @@ impl fmt::Display for LlvmError<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LlvmError::NotInitialized => f.write_str("blaze-llvm: `init` has not run: no LLVM target is registered"),
-            LlvmError::InitRacing => f.write_str("blaze-llvm: `init` was called while another thread ran it"),
+            LlvmError::InitRacing => f.write_str("blaze-llvm: `init`: another thread's target registration did not finish within `INIT_WAIT` (30 s)"),
+            LlvmError::DefaultPipeline { level } => write!(f, "blaze-llvm: LLVM has no `default<O{level}>` pipeline (levels 1 to 3)"),
             LlvmError::Cpu { what } => write!(f, "blaze-llvm: the target CPU {what} (D100 point 14: name it)"),
             LlvmError::Features { arch, bits } => write!(f, "blaze-llvm: unknown feature bits {bits:#x} for {arch:?}"),
             LlvmError::NoPipeline { pipeline } => {
-                write!(f, "blaze-llvm: the pipeline `{pipeline}` has no pass text yet (pipeline.rs BLAZE_O2_PASSES)")
+                write!(f, "blaze-llvm: the pipeline `{pipeline}` has no pass text for this arch (pipeline.rs)")
             }
             LlvmError::Target { triple, message } => write!(f, "blaze-llvm: no LLVM target for `{triple}`: {message}"),
             LlvmError::Parse { message } => write!(f, "blaze-llvm: the IR did not parse: {message}"),
@@ -114,26 +120,37 @@ pub struct Linked<'b> {
 }
 
 const UNINIT: u8 = 0;
-const RUNNING: u8 = 1;
 const READY: u8 = 2;
 
 /// LLVM's target registry is the process's (LLVM's own global state); this says whether
-/// blaze's targets are in it.
+/// blaze's targets are in it. It is set only under `REGISTERING`, read without it.
 static TARGETS: AtomicU8 = AtomicU8::new(UNINIT);
 
-/// Registers the arm64 and x86-64 targets with LLVM: once per process, before the first
-/// compile, from one thread (the process's start). A second call after the first finished
-/// does nothing; a call while another runs is `LlvmError::InitRacing` (it never waits).
+/// Held while the targets are registered; `true` once they are.
+static REGISTERING: Lock<bool> = Lock::new("llvm.targets", false);
+
+/// How long a caller waits for another thread's registration (eight registry calls, which take
+/// microseconds) before `LlvmError::InitRacing`.
+const INIT_WAIT: Duration = Duration::from_secs(30);
+
+/// Registers the arm64 and x86-64 targets with LLVM, once per process, before the first
+/// compile. Any thread may call it at any time. A call after registration is one atomic load.
+/// Otherwise the caller takes `REGISTERING`, waiting at most `INIT_WAIT`, and the first holder
+/// registers. Past the deadline the call is `LlvmError::InitRacing`, never a second registration.
 pub fn init() -> Result<(), LlvmError<'static>> {
-    match TARGETS.compare_exchange(UNINIT, RUNNING, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => {}
-        Err(READY) => return Ok(()),
-        Err(_) => return Err(LlvmError::InitRacing),
+    if TARGETS.load(Ordering::Acquire) == READY {
+        return Ok(());
+    }
+    let Some(mut registered) = REGISTERING.try_lock_for(INIT_WAIT) else {
+        return Err(LlvmError::InitRacing);
+    };
+    if *registered {
+        return Ok(());
     }
     // SAFETY: each is a target library's registration entry point, linked by llvm-sys (the
     // pinned prefix's lib/ has libLLVMAArch64*.a and libLLVMX86*.a). Registration writes
-    // LLVM's global registry; the state above admits exactly one caller, and no compile runs
-    // before READY is stored.
+    // LLVM's global registry. `REGISTERING` is held and unset, so exactly one thread runs this
+    // once per process, and no compile runs before READY is stored.
     unsafe {
         ffi::LLVMInitializeAArch64TargetInfo();
         ffi::LLVMInitializeAArch64Target();
@@ -144,6 +161,7 @@ pub fn init() -> Result<(), LlvmError<'static>> {
         ffi::LLVMInitializeX86TargetMC();
         ffi::LLVMInitializeX86AsmPrinter();
     }
+    *registered = true;
     TARGETS.store(READY, Ordering::Release);
     Ok(())
 }
@@ -385,6 +403,72 @@ impl Drop for SinkOwner {
     }
 }
 
+/// The CPU is named (D100 point 14): not empty, not `native`, no NUL byte.
+fn named_cpu(cpu: &str) -> Result<(), LlvmError<'static>> {
+    match cpu {
+        "" => Err(LlvmError::Cpu { what: "is empty" }),
+        "native" => Err(LlvmError::Cpu { what: "is `native`" }),
+        _ if cpu.as_bytes().contains(&0) => Err(LlvmError::Cpu { what: "holds a NUL byte" }),
+        _ => Ok(()),
+    }
+}
+
+/// The target machine: the named CPU, explicit features, PIC, the small code model, and -O2's
+/// code generator.
+///
+/// # Safety
+/// `triple`, `cpu_c` and `features` are NUL-terminated, and [`init`] has finished.
+unsafe fn target_machine<'a>(
+    triple: &'static [u8],
+    cpu_c: &[u8],
+    features: &'static [u8],
+    alloc: Alloc<'a>,
+) -> Result<MachineOwner, LlvmError<'a>> {
+    let mut target: ffi::TargetRef = ptr::null_mut();
+    let mut message: *mut c_char = ptr::null_mut();
+    // SAFETY: the three byte strings are NUL-terminated (the caller's promise) and outlive the
+    // calls; the target is the registry's (static), and the machine is owned by the returned
+    // `MachineOwner`, which disposes of it once.
+    unsafe {
+        if ffi::LLVMGetTargetFromTriple(triple.as_ptr().cast(), &mut target, &mut message) != 0 {
+            return Err(LlvmError::Target { triple: triple_str(triple), message: take_message(message, alloc) });
+        }
+        Ok(MachineOwner(ffi::LLVMCreateTargetMachine(
+            target,
+            triple.as_ptr().cast(),
+            cpu_c.as_ptr().cast(),
+            features.as_ptr().cast(),
+            ffi::CODEGEN_LEVEL_DEFAULT,
+            ffi::RELOC_PIC,
+            ffi::CODE_MODEL_SMALL,
+        )))
+    }
+}
+
+/// LLVM's own `default<O{level}>` pipeline text for `machine` and `cpu`, with SLP
+/// vectorization on, as `opt -print-pipeline-passes` prints it, built by the pinned LLVM's
+/// PassBuilder (vendor/llvm-sys `LLVMBlazeDefaultPipeline`). `blaze-O2` is derived from this
+/// text and checked against it (pipeline.rs), so an LLVM bump that changes the default is seen.
+pub fn default_pipeline<'a>(machine: &Machine, cpu: &str, level: u8, alloc: Alloc<'a>) -> Result<AString<'a>, LlvmError<'a>> {
+    if TARGETS.load(Ordering::Acquire) != READY {
+        return Err(LlvmError::NotInitialized);
+    }
+    named_cpu(cpu)?;
+    let triple = triple_c(machine);
+    let features = features_c(machine)?;
+    let cpu_c = nul_terminated(cpu.as_bytes(), alloc);
+    // SAFETY: `init` has finished (checked above); the strings are NUL-terminated; the text LLVM
+    // returns is a fresh `LLVMCreateMessage` copy that `take_message` frees once.
+    unsafe {
+        let tm = target_machine(triple, &cpu_c, features, alloc)?;
+        let text = ffi::LLVMBlazeDefaultPipeline(tm.0, u32::from(level), 1);
+        if text.is_null() {
+            return Err(LlvmError::DefaultPipeline { level });
+        }
+        Ok(take_message(text, alloc))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run<'a>(
     ir: &[u8],
@@ -400,15 +484,10 @@ fn run<'a>(
     if TARGETS.load(Ordering::Acquire) != READY {
         return Err(LlvmError::NotInitialized);
     }
-    match cpu {
-        "" => return Err(LlvmError::Cpu { what: "is empty" }),
-        "native" => return Err(LlvmError::Cpu { what: "is `native`" }),
-        _ if cpu.as_bytes().contains(&0) => return Err(LlvmError::Cpu { what: "holds a NUL byte" }),
-        _ => {}
-    }
+    named_cpu(cpu)?;
     // An empty pipeline is refused just before it would run (below), so parsing, linking and
     // verifying are checked whatever the pipeline's state.
-    let passes = pipeline.passes();
+    let passes = pipeline.passes(machine.arch);
     let triple = triple_c(machine);
     let features = features_c(machine)?;
     let cpu_c = nul_terminated(cpu.as_bytes(), alloc);
@@ -444,22 +523,7 @@ fn run<'a>(
         }
         let mut sink = SinkOwner { context: context.0, sink: sink_ref, ended: false };
 
-        // The target machine: named CPU, explicit features, PIC, the small code model, -O2's
-        // code generator.
-        let mut target: ffi::TargetRef = ptr::null_mut();
-        let mut message: *mut c_char = ptr::null_mut();
-        if ffi::LLVMGetTargetFromTriple(triple.as_ptr().cast(), &mut target, &mut message) != 0 {
-            return Err(LlvmError::Target { triple: triple_str(triple), message: take_message(message, alloc) });
-        }
-        let tm = MachineOwner(ffi::LLVMCreateTargetMachine(
-            target,
-            triple.as_ptr().cast(),
-            cpu_c.as_ptr().cast(),
-            features.as_ptr().cast(),
-            ffi::CODEGEN_LEVEL_DEFAULT,
-            ffi::RELOC_PIC,
-            ffi::CODE_MODEL_SMALL,
-        ));
+        let tm = target_machine(triple, &cpu_c, features, alloc)?;
 
         // The caller's module.
         let buffer = BufferOwner(ffi::LLVMCreateMemoryBufferWithMemoryRange(

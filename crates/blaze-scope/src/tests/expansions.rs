@@ -217,12 +217,12 @@ fn a_kept_derive_whose_asked_cfg_atom_moved_is_expanded_again() {
     assert!(sets.set(0) == fresh.set(0), "the set under the new cfg equals a first solve's under it");
 }
 
-/// The planted bug: a key that leaves out the attribute (the derive's name). `Both`'s `Clone`
-/// and `Copy` calls then have one key and two expansions, which the set refuses to write
-/// (rule 21: two values under one key), naming the rule.
+/// The planted bug: a key that leaves out the definition (the derive's content). `Both`'s
+/// `Clone` and `Copy` calls (one item, one shaped input) then have one key and two expansions,
+/// which the set refuses to write (rule 21: two values under one key), naming the rule.
 #[test]
-#[should_panic(expected = "two expansions under one text key")]
-fn a_key_without_the_attribute_is_caught() {
+#[should_panic(expected = "two expansions under one call key")]
+fn a_key_without_the_definition_is_caught() {
     let crates = crates(&[]);
-    solve(&crates, &TEXTS, &Sets::new(true, Planted::KeyWithoutTheAttribute));
+    solve(&crates, &TEXTS, &Sets::new(true, Planted::KeyWithoutTheDefinition));
 }

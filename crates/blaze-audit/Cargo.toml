@@ -31,7 +31,7 @@ blaze-own.workspace = true
 [dev-dependencies]
 blaze-sim.workspace = true
 # `Alloc::global()`: the tests' locks are read in the global allocator.
-blaze-own = { workspace = true, features = ["std"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
 
 [lints]
 workspace = true

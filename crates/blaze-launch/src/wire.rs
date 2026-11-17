@@ -20,6 +20,7 @@
 //! ([`List`]) from the frame.
 
 pub mod cbor;
+mod personality;
 pub mod run;
 
 use alloc::vec::Vec;

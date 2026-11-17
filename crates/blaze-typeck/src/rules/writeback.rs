@@ -68,6 +68,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 list(l, out)
             }
             TyView::Alias { args, .. } | TyView::ClosureOf { args, .. } => list(args, out),
+            TyView::CoroutineOf { args, output, interior, .. } => {
+                out.push(output);
+                out.push(interior);
+                list(args, out)
+            }
             TyView::Dynamic(l) | TyView::ExTrait(_, l) | TyView::ExProj { args_term: l, .. } => list(l, out),
             TyView::Ref(_, t) | TyView::Ptr(_, t) | TyView::Slice(t) | TyView::Closure(_, t) | TyView::ConstValue { ty: t, .. } => {
                 out.push(t)
@@ -208,6 +213,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
                 TyView::ClosureOf { owner, ordinal, args, .. } => PNode::Closure { owner, ordinal, args: self.export_list(ex, args)? },
                 TyView::Future(e, o, i) => PNode::Future(e, one(ex, o, self.ty)?, one(ex, i, self.ty)?),
+                TyView::CoroutineOf { owner, ordinal, args, .. } => PNode::Coroutine { owner, ordinal, args: self.export_list(ex, args)? },
                 TyView::Param(i) => PNode::Param(i),
                 TyView::Alias { trait_, name, args } => PNode::Alias { trait_, name, args: self.export_list(ex, args)? },
                 TyView::Opaque(k, l) => PNode::Opaque(k, self.export_list(ex, l)?),
@@ -454,16 +460,33 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         for &(k, t) in defined.iter() {
             let n = self.diags.len();
             let p = self.export(&mut ex, t, At::Body)?;
+            let p = match ex.out.view().node(p)? {
+                PNode::Future(e, ..) => {
+                    let Some(ordinal) = crate::coroutine_id::coroutine_ordinal(&self.body, e) else {
+                        return Err(CheckError::Malformed(crate::error::Malformed::Unreached(e)));
+                    };
+                    let mut ps: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(self.own_params as usize, self.alloc);
+                    for i in 0..self.own_params {
+                        ps.push(ex.out.intern(PNode::Param(i))?);
+                    }
+                    let args = ex.out.intern_list(&ps)?;
+                    ex.out.intern(PNode::Coroutine { owner: self.body.owner, ordinal, args })?
+                }
+                _ => p,
+            };
             if self.diags.len() == n {
                 hidden.push((k, p));
             } else {
                 self.diags.truncate(n);
             }
         }
+        let mut promoted: Vec<crate::ids::ExprId, Alloc<'a>> = Vec::with_capacity_in(self.promoted.len(), alloc);
+        promoted.extend_from_slice(&self.promoted);
         let (reads, needs) = self.reads.finish(alloc);
         Ok(Checked {
             suggests,
             hidden,
+            promoted,
             types: ex.out,
             expr_ty,
             pat_ty,
@@ -536,7 +559,7 @@ fn first_unknown(r: Recs<'_, '_>, alloc: Alloc<'_>) -> Result<Option<crate::erro
             | PNode::ConstParam(_)
             | PNode::ExAuto(_) => false,
             PNode::Ref(_, c) | PNode::Ptr(_, c) | PNode::Slice(c) | PNode::ConstValue { ty: c, .. } => one(c),
-            PNode::Closure { args, .. } => any(args)?,
+            PNode::Closure { args, .. } | PNode::Coroutine { args, .. } => any(args)?,
             PNode::Array(a, b) | PNode::Future(_, a, b) => one(a) || one(b),
             PNode::Pat(c, l) => one(c) || any(l)?,
             PNode::ExProj { args, term, .. } => one(term) || any(args)?,

@@ -1069,6 +1069,11 @@ impl FrontEnd for Front2Program<'_> {
         }
     }
 
+    fn c_variadic(&self, key: ItemKey) -> Option<u32> {
+        let head = self.store.fns.get(&key)?;
+        head.c_variadic.then_some(head.inputs.len() as u32)
+    }
+
     fn entry(&self) -> Option<usize> {
         self.entry
     }
@@ -1104,7 +1109,7 @@ impl FrontEnd for Front2Program<'_> {
         if let Some(c) = self.store.ctors.get(&key) {
             let header = tc::FnPtrHeader { abi: tc::Abi::Rust, safety: tc::Safety::Safe };
             let (inputs, output, types) = (&c.inputs[..], c.output, self.tys.view());
-            return FnSig { parent_count: 0, own_count: c.generics, declared_count: c.generics, self_param: false, header, inputs, output, types };
+            return FnSig { parent_count: 0, own_count: c.generics, declared_count: c.generics, self_param: false, header, c_variadic: false, inputs, output, types };
         }
         let f = &self.store.fns[&key];
         FnSig {
@@ -1113,6 +1118,7 @@ impl FrontEnd for Front2Program<'_> {
             declared_count: f.declared,
             self_param: f.self_param,
             header: f.header,
+            c_variadic: false,
             inputs: &f.inputs,
             output: f.output,
             types: self.tys.view(),
@@ -1121,6 +1127,12 @@ impl FrontEnd for Front2Program<'_> {
 
     fn fn_index(&self, key: ItemKey) -> Option<usize> {
         self.by_key.get(&key).copied()
+    }
+
+    /// The digest filed in the store when fn `i`'s body was checked: its `Checked` holds no
+    /// list (front2 body_reads.rs).
+    fn body_reads(&self, i: usize, _checked: &Checked<'static>) -> Option<super::body_reads::ReadsDigest> {
+        self.store.reads.get(self.fns[i].key)
     }
 
     /// Each body was checked once, in `new` (rule 77); this hands the results over.

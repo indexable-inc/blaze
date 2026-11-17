@@ -76,7 +76,8 @@ const DOC: &str = r#"tobstd: moves one crate from `std` onto bstd and blaze-own 
     generic   a generic a function gains with the parameter (null: none, for a concrete `type`;
               "A: core::alloc::Allocator + Copy" with type "A" for a generic allocator)
     entry     what `main` and a test pass in place of gaining the parameter
-              ("blaze_own::Alloc::global()"), or null: then each is a wall `entry`
+              ("blaze_own::Heap::process().alloc()"; a test then passes
+              "blaze_own::testing::heap().alloc()", D102), or null: then each is a wall `entry`
     roots     the crates a replacement may name (["core", "blaze_own"]): a row whose
               replacement is elsewhere is skipped, and the summary says so
     cargo     the cargo to run ("/Volumes/Projects/blaze-int-1112-notes/wtcargo.sh")
@@ -188,8 +189,11 @@ impl Mode {
 
 /// The allocator's parameter type: one concrete `Copy` handle, so a function gains no generic.
 const ALLOC_TYPE: &str = "blaze_own::Alloc<'_>";
-/// What `main` and a test pass.
-const ALLOC_ENTRY: &str = "blaze_own::Alloc::global()";
+/// What `main` passes: the heap the program's entry takes (D102; never `Alloc::global()`).
+const ALLOC_ENTRY: &str = "blaze_own::Heap::process().alloc()";
+/// What a test passes in place of [`ALLOC_ENTRY`]: a test is its own entry, and its root is the
+/// tests' heap (the crate's dev-dependencies turn on blaze-own's `testing`).
+const ALLOC_TEST_ENTRY: &str = "blaze_own::testing::heap().alloc()";
 /// The trait whose `share` a `.clone()` becomes, imported by share-clone.
 const SHARE_USE: &str = "use blaze_own::Share as _;";
 
@@ -929,6 +933,8 @@ fn source_of(ctx: &Context, a: &Args, file: &str, at: usize, cands: Option<&BTre
     }
     if func.entry {
         return match &a.entry {
+            // A test is its own entry: the default's test form (D102).
+            Some(e) if e == ALLOC_ENTRY && func.name != "main" => Source::Expr(ALLOC_TEST_ENTRY.to_owned()),
             Some(e) => Source::Expr(e.clone()),
             None => Source::Wall("entry", format!("`{}`", func.name)),
         };

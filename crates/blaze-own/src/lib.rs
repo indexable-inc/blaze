@@ -138,6 +138,8 @@ pub use alloc_ref::{
     AArc, ABTreeMap, ABTreeSet, ABox, ADeque, ALists, APaths, ARc, ASoa, ASortedMap, ASortedSet, AString, ATexts, AVec,
     Alloc, Erased, Headed, Header, SharedAlloc,
 };
+#[cfg(any(test, feature = "std"))]
+pub use alloc_ref::Heap;
 pub use lists::Lists;
 pub use paths::{DirId, PathId, PathsView, Paths, SealedPaths};
 pub use segs::{Appender, Segs, SharedSegs};

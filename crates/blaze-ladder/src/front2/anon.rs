@@ -224,6 +224,7 @@ pub fn file_asked<'n>(store: &mut Store<'n>, keys: &mut Keys) -> Result<Vec<LibK
                 declared: 0,
                 self_param: false,
                 header,
+                c_variadic: false,
                 inputs: Vec::new_in(Global),
                 output,
                 has_body: true,

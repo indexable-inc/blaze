@@ -27,6 +27,9 @@ blaze-own.workspace = true
 
 [dev-dependencies]
 blaze-own = { workspace = true, features = ["std"] }
+# tests/features.rs checks the feature table row by row against rustc's tables and the
+# apple-m1 CPU set this crate holds (`TargetArch::rustc_table`, `cpus::features`).
+target-features.workspace = true
 
 [lints]
 workspace = true

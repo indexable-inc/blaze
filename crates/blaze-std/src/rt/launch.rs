@@ -53,14 +53,15 @@ pub fn launch<R: crate::entry::Outcome>(
             return Exit(Status::FAILED);
         }
     };
-    let alloc = SharedAlloc::global();
+    // The process's entry: where its heap is taken, once, and handed down (D102).
+    let alloc: SharedAlloc<'static> = blaze_own::Heap::process().shared();
     // An ordinary start's spec holds no command line, environment or directory: the world reads
     // the process's own, where the kernel left them (std.md, "What a program pays for at
     // start"), so nothing is copied into it, sorted, or copied back out.
     let defaults = || -> RunSpec<LaunchAlloc> {
         RunSpec::defaults(blaze_own::Vec::new_in(alloc), blaze_own::Vec::new_in(alloc), blaze_own::String::from_str_in(".", alloc), alloc)
     };
-    match prepare(manifest, delivered.as_deref(), defaults) {
+    match prepare(manifest, delivered.as_deref(), defaults, alloc) {
         Prepared::Manifest(text) => match write_out(Stream::Out, &[text.as_bytes(), b"\n"]) {
             Ok(()) => Exit(Status::OK),
             Err(why) => {

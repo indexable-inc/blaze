@@ -173,6 +173,13 @@ fn encode_trees(top: &[PTy], ground: PTys<'_>, scratch: Alloc<'_>, out: &mut AVe
                 out.push(22);
                 out.extend_from_slice(&ordinal.0.to_le_bytes());
             }
+            // A future of another body by identity (`PNode::Coroutine`): its own tag, its
+            // owner and ordinal, as a closure's; its children the owner's arguments.
+            PNode::Coroutine { owner, ordinal, .. } => {
+                out.push(23);
+                key(out, owner);
+                out.extend_from_slice(&ordinal.to_le_bytes());
+            }
             PNode::Param(_) => return Err(SymbolError::NotGround { what: "a generic parameter" }),
             PNode::ConstParam(_) => return Err(SymbolError::NotGround { what: "a const generic parameter" }),
             PNode::Alias { .. } => return Err(SymbolError::NotGround { what: "a projection not normalized" }),

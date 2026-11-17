@@ -350,7 +350,7 @@ fn unifies(
 /// One case: a goal, up to forty impl headers, their columns filtered by the goal's
 /// fingerprint; every dropped impl is unified with the goal.
 fn head_shape_case(t: &Tape, head: Head) -> Result<(), Broke> {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     // One to five arguments: the fingerprint reads four, the fifth is never filtered on.
     let arity = 1 + t.below(5, "trait arguments") as usize;
     let mut tys = TestTys::new();
@@ -473,7 +473,7 @@ fn forty_impls() -> String {
 /// The answer to `case`'s goal `goal` in `world` from a fresh solver, with the impl
 /// candidates it assembled.
 fn impl_candidates(world: &World, case: &CaseA, goal: usize) -> Result<(Answer, u64), String> {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let mut tys = TestTys::new();
     let mut vars: HashMap<String, Ty> = HashMap::new();
     let mut solver = Solver::new_in(alloc);

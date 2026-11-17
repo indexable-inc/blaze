@@ -1,0 +1,16 @@
+status 0
+stdout
+"42" -> 42
+"" -> cannot parse integer from empty string
+"4x" -> invalid digit found in string
+"300" -> number too large to fit in target type
+"-1" -> invalid digit found in string
+Err("number too small to fit in target type")
+Ok(3.5)
+invalid float literal
+Ok(true)
+provided string was not `true` or `false`
+Err("too many characters in string")
+invalid utf-8 sequence of 1 bytes from index 1
+Ok(-255)
+Ok(7)

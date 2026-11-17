@@ -30,7 +30,7 @@ blaze-protocol.workspace = true
 stdx.workspace = true
 # The frame's properties and their planted-bug control.
 blaze-sim.workspace = true
-blaze-own = { workspace = true, features = ["std"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
 
 [lints]
 workspace = true

@@ -1,0 +1,7 @@
+status 0
+stdout
+a b polls 4
+a 1, b 3, a 0, b 2, b 1, b 0
+x done y done polls 3
+x 2, y 0, x 1, x 0
+[100, 200, 300]

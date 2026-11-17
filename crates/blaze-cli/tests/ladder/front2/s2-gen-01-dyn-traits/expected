@@ -1,0 +1,11 @@
+status 0
+stdout
+11
+square 2 4
+shape 6
+square 1 1
+shape
+square 3 has area 9
+woof meow
+[1, 2]
+Some(5) None

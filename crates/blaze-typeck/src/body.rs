@@ -332,6 +332,9 @@ pub struct BodyView<'b> {
     pub fmt_uses: &'b [FmtUse],
     /// `Some` for an `async fn`'s body.
     pub coroutine: Option<CoroutineKind>,
+    /// The `let` statements written `super let` (the library's `pin!`), in ascending order: each
+    /// binding is owned by the scope a temporary of its block's value would be (async plan P11).
+    pub super_lets: &'b [StmtId],
 }
 
 fn slice<'b, T>(column: &'static str, all: &'b [T], l: List) -> Result<&'b [T], CheckError> {

@@ -1,6 +1,6 @@
 //! Floats and 128-bit integers in the walk.
 //!
-//! - `f32` and `f64` are `Repr::Float` (their LIR scalar); `f16` and `f128` are refused by name.
+//! - `f16`, `f32`, `f64` and `f128` are `Repr::Float` (their LIR scalar: walk/halfquad.rs).
 //!   Arithmetic is `fadd`/`fsub`/`fmul`/`fdiv`/`frem` (the emitter calls `fmod`/`fmodf` for
 //!   `frem`); unary `-` is `fneg`. The Reference, "Comparison operators": a float comparison is
 //!   IEEE 754's, so with a `NaN` on either side `==`, `<`, `<=`, `>`, `>=` are false and `!=` is
@@ -23,29 +23,26 @@ use core::alloc::Allocator;
 use blaze_lir::{Flags, FloatCond, Op, Ty, Value};
 use blaze_typeck::{BinOp, ExprId, FloatTy};
 
-use super::{Repr, TyErr, V, Walk, unsupported};
+use super::{Repr, TyErr, V, Walk, halfquad, unsupported};
 use crate::BuildError;
 
-/// How a float type is held: `f32` and `f64`; `f16` and `f128` are refused by name.
+/// How a float type is held: its LIR float scalar, at all four widths.
 pub(super) fn float_repr(f: FloatTy) -> Result<Repr, TyErr> {
-    Ok(Repr::Float(match f {
-        FloatTy::F32 => Ty::F32,
-        FloatTy::F64 => Ty::F64,
-        FloatTy::F16 | FloatTy::F128 => return Err(TyErr::Unsupported("`f16` or `f128`")),
-    }))
+    Ok(Repr::Float(halfquad::float_ty(f)))
 }
 
 impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// `1.5`: its bits at its type.
     pub(super) fn float_lit(&mut self, e: ExprId) -> Result<V, BuildError> {
         let Repr::Float(ty) = self.expr_repr(e)? else {
-            return Err(unsupported(e, "a float literal of a type that is not `f32` or `f64`"));
+            return Err(unsupported(e, "a float literal of a type that is not a float"));
         };
+        let f = halfquad::float_of(ty).ok_or(BuildError::Malformed { what: "a float literal held in a LIR type that is no float scalar" })?;
         let bits = self.adts.float_lit(self.body.owner, e).ok_or(BuildError::NoLiteralValue { expr: e })?;
-        if ty == Ty::F32 && bits > u128::from(u32::MAX) || bits > u128::from(u64::MAX) {
+        if !halfquad::lit_fits(f, bits) {
             return Err(BuildError::Malformed { what: "a float literal's bits past its type's width" });
         }
-        Ok(V::Scalar(self.b.fconst(ty, bits)))
+        Ok(V::Scalar(halfquad::float_lit(&mut self.b, f, bits)))
     }
 
     /// A binary operator on two floats: a comparison (an `i8` of 0 or 1) or arithmetic.
@@ -79,10 +76,12 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let out = match (from, to) {
             (Repr::Float(f), Repr::Float(t)) => {
                 let x = self.scalar(v, f)?;
-                match (f == t, t == Ty::F64) {
-                    (true, _) => x,
-                    (false, true) => self.b.convert(Op::Fpext, Flags::NONE, t, x),
-                    (false, false) => self.b.convert(Op::Fptrunc, Flags::NONE, t, x),
+                let (Some(from), Some(to)) = (halfquad::float_of(f), halfquad::float_of(t)) else {
+                    return Err(BuildError::Malformed { what: "a float cast between LIR types that are no float scalars" });
+                };
+                match halfquad::resize_op(from, to) {
+                    None => x,
+                    Some(op) => self.b.convert(op, Flags::NONE, t, x),
                 }
             }
             (Repr::Float(f), Repr::Int { ty, signed }) => {

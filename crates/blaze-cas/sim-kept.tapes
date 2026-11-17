@@ -1,0 +1,6 @@
+# blaze-cas's kept failing tapes (docs/v2/plan/design/test.md, piece S3), compiled in by
+# `blaze_sim::sim_kept!()` and replayed first by `blaze_sim::check_kept`.
+# One line a tape, as a failure's report prints it after `blaze-sim keep: `:
+#   <test path> v<primitives version> <tape>  # <date> <one line why>
+# Lines are only added; a line whose test is renamed moves to the new path.
+tests::collect::the_collector_forgets_nothing_a_root_names v2 0*6 37 1 0*6 1 0 10 0*3 1 0*2 1 0*2 1 0*3 1 0*6 1 0*6 1 0 26 3156351 0*2 3  # 2026-11-16 key 0 forgotten though pinned, after a reopen with fail_one_in 23

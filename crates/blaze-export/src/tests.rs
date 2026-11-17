@@ -69,7 +69,7 @@ fn tiny() -> (AVec<'static, u8>, AVec<'static, u8>) {
 }
 
 fn program<'r>(functions: &'r [Function<'r>], data: &'r [Data<'r>], profile: Option<Profile<'r>>) -> ProgramIn<'r> {
-    ProgramIn { name: "tiny", functions, data, entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, profile }
+    ProgramIn { name: "tiny", functions, data, entry: Entry::CMain { main: sym("main") }, panic: Panic::Unwind, personality: None, profile }
 }
 
 fn functions<'r>(main: &'r [u8], second: &'r [u8]) -> [Function<'r>; 2] {
@@ -91,7 +91,7 @@ fn calls_in_reach_are_direct() {
     let (main, second) = tiny();
     let fs = functions(&main, &second);
     let members: [Member<'_>; 2] = fs.map(|f| Member { symbol: f.symbol, record: f.record, tier: Some(f.tier) });
-    let laid = lay_out(&members, &[], sym("main"), None, macho::plan(), Alloc::global()).unwrap();
+    let laid = lay_out(&members, &[], sym("main"), None, macho::plan(), 0, Alloc::global()).unwrap();
     let home = |name: &str| laid.placed.iter().find(|p| p.symbol == sym(name)).unwrap().at;
     let (m, s) = (home("main"), home("second"));
     assert_eq!(laid.entry, m);
@@ -180,22 +180,6 @@ fn a_call_out_of_reach_is_refused() {
     println!("refused: {error}");
 }
 
-/// Prints `refused: export: function <thrower> calls `_Unwind_RaiseException`: ...` (unwind
-/// tables are not written, so a program that can unwind is refused, never exported wrong).
-#[test]
-fn a_program_that_unwinds_is_refused() {
-    let (main, second) = tiny();
-    let thrower = rec(&[STP, MOV_FP, ADRP_X16, LDR_X16, BLR_X16, LDP, RET], &[], &[(8, "_Unwind_RaiseException")]);
-    let [a, b] = functions(&main, &second);
-    let fs = [a, b, Function { symbol: sym("thrower"), record: CodeView::read(&thrower).unwrap(), tier: Tier::Fast }];
-    let mut out = Vec::new_in(Alloc::global());
-    let Err(error) = export(&program(&fs, &[], None), Platform::MacosArm64, &mut out, Alloc::global()) else {
-        panic!("a program calling the unwinder was exported without unwind tables");
-    };
-    assert_eq!(error, ExportError::Unwinds { from: sym("thrower"), name: "_Unwind_RaiseException", panic: Panic::Unwind });
-    println!("refused: {error}");
-}
-
 /// Prints `folded: 2 equal records, 1 copy of code`.
 #[test]
 fn equal_records_are_placed_once() {
@@ -210,7 +194,7 @@ fn equal_records_are_placed_once() {
         Member { symbol: sym("f"), record: CodeView::read(&a).unwrap(), tier: Some(Tier::Fast) },
         Member { symbol: sym("g"), record: CodeView::read(&a).unwrap(), tier: Some(Tier::Fast) },
     ];
-    let laid = lay_out(&members, &[], sym("main"), None, macho::plan(), Alloc::global()).unwrap();
+    let laid = lay_out(&members, &[], sym("main"), None, macho::plan(), 0, Alloc::global()).unwrap();
     let home = |name: &str| *laid.placed.iter().find(|p| p.symbol == sym(name)).unwrap();
     assert_eq!(home("f").at, home("g").at);
     assert_eq!(laid.placed.iter().filter(|p| p.folded).count(), 1);
@@ -225,7 +209,7 @@ fn the_profile_orders_and_is_in_the_identity() {
     let members: [Member<'_>; 2] = fs.map(|f| Member { symbol: f.symbol, record: f.record, tier: Some(f.tier) });
     let hot = [sym("second")];
     let profile = Profile { digest: [7; 32], hot: &hot };
-    let laid = lay_out(&members, &[], sym("main"), Some(profile), elf::plan(), Alloc::global()).unwrap();
+    let laid = lay_out(&members, &[], sym("main"), Some(profile), elf::plan(), 0, Alloc::global()).unwrap();
     assert_eq!(laid.placed[0].symbol, sym("second"));
     let mut out = Vec::new_in(Alloc::global());
     let with = export(&program(&fs, &[], Some(profile)), Platform::MacosArm64, &mut out, Alloc::global()).unwrap();
@@ -250,7 +234,7 @@ fn statics_and_vtables_are_placed_and_fixed() {
         Data { target: vt, bytes: &table, align: 8, words: &words, place: DataPlace::ReadOnly },
     ];
     let members = [Member { symbol: sym("main"), record: CodeView::read(&main).unwrap(), tier: Some(Tier::Fast) }];
-    let laid = lay_out(&members, &data, sym("main"), None, macho::plan(), Alloc::global()).unwrap();
+    let laid = lay_out(&members, &data, sym("main"), None, macho::plan(), 0, Alloc::global()).unwrap();
     let m = laid.entry;
     let x = |pc: u64| read32(&laid.text, pc - laid.text_at);
     let to = adrp_add_target(x(m), x(m + 4), m).unwrap();

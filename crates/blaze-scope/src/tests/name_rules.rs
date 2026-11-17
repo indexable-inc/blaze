@@ -19,7 +19,6 @@ use blaze_id::ItemKey;
 use blaze_sim::{Tail, Tape};
 
 use super::{Solved, V, World, same, solve, solve_with};
-use crate::resolver::Plant;
 use crate::{CallShape, DefKind, Edition, Namespace, ScopeError, Unresolved};
 
 /// Drawn completion orders per fixture (the brief's floor is 64).
@@ -58,11 +57,11 @@ fn tape_of(seed: u64) -> Tape {
 
 /// `want` holds for the calm order and every drawn order, and each order equals the calm one.
 fn every_order(w: &World, want: &dyn Fn(&Solved) -> Result<(), String>) -> Result<(), String> {
-    let calm = solve(w, None, Plant::None);
+    let calm = solve(w, None);
     want(calm.as_ref().map_err(|e| format!("calm order: the solver failed: {e}"))?).map_err(|e| format!("calm order: {e}"))?;
     for seed in 0..ORDERS {
         let tape = tape_of(seed);
-        let got = solve_with(w, w, Some(&tape), Plant::Shuffle(seed));
+        let got = solve_with(w, w, Some(&tape));
         let s = got.as_ref().map_err(|e| format!("order {seed}: the solver failed: {e}"))?;
         want(s).map_err(|e| format!("order {seed}: {e}"))?;
         same(&calm, &got).map_err(|e| format!("order {seed} differs from the calm order: {e}"))?;

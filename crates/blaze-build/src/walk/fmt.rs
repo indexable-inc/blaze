@@ -154,7 +154,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let base = self.vals.len().checked_sub(n).ok_or(malformed("a `format_args!`'s arguments missing from the value stack (a build bug)"))?;
         let mut refs = blaze_own::Vec::with_capacity_in(n, self.alloc.clone());
         refs.extend_from_slice(&self.vals[base..]);
-        self.vals.truncate(base);
+        self.truncate_vals(base);
 
         // `Arguments`: two pointer fields, found by name.
         let repr = self.expr_repr(e)?;
@@ -192,7 +192,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             let tagged = ((bytes.len() as u128) << 1) | 1;
             let x = self.b.iconst(Ty::I64, tagged);
             self.b.store(Flags::NONE, x, at.0, at.1 + args_off, MemAttrs::aligned(3));
-            self.vals.push(V::Place(at.0, at.1));
+            self.push_val(V::Place(at.0, at.1), None);
             return Ok(());
         }
 
@@ -228,14 +228,14 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             let rpass = self.pass(g_arg, arg_repr, abi, Some(item))?;
             let place = self.ref_place(Instance { item, args: targs });
             let reference = self.b.reference(RefKind::Func, place);
-            self.vals.push(r);
+            self.push_val(r, None);
             self.emit_call(Callee::Direct(reference), &[ref_repr], &[pass], arg_repr, rpass)?;
             let made = self.pop()?;
             let off = i32::try_from(stride * i as u32).map_err(|_| malformed("an argument array offset past 2 GiB"))?;
             self.store(made, arg_repr, (arr, off))?;
         }
         self.b.store(Flags::NONE, arr, at.0, at.1 + args_off, MemAttrs::aligned(3));
-        self.vals.push(V::Place(at.0, at.1));
+        self.push_val(V::Place(at.0, at.1), None);
         Ok(())
     }
 

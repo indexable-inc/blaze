@@ -37,6 +37,7 @@ use super::types::{PRIMS, children, path_texts};
 use crate::resolve::{Kind, Ns, ResolveError};
 
 mod asked;
+mod by_trait;
 
 pub use asked::{Ask, BucketRead, INCOHERENT_FACT, UNFILED_LIST};
 
@@ -77,7 +78,7 @@ pub(crate) fn shape_of(t: PTys<'_>, p: PTy) -> Option<Shape> {
         PNode::FnDef(k, _) => Shape::FnDef(k),
         PNode::FnPtr(l, _) => Shape::FnPtr(l.len.saturating_sub(1)),
         PNode::Opaque(k, _) => Shape::Opaque(k),
-        PNode::Closure { .. } | PNode::Future(..) => Shape::Closure,
+        PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => Shape::Closure,
         // A const generic's value is no type: never an impl's self type.
         PNode::Param(_) | PNode::Alias { .. } | PNode::Infer | PNode::Error | PNode::ConstValue { .. } | PNode::ConstParam(_) => return None,
         PNode::Dynamic(l) => Shape::Dynamic(blaze_typeck::object_principal(t, l)),

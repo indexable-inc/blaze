@@ -132,8 +132,9 @@ pub struct FileLimits {
 }
 
 impl FileLimits {
-    /// 64 MiB and 4096 files.
-    pub const DEFAULT: FileLimits = FileLimits { bytes: 64 << 20, files: 4096 };
+    /// 1 GiB and 4096 files: a file over [`crate::outputs4::BLOB_OVER`] is its own record in
+    /// `bzbsout4` (NATIVE.md 3.8), so the total no longer sizes one record.
+    pub const DEFAULT: FileLimits = FileLimits { bytes: 1 << 30, files: 4096 };
 }
 
 /// Why a file is not taken into the record.
@@ -249,7 +250,20 @@ impl<'a> Outputs<'a> {
 
     /// Appends the record's bytes to `out`.
     pub fn encode(&self, out: &mut AVec<'_, u8>) {
-        out.extend_from_slice(&LAYOUT.to_le_bytes());
+        self.encode_head(LAYOUT, out);
+        count(out, self.files.len());
+        for file in self.files.iter() {
+            text(out, &file.name);
+            out.extend_from_slice(&(file.bytes.len() as u64).to_le_bytes());
+            out.extend_from_slice(&file.bytes);
+        }
+        self.encode_tail(out);
+    }
+
+    /// The layout word `layout`, the `OUT_DIR` and the ten sections before the files: one
+    /// encoding for every layout (`bzbsout4` in [`crate::outputs4`] shares it).
+    pub(crate) fn encode_head(&self, layout: u64, out: &mut AVec<'_, u8>) {
+        out.extend_from_slice(&layout.to_le_bytes());
         text(out, &self.out_dir);
         count(out, self.cfgs.len());
         for (name, value) in self.cfgs.iter() {
@@ -289,22 +303,20 @@ impl<'a> Outputs<'a> {
             out.push(note.kind.code());
             text(out, &note.key);
         }
-        count(out, self.files.len());
-        for file in self.files.iter() {
-            text(out, &file.name);
-            out.extend_from_slice(&(file.bytes.len() as u64).to_le_bytes());
-            out.extend_from_slice(&file.bytes);
-        }
+    }
+
+    /// The section after the files: the C requests.
+    pub(crate) fn encode_tail(&self, out: &mut AVec<'_, u8>) {
         count(out, self.c_requests.len());
         self.c_requests.iter().for_each(|it| text(out, it));
     }
 }
 
-fn count(out: &mut AVec<'_, u8>, n: usize) {
+pub(crate) fn count(out: &mut AVec<'_, u8>, n: usize) {
     out.extend_from_slice(&u32::try_from(n).unwrap_or(u32::MAX).to_le_bytes());
 }
 
-fn text(out: &mut AVec<'_, u8>, text: &str) {
+pub(crate) fn text(out: &mut AVec<'_, u8>, text: &str) {
     count(out, text.len());
     out.extend_from_slice(text.as_bytes());
 }
@@ -332,40 +344,47 @@ pub enum RecordError {
     Trailing { at: usize },
     /// The `OUT_DIR` at `at` is not an absolute path.
     OutDir { at: usize },
+    /// The record is of the earlier layout `tag` (`bzbsout3` read by
+    /// [`crate::outputs4::Outputs4Ref::open`]): an old home, reported and rebuilt (rule 26),
+    /// never read.
+    OldHome { tag: u64 },
+    /// A `bzbsout4` file's form byte at `at` disagrees with its length: inline over
+    /// [`crate::outputs4::BLOB_OVER`] or a blob not over it (one outputs, one encoding).
+    FileForm { at: usize },
 }
 
 /// A cursor over a record's bytes.
 #[derive(Clone, Copy)]
-struct Cursor<'b> {
-    bytes: &'b [u8],
-    at: usize,
+pub(crate) struct Cursor<'b> {
+    pub(crate) bytes: &'b [u8],
+    pub(crate) at: usize,
 }
 
 impl<'b> Cursor<'b> {
-    fn take(&mut self, n: usize) -> Result<&'b [u8], RecordError> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'b [u8], RecordError> {
         let end = self.at.checked_add(n).filter(|end| *end <= self.bytes.len()).ok_or(RecordError::Short { at: self.at })?;
         let taken = &self.bytes[self.at..end];
         self.at = end;
         Ok(taken)
     }
 
-    fn u8(&mut self) -> Result<u8, RecordError> {
+    pub(crate) fn u8(&mut self) -> Result<u8, RecordError> {
         Ok(self.take(1)?[0])
     }
 
-    fn u32(&mut self) -> Result<u32, RecordError> {
+    pub(crate) fn u32(&mut self) -> Result<u32, RecordError> {
         let mut word = [0; 4];
         word.copy_from_slice(self.take(4)?);
         Ok(u32::from_le_bytes(word))
     }
 
-    fn u64(&mut self) -> Result<u64, RecordError> {
+    pub(crate) fn u64(&mut self) -> Result<u64, RecordError> {
         let mut word = [0; 8];
         word.copy_from_slice(self.take(8)?);
         Ok(u64::from_le_bytes(word))
     }
 
-    fn text(&mut self) -> Result<&'b str, RecordError> {
+    pub(crate) fn text(&mut self) -> Result<&'b str, RecordError> {
         let at = self.at;
         let len = self.u32()? as usize;
         core::str::from_utf8(self.take(len)?).map_err(|_| RecordError::NotUtf8 { at })
@@ -379,7 +398,7 @@ impl<'b> Cursor<'b> {
 }
 
 /// The twelve sections' starts (after each count) and counts.
-const SECTIONS: usize = 12;
+pub(crate) const SECTIONS: usize = 12;
 
 /// The domain of [`OutputsRef::crate_digest`]; a change to what it covers takes the next number.
 pub const CRATE_VIEW: &str = "blaze v2 build-script crate view 1";
@@ -393,7 +412,7 @@ pub struct OutputsRef<'b> {
 }
 
 /// One entry of any section, borrowed.
-enum Entry<'b> {
+pub(crate) enum Entry<'b> {
     Cfg(&'b str, Option<&'b str>),
     Text(&'b str),
     Pair(&'b str, &'b str),
@@ -403,7 +422,7 @@ enum Entry<'b> {
     File(&'b str, &'b [u8]),
 }
 
-fn entry<'b>(section: usize, cur: &mut Cursor<'b>) -> Result<Entry<'b>, RecordError> {
+pub(crate) fn entry<'b>(section: usize, cur: &mut Cursor<'b>) -> Result<Entry<'b>, RecordError> {
     Ok(match section {
         0 => {
             let name = cur.text()?;

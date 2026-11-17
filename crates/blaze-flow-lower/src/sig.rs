@@ -461,7 +461,7 @@ impl<'t, 'w, A: Allocator + Clone> Reader<'t, 'w, A> {
                     stack.extend_from_slice(self.tys.list(l).map_err(|_| SigRefusal::Unknown)?);
                 }
                 PNode::Opaque(_, _) | PNode::Alias { .. } | PNode::Dynamic(_) => n += 1,
-                PNode::Closure { .. } | PNode::Future(..) => return Err(SigRefusal::TypeNode),
+                PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => return Err(SigRefusal::TypeNode),
                 _ => {}
             }
         }

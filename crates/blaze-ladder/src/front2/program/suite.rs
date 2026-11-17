@@ -117,11 +117,12 @@ fn code_identity(program: &Front2Program<'_>, row: &Tabled<'_>) -> ContentId {
         Some(head) => h.part(head.text.as_bytes()),
         None => h.part(&[]),
     };
-    if let Some(c) = row.checked.as_ref() {
-        for answer in c.reads.rows.column::<1>() {
-            h.update(&answer.to_le_bytes());
-        }
-    }
+    // What the check read: the digest filed when the body was checked (its `Checked` holds
+    // no list, front2 body_reads.rs), or a mark that none was.
+    match program.store.reads.get(row.key) {
+        Some(reads) => h.update(&[1]).update(&reads.0.0),
+        None => h.update(&[0]),
+    };
     h.finish()
 }
 

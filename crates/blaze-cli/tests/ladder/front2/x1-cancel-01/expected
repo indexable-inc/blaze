@@ -1,0 +1,5 @@
+status 42
+stdout
+poll 1: pending, log 0
+poll 2: pending, log 4
+dropped: log 4321

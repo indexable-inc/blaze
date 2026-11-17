@@ -28,9 +28,11 @@ use crate::run::{Named, RunError};
 /// the one list both front ends answer from, so each tables the same set. A front end that
 /// tables only what it walks starts its walk at each one the program's world declares.
 impl FnLang {
-    pub const ALL: [FnLang; 12] = [
+    pub const ALL: [FnLang; 14] = [
         FnLang::PanicBoundsCheck,
         FnLang::DropInPlace,
+        FnLang::EhPersonality,
+        FnLang::PanicCannotUnwind,
         FnLang::PanicConst(PanicConst::AddOverflow),
         FnLang::PanicConst(PanicConst::SubOverflow),
         FnLang::PanicConst(PanicConst::MulOverflow),
@@ -48,6 +50,8 @@ impl FnLang {
         match self {
             FnLang::PanicBoundsCheck => "panic_bounds_check",
             FnLang::DropInPlace => "drop_in_place",
+            FnLang::EhPersonality => "eh_personality",
+            FnLang::PanicCannotUnwind => "panic_cannot_unwind",
             FnLang::PanicConst(p) => p.lang(),
         }
     }
@@ -67,6 +71,8 @@ impl FnLang {
         match self {
             FnLang::PanicBoundsCheck => &["panic_bounds_check"],
             FnLang::DropInPlace => &["drop_glue", "drop_in_place"],
+            FnLang::EhPersonality => &["eh_personality"],
+            FnLang::PanicCannotUnwind => &["panic_cannot_unwind"],
             FnLang::PanicConst(p) => p.declared_as(),
         }
     }
@@ -112,6 +118,12 @@ impl FnFacts<'_> {
 pub trait FrontEnd {
     fn fn_count(&self) -> usize;
     fn function(&self, i: usize) -> FnFacts<'_>;
+    /// For a C-variadic foreign fn `key` (`...` last), its declared parameter count; `None`
+    /// for any other fn. The old front refuses `...`, so its answer is `None`.
+    fn c_variadic(&self, key: ItemKey) -> Option<u32> {
+        let _ = key;
+        None
+    }
     fn entry(&self) -> Option<usize>;
     /// The program's one type table: signatures' and bodies' types.
     fn types(&self) -> PTys<'_>;
@@ -125,6 +137,10 @@ pub trait FrontEnd {
     /// Every body checked, by index: `None` for a fn without one. A body with any diagnostic
     /// or gap is a refusal, never a `Some`.
     fn check_all(&mut self) -> Result<Vec<Option<Checked<'static>>, Global>, RunError>;
+    /// The digest of fn `i`'s checked body's read list (front2 body_reads.rs), `checked` the
+    /// body [`FrontEnd::check_all`] handed over for `i`: what a code record's key holds of what
+    /// the check read. `None` where none was filed, which the caller refuses by name.
+    fn body_reads(&self, i: usize, checked: &Checked<'static>) -> Option<crate::front2::body_reads::ReadsDigest>;
     fn fn_lang(&self, l: FnLang) -> Option<ItemKey>;
     /// The `drop` lang trait and its `drop` fn.
     fn drop_trait(&self) -> Option<(ItemKey, Option<ItemKey>)>;
@@ -295,6 +311,11 @@ impl FrontEnd for Front<'_> {
 
     fn fn_index(&self, key: ItemKey) -> Option<usize> {
         Front::fn_index(self, key)
+    }
+
+    /// The old front's checks keep their lists (its `check_all` does not file them out).
+    fn body_reads(&self, _i: usize, checked: &Checked<'static>) -> Option<crate::front2::body_reads::ReadsDigest> {
+        Some(crate::front2::body_reads::ReadsDigest::of(&checked.reads, Alloc::global()))
     }
 
     /// Every body checked once, generically, in its own world.

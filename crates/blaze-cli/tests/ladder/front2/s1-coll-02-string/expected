@@ -1,0 +1,21 @@
+status 0
+stdout
+hello, world 12
+HELLO, WORLD
+Some(7)
+heLLo, worLd
+["a", "bb", "ccc"]
+["a", "b", "", "c"]
+[pad]
+desserts
+-246
+6 5 Some((3, 'l'))
+hé
+[104, 195, 169]
+ababab
+Some(("key", "value=x"))
+true true
+yx
+true
+concat!
+[0]

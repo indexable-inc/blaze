@@ -41,7 +41,8 @@ pub struct Body {
     pub targets: Vec<Target, Global>,
     /// By `Static` reference place: the static, found in the placed static image.
     pub statics: Vec<ItemKey, Global>,
-    /// By `Tls` reference place: the thread-local's offset in a thread's block.
+    /// By `Tls` reference place: the thread-local's index in the run's thread-local table
+    /// (crate::tls_index).
     pub tls: Vec<u32, Global>,
     /// By `Vtable` reference place: the program's table ([`Vtables`]) the word is the address of.
     pub vtables: Vec<u32, Global>,
@@ -162,6 +163,12 @@ pub enum PlaceError {
     NoMemory { bytes: usize },
     /// `pthread_key_create` refused the program's thread-local key: its error number.
     TlsKey { errno: i32 },
+    /// The thread-locals' ender (the key's destructor) has no entry thunk: its slot is not
+    /// declared, or its address is not a function's (crate::tls_index::create_key).
+    NoEnder,
+    /// The descriptor's `root` offset uses bit 63, which the access sequence clears to read it
+    /// (THREADS.md D2: bit 63 is the Linux flag).
+    TlsRoot { offset: u64 },
     /// The program has thread-locals and its static image holds no descriptor for them.
     NoDescriptor,
     /// A vtable's word names a table the program does not have.
@@ -170,6 +177,8 @@ pub enum PlaceError {
     VtableWord { table: u32, offset: u32 },
     /// The placed code is AArch64 and this process is not: its entry is never called.
     NotThisMachine,
+    /// The run could not be watched for traps, or a trap could not be placed (crate::trap).
+    Trap(crate::trap::TrapError),
 }
 
 impl core::fmt::Display for PlaceError {
@@ -195,10 +204,15 @@ impl core::fmt::Display for PlaceError {
             PlaceError::Statics(error) => write!(f, "the static image: {error:?}"),
             PlaceError::NoMemory { bytes } => write!(f, "no memory for the {bytes}-byte static image"),
             PlaceError::TlsKey { errno } => write!(f, "`pthread_key_create` for the thread-locals' key failed: errno {errno}"),
+            PlaceError::NoEnder => write!(f, "the thread-locals' ender has no entry thunk: its slot is not declared (the key would have no destructor)"),
+            PlaceError::TlsRoot { offset } => {
+                write!(f, "the thread-locals' root offset {offset:#x} uses bit 63, the flag the access sequence clears")
+            }
             PlaceError::NoDescriptor => write!(f, "the program has thread-locals and its static image holds no descriptor"),
             PlaceError::NoVtable { table } => write!(f, "a vtable's word names table {table}, which the program does not have"),
             PlaceError::VtableWord { table, offset } => write!(f, "vtable {table}: the address word at byte {offset} is not an aligned word inside it"),
             PlaceError::NotThisMachine => write!(f, "the program's code is AArch64 and this machine is not: the skeleton runs a program only where it was emitted for"),
+            PlaceError::Trap(error) => write!(f, "the trap watch: {error}"),
         }
     }
 }
@@ -212,6 +226,8 @@ pub struct Placed {
     /// Where a called stub leaves the program (crate::stub); the stubs' code holds its
     /// address, so it is boxed and lives as long as the code does.
     stops: Box<crate::stub::Stops>,
+    /// The code area's addresses: a trap with its pc here is the program's (crate::trap).
+    code: core::ops::Range<usize>,
 }
 
 /// How a placed program's entry ended.
@@ -221,6 +237,9 @@ pub enum Ended {
     Status(u8),
     /// It called stub `n`, a function that is not built, and was stopped there.
     Stub(u32),
+    /// It trapped (a `brk`) at `offset` in the body of `slot`, called from `callers` (each at
+    /// its call; read from the frame-pointer chain), and was stopped there (crate::trap).
+    Trap { code: crate::trap::TrapCode, slot: u32, offset: u64, callers: crate::trap::Callers },
 }
 
 /// The records of one placement: each slot's body, by slot.
@@ -363,8 +382,8 @@ impl Records for Table<'_> {
                     Some(&t) => self.vtables.address(t, place)?,
                     None => return Err(format!("slot {slot}: vtable reference {p} is not in the body's table")),
                 },
-                RelocTo::TlsOffset(p) => match body.tls.get(p as usize) {
-                    Some(&offset) => u64::from(offset),
+                RelocTo::TlsIndex(p) => match body.tls.get(p as usize) {
+                    Some(&index) => u64::from(index),
                     None => return Err(format!("slot {slot}: thread-local reference {p} is not in the body's table")),
                 },
                 RelocTo::TlsDesc | RelocTo::TlsGetter => {
@@ -430,18 +449,6 @@ fn write_statics(image: &StaticImage<Global>, base: u64, fns: &[(InstanceKey, u3
     image.fill(base, out, fn_at).map_err(PlaceError::Statics)
 }
 
-/// Creates the program's thread-local key in the descriptor static at `desc` (its first
-/// word), with `free` as the destructor of each thread's block (crates/blaze-build/src/tls.rs).
-pub fn create_tls_key(desc: u64) -> Result<(), PlaceError> {
-    // SAFETY: `desc` is the descriptor static in the image `load_statics` wrote, 8-aligned, its
-    // first word the key (`tls::DESC_KEY`); `pthread_key_t` fits in it. Each block was made by
-    // the getter's `aligned_alloc`, so `free` is its destructor, run once at its thread's exit.
-    let errno = unsafe { libc::pthread_key_create(desc as *mut libc::pthread_key_t, Some(libc::free)) };
-    if errno != 0 {
-        return Err(PlaceError::TlsKey { errno });
-    }
-    Ok(())
-}
 
 /// Places `bodies`, body `n` in slot `n`, in one edit. `image` is the program's statics and the
 /// memory reserved for them ([`load_statics`]), written here once the slots are declared, each
@@ -493,7 +500,10 @@ pub fn place(
         });
     }
     let shared = driver.shared();
-    Ok(Placed { _driver: driver, shared, stops })
+    // The code area's addresses (`area` bytes from its base): where a trap is the program's.
+    let base = driver.base();
+    let code = base..base + area as usize;
+    Ok(Placed { _driver: driver, shared, stops, code })
 }
 
 /// How the entry is called, by its signature.
@@ -509,6 +519,12 @@ pub enum Entry {
 }
 
 impl Placed {
+    /// The address of `slot`'s entry thunk: what the function's address is. `None` for a slot
+    /// not declared.
+    pub fn thunk(&self, slot: u32) -> Option<u64> {
+        self._driver.thunk(Slot(slot)).map(|at| at as u64)
+    }
+
     /// Calls the function in `slot` on this thread: the process status it ends with, or the
     /// stub it called (a function that is not built: the program is left there, crate::stub).
     pub fn call(&self, slot: u32, entry: Entry) -> Result<Ended, PlaceError> {
@@ -523,6 +539,10 @@ impl Placed {
             Entry::Unit | Entry::I32 => core::ptr::null(),
             Entry::Hosted(table) => table.as_ptr().cast_const(),
         };
+        // A trap in the placed code on this thread ends the run at stub.rs `leave` (crate::trap's
+        // handler resumes there), caught by this watch, armed for the run only.
+        let watch = crate::trap::Watch::new(self.code.clone(), self.stops.jump()).map_err(PlaceError::Trap)?;
+        let armed = watch.arm().map_err(PlaceError::Trap)?;
         // SAFETY: `at` is the slot's word: the address of a body this module placed (`place`),
         // emitted by blaze-emit in the C convention for a function of no parameters (`Unit`,
         // `I32`) or one pointer parameter in `x0` (`Hosted`: the host's table, alive for this
@@ -530,7 +550,12 @@ impl Placed {
         // (`sys::Code`); the program's stubs were placed with `self.stops`' address, and
         // `&self` is one run at a time on this thread.
         let left = unsafe { self.stops.run(at, argument) }.ok_or(PlaceError::NotThisMachine)?;
+        let caught = armed.disarm();
         me.safepoint();
+        if let Some(caught) = caught {
+            let (code, slot, offset, callers) = crate::trap::locate(&self._driver, &caught).map_err(PlaceError::Trap)?;
+            return Ok(Ended::Trap { code, slot, offset, callers });
+        }
         if left.stopped != 0 {
             return Ok(Ended::Stub(left.value as u32));
         }

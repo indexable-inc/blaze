@@ -16,6 +16,7 @@
 
 pub mod record;
 pub mod shelf;
+pub mod side;
 
 #[cfg(test)]
 mod tests;
@@ -24,6 +25,7 @@ use core::fmt;
 
 pub use record::{CrateRow, Role, ToolchainView, UnitKind, UnitRow};
 pub use shelf::{Shelf, ToolchainError};
+pub use side::{MACRO_TRIPLE, MacroSide, Side, SideName, SideSysroot, SideTriple, TargetSide};
 
 /// A toolchain's identity: the BLAKE3 of its manifest record's bytes before the footer.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]

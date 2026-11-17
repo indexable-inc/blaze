@@ -228,4 +228,22 @@ impl<'a, L: LoadItems<'a>> RecordItems<'a, L> {
         let edition = record.edition();
         record.item_now(key, &|which| self.read(krate, which), &|path, chain| self.load.item(krate, path, chain, edition, self.alloc))
     }
+
+    /// The text of file `index` of crate `krate` as the loader has it now, for a reader that
+    /// reads every item in it at item grain ([`RecordItems::item_now`]): the text the record
+    /// saw, proved by its digest ([`ItemsRecord::whole`]); or, when the file changed since, the
+    /// file as it is now, whose items are each proved or refused by `item_now` when read: never
+    /// read through the record's old offsets. An expansion is not asked here (an expansion's
+    /// text that changed stays refused whole).
+    pub fn file_now(&self, krate: usize, index: u32) -> Result<&'a str, ItemsRecordError> {
+        let record = self.record(krate).ok_or(ItemsRecordError::Short { what: "a crate with an items record", at: krate })?;
+        match record.whole(At::File(index), &|which| self.read(krate, which)) {
+            Ok(text) => Ok(text),
+            Err(ItemsRecordError::Stale { file: Some(_), call: None, .. }) => {
+                let row = record.file(index)?.ok_or(ItemsRecordError::Short { what: "a file row", at: index as usize })?;
+                self.load.file(krate, row.path).ok_or(ItemsRecordError::Gone { krate: record.key, file: Some(index), call: None })
+            }
+            Err(e) => Err(e),
+        }
+    }
 }

@@ -16,7 +16,7 @@
 #[expect(dead_code, reason = "the old renderer, kept whole for the comparison; the demo calls only its render")]
 mod old_frame;
 
-use blaze_own::{AString, Alloc};
+use blaze_own::{AString};
 use blaze_report::Severity;
 use blaze_report::frame::words::{Area, say, wording};
 use blaze_report::frame::{
@@ -52,7 +52,7 @@ fn old_caps(level: &str, width: u16) -> old_frame::Caps {
 }
 
 /// The same findings drawn by the old renderer.
-fn old_render(out: &mut AString<'_>, findings: &[Finding<'_>], sources: &[Source<'_>], caps: old_frame::Caps) {
+fn old_render(out: &mut AString<'_>, findings: &[Finding<'_>], sources: &[Source<'_>], caps: old_frame::Caps, heap: &'static blaze_own::Heap) {
     let marks: Vec<Vec<old_frame::Mark<'_>>> = findings
         .iter()
         .map(|f| f.secondary.iter().map(|m| old_frame::Mark { start: m.start, end: m.end, label: m.label }).collect())
@@ -78,10 +78,11 @@ fn old_render(out: &mut AString<'_>, findings: &[Finding<'_>], sources: &[Source
     let old_sources: Vec<old_frame::Source<'_>> =
         sources.iter().map(|s| old_frame::Source { shown: s.shown, absolute: s.absolute, text: s.text }).collect();
     let input = old_frame::Input { findings: &old, sources: &old_sources, link: old_frame::LINK_FILE };
-    old_frame::render(out, &input, caps, Alloc::global()).expect("every range is in its file");
+    old_frame::render(out, &input, caps, heap.alloc()).expect("every range is in its file");
 }
 
 fn main() {
+    let heap = blaze_own::Heap::process();
     let mut level = String::from("truecolor");
     let mut width: u16 = 100;
     let mut bg = background(std::env::var("COLORFGBG").ok().as_deref());
@@ -168,8 +169,8 @@ fn main() {
     };
     let second = Finding { primary: span(&main_rs, "?", 1, refused.label), ..first };
 
-    let mut headline = AString::new_in(Alloc::global());
-    let mut label = AString::new_in(Alloc::global());
+    let mut headline = AString::new_in(heap.alloc());
+    let mut label = AString::new_in(heap.alloc());
     let name = say(Area::Cli, 2, &["bstd"], &mut headline, &mut label).expect("cli rule 2 has words");
     let dependency = Finding {
         severity: Severity::Error,
@@ -263,13 +264,13 @@ fn main() {
         &[Finding { severity: Severity::Warning, ..advice }],
         &[advice],
     ];
-    let mut out = AString::new_in(Alloc::global());
+    let mut out = AString::new_in(heap.alloc());
     let mut counts = Counts { files: 8, ..Counts::default() };
     for findings in fixtures {
         out.push_str("── before ──\n");
-        old_render(&mut out, findings, &sources, old);
+        old_render(&mut out, findings, &sources, old, heap);
         out.push_str("── after ──\n");
-        render(&mut out, &Input { findings, sources: &sources, link: LINK_FILE, fixes: Fixes::ByHand, ids: &[] }, caps, Alloc::global())
+        render(&mut out, &Input { findings, sources: &sources, link: LINK_FILE, fixes: Fixes::ByHand, ids: &[] }, caps, heap.alloc())
             .expect("every range is in its file");
         out.push_str("\n");
         for finding in findings {

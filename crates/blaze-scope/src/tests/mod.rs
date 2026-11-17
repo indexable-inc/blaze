@@ -1,11 +1,9 @@
-//! The machine's tests: a compact builder of module records ([`World`]), a driver that plays
-//! the caller of the protocol ([`solve`]: answers from finished scopes, `InProgress` for a
-//! module on its stack, groups on a cycle, and, given a tape, answers shuffled and given in
-//! partial batches), the rule tests, and the properties.
+//! The names tests: a compact builder of module records ([`World`]), [`solve`] (the cell core,
+//! the names records' one writer, over a whole world, crate by crate, given a tape its items
+//! pushed in a drawn order), the rule tests, and the records' tests.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::string::String;
 use std::vec::Vec;
 use std::{format, vec};
@@ -15,21 +13,20 @@ use blaze_own::{Alloc, Vec as OwnVec};
 use blaze_sim::Tape;
 use blaze_surface::SurfaceError;
 
-use crate::resolver::Plant;
 use crate::{
-    Answer, CallShape, ChildModDecl, CrateRootBuilder, CrateRootHead, DeclaredItem, DeclsBuilder,
-    Def, DefKind, Dep, Edition, ExternCrateDecl, ExternTarget, Group, MacroCallDecl,
-    MacroRulesDecl, ModuleInfo, NameAnswer, Namespace, Path, PathKind, Read, Rename, Reply,
-    Resolved, Resolver, Saw, ScopeBuilder, ScopeError, ScopeFacts, Step,
+    CallShape, ChildModDecl, CrateRootBuilder, CrateRootHead, DeclaredItem, DeclsBuilder,
+    Def, DefKind, Dep, Edition, ExternCrateDecl, ExternTarget, MacroCallDecl,
+    MacroRulesDecl, ModuleInfo, Namespace, Path, PathKind, Rename,
+    Resolved, ScopeBuilder, ScopeError, ScopeFacts,
     TextualDef, UseDecl, UseForm, WrittenVis,
 };
 
 mod asked;
 mod asked_digest;
 mod attr_value;
-mod edits;
 mod attrs;
 mod blocks;
+mod macro_blocks;
 mod entry;
 mod expansions;
 mod exports;
@@ -48,7 +45,6 @@ mod oracle;
 pub(crate) use oracle::{B, Imp, reference_imports, reference_world};
 mod per_crate;
 mod procs;
-mod props;
 mod records;
 mod rules;
 mod tests_record;
@@ -339,147 +335,23 @@ impl ScopeFacts for World {
     }
 }
 
-/// A digest of an answer's content, as a record writer would give.
-fn digest<T: Hash>(tag: u8, items: &[T]) -> ContentId {
-    let mut h = DefaultHasher::new();
-    tag.hash(&mut h);
-    items.hash(&mut h);
-    let mut bytes = [0u8; 32];
-    bytes[..8].copy_from_slice(&h.finish().to_le_bytes());
-    ContentId(bytes)
-}
 
-/// An answer as the driver holds it.
-pub(crate) enum Own {
-    Name(NameAnswer),
-    Globs { edges: Vec<crate::GlobEdge>, krate: CrateItemKey, chain: Vec<ItemKey>, digest: ContentId },
-    Textual(Vec<TextualDef<N>>, ContentId),
-    Helpers(Vec<N>, ContentId),
-    /// In progress, waiting on the module named.
-    InProgress(ItemKey),
-}
 
-impl Own {
-    pub(crate) fn answer(&self) -> Answer<'_, N> {
-        match self {
-            Own::Name(a) => Answer::Name(*a),
-            Own::Globs { edges, krate, chain, digest } => Answer::Globs { edges, krate: *krate, chain, digest: *digest },
-            Own::Textual(defs, digest) => Answer::Textual { defs, digest: *digest },
-            Own::Helpers(names, digest) => Answer::Helpers { names, digest: *digest },
-            Own::InProgress(module) => Answer::InProgress { module: *module },
-        }
-    }
 
-    pub(crate) fn saw(&self) -> Option<Saw> {
-        match self {
-            Own::Name(a) => Some(Saw::Name(*a)),
-            Own::Globs { digest: d, .. } | Own::Textual(_, d) | Own::Helpers(_, d) => Some(Saw::Digest(*d)),
-            Own::InProgress(_) => None,
-        }
-    }
-}
 
-/// The `macro_rules!` visible at `module`'s `mod` line, from its ancestors' scopes; `Err` names
-/// an ancestor not done yet.
-fn entry(w: &World, done: &BTreeMap<ItemKey, Resolved<'static, N>>, module: ItemKey) -> Result<Vec<TextualDef<N>>, ItemKey> {
-    let Some(parent) = w.modules[&module].parent else { return Ok(Vec::new()) };
-    let Some(p) = done.get(&parent) else { return Err(parent) };
-    // One level: the parent's own definitions before the `mod` line; the resolver walks up.
-    let mut out = Vec::new();
-    // A module whose declaring call failed is not in its parent's scope: it does not exist,
-    // the driver solves it anyway, and the comparison (live modules only) says if that is wrong.
-    let Some(len) = p.scope.mark(module) else { return Ok(Vec::new()) };
-    out.extend_from_slice(&p.scope.textual[..len as usize]);
-    Ok(out)
-}
 
-/// What today's records answer `read`; `Err` names the module that has to be done first.
-pub(crate) fn answer(
-    w: &World,
-    done: &BTreeMap<ItemKey, Resolved<'static, N>>,
-    read: Read<N>,
-) -> Result<Own, ItemKey> {
-    fn of<'d>(
-        done: &'d BTreeMap<ItemKey, Resolved<'static, N>>,
-        m: ItemKey,
-    ) -> Result<&'d ScopeBuilder<'static, N>, ItemKey> {
-        done.get(&m).map(|r| &r.scope).ok_or(m)
-    }
-    let scope = move |m: ItemKey| of(done, m);
-    Ok(match read {
-        Read::Name { module, ns, name } => Own::Name(NameAnswer::from(scope(module)?.get(ns, name).copied())),
-        Read::Globs { module } => {
-            let s = scope(module)?;
-            let edges = s.globs.to_vec();
-            let krate = w.modules[&module].krate;
-            let mut chain = vec![module];
-            while let Some(p) = w.modules[chain.last().expect("the chain starts with the module")].parent {
-                chain.push(p);
-            }
-            let digest = blaze_surface::globs_digest(&edges, krate, &chain, Alloc::global());
-            Own::Globs { edges, krate, chain, digest }
-        }
-        Read::TextualOut { module } => {
-            let v = scope(module)?.textual.to_vec();
-            let d = blaze_surface::textual_digest(&v, Alloc::global());
-            Own::Textual(v, d)
-        }
-        Read::TextualEntry { module } => {
-            let v = entry(w, done, module)?;
-            let d = blaze_surface::textual_digest(&v, Alloc::global());
-            Own::Textual(v, d)
-        }
-        Read::DeriveHelpers { derive } => {
-            let v = w.helpers.get(&derive).cloned().unwrap_or_default();
-            let d = digest(4, &v);
-            Own::Helpers(v, d)
-        }
-    })
-}
 
-enum Machine {
-    One(Resolver<'static, N>),
-    Many(Group<'static, N>),
-}
 
-impl Machine {
-    fn holds(&self, module: ItemKey) -> bool {
-        match self {
-            Machine::One(r) => r.module() == module,
-            Machine::Many(g) => g.modules().any(|m| m == module),
-        }
-    }
-}
 
-struct Frame {
-    m: Machine,
-    asks: Vec<Read<N>>,
-}
 
-enum Out {
-    Ask(Vec<Read<N>>),
-    Expand(Vec<ItemKey>),
-    Cycle(Vec<ItemKey>),
-    Done(Vec<Resolved<'static, N>>),
-}
 
-fn step<F: ScopeFacts<Name = N>>(m: &mut Machine, w: &F, replies: &[Reply<'_, N>]) -> Result<Out, String> {
-    let shown = |e: crate::ResolveError| format!("{e}");
-    Ok(match m {
-        Machine::One(r) => match r.step(w, replies).map_err(shown)? {
-            Step::Ask(x) => Out::Ask(x.to_vec()),
-            Step::Expand(x) => Out::Expand(x.iter().map(|e| e.call).collect()),
-            Step::Cycle(x) => Out::Cycle(x.to_vec()),
-            Step::Done(d) => Out::Done(vec![d]),
-        },
-        Machine::Many(g) => match g.step(w, replies).map_err(shown)? {
-            Step::Ask(x) => Out::Ask(x.to_vec()),
-            Step::Expand(x) => Out::Expand(x.iter().map(|e| e.call).collect()),
-            Step::Cycle(x) => Out::Cycle(x.to_vec()),
-            Step::Done(d) => Out::Done(d.into_iter().collect()),
-        },
-    })
-}
+
+
+
+
+
+
+
 
 /// Every module of a world, finished.
 pub(crate) struct Solved {
@@ -523,17 +395,12 @@ impl Solved {
     }
 }
 
-fn new_frame<F: ScopeFacts<Name = N>>(w: &F, module: ItemKey, plant: Plant) -> Result<Frame, String> {
-    let mut r = Resolver::new_in(module, w, Alloc::global()).map_err(|e| format!("{e}"))?;
-    r.set_plant(plant);
-    Ok(Frame { m: Machine::One(r), asks: Vec::new() })
-}
 
-/// Resolves every module of `w` as a caller would: demand-driven, a module asked for pushed
-/// on a stack, `InProgress` for one on it, a group of the frames of a cycle. With a tape, the
-/// modules start in a drawn order and each step gets a drawn, shuffled part of its answers.
-pub(crate) fn solve(w: &World, tape: Option<&Tape>, plant: Plant) -> Result<Solved, String> {
-    solve_with(w, w, tape, plant)
+
+/// Every module of `w` as the cell core (the names records' one writer) writes it, crate by
+/// crate in dependency order. With a tape, each crate's items are pushed in a drawn order.
+pub(crate) fn solve(w: &World, tape: Option<&Tape>) -> Result<Solved, String> {
+    solve_with(w, w, tape)
 }
 
 /// Whether two runs gave one result: the same scopes (as record bytes) and read lists, or the
@@ -603,17 +470,15 @@ fn scope_diff(a: &ScopeBuilder<'static, N>, b: &ScopeBuilder<'static, N>) -> Str
     out
 }
 
-/// [`solve`], the machines reading their facts from `facts` (the world's records, say) and
-/// the driver answering reads from `w`'s finished scopes as before.
-pub(crate) fn solve_with<F: ScopeFacts<Name = N>>(
-    w: &World,
-    facts: &F,
-    tape: Option<&Tape>,
-    plant: Plant,
-) -> Result<Solved, String> {
-    w.expanded.borrow_mut().clear();
-    let order: Vec<ItemKey> = w.modules.keys().copied().collect();
-    let done = drive_by::<F>(w, facts, tape, plant, BTreeMap::new(), order)?;
+/// [`solve`], the cell core reading its facts from `facts` (the world's records, say).
+pub(crate) fn solve_with<F: ScopeFacts<Name = N>>(w: &World, facts: &F, tape: Option<&Tape>) -> Result<Solved, String> {
+    let done = crate::cells::solve_world(w, facts, tape, crate::cells::CellPlant::None)?;
+    Ok(w.solved(done))
+}
+
+/// [`solve`] with a bug planted in the cell core (a control).
+pub(crate) fn solve_planted(w: &World, plant: crate::cells::CellPlant) -> Result<Solved, String> {
+    let done = crate::cells::solve_world(w, w, None, plant)?;
     Ok(w.solved(done))
 }
 
@@ -636,227 +501,4 @@ impl World {
     }
 }
 
-/// Resolves again after an edit of `before` into `w`, as an incremental driver does: the
-/// `edited` modules from their text, every other module answered by its record in `old`;
-/// widened by [`crate::Again::suspects`] to the kept records a rerun's derivation may go
-/// around; then each module whose read list no longer holds, again, until every one holds.
-/// With a tape, every round draws its own order and batches, so two calls are two schedules.
-/// With `plant` [`Plant::KeepSuspects`], the widening is left out.
-pub(crate) fn resolve_again(
-    before: &World,
-    w: &World,
-    old: &Solved,
-    edited: &[ItemKey],
-    tape: Option<&Tape>,
-    plant: Plant,
-) -> Result<Again, String> {
-    let g = Alloc::global();
-    let mut done: BTreeMap<ItemKey, Resolved<'static, N>> =
-        old.by.iter().filter(|(m, _)| w.modules.contains_key(*m)).map(|(m, r)| (*m, r.clone())).collect();
-    let parent_before = |m: ItemKey| before.modules.get(&m).and_then(|i| i.parent);
-    let parent = |m: ItemKey| w.modules.get(&m).and_then(|i| i.parent);
-    let again = crate::Again::new_in(old.by.iter().map(|(m, r)| (*m, &r.reads)), parent_before, g);
-    let mut touched: BTreeMap<ItemKey, crate::Touched<'static, N>> = BTreeMap::new();
-    // A module new in the edit has no record yet; one that read a module the edit removed has
-    // nothing to answer that read; one that NAMES a removed module (a glob edge to it, a
-    // binding of it) is no longer true, and a walk through it would read the removed module
-    // (seed 654: a kept root's glob edge to a removed `m::m`, walked by the edited `m`).
-    let removed = |d: Def| d.kind == DefKind::Module && !w.modules.contains_key(&d.key);
-    let gone = |r: &Resolved<'static, N>| {
-        r.reads.entries.iter().any(|e| match e.read {
-            Read::TextualEntry { .. } | Read::DeriveHelpers { .. } => false,
-            Read::Name { module, .. } | Read::Globs { module } | Read::TextualOut { module } => !w.modules.contains_key(&module),
-        }) || r.scope.globs.iter().any(|e| removed(e.source))
-            || r.scope.bindings.iter().any(|b| removed(b.binding.def))
-    };
-    let mut dirty: Vec<ItemKey> = w
-        .modules
-        .keys()
-        .copied()
-        .filter(|m| edited.contains(m) || done.get(m).is_none_or(|r| gone(r)))
-        .collect();
-    for &m in dirty.iter() {
-        let t = match (before.decls.get(&m), w.decls.get(&m)) {
-            (Some(a), Some(b)) => crate::Touched::of_text(a, b, g),
-            _ => crate::Touched::wild(g),
-        };
-        touched.insert(m, t);
-    }
-    let mut fresh: BTreeSet<ItemKey> = BTreeSet::new();
-    let mut widened: BTreeSet<ItemKey> = BTreeSet::new();
-    let mut rounds = 0u32;
-    while !dirty.is_empty() {
-        rounds += 1;
-        if rounds > 1_000 {
-            return Err(String::from("resolving again took 1000 rounds"));
-        }
-        // One wave: the dirty modules from their text, widened until no kept record they read
-        // reaches back to what they derive anew.
-        loop {
-            rounds += 1;
-            if rounds > 1_000 {
-                return Err(String::from("resolving again took 1000 rounds"));
-            }
-            for m in dirty.iter() {
-                done.remove(m);
-            }
-            done = drive_by::<World>(w, w, tape, plant, done, dirty.clone())?;
-            fresh.extend(dirty.iter().copied());
-            for m in dirty.iter() {
-                if let (Some(o), Some(n)) = (old.by.get(m), done.get(m)) {
-                    touched.get_mut(m).expect("every dirty module is touched").add_changed(&o.scope, &n.scope);
-                }
-            }
-            if plant == Plant::KeepSuspects {
-                break;
-            }
-            let rerun: Vec<(ItemKey, &crate::ReadList<'static, N>, &crate::Touched<'static, N>)> =
-                dirty.iter().map(|m| (*m, &done[m].reads, &touched[m])).collect();
-            let suspects = again.suspects(&rerun, |m| !fresh.contains(&m) && done.contains_key(&m), parent);
-            if suspects.is_empty() {
-                break;
-            }
-            for &s in suspects.iter() {
-                widened.insert(s);
-                touched.insert(s, crate::Touched::wild(g));
-                dirty.push(s);
-            }
-        }
-        dirty = done
-            .iter()
-            .filter(|(_, r)| {
-                !r.reads.holds(|read| match answer(w, &done, *read) {
-                    Ok(own) => own.saw().unwrap_or(Saw::Name(NameAnswer::Absent)),
-                    Err(_) => Saw::Name(NameAnswer::Absent),
-                })
-            })
-            .map(|(m, _)| *m)
-            .collect();
-        for &m in dirty.iter() {
-            touched.insert(m, crate::Touched::wild(g));
-        }
-    }
-    Ok(Again { solved: w.solved(done), widened })
-}
 
-/// What [`resolve_again`] gives: every record, and the modules it solved again.
-pub(crate) struct Again {
-    pub(crate) solved: Solved,
-    /// The kept records solved again because a rerun's derivation may go around them.
-    pub(crate) widened: BTreeSet<ItemKey>,
-}
-
-/// Drives the machines of `order`'s modules (a drawn order with a tape) to done, every module
-/// in `done` answered by its record there; `done` with them.
-fn drive_by<F: ScopeFacts<Name = N>>(
-    w: &World,
-    facts: &F,
-    tape: Option<&Tape>,
-    plant: Plant,
-    done: BTreeMap<ItemKey, Resolved<'static, N>>,
-    order: Vec<ItemKey>,
-) -> Result<BTreeMap<ItemKey, Resolved<'static, N>>, String> {
-    let mut order = order;
-    if let Some(t) = tape {
-        t.shuffle(&mut order, "module order");
-    }
-    let mut done = done;
-    let mut stack: Vec<Frame> = Vec::new();
-    let mut next = 0usize;
-    let mut steps = 0u32;
-    loop {
-        if stack.is_empty() {
-            while next < order.len() && done.contains_key(&order[next]) {
-                next += 1;
-            }
-            if next == order.len() {
-                break;
-            }
-            stack.push(new_frame(facts, order[next], plant)?);
-        }
-        steps += 1;
-        if steps > 100_000 {
-            return Err(String::from("the driver took 100000 steps"));
-        }
-        let top = stack.len() - 1;
-        let asks = core::mem::take(&mut stack[top].asks);
-        let mut owned: Vec<(Read<N>, Own)> = Vec::new();
-        let mut first_needed = None;
-        for &read in asks.iter() {
-            match answer(w, &done, read) {
-                Ok(own) => owned.push((read, own)),
-                Err(owner) => {
-                    if stack.iter().any(|f| f.m.holds(owner)) {
-                        owned.push((read, Own::InProgress(owner)));
-                    } else if first_needed.is_none() {
-                        first_needed = Some(owner);
-                    }
-                }
-            }
-        }
-        if let Some(t) = tape {
-            t.shuffle(&mut owned, "answer order");
-            if owned.len() > 1 {
-                let keep = 1 + t.index(owned.len(), "answer batch");
-                owned.truncate(keep);
-            }
-        }
-        if owned.is_empty() {
-            if let Some(owner) = first_needed {
-                if !w.modules.contains_key(&owner) {
-                    let who: Vec<String> = stack
-                        .iter()
-                        .map(|f| match &f.m {
-                            Machine::One(r) => format!("{:x}", r.module),
-                            Machine::Many(g) => format!("{:x?}", g.modules().collect::<Vec<_>>()),
-                        })
-                        .collect();
-                    // A kept record that names a removed module is dirty (`gone`), so no walk
-                    // reaches one: a read of it is the driver's bug, named with its reader.
-                    return Err(format!("a read of the removed module {owner:x}: {asks:x?}, by the machines {who:?}"));
-                }
-                stack[top].asks = asks;
-                stack.push(new_frame(facts, owner, plant)?);
-                continue;
-            }
-        }
-        let replies: Vec<Reply<'_, N>> =
-            owned.iter().map(|(read, own)| Reply { read: *read, answer: own.answer() }).collect();
-        match step::<F>(&mut stack[top].m, facts, &replies)? {
-            Out::Ask(reads) => stack[top].asks = reads,
-            Out::Expand(calls) => {
-                let mut expanded = w.expanded.borrow_mut();
-                for call in calls {
-                    expanded.insert(call);
-                }
-            }
-            Out::Cycle(modules) => {
-                let mut low = top;
-                for m in modules {
-                    let at = stack
-                        .iter()
-                        .position(|f| f.m.holds(m))
-                        .ok_or_else(|| format!("a cycle names {m:x}, which is not in progress"))?;
-                    low = low.min(at);
-                }
-                let mut members = Vec::new();
-                for f in stack.drain(low..) {
-                    match f.m {
-                        Machine::One(r) => members.push(r),
-                        Machine::Many(g) => members.extend(g.into_members()),
-                    }
-                }
-                let g = Group::new_in(OwnVec::from_iter_in(members, Alloc::global()), Alloc::global())
-                    .map_err(|e| format!("{e}"))?;
-                stack.push(Frame { m: Machine::Many(g), asks: Vec::new() });
-            }
-            Out::Done(all) => {
-                stack.pop();
-                for r in all {
-                    done.insert(r.scope.module, r);
-                }
-            }
-        }
-    }
-    Ok(done)
-}

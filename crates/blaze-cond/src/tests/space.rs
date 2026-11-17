@@ -3,7 +3,7 @@
 
 use std::{format, string::String};
 
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec};
 
 use crate::cfg;
 use crate::isop::Cover;
@@ -30,7 +30,7 @@ const WINDOWS: &[Atom<'static>] = &[
 ];
 
 fn space(reversed: bool) -> Space<'static> {
-    let mut b = SpaceBuilder::new_in(Alloc::global());
+    let mut b = SpaceBuilder::new_in(blaze_own::testing::heap().alloc());
     if reversed {
         b.switch(Atom::flag("test")).unwrap();
         b.implies(("tokio", "full"), ("tokio", "rt")).unwrap();
@@ -49,7 +49,7 @@ fn space(reversed: bool) -> Space<'static> {
 }
 
 fn lower(text: &str, space: &Space<'_>, bdd: &mut Bdd<'_>) -> Cond {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let expr = cfg::parse(text, alloc).unwrap_or_else(|e| panic!("`{text}`: {e}"));
     let mut absent = AVec::new_in(alloc);
     cfg::lower(&expr, space, "tokio", bdd, &mut absent).unwrap()
@@ -58,7 +58,7 @@ fn lower(text: &str, space: &Space<'_>, bdd: &mut Bdd<'_>) -> Cond {
 #[test]
 fn valid_is_one_target_and_closed_features() {
     let space = space(false);
-    let mut bdd = Bdd::new_in(space.len(), Limits::TASK, Alloc::global()).unwrap();
+    let mut bdd = Bdd::new_in(space.len(), Limits::TASK, blaze_own::testing::heap().alloc()).unwrap();
     let valid = space.valid_in(&mut bdd).unwrap();
     // Three targets, {}, {rt}, {rt, full}, test on or off.
     assert_eq!(bdd.sat_count(Cond::TRUE, valid).unwrap(), 18);
@@ -74,10 +74,10 @@ fn valid_is_one_target_and_closed_features() {
 #[test]
 fn a_witness_reads_as_a_configuration() {
     let space = space(false);
-    let mut bdd = Bdd::new_in(space.len(), Limits::TASK, Alloc::global()).unwrap();
+    let mut bdd = Bdd::new_in(space.len(), Limits::TASK, blaze_own::testing::heap().alloc()).unwrap();
     let valid = space.valid_in(&mut bdd).unwrap();
     let f = lower(r#"all(windows, feature = "full", not(test))"#, &space, &mut bdd);
-    let mut witness = AVec::new_in(Alloc::global());
+    let mut witness = AVec::new_in(blaze_own::testing::heap().alloc());
     assert!(bdd.any_sat(f, valid, &mut witness).unwrap());
     let mut text = String::new();
     space.describe(&witness, &mut text).unwrap();
@@ -87,7 +87,7 @@ fn a_witness_reads_as_a_configuration() {
 #[test]
 fn the_printed_form_says_the_same_within_valid() {
     let space = space(false);
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let mut bdd = Bdd::new_in(space.len(), Limits::TASK, alloc).unwrap();
     let valid = space.valid_in(&mut bdd).unwrap();
     let mut cover = Cover::new_in(alloc);
@@ -125,7 +125,7 @@ fn the_printed_form_says_the_same_within_valid() {
 fn two_builders_in_two_orders_write_equal_bytes() {
     let (a, b) = (space(false), space(true));
     assert_eq!(a.len(), b.len());
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let mut bdd_a = Bdd::new_in(a.len(), Limits::TASK, alloc).unwrap();
     let mut bdd_b = Bdd::new_in(b.len(), Limits::TASK, alloc).unwrap();
     let text = r#"any(all(unix, feature = "rt"), all(windows, not(test)))"#;
@@ -142,7 +142,7 @@ fn two_builders_in_two_orders_write_equal_bytes() {
 
 #[test]
 fn malformed_predicates_are_refused_by_place() {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let err = |text: &str| cfg::parse(text, alloc).err();
     assert_eq!(err("all(unix"), Some(ParseError::End { at: 8 }));
     assert_eq!(err("foo(unix)"), Some(ParseError::UnknownFunction { at: 0 }));

@@ -294,7 +294,7 @@ fn reader_traced(sim: &mut Sim, n: u64, boot: u64, plant: Plant, inject: Option<
                 it.store.handed();
                 return it;
             }
-            Some(why) => assert!(injected(why), "a reader broke on its own: {why}\nTRACE-TMP\n{}", trace.as_ref().map(Trace::render).unwrap_or_default()),
+            Some(why) => assert!(injected(why), "a reader broke on its own: {why}\n\nthe run, traced (when it is):\n{}", trace.as_ref().map(Trace::render).unwrap_or_default()),
         }
     }
     panic!("no reader opened in 50 tries");
@@ -600,6 +600,40 @@ impl Trace {
     }
 }
 
+/// The generation a power cut left: of the head's two slots as the disk holds them right after
+/// the cut, the newest whole one whose manifest its log holds whole (its length, its CRC-32C and
+/// its generation); 0 when none. Read by the test from the disk, not from any open: the opens
+/// after a cut flip generations of their own, numbered on from this (from 1 when it is 0), so
+/// a number an open reads later is not one a writer committed.
+fn survived_on_disk(sim: &Sim) -> u64 {
+    let head = FileName::new(&format!("{}/head", dir().as_str())).expect("the head's name");
+    if !sim.exists(&head) {
+        return 0;
+    }
+    let bytes = sim.contents(&head);
+    let mut survived = 0;
+    for at in format::SLOT_AT {
+        let at = at as usize;
+        if bytes.len() < at + format::SLOT {
+            continue;
+        }
+        let format::SlotRead::Slot(slot) = Slot::decode(&bytes[at..at + format::SLOT]) else { continue };
+        let Some(log) = FileName::new(&format!("{}/manifests-{:016x}", dir().as_str(), slot.log)) else { continue };
+        if !sim.exists(&log) {
+            continue;
+        }
+        let held = sim.contents(&log);
+        let (from, len) = (slot.manifest_at as usize, slot.manifest_len as usize);
+        let Some(manifest) = held.get(from..from + len) else { continue };
+        let whole = blaze_ids::crc32c::crc32c(manifest) == slot.manifest_crc
+            && format::Manifest::decode(manifest).is_ok_and(|it| it.generation == slot.generation);
+        if whole {
+            survived = survived.max(slot.generation);
+        }
+    }
+    survived
+}
+
 /// The manifest `slot` names, read from its log as the disk holds it now.
 fn named_manifest(sim: &Sim, slot: &Slot) -> String {
     let Some(log) = FileName::new(&format!("{}/manifests-{:016x}", dir().as_str(), slot.log)) else {
@@ -730,6 +764,16 @@ fn oracle(store: &Plain, ledger: &Ledger, cut: bool, durable: bool) -> Result<()
 /// loss is reported at least once, by some open whose open returned; one whose report dies
 /// with its process does not count).
 fn oracle_with(store: &Plain, ledger: &Ledger, cut: bool, durable: bool, handed: &BTreeSet<u64>) -> Result<(), String> {
+    oracle_since(store, ledger, cut, durable, handed, store.report().whole.unwrap_or(0))
+}
+
+/// [`oracle_with`] against `survived`, the generation the cut left ([`survived_on_disk`]; with
+/// no cut, the first open's newest whole generation), not the open's own. The promise "a record committed after the generation
+/// that survived may be gone with no trace" is about the generations the writers numbered;
+/// the openers' own flips number on from what survived (from 1 again when no slot did), so a
+/// later open's newest whole generation is not one a writer committed, and only the first
+/// open's says what survived the cut.
+fn oracle_since(store: &Plain, ledger: &Ledger, cut: bool, durable: bool, handed: &BTreeSet<u64>, survived: u64) -> Result<(), String> {
     let mut lost = named_lost(store);
     lost.extend(handed.iter().copied());
     // Verify once: no segment checked twice by this process, and no read checked anything.
@@ -750,8 +794,9 @@ fn oracle_with(store: &Plain, ledger: &Ledger, cut: bool, durable: bool, handed:
     if !loss && let Some(it) = store.report().lost.iter().find(|it| it.segment.is_some_and(|it| named.contains(&it))) {
         return Err(format!("a committed segment lost with no power cut or in durable mode: {it:?}"));
     }
-    // The newest generation the open read whole: with no power cut, the newest committed.
-    let whole = store.report().whole.unwrap_or(0);
+    // The newest generation the first open since the cut read whole: with no power cut, the
+    // newest committed.
+    let whole = survived;
     for (&n, &Landed { segment, generation, space }) in &ledger.committed {
         if !loss && generation > whole {
             return Err(format!("committed record {n} of generation {generation}, and with no power cut the open read generation {whole}"));
@@ -833,6 +878,8 @@ fn scenario_traced(
     let mut next = [0u32, 1_000_000];
     let mut pending: [Option<Vec<u32>>; 2] = [None, None];
     let mut crashed = false;
+    // The generation the cut left, read from the disk ([`survived_on_disk`]).
+    let mut survived_cut = None;
     for round in 0..=rounds {
         for (i, actor) in actors.iter_mut().enumerate() {
             if round == rounds || !actor.store.ready() || pending[i].is_some() {
@@ -886,6 +933,7 @@ fn scenario_traced(
                 trace.disk(&sim);
             }
             crashed = true;
+            survived_cut = Some(survived_on_disk(&sim));
             break;
         }
         if let Some(why) = actors.iter().find_map(|it| it.store.broken()) {
@@ -907,7 +955,9 @@ fn scenario_traced(
         }
         trace.push(Event::Opened { who: "ledger".into(), says: ledger_says });
     }
-    oracle(&r.store, &ledger, crashed, durable)?;
+    // With no cut, the first open's newest whole generation is the newest committed.
+    let survived = survived_cut.unwrap_or_else(|| r.store.report().whole.unwrap_or(0));
+    oracle_since(&r.store, &ledger, crashed, durable, &BTreeSet::new(), survived)?;
     let reported = named_lost(&r.store);
     // The reader hands its report, then clears the marks it named with one flip of its own
     // (an injected failure may stop that flip: the marks stay, reported again).
@@ -928,7 +978,7 @@ fn scenario_traced(
     if let Some(it) = again.store.report().lost.iter().find(|it| it.segment.is_none_or(|id| !reported.contains(&id))) {
         return Err(format!("a second open reported a loss the first did not: {it:?}"));
     }
-    oracle_with(&again.store, &ledger, crashed, durable, &reported)?;
+    oracle_since(&again.store, &ledger, crashed, durable, &reported, survived)?;
     // The first open of this boot recorded its checks: none is made twice in one boot.
     if !again.store.fully_checked().is_empty() {
         return Err(format!("segments checked in full a second time in one boot: {:x?}", again.store.fully_checked()));
@@ -1056,8 +1106,6 @@ fn a_traced_scenario_is_the_untraced_one() {
         (17, 5, 2, Some(1), 40, false),
     ];
     for (seed, rounds, per, cut, fail, durable) in cases {
-        eprintln!("CASE-TMP {seed} {rounds} {per} {cut:?} {fail} {durable}");
-        let _ = scenario_traced(seed, rounds, per, cut, fail, HONEST, durable, None, &mut 0, &mut Some(Trace::default()));
         let mut bare = 0;
         let untraced = scenario_traced(seed, rounds, per, cut, fail, HONEST, durable, None, &mut bare, &mut None);
         let mut traced_taken = 0;
@@ -1120,6 +1168,47 @@ fn caught(seeds: u64, plants: [Plant; 3], durable: bool, cut: impl Fn(u64) -> Op
         }
     }
     assert!(caught.is_some(), "no seed of {seeds} caught {plants:?}");
+}
+
+/// [`caught`], a planted run also counting as caught when an open breaks on its own (the
+/// harness's readers stop the run with a panic naming it: "a reader broke on its own").
+fn caught_or_broke(seeds: u64, plants: [Plant; 3], durable: bool, cut: impl Fn(u64) -> Option<u32>) {
+    let mut caught = None;
+    for seed in 0..seeds {
+        let honest = scenario(seed, 3, 6, cut(seed), 0, HONEST, durable);
+        assert!(honest.is_ok(), "seed {seed} without the plant: {honest:?}");
+        if caught.is_some() {
+            continue;
+        }
+        let at = cut(seed);
+        let planted = std::panic::catch_unwind(move || scenario(seed, 3, 6, at, 0, plants, durable));
+        caught = match planted {
+            Ok(Ok(())) => None,
+            Ok(Err(why)) => Some(why),
+            Err(panic) => Some(panic.downcast_ref::<String>().cloned().unwrap_or_else(|| "a panic".into())),
+        };
+    }
+    assert!(caught.is_some(), "no seed of {seeds} caught {plants:?}");
+}
+
+/// The control of durable mode's directory sync: a file's sync does not make its name
+/// durable, so a flip whose slot is written before the store's directory is synced can leave,
+/// after a power cut, a durable generation naming a segment or a log that is gone (seen
+/// 2026-11-16 once blaze-core's simulation kept a name only after its directory's sync: "a
+/// committed segment lost with no power cut or in durable mode", and "writing a manifest log
+/// .. failed: plain/manifests-..: no such file").
+#[test]
+fn the_oracle_catches_a_skipped_directory_sync() {
+    caught_or_broke(64, [Plant::SkipDirSync, Plant::SkipDirSync, Plant::None], true, |seed| Some(40 + (seed as u32 * 7) % 200));
+}
+
+/// The control of the lost log: after a power cut took the log the newest slot names (no
+/// generation's manifest read back), the next flip starts a new log; the plant appends to the
+/// lost one, and an open breaks on "no such file" (2026-11-16, seed 13 of the traced cases).
+#[test]
+fn the_oracle_catches_an_append_to_a_lost_log() {
+    let plants = [Plant::AppendToLostLog, Plant::AppendToLostLog, Plant::AppendToLostLog];
+    caught_or_broke(64, plants, false, |seed| Some(40 + (seed as u32 * 7) % 200));
 }
 
 #[test]

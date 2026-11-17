@@ -51,7 +51,7 @@ fn row(start: u32, landing: u32, action: Action) -> Row {
 /// Prints `unwind rows: frame and 3 rows back as written; 3 broken words and 8 broken rows refused`.
 #[test]
 fn rows_round_trip_and_every_break_is_refused() {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let frame = Frame { x_pairs: 0b10001, d_pairs: 0b0010 };
     let rows = [row(40, 0, Action::Continue), row(24, 60, Action::Cleanup), row(48, 64, Action::Catch)];
     let bytes = encoded(24, frame, &rows, alloc);
@@ -90,7 +90,7 @@ fn rows_round_trip_and_every_break_is_refused() {
 /// Prints `unwind rows: every one of N cuts of an encoded record refused`.
 #[test]
 fn every_cut_is_refused() {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let bytes = encoded(16, Frame::PLAIN, &[row(12, 40, Action::Cleanup), row(20, 0, Action::Continue)], alloc);
     for cut in 0..bytes.len() {
         assert!(CodeView::read(&bytes[..cut]).is_err(), "a record cut at {cut} of {} bytes was read", bytes.len());
@@ -326,7 +326,7 @@ fn expected(row: Row) -> Found {
 /// call (its return address the instruction after it) finds its action; a call at `unlisted`
 /// finds `Terminate`. Gives the first mismatch.
 fn check(insts: u32, frame: Frame, rows: &[Row], planted: &[Row], unlisted: &[u32]) -> Result<StdVec<u8>, String> {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let bytes = encoded(insts, frame, planted, alloc);
     let read = unwind::read(CodeView::read(&bytes).unwrap()).unwrap();
     let mut out = Vec::new_in(alloc);
@@ -357,7 +357,7 @@ fn check(insts: u32, frame: Frame, rows: &[Row], planted: &[Row], unlisted: &[u3
 /// Prints `eh: 3 functions' CIE, FDE and LSDA read back as the personality reads them`.
 #[test]
 fn three_functions_read_back() {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     // One: a frame and no pads: `zR`, no personality, no LSDA.
     let bytes = encoded(8, Frame::PLAIN, &[], alloc);
     let read = unwind::read(CodeView::read(&bytes).unwrap()).unwrap();

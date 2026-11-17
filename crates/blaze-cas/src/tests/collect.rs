@@ -137,6 +137,8 @@ struct Plants {
     /// ([`crate::rebuild`]), a build handed out with a scan and back when the scan runs, or
     /// at a step of the collector, so packs are retired and the power goes while one is out.
     index_off_thread: bool,
+    /// A failure that would stop the store is dropped ([`PlacePlant::SwallowsFailure`]).
+    swallows_failure: bool,
 }
 
 struct World {
@@ -204,6 +206,9 @@ impl World {
             store.index_off_thread();
         }
         crate::pool::RETIRE_PINNED.with(|it| it.set(plants.retire_pinned));
+        if plants.swallows_failure {
+            store.plant = crate::PlacePlant::SwallowsFailure;
+        }
     }
 
     /// What the store holds under key `n`, read as a check reads it (no flag of use set).
@@ -465,6 +470,16 @@ impl World {
             let mut effects = Vec::new();
             self.store.flush(&mut effects);
             self.drive(&mut effects);
+            // A clean reopen promises only what the store made durable: a flush that failed
+            // stopped the store and said why (`Store::broken`), and its puts and pins were
+            // never acknowledged durable. That is the error this run ends with, as `check`
+            // ends it at any other op; going on to the open would swallow it and then hold
+            // the new store to records nothing made durable (2026-11-16, the kept tape of
+            // `sim-kept.tapes`: a file write failed at the flush, key 0 and its pin were not
+            // durable, and the oracle said "forgotten, though a pin names it").
+            if let Some(broken) = self.store.broken() {
+                return Err(format!("the store stopped: {broken}"));
+            }
         }
         let mut effects = Vec::new();
         let store = Store::open(config("store"), &mut effects);
@@ -730,7 +745,9 @@ fn injected(why: &str) -> bool {
 /// ends under its budget or says it is over. `BLAZE_SIM_SEEDS=<n>` runs it longer.
 #[test]
 fn the_collector_forgets_nothing_a_root_names() {
-    blaze_sim::check(SimConfig::cases(64), |tape| {
+    // The kept tapes are replayed first; a line of another primitives version than this
+    // build's is refused by name in blaze-sim's pass line, never replayed.
+    let search = |tape: &Tape| {
         let ops = tape.vec(1..=60, "ops", op);
         let seed = tape.next_u64("sim seed");
         let faults = Faults {
@@ -745,7 +762,25 @@ fn the_collector_forgets_nothing_a_root_names() {
         {
             panic!("seed {seed}, {faults:?}, {plants:?}, {ops:?}: {why}");
         }
-    });
+    };
+    blaze_sim::check_kept(SimConfig::cases(64), blaze_sim::sim_kept!(), search);
+}
+
+/// The kept tape's case of `sim-kept.tapes` (2026-11-16), as ops: key 0 put in a batch of 38,
+/// put again, pinned, put twice more, and the store reopened cleanly with one effect in 23
+/// failing (seed 0). Honest, the flush at the reopen fails a file write: the store stops and
+/// says it was injected, and the run ends there (`World::reopen`). The control: a store that
+/// swallows that failure (`PlacePlant::SwallowsFailure`) says nothing, and the reopen finds
+/// key 0 gone while the pin names it: the oracle catches it, not as injected.
+#[test]
+fn the_oracle_catches_a_failed_flush_swallowed() {
+    let ops = vec![Op::Put(0, 38), Op::Put(0, 1), Op::Pin(0, vec![0, 0, 0]), Op::Put(0, 1), Op::Put(0, 1), Op::Reopen];
+    let faults = Faults { fail_one_in: 23, max_latency: Duration::ZERO, ..Faults::default() };
+    let honest = runs(&ops, 0, faults.clone(), Plants::default()).expect_err("the flush at the reopen fails");
+    assert!(injected(&honest) && honest.contains("op 5 (Reopen)"), "{honest}");
+    let planted = runs(&ops, 0, faults, Plants { swallows_failure: true, ..Plants::default() })
+        .expect_err("the plant was not caught");
+    assert!(!injected(&planted) && planted.contains("forgotten, though a pin names it"), "{planted}");
 }
 
 /// The directed run every control shares: a first build puts a hundred records and a second

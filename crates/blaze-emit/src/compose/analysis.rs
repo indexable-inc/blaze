@@ -19,7 +19,9 @@
 //!   least to the last predecessor's terminator), extended to the last instruction of every loop
 //!   whose header the value is live into. Registers are given header parameters first, deepest
 //!   loop first, then by `start`, each the lowest free register of its class in
-//!   `regs.allocatable` (free: no interval given it overlaps). None free: its cell.
+//!   `regs.allocatable` less the registers reserve.rs keeps for one instruction's operands and
+//!   result (`reserve::kept`: never a home, so a block-local value always finds a register or
+//!   a local to evict) (free: no interval given it overlaps). None free: its cell.
 //! - `last_use`, per instruction: the instruction at the END of its interval for a value with a
 //!   home (its register is held through it), the last use in its block for a `Local` value, its
 //!   own index for one with no use. `next_use`, per instruction: its first use after its
@@ -31,8 +33,10 @@
 //!   header's), with `at` left 0. `live`: each header's rows, sorted by value: every value live
 //!   into it (a header parameter with a use included) at the place it has at the header, and
 //!   every stack slot whose address is taken in a block that reaches the header by one or more
-//!   edges, as [`Place::Slot`] with its slot index as the value. A [`Place::Cell`] or
-//!   [`Place::Slot`] row's `sp_offset` is left 0: the emission pass lays out the frame.
+//!   edges, as [`Place::Slot`] keyed after every instruction (the function's instruction count
+//!   plus its slot index: one key space, so each header lists each key once; loop_map.rs). A
+//!   [`Place::Cell`] or [`Place::Slot`] row's `sp_offset` is left 0: the emission pass lays out
+//!   the frame.
 //! - `saved`: the callee-saved registers a home holds. THE EMISSION PASS'S CONTRACT: a `Local`
 //!   value takes a register outside `regs.callee_saved` or inside `saved` (the prologue saves
 //!   only `saved`); a home in a caller-saved register live across a call is saved in its cell
@@ -54,6 +58,9 @@ use blaze_lir::ty::Form;
 use blaze_lir::{Block, Field, Layout, Op, Scalar, Ty, Value, View};
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_tier::{Live, LoopHeader, Place, Reg, RegClass, RegDesc, RegSet, TierError, TierName};
+
+use super::loop_map::LoopMap;
+use super::reserve;
 
 /// "No use": a [`Analysis::next_use`] entry of a value nothing reads.
 pub(crate) const NO_USE: u32 = u32::MAX;
@@ -690,11 +697,21 @@ fn homes<'a>(
     }
     wanted.sort_unstable();
     let mut taken: [AVec<'_, (u32, u32)>; 64] = array::from_fn(|_| Vec::new_in(alloc));
-    let mut saved = RegSet::EMPTY;
+    // D100 point 5: some registers of each class are never a home (reserve.rs), so the emission
+    // pass can always place one instruction's operands and result beside the homes, evicting a
+    // local where it must; a kept callee-saved register (none on arm64) is saved for the locals.
+    let homes_may_take = [
+        regs.allocatable.of(RegClass::Gpr).minus(reserve::kept(regs, RegClass::Gpr)),
+        regs.allocatable.of(RegClass::Fpr).minus(reserve::kept(regs, RegClass::Fpr)),
+    ];
+    let mut saved = reserve::kept_callee_saved(regs);
     for &(_, _, from, value) in wanted.iter() {
         let to = lives.end[value as usize];
         let Some(class) = class_of(view.ty(Value(value)), view.head.ptr_bits) else { continue };
-        let mut free = regs.allocatable.of(class);
+        let mut free = match class {
+            RegClass::Gpr => homes_may_take[0],
+            RegClass::Fpr => homes_may_take[1],
+        };
         home[value as usize] = Home::Cell;
         while let Some(reg) = free.first() {
             let held = &mut taken[reg.0 as usize];
@@ -712,7 +729,8 @@ fn homes<'a>(
     (home, saved)
 }
 
-/// The loop map: one header row per loop (`at` 0) and its live rows, sorted by value.
+/// The loop map: one header row per loop (`at` 0) and its live rows, sorted by key, each key once
+/// ([`LoopMap`]: values by index, address-taken slots after every instruction).
 fn loop_rows<'a>(
     view: View<'_>,
     graph: &Graph<'_>,
@@ -722,14 +740,14 @@ fn loop_rows<'a>(
     header_live: &[(u32, u32)],
     alloc: Alloc<'a>,
 ) -> Result<(AVec<'a, LoopHeader>, AVec<'a, Live>), TierError> {
-    let mut rows: AVec<'_, (u32, Live)> = Vec::with_capacity_in(header_live.len(), alloc);
+    let mut map = LoopMap::new(view.len(), view.slots.len(), headers.blocks.len(), alloc)?;
     for &(inner, value) in header_live {
         let place = match home[value as usize] {
             Home::Reg(reg) => Place::Reg(reg),
             Home::Cell => Place::Cell { sp_offset: 0 },
             Home::Local => return Err(refused(Some(value), "a value live into a loop header without a home")),
         };
-        rows.push((inner, Live { value, place }));
+        map.value(inner, value, place)?;
     }
     // Slots whose address is taken: live into every header reached from a block taking it.
     let mut taken: AVec<'_, (u32, u32)> = Vec::new_in(alloc);
@@ -765,7 +783,7 @@ fn loop_rows<'a>(
         while let Some(block) = work.pop() {
             let inner = headers.loop_of[block as usize];
             if inner != NONE {
-                rows.push((inner, Live { value: slot, place: Place::Slot { sp_offset: 0 } }));
+                map.slot(inner, slot)?;
             }
             for &to in graph.succs(block) {
                 if stamp[to as usize] != slot {
@@ -775,18 +793,5 @@ fn loop_rows<'a>(
             }
         }
     }
-    rows.sort_unstable();
-    rows.dedup();
-    let mut loops = Vec::with_capacity_in(headers.blocks.len(), alloc);
-    let mut live = Vec::with_capacity_in(rows.len(), alloc);
-    let mut next = 0;
-    for inner in 0..headers.blocks.len() as u32 {
-        let first = live.len() as u32;
-        while next < rows.len() && rows[next].0 == inner {
-            live.push(rows[next].1);
-            next += 1;
-        }
-        loops.push(LoopHeader { at: 0, first, count: live.len() as u32 - first });
-    }
-    Ok((loops, live))
+    map.finish(alloc)
 }

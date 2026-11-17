@@ -48,7 +48,7 @@ impl ExpandCx for NoCx {
 }
 
 fn tokens(text: &str, edition: Edition) -> TokenStream<'static> {
-    lex(text, edition, Alloc::global()).expect("the test's text lexes")
+    lex(text, edition, blaze_own::testing::heap().alloc()).expect("the test's text lexes")
 }
 
 fn def(body: &str, edition: Edition) -> MacroDefinition<'static> {
@@ -72,7 +72,7 @@ fn expanded(body: &str, input: &str, edition: Edition) -> Result<Expanded<'stati
     let prepared = prepare(def)?;
     let input = Box::leak(Box::new(tokens(input, edition)));
     let call = Call::fn_like(input, site(edition));
-    expand_prepared(&prepared, &call, &NoCx, Alloc::global())
+    expand_prepared(&prepared, &call, &NoCx, blaze_own::testing::heap().alloc())
 }
 
 /// The recorded expansions: one block a case, `== <case>` and then its rendering
@@ -225,15 +225,15 @@ fn the_oracle_catches_planted_differences() {
     let plants: [(&str, Plant); 5] = [
         ("drop the last token", |exp| {
             let len = exp.tokens.len() - 1;
-            exp.tokens = exp.tokens.copy_in(0..len, Alloc::global()).expect("copies");
+            exp.tokens = exp.tokens.copy_in(0..len, blaze_own::testing::heap().alloc()).expect("copies");
             exp.origins.truncate(len);
         }),
         ("make a token joint", |exp| {
-            let mut copy = TokenStream::new_in(Alloc::global());
+            let mut copy = TokenStream::new_in(blaze_own::testing::heap().alloc());
             for at in 0..exp.tokens.len() {
                 copy.push_from(&exp.tokens, at).expect("copies");
             }
-            let mut out = TokenStream::new_in(Alloc::global());
+            let mut out = TokenStream::new_in(blaze_own::testing::heap().alloc());
             for at in 0..copy.len() {
                 let token = copy.tokens()[at];
                 let kind = match (at, token.kind) {

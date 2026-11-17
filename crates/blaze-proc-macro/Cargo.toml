@@ -23,6 +23,8 @@ default = ["runtime"]
 [dependencies]
 # The expansion records' files through the effect layer (`record::OnDir`).
 blaze-std.workspace = true
+# `spawn_route.rs`, `spawn_records.rs`: the spawn seam's records and the `Executor` trait (W1).
+blaze-spawn.workspace = true
 # A build script's environment, outputs, key and compiler answers (`script.rs`).
 blaze-build-script = { workspace = true, optional = true }
 # `TokenStream`, `Produced`, `ProcDiagnostic`, `TokenOrigin`, `lex`: the hook's types.

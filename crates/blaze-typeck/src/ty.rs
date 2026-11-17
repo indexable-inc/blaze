@@ -68,6 +68,11 @@ pub enum TyView {
     /// its signature (a `FnPtr`, substituted by `args`) and its kind. The solver sees
     /// `Closure(hash(owner, ordinal), [args.., kind, sig, ()])`.
     ClosureOf { owner: ItemKey, ordinal: u32, args: TyList, sig: Ty, kind: ClosureKind },
+    /// An async block's future of another body (`PNode::Coroutine`): its identity (`owner`,
+    /// `ordinal`, the owner's arguments `args`) and the facts the owner's check recorded
+    /// (`Question::Coroutine`): its output and interior, substituted by `args`. The solver sees
+    /// `Coroutine(coroutine_def(owner, ordinal), [output, interior])`, so two bodies agree.
+    CoroutineOf { owner: ItemKey, ordinal: u32, args: TyList, output: Ty, interior: Ty },
     /// An async block's (or an async closure's call's) future, by its expression: its output,
     /// then its interior, the tuple of what it holds (its captures by capture kind and the
     /// values live across an `.await`): a variable until the end sequence fixes it.

@@ -216,3 +216,18 @@ fn the_global_handle_allocates() -> Result<(), Broke> {
     }
     Ok(())
 }
+
+/// The heap capability (D102): a test's heap and the process's are the one global allocator,
+/// so a block made through one handle is freed through another; prints "heap: one allocator".
+#[test]
+fn heap_is_the_global_allocator() {
+    let tests = crate::testing::heap();
+    assert!(tests.alloc().same(crate::Heap::process().alloc()), "a test's heap is not the process's");
+    assert!(tests.alloc().same(Alloc::global()), "a test's heap is not the global allocator");
+    let mut v: AVec<'_, u32> = Vec::new_in(tests.alloc());
+    v.extend_from_slice(&[1, 2, 3]);
+    let moved: Vec<u32, Alloc<'_>> = Vec::from_slice_in(&v, tests.shared().local());
+    drop(v);
+    assert_eq!(moved.as_slice(), &[1, 2, 3]);
+    std::println!("heap: one allocator");
+}

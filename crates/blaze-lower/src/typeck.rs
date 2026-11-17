@@ -250,6 +250,8 @@ pub struct TypeckBody<'a> {
     pub opt_types: AVec<'a, Option<PTy>>,
     pub fmt_uses: AVec<'a, tc::FmtUse>,
     pub coroutine: Option<tc::CoroutineKind>,
+    /// The `super let` statements, ascending (super_let.rs).
+    pub super_lets: AVec<'a, StmtId>,
     /// Every const term of the body left a hole ([`ConstGap`]), in the order met. Not empty:
     /// the body is checked, never checked clean.
     pub const_gaps: AVec<'a, ConstGap>,
@@ -281,6 +283,7 @@ impl<'a> TypeckBody<'a> {
             opt_types: &self.opt_types,
             fmt_uses: &self.fmt_uses,
             coroutine: self.coroutine,
+            super_lets: &self.super_lets,
         }
     }
 }
@@ -894,7 +897,9 @@ impl Conv<'_, '_, '_, '_, '_> {
             }
             Expr::FormatArgs { row } => self.format_args(row, r)?,
             Expr::MacroCall { .. } => return self.refuse("a macro call", r),
-            Expr::Asm => return self.refuse("inline assembly", r),
+            // blaze-typeck's body form has no `asm!` expression yet (INTRINSICS.md P9b adds it
+            // with the operand rules): refused by name until then.
+            Expr::Asm { .. } => return self.refuse("inline assembly (blaze-typeck has no `asm!` form yet)", r),
             Expr::OffsetOf { ty, fields } => {
                 let ty = self.ty(ty)?;
                 let start = len(self.out.segments.len());
@@ -1070,6 +1075,7 @@ pub fn to_typeck<'a>(
         opt_types: Vec::new_in(alloc),
         fmt_uses: Vec::new_in(alloc),
         coroutine: None,
+        super_lets: crate::super_let::super_lets(view, alloc),
         const_gaps: Vec::new_in(alloc),
     };
     let mut slice_rest: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(view.pats.len(), alloc);

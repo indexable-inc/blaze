@@ -30,7 +30,7 @@ use std::time::Instant;
 
 use blaze_columns::enc::{IdView, IntPolicy, IntView, StrPolicy, StrScheme, StrView, encode_ids, encode_ints, encode_strs};
 use blaze_columns::{Batch, Field};
-use blaze_own::{AVec, Alloc};
+use blaze_own::AVec;
 use blaze_parquet::{Compression, Encoding, File, Options};
 use blaze_surface::{ContentId, Edition, FileItemsView, ScopeBuilder, ScopeView, Visibility};
 
@@ -331,8 +331,8 @@ impl Cols {
     }
 
     /// Each column encoded at the record policy, end to end; the columns' starts.
-    fn encode(&self) -> (Vec<u8>, Vec<usize>) {
-        let alloc = Alloc::global();
+    fn encode(&self, heap: &'static blaze_own::Heap) -> (Vec<u8>, Vec<usize>) {
+        let alloc = heap.alloc();
         let mut out = AVec::new_in(alloc);
         let mut starts = vec![];
         for (_, v) in &self.ints {
@@ -393,8 +393,8 @@ fn ours_read(bytes: &[u8], starts: &[usize], cols: &Cols) -> f64 {
 
 /// The scope records' binding rows as columns; the rest of each record (globs, errors, paths,
 /// textual, the strings no binding names) written again as a scope with no bindings, raw.
-fn scope_ours(recs: &[Vec<u8>]) -> (Vec<Vec<u8>>, Vec<Cols>) {
-    let alloc = Alloc::global();
+fn scope_ours(recs: &[Vec<u8>], heap: &'static blaze_own::Heap) -> (Vec<Vec<u8>>, Vec<Cols>) {
+    let alloc = heap.alloc();
     let mut tags = Tags::default();
     let mut out = vec![];
     let mut all = vec![];
@@ -420,7 +420,7 @@ fn scope_ours(recs: &[Vec<u8>]) -> (Vec<Vec<u8>>, Vec<Cols>) {
         let mut rest = ScopeBuilder::from(&view, alloc);
         rest.bindings.clear();
         let rest = rest.write(alloc).unwrap();
-        let mut rec = if cols.rows() > 0 { cols.encode().0 } else { vec![] };
+        let mut rec = if cols.rows() > 0 { cols.encode(heap).0 } else { vec![] };
         rec.extend_from_slice(&rest);
         out.push(rec);
         all.push(cols);
@@ -430,8 +430,8 @@ fn scope_ours(recs: &[Vec<u8>]) -> (Vec<Vec<u8>>, Vec<Cols>) {
 
 /// The bytes one `FileItems` row takes, from two records that differ by eight items of
 /// eight-byte names.
-fn item_row_bytes() -> usize {
-    let alloc = Alloc::global();
+fn item_row_bytes(heap: &'static blaze_own::Heap) -> usize {
+    let alloc = heap.alloc();
     let make = |n: usize| {
         let text: String = (0..n).map(|i| format!("fn fn{i:05}(){{}}\n")).collect();
         let o = blaze_file_items::outline(&text, Edition::E2024, alloc);
@@ -441,8 +441,8 @@ fn item_row_bytes() -> usize {
 }
 
 /// Every `.rs` under `dir` outlined to its `FileItems` record.
-fn library_items(dir: &Path) -> Vec<Vec<u8>> {
-    let alloc = Alloc::global();
+fn library_items(dir: &Path, heap: &'static blaze_own::Heap) -> Vec<Vec<u8>> {
+    let alloc = heap.alloc();
     let mut files = vec![];
     walk(dir, Some("rs"), &mut files);
     let mut out = vec![];
@@ -456,7 +456,7 @@ fn library_items(dir: &Path) -> Vec<Vec<u8>> {
     out
 }
 
-fn items_ours(recs: &[Vec<u8>], row: usize) -> (usize, usize, Vec<Cols>, Vec<Vec<u8>>) {
+fn items_ours(recs: &[Vec<u8>], row: usize, heap: &'static blaze_own::Heap) -> (usize, usize, Vec<Cols>, Vec<Vec<u8>>) {
     let mut tags = Tags::default();
     let (mut cols_bytes, mut rest) = (0, 0);
     let mut all = vec![];
@@ -493,7 +493,7 @@ fn items_ours(recs: &[Vec<u8>], row: usize) -> (usize, usize, Vec<Cols>, Vec<Vec
         }
         let n = view.items().len();
         let raw_rest = r.len().saturating_sub(n * row + names);
-        let enc = if n > 0 { cols.encode().0 } else { vec![] };
+        let enc = if n > 0 { cols.encode(heap).0 } else { vec![] };
         cols_bytes += enc.len();
         rest += raw_rest;
         encoded.push(enc);
@@ -510,8 +510,8 @@ fn biggest(cols: &[Cols]) -> usize {
 // ---------------------------------------------------------------------------------------------
 // Cascades inside blaze's encodings.
 
-fn ints_bytes(values: &[u64], policy: IntPolicy) -> Vec<u8> {
-    let alloc = Alloc::global();
+fn ints_bytes(values: &[u64], policy: IntPolicy, heap: &'static blaze_own::Heap) -> Vec<u8> {
+    let alloc = heap.alloc();
     let mut out = AVec::new_in(alloc);
     encode_ints(values, policy, alloc, &mut out).unwrap();
     out.as_slice().to_vec()
@@ -540,7 +540,7 @@ fn get_ns(n: usize, mut get: impl FnMut(usize) -> u64) -> f64 {
 
 /// Column-level run-length (runs across blocks), its run values and run starts each a column of
 /// the chooser (which may dictionary-code the values): dictionary, then runs, then bit-packing.
-fn cascade_rle(values: &[u64]) -> (usize, f64) {
+fn cascade_rle(values: &[u64], heap: &'static blaze_own::Heap) -> (usize, f64) {
     let (mut run_values, mut starts) = (vec![], vec![]);
     for (i, &v) in values.iter().enumerate() {
         if run_values.last() != Some(&v) || i == 0 {
@@ -548,8 +548,8 @@ fn cascade_rle(values: &[u64]) -> (usize, f64) {
             starts.push(i as u64);
         }
     }
-    let vb = ints_bytes(&run_values, IntPolicy::RECORD);
-    let sb = ints_bytes(&starts, IntPolicy::CONSTANT);
+    let vb = ints_bytes(&run_values, IntPolicy::RECORD, heap);
+    let sb = ints_bytes(&starts, IntPolicy::CONSTANT, heap);
     let vv = IntView::open(&vb).unwrap();
     let sv = IntView::open(&sb).unwrap();
     let runs = starts.len();
@@ -565,14 +565,14 @@ fn cascade_rle(values: &[u64]) -> (usize, f64) {
 }
 
 /// A sorted dictionary: distinct values in order as a delta column, codes as ranks.
-fn cascade_sorted_dict(values: &[u64]) -> (usize, f64) {
+fn cascade_sorted_dict(values: &[u64], heap: &'static blaze_own::Heap) -> (usize, f64) {
     let mut distinct = values.to_vec();
     distinct.sort_unstable();
     distinct.dedup();
     let rank: HashMap<u64, u64> = distinct.iter().enumerate().map(|(i, &v)| (v, i as u64)).collect();
     let codes: Vec<u64> = values.iter().map(|v| rank[v]).collect();
-    let db = ints_bytes(&distinct, IntPolicy { max_get: blaze_columns::enc::GetCost::Block, ..IntPolicy::RECORD });
-    let cb = ints_bytes(&codes, IntPolicy::RECORD);
+    let db = ints_bytes(&distinct, IntPolicy { max_get: blaze_columns::enc::GetCost::Block, ..IntPolicy::RECORD }, heap);
+    let cb = ints_bytes(&codes, IntPolicy::RECORD, heap);
     let dv = IntView::open(&db).unwrap();
     let cv = IntView::open(&cb).unwrap();
     let ns = get_ns(values.len(), |i| dv.get(cv.get(i) as usize));
@@ -580,11 +580,11 @@ fn cascade_sorted_dict(values: &[u64]) -> (usize, f64) {
 }
 
 /// Deltas as a column of the chooser (runs, a dictionary of deltas), a checkpoint a block.
-fn cascade_delta(values: &[u64]) -> (usize, f64) {
+fn cascade_delta(values: &[u64], heap: &'static blaze_own::Heap) -> (usize, f64) {
     let deltas: Vec<u64> = values.iter().enumerate().map(|(i, &v)| if i % 1024 == 0 { 0 } else { v.wrapping_sub(values[i - 1]) }).collect();
     let checks: Vec<u64> = values.iter().step_by(1024).copied().collect();
-    let db = ints_bytes(&deltas, IntPolicy::RECORD);
-    let cb = ints_bytes(&checks, IntPolicy::CONSTANT);
+    let db = ints_bytes(&deltas, IntPolicy::RECORD, heap);
+    let cb = ints_bytes(&checks, IntPolicy::CONSTANT, heap);
     let dv = IntView::open(&db).unwrap();
     let cv = IntView::open(&cb).unwrap();
     let ns = get_ns(values.len(), |i| {
@@ -601,7 +601,7 @@ fn cascade_delta(values: &[u64]) -> (usize, f64) {
 /// The single-level chooser against each cascade, on every integer column of `cols` joined
 /// across records (as a column of a set would be); per column the cheapest in bytes whose `get`
 /// is within 1.3 times the chooser's, then the totals.
-fn cascades(set: &str, cols: &[Cols]) {
+fn cascades(set: &str, cols: &[Cols], heap: &'static blaze_own::Heap) {
     let mut joined: Vec<(&'static str, Vec<u64>)> = vec![];
     for c in cols {
         for (name, v) in &c.ints {
@@ -617,12 +617,12 @@ fn cascades(set: &str, cols: &[Cols]) {
     let (mut base, mut best_within, mut best_any) = (0usize, 0usize, 0usize);
     let (mut base_ns, mut within_ns) = (0f64, 0f64);
     for (name, v) in &joined {
-        let b = ints_bytes(v, IntPolicy::RECORD);
+        let b = ints_bytes(v, IntPolicy::RECORD, heap);
         let view = IntView::open(&b).unwrap();
         let ns = get_ns(v.len(), |i| view.get(i));
-        let (r, rns) = cascade_rle(v);
-        let (s, sns) = cascade_sorted_dict(v);
-        let (d, dns) = cascade_delta(v);
+        let (r, rns) = cascade_rle(v, heap);
+        let (s, sns) = cascade_sorted_dict(v, heap);
+        let (d, dns) = cascade_delta(v, heap);
         println!("| {name} | {} | {} | {ns:.1} | {r} | {rns:.1} | {s} | {sns:.1} | {d} | {dns:.1} |", v.len(), b.len());
         base += b.len();
         base_ns += ns;
@@ -653,7 +653,7 @@ fn cascades(set: &str, cols: &[Cols]) {
         }
     }
     let s: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
-    let alloc = Alloc::global();
+    let alloc = heap.alloc();
     let mut line = format!("strings, {set} `name` ({} rows, {} bytes):", s.len(), s.iter().map(|x| x.len()).sum::<usize>());
     for scheme in StrScheme::ALL.into_iter().map(Some).chain([None]) {
         let mut out = AVec::new_in(alloc);
@@ -721,6 +721,7 @@ fn profile_sizes(dir: &Path) -> ([usize; 5], usize) {
 }
 
 fn main() {
+    let heap = blaze_own::Heap::process();
     let mut args: HashMap<String, String> = HashMap::new();
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -749,12 +750,12 @@ fn main() {
             let set = read_recs(&path);
             let mut table = general(kind, &set, true);
             if kind == "module_scope" {
-                let (ours, cols) = scope_ours(&set);
+                let (ours, cols) = scope_ours(&set, heap);
                 let enc = best(ROUNDS, || {
-                    black_box(scope_ours(black_box(&set)));
+                    black_box(scope_ours(black_box(&set), heap));
                 });
                 let m = biggest(&cols);
-                let (bytes, starts) = cols[m].encode();
+                let (bytes, starts) = cols[m].encode(heap);
                 let read = ours_read(&bytes, &starts, &cols[m]);
                 table.rows.insert(1, Row { scheme: "ours: bindings as columns, rest raw".into(), bytes: total(&ours), extra: 0, enc: Some(mbs(total(&set), enc)), dec: None, read_ns: Some(read) });
                 let mut z = zstd_row("ours, then zstd 3 per record", &ours, 3, None, ROUNDS);
@@ -770,7 +771,7 @@ fn main() {
                 table.rows.insert(4, solid_row(&ours, 64 << 10, 3));
                 table.rows[4].scheme = format!("ours, then {}", table.rows[4].scheme);
                 table.print();
-                cascades("module_scope", &cols);
+                cascades("module_scope", &cols, heap);
             } else {
                 table.print();
             }
@@ -778,18 +779,18 @@ fn main() {
     }
 
     if let Some(lib) = arg("library") {
-        let set = library_items(&lib);
-        let row = item_row_bytes();
+        let set = library_items(&lib, heap);
+        let row = item_row_bytes(heap);
         let mut table = general("file_items (library/)", &set, true);
-        let (cols_bytes, rest, cols, encoded) = items_ours(&set, row);
+        let (cols_bytes, rest, cols, encoded) = items_ours(&set, row, heap);
         let m = biggest(&cols);
-        let (bytes, starts) = cols[m].encode();
+        let (bytes, starts) = cols[m].encode(heap);
         let read = ours_read(&bytes, &starts, &cols[m]);
         table.rows.insert(1, Row { scheme: format!("ours: item rows as columns ({cols_bytes}), rest raw ({rest}, estimated: a row is {row} bytes)"), bytes: cols_bytes + rest, extra: 0, enc: None, dec: None, read_ns: Some(read) });
         let z: usize = encoded.iter().map(|e| zstd::bulk::compress(e, 3).unwrap().len()).sum();
         table.rows.insert(2, Row { scheme: "ours (the columns alone), then zstd 3 per record".into(), bytes: z, extra: 0, enc: None, dec: None, read_ns: None });
         table.print();
-        cascades("file_items", &cols);
+        cascades("file_items", &cols, heap);
     }
 
     if let Some(ladder) = arg("ladder") {

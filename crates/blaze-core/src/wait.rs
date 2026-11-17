@@ -44,7 +44,7 @@ mod reaping;
 mod retry;
 
 pub use self::{
-    choice::{MarkRefused, SANDBOXED, Waits, choose, choose_from_env},
+    choice::{MarkRefused, SANDBOXED, Waits, choose, choose_from, choose_from_env, waits_of},
     retry::{Clock, Deadline, Once, WaitError, Waited},
 };
 

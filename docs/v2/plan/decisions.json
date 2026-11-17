@@ -842,6 +842,54 @@
    "recommended": "The builder takes the setting from its caller (no default), the driver reads it from the manifest's profile, and the code key holds it.",
    "why": "Found by the wrong-answers lane (runner 5, S2). A silent wrap where Rust panics is a correctness bug, and a key that misses the setting would share code between profiles.",
    "state": "decided; writer to start"
+  },
+  {
+   "id": "D102",
+   "date": "2026-11-16",
+   "decision": "The owner: `Alloc::global()` should not exist within bstd; the allocator is a capability handed down like the clock, the environment and IO. So: `blaze_own::Alloc::global()` and `SharedAlloc::global()` go. The program's entry makes the root allocator capability ONCE (a constructor only the entry and a test's own entry can reach) and hands it down. Step 1, now: blaze-std's 14 uses outside tests (hosting.rs, entry.rs, guest.rs, grant.rs, rt/launch.rs) take the capability from the entry; a lint ban on both functions with a per-crate ratchet that may only fall (the tree had 1,911 uses on 2026-11-16 17:45). Step 2: the other crates move crate by crate, by syntax (ast-grep or `blaze check --fix`), each when no writer's wiring is pending in it, because a 1,900-site rewrite under fifty lanes would break their pending edits. Step 3: the two functions are deleted.",
+   "recommended": "One lane does step 1 and writes step 2's order.",
+   "why": "Rule 75 (nothing ambient): an allocator conjured from nowhere is a hidden default.",
+   "state": "decided; step 1 started"
+  },
+  {
+   "id": "D103",
+   "date": "2026-11-16",
+   "decision": "`blaze run` puts NO deadline on the program it runs: the program's lifetime is the user's (a server runs for days). The parent's wait is named (\"the program `<name>` to exit\") and ends when the child exits or is killed by a signal; every step of the parent's OWN work keeps its deadline (starting the child, serving one need, the launcher's first message). A caller may give a limit: `blaze test` gives each test its deadline; `run` takes none by default. While the program runs, the parent ignores SIGINT and SIGQUIT (the terminal delivers them to the program's foreground process group, as under a shell) and reports the program's status: its exit status unchanged, a signal as 128 + n; SIGTERM to the parent ends the program first, then the parent. A child cannot outlive its parent (the parent-death mechanism of the platform).",
+   "recommended": "One writer wires `run` through the run parent with these rules; the signal handling is an effect in blaze-core.",
+   "why": "Asked by the command-crates integrator as an owner's call; it is the behaviour of every shell and of `cargo run`, and rule 18's bound is on blaze's own work, not on the user's program. The owner can overrule it.",
+   "state": "decided by the coordinator; told to the owner"
+  },
+  {
+   "id": "D104",
+   "date": "2026-11-16",
+   "decision": "`main` names each capability it uses; a whole `Io` cannot be asked for. `fn main(cx: &Cx, io: Io)` is refused at the parameter, with the kinds to name instead (`out: Out`, `args: Args`, `data: Dir<ReadOnly>`, `api: Net`, ...). `Io` is not a `Grant`: `impl Grant for Io`, `Kind::Everything` and the spec's `everything` scope are deleted. In a blaze edition the root's `fn main` with parameters is expanded by `bstd::main` unasked, the same path a written `#[bstd::main]` takes; the front end's four constant entry texts and the rule `entry-takes-roots` (D59's interim) are deleted. The edition's prelude holds the grant types and no longer `Io`. `Io` stays as bstd's own world handle (the launcher makes grants from it) and as a test's simulated world.",
+   "recommended": "One lane: the front end's entry first (the granted form accepted), then every `main` in the tree, the `blaze new` template and the docs ported, then the grant of everything deleted. blaze's own entries that still hold a whole `Io` through `rt::run` are ported with the capability plan's batch that closes `Io::native`.",
+   "why": "The owner, 18:16: the signature with one massive `io` should not be allowed; a program includes everything it needs in the signature. A grant of everything makes every other grant decoration: nothing can be withheld from a program that may ask for all of it, and its manifest says nothing.",
+   "state": "decided by the owner; lane started"
+  },
+  {
+   "id": "D105",
+   "date": "2026-11-16",
+   "decision": "A producer's identity is handed down from the entry; it is never a version string a person bumps. Today `BODY_CHECKER`, `EXPANDER` and `BODY_KEY_DOMAIN` (and the head and items record versions when their producer changes) are typed in and were bumped about ten times on 2026-11-16, each by a message between integrators; a missed bump is a stale record read as a fresh answer (rule 21's class) and rule 52 says nothing invalidates by hand. The key's `Tool` (blaze-drive key.rs) already holds the running binary's build id; every producer's key takes its producer id from a table made once at the entry, each row the digest of the source of the crates that producer is made of (computed as blaze is built), so an edit to the checker changes the body-check keys and nothing else. A FORMAT number (a record's layout) stays a typed constant: it names a contract, not code. When blaze builds blaze, the row is the code identity of the producer's function, by reflection.",
+   "recommended": "One lane: the table type and its build step as new files, then one batch that replaces the three constants; a gate check that no producer constant is left.",
+   "why": "Rules 21, 52 and 75; the coordination cost and the stale-record class seen on 2026-11-16.",
+   "state": "decided by the coordinator; lane started"
+  },
+  {
+   "id": "D106",
+   "date": "2026-11-16",
+   "decision": "`blaze run` finds a body's code record by a key made from text before any check: the body's check identity (the drive's BodyCheck key) and its instance, with the check's reads as the record's read list. A found record is followed to its declared callees; only a missing one is checked, lowered and built, one body at a time. The run's names come from the names records, read in place, not from a world resolved again. Measured 2026-11-16 18:12 on hello world: 16.2 s of 16.3 s user time is library work done again on every run (names 5.1 s, library bodies 9.3 s, instances 1.8 s); the program's own code is about 10 ms.",
+   "recommended": "The edit list in the pipeline notes (\"Step 3 replaced\"): the key and the `BodyIds` seam in the run path, bodies checked on demand in front2's program, the command handing the body-check records over. The program table is built once, in place.",
+   "why": "The design's first line (keyed from text before the work) and the goal order: time after restart first.",
+   "state": "decided; writers started"
+  },
+  {
+   "id": "D107",
+   "date": "2026-11-16",
+   "decision": "The front end moves out of the test-ladder crate and the command crate: `crates/blaze-ladder/src/front2` and the logic in `crates/blaze-cli/src` (names, body types, the loaders) become front-end crates with sans-IO cores, and blaze-cli keeps argument parsing and wiring. NOT done now: about fifty lanes hold wiring written against today's paths, and a move breaks all of it at once. It is done as one batch at the first point the wiring queue is empty.",
+   "recommended": "The coordinator calls the batch when the integrators report empty queues; one lane moves files by `git mv` and fixes paths; nothing else lands during it.",
+   "why": "Rules 14, 30 and 31: semantics belong in the front end's crates; a regression in the command on 2026-11-16 came from three lanes editing logic in blaze-cli.",
+   "state": "decided by the coordinator; waits for an empty queue"
   }
  ]
 }

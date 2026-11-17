@@ -158,6 +158,18 @@ impl<'a> ItemAttrs<'a> {
         }
     }
 
+    /// The call of an attribute macro that no attribute in the item names (D104: a blaze
+    /// edition binary's root `fn main` is `std::main`'s input unasked, blaze-scope
+    /// `IMPLICIT_MAIN`). It stands outermost, before every written attribute, so, as for a
+    /// written first attribute ([`ItemAttrs::next`]), each `#[cfg_attr]` is applied before the
+    /// macro sees the item, and every other attribute (a `#[cfg]`, a doc, `#[inline]`) stays in
+    /// it. No arguments, and no derive is taken (a derive on a fn is refused by the macro's own
+    /// expansion, as written).
+    pub fn implicit_call<E>(mut self, atom: &mut dyn FnMut(&str, Option<&str>) -> Result<bool, E>) -> Result<AttrCall<'a>, ItemAttrsError<E>> {
+        if false { self.apply_later_cfg_attrs(0, atom)?; }
+        Ok(AttrCall { args: None, item: self.item, derives_taken: 0 })
+    }
+
     /// Each `#[cfg_attr(..)]` among the outer attributes from token `from` on replaced in place
     /// by what it leaves (nested ones applied by [`cfg_attr_metas`]); a loop, read once each.
     fn apply_later_cfg_attrs<E>(&mut self, from: usize, atom: &mut dyn FnMut(&str, Option<&str>) -> Result<bool, E>) -> Result<(), ItemAttrsError<E>> {

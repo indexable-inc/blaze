@@ -276,3 +276,5 @@ fn a_move_out_of_a_place_behind_a_reference_is_refused_by_name() {
     // The checker may refuse it first (a diagnostic); the builder's refusal names the move.
     assert!(error.contains("a move out") || error.starts_with("diagnostics"), "{error}");
 }
+
+mod field_scrutinee;

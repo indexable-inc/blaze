@@ -83,6 +83,9 @@ pub enum Rule {
     /// `Future::Output` of an async coroutine (normalizes_to.rs
     /// `consider_builtin_future_candidate`; builtin.rs `normalize_future_output`).
     FutureOutput,
+    /// One of the async traits' associated types of a callable self type (normalizes_to.rs
+    /// `consider_builtin_async_fn_trait_candidates`; async_fn.rs `normalize`).
+    AsyncFn(crate::async_fn::Assoc),
     /// `DiscriminantKind::Discriminant` (normalizes_to.rs
     /// `consider_builtin_discriminant_kind_candidate`; builtin.rs `normalize_discriminant`).
     Discriminant,
@@ -357,6 +360,11 @@ fn assemble_normalizes_to<T: Tys, F: Facts>(
             if cx.is_lang(item, Lang::FutureOutput)? {
                 out.push(cand(Source::Builtin(BuiltinSource::Misc), Rule::FutureOutput, self_ty));
             }
+            for which in crate::async_fn::Assoc::ALL {
+                if cx.is_lang(item, which.lang())? {
+                    out.push(cand(Source::Builtin(BuiltinSource::Misc), Rule::AsyncFn(which), self_ty));
+                }
+            }
             if cx.is_lang(item, Lang::Discriminant)? {
                 out.push(cand(Source::Builtin(BuiltinSource::Misc), Rule::Discriminant, self_ty));
             }
@@ -550,6 +558,11 @@ pub fn step<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, rule: 
         Rule::FutureOutput => {
             let (_, term) = nt_goal(cx)?;
             crate::builtin::normalize_future_output(cx, cand.a, term)
+        }
+        Rule::AsyncFn(which) => {
+            let (alias, term) = nt_goal(cx)?;
+            let Some((_, _, _, args)) = alias_parts(cx, alias) else { return Err(malformed()) };
+            crate::async_fn::normalize(cx, cand.a, args, term, which)
         }
         Rule::Discriminant => {
             let (alias, term) = nt_goal(cx)?;

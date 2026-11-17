@@ -12,7 +12,7 @@ use std::{alloc::Global, path::PathBuf, time::Instant};
 use blaze_file_items::{ContentId, outline};
 use blaze_mem::frame::Frame;
 use blaze_mem::tag::Tag;
-use blaze_own::{Alloc, Erased};
+use blaze_own::{Erased};
 use blaze_surface::{Edition, ItemDetail, Range, Rename, WrittenVis};
 
 /// Every `.rs` file under `dir`, sorted, with its text.
@@ -93,7 +93,7 @@ fn detail_ranges(detail: &ItemDetail) -> [Option<Range>; 2] {
 /// entry over all files, and the share of entries at the frame's zero. Positions are as the
 /// record has them: the entry's start a delta from the previous entry's, the others relative
 /// to the entry; `parent` and `end` as distances back and forward.
-fn field_costs(texts: &[&str]) {
+fn field_costs(texts: &[&str], heap: &'static blaze_own::Heap) {
     const NAMES: [&str; 22] = [
         "detail tag", "detail range 1 start", "detail range 1 len", "detail range 2 start", "detail range 2 len",
         "parent (distance back)", "end (descendants)", "range start (delta)", "range len", "name start",
@@ -105,7 +105,7 @@ fn field_costs(texts: &[&str]) {
     let mut same_hash = 0u64;
     let mut total = 0u64;
     for text in texts {
-        let made = outline(text, Edition::E2021, Alloc::global());
+        let made = outline(text, Edition::E2021, heap.alloc());
         let items = made.items();
         let mut columns: [Vec<u64>; 22] = std::array::from_fn(|_| Vec::new());
         let (mut previous_start, mut previous_attrs) = (0u64, 0u64);
@@ -185,6 +185,7 @@ fn field_costs(texts: &[&str]) {
 }
 
 fn main() {
+    let heap = blaze_own::Heap::process();
     let args: Vec<String> = std::env::args().collect();
     // `scratch profile <core dir> <seconds>`: outline library/core over and over on one thread,
     // for a sampling profiler to attach to.
@@ -237,7 +238,7 @@ fn main() {
     report("1,000 one-line fns", &[fns.as_str()]);
     let core = files(&PathBuf::from(core));
     report("library/core", &core.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>());
-    field_costs(&core.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>());
+    field_costs(&core.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(), heap);
     let large = std::fs::read_to_string(large).expect("the large file reads");
     report("large file", &[large.as_str()]);
 
@@ -245,9 +246,9 @@ fn main() {
     let library = files(&PathBuf::from(library));
     let mut all = Vec::new();
     for (path, text) in &library {
-        let made = outline(text, Edition::E2021, Alloc::global());
+        let made = outline(text, Edition::E2021, heap.alloc());
         let record = made
-            .to_file_items(text, ContentId(blaze_blake3::hash(text.as_bytes())), Alloc::global())
+            .to_file_items(text, ContentId(blaze_blake3::hash(text.as_bytes())), heap.alloc())
             .unwrap_or_else(|e| panic!("{}: {e:?}", path.display()));
         all.extend_from_slice(&blaze_blake3::hash(&record));
     }

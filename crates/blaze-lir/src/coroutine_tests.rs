@@ -31,7 +31,7 @@ use blaze_sim::{Broke, Config, Tape, check, control};
 use crate::{
     Block, BlockKind, BuildError, Builder, Flags, Full, Func, IntCond, Op, Ty, Value, View,
     builder::{MemAttrs, Param, Variadic},
-    coroutine::{CoroutineError, Plant, Saved, Shape, Split, StateField, split, split_planted},
+    coroutine::{CoroutineError, PANICKED, Plant, Saved, Shape, Split, StateField, split, split_planted},
     func::{Conv, RefId, RefKind, SigId, SlotId, SlotKind},
     op::Target,
     parse, print, verify,
@@ -53,6 +53,10 @@ const UNDEF: Fault = "a use of an undefined value";
 const OLD_FRAME: Fault = "a pointer into the frame of an earlier poll";
 const DIVERGED: &str = "the two runs diverged";
 const FAULTED: &str = "the machine run faulted";
+/// The machine's check after an unwind (ASYNC.md D-A5).
+const POISONED: Fault = "after an unwind the tag must be PANICKED (2)";
+/// The exception `may_unwind` throws: what its landing block's parameter holds.
+const EXCEPTION: u64 = 0xe0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Val {
@@ -84,6 +88,8 @@ enum Event {
     Trap(u32),
     /// The machine was polled more often than the body yields.
     Overrun,
+    /// A `resume`: the unwind left the poll.
+    Unwound,
 }
 
 struct World {
@@ -103,6 +109,8 @@ enum Stop {
     Suspended { resume: Block, cancel: Block, pending: Vec<u64> },
     Cancelled,
     Trapped(u32),
+    /// A `resume`: the unwind left the call.
+    Unwound,
 }
 
 impl World {
@@ -321,6 +329,26 @@ fn run(world: &mut World, view: View<'_>, frame: &mut Frame, mut block: Block) -
                     return Ok(Stop::Suspended { resume, cancel, pending: ints(frame, o.values())? });
                 }
                 Op::Cancelled => return Ok(Stop::Cancelled),
+                // The one invoked callee: `may_unwind(i64)`, which observes its argument and
+                // unwinds when it is odd (coroutine_unwind_tests.rs).
+                Op::Invoke => {
+                    o.reference();
+                    o.sig();
+                    let (normal, unwind) = (o.block(), o.block());
+                    let seen = int(frame, o.values().get(0))?;
+                    world.trace.push(Event::Observe(seen));
+                    if seen % 2 == 1 {
+                        frame.values[view.params(unwind).start] = Some(Val::Int(EXCEPTION));
+                        next = Some(unwind);
+                    } else {
+                        next = Some(normal);
+                    }
+                    None
+                }
+                Op::Resume => match get(frame, o.value())? {
+                    Val::Int(EXCEPTION) => return Ok(Stop::Unwound),
+                    _ => return Err("a `resume` of something not the exception"),
+                },
                 _ => return Err("an operation the test's interpreter has not"),
             };
             if let Some(value) = made {
@@ -376,6 +404,10 @@ fn direct(view: View<'_>, shape: Shape, upvars: [u64; 2], cancel: Option<u32>) -
             }
             Stop::Trapped(code) => {
                 world.trace.push(Event::Trap(code));
+                break;
+            }
+            Stop::Unwound => {
+                world.trace.push(Event::Unwound);
                 break;
             }
         }
@@ -440,6 +472,16 @@ fn machine(split: &Split<Global>, upvars: [u64; 2], cancel: Option<u32>, most_po
             }
             Stop::Trapped(code) => {
                 world.trace.push(Event::Trap(code));
+                break;
+            }
+            // An unwind out of a poll leaves the state `Panicked`; the owner then drops the
+            // future while the panic passes, and that drop must do nothing.
+            Stop::Unwound => {
+                world.trace.push(Event::Unwound);
+                if world.load(state, layout.tag_offset as i32, layout.tag_ty)? != Val::Int(u64::from(PANICKED)) {
+                    return Err(POISONED);
+                }
+                dropped(&mut world)?;
                 break;
             }
             Stop::Suspended { .. } | Stop::Cancelled => return Err("a `suspend` or `cancelled` left in an output"),
@@ -977,3 +1019,7 @@ fn paths_that_end_the_wrong_way_are_refused() {
     assert_eq!(split(body(true).view(), shape, Global).err(), Some(CoroutineError::ReturnOnCancel { block: 2 }));
     assert_eq!(split(body(false).view(), shape, Global).err(), Some(CoroutineError::CancelledOnResume { block: 1 }));
 }
+
+/// A panic inside a poll (ASYNC.md D-A5), on this file's interpreter.
+#[path = "coroutine_unwind_tests.rs"]
+mod unwind;

@@ -91,6 +91,7 @@ impl BodyBuf {
             opt_types: &[],
             fmt_uses: &[],
             coroutine: None,
+            super_lets: &[],
         }
     }
 }

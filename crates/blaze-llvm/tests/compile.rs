@@ -1,9 +1,7 @@
 //! D1's tests: the CPU is named, IR errors are named, objects come out, the inliner's remarks
 //! are read back (and an unreadable stream is an error), and alone and batched give equal bytes.
 //!
-//! Tests that run the pipeline need `pipeline.rs` `BLAZE_O2_PASSES` filled (see it): until then
-//! they fail with "the pipeline `blaze-O2` has no pass text yet", which is the named refusal,
-//! not a pass. Each test's doc says the line it prints when it passes.
+//! Each test's doc says the line it prints when it passes.
 
 #![feature(allocator_api)]
 
@@ -80,7 +78,8 @@ fn an_add_compiles_to_an_object() {
 }
 
 /// The inliner's decisions come back as rows: an internal one-line callee is inlined (a
-/// `Passed` remark), a declared callee with no body is not (a `Missed` remark).
+/// `Passed` remark), a `noinline` callee is not (LLVM's `NeverInline` `Missed` remark; a
+/// declaration is never a candidate, so it has no remark).
 /// Passes (once the pipeline text is in): "test the_inliners_decisions_are_read_back ... ok".
 #[test]
 fn the_inliners_decisions_are_read_back() {
@@ -88,7 +87,7 @@ fn the_inliners_decisions_are_read_back() {
     let alloc = Alloc::global();
     let (caller, small, outside) = (name(1), name(2), name(3));
     let ir = format!(
-        "declare i64 @{outside}(i64)\n\
+        "define i64 @{outside}(i64 %x) noinline {{\n  %y = mul i64 %x, 7\n  ret i64 %y\n}}\n\
          define internal i64 @{small}(i64 %x) {{\n  %y = add i64 %x, 1\n  ret i64 %y\n}}\n\
          define i64 @{caller}(i64 %a) {{\n  %b = call i64 @{small}(i64 %a)\n  %c = call i64 @{outside}(i64 %b)\n  ret i64 %c\n}}\n"
     );

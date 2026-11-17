@@ -676,83 +676,7 @@ impl blaze_scope::crate_scope::ReadyHooks for Clock {
     }
 }
 
-/// The cell core's shadow seam (feature `cells`): the clock is the process's, from its first
-/// ask; each crate's typed report is printed here, the library prints nothing.
-#[cfg(feature = "cells")]
-struct PrintShadows;
-
-#[cfg(feature = "cells")]
-impl blaze_scope::CellsSeam for PrintShadows {
-    fn now(&self) -> Duration {
-        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-        START.get_or_init(Instant::now).elapsed()
-    }
-
-    fn report(&self, krate: &str, shadowed: Result<blaze_scope::CellsShadowed, blaze_scope::CellsRefused>) {
-        let s = match shadowed {
-            Ok(s) => s,
-            Err(refused) => {
-                eprintln!("cells seam: {krate}: refused: {refused:?}");
-                return;
-            }
-        };
-        for d in s.differ_first.iter() {
-            eprintln!("cells seam: {krate}: differ {:x} {:?} `{}`: old {:?}, cells {:?}", d.module, d.ns, d.name, d.old, d.cells);
-        }
-        for u in s.unknown_first.iter() {
-            let what = if u.call.is_some() { "call" } else if u.glob { "glob" } else { "import" };
-            eprintln!("cells seam: {krate}: unknown {what} {:?} {:?} {:?} in {:x}", u.why, u.kind, &u.segments[..], u.module);
-        }
-        for d in s.written_first.iter() {
-            eprintln!("cells seam: {krate}: written {:?} {:x} {:?} `{}`: old {:?}, cells {:?}", d.which, d.module, d.ns, d.name, d.old, d.cells);
-        }
-        for l in s.lost_first.iter() {
-            eprintln!("cells seam: {krate}: lost call {:?} {:?} -> {:?} in {:x} (call {:x})", l.kind, &l.segments[..], l.outcome, l.module, l.call);
-        }
-        eprintln!(
-            "cells seam: {krate}: unknown by class: imports {:?} calls {:?}; lost calls {}; exports published later {}",
-            s.unknown_imports, s.unknown_calls, s.lost, s.written.exports_published_later
-        );
-        let ms = |d: Duration| d.as_secs_f64() * 1e3;
-        eprintln!(
-            "cells seam: {krate}: old fill {:.2} ms, cells load {:.2} ms + solve {:.2} ms; bindings equal {}, differ {}, cells unknown {}; \
-             old errors {}, cells failed {}, outside {}, undecided {}; dep reads {}, dep absent {}; \
-             calls the fill did not expand {} (first {:?}); cells {}, stalls {}; r6 errors {}, speculated {}",
-            ms(s.old_fill), ms(s.cells_load), ms(s.cells_solve), s.equal, s.differ, s.unknown,
-            s.old_errors, s.failed, s.outside, s.undecided, s.dep_reads, s.dep_absent,
-            s.not_expanded, s.first_not_expanded, s.cells, s.stalls, s.r6_errors, s.speculated,
-        );
-        let w = s.written;
-        eprintln!(
-            "cells seam: {krate}: cells written: absent {} unread {} later {} unknown {} bindings_equal {} bindings_differ {} globs_equal {} globs_differ {} \
-             only_old {} only_cells {} def {} vis {} origin {} expansion {} state {}",
-            w.modules_absent, w.modules_unread, w.modules_later, w.modules_unknown, w.bindings_equal, w.bindings_differ, w.globs_equal, w.globs_differ,
-            w.only_old, w.only_cells, w.def, w.vis, w.origin, w.expansion, w.state,
-        );
-        eprintln!(
-            "cells seam: {krate}: whole scopes: equal {} unknown {} differ by field {:?} {:?}",
-            w.scopes_equal, w.scopes_unknown, blaze_scope::CELLS_SCOPE_FIELDS, w.scope_fields
-        );
-        for d in s.scope_first.iter() {
-            eprintln!(
-                "cells seam: {krate}: scope {:x} {} old {} cells {}; error old {:?} cells {:?}",
-                d.module, blaze_scope::CELLS_SCOPE_FIELDS[d.field], d.old_len, d.cells_len, d.old_error, d.cells_error
-            );
-        }
-    }
-}
-
-/// `--cells-write` (feature `cells`): no seam, so the cell core solves and writes the records
-/// (the switch); without it the old fill writes and the cell core is compared beside it.
-#[cfg(feature = "cells")]
-static CELLS_WRITE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 impl blaze_scope::task::Par for Threads {
-    #[cfg(feature = "cells")]
-    fn cells_seam(&self) -> Option<&dyn blaze_scope::CellsSeam> {
-        if CELLS_WRITE.load(Ordering::Relaxed) { None } else { Some(&PrintShadows) }
-    }
-
     fn stage(&self, stage: blaze_scope::task::Stage) {
         stages::mark(stage);
     }
@@ -1755,11 +1679,7 @@ fn main() {
                 keeps_expansions: args.iter().any(|a| a == "--expansions"),
                 x_bytes: AtomicU64::new(0),
                 x_digest: AtomicU64::new(0),
-                solve_again: {
-                    #[cfg(feature = "cells")]
-                    CELLS_WRITE.store(args.iter().any(|a| a == "--cells-write"), Ordering::Relaxed);
-                    args.iter().any(|a| a == "--solve-again")
-                },
+                solve_again: args.iter().any(|a| a == "--solve-again"),
                 outlined: AtomicU64::new(0),
                 missed: (0..inputs.len()).map(|_| std::sync::Mutex::new(None)).collect(),
             };

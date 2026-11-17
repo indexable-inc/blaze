@@ -23,7 +23,7 @@ use edition::{BlazeEdition, Edition as Syntax, PackageEdition};
 use crate::{Packages, Place, Script, ScriptOutputs, Toolchain, Tree, World, WorldError, needs, world};
 
 fn g() -> Alloc<'static> {
-    Alloc::global()
+    blaze_own::testing::heap().alloc()
 }
 
 use crate::fixture::pack;
@@ -204,6 +204,8 @@ struct Store {
     lock: &'static Lock<'static>,
     packs: StdMap<&'static str, &'static [u8]>,
     asked: StdVec<StdString>,
+    /// Where the member `app` is in the checkout.
+    app_dir: &'static str,
 }
 
 impl Packages<'static> for Store {
@@ -211,7 +213,7 @@ impl Packages<'static> for Store {
         let name: &'static str = StdBox::leak(self.lock.package(package).name.as_str().to_string().into_boxed_str());
         self.asked.push(name.to_string());
         match name {
-            "app" => Ok(Place::Checkout { dir: "app" }),
+            "app" => Ok(Place::Checkout { dir: self.app_dir }),
             "blz" => Ok(Place::Checkout { dir: "blz" }),
             _ => match self.packs.get(name) {
                 Some(bytes) => Ok(Place::Pack { view: PackView::open_verified(bytes).expect("a pack"), dir: "" }),
@@ -224,15 +226,19 @@ impl Packages<'static> for Store {
 fn store(lock: &'static Lock<'static>) -> Store {
     let mut packs: StdMap<&'static str, &'static [u8]> = StdMap::new();
     for (name, text) in [
-        ("util", "pub fn thing() {}\n"),
+        // util reads a file of its own by the root it sees (D96): `/package/src/more.rs`.
+        (
+            "util",
+            "pub fn thing() {}\n#[rustc_builtin_macro]\nmacro_rules! include { () => {} }\n#[rustc_builtin_macro]\nmacro_rules! concat { () => {} }\n#[rustc_builtin_macro]\nmacro_rules! env { () => {} }\ninclude!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/more.rs\"));\n",
+        ),
         ("helper", "pub fn help() {}\n"),
         ("derive_it", "extern crate proc_macro;\n#[proc_macro_derive(It)]\npub fn it(_: proc_macro::TokenStream) -> proc_macro::TokenStream { loop {} }\n"),
         ("testkit", "pub fn check() {}\n"),
     ] {
-        let p = pack(&[("src/lib.rs", text)]);
+        let p = pack(&[("src/lib.rs", text), ("src/more.rs", "pub fn more() {}\n")]);
         packs.insert(name, StdBox::leak(p.into_boxed_slice()));
     }
-    Store { lock, packs, asked: vec![] }
+    Store { lock, packs, asked: vec![], app_dir: "app" }
 }
 
 /// One record for every served library: cfg `has_atomics`, an env pair and one generated file.
@@ -445,6 +451,66 @@ fn the_world_resolves() {
     assert_eq!(c.tree.modules.len(), 2, "{:?}", c.tree.notes);
     let errors: usize = c.done.values().map(|r| r.scope.errors.len()).sum();
     assert_eq!(errors, 0, "app's imports all resolve");
+}
+
+/// D96 P2 and P3: the command's texts answer each crate's environment (before, `Texts` had no
+/// `crate_env` and every `env!` in the command was refused). What a crate SEES as its root never
+/// depends on the workspace: a dependency (registry, git, toolchain) sees the one root
+/// `/package`; a member sees `/workspace/<member dir>`. The cargo book, "Environment variables
+/// Cargo sets for crates": "CARGO_MANIFEST_DIR — The directory containing the manifest of your
+/// package." Prints `D96 P2: util sees /package, app sees /workspace/app`.
+#[test]
+fn a_dependency_sees_the_one_package_root_and_a_member_its_workspace_dir() {
+    use blaze_scope::resolve::SourceTexts;
+    let w = made(&IN_ORDER, None);
+    let dir = |name: &str| {
+        let at = w.crates.iter().position(|c| c.input.name == name).unwrap_or_else(|| panic!("no crate `{name}`"));
+        let env = w.texts.crate_env(at).unwrap_or_else(|| panic!("`{name}`: the command's texts give no crate environment"));
+        (env.get("CARGO_MANIFEST_DIR"), env.get("CARGO_MANIFEST_PATH"))
+    };
+    assert_eq!(dir("util"), (Ok(Some("/package")), Ok(Some("/package/Cargo.toml"))));
+    assert_eq!(dir("core").0, Ok(Some("/package")), "a toolchain crate is a dependency too");
+    assert_eq!(dir("app"), (Ok(Some("/workspace/app")), Ok(Some("/workspace/app/Cargo.toml"))));
+    std::println!("D96 P2: util sees /package, app sees /workspace/app");
+}
+
+/// D96 P4: `include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/more.rs"))` in a dependency
+/// reads its own `src/more.rs`: an absolute path under the root the crate sees is served from
+/// its package, a tracked read (before, any absolute written path was refused as leaving the
+/// root). The cargo book: "CARGO_MANIFEST_DIR — The directory containing the manifest of your
+/// package"; core `macros/mod.rs`, `include!`: "Parses a file as an expression or an item
+/// according to the context." Prints `D96 P4: util read /package/src/more.rs`.
+#[test]
+fn an_include_under_the_crates_own_root_is_served() {
+    let w = made(&IN_ORDER, None);
+    let inputs = w.inputs(g());
+    let names = w.resolve(&inputs, &Serial, g()).unwrap_or_else(|e| panic!("{e}"));
+    let at = w.crates.iter().position(|c| c.input.name == "util").expect("util");
+    let c = names.krate(at);
+    let made: StdVec<&str> = c.expansions.values().filter_map(|e| e.made.map(|m| m.text)).collect();
+    assert_eq!(made, ["pub fn more( ) { }"], "util's include of its own file by CARGO_MANIFEST_DIR; notes: {:?}", c.notes);
+    std::println!("D96 P4: util read /package/src/more.rs");
+}
+
+/// D96 P3, rule 21: a member sees `/workspace/<its dir>` (`env!("CARGO_MANIFEST_DIR")`,
+/// `file!()`), so its directory is an input of everything made for it and must be in its crate
+/// key: one member moved from `app` to `crates/app` gets another key, and its dependent `blz`
+/// too; a dependency (`util`) keeps its key. Prints `D96 P3: a moved member is another key`.
+#[test]
+fn a_members_directory_is_in_its_crate_key() {
+    let lock = lock();
+    let graph = graph(lock, &IN_ORDER);
+    let tc = toolchain(needs(graph));
+    let mut here = store(lock);
+    let mut moved = store(lock);
+    moved.app_dir = "crates/app";
+    let a = world(graph, lock, tc, &mut here, checkout(), None, g()).unwrap_or_else(|e| panic!("{e}"));
+    let b = world(graph, lock, tc, &mut moved, checkout(), None, g()).unwrap_or_else(|e| panic!("{e}"));
+    let key = |w: &World<'static>, name: &str| by_name(w, name)[0].input.key;
+    assert_ne!(key(&a, "app"), key(&b, "app"), "`app` moved to crates/app kept its key: its directory is not in it");
+    assert_ne!(key(&a, "blz"), key(&b, "blz"), "`blz` depends on the moved `app`");
+    assert_eq!(key(&a, "util"), key(&b, "util"), "a dependency's key does not hold where a member is");
+    std::println!("D96 P3: a moved member is another key");
 }
 
 /// D96 P1: a dependency's scope and items records are a function of the dependency, not of the

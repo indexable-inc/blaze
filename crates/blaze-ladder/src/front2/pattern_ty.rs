@@ -19,19 +19,14 @@ use std::format;
 use std::string::String;
 use std::vec::Vec;
 
-use blaze_lower::by_name::ByName;
 use blaze_lower::form as lf;
 use blaze_lower::typeck::{Refused, parse_pattern_type, pattern_type};
 use blaze_lower::View;
-use blaze_own::Alloc;
 use blaze_surface::Range;
 use blaze_typeck::{PTy, PortableTys};
 
-use super::body::NoHost;
-use super::heads::CrateCfg;
-use super::scoped::ScopedBy;
 use super::source::NamesSource;
-use super::types::{Builder, Env, Heads, Why, children};
+use super::types::{Builder, Env, Heads, Why};
 
 fn refused(what: String, r: Range) -> Why {
     Why::PatternType(what.into_boxed_str(), r)
@@ -42,30 +37,18 @@ impl<'n, H: Heads, S: NamesSource<'n>> Builder<'_, H, S> {
     /// `env.module`: its text expanded and lowered, then read as a type.
     pub(super) fn macro_ty(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, r: Range) -> Result<PTy, Why> {
         let text = v.text_at(v.type_range(t)?)?;
-        let names = self.resolver.names;
-        let krate = names.crate_of(env.module).ok_or_else(|| refused(format!("the crate of module {:x} is not read", env.module), r))?;
-        let atoms = names.cfg_atoms(krate).ok_or_else(|| refused(format!("the cfg of the crate of module {:x} is not read", env.module), r))?;
-        let edition = names.edition_of(krate).ok_or_else(|| refused(format!("the edition of the crate of module {:x} is not read", env.module), r))?;
-        let scoped = ScopedBy { names, module: env.module, prepared: None };
-        let mut expand = ByName::with_names(&scoped, NoHost, Alloc::global());
-        let lowered = blaze_lower::lower_type_text_expanding(text, edition, &mut CrateCfg(atoms), &mut expand, Alloc::global())
-            .map_err(|e| Why::TypeMacro(format!("`{text}`: {e}").into_boxed_str(), r))?;
-        let bv = lowered.view();
-        let root = bv.type_root().ok_or_else(|| Why::TypeMacro(format!("`{text}` expanded to no type").into_boxed_str(), r))?;
-        let mut stack: Vec<lf::TypeId, Global> = Vec::new_in(Global);
-        let mut kids: Vec<lf::TypeId, Global> = Vec::new_in(Global);
-        stack.push(root);
-        while let Some(t) = stack.pop() {
-            match bv.ty(t)? {
-                lf::TypeRef::Macro(_) => return Err(Why::TypeMacro(format!("`{text}` (a macro call its expansion leaves)").into_boxed_str(), r)),
-                lf::TypeRef::Error => return Err(Why::TypeMacro(format!("`{text}` (its expansion is no type)").into_boxed_str(), r)),
-                _ => {}
-            }
-            kids.clear();
-            children(&bv, t, &mut kids)?;
-            stack.extend(kids.iter().copied());
+        let x = super::type_expand::expand_type_text(self.resolver.names, env.module, text, r)?;
+        // A fn's return type with a macro in it is expanded whole by `heads.rs` `fn_head`
+        // before its opaques are numbered, so no return opaque arrives here. An `impl Trait`
+        // a type macro writes anywhere else (a parameter's type, a field, an alias) is refused
+        // by name; it is never looked up in `env.anon`, whose ids are the item view's, not
+        // this expansion's (a type id carries no view: a lookup could match another type).
+        let mut impls: Vec<lf::TypeId, Global> = Vec::new_in(Global);
+        x.impls(text, r, &mut impls)?;
+        if !impls.is_empty() {
+            return Err(Why::Unsupported("an `impl Trait` a type macro writes outside a fn's return type", r));
         }
-        self.ty(tys, env, &bv, root)
+        self.ty(tys, &Env { anon: &[], ..*env }, &x.view(), x.root)
     }
 
     /// The pattern type over `base` (already built) with the pattern `pat` of `v`.

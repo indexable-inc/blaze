@@ -841,3 +841,57 @@ fn a_trait_method_added_rebuilds_tables_and_only_callers_of_moved_slots() {
         assert_ne!(b.key, a.key);
     }
 }
+
+/// The Reference, "Trait objects": a method call on a trait object dispatches through the
+/// vtable to the concrete type's implementation; no impl of the object's own trait for the
+/// object type exists (E0371), so a call of such a method with `Self = dyn Tr` is never a direct
+/// call: built as one it would run the trait's own (default) body, the wrong function. A
+/// method the world marks with no slot (`self` by value, `where Self: Sized`, generic) is
+/// therefore refused by name; here Tr's `m` (and, through `dyn Sub`, the supertrait's `m`) is
+/// marked so and `r.m()` is built from `main`. A method of another trait, implemented FOR the
+/// object type, stays an ordinary call: not tested here (the fixture world has no such impl).
+///
+/// Prints `test tests::objects::a_slotless_method_on_an_object_is_refused_not_called_directly ... ok`;
+/// without the refusal in walk.rs `dyn_slot` it fails with "built as a direct call".
+#[test]
+fn a_slotless_method_on_an_object_is_refused_not_called_directly() {
+    for obj in ["tr", "sub"] {
+        let mut w = world();
+        let tr = w.tr;
+        let obj = if obj == "tr" { w.tr } else { w.sub };
+        for m in w.traits.iter_mut().find(|(k, _, _)| *k == tr).expect("Tr").2.iter_mut() {
+            m.dispatch = false;
+        }
+        let mut b = Bb::new();
+        let x = b.bind("x");
+        let lit = b.int(None);
+        let xt = map_ty(&w.fx, &mut b, w.u64_);
+        let s0 = b.let_(x, Some(xt), lit);
+        let r = b.bind("r");
+        let r_ty = dyn_ty(&mut b, obj, |b, d| b.ty(PNode::Ref(Mutbl::Not, d)));
+        let xe = b.local(x);
+        let borrow = b.borrow(Mutbl::Not, xe);
+        let s1 = b.let_(r, Some(r_ty), borrow);
+        let re = b.local(r);
+        let call = b.method(re, "m", &[]);
+        let root = b.block(&[s0, s1], Some(call));
+        let lits = [(lit, 5u128)];
+        let view = b.view(w.main, root);
+        let mut ty = InferCtx::new_in(Alloc::global());
+        let checked = match blaze_typeck::check(&view, &w.fx, &mut ty, &Needs::new_in(Alloc::global()), Alloc::global()) {
+            Ok(Outcome::Done(c)) => c,
+            other => panic!("the check of `main` did not finish: {:?}", other.err()),
+        };
+        assert!(checked.diags.is_empty(), "diagnostics: {:?}", checked.diags);
+        let sig = w.fx.sig_of(w.main).expect("main's signature");
+        let mut ground = PortableTys::new_in(Alloc::global());
+        let mut subst = Subst { args: &[], ground: &mut ground, scratch: Alloc::global() };
+        match crate::build(&view, &checked, &sig, &mut subst, &FxAdts { w: &w, lits: &lits }, Global) {
+            Err(crate::BuildError::Unsupported { what, .. }) => {
+                assert!(what.contains("no vtable slot"), "refused for another reason: {what}");
+            }
+            Err(other) => panic!("refused for another reason: {other}"),
+            Ok(_) => panic!("`r.m()` on `&dyn` with no slot for `m` was built as a direct call of the trait's `m`"),
+        }
+    }
+}

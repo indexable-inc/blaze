@@ -15,7 +15,7 @@ use crate::form::*;
 use crate::machine::{Machine, V, idx};
 
 /// The byte offsets of a string token's contents in `text`: `"..."` and `r#"..."#`.
-fn string_contents(text: &str) -> Option<(usize, usize)> {
+pub(crate) fn string_contents(text: &str) -> Option<(usize, usize)> {
     if let Some(raw) = text.strip_prefix('r') {
         let hashes = raw.len() - raw.trim_start_matches('#').len();
         let start = 1 + hashes + 1;

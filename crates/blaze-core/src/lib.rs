@@ -105,6 +105,8 @@ pub mod reaped;
 )]
 pub mod shared;
 pub mod reserve;
+#[allow(unsafe_code, reason = "sigaction of SIGINT, SIGQUIT and SIGTERM in the run parent, each call behind a safe function")]
+pub mod run_signals;
 pub mod signal;
 pub mod sim;
 pub mod site;
@@ -129,6 +131,7 @@ pub mod wait;
 pub mod wheel;
 pub mod world;
 pub mod listing;
+pub mod os;
 
 use std::{fmt, time::Duration};
 
@@ -142,6 +145,10 @@ pub use crate::spans::{DIRECT_ALIGN, Memory, Registered, Span, SpanRegion, Spans
 pub use crate::tags::Tags;
 pub use crate::lock::{SharedByHash, SharedMap, SharedSet};
 pub use crate::boot::{Boot, NoBoot};
+pub use crate::os::{Os, native_in, system_wall_ns_in};
+/// `blaze_core::testing::os()`: a test's root of real-OS authority (the `testing` feature).
+#[cfg(any(test, feature = "testing"))]
+pub use crate::os::testing;
 
 /// Makes the sandbox of a process: given to a driver by whoever owns the platform's sandbox
 /// (`blaze-usercode`), so the driver starts what it says in place of the program. A driver
@@ -1980,15 +1987,12 @@ pub trait Driver {
 /// question on a loop asks its driver instead, so a simulation answers it. A reading before
 /// the epoch is a clock no stamp can be compared with: it panics, naming the reading, as a
 /// window measured from it would trust every stamp.
+///
+/// The clock from nowhere: it reaches the root itself. Its one home is
+/// [`system_wall_ns_in`], which takes the root of real-OS authority ([`Os`]); this form goes
+/// in batch B1 (port27/bstd-capabilities.md), its callers then taking `&Os` from their entry.
 pub fn system_wall_ns() -> u64 {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        // A reading past 2554 saturates: every stamp is then within its window, none trusted.
-        Ok(since) => u64::try_from(since.as_nanos()).unwrap_or(u64::MAX),
-        Err(error) => panic!(
-            "the system's wall clock reads {:?} before the Unix epoch: no file's change time can be compared with it",
-            error.duration()
-        ),
-    }
+    os::system_wall_ns_in(Os::process())
 }
 
 /// Ends a [`Driver`]'s wait from any thread ([`Driver::waker`]): the poll under way, or the
@@ -2103,22 +2107,12 @@ pub type Native = threads::Threads;
 
 /// This target's [`Native`] driver over `root`. `threads` sizes the pool kqueue and IOCP run
 /// file calls on; io_uring's off-ring errands start their own.
-#[cfg(target_os = "linux")]
-pub fn native(root: &std::path::Path, _threads: usize) -> std::io::Result<Native> {
-    uring::Uring::new(root)
-}
-#[cfg(target_os = "macos")]
+///
+/// The authority to touch the real system from nowhere: it reaches the root itself. Its one
+/// home is [`native_in`], which takes the root of real-OS authority ([`Os`]); this form goes
+/// in batch B1 (port27/bstd-capabilities.md), its callers then taking `&Os` from their entry.
 pub fn native(root: &std::path::Path, threads: usize) -> std::io::Result<Native> {
-    kqueue::Kqueue::new(root, threads)
-}
-#[cfg(windows)]
-pub fn native(root: &std::path::Path, threads: usize) -> std::io::Result<Native> {
-    iocp::Iocp::new(root, threads)
-}
-/// `threads` is not used: WASI starts none.
-#[cfg(target_os = "wasi")]
-pub fn native(root: &std::path::Path, threads: usize) -> std::io::Result<Native> {
-    Ok(threads::Threads::new(root, threads))
+    os::native_in(Os::process(), root, threads)
 }
 
 #[cfg(test)]

@@ -1,0 +1,5 @@
+status 42
+stdout
+spawned 3, finished 3
+polls: task 1: 2, task 2: 4, task 3: 2
+value from the worker thread: 42

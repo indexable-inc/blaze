@@ -28,7 +28,7 @@ zstd.workspace = true
 
 [dev-dependencies]
 # The measurement's global allocator handle for blaze-columns' encoders (tests/measure.rs).
-blaze-own = { workspace = true, features = ["std"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
 
 [lints]
 workspace = true

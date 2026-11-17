@@ -54,6 +54,11 @@ pub enum PNode {
     /// An async block's future, by its expression: its output and its interior
     /// (`TyView::Future`).
     Future(ExprId, PTy, PTy),
+    /// An async block's future of another body (the sibling of `Closure`): `owner`'s body,
+    /// its ordinal among that body's `Expr::AsyncBlock`s in expression order (blaze-build
+    /// `coroutines_in`), the owner's generic arguments. Output and interior are facts:
+    /// `World::coroutine`.
+    Coroutine { owner: ItemKey, ordinal: u32, args: List },
     /// A generic parameter of the item, by its index in the item's generics (parents first;
     /// a trait's `Self` is index 0).
     Param(u32),
@@ -283,6 +288,7 @@ pub(crate) fn node_children(t: PTys<'_>, n: PNode, out: &mut blaze_own::Vec<u32,
         | PNode::Dynamic(l)
         | PNode::ExTrait(_, l)
         | PNode::Closure { args: l, .. }
+        | PNode::Coroutine { args: l, .. }
         | PNode::Alias { args: l, .. } => list(l, out),
         PNode::ExProj { args, term, .. } => {
             list(args, out)?;
@@ -377,6 +383,12 @@ pub(crate) fn hash_node(n: &PNode, h: &mut StableHasher) {
         }
         PNode::Infer => h.tag(19),
         PNode::Error => h.tag(20),
+        PNode::Coroutine { owner, ordinal, args } => {
+            h.tag(29);
+            h.u128(owner.0);
+            h.u32(ordinal);
+            hash_list(args, h);
+        }
         PNode::Future(e, output, interior) => {
             h.tag(21);
             h.u32(e.0);
@@ -438,6 +450,7 @@ pub(crate) fn hash_node_shape(n: &PNode, h: &mut StableHasher) {
         PNode::FnPtr(x, hdr) => PNode::FnPtr(l(x), hdr),
         PNode::Closure { owner, ordinal, args } => PNode::Closure { owner, ordinal, args: l(args) },
         PNode::Future(e, ..) => PNode::Future(e, p, p),
+        PNode::Coroutine { owner, ordinal, args } => PNode::Coroutine { owner, ordinal, args: l(args) },
         PNode::Alias { trait_, name, args } => PNode::Alias { trait_, name, args: l(args) },
         PNode::Opaque(k, x) => PNode::Opaque(k, l(x)),
         PNode::ConstValue { bits, .. } => PNode::ConstValue { ty: p, bits },

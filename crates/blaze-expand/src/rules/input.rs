@@ -608,7 +608,6 @@ pub(crate) fn same_puncts(view: &View<'_, '_>, at: u32, len: u8, def: Def<'_>, t
 #[cfg(test)]
 mod tests {
     use blaze_id::{ContentId, CrateItemKey};
-    use blaze_own::Alloc;
 
     use super::*;
     use crate::{CallSite, Ctx, DefAt, DefSite, Export, LocalInner, MacroDefinition, lex};
@@ -624,7 +623,7 @@ mod tests {
     /// tokens".
     #[test]
     fn a_fragment_costs_by_its_length_not_the_inputs() {
-        let alloc = Alloc::global();
+        let alloc = blaze_own::testing::heap().alloc();
         let mut text = Vec::new_in(alloc);
         text.extend_from_slice(b"pub(crate) ");
         for _ in 0..40_000 {
@@ -692,7 +691,7 @@ mod tests {
         ];
         let n = toks.len() as u32;
         let token = |at: u32| (toks[at as usize].0, toks[at as usize].1, Edition::E2021);
-        let alloc = Alloc::global();
+        let alloc = blaze_own::testing::heap().alloc();
         let (mut whole, mut word_at) = (Vec::new_in(alloc), Vec::new_in(alloc));
         words_of(n, token, &mut whole, &mut word_at);
         let mut windows = 0;

@@ -125,7 +125,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         self.b.store(Flags::NONE, p, d.0, d.1, MemAttrs::aligned(3));
         let d8 = offset_by(d, 8)?;
         self.b.store(Flags::NONE, second, d8.0, d8.1, MemAttrs::aligned(3));
-        self.vals.push(V::Place(dst.0, dst.1));
+        self.push_val(V::Place(dst.0, dst.1), None);
         Ok(())
     }
 

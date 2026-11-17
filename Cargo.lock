@@ -334,6 +334,7 @@ dependencies = [
  "blaze-manifest",
  "blaze-own",
  "blaze-sim",
+ "blaze-spawn",
  "blaze-unit-graph",
 ]
 
@@ -403,10 +404,12 @@ dependencies = [
 name = "blaze-cli"
 version = "0.0.0"
 dependencies = [
+ "blaze-blake3",
  "blaze-cas",
  "blaze-core",
  "blaze-deflate",
  "blaze-drive",
+ "blaze-emit",
  "blaze-fetch",
  "blaze-file-items",
  "blaze-h1",
@@ -415,6 +418,7 @@ dependencies = [
  "blaze-ids",
  "blaze-keyed",
  "blaze-ladder",
+ "blaze-launch",
  "blaze-manifest",
  "blaze-mem",
  "blaze-own",
@@ -566,7 +570,6 @@ dependencies = [
  "blaze-manifest",
  "blaze-own",
  "blaze-run",
- "blaze-scope",
  "blaze-sim",
  "blaze-surface",
  "blaze-text",
@@ -619,6 +622,7 @@ dependencies = [
  "blaze-ids",
  "blaze-own",
  "blaze-sha256",
+ "blaze-tier",
 ]
 
 [[package]]
@@ -1032,6 +1036,7 @@ dependencies = [
  "blaze-build",
  "blaze-code",
  "blaze-consteval",
+ "blaze-core",
  "blaze-emit",
  "blaze-expand",
  "blaze-fetch",
@@ -1072,9 +1077,11 @@ dependencies = [
 name = "blaze-launch-rt"
 version = "0.0.0"
 dependencies = [
+ "blaze-alloc-count",
  "blaze-blake3",
  "blaze-check",
  "blaze-code",
+ "blaze-core",
  "blaze-launch",
  "blaze-own",
  "blaze-queue",
@@ -1088,6 +1095,7 @@ dependencies = [
 name = "blaze-launcher"
 version = "0.0.0"
 dependencies = [
+ "blaze-core",
  "blaze-launch",
  "blaze-launch-rt",
  "blaze-own",
@@ -1144,6 +1152,7 @@ name = "blaze-llvm"
 version = "0.0.0"
 dependencies = [
  "blaze-code",
+ "blaze-core",
  "blaze-lir",
  "blaze-own",
  "blaze-tier",
@@ -1258,6 +1267,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-native"
+version = "0.0.0"
+dependencies = [
+ "blaze-hash",
+ "blaze-own",
+]
+
+[[package]]
 name = "blaze-new"
 version = "0.0.0"
 dependencies = [
@@ -1336,6 +1353,7 @@ dependencies = [
  "blaze-record",
  "blaze-sha256",
  "blaze-sim",
+ "blaze-spawn",
  "blaze-std",
  "blaze-surface",
  "blaze-typeck",
@@ -1570,6 +1588,7 @@ dependencies = [
  "blaze-toolchain",
  "blaze-unit-graph",
  "edition",
+ "target-features",
 ]
 
 [[package]]
@@ -1688,6 +1707,15 @@ dependencies = [
  "rustc-stable-hash",
  "serde",
  "url",
+]
+
+[[package]]
+name = "blaze-spawn"
+version = "0.0.0"
+dependencies = [
+ "blaze-ids",
+ "blaze-own",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1847,6 +1875,7 @@ dependencies = [
  "blaze-lir",
  "blaze-own",
  "blaze-run",
+ "target-features",
 ]
 
 [[package]]

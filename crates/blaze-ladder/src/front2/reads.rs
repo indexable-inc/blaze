@@ -104,6 +104,8 @@ pub enum FactKind {
     /// digest, or `buckets::UNFILED_LIST`, or `buckets::INCOHERENT_FACT`). Its answer is the
     /// bucket's own digest: an impl added to another bucket or crate leaves it equal.
     CrateBucket = 21,
+    /// An async block's facts. `key`: its owner's body; `detail`: its ordinal.
+    Coroutine = 22,
 }
 
 /// One fact a body's check asked for (module docs). Ordered as its bytes are
@@ -339,6 +341,7 @@ pub fn fact_of(q: Question, module: tc::ItemKey, paths: &[BodyPath], segments: &
         Question::ConstHolds(item, args) => about(FactKind::ConstHolds, item, args),
         Question::ConstParams(item) => about(FactKind::ConstParams, item, 0),
         Question::Closure(owner, ordinal) => about(FactKind::Closure, owner, u64::from(ordinal)),
+        Question::Coroutine(owner, ordinal) => about(FactKind::Coroutine, owner, u64::from(ordinal)),
         Question::AssocGenerics(trait_, name) => about(FactKind::AssocGenerics, trait_, name.0),
     })
 }

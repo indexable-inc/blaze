@@ -25,6 +25,8 @@ blaze-unit-graph.workspace = true
 blaze-expand.workspace = true
 # `Oid`: the commit a fetched git source is (D54), and later the object store's reader.
 blaze-git-fetch.workspace = true
+# `SpawnRequest`: a deferred C request made a request for the deterministic sandbox (`c_request`).
+blaze-spawn.workspace = true
 
 [dev-dependencies]
 # `Alloc::global()` in the tests and the census.

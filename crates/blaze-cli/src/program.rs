@@ -147,7 +147,8 @@ pub fn run(cx: &Cx, root: &Dir<ReadWrite>, launch: &Launch<'_>, frame: &Frame) -
     let args = launch.args.iter().map(|arg| std::string::String::from(*arg)).collect();
     let grants = launch.grants.iter().map(|(name, value)| (std::string::String::from(*name), std::string::String::from(*value))).collect();
     // clone: the command's world, a refcount.
-    let hosting = Hosting::new(launch.io.clone(), args, grants, EXCHANGE);
+    // D102: blaze-cli's entry does not hand its heap down yet; this moves with blaze-cli.
+    let hosting = Hosting::new(launch.io.clone(), args, grants, EXCHANGE, blaze_own::SharedAlloc::global());
     let table = hosting.table();
     let host = NonNull::from(&table).cast::<c_void>();
     // The new front end's inputs: the package as its manifest names it, and the toolchain's
@@ -173,10 +174,11 @@ pub fn run(cx: &Cx, root: &Dir<ReadWrite>, launch: &Launch<'_>, frame: &Frame) -
     Ok(ran.status)
 }
 
-/// The exit status of `blaze run` when blaze itself could not build or start the program, or
-/// stopped it at a function that is not built ([`CliError::Ran`]): the tool's own failure (D86),
-/// as `env`, `timeout` and `xargs` say it. The program's own status passes through unchanged,
-/// and 101 stays a Rust program's panic.
+/// The exit status of `blaze run` and `blaze test` for every failure before the program starts
+/// (the manifest, a finding, the build, the start; main.rs `main` and `close`), and when blaze
+/// stopped it at a function that is not built ([`CliError::Ran`]): the tool's own failure (D86,
+/// the ladder's L6), as `env`, `timeout` and `xargs` say it. The program's own status passes
+/// through unchanged, and 101 stays a Rust program's panic.
 pub(crate) const NOT_RUN: u8 = 125;
 
 /// The passes the package's layout may take (units.rs `MOST_PASSES`; rule 18).

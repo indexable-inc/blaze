@@ -8,14 +8,14 @@
 //! padding at the end, so pointer casting to a `&[T; N]` is safe."
 //!
 //! So a vector is laid out as a one-field struct whose field is the array `[E; N]` at offset
-//! 0, with the alignment raised as `repr(align(n))` raises it. The alignment is the TARGET's:
-//! AAPCS64 (section 5.9, "Short vectors") gives a 64-bit short vector 8-byte alignment and a
-//! 128-bit one 16-byte alignment, the vector's size; this is what makes `vld1_u8`'s
-//! `read_unaligned` and `as_array` agree. Only those two sizes are laid out: a vector of any
-//! other size (rustc pads a non-power-of-two one, and gives a 32-byte one 32-byte alignment)
-//! is refused by name, as is an element that is not an integer, a float (`f16`, `f32`, `f64`)
-//! or a thin pointer, the older form of N scalar fields (the pinned library declares none),
-//! and `repr(simd, packed)`.
+//! 0, with the alignment raised as `repr(align(n))` raises it. Its size and alignment are
+//! rustc_abi's rule (layout/simd_rule.rs, `vector_shape`): the unpadded size rounded up to a
+//! power of two, which is also the alignment (AAPCS64's 8- and 16-byte short vectors are two
+//! instances of it; a 32-byte vector is 32-aligned), except that a `repr(simd, packed)` one
+//! with a lane count that is not a power of two keeps the array's size, aligned to the
+//! largest power of two dividing it. 1 to 64 lanes are laid out. Refused by name: an element
+//! that is not an integer, a float (`f16`, `f32`, `f64`) or a thin pointer, and the older
+//! form of N scalar fields (the pinned library declares none).
 //!
 //! A vector has no scalar or pair form and no niche: the walk holds it as an aggregate
 //! (`Repr::Agg`) and the Rust ABI passes it by the address of the caller's copy (lib.rs,
@@ -28,14 +28,12 @@ use core::alloc::Allocator;
 use blaze_own::Alloc;
 use blaze_typeck::{Adt, AdtKind, FloatTy, PNode, PTy};
 
+use super::simd_rule::{MAX_ALIGN, vector_shape};
 use super::{Fields, LayoutCx, LayoutError, LayoutId, Layouts, Order, Prim, Refusal, ReprAttrs};
 use crate::ground;
 
 #[cfg(test)]
 mod tests;
-
-/// The vector sizes laid out: AAPCS64's short vectors, 64 and 128 bits.
-const SHORT_VECTOR_BYTES: [u64; 2] = [8, 16];
 
 /// A vector's lanes, as the `simd_*` intrinsics read them (intrinsics/simd.rs): lane `i` is
 /// the element at byte `i * stride` of the vector's memory.
@@ -46,7 +44,7 @@ pub struct Lanes {
     pub elem: Prim,
     /// The element's size: the bytes from one lane to the next.
     pub stride: u64,
-    /// The vector's size (8 or 16) and log2 of its alignment.
+    /// The vector's size (layout/simd_rule.rs) and log2 of its alignment.
     pub size: u64,
     pub align: u8,
 }
@@ -86,9 +84,6 @@ impl<A: Allocator + Clone> Layouts<A> {
         if adt.kind != AdtKind::Struct {
             return Err(Refusal::Malformed("a `repr(simd)` enum or union (only a struct is a vector)"));
         }
-        if attrs.packed.is_some() {
-            return Err(Refusal::Unsupported("a `repr(simd, packed)` type (lanes at the element's alignment)"));
-        }
         if attrs.c || attrs.transparent || attrs.int.is_some() {
             return Err(Refusal::Unsupported("a `repr(simd)` type with another `repr` hint"));
         }
@@ -115,14 +110,24 @@ impl<A: Allocator + Clone> Layouts<A> {
         if !scalar_kind || !lane_is_scalar {
             return Err(Refusal::Unsupported("a `repr(simd)` type whose element is not an integer, float or thin pointer"));
         }
-        if !SHORT_VECTOR_BYTES.contains(&array.size) {
-            return Err(Refusal::Unsupported("a `repr(simd)` type whose size is not 8 or 16 bytes (only AAPCS64's short vectors are laid out)"));
-        }
-        // The target's alignment of a short vector, its size (8 or 16: log2 3 or 4), raised as
-        // `repr(align(n))` raises a struct's.
-        let vector_align = array.size.trailing_zeros() as u8;
-        let raised = ReprAttrs { align: Some(attrs.align.map_or(vector_align, |a| a.max(vector_align))), ..attrs };
+        let Fields::Array { count, .. } = array.fields else {
+            return Err(Refusal::Malformed("a laid-out vector field that is not an array"));
+        };
+        // rustc_abi's rule (simd_rule.rs): `packed` only changes a vector whose lane count is
+        // not a power of two (no padding, alignment the largest power of two dividing the
+        // size).
+        let (size, align) = vector_shape(count, lane.size, attrs.packed.is_some(), MAX_ALIGN).map_err(|r| r.refusal())?;
+        // The vector's alignment (a power of two: log2 is its trailing zeros), raised as
+        // `repr(align(n))` raises a struct's. `packed` is spent by the rule: the one array
+        // field is never under-aligned by it (its alignment divides the vector's).
+        let vector_align = align.trailing_zeros() as u8;
+        let raised = ReprAttrs { packed: None, align: Some(attrs.align.map_or(vector_align, |a| a.max(vector_align))), ..attrs };
         let mut u = self.univariant(fields, Order::Declaration, raised, 0, 0)?;
+        // Without `repr(align)`, the struct's size is the rule's: the array rounded up to the
+        // vector alignment.
+        if attrs.align.is_none() && u.size != size {
+            return Err(Refusal::Malformed("a laid-out vector whose size is not its rule's (simd_rule.rs)"));
+        }
         // An aggregate: no scalar or pair form (an array has none; said here, not inherited),
         // and no niche (every bit pattern of an integer or float lane is valid; a vector is
         // never an enum's niche carrier).

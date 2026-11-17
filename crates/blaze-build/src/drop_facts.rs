@@ -130,6 +130,11 @@ pub fn needs_drop<'g, E>(
             PNode::Dynamic(_) => return Ok(true),
             // A coroutine's drop is its pass's `drop`, which reads the state's tag.
             PNode::Future(..) => return Ok(true),
+            PNode::Coroutine { .. } => {
+                return Err(NeedsDropError::Ground(BuildError::UnsupportedSig {
+                    what: "an async block's future by identity (`PNode::Coroutine`): the builder grounds the `Future(ordinal, output, FnDef)` form (coroutine.rs) until it reads `World::coroutine`",
+                }));
+            }
             PNode::Closure { owner, ordinal, args: l } => {
                 let c = facts.closure(owner, ordinal).ok_or(NeedsDropError::NoClosure { owner, ordinal })?;
                 args.clear();

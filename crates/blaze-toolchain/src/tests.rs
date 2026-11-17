@@ -4,14 +4,13 @@ use std::collections::BTreeMap;
 
 use blaze_fetch::pack::{Builder, Kind, Limits};
 use blaze_fetch::{Mode, PackView};
-use blaze_own::Alloc;
 
 use crate::record::{self, CrateIn, RecordRefused, Role, TargetIn, UnitIn, UnitKind};
 use crate::shelf::{self, Shelf, What, Why};
 use crate::{Hex, ToolchainId, ToolchainView, parse_hex};
 
 fn pack(files: &[(&str, &str)]) -> std::vec::Vec<u8> {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let limits = Limits { most_files: 16, most_bytes: 1 << 20, most_path: 256 };
     let mut builder = Builder::new(Kind::Tree, [7; 32], limits, 0, alloc).expect("a builder");
     for (path, text) in files {
@@ -57,7 +56,7 @@ fn sample() -> (std::vec::Vec<u8>, std::vec::Vec<std::vec::Vec<u8>>) {
     ];
     let cfg = [("panic", Some("unwind")), ("target_os", Some("macos")), ("unix", None)];
     let targets = [TargetIn { triple: "aarch64-apple-darwin", units: &units, cfg: &cfg }];
-    let bytes = record::write(&crates, &targets, Alloc::global()).expect("a record").to_vec();
+    let bytes = record::write(&crates, &targets, blaze_own::testing::heap().alloc()).expect("a record").to_vec();
     (bytes, vec![library, workspace])
 }
 
@@ -80,7 +79,7 @@ fn a_record_reads_back_as_written() {
     // Atoms out of order are refused when written (control: the sorted ones above were taken).
     let unsorted = [("unix", None), ("panic", Some("unwind"))];
     let targets = [TargetIn { triple: "t", units: &[], cfg: &unsorted }];
-    assert!(matches!(record::write(&[], &targets, Alloc::global()), Err(RecordRefused::Form { .. })));
+    assert!(matches!(record::write(&[], &targets, blaze_own::testing::heap().alloc()), Err(RecordRefused::Form { .. })));
     // Two writers of one input write equal bytes (rule 25).
     assert_eq!(sample().0, bytes);
 }

@@ -103,7 +103,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             }
             self.load(repr, (addr, field_off))
         };
-        self.vals.push(v);
+        self.push_val(v, None);
         Ok(())
     }
 }

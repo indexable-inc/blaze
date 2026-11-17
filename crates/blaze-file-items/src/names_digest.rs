@@ -285,7 +285,6 @@ fn head(written: &str) -> Head<'_> {
 mod tests {
     use std::{format, string::String};
 
-    use blaze_own::Alloc;
     use blaze_surface::{Edition, ItemIndex};
 
     use super::*;
@@ -322,7 +321,7 @@ mod tests {
     #[test]
     fn side_by_side_is_one_hasher_an_entry() {
         let text = fixture();
-        let outline = crate::outline(&text, Edition::E2024, Alloc::global());
+        let outline = crate::outline(&text, Edition::E2024, blaze_own::testing::heap().alloc());
         assert!(outline.items().len() > 3 * BATCH + 40, "{} entries", outline.items().len());
         assert!(outline.errors().is_empty(), "{:?}", outline.errors());
         for (at, item) in outline.items().iter().enumerate() {

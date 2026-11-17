@@ -51,7 +51,8 @@ use blaze_launch::{Slot, Target, Thread};
 
 use crate::drive::{Driver, EditError, Error, Records};
 use crate::sys;
-use crate::table::{Bound, Event, Shared};
+use crate::stub_wait::{self, Answer};
+use crate::table::{Event, Shared};
 
 /// Why the control thread could not go on serving code.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -164,8 +165,9 @@ struct Control<'a, 'h> {
     /// The slots whose stub fired, each with the thread that fired it first, while no `Need`
     /// can be said yet (the other side has not welcomed the launcher): asked once it has.
     unasked: Vec<(Slot, Thread)>,
-    /// By slot: the threads waiting in its stub, for which one `Need` was said.
-    needs: Vec<(Slot, Vec<std::sync::Arc<sys::Handoff<Bound>>>)>,
+    /// By slot: the stub waiters' rows of the threads waiting in its stub, for which one
+    /// `Need` was said. Each row is answered once (`Waiters::answer`).
+    needs: Vec<(Slot, Vec<u32>)>,
     /// The id of the last message this side began.
     said: u64,
     /// The first failure: no code can come any more.
@@ -407,13 +409,13 @@ impl Control<'_, '_> {
         self.lost.get_or_insert(why);
     }
 
-    /// Answers every stub that waits: no code can come, for `why`.
+    /// Answers every stub that waits: no code can come, for `why` (said first, once a slot:
+    /// a waiter answered LOST ends the process without words of its own).
     fn answer(&mut self, why: &str) {
-        for (_, waiters) in self.needs.drain(..) {
-            for waiter in waiters {
-                // A waiter is a thread blocked on this answer; were it gone, there is no one
-                // to tell.
-                waiter.put(Bound::Lost(why.to_owned()));
+        for (slot, rows) in self.needs.drain(..) {
+            stub_wait::say_no_code(slot.0, why);
+            for row in rows {
+                self.driver.waiters().answer(row, Answer::Lost);
             }
         }
     }
@@ -422,7 +424,7 @@ impl Control<'_, '_> {
     fn handle(&mut self, event: Event) -> Result<bool, ControlError> {
         match event {
             Event::Thread(told) => self.driver.told(told)?,
-            Event::Need { slot, thread, reply } => self.need(slot, thread, reply)?,
+            Event::Need { slot, thread, row } => self.need(slot, thread, row)?,
             Event::Frame(item) => self.tell(&item)?,
             Event::Closed(why) => return Err(ControlError::Closed(why)),
             Event::Stop => return Ok(false),
@@ -431,26 +433,22 @@ impl Control<'_, '_> {
     }
 
     /// A stub fired.
-    fn need(
-        &mut self,
-        slot: Slot,
-        thread: Thread,
-        reply: std::sync::Arc<sys::Handoff<Bound>>,
-    ) -> Result<(), ControlError> {
+    fn need(&mut self, slot: Slot, thread: Thread, row: u32) -> Result<(), ControlError> {
         if let Some(lost) = &self.lost {
-            reply.put(Bound::Lost(lost.to_string()));
+            stub_wait::say_no_code(slot.0, &lost.to_string());
+            self.driver.waiters().answer(row, Answer::Lost);
             return Ok(());
         }
         // Bound since the thread loaded the word: it calls through the word again.
         if matches!(self.driver.target(slot), Ok(Target::Body(_) | Target::Gate { .. })) {
-            reply.put(Bound::Code);
+            self.driver.waiters().answer(row, Answer::Bound);
             return Ok(());
         }
         match self.needs.iter_mut().find(|(waited, _)| *waited == slot) {
-            Some((_, waiters)) => waiters.push(reply),
+            Some((_, rows)) => rows.push(row),
             None => {
-                // alloc: the threads in one slot's stub; a list a slot being fetched.
-                self.needs.push((slot, vec![reply]));
+                // alloc: the rows in one slot's stub; a list a slot being fetched.
+                self.needs.push((slot, vec![row]));
                 match self.joining {
                     Joining::Joined => self.ask(None, &Ask::Need { slot, thread })?,
                     // Asked once the other side has welcomed the launcher (`Tell::Welcome`).
@@ -541,8 +539,9 @@ impl Control<'_, '_> {
                 let Some(at) = self.needs.iter().position(|(waited, _)| *waited == slot) else {
                     return Err(ControlError::Unasked { slot });
                 };
-                for waiter in self.needs.swap_remove(at).1 {
-                    waiter.put(Bound::Refused(diagnostic.to_owned()));
+                stub_wait::say_no_code(slot.0, diagnostic);
+                for row in self.needs.swap_remove(at).1 {
+                    self.driver.waiters().answer(row, Answer::Refused);
                 }
             }
             Tell::Unheld { why } => return Err(ControlError::Unheld { why: why.to_owned() }),
@@ -585,8 +584,8 @@ impl Control<'_, '_> {
             if !matches!(driver.target(*slot), Ok(Target::Body(_) | Target::Gate { .. })) {
                 return true;
             }
-            for waiter in waiters {
-                waiter.put(Bound::Code);
+            for &row in waiters.iter() {
+                driver.waiters().answer(row, Answer::Bound);
             }
             false
         });
@@ -619,9 +618,9 @@ impl Control<'_, '_> {
                         failed.get_or_insert(ControlError::Driver(why));
                     }
                 }
-                Event::Need { reply, .. } => {
-                    let why = "the launcher's control thread was stopped";
-                    reply.put(Bound::Lost(why.to_owned()));
+                Event::Need { slot, row, .. } => {
+                    stub_wait::say_no_code(slot.0, "the launcher's control thread was stopped");
+                    self.driver.waiters().answer(row, Answer::Lost);
                 }
                 Event::Frame(_) | Event::Closed(_) | Event::Stop => {}
             }

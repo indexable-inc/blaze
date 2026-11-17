@@ -16,16 +16,26 @@
 //! its `#[path]` is relative to, whatever module the `include!` call stands in. An inline
 //! `mod y { mod z; }` in the included file then looks under that folder's `y/`, as in any file.
 
+use blaze_expand::seen::SeenRoot;
 use blaze_expand::{ReadAnswer, ReadKind, ReadRoot, Reads, SourceOrigin, include_target};
 use blaze_own::{AString, Alloc};
 
 /// The absolute path of the file an `include!` written in the file `calling` (absolute, under
-/// the package folder `package`) names by `written`: the calling file's folder joined with the
-/// written path, `.` and `..` taken lexically ([`include_target`]). `None` when the calling
-/// file is not under the package or the path leaves it (the texts hold the package alone).
-pub(crate) fn included_file<'a>(package: &str, calling: &str, written: &str, alloc: Alloc<'a>) -> Option<AString<'a>> {
-    let folder = calling.rsplit_once('/').map_or("", |(dir, _)| dir);
-    let folder = folder.strip_prefix(package)?;
+/// the package folder `package`, the reader's path space) names by `written`: the calling
+/// file's folder joined with the written path, `.` and `..` taken lexically
+/// ([`include_target`]). An absolute `written` under the root the crate SEES (`seen`, D96 (4):
+/// `/package/..` for a dependency, `/workspace/<dir>/..` for a member, what
+/// `env!("CARGO_MANIFEST_DIR")` gives) is the package's file at the rest of the path; any other
+/// absolute path names the machine and is outside. `None` when the calling file is not under
+/// the package or the path leaves it (the texts hold the package alone).
+pub fn included_file<'a>(package: &str, seen: Option<SeenRoot<'_>>, calling: &str, written: &str, alloc: Alloc<'a>) -> Option<AString<'a>> {
+    let (folder, written) = match seen.and_then(|seen| seen.under(written)) {
+        Some(rest) => ("", rest),
+        None => {
+            let folder = calling.rsplit_once('/').map_or("", |(dir, _)| dir);
+            (folder.strip_prefix(package.trim_end_matches('/'))?, written)
+        }
+    };
     let root = ReadRoot { origin: SourceOrigin::Package, package: "" };
     let target = include_target(root, folder, written, alloc).ok()?;
     let mut path = AString::new_in(alloc);
@@ -42,13 +52,13 @@ pub(crate) fn included_file<'a>(package: &str, calling: &str, written: &str, all
 /// diagnostic says so), read more than one (not an `include!` of one path: nothing is guessed),
 /// or read a file that is not under the package (a build script's output: its `mod x;` keeps
 /// the calling module's folder, as before this rule).
-pub(crate) fn included_dir<'a>(package: &str, calling: &str, reads: &Reads<'_>, alloc: Alloc<'a>) -> Option<AString<'a>> {
+pub(crate) fn included_dir<'a>(package: &str, seen: Option<SeenRoot<'_>>, calling: &str, reads: &Reads<'_>, alloc: Alloc<'a>) -> Option<AString<'a>> {
     let mut found = reads.list().iter().filter(|read| read.kind == ReadKind::IncludeStr && matches!(read.answer, ReadAnswer::Digest(_)));
     let read = found.next()?;
     if found.next().is_some() {
         return None;
     }
-    let mut path = included_file(package, calling, reads.subject(read), alloc)?;
+    let mut path = included_file(package, seen, calling, reads.subject(read), alloc)?;
     crate::task::pop_dir(&mut path);
     Some(path)
 }

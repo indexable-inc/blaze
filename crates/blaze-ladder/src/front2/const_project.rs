@@ -103,6 +103,19 @@ impl<'w> ProjectAsk<'w> {
         ProjectAsk { buckets, fills: RefCell::new(Vec::new_in(Global)), gaps: RefCell::new(Vec::new_in(Global)), refused: Cell::new(None) }
     }
 
+    /// The records' impl buckets this step's world reads (const_select.rs `select_once`, a
+    /// trait's constant selected inside the step, reads the same).
+    pub(super) fn buckets(&self) -> Option<&'w Buckets> {
+        self.buckets
+    }
+
+    /// The fills and gaps a selection inside the step noted (consts.rs `ConstsWorld::resolve`
+    /// through const_select.rs): kept with the projections' own, made or refused by [`answer`].
+    pub(super) fn note(&self, fills: Vec<Fill, Global>, gaps: Vec<Gap, Global>) {
+        self.fills.borrow_mut().extend(fills);
+        self.gaps.borrow_mut().extend(gaps);
+    }
+
     /// `<args[0] as trait_<args[1..]>>::name` at ground `args` (types of `ground`), normalized
     /// by the checker's solver over the store; the answer is interned in `ground`. Not
     /// answered: the fills and gaps the world noted, and the refusal, are kept for the caller,

@@ -80,6 +80,7 @@ fn krate(name: &'static str, package: u32, deps: &[(&'static str, usize)], build
         implicit: RUST,
         root: Text::from_str_in(&std::format!("{base}src/lib.rs"), a()),
         shown_from: Text::from_str_in(&base, a()),
+        seen: blaze_expand::seen::SeenRoot::Package,
         features: AVec::new_in(a()),
         deps: dep_list,
         cfg: AVec::new_in(a()),

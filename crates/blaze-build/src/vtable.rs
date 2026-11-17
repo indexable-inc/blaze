@@ -198,7 +198,7 @@ pub enum ObjectRead {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RecordKey(pub ContentId);
 
-const RECORD_DOMAIN: &str = "blaze-build fn record key 1";
+const RECORD_DOMAIN: &str = "blaze-build fn record key 2";
 
 /// [`RecordKey`] of `instance` whose body reads `reads` (in the order [`crate::object_reads`]
 /// gives them: expression order, deterministic).

@@ -102,7 +102,8 @@ is, and nothing else is:
   - the file of a module declared out of line in test code (`#[cfg(test)] mod t;`, or any
     `mod m;` in a test file): `m.rs` or `m/mod.rs` beside a crate root (`lib.rs`, `main.rs`,
     `mod.rs`, `build.rs`, a file of a `bin` directory), else in the directory named for the
-    declaring file. A `#[path]` is not followed, so such a module counts.
+    declaring file; a `#[path = ".."]` on the declaration (its line or an attribute line above)
+    names the file instead, relative to the declaring file's directory.
 Everything else counts: build scripts, binaries and `*_tests.rs` files a test module does not
 declare included. `is_std` is the root's, test code or not.
 
@@ -128,6 +129,18 @@ use blaze_script::{
 #[path = "ambient/in_tests.rs"]
 mod in_tests;
 use in_tests::Effect;
+
+/// The heap's ratchet (decision D102): calls that reach the global heap from nowhere, read by
+/// the same walk.
+#[path = "ambient/heap.rs"]
+mod heap;
+use heap::HeapUse;
+
+/// The reach ratchet (rule 75, D104): calls that reach the clock, the environment, randomness,
+/// exit or a whole world from nowhere, read by the same walk.
+#[path = "ambient/reach.rs"]
+mod reach;
+use reach::ReachUse;
 
 const SCRIPT: &str = "ambient";
 /// The list, from the root.
@@ -186,7 +199,26 @@ impl Input for Args {
 
     fn parse(f: &Fields<'_>) -> Result<Args, InputError> {
         Ok(Args {
-            command: f.one_of("command", &["check", "write", "findings", "tests-check", "tests-write", "tests-report"], None)?,
+            command: f.one_of(
+                "command",
+                &[
+                    "check",
+                    "write",
+                    "findings",
+                    "tests-check",
+                    "tests-write",
+                    "tests-report",
+                    "heap-check",
+                    "heap-write",
+                    "heap-report",
+                    "heap-sites",
+                    "reach-check",
+                    "reach-write",
+                    "reach-report",
+                    "reach-sites",
+                ],
+                None,
+            )?,
             root: f.str("root", Some("."))?,
             base: f.str_or_null("base")?,
         })
@@ -446,8 +478,8 @@ struct Scanned {
     /// The sites outside its test code (line from 1, what it is), in line order and then by
     /// column.
     sites: Vec<(usize, Kind)>,
-    /// Each `mod <name>;` it declares, and whether test code declares it.
-    mods: Vec<(String, bool)>,
+    /// Each `mod <name>;` it declares.
+    mods: Vec<ModDecl>,
     /// `#![cfg(test)]`: the whole file is test code.
     test: bool,
     /// The sites on its test code's lines (every line when `test`): the other side of the same
@@ -456,8 +488,34 @@ struct Scanned {
     /// The ambient effects ([`Effect`]) outside its test code, and on it.
     effects: Vec<(usize, Effect)>,
     test_effects: Vec<(usize, Effect)>,
+    /// The calls that reach the heap with no caller handing it ([`HeapUse`], heap.rs),
+    /// outside its test code, and on it.
+    heap: Vec<(usize, HeapUse)>,
+    test_heap: Vec<(usize, HeapUse)>,
+    /// The calls that reach the clock, the environment, randomness, exit or a whole world with
+    /// no caller handing it ([`ReachUse`], reach.rs), outside its test code, and on it.
+    reach: Vec<(usize, ReachUse)>,
+    test_reach: Vec<(usize, ReachUse)>,
     /// Its text says `#![no_std]` (read for a test target's root).
     no_std: bool,
+}
+
+/// One `mod <name>;` a file declares out of line.
+#[derive(Debug, PartialEq, Eq)]
+struct ModDecl {
+    name: String,
+    /// Its `#[path = ".."]`, on its line or on an attribute line above it: the file, relative
+    /// to the declaring file's directory.
+    path: Option<String>,
+    /// Test code declares it.
+    in_test: bool,
+}
+
+/// The file a `#[path = "<file>"]` on `line` names, if any.
+fn path_attr(line: &str) -> Option<&str> {
+    let at = line.find("#[path")?;
+    let rest = line[at + "#[path".len()..].trim_start().strip_prefix('=')?.trim_start().strip_prefix('"')?;
+    Some(&rest[..rest.find('"')?])
 }
 
 /// The sites of one file's text and the modules it declares out of line.
@@ -465,6 +523,8 @@ fn scan_file(text: &str) -> Scanned {
     let lines: Vec<&str> = text.split('\n').collect();
     let mut test = vec![false; lines.len()];
     let mut out = Scanned::default();
+    // A `#[path]` on an attribute line, waiting for the `mod` it is on.
+    let mut path: Option<&str> = None;
     // The byte where line `at` starts.
     let mut start = 0;
     for (at, line) in lines.iter().enumerate() {
@@ -481,21 +541,29 @@ fn scan_file(text: &str) -> Scanned {
                 *it = true;
             }
         }
+        let named = path_attr(line).or(path);
         if let Some(name) = module_decl(line) {
-            out.mods.push((name.to_owned(), test[at]));
+            out.mods.push(ModDecl { name: name.to_owned(), path: named.map(str::to_owned), in_test: test[at] });
+            path = None;
+        } else if line.trim_start().starts_with("#[") {
+            path = named;
+        } else if !line.trim().is_empty() {
+            path = None;
         }
         start += line.len() + 1;
     }
     let whole = out.test;
     if whole {
         for it in &mut out.mods {
-            it.1 = true;
+            it.in_test = true;
         }
     }
     // One scan; each site is on test code's side of the line or on the other, by `test`.
     let (sites, effects) = all_sites(text);
     (out.test_sites, out.sites) = sites.into_iter().partition(|(line, _)| whole || test[line - 1]);
     (out.test_effects, out.effects) = effects.into_iter().partition(|(line, _)| whole || test[line - 1]);
+    (out.test_heap, out.heap) = heap::heap_uses(text).into_iter().partition(|(line, _)| whole || test[line - 1]);
+    (out.test_reach, out.reach) = reach::reach_uses(text).into_iter().partition(|(line, _)| whole || test[line - 1]);
     out.no_std = declares_no_std(text);
     out
 }
@@ -873,6 +941,22 @@ fn test_path(parts: &[String]) -> bool {
 }
 
 /// The two files the module `name`, declared out of line in the file `parts`, can be.
+/// The file a `#[path = "<named>"]` on a module the file `parts` declares names: relative to
+/// that file's directory, `.` and `..` taken.
+fn path_file(parts: &[String], named: &str) -> String {
+    let mut out: Vec<&str> = parts.split_last().map_or(&[][..], |(_, dirs)| dirs).iter().map(String::as_str).collect();
+    for part in named.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            _ => out.push(part),
+        }
+    }
+    out.join("/")
+}
+
 fn module_files(parts: &[String], name: &str) -> [String; 2] {
     let Some((file, dirs)) = parts.split_last() else { return [String::new(), String::new()] };
     let mut base: Vec<&str> = dirs.iter().map(String::as_str).collect();
@@ -1045,12 +1129,16 @@ fn walk(root: &Path) -> Result<Walked, TreeError> {
         if test_path(&parts) || found.test {
             skipped.insert(path.clone());
         }
-        for (name, in_test) in &found.mods {
-            for file in module_files(&parts, name) {
+        for decl in &found.mods {
+            let files = match &decl.path {
+                Some(named) => vec![path_file(&parts, named)],
+                None => module_files(&parts, &decl.name).into(),
+            };
+            for file in files {
                 if !known.contains(&file) {
                     continue;
                 }
-                if *in_test {
+                if decl.in_test {
                     skipped.insert(file.clone());
                 }
                 children.entry(path.clone()).or_default().push(file);
@@ -1274,6 +1362,14 @@ fn main_with(it: &Args) {
     }
     if it.command.starts_with("tests-") {
         in_tests::main_with(&it.command, it.base.as_deref(), &root);
+        return;
+    }
+    if it.command.starts_with("heap-") {
+        heap::main_with(&it.command, it.base.as_deref(), &root);
+        return;
+    }
+    if it.command.starts_with("reach-") {
+        reach::main_with(&it.command, it.base.as_deref(), &root);
         return;
     }
     let counts = count(&root).unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
@@ -1521,6 +1617,9 @@ fn selftest() {
     put("crates/a/src/lib.rs", FIXTURE);
     put("crates/a/src/x.rs", "#[cfg(test)]\nmod t;\n");
     put("crates/a/src/x/t.rs", uses_std);
+    // A test module declared with a `#[path]`: its file is test code, not the default `y/t.rs`.
+    put("crates/a/src/y.rs", "#[cfg(test)]\n#[path = \"y_tests.rs\"]\nmod t;\n");
+    put("crates/a/src/y_tests.rs", uses_std);
     put("crates/a/build.rs", uses_std);
     put("crates/a/tests/it.rs", uses_std);
     put("crates/a/tests/fixture/Cargo.toml", "[package]\nname = \"fixture\"\n");
@@ -1612,6 +1711,8 @@ fn selftest() {
         "a bad row is refused, naming its line",
     );
     in_tests::selftest();
+    heap::selftest();
+    reach::selftest();
     println!("{SCRIPT} selftest: ok");
 }
 
@@ -1621,7 +1722,7 @@ fn main() {
         [one] if one == "selftest" => selftest(),
         [one] => main_with(&input::parse::<Args>(one, SCRIPT)),
         _ => {
-            eprintln!("usage: {SCRIPT} '<json>' | selftest\n\n{DOC}{}", in_tests::TESTS_DOC);
+            eprintln!("usage: {SCRIPT} '<json>' | selftest\n\n{DOC}{}{}{}", in_tests::TESTS_DOC, heap::HEAP_DOC, reach::REACH_DOC);
             std::process::exit(1);
         }
     }

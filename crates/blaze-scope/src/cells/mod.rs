@@ -25,18 +25,20 @@ use crate::facts::ScopeFacts;
 use crate::{AmbiguityKind, CallShape, Def, DefKind, Edition, ExternTarget, Namespace, Origin, Path, PathKind, Rename, Unresolved, UseForm, Visibility, WrittenVis};
 
 mod deps;
-mod seam;
 mod switch;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod world;
 mod write;
+
+#[cfg(test)]
+pub(crate) use world::solve_world;
 
 pub(crate) use switch::solve_and_write;
 pub use switch::{MOST_ROUNDS, Unwritten};
 
 pub(crate) use deps::{BuiltDeps, DepAnswer, DepNames, EnumNames};
-pub(crate) use seam::shadow;
-pub use seam::{DIFFER_SHOWN, Differ, SCOPE_FIELDS, ScopeDiffer, Seam, ShadowRefused, Shadowed, Unknown, WrittenAgainst, WrittenDiffer, WrittenWhich};
 
 pub(crate) const NAMESPACES: [Namespace; 3] = [Namespace::Types, Namespace::Values, Namespace::Macros];
 
@@ -247,6 +249,11 @@ pub struct CellStats {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum CellPlant {
     None,
+    /// A `use` that makes a binding more visible than it is writes no `WiderReexport`.
+    NoWiderReexport,
+    /// The `#[macro_export]` macros an expansion wrote are listed in the order their
+    /// expansions were read, not in the module's text order.
+    ExportsByExpansionTime,
     /// A tool attribute (`#[rustfmt::skip]`) is a call like any other: its path fails.
     ToolAttrIsACall,
     /// No expansion depth limit: a self-calling macro expands until the load's bound refuses.
@@ -598,6 +605,10 @@ pub(crate) struct Cells<'a, N> {
     pub(crate) r6: ABTreeSet<'a, ItemId>,
     pub(crate) stats: CellStats,
     pub(crate) plant: CellPlant,
+    /// Items are evaluated from the last id first (and so their calls expanded in that order):
+    /// a second schedule the tests run, so that what the core writes is shown not to depend on
+    /// the order its work happened to finish in (rule 25). Production runs forward.
+    pub(crate) backward: bool,
     /// The dependencies' decided names; `None`: every path into another crate is unknown.
     deps: Option<&'a dyn DepNames<N>>,
     /// This crate's enums' variants; `None`: every path through one of them is unknown.
@@ -715,6 +726,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             r6: ABTreeSet::new_in(alloc),
             stats: CellStats::default(),
             plant,
+            backward: false,
             deps,
             enums: None,
             enum_mods: ABTreeSet::new_in(alloc),
@@ -2642,7 +2654,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 expand(self, i)?;
                 continue;
             }
-            if let Some(i) = self.item_queue.pop_first() {
+            let next = if self.backward { self.item_queue.pop_last() } else { self.item_queue.pop_first() };
+            if let Some(i) = next {
                 // A call past the recursion limit is never evaluated (its error is written).
                 if !self.items[i as usize].deep {
                     self.eval(i);

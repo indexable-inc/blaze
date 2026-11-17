@@ -89,6 +89,11 @@ pub fn instance_key(code: ContentId, args: List, ground: PTys<'_>, scratch: Allo
             // its identity form, so the first part is its ORDINAL among the owner body's async
             // blocks; its children the output, then the owner and the owner's arguments.
             PNode::Future(ordinal, ..) => (22, u128::from(ordinal.0)),
+            PNode::Coroutine { .. } => {
+                return Err(BuildError::UnsupportedSig {
+                    what: "an async block's future by identity (`PNode::Coroutine`): the builder grounds the `Future(ordinal, output, FnDef)` form (coroutine.rs) until it reads `World::coroutine`",
+                });
+            }
             PNode::Alias { .. }
             | PNode::Opaque(..)
             | PNode::Param(_)
@@ -203,6 +208,11 @@ pub fn ground(
             PNode::FnPtr(l, header) => PNode::FnPtr(map_list(l, &mut list)?, header),
             PNode::Closure { owner, ordinal, args } => PNode::Closure { owner, ordinal, args: map_list(args, &mut list)? },
             PNode::Future(e, o, i) => crate::walk::coroutine::ground_node(from, e, i, mapped[o.0 as usize], mapped[i.0 as usize])?,
+            PNode::Coroutine { .. } => {
+                return Err(BuildError::UnsupportedSig {
+                    what: "an async block's future by identity (`PNode::Coroutine`): the builder grounds the `Future(ordinal, output, FnDef)` form (coroutine.rs) until it reads `World::coroutine`",
+                });
+            }
             PNode::Alias { trait_, name, args } => {
                 projections = true;
                 PNode::Alias { trait_, name, args: map_list(args, &mut list)? }
@@ -241,7 +251,9 @@ pub fn each_child(from: PTys<'_>, node: PNode, out: &mut Vec<PTy, Alloc<'_>>) ->
         PNode::Tuple(l) | PNode::Adt(_, l) | PNode::FnDef(_, l) | PNode::FnPtr(l, _) | PNode::Opaque(_, l) => {
             out.extend_from_slice(from.list(l).map_err(malformed)?);
         }
-        PNode::Alias { args, .. } | PNode::Closure { args, .. } => out.extend_from_slice(from.list(args).map_err(malformed)?),
+        PNode::Alias { args, .. } | PNode::Closure { args, .. } | PNode::Coroutine { args, .. } => {
+            out.extend_from_slice(from.list(args).map_err(malformed)?)
+        }
         PNode::Ref(_, t) | PNode::Ptr(_, t) | PNode::Slice(t) | PNode::ConstValue { ty: t, .. } => out.push(t),
         PNode::Future(_, o, i) | PNode::Array(o, i) => {
             out.push(o);

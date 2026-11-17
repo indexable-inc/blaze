@@ -610,8 +610,9 @@ pub struct Plain {
     holds_lock: bool,
     /// The torn slot a short head showed before this open made it whole length.
     head_torn: Option<usize>,
-    /// A torn slot was reported at this open: the next flip writes over it (that slot is the
-    /// one the newest does not hold), so it is reported once, not at every open.
+    /// A torn slot, or a slot whose manifest is not whole, was reported at this open: the next
+    /// flip writes past it (over the torn slot, which the newest does not hold; a generation
+    /// whose manifest is whole beside the other), so it is reported once, not at every open.
     torn_stamp: bool,
 }
 
@@ -2253,7 +2254,12 @@ impl Plain {
                 }
             }
             (HEAD_MAKE, Phase::MakeHead) => {
-                if let Some(why) = fail(if index == 0 { "making the head at its length" } else { "syncing the head made" }, &self.head, &done) {
+                let (doing, file) = match index {
+                    0 => ("making the head at its length", &self.head),
+                    1 => ("syncing the head made", &self.head),
+                    _ => ("syncing the store's directory after making the head", &self.cfg.dir),
+                };
+                if let Some(why) = fail(doing, file, &done) {
                     return Err(why);
                 }
                 if index == 0 {
@@ -2572,6 +2578,9 @@ impl Plain {
     fn manifest_torn(&mut self, ctx: Ctx, slots: [Option<Slot>; 2], at: usize, now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
         let slot = slots[at].expect("read");
         if ctx == Ctx::Open {
+            // Reported once: the next flip writes a generation past it, whose manifest is whole,
+            // so no later open reads this one again.
+            self.torn_stamp = true;
             self.report.lost.push(Lost {
                 file: self.log_file(slot.log),
                 segment: None,

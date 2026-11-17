@@ -28,6 +28,7 @@ use blaze_ids::Hasher;
 use blaze_own::{AVec, Alloc, Vec};
 
 use crate::bytes;
+use crate::eh_out::EhSections;
 use crate::error::ExportError;
 use crate::layout::{FixTo, Laid, Plan};
 use crate::plant::{self, Plant};
@@ -64,6 +65,9 @@ const SG_READ_ONLY: u32 = 0x10;
 /// `S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS`.
 const S_CODE: u32 = 0x8000_0000 | 0x400;
 const S_REGULAR: u32 = 0;
+/// ld64's `__eh_frame` flags: `S_COALESCED | S_ATTR_NO_TOC | S_ATTR_STRIP_STATIC_SYMS |
+/// S_ATTR_LIVE_SUPPORT`.
+const S_EH_FRAME: u32 = 0x6800_000B;
 const S_ZEROFILL: u32 = 0x1;
 const S_NON_LAZY_SYMBOL_POINTERS: u32 = 0x6;
 
@@ -96,7 +100,7 @@ const SECTION: u64 = 80;
 /// Every load command at its largest: the header's room is fixed, so the code's place does not
 /// depend on which optional segments a program has.
 const MAX_COMMANDS: u64 = SEGMENT // __PAGEZERO
-    + SEGMENT + SECTION // __TEXT
+    + SEGMENT + 4 * SECTION // __TEXT: __text, __eh_frame, __gcc_except_tab, __unwind_info
     + SEGMENT + 2 * SECTION // __DATA_CONST
     + SEGMENT + 2 * SECTION // __DATA
     + SEGMENT // __LINKEDIT
@@ -275,10 +279,11 @@ fn linkedit_data(out: &mut AVec<'_, u8>, cmd: u32, off: u64, size: u64) {
 /// Writes `laid` as a Mach-O executable into `out` (its contents replaced): the file, whole,
 /// signed. `identifier` is the signature's; `seed` joins the content in the file's `LC_UUID`
 /// (the profile's digest, or zeros). Returns the UUID.
-pub fn write<'a>(laid: &Laid<'_, '_>, identifier: &str, seed: &[u8; 32], out: &mut AVec<'a, u8>, alloc: Alloc<'a>) -> Result<[u8; 16], ExportError> {
+pub fn write<'a>(laid: &Laid<'_, '_>, eh: &EhSections<'_>, identifier: &str, seed: &[u8; 32], out: &mut AVec<'a, u8>, alloc: Alloc<'a>) -> Result<[u8; 16], ExportError> {
     let has_const = !laid.konst.is_empty();
     let has_data = !laid.data.is_empty() || laid.zero_len > 0;
-    let text_size = up(laid.text_end(), PAGE);
+    // `__TEXT` holds the code and, after it, the unwind tables (eh_out.rs).
+    let text_size = up(eh.end(), PAGE);
     let const_size = up(laid.konst.len() as u64, PAGE);
     let data_file = up(laid.data.len() as u64, PAGE);
     let mut file_end = text_size;
@@ -392,8 +397,11 @@ pub fn write<'a>(laid: &Laid<'_, '_>, identifier: &str, seed: &[u8; 32], out: &m
         ncmds += 1;
         match seg.name {
             "__TEXT" => {
-                segment(out, seg, 1);
+                segment(out, seg, 4);
                 section(out, "__text", "__TEXT", laid.text_at, laid.text.len() as u64, laid.text_at, 4, S_CODE, 0);
+                section(out, "__eh_frame", "__TEXT", eh.eh_frame_at, eh.eh_frame.len() as u64, eh.eh_frame_at, 3, S_EH_FRAME, 0);
+                section(out, "__gcc_except_tab", "__TEXT", eh.except_tab_at, eh.except_tab.len() as u64, eh.except_tab_at, 2, S_REGULAR, 0);
+                section(out, "__unwind_info", "__TEXT", eh.unwind_info_at, eh.unwind_info.len() as u64, eh.unwind_info_at, 2, S_REGULAR, 0);
             }
             "__DATA_CONST" => {
                 let rest_at = laid.got_at + got_size;
@@ -482,6 +490,12 @@ pub fn write<'a>(laid: &Laid<'_, '_>, identifier: &str, seed: &[u8; 32], out: &m
     // The regions at their offsets, the fixups' slots in them.
     out.resize(laid.text_at as usize, 0);
     out.extend_from_slice(&laid.text);
+    out.resize(eh.eh_frame_at as usize, 0);
+    out.extend_from_slice(&eh.eh_frame);
+    out.resize(eh.except_tab_at as usize, 0);
+    out.extend_from_slice(&eh.except_tab);
+    out.resize(eh.unwind_info_at as usize, 0);
+    out.extend_from_slice(&eh.unwind_info);
     out.resize(text_size as usize, 0);
     if has_const {
         out.extend_from_slice(&laid.konst);

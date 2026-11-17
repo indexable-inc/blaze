@@ -173,13 +173,14 @@ impl Records<'static> for Folder {
 }
 
 fn main() {
+    let heap = blaze_own::Heap::process();
     let args: Vec<String> = std::env::args().collect();
     let (Some(root), Some(store)) = (args.get(1).map(PathBuf::from), args.get(2).map(PathBuf::from)) else {
         eprintln!("usage: units <workspace dir> <blaze-fetch store folder> [--tests] [--list]");
         std::process::exit(2);
     };
     let tests = args.iter().any(|a| a == "--tests");
-    let alloc = Alloc::global();
+    let alloc = heap.alloc();
 
     let t0 = Instant::now();
     let bytes = std::fs::read(root.join("Cargo.lock")).unwrap_or_else(|e| panic!("{}: {e}", root.join("Cargo.lock").display()));

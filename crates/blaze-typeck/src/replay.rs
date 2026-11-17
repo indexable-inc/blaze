@@ -136,6 +136,9 @@ fn ask<'w, 'a, W: World>(reads: &mut Reads<'w, 'a, W>, body: &BodyView<'_>, q: Q
         Question::Closure(owner, ordinal) => {
             reads.closure(owner, ordinal)?;
         }
+        Question::Coroutine(owner, ordinal) => {
+            reads.coroutine(owner, ordinal)?;
+        }
         Question::AssocGenerics(trait_, name) => {
             reads.assoc_generics(trait_, name)?;
         }
@@ -211,6 +214,7 @@ mod tests {
             opt_types: &[],
             fmt_uses: &[],
             coroutine: None,
+            super_lets: &[],
         }
     }
 

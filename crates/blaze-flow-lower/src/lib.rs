@@ -29,10 +29,17 @@ use blaze_typeck::{
 };
 
 pub mod sig;
+mod super_let;
 #[cfg(test)]
 mod tests;
 
 pub use sig::{CallableRefusal, Region, SigBuf, SigLife, SigRefusal, read_callable_param, read_signature};
+
+pub mod coroutine;
+#[cfg(test)]
+mod coroutine_tests;
+
+pub use coroutine::{LoweredAsync, interior, lower_async};
 
 /// What the lowering needs to know about an ADT (flow.md section 7, question (e)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +94,21 @@ pub trait Facts {
     fn closure_bodies_checked(&self) -> bool {
         false
     }
+    /// Whether the caller checks each async block's BODY on its own ([`lower_async`]). The
+    /// lowering makes an async block expression the borrows and moves of its captures (as a
+    /// closure's) and does not descend into its body; while nothing checks that body, a body
+    /// holding an async block is refused (`Form::AsyncBlock`), which is what `false` says.
+    fn async_bodies_checked(&self) -> bool {
+        false
+    }
+    /// Whether `ty` (a type of the body's record, `Checked::types`) implements `Future`. An
+    /// `.await`'s operand must: the future it holds is then the operand itself (the library's
+    /// `impl<F: Future> IntoFuture for F`, core/src/future/into_future.rs). `None`: not known,
+    /// and such an `.await` is refused (`Form::AwaitOperand`). A future of this body
+    /// (`PNode::Future`) or a coroutine (`PNode::Coroutine`) is not asked.
+    fn is_future(&self, _ty: PTy) -> Option<bool> {
+        None
+    }
     /// The index of field `name` of `variant`.
     fn field(&self, adt: ItemKey, variant: u32, name: Name) -> Option<u32>;
     /// The number of fields of `variant`.
@@ -102,6 +124,14 @@ pub enum Form {
     AsyncBlock,
     Await,
     Coroutine,
+    /// An `async` closure, or an `.await` inside a closure, within an async block
+    /// (coroutine.rs): its body is no part of the block's flow.
+    AsyncClosure,
+    /// An `.await` whose operand is not known to implement `Future` (`Facts::is_future`): the
+    /// future it holds, `<T as IntoFuture>::IntoFuture`, is not a type of the record.
+    AwaitOperand,
+    /// The table given to `interior` does not hold the record's types at their indices.
+    InteriorTable,
     Union,
     StaticMut,
     StructUpdate,
@@ -142,6 +172,9 @@ pub enum Form {
     Malformed,
     Bound,
     Builder,
+    /// A `super let` form not placed: with an `else` block, or in a block no temporary scope
+    /// holds (super_let.rs).
+    SuperLet,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,6 +346,8 @@ enum Task {
     IndexDone(ExprId, bool),
     FmtDone(ExprId, u32),
     LetInit(StmtId),
+    /// An `.await`, its operand's value on the stack (coroutine.rs `await_done`).
+    AwaitDone(ExprId),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -354,6 +389,15 @@ struct Lower<'b, 'c, F: Facts, A: Allocator + Clone> {
     ret_block: Block,
     stats: Stats,
     plant: Plant,
+    /// The flow's arguments: the body's parameters, or an async block's captures.
+    nargs: u32,
+    /// The async block whose body is lowered (`lower_async`); `None` for a fn body.
+    async_root: Option<ExprId>,
+    /// Per capture by reference of the async block: the pattern, the place `*arg` an
+    /// `Expr::Local` of it reads, and its type.
+    upvar_places: Vec<(PatId, Place, TyD), A>,
+    /// Per suspension, in statement order, its `Expr::Await`.
+    points: Vec<ExprId, A>,
 }
 
 /// Every type walk visits each node at most once per position: bounded by the table's size.
@@ -402,6 +446,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             ret_block: Block(0),
             stats: Stats::default(),
             plant: Plant::None,
+            nargs: n,
+            async_root: None,
+            upvar_places: Vec::new_in(alloc.clone()),
+            points: Vec::new_in(alloc.clone()),
         };
         Ok(l)
     }
@@ -549,7 +597,26 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                         }
                     }
                 }
-                PNode::Closure { .. } | PNode::Future(..) => return self.refuse(Form::TypeNode, e),
+                // An async block of this body is its captures, as a closure is (the Reference,
+                // "Async blocks": "Async blocks capture variables from their environment using
+                // the same capture modes as closures"): one position per capture by
+                // reference, then the captured type's own.
+                PNode::Future(fe, _, _) => {
+                    let ck: &'c Checked<'c> = self.ck;
+                    for (i, x) in ck.captures.column::<0>().iter().enumerate() {
+                        if *x != fe {
+                            continue;
+                        }
+                        if ck.captures.column::<2>()[i] != blaze_typeck::CaptureKind::ByValue {
+                            n += 1;
+                        }
+                        match ck.local_ty.get(ck.captures.column::<1>()[i].ix()) {
+                            Some(&t) => stack.push(t),
+                            None => return self.refuse(Form::Malformed, e),
+                        }
+                    }
+                }
+                PNode::Closure { .. } | PNode::Coroutine { .. } => return self.refuse(Form::TypeNode, e),
                 _ => {}
             }
         }
@@ -579,11 +646,17 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 continue;
             }
             let p = ck.captures.column::<1>()[i];
-            let l = match self.pat_local.get(p.ix()) {
-                Some(&l) if l != u32::MAX => Local(l),
-                _ => return self.refuse(Form::UnknownLocal, e),
+            // In an async block's body, a variable the block captures by reference is `*arg`.
+            let (pl, lt) = match self.upvar_place(p) {
+                Some(at) => at,
+                None => {
+                    let l = match self.pat_local.get(p.ix()) {
+                        Some(&l) if l != u32::MAX => Local(l),
+                        _ => return self.refuse(Form::UnknownLocal, e),
+                    };
+                    (self.place_of(l), self.local_ty[l.0 as usize])
+                }
             };
-            let (pl, lt) = (self.place_of(l), self.local_ty[l.0 as usize]);
             let (src, st) = match ck.captures.column::<2>()[i] {
                 blaze_typeck::CaptureKind::ByValue => (pl, lt),
                 kind => {
@@ -692,6 +765,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                     stack.extend_from_slice(self.list(l, e)?);
                 }
                 PNode::Param(_) | PNode::Alias { .. } | PNode::Opaque(..) | PNode::Dynamic(_) => return Ok(true),
+                // A future holds its captures and its saved values: dropping it may run code.
+                PNode::Future(..) | PNode::Coroutine { .. } => return Ok(true),
                 _ => {}
             }
         }
@@ -1029,7 +1104,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         };
         for i in (vfrom..self.vars.len()).rev() {
             let l = self.vars[i];
-            if l.0 > self.body.params.len() as u32 {
+            if l.0 > self.nargs {
                 self.drop_local(l, e)?;
             } else {
                 let t = self.local_ty[l.0 as usize];
@@ -1579,6 +1654,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             Task::FieldDone(e) => self.field_done(e),
             Task::IndexDone(e, m) => self.index_done(e, m),
             Task::LetInit(s) => self.let_init(s),
+            Task::AwaitDone(e) => self.await_done(e),
         }
     }
 
@@ -1619,6 +1695,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         match self.expr(e)? {
             Expr::Missing => return self.refuse(Form::Missing, e),
             Expr::Lit(_) | Expr::OffsetOf { .. } | Expr::ConstBlock { .. } => self.vals.push(Val { at: At::Const, ty }),
+            Expr::Local(p) if self.upvar_place(p).is_some() => {
+                let Some((pl, lt)) = self.upvar_place(p) else {
+                    return self.refuse(Form::UnknownLocal, e);
+                };
+                self.push_place(pl, lt);
+            }
             Expr::Local(p) => match self.pat_local.get(p.ix()) {
                 Some(&l) if l != u32::MAX => {
                     let pl = self.place_of(Local(l));
@@ -1820,6 +1902,26 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 self.tasks.push(Task::Eval(rhs, false));
                 self.tasks.push(Task::Eval(lhs, true));
             }
+            // The Reference, "Constant promotion": a borrow the checker promoted
+            // (`Checked::promoted`) is of a `'static` slot: no loan of the body's, and the
+            // operand's code does not run here (the builder reads the evaluator's value).
+            Expr::Ref { mutbl: Mutbl::Not, .. } if self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok() => {
+                let ty = TyD::of(self.expr_ty(e)?);
+                let t = self.temp(ty, e)?;
+                let tp = self.place_of(t);
+                self.b.assign(tp, Operand::Const, self.span(e));
+                self.push_place(tp, ty);
+            }
+            // The Reference, "Constant promotion": a borrow the checker promoted
+            // (`Checked::promoted`) is of a `'static` slot: no loan of the body's, and the
+            // operand's code does not run here (the builder reads the evaluator's value).
+            Expr::Ref { mutbl: Mutbl::Not, .. } if self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok() => {
+                let ty = TyD::of(self.expr_ty(e)?);
+                let t = self.temp(ty, e)?;
+                let tp = self.place_of(t);
+                self.b.assign(tp, Operand::Const, self.span(e));
+                self.push_place(tp, ty);
+            }
             Expr::Ref { mutbl, operand } => {
                 self.tasks.push(Task::RefDone(e, mutbl));
                 self.tasks.push(Task::Eval(operand, mutbl == Mutbl::Mut));
@@ -1866,8 +1968,23 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 }
                 self.closure_value(e)?;
             }
-            Expr::AsyncBlock { .. } => return self.refuse(Form::AsyncBlock, e),
-            Expr::Await(_) => return self.refuse(Form::Await, e),
+            // An async block is the aggregate of its captures, as a closure is (closure_value);
+            // its body is checked on its own (`lower_async`), or the block is refused.
+            Expr::AsyncBlock { .. } => {
+                if !self.facts.async_bodies_checked() {
+                    return self.refuse(Form::AsyncBlock, e);
+                }
+                self.closure_value(e)?;
+            }
+            // `.await` only inside the body `lower_async` lowers (the Reference, "Await
+            // expressions": "only allowed within an async context").
+            Expr::Await(op) => {
+                if self.async_root.is_none() {
+                    return self.refuse(Form::Await, e);
+                }
+                self.tasks.push(Task::AwaitDone(e));
+                self.tasks.push(Task::Eval(op, false));
+            }
             Expr::Underscore => return self.refuse(Form::Malformed, e),
             Expr::FormatArgs { args, .. } => {
                 let es = match body.expr_lists.get(args.range()) {
@@ -2616,6 +2733,16 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
     /// binding mode: 0 move, 1 `ref`, 2 `ref mut`), the checker's peeling rule repeated (a
     /// non-reference pattern derefs a reference place and makes the mode by-reference).
     fn bind_pattern(&mut self, p: PatId, v: Val) -> Result<(), Refusal> {
+        self.bind_pattern_from(p, v, None)
+    }
+
+    /// [`Self::bind_pattern`], where `from` is the span of the expression the value came from
+    /// (a `let`'s initializer). A by-value binding of the WHOLE pattern reads that place there,
+    /// so its move or copy, and any finding about it, is at the initializer: `let c = a;` uses
+    /// `a` at `a` (the Reference, "Moved and copied types"), not at `c`. A binding inside the
+    /// pattern keeps its own span.
+    fn bind_pattern_from(&mut self, p: PatId, v: Val, from: Option<Span>) -> Result<(), Refusal> {
+        let whole = p;
         let root = self.body.root;
         let place = self.as_place(v, root)?;
         let mut stack: Vec<(PatId, Place, TyD, u8), A> = Vec::new_in(self.alloc.clone());
@@ -2675,7 +2802,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                                 return self.refuse_pat(Form::BindingMode, p);
                             }
                             let op = self.operand(Val { at: At::Place(place), ty }, root)?;
-                            self.b.assign(lp, op, self.pat_span(p));
+                            let at = match from {
+                                Some(s) if p == whole => s,
+                                _ => self.pat_span(p),
+                            };
+                            self.b.assign(lp, op, at);
                             self.relate(place, lp, lt, root)?;
                         }
                         Some(m) => {
@@ -2906,8 +3037,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
     }
 
     fn let_init(&mut self, s: StmtId) -> Result<(), Refusal> {
-        let (pat, else_) = match self.body.stmts.get(s.ix()) {
-            Some(TStmt::Let { pat, else_, .. }) => (*pat, *else_),
+        let (pat, init, else_) = match self.body.stmts.get(s.ix()) {
+            Some(TStmt::Let { pat, init, else_, .. }) => (*pat, *init, *else_),
             _ => return self.refuse(Form::Malformed, self.body.root),
         };
         let root = self.body.root;
@@ -2925,7 +3056,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 self.tasks.push(Task::Discard);
                 self.tasks.push(Task::Eval(x, false));
             }
-            None => self.bind_pattern(pat, v)?,
+            None => {
+                let from = init.map(|i| self.span(i));
+                self.bind_pattern_from(pat, v, from)?
+            }
         }
         Ok(())
     }

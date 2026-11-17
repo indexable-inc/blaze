@@ -886,6 +886,10 @@ enum PlacedFile {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PlacePlant {
     None,
+    /// A failure that would stop the store is dropped ([`Store::fail`] does nothing): the
+    /// store goes on as if the write had landed, and its caller never hears of it
+    /// (`tests::collect::the_oracle_catches_a_failed_flush_swallowed`).
+    SwallowsFailure,
     /// A key a place let go of whose value is a file of its own is asked to be forgotten
     /// ([`Store::forget`]) as the path is placed from another value, as before 2026-11-14:
     /// the value a unit record names is gone after another request placed over it
@@ -8359,6 +8363,10 @@ impl Store {
     /// The store broken, naming `file` and `what` went wrong (the first break is kept). Places
     /// held for the open's look through `placed/` are refused with it: the look never ends now.
     fn fail(&mut self, file: FileName, what: impl Into<String>) {
+        #[cfg(test)]
+        if self.plant == PlacePlant::SwallowsFailure {
+            return;
+        }
         self.broken.get_or_insert(Broken { file, what: what.into() });
         self.look_wait_over();
         for ask in std::mem::take(&mut self.held_asks) {

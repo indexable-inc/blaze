@@ -216,6 +216,10 @@ unsafe extern "C" {
     /// YAML, borrowed from the sink until `LLVMBlazeRemarksDispose`.
     pub fn LLVMBlazeRemarksEnd(context: ContextRef, sink: RemarkSinkRef, data: *mut *const c_char, length: *mut usize);
     pub fn LLVMBlazeRemarksDispose(sink: RemarkSinkRef);
+    /// LLVM's own `default<O{level}>` (level 1 to 3) for `machine`, as `opt
+    /// -print-pipeline-passes` prints it; null for another level or a null machine. Owned by the
+    /// caller: freed with `LLVMDisposeMessage`.
+    pub fn LLVMBlazeDefaultPipeline(machine: TargetMachineRef, level: c_uint, slp_vectorization: c_int) -> *mut c_char;
 }
 
 /// The bytes of a remark string, borrowed from the entry it came from.

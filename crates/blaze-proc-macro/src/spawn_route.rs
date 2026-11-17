@@ -121,8 +121,8 @@ pub(crate) fn child_env(script_env: &[(String, String)], d: &Decoded) -> Vec<(St
     env
 }
 
-/// Which answerer takes a spawn ([`route`]).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Which answerer takes a spawn ([`route`]). (No derives: `Fact` is W5's, whose derives this
+/// file does not assume.)
 pub(crate) enum Route<'s> {
     /// `rustc`: the probe table.
     Rustc,
@@ -334,7 +334,7 @@ impl ScriptSandbox {
         };
         let answer = match facts::answer(fact, &pins, alloc) {
             Ok(answer) => answer,
-            Err(why) => return Err(self.refuse(Refusal::Spawn(refused(format!("{why:?}"))))),
+            Err(why) => return Err(self.refuse(Refusal::Spawn(refused(why.to_string())))),
         };
         let subject = facts::subject(fact, alloc);
         let digest = reply_digest(answer.code, answer.stdout.as_bytes(), answer.stderr.as_bytes());
@@ -357,7 +357,7 @@ impl ScriptSandbox {
             return Err(self.refuse(no_sandbox(NoSandbox::ToolNotPinned)));
         };
         let personality = if script.host.ends_with("-apple-darwin") { Personality::Xnu } else { Personality::Linux };
-        let userland = match (setting.userland, personality) {
+        let userland = match (setting.userland, &personality) {
             (Some(userland), _) => userland,
             (None, Personality::Xnu) => return Err(self.refuse(no_sandbox(NoSandbox::NoAppleUserland))),
             (None, Personality::Linux) => {
@@ -413,7 +413,7 @@ impl ScriptSandbox {
             Err(why) => return Err(self.refuse(Refusal::Spawn(SpawnRefusal::Executor(format!("`{program}`: its spawn request is refused: {why:?}"))))),
         };
         let key = request.key(alloc);
-        let answered = executor.answer(&request, &SpawnFiles { tree, sandbox: self, out_dir }, alloc);
+        let answered = executor.answer(&request, &SpawnFiles { tree, sandbox: &*self, out_dir }, alloc);
         let answer: SpawnAnswer<'_> = match answered {
             Ok(answer) => answer,
             Err(SpawnRefused::NoSandbox { why, .. }) => return Err(self.refuse(no_sandbox(why))),

@@ -121,6 +121,11 @@ impl Memory for Sim {
         Ok(at)
     }
 
+    /// The model has one range: hot code is laid out after the rest, as it comes.
+    fn reserve_hot(&mut self, len: usize, align: usize) -> Result<u64, RunModeError> {
+        self.reserve(len, align)
+    }
+
     fn carry(&mut self, step: Step, placing: &Placing<'_>) -> Result<(), RunModeError> {
         let slot = placing.slot;
         self.grow(slot);
@@ -166,6 +171,7 @@ fn carry(
         match act {
             Act::Stub { slot } => memory.stub(slot).expect("a stub"),
             Act::Place { slot, record } => mode.place(slot, record, source, memory, plant, acts).expect("the record places"),
+            Act::Promote { slot, record } => mode.promote(slot, record, source, memory, plant).expect("the record promotes"),
             Act::Wake { thread, slot } => woken.push((thread, slot, memory.stored.get(slot.index()).copied().unwrap_or(false))),
             Act::Stop(stop) => panic!("the run stopped: {stop:?}"),
         }

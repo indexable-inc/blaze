@@ -9,7 +9,6 @@
 use std::fmt::Write as _;
 
 use blaze_file_items::{Assembled, Bodies, Outline, outline, outline_item, outline_with, split_top_level};
-use blaze_own::Alloc;
 use blaze_format::Aligned;
 use blaze_surface::{
     AttrKind, ContentId, Edition, FileItemsView, Item, ItemDetail, ItemIndex, Range, Rename,
@@ -18,7 +17,7 @@ use blaze_surface::{
 use blaze_sim::{Broke, Config, Tape};
 
 fn parse(text: &str) -> Outline<'static> {
-    outline(text, Edition::E2024, Alloc::global())
+    outline(text, Edition::E2024, blaze_own::testing::heap().alloc())
 }
 
 /// The first entry in source order whose name is `name`.
@@ -476,7 +475,7 @@ fn an_outline_is_a_function_of_the_text() {
 fn record_answers_as_outline(text: &str) -> Result<(), Broke> {
     let made = parse(text);
     let broke = |what: &str| Broke::Oracle(format!("{what}:\n{text}"));
-    let bytes = made.to_file_items(text, ContentId([7; 32]), Alloc::global()).map_err(|error| broke(&error.to_string()))?;
+    let bytes = made.to_file_items(text, ContentId([7; 32]), blaze_own::testing::heap().alloc()).map_err(|error| broke(&error.to_string()))?;
     let buffer = Aligned::copy_from(&bytes);
     let view = FileItemsView::read(&buffer).map_err(|error| broke(&error.to_string()))?;
     let entries = view.file() == ContentId([7; 32])
@@ -540,7 +539,7 @@ fn n() { let r#unsafe = 1; let unsafe_code = r#\"unsafe\"#; }
     for bodies in [None, Some(Bodies::Skipped), Some(Bodies::Parsed)] {
         let made = match bodies {
             None => parse(TEXT),
-            Some(bodies) => outline_with(TEXT, Edition::E2024, bodies, Alloc::global()),
+            Some(bodies) => outline_with(TEXT, Edition::E2024, bodies, blaze_own::testing::heap().alloc()),
         };
         for (name, flags) in want {
             assert_eq!(named(&made, TEXT, name).1.flags, flags, "{name}'s flags, outlined by {bodies:?}");
@@ -551,7 +550,7 @@ fn n() { let r#unsafe = 1; let unsafe_code = r#\"unsafe\"#; }
         assert_eq!(made.flags(), F::UNSAFE | F::FOREIGN | F::ASM | F::MACRO_CALL);
     }
     let made = parse(TEXT);
-    let bytes = made.to_file_items(TEXT, ContentId([7; 32]), Alloc::global()).expect("the outline's record");
+    let bytes = made.to_file_items(TEXT, ContentId([7; 32]), blaze_own::testing::heap().alloc()).expect("the outline's record");
     let buffer = Aligned::copy_from(&bytes);
     let view = FileItemsView::read(&buffer).expect("a record just written");
     let flagged: Vec<_> = view.flagged().map(|(at, flags)| (view.item(at).expect("an entry").name.to_owned(), flags)).collect();
@@ -567,8 +566,8 @@ fn n() { let r#unsafe = 1; let unsafe_code = r#\"unsafe\"#; }
 /// Whether the outline that skips bodies equals the one that parses them, apart from the
 /// syntax errors the parse of a skipped body finds, which are not the skipping outline's.
 fn skipping_equals_parsing(what: &str, text: &str) -> Result<(), String> {
-    let skipped = outline_with(text, Edition::E2024, Bodies::Skipped, Alloc::global());
-    let parsed = outline_with(text, Edition::E2024, Bodies::Parsed, Alloc::global());
+    let skipped = outline_with(text, Edition::E2024, Bodies::Skipped, blaze_own::testing::heap().alloc());
+    let parsed = outline_with(text, Edition::E2024, Bodies::Parsed, blaze_own::testing::heap().alloc());
     let first = |ours: &[Item], theirs: &[Item]| ours.iter().zip(theirs).position(|(a, b)| a != b);
     if skipped.items() != parsed.items() {
         let at = first(skipped.items(), parsed.items());
@@ -641,8 +640,8 @@ fn skipping_bodies_outlines_as_parsing_them() {
 /// from the deepest entry up, sharing no code with the crate's.
 fn digests_are_the_definition(what: &str, text: &str) -> Result<(), String> {
     use blaze_file_items::{OneByOne, SideBySide, outline_hashed_by};
-    let side = outline_hashed_by::<SideBySide>(text, Edition::E2024, Bodies::Skipped, Alloc::global());
-    let one = outline_hashed_by::<OneByOne>(text, Edition::E2024, Bodies::Skipped, Alloc::global());
+    let side = outline_hashed_by::<SideBySide>(text, Edition::E2024, Bodies::Skipped, blaze_own::testing::heap().alloc());
+    let one = outline_hashed_by::<OneByOne>(text, Edition::E2024, Bodies::Skipped, blaze_own::testing::heap().alloc());
     if side != one {
         return Err(format!("{what}: the digests side by side are not those one by one"));
     }
@@ -692,7 +691,7 @@ fn digests_are_the_definition(what: &str, text: &str) -> Result<(), String> {
             return Err(format!("{what}: entry {at}'s digests are not the definition's"));
         }
     }
-    let parts = split_top_level(text, Alloc::global());
+    let parts = split_top_level(text, blaze_own::testing::heap().alloc());
     let mut digests = vec![ContentId([0; 32]); parts.len()];
     blaze_file_items::part_digests::<SideBySide>(bytes, &parts, &mut digests);
     if !parts.iter().zip(&digests).all(|(range, digest)| blaze_file_items::part_digest(&bytes[range.to_usize()]) == *digest) {
@@ -705,7 +704,7 @@ fn digests_are_the_definition(what: &str, text: &str) -> Result<(), String> {
 /// the file's one outline), and the parts each outlined alone and put together by `Assembled`,
 /// equal the walk of the whole file, and the parts cover the file in order.
 fn parts_equal_whole(what: &str, text: &str) -> Result<usize, String> {
-    let parts = split_top_level(text, Alloc::global());
+    let parts = split_top_level(text, blaze_own::testing::heap().alloc());
     let mut from = 0;
     for part in parts.iter() {
         if part.start != from || part.end < part.start {
@@ -716,8 +715,8 @@ fn parts_equal_whole(what: &str, text: &str) -> Result<usize, String> {
     if usize::try_from(from).expect("a small file") != text.len() {
         return Err(format!("{what}: the parts end at {from}, the file at {}", text.len()));
     }
-    let whole = outline_with(text, Edition::E2024, Bodies::Skipped, Alloc::global());
-    let assembled = outline(text, Edition::E2024, Alloc::global());
+    let whole = outline_with(text, Edition::E2024, Bodies::Skipped, blaze_own::testing::heap().alloc());
+    let assembled = outline(text, Edition::E2024, blaze_own::testing::heap().alloc());
     if whole != assembled {
         let at = whole.items().iter().zip(assembled.items()).position(|(a, b)| a != b);
         return Err(format!(
@@ -733,9 +732,9 @@ fn parts_equal_whole(what: &str, text: &str) -> Result<usize, String> {
     }
     // The incremental path: each part outlined alone, put together by `Assembled`.
     let alone: Vec<Outline<'static>> =
-        parts.iter().map(|part| outline_item(&text[part.to_usize()], Edition::E2024, Alloc::global())).collect();
-    let put = Assembled::new(parts.iter().zip(&alone).map(|(part, it)| (part.start, it)), Alloc::global())
-        .to_outline(Alloc::global());
+        parts.iter().map(|part| outline_item(&text[part.to_usize()], Edition::E2024, blaze_own::testing::heap().alloc())).collect();
+    let put = Assembled::new(parts.iter().zip(&alone).map(|(part, it)| (part.start, it)), blaze_own::testing::heap().alloc())
+        .to_outline(blaze_own::testing::heap().alloc());
     if put != whole {
         return Err(format!("{what}: {} parts outlined alone and assembled are not the whole file's outline", parts.len()));
     }

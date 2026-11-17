@@ -14,8 +14,9 @@ use core::panic::Location;
 use std::cell::Cell;
 
 use super::{
-    DATE_TO_FILL, File, KEEP, KeptError, KeptFailed, LineProblem, Order, PRIMITIVES, Replayed,
-    Test, Why, all_known, kept_then_search, paths, unknown, write_line, write_line_with,
+    DATE_TO_FILL, File, KEEP, KeptError, KeptFailed, KeptRefusal, LineProblem, Order, PRIMITIVES,
+    Replayed, Test, Versions, Why, all_known, kept_then_search, kept_then_search_with, paths,
+    unknown, write_line, write_line_with,
 };
 use crate::check::{report_here, search, with_test_name};
 use crate::search::{Broke, Config, Verdict};
@@ -281,33 +282,55 @@ fn a_malformed_line_and_a_line_for_no_test_are_refused_naming_the_line() {
     println!("refused: line 4 (not a version), line 3 (gone::test)");
 }
 
-/// (e) A line kept under the other primitives version is still replayed: when it passes it is
-/// counted as such, and when it fails the failure says "kept under primitives v<other>".
+/// (e) A line kept under the other primitives version is refused by name, never replayed and
+/// never a failure, even when its tape fails the body: `check_kept`'s work passes with one
+/// refusal, and `all_known` prints the same refusal without failing. The planted bug, "replay
+/// anyway" (`Versions::All`), runs the tape on case 1 and fails: the test catches it.
 ///
-/// Prints: `replayed under v<this>: kept under primitives v<other>, case 1`
+/// Prints (feature `edge-first` off; with it on, v1 and v2 swap):
+/// `blaze-sim: line 1 of `blaze-sim`'s sim-kept.tapes kept under v2, not replayed by this v1 build: the search re-finds it`
+/// (twice: from the replay and from `all_known`), then
+/// `other primitives: 1 refused, 0 replayed; replayed anyway: case 1`
 #[test]
-fn a_line_of_the_other_primitives_version_is_replayed_and_said() {
+fn a_line_of_the_other_primitives_version_is_refused_not_replayed() {
     let other = if PRIMITIVES == 1 { 2 } else { 1 };
     let test = this_test();
-    let passes = File::new(leaked(format!("{test} v{other} 5  # passes now\n")), KRATE);
-    let (calls, first_failed) = (Cell::new(0u32), Cell::new(None));
-    let got =
-        kept_then_search(Config::cases(8), passes, keyed(&calls, &first_failed), Order::KeptFirst);
-    assert_eq!(got, Ok(Replayed { kept: 1, other_version: 1 }));
+    let file = File::new(leaked(format!("{test} v{other} {KEY}  # the key, other draws\n")), KRATE);
 
-    let fails = File::new(leaked(format!("{test} v{other} {KEY}  # the key\n")), KRATE);
     let (calls, first_failed) = (Cell::new(0u32), Cell::new(None));
     let got =
-        kept_then_search(Config::cases(8), fails, keyed(&calls, &first_failed), Order::KeptFirst);
-    let Err(failed @ KeptFailed::Replay(replay)) = &got else {
-        panic!("the kept line of v{other} was not replayed: {got:?}");
+        kept_then_search(Config::cases(8), file, keyed(&calls, &first_failed), Order::KeptFirst);
+    assert_eq!(got, Ok(Replayed { kept: 0, refused: 1 }), "refused, not replayed, not failed");
+    assert_eq!(first_failed.get(), None, "the other version's tape never ran");
+    let Some(Ok(line)) = file.lines().next() else {
+        panic!("the file's one line did not parse");
+    };
+    let refusal = KeptRefusal::of(file, &line);
+    assert_eq!(
+        refusal,
+        Some(KeptRefusal::OtherPrimitives { krate: KRATE, line: 1, kept: other, build: PRIMITIVES })
+    );
+    let said = refusal.map(|refusal| refusal.to_string()).unwrap_or_default();
+    let expected = format!(
+        "blaze-sim: line 1 of `blaze-sim`'s sim-kept.tapes kept under v{other}, not replayed by this v{PRIMITIVES} build: the search re-finds it"
+    );
+    assert_eq!(said, expected);
+    all_known(file, &[test.as_str()]);
+
+    let (calls, first_failed) = (Cell::new(0u32), Cell::new(None));
+    let planted = kept_then_search_with(
+        Config::cases(8),
+        file,
+        keyed(&calls, &first_failed),
+        Order::KeptFirst,
+        Versions::All,
+    );
+    let Err(KeptFailed::Replay(replay)) = &planted else {
+        panic!("replayed anyway, the key's tape did not fail: {planted:?}");
     };
     assert_eq!((replay.case, replay.line.version), (1, other));
-    let message = said(failed);
-    let under = format!("kept under primitives v{other}");
-    assert!(message.contains(&under), "{message}");
-    assert_eq!(first_failed.get(), Some(1));
-    println!("replayed under v{PRIMITIVES}: {under}, case {}", replay.case);
+    assert_eq!(first_failed.get(), Some(1), "replayed anyway: the other version's tape ran first");
+    println!("other primitives: 1 refused, 0 replayed; replayed anyway: case {}", replay.case);
 }
 
 /// The crate's own `sim-kept.tapes` is compiled in by `sim_kept!`, named by the crate, and every

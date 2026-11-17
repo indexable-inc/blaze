@@ -249,6 +249,12 @@ impl Sim {
             Down::Declare { pairs } => Got::Declare(pairs.iter().collect()),
             Down::Publish { slot, record, .. } => Got::Publish(SlotId(slot.0), CodeRef(record.0)),
             Down::Failed { need, why } => Got::Failed(need, why == Failure::Unresolved),
+            Down::Personality { slot } => {
+                return Err(Broke::Oracle(format!(
+                    "the parent sent `Personality` naming slot {}: this simulation's parent never binds a personality routine",
+                    slot.0
+                )));
+            }
         };
         drop(self.down.drain(..took));
         match got {

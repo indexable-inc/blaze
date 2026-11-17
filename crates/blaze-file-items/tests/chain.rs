@@ -8,7 +8,6 @@
 
 use blaze_file_items::{CHAIN_DOMAIN, Outline, chain_at, head_of, item_chain, outline};
 use blaze_ids::{ContentId, Hasher};
-use blaze_own::Alloc;
 use blaze_surface::{Edition, Item, ItemIndex, ItemKind};
 
 /// Two impls with a member of one name, two `use` items (no name: told apart by their heads),
@@ -50,7 +49,7 @@ fn chains(outline: &Outline<'_>, text: &str) -> Vec<(ItemKind, String, ContentId
 
 #[test]
 fn every_entry_has_its_own_chain_and_an_edit_elsewhere_moves_none() {
-    let made = outline(TEXT, Edition::E2024, Alloc::global());
+    let made = outline(TEXT, Edition::E2024, blaze_own::testing::heap().alloc());
     let now = chains(&made, TEXT);
     // Two `use`, two structs, two impls, their two members and the free fn.
     assert_eq!(now.len(), 9, "the entries of the text: {now:?}");
@@ -64,7 +63,7 @@ fn every_entry_has_its_own_chain_and_an_edit_elsewhere_moves_none() {
     // An edit elsewhere: a comment above everything and another body for the free fn. Every
     // entry keeps its chain (a chain holds no position and no body).
     let edited = format!("// a line above\n\n{}", TEXT.replace("    3\n", "    30 + 3\n"));
-    let made_edited = outline(&edited, Edition::E2024, Alloc::global());
+    let made_edited = outline(&edited, Edition::E2024, blaze_own::testing::heap().alloc());
     let later = chains(&made_edited, &edited);
     assert_eq!(now, later, "an edit to a comment and to one body moved a chain");
 

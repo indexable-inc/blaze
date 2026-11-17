@@ -28,7 +28,7 @@ testing = ["blaze-own/std"]
 
 [dev-dependencies]
 # `Alloc::global()`, which the tests and the cost example hand down.
-blaze-own = { workspace = true, features = ["std"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
 # `check`, `control`: the prefilter's property and its planted-bug control.
 blaze-sim.workspace = true
 

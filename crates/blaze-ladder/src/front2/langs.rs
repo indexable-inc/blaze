@@ -12,7 +12,7 @@ use super::index::Index;
 use crate::resolve::{Kind, Ns};
 
 /// The lang items that are traits: what `TraitDef::lang` may be.
-pub const TRAITS: [LangItem; 48] = [
+pub const TRAITS: [LangItem; 49] = [
     LangItem::Sized,
     LangItem::MetaSized,
     LangItem::PointeeSized,
@@ -61,6 +61,7 @@ pub const TRAITS: [LangItem; 48] = [
     LangItem::Pointee,
     LangItem::DiscriminantKind,
     LangItem::Future,
+    LangItem::Freeze,
 ];
 
 /// The trait lang item `#[lang = "name"]` declares, if `name` is one.
@@ -215,6 +216,13 @@ pub fn mark(item: LangItem) -> Mark {
         LangItem::PollReady => "Ready",
         LangItem::PollPending => "Pending",
         LangItem::FutureOutput => "future_output",
+        LangItem::Freeze => "freeze",
+        LangItem::AsyncFn => "async_fn",
+        LangItem::AsyncFnMut => "async_fn_mut",
+        LangItem::AsyncFnOnce => "async_fn_once",
+        LangItem::AsyncFnOnceOutput => "async_fn_once_output",
+        LangItem::CallOnceFuture => "call_once_future",
+        LangItem::CallRefFuture => "call_ref_future",
         // `IntoFuture` the trait has no `#[lang]`; its fn is `into_future`.
         LangItem::Send => return Mark::CorePath(&["marker", "Send"]),
         LangItem::IntoFuture => return Mark::CorePath(&["future", "IntoFuture"]),
@@ -233,7 +241,7 @@ pub fn mark(item: LangItem) -> Mark {
 /// Every [`LangItem`] in declaration order, for the test that each has an answer in the pinned
 /// library (tests/front2_bounds.rs, which checks this list's length against
 /// `core::mem::variant_count::<LangItem>()` and its order, so a new variant cannot be left out).
-pub const ALL: [LangItem; 91] = {
+pub const ALL: [LangItem; 98] = {
     use LangItem::*;
     [
         Sized, Copy, Deref, DerefMut, Add, Sub, Mul, Div, Rem, BitAnd, BitOr, BitXor, Shl, Shr, AddAssign, SubAssign, MulAssign, DivAssign, RemAssign, BitAndAssign, BitOrAssign,
@@ -242,5 +250,7 @@ pub const ALL: [LangItem; 91] = {
         IntoFuture, FormatArguments, FmtDisplay, FmtDebug, FmtLowerHex, FmtUpperHex, FmtOctal, FmtBinary, FmtLowerExp, FmtUpperExp, FmtPointer, PanicBoundsCheck, IntoIterIntoIter,
         IteratorNext, OptionSome, OptionNone, TryTraitBranch, TryTraitFromResidual, ControlFlowContinue, ControlFlowBreak, Range, RangeFrom, RangeTo, RangeFull, RangeInclusiveNew,
         RangeToInclusive, IntoFutureIntoFuture, FuturePoll, PinNewUnchecked, GetContext, PollReady, PollPending, FutureOutput, TryTraitFromOutput,
+        Freeze,
+        AsyncFn, AsyncFnMut, AsyncFnOnce, AsyncFnOnceOutput, CallOnceFuture, CallRefFuture,
     ]
 };

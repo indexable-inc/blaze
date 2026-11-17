@@ -186,7 +186,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     }
 
     /// The direct child expressions of `x` into `exprs`, and the patterns it binds into `pats`.
-    fn expr_children(&self, x: ExprId, exprs: &mut Vec<ExprId, Alloc<'a>>, pats: &mut Vec<PatId, Alloc<'a>>) -> Result<(), Stop> {
+    pub(crate) fn expr_children(&self, x: ExprId, exprs: &mut Vec<ExprId, Alloc<'a>>, pats: &mut Vec<PatId, Alloc<'a>>) -> Result<(), Stop> {
         let b = self.body;
         match b.expr(x)? {
             Expr::Missing

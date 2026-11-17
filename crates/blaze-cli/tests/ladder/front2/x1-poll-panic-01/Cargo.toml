@@ -1,0 +1,12 @@
+[package]
+name = "ladder-x1-poll-panic-01"
+version = "0.1.0"
+edition = "2024"
+
+# The rung is about unwinding out of a poll: both profiles say so (tempo's own release profile
+# sets `panic = "unwind"`, Cargo.toml line 117; the dev profile's default is unwind too).
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"

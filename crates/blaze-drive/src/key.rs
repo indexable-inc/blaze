@@ -93,6 +93,14 @@ impl Kind {
         Kind::ALL.get(usize::from(byte).checked_sub(1)?).copied()
     }
 
+    /// Whether a batch of this kind is one home's ready tasks, whole, rather than sized by time:
+    /// a runner sets up once per home and batch (a body check builds its file's front-end
+    /// reader once for all the file's bodies), so a batch cut by the per-task mean (which
+    /// includes that setup) would pay the setup once a task.
+    pub const fn batches_by_home(self) -> bool {
+        matches!(self, Kind::BodyCheck)
+    }
+
     /// Its index in [`Kind::ALL`].
     pub fn index(self) -> usize {
         self as usize - 1

@@ -1,0 +1,6 @@
+status 42
+stdout
+poll 1: pending, log 0
+poll 2: panicked with "boom in poll", log 7
+poll 3: panicked with "`async fn` resumed after panicking", log 7
+dropped: log 7

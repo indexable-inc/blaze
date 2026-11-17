@@ -479,7 +479,7 @@ impl<'b> AtomsBuilder<'b> {
 
 #[cfg(test)]
 mod tests {
-    use blaze_own::{AVec, Alloc, Vec};
+    use blaze_own::{AVec, Vec};
     use blaze_sim::{Broke, Config, Tape};
 
     use super::{AtomPlant, Atoms, AtomsBuilder, AtomsError, Built};
@@ -520,7 +520,7 @@ mod tests {
     /// The table and rows of `tokens`, interned from the last to the first when `backward`,
     /// the rows in the stream's own order.
     fn written(tokens: &[(TokenKind, &'static str)], backward: bool, seed: u64, plant: AtomPlant) -> Result<(Built<'static>, AVec<'static, u8>), Broke> {
-        let alloc = Alloc::global();
+        let alloc = blaze_own::testing::heap().alloc();
         let mut builder = AtomsBuilder::planted(alloc, seed, plant);
         let mut interned: AVec<'static, u32> = Vec::new_in(alloc);
         interned.resize(tokens.len(), 0);
@@ -538,7 +538,7 @@ mod tests {
     /// A random stream's rows read back are the stream, and its table's bytes do not depend on
     /// the order its atoms were interned in or on the hash's seed.
     fn rows_read_back(tape: &Tape, plant: AtomPlant) -> Result<(), Broke> {
-        let alloc = Alloc::global();
+        let alloc = blaze_own::testing::heap().alloc();
         let ctx = Ctx::root(Edition::E2021);
         let count = usize::try_from(tape.below(40, "tokens")).map_err(|_| harness("a count past the machine's word"))?;
         let mut tokens: AVec<'static, (TokenKind, &'static str)> = Vec::new_in(alloc);
@@ -576,7 +576,7 @@ mod tests {
     /// A table cut, or changed in one field, is refused by name; a row past the table too.
     #[test]
     fn a_wrong_table_is_refused_by_name() {
-        let alloc = Alloc::global();
+        let alloc = blaze_own::testing::heap().alloc();
         let mut builder = AtomsBuilder::new_in(alloc, 7);
         let a = builder.intern(TokenKind::Ident { raw: Raw::No, spacing: Spacing::Alone }, "caf\u{e9}").expect("interned");
         let b = builder.intern(TokenKind::Punct { char: '+', spacing: Spacing::Joint }, "").expect("interned");

@@ -323,7 +323,35 @@ impl Store for DirStore {
     type Error = FilesError;
 
     fn get(&self, kind: Kind, key: &ContentId) -> Result<Option<Self::Held>, FilesError> {
-        let name = Self::name(kind, key);
+        self.get_at(Self::name(kind, key))
+    }
+
+    fn put(&self, kind: Kind, key: ContentId, bytes: &[u8]) -> Result<(), FilesError> {
+        self.put_at(Self::name(kind, &key), bytes)
+    }
+
+    fn bytes(held: &Self::Held) -> &[u8] {
+        held
+    }
+
+    fn tally(&self) -> &Tally {
+        &self.tally
+    }
+}
+
+impl DirStore {
+    /// A spawn's answer record (`spawn_records::Recorded`): `spawn/<64 hex of the request key>`.
+    pub(crate) fn get_spawn(&self, key: &ContentId) -> Result<Option<Vec<u8>>, FilesError> {
+        self.get_at(Self::named(b"spawn/", key))
+    }
+
+    /// Keeps a spawn's answer record, written once: other bytes under the key are refused.
+    pub(crate) fn put_spawn(&self, key: &ContentId, bytes: &[u8]) -> Result<(), FilesError> {
+        self.put_at(Self::named(b"spawn/", key), bytes)
+    }
+
+    /// The record at `name`, its seal checked: `None` when absent or torn.
+    fn get_at(&self, name: RecordName) -> Result<Option<Vec<u8>>, FilesError> {
         let mut bytes = match self.files.read(&name)? {
             Held::Absent => return Ok(None),
             Held::Whole(bytes) => bytes,
@@ -341,23 +369,16 @@ impl Store for DirStore {
         Ok(Some(bytes))
     }
 
-    fn put(&self, kind: Kind, key: ContentId, bytes: &[u8]) -> Result<(), FilesError> {
-        let name = Self::name(kind, &key);
-        if let Some(held) = self.get(kind, &key)? {
+    /// `bytes` published at `name` with its seal, written once: a whole record of other bytes
+    /// there is refused naming it (rule 21).
+    fn put_at(&self, name: RecordName, bytes: &[u8]) -> Result<(), FilesError> {
+        if let Some(held) = self.get_at(name)? {
             return if held == bytes { Ok(()) } else { Err(FilesError::OtherBytes { name }) };
         }
         let mut whole = Vec::with_capacity(bytes.len() + SEAL_LEN);
         whole.extend_from_slice(bytes);
         whole.extend_from_slice(&ContentId::of(SEAL, bytes).0);
         self.files.publish(&name, &whole)
-    }
-
-    fn bytes(held: &Self::Held) -> &[u8] {
-        held
-    }
-
-    fn tally(&self) -> &Tally {
-        &self.tally
     }
 }
 

@@ -421,6 +421,8 @@ blaze-url = { path = "crates/blaze-url" } # HostPort, Scheme, Origin, Url: check
 blaze-git-fetch = { path = "crates/blaze-git-fetch" }
 # blaze's own test engine and simulation kit (docs/v2/plan/design/sim.md).
 blaze-sim = { path = "crates/blaze-sim" }
+# The spawn seam as records: a build step's spawned command and its answer, keyed from text (port27/hvbox-1116/READINESS.md 1a).
+blaze-spawn = { path = "crates/blaze-spawn" }
 blaze-ty = { path = "crates/blaze-ty" }
 blaze-typeck = { path = "crates/blaze-typeck" }
 # blaze's own trait solver (docs/v2/plan/design/solve.md).

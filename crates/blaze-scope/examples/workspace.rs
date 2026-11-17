@@ -24,7 +24,7 @@ use blaze_manifest::lock::{Lock, LockId, LockSource};
 use blaze_own::{AVec, Alloc};
 use blaze_scope::resolve::{CrateNames, SourceTexts, resolve_crates};
 use blaze_scope::task::{Loc, Serial};
-use blaze_scope::units::{Origin, unit_crates};
+use blaze_scope::units::{Member, Origin, unit_crates};
 use blaze_surface::{BuiltinDerive, CallShape, PathKind, ScopeError};
 use blaze_toolchain::{Shelf, ToolchainView};
 use blaze_unit_graph::{Ask, CfgAtom, Package, Pass, Records, Resolution, Resolver, StoreSources, TargetDesc};
@@ -283,6 +283,7 @@ fn main() {
     let resolver = Resolver::of(written, ws.root_edition).unwrap_or_else(|_| panic!("unknown resolver {written:?}"));
     let mut roots = AVec::new_in(alloc);
     let mut member_ids: Vec<LockId> = Vec::new();
+    let mut members: Vec<Member<'static>> = Vec::new();
     let mut member_dirs: BTreeMap<u32, PathBuf> = BTreeMap::new();
     let mut facts = Vec::new();
     for m in ws.members.iter() {
@@ -292,6 +293,8 @@ fn main() {
         };
         roots.push(id);
         member_ids.push(id);
+        let dir: &'static str = Box::leak(m.dir.as_str().to_owned().into_boxed_str());
+        members.push(Member::new(id, dir).unwrap_or_else(|e| panic!("{e}")));
         member_dirs.insert(id.0, root.join(m.dir.as_str()));
         facts.push((id, Package::from_member(m, alloc)));
     }
@@ -331,7 +334,7 @@ fn main() {
         blaze_toolchain::shelf::open_manifest(&mut shelf, id).unwrap_or_else(|e| panic!("the toolchain at {}: {e}", shelf.place)).into_boxed_slice(),
     );
     let view = ToolchainView::open(manifest, id).unwrap_or_else(|e| panic!("the toolchain manifest: {e}"));
-    let crates = leak(unit_crates(graph, lock, &member_ids, view, TRIPLE, alloc).unwrap_or_else(|e| {
+    let crates = leak(unit_crates(graph, lock, &members, view, TRIPLE, alloc).unwrap_or_else(|e| {
         eprintln!("the workspace's crates: {e}");
         std::process::exit(2);
     }));

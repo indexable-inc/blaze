@@ -180,6 +180,9 @@ fn run_mode(fd: OsString) -> ! {
 }
 
 fn main() {
+    // Before any thread and any wait: a stub's wait and the control thread's use direct
+    // system calls, which keep no per-thread state (THREADS.md D6; blaze_launch_rt::stub_wait).
+    blaze_core::wait::choose(blaze_core::wait::Waits::Direct);
     if let Some(fd) = std::env::var_os("BLAZE_LAUNCH_FD") {
         run_mode(fd);
     }
@@ -210,6 +213,18 @@ fn main() {
         Ok(driver) => driver,
         Err(why) => stop(CANNOT_RUN, &format!("the launcher could not map its code area: {why}")),
     };
+    /// Code given back and made inaccessible, read by the fault handler without a lock
+    /// (blaze-launch-rt retired.rs); lives as long as the process.
+    static RETIRED: blaze_launch_rt::retired::Table<{ 1 << 14 }> = blaze_launch_rt::retired::Table::new();
+    let area = match usize::try_from(Config::PROGRAM.area) {
+        Ok(len) => driver.base()..driver.base() + len,
+        Err(_) => stop(CANNOT_RUN, "the launcher's code area does not fit this machine's addresses"),
+    };
+    // SAFETY: the launcher's main thread, before the control thread starts and before any
+    // program code runs; nothing else installs a SIGSEGV or SIGBUS action.
+    if let Err(why) = unsafe { blaze_launch_rt::signals::install(&RETIRED, area) } {
+        stop(CANNOT_RUN, &format!("the launcher could not install its fault handler: {why}"));
+    }
     let shared = driver.shared();
     let me = match blaze_launch_rt::threads::adopt(&shared) {
         Ok(me) => me,
@@ -219,6 +234,11 @@ fn main() {
     // The control thread: the one writer of code, for the life of the process. It is never
     // joined: the process ends through the program's `main` or an `exit` of its own.
     let control = std::thread::Builder::new().name("blaze-launch".to_owned()).spawn(move || {
+        // A fault here with no program action runs the launcher's own std handler, which
+        // names this thread (blaze-launch-rt signals.rs, step 3).
+        if let Err(why) = blaze_launch_rt::signals::launcher_thread() {
+            stop(CANNOT_RUN, &format!("the launcher's control thread could not be marked: {why}"));
+        }
         let mut records = match Loaded::new() {
             Ok(records) => records,
             Err(why) => stop(CANNOT_RUN, &format!("the launcher could not map the program's data: {why}")),

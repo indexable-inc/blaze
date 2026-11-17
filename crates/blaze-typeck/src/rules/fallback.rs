@@ -57,6 +57,8 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         // An async block's captures (rules/async_fn.rs): rows of the same table.
         self.analyze_coroutine_captures()?;
         self.analyze_futures()?;
+        // Constant promotion (rules/promote.rs): after every type the rule reads is fixed.
+        self.analyze_promotions()?;
         // A mutable place through an overloaded deref calls `DerefMut` (rules/mut_places.rs);
         // before `select_all`, so the `DerefMut` goals it registers are proven with the rest.
         self.mut_places()?;

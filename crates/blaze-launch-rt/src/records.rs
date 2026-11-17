@@ -263,22 +263,10 @@ impl Loaded {
     }
 }
 
-/// The symbols a record may name that the launcher itself defines, since no library does.
+/// The symbols a record may name that the launcher itself defines: the one table
+/// ([`crate::signals::own`]) on the launcher's path.
 fn own(name: &str) -> Option<u64> {
-    /// What `__cxa_thread_atexit_impl` takes as the object a destructor belongs to: a linked
-    /// image's is a symbol its linker makes. The program is one "image" here, never unloaded.
-    static DSO_HANDLE: u8 = 0;
-    match name {
-        "__dso_handle" => Some(&raw const DSO_HANDLE as u64),
-        // The program's threads are started through the launcher, which tells the core of
-        // each before it runs (`threads`).
-        "pthread_create" => Some(crate::threads::create as *const () as u64),
-        // The images of the process, with the launcher's code as one more: where the
-        // program's backtraces find the names of its own functions (`symbols`).
-        #[cfg(target_os = "linux")]
-        "dl_iterate_phdr" => Some(crate::symbols::iterate as *const () as u64),
-        _ => None,
-    }
+    crate::signals::own(name, crate::signals::Path::Launcher)
 }
 
 impl Records for Loaded {

@@ -5,7 +5,6 @@
 use std::{format, string::String, vec, vec::Vec};
 
 use blaze_id::{ContentId, ItemKey};
-use blaze_own::Alloc;
 use blaze_sim::{Broke, Config, Tape};
 
 use crate::infer::Plant;
@@ -174,7 +173,7 @@ fn interning_is_structural() {
         let mut m = Model::default();
         let a = m.draw(tape, 4, 0, 3);
         let b = if tape.coin("same") { a } else { m.draw(tape, 4, 0, 3) };
-        let mut tys = Tys::new_in(Alloc::global());
+        let mut tys = Tys::new_in(blaze_own::testing::heap().alloc());
         let ta = build(&mut tys, &m, a, &[], None);
         let tb = build(&mut tys, &m, b, &[], None);
         let again = build(&mut tys, &m, a, &[], None);
@@ -260,7 +259,7 @@ fn unify_matches_robinson() {
         let mut sub = vec![None; nvars];
         let model_ok = model_unify(&m, a, b, &mut sub);
 
-        let mut cx = TyCx::new_in(Alloc::global());
+        let mut cx = TyCx::new_in(blaze_own::testing::heap().alloc());
         let vars: Vec<Ty> = (0..nvars).map(|_| cx.next_ty_var()).collect();
         let ta = build(&mut cx.tys, &m, a, &vars, None);
         let tb = build(&mut cx.tys, &m, b, &vars, None);
@@ -288,7 +287,7 @@ enum SnapPlant {
 }
 
 fn snapshots(tape: &Tape, p: SnapPlant) -> Result<(), Broke> {
-    let mut cx = TyCx::new_in(Alloc::global());
+    let mut cx = TyCx::new_in(blaze_own::testing::heap().alloc());
     cx.vars.plant = match p {
         SnapPlant::Clean => Plant::Clean,
         SnapPlant::ForgetIntUndo => Plant::ForgetIntUndo,
@@ -365,7 +364,7 @@ fn substitution_matches_the_model() {
         let mut m = Model::default();
         let t = m.draw(tape, 4, 0, 3);
         let args: Vec<usize> = (0..3).map(|_| m.draw(tape, 2, 0, 0)).collect();
-        let mut cx = TyCx::new_in(Alloc::global());
+        let mut cx = TyCx::new_in(blaze_own::testing::heap().alloc());
         let arg_tys: Vec<Ty> = args.iter().map(|a| build(&mut cx.tys, &m, *a, &[], None)).collect();
         let list = cx.tys.mk_ty_list(&arg_tys);
         let term = build(&mut cx.tys, &m, t, &[], None);
@@ -398,7 +397,7 @@ fn reaches(m: &Model, from: usize, to: usize) -> bool {
 /// Canonicalizes a model term in a fresh context whose variables are made in the order
 /// `order` (with `junk` unrelated variables first), returning the key.
 fn canon_key(m: &Model, t: usize, nvars: usize, order: &[usize], junk: usize) -> Vec<u32> {
-    let mut cx = TyCx::new_in(Alloc::global());
+    let mut cx = TyCx::new_in(blaze_own::testing::heap().alloc());
     for _ in 0..junk {
         cx.next_ty_var();
     }
@@ -407,14 +406,14 @@ fn canon_key(m: &Model, t: usize, nvars: usize, order: &[usize], junk: usize) ->
         vars[i] = cx.next_ty_var();
     }
     let term = build(&mut cx.tys, m, t, &vars, None);
-    let mut buf = CanonBuf::new_in(Alloc::global());
+    let mut buf = CanonBuf::new_in(blaze_own::testing::heap().alloc());
     let c = cx.canonicalize(term.node(), Mode::Input { param_env: false }, &mut buf);
     let Ok(c) = c else { panic!("canonicalizing a plain term refused: {c:?}") };
     let key: Vec<u32> = buf.key.iter().copied().collect();
     // The one walk wrote the term's words from the canonical nodes as it made them: they are
     // the words of the finished canonical term written alone (canonicalizing it changes
     // nothing, so its walk only writes).
-    let mut again = CanonBuf::new_in(Alloc::global());
+    let mut again = CanonBuf::new_in(blaze_own::testing::heap().alloc());
     let c2 = cx.canonicalize(c.value, Mode::Input { param_env: false }, &mut again);
     assert!(matches!(c2, Ok(x) if x.value == c.value && x.vars == 0), "a canonical term canonicalized changed: {c2:?}");
     let words = key.len() - 2 * buf.vars.len() - 2;
@@ -465,9 +464,9 @@ fn rename(m: &mut Model, t: usize, perm: &[usize]) -> usize {
 }
 
 fn export_bytes(tys: &Tys<'_>, n: Node) -> Vec<u8> {
-    let mut p = PTys::new_in(Alloc::global());
+    let mut p = PTys::new_in(blaze_own::testing::heap().alloc());
     p.export(tys, n);
-    let mut out = blaze_own::Vec::new_in(Alloc::global());
+    let mut out = blaze_own::Vec::new_in(blaze_own::testing::heap().alloc());
     p.to_bytes(&mut out);
     out.iter().copied().collect()
 }
@@ -477,19 +476,19 @@ fn export_import_round_trips() {
     blaze_sim::check(Config::cases(400), |tape| {
         let mut m = Model::default();
         let t = m.draw(tape, 4, 0, 3);
-        let mut a = Tys::new_in(Alloc::global());
+        let mut a = Tys::new_in(blaze_own::testing::heap().alloc());
         let ta = build(&mut a, &m, t, &[], None);
         // Another arena, with unrelated rows made first: other ids, the same bytes.
-        let mut b = Tys::new_in(Alloc::global());
+        let mut b = Tys::new_in(blaze_own::testing::heap().alloc());
         let junk = m.draw(tape, 3, 0, 3);
         build(&mut b, &m, junk, &[], None);
         let tb = build(&mut b, &m, t, &[], None);
         let (ba, bb) = (export_bytes(&a, ta.node()), export_bytes(&b, tb.node()));
         oracle(ba == bb, || "one type exported from two arenas gave different bytes".into())?;
 
-        let p = PTys::from_bytes(&ba, Alloc::global()).map_err(|e| Broke::Oracle(format!("re-reading refused: {e}")))?;
-        let mut c = Tys::new_in(Alloc::global());
-        let mut map = blaze_own::Vec::new_in(Alloc::global());
+        let p = PTys::from_bytes(&ba, blaze_own::testing::heap().alloc()).map_err(|e| Broke::Oracle(format!("re-reading refused: {e}")))?;
+        let mut c = Tys::new_in(blaze_own::testing::heap().alloc());
+        let mut map = blaze_own::Vec::new_in(blaze_own::testing::heap().alloc());
         let mut hole = |_: &mut Tys<'_>, _: VarKind| -> Node { Ty::ERROR.node() };
         p.import(&mut c, &mut hole, &mut map).map_err(|e| Broke::Oracle(format!("import refused: {e}")))?;
         let last = crate::PTy(u32::try_from(p.len().saturating_sub(1)).unwrap_or(0));
@@ -507,16 +506,16 @@ fn malformed_bytes_are_refused() {
     blaze_sim::check(Config::cases(300), |tape| -> Result<(), Broke> {
         let mut m = Model::default();
         let t = m.draw(tape, 3, 0, 2);
-        let mut a = Tys::new_in(Alloc::global());
+        let mut a = Tys::new_in(blaze_own::testing::heap().alloc());
         let ta = build(&mut a, &m, t, &[], None);
         let mut bytes = export_bytes(&a, ta.node());
         let i = tape.index(bytes.len(), "byte");
         bytes[i] ^= 1 << tape.index(8, "bit");
         // Reading may refuse or accept; an accepted table either imports or refuses, never
         // panics.
-        if let Ok(p) = PTys::from_bytes(&bytes, Alloc::global()) {
-            let mut c = Tys::new_in(Alloc::global());
-            let mut map = blaze_own::Vec::new_in(Alloc::global());
+        if let Ok(p) = PTys::from_bytes(&bytes, blaze_own::testing::heap().alloc()) {
+            let mut c = Tys::new_in(blaze_own::testing::heap().alloc());
+            let mut map = blaze_own::Vec::new_in(blaze_own::testing::heap().alloc());
             let mut hole = |_: &mut Tys<'_>, _: VarKind| -> Node { Ty::ERROR.node() };
             let _ = p.import(&mut c, &mut hole, &mut map);
         }
@@ -542,7 +541,7 @@ impl Out for Text {
 
 #[test]
 fn prints_rust_forms() {
-    let mut cx = TyCx::new_in(Alloc::global());
+    let mut cx = TyCx::new_in(blaze_own::testing::heap().alloc());
     let i32_ = Ty::int(IntTy::I32);
     let r = cx.tys.reference(Region::STATIC, i32_, Mutability::Mut);
     let s = cx.tys.slice(r);
@@ -562,7 +561,7 @@ fn prints_rust_forms() {
 #[test]
 fn aliases_defer_unless_structural() {
     use crate::{AliasKind, PredKind, TyKind};
-    let mut cx = TyCx::new_in(Alloc::global());
+    let mut cx = TyCx::new_in(blaze_own::testing::heap().alloc());
     let item = cx.tys.def(key(7));
     let v = cx.next_ty_var();
     let args = cx.tys.mk_ty_list(&[v]);
@@ -582,7 +581,7 @@ fn aliases_defer_unless_structural() {
     assert_eq!(cx.resolve_ty(v), v, "the alias's argument is not touched");
 
     // Structurally: the arguments relate, no goal is made.
-    let mut cx = TyCx::new_in(Alloc::global());
+    let mut cx = TyCx::new_in(blaze_own::testing::heap().alloc());
     let item = cx.tys.def(key(7));
     let v = cx.next_ty_var();
     let with_var = cx.tys.mk_ty_list(&[v]);
@@ -609,7 +608,7 @@ fn a_shared_dag_is_walked_once_per_node() {
     // fold that lost the memo, or a deferred intern that kept a sibling's result from it,
     // would not finish.
     const LEVELS: usize = 64;
-    let mut cx = TyCx::new_in(Alloc::global());
+    let mut cx = TyCx::new_in(blaze_own::testing::heap().alloc());
     let v = cx.next_ty_var();
     let (mut with_param, mut with_var, mut plain) = (cx.tys.param(0), v, Ty::BOOL);
     for _ in 0..LEVELS {
@@ -619,7 +618,7 @@ fn a_shared_dag_is_walked_once_per_node() {
     }
     let args = cx.tys.mk_ty_list(&[Ty::BOOL]);
     assert_eq!(cx.subst_ty(with_param, args), Ok(plain));
-    let mut buf = CanonBuf::new_in(Alloc::global());
+    let mut buf = CanonBuf::new_in(blaze_own::testing::heap().alloc());
     let c = cx.canonicalize(with_var.node(), Mode::Input { param_env: false }, &mut buf);
     assert!(matches!(c, Ok(c) if c.vars == 1), "{c:?}");
     assert_eq!(cx.eq(v.arg(), Ty::BOOL.arg(), &mut AllInvariant), Ok(true));
@@ -629,7 +628,7 @@ fn a_shared_dag_is_walked_once_per_node() {
 #[test]
 fn a_million_deep_chain_walks_without_stack_growth() {
     const DEPTH: usize = 1_000_000;
-    let mut cx = TyCx::new_in(Alloc::global());
+    let mut cx = TyCx::new_in(blaze_own::testing::heap().alloc());
     let p = cx.tys.param(0);
     let v = cx.next_ty_var();
     let (mut with_param, mut with_var, mut plain) = (p, v, Ty::BOOL);
@@ -651,11 +650,11 @@ fn a_million_deep_chain_walks_without_stack_growth() {
         deep_w = cx.tys.reference(Region::STATIC, deep_w, Mutability::Not);
     }
     assert!(cx.eq(w.arg(), deep_w.arg(), &mut AllInvariant).is_err(), "a variable equated with a type containing it");
-    let mut buf = CanonBuf::new_in(Alloc::global());
+    let mut buf = CanonBuf::new_in(blaze_own::testing::heap().alloc());
     let c = cx.canonicalize(deep_w.node(), Mode::Input { param_env: false }, &mut buf);
     assert!(c.is_ok());
     let bytes = export_bytes(&cx.tys, plain.node());
-    let pt = PTys::from_bytes(&bytes, Alloc::global());
+    let pt = PTys::from_bytes(&bytes, blaze_own::testing::heap().alloc());
     assert!(pt.is_ok());
     let mut count = Count(0);
     print(&cx.tys, plain.node(), &mut DefaultNames, &mut count);
@@ -670,7 +669,7 @@ fn a_million_deep_chain_walks_without_stack_growth() {
 fn node_at_round_trips_every_node_and_refuses_the_rest() {
     blaze_sim::check(Config::cases(300), |tape| {
         let mut m = Model::default();
-        let mut cx = TyCx::new_in(Alloc::global());
+        let mut cx = TyCx::new_in(blaze_own::testing::heap().alloc());
         let vars: Vec<Ty> = (0..3).map(|_| cx.next_ty_var()).collect();
         let n = 1 + tape.index(6, "terms");
         for _ in 0..n {
@@ -788,7 +787,7 @@ fn unbound_roots(cx: &TyCx<'_>) -> Vec<crate::VarId> {
 }
 
 fn binding_log(tape: &Tape, plant: Plant) -> Result<(), Broke> {
-    let mut cx = TyCx::new_in(Alloc::global());
+    let mut cx = TyCx::new_in(blaze_own::testing::heap().alloc());
     cx.vars.plant = plant;
     let v = tape_vars(tape, &mut cx);
     let ops = 1 + tape.index(8, "ops");
@@ -849,7 +848,7 @@ fn binding_log_control_catches_an_unlogged_int_binding() {
 /// (4) The counts: one per variable made, rolled back with the snapshot that made them.
 #[test]
 fn var_counts_follow_creation_and_rollback() {
-    let mut cx = TyCx::new_in(Alloc::global());
+    let mut cx = TyCx::new_in(blaze_own::testing::heap().alloc());
     let _ = (cx.next_ty_var(), cx.next_ty_var(), cx.next_int_var(), cx.next_const_var(), cx.next_region_var());
     let counts = |cx: &TyCx<'_>| {
         [VarKind::Ty, VarKind::Int, VarKind::Float, VarKind::Const, VarKind::Region].map(|k| cx.vars.var_count(k))
@@ -867,7 +866,7 @@ fn var_counts_follow_creation_and_rollback() {
 #[test]
 fn rollback_to_an_outer_snapshot_closes_the_inner() {
     use crate::fold::AllInvariant;
-    let mut cx = TyCx::new_in(Alloc::global());
+    let mut cx = TyCx::new_in(blaze_own::testing::heap().alloc());
     let v = cx.next_ty_var();
     let w = cx.next_ty_var();
     let outer = cx.snapshot();
@@ -887,7 +886,7 @@ fn rollback_to_an_outer_snapshot_closes_the_inner() {
 #[test]
 fn var_node_names_each_variable_and_nothing_past_the_count() {
     use crate::VarId;
-    let mut cx = TyCx::new_in(Alloc::global());
+    let mut cx = TyCx::new_in(blaze_own::testing::heap().alloc());
     let made = [
         (VarId { kind: VarKind::Ty, index: 0 }, cx.next_ty_var().node()),
         (VarId { kind: VarKind::Ty, index: 1 }, cx.next_ty_var().node()),

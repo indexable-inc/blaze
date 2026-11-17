@@ -20,23 +20,25 @@
 //!
 //! REFUSED BY NAME ([`BuildError::NoCleanup`]), because the cleanup would be inexact:
 //!
-//! - **An operand waiting on the value stack.** The Reference, "Destructors": "Temporaries are
-//!   also created to hold the result of operands to an expression while the other operands are
-//!   evaluated ... dropping them has no effect unless one of the operands to an expression
-//!   breaks out of the expression, returns, or panics." A call made while an earlier operand's
-//!   value waits (`g(s, f())`, `v.push(f())`) would have to drop that value if it is owned and
-//!   needs drop; the walk keeps no type beside each waiting value, so it cannot tell `&mut v`
-//!   from a moved `String`. A waiting value that is an integer or float scalar, an unsized
-//!   place (only ever borrowed) or nothing passes; any other is refused. MISSING: the type of
-//!   each waiting value (a row beside `vals`), with which a reference or a `Copy` value passes
-//!   and an owned one joins the cleanup.
-//! - **A call in an `async` body with values to drop.** The coroutine pass refuses landing
-//!   blocks (blaze-lir coroutine.rs, "Unwinding ... is not built").
+//! - **A waiting operand the walk cannot ground.** The Reference, "Destructors": "Temporaries
+//!   are also created to hold the result of operands to an expression while the other operands
+//!   are evaluated ... dropping them has no effect unless one of the operands to an expression
+//!   breaks out of the expression, returns, or panics." Beside each waiting value the walk keeps
+//!   its ground type when it owns it (walk/val_stack.rs): an owned one that needs drop
+//!   (`g(s, f())`: the caller's copy of `s`) is dropped by the cleanup first, top of the stack
+//!   first, before `drop_from(0)`; a borrow (`v.push(f())`), a scalar or a binding's place is
+//!   not owned and passes. Refused: an aggregate literal being built whose fields need drop
+//!   (`S { a: String::new(), b: f() }`), of which the walk cannot say what is stored.
 //!
 //! NOT BUILT, and not refused because it is no wrong answer of the kind a cleanup could give:
 //! a drop at a scope's normal exit is a plain call, so a destructor that panics there skips the
 //! scope's remaining drops (Rust drops them); MISSING: an unwind edge from each exit drop to a
 //! cleanup of the entries before it.
+//!
+//! - In an `async` body every call made through [`Walk::call_unwinding`] lands, with or
+//!   without something to drop: its cleanup's `resume` is where the coroutine pass stores
+//!   `Panicked` (blaze-lir coroutine_unwind.rs), so a poll that unwinds leaves its state
+//!   poisoned, as rustc's transform poisons every unwind edge of a coroutine.
 //!
 //! `catch_unwind` (the intrinsic; pinned core intrinsics/mod.rs: "Rust's \"try catch\"
 //! construct for unwinding. Invokes the function pointer `try_fn` with the data pointer `data`,
@@ -68,30 +70,22 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         if self.adts.panic() == Panic::Abort || self.cleanup || !self.live {
             return Ok(false);
         }
-        for &v in self.vals.iter() {
-            let plain = match v {
-                V::None | V::Unsized(..) => true,
-                V::Scalar(x) => matches!(self.b.ty(x), Ty::I1 | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::I128 | Ty::F32 | Ty::F64),
-                V::Place(..) => false,
-            };
-            if !plain {
-                return Err(BuildError::NoCleanup {
-                    what: "an operand evaluated before this call waits on the value stack, and the walk keeps no type for it, so whether the unwind path must drop it is not known",
-                });
-            }
-        }
-        if !self.pending_from(0) {
-            return Ok(false);
-        }
-        if self.co.is_some() {
-            return Err(BuildError::NoCleanup { what: "a call with values to drop inside an `async` body: the coroutine pass does not carry landing blocks" });
-        }
-        Ok(true)
+        // An operand waiting on the value stack (walk/val_stack.rs): one the walk owns whose type
+        // needs drop joins the cleanup; one whose ownership it could not ground is refused there.
+        let waiting = self.waiting_owned()?;
+        // In an `async` body every call lands, even with nothing to drop: the cleanup's
+        // `resume` is where the coroutine pass stores `Panicked` (ASYNC.md D-A5).
+        Ok(self.co.is_some() || waiting || self.pending_from(0))
     }
 
     /// The call `emit_call` makes: an `invoke` whose cleanup drops what is live when
     /// [`Self::needs_cleanup`] says so, else a plain call. Gives the call's value.
     pub(super) fn call_unwinding(&mut self, callee: Callee, sig: SigId, values: &[Value]) -> Result<Value, BuildError> {
+        // A body whose ABI does not permit unwinding: no cleanup, the unwind ends in
+        // `panic_cannot_unwind` (walk/nounwind.rs; the Reference, [items.fn.extern.abort]).
+        if self.adts.panic() == Panic::Unwind && self.live && !self.cleanup && self.is_nounwind() {
+            return self.call_terminating(callee, sig, values);
+        }
         if !self.needs_cleanup()? {
             return Ok(match callee {
                 Callee::Direct(reference) => self.b.call(Flags::NONE, reference, sig, values),
@@ -109,7 +103,9 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         self.begin(pad);
         let exception = self.b.param(Ty::PTR);
         self.cleanup = true;
-        let dropped = self.drop_from(0);
+        // The waiting operands first (the innermost temporary scope), top of the stack first,
+        // then every open scope (walk/val_stack.rs).
+        let dropped = self.drop_waiting().and_then(|()| self.drop_from(0));
         self.cleanup = false;
         dropped?;
         self.b.resume(exception);
@@ -126,7 +122,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         }
         let base = self.vals.len().checked_sub(3).ok_or(malformed("an intrinsic's arguments missing from the value stack (a build bug)"))?;
         let (try_fn, data, catch_fn) = (self.vals[base], self.vals[base + 1], self.vals[base + 2]);
-        self.vals.truncate(base);
+        self.truncate_vals(base);
         let try_fn = self.scalar(try_fn, Ty::PTR)?;
         let data = self.scalar(data, Ty::PTR)?;
         let catch_fn = self.scalar(catch_fn, Ty::PTR)?;
@@ -135,7 +131,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         if self.adts.panic() == Panic::Abort || !self.live {
             self.b.call_indirect(Flags::NONE, try_fn, one, &[data]);
             let no = self.b.iconst(Ty::I8, 0);
-            self.vals.push(V::Scalar(no));
+            self.push_val(V::Scalar(no), None);
             return Ok(());
         }
         if self.co.is_some() {
@@ -157,7 +153,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         self.jump(join, &[yes]);
         self.begin(join);
         let caught = self.b.param(Ty::I8);
-        self.vals.push(V::Scalar(caught));
+        self.push_val(V::Scalar(caught), None);
         Ok(())
     }
 }

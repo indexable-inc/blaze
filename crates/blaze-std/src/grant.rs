@@ -47,7 +47,8 @@ use crate::{
     spec::{Granted, Layers, Provider, RunSpec, Scope},
 };
 
-/// The allocator a launcher's spec and problems are in: the global heap, named once.
+/// The allocator a launcher's spec and problems are in: the heap's handle, which the entry
+/// (`rt::launch`, or a test through [`crate::entry::launch_in`]) hands down (D102).
 pub type LaunchAlloc = SharedAlloc<'static>;
 
 /// What a capability parameter of `main` is.
@@ -234,6 +235,11 @@ impl Spec {
     pub fn get(&self) -> &RunSpec<LaunchAlloc> {
         &self.0
     }
+
+    /// The allocator the spec is in: the launcher's, which its entry handed down (D102).
+    pub fn alloc(&self) -> LaunchAlloc {
+        *blaze_own::Arc::allocator(&self.0)
+    }
 }
 
 impl fmt::Debug for Spec {
@@ -319,7 +325,9 @@ pub struct Refused {
 
 impl fmt::Display for Refused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let text = text_in(SharedAlloc::global(), |out| {
+        // The launcher's allocator, which the problems are in (D102: never one from nowhere).
+        let alloc = *self.problems.allocator();
+        let text = text_in(alloc, |out| {
             out.str("bstd: `main` was not started: ").int(self.problems.len());
             match self.problems.len() {
                 1 => out.str(" grant is missing or wrong"),
@@ -332,7 +340,7 @@ impl fmt::Display for Refused {
         });
         f.write_str(text.as_str())?;
         for problem in self.problems.iter() {
-            let mut line = String::new_in(SharedAlloc::global());
+            let mut line = String::new_in(alloc);
             problem.line(&mut line);
             f.write_str("\n")?;
             f.write_str(line.as_str())?;
@@ -369,6 +377,11 @@ pub struct Granting<'g> {
 }
 
 impl<'g> Granting<'g> {
+    /// The launcher's allocator, the spec's (D102: handed down from the entry).
+    pub fn alloc(&self) -> LaunchAlloc {
+        self.given.spec.alloc()
+    }
+
     /// The spec's grant of this parameter's name.
     pub fn granted(&self) -> Option<&'g Granted<LaunchAlloc>> {
         self.given.spec.get().grant(self.name)
@@ -525,7 +538,7 @@ fn granted_dir(from: &Granting<'_>, wants_write: bool) -> Result<Dir<ReadWrite>,
     }
     let fs = io.need_fs().map_err(Want::NotOffered)?;
     let failed = |why: &dyn fmt::Display| {
-        let mut said = String::new_in(SharedAlloc::global());
+        let mut said = String::new_in(from.alloc());
         blaze_text::PutDisplay::put_display(&mut said, why);
         Want::Failed(said)
     };
@@ -575,7 +588,7 @@ impl Grant for crate::env::Env {
         let (scope, io) = from.scope("env")?;
         let Scope::Env { names } = scope else { return Err(Want::WrongKind { given: scope.kind_name() }) };
         let env = io.need_env().map_err(Want::NotOffered)?;
-        let mut kept = Vec::with_capacity_in(names.len(), SharedAlloc::global());
+        let mut kept = Vec::with_capacity_in(names.len(), from.alloc());
         for name in names.iter() {
             match crate::env::VarName::new(name.as_str()) {
                 Ok(name) => kept.push(name),
@@ -661,7 +674,7 @@ impl<'g> Given<'g> {
         started: Started,
         manifest: &'static Manifest,
     ) -> Given<'g> {
-        Given { cx, real, fake, spec, started, manifest, problems: Vec::new_in(SharedAlloc::global()) }
+        Given { cx, real, fake, spec, started, manifest, problems: Vec::new_in(spec.alloc()) }
     }
 
     /// The parameter `name` of type `T` made and dropped: a problem it has is kept.
@@ -678,14 +691,14 @@ impl<'g> Given<'g> {
         for granted in self.spec.get().grants.iter() {
             if self.manifest.param(granted.name.as_str()).is_none() {
                 // clone: a grant's name, for its problem.
-                let name = String::from_str_in(granted.name.as_str(), SharedAlloc::global());
+                let name = String::from_str_in(granted.name.as_str(), self.spec.alloc());
                 self.problems.push(Problem::NoParam { name, given: granted.scope.kind_name() });
             }
         }
         match self.problems.is_empty() {
             true => Ok(Filled { given: self }),
             false => {
-                let problems = core::mem::replace(&mut self.problems, Vec::new_in(SharedAlloc::global()));
+                let problems = core::mem::replace(&mut self.problems, Vec::new_in(self.spec.alloc()));
                 Err(Refused { problems, started: self.started })
             }
         }
@@ -718,13 +731,13 @@ pub enum Prepared {
 }
 
 /// The launcher's decision from what file descriptor 3 held (`None`: it was closed) and the
-/// spec of an ordinary start (`defaults`).
+/// spec of an ordinary start (`defaults`); what it makes is in `alloc`, the entry's (D102).
 pub fn prepare(
     manifest: &'static Manifest,
     delivered: Option<&[u8]>,
     defaults: impl FnOnce() -> RunSpec<LaunchAlloc>,
+    alloc: LaunchAlloc,
 ) -> Prepared {
-    let alloc = SharedAlloc::global();
     let (spec, started) = match delivered {
         None => (defaults(), Started::Ordinary),
         Some(bytes) => match crate::spec::read_delivery(bytes, alloc) {

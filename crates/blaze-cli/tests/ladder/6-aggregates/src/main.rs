@@ -22,6 +22,14 @@ fn panic_bounds_check(index: usize, len: usize) -> ! {
     loop {}
 }
 
+// What a division by zero calls: the check is in every build (the Reference, "Arithmetic and
+// Logical Binary Operators": integer division by zero panics; the pinned core's
+// `panic_const::panic_const_div_by_zero`); never returns.
+#[lang = "panic_const_div_by_zero"]
+fn panic_const_div_by_zero() -> ! {
+    loop {}
+}
+
 struct Tx {
     nonce: u64,
     size: u32,

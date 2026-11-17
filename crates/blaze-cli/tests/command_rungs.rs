@@ -41,14 +41,12 @@
 //! `COMMAND_RUNGS_LIST`, of the same form as the harness's `FRONT2_RUNGS_LIST`, names a file the
 //! lines are also written to (the checker scripts keep no test output).
 //!
-//! How a refusal is told from a program's own status (crates/blaze-cli/src/main.rs, D86): when
-//! blaze did not build or start the program, `blaze run` exits 125 (`program::NOT_RUN`) with an
-//! `error: <what>` line on standard error: REFUSED, named by that line. blaze's other failures
-//! (findings, an error before the program) still exit 1 with words on standard error, where a
-//! clean run says nothing (tests/run_output.rs): status 1 with words there is REFUSED too. Any
-//! other status, 101 (the program panicked) among them, is the program's own, and is compared
-//! with `expected`. The one overlap left: a program that writes to standard error and exits 1
-//! reads as refused; no rung does.
+//! How a refusal is told from a program's own status (crates/blaze-cli/src/main.rs, D86 and the
+//! ladder's L6): every failure of `blaze run` before the program starts (the manifest, a
+//! finding, the build, the start) exits 125 (`program::NOT_RUN`) with an `error: <what>` line
+//! on standard error: REFUSED, named by that line. Any other status, 1 (`main` returned `Err`)
+//! and 101 (the program panicked) among them, is the program's own, and is compared with
+//! `expected` (tests/run_not_run.rs proves the 125).
 //!
 //! Expected today: every rung REFUSED and `hello-blaze` not PASS until `blaze run` and
 //! `blaze check` use the new front end; the must-pass assertion names it.
@@ -87,10 +85,6 @@ const REAP: Duration = Duration::from_secs(10);
 
 /// `SIGKILL`, the same number on macOS and Linux.
 const SIGKILL: i32 = 9;
-
-/// blaze's own failure status (main.rs `STATUSES`: "an error was found, a task failed, or
-/// blaze itself failed").
-const BLAZE_FAILED: u8 = 1;
 
 /// The old note of a `check` that printed a pass while its stages did not run.
 const HOLLOW_CHECK: &str = "does not read the dependencies";
@@ -330,10 +324,9 @@ fn holds(words: &[u8], needle: &str) -> bool {
 }
 
 /// `blaze run`'s verdict: a refusal first (as the harness checks its error first), then the
-/// answer against `want`. Read from the status (D86): [`NOT_RUN`] (125) is blaze's refusal to
-/// build or start the program, named by its `error: ` line; status 1 with words on standard
-/// error is blaze's other failures (findings, or an error before the program); any other
-/// status, 101 (the program panicked) among them, is the program's own, compared with `want`.
+/// answer against `want`. Read from the status alone (D86, L6): [`NOT_RUN`] (125) is blaze's
+/// refusal to build or start the program, named by its `error: ` line; any other status, 1
+/// and 101 (the program panicked) among them, is the program's own, compared with `want`.
 fn judge_run(ended: Ended, want: Expected) -> Verdict {
     let (status, stdout, stderr) = match ended {
         Ended::Hung { after } => return Verdict::Hung { after },
@@ -342,11 +335,6 @@ fn judge_run(ended: Ended, want: Expected) -> Verdict {
     };
     if status == NOT_RUN {
         let said = error_line(&stderr).or_else(|| first_line(&stderr)).unwrap_or_else(|| format!("exit status {NOT_RUN}, nothing said"));
-        return Verdict::Refused { said };
-    }
-    if status == BLAZE_FAILED
-        && let Some(said) = error_line(&stderr).or_else(|| first_line(&stderr))
-    {
         return Verdict::Refused { said };
     }
     if status == want.status && stdout == want.stdout {

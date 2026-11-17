@@ -67,6 +67,12 @@ fn lang_of(name: &str) -> Option<Lang> {
         "manually_drop" => Lang::ManuallyDrop,
         "future_trait" => Lang::Future,
         "future_output" => Lang::FutureOutput,
+        "async_fn" => Lang::AsyncFn,
+        "async_fn_mut" => Lang::AsyncFnMut,
+        "async_fn_once" => Lang::AsyncFnOnce,
+        "async_fn_once_output" => Lang::AsyncFnOnceOutput,
+        "call_once_future" => Lang::CallOnceFuture,
+        "call_ref_future" => Lang::CallRefFuture,
         _ => return None,
     })
 }

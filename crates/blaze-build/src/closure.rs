@@ -146,7 +146,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let mut caps = Vec::new_in(self.alloc.clone());
         self.captures_of(e, &mut caps);
         if let Repr::None = repr {
-            self.vals.push(V::None);
+            self.push_val(V::None, None);
             return Ok(());
         }
         let mut offs = Vec::new_in(self.alloc.clone());
@@ -168,7 +168,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 }
             }
         }
-        self.vals.push(V::Place(at.0, at.1));
+        self.push_val(V::Place(at.0, at.1), None);
         Ok(())
     }
 
@@ -278,10 +278,10 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let reference = self.b.reference(RefKind::Func, place);
         self.emit_call(Callee::Direct(reference), &reprs, &passes, rrepr, rpass)?;
         if let PNode::Never = self.node_at(e, ty)? {
-            self.vals.pop();
+            self.pop_val();
             self.b.unreachable();
             self.dead_block();
-            self.vals.push(V::None);
+            self.push_val(V::None, None);
         }
         Ok(())
     }
@@ -447,17 +447,17 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 Some(at)
             }
             (_, v) => {
-                self.vals.push(v);
+                self.push_val(v, None);
                 None
             }
         };
         if let Some(at) = owned {
             let a = self.address(at);
-            self.vals.push(V::Scalar(a));
+            self.push_val(V::Scalar(a), None);
         }
         for i in 1..n {
             let v = self.take_passed(reprs[i], passes[i], &mut next)?;
-            self.vals.push(v);
+            self.push_val(v, None);
         }
         reprs[0] = Repr::Ptr;
         passes[0] = Self::rust_pass(Repr::Ptr)?;
@@ -590,7 +590,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let mut tpasses = Vec::with_capacity_in(n - 1, self.alloc.clone());
         for i in 1..n {
             let v = self.take_passed(reprs[i], passes[i], &mut next)?;
-            self.vals.push(v);
+            self.push_val(v, None);
             treprs.push(reprs[i]);
             tpasses.push(self.pass(inputs[i - 1], reprs[i], abi, item)?);
         }
@@ -630,6 +630,7 @@ fn empty_record(a: Alloc<'_>) -> Checked<'_> {
         needs: blaze_typeck::Needs::new_in(a),
         suggests: blaze_typeck::suggest::Suggests::new_in(a),
         hidden: blaze_own::Vec::new_in(a),
+        promoted: blaze_own::Vec::new_in(a),
     }
 }
 
@@ -670,6 +671,7 @@ pub(crate) fn build_fn_shim<A: Allocator + Clone>(
         opt_types: &[],
         fmt_uses: &[],
         coroutine: None,
+        super_lets: &[],
     };
     let mut w = Walk::new(&body, &checked, subst, adts, alloc);
     w.run_fn_shim(callee, tuple, which, sig)?;

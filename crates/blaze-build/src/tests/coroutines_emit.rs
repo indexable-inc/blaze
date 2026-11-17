@@ -852,3 +852,5 @@ fn an_async_fn_awaits_another_async_fn() {
     assert_eq!(ran, Ran { value: 42, polls: 3, drops: 0, made: 1 });
     println!("coroutine emit 4: ready({}) at poll {} through two coroutines, twice() called {} time", ran.value, ran.polls, ran.made);
 }
+
+mod async_unwind;

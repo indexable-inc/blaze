@@ -25,7 +25,7 @@ fn every_hosted_rung_writes_its_expected_output_through_the_table() {
         let (status, stdout) = rungs::expected(&dir);
         let files = rungs::sources(&dir);
         let views: Vec<SourceFile<'_>> = files.iter().map(|(path, text)| SourceFile { path, text }).collect();
-        let hosting = Hosting::holding(Io::sim(1), Vec::new(), vec![("everything".into(), "io".into())], 4096, Holding::of(Hold::Record));
+        let hosting = Hosting::holding(Io::sim(1), Vec::new(), vec![("everything".into(), "io".into())], 4096, Holding::of(Hold::Record), blaze_own::SharedAlloc::global());
         let table = hosting.table();
         let host = NonNull::from(&table).cast::<c_void>();
         let got = match blaze_ladder::run::run(&views, "src/main.rs", Some(host), rungs::x::overflow_of(&dir)) {

@@ -128,6 +128,7 @@ fn body_class(e: &BodyError) -> String {
         }
         BodyError::Head { error, .. } => format!("lower Head: {}", head_class(error)),
         BodyError::Rounds { .. } => "lower Rounds".into(),
+        BodyError::Made { need, .. } => format!("lower Made: {}", cls(&format!("{need:?}"))),
         BodyError::Table { error, .. } => format!("lower Table: {}", cls(&format!("{error:?}"))),
         BodyError::Traits { error, .. } => format!("lower Traits: {}", cls(&format!("{error:?}"))),
         BodyError::PatternName { error, .. } => format!("lower PatternName: {}", cls(&format!("{error:?}"))),

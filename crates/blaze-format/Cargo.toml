@@ -28,7 +28,7 @@ blaze-own = { path = "../blaze-own" }
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 # `Alloc::global()`, the allocator a test names at its top (blaze-own's `std` feature).
-blaze-own = { path = "../blaze-own", features = ["std"] }
+blaze-own = { path = "../blaze-own", features = ["std", "testing"] }
 blaze-sim.workspace = true
 blaze-v2-proof.workspace = true
 

@@ -209,7 +209,7 @@ fn eager_builtins_take_their_inputs_expanded() {
 #[test]
 fn refusals_are_named() {
     assert_eq!(whys(&[], "fn f() { nowhere!(); }"), vec![Why::NotExpanded]);
-    assert_eq!(whys(&[], "fn f() { core::arch::asm!(\"nop\"); }"), vec![Why::Asm]);
+    assert_eq!(whys(&[], "fn f() { core::arch::global_asm!(\"nop\"); }"), vec![Why::Asm]);
     let forever = ("forever", "() => { forever!() }");
     assert_eq!(whys(&[forever], "fn f() { forever!(); }"), vec![Why::TooDeep]);
 }

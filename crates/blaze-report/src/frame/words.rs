@@ -177,6 +177,26 @@ pub const WORDINGS: &[Wording] = &[
         label: "not a pass: the check stopped here",
         args: 1,
     },
+    // A body's move or borrow finding (blaze-cli body_types.rs `BORROWS`): the code and its
+    // words. A note until the borrow check is trusted (`BORROWS_ARE_ERRORS`).
+    Wording {
+        area: Area::Cli,
+        number: 19,
+        name: "borrows",
+        headline: "{1}",
+        label: "borrow check {0}",
+        args: 2,
+    },
+    // A body whose moves and borrows were not checked to the end (blaze-cli body_types.rs
+    // `BORROWS_NOT_CHECKED`): never a pass.
+    Wording {
+        area: Area::Cli,
+        number: 20,
+        name: "borrows-not-checked",
+        headline: "this body's moves and borrows were not checked: {0}",
+        label: "not a pass: the borrow check stopped here",
+        args: 1,
+    },
     Wording {
         area: Area::Drive,
         number: 0xC0F6,

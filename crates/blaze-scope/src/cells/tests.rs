@@ -1729,3 +1729,106 @@ fn a_call_reads_only_its_own_sub_namespace() {
     assert!(matches!(bad.call_outcome(derive), Some(Outcome::Called(d)) if d.key == rules), "the control: {:?}", bad.call_outcome(derive));
     assert!(matches!(bad.call_outcome(wrong), Some(Outcome::Called(d)) if d.key == at), "the control: {:?}", bad.call_outcome(wrong));
 }
+
+/// The written scope of module `m` of the crate `root` is the root of, the core planted with
+/// `plant` and run forward or `backward` (items evaluated, and so calls expanded, from the last
+/// id first).
+fn written_scope(w: &World, root: ItemKey, m: ItemKey, plant: CellPlant, backward: bool) -> blaze_surface::ScopeBuilder<'static, N> {
+    w.expanded.borrow_mut().clear();
+    let mut c = Cells::load_planted(w, root, None, plant, Alloc::global()).expect("the load");
+    c.backward = backward;
+    let expand = |call: ItemKey, _: crate::Def| {
+        w.expanded.borrow_mut().insert(call);
+    };
+    c.run(w, &expand, &[]).expect("the core runs");
+    let ix = c.write_index(Alloc::global());
+    let (scope, unknown) = c.scope(&ix, m, Alloc::global()).expect("the module is written");
+    assert_eq!(unknown, 0, "{:?}", scope.errors);
+    scope
+}
+
+/// The names of the `WiderReexport` errors among `errors`, in their order.
+fn wider_names(errors: &[blaze_surface::ScopeError<N, blaze_surface::Path<'static, N>>]) -> Vec<N> {
+    errors
+        .iter()
+        .filter_map(|e| match e {
+            blaze_surface::ScopeError::WiderReexport { name, .. } => Some(*name),
+            _ => None,
+        })
+        .collect()
+}
+
+/// lz4_flex (c10-r17c: two `WiderReexport` the old core wrote and the cells did not). The
+/// Reference, `items.use.visibility.intro`: "A public use declaration can therefore redirect
+/// some public name to a different target definition"; the error index, E0364: "Private items
+/// cannot be publicly re-exported", E0365: "Private modules cannot be publicly re-exported"
+/// (its example: `mod foo { .. } pub use foo as foo2;`). The crate: `mod foo {}`, `pub use foo
+/// as foo2;`, `pub mod a { pub(crate) struct s; pub struct p; pub use self::s as t;
+/// pub(crate) use self::s as u; pub use self::p as q; }`. `foo2` (root) and `t` (`a`) are the
+/// errors, in the types namespace, and each name is still bound; `u` and `q` are not errors.
+/// The control `NoWiderReexport` writes none.
+/// Prints: "test cells::tests::a_use_wider_than_its_target_is_an_error ... ok".
+#[test]
+fn a_use_wider_than_its_target_is_an_error() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let foo = w.module(root, "foo", V::Priv);
+    w.use_as(root, "foo", "foo2", V::Pub);
+    let a = w.module(root, "a", V::Pub);
+    let s = w.item(a, "s", Namespace::Types, crate::DefKind::Other, V::Crate);
+    let p = w.item(a, "p", Namespace::Types, crate::DefKind::Other, V::Pub);
+    w.use_as(a, "self::s", "t", V::Pub);
+    w.use_as(a, "self::s", "u", V::Crate);
+    w.use_as(a, "self::p", "q", V::Pub);
+    let r = written_scope(&w, root, root, CellPlant::None, false);
+    assert_eq!(wider_names(&r.errors), ["foo"], "the root: {:?}", r.errors);
+    assert!(r.errors.iter().all(|e| matches!(e, blaze_surface::ScopeError::WiderReexport { ns: Namespace::Types, def, .. } if def.key == foo)), "{:?}", r.errors);
+    assert!(r.bindings.iter().any(|e| e.name == "foo2" && e.binding.def.key == foo), "`foo2` is bound: {:?}", r.bindings);
+    let sa = written_scope(&w, root, a, CellPlant::None, false);
+    assert_eq!(wider_names(&sa.errors), ["s"], "`a`: {:?}", sa.errors);
+    assert_eq!(sa.errors.len(), 1, "`a`: {:?}", sa.errors);
+    for (name, def) in [("t", s), ("u", s), ("q", p)] {
+        assert!(sa.bindings.iter().any(|e| e.name == name && e.binding.def.key == def), "`{name}` is bound: {:?}", sa.bindings);
+    }
+    assert!(written_scope(&w, root, root, CellPlant::NoWiderReexport, false).errors.is_empty(), "the control, the root");
+    assert!(written_scope(&w, root, a, CellPlant::NoWiderReexport, false).errors.is_empty(), "the control, `a`");
+}
+
+/// futures_util (c10-r17c: the root's `macro_exports` in another order than the old core's).
+/// Its `select_mod.rs`: `document_select_macro! { #[macro_export] macro_rules! select { .. }
+/// #[macro_export] macro_rules! select_biased { .. } }`, whose second arm expands to
+/// `document_select_macro!($select); .. $select_biased`: `select` is written by the nested call,
+/// one expansion later than `select_biased`, but before it in the text. Rule 25: a record's
+/// bytes do not depend on the order work happened to finish in; the list is the walk's tree
+/// order (the module's text, every call's expansion at the call), a function of the text alone.
+/// The crate: `pub mod x { pub macro m }` (named by path, so no call waits on an earlier one as a
+/// textual name would), `x::m!()` (A, expanding to `x::m!()` (B, expanding to `#[macro_export]
+/// macro_rules! s`) then `#[macro_export] macro_rules! sb`), `x::m!()` (C1: `.. p`), `x::m!()`
+/// (C2: `.. q`). Run forward (A, C1, C2 expand, then B) and backward (C2, C1, A, then B), the root's
+/// whole written scope is equal, its `macro_exports` [s, sb, p, q]. The control
+/// `ExportsByExpansionTime` lists them by expansion: forward [sb, p, q, s], backward [q, p, sb,
+/// s], the two schedules differ.
+/// Prints: "test cells::tests::macro_exports_are_in_text_order_whatever_the_expansion_order ... ok".
+#[test]
+fn macro_exports_are_in_text_order_whatever_the_expansion_order() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let x = w.module(root, "x", V::Pub);
+    w.item(x, "m", Namespace::Macros, crate::DefKind::Macro(crate::MacroShapes::FN_LIKE), V::Pub);
+    let a = w.call(root, "x::m", crate::CallShape::FnLike);
+    let b = w.call(a, "x::m", crate::CallShape::FnLike);
+    w.rules_with(b, "s", true);
+    w.rules_with(a, "sb", true);
+    let c1 = w.call(root, "x::m", crate::CallShape::FnLike);
+    w.rules_with(c1, "p", true);
+    let c2 = w.call(root, "x::m", crate::CallShape::FnLike);
+    w.rules_with(c2, "q", true);
+    let names = |s: &blaze_surface::ScopeBuilder<'static, N>| s.macro_exports.iter().map(|d| d.name).collect::<Vec<N>>();
+    let fwd = written_scope(&w, root, root, CellPlant::None, false);
+    let bwd = written_scope(&w, root, root, CellPlant::None, true);
+    assert_eq!(names(&fwd), ["s", "sb", "p", "q"], "forward");
+    assert_eq!(format!("{fwd:?}"), format!("{bwd:?}"), "the whole scope, forward and backward");
+    let pf = written_scope(&w, root, root, CellPlant::ExportsByExpansionTime, false);
+    let pb = written_scope(&w, root, root, CellPlant::ExportsByExpansionTime, true);
+    assert_ne!(names(&pf), names(&pb), "the control: the schedules differ: {:?} {:?}", names(&pf), names(&pb));
+}

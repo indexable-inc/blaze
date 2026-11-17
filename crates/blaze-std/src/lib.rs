@@ -330,8 +330,9 @@ pub mod set {
 
 /// The hashers behind [`map`] and [`set`]: the fixed seed, the identity hasher for keys that are
 /// hashes already, SipHash under a key for keys an attacker picks, and a value's `Hash` fed to
-/// BLAKE3 for what is persisted (blaze-hash). `LazyKey`, a key drawn for a table in a `static`,
-/// is left out: bstd has no statics with interior mutability.
+/// BLAKE3 for what is persisted (blaze-hash). A `SipKey` comes from [`crate::io::Io::sip_key`].
+/// `LazyKey`, a key drawn for a table in a `static`, is left out: bstd has no statics with
+/// interior mutability.
 pub mod hash {
     pub use blaze_hash::{
         Blake3Hasher, BuildKeyHasher, FixedHasher, FixedState, KeyHasher, SipHasher, SipKey,

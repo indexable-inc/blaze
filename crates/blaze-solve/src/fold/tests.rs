@@ -4,7 +4,6 @@
 //! `Cx` helpers and eval's and coherence's `import_pred`), so a census line says which rule
 //! gave the short list instead of only that one was short.
 
-use blaze_own::Alloc;
 
 use super::{Inst, Scratch, import};
 use crate::error::{Malformed, SolveError};
@@ -24,7 +23,7 @@ use crate::tys::Tys;
 #[test]
 fn param_refusal_names_its_caller() {
     let mut tys = TestTys::new();
-    let mut s = Scratch::new_in(Alloc::global());
+    let mut s = Scratch::new_in(blaze_own::testing::heap().alloc());
     let nodes = [TyKind::Param(0)];
     let p = Portable { nodes: &nodes, lists: &[] };
 

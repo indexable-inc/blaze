@@ -15,7 +15,6 @@
 
 use std::time::Instant;
 
-use blaze_own::Alloc;
 use blaze_ty::{AllInvariant, CanonBuf, IntTy, Mode, Mutability, Region, Ty, TyCx, Tys};
 
 /// `n` as a float (every count here is under 2^32).
@@ -38,9 +37,9 @@ fn chain(tys: &mut Tys<'_>, bottom: Ty, depth: usize) -> Ty {
 /// An intern hit with the working set in cache: a thousand types looked up a thousand times.
 /// (The hit's pieces were timed apart once, through a module that existed only for this; the
 /// findings are in `src/tys.rs` and `src/index.rs`, and the module is gone.)
-fn hot_hit() {
+fn hot_hit(heap: &'static blaze_own::Heap) {
     use std::hint::black_box;
-    let mut hot = Tys::new_in(Alloc::global());
+    let mut hot = Tys::new_in(heap.alloc());
     let mut t = Ty::BOOL;
     for _ in 0..1000 {
         t = hot.slice(t);
@@ -57,11 +56,12 @@ fn hot_hit() {
 }
 
 fn main() {
+    let heap = blaze_own::Heap::process();
     const N: usize = 1_000_000;
     let i32_ = Ty::int(IntTy::I32);
 
     // Intern miss: a million new types (each a slice of the last).
-    let mut tys = Tys::new_in(Alloc::global());
+    let mut tys = Tys::new_in(heap.alloc());
     let start = Instant::now();
     let mut t = Ty::BOOL;
     for _ in 0..N {
@@ -77,10 +77,10 @@ fn main() {
     let hit = per(start, N);
     assert_eq!(t, u);
     println!("intern miss: {miss:.1} ns/type; intern hit: {hit:.1} ns/type (1,000,000 rows, each lookup waiting on the last)");
-    hot_hit();
+    hot_hit(heap);
 
     for n in [10_000usize, 1_000_000] {
-        let mut tys = Tys::new_in(Alloc::global());
+        let mut tys = Tys::new_in(heap.alloc());
         let mut t = Ty::BOOL;
         for _ in 0..n {
             t = tys.slice(t);
@@ -90,7 +90,7 @@ fn main() {
     }
 
     // Unify small: a fresh variable with `(i32, bool)`, in one context.
-    let mut cx = TyCx::new_in(Alloc::global());
+    let mut cx = TyCx::new_in(heap.alloc());
     let small = cx.tys.tuple_of(&[i32_, Ty::BOOL]);
     const SMALL: usize = 200_000;
     let start = Instant::now();
@@ -162,7 +162,7 @@ fn main() {
     // Canonicalize: a small goal with three variables, key and all.
     let (a, b, c) = (cx.next_ty_var(), cx.next_ty_var(), cx.next_int_var());
     let goal = cx.tys.tuple_of(&[a, b, c, a, i32_]);
-    let mut buf = CanonBuf::new_in(Alloc::global());
+    let mut buf = CanonBuf::new_in(heap.alloc());
     const CANON: usize = 200_000;
     let start = Instant::now();
     for _ in 0..CANON {

@@ -123,11 +123,11 @@ fn a_crate_scope_record_files_its_names_and_items() {
             other => panic!("a payload cut at byte {cut} of {} was not refused as short: {other:?}", payload.len()),
         }
     }
-    // The tests section is empty here: it sits at the items' end rounded up to 16, so one byte
-    // off the end cuts either the items record or the padding before the empty tests record.
+    // The last section is cut: the expansion texts, or (when the crate's calls made none, and the
+    // tests section is empty too) the items record or the places of the empty sections after it.
     assert!(
-        matches!(sections(&payload[..payload.len() - 1]), Err(SectionsError::Short { section: Section::Items | Section::Tests, .. })),
-        "one byte off the end is the items record, or the place of the empty tests record, cut short"
+        matches!(sections(&payload[..payload.len() - 1]), Err(SectionsError::Short { section: Section::Items | Section::Tests | Section::Expansions, .. })),
+        "one byte off the end is the last non-empty section, or the place of an empty one after it, cut short"
     );
     let mut longer = payload.clone();
     longer.push(0);
@@ -209,6 +209,6 @@ fn a_test_units_payload_files_its_tests_record() {
     assert!(record.find("helper").unwrap_or_else(|e| panic!("find: {e}")).is_none(), "`helper` is no test");
 
     // The round trip: the payload written again from its own sections is the same bytes.
-    let again = write_payload(parts.unresolved, [parts.exports, parts.inner, parts.names, parts.items, parts.tests]);
-    assert_eq!(again.as_slice(), payload.as_slice(), "the payload written from its five sections differs from the one filed");
+    let again = write_payload(parts.unresolved, [parts.exports, parts.inner, parts.names, parts.items, parts.tests, parts.expansions]);
+    assert_eq!(again.as_slice(), payload.as_slice(), "the payload written from its six sections differs from the one filed");
 }

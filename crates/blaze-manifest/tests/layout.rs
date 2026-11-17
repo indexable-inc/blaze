@@ -21,7 +21,7 @@ fn fixtures() -> &'static Path {
 
 /// The layout of the workspace whose start is `start`, under the anchor `anchor`.
 fn read(anchor: &Path, start: &str) -> Units<'static> {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let mut layout = Layout::new(start, alloc).unwrap();
     for _ in 0..64 {
         match layout.pass().unwrap() {
@@ -164,7 +164,7 @@ fn actual_deps(units: &Units<'_>, index: usize) -> BTreeSet<DepRow> {
 fn check(fixture: &str, start: &str) {
     let root = fixtures().join(fixture);
     let expected_text = std::fs::read(root.join("expected.json")).unwrap();
-    let expected: Json = blaze_json::read_in(&expected_text, blaze_json::Limits::DEFAULT, Alloc::global()).unwrap();
+    let expected: Json = blaze_json::read_in(&expected_text, blaze_json::Limits::DEFAULT, blaze_own::testing::heap().alloc()).unwrap();
     let units = read(&root, start);
 
     let packages = expected.get("packages").unwrap().as_list().unwrap();
@@ -243,7 +243,7 @@ fn single() {
 #[test]
 fn not_a_member() {
     let root = fixtures().join("not-a-member");
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let mut layout = Layout::new("stray", alloc).unwrap();
     let error = loop {
         match layout.pass() {

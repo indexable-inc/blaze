@@ -38,7 +38,7 @@ rustc_lexer.workspace = true
 [dev-dependencies]
 blaze-sim.workspace = true
 # `Alloc::global()`: the tests' handle.
-blaze-own = { workspace = true, features = ["std"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
 
 [lints]
 workspace = true

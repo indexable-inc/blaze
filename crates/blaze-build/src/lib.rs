@@ -199,9 +199,11 @@ pub mod imports;
 pub mod instance;
 pub mod intrinsics;
 pub mod layout;
+pub mod coroutine_niche;
 mod normalize;
 #[cfg(any(test, feature = "testing"))]
 pub mod read_back;
+pub mod start;
 pub mod tls;
 pub mod vtable;
 mod walk;
@@ -219,6 +221,7 @@ use blaze_typeck::{Adt, BodyView, Checked, Expr, ExprId, FmtTrait, FnSig, ItemKe
 pub use instance::{Instance, InstanceKey, ground, instance_key, instance_key_normalized};
 pub use walk::arith_checks::PanicConst;
 pub use walk::coroutine::{CoroutineFacts, CoroutineOf, StateShape, coroutine_facts, coroutine_of, coroutines_in, identity as coroutine_identity};
+pub use coroutine_niche::{NicheRefused, StateNiche, niche_of, row_niche};
 
 /// The instance being built: its generic arguments, types of `ground`, the program's one table
 /// of ground types. Every type the build lays out is first carried into `ground` with each
@@ -295,6 +298,16 @@ pub trait Adts {
     /// them (walk/unwind.rs). The default builds none, as before unwinding was built.
     fn panic(&self) -> Panic {
         Panic::Abort
+    }
+
+    /// Whether the body of fn item `owner` may not unwind (walk/nounwind.rs): its own ABI is of
+    /// the Reference's "non-unwinding" category ("C", "system", ...: not "Rust", not one ending
+    /// in "-unwind"), or it is `#[rustc_nounwind]`. `None`: not said; then a Rust body unwinds
+    /// and an `extern` body built under [`Panic::Unwind`] is refused by name, because
+    /// [`Abi::C`] stands for both "C" and "C-unwind".
+    fn nounwind(&self, owner: ItemKey) -> Option<bool> {
+        let _ = owner;
+        None
     }
 
     /// Whether `+ - *`, shifts and unary `-` on integers panic on overflow (the Reference,
@@ -382,6 +395,16 @@ pub trait Adts {
         None
     }
 
+    /// For a C-variadic foreign fn `item` (`fn printf(format: *const c_char, ...)`), its
+    /// declared parameter count: a call's arguments past it are the `...` ones
+    /// (walk/c_variadic.rs). `None`: not variadic. The checker refuses more arguments than
+    /// declared to any other fn (E0061), so a world that does not know `...` (the default)
+    /// never sees such a call checked.
+    fn c_variadic(&self, item: ItemKey) -> Option<u32> {
+        let _ = item;
+        None
+    }
+
     /// The text of string literal `expr` of the body of `owner` (its escapes processed).
     fn str_lit(&self, owner: ItemKey, expr: ExprId) -> Option<&str> {
         let _ = (owner, expr);
@@ -430,6 +453,25 @@ pub trait Adts {
     /// built in its place.
     fn const_block_value(&self, owner: ItemKey, block: ExprId, args: &[PTy]) -> Option<&data::DataRecord<Global>> {
         let _ = (owner, block, args);
+        None
+    }
+
+    /// The evaluated value of promoted borrow `borrow` (`&expr` listed in `Checked::promoted`) of
+    /// `owner`'s body at the instance's ground arguments `args`: the constant evaluator's record
+    /// of `expr`, read like a const block's (walk/promote.rs). The Reference, "Constant
+    /// promotion": the expression "can be evaluated at compile-time". No answer is refused with
+    /// [`BuildError::NoPromotedValue`]; the operand is never built as a frame temporary.
+    fn promoted_value(&self, owner: ItemKey, borrow: ExprId, args: &[PTy]) -> Option<&data::DataRecord<Global>> {
+        let _ = (owner, borrow, args);
+        None
+    }
+
+    /// The key the program gives fn instance `instance` (a promoted operand's fn item, its
+    /// arguments in `ground`), so a promoted record's `DataTarget::Fn(key)` is resolved to a
+    /// reference of this function (walk/promote.rs). No answer is refused with
+    /// [`BuildError::NoPromotedFnKey`].
+    fn promoted_fn_key(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<InstanceKey> {
+        let _ = (instance, ground);
         None
     }
 
@@ -506,6 +548,9 @@ pub struct StaticItem {
 pub enum Intrinsic {
     /// An intrinsic of [`intrinsics::TABLE`], built by [`intrinsics::build`].
     Table(intrinsics::Which),
+    /// A target intrinsic (a foreign fn of an `"unadjusted"` block whose `link_name` is
+    /// `llvm.*`, THREADS.md D1), built by [`intrinsics::target::build`].
+    Target(intrinsics::target::Target),
 }
 
 /// The ABI a fn is declared with.
@@ -648,6 +693,12 @@ pub enum BuildError {
     /// `const { .. }` block `expr` of `owner`'s body, whose value at the instance
     /// [`Adts::const_block_value`] does not hold. The block's code is never built in its place.
     NoConstBlockValue { expr: ExprId, owner: ItemKey },
+    /// Promoted borrow `expr` of `owner`'s body, whose value at the instance
+    /// [`Adts::promoted_value`] does not hold. Never built as a frame temporary.
+    NoPromotedValue { expr: ExprId, owner: ItemKey },
+    /// Path `expr` in a promoted operand names fn `item`, whose instance key
+    /// [`Adts::promoted_fn_key`] does not give.
+    NoPromotedFnKey { expr: ExprId, item: ItemKey },
     /// Path pattern `pat` names const `item`, whose value [`Adts::const_value`] does not hold.
     NoPatConstValue { pat: PatId, item: ItemKey },
     /// A layout read a record that is not made yet: `item`'s (an enum's explicit discriminant).
@@ -663,6 +714,9 @@ pub enum BuildError {
     /// Intrinsic call `expr` of `which` was not built: its arguments are not of the
     /// intrinsic's signature, or (`unsupported`) a use blaze does not build yet, named by `why`.
     Intrinsic { expr: ExprId, which: intrinsics::Which, why: &'static str, unsupported: bool },
+    /// A call of target intrinsic `target` (at `expr` when the walk knows it) was refused,
+    /// named by `why` (intrinsics/target.rs).
+    Target { target: intrinsics::target::Target, expr: Option<ExprId>, why: &'static str },
     /// An `extern "C"` signature's C ABI classification was refused (`cabi`), for fn `item`
     /// (none: a call through a fn pointer), naming why.
     CAbi { item: Option<ItemKey>, why: &'static str },
@@ -720,6 +774,9 @@ pub struct BuiltCoroutine<A: Allocator> {
     /// The state as the pass laid it out: the record `LayoutFacts::coroutine_state` answers
     /// from for this instance.
     pub state: StateShape,
+    /// The tag's valid range in that state ([`niche_of`] the pass's layout): the record
+    /// `LayoutFacts::coroutine_niche` answers from, kept beside `state`.
+    pub niche: StateNiche,
 }
 
 impl fmt::Display for BuildError {
@@ -766,6 +823,12 @@ impl fmt::Display for BuildError {
             BuildError::NoConstBlockValue { expr, owner } => {
                 write!(f, "expression {}: the const block of fn {:#x} has no evaluated value at this instance in the build's `Adts`", expr.0, owner.0)
             }
+            BuildError::NoPromotedValue { expr, owner } => {
+                write!(f, "expression {}: the promoted borrow of fn {:#x} has no promoted value at this instance in the build's `Adts`", expr.0, owner.0)
+            }
+            BuildError::NoPromotedFnKey { expr, item } => {
+                write!(f, "expression {}: fn {:#x} in a promoted value has no instance key in the build's `Adts`", expr.0, item.0)
+            }
             BuildError::NoPatConstValue { pat, item } => {
                 write!(f, "pattern {}: const item {:#x} has no evaluated value in the build's `Adts`", pat.0, item.0)
             }
@@ -786,6 +849,10 @@ impl fmt::Display for BuildError {
             BuildError::Intrinsic { expr, which, why, unsupported: true } => {
                 write!(f, "expression {}: intrinsic `{}`: {why} is not built to LIR yet", expr.0, which.entry().name)
             }
+            BuildError::Target { target, expr: Some(expr), why } => {
+                write!(f, "expression {}: target intrinsic `{}`: {why}", expr.0, target.link_name())
+            }
+            BuildError::Target { target, expr: None, why } => write!(f, "target intrinsic `{}`: {why}", target.link_name()),
             BuildError::CAbi { item: Some(item), why } => write!(f, "fn item {:#x}: its `extern \"C\"` signature: {why}", item.0),
             BuildError::CAbi { item: None, why } => write!(f, "a call through an `extern \"C\"` fn pointer: {why}"),
             BuildError::Vtable { at: Some(expr), error } => write!(f, "expression {}: a trait object's vtable: {error}", expr.0),

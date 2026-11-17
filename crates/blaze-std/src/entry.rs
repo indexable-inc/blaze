@@ -171,20 +171,22 @@ pub use crate::rt::{SPEC_MARK, SPEC_MARK_VALUE, launch};
 /// [`launch`] on a world its caller made: what file descriptor 3 would hold is
 /// `delivered` (`None`: closed), the process's world is `io`, and a manifest asked for is
 /// written to `io`'s standard output. A test runs a `#[bstd::main]`-shaped program with it on
-/// [`Io::sim`]: the macro's `body` is [`launch_body!`](crate::launch_body).
+/// [`Io::sim`]: the macro's `body` is [`launch_body!`](crate::launch_body). The launcher's
+/// spec and problems are made in `alloc`, which the caller (the test, its own entry) hands in
+/// (D102): `blaze_own::testing::heap().shared()`.
 pub fn launch_in<R: Outcome>(
     manifest: &'static crate::grant::Manifest,
     delivered: Option<&[u8]>,
     io: Io,
     said: &mut dyn fmt::Write,
+    alloc: crate::grant::LaunchAlloc,
     body: impl FnOnce(&mut crate::grant::Given<'_>) -> Result<R, crate::grant::Refused>,
 ) -> Status {
-    let alloc = blaze_own::SharedAlloc::global();
     let defaults = || {
         let (args, env) = (blaze_own::Vec::new_in(alloc), blaze_own::Vec::new_in(alloc));
         crate::spec::RunSpec::defaults(args, env, blaze_own::String::from_str_in("/", alloc), alloc)
     };
-    match crate::grant::prepare(manifest, delivered, defaults) {
+    match crate::grant::prepare(manifest, delivered, defaults, alloc) {
         crate::grant::Prepared::Manifest(text) => match io.write_out(crate::out::Stream::Out, &[text.as_bytes(), b"\n"]) {
             Ok(()) => Status::OK,
             Err(why) => {

@@ -1,0 +1,4 @@
+[package]
+name = "ladder-s2-gen-01-dyn-traits"
+version = "0.1.0"
+edition = "2024"

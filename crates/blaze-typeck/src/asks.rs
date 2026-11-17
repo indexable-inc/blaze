@@ -56,7 +56,7 @@ pub(crate) struct Cursor {
 }
 
 /// The question kinds the tally counts apart, in [`Question`]'s declaration order.
-pub const QUESTION_KINDS: [&str; 20] = [
+pub const QUESTION_KINDS: [&str; 21] = [
     "FnSig",
     "Predicates",
     "Adt",
@@ -77,6 +77,7 @@ pub const QUESTION_KINDS: [&str; 20] = [
     "ConstParams",
     "Closure",
     "AssocGenerics",
+    "Coroutine",
 ];
 
 /// The index of `q`'s kind in [`QUESTION_KINDS`].
@@ -102,6 +103,7 @@ pub const fn question_kind(q: Question) -> usize {
         Question::ConstParams(_) => 17,
         Question::Closure(..) => 18,
         Question::AssocGenerics(..) => 19,
+        Question::Coroutine(..) => 20,
     }
 }
 

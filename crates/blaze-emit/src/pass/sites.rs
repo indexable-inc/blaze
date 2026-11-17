@@ -123,7 +123,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
     }
 
     /// `adrp rt, 0; ldr rt, [rt]`: a load site, `rt` the value of `to`'s import word (an
-    /// address; for [`RelocTo::TlsOffset`] the offset).
+    /// address; for [`RelocTo::TlsIndex`] the index).
     pub(super) fn import_load(&mut self, rt: Reg, to: RelocTo) {
         let at = self.here();
         self.put(enc::adrp(rt, 0));
@@ -160,8 +160,9 @@ impl<A: Allocator> Pass<'_, '_, A> {
 
     /// [`Pass::finish`] in the record form: the data rows holding no address follow the
     /// instructions, the rows holding one go to the relro part with a word row per address,
-    /// then every field and the frame's size are patched as in the literal-word form.
-    pub(super) fn finish_record(&mut self, frame_at: u32, most_align: u64) -> Result<(), EmitError> {
+    /// then every field is patched as in the literal-word form (the frame's size and its
+    /// stack-probe tail were placed by `place_frame` before this, inside the instructions).
+    pub(super) fn finish_record(&mut self) -> Result<(), EmitError> {
         let Some(form) = self.record.take() else {
             return Err(EmitError::Record { why: "the record form's rows are gone before the pass finished" });
         };
@@ -244,6 +245,6 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 .ok_or(EmitError::Data { row, why: "an addend past what a word holds" })?;
             form.words.push(WordRow { at: word, to, addend });
         }
-        self.settle(frame_at, most_align, 0, 0, &form.data_at)
+        self.settle(0, 0, &form.data_at)
     }
 }

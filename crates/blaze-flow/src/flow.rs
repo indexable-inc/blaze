@@ -145,13 +145,20 @@ pub enum StmtKind {
     Switch { on: Place, targets: Ops },
     Return,
     Unreachable,
+    /// An `.await`'s suspension: polled again, go on at `resume`; dropped while parked here, go
+    /// to `cancel` (coroutines.md D2). A terminator.
+    Suspend { resume: Block, cancel: Block },
 }
 
 impl StmtKind {
     pub fn is_terminator(self) -> bool {
         matches!(
             self,
-            StmtKind::Goto(_) | StmtKind::Switch { .. } | StmtKind::Return | StmtKind::Unreachable
+            StmtKind::Goto(_)
+                | StmtKind::Switch { .. }
+                | StmtKind::Return
+                | StmtKind::Unreachable
+                | StmtKind::Suspend { .. }
         )
     }
 }
@@ -276,6 +283,10 @@ impl<A: Allocator> Flow<A> {
                     f(Stmt(self.blocks[b.index()].start));
                 }
             }
+            StmtKind::Suspend { resume, cancel } => {
+                f(Stmt(self.blocks[resume.index()].start));
+                f(Stmt(self.blocks[cancel.index()].start));
+            }
             StmtKind::Return | StmtKind::Unreachable => {}
             _ => f(Stmt(s.0 + 1)),
         }
@@ -381,6 +392,7 @@ impl<A: Allocator> Flow<A> {
                     }
                     StmtKind::Return => f.write_str("return")?,
                     StmtKind::Unreachable => f.write_str("unreachable")?,
+                    StmtKind::Suspend { resume, cancel } => write!(f, "suspend -> {resume}, cancel {cancel}")?,
                 }
                 for &(at, from, into) in self.subsets.iter() {
                     if at.0 == s {
@@ -591,6 +603,12 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
 
     pub fn ret(&mut self, span: Span) -> Stmt {
         self.push(StmtKind::Return, span)
+    }
+
+    /// Ends the open block with an `.await`'s suspension (span: the empty range, as the prompt's
+    /// signature takes none).
+    pub fn suspend(&mut self, resume: Block, cancel: Block) {
+        self.push(StmtKind::Suspend { resume, cancel }, Span::default());
     }
 
     pub fn finish(self) -> Result<Flow<A>, FlowError> {

@@ -28,6 +28,7 @@ use blaze_sim::{Broke, Config, Tape, check, control};
 use blaze_tier::{ARM64, Place, RegClass};
 
 use super::analysis::{Analysis, Home, NO_USE, Plant, analyse_planted};
+use super::loop_map::slot_of;
 
 /// A drawn block parameter's type: mostly `i64`, some `f64` (the other class), some `i128` (no
 /// register class: always a cell when it crosses a block).
@@ -458,8 +459,9 @@ fn header_map(view: View<'_>, got: &Analysis<'_>, header: usize, out: &[bool]) -
     };
     let row = got.loops[index as usize];
     let rows = &got.live[row.first as usize..(row.first + row.count) as usize];
-    if rows.windows(2).any(|pair| pair[0] > pair[1]) {
-        return Err(oracle(format!("header {header}'s rows are not sorted: {rows:?}")));
+    // blaze-tier record/form.rs `check`: "each header's live values by value", each once.
+    if rows.windows(2).any(|pair| pair[0].value >= pair[1].value) {
+        return Err(oracle(format!("header {header}'s rows are not sorted by value, each once: {rows:?}")));
     }
     for (value, &is_live) in live.iter().enumerate() {
         if !is_live {
@@ -481,7 +483,7 @@ fn header_map(view: View<'_>, got: &Analysis<'_>, header: usize, out: &[bool]) -
     }
     for it in rows {
         let extra = match it.place {
-            Place::Slot { .. } => it.value as usize >= view.slots.len(),
+            Place::Slot { .. } => slot_of(view.len(), it.value).is_none_or(|slot| slot >= view.slots.len()),
             Place::Reg(_) | Place::Cell { .. } => !live.get(it.value as usize).copied().unwrap_or(false),
         };
         if extra {

@@ -6,7 +6,6 @@ extern crate std;
 
 use std::{format, string::String, vec::Vec as StdVec};
 
-use blaze_own::Alloc;
 use blaze_sim::{Broke, Config, Tape};
 
 use super::{Part, Plant, join, part_digest, resplit_in, speculate, split_top_level};
@@ -55,7 +54,7 @@ fn boundary(text: &str, mut at: usize) -> usize {
 fn place(tape: &Tape, text: &str) -> usize {
     let near = |needle: &str| text.match_indices(needle).map(|(at, _)| at + needle.len()).collect::<StdVec<_>>();
     let cuts: StdVec<usize> =
-        split_top_level(text, Alloc::global()).iter().map(|range| usize::try_from(range.start).expect("small")).collect();
+        split_top_level(text, blaze_own::testing::heap().alloc()).iter().map(|range| usize::try_from(range.start).expect("small")).collect();
     let choices = [cuts, near("\""), near("/*"), near("//")];
     let at = match tape.below(5, "where") {
         4 => tape.index(text.len() + 1, "anywhere"),
@@ -82,7 +81,7 @@ fn edit(tape: &Tape, text: &str) -> String {
 }
 
 fn parts(text: &str) -> StdVec<Part> {
-    split_top_level(text, Alloc::global())
+    split_top_level(text, blaze_own::testing::heap().alloc())
         .iter()
         .map(|range| Part { range: *range, digest: part_digest(&text.as_bytes()[range.to_usize()]) })
         .collect()
@@ -95,7 +94,7 @@ fn resplit_equals_split(tape: &Tape, plant: Plant) -> Result<(), Broke> {
         after = edit(tape, &after);
     }
     let prev = parts(&before);
-    let made = resplit_in(&before, &prev, &after, Alloc::global(), plant);
+    let made = resplit_in(&before, &prev, &after, blaze_own::testing::heap().alloc(), plant);
     let want = parts(&after);
     if made.parts[..] != want[..] {
         return Err(Broke::Oracle(format!(
@@ -132,10 +131,10 @@ fn joined_equals_split(text: &str, starts: &[u32]) -> Result<(), String> {
     let chunks: StdVec<_> = starts
         .iter()
         .enumerate()
-        .map(|(at, &start)| speculate(text, start, starts.get(at + 1).copied().unwrap_or(len), Alloc::global()))
+        .map(|(at, &start)| speculate(text, start, starts.get(at + 1).copied().unwrap_or(len), blaze_own::testing::heap().alloc()))
         .collect();
-    let (joined, _) = join(text, &chunks, Alloc::global());
-    let want = split_top_level(text, Alloc::global());
+    let (joined, _) = join(text, &chunks, blaze_own::testing::heap().alloc());
+    let want = split_top_level(text, blaze_own::testing::heap().alloc());
     match joined[..] == want[..] {
         true => Ok(()),
         false => Err(format!("join differs from split_top_level at starts {starts:?}:\n{text:?}\n{:?}\n{:?}", &joined[..], &want[..])),
@@ -170,7 +169,7 @@ fn join_equals_split_on_library() {
             } else if path.extension().is_some_and(|it| it == "rs") {
                 let Ok(text) = std::fs::read_to_string(&path) else { continue };
                 for chunks in [2, 7, 18] {
-                    let starts = super::chunk_starts(&text, chunks, Alloc::global());
+                    let starts = super::chunk_starts(&text, chunks, blaze_own::testing::heap().alloc());
                     joined_equals_split(&text, &starts).unwrap_or_else(|why| panic!("{}: {why}", path.display()));
                 }
                 files += 1;

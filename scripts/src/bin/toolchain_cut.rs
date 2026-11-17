@@ -5,7 +5,7 @@
 //! ```text
 //! {"tree": "/path/to/blaze", "targets": ["aarch64-apple-darwin"],
 //!  "registry": "~/.cargo/registry/cache/index.crates.io-…", "shelf": "~/.blaze/v2/toolchain",
-//!  "write_pin": true, "check": false}
+//!  "write_pin": true, "check": false, "macro_side": false}
 //! ```
 //!
 //! - Resolves, per target, the sysroot's units with blaze-unit-graph: `sysroot` (its default
@@ -19,6 +19,10 @@
 //!   temporary name and renamed; a file already there is read and its digest compared), and
 //!   with `write_pin` the id to `crates/blaze-toolchain/PINNED`.
 //! - With `check`, writes nothing and fails when `PINNED` is not the id the tree cuts to.
+//! - With `macro_side`, also cuts the macro side, `wasm32-wasip1` (blaze_toolchain::side): the
+//!   library proc macros and build scripts are built against, kept apart from the target side's
+//!   by type. The triples cut are the targets and the macro side's, sorted, each once; one not
+//!   among the pinned nightly's recorded targets is refused by name before anything is resolved.
 
 #![feature(allocator_api)]
 
@@ -35,6 +39,7 @@ use blaze_manifest::lock::{Checksum, Lock, LockId, LockSource};
 use blaze_own::{Alloc, Vec as AVec};
 use blaze_script::input::{self, Fields, Input, InputError};
 use blaze_toolchain::record::{self, CrateIn, Role, TargetIn, UnitIn, UnitKind};
+use blaze_toolchain::side::{SideTriple, TargetSide, cut_triples};
 use blaze_toolchain::{Hex, ToolchainView, parse_hex};
 use blaze_unit_graph::{Ask, CfgAtom, Package, Pass, Resolution, Resolver, TargetDesc, UnitGraph, UnitKind as GraphKind};
 
@@ -47,10 +52,11 @@ struct Args {
     shelf: String,
     write_pin: bool,
     check: bool,
+    macro_side: bool,
 }
 
 impl Input for Args {
-    const FIELDS: &'static [&'static str] = &["tree", "targets", "registry", "shelf", "write_pin", "check"];
+    const FIELDS: &'static [&'static str] = &["tree", "targets", "registry", "shelf", "write_pin", "check", "macro_side"];
     fn parse(f: &Fields<'_>) -> Result<Args, InputError> {
         Ok(Args {
             tree: f.str("tree", None)?,
@@ -59,6 +65,7 @@ impl Input for Args {
             shelf: f.str("shelf", None)?,
             write_pin: f.bool("write_pin", Some(false))?,
             check: f.bool("check", Some(false))?,
+            macro_side: f.bool("macro_side", Some(false))?,
         })
     }
 }
@@ -171,6 +178,18 @@ fn target_desc(tree: &Path, triple: &str, alloc: Alloc<'static>) -> (TargetDesc<
         });
     }
     (TargetDesc::new(triple, cfg, alloc), atoms)
+}
+
+/// The targets the pinned nightly's answers are recorded for: the keys of `rustc.json`'s
+/// `targets` (the same file `target_desc` reads a target's cfgs from).
+fn recorded_targets(tree: &Path) -> Vec<String> {
+    let path = tree.join("crates/blaze-units/src/stdlib/rustc.json");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
+    let data: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
+    let Some(targets) = data.get("targets").and_then(|t| t.as_object()) else {
+        fail(&format!("{}: no `targets` object", path.display()))
+    };
+    targets.keys().cloned().collect()
 }
 
 /// Which tree a crate is from.
@@ -494,7 +513,11 @@ fn kind_of(kind: &GraphKind<'_>) -> Option<UnitKind> {
         GraphKind::Lib => Some(UnitKind::Lib),
         GraphKind::ProcMacro => Some(UnitKind::ProcMacro),
         GraphKind::BuildScript => Some(UnitKind::BuildScript),
-        GraphKind::Bin(_) | GraphKind::Test { .. } => None,
+        GraphKind::Bin(_)
+        | GraphKind::Test { .. }
+        | GraphKind::IntegrationTest(_)
+        | GraphKind::Example(_)
+        | GraphKind::Bench(_) => None,
     }
 }
 
@@ -593,14 +616,18 @@ fn main() {
     let mut facts = BTreeMap::new();
     let mut cut: Vec<(String, Vec<CutUnit>)> = Vec::new();
     let mut target_cfgs: Vec<Vec<(String, Option<String>)>> = Vec::new();
-    for triple in &args.targets {
+    let recorded = recorded_targets(&tree);
+    let recorded: Vec<&str> = recorded.iter().map(String::as_str).collect();
+    let asked: Vec<SideTriple<'_, TargetSide>> = args.targets.iter().map(|t| SideTriple::target(t.as_str())).collect();
+    let triples = cut_triples(&asked, args.macro_side.then(SideTriple::macros), &recorded, alloc).unwrap_or_else(|e| fail(&e.to_string()));
+    for triple in triples.iter().copied() {
         let (desc, atoms) = target_desc(&tree, triple, alloc);
         target_cfgs.push(atoms);
         let target: &'static TargetDesc<'static> = Box::leak(Box::new(desc));
         let lib_graph = resolve(&mut library, "sysroot", target, &registry, alloc);
         let ws_graph = resolve(&mut workspace, "blaze-std", target, &registry, alloc);
         let units = cut_target(&[(Origin::Library, &lib_graph, &library), (Origin::Workspace, &ws_graph, &workspace)], &mut facts);
-        cut.push((triple.clone(), units));
+        cut.push((triple.to_string(), units));
     }
     let resolved = started.elapsed();
 

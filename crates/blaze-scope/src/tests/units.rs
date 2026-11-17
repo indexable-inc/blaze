@@ -10,7 +10,13 @@ use blaze_toolchain::{Role, ToolchainView, UnitKind as ToolchainKind};
 use blaze_unit_graph::{CfgAtom, Resolver, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
 use edition::PackageEdition;
 
-use super::{Origin, RefusedCrate, UnitsError, unit_crates};
+use super::{Member, Origin, RefusedCrate, UnitsError, unit_crates};
+
+/// The workspace member of lock package `id`, at `m<id>` under the workspace.
+fn member(id: u32) -> Member<'static> {
+    let dir: &'static str = std::boxed::Box::leak(std::format!("m{id}").into_boxed_str());
+    Member::new(LockId(id), dir).expect("a plain dir")
+}
 
 const TRIPLE: &str = "aarch64-apple-darwin";
 
@@ -120,7 +126,7 @@ fn a_proc_macro_is_kept_without_its_host_deps_and_a_dropped_dep_is_refused() {
     let bytes = toolchain();
     let view = ToolchainView::open(&bytes, ToolchainView::id_of_bytes(&bytes)).expect("its own id");
     let lock = Lock::read(LOCK.as_bytes(), a()).expect("the lock");
-    let members = [LockId(0)];
+    let members = [member(0)];
 
     // app (lib, with a build script) on dep and on the proc macro pm, whose host dep syn is
     // not followed.
@@ -170,7 +176,7 @@ fn a_members_test_units_are_crates_with_test_in_their_cfg() {
     let bytes = toolchain();
     let view = ToolchainView::open(&bytes, ToolchainView::id_of_bytes(&bytes)).expect("its own id");
     let lock = Lock::read(LOCK.as_bytes(), a()).expect("the lock");
-    let members = [LockId(0)];
+    let members = [member(0)];
     let test_of = |bin: Option<&str>, deps: &[(&str, u32)]| {
         let mut u = unit(0, "app", UnitKind::Test { bin: bin.map(t) }, false, deps);
         u.cfg.push(CfgAtom::flag("test", a()));
@@ -248,7 +254,7 @@ fn a_member_proc_macro_resolves_its_dependencies_on_the_macro_side() {
     let lock = Lock::read(LOCK.as_bytes(), a()).expect("the lock");
     // app and its proc macro pm are both members; pm's host-side syn is followed onto the
     // macro side, app's target-side syn stays the target's.
-    let members = [LockId(0), LockId(2)];
+    let members = [member(0), member(2)];
     let g = || {
         graph(std::vec![
             unit(0, "app", UnitKind::Lib, false, &[("pm", 2), ("syn", 1)]),

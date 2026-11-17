@@ -16,6 +16,15 @@ use super::{Code, GenError, RES, Recipe, SiteAt, Slot, SlotKind, T0, T1, Vals};
 use crate::enc::{self, Cond, Size, X16, ZR};
 use crate::pass::{BRK_DIV_OVERFLOW, BRK_DIV_ZERO, BRK_UNREACHABLE, cond_of, is_signed};
 
+/// The composer's own instructions and the single-word forms added beside these (frame steps,
+/// moves, float cells, `ret`, the poll, `xor` immediates, shifted operands, `cbz`).
+#[path = "arm64_glue.rs"]
+pub(crate) mod glue_recipes;
+
+/// Shifts and divisions of 1 bit, and `freeze`, which the tier equality harness found missing.
+#[path = "arm64_one_bit.rs"]
+pub(crate) mod one_bit_recipes;
+
 type Each<'e> = dyn FnMut(&Recipe<'_>) -> Result<(), GenError> + 'e;
 
 const NONE: Form = Form::None;
@@ -100,7 +109,9 @@ pub(crate) fn recipes(each: &mut Each<'_>) -> Result<(), GenError> {
     conversions(each)?;
     memory(each)?;
     constants_and_sites(each)?;
-    floats(each)
+    floats(each)?;
+    one_bit_recipes::recipes(each)?;
+    glue_recipes::recipes(each)
 }
 
 fn integers(each: &mut Each<'_>) -> Result<(), GenError> {

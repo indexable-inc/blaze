@@ -18,6 +18,9 @@ pub(crate) mod async_fmt;
 pub(crate) mod async_fn;
 pub(crate) mod block;
 pub(crate) mod builtin_ops;
+pub(crate) mod c_variadic;
+#[cfg(test)]
+mod c_variadic_tests;
 pub(crate) mod call;
 pub(crate) mod cast;
 pub(crate) mod closure;
@@ -34,6 +37,7 @@ pub(crate) mod mut_places;
 pub(crate) mod op;
 pub(crate) mod opaque_def;
 pub(crate) mod pat;
+pub(crate) mod promote;
 pub(crate) mod self_path;
 pub mod suggest;
 pub(crate) mod writeback;

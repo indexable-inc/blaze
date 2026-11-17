@@ -42,7 +42,7 @@ fn inst(code: &[u8], at: u64) -> u32 {
 /// Prints `record: 2 targets, 2 sites, equal bytes from either order`.
 #[test]
 fn record_is_canonical() {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let code = [ADRP_X16, LDR_X16, BLR_X16, ADRP_X16, LDR_X16, BLR_X16, RET];
     let one = record(&code, &[(0, func("g")), (12, func("h"))], alloc);
     // The same calls, the targets added the other way round.
@@ -69,7 +69,7 @@ fn record_is_canonical() {
 /// Prints `refused: a code record's site at 4 covers 12 bytes past its 8 bytes of code`.
 #[test]
 fn site_past_the_code_is_refused() {
-    let mut r = CodeRecord::new_in(Alloc::global());
+    let mut r = CodeRecord::new_in(blaze_own::testing::heap().alloc());
     r.code.extend_from_slice(&ADRP_X16.to_le_bytes());
     r.code.extend_from_slice(&LDR_X16.to_le_bytes());
     let g = r.target(func("g"));
@@ -82,7 +82,7 @@ fn site_past_the_code_is_refused() {
 /// Prints `bundle: f calls g by bl +8, 0 imports; delta: 1 import`.
 #[test]
 fn bundle_relaxes_calls_within_it() {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let f = record(&[ADRP_X16, LDR_X16, BLR_X16, RET], &[(0, func("g"))], alloc);
     let g = record(&[RET], &[], alloc);
     let members = [
@@ -109,7 +109,7 @@ fn bundle_relaxes_calls_within_it() {
 /// Prints `folded: 2 functions, 1 body, 4 bytes of code`.
 #[test]
 fn equal_records_are_placed_once() {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let a = record(&[RET], &[], alloc);
     let b = record(&[RET], &[], alloc);
     let members = [
@@ -125,7 +125,7 @@ fn equal_records_are_placed_once() {
 /// Prints `edit: g moved to 0x100008000, 1 word rewritten at 0x100004000`.
 #[test]
 fn edit_rewrites_only_the_words_naming_what_moved() {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let base = 0x1_0000_0000;
     let f = record(&[ADRP_X16, LDR_X16, BLR_X16, RET], &[(0, func("g"))], alloc);
     let g = record(&[RET], &[], alloc);

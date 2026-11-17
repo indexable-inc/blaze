@@ -93,6 +93,7 @@ mod literal;
 mod nested;
 mod record;
 mod rules;
+pub mod seen;
 mod tokens;
 
 pub use crate::attr_value::{AttrLiteralError, MOST_ATTR_VALUE_DEPTH, attr_literal};
@@ -122,8 +123,7 @@ pub use crate::{
     },
     item::{AttrCall, DeriveUse, Derives, ItemAttrs, ItemAttrsError, NextAttr},
     key::{
-        CallKey, DefDigest, DefText, EXPANDER, ExpansionKey, TextCall, TextKey, call_key, def_digest, expansion_key, text_key,
-        text_key_with,
+        CallKey, EXPANDER, ExpansionKey, call_key, call_key_of, expansion_key,
     },
     limit::{Depth, LimitReached, RecursionLimit},
     nested::find_calls,
@@ -132,6 +132,6 @@ pub use crate::{
     },
     tokens::{
         Ctx, CtxNode, DefSite, Delim, Edition, LitKind, Mark, MarkOf, Raw, Sink, Spacing, Text,
-        Token, TokenHygiene, TokenKind, TokenStream, Transparency, lex,
+        Token, TokenHygiene, TokenKind, TokenStream, Transparency, lex, lex_inside,
     },
 };

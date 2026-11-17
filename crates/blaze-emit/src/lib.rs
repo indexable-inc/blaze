@@ -110,21 +110,16 @@
 //!
 //! # Thread-locals
 //!
-//! `tls_addr` follows the scheme of crates/blaze-build/src/tls.rs: one block per thread found
-//! by a pthread key, a descriptor static `{key @0, size @8, align @16, template @24}`
-//! ([`RelocTo::TlsDesc`]), and a getter `fn(desc) -> block` (C convention,
-//! [`RelocTo::TlsGetter`]) that allocates a thread's block on its first use. The thread-local's
-//! offset in the block is a literal word too ([`RelocTo::TlsOffset`]).
-//!
-//! - On macOS ([`Os::MacOs`]) the block is found in line, the getter only called on a thread's
-//!   first access: `ldr x9, =desc; ldr x10, [x9]; mrs x11, tpidrro_el0; and x11, x11, #~7;
-//!   ldr x0, [x11, x10, lsl #3]; cbnz x0, 1f; mov x0, x9; ldr x16, =getter; blr x16;
-//!   1: ldr x10, =offset; add x9, x0, x10`. This is a macOS private ABI (rule 45): libpthread's
-//!   `_pthread_getspecific_direct` reads the thread's specific-data slots at
-//!   `tpidrro_el0 & ~7`, and a key from `pthread_key_create` is its slot's index. The test
-//!   `the_direct_tsd_read_equals_pthread_getspecific` fails if an OS changes that layout.
-//! - On Linux ([`Os::Linux`]) every access calls the getter: the portable twin, the same
-//!   result through `pthread_getspecific`.
+//! `tls_addr` is the index form of crates/blaze-build/src/tls/index.rs (THREADS.md D2;
+//! `pass/tls_index.rs`): a descriptor static `{key @0, root @8, count @16, cap @24, vars @32}`
+//! ([`RelocTo::TlsDesc`]), the thread-local's index as a literal word ([`RelocTo::TlsIndex`]),
+//! and a getter `fn(desc, index, root_at) -> copy` (C convention, [`RelocTo::TlsGetter`])
+//! called only on the cold path. The thread's table is found in line from the root: on macOS
+//! ([`Os::MacOs`]) the key's TSD slot at `(tpidrro_el0 & ~7) + key * 8`, a macOS private ABI
+//! (rule 45): libpthread's `_pthread_getspecific_direct` reads the thread's specific-data slots
+//! there, and a key from `pthread_key_create` is its slot's index; the test
+//! `the_direct_tsd_read_equals_pthread_getspecific` fails if an OS changes that layout. On Linux
+//! ([`Os::Linux`]) the launcher's own thread-local at `tpidr_el0 + root`, which the getter keeps.
 //!
 //! # The subset
 //!
@@ -145,14 +140,17 @@
 //!   [`Reloc`]s; a static through a literal word placement fills, also a [`Reloc`]),
 //!   `func_addr`, `tls_addr`;
 //! - calls: `call` and `call_indirect` (C convention, at most 8 integer arguments past an
-//!   `sret`, `byval` copies, at most two integer returns, not variadic);
+//!   `sret`, `byval` copies, at most two integer returns; a C-variadic callee's variable
+//!   arguments in 8-byte stack slots on Apple and in the registers then stack slots on Linux:
+//!   pass/variadic.rs);
 //! - ends: `jump`, `br`, `switch`, `return`, `trap`, `unreachable`.
 //!
 //! Promise and hint flags are dropped (they only allow UB or say nothing); `volatile` on a
 //! load, store or atomic is honoured (each is one access of its width), atomic orderings as
 //! above. Refused by name: floats, vectors, `i128`, compounds other than integer pairs,
-//! more than 8 integer arguments (the rest go on the stack), a variadic signature (Apple
-//! passes the variable arguments on the stack), more than two returns, a `volatile` bulk
+//! more than 8 integer arguments (the rest go on the stack), a C-variadic definition, a
+//! variable argument narrower than 32 bits, an `f32`, an `i128` or a compound, more than 510
+//! stacked or stacked under an `invoke`, more than two returns, a `volatile` bulk
 //! operation, `memcmp`, `uninit`, `invoke` and unwinding, tail calls, `asm!`, target
 //! intrinsics, and `frame_address`, `return_address`, `stack_pointer`. The provenance
 //! operations are their bits: `expose` is `ptr_addr`, `from_exposed` the address itself,
@@ -170,10 +168,14 @@ use blaze_lir::{Op, View};
 
 mod compose;
 mod enc;
+mod enc_probe;
+mod enc_tls;
 mod pass;
 mod record;
 mod record_check;
 pub mod table_gen;
+mod tier;
+pub use tier::Reference;
 
 pub use record::{Named, Names, Outside, RecordEmitError, emit_record};
 pub use compose::Fast;
@@ -206,10 +208,32 @@ mod bulk_tests;
 mod abi_tests;
 
 #[cfg(test)]
+mod variadic_tests;
+
+#[cfg(test)]
 mod tls_tests;
 
 #[cfg(test)]
+mod tls_index_tests;
+
+#[cfg(test)]
+mod enc_tls_tests;
+
+#[cfg(test)]
+mod probe_tests;
+
+#[cfg(test)]
+mod probe_place_tests;
+
+#[cfg(test)]
 mod num_tests;
+
+#[cfg(test)]
+mod target_tests;
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tier_tests;
+
 
 /// The most bytes a `memcpy` or `memset` of a constant length is emitted inline; past it, the
 /// system routine is called. Measured on this Mac (Apple M-series, 2026-11-16) by
@@ -358,18 +382,17 @@ pub enum RelocTo {
     Routine(Routine),
     /// The program's thread-local descriptor static (crates/blaze-build/src/tls.rs).
     TlsDesc,
-    /// The program's thread-local getter, `fn(desc) -> block` (C convention).
+    /// The program's thread-local getter, `fn(desc, index, root_at) -> copy` (C convention).
     TlsGetter,
-    /// Not an address: the byte offset of the thread-local of reference place `place`
-    /// (`RefKind::Tls`) in the program's thread-local block. Placement writes that offset
-    /// plus `addend` as the word itself.
-    TlsOffset(u32),
+    /// Not an address: the run's index of thread-local `place` (`RefKind::Tls`) in the run's
+    /// thread-local table (blaze-build `tls::index`): the word holds the index plus `addend`.
+    TlsIndex(u32),
 }
 
 /// An 8-byte word of the code that placement fills: the address of `to` plus `addend`,
-/// little-endian (for [`RelocTo::TlsOffset`], the offset plus `addend`). A literal word the
+/// little-endian (for [`RelocTo::TlsIndex`], the index plus `addend`). A literal word the
 /// code loads (`data_addr` of a static, a routine, a thread-local's descriptor, getter and
-/// offset, `func_addr` of a slot function; `addend` 0), and each relocation of the function's
+/// index, `func_addr` of a slot function; `addend` 0), and each relocation of the function's
 /// own data rows (`DataRelocRec`), are one each.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Reloc {

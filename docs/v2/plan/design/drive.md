@@ -1462,6 +1462,40 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
       the existing `Effect::Map`), a get a copy or a borrow. Beyond the floor of a get: an
       edit run makes 121929 gets for one changed body, gets in proportion to the tree, not
       the edit.
+    - RUNNER 16 2026-11-16 (uncommitted; runs in port27/drive-1116/r16/; binaries
+      targets/green/release/blaze-r16-a (17:26) and blaze-r16-b (17:44), greenmixes).
+      ITEM 1, `blaze run` on a `no_core` program. Rule: the Rust Reference, "Preludes", extern
+      prelude ("If the `no_std` attribute is specified, then the `std` crate is not added");
+      `no_core` (unstable, so outside the Reference) takes `core` away too, as blaze-scope
+      graph.rs already does for names. BEFORE (blaze-r15-b, which still clashed on `sized`):
+      6.46 s real, 81695009964 instructions, load 34.1, then "the lang item `sized` is
+      declared twice"; `sample` (b1.sample.txt): 3144 of 3149 main-thread samples in
+      `run_program` > `resolve_crates`: the whole toolchain resolved for a crate that names
+      none of it (the debug test binary is ~10x that: the 60 s). FIX: NEW
+      blaze-ladder/src/library_set.rs (`library_of`, `toolchain_for`, `root_names_toolchain`:
+      a `no_core` root that writes no `extern crate core|alloc|std` gets `Toolchain::none()`),
+      wired by the RUN-PATH integrator into `build_new`, `run_program`, `build_records_new`.
+      Test `a_no_core_root_is_given_no_toolchain_crate_it_did_not_name`: passes; with the rule
+      removed: "left: Shelf right: None". "mixcheck test blaze-cli: exit 0; 2 passed, 0
+      failed" for `--test run_output` (17:36). AFTER, cold in a fresh home (blaze-r16-a):
+      "hello", exit 0, 4.05 s, 48873321669 instructions, load 26.2; sampled (a2.sample.txt):
+      1997 of 2222 samples now in the CHECK beside the run, `names::run` > `resolve_crate`:
+      "scopes 0 0 15 0", all 15 toolchain crates made. Two tries, both reverted: (a) leaving
+      toolchain crates out of `names::parts` broke 35 tests: a `Need` locates its name among
+      its home's parts; (b) handing a `no_core` crate no sysroot in names.rs `run` (reading the
+      root by `names.world.texts.read(at, ..)`) broke the names tests (NAMES runner 18's
+      removal proof: "4 passed, 6 failed" to "9 passed, 1 failed"): that read is likely not by
+      the world's crate index. OWED: a part located but run only when wanted (drive), and the
+      sysroot handed by the root's attributes read correctly.
+      ITEM 2, the module store's listing as a checked fact: sweep.rs `LeafKind::HomeListing`
+      (a folder under `<home>/.blaze`, followed like a listing; `read_home_listing`;
+      `Follow::follow` takes the home's folder), main.rs opens the machine store before the
+      sweep and reads the row `macros::MODULE_LISTING` after `units::lay`; the row is in the
+      units' source, so a module that comes or goes moves the certificate, the graph's source
+      and each `MacroModule` part's key; macros.rs files "store lacks" (`FailedSaying`). Test
+      `a_module_put_in_the_home_store_moves_the_units_source_and_nothing_else_does`: passes;
+      without the row: "a module put in the store moved nothing". Also `store.name_tool(tool)`
+      after `Layered::open` (main.rs).
 - Owed, not now: `run` after `check` writes its own certificate, because the command is in
   the key. That costs 3.5 ms against the second run's 1.0 ms on hello-world. A coarse proof
   covers all under it: `check`'s certificate should stand for `run`'s check part.

@@ -86,3 +86,52 @@ fn negation_of_an_unsigned_integer_is_refused_by_the_reference() {
         );
     }
 }
+
+/// `fn g() { let x = 5; let y = -x; let z: <late> = x; }` in the module doc's world: `-x` is
+/// checked while `x` is still `{integer}`, and `x` is resolved by the LATER `let`.
+fn negate_then_resolve(late: PNode) -> crate::Checked<'static> {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let p0 = fx.param(0);
+    let i32_ = fx.ty(PNode::Int(IntTy::I32));
+    let neg = fx.tr("Neg", 1, Vec::new(), &["Output"]);
+    fx.lang(LangItem::Neg, neg);
+    let out = fx.alias(neg, "Output", &[p0]);
+    fx.trait_fn(neg, "neg", true, &[p0], out);
+    fx.imp("neg for i32", 0, i32_, Some((neg, &[])), &[("Output", i32_)], Vec::new());
+    let unit = fx.unit();
+    let owner = fx.func("g", 0, &[], unit, Vec::new());
+    fx.finish();
+    let mut bb = Bb::new();
+    let x = bb.bind("x");
+    let lit = bb.int(None);
+    let s0 = bb.let_(x, None, lit);
+    let y = bb.bind("y");
+    let xe = bb.local(x);
+    let neg_e = bb.e(Expr::Unary { op: UnOp::Neg, operand: xe });
+    let s1 = bb.let_(y, None, neg_e);
+    let z = bb.bind("z");
+    let zt = bb.ty(late);
+    let xe2 = bb.local(x);
+    let s2 = bb.let_(z, Some(zt), xe2);
+    let root = bb.block(&[s0, s1, s2], None);
+    check_body(&fx, &bb, owner, root, Plant::None, InferPlant::None)
+}
+
+/// REFUSED: `-x` where `x` is `{integer}` at the negation and `u32` after the next `let` is
+/// refused (the obligation `u32: Neg`, which no impl answers: E0277 or E0600, at the
+/// negation). CLEAN twin: the same with `i32`, which core's `Neg` impl answers.
+/// Before the fix (Edit 1 of wiring wrong-r7-neg-var-1.md) the `u32` case found nothing.
+/// Prints `test suite::neg_unsigned::negation_of_a_variable_resolved_unsigned_later_is_refused ... ok`.
+#[test]
+fn negation_of_a_variable_resolved_unsigned_later_is_refused() {
+    let clean = negate_then_resolve(PNode::Int(IntTy::I32));
+    assert!(clean.diags.is_empty(), "-x with x: i32 later: {:?}", clean.diags);
+    let c = negate_then_resolve(PNode::Uint(UintTy::U32));
+    let found: Vec<_> = c.diags.iter().map(|d| d.code).collect();
+    assert!(
+        found.iter().any(|code| matches!(code, DiagCode::UnOp | DiagCode::Unsatisfied)),
+        "-x with x: u32 later is not refused: {found:?}"
+    );
+}

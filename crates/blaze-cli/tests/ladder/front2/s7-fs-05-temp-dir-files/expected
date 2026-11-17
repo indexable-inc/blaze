@@ -1,0 +1,13 @@
+status 0
+stdout
+"alpha\nbeta\ngamma\n"
+17
+["line 0", "line 1", "line 2"]
+["a.txt", "sub"]
+["b.txt:file", "deeper:dir"]
+beta
+false true
+17
+NotFound
+Err(AlreadyExists)
+false

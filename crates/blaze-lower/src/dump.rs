@@ -461,7 +461,7 @@ fn expr(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, e: ExprId) -> fmt::
             work.push(W::Row(row));
             Ok(())
         }
-        Expr::Asm => node(p, work, "asm", &[W::Src(r)]),
+        Expr::Asm { .. } => node(p, work, "asm", &[W::Src(r)]),
         Expr::OffsetOf { ty, fields } => node(p, work, "offset-of", &[W::Ty(ty), W::Names(fields)]),
         Expr::Underscore => p.atom("_"),
         Expr::Await(e) => node(p, work, "await", &[W::Expr(e)]),

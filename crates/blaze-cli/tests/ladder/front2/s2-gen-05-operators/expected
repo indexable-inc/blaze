@@ -1,0 +1,14 @@
+status 0
+stdout
+V2 { x: 11, y: 22 }
+V2 { x: -3, y: -6 }
+V2 { x: 2, y: 4 } true
+5 6 0
+212
+Ok(Even(4)) Err("5 is odd")
+Ok(Even(8))
+Err("number too large to fit in target type")
+8
+c
+Less
+4

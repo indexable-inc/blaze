@@ -18,15 +18,19 @@
 
 #![no_std]
 
+pub mod features;
 pub mod key;
 pub mod names;
 pub mod record;
 pub mod regs;
+pub mod route;
 pub mod sample;
 pub mod seam;
 pub mod table;
 
+pub use features::{Feature, FeatureError, Features};
 pub use names::{Named, Names, Outside};
+pub use route::first_tier;
 pub use record::{Emitted, InlineFrame, Live, LoopHeader, OUTERMOST, Place, Poll, Position, Reloc, RelocKind};
 pub use regs::{ARM64, Arch, Machine, Os, Reg, RegClass, RegDesc, RegSet};
 pub use regs::x86_64::X86_64_SYSV;

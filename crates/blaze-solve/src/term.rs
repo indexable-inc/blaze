@@ -553,6 +553,19 @@ pub enum Lang {
     Future,
     /// `Future::Output` (`future_output`).
     FutureOutput,
+    /// The trait `AsyncFn` (`async_fn`; library/core/src/ops/async_function.rs). The six
+    /// async-callable items are last, so the earlier items keep their indices.
+    AsyncFn,
+    /// The trait `AsyncFnMut` (`async_fn_mut`).
+    AsyncFnMut,
+    /// The trait `AsyncFnOnce` (`async_fn_once`).
+    AsyncFnOnce,
+    /// `AsyncFnOnce::Output` (`async_fn_once_output`).
+    AsyncFnOnceOutput,
+    /// `AsyncFnOnce::CallOnceFuture` (`call_once_future`).
+    CallOnceFuture,
+    /// `AsyncFnMut::CallRefFuture` (`call_ref_future`).
+    CallRefFuture,
 }
 
 /// The shape of a self type impls are bucketed by (rustc's `SimplifiedType`, blaze-impls'

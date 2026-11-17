@@ -11,7 +11,7 @@ use blaze_columns::{
     Batch, Field, Values,
     enc::{IntPolicy, StrPolicy, encode_ints, encode_strs},
 };
-use blaze_own::{AVec, Alloc};
+use blaze_own::AVec;
 use blaze_parquet::{Compression, Encoding, File, Options, write};
 
 const CONFIGS: [(&str, Encoding, Compression); 5] = [
@@ -36,7 +36,7 @@ fn best(runs: usize, mut f: impl FnMut()) -> f64 {
 /// The bytes `values` take in blaze-columns' own encodings (`encode_ints` / `encode_strs` at
 /// their record policies), for comparison: each value read in place, no page decoded.
 fn columns_bytes(values: &Values<Global>) -> usize {
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let mut out = AVec::new_in(alloc);
     let ints = |it: &mut dyn Iterator<Item = u64>, out: &mut AVec<'_, u8>| {
         let all: Vec<u64> = it.collect();

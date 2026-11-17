@@ -28,10 +28,16 @@ pub mod clock;
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
+pub mod attribute;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod register;
 pub mod ring;
 
 #[cfg(all(test, not(blaze_check)))]
 mod tests;
+
+#[cfg(all(test, not(blaze_check)))]
+mod attribute_tests;
 
 #[cfg(all(test, blaze_check))]
 mod ring_wait;

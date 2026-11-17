@@ -95,6 +95,9 @@ pub enum Rule {
     UnsizeArray,
     /// `consider_builtin_struct_unsize`: `c` is the target struct.
     UnsizeStruct,
+    /// `consider_builtin_async_fn_trait_candidates` for this goal kind; `c` is
+    /// `Tuple([inputs, output])` (async_fn.rs).
+    AsyncFnTrait(ClosureKind),
 }
 
 /// A closure kind (`rustc_type_ir::ClosureKind`), in the order of `extends`.
@@ -364,6 +367,11 @@ pub fn assemble<T: Tys, F: Facts>(
             Some(Lang::FnMut) => assemble_fn_trait(cx, g, self_ty, ClosureKind::FnMut, out)?,
             Some(Lang::FnOnce) => assemble_fn_trait(cx, g, self_ty, ClosureKind::FnOnce, out)?,
             Some(Lang::FnPtrTrait) => assemble_fn_ptr_trait(g, k, out),
+            Some(l @ (Lang::AsyncFn | Lang::AsyncFnMut | Lang::AsyncFnOnce)) => {
+                if let Some(kind) = crate::async_fn::goal_kind(l) {
+                    crate::async_fn::assemble_async_fn_trait(cx, g, self_ty, kind, out)?;
+                }
+            }
             // `consider_builtin_future_candidate`: an async coroutine implements `Future`
             // (its `Output` by `normalize_future_output`).
             Some(Lang::Future) => {
@@ -451,7 +459,7 @@ fn is_known_rigid(k: TyKind) -> bool {
 }
 
 /// What `extract_tupled_inputs_and_output_from_callable` answers.
-enum Callable {
+pub(crate) enum Callable {
     /// `Err(NoSolution)`.
     No,
     /// `Ok(None)`: the closure's kind is not known yet.
@@ -465,7 +473,7 @@ enum Callable {
 ///
 /// A closure's signature (the second-to-last of its args) is the reference's "rust-call" form:
 /// its one input is the tuple of the closure's arguments (`sig.inputs().get(0)`).
-fn callable<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, self_ty: Ty, goal_kind: ClosureKind) -> Result<Callable, Stop> {
+pub(crate) fn callable<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, self_ty: Ty, goal_kind: ClosureKind) -> Result<Callable, Stop> {
     match cx.kind(self_ty) {
         TyKind::FnDef(d, args) => {
             let sig: FnSigDef<'_> = cx.fn_sig(d)?;
@@ -689,6 +697,7 @@ pub fn step<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, rule: 
         Rule::UnsizeUpcast => step_upcast(cx, cand),
         Rule::UnsizeArray => step_array_unsize(cx, cand),
         Rule::UnsizeStruct => step_struct_unsize(cx, cand),
+        Rule::AsyncFnTrait(_) => crate::async_fn::step_async_fn_trait(cx, cand),
     }
 }
 

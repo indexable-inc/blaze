@@ -275,7 +275,7 @@ fn draw_git(tape: &Tape, at: usize, limits: &Limits) -> Crate {
     let (commit, archive, tampered) = build_commit(tape, &name, hostile);
     let (_, decoy, _) = build_commit(tape, "decoy", Hostile::No);
     let truth = (hostile == Hostile::No).then(|| {
-        let (record, _) = unpack::git_record(commit, &archive, limits.git_most, &limits.unpack, Alloc::global()).unwrap();
+        let (record, _) = unpack::git_record(commit, &archive, limits.git_most, &limits.unpack, blaze_own::testing::heap().alloc()).unwrap();
         record.as_slice().to_vec()
     });
     let repo = format!("https://git.example.test/{name}.git");
@@ -364,7 +364,7 @@ fn draw_crate(tape: &Tape, at: usize, unpack: &unpack::Limits) -> Crate {
     let tampered = gzip(&tar_of(&folder, &other, None));
     let sha256 = blaze_sha256::digest(&archive);
     let truth = (hostile == Hostile::No).then(|| {
-        let (record, _) = unpack::crate_record(&name, &version, sha256, &archive, unpack, Alloc::global()).unwrap();
+        let (record, _) = unpack::crate_record(&name, &version, sha256, &archive, unpack, blaze_own::testing::heap().alloc()).unwrap();
         record.as_slice().to_vec()
     });
     Crate { name, version, hostile, archive, tampered, sha256, truth, git: None }
@@ -827,7 +827,7 @@ fn a_record_is_the_same_bytes_in_the_heap_or_in_place() {
         let unpack = limits(tape).unpack;
         let krate = draw_crate(tape, 0, &unpack);
         let Some(truth) = &krate.truth else { return Ok(()) };
-        let alloc = Alloc::global();
+        let alloc = blaze_own::testing::heap().alloc();
         let room = unpack::crate_room(&krate.archive, &unpack);
         if room.most < truth.len() as u64 {
             return Err(Broke::Oracle(format!("a bound of {} under a record of {}", room.most, truth.len())));
@@ -885,8 +885,8 @@ source = "git+ssh://git@example.com/o/r#0123456789abcdef0123456789abcdef01234567
 name = "w"
 version = "0.1.0"
 "#;
-    let lock = blaze_manifest::lock::Lock::read(lock, Alloc::global()).unwrap();
-    let plan = crate::plan::plan(&lock, Alloc::global()).unwrap();
+    let lock = blaze_manifest::lock::Lock::read(lock, blaze_own::testing::heap().alloc()).unwrap();
+    let plan = crate::plan::plan(&lock, blaze_own::testing::heap().alloc()).unwrap();
     assert_eq!((plan.packages, plan.paths, plan.units.len(), plan.skipped.len()), (6, 1, 2, 2));
     assert!(matches!(plan.units[0], Unit::Crate { name: "a", .. }));
     assert!(matches!(plan.units[1], Unit::Git { packages: 2, .. }));

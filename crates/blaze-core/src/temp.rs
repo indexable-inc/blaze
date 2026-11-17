@@ -11,10 +11,30 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-/// The system's temporary directory: `TMPDIR` where it is set, else the platform's (`/tmp` on
-/// Linux). Only [`TempDir`] and what makes a temporary file next to it read it.
+/// [`base_in`] and [`platform`]: the temporary directory from values its caller read.
+mod given;
+
+pub use given::base_in;
+#[cfg(unix)]
+pub use given::platform;
+
+/// The system's temporary directory: `TMPDIR` where it is set and not empty, else the
+/// platform's ([`platform`]: `/tmp` on Linux, the user's under `/var/folders` on macOS). Only
+/// [`TempDir`] and what makes a temporary file next to it read it.
+///
+/// Ambient (rule 75): reads this process's environment from nowhere. The capability form is
+/// [`base_in`] of the `TMPDIR` its caller read from its `Env`. Deleted by batch P5-temp once
+/// its callers have moved.
+#[allow(clippy::disallowed_methods, reason = "the ambient form's one read of TMPDIR, kept until batch P5-temp")]
 pub fn base() -> PathBuf {
-    std::env::temp_dir()
+    #[cfg(unix)]
+    {
+        base_in(std::env::var_os("TMPDIR").as_deref(), &platform())
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir()
+    }
 }
 
 /// A new directory under [`base`], removed with all it holds when this drops.

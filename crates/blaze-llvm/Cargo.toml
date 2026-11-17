@@ -28,6 +28,8 @@ blaze-tier.workspace = true
 blaze-code = { path = "../blaze-code" }
 # `AVec`, `AString`, `Alloc`: every list in the caller's allocator.
 blaze-own.workspace = true
+# `lock::Lock`: `init`'s one-time registration, waited on with a deadline.
+blaze-core.workspace = true
 
 [dev-dependencies]
 blaze-own = { workspace = true, features = ["std"] }

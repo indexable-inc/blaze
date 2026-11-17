@@ -19,18 +19,24 @@
 #[cfg(test)]
 mod tests;
 
+/// The parent's end of a socket pair given to the child as descriptor 3, read and written by
+/// deadline in whole length-prefixed messages.
+pub mod channel;
+/// The start every linked child goes through: streams, argv[0], the kill at the parent's death.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod run;
+
 pub use std::os::fd::BorrowedFd;
 use std::{
     cell::Cell,
     fmt, io,
     os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd},
     path::PathBuf,
-    sync::atomic::Ordering,
     time::Duration,
 };
 
 use crate::{
-    Command, Sandbox,
+    Command,
     wait::{Clock, Deadline, Monotonic},
 };
 
@@ -84,8 +90,14 @@ pub enum LinkOp {
     Reap,
     /// Signalling its group.
     KillGroup,
+    /// Sending it SIGTERM (`LinkedChild::terminate`: the run parent forwarding the SIGTERM it
+    /// was sent, D103).
+    Terminate,
     /// A group was asked to be killed of a child started without one of its own.
     NotOwnGroup,
+    /// The kernel's kill at the parent's death (`run::ParentDeath::Kernel`) is asked, and this
+    /// system has none (macOS).
+    NoParentDeathSignal,
 }
 
 impl LinkOp {
@@ -107,7 +119,11 @@ impl LinkOp {
             LinkOp::Wait => "waiting for its exit",
             LinkOp::Reap => "reaping it",
             LinkOp::KillGroup => "killing its process group",
+            LinkOp::Terminate => "sending it SIGTERM (the run parent forwards the SIGTERM it was sent, D103)",
             LinkOp::NotOwnGroup => "killing its group, when it was started without a group of its own",
+            LinkOp::NoParentDeathSignal => {
+                "the kernel's kill at the parent's death is asked, and this system has none (Linux's PR_SET_PDEATHSIG)"
+            }
         }
     }
 }
@@ -165,88 +181,18 @@ pub struct LinkedChild {
 }
 
 /// `command` started linked as `link` says: its descriptors given, its group its own where
-/// asked, listed until reaped. Refused by name: `Sandbox::On`, a memory limit, input, a target
-/// below 3 or named twice, more than [`MOST_INHERITED`] descriptors.
+/// asked, listed until reaped; no input, its output and error piped to the caller
+/// ([`LinkedChild::take_outputs`]). [`run::start_run`] with [`run::Streams::PIPED`]: its
+/// refusals are that function's.
 pub fn start_linked(command: &Command, link: &Link<'_>) -> Result<LinkedChild, LinkError> {
-    let refuse = |op: LinkOp, os: i32| LinkError {
-        // clone: an error path, the program's path.
-        program: command.program.clone(),
-        op,
-        os,
-    };
-    if !matches!(command.sandbox, Sandbox::Off) {
-        return Err(refuse(LinkOp::SandboxNotJoined, 0));
-    }
-    if command.memory.is_some() {
-        return Err(refuse(LinkOp::MemoryNotHeld, 0));
-    }
-    if !command.stdin.is_empty() {
-        return Err(refuse(LinkOp::InputNotWritten, 0));
-    }
-    if link.inherit.len() > MOST_INHERITED {
-        return Err(refuse(LinkOp::TooManyDescriptors, 0));
-    }
-    // Every target past 2 and named once; the copies go past the highest, so no `dup2` in the
-    // child lands on a source a later one still reads (`spawn_with`).
-    let mut highest: RawFd = 2;
-    for (at, &(_, target)) in link.inherit.iter().enumerate() {
-        let Ok(target) = RawFd::try_from(target) else { return Err(refuse(LinkOp::Target, 0)) };
-        let twice = link.inherit[..at].iter().any(|&(_, it)| RawFd::try_from(it) == Ok(target));
-        if target < 3 || twice {
-            return Err(refuse(LinkOp::Target, 0));
-        }
-        highest = highest.max(target);
-    }
-    // The parent's copies, closed on exec and when this returns: the child has its own by then.
-    let mut copies: [Option<OwnedFd>; MOST_INHERITED] = Default::default();
-    let mut extra: [(RawFd, RawFd); MOST_INHERITED] = [(-1, -1); MOST_INHERITED];
-    for (at, (fd, target)) in link.inherit.iter().enumerate() {
-        let copy = copy_past(*fd, highest + 1).map_err(|error| refuse(LinkOp::Copy, os_of(&error)))?;
-        // `target` was checked to fit a `RawFd` above.
-        extra[at] = (copy.as_raw_fd(), *target as RawFd);
-        copies[at] = Some(copy);
-    }
-    let program = super::spawn::Program {
-        program: &command.program,
-        args: &command.args,
-        env: &command.env,
-        dir: &command.dir,
-    };
-    let spawned =
-        super::spawn::spawn_with(&program, false, None, &extra[..link.inherit.len()], link.own_group)
-            .map_err(|error| refuse(LinkOp::Spawn, os_of(&error)))?;
-    drop(copies);
-    let run = super::RUNS.fetch_add(1, Ordering::Relaxed);
-    let listed = super::Listed::new(spawned.pid, run, &command.program);
-    #[cfg(target_os = "macos")]
-    let watch = match watch_exit(spawned.pid) {
-        Ok(watch) => watch,
-        Err(error) => {
-            // Not left running: killed (with its group where it has one) and reaped.
-            let target = if link.own_group { -spawned.pid } else { spawned.pid };
-            // SAFETY: no pointers; `spawned.pid` is this process's child, not yet reaped, so
-            // it and the group it leads are no one else's.
-            unsafe { libc::kill(target, libc::SIGKILL) };
-            _ = super::reap(spawned.pid);
-            drop(listed);
-            return Err(refuse(LinkOp::Watch, os_of(&error)));
-        }
-    };
-    Ok(LinkedChild {
-        pid: spawned.pid,
-        // clone: once per linked start, the program's path its errors name.
-        program: command.program.clone(),
+    let run = run::RunLink {
+        inherit: link.inherit,
         own_group: link.own_group,
-        clock: Monotonic::new(),
-        ended: Cell::new(None),
-        stdout: Some(spawned.stdout),
-        stderr: Some(spawned.stderr),
-        #[cfg(target_os = "linux")]
-        _pidfd: spawned.pidfd,
-        #[cfg(target_os = "macos")]
-        watch,
-        listed,
-    })
+        streams: run::Streams::PIPED,
+        arg0: None,
+        parent_death: run::ParentDeath::DropOnly,
+    };
+    run::start_run(command, &run)
 }
 
 impl LinkedChild {

@@ -25,7 +25,7 @@ blaze-kit.workspace = true
 # `enc`'s properties and planted-bug controls.
 blaze-sim.workspace = true
 # `Alloc::global()` for the tests and the cost example.
-blaze-own = { workspace = true, features = ["std"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
 # The cost example's token-kind column: the pinned nightly's lexer.
 rustc_lexer.workspace = true
 # The cost example's reference ratio for general compression: blaze's own DEFLATE, in the tree.

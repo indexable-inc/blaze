@@ -1,0 +1,4 @@
+[package]
+name = "ladder-s2-gen-04-iterator-chains"
+version = "0.1.0"
+edition = "2024"

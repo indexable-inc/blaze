@@ -10,6 +10,7 @@
 use blaze_surface::Range;
 
 pub use crate::columns::BodyRange;
+use crate::asm::AsmRule;
 use crate::columns::Lens;
 pub use blaze_typeck::{
     BinOp, BindAnn, ExprId, FloatTy, IntSuffix, IntTy, List, Mutbl, PatId, PathIdx, ScopeId, StmtId, UintTy,
@@ -826,8 +827,9 @@ pub enum Expr {
     FormatArgs { row: RowIdx },
     /// A macro call not expanded here: a row of [`MacroCall`].
     MacroCall { row: RowIdx },
-    /// `asm!`'s builtin form, kept by its range.
-    Asm,
+    /// `asm!`'s builtin form, its templates parsed and its operands placed: a row of
+    /// [`crate::asm::AsmForm`].
+    Asm { row: RowIdx },
     /// `offset_of!(T, a.b)`: the field names in `ids`.
     OffsetOf { ty: TypeId, fields: List },
     /// `_` on the left of an assignment.
@@ -954,7 +956,7 @@ impl Expr {
             E::Closure { row } => Node { a: row.0, ..n(30) },
             E::FormatArgs { row } => Node { a: row.0, ..n(31) },
             E::MacroCall { row } => Node { a: row.0, ..n(32) },
-            E::Asm => n(33),
+            E::Asm { row } => Node { a: row.0, ..n(33) },
             E::OffsetOf { ty, fields } => Node { a: ty.0, b: fields.start, c: fields.len, ..n(34) },
             E::Underscore => n(35),
             E::Await(e) => Node { a: e.0, ..n(36) },
@@ -1035,7 +1037,7 @@ impl Expr {
             30 => E::Closure { row: RowIdx(n.a) },
             31 => E::FormatArgs { row: RowIdx(n.a) },
             32 => E::MacroCall { row: RowIdx(n.a) },
-            33 => E::Asm,
+            33 => E::Asm { row: RowIdx(n.a) },
             34 => E::OffsetOf { ty: TypeId(n.a), fields: list(n.b, n.c) },
             35 => E::Underscore,
             36 => E::Await(ExprId(n.a)),
@@ -1232,6 +1234,13 @@ pub(crate) const ROW_ATTR: u16 = 17;
 pub(crate) const ROW_FIELD: u16 = 18;
 pub(crate) const ROW_VARIANT: u16 = 19;
 pub(crate) const ROW_ASSOC: u16 = 20;
+pub(crate) const ROW_ASM: u16 = 21;
+pub(crate) const ROW_ASM_PIECE: u16 = 22;
+pub(crate) const ROW_ASM_OPERAND: u16 = 23;
+/// Only on the machine's value stack, never placed: an `asm!`'s `options(..)` and one
+/// `clobber_abi` string (`asm.rs`).
+pub(crate) const ROW_ASM_OPTIONS: u16 = 24;
+pub(crate) const ROW_ASM_CLOBBER: u16 = 25;
 
 macro_rules! check_tag {
     ($n:expr, $tag:expr, $column:expr) => {
@@ -1899,8 +1908,13 @@ pub enum Why {
     ExpansionFailed,
     /// A macro call past [`crate::EXPANSION_DEPTH`] expansions deep.
     TooDeep,
-    /// `asm!`, `global_asm!` or `naked_asm!`: inline assembly has no lowering yet.
+    /// `global_asm!` or `naked_asm!`: no lowering yet (INTRINSICS.md P12); `asm!` lowers
+    /// (`asm.rs`).
     Asm,
+    /// An `asm!` template whose string escape makes a brace (`\u{7b}`, `\x7d`) or stands inside
+    /// a placeholder: its pieces are kept by range in the literal's text, which such an escape
+    /// would misread (rustc parses the template's value).
+    AsmTemplateEscape,
     /// A macro call after its body had made [`crate::EXPANSION_BUDGET`] expansions. The
     /// call's row names its path and range.
     TooMany,
@@ -1916,6 +1930,7 @@ impl Unhandled {
             Why::TooDeep => 5,
             Why::Asm => 6,
             Why::TooMany => 7,
+            Why::AsmTemplateEscape => 8,
         };
         Node { a: self.range.raw().start, b: self.range.raw().end, ..Node::of(self.syntax).with(why) }
     }
@@ -1931,6 +1946,7 @@ impl Unhandled {
                 5 => Why::TooDeep,
                 6 => Why::Asm,
                 7 => Why::TooMany,
+                8 => Why::AsmTemplateEscape,
                 _ => Why::Kind,
             },
         }
@@ -1966,6 +1982,10 @@ pub enum DiagKind {
     /// those or of a constant, a unit struct or a unit variant (the Reference, "Identifier
     /// patterns"; rustc: "match bindings cannot shadow statics").
     PatternShadows,
+    /// An `asm!` breaking a rule of the Reference's inline-assembly chapter, named by
+    /// [`AsmRule`] (`asm.rs`). Encoded with the tag `DIAG_KINDS.len()` and the rule's code in
+    /// `c`.
+    Asm(AsmRule),
 }
 
 /// A diagnostic, at a range of the record (its position: [`crate::View::site`]).
@@ -1990,15 +2010,20 @@ const DIAG_KINDS: [DiagKind; 10] = [
 
 impl Diag {
     pub(crate) fn encode(self) -> Node {
-        let code = DIAG_KINDS.iter().position(|k| *k == self.kind).map_or(0, |i| i as u16);
-        Node { a: self.range.raw().start, b: self.range.raw().end, ..Node::of(code) }
+        let (code, rule) = match self.kind {
+            DiagKind::Asm(rule) => (DIAG_KINDS.len() as u16, rule.code()),
+            kind => (DIAG_KINDS.iter().position(|k| *k == kind).map_or(0, |i| i as u16), NONE),
+        };
+        Node { a: self.range.raw().start, b: self.range.raw().end, c: rule, ..Node::of(code) }
     }
 
     pub(crate) fn decode(n: Node, lens: Lens) -> Result<Diag, BadRow> {
-        Ok(Diag {
-            kind: *DIAG_KINDS.get(n.tag as usize).ok_or(bad("diags", n.tag))?,
-            range: BodyRange::new(Range::new(n.a, n.b), lens),
-        })
+        let kind = if n.tag as usize == DIAG_KINDS.len() {
+            DiagKind::Asm(AsmRule::of_code(n.c).ok_or(bad("diags", n.tag))?)
+        } else {
+            *DIAG_KINDS.get(n.tag as usize).ok_or(bad("diags", n.tag))?
+        };
+        Ok(Diag { kind, range: BodyRange::new(Range::new(n.a, n.b), lens) })
     }
 }
 

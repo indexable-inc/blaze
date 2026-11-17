@@ -11,13 +11,17 @@
 //! | `run` | the straight line: lower, check, build, emit, place, call | the request machine's tasks |
 
 #![feature(allocator_api)]
+#![feature(thread_local)]
 
 mod class_chain;
 pub mod code_records;
+mod emit_class;
 pub mod crates;
 mod fn_shim;
 pub mod front;
 pub mod front2;
+pub mod library_set;
+pub mod personality;
 pub mod place;
 pub mod program_texts;
 pub mod refusal;
@@ -26,6 +30,8 @@ pub mod run;
 pub mod seam;
 pub mod stub;
 pub mod symbols;
+pub mod tls_index;
+pub mod trap;
 
 #[cfg(test)]
 mod tests;

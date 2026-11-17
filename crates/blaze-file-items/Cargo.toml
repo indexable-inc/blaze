@@ -40,6 +40,7 @@ blaze-lex.workspace = true
 blaze-memchr.workspace = true
 
 [dev-dependencies]
+blaze-own = { workspace = true, features = ["testing"] }
 blaze-sim.workspace = true
 # `Aligned`: a record's bytes at the alignment its view reads them at.
 blaze-format.workspace = true

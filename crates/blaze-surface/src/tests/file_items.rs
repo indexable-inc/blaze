@@ -6,7 +6,6 @@ use std::alloc::Global;
 
 use blaze_format::Aligned;
 use blaze_id::ContentId;
-use blaze_own::Alloc;
 use blaze_sim::{Broke, Config, Tape};
 
 use super::{file, name, small};
@@ -183,7 +182,7 @@ fn oracle(what: &str) -> Broke {
 fn file_items_read_back_every_value() {
     blaze_sim::check(Config::cases(300), |tape| {
         let drawn = drawn(tape);
-        let bytes = drawn.parts().write(Alloc::global()).map_err(|error| Broke::Oracle(error.to_string()))?;
+        let bytes = drawn.parts().write(blaze_own::testing::heap().alloc()).map_err(|error| Broke::Oracle(error.to_string()))?;
         let buffer = Aligned::copy_from(&bytes);
         let view = FileItemsView::read(&buffer).map_err(|error| Broke::Oracle(error.to_string()))?;
         if view.file() != file(0) || !view.items().map(|entry| entry.item).eq(drawn.items.iter().copied()) {
@@ -261,7 +260,7 @@ fn write_one(item: Item) -> Result<(), BuildError> {
         messages: &[],
         file_flags: ItemFlags::NONE,
     };
-    parts.write(Alloc::global()).map(|_| ())
+    parts.write(blaze_own::testing::heap().alloc()).map(|_| ())
 }
 
 /// The control is written; each fault, planted in it alone, is refused by name.

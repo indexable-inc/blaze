@@ -15,9 +15,10 @@
 //!   `Unit::name`, `Unit::version`);
 //! - `CARGO_CRATE_NAME`: the crate's name (`-` already `_` in the unit graph's `crate_name`);
 //! - `CARGO_BIN_NAME`: a binary's name;
-//! - `CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH`: the package's STABLE folder, `/package/N`
-//!   (the folder its files are read under: units.rs's `shown_from`), never where the checkout
-//!   is (rules 21, 25);
+//! - `CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH`: the root the crate SEES (decision D96,
+//!   [`SeenRoot`]): `/package` for every dependency, `/workspace/<member dir>` for a member;
+//!   never where the checkout is, nor the folder the host reads its files under (that is
+//!   [`CrateEnv::read_folder`], the caller's path space: two values, two types, rule 76);
 //! - `OUT_DIR` and every `cargo::rustc-env` pair: from the build script's joined outputs record
 //!   (blaze-build-script's `OutputsRef`), a later pair of one name winning as cargo gives it.
 //!
@@ -36,6 +37,9 @@
 use core::fmt;
 
 use blaze_build_script::OutputsRef;
+/// The root a crate sees (D96): its home is blaze-expand's `seen`, re-exported for the crates
+/// that make environments.
+pub use blaze_expand::seen::{MemberDirError, SeenRoot};
 use blaze_own::{AString, AVec, Alloc};
 use blaze_unit_graph::{UnitGraph, UnitKind};
 
@@ -75,9 +79,11 @@ pub struct EnvFacts<'p> {
     pub package: Option<(&'p str, &'p str)>,
     /// A binary's name (`CARGO_BIN_NAME`).
     pub bin: Option<&'p str>,
-    /// The package's stable folder, as the crate's files are read under it (`/package/N/`, a
-    /// trailing `/` allowed): `CARGO_MANIFEST_DIR` without the trailing `/`.
-    pub folder: &'p str,
+    /// The root the crate sees (D96): `CARGO_MANIFEST_DIR`.
+    pub seen: SeenRoot<'p>,
+    /// The folder the host reads the crate's files under, in the caller's path space
+    /// (`/<tree>/<dir>/`, `/package/N/`; a trailing `/` allowed): never shown to user code.
+    pub read_folder: &'p str,
     /// The package has a build script.
     pub build_script: bool,
     /// Its outputs record, once joined (`UnitCrates::join_scripts`).
@@ -96,8 +102,10 @@ pub struct CrateEnv<'a> {
     /// `CARGO_BIN_EXE_<name>` is set for this crate (an integration test or a bench) but not
     /// known.
     bin_exe_unknown: bool,
-    /// The package's folder with its trailing `/` (`/package/N/`).
-    folder: AString<'a>,
+    /// The root the crate sees (D96).
+    seen: SeenRoot<'a>,
+    /// The folder its files are read under, with its trailing `/` (the caller's path space).
+    read_folder: AString<'a>,
     script: Option<OutputsRef<'a>>,
 }
 
@@ -157,13 +165,15 @@ impl<'a> CrateEnv<'a> {
             let order = given.len() as u32;
             given.push((AString::from_str_in(name, alloc), AString::from_str_in(value, alloc), order));
         };
-        let folder = facts.folder.trim_end_matches('/');
-        let mut with_slash = AString::from_str_in(folder, alloc);
-        with_slash.push_str("/");
-        let mut manifest = AString::from_str_in(folder, alloc);
+        let mut read_folder = AString::from_str_in(facts.read_folder.trim_end_matches('/'), alloc);
+        read_folder.push_str("/");
+        let mut dir = AString::new_in(alloc);
+        // An arena string takes any length: writing cannot fail.
+        let _ = fmt::write(&mut Into(&mut dir), format_args!("{}", facts.seen));
+        let mut manifest = AString::from_str_in(dir.as_str(), alloc);
         manifest.push_str("/Cargo.toml");
         put(&mut given, "CARGO_CRATE_NAME", facts.crate_name);
-        put(&mut given, "CARGO_MANIFEST_DIR", folder);
+        put(&mut given, "CARGO_MANIFEST_DIR", dir.as_str());
         put(&mut given, "CARGO_MANIFEST_PATH", manifest.as_str());
         if let Some((name, version)) = facts.package {
             let [major, minor, patch, pre] = version_parts(version).ok_or(CrateEnvError::Version { krate: facts.crate_name, version })?;
@@ -206,7 +216,7 @@ impl<'a> CrateEnv<'a> {
         }
         unknown.sort_unstable();
         unknown.dedup();
-        Ok(CrateEnv { vars, unknown, bin_exe_unknown: facts.test_or_bench, folder: with_slash, script: facts.script })
+        Ok(CrateEnv { vars, unknown, bin_exe_unknown: facts.test_or_bench, seen: facts.seen, read_folder, script: facts.script })
     }
 
     /// The variable `name`: its value, `None` when the crate is compiled without it (`env!` of
@@ -222,10 +232,16 @@ impl<'a> CrateEnv<'a> {
         Ok(None)
     }
 
-    /// The package's stable folder, with its trailing `/` (`/package/N/`): where the crate's
-    /// files are read, and what `CARGO_MANIFEST_DIR` names.
-    pub fn folder(&self) -> &str {
-        self.folder.as_str()
+    /// The folder the crate's files are read under, with its trailing `/`, in the caller's path
+    /// space: an include's read bound. Never what user code sees ([`CrateEnv::seen`]).
+    pub fn read_folder(&self) -> &str {
+        self.read_folder.as_str()
+    }
+
+    /// The root the crate sees (D96): what `CARGO_MANIFEST_DIR` names, and the root an
+    /// absolute include path is taken under.
+    pub fn seen(&self) -> SeenRoot<'a> {
+        self.seen
     }
 
     /// The build script's joined outputs record: its `OUT_DIR` files are read from it.
@@ -261,7 +277,8 @@ impl<'a> UnitCrates<'a> {
                         UnitKind::Bin(name) => Some(name.as_str()),
                         _ => None,
                     },
-                    folder: c.shown_from.as_str(),
+                    seen: c.seen,
+                    read_folder: c.shown_from.as_str(),
                     build_script: c.build_script,
                     script: c.script,
                     test_or_bench: matches!(unit.kind, UnitKind::IntegrationTest(_) | UnitKind::Bench(_)),
@@ -271,7 +288,8 @@ impl<'a> UnitCrates<'a> {
                 crate_name: c.name,
                 package: None,
                 bin: None,
-                folder: c.shown_from.as_str(),
+                seen: c.seen,
+                read_folder: c.shown_from.as_str(),
                 build_script: false,
                 script: None,
                 test_or_bench: false,
@@ -281,8 +299,19 @@ impl<'a> UnitCrates<'a> {
     }
 }
 
+/// `fmt::Write` into an arena string.
+struct Into<'s, 'a>(&'s mut AString<'a>);
+
+impl fmt::Write for Into<'_, '_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.0.push_str(s);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use blaze_expand::seen::SeenRoot;
     use blaze_own::Alloc;
 
     use super::{CrateEnv, EnvFacts, EnvUnknown};
@@ -292,15 +321,17 @@ mod tests {
             crate_name: "tempo_node",
             package: Some(("tempo-node", version)),
             bin: None,
-            folder: "/package/7/",
+            seen: SeenRoot::Package,
+            read_folder: "/7/",
             build_script: false,
             script: None,
             test_or_bench: false,
         }
     }
 
-    /// CLEAN: `env!("CARGO_PKG_NAME")` and the version's parts are the package's, the folder
-    /// is the stable `/package/N`, never a machine path. Prints nothing; passes.
+    /// CLEAN: `env!("CARGO_PKG_NAME")` and the version's parts are the package's;
+    /// `CARGO_MANIFEST_DIR` is the one root every dependency sees, `/package` (D96), never the
+    /// folder the host reads the files under (`/7/` here) nor a machine path. Prints nothing.
     /// The cargo book, "Environment variables Cargo sets for crates": "CARGO_PKG_VERSION_PRE —
     /// The pre-release version of your package."
     #[test]
@@ -313,9 +344,11 @@ mod tests {
         assert_eq!(env.get("CARGO_PKG_VERSION_MINOR"), Ok(Some("20")));
         assert_eq!(env.get("CARGO_PKG_VERSION_PATCH"), Ok(Some("3")));
         assert_eq!(env.get("CARGO_PKG_VERSION_PRE"), Ok(Some("rc.1")));
-        assert_eq!(env.get("CARGO_MANIFEST_DIR"), Ok(Some("/package/7")));
-        assert_eq!(env.get("CARGO_MANIFEST_PATH"), Ok(Some("/package/7/Cargo.toml")));
-        assert_eq!(env.folder(), "/package/7/");
+        assert_eq!(env.get("CARGO_MANIFEST_DIR"), Ok(Some("/package")));
+        assert_eq!(env.get("CARGO_MANIFEST_PATH"), Ok(Some("/package/Cargo.toml")));
+        assert_eq!(env.read_folder(), "/7/");
+        let member = CrateEnv::of(EnvFacts { seen: SeenRoot::member("crates/node").expect("a plain dir"), ..facts("1.0.0") }, Alloc::global()).expect("a SemVer version");
+        assert_eq!(member.get("CARGO_MANIFEST_DIR"), Ok(Some("/workspace/crates/node")));
     }
 
     /// REFUSED, two ways. A name the crate is compiled without is unset (`env!` of it is the
@@ -339,9 +372,9 @@ mod tests {
     /// A toolchain crate has no package: its `CARGO_PKG_NAME` is unknown, never unset.
     #[test]
     fn a_toolchain_crate_s_package_variables_are_unknown() {
-        let f = EnvFacts { package: None, folder: "/toolchain/core/", ..facts("1.0.0") };
+        let f = EnvFacts { package: None, read_folder: "/toolchain/core/", ..facts("1.0.0") };
         let env = CrateEnv::of(f, Alloc::global()).expect("no version to read");
         assert_eq!(env.get("CARGO_PKG_NAME"), Err(EnvUnknown));
-        assert_eq!(env.get("CARGO_MANIFEST_DIR"), Ok(Some("/toolchain/core")));
+        assert_eq!(env.get("CARGO_MANIFEST_DIR"), Ok(Some("/package")));
     }
 }

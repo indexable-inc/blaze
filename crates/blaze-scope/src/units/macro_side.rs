@@ -82,7 +82,7 @@ pub struct RefusedCrate<'a> {
 pub(super) fn add_macro_side<'a>(
     graph: &'a UnitGraph<'_>,
     lock: &'a Lock<'_>,
-    members: &[LockId],
+    members: &[super::Member<'a>],
     view: ToolchainView<'a>,
     at_of: &[usize],
     crates: &mut AVec<'a, UnitCrate<'a>>,
@@ -93,7 +93,7 @@ pub(super) fn add_macro_side<'a>(
     let units = &graph.units;
     let mut macros: AVec<'a, usize> = AVec::new_in(alloc);
     for (at, u) in units.iter().enumerate() {
-        if at_of[at] != usize::MAX && u.kind == UnitKind::ProcMacro && members.contains(&u.package) {
+        if at_of[at] != usize::MAX && u.kind == UnitKind::ProcMacro && members.iter().any(|m| m.id() == u.package) {
             macros.push(at);
         }
     }
@@ -183,6 +183,7 @@ pub(super) fn add_macro_side<'a>(
             implicit,
             root,
             shown_from: base,
+            seen: super::seen_of(members, u.package),
             features,
             deps,
             cfg,
@@ -347,6 +348,7 @@ fn side_toolchain<'a>(
             implicit: implicit(rust, if proc_macro_kind { &UnitKind::ProcMacro } else { &UnitKind::Lib }),
             root,
             shown_from: base,
+            seen: blaze_expand::seen::SeenRoot::Package,
             features,
             deps,
             cfg,

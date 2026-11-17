@@ -22,7 +22,7 @@ blaze-ids = { path = "../blaze-ids" }
 
 [dev-dependencies]
 # `Alloc::global()`, the handle the tests hand every function.
-blaze-own = { workspace = true, features = ["std"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
 
 [lints]
 workspace = true

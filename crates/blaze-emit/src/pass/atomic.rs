@@ -121,7 +121,15 @@ impl<A: Allocator> Pass<'_, '_, A> {
     /// The access size of an atomic of `value`'s type: 8, 16, 32 or 64 bits.
     fn atomic_size(&self, inst: usize, op: Op, value: Value) -> Result<Size, EmitError> {
         let width = self.width_of(inst, op, value)?;
-        size_of_width(width).ok_or(unsupported(inst, op, "an atomic of an `i1` (memory holds whole bytes)"))
+        size_of_width(width).ok_or(unsupported(
+            inst,
+            op,
+            match width {
+                1 => "an atomic of an `i1` (memory holds whole bytes)",
+                128 => "an atomic of 128 bits (CASP or LDXP/STXP is not built)",
+                _ => "an atomic of a width that is not 8, 16, 32 or 64 bits",
+            },
+        ))
     }
 
     /// `x11 = ` the old value of `*x9`, `*x9 = old rmw x10`, by an exclusive load and store

@@ -1,0 +1,4 @@
+[package]
+name = "ladder-s6-async-04-boxed-futures-drop"
+version = "0.1.0"
+edition = "2024"

@@ -239,8 +239,13 @@ fn a_raised_unwind_stops_the_run_by_name() {
 #[test]
 fn a_static_of_fn_pointers_calls_through_its_words() {
     let rung = include_str!("../../blaze-cli/tests/ladder/front2/x0-static-03-fn-pointers/src/main.rs");
-    let text = rung.replace("    let second = (PICK[1])();", "    let direct = forty() + two();\n    let second = (PICK[1])();\n    if direct != 42 {\n        return 3;\n    }");
+    let mut text = rung.replace("    let second = (PICK[1])();", "    let direct = forty() + two();\n    let second = (PICK[1])();\n    if direct != 42 {\n        return 3;\n    }");
     assert_ne!(text, rung, "the rung's `main` changed: this test's edit of it no longer applies");
+    // The added `+` is checked where overflow checks are on (the strict run): a `no_core`
+    // program declares what the check calls (the pinned core's `panic_const_add_overflow`).
+    // Judge-changed 2026-11-16 18:2x (run-path integrator B): the check is now built, so the
+    // edit that adds the `+` adds its lang fn too.
+    text.push_str("\n#[lang = \"panic_const_add_overflow\"]\nfn panic_const_add_overflow() -> ! {\n    loop {}\n}\n");
     let files = [SourceFile { path: "src/main.rs", text: &text }];
     let strict = run_with(&files, "src/main.rs", None, FrontChoice::New(NEW)).unwrap_or_else(|e| panic!("STATIC FN POINTERS (strict): {e}"));
     let ran = run_program(&files, "src/main.rs", None, NEW).unwrap_or_else(|e| panic!("STATIC FN POINTERS: {e}"));

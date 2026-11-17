@@ -369,6 +369,8 @@ pub struct FnHead<'n> {
     pub self_param: bool,
     /// Its ABI and safety: the header of the fn pointer it reifies to.
     pub header: tc::FnPtrHeader,
+    /// A C-variadic foreign fn (`...` last): `inputs` are the declared parameters only.
+    pub c_variadic: bool,
     pub inputs: Vec<PTy, Global>,
     pub output: PTy,
     pub has_body: bool,
@@ -491,6 +493,9 @@ pub struct Store<'n> {
     /// expansion reads. `None` (as [`Store::new`] makes it): every `env!`, include and proc
     /// macro in a body is refused by name. The command sets it once, before any body.
     pub sources: Option<&'n dyn super::body_host::BodySources>,
+    /// Each body checked clean in this run: its read list's digest, by owner, filed where the
+    /// check finished (front2 body_reads.rs); the list itself is dropped there.
+    pub reads: super::body_reads::Digests,
 }
 
 /// A trait's clauses on `Self` and its associated types with their keys and defaults (in the
@@ -762,6 +767,7 @@ impl<'n> Store<'n> {
             locals: super::locals::Locals::new(frame),
             lives: super::lifetimes::Lives::new_in(Alloc::global()),
             sources: None,
+            reads: super::body_reads::Digests::new(),
         }
     }
 
@@ -1193,7 +1199,7 @@ impl<'n> Store<'n> {
                     self.preds.insert(mk, cp);
                     let header = tc::FnPtrHeader { abi: tc::Abi::Rust, safety: tc::Safety::Safe };
                     let has_body = mv.head[head::FLAGS] & sig::HAS_BODY != 0;
-                    let row = FnHead { lib: key, text: m.text, container: Some(ck), parent: own + 1, own: 0, declared: 0, self_param: false, header, inputs: Vec::new_in(Global), output, has_body, module, params: ps.clone(), consts: cs.clone(), bounds: own_bounds, self_: env.self_, self_assoc: Vec::new_in(Global) };
+                    let row = FnHead { lib: key, text: m.text, container: Some(ck), parent: own + 1, own: 0, declared: 0, self_param: false, header, c_variadic: false, inputs: Vec::new_in(Global), output, has_body, module, params: ps.clone(), consts: cs.clone(), bounds: own_bounds, self_: env.self_, self_assoc: Vec::new_in(Global) };
                     self.fns.insert(mk, row);
                 }
                 _ => {}
@@ -1413,7 +1419,7 @@ impl<'n> Store<'n> {
             // is what the constant evaluator reads when another constant names it
             // (`usize::MAX >> 1`). Read from the text, never assumed.
             let has_body = cv.head[head::FLAGS] & sig::HAS_BODY != 0;
-            let row = FnHead { lib: key, text, container: Some(ck), parent: generics, own: 0, declared: 0, self_param: false, header, inputs: Vec::new_in(Global), output, has_body, module, params: ps.clone(), consts: cs.clone(), bounds: own_bounds, self_: env.self_, self_assoc };
+            let row = FnHead { lib: key, text, container: Some(ck), parent: generics, own: 0, declared: 0, self_param: false, header, c_variadic: false, inputs: Vec::new_in(Global), output, has_body, module, params: ps.clone(), consts: cs.clone(), bounds: own_bounds, self_: env.self_, self_assoc };
             self.fns.insert(mk, row);
             consts.push((name, mk));
         }
@@ -1483,14 +1489,41 @@ impl<'n> Store<'n> {
             ident.push(intern(&mut self.tys, node)?);
         }
         let ident = intern_list(&mut self.tys, &ident)?;
+        // The return type as the Reference reads it, after macro expansion: one that writes a
+        // type macro anywhere (`-> fut!(u8)`, `-> Option<it!(u8)>`, alloy's `-> impl_future!(<Output
+        // = T>)`) is lowered again from its own text with every macro expanded
+        // ([`super::type_expand`]) and its opaques are the expansion's, numbered in the same
+        // preorder; one with no macro is read in place. An `async fn`'s written return type is
+        // walked the same way (`-> eyre::Result<impl Provider<N>>`: opaque 1, after the future's 0).
+        let written_ret = v.head_opt(head::TY).map(lf::TypeId);
         let mut rets = Vec::new_in(Global);
-        if let Some(t) = v.head_opt(head::TY) {
-            super::types::return_impls(v, lf::TypeId(t), &mut rets)?;
-        }
+        let has_macro = match written_ret {
+            Some(t) => super::types::return_impls(v, t, &mut rets)?,
+            None => false,
+        };
+        let expanded = match written_ret {
+            Some(t) if has_macro => {
+                rets.clear();
+                let r = v.site(v.type_range(t)?)?;
+                let ret_text = v.text_at(v.type_range(t)?)?;
+                let x = super::type_expand::expand_type_text(names, outer.module, ret_text, r)?;
+                x.impls(ret_text, r, &mut rets)?;
+                Some(x)
+            }
+            _ => None,
+        };
+        // `rv` is the view the return type and its opaques' ids are in: the expansion's, or
+        // the item's own. The return opaques are in their own list (`opaques`), never in
+        // `anon` with the parameters' `impl`s: two views' type ids are not comparable.
+        let (rv, ret) = match &expanded {
+            Some(x) => (x.view(), Some(x.root)),
+            None => (*v, written_ret),
+        };
         let first = u32::from(is_async);
+        let mut opaques: Vec<(lf::TypeId, PTy), Global> = Vec::with_capacity_in(rets.len(), Global);
         for (j, &t) in rets.iter().enumerate() {
             let k = super::keys::opaque_key(key, first + j as u32);
-            anon.push((t, intern(&mut self.tys, PNode::Opaque(k, ident))?));
+            opaques.push((t, intern(&mut self.tys, PNode::Opaque(k, ident))?));
         }
         let mut bounds = Vec::new_in(Global);
         let Bounds::Done(outer_bounds) = outer.bounds else {
@@ -1501,6 +1534,9 @@ impl<'n> Store<'n> {
         let env = Env { module: outer.module, params: &ps, bounds: Bounds::Building(&[]), self_: outer.self_, self_assoc: outer.self_assoc, anon: &anon, consts: &cs };
         b.param_bounds(&mut self.tys, &env, v, parent, &mut bounds)?;
         let env = Env { bounds: Bounds::Done(&bounds), ..env };
+        // The return type's env: its opaques by their ids in `rv`; the parameters' `impl`s are
+        // not in it (none is written in a return type).
+        let ret_env = Env { anon: &opaques, ..env };
         let self_ty = match env.self_ {
             SelfTy::Trait(_) => Some(intern(&mut self.tys, PNode::Param(0))?),
             SelfTy::Ty(t, _) => Some(t),
@@ -1511,6 +1547,10 @@ impl<'n> Store<'n> {
         let list = v.list(head::PARAMS);
         for (k, &n) in v.rows(list)?.iter().enumerate() {
             let prm = lf::Param::decode(n)?;
+            // `...` (last, blaze-lower's grammar): no input; `c_variadic` below records it.
+            if prm.variadic {
+                continue;
+            }
             let r = v.site(v.row_range(list.start + k as u32)?)?;
             let ty = match (prm.self_kind, self_ty) {
                 (lf::SelfKind::No | lf::SelfKind::Typed, _) => b.ty(&mut self.tys, &env, v, prm.ty.ok_or(Why::Unsupported("a parameter with no type", r))?)?,
@@ -1521,21 +1561,25 @@ impl<'n> Store<'n> {
             self_param |= k == 0 && prm.self_kind != lf::SelfKind::No;
             inputs.push(ty);
         }
-        let written = match v.head_opt(head::TY) {
-            Some(t) => b.ty(&mut self.tys, &env, v, lf::TypeId(t))?,
+        let written = match ret {
+            Some(t) => b.ty(&mut self.tys, &ret_env, &rv, t)?,
             None => intern(&mut self.tys, PNode::Tuple(List::EMPTY))?,
         };
         let whole = Range::new(0, text.len() as u32);
-        if flags & (sig::GEN | sig::VARIADIC) != 0 {
-            return Err(Why::Unsupported("a `gen fn` or a variadic fn", whole));
+        if flags & sig::GEN != 0 {
+            return Err(Why::Unsupported("a `gen fn`", whole));
+        }
+        let c_variadic = flags & sig::VARIADIC != 0;
+        if c_variadic && flags & sig::HAS_BODY != 0 {
+            return Err(Why::Unsupported("a C-variadic fn definition (`unsafe extern \"C\" fn f(x: i32, mut args: ...)`: the unstable `c_variadic` feature)", whole));
         }
         // Each opaque's bounds as written, with the opaque type as `Self`, are its own
         // predicates (the checker's `Predicates(k)`); the written ones' bounds are made after
         // the fn's own bounds are known (a bound may name `T::Item`).
-        for (j, &(t, me)) in anon[params_end..].iter().enumerate() {
+        for (j, &(t, me)) in opaques.iter().enumerate() {
             let k = super::keys::opaque_key(key, first + j as u32);
             let mut op = Preds::new();
-            b.impl_bounds(&mut self.tys, &env, v, &[(t, me)], self.sized, &mut op)?;
+            b.impl_bounds(&mut self.tys, &ret_env, &rv, &[(t, me)], self.sized, &mut op)?;
             self.preds.insert(k, op);
             self.opaques.insert(k, (key, first + j as u32));
         }
@@ -1571,6 +1615,9 @@ impl<'n> Store<'n> {
             Some(f) if f.kind == super::foreign_locals::ForeignKind::Fn => tc::FnPtrHeader { abi: super::types::fn_ptr_abi(f.abi, whole)?, safety: if f.safe { tc::Safety::Safe } else { tc::Safety::Unsafe } },
             _ => header,
         };
+        if c_variadic && !matches!(header.abi, tc::Abi::C | tc::Abi::CUnwind | tc::Abi::System | tc::Abi::SystemUnwind) {
+            return Err(Why::Unsupported("`...` on a fn of an ABI other than \"C\" or \"system\" (the Reference, [items.extern.variadic.conventions])", whole));
+        }
         let has_body = flags & sig::HAS_BODY != 0;
         let mut preds = Preds::new();
         preds.clauses.extend_from_slice(inherited);
@@ -1589,7 +1636,7 @@ impl<'n> Store<'n> {
         if container.is_none() {
             self.maps.const_params.insert(lib, cs.clone());
         }
-        self.fns.insert(key, FnHead { lib, text, container, parent, own, declared, self_param, header, inputs, output, has_body, module, params: ps, consts: cs, bounds, self_, self_assoc });
+        self.fns.insert(key, FnHead { lib, text, container, parent, own, declared, self_param, header, c_variadic, inputs, output, has_body, module, params: ps, consts: cs, bounds, self_, self_assoc });
         Ok(())
     }
 }

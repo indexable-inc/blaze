@@ -48,6 +48,11 @@
 
 use crate::SipKey;
 
+/// [`switch_key_from`]: the switch key from a key the table's maker drew.
+mod drawn;
+
+pub use drawn::switch_key_from;
+
 /// The shortest walk (full slots stepped past from a key's home, the key not found among them)
 /// that a linear-probing table of `2^log_slots` slots, at most half full, refuses as a flood.
 ///
@@ -77,6 +82,10 @@ pub const FLOODED_COMPARES: usize = 8;
 /// The key an adaptive table switches to: drawn by [`SipKey::random`], never shown. Under the
 /// model checker (`cfg(blaze_check)`) a fixed key instead, as intern's tables do: the checker
 /// runs a model many times and needs each run to place keys alike.
+///
+/// Ambient: draws from the operating system inside the table operation that saw the flood.
+/// The capability form is [`switch_key_from`] of a standby key the table holds from its maker.
+/// Deleted by batch P4-switch once its callers have moved.
 pub fn switch_key() -> SipKey {
     if cfg!(blaze_check) { MODEL_KEY } else { SipKey::random() }
 }

@@ -311,18 +311,14 @@ fn a_body_edit_runs_two_tasks_there_and_none_in_the_other_worktree() {
         "a body edit in worktree two runs its file's outline and its body's check, nothing else:\n{}",
         edited.profile
     );
-    // Gap (b) of piece 7 (RECORDS-PIPELINE.md, Runner 2): the edited body's types are not
-    // checked, by either owner of its file (the library and its test unit), one
-    // `types-not-checked` note each: the crate's names record stands (its surfaces did not
-    // move) and front2 refuses its file as a whole once its text moved. Front2 reading at item
-    // grain (blaze-scope `item_now`) makes this +0; then this line says so.
-    assert_eq!((edited.errors, &edited.findings), (two.errors + 2, &two.findings), "a body edit moved worktree two's findings");
+    // The edited body's types are checked although its crate's names record stands: front2
+    // reads its file at item grain (item-now-1); before, two `types-not-checked` notes here.
+    assert_eq!((edited.errors, &edited.findings), (two.errors, &two.findings), "a body edit moved worktree two's findings");
     let other = check_in(&io, ONE, Keys::FromText);
     assert!(other.certified && other.runs == 0, "worktree one after two's edit: certified {}, {} runs:\n{}", other.certified, other.runs, other.profile);
     // The same edit in worktree one: every record it needs is the one worktree two made.
     write(&io, ONE, "src/b.rs", B_EDITED);
     let adopted = check_in(&io, ONE, Keys::FromText);
     assert_eq!((adopted.runs, adopted.machine_put), (0, 0), "worktree one, given the text worktree two built, ran or wrote:\n{}", adopted.profile);
-    // Gap (b) again: worktree two's two notes, adopted with its records.
-    assert_eq!((adopted.errors, &adopted.findings), (one.errors + 2, &one.findings), "the same edit moved worktree one's findings");
+    assert_eq!((adopted.errors, &adopted.findings), (one.errors, &one.findings), "the same edit moved worktree one's findings");
 }

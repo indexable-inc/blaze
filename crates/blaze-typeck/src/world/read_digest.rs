@@ -35,6 +35,7 @@ fn sig<'t>(types: PTys<'t>, inputs: &'t [PTy], output: PTy) -> FnSig<'t> {
         declared_count: 0,
         self_param: false,
         header: FnPtrHeader { abi: Abi::Rust, safety: Safety::Safe },
+        c_variadic: false,
         inputs,
         output,
         types,

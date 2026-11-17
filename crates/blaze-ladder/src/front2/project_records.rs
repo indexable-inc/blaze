@@ -64,14 +64,16 @@ impl<'n> BodySource<'n> for &'n Names<'n> {
 
 impl<'n> BodySource<'n> for &'n source::Records<'n> {
     fn own_file(self, file: u32) -> Option<&'n str> {
-        self.whole_text(0, At::File(file))
+        // The file as it is now: every body listed from it was read at item grain
+        // (source/item_grain.rs), so after a body edit the file's other bodies still list.
+        self.file_now(0, file)
     }
 
     fn with_outline(self, file: u32, alloc: Alloc<'_>, each: &mut dyn FnMut(&str, &Outline<'_>)) -> bool {
-        let Some(text) = self.whole_text(0, At::File(file)) else { return false };
+        let Some(text) = self.file_now(0, file) else { return false };
         let Some(edition) = self.edition_of(0) else { return false };
-        // The outline the items record's `outline` indexes were made in: the same function over
-        // the same text (the record proves the text by its digest) and edition.
+        // The outline today's item rows' `outline` indexes are in: the same function over the
+        // file as it is now (each listed item proved at item grain) and edition.
         let outline = blaze_file_items::outline(text, edition, alloc);
         each(text, &outline);
         true

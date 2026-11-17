@@ -105,7 +105,7 @@ fn retry(plant: Plant) -> Retried {
     let c = w.konst("C", "i32", "mk() + one()");
     w.build();
     let (p, mk, one) = (w.key("P"), w.key("mk"), w.key("one"));
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let mut ground = PortableTys::new_in(alloc);
     let mut layout = Layouts::new_in(alloc);
     let mut codes = Codes::new_in(alloc);

@@ -1,0 +1,4 @@
+[package]
+name = "ladder-s6-async-02-join-by-hand"
+version = "0.1.0"
+edition = "2024"

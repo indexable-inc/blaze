@@ -1,0 +1,4 @@
+[package]
+name = "ladder-s9-app-03-tiny-executor"
+version = "0.1.0"
+edition = "2024"

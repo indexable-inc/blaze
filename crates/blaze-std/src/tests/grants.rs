@@ -118,7 +118,7 @@ fn launch_cat(io: &Io, fd3: Option<&[u8]>) -> (Status, StdString, bool) {
     RAN.with(|ran| ran.set(false));
     let mut said = StdString::new();
     let manifest = manifest!(out: Out, data: Dir<ReadOnly>);
-    let status = launch_in(manifest, fd3, io.clone(), &mut said, crate::launch_body!(cat; out: Out, data: Dir<ReadOnly>));
+    let status = launch_in(manifest, fd3, io.clone(), &mut said, blaze_own::testing::heap().shared(),crate::launch_body!(cat; out: Out, data: Dir<ReadOnly>));
     (status, said, RAN.with(Cell::get))
 }
 
@@ -127,14 +127,14 @@ fn every_shape_of_main_is_filled_and_runs() {
     // Started with no spec: an `Io` is the process's world, as before grants.
     let io = Io::sim(1);
     let mut said = StdString::new();
-    let status = launch_in(manifest!(io: Io), None, io.clone(), &mut said, crate::launch_body!(everything; io: Io));
+    let status = launch_in(manifest!(io: Io), None, io.clone(), &mut said, blaze_own::testing::heap().shared(),crate::launch_body!(everything; io: Io));
     assert_eq!((status, said.as_str(), written(&io).as_str()), (Status::OK, "", "everything\n"));
 
     // What fills itself needs no spec; `out` and `err` are the two streams.
     let io = Io::sim(2);
     let manifest = manifest!(out: Out, err: Out, args: Args, clock: Clock);
     let body = crate::launch_body!(streams; out: Out, err: Out, args: Args, clock: Clock);
-    assert_eq!(launch_in(manifest, None, io.clone(), &mut said, body), Status::OK);
+    assert_eq!(launch_in(manifest, None, io.clone(), &mut said, blaze_own::testing::heap().shared(),body), Status::OK);
     assert_eq!(written(&io), "to out\n0\n");
     assert_eq!(io.script(|host| host.err.clone()).expect("a simulated world"), b"to err\n");
 
@@ -155,7 +155,7 @@ fn every_shape_of_main_is_filled_and_runs() {
     let io = Io::sim(5);
     let spec = bare();
     let mut said = StdString::new();
-    let status = launch_in(manifest!(out: Out, spec: Spec), Some(&delivered(&spec)), io.clone(), &mut said, crate::launch_body!(own_spec; out: Out, spec: Spec));
+    let status = launch_in(manifest!(out: Out, spec: Spec), Some(&delivered(&spec)), io.clone(), &mut said, blaze_own::testing::heap().shared(),crate::launch_body!(own_spec; out: Out, spec: Spec));
     assert_eq!((status, said.as_str()), (Status::OK, ""));
     assert_eq!(written(&io), std::format!("{}\n", spec.digest(a())));
 
@@ -166,7 +166,7 @@ fn every_shape_of_main_is_filled_and_runs() {
     spec.put_grant(granted("api", Scope::Net { at: text("example.com:443"), listen: false }));
     let manifest = manifest!(out: Out, cache: Dir<ReadWrite>, api: Net);
     let mut said = StdString::new();
-    let status = launch_in(manifest, Some(&delivered(&spec)), io.clone(), &mut said, crate::launch_body!(writes; out: Out, cache: Dir<ReadWrite>, api: Net));
+    let status = launch_in(manifest, Some(&delivered(&spec)), io.clone(), &mut said, blaze_own::testing::heap().shared(),crate::launch_body!(writes; out: Out, cache: Dir<ReadWrite>, api: Net));
     assert_eq!((status, said.as_str(), written(&io).as_str()), (Status::OK, "", "wrote\n"));
 }
 
@@ -250,7 +250,7 @@ fn a_grant_never_widens_and_an_unbuilt_provider_is_refused() {
     let launch = |spec: &RunSpec<LaunchAlloc>| {
         let mut said = StdString::new();
         let body = crate::launch_body!(writes; out: Out, cache: Dir<ReadWrite>, api: Net);
-        (launch_in(manifest, Some(&delivered(spec)), io.clone(), &mut said, body), said)
+        (launch_in(manifest, Some(&delivered(spec)), io.clone(), &mut said, blaze_own::testing::heap().shared(),body), said)
     };
     let mut spec = bare();
     spec.put_grant(granted("cache", dir_scope("cache", false)));

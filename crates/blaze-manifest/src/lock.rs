@@ -405,7 +405,6 @@ fn source_of<'a>(source: &str, alloc: Alloc<'a>) -> Option<LockSource<'a>> {
 
 #[cfg(test)]
 mod tests {
-    use blaze_own::Alloc;
 
     use super::{Checksum, GitReference, Lock, LockFormat, LockRefused, LockSource, MOST_LOCK_BYTES};
 
@@ -447,7 +446,7 @@ source = "git+https://github.com/o/tool?rev=abc123#abc123def456"
 
     #[test]
     fn a_lock_reads_with_its_sources_checksums_and_entries() {
-        let lock = Lock::read(LOCK.as_bytes(), Alloc::global()).unwrap();
+        let lock = Lock::read(LOCK.as_bytes(), blaze_own::testing::heap().alloc()).unwrap();
         assert_eq!(lock.format, LockFormat(Some(4)));
         assert_eq!(lock.packages.len(), 5);
         let app = &lock.packages[0];
@@ -473,7 +472,7 @@ source = "git+https://github.com/o/tool?rev=abc123#abc123def456"
     #[test]
     fn a_dangling_entry_is_refused_with_its_line() {
         let text = "version = 3\n\n[[package]]\nname = \"a\"\nversion = \"1.0.0\"\ndependencies = [\"nope\"]\n";
-        match Lock::read(text.as_bytes(), Alloc::global()) {
+        match Lock::read(text.as_bytes(), blaze_own::testing::heap().alloc()) {
             Err(LockRefused::Dangling { line, package, dep }) => {
                 assert_eq!((line, package.as_str(), dep.as_str()), (3, "a", "nope"));
             }
@@ -485,6 +484,6 @@ source = "git+https://github.com/o/tool?rev=abc123#abc123def456"
     #[test]
     fn a_lock_past_the_bound_is_refused_before_decoding() {
         let text = std::vec![b' '; MOST_LOCK_BYTES + 1];
-        assert!(matches!(Lock::read(&text, Alloc::global()), Err(LockRefused::TooBig { .. })));
+        assert!(matches!(Lock::read(&text, blaze_own::testing::heap().alloc()), Err(LockRefused::TooBig { .. })));
     }
 }

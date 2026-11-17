@@ -44,6 +44,7 @@ use blaze_launch::{
 
 use crate::arch::{self, GATE_ALIGN, GATE_ENTRY, GATE_HEAD, OutOfReach, STUB, STUB_HEAD, THUNK};
 use crate::sys::{self, Code, SysError};
+use crate::stub_wait::{self, Waiters};
 use crate::table::{Event, Shared, Told};
 
 /// Where a bind's code comes from: the daemon's records, to the launcher.
@@ -286,6 +287,7 @@ impl Driver {
             base + stubs,
             base + thunks,
             base + area..base + whole as usize,
+            Waiters::reserve(stub_wait::MOST_WAITERS)?,
         ));
         // The stubs hand this pointer to `table::resolve` for as long as the process runs
         // code: one count of the `Arc` is leaked for it, so it never dangles, whatever
@@ -310,6 +312,11 @@ impl Driver {
     /// What program threads hold.
     pub fn shared(&self) -> Arc<Shared> {
         Arc::clone(&self.shared)
+    }
+
+    /// The rows stubs wait in: what the control thread answers through.
+    pub(crate) fn waiters(&self) -> &Waiters {
+        &self.shared.waiters
     }
 
     /// The address of the code area's offset 0.

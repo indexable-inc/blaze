@@ -75,6 +75,9 @@ pub enum NativeScriptError {
     Failed { program: std::string::String, code: Option<i32>, stderr: std::string::String },
     Output { program: std::string::String, why: std::string::String },
     Files { folder: std::string::String, why: std::string::String },
+    /// The script's environment lacks a variable cargo always sets for a build script (D96 P5:
+    /// never shown as a default root).
+    MissingVar { program: std::string::String, name: &'static str },
 }
 
 impl std::fmt::Display for NativeScriptError {
@@ -86,11 +89,54 @@ impl std::fmt::Display for NativeScriptError {
             }
             NativeScriptError::Output { program, why } => write!(f, "{program}: its outputs: {why}"),
             NativeScriptError::Files { folder, why } => write!(f, "{folder}: {why}"),
+            NativeScriptError::MissingVar { program, name } => {
+                write!(f, "{program}: the build script's environment has no `{name}`, which cargo always sets for a build script (decision D96: no default root is shown)")
+            }
         }
     }
 }
 
 impl std::error::Error for NativeScriptError {}
+
+/// The `OUT_DIR` and `CARGO_MANIFEST_DIR` the script is shown (what its outputs' real folders
+/// are mapped back to), each from its environment; a missing one is refused by name (rule 3).
+fn shown_folders<'e>(env: &'e Env<'_>, program: &str) -> Result<(&'e str, &'e str), NativeScriptError> {
+    let missing = |name: &'static str| NativeScriptError::MissingVar { program: program.to_owned(), name };
+    let out = env.get("OUT_DIR").ok_or_else(|| missing("OUT_DIR"))?;
+    let package = env.get("CARGO_MANIFEST_DIR").ok_or_else(|| missing("CARGO_MANIFEST_DIR"))?;
+    Ok((out, package))
+}
+
+#[cfg(test)]
+mod d96_tests {
+    use blaze_build_script::Env;
+    use blaze_own::{AString, AVec, Alloc};
+
+    use super::{NativeScriptError, shown_folders};
+
+    fn env(pairs: &[(&str, &str)]) -> Env<'static> {
+        let mut vars = AVec::new_in(Alloc::global());
+        for (n, v) in pairs {
+            vars.push((AString::from_str_in(n, Alloc::global()), AString::from_str_in(v, Alloc::global())));
+        }
+        vars.sort_by(|a: &(AString<'static>, AString<'static>), b| a.0.as_str().cmp(b.0.as_str()));
+        Env { vars }
+    }
+
+    /// D96 P5: cargo always sets `OUT_DIR` and `CARGO_MANIFEST_DIR` for a build script (the
+    /// cargo book, "Environment variables Cargo sets for build scripts"); an environment
+    /// without one is refused naming it and the script, never shown `/out` or `/workspace`.
+    /// Prints nothing; passes.
+    #[test]
+    fn a_missing_manifest_dir_or_out_dir_is_refused_by_name() {
+        let full = env(&[("CARGO_MANIFEST_DIR", "/package"), ("OUT_DIR", "/target/debug/build/x-0/out")]);
+        assert_eq!(shown_folders(&full, "build-script-build").map_err(|e| e.to_string()), Ok(("/target/debug/build/x-0/out", "/package")));
+        let no_dir = env(&[("OUT_DIR", "/o")]);
+        assert!(matches!(shown_folders(&no_dir, "s"), Err(NativeScriptError::MissingVar { name: "CARGO_MANIFEST_DIR", .. })));
+        let no_out = env(&[("CARGO_MANIFEST_DIR", "/package")]);
+        assert!(matches!(shown_folders(&no_out, "s"), Err(NativeScriptError::MissingVar { name: "OUT_DIR", .. })));
+    }
+}
 
 /// The bytes of every file under `folder`, sorted by path, through the effect layer.
 pub(crate) fn files_under(folder: &str) -> Result<std::vec::Vec<(std::string::String, std::vec::Vec<u8>)>, NativeScriptError> {
@@ -148,8 +194,7 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<NativeScriptRun<'a>, NativeScriptError> {
     let c = &script.c;
     let program = || script.program.to_owned();
-    let shown_out = script.env.get("OUT_DIR").unwrap_or("/out");
-    let shown_package = script.env.get("CARGO_MANIFEST_DIR").unwrap_or("/workspace");
+    let (shown_out, shown_package) = shown_folders(script.env, script.program)?;
     let mut manifest: AString<'a> = String::from_str_in(c.package, alloc);
     manifest.push_str("/Cargo.toml");
 

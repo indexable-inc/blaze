@@ -42,13 +42,16 @@ pub struct Shown<'f> {
     /// How many bodies said their types were not checked (body_types.rs): the types stage then
     /// did not run, whatever else was found (main.rs `close`).
     pub types_unchecked: u32,
+    /// How many bodies said their moves and borrows were not checked (body_types.rs
+    /// `BORROWS_NOT_CHECKED`): with `BORROWS_ARE_ERRORS`, the borrows stage then did not run.
+    pub borrows_unchecked: u32,
 }
 
 impl<'f> Shown<'f> {
     /// The plain views are lines whatever the terminal draws: their bytes are the same anywhere.
     pub fn new(caps: Caps, view: View, root: &'f str, frame: &'f Frame) -> Shown<'f> {
         let caps = if view == View::Person { caps } else { Caps::LINES };
-        Shown { caps, counts: Counts::default(), view, quiet: false, listed: Vec::new_in(frame), fixes: Vec::new_in(frame), root, files: Vec::new_in(frame), types_unchecked: 0 }
+        Shown { caps, counts: Counts::default(), view, quiet: false, listed: Vec::new_in(frame), fixes: Vec::new_in(frame), root, files: Vec::new_in(frame), types_unchecked: 0, borrows_unchecked: 0 }
     }
 
     fn file(&mut self, path: &str) {
@@ -344,9 +347,22 @@ pub fn finding(cx: &Cx, l: &Listed<'_>, text: &[u8], shown: &mut Shown<'_>, fram
     // A body whose types were not checked is no error of the program: it is a note, and it
     // keeps `check` from saying `ok` (main.rs `close`).
     let unchecked = l.area == Area::Cli && l.rule == crate::body_types::TYPES_NOT_CHECKED;
-    let severity = if unchecked { Severity::Note } else { Severity::Error };
+    // The move and borrow check (body_types.rs `BORROWS`, `BORROWS_NOT_CHECKED`): a refusal is
+    // always a note; a finding is one until the check is trusted (`BORROWS_ARE_ERRORS`).
+    let borrows_unchecked = l.area == Area::Cli && l.rule == crate::body_types::BORROWS_NOT_CHECKED;
+    let borrows_note = borrows_unchecked || (l.area == Area::Cli && l.rule == crate::body_types::BORROWS && !crate::body_types::BORROWS_ARE_ERRORS);
+    let severity = if unchecked || borrows_note { Severity::Note } else { Severity::Error };
     if unchecked {
         shown.types_unchecked += 1;
+    }
+    if borrows_unchecked {
+        shown.borrows_unchecked += 1;
+    }
+    // A borrow note is neither drawn nor counted for a person: untrusted, census 3 found every
+    // finding false; the closing line's "NOT checked: borrows" says the stage did not pass. The
+    // agent's and JSON views list each with its code, range and why.
+    if borrows_note && shown.view == View::Person {
+        return Ok(());
     }
     // A person sees the count in the closing line ("NOT checked: types"), not a note a body:
     // on a workspace they are thousands. The agent's and JSON views list each with its why.
@@ -630,6 +646,10 @@ mod tests {
             (Area::Cli, crate::units::TARGET_REFUSED),
             (Area::Cli, crate::work::MODULE_AT_BOTH),
             (Area::Cli, crate::names::UNRESOLVED),
+            (Area::Cli, crate::body_types::TYPES),
+            (Area::Cli, crate::body_types::TYPES_NOT_CHECKED),
+            (Area::Cli, crate::body_types::BORROWS),
+            (Area::Cli, crate::body_types::BORROWS_NOT_CHECKED),
             (Area::Drive, OVER_CAP_RULE),
             (Area::Drive, blaze_drive::request::MODULE_FILE_MISSING_RULE),
             (Area::Drive, blaze_drive::request::PATH_FILE_MISSING_RULE),

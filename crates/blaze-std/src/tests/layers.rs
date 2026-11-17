@@ -55,7 +55,7 @@ fn world(seed: u64) -> Io {
 }
 
 fn held(io: Io, holding: Holding) -> Box<Hosting> {
-    Hosting::holding(io, vec!["layered".to_owned()], vec![("everything".to_owned(), "io".to_owned())], EXCHANGE, holding)
+    Hosting::holding(io, vec!["layered".to_owned()], vec![("everything".to_owned(), "io".to_owned())], EXCHANGE, holding, blaze_own::testing::heap().shared())
 }
 
 fn holding(hold: Hold, dry: bool, ask: Option<Box<dyn Decide + Send>>, fakes: Fakes) -> Holding {
@@ -401,7 +401,7 @@ fn run_replay(plan: &(Vec<Step>, bool), plant: Plant) -> Result<(), String> {
             return Err(format!("the fixed clock answered {answer:?}"));
         }
     }
-    let record = Record::read(&recorder.record().write()).map_err(|error| format!("the record does not read back: {error}"))?;
+    let record = Record::read(&recorder.record().write(blaze_own::testing::heap().alloc())).map_err(|error| format!("the record does not read back: {error}"))?;
 
     let elsewhere = world(6);
     let replayed = held(elsewhere.clone(), Holding::of(Hold::Replay(record)));

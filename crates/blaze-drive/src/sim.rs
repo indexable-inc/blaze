@@ -667,7 +667,7 @@ fn work(world: &World, store: &Store, table: &Settled<Global>, tasks: StdVec<(Ti
         loop {
             match execute(world, &task)? {
                 Answered::Need(wants) => {
-                    let mut left: Vec<Want, Alloc<'static>> = Vec::new_in(Alloc::global());
+                    let mut left: Vec<Want, Alloc<'static>> = Vec::new_in(blaze_own::testing::heap().alloc());
                     let before = task.inputs.len();
                     let again = worker::answer_in_place(table, &mut task, &wants, 32, &mut left);
                     for input in &task.inputs[before..] {
@@ -732,9 +732,9 @@ fn request_with(
         Some(lock) => key::digest("sim units and lock", &[units_source(&files).0, graph_source(lock).0].concat()),
     };
 
-    let mut req = Request::planted_in(config(setup.workers, setup.tool), setup.ask, setup.plant, Alloc::global());
+    let mut req = Request::planted_in(config(setup.workers, setup.tool), setup.ask, setup.plant, blaze_own::testing::heap().alloc());
     let table: Settled<Global> = Settled::new_in(1 << 12, Global);
-    let mut out: Vec<Effect<'static>, Alloc<'static>> = Vec::new_in(Alloc::global());
+    let mut out: Vec<Effect<'static>, Alloc<'static>> = Vec::new_in(blaze_own::testing::heap().alloc());
     let mut ended = Ended {
         answer: None,
         error: None,
@@ -949,14 +949,14 @@ fn table(store: &Store, last: &[u8]) -> Result<Table, Broke> {
     let wire = |error| Broke::Oracle(format!("a stored answer is not one: {error}"));
     let last = read_last(last).map_err(wire)?;
     let root_bytes = store.records.get(&last.root).ok_or(Broke::Oracle(String::from("the root is not stored")))?;
-    let root = read_root(root_bytes, Alloc::global()).map_err(wire)?;
+    let root = read_root(root_bytes, blaze_own::testing::heap().alloc()).map_err(wire)?;
     let mut table = Table::new();
     for page_key in root.pages.iter() {
         if *page_key == Key::default() {
             continue;
         }
         let bytes = store.records.get(page_key).ok_or(Broke::Oracle(String::from("a page is not stored")))?;
-        for (name, row) in read_page(bytes, Alloc::global()).map_err(wire)?.iter() {
+        for (name, row) in read_page(bytes, blaze_own::testing::heap().alloc()).map_err(wire)?.iter() {
             table.insert(
                 *name,
                 (
@@ -1496,10 +1496,10 @@ fn fifo(world: &World, ask: Ask<'_>) -> Result<Fifo, Broke> {
     let manifest = b"Cargo.toml".to_vec();
     files.push(FileEntry { path: &manifest, id: key::digest("sim manifest", b"[package]"), changed: false, manifest: true });
     files.sort_by(|a, b| a.path.cmp(b.path));
-    let mut req = Request::planted_in(config(16, SIM_TOOL), ask, world.plant, Alloc::global());
+    let mut req = Request::planted_in(config(16, SIM_TOOL), ask, world.plant, blaze_own::testing::heap().alloc());
     let mut store: BTreeMap<Key, StdVec<u8>> = BTreeMap::new();
     let mut todo: std::collections::VecDeque<Effect<'static>> = std::collections::VecDeque::new();
-    let mut out: Vec<Effect<'static>, Alloc<'static>> = Vec::new_in(Alloc::global());
+    let mut out: Vec<Effect<'static>, Alloc<'static>> = Vec::new_in(blaze_own::testing::heap().alloc());
     let (mut jobs, mut edges) = (0u64, 0u64);
     let mut prints = StdVec::new();
     let units = units_source(&files);
@@ -1930,7 +1930,7 @@ struct Pointers {
 impl Pointers {
     fn write(&mut self, name: PointerName, bytes: StdVec<u8>, plant: pointers::Plant) {
         let mut held: StdVec<(PointerName, u64)> = self.held.iter().map(|(name, (at, _))| (*name, *at)).collect();
-        let mut gone = Vec::new_in(Alloc::global());
+        let mut gone = Vec::new_in(blaze_own::testing::heap().alloc());
         pointers::evicted(&mut held, name, plant, &mut gone);
         for name in gone.iter() {
             self.held.remove(name);

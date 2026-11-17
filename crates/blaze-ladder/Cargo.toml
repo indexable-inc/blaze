@@ -28,6 +28,9 @@ blaze-hash = { path = "../blaze-hash" }
 blaze-mem.workspace = true
 # A checked body to LIR, and LIR to AArch64 code (the baseline tier).
 blaze-build.workspace = true
+# front2/borrows.rs: a checked body lowered to its flow, then the move and borrow checks.
+blaze-flow.workspace = true
+blaze-flow-lower.workspace = true
 blaze-emit.workspace = true
 # A `const` item's value: evaluated once, its record the build reads (`Adts::const_value`).
 blaze-consteval.workspace = true
@@ -57,14 +60,16 @@ blaze-id.workspace = true
 # A body's macro calls expanded through the names library (front2/body.rs: blaze-lower's
 # `Scoped` and `ByName`, whose host is an `ExpandCx`).
 blaze-expand.workspace = true
+# crates.rs `DirShelf`: the toolchain's packs mapped read-only (`blaze_core::Mapping`), never
+# copied to the heap.
+blaze-core.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true
 # tests/hosted.rs: the host table a hosted rung is started with, its calls recorded.
 blaze-std.workspace = true
-# tests/flow_census.rs: every clean body of bstd lowered to its flow and move and borrow checked.
-blaze-flow.workspace = true
-blaze-flow-lower.workspace = true
+# tests/front2_borrows.rs: `blaze_own::testing::heap()`, the test's root allocator.
+blaze-own = { workspace = true, features = ["std", "testing"] }
 
 [lints]
 workspace = true

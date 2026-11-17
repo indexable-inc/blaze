@@ -123,9 +123,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 for (i, step) in steps.iter().enumerate() {
                     let sig = match self.view(step.ty) {
                         TyView::FnDef(k, fargs) => match self.fn_def_sig(k, fargs, Cause::Expr(e))? {
-                            Some(sig) => {
+                            Some((inputs, output)) => {
                                 self.callees.push((e, k, fargs));
-                                Some(sig)
+                                // A C-variadic `k`: one fresh input per argument past the
+                                // declared ones (rules/c_variadic.rs).
+                                let inputs = self.c_variadic_inputs(k, inputs, arg_ids.len())?;
+                                Some((inputs, output))
                             }
                             None => None,
                         },
@@ -179,7 +182,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 self.start_args(f, e, arg_ids, errs, self.common.err, 2, false)
             }
             _ => {
-                if self.next_arg(f, arg_ids, 2)? { Ok(Flow::Wait) } else { Ok(Flow::Done(f.u)) }
+                if self.next_arg(f, arg_ids, 2)? {
+                    return Ok(Flow::Wait);
+                }
+                // Every argument is typed: the `...` ones are held to C's promotions (E0617).
+                self.check_c_variadic_args(e, arg_ids)?;
+                Ok(Flow::Done(f.u))
             }
         }
     }

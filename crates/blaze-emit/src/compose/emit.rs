@@ -55,8 +55,10 @@
 //! Values that are not an integer of at most 64 bits, a pointer, an `f32` or an `f64` (compounds,
 //! `i128`, vectors); `sret`/`byval` parameters, more arguments than registers, calls returning two
 //! values; landing blocks, `invoke`, `resume`; atomics, fences, bulk memory, `asm`, intrinsics,
-//! thread-locals, the function's own data, tail calls, coroutines' `suspend`; a frame past the
-//! cell loads' reach (32 KiB) or a slot aligned past 16 bytes.
+//! thread-locals, the function's own data, tail calls, coroutines' `suspend`; a frame past one
+//! page under the saved registers (no stack-probe template yet: pass/probe.rs,
+//! `FAST_FRAME_PAST_A_PAGE`), past the cell loads' reach (32 KiB), or a slot aligned past 16
+//! bytes.
 
 use blaze_code::record::{SiteKind, Space, Symbol, Target};
 use blaze_code::unwind::{Action, Frame, INST, Row};
@@ -71,6 +73,8 @@ use blaze_tier::{
 };
 
 use super::analysis::{Analysis, Home};
+use crate::pass::probe::{FAST_FRAME_PAST_A_PAGE, PROBE_STEP};
+use super::loop_map::slot_of;
 
 /// The C name of the runtime's poll page: the launcher maps it readable, and makes it unreadable
 /// to stop every running loop at its next back edge (D100 point 3; piece L's fault handler).
@@ -700,7 +704,7 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
                     Some(sp_offset) => Place::Cell { sp_offset },
                     None => return Err(refused_fn("a loop-map value with no cell")),
                 },
-                Place::Slot { .. } => match self.slot_at.get(v).copied() {
+                Place::Slot { .. } => match slot_of(self.view.len(), live.value).and_then(|slot| self.slot_at.get(slot).copied()) {
                     Some(sp_offset) => Place::Slot { sp_offset },
                     None => return Err(refused_fn("a loop-map slot the function lacks")),
                 },
@@ -1268,6 +1272,12 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
     // ---- prologue, entry, blocks -----------------------------------------------------------
 
     fn prologue(&mut self) -> Result<(), TierError> {
+        // A guard page must not be stepped over (pass/probe.rs): `sp` drops `frame` bytes
+        // under the last saved pair before anything writes again, and the table has no probe
+        // template. Refused by name; the Reference tier serves and probes it.
+        if 16 + u64::from(self.out.frame) > u64::from(PROBE_STEP) {
+            return Err(refused_fn(FAST_FRAME_PAST_A_PAGE));
+        }
         let none = [Arg::None; 7];
         self.put(glue::frame(glue::ENTER, [Form::None; 4]), &none)?;
         let saved = self.an.saved;
@@ -1319,6 +1329,9 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
         let view = self.view;
         if view.head.sig as usize >= view.sigs.len() {
             return Err(refused_fn("no signature row"));
+        }
+        if view.sigs[view.head.sig as usize].bits & blaze_lir::func::SigRec::VARIADIC != 0 {
+            return Err(refused_fn(crate::pass::variadic::VARIADIC_DEFINITION));
         }
         let sig = view.sig(SigId(view.head.sig));
         let params = view.params(Block(0));
@@ -1857,6 +1870,12 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
             _ => None,
         };
         let args = o.values();
+        if view.sigs[sig.index()].bits & blaze_lir::func::SigRec::VARIADIC != 0 && args.len() > view.sig(sig).params.len() {
+            return Err(refused(
+                inst,
+                "a call passing variable arguments to a C-variadic callee (Apple stacks them in an outgoing area opened before the call site; the Reference tier's pass/variadic.rs builds it)",
+            ));
+        }
         let sig = view.sig(sig);
         if sig.params.len() != args.len() {
             return Err(refused(inst, "a call whose arguments are not its signature's parameters"));

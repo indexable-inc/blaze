@@ -1962,14 +1962,16 @@ fn a_flipped_byte_of_a_value_is_never_served() {
     let mut bytes = sim.contents(&pack);
     bytes[(loc.offset + RECORD_HEADER) as usize + 500] ^= 1;
     sim.change(&pack, &bytes);
-    // With its block's check fixed up too, so the open's block checks pass and the value's
-    // content hash is what refuses it (`block_checks` has the open that stops on the block).
+    // With its block's check fixed up too, so the open's block checks pass and the record's
+    // own check is what refuses it (`block_checks` has the open that stops on the block): a
+    // format-9 record's CRC-32C covers its payload (`disk::RecordHeader::check`, since
+    // 2026-11-13), before the value's content hash is computed.
     recheck(&mut sim, &pack);
     let store = open(&mut sim, "store");
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), vec![b'a'; 1000]);
     let corrupt = store.get(&key(2)).unwrap_err();
     assert_eq!(corrupt.pack, pack);
-    assert!(corrupt.what.contains("hash"), "{corrupt}");
+    assert!(corrupt.what.contains("header and payload do not match its check"), "{corrupt}");
     let found = store.verify(None);
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].key, key(2));
@@ -2288,6 +2290,9 @@ fn a_clone_placed_where_a_program_starts_is_prewarmed_before_its_rename() {
                 Some(format!("prewarm {like} into {}", if *file == to { "the path" } else { "its clone" }))
             }
             Effect::RenameUnsynced { to: onto, .. } if *onto == to => Some("rename".to_owned()),
+            // A path a program is started from: the staged clone made executable before its
+            // look ([`Store::mode_first`]).
+            Effect::Mode { file, .. } if file.as_str().ends_with(".placing") => Some("mode".to_owned()),
             // The staged clone's look, whose stamp the place answers (`tests::place_copy`).
             Effect::Stamp { files, .. } if files.iter().any(|it| it.ends_with(".placing")) => {
                 Some("look".to_owned())
@@ -2314,16 +2319,18 @@ fn a_clone_placed_where_a_program_starts_is_prewarmed_before_its_rename() {
     // No file at the path yet: prewarmed all the same (of nothing), and placed.
     store.starts(&name("target/app"), true);
     let first = placed_logged(&mut sim, &mut store, "target/app");
-    assert_eq!(asked(&first), ["clone", "prewarm target/app into its clone", "look", "rename"]);
+    assert_eq!(asked(&first), ["clone", "prewarm target/app into its clone", "mode", "look", "rename"]);
     assert_eq!(sim.contents(&name("target/app")), big);
-    // Over the file there: the prewarm is asked as the clone completed, the staged clone's
-    // look as the prewarm did, and the rename as the look did (since 2026-11-12 a place
+    // Over the file there: the prewarm is asked as the clone completed, the staged clone made
+    // executable as the prewarm did (a started path: `Store::mode_first`, since 2026-11-13),
+    // its look as the mode was set, and the rename as the look did (since 2026-11-12 a place
     // answers the stamp its clone has: `tests::place_copy`).
     let again = placed_logged(&mut sim, &mut store, "target/app");
-    assert_eq!(asked(&again), ["clone", "prewarm target/app into its clone", "look", "rename"]);
+    assert_eq!(asked(&again), ["clone", "prewarm target/app into its clone", "mode", "look", "rename"]);
     assert_eq!(again[1].1.as_deref(), Some("Cloned"), "{again:?}");
     assert!(again[2].1.as_deref().is_some_and(|it| it.starts_with("Prewarmed")), "{again:?}");
-    assert!(again[3].1.as_deref().is_some_and(|it| it.starts_with("Stamped")), "{again:?}");
+    assert_eq!(again[3].1.as_deref(), Some("Moded"), "{again:?}");
+    assert!(again[4].1.as_deref().is_some_and(|it| it.starts_with("Stamped")), "{again:?}");
     // The control: a path nothing is started from, and the same path once it is said so.
     let other = placed_logged(&mut sim, &mut store, "target/app.debug");
     assert_eq!(asked(&other), ["clone", "look", "rename"]);
@@ -3014,13 +3021,14 @@ fn a_damaged_value_in_another_writers_store_is_never_served() {
     let mut bytes = sim.contents(&pack);
     bytes[(loc.offset + RECORD_HEADER) as usize + 500] ^= 1;
     sim.change(&pack, &bytes);
-    // Its block's check fixed up too: the value's content hash is what refuses it.
+    // Its block's check fixed up too: the record's own check (its CRC-32C covers the payload,
+    // `disk::RecordHeader::check`) is what refuses it.
     recheck(&mut sim, &pack);
     let b = open_shared(&mut sim, 2);
     assert_eq!(bytes_of(&b, &key(1)).unwrap(), vec![b'a'; 1000]);
     let corrupt = b.get(&key(2)).unwrap_err();
     assert_eq!(corrupt.pack, pack);
-    assert!(corrupt.what.contains("hash"), "{corrupt}");
+    assert!(corrupt.what.contains("header and payload do not match its check"), "{corrupt}");
 }
 
 #[test]

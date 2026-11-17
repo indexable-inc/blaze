@@ -3,11 +3,10 @@
 //! (`final fn` in a trait, a const closure in a body) without a syntax error.
 
 use blaze_file_items::{HeaderError, impl_header, outline};
-use blaze_own::Alloc;
 use blaze_surface::{Edition, ImplFlags};
 
 fn read(text: &str) -> (ImplFlags, Vec<&str>, Option<&str>, &str) {
-    match impl_header(text, Edition::E2024, Alloc::global()) {
+    match impl_header(text, Edition::E2024, blaze_own::testing::heap().alloc()) {
         Ok(h) => (h.flags, h.params.iter().copied().collect(), h.trait_, h.self_ty),
         Err(error) => panic!("`{text}` does not read: {error}"),
     }
@@ -49,7 +48,7 @@ fn headers_read_by_tokens() {
     assert_eq!((trait_, self_ty), (None, "dyn Error + 'static"));
     let (_, _, trait_, self_ty) = read("impl<T> Fn<()> for for<'a> fn(&'a T)");
     assert_eq!((trait_, self_ty), (Some("Fn<()>"), "for<'a> fn(&'a T)"));
-    let refused = |text| impl_header(text, Edition::E2024, Alloc::global()).map(|_| ());
+    let refused = |text| impl_header(text, Edition::E2024, blaze_own::testing::heap().alloc()).map(|_| ());
     assert_eq!(refused("struct S"), Err(HeaderError::NoImpl));
     assert_eq!(refused("impl<T"), Err(HeaderError::Unclosed));
     assert_eq!(refused("impl Trait for"), Err(HeaderError::NoSelfType));
@@ -60,7 +59,7 @@ fn cores_nightly_items_outline_without_errors() {
     let text = "pub trait Share: Clone {\n    /// Doc.\n    final fn share(&self) -> Self { self.clone() }\n}\n\
                 fn f<T>(mut f: impl FnMut(T) -> bool) -> impl FnMut((), T) {\n    const move |(), x| { f(x); }\n}\n\
                 const impl<T: ?Sized> Borrow<T> for T {}\n";
-    let outline = outline(text, Edition::E2024, Alloc::global());
+    let outline = outline(text, Edition::E2024, blaze_own::testing::heap().alloc());
     let errors: Vec<String> = outline.errors().iter().map(|it| outline.message(it).to_string()).collect();
     assert_eq!(errors, Vec::<String>::new());
 }
