@@ -68,6 +68,8 @@ mod unix {
     fn a_file_anyone_may_write_is_refused_by_its_name() {
         let (_root, dir, name) = store("file");
         std::fs::create_dir_all(dir.join("packs")).unwrap();
+        // The store is the user's alone whatever the umask made it, so the file is what is refused.
+        chmod(&dir, 0o700);
         std::fs::write(dir.join("packs/a"), b"a").unwrap();
         chmod(&dir.join("packs/a"), 0o646);
         let file = FileName::new("store/packs/a").unwrap();
@@ -93,6 +95,9 @@ mod unix {
     fn a_link_is_checked_by_what_it_points_at() {
         let (_root, dir, name) = store("link");
         std::fs::create_dir(&dir).unwrap();
+        // The store is the user's alone whatever the umask made it, so the link's target is what is
+        // refused.
+        chmod(&dir, 0o700);
         let outside = dir.parent().unwrap().join("outside");
         std::fs::write(&outside, b"o").unwrap();
         chmod(&outside, 0o666);
