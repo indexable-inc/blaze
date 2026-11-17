@@ -166,7 +166,7 @@ pub(super) fn ground_self(tys: PTys<'_>, env: &Env<'_>, text: &str) -> Option<(P
         return None;
     }
     let SelfTy::Ty(t, _) = env.self_ else { return None };
-    let node = tys.nodes.get(t.0 as usize).copied()?;
+    let node = tys.get(t).copied()?;
     match node {
         PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) | PNode::Float(_) | PNode::Str => Some((t, node)),
         PNode::Adt(_, args) if args.len == 0 => Some((t, node)),

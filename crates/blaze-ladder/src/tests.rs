@@ -10,7 +10,7 @@ use blaze_own::Alloc;
 use blaze_typeck::{InferCtx, Needs, Outcome};
 
 use crate::front::Front;
-use crate::run::refusals;
+use crate::run::{OverflowChecks, refusals};
 use crate::refusal::{NOT_YET, RefusalRule, SourceFile, syntax_name};
 
 /// A rung's files, read from disk: `(path, text)` with paths relative to the package root.
@@ -84,24 +84,32 @@ fn the_real_context_refuses_an_unmet_bound() {
 }
 
 /// A construct this build does not take is one refusal naming it, at its place, in the words
-/// a Rust programmer uses, whichever stage refuses it: a closure passes the front end and the
-/// checker and is refused by the build (`BuildError::Unsupported`), with the same finding the
-/// front end gives. The plain rendering says it on its line and closes with what this build
-/// runs today.
+/// a Rust programmer uses, whichever stage refuses it: the construct here passes the front
+/// end and the checker and is refused by the build. It is an underscore assignment
+/// (the Reference, "Destructuring assignments": `_ = e` is an assignee expression), which the
+/// build refuses by name (blaze-build walk: "`_` (`_ = e` is not built yet)"). The plain
+/// rendering says it on its line and closes with what this build runs today. Judge-changed
+/// 2026-11-16 (checks integrator, on the coordinator's decision): was
+/// `a_closure_is_a_named_refusal`; the build now builds an unused non-capturing closure, so a
+/// closure is no longer a refused construct. (An `f16` was tried first: the old front end
+/// refuses it as "the type `f16` names nothing" before the build sees it.)
 #[test]
-fn a_closure_is_a_named_refusal() {
-    let text = "struct S { a: u8 }\nfn main() { let f = |x: i32| x; }";
+fn an_underscore_assignment_is_a_named_refusal() {
+    let text = "struct S { a: u8 }\nfn main() { _ = 1u8; }";
     let files = [SourceFile { path: "src/main.rs", text }];
-    let all = refusals(&files, "src/main.rs");
+    let all = refusals(&files, "src/main.rs", OverflowChecks::On);
     assert_eq!(all.len(), 1, "{all:?}");
     let r = &all[0];
-    assert_eq!((r.rule, r.construct), (RefusalRule::Unsupported, Some("a closure")), "{r:?}");
+    assert_eq!(r.rule, RefusalRule::Unsupported, "{r:?}");
+    assert!(r.construct.is_some_and(|c| c.contains("`_ = e`")), "{r:?}");
     assert!(r.message.ends_with(NOT_YET), "{}", r.message);
     let at = (r.place + r.start) as usize;
-    assert!(text[at..].starts_with("|x: i32| x"), "{r:?}: at `{}`", &text[at..]);
+    assert!(text[at..].starts_with('_'), "{r:?}: at `{}`", &text[at..]);
     let shown = crate::run::plain(&files, &all);
     let lines: Vec<&str> = shown.lines().collect();
-    assert_eq!(lines, ["src/main.rs:2:21: a closure is not supported by this build of blaze yet", crate::run::RUNS_TODAY]);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].starts_with("src/main.rs:2:13: ") && lines[0].ends_with("is not supported by this build of blaze yet"), "{lines:?}");
+    assert_eq!(lines[1], crate::run::RUNS_TODAY);
 }
 
 /// `#[blaze::..]` is inert: a known name is no refusal and is counted as unchecked; an unknown
@@ -113,7 +121,7 @@ fn blaze_attributes_are_inert_and_unknown_ones_advice() {
     let run = |items: &str| {
         let text = std::format!("{head}{items}\nfn main() {{}}");
         let files = [SourceFile { path: "src/main.rs", text: &text }];
-        let (refused, blaze) = crate::run::findings(&files, "src/main.rs");
+        let (refused, blaze) = crate::run::findings(&files, "src/main.rs", OverflowChecks::On);
         (refused, blaze.advice.iter().map(|a| (a.rule, std::string::String::from(&*a.message))).collect::<Vec<_>>(), blaze.unchecked(), blaze.note())
     };
     let (refused, advice, unchecked, note) = run("#[blaze::noalloc]\n#[blaze::nopanic]\n#[rustfmt::skip]\nfn a() {}\n#[blaze::noalloc]\nfn b() {}");
@@ -154,7 +162,7 @@ fn a_where_const_condition_is_evaluated_at_the_impl_arguments() {
              fn main() {{ let _ = 0u8.flat(); }}"
         );
         let files = [SourceFile { path: "src/main.rs", text: &text }];
-        let all = refusals(&files, "src/main.rs");
+        let all = refusals(&files, "src/main.rs", OverflowChecks::On);
         if holds {
             assert!(all.is_empty(), "{value} {body}: {all:?}");
         } else {
@@ -167,7 +175,7 @@ fn a_where_const_condition_is_evaluated_at_the_impl_arguments() {
 #[test]
 fn a_missing_module_file_is_named() {
     let files = [SourceFile { path: "src/main.rs", text: "mod gone;\nfn main() {}" }];
-    let all = refusals(&files, "src/main.rs");
+    let all = refusals(&files, "src/main.rs", OverflowChecks::On);
     assert_eq!(all.len(), 1, "{all:?}");
     assert_eq!(all[0].rule, RefusalRule::Program, "{all:?}");
     assert!(all[0].message.contains("gone"), "{}", all[0].message);

@@ -265,3 +265,53 @@ fn main() {}
     let got = check_fns(TEXT, &["three", "four"]);
     expect("trait constant", &got, &[true, false]);
 }
+
+/// Tempo census 13, brief 14 (`RefusedImpl [From]: the type alias `U64` is refused: ..
+/// Nested`, 92 bodies): crypto_bigint writes `const BYTES` in one `impl Limb` and `fn
+/// from_be_bytes(bytes: [u8; Self::BYTES])` in another (limb.rs, limb/encoding.rs). The
+/// Reference, "Implementations": "A type can also have multiple inherent implementations";
+/// "Associated Items": "The path to an associated item is any path to the implementing type,
+/// followed by the associated item's identifier as the final path component": finding
+/// `L::from_be` by name reads the impls' names, and evaluating `Self::BYTES` (8) needs no
+/// signature of `from_be`. It was "constant ..: an array length needs it while another
+/// constant is evaluated" (`ConstFail::Nested`): the impl's head made every fn's signature,
+/// so the name lookup inside `Self::BYTES`'s evaluation needed `Self::BYTES` again. Planted
+/// control: with the eager loop in heads.rs `Store::impl_` back, `eight` is "not checked ..
+/// Nested" and this fails. Expected lines: "sibling const: eight: clean", "sibling const:
+/// seven: diags [..]" (a `[u8; 7]` where `[u8; 8]` is expected).
+#[test]
+fn an_inherent_length_over_a_sibling_impls_const_has_its_value() {
+    const TEXT: &str = "struct L(u64);
+impl L { pub const BYTES: usize = 8; }
+impl L { fn from_be(b: [u8; Self::BYTES]) -> u8 { b[0] } }
+fn eight(b: [u8; 8]) -> u8 { L::from_be(b) }
+fn seven(b: [u8; 7]) -> u8 { L::from_be(b) }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["eight", "seven"]);
+    expect("sibling const", &got, &[true, false]);
+}
+
+/// The other side of brief 14: a signature that REALLY needs itself stays refused, by name.
+/// `h`'s signature needs `Self::N`, and `N`'s body names `Self::h` (a value of `h`'s fn item
+/// type, which is `h`'s signature): the Reference, "Constant evaluation", "Constant
+/// expressions": "Paths to functions and constants. Recursively defining constants is not
+/// allowed." Making signatures one at a time must not turn this into a value: the length
+/// `Self::N` is met again inside its own evaluation. Expected line: "own cycle: cyc: not
+/// .." naming the length's constant by its text (`Self::N`, rule 19: check.rs `key_shown`).
+#[test]
+fn a_signature_whose_length_needs_that_fn_is_refused_by_name() {
+    const TEXT: &str = "struct L(u64);
+impl L { const N: usize = { let _f = Self::h; 1 }; }
+impl L { fn h(b: [u8; Self::N]) -> u8 { b[0] } }
+fn cyc(b: [u8; 1]) -> u8 { L::h(b) }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["cyc"]);
+    for (n, o) in &got {
+        println!("own cycle: {n}: {o}");
+    }
+    let (_, o) = &got[0];
+    assert!(o.starts_with("not "), "`cyc` must be refused, not clean and not a diagnostic: {o}");
+    assert!(o.contains("Self::N"), "the refusal must name the length's constant by its text: {o}");
+}

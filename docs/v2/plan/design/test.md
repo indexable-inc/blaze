@@ -522,3 +522,84 @@ only warns or fails the test (its code was not read); whether macOS gives a proc
 instruction counter without root; the store's collection rule that must keep 30 greens'
 manifests (no store design was read); and the real cost of a case-board progress write and
 of branch counters, which want a measurement on the first built piece.
+
+## End state: the search itself: edge values first, vacuity a failure, failures kept (coordinator, 2026-11-16)
+
+The owner, 2026-11-16: "make sure DST primitives that we have have really crazy edge case values ... pick sota
+method also consider recording previous failures ... anything that would make it ... better at uncovering bugs".
+Decision D95. What blaze-sim has already (crates/blaze-sim): one tape of choices, shrunk and replayed (tape.rs,
+shrink.rs); `Tape::int_in` with small offsets from a range's ends; twelve special floats (draw.rs `SPECIAL_F64`);
+`Tape::reached` with `Verdict::Unreached` (a point no passing case reached fails the test); `check_given`;
+`control` with planted bugs; a coverage-guided phase that takes its signal as an input (guided.rs); `differ`.
+blaze-core's `Sim` tears unsynced writes by sector, fails syncs, runs out of room; blaze-check explores
+interleavings and checks linearizability. What is missing is below, as pieces S1 to S8.
+
+The method, chosen, with what each part is known for: a choice-sequence tape with internal shrinking (kept);
+interesting-value tables at every primitive (the boundary values fuzzers keep in a dictionary); swarm testing
+(each case switches a random subset of operation and fault kinds OFF, which finds more than uniform mixing);
+repetition bias (a new element or operation repeats an earlier one: collisions, duplicates, the same key twice);
+bounded exhaustive enumeration where the space is small (every crash point, every schedule up to a preemption
+bound) and priority schedules with a depth bound where it is not; reach points that fail a test which never
+exercised what it claims (the same idea as "sometimes" assertions); kept failing tapes replayed first; and a
+measure of each test's power from its planted bugs.
+
+ROLLOUT, the same for S1, S2 and S4: a changed distribution changes what all fifty crates' tests see. So it is
+built behind blaze-sim's cargo feature `edge-first` (off by default) and the SIM INTEGRATOR runs every dependent
+crate's tests with the feature on, one crate at a time; each new failure is a found bug or a test with a wrong
+assumption, filed as a kept tape (S3) and sent to the crate's owner; when the harvest is done the coordinator
+makes the feature the default and the old path is deleted. A new report (S4) starts in observe mode: it prints,
+and fails nothing, until the harvest has read its lines.
+
+- S1a INTEGERS AND SIZES (tape.rs `int`, `int_in`, `Int::draw_int`, `more`, the sizes in `vec`; NEW
+  src/edge_ints.rs). One table, used by every width, signed and unsigned: 0, 1, -1, MIN, MAX, MIN+1, MAX-1;
+  every power of two with its two neighbours up to the width; the ends of each narrower width seen through a
+  wider one (127, 128, 255, 256, 32767, 32768, 65535, 65536, 2^31 and 2^32 and 2^63 with their neighbours). In a
+  range: its two ends, each end's neighbour, the middle with its neighbours, and every table value inside the
+  range. A size (a list's length, a byte count): 0, 1, 2, the cap and cap-1, powers of two with their neighbours
+  inside the cap (7, 8, 9, 15, 16, 17 ... 4095, 4096, 4097), and rarely a size near the cap however large. An
+  edge kind is drawn about one case in four; the calm choice stays the simplest value; kinds are ordered so
+  shrinking moves from an edge to a simple value.
+- S1b BYTES, CHARACTERS, TEXT, FLOATS (draw.rs `bytes`, `char`, `text`, `text_from`, the float draws; NEW
+  src/edge_text.rs). Bytes: empty; one byte repeated (0x00, 0xFF, 0x7F, 0x80); ascending; a short pattern
+  repeated; valid UTF-8 followed by one byte that breaks it; a long run inside random bytes. Characters: U+0000;
+  the ends of each UTF-8 length (U+007F, U+0080, U+07FF, U+0800, U+FFFF, U+10000); U+D7FF and U+E000 beside the
+  surrogates; U+10FFFF; U+FEFF; a combining mark; a zero-width joiner; U+202E; the line ends (CR, LF, U+0085,
+  U+2028); a tab; a case pair that changes length when folded. Text: empty; one character repeated; CR LF pairs;
+  the same text in composed and decomposed form; and for a text used as a NAME (a new draw `name`): ".", "..",
+  a leading or trailing space or dot, a separator ("/", "\\"), a NUL, a name of 255 and of 256 bytes. Floats,
+  added to the twelve: -0.0; the least and greatest subnormal; 1.0 with its two neighbours; 2^53 with its
+  neighbours; the i64 and u64 conversion ends; NaNs of both signs with a payload.
+- S2 SHAPES OF COLLECTIONS AND SEQUENCES (tape.rs `vec`; NEW src/shape.rs). Repetition at the tape's level,
+  so it needs no `Clone`: with some chance a new element's span REPLAYS the choices of an earlier element's
+  span (an equal element), or replays them with the last choice moved by one (a neighbour). A list is also,
+  rarely, sorted, reversed, or all one element where the caller gives an order (`vec_ordered`). `Swarm`:
+  `tape.swarm(kinds)` draws once a case which kinds are on (each with chance one half, never none), and
+  `tape.op(swarm, ..)` draws the next operation from those on, repeating the previous operation or its key with
+  some chance. A test that draws operations uses it; the kinds that were off are in the failure's notes.
+- S3 KEPT FAILURES (NEW src/kept.rs; check.rs `report`). A failure prints ONE line to keep:
+  `blaze-sim keep: <test path> v<primitives version> <the shrunk tape as text>  # <date> <one line why>`. A
+  crate keeps its lines in a checked-in `sim-kept.tapes` beside its manifest, compiled in with `include_str!`
+  (nothing ambient: the file is an input of the build), and `check_kept(config, KEPT, body)` replays this
+  test's lines FIRST, in file order, before any search. A line whose test no longer exists, or that does not
+  parse, fails naming the line (never skipped). A line of an older primitives version is still replayed and the
+  report says so. Lines are only added (a later ratchet in the gate). In `blaze test` the same lines are
+  records (piece 4 of the section above): a failure CI found replays on a laptop.
+- S4 VACUITY AND POWER, IN OBSERVE MODE (check.rs, search.rs, control.rs; NEW src/observe.rs). After a search:
+  each labelled draw that could have given more than one value and gave one value in every case is listed
+  ("never varied"); each edge kind of S1 that no case produced for a label is listed; `control` prints for each
+  planted bug the case that caught it ("caught at case k of n") and a plant caught only in the last tenth of the
+  budget is listed as weak. One block of lines after the test's own; nothing fails yet.
+- S5 CRASH POINTS, EVERY ONE (crates/blaze-core/src/sim/, a NEW file; additive). For an operation sequence of
+  bounded length, enumerate EVERY crash point (after each write, between a write and its sync, at each sector
+  of a torn write up to a bound) instead of drawing one: the recovery invariant is checked at each. The random
+  search stays for long sequences. Also a list, checked against the code, of what `Sim` injects and what it does
+  not (a short read, a spurious wake, a completion delivered twice or late, the clock jumping or standing
+  still): each missing one added behind a swarm kind.
+- S6 SCHEDULES (crates/blaze-check/src/explore.rs and a NEW file; additive). State what `explore` does today
+  (exhaustive, bounded, random). Add what is missing of: a preemption bound with exhaustive search under it;
+  priority schedules with d change points for a depth-d bug; the schedule of a failure as a kept tape (S3).
+- S7 A SIGNAL FOR THE GUIDED PHASE (after S1; guided.rs, check.rs). The coverage words of a case are: its
+  reach points, the edge kind each labelled draw took, and a bucket of each labelled draw's value. No compiler
+  support needed; deterministic.
+- S8 THE HARVEST (the SIM INTEGRATOR; after S1 to S4 compile). Every crate that calls `blaze_sim::check`, with
+  `edge-first` on, one crate at a time; the table of new failures by crate and test, each with its kept line.

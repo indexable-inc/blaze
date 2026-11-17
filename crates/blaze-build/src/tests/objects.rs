@@ -15,6 +15,8 @@ use crate::layout::{LayoutFacts, Missing, ReprAttrs, ValidRange};
 use crate::vtable::{ObjectMethod, ObjectTrait};
 use crate::{Abi, Adts, Built, Intrinsic, Subst};
 
+mod nested_unsize;
+
 /// ```text
 /// #[lang = "sized"] trait Sized {}  #[lang = "unsize"] trait Unsize<U: ?Sized> {}
 /// trait Tr { fn m(&self) -> u64; }        trait Sub: Tr { fn n(&self) -> u64; }
@@ -335,6 +337,11 @@ impl LayoutFacts for FxAdts<'_> {
 impl Adts for FxAdts<'_> {
     fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {
         self.w.fx.adt_of(key)
+    }
+
+    /// The fixture's bodies do no arithmetic that overflows: the release setting.
+    fn overflow_checks(&self) -> crate::OverflowChecks {
+        crate::OverflowChecks::Off
     }
 
     fn facts(&self) -> &dyn LayoutFacts {

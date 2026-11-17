@@ -85,7 +85,7 @@ impl Server {
 
     fn listen(&mut self, effects: &mut Vec<Effect>) {
         let tag = self.tag(Did::Listen);
-        effects.push(Effect::Listen { at: Address::Tcp(at()), tag });
+        effects.push(Effect::Listen { at: Address::Tcp(at()), options: blaze_core::sockopt::Tcp::DEFAULT, tag });
     }
 
     fn recv(&mut self, conn: Conn, effects: &mut Vec<Effect>) {

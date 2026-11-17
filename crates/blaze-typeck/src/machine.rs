@@ -219,8 +219,10 @@ const HOLE_STEPS: usize = 1 << 16;
 
 /// What the nodes under the one being lowered were lowered to ([`Machine::lower_at`]).
 pub(crate) struct Lowered<'a> {
-    /// By node index: a node without a hole in its subtree, lowered once.
-    memo: Vec<Option<Ty>, Alloc<'a>>,
+    /// By node index: a node without a hole in its subtree, lowered once. A map of the nodes
+    /// the walk reached, never a vector by index: a body's type sits above the whole records'
+    /// table, so a vector would cost the table's length per lowering (runner 2, 2026-11-16).
+    memo: blaze_hash::HashMap<u32, Ty, Alloc<'a>>,
     /// A node that holds a hole is lowered once per written occurrence
     /// ([`Machine::lower_holes`]): `(node, type)` for each occurrence its parent has not taken.
     pool: Vec<(u32, Ty), Alloc<'a>>,
@@ -1088,40 +1090,49 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     /// signature when it instantiates it.
     /// `cause` is the place the type is instantiated for (the call whose callee's signature it
     /// is, the path naming the item): a projection in it that fails is reported there.
+    /// A parameter past `Lower::Args`'s list is `Malformed::Param` naming this call's caller
+    /// (`ParamSite::Lower`).
+    #[track_caller]
     pub(crate) fn lower(&mut self, types: PTys<'_>, root: PTy, mode: Lower, cause: Cause) -> Result<Ty, Stop> {
-        self.lower_at(types, root, mode, cause, None)
+        let by = core::panic::Location::caller();
+        self.lower_at(types, root, mode, cause, None).map_err(|e| match e {
+            Stop::Error(CheckError::Malformed(Malformed::Param { index, args, site: crate::error::ParamSite::Lower { at: None } })) => {
+                let site = crate::error::ParamSite::Lower { at: Some(by) };
+                Stop::Error(CheckError::Malformed(Malformed::Param { index, args, site }))
+            }
+            e => e,
+        })
     }
 
     /// [`Machine::lower`]; with `dyn_at`, each trait object's principal in the type is checked
     /// for dyn compatibility and reported there ([`Machine::check_dyn`]).
     fn lower_at(&mut self, types: PTys<'_>, root: PTy, mode: Lower, cause: Cause, dyn_at: Option<At>) -> Result<Ty, Stop> {
         let n = root.0 as usize + 1;
-        if n > types.nodes.len() {
+        if n > types.len() {
             return Err(CheckError::Malformed(Malformed::TypeOrder { node: root.0, child: root.0 }).into());
         }
-        let mut low = Lowered { memo: Vec::with_capacity_in(n, self.alloc), pool: Vec::new_in(self.alloc) };
-        low.memo.resize(n, None);
+        let mut low = Lowered { memo: blaze_hash::HashMap::new_in(self.alloc), pool: Vec::new_in(self.alloc) };
         // A node is `holey` when a hole (`_`) is in its subtree. The table interns nodes, so
         // two written holes are ONE `Infer` node, and `Vec<_>` written twice is one node too: a
         // holey node is never memoized (one memo entry would make the two holes one
         // variable); it is lowered once per written occurrence, after this loop
         // ([`Machine::lower_holes`]). Filled (and read) only once a hole was met, so a type
         // without holes pays nothing.
-        let mut holey: Vec<bool, Alloc<'a>> = Vec::new_in(self.alloc);
-        let mut any_hole = false;
+        // A set of the walk's nodes, never a vector by index (as `low.memo`).
+        let mut holey: blaze_hash::HashSet<u32, Alloc<'a>> = blaze_hash::HashSet::new_in(self.alloc);
         let mut stack: Vec<(u32, bool), Alloc<'a>> = Vec::new_in(self.alloc);
         let mut kids: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
         stack.push((root.0, false));
         // Each node is expanded once and finished once; each list entry is pushed at most once
         // per expansion of its parent.
-        let bound = 2 * (n + types.lists.len()) + 2;
+        let bound = 2 * (n + types.lists_len()) + 2;
         let mut steps = 0usize;
         while let Some((at, expanded)) = stack.pop() {
             steps += 1;
             if steps > bound {
                 return Err(CheckError::Limit(Limit::Export).into());
             }
-            if low.memo[at as usize].is_some() || (any_hole && holey[at as usize]) {
+            if low.memo.contains_key(&at) || holey.contains(&at) {
                 continue;
             }
             let node = types.node(PTy(at))?;
@@ -1133,47 +1144,45 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                     if c.0 >= at {
                         return Err(CheckError::Malformed(Malformed::TypeOrder { node: at, child: c.0 }).into());
                     }
-                    if low.memo[c.0 as usize].is_none() && !(any_hole && holey[c.0 as usize]) {
+                    if !low.memo.contains_key(&c.0) && !holey.contains(&c.0) {
                         stack.push((c.0, false));
                     }
                 }
                 continue;
             }
             let mut hole = matches!(node, PNode::Infer);
-            if any_hole && !hole {
+            if !holey.is_empty() && !hole {
                 kids.clear();
                 children(node, types, &mut kids)?;
-                hole = kids.iter().any(|c| holey[c.0 as usize]);
+                hole = kids.iter().any(|c| holey.contains(&c.0));
             }
             if hole {
-                if !any_hole {
-                    holey.resize(n, false);
-                    any_hole = true;
-                }
-                holey[at as usize] = true;
+                holey.insert(at);
                 continue;
             }
             let ty = self.lower_node(node, types, &mut low, mode, cause)?;
-            low.memo[at as usize] = Some(ty);
+            low.memo.insert(at, ty);
         }
-        // The lowered nodes are exactly the type's subtree.
+        // The lowered nodes are exactly the type's subtree: checked in node order, so the
+        // findings do not follow the maps' order.
         if let Some(at) = dyn_at {
-            for (i, m) in low.memo.iter().enumerate() {
-                if m.is_none() && !(any_hole && holey[i]) {
-                    continue;
-                }
-                if let PNode::Dynamic(l) = types.node(PTy(i as u32))?
+            let mut reached: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(low.memo.len() + holey.len(), self.alloc);
+            reached.extend(low.memo.iter().map(|(&i, _)| i));
+            reached.extend(holey.iter().copied());
+            reached.sort_unstable();
+            for &i in reached.iter() {
+                if let PNode::Dynamic(l) = types.node(PTy(i))?
                     && let Some(principal) = crate::portable::object_principal(types, l)
                 {
                     self.check_dyn(principal, at)?;
                 }
             }
         }
-        if any_hole && holey[root.0 as usize] {
+        if holey.contains(&root.0) {
             return self.lower_holes(types, root, mode, cause, &mut low, &holey);
         }
-        match low.memo[root.0 as usize] {
-            Some(t) => Ok(t),
+        match low.memo.get(&root.0) {
+            Some(&t) => Ok(t),
             None => Err(CheckError::Malformed(Malformed::TypeOrder { node: root.0, child: root.0 }).into()),
         }
     }
@@ -1188,7 +1197,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     /// ([`Machine::lowered`]). The walk is over the written tree, so its steps are the
     /// written type's size; a table whose sharing makes that tree larger than
     /// [`HOLE_STEPS`] is refused ([`Limit::Export`]).
-    fn lower_holes(&mut self, types: PTys<'_>, root: PTy, mode: Lower, cause: Cause, low: &mut Lowered<'a>, holey: &[bool]) -> Result<Ty, Stop> {
+    fn lower_holes(&mut self, types: PTys<'_>, root: PTy, mode: Lower, cause: Cause, low: &mut Lowered<'a>, holey: &blaze_hash::HashSet<u32, Alloc<'a>>) -> Result<Ty, Stop> {
         let mut stack: Vec<(u32, bool), Alloc<'a>> = Vec::new_in(self.alloc);
         let mut kids: Vec<PTy, Alloc<'a>> = Vec::new_in(self.alloc);
         stack.push((root.0, false));
@@ -1215,7 +1224,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             };
             for &c in kids.iter() {
                 // `lower_at` checked the order of every node reached here.
-                if holey.get(c.0 as usize).copied().unwrap_or(false) && Some(c) != len_hole {
+                if holey.contains(&c.0) && Some(c) != len_hole {
                     stack.push((c.0, false));
                 }
             }
@@ -1227,7 +1236,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     /// node that holds a hole) one of its occurrences waiting in the pool: which one does not
     /// matter, each is a lowering of the same node with its own fresh variables.
     fn lowered(low: &mut Lowered<'a>, t: PTy) -> Result<Ty, Stop> {
-        if let Some(t) = low.memo.get(t.0 as usize).copied().flatten() {
+        if let Some(&t) = low.memo.get(&t.0) {
             return Ok(t);
         }
         match low.pool.iter().rposition(|&(n, _)| n == t.0) {
@@ -1286,7 +1295,9 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 Lower::Args(args) => {
                     let len = self.ty.list_len(args);
                     if i >= len {
-                        return Err(CheckError::Malformed(Malformed::Param { index: i, args: len }).into());
+                        // `Machine::lower` fills in its caller.
+                        let site = crate::error::ParamSite::Lower { at: None };
+                        return Err(CheckError::Malformed(Malformed::Param { index: i, args: len, site }).into());
                     }
                     return Ok(self.ty.list_get(args, i));
                 }
@@ -1296,7 +1307,8 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 Lower::Args(args) => {
                     let len = self.ty.list_len(args);
                     if i >= len {
-                        return Err(CheckError::Malformed(Malformed::Param { index: i, args: len }).into());
+                        let site = crate::error::ParamSite::Lower { at: None };
+                        return Err(CheckError::Malformed(Malformed::Param { index: i, args: len, site }).into());
                     }
                     return Ok(self.ty.list_get(args, i));
                 }

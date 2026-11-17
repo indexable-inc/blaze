@@ -399,7 +399,7 @@ impl Loop {
         match rest.pop_front() {
             Some(at) => {
                 let tag = self.tag(Op::Connect { conn, at, rest, tried });
-                self.effects.push(Effect::Connect { at: Address::Tcp(at), tag });
+                self.effects.push(Effect::Connect { at: Address::Tcp(at), options: blaze_core::sockopt::Tcp::DEFAULT, tag });
             }
             None => {
                 self.conns.remove(&conn);

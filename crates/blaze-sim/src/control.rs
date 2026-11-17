@@ -2,11 +2,13 @@
 //! seen to catch a bug planted on purpose, and a clean run of the same code has been seen to
 //! pass. [`Broke`] is what an oracle, or the harness itself, says broke a case.
 
+use core::alloc::Allocator;
 use core::fmt::Debug;
 use std::cell::Cell;
 use std::panic::Location;
 
-use crate::check::{report_here, search};
+use crate::check::{observed_lines, report_here, say_observed, search, search_observing};
+use crate::observe::{Caught, plant_lines_into};
 use crate::search::{Broke, Config, Origin, Verdict};
 use crate::tape::Tape;
 
@@ -23,16 +25,16 @@ mod tests;
 /// run goes on as if that case had passed. A case that fails any other way (`Broke::Harness`, a
 /// panic, an overrun) ends the control at once: the plant was not caught by the oracle.
 ///
+/// When it passes it prints its observe block (observe.rs) on standard error: the case that
+/// caught the plant ("plant <plant>: caught at case k of n", and "weak: .." when that was in the
+/// last tenth of the cases) after what the clean run never varied. Fails nothing for it.
+///
 /// Reads nothing from outside. Panics, saying which half failed: the clean run's report; a
 /// planted failure of another kind, quoting it; `<plant> was caught <n> times in <cases> cases,
 /// never saying ..; first: ..` when the oracle spoke but never the words; `the oracle missed
 /// <plant> in <cases> cases` when it never spoke; or the report of a planted run that ended
 /// neither failed nor passed (nothing drawn, all discarded, a point unreached).
 #[track_caller]
-#[expect(
-    blaze::error_debug,
-    reason = "a plant is a value of the caller's own type, which the signature asks only to be `Debug`: its `Debug` form is the name the messages give it"
-)]
 pub fn control<P: Copy + Debug>(
     config: Config,
     clean: P,
@@ -41,7 +43,30 @@ pub fn control<P: Copy + Debug>(
     run: impl Fn(&Tape, P) -> Result<(), Broke>,
 ) {
     let at = Location::caller();
-    let clean_run = search(config.clone(), |tape| run(tape, clean));
+    let mut observed = observed_lines();
+    control_observed(at, config, clean, plant, says, run, &mut observed);
+    say_observed(at, &observed);
+}
+
+/// `control` from the place `at`, appending the lines of its observe block (observe.rs) to `out`
+/// in place of printing them: what the clean run's passing cases never varied, then where the
+/// planted run caught `plant` ("plant <plant>: caught at case k of n"), and "weak" when that was
+/// in the last tenth of the cases. Panics as `control` does.
+#[expect(
+    blaze::error_debug,
+    reason = "a plant is a value of the caller's own type, which the signature asks only to be `Debug`: its `Debug` form is the name the messages give it"
+)]
+pub(crate) fn control_observed<P: Copy + Debug, A: Allocator>(
+    at: &Location<'_>,
+    config: Config,
+    clean: P,
+    plant: P,
+    says: &str,
+    run: impl Fn(&Tape, P) -> Result<(), Broke>,
+    out: &mut blaze_own::String<A>,
+) {
+    let (clean_run, clean_search) = search_observing(config.clone(), |tape| run(tape, clean));
+    clean_search.tally().lines_into(out);
     if !matches!(clean_run, Verdict::Passed(_)) {
         panic!("the control's clean run did not pass:\n{}", report_here(&clean_run, at));
     }
@@ -59,7 +84,11 @@ pub fn control<P: Copy + Debug>(
     });
     match &planted_run {
         Verdict::Failed(failed)
-            if failed.failure.origin == Origin::Oracle && failed.failure.text.contains(says) => {}
+            if failed.failure.origin == Origin::Oracle && failed.failure.text.contains(says) =>
+        {
+            let caught = Caught { case: failed.case, cases: failed.cases };
+            plant_lines_into(&plant, caught, out);
+        }
         Verdict::Failed(failed) => {
             panic!("{plant:?} was caught, but saying `{}`, not `{says}`", failed.failure.text)
         }

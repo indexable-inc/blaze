@@ -18,10 +18,11 @@
 
 use std::path::Path;
 
+use blaze_build::OverflowChecks;
 use blaze_ladder::refusal::SourceFile;
 use blaze_ladder::run::{NewFront, RunError};
 
-use super::{expected, sources};
+use super::{Want, sources, wanted};
 
 /// The package name every rung is built as.
 pub const PACKAGE: &str = "ladder";
@@ -34,7 +35,8 @@ pub enum Verdict {
     Pass,
     Refused { class: String, first: String },
     Panicked { first: String },
-    Wrong { status: u8, out: Vec<u8> },
+    /// `raised`: the program panicked, stopped at the raise by this fn (D91).
+    Wrong { status: u8, raised: Option<String>, out: Vec<u8> },
 }
 
 /// Runs `f` with fd 1 on a pipe; its status and what it wrote there. As ladder_front2.rs's.
@@ -70,6 +72,32 @@ pub fn edition_of(dir: &Path) -> String {
     let manifest = std::fs::read_to_string(dir.join("Cargo.toml")).expect("a rung's Cargo.toml");
     let line = manifest.lines().find_map(|l| l.trim().strip_prefix("edition")).expect("an edition line");
     line.trim().trim_start_matches('=').trim().trim_matches('"').to_string()
+}
+
+/// The rung's overflow setting as `blaze run` takes it (D101): the `dev` profile's, on unless
+/// its `Cargo.toml` has `overflow-checks = false` (or `true`) under `[profile.dev]`. Any other
+/// line under `[profile.dev]` stops the rung by name: the harness reads only this key.
+pub fn overflow_of(dir: &Path) -> OverflowChecks {
+    let manifest = std::fs::read_to_string(dir.join("Cargo.toml")).expect("a rung's Cargo.toml");
+    let mut in_dev = false;
+    let mut setting = OverflowChecks::On;
+    for line in manifest.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        if line.starts_with('[') {
+            in_dev = line == "[profile.dev]";
+            continue;
+        }
+        if !in_dev {
+            continue;
+        }
+        let (key, value) = line.split_once('=').unwrap_or_else(|| panic!("{}: `{line}` under [profile.dev] is no key", dir.display()));
+        assert_eq!(key.trim(), "overflow-checks", "{}: the rung harness reads only `overflow-checks` under [profile.dev]", dir.display());
+        setting = match value.trim() {
+            "true" => OverflowChecks::On,
+            "false" => OverflowChecks::Off,
+            other => panic!("{}: `overflow-checks = {other}` is no boolean", dir.display()),
+        };
+    }
+    setting
 }
 
 /// Whether a package of `edition` builds against the real libraries (the toolchain's shelf):
@@ -128,13 +156,21 @@ pub fn run_one(dir: &Path, shelf: Option<&str>, run: impl FnOnce(&[SourceFile<'_
     let files = sources(dir);
     let views: Vec<SourceFile<'_>> = files.iter().map(|(path, text)| SourceFile { path, text }).collect();
     let edition = edition_of(dir);
-    let new = NewFront { package: PACKAGE, edition: &edition, shelf: if on_shelf(&edition) { shelf } else { None } };
+    let new = NewFront { package: PACKAGE, edition: &edition, shelf: if on_shelf(&edition) { shelf } else { None }, overflow: overflow_of(dir) };
     let mut refused = None;
     let mut panicked = None;
+    // The program panicked and was stopped at the raise (D91): which fn raised, and the
+    // refusal it is when `expected` wants a status.
+    let mut raised: Option<(String, (String, String))> = None;
     let (status, out) = capture(|| {
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&views, new)));
         match ran {
             Ok(Ok(status)) => status,
+            Ok(Err(error @ RunError::UnwindRaised { .. })) => {
+                let RunError::UnwindRaised { function } = &error else { unreachable!("matched above") };
+                raised = Some((function.path.to_string(), (class_of(&format!("{error:?}")), first_line(&error.to_string()))));
+                u8::MAX
+            }
             Ok(Err(error)) => {
                 refused = Some((class_of(&format!("{error:?}")), first_line(&error.to_string())));
                 u8::MAX
@@ -156,8 +192,20 @@ pub fn run_one(dir: &Path, shelf: Option<&str>, run: impl FnOnce(&[SourceFile<'_
     if let Some(first) = panicked {
         return Verdict::Panicked { first };
     }
-    let want = expected(dir);
-    if (status, &out) == (want.0, &want.1) { Verdict::Pass } else { Verdict::Wrong { status, out } }
+    let (want, want_out) = wanted(dir);
+    let ended = match (&want, &raised) {
+        (Want::Status(s), None) => *s == status,
+        (Want::Panicked(f), Some((by, _))) => f == by,
+        _ => false,
+    };
+    if ended && out == want_out {
+        return Verdict::Pass;
+    }
+    match raised {
+        // A panic where a status was wanted stays the stop it is.
+        Some((_, (class, first))) if matches!(want, Want::Status(_)) => Verdict::Refused { class, first },
+        raised => Verdict::Wrong { status, raised: raised.map(|(by, _)| by), out },
+    }
 }
 
 /// The verdict's word and its rest (no newline in either): what follows the rung's name.
@@ -166,13 +214,16 @@ pub fn verdict_line(dir: &Path, verdict: Verdict) -> (&'static str, String) {
         Verdict::Pass => ("PASS", String::new()),
         Verdict::Refused { class, first } => ("REFUSED", format!("{class}: {first}")),
         Verdict::Panicked { first } => ("PANICKED", first),
-        Verdict::Wrong { status, out } => {
-            let want = expected(dir);
+        Verdict::Wrong { status, raised, out } => {
+            let (want, want_out) = wanted(dir);
+            let got = match raised {
+                Some(by) => format!("panicked {by}"),
+                None => format!("status {status}"),
+            };
             let rest = format!(
-                "got status {status} stdout {:?} want status {} stdout {:?}",
+                "got {got} stdout {:?} want {want} stdout {:?}",
                 String::from_utf8_lossy(&out),
-                want.0,
-                String::from_utf8_lossy(&want.1)
+                String::from_utf8_lossy(&want_out)
             );
             ("WRONG", rest)
         }

@@ -36,7 +36,7 @@ struct Owned {
 
 impl Owned {
     fn view(&self) -> PTys<'_> {
-        PTys { nodes: &self.nodes, lists: &self.lists }
+        PTys::flat(&self.nodes, &self.lists)
     }
 }
 
@@ -65,10 +65,10 @@ pub(crate) fn struct_key(i: u32) -> ItemKey {
 
 fn to_owned(t: PortableTys<'_>) -> Owned {
     let v = t.view();
-    let mut nodes = Vec::with_capacity_in(v.nodes.len(), Global);
-    nodes.extend_from_slice(v.nodes);
-    let mut lists = Vec::with_capacity_in(v.lists.len(), Global);
-    lists.extend_from_slice(v.lists);
+    let mut nodes = Vec::with_capacity_in(v.len(), Global);
+    nodes.extend(v.nodes().copied());
+    let mut lists = Vec::with_capacity_in(v.lists_len(), Global);
+    lists.extend(v.lists());
     Owned { nodes, lists }
 }
 

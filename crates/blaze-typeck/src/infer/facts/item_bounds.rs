@@ -71,7 +71,7 @@ impl<'a> FactCache<'a> {
             let c = Conv { q, tab: INSTANCE_TAB, t: t.types };
             put.clear();
             for cl in t.supertraits {
-                let Some(sp) = self.instantiate(c, *cl, &with, &mut put)? else { continue };
+                let Some(sp) = self.instantiate(c, k, *cl, &with, &mut put)? else { continue };
                 if self.bound_listed(start, sp) {
                     continue;
                 }
@@ -104,19 +104,28 @@ impl<'a> FactCache<'a> {
         })
     }
 
-    /// The clause `cl` of `c`'s table as a solver predicate, `Param(i)` and `ConstParam(i)`
-    /// replaced by `with[i]` (`FactCache::clauses`, substituting). `None`: a `where const`
-    /// clause under the planted bug that drops them.
-    fn instantiate(&mut self, c: Conv<'_>, cl: PClause, with: &[STy], put: &mut Vec<u32, blaze_own::Alloc<'a>>) -> Result<Option<Pred>, Stop> {
+    /// The clause `cl` of `c`'s table (trait `of`'s supertraits) as a solver predicate, `Param(i)`
+    /// and `ConstParam(i)` replaced by `with[i]` (`FactCache::clauses`, substituting). `None`: a
+    /// `where const` clause under the planted bug that drops them.
+    fn instantiate(
+        &mut self,
+        c: Conv<'_>,
+        of: ItemKey,
+        cl: PClause,
+        with: &[STy],
+        put: &mut Vec<u32, blaze_own::Alloc<'a>>,
+    ) -> Result<Option<Pred>, Stop> {
         let p = match cl {
             PClause::Trait { trait_, args } => {
-                Pred::Trait { trait_: SDef(trait_.0), args: self.instance_list(c, args, with, put)?, polarity: Polarity::Positive }
+                let site = crate::error::ParamSite::Supertrait { of, super_: trait_ };
+                Pred::Trait { trait_: SDef(trait_.0), args: self.instance_list(c, args, with, put, site)?, polarity: Polarity::Positive }
             }
             PClause::Projection { trait_, args, name, term } => {
+                let site = crate::error::ParamSite::Supertrait { of, super_: trait_ };
                 let d = assoc_def(trait_, name);
                 self.names.insert(d, (trait_, name));
-                let args = self.instance_list(c, args, with, put)?;
-                let term = self.instance_ty(c, term, with, put)?;
+                let args = self.instance_list(c, args, with, put, site)?;
+                let term = self.instance_ty(c, term, with, put, site)?;
                 let alias = self.nodes.len() as u32;
                 self.nodes.push(K::Alias(Rigid::No, SAlias::Projection, SDef(d), args));
                 Pred::Projection { alias: STy(alias), term }
@@ -126,18 +135,27 @@ impl<'a> FactCache<'a> {
                 if self.drop_const_clauses {
                     return Ok(None);
                 }
-                Pred::ConstHolds { cond: SDef(cond.0), args: self.instance_list(c, args, with, put)? }
+                let site = crate::error::ParamSite::Supertrait { of, super_: cond };
+                Pred::ConstHolds { cond: SDef(cond.0), args: self.instance_list(c, args, with, put, site)? }
             }
         };
         Ok(Some(p))
     }
 
-    /// The list `l` of `c`'s table, each term instantiated ([`Self::instance_ty`]).
-    fn instance_list(&mut self, c: Conv<'_>, l: crate::ids::List, with: &[STy], put: &mut Vec<u32, blaze_own::Alloc<'a>>) -> Result<SList, Stop> {
+    /// The list `l` of `c`'s table, each term instantiated ([`Self::instance_ty`]); `site` is
+    /// named by a parameter past `with`.
+    fn instance_list(
+        &mut self,
+        c: Conv<'_>,
+        l: crate::ids::List,
+        with: &[STy],
+        put: &mut Vec<u32, blaze_own::Alloc<'a>>,
+        site: crate::error::ParamSite,
+    ) -> Result<SList, Stop> {
         let mut terms: Vec<STy, blaze_own::Alloc<'a>> = Vec::with_capacity_in(l.len as usize, self.alloc);
         for i in l.range() {
-            let p = *c.t.lists.get(i as usize).ok_or(CheckError::Malformed(Malformed::NoRecord(c.q)))?;
-            terms.push(self.instance_ty(c, p, with, put)?);
+            let p = c.t.list_slot(i as usize).ok_or(CheckError::Malformed(Malformed::NoRecord(c.q)))?;
+            terms.push(self.instance_ty(c, p, with, put, site)?);
         }
         let start = self.lists.len() as u32;
         self.lists.extend_from_slice(&terms);
@@ -148,7 +166,14 @@ impl<'a> FactCache<'a> {
     /// `with[i]`: `FactCache::ty`'s walk (children first, by a work list; a child comes before
     /// its parent in the table, so it ends) under the instance's memo number, each node it
     /// enters there named in `put`. A parameter past `with` is refused by name.
-    fn instance_ty(&mut self, c: Conv<'_>, root: PTy, with: &[STy], put: &mut Vec<u32, blaze_own::Alloc<'a>>) -> Result<STy, Stop> {
+    fn instance_ty(
+        &mut self,
+        c: Conv<'_>,
+        root: PTy,
+        with: &[STy],
+        put: &mut Vec<u32, blaze_own::Alloc<'a>>,
+        site: crate::error::ParamSite,
+    ) -> Result<STy, Stop> {
         self.work.clear();
         self.work.push((root.0, false));
         while let Some((n, expanded)) = self.work.pop() {
@@ -158,7 +183,7 @@ impl<'a> FactCache<'a> {
             let node = c.t.node(PTy(n)).map_err(Stop::from)?;
             if let PNode::Param(i) | PNode::ConstParam(i) = node {
                 let Some(&s) = with.get(i as usize) else {
-                    return Err(CheckError::Malformed(Malformed::Param { index: i, args: with.len() as u32 }).into());
+                    return Err(CheckError::Malformed(Malformed::Param { index: i, args: with.len() as u32, site }).into());
                 };
                 self.memo.insert((c.tab, n), s);
                 put.push(n);

@@ -586,11 +586,14 @@ dependencies = [
 name = "blaze-emit"
 version = "0.0.0"
 dependencies = [
+ "blaze-blake3",
  "blaze-code",
  "blaze-inproc",
  "blaze-lir",
  "blaze-own",
  "blaze-sim",
+ "blaze-std",
+ "blaze-tier",
 ]
 
 [[package]]
@@ -821,6 +824,14 @@ dependencies = [
 
 [[package]]
 name = "blaze-h1"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
+name = "blaze-h2"
 version = "0.0.0"
 dependencies = [
  "blaze-own",
@@ -1062,11 +1073,14 @@ name = "blaze-launch-rt"
 version = "0.0.0"
 dependencies = [
  "blaze-blake3",
+ "blaze-check",
  "blaze-code",
  "blaze-launch",
  "blaze-own",
  "blaze-queue",
  "blaze-run",
+ "blaze-sim",
+ "blaze-tier",
  "libc",
 ]
 
@@ -1076,6 +1090,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-launch",
  "blaze-launch-rt",
+ "blaze-own",
  "libc",
 ]
 
@@ -1120,7 +1135,19 @@ dependencies = [
  "blaze-format",
  "blaze-hash",
  "blaze-ids",
+ "blaze-own",
  "blaze-sim",
+]
+
+[[package]]
+name = "blaze-llvm"
+version = "0.0.0"
+dependencies = [
+ "blaze-code",
+ "blaze-lir",
+ "blaze-own",
+ "blaze-tier",
+ "llvm-sys",
 ]
 
 [[package]]
@@ -1606,6 +1633,7 @@ dependencies = [
 name = "blaze-sim"
 version = "0.0.0"
 dependencies = [
+ "blaze-own",
  "blaze-rng",
 ]
 
@@ -1810,6 +1838,16 @@ dependencies = [
 [[package]]
 name = "blaze-text-size"
 version = "0.0.0"
+
+[[package]]
+name = "blaze-tier"
+version = "0.0.0"
+dependencies = [
+ "blaze-code",
+ "blaze-lir",
+ "blaze-own",
+ "blaze-run",
+]
 
 [[package]]
 name = "blaze-toml"
@@ -3030,6 +3068,16 @@ name = "litemap"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
+
+[[package]]
+name = "llvm-sys"
+version = "231.0.1"
+dependencies = [
+ "anyhow",
+ "cc",
+ "lazy_static",
+ "libc",
+]
 
 [[package]]
 name = "lock_api"
@@ -5109,10 +5157,6 @@ dependencies = [
 [[patch.unused]]
 name = "cranelift-object"
 version = "0.137.1"
-
-[[patch.unused]]
-name = "llvm-sys"
-version = "231.0.1"
 
 [[patch.unused]]
 name = "ra-ap-rustc_pattern_analysis"

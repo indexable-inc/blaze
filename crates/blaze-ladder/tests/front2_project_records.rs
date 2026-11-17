@@ -95,8 +95,8 @@ impl Load<'static> for Kept {
         self.items.get(krate).copied()
     }
 
-    fn file(&self, krate: usize, path: &str) -> Option<&'static str> {
-        self.files.get(krate)?.get(path).copied()
+    fn file(&self, krate: usize, path: blaze_scope::package_path::PackagePath<'_>) -> Option<&'static str> {
+        self.files.get(krate)?.get(path.as_str()).copied()
     }
 
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'static str> {
@@ -183,7 +183,8 @@ fn compare(label: &str, files: &[(String, String)]) -> Compared {
         for c in names.crates().iter() {
             kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("the names record of `{}`: {e:?}", c.name)), g));
             kept.items.push(aligned(&items_record::encode(c, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), g));
-            kept.files.push(c.files.iter().map(|f| (f.path.to_string(), leak(f.text))).collect());
+            // By each file's path in its package: what the items record asks for (D96).
+            kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), leak(f.text))).collect());
             kept.expansions.push(c.expansions.iter().filter_map(|(call, e)| e.made.map(|m| (*call, leak(m.text)))).collect());
         }
         let shown: Vec<String> = rows.iter().map(|(file, chain, body)| format!("{file} {chain:?} {body:?}")).collect();

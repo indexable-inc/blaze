@@ -74,7 +74,8 @@ pub enum ConstFail {
     Steps { item: ItemKey, last: Need },
     /// An array length in a head names `item` while another constant is being evaluated (or
     /// where the caller gave no evaluator): not evaluated nested; owed: one work list.
-    Nested { item: ItemKey },
+    /// `shown`: what `item` names (check.rs `key_shown`: rule 19), beside the key.
+    Nested { item: ItemKey, shown: Box<str, Global> },
     /// An array length's constant `item` is not a `usize` value that fits in 64 bits.
     NotUsize { item: ItemKey },
     /// One fill named more than `most` array-length constants.
@@ -111,6 +112,10 @@ pub enum ConstFail {
     /// Expression `block` of `owner`'s body, as this evaluator lowered it, is not the
     /// `const { .. }` block an instance's build asked the value of (const_at.rs).
     NotConstBlock { owner: ItemKey, block: ExprId },
+    /// A type `item`'s evaluation lays out or grounds (a field's type: `Atomic<T>`'s
+    /// `UnsafeCell<T::Storage>`) holds a projection the checker's solver did not normalize:
+    /// that type has no ground form (front2/const_project.rs).
+    Projection { item: ItemKey, refused: super::const_project::ProjectionRefused },
 }
 
 impl core::fmt::Display for ConstFail {
@@ -124,7 +129,7 @@ impl core::fmt::Display for ConstFail {
             ConstFail::UnknownIntrinsic { item, name } => write!(f, "fn {item:?} is the intrinsic `{name}`, which blaze's intrinsics table does not hold"),
             ConstFail::Eval(e) => write!(f, "{e}"),
             ConstFail::Steps { item, last } => write!(f, "constant {item:?}: its needs did not settle in {MOST_STEPS} steps; the last: {last:?}"),
-            ConstFail::Nested { item } => write!(f, "constant {item:?}: an array length needs it while another constant is evaluated"),
+            ConstFail::Nested { item, shown } => write!(f, "constant {item:?} ({shown}): an array length needs it while another constant is evaluated"),
             ConstFail::NotUsize { item } => write!(f, "constant {item:?}: an array length's value is not a `usize` of 64 bits"),
             ConstFail::TooManyLengths { item, most } => write!(f, "constant {item:?}: one head named more than {most} array-length constants"),
             ConstFail::AdtRow { item, adt, why } => write!(f, "constant {item:?}: a layout it reads needs the row of ADT {adt:?}: {why}"),
@@ -136,6 +141,7 @@ impl core::fmt::Display for ConstFail {
             ConstFail::QPathDepth { need, most } => write!(f, "the qualified constant {need:?}: more than {most} are answered inside one another"),
             ConstFail::QPathKey { need, clash } => write!(f, "the qualified constant {need:?}: two origins under one checker key: {clash:?}"),
             ConstFail::NotConstBlock { owner, block } => write!(f, "fn {owner:?}: expression {} of its body as the evaluator lowered it is not a `const {{ .. }}` block", block.0),
+            ConstFail::Projection { item, refused } => write!(f, "constant {item:?}: a type it lays out: {refused}"),
         }
     }
 }
@@ -212,7 +218,7 @@ struct ConstBody<'n> {
     text: &'n str,
     hash: ContentId,
     typeck: TypeckBody<'static>,
-    tys: PortableTys<'static>,
+    tys: tc::OwnTys<'static>,
     checked: Checked<'static>,
     lits: LitTable,
     /// `Some(block)`: the body of a `const { .. }` block (front2/const_at.rs): its owner's body
@@ -241,12 +247,26 @@ struct ConstsWorld<'w, 'n, S> {
     store: &'w Store<'n>,
     bodies: &'w [ConstBody<'n>],
     records: &'w [ConstRecord<Alloc<'static>>],
-    /// The first `#[rustc_intrinsic]` fn met whose name the table does not hold.
-    unknown: core::cell::RefCell<Option<(ItemKey, Box<str>)>>,
     /// The last (trait, ground `Self`) [`ConstsWorld::impl_const`] selected no impl for among
     /// the impls made in the store: what [`Consts::value`] makes the candidates of before it
     /// asks again (front2/const_open.rs `impl_rows`).
     wanted: core::cell::Cell<Option<super::const_open::Wanted>>,
+    /// What the step's projections asked of the records ([`LayoutFacts::normalize`] below):
+    /// [`Consts::value`] makes its fills and asks again, or refuses naming the projection.
+    project: super::const_project::ProjectAsk<'w>,
+}
+
+/// An item's code identity from its key and its text: the ONE identity of a fn's code, which
+/// the evaluator's fn pointers (their instance keys, in a static's record) and the run's
+/// instance keys (`FrontEnd::code_of`) both take, so a static's fn word names the slot the run
+/// built (rule 30).
+pub(crate) fn item_code_id(item: ItemKey, text: Option<&str>) -> ContentId {
+    let mut h = Hasher::new("blaze-ladder front2 constant item");
+    h.update(&item.0.to_le_bytes());
+    if let Some(t) = text {
+        h.id(&hash_text(t));
+    }
+    h.finish()
 }
 
 fn hash_text(text: &str) -> ContentId {
@@ -271,7 +291,7 @@ fn written_name<'n, S: NamesSource<'n>>(names: S, lib: LibKey) -> Option<&'n str
 
 impl<'n, S: NamesSource<'n>> ConstsWorld<'_, 'n, S> {
     /// A free fn's kind from its signature: `const`, `#[rustc_intrinsic]`, or neither.
-    fn free_fn_kind(&self, item: ItemKey, lib: LibKey) -> FnKind {
+    fn free_fn_kind(&self, lib: LibKey) -> FnKind {
         if self.index.lang_name_of(lib).is_some_and(is_panic_lang) {
             return FnKind::Panic;
         }
@@ -284,12 +304,11 @@ impl<'n, S: NamesSource<'n>> ConstsWorld<'_, 'n, S> {
         });
         if intrinsic {
             let Some(name) = written_name(self.names, lib) else { return FnKind::NotConst };
+            // An unknown name is its own kind: the evaluator refuses a call of it as
+            // `Refusal::UnknownIntrinsic`, which compiled code keeps like any final refusal.
             return match Intrinsic::named(name) {
                 Ok(w) => FnKind::Intrinsic(w),
-                Err(_) => {
-                    self.unknown.borrow_mut().get_or_insert((item, Box::from(name)));
-                    FnKind::NotConst
-                }
+                Err(_) => FnKind::UnknownIntrinsic,
             };
         }
         if v.head[head::FLAGS] & blaze_lower::machine::sig::CONST != 0 { FnKind::Const } else { FnKind::NotConst }
@@ -427,12 +446,24 @@ impl<'n, S: NamesSource<'n>> LayoutFacts for ConstsWorld<'_, 'n, S> {
     fn valid_range(&self, _: ItemKey) -> ValidRange {
         ValidRange::default()
     }
+
+    /// By the checker's solver over the store (front2/const_project.rs): a field's type
+    /// grounded for a static's or constant's layout (`Atomic<usize>`'s
+    /// `UnsafeCell<<usize as AtomicPrimitive>::Storage>`) normalizes exactly as the run path's
+    /// layout does (program.rs `FrontEnd::normalize`). What it could not answer is kept in
+    /// `project` for [`Consts::value`].
+    fn normalize(&self, trait_: ItemKey, name: tc::Name, args: &[tc::PTy], ground: &mut PortableTys<'_>) -> Result<tc::PTy, blaze_build::BuildError> {
+        self.project.normalize(self.names, self.keys, self.index, self.store, trait_, name, args, ground)
+    }
 }
 
 impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
     fn body(&self, item: ItemKey) -> Fetch<Option<Typed<'_>>> {
         let b = self.bodies.iter().find(|b| b.key == item).ok_or(Missing)?;
-        let mut view = b.typeck.view(b.tys.view());
+        // `store.tys` is a table of its own and only grows, so the body's base is in it whole
+        // (`OwnTys::view` refuses only a shorter base or an overlay): an invariant, not a gap.
+        let tys = b.tys.view(&self.store.tys).expect("a body's types over the records' table it was lowered over");
+        let mut view = b.typeck.view(tys);
         // A const block's body: its owner's, evaluated from the block (const_at.rs).
         if let Some(root) = b.root {
             view.root = root;
@@ -447,7 +478,7 @@ impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
             return FnKind::Ctor { adt: c.adt, variant };
         }
         match self.keys.library_in(self.names, item) {
-            Some(lib) => self.free_fn_kind(item, lib),
+            Some(lib) => self.free_fn_kind(lib),
             None => match self.store.fns.get(&item) {
                 Some(f) if f.has_body => {
                     let v = f.text;
@@ -480,8 +511,6 @@ impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
     /// From the item's key and its text: the same whether or not its body is checked yet (a
     /// compiled caller keeps the record keys it computed, so the id must never change).
     fn code_id(&self, item: ItemKey) -> ContentId {
-        let mut h = Hasher::new("blaze-ladder front2 constant item");
-        h.update(&item.0.to_le_bytes());
         let text = match (self.store.locals.head(item), self.keys.library_in(self.names, item)) {
             // An item declared in a body: its kept text, there from the lowering of its
             // enclosing body on (its key is derived from that body's key and its name, not
@@ -490,10 +519,7 @@ impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
             (None, Some(lib)) => self.names.text_of(lib).map(|t| t.text),
             (None, None) => self.store.fns.get(&item).map(|f| f.text),
         };
-        if let Some(t) = text {
-            h.id(&hash_text(t));
-        }
-        h.finish()
+        item_code_id(item, text)
     }
 
     fn record(&self, key: RecordKey) -> Fetch<&ConstRecord<Alloc<'_>>> {
@@ -575,7 +601,7 @@ impl<'n> Consts<'n> {
     fn select_args<S: NamesSource<'n>>(&self, r: &mut Records<'_, 'n, S>, item: ItemKey, args: List, ground: &mut PortableTys<'_>) -> Result<(ItemKey, List), ConstFail> {
         let mut last: Option<super::const_open::Wanted> = None;
         loop {
-            let world = ConstsWorld { names: r.names, keys: &*r.keys, index: r.index, store: &*r.store, bodies: &self.bodies, records: &self.records, unknown: core::cell::RefCell::new(None), wanted: core::cell::Cell::new(None) };
+            let world = ConstsWorld { names: r.names, keys: &*r.keys, index: r.index, store: &*r.store, bodies: &self.bodies, records: &self.records, wanted: core::cell::Cell::new(None), project: super::const_project::ProjectAsk::new(r.buckets.as_ref()) };
             let Some((trait_, name)) = world.trait_const(item) else {
                 return Ok((item, args));
             };
@@ -597,7 +623,7 @@ impl<'n> Consts<'n> {
     /// The root of an evaluation that starts at the trait's constant `declared` for the
     /// ground `self_ty`: the selected item and its arguments (in `ground`).
     fn select_root<S: NamesSource<'n>>(&self, r: &Records<'_, 'n, S>, declared: ItemKey, self_ty: tc::PNode, ground: &mut PortableTys<'_>) -> Result<(ItemKey, List), ConstFail> {
-        let world = ConstsWorld { names: r.names, keys: &*r.keys, index: r.index, store: &*r.store, bodies: &self.bodies, records: &self.records, unknown: core::cell::RefCell::new(None), wanted: core::cell::Cell::new(None) };
+        let world = ConstsWorld { names: r.names, keys: &*r.keys, index: r.index, store: &*r.store, bodies: &self.bodies, records: &self.records, wanted: core::cell::Cell::new(None), project: super::const_project::ProjectAsk::new(r.buckets.as_ref()) };
         let Some((trait_, name)) = world.trait_const(declared) else {
             return Err(ConstFail::TraitConstNoSelf { item: declared, constant: declared });
         };
@@ -610,6 +636,18 @@ impl<'n> Consts<'n> {
     /// [`Consts::value`] (`self_ty` is `None`: `item` at no arguments), or
     /// [`Consts::trait_const_value`] (`item` is a trait's constant, selected for `self_ty`).
     fn value_at<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, root: Root) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
+        // Counted in and out (`Maps::evaluating`): a head that needs a constant while this
+        // runs finds the evaluator BUSY (`ConstFail::Nested`, which the work list below
+        // reads), where a caller with no evaluator at all has the head refused by name
+        // (check.rs `make`).
+        r.store.maps.evaluating.set(r.store.maps.evaluating.get().saturating_add(1));
+        let out = self.value_listed(r, prepared, item, root);
+        r.store.maps.evaluating.set(r.store.maps.evaluating.get().saturating_sub(1));
+        out
+    }
+
+    /// [`Consts::value_at`]'s work: the root's evaluation, with every constant it needs first.
+    fn value_listed<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, root: Root) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
         // A work list of the constants to evaluate FIRST, innermost last: a head made while a
         // body of the evaluation was checked names one (front2/const_open.rs `needed_first`:
         // `[u8; size_of::<Self>()]` on a method of `u8`, met when `u8::MAX` is checked). The
@@ -630,10 +668,11 @@ impl<'n> Consts<'n> {
                 }
                 Err(e) => {
                     let Some(c) = super::const_open::needed_first(&e) else { return Err(e) };
-                    // Only a constant this evaluator can file: an anonymous constant's need
-                    // key or an item's own key (a qualified leaf's need key is answered by
-                    // selection, which needs the evaluator free).
-                    let fileable = super::anon::need_key(super::keys::checker_of(c)) == c || r.keys.library_in(r.names, super::keys::checker_of(c)) == Some(c);
+                    // Any constant `check::eval_len` evaluates by its checker key (an item's,
+                    // an impl's or trait's member's, an anonymous one's) is filed here the
+                    // same way; a qualified leaf's need key is not: it is answered by
+                    // selection (`const_qpath::eval_asked`), which needs the evaluator free.
+                    let fileable = !r.store.maps.qpaths.borrow().is_leaf(c);
                     if rounds >= super::const_open::MOST_FIRSTS || firsts.contains(&c) || !fileable {
                         return Err(e);
                     }
@@ -728,10 +767,10 @@ impl<'n> Consts<'n> {
                 }
                 continue;
             }
-            let world = ConstsWorld { names: r.names, keys: r.keys, index: r.index, store: r.store, bodies: &self.bodies, records: &self.records, unknown: core::cell::RefCell::new(None), wanted: core::cell::Cell::new(None) };
+            let world = ConstsWorld { names: r.names, keys: r.keys, index: r.index, store: r.store, bodies: &self.bodies, records: &self.records, wanted: core::cell::Cell::new(None), project: super::const_project::ProjectAsk::new(r.buckets.as_ref()) };
             let answer = value_of(&world, &mut layout, &mut codes, n.item, n.args, &mut ground, Limits::DEFAULT, alloc);
             let wanted = world.wanted.take();
-            let unknown = world.unknown.into_inner();
+            let asked = world.project.into_asked();
             let step = match answer {
                 Ok(Answer::Done(rec)) => {
                     let key = rec.key;
@@ -764,9 +803,22 @@ impl<'n> Consts<'n> {
                         Refusal::Missing { what: "impl for an associated item", item: constant } => wanted.map(|w| (constant, w)),
                         _ => None,
                     };
+                    // A call of a `#[rustc_intrinsic]` fn the table does not hold (`free_fn_kind`
+                    // answered `UnknownIntrinsic`): named by the item's written name, the same
+                    // read `free_fn_kind` made, in this evaluation and every later one that runs
+                    // the kept code.
+                    let unknown = match e.refusal {
+                        Refusal::UnknownIntrinsic { item } => Some(item),
+                        _ => None,
+                    };
                     let text = format!("{e}").into_boxed_str();
                     match (unknown, no_adt, no_impl) {
-                        (Some((item, name)), _, _) => Err(ConstFail::UnknownIntrinsic { item, name }),
+                        (Some(item), _, _) => Err(match r.keys.library_in(r.names, item).and_then(|lib| written_name(r.names, lib)) {
+                            Some(name) => ConstFail::UnknownIntrinsic { item, name: Box::from(name) },
+                            // Not reached: `free_fn_kind` answers `UnknownIntrinsic` only after
+                            // reading this name; the evaluator's own text names the item and why.
+                            None => ConstFail::Eval(text),
+                        }),
                         (None, Some(adt), _) => match adt_row(r, n.item, adt) {
                             Ok(()) => continue,
                             Err(e) => Err(e),
@@ -775,7 +827,18 @@ impl<'n> Consts<'n> {
                             Ok(()) => continue,
                             Err(e) => Err(e),
                         },
-                        (None, None, None) => Err(ConstFail::Eval(text)),
+                        // A projection a type of the step holds (a field's `T::Storage`): the
+                        // records its normalization needs are made now and the same need is
+                        // evaluated again; one the solver refuses is named
+                        // (front2/const_project.rs `answer`).
+                        (None, None, None) => match super::const_project::answer(r, n.item, asked) {
+                            // The fills change what a type grounds to: code that met the
+                            // unanswered projection is not complete (blaze-consteval
+                            // machine/late.rs), so the evaluator compiles that body again.
+                            Some(Ok(())) => continue,
+                            Some(Err(e)) => Err(e),
+                            None => Err(ConstFail::Eval(text)),
+                        },
                     }
                 }
             };

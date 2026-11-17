@@ -48,6 +48,7 @@
 //! by.
 
 mod extra;
+pub mod profile;
 mod raw;
 #[cfg(test)]
 mod tests;

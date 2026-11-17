@@ -34,6 +34,7 @@ use blaze_own::{AVec, Alloc};
 use blaze_scope::items_record::{ImplRow, ItemsDecoded, ItemsRecord, ItemsRecordError, LoadItems, RecordItems};
 use blaze_scope::names::{self, PathError, Resolved, Why, Written};
 use blaze_scope::names_record::{Decoded, LoadNames, NamesRecord, NamesRecordError, RecordNames};
+use blaze_scope::package_path::PackagePath;
 use blaze_scope::resolve::{Names, Place};
 use blaze_scope::task::{ItemText, MacroBody, MacroSrc, Variant};
 use blaze_surface::{Def, Edition, ItemDetail, ItemIndex, ItemKind, Namespace};
@@ -553,15 +554,17 @@ pub trait Load<'n> {
     fn names(&self, krate: usize) -> Option<&'n [u8]>;
     /// The items record of crate `krate`, 16-aligned; `None` when none is kept.
     fn items(&self, krate: usize) -> Option<&'n [u8]>;
-    /// The text of the crate's file at `path` as it is now (the record checks its digest).
-    fn file(&self, krate: usize, path: &str) -> Option<&'n str>;
+    /// The text of the crate's file at `path` in its package as it is now (the record checks
+    /// its digest): the loader joins `path` onto the directory its world placed the crate's
+    /// package at (D96).
+    fn file(&self, krate: usize, path: PackagePath<'_>) -> Option<&'n str>;
     /// The text the macro call `call` of the crate expanded to.
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'n str>;
     /// The entry of the crate's file at `path`, as it is now, whose item chain is `chain`: what
     /// an items record row whose file changed is checked against, item by item
     /// (`blaze_scope::items_record::ItemsRecord::item_now`). This one outlines the file's text
     /// now; a caller that holds the file's `FileItems` record answers from it instead.
-    fn item(&self, krate: usize, path: &str, chain: blaze_id::ContentId, edition: Edition, alloc: Alloc<'n>) -> Option<blaze_scope::items_record::ItemToday<'n>> {
+    fn item(&self, krate: usize, path: PackagePath<'_>, chain: blaze_id::ContentId, edition: Edition, alloc: Alloc<'n>) -> Option<blaze_scope::items_record::ItemToday<'n>> {
         blaze_scope::items_record::grain::outline_today(self.file(krate, path)?, chain, edition, alloc)
     }
 }
@@ -592,7 +595,7 @@ impl<'n> LoadItems<'n> for Loader<'n> {
         bytes
     }
 
-    fn file(&self, krate: usize, path: &str) -> Option<&'n str> {
+    fn file(&self, krate: usize, path: PackagePath<'_>) -> Option<&'n str> {
         self.load.file(krate, path)
     }
 
@@ -600,7 +603,7 @@ impl<'n> LoadItems<'n> for Loader<'n> {
         self.load.expansion(krate, call)
     }
 
-    fn item(&self, krate: usize, path: &str, chain: blaze_id::ContentId, edition: Edition, alloc: Alloc<'n>) -> Option<blaze_scope::items_record::ItemToday<'n>> {
+    fn item(&self, krate: usize, path: PackagePath<'_>, chain: blaze_id::ContentId, edition: Edition, alloc: Alloc<'n>) -> Option<blaze_scope::items_record::ItemToday<'n>> {
         self.load.item(krate, path, chain, edition, alloc)
     }
 }

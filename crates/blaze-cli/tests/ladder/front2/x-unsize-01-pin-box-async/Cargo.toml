@@ -1,0 +1,4 @@
+[package]
+name = "ladder-x-unsize-01-pin-box-async"
+version = "0.1.0"
+edition = "blaze-2026.11"

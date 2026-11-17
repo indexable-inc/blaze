@@ -657,11 +657,11 @@ fn floor_ns(c: &blaze_typeck::Checked<'_>) -> u64 {
         let t = Instant::now();
         let view = c.types.view();
         let mut out = blaze_typeck::PortableTys::new_in(Alloc::global());
-        for &n in view.nodes {
+        for &n in view.nodes() {
             let _ = out.intern(n);
         }
         let col: Vec<blaze_typeck::PTy> = c.expr_ty.iter().copied().collect();
-        std::hint::black_box((col.len(), out.view().nodes.len()));
+        std::hint::black_box((col.len(), out.view().len()));
         best = best.min(t.elapsed().as_nanos() as u64);
     }
     best
@@ -684,8 +684,8 @@ fn print_floor(costs: &[Cost]) {
 /// The record's bytes as columns: each column's length times its element size.
 fn record_bytes(done: &blaze_typeck::Checked<'_>) -> usize {
     let tys = done.types.view();
-    tys.nodes.len() * std::mem::size_of::<blaze_typeck::PNode>()
-        + tys.lists.len() * 4
+    tys.len() * std::mem::size_of::<blaze_typeck::PNode>()
+        + tys.lists_len() * 4
         + done.expr_ty.len() * 4
         + done.pat_ty.len() * 4
         + done.local_ty.len() * 4
@@ -844,7 +844,7 @@ impl World for Empty {
         Ok(None)
     }
     fn predicates(&self, _: Seal, _: ItemKey) -> Fetch<Predicates<'_>> {
-        Ok(Predicates { clauses: &[], types: blaze_typeck::PTys { nodes: &[], lists: &[] } })
+        Ok(Predicates { clauses: &[], types: blaze_typeck::PTys::EMPTY })
     }
     fn adt(&self, _: Seal, _: ItemKey) -> Fetch<Option<blaze_typeck::Adt<'_>>> {
         Ok(None)

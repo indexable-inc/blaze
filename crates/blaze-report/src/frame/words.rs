@@ -150,6 +150,34 @@ pub const WORDINGS: &[Wording] = &[
         args: 4,
     },
     Wording {
+        area: Area::Cli,
+        number: 16,
+        name: "task-failed",
+        headline: "{0}",
+        label: "this is the task's answer until what it read changes: it is kept, never retried",
+        args: 1,
+    },
+    // A body's type error, from its `BodyCheck` task (blaze-cli body_types.rs): the checker's
+    // code and its words.
+    Wording {
+        area: Area::Cli,
+        number: 17,
+        name: "types",
+        headline: "{1}",
+        label: "type error {0}",
+        args: 2,
+    },
+    // A body whose types were not checked to the end (blaze-cli body_types.rs): never a pass;
+    // the command's closing line then says "NOT checked: types".
+    Wording {
+        area: Area::Cli,
+        number: 18,
+        name: "types-not-checked",
+        headline: "this body's types were not checked: {0}",
+        label: "not a pass: the check stopped here",
+        args: 1,
+    },
+    Wording {
         area: Area::Drive,
         number: 0xC0F6,
         name: "too-many-configurations",

@@ -207,6 +207,8 @@ mod unix {
         socket: UdpSocket,
         local: SocketAddr,
         options: Options,
+        /// Its buffers as the kernel said them once bound.
+        buffers: crate::sockopt::Buffers,
         /// Fired as it is unbound.
         stop: Stop,
         /// The receives asked of it, in order, for its one receiving thread.
@@ -352,10 +354,10 @@ mod unix {
                     let done = match bind(sock, at, options) {
                         Ok(bound) => {
                             self.next += 1;
-                            let local = bound.local;
+                            let (local, buffers) = (bound.local, bound.buffers);
                             // Once per socket bound, shared with its receiving thread.
                             self.socks.insert(sock.0, Arc::new_in(bound, Global));
-                            Done::Bound { sock, local }
+                            Done::Bound { sock, local, buffers }
                         }
                         Err((what, error)) => Done::Failed(IoError(format!(
                             "binding a UDP socket at {at} ({options:?}): {what}: {error}"
@@ -629,12 +631,18 @@ mod unix {
     ) -> Result<Bound, (&'static str, io::Error)> {
         let socket: UdpSocket = udp::bind(at, options)?;
         let local = socket.local_addr().map_err(|error| ("its address", error))?;
+        let buffers = {
+            use std::os::fd::AsRawFd as _;
+            crate::sockopt::buffers(socket.as_raw_fd(), at.is_ipv6())
+        }
+        .map_err(|error| ("its buffers read back", error))?;
         let stop = Stop::new().map_err(|error| ("its stop", error))?;
         Ok(Bound {
             sock,
             socket,
             local,
             options,
+            buffers,
             stop,
             receives: SegQueue::new(),
             parker: Parker::new(),

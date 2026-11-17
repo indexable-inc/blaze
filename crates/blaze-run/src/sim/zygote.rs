@@ -586,7 +586,7 @@ fn the_table_covers_every_op_once() {
         let (kind, site, _) = op_key(&op);
         assert!(rule(kind, site).is_some(), "{op:?} has no row");
     }
-    assert_eq!(RULES.len(), every_op().len());
+    assert_eq!(RULES.len(), every_op().len() + 1); // + (Spawn, WorkspaceBinary): only key_with with binaries gives it
 }
 
 #[test]
@@ -600,7 +600,7 @@ fn the_classifier_follows_its_table() {
         (Op::Stat { at: Where::Root("src") }, Class::Ask(Asked::Facts("src"))),
         (Op::ReadDir { at: Where::Root("tests") }, Class::Ask(Asked::Listing("tests"))),
         (Op::Change { at: Where::Outside("/var/tmp/x") }, Class::Refused { refusal: Refusal::Write, what: "/var/tmp/x" }),
-        (Op::Clock(Clock::Monotonic), Class::NotKept(NotKept::Clock)),
+        (Op::Clock(Clock::Monotonic), Class::Own),
         (Op::Env { name: "HOME" }, Class::Ask(Asked::Var("HOME"))),
         (Op::Random, Class::Own),
         (Op::Connect { peer: Peer::OwnLoopback }, Class::Own),

@@ -746,7 +746,7 @@ impl Remote for Client {
         if let Link::Down = self.link {
             let connect = self.tags.next();
             // clone: once per connection, connecting is the edge.
-            effects.push(Effect::Connect { at: self.at.clone(), tag: connect });
+            effects.push(Effect::Connect { at: self.at.clone(), options: blaze_core::sockopt::Tcp::DEFAULT, tag: connect });
             self.link = Link::Connecting(connect);
         }
         let unsent = match &self.link {
@@ -927,7 +927,7 @@ impl Server {
         self.listen = Some(tag);
         self.failed = None;
         // clone: once per listen, setup.
-        effects.push(Effect::Listen { at: self.at.clone(), tag });
+        effects.push(Effect::Listen { at: self.at.clone(), options: blaze_core::sockopt::Tcp::DEFAULT, tag });
     }
 
     /// Whether `tag` is one it asks with, so its completion goes to [`Server::complete`].
@@ -1360,7 +1360,7 @@ mod tests {
         fn effect(&mut self, side: usize, effect: Effect) {
             let done = |tag, done| Completion { tag, done };
             match effect {
-                Effect::Listen { at, tag } if side == S => {
+                Effect::Listen { at, tag, .. } if side == S => {
                     assert_eq!(at, socket());
                     self.listen = Some(tag);
                 }
@@ -1368,7 +1368,7 @@ mod tests {
                     assert_eq!(self.listen.take(), Some(tag));
                     self.inbox[S].push_back(done(tag, Done::Unlistened));
                 }
-                Effect::Connect { at, tag } if side == C => {
+                Effect::Connect { at, tag, .. } if side == C => {
                     assert_eq!(at, socket());
                     let Some(listen) = self.listen else {
                         let failed = Done::Failed(IoError("nothing listens there".into()));

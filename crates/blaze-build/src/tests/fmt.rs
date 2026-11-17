@@ -157,6 +157,10 @@ impl Adts for FmtAdts<'_> {
         self.inner.adt(key)
     }
 
+    fn overflow_checks(&self) -> crate::OverflowChecks {
+        self.inner.overflow_checks()
+    }
+
     fn facts(&self) -> &dyn LayoutFacts {
         self.inner.facts()
     }

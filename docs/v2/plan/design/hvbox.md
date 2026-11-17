@@ -29,6 +29,104 @@ randomness). That is blaze's existing `blaze_core::Command` with its `Sandbox`; 
 input is that value, so wiring hvbox in later is a strategy choice at one seam, not a second
 interface.
 
+## Incident 2026-11-16
+
+**What was run.** At 15:37:51 the lane building hvbox rebuilt the helper, signed it ad hoc with
+the hypervisor entitlement and ran it on a C `hello` (`timeout 30 blaze-hvbox run --verbose --
+hello`) on the owner's Mac. That run mapped every mapping of the dyld shared cache into the
+guest with `hv_vm_map` (0x1a2f8c000 bytes), took five exits, refused `thread_selfid` (372) and
+stopped with a typed error at a stage-2 data abort at address 8. Nothing went wrong on the host.
+At 15:37:59 and 15:38:03 the lane added an answer for `thread_selfid` and ran the helper again.
+
+**What happened.** At 15:38:05 the kernel panicked and the Mac rebooted, with every other lane's
+work cut off mid-step: `[SPTM] VIOLATION_ILLEGAL_MAPPING_TYPE: sptm_map_page(sptm.c:583) -
+root_pt_fte->type(XNU_STAGE2_ROOT_TABLE), leaf_pt_fte->type(XNU_STAGE2_PAGE_TABLE),
+page_fte->type(XNU_USER_EXEC), vaddr(0x180000000)`, panicked task pid 24783, `blaze-hvbox`. The
+page-table monitor refused to put a page typed as user-executable into a guest's stage-2 table,
+at guest address 0x180000000, and its refusal is a panic of the whole machine. The second run's
+own output was lost in the reboot.
+
+**The cause, inferred, not reproduced (and never to be reproduced).** The helper backed the
+shared cache with private file mappings (`mmap(PROT_READ | PROT_WRITE, MAP_PRIVATE, fd,
+offset)`) and handed them to `hv_vm_map`. A page of a private file mapping that nobody has
+written is the file's own page frame. 0x180000000 is the cache's base and its first mapping:
+the main cache file from offset 0, 0xb4000 bytes, read and execute, with no slide info, so the
+helper never wrote it; its frames are the cache text the system maps executable into every
+process, hence `XNU_USER_EXEC`. The first run survived although it mapped the same ranges, so
+`hv_vm_map` only records the mapping and the kernel enters each page in the stage-2 table when
+the guest first touches it; the first run stopped before dyld touched the cache. With
+`thread_selfid` answered, the second run most likely went on to `shared_region_check_np` and
+dyld's first read of the cache header at 0x180000000, which made the kernel enter that frame.
+Confidence: high that the page was the first mapping of the main cache file (the panic names
+exactly its address, and it is the only file-backed executable mapping there); medium that the
+trigger was dyld's first read (it fits the timeline and the first run's survival, but the
+second run's log is gone).
+
+**What was not known beforehand.** That this machine's page-table monitor types every
+physical page and answers a typed page in a stage-2 table with a machine panic rather than an
+error from the call; that `hv_vm_map` accepts such memory without complaint; that a mistake in
+an unprivileged helper's memory could take the owner's Mac down at all. The first brief's rails
+assumed the worst a guest or the helper could do was hang the helper.
+
+**The rule that follows.** Only anonymous private memory the helper allocated itself ever
+reaches the stage-2 table, by construction (Host safety, below); a file's bytes reach the guest
+only by being copied in. No process calls Hypervisor.framework until the owner allows it by
+hand (the consent file, below).
+
+## Host safety
+
+The rule: **the only memory that can reach `hv_vm_map` is a `GuestMem`**
+(`host/src/guest.rs`): fresh anonymous private memory (`bstd::mem::Region::reserve_sparse`:
+`MAP_PRIVATE | MAP_ANON | MAP_NORESERVE`, `PROT_READ | PROT_WRITE`), never executable on the
+host, never `MAP_JIT`, never a file, never shared, never the host's shared region or commpage.
+Its fields are private and its one constructor is that reservation. The framework's functions
+are declared only inside `host/src/vm.rs` (a private module), `hv_vm_map` is called only by
+`Vm::map`, and `Vm::map`'s only memory argument is a range of a `GuestMem` the `Vm` owns. The
+helper makes no file mapping at all: program, dyld and cache are read with bstd's
+`File::read_into`, a guest's file `mmap` is `Backing::Copy` (a `pread` into fresh guest
+memory). Every touch of the kernel through the framework:
+
+| call | what could go wrong on the host | the rule that prevents it |
+|---|---|---|
+| `hv_vm_config_*`, `hv_vm_create` | a VM made by a process nobody allowed | `Vm::new` takes a `Consent`, made only by reading the owner's consent file |
+| `hv_vm_map` | a typed page (file-backed, executable, JIT, shared, kernel) entered in stage 2: the incident's panic | only a range of a `GuestMem` the `Vm` owns; nothing else has the signature |
+| `hv_vm_map` | host memory freed or reused while the guest still maps it | the `Vm` owns each `GuestMem`; it is released only after its last stage-2 range is unmapped, or after `hv_vm_destroy` |
+| `hv_vm_protect` | stage-2 change of a range the helper did not map | only ranges the core's space holds; the cache, mapped in chunks, may not be reprotected (`Stop::CacheChange`) |
+| `hv_vm_unmap` | unmapping a range no slot backs, freeing the wrong memory | `Vm::unmap` finds the slot backing the host range first, or fails typed |
+| `hv_vm_destroy` | destroying with a vCPU alive | the `Vcpu` is declared after the `Vm` and drops first |
+| `hv_vcpu_create`, `_destroy` | a vCPU without a VM, or on another thread | `Vcpu::new` takes the `Vm`; one vCPU, made and run on the calling thread |
+| `hv_vcpu_run` | guest code reaching the host | none can: the guest runs at EL0 under the stub at EL1 inside the VM; every exception is an exit; the loop is bounded (`MAX_EXITS`), the run under `timeout` |
+| register access (`hv_vcpu_get/set_reg`, `_sys_reg`) | a bad value harming the host | they set only the guest's registers; a wrong one faults the guest into an exit |
+| exits | acting on a guest-chosen host address | the core translates guest addresses through its space; the driver checks every host address the core hands it (memory reads and writes, every pointer of a forwarded call) lies inside a `GuestMem` (`Vm::holds_host`) and stops typed otherwise (`Error::OutsideGuest`) |
+| forwarded calls (`svc`) | the guest acting on the host as the owner | the call table: only listed calls, pointers translated and checked, paths through the grant, network, `kill`, `ptrace`, task ports, `mount`, `reboot`, spawning refused by name |
+| the commpage | the host's page entered in stage 2 | its bytes are read and copied into a `GuestMem`; the host's page is never mapped |
+
+UNVERIFIED, a residual risk to watch in the first runs: what frame an anonymous page the host
+never wrote gets when the guest touches it first. XNU zero-fills a fresh page for anonymous
+memory as far as known; a shared zero page, if one exists, would be typed as data, not
+executable. The predecessor's Linux `hello` (15:36, from its scratch output) ran to exit on
+anonymous memory mapped executable at stage 2 with nothing amiss on the host.
+
+## First run checklist
+
+For when the owner allows a run; nothing below happens before he says so.
+
+1. The owner saves his work and closes what matters: a mistake here can panic and reboot the Mac.
+   No other heavy job runs.
+2. The agent builds (`cd crates/blaze-hvbox && CARGO_TARGET_DIR=<notes>/target timeout 300 nice
+   -n 10 cargo +nightly-2026-10-27 build --offline -j 4`) and the core's tests pass.
+3. The owner creates, by hand, `/Volumes/Projects/blaze-int-1112-notes/port27/hvbox-1116/OWNER-ALLOWS-HYPERVISOR-RUN`
+   holding exactly the line `I, the owner of this Mac, allow blaze-hvbox to call
+   Hypervisor.framework.` Without it the helper exits 121 before any framework call.
+4. The agent signs the helper ad hoc with `host/hv.entitlements.plist` and runs, once, the
+   freestanding Linux `hello` (no dyld, no cache): `timeout 30 <helper> run --verbose
+   --resident-cap 268435456 -- <notes>/bin/linux-hello`. Expected: `hello from a linux guest`,
+   status 7.
+5. Only if that was clean: once, the C `hello` with `--resident-cap 1073741824`. Each run is
+   one command, read before the next; no loop of reruns, no edit between a run and reading it.
+   Stop at the first of: a kernel message or panic, a hang past `timeout`, any `HvError`, any
+   result not understood. Afterwards the owner deletes the consent file until the next session.
+
 ## Layering
 
 1. **Guest**: the step's own Mach-O, the host's real `/usr/lib/dyld` and the dyld shared cache,
@@ -41,7 +139,16 @@ interface.
    primitive). Owns the call tables, the verdicts, the path view, the guest address-space
    bookkeeping, the Mach-O reader, the shared-cache reader, the trace, time and randomness.
 4. **Driver** (`blaze-hvbox-host`): the only code that touches Hypervisor.framework and the real
-   kernel: it maps memory, runs the vCPU, performs effects, feeds results back.
+   kernel: it maps memory, runs the vCPU, performs effects, feeds results back. It uses
+   blaze's own standard library, bstd (`crates/blaze-std`, a path dependency), wherever bstd
+   has what it needs: its entry, arguments and standard error; file reads through a read-only
+   world rooted at the host's `/`; guest memory from `bstd::mem::Region::reserve_sparse`; its
+   tables in the run context's frame. What bstd lacks is worked around beside its one use and
+   listed in the crate's DEBT block: a positional read of a file above a command's start
+   folder (`Ancestor::open_read`), `File::read_exact_at`, byte (non-UTF-8) arguments, and a
+   read on a raw descriptor (the guest's own descriptors, read with the forwarding `svc`).
+   This brings blaze-core and its third-party crates (libc) into the crate's lock file, which
+   the first brief's "no third-party crates" did not foresee; the owner's "use bstd" decides.
 
 ## Exit protocol
 
@@ -50,10 +157,12 @@ far }`, with `kind` one of `Svc`, `Abort { stage2 }`, `Counter`, `Undefined`, `O
 Hypervisor.framework fills it from `ESR_EL1/ELR_EL1/FAR_EL1/SPSR_EL1` after the stub's `hvc`, or
 from the exit's own syndrome for a stage-2 fault. A KVM driver or a seccomp-trap driver fills
 the same struct; nothing in the core names Hypervisor.framework. The core answers with a
-`Step`: zero or more `Effect`s (`OpenHost { path, flags }`, `ReadHost`, `MapGuest { va, len,
-prot, backing }`, `Forward { call }` on a same-ABI host, `Answer { x0, x1, carry }`,
-`SetThreadPointer`, `Exit(status)`, `Stop(Refusal)`), each completed by the driver with a
-result the core consumes. Darwin's ABI (UNVERIFIED, checked by the hello run): number in x16
+`Effect` (`Resume` with the registers to set, `Host(call)` on a same-ABI host carrying the
+span of every pointer argument, `Map { va, len, prot, backing }` with `backing` either zeros
+or `Copy { fd, offset }`, `Fill` of one chunk of a region filled on demand, `Unmap`, `Protect`,
+`Exit(status)`, `Stop(reason)`), each completed by the driver with an `Outcome` the core
+consumes, which may yield the next effect. A call whose memory argument lies in an unfilled
+chunk is answered with the `Fill` first and then answered again. Darwin's ABI (UNVERIFIED, checked by the hello run): number in x16
 (positive BSD, negative Mach trap, `0x80000000` the machine-dependent class that sets the
 thread pointer), arguments x0..x7, error as carry set and errno in x0.
 
@@ -147,7 +256,15 @@ guest), or serialised scheduling (fixes those, costs parallelism). Not chosen he
 **The test** is a property test on blaze's own engine: one step run several times under
 perturbed host conditions (real time, load, host pids, host directory order, CPU count) gives
 byte-identical outputs and an identical guest-visible trace, and a planted leak (one host value
-let through) fails it. Which driver can promise what: a hypervisor driver traps or hides direct
+let through) fails it. Its first form, at the core's seam with no hypervisor, exists
+(`core/src/tests.rs`, `blaze_sim::check`): a scripted guest (entropy, clock reads, an
+anonymous map, thread id, pid) under perturbed host addresses, host memory layout and host
+descriptor numbers sees identical answers and identical memory, and the planted control (a
+forwarded call answered differently by two hosts) is caught. That control is also a finding:
+a forwarded call's result is the host's (an `fstat64` carries the host's inode, size and
+times), so today the contract holds for emulated calls only; forwarded results must pass
+through the model (the inode table, fixed input times) before the contract holds whole. The
+whole-step form needs a run and waits for one. Which driver can promise what: a hypervisor driver traps or hides direct
 counter reads and the hardware random instruction beneath the EL1 stub, so it can hold the whole
 contract; a seccomp-trap driver cannot see a counter read or `RNDR` and holds it only for calls.
 Linux serves time through the vDSO, so the Linux personality maps its own vDSO or none.
@@ -155,13 +272,21 @@ Linux serves time through the vDSO, so the Linux personality maps its own vDSO o
 ## Address space, shared cache, pointer authentication
 
 IPA equals guest VA; the stage-1 tables identity-map 1 TB in 32 MB blocks, 16K granule; the
-real permissions are stage 2 (`hv_vm_map` flags), which the Sentry owns. The Sentry maps the
-shared cache's files itself, applies their slide info as plain pointers, and answers
-`shared_region_check_np` with its base: dyld then uses it (UNVERIFIED). Pointer authentication
+real permissions are stage 2 (`hv_vm_map` flags), which the Sentry owns. Every guest page is
+host memory the helper allocated itself (Host safety, above). The shared cache (about 7 GB of
+mappings on the host of 2026-11-16) is filled on demand: each of its mappings is a lazy region
+of reserved anonymous memory, nothing mapped; a stage-2 fault in an unfilled 256 KB chunk
+copies that chunk from the cache file (bstd `File::read_into`), applies the slide info to it as
+plain pointers, maps it and runs the faulting instruction again. Resident guest memory is
+capped (`--resident-cap`, default 4 GB); passing the cap stops the run with a typed error,
+never an eviction or a retry. The guest may not unmap, reprotect or map over the cache
+(`Stop::CacheChange`, by name). The Sentry answers `shared_region_check_np` with the cache's
+base: dyld then uses it (UNVERIFIED). Pointer authentication
 keys are disabled in `SCTLR_EL1`, so signing and authenticating are identity and plain pointers
 work (UNVERIFIED for every instruction class the cache uses). The decoder is checked against the
 host's own live shared region: same slide, same non-auth words, same auth words once stripped.
-Later: the fixed-up cache pages become a record mapped copy-on-write per process.
+Later: the fixed-up cache chunks become a record shared by every helper, still copied into each
+guest's own memory, never mapped from the record's file (Host safety).
 
 ## Threads, spawn and fork
 
@@ -212,7 +337,10 @@ releases. Not chosen here.
 
 0. This spec, and a freestanding static Linux aarch64 `hello` (`write`, `exit_group` through
    `svc #0`) run to exit under the Hypervisor.framework driver: the trap loop, the tables and
-   the exit protocol with no dyld, cache or pointer authentication in the way.
+   the exit protocol with no dyld, cache or pointer authentication in the way. Reached once
+   at 15:36 on 2026-11-16 by the code before the incident (from the predecessor's scratch
+   output: `hello from a linux guest`, two exits, `exit_group(7)`); the code since the fix has
+   never run (no run is allowed until the owner says so).
 1. A C `hello` runs to exit in the guest; its stdout and status equal the native run's.
 2. `clang -c` on one file; the object is byte-equal to the native run's.
 3. One small C-building Cargo build script from the reference project.

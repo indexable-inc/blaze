@@ -778,6 +778,70 @@
    "recommended": "One lane proves (1) by rerunning the same profile; every other piece goes to parallel write-only Opus writers from the architects' piece lists, planned in one wave file so no two writers share a function.",
    "why": "The owner: 'WHY SO LONG? im scared ur thign is not sota', then 'fix EVERYTHING wrong with design and get parallel opus to fix this (no need to check just write code)'. The design's floors are a repeat in 2 to 3 ms and a body edit in about 4 ms (estimates); the measured run did none of what the design says because the command's run path is not connected to records.",
    "state": "decided; writing"
+  },
+  {
+   "id": "D94",
+   "date": "2026-11-16",
+   "decision": "After the experimental sandbox helper panicked the owner's Mac at 15:38 (the page-table monitor refused a user-executable host page frame in a guest stage-2 table at the shared cache's address): no process may call Hypervisor.framework on that machine until the owner says so; the helper refuses to create a VM unless a file he creates by hand exists; the only memory that can reach `hv_vm_map` is anonymous memory the helper allocated and filled by copying, enforced by a type; the crate stays out of the pushed repository while its source reproduces the panic. The lane writes the fix, the host-safety and incident sections of the spec, and the core with its own tests; it runs nothing that touches the hypervisor.",
+   "recommended": "The owner decides: whether and when a first run happens, and whether the panic is reported to Apple.",
+   "why": "The lane was given rails for what the guest may ask of the host but none for what the helper itself hands the hypervisor; a file-backed mapping of the shared cache was passed to it. The cause is inferred from the panic text and the code and must not be reproduced to confirm it.",
+   "state": "decided; fix being written; runs held"
+  },
+  {
+   "id": "D95",
+   "date": "2026-11-16",
+   "decision": "blaze-sim's search finds edge cases by construction: interesting-value tables at every primitive (integers, sizes, bytes, characters, text, names, floats); repetition and order shapes for collections, replayed at the tape's level; swarm testing for operation and fault kinds; every crash point enumerated for bounded sequences and bounded or priority schedules for interleavings; a test that never exercised what it claims is reported (observe mode first, then a failure); failing tapes are kept in a checked-in file per crate, compiled in and replayed first; each planted bug reports the case that caught it. Built behind the cargo feature `edge-first`; an integrator runs every dependent crate with it on and files what it finds; then it becomes the default and the old path is deleted. Spec: docs/v2/plan/design/test.md, 'End state: the search itself'.",
+   "recommended": "Seven write-only writers (S1a, S1b, S2 to S6) and one SIM INTEGRATOR now; S7 after S1; S8 is the harvest.",
+   "why": "The owner asked for crazy edge values, a state-of-the-art method and kept failures. Today: integers favour a range's ends but have no boundary table; sizes, bytes, characters and text have none; nothing repeats an element or switches kinds off per case; a failing seed found by a lane lives only in that lane's report (two were quoted today and are in no file).",
+   "state": "decided; writing"
+  },
+  {
+   "id": "D96",
+   "date": "2026-11-16",
+   "decision": "DECIDED 2026-11-16 after the probe (/Volumes/Projects/blaze-int-1112-notes/port27/D96-probe.md: 39 places, 15 silent defaults): what a crate sees as its root never depends on the workspace that uses it. (1) Records hold package-relative paths only; a file is read by (crate, path in package); no tree number, lock index or root is stored (today the items record's file row `path` carries `/<tree>/<dir>/`, so every fetched and toolchain crate's scope record differs between workspaces under one key). (2) A dependency (registry, git, toolchain) sees one constant root `/package` for `env!`, proc macros and build scripts. (3) A workspace member sees `/workspace/<member dir>` with the workspace above it, in all three; the member dir is in its crate key. (4) `include!` of an absolute path under the crate's own root is served; `file!()` and `Location` give a member's workspace-relative path and a dependency's `<name>-<version>/<path>`. (5) Every missing-variable default (the `/workspace` one in native_script.rs and the rest) becomes a typed error; `line!`, `column!` and `module_path!` give one answer in both hosts.",
+   "recommended": "Pieces P1 to P5 of the probe file; P1 (package-relative paths in records) is a cross-crate batch.",
+   "why": "Found by the writer of tempo census brief 17a: two stable paths for one thing, and a silent default.",
+   "state": "decided; P1 started"
+  },
+  {
+   "id": "D97",
+   "date": "2026-11-16",
+   "decision": "Code generation on the item layer, decided by the coordinator at the owner's request (docs/v2/plan/design/backend-next.md, 'End state: code generation on the item layer'): one `Tier` seam with three tiers tested equal; the fast tier is one analysis pass and one emission pass with a greedy register allocator, its encoders a checked-in table of machine-code templates with register, immediate and site fields, generated at blaze's build time through the same LIR-to-LLVM lowering the optimizing tier uses and validated per template; heat from sampling the program counter and link register, not a counter in every prologue; no on-stack replacement; a profile record and a startup record per program; the optimizing tier is blaze's own inliner on LIR followed by a fixed LLVM function pipeline on one function, so a record's read list is exact by construction; export is the same units, all of them.",
+   "recommended": "The seam with its equality harness, the register allocator and the LIR inliner start now; LLVM lowering, the table, sampling, export and x86-64 follow in that order.",
+   "why": "The rebuilt fast tier is a stand-in that keeps every value in a stack cell; the stencil backend is parked with the old layer; no optimizing tier exists on the new layer. Because code is a record found by its key, the fast tier's emission speed matters little and its code's speed matters more, which favours registers and LLVM-chosen instruction encodings over plain per-assignment stencils.",
+   "state": "decided; pieces being listed"
+  },
+  {
+   "id": "D98",
+   "date": "2026-11-16",
+   "decision": "D97 checked against the published state of the art and amended in three places (backend-next.md, 'Checked against the published state of the art'): (1) the fast tier's two-pass shape with generated encoders is TPDE's (CGO 2026) and stands, but its code is -O0 class, so its input is LIR after blaze's own TRIVIAL inliner (small loop-free bodies and `#[inline(always)]`, exact read list), and the fast-to-optimized ratio is reported from a measurement, never claimed; (2) the optimizing tier uses LLVM's own inliner inside an OFFER SET of callee bodies blaze chooses (`available_externally`), and the record's read list is the offer set: sound by construction, the shape of ThinLTO's cache key; blaze writes no general inliner; (3) a running loop tiers up: a loop map in every fast record, one poll load on each loop back-edge, an optimized loop-entry variant entered from the poll's fault.",
+   "recommended": "The architect's pieces carry the three amendments: (b) writes the loop map and reserves the run-context register; (c) is the trivial inliner; (d) lowers the instance with its offer set.",
+   "why": "The owner: 'it needs to be sota'. A blaze-own inliner on unoptimized LIR would decide worse than LLVM's bottom-up inliner; -O0-class Rust is far from optimized Rust; a loop in a function entered once would never leave fast code.",
+   "state": "decided"
+  },
+  {
+   "id": "D99",
+   "date": "2026-11-16",
+   "decision": "The code generation design (D97, D98) is built straight at its end state, every piece at once against one interface crate (backend-next.md, 'Built straight at the end state'): no stage where the register allocator sits on hand-written encoders; the fast tier is written once as the composer over the template table; today's hand-written encoders become one generator of table entries and the LLVM generator the other, tested equal; the composer, both generators, the equality harness, the trivial inliner, the offer set, LIR-to-LLVM, sampling and promotion, loop tier-up, export and the x86-64 table are parallel writers.",
+   "recommended": "Piece 0 (the types crate) first and alone; then one writer a piece.",
+   "why": "The owner: 'go straight to sota'. Rules 62, 66 and 79.",
+   "state": "decided"
+  },
+  {
+   "id": "D100",
+   "date": "2026-11-16",
+   "decision": "The code generation design after an outside critic and the architect's objections (backend-next.md, 'The outside critic's findings and the architect's objections, decided', 14 points): the Fast tier's input is LIR after a linear simplify stage (trivial inliner, scalar replacement of non-escaping slots, copy and constant propagation, dead code); a running loop tiers up in a new frame above the fast frame, never by moving it; no reserved register (the poll is a load site); call edges from the frame record, macOS sampled by thread suspension and Linux by a per-thread timer; homes for values live across blocks in the analysis pass, eviction only for block-local values; fused templates and immediate classes; an optimized record's read list is exactly the inlined set (a named custom pipeline with no inference from offered bodies, facts supplied by blaze, LLVM's inline remarks read back) so an edit of a hot leaf does not demote callers that did not inline it; the offer set's digest in the key and profile-made records private; callees offered as already-optimized bitcode records; unwind rows, a position map with inline frames and debugger registration in every tier's record; sites at relocation grain in one new code record format; shared instances found optimized, never through Fast; slot words stay until a measurement of call cost.",
+   "recommended": "The architect rewrites the wave for D99 and D100; piece 0 first.",
+   "why": "The owner: 'it needs to be sota', 'go straight to sota'. Three of the critic's findings were blockers: fast code without scalar replacement stays far from optimized; moving a frame dangles Rust's pointers to locals; the link register names the caller only in a leaf.",
+   "state": "decided"
+  },
+  {
+   "id": "D101",
+   "date": "2026-11-16",
+   "decision": "Arithmetic overflow checks follow the profile and are part of every code key: on for the dev profile and for `test`, off for the release profile, overridden by the manifest's `overflow-checks` for the profile in use; `run` and `test` build workspace code with the dev setting unless the manifest says otherwise; a cached dependency record is keyed by its own setting. Division and remainder by zero and MIN / -1 are checked always (the Reference: they panic in every build). Today `Adts::overflow_checks()` defaults to false and no driver sets it, so `+ - *` wrap silently in a dev build: a wrong answer by Rust's rule.",
+   "recommended": "The builder takes the setting from its caller (no default), the driver reads it from the manifest's profile, and the code key holds it.",
+   "why": "Found by the wrong-answers lane (runner 5, S2). A silent wrap where Rust panics is a correctness bug, and a key that misses the setting would share code between profiles.",
+   "state": "decided; writer to start"
   }
  ]
 }

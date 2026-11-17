@@ -193,6 +193,65 @@ struct Resolved {
     absent: std::vec::Vec<String, Global>,
     /// Each unresolved path of the crate's own code, as its record's finding ([`unresolved`]).
     findings: blaze_own::Vec<Unresolved, Global>,
+    /// The crate's failure, filed as the record's [`crate::work::TASK_FAILED`] error: its
+    /// names could not be resolved or a section written (the out is then
+    /// [`crate::work::failed_out`]), or its tests section is empty though it is a test unit.
+    failed: Option<std::string::String>,
+}
+
+/// A resolved crate's payload ([`sections::write`]) with its unresolved paths as findings.
+struct ScopeRecord {
+    payload: blaze_own::Vec<u8, Global>,
+    findings: blaze_own::Vec<Unresolved, Global>,
+    unresolved: u32,
+    /// Why the tests section is empty though the unit is a test unit.
+    tests_refused: Option<std::string::String>,
+}
+
+/// A section of a resolved crate's record that could not be written: the crate's failure.
+#[derive(Debug)]
+struct Unwritten {
+    crate_name: std::string::String,
+    section: &'static str,
+    why: std::string::String,
+}
+
+impl core::fmt::Display for Unwritten {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "crate `{}`: its {} record could not be written: {}", self.crate_name, self.section, self.why)
+    }
+}
+
+/// The record of the crate `crate_name` resolved as `done`.
+fn scope_record(done: &blaze_scope::crate_scope::CrateScope<'_>, crate_name: &str) -> Result<ScopeRecord, Unwritten> {
+    let unwritten = |section: &'static str, why: std::string::String| Unwritten { crate_name: crate_name.into(), section, why };
+    let mut findings = blaze_own::Vec::new_in(Global);
+    let unresolved = done.names.notes.len() as u32 + unresolved(done.names, &mut findings);
+    // The names and items records, filed in the same record (drive.md, "End state", piece
+    // 3): a body is checked by reading them, never by solving the crate graph again.
+    let names_record = blaze_scope::names_record::encode(done.names, Alloc::global()).map_err(|error| unwritten("names", std::format!("{error:?}")))?;
+    let items_record = blaze_scope::items_record::encode(done.names, Alloc::global()).map_err(|error| unwritten("items", std::format!("{error:?}")))?;
+    // A test unit's tests, from attributes alone (test.md, "The tests record", piece 6): the
+    // fifth section. A unit without `test` in its cfg has none, and its section is empty.
+    // A refused tests record is the crate's finding, not its failure: the section stays
+    // empty and the rest of the record is kept, standing until a file it read moves.
+    let mut tests_refused = None;
+    let tests_record = match blaze_scope::tests_record::encode(done.names, Alloc::global()) {
+        Ok(bytes) => Some(bytes),
+        Err(blaze_scope::tests_record::TestsRecordError::NotATestUnit { .. }) => None,
+        Err(error) => {
+            tests_refused = Some(std::format!("{}", unwritten("tests", std::format!("{error}"))));
+            None
+        }
+    };
+    let tests: &[u8] = match &tests_record {
+        Some(bytes) => &bytes[..],
+        None => &[],
+    };
+    let payload = sections::write(unresolved, [&done.record[..], &done.inner[..], &names_record[..], &items_record[..], tests]);
+    #[cfg(test)]
+    sections::watch_tests(crate_name, &payload, tests);
+    Ok(ScopeRecord { payload, findings, unresolved, tests_refused })
 }
 
 /// The rule of a `use` or macro path in a project's own crate that names nothing.
@@ -365,6 +424,13 @@ impl core::fmt::Display for Unlisted {
             "the names of package `{}` read `{}`, which no manifest's targets and no file's `mod` lines list (a module under a macro, an attribute or a `#[path]` the outline does not follow): its items cannot be checked",
             self.package, self.path
         )
+    }
+}
+
+impl<'f> Names<'f> {
+    /// The world the names are of: its crates in index order, their texts (body_types.rs).
+    pub(crate) fn world(&self) -> &World<'f> {
+        &self.world
     }
 }
 
@@ -683,7 +749,7 @@ pub(crate) fn run<'f, 'b>(
             resolve_crate(&local_input, &deps, local_sysroot, &texts, at, &Serial, names.prepares, Alloc::global())
         };
         let done = match done {
-            Ok(done) => done,
+            Ok(done) => Ok(done),
             Err(CrateScopeError::Need(keys)) => {
                 let mut wants = blaze_own::Vec::with_capacity_in(keys.len(), held);
                 for key in keys.iter() {
@@ -694,46 +760,24 @@ pub(crate) fn run<'f, 'b>(
                 }
                 return Ok(Did::Need(wants));
             }
-            Err(error) => {
-                let words = bstd::mem::format_in!(held, "crate `{}`: its names could not be resolved: {error:?}", input.name);
-                return Ok(Did::FailedSaying(refused("the crate's names could not be resolved"), held_str(words.as_str(), held)));
+            // The crate's typed failure is its answer (work.rs, `filed`): a record whose out
+            // says failed, with the files it read so far as its read list, so it stands until
+            // one of them moves and a reader of it fails `Waited` on it.
+            Err(error) => Err(std::format!("crate `{}`: its names could not be resolved: {error:?}", input.name)),
+        };
+        let (out, payload, findings, failed) = match done {
+            Ok(done) => {
+                names.resolved += 1;
+                match scope_record(&done, input.name) {
+                    Ok(record) => {
+                        names.unresolved += u64::from(record.unresolved);
+                        (ContentId::of(OUT_DOMAIN, &done.record), record.payload, record.findings, record.tests_refused)
+                    }
+                    Err(unwritten) => (crate::work::failed_out(), sections::write(0, [&[][..]; 5]), blaze_own::Vec::new_in(Global), Some(std::format!("{unwritten}"))),
+                }
             }
+            Err(words) => (crate::work::failed_out(), sections::write(0, [&[][..]; 5]), blaze_own::Vec::new_in(Global), Some(words)),
         };
-        let mut findings = blaze_own::Vec::new_in(Global);
-        let unresolved = done.names.notes.len() as u32 + unresolved(&done.names, &mut findings);
-        // The names and items records, filed in the same record (drive.md, "End state", piece
-        // 3): a body is checked by reading them, never by solving the crate graph again.
-        let names_record = match blaze_scope::names_record::encode(done.names, Alloc::global()) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                let words = bstd::mem::format_in!(held, "crate `{}`: its names record could not be written: {error:?}", input.name);
-                return Ok(Did::FailedSaying(refused("the crate's names record could not be written"), held_str(words.as_str(), held)));
-            }
-        };
-        let items_record = match blaze_scope::items_record::encode(done.names, Alloc::global()) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                let words = bstd::mem::format_in!(held, "crate `{}`: its items record could not be written: {error:?}", input.name);
-                return Ok(Did::FailedSaying(refused("the crate's items record could not be written"), held_str(words.as_str(), held)));
-            }
-        };
-        // A test unit's tests, from attributes alone (test.md, "The tests record", piece 6): the
-        // fifth section. A unit without `test` in its cfg has none, and its section is empty.
-        let tests_record = match blaze_scope::tests_record::encode(done.names, Alloc::global()) {
-            Ok(bytes) => Some(bytes),
-            Err(blaze_scope::tests_record::TestsRecordError::NotATestUnit { .. }) => None,
-            Err(error) => {
-                let words = bstd::mem::format_in!(held, "crate `{}`: its tests record could not be written: {error}", input.name);
-                return Ok(Did::FailedSaying(refused("the crate's tests record could not be written"), held_str(words.as_str(), held)));
-            }
-        };
-        let tests: &[u8] = match &tests_record {
-            Some(bytes) => &bytes[..],
-            None => &[],
-        };
-        let payload = sections::write(unresolved, [&done.record[..], &done.inner[..], &names_record[..], &items_record[..], tests]);
-        #[cfg(test)]
-        sections::watch_tests(input.name, &payload, tests);
         // The drive names a module file by its slot (`x.rs` for `x/mod.rs` too, sweep.rs): a
         // read of either place is a read of the slot's `Surface`.
         let (mut read, mut lacked) = (texts.read.into_inner(), texts.absent.into_inner());
@@ -749,9 +793,7 @@ pub(crate) fn run<'f, 'b>(
         absent.sort_unstable();
         absent.dedup();
         absent.retain(|path| files.binary_search(path).is_err());
-        names.resolved += 1;
-        names.unresolved += u64::from(unresolved);
-        let resolved = Resolved { out: ContentId::of(OUT_DOMAIN, &done.record), payload, files, absent, findings };
+        let resolved = Resolved { out, payload, files, absent, findings, failed };
         let i = names.made.binary_search_by_key(&name.subject, |(subject, _)| *subject).unwrap_err();
         names.made.insert(i, (name.subject, resolved));
     }
@@ -772,6 +814,9 @@ pub(crate) fn run<'f, 'b>(
     for finding in resolved.findings.iter() {
         let words = core::str::from_utf8(&finding.message).map_err(|_| CliError::Text { what: "a path's segment is not UTF-8" })?;
         made.find(UNRESOLVED, finding.at, &[words]);
+    }
+    if let Some(words) = &resolved.failed {
+        made.find(crate::work::TASK_FAILED, (0, 0), &[words.as_str()]);
     }
     for path in resolved.files.iter() {
         let input = task.inputs.iter().find(|input| input.name == surface(path)).expect("checked above");

@@ -29,6 +29,19 @@
 //! lines: `block_use_underscore: clean`, `block_use_named: clean`, `block_use_glob: clean`,
 //! `block_use_by_macro: clean`, `block_use_absent: clean (refused with NoMethod)`,
 //! `block_use_out_of_block: clean (refused with NoMethod)`.
+//!
+//! Traits declared in a block (front2 block_traits.rs `Reader::declared`; the block is a module
+//! of the names library, blaze-scope blocks.rs). The Reference, "Statements"
+//! [statement.item.scope] above, and "Method call expressions": "Then all remaining methods in
+//! scope are looked up": a trait declared in a block is in scope in that block. The pinned
+//! core's `Write::write_fmt` (library/core/src/fmt/mod.rs) declares `trait SpecWriteFmt` and
+//! `impl<W: Write + ?Sized> SpecWriteFmt for &mut W` in its body and calls
+//! `self.spec_write_fmt(args)`: `block_trait_write_fmt` is its shape. Expected lines:
+//! `block_trait_write_fmt: clean`, `block_trait_inner_call: clean`, `block_trait_provided:
+//! clean`, `block_trait_out_of_block: clean (refused with NoMethod)`,
+//! `block_trait_path_elsewhere: clean (refused with UnresolvedPath)`. Before the change, the
+//! first three print "no head"/"does not lower"/a `Local` gap naming "a trait declared in a
+//! block".
 
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::Front2;
@@ -77,6 +90,30 @@ macro_rules! check_shape {
     };
 }
 fn local_macro(n: usize) { check_shape!(n); }
+mod sink {
+    pub trait Sink { fn put(&mut self, b: u8) -> u8; }
+    impl Sink for u8 { fn put(&mut self, b: u8) -> u8 { *self = b; b } }
+}
+fn block_trait_write_fmt(w: &mut u8) -> u8 {
+    trait SpecPut { fn spec_put(self, b: u8) -> u8; }
+    impl<W: crate::sink::Sink + ?Sized> SpecPut for &mut W { fn spec_put(self, b: u8) -> u8 { self.put(b) } }
+    w.spec_put(7)
+}
+fn block_trait_inner_call(w: &mut u8) -> u8 {
+    trait SpecPut { fn spec_put(self, b: u8) -> u8; }
+    impl<W: crate::sink::Sink + ?Sized> SpecPut for &mut W { fn spec_put(self, b: u8) -> u8 { self.put(b) } }
+    { let r = w.spec_put(8); r }
+}
+fn block_trait_provided(x: u8) -> u8 {
+    trait Doubled { fn get(&self) -> u8; fn doubled(&self) -> u8 { self.get() * 2 } }
+    impl Doubled for u8 { fn get(&self) -> u8 { *self } }
+    x.doubled()
+}
+fn block_trait_out_of_block(x: u8) -> u8 {
+    { trait Tripled { fn tripled(&self) -> u8 { 3 } } impl Tripled for u8 {} }
+    x.tripled()
+}
+fn block_trait_path_elsewhere(w: &mut u8) -> u8 { SpecPut::spec_put(w, 1) }
 ";
 
 /// The bodies that must check clean, each with the rule it proves.
@@ -92,13 +129,26 @@ const CLEAN: &[(&str, &str)] = &[
     ("block_use_named", "an inner block's named `use` of a trait puts its methods in scope there"),
     ("block_use_glob", "a block's glob `use` of a module puts the module's traits in scope there"),
     ("block_use_by_macro", "tracing's shape: an expansion's block writes `use $crate::..::Trait as _;` and calls its method"),
+    ("block_trait_write_fmt", "core's `Write::write_fmt` shape: a block declares a trait and its impl for `&mut W` and calls the method"),
+    ("block_trait_inner_call", "a block's trait is in scope in the blocks inside it"),
+    ("block_trait_provided", "a block's trait with a provided method, called through the block's impl"),
 ];
 
 /// The bodies that must be refused, with the finding each must have. `block_use_absent` is
 /// `block_use_underscore` without its `use` (the cause removed: `Not` is in no prelude);
 /// `block_use_out_of_block` imports in an inner block and calls outside it (the Reference,
 /// "Use declarations": a block's import is in scope in that block only).
-const REFUSED: &[(&str, &str)] = &[("out_of_block", "UnresolvedPath"), ("block_use_absent", "NoMethod"), ("block_use_out_of_block", "NoMethod")];
+/// `block_trait_out_of_block` declares a trait (and its impl) in an inner block and calls its
+/// method outside it, and `block_trait_path_elsewhere` names another fn's block trait by path
+/// (the Reference, "Statements": "Declaring an item within a statement block restricts its
+/// scope to the block containing the statement").
+const REFUSED: &[(&str, &str)] = &[
+    ("out_of_block", "UnresolvedPath"),
+    ("block_use_absent", "NoMethod"),
+    ("block_use_out_of_block", "NoMethod"),
+    ("block_trait_out_of_block", "NoMethod"),
+    ("block_trait_path_elsewhere", "UnresolvedPath"),
+];
 
 /// Library fns that use `assert_unsafe_precondition!`, by path from their crate's root.
 const LIBRARY: &[(&str, &[&str])] = &[("core", &["ptr", "read"]), ("core", &["ptr", "write_bytes"])];

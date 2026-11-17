@@ -285,7 +285,7 @@ impl Net {
         let address = at.reach(NetOp::Connect)?;
         let done = self
             .io
-            .call(cx, |tag| Effect::Connect { at: address, tag })
+            .call(cx, |tag| Effect::Connect { at: address, options: blaze_core::sockopt::Tcp::DEFAULT, tag })
             .map_err(|stopped| error(NetOp::Connect, at, NetKind::Stopped(stopped)))?;
         match done {
             // clone: the connection's peer, for its errors.
@@ -303,7 +303,7 @@ impl Net {
         }
         cx.check().map_err(|stopped| error(NetOp::Listen, at, NetKind::Stopped(stopped)))?;
         let address = at.reach(NetOp::Listen)?;
-        let tag = self.io.submit(|tag| Effect::Listen { at: address, tag });
+        let tag = self.io.submit(|tag| Effect::Listen { at: address, options: blaze_core::sockopt::Tcp::DEFAULT, tag });
         let listening = Listening { io: self.io.clone(), tag, open: true };
         // clone: the listener's address, for its errors; the budget shared, a refcount.
         Ok(Listener {

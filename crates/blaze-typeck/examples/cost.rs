@@ -151,11 +151,11 @@ fn check_one<'a>(f: &File, i: usize, alloc: Alloc<'a>) -> (Checked<'a>, u64) {
 fn floor_one(c: &Checked<'_>, alloc: Alloc<'_>) -> usize {
     let view = c.types.view();
     let mut out = PortableTys::new_in(alloc);
-    for &n in view.nodes {
+    for &n in view.nodes() {
         let _ = out.intern(n);
     }
     let col: Vec<PTy> = c.expr_ty.iter().copied().collect();
-    col.len() + out.view().nodes.len()
+    col.len() + out.view().len()
 }
 
 fn main() {

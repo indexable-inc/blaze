@@ -31,6 +31,8 @@ use super::spell::Spelling;
 use crate::front::FnLang;
 use super::back_needs::BackNeeds;
 
+mod initializers;
+
 /// The most fns one walk visits (rule 18: a table has a cap), sized by need: a walk reaches
 /// only fns of the program's crates, and the toolchain's core alone holds 29,243 fn heads
 /// (port27/front2/heads-4.txt: 10,979 fns and 18,264 impl fns), alloc and std together fewer
@@ -125,7 +127,10 @@ pub enum First<'a, 'c, 'n> {
 /// through a type or a qualified path, a trait's fn, which needs `Self`) is counted in
 /// `not_followed`. The records a path's resolution needs are made as the checker makes them.
 fn queue_by_name(r: &mut Records<'_, '_>, body: &Body<'_>, scope: &BodyScope<'_>, queue: &mut Vec<(ItemKey, Option<Reached>), Global>, not_followed: &mut usize) {
-    let view = body.typeck.view(body.tys.view());
+    // Names only: the body's expressions, paths and segments, never a type (the records are
+    // made between rounds, so no view of `r.store.tys` is held across them). A type read
+    // through this view would be refused as past an empty table, never answered wrong.
+    let view = body.typeck.view(tc::PTys::EMPTY);
     let mut found: Vec<ItemKey, Global> = Vec::new_in(Global);
     let mut names: Vec<tc::Name, Global> = Vec::new_in(Global);
     let mut by_type = 0;
@@ -346,6 +351,8 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
     queue.extend(also.iter().map(|&k| (k, None)));
     // What the builder calls on its own for what the reached bodies write, queued as read.
     let mut needs = BackNeeds::new();
+    // The statics and constants reached bodies name: their initializers read once each.
+    let mut inits = initializers::Initializers::new();
     let mut firsts: Vec<&Checked<'_>, Global> = Vec::with_capacity_in(starts.len(), Global);
     for s in starts {
         let (queue_mark, fns_mark) = (queue.len(), census.fns.len());
@@ -405,11 +412,16 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
         // A fn whose head says it has no body (a foreign fn's declaration, an intrinsic's):
         // nothing to lower; what calls it is the table's to say.
         if r.store.fns.get(&k).is_some_and(|h| !h.has_body) {
-            // The one declaration that is a call of a Rust fn: core's `#[lang = "panic_impl"]`
-            // runs the program's `#[panic_handler]` fn, queued here as its callee
-            // ([`super::panic_entry`]); every other fn with no body is `NoBody`.
-            let (outcome, handler) = super::panic_entry::reached(r, k, blaze_own::Alloc::global());
-            queue.extend(handler.map(|h| (h, None)));
+            // The declarations that are calls of Rust fns: alloc's `extern "Rust"` allocator
+            // entries run their defaults (std's `__rdl_*`, [`super::alloc_shim`]); core's
+            // `#[lang = "panic_impl"]` runs the program's `#[panic_handler]` fn
+            // ([`super::panic_entry`]); each is queued here as its callee; every other fn with
+            // no body is `NoBody`.
+            let (outcome, callee) = match super::alloc_shim::reached(r, k, blaze_own::Alloc::global()) {
+                Some(bound) => bound,
+                None => super::panic_entry::reached(r, k, blaze_own::Alloc::global()),
+            };
+            queue.extend(callee.map(|h| (h, None)));
             census.fns.push((k, outcome));
             continue;
         }
@@ -475,6 +487,11 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
     if let Some((from, q, f)) = reading.take() {
         note_edges(&mut census.edges, from, &queue[q.min(queue.len())..], &census.fns[f.min(census.fns.len())..]);
     }
+    // What a reached static's or constant's initializer names is reached too
+    // (reach/initializers.rs): its fns are walked before the instances' round.
+    if !census.capped && inits.round(r, prepared, &firsts, &census.bodies, &mut needs, &mut queue, &mut census.fns, &mut census.edges) {
+        continue;
+    }
     if census.capped || !instances.round(r, &firsts, &mut census, &needs, &mut queue) {
         break;
     }
@@ -510,7 +527,7 @@ impl Instances {
     /// glue's impls are not yet narrowed to the types an entry's bodies hold).
     fn round(&mut self, r: &mut Records<'_, '_>, firsts: &[&Checked<'_>], census: &mut Census<'_>, needs: &BackNeeds, queue: &mut Vec<(ItemKey, Option<Reached>), Global>) -> bool {
         let mut add = |tys: tc::PTys<'_>, shapes: &mut HashMap<tc::Shape, (), Global>| {
-            for i in 0..tys.nodes.len() {
+            for i in 0..tys.len() {
                 if let Some(s) = shape_of(tys, tc::PTy(i as u32)) {
                     shapes.insert(s, ());
                 }

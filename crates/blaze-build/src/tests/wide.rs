@@ -182,6 +182,6 @@ fn float_rem_wide_div_and_wide_casts_run() {
         assert!(text.contains(op), "no `{op}` in the built function:\n{text}");
     }
     #[cfg(target_arch = "aarch64")]
-    assert_eq!(run_native(&[(MAIN, &built)]), 255);
+    assert_eq!(run_native_with(&[(PANIC_CONST, host_panic_const as usize as u64)], &[(MAIN, None, &built)]), 255);
     let _ = built;
 }

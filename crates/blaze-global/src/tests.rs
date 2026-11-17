@@ -195,7 +195,7 @@ impl World {
     fn raw(seed: u64, answer: impl FnMut(&str, &[u8]) -> Reply + 'static) -> World {
         let mut world = World::bare(seed);
         let listen = Tag(RAW);
-        world.effects.push(Effect::Listen { at: at(), tag: listen });
+        world.effects.push(Effect::Listen { at: at(), options: blaze_core::sockopt::Tcp::DEFAULT, tag: listen });
         world.raw = Some(Raw {
             listen,
             next: 0,

@@ -3,6 +3,7 @@
 //! step of `run::build_new`, apart so a runner that resolves the toolchain library once
 //! (`crates::library`) makes it per program.
 
+use blaze_build::OverflowChecks;
 use edition::PackageEdition;
 
 use crate::crates::{Toolchain, UserCrate, syntax_of};
@@ -23,6 +24,8 @@ pub struct ProgramTexts {
     pub(crate) root_file: usize,
     /// What was appended to the root, if anything.
     pub(crate) appended: Option<Appended>,
+    /// The profile's overflow setting ([`NewFront::overflow`]), which the build takes.
+    pub(crate) overflow: OverflowChecks,
 }
 
 impl ProgramTexts {
@@ -39,7 +42,7 @@ impl ProgramTexts {
         let root_file = files.iter().position(|f| f.path == root).ok_or(RunError::NoMain)?;
         let appended = entry::append(&mut owned[root_file].1, syntax_of(edition), edition.blaze.is_some(), &tc.program_cfg())
             .map_err(|e| RunError::Entry { file: root_file as u32, range: e.range(), why: format!("{e}").into_boxed_str() })?;
-        Ok(ProgramTexts { package: new.package.into(), dir, files: owned, root: root_at, edition, root_file, appended })
+        Ok(ProgramTexts { package: new.package.into(), dir, files: owned, root: root_at, edition, root_file, appended, overflow: new.overflow })
     }
 
     /// The program's crate over these texts.

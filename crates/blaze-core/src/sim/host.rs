@@ -428,6 +428,11 @@ impl Sim {
         if self.rng.one_in(u64::from(self.faults.fail_one_in)) {
             return self.fail(tag).done;
         }
+        // The simulation has every option; it refuses what contradicts, as a host does.
+        if let Err(refused) = crate::sockopt::check_udp(&options, crate::sockopt::Platform::Simulated) {
+            // alloc: an error's message.
+            return Done::Failed(IoError(format!("binding a UDP socket at {at}: {refused}")));
+        }
         let port = match at.port() {
             0 => match self.free_port(at) {
                 Some(port) => port,
@@ -449,7 +454,8 @@ impl Sim {
         self.host.next_sock += 1;
         // alloc: none until a datagram lands.
         self.host.socks.push(Bound { id, local, options, inbox: VecDeque::new() });
-        Done::Bound { sock: Dgram(id), local }
+        let buffers = crate::sockopt::Buffers::simulated(options.tuning.recv_buffer, options.tuning.send_buffer);
+        Done::Bound { sock: Dgram(id), local, buffers }
     }
 
     /// The next port no socket at `at`'s address has, from the one after the last given: at

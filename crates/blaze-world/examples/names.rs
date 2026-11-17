@@ -729,13 +729,28 @@ impl blaze_scope::CellsSeam for PrintShadows {
             w.modules_absent, w.modules_unread, w.modules_later, w.modules_unknown, w.bindings_equal, w.bindings_differ, w.globs_equal, w.globs_differ,
             w.only_old, w.only_cells, w.def, w.vis, w.origin, w.expansion, w.state,
         );
+        eprintln!(
+            "cells seam: {krate}: whole scopes: equal {} unknown {} differ by field {:?} {:?}",
+            w.scopes_equal, w.scopes_unknown, blaze_scope::CELLS_SCOPE_FIELDS, w.scope_fields
+        );
+        for d in s.scope_first.iter() {
+            eprintln!(
+                "cells seam: {krate}: scope {:x} {} old {} cells {}; error old {:?} cells {:?}",
+                d.module, blaze_scope::CELLS_SCOPE_FIELDS[d.field], d.old_len, d.cells_len, d.old_error, d.cells_error
+            );
+        }
     }
 }
+
+/// `--cells-write` (feature `cells`): no seam, so the cell core solves and writes the records
+/// (the switch); without it the old fill writes and the cell core is compared beside it.
+#[cfg(feature = "cells")]
+static CELLS_WRITE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl blaze_scope::task::Par for Threads {
     #[cfg(feature = "cells")]
     fn cells_seam(&self) -> Option<&dyn blaze_scope::CellsSeam> {
-        Some(&PrintShadows)
+        if CELLS_WRITE.load(Ordering::Relaxed) { None } else { Some(&PrintShadows) }
     }
 
     fn stage(&self, stage: blaze_scope::task::Stage) {
@@ -989,6 +1004,14 @@ impl blaze_scope::crate_scope::Kept for KeptDir<'_> {
         self.read_bytes.fetch_add(read.len() as u64, Ordering::Relaxed);
         self.read_digest.fetch_add(self.record_digest(krate, &[read]), Ordering::Relaxed);
         self.made_digest.fetch_add(self.record_digest(krate, &[record, inner]), Ordering::Relaxed);
+        // One line per crate, for a table of which crates' records two runs differ in.
+        eprintln!(
+            "crate digest: {krate} {} exports {:016x} inner {:016x} read {:016x}",
+            self.inputs[krate].name,
+            self.record_digest(krate, &[record]),
+            self.record_digest(krate, &[inner]),
+            self.record_digest(krate, &[read])
+        );
         out.extend_from_slice(&(record.len() as u64).to_le_bytes());
         out.extend_from_slice(record);
         out.extend_from_slice(&(inner.len() as u64).to_le_bytes());
@@ -1012,6 +1035,7 @@ impl blaze_scope::crate_scope::Kept for KeptDir<'_> {
         std::fs::rename(&part, &path).unwrap_or_else(|e| panic!("names record {}: {e}", path.display()));
         self.names_bytes.fetch_add(names.len() as u64, Ordering::Relaxed);
         self.names_digest.fetch_add(self.record_digest(krate, &[names]), Ordering::Relaxed);
+        eprintln!("crate digest: {krate} {} names {:016x}", self.inputs[krate].name, self.record_digest(krate, &[names]));
     }
 
     /// `--expansions`: each crate's expansions kept as one set, `<hex>.x` beside its kept file.
@@ -1117,12 +1141,10 @@ fn procs_of<P: blaze_world::Packages<'static>>(store: &FsPath, out: &FsPath, roo
     let mut packages = Vec::with_capacity(world.crates.len());
     let mut macro_units = Vec::new();
     // Each crate's macros see its own package's files and nothing else, at the sandbox's one
-    // virtual root that `CARGO_MANIFEST_DIR` names (proc-macro-crate reads
-    // `$CARGO_MANIFEST_DIR/Cargo.toml`: jsonrpsee's `rpc`): a workspace member's folder on
-    // disk, a fetched package's files read in place from its fetch record. A toolchain crate
-    // calls no proc macro: an empty list.
-    use blaze_proc_macro::sandbox::{Files, PACKAGE};
-    let none: std::sync::Arc<[(String, &'static [u8])]> = std::sync::Arc::from(Vec::new());
+    // virtual root that `CARGO_MANIFEST_DIR` names: the rule's one home is
+    // `blaze_world::procs::files` (shared with blaze-real's `names_load`).
+    use blaze_proc_macro::sandbox::PACKAGE;
+    use blaze_world::procs::files::{PackageAt, sandbox_files};
     for (i, c) in world.crates.iter().enumerate() {
         let mut env = vec![
             ("CARGO_PKG_NAME".to_string(), c.package.to_string()),
@@ -1133,17 +1155,11 @@ fn procs_of<P: blaze_world::Packages<'static>>(store: &FsPath, out: &FsPath, roo
             blaze_world::Origin::Unit(uid) => {
                 env.push(("CARGO_MANIFEST_DIR".to_string(), PACKAGE.to_string()));
                 match places.place(graph.units[uid.0 as usize].package).unwrap_or_else(|e| panic!("{} {}: {e}", c.package, c.version)) {
-                    blaze_world::Place::Checkout { dir } => Files::Folder(root.join(dir)),
-                    blaze_world::Place::Pack { view, dir } => {
-                        let prefix = if dir.is_empty() { String::new() } else { format!("{}/", dir.trim_matches('/')) };
-                        let mut listed: Vec<(String, &'static [u8])> =
-                            view.files().filter_map(|f| f.path.strip_prefix(prefix.as_str()).map(|rel| (rel.to_string(), f.bytes))).collect();
-                        listed.sort_by(|a, b| a.0.cmp(&b.0));
-                        Files::Listed(std::sync::Arc::from(listed))
-                    }
+                    blaze_world::Place::Checkout { dir } => sandbox_files(PackageAt::Disk(&root.join(dir))),
+                    blaze_world::Place::Pack { view, dir } => sandbox_files(PackageAt::Pack { view, dir }),
                 }
             }
-            blaze_world::Origin::Toolchain(_) => Files::Listed(none.clone()),
+            blaze_world::Origin::Toolchain(_) => sandbox_files(PackageAt::Toolchain),
         };
         env.sort();
         let package = blaze_proc_macro::sandbox::Package { files, env };
@@ -1739,7 +1755,11 @@ fn main() {
                 keeps_expansions: args.iter().any(|a| a == "--expansions"),
                 x_bytes: AtomicU64::new(0),
                 x_digest: AtomicU64::new(0),
-                solve_again: args.iter().any(|a| a == "--solve-again"),
+                solve_again: {
+                    #[cfg(feature = "cells")]
+                    CELLS_WRITE.store(args.iter().any(|a| a == "--cells-write"), Ordering::Relaxed);
+                    args.iter().any(|a| a == "--solve-again")
+                },
                 outlined: AtomicU64::new(0),
                 missed: (0..inputs.len()).map(|_| std::sync::Mutex::new(None)).collect(),
             };

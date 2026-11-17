@@ -21,12 +21,14 @@
 use blaze_own::Alloc;
 
 use crate::body::{BinOp, Expr, UnOp};
-use crate::diag::{At, DiagCode};
+use crate::diag::{At, Because, DiagCode};
 use crate::error::Stop;
 use crate::ids::{ExprId, LangItem, Mutbl, Name};
 use crate::machine::{Expectation, Flow, Frame, Machine, Then};
 use crate::ty::{Cause, Goal, Ty, TyView, TypeCtx, Var, VarKind};
 use crate::world::{Def, World};
+
+use super::builtin_ops::{self, Decision, Yields};
 
 /// rustc's `BinOpCategory`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -114,6 +116,10 @@ fn binop_method(op: BinOp, assign: bool) -> Option<&'static str> {
     })
 }
 
+/// Why `-x` on an unsigned integer is refused (E0600): the Reference, "Negation operators",
+/// [expr.negate.results], its table's note on `-` for integers.
+const NEG_UNSIGNED: Because = Because::Reference { rule: "expr.negate.results", says: "Negation: Only for signed integer types." };
+
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// Whether callee row `(e, _, args)` is an operator's whose FINAL operand types are that
     /// operator's builtin scalar types: then the operator is the builtin one and the row is
@@ -136,9 +142,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             Expr::Unary { op: op @ (UnOp::Neg | UnOp::Not), .. } if n == 1 => {
                 let t = self.ty.list_get(args, 0);
                 let t = self.ty.resolve(t)?;
-                Ok(self.is_err(t)
-                    || self.is_integral(t)
-                    || if op == UnOp::Not { self.is_bool(t) } else { self.is_float(t) })
+                Ok(self.is_err(t) || if op == UnOp::Not { self.is_integral(t) || self.is_bool(t) } else { self.is_neg_builtin(t) })
             }
             _ => Ok(false),
         }
@@ -146,6 +150,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
 
     fn is_integral(&mut self, t: Ty) -> bool {
         matches!(self.view(t), TyView::Int(_) | TyView::Uint(_) | TyView::Infer(Var { kind: VarKind::Int, .. }))
+    }
+
+    /// Whether unary `-` is builtin on `t`: a signed integer, an integer variable, or a float
+    /// ([`NEG_UNSIGNED`]: "Only for signed integer types"). On an unsigned integer it is no
+    /// builtin: the `Neg` trait is asked, as on any other type, and core has no impl there.
+    /// MISSING: an integer variable that later resolves to an unsigned type is not refused.
+    fn is_neg_builtin(&mut self, t: Ty) -> bool {
+        matches!(self.view(t), TyView::Int(_) | TyView::Infer(Var { kind: VarKind::Int, .. })) || self.is_float(t)
     }
 
     fn is_float(&mut self, t: Ty) -> bool {
@@ -234,44 +246,23 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
     }
 
-    /// A primitive scalar type, known: an integer, a float, `bool` or `char`; never an inference
-    /// variable (an integer literal's included), a projection, a type parameter or the error
-    /// type.
-    fn is_primitive_scalar(&mut self, t: Ty) -> bool {
-        matches!(self.view(t), TyView::Int(_) | TyView::Uint(_) | TyView::Float(_) | TyView::Bool | TyView::Char)
-    }
-
-    /// Whether `lhs op rhs` is decided builtin by the two types alone: both are known primitive
-    /// scalar types (`is_primitive_scalar`) and the pair is one the operator is builtin on
-    /// (`is_builtin_binop`: the Reference's tables, `[expr.arith-logic.behavior]` for integers,
-    /// floats and `bool`, `[expr.cmp]` for the comparisons).
-    ///
-    /// Asking the trait first could not change the answer. (1) The final state already takes
-    /// the builtin operator for every pair `is_builtin_binop` accepts, whether or not the trait
-    /// obligation was registered; this is a subset of those pairs. (2) No other impl could be
-    /// picked: an `impl Add<u8> for i32` names a foreign trait and only primitive types, and
-    /// the Reference, `[items.impl.trait.orphan-rule.general]`, requires that "At least one of
-    /// the types `T0..=Tn` must be a local type" unless the trait is local: only the crate
-    /// that declares the operator traits can hold it, and for the primitive pairs it holds
-    /// the builtin operator itself (the pinned library, core/src/ops/arith.rs: `fn add(self,
-    /// other: $t) -> $t { self + other }`). (3) Nothing is left to infer: both types are known,
-    /// and `enforce_builtin` states the pair's result type.
-    fn settled_builtin_pair(&mut self, lhs: Ty, rhs: Ty, op: BinOp) -> bool {
-        self.is_primitive_scalar(lhs) && self.is_primitive_scalar(rhs) && self.is_builtin_binop(lhs, rhs, op)
-    }
-
-    /// `lookup_op_method` for `f.t op f.u`: asks whether the operator's trait may hold at the
-    /// operand types and, when it may, registers the obligation and projects `Output`. Sets
-    /// `f.a` (the trait's output) and `f.b` (1: registered; 2: the world has no such lang
-    /// trait, reported at the end unless the operator is builtin).
-    fn binop_lookup(&mut self, f: &mut Frame, e: ExprId, op: BinOp, assign: bool) -> Result<(), Stop> {
+    /// `lookup_op_method` for `f.t op f.u`: asks whether the operator's trait may hold at
+    /// `[f.t, ask_rhs]` and, when it may, registers the obligation at `[f.t, f.u]` and projects
+    /// `Output`. `ask_rhs` is `f.u` when the right operand is not checked yet (state 1), and a
+    /// fresh variable when the question was deferred to state 2: the question is then the one
+    /// state 1 would have asked (`lhs: Op<?R>`), so a deferral never changes its answer or the
+    /// finding (`1 + 1.0` stays E0277, the registered obligation failing). Sets `f.a` (the
+    /// trait's output) and `f.b` (1: registered; 2: the world has no such lang trait, reported
+    /// at the end unless the operator is builtin).
+    fn binop_lookup(&mut self, f: &mut Frame, e: ExprId, op: BinOp, assign: bool, ask_rhs: Ty) -> Result<(), Stop> {
         let Some(item) = op_lang(op, assign) else { return Ok(()) };
         let Some(tr) = self.lang(item)? else {
             f.b = 2;
             return Ok(());
         };
+        let asked = self.mk_list(&[f.t, ask_rhs])?;
+        let goal = Goal::Trait { trait_: tr, args: asked };
         let args = self.mk_list(&[f.t, f.u])?;
-        let goal = Goal::Trait { trait_: tr, args };
         // `lookup_method_in_trait`: only `predicate_may_hold`. A left side that is still a
         // variable (`|a, b| a + b`) may hold: the obligation is registered ambiguous and
         // `Output` projected, both settled by a later use.
@@ -291,7 +282,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// `check_overloaded_binop` and the builtin fast path. `f.t` holds the left type, `f.u` the
     /// right variable, `f.a` the trait's output (a `Ty` index) and `f.b` what was done about
     /// the operator's trait (0: asked, does not hold; 1: registered; 2: no such lang trait;
-    /// 3: not asked yet, the left type being a known primitive scalar).
+    /// 3: not asked yet, the left type being one some right operand makes the operator
+    /// built in on: `builtin_ops::defers`, integer and float literal variables included).
     fn binop(&mut self, mut f: Frame, e: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId, assign: bool) -> Result<Flow, Stop> {
         match f.state {
             0 => {
@@ -306,13 +298,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 f.u = rhs_var;
                 f.b = 0;
                 f.a = self.common.err.0;
-                if self.is_primitive_scalar(lhs_ty) {
-                    // `f.b == 3`: the left side is a primitive scalar type, known. The trait is
-                    // not asked yet: if the right side comes back a primitive scalar too and
-                    // the pair is the operator's builtin one, it never is (the final state).
+                let lhs_shape = builtin_ops::shape(self.view(lhs_ty));
+                if builtin_ops::defers(op, assign, lhs_shape) {
+                    // `f.b == 3`: the left side is integral, floating, `bool` or `char` (a
+                    // literal's variable included). The trait is not asked yet: if the right
+                    // side comes back of the class `builtin_ops::classify` needs, it never is.
                     f.b = 3;
                 } else {
-                    self.binop_lookup(&mut f, e, op, assign)?;
+                    self.binop_lookup(&mut f, e, op, assign, rhs_var)?;
                 }
                 self.resume(f, 2)?;
                 self.push_expr(rhs, Expectation::HasType(rhs_var), Then::Coerce { to: rhs_var, two_phase: false })?;
@@ -326,18 +319,30 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 let mut lhs_ty = self.try_structurally_resolve(f.t)?;
                 let mut rhs_ty = self.try_structurally_resolve(f.u)?;
                 if f.b == 3 {
-                    // Both operand types are known primitive scalars and the pair is the
-                    // operator's builtin one: the operator is the builtin one, with no callee
-                    // row, no obligation and no question to the solver (`settled_builtin_pair`
-                    // says why no answer can differ).
-                    if self.settled_builtin_pair(lhs_ty, rhs_ty, op) {
-                        let builtin = self.enforce_builtin(e, lhs_ty, rhs_ty, op, assign)?;
-                        return Ok(Flow::Done(builtin));
+                    // Both operand types are of one built-in class for the operator
+                    // (rules/builtin_ops.rs says the rule and why no answer can differ): the
+                    // operator is the built-in one, with no callee row, no obligation and no
+                    // question to the solver. Unifying `{integer}` with `u8` resolves the
+                    // variable as the solver's answer would have.
+                    let lhs_shape = builtin_ops::shape(self.view(lhs_ty));
+                    let rhs_shape = builtin_ops::shape(self.view(rhs_ty));
+                    if let Decision::Builtin { unify, yields } = builtin_ops::classify(op, assign, lhs_shape, rhs_shape) {
+                        if unify {
+                            self.demand_eq(At::Expr(e), lhs_ty, rhs_ty)?;
+                        }
+                        let value = match yields {
+                            Yields::Left => lhs_ty,
+                            Yields::Bool => self.common.bool_,
+                            Yields::Unit => self.common.unit,
+                        };
+                        return Ok(Flow::Done(value));
                     }
                     // Anything else (a reference, a type parameter, a type still unknown, an
-                    // ADT on the right): the trait is asked now, as state 1 asks it.
+                    // ADT, an integer against a float): the trait is asked now with the
+                    // question state 1 would have asked (`lhs: Op<?R>`, a fresh `?R`).
                     f.b = 0;
-                    self.binop_lookup(&mut f, e, op, assign)?;
+                    let ask_rhs = self.fresh()?;
+                    self.binop_lookup(&mut f, e, op, assign, ask_rhs)?;
                     lhs_ty = self.try_structurally_resolve(f.t)?;
                     rhs_ty = self.try_structurally_resolve(f.u)?;
                 }
@@ -407,11 +412,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 Ok(Flow::Done(self.common.err))
             }
             UnOp::Not | UnOp::Neg => {
-                let builtin = if op == UnOp::Not {
-                    self.is_integral(t) || self.is_bool(t)
-                } else {
-                    self.is_integral(t) || self.is_float(t)
-                };
+                let builtin = if op == UnOp::Not { self.is_integral(t) || self.is_bool(t) } else { self.is_neg_builtin(t) };
                 if builtin {
                     return Ok(Flow::Done(t));
                 }
@@ -431,6 +432,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     return Ok(Flow::Done(out));
                 }
                 self.diag(DiagCode::UnOp, At::Expr(e), None, Some(t), None);
+                if op == UnOp::Neg
+                    && matches!(self.view(t), TyView::Uint(_))
+                    && let Some(d) = self.diags.last_mut()
+                {
+                    d.because = Some(NEG_UNSIGNED);
+                }
                 Ok(Flow::Done(self.common.err))
             }
         }

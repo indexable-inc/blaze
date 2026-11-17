@@ -614,7 +614,7 @@ impl<C: Channels> Client<C> {
         for _ in 0..more.min(CONNECTIONS.saturating_sub(self.links.len())) {
             let tag = self.tags.next();
             // alloc: setup: once a connection.
-            effects.push(Effect::Connect { at: self.endpoint.at.clone(), tag });
+            effects.push(Effect::Connect { at: self.endpoint.at.clone(), options: blaze_core::sockopt::Tcp::DEFAULT, tag });
             self.links.push(Link::Connecting(tag));
         }
     }

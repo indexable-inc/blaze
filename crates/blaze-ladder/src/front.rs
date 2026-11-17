@@ -60,6 +60,9 @@ pub enum FnLang {
     PanicBoundsCheck,
     /// `#[lang = "drop_in_place"]`: what a drop calls; its instances are built as drop glue.
     DropInPlace,
+    /// `#[lang = "panic_const_*"]`: what a failed arithmetic check calls (blaze-build
+    /// walk/arith_checks.rs).
+    PanicConst(blaze_build::PanicConst),
 }
 
 /// The edition every file is read in (the blaze editions are 2024's syntax).
@@ -297,7 +300,7 @@ fn subst(tys: &mut PortableTys<'_>, t: PTy, args: &[PTy]) -> Result<PTy, Why> {
                 kids.clear();
                 children_of(tys.view(), t, &mut kids).ok_or_else(bad)?;
                 let start = done.len() - kids.len();
-                let node = *tys.view().nodes.get(t.0 as usize).ok_or_else(bad)?;
+                let node = *tys.view().get(t).ok_or_else(bad)?;
                 let new: Vec<PTy, Global> = done.split_off(start);
                 let made = match node {
                     PNode::Param(i) | PNode::ConstParam(i) => *args.get(i as usize).ok_or_else(|| program(format!("a generic parameter past the arguments"), Range::new(0, 0)))?,
@@ -340,7 +343,7 @@ fn subst(tys: &mut PortableTys<'_>, t: PTy, args: &[PTy]) -> Result<PTy, Why> {
 
 /// The types `t` is made of, in order; `None` past the table.
 fn children_of(t: PTys<'_>, ty: PTy, out: &mut Vec<PTy, Global>) -> Option<()> {
-    match *t.nodes.get(ty.0 as usize)? {
+    match *t.get(ty)? {
         PNode::Ref(_, i) | PNode::Ptr(_, i) | PNode::Slice(i) => out.push(i),
         PNode::Array(i, n) => {
             out.push(i);
@@ -1410,7 +1413,7 @@ pub struct Front<'f> {
 
 /// The shape an impl's self type is bucketed by; `None` for a blanket impl.
 fn shape_of(t: PTys<'_>, p: PTy) -> Option<Shape> {
-    Some(match *t.nodes.get(p.0 as usize)? {
+    Some(match *t.get(p)? {
         PNode::Bool => Shape::Bool,
         PNode::Char => Shape::Char,
         PNode::Int(i) => Shape::Int(i),
@@ -2835,7 +2838,7 @@ impl World for FrontWorld<'_, '_> {
         if first == SELF_TY {
             return Ok(match env.self_ {
                 SelfTy::Trait(_) => Some(PathRes { def: Def::TyParam(0), consumed: 1 }),
-                SelfTy::Ty(t) => match self.front.tys.view().nodes.get(t.0 as usize) {
+                SelfTy::Ty(t) => match self.front.tys.view().get(t) {
                     Some(PNode::Adt(k, _)) => Some(PathRes { def: Def::Adt(*k), consumed: 1 }),
                     _ => None,
                 },

@@ -22,6 +22,7 @@
 
 pub mod cx;
 pub mod env;
+pub mod facts;
 pub mod git;
 mod git_objects;
 pub mod host_tools;
@@ -33,6 +34,8 @@ pub mod pinned;
 pub mod probe;
 pub mod toolchain;
 
+#[cfg(test)]
+mod facts_tests;
 #[cfg(test)]
 mod git_tests;
 #[cfg(test)]

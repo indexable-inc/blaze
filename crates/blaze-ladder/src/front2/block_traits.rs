@@ -1,6 +1,7 @@
 //! The traits in scope at each block of a body: the module's ([`super::body::Body::traits`])
-//! and the traits the body's blocks bring in by `use` (named, `as _`, a glob), each block's
-//! inherited by the blocks inside it and by the bodies of items declared there.
+//! and the traits the body's blocks bring in by `use` (named, `as _`, a glob) or declare
+//! (`trait SpecWriteFmt { .. }` in core's `Write::write_fmt`: `Reader::declared`), each
+//! block's inherited by the blocks inside it and by the bodies of items declared there.
 //!
 //! The Reference, "Use declarations" [items.use.intro]: "These declarations may appear in
 //! modules and blocks, usually at the top." [items.use.as-underscore.intro]: "Items can be
@@ -28,8 +29,9 @@
 //! Refused by name, lazily, at the first method call in a block where the answer depends on
 //! it ([`InScope::Refused`], the body's [`super::world_items::Gap::Local`]): a `use` whose path
 //! does not resolve or resolves only in part ([`UNRESOLVED`], [`PARTIAL`]), a trait alias
-//! imported ([`TRAIT_ALIAS`]), a trait declared in a block ([`LOCAL_TRAIT`]: a local trait has
-//! no head yet), a glob of something that is no module or enum ([`GLOB_NOT_MODULE`]), a glob
+//! imported ([`TRAIT_ALIAS`]) or declared ([`LOCAL_TRAIT_ALIAS`]), a trait declared in a
+//! block whose block module the names library did not make or does not read it in
+//! ([`LocalKind::unplaced`], [`LOCAL_TRAIT`]), a glob of something that is no module or enum ([`GLOB_NOT_MODULE`]), a glob
 //! of a module whose prelude is larger than the body's ([`GLOB_LATER_EDITION`]: its prelude's
 //! traits would be in scope here though the body's prelude has not them), a path through
 //! another block's item that is no type or import ([`THROUGH_LOCAL`]), and import chains or
@@ -63,7 +65,8 @@ pub const MOST_CHAIN: u32 = 64;
 pub const UNRESOLVED: &str = "a use declaration in a block whose path the names library does not resolve (the traits it brings into scope are not known)";
 pub const PARTIAL: &str = "a use declaration in a block whose path the names library resolves only in part";
 pub const TRAIT_ALIAS: &str = "a trait alias imported in a block (its traits' methods would be in scope there)";
-pub const LOCAL_TRAIT: &str = "a trait declared in a block (its methods are in scope there; a local trait has no head yet)";
+pub const LOCAL_TRAIT: &str = "a trait declared in a block whose block's module does not read its name as a trait";
+pub const LOCAL_TRAIT_ALIAS: &str = "a trait alias declared in a block (its traits' methods would be in scope there)";
 pub const GLOB_NOT_MODULE: &str = "a glob use in a block of an item that is no module or enum";
 pub const GLOB_LATER_EDITION: &str = "a glob use in a block of a module whose crate's edition has a larger prelude than the body's";
 pub const THROUGH_LOCAL: &str = "a use declaration in a block whose path starts at a block's item that is no type or import";
@@ -183,7 +186,7 @@ impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
     /// appended to `out` (checker keys, unsorted).
     fn row(&self, owner: ItemKey, row: &Row<'n>, out: &mut AVec<'_, ItemKey>, alloc: Alloc<'_>) -> Result<(), LocalGap> {
         match row.kind {
-            LocalKind::Trait => return Err(Self::gap(row, LOCAL_TRAIT)),
+            LocalKind::Trait => return self.declared(row, out),
             LocalKind::Use => {}
             _ => return Ok(()),
         }
@@ -214,7 +217,10 @@ impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
                     path = through;
                     abs = local.abs;
                 }
-                // A block's type: only its variants are under it, never a trait.
+                // A block's type: only its variants are under it, never a trait. A block's
+                // trait: `use Tr as _;` names it, and it is in scope here already (its block
+                // is this row's or one around it: [`Self::declared`]); its associated items
+                // are no traits.
                 k if k.in_block_module() => return Ok(()),
                 _ => return Err(LocalGap { item: local.key, form: THROUGH_LOCAL, range: row.range }),
             }
@@ -250,6 +256,34 @@ impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
             Err(_) => return Err(Self::gap(row, UNRESOLVED)),
         }
         Ok(())
+    }
+
+    /// The trait a block declares (`trait SpecWriteFmt { .. }` in core's `Write::write_fmt`),
+    /// in scope in its block and the blocks inside it. The Reference, "Statements", "Item
+    /// declarations": "Declaring an item within a statement block restricts its scope to the
+    /// block containing the statement"; "Method call expressions": "Then all remaining methods
+    /// in scope are looked up." It is an item of its block's module in the names library
+    /// ([`LocalKind::in_block_module`], [`Row::module`]): its one key is the one the name
+    /// solver answers for its name there, the key its head is made under and the impls of the
+    /// block that name it are filed under, as for a module's trait. Refused by name: a block
+    /// whose module the library did not make ([`LocalKind::unplaced`]), a trait alias
+    /// ([`LOCAL_TRAIT_ALIAS`]), and a name the module does not read as a trait
+    /// ([`LOCAL_TRAIT`]).
+    fn declared(&self, row: &Row<'n>, out: &mut AVec<'_, ItemKey>) -> Result<(), LocalGap> {
+        let Some(module) = row.module else { return Err(Self::gap(row, row.kind.unplaced())) };
+        let segments = [row.name];
+        let w = Written { kind: PathKind::Plain, segments: &segments };
+        match self.names.walk(module, Namespace::Types, w) {
+            Ok(r) if r.consumed == 1 => match r.def.kind {
+                DefKind::Trait => {
+                    out.push(checker_of(r.def.key));
+                    Ok(())
+                }
+                DefKind::Other if matches!((Paths { names: self.names }).kind_of(r.def), Ok(Kind::TraitAlias)) => Err(Self::gap(row, LOCAL_TRAIT_ALIAS)),
+                _ => Err(Self::gap(row, LOCAL_TRAIT)),
+            },
+            _ => Err(Self::gap(row, LOCAL_TRAIT)),
+        }
     }
 
     /// The traits a glob row `use <w>::*;` brings into scope.

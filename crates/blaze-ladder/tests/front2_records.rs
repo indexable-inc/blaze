@@ -89,7 +89,7 @@ use blaze_ladder::front2::consts::Consts;
 use blaze_ladder::front2::heads::Store;
 use blaze_ladder::front2::index::Index;
 use blaze_ladder::front2::keys::{Keys, checker_of};
-use blaze_ladder::front2::source::{Load, Log, NamesSource, Records};
+use blaze_ladder::front2::source::{Load, Log, NamesSource, Opened, Records};
 use blaze_ladder::front2::spell::Spelling;
 use blaze_ladder::front2::world_items::Gap;
 use blaze_ladder::front2::{Front2, fill, langs};
@@ -154,8 +154,8 @@ impl Load<'static> for Kept {
         self.items.get(krate).copied()
     }
 
-    fn file(&self, krate: usize, path: &str) -> Option<&'static str> {
-        self.files.get(krate)?.get(path).copied()
+    fn file(&self, krate: usize, path: blaze_scope::package_path::PackagePath<'_>) -> Option<&'static str> {
+        self.files.get(krate)?.get(path.as_str()).copied()
     }
 
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<&'static str> {
@@ -295,18 +295,41 @@ fn body_checked<'n, S: NamesSource<'n>>(
     consts: &mut Consts<'n>,
     item: ItemKey,
 ) -> String {
+    body_checked_timed(names, prepared, keys, index, store, buckets, consts, item).0
+}
+
+/// [`body_checked`] with its phases' wall times: lowering, spelling and scope, the check.
+#[allow(clippy::too_many_arguments)]
+fn body_checked_timed<'n, S: NamesSource<'n>>(
+    names: S,
+    prepared: &'n Prepares<'n>,
+    keys: &mut Keys,
+    index: &Index<'n>,
+    store: &mut Store<'n>,
+    buckets: &mut Option<Buckets>,
+    consts: &mut Consts<'n>,
+    item: ItemKey,
+) -> (String, [std::time::Duration; 3]) {
+    let mut times = [std::time::Duration::ZERO; 3];
+    let start = Instant::now();
     let body = match lower_fn(names, prepared, keys, store, item) {
         Ok(body) => body,
-        Err(e) => return format!("not lowered: {e}"),
+        Err(e) => return (format!("not lowered: {e}"), times),
     };
+    times[0] = start.elapsed();
+    let start = Instant::now();
     let view = body.lowered.view();
     let spell = match Spelling::of(&view) {
         Ok(spell) => spell,
-        Err(e) => return format!("not spelled: {e:?}"),
+        Err(e) => return (format!("not spelled: {e:?}"), times),
     };
     let scope = body.scope(&spell);
+    times[1] = start.elapsed();
+    let start = Instant::now();
     let mut records = check::Records { names, keys, index, store, buckets, order: BuildOrder::AsAsked, consts: Some((consts, prepared)) };
-    outcome(&check_body(&mut records, &body, &scope))
+    let got = outcome(&check_body(&mut records, &body, &scope));
+    times[2] = start.elapsed();
+    (got, times)
 }
 
 /// The terms under `roots` in `t` as text, in preorder, each node by its own content (never by
@@ -472,7 +495,8 @@ fn records_answer_what_the_solved_names_answer() {
             // The bucket index resolved by the whole graph's names (`encode_with`): every impl
             // header's paths are walked to their end, as the reader's names would walk them.
             kept.items.push(aligned(&items_record::encode_with(c, names, g).unwrap_or_else(|e| panic!("the items record of `{}`: {e:?}", c.name)), g));
-            kept.files.push(c.files.iter().map(|f| (f.path.to_string(), leak(f.text))).collect());
+            // By each file's path in its package: what the items record asks for (D96).
+            kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), leak(f.text))).collect());
             kept.expansions.push(c.expansions.iter().filter_map(|(call, e)| e.made.map(|m| (*call, leak(m.text)))).collect());
         }
         kept
@@ -579,10 +603,15 @@ fn records_answer_what_the_solved_names_answer() {
     let prepared = Prepares::new_in(Alloc::global());
     let (mut store, mut body_buckets, mut consts) = (Store::new(body_front.index.lang("sized"), body_frame), None, Consts::default());
     let mut body_times = Vec::new();
+    // Per body: its phases and what it opened beyond the bodies before it (the first body's
+    // line says where its time goes).
+    let mut body_phases: Vec<([std::time::Duration; 3], Opened, Opened)> = Vec::new();
     for (i, key) in chosen.iter().enumerate() {
+        let before = body_records.opened();
         let start = Instant::now();
-        let got = body_checked(body_records, prepared, &mut body_front.keys, &body_front.index, &mut store, &mut body_buckets, &mut consts, *key);
+        let (got, phases) = body_checked_timed(body_records, prepared, &mut body_front.keys, &body_front.index, &mut store, &mut body_buckets, &mut consts, *key);
         body_times.push(start.elapsed());
+        body_phases.push((phases, before, body_records.opened()));
         let errors: Vec<String> = body_records.errors().iter().map(|e| e.to_string()).collect();
         // The check scripts cut a panic's text: `FRONT2_RECORDS_DIFF` names a file for the whole
         // of what a failing body filed and of both outcomes.
@@ -732,6 +761,25 @@ fn records_answer_what_the_solved_names_answer() {
         format!("texts opened {} (bytes {})", body_opened.items.texts, body_opened.items.text_bytes),
         format!("first body check over records {} us", body_times[0].as_micros()),
         format!("tenth body check over records {} us", body_times[9].as_micros()),
+        {
+            // Where the first body's time goes, and what it opened beyond the reader's start.
+            let ([lower, spell, check], b, a) = body_phases[0];
+            format!(
+                "first body phases: lower {} us, spell+scope {} us, check {} us; opened: names records {} ({} bytes), scopes {} ({} bytes), items records {} ({} bytes), member lists {}, texts {} ({} bytes)",
+                lower.as_micros(),
+                spell.as_micros(),
+                check.as_micros(),
+                a.names.crates - b.names.crates,
+                a.names.bytes - b.names.bytes,
+                a.names.scopes - b.names.scopes,
+                a.names.scope_bytes - b.names.scope_bytes,
+                a.items.crates - b.items.crates,
+                a.items.bytes - b.items.bytes,
+                a.items.member_lists - b.items.member_lists,
+                a.items.texts - b.items.texts,
+                a.items.text_bytes - b.items.text_bytes
+            )
+        },
         "planted: item row withheld -> differs".to_string(),
         format!(
             "bool: Clone alone over a fresh reader: texts opened {} (crates {}); impls filed from rows {alone_rows}, from header text {alone_text}",
@@ -755,8 +803,9 @@ fn records_answer_what_the_solved_names_answer() {
             alone_reads.len()
         ),
         format!(
-            "bool: Clone, then impl bool, by bucket: crates asked {}; impls filed from the index {}",
+            "bool: Clone, then impl bool, by bucket: crates asked {} ({}); impls filed from the index {}",
             asked_lazy.crates_asked(),
+            asked_lazy.crates_asked_sorted().iter().map(|c| format!("`{}`", crate_names[*c])).collect::<Vec<_>>().join(", "),
             asked_lazy.filed_from_index()
         ),
         format!("not filed when written, in the crates asked: {}", asked_lazy.not_filed().iter().map(|(class, n)| format!("{class} {n}")).collect::<Vec<_>>().join(", ")),

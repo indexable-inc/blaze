@@ -23,5 +23,23 @@ pub(crate) fn host_facts(name: Arc<str>, driver_now: Duration) -> Result<HostFac
         // alloc: once per process, why its start is not known.
         Err(error) => Born::Unknown(Arc::from(alloc::string::ToString::to_string(&error))),
     };
-    Ok(HostFacts { pid: crate::rt::process_id(), cores, name, born, build_id: crate::rt::image::build_id() })
+    Ok(HostFacts {
+        pid: crate::rt::process_id(),
+        cores,
+        name,
+        born,
+        build_id: crate::rt::image::build_id(),
+        exe: own_exe(),
+    })
+}
+
+/// The program's own file, as the kernel names it; `None` when it cannot say or the path is not
+/// UTF-8 ([`crate::host::Host::exe`] then refuses by name). 4,096 bytes is Linux's `PATH_MAX`,
+/// above macOS's 1,024.
+fn own_exe() -> Option<Arc<str>> {
+    let mut path = [0u8; 4096];
+    let len = crate::rt::image::exe_path(&mut path)?;
+    let path = core::str::from_utf8(path.get(..len)?).ok()?;
+    // alloc: once per process, its own path.
+    Some(Arc::from(path))
 }

@@ -27,6 +27,7 @@ extern crate alloc;
 #[cfg(any(test, feature = "testing"))]
 extern crate std;
 
+mod drop_ask;
 mod error;
 pub mod layout;
 mod lit;
@@ -112,6 +113,10 @@ pub struct Typed<'b> {
     pub expr_defs: (&'b [ExprId], &'b [Def]),
     /// What each path, tuple-struct and struct pattern resolved to, sorted.
     pub pat_defs: (&'b [PatId], &'b [Def]),
+    /// The generic arguments each constant value path is read at, sorted by expression (a
+    /// list of `types`; blaze-typeck `Checked::const_args`): `[Self, trait args..]` for
+    /// `Self::NAME`, `T::NAME` or `<T as Tr>::NAME`, the impl's for an inherent impl's.
+    pub const_args: (&'b [ExprId], &'b [List]),
 }
 
 impl<'b> Typed<'b> {
@@ -131,6 +136,7 @@ impl<'b> Typed<'b> {
             fields: (checked.fields.column::<0>(), checked.fields.column::<1>(), checked.fields.column::<2>()),
             expr_defs: (checked.expr_defs.column::<0>(), checked.expr_defs.column::<1>()),
             pat_defs: (checked.pat_defs.column::<0>(), checked.pat_defs.column::<1>()),
+            const_args: (checked.const_args.column::<0>(), checked.const_args.column::<1>()),
         }
     }
 }
@@ -142,6 +148,9 @@ pub enum FnKind {
     Const,
     /// Not `const`: refused (`NotConstFn`).
     NotConst,
+    /// A `#[rustc_intrinsic]` fn whose name blaze's one intrinsic table does not hold: refused
+    /// as such (`Refusal::UnknownIntrinsic`), a reason the unit's kept code keeps.
+    UnknownIntrinsic,
     /// A tuple struct's or variant's constructor.
     Ctor { adt: ItemKey, variant: u32 },
     /// An intrinsic the evaluator computes itself.
@@ -182,6 +191,23 @@ pub trait ConstWorld: LayoutFacts {
     fn record(&self, key: RecordKey) -> Fetch<&ConstRecord<Alloc<'_>>>;
     /// The body of variant `variant`'s explicit discriminant (`A = expr`), if it has one.
     fn explicit_discriminant(&self, adt: ItemKey, variant: u32) -> Option<ItemKey>;
+
+    /// Whether ground ADT type `ty` (of `ground`) has a `Drop` impl: its `drop` fn, as
+    /// `blaze_build::Adts::drop_impl` answers the builder (one solver call). Read by the
+    /// `needs_drop` intrinsic (drop_ask.rs). `None`, the default: this world does not answer,
+    /// and `needs_drop` of a type reaching an ADT is refused naming the ADT
+    /// ([`Refusal::Missing`]); never a guessed "no impl".
+    fn drop_impl(&self, ty: PTy, ground: &mut PortableTys<'_>) -> Option<Result<Option<ItemKey>, blaze_build::BuildError>> {
+        let _ = (ty, ground);
+        None
+    }
+
+    /// core's `ManuallyDrop` ADT (`#[lang = "manually_drop"]`), whose value is never dropped:
+    /// `Some(None)` when the library declares none. `None`, the default: not answered, refused
+    /// as [`ConstWorld::drop_impl`]'s default is.
+    fn manually_drop(&self) -> Option<Option<ItemKey>> {
+        None
+    }
 }
 
 /// The bounds of one evaluation (rule 18): each passed is a typed refusal naming the constant.

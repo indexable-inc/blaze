@@ -382,10 +382,6 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
     }
 
     fn inherent(&self, _: Seal, shape: Shape, name: Name) -> Fetch<&[AssocItem]> {
-        if let Some(f) = self.buckets.and_then(|b| b.gapped(shape, name)) {
-            let why = self.store.fn_gaps.get(&f).map(|w| format!("{w:?}")).unwrap_or_default();
-            return self.gap(Gap::FnHead(f, why.into_boxed_str()));
-        }
         if let Some((k, why)) = self.buckets.and_then(|b| b.inherent_gap(shape)) {
             return self.gap(self.failed_impl(k, why, &format!("the inherent items of {shape:?}")));
         }
@@ -397,9 +393,14 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
 
     fn assoc_item(&self, _: Seal, container: ItemKey, name: Name) -> Fetch<Option<AssocItem>> {
         if let Some(i) = self.store.impls.get(&container) {
-            if let Some(&(_, f)) = i.fns.iter().find(|(n, _)| *n == name) {
-                let row = self.fn_row(f)?;
-                return Ok(Some(AssocItem { container, item: f, kind: AssocKind::Fn { self_param: row.self_param } }));
+            // The fn's `self` from its text (`ImplHead::fn_self`): naming a member makes no
+            // signature; `fn_sig` asks for it (`Want::MemberFn`) when the fn is used.
+            if let Some(at) = i.fns.iter().position(|(n, _)| *n == name) {
+                let f = i.fns[at].1;
+                let Some(&self_param) = i.fn_self.get(at) else {
+                    return self.gap(Gap::FnHead(f, "its impl's head holds no `self` flag for it".into()));
+                };
+                return Ok(Some(AssocItem { container, item: f, kind: AssocKind::Fn { self_param } }));
             }
             if let Some(&(_, c)) = i.consts.iter().find(|(n, _)| *n == name) {
                 return Ok(Some(AssocItem { container, item: c, kind: AssocKind::Const }));

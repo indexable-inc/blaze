@@ -27,7 +27,9 @@ use bstd::mem::{Bytes, TASK_FRAME};
 use bstd::path::Path;
 use bstd::test::{BUDGET, Given, Seeds, seeded};
 
-use super::{BOOT, BOOT_MAGIC, Boot, CliError, FOOTER, Layered, Machine, PACKS, PACKS_MOST, PackStore, Place, ROW, SHARED, Sharing, Store, StorePlant, index_number, le_u64, pack_bytes, pack_name};
+use super::{BOOT, BOOT_MAGIC, Boot, CliError, FOOTER, Layered, MAGIC, Machine, PACKS, PACKS_MOST, PackError, PackStore, Place, ROW, SHARED, Sharing, Store, StorePlant, index_number, le_u64, pack_bytes, pack_name, payloads_digest};
+use super::producers::NOT_A_DRIVE_RECORD;
+use blaze_drive::{Kind, Tool};
 
 const MIB: usize = 1 << 20;
 
@@ -298,5 +300,189 @@ fn the_compaction_oracle_catches_a_merge_that_removes_first() {
             let said = std::format!("{failed}");
             assert!(said.contains("is lost"), "the planted MergeRemovesFirst failed otherwise: {said}");
         }
+    }
+}
+
+/// A drive shape record of `kind`, by hand (blaze-drive record.rs `write_shape`, which is
+/// crate-private: `BDR3`, tag 2, the name's kind byte and 32-byte subject, a read count of 0).
+/// The test asserts `record::open` takes it, so a change of that form fails here by name.
+fn shape_record(kind: Kind, subject: u8) -> std::vec::Vec<u8> {
+    let mut bytes = std::vec::Vec::from(*b"BDR3");
+    bytes.push(2);
+    bytes.push(kind as u8);
+    bytes.extend_from_slice(&[subject; 32]);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes
+}
+
+/// Pack format 3 (remote-read.md piece 7): a `Surface` record, a `BodyCheck` record and a
+/// certificate (not a drive record) sealed under one tool; the next boot's open verifies the
+/// pack whole (the producer table under the payloads digest); a second tool seals a later
+/// `Surface` record; the merge's table holds both tools and remaps each row. Each row then
+/// names its kind and its tool. A seal that wrote no table, a merge that kept a pack's own
+/// indexes, or a table outside the digest fails here. Prints "pack format 3: 4 records of 2
+/// tools merged, each row names its kind and its tool".
+#[test]
+fn a_pack_names_each_records_producer() {
+    let (io, cx) = sim(21);
+    let root = io.need_fs().expect("a file system").root();
+    let tool = Tool(ContentId::of("blaze-cli store producer test", b"the first tool"));
+    let other = Tool(ContentId::of("blaze-cli store producer test", b"the second tool"));
+    let surface = shape_record(Kind::Surface, 1);
+    let body = shape_record(Kind::BodyCheck, 2);
+    let later = shape_record(Kind::Surface, 3);
+    for record in [&surface, &body, &later] {
+        assert!(blaze_drive::record::open(record).is_ok(), "the hand-made shape record is a drive record");
+    }
+    let certificate = b"a certificate: not a drive record".as_slice();
+    let (k_surface, k_body, k_cert, k_later) = (big_key(900, 0), big_key(900, 1), big_key(900, 2), big_key(900, 3));
+    let mut store = PackStore::open_with(&cx, &root, Boot::Known([3; 16]), PACKS_MOST, StorePlant::None).expect("the open");
+    store.name_tool(tool);
+    store.put(&cx, k_surface, &surface).expect("the put");
+    store.put(&cx, k_body, &body).expect("the put");
+    store.put(&cx, k_cert, certificate).expect("the put");
+    store.seal(&cx).expect("the seal");
+    drop(store);
+    let mut store = PackStore::open_with(&cx, &root, Boot::Known([4; 16]), PACKS_MOST, StorePlant::None).expect("the open in the next boot");
+    assert_eq!((store.packs.len(), store.verified, store.refused), (1, 1, 0), "the format 3 pack read whole and verified");
+    store.name_tool(other);
+    store.put(&cx, k_later, &later).expect("the put");
+    store.seal(&cx).expect("the second seal");
+    store.merge(&cx).expect("the merge");
+    assert_eq!(store.packs.len(), 1, "one pack after the merge");
+    let (surface_tag, body_tag) = (u16::from(Kind::Surface as u8), u16::from(Kind::BodyCheck as u8));
+    let want = [(k_surface, surface_tag, tool), (k_body, body_tag, tool), (k_cert, u16::from(NOT_A_DRIVE_RECORD), tool), (k_later, surface_tag, other)];
+    for (key, kind, by) in want {
+        let producer = store.producer_of(&cx, key).expect("the table read").expect("the record is held");
+        assert_eq!((producer.kind, producer.tool()), (kind, Some(by)), "each row names its kind and its tool");
+    }
+    let mut into = Bytes::new_in(cx.frame(), "a record of the producer test");
+    assert!(store.get_into(&cx, k_body, &mut into).expect("the get"), "the record is held");
+    assert!(into.as_slice() == body.as_slice(), "the record's own bytes, the table beside them");
+    std::println!("pack format 3: 4 records of 2 tools merged, each row names its kind and its tool");
+}
+
+/// An old pack's bytes in format 2's layout (store.rs before W1-7): each payload at an 8-aligned
+/// offset, rows of key, offset (u64), length (u32), four zero bytes, then `BLZP`, `word`, the
+/// count (u64), the index's offset, the payloads' digest; named by the digest of its index and
+/// footer. With `word` 2 it is a format 2 pack; with 1, a pack the open takes as format 1 (its
+/// own layout was never committed: store/producers.rs).
+fn old_pack(records: &[(Key, std::vec::Vec<u8>)], word: u32) -> (std::vec::Vec<u8>, u64) {
+    let mut out = std::vec::Vec::new();
+    let mut rows = std::vec::Vec::new();
+    for (key, bytes) in records {
+        let at = out.len() as u64;
+        out.extend_from_slice(bytes);
+        out.resize(out.len().next_multiple_of(8), 0);
+        rows.extend_from_slice(&key.0.0);
+        rows.extend_from_slice(&at.to_le_bytes());
+        rows.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        rows.extend_from_slice(&[0; 4]);
+    }
+    let index_at = out.len();
+    let digest = payloads_digest(&out);
+    out.extend_from_slice(&rows);
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&word.to_le_bytes());
+    out.extend_from_slice(&(records.len() as u64).to_le_bytes());
+    out.extend_from_slice(&(index_at as u64).to_le_bytes());
+    out.extend_from_slice(&digest);
+    let number = index_number(&out[index_at..]);
+    (out, number)
+}
+
+/// The old-pack oracle (the coordinator's decision, 2026-11-16: this piece deletes nothing that
+/// is intact). A format 2 pack and a format 1 pack, intact, and a format 3 pack whose format
+/// word was torn to 2, sit in the project's folder. The open refuses the two old ones by name
+/// with their bytes, reads neither (a miss for their keys), and refuses the torn one as torn
+/// (removed). Two commands' worth of records are put and sealed beside them, and the format 3
+/// packs merged. After the open, after the puts and after the merge, each old pack is on disk
+/// byte-equal. `plant` is `None` or `OldPackMerged`.
+fn old_packs_stand(plant: StorePlant) -> Result<(), std::string::String> {
+    let (io, cx) = sim(22);
+    let root = io.need_fs().expect("a file system").root();
+    let dir = root.subdir(&Path::new(PACKS).expect("the folder"));
+    let two_held = [(big_key(901, 0), big_payload(901, 0, 40))];
+    let one_held = [(big_key(903, 0), big_payload(903, 0, 24))];
+    let (two, two_number) = old_pack(&two_held, 2);
+    let (one, one_number) = old_pack(&one_held, 1);
+    dir.publish(&cx, &pack_name(two_number).expect("a name"), Content::bytes(&two), Durable::No).expect("the format 2 pack");
+    dir.publish(&cx, &pack_name(one_number).expect("a name"), Content::bytes(&one), Durable::No).expect("the format 1 pack");
+    // The torn one: a format 3 pack under its own name, its format word then torn to 2 (3 ^ 1).
+    let torn_held = [(big_key(902, 0), big_payload(902, 0, 40))];
+    let mut torn = pack_bytes(torn_held.iter().map(|(key, bytes)| (*key, bytes.as_slice())), torn_held.len()).expect("a pack");
+    let end = torn.len();
+    let torn_number = index_number(&torn[le_u64(&torn[end - FOOTER + 16..]) as usize..]);
+    torn[end - FOOTER + 4] ^= 1;
+    dir.publish(&cx, &pack_name(torn_number).expect("a name"), Content::bytes(&torn), Durable::No).expect("the torn pack");
+    let on_disk = |cx: &Cx, number: u64| -> Option<std::vec::Vec<u8>> {
+        let path = Path::new(&std::format!("{PACKS}/{number:016x}")).expect("a path");
+        let mut bytes = Bytes::new_in(cx.frame(), "a pack read back by the old-pack oracle");
+        match root.read_all(cx, &path, &mut bytes) {
+            Ok(_) => Some(bytes.as_slice().to_vec()),
+            Err(_) => None,
+        }
+    };
+    let stand = |cx: &Cx, when: &str| -> Result<(), std::string::String> {
+        for (number, bytes) in [(two_number, &two), (one_number, &one)] {
+            match on_disk(cx, number) {
+                Some(now) if now == *bytes => {}
+                Some(_) => return Err(std::format!("old pack oracle: the old pack {number:016x} was rewritten {when}")),
+                None => return Err(std::format!("old pack oracle: the old pack {number:016x} is gone {when}")),
+            }
+        }
+        Ok(())
+    };
+    let mut store = PackStore::open_with(&cx, &root, Boot::Known([5; 16]), 2, plant).map_err(|e| std::format!("the open: {e}"))?;
+    let want = [
+        PackError::OldFormat { folder: PACKS, pack: two_number, format: 2, bytes: two.len() as u64 },
+        PackError::OldFormat { folder: PACKS, pack: one_number, format: 1, bytes: one.len() as u64 },
+    ];
+    if store.old_packs().len() != 2 || !want.iter().all(|old| store.old_packs().contains(old)) {
+        return Err(std::format!("old pack oracle: refused by name: {:?}", store.old_packs()));
+    }
+    if store.old_note() != Some((2, (two.len() + one.len()) as u64)) {
+        return Err(std::format!("old pack oracle: the note {:?}", store.old_note()));
+    }
+    if (store.packs.len(), store.refused) != (0, 1) || on_disk(&cx, torn_number).is_some() {
+        return Err(std::format!("old pack oracle: {} taken, {} refused: the torn word refused as torn and removed", store.packs.len(), store.refused));
+    }
+    stand(&cx, "after the open")?;
+    for key in [two_held[0].0, one_held[0].0] {
+        let mut into = Bytes::new_in(cx.frame(), "a record of an old pack");
+        if store.get_into(&cx, key, &mut into).map_err(|e| std::format!("the get: {e}"))? {
+            return Err(std::format!("old pack oracle: {key} read from an old pack"));
+        }
+    }
+    for k in 0..2u32 {
+        store.put(&cx, big_key(904, k), &big_payload(904, k, 40)).map_err(|e| std::format!("the put: {e}"))?;
+        store.seal(&cx).map_err(|e| std::format!("the seal: {e}"))?;
+    }
+    stand(&cx, "after the puts")?;
+    store.merge(&cx).map_err(|e| std::format!("the merge: {e}"))?;
+    if store.packs.len() != 1 {
+        return Err(std::format!("old pack oracle: {} packs after the merge of the format 3 ones", store.packs.len()));
+    }
+    stand(&cx, "after the merge")?;
+    Ok(())
+}
+
+/// Prints "old packs: formats 1 and 2 refused by name, byte-equal after the open, the puts and
+/// the merge; a torn word refused as torn".
+#[test]
+fn old_packs_are_refused_by_name_and_kept() {
+    if let Err(said) = old_packs_stand(StorePlant::None) {
+        panic!("{said}");
+    }
+    std::println!("old packs: formats 1 and 2 refused by name, byte-equal after the open, the puts and the merge; a torn word refused as torn");
+}
+
+/// The planted `OldPackMerged` (a merge that removes the old packs) is caught: "is gone after
+/// the merge".
+#[test]
+fn the_old_pack_oracle_catches_a_merge_that_removes_them() {
+    match old_packs_stand(StorePlant::OldPackMerged) {
+        Ok(()) => panic!("the planted OldPackMerged was not caught"),
+        Err(said) => assert!(said.contains("is gone after the merge"), "the planted OldPackMerged failed otherwise: {said}"),
     }
 }

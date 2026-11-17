@@ -321,6 +321,14 @@ impl Buckets {
         self.indexed.unfiled.len()
     }
 
+    /// The crates asked by bucket, by index, sorted (what [`Self::crates_asked`] counts).
+    pub fn crates_asked_sorted(&self) -> blaze_own::Vec<usize, Global> {
+        let mut out = blaze_own::Vec::new_in(Global);
+        out.extend(self.indexed.unfiled.keys().copied());
+        out.sort_unstable();
+        out
+    }
+
     /// The unfiled impls met in the crates asked, by why their record's writer did not file
     /// them: (class, count), in [`NotFiled`]'s order.
     pub fn not_filed(&self) -> [(&'static str, u32); 10] {

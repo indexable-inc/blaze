@@ -27,6 +27,8 @@ blaze-own.workspace = true
 # `code_unwind`: a code record's unwind entry (blaze-code eh.rs), registered before its slot's
 # word is published.
 blaze-code = { path = "../blaze-code" }
+# `sample`: the sample ring's entry (`sample::SampleEntry`), piece 0 of code generation.
+blaze-tier.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
@@ -34,6 +36,12 @@ libc.workspace = true
 [dev-dependencies]
 # examples/fork_smoke: `Alloc::global()`, the handle a test program hands the zygote.
 blaze-own = { workspace = true, features = ["std"] }
+# sample/tests.rs: the frame check's property and planted-bug control, the pace's property.
+blaze-sim.workspace = true
+
+# sample/ring_wait.rs: the ring under the interleaving checker (`--cfg blaze_check`).
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
 
 [lints]
 workspace = true

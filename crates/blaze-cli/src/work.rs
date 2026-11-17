@@ -39,6 +39,64 @@ pub const MODULE_AT_BOTH: u16 = 4;
 
 const OUT_DOMAIN: &str = "blaze-cli parts out 1";
 
+/// The finding number of a task's typed failure, filed as its answer ([`filed`]): its one
+/// argument is the failure's words.
+pub const TASK_FAILED: u16 = 16;
+
+/// The out of every filed failure ([`filed`]): a reader handed an input with this out was handed
+/// a failure, never a payload, and fails `Waited` on it ([`failed_input`]).
+pub(crate) fn failed_out() -> ContentId {
+    ContentId::of("blaze-cli a task's typed failure 1", b"failed")
+}
+
+/// The first input of `task` that is a filed failure ([`failed_out`]).
+pub(crate) fn failed_input(task: &Task<'_>) -> Option<Name> {
+    let failed = failed_out();
+    task.inputs.iter().find(|input| input.out == failed).map(|input| input.name)
+}
+
+/// Whether a task's typed failure is filed as its answer: a record under the task's key whose
+/// read list is what the task was handed, holding the failure as a [`TASK_FAILED`] error. It
+/// then stands like any answer while its key and its reads are today's, and is asked again
+/// only when one of them moves: nothing is retried, and the request's answer is whole, so the
+/// next command with nothing changed stands on its certificate (decision of 2026-11-16, drive.md
+/// runner 15). Not filed, a hole the next command runs again: a panic (a bug, or a frame too
+/// small: neither is a function of the inputs), and a `CrateScope` failure other than a wait (a
+/// crate's names read checkout files its key does not hold; names.rs files those itself, with
+/// the files in the read list). A failure on a fact outside the key and the reads is a
+/// [`Did::Hole`] and never comes here; so is the failure of a task handed a hole (`Task::failed`
+/// not empty: what it waited on is asked again next command, so its own failure is too).
+fn filed(failure: &TaskFailure, task: &Task<'_>) -> bool {
+    if !task.failed.is_empty() {
+        return false;
+    }
+    match failure.why {
+        Why::Panicked { .. } => false,
+        Why::Waited { .. } => true,
+        Why::NotBuilt | Why::Refused { .. } => failure.name.kind != Kind::CrateScope,
+    }
+}
+
+/// `failure` of `task` as its filed answer ([`filed`]), in `held`: no payload, the failure as a
+/// [`TASK_FAILED`] error (with the task's own words when it has them), and every input it was
+/// handed as a read, with the out it had.
+fn filed_record<'b>(task: &Task<'_>, failure: &TaskFailure, words: Option<&str>, plant: Plant, held: &'b Frame) -> Made<'b> {
+    let mut made = Made::new_in(task.name, held);
+    made.out = failed_out();
+    let said = match words {
+        Some(words) => bstd::mem::format_in!(held, "{failure}: {words}"),
+        None => bstd::mem::format_in!(held, "{failure}"),
+    };
+    made.find(TASK_FAILED, (0, 0), &[said.as_str()]);
+    if plant == Plant::FiledWithoutReads {
+        return made;
+    }
+    for input in task.inputs.iter() {
+        made.reads.push((input.name, input.out));
+    }
+    made
+}
+
 /// What one task made, in the allocator `A`: a frame on the coordinator's thread ([`Made`]), or
 /// `Global` on a pool worker, whose frame ends with its task (copied into the batch's frame
 /// once joined, in [`answer_batch`]).
@@ -118,6 +176,8 @@ pub struct Facts<'f, S> {
     /// The names world and what the `CrateScope` tasks made this command (names.rs): made by
     /// the `UnitGraph` task, or by the first `CrateScope` task when the graph was answered.
     pub names: Option<crate::names::Names<'f>>,
+    /// The `CrateScope` records the `BodyCheck` tasks read this command (body_types.rs).
+    pub bodies: crate::body_types::Kept,
 }
 
 pub(crate) enum Did<'f> {
@@ -128,6 +188,9 @@ pub(crate) enum Did<'f> {
     Failed(TaskFailure),
     /// Failed, with words of its own the closing lines print (a fetch's network failure).
     FailedSaying(TaskFailure, &'f str),
+    /// Failed on a fact outside its key and its reads (a module the home's store lacks): never
+    /// filed ([`filed`]), a hole the next command runs again; printed as `FailedSaying` is.
+    Hole(TaskFailure, &'f str),
 }
 
 /// A record an input names, read whole into a task's frame: [`Input::payload`] its kind's own
@@ -216,6 +279,12 @@ pub enum Plant {
     Drive(blaze_drive::Plant),
     /// The sweep's own planted bug (`sweep::Plant`), for the command-level properties.
     Sweep(crate::sweep::Plant),
+    /// A filed failure keeps no reads ([`filed_record`]): it stands after an input it was
+    /// handed changed, which the filed-failure test must catch.
+    FiledWithoutReads,
+    /// The command's tool names this body checker, not [`crate::body_types::BODY_CHECKER`]
+    /// (home.rs `tool_of`): an older checker's records, for the producer test.
+    BodyChecker(&'static str),
 }
 
 impl Sizes {
@@ -305,10 +374,14 @@ pub fn run_batches<'f, 'r>(
         let jobs: &Frame = jobs;
         // The round's body jobs being gathered: each file's job and its bodies so far, over
         // every batch (a batch is of one home; two batches may be of the same one).
-        let mut files: Vec<(Job<'_>, Vec<(Name, u32), &Frame>), Global> = Vec::new_in(Global);
+        let mut files: Vec<(Job<'_>, Vec<(Name, u32), &Frame>, &crate::body_types::TypesJob<'_>), Global> = Vec::new_in(Global);
         for batch in batches.iter() {
             let mut tasks = Vec::with_capacity_in(batch.tasks.len(), Global);
             for (_, task) in batch.tasks.iter() {
+                if let Some(on) = failed_input(task) {
+                    tasks.push(Spawned::Waited(on));
+                    continue;
+                }
                 tasks.push(match task.name.kind {
                     Kind::FileItems => match job_of(req, facts, task, jobs) {
                         Ok(job) => Spawned::One(scope.may_overlap("outline", task_frame, {
@@ -318,24 +391,43 @@ pub fn run_batches<'f, 'r>(
                         Err(what) => Spawned::Refused(what),
                     },
                     Kind::BodyCheck => {
+                        // The crates its types read come first (body_types.rs): a task that
+                        // lacks them answers `Need`, and joins its file's job only with them.
                         let path = req.file_of(task);
-                        let known = files.iter().position(|(job, _)| Some(job.slot.as_bytes()) == path && job.edition == task.edition);
-                        let group = match known {
-                            Some(group) => Ok(group),
+                        let known = files.iter().position(|(job, _, _)| Some(job.slot.as_bytes()) == path && job.edition == task.edition);
+                        let job = match known {
+                            Some(group) => Ok((None, files[group].0.slot, files[group].0.flags)),
                             None => job_of(req, facts, task, jobs).map(|job| {
-                                files.push((job, Vec::new_in(jobs)));
-                                files.len() - 1
+                                let (slot, flags) = (job.slot, job.flags);
+                                (Some(job), slot, flags)
                             }),
                         };
-                        match group {
-                            Ok(group) => {
-                                let bodies = &mut files[group].1;
-                                match bodies.try_push((task.name, task.place)) {
-                                    Ok(()) => Spawned::Body { group, at: bodies.len() - 1 },
-                                    Err(_) => Spawned::Refused(JOBS_FULL),
+                        match job {
+                            Err(what) => Spawned::Refused(what),
+                            Ok((job, slot, flags)) => {
+                                let real = crate::sweep::real_path(slot, flags, jobs);
+                                let real = core::str::from_utf8(real.leak()).map_err(|_| CliError::Text { what: "a path is not UTF-8" })?;
+                                match crate::body_types::prepare(&cx, root, store, facts, task, real, frame, jobs, alloc)? {
+                                    crate::body_types::Prepared::Need(wants) => Spawned::Need(wants),
+                                    crate::body_types::Prepared::Waited(on) => Spawned::Waited(on),
+                                    crate::body_types::Prepared::Refused(what) => Spawned::Refused(what),
+                                    crate::body_types::Prepared::Ready(types) => {
+                                        let group = match (known, job) {
+                                            (Some(group), _) => group,
+                                            (None, Some(job)) => {
+                                                files.push((job, Vec::new_in(jobs), types));
+                                                files.len() - 1
+                                            }
+                                            (None, None) => return Err(CliError::Text { what: "a body's file job was neither found nor made" }),
+                                        };
+                                        let bodies = &mut files[group].1;
+                                        match bodies.try_push((task.name, task.place)) {
+                                            Ok(()) => Spawned::Body { group, at: bodies.len() - 1 },
+                                            Err(_) => Spawned::Refused(JOBS_FULL),
+                                        }
+                                    }
                                 }
                             }
-                            Err(what) => Spawned::Refused(what),
                         }
                     }
                     _ => Spawned::Here,
@@ -344,8 +436,8 @@ pub fn run_batches<'f, 'r>(
             pending.push(tasks);
         }
         groups.try_reserve_exact(files.len()).map_err(|_| CliError::Text { what: "the list of a round's body jobs could not be made" })?;
-        for (file, bodies) in files {
-            let job = BodiesJob { file, bodies: bodies.leak() };
+        for (file, bodies, types) in files {
+            let job = BodiesJob { file, bodies: bodies.leak(), types };
             groups.push(Group::Running(scope.may_overlap("bodies", task_frame, {
                 let clock = &clock;
                 move |cx: &Cx| Ok::<_, core::convert::Infallible>(pooled_bodies(cx, root, &job, clock))
@@ -385,6 +477,11 @@ enum Spawned<'s> {
     One(bstd::task::Task<'s, Pooled>),
     /// A `BodyCheck` task: the `at`th body of the round's `group`th file job.
     Body { group: usize, at: usize },
+    /// An input it was handed is a filed failure ([`failed_input`]): it fails `Waited` on it,
+    /// unrun.
+    Waited(Name),
+    /// A `BodyCheck` task that lacks inputs (body_types.rs `prepare`): it answers `Need`.
+    Need(std::vec::Vec<Want, Global>),
 }
 
 /// A batch's tasks as [`run_batches`] spawned them.
@@ -442,6 +539,8 @@ fn answer_batch<'f, 'r>(
         let (done, ns) = match (spawned, here) {
             (_, Some(done)) => done,
             (Spawned::Refused(what), _) => (Did::Failed(TaskFailure { name: task.name, why: Why::Refused { what, rule: "blaze-cli work.rs" } }), 0),
+            (Spawned::Waited(on), _) => (Did::Failed(TaskFailure { name: task.name, why: Why::Waited { on } }), 0),
+            (Spawned::Need(wants), _) => (Did::Need(Vec::from_slice_in(&wants, held)), 0),
             (Spawned::Body { group, at }, _) => {
                 let unanswered = Why::Refused { what: "a file's body job answered nothing for this body", rule: "blaze-cli work.rs, pooled_bodies" };
                 let Some(slot) = groups.get_mut(group) else {
@@ -474,11 +573,14 @@ fn answer_batch<'f, 'r>(
             (Spawned::One(handle), _) => {
                 let joined = handle.join(&cx).map_err(CliError::Pool)?;
                 high.scratch = high.scratch.max(joined.used);
-                let did = joined.did.map_err(|error| match error {
-                    Unread::Path(error) => CliError::Path(error),
-                    Unread::Fs(error) => CliError::Fs(error),
-                    Unread::Text(what) => CliError::Text { what },
-                })?;
+                // A file's text this build refuses (not UTF-8, past 4 GiB) fails its own task,
+                // a function of the text (rule 20); a path or a read that failed stops the command.
+                let did = match joined.did {
+                    Ok(did) => did,
+                    Err(Unread::Text(what)) => Err(Why::Refused { what, rule: "blaze-cli work.rs" }),
+                    Err(Unread::Path(error)) => return Err(CliError::Path(error)),
+                    Err(Unread::Fs(error)) => return Err(CliError::Fs(error)),
+                };
                 let done = match did {
                     Ok(record) => Did::Done(record.clone_in(held)),
                     Err(why) => Did::Failed(TaskFailure { name: task.name, why }),
@@ -488,13 +590,19 @@ fn answer_batch<'f, 'r>(
             }
             (Spawned::Here, None) => unreachable!("a task neither pooled nor run here"),
         };
-        if let Did::Failed(failure) | Did::FailedSaying(failure, _) = &done {
+        // A typed failure that is a function of the task's key and inputs is its answer, filed.
+        let done = match done {
+            Did::Failed(failure) if filed(&failure, task) => Did::Done(filed_record(task, &failure, None, facts.plant, held)),
+            Did::FailedSaying(failure, words) if filed(&failure, task) => Did::Done(filed_record(task, &failure, Some(words), facts.plant, held)),
+            other => other,
+        };
+        if let Did::Failed(failure) | Did::FailedSaying(failure, _) | Did::Hole(failure, _) = &done {
             let path = match req.file_of(task) {
                 Some(path) => Some(core::str::from_utf8(Vec::from_slice_in(path, frame).leak()).map_err(|_| CliError::Text { what: "a path is not UTF-8" })?),
                 None => None,
             };
             let detail = match &done {
-                Did::FailedSaying(_, words) => Some(held_str(words, frame)),
+                Did::FailedSaying(_, words) | Did::Hole(_, words) => Some(held_str(words, frame)),
                 _ => None,
             };
             failed.push(Failed { path, failure: *failure, detail });
@@ -548,7 +656,7 @@ fn answer_batch<'f, 'r>(
                 Ran::Done(&outputs[at - 1..at])
             }
             Did::Need(wants) => Ran::Need(wants),
-            Did::Failed(failure) | Did::FailedSaying(failure, _) => Ran::Failed(*failure),
+            Did::Failed(failure) | Did::FailedSaying(failure, _) | Did::Hole(failure, _) => Ran::Failed(*failure),
         };
         results.push(Outcome { ticket: *ticket, ran, in_place: 0, ns: *ns });
     }
@@ -673,7 +781,7 @@ pub const fn whole(kind: Kind) -> bool {
 /// [`whole`], else the part it does.
 pub fn does(kind: Kind) -> &'static str {
     match kind {
-        Kind::BodyCheck => "check the bodies' syntax",
+        Kind::BodyCheck => "check the bodies' syntax and types",
         _ => kind.stage(),
     }
 }
@@ -681,6 +789,10 @@ pub fn does(kind: Kind) -> &'static str {
 /// The names stage's word in [`CHECK_STAGES`]: the one stage a command can also find not run
 /// (main.rs `Finished::names_held`).
 pub(crate) const NAMES_STAGE: &str = "names";
+
+/// The types stage's word in [`CHECK_STAGES`]: not run when any body says it was not checked
+/// (body_types.rs `TYPES_NOT_CHECKED`, counted by print.rs).
+pub(crate) const TYPES_STAGE: &str = "types";
 
 /// The one list of the stages `check` is defined to run, in order, and whether this build runs
 /// each, derived from the kinds this worker builds: the closing line's "NOT checked" and
@@ -690,8 +802,10 @@ pub(crate) const CHECK_STAGES: [(&str, bool); 6] = [
     ("syntax of items", builds(Kind::FileItems)),
     ("syntax inside bodies", builds(Kind::BodyCheck)),
     (NAMES_STAGE, builds(Kind::CrateScope)),
-    // A body's types are its `BodyCheck` task's, an item's its `Signature`'s.
-    ("types", whole(Kind::Signature) && whole(Kind::ImplBucket) && whole(Kind::BodyCheck)),
+    // A body's types are its `BodyCheck` task's, over records, with the heads it reads made
+    // in the task (body_types.rs). A body it could not check to the end is a
+    // `TYPES_NOT_CHECKED` finding, which turns this stage to "NOT checked" (main.rs `close`).
+    (TYPES_STAGE, builds(Kind::BodyCheck)),
     ("borrows", whole(Kind::BodyCheck)),
 ];
 
@@ -825,6 +939,8 @@ const JOBS_FULL: &str = "the frame of one round's jobs is full: its tasks' paths
 struct BodiesJob<'a> {
     file: Job<'a>,
     bodies: &'a [(Name, u32)],
+    /// The crates its bodies' types read (body_types.rs).
+    types: &'a crate::body_types::TypesJob<'a>,
 }
 
 /// The `FileItems` job of `task`, or the job of a `BodyCheck` task's home file, or the refusal
@@ -920,13 +1036,20 @@ fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, job: &Job<'
             parts.push(Part { name: Name::new(Kind::Surface, job.name.subject), locate: Locate::Source(surface), place: 0 });
             // Each body its own part, keyed by its item's text: an edit of one body re-parses
             // that one ([`body_syntax`]). Its syntax errors are its record's alone.
+            // Its source is its item's text and its file's text around every body
+            // (body_types.rs `body_source`): a signature edit in the file re-checks its bodies.
             let mut bodies = Vec::new_in(scratch);
+            let mut named = Vec::new_in(scratch);
             for item in outline.items() {
                 if let Some(body) = checked_body(&outline, item) {
-                    let name = body_name(job.name, &outline, item, text);
-                    parts.push(Part { name, locate: Locate::Source(item.hash), place: item.range.start });
+                    named.push((body_name(job.name, &outline, item, text), item.hash, item.range.start));
                     bodies.push((item.range.start + body.start, item.range.start + body.end));
                 }
+            }
+            bodies.sort_unstable();
+            let around = crate::body_types::around_bodies(text, &bodies);
+            for (name, hash, place) in named.iter().copied() {
+                parts.push(Part { name, locate: Locate::Source(crate::body_types::body_source(hash, around)), place });
             }
             parts.sort_unstable_by_key(|part| part.name);
             let mut findings = Vec::new_in(held);
@@ -1049,10 +1172,22 @@ fn bodies_syntax(cx: &Cx, root: &Dir<ReadWrite>, job: &BodiesJob<'_>, scratch: &
         }
     }
     starts.sort_unstable();
+    // The bodies' types (body_types.rs): each owner's front end over records, made once a job.
+    let mut types = crate::body_types::FileTypes::new(cx, root, job.types, text, scratch);
     for (name, place) in job.bodies.iter().copied() {
         let found = starts.binary_search_by_key(&place, |(start, _)| *start).ok().map(|at| &outline.items()[starts[at].1 as usize]);
         let (used, limit) = (scratch.peak() as u64, scratch.reserved() as u64);
-        did.push(Some(match unwinding(|| body_syntax(&outline, found, text, edition, name, Global)) {
+        let checked = unwinding(|| {
+            let mut done = body_syntax(&outline, found, text, edition, name, Global)?;
+            // A body with a syntax error is that error's: its types are not asked.
+            if let Some(item) = found
+                && done.findings.is_empty()
+            {
+                types.check(&outline, item, text, &mut done);
+            }
+            Ok(done)
+        });
+        did.push(Some(match checked {
             Ok(done) => done,
             Err(Panicked) => Err(Why::Panicked { used, limit }),
         }));

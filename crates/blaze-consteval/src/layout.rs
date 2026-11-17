@@ -63,7 +63,11 @@ fn stop(e: &blaze_build::layout::LayoutError) -> Stop {
         L::Recursive => Refusal::Malformed { what: "a type that holds itself by value" },
         L::TooLarge => Refusal::Unsupported { what: "a type larger than `isize::MAX` bytes" },
         L::NoAdt(item) => Refusal::Missing { what: "ADT definition", item },
-        L::Ground(_) => Refusal::Unsupported { what: "a field type with no ground form" },
+        L::Ground(ref error) => match projection_of(error) {
+            Some((trait_, name)) => Refusal::Projection { trait_, name },
+            None => Refusal::Unsupported { what: "a field type with no ground form" },
+        },
+        L::FieldGround { adt, field, name, ref error } => Refusal::FieldGround { adt, field, name, projection: projection_of(error) },
     })
 }
 
@@ -182,7 +186,7 @@ pub(crate) fn is_unsized<W: LayoutFacts>(world: &W, g: &mut PortableTys<'_>, poi
                 if v.fields.len == 0 {
                     return Ok(false);
                 }
-                t = field_ty(&adt, v.fields.start + v.fields.len - 1, args, g, scratch, world)?;
+                t = field_ty(key, &adt, v.fields.start + v.fields.len - 1, args, g, scratch, world)?;
             }
             _ => return Ok(false),
         }
@@ -194,10 +198,24 @@ fn bad() -> Refusal<'static> {
     Refusal::Malformed { what: "a type past the ground table" }
 }
 
-/// The ground type of field `field` of `adt` at `args`.
-pub(crate) fn field_ty(adt: &Adt<'_>, field: u32, args: List, ground: &mut PortableTys<'_>, scratch: Alloc<'_>, facts: &dyn LayoutFacts) -> Result<PTy, Refusal<'static>> {
+/// The `(trait, associated type)` of a grounding refusal that is a projection no impl
+/// answered; `None` for any other.
+fn projection_of(error: &blaze_build::BuildError) -> Option<(ItemKey, blaze_typeck::Name)> {
+    match *error {
+        blaze_build::BuildError::Projection { trait_, name } => Some((trait_, name)),
+        _ => None,
+    }
+}
+
+/// The ground type of field `field` (its row in `adt.fields`) of ADT `key` (`adt`) at `args`;
+/// a type with no ground form is refused naming the field ([`Refusal::FieldGround`]).
+pub(crate) fn field_ty(key: ItemKey, adt: &Adt<'_>, field: u32, args: List, ground: &mut PortableTys<'_>, scratch: Alloc<'_>, facts: &dyn LayoutFacts) -> Result<PTy, Refusal<'static>> {
     let f = adt.fields.get(field as usize).ok_or(Refusal::Malformed { what: "a field past its ADT" })?;
     let mut a: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
     a.extend_from_slice(ground.view().list(args).map_err(|_| bad())?);
-    blaze_build::ground(adt.types, f.ty, &a, ground, scratch, facts).map_err(|_| Refusal::Unsupported { what: "a field type with no ground form" })
+    blaze_build::ground(adt.types, f.ty, &a, ground, scratch, facts)
+        .map_err(|e| Refusal::FieldGround { adt: key, field, name: f.name, projection: projection_of(&e) })
 }
+
+#[cfg(test)]
+mod field_ground_tests;

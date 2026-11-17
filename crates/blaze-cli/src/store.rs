@@ -67,13 +67,19 @@ const HOME_FOLDER: &str = ".blaze";
 /// A store's record of the boot its packs were last known whole in, in its folder.
 const BOOT: &str = "boot";
 const BOOT_MAGIC: &[u8; 4] = b"BLZB";
-/// A pack's last bytes: `BLZP`, the format, the record count, the index's offset, the digest
-/// of the payloads (every byte before the index).
+/// A pack's last bytes: `BLZP`, the format, the record count (u32), the producer count (u32),
+/// the index's offset, the digest of the payloads (every byte before the index, the producer
+/// table included: store/producers.rs).
 const FOOTER: usize = 56;
 const MAGIC: &[u8; 4] = b"BLZP";
-/// 2 since 2026-11-16 (the payloads' digest); 1 had none, and is refused, removed and made again.
-const FORMAT: u32 = 2;
-/// One index row: the key, the payload's offset and length, four zero bytes.
+/// 3 since 2026-11-16 (each row names its record's producer: store/producers.rs). A pack of an
+/// older format with a valid footer of its own (1 or 2) is refused by name at the open
+/// (`PackError::OldFormat`) and kept as it is: never read, merged from, removed or rewritten
+/// (another installed blaze may read it; the collector removes dead ones). A torn pack is
+/// removed by the open as before, a torn format word included.
+const FORMAT: u32 = 3;
+/// One index row: the key, the payload's offset (u64) and length (u32), the index of its
+/// producer in the pack's producer table (u16), two zero bytes.
 const ROW: usize = 48;
 /// Past this many packs, the store merges them all into one after the answer.
 pub(crate) const PACKS_MOST: usize = 8;
@@ -110,12 +116,19 @@ pub(crate) enum StorePlant {
     /// The seal makes the pack's name hold its index and footer, and the boot record vouch for
     /// it, before the payloads are written (store/chunks.rs, `seal_records`).
     IndexBeforePayloads,
+    /// The merge removes the old-format packs the open refused, as a merge that took them for
+    /// its own would (store/producers.rs `planted_remove_old`): another blaze's live records.
+    OldPackMerged,
 }
 
 /// A command's own records before the seal: bytes that never move, rows sorted once.
 mod chunks;
 /// When a layer's packs are merged, and the merge's typed refusal.
 mod compact;
+/// Who made each record of a pack (pack format 3), and an old pack's refusal by name.
+mod producers;
+pub use producers::PackError;
+use blaze_own::alloc_ref::SharedAlloc;
 /// The store at a real home's size: what a get reads, what a repeated command writes, the
 /// compaction's crash proof.
 #[cfg(test)]
@@ -130,6 +143,12 @@ struct Pack {
     /// Bytes the open read of it: its footer, its index and footer, and its payloads when it
     /// was verified (store/scale_tests.rs counts them).
     read: u64,
+    /// Entries in its producer table, which starts at `table_at` and ends at the index; read
+    /// only when asked (`Pack::producers`, store/producers.rs).
+    producers: u32,
+    table_at: u64,
+    /// Each row's producer's index in that table, beside `rows` (one each, same order).
+    producer_of: blaze_own::Vec<u16, SharedAlloc<'static>>,
 }
 
 impl Pack {
@@ -192,6 +211,12 @@ pub struct PackStore {
     plant: StorePlant,
     /// Reads of footers and indexes, reset after each.
     scratch: bstd::mem::Frame,
+    /// The tool its seals name as each record's producer's (store/producers.rs): `None` until
+    /// the command names it (`PackStore::name_tool`), written as the unnamed id.
+    tool: Option<blaze_drive::Tool>,
+    /// Packs of an older format the open refused by name: never read, merged from, removed or
+    /// rewritten (store/producers.rs); said once by `Layered::open_chain`.
+    old: blaze_own::Vec<PackError, SharedAlloc<'static>>,
 }
 
 /// A pack's name, from its index and footer: the first 8 bytes of their digest, in hex. The
@@ -255,6 +280,9 @@ fn le_u64(bytes: &[u8]) -> u64 {
 /// command's merge removed it after this one listed it: its records are in that merge's pack).
 enum Untaken {
     Refused,
+    /// A pack of an older format with a valid footer of its own: refused by name, never read,
+    /// kept as it is ([`PackError::OldFormat`], store/producers.rs `old_or_torn`).
+    Old(PackError),
     Gone,
     Failed(CliError),
 }
@@ -302,6 +330,8 @@ impl PackStore {
             packs_most,
             plant,
             scratch,
+            tool: None,
+            old: blaze_own::Vec::new_in(SharedAlloc::global()),
         };
         if let Some(entries) = root.entries(&cx, &folder)? {
             for i in 0..entries.len() {
@@ -313,7 +343,7 @@ impl PackStore {
                     _ => continue,
                 };
                 let known = trusted.binary_search(&number).is_ok();
-                let taken = PackStore::read_pack(&cx, &store.packs_dir, number, !known, &store.scratch, plant);
+                let taken = PackStore::read_pack(&cx, &store.packs_dir, named, number, !known, &store.scratch, plant);
                 store.scratch.reset();
                 match taken {
                     Ok(pack) => {
@@ -322,6 +352,12 @@ impl PackStore {
                         store.packs.push((number, pack));
                     }
                     Err(Untaken::Gone) => {}
+                    // An older format, whole by its own footer: refused by name and kept as it
+                    // is; another installed blaze may read it (store/producers.rs).
+                    Err(Untaken::Old(old)) => {
+                        let entries = store.old.len() + 1;
+                        store.old.try_push(old).map_err(|_| producers::pack_refused(PackError::NoRoom { folder: named, what: "the list of old packs refused", entries }))?;
+                    }
                     // Torn or foreign: never read around. It is removed, said, and its records
                     // made again; the rest of the home stands, each pack checked on its own.
                     Err(Untaken::Refused) => {
@@ -362,7 +398,7 @@ impl PackStore {
     /// pack not known whole in this boot), every byte too, once: the index and footer against
     /// the name, the payloads against the footer's digest. A pack that fails any is
     /// [`Untaken::Refused`].
-    fn read_pack(cx: &Cx, dir: &Dir<ReadWrite>, number: u64, verify: bool, scratch: &bstd::mem::Frame, plant: StorePlant) -> Result<Pack, Untaken> {
+    fn read_pack(cx: &Cx, dir: &Dir<ReadWrite>, folder: &'static str, number: u64, verify: bool, scratch: &bstd::mem::Frame, plant: StorePlant) -> Result<Pack, Untaken> {
         let name = pack_name(number).map_err(Untaken::Failed)?;
         let file = dir.open_read(cx, &name)?;
         let len = file.len(cx)?;
@@ -372,10 +408,24 @@ impl PackStore {
         let mut footer = Bytes::new_in(scratch, "a pack's footer");
         file.read_at(cx, len - FOOTER as u64, FOOTER, &mut footer)?;
         let footer = footer.as_slice();
-        if footer.len() != FOOTER || &footer[..4] != MAGIC || le_u32(&footer[4..]) != FORMAT {
+        if footer.len() != FOOTER || &footer[..4] != MAGIC {
             return Err(Untaken::Refused);
         }
-        let (count, index_at) = (le_u64(&footer[8..]), le_u64(&footer[16..]));
+        match le_u32(&footer[4..]) {
+            FORMAT => {}
+            // Old (a valid footer of its own format: refused by name, kept) or a format 3 pack
+            // with a torn word (refused as torn): store/producers.rs `old_or_torn`.
+            1 | 2 => return Err(producers::old_or_torn(cx, &file, len, footer, folder, number, scratch)),
+            _ => return Err(Untaken::Refused),
+        }
+        let (count, producers, index_at) = (u64::from(le_u32(&footer[8..])), le_u32(&footer[12..]), le_u64(&footer[16..]));
+        if producers as usize > producers::PRODUCERS_MOST {
+            return Err(Untaken::Refused);
+        }
+        // The producer table ends the payloads: it lies before the index, under the digest.
+        let Some(table_at) = index_at.checked_sub(producers::table_len(producers)) else {
+            return Err(Untaken::Refused);
+        };
         let mut digest = [0u8; 32];
         digest.copy_from_slice(&footer[24..56]);
         let rows_len = count.checked_mul(ROW as u64).filter(|bytes| index_at.checked_add(*bytes) == Some(len - FOOTER as u64));
@@ -421,19 +471,26 @@ impl PackStore {
             }
         }
         let mut rows = std::vec::Vec::with_capacity_in(rows_len / ROW, Global);
+        let no_room = |_| Untaken::Failed(producers::pack_refused(PackError::NoRoom { folder, what: "a pack's producer indexes", entries: rows_len / ROW }));
+        let mut producer_of: blaze_own::Vec<u16, SharedAlloc<'static>> = blaze_own::Vec::try_with_capacity_in(rows_len / ROW, SharedAlloc::global()).map_err(no_room)?;
         for row in index.as_slice()[..rows_len].chunks_exact(ROW) {
             let mut key = [0u8; 32];
             key.copy_from_slice(&row[..32]);
             let (at, size) = (le_u64(&row[32..]), le_u32(&row[40..]));
-            if at.checked_add(u64::from(size)).is_none_or(|end| end > index_at) {
+            let producer = u16::from_le_bytes([row[44], row[45]]);
+            // A payload ends before the producer table; a row names an entry of the table; the
+            // row's last two bytes are zero (one encoding).
+            if at.checked_add(u64::from(size)).is_none_or(|end| end > table_at) || u32::from(producer) >= producers || row[46..48] != [0, 0] {
                 return Err(Untaken::Refused);
             }
             rows.push((Key(blaze_ids::ContentId(key)), at, size));
+            // Within the capacity reserved above: nothing allocated.
+            producer_of.push(producer);
         }
         if !rows.is_sorted_by(|a, b| a.0 < b.0) {
             return Err(Untaken::Refused);
         }
-        Ok(Pack { file, rows, gone: false, read })
+        Ok(Pack { file, rows, gone: false, read, producers, table_at, producer_of })
     }
 
     /// This command's records as one pack, if it wrote any: sorted by key, one publish (one
@@ -464,22 +521,60 @@ impl PackStore {
         // Every table below is reserved before it is filled: a refused allocation is a typed
         // error naming the folder and the rows (store/compact.rs `no_room`), never a panic.
         let all_rows: usize = self.packs.iter().map(|(_, pack)| pack.rows.len()).sum();
-        let mut rows: std::vec::Vec<(Key, usize, u64, u32), Global> = std::vec::Vec::new_in(Global);
+        if self.packs.is_empty() {
+            return Ok(());
+        }
+        // Each pack's producer table (one positioned read each), and the merged table: every
+        // (kind, tool) once, sorted. A pack another command's merge removed meanwhile ends this
+        // merge with nothing changed, as below.
+        let folder = self.folder;
+        let mut tables: blaze_own::Vec<blaze_own::Vec<producers::Producer, SharedAlloc<'static>>, SharedAlloc<'static>> = blaze_own::Vec::try_with_capacity_in(self.packs.len(), SharedAlloc::global()).map_err(|_| self.no_room(all_rows))?;
+        let mut table: blaze_own::Vec<producers::Producer, SharedAlloc<'static>> = blaze_own::Vec::new_in(SharedAlloc::global());
+        for (number, pack) in self.packs.iter() {
+            let read = pack.producers(&cx, &self.scratch, folder, *number);
+            self.scratch.reset();
+            let Some(one) = read? else { return Ok(()) };
+            let entries = table.len() + one.len();
+            table.try_extend_from_slice(one.as_slice()).map_err(|_| producers::pack_refused(PackError::NoRoom { folder, what: "the merged producer table", entries }))?;
+            // Within the capacity reserved above.
+            tables.push(one);
+        }
+        table.sort_unstable();
+        table.dedup();
+        if table.len() > producers::PRODUCERS_MOST {
+            return Err(producers::pack_refused(PackError::TooManyProducers { folder, producers: table.len() }));
+        }
+        let mut rows: std::vec::Vec<(Key, usize, u64, u32, u16), Global> = std::vec::Vec::new_in(Global);
         rows.try_reserve_exact(all_rows).map_err(|_| self.no_room(all_rows))?;
         let mut merged = std::vec::Vec::new_in(Global);
         merged.try_reserve_exact(self.packs.len()).map_err(|_| self.no_room(all_rows))?;
         for (at, (number, pack)) in self.packs.iter().enumerate() {
-            rows.extend(pack.rows.iter().map(|(key, offset, len)| (*key, at, *offset, *len)));
+            let own = &tables[at];
+            for ((key, offset, len), index) in pack.rows.iter().zip(pack.producer_of.iter()) {
+                let bad = |why| producers::pack_refused(PackError::BadTable { folder, pack: *number, why });
+                let producer = own.get(*index as usize).ok_or_else(|| bad("a row names an entry past its end"))?;
+                // Every entry of every pack's table is in the merged one, which holds at most
+                // `PRODUCERS_MOST`: its index fits a u16.
+                let into = table.binary_search(producer).map_err(|_| bad("an entry missing from the merged table"))?;
+                rows.push((*key, at, *offset, *len, into as u16));
+            }
             merged.push(*number);
         }
         // Stable: of a key in two packs (equal bytes, rule 21), the first pack's stays.
         rows.sort_by_key(|row| row.0);
         rows.dedup_by_key(|row| row.0);
+        let count = u32::try_from(rows.len()).map_err(|_| producers::pack_refused(PackError::TooManyRows { folder, rows: rows.len() }))?;
+        let table_len = producers::table_len(table.len() as u32) as usize;
         let mut tail: std::vec::Vec<u8, Global> = std::vec::Vec::new_in(Global);
-        tail.try_reserve_exact(rows.len() * ROW + FOOTER).map_err(|_| self.no_room(all_rows))?;
+        tail.try_reserve_exact(table_len + rows.len() * ROW + FOOTER).map_err(|_| self.no_room(all_rows))?;
+        // The tail is the producer table (the payloads' end), the index, the footer.
+        let Ok(()) = producers::write_table::<core::convert::Infallible>(table.as_slice(), &mut |piece: &[u8]| {
+            tail.extend_from_slice(piece);
+            Ok(())
+        });
         let mut hasher = blaze_ids::Hasher::new(chunks::PAYLOADS);
         let mut index_at = 0u64;
-        for (key, pack_at, offset, len) in rows.iter() {
+        for (key, pack_at, offset, len, producer) in rows.iter() {
             let pack = &self.packs[*pack_at].1;
             // A payload and the zeros that pad it to 8 bytes, as its pack holds them.
             let padded = u64::from(*len).next_multiple_of(8);
@@ -510,15 +605,21 @@ impl PackStore {
             tail.extend_from_slice(&key.0.0);
             tail.extend_from_slice(&index_at.to_le_bytes());
             tail.extend_from_slice(&len.to_le_bytes());
-            tail.extend_from_slice(&[0; 4]);
+            tail.extend_from_slice(&producer.to_le_bytes());
+            tail.extend_from_slice(&[0; 2]);
             index_at += padded;
         }
+        // The rows' offsets are the payloads'; the table follows them, under the digest.
+        hasher.update(&tail[..table_len]);
+        let index_at = index_at + table_len as u64;
         tail.extend_from_slice(MAGIC);
         tail.extend_from_slice(&FORMAT.to_le_bytes());
-        tail.extend_from_slice(&(rows.len() as u64).to_le_bytes());
+        tail.extend_from_slice(&count.to_le_bytes());
+        tail.extend_from_slice(&(table.len() as u32).to_le_bytes());
         tail.extend_from_slice(&index_at.to_le_bytes());
         tail.extend_from_slice(&hasher.finish().0);
-        let number = index_number(&tail);
+        // The name is the digest of the index and footer, as `read_pack` checks it.
+        let number = index_number(&tail[table_len..]);
         let removes_first = self.plant == StorePlant::MergeRemovesFirst;
         if removes_first {
             for gone in merged.iter() {
@@ -528,7 +629,7 @@ impl PackStore {
         let published = {
             let mut parts: std::vec::Vec<bstd::fs::FilePart<'_>, Global> = std::vec::Vec::new_in(Global);
             parts.try_reserve_exact(rows.len()).map_err(|_| self.no_room(all_rows))?;
-            for (_, pack_at, offset, len) in rows.iter().filter(|row| row.3 > 0) {
+            for (_, pack_at, offset, len, _) in rows.iter().filter(|row| row.3 > 0) {
                 parts.push(bstd::fs::FilePart { of: &self.packs[*pack_at].1.file, at: *offset, len: u64::from(*len).next_multiple_of(8) });
             }
             let chunk = core::num::NonZero::new(chunks::PART).unwrap_or(core::num::NonZero::<usize>::MIN);
@@ -550,6 +651,9 @@ impl PackStore {
             for gone in merged.iter().filter(|gone| **gone != number) {
                 self.packs_dir.remove(&cx, &pack_name(*gone)?, Durable::No)?;
             }
+        }
+        if self.plant == StorePlant::OldPackMerged {
+            self.planted_remove_old(&cx)?;
         }
         drop(old);
         Ok(())
@@ -594,8 +698,15 @@ impl PackStore {
 #[cfg(test)]
 fn pack_bytes<'b>(records: impl Iterator<Item = (Key, &'b [u8])> + Clone, count: usize) -> Result<std::vec::Vec<u8, Global>, CliError> {
     let too_big = || CliError::Text { what: "a record past 4 GiB" };
+    // One tool (none named: the unnamed id, as a store named none seals), each kind seen.
+    let mut kinds = producers::OneTool::new();
+    for (_, bytes) in records.clone() {
+        kinds.see(producers::kind_of(bytes));
+    }
+    kinds.rank();
+    let table_len = producers::table_len(kinds.count()) as usize;
     let payloads: usize = records.clone().map(|(_, bytes)| bytes.len().next_multiple_of(8)).sum();
-    let mut out = std::vec::Vec::with_capacity_in(payloads + count * ROW + FOOTER, Global);
+    let mut out = std::vec::Vec::with_capacity_in(payloads + table_len + count * ROW + FOOTER, Global);
     let mut rows = std::vec::Vec::with_capacity_in(count * ROW, Global);
     for (key, bytes) in records {
         let at = out.len() as u64;
@@ -604,14 +715,20 @@ fn pack_bytes<'b>(records: impl Iterator<Item = (Key, &'b [u8])> + Clone, count:
         rows.extend_from_slice(&key.0.0);
         rows.extend_from_slice(&at.to_le_bytes());
         rows.extend_from_slice(&u32::try_from(bytes.len()).map_err(|_| too_big())?.to_le_bytes());
-        rows.extend_from_slice(&[0; 4]);
+        rows.extend_from_slice(&kinds.index(producers::kind_of(bytes)).to_le_bytes());
+        rows.extend_from_slice(&[0; 2]);
     }
+    let Ok(()) = kinds.write::<core::convert::Infallible>(None, &mut |piece: &[u8]| {
+        out.extend_from_slice(piece);
+        Ok(())
+    });
     let index_at = out.len() as u64;
     let digest = payloads_digest(&out);
     out.extend_from_slice(&rows);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&FORMAT.to_le_bytes());
-    out.extend_from_slice(&(count as u64).to_le_bytes());
+    out.extend_from_slice(&u32::try_from(count).map_err(|_| too_big())?.to_le_bytes());
+    out.extend_from_slice(&kinds.count().to_le_bytes());
     out.extend_from_slice(&index_at.to_le_bytes());
     out.extend_from_slice(&digest);
     Ok(out)
@@ -1054,12 +1171,18 @@ impl<'r, S: Sharing> Layered<'r, S> {
         if local.refused > 0 {
             err.line(cx, format_args!("blaze: {} torn pack(s) under {PACKS} (a crash while one was written?): removed; their records are made again", local.refused))?;
         }
+        if let Some((count, bytes)) = local.old_note() {
+            err.line(cx, format_args!("blaze: {count} packs of an older store format ({bytes} bytes) are not read by this blaze, under {PACKS}"))?;
+        }
         let mut machines = [None, None];
         if let Some(home) = home {
             for (at, folder) in [SHARED, OWN].into_iter().enumerate() {
                 let store = PackStore::open_in(cx, home, folder, boot, packs_most, plant)?;
                 if store.refused > 0 {
                     err.line(cx, format_args!("blaze: {} torn pack(s) under the home's {folder} (a crash while one was written?): removed; their records are made again", store.refused))?;
+                }
+                if let Some((count, bytes)) = store.old_note() {
+                    err.line(cx, format_args!("blaze: {count} packs of an older store format ({bytes} bytes) are not read by this blaze, under the home's {folder}"))?;
                 }
                 machines[at] = Some(store);
             }

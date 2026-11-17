@@ -16,6 +16,7 @@
 //! | [`symbols`] | the names of placed code where the program's own backtrace looks: one more image of `dl_iterate_phdr`, whose file is a symbol table (Linux) |
 //! | [`unwind`] | a placed function's unwind entry, told to the system's unwinder and taken back when the body is freed |
 //! | [`retired`] | code given back and made inaccessible: an append-only table a fault handler reads without a lock, and the stop line it writes |
+//! | [`sample`] | heat by sampling (D100 point 4): macOS stops one program thread at a time from the control thread (`thread_suspend`, `thread_get_state`), Linux a per-thread CPU timer's signal; one `SampleEntry` each into a fixed ring, the frame record read only inside the thread's stack bounds |
 //! | [`waits`] | which thread waits for what since when, a seqlocked row per thread in the region the monitor reads: why a run hangs |
 //! | [`zygote`] | `blaze test`'s system calls: the zygote forks one child per test (one thread at each fork, counted), a child's setup steps and its report on descriptor 3, the pipes polled and children reaped under each test's deadline; the decisions are blaze-run's `zygote` and `child` machines |
 //!
@@ -57,12 +58,16 @@ pub mod fault;
 pub mod observe;
 pub mod records;
 pub mod retired;
+pub mod run_mode;
+pub mod sample;
 pub mod symbols;
 pub mod sys;
 pub mod table;
 pub mod threads;
 pub mod tls;
+pub mod jit_debug;
 pub mod unwind;
+pub mod unwind_reg;
 pub mod waits;
 pub mod zygote;
 

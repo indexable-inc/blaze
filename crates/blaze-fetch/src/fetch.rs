@@ -6,6 +6,15 @@
 //!
 //! 1. [`Effect::Lookup`]: does the store hold its key? Held, it is [`Outcome::Present`] and
 //!    nothing is asked (a second run fetches nothing).
+//!
+//!    A crate not held: [`Effect::Local`], the machine's own local step (fetch.md, "End state:
+//!    dependencies on the command path", place 2, piece 7): does another tool on this machine
+//!    hold its `.crate` (cargo's `registry/cache`)? The bytes found are adopted only through
+//!    [`local::adopt_in`] (their SHA-256 against the lock's before one is inflated), into the
+//!    record and key the network makes ([`Outcome::Fetched`] with `down` 0,
+//!    [`Machine::adopted`]); absent, unreadable or refused, the try is kept
+//!    ([`Machine::tried`]) and the unit goes on to the next place in the order, HTTPS. That is
+//!    the order's next place, not a retry: the place that refused is never asked again.
 //! 2. [`Effect::Http`]: a crate's `.crate` from crates.io's static host; for a git commit, the
 //!    advertisement (`info/refs`, protocol v2), then a `fetch` of the commit at depth 1. At most
 //!    [`Limits::in_flight_most`] at once, each with a byte limit and a deadline. A request
@@ -31,7 +40,8 @@ use blaze_ids::ContentId;
 use blaze_own::{Alloc, String, Vec, VecDeque};
 use blaze_text::{Put, Show, Writes as _};
 
-use crate::pack::Fixed;
+use crate::local::{self, AdoptRefused, Miss, Try};
+use crate::pack::{Fixed, Sink};
 use crate::plan::Unit;
 use crate::unpack::{self, Made, UnpackError};
 use crate::{Plant, planted};
@@ -141,6 +151,73 @@ pub enum Effect<'a> {
     /// given for `unit`: answer with [`Machine::reserved`], then finish the reservation at the
     /// length it gives (or abandon it at `None`), then [`Machine::stored`].
     Reserve { unit: u32, key: ContentId, room: u64 },
+    /// Whether this machine holds crate `unit`'s `.crate` in another tool's cache
+    /// ([`crate::FetchIo::local_archive`]): answer with [`Machine::local_found`], and when it
+    /// gives [`Adopt::Reserve`], reserve as for [`Effect::Reserve`], writing with
+    /// [`Machine::adopt_into`]. Asked only for a [`Unit::Crate`] the store does not hold, once,
+    /// before any HTTP for it.
+    Local { unit: u32 },
+}
+
+/// The answer to [`Effect::Local`]: what the driver's IO found of a crate's archive on this
+/// machine. The bytes of [`LocalArchive::Found`] are given beside it, and are believed of
+/// nothing: the lock's SHA-256 decides.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LocalArchive {
+    /// No place on the machine holds a file of that name.
+    Absent,
+    /// A file was read whole into the buffer the IO was given.
+    Found,
+    /// A file is there and could not be read (`why`: permissions, an IO error, past the IO's
+    /// own bound): the try is named, and the unit goes on to HTTPS.
+    Unreadable { why: &'static str },
+}
+
+/// What the driver does after [`Machine::local_found`].
+#[must_use]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Adopt {
+    /// Nothing more for this answer: the record is queued ([`Effect::Put`]) or the unit is on its
+    /// way to HTTPS (the next [`Machine::poll`] says).
+    Done,
+    /// Reserve `room` bytes in place at `key` for the unit, now, while the archive's bytes are
+    /// still the driver's, and write them with [`Machine::adopt_into`]; then finish, abandon or
+    /// answer [`Machine::stored`] as for [`Effect::Reserve`].
+    Reserve { key: ContentId, room: u64 },
+}
+
+/// A bug planted in the local step by a test, to show its oracle catches it: only ever in this
+/// crate's tests.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LocalPlant {
+    None,
+    /// A found archive is made into a record without its SHA-256 compared to the lock's.
+    AdoptBeforeChecksum,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LOCAL_PLANT: core::cell::Cell<LocalPlant> = const { core::cell::Cell::new(LocalPlant::None) };
+}
+
+/// Whether `plant` is planted: only ever in this crate's tests.
+#[cfg(test)]
+fn local_planted(plant: LocalPlant) -> bool {
+    LOCAL_PLANT.get() == plant
+}
+
+/// Whether `plant` is planted: never, outside tests.
+#[cfg(not(test))]
+#[inline(always)]
+fn local_planted(_plant: LocalPlant) -> bool {
+    false
+}
+
+/// One local try of a unit: what the place gave, and an unreadable file's reason.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct LocalTry {
+    miss: Miss,
+    why: Option<&'static str>,
 }
 
 /// An answer to [`Effect::Http`].
@@ -261,6 +338,11 @@ enum Phase {
     /// Wanted, its lookup not yet asked.
     Wanted,
     Looking,
+    /// Not held: the driver is asked for a local archive ([`Effect::Local`]).
+    Local,
+    /// A local archive found and a reservation asked for its record ([`Adopt::Reserve`]): the
+    /// driver keeps the archive's bytes until [`Machine::adopt_into`].
+    Adopting,
     Ready(Step),
     Asked { step: Step, seq: u32, deadline: u64 },
     Backoff { step: Step, until: u64 },
@@ -281,6 +363,8 @@ struct State {
     most: u64,
     /// Bytes of the record made and not yet stored.
     held: u64,
+    /// The record was made from an archive found on the machine, not downloaded.
+    adopted: bool,
 }
 
 /// The machine: see the module.
@@ -291,6 +375,10 @@ pub struct Machine<'p, 'l, 'a> {
     limits: Limits,
     /// Units wanted and not yet looked up, in the order wanted.
     lookups: VecDeque<u32, Alloc<'a>>,
+    /// Crates not held, their local archive not yet asked for, in order.
+    locals: VecDeque<u32, Alloc<'a>>,
+    /// A unit's local try, once its local step gave nothing adopted.
+    tried: Vec<Option<LocalTry>, Alloc<'a>>,
     ready: VecDeque<u32, Alloc<'a>>,
     asked: Vec<u32, Alloc<'a>>,
     waiting: Vec<u32, Alloc<'a>>,
@@ -321,9 +409,11 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
     pub fn wanting(units: &'p [Unit<'l, 'a>], limits: Limits, alloc: Alloc<'a>) -> Machine<'p, 'l, 'a> {
         let mut states = Vec::with_capacity_in(units.len(), alloc);
         let mut outcomes = Vec::with_capacity_in(units.len(), alloc);
+        let mut tried = Vec::with_capacity_in(units.len(), alloc);
         for _ in units {
-            states.push(State { phase: Phase::Idle, tries: 0, seq: 0, down: 0, most: 0, held: 0 });
+            states.push(State { phase: Phase::Idle, tries: 0, seq: 0, down: 0, most: 0, held: 0, adopted: false });
             outcomes.push(Outcome::Pending);
+            tried.push(None);
         }
         Machine {
             units,
@@ -331,6 +421,8 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
             outcomes,
             limits,
             lookups: VecDeque::new_in(alloc),
+            locals: VecDeque::new_in(alloc),
+            tried,
             ready: VecDeque::new_in(alloc),
             asked: Vec::new_in(alloc),
             waiting: Vec::new_in(alloc),
@@ -351,6 +443,9 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
         if let Some(unit) = self.lookups.pop_front() {
             self.states[unit as usize].phase = Phase::Looking;
             return Some(Effect::Lookup { unit, key: self.units[unit as usize].key() });
+        }
+        if let Some(unit) = self.locals.pop_front() {
+            return Some(Effect::Local { unit });
         }
         if let Some((unit, key, record)) = self.puts.pop_front() {
             return Some(Effect::Put { unit, key, record });
@@ -419,12 +514,150 @@ impl<'p, 'l, 'a> Machine<'p, 'l, 'a> {
             self.finish(unit, Outcome::Present);
             return;
         }
-        let step = match self.units[unit as usize] {
-            Unit::Crate { .. } => Step::Crate,
-            Unit::Git { .. } => Step::Advert,
+        match self.units[unit as usize] {
+            // The order's second place before the network: this machine's archives.
+            Unit::Crate { .. } => {
+                self.states[unit as usize].phase = Phase::Local;
+                self.locals.push_back(unit);
+            }
+            Unit::Git { .. } => {
+                self.states[unit as usize].phase = Phase::Ready(Step::Advert);
+                self.ready.push_back(unit);
+            }
+        }
+    }
+
+    /// The unit `unit` names: what [`Effect::Local`]'s driver looks for.
+    pub fn unit(&self, unit: u32) -> &'p Unit<'l, 'a> {
+        &self.units[unit as usize]
+    }
+
+    /// The allocator the machine's buffers come from: a driver's buffer for a local archive is
+    /// made in it.
+    pub fn alloc(&self) -> Alloc<'a> {
+        self.alloc
+    }
+
+    /// The answer to [`Effect::Local`] for `unit`: `found`, and with [`LocalArchive::Found`]
+    /// the archive's whole bytes. Found bytes are adopted only through [`local::adopt_in`] (the
+    /// lock's SHA-256 first); a small record is queued as [`Effect::Put`], a large one asks the
+    /// driver to reserve it now ([`Adopt::Reserve`]). Absent, unreadable or refused, the try is
+    /// kept ([`Machine::tried`]) and the unit goes on to HTTPS.
+    pub fn local_found(&mut self, unit: u32, found: LocalArchive, archive: &[u8]) -> Adopt {
+        let Some(state) = self.states.get(unit as usize).copied() else { return Adopt::Done };
+        if state.phase != Phase::Local {
+            self.stale += 1;
+            return Adopt::Done;
+        }
+        match found {
+            LocalArchive::Absent => self.to_network(unit, Miss::Absent, None),
+            LocalArchive::Unreadable { why } => self.to_network(unit, Miss::Unreadable, Some(why)),
+            LocalArchive::Found => {
+                let room = unpack::crate_room(archive, &self.limits.unpack);
+                if room.stated >= self.limits.reserve_from {
+                    // Made in place: the archive's bytes, still the driver's, are held against
+                    // the budget until `adopt_into`.
+                    let key = self.units[unit as usize].key();
+                    let body = archive.len() as u64;
+                    self.hold(body);
+                    let state = &mut self.states[unit as usize];
+                    state.held = body;
+                    state.phase = Phase::Adopting;
+                    return Adopt::Reserve { key, room: room.most };
+                }
+                match self.adopt(unit, archive, Vec::new_in(self.alloc)) {
+                    Ok((record, made)) => {
+                        let key = self.units[unit as usize].key();
+                        self.hold(record.len() as u64);
+                        let state = &mut self.states[unit as usize];
+                        state.held = record.len() as u64;
+                        state.adopted = true;
+                        state.phase = Phase::Storing(made);
+                        self.puts.push_back((unit, key, record));
+                    }
+                    Err(refused) => self.to_network(unit, Miss::Refused(refused), None),
+                }
+            }
+        }
+        Adopt::Done
+    }
+
+    /// The reservation [`Adopt::Reserve`] asked for `unit`, or why the store made none, with
+    /// `archive`, the bytes the driver kept from [`Effect::Local`]. They are adopted into the
+    /// reservation's bytes only through [`local::adopt_in`]: `Some(len)` is the length to
+    /// finish it at, then answer [`Machine::stored`]; `None`, the reservation is abandoned and
+    /// the unit failed (the store's [`Why`]), went on to HTTPS (the archive refused, the try
+    /// kept), or the call was stale.
+    pub fn adopt_into(&mut self, unit: u32, archive: &[u8], room: Result<&mut [u8], StoreFailure>) -> Option<u64> {
+        let state = self.states.get(unit as usize).copied()?;
+        if state.phase != Phase::Adopting {
+            self.stale += 1;
+            return None;
+        }
+        self.in_flight -= state.held;
+        self.states[unit as usize].held = 0;
+        let room = match room {
+            Ok(room) => room,
+            Err(failure) => {
+                self.fail(unit, Why::Store(failure));
+                return None;
+            }
         };
-        self.states[unit as usize].phase = Phase::Ready(step);
+        match self.adopt(unit, archive, Fixed::new(room)) {
+            Ok((out, made)) => {
+                let len = out.written();
+                self.hold(len);
+                let state = &mut self.states[unit as usize];
+                state.held = len;
+                state.adopted = true;
+                state.phase = Phase::Storing(made);
+                Some(len)
+            }
+            Err(refused) => {
+                self.to_network(unit, Miss::Refused(refused), None);
+                None
+            }
+        }
+    }
+
+    /// `unit`'s record made from `archive`, found on this machine, into `out`: by
+    /// [`local::adopt_in`] alone, which compares its SHA-256 with the lock's before a byte is
+    /// inflated.
+    fn adopt<S: Sink>(&self, unit: u32, archive: &[u8], out: S) -> Result<(S, Made), AdoptRefused> {
+        let unit = &self.units[unit as usize];
+        if local_planted(LocalPlant::AdoptBeforeChecksum) {
+            let Unit::Crate { name, version, sha256, .. } = unit else { return Err(AdoptRefused::NotACrate) };
+            return unpack::crate_record_in(name, version.as_str(), *sha256, archive, &self.limits.unpack, out, self.alloc)
+                .map_err(AdoptRefused::Unpack);
+        }
+        local::adopt_in(unit, archive, &self.limits.unpack, out, self.alloc)
+    }
+
+    /// The local step gave nothing adopted: the try is kept and `unit` goes on to the order's
+    /// next place, the registry over HTTPS (never this place again).
+    fn to_network(&mut self, unit: u32, miss: Miss, why: Option<&'static str>) {
+        self.tried[unit as usize] = Some(LocalTry { miss, why });
+        self.states[unit as usize].phase = Phase::Ready(Step::Crate);
         self.ready.push_back(unit);
+    }
+
+    /// What the local step gave `unit` when it adopted nothing, as one try of the finding that
+    /// names every place ([`local::Tried`]); `None` when it was not asked or adopted.
+    pub fn tried(&self, unit: u32) -> Option<Try<'static>> {
+        let tried = self.tried.get(unit as usize)?.as_ref()?;
+        Some(Try { place: local::CARGO_CACHE, miss: tried.miss.clone() })
+    }
+
+    /// Why `unit`'s local archive could not be read ([`LocalArchive::Unreadable`]), as the IO
+    /// said.
+    pub fn unreadable(&self, unit: u32) -> Option<&'static str> {
+        self.tried.get(unit as usize)?.as_ref()?.why
+    }
+
+    /// Whether `unit`'s record was made from an archive found on this machine (its outcome is
+    /// [`Outcome::Fetched`] with `down` 0) rather than downloaded.
+    pub fn adopted(&self, unit: u32) -> bool {
+        self.states.get(unit as usize).is_some_and(|state| state.adopted)
     }
 
     /// The answer to `ask`, at `now`.

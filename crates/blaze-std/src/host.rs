@@ -15,6 +15,10 @@ use crate::{
     procs::Procs,
 };
 
+/// Another program's linker id from its file's first bytes (`rt::image`): the roster's test that
+/// the file at an entry's path is still the binary it names (remote-read.md section 3).
+pub use crate::rt::image::build_id_in;
+
 /// What a native world offers: everything its target's driver has an effect for
 /// ([`Offers::NATIVE`]). The wasi driver keeps no sockets (blaze-core's `threads` driver runs
 /// them on unix only), so there `net` is `None`.
@@ -31,6 +35,10 @@ pub struct HostFacts {
     pub born: Born,
     /// The running image's linker id; `None` when it was linked without one.
     pub build_id: Option<BuildId>,
+    /// The running program's own file, as the kernel names it (macOS `_NSGetExecutablePath`,
+    /// Linux `/proc/self/exe`); `None` when the host cannot say. The roster (blaze-cli
+    /// roster.rs, remote-read.md section 3) keys a binary's entry by it.
+    pub exe: Option<Arc<str>>,
 }
 
 /// This program's identity: the id its linker wrote into the running image from the image's
@@ -101,6 +109,8 @@ impl HostFacts {
             name: Arc::from("sim"),
             born: Born::Before(Duration::ZERO),
             build_id: BuildId::of(b"bstd simulated!!"),
+            // alloc: once per simulated world, its program's path.
+            exe: Some(Arc::from("/sim/bin/blaze")),
         }
     }
 }
@@ -144,6 +154,12 @@ impl Host {
         self.io.host_facts(|facts| facts.build_id).ok_or(NoBuildId)
     }
 
+    /// The running program's own file ([`HostFacts::exe`]). A host that cannot name it is
+    /// refused by name, never guessed from `argv[0]` (rule 3).
+    pub fn exe(&self) -> Result<Arc<str>, Missing> {
+        self.io.host_facts(|facts| facts.exe.as_ref().map(Arc::clone)).ok_or(Missing { capability: "exe" })
+    }
+
     /// Other processes, if the host offers them (the simulation does): its own entry of
     /// [`Offers`], apart from this process's own facts and exit.
     pub fn procs(&self) -> Option<Procs> {
@@ -160,6 +176,19 @@ impl Host {
     /// the unwind on rather than failing a task with it.
     pub fn exit(&self, status: i32) -> ! {
         self.io.exit(status)
+    }
+
+    /// The authority to start child processes linked to this one ([`crate::procs::Spawner`]):
+    /// a native world's on Linux and macOS; the simulation has none, refused by name.
+    #[cfg(unix)]
+    pub fn spawner(&self) -> Result<crate::procs::Spawner, Missing> {
+        crate::procs::Spawner::of(&self.io)
+    }
+
+    /// No child processes are started on this system: refused by name.
+    #[cfg(not(unix))]
+    pub fn spawner(&self) -> Result<core::convert::Infallible, Missing> {
+        Err(Missing { capability: "spawner" })
     }
 }
 

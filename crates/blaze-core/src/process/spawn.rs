@@ -56,6 +56,27 @@ pub(super) fn spawn(
     input: bool,
     procs: Option<&CStr>,
 ) -> io::Result<Spawned> {
+    spawn_with(program, input, procs, &[], false)
+}
+
+/// As [`spawn`], and besides: each `(source, target)` of `extra` is the child's descriptor
+/// `target`, a copy of the parent's `source` (`dup2` in the child, after its standard ones),
+/// and with `group` the child leads a process group of its own (`setpgid(0, 0)` before its
+/// program runs), whose id is its pid, so that one signal reaches it and all it starts.
+///
+/// The caller ([`super::linked`]) makes every `source` distinct from every `target` and past
+/// all of them and 2, and every `target` past 2 and distinct: then no copy lands on a
+/// descriptor a later copy still reads, and none on a standard one. Both are true when this
+/// returns: the group is made before the program runs (Linux: in the child, which the parent
+/// waits for, CLONE_VFORK; macOS: by `posix_spawn` itself, `POSIX_SPAWN_SETPGROUP`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn spawn_with(
+    program: &Program<'_>,
+    input: bool,
+    procs: Option<&CStr>,
+    extra: &[(RawFd, RawFd)],
+    group: bool,
+) -> io::Result<Spawned> {
     let plan = Plan::new(program)?;
     let (stdin_child, stdin) = match input {
         true => {
@@ -72,15 +93,39 @@ pub(super) fn spawn(
     {
         let procs = procs.map(|path| open(path, libc::O_WRONLY)).transpose()?;
         let joins = procs.as_ref().map_or(-1, |it| it.as_raw_fd());
-        let (pid, pidfd) = while_busy(|| clone(&plan, fds, joins))?;
+        let (pid, pidfd) = while_busy(|| clone(&plan, fds, joins, extra, group))?;
         Ok(Spawned { pid, pidfd, stdin, stdout, stderr })
     }
     #[cfg(target_os = "macos")]
     {
         debug_assert!(procs.is_none(), "no cgroups on macOS");
-        let pid = posix_spawn(&plan, fds)?;
+        let pid = posix_spawn(&plan, fds, extra, group)?;
         Ok(Spawned { pid, stdin, stdout, stderr })
     }
+}
+
+/// No descriptor beyond the standard three, and no group, can be given through std's spawn on
+/// this system: refused by name; with neither asked, [`spawn`].
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(super) fn spawn_with(
+    program: &Program<'_>,
+    input: bool,
+    procs: Option<&std::ffi::CStr>,
+    extra: &[(std::os::fd::RawFd, std::os::fd::RawFd)],
+    group: bool,
+) -> io::Result<Spawned> {
+    if !extra.is_empty() || group {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            // alloc: an error path.
+            format!(
+                "{}: an inherited descriptor or a process group of its own is given only on \
+                 Linux and macOS",
+                program.program.display()
+            ),
+        ));
+    }
+    spawn(program, input, procs)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -317,20 +362,31 @@ struct Child<'a> {
     fds: [RawFd; 3],
     /// `cgroup.procs` of its cgroup, or -1.
     procs: RawFd,
+    /// Each `(source, target)`: the parent's `source` copied onto the child's `target`
+    /// ([`spawn_with`] says why no copy overwrites a later one's source).
+    extra: &'a [(RawFd, RawFd)],
+    /// Whether it leads a process group of its own.
+    group: bool,
     /// The step that failed (0: none) and its errno.
     step: u8,
     failed: libc::c_int,
 }
 
 #[cfg(target_os = "linux")]
-fn clone(plan: &Plan, fds: [RawFd; 3], procs: RawFd) -> io::Result<(libc::pid_t, OwnedFd)> {
+fn clone(
+    plan: &Plan,
+    fds: [RawFd; 3],
+    procs: RawFd,
+    extra: &[(RawFd, RawFd)],
+    group: bool,
+) -> io::Result<(libc::pid_t, OwnedFd)> {
     blaze_mem::scratch::with_bytes(|stack| {
         // alloc: once per thread that spawns, kept: the child's stack, its room unwritten.
         stack.reserve(STACK);
         // SAFETY: `reserve` made the capacity at least `STACK` bytes, so `STACK` bytes from
         // `as_mut_ptr()` are in the allocation, and the thread's byte buffer is lent to this
         // closure alone until it returns, after `clone_on` has.
-        unsafe { clone_on(stack.as_mut_ptr(), plan, fds, procs) }
+        unsafe { clone_on(stack.as_mut_ptr(), plan, fds, procs, extra, group) }
     })
 }
 
@@ -346,10 +402,12 @@ unsafe fn clone_on(
     plan: &Plan,
     fds: [RawFd; 3],
     procs: RawFd,
+    extra: &[(RawFd, RawFd)],
+    group: bool,
 ) -> io::Result<(libc::pid_t, OwnedFd)> {
     // It grows down from its end, which both ABIs (x86-64, AArch64) want on 16 bytes.
     let top = stack.wrapping_add(STACK).map_addr(|it| it & !15);
-    let mut child = Child { plan, fds, procs, step: 0, failed: 0 };
+    let mut child = Child { plan, fds, procs, extra, group, step: 0, failed: 0 };
     let mut pidfd: libc::c_int = -1;
     // SAFETY: all zeros is a valid `sigset_t`; the calls below fill it.
     let mut all: libc::sigset_t = unsafe { std::mem::zeroed() };
@@ -397,6 +455,8 @@ unsafe fn clone_on(
         1 => "giving it its input and output",
         2 => "putting it in its cgroup",
         3 => "changing to its directory",
+        5 => "making it the leader of a process group of its own",
+        6 => "giving it its inherited descriptors",
         _ => "running its program",
     };
     let error = io::Error::from_raw_os_error(failed);
@@ -411,7 +471,7 @@ unsafe fn clone_on(
 /// another thread of the daemon may hold any lock (the allocator's, stdio's, the C library's).
 /// So every call it makes is async-signal-safe (POSIX.1-2017 section 2.4.3, the functions
 /// allowed after `fork` in a multithreaded process): `sigaction`, `sigemptyset`,
-/// `sigprocmask`, `dup2`, `write`, `chdir`, `execve`, `_exit`; and `__errno_location`, which
+/// `sigprocmask`, `setpgid`, `dup2`, `write`, `chdir`, `execve`, `_exit`; and `__errno_location`, which
 /// only returns this thread's TLS address. Each is a thin wrapper of one system call in glibc
 /// and musl, taking no lock. The rest is plain loads and stores into `Child`, the stack
 /// (`mem::zeroed` structs, stores or a `memset`, async-signal-safe since POSIX.1-2016), and
@@ -464,11 +524,29 @@ extern "C" fn run(arg: *mut libc::c_void) -> libc::c_int {
     // SAFETY: a `sigset_t` to read; every handler is the default now, so an unblocked signal
     // runs nothing of the daemon's. Async-signal-safe.
     unsafe { libc::sigprocmask(libc::SIG_SETMASK, &none, ptr::null_mut()) };
+    // A group of its own, made before its program runs, so the parent (waiting, CLONE_VFORK)
+    // can signal the group the moment `clone` returns.
+    // SAFETY: no pointers; this process's own group set to its pid. Async-signal-safe
+    // (POSIX.1-2017 section 2.4.3 lists `setpgid`).
+    if child.group && unsafe { libc::setpgid(0, 0) } != 0 {
+        fail(child, 5);
+    }
     for (target, fd) in (0..).zip(child.fds) {
         // SAFETY: an open descriptor past 2 onto one of 0, 1 and 2; the copy keeps no
         // close-on-exec. Async-signal-safe.
         if unsafe { libc::dup2(fd, target) } < 0 {
             fail(child, 1);
+        }
+    }
+    // After the standard three, so none of these lands on a descriptor they still read; each
+    // source is past every target (`spawn_with`), so none lands on a later one's source.
+    for &(source, target) in child.extra {
+        // SAFETY: an open descriptor of the parent's (shared table until exec: CLONE_VM
+        // without CLONE_FILES copies the table, so this changes the child's alone) onto
+        // `target`, past 2; the copy keeps no close-on-exec. Async-signal-safe. The slice is
+        // the parent's, which nothing writes while it waits.
+        if unsafe { libc::dup2(source, target) } < 0 {
+            fail(child, 6);
         }
     }
     // SAFETY: one byte from a static, to an open descriptor. Async-signal-safe.
@@ -486,16 +564,32 @@ extern "C" fn run(arg: *mut libc::c_void) -> libc::c_int {
     fail(child, 4)
 }
 
+/// `extra` and `group` as [`spawn_with`] says: one `posix_spawn_file_actions_adddup2` per
+/// extra, after the standard three (under `CLOEXEC_DEFAULT` a descriptor a file action gives is
+/// the one kept open), and `POSIX_SPAWN_SETPGROUP` with group 0, the child's own pid.
 #[cfg(target_os = "macos")]
-fn posix_spawn(plan: &Plan, fds: [RawFd; 3]) -> io::Result<libc::pid_t> {
+fn posix_spawn(
+    plan: &Plan,
+    fds: [RawFd; 3],
+    extra: &[(RawFd, RawFd)],
+    group: bool,
+) -> io::Result<libc::pid_t> {
     unsafe extern "C" {
         fn posix_spawn_file_actions_addchdir_np(
             actions: *mut libc::posix_spawn_file_actions_t,
             path: *const libc::c_char,
         ) -> libc::c_int;
+        // Declared here rather than taken from libc, whose Apple bindings may lack it; the
+        // symbol is POSIX's and in libSystem (spawn.h).
+        fn posix_spawnattr_setpgroup(
+            attr: *mut libc::posix_spawnattr_t,
+            pgroup: libc::pid_t,
+        ) -> libc::c_int;
     }
     /// Every descriptor not given by a file action is closed in the child (Apple's).
     const CLOEXEC_DEFAULT: libc::c_short = 0x4000;
+    /// The group of `posix_spawnattr_setpgroup` is set before the program runs (spawn.h).
+    const SETPGROUP: libc::c_short = 0x0002;
     let check = |code: libc::c_int| match code {
         0 => Ok(()),
         _ => Err(io::Error::from_raw_os_error(code)),
@@ -515,6 +609,15 @@ fn posix_spawn(plan: &Plan, fds: [RawFd; 3]) -> io::Result<libc::pid_t> {
             // SAFETY: made above; an open descriptor onto one of 0, 1 and 2.
             check(unsafe { libc::posix_spawn_file_actions_adddup2(&mut actions, fd, target) })?;
         }
+        for &(source, target) in extra {
+            // SAFETY: made above; an open descriptor onto a target past 2 that no later action
+            // reads (`spawn_with`).
+            check(unsafe { libc::posix_spawn_file_actions_adddup2(&mut actions, source, target) })?;
+        }
+        if group {
+            // SAFETY: made above; group 0 is the child's own pid.
+            check(unsafe { posix_spawnattr_setpgroup(&mut attr, 0) })?;
+        }
         // SAFETY: made above; a NUL-terminated path kept until the spawn.
         check(unsafe { posix_spawn_file_actions_addchdir_np(&mut actions, plan.dir) })?;
         // SIGPIPE, which std ignores in the daemon, back to its default in the child, and the
@@ -529,7 +632,8 @@ fn posix_spawn(plan: &Plan, fds: [RawFd; 3]) -> io::Result<libc::pid_t> {
         check(unsafe { libc::posix_spawnattr_setsigmask(&mut attr, &none) })?;
         let flags = CLOEXEC_DEFAULT
             | libc::POSIX_SPAWN_SETSIGDEF as libc::c_short
-            | libc::POSIX_SPAWN_SETSIGMASK as libc::c_short;
+            | libc::POSIX_SPAWN_SETSIGMASK as libc::c_short
+            | if group { SETPGROUP } else { 0 };
         // SAFETY: made above.
         check(unsafe { libc::posix_spawnattr_setflags(&mut attr, flags) })?;
         let mut pid = 0;

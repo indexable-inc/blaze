@@ -446,3 +446,47 @@ fn the_world_resolves() {
     let errors: usize = c.done.values().map(|r| r.scope.errors.len()).sum();
     assert_eq!(errors, 0, "app's imports all resolve");
 }
+
+/// D96 P1: a dependency's scope and items records are a function of the dependency, not of the
+/// workspace using it. The second workspace has no proc macro (derive_it is a plain library
+/// there), so it keeps one toolchain crate fewer (`proc_macro`): bstd and every fetched package
+/// sit at another tree number. The same crate under the same key must still write byte-equal
+/// names and items records (before D96 the items record's file rows held `/<tree>/...`).
+/// Prints `D96 P1: <n> crates' records equal in two workspaces`.
+#[test]
+fn a_dependencys_records_are_equal_in_two_workspaces() {
+    let first = made(&IN_ORDER, None);
+    let lock = lock();
+    let mut units = graph(lock, &IN_ORDER).units.clone();
+    units[3].kind = UnitKind::Lib;
+    units[3].for_host = false;
+    // A target-side library depends on the target's helper, not the host's.
+    units[3].deps[0].unit = UnitId(8);
+    let other: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(g()), resolver: Resolver::V2 }));
+    let tc = toolchain(needs(other));
+    let mut store = store(lock);
+    let second = world(other, lock, tc, &mut store, checkout(), None, g()).unwrap_or_else(|e| panic!("{e}"));
+    assert_ne!(first.toolchain_crates, second.toolchain_crates, "the two workspaces keep the same toolchain crates");
+
+    let (a_inputs, b_inputs) = (first.inputs(g()), second.inputs(g()));
+    let a = first.resolve(&a_inputs, &Serial, g()).unwrap_or_else(|e| panic!("{e}"));
+    let b = second.resolve(&b_inputs, &Serial, g()).unwrap_or_else(|e| panic!("{e}"));
+    let mut equal = 0;
+    for name in ["util", "testkit", "bstd", "std", "core"] {
+        let at = |w: &World<'static>| w.crates.iter().position(|c| c.input.name == name).unwrap_or_else(|| panic!("no crate `{name}`"));
+        let (i, j) = (at(&first), at(&second));
+        assert_eq!(first.crates[i].input.key, second.crates[j].input.key, "`{name}`: another key");
+        let (x, y) = (a.krate(i), b.krate(j));
+        let names = |n| blaze_scope::names_record::encode(n, g()).unwrap_or_else(|e| panic!("`{name}`'s names record: {e:?}"));
+        let items = |n| blaze_scope::items_record::encode(n, g()).unwrap_or_else(|e| panic!("`{name}`'s items record: {e:?}"));
+        assert!(names(x).as_slice() == names(y).as_slice(), "`{name}`: the names records differ between the two workspaces");
+        assert!(
+            items(x).as_slice() == items(y).as_slice(),
+            "`{name}`: the items records differ between the two workspaces (its files at {:?} and {:?})",
+            first.crates[i].input.root,
+            second.crates[j].input.root
+        );
+        equal += 1;
+    }
+    std::println!("D96 P1: {equal} crates' records equal in two workspaces");
+}

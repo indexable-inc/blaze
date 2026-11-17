@@ -27,7 +27,7 @@ use blaze_ladder::front2::Front2;
 use blaze_ladder::front2::body::{BodyError, lower_fn, lower_member};
 use blaze_ladder::front2::check::{BuildOrder, Records, answer_impls, check_body, eval_len};
 use blaze_ladder::front2::consts::Consts;
-use blaze_ladder::front2::heads::{HeadError, Store, Want};
+use blaze_ladder::front2::heads::{HeadError, Store, Want, member_fn_want};
 use blaze_ladder::front2::keys::{MemberKind, Origin, checker_of};
 use blaze_ladder::front2::spell::Spelling;
 use blaze_ladder::front2::types::Why;
@@ -159,7 +159,7 @@ fn ensure_one(r: &mut Records<'_, '_>, w: Want) -> bool {
 fn gather(r: &mut Records<'_, '_>, owner: tc::ItemKey, c: &tc::Checked<'_>, copy: Option<tc::ItemKey>, drop: Option<tc::ItemKey>, boxk: Option<tc::ItemKey>) -> Gathered {
     let mut g = Gathered::default();
     let mut adts: BTreeSet<u128> = BTreeSet::new();
-    for n in c.types.view().nodes {
+    for n in c.types.view().nodes() {
         if let tc::PNode::Adt(k, _) = n {
             adts.insert(k.0);
         }
@@ -214,6 +214,10 @@ fn gather(r: &mut Records<'_, '_>, owner: tc::ItemKey, c: &tc::Checked<'_>, copy
                         && !container_head(r, lib, false)
                     {
                         container_head(r, lib, true);
+                    }
+                    // An impl's fn's signature is its own want (heads.rs `Want::MemberFn`).
+                    if let Some(w) = member_fn_want(r.names, &*r.keys, key) {
+                        ensure_one(r, w);
                     }
                 }
                 None => {}
@@ -354,7 +358,7 @@ fn take<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, t: Target<'_>, lan
     };
     let text = r.store.fns.get(&body.owner).map(|f| f.text).or_else(|| r.names.item_text(body.item).map(|t| t.text)).unwrap_or("").to_string();
     let g = gather(r, body.owner, &done, langs.0, langs.1, langs.2);
-    let tview = body.typeck.view(body.tys.view());
+    let tview = body.typeck.view(body.tys.view(&r.store.tys).expect("a body's types over the records' table it was lowered over"));
     let t0 = Instant::now();
     let lowered = lower(&tview, &done, &g, Alloc::global());
     let lower_t = t0.elapsed();

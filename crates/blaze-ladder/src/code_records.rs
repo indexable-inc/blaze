@@ -92,17 +92,20 @@ pub enum PanicStrategy {
 /// The builder's settings that change code.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Settings {
-    pub overflow_checks: bool,
+    /// The profile's `overflow-checks` (D101): the walk of a record run builds with exactly
+    /// this (run.rs `build_records`), so two profiles never share a record.
+    pub overflow_checks: blaze_build::OverflowChecks,
     pub debug_assertions: bool,
     pub panic: PanicStrategy,
 }
 
 impl Settings {
-    /// What the baseline tier builds today: wrapping arithmetic (blaze-build walk.rs `arith`:
-    /// "overflow is not checked in this tier"), no debug assertions, and no unwinding (the
-    /// emitter refuses `Invoke` and `Resume`). A record keyed by other settings is built by
-    /// the same code today: over-keyed, never stale.
-    pub const BASELINE: Settings = Settings { overflow_checks: false, debug_assertions: false, panic: PanicStrategy::Abort };
+    /// What the baseline tier builds at `overflow_checks`: no debug assertions and no unwinding
+    /// (the emitter refuses `Invoke` and `Resume`). A record keyed by other settings of those
+    /// two is built by the same code today: over-keyed, never stale.
+    pub const fn baseline(overflow_checks: blaze_build::OverflowChecks) -> Settings {
+        Settings { overflow_checks, debug_assertions: false, panic: PanicStrategy::Abort }
+    }
 }
 
 /// What every record of one run is built for.
@@ -138,6 +141,8 @@ pub enum KeyPlant {
     None,
     /// The tier left out of the key: a fast and an optimized record would share it.
     WithoutTier,
+    /// The overflow setting left out of the key: a dev and a release record would share it.
+    WithoutOverflow,
 }
 
 /// The key of the code record of `parts` built by `builder`: the eight parts of the module doc,
@@ -166,7 +171,8 @@ pub fn code_key_planted(parts: &KeyParts, builder: &Builder, plant: KeyPlant) ->
         PanicStrategy::Unwind => 0,
         PanicStrategy::Abort => 1,
     };
-    h.part(&[u8::from(s.overflow_checks), u8::from(s.debug_assertions), panic]);
+    let overflow = s.overflow_checks.on() && plant != KeyPlant::WithoutOverflow;
+    h.part(&[u8::from(overflow), u8::from(s.debug_assertions), panic]);
     h.part(&builder.toolchain.0);
     h.part(&ENTRY_FORM.to_le_bytes());
     h.part(&MAGIC);

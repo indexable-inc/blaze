@@ -1,5 +1,7 @@
 //! Every ladder rung of tests/ladder/front2/, and the owner's hello world, through the REAL
-//! command: the built `blaze` binary, started as a process, as a person runs it. The library
+//! command: a RELEASE `blaze` binary, started as a process, as a person runs it. The binary is
+//! the one `BLAZE_RUNGS_BIN` names (a debug `CARGO_BIN_EXE_blaze` takes minutes per
+//! blaze-edition child); unset, the test fails naming the variable and runs nothing. The library
 //! harness (crates/blaze-ladder/tests/ladder_front2.rs) runs the same rungs by calling
 //! blaze-ladder directly; twice on 2026-11-15/16 a stage it proved did not happen through the
 //! command (`blaze check` skipped the stages, and the owner's hello world failed under
@@ -9,7 +11,7 @@
 //!     <name>: PASS (status N, stdout byte-equal)
 //!     <name>: REFUSED: <the command's first error line>
 //!     <name>: WRONG: status N, stdout "..", want status M, stdout ".."
-//!     <name>: HUNG: no answer in 120 s; its process group was killed
+//!     <name>: HUNG: no answer in N s; its process group was killed
 //!     <name>: CRASHED: signal N
 //!
 //! and the last line is the census:
@@ -26,8 +28,9 @@
 //! process group, with an environment built from nothing: `HOME` (a scratch home under the
 //! temporary root, the toolchain's shelf hard-linked in by tests/support's `fresh_home`),
 //! `PATH`, `TERM=dumb`, `LANG=C.UTF-8`. Children run one at a time, so the lines come in the
-//! same order on any machine. A child still running at [`DEADLINE`] has its whole group killed
-//! and is HUNG. No network, no retry, no sleep.
+//! same order on any machine (each child peaks at about 2.3 GB). A child still running at its
+//! deadline ([`HELLO_DEADLINE`], 300 s, for the hello world, run first and cold; [`DEADLINE`],
+//! 120 s, for a rung) has its whole group killed and is HUNG. No network, no retry, no sleep.
 //!
 //! The test FAILS when a program is WRONG, HUNG or CRASHED, or when a program named in
 //! tests/command_rungs.must-pass is not PASS (a name there covers its `(check)` line too).
@@ -38,14 +41,14 @@
 //! `COMMAND_RUNGS_LIST`, of the same form as the harness's `FRONT2_RUNGS_LIST`, names a file the
 //! lines are also written to (the checker scripts keep no test output).
 //!
-//! How a refusal is told from a program's own status (crates/blaze-cli/src/main.rs): `blaze
-//! run`'s status is its program's (`close`: `Command::Run => ran.map(Status)`), and blaze's own
-//! failure is status 1 too (`blaze explain 1`), so the status alone cannot tell them apart.
-//! What does: blaze's words for `run` go to standard error, a failure as one `error: <what>`
-//! line (bstd's exit path, crates/blaze-std/src/rt.rs `error_line`), findings and the closing
-//! line before it; a clean run says nothing there (tests/run_output.rs). So a run whose
-//! standard error holds an `error: ` line, or that ended with status 1 having said anything on
-//! standard error, is REFUSED; the rungs' programs write nothing to standard error.
+//! How a refusal is told from a program's own status (crates/blaze-cli/src/main.rs, D86): when
+//! blaze did not build or start the program, `blaze run` exits 125 (`program::NOT_RUN`) with an
+//! `error: <what>` line on standard error: REFUSED, named by that line. blaze's other failures
+//! (findings, an error before the program) still exit 1 with words on standard error, where a
+//! clean run says nothing (tests/run_output.rs): status 1 with words there is REFUSED too. Any
+//! other status, 101 (the program panicked) among them, is the program's own, and is compared
+//! with `expected`. The one overlap left: a program that writes to standard error and exits 1
+//! reads as refused; no rung does.
 //!
 //! Expected today: every rung REFUSED and `hello-blaze` not PASS until `blaze run` and
 //! `blaze check` use the new front end; the must-pass assertion names it.
@@ -62,9 +65,22 @@ use std::time::Duration;
 use blaze_core::chan::{self, RecvTimeoutError};
 use support::fresh_home;
 
-/// How long one `blaze` child may take before its process group is killed and it is HUNG: a
-/// cold run of a rung is well under a second; a hang is a bug (rule 18), named, never waited out.
+/// How long one rung's `blaze` child may take before its process group is killed and it is
+/// HUNG: a blaze-edition child resolves the toolchain's names (26 to 32 s in release on
+/// 2026-11-16); a hang is a bug (rule 18), named, never waited out.
 const DEADLINE: Duration = Duration::from_secs(120);
+
+/// [`DEADLINE`] for the owner's hello world, run first and cold (a fresh scratch home).
+const HELLO_DEADLINE: Duration = Duration::from_secs(300);
+
+/// The variable naming the prebuilt RELEASE `blaze` this test runs. A debug
+/// `CARGO_BIN_EXE_blaze` takes minutes per blaze-edition child; the test never falls back to
+/// it: unset, the test fails naming this variable and runs nothing.
+const BIN_VAR: &str = "BLAZE_RUNGS_BIN";
+
+/// `blaze run`'s status when blaze itself did not build or start the program (D86,
+/// crates/blaze-cli/src/program.rs `NOT_RUN`), apart from any status the program ends with.
+const NOT_RUN: u8 = 125;
 
 /// How long a child killed at its deadline may take to be reaped: the kill is SIGKILL.
 const REAP: Duration = Duration::from_secs(10);
@@ -109,8 +125,8 @@ enum Ended {
     Exited { status: u8, stdout: Vec<u8>, stderr: Vec<u8> },
     /// A signal ended it before the deadline.
     Signalled { signal: i32 },
-    /// It was running at the deadline; its process group was killed.
-    Hung,
+    /// It was running at its deadline, `after` from its start; its process group was killed.
+    Hung { after: Duration },
 }
 
 /// A program's `expected`: its exit status, then its standard output byte for byte.
@@ -134,7 +150,7 @@ enum Verdict {
     /// The command answered with its own error, this line of it.
     Refused { said: String },
     Wrong(Wrong),
-    Hung,
+    Hung { after: Duration },
     Crashed { signal: i32 },
 }
 
@@ -154,7 +170,7 @@ impl Verdict {
             Verdict::Pass { .. } => Kind::Pass,
             Verdict::Refused { .. } => Kind::Refused,
             Verdict::Wrong(_) => Kind::Wrong,
-            Verdict::Hung => Kind::Hung,
+            Verdict::Hung { .. } => Kind::Hung,
             Verdict::Crashed { .. } => Kind::Crashed,
         }
     }
@@ -174,7 +190,7 @@ impl Verdict {
             Verdict::Wrong(Wrong::HollowCheck { status }) => {
                 format!("{name}: WRONG: status {status}, said {HOLLOW_CHECK:?}: a pass printed over stages that did not run")
             }
-            Verdict::Hung => format!("{name}: HUNG: no answer in {} s; its process group was killed", DEADLINE.as_secs()),
+            Verdict::Hung { after } => format!("{name}: HUNG: no answer in {} s; its process group was killed", after.as_secs()),
             Verdict::Crashed { signal } => format!("{name}: CRASHED: signal {signal}"),
         }
     }
@@ -232,13 +248,14 @@ fn copy_tree(from: &Path, to: &Path) {
 
 /// `blaze <word>` in `dir` as one child leading its own process group, with exactly `HOME`,
 /// `PATH`, `TERM` and `LANG`, no standard input, its outputs to `<logs>/<word>.out` and `.err`.
-/// A waiter thread reaps it; at [`DEADLINE`] the whole group is killed and it is [`Ended::Hung`].
-fn run_blaze(word: Word, dir: &Path, home: &Path, path: &OsStr, logs: &Path) -> Ended {
+/// `blaze` is the release binary [`BIN_VAR`] names. A waiter thread reaps it; at `deadline` the
+/// whole group is killed and it is [`Ended::Hung`].
+fn run_blaze(blaze: &Path, word: Word, dir: &Path, home: &Path, path: &OsStr, logs: &Path, deadline: Duration) -> Ended {
     let out_path = logs.join(format!("{}.out", word.arg()));
     let err_path = logs.join(format!("{}.err", word.arg()));
     let file = |at: &Path| File::create(at).unwrap_or_else(|error| panic!("making {}: {error}", at.display()));
-    #[allow(clippy::disallowed_methods, reason = "the test starts the built `blaze` binary itself, its working directory and whole environment given")]
-    let mut command = Command::new(env!("CARGO_BIN_EXE_blaze"));
+    #[allow(clippy::disallowed_methods, reason = "the test starts the release `blaze` binary itself, its working directory and whole environment given")]
+    let mut command = Command::new(blaze);
     command
         .arg(word.arg())
         .current_dir(dir)
@@ -263,7 +280,7 @@ fn run_blaze(word: Word, dir: &Path, home: &Path, path: &OsStr, logs: &Path) -> 
             }
         })
         .unwrap_or_else(|error| panic!("the waiter thread did not start: {error}"));
-    let status = match got.recv_timeout(DEADLINE) {
+    let status = match got.recv_timeout(deadline) {
         Ok(status) => status,
         Err(RecvTimeoutError::Timeout) => {
             // SAFETY: `kill` takes no pointer. `-pid` names the child's process group
@@ -277,7 +294,7 @@ fn run_blaze(word: Word, dir: &Path, home: &Path, path: &OsStr, logs: &Path) -> 
                 panic!("`blaze {}` in {} was killed at its deadline and not reaped within {REAP:?}: {error:?}", word.arg(), dir.display());
             }
             waiter.join().unwrap_or_else(|_| panic!("the waiter on `blaze {}` panicked", word.arg()));
-            return Ended::Hung;
+            return Ended::Hung { after: deadline };
         }
         Err(RecvTimeoutError::Disconnected) => panic!("the waiter on `blaze {}` in {} ended without its status", word.arg(), dir.display()),
     };
@@ -313,18 +330,22 @@ fn holds(words: &[u8], needle: &str) -> bool {
 }
 
 /// `blaze run`'s verdict: a refusal first (as the harness checks its error first), then the
-/// answer against `want`.
+/// answer against `want`. Read from the status (D86): [`NOT_RUN`] (125) is blaze's refusal to
+/// build or start the program, named by its `error: ` line; status 1 with words on standard
+/// error is blaze's other failures (findings, or an error before the program); any other
+/// status, 101 (the program panicked) among them, is the program's own, compared with `want`.
 fn judge_run(ended: Ended, want: Expected) -> Verdict {
     let (status, stdout, stderr) = match ended {
-        Ended::Hung => return Verdict::Hung,
+        Ended::Hung { after } => return Verdict::Hung { after },
         Ended::Signalled { signal } => return Verdict::Crashed { signal },
         Ended::Exited { status, stdout, stderr } => (status, stdout, stderr),
     };
-    if let Some(said) = error_line(&stderr) {
+    if status == NOT_RUN {
+        let said = error_line(&stderr).or_else(|| first_line(&stderr)).unwrap_or_else(|| format!("exit status {NOT_RUN}, nothing said"));
         return Verdict::Refused { said };
     }
     if status == BLAZE_FAILED
-        && let Some(said) = first_line(&stderr)
+        && let Some(said) = error_line(&stderr).or_else(|| first_line(&stderr))
     {
         return Verdict::Refused { said };
     }
@@ -339,7 +360,7 @@ fn judge_run(ended: Ended, want: Expected) -> Verdict {
 /// else its "NOT checked" line, else its first line.
 fn judge_check(ended: Ended) -> Verdict {
     let (status, stdout, stderr) = match ended {
-        Ended::Hung => return Verdict::Hung,
+        Ended::Hung { after } => return Verdict::Hung { after },
         Ended::Signalled { signal } => return Verdict::Crashed { signal },
         Ended::Exited { status, stdout, stderr } => (status, stdout, stderr),
     };
@@ -388,6 +409,12 @@ fn programs(cli: &Path) -> Vec<(String, PathBuf)> {
 #[test]
 fn every_rung_through_the_command() {
     let cli = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // The release blaze to run, never the debug `CARGO_BIN_EXE_blaze` in its place.
+    let Some(blaze) = std::env::var_os(BIN_VAR) else {
+        panic!("{BIN_VAR} is not set: name a prebuilt RELEASE blaze binary (a debug one passes the deadlines); nothing was run");
+    };
+    let blaze = PathBuf::from(blaze);
+    assert!(blaze.is_file(), "{BIN_VAR}={}: no such file; nothing was run", blaze.display());
     // The scratch home's toolchain is the owner's shelf, hard-linked (read only) by
     // `fresh_home`; without one the command cannot build a blaze edition.
     let owner = std::env::var_os("HOME").expect("HOME, to find the toolchain's shelf a scratch home is given");
@@ -405,9 +432,9 @@ fn every_rung_through_the_command() {
         copy_tree(from, &copy);
         let logs = base.join("logs").join(program);
         std::fs::create_dir_all(&logs).unwrap_or_else(|error| panic!("making {}: {error}", logs.display()));
-        let words: &[Word] = if program == HELLO { &[Word::Run, Word::Check] } else { &[Word::Run] };
+        let (words, deadline): (&[Word], Duration) = if program == HELLO { (&[Word::Run, Word::Check], HELLO_DEADLINE) } else { (&[Word::Run], DEADLINE) };
         for &word in words {
-            let ended = run_blaze(word, &copy, &home, &path, &logs);
+            let ended = run_blaze(&blaze, word, &copy, &home, &path, &logs, deadline);
             let verdict = match word {
                 Word::Run => judge_run(ended, expected(from)),
                 Word::Check => judge_check(ended),

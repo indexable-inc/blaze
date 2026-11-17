@@ -74,6 +74,8 @@ pub enum Refusal<'a> {
     MutableStatic { item: ItemKey },
     /// A call of a fn that is not `const fn`.
     NotConstFn { item: ItemKey },
+    /// A call of a `#[rustc_intrinsic]` fn blaze's intrinsic table does not hold.
+    UnknownIntrinsic { item: ItemKey },
     /// A `bool` that is not 0 or 1, a `char` that is not a scalar value, an enum tag no
     /// variant has: invalid values ("Behavior considered undefined").
     InvalidBool { value: u128 },
@@ -107,6 +109,16 @@ pub enum Refusal<'a> {
     Literal(LitError),
     /// The world has no body, ADT or definition this evaluation reads.
     Missing { what: &'static str, item: ItemKey },
+    /// `needs_drop::<T>()` reached a part of `T` it cannot judge (a type that is not ground,
+    /// an array length that is not a value, a `Drop` impl the solver could not select), named.
+    NeedsDrop { what: &'static str },
+    /// A type of the body holds the projection `<_ as trait_>::name` that no impl answered:
+    /// pending (machine/late.rs), the front end makes the impls and asks again.
+    Projection { trait_: ItemKey, name: blaze_typeck::Name },
+    /// The type of field `field` (its row in the ADT's fields, named `name`) of ADT `adt` has
+    /// no ground form: `projection` is `(trait, associated type)` when a projection no impl
+    /// answered is why; `None` for another grounding refusal (an opaque type not answered).
+    FieldGround { adt: ItemKey, field: u32, name: blaze_typeck::Name, projection: Option<(ItemKey, blaze_typeck::Name)> },
 }
 
 /// A refusal of one constant: the constant, where, and what.
@@ -144,6 +156,7 @@ impl fmt::Display for ConstError<'_> {
             Refusal::WriteToImmutable => write!(f, "a write to immutable memory"),
             Refusal::MutableStatic { item } => write!(f, "a constant reads mutable static {:#x}", item.0),
             Refusal::NotConstFn { item } => write!(f, "a call of {:#x}, which is not a `const fn`", item.0),
+            Refusal::UnknownIntrinsic { item } => write!(f, "a call of {:#x}, an intrinsic blaze's intrinsics table does not hold", item.0),
             Refusal::InvalidBool { value } => write!(f, "{value} is not a valid `bool`"),
             Refusal::InvalidChar { value } => write!(f, "{value:#x} is not a valid `char`"),
             Refusal::InvalidTag { bits } => write!(f, "{bits:#x} is the tag of no variant"),
@@ -178,6 +191,17 @@ impl fmt::Display for ConstError<'_> {
             Refusal::Malformed { what } => write!(f, "a malformed body or record: {what}"),
             Refusal::Literal(e) => write!(f, "a literal with no value: {e:?}"),
             Refusal::Missing { what, item } => write!(f, "the world has no {what} for {:#x}", item.0),
+            Refusal::NeedsDrop { what } => write!(f, "`needs_drop` reached {what} (the Reference, \"Destructors\")"),
+            Refusal::Projection { trait_, name } => {
+                write!(f, "the projection `<_ as {:#x}>::{:#x}` in a type of the body is not normalized", trait_.0, name.0)
+            }
+            Refusal::FieldGround { adt, field, name, projection } => {
+                write!(f, "field {field} (name {:#x}) of ADT {:#x} has no ground form: ", name.0, adt.0)?;
+                match projection {
+                    Some((tr, assoc)) => write!(f, "the projection `<_ as {:#x}>::{:#x}` is not normalized", tr.0, assoc.0),
+                    None => write!(f, "grounding its type was refused"),
+                }
+            }
         }
     }
 }

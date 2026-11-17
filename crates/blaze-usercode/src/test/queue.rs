@@ -1346,7 +1346,7 @@ impl Queue {
         server.listen = Some(listen);
         server.spawn = Some(spawn);
         server.loaded = loaded;
-        effects.push(Effect::Listen { at, tag: listen });
+        effects.push(Effect::Listen { at, options: blaze_core::sockopt::Tcp::DEFAULT, tag: listen });
         effects.push(Effect::Spawn { command: Box::new(command), tag: spawn }); // alloc: setup, once per server: the driver's command owns its parts
     }
 

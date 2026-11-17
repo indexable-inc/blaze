@@ -15,7 +15,7 @@ use blaze_ladder::front2::body::lower_fn;
 use blaze_ladder::front2::check::{BuildOrder, CheckFail, Records, check_body};
 use blaze_ladder::front2::consts::Consts;
 use blaze_ladder::front2::heads::{HeadError, Store};
-use blaze_ladder::front2::reach::{Reached, reach};
+use blaze_ladder::front2::program::walk_report::{Ask, BuildFrom, Receivers, RootRead, Stage, WalkHooks, World, walk};
 use blaze_ladder::front2::types::Why;
 use blaze_ladder::front2::spell::Spelling;
 use blaze_ladder::front2::world_items::Gap;
@@ -160,6 +160,13 @@ fn a_macro_written_member_checks() {
     assert!(clean, "{line}");
 }
 
+/// His main walked by the library's walk (front2/program/walk_report.rs `walk`, which holds
+/// this test's walk since 2026-11-16: the same format strings, moved), with this test's own
+/// lines between the walk's ([`HisMain`]). Prints, with `FRONT2_WORK_LIST` set, the lines the
+/// measurer compares run to run (port27/front2/list-AI.txt): `ORDER: ..`, `his main's
+/// diagnostics: 0 []`, `REACHABLE: N of M reachable functions type-check (his main and ..)`,
+/// its classes, `BUILDS: N of M clean reachable functions' instances (..)`, its classes, then
+/// the ctor and `T::X` rules, the impls and `his main type-checks` or its work list.
 #[test]
 fn his_main_through_the_checker() {
     let start = Instant::now();
@@ -196,21 +203,19 @@ fn his_main_through_the_checker() {
     let ok_shown = ok.map(|k| format!("{k:x}"));
     let in_any = ok.map(|k| names.crates().iter().any(|c| c.tables.enums.values().any(|vs| vs.iter().any(|v| v.key == k))));
     out.push_str(&format!("probe: `Ok` is {ok_shown:?}, in some enums row: {in_any:?}; `Result`'s row: {row_keys:?}\n"));
-    // The walk (front2/program/walk_report.rs, which held no code of its own before: this
-    // test's, moved): his main lowered and checked, `REACHABLE:` and `BUILDS:`; a lowering
-    // that fails is its `WORK LIST (lowering ..)` line and nothing more. This test's own lines
-    // are written between the walk's by [`HisMain`].
+    // The walk: his main lowered and checked, `REACHABLE:` and `BUILDS:`; a lowering that fails
+    // is its `WORK LIST (lowering ..)` line and nothing more (the walk returns before any hook).
     let prepared = Prepares::new_in(Alloc::global());
-    let world = World { names: &names, frame: &frame, survey_frame: &survey_frame, prepared, sources: &sources, crate_names: &crate_names };
+    let world = World { names: &names, frame: &frame, survey_frame: &survey_frame, prepared, sources: &sources, crate_names: &crate_names, body_sources: None, receivers: Receivers::NotLookedUp };
     let ask = Ask { roots: &[main], build_from: BuildFrom::Main, read: RootRead::Callees, label: "his main" };
     let mut his = HisMain { names: &names, crate_names: &crate_names, frame: &frame, sources: &sources, main, ok };
     walk(&world, &ask, &mut his, &mut out, Alloc::global()).unwrap_or_else(|e| panic!("{e}"));
     report(out, start);
 }
 
-/// The hello world's own lines around the walk: the determinism check, the diagnostics and the
-/// `FRONT2_DUMP` dump after his main is checked; the ctor and `T::X` rules, the impls and the
-/// work list after `BUILDS:`. Each as this test has always printed it.
+/// The hello world's own lines around the walk, each as this test has always printed it: after
+/// his main is checked, the determinism check (`ORDER:`), his diagnostics and the `FRONT2_DUMP`
+/// dump; after `BUILDS:`, the ctor and `T::X` rules, the impls and his main's outcome.
 struct HisMain<'n> {
     names: &'n Names<'n>,
     crate_names: &'n [&'n str],
@@ -223,347 +228,349 @@ struct HisMain<'n> {
 
 impl<'n> WalkHooks<'n> for HisMain<'n> {
     fn checked(&mut self, at: &mut Stage<'_, '_, 'n>, sink: &mut dyn std::fmt::Write) -> std::fmt::Result {
-    let (names, crate_names, prepared, main) = (self.names, self.crate_names, at.prepared, self.main);
-    let records = &mut *at.records;
-    let body = &at.bodies[at.walked[0]];
-    let checked = &at.checked[0];
-    let mut out = String::new();
-    // The check of one body is a function of the program alone: checked again from empty
-    // records in this process, every noted item made in the REVERSED order, it must end the
-    // same: its diagnostics, its gaps (or refusal) and its recorded callees.
-    let first = outcome(&checked);
-    {
-        // The command's one frame (the names' lifetime is the frame's).
-        let mut front_r = Front2::new(names, self.frame, self.sources).unwrap_or_else(|e| panic!("front2 (reversed): {e}"));
-        let mut store_r = Store::new(front_r.index.lang("sized"), front_r.frame);
-        let mut buckets_r = None;
-        let body_r = lower_fn(names, prepared, &mut front_r.keys, &mut store_r, main).unwrap_or_else(|e| panic!("lowering main again: {e}"));
-        let view_r = body_r.lowered.view();
-        let spell_r = Spelling::of(&view_r).unwrap_or_else(|e| panic!("spelling his main's names again: {e:?}"));
-        let scope_r = body_r.scope(&spell_r);
-        let mut consts_r = Consts::default();
-        let mut records_r = Records { names: &names, keys: &mut front_r.keys, index: &front_r.index, store: &mut store_r, buckets: &mut buckets_r, order: BuildOrder::Reversed, consts: Some((&mut consts_r, prepared)) };
-        let again = outcome(&check_body(&mut records_r, &body_r, &scope_r));
-        assert_eq!(first, again, "his main's check depends on the order its records were made in");
-    }
-    out.push_str(&format!("ORDER: the same outcome with the build order reversed: {first}\n"));
-    // A finished check is clean only with no diagnostic: `?`'s variant lang items (`Break`,
-    // `Continue`) missing from the index left 11 (E0425, E0277) that read as "type-checks".
-    if let Ok(done) = &checked {
-        let codes: Vec<&str> = done.diags.iter().map(|d| d.code.code()).collect();
-        out.push_str(&format!("his main's diagnostics: {} {codes:?}\n", codes.len()));
-    }
-    // The trait questions selection was asked while checking, each with its candidates (as
-    // filed) and its answer: the traits of the E0277s are among them, and an empty answer
-    // over candidates says which header did not fit. A large dump (ASKED / HEAD / PREDS /
-    // NODE lines): printed only with `FRONT2_DUMP` set.
-    if let Some(b) = records.buckets.as_ref().filter(|_| std::env::var_os("FRONT2_DUMP").is_some()) {
-        for (t, s, got) in b.answered() {
-            let tn = records.keys.library(t).map_or_else(|| format!("{t:?}"), |k| shown(&names, &crate_names, k));
-            let cands = b.trait_candidates(t, s, b.home_of(t, s));
-            out.push_str(&format!("ASKED {tn} at {s:?}: {} candidates, {} answer\n", cands.len(), got.len()));
-            for k in cands.iter().take(12) {
-                let h = records.store.impls.get(&blaze_ladder::front2::keys::checker_of(*k));
-                let how = match h {
-                    None => "no header".to_string(),
-                    Some(h) if h.trait_ == Some(t) => format!("trait fits, picked {}", got.contains(&blaze_ladder::front2::keys::checker_of(*k))),
-                    Some(h) => format!("header trait {:?}", h.trait_.and_then(|x| records.keys.library(x)).map(|x| shown(&names, &crate_names, x))),
-                };
-                out.push_str(&format!("    {} [{how}] unread={} failed={}\n", shown(&names, &crate_names, *k), b.is_unread(*k), b.has_failed(*k)));
-            }
+        let (names, crate_names, prepared, main) = (self.names, self.crate_names, at.prepared, self.main);
+        let body = &at.bodies[at.walked[0]];
+        let checked = &at.checked[0];
+        let records = &mut *at.records;
+        let mut out = String::new();
+        // The check of one body is a function of the program alone: checked again from empty
+        // records in this process, every noted item made in the REVERSED order, it must end the
+        // same: its diagnostics, its gaps (or refusal) and its recorded callees.
+        let first = outcome(checked);
+        {
+            // The command's one frame (the names' lifetime is the frame's).
+            let mut front_r = Front2::new(names, self.frame, self.sources).unwrap_or_else(|e| panic!("front2 (reversed): {e}"));
+            let mut store_r = Store::new(front_r.index.lang("sized"), front_r.frame);
+            let mut buckets_r = None;
+            let body_r = lower_fn(names, prepared, &mut front_r.keys, &mut store_r, main).unwrap_or_else(|e| panic!("lowering main again: {e}"));
+            let view_r = body_r.lowered.view();
+            let spell_r = Spelling::of(&view_r).unwrap_or_else(|e| panic!("spelling his main's names again: {e:?}"));
+            let scope_r = body_r.scope(&spell_r);
+            let mut consts_r = Consts::default();
+            let mut records_r = Records { names, keys: &mut front_r.keys, index: &front_r.index, store: &mut store_r, buckets: &mut buckets_r, order: BuildOrder::Reversed, consts: Some((&mut consts_r, prepared)) };
+            let again = outcome(&check_body(&mut records_r, &body_r, &scope_r));
+            assert_eq!(first, again, "his main's check depends on the order its records were made in");
         }
-        // The heads the obligations are made from, as the store holds them: his main's
-        // signature and clauses, each picked impl's header and clauses, and the asked traits'
-        // fns (`branch`, `from_residual`, `from_output`).
-        let tys = records.store.tys.view();
-        let mut picked: Vec<blaze_typeck::ItemKey> = Vec::new();
-        let mut traits: Vec<blaze_typeck::ItemKey> = Vec::new();
-        for (t, _, got) in b.answered() {
-            picked.extend_from_slice(got);
-            traits.push(t);
+        out.push_str(&format!("ORDER: the same outcome with the build order reversed: {first}\n"));
+        // A finished check is clean only with no diagnostic: `?`'s variant lang items (`Break`,
+        // `Continue`) missing from the index left 11 (E0425, E0277) that read as "type-checks".
+        if let Ok(done) = checked {
+            let codes: Vec<&str> = done.diags.iter().map(|d| d.code.code()).collect();
+            out.push_str(&format!("his main's diagnostics: {} {codes:?}\n", codes.len()));
         }
-        let clauses = |item: blaze_typeck::ItemKey, roots: &mut Vec<blaze_typeck::PTy>| -> String {
-            let Some(p) = records.store.preds.get(&item) else { return "no preds".to_string() };
-            let mut s = format!("{} conds;", p.conds.len());
-            for c in p.clauses.iter() {
-                s.push_str(&format!(" {c:?}"));
-                match *c {
-                    blaze_typeck::PClause::Trait { args, .. } => roots.extend_from_slice(tys.list(args).unwrap_or(&[])),
-                    blaze_typeck::PClause::Projection { args, term, .. } => {
-                        roots.extend_from_slice(tys.list(args).unwrap_or(&[]));
-                        roots.push(term);
-                    }
-                    blaze_typeck::PClause::Const { .. } => {}
+        // The trait questions selection was asked while checking, each with its candidates (as
+        // filed) and its answer: the traits of the E0277s are among them, and an empty answer
+        // over candidates says which header did not fit. A large dump (ASKED / HEAD / PREDS /
+        // NODE lines): printed only with `FRONT2_DUMP` set.
+        if let Some(b) = records.buckets.as_ref().filter(|_| std::env::var_os("FRONT2_DUMP").is_some()) {
+            for (t, s, got) in b.answered() {
+                let tn = records.keys.library(t).map_or_else(|| format!("{t:?}"), |k| shown(names, crate_names, k));
+                let cands = b.trait_candidates(t, s, b.home_of(t, s));
+                out.push_str(&format!("ASKED {tn} at {s:?}: {} candidates, {} answer\n", cands.len(), got.len()));
+                for k in cands.iter().take(12) {
+                    let h = records.store.impls.get(&blaze_ladder::front2::keys::checker_of(*k));
+                    let how = match h {
+                        None => "no header".to_string(),
+                        Some(h) if h.trait_ == Some(t) => format!("trait fits, picked {}", got.contains(&blaze_ladder::front2::keys::checker_of(*k))),
+                        Some(h) => format!("header trait {:?}", h.trait_.and_then(|x| records.keys.library(x)).map(|x| shown(names, crate_names, x))),
+                    };
+                    out.push_str(&format!("    {} [{how}] unread={} failed={}\n", shown(names, crate_names, *k), b.is_unread(*k), b.has_failed(*k)));
                 }
             }
-            s
-        };
-        let mut roots: Vec<blaze_typeck::PTy> = Vec::new();
-        if let Some(f) = records.store.fns.get(&body.owner) {
-            out.push_str(&format!("HEAD main: parent {} own {} inputs {:?} output {:?}\n", f.parent, f.own, f.inputs, f.output));
-            roots.extend_from_slice(&f.inputs);
-            roots.push(f.output);
-        }
-        out.push_str(&format!("PREDS main: {}\n", clauses(body.owner, &mut roots)));
-        for k in picked.iter() {
-            if let Some(h) = records.store.impls.get(k) {
-                out.push_str(&format!("HEAD impl {k:?}: generics {} self {:?} trait args {:?} assoc {:?}\n", h.generics, h.self_ty, tys.list(h.trait_args.list()), h.assoc));
-                roots.push(h.self_ty);
-                roots.extend_from_slice(tys.list(h.trait_args.list()).unwrap_or(&[]));
-                roots.extend(h.assoc.iter().map(|a| a.1));
+            // The heads the obligations are made from, as the store holds them: his main's
+            // signature and clauses, each picked impl's header and clauses, and the asked traits'
+            // fns (`branch`, `from_residual`, `from_output`).
+            let tys = records.store.tys.view();
+            let mut picked: Vec<blaze_typeck::ItemKey> = Vec::new();
+            let mut traits: Vec<blaze_typeck::ItemKey> = Vec::new();
+            for (t, _, got) in b.answered() {
+                picked.extend_from_slice(got);
+                traits.push(t);
             }
-            out.push_str(&format!("PREDS impl {k:?}: {}\n", clauses(*k, &mut roots)));
-        }
-        for (fk, f) in records.store.fns.iter() {
-            if *fk != body.owner {
-                let sig = f.text.find("fn ").map_or(f.text, |at| &f.text[at..]);
-                let sig: String = sig.chars().take(160).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
-                out.push_str(&format!("HEAD fn `{sig}` {fk:?} in {:?}: parent {} own {} self_param {} inputs {:?} output {:?}\n", f.container, f.parent, f.own, f.self_param, f.inputs, f.output));
+            let clauses = |item: blaze_typeck::ItemKey, roots: &mut Vec<blaze_typeck::PTy>| -> String {
+                let Some(p) = records.store.preds.get(&item) else { return "no preds".to_string() };
+                let mut s = format!("{} conds;", p.conds.len());
+                for c in p.clauses.iter() {
+                    s.push_str(&format!(" {c:?}"));
+                    match *c {
+                        blaze_typeck::PClause::Trait { args, .. } => roots.extend_from_slice(tys.list(args).unwrap_or(&[])),
+                        blaze_typeck::PClause::Projection { args, term, .. } => {
+                            roots.extend_from_slice(tys.list(args).unwrap_or(&[]));
+                            roots.push(term);
+                        }
+                        blaze_typeck::PClause::Const { .. } => {}
+                    }
+                }
+                s
+            };
+            let mut roots: Vec<blaze_typeck::PTy> = Vec::new();
+            if let Some(f) = records.store.fns.get(&body.owner) {
+                out.push_str(&format!("HEAD main: parent {} own {} inputs {:?} output {:?}\n", f.parent, f.own, f.inputs, f.output));
                 roots.extend_from_slice(&f.inputs);
                 roots.push(f.output);
-                out.push_str(&format!("PREDS fn {fk:?}: {}\n", clauses(*fk, &mut roots)));
             }
-        }
-        for (ck, c) in records.store.ctors.iter() {
-            out.push_str(&format!("CTOR {ck:?} of {:?}: generics {} inputs {:?} output {:?}\n", c.adt, c.generics, c.inputs, c.output));
-            roots.extend_from_slice(&c.inputs);
-            roots.push(c.output);
-        }
-        for (ak, a) in records.store.adts.iter() {
-            out.push_str(&format!("ADT {ak:?}: generics {} variants {}\n", a.generics, a.variants.len()));
-        }
-        // Every node under those roots, each once, by a work list.
-        let mut seen = std::collections::BTreeSet::new();
-        while let Some(t) = roots.pop() {
-            if !seen.insert(t.0) {
-                continue;
+            out.push_str(&format!("PREDS main: {}\n", clauses(body.owner, &mut roots)));
+            for k in picked.iter() {
+                if let Some(h) = records.store.impls.get(k) {
+                    out.push_str(&format!("HEAD impl {k:?}: generics {} self {:?} trait args {:?} assoc {:?}\n", h.generics, h.self_ty, tys.list(h.trait_args.list()), h.assoc));
+                    roots.push(h.self_ty);
+                    roots.extend_from_slice(tys.list(h.trait_args.list()).unwrap_or(&[]));
+                    roots.extend(h.assoc.iter().map(|a| a.1));
+                }
+                out.push_str(&format!("PREDS impl {k:?}: {}\n", clauses(*k, &mut roots)));
             }
-            let mut kids: Vec<blaze_typeck::PTy> = Vec::new();
-            blaze_ladder::front2::types::children_of(tys, t, &mut kids);
-            roots.extend(kids.iter().copied());
-        }
-        for id in seen {
-            let mut kids: Vec<blaze_typeck::PTy> = Vec::new();
-            blaze_ladder::front2::types::children_of(tys, blaze_typeck::PTy(id), &mut kids);
-            let kids: Vec<u32> = kids.iter().map(|k| k.0).collect();
-            out.push_str(&format!("  NODE {id} = {:?} over {kids:?}\n", tys.node(blaze_typeck::PTy(id))));
-        }
-        for (k, why) in b.failed.iter().take(20) {
-            out.push_str(&format!("FAILED HEADER {}: {why}\n", shown(&names, &crate_names, *k)));
-        }
-    }
-    // C: every fn reachable from his main, each in its own env (a member's: its container's
-    // generics first, then its own; `Self` the impl's self type or the trait's parameter 0).
-    // A `main` that does not check is no dead end: the walk goes on from its calls by name.
-    let main_ok = usize::from(checked.is_ok());
-    let first = match &mut checked {
-        Ok(done) => blaze_ladder::front2::reach::First::Checked(done),
-        Err(_) => blaze_ladder::front2::reach::First::Unchecked(&body),
-    };
-    let census = Some(reach(&mut records, prepared, body.owner, first, &scope));
-    if let Some(c) = &census {
-        let ok = c.fns.iter().filter(|(_, r)| matches!(r, Reached::Checked)).count();
-        let no_body = c.fns.iter().filter(|(_, r)| matches!(r, Reached::NoBody)).count();
-        let ctors = c.fns.iter().filter(|(_, r)| matches!(r, Reached::Ctor)).count();
-        let elsewhere = c.fns.iter().filter(|(_, r)| matches!(r, Reached::AtInstance | Reached::AtObject)).count();
-        out.push_str(&format!(
-            "REACHABLE: {} of {} reachable functions type-check (his main and {} reached; {ctors} ctors; {elsewhere} trait calls walked where the instance or object is made; {no_body} required trait methods not walked; {} calls not followed: their caller did not check and only its types name them; capped: {})\n",
-            ok + main_ok,
-            c.fns.len() + 1 - no_body - ctors - elsewhere,
-            c.fns.len(),
-            c.not_followed,
-            c.capped
-        ));
-        let mut causes: Vec<(&str, usize, String)> = Vec::new();
-        for (k, r) in c.fns.iter() {
-            if let Reached::Failed { class, detail } = r {
-                match causes.iter_mut().find(|x| x.0 == &**class) {
-                    Some(x) => x.1 += 1,
-                    None => {
-                        let name = records.keys.library(*k).map_or_else(|| format!("{k:?}"), |l| shown(&names, &crate_names, l));
-                        causes.push((class, 1, format!("{name}: {detail}")));
-                    }
+            for (fk, f) in records.store.fns.iter() {
+                if *fk != body.owner {
+                    let sig = f.text.find("fn ").map_or(f.text, |at| &f.text[at..]);
+                    let sig: String = sig.chars().take(160).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
+                    out.push_str(&format!("HEAD fn `{sig}` {fk:?} in {:?}: parent {} own {} self_param {} inputs {:?} output {:?}\n", f.container, f.parent, f.own, f.self_param, f.inputs, f.output));
+                    roots.extend_from_slice(&f.inputs);
+                    roots.push(f.output);
+                    out.push_str(&format!("PREDS fn {fk:?}: {}\n", clauses(*fk, &mut roots)));
                 }
             }
+            for (ck, c) in records.store.ctors.iter() {
+                out.push_str(&format!("CTOR {ck:?} of {:?}: generics {} inputs {:?} output {:?}\n", c.adt, c.generics, c.inputs, c.output));
+                roots.extend_from_slice(&c.inputs);
+                roots.push(c.output);
+            }
+            for (ak, a) in records.store.adts.iter() {
+                out.push_str(&format!("ADT {ak:?}: generics {} variants {}\n", a.generics, a.variants.len()));
+            }
+            // Every node under those roots, each once, by a work list.
+            let mut seen = std::collections::BTreeSet::new();
+            while let Some(t) = roots.pop() {
+                if !seen.insert(t.0) {
+                    continue;
+                }
+                let mut kids: Vec<blaze_typeck::PTy> = Vec::new();
+                blaze_ladder::front2::types::children_of(tys, t, &mut kids);
+                roots.extend(kids.iter().copied());
+            }
+            for id in seen {
+                let mut kids: Vec<blaze_typeck::PTy> = Vec::new();
+                blaze_ladder::front2::types::children_of(tys, blaze_typeck::PTy(id), &mut kids);
+                let kids: Vec<u32> = kids.iter().map(|k| k.0).collect();
+                out.push_str(&format!("  NODE {id} = {:?} over {kids:?}\n", tys.node(blaze_typeck::PTy(id))));
+            }
+            for (k, why) in b.failed.iter().take(20) {
+                out.push_str(&format!("FAILED HEADER {}: {why}\n", shown(names, crate_names, *k)));
+            }
         }
-        causes.sort_by(|a, b| b.1.cmp(&a.1));
-        for (class, n, first) in &causes {
-            out.push_str(&format!("  {n} x {class}; the first: {first}\n"));
-        }
+        sink.write_str(&out)
     }
-    // D: what the CODE BUILDER makes of the clean ones: the program with every clean fn tabled
-    // (the rest left out), each instance from his `main` built as the run builds it, through the
-    // seam; a refusal is filed by its typed name and the walk goes on.
-    {
-        let mut left_out = Vec::new_in(std::alloc::Global);
-        let survey_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the survey's frame");
-        match blaze_ladder::front2::program::Front2Program::survey(&names, &survey_frame, &sources, &mut left_out) {
-            Err(e) => out.push_str(&format!("BUILDS: no survey: {e}\n")),
-            Ok(mut program) => {
-                let mut refused = Vec::new_in(std::alloc::Global);
-                match blaze_ladder::run::build_survey(&mut program, &mut refused) {
-                    Err(e) => out.push_str(&format!("BUILDS: the survey stopped: {e}\n")),
-                    Ok(counts) => {
-                        out.push_str(&format!(
-                            "BUILDS: {} of {} clean reachable functions' instances ({} refused; {} generic with no instance; {} left out unchecked)\n",
-                            counts.built,
-                            counts.tried,
-                            counts.tried - counts.built,
-                            counts.no_instance.len(),
-                            left_out.len()
-                        ));
-                        let mut classes: Vec<(&str, usize, &str)> = Vec::new();
-                        for (f, class) in refused.iter() {
-                            match classes.iter_mut().find(|x| x.0 == &**class) {
-                                Some(x) => x.1 += 1,
-                                None => classes.push((class, 1, f)),
-                            }
-                        }
-                        classes.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-                        for (class, n, first) in &classes {
-                            out.push_str(&format!("  {n} x {class}; the first: `{first}`\n"));
+
+    fn walked(&mut self, at: &mut Stage<'_, '_, 'n>, sink: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        let (names, crate_names, ok) = (self.names, self.crate_names, self.ok);
+        let checked = &at.checked[0];
+        let records = &mut *at.records;
+        let mut out = String::new();
+        // The ctor rule (the Reference, "Enumerated types"): `Ok` in the value namespace is a fn
+        // generic over `Result`'s two parameters, from its one field to `Result<T, E>`; it is made
+        // with `Result`'s head, which his `?` and `Ok(())` make the check fill.
+        if let Some(c) = ok.and_then(|k| records.store.ctors.get(&blaze_ladder::front2::keys::checker_of(k))) {
+            assert_eq!((c.generics, c.inputs.len()), (2, 1), "`Ok`'s ctor fn: generic over `T, E`, one input");
+            out.push_str("ctor rule: `Ok` is a fn over 2 generics with 1 input\n");
+        }
+        // The `T::X` rule (the Reference, "Paths in types"): `T::X` with `T` a type parameter is
+        // `<T as Tr>::X` for the one trait among `T`'s bounds, supertraits included, declaring `X`.
+        // core's `ChangeOutputType<T: Try<..>, V>` is written `<T::Residual as Residual<V>>::TryType`
+        // (an alias's bounds are read for this): its head must be made, or refused for another cause.
+        if let Some(core) = crate_names.iter().position(|n| *n == "core") {
+            let segs = ["ops", "try_trait", "ChangeOutputType"];
+            let found = names::path(names, names.root(core), Namespace::Types, Written { kind: PathKind::Plain, segments: &segs }, Alloc::global());
+            let key = found.ok().and_then(|f| f.whole(segs.len()).map(|d| d.key));
+            match key.map(|k| (records.store.maps.aliases.get(&k), records.store.maps.alias_gaps.get(&k))) {
+                Some((Some(Some(_)), _)) => out.push_str("T::X rule: core's ChangeOutputType is made, `T::Residual` read through `T: Try`\n"),
+                Some((_, Some(why))) => {
+                    assert!(!matches!(why, Why::AssocNotFound(..) | Why::AssocAmbiguous(..)), "`T::Residual` through `T: Try` must be found: {why:?}");
+                    out.push_str(&format!("T::X rule: core's ChangeOutputType refused for another cause: {why:?}\n"));
+                }
+                other => out.push_str(&format!("T::X rule: core's ChangeOutputType not asked by this check ({:?})\n", other.map(|o| o.0.is_some()))),
+            }
+        }
+        let lowered = records.buckets.as_ref().map_or(0, |b| b.lowered);
+        let filed = records.buckets.as_ref().map(|b| b.filed());
+        out.push_str(&format!("impls on a builtin the checker has no type for (filed nowhere): {:?}\n", records.buckets.as_ref().map(|b| b.no_checker_type)));
+        out.push_str(&format!("impl headers lowered by the check: {lowered} of the program's {}; filed (trait+shape, trait any, inherent, inherent any, unread): {filed:?}\n", records.index.impls.len()));
+        // The unread impls by class: a count and samples from different crates.
+        if let Some(b) = records.buckets.as_ref() {
+            let mut classes: Vec<(String, usize, Vec<String>)> = Vec::new();
+            for (k, why) in b.unread_why.iter() {
+                let class = why.class();
+                let krate = names.crate_of(*k).and_then(|c| crate_names.get(c).copied()).unwrap_or("?");
+                let sample = format!("[{krate}] {} : {why:?}", shown(names, crate_names, *k));
+                match classes.iter_mut().find(|c| c.0 == class) {
+                    Some(c) => {
+                        c.1 += 1;
+                        if c.2.len() < 8 && !c.2.iter().any(|s| s.starts_with(&format!("[{krate}]"))) {
+                            c.2.push(sample);
                         }
                     }
+                    None => classes.push((class, 1, vec![sample])),
                 }
             }
-        }
-    }
-    // The ctor rule (the Reference, "Enumerated types"): `Ok` in the value namespace is a fn
-    // generic over `Result`'s two parameters, from its one field to `Result<T, E>`; it is made
-    // with `Result`'s head, which his `?` and `Ok(())` make the check fill.
-    if let Some(c) = ok.and_then(|k| store.ctors.get(&blaze_ladder::front2::keys::checker_of(k))) {
-        assert_eq!((c.generics, c.inputs.len()), (2, 1), "`Ok`'s ctor fn: generic over `T, E`, one input");
-        out.push_str("ctor rule: `Ok` is a fn over 2 generics with 1 input\n");
-    }
-    // The `T::X` rule (the Reference, "Paths in types"): `T::X` with `T` a type parameter is
-    // `<T as Tr>::X` for the one trait among `T`'s bounds, supertraits included, declaring `X`.
-    // core's `ChangeOutputType<T: Try<..>, V>` is written `<T::Residual as Residual<V>>::TryType`
-    // (an alias's bounds are read for this): its head must be made, or refused for another cause.
-    if let Some(core) = crate_names.iter().position(|n| *n == "core") {
-        let segs = ["ops", "try_trait", "ChangeOutputType"];
-        let found = names::path(&names, names.root(core), Namespace::Types, Written { kind: PathKind::Plain, segments: &segs }, Alloc::global());
-        let key = found.ok().and_then(|f| f.whole(segs.len()).map(|d| d.key));
-        match key.map(|k| (store.maps.aliases.get(&k), store.maps.alias_gaps.get(&k))) {
-            Some((Some(Some(_)), _)) => out.push_str("T::X rule: core's ChangeOutputType is made, `T::Residual` read through `T: Try`\n"),
-            Some((_, Some(why))) => {
-                assert!(!matches!(why, Why::AssocNotFound(..) | Why::AssocAmbiguous(..)), "`T::Residual` through `T: Try` must be found: {why:?}");
-                out.push_str(&format!("T::X rule: core's ChangeOutputType refused for another cause: {why:?}\n"));
-            }
-            other => out.push_str(&format!("T::X rule: core's ChangeOutputType not asked by this check ({:?})\n", other.map(|o| o.0.is_some()))),
-        }
-    }
-    let lowered = buckets.as_ref().map_or(0, |b| b.lowered);
-    let filed = buckets.as_ref().map(|b| b.filed());
-    out.push_str(&format!("impls on a builtin the checker has no type for (filed nowhere): {:?}\n", buckets.as_ref().map(|b| b.no_checker_type)));
-    out.push_str(&format!("impl headers lowered by the check: {lowered} of the program's {}; filed (trait+shape, trait any, inherent, inherent any, unread): {filed:?}\n", front.index.impls.len()));
-    // The unread impls by class: a count and samples from different crates.
-    if let Some(b) = buckets.as_ref() {
-        let mut classes: Vec<(String, usize, Vec<String>)> = Vec::new();
-        for (k, why) in b.unread_why.iter() {
-            let class = why.class();
-            let krate = names.crate_of(*k).and_then(|c| crate_names.get(c).copied()).unwrap_or("?");
-            let sample = format!("[{krate}] {} : {why:?}", shown(&names, &crate_names, *k));
-            match classes.iter_mut().find(|c| c.0 == class) {
-                Some(c) => {
-                    c.1 += 1;
-                    if c.2.len() < 8 && !c.2.iter().any(|s| s.starts_with(&format!("[{krate}]"))) {
-                        c.2.push(sample);
-                    }
-                }
-                None => classes.push((class, 1, vec![sample])),
-            }
-        }
-        classes.sort_by(|a, b| b.1.cmp(&a.1));
-        // By crate and path as written: the reductions to send to the names library's lane.
-        let mut by_path: Vec<(String, usize)> = Vec::new();
-        for (k, why) in b.unread_why.iter() {
-            let krate = names.crate_of(*k).and_then(|c| crate_names.get(c).copied()).unwrap_or("?");
-            let path = match why {
-                blaze_ladder::front2::buckets::Unread::Resolve { path, .. } | blaze_ladder::front2::buckets::Unread::NotATrait { path, .. } => &**path,
-                _ => "",
-            };
-            let row = format!("{krate}: `{path}`");
-            match by_path.iter_mut().find(|x| x.0 == row) {
-                Some(x) => x.1 += 1,
-                None => by_path.push((row, 1)),
-            }
-        }
-        by_path.sort_by(|a, b| b.1.cmp(&a.1));
-        for (row, n) in by_path.iter().take(12) {
-            out.push_str(&format!("unread by crate and path: {n} x {row}\n"));
-        }
-        for (class, n, samples) in &classes {
-            out.push_str(&format!("unread class {class}: {n}\n"));
-            for s in samples {
-                out.push_str(&format!("    {s}\n"));
-            }
-        }
-    }
-    match checked {
-        Ok(_) => out.push_str("his main type-checks\n"),
-        Err(CheckFail::Gap { gaps, .. }) => {
-            out.push_str(&format!("WORK LIST ({} gaps):\n", gaps.len()));
-            // The unread impls' failures, by crate and cause (the why's variant): a count and
-            // the first, so each owner's share is read off one line.
-            let mut unread: Vec<(String, usize, String)> = Vec::new();
-            for gap in gaps.iter() {
-                if let Gap::UnreadImpl(k, why) = gap {
-                    let krate = names.crate_of(*k).and_then(|c| crate_names.get(c).copied()).unwrap_or("?");
-                    let cause = format!("{why}");
-                    let row = format!("{krate} / {}", cause.split(['(', ':']).next().unwrap_or(""));
-                    match unread.iter_mut().find(|u| u.0 == row) {
-                        Some(u) => u.1 += 1,
-                        None => unread.push((row, 1, format!("{} {cause}", shown(&names, &crate_names, *k)))),
-                    }
-                }
-            }
-            for (row, n, first) in &unread {
-                out.push_str(&format!("  unread impls in {row}: {n}; the first: {first}\n"));
-            }
-            for (i, gap) in gaps.iter().filter(|g| !matches!(g, Gap::UnreadImpl(..))).enumerate() {
-                let item = match gap {
-                    Gap::VariantOfNoEnum(k) => format!("(lang `{}`)", front.index.lang_name_of(*k).unwrap_or("?")),
-                    Gap::TypeAlias(k) => shown(&names, &crate_names, *k),
-                    Gap::WhereConst(k) | Gap::CtorFn(k) | Gap::ImplAssocType(k, _) => match front.keys.library(*k) {
-                        Some(lib) => shown(&names, &crate_names, lib),
-                        None => format!("{k:?}"),
-                    },
-                    _ => String::new(),
+            classes.sort_by(|a, b| b.1.cmp(&a.1));
+            // By crate and path as written: the reductions to send to the names library's lane.
+            let mut by_path: Vec<(String, usize)> = Vec::new();
+            for (k, why) in b.unread_why.iter() {
+                let krate = names.crate_of(*k).and_then(|c| crate_names.get(c).copied()).unwrap_or("?");
+                let path = match why {
+                    blaze_ladder::front2::buckets::Unread::Resolve { path, .. } | blaze_ladder::front2::buckets::Unread::NotATrait { path, .. } => &**path,
+                    _ => "",
                 };
-                out.push_str(&format!("  {}. {gap} {item}\n", i + 1));
+                let row = format!("{krate}: `{path}`");
+                match by_path.iter_mut().find(|x| x.0 == row) {
+                    Some(x) => x.1 += 1,
+                    None => by_path.push((row, 1)),
+                }
             }
-        }
-        Err(CheckFail::Head { error: HeadError::Item(k, why), .. }) => {
-            let text = names.item_text(k).map(|t| t.text).unwrap_or("");
-            let at = match &why {
-                Why::Unsupported(_, r)
-                | Why::Program(_, r)
-                | Why::Resolve(_, r)
-                | Why::NoCheckerType(_, r)
-                | Why::AssocNotFound(_, r)
-                | Why::AssocAmbiguous(_, _, r)
-                | Why::TwoPrincipals(_, _, r)
-                | Why::TypeMacro(_, r)
-                | Why::PatternType(_, r)
-                | Why::ConstPath(_, r) => text.get(r.start as usize..r.end as usize),
-                | Why::NeedConst(_, r) => text.get(r.start as usize..r.end as usize),
-                Why::Need(_) => None,
-            };
-            out.push_str(&format!("WORK LIST (one failure): the head of {}: {why:?}, at `{}`\n", shown(&names, &crate_names, k), at.unwrap_or("?")));
-            // The probe for a name that names nothing: the same text from the item's module,
-            // and its prefixes from his root, through the names library.
-            if let (Some(module), Some(word)) = (names.module_of(k), at) {
-                let from_item = names::path(&names, module, Namespace::Types, Written { kind: PathKind::Plain, segments: &[word] }, Alloc::global());
-                out.push_str(&format!("probe: `{word}` from the item's module: {:?}\n", from_item.as_ref().map(|f| f.whole(1).map(|d| d.key)).map_err(|e| format!("{e}"))));
-                for segs in [&["std"][..], &["std", "ffi"][..], &["std", "ffi", word][..], &["std", "path", "Path"][..], &["std", "alloc", "Allocator"][..], &["Allocator"][..], &["Path"][..]] {
-                    let got = names::path(&names, module, Namespace::Types, Written { kind: PathKind::Plain, segments: segs }, Alloc::global());
-                    out.push_str(&format!("probe: `{}` from the item's module: {:?}\n", segs.join("::"), got.as_ref().map(|f| f.whole(segs.len()).map(|d| d.key)).map_err(|e| format!("{e}"))));
+            by_path.sort_by(|a, b| b.1.cmp(&a.1));
+            for (row, n) in by_path.iter().take(12) {
+                out.push_str(&format!("unread by crate and path: {n} x {row}\n"));
+            }
+            for (class, n, samples) in &classes {
+                out.push_str(&format!("unread class {class}: {n}\n"));
+                for s in samples {
+                    out.push_str(&format!("    {s}\n"));
                 }
             }
         }
-        Err(e) => out.push_str(&format!("WORK LIST (one failure): {e}\n")),
+        match checked {
+            Ok(_) => out.push_str("his main type-checks\n"),
+            Err(CheckFail::Gap { gaps, .. }) => {
+                out.push_str(&format!("WORK LIST ({} gaps):\n", gaps.len()));
+                // The unread impls' failures, by crate and cause (the why's variant): a count and
+                // the first, so each owner's share is read off one line.
+                let mut unread: Vec<(String, usize, String)> = Vec::new();
+                for gap in gaps.iter() {
+                    if let Gap::UnreadImpl(k, why) = gap {
+                        let krate = names.crate_of(*k).and_then(|c| crate_names.get(c).copied()).unwrap_or("?");
+                        let cause = format!("{why}");
+                        let row = format!("{krate} / {}", cause.split(['(', ':']).next().unwrap_or(""));
+                        match unread.iter_mut().find(|u| u.0 == row) {
+                            Some(u) => u.1 += 1,
+                            None => unread.push((row, 1, format!("{} {cause}", shown(names, crate_names, *k)))),
+                        }
+                    }
+                }
+                for (row, n, first) in &unread {
+                    out.push_str(&format!("  unread impls in {row}: {n}; the first: {first}\n"));
+                }
+                for (i, gap) in gaps.iter().filter(|g| !matches!(g, Gap::UnreadImpl(..))).enumerate() {
+                    let item = match gap {
+                        Gap::VariantOfNoEnum(k) => format!("(lang `{}`)", records.index.lang_name_of(*k).unwrap_or("?")),
+                        Gap::TypeAlias(k) => shown(names, crate_names, *k),
+                        Gap::WhereConst(k) | Gap::CtorFn(k) | Gap::ImplAssocType(k, _) => match records.keys.library(*k) {
+                            Some(lib) => shown(names, crate_names, lib),
+                            None => format!("{k:?}"),
+                        },
+                        _ => String::new(),
+                    };
+                    out.push_str(&format!("  {}. {gap} {item}\n", i + 1));
+                }
+            }
+            Err(CheckFail::Head { error: HeadError::Item(k, why), .. }) => {
+                let k = *k;
+                let text = names.item_text(k).map(|t| t.text).unwrap_or("");
+                let at = match why {
+                    Why::Unsupported(_, r)
+                    | Why::Program(_, r)
+                    | Why::Resolve(_, r)
+                    | Why::NoCheckerType(_, r)
+                    | Why::AssocNotFound(_, r)
+                    | Why::AssocAmbiguous(_, _, r)
+                    | Why::TwoPrincipals(_, _, r)
+                    | Why::TypeMacro(_, r)
+                    | Why::PatternType(_, r)
+                    | Why::ConstPath(_, r)
+                    | Why::NeedConst(_, r) => text.get(r.start as usize..r.end as usize),
+                    Why::Need(_) => None,
+                };
+                out.push_str(&format!("WORK LIST (one failure): the head of {}: {why:?}, at `{}`\n", shown(names, crate_names, k), at.unwrap_or("?")));
+                // The probe for a name that names nothing: the same text from the item's module,
+                // and its prefixes from his root, through the names library.
+                if let (Some(module), Some(word)) = (names.module_of(k), at) {
+                    let from_item = names::path(names, module, Namespace::Types, Written { kind: PathKind::Plain, segments: &[word] }, Alloc::global());
+                    out.push_str(&format!("probe: `{word}` from the item's module: {:?}\n", from_item.as_ref().map(|f| f.whole(1).map(|d| d.key)).map_err(|e| format!("{e}"))));
+                    for segs in [&["std"][..], &["std", "ffi"][..], &["std", "ffi", word][..], &["std", "path", "Path"][..], &["std", "alloc", "Allocator"][..], &["Allocator"][..], &["Path"][..]] {
+                        let got = names::path(names, module, Namespace::Types, Written { kind: PathKind::Plain, segments: segs }, Alloc::global());
+                        out.push_str(&format!("probe: `{}` from the item's module: {:?}\n", segs.join("::"), got.as_ref().map(|f| f.whole(segs.len()).map(|d| d.key)).map_err(|e| format!("{e}"))));
+                    }
+                }
+            }
+            Err(e) => out.push_str(&format!("WORK LIST (one failure): {e}\n")),
+        }
+        sink.write_str(&out)
     }
-    report(out, start);
+}
+
+/// The walk from TWO roots given as a list (front2/program/walk_report.rs `walk`): both are
+/// lowered, checked and walked in one walk; `shared`, which both reach, is counted once, and
+/// `only_second`, which only the second reaches, is counted; a root given twice is one root.
+/// The Reference, "Call expressions": a call names its callee; nothing else is reached.
+///
+/// Prints: `REACHABLE: 4 of 4 reachable functions type-check (two roots and 2 reached; 0
+/// ctors; 0 trait calls walked where the instance or object is made; 0 required trait methods
+/// not walked; 0 calls not followed: their caller did not check and only its types name them;
+/// capped: false)`
+#[test]
+fn two_roots_are_walked_once() {
+    const PROGRAM: &str = "#![feature(no_core, lang_items)]
+#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+fn shared() -> i32 {
+    1
+}
+
+fn only_second() -> i32 {
+    2
+}
+
+fn first() {
+    shared();
+}
+
+fn second() {
+    shared();
+    only_second();
+}
+";
+    let files = [SourceFile { path: "src/main.rs", text: PROGRAM }];
+    let tc = Toolchain::none();
+    let new = blaze_ladder::run::NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
+    let texts = blaze_ladder::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc).unwrap_or_else(|e| panic!("the program's texts: {e}"));
+    let user = texts.user();
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let crate_names: Vec<&str> = crates.iter().map(|c| c.name).collect();
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the walk's frame");
+    let survey_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the survey's frame");
+    let key = |name: &'static str| {
+        let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &[name] }, Alloc::global())
+            .unwrap_or_else(|e| panic!("`{name}` from the crate root: {e}"));
+        found.whole(1).unwrap_or_else(|| panic!("`{name}` not named")).key
+    };
+    let (first, second) = (key("first"), key("second"));
+    let prepared = Prepares::new_in(Alloc::global());
+    let world = World { names: &names, frame: &frame, survey_frame: &survey_frame, prepared, sources: &files, crate_names: &crate_names, body_sources: None, receivers: Receivers::Found };
+    let ask = Ask { roots: &[first, second, first], build_from: BuildFrom::Roots, read: RootRead::Callees, label: "two roots" };
+    let mut out = String::new();
+    let counts = walk(&world, &ask, &mut blaze_ladder::front2::program::walk_report::NoHooks, &mut out, Alloc::global()).unwrap_or_else(|e| panic!("{e}"));
+    let line = out.lines().find(|l| l.starts_with("REACHABLE:")).unwrap_or_else(|| panic!("no REACHABLE line in:\n{out}"));
+    println!("{line}");
+    assert_eq!((counts.roots, counts.walked, counts.roots_checked), (2, 2, 2), "`first` given twice is one root; both check:\n{out}");
+    assert_eq!(counts.reached, 2, "`shared` once and `only_second` once:\n{out}");
+    assert_eq!((counts.type_check, counts.reachable), (4, 4), "two roots and two reached, all clean:\n{out}");
+    assert!(out.lines().any(|l| l.starts_with("BUILDS:")), "the builds survey's line is written, whatever it says:\n{out}");
 }
 
 /// Prints the outcome; with `FRONT2_WORK_LIST` set (a file path), writes it there too, since a
@@ -629,7 +636,7 @@ fn the_entry_programs_as_far_as_each_gets() {
     let mut out = String::from("ENTRY PROGRAMS (D59 interim, edition blaze-2026.11):\n");
     for (shape, text) in programs {
         let files = [SourceFile { path: "src/main.rs", text }];
-        let got = build_new(&files, "src/main.rs", NewFront { package: "entry", edition: EDITION, shelf: Some(&shelf) });
+        let got = build_new(&files, "src/main.rs", NewFront { package: "entry", edition: EDITION, shelf: Some(&shelf), overflow: blaze_build::OverflowChecks::On });
         let line = match &got {
             Ok(_) => "BUILT (front, checker and builder: no refusal)".to_string(),
             Err(e) => format!("REFUSED: {e}"),

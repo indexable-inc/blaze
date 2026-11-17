@@ -41,7 +41,7 @@ use blaze_lir::builder::MemAttrs;
 use blaze_lir::func::{SlotId, SlotKind};
 use blaze_lir::{Block, Flags, IntCond, Op, Ty, Value};
 use blaze_own::Vec;
-use blaze_typeck::{AdjustKind, Expr, ExprId, PNode, PTy, Pat, PatId};
+use blaze_typeck::{AdjustKind, Expr, ExprId, PNode, PTy, Pat, PatId, UnOp};
 
 use super::{Held, NO_EXPR, Owner, Repr, Shape, V, Walk, malformed, unsupported};
 use crate::BuildError;
@@ -152,6 +152,11 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let t = self.adjusted_ty(scrutinee)?;
         let g = self.ground_ty(t).map_err(|error| Self::ty_err(scrutinee, error))?;
         if !self.needs_drop(g).map_err(|error| Self::ty_err(scrutinee, error))? {
+            return Ok(None);
+        }
+        // A place behind a pointer, matched in place: no one here owns it, nothing is held,
+        // and a by-value binding of a part that needs drop is refused (`move_out`).
+        if self.scrutinee_in_place(scrutinee)? {
             return Ok(None);
         }
         if self.adjust_rows(scrutinee).is_empty()
@@ -522,7 +527,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// `Drop` (E0509).
     pub(super) fn move_field(&mut self, e: ExprId, at: (Value, i32), repr: Repr) -> Result<V, BuildError> {
         let Some((_, mask, start, len, drops)) = self.field_path(e)? else {
-            return Err(unsupported(e, "a move out of a field of other than a local (a temporary's, or behind a pointer or a smart pointer)"));
+            // Not a local's: a temporary's field, or a field behind a pointer.
+            return self.move_temp_field(e, at, repr);
         };
         if drops {
             self.moves.steps.truncate(start as usize);
@@ -535,6 +541,154 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let tmp = self.temp(repr);
         self.store(V::Place(at.0, at.1), repr, tmp)?;
         Ok(V::Place(tmp.0, tmp.1))
+    }
+
+    /// `let a = make().f;`: a move by place expression `e` (its value at `at`, held as `repr`,
+    /// which needs drop) out of a field of a TEMPORARY. The Reference, [expr.move.movable-place]:
+    /// "Only the following place expressions may be moved out of: ... Temporary values. Fields
+    /// of a place expression which can be moved out of and don't implement `Drop`."; "Destructors",
+    /// "Temporary scopes": the temporary lives to the end of its temporary scope (its statement),
+    /// and "If a variable has been partially initialized, only its initialized fields are
+    /// dropped" (a temporary alike). Built as a match by tests' temporary scrutinee is
+    /// (`own_scrutinee`): the temporary's `hold_temp` entry (a whole `Held::Rest`) becomes a
+    /// `Held::Moved` with a word of its own, all held, and the moved part's bit is cleared, so
+    /// the statement's end drops the rest and the moved field is dropped by its new owner only.
+    /// Refused by name: a field reached through a pointer or a smart pointer (Rust's E0507,
+    /// unless the type is `Copy`, which never needs drop; a `Box`'s contents moved out by a
+    /// field path is not built), a container that implements `Drop` (E0509), more than 64
+    /// parts of one temporary, and a temporary not held to its statement's end.
+    fn move_temp_field(&mut self, e: ExprId, at: (Value, i32), repr: Repr) -> Result<V, BuildError> {
+        let Some((base, start, len, drops, off)) = self.temp_field_path(e)? else {
+            return Err(unsupported(
+                e,
+                "a move out of a field of other than a temporary or a local with field flags (behind a pointer or a smart pointer: E0507 unless a `Box`'s, whose contents moved out by a field are not built to LIR yet)",
+            ));
+        };
+        if drops {
+            self.moves.steps.truncate(start as usize);
+            return Err(unsupported(e, "a move out of a field of a type that implements `Drop` (E0509)"));
+        }
+        let held_at = (at.0, at.1 - off);
+        let found = self
+            .scope_pats
+            .iter()
+            .rposition(|h| matches!(*h, Held::Rest { at: a, variant: None, .. } | Held::Moved { at: a, .. } if a == held_at));
+        let Some(i) = found else {
+            self.moves.steps.truncate(start as usize);
+            if !self.live {
+                // Unreachable code: nothing runs, nothing is held (`Task::Spill` held nothing).
+                let tmp = self.temp(repr);
+                self.store(V::Place(at.0, at.1), repr, tmp)?;
+                return Ok(V::Place(tmp.0, tmp.1));
+            }
+            return Err(unsupported(e, "a move out of a field of a temporary not held to its statement's end (an extended temporary)"));
+        };
+        let mask = match self.scope_pats[i] {
+            // A second part of the same temporary: its word is made.
+            Held::Moved { mask, .. } => mask,
+            _ => {
+                let t = self.expr_ty(base)?;
+                let g = self.ground_ty(t).map_err(|error| Self::ty_err(base, error))?;
+                let slot = self.b.slot(8, 3, SlotKind::Named);
+                let fa = self.b.slot_addr(slot);
+                let all = self.b.iconst(Ty::I64, u128::from(u64::MAX));
+                self.b.store(Flags::NONE, all, fa, 0, MemAttrs::aligned(3));
+                self.scope_pats[i] = Held::Moved { at: held_at, g, mask: slot };
+                slot
+            }
+        };
+        let Some(bit) = self.part_bit(mask, start, len, 0, Some(e))? else {
+            return Err(unsupported(e, "a move out of more than 64 parts of one temporary (its word)"));
+        };
+        self.clear_bit(mask, bit);
+        // Copied out first, as `move_field` does.
+        let tmp = self.temp(repr);
+        self.store(V::Place(at.0, at.1), repr, tmp)?;
+        Ok(V::Place(tmp.0, tmp.1))
+    }
+
+    /// The path of fields from a temporary to place expression `e` (a chain of struct or tuple
+    /// fields with no adjustment on the way, over a value expression that is not a place and
+    /// has no adjustment: `make().a.b`), appended to `steps` root first: the temporary's
+    /// expression, the path's start and length, whether some container on it implements `Drop`,
+    /// and the field's offset in the temporary. `None` (`steps` as it was) for anything else:
+    /// a local's field, a union's, or a field behind a dereference.
+    fn temp_field_path(&mut self, e: ExprId) -> Result<Option<(ExprId, u32, u32, bool, i32)>, BuildError> {
+        let start = self.moves.steps.len() as u32;
+        let mut drops = false;
+        let mut off = 0i32;
+        let mut cur = e;
+        let base = loop {
+            match self.expr(cur)? {
+                Expr::Paren(inner) if self.adjust_rows(inner).is_empty() => cur = inner,
+                Expr::Field { base, .. } | Expr::TupleField { base, .. } if self.adjust_rows(base).is_empty() => {
+                    let col = self.checked.fields.column::<0>();
+                    let row = col.binary_search(&cur).map_err(|_| malformed("a field access without its record row"))?;
+                    let k = self.checked.fields.column::<2>()[row];
+                    let Repr::Agg(l) = self.adjusted_repr(base)? else { break None };
+                    if self.layouts[l as usize].is_union {
+                        break None;
+                    }
+                    let Shape::Fields { first, len } = self.layouts[l as usize].shape else { break None };
+                    if k >= len {
+                        return Err(malformed("a field index past its aggregate's fields"));
+                    }
+                    drops |= self.layouts[l as usize].drop_fn.is_some();
+                    off += self.layout_fields[(first + k) as usize].1 as i32;
+                    self.moves.steps.push(Step::Field(first + k));
+                    cur = base;
+                }
+                // The chain's root: a temporary (a call, a literal, a block) when it is no place.
+                _ if cur != e && !self.is_place_expr(cur)? => break Some(cur),
+                _ => break None,
+            }
+        };
+        let Some(base) = base else {
+            self.moves.steps.truncate(start as usize);
+            return Ok(None);
+        };
+        self.moves.steps[start as usize..].reverse();
+        let len = self.moves.steps.len() as u32 - start;
+        Ok(Some((base, start, len, drops, off)))
+    }
+
+    /// Whether `match`/`if let`/`let`-`else` scrutinee `scrutinee` is matched IN PLACE as a
+    /// place no one here owns: a place expression reached through a dereference (`*r`,
+    /// `self.f` with `self: &S`, `(*b).f`), an index, or a static, of ANY type: whether a place
+    /// is copied is never decided by its type or how it is held (a `ref mut` binding of `*r`
+    /// with `r: &mut u32` writes `*r`; held as a scalar copy it wrote the copy). The
+    /// Reference, "Match expressions": "If the scrutinee expression is a place expression, the
+    /// match does not allocate a temporary location; however, a by-value binding may copy or
+    /// move from the memory location"; so nothing moves but what a by-value binding binds,
+    /// and such a binding of a part that needs drop is refused by name (`move_out` finds no
+    /// owner: E0507 behind a reference; out of a `Box`, not built). A local and a temporary are
+    /// not this (their own owners: field flags, `own_scrutinee`); neither is a scrutinee with
+    /// an adjustment (a coercion makes a new value).
+    pub(super) fn scrutinee_in_place(&mut self, scrutinee: ExprId) -> Result<bool, BuildError> {
+        if !self.adjust_rows(scrutinee).is_empty() {
+            return Ok(false);
+        }
+        let mut cur = scrutinee;
+        let borrowed = loop {
+            match self.expr(cur)? {
+                Expr::Paren(inner) if self.adjust_rows(inner).is_empty() => cur = inner,
+                Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
+                    let rows = self.adjust_rows(base);
+                    if rows.is_empty() {
+                        cur = base;
+                        continue;
+                    }
+                    // An autoderef of the base (`self.f`, `self: &S`): behind a pointer.
+                    let kinds = self.checked.adjusts.column::<1>().get(rows).ok_or(malformed("adjustment rows past their column"))?;
+                    break kinds.iter().all(|k| matches!(k, AdjustKind::Deref { .. }));
+                }
+                Expr::Unary { op: UnOp::Deref, .. } | Expr::Index { .. } => break true,
+                // A static's place.
+                Expr::Path(_) => break self.is_place_expr(cur)?,
+                _ => break false,
+            }
+        };
+        Ok(borrowed)
     }
 
     /// `lhs = v` over a value of type `g` at `at` (held as `repr`, needing drop), not a whole

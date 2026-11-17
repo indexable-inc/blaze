@@ -10,8 +10,8 @@
 //! items) and types/src/typeck/coerce_unsized.rs (`coerce_unsized`).
 //!
 //! Unsizing (`coerce_unsized`): `[T; N]` to `[T]` behind a reference or pointer by unification;
-//! to a `dyn` pointee by the solver's `Unsize`; one ADT's two instances (`Box`) by
-//! `CoerceUnsized`; each goal asked in a probe, then registered. Said where it differs: two
+//! to a `dyn` pointee by the solver's `Unsize`; one ADT's two instances (`Box`, `Pin<Box<_>>`)
+//! by `CoerceUnsized`; each goal asked in a probe, then registered. Said where it differs: two
 //! unresolved variables unify instead of registering a `Coerce` predicate. A closure that
 //! captures nothing coerces to a fn pointer (`ClosureFnPointer`).
 
@@ -184,15 +184,14 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         Ok(Some(()))
     }
 
-    /// `coerce_unsized` for one ADT's two instances (`Box<T>` to `Box<dyn Tr>`): only when an
-    /// argument of the target `lb` is a `dyn` or a slice and the two do not unify as they are;
-    /// then `a: CoerceUnsized<b>`, asked, registered, and one `Unsize` adjustment.
+    /// `coerce_unsized` for one ADT's two instances (`Box<T>` to `Box<dyn Tr>`, and nested:
+    /// `Pin<Box<T>>` to `Pin<Box<dyn Tr>>`, a user `Wrap<Rc<T>>`): only when the target's
+    /// arguments `lb` reach a `dyn` or a slice through ADT arguments and pointers
+    /// (rules/coerce_nested.rs) and the two do not unify as they are; then the one general
+    /// question `a: CoerceUnsized<b>`, asked, registered, and one `Unsize` adjustment. The
+    /// nested pointer's own `CoerceUnsized` is the impl's where-clause, the solver's goal.
     fn coerce_unsized_adt(&mut self, a: Ty, b: Ty, lb: TyList, cause: Cause) -> Result<Option<()>, Stop> {
-        let mut unsized_arg = false;
-        for t in self.list(lb) {
-            unsized_arg |= matches!(self.view(t), TyView::Dynamic(_) | TyView::Slice(_));
-        }
-        if !unsized_arg || self.probe(|m| m.unify_some(a, b))?.is_some() {
+        if !self.target_reaches_unsized(lb) || self.probe(|m| m.unify_some(a, b))?.is_some() {
             return Ok(None);
         }
         // As `Unsize` above: no `CoerceUnsized` is the finding naming it, the coercion taken.

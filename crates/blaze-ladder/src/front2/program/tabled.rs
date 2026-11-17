@@ -95,6 +95,11 @@ fn row<'n>(
     // Core's `#[lang = "panic_impl"]` declaration is no symbol: a call of it is a call of the
     // program's `#[panic_handler]` fn (the walk queued it; `resolve` answers it).
     let panic_entry = crate::front2::panic_entry::declares(names, store, key, Alloc::global()).map_err(local)?;
+    // Alloc's `extern "Rust"` allocator declarations are no symbols either: a call of one is a
+    // call of its default (the walk queued it; `resolve` answers it), and the marker
+    // `__rust_no_alloc_shim_is_unstable_v2` is built in place as nothing (front2/alloc_shim.rs).
+    let alloc_shim = crate::front2::alloc_shim::declares(names, store, key, Alloc::global())
+        .map_err(|why| Front2Refusal::Attrs { function: function(), why: why.detail() })?;
     let (body, checked, kind, symbol, lits) = match body {
         Some((body, checked)) => {
             let lits = literals(&body, path)?;
@@ -103,6 +108,7 @@ fn row<'n>(
         // Tabled for its ABI alone (the builder reads a call's ABI from the item the call
         // names): no body, no symbol, never `Foreign`.
         None if panic_entry => (None, None, FnKind::Free, Box::<str>::from(""), Literals::default()),
+        None if alloc_shim.is_some() => (None, None, FnKind::Free, Box::<str>::from(""), Literals::default()),
         // A declaration in an `extern` block is called by its symbol: its `#[link_name]`,
         // else its name.
         None if foreign.is_some() && head.container.is_none() => {
@@ -121,6 +127,12 @@ fn row<'n>(
         (true, None) => {
             let name = path.rsplit("::").next().unwrap_or(path);
             match blaze_build::intrinsics::Which::named(name) {
+                Ok(which) => Some(Intrinsic::Table(which)),
+                Err(_) => return Err(Front2Refusal::Intrinsic { function: function() }),
+            }
+        }
+        (false, None) if alloc_shim == Some(crate::front2::alloc_shim::Shim::Marker) => {
+            match blaze_build::intrinsics::Which::named(crate::front2::alloc_shim::Shim::Marker.declared()) {
                 Ok(which) => Some(Intrinsic::Table(which)),
                 Err(_) => return Err(Front2Refusal::Intrinsic { function: function() }),
             }

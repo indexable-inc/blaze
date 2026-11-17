@@ -24,8 +24,12 @@ pub enum Limit {
 pub enum Malformed {
     /// A portable answer's handle past its nodes, or a child not before its parent.
     PortableIndex { node: u32, len: u32 },
-    /// A generic parameter index past the arguments it is instantiated with.
-    Param { index: u32, args: u32 },
+    /// A generic parameter index past the arguments it is instantiated with. `at` is the line
+    /// that asked for the import (`fold::import` and the helpers over it are `#[track_caller]`,
+    /// so it is the rule's own call: alias.rs, builtin.rs, ..), or the solver's check that
+    /// refused it (coherence's orphan walk); `goal` is the goal being solved (filled by the
+    /// driver's loop, `eval::Search::drive`, as for `Pred`; `None` outside a goal).
+    Param { index: u32, args: u32, at: &'static core::panic::Location<'static>, goal: Option<BadPred> },
     /// Canonical words that do not decode.
     Canonical { at: u32 },
     /// A predicate that cannot be a goal where it was found (an `Eq` in an answer, say).

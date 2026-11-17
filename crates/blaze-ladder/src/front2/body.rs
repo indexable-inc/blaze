@@ -28,7 +28,7 @@ use blaze_lower::typeck::{ConstGapWhy, ConstTerm, Refused, TypeckBody, Types, to
 use blaze_lower::{Lowered, View};
 use blaze_own::Alloc;
 use blaze_surface::Range;
-use blaze_typeck::{ExprId, ItemKey, Name, PTy, PortableTys};
+use blaze_typeck::{ExprId, ItemKey, Name, OwnTys, PTy, PortableTys};
 
 use super::check::{BodyScope, MOST_ROUNDS};
 use super::heads::{CrateCfg, FnHead, HeadError, Maps, Store, Want, own_generics};
@@ -233,10 +233,11 @@ pub struct Body<'n> {
     /// The body's lowering: its view spells the body's names ([`Spelling::of`]).
     pub lowered: Lowered<'static, 'n>,
     pub typeck: TypeckBody<'static>,
-    /// The body's types: a copy of the records' table (`Store::tys`) when it was lowered, then
-    /// the body's own (closures, futures, holes). A record is answered from `Store::tys`
+    /// The body's own types (closures, futures, holes, written types the records' table
+    /// lacked), numbered after the records' table (`Store::tys`) as it stood when the body was
+    /// lowered: read with it, `tys.view(&store.tys)`. A record is answered from `Store::tys`
     /// alone, which never holds a body's type, whatever bodies were checked before.
-    pub tys: PortableTys<'static>,
+    pub tys: OwnTys<'static>,
     pub params: Vec<(Name, u32), Global>,
     pub self_: SelfTy,
     /// The traits in scope at `module`, checker keys, sorted.
@@ -571,12 +572,21 @@ fn lower_fn_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys
 /// head was made in ([`FnHead`]: the Reference's rule, Items > Generics and Implementations:
 /// the container's generic parameters are in scope in its associated items, before the item's
 /// own; `Self` is the implementing type in an impl, and the trait's implicit type parameter,
-/// index 0, in a trait). Its head must be made: a callee the checker picked always has one.
+/// index 0, in a trait). A trait's fn's head must be made (a callee the checker picked always
+/// has one); an impl's fn's is made here when it is not yet ([`Want::MemberFn`]).
 pub fn lower_member<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, key: ItemKey) -> Result<Body<'n>, BodyError> {
     lower_member_into(names, prepared, keys, store, key, None)
 }
 
 fn lower_member_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, key: ItemKey, into: Option<&mut PortableTys<'static>>) -> Result<Body<'n>, BodyError> {
+    // An impl's fn's signature is its own want, made when the fn is used: a body asked before
+    // any check typed a call of it (drop glue, an impl's fn a trait question selected) makes
+    // it here; one refused is its `fn_gaps` row, and `NoHead` below.
+    if !store.fns.contains_key(&key) && !store.fn_gaps.contains_key(&key) {
+        if let Some(want @ Want::MemberFn(impl_, _)) = super::heads::member_fn_want(names, keys, key) {
+            store.ensure(names, keys, want).map_err(|error| BodyError::Head { item: impl_, error })?;
+        }
+    }
     let head: &FnHead<'n> = store.fns.get(&key).ok_or(BodyError::NoHead(key))?;
     if !head.has_body {
         return Err(BodyError::NoBody(key));
@@ -680,20 +690,30 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             locals: &store.locals,
             owner,
         };
-        // Each round converts into a fresh copy of the records' table: a refused round's
-        // types are dropped with it, and none reaches `store.tys`.
-        let (mut own, again) = match into.as_deref_mut() {
-            Some(t) => (PortableTys::new_in(Alloc::global()), Some(t)),
-            None => (store.tys.fork_in(Alloc::global()).map_err(|error| BodyError::Table { item, error })?, None),
+        // Each round converts into a fresh overlay of the records' table (read in place, never
+        // copied): a refused round's types are dropped with it, none reaches `store.tys`, and
+        // what the body keeps is only its own types (`OwnTys`), read over `store.tys` again.
+        let again_now = into.is_some();
+        let (converted, kept) = match into.as_deref_mut() {
+            Some(t) => (to_typeck(&view, owner, t, &mut types, Alloc::global()), None),
+            None => {
+                let mut own = PortableTys::over(&store.tys, Alloc::global()).map_err(|error| BodyError::Table { item, error })?;
+                let converted = to_typeck(&view, owner, &mut own, &mut types, Alloc::global());
+                let kept = match converted {
+                    Ok(_) => Some(own.keep_in(Alloc::global()).map_err(|error| BodyError::Table { item, error })?),
+                    Err(_) => None,
+                };
+                (converted, kept)
+            }
         };
-        let again_now = again.is_some();
-        let tys = match again {
-            Some(t) => t,
-            None => &mut own,
-        };
-        match to_typeck(&view, owner, tys, &mut types, Alloc::global()) {
+        match converted {
             Ok(b) => {
-                typeck = Some((b, own));
+                // Lowered into another table (`lower_again`): the body keeps no types of its own.
+                let kept = match kept {
+                    Some(k) => k,
+                    None => OwnTys::none(Alloc::global()),
+                };
+                typeck = Some((b, kept));
                 break;
             }
             // A fn whose text has no body (an intrinsic's or a foreign fn's declaration, met

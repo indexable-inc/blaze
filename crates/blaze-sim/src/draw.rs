@@ -14,6 +14,11 @@ use core::ops::RangeInclusive;
 use std::alloc::Global;
 use std::collections::BTreeMap;
 
+use blaze_own::{AString, Alloc};
+
+#[cfg(feature = "edge-first")]
+use crate::edge_text;
+use crate::edge_text::{Leak, NAME_ALPHABET};
 use crate::tape::Tape;
 
 #[cfg(test)]
@@ -212,12 +217,22 @@ impl Tape {
         core::array::from_fn(|_| self.span(label, &mut element))
     }
 
-    /// `sizes` bytes, each uniform and its own span; calm is the least size of zeros.
+    /// `sizes` bytes, each uniform and its own span; calm is the least size of zeros. With
+    /// `edge-first`, a gate first (calm: the draw above) and about one draw in four a shape of
+    /// src/edge_text.rs `BYTE_SHAPES` of a size in `sizes`.
     #[expect(
         blaze::as_cast,
         reason = "the cast is the operation: a draw below 256 taken as the byte of the same value, which every such draw is"
     )]
     pub fn bytes(&self, sizes: RangeInclusive<usize>, label: &'static str) -> Vec<u8> {
+        #[cfg(feature = "edge-first")]
+        {
+            // The return below fixes `out`'s type; `Default` allocates nothing.
+            let mut out = Default::default();
+            if edge_text::bytes(self, &sizes, label, &mut out).is_some() {
+                return out;
+            }
+        }
         self.vec(sizes, label, |tape| tape.below(BYTE_VALUES, label) as u8)
     }
 
@@ -229,6 +244,13 @@ impl Tape {
         reason = "a code that does not fit `u32` is no scalar value either, and the one `expect` that follows says both"
     )]
     pub fn char(&self, label: &'static str) -> char {
+        // With `edge-first`: a gate first (calm: the draw below), then one of `EDGE_CHARS`.
+        #[cfg(feature = "edge-first")]
+        {
+            if let Some(edge) = edge_text::char(self, label) {
+                return edge;
+            }
+        }
         let code = match self.below(CHAR_KINDS, label) {
             0..=4 => PRINTABLE_FROM + self.below(PRINTABLE_COUNT, label),
             5 | 6 => past_surrogates(self.below(BASIC_COUNT, label)),
@@ -243,6 +265,14 @@ impl Tape {
     /// `sizes` characters of `char`, each its own span; calm is the least size of spaces.
     pub fn text(&self, sizes: RangeInclusive<usize>, label: &'static str) -> String {
         let mut out = String::new();
+        // With `edge-first`: a gate first (calm: the draw below), then a shape of `TEXT_SHAPES`
+        // of a count of characters in `sizes`.
+        #[cfg(feature = "edge-first")]
+        {
+            if edge_text::text(self, &sizes, label, &mut out).is_some() {
+                return out;
+            }
+        }
         // The elements are pushed as they are drawn, so `vec` decides the length and the spans
         // and its own list holds only `()`, which allocates nothing.
         let _drawn: Vec<()> = self.vec(sizes, label, |tape| out.push(tape.char(label)));
@@ -250,31 +280,91 @@ impl Tape {
     }
 
     /// `sizes` characters, each one of `alphabet`'s and its own span; calm is its first. An
-    /// empty alphabet panics, naming the label.
+    /// empty alphabet panics, naming the label. With `edge-first`, about one draw in four a
+    /// shape the alphabet allows (`FROM_SHAPES`: empty, one character repeated, only its first
+    /// and last), never a character outside it.
     pub fn text_from(
         &self,
         alphabet: &str,
         sizes: RangeInclusive<usize>,
         label: &'static str,
     ) -> String {
+        let mut out = String::new();
+        self.text_from_into(alphabet, sizes, label, Leak::None, &mut out);
+        out
+    }
+
+    /// A text used as a file or item name, in `alloc` (the caller's): `sizes` characters of
+    /// `NAME_ALPHABET` (ASCII letters, digits, `_`, `-`) as `text_from` draws them; calm is the
+    /// least size of `a`s. With `edge-first`, a gate first (calm: the draw above) and about one
+    /// draw in four a shape of `NAME_SHAPES` the sizes allow: `.`, `..`, a leading or trailing
+    /// space or dot, `/`, `\` or a NUL inside, a name of 255 or of 256 UTF-8 bytes; always
+    /// `sizes` characters.
+    pub fn name<'a>(
+        &self,
+        sizes: RangeInclusive<usize>,
+        label: &'static str,
+        alloc: Alloc<'a>,
+    ) -> AString<'a> {
+        let mut out = AString::new_in(alloc);
+        #[cfg(feature = "edge-first")]
+        {
+            if edge_text::name(self, &sizes, label, &mut out).is_some() {
+                return out;
+            }
+        }
+        self.text_from_into(NAME_ALPHABET, sizes, label, Leak::None, &mut out);
+        out
+    }
+
+    /// `text_from`'s draw, written to `out`, with `leak` (`Leak::None` but in the control of
+    /// src/edge_text/tests.rs). Panics on an empty alphabet, naming the label.
+    #[cfg_attr(
+        not(feature = "edge-first"),
+        expect(unused_variables, reason = "only the edge shapes read `leak`")
+    )]
+    pub(crate) fn text_from_into(
+        &self,
+        alphabet: &str,
+        sizes: RangeInclusive<usize>,
+        label: &'static str,
+        leak: Leak,
+        out: &mut impl Extend<char>,
+    ) {
         let count = alphabet.chars().count();
         assert!(
             count > 0,
             "`{label}`: text_from with an empty alphabet: there is no character to draw"
         );
-        let mut out = String::new();
+        #[cfg(feature = "edge-first")]
+        {
+            if edge_text::text_from(self, alphabet, count, &sizes, label, out, leak).is_some() {
+                return;
+            }
+        }
         // As in `text`: `vec` decides the length and the spans; the characters go straight in.
         let _drawn: Vec<()> = self.vec(sizes, label, |tape| {
             let at = tape.index(count, label);
-            out.push(alphabet.chars().nth(at).expect("`index` is below the alphabet's length"));
+            out.extend([alphabet.chars().nth(at).expect("`index` is below the alphabet's length")]);
         });
-        out
     }
 
     /// Any `f64`, NaN and the infinities among them; calm is 0.0. A kind first, the calm one
     /// first: a small whole number; a small integer over a power of two; uniform in `[0, 1)` of
-    /// either sign; any bit pattern; one of the special values.
+    /// either sign; any bit pattern; one of the special values. With `edge-first`, a gate first
+    /// (calm: that draw) and about one draw in four one of `EDGE_FLOATS`.
     pub fn f64(&self, label: &'static str) -> f64 {
+        #[cfg(feature = "edge-first")]
+        {
+            if let Some(edge) = edge_text::float::<f64>(self, label) {
+                return edge;
+            }
+        }
+        self.f64_plain(label)
+    }
+
+    /// `f64` as it was before `edge-first`.
+    fn f64_plain(&self, label: &'static str) -> f64 {
         match self.below(FLOAT_KINDS, label) {
             0 => whole_f64(self, label),
             1 => {
@@ -298,7 +388,14 @@ impl Tape {
     /// Any finite `f64`; calm is 0.0. `f64`'s draw with a NaN or infinite result replaced by
     /// `MAX` of the result's sign (a NaN counts as positive).
     pub fn f64_finite(&self, label: &'static str) -> f64 {
-        let x = self.f64(label);
+        // With `edge-first`: a gate first (calm: the draw below), then a finite `EDGE_FLOATS`.
+        #[cfg(feature = "edge-first")]
+        {
+            if let Some(edge) = edge_text::float_finite::<f64>(self, label) {
+                return edge;
+            }
+        }
+        let x = self.f64_plain(label);
         match Reach::of(x) {
             Reach::Finite => x,
             Reach::AboveMax => f64::MAX,
@@ -315,6 +412,14 @@ impl Tape {
             "`{label}`: f64_in over {lo}..={hi}: an end is NaN or infinite, and the draw is of finite values"
         );
         assert!(lo <= hi, "`{label}`: f64_in over {lo}..={hi}: the range is empty");
+        // With `edge-first`: a gate first (calm: the draw below), then an edge of the range: an
+        // end, an end's neighbour, or a zero of either sign when the range holds zero.
+        #[cfg(feature = "edge-first")]
+        {
+            if let Some(edge) = edge_text::float_in(self, lo, hi, label) {
+                return edge;
+            }
+        }
         match self.below(IN_RANGE_KINDS, label) {
             0 => lo,
             1 => hi,
@@ -328,8 +433,21 @@ impl Tape {
     }
 
     /// Any `f32`, NaN and the infinities among them; calm is 0.0. `f64`'s kinds, drawn as `f32`
-    /// (never an `f64` narrowed, which would miss `f32`'s own subnormals and bit patterns).
+    /// (never an `f64` narrowed, which would miss `f32`'s own subnormals and bit patterns). With
+    /// `edge-first`, a gate first (calm: that draw) and about one draw in four one of
+    /// `EDGE_FLOATS` read as `f32`.
     pub fn f32(&self, label: &'static str) -> f32 {
+        #[cfg(feature = "edge-first")]
+        {
+            if let Some(edge) = edge_text::float::<f32>(self, label) {
+                return edge;
+            }
+        }
+        self.f32_plain(label)
+    }
+
+    /// `f32` as it was before `edge-first`.
+    fn f32_plain(&self, label: &'static str) -> f32 {
         match self.below(FLOAT_KINDS, label) {
             0 => whole_f32(self, label),
             1 => {
@@ -352,7 +470,14 @@ impl Tape {
 
     /// Any finite `f32`; calm is 0.0. As `f64_finite`.
     pub fn f32_finite(&self, label: &'static str) -> f32 {
-        let x = self.f32(label);
+        // As `f64_finite`.
+        #[cfg(feature = "edge-first")]
+        {
+            if let Some(edge) = edge_text::float_finite::<f32>(self, label) {
+                return edge;
+            }
+        }
+        let x = self.f32_plain(label);
         match Reach::of(f64::from(x)) {
             Reach::Finite => x,
             Reach::AboveMax => f32::MAX,
@@ -368,6 +493,13 @@ impl Tape {
             "`{label}`: f32_in over {lo}..={hi}: an end is NaN or infinite, and the draw is of finite values"
         );
         assert!(lo <= hi, "`{label}`: f32_in over {lo}..={hi}: the range is empty");
+        // As `f64_in`.
+        #[cfg(feature = "edge-first")]
+        {
+            if let Some(edge) = edge_text::float_in(self, lo, hi, label) {
+                return edge;
+            }
+        }
         match self.below(IN_RANGE_KINDS, label) {
             0 => lo,
             1 => hi,

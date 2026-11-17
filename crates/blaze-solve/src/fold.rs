@@ -20,11 +20,25 @@ pub struct Scratch<'a> {
     /// The import's memo: a portable node to its arena handle, for the nodes one import
     /// reaches (a record's table may hold many terms; only the root's are walked).
     memo: HashMap<u32, Ty, Alloc<'a>>,
+    /// Which generics of an impl are const parameters, one bit each, by the impl and its
+    /// header's digest (coherence.rs `fresh_for_impl`): found once per solver, not once per
+    /// candidate.
+    masks: HashMap<(crate::term::Def, u64), u64, Alloc<'a>>,
 }
 
 impl<'a> Scratch<'a> {
     pub fn new_in(alloc: Alloc<'a>) -> Scratch<'a> {
-        Scratch { work: Vec::new_in(alloc), out: Vec::new_in(alloc), memo: HashMap::new_in(alloc) }
+        Scratch { work: Vec::new_in(alloc), out: Vec::new_in(alloc), memo: HashMap::new_in(alloc), masks: HashMap::new_in(alloc) }
+    }
+
+    /// The const-parameter mask kept for `impl_` with the header digest `digest`.
+    pub(crate) fn const_mask(&self, impl_: crate::term::Def, digest: u64) -> Option<u64> {
+        self.masks.get(&(impl_, digest)).copied()
+    }
+
+    /// Keeps `mask` for `impl_` with the header digest `digest`.
+    pub(crate) fn keep_const_mask(&mut self, impl_: crate::term::Def, digest: u64, mask: u64) {
+        self.masks.insert((impl_, digest), mask);
     }
 }
 
@@ -172,8 +186,23 @@ pub struct Inst<'i> {
 }
 
 /// The portable term `root` of `p` in the arena, its parameters instantiated by `inst`. A region
-/// parameter becomes `ReErased` (regions are not related: solve.md, "Not ported").
+/// parameter becomes `ReErased` (regions are not related: solve.md, "Not ported"). A parameter
+/// past `inst` is `Malformed::Param` naming the caller's line.
+#[track_caller]
 pub fn import<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, p: Portable<'_>, root: Ty, inst: Inst<'_>) -> Result<Ty, SolveError> {
+    import_at(tys, s, p, root, inst, core::panic::Location::caller())
+}
+
+/// [`import`] with the line a `Malformed::Param` names given: for a helper that imports from a
+/// closure (which cannot forward its caller's location) and takes `at` once, `#[track_caller]`.
+pub fn import_at<T: Tys>(
+    tys: &mut T,
+    s: &mut Scratch<'_>,
+    p: Portable<'_>,
+    root: Ty,
+    inst: Inst<'_>,
+    at: &'static core::panic::Location<'static>,
+) -> Result<Ty, SolveError> {
     let len = p.nodes.len() as u32;
     if root.0 >= len {
         return Err(SolveError::Malformed(Malformed::PortableIndex { node: root.0, len }));
@@ -183,13 +212,20 @@ pub fn import<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, p: Portable<'_>, root: T
     // parent's (children come first in a table), which bounds the walk on a malformed table.
     s.memo.clear();
     let wb = s.work.len();
-    let r = import_walk(tys, s, p, root, inst);
+    let r = import_walk(tys, s, p, root, inst, at);
     s.work.truncate(wb);
     s.memo.clear();
     r
 }
 
-fn import_walk<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, p: Portable<'_>, root: Ty, inst: Inst<'_>) -> Result<Ty, SolveError> {
+fn import_walk<T: Tys>(
+    tys: &mut T,
+    s: &mut Scratch<'_>,
+    p: Portable<'_>,
+    root: Ty,
+    inst: Inst<'_>,
+    at: &'static core::panic::Location<'static>,
+) -> Result<Ty, SolveError> {
     let get = |l: List, x: u32| {
         let at = (l.start + x) as usize;
         if at < p.lists.len() { p.lists[at] } else { Ty::NONE }
@@ -235,7 +271,7 @@ fn import_walk<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, p: Portable<'_>, root: 
                 Some(&a) => a,
                 None => {
                     s.work.truncate(base);
-                    return Err(SolveError::Malformed(Malformed::Param { index: x, args: inst.args.len() as u32 }));
+                    return Err(SolveError::Malformed(Malformed::Param { index: x, args: inst.args.len() as u32, at, goal: None }));
                 }
             },
             TyKind::ReParam(_) => tys.mk(TyKind::ReErased)?,
@@ -243,7 +279,7 @@ fn import_walk<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, p: Portable<'_>, root: 
                 Some(&b) => b,
                 None => {
                     s.work.truncate(base);
-                    return Err(SolveError::Malformed(Malformed::Param { index: x, args: inst.bound.len() as u32 }));
+                    return Err(SolveError::Malformed(Malformed::Param { index: x, args: inst.bound.len() as u32, at, goal: None }));
                 }
             },
             _ => {
@@ -315,3 +351,6 @@ pub fn resolve<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, root: Ty) -> Result<Ty,
     }
     Err(SolveError::Limit(Limit::Walk))
 }
+
+#[cfg(test)]
+mod tests;

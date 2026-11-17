@@ -418,6 +418,13 @@ impl Table {
         self.asked.as_slice().iter().any(|a| a.need == need)
     }
 
+    /// Whether `need` is the need key of a qualified leaf asked here (answered by
+    /// [`eval_asked`], never evaluated by its checker key): what consts.rs `Consts::value_at`
+    /// asks before it files a constant an evaluation needs first.
+    pub fn is_leaf(&self, need: LibKey) -> bool {
+        self.has(need)
+    }
+
     fn at(&self, i: usize) -> Option<(LibKey, LibKey, QSelf, String<Alloc<'static>>)> {
         self.asked.as_slice().get(i).map(|a| (a.need, a.trait_, a.self_, a.name.clone()))
     }
@@ -689,7 +696,7 @@ fn eval_one<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, need_lib: LibKey
     // The impl candidates of (trait, type): the body check's own fill (check.rs `make_once`,
     // `Fill::Impls`), so the impls `impl_const` scans are the ones a body's goal would see.
     make_for(r, Fill::Impls(trait_, shape), need).map_err(wrap)?;
-    let Some((consts, prepared)) = r.consts.take() else { return Err(ConstFail::Nested { item: need }) };
+    let Some((consts, prepared)) = r.consts.take() else { return Err(ConstFail::Nested { item: need, shown: super::check::key_shown(r, need) }) };
     let got = consts.trait_const_value(r, prepared, declared, self_node).map(int_of);
     r.consts = Some((consts, prepared));
     let bits = got?.ok_or(ConstFail::QPathType { constant: declared })?;

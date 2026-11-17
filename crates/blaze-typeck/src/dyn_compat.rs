@@ -358,8 +358,8 @@ pub fn item_dyn_findings<W: World>(world: &W, item: ItemKey, out: &mut Vec<crate
     } else {
         return Err(CheckError::Malformed(Malformed::NoRecord(Question::FnSig(item))).into());
     };
-    let mut seen_nodes: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(types.nodes.len(), Alloc::global());
-    seen_nodes.resize(types.nodes.len(), false);
+    let mut seen_nodes: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(types.len(), Alloc::global());
+    seen_nodes.resize(types.len(), false);
     let mut traits: Vec<ItemKey, Alloc<'_>> = Vec::new_in(Alloc::global());
     let mut kids: Vec<PTy, Alloc<'_>> = Vec::new_in(Alloc::global());
     // Children are pushed reversed so the walk meets types in written order.
@@ -400,8 +400,8 @@ pub fn item_dyn_findings<W: World>(world: &W, item: ItemKey, out: &mut Vec<crate
 /// Whether `Param(0)` is in any of the types `l` of `t`: a bounded walk over the node table,
 /// whose children come before their parents (each node is visited once).
 pub(crate) fn names_self(t: PTys<'_>, l: &[PTy]) -> Result<bool, Stop> {
-    let mut seen: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(t.nodes.len(), Alloc::global());
-    seen.resize(t.nodes.len(), false);
+    let mut seen: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(t.len(), Alloc::global());
+    seen.resize(t.len(), false);
     let mut todo: Vec<PTy, Alloc<'_>> = Vec::with_capacity_in(l.len(), Alloc::global());
     todo.extend_from_slice(l);
     let mut kids: Vec<PTy, Alloc<'_>> = Vec::new_in(Alloc::global());

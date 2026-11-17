@@ -11,8 +11,10 @@
 //! An index: base, then index, each with no expectation. At each autoderef step of the base
 //! (then the array's slice), the builtin case first (an array or slice indexed by `usize` or an
 //! integer variable, which becomes `usize`), then `Index` through the solver, its `Output` the
-//! type. None at all is E0608. Omitted for now: `IndexMut` selection for mutable places (that
-//! is fixed up after the walk in rustc, `convert_place_derefs_to_mutable`), and privacy.
+//! type. None at all is E0608. The base's overloaded derefs in a mutable place become
+//! `DerefMut` after the walk (rules/mut_places.rs, rustc's `convert_place_derefs_to_mutable`).
+//! Omitted for now: recording `IndexMut` for an overloaded index in a mutable place (the record
+//! has no column naming the index method; the builder refuses it by name), and privacy.
 
 use crate::diag::{At, DiagCode};
 use crate::error::Stop;

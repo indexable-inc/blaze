@@ -83,7 +83,7 @@ pub(super) fn fieldless<'n, S: NamesSource<'n>>(names: S, key: LibKey, v: &View<
 /// arguments whose head filed it in `Maps::fieldless_enums` (its head is made before any
 /// path to it has a type, so an enum not filed there is not fieldless).
 pub(super) fn accepts(heads: &Maps, tys: &PortableTys<'_>, t: PTy) -> bool {
-    match tys.view().nodes.get(t.0 as usize) {
+    match tys.view().get(t) {
         Some(PNode::Adt(k, l)) if l.len == 0 => heads.fieldless_enums.contains_key(k),
         _ => false,
     }
@@ -107,7 +107,7 @@ pub(super) enum Term {
 /// enum it is [`Term::Is`] its value, the node `PortableTys::variant_value` makes; of another
 /// enum [`Term::OtherEnum`]. Anything else there is refused by name ([`NOT_A_VARIANT`]).
 pub(super) fn term(tys: &mut PortableTys<'_>, resolve: &dyn Fn(bool, &[&str]) -> Result<Target, ResolveError>, want: PTy, text: &str, r: Range) -> Result<Term, Why> {
-    let enum_ = match tys.view().nodes.get(want.0 as usize) {
+    let enum_ = match tys.view().get(want) {
         Some(&PNode::Adt(k, l)) if l.len == 0 => k,
         _ => return Ok(Term::NotEnum),
     };

@@ -266,7 +266,9 @@ fn exit_status(counts: &x::Counts) -> i32 {
 /// its text is not read by the library's resolve).
 fn library_of(tc: &'static Toolchain, edition: &str) -> Result<&'static Library<'static>, Stop> {
     let stand_in = [SourceFile { path: x::ROOT, text: "fn main() {}\n" }];
-    let new = NewFront { package: x::PACKAGE, edition, shelf: None };
+    // The stand-in is never built (only the library's names are read of it): its overflow
+    // setting is the dev profile's, as a rung's is unless its manifest says otherwise.
+    let new = NewFront { package: x::PACKAGE, edition, shelf: None, overflow: blaze_build::OverflowChecks::On };
     let texts = kept(ProgramTexts::new(&stand_in, x::ROOT, new, tc).map_err(|error| Stop::StandIn { edition: edition.to_string(), error })?);
     let user: &'static UserCrate<'static> = kept(texts.user());
     let inputs: &'static Inputs<'static> = kept(Inputs::new(user, tc).map_err(Stop::Toolchain)?);

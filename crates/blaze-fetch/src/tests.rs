@@ -4,6 +4,7 @@
 use crate::digest::{Algo, Blake3, Digest, DigestRefused};
 use crate::tree::{self, Entry, Kind};
 
+mod local_step;
 mod sim;
 
 #[test]

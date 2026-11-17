@@ -9,7 +9,7 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 use std::alloc::Global;
 
-use blaze_build::data::{DataAlloc, DataError, DataRecord, StaticImage};
+use blaze_build::data::{DataAlloc, DataError, DataRecord, ImageTarget, StaticImage};
 use blaze_build::tls::{self, TlsError, TlsLayout};
 use blaze_build::layout::{LayoutCx, LayoutFacts, Layouts, Missing, ReprAttrs, ValidRange};
 use blaze_build::vtable::{Shape, Vtable, VtableRef, VtableTarget, Word};
@@ -20,6 +20,9 @@ use blaze_consteval::{
 use blaze_ids::ContentId;
 use blaze_typeck::{Checked, ConstHolds, Fetch, PTys};
 use blaze_build::{Abi, Adts, BuildError, Instance, InstanceKey, Intrinsic, StaticItem, Subst, instance_key};
+/// The profile's overflow setting every build entry here takes (D101), for callers that do not
+/// name blaze-build.
+pub use blaze_build::OverflowChecks;
 use blaze_emit::{Code, EmitError, Isa, Os, Via};
 use blaze_own::Alloc;
 use blaze_typeck::{
@@ -58,6 +61,10 @@ pub enum RunError {
     Lower { refusals: std::vec::Vec<Refusal, Global>, shown: Box<str, Global> },
     /// More instances than a slot index holds.
     TooManyInstances,
+    /// A record walk asked for a walk with one overflow setting and records keyed by the other
+    /// ([`build_records_new`]): the code would be filed under a key that does not describe it
+    /// (rule 21).
+    OverflowDisagrees { walk: OverflowChecks, key: OverflowChecks },
     /// The checker stopped on a malformed body or a bound.
     Check { function: Named, error: CheckError },
     /// The checker asked for a question the lowered program's world holds back: the world's bug.
@@ -132,7 +139,21 @@ pub enum RunError {
     /// crate::stub): the program was stopped at that call. `refusal` is why that function was
     /// not built; `not_built` of the `reached` instances the program reaches have a stub.
     NotBuilt { refusal: Box<RunError>, not_built: u32, reached: u32 },
+    /// D91: `function` raised a panic to unwind (it called [`UNWIND_RAISE`]) and unwinding
+    /// through code blaze placed is not registered yet (run.md piece 11, part C): the program was
+    /// stopped at the raise, never left to unwind past frames no unwinder can read. No panic
+    /// strategy is swapped silently: a panic that is never raised costs nothing.
+    UnwindRaised { function: Named },
+    /// A static (`static_`, when the image tells which) points at fn instance `key`, which the
+    /// walk did not reach: the image names it by key alone, so it is not built; its slot holds a
+    /// stub, and only a call through the static stops the program here.
+    StaticFn { static_: Option<ItemKey>, key: InstanceKey },
 }
+
+/// The Itanium ABI's entry that starts an unwind (`_Unwind_RaiseException`): a call of it by a
+/// placed function is a stub that stops the run ([`RunError::UnwindRaised`], D91) until each
+/// placed body's unwind entry is registered (run.md piece 11, part C).
+pub const UNWIND_RAISE: &str = "_Unwind_RaiseException";
 
 /// What a run that stubs its refused instances ([`run_program`]) ended with: the program's
 /// status, and how many of the instances it reaches are not built (none of them was called).
@@ -148,6 +169,9 @@ impl core::fmt::Display for RunError {
         match self {
             RunError::Lower { shown, .. } => write!(f, "{shown}"),
             RunError::TooManyInstances => write!(f, "more than 2^32 instances"),
+            RunError::OverflowDisagrees { walk, key } => {
+                write!(f, "the walk's overflow checks are {walk:?} but its records are keyed {key:?} (rule 21: a key covers every input)")
+            }
             RunError::Check { function, error } => write!(f, "`{function}`: the checker stopped: {error:?}"),
             RunError::Need { function } => {
                 write!(f, "`{function}`: the checker needed a fact the program's world holds back")
@@ -210,6 +234,14 @@ impl core::fmt::Display for RunError {
             RunError::NotBuilt { refusal, not_built, reached } => write!(
                 f,
                 "the program called a function this build of blaze cannot build yet and was stopped there: {refusal} ({not_built} of {reached} reachable functions are not built yet)"
+            ),
+            RunError::StaticFn { static_, key } => match static_ {
+                Some(s) => write!(f, "the static {:#x} points to fn instance {:?}, which no code of the program reaches, so it is not built yet", s.0, key.0),
+                None => write!(f, "a static points to fn instance {:?}, which no code of the program reaches, so it is not built yet", key.0),
+            },
+            RunError::UnwindRaised { function } => write!(
+                f,
+                "the program panicked and `{function}` raised the panic to unwind (`{UNWIND_RAISE}`): unwinding from code records is not registered yet (run.md piece 11, part C), so the run was stopped at the raise"
             ),
         }
     }
@@ -298,9 +330,11 @@ impl RunError {
             | RunError::Vtable { ref function, .. }
             | RunError::MainShape { main: ref function, .. }
             | RunError::NoHost { start: ref function }
+            | RunError::UnwindRaised { ref function }
             | RunError::ConstAt { ref function, .. }
             | RunError::Const { constant: ref function, .. } => Some(function.at),
             RunError::TooManyInstances
+            | RunError::OverflowDisagrees { .. }
             | RunError::NoMain
             | RunError::Lang(_)
             | RunError::Statics { .. }
@@ -309,6 +343,7 @@ impl RunError {
             | RunError::Crates(_)
             | RunError::Edition { .. }
             | RunError::Manifest { .. }
+            | RunError::StaticFn { .. }
             | RunError::Names { .. } => None,
         }
     }
@@ -330,6 +365,8 @@ struct Bodies<'a> {
     /// Every async block's facts, the states of the coroutine instances built so far, and the
     /// library's async items (front2/coroutines.rs).
     coroutines: crate::front2::coroutines::Coroutines,
+    /// What [`FrontAdts`]'s `overflow_checks` answers: the build's caller's setting (D101).
+    overflow: OverflowChecks,
 }
 
 /// One built coroutine instance, its three functions kept until each one's slot is reached
@@ -717,8 +754,8 @@ fn check_for_condition(program: &Front<'_>, j: usize) -> Option<Checked<'static>
 /// `args` of table `types` in `ground`: the table copied node by node (each node's children
 /// come before it, as `PortableTys::intern` requires), then the list.
 fn ground_list(ground: &mut PortableTys<'_>, args: &[PTy], types: PTys<'_>) -> Option<List> {
-    let mut map = Vec::with_capacity_in(types.nodes.len(), Global);
-    for &n in types.nodes {
+    let mut map = Vec::with_capacity_in(types.len(), Global);
+    for &n in types.nodes() {
         let node = match n {
             PNode::Tuple(l) => PNode::Tuple(ground_of_list(ground, types, &map, l)?),
             PNode::Ref(m, t) => PNode::Ref(m, *map.get(t.0 as usize)?),
@@ -820,6 +857,10 @@ impl<P: FrontEnd> LayoutFacts for FrontAdts<'_, P> {
 impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
     fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {
         self.0.adt(key)
+    }
+
+    fn overflow_checks(&self) -> OverflowChecks {
+        self.4.overflow
     }
 
     fn facts(&self) -> &dyn LayoutFacts {
@@ -1016,7 +1057,7 @@ fn entry_shape<P: FrontEnd>(program: &P, main: usize) -> Result<Start, RunError>
     let sig = program.sig(main);
     let row = program.function(main);
     let shape = |what| RunError::MainShape { main: row.named(), what };
-    let node = |t: PTy| sig.types.nodes.get(t.0 as usize);
+    let node = |t: PTy| sig.types.get(t);
     let returns_i32 = matches!(node(sig.output), Some(PNode::Int(blaze_typeck::IntTy::I32)));
     if row.export == Some(HOSTED_START) {
         let one_pointer = matches!(sig.inputs, [p] if matches!(node(*p), Some(PNode::Ptr(Mutbl::Not, _))));
@@ -1061,6 +1102,9 @@ pub struct Built {
     refused: Vec<RunError, Global>,
     /// The instances the entry reaches, built or not: the slots before the getter's.
     reached: u32,
+    /// Each fn instance a static points at, sorted by key, and its slot ([`static_fn_slots`]):
+    /// placement writes the slot's thunk into the static's word.
+    static_fns: Vec<(InstanceKey, u32), Global>,
 }
 
 impl Built {
@@ -1133,22 +1177,21 @@ fn static_image<P: FrontEnd>(
 /// `host` is the host's table (bstd's `wire::HostTable`, built by bstd's `Hosting`): a program
 /// that starts at bstd's hosted entry is called with it, and refused without one; any other
 /// program does not read it.
-pub fn run(files: &[SourceFile<'_>], root: &str, host: Option<NonNull<c_void>>) -> Result<u8, RunError> {
-    run_with(files, root, host, FrontChoice::Old)
+pub fn run(files: &[SourceFile<'_>], root: &str, host: Option<NonNull<c_void>>, overflow: OverflowChecks) -> Result<u8, RunError> {
+    run_with(files, root, host, FrontChoice::Old(overflow))
 }
 
-/// Which front end answers the back half (crate::seam): one explicit input of the runner, the
-/// old one by default. The new one never hands a program to the old one: what it cannot do is
-/// a [`RunError::Front2`] naming it.
-#[derive(Clone, Copy, Debug, Default)]
+/// Which front end answers the back half (crate::seam): one explicit input of the runner. The
+/// new one never hands a program to the old one: what it cannot do is a [`RunError::Front2`]
+/// naming it. Each carries the profile's `overflow-checks` (D101; [`NewFront::overflow`]).
+#[derive(Clone, Copy, Debug)]
 pub enum FrontChoice<'a> {
-    #[default]
-    Old,
+    Old(OverflowChecks),
     New(NewFront<'a>),
 }
 
-/// What the new front end needs that the old one does not: the package as the names library
-/// takes it.
+/// What the new front end needs: the package as the names library takes it, and the
+/// profile's overflow setting the build takes (the old front end takes it beside the files).
 #[derive(Clone, Copy, Debug)]
 pub struct NewFront<'a> {
     /// The package's name: its crate's name.
@@ -1157,12 +1200,16 @@ pub struct NewFront<'a> {
     pub edition: &'a str,
     /// The toolchain's shelf; `None` resolves over no toolchain crate (a `#![no_core]` program).
     pub shelf: Option<&'a str>,
+    /// The profile's `overflow-checks` (decision D101): `run` and `test` build with the `dev`
+    /// profile's (on unless the manifest's `[profile.dev]` says otherwise), `export` with
+    /// `release`'s (off unless `[profile.release]` says otherwise).
+    pub overflow: OverflowChecks,
 }
 
 /// [`run`] through the front end `choice` names.
 pub fn run_with(files: &[SourceFile<'_>], root: &str, host: Option<NonNull<c_void>>, choice: FrontChoice<'_>) -> Result<u8, RunError> {
     let built = match choice {
-        FrontChoice::Old => build(files, root)?,
+        FrontChoice::Old(overflow) => build(files, root, overflow)?,
         FrontChoice::New(new) => build_new(files, root, new)?,
     };
     run_built(built, host)
@@ -1189,20 +1236,26 @@ pub fn ran_built(mut built: Built, host: Option<NonNull<c_void>>) -> Result<Ran,
     let tls = match (built.getter, image) {
         (Some(getter), Some((image, base))) => {
             let at = image.static_at(TLS_DESC).ok_or(RunError::Place(PlaceError::NoDescriptor))?;
-            let desc = base + u64::from(at);
-            place::create_tls_key(desc).map_err(RunError::Place)?;
-            Some(place::Tls { desc, getter })
+            // The key goes into the descriptor after `place` wrote the image (below).
+            Some(place::Tls { desc: base + u64::from(at), getter })
         }
         _ => None,
     };
     // Each stub's refusal in words, for the one stop that cannot come back here (a stub called
     // on a thread the program started: stub.rs `stopped`).
     let said: Box<[Box<str>]> = built.refused.iter().map(|refusal| format!("{refusal}").into_boxed_str()).collect();
-    let not_built = u32::try_from(built.refused.len()).map_err(|_| RunError::TooManyInstances)?;
-    let placed = place::place(&built.bodies, &built.vtables, image, tls, said).map_err(RunError::Place)?;
+    // A raise's stub (D91) is no function left unbuilt: not counted.
+    let raises = built.refused.iter().filter(|refusal| matches!(refusal, RunError::UnwindRaised { .. })).count();
+    let not_built = u32::try_from(built.refused.len() - raises).map_err(|_| RunError::TooManyInstances)?;
+    let placed = place::place(&built.bodies, &built.vtables, image, &built.static_fns, tls, said).map_err(RunError::Place)?;
+    if let Some(tls) = tls {
+        place::create_tls_key(tls.desc).map_err(RunError::Place)?;
+    }
     // The entry's instance was the first reached.
     match placed.call(0, entry).map_err(RunError::Place)? {
         place::Ended::Status(status) => Ok(Ran { status, not_built, reached: built.reached }),
+        // D91: the program raised a panic to unwind; stopped there, by its own error.
+        place::Ended::Stub(stub) if matches!(built.refused.get(stub as usize), Some(RunError::UnwindRaised { .. })) => Err(built.refused.swap_remove(stub as usize)),
         place::Ended::Stub(stub) if (stub as usize) < built.refused.len() => {
             Err(RunError::NotBuilt { refusal: Box::new(built.refused.swap_remove(stub as usize)), not_built, reached: built.reached })
         }
@@ -1214,15 +1267,17 @@ pub fn ran_built(mut built: Built, host: Option<NonNull<c_void>>) -> Result<Ran,
 /// What `blaze run` refuses of the program of `files`, every stage up to placing: empty when
 /// it would place and call `main`. blaze-cli's findings path calls this, and [`run`] stops at
 /// the same refusals, so the two cannot disagree (rule 30). Each stage stops at its first.
-pub fn refusals(files: &[SourceFile<'_>], root: &str) -> Vec<Refusal, Global> {
-    findings(files, root).0
+pub fn refusals(files: &[SourceFile<'_>], root: &str, overflow: OverflowChecks) -> Vec<Refusal, Global> {
+    findings(files, root, overflow).0
 }
 
 /// [`refusals`], and the `blaze::` attributes the front end read: the advice about unknown
 /// names and the count nothing checks ([`BlazeAttrs::note`]). `blaze check`'s call.
-pub fn findings(files: &[SourceFile<'_>], root: &str) -> (Vec<Refusal, Global>, BlazeAttrs) {
+/// `overflow` is the setting `blaze run` would build with: with it on, an integer `+` needs
+/// core's `panic_const_add_overflow`, so the refusals can differ.
+pub fn findings(files: &[SourceFile<'_>], root: &str, overflow: OverflowChecks) -> (Vec<Refusal, Global>, BlazeAttrs) {
     let mut blaze = BlazeAttrs::default();
-    let refusals = match build_noting(files, root, &mut blaze) {
+    let refusals = match build_noting(files, root, &mut blaze, overflow) {
         Ok(_) => Vec::new_in(Global),
         Err(error) => error.refusals(),
     };
@@ -1234,8 +1289,8 @@ pub fn findings(files: &[SourceFile<'_>], root: &str) -> (Vec<Refusal, Global>, 
 /// Every body is checked once, generically. Instances are then built from `main` forward:
 /// slot `n` is the `n`th instance reached, and only reached instances are built (a generic fn
 /// once per list of ground arguments, an unreached fn never).
-pub fn build(files: &[SourceFile<'_>], root: &str) -> Result<Built, RunError> {
-    build_noting(files, root, &mut BlazeAttrs::default())
+pub fn build(files: &[SourceFile<'_>], root: &str, overflow: OverflowChecks) -> Result<Built, RunError> {
+    build_noting(files, root, &mut BlazeAttrs::default(), overflow)
 }
 
 /// [`build`] through the new front end: the program's names resolved by the names library over
@@ -1260,7 +1315,7 @@ pub fn build_over(names: &blaze_scope::resolve::Names<'_>, files: &[SourceFile<'
     let (root_file, appended) = (texts.root_file, texts.appended);
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).map_err(|e| RunError::Names { shown: std::format!("the command's frame: {e}").into_boxed_str() })?;
     let mut program = Front2Program::new(names, &frame, files).map_err(RunError::Front2)?;
-    build_with(&mut program).map_err(|error| match (appended, error.function_at()) {
+    build_with(&mut program, texts.overflow).map_err(|error| match (appended, error.function_at()) {
         // A finding inside text the user never wrote is reported at `main`'s parameters.
         (Some(a), Some(at)) if at.file as usize == root_file && at.place >= a.user_len => RunError::Entry {
             file: root_file as u32,
@@ -1321,7 +1376,7 @@ pub fn build_stubbed(names: &blaze_scope::resolve::Names<'_>, files: &[SourceFil
     if let Some((item, why)) = program.own_left_out() {
         return Err(RunError::Front2(Front2Refusal::OwnLeftOut { item, why }));
     }
-    let built = build_from(&mut program, None, None, true).map_err(|error| match (appended, error.function_at()) {
+    let built = build_from(&mut program, None, None, true, texts.overflow).map_err(|error| match (appended, error.function_at()) {
         // As [`build_over`]: a finding inside text the user never wrote is at `main`'s parameters.
         (Some(a), Some(at)) if at.file as usize == root_file && at.place >= a.user_len => RunError::Entry {
             file: root_file as u32,
@@ -1334,21 +1389,21 @@ pub fn build_stubbed(names: &blaze_scope::resolve::Names<'_>, files: &[SourceFil
 }
 
 /// [`build`], the `blaze::` attributes the front end read put in `blaze`.
-fn build_noting(files: &[SourceFile<'_>], root: &str, blaze: &mut BlazeAttrs) -> Result<Built, RunError> {
+fn build_noting(files: &[SourceFile<'_>], root: &str, blaze: &mut BlazeAttrs, overflow: OverflowChecks) -> Result<Built, RunError> {
     let mut program = Front::new(files, root, blaze).map_err(|refusal| {
         let mut refusals = Vec::with_capacity_in(1, Global);
         refusals.push(refusal);
         let shown = plain(files, &refusals).into_boxed_str();
         RunError::Lower { refusals, shown }
     })?;
-    build_with(&mut program)
+    build_with(&mut program, overflow)
 }
 
 /// The back half over any front end (crate::seam): its bodies checked, consts and statics
-/// evaluated, instances built from the entry forward, emitted.
-pub fn build_with<P: FrontEnd>(program: &mut P) -> Result<Built, RunError> {
+/// evaluated, instances built from the entry forward, emitted, with the profile's `overflow`.
+pub fn build_with<P: FrontEnd>(program: &mut P, overflow: OverflowChecks) -> Result<Built, RunError> {
     // Only a survey goes on with no entry: a run's `None` is no `main`.
-    build_from(program, None, None, false)?.ok_or(RunError::NoMain)
+    build_from(program, None, None, false, overflow)?.ok_or(RunError::NoMain)
 }
 
 /// The run path's code records (code_records.rs; run.md pieces 3 and 7): every instance the
@@ -1359,14 +1414,20 @@ pub fn build_with<P: FrontEnd>(program: &mut P) -> Result<Built, RunError> {
 /// the thread-local getter when the program has thread-locals: one function a program, made as
 /// its own record (`RecordRun::getter`) since no caller declares it. The program's vtables and
 /// statics are data, not records here: placed by the launcher's piece.
+/// The walk's overflow setting is the one the records are keyed by (`records.builder`).
 pub fn build_records<P: FrontEnd>(program: &mut P, records: &mut crate::code_records::RecordRun<'_>) -> Result<(), RunError> {
-    build_from(program, None, Some(records), false)?;
+    let overflow = records.builder.settings.overflow_checks;
+    build_from(program, None, Some(records), false, overflow)?;
     Ok(())
 }
 
 /// [`build_records`] over the new front end, the program read as [`build_new`] reads it: the
 /// run path of `blaze run` on front2 (run.md piece 3).
 pub fn build_records_new(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>, records: &mut crate::code_records::RecordRun<'_>) -> Result<(), RunError> {
+    let key = records.builder.settings.overflow_checks;
+    if new.overflow != key {
+        return Err(RunError::OverflowDisagrees { walk: new.overflow, key });
+    }
     let tc = match new.shelf {
         Some(shelf) => Toolchain::open(&mut DirShelf::new(shelf.into())).map_err(RunError::Crates)?,
         None => Toolchain::none(),
@@ -1395,9 +1456,9 @@ pub struct SurveyCounts {
 /// is built as the run builds it, but a refusal (the builder's, a callee's resolution or
 /// absence, the emitter's) is filed in `refused` (the fn, the refusal's typed name) and the
 /// walk goes on, so one refusal hides nothing behind it but the callees of the refused fn.
-pub fn build_survey<P: FrontEnd>(program: &mut P, refused: &mut Vec<(Box<str>, Box<str>), Global>) -> Result<SurveyCounts, RunError> {
+pub fn build_survey<P: FrontEnd>(program: &mut P, refused: &mut Vec<(Box<str>, Box<str>), Global>, overflow: OverflowChecks) -> Result<SurveyCounts, RunError> {
     let mut counts = SurveyCounts { built: 0, tried: 0, no_instance: Vec::new_in(Global) };
-    build_from(program, Some((refused, &mut counts)), None, false)?;
+    build_from(program, Some((refused, &mut counts)), None, false, overflow)?;
     Ok(counts)
 }
 
@@ -1405,7 +1466,9 @@ pub fn build_survey<P: FrontEnd>(program: &mut P, refused: &mut Vec<(Box<str>, B
 /// emitter's `emit:`) and the walk goes on; in the stub build, `e` kept as its slot's refusal
 /// ([`Stubs::keep`]) and the walk goes on; in a strict run, `e` stops it.
 fn filed(sink: &mut Sink<'_>, e: RunError) -> Result<(), RunError> {
-    if let Some(stubs) = sink.stubs.as_mut() {
+    if sink.stub_refusals
+        && let Some(stubs) = sink.stubs.as_mut()
+    {
         if !stubbed(&e) {
             return Err(e);
         }
@@ -1546,7 +1609,12 @@ impl Reached {
 /// strict build stops at it), a survey's list, or the stub build's table.
 struct Sink<'a> {
     survey: Option<&'a mut Vec<(Box<str>, Box<str>), Global>>,
+    /// The stubs of a build that runs (the stub build's and a strict one's): a strict build
+    /// keeps only the stops no build can avoid yet (an unwind's raise, D91).
     stubs: Option<Stubs>,
+    /// Whether a refusal of one instance becomes its stub ([`build_stubbed`]) rather than the
+    /// strict build's stop.
+    stub_refusals: bool,
 }
 
 /// The stub build's refusals ([`build_stubbed`]): each instance that could not be built keeps
@@ -1590,7 +1658,7 @@ impl Stubs {
 /// of its own holding a stub (`Some`: the caller is built, and stops only if it makes this
 /// call); else `refusal` goes to [`filed`] and the caller is left unbuilt (`None`).
 fn unresolved(sink: &mut Sink<'_>, reached: &mut Reached, called: Instance, caller: usize, refusal: RunError) -> Result<Option<u32>, RunError> {
-    if sink.stubs.is_some() && stubbed(&refusal) {
+    if sink.stub_refusals && sink.stubs.is_some() && stubbed(&refusal) {
         return reached.unresolved(called, caller, refusal).map(Some);
     }
     filed(sink, refusal)?;
@@ -1642,13 +1710,15 @@ fn build_from<P: FrontEnd>(
     surveyed: Option<(&mut Vec<(Box<str>, Box<str>), Global>, &mut SurveyCounts)>,
     mut records: Option<&mut crate::code_records::RecordRun<'_>>,
     stub_refusals: bool,
+    overflow: OverflowChecks,
 ) -> Result<Option<Built>, RunError> {
     let (survey, mut counts) = match surveyed {
         Some((refused, counts)) => (Some(refused), Some(counts)),
         None => (None, None),
     };
-    let stubs = stub_refusals.then(|| Stubs { refused: Vec::new_in(Global), slot: 0, last: None });
-    let mut survey = Sink { survey, stubs };
+    // Every build that runs has a stub table: a strict one for the raise's stop alone (D91).
+    let stubs = (stub_refusals || survey.is_none()).then(|| Stubs { refused: Vec::new_in(Global), slot: 0, last: None });
+    let mut survey = Sink { survey, stubs, stub_refusals };
     let entry = match (program.entry(), survey.survey.is_some()) {
         (Some(main), _) => Some(main),
         (None, true) => None,
@@ -1685,6 +1755,7 @@ fn build_from<P: FrontEnd>(
         closures: ClosureTable::of(program, &checked),
         coroutines: crate::front2::coroutines::Coroutines::of(program, &checked, Alloc::global()),
         const_at: crate::front2::const_at::ConstTable::new_in(Global),
+        overflow,
     };
     // Each coroutine instance built, its three functions waiting for their slots.
     let mut coroutine_stash: Vec<BuiltParts, Global> = Vec::new_in(Global);
@@ -1755,6 +1826,41 @@ fn build_from<P: FrontEnd>(
             reached.instances.push(instance);
             reached.tabled.push(c);
             reached.keys.push(Some(key));
+        }
+    }
+    // A build that runs: each fn a static points at is reached as the entry is (a static's fn
+    // pointer is called through the static, which no walk step sees). The image names it by
+    // its instance key alone; a fn with no generics is found by that key, in the program's fn
+    // order, only while a key is unfound. A generic instance is not found here: its slot is a
+    // stub ([`static_fn_slots`], [`RunError::StaticFn`]).
+    if survey.stubs.is_some()
+        && let Some(image) = image.as_ref()
+    {
+        let mut wanted: Vec<InstanceKey, Global> = Vec::new_in(Global);
+        wanted.extend(image.relocs.iter().filter_map(|r| match r.target {
+            ImageTarget::Fn(key) => Some(key),
+            ImageTarget::Image(_) => None,
+        }));
+        wanted.sort_unstable();
+        wanted.dedup();
+        wanted.retain(|key| !reached.keys.contains(&Some(*key)));
+        for c in 0..program.fn_count() {
+            if wanted.is_empty() {
+                break;
+            }
+            if program.function(c).body.is_none() || checked[c].is_none() || generic(program, c) {
+                continue;
+            }
+            let instance = Instance { item: program.function(c).key, args: List::EMPTY };
+            // A fn whose key cannot be made is no static's target: the evaluator made a key for
+            // each target, and a key this walk cannot make is refused when a call reaches it.
+            let Ok(key) = key_of(program, c, instance, &mut ground, &keyer) else { continue };
+            if let Ok(i) = wanted.binary_search(&key) {
+                wanted.remove(i);
+                reached.instances.push(instance);
+                reached.tabled.push(c);
+                reached.keys.push(Some(key));
+            }
         }
     }
     let mut bodies = Vec::with_capacity_in(program.fn_count(), Global);
@@ -2090,6 +2196,12 @@ fn build_from<P: FrontEnd>(
                 };
                 via.push(Via::Slot);
                 targets.push(Target::Slot(reached.slot(callee, c, key)?));
+            } else if target.kind == FnKind::Foreign && target.symbol == UNWIND_RAISE && survey.stubs.is_some() {
+                // D91: the raise is a stub of its own that stops the run (a survey, which runs
+                // nothing, keeps the outside symbol below).
+                let slot = reached.unresolved(callee, i, RunError::UnwindRaised { function: name() })?;
+                via.push(Via::Slot);
+                targets.push(Target::Slot(slot));
             } else if target.kind == FnKind::Foreign {
                 via.push(Via::Address);
                 targets.push(Target::Symbol(target.symbol.into()));
@@ -2322,6 +2434,12 @@ fn build_from<P: FrontEnd>(
     }
     // A survey with no entry makes no image: its counts are the answer.
     let Some(main) = entry else { return Ok(None) };
+    // A build that runs: each fn a static points at gets its slot (a stub's when the walk did
+    // not reach it), before the getter's slot.
+    let static_fns = match (image.as_ref(), survey.stubs.as_mut()) {
+        (Some(image), Some(stubs)) => static_fn_slots(image, &reached.keys, stubs, &mut bodies)?,
+        _ => Vec::new_in(Global),
+    };
     // The thread-locals' getter, once, in the slot after every instance; it calls its imports
     // directly.
     let getter = match tls_layout {
@@ -2346,5 +2464,40 @@ fn build_from<P: FrontEnd>(
     // has any refusal to list.
     let reached = u32::try_from(reached.instances.len()).map_err(|_| RunError::TooManyInstances)?;
     let refused = survey.stubs.map_or_else(|| Vec::new_in(Global), |stubs| stubs.refused);
-    Ok(Some(Built { bodies, vtables: tables.images, start, start_fn: program.function(main).named(), image, getter, refused, reached }))
+    Ok(Some(Built { bodies, vtables: tables.images, start, start_fn: program.function(main).named(), image, getter, refused, reached, static_fns }))
+}
+
+/// Each fn instance `image` points at (its `ImageTarget::Fn` words), sorted by key, with its
+/// slot: the slot the walk built it in (`keys` by slot), else a slot of its own at the end of
+/// `bodies` holding a stub with [`RunError::StaticFn`] (the image names it by key alone, so the
+/// walk cannot build it: it stops the program only if called through the static).
+fn static_fn_slots(image: &StaticImage<Global>, keys: &[Option<InstanceKey>], stubs: &mut Stubs, bodies: &mut Vec<Body, Global>) -> Result<Vec<(InstanceKey, u32), Global>, RunError> {
+    let mut by_key: Vec<(InstanceKey, u32), Global> = Vec::with_capacity_in(keys.len(), Global);
+    for (slot, key) in keys.iter().enumerate() {
+        if let Some(key) = key {
+            by_key.push((*key, u32::try_from(slot).map_err(|_| RunError::TooManyInstances)?));
+        }
+    }
+    // The first slot of a key, as `Reached::slot` gives it.
+    by_key.sort_by_key(|k| k.0);
+    by_key.dedup_by_key(|k| k.0);
+    let mut out: Vec<(InstanceKey, u32), Global> = Vec::new_in(Global);
+    for r in image.relocs.iter() {
+        let ImageTarget::Fn(key) = r.target else { continue };
+        let Err(at) = out.binary_search_by_key(&key, |f| f.0) else { continue };
+        let slot = match by_key.binary_search_by_key(&key, |k| k.0) {
+            Ok(found) => by_key[found].1,
+            Err(_) => {
+                let slot = bodies.len();
+                // The static whose bytes hold the word: the last whose first byte is at or before it.
+                let static_ = image.statics.iter().filter(|s| s.1 <= r.at).max_by_key(|s| s.1).map(|s| s.0);
+                stubs.slot = slot;
+                stubs.keep(RunError::StaticFn { static_, key });
+                bodies.push(stubs.body(slot).ok_or(RunError::TooManyInstances)?);
+                u32::try_from(slot).map_err(|_| RunError::TooManyInstances)?
+            }
+        };
+        out.insert(at, (key, slot));
+    }
+    Ok(out)
 }

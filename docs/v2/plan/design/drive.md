@@ -1366,6 +1366,102 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
       a scratch that is reset a finding (or stream it), so 3,487 findings fit; a full frame
       there is `CliError`, never a panic (step 6's typed refusal); then the cold check again
       with blaze-r13-c's successor for its closing line, then a repeat and step 3 and 5.
+    - RUNNER 15 2026-11-16 (uncommitted; run files in port27/drive-1116/r15/; binary
+      port27/drive-1116/blaze-r15-a, a greenmix of the live tree).
+      DONE 1: printing without a panic. print.rs `list` resets `scratch.file` a file (it had
+      been lost); `thousands_of_findings_are_drawn_in_frames_a_fraction_of_their_work` failed
+      without the reset ("the allocator refused 360 bytes") and passes with it.
+      DONE 2, the clone's three runs (blaze-r15-a; `/usr/bin/time -l`, loads 35.7, 47.7, 40.5):
+      cold 49.66 s real, 487263959229 instructions, 13587120128 bytes peak; repeat 4.91 s,
+      44604506101, 1134428160; one body edit (blaze-diff `differentiate`, still in the clone)
+      8.01 s, 45575525092, 1121763328. Each ends "incomplete: NOT checked: types, borrows" and
+      "3487 errors: blaze check", exit 1. The edit run: "FileItems found 4703 made 1",
+      "BodyCheck found 110513 made 1", "store gets 121929 hits 121905". The repeat is not
+      certified: 22 tasks fail every run (14 MacroModule "store lacks", 6 MacroModule
+      "without module identity", 2 CrateScope tests records "marked `test` or `bench` more
+      than once": blaze_cargo, blaze_diagnostics).
+      IN PROGRESS, "an answer with errors is certified": work.rs files a typed failure as
+      the task's record (out `failed_out`, one `task-failed` error, Cli wording 16; its reads
+      are every input it was handed), so the request writes its certificate; a task handed a
+      filed failure fails `Waited` and is filed the same way. Not filed: a failure on a fact
+      outside the key and the reads (`Did::Hole`: a source not fetched, the home's module
+      store, no home), a panic, a task handed a hole (`task.failed`). names.rs files its own
+      failures with the files it read (`scope_record`, `Unwritten`); a refused tests record
+      is now a finding beside an empty tests section. print.rs lists a finding in a file
+      that is not UTF-8 without a place. Test `an_answer_with_errors_is_certified_and_asked_
+      again_when_its_input_moves`, control `Plant::FiledWithoutReads`. HONEST LIMIT: the 14
+      MacroModule "store lacks" stay holes (the home's module store is in no key), so the
+      clone's repeat stays uncertified until the module store is a checked fact (a stamp of
+      `proc-macro/modules` read as an input) or the modules are filled. Test green: "mixcheck
+      test blaze-cli: exit 0; 112 passed, 0 failed" (tree f49ac44007), blaze-drive "45
+      passed". Its first form (a non-UTF-8 module file) passed with the plant too: a
+      `FileItems` key holds its text, so reads never mattered; the two-member form catches it.
+      The clone with blaze-r15-b (r15/d): first 40.19 s, 487258064830 instructions, 13606109184
+      bytes, "3507 errors" (the 20 more are the filed failures: 6 macro crates without an
+      identity, 2 tests records, `Waited` ones); repeat 3.71 s, 36621888783, 748470272, NOT
+      certified ("certificate missed"): the 14 `MacroModule` holes.
+      RUN_OUTPUT ("`sized` is declared twice"): the refusal now names both crates (front2
+      index.rs `LangTwice::crates`): "ba497b86.. (crate `ladder-3-hello`, /ladder-3-hello/src/
+      main.rs) and 2980e808..": the `#![no_core]` program's own `#[lang = "sized"]` against
+      core's, which `run_program` resolves beside it whenever a shelf is given. Fixed in
+      `Index::new`: a `no_core` program's lang items are its own (it links no toolchain
+      crate). Owed: such a program should resolve no toolchain crate at all.
+      RUN_OUTPUT AFTER THE FIX (tree d9939596e5, 16:56): the clash is gone, and the run now
+      fails differently: "`blaze run` on 3-hello past 60s" (run_output.rs:92). That is a
+      deadline hit, not a refusal. Not yet looked at: profile it first. It may be the debug
+      build resolving the whole toolchain for a `no_core` program, which the owed change
+      (resolve no toolchain crate for `no_core`, run.rs `run_program`/`build_new`) would
+      remove; that is not shown yet.
+      ## HAND-ON 16:58 (runner 15, at the context limit)
+      GREEN: "mixcheck test blaze-cli: exit 0; 112 passed, 0 failed" (tree f49ac44007, with
+      the filed-failure test and its control); "mixcheck test blaze-drive: exit 0; 45 passed"
+      (22186d6527); "mixcheck blaze-ladder: check ok (all targets)" (d561e20994, with the
+      index.rs fix). blaze-cli went red at 16:5x in the PIPELINE ON RECORDS runner 2's files
+      (body_types.rs, work.rs `run_batches`), not mine; `--test run_output` with the index fix
+      waits on it (see the result line below if it came).
+      HALF-DONE: nothing mid-edit. The store get: measured and floor written, no code changed
+      (the bstd writer aa45ab6b5cc95648d offers `File::read_at` through `Io::call`, one
+      function in blaze-std fs.rs; mapped packs are the end state: main assigns).
+      OPEN, in order: (1) a certified repeat on the clone: make the home's module store a
+      checked fact (its listing's stamp an input of `MacroModule`) so "store lacks" is filed,
+      not a hole; then the repeat makes 1 get, not 122k. (2) The 31-49 µs store get (above).
+      (3) `store.name_tool(tool)` after `Layered::open` (main.rs:750; `name_tool` is not in
+      store.rs yet: W1-7's piece). (4) `run_after_check` NoMain (program.rs, hello-world lane).
+      (5) PIPELINE ON RECORDS runner 2's `Spawned::Need` arm (theirs; told them go ahead).
+      (6) The `test` arm in main.rs (plan: new test_cmd.rs; suites from the UnitGraph's
+      CrateScope parts via `Request::settled_input`, added before `certificate()`; drive
+      `TestLoop` with `test_run::Runner` over `Unbuilt`; exit `NOT_RUN` when it cannot run;
+      tests/test_command.rs to pass args after `--` and lose `#[ignore]`). (7) Names off the
+      main thread (CrateScope pooled: step 4). (8) D101's overflow-checks from the manifest's
+      profile (WRONG ANSWERS runner 6 will ask).
+      FILES EDITED since 15:45: blaze-cli src/work.rs (`TASK_FAILED`, `failed_out`,
+      `failed_input`, `filed`, `filed_record`, `Did::Hole`, `Spawned::Waited`,
+      `Plant::FiledWithoutReads`, `Unread::Text` as a task failure), names.rs (`scope_record`,
+      `ScopeRecord`, `Unwritten`, `Resolved::failed`), graph.rs, fetch.rs, macros.rs (holes),
+      fetch_tests.rs, print.rs (`list` reset and non-UTF-8 unplaced; `finding` prints the
+      code), main.rs (test `an_answer_with_errors_is_certified_and_asked_again_when_its_input_
+      moves`); blaze-drive src/request.rs (`settled_input`, `Waited` words); blaze-report
+      src/frame/words.rs (Cli 16 `task-failed`); blaze-ladder src/front2/index.rs
+      (`LangTwice::crates`, `keys_of`, the `no_core` rule); this file. Clone edit still in
+      place: main-clone crates/blaze-diff/src/lib.rs `let _edited = var + 1;`.
+      THE STORE GET, measured before any change (blaze-r15-a, the clone after the edit,
+      r15/p1: `sample` 3 s of a 5.62 s repeat): "effect get 243858x 3779997663" ns for 121929
+      gets, 31 µs a get (49 µs at load 40.5 in the edit run). Of the main thread's 1656
+      samples, 1364 are `Layered::get_into`, 1284 `PackStore::get_into`, 1199 `File::read_at`,
+      and 1188 of those wait: `Pending::wait` > `Io::poll` > `Kqueue::wait` > `kevent` (1154).
+      The read itself is handed to the kqueue thread (`Io::submit` > `hand_over` >
+      `Kqueue::to_threads` > `__ulock_wake`, 67 samples) and run there (`pread` 116 samples
+      over all threads). So 93% of a get is the hand-off to another thread and the wait for
+      its completion; the binary search over the packs' rows is 80 samples. FLOOR: a get is
+      one binary search per pack (4 local packs, about 17 compares each) and one copy of the
+      record from the page cache: a `pread` on the calling thread is about 1.5 µs, a copy from
+      a read-only mapping of the pack under 0.5 µs for these records. Floor about 1 µs a get,
+      30 to 50 times under today's. The fix of the largest part is the bstd writer's piece
+      (OWNERS.md: "blocking file calls inline on the native driver", aa45ab6b5cc95648d); the
+      store's own end state is the packs mapped read-only at open (a bstd `File::map` over
+      the existing `Effect::Map`), a get a copy or a borrow. Beyond the floor of a get: an
+      edit run makes 121929 gets for one changed body, gets in proportion to the tree, not
+      the edit.
 - Owed, not now: `run` after `check` writes its own certificate, because the command is in
   the key. That costs 3.5 ms against the second run's 1.0 ms on hello-world. A coarse proof
   covers all under it: `check`'s certificate should stand for `run`'s check part.

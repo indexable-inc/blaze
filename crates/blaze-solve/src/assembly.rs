@@ -270,6 +270,13 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
         self.mk_list(&v)
     }
 
+    /// [`Cx::fresh_impl_args`] for the impl `impl_`, whose const parameters are found once per
+    /// solver (coherence.rs `fresh_for_impl`).
+    pub fn fresh_impl_args_of(&mut self, impl_: Def, h: &ImplHeader<'_>) -> Result<List, Stop> {
+        let v = crate::coherence::fresh_for_impl(self.tys, self.scratch, impl_, h, self.alloc)?;
+        self.mk_list(&v)
+    }
+
     /// `n` placeholders of a new universe: a goal's bound variables when it is proven
     /// (`instantiate_binder_with_placeholders`).
     pub fn placeholders(&mut self, n: u32) -> Result<List, Stop> {
@@ -332,14 +339,19 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
         if same { Ok(l) } else { self.mk_list(&v) }
     }
 
-    /// The portable term `t` of `p` in the arena, `Param(i)` replaced by `args[i]`.
+    /// The portable term `t` of `p` in the arena, `Param(i)` replaced by `args[i]`. A
+    /// parameter past `args` is `Malformed::Param` naming the caller's line.
+    #[track_caller]
     pub fn import(&mut self, p: Portable<'_>, t: Ty, args: List) -> Result<Ty, Stop> {
+        let at = core::panic::Location::caller();
         let v = self.list(args);
-        Ok(fold::import(self.tys, self.scratch, p, t, Inst { args: &v, bound: &[] })?)
+        Ok(fold::import_at(self.tys, self.scratch, p, t, Inst { args: &v, bound: &[] }, at)?)
     }
 
     /// The portable list `l` of `p`, imported as `import` does each element.
+    #[track_caller]
     pub fn import_list(&mut self, p: Portable<'_>, l: List, args: List) -> Result<List, Stop> {
+        let site = core::panic::Location::caller();
         let v = self.list(args);
         let mut out: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(l.len as usize, self.alloc);
         for i in 0..l.len {
@@ -350,13 +362,15 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
                     len: p.lists.len() as u32,
                 })));
             };
-            out.push(fold::import(self.tys, self.scratch, p, x, Inst { args: &v, bound: &[] })?);
+            out.push(fold::import_at(self.tys, self.scratch, p, x, Inst { args: &v, bound: &[] }, site)?);
         }
         self.mk_list(&out)
     }
 
     /// The portable predicate `pred` of `p`, imported.
+    #[track_caller]
     pub fn import_pred(&mut self, p: Portable<'_>, pred: Pred, args: List) -> Result<Pred, Stop> {
+        let at = core::panic::Location::caller();
         match pred {
             Pred::Trait { trait_, args: a, polarity } => {
                 Ok(Pred::Trait { trait_, args: self.import_list(p, a, args)?, polarity })
@@ -368,7 +382,7 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
             Pred::Eq { .. } => Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred()))),
             other => {
                 let v = self.list(args);
-                self.map_pred(other, |cx, t| Ok(fold::import(cx.tys, cx.scratch, p, t, Inst { args: &v, bound: &[] })?))
+                self.map_pred(other, |cx, t| Ok(fold::import_at(cx.tys, cx.scratch, p, t, Inst { args: &v, bound: &[] }, at)?))
             }
         }
     }

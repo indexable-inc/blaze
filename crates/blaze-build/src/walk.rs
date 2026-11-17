@@ -28,10 +28,12 @@ pub(crate) use closure::{build_fn_shim, closures_in};
 #[path = "coroutine.rs"]
 pub(crate) mod coroutine;
 
+pub(crate) mod arith_checks;
 mod casts;
 mod fmt;
 #[cfg(test)]
 pub(crate) use fmt::encode_text as fmt_encode_text_for_tests;
+mod discard;
 mod index;
 mod lets;
 mod matches;
@@ -41,6 +43,7 @@ mod moves;
 mod slice_glue;
 mod strs;
 mod temps;
+mod unsize_nested;
 mod unsized_tail;
 mod unwind;
 mod wide_cmp;
@@ -132,7 +135,7 @@ fn layout_err(error: LayoutError) -> TyErr {
         Refusal::Recursive => TyErr::Malformed("an aggregate that contains itself by value"),
         Refusal::TooLarge => TyErr::Unsupported("a type larger than `isize::MAX` bytes"),
         Refusal::NoAdt(adt) => TyErr::Other(BuildError::NoAdt { adt }),
-        Refusal::Ground(error) => ground_err(error),
+        Refusal::Ground(error) | Refusal::FieldGround { error, .. } => ground_err(error),
         Refusal::Missing(m) => TyErr::Other(BuildError::MissingRecord { item: m.item }),
     }
 }
@@ -330,8 +333,9 @@ enum Task {
     CondLink(Block),
     /// `let`-`else` statement (walk/lets.rs), its scrutinee on top.
     LetElse(StmtId),
-    /// The end of a `let`-`else`'s diverging block: the statement goes on in the block given.
-    LetElseEnd(Block),
+    /// The end of a `let`-`else`'s diverging block: the statement goes on in the block given,
+    /// its entries set aside for the `else` block (`let_else_held` from the index) put back.
+    LetElseEnd(Block, u32),
     LoopEnd(ExprId),
     Break(ExprId, bool),
     Return(bool),
@@ -439,15 +443,14 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     /// Per pattern: a `match` on the binding may move fields out of it, so it gets field
     /// flags if its type needs drop (`scan_flags`).
     partial: Vec<bool, A>,
-    /// Per expression: it is a temporary scope's whole (a statement's expression, a `let`'s
-    /// initializer, an arm's body, an edition-2024 block's tail), so a temporary made in it
-    /// drops right after it.
-    temp_scope_end: Vec<bool, A>,
     /// Per expression: its parent (`NO_EXPR` for none) and whether the edge to it is
     /// conditional, from `scan_flags` (walk/temps.rs finds a temporary's scope by it).
     expr_parent: Vec<(u32, bool), A>,
     /// Per statement being built: where its temporaries start in `scope_pats`.
     temp_marks: Vec<u32, A>,
+    /// A `let`-`else` statement's own entries of `scope_pats` (its temporaries, its bindings),
+    /// set aside while its `else` block is built (walk/lets.rs `let_else_test`), innermost last.
+    let_else_held: Vec<Held, A>,
     /// Per expression: whether it is a temporary scope of its own, and entered
     /// (walk/temps.rs `scan_temp_scopes`).
     temp_here: Vec<u8, A>,
@@ -605,8 +608,6 @@ pub(crate) fn build<A: Allocator + Clone>(
 /// An unsizing adjustment's types: the pointer before and after, its pointee before and after.
 #[derive(Clone, Copy)]
 struct UnsizeEnds {
-    before: PTy,
-    after: PTy,
     from: PTy,
     to: PTy,
 }
@@ -646,8 +647,6 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     needs_flag.resize(body.pats.len(), false);
     let mut partial = Vec::with_capacity_in(body.pats.len(), alloc.clone());
     partial.resize(body.pats.len(), false);
-    let mut temp_scope_end = Vec::with_capacity_in(body.exprs.len(), alloc.clone());
-    temp_scope_end.resize(body.exprs.len(), false);
     let mut owned = Vec::with_capacity_in(body.pats.len(), alloc.clone());
     owned.resize(body.pats.len(), None);
     let mut init = Vec::with_capacity_in(body.pats.len(), alloc.clone());
@@ -687,9 +686,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         sret: None,
         needs_flag,
         partial,
-        temp_scope_end,
         expr_parent: Vec::new_in(alloc.clone()),
         temp_marks: Vec::new_in(alloc.clone()),
+        let_else_held: Vec::new_in(alloc.clone()),
         temp_here: {
             let mut here = Vec::with_capacity_in(body.exprs.len(), alloc.clone());
             here.resize(body.exprs.len(), temps::NOT_SCOPE);
@@ -1696,7 +1695,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
 
     /// Binds `v` to pattern `p`: a binding (the value stored into its slot), `_` (dropped), a
     /// tuple pattern or an array pattern (`[a, _, b]`) taken apart from the aggregate's place,
-    /// by a work list.
+    /// by a work list; every other irrefutable pattern (a struct or only-variant pattern, `&p`,
+    /// an array with `..`, a tuple over a reference) by walk/matches/irrefutable.rs.
     fn bind_value(&mut self, p: PatId, v: V) -> Result<(), BuildError> {
         let mut todo = Vec::new_in(self.alloc.clone());
         let mut parts = Vec::new_in(self.alloc.clone());
@@ -1719,13 +1719,16 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 }
                 Pat::Tuple { elems, rest } => (elems, rest),
                 Pat::Slice { elems, rest: None } => (elems, None),
-                Pat::Slice { rest: Some(_), .. } => {
-                    return Err(BuildError::UnsupportedPat { pat: p, what: "an array pattern with `..`" });
+                // An array with `..`, a struct or only-variant pattern, `&p`: the irrefutable
+                // binder, by the match builder's projection.
+                Pat::Slice { rest: Some(_), .. } | Pat::Struct { .. } | Pat::TupleStruct { .. } | Pat::Ref { .. } | Pat::Path(_) => {
+                    self.bind_irrefutable(p, v)?;
+                    continue;
                 }
                 _ => {
                     return Err(BuildError::UnsupportedPat {
                         pat: p,
-                        what: "a pattern other than a binding, `_`, a tuple or an array pattern",
+                        what: "a pattern other than a binding, `_`, a tuple, an array, a struct, a variant, a path or a `&` pattern",
                     });
                 }
             };
@@ -1739,6 +1742,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 (PNode::Tuple(_), true) | (PNode::Array(..), false) => {}
                 (PNode::Slice(_), false) => {
                     return Err(BuildError::UnsupportedPat { pat: p, what: "a slice pattern of a slice" });
+                }
+                // Over a reference ("Binding modes": dereferenced, bindings by `ref`).
+                (PNode::Ref(..), _) => {
+                    self.bind_irrefutable(p, v)?;
+                    continue;
                 }
                 _ => return Err(malformed("a tuple or array pattern of a type of another shape")),
             }
@@ -2007,11 +2015,21 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         todo.push(p);
         while let Some(p) = todo.pop() {
             let subs = match self.pat(p)? {
-                Pat::Bind { .. } => {
+                Pat::Bind { sub, .. } => {
                     self.own(p, true)?;
+                    todo.extend(sub);
                     continue;
                 }
-                Pat::Tuple { elems, .. } | Pat::Slice { elems, .. } => elems,
+                Pat::Ref { inner, .. } => {
+                    todo.push(inner);
+                    continue;
+                }
+                Pat::Struct { fields, .. } => {
+                    let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
+                    todo.extend(fps.iter().rev().map(|fp| fp.pat));
+                    continue;
+                }
+                Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } => elems,
                 _ => continue,
             };
             let subs = self.body.pat_lists.get(subs.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
@@ -2178,25 +2196,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                                 kids.extend(init.map(|c| (c, false)));
                                 kids.extend(else_.map(|c| (c, true)));
                                 pats.push(pat);
-                                if let Some(c) = init {
-                                    *self.temp_scope_end.get_mut(c.ix()).ok_or(malformed("an initializer past `exprs`"))? = true;
-                                }
                             }
-                            Stmt::Expr { expr, .. } => {
-                                kids.push((expr, false));
-                                *self.temp_scope_end.get_mut(expr.ix()).ok_or(malformed("a statement past `exprs`"))? = true;
-                            }
+                            Stmt::Expr { expr, .. } => kids.push((expr, false)),
                             Stmt::Item => {}
                         }
                     }
                     kids.extend(tail.map(|c| (c, false)));
-                    // Edition 2024 drops a tail's temporaries before the block's locals, right
-                    // after the tail; edition 2021 keeps them past the block.
-                    if let Some(t) = tail
-                        && body.edition >= Edition::E2024
-                    {
-                        *self.temp_scope_end.get_mut(t.ix()).ok_or(malformed("a tail past `exprs`"))? = true;
-                    }
                 }
                 Expr::If { cond, then, else_ } => {
                     kids.push((cond, false));
@@ -2221,7 +2226,6 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         _ => None,
                     };
                     for arm in body.arms.get(arms.range()).ok_or(malformed("a match's arms past `arms`"))? {
-                        *self.temp_scope_end.get_mut(arm.body.ix()).ok_or(malformed("an arm's body past `exprs`"))? = true;
                         if let Some(x) = local {
                             let by_value = |p: PatId| matches!(body.pats.get(p.ix()), Some(Pat::Bind { ann, .. }) if ann.by_ref.is_none());
                             let subs: &[PatId] = match body.pats.get(arm.pat.ix()) {
@@ -3185,7 +3189,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Task::LetLink { expr, fail } => self.let_link(expr, fail)?,
             Task::CondLink(fail) => self.cond_link(fail)?,
             Task::LetElse(s) => self.let_else_test(s)?,
-            Task::LetElseEnd(cont) => self.let_else_end(cont)?,
+            Task::LetElseEnd(cont, from) => self.let_else_end(cont, from)?,
             Task::LoopEnd(e) => {
                 let t = self.targets.pop().filter(|t| t.expr == e).ok_or(malformed("a loop's target out of order"))?;
                 let header = t.header.ok_or(malformed("a loop without its head"))?;
@@ -3250,9 +3254,22 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let v = self.pop()?;
                 let repr = self.expr_repr(e)?;
                 let r = match (op, repr) {
-                    (UnOp::Neg, Repr::Int { ty, .. }) => {
+                    (UnOp::Neg, Repr::Int { ty, signed }) => {
                         let x = self.scalar(v, ty)?;
-                        self.b.unary(Op::Neg, Flags::NONE, x)
+                        // [expr.operator.int-overflow]: `-MIN` overflows "unless the operand
+                        // is a literal expression (or a literal expression standing alone
+                        // inside one or more grouped expressions)".
+                        let Expr::Unary { mut operand, .. } = self.expr(e)? else {
+                            return Err(malformed("a unary task on another expression"));
+                        };
+                        while let Expr::Paren(inner) = self.expr(operand)? {
+                            operand = inner;
+                        }
+                        if signed && self.adts.overflow_checks().on() && !matches!(self.expr(operand)?, Expr::Lit(_)) {
+                            self.checked_neg(e, x, ty)?
+                        } else {
+                            self.b.unary(Op::Neg, Flags::NONE, x)
+                        }
                     }
                     (UnOp::Not, Repr::Int { ty, .. }) => {
                         let x = self.scalar(v, ty)?;
@@ -3640,115 +3657,23 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         Ok(())
     }
 
-    /// Adjustment `n` of `e`, an unsizing of the pointer on top (lib.rs, "Wide pointers";
-    /// codegen.md, "Trait objects"). The Reference, "Coercion types": `&T`, `&mut T`, `*const T`,
-    /// `*mut T` and a `CoerceUnsized` struct (`Box<T>`) to the same with `U`, where `T: Unsize<U>`:
-    /// - `[T; N]` to `[T]`: the address and `N`;
-    /// - a concrete `T` to `dyn Tr`: the address and `(T, Tr)`'s vtable's;
-    /// - `dyn Sub` to `dyn Tr`, an upcast: the same table on the first supertrait chain, else
-    ///   the one word `Shape::upcast` names; an auto trait dropped: the same two words.
-    ///
-    /// A struct is unsized through its one pointer: refused by name unless it is 8 bytes before
-    /// and 16 after, so every other field is zero-sized and the pointer is at offset 0.
+    /// Adjustment `n` of `e`, an unsizing of the value on top (lib.rs, "Wide pointers";
+    /// codegen.md, "Trait objects"): a pointer, or a struct holding one at any depth (`Box<T>`,
+    /// `Pin<Box<T>>`, a user `Wrap<T>(u32, Box<T>)`), followed by structure with the other
+    /// fields moved to their offsets in the target: walk/unsize_nested.rs.
     fn unsize(&mut self, e: ExprId, n: usize) -> Result<(), BuildError> {
-        let ends = self.unsize_ends(e, n)?;
-        self.unsize_from(e, ends)
+        self.unsize_nested(e, n)
     }
 
-    /// Adjustment `n` of `e`, an unsizing: the pointer's type before and after it, and the
-    /// pointee before and after (a `CoerceUnsized` struct's one changed argument).
+    /// Adjustment `n` of `e`, an unsizing: the pointee before and after, past every struct
+    /// around the pointer and every struct tail of the pointee (walk/unsize_nested.rs).
     fn unsize_ends(&mut self, e: ExprId, n: usize) -> Result<UnsizeEnds, BuildError> {
         let before = self.ty_before(e, n)?;
         let after = self.checked.adjusts.column::<2>()[self.adjust_rows(e).start + n];
-        let (from, to) = match (self.node_at(e, before)?, self.node_at(e, after)?) {
-            (PNode::Ref(_, from) | PNode::Ptr(_, from), PNode::Ref(_, to) | PNode::Ptr(_, to)) => (from, to),
-            (PNode::Adt(k, a), PNode::Adt(k2, b)) if k == k2 => {
-                let view = self.ground.view();
-                let (a, b) = (view.list(a), view.list(b));
-                let (Ok(a), Ok(b)) = (a, b) else {
-                    return Err(malformed("a struct's arguments past the ground table"));
-                };
-                let mut differ = a.iter().zip(b.iter()).filter(|(x, y)| x != y);
-                let (Some((&from, &to)), None) = (differ.next(), differ.next()) else {
-                    return Err(unsupported(e, "a `CoerceUnsized` unsizing that changes other than one type argument"));
-                };
-                let (rb, ra) = (self.repr_at(e, before)?, self.repr_at(e, after)?);
-                if self.size_align(rb).0 != 8 || self.size_align(ra).0 != 16 {
-                    return Err(unsupported(e, "a `CoerceUnsized` struct with a field beside its pointer that is not zero-sized"));
-                }
-                (from, to)
-            }
-            _ => return Err(unsupported(e, "an unsizing of other than a pointer or a `CoerceUnsized` struct")),
-        };
-        Ok(UnsizeEnds { before, after, from, to })
-    }
-
-    /// [`Self::unsize`] once its ends are known.
-    fn unsize_from(&mut self, e: ExprId, ends: UnsizeEnds) -> Result<(), BuildError> {
-        let UnsizeEnds { before, from, to, .. } = ends;
-        let node = |w: &Self, t: PTy| w.ground_node(t).map_err(|error| Self::ty_err(e, error));
-        let (nf, nt) = (node(self, from)?, node(self, to)?);
-        let v = self.pop()?;
-        let rb = self.repr_at(e, before)?;
-        // The data address, and the pointer's second word when it is already wide (an upcast).
-        let (p, old) = match rb {
-            Repr::Ptr => (self.scalar(v, Ty::PTR)?, None),
-            Repr::Agg(_) => {
-                let at = self.place(v, rb)?;
-                let p = self.load(Repr::Ptr, at);
-                let p = self.scalar(p, Ty::PTR)?;
-                let second = match nf {
-                    PNode::Dynamic(_) => {
-                        let w = self.load(Repr::Ptr, (at.0, at.1 + 8));
-                        Some(self.scalar(w, Ty::PTR)?)
-                    }
-                    _ => None,
-                };
-                (p, second)
-            }
-            _ => return Err(malformed("an unsized pointer held as other than a pointer or an aggregate")),
-        };
-        let second = match (nf, nt, old) {
-            (PNode::Array(_, len), PNode::Slice(_), None) => {
-                let len = self.ground_len(len).map_err(|error| Self::ty_err(e, error))?;
-                self.b.iconst(Ty::I64, u128::from(len))
-            }
-            (PNode::Dynamic(_), PNode::Dynamic(_), Some(vt)) => {
-                let (pf, pt) = (self.principal(e, from)?, self.principal(e, to)?);
-                match (pf, pt) {
-                    (_, None) => return Err(unsupported(e, "an unsizing to a trait object of auto traits alone (no principal trait)")),
-                    (Some((a, _)), Some((b, _))) if a == b => vt,
-                    (Some((a, _)), Some((b, _))) => {
-                        let shape = crate::vtable::Shape::of(a, |t| self.adts.object_trait(t), self.alloc.clone())
-                            .map_err(|error| BuildError::Vtable { at: Some(e), error })?;
-                        match shape.upcast(b) {
-                            Some(crate::vtable::Upcast::Prefix) => vt,
-                            Some(crate::vtable::Upcast::Load(slot)) => {
-                                let off = 8 * (crate::vtable::HEADER_WORDS + slot);
-                                let off = i32::try_from(off).map_err(|_| malformed("a vtable slot past 2^31 bytes"))?;
-                                self.b.load(Ty::PTR, Flags::NONE, vt, off, MemAttrs::aligned(3))
-                            }
-                            None => return Err(malformed("an upcast to a trait that is not a supertrait")),
-                        }
-                    }
-                    (None, Some(_)) => return Err(malformed("an upcast from a trait object without a principal")),
-                }
-            }
-            (PNode::Dynamic(_), _, _) | (_, _, Some(_)) => return Err(malformed("an unsizing of a trait object to other than a trait object")),
-            (_, PNode::Dynamic(_), None) => {
-                let Some((principal, args)) = self.principal(e, to)? else {
-                    return Err(unsupported(e, "an unsizing to a trait object of auto traits alone (no principal trait)"));
-                };
-                self.vtable_addr(crate::vtable::VtableRef { concrete: from, principal, args })?
-            }
-            _ => return Err(unsupported(e, "an unsizing to other than a slice or a trait object")),
-        };
-        let repr = self.repr_at(e, ends.after)?;
-        let at = self.temp(repr);
-        self.b.store(Flags::NONE, p, at.0, at.1, MemAttrs::aligned(3));
-        self.b.store(Flags::NONE, second, at.0, at.1 + 8, MemAttrs::aligned(3));
-        self.vals.push(V::Place(at.0, at.1));
-        Ok(())
+        let gb = self.ground_ty(before).map_err(|error| Self::ty_err(e, error))?;
+        let ga = self.ground_ty(after).map_err(|error| Self::ty_err(e, error))?;
+        let unsize_nested::UnsizeWalk { from, to, .. } = self.unsize_walk(e, gb, ga, None)?;
+        Ok(UnsizeEnds { from, to })
     }
 
     /// The principal trait of ground trait object `t` and its arguments after `Self` (its first
@@ -3882,8 +3807,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let reference = self.b.reference(RefKind::Func, place);
         let usize_ = Param::of(Ty::I64);
         let sig = self.b.sig(Conv::C, Variadic::No, &[usize_, usize_], &[]);
-        // In this block `i` and `n` are the values the branch compared.
-        self.b.call(Flags::NONE, reference, sig, &[i, n]);
+        // In this block `i` and `n` are the values the branch compared. The panic may unwind:
+        // called as every unwinding call is, so the live values are dropped on the way out
+        // (walk/unwind.rs; the Reference, "Panic": unwinding runs destructors).
+        self.call_unwinding(Callee::Direct(reference), sig, &[i, n])?;
         self.b.unreachable();
         self.begin(ok);
         let (stride, _) = self.size_align(elem);
@@ -4440,13 +4367,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             // `let _ = <place>` reads nothing and moves nothing; `let _ = <value>` drops the
             // value at once.
             Stmt::Let { pat, init: Some(init), else_: None, .. } if matches!(self.pat(pat)?, Pat::Wild) => {
-                if self.adjust_rows(init).is_empty() && self.is_place_expr(init)? {
-                    self.work.push(Task::Discard);
-                    self.work.push(Task::Place(init));
-                } else {
-                    self.work.push(Task::DropValue(init));
-                    self.work.push(Task::Eval(init));
-                }
+                self.discard(init)?;
             }
             Stmt::Let { pat, init: Some(init), else_: None, .. } => {
                 self.work.push(Task::Let(pat, Some(init)));
@@ -4556,7 +4477,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             // coroutine.rs: the operand, then `Task::Await`; the state, its tag `Unresumed`.
             Expr::Await(operand) => self.await_operand(e, operand)?,
             Expr::AsyncBlock { .. } => self.coroutine_value(e)?,
-            Expr::Underscore => return Err(unsupported(e, "`_` (`_ = e` is not built yet)")),
+            // `_ = e` is built by its assignment (walk/discard.rs); `_` anywhere else is the
+            // check's `UnderscoreExpr` error.
+            Expr::Underscore => return Err(malformed("`_` outside the whole left side of an assignment (the check's `UnderscoreExpr`)")),
             Expr::RawRef { mutbl, operand } => self.push_raw_ref(e, mutbl, operand)?,
             // The Reference, "Block expressions", "Const blocks": the block is evaluated at compile
             // time with the enclosing generics in scope, its value the expression's; one value
@@ -4587,6 +4510,20 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     Expr::Local(p) if self.owned[p.ix()].is_some() && self.adjust_rows(scrutinee).is_empty() => {
                         self.work.push(Task::Place(s));
                     }
+                    // An unsized scrutinee (`match *w { [a, .., d] => .. }`, `w: Deref<Target =
+                    // [u8]>`, or `*s` of `s: &[u8]`): the Reference, "Match expressions": "A
+                    // match behaves differently depending on whether or not the scrutinee
+                    // expression is a place expression"; an unsized value is never copied, so
+                    // its place (`V::Unsized`, the wide pointer's memory) is what is tested.
+                    _ if self.is_place_expr(scrutinee)?
+                        && matches!(self.node_at(scrutinee, self.adjusted_ty(scrutinee)?)?, PNode::Slice(_) | PNode::Str) =>
+                    {
+                        self.work.push(Task::Place(scrutinee));
+                    }
+                    // A place behind a pointer whose type needs drop (`matches!(*self, Ok(_))`,
+                    // `match self.kind { .. }` with `self: &S`): matched in place; only a by-value
+                    // binding would move (walk/moves.rs `scrutinee_in_place`).
+                    _ if self.scrutinee_in_place(scrutinee)? => self.work.push(Task::Place(scrutinee)),
                     _ => self.work.push(Task::Eval(scrutinee)),
                 }
             }
@@ -4740,6 +4677,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.work.push(Task::Binary(e, op));
                 self.work.push(Task::Eval(rhs));
                 self.work.push(Task::Eval(lhs));
+            }
+            // `_ = rhs` is `{ let _ = rhs; }` (the Reference, "Destructuring assignments";
+            // walk/discard.rs), its value `()`.
+            Expr::Assign { lhs, rhs } if self.assigns_to_underscore(lhs)? => {
+                self.work.push(Task::PushNone);
+                self.discard(rhs)?;
             }
             // The right side first, then the place: Rust's order for a primitive assignment.
             Expr::Assign { lhs, rhs } => {
@@ -4907,14 +4850,26 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         Ok(())
     }
 
-    /// An arithmetic or bitwise operation of Rust's wrapping semantics (overflow is not checked
-    /// in this tier); a shift's amount is brought to the left side's width first.
+    /// An arithmetic or bitwise operation by the Reference (walk/arith_checks.rs): division and
+    /// remainder checked in every build, `+ - *` and shifts checked when
+    /// [`Adts::overflow_checks`] says so and wrapping otherwise; a shift's amount is brought to
+    /// the left side's width first.
     fn arith(&mut self, e: ExprId, op: BinOp, l: Value, r: Value, lrepr: Repr, rrepr: Repr) -> Result<Value, BuildError> {
         let (ty, signed) = match lrepr {
             Repr::Int { ty, signed } => (ty, signed),
             Repr::Bool if matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) => (Ty::I8, false),
             _ => return Err(unsupported(e, "arithmetic on this type (a pointer, a bool)")),
         };
+        let checks = matches!(lrepr, Repr::Int { .. }) && self.adts.overflow_checks().on();
+        match op {
+            BinOp::Div | BinOp::Rem if matches!(lrepr, Repr::Int { .. }) => return self.checked_div(e, op, l, r, ty, signed),
+            BinOp::Add | BinOp::Sub | BinOp::Mul if checks => return self.checked_add_sub_mul(e, op, l, r, signed),
+            BinOp::Shl | BinOp::Shr if checks => {
+                let Repr::Int { ty: rty, .. } = rrepr else { return Err(unsupported(e, "a shift by a non-integer")) };
+                self.check_shift(e, op, r, rty, ty)?;
+            }
+            _ => {}
+        }
         let o = match op {
             BinOp::Add => Op::Add,
             BinOp::Sub => Op::Sub,
@@ -5432,8 +5387,18 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     fn match_dispatch(&mut self, e: ExprId) -> Result<(), BuildError> {
         let Expr::Match { scrutinee, arms } = self.expr(e)? else { return Err(malformed("a match task on another expression")) };
         let mut s = self.pop()?;
+        // An unsized scrutinee's place (`match *w`, pushed as a place by `Expr::Match`) has no
+        // repr of its own: it is tested in place by its ground type (`tested_place` takes a
+        // `V::Unsized` as the wide pointer's memory, walk/matches.rs reads a slice's elements
+        // and length through it), never held as a value.
+        if let V::Unsized(..) = s {
+            return self.match_tested(e, scrutinee, arms, s, Repr::None);
+        }
         let mut srepr = self.adjusted_repr(scrutinee)?;
-        if !self.switch_takes(scrutinee, arms, srepr)? {
+        // A place behind a pointer that needs drop, matched in place (`Expr::Match` pushed its
+        // place): by tests, whose bindings refuse a move out with no owner (walk/moves.rs
+        // `scrutinee_in_place`); the switch below would own it as a temporary.
+        if !self.switch_takes(scrutinee, arms, srepr)? || self.scrutinee_in_place(scrutinee)? {
             return self.match_tested(e, scrutinee, arms, s, srepr);
         }
         // A reference to an enum, matched by variant patterns: the default binding mode (the
@@ -5502,13 +5467,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     owner = match self.local_of(scrutinee)? {
                         // As `Expr::Match` evaluated it: in place.
                         Some(p) if self.owned[p.ix()].is_some() && self.adjust_rows(scrutinee).is_empty() => Owner::Local(p),
-                        _ if self.temp_scope_end[e.ix()] => Owner::Temp,
-                        _ => {
-                            return Err(unsupported(
-                                e,
-                                "a `match` by value on a temporary that needs drop, inside a larger expression (its rest drops at the statement's end, after later operands)",
-                            ));
-                        }
+                        // A temporary: held in its temporary scope like every temporary
+                        // (walk/temps.rs `hold_temp`, as `Held::Moved` with its word: "The
+                        // scrutinee of a `match` expression is not a temporary scope"), wherever
+                        // the match stands (a statement, or inside a larger expression such as
+                        // `a()?.b()?`), and dropped at that scope's end minus what an arm moved.
+                        // One drop point for every temporary: the match by tests owns it.
+                        _ => return self.match_tested(e, scrutinee, arms, s, srepr),
                     };
                 }
                 let at = match srepr {
@@ -5593,14 +5558,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.begin(pass);
             }
         }
-        // The arm's drop scope: its bindings drop at its end, then a temporary scrutinee's
-        // rest, which is held ahead of them (codegen.md, "A `match` by value on an enum that
-        // needs drop").
+        // The arm's drop scope: its bindings drop at its end. (A temporary scrutinee that needs
+        // drop is never the switch's: the match by tests holds it in its temporary scope.)
         self.scope_marks.push(self.scope_pats.len() as u32);
-        let rest_at = self.scope_pats.len();
-        if let (Owner::Temp, Some((at, l, _))) = (st.owner, st.of_enum) {
-            self.scope_pats.push(Held::Rest { at, l, variant: None, moved: 0 });
-        }
         let mut moved = 0u64;
         let mut whole = false;
         match (self.pat(arm.pat)?, st.of_enum) {
@@ -5633,8 +5593,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                             let left = self.b.binary(Op::And, Flags::NONE, mask, keep);
                             self.b.store(Flags::NONE, left, fa, 0, MemAttrs::aligned(3));
                         }
-                        Owner::Temp => self.scope_pats[rest_at] = Held::Rest { at, l, variant: Some(variant), moved },
-                        Owner::None => return Err(malformed("a field that needs drop moved out of a scrutinee no one owns")),
+                        Owner::Temp | Owner::None => return Err(malformed("a field that needs drop moved out of a scrutinee the switch does not own")),
                     }
                 }
             }
@@ -5656,9 +5615,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         if whole {
             match st.owner {
                 Owner::Local(x) => self.moved(st.expr, x)?,
-                Owner::Temp => {
-                    self.scope_pats.remove(rest_at);
-                }
+                Owner::Temp => return Err(malformed("a switch owning a temporary scrutinee (the match by tests owns those)")),
                 Owner::None => {}
             }
         }

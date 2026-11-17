@@ -1264,7 +1264,7 @@ fn processes_and_sockets(driver: &mut impl Driver) -> Vec<String> {
     let mut effects = vec![
         Effect::Write { file: name("store/pack"), bytes: b"packed".to_vec(), tag: Tag(1) },
         Effect::Spawn { command: sh, tag: Tag(3) },
-        Effect::Listen { at: at.clone(), tag: Tag(4) },
+        Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(4) },
     ];
     let (mut client, mut server, mut got) = (None, None, Vec::new());
     let mut ended_after_hangup = false;
@@ -1279,7 +1279,7 @@ fn processes_and_sockets(driver: &mut impl Driver) -> Vec<String> {
                     extent: crate::Extent::Whole,
                     tag: Tag(2),
                 });
-                effects.push(Effect::Connect { at: at.clone(), tag: Tag(5) });
+                effects.push(Effect::Connect { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(5) });
             }
             (2, Done::Mapped(it)) => seen.push(format!("mapped {:?}", it.bytes())),
             (3, Done::Exited(exit)) => seen.push(format!(
@@ -1952,9 +1952,9 @@ fn connected(
 ) -> (crate::Conn, crate::Conn) {
     let mut effects = Vec::with_capacity(2);
     if listen {
-        effects.push(Effect::Listen { at: at.clone(), tag: Tag(1) });
+        effects.push(Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) });
     }
-    effects.push(Effect::Connect { at: at.clone(), tag: connect });
+    effects.push(Effect::Connect { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: connect });
     driver.submit(&mut effects);
     let mut out = Vec::with_capacity(4);
     poll_for(driver, &mut out, 2);
@@ -2178,7 +2178,7 @@ fn host(driver: &mut impl Driver, real: bool) -> BTreeMap<u64, String> {
         driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(100)));
         for Completion { tag, done } in out.drain(..) {
             let shown = match done {
-                Done::Bound { sock, local } => {
+                Done::Bound { sock, local, .. } => {
                     bound[tag.0 as usize - 1] = Some((sock, local));
                     "bound".to_owned()
                 }

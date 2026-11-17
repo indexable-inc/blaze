@@ -113,10 +113,14 @@ impl NestedKind {
     /// program, and its header is read in the block), and a struct, enum, union or type alias
     /// (the Reference, "Statements", "Item declarations": "Declaring an item within a
     /// statement block restricts its scope to the block containing the statement": a type
-    /// with a head of its own, named by the bodies and impls of that block). A block's `fn`,
-    /// `const`, `static` and `use` alone make none: the body's own lowering resolves them.
+    /// with a head of its own, named by the bodies and impls of that block), and a trait (the
+    /// same: a trait of the block's module, with its head, its impls in the block filed under
+    /// its one key, and its methods candidates at method calls in the block, where it is in
+    /// scope: core's `Write::write_fmt` declares `trait SpecWriteFmt` and its impls in its
+    /// body). A block's `fn`, `const`, `static` and `use` alone make none: the body's own
+    /// lowering resolves them.
     pub fn makes_module(self) -> bool {
-        matches!(self, NestedKind::Impl | NestedKind::Struct | NestedKind::Enum | NestedKind::Union | NestedKind::TypeAlias)
+        matches!(self, NestedKind::Impl | NestedKind::Struct | NestedKind::Enum | NestedKind::Union | NestedKind::TypeAlias | NestedKind::Trait)
     }
 }
 
@@ -613,5 +617,23 @@ mod tests {
     fn an_unclosed_body_is_not_used() {
         assert_eq!(scan("fn f() { impl A for B {", Alloc::global()).end, NestedEnd::Unbalanced);
         assert_eq!(scan("fn f() { } }", Alloc::global()).end, NestedEnd::Unbalanced);
+    }
+
+    /// A trait declared in a block makes its block a module of the names library, alone (no
+    /// impl beside it) as with its impl (core's `Write::write_fmt` shape): the Reference,
+    /// "Statements", "Item declarations": "Declaring an item within a statement block
+    /// restricts its scope to the block containing the statement." A `fn` alone makes none.
+    /// Prints nothing; fails with "a block's trait makes no module" without `Trait` in
+    /// `NestedKind::makes_module`.
+    #[test]
+    fn a_trait_in_a_block_makes_a_module() {
+        let alone = "fn f() { trait T { fn m(&self) -> u8 { 1 } } 0u8.m(); }";
+        let got = items(alone);
+        assert_eq!(got, [(NestedKind::Trait, 0, "trait T { fn m(&self) -> u8 { 1 } }")]);
+        assert!(scan(alone, Alloc::global()).makes_module(), "a block's trait makes no module");
+        let write_fmt = "fn write_fmt(&mut self, args: Arguments<'_>) -> Result { trait SpecWriteFmt { fn spec_write_fmt(self, args: Arguments<'_>) -> Result; } impl<W: Write + ?Sized> SpecWriteFmt for &mut W { fn spec_write_fmt(self, args: Arguments<'_>) -> Result { write(self, args) } } self.spec_write_fmt(args) }";
+        let kinds: std::vec::Vec<NestedKind> = items(write_fmt).iter().map(|i| i.0).collect();
+        assert_eq!(kinds, [NestedKind::Trait, NestedKind::Impl]);
+        assert!(!scan("fn f() { fn g() {} g() }", Alloc::global()).makes_module());
     }
 }

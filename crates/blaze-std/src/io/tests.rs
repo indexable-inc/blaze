@@ -48,6 +48,8 @@ use crate::{
     path::Path,
 };
 
+mod read_at;
+
 /// The reads `native_now_takes_no_lock` makes.
 const READS: u64 = 1_000_000;
 

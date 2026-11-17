@@ -519,8 +519,8 @@ struct Recs<'r, 'a> {
 fn first_unknown(r: Recs<'_, '_>, alloc: Alloc<'_>) -> Result<Option<crate::error::Recorded>, CheckError> {
     use crate::error::Recorded;
     let v = r.types.view();
-    let mut bad: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(v.nodes.len(), alloc);
-    for &n in v.nodes {
+    let mut bad: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(v.len(), alloc);
+    for &n in v.nodes() {
         let any = |l: List| -> Result<bool, CheckError> { Ok(v.list(l)?.iter().any(|c| bad.get(c.0 as usize).copied().unwrap_or(true))) };
         let one = |c: PTy| bad.get(c.0 as usize).copied().unwrap_or(true);
         let held = match n {

@@ -93,7 +93,7 @@ fn list() -> UnitCrates<'static> {
     let mut crates = AVec::new_in(a());
     crates.push(krate("user", 0, &[("dep", 1)], false));
     crates.push(krate("dep", 1, &[], true));
-    UnitCrates { crates, sysroot: Sysroot::default(), toolchain: 0, build_scripts: 1, alloc: a() }
+    UnitCrates { crates, sysroot: Sysroot::default(), toolchain: 0, build_scripts: 1, refused: AVec::new_in(a()), alloc: a() }
 }
 
 fn resolved(crates: UnitCrates<'static>) -> Names<'static> {

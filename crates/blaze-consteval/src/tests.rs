@@ -15,6 +15,9 @@ use crate::machine::{Answer, Codes, Plant, discriminant_with_plant, int_binop, m
 use crate::record::DataTarget;
 use crate::{ConstError, Intrinsic, Layouts, Limits, Op, PanicPart, Refusal, eval_discriminant};
 
+mod needs_drop;
+mod ub_checks;
+
 /// A world with the intrinsics and the panic entry core's code reaches.
 fn world() -> World {
     let mut w = World::new();

@@ -194,3 +194,450 @@ this lane's: listed below).
 - lir.md:707: LIR has a test evaluator (e).
 - Root Cargo.toml: blaze-codegen and blaze-stencil are excluded (parked), so the tests built in
   blaze-codegen here compile only when it is unparked; blaze-lir's do now.
+
+## End state: code generation on the item layer (coordinator's decisions, 2026-11-16)
+
+The owner: "does it do a JIT and eventually get to LLVM cross function inlining", "are u using stencils at all",
+"best architecture u should give and then implement it". These are the decisions (D97). They sit inside
+bottom.md section 11 (code is records behind slots; compile on first call; a background tier that inlines across
+functions; `export` whole and optimized) and lir.md (LIR is the one input of every backend; LLVM is fed from LIR).
+An architect's pass below this section checks each against the tree and lists the pieces.
+
+1. ONE SEAM, THREE TIERS. `Tier` is a type parameter at one seam (rule 78): one LIR function and its context in,
+   one code record out. `Reference`: today's emitter (crates/blaze-emit: every value in a stack cell): kept as the
+   simplest machine-code oracle, never the default once `Fast` passes. `Fast`: point 2. `Optimized`: point 4. Every
+   tier of one LIR function gives the same observable result: generated LIR programs (blaze-sim) and every ladder
+   rung run at every tier and are compared with LIR's evaluator; a planted wrong encoder must be caught.
+
+2. THE FAST TIER IS ONE ANALYSIS PASS AND ONE EMISSION PASS, WITH REGISTERS, AND ITS ENCODERS ARE DATA.
+   - Analysis, one pass over the function: block order, loop depth, each value's last use.
+   - Emission, one pass: a greedy register allocator (a value lives in a register from its definition to its last
+     use; when none is free the value with the farthest next use is spilled to its cell; at a block boundary block
+     parameters are in fixed places), instruction selection, and encoding, together.
+   - The encoders are a TABLE, not hand-written code: for each LIR operation, type and operand shape (register,
+     constant, memory) a machine-code template with marked fields: the register fields, the immediate, the branch
+     or import site. Emitting an operation is a copy and a few field writes. This is copy-and-patch whose holes
+     include the registers, so there is one template an operation and not one per register assignment; on AArch64
+     every register field is at a fixed place in a 32-bit word.
+   - The table is MADE at blaze's build time, never at its run time, by lowering each one-operation LIR function
+     through the SAME LIR-to-LLVM lowering the optimizing tier uses (one home) with the operands pinned to
+     placeholder registers, and reading the bytes and the fields out of LLVM's object. It is checked in as data
+     with its digest and the generator's inputs; building blaze does not need LLVM for it; two builders agree
+     because nobody regenerates it implicitly. A second target (x86-64) is a second table and a second register
+     description; the two passes are shared.
+   - Each template is validated once, when the table is generated: against LIR's evaluator on every operand edge
+     value (the engine's edge tables), and, for the integer and bit operations, proved equal to the operation's
+     bit-vector meaning (the separate `bv_decide` proofs the gate already lists). The backend is then a table of
+     checked fragments and a small composer.
+   - Why not plain stencils as in the parked crate: a template per register assignment multiplies the table or
+     forces values through memory between operations; register fields as holes keep the table small and the code
+     in registers. Why not hand-written encoders with an allocator: the allocator is needed either way and is
+     built FIRST on today's hand-written encoders (stage 1: it removes the stack-cell traffic); the table then
+     replaces the hand-written encoders operation by operation (stage 2) and brings x86-64 with it.
+   - What decides emission speed matters less here than elsewhere: code is a record found by its key, so the fast
+     tier runs once per function per content, and after an edit for the one function edited. Its CODE's speed
+     matters more: an edited function and the callers that had inlined it run fast-tier code until the tier-up.
+     Floors (estimates until measured): 10 to 30 ns per LIR instruction emitted; fast code within 2x of optimized
+     code on the ladder's integer programs.
+
+3. HEAT COMES FROM SAMPLING THE PROGRAM COUNTER, NOT FROM A COUNTER IN EVERY PROLOGUE (bottom.md left it open).
+   The launcher's runtime takes a profiling timer signal on each program thread and writes (program counter,
+   link register) pairs to a ring; the control thread drains it and maps addresses to functions through the
+   placed records. No instruction is added to any function; a hot LOOP in a function called once is seen (an
+   entry counter never sees it); the link register gives the calling function, so hot call EDGES come for free,
+   and they are what inlining is chosen by. Past a bound a function is queued once per run for the optimizing
+   tier, compiled by the run's parent on the pool, after the answer, and published by writing one slot word:
+   calls made after the write run the new code; a frame already in the old code finishes in it (no on-stack
+   replacement: a loop that never returns stays in fast code, which point 2 makes acceptable; revisit only if a
+   real program shows it). A profile record per program, keyed by names that survive edits (instance symbols, not
+   code identities), keeps the hot set and the hot edges, so after an edit the functions known hot are
+   re-optimized without being rediscovered. A startup record keeps the order functions were first called in, so
+   the next run asks for them in one batch instead of one stub at a time.
+
+4. THE OPTIMIZING TIER: BLAZE INLINES ON LIR; LLVM OPTIMIZES ONE FUNCTION.
+   - The unit is one instance. Blaze's own inliner, an LIR-to-LIR pass, splices in the callees it chose (always:
+     tiny bodies and `#[inline(always)]`; then hot edges from the profile, largest benefit first, under a size
+     budget; never a cycle). The record's read list is then exact BY CONSTRUCTION: the code identity of every
+     body spliced in, transitively. An edit of a callee makes exactly the callers that inlined it stale, and they
+     run their fast code until remade. LLVM's inliner is not used: its choices would have to be read back out of
+     it, and a read list that is guessed is a wrong build waiting.
+   - The inlined LIR function is lowered to LLVM IR and run through a fixed, named function pipeline (the
+     standard -O2 function passes without an inliner; -O3 only if a measurement on the acceptance projects pays
+     for its compile time), single-threaded, with the target features in the key: equal inputs give equal bytes.
+   - LLVM is told what Rust knows, carried on LIR from the front end (rule 31), never recovered by pattern:
+     no-alias and read-only parameters, non-null, dereferenceable sizes, alignments, value ranges of loads, and,
+     from blaze's effect facts, that a callee cannot unwind or is pure. A fact about a callee that was NOT inlined
+     is a read like any other (its fact record, keyed by its code identity).
+   - The inliner is blaze's own pass on purpose: it is validated like every tier (evaluator equality on generated
+     programs), it is the first pass of the backend that replaces LLVM at the top one day, and it is where the
+     profile is used.
+   - An optimized record is found without knowing what it inlined through a pointer keyed by the instance and
+     tier, and is valid only if every entry of its read list still holds (a record valid by its read list).
+
+5. EXPORT IS THE SAME UNITS, ALL OF THEM. Every reached instance at the optimized tier, the inline plan from the
+   profile record when there is one and from static sizes when not, direct calls in place of slots, the layout
+   from the profile (code-layout.md). The file is written whole each time; the units behind it are records, so
+   an export after a session of runs reuses what the background tier already made.
+
+6. KEYS. A fast record: the instance's symbol, its body's digest, the facts of types it was built with, the
+   target and features, the tier, the producer of that tier (the stage's own code identity, D87), the table's
+   digest. An optimized record: the same, plus the pipeline's name, LLVM's version, and its read list. The profile
+   and startup records hold no address and no time.
+
+7. ORDER OF BUILDING: (a) the `Tier` seam and the tier-equality harness on today's emitter; (b) liveness and the
+   register allocator in blaze-emit (stage 1); (c) the LIR inliner with its validation; (d) LIR-to-LLVM lowering
+   with the facts, behind the seam, in a helper the run's parent starts; (e) the encoder table's generator and
+   the table (stage 2), which reuses (d); (f) sampling, the profile and startup records, promotion; (g) export at
+   the optimized tier; (h) x86-64. (a), (b) and (c) need nothing that does not exist today and start at once.
+
+### Checked against the published state of the art (coordinator, 2026-11-16 16:45; D98 amends D97)
+
+The owner: "it needs to be sota". Each point above was compared with what is published; three change.
+
+- THE FAST TIER'S SHAPE IS THE PUBLISHED BEST FOR EMISSION SPEED, AND ITS FLOOR WAS WRONG. Point 2 is the shape of
+  TPDE (Schwarz, Kamm, Engelke, CGO 2026, arXiv 2505.22610): one analysis pass, then one pass that selects,
+  allocates registers and encodes, with encoders generated through LLVM from high-level code ("snippet encoders");
+  its authors report 8 to 24 times LLVM -O0's back-end speed on SPEC CPU2017 with run time within about 9% of
+  -O0. Copy-and-patch (Xu and Kjolstad 2021; Deegen 2024) is the other reference: stencil variants per register
+  situation, nothing allocated across stencils. So the two passes and the generated table stand. What does NOT
+  stand is "fast code within 2x of optimized": the published result for this shape is -O0-class code, and
+  -O0-class Rust is far from optimized Rust because nothing is inlined (an iterator's `next`, a `Deref`, an
+  operator on a wrapper are calls). AMENDED: the Fast tier's input is LIR after the TRIVIAL INLINER, blaze's own
+  LIR-to-LIR pass: bodies under a small instruction bound with no loop, and `#[inline(always)]`, spliced in; the
+  fast record's read list gains exactly those bodies' code identities. The bound is set by a measurement (the
+  ladder's programs and tempo's tests at Fast with and without it, instructions retired), and the ratio of fast
+  to optimized code is REPORTED from that run; no number is claimed before it.
+- THE OPTIMIZING TIER USES LLVM'S INLINER INSIDE AN OFFER SET BLAZE CHOOSES (point 4 amended). A blaze-own
+  inliner deciding on unoptimized LIR would decide worse than LLVM's, which works bottom-up with simplification
+  between inlines and is what `rustc -O` code gets its speed from; a top tier below that is not the state of the
+  art. The module handed to LLVM holds the one instance and, as `available_externally` bodies, the callees blaze
+  OFFERS: transitively, under a size bound, hot edges from the profile first, never a cycle, never unbounded.
+  The standard -O2 module pipeline runs on it; code is emitted for the one instance. The record's read list is
+  the OFFER SET: a superset of what was inlined or read for an inferred attribute, and sound BY CONSTRUCTION,
+  because LLVM cannot use a body it was not given. This is the shape of ThinLTO's incremental cache key (the
+  hashes of the import list). Its cost: an edit of a callee that was offered and not inlined remakes the caller
+  for nothing; accepted, and never tightened from LLVM's remarks (an offered body may have fed an inferred
+  attribute). Blaze's own inliner is the trivial one above and nothing more. Later, in this order: optimized
+  bitcode kept as a record an instance so a callee is offered already optimized; the samples as entry counts and
+  branch weights on the module (sampling PGO, AutoFDO's shape).
+- A RUNNING LOOP TIERS UP (point 3 amended: "no on-stack replacement" was below HotSpot, V8 and JavaScriptCore:
+  a loop in a function entered once would run fast-tier code for the whole run, and that is the first program
+  anyone times). Designed in from the first fast record, built after promotion works: (i) the fast tier keeps
+  every value live across a loop header in a FIXED PLACE at that header and writes the LOOP MAP (a header: its
+  live values and their places) into the code record; (ii) each loop back-edge carries one POLL: a load through
+  the run-context register from a page the runtime can protect (HotSpot's safepoint poll: one instruction, no
+  branch, no counter); (iii) when the samples show a thread staying inside one loop, the parent makes the
+  instance's optimized LOOP-ENTRY variant (the same LIR entered at the header, the loop map's values as its
+  parameters) and protects the page; the poll faults at a back-edge, and the handler moves the mapped values and
+  resumes in the variant. The same poll is the bounded-time stopping point that later features need (patching a
+  running program). The allocator piece (b) reserves the register and writes the loop map from its first
+  version; the poll instruction goes in from the start unless the ladder shows it costs more than 1%.
+
+Unchanged after the comparison: the one seam with tiers tested equal (point 1); sampling instead of prologue
+counters (the sampler's link register gives call edges, which counters do not); the table generated through the
+one LIR-to-LLVM lowering and validated per template; export from the same units; the keys.
+
+### Evidence, gap and pieces (architect, 2026-11-16)
+
+SUPERSEDED IN PART (17:15): D99 and D100 below decide every objection here and replace the piece list. The
+evidence per point still stands. Piece 0 is now crates/blaze-tier. The one wave of pieces is in WAVE-BACKEND.md:
+R, A, K1, K2, T1, S1, S2, C1, C2, O, D1, D2, D3, T2, F1, F2, L, U, G, X, M. In piece 0 the new record format
+lives in blaze-tier, because blaze-code cannot depend on blaze-tier without a cycle. blaze-code keeps its leaf
+types, segments and image. `bzcode01` is deleted when its last user moves.
+
+What the tree has under each decided point (D97 as amended by D98), what must change, the objections, the gap
+table and the pieces. Ready writer prompts: /Volumes/Projects/blaze-int-1112-notes/port27/WAVE-BACKEND.md. Every
+number marked "estimate" is one; no run backs it.
+
+#### Evidence per point
+
+1. The seam. crates/blaze-emit record.rs `emit_record(func: View, names: &dyn Names, isa: Isa, alloc) ->
+   Result<CodeRecord, RecordEmitError>` is already the one entry every caller uses; it becomes the `Reference`
+   tier unchanged. crates/blaze-run lib.rs `enum Tier { Fast, Optimized }` and `struct CodeKey { function, tier }`
+   name the tier in the run's keys; tier.rs `trait Optimizer`, `struct Optimized { code, inlined }`, `fn usable`
+   are the optimized record's shape (its `inlined` list becomes the offer set, D98). The harness to reuse:
+   blaze-emit tests.rs `mod random` `fn program(tape)`, `fn machine_agrees`, `random_programs_agree_with_the_
+   evaluator` (1000 cases, literal-word form through `run::place`/`run::call`); record_tests.rs `mod runs` `fn
+   bound(func, home)` binds a record and runs it, but emits the record itself: it is split so any tier's record can
+   be bound (piece A's wiring). blaze-lir tiers.rs already has a private `trait Tier` and a `blaze_sim::control`
+   with a planted `SubAsAdd`: that is a model, not the seam (it compares LIR evaluators, not machine code).
+2. The fast tier. blaze-emit lib.rs: every LIR value has a 16-byte stack cell; pass.rs `fn ld` is
+   `self.ld_sp(rt, value.0 * 16)` and `fn st` is `self.st_sp(rt, inst * 16)`: one seam through which every operand
+   passes, so registers enter at two functions (plus pass/float.rs `fld`/`fst`). Scratch use today: X9..X12, X16,
+   V0, V1 (enc.rs constants stop at X16; FP=29, LR=30); x19..x28 and d8..d15 are never used, so a callee-saved
+   pool exists without moving anything. pass.rs `run` writes the prologue `stp x29,x30,[sp,#-16]!; mov x29, sp`
+   and patches the frame in `settle`; `fn edge` makes block-argument moves through cells. No liveness, loop or
+   last-use analysis exists anywhere: blaze-lir verify.rs computes dominators privately (lines 596-683) for its
+   checks only. The encoders are enc.rs, one `const fn` per A64 form (about 100), each pinned by tests.rs
+   `encodings`: stage 1 keeps them. The baseline to beat: codegen.md "cells 1.031 ns/iter, registers 0.234
+   ns/iter, ratio 4.41" from tests.rs `the_cell_baseline_against_registers`.
+   The trivial inliner (D98): blaze-lir has one LIR-to-LIR pass, coroutine.rs `split`, built through Builder: the
+   model; builder.rs `Builder::inlined(parent, call_site)` already makes inline span scopes; eval.rs refuses every
+   call (`EvalError::Unsupported`), so validation needs the evaluator to follow calls first (piece C1).
+3. Heat by sampling. Nothing samples today: no SIGPROF, setitimer, timer_create or thread_get_state in
+   blaze-launch-rt or blaze-run (blaze-core wait/linux.rs lists SIGPROF only among signals it blocks). What exists
+   is the count stub: blaze-launch-rt observe.rs `count` (14 words, x16/x17), driven by blaze-run heat.rs
+   `Config { bound }` and `Heat::reached(slot, hot)` (once per run). `Heat` stays (a sample count reaching the
+   bound calls it); the count stub is retired when F2 lands. Publication: run.md's order (copy, cache
+   maintenance, unwind entry, release store, wake) and blaze-run slots.rs are already one slot word.
+   launch-rt run_mode.rs refuses "a record at the optimized tier" by name (line ~495) and refuses x86-64 (module
+   doc): F2 and H lift those. Loop map and poll (D98): blaze-code record.rs `CodeRecord { code, relro, targets,
+   sites, words, frame, pads, names, text }`, MAGIC `bzcode01`, header "frame, flags (0), eight counts": no place
+   for a map; it gains two sections (piece B3).
+4. The optimizing tier. Facts LIR already carries (blaze-lir func.rs): `ParamFactsRec` NONNULL, NOALIAS,
+   READONLY, NOUNDEF, CAPTURES_NONE, DEREF_OR_NULL, WRITABLE, DEAD_ON_UNWIND, deref, size, range, align;
+   `MemAttrsRec` range, align, NONNULL, NOUNDEF, INVARIANT; flags.rs NSW NUW EXACT DISJOINT INBOUNDS and
+   fast-math; `FnAttrs` nounwind, cold, inline forms. What the front end FILLS today: almost none. blaze-build sets
+   only `MemAttrs::aligned` on loads, NSW/NUW/INBOUNDS only in intrinsics.rs, and at walk.rs ~2802 only size and
+   align on memory parameters: no noalias, nonnull, dereferenceable or range reaches LIR. LLVM -O2 without those
+   facts is not `rustc -O` code; filling them is front-end work (rule 31) and a piece of its own (gap row 9).
+   Knowledge that carries over from the parked crates/hir-ty-codegen: llvm.rs `set_options`
+   (`-aarch64-enable-global-isel-at-O=-1` because of a landing-pad bug seen in LLVM 20.1, `-disable-preinline`,
+   `-disable-vp`); the diagnostic handler (LLVM 23 prints an error and continues); `INLINE_THRESHOLD` 500,
+   measured geomean 1.091 to 1.080 of rustc for 2-5% more code; `shown_name`/`unshow` (callee bodies shown for
+   inlining, then dropped: the same idea as `available_externally`); llvm/emitted.rs reads an object back and
+   zeroes relocated fields; llvm/lower.rs (3083 lines) is how each MIR form became IR. crates/blaze-stencil
+   (parked) gen/ shows LLVM driven at build time with a pinned prebuilt output checked by BLAKE3 (pin.rs,
+   stencils.json): the model for the table's digest (point 2, stage 2).
+   How LLVM is pinned and linked: root Cargo.toml `[workspace.metadata.blaze.native.llvm] pin =
+   "crates/hir-ty-codegen/llvm.json", env = "LLVM_SYS_231_PREFIX", packages = ["llvm-sys",
+   "blaze-stencil/llvm-stencils"]`; llvm.json pins 23.1.4 with per-target tarballs and sha256; vendor/llvm-sys
+   pin.rs reads `PIN_JSON = "../../crates/hir-ty-codegen/llvm.json"`, wrappers/passes.cpp holds
+   `LLVMBlazeRunPasses`. The pin lives in a parked crate and must move when blaze-llvm exists (coordinator's
+   edit: vendor/ is no lane's).
+5. Export. blaze-export export.rs `export(program, platform, out, alloc)` already makes every in-reach call a
+   `bl`; layout.rs `order` puts input.rs `Profile { digest, hot }` functions first. It needs only optimized
+   records as input (G).
+6. Keys. blaze-ladder code_records.rs `code_key` hashes symbol, body digest, ground, triple, lse, tier byte,
+   settings, toolchain, ENTRY_FORM, MAGIC; layouts and constants are its READ LIST. Point 6 puts "the facts of the
+   types it was built with" in the key: allowed (see the note below), but it is a change from today's form. The
+   producer's code identity (D87) and the table's digest are not in `code_key` yet.
+7. Order. Checked: (a), (b) stage 1, (c) and the offer set need nothing that does not exist; (d) needs a new
+   crate and the pin; (e) needs (d); (f) needs the OS-sampling choice below; (h) needs (e).
+
+#### Objections
+
+OBJECTION: point 2's spill rule ("when none is free the value with the farthest next use is spilled to its cell")
+cannot run in ONE forward emission pass: code already emitted, including a loop body a back edge returns to,
+reads the register the rule would hand to another value. Evidence: pass.rs emits each instruction's bytes at once
+(`put`, `lower`), with only branch offsets patched later (`patches`). Architect's choice, written into B1: homes
+for whole intervals, decided in the analysis pass: a value gets a register only if it is free for all of [def,
+last use], intervals extended to a loop's end when live into its header; otherwise its cell. This also gives
+D98's fixed place at each header for free, and lets the prologue know which callee-saved registers to save.
+
+OBJECTION: D98's run-context register is not reliable at every entry. A callee-saved register (x28 is the one
+blaze-emit can reserve: nothing uses x19..x28 today; x18 is the platform's on Apple) holds whatever foreign code
+put there when C calls back into blaze code (a `qsort` comparator, a thread start through libc, a signal
+handler): run.md says a function's address is its entry thunk, and every indirect entry would have to reload it.
+Evidence: blaze-emit lib.rs (AAPCS64 calls), run.md "End state" (entry thunks). Proposal for the coordinator: the
+poll is a Load site, `adrp x16, poll@PAGE; ldr xzr, [x16, poll@PAGEOFF]`, two instructions, no reserved register,
+in the site form blaze-code already has (SiteKind::Load). B2 is written with x28 as decided; switching is one
+function.
+
+OBJECTION: point 3's "the link register gives the hot call edges" holds only in a leaf or before the prologue's
+`stp x29, x30`. In a non-leaf body the link register holds the return address of the last call the function made,
+which points into the function itself. Evidence: blaze-emit always builds an x29 frame (pass.rs `run` prologue).
+The caller is the return address in the frame record at [x29+8]; F1 takes lr only in the first 8 bytes and at a
+`ret` word.
+
+OBJECTION: macOS has no per-thread CPU timer (no `timer_create`; `setitimer(ITIMER_PROF)` is one per process and
+the kernel picks the thread), and a profiling signal is observable by the program: an interrupted `nanosleep`,
+`poll` or `select` returns EINTR even under SA_RESTART, and a program's own SIGPROF handler collides. Proposal: on
+macOS the launcher's control thread samples with `thread_suspend` + `thread_get_state` (no signal; launch-rt
+lib.rs already names thread_suspend as a tool); on Linux `timer_create(CLOCK_THREAD_CPUTIME_ID)` with
+`SIGEV_THREAD_ID` or perf_event. F1 is written so either works.
+
+OBJECTION: point 2 stage 2 on x86-64. "Templates with marked register fields" holds on AArch64 (Rd at bit 0, Rn at
+5, Rm at 16, Ra at 10), not on x86-64, where the register changes the bytes and the length (REX prefixes, the rax
+short forms, SIB for rsp/r12, disp8 for rbp/r13). The table needs canonical long forms or a variant per register
+class there. On both targets a constant operand needs encodability classes (AArch64 logical immediates and imm12
+depend on the value).
+
+OBJECTION: reading LLVM's code back (D3). blaze-code SiteKind Load assumes `adrp xN; ldr xN` at +0/+4 and Call
+assumes `blr x16` at +8. LLVM's scheduler may separate the pair, and a GOT call may use any register. Either the
+site form gains two offsets and a register, or D3 refuses such code by name and loses calls. The coordinator
+decides before D3 is written.
+
+Not an objection, a note on point 6: today's `code_key` keeps layouts out of the key and in the read list, so a
+layout change revalidates instead of rekeying. Putting the facts of types in the key is sound; it makes fewer
+records shareable across a layout edit. Kept as decided.
+
+#### Gap table
+
+| # | What the decision needs | Today | Piece |
+|---|---|---|---|
+| 1 | One `Tier` seam, tiers tested equal on machine code | `emit_record`; a private LIR-level `Tier` in blaze-lir tiers.rs | A |
+| 2 | Liveness, loops, last use, homes, loop map | none | B1 |
+| 3 | Values in registers, callee-saved pairs, unwind rows, poll | cells only (pass.rs `ld`/`st`) | B2 (after Run piece 11) |
+| 4 | The loop map in the record | no section; MAGIC bzcode01 | B3 |
+| 5 | Evaluator follows calls | refused | C1 |
+| 6 | Trivial inliner with exact read list | none; `split` and `Builder::inlined` to build on | C2 |
+| 7 | The offer set | none; `Callee`, `InstanceKey`, `CodeId` exist | O |
+| 8 | LIR to LLVM, -O2 module pipeline, one context per call, own `extern "C"` | parked inkwell code in hir-ty-codegen | D1, D2 |
+| 9 | Facts filled by the front end | only align, intrinsics' flags | front-end piece (blaze-build; WRONG ANSWERS holds walk.rs now) |
+| 10 | Object read back into a record | parked emitted.rs | D3 (after the site objection) |
+| 11 | Optimized tier in a helper, keyed per point 6 | `Optimizer` trait, no implementation | D4 |
+| 12 | Template table, generated, digested, validated | hand-written enc.rs | E |
+| 13 | Sampling, profile and startup records, promotion | count stub, `Heat` | F1 (core), F2 (OS half, records, promotion) |
+| 14 | Loop-entry variant, poll fault handler | none | F3 |
+| 15 | Export of optimized records | export takes today's records | G |
+| 16 | x86-64 | refused in run mode; parked stencils only | H |
+| 17 | The LLVM pin out of a parked crate | crates/hir-ty-codegen/llvm.json, vendor/llvm-sys pin.rs | coordinator |
+
+#### Pieces, in point 7's order
+
+- A, the seam and the harness (blaze-emit tier.rs, tier_tests.rs): now.
+- B1, liveness, homes, loop map (blaze-emit pass/live.rs): now.
+- B3, the loop map in the record (blaze-code loop_map.rs, record.rs wiring, cross-crate): now; apply after or
+  with Run piece 11 if that changes the header too.
+- C1, the evaluator follows calls (blaze-lir eval/calls.rs): now.
+- C2, the trivial inliner (blaze-lir inline.rs): now; its test needs C1.
+- O, the offer set (blaze-run offer.rs): now.
+- B2, registers at the ld/st seam, the poll, the `Fast` tier: after A, B1, B3 and Run piece 11's unwind wiring.
+- D1, blaze-llvm: IR text to an object at `default<O2>` (staged new crate): now; the pin move is the
+  coordinator's.
+- D2, LIR to LLVM IR text with the facts and `available_externally` offers (staged, sans-IO): now.
+- D3, object read back into a CodeRecord: after D1 and the site-form objection.
+- D4, the optimized tier in a helper the parent starts, keyed per point 6, read list = the offer set: after D1,
+  D2, D3, O.
+- Front-end facts (noalias, nonnull, dereferenceable, range from types and borrows): after the WRONG ANSWERS lane
+  releases walk.rs; before any optimized-tier speed is quoted.
+- E, the table generator and table (stage 2): after D1, D2 and the x86-64 objection.
+- F1, sample attribution and heat (blaze-launch-rt sample.rs): now (sans-IO).
+- F2, taking samples, profile and startup records, promotion, lifting run_mode's refusal: after F1, D4 and the
+  sampling objection.
+- F3, the loop-entry variant and the poll's fault handler: after F2, B2, B3.
+- G, export at the optimized tier: after D4.
+- H, x86-64: after E.
+
+Measurements that must come first (each names the tree's commit, the load and instructions retired):
+- The cell baseline ratio after B2 (today 4.41; B2's test prints the new one; the ratio of fast to optimized code
+  is reported from the ladder after C2 and D4, never claimed before, D98).
+- Emission time per LIR instruction today and after B2, over the hello world's 12,651 reached bodies
+  (port27/hello-1116/NOTES.md): before E, to know what stage 2 buys. The HELLO WORLD lane can run it.
+- The trivial inliner's bound: the ladder and tempo's tests at Fast with and without C2 (D98).
+- The poll's cost on the ladder (D98: kept unless above 1%), after B2.
+- The number of first-call asks before `main` prints, and the cost of sampling at the chosen rate: before F2's
+  bound. The RUN PROFILE lane (BODY TABLES row) or the HELLO WORLD lane.
+- LLVM's bytes equal across two processes (D1's test does it within one; a two-process run is the integrator's).
+- `default<O2>` against `default<O3>` on the ladder and tempo, compile and run time: before O3 is ever named.
+
+Contradictions with bottom.md section 11 found in other docs (bottom.md itself left "prologue add against
+sampling" open, and point 3 closes it): run.md "Machines" keys the profile "per instance by code identity", point 3
+by instance symbol; run.md and blaze-launch-rt observe.rs still describe the count stub as the heat; lir.md "LLVM"
+keeps inkwell over vendor/llvm-sys while bottom.md 11 says the Rust bindings go; lir.md "LLVM's memory" admits
+compiles by memory, against rule 50; tiers.md calls tier 0 stencils, which point 2 replaces.
+
+### Built straight at the end state (coordinator, 2026-11-16 16:50; D99, replaces point 7's order and point 2's "stage 1")
+
+The owner: "go straight to sota". So there is no stage 1 and no order of arrival: nothing is built that the end
+state then replaces, and every piece starts at once.
+
+- PIECE 0, FIRST AND ALONE (rule 79): one small crate of types that compiles and holds no logic: the `Tier` seam;
+  the code record with its loop map, poll sites, import sites and read list; the TEMPLATE TABLE's format (a
+  template: its bytes, its register fields, its immediate and site fields, the operand shapes it serves, its
+  clobbers) and the trait a table is read through; the register description of a target; the offer set; the
+  sample ring's entry and the profile and startup records. Every other piece is written against it.
+- THE FAST TIER IS WRITTEN ONCE, AS THE COMPOSER OVER THE TABLE: analysis pass, emission pass with the allocator,
+  the loop map and the polls, reading templates only through the table's trait. It never calls a hand-written
+  encoder. Today's hand-written encoders (crates/blaze-emit enc.rs) are not thrown away and not built upon: they
+  become a GENERATOR of table entries (each run once with placeholder registers at blaze's build time), so the
+  composer runs on a real table the day it compiles; the LLVM generator fills the same table by the same format,
+  and where both give an entry the two are tested equal against LIR's evaluator: two independent sources of one
+  template is a differential test the design gets for nothing.
+- IN PARALLEL, each a writer against piece 0: the composer (arm64); the table generator from enc.rs; the tier
+  equality harness (generated LIR programs and the rungs at every tier against the evaluator, planted wrong
+  template caught); the trivial inliner; the offer set's chooser; LIR-to-LLVM lowering with the facts and the
+  -O2 module pipeline in a helper; the table generator through LLVM and the per-template validation; the sampler
+  (signal, ring, address map), the profile and startup records, promotion by slot write; the loop-entry variant
+  and the poll's fault handler; export at the optimized tier; the x86-64 register description and table.
+- What is NOT parallel is admission: the coordinator's integrators compile each piece as it arrives, and a tier
+  becomes the default only after the equality harness passes on it and the real command has run a real project
+  through it with the profile on (rules 68, 82).
+
+### The outside critic's findings and the architect's objections, decided (coordinator, 2026-11-16 17:00; D100)
+
+An outside reader was given the design above and asked only where it is below the best systems; the architect
+listed where the code contradicts it. Each is decided here; where this differs from an earlier line, this wins.
+
+1. FAST CODE NEEDS A SIMPLIFIER, NOT ONLY AN INLINER (critic, blocker; accepted). Splicing `next` or `deref` in
+   and leaving the `Option`, the range and the iterator in memory keeps the code 5 to 20 times from optimized;
+   rustc pairs its MIR inliner with scalar replacement, Cranelift has a mid-end, V8 and .NET have a middle tier
+   for this reason. The Fast tier's input is LIR after the LINEAR SIMPLIFY STAGE, blaze's own LIR-to-LIR passes,
+   each one walk: the trivial inliner; scalar replacement of slots whose address does not escape (their fields
+   become values); copy and constant propagation with folding; dead code and trivial branch removal. Each is
+   validated like a tier (evaluator equality on generated programs, a planted wrong rewrite caught). The four
+   setups are measured on the ladder and on tempo's tests (Fast; with the inliner; with the whole stage;
+   Optimized), instructions retired, and the stage's bounds are set by that run.
+2. A RUNNING LOOP TIERS UP ON TOP OF ITS FRAME, NEVER BY MOVING IT (critic, blocker; accepted; replaces D98's
+   "moves the mapped values"). Rust takes the address of locals everywhere; moving a frame leaves pointers into
+   it dangling. The loop-entry variant runs in a NEW frame above the fast frame, as .NET's does: slots whose
+   address is taken stay where they are in the fast frame and reach the variant as pointers; only values held in
+   registers or private cells are passed as parameters; the variant runs the rest of the function, drops what
+   the fast frame held, and returns through a stub that pops both. The fast frame's unwind row at that stub has
+   no cleanup; the variant's landing pads own the drops.
+3. NO RESERVED REGISTER (architect and critic; accepted). The poll is a load site in the form blaze-code has:
+   `adrp x16, poll@PAGE; ldr xzr, [x16, poll@PAGEOFF]`: no register is taken from the allocator and an entry
+   from foreign code needs nothing reloaded.
+4. CALL EDGES COME FROM THE FRAME RECORD, AND macOS IS SAMPLED BY SUSPENSION (architect and critic; accepted;
+   replaces point 3's link register and timer signal). Every tier keeps the frame record. A sample is the
+   program counter, the frame pointer and the link register; the caller is the return address at [x29+8],
+   except in the prologue's first words and at a `ret`, where it is the link register; the reader checks the
+   frame pointer against the thread's stack bounds before it reads. On macOS the runtime's control thread
+   samples with `thread_suspend` and `thread_get_state` and holds no lock and allocates nothing while a thread
+   is stopped (JavaScriptCore's sampler); no signal reaches the program, so no sleep or poll of its own is
+   interrupted. On Linux: `timer_create(CLOCK_THREAD_CPUTIME_ID)` with `SIGEV_THREAD_ID`.
+5. HOMES AND EVICTION (architect's objection to point 2's spill rule; accepted with one addition). A value live
+   across a block boundary gets its home (a register for its whole interval, extended to a loop's end when live
+   into its header, or its cell) in the analysis pass: that is what gives the fixed place at each header. A
+   value defined and last used inside one block, which is most values, takes any free register in the emission
+   pass and may be evicted to its cell there, since no other path can reach that code.
+6. FUSED PATTERNS AND IMMEDIATE CLASSES (critic 10, architect on x86-64; accepted). A template may cover a small
+   tree of operations when the inner value has one use (compare and branch, an address folded into a load or
+   store, a shifted operand). An operand shape includes the immediate's encodability class; a constant outside
+   it is put in a register by the composer. On x86-64 a template uses the canonical long form, so its register
+   fields are at fixed bits, and a short variant only where a measurement pays for it.
+7. THE READ LIST OF AN OPTIMIZED RECORD IS THE INLINED SET, EXACTLY (critic 5; accepted; replaces D98's "the
+   offer set, never tightened"). With the offer set as the read list, an edit of one small hot function demotes
+   every caller it was offered to, at once, in the edit loop: a cliff. So: (a) the pipeline is a NAMED CUSTOM
+   one: LLVM's inliner in its bottom-up order with the -O2 function simplification, and NO pass that infers a
+   fact about a callee from an offered body (no interprocedural attribute inference, no interprocedural
+   constant propagation over them); (b) what such passes would have inferred is SUPPLIED from blaze's own fact
+   records (cannot unwind, pure, reads only, no-alias, ranges), each a read by the fact's content, so a callee
+   edited without changing its facts invalidates nobody; (c) the inliner's remarks are read from LLVM's remark
+   stream by the helper (a remark for every inlined call site; an unreadable stream is an error, never a guess),
+   and the read list is the bodies inlined, transitively, plus the fact records of callees still called; (d) an
+   optimized caller whose non-inlined callee changed stays valid and reaches the new callee through its slot.
+8. THE KEY HOLDS THE OFFER SET'S DIGEST (critic 4; accepted). The profile chooses the offer set, so two runs
+   would write different bytes under one key. The optimized record's key includes the digest of the offer set
+   (in a total order); the pointer from (instance, tier) to the newest record is local and never shared; a
+   record made from an observed profile stays in the private layer; the shared cache holds records whose offer
+   set came from the static policy or from a profile that is itself a named input.
+9. CALLEES ARE OFFERED ALREADY OPTIMIZED, FROM THE FIRST VERSION (critic 6; accepted; moves "later" to now).
+   Each optimized instance also keeps its optimized LLVM bitcode as a record; a callee with one is offered in
+   that form (ThinLTO's import of already-simplified code), so a caller's compile does not re-simplify it, and
+   the parent makes hot callees before their callers. The helper compiles many instances in one process, a
+   fresh module each, and "alone and batched give equal bytes" is a test. What a whole-crate pipeline has that
+   this lacks (dead argument elimination, argument promotion, merging, global optimization) belongs to `export`,
+   which is not incremental: blaze's whole-program LIR passes (devirt.md, icf.md) run there.
+10. UNWINDING, POSITIONS AND DEBUGGERS ARE PART OF EVERY TIER'S RECORD (critic 7; accepted; the design was
+   silent). A code record carries its unwind rows and landing pads, and a position map (item-relative, rule 71)
+   with the inline frames the simplifier and LLVM created, so a backtrace names spliced bodies. Placed code is
+   registered with the unwinder through `__unw_add_find_dynamic_unwind_sections` on macOS (a lookup callback,
+   not a list walked on every throw) and its like on Linux; a debugger sees placed code through the JIT
+   interface. The loop-entry variant's rows describe its frame above the fast frame.
+11. ONE RECORD FORMAT CHANGE CARRIES ALL OF IT (architect on reading LLVM's code back; decided). A site is one
+   relocation: an offset, a kind (page, page offset, branch, GOT page, GOT page offset) and a target; today's
+   paired load and call forms are two and three such sites. With the loop map, the poll sites, the unwind rows
+   and the position map this is ONE new format of the code record, made once.
+12. SHARED INSTANCES NEVER PASS THROUGH FAST (critic 9; accepted). Keys use the instance's share identity
+   (polymorph.md); an instance whose content depends only on dependencies is found in the shared cache at the
+   optimized tier before anything is compiled.
+13. OPEN, BY MEASUREMENT (critic 8): a call through a slot word is a load and an indirect branch; the
+   alternative is `bl` to a per-callee `b` that tier-up rewrites. Slot words stay (bottom.md section 11, the
+   owner's design: no code is patched, any distance) until the ladder's call-heavy rungs show the difference;
+   that run is part of the first measurement. Accepted now: promoted code is placed together in a hot region
+   ordered by the sampled call edges (code-layout.md), not in first-call order.
+14. Proofs do not gate a template (critic 12): a template is admitted by evaluator equality over the edge
+   tables; the bit-vector proofs are added where they are generated for free. The target CPU is named in the
+   key and given to LLVM explicitly, never `native` (critic 11).

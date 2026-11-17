@@ -22,6 +22,7 @@ use crate::crate_scope::{Ready, resolve_by_records};
 use crate::graph::Sysroot;
 use crate::items_record::plant::{PLANT, Plant};
 use crate::items_record::{ItemsRecordError, LoadItems, RecordItems, SelfHead, encode};
+use crate::package_path::PackagePath;
 use crate::resolve::{At, CrateInput, CrateNames, Names, aligned};
 use crate::task::Serial;
 
@@ -121,10 +122,11 @@ impl LoadItems<'static> for Loaded {
         self.records.get(krate).copied()
     }
 
-    fn file(&self, krate: usize, path: &str) -> Option<&'static str> {
+    fn file(&self, krate: usize, path: PackagePath<'_>) -> Option<&'static str> {
+        let file = self.names.get(krate)?.files.iter().find(|f| f.package == path)?;
         match self.changed {
-            Some((k, p, now)) if k == krate && p == path => Some(now),
-            _ => self.names.get(krate)?.files.iter().find(|f| f.path == path).map(|f| f.text),
+            Some((k, p, now)) if k == krate && p == file.path => Some(now),
+            _ => Some(file.text),
         }
     }
 
@@ -167,7 +169,7 @@ fn ask(fresh: &Names<'static>, read: &RecordItems<'static, Loaded>, all: &[&'sta
         same(n.files.len(), r.files(), &format!("`{c}`'s files"))?;
         for (i, f) in n.files.iter().enumerate() {
             let row = rec(r.file(i as u32), "a file row")?.ok_or_else(|| differs(format!("`{c}` file {i}: no row")))?;
-            same((f.path, f.shown, f.id, f.text.len()), (row.path, row.shown, row.id, row.len as usize), &format!("`{c}` file {i}"))?;
+            same((f.package, f.shown, f.id, f.text.len()), (row.path, row.shown, row.id, row.len as usize), &format!("`{c}` file {i}"))?;
             same(f.text, rec(read.whole(k, At::File(i as u32)), "a file's text")?, &format!("`{c}` file {i}'s text"))?;
         }
         let mut made = 0;

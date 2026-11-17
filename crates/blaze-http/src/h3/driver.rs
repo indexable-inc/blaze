@@ -305,7 +305,7 @@ impl Loop {
             }
         }
         match (op, done) {
-            (Op::Bind, Done::Bound { sock, local }) => self.sock = Some((sock, local)),
+            (Op::Bind, Done::Bound { sock, local, .. }) => self.sock = Some((sock, local)),
             (Op::Bind, Done::Failed(error)) => {
                 let why = format!("binding the UDP socket at {}: {error}", self.at);
                 self.failed = Some(Error { peer: None, step: Step::Config, why });
@@ -1267,7 +1267,7 @@ impl<D: effects::Driver> Wired<D> {
             driver.poll(&mut done, until);
             if let Some(at_bind) = done.iter().position(|it| it.tag == Tag(0)) {
                 match done.swap_remove(at_bind).done {
-                    Done::Bound { sock, local } => break (sock, local),
+                    Done::Bound { sock, local, .. } => break (sock, local),
                     Done::Failed(why) => return Err(config(format!("binding the UDP socket at {at}: {why}"))),
                     other => panic!("blaze-http's HTTP/3 wire: a bind completed with {other:?}, which blaze-core's effect never gives"),
                 }

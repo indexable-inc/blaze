@@ -1860,10 +1860,13 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             EXPR_STMT
                 if self.vals[f.base as usize..]
                     .iter()
-                    .any(|v| v.v == V::Stmt || matches!(v.v, V::Skipped(k) if is_item(k))) =>
+                    .any(|v| v.v == V::Stmt || matches!(v.v, V::Skipped(k) if is_item(k)))
+                    || self.count(f, |v| v == V::Expr) > 1 =>
             {
                 // A macro call's statements, lowered in place: they stay the block's, and a
                 // last expression is a statement of its own when a `;` follows the call.
+                // (More than one expression: an expansion of block-like statements, each left
+                // a `V::Expr` by the arm below; `stmt_list` decides which one is the tail.)
                 let semi = self.has_tok(f, SEMICOLON);
                 let last = self.vals[f.base as usize..].iter().rposition(|v| v.v == V::Expr);
                 if semi && let Some(at) = last {
@@ -1878,8 +1881,20 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let semi = self.has_tok(f, SEMICOLON);
                 self.done(f);
                 if let Some(e) = e {
-                    let s = self.put_stmt(Stmt::Expr { expr: ExprId(e.id), semi });
-                    self.push(V::Stmt, s.0, r);
+                    if semi {
+                        let s = self.put_stmt(Stmt::Expr { expr: ExprId(e.id), semi: true });
+                        self.push(V::Stmt, s.0, r);
+                    } else {
+                        // A block-like expression with no `;` (the parser's EXPR_STMT for one
+                        // that is not followed by `}`) is not yet a statement: whether it is the
+                        // block's final operand is known only after cfg stripping, when a later
+                        // `#[cfg(..)]`-false statement has left nothing (the Reference,
+                        // "Conditional compilation": "If any predicate is false, the form is
+                        // removed from the source code"). `stmt_list` makes the last expression
+                        // with nothing after it the tail and every other one a
+                        // `Stmt::Expr { semi: false }`.
+                        self.vals.push(e);
+                    }
                 }
             }
             MATCH_GUARD => {

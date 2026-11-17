@@ -126,7 +126,9 @@ impl BackNeeds {
             }
         }
         let Some(body) = body else { return };
-        let view = body.typeck.view(body.tys.view());
+        // The lowering's expressions and `format_args!` uses only; types are the check's
+        // (`c.types`). A type read through this view is refused as past an empty table.
+        let view = body.typeck.view(tc::PTys::EMPTY);
         let mut wanted: Vec<tc::FmtTrait, Global> = Vec::new_in(Global);
         for x in view.exprs.iter() {
             match *x {

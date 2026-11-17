@@ -136,7 +136,7 @@ impl<C: Channels> Server<C> {
         let tag = self.tags.next();
         self.listen = Some(tag);
         // alloc: setup: once a server or a connection.
-        effects.push(Effect::Listen { at: self.at.clone(), tag });
+        effects.push(Effect::Listen { at: self.at.clone(), options: blaze_core::sockopt::Tcp::DEFAULT, tag });
     }
 
     /// Stops listening and hangs up on every connection.

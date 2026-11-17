@@ -89,7 +89,7 @@ impl<'n, H: Heads, S: NamesSource<'n>> Builder<'_, H, S> {
         // the evaluator has filled it (the caller's `eval_len` loop), then its value.
         // An end that is another constant expression (`u32::MAX`, `A - 1`) is an anonymous
         // constant of the BASE type (`Builder::end_value`), needed and evaluated the same way.
-        let base_node = tys.view().nodes.get(base.0 as usize).copied();
+        let base_node = tys.view().get(base).copied();
         let mut need: Option<Why> = None;
         let mut eval = |p: &str| -> Result<u128, Refused> {
             match self.end_value(env, p, r, base_node) {

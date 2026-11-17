@@ -39,6 +39,8 @@ pub(super) const KNOWN: &[(&str, &str)] = &[
     ("r7d", "glob-vs-outer at an import's first segment, neither candidate holding the next segment: answers NotFound, not Ambiguous(GlobVsOuter) (oracle no-calls seed 29)"),
     ("r7f", "glob-vs-outer reported early, but the import is still resolved through the glob candidate and binds its names (wide seed 107: `y` bound)"),
     ("r7g", "WRONG ACCEPT: a module's glob of the root brings the module itself, beside a standard-prelude module of its name: no error at all (no-calls seed 156)"),
+    ("x1", "CALL NEVER EXPANDED: a body's block (a module with no `mod` line) gets none of its module's `macro_rules!` (`mod b { macro_rules! far; const _: () = { far!{ fn x() {} } }; }`: `x` names None); inferred to be the tempo run's 332 calls the fill did not expand (320 in serde_core), not shown call by call; the cell core places the block in `b`'s text (cells/tests.rs `a_blocks_module_reads_the_textual_scope_around_its_body`)"),
+    ("x2", "MISSING MACRO: a `#[macro_export]` macro in a module below one an expansion declared is not in the root (`mk!{ mod p { pub mod d { #[macro_export] macro_rules! exp; } } }`: `exp` names None); the tempo run's 21 `only_cells` (serde_core's `__private_serialize`, nix's `sockopt_impl`, tokio's `count!`); the cell core answers it (cells/tests.rs `an_export_below_a_module_an_expansion_declared_is_in_the_root`)"),
 ];
 
 /// A tape whose first choices are drawn from `seed` (small values, so each is in range), calm after.
@@ -1192,22 +1194,26 @@ fn r9a_builtin_type_beside_a_module_both_sides() {
 }
 
 /// The textual scope reaches a block (the cell core's runner 15; tempo run c10-r14c: "calls
-/// the fill did not expand, summed: 332", 320 of them in serde_core): `macro_rules! far; mod b
-/// { const _: () = { far!{ fn x() {} } }; }`. A body's block that holds items is a module of
-/// its own with no `mod` line. The Reference, `macro.decl.scope.textual.intro`: "When
+/// the fill did not expand, summed: 332", 320 of them in serde_core): `mod b { macro_rules!
+/// far; const _: () = { far!{ fn x() {} } }; }`. A body's block that holds items is a module of
+/// its own with no `mod` line in its parent (blocks.rs), so the old core marks no place for it
+/// in `b`'s textual scope and gives it none of `b`'s `macro_rules!` (the real-path form is
+/// tests/blocks.rs `blocks_expand_a_statement_call_named_by_textual_scope`, "2 of 3"; with the
+/// macro in the ROOT instead, as runner 15 first wrote it, the old core passes: `b`'s own place
+/// in the root is marked). The Reference, `macro.decl.scope.textual.intro`: "When
 /// `macro_rules!` is used to define a macro, the macro enters the scope after the definition
 /// (note that it can still be used recursively, since names are looked up from the invocation
 /// site), up until its surrounding scope, typically a module, is closed.", and
 /// `macro.decl.scope.textual.function-local`: "Macros can be declared and used locally inside
-/// functions as well, and work similarly". So `far!` in the block names the root's `far`, it is
+/// functions as well, and work similarly". So `far!` in the block names `b`'s `far`, it is
 /// expanded, and `x` is an item of the block's module. The cell core's side of this is
 /// cells/tests.rs `a_blocks_module_reads_the_textual_scope_around_its_body`.
 #[test]
 fn x1_a_block_reads_the_textual_scope_around_it() {
     let mut w = World::new();
     let root = w.root(1, Edition::E2021);
-    w.rules(root, "far");
     let b = w.module(root, "b", V::Pub);
+    w.rules(b, "far");
     let blk = w.module(b, "blk", V::Priv);
     w.decls.get_mut(&b).expect("b's text").mods.retain(|c| c.module != blk);
     let call = w.call(blk, "far", CallShape::FnLike);

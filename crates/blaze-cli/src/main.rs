@@ -24,15 +24,18 @@
 #![feature(macro_attr, allocator_api, alloc_error_hook)]
 #![forbid(unsafe_code)]
 
+mod body_types;
 mod checkout;
 mod fetch;
 mod fix;
+mod front_load;
 mod home;
 mod macros;
 mod names;
 mod phases;
 mod print;
 mod program;
+mod roster;
 mod seal;
 mod store;
 mod sweep;
@@ -97,6 +100,9 @@ pub enum CliError {
     Program(RunError),
     /// The program of the command typed did not run.
     Ran { command: &'static str, error: RunError },
+    /// `blaze run` in a package with no binary to run (program.rs): the person's request, not
+    /// blaze's failure to build, so not [`program::NOT_RUN`].
+    NoBinary(program::NoBinary),
     /// A named origin's read path stopped the command (store.rs; a miss is not this).
     Remote(store::RemoteError),
     /// The running binary carries no linker id, the tool identity every key starts from.
@@ -136,6 +142,7 @@ impl fmt::Display for CliError {
             CliError::Table(full) => write!(f, "{full}"),
             CliError::Program(error) => write!(f, "the program: {error}"),
             CliError::Ran { command, error } => write!(f, "blaze {command}: {error}"),
+            CliError::NoBinary(no) => write!(f, "{no}"),
             CliError::Remote(error) => write!(f, "{error}"),
             CliError::BuildId(error) => write!(f, "{error}: blaze keys every record by its own code and will not run without that id"),
             CliError::Pool(error) => write!(f, "{error}"),
@@ -163,8 +170,11 @@ macro_rules! from {
 from!(Missing(Missing), Path(PathError), Fs(FsError), Out(OutError), Drive(DriveError), Table(TableFull), BuildId(bstd::host::NoBuildId));
 
 /// `blaze run` and `test` fail on any finding, lints included (bottom.md 11); `check` reports.
-fn every_rule(_: u16) -> bool {
-    true
+/// A body whose types were not checked (`body_types::TYPES_NOT_CHECKED`) says what the command
+/// left out, not what is wrong with the program: it is no error, and the closing line says
+/// "incomplete" for it (`check_coverage`).
+fn every_rule(rule: u16) -> bool {
+    rule != body_types::TYPES_NOT_CHECKED
 }
 
 /// What follows the command word.
@@ -421,7 +431,7 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
 /// `check` names what it did not check, and never says `ok` over it (decision D61 item 5).
 #[expect(clippy::too_many_arguments, reason = "the request's parts, each read once")]
 fn close(cx: &Cx, command: Command, finished: &Finished<'_>, shown: &print::Shown<'_>, ran: Option<u8>, in_main: u64, frame: &Frame, out: &Out) -> Result<Status, CliError> {
-    let (ran_stages, not_stages) = check_coverage(finished.names_held, frame);
+    let (ran_stages, not_stages) = check_coverage(finished.names_held, shown.types_unchecked == 0, frame);
     let coverage = (command == Command::Check && !not_stages.is_empty()).then_some(blaze_report::frame::Coverage { ran: &ran_stages, not: &not_stages });
     if ran.is_none() {
         let tail = (command == Command::Test).then_some("tests are not run yet: this build of blaze checks them");
@@ -516,11 +526,12 @@ fn explain(cx: &Cx, asked: Option<&str>, out: &Out) -> Result<Status, CliError> 
 /// [`work::CHECK_STAGES`] split: those this command ran, and those it did not: a stage this
 /// build does not run, and the names stage when the answer holds no crate's names
 /// (`Finished::names_held`): never a pass printed over a stage that did not run.
-fn check_coverage(names_held: bool, frame: &Frame) -> (Vec<&'static str, &Frame>, Vec<&'static str, &Frame>) {
+/// `types_whole`: no body said its types were not checked (`print::Shown::types_unchecked`).
+fn check_coverage(names_held: bool, types_whole: bool, frame: &Frame) -> (Vec<&'static str, &Frame>, Vec<&'static str, &Frame>) {
     let mut ran = Vec::new_in(frame);
     let mut not = Vec::new_in(frame);
     for (stage, built) in work::CHECK_STAGES {
-        match built && (names_held || stage != work::NAMES_STAGE) {
+        match built && (names_held || stage != work::NAMES_STAGE) && (types_whole || stage != work::TYPES_STAGE) {
             true => ran.push(stage),
             false => not.push(stage),
         }
@@ -554,7 +565,7 @@ fn kept<'f>(req: &Request<'_>, followed: &sweep::Followed<'_>, rows: &Rows<'_>, 
             // (a gap: one dropped stays until the table is made again cold).
             let keep = match leaf.kind {
                 LeafKind::Slot => leaf.absent() || req.holds(path.as_bytes()),
-                LeafKind::Manifest | LeafKind::Listing => !slots_only,
+                LeafKind::Manifest | LeafKind::Listing | LeafKind::HomeListing => !slots_only,
             };
             if keep {
                 kept.push(leaf.kind, leaf.flags, path, leaf.stamp, leaf.id);
@@ -657,7 +668,16 @@ fn request<'f>(
         work::Plant::Sweep(plant) => plant,
         _ => sweep::Plant::None,
     };
-    let followed = sweep::Follow { stamps, plant: sweep_plant }.follow(&cx, root, &leaves, frame)?;
+    // The machine store under the home (remote-read.md, "One chain of stores"): its place
+    // from `HOME` as read at the edge (rule 75), a second tree wherever it is. Opened before the
+    // sweep: blaze's folder in the home holds a fact the answer reads (the proc-macro module
+    // store's listing, a `HomeListing` row).
+    let machine = store::Machine::of(&cx, &launch.io.need_fs()?, home)?;
+    let home_dir = match &machine {
+        store::Machine::Home(dir) => Some(dir),
+        store::Machine::Off(_) => None,
+    };
+    let followed = sweep::Follow { stamps, plant: sweep_plant }.follow(&cx, root, home_dir, &leaves, frame)?;
     phases.mark_in("sweep", frame);
     // No table: nothing to follow; the layout discovers forward from the root manifest, and the
     // drive opens each file as a record names it.
@@ -666,9 +686,13 @@ fn request<'f>(
     // of its own, so it is erased into one here, on this stack, for this request.
     let erased = blaze_own::Erased::new(frame);
     let alloc = erased.handle();
-    let mut facts = work::Facts { stamps, rows: Rows::new_in(frame), found: sweep::Found::new_in(frame), laid: None, plant: sizes.plant, workers, fetch_env: fetch::FetchEnv { clock: phases.clock().clone(), checkout: checkout_at, cert_file, cert_dir, home, cargo_home, start, toolchain, fs: launch.io.need_fs()? }, macros: None, names: None };
+    let mut facts = work::Facts { stamps, rows: Rows::new_in(frame), found: sweep::Found::new_in(frame), laid: None, plant: sizes.plant, workers, fetch_env: fetch::FetchEnv { clock: phases.clock().clone(), checkout: checkout_at, cert_file, cert_dir, home, cargo_home, start, toolchain, fs: launch.io.need_fs()? }, macros: None, names: None, bodies: body_types::Kept::default() };
     if cold || followed.layout_moved {
         facts.laid = Some(units::lay(&cx, root, &stamps, &mut facts.rows, toolchain, frame, alloc)?);
+        // The proc-macro module store's listing, read with the layout: in the units' source, so
+        // a module that comes or goes moves the certificate and the dependency graph's source,
+        // and with it each `MacroModule` part's (macros.rs).
+        sweep::read_home_listing(&cx, home_dir, &stamps, macros::MODULE_LISTING, &mut facts.rows, frame)?;
     } else {
         for leaf in followed.now.rows.iter().filter(|leaf| leaf.kind != LeafKind::Slot) {
             facts.rows.push(leaf.kind, leaf.flags, followed.now.path(leaf), leaf.stamp, leaf.id);
@@ -690,7 +714,7 @@ fn request<'f>(
     let mut gone: Vec<&[u8], &Frame> = Vec::new_in(frame);
     for (i, leaf) in followed.now.rows.iter().enumerate() {
         let path = followed.now.path(leaf);
-        if leaf.kind != LeafKind::Listing && leaf.absent() && followed.was[i].0 & sweep::ABSENT == 0 {
+        if !matches!(leaf.kind, LeafKind::Listing | LeafKind::HomeListing) && leaf.absent() && followed.was[i].0 & sweep::ABSENT == 0 {
             gone.push(path.as_bytes());
         }
         if leaf.kind != LeafKind::Slot || leaf.absent() {
@@ -736,10 +760,10 @@ fn request<'f>(
             store::Boot::Unknown
         }
     };
-    // The machine store under the home (remote-read.md, "One chain of stores"): its place
-    // from `HOME` as read at the edge (rule 75), a second tree wherever it is.
-    let machine = store::Machine::of(&cx, &facts.fetch_env.fs, home)?;
+    // The machine store, opened before the sweep (above).
     let mut store = store::Layered::open(&cx, root, &machine, boot, origin, phases.clock().clone(), err, alloc)?;
+    // Every record this command seals names this tool as its producer (store/producers.rs).
+    store.name_tool(tool);
     // The workers' read side: today's tasks publish a file's outline and a manifest's units,
     // about one name a file, so 8 a file. A cold run starts with no files listed and opens them
     // as it goes: the table grows on a full one (`Settled::grown_in`), never stops. On the
@@ -995,7 +1019,9 @@ fn program_refusals<'f>(cx: &Cx, root: &Dir<ReadWrite>, rows: &Rows<'_>, frame: 
     }
     // What the runner refuses, every stage before placing: the same call `blaze run` stops at;
     // beside it, the advice about `blaze::` attributes it read and the count nothing checks.
-    let (mut refusals, blaze) = blaze_ladder::run::findings(&files, PROGRAM_ROOT);
+    // With the setting `blaze run` builds with (D101): it decides which lang fns are needed.
+    let overflow = program::dev_overflow(cx, root, frame)?;
+    let (mut refusals, blaze) = blaze_ladder::run::findings(&files, PROGRAM_ROOT, overflow);
     let unchecked = blaze.note();
     refusals.extend(blaze.advice);
     Ok(Refused { texts, refusals, unchecked })
@@ -1394,9 +1420,13 @@ mod tests {
         let mut ran = None;
         let launch = program::Launch { io, grants: &[], args: &[] };
         let said = words(command.0, &out, &err);
+        let tool = match sizes.plant {
+            work::Plant::BodyChecker(older) => home::tool_of(b"test", older),
+            _ => home::tool(b"test"),
+        };
         let toolchain = shelf(io);
         let mut run = |mut shown, ran: &mut Option<u8>, phases: &mut Phases| {
-            let finished = request(&cx, &root, ("ws", None, None, Some("/h"), None, Some("/"), toolchain), None, command, 1, home::tool(b"test"), sizes, &launch, frame, said, &err, ran, &mut shown, phases);
+            let finished = request(&cx, &root, ("ws", None, None, Some("/h"), None, Some("/"), toolchain), None, command, 1, tool, sizes, &launch, frame, said, &err, ran, &mut shown, phases);
             finished.map(|finished| (finished, shown))
         };
         let (finished, shown) = match fix {
@@ -1447,6 +1477,49 @@ mod tests {
         let created = check(&io, work::Sizes::USUAL);
         assert!(created.failed.is_empty(), "{:?}", created.failed);
         assert_eq!(created.errors, 0, "the created file clears the error:\n{}", created.profile);
+    }
+
+    /// An answer with errors is certified: a task's typed failure is filed as its record with
+    /// the inputs it was handed as its reads, so the repeat stands on its certificate with the
+    /// same errors, and fixing the cause asks again and clears them. Here member `a`'s root is
+    /// not UTF-8, so its names fail (filed by names.rs with the files it read) and `b`, which
+    /// depends on it, fails `Waited` on `a` (filed by work.rs): `b`'s key holds none of `a`'s
+    /// text, so only its read of `a` asks it again. `Err` names the step that broke.
+    fn a_filed_failure_stands_until_its_input_moves(plant: work::Plant) -> Result<(), std::string::String> {
+        let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+        write(&io, "Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n");
+        write(&io, "a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+        write(&io, "b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\na = { path = \"../a\" }\n");
+        write(&io, "b/src/lib.rs", "pub fn h() -> u8 {\n    a::f()\n}\n");
+        {
+            let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+            let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
+            root.publish(&cx, &Path::new("a/src/lib.rs").expect("a path"), Content::bytes(b"pub fn f() -> u8 {\n    1\n}\n// \xff\xfe\n"), Durable::No).expect("write");
+        }
+        let sizes = work::Sizes { plant, ..work::Sizes::USUAL };
+        let first = check(&io, sizes);
+        if first.errors == 0 {
+            return Err(format!("a module file that is not UTF-8 is no error:\n{}", first.profile));
+        }
+        let repeat = check(&io, sizes);
+        if !(repeat.certified && repeat.runs == 0 && repeat.errors == first.errors) {
+            return Err(format!("the repeat: certified {}, {} runs, {} errors (first {}):\n{}", repeat.certified, repeat.runs, repeat.errors, first.errors, repeat.profile));
+        }
+        write(&io, "a/src/lib.rs", "pub fn f() -> u8 {\n    1\n}\n");
+        let fixed = check(&io, sizes);
+        if fixed.errors != 0 || !fixed.failed.is_empty() {
+            return Err(format!("after the fix: {} errors, failed {:?}:\n{}", fixed.errors, fixed.failed, fixed.profile));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_answer_with_errors_is_certified_and_asked_again_when_its_input_moves() {
+        if let Err(broke) = a_filed_failure_stands_until_its_input_moves(work::Plant::None) {
+            panic!("{broke}");
+        }
+        // Control: a filed failure without its reads stands after the fix, and is caught.
+        assert!(a_filed_failure_stands_until_its_input_moves(work::Plant::FiledWithoutReads).is_err(), "the planted bug (a filed failure with no reads) went uncaught");
     }
 
     /// The findings lines of the last command: what it printed since `before` bytes of stdout.
@@ -1645,6 +1718,49 @@ mod tests {
         assert_eq!((edited.status, made(&edited.profile, "BodyCheck")), (Some(3), 1), "{}", edited.profile);
     }
 
+    /// Piece 7 (body_types.rs): a body's types are checked in its `BodyCheck` task over the
+    /// crates' records. `fn f() -> u32 { "x" }` is one `types` error (the Reference, "Function
+    /// body": the block's type must be the declared return type), `g` beside it clean; the
+    /// repeat makes no `BodyCheck`; a signature edit of `g` in the same file re-checks both
+    /// bodies (their key holds the file around its bodies). Without the arm (work.rs
+    /// `run_batches` calling `prepare`) no type error is found and the status is 3.
+    /// Prints `body types: cold 1 error, repeat made 0, signature edit made 2`.
+    #[test]
+    fn a_body_type_error_is_found_over_records_and_kept() {
+        let io = Io::simulated(SimWorld::new(8, Limits::USUAL));
+        write(&io, "Cargo.toml", MANIFEST);
+        write(&io, "src/lib.rs", "pub fn f() -> u32 { \"x\" }\npub fn g() -> u32 { 1 }\n");
+        let cold = check(&io, work::Sizes::USUAL);
+        let out = stdout(&io);
+        assert_eq!((cold.errors, cold.status), (1, Some(1)), "{out}\n{}", cold.profile);
+        assert!(cold.ids.iter().any(|(code, _)| code == "types"), "{:?}\n{out}", cold.ids);
+        let repeat = check(&io, work::Sizes::USUAL);
+        assert_eq!((repeat.errors, made(&repeat.profile, "BodyCheck")), (1, 0), "{}", repeat.profile);
+        write(&io, "src/lib.rs", "pub fn f() -> u32 { \"x\" }\npub fn g() -> u64 { 1 }\n");
+        let edited = check(&io, work::Sizes::USUAL);
+        assert_eq!(made(&edited.profile, "BodyCheck"), 2, "{}", edited.profile);
+        std::println!("body types: cold {} error, repeat made {}, signature edit made {}", cold.errors, made(&repeat.profile, "BodyCheck"), made(&edited.profile, "BodyCheck"));
+    }
+
+    /// A body's record made by an older body checker is never read after a checker fix
+    /// (`body_types::BODY_CHECKER`, in the tool): the same text, checked by the older producer
+    /// and then by today's, makes every body again; today's twice makes none. Without the
+    /// producer in the key (home.rs `tool_of` ignoring it) the second check makes 0 and the
+    /// older answer is served.
+    #[test]
+    fn a_body_record_of_an_older_checker_is_made_again() {
+        let io = Io::simulated(SimWorld::new(9, Limits::USUAL));
+        write(&io, "Cargo.toml", MANIFEST);
+        write(&io, "src/lib.rs", "pub fn f() -> u32 { \"x\" }\npub fn g() -> u32 { 1 }\n");
+        let older = work::Sizes { plant: work::Plant::BodyChecker("blaze body checker 2026-11-16.0"), ..work::Sizes::USUAL };
+        let by_older = check(&io, older);
+        assert_eq!(made(&by_older.profile, "BodyCheck"), 2, "{}", by_older.profile);
+        let today = check(&io, work::Sizes::USUAL);
+        assert_eq!(made(&today.profile, "BodyCheck"), 2, "an older checker's body records were read\n{}", today.profile);
+        let again = check(&io, work::Sizes::USUAL);
+        assert_eq!(made(&again.profile, "BodyCheck"), 0, "{}", again.profile);
+    }
+
     /// What the simulated host's standard output holds.
     fn stdout(io: &Io) -> std::string::String {
         let out = io.script(|host| host.out.clone()).expect("a simulated host");
@@ -1710,7 +1826,8 @@ mod tests {
     /// `blaze run` after `blaze check` of a package with an error (a dependency not read): the
     /// run's certificate is its own, so it walks forward from the check's answer, and answers
     /// with the error, never stepping the machine past its answer (hello-world, 2026-11-16:
-    /// "a step after the request answered").
+    /// "a step after the request answered"). The package is a library, so the error is
+    /// [`CliError::NoBinary`] naming it.
     #[test]
     fn run_after_check_answers_with_the_error() {
         let io = workspace(10);
@@ -1718,7 +1835,19 @@ mod tests {
         let checked = check(&io, SMALL);
         assert!(checked.failed.is_empty());
         let ran = ask(&io, (Command::Run, "run"), SMALL);
-        assert!(ran.is_ok(), "{:?}", ran.err());
+        // The package is a library (src/lib.rs, no `[[bin]]`): the run answers that there is no
+        // program, by the package's name, before reading a source file; never the front end's
+        // `NoMain` (2026-11-16), and never the old front end's lowering refusal, which was an
+        // accident of what it could not read (the test passed on it before the switch).
+        match ran {
+            Err(CliError::NoBinary(no)) => {
+                assert_eq!(&*no.package, "wide");
+                assert!(no.bins.is_empty(), "a library has no binary target: {:?}", no.bins);
+                let shown = no.to_string();
+                assert!(shown.contains("`wide` has no binary target"), "{shown}");
+            }
+            other => panic!("wanted NoBinary naming `wide`, got {:?}", other.err()),
+        }
     }
 
     /// A clean `blaze run` says nothing of its own on either stream: no note, no closing line
@@ -1833,17 +1962,25 @@ mod tests {
         assert_eq!((body.runs, made(&body.profile, "BodyCheck")), (2, 1), "a body edit runs its file's outline and that one body:\n{}", body.profile);
         write(&io, "src/m3.rs", &functions(100).replace("fn f00003() {}", "fn f00003(_x: u8) { let _x = 1; }"));
         let signature = check(&io, SMALL);
-        assert_eq!((signature.runs, made(&signature.profile, "Surface"), made(&signature.profile, "CrateScope")), (2, 0, 0), "a parameter edit runs its file's outline and its body:\n{}", signature.profile);
+        // Every body of the edited file is checked again (piece 7): a body's key holds its
+        // file's text around the bodies (body_types.rs `around_bodies`), the cover for a
+        // sibling's signature it may read, until a body's reads are kept at signature grain.
+        assert_eq!(
+            (signature.runs, made(&signature.profile, "Surface"), made(&signature.profile, "CrateScope"), made(&signature.profile, "BodyCheck")),
+            (101, 0, 0, 100),
+            "a parameter edit runs its file's outline and its file's bodies:\n{}",
+            signature.profile
+        );
         let added = functions(100).replace("fn f00003() {}", "fn f00003(_x: u8) { let _x = 1; }") + "pub fn added() {}\n";
         write(&io, "src/m3.rs", &added);
         let item = check(&io, SMALL);
         // Entries, not tasks: the outline, the surface, each of the two crates' `CrateScope`
         // twice (its first entry answers `Need` of the moved surface, the second resolves),
-        // and the new item's body.
+        // and every body of the file (its text around the bodies moved, as above).
         assert_eq!(
             (item.runs, made(&item.profile, "Surface"), made(&item.profile, "CrateScope"), made(&item.profile, "BodyCheck")),
-            (7, 1, 2, 1),
-            "a new item runs its file's outline, its surface, its two crates' names (two entries each) and its body:\n{}",
+            (107, 1, 2, 101),
+            "a new item runs its file's outline, its surface, its two crates' names (two entries each) and its file's bodies:\n{}",
             item.profile
         );
     }

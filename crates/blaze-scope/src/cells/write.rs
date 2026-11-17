@@ -1,16 +1,25 @@
-//! What the cell core decided, in the scope record's own forms (blaze-surface's `ScopeEntry` and
-//! `GlobEdge`): the first part of the switch, where the cell core fills the scopes the one record
-//! writer reads. A module's own bindings are its explicit entries (items, `mod`s, `extern crate`
-//! items, the root's `#[macro_export]` macros) and what its named imports bind; its globs are
-//! edges, one per source. Sorted as the record is: bindings by namespace then name, edges by
-//! source key. Not written here yet: the errors, the textual list and its marks, the `use .. as
-//! _` traits and the expansions' macro exports (the seam counts the modules equal without them).
+//! What the cell core decided, in the scope record's own forms (blaze-surface's `ScopeBuilder`):
+//! the writer of the switch, where the cell core fills the scopes the one record writer reads.
+//!
+//! A module's own bindings are its explicit entries (items, `mod`s, `extern crate` items, the
+//! root's `#[macro_export]` macros of the walked tree's texts) and what its named imports bind;
+//! its globs are edges, one per source. Sorted as the record is: bindings by namespace then
+//! name, edges by source key. The rest of the scope is one walk of the module's fragments in
+//! tree order (its text, each call's expansion where the call is written), as the old core's
+//! final pass walks them (finish.rs `finish_frag`, `flatten`, `anon_and_exports`): the errors,
+//! the textual list with each child's mark, the `use .. as _` traits, and the `#[macro_export]`
+//! macros an expansion wrote (published to the root by the record writer, as before).
+//!
+//! Not written (counted by the seam's whole-scope comparison, c10-r17a): `WiderReexport`
+//! (lz4_flex's two, a lint at most), `Inconsistent`, `RestrictedNotAncestor` (a bad `pub(in ..)`
+//! refuses the cell core's load), a second item of one name (`Duplicate` of explicit entries:
+//! see `add_explicit`), and R6/R8's errors as `Ambiguous`.
 
 use blaze_id::ItemKey;
-use blaze_own::{AVec, Alloc};
-use blaze_surface::{Binding, GlobEdge, ScopeEntry};
+use blaze_own::{ABTreeMap, AVec, Alloc};
+use blaze_surface::{AnonImport, Binding, GlobEdge, Path, ScopeBuilder, ScopeEntry, ScopeError, TextualDef, TextualMark, Unresolved, UseSite};
 
-use super::{Cells, FragId, NAMESPACES, Outcome, ns_at};
+use super::{Cells, FragId, ItemId, NAMESPACES, Outcome, Slot, ns_at};
 use crate::{BindingState, Def, DefKind, Namespace, Origin};
 
 /// One module's bindings and glob edges as the cell core decided them.
@@ -22,9 +31,20 @@ pub(crate) struct Written<'a, N> {
     pub(crate) unknown: u32,
 }
 
+/// What the writer's walk needs of every fragment, made once per crate after the run.
+pub(crate) struct WriteIndex<'a, N> {
+    /// Each fragment's imports, in the order its declarations list them (a `UseSite`'s index).
+    uses: AVec<'a, AVec<'a, ItemId>>,
+    /// The call each fragment is the expansion of (`None`: a module's own text).
+    call: AVec<'a, Option<ItemKey>>,
+    /// Each fragment's explicit entries (no `#[macro_export]`): the non-glob bindings a later
+    /// import of the same name is a `Duplicate` of.
+    explicit: AVec<'a, AVec<'a, (Namespace, N, Def)>>,
+}
+
 impl<'a, N: crate::Name> Cells<'a, N> {
     /// How deep in macro expansions fragment `f` is written: 0 for a module's own text.
-    fn depth(&self, f: FragId) -> u16 {
+    pub(super) fn depth(&self, f: FragId) -> u16 {
         let mut depth = 0u16;
         let mut at = self.frags[f as usize].up;
         while let Some((up, _)) = at {
@@ -34,17 +54,27 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         depth
     }
 
+    /// A `#[macro_export]` macro of the root that the record writer publishes after the solve
+    /// (task/exports.rs): one an expansion wrote, or one in the text of a module an expansion
+    /// or a block made. The root's own scope is written without it, as the old core's is.
+    fn published_later(&self, origin: Origin, frag: FragId) -> bool {
+        origin == Origin::MacroExport && (self.depth(frag) > 0 || self.frags[frag as usize].module >= self.walked)
+    }
+
     /// The bindings and glob edges of `module` after the run; `None` for a key that is no
     /// module of this crate.
-    pub(crate) fn written(&self, module: ItemKey, alloc: Alloc<'a>) -> Option<Written<'a, N>> {
+    pub(crate) fn written<'o>(&self, module: ItemKey, alloc: Alloc<'o>) -> Option<Written<'o, N>> {
         let &m = self.by_key.get(&module)?;
         let md = &self.modules[m as usize];
         if md.foreign || md.unread {
             return None;
         }
         let mut unknown = 0u32;
-        let mut bindings: AVec<'a, ScopeEntry<N>> = AVec::with_capacity_in(md.explicit.len() + md.named.len(), alloc);
+        let mut bindings: AVec<'o, ScopeEntry<N>> = AVec::with_capacity_in(md.explicit.len() + md.named.len(), alloc);
         for (&(ns, name), &(def, vis, origin, frag)) in md.explicit.iter() {
+            if self.published_later(origin, frag) {
+                continue;
+            }
             let binding = Binding { def, vis, origin, expansion: self.depth(frag), state: BindingState::Determined };
             bindings.push(ScopeEntry { ns, name, binding });
         }
@@ -76,7 +106,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             }
         }
         bindings.sort_unstable_by(|a, b| (a.ns, a.name).cmp(&(b.ns, b.name)));
-        let mut globs: AVec<'a, GlobEdge> = AVec::with_capacity_in(md.edges.len(), alloc);
+        let mut globs: AVec<'o, GlobEdge> = AVec::with_capacity_in(md.edges.len(), alloc);
         for &j in md.glob_items.iter() {
             let it = &self.items[j as usize];
             let Some(&(source, vis)) = md.edges.get(&it.index) else {
@@ -99,6 +129,166 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         }
         globs.sort_unstable_by_key(|e| e.source.key);
         Some(Written { bindings, globs, unknown })
+    }
+
+    /// The writer's index over the fragments read so far (made after the run, once).
+    pub(crate) fn write_index(&self, alloc: Alloc<'a>) -> WriteIndex<'a, N> {
+        let n = self.frags.len();
+        let mut ix = WriteIndex { uses: AVec::with_capacity_in(n, alloc), call: AVec::with_capacity_in(n, alloc), explicit: AVec::with_capacity_in(n, alloc) };
+        for _ in 0..n {
+            ix.uses.push(AVec::new_in(alloc));
+            ix.call.push(None);
+            ix.explicit.push(AVec::new_in(alloc));
+        }
+        for (i, it) in self.items.iter().enumerate() {
+            match (it.call, it.expansion) {
+                (None, _) => ix.uses[it.at as usize].push(i as ItemId),
+                (Some(at), Some(f)) => ix.call[f as usize] = Some(at.key),
+                (Some(_), None) => {}
+            }
+        }
+        for md in self.modules.iter() {
+            for (&(ns, name), &(def, _, origin, frag)) in md.explicit.iter() {
+                if origin != Origin::MacroExport {
+                    ix.explicit[frag as usize].push((ns, name, def));
+                }
+            }
+        }
+        ix
+    }
+
+    /// The whole scope of `module` as the record holds it, and how many of its imports and
+    /// calls the core left outside what it follows or undecided (with one, the scope is not
+    /// the answer); `None` for a key that is no module of this crate.
+    pub(crate) fn scope<'o>(&self, ix: &WriteIndex<'_, N>, module: ItemKey, alloc: Alloc<'o>) -> Option<(ScopeBuilder<'o, N>, u32)> {
+        let w = self.written(module, alloc)?;
+        let &m = self.by_key.get(&module)?;
+        let mut out = ScopeBuilder::new_in(module, alloc);
+        out.bindings = w.bindings;
+        out.globs = w.globs;
+        let mut unknown = w.unknown;
+        // The non-glob bindings met so far in tree order: a second target is `Duplicate`.
+        let mut seen: ABTreeMap<'o, (Namespace, N), Def> = ABTreeMap::new_in(alloc);
+        let mut bind = |ns: Namespace, name: N, def: Def, errors: &mut AVec<'o, ScopeError<N, Path<'o, N>>>| {
+            let first = *seen.entry((ns, name)).or_insert(def);
+            if first != def {
+                errors.push(ScopeError::Duplicate { ns, name, first, second: def });
+            }
+        };
+        let path = |i: ItemId| {
+            let it = &self.items[i as usize];
+            Path { kind: it.kind, segments: AVec::from_slice_in(&it.segments, alloc) }
+        };
+        for &(k, name) in self.bad_extern.iter() {
+            if k == module {
+                out.errors.push(ScopeError::ExternCrate { name });
+            }
+        }
+        // The walk: (fragment, next slot, next import, the module's own fragment or a
+        // `#[macro_use]` child's carried out). Slots and imports merge by text position.
+        let mut stack: AVec<'o, (FragId, usize, usize, bool)> = AVec::new_in(alloc);
+        let text = self.modules[m as usize].text;
+        stack.push((text, 0, 0, true));
+        for &(ns, name, def) in ix.explicit[text as usize].iter() {
+            bind(ns, name, def, &mut out.errors);
+        }
+        while let Some(&(f, si, ui, own)) = stack.last() {
+            let frag = &self.frags[f as usize];
+            let next_slot = frag.slots.get(si).copied();
+            let next_use = if own { ix.uses[f as usize].get(ui).copied() } else { None };
+            let take_use = match (next_slot, next_use) {
+                (None, None) => {
+                    stack.pop();
+                    continue;
+                }
+                (Some((pos, _)), Some(i)) => self.items[i as usize].pos < pos,
+                (None, Some(_)) => true,
+                (Some(_), None) => false,
+            };
+            let top = stack.len() - 1;
+            if take_use {
+                stack[top].2 += 1;
+                let Some(i) = next_use else { continue };
+                let it = &self.items[i as usize];
+                let site = UseSite { expansion: ix.call[f as usize], index: ui as u32 };
+                match it.outcome {
+                    Some(Outcome::Failed(why)) => out.errors.push(ScopeError::Import { site, path: path(i), segment: it.seg, why }),
+                    Some(Outcome::Named(b)) if b.iter().all(Option::is_none) => {
+                        let last = it.segments.len().saturating_sub(1) as u32;
+                        out.errors.push(ScopeError::Import { site, path: path(i), segment: last, why: Unresolved::NotFound });
+                    }
+                    Some(Outcome::Named(b)) => match it.binds {
+                        Some(name) => {
+                            for ns in NAMESPACES {
+                                if let Some((def, _)) = b[ns_at(ns)] {
+                                    bind(ns, name, def, &mut out.errors);
+                                }
+                            }
+                        }
+                        None => {
+                            if let Some((def, _)) = b[ns_at(Namespace::Types)]
+                                && def.kind == DefKind::Trait
+                            {
+                                out.traits.push(AnonImport { site, def, vis: it.vis });
+                            }
+                        }
+                    },
+                    // `written` counted the named imports and globs; an `as _` import here.
+                    Some(Outcome::Outside) | None if it.binds.is_none() && !it.glob => unknown += 1,
+                    Some(Outcome::Outside | Outcome::Glob(_) | Outcome::Called(_)) | None => {}
+                }
+                continue;
+            }
+            stack[top].1 += 1;
+            let Some((_, slot)) = next_slot else { continue };
+            match slot {
+                Slot::Rules(name, def, export) => {
+                    let DefKind::Macro(shapes) = def.kind else { continue };
+                    let d = TextualDef { name, def: def.key, expansion: self.depth(f), shapes };
+                    out.textual.push(d);
+                    if own && export && d.expansion > 0 {
+                        out.macro_exports.push(d);
+                    }
+                }
+                Slot::Mod(child, macro_use) => {
+                    let c = &self.modules[child as usize];
+                    if own {
+                        out.marks.push(TextualMark { child: c.key, len: out.textual.len() as u32 });
+                    }
+                    if macro_use && !c.foreign && !c.unread && c.text != FragId::MAX {
+                        stack.push((c.text, 0, 0, false));
+                    }
+                }
+                Slot::Call(c) => {
+                    let it = &self.items[c as usize];
+                    if own && it.deep {
+                        if let Some(at) = it.call {
+                            out.errors.push(ScopeError::RecursionLimit { call: at.key });
+                        }
+                    } else if own {
+                        match it.outcome {
+                            Some(Outcome::Failed(why)) => {
+                                if let Some(at) = it.call {
+                                    out.errors.push(ScopeError::Macro { call: at.key, path: path(c), segment: it.seg, why });
+                                }
+                            }
+                            Some(Outcome::Outside) | None => unknown += 1,
+                            Some(Outcome::Called(_) | Outcome::Named(_) | Outcome::Glob(_)) => {}
+                        }
+                    }
+                    if let Some(e) = it.expansion {
+                        stack.push((e, 0, 0, own));
+                        if own {
+                            for &(ns, name, def) in ix.explicit[e as usize].iter() {
+                                bind(ns, name, def, &mut out.errors);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out.marks.sort_unstable_by_key(|k| k.child);
+        Some((out, unknown))
     }
 }
 

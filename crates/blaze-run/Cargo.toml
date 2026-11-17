@@ -27,6 +27,9 @@ blaze-hash.workspace = true
 # `wire` and `zygote`: a test report's digest (a torn report is refused) and the digest of a
 # test's whole output; `child`: an outside read's name.
 blaze-blake3.workspace = true
+# `property`: the parent's machine over a tape-search test's case board (`board::Board`) and
+# blaze-sim's sans-IO `shrink::Shrinker`, run in the parent (test.md, A, "The case board").
+blaze-sim.workspace = true
 
 [dev-dependencies]
 # `check` and `control`: every machine's simulation and its planted-bug controls.

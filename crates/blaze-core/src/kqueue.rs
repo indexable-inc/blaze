@@ -709,8 +709,8 @@ impl Kqueue {
                 }
             }
             Effect::Spawn { command, tag } => self.spawn(command, tag),
-            Effect::Listen { at, tag } => self.listen(&at, tag),
-            Effect::Connect { at, tag } => self.connect(at, tag),
+            Effect::Listen { at, options, tag } => self.listen(&at, &options, tag),
+            Effect::Connect { at, options, tag } => self.connect(at, &options, tag),
             Effect::Recv { conn, most, into, tag } => {
                 match self.connection(conn) {
                     Ok(connection) => connection.recvs.push_back((tag, most, into)),
@@ -1039,11 +1039,11 @@ impl Kqueue {
         self.ready.push(Completion { tag, done });
     }
 
-    fn listen(&mut self, at: &Address, tag: Tag) -> io::Result<()> {
+    fn listen(&mut self, at: &Address, options: &crate::sockopt::Tcp, tag: Tag) -> io::Result<()> {
         let context =
             // alloc: an error path.
             |error: io::Error| io::Error::new(error.kind(), format!("listening at {at:?}: {error}"));
-        let listener = net::listen(&self.root, at).map_err(context)?;
+        let listener = net::listen(&self.root, at, options).map_err(context)?;
         listener.set_nonblocking(true).map_err(context)?;
         let fd = listener.fd() as usize;
         let listen = self.listens.insert(Listening { tag, listener, id: TRIGGER });
@@ -1116,12 +1116,14 @@ impl Kqueue {
         Conn(conn.to_bits())
     }
 
-    fn connect(&mut self, at: Address, tag: Tag) -> io::Result<()> {
+    fn connect(&mut self, at: Address, options: &crate::sockopt::Tcp, tag: Tag) -> io::Result<()> {
         let context =
             // alloc: an error path.
             |error: io::Error| io::Error::new(error.kind(), format!("connecting to {at:?}: {error}"));
         let address = net::sockaddr(&self.root, &at).map_err(context)?;
         let fd = net::stream_socket(address.domain).map_err(context)?;
+        crate::sockopt::for_stream(fd.as_raw_fd(), address.domain, options, crate::sockopt::Side::Connect)
+            .map_err(context)?;
         set_nonblocking(fd.as_raw_fd()).map_err(context)?;
         no_sigpipe(fd.as_raw_fd()).map_err(context)?;
         let unix = address.domain == libc::AF_UNIX;
@@ -1157,10 +1159,9 @@ impl Kqueue {
     }
 
     fn connected(&mut self, tag: Tag, fd: OwnedFd, unix: bool) -> io::Result<()> {
+        // Its options were set before it connected (`connect`): setting no-delay here would
+        // undo a caller's `no_delay: Must(false)`.
         let socket = net::Socket::from_fd(fd, unix);
-        if let net::Socket::Tcp(stream) = &socket {
-            stream.set_nodelay(true)?;
-        }
         let conn = self.adopt(socket);
         self.ready.push(Completion { tag, done: Done::Connected { conn } });
         Ok(())
@@ -2003,7 +2004,7 @@ mod tests {
     fn round_trip(root: &Path, at: Address) {
         let mut driver = Kqueue::new(root, 1).unwrap();
         // The listen is made as it is submitted.
-        driver.submit(&mut vec![Effect::Listen { at: at.clone(), tag: Tag(1) }]);
+        driver.submit(&mut vec![Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) }]);
         let at = match at {
             Address::Tcp(_) => {
                 let bound = driver.listens.iter().find_map(|(_, it)| it.listener.local_addr());
@@ -2011,7 +2012,7 @@ mod tests {
             }
             other => other,
         };
-        let mut effects = vec![Effect::Connect { at, tag: Tag(2) }];
+        let mut effects = vec![Effect::Connect { at, options: crate::sockopt::Tcp::DEFAULT, tag: Tag(2) }];
         let (mut server, mut client) = (None, None);
         let mut ends = Vec::new();
         run_until_idle(&mut driver, &mut effects, |done, effects| match (done.tag.0, done.done) {
@@ -2092,7 +2093,7 @@ mod tests {
                 Effect::Unlisten { tag: Tag(2) },
                 Effect::Recv { conn: Conn(77), most: 8, into: b"kept".to_vec(), tag: Tag(3) },
                 Effect::Hangup { conn: Conn(77), tag: Tag(4) },
-                Effect::Connect { at: Address::Unix(name("nobody")), tag: Tag(5) },
+                Effect::Connect { at: Address::Unix(name("nobody")), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(5) },
                 Effect::Kill { tag: Tag(6) },
             ],
         );
@@ -2933,8 +2934,8 @@ mod tests {
         let mut driver = Kqueue::new(&root, 1).unwrap();
         let at = Address::Unix(name("s"));
         let mut effects = vec![
-            Effect::Listen { at: at.clone(), tag: Tag(1) },
-            Effect::Connect { at: at.clone(), tag: Tag(2) },
+            Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) },
+            Effect::Connect { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(2) },
         ];
         driver.submit(&mut effects);
         let mut out = Vec::with_capacity(16);
@@ -3002,7 +3003,7 @@ mod tests {
             "{out:?}"
         );
         out.clear();
-        effects.push(Effect::Connect { at, tag: Tag(3) });
+        effects.push(Effect::Connect { at, options: crate::sockopt::Tcp::DEFAULT, tag: Tag(3) });
         driver.submit(&mut effects);
         let (again, other) = accept(&mut driver, &mut out, Tag(3));
         let index = |conn: Conn| conn_id(conn).index();

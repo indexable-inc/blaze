@@ -31,6 +31,7 @@ use blaze_surface::{
 };
 
 use super::Variant;
+use super::attr_value::{AttrCall, AttrValueRefusal, attr_string, read_call};
 
 // ---------------------------------------------------------------------------------------------
 // Keys.
@@ -400,7 +401,9 @@ impl<'s, 'a> Cfg<'s, 'a> {
                     }
                 }
                 "unsafe" => next = Some(args(content).trim()),
-                "path" => attrs.path = string_value(content),
+                // A quoted value now; a macro call (`path = concat!(..)`) kept for the walk
+                // and the lowering, which hold the edition (task/attr_value.rs).
+                "path" => (attrs.path, attrs.path_call) = attr_string(content),
                 "derive" | "derive_const" => {
                     for path in SplitTop::new(args(content)) {
                         let path = path.trim();
@@ -414,13 +417,22 @@ impl<'s, 'a> Cfg<'s, 'a> {
                     attrs.local_inner |= args(content).contains("local_inner_macros");
                 }
                 "macro_use" => attrs.macro_use = true,
-                "lang" => attrs.lang = string_value(content),
+                // `#[lang = stringify!($lang)]` (core's `panic_const!`): kept as a call and
+                // read in `Lower::attrs` (task/attr_value.rs). `doc` and `deprecated` values
+                // are not read here at all: nothing in the build depends on them.
+                "lang" => (attrs.lang, attrs.lang_call) = attr_string(content),
                 // `#[panic_handler]` files its fn in the lang rows under the attribute's own
                 // name (the Reference, [panic.panic_handler.unique]: "There must be a single
                 // panic_handler function in the dependency graph"): what a call of core's
                 // `#[lang = "panic_impl"]` declaration is bound to (blaze-ladder
                 // front2/panic_entry.rs asks the row by this name). No `#[lang]` is named so.
                 "panic_handler" => attrs.lang = Some("panic_handler"),
+                // `#[global_allocator]` files its static in the lang rows under the attribute's
+                // own name: the allocator's `extern "Rust"` declarations bind to it (blaze-ladder
+                // front2/alloc_shim.rs asks the row by this name, and refuses a program with
+                // one until the attribute's expansion is built); two are the index's
+                // `LangTwice`. No `#[lang]` is named so.
+                "global_allocator" => attrs.lang = Some("global_allocator"),
                 "rustc_builtin_macro" => {
                     attrs.builtin = true;
                     let arg = SplitTop::new(args(content)).next().map_or("", str::trim);
@@ -604,6 +616,10 @@ pub struct Attrs<'t, 'a> {
     pub local_inner: bool,
     pub macro_use: bool,
     pub lang: Option<&'t str>,
+    /// `lang = <macro call>`, read by [`read_call`] where the edition is known.
+    pub lang_call: Option<AttrCall<'t>>,
+    /// `path = <macro call>`, read by [`read_call`] where the edition is known.
+    pub path_call: Option<AttrCall<'t>>,
     pub builtin: bool,
     pub builtin_name: Option<&'t str>,
     pub prelude_import: bool,
@@ -696,6 +712,8 @@ impl<'a> Attrs<'_, 'a> {
             local_inner: false,
             macro_use: false,
             lang: None,
+            lang_call: None,
+            path_call: None,
             builtin: false,
             builtin_name: None,
             prelude_import: false,
@@ -1202,6 +1220,8 @@ pub enum WalkNote<'t, 'a> {
     PathFileNotFound { at: Loc, path: AString<'a> },
     /// More than [`MOST_MODULES`] modules: the rest are not walked.
     TooManyModules { at: Loc },
+    /// A `#[path = <macro call>]` that does not read to a string: the module is not walked.
+    PathValueRefused { at: Loc, refusal: AttrValueRefusal<'t> },
 }
 
 impl fmt::Display for WalkNote<'_, '_> {
@@ -1212,6 +1232,7 @@ impl fmt::Display for WalkNote<'_, '_> {
             WalkNote::NeitherFile { .. } => "module: neither x.rs nor x/mod.rs exists",
             WalkNote::PathFileNotFound { .. } => "module: #[path] file not found",
             WalkNote::TooManyModules { .. } => "module: more modules than the walk takes",
+            WalkNote::PathValueRefused { .. } => "module: #[path] value is a macro call that does not read to a string",
         })
     }
 }
@@ -1282,13 +1303,14 @@ fn copied<'a>(text: &str, alloc: Alloc<'a>) -> AString<'a> {
 
 /// The module tree of the crate `krate` (named `name`) whose root file is `root`, in the
 /// directory `root_dir`: each `mod` item that is on under `cfg`, inline or in its file.
-pub fn walk<'t, 'a, F: Files<'t> + ?Sized>(
+pub fn walk<'t, 'a: 't, F: Files<'t> + ?Sized>(
     files: &F,
     cfg: &Cfg<'_, '_>,
     krate: CrateItemKey,
     name: &str,
     root: u32,
     root_dir: &str,
+    edition: Edition,
     alloc: Alloc<'a>,
 ) -> Tree<'t, 'a> {
     let mut tree = Tree {
@@ -1319,12 +1341,21 @@ pub fn walk<'t, 'a, F: Files<'t> + ?Sized>(
         let text = files.text(file);
         for (idx, child) in o.children(item) {
             let ItemDetail::Mod { inline, .. } = child.detail else { continue };
-            let attrs = item_attrs(cfg, o, child, text, alloc);
+            let mut attrs = item_attrs(cfg, o, child, text, alloc);
             if !attrs.cfg_ok {
                 continue;
             }
             let Some(name) = child.name.map(|r| unraw(child.text(text, r))) else { continue };
             let loc = Loc { file, offset: child.range.start };
+            if let Some(call) = attrs.path_call.take() {
+                match read_call(call, edition, alloc) {
+                    Ok(path) => attrs.path = Some(path),
+                    Err(refusal) => {
+                        tree.notes.push(WalkNote::PathValueRefused { at: loc, refusal });
+                        continue;
+                    }
+                }
+            }
             if tree.modules.len() >= MOST_MODULES {
                 tree.notes.push(WalkNote::TooManyModules { at: loc });
                 break;
@@ -1494,8 +1525,9 @@ impl<'t> BodySrc<'t> {
         );
         // The words of the items that make a block a module
         // (`blaze_file_items::nested::NestedKind::makes_module`): a body without one costs
-        // five substring searches and no scan.
-        const WORDS: [&str; 5] = ["impl", "struct", "enum", "union", "type"];
+        // six substring searches and no scan. A trait declared in a block makes one too
+        // (core's `Write::write_fmt` declares `trait SpecWriteFmt` in its body).
+        const WORDS: [&str; 6] = ["impl", "struct", "enum", "union", "type", "trait"];
         (holds && WORDS.iter().any(|w| text.contains(w))).then_some(BodySrc { key, module, text, loc, depth, place })
     }
 }
@@ -1571,6 +1603,9 @@ pub enum LowerNoteKind<'t> {
     ItemNotRead,
     /// An item of a syntax kind the outline does not take apart.
     UnhandledItem { syntax: u16 },
+    /// A `#[lang = ..]` or `#[path = ..]` whose macro-call value does not read to a string
+    /// (`include_str!`, `env!`, a macro only resolution can tell): no lang row, no path.
+    AttrValueRefused(AttrValueRefusal<'t>),
 }
 
 impl fmt::Display for LowerNoteKind<'_> {
@@ -1588,6 +1623,7 @@ impl fmt::Display for LowerNoteKind<'_> {
             LowerNoteKind::MacroCallPathNotRead => f.write_str("macro call path not read"),
             LowerNoteKind::ItemNotRead => f.write_str("an item the outline could not read"),
             LowerNoteKind::UnhandledItem { syntax } => write!(f, "unhandled item form: {:?}", syntax_kind(*syntax)),
+            LowerNoteKind::AttrValueRefused(refusal) => write!(f, "{refusal}"),
         }
     }
 }
@@ -1683,7 +1719,7 @@ pub struct Fragment<'c, 't> {
 }
 
 /// Lowers `fragment`'s items under `cx`.
-pub fn lower<'p: 't, 't, 'a, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fragment: Fragment<'_, 't>, alloc: Alloc<'a>) -> Lowered<'t, 'a> {
+pub fn lower<'p: 't, 't, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fragment: Fragment<'_, 't>, alloc: Alloc<'a>) -> Lowered<'t, 'a> {
     let mut low = Lower {
         krate: cx.krate,
         edition: cx.edition,
@@ -1780,7 +1816,7 @@ struct Lower<'c, 't, 'a, W: ?Sized> {
     out: Lowered<'t, 'a>,
 }
 
-impl<'t, 'a, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
+impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
     /// The key of `owner`'s next entry of kind `tag` named `name`. Its index counts only the
     /// earlier entries of that owner, kind and name (two `impl`s, two `_` consts, one item
     /// under two `#[cfg]`s): an item added, removed or moved changes no other item's key, so
@@ -1817,6 +1853,21 @@ impl<'t, 'a, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
                 continue;
             }
             self.cfg.attr(&mut attrs, strip_attr(item.text(self.text, attr.range)), &mut self.stack);
+        }
+        // A value written as a macro call (`#[lang = stringify!(x)]`), read where the crate's
+        // edition and the allocator are at hand (task/attr_value.rs); one that does not read
+        // is refused by name and leaves the attribute unset.
+        if let Some(call) = attrs.lang_call.take() {
+            match read_call(call, self.edition, self.alloc) {
+                Ok(name) => attrs.lang = Some(name),
+                Err(refusal) => self.note(LowerNoteKind::AttrValueRefused(refusal), item.range.start, call.expr),
+            }
+        }
+        if let Some(call) = attrs.path_call.take() {
+            match read_call(call, self.edition, self.alloc) {
+                Ok(path) => attrs.path = Some(path),
+                Err(refusal) => self.note(LowerNoteKind::AttrValueRefused(refusal), item.range.start, call.expr),
+            }
         }
         attrs
     }
@@ -1872,8 +1923,6 @@ impl<'t, 'a, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         let vis = self.vis(item);
         let key = self.key(self.owner, kind_tag(item.detail.kind()), name.unwrap_or(""));
         let whole = &text[item.range.start as usize..item.range.end as usize];
-        let impl_header = matches!(item.detail, ItemDetail::Impl).then(|| self.impl_header(item));
-        self.out.texts.push(ItemText { key, module: self.module, item: idx, name, impl_header, text: whole });
         // A procedural macro's function under another attribute macro (alloy-sol-macro's
         // `#[proc_macro] #[proc_macro_error] pub fn sol`) is declared from its text: the
         // Reference, "Procedural Macros": a proc-macro crate exports only its procedural
@@ -1894,6 +1943,12 @@ impl<'t, 'a, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             self.out.calls.push((call, src));
             return false;
         }
+        // The item's own text, only now: an item an attribute macro takes is replaced by the
+        // macro's output (the Reference, "Procedural Macros", "Attribute macros": "The item to
+        // which the attribute is applied is replaced by the zero or more items in the returned
+        // TokenStream"), so the input has no text of its own; the expansion's items have theirs.
+        let impl_header = matches!(item.detail, ItemDetail::Impl).then(|| self.impl_header(item));
+        self.out.texts.push(ItemText { key, module: self.module, item: idx, name, impl_header, text: whole });
         for &path in attrs.derives.iter() {
             let call = self.key(self.owner, "derive", path);
             let Some(parsed) = parse_path(path, self.krate, self.alloc) else {

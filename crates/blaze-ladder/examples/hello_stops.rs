@@ -47,7 +47,8 @@ fn main() {
     sources.sort();
     let files: Vec<SourceFile<'_>> = sources.iter().map(|(path, text)| SourceFile { path, text }).collect();
     let shelf = (shelf != "-").then_some(shelf.as_str());
-    let new = NewFront { package, edition, shelf };
+    // `blaze run`'s setting: the dev profile's overflow checks (D101).
+    let new = NewFront { package, edition, shelf, overflow: blaze_build::OverflowChecks::On };
     let mut lines = String::new();
     let tc = match shelf {
         Some(shelf) => Toolchain::open(&mut DirShelf::new(shelf.into())).unwrap_or_else(|e| panic!("the toolchain: {e}")),

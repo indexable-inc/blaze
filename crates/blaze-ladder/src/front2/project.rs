@@ -245,7 +245,9 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         // The read list as facts (front2 reads.rs), for every outcome: the list of the run
         // that finished, or the questions of the last round of a check that stopped.
         let module = checker_of(lowered.module);
-        let written = lowered.typeck.view(lowered.tys.view());
+        // Its paths and segments only (the check below makes records into `r.store.tys`, so
+        // no view of it is held here); a type read through this view is refused, never wrong.
+        let written = lowered.typeck.view(blaze_typeck::PTys::EMPTY);
         let mut asked = Asked::new_in(alloc);
         let checked = check_body_asked(&mut r, &lowered, &scope, None, Some(&mut asked));
         // The buckets as the check left them: what each impl question read, per crate.
@@ -300,12 +302,13 @@ fn lower<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, prepared: &Prepares
     let target = match body {
         BodyRef::Free(lib) => Target::Free(lib),
         BodyRef::Member { container, is_trait, name } => {
-            let wants: &[Want] = if is_trait { &[Want::Head(container), Want::Members(container)] } else { &[Want::Impl(container)] };
-            for &w in wants {
+            // One want, with each constant its heads' array lengths name evaluated, at most
+            // `MOST_LENS` of them.
+            let made = |r: &mut Records<'_, 'n, S>, w: Want| -> Result<(), Refused> {
                 let mut lens = 0;
                 loop {
                     match r.store.ensure(r.names, r.keys, w) {
-                        Ok(()) => break,
+                        Ok(()) => return Ok(()),
                         Err(HeadError::Item(_, Why::NeedConst(c, _))) if lens < MOST_LENS => {
                             lens += 1;
                             eval_len(r, c).map_err(Refused::Length)?;
@@ -314,8 +317,17 @@ fn lower<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, prepared: &Prepares
                         Err(e) => return Err(Refused::Container(e)),
                     }
                 }
+            };
+            let wants: &[Want] = if is_trait { &[Want::Head(container), Want::Members(container)] } else { &[Want::Impl(container)] };
+            for &w in wants {
+                made(&mut *r, w)?;
             }
             let k = r.keys.filed_member(checker_of(container), MemberKind::Fn, name).ok_or(Refused::MemberNotFiled)?;
+            // An impl's fn's signature is its own want (heads.rs `Want::MemberFn`), never made
+            // with its impl's head; its own refusal is its `fn_gaps` row, read just below.
+            if !is_trait {
+                made(&mut *r, Want::MemberFn(container, k))?;
+            }
             if r.store.fn_gaps.get(&k).is_some() {
                 return Err(Refused::MemberHead(k));
             }

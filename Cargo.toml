@@ -111,7 +111,7 @@ lock = "required"
 [workspace.metadata.blaze.native.llvm]
 pin = "crates/hir-ty-codegen/llvm.json"
 env = "LLVM_SYS_231_PREFIX"
-packages = ["llvm-sys", "blaze-stencil/llvm-stencils"]
+packages = ["llvm-sys", "blaze-stencil/llvm-stencils", "blaze-llvm"]
 
 [workspace.package]
 version = "0.0.0"
@@ -393,6 +393,8 @@ blaze-lir = { path = "crates/blaze-lir" }
 blaze-build = { path = "crates/blaze-build" } # A type-checked body to LIR (crates/blaze-cli/tests/ladder/README.md).
 blaze-consteval = { path = "crates/blaze-consteval" } # The constant evaluator (docs/v2/plan/design/consteval.md).
 blaze-emit = { path = "crates/blaze-emit" } # The baseline tier: LIR to AArch64 machine code.
+blaze-tier = { path = "crates/blaze-tier" } # Piece 0 of the tiers (backend-next.md D99): the seam, the record rows, the template table's form, register descriptions, samples, keys.
+blaze-llvm = { path = "crates/blaze-llvm" } # The optimizing tier's LLVM (backend-next.md D100 points 7, 8, 9, 14): LIR to LLVM IR with blaze's facts, the named custom pipeline, the inliner's remarks, offered bitcode.
 blaze-ladder = { path = "crates/blaze-ladder" } # The `blaze run` walking skeleton's straight line.
 blaze-world = { path = "crates/blaze-world" } # One world for run and check: the unit graph made into the names library's inputs.
 blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
@@ -412,6 +414,8 @@ blaze-deflate = { path = "crates/blaze-deflate" }
 blaze-tar = { path = "crates/blaze-tar" }
 # blaze's own HTTP/1.1 client machine (no_std, sans-IO), and its driver over bstd's `Net` with a `Tls` seam.
 blaze-h1 = { path = "crates/blaze-h1" }
+# blaze's own HTTP/2 with HPACK (no_std, sans-IO).
+blaze-h2 = { path = "crates/blaze-h2" }
 blaze-url = { path = "crates/blaze-url" } # HostPort, Scheme, Origin, Url: checked addresses, the one home; bstd re-exports them.
 # A commit's files over git's smart HTTP protocol v2: pkt-lines, packs with deltas, SHA-1 object ids.
 blaze-git-fetch = { path = "crates/blaze-git-fetch" }

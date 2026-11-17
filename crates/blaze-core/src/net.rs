@@ -31,14 +31,15 @@ pub(crate) enum Listener {
         listener: UnixListener,
         path: Option<(PathBuf, Made)>,
     },
-    Tcp(TcpListener),
+    /// With its options, set again on each connection it accepts.
+    Tcp(TcpListener, crate::sockopt::Tcp),
 }
 
 impl Listener {
     pub(crate) fn fd(&self) -> RawFd {
         match self {
             Listener::Unix { listener, .. } => listener.as_raw_fd(),
-            Listener::Tcp(listener) => listener.as_raw_fd(),
+            Listener::Tcp(listener, _) => listener.as_raw_fd(),
         }
     }
 
@@ -49,7 +50,7 @@ impl Listener {
     pub(crate) fn set_nonblocking(&self, on: bool) -> io::Result<()> {
         match self {
             Listener::Unix { listener, .. } => listener.set_nonblocking(on),
-            Listener::Tcp(listener) => listener.set_nonblocking(on),
+            Listener::Tcp(listener, _) => listener.set_nonblocking(on),
         }
     }
 
@@ -57,16 +58,16 @@ impl Listener {
     pub(crate) fn local_addr(&self) -> Option<std::net::SocketAddr> {
         match self {
             Listener::Unix { .. } => None,
-            Listener::Tcp(listener) => listener.local_addr().ok(),
+            Listener::Tcp(listener, _) => listener.local_addr().ok(),
         }
     }
 
     pub(crate) fn accept(&self) -> io::Result<Socket> {
         match self {
             Listener::Unix { listener, .. } => Ok(Socket::Unix(listener.accept()?.0)),
-            Listener::Tcp(listener) => {
+            Listener::Tcp(listener, options) => {
                 let (stream, _) = listener.accept()?;
-                stream.set_nodelay(true)?;
+                crate::sockopt::accepted(&stream, options)?;
                 Ok(Socket::Tcp(stream))
             }
         }
@@ -106,7 +107,10 @@ impl Drop for Listener {
 /// A socket listening at `at`. A Unix socket is made under a temporary name, given mode 0600
 /// and renamed into place, so no other user can connect in between; a name left by a daemon
 /// that is gone is replaced, one another process listens on is refused.
-pub(crate) fn listen(root: &Path, at: &Address) -> io::Result<Listener> {
+pub(crate) fn listen(root: &Path, at: &Address, options: &crate::sockopt::Tcp) -> io::Result<Listener> {
+    if !matches!(at, Address::Tcp(_)) {
+        crate::sockopt::unix_refused(options)?;
+    }
     match at {
         Address::Unix(name) => {
             let path = root.join(name.as_str());
@@ -144,7 +148,11 @@ pub(crate) fn listen(root: &Path, at: &Address) -> io::Result<Listener> {
             Ok(Listener::Unix { listener, path: Some((path, made)) })
         }
         Address::Inherited { fd, at } => inherited(root, *fd, at),
-        Address::Tcp(address) => Ok(Listener::Tcp(TcpListener::bind(address)?)),
+        Address::Tcp(address) => {
+            let listener = crate::sockopt::listen_tcp(*address, options.get())?;
+            // clone: the listen's options, kept to set on each connection it accepts.
+            Ok(Listener::Tcp(listener, options.clone()))
+        }
     }
 }
 
@@ -448,7 +456,10 @@ impl Socket {
 }
 
 /// A connection made to `at`, blocking until it is.
-pub(crate) fn connect(root: &Path, at: &Address) -> io::Result<Socket> {
+pub(crate) fn connect(root: &Path, at: &Address, options: &crate::sockopt::Tcp) -> io::Result<Socket> {
+    if !matches!(at, Address::Tcp(_)) {
+        crate::sockopt::unix_refused(options)?;
+    }
     match at {
         Address::Unix(name) => {
             let stream = blaze_mem::scratch::with_path(|path| {
@@ -459,11 +470,7 @@ pub(crate) fn connect(root: &Path, at: &Address) -> io::Result<Socket> {
             Ok(Socket::Unix(stream))
         }
         Address::Inherited { .. } => Err(not_connectable(at)),
-        Address::Tcp(address) => {
-            let stream = TcpStream::connect(address)?;
-            stream.set_nodelay(true)?;
-            Ok(Socket::Tcp(stream))
-        }
+        Address::Tcp(address) => Ok(Socket::Tcp(crate::sockopt::connect_tcp(*address, options)?)),
     }
 }
 

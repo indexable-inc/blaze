@@ -41,6 +41,7 @@ pub mod busy;
 pub mod chan;
 // The records in flight: a per-key claim, its waiters, the cycle walk (parallel.md, end state).
 pub mod claim_table;
+pub mod claim_watch;
 #[cfg(target_os = "linux")]
 pub mod cgroup;
 #[allow(
@@ -53,6 +54,8 @@ pub mod decimal;
 mod descriptors;
 pub mod dgram;
 pub mod exit;
+#[allow(unsafe_code, reason = "setsockopt and getsockopt of values on the stack; bind, listen and connect of a sockaddr")]
+pub mod sockopt;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code, reason = "the fanotify driver: its system calls and the events it reads")]
 mod fanotify;
@@ -79,6 +82,10 @@ mod locks;
 mod net;
 #[cfg(unix)]
 mod process;
+/// A process started linked to its parent: descriptors given, a group of its own, a wait by a
+/// deadline and a kill of the whole group ([`linked::start_linked`]).
+#[cfg(unix)]
+pub use crate::process::linked;
 /// The children the drivers started and have not reaped, for a stall report to name
 /// ([`children::unreaped`]).
 #[cfg(unix)]
@@ -868,16 +875,23 @@ pub enum Effect {
     /// Completes with [`Done::Accepted`] for each connection made to `at`, until an
     /// [`Effect::Unlisten`] of the same tag, which ends it with [`Done::Unlistened`]. In
     /// flight until it ends, as a watch is.
+    /// A TCP listen takes `options` ([`sockopt::TcpOptions`], set before its bind, and on each
+    /// connection it accepts the ones that act per connection); a Unix one takes only
+    /// [`sockopt::Tcp::DEFAULT`]. An option the system lacks, asked `Must`, fails it naming the
+    /// option and the system.
     Listen {
         at: Address,
+        options: sockopt::Tcp,
         tag: Tag,
     },
     Unlisten {
         tag: Tag,
     },
-    /// A connection made to `at`; completes with [`Done::Connected`].
+    /// A connection made to `at`; completes with [`Done::Connected`]. `options` are set on its
+    /// socket before it connects, as [`Effect::Listen`] says.
     Connect {
         at: Address,
+        options: sockopt::Tcp,
         tag: Tag,
     },
     /// The bytes the peer of `conn` sent since the last receive, at most `most` and at most
@@ -1811,6 +1825,9 @@ pub enum Done {
     Bound {
         sock: Dgram,
         local: std::net::SocketAddr,
+        /// Its buffers as the kernel said them once every option was set: what a buffer asked
+        /// became (the simulation's: [`sockopt::Buffers::simulated`]).
+        buffers: sockopt::Buffers,
     },
     /// Of an [`Effect::RecvFrom`]: at least one datagram, each head saying who sent it.
     Datagrams(dgram::Batch),

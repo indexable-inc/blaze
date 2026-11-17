@@ -606,15 +606,24 @@ fn heads<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, krate: usize, cname: 
                 let got = if !built {
                     Err(plain_refusal(CONTAINER_REFUSED.to_string(), "-"))
                 } else {
-                    match (mk, r.keys.filed_member(ck, mk, name)) {
-                        (MemberKind::Fn, Some(fk)) => match r.store.fn_gaps.get(&fk) {
-                            Some(why) => {
+                    let filed = r.keys.filed_member(ck, mk, name);
+                    // An impl's fn's signature is its own want (heads.rs `Want::MemberFn`),
+                    // never made with the impl's head: asked here. Its own refusal is its
+                    // `fn_gaps` row; a want that does not settle is the made want's refusal.
+                    let member_made = match (mk, filed) {
+                        (MemberKind::Fn, Some(fk)) if !is_trait => make(&mut r, Want::MemberFn(*k, fk)),
+                        _ => Ok(()),
+                    };
+                    match (mk, filed) {
+                        (MemberKind::Fn, Some(fk)) => match (member_made, r.store.fn_gaps.get(&fk)) {
+                            (Err(x), _) => Err(x),
+                            (Ok(()), Some(why)) => {
                                 let mut x = why_refusal(m.key, why);
                                 x.owner = Some(*k);
                                 Err(x)
                             }
-                            None if r.store.fns.contains_key(&fk) => Ok(()),
-                            None => Err(plain_refusal("member fn filed but no head in the store".to_string(), "heads.rs")),
+                            (Ok(()), None) if r.store.fns.contains_key(&fk) => Ok(()),
+                            (Ok(()), None) => Err(plain_refusal("member fn filed but no head in the store".to_string(), "heads.rs")),
                         },
                         (MemberKind::Const, Some(_)) => Ok(()),
                         (MemberKind::Const, None) if is_trait => Err(plain_refusal("trait assoc const: no head made (trait_members files none)".to_string(), "heads.rs")),
@@ -1011,6 +1020,34 @@ fn print_blockers(names: &Names<'_>, title: &str, blockers: &BTreeMap<blaze_id::
     out
 }
 
+/// The proc-macro runner's findings, one line each (a call it refused or that failed is never
+/// a silent empty expansion: blaze-proc-macro's `Finding`, as stages.rs prints them), then
+/// every error an expansion emitted (`compile_error!`, a proc macro's error or panic), naming
+/// the crate it was written in, the macro and the call. The message itself is not printed:
+/// blaze-scope's `ExpandNote::Diagnostic` keeps the diagnostic's text range but not the
+/// expansion's text table it points into.
+fn print_proc_findings(loaded: &names_load::Loaded) {
+    use blaze_expand::{Diagnostic, ProcLevel};
+    use blaze_scope::resolve::{ExpandNote, NamesNote};
+    if let Some(procs) = loaded.procs {
+        for finding in procs.procs.take_findings() {
+            println!("proc-macro finding: {finding}");
+        }
+    }
+    for (k, c) in loaded.names.crates().iter().enumerate() {
+        for note in loaded.names.notes(k) {
+            let NamesNote::Expand { call, at, note: ExpandNote::Diagnostic { macro_name, diagnostic } } = note else { continue };
+            let what = match diagnostic {
+                Diagnostic::CompileError { .. } => "compile_error!",
+                Diagnostic::ProcMacro { level: ProcLevel::Error, .. } => "a proc macro's error",
+                Diagnostic::ProcMacroPanicked { .. } => "a proc macro's panic",
+                _ => continue,
+            };
+            println!("expansion error: crate {}: {what} from the call of `{macro_name}` ({call:?} at {at:?})", c.name);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 7 {
@@ -1043,6 +1080,7 @@ fn main() {
     let names_s = t0.elapsed().as_secs_f64();
     let names_mb = LIVE.load(Ordering::Relaxed) as f64 / 1e6;
     println!("names: {} crates in {names_s:.1}s (resolve {:.1}s); {}", names.crates().len(), loaded.resolve_ms / 1e3, mem());
+    print_proc_findings(&loaded);
     let mut blockers: BTreeMap<blaze_id::ItemKey, Blocker> = BTreeMap::new();
     let t1 = Instant::now();
     // The command's frame, alive as long as the names (the whole run).

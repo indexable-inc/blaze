@@ -30,22 +30,27 @@
 //! - *Failure.* A helped task's error or panic is caught in its own body and kept in its own
 //!   scope's tally (`Scope::pool_job`): it fails that task, never the helper.
 //!
-//! **The batch join** ([`Batch`]). The tasks of one scope, spawned through the batch, each with
-//! the index of its spawn. [`Batch::join_each`] hands each outcome to a callback as it is found
-//! ended, with its index in the same value ([`Joined`]): the caller merges by index (or by a
-//! key in the result), never by arrival, so its output is the same bytes under any schedule
-//! (rule 25; parallel.md point 8). The loop is [`drive`]: it sweeps the open tasks for ended
-//! ones, helps as above, and parks only when nothing ended since its last sweep and nothing can
-//! be run here. One wake serves every task that ended before it: the park waits for the
-//! scope's count of ended tasks to move, and the sweep after it takes all that ended. A sweep
-//! costs the open tasks, so it runs when at least `open / SWEEP_SHARE` tasks ended since the
-//! last one (or before a park): its cost per task is a constant.
+//! **A seat** (task/seat.rs). A joiner outside the pool takes one of the pool's seats for its
+//! join's length ([`Pool::adopt`]) and with it also steals from the workers' deques of its
+//! class ([`Pool::steal_seated`]), as a worker does; it gives the seat back before it parks.
+//! With no seat free it helps from the injection queues only.
 //!
-//! **No wake is lost** because the count of ended tasks is read BEFORE the sweep: a task that
-//! ends after the read moves the count, so the park's condition is already true; one that
-//! ended before it is found by the sweep (the runner stores `DONE`, then counts, then unparks:
-//! `Tally::ended`). The control [`HelpPlant::CountAfterSweep`] reads it after, and the model
-//! finds the joiner asleep with a result ready.
+//! **The batch join** ([`Batch`]). The tasks of one scope, spawned through the batch, each with
+//! the index of its spawn; the batch is given its capacity at its start. [`Batch::join_each`]
+//! hands each outcome to a callback as it ends, with its index in the same value ([`Joined`]):
+//! the caller merges by index (or by a key in the result), never by arrival, so its output is
+//! the same bytes under any schedule (rule 25; parallel.md point 8). Each task ends into the
+//! batch's ring (task/ring.rs), so the join reads only what ended, never the open tasks. The
+//! loop is [`drive`]: it delivers what the ring holds, helps as above, and parks only when the
+//! scope's count of ended tasks has not moved since before that read and nothing can be run
+//! here. One wake serves every task that ended before it.
+//!
+//! **No wake is lost** because the count of ended tasks is read BEFORE the ring: a task that
+//! ends after the read moves the count, so the park's condition is already false; one that
+//! ended before it is in the ring (the runner writes its slot, stores `DONE`, then counts, then
+//! unparks: task/ring.rs `end_task`). The control [`HelpPlant::CountAfterSweep`] reads it after,
+//! and the model finds the joiner asleep with a result ready; task/ring.rs's model plants the
+//! runner's wake before its slot.
 //!
 //! **Counted** ([`Joins`], read as [`JoinCounts`] by [`Scope::join_counts`]): tasks run by the
 //! joining thread as their own join, tasks it ran as a helper, tasks ended in all (the rest ran
@@ -70,7 +75,8 @@ use super::{
     Held, Pending, Scope, Task, TaskError,
     claim::Claim,
     outlast,
-    threads::{Pool, Ran, Tally},
+    ring::{self, EndRing},
+    threads::{self, Header, Pool, Ran, Seat, Tally},
 };
 use crate::cx::{Cx, Here};
 
@@ -78,9 +84,6 @@ use crate::cx::{Cx, Here};
 /// counts two. At the cap a join parks instead of helping.
 pub(crate) const HELP_DEPTH: u32 = 8;
 
-/// A sweep of a batch's open tasks runs once at least one in this many of them ended since the
-/// last sweep, so sweeping costs a constant per task.
-const SWEEP_SHARE: usize = 64;
 
 /// A planted bug for the model's controls (rule 53).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -90,8 +93,8 @@ pub(crate) enum HelpPlant {
     /// both run one task.
     #[cfg_attr(not(blaze_check), expect(dead_code, reason = "the model's control"))]
     HelperSkipsClaim,
-    /// The batch join reads the count of ended tasks after its sweep, not before: a task that
-    /// ends between the two is never seen, and the joiner parks with its result ready.
+    /// The batch join reads the count of ended tasks after it delivers, not before: a task
+    /// that ends between the two is never seen, and the joiner parks with its result ready.
     #[cfg_attr(not(blaze_check), expect(dead_code, reason = "the model's control"))]
     CountAfterSweep,
 }
@@ -248,8 +251,9 @@ pub(crate) enum Helped {
     Capped,
 }
 
-/// Runs one queued task on `cx`'s thread, for a join of a scope whose tally is `tally`.
-fn help_one(pool: &Pool, tally: &Tally, cx: &Cx) -> Helped {
+/// Runs one queued task on `cx`'s thread, for a join of a scope whose tally is `tally`: from
+/// the injection queues, then, with a `seat`, from the workers' deques.
+fn help_one(pool: &Pool, tally: &Tally, cx: &Cx, seat: Option<&Seat<'_>>) -> Helped {
     let here = cx.here();
     // A worker's own queues are run by `Pool::wait`, as before; this is the thread outside.
     if !matches!(here, Here::Outside) {
@@ -263,10 +267,14 @@ fn help_one(pool: &Pool, tally: &Tally, cx: &Cx) -> Helped {
         return Helped::Capped;
     }
     // A bounded look: each queued pointer is taken out once, so the loop ends when the
-    // injection queues of this class are empty.
+    // injection queues of this class, and with a seat the deques, are empty.
     loop {
-        let Some(job) = pool.lend(cx.class()) else {
-            return Helped::Nothing;
+        let job = match pool.lend(cx.class()) {
+            Some(job) => job,
+            None => match seat.and_then(|seat| pool.steal_seated(seat, cx.class())) {
+                Some(job) => job,
+                None => return Helped::Nothing,
+            },
         };
         assert!(DEPTH.enter(HELP_DEPTH), "bstd::task::help: the depth was checked above");
         let leave = Leave;
@@ -302,12 +310,15 @@ pub(super) fn finish<T>(pending: &Pending<T>, cx: &Cx, name: &'static str) -> Ra
         tally.joins().by_joiner.fetch_add(1, Ordering::Relaxed);
         return ran;
     }
+    let seat = if matches!(cx.here(), Here::Outside) { pending.pool.adopt() } else { None };
     while !queued.done() {
-        match help_one(&pending.pool, tally, cx) {
+        match help_one(&pending.pool, tally, cx, seat.as_ref()) {
             Helped::Ran => {}
             Helped::Nothing | Helped::Capped => break,
         }
     }
+    // Given back before the park: a parked joiner steals nothing.
+    drop(seat);
     if !queued.done() {
         park(cx, &pending.pool, tally, name, || queued.done());
     }
@@ -319,11 +330,8 @@ pub(super) fn finish<T>(pending: &Pending<T>, cx: &Cx, name: &'static str) -> Ra
 pub(crate) trait Joining {
     /// The tasks not yet delivered.
     fn open(&self) -> usize;
-    /// Whether open task `at` (a position below [`Joining::open`]) has ended.
-    fn done(&self, at: usize) -> bool;
-    /// Takes open task `at`, which has ended, out and hands its outcome on. The last open task
-    /// takes its position.
-    fn deliver(&mut self, at: usize);
+    /// Hands on the outcome of every open task found ended now (the batch's ring): how many.
+    fn deliver_ended(&mut self) -> usize;
     /// How many of the scope's tasks have ended: only grows.
     fn ended(&self) -> u64;
     /// Runs one queued task here.
@@ -334,45 +342,23 @@ pub(crate) trait Joining {
 
 /// The batch join's loop (the module's doc): until no task is open.
 pub(crate) fn drive<J: Joining>(joining: &mut J, plant: HelpPlant) {
-    let mut swept = joining.ended();
-    let mut sweep = true;
     loop {
-        if sweep {
-            // Read before the sweep: a task that ends after this read moves the count, so the
-            // park below does not wait for it.
-            if plant != HelpPlant::CountAfterSweep {
-                swept = joining.ended();
-            }
-            let mut at = 0;
-            while at < joining.open() {
-                if joining.done(at) {
-                    joining.deliver(at);
-                } else {
-                    at += 1;
-                }
-            }
-            if plant == HelpPlant::CountAfterSweep {
-                swept = joining.ended();
-            }
-            sweep = false;
+        // Read before the delivery: a task that ends after this read moves the count, so the
+        // park below does not wait for it.
+        let mut swept = joining.ended();
+        joining.deliver_ended();
+        if plant == HelpPlant::CountAfterSweep {
+            swept = joining.ended();
         }
-        let open = joining.open();
-        if open == 0 {
+        if joining.open() == 0 {
             return;
-        }
-        let ended = joining.ended().saturating_sub(swept);
-        let due = u64::try_from((open / SWEEP_SHARE).max(1)).unwrap_or(u64::MAX);
-        if ended >= due {
-            sweep = true;
-            continue;
         }
         match joining.help() {
             Helped::Ran => {}
             Helped::Nothing | Helped::Capped => {
-                if ended == 0 {
+                if joining.ended() == swept {
                     joining.park(swept);
                 }
-                sweep = true;
             }
         }
     }
@@ -390,13 +376,17 @@ pub struct Joined<T> {
     pub result: Result<T, TaskError>,
 }
 
-/// Why a batch took no more tasks.
+/// Why a batch took no more tasks, or was not made.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BatchError {
-    /// The batch's allocator had no room for one more handle: the task was not spawned.
+    /// The batch's allocator had no room for its ring and handles (`Scope::batch`), or for one
+    /// more handle: the task was not spawned.
     NoRoom { scope: &'static str, task: &'static str, held: u32 },
     /// The batch holds `u32::MAX` tasks: the task was not spawned.
     TooMany { scope: &'static str, task: &'static str },
+    /// The batch holds the capacity it was made with: the task was not spawned (rule
+    /// bounded-progress: its ring has that many slots).
+    PastCapacity { scope: &'static str, task: &'static str, capacity: u32 },
 }
 
 impl fmt::Display for BatchError {
@@ -407,6 +397,9 @@ impl fmt::Display for BatchError {
             }
             BatchError::TooMany { scope, task } => {
                 write!(f, "bstd::task::Batch of scope {scope}: task {task} would be past the last index, {} (the task was not spawned)", u32::MAX)
+            }
+            BatchError::PastCapacity { scope, task, capacity } => {
+                write!(f, "bstd::task::Batch of scope {scope}: task {task} would be past the capacity {capacity} the batch was made with (rule bounded-progress; the task was not spawned)")
             }
         }
     }
@@ -425,14 +418,26 @@ struct Entry<'s, T> {
 #[must_use = "a batch is finished with join_each(cx, ..)"]
 pub struct Batch<'s, 'p, T, A: Allocator> {
     scope: &'s Scope<'p>,
-    open: Vec<Entry<'s, T>, A>,
+    /// By spawn index; `None` once delivered.
+    open: Vec<Option<Entry<'s, T>>, A>,
+    /// Spawns that ended with no job (run inline at the spawn): delivered from here.
+    inline: Vec<u32, A>,
     next: u32,
+    /// Declared after `open`: dropped after every handle, so every task ends into a live ring.
+    ring: EndRing<Header, A>,
 }
 
 impl<'p> Scope<'p> {
-    /// An empty batch of this scope's tasks, its handles kept in `alloc`.
-    pub fn batch<T, A: Allocator>(&self, alloc: A) -> Batch<'_, 'p, T, A> {
-        Batch { scope: self, open: Vec::new_in(alloc), next: 0 }
+    /// An empty batch of this scope's tasks, of at most `capacity` (rule bounded-progress): its
+    /// ring and handles are made now, in `alloc`, and none grows after.
+    pub fn batch<T, A: Allocator + Clone>(&self, capacity: u32, alloc: A) -> Result<Batch<'_, 'p, T, A>, BatchError> {
+        let no_room = BatchError::NoRoom { scope: self.live.cx.name(), task: "(the batch's ring and handles)", held: 0 };
+        let ring = EndRing::try_new_in(capacity, alloc.clone()).map_err(|_| no_room)?;
+        let mut open = Vec::new_in(alloc.clone());
+        open.try_reserve(capacity as usize).map_err(|_| no_room)?;
+        let mut inline = Vec::new_in(alloc);
+        inline.try_reserve(capacity as usize).map_err(|_| no_room)?;
+        Ok(Batch { scope: self, open, inline, next: 0, ring })
     }
 
     /// What this scope's joins did so far (the module's doc, "Counted").
@@ -456,13 +461,29 @@ impl<'s, 'p, T: Send, A: Allocator> Batch<'s, 'p, T, A> {
         let Some(next) = index.checked_add(1) else {
             return Err(BatchError::TooMany { scope: scope.live.cx.name(), task: name });
         };
-        // Room first: a spawned task's handle is linear, so nothing is spawned that cannot be
-        // kept.
-        if self.open.try_reserve(1).is_err() {
+        // Room first (made at the batch's start for `capacity`): a spawned task's handle is
+        // linear, so nothing is spawned that cannot be kept, and its ring has its slot.
+        if index >= self.ring.capacity() {
+            return Err(BatchError::PastCapacity { scope: scope.live.cx.name(), task: name, capacity: self.ring.capacity() });
+        }
+        if self.open.try_reserve(1).is_err() || self.inline.try_reserve(1).is_err() {
             return Err(BatchError::NoRoom { scope: scope.live.cx.name(), task: name, held: index });
         }
+        // The job this spawn makes takes the ring (task/ring.rs "Which tasks").
+        let outer = ring::install(self.ring.end());
         let task = scope.may_overlap(name, scratch, task);
-        self.open.push(Entry { index, task });
+        let in_ring = ring::restore(outer);
+        match &task.held {
+            Held::Queued(pending) => {
+                assert!(in_ring, "bstd::task::Batch of scope {}: task {name}'s job did not take the batch's ring", scope.live.cx.name());
+                pending.queued.set_tag(index);
+            }
+            Held::Ended(_) => {
+                assert!(!in_ring, "bstd::task::Batch of scope {}: task {name} ended inline but a job took the batch's ring", scope.live.cx.name());
+                self.inline.push(index);
+            }
+        }
+        self.open.push(Some(Entry { index, task }));
         self.next = next;
         Ok(index)
     }
@@ -482,8 +503,12 @@ impl<'s, 'p, T: Send, A: Allocator> Batch<'s, 'p, T, A> {
     /// scope's, runs queued tasks while it waits and parks only with nothing to run (the
     /// module's doc), until `cx`'s deadline and the abandon wait, as [`Task::join`].
     pub fn join_each(self, cx: &Cx, each: impl FnMut(Joined<T>)) {
-        let Batch { scope, open, .. } = self;
-        let mut run = Run { scope, cx, open, each };
+        let Batch { scope, open, inline, next, ring } = self;
+        let seat = match (cx.here(), scope.live.cx.pool()) {
+            (Here::Outside, Some(pool)) => pool.adopt(),
+            _ => None,
+        };
+        let mut run = Run { scope, cx, open, left: next as usize, inline, read: 0, seat, each, ring };
         drive(&mut run, HelpPlant::None);
     }
 }
@@ -492,32 +517,61 @@ impl<'s, 'p, T: Send, A: Allocator> Batch<'s, 'p, T, A> {
 struct Run<'r, 's, 'p, T, A: Allocator, F> {
     scope: &'s Scope<'p>,
     cx: &'r Cx,
-    open: Vec<Entry<'s, T>, A>,
+    open: Vec<Option<Entry<'s, T>>, A>,
+    /// The tasks not yet delivered.
+    left: usize,
+    inline: Vec<u32, A>,
+    /// The ring's next slot to read.
+    read: u32,
+    /// The joiner's seat, if it is outside the pool and one was free.
+    seat: Option<Seat<'s>>,
     each: F,
+    /// After `open`, as in `Batch`.
+    ring: EndRing<Header, A>,
 }
 
-impl<T, A: Allocator, F: FnMut(Joined<T>)> Joining for Run<'_, '_, '_, T, A, F> {
-    fn open(&self) -> usize {
-        self.open.len()
-    }
-
-    fn done(&self, at: usize) -> bool {
-        match &self.open[at].task.held {
-            Held::Ended(_) => true,
-            Held::Queued(pending) => pending.queued.done(),
-        }
-    }
-
-    fn deliver(&mut self, at: usize) {
-        let Entry { index, task } = self.open.swap_remove(at);
+impl<T, A: Allocator, F: FnMut(Joined<T>)> Run<'_, '_, '_, T, A, F> {
+    /// Hands on task `index`'s outcome: it ended.
+    fn deliver(&mut self, index: u32) {
+        let scope = self.scope.live.cx.name();
+        let Some(Entry { index, task }) = self.open.get_mut(index as usize).and_then(Option::take) else {
+            panic!("bstd::task::Batch of scope {scope}: the ring gave task {index}, which is not open in this batch");
+        };
         let Task { name, held, unfinished, .. } = task;
         unfinished.finished();
         let result = match held {
             Held::Ended(outcome) => outcome,
-            // Ended (`done` said so): its result is taken, and the handle's drop finds it so.
+            // Ended (it was in the ring): its result is taken, and the handle's drop finds it so.
             Held::Queued(pending) => Scope::outcome(pending.queued.take()),
         };
+        self.left -= 1;
         (self.each)(Joined { index, name, result });
+    }
+}
+
+impl<T, A: Allocator, F: FnMut(Joined<T>)> Joining for Run<'_, '_, '_, T, A, F> {
+    fn open(&self) -> usize {
+        self.left
+    }
+
+    fn deliver_ended(&mut self) -> usize {
+        let mut delivered = 0;
+        while let Some(index) = self.inline.pop() {
+            self.deliver(index);
+            delivered += 1;
+        }
+        // A slot is taken only once its task is done (task/ring.rs `EndRing::next`).
+        // SAFETY (in the closure): the job's handle is in `open` until delivered, so it lives.
+        #[expect(unsafe_code, reason = "reading a live job's DONE: the SAFETY above")]
+        let done = |header| unsafe { threads::done_of(header) };
+        while let Some(header) = self.ring.next(&mut self.read, done) {
+            // SAFETY: the job's handle is in `open` until it is delivered, so its header lives.
+            #[expect(unsafe_code, reason = "reading a live job's batch index: the SAFETY above")]
+            let index = unsafe { threads::tag_of(header) };
+            self.deliver(index);
+            delivered += 1;
+        }
+        delivered
     }
 
     fn ended(&self) -> u64 {
@@ -527,7 +581,7 @@ impl<T, A: Allocator, F: FnMut(Joined<T>)> Joining for Run<'_, '_, '_, T, A, F> 
     fn help(&mut self) -> Helped {
         let live = &self.scope.live;
         match (live.cx.pool(), &live.shared) {
-            (Some(pool), Some(tally)) => help_one(pool, tally, self.cx),
+            (Some(pool), Some(tally)) => help_one(pool, tally, self.cx, self.seat.as_ref()),
             // No pool: every task ran inline at its spawn, so none is open to wait for.
             (None, _) | (_, None) => Helped::Nothing,
         }
@@ -538,13 +592,19 @@ impl<T, A: Allocator, F: FnMut(Joined<T>)> Joining for Run<'_, '_, '_, T, A, F> 
         let (Some(pool), Some(tally)) = (live.cx.pool(), &live.shared) else {
             panic!("bstd::task::Batch of scope {}: a task is open with no pool to wait on", live.cx.name());
         };
+        // The seat is given back for the park and taken again after: a parked joiner steals
+        // nothing.
+        let seated = self.seat.take().is_some();
         park(self.cx, pool, tally, live.last.get(), || tally.joins().ended.load(Ordering::Acquire) != swept);
+        if seated {
+            self.seat = pool.adopt();
+        }
     }
 }
 
 impl<T, A: Allocator> fmt::Debug for Batch<'_, '_, T, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Batch").field("scope", &self.scope.live.cx.name()).field("spawned", &self.next).field("open", &self.open.len()).finish()
+        f.debug_struct("Batch").field("scope", &self.scope.live.cx.name()).field("spawned", &self.next).field("capacity", &self.ring.capacity()).finish()
     }
 }
 
@@ -594,13 +654,20 @@ mod tests {
             self.open.len()
         }
 
-        fn done(&self, at: usize) -> bool {
-            self.ran[self.open[at] as usize]
-        }
-
-        fn deliver(&mut self, at: usize) {
-            let index = self.open.swap_remove(at);
-            self.delivered.push(index);
+        /// A sweep: this test has no ring.
+        fn deliver_ended(&mut self) -> usize {
+            let mut delivered = 0;
+            let mut at = 0;
+            while at < self.open.len() {
+                if self.ran[self.open[at] as usize] {
+                    let index = self.open.swap_remove(at);
+                    self.delivered.push(index);
+                    delivered += 1;
+                } else {
+                    at += 1;
+                }
+            }
+            delivered
         }
 
         fn ended(&self) -> u64 {
@@ -714,14 +781,22 @@ mod model {
             self.open.len()
         }
 
-        fn done(&self, at: usize) -> bool {
-            self.world.claims[self.open[at] as usize].done()
-        }
-
-        fn deliver(&mut self, at: usize) {
-            let index = self.open.swap_remove(at);
-            assert!(self.world.claims[index as usize].done(), "a result was delivered before its task ended");
-            self.delivered.push(index);
+        /// A sweep over the claims: this model is of the helper and the count (task/ring.rs's
+        /// model is of the ring).
+        fn deliver_ended(&mut self) -> usize {
+            let mut delivered = 0;
+            let mut at = 0;
+            while at < self.open.len() {
+                if self.world.claims[self.open[at] as usize].done() {
+                    let index = self.open.swap_remove(at);
+                    assert!(self.world.claims[index as usize].done(), "a result was delivered before its task ended");
+                    self.delivered.push(index);
+                    delivered += 1;
+                } else {
+                    at += 1;
+                }
+            }
+            delivered
         }
 
         fn ended(&self) -> u64 {

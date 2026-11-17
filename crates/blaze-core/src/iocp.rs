@@ -1036,8 +1036,10 @@ impl Iocp {
                 )))
             }
             Effect::Spawn { command, tag } => self.spawn(command, tag),
-            Effect::Listen { at, tag } => self.listen(at, tag),
-            Effect::Connect { at, tag } => self.connect(at, tag),
+            // Windows sets its own no-delay and takes no options yet (out of scope: no Windows
+            // target now); the field is not read here.
+            Effect::Listen { at, tag, .. } => self.listen(at, tag),
+            Effect::Connect { at, tag, .. } => self.connect(at, tag),
             Effect::Recv { conn, most, into, tag } => {
                 let (id, connection) = match self.connection(conn) {
                     Ok(it) => it,
@@ -3169,8 +3171,8 @@ mod tests {
     fn round_trip(root: &Path, at: Address) {
         let mut driver = Iocp::new(root, 1).unwrap();
         let mut effects = vec![
-            Effect::Listen { at: at.clone(), tag: Tag(1) },
-            Effect::Connect { at, tag: Tag(2) },
+            Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) },
+            Effect::Connect { at, options: crate::sockopt::Tcp::DEFAULT, tag: Tag(2) },
         ];
         let (mut server, mut client) = (None, None);
         let mut ends = Vec::new();
@@ -3232,13 +3234,13 @@ mod tests {
         let root = dir("taken");
         let mut driver = Iocp::new(&root, 1).unwrap();
         let mut out = Vec::new();
-        driver.submit(&mut vec![Effect::Listen { at: Address::Unix(name("s")), tag: Tag(1) }]);
+        driver.submit(&mut vec![Effect::Listen { at: Address::Unix(name("s")), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) }]);
         driver.poll(&mut out, Deadline::PASSED);
         assert!(out.is_empty(), "{out:?}");
         let seen = run(
             &mut driver,
             vec![
-                Effect::Listen { at: Address::Unix(name("s")), tag: Tag(2) },
+                Effect::Listen { at: Address::Unix(name("s")), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(2) },
                 Effect::Unlisten { tag: Tag(1) },
             ],
         );
@@ -3269,7 +3271,7 @@ mod tests {
                 Effect::Unlisten { tag: Tag(2) },
                 Effect::Recv { conn: Conn(77), most: 8, into: b"kept".to_vec(), tag: Tag(3) },
                 Effect::Hangup { conn: Conn(77), tag: Tag(4) },
-                Effect::Connect { at: Address::Unix(name("nobody")), tag: Tag(5) },
+                Effect::Connect { at: Address::Unix(name("nobody")), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(5) },
                 Effect::Kill { tag: Tag(6) },
             ],
         );
@@ -4110,10 +4112,11 @@ mod tests {
         let mut out = Vec::with_capacity(16);
         driver.submit(&mut vec![Effect::Listen {
             at: Address::Tcp("127.0.0.1:0".parse().unwrap()),
+            options: crate::sockopt::Tcp::DEFAULT,
             tag: Tag(1),
         }]);
         let at = driver.local_addr(Tag(1)).unwrap();
-        driver.submit(&mut vec![Effect::Connect { at: Address::Tcp(at), tag: Tag(2) }]);
+        driver.submit(&mut vec![Effect::Connect { at: Address::Tcp(at), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(2) }]);
         until(&mut driver, &mut out, 2);
         let (mut server, mut client) = (None, None);
         for it in out.drain(..) {

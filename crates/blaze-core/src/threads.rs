@@ -1011,9 +1011,9 @@ impl Threads {
     }
 
     #[cfg(unix)]
-    fn listen(&mut self, at: &crate::Address, tag: Tag) -> io::Result<()> {
+    fn listen(&mut self, at: &crate::Address, options: &crate::sockopt::Tcp, tag: Tag) -> io::Result<()> {
         use std::os::fd::{AsRawFd as _, OwnedFd};
-        let listener = crate::net::listen(&self.shared.root, at)?;
+        let listener = crate::net::listen(&self.shared.root, at, options)?;
         let (read_end, write_end) = std::io::pipe()?;
         let (read_end, write_end) = (OwnedFd::from(read_end), OwnedFd::from(write_end));
         crate::net::set_cloexec(read_end.as_raw_fd())?;
@@ -1638,6 +1638,7 @@ enum Errand {
     },
     Connect {
         at: crate::Address,
+        options: crate::sockopt::Tcp,
         tag: Tag,
     },
     Recv {
@@ -1810,7 +1811,7 @@ impl Errand {
                 };
                 Some(Told::Exited { spawn, completion: Completion { tag, done } })
             }
-            Errand::Connect { at, tag } => Some(match crate::net::connect(&shared.root, &at) {
+            Errand::Connect { at, options, tag } => Some(match crate::net::connect(&shared.root, &at, &options) {
                 Ok(socket) => Told::Connected { tag, socket },
                 Err(error) => failed(tag, error),
             }),
@@ -2313,8 +2314,8 @@ impl Driver for Threads {
                     }
                 }
                 #[cfg(unix)]
-                Effect::Listen { at, tag } => {
-                    if let Err(error) = self.listen(&at, tag) {
+                Effect::Listen { at, options, tag } => {
+                    if let Err(error) = self.listen(&at, &options, tag) {
                         // alloc: an error path.
                         self.tell(tag, Done::Failed(IoError(error.to_string())));
                     }
@@ -2329,9 +2330,9 @@ impl Driver for Threads {
                     ),
                 },
                 #[cfg(unix)]
-                Effect::Connect { at, tag } => {
+                Effect::Connect { at, options, tag } => {
                     self.in_flight += 1;
-                    self.dispatch(Errand::Connect { at, tag });
+                    self.dispatch(Errand::Connect { at, options, tag });
                 }
                 #[cfg(unix)]
                 Effect::Recv { conn, most, into, tag } => match self.socket(conn) {

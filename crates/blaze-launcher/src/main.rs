@@ -135,7 +135,54 @@ unsafe extern "C" {
     static environ: *const *const c_char;
 }
 
+/// The run path's mode (docs/v2/plan/design/run.md, piece 5): the parent, `blaze run`, set
+/// `BLAZE_LAUNCH_FD=3` (its socket pair's end), `BLAZE_LAUNCH_STORE` (the folder of code records)
+/// and `BLAZE_LAUNCH_ENTRY` (`<unit|c-main>:<symbol>`). Each is read once here and removed from
+/// the environment the program gets. Never returns: the program ends the process.
+fn run_mode(fd: OsString) -> ! {
+    use blaze_launch_rt::run_mode::{self, Folder, STOPPED, Start};
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    if fd.as_encoded_bytes() != b"3" {
+        stop(
+            CANNOT_RUN,
+            &format!("BLAZE_LAUNCH_FD is `{}`: the run mode takes its parent's socket on descriptor 3 only", fd.display()),
+        );
+    }
+    let Some(store) = std::env::var_os("BLAZE_LAUNCH_STORE") else {
+        stop(CANNOT_RUN, "BLAZE_LAUNCH_FD is set and BLAZE_LAUNCH_STORE (the folder of the run's code records) is not");
+    };
+    let Some(entry) = std::env::var_os("BLAZE_LAUNCH_ENTRY") else {
+        stop(CANNOT_RUN, "BLAZE_LAUNCH_FD is set and BLAZE_LAUNCH_ENTRY (`<unit|c-main>:<symbol>`) is not");
+    };
+    let start = match Start::parse(entry.as_encoded_bytes()) {
+        Ok(start) => start,
+        Err(why) => stop(CANNOT_RUN, &why.to_string()),
+    };
+    // SAFETY: one thread runs (nothing has been started yet), so nothing reads the environment
+    // while it changes.
+    unsafe {
+        std::env::remove_var("BLAZE_LAUNCH_FD");
+        std::env::remove_var("BLAZE_LAUNCH_STORE");
+        std::env::remove_var("BLAZE_LAUNCH_ENTRY");
+    }
+    // SAFETY: asks whether descriptor 3 is open; changes nothing.
+    if unsafe { libc::fcntl(3, libc::F_GETFD) } == -1 {
+        stop(CANNOT_RUN, "BLAZE_LAUNCH_FD is 3 and descriptor 3 is not open: start the program with `blaze run`");
+    }
+    // SAFETY: descriptor 3 is open (checked above) and is the parent's socket, which nothing
+    // else in this process owns: this is its one owner.
+    let socket = unsafe { OwnedFd::from_raw_fd(3) };
+    let store = store.into_vec();
+    let folder = Folder::new(&store);
+    let why = run_mode::run(socket, &folder, start, blaze_own::SharedAlloc::global());
+    stop(STOPPED, &format!("the program could not start: {why}"))
+}
+
 fn main() {
+    if let Some(fd) = std::env::var_os("BLAZE_LAUNCH_FD") {
+        run_mode(fd);
+    }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(why) => stop(CANNOT_RUN, &format!("this process's own path does not read: {why}")),

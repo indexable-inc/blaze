@@ -88,6 +88,10 @@ mod help;
 mod idle;
 #[expect(unsafe_code, reason = "per-worker slots handed to the worker that owns them: each `unsafe` states why")]
 mod per_worker;
+#[expect(unsafe_code, reason = "a batch's ring written by the tasks that end into it: each `unsafe` states its invariant")]
+mod ring;
+#[expect(unsafe_code, reason = "a running task's name read back from its pointer and length: the `unsafe` states why")]
+mod seat;
 #[expect(unsafe_code, reason = "type-erased tasks shared with the pool's workers: each `unsafe` states its invariant")]
 pub(crate) mod threads;
 #[cfg(all(test, not(blaze_check)))]

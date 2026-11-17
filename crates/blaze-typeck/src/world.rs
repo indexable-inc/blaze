@@ -20,6 +20,9 @@ use crate::hash::{ContentHash, StableHasher};
 use crate::ids::{FloatTy, FnPtrHeader, IntTy, ItemKey, LangItem, List, Mutbl, Name, PathIdx, ScopeId, UintTy};
 use crate::portable::{PTy, PTys};
 
+#[cfg(test)]
+mod read_digest;
+
 /// The proof that a call to a `World` method is made by the recorder. Its field is private to
 /// this module, so nothing else can make one.
 pub struct Seal {
@@ -772,6 +775,13 @@ impl<'a> Hashes<'a> {
             let node = t.node(PTy(n))?;
             self.kids.clear();
             crate::portable::node_children(t, node, &mut self.kids)?;
+            // A future's output and interior are terms too, though conversion does not walk
+            // them (a head never holds a future: infer/facts.rs refuses one): its digest covers
+            // them, by content like every other child.
+            if let crate::portable::PNode::Future(_, o, i) = node {
+                self.kids.push(o.0);
+                self.kids.push(i.0);
+            }
             if !expanded {
                 self.work.push((n, true));
                 for &c in &self.kids {
@@ -782,8 +792,8 @@ impl<'a> Hashes<'a> {
                 }
                 continue;
             }
-            let mut h = StableHasher::new("term");
-            crate::portable::hash_node(&node, &mut h);
+            let mut h = StableHasher::new("term shape");
+            crate::portable::hash_node_shape(&node, &mut h);
             for c in &self.kids {
                 let d = self.memo.get(&(tab, *c)).copied().ok_or(CheckError::Malformed(Malformed::TypeOrder { node: n, child: *c }))?;
                 h.u64(d);
@@ -793,16 +803,18 @@ impl<'a> Hashes<'a> {
         self.memo.get(&(tab, root)).copied().ok_or(CheckError::Malformed(Malformed::TypeOrder { node: root, child: root }))
     }
 
-    /// The read-list digest of a record with a table: the record without its table, then the
-    /// digest of each term its handles reach (a list: its length, then its terms').
+    /// The read-list digest of a record with a table: the record without its table and without
+    /// its handles' numbers (`Tabled::hash_shape`), then the digest of each term its handles
+    /// reach (a list: its length, then its terms'). Content only: two stores holding one head
+    /// give one digest whatever order each interned its terms in.
     fn rooted<T: Tabled>(&mut self, v: &T) -> Result<u64, CheckError> {
-        let mut h = StableHasher::new("answer");
-        v.untabled().hash_into(&mut h);
+        let mut h = StableHasher::new("answer shape");
+        v.hash_shape(&mut h);
         self.roots.clear();
         let mut roots = core::mem::replace(&mut self.roots, Vec::new_in(self.alloc));
         let t = v.parts(&mut roots);
         if let Some(t) = t {
-            let id = (t.nodes.as_ptr() as usize, t.lists.as_ptr() as usize);
+            let id = t.identity();
             let next = self.seen.len() as u32;
             let tab = *self.seen.entry(id).or_insert(next);
             for r in &roots {
@@ -811,7 +823,7 @@ impl<'a> Hashes<'a> {
                     Root::List(l) => {
                         h.u32(l.len);
                         for i in l.range() {
-                            let p = t.lists.get(i).ok_or(CheckError::Malformed(Malformed::TypeOrder { node: i as u32, child: i as u32 }))?;
+                            let p = t.list_slot(i).ok_or(CheckError::Malformed(Malformed::TypeOrder { node: i as u32, child: i as u32 }))?;
                             h.u64(self.term(tab, t, p.0)?);
                         }
                     }
@@ -850,16 +862,47 @@ pub(crate) enum Root {
 pub(crate) trait Tabled: ContentHash {
     /// Pushes the record's handles into its table and returns the table (`None`: no record).
     fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>>;
-    /// The record with an empty table: what is hashed besides the reached terms.
-    fn untabled(&self) -> Self;
+    /// Hashes what is hashed besides the reached terms: the record without its table and
+    /// without its handles' numbers (a handle's place in the table is not content; the term
+    /// it reaches is hashed after, in `parts`' order), with every count that fixes how many
+    /// roots `parts` pushes.
+    fn hash_shape(&self, h: &mut StableHasher);
 }
 
 impl<T: Tabled> Tabled for Option<T> {
     fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
         self.as_ref().and_then(|v| v.parts(roots))
     }
-    fn untabled(&self) -> Self {
-        self.as_ref().map(|v| v.untabled())
+    fn hash_shape(&self, h: &mut StableHasher) {
+        match self {
+            Some(v) => {
+                h.tag(1);
+                v.hash_shape(h);
+            }
+            None => h.tag(0),
+        }
+    }
+}
+
+/// A clause's shape: its kind and keys, never its handles (`Tabled::hash_shape`).
+fn clauses_shape(cs: &[PClause], h: &mut StableHasher) {
+    h.u64(cs.len() as u64);
+    for c in cs {
+        match *c {
+            PClause::Trait { trait_, .. } => {
+                h.tag(0);
+                h.u128(trait_.0);
+            }
+            PClause::Projection { trait_, name, .. } => {
+                h.tag(1);
+                h.u128(trait_.0);
+                h.u64(name.0);
+            }
+            PClause::Const { cond, .. } => {
+                h.tag(2);
+                h.u128(cond.0);
+            }
+        }
     }
 }
 
@@ -881,8 +924,24 @@ impl Tabled for TraitDef<'_> {
         roots.extend(self.assoc_types.iter().filter_map(|a| a.default).map(Root::Ty));
         Some(self.types)
     }
-    fn untabled(&self) -> Self {
-        TraitDef { types: PTys::EMPTY, ..*self }
+    fn hash_shape(&self, h: &mut StableHasher) {
+        h.u32(self.generics);
+        h.u32(self.flags.0);
+        match self.lang {
+            Some(l) => {
+                h.tag(1);
+                l.hash_into(h);
+            }
+            None => h.tag(0),
+        }
+        clauses_shape(self.supertraits, h);
+        h.u64(self.assoc_types.len() as u64);
+        for a in self.assoc_types {
+            h.u64(a.name.0);
+            h.u128(a.item.0);
+            h.tag(u8::from(a.default.is_some()));
+        }
+        self.members.hash_into(h);
     }
 }
 
@@ -891,8 +950,11 @@ impl Tabled for ConstParams<'_> {
         roots.extend(self.params.iter().map(|&(_, p)| Root::Ty(p)));
         Some(self.types)
     }
-    fn untabled(&self) -> Self {
-        ConstParams { types: PTys::EMPTY, ..*self }
+    fn hash_shape(&self, h: &mut StableHasher) {
+        h.u32(self.params.len() as u32);
+        for &(i, _) in self.params {
+            h.u32(i);
+        }
     }
 }
 
@@ -902,8 +964,13 @@ impl Tabled for FnSig<'_> {
         roots.push(Root::Ty(self.output));
         Some(self.types)
     }
-    fn untabled(&self) -> Self {
-        FnSig { types: PTys::EMPTY, ..*self }
+    fn hash_shape(&self, h: &mut StableHasher) {
+        h.u32(self.parent_count);
+        h.u32(self.own_count);
+        h.u32(self.declared_count);
+        h.tag(u8::from(self.self_param));
+        h.tag(self.header.bits());
+        h.u64(self.inputs.len() as u64);
     }
 }
 
@@ -912,8 +979,8 @@ impl Tabled for Predicates<'_> {
         clause_roots(self.clauses, roots);
         Some(self.types)
     }
-    fn untabled(&self) -> Self {
-        Predicates { types: PTys::EMPTY, ..*self }
+    fn hash_shape(&self, h: &mut StableHasher) {
+        clauses_shape(self.clauses, h);
     }
 }
 
@@ -922,8 +989,14 @@ impl Tabled for Adt<'_> {
         roots.extend(self.fields.iter().map(|f| Root::Ty(f.ty)));
         Some(self.types)
     }
-    fn untabled(&self) -> Self {
-        Adt { types: PTys::EMPTY, ..*self }
+    fn hash_shape(&self, h: &mut StableHasher) {
+        h.tag(self.kind as u8);
+        h.u32(self.generics);
+        self.variants.hash_into(h);
+        h.u64(self.fields.len() as u64);
+        for f in self.fields {
+            h.u64(f.name.0);
+        }
     }
 }
 
@@ -934,8 +1007,18 @@ impl Tabled for ImplHeader<'_> {
         roots.extend(self.assoc_types.iter().map(|&(_, p)| Root::Ty(p)));
         Some(self.types)
     }
-    fn untabled(&self) -> Self {
-        ImplHeader { types: PTys::EMPTY, ..*self }
+    fn hash_shape(&self, h: &mut StableHasher) {
+        h.u32(self.generics);
+        self.trait_.hash_into(h);
+        h.u64(self.assoc_types.len() as u64);
+        for (n, _) in self.assoc_types {
+            h.u64(n.0);
+        }
+        h.u32(match self.polarity {
+            ImplPolarity::Positive => 0,
+            ImplPolarity::Negative => 1,
+            ImplPolarity::Reservation => 2,
+        });
     }
 }
 
@@ -944,8 +1027,8 @@ impl Tabled for ClosureFacts<'_> {
         roots.push(Root::Ty(self.sig));
         Some(self.types)
     }
-    fn untabled(&self) -> Self {
-        ClosureFacts { types: PTys::EMPTY, ..*self }
+    fn hash_shape(&self, h: &mut StableHasher) {
+        h.u32(self.kind as u32);
     }
 }
 
@@ -962,8 +1045,8 @@ impl Tabled for Hidden<'_> {
         roots.push(Root::Ty(self.ty));
         Some(self.types)
     }
-    fn untabled(&self) -> Self {
-        Hidden { types: PTys::EMPTY, ..*self }
+    fn hash_shape(&self, _h: &mut StableHasher) {
+        // One handle and its table: all its content is the term `parts` reaches.
     }
 }
 

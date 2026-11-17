@@ -43,6 +43,8 @@ struct BodyBuf {
     strs: Vec<(ExprId, &'static str), Global>,
     /// String literal patterns' texts (`Adts::str_pat`).
     pat_strs: Vec<(PatId, &'static str), Global>,
+    /// Struct patterns' `name: pat` fields (`BodyView::field_pats`).
+    field_pats: Vec<FieldPat, Global>,
 }
 
 impl BodyBuf {
@@ -66,6 +68,7 @@ impl BodyBuf {
             pat_lits: Vec::new_in(Global),
             strs: Vec::new_in(Global),
             pat_strs: Vec::new_in(Global),
+            field_pats: Vec::new_in(Global),
         }
     }
 
@@ -205,7 +208,7 @@ impl BodyBuf {
             stmt_lists: &self.stmt_lists,
             arms: &self.arms,
             field_inits: &self.field_inits,
-            field_pats: &[] as &[FieldPat],
+            field_pats: &self.field_pats,
             paths: &self.paths,
             segments: &self.segments,
             types: self.types.view(),
@@ -239,6 +242,8 @@ struct TestWorld {
     types: PortableTys<'static>,
     /// What [`Adts::panic`] answers (tests/unwind.rs sets `Unwind`).
     panic: crate::Panic,
+    /// What [`Adts::overflow_checks`] answers.
+    overflow: crate::OverflowChecks,
     fns: Vec<Fun, Global>,
     structs: Vec<Struct, Global>,
     /// The fns declared `extern "C"`; every other is of the Rust ABI.
@@ -294,12 +299,16 @@ const DEREF_IMPL: ItemKey = ItemKey(92);
 const INDEX: ItemKey = ItemKey(93);
 const INDEX_OUTPUT: ItemKey = ItemKey(94);
 const INDEX_IMPL: ItemKey = ItemKey(95);
+/// What [`TestAdts`] answers for every `panic_const_*` lang fn (walk/arith_checks.rs).
+const PANIC_CONST: ItemKey = ItemKey(96);
 
 impl TestWorld {
     fn new() -> TestWorld {
         TestWorld {
             types: PortableTys::new_in(Alloc::global()),
             panic: crate::Panic::Abort,
+            // The fixture's bodies were written for wrapping arithmetic (the release setting).
+            overflow: crate::OverflowChecks::Off,
             fns: Vec::new_in(Global),
             structs: Vec::new_in(Global),
             c_abi: Vec::new_in(Global),
@@ -672,6 +681,10 @@ impl Adts for TestAdts<'_> {
         self.world.panic
     }
 
+    fn overflow_checks(&self) -> crate::OverflowChecks {
+        self.world.overflow
+    }
+
     fn static_item(&self, item: ItemKey) -> Option<StaticItem> {
         self.world.statics.iter().find(|(k, _)| *k == item).map(|&(_, s)| s)
     }
@@ -701,6 +714,9 @@ impl Adts for TestAdts<'_> {
         match name {
             "panic_bounds_check" => self.world.bounds,
             "drop_in_place" => self.world.drop_in_place,
+            // The arithmetic checks' entry points (walk/arith_checks.rs): one fn for all; no
+            // test of this world reaches one (tests/arith_panics.rs runs them).
+            n if crate::PanicConst::ALL.iter().any(|p| p.lang() == n) => Some(PANIC_CONST),
             _ => None,
         }
     }
@@ -1904,6 +1920,13 @@ fn transmute_keeps_the_bytes() {
 #[cfg(target_arch = "aarch64")]
 extern "C" fn host_bounds(index: u64, len: u64) {
     panic!("an index out of bounds in emitted code: {index} of {len}");
+}
+
+/// Every `panic_const_*` entry point ([`PANIC_CONST`]) on the host: a failed arithmetic check
+/// in emitted code stops the test.
+#[cfg(target_arch = "aarch64")]
+extern "C" fn host_panic_const() {
+    panic!("an arithmetic check failed in emitted code");
 }
 
 /// `const_eval_select`'s run-time fn on the host: `a * 10 + b`.
@@ -3157,15 +3180,27 @@ fn match_drops(s: Scrut, arms: Arms, temp: bool) -> Result<Vec<i32, Global>, Str
     let k_init = g_lit(&mut b, 9);
     stmts.push(Stmt::Let { pat: k, ty: None, init: Some(k_init), else_: None });
     let root = b.block(&stmts, None);
+    let seen = g_drops(&w, &b, root, [g, n, e])?;
+    if std::env::var_os("BLAZE_TEST_PRINT").is_some() {
+        println!("{s:?} {arms:?} temp={temp}: {seen:?}");
+    }
+    Ok(seen)
+}
+
+/// `main` (body `b` from `root`, in `match_world`'s world `w`) built, and run natively with
+/// the drop glue of `types` (`G`, `N`, `E`): the order the `G`s were dropped in (each `G`'s
+/// `x`). Off aarch64: built only, and nothing seen.
+fn g_drops(w: &TestWorld, b: &BodyBuf, root: ExprId, types: [PNode; 3]) -> Result<Vec<i32, Global>, String> {
     let mut ground = PortableTys::new_in(Alloc::global());
-    let main = build_instance(&w, &b, MAIN, root, &[], &mut ground)?;
+    let main = build_instance(w, b, MAIN, root, &[], &mut ground)?;
     #[cfg(not(target_arch = "aarch64"))]
     {
-        let _ = (main, g, n);
+        let _ = (main, types);
         Ok(Vec::new_in(Global))
     }
     #[cfg(target_arch = "aarch64")]
     {
+        let [g, n, e] = types;
         let text = blaze_lir::print(main.func.view());
         let mut gb = BodyBuf::new();
         let p = gb.bind("to_drop");
@@ -3173,7 +3208,7 @@ fn match_drops(s: Scrut, arms: Arms, temp: bool) -> Result<Vec<i32, Global>, Str
         let groot = gb.block(&[], None);
         let view = gb.view(DROP_IN_PLACE, groot);
         let mut cx = InferCtx::new_in(Alloc::global());
-        let checked = match blaze_typeck::check(&view, &w, &mut cx, &Needs::new_in(Alloc::global()), Alloc::global()) {
+        let checked = match blaze_typeck::check(&view, w, &mut cx, &Needs::new_in(Alloc::global()), Alloc::global()) {
             Ok(Outcome::Done(c)) => c,
             other => panic!("the check did not finish: {:?}", other.err()),
         };
@@ -3182,7 +3217,7 @@ fn match_drops(s: Scrut, arms: Arms, temp: bool) -> Result<Vec<i32, Global>, Str
             let ty = ground.intern(t).expect("intern");
             let args = ground.intern_list(&[ty]).expect("intern");
             let mut subst = Subst { args: &[ty], ground: &mut ground, scratch: Alloc::global() };
-            let built = crate::build_drop_glue(&view, &checked, &sig, &mut subst, &TestAdts { world: &w, body: &gb }, Global)
+            let built = crate::build_drop_glue(&view, &checked, &sig, &mut subst, &TestAdts { world: w, body: &gb }, Global)
                 .unwrap_or_else(|e| panic!("{e}"));
             (args, built)
         };
@@ -3201,7 +3236,7 @@ fn match_drops(s: Scrut, arms: Arms, temp: bool) -> Result<Vec<i32, Global>, Str
         );
         let seen = DROPPED.with(|d| d.borrow().clone());
         if std::env::var_os("BLAZE_TEST_PRINT").is_some() {
-            println!("{s:?} {arms:?} temp={temp}: {seen:?}\n{text}");
+            println!("{seen:?}\n{text}");
         }
         Ok(seen)
     }
@@ -3316,7 +3351,7 @@ fn a_match_by_value_refuses_drop_impl_enums_and_wide_enums() {
 }
 
 /// What the by-value match does not build is refused by name: a move below a field (`W(P(s),
-/// _)`), a guard on a moving arm, and a temporary scrutinee inside a larger expression.
+/// _)`) and a guard on a moving arm.
 #[test]
 fn a_match_by_value_refuses_what_it_does_not_build() {
     // CHANGED ON PURPOSE (walk/moves.rs): `W(P(s), _)` was refused ("a binding by value of a
@@ -3334,30 +3369,8 @@ fn a_match_by_value_refuses_what_it_does_not_build() {
     let _ = (deep, deep_temp);
     let guard = match_drops(Scrut::A, Arms::Guard, false).expect_err("a guard on a moving arm is refused");
     assert!(guard.contains("a guard on an arm that moves out of its scrutinee"), "{guard}");
-
-    // `let v = (match A(G{1}, G{2}) { A(a, _) => 1, _ => 2 }) + 1;`
-    let mut w = TestWorld::new();
-    match_world(&mut w);
-    let mut b = BodyBuf::new();
-    let value = scrut_value(&mut b, Scrut::A);
-    let (a, w0) = (b.bind("a"), b.pat(Pat::Wild));
-    let pa = variant_pat(&mut b, "A", &[a, w0]);
-    let w1 = b.pat(Pat::Wild);
-    let (one, two) = (b.int(1, None), b.int(2, None));
-    let start = b.arms.len() as u32;
-    b.arms.push(Arm { pat: pa, guard: None, body: one });
-    b.arms.push(Arm { pat: w1, guard: None, body: two });
-    let m = b.e(Expr::Match { scrutinee: value, arms: List { start, len: 2 } });
-    let paren = b.e(Expr::Paren(m));
-    let k = b.int(1, None);
-    let sum = b.bin(BinOp::Add, paren, k);
-    let v = b.bind("v");
-    let root = b.block(&[Stmt::Let { pat: v, ty: None, init: Some(sum), else_: None }], None);
-    let mut ground = PortableTys::new_in(Alloc::global());
-    let Err(inner) = build_instance(&w, &b, MAIN, root, &[], &mut ground) else {
-        panic!("a temporary inside an expression is refused")
-    };
-    assert!(inner.contains("inside a larger expression"), "{inner}");
+    // CHANGED ON PURPOSE (2026-11-16): a temporary scrutinee inside a larger expression was
+    // refused here ("inside a larger expression") and is now built: tests/temp_drops.rs.
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -3374,13 +3387,22 @@ mod matches;
 mod guards;
 #[cfg(target_arch = "aarch64")]
 mod operators;
+#[cfg(target_arch = "aarch64")]
+mod arith_panics;
 mod moves;
+mod moves_places;
 mod unwind;
 #[cfg(target_arch = "aarch64")]
 mod temps;
 #[cfg(target_arch = "aarch64")]
 mod zst_drops;
+#[cfg(target_arch = "aarch64")]
+mod temp_drops;
+#[cfg(target_arch = "aarch64")]
+mod discard;
 mod lets;
+#[cfg(target_arch = "aarch64")]
+mod irrefutable;
 mod wide;
 mod index;
 mod fmt;

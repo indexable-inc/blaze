@@ -89,7 +89,7 @@ fn datagrams(seed: u64, plant: Option<Plant>, saw: &mut Saw) -> Result<(), Strin
     drive(&mut sim, &mut effects, |_, Completion { tag, done }, effects| {
         let mut fail = |why: String| _ = broke.get_or_insert(format!("seed {seed}: {why}"));
         match (tag, done) {
-            (Tag(n @ (1 | 2)), Done::Bound { sock, local }) => {
+            (Tag(n @ (1 | 2)), Done::Bound { sock, local, .. }) => {
                 bound[n as usize - 1] = Some((sock, local));
                 if let [Some(_), Some((to, at))] = bound {
                     let (from, _) = bound[0].expect("both bound");
@@ -181,7 +181,7 @@ fn a_datagram_too_long_or_to_a_socket_not_bound_is_refused_naming_it() {
     let options = Options::default();
     let mut effects = vec![Effect::Bind { at, options, tag: Tag(1) }];
     run_until_idle(&mut sim, &mut effects, |done, _| answers.push(done)).unwrap();
-    let Done::Bound { sock, local } = answers.pop().unwrap().done else { panic!("not bound") };
+    let Done::Bound { sock, local, .. } = answers.pop().unwrap().done else { panic!("not bound") };
     assert_eq!(local, at);
     let mut long = Batch::new();
     long.push(at, Ecn::NotEct, &vec![0; DATAGRAM_MOST + 1]);
@@ -605,7 +605,7 @@ fn a_black_hole_drops_every_datagram_and_codepoints_cross() {
     let bound: Vec<(Dgram, SocketAddr)> = answers
         .drain(..)
         .map(|it| match it.done {
-            Done::Bound { sock, local } => (sock, local),
+            Done::Bound { sock, local, .. } => (sock, local),
             done => panic!("bound with {done:?}"),
         })
         .collect();

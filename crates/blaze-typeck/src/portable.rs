@@ -85,20 +85,106 @@ pub enum PNode {
     ExAuto(ItemKey),
 }
 
-/// A borrowed portable table.
+/// A borrowed portable table: a base (the shared table as it stood, read in place) and the
+/// nodes and list entries after it (a body's own, numbered on from the base's lengths; empty
+/// for a table read whole). One numbering over both: `PTy(i)` below the base's length is the
+/// base's node `i`, from it up the own node `i - base`; a list lies wholly in one part. The
+/// parts are private, so no reader can take the base for the whole table.
 #[derive(Clone, Copy, Debug)]
 pub struct PTys<'a> {
-    pub nodes: &'a [PNode],
-    pub lists: &'a [PTy],
+    nodes: &'a [PNode],
+    lists: &'a [PTy],
+    own_nodes: &'a [PNode],
+    own_lists: &'a [PTy],
 }
 
 impl<'a> PTys<'a> {
     /// The empty table.
-    pub const EMPTY: PTys<'static> = PTys { nodes: &[], lists: &[] };
+    pub const EMPTY: PTys<'static> = PTys { nodes: &[], lists: &[], own_nodes: &[], own_lists: &[] };
+
+    /// A table held in two columns, nodes and list entries.
+    pub const fn flat(nodes: &'a [PNode], lists: &'a [PTy]) -> PTys<'a> {
+        PTys { nodes, lists, own_nodes: &[], own_lists: &[] }
+    }
+
+    /// The base `base` with `own_nodes` and `own_lists` numbered on after it.
+    pub(crate) const fn overlay(base: PTys<'a>, own_nodes: &'a [PNode], own_lists: &'a [PTy]) -> PTys<'a> {
+        PTys { nodes: base.nodes, lists: base.lists, own_nodes, own_lists }
+    }
+
+    /// The node of `t`, borrowed; `None` past the table.
+    #[inline]
+    pub fn get(&self, t: PTy) -> Option<&'a PNode> {
+        let i = t.0 as usize;
+        match i.checked_sub(self.nodes.len()) {
+            None => self.nodes.get(i),
+            Some(own) => self.own_nodes.get(own),
+        }
+    }
+
+    /// The number of nodes.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.nodes.len() + self.own_nodes.len()
+    }
+
+    /// Whether the table has no node.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The number of nodes in the base (the first own node's index).
+    pub fn base_len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Every node, in index order (`PTy(0)` first).
+    pub fn nodes(&self) -> impl Iterator<Item = &'a PNode> + Clone + 'a {
+        self.nodes.iter().chain(self.own_nodes.iter())
+    }
+
+    /// Every list entry, in the list column's order.
+    pub fn lists(&self) -> impl Iterator<Item = &'a PTy> + Clone + 'a {
+        self.lists.iter().chain(self.own_lists.iter())
+    }
+
+    /// The number of list entries (the list column's length).
+    pub fn lists_len(&self) -> usize {
+        self.lists.len() + self.own_lists.len()
+    }
+
+    /// The list entry at `i` of the list column; `None` past it.
+    #[inline]
+    pub fn list_slot(&self, i: usize) -> Option<PTy> {
+        match i.checked_sub(self.lists.len()) {
+            None => self.lists.get(i).copied(),
+            Some(own) => self.own_lists.get(own).copied(),
+        }
+    }
+
+    /// The list entries in `r`; `None` when `r` is not within one part of the column (a list
+    /// never straddles the base's end).
+    pub fn list_at(&self, r: core::ops::Range<usize>) -> Option<&'a [PTy]> {
+        let base = self.lists.len();
+        if r.end <= base {
+            self.lists.get(r)
+        } else if r.start >= base {
+            self.own_lists.get(r.start - base..r.end - base)
+        } else {
+            None
+        }
+    }
+
+    /// The table's identity while it is borrowed: two views of one table are one identity. For
+    /// a memo only; never part of a key, a record or an output. Two overlays of one base
+    /// differ in their own parts' addresses (an empty own part has nothing to tell apart).
+    pub fn identity(&self) -> (usize, usize) {
+        (self.nodes.as_ptr() as usize, self.own_nodes.as_ptr() as usize)
+    }
 
     /// The node of `t`.
     pub fn node(&self, t: PTy) -> Result<PNode, CheckError> {
-        match self.nodes.get(t.0 as usize) {
+        match self.get(t) {
             Some(n) => Ok(*n),
             None => Err(CheckError::Malformed(Malformed::TypeOrder { node: t.0, child: t.0 })),
         }
@@ -107,7 +193,7 @@ impl<'a> PTys<'a> {
     /// The value of the const term `t` when it is a `ConstValue` that fits in a `u64` (an array
     /// length once its item is instantiated); `None` for a parameter, a hole or anything else.
     pub fn value_u64(&self, t: PTy) -> Option<u64> {
-        match self.nodes.get(t.0 as usize)? {
+        match self.get(t)? {
             PNode::ConstValue { bits, .. } => u64::try_from(*bits).ok(),
             _ => None,
         }
@@ -115,7 +201,7 @@ impl<'a> PTys<'a> {
 
     /// The children of a list.
     pub fn list(&self, l: List) -> Result<&'a [PTy], CheckError> {
-        match self.lists.get(l.range()) {
+        match self.list_at(l.range()) {
             Some(s) => Ok(s),
             None => Err(CheckError::Malformed(Malformed::List {
                 column: "types.lists",
@@ -126,14 +212,15 @@ impl<'a> PTys<'a> {
     }
 }
 
+/// Hashed as one table (base then own), so an overlay hashes as the copy it stands for.
 impl ContentHash for PTys<'_> {
     fn hash_into(&self, h: &mut StableHasher) {
-        h.u64(self.nodes.len() as u64);
-        for n in self.nodes {
+        h.u64(self.len() as u64);
+        for n in self.nodes() {
             hash_node(n, h);
         }
-        h.u64(self.lists.len() as u64);
-        for t in self.lists {
+        h.u64(self.lists_len() as u64);
+        for t in self.lists() {
             h.u32(t.0);
         }
     }
@@ -156,7 +243,7 @@ fn hash_list(l: List, h: &mut StableHasher) {
 pub(crate) fn node_children(t: PTys<'_>, n: PNode, out: &mut blaze_own::Vec<u32, blaze_own::Alloc<'_>>) -> Result<(), CheckError> {
     let mut list = |l: List, out: &mut blaze_own::Vec<u32, blaze_own::Alloc<'_>>| -> Result<(), CheckError> {
         for i in l.range() {
-            let p = t.lists.get(i).ok_or(CheckError::Malformed(Malformed::TypeOrder { node: i as u32, child: i as u32 }))?;
+            let p = t.list_slot(i).ok_or(CheckError::Malformed(Malformed::TypeOrder { node: i as u32, child: i as u32 }))?;
             out.push(p.0);
         }
         Ok(())
@@ -328,10 +415,55 @@ pub(crate) fn hash_node(n: &PNode, h: &mut StableHasher) {
     }
 }
 
+/// The content of one node WITHOUT where its children sit in its table: every handle to a
+/// term is `PTy(0)` and every list starts at 0 (its length kept), so two tables that interned
+/// the same terms in different orders give one hash. The children's own digests are hashed
+/// after it, in [`node_children`]'s order (world.rs `Hashes::term`). A read-list digest takes
+/// this form, never [`hash_node`]'s: a store's table numbers terms in the order its run met
+/// them, which is not content (the `front2_records` test's body 1, 2026-11-16: `Box::leak`'s
+/// signature equal over records and over solved names, its input at `PTy(478)` in one store
+/// and `PTy(486)` in the other).
+pub(crate) fn hash_node_shape(n: &PNode, h: &mut StableHasher) {
+    let p = PTy(0);
+    let l = |l: List| List { start: 0, len: l.len };
+    let shape = match *n {
+        PNode::Tuple(x) => PNode::Tuple(l(x)),
+        PNode::Ref(m, _) => PNode::Ref(m, p),
+        PNode::Ptr(m, _) => PNode::Ptr(m, p),
+        PNode::Array(..) => PNode::Array(p, p),
+        PNode::Slice(_) => PNode::Slice(p),
+        PNode::Pat(_, x) => PNode::Pat(p, l(x)),
+        PNode::Adt(k, x) => PNode::Adt(k, l(x)),
+        PNode::FnDef(k, x) => PNode::FnDef(k, l(x)),
+        PNode::FnPtr(x, hdr) => PNode::FnPtr(l(x), hdr),
+        PNode::Closure { owner, ordinal, args } => PNode::Closure { owner, ordinal, args: l(args) },
+        PNode::Future(e, ..) => PNode::Future(e, p, p),
+        PNode::Alias { trait_, name, args } => PNode::Alias { trait_, name, args: l(args) },
+        PNode::Opaque(k, x) => PNode::Opaque(k, l(x)),
+        PNode::ConstValue { bits, .. } => PNode::ConstValue { ty: p, bits },
+        PNode::Dynamic(x) => PNode::Dynamic(l(x)),
+        PNode::ExTrait(k, x) => PNode::ExTrait(k, l(x)),
+        PNode::ExProj { trait_, name, args, .. } => PNode::ExProj { trait_, name, args: l(args), term: p },
+        leaf @ (PNode::Bool
+        | PNode::Char
+        | PNode::Int(_)
+        | PNode::Uint(_)
+        | PNode::Float(_)
+        | PNode::Str
+        | PNode::Never
+        | PNode::Param(_)
+        | PNode::Infer
+        | PNode::Error
+        | PNode::ConstParam(_)
+        | PNode::ExAuto(_)) => leaf,
+    };
+    hash_node(&shape, h);
+}
+
 /// A trait object's impl-lookup shape key: its principal trait, from its rows `l` of `t`
 /// (`None`: auto traits only, or a list past the table).
 pub fn object_principal(t: PTys<'_>, l: List) -> Option<ItemKey> {
-    match t.nodes.get(t.lists.get(l.range())?.first()?.0 as usize)? {
+    match t.get(*t.list(l).ok()?.first()?)? {
         PNode::ExTrait(k, _) => Some(*k),
         _ => None,
     }
@@ -413,19 +545,42 @@ pub fn canonical_ranges(
 /// An owned portable table, hash-consed: equal structure is an equal `PTy`, and an equal list
 /// is an equal `List`, so the table's bytes depend on structure and the order of first use
 /// only (rule 25).
+///
+/// A body's table is an OVERLAY ([`PortableTys::over`]): the shared table, borrowed and read in
+/// place, then the body's own nodes and lists numbered on after it. Making one copies nothing;
+/// interning looks in the shared table's index first, then the overlay's own. The borrow keeps
+/// the shared table unchanged while the overlay lives, and what the body keeps after it is only
+/// its own part ([`PortableTys::keep_in`], [`OwnTys`]), so a body-only type never enters a
+/// table a record is answered from (`Malformed::BodyTypeInRecord`), and a body's ids and bytes
+/// depend only on the shared table as it stood when the body began.
 pub struct PortableTys<'a> {
+    /// The shared table this one extends (an overlay); `None`: a table of its own.
+    base: Option<&'a PortableTys<'a>>,
+    /// The own nodes: node `i` is `PTy(base nodes + i)`.
     nodes: Vec<PNode, Alloc<'a>>,
+    /// The own list entries: entry `i` is at `base list entries + i` of the list column.
     lists: Vec<PTy, Alloc<'a>>,
+    /// Own nodes by content, to their own index (`i`, not the `PTy`).
     node_index: HashMap<PNode, u32, Alloc<'a>>,
     list_index: ListIndex<'a>,
-    /// Per interned list, in the order interned: where it is in `lists`.
+    /// Per own interned list, in the order interned: where it is in the whole list column.
     list_rows: Vec<List, Alloc<'a>>,
 }
+
+/// `&PortableTys<'long>` is a `&PortableTys<'short>`: an overlay borrows a longer-lived shared
+/// table at the overlay's own lifetime. Fails to compile if the table stops being covariant.
+const _: fn() = || {
+    fn covariant<'s>(t: &'s PortableTys<'static>) -> &'s PortableTys<'s> {
+        t
+    }
+    let _ = covariant;
+};
 
 impl<'a> PortableTys<'a> {
     /// An empty table.
     pub fn new_in(alloc: Alloc<'a>) -> PortableTys<'a> {
         PortableTys {
+            base: None,
             nodes: Vec::new_in(alloc),
             lists: Vec::new_in(alloc),
             node_index: HashMap::new_in(alloc),
@@ -434,20 +589,63 @@ impl<'a> PortableTys<'a> {
         }
     }
 
+    /// A body's table: `base` read in place, its own types in `alloc` after it. O(1): nothing
+    /// of `base` is copied or hashed. `base` must be a table of its own (one level of overlay).
+    pub fn over(base: &'a PortableTys<'a>, alloc: Alloc<'a>) -> Result<PortableTys<'a>, CheckError> {
+        if base.base.is_some() {
+            let n = u32::try_from(base.len()).unwrap_or(u32::MAX);
+            return Err(CheckError::Malformed(Malformed::Overlay { base: n, have: n }));
+        }
+        let mut t = PortableTys::new_in(alloc);
+        t.base = Some(base);
+        Ok(t)
+    }
+
+    /// The base's node and list-entry counts (0, 0 for a table of its own).
+    fn base_lens(&self) -> (usize, usize) {
+        match self.base {
+            Some(b) => (b.nodes.len(), b.lists.len()),
+            None => (0, 0),
+        }
+    }
+
     /// The table, borrowed.
     pub fn view(&self) -> PTys<'_> {
-        PTys { nodes: &self.nodes, lists: &self.lists }
+        match self.base {
+            Some(b) => PTys::overlay(b.view(), &self.nodes, &self.lists),
+            None => PTys::flat(&self.nodes, &self.lists),
+        }
+    }
+
+    /// The own part (the whole table when it has no base) copied into `alloc`, with the base's
+    /// lengths: what a body keeps once its table's borrow of the shared table ends. The index
+    /// is not kept: a kept table is read, never interned into.
+    pub fn keep_in<'k>(&self, alloc: Alloc<'k>) -> Result<OwnTys<'k>, CheckError> {
+        let (bn, bl) = self.base_lens();
+        let limit = |_| CheckError::Limit(crate::error::Limit::Table);
+        let mut nodes = Vec::with_capacity_in(self.nodes.len(), alloc);
+        nodes.extend_from_slice(&self.nodes);
+        let mut lists = Vec::with_capacity_in(self.lists.len(), alloc);
+        lists.extend_from_slice(&self.lists);
+        Ok(OwnTys { base_nodes: u32::try_from(bn).map_err(limit)?, base_lists: u32::try_from(bl).map_err(limit)?, nodes, lists })
     }
 
     /// The node `n`, interned. Its children must already be in the table.
     pub fn intern(&mut self, n: PNode) -> Result<PTy, CheckError> {
-        if let Some(&found) = self.node_index.get(&n) {
+        if let Some(b) = self.base
+            && let Some(&found) = b.node_index.get(&n)
+        {
             return Ok(PTy(found));
         }
-        let at = u32::try_from(self.nodes.len())
+        let (base, _) = self.base_lens();
+        if let Some(&found) = self.node_index.get(&n) {
+            return Ok(PTy(found + base as u32));
+        }
+        let own = u32::try_from(self.nodes.len()).map_err(|_| CheckError::Limit(crate::error::Limit::Table))?;
+        let at = u32::try_from(base + self.nodes.len())
             .map_err(|_| CheckError::Limit(crate::error::Limit::Table))?;
         self.nodes.push(n);
-        self.node_index.insert(n, at);
+        self.node_index.insert(n, own);
         Ok(PTy(at))
     }
 
@@ -564,11 +762,19 @@ impl<'a> PortableTys<'a> {
             h.u32(t.0);
         }
         let hash = h.finish();
+        if let Some(b) = self.base {
+            let (lists, rows) = (&b.lists, &b.list_rows);
+            if let Some(found) = b.list_index.find(hash, |id| lists.get(rows[id as usize].range()) == Some(tys)) {
+                return Ok(b.list_rows[found as usize]);
+            }
+        }
+        let (_, base) = self.base_lens();
         let (lists, rows) = (&self.lists, &self.list_rows);
-        if let Some(found) = self.list_index.find(hash, |id| lists.get(rows[id as usize].range()) == Some(tys)) {
+        let own_range = |l: List| l.start as usize - base..l.start as usize - base + l.len as usize;
+        if let Some(found) = self.list_index.find(hash, |id| lists.get(own_range(rows[id as usize])) == Some(tys)) {
             return Ok(self.list_rows[found as usize]);
         }
-        let start = u32::try_from(self.lists.len())
+        let start = u32::try_from(base + self.lists.len())
             .map_err(|_| CheckError::Limit(crate::error::Limit::Table))?;
         let len = u32::try_from(tys.len()).map_err(|_| CheckError::Limit(crate::error::Limit::Table))?;
         self.list_index.push(hash)?;
@@ -578,22 +784,23 @@ impl<'a> PortableTys<'a> {
         Ok(list)
     }
 
-    /// The number of nodes.
+    /// The number of nodes (the base's and the own).
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.base_lens().0 + self.nodes.len()
     }
 
-    /// A copy of the table in `alloc`: every node and list at the same index, so a type of
-    /// this table is the same type of the copy. A body's lowering extends a copy of the
-    /// records' table, so what only a body has (a closure, a future, a hole) is never in a
-    /// table a record is answered from (`Malformed::BodyTypeInRecord`).
+    /// A copy of the whole table (base and own) in `alloc`, as a table of its own: every node
+    /// and list at the same index, so a type of this table is the same type of the copy. The
+    /// back half's one table starts as a copy of the records' table (program.rs), once.
     pub fn fork_in<'b>(&self, alloc: Alloc<'b>) -> Result<PortableTys<'b>, CheckError> {
         let mut out = PortableTys::new_in(alloc);
-        for &n in &self.nodes {
+        for &n in self.view().nodes() {
             out.intern(n)?;
         }
-        for &l in &self.list_rows {
-            out.intern_list(&self.lists[l.range()])?;
+        let view = self.view();
+        let base_rows = self.base.map_or(&[][..], |b| &b.list_rows[..]);
+        for &l in base_rows.iter().chain(self.list_rows.iter()) {
+            out.intern_list(view.list(l)?)?;
         }
         Ok(out)
     }
@@ -601,7 +808,8 @@ impl<'a> PortableTys<'a> {
 
 impl<'a> PartialEq for PortableTys<'a> {
     fn eq(&self, other: &PortableTys<'a>) -> bool {
-        self.nodes == other.nodes && self.lists == other.lists
+        let (a, b) = (self.view(), other.view());
+        a.len() == b.len() && a.lists_len() == b.lists_len() && a.nodes().eq(b.nodes()) && a.lists().eq(b.lists())
     }
 }
 
@@ -609,9 +817,64 @@ impl<'a> Eq for PortableTys<'a> {}
 
 impl<'a> core::fmt::Debug for PortableTys<'a> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let (bn, bl) = self.base_lens();
         f.debug_struct("PortableTys")
+            .field("base_nodes", &bn)
+            .field("base_lists", &bl)
             .field("nodes", &&self.nodes[..])
             .field("lists", &&self.lists[..])
             .finish()
+    }
+}
+
+/// What a body keeps of its table once the borrow of the shared table ends: its own nodes and
+/// list entries, and how long the shared table was when the body began. Read with the shared
+/// table passed again ([`OwnTys::view`]); the shared table only grows, so its first
+/// `base_nodes` nodes still mean what they meant, and the ids it gained since are never read
+/// through this body (its own ids occupy that range).
+pub struct OwnTys<'a> {
+    base_nodes: u32,
+    base_lists: u32,
+    nodes: Vec<PNode, Alloc<'a>>,
+    lists: Vec<PTy, Alloc<'a>>,
+}
+
+impl<'a> OwnTys<'a> {
+    /// No types: a body whose types went into another table (`lower_again`).
+    pub fn none(alloc: Alloc<'a>) -> OwnTys<'a> {
+        OwnTys { base_nodes: 0, base_lists: 0, nodes: Vec::new_in(alloc), lists: Vec::new_in(alloc) }
+    }
+
+    /// The number of own nodes.
+    pub fn own_len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// The body's table: `base`'s first nodes and list entries as they were when the body
+    /// began, then the body's own. Refused (`Malformed::Overlay`) when `base` is shorter than
+    /// that or is itself an overlay.
+    pub fn view<'s>(&'s self, base: &'s PortableTys<'_>) -> Result<PTys<'s>, CheckError> {
+        self.view_over(base, true)
+    }
+
+    /// The planted bug of the overlay test: the base read at its CURRENT length, so an id the
+    /// shared table gained after the body began shadows the body's own type at that id.
+    #[cfg(test)]
+    pub(crate) fn view_untruncated<'s>(&'s self, base: &'s PortableTys<'_>) -> Result<PTys<'s>, CheckError> {
+        self.view_over(base, false)
+    }
+
+    fn view_over<'s>(&'s self, base: &'s PortableTys<'_>, truncate: bool) -> Result<PTys<'s>, CheckError> {
+        let have = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        if base.base.is_some() {
+            return Err(CheckError::Malformed(Malformed::Overlay { base: self.base_nodes, have: have(base.len()) }));
+        }
+        let (bn, bl) = (self.base_nodes as usize, self.base_lists as usize);
+        let (Some(nodes), Some(lists)) = (base.nodes.get(..bn), base.lists.get(..bl)) else {
+            let (want, got) = if base.nodes.len() < bn { (self.base_nodes, base.nodes.len()) } else { (self.base_lists, base.lists.len()) };
+            return Err(CheckError::Malformed(Malformed::Overlay { base: want, have: have(got) }));
+        };
+        let (nodes, lists) = if truncate { (nodes, lists) } else { (&base.nodes[..], &base.lists[..]) };
+        Ok(PTys::overlay(PTys::flat(nodes, lists), &self.nodes, &self.lists))
     }
 }

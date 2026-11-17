@@ -64,6 +64,12 @@ pub enum ProcsOp {
     List,
     Signal,
     Inspect,
+    /// Starting a linked child ([`Spawner::start_linked`]).
+    StartLinked,
+    /// Waiting for a linked child ([`Linked::wait_until`]).
+    WaitLinked,
+    /// Killing a linked child's group ([`Linked::kill_group`]).
+    KillGroup,
 }
 
 /// A call on other processes that failed: the call, the process (none for a list) and how.
@@ -164,3 +170,9 @@ impl fmt::Debug for Procs {
         write!(f, "Procs({:?})", self.allowed)
     }
 }
+
+// Children started linked to this process (test zygote, run parent): a native world's only.
+#[cfg(unix)]
+mod linked;
+#[cfg(unix)]
+pub use self::linked::{BorrowedFd, Ended, Linked, LinkedSpec, Spawner};

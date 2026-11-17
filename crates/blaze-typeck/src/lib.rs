@@ -26,6 +26,7 @@ mod diag;
 /// Dyn compatibility: the rule's one home (facts in, verdict out).
 pub mod dyn_compat;
 mod error;
+mod filed;
 mod hash;
 mod ids;
 /// The real type context over blaze-ty and blaze-solve.
@@ -42,6 +43,8 @@ mod world;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod overlay_tests;
 #[cfg(test)]
 mod suite;
 /// A world and bodies written by hand, for the body suite and `examples/cost.rs`.
@@ -66,12 +69,13 @@ pub use diag::{Because, Diag, DiagCode, UnmetGoal};
 /// The fix offered for a name that does not resolve: `Checked::suggests` and `suggest::pick`.
 pub use rules::suggest;
 pub use error::{CheckError, Limit, Malformed, Recorded, Stop};
+pub use filed::Filed;
 pub use hash::{ContentHash, StableHasher};
 pub use ids::{
     Abi, Edition, ExprId, FloatTy, FnPtrHeader, IntTy, ItemKey, LangItem, List, Mutbl, Name, PatId, PathIdx, Range,
     Safety, ScopeId, StmtId, UintTy,
 };
-pub use portable::{MAX_OBJECT_PREDS, MAX_PATTERN_RANGES, PNode, PTy, PTys, PortableTys, canonical_ranges, object_principal};
+pub use portable::{MAX_OBJECT_PREDS, MAX_PATTERN_RANGES, OwnTys, PNode, PTy, PTys, PortableTys, canonical_ranges, object_principal};
 pub use ty::{Cause, ClosureKind, FulfillError, FulfillErrorKind, Goal, Obligation, Ty, TyList, TyView, TypeCtx, Var, VarKind};
 pub use world::{
     Adt, AdtKind, ArgsAfterSelf, SplitSelf, AssocGenerics, AssocItem, AssocKind, AssocParent, AssocTyDef, ClosureFacts, ConstHolds, ConstParams, CtorKind, Def, Fetch, Field, FnSig,

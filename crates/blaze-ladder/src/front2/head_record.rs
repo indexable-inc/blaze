@@ -55,7 +55,8 @@ type Mem = Alloc<'static>;
 
 const MAGIC: [u8; 4] = *b"BZHD";
 /// Raised on any change of the form: an old record is then [`HeadRecordError::Version`].
-pub const VERSION: u32 = 1;
+/// 2: an impl's record holds one `self` flag per fn (`ImplHead::fn_self`, brief 14).
+pub const VERSION: u32 = 2;
 /// The digest domains: the record's out digest and a fn text's check.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -572,6 +573,10 @@ pub fn encode<'b>(head: HeadRef<'_, '_>, tys: PTys<'_>, alloc: Alloc<'b>) -> Res
             o.list(head.trait_args.list(), "an impl's trait arguments")?;
             o.named_tys(&head.assoc, "an impl's associated types")?;
             o.named_keys(&head.fns, "an impl's fns")?;
+            o.count(head.fn_self.len(), "an impl's fn `self` flags")?;
+            for &s in head.fn_self.iter() {
+                o.byte(u8::from(s));
+            }
             o.named_keys(&head.consts, "an impl's constants")?;
             o.byte(match head.polarity {
                 tc::ImplPolarity::Positive => 0,
@@ -1663,6 +1668,11 @@ impl<'r> In<'r, '_, '_> {
         };
         let assoc = self.named_tys("an impl's associated types")?;
         let fns = self.named_keys("an impl's fns")?;
+        let fn_self = self.many("an impl's fn `self` flags", |r| match r.u8("an impl's fn `self` flag")? {
+            0 => Ok(false),
+            1 => Ok(true),
+            byte => Err(E::Byte { what: "an impl's fn `self` flag", byte }),
+        })?;
         let consts = self.named_keys("an impl's constants")?;
         let polarity = match self.u8("an impl's polarity")? {
             0 => tc::ImplPolarity::Positive,
@@ -1671,7 +1681,10 @@ impl<'r> In<'r, '_, '_> {
             byte => return Err(E::Byte { what: "an impl's polarity", byte }),
         };
         let preds = self.opt("an impl's where-clauses", |r| r.preds())?;
-        let head = ImplHead { generics, self_ty, trait_, trait_args, assoc, fns, consts, polarity };
+        let head = ImplHead { generics, self_ty, trait_, trait_args, assoc, fns, fn_self, consts, polarity };
+        if head.fn_self.len() != head.fns.len() {
+            return Err(E::Shape { what: "an impl's fn `self` flags are not one per fn" });
+        }
         Ok(Head::Impl { key, head, preds })
     }
 }
@@ -1868,7 +1881,7 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(h1.self_ty == h2.self_ty, "an impl's self type");
             need!(h1.trait_ == h2.trait_ && l(h1.trait_args.list(), h2.trait_args.list()), "an impl's trait");
             need!(h1.assoc[..] == h2.assoc[..], "an impl's associated types");
-            need!(h1.fns[..] == h2.fns[..] && h1.consts[..] == h2.consts[..], "an impl's members");
+            need!(h1.fns[..] == h2.fns[..] && h1.fn_self[..] == h2.fn_self[..] && h1.consts[..] == h2.consts[..], "an impl's members");
             need!(h1.polarity == h2.polarity, "an impl's polarity");
             need!(preds(p1, p2), "an impl's where-clauses");
             None

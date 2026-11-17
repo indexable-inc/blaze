@@ -28,6 +28,7 @@ use crate::search::{
     Broke, Config, Ended, Failed, Failure, Given, GivenError, Next, Origin, Passed, SEED, SEEDS,
     Search, TAPE, Verdict,
 };
+use crate::observe;
 use crate::tape::{Record, Tail, Tape};
 use crate::text;
 
@@ -223,12 +224,29 @@ pub(crate) fn search_planted<O: Outcome>(
     drive(Search::planted(config, plant), body)
 }
 
+/// `search`, also giving back the search that ran, which holds what its passing cases drew
+/// (`Search::tally`, observe.rs). Reads nothing from outside.
+pub(crate) fn search_observing<O: Outcome>(
+    config: Config,
+    body: impl FnMut(&Tape) -> O,
+) -> (Verdict, Search) {
+    drive_observing(Search::new(config), body)
+}
+
 /// Runs `search`'s proposals on one tape and one record, kept across cases.
+fn drive<O: Outcome>(search: Search, body: impl FnMut(&Tape) -> O) -> Verdict {
+    drive_observing(search, body).0
+}
+
+/// `drive`, giving back the search with its verdict.
 #[expect(
     blaze::std_use,
     reason = "the hook hands a body's panic to its search through this thread's kept panic: emptied before each run, taken after it"
 )]
-fn drive<O: Outcome>(mut search: Search, mut body: impl FnMut(&Tape) -> O) -> Verdict {
+fn drive_observing<O: Outcome>(
+    mut search: Search,
+    mut body: impl FnMut(&Tape) -> O,
+) -> (Verdict, Search) {
     install_hook();
     let _inside = Inside::enter();
     let tape = Tape::new(&[], Tail::Calm, search.most_choices());
@@ -244,7 +262,10 @@ fn drive<O: Outcome>(mut search: Search, mut body: impl FnMut(&Tape) -> O) -> Ve
                 | Verdict::AllDiscarded { .. }
                 | Verdict::Unreached { .. }
                 | Verdict::Misfit { .. }),
-            ) => return verdict.clone(),
+            ) => {
+                let verdict = verdict.clone();
+                return (verdict, search);
+            }
             Next::Run(proposal) => proposal,
         };
         tape.reset(proposal.prefix, proposal.tail);
@@ -690,7 +711,10 @@ pub fn check<O: Outcome>(config: Config, body: impl FnMut(&Tape) -> O) {
 #[track_caller]
 pub fn check_given<O: Outcome>(config: Config, given: Given, body: impl FnMut(&Tape) -> O) {
     let at = Location::caller();
-    let verdict = search(config.given(given), body);
+    let (verdict, searched) = search_observing(config.given(given), body);
+    let mut observed = observed_lines();
+    searched.tally().lines_into(&mut observed);
+    say_observed(at, &observed);
     match &verdict {
         Verdict::Passed(passed) => {
             say_passed(&with_test_name(|test| place(at, test)), passed.cases, passed.choices);
@@ -713,7 +737,7 @@ const MAIN_THREAD: &str = "main";
     blaze::std_use,
     reason = "the test harness names the thread it runs a test on after the test: the thread's name is the one place the test's name is"
 )]
-fn with_test_name<R>(then: impl FnOnce(Option<&str>) -> R) -> R {
+pub(crate) fn with_test_name<R>(then: impl FnOnce(Option<&str>) -> R) -> R {
     let thread = std::thread::current();
     then(thread.name().filter(|name| *name != MAIN_THREAD))
 }
@@ -775,6 +799,36 @@ fn say_passed(place: &str, cases: u32, choices: u64) {
     println!("blaze-sim: {place}: {cases} cases, {choices} choices");
 }
 
+/// Prints the observe block (observe.rs) of the check at `at`, when `lines` has any: once, after
+/// the search and so after the test's own output, on standard error, where a failing check's
+/// `report` goes. Fails nothing (`ObserveMode::Observe`).
+#[expect(
+    clippy::print_stderr,
+    reason = "the observe block goes to standard error beside a check's report"
+)]
+#[expect(
+    blaze::std_use,
+    reason = "the observe block goes to the test's own standard error, which the test harness captures through `eprint!` alone"
+)]
+#[expect(
+    blaze::effect_breadth,
+    reason = "one `eprint!`: std's `_eprint` brings IO, blocking, locking and allocating and its arguments' formatting panicking, so any function that prints a line has all five"
+)]
+pub(crate) fn say_observed(at: &Location<'_>, lines: &str) {
+    if lines.is_empty() {
+        return;
+    }
+    let mut block = observed_lines();
+    observe::block(&with_test_name(|test| place(at, test)), lines, &mut block);
+    eprint!("{block}");
+}
+
+/// An empty buffer for observe lines (observe.rs) on the test process's heap: the driver is the
+/// one place that names the allocator they go in (see the crate's `blaze::hot_alloc` note).
+pub(crate) fn observed_lines() -> blaze_own::String<Global> {
+    blaze_own::String::new_in(Global)
+}
+
 /// The test's name, or else `file:line` of the check.
 fn place(at: &Location<'_>, test: Option<&str>) -> String {
     match test {
@@ -789,7 +843,13 @@ fn place(at: &Location<'_>, test: Option<&str>) -> String {
 pub fn report(verdict: &Verdict, at: &Location<'_>, test: Option<&str>) -> String {
     let place = place(at, test);
     match verdict {
-        Verdict::Failed(failed) => report_failed(failed, &place),
+        Verdict::Failed(failed) => {
+            let mut out = report_failed(failed, &place);
+            // The ONE line to keep (piece S3): a failure found once is replayed forever.
+            #[expect(clippy::let_underscore_must_use, reason = "writing to a `String` cannot fail")]
+            let _ = crate::kept::keep_lines(&mut out, failed, &place, at);
+            out
+        }
         Verdict::Passed(passed) => {
             format!(
                 "blaze-sim: `{place}` passed: {} cases ({} discarded), {} choices",

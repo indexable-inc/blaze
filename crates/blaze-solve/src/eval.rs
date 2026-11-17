@@ -213,6 +213,9 @@ pub struct Stats {
     pub fast_path: u64,
     pub candidates: u64,
     pub reruns: u64,
+    /// Impl candidates assembled, after the fingerprint prefilter (prefilter.rs): each is one
+    /// impl header imported with fresh arguments (`trait_goals::step_impl`).
+    pub impl_candidates: u64,
 }
 
 fn env_slice<'e>(clauses: &'e [Clause], rows: &[(u32, u32)], env: EnvId) -> &'e [Clause] {
@@ -596,6 +599,10 @@ impl<'a> Solver<'a> {
                     let goal = self.frames.get(top).map(|f| bad_pred_of(tys, f.goal.pred));
                     return Err(Stop::Error(SolveError::Malformed(Malformed::Sort { term, met, at, goal })));
                 }
+                Err(Stop::Error(SolveError::Malformed(Malformed::Param { index, args, at, goal: None }))) => {
+                    let goal = self.frames.get(top).map(|f| bad_pred_of(tys, f.goal.pred));
+                    return Err(Stop::Error(SolveError::Malformed(Malformed::Param { index, args, at, goal })));
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -804,6 +811,7 @@ impl<'a> Solver<'a> {
                     let mut cx = self.cx(tys, facts, top);
                     trait_goals::assemble_impls(&mut cx, &st, &mut out)?;
                 }
+                self.stats.impl_candidates += out.iter().filter(|c| matches!(c.source, Source::Impl(_))).count() as u64;
                 self.added.clear();
                 self.cands.extend_from_slice(&out);
                 return Ok(());
@@ -1322,7 +1330,9 @@ fn pred_terms<T: Tys>(tys: &T, p: Pred, f: &mut impl FnMut(Ty) -> Result<(), Sol
     }
 }
 
-/// A portable predicate of a trait's definition, `Param(i)` replaced by `args[i]`.
+/// A portable predicate of a trait's definition, `Param(i)` replaced by `args[i]`. A parameter
+/// past `args` is `Malformed::Param` naming the caller's line.
+#[track_caller]
 fn import_pred<T: Tys>(
     tys: &mut T,
     s: &mut Scratch<'_>,
@@ -1331,14 +1341,15 @@ fn import_pred<T: Tys>(
     args: &[Ty],
     alloc: Alloc<'_>,
 ) -> Result<Pred, SolveError> {
-    let inst = |tys: &mut T, s: &mut Scratch<'_>, t: Ty| fold::import(tys, s, p, t, Inst { args, bound: &[] });
+    let at = core::panic::Location::caller();
+    let inst = |tys: &mut T, s: &mut Scratch<'_>, t: Ty| fold::import_at(tys, s, p, t, Inst { args, bound: &[] }, at);
     let list = |tys: &mut T, s: &mut Scratch<'_>, l: crate::term::List| -> Result<crate::term::List, SolveError> {
         let mut v: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(l.len as usize, alloc);
         for i in 0..l.len {
             let Some(&x) = p.lists.get((l.start + i) as usize) else {
                 return Err(SolveError::Malformed(Malformed::PortableIndex { node: l.start + i, len: p.lists.len() as u32 }));
             };
-            v.push(fold::import(tys, s, p, x, Inst { args, bound: &[] })?);
+            v.push(fold::import_at(tys, s, p, x, Inst { args, bound: &[] }, at)?);
         }
         tys.mk_list(&v)
     };

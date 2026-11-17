@@ -372,6 +372,8 @@ impl Escape {
                 // alloc: once per hosted run that sends an effect.
                 born: Born::Unknown(Arc::from("the hosted wire does not carry the process's start yet")),
                 build_id: None,
+                // The hosted wire does not carry the program's path.
+                exe: None,
             },
             offers: crate::guest::OFFERS,
             limits,

@@ -8,6 +8,7 @@ mod heat_tier;
 mod judge;
 mod parent;
 mod plan;
+mod property;
 mod registry;
 mod report;
 mod result;

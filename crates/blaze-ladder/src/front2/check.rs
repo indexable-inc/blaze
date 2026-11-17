@@ -71,7 +71,8 @@ pub enum CheckFail {
     Rounds { owner: ItemKey, last: Vec<Question, Global> },
     /// The constant `key` an array length in a head names has no value: the evaluator's
     /// refusal, or [`ConstFail::Nested`] for one met while another constant is evaluated.
-    Const { owner: ItemKey, key: LibKey, error: Box<ConstFail, Global> },
+    /// `shown` is what `key` names ([`key_shown`]: rule 19), beside the key tools grep.
+    Const { owner: ItemKey, key: LibKey, shown: Box<str, Global>, error: Box<ConstFail, Global> },
     /// Instance resolution of the call of `item` in `owner` failed (no impl, overlap, not
     /// ground, or a question the world could not make a record for).
     Resolve { owner: ItemKey, item: ItemKey, error: tc::ResolveError, args: Box<str> },
@@ -100,7 +101,7 @@ impl core::fmt::Display for CheckFail {
             }
             CheckFail::Rounds { owner, last } => write!(f, "checking {owner:?}: still needs {last:?} after {MOST_ROUNDS} rounds"),
             CheckFail::Resolve { owner, item, error, args } => write!(f, "in {owner:?}, the call of {item:?} at [{args}]: {error}"),
-            CheckFail::Const { owner, key, error } => write!(f, "checking {owner:?}: the constant {key:?} an array length names: {error:?}"),
+            CheckFail::Const { owner, key, shown, error } => write!(f, "checking {owner:?}: the constant {key:?} ({shown}) an array length names: {error:?}"),
         }
     }
 }
@@ -163,7 +164,8 @@ pub fn check_body_asked<'n, S: NamesSource<'n>>(
     let mut hints = Needs::new_in(Alloc::global());
     let mut all_gaps: Vec<Gap, Global> = Vec::new_in(Global);
     for round in 0..MOST_ROUNDS {
-        let view: BodyView<'_> = body.typeck.view(body.tys.view());
+        let tys = body.tys.view(&r.store.tys).map_err(|error| CheckFail::Check { owner, error })?;
+        let view: BodyView<'_> = body.typeck.view(tys);
         let world = world_at(r, scope);
         let mut cx = InferCtx::new_in(Alloc::global());
         let out = match &mut count {
@@ -270,7 +272,7 @@ fn make_round<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fills: Vec<Fill
         }
     }
     match refused {
-        Some((_, e)) if made == 0 => Err(e.at(owner)),
+        Some((_, e)) if made == 0 => Err(e.at(r, owner)),
         _ => Ok(dropped),
     }
 }
@@ -281,6 +283,35 @@ pub(crate) fn item_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>,k: ItemK
         Some(n) => n.to_string(),
         None => format!("{k:?}"),
     }
+}
+
+/// What `k` names, for an error beside its key (rule 19: an error names the item; the key
+/// stays, as tools grep it): a library item's module path and name, an anonymous constant's
+/// text as filed in `store.fns` (front2/anon.rs `file_asked`), a member's container's path
+/// and its name; else that the store gives no path.
+pub(crate) fn key_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -> Box<str, Global> {
+    let path_of = |lib: LibKey| -> Option<String> {
+        let name = r.names.name_of(lib)?;
+        Some(match r.names.home_of(lib).and_then(|m| r.names.module_path(m)) {
+            Some(module) => format!("{module}::{name}"),
+            None => String::from(name),
+        })
+    };
+    let shown = match r.keys.origin(k) {
+        Some(Origin::Member { kind: super::keys::MemberKind::Anon, .. }) => match r.store.fns.get(&k) {
+            Some(h) => format!("the anonymous constant `{}`", h.text),
+            None => String::from("an anonymous constant not filed in the store"),
+        },
+        Some(Origin::Member { container, name, .. }) => match r.keys.library_in(r.names, *container).and_then(path_of) {
+            Some(c) => format!("`{c}::{name}`"),
+            None => format!("`{name}` of {container:?}"),
+        },
+        _ => match r.keys.library_in(r.names, k).and_then(path_of) {
+            Some(p) => format!("`{p}`"),
+            None => String::from("no path in the store"),
+        },
+    };
+    shown.into_boxed_str()
 }
 
 /// `t` of `tys` as Rust spells it (`Result<Out, Missing>`), by a work list; a node with no
@@ -543,11 +574,11 @@ enum MakeFail {
 }
 
 impl MakeFail {
-    fn at(self, owner: ItemKey) -> CheckFail {
+    fn at<'n, S: NamesSource<'n>>(self, r: &Records<'_, 'n, S>, owner: ItemKey) -> CheckFail {
         match self {
             MakeFail::Head(error) => CheckFail::Head { owner, error },
             MakeFail::Buckets(error) => CheckFail::Buckets { owner, error },
-            MakeFail::Const(key, error) => CheckFail::Const { owner, key, error: Box::new_in(error, Global) },
+            MakeFail::Const(key, error) => CheckFail::Const { owner, key, shown: key_shown(r, checker_of(key)), error: Box::new_in(error, Global) },
         }
     }
 }
@@ -559,7 +590,10 @@ const MOST_CONSTS: u32 = 64;
 /// qualified constant leaf is selected from): the fill's refusal as the check's, naming
 /// `owner`.
 pub(super) fn make_for<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, fill: Fill, owner: ItemKey) -> Result<(), CheckFail> {
-    make(r, fill).map_err(|e| e.at(owner))
+    match make(r, fill) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(e.at(r, owner)),
+    }
 }
 
 /// Makes `fill`; a head whose array length names a constant ([`Why::NeedConst`]) has that
@@ -577,7 +611,21 @@ fn make<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> Result
         if asked > MOST_CONSTS {
             return Err(MakeFail::Const(c, ConstFail::TooManyLengths { item: checker_of(c), most: MOST_CONSTS }));
         }
-        eval_len(r, c).map_err(|e| MakeFail::Const(c, e))?;
+        match eval_len(r, c) {
+            Ok(()) => {}
+            // No evaluator here and none running (`Maps::evaluating` is zero): this caller
+            // evaluates no constant at all (a harness, a caller made with `Records::consts`
+            // `None`). An ANONYMOUS constant a head wrote (`[u8; size_of::<Self>()]` on a
+            // method of `u8`, met by any probe of `u8`'s impls) is then that head's refusal
+            // by name and only that head's, filed as the evaluator's own refusal of one is
+            // (`Maps::anon_failed`): the fill goes on, and the body that asked reports a gap
+            // only if it uses that head. While an evaluation runs the `Nested` goes up
+            // unfiled: its work list evaluates the constant first (consts.rs `value_at`).
+            Err(ConstFail::Nested { .. }) if r.consts.is_none() && r.store.maps.evaluating.get() == 0 && super::anon::need_key(checker_of(c)) == c => {
+                r.store.maps.anon_failed.insert(c, Box::from("this caller has no constant evaluator (`Records::consts` is `None`)"));
+            }
+            Err(e) => return Err(MakeFail::Const(c, e)),
+        }
     }
 }
 
@@ -592,7 +640,7 @@ pub fn eval_len<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,c: LibKey) ->
         return Ok(());
     }
     let Some((consts, prepared)) = r.consts.take() else {
-        return Err(ConstFail::Nested { item: checker_of(c) });
+        return Err(ConstFail::Nested { item: checker_of(c), shown: key_shown(r, checker_of(c)) });
     };
     // An anonymous constant a head asked for (`1 << 0`, `u8::MAX`: front2/anon.rs) is made a
     // constant item's head first; `c` may be one's need key, whose checker key is that head's.
@@ -658,7 +706,7 @@ pub(super) fn make_all<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fills:
         }
     }
     match refused {
-        Some((_, e)) => Err(e.at(owner)),
+        Some((_, e)) => Err(e.at(r, owner)),
         None => Ok(()),
     }
 }

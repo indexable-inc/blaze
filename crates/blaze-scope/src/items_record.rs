@@ -45,6 +45,7 @@ use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_own::{AVec, Alloc};
 use blaze_surface::{CallShape, Edition, ImplFlags, ItemDetail, ItemIndex, ItemKind, ProcKind, RecordBytes};
 
+use crate::package_path::{NotPackagePath, PackagePath};
 use crate::resolve::{At, CrateNames};
 use crate::task::{MacroBody, MacroSrc};
 
@@ -52,8 +53,10 @@ const MAGIC: [u8; 4] = *b"BZIT";
 /// 2: the item grain section ([`grain`]); a version-1 record is refused (`NotThisRecord`) and
 /// the crate is solved again. 3: the member owners section ([`owners`]), added after it; a
 /// version-2 record is refused the same way. 4: the variant table ([`variants`]) and the bucket
-/// index ([`buckets`]), added after them; a version-3 record is refused the same way.
-const VERSION: u32 = 4;
+/// index ([`buckets`]), added after them; a version-3 record is refused the same way. 5: a file
+/// row's path is its [`PackagePath`] (D96), never the caller's `/<tree>/...`; a version-4
+/// record is refused the same way.
+const VERSION: u32 = 5;
 const ALIGN: usize = 16;
 const HEADER: usize = 256;
 const KEYS_AT: usize = 160;
@@ -146,8 +149,9 @@ pub fn expansion_id(text: &str) -> ContentId {
 /// Which text of a crate: what a reader's loader is asked for, and what an error names.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TextOf<'r> {
-    /// The crate's file `index`, at `path` as the solve read it.
-    File { index: u32, path: &'r str },
+    /// The crate's file `index`, at `path` in the crate's package: the reader joins it onto the
+    /// directory its world placed that crate's package at.
+    File { index: u32, path: PackagePath<'r> },
     /// The expansion of the macro call `call`: its own record's text.
     Expansion { call: ItemKey },
 }
@@ -184,6 +188,8 @@ pub enum ItemsRecordError {
     /// A range of the record lies outside its (verified) text, or cuts a character: a
     /// writer's bug.
     Range { krate: CrateItemKey, start: u32, len: u32 },
+    /// File row `at`'s path is not a package-relative path (D96: a record holds no root).
+    NotPackagePath { at: usize, why: NotPackagePath },
 }
 
 fn u32_of(n: usize, what: &'static str) -> Result<u32, ItemsRecordError> {
@@ -464,7 +470,7 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
     // Files, by index; expansions that made a text, by call key.
     let mut file_rows = RecordBytes::new_in(alloc);
     for f in names.files.iter() {
-        let (path, shown) = (strings.put(f.path)?, strings.put(f.shown)?);
+        let (path, shown) = (strings.put(f.package.as_str())?, strings.put(f.shown)?);
         file_rows.extend_from_slice(&f.id.0);
         for n in [path.0, path.1, shown.0, shown.1, u32_of(f.text.len(), "a file's text")?, 0] {
             put32(&mut file_rows, n);
@@ -858,11 +864,12 @@ pub struct TextSpan {
 /// A file of the crate, as the solve read it.
 ///
 /// Row, 56 bytes, by file index (an [`At::File`]'s): digest 32 (what proves a text handed to a
-/// reader is the one the ranges were made in: question 7), path at/len u32 (what the loader is
-/// asked for: 7, 19), shown path at/len u32 (what a finding prints: 19), text length u32, pad.
+/// reader is the one the ranges were made in: question 7), path at/len u32 (the file's
+/// [`PackagePath`]: what the loader is asked for with the crate, 7, 19), shown path at/len u32
+/// (what a finding prints: 19), text length u32, pad.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FileRow<'a> {
-    pub path: &'a str,
+    pub path: PackagePath<'a>,
     pub shown: &'a str,
     pub id: ContentId,
     pub len: u32,
@@ -1204,7 +1211,8 @@ impl<'a> ItemsRecord<'a> {
         let b = self.bytes;
         Ok(Some(FileRow {
             id: id_at(b, r),
-            path: self.str_at("a file's path", le32(b, r + 32), le32(b, r + 36))?,
+            path: PackagePath::new(self.str_at("a file's path", le32(b, r + 32), le32(b, r + 36))?)
+                .map_err(|why| ItemsRecordError::NotPackagePath { at: index as usize, why })?,
             shown: self.str_at("a file's shown path", le32(b, r + 40), le32(b, r + 44))?,
             len: le32(b, r + 48),
         }))
@@ -1526,9 +1534,11 @@ pub trait LoadItems<'a> {
     /// 16-aligned, or `None` when none is kept.
     fn load(&self, krate: usize) -> Option<&'a [u8]>;
 
-    /// The text of the crate's file at `path` as it is now. The record checks it against the
-    /// digest it holds, so a loader need not.
-    fn file(&self, krate: usize, path: &str) -> Option<&'a str>;
+    /// The text of the crate's file at `path` in its package, as it is now: the loader joins
+    /// `path` onto the directory its world placed the crate's package at
+    /// ([`PackagePath::in_package`]). The record checks the text against the digest it holds,
+    /// so a loader need not.
+    fn file(&self, krate: usize, path: PackagePath<'_>) -> Option<&'a str>;
 
     /// The text the macro call `call` of the crate expanded to, from the expansion's own
     /// record.
@@ -1538,7 +1548,7 @@ pub trait LoadItems<'a> {
     /// ([`grain::item_chain`]): what a row whose file changed is checked against, item by item
     /// ([`ItemsRecord::item_now`]). This one outlines the file's text now in `alloc`; a loader
     /// that holds the file's `FileItems` record answers from that instead, with equal entries.
-    fn item(&self, krate: usize, path: &str, chain: ContentId, edition: Edition, alloc: Alloc<'a>) -> Option<ItemToday<'a>> {
+    fn item(&self, krate: usize, path: PackagePath<'_>, chain: ContentId, edition: Edition, alloc: Alloc<'a>) -> Option<ItemToday<'a>> {
         grain::outline_today(self.file(krate, path)?, chain, edition, alloc)
     }
 }

@@ -42,6 +42,8 @@
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/LLVMRemarkStreamer.h>
+#include <llvm/Support/raw_ostream.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/MC/MCSubtargetInfo.h>
@@ -827,5 +829,48 @@ size_t LLVMBlazeReportRows(LLVMBlazeOpaquePasses *Passes, const LLVMBlazeReportR
   *Out = Passes->Rows.data();
   return Passes->Rows.size();
 }
+
+/* The inliner's remark stream (crates/blaze-llvm, D100 point 7 (c)): the remarks of the passes
+ * a regular expression names, serialized as YAML into a buffer the sink owns, for
+ * llvm-c/Remarks.h's parser to read back. LLVM's C API can parse remarks but not start a
+ * stream, so these three do. */
+struct LLVMBlazeRemarkSink {
+  std::string Text;
+  raw_string_ostream Stream{Text};
+};
+
+/* Starts the stream on `C` for the passes `Passes[0..Length)` matches; the sink in `*Out`.
+ * An error if `C` already streams remarks. OWNERSHIP: the caller owns the sink (freed only by
+ * LLVMBlazeRemarksDispose); `C` keeps a streamer writing into the sink's buffer, so `C` must
+ * stay alive until LLVMBlazeRemarksEnd, and End must run before Dispose and before `C` is
+ * disposed. `Passes` is read during this call only. */
+LLVMErrorRef LLVMBlazeRemarksBegin(LLVMContextRef C, const char *Passes, size_t Length,
+                                   LLVMBlazeRemarkSink **Out) {
+  *Out = nullptr;
+  LLVMContext &Context = *unwrap(C);
+  if (Context.getLLVMRemarkStreamer() || Context.getMainRemarkStreamer())
+    return wrap(make_error<StringError>("blaze: the context already streams remarks",
+                                        inconvertibleErrorCode()));
+  auto Sink = std::make_unique<LLVMBlazeRemarkSink>();
+  if (Error Err = setupLLVMOptimizationRemarks(Context, Sink->Stream, StringRef(Passes, Length),
+                                               "yaml", /*RemarksWithHotness=*/false))
+    return wrap(std::move(Err));
+  *Out = Sink.release();
+  return nullptr;
+}
+
+/* Finalizes the stream and deregisters it from `C` (which must be the context Begin was given,
+ * still alive); the YAML in `*Data`/`*Length`, borrowed from the sink until
+ * LLVMBlazeRemarksDispose. After this `C` holds no pointer into the sink. */
+void LLVMBlazeRemarksEnd(LLVMContextRef C, LLVMBlazeRemarkSink *Sink, const char **Data,
+                         size_t *Length) {
+  finalizeLLVMOptimizationRemarks(*unwrap(C));
+  Sink->Stream.flush();
+  *Data = Sink->Text.data();
+  *Length = Sink->Text.size();
+}
+
+/* Frees the sink and its buffer: only after LLVMBlazeRemarksEnd (no context points into it). */
+void LLVMBlazeRemarksDispose(LLVMBlazeRemarkSink *Sink) { delete Sink; }
 
 } // extern "C"

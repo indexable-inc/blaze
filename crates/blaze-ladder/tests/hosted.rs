@@ -28,7 +28,7 @@ fn every_hosted_rung_writes_its_expected_output_through_the_table() {
         let hosting = Hosting::holding(Io::sim(1), Vec::new(), vec![("everything".into(), "io".into())], 4096, Holding::of(Hold::Record));
         let table = hosting.table();
         let host = NonNull::from(&table).cast::<c_void>();
-        let got = match blaze_ladder::run::run(&views, "src/main.rs", Some(host)) {
+        let got = match blaze_ladder::run::run(&views, "src/main.rs", Some(host), rungs::x::overflow_of(&dir)) {
             Ok(got) => got,
             Err(error) => panic!("{rung}: {error}"),
         };

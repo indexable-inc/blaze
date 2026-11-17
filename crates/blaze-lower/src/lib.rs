@@ -463,7 +463,7 @@ pub use crate::type_text::{TypeTextRefused, lower_type_text, lower_type_text_exp
 /// The domain of [`signature_key`]: this lowering's version and the parser's.
 pub const SIGNATURE_KEY_DOMAIN: &str = "blaze v2 lower signature 3, parser 1";
 /// The domain of [`body_key`].
-pub const BODY_KEY_DOMAIN: &str = "blaze v2 lower body 7, parser 1";
+pub const BODY_KEY_DOMAIN: &str = "blaze v2 lower body 8, parser 1";
 /// The domain of [`anon_const_key`].
 pub const ANON_CONST_KEY_DOMAIN: &str = "blaze v2 lower anon const 3, parser 1";
 

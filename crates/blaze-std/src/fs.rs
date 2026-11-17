@@ -114,6 +114,9 @@ pub(crate) use looks::SkipsLast;
 mod read_sized;
 pub use read_sized::SizedError;
 
+// A whole file mapped read-only (`Dir::map_read`): a large plain array read in place.
+mod map_read;
+
 // A walk over folders, bounded by its caller: the visitor chooses each folder's sub-folders.
 mod walk;
 #[cfg(test)]
@@ -1858,23 +1861,21 @@ impl<#[blaze::linear] P: Rights> File<P> {
         })
     }
 
-    /// Up to `len` bytes at `at` added to `into`, fewer at the end of the file; how many. Its
-    /// [`File::read_into`], waited for.
+    /// Up to `len` bytes at `at` added to `into`, fewer at the end of the file; how many.
+    /// One `Effect::Read` through `Io::call`, which looks at the context's deadline first: on
+    /// a native driver with inline calls the `pread` runs on this thread, with no handoff to
+    /// the driver's threads; the simulation queues it, as `read_into` does, the same effect it
+    /// can fail, delay and reorder.
     pub fn read_at(&self, cx: &Cx, at: u64, len: usize, into: &mut Bytes<'_>) -> Result<usize, FsError> {
-        let stopped = |stopped| FsError::new(FsOp::Read, &self.name, FsKind::Stopped(stopped));
-        cx.stopped_by(self.io.now()).map_err(stopped)?;
-        let start = into.len();
-        let slot = into.grow_zeroed(len).map_err(stopped)?;
-        let read = self.read_into(slot, at).wait(cx);
-        match read {
-            Ok(read) => {
-                into.truncate(start + read);
-                Ok(read)
+        // clone: the effect's name, a refcount.
+        let file = self.name.clone();
+        match call(&self.io, cx, FsOp::Read, &self.name, |tag| Effect::Read { file, at, len, tag })? {
+            Done::Read(bytes) if bytes.len() <= len => {
+                into.try_extend(&bytes)
+                    .map_err(|stopped| FsError::new(FsOp::Read, &self.name, FsKind::Stopped(stopped)))?;
+                Ok(bytes.len())
             }
-            Err(error) => {
-                into.truncate(start);
-                Err(error)
-            }
+            done => Err(unexpected(FsOp::Read, &self.name, done)),
         }
     }
 

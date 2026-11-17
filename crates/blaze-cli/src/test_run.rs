@@ -543,11 +543,21 @@ impl<'b, Z: Zygotes> Runner<'b, Z> {
             self.owed.push((test, why));
             return Ok(());
         }
-        if self.exited.is_some() || self.closed {
+        if self.closed {
+            // Its channel ended: nothing more can come from it, so its death is decided now.
             return Err(self.died(suite));
         }
         if self.flights.iter().any(|flight| flight.row == row) {
             return Err(RunError::TwoRuns { suite, row });
+        }
+        if self.exited.is_some() {
+            // Reaped, but its channel is not drained: results it sent before it died may still be
+            // in it ("Drain before exit"). This run is not asked (no process reads the ask); it is
+            // held out so the death, decided at the channel's end ([`Runner::take`]) or past
+            // [`CHANNEL_GRACE`] ([`Runner::watch`]), counts it as not answered.
+            let asked = self.zygotes.now();
+            self.flights.push(Flight { test, row, deadline, asked, killed: false });
+            return Ok(());
         }
         self.zygotes.ask(row, test, self.budget)?;
         let asked = self.zygotes.now();

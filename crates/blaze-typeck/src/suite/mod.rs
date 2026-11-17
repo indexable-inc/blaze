@@ -53,9 +53,15 @@ mod fn_traits;
 mod gat;
 mod holes;
 mod lower_forms;
+mod mut_places;
+mod neg_unsigned;
 mod op_callees;
+mod op_fast_path;
+mod op_literal_vars;
 mod opaque;
 mod pattern_types;
+mod pin_unsize;
+mod self_impl_args;
 mod self_paths;
 mod self_ty_paths;
 mod suggest;
@@ -286,7 +292,8 @@ fn adjusts(fx: &Fx, c: &Checked<'_>, e: ExprId) -> String {
         }
         let k = match ks[i] {
             AdjustKind::Deref { overloaded: None } => String::from("*"),
-            AdjustKind::Deref { overloaded: Some(_) } => String::from("*Deref"),
+            AdjustKind::Deref { overloaded: Some(Mutbl::Not) } => String::from("*Deref"),
+            AdjustKind::Deref { overloaded: Some(Mutbl::Mut) } => String::from("*DerefMut"),
             AdjustKind::Borrow { mutbl: Mutbl::Not, .. } => String::from("&"),
             AdjustKind::Borrow { mutbl: Mutbl::Mut, two_phase, .. } => {
                 String::from(if two_phase { "&mut 2φ" } else { "&mut" })
@@ -304,7 +311,7 @@ fn callee(fx: &Fx, c: &Checked<'_>, e: ExprId) -> String {
     let (es, items, args) = (c.callees.column::<0>(), c.callees.column::<1>(), c.callees.column::<2>());
     match es.iter().position(|&x| x == e) {
         Some(i) => {
-            let a: Vec<String> = c.types.view().lists[args[i].range()].iter().map(|&t| show(fx, c.types.view(), t)).collect();
+            let a: Vec<String> = c.types.view().list(args[i]).expect("a callee's arguments in the body's table").iter().map(|&t| show(fx, c.types.view(), t)).collect();
             format!("{}<{}>", fx.name_of(items[i]), a.join(", "))
         }
         None => String::from("none"),

@@ -248,3 +248,58 @@ fn blocks_expand_a_statement_call_named_by_textual_scope() {
     std::println!("BLOCK impls by textual scope: {} of 3: {all:?}", all.len());
     assert!(all.len() >= 2, "{all:?}");
 }
+
+/// A trait declared in a block: the shape of core's `Write::write_fmt` (library/core/src/fmt/
+/// mod.rs: `trait SpecWriteFmt { .. }` and `impl<W: Write + ?Sized> SpecWriteFmt for &mut W`
+/// in the fn's body), and a block whose only item is a trait. The Reference, "Statements",
+/// "Item declarations": "Declaring an item within a statement block restricts its scope to the
+/// block containing the statement." So the trait is an item of its block's module: the impl's
+/// header names it there, it is among that module's traits in scope, and a block holding a
+/// trait alone is made a module too (task/lower.rs `BodySrc::of`'s words and
+/// `NestedKind::makes_module`). Prints "BLOCK trait: SpecWriteFmt and Provided are traits of
+/// their blocks' modules"; without "trait" in either, the second body makes no module and the
+/// test fails at "`Provided` read in its block's module".
+const BLOCK_TRAIT: &str = "#![no_core]
+pub trait Write {}
+pub fn write_fmt() -> u8 {
+    trait SpecWriteFmt { fn spec_write_fmt(self) -> u8; }
+    impl<W: Write + ?Sized> SpecWriteFmt for &mut W { fn spec_write_fmt(self) -> u8 { 0 } }
+    0
+}
+pub fn alone() -> u8 {
+    trait Provided { fn one(&self) -> u8 { 1 } }
+    0
+}
+";
+
+static BLOCK_TRAIT_TEXTS: Texts = Texts(&[&[("/user/lib.rs", BLOCK_TRAIT)]]);
+
+#[test]
+fn blocks_hold_a_trait_as_an_item_of_their_module() {
+    use blaze_surface::DefKind;
+    let crates = [input("user", "/user/lib.rs", &[])];
+    let names = resolved(&crates, &BLOCK_TRAIT_TEXTS);
+    let spec = impl_ending(&names, 0, "SpecWriteFmtfor&mutW");
+    let tr = names
+        .item_at(spec.module, Namespace::Types, Written { kind: PathKind::Plain, segments: &["SpecWriteFmt"] }, Alloc::global())
+        .unwrap_or_else(|e| panic!("`SpecWriteFmt` read in the impl's block module: {e}"));
+    assert_eq!(tr.def.kind, DefKind::Trait, "`SpecWriteFmt` is a trait of the block's module");
+    let in_scope = names.traits_in_scope(spec.module, Alloc::global()).unwrap_or_else(|e| panic!("traits in scope at the block's module: {e}"));
+    assert!(in_scope.contains(&tr.def.key), "the block's trait is in scope in its block");
+    // The block whose only item is a trait: its module's key from the same scan.
+    let root = names.root(0);
+    let alone = names
+        .item_at(root, Namespace::Values, Written { kind: PathKind::Plain, segments: &["alone"] }, Alloc::global())
+        .unwrap_or_else(|e| panic!("`alone`: {e}"));
+    let at = BLOCK_TRAIT.find("pub fn alone").unwrap_or_else(|| panic!("the text holds `alone`"));
+    let nested = blaze_file_items::nested::scan(&BLOCK_TRAIT[at..], Alloc::global());
+    let modules = crate::blocks::block_modules(names.krate(0).key, alone.def.key, &nested, Alloc::global());
+    let module = modules.first().copied().flatten().unwrap_or_else(|| panic!("`alone`'s block is written as a module"));
+    let provided = names
+        .item_at(module, Namespace::Types, Written { kind: PathKind::Plain, segments: &["Provided"] }, Alloc::global())
+        .unwrap_or_else(|e| panic!("`Provided` read in its block's module: {e}"));
+    assert_eq!(provided.def.kind, DefKind::Trait);
+    // Outside the block the trait is no name (the Reference's sentence above).
+    assert!(names.item_at(root, Namespace::Types, Written { kind: PathKind::Plain, segments: &["Provided"] }, Alloc::global()).is_err(), "a block's trait is not the module's");
+    std::println!("BLOCK trait: SpecWriteFmt and Provided are traits of their blocks' modules");
+}

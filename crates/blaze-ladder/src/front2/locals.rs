@@ -142,11 +142,13 @@ impl LocalKind {
 
     /// Whether an item of this kind is an item of its block's MODULE in the names library
     /// (blaze-scope blocks.rs; `blaze_file_items::nested::NestedKind::makes_module`): a
-    /// struct, enum, union or type alias. Its key is the library's, its head is made by the
-    /// ordinary code ([`super::heads`]'s `Store::step`), and a path naming it is resolved by
-    /// the one name solver at that module ([`Row::module`]).
+    /// struct, enum, union, type alias or trait. Its key is the library's, its head is made by
+    /// the ordinary code ([`super::heads`]'s `Store::step`), and a path naming it is resolved
+    /// by the one name solver at that module ([`Row::module`]). A trait's methods are also
+    /// candidates at method calls in its block and the blocks inside it
+    /// ([`super::block_traits`]).
     pub fn in_block_module(self) -> bool {
-        matches!(self, LocalKind::Struct | LocalKind::Enum | LocalKind::Union | LocalKind::TypeAlias)
+        matches!(self, LocalKind::Struct | LocalKind::Enum | LocalKind::Union | LocalKind::TypeAlias | LocalKind::Trait)
     }
 
     /// The gap's words for a struct, enum, union or alias whose block has no module in the
@@ -159,6 +161,7 @@ impl LocalKind {
             LocalKind::Enum => "an enum in a block that a macro call wrote or that is in a local item's body",
             LocalKind::Union => "a union in a block that a macro call wrote or that is in a local item's body",
             LocalKind::TypeAlias => "a type alias in a block that a macro call wrote or that is in a local item's body",
+            LocalKind::Trait => "a trait in a block that a macro call wrote or that is in a local item's body",
             other => other.form(),
         }
     }

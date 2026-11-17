@@ -7,8 +7,10 @@
 #![blaze::sans_io]
 
 use blaze_ids::ContentId;
+use blaze_own::{AVec, Vec};
 
-use crate::fetch::{Ask, Effect, Machine, Method, Reply, StoreFailure};
+use crate::fetch::{Adopt, Ask, Effect, LocalArchive, Machine, Method, Reply, StoreFailure};
+use crate::plan::Unit;
 
 /// What became of a reservation ([`FetchIo::reserve`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -63,6 +65,16 @@ pub trait FetchIo {
         room: u64,
         write: &mut dyn FnMut(&[u8], Result<&mut [u8], StoreFailure>) -> Option<u64>,
     ) -> Reserved;
+    /// The machine's local step ([`Effect::Local`], fetch.md's place 2): reads the `.crate` of
+    /// `name` `version` that another tool keeps on this machine (cargo's
+    /// `<cargo home>/registry/cache/<crates.io folder>/<name>-<version>.crate`, its folders
+    /// chosen by [`crate::local::crates_io_folder`] and the file by
+    /// [`crate::local::archive_name`]) whole into `out`, and says what it found. Nothing found
+    /// is trusted here: the machine adopts the bytes only by the lock's SHA-256. The default
+    /// holds nothing, so an IO without the step goes straight to HTTPS.
+    fn local_archive(&mut self, _name: &str, _version: &str, _out: &mut AVec<'_, u8>) -> LocalArchive {
+        LocalArchive::Absent
+    }
 }
 
 /// Carries out every effect `machine` has now, then, unless it is done, waits once: for an
@@ -92,6 +104,27 @@ pub fn step<I: FetchIo + ?Sized>(machine: &mut Machine<'_, '_, '_>, io: &mut I, 
             }
             Effect::Http { ask, method, url, headers, body, most, deadline_ns } => {
                 io.send(ask, method, url.as_str(), headers, body.as_slice(), most, deadline_ns);
+            }
+            Effect::Local { unit } => {
+                let mut archive = Vec::new_in(machine.alloc());
+                let found = match machine.unit(unit) {
+                    Unit::Crate { name, version, .. } => io.local_archive(name, version.as_str(), &mut archive),
+                    // Never asked: the machine asks only for a crate's archive (`looked`);
+                    // answered so the unit goes on by the order rather than waiting.
+                    Unit::Git { .. } => LocalArchive::Absent,
+                };
+                // A large record is reserved now, while the archive's bytes are still here: the
+                // IO kept no answer for this unit, so `write` is given these, not its own.
+                if let Adopt::Reserve { key, room } = machine.local_found(unit, found, archive.as_slice()) {
+                    let reserved =
+                        io.reserve(unit, &key, room, &mut |_kept, room| machine.adopt_into(unit, archive.as_slice(), room));
+                    match reserved {
+                        Reserved::Kept => machine.stored(unit, Ok(())),
+                        Reserved::Abandoned => {}
+                        Reserved::Unkept(failure) => machine.stored(unit, Err(failure)),
+                    }
+                }
+                drop(archive);
             }
         }
     }

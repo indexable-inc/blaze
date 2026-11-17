@@ -19,12 +19,13 @@
 //! - "Temporary scopes": "The pattern-matching condition(s) and consequent body of `if`", "The
 //!   pattern-matching condition and loop body of `while`".
 //!
-//! Nothing here needs a drop flag, so nothing is dropped on a failed link: a binding by value
-//! of a part that needs drop is refused by `bind_tested` (so no earlier link holds one), a
-//! scrutinee temporary that needs drop is refused by `tested_place`, and a borrowed temporary
-//! that needs drop in a condition is refused by walk/temps.rs `hold_temp`; in a `let`-`else`
-//! initializer it is refused here (`let_else_test`), since its drop around the `else` block is
-//! not built.
+//! In a condition nothing needs a drop flag, so nothing is dropped on a failed link: a binding
+//! by value of a part that needs drop is refused by `bind_tested` (so no earlier link holds
+//! one), a scrutinee temporary that needs drop is refused by `tested_place`, and a borrowed
+//! temporary that needs drop in a condition is refused by walk/temps.rs `hold_temp`. A
+//! `let`-`else` owns its scrutinee as a match does (`owned_place`: a temporary joins the
+//! statement's temporaries, the one drop point every temporary has) and drops the statement's
+//! temporaries before its `else` block (`let_else_test`).
 
 use core::alloc::Allocator;
 
@@ -101,6 +102,9 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             Expr::Local(p) if self.owned[p.ix()].is_some() && self.adjust_rows(init).is_empty() => {
                 self.work.push(Task::Place(s));
             }
+            // A place behind a pointer that needs drop (`if let Reach::Hosted = self.reach`):
+            // matched in place, nothing moved (walk/moves.rs `scrutinee_in_place`).
+            _ if self.scrutinee_in_place(init)? => self.work.push(Task::Place(init)),
             _ => self.work.push(Task::Eval(init)),
         }
         Ok(())
@@ -143,38 +147,79 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let Stmt::Let { pat, init: Some(init), else_: Some(els), .. } = stmt else {
             return Err(malformed("a `let`-`else` task on another statement"));
         };
-        // A borrowed temporary of the initializer that needs drop joined the statement's
-        // temporaries (walk/temps.rs `hold_temp`): its drop around the `else` block is not built.
         let mark = *self.temp_marks.last().ok_or(malformed("a `let`-`else` outside a statement"))? as usize;
-        let held = self.scope_pats.get(mark..).ok_or(malformed("a statement's temporaries mark past `scope_pats`"))?;
-        if held.iter().any(|h| matches!(h, Held::Rest { .. } | Held::Moved { .. })) {
-            return Err(unsupported(
-                init,
-                "a borrowed temporary whose type needs drop in a `let`-`else` initializer (its drop around the `else` block is not built)",
-            ));
+        if self.scope_marks.last().is_some_and(|&m| m as usize > mark) {
+            return Err(malformed("a drop scope left open inside a `let`-`else` initializer"));
         }
         let v = self.pop()?;
         let srepr = self.adjusted_repr(init)?;
-        let at = self.tested_place(init, v, srepr, "a `let`-`else` on a temporary that needs drop (its drop point is not built)")?;
+        // The scrutinee is owned like a match's (`owned_place`): a temporary that needs drop
+        // joins the statement's temporaries with a word, and a binding by value moves its part
+        // out of it. A local scrutinee keeps the place it has (a move out of it is refused by
+        // `bind_tested`, as before).
+        let local = self.adjust_rows(init).is_empty() && self.local_of(init)?.is_some();
+        let m = self.matches.len() as u32;
+        let at = self.owned_place(m, init, init, v, srepr)?;
         let pass = self.create();
         let fail = self.create();
         self.test_pat(pat, at, pass, fail)?;
         self.begin(pass);
-        self.bind_tested(pat, at)?;
+        if !local {
+            self.move_arm(m, pat, false);
+        }
+        let bound = self.bind_tested(pat, at);
+        self.move_arm_end();
+        bound?;
         let cont = self.create();
         self.jump(cont, &[]);
+        // The pattern failed: the statement's temporaries (the initializer's borrowed ones and
+        // its own value, whole: nothing was moved out on this path) drop now, last created
+        // first, BEFORE the `else` block runs. The Reference's copy on this machine
+        // (nightly-2026-10-27, "Destructors") does not state it for `let`-`else`; the rule is
+        // rustc's own test, tests/ui/let-else/let-else-temporary-lifetime.rs: `let Foo(0) =
+        // Foo(&mut foo) else { *&mut foo = 1; todo!() };` compiles only if the temporary
+        // `Foo` (its borrow of `foo`) is gone when the `else` block starts, and `let 0 =
+        // Droppy::default().inner else { return };` asserts the drop has run by the next
+        // statement. The `else` block is then built with the statement's own entries (its
+        // temporaries, now dropped, and its bindings, never made on this path) set aside, so
+        // a `return` or `break` in it drops neither again; `let_else_end` puts them back for
+        // the matched path, where they drop at the statement's end (`temp_end`).
         self.begin(fail);
-        self.work.push(Task::LetElseEnd(cont));
+        let mut i = self.scope_pats.len();
+        while i > mark {
+            i -= 1;
+            match self.scope_pats[i] {
+                h @ (Held::Rest { .. } | Held::Moved { .. }) => self.drop_held(h, false)?,
+                Held::Pat(_) => {}
+                Held::Temp { .. } => {
+                    return Err(unsupported(init, "an extended temporary in a `let`-`else` initializer"));
+                }
+            }
+        }
+        let from = self.let_else_held.len() as u32;
+        self.let_else_held.extend_from_slice(&self.scope_pats[mark..]);
+        self.scope_pats.truncate(mark);
+        self.work.push(Task::LetElseEnd(cont, from));
         self.work.push(Task::Eval(els));
         Ok(())
     }
 
     /// `Task::LetElseEnd`: the `else` block's value (of type `!`) on top; nothing follows it,
-    /// and the statement goes on in `cont`.
-    pub(super) fn let_else_end(&mut self, cont: Block) -> Result<(), BuildError> {
+    /// and the statement goes on in `cont` with its entries (`let_else_held` from `from`) back.
+    pub(super) fn let_else_end(&mut self, cont: Block, from: u32) -> Result<(), BuildError> {
         self.pop()?;
         self.b.unreachable();
         self.begin(cont);
+        let mark = *self.temp_marks.last().ok_or(malformed("a `let`-`else` end outside its statement"))? as usize;
+        if self.scope_pats.len() != mark {
+            return Err(malformed("a `let`-`else`'s `else` block left drop entries behind"));
+        }
+        let from = from as usize;
+        if from > self.let_else_held.len() {
+            return Err(malformed("a `let`-`else`'s entries set aside out of order"));
+        }
+        self.scope_pats.extend_from_slice(&self.let_else_held[from..]);
+        self.let_else_held.truncate(from);
         Ok(())
     }
 }

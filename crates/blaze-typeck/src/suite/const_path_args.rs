@@ -54,7 +54,7 @@ fn world() -> (Fx, [ItemKey; 3]) {
 /// Whether the row at `e` holds exactly `want`, each shown (`P0`: the fn's first type parameter).
 fn holds(fx: &Fx, c: &Checked<'_>, e: ExprId, want: &[&str]) -> bool {
     let Some(l) = c.const_args_of(e) else { return false };
-    let got = &c.types.view().lists[l.range()];
+    let got = c.types.view().list(l).expect("the callee's arguments in the body's table");
     got.len() == want.len() && got.iter().zip(want.iter()).all(|(&t, w)| show(fx, c.types.view(), t) == *w)
 }
 

@@ -12,7 +12,7 @@ use std::alloc::Global;
 use std::vec::Vec;
 
 use blaze_build::layout::ReprAttrs;
-use blaze_build::{Abi, Intrinsic, StaticItem};
+use blaze_build::{Abi, Intrinsic, PanicConst, StaticItem};
 use blaze_ids::ContentId;
 use blaze_lower::typeck::TypeckBody;
 use blaze_own::Alloc;
@@ -28,13 +28,27 @@ use crate::run::{Named, RunError};
 /// the one list both front ends answer from, so each tables the same set. A front end that
 /// tables only what it walks starts its walk at each one the program's world declares.
 impl FnLang {
-    pub const ALL: [FnLang; 2] = [FnLang::PanicBoundsCheck, FnLang::DropInPlace];
+    pub const ALL: [FnLang; 12] = [
+        FnLang::PanicBoundsCheck,
+        FnLang::DropInPlace,
+        FnLang::PanicConst(PanicConst::AddOverflow),
+        FnLang::PanicConst(PanicConst::SubOverflow),
+        FnLang::PanicConst(PanicConst::MulOverflow),
+        FnLang::PanicConst(PanicConst::DivOverflow),
+        FnLang::PanicConst(PanicConst::RemOverflow),
+        FnLang::PanicConst(PanicConst::NegOverflow),
+        FnLang::PanicConst(PanicConst::ShrOverflow),
+        FnLang::PanicConst(PanicConst::ShlOverflow),
+        FnLang::PanicConst(PanicConst::DivByZero),
+        FnLang::PanicConst(PanicConst::RemByZero),
+    ];
 
     /// Its `#[lang = ".."]` name.
     pub const fn lang(self) -> &'static str {
         match self {
             FnLang::PanicBoundsCheck => "panic_bounds_check",
             FnLang::DropInPlace => "drop_in_place",
+            FnLang::PanicConst(p) => p.lang(),
         }
     }
 
@@ -53,6 +67,7 @@ impl FnLang {
         match self {
             FnLang::PanicBoundsCheck => &["panic_bounds_check"],
             FnLang::DropInPlace => &["drop_glue", "drop_in_place"],
+            FnLang::PanicConst(p) => p.declared_as(),
         }
     }
 }

@@ -59,6 +59,28 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         Ok(Some(self.try_structurally_resolve(t)?))
     }
 
+    /// The arguments `Self` stands at where the world answered it with the ADT `adt`
+    /// (`Def::Adt`, the segment `Self` alone): those of the impl's own self type as the body
+    /// sees them. The Reference, "Paths", "`Self`": "In an implementation, it refers to the
+    /// type being implemented", so `Self` in `impl<const N: usize> C<N>` is `C<N>` at the
+    /// impl's `N`, never `C` at fresh arguments (those are for a written name, `C::H`, through
+    /// `explicit_args`). `None` after `UnresolvedPath` naming `Self`: the body is in no impl,
+    /// or the impl's self type is not `adt`.
+    pub(crate) fn impl_self_adt_args(&mut self, at: At, cause: Cause, adt: ItemKey) -> Result<Option<TyList>, Stop> {
+        let self_name = Some(crate::ids::Name::of("Self"));
+        let Some(self_ty) = self.impl_self_ty(cause)? else {
+            self.diag(DiagCode::UnresolvedPath, at, None, None, self_name);
+            return Ok(None);
+        };
+        match self.view(self_ty) {
+            TyView::Adt(k, args) if k == adt => Ok(Some(args)),
+            _ => {
+                self.diag(DiagCode::UnresolvedPath, at, None, Some(self_ty), self_name);
+                Ok(None)
+            }
+        }
+    }
+
     /// The type `P::Assoc` of the value path `P::Assoc::name` at `at`: the associated type
     /// `assoc` of the one candidate trait of `prefix` that declares it, as a projection the
     /// solver normalizes. `None`: refused and reported, naming `assoc` (E0220: no candidate

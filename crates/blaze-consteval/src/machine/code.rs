@@ -7,7 +7,9 @@
 //!
 //! What compiling meets that the language refuses, or a record not made yet, becomes an
 //! operation that stops the run when it is reached (`Op::Late`), never the compile: a branch
-//! not taken refuses nothing. Code with a need in it is compiled again when next asked for.
+//! not taken refuses nothing. A stop that names what a later step supplies (a need, a missing
+//! definition, an unanswered projection) is PENDING and makes the code incomplete: the next
+//! evaluation that asks for it compiles that body again (machine/late.rs).
 //! The compiler is an explicit work stack, as the run is: no recursion on the input.
 
 use core::alloc::Allocator;
@@ -22,6 +24,7 @@ use blaze_typeck::{
     Stmt, StmtId, UnOp,
 };
 
+use super::late::Late;
 use super::{Machine, Mode, Need, NeedKind, Place, R, Repr, Stop, Val, Work, int_info, malformed, mask, unsupported};
 use crate::error::Refusal;
 use crate::layout::{self, Layout};
@@ -29,6 +32,10 @@ use crate::lit;
 use crate::mem::{PTR, Scalar};
 use crate::record::RecordKey;
 use crate::{ConstWorld, FnKind, Intrinsic, Typed};
+
+// `let` in a condition: `if let`, `while let`, let chains (machine/lets.rs).
+#[path = "lets.rs"]
+mod lets;
 
 /// A register of a frame, by number.
 pub(super) type Reg = u32;
@@ -182,12 +189,6 @@ pub(super) struct Call {
     pub(super) ret: PTy,
 }
 
-/// What a reached `Late` stops with.
-#[derive(Debug)]
-pub(super) enum Late {
-    Refuse(Refusal<'static>),
-    Need(Need),
-}
 
 /// One body compiled at one instance.
 pub(super) struct Code<A: Allocator + Clone> {
@@ -225,10 +226,14 @@ pub(super) struct Code<A: Allocator + Clone> {
     pub(super) discrs: Vec<i128, A>,
     /// The records compiling read (explicit discriminants): every run reads them too.
     pub(super) reads: Vec<ContentId, A>,
-    /// No `Late::Need` in it, and no run of it has stopped on what the world does not hold
-    /// (a reached `Late::Refuse(Refusal::Missing)`: machine.rs, `Op::Late`): kept for every
-    /// later evaluation.
+    /// No `Late::Pending` in it (machine/late.rs): kept for every later evaluation. Incomplete
+    /// code is compiled again by the first later evaluation that asks for it.
     pub(super) complete: bool,
+    /// The evaluation (`Codes::evaluation`) that compiled it: incomplete code is reused within
+    /// it, since the world does not change while an evaluation runs.
+    pub(super) compiled_in: u64,
+    /// How many times this body at this instance was compiled (the tests' counter).
+    pub(super) compiles: u32,
 }
 
 /// What a run needs to know of an enum, found once when its code is compiled (rule 74): where
@@ -279,15 +284,20 @@ pub struct Codes<A: Allocator + Clone> {
     /// no room, while an evaluation holds them).
     work: Work<A>,
     alloc: A,
+    /// The evaluations begun on this table: each takes the work once ([`Self::take_work`]).
+    pub(super) evaluation: u64,
 }
 
 impl<A: Allocator + Clone> Codes<A> {
     pub fn new_in(alloc: A) -> Codes<A> {
-        Codes { list: Vec::new_in(alloc.clone()), by: HashMap::new_in(alloc.clone()), work: Work::new_in(alloc.clone()), alloc }
+        Codes { list: Vec::new_in(alloc.clone()), by: HashMap::new_in(alloc.clone()), work: Work::new_in(alloc.clone()), alloc, evaluation: 0 }
     }
 
     /// The working vectors, for one evaluation, which gives them back ([`Self::put_work`]).
+    /// Taking them begins an evaluation: incomplete code compiled before it is compiled again
+    /// when asked for.
     pub(super) fn take_work(&mut self) -> Work<A> {
+        self.evaluation += 1;
         core::mem::replace(&mut self.work, Work::new_in(self.alloc.clone()))
     }
 
@@ -368,6 +378,15 @@ enum C {
     Arm { e: ExprId, arm: u32, place: Reg, ty: PTy, dst: Reg, ends: u32 },
     Guard { e: ExprId, arm: u32, place: Reg, ty: PTy, dst: Reg, ends: u32, fail: u32 },
     ArmBody { e: ExprId, arm: u32, place: Reg, ty: PTy, dst: Reg, ends: u32, fail: u32 },
+    /// A link of an `if` condition compiled by links (machine/lets.rs): an `&&`, a `let` or a
+    /// `bool`; every failure to fixup list `fail` (the `else` block).
+    CondLink { e: ExprId, fail: u32 },
+    /// A condition `let` after its scrutinee: its pattern's tests, failures to `fail`.
+    CondLet { e: ExprId, fail: u32 },
+    /// A condition `bool` link after its value: false to `fail`.
+    CondBool { e: ExprId, fail: u32 },
+    /// An `if` by links after its consequent: the `else` block at `fail`.
+    IfLetEnd { e: ExprId, dst: Reg, fail: u32 },
 }
 
 impl C {
@@ -405,7 +424,11 @@ impl C {
             | C::Match(e)
             | C::Arm { e, .. }
             | C::Guard { e, .. }
-            | C::ArmBody { e, .. } => e,
+            | C::ArmBody { e, .. }
+            | C::CondLink { e, .. }
+            | C::CondLet { e, .. }
+            | C::CondBool { e, .. }
+            | C::IfLetEnd { e, .. } => e,
         }
     }
 }
@@ -461,13 +484,6 @@ pub(super) fn num(n: PNode) -> Num {
     }
 }
 
-/// The `Late` that a compile-time stop becomes.
-fn late(s: Stop<'_>) -> Late {
-    match s {
-        Stop::Need(n) => Late::Need(n),
-        Stop::Refused(r) => Late::Refuse(r.detach()),
-    }
-}
 
 impl Refusal<'_> {
     /// A refusal with no owned parts, as code keeps it; one with parts never arises while
@@ -489,6 +505,7 @@ impl Refusal<'_> {
             Refusal::WriteToImmutable => Refusal::WriteToImmutable,
             Refusal::MutableStatic { item } => Refusal::MutableStatic { item },
             Refusal::NotConstFn { item } => Refusal::NotConstFn { item },
+            Refusal::UnknownIntrinsic { item } => Refusal::UnknownIntrinsic { item },
             Refusal::InvalidBool { value } => Refusal::InvalidBool { value },
             Refusal::InvalidChar { value } => Refusal::InvalidChar { value },
             Refusal::InvalidTag { bits } => Refusal::InvalidTag { bits },
@@ -502,6 +519,9 @@ impl Refusal<'_> {
             Refusal::Malformed { what } => Refusal::Malformed { what },
             Refusal::Literal(e) => Refusal::Literal(e),
             Refusal::Missing { what, item } => Refusal::Missing { what, item },
+            Refusal::NeedsDrop { what } => Refusal::NeedsDrop { what },
+            Refusal::Projection { trait_, name } => Refusal::Projection { trait_, name },
+            Refusal::FieldGround { adt, field, name, projection } => Refusal::FieldGround { adt, field, name, projection },
             Refusal::Panic { .. } | Refusal::Cycle { .. } => Refusal::Malformed { what: "a refusal with parts kept in code" },
         }
     }
@@ -512,8 +532,12 @@ impl Refusal<'_> {
             Refusal::Unsupported { what } => Refusal::Unsupported { what },
             Refusal::Malformed { what } => Refusal::Malformed { what },
             Refusal::Missing { what, item } => Refusal::Missing { what, item: *item },
+            Refusal::NeedsDrop { what } => Refusal::NeedsDrop { what },
+            Refusal::Projection { trait_, name } => Refusal::Projection { trait_: *trait_, name: *name },
+            Refusal::FieldGround { adt, field, name, projection } => Refusal::FieldGround { adt: *adt, field: *field, name: *name, projection: *projection },
             Refusal::MutableStatic { item } => Refusal::MutableStatic { item: *item },
             Refusal::NotConstFn { item } => Refusal::NotConstFn { item: *item },
+            Refusal::UnknownIntrinsic { item } => Refusal::UnknownIntrinsic { item: *item },
             Refusal::Literal(e) => Refusal::Literal(*e),
             Refusal::Unreachable => Refusal::Unreachable,
             Refusal::DiscriminantOverflow { variant } => Refusal::DiscriminantOverflow { variant: *variant },
@@ -529,7 +553,8 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
     pub(super) fn code<A: Allocator + Clone>(&mut self, codes: &mut Codes<A>, item: ItemKey, args: List) -> R<'a, u32> {
         let old = codes.by.get(&(item, args)).copied();
         if let Some(i) = old {
-            if codes.list[i as usize].complete {
+            let c = &codes.list[i as usize];
+            if c.complete || c.compiled_in == codes.evaluation {
                 return Ok(i);
             }
         }
@@ -566,6 +591,8 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 discrs: Vec::new_in(codes.alloc.clone()),
                 reads: Vec::new_in(codes.alloc.clone()),
                 complete: true,
+                compiled_in: codes.evaluation,
+                compiles: 1,
             };
             let mut args_v = Vec::new_in(self.alloc);
             args_v.extend_from_slice(self.ground.view().list(args).map_err(|_| malformed("arguments past the ground table"))?);
@@ -602,6 +629,12 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
         };
         Ok(match old {
             Some(i) => {
+                // Compiled again in place: callers' links to `i` stay valid, and no frame runs
+                // the old code (it was compiled in an earlier evaluation, and this is the first
+                // ask for it in this one).
+                let mut code = code;
+                code.compiles = codes.list[i as usize].compiles.saturating_add(1);
+                self.charge_recompile(item, code.ops.len())?;
                 codes.list[i as usize] = code;
                 i
             }
@@ -646,7 +679,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 self.pattern(cc, code, pat, place, t, fail)?;
                 let ok = self.jump(code, cc);
                 self.patch(code, cc, fail);
-                let k = self.keep_late(code, Late::Refuse(Refusal::Malformed { what: "a refutable parameter pattern" }));
+                let k = self.keep_late(code, Late::Final(Refusal::Malformed { what: "a refutable parameter pattern" }));
                 self.emit(code, cc, Op::Late { k });
                 self.patch_one(code, ok);
                 Ok(())
@@ -709,12 +742,13 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
     }
 
     fn late<A: Allocator + Clone>(&self, code: &mut Code<A>, cc: &mut Cc<'w, '_>, s: Stop<'a>) {
-        let k = self.keep_late(code, late(s));
+        let k = self.keep_late(code, Late::of(s));
         self.emit(code, cc, Op::Late { k });
     }
 
+    /// Keeps a stop in the code; a pending one makes the code incomplete (machine/late.rs).
     fn keep_late<A: Allocator + Clone>(&self, code: &mut Code<A>, l: Late) -> u32 {
-        if matches!(l, Late::Need(_)) {
+        if l.makes_incomplete(self.plant) {
             code.complete = false;
         }
         code.lates.push(l);
@@ -763,7 +797,12 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 return Ok(PTy(c));
             }
         }
-        let out = blaze_build::ground(cc.typed.types, t, &cc.args, self.ground, self.alloc, self.world).map_err(|_| unsupported("a type with no ground form (an alias, an opaque type, a closure)"))?;
+        // A projection no impl answered is pending (machine/late.rs): the front end makes the
+        // impls and asks again. Any other grounding refusal is final.
+        let out = blaze_build::ground(cc.typed.types, t, &cc.args, self.ground, self.alloc, self.world).map_err(|e| match e {
+            blaze_build::BuildError::Projection { trait_, name } => Stop::Refused(Refusal::Projection { trait_, name }),
+            _ => unsupported("a type with no ground form (an alias, an opaque type, a closure)"),
+        })?;
         if cc.tys.len() <= t.0 as usize {
             cc.tys.resize(t.0 as usize + 1, u32::MAX);
         }
@@ -831,6 +870,24 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
         all.push(blaze_build::ground(body.types, anchor.ty, &cc.args, self.ground, self.alloc, self.world).map_err(|_| unsupported(no_ground))?);
         for &t in written {
             all.push(blaze_build::ground(body.types, t, &cc.args, self.ground, self.alloc, self.world).map_err(|_| unsupported(no_ground))?);
+        }
+        self.ground.intern_list(&all).map_err(|_| malformed("the ground table is full"))
+    }
+
+    /// The arguments the check recorded for constant path `e` (blaze-typeck
+    /// `Checked::const_args`: `Self::NAME` in a trait's default is `[Self]`), each grounded at
+    /// this instance's arguments; `List::EMPTY` for a path with no row (a constant with no
+    /// generics). The Reference, "Associated Items", "Associated constants": "definitions that
+    /// include generic parameters are evaluated after monomorphization", so `Self::SIZE` in
+    /// `SizedTypeProperties::IS_ZST` at `Self = u8` is `u8`'s.
+    fn recorded_const_args(&mut self, cc: &Cc<'w, '_>, e: ExprId) -> R<'a, List> {
+        let t = &cc.typed;
+        let Some(i) = rows(t.const_args.0, e).next() else { return Ok(List::EMPTY) };
+        let recorded = t.types.list(t.const_args.1[i]).map_err(|_| malformed("a constant path's arguments past the record's types"))?;
+        let no_ground = "a constant path's recorded arguments with no ground form (a hole `_`, an alias, an opaque type)";
+        let mut all: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(recorded.len(), self.alloc);
+        for &ty in recorded {
+            all.push(blaze_build::ground(t.types, ty, &cc.args, self.ground, self.alloc, self.world).map_err(|_| unsupported(no_ground))?);
         }
         self.ground.intern_list(&all).map_err(|_| malformed("the ground table is full"))
     }
@@ -1372,7 +1429,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                     None => {
                         let ok = self.jump(code, cc);
                         self.patch(code, cc, fail);
-                        let k = self.keep_late(code, Late::Refuse(Refusal::Malformed { what: "a refutable `let` with no `else`" }));
+                        let k = self.keep_late(code, Late::Final(Refusal::Malformed { what: "a refutable `let` with no `else`" }));
                         self.emit(code, cc, Op::Late { k });
                         self.patch_one(code, ok);
                     }
@@ -1412,6 +1469,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 cc.rs.push(d);
             }
             C::Call(e) => self.call_c(cc, code, e)?,
+            C::CondLink { .. } | C::CondLet { .. } | C::CondBool { .. } | C::IfLetEnd { .. } => self.let_c(cc, code, task)?,
             C::Match(e) => {
                 let Expr::Match { scrutinee, .. } = self.expr_c(cc, e)? else { return Err(malformed("a match task")) };
                 let s = self.pop_r(cc)?;
@@ -1426,7 +1484,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 let l = body.arms.get(arms.range()).ok_or(malformed("arms past their column"))?;
                 match l.get(arm as usize) {
                     None => {
-                        let k = self.keep_late(code, Late::Refuse(Refusal::Unreachable));
+                        let k = self.keep_late(code, Late::Final(Refusal::Unreachable));
                         self.emit(code, cc, Op::Late { k });
                         self.patch(code, cc, ends);
                         cc.rs.push(dst);
@@ -1540,10 +1598,14 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                         // ([`Self::qualified_const_args`]): the impl is selected for the
                         // ground `Q`, as a call's callee is. Any other path stays at no
                         // arguments.
-                        let written = self.qualified_const_args(cc, p)?;
-                        // No impl selected is `Refusal::Missing`: when a run reaches it this
-                        // code is no longer kept (machine.rs, `Op::Late`), so a world that
-                        // then makes the trait's impls and asks again has it compiled again.
+                        // The check's recorded arguments first (`Self::NAME`, `T::NAME` and
+                        // inferred trait arguments included); a path with no row keeps what it
+                        // writes.
+                        let recorded = self.recorded_const_args(cc, e)?;
+                        let written = if recorded.len != 0 { recorded } else { self.qualified_const_args(cc, p)? };
+                        // No impl selected is `Refusal::Missing`, a pending stop: this code
+                        // is not complete (machine/late.rs), so a world that then makes the
+                        // trait's impls and asks again has it compiled again.
                         let (k, args) = if written.len == 0 { (k, List::EMPTY) } else { self.resolve(k, written)? };
                         let key = RecordKey::of(self.instance(k, args)?);
                         code.consts.push((k, args, key));
@@ -1589,6 +1651,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 cc.tasks.push(C::BlockEnd(e));
                 cc.tasks.push(C::Block { e, next: 0 });
             }
+            Expr::If { cond, .. } if self.cond_by_links(cc, cond)? => self.if_let(cc, e, cond)?,
             Expr::If { cond, .. } => {
                 cc.tasks.push(C::IfCond(e));
                 cc.tasks.push(C::Eval(cond, Mode::Value));
@@ -1729,7 +1792,9 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 cc.tasks.push(C::Eval(base, Mode::Place));
             }
             Expr::Closure { .. } => return Err(unsupported("a closure in a constant")),
-            Expr::Let { .. } => return Err(unsupported("`let` in a condition in a constant")),
+            // An `if` condition's `let` links are compiled by machine/lets.rs; a `let` reached
+            // here is not a condition operand (inside parentheses, under `||`).
+            Expr::Let { .. } => return Err(unsupported("`let` outside an `if` or `while` condition's `&&` chain")),
             Expr::FormatArgs { .. } => return Err(unsupported("`format_args!` in a constant")),
             Expr::Await(_) | Expr::AsyncBlock { .. } => return Err(unsupported("`async` in a constant")),
             Expr::Underscore => return Err(unsupported("`_` (`_ = e`) in a constant")),
@@ -1874,6 +1939,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 dst
             }
             FnKind::NotConst => return Err(Stop::Refused(Refusal::NotConstFn { item })),
+            FnKind::UnknownIntrinsic => return Err(Stop::Refused(Refusal::UnknownIntrinsic { item })),
             FnKind::Ctor { variant, .. } => {
                 let mut fields: Vec<(u32, Reg, PTy), Alloc<'a>> = Vec::new_in(self.alloc);
                 for (k, &(r, t)) in vals.iter().enumerate() {
@@ -2274,6 +2340,9 @@ fn shape<'a>(task: C, typed: &Typed<'_>) -> R<'a, (u32, bool)> {
         | C::ArmBody { .. } => (1, true),
         C::Binary(_) | C::Index(_) => (2, true),
         C::StmtEnd { .. } | C::Let { .. } | C::LetElse { .. } | C::LoopBody(_) => (1, false),
+        C::CondLink { .. } => (0, false),
+        C::CondLet { .. } | C::CondBool { .. } => (1, false),
+        C::IfLetEnd { .. } => (1, true),
         C::Aggregate(e) => match expr(e)? {
             Expr::Tuple { elems } | Expr::Array { elems } => (elems.len, true),
             _ => (0, true),

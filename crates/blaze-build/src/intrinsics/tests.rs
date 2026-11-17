@@ -244,7 +244,6 @@ fn type_queries_are_the_layout() {
 fn reads_writes_offsets_and_transmutes_go_through_memory() {
     let mut env = Env::new();
     let u32_ = env.g.n(U32);
-    let isize_ = env.g.n(ISIZE);
     let p = env.g.n(PNode::Ptr(blaze_typeck::Mutbl::Not, u32_));
     let u8_ = env.g.n(U8);
     let arr = env.g.array(u8_, 4);
@@ -253,7 +252,8 @@ fn reads_writes_offsets_and_transmutes_go_through_memory() {
         let slot = b.slot(16, 2, SlotKind::Temp);
         let base = b.slot_addr(slot);
         // "Calculates the offset from a pointer, potentially wrapping.": element 2, byte 8.
-        let c = Call { which: Which::ArithOffset, generics: &[GenericArg::Ty(p), GenericArg::Ty(isize_)], args: &[Arg::Scalar(base), Arg::Scalar(a[1])], ret: p, site: None };
+        // `arith_offset<T>(dst: *const T, offset: isize)`: its one generic is the element `u32`.
+        let c = Call { which: Which::ArithOffset, generics: &[GenericArg::Ty(u32_)], args: &[Arg::Scalar(base), Arg::Scalar(a[1])], ret: p, site: None };
         let at = scalar(env.call(b, &c).unwrap());
         let c = Call { which: Which::WriteViaMove, generics: &[GenericArg::Ty(u32_)], args: &[Arg::Scalar(at), Arg::Scalar(a[0])], ret: unit, site: None };
         assert_eq!(env.call(b, &c).unwrap(), Out::None);
@@ -517,3 +517,5 @@ fn slice_get_unchecked_projects_without_a_check() {
         "intrinsic `slice_get_unchecked`: `slice_get_unchecked` of a `SlicePtr` that is not a pointer to a slice"
     );
 }
+
+mod offsets;

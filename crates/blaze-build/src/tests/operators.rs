@@ -240,6 +240,11 @@ impl Adts for OpAdts<'_> {
         self.w.fx.adt_of(key)
     }
 
+    /// The operator fixtures were written for wrapping arithmetic: the release setting.
+    fn overflow_checks(&self) -> crate::OverflowChecks {
+        crate::OverflowChecks::Off
+    }
+
     fn facts(&self) -> &dyn LayoutFacts {
         self
     }

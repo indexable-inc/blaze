@@ -20,6 +20,8 @@ doctest = false
 [dependencies]
 blaze-launch.workspace = true
 blaze-launch-rt.workspace = true
+# The run mode's allocator: the global one, named at the program's top (`SharedAlloc::global`).
+blaze-own = { workspace = true, features = ["std"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

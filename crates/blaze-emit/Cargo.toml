@@ -21,10 +21,20 @@ blaze-lir.workspace = true
 blaze-code = { path = "../blaze-code" }
 # `Vec` and `Alloc`: the record form's rows, in the allocator the caller names.
 blaze-own.workspace = true
+# The template table's form, `Pattern`, and the register descriptions (piece 0).
+blaze-tier.workspace = true
+# The template table's digest (`TableHead::digest`): BLAKE3 of its bytes.
+blaze-blake3.workspace = true
+
+[build-dependencies]
+# build.rs: the committed table's BLAKE3, against table/arm64.json.
+blaze-blake3.workspace = true
 
 [dev-dependencies]
 # `Alloc::global()`, the handle the record tests hand `emit_record`.
 blaze-own = { workspace = true, features = ["std"] }
+# `examples/gen_table.rs`: the files it writes, through bstd's effect layer.
+blaze-std.workspace = true
 # The reference evaluator every emitted function is compared with.
 blaze-lir = { workspace = true, features = ["eval"] }
 # `check`: random LIR functions run as machine code and in the evaluator.

@@ -28,12 +28,24 @@ pub struct LangTwice {
     pub name: std::string::String,
     pub first: LibKey,
     pub second: LibKey,
+    /// Each declaring crate's name and root file (rule 19: the refusal names both).
+    pub crates: [(std::string::String, std::string::String); 2],
 }
 
 impl core::fmt::Display for LangTwice {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "the lang item `{}` is declared twice: {:x} and {:x}", self.name, self.first, self.second)
+        let [(a, a_root), (b, b_root)] = &self.crates;
+        write!(f, "the lang item `{}` is declared twice: {:x} (crate `{a}`, {a_root}) and {:x} (crate `{b}`, {b_root})", self.name, self.first, self.second)
     }
+}
+
+/// The lang items by name, without the crate each was found in (kept only to name a clash).
+fn keys_of<'n>(found: HashMap<&'n str, (LibKey, usize), Global>) -> HashMap<&'n str, LibKey, Global> {
+    let mut langs = HashMap::new_in(Global);
+    for (name, (key, _)) in found {
+        langs.insert(name, key);
+    }
+    langs
 }
 
 /// Every impl, and every lang item by its name.
@@ -45,8 +57,20 @@ pub struct Index<'n> {
 impl<'n> Index<'n> {
     pub fn new(names: &'n Names<'n>) -> Result<Index<'n>, LangTwice> {
         let mut impls = Vec::new_in(Global);
-        let mut langs: HashMap<&'n str, LibKey, Global> = HashMap::new_in(Global);
+        let mut langs: HashMap<&'n str, (LibKey, usize), Global> = HashMap::new_in(Global);
+        let named = |krate: usize| {
+            let c = &names.crates()[krate];
+            (std::string::String::from(c.name), c.files.first().map_or(std::string::String::from("no file"), |file| std::string::String::from(file.path)))
+        };
+        // A `#![no_core]` program (the program's crate is index 0, `Front2::new`) links no
+        // toolchain crate (crates.rs `Toolchain::none`): its own lang items are the program's,
+        // and a toolchain crate resolved beside it declares none of them. Owed: such a program
+        // resolves no toolchain crate at all (run.rs `run_program` opens the shelf first).
+        let no_core = names.crates().first().is_some_and(|c| c.root_attrs.no_core);
         for (krate, c) in names.crates().iter().enumerate() {
+            if no_core && krate != 0 {
+                continue;
+            }
             // A proc-macro unit (the unit graph's kind, carried as `implicit.proc_macro`) runs
             // at build time in the sandbox; its items are never linked into the program, so
             // none of its impls can answer a question of the program's.
@@ -56,19 +80,19 @@ impl<'n> Index<'n> {
             impls.extend(c.tables.impls.iter().map(|i| ImplAt { krate, key: i.key, module: i.module, header: i.header }));
             for l in c.tables.langs.iter() {
                 match langs.get(l.name) {
-                    Some(&first) if first != l.key => {
-                        return Err(LangTwice { name: l.name.into(), first, second: l.key });
+                    Some(&(first, in_crate)) if first != l.key => {
+                        return Err(LangTwice { name: l.name.into(), first, second: l.key, crates: [named(in_crate), named(krate)] });
                     }
                     Some(_) => {}
                     None => {
-                        langs.insert(l.name, l.key);
+                        langs.insert(l.name, (l.key, krate));
                     }
                 }
             }
         }
         // By key: the order selection reads them in is a function of the records.
         impls.sort_by_key(|i| i.key);
-        Ok(Index { impls, langs })
+        Ok(Index { impls, langs: keys_of(langs) })
     }
 
     /// The lang items the crates `lang_crates` declare, from any source of names, and no impl
@@ -77,28 +101,30 @@ impl<'n> Index<'n> {
     /// are skipped as [`Index::new`] skips the unit. Crates are read in the order given, so
     /// which of two clashing declarations is `first` is a function of that order alone.
     pub fn from_source<S: super::source::NamesSource<'n>>(names: S, lang_crates: &[usize]) -> Result<Index<'n>, LangTwice> {
-        let mut langs: HashMap<&'n str, LibKey, Global> = HashMap::new_in(Global);
+        let mut langs: HashMap<&'n str, (LibKey, usize), Global> = HashMap::new_in(Global);
         let mut twice: Option<LangTwice> = None;
+        // A source of names by records holds no crate's name: its crate key and index name it.
+        let named = |krate: usize| (std::format!("{:?}", names.crate_key(krate)), std::format!("crate {krate} of the records"));
         for &krate in lang_crates {
             if names.proc_macro(krate) == Some(true) {
                 continue;
             }
             names.each_lang(krate, &mut |name, key| match langs.get(name) {
-                Some(&first) if first != key => {
+                Some(&(first, in_crate)) if first != key => {
                     if twice.is_none() {
-                        twice = Some(LangTwice { name: name.into(), first, second: key });
+                        twice = Some(LangTwice { name: name.into(), first, second: key, crates: [named(in_crate), named(krate)] });
                     }
                 }
                 Some(_) => {}
                 None => {
-                    langs.insert(name, key);
+                    langs.insert(name, (key, krate));
                 }
             });
             if let Some(twice) = twice {
                 return Err(twice);
             }
         }
-        Ok(Index { impls: Vec::new_in(Global), langs })
+        Ok(Index { impls: Vec::new_in(Global), langs: keys_of(langs) })
     }
 
     /// The item `#[lang = "name"]` declares.

@@ -281,7 +281,7 @@ impl fmt::Display for TaskFailure {
                 self.name
             ),
             Why::Refused { what, rule } => write!(f, "{}: {what} ({rule})", self.name),
-            Why::Waited { on } => write!(f, "{}: needs {on}, which failed this command; no record is kept (rule 3)", self.name),
+            Why::Waited { on } => write!(f, "{}: needs {on}, which failed", self.name),
         }
     }
 }
@@ -1047,6 +1047,14 @@ impl<'a> Request<'a> {
 
     pub fn profile(&self) -> &Profile {
         &self.profile
+    }
+
+    /// The record `name` stands at once the request has answered: made or kept this run, else
+    /// the last answer's; `None` when no record holds it (never asked, or its task failed). How
+    /// `test` reads its suites' `CrateScope` records after the check.
+    pub fn settled_input(&self, name: Name) -> Option<Input> {
+        let now = self.now.get(&name).copied().or_else(|| self.old(name).map(|row| Now { at: row.at, out: row.out }))?;
+        Some(Input { name, at: now.at, out: now.out })
     }
 
     /// The request's certificate key, known after `Start`.

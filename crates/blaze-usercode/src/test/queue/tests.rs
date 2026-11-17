@@ -238,7 +238,7 @@ impl Fake {
                         self.removed.push(file);
                         answers.push(Completion { tag, done: Done::Removed });
                     }
-                    Effect::Listen { at, tag } => self.listens.push((tag, at)),
+                    Effect::Listen { at, tag, .. } => self.listens.push((tag, at)),
                     Effect::Recv { conn, tag, .. } => self.recvs.push((tag, conn)),
                     Effect::Spawn { command, tag } => self.spawns.push((tag, *command)),
                     Effect::Kill { tag } => self.kills.push(tag),

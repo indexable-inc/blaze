@@ -38,6 +38,7 @@ use blaze_own::{AllocFailure, Vec};
 use bstd::cx::Cx;
 use bstd::fs::{Content, Durable};
 
+use super::producers::{OneTool, PackError, kind_of, pack_refused, table_len};
 use super::{CliError, FOOTER, FORMAT, MAGIC, PackStore, ROW, RemoteError, StorePlant, Untaken, index_number, pack_name};
 
 /// The domain of a pack's payloads' digest (the footer's).
@@ -71,6 +72,8 @@ pub enum PutError {
     /// Memory for the merge's (or the compaction rule's) table of `rows` index rows over
     /// `packs` packs could not be had, in the folder `folder` (store/compact.rs).
     MergeNoRoom { folder: &'static str, packs: u32, rows: u64 },
+    /// A pack, or its producer table, refused by name (store/producers.rs).
+    Pack(PackError),
 }
 
 impl core::fmt::Display for PutError {
@@ -81,6 +84,7 @@ impl core::fmt::Display for PutError {
             PutError::TooMany { key } => write!(f, "the store's put of {key}: past 2^32 records in one command (rule 18, bounded-progress: the table's cap)"),
             PutError::SealNoRoom { records, why } => write!(f, "the store's seal of {records} records: no memory for the pack's index (rule 3, no-fallback): {why}"),
             PutError::MergeNoRoom { folder, packs, rows } => write!(f, "the store's merge of {packs} packs under {folder}: no memory for the table of their {rows} index rows (48 bytes each; rule 3, no-fallback: nothing is merged, every pack stays readable)"),
+            PutError::Pack(error) => write!(f, "{error}"),
         }
     }
 }
@@ -343,12 +347,14 @@ impl PackStore {
 
     /// The pack `number`, just published, taken as known whole in this boot.
     pub(super) fn take_pack(&mut self, cx: &Cx, number: u64) -> Result<(), CliError> {
-        let taken = PackStore::read_pack(cx, &self.packs_dir, number, false, &self.scratch, self.plant);
+        let taken = PackStore::read_pack(cx, &self.packs_dir, self.folder, number, false, &self.scratch, self.plant);
         self.scratch.reset();
         match taken {
             Ok(pack) => self.packs.push((number, pack)),
             // Another command's merge took it already: its records are in that merge's pack.
             Err(Untaken::Gone) => {}
+            // Just written in format 3: an older format under its name is another writer's.
+            Err(Untaken::Old(error)) => return Err(pack_refused(error)),
             Err(Untaken::Refused) => return Err(CliError::Text { what: "a pack under .blaze/v2/packs read back as torn just after its publish" }),
             Err(Untaken::Failed(error)) => return Err(error),
         }
@@ -376,24 +382,42 @@ impl PackStore {
             let own = &self.own;
             order.sort_unstable_by(|a, b| own.key(*a).cmp(&own.key(*b)));
         }
+        // Each record's kind, opened once (blaze-drive `record::open`, as `Sharing::place`
+        // does), in the sorted order; the table is those kinds under this store's one tool.
+        let mut kinds: Vec<u8, SharedAlloc<'static>> = Vec::try_with_capacity_in(count as usize, alloc).map_err(no_room)?;
+        let mut table = OneTool::new();
+        for row in order.iter() {
+            let kind = kind_of(self.own.record(*row).1);
+            table.see(kind);
+            // Within the capacity reserved above.
+            kinds.push(kind);
+        }
+        table.rank();
+        let mut table_bytes: Vec<u8, SharedAlloc<'static>> = Vec::try_with_capacity_in(table_len(table.count()) as usize, alloc).map_err(no_room)?;
+        table.write(self.tool, &mut |piece: &[u8]| table_bytes.try_extend_from_slice(piece)).map_err(no_room)?;
         // The index and footer, and the payloads' digest: each byte hashed once, none copied.
         let mut tail: Vec<u8, SharedAlloc<'static>> = Vec::try_with_capacity_in(count as usize * ROW + FOOTER, alloc).map_err(no_room)?;
         let mut hasher = Hasher::new(PAYLOADS);
         let mut at = 0u64;
-        for row in order.iter() {
+        for (row, kind) in order.iter().zip(kinds.iter()) {
             let (key, bytes) = self.own.record(*row);
             let pad = bytes.len().next_multiple_of(8) - bytes.len();
             hasher.update(bytes).update(&ZEROS[..pad]);
             tail.try_extend_from_slice(&key.0.0).map_err(no_room)?;
             tail.try_extend_from_slice(&at.to_le_bytes()).map_err(no_room)?;
             tail.try_extend_from_slice(&(bytes.len() as u32).to_le_bytes()).map_err(no_room)?;
-            tail.try_extend_from_slice(&[0; 4]).map_err(no_room)?;
+            tail.try_extend_from_slice(&table.index(*kind).to_le_bytes()).map_err(no_room)?;
+            tail.try_extend_from_slice(&[0; 2]).map_err(no_room)?;
             at += (bytes.len() + pad) as u64;
         }
+        // The producer table ends the payloads: under their digest, before the index.
+        hasher.update(table_bytes.as_slice());
+        let index_at = at + table_bytes.len() as u64;
         tail.try_extend_from_slice(MAGIC).map_err(no_room)?;
         tail.try_extend_from_slice(&FORMAT.to_le_bytes()).map_err(no_room)?;
-        tail.try_extend_from_slice(&u64::from(count).to_le_bytes()).map_err(no_room)?;
-        tail.try_extend_from_slice(&at.to_le_bytes()).map_err(no_room)?;
+        tail.try_extend_from_slice(&count.to_le_bytes()).map_err(no_room)?;
+        tail.try_extend_from_slice(&table.count().to_le_bytes()).map_err(no_room)?;
+        tail.try_extend_from_slice(&index_at.to_le_bytes()).map_err(no_room)?;
         tail.try_extend_from_slice(&hasher.finish().0).map_err(no_room)?;
         let number = index_number(tail.as_slice());
         let name = pack_name(number)?;
@@ -401,8 +425,8 @@ impl PackStore {
         if self.plant == StorePlant::IndexBeforePayloads {
             // The planted bug: the pack's name holds its index and footer over a hole where the
             // payloads go, and the boot record vouches for it, before the payloads are written.
-            let mut hole: Vec<u8, SharedAlloc<'static>> = Vec::try_with_capacity_in(at as usize, alloc).map_err(no_room)?;
-            hole.resize(at as usize, 0);
+            let mut hole: Vec<u8, SharedAlloc<'static>> = Vec::try_with_capacity_in(index_at as usize, alloc).map_err(no_room)?;
+            hole.resize(index_at as usize, 0);
             let first = [hole.as_slice(), tail.as_slice()];
             self.packs_dir.publish(&cx, &name, Content::parts(&first, most), Durable::No)?;
             let before = self.packs.len();
@@ -411,7 +435,7 @@ impl PackStore {
             self.packs.truncate(before);
         }
         {
-            let mut parts: Vec<&[u8], SharedAlloc<'static>> = Vec::try_with_capacity_in(count as usize * 2 + 1, alloc).map_err(no_room)?;
+            let mut parts: Vec<&[u8], SharedAlloc<'static>> = Vec::try_with_capacity_in(count as usize * 2 + 2, alloc).map_err(no_room)?;
             for row in order.iter() {
                 let bytes = self.own.record(*row).1;
                 let pad = bytes.len().next_multiple_of(8) - bytes.len();
@@ -421,6 +445,9 @@ impl PackStore {
                 if pad > 0 {
                     parts.try_push(&ZEROS[..pad]).map_err(|refused| no_room(refused.why))?;
                 }
+            }
+            if !table_bytes.is_empty() {
+                parts.try_push(table_bytes.as_slice()).map_err(|refused| no_room(refused.why))?;
             }
             parts.try_push(tail.as_slice()).map_err(|refused| no_room(refused.why))?;
             self.packs_dir.publish(&cx, &name, Content::parts(parts.as_slice(), most), Durable::No)?;

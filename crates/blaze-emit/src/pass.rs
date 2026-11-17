@@ -363,7 +363,7 @@ fn size_of_width(width: u32) -> Option<Size> {
     }
 }
 
-fn cond_of(cond: IntCond) -> Cond {
+pub(crate) fn cond_of(cond: IntCond) -> Cond {
     match cond {
         IntCond::Eq => Cond::Eq,
         IntCond::Ne => Cond::Ne,
@@ -378,7 +378,7 @@ fn cond_of(cond: IntCond) -> Cond {
     }
 }
 
-const fn is_signed(cond: IntCond) -> bool {
+pub(crate) const fn is_signed(cond: IntCond) -> bool {
     matches!(cond, IntCond::Slt | IntCond::Sle | IntCond::Sgt | IntCond::Sge)
 }
 

@@ -234,7 +234,7 @@ fn step_impl<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, impl_: Def) -> Result<
         (ImplPolarity::Positive, Polarity::Positive) | (ImplPolarity::Negative, Polarity::Negative) => Certainty::Yes,
         _ => return Ok(Step::No),
     };
-    let args = cx.fresh_impl_args(&h)?;
+    let args = cx.fresh_impl_args_of(impl_, &h)?;
     let header = cx.import_list(h.portable, h.args, args)?;
     if !cx.eq_lists(gargs, header)? {
         return Ok(Step::No);

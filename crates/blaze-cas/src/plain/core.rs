@@ -288,6 +288,12 @@ pub(crate) enum Plant {
     /// [`Plain::scrub_next`] records a segment scrubbed this boot when its first slice is
     /// walked, before the rest is: what the slices after would have found is never looked at.
     ScrubMarkedEarly,
+    /// Durable: the flip writes its slot without syncing the store's directory first: the
+    /// names of the segments and the log it made may not survive a power cut the slot does.
+    SkipDirSync,
+    /// A flip after an open that found no generation's manifest appends to the log the newest
+    /// slot names, which a power cut may have taken.
+    AppendToLostLog,
 }
 
 /// What one slice of the background pass did ([`Plain::scrub_next`]).
@@ -396,6 +402,10 @@ const REMOVE: u8 = 17;
 const LATE_SYNC: u8 = 18;
 const HEAD_MAKE: u8 = 19;
 const BARRIER: u8 = 20;
+/// The store's directory synced: the names of the files made before it (the head at the first
+/// open; durable: a commit's segments and its log, before the slot that names them) survive a
+/// power cut, as a file's own sync does not make its name do.
+const DIR_SYNC: u8 = 21;
 
 enum RootEdit {
     Set { name: String, key: Key },
@@ -591,6 +601,10 @@ pub struct Plain {
     unopened: Vec<(Segment, FileName, StoreError)>,
     /// This open made the head at its length already (it is made once, never twice).
     head_made: bool,
+    /// The log the current slot names gave no generation's manifest back (a power cut tore it,
+    /// or took its name before its directory was synced): the next flip starts a new log, as
+    /// an append to it may find no file there.
+    log_lost: bool,
     /// The flip lock is held (taken, and its unlock not yet asked): a step that fails under it
     /// lets it go as it stops, so a broken store never holds every other process's commit.
     holds_lock: bool,
@@ -760,6 +774,7 @@ impl Plain {
             late_sync: Vec::new_in(Global),
             unopened: Vec::new_in(Global),
             head_made: false,
+            log_lost: false,
             holds_lock: false,
             head_torn: None,
             torn_stamp: false,
@@ -1645,8 +1660,10 @@ impl Plain {
         });
         // The log: a new one past its bound, the old one retired.
         let estimate = m.encode().len() as u64 + 24;
+        // A log no generation's manifest was read from may be gone: never appended to.
+        let appendable = !self.log_lost || self.plant() == Plant::AppendToLostLog;
         let (log, at) = match base.slot {
-            Some(slot) if slot.log_end() + estimate <= LOG_MOST => (slot.log, slot.log_end()),
+            Some(slot) if appendable && slot.log_end() + estimate <= LOG_MOST => (slot.log, slot.log_end()),
             _ => {
                 self.seq += 1;
                 let id = format::id_of(LOG_DOMAIN, &[&self.cfg.nonce.to_le_bytes(), &self.seq.to_le_bytes(), &now_ns.to_le_bytes()]);
@@ -1766,6 +1783,8 @@ impl Plain {
         self.torn_stamp = false;
         self.slot = Some(slot);
         self.manifest = manifest;
+        // The slot names the log this flip wrote its manifest to.
+        self.log_lost = false;
         if self.cfg.durable && self.plant() == Plant::FlipBeforeSync {
             for (i, file) in std::mem::take(&mut self.late_sync).into_iter().enumerate() {
                 effects.push(Effect::Sync { file, tag: self.tag(LATE_SYNC, i as u32) });
@@ -2222,6 +2241,8 @@ impl Plain {
                     .transpose();
                 match manifest {
                     Ok(Some(manifest)) if manifest.generation == slot.generation => {
+                        // Read back whole: the log is there to append to.
+                        self.log_lost = false;
                         if ctx == Ctx::Open {
                             self.report.whole = Some(manifest.generation);
                         }
@@ -2239,6 +2260,10 @@ impl Plain {
                     // Synced once in the store's life, before its first segment: so an empty or
                     // short head never stands beside segments a power cut kept.
                     effects.push(Effect::Sync { file: self.head.clone(), tag: self.tag(HEAD_MAKE, 1) });
+                } else if index == 1 {
+                    // And its name with it: a power cut never keeps a segment's name and loses
+                    // the head's.
+                    effects.push(Effect::SyncDir { dir: self.cfg.dir.clone().into(), tag: self.tag(HEAD_MAKE, 2) });
                 } else {
                     self.phase = Phase::ReadHead(Ctx::Open);
                     effects.push(Effect::ReadAll { file: self.head.clone(), tag: self.tag(HEAD_READ, 0) });
@@ -2463,6 +2488,19 @@ impl Plain {
                 if let Some(why) = fail("syncing a manifest log", &flip.log, &done) {
                     return Err(why);
                 }
+                if self.plant() == Plant::SkipDirSync {
+                    self.write_slot(effects);
+                } else {
+                    // Durable: the names of the segments and the log made for this generation
+                    // are made durable before the slot that names them.
+                    effects.push(Effect::SyncDir { dir: self.cfg.dir.clone().into(), tag: self.tag(DIR_SYNC, 0) });
+                }
+                Ok(())
+            }
+            (DIR_SYNC, Phase::Flipping(_)) => {
+                if let Some(why) = fail("syncing the store's directory", &self.cfg.dir, &done) {
+                    return Err(why);
+                }
                 self.write_slot(effects);
                 Ok(())
             }
@@ -2549,6 +2587,8 @@ impl Plain {
         // generation follows the newest number so its slot is right.
         let newest = slots[0].expect("read");
         let manifest = Manifest { generation: newest.generation, ..Manifest::default() };
+        // The newest slot's number is followed; its log, which gave nothing back, is not.
+        self.log_lost = true;
         self.resolved(ctx, Base { slot: Some(newest), manifest }, false, true, now_ns, effects)
     }
 

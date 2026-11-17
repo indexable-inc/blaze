@@ -593,6 +593,29 @@ impl<'a> Driver<'_, 'a> {
             match expand.attr(&path, call.args.as_ref(), &call.item, self.edition, &mut out) {
                 Expansion::Unsupported => continue,
                 expansion => {
+                    // The derives written before the macro ran first and are not in its input
+                    // (blaze-expand `ItemAttrs::attr_call`): the first `derives_taken` of the
+                    // item's derives, each on the item as a derive sees it.
+                    if call.derives_taken > 0 {
+                        let cfg = &mut *self.cfg;
+                        let derives = blaze_expand::ItemAttrs::new(walk.item().clone()).derives(&mut |name, value| match cfg.atom(name, value) {
+                            CfgAnswer::Yes => Ok(true),
+                            CfgAnswer::No => Ok(false),
+                            CfgAnswer::Need => Err(()),
+                        });
+                        match derives {
+                            Ok(Some(derives)) => {
+                                for u in derives.uses.iter().take(call.derives_taken) {
+                                    let mut derived = BodyOut::new_in(self.alloc);
+                                    let made = expand.derive(&u.path, &derives.input, derives.facts(u), self.edition, &mut derived);
+                                    self.queue_expansion(made, &derived, depth, jobs);
+                                }
+                            }
+                            // A later `#[cfg]` false, a cfg atom not known yet or a malformed
+                            // attribute: the derives are not run, and counted.
+                            Ok(None) | Err(_) => self.stats.macro_calls_unsupported += 1,
+                        }
+                    }
                     self.queue_expansion(expansion, &out, depth, jobs);
                     return true;
                 }

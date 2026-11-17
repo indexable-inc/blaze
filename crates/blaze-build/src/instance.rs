@@ -124,7 +124,7 @@ pub fn instance_key_normalized(
     let mut all: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
     all.extend_from_slice(ground.view().list(args).map_err(malformed)?);
     let given = all.len();
-    for (at, node) in from.nodes.iter().enumerate() {
+    for (at, node) in from.nodes().enumerate() {
         if matches!(node, PNode::Alias { .. }) {
             let normalized = crate::instance::ground(from, PTy(at as u32), &all[..given], ground, scratch, facts)?;
             all.push(normalized);

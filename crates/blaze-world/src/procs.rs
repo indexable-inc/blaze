@@ -4,6 +4,9 @@
 //! compiled here: it is looked up in the module store the bootstrap tool (`proc_macro_modules`)
 //! fills.
 
+/// The files a macro called in a crate is shown: that crate's own package, whoever it is.
+pub mod files;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::string::{String, ToString};

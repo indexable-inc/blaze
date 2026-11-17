@@ -22,17 +22,21 @@ use blaze_own::{ABTreeMap, ABTreeSet, AVec, Alloc};
 use blaze_surface::{DeclsBuilder, SurfaceError};
 
 use crate::facts::ScopeFacts;
-use crate::{AmbiguityKind, Def, DefKind, Edition, ExternTarget, Namespace, Origin, Path, PathKind, Rename, Unresolved, UseForm, Visibility, WrittenVis};
+use crate::{AmbiguityKind, CallShape, Def, DefKind, Edition, ExternTarget, Namespace, Origin, Path, PathKind, Rename, Unresolved, UseForm, Visibility, WrittenVis};
 
 mod deps;
 mod seam;
+mod switch;
 #[cfg(test)]
 mod tests;
 mod write;
 
+pub(crate) use switch::solve_and_write;
+pub use switch::{MOST_ROUNDS, Unwritten};
+
 pub(crate) use deps::{BuiltDeps, DepAnswer, DepNames, EnumNames};
 pub(crate) use seam::shadow;
-pub use seam::{DIFFER_SHOWN, Differ, Seam, ShadowRefused, Shadowed, Unknown, WrittenAgainst, WrittenDiffer, WrittenWhich};
+pub use seam::{DIFFER_SHOWN, Differ, SCOPE_FIELDS, ScopeDiffer, Seam, ShadowRefused, Shadowed, Unknown, WrittenAgainst, WrittenDiffer, WrittenWhich};
 
 pub(crate) const NAMESPACES: [Namespace; 3] = [Namespace::Types, Namespace::Values, Namespace::Macros];
 
@@ -145,7 +149,7 @@ pub enum BadVis {
 }
 
 /// Why the core stopped, naming the thing.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum CellError {
     Facts { module: ItemKey, error: SurfaceError },
     /// `pub(in path)` naming no ancestor, `pub(path)` or `pub(super)` at the root.
@@ -199,6 +203,10 @@ pub struct CellStats {
     pub names_declared: u64,
     /// Imports.
     pub items: u64,
+    /// Tool attributes (`#[rustfmt::skip]`) met: inert, no call made.
+    pub tool_attrs: u64,
+    /// Calls written at expansion depth `RECURSION_LIMIT` or deeper: errors, never expanded.
+    pub too_deep: u64,
     pub cells: u64,
     pub decisions: u64,
     pub waiters: u64,
@@ -239,6 +247,12 @@ pub struct CellStats {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum CellPlant {
     None,
+    /// A tool attribute (`#[rustfmt::skip]`) is a call like any other: its path fails.
+    ToolAttrIsACall,
+    /// No expansion depth limit: a self-calling macro expands until the load's bound refuses.
+    NoRecursionLimit,
+    /// `use crate as name;` names nothing (the walk reads no leaf): `name` is not bound.
+    CrateRootImportFails,
     /// An enum is no source of names: a path through one stays unknown.
     EnumIsOutside,
     /// A glob of an enum is as visible as the glob alone, not narrowed by the enum's binding.
@@ -330,6 +344,9 @@ pub(crate) enum CellPlant {
     /// At a stall a pending named import of the call's own name does not hold its lookup: the
     /// globs' candidate or an outer one is taken past it.
     StallPassesNamedImport,
+    /// A call takes the first candidate of its name whatever its sub-namespace ([`same_sub`]),
+    /// and a macro of the wrong shape is called (the core's answer until runner 16).
+    SubNamespaceIgnored,
 }
 
 type ModId = u32;
@@ -343,8 +360,8 @@ type Entry = (Def, Visibility, Origin, FragId);
 /// One entry of a text fragment the textual scope sees.
 #[derive(Clone, Copy)]
 enum Slot<N> {
-    /// `macro_rules! name`.
-    Rules(N, Def),
+    /// `macro_rules! name`, and whether it is `#[macro_export]`.
+    Rules(N, Def, bool),
     /// `mod child;`, with `#[macro_use]` or not.
     Mod(ModId, bool),
     /// A macro call: its expansion is a fragment at this place.
@@ -365,6 +382,20 @@ struct CallAt {
     key: ItemKey,
     frag: FragId,
     pos: u32,
+    /// How it is written (`m!(..)`, `#[m]`, `#[derive(m)]`): which macros it may name.
+    shape: CallShape,
+}
+
+/// Whether macro `def` is in the sub-namespace a call of `shape` reads (Reference
+/// `names.resolution.expansion.macros.intro`: "Macros are split into two sub-namespaces, one
+/// for function-like macros, and the other for attributes and derives. Resolution candidates
+/// from the incorrect sub-namespace are ignored."). Not a macro: never.
+fn same_sub(def: Def, shape: CallShape) -> bool {
+    let DefKind::Macro(s) = def.kind else { return false };
+    match shape {
+        CallShape::FnLike => s.accepts(CallShape::FnLike),
+        CallShape::Attr | CallShape::Derive => s.accepts(CallShape::Attr) || s.accepts(CallShape::Derive),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -458,6 +489,12 @@ struct Item<'a, N> {
     /// A path whose last module-like segment is an enum: the visibility the enum was read
     /// with there, which its glob is narrowed by (a variant is as visible as its enum).
     clamp: Option<Visibility>,
+    /// The segment the last evaluation's walk was at: where a failure is reported (the scope
+    /// record's `segment` of an `Import` or `Macro` error).
+    seg: u32,
+    /// A call written at expansion depth [`crate::RECURSION_LIMIT`] or deeper: never resolved
+    /// or expanded, a `RecursionLimit` error of its scope (rustc's default `recursion_limit`).
+    deep: bool,
 }
 
 /// What a module's own view leaves out of its growth (calls not expanded yet).
@@ -549,6 +586,9 @@ pub(crate) struct Cells<'a, N> {
     /// quiet point adds to the wait graph, so the group is not taken for a sink again.
     extra: ABTreeSet<'a, (Node, Node)>,
     outer: Outer<'a, N>,
+    /// The crate's tool namespaces (`rustfmt`, `clippy`, `blaze`, the root's `register_tool`s),
+    /// from its root record: an attribute whose path starts with one is inert.
+    tools: AVec<'a, N>,
     /// R6's watches: a use whose plain first segment took an outer binding while its module could
     /// still grow, by module and name.
     watches: ABTreeMap<'a, (ModId, Namespace, N), AVec<'a, (ItemId, Def)>>,
@@ -590,6 +630,10 @@ pub(crate) struct Cells<'a, N> {
     taken: AVec<'a, Taken<N>>,
     /// A weak view whose fixed point did not settle: the stall's error.
     weak_error: Option<CellError>,
+    /// The modules of the crate's walked tree are `0..walked`: those an expansion or a block
+    /// made come after (their `#[macro_export]` macros are published to the root by the
+    /// record writer, not read from the root record).
+    walked: ModId,
 }
 
 /// A read of a cell by an item: decided, or the item now waits on it.
@@ -665,6 +709,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 foreign_open: false,
                 macro_use: false,
             },
+            tools: AVec::new_in(alloc),
             watches: ABTreeMap::new_in(alloc),
             written: ABTreeMap::new_in(alloc),
             r6: ABTreeSet::new_in(alloc),
@@ -684,14 +729,17 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             speculated: AVec::new_in(alloc),
             taken: AVec::new_in(alloc),
             weak_error: None,
+            walked: 0,
         };
         // The dependencies by name before any text is read: an `extern crate` of any module
         // names one.
         {
             let r = facts.crate_root(info.krate).map_err(|error| CellError::Facts { module: root, error })?;
             cells.dep_roots.extend(r.deps.iter().map(|d| (d.name, d.root)));
+            cells.tools.extend(r.tools.iter().copied());
         }
         let made = cells.make_modules(facts, &[root])?;
+        cells.walked = cells.modules.len() as ModId;
         cells.root = cells.by_key[&root];
         for &m in made.iter() {
             cells.read_text(facts, m)?;
@@ -863,7 +911,10 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     }
 
     /// An explicit entry of `m`; the first of a name stays. A cell of it decided not found is a
-    /// bug in when cells decide (finality).
+    /// bug in when cells decide (finality). A second item of one name (E0428) is not reported
+    /// yet: the injected `extern crate` comes last and must yield silently (it is def-site
+    /// hygienic: thiserror's `extern crate std as core;` under `#![no_std]`), which the decl
+    /// does not mark yet.
     fn add_explicit(&mut self, m: ModId, ns: Namespace, name: N, entry: Entry) -> Result<(), CellError> {
         self.check_final(m, ns, name)?;
         self.modules[m as usize].explicit.entry((ns, name)).or_insert(entry);
@@ -912,7 +963,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         }
         for r in d.macro_rules.iter() {
             let def = Def { key: r.def, kind: DefKind::Macro(r.shapes) };
-            slots.push((r.pos, Slot::Rules(r.name, def)));
+            slots.push((r.pos, Slot::Rules(r.name, def, r.export)));
             if r.export {
                 // Also a crate-root name in the macro namespace; the root record already holds
                 // those of module texts, so the same def adds nothing.
@@ -920,7 +971,26 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 self.add_explicit(root, Namespace::Macros, r.name, (def, Visibility::Public, Origin::MacroExport, fid))?;
             }
         }
+        // The fragment's expansion depth: a call written at rustc's default `recursion_limit`
+        // or deeper is an error, not a call (the old core's `CallState::TooDeep`).
+        let depth = match up {
+            Some((u, _)) => self.depth(u).saturating_add(1),
+            None => 0,
+        };
+        let deep = depth >= crate::RECURSION_LIMIT && self.plant != CellPlant::NoRecursionLimit;
         for c in d.calls.iter() {
+            // A tool attribute (Reference `attributes.tool`: "The tool attributes are ..
+            // `rustfmt` and `clippy`", and `register_tool`'s): inert, no call. The first segment
+            // is a tool module only in an attribute's plain path of two segments or more.
+            if c.kind == CallShape::Attr
+                && c.path.kind == PathKind::Plain
+                && c.path.segments.len() >= 2
+                && self.tools.contains(&c.path.segments[0])
+                && self.plant != CellPlant::ToolAttrIsACall
+            {
+                self.stats.tool_attrs += 1;
+                continue;
+            }
             let id = self.items.len() as ItemId;
             self.items.push(Item {
                 module: m,
@@ -934,8 +1004,10 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 waiters: AVec::new_in(alloc),
                 waits: AVec::new_in(alloc),
                 evaluations: 0,
-                call: Some(CallAt { key: c.call, frag: fid, pos: c.pos }),
-                grown: false,
+                call: Some(CallAt { key: c.call, frag: fid, pos: c.pos, shape: c.kind }),
+                // A call past the recursion limit adds nothing: grown from the start, so a read
+                // after it in its fragment (the textual scope) never waits on it.
+                grown: deep,
                 expansion: None,
                 at: fid,
                 pos: c.pos,
@@ -943,12 +1015,19 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 types_only: false,
                 why: None,
                 clamp: None,
+                seg: 0,
+                deep,
             });
             self.call_ids.insert(c.call, id);
+            slots.push((c.pos, Slot::Call(id)));
+            if deep {
+                // Never resolved, never waited on: its scope's `RecursionLimit` error.
+                self.stats.too_deep += 1;
+                continue;
+            }
             let module = &mut self.modules[m as usize];
             module.calls.push(id);
             module.growth += 1;
-            slots.push((c.pos, Slot::Call(id)));
             self.item_queue.insert(id);
             self.stats.calls += 1;
         }
@@ -1001,6 +1080,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 types_only: false,
                 why: None,
                 clamp: None,
+                seg: 0,
+                deep: false,
             });
             // `use a::b::{self};` binds `b` in the type namespace alone (Reference
             // `items.use.self`: "only the type namespace").
@@ -1625,8 +1706,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         {
             // A one-segment call looks in the textual scope first (Reference `macros.by-example.scope`).
             let name = self.items[i as usize].segments[0];
-            match self.textual(at.frag, at.pos, name, guess) {
-                Step::Done(Some(def)) => return Step::Done(Outcome::Called(def)),
+            match self.textual(at.frag, at.pos, name, Some(at.shape), guess) {
+                Step::Done(Some(def)) => return Step::Done(self.called(at, def)),
                 Step::Done(None) => {}
                 Step::Wait(n) => {
                     self.items[i as usize].waits.push(n);
@@ -1635,6 +1716,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             }
         }
         self.items[i as usize].clamp = None;
+        self.items[i as usize].seg = 0;
         // The first segment the walk reads (`::dep` reads its crate from the extern prelude).
         let mut first = 0;
         let mut cur = match kind {
@@ -1698,9 +1780,16 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             }
         };
         let len = self.items[i as usize].segments.len();
+        // `use crate as name;` (and `$crate` alone): the path names the crate root itself, a
+        // module, bound in the type namespace at the import's visibility (serde's `pub use
+        // crate as serde;`, read by its derives' `use serde::private::serde as _serde;`).
+        if len == 0 && !glob && self.items[i as usize].call.is_none() && matches!(kind, PathKind::Crate | PathKind::DollarCrate(_)) && self.plant != CellPlant::CrateRootImportFails {
+            return Step::Done(Outcome::Named([Some((Def::module(self.modules[cur as usize].key), ivis)), None, None]));
+        }
         let steps = if glob { len } else { len.saturating_sub(1) };
         for k in first..steps {
             let s = self.items[i as usize].segments[k];
+            self.items[i as usize].seg = k as u32;
             let v = if kind == PathKind::Plain && k == 0 {
                 match self.first_segment(m, Namespace::Types, s, i, guess, hold) {
                     Step::Done(v) => v,
@@ -1752,10 +1841,11 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         if glob {
             return Step::Done(Outcome::Glob(self.modules[cur as usize].key));
         }
+        self.items[i as usize].seg = len.saturating_sub(1) as u32;
         let Some(&leaf) = self.items[i as usize].segments.last() else {
             return Step::Done(Outcome::Failed(Unresolved::NotFound));
         };
-        if self.items[i as usize].call.is_some() {
+        if let Some(at) = self.items[i as usize].call {
             // The path-based scope of a call: the leaf in the macro namespace. In its own module
             // the call reads its own view, which does not wait on its own growth.
             let v = if kind == PathKind::Plain && len == 1 {
@@ -1783,7 +1873,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     Step::Done(Outcome::Failed(Unresolved::Private))
                 }
                 Step::Done(Value::Ambiguous(..)) => Step::Done(Outcome::Failed(Unresolved::Ambiguous(AmbiguityKind::GlobVsGlob))),
-                Step::Done(Value::Found(def, _)) => Step::Done(Outcome::Called(def)),
+                Step::Done(Value::Found(def, _)) => Step::Done(self.called(at, def)),
             };
         }
         // An import never justifies itself: of its own name in its own module it reads the globs.
@@ -1807,7 +1897,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 // of `pub(crate)`. `#[macro_export]` changes the implicit visibility to `pub`.").
                 let tex = if ns == Namespace::Macros && self.plant != CellPlant::NoTextualImport {
                     let (frag, pos) = (self.items[i as usize].at, self.items[i as usize].pos);
-                    match self.textual(frag, pos, leaf, guess) {
+                    match self.textual(frag, pos, leaf, None, guess) {
                         Step::Done(d) => d,
                         Step::Wait(n) => {
                             self.items[i as usize].waits.push(n);
@@ -2034,7 +2124,11 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// `#[macro_use]` prelude (macros), the standard prelude. `Some(Value::Outside)` when a scope
     /// of another crate this run cannot see may hold it. Built-in types are a type position's
     /// (R9), not a path's first segment.
-    fn outer_of(&mut self, ns: Namespace, name: N, guess: Option<&Guess<'a>>) -> Step<Option<Value>> {
+    ///
+    /// `sub`: a call's shape; a scope's candidate of the wrong sub-namespace is passed over
+    /// ([`same_sub`]) and the walk goes on to the next scope.
+    fn outer_of(&mut self, ns: Namespace, name: N, sub: Option<CallShape>, guess: Option<&Guess<'a>>) -> Step<Option<Value>> {
+        let wrong = |v: Value| matches!(v, Value::Found(d, _) if sub.is_some_and(|s| !same_sub(d, s)));
         if ns == Namespace::Types
             && self.plant == CellPlant::R8MacroReplaces
             && let Some(&k) = self.outer.added.get(&name)
@@ -2061,7 +2155,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     continue;
                 };
                 match self.read(r, ns, name, Layer::Full, guess) {
-                    Read::Ready(v @ (Value::Found(_, Visibility::Public) | Value::Ambiguous(_, Visibility::Public))) => return Step::Done(Some(v)),
+                    Read::Ready(v @ (Value::Found(_, Visibility::Public) | Value::Ambiguous(_, Visibility::Public))) if !wrong(v) => return Step::Done(Some(v)),
                     Read::Ready(Value::Outside) => unknown = true,
                     Read::Ready(_) => {}
                     Read::Wait(c) => return Step::Wait(Node::Cell(c)),
@@ -2077,10 +2171,14 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 Read::Wait(c) => Step::Wait(Node::Cell(c)),
                 Read::Ready(Value::NotFound) if self.plant != CellPlant::NoLanguagePrelude => Step::Done(self.builtin(ns, name)),
                 Read::Ready(Value::NotFound) => Step::Done(None),
+                // The language prelude after it holds no macro (`builtin`).
+                Read::Ready(v) if wrong(v) => Step::Done(None),
                 Read::Ready(v) => Step::Done(Some(v)),
             };
         }
-        if let Some(&def) = self.outer.foreign.get(&(ns, name)) {
+        if let Some(&def) = self.outer.foreign.get(&(ns, name))
+            && !wrong(Value::Found(def, Visibility::Public))
+        {
             return Step::Done(Some(Value::Found(def, Visibility::Public)));
         }
         if self.outer.foreign_open {
@@ -2122,7 +2220,16 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         if inner == Value::Outside {
             return Step::Done(Value::Outside);
         }
-        let outer = match self.outer_of(ns, name, guess) {
+        // A call's name: a candidate of the wrong sub-namespace is ignored, here and outward.
+        let sub = match self.items[me as usize].call {
+            Some(at) if ns == Namespace::Macros && self.plant != CellPlant::SubNamespaceIgnored => Some(at.shape),
+            _ => None,
+        };
+        let inner = match inner {
+            Value::Found(d, _) if sub.is_some_and(|s| !same_sub(d, s)) => Value::NotFound,
+            v => v,
+        };
+        let outer = match self.outer_of(ns, name, sub, guess) {
             Step::Done(o) => o,
             Step::Wait(n) => return Step::Wait(n),
         };
@@ -2325,17 +2432,31 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         }
     }
 
+    /// A call written at `at` that selected `def`: called when `def` takes the call's shape;
+    /// else refused by name. Its sub-namespace's candidates alone were looked at
+    /// ([`same_sub`]), so what is refused here is the other shape of that sub-namespace (an
+    /// attribute macro named by `#[derive(..)]`, a derive by `#[..]`) or, for a path of two or
+    /// more segments, any macro the path's module holds under that name.
+    fn called(&self, at: CallAt, def: Def) -> Outcome {
+        match def.kind {
+            DefKind::Macro(s) if s.accepts(at.shape) || self.plant == CellPlant::SubNamespaceIgnored => Outcome::Called(def),
+            _ => Outcome::Failed(Unresolved::WrongMacroKind),
+        }
+    }
+
     /// The text of `m` defines a `macro_rules!` named `name`.
     fn has_rules(&self, m: ModId, name: N) -> bool {
-        self.frags[self.modules[m as usize].text as usize].slots.iter().any(|s| matches!(s.1, Slot::Rules(n, _) if n == name))
+        self.frags[self.modules[m as usize].text as usize].slots.iter().any(|s| matches!(s.1, Slot::Rules(n, ..) if n == name))
     }
 
     /// `name!` by the textual scope just before `pos` of fragment `frag` (Reference
     /// `macros.by-example.scope`): backward through the text, the latest definition first, into
     /// `#[macro_use]` modules and expansions met on the way, then out to the enclosing text at
     /// each call and `mod` line. A call met that has not grown yet may still define the name:
-    /// the walk waits on it (under a guess a call of the group adds nothing).
-    fn textual(&mut self, frag: FragId, pos: u32, name: N, guess: Option<&Guess<'a>>) -> Step<Option<Def>> {
+    /// the walk waits on it (under a guess a call of the group adds nothing). `sub`: a call's
+    /// shape, whose wrong sub-namespace's definitions are passed over ([`same_sub`]); `None`
+    /// for an import, which takes any.
+    fn textual(&mut self, frag: FragId, pos: u32, name: N, sub: Option<CallShape>, guess: Option<&Guess<'a>>) -> Step<Option<Def>> {
         self.stats.textual_reads += 1;
         let (mut f, mut end) = (frag, pos);
         let mut stack: AVec<'a, (FragId, usize)> = AVec::new_in(self.alloc);
@@ -2350,7 +2471,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 top.1 -= 1;
                 let (_, slot) = self.frags[top.0 as usize].slots[top.1];
                 match slot {
-                    Slot::Rules(n, def) if n == name => return Step::Done(Some(def)),
+                    Slot::Rules(n, def, _) if n == name && (self.plant == CellPlant::SubNamespaceIgnored || sub.is_none_or(|s| same_sub(def, s))) => {
+                        return Step::Done(Some(def));
+                    }
                     Slot::Rules(..) | Slot::Mod(_, false) => {}
                     Slot::Mod(child, true) => {
                         let t = self.modules[child as usize].text;
@@ -2520,7 +2643,10 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 continue;
             }
             if let Some(i) = self.item_queue.pop_first() {
-                self.eval(i);
+                // A call past the recursion limit is never evaluated (its error is written).
+                if !self.items[i as usize].deep {
+                    self.eval(i);
+                }
                 continue;
             }
             if !self.quiet_point()? {
@@ -2648,7 +2774,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             }
         }
         for i in 0..self.items.len() as ItemId {
-            if self.items[i as usize].outcome.is_none() {
+            if self.items[i as usize].outcome.is_none() && !self.items[i as usize].deep {
                 nodes.push(Node::Item(i));
             }
         }
@@ -3044,7 +3170,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     continue;
                 }
                 let name = self.items[i as usize].segments[0];
-                if let Step::Wait(w) = self.textual(at.frag, at.pos, name, None)
+                if let Step::Wait(w) = self.textual(at.frag, at.pos, name, Some(at.shape), None)
                     && members.contains(&w)
                 {
                     spared.push(i);

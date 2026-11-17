@@ -431,7 +431,7 @@ fn bare_name<'v>(v: &View<'v>, t: lf::TypeId) -> Result<Option<&'v str>, Why> {
 /// literal, `-` before it for a signed type; its bits are the value's in `want`'s width, as
 /// blaze-consteval writes them. `None`: the text is no such literal.
 fn literal_value(tys: &mut PortableTys<'_>, text: &str, want: PTy, r: Range) -> Result<Option<PTy>, Why> {
-    let node = *tys.view().nodes.get(want.0 as usize).ok_or(program(format!("a const parameter's type is past the type table"), r))?;
+    let node = *tys.view().get(want).ok_or(program(format!("a const parameter's type is past the type table"), r))?;
     let signed = match node {
         PNode::Bool => {
             let b = match text {
@@ -699,7 +699,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         // Any other constant: a constant item's value or an anonymous constant's, in `ty`'s
         // width (`ty`'s node says how the anonymous one is typed; an unknown type, a body's
         // `_`, takes only a constant item's path).
-        let node = tys.view().nodes.get(ty.0 as usize).copied();
+        let node = tys.view().get(ty).copied();
         // An expression that names `Self` where `Self` is a ground type has a value here
         // (`[u8; size_of::<Self>()]` in `impl u16`: front2/const_open.rs, state one): its
         // anonymous constant is filed with that `Self` in scope. Every other expression is
@@ -1274,7 +1274,7 @@ pub fn subst(tys: &mut PortableTys<'_>, t: PTy, args: &[PTy]) -> Result<PTy, Why
             S::Make(t) => {
                 children_of(tys.view(), t, &mut kids).ok_or_else(bad)?;
                 let start = done.len() - kids.len();
-                let node = *tys.view().nodes.get(t.0 as usize).ok_or_else(bad)?;
+                let node = *tys.view().get(t).ok_or_else(bad)?;
                 let new: Vec<PTy, Global> = done.split_off(start);
                 let made = match node {
                     PNode::Param(i) | PNode::ConstParam(i) => *args.get(i as usize).ok_or_else(|| program(format!("a generic parameter past the arguments"), Range::new(0, 0)))?,
@@ -1337,7 +1337,7 @@ pub(super) fn fn_ptr_abi(written: &str, r: Range) -> Result<tc::Abi, Why> {
 
 /// The types `t` is made of, in order; `None` past the table.
 pub fn children_of(t: blaze_typeck::PTys<'_>, ty: PTy, out: &mut Vec<PTy, Global>) -> Option<()> {
-    match *t.nodes.get(ty.0 as usize)? {
+    match *t.get(ty)? {
         PNode::Ref(_, i) | PNode::Ptr(_, i) | PNode::Slice(i) => out.push(i),
         PNode::Closure { args, .. } => out.extend_from_slice(t.list(args).ok()?),
         PNode::Future(_, o, i) | PNode::Array(o, i) => {

@@ -410,7 +410,7 @@ fn question_mark_on_result_with_the_same_error_type() {
 /// arguments (`Self`, `R`).
 fn selected_impl(fx: &crate::fixture::Fx, tr: crate::ids::ItemKey, mut c: crate::Checked<'static>) -> Option<crate::ids::ItemKey> {
     let i = c.callees.column::<0>().iter().position(|&x| x == ExprId(6)).expect("a callee at 6");
-    let args: Vec<crate::portable::PTy> = c.types.view().lists[c.callees.column::<2>()[i].range()].to_vec();
+    let args: Vec<crate::portable::PTy> = c.types.view().list(c.callees.column::<2>()[i]).expect("the callee's arguments in the body's table").to_vec();
     crate::instance::select_impl(fx, tr, &args, &mut c.types, blaze_own::Alloc::global()).expect("selects").map(|(imp, _)| imp)
 }
 

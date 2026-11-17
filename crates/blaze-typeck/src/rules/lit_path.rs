@@ -148,7 +148,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// `impl Trait` arguments are always fresh (the Reference, "Impl trait").
     pub(crate) fn explicit_fn_args(&mut self, at: At, seg: Option<Segment>, item: ItemKey, sig: &FnSig<'_>) -> Result<TyList, Stop> {
         if sig.declared_count > sig.own_count {
-            return Err(CheckError::Malformed(Malformed::Param { index: sig.declared_count, args: sig.own_count }).into());
+            let site = crate::error::ParamSite::ExplicitArgs { item };
+            return Err(CheckError::Malformed(Malformed::Param { index: sig.declared_count, args: sig.own_count, site }).into());
         }
         self.explicit_args_declared(at, seg, item, sig.parent_count, sig.declared_count, sig.own_count)
     }
@@ -227,7 +228,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 let owner = self.body.owner;
                 let own = self.reads.const_params(owner)?;
                 let Some(pt) = own.type_of(j) else {
-                    return Err(CheckError::Malformed(Malformed::Param { index: j, args: 0 }).into());
+                    let site = crate::error::ParamSite::ConstParamType { owner };
+                    return Err(CheckError::Malformed(Malformed::Param { index: j, args: 0, site }).into());
                 };
                 let empty = self.mk_list(&[])?;
                 self.lower(own.types, pt, Lower::Args(empty), at.cause())?
@@ -354,7 +356,25 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     self.diag(DiagCode::UnresolvedPath, at, None, None, last_name);
                     return Ok(self.common.err);
                 };
-                let args = self.explicit_args(at, Some(segs[consumed - 1]), k, 0, adt.generics)?;
+                // `Self::X` in an impl: `Self` is the impl's self type at the impl's own
+                // arguments (rules/self_path.rs `impl_self_adt_args`), so `Self::HIGH` in
+                // `impl<const SLOTS: usize> Ctrl<SLOTS>` leaves no variable; a written name
+                // (`Ctrl::HIGH`) takes fresh arguments, inferred or E0282.
+                let by_self = consumed == 1 && segs[0].name == SELF_NAME;
+                let args = if by_self {
+                    if segs[0].has_args {
+                        // The Reference, "Paths", "`Self`": "The Self path cannot include
+                        // generic arguments (as in Self::<i32>)." rustc's E0109, for which the
+                        // checker has no code: refused by name.
+                        return Err(CheckError::Unported("generic arguments on `Self` in a value path (E0109)").into());
+                    }
+                    match self.impl_self_adt_args(at, cause, k)? {
+                        Some(args) => args,
+                        None => return Ok(self.common.err),
+                    }
+                } else {
+                    self.explicit_args(at, Some(segs[consumed - 1]), k, 0, adt.generics)?
+                };
                 // `Self::A`, `Alias::A`: a variant of the enum the prefix names, in an
                 // expression or a pattern, before any associated item of that name (rustc's
                 // `associated_path_to_ty` checks the variants first; its deny-by-default lint

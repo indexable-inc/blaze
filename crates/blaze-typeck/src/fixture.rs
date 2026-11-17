@@ -119,7 +119,7 @@ pub struct Fx {
 
 /// The shape an impl's self type is bucketed by; `None` for a blanket impl.
 fn shape_of(t: PTys<'_>, p: PTy) -> Option<Shape> {
-    Some(match t.nodes[p.0 as usize] {
+    Some(match *t.get(p)? {
         PNode::Bool => Shape::Bool,
         PNode::Char => Shape::Char,
         PNode::Int(i) => Shape::Int(i),
@@ -140,8 +140,8 @@ fn shape_of(t: PTys<'_>, p: PTy) -> Option<Shape> {
         PNode::Closure { .. } | PNode::Future(..) => Shape::Closure,
         PNode::Param(_) | PNode::Alias { .. } | PNode::Infer | PNode::Error => return None,
         PNode::ConstValue { .. } | PNode::ConstParam(_) => return None,
-        PNode::Dynamic(l) => Shape::Dynamic(match t.lists.get(l.range()).and_then(|r| r.first()) {
-            Some(&f) => match t.nodes[f.0 as usize] {
+        PNode::Dynamic(l) => Shape::Dynamic(match t.list(l).ok().and_then(|r| r.first()) {
+            Some(&f) => match *t.get(f)? {
                 PNode::ExTrait(k, _) => Some(k),
                 _ => None,
             },
@@ -189,7 +189,14 @@ impl Fx {
     }
 
     /// Declares generic parameter `index` of `item` (over all its generics, the parent's
-    /// first) a const parameter of type `ty`.
+    /// first) a const parameter of type `ty`, and takes away the implied `Sized` that the
+    /// item's maker ([`Fx::imp`], [`Fx::func`], [`Fx::strukt`], [`Fx::enum_`]) gave that index
+    /// before it knew it is a const: the Reference, "Special types and traits", "`Sized`":
+    /// "Type parameters (except `Self` in traits) are `Sized` by default"; a const parameter
+    /// is no type and has no such bound (as the front end: blaze-ladder front2/preds.rs skips
+    /// const parameters). Rows covered: the impl `item` and every member made from it so far
+    /// (they copied its clauses; one made later copies them already without), the fn `item`,
+    /// and the tuple constructors of the ADT `item`.
     pub fn const_param(&mut self, item: ItemKey, index: u32, ty: PTy) {
         let row = match self.const_params.iter().position(|(k, _)| *k == item) {
             Some(i) => i,
@@ -201,6 +208,16 @@ impl Fx {
         let params = &mut self.const_params[row].1;
         params.push((index, ty));
         params.sort_unstable_by_key(|&(i, _)| i);
+        let Some(&(_, sized)) = self.lang.iter().find(|(l, _)| *l == LangItem::Sized) else { return };
+        let p = self.param(index);
+        let implied = self.bound(sized, &[p]);
+        let ctors: Vec<ItemKey> = self.adts.iter().filter(|a| a.key == item).flat_map(|a| a.variants.iter().map(|v| v.key)).collect();
+        for r in self.impls.iter_mut().filter(|r| r.key == item) {
+            r.clauses.retain(|c| *c != implied);
+        }
+        for f in self.fns.iter_mut().filter(|f| f.key == item || f.container == Some(item) || ctors.contains(&f.key)) {
+            f.clauses.retain(|c| *c != implied);
+        }
     }
 
     /// A `where const` condition (its anonymous constant) whose value at ground arguments is
@@ -791,7 +808,7 @@ impl Fx {
         for (i, r) in self.impls.iter().enumerate() {
             self.ix.insert(r.key, i);
         }
-        let view = PTys { nodes: self.t.view().nodes, lists: self.t.view().lists };
+        let view = self.t.view();
         let mut rows: Vec<(ItemKey, Option<ItemKey>, Option<Shape>)> = Vec::new();
         for i in &self.impls {
             rows.push((i.key, i.trait_, shape_of(view, i.self_ty)));
@@ -979,7 +996,7 @@ impl World for Fx {
 
     fn const_holds(&self, _: Seal, cond: ItemKey, args: &[PTy], types: PTys<'_>) -> Fetch<ConstHolds> {
         let &(_, value) = self.conditions.iter().find(|(k, _)| *k == cond).ok_or(Missing)?;
-        let nodes: Vec<PNode> = args.iter().map(|a| types.nodes[a.0 as usize]).collect();
+        let nodes: Vec<PNode> = args.iter().map(|&a| *types.get(a).expect("a condition's argument in its table")).collect();
         Ok(value(&nodes))
     }
 
@@ -1344,10 +1361,10 @@ impl Bb {
 /// the owner as `P<i>`).
 pub fn show(fx: &Fx, t: PTys<'_>, p: PTy) -> String {
     let list = |l: List| -> String {
-        let parts: Vec<String> = t.lists[l.range()].iter().map(|&x| show(fx, t, x)).collect();
+        let parts: Vec<String> = t.list(l).expect("a shown list in its table").iter().map(|&x| show(fx, t, x)).collect();
         parts.join(", ")
     };
-    match t.nodes[p.0 as usize] {
+    match *t.get(p).expect("a shown type in its table") {
         PNode::Bool => String::from("bool"),
         PNode::Char => String::from("char"),
         PNode::Int(i) => String::from(match i {
@@ -1398,7 +1415,7 @@ pub fn show(fx: &Fx, t: PTys<'_>, p: PTy) -> String {
                 crate::ids::Abi::RustCall => "extern \"rust-call\" ",
             };
             // The list is the inputs, then the output.
-            let all = &t.lists[l.range()];
+            let all = t.list(l).expect("a shown list in its table");
             let (ins, out) = all.split_at(all.len().saturating_sub(1));
             let ins: Vec<String> = ins.iter().map(|&x| show(fx, t, x)).collect();
             let out = match out.first() {
@@ -1415,7 +1432,7 @@ pub fn show(fx: &Fx, t: PTys<'_>, p: PTy) -> String {
         PNode::Infer => String::from("_"),
         PNode::Error => String::from("{error}"),
         PNode::ConstParam(i) => format!("C{i}"),
-        PNode::ConstValue { ty, bits } => match t.nodes.get(ty.0 as usize) {
+        PNode::ConstValue { ty, bits } => match t.get(ty) {
             Some(PNode::Bool) => format!("{}", bits != 0),
             Some(PNode::Char) => match u32::try_from(bits).ok().and_then(char::from_u32) {
                 Some(c) => format!("{c:?}"),
@@ -1425,7 +1442,7 @@ pub fn show(fx: &Fx, t: PTys<'_>, p: PTy) -> String {
             _ => format!("{bits}{}", show(fx, t, ty)),
         },
         PNode::Dynamic(l) => {
-            let rows: Vec<String> = t.lists[l.range()].iter().map(|&x| show(fx, t, x)).collect();
+            let rows: Vec<String> = t.list(l).expect("a shown list in its table").iter().map(|&x| show(fx, t, x)).collect();
             format!("dyn {}", rows.join(" + "))
         }
         PNode::ExTrait(k, l) if l.len == 0 => String::from(fx.name_of(k)),

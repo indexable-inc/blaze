@@ -36,7 +36,8 @@ fn at_least(tape: &Tape, t: u64) -> Result<(), String> {
 }
 
 /// Family (b): a list of up to 12 items below 10; fails when at least `k` are nonzero. Its
-/// least failing tape is `k` elements each 1, each written as `more = 1` then the item.
+/// least failing tape is `k` elements each 1, each written as `more = 1` then the item; with
+/// `edge-first` on, after the list's leading calm choice (S1a's size kind).
 fn nonzero_items(tape: &Tape, k: usize) -> Result<(), String> {
     let items = tape.vec(0..=12, "items", |tape| tape.below(10, "item"));
     let nonzero = items.iter().filter(|&&item| item != 0).count();
@@ -100,7 +101,14 @@ fn a_search_ends_on_the_least_failing_tape() {
         let k = usize::try_from(tape.range(1..6, "k")).expect("k is drawn below 6");
         let m = usize::try_from(tape.range(1..7, "m")).expect("m is drawn below 7");
         ends_on(Plant::None, |inner| at_least(inner, t), &[t])?;
-        ends_on(Plant::None, |inner| nonzero_items(inner, k), &vec![1u64; 2 * k])?;
+        // With `edge-first` (test.md S1a) the list first draws its size kind, calm on the least
+        // tape; the shrinker never deletes a leading calm choice. S2's replay decisions are the
+        // `more` choices themselves (1: a fresh element), so they add nothing here.
+        #[cfg(feature = "edge-first")]
+        let least_items = [&[0u64][..], &vec![1u64; 2 * k][..]].concat();
+        #[cfg(not(feature = "edge-first"))]
+        let least_items = vec![1u64; 2 * k];
+        ends_on(Plant::None, |inner| nonzero_items(inner, k), &least_items)?;
         ends_on(Plant::None, |inner| unsorted(inner, m), &least_unsorted(m))
     });
 }

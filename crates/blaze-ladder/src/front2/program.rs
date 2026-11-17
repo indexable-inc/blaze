@@ -369,7 +369,7 @@ fn const_values<'c>(r: &mut Records<'_, '_>, bodies: impl Iterator<Item = &'c Ch
 fn dyn_principals<'v>(views: impl Iterator<Item = PTys<'v>>) -> Vec<ItemKey, Global> {
     let mut asked: Vec<ItemKey, Global> = Vec::new_in(Global);
     for v in views {
-        for n in v.nodes.iter() {
+        for n in v.nodes() {
             if let tc::PNode::Dynamic(l) = *n
                 && let Some(k) = tc::object_principal(v, l)
             {
@@ -681,7 +681,7 @@ impl<'n> Front2Program<'n> {
             let mut missing: Vec<ItemKey, Global> = Vec::new_in(Global);
             let views = core::iter::once(records.store.tys.view()).chain(checked.iter().flatten().map(|c| c.types.view())).chain(census.bodies.iter().map(|(_, c)| c.types.view()));
             for v in views {
-                for n in v.nodes.iter() {
+                for n in v.nodes() {
                     if let tc::PNode::Adt(k, _) = n
                         && !records.store.adts.contains_key(k)
                         && !given_up.contains_key(k)
@@ -896,7 +896,7 @@ fn exported_entry(names: &Names<'_>) -> Result<Option<LibKey>, Front2Refusal> {
         let shown = format!("{}` (file {}, byte {}", it.name.unwrap_or("_"), at.file, at.place);
         // `symbols_of` reads a `#[no_mangle]` fn's export from the NAME it is given: the bare
         // name here, never `shown` (which appends the place for the TwoEntries message).
-        let export = symbols_of(names, key, it.text, &shown)?.export;
+        let export = symbols_of(names, key, it.text, it.name.unwrap_or("_"))?.export;
         let rank = match export.as_deref() {
             Some(HOSTED_START) => 0,
             Some("main") => 1,
@@ -951,7 +951,7 @@ fn symbols_of(names: &Names<'_>, lib: LibKey, text: &str, path: &str) -> Result<
 /// Where `lib` is written (its file and first byte, as the old front's [`At`]), and, for an
 /// entry of an `extern` block, the block's ABI (Rust: `extern { .. }` is `"C"`): read from the
 /// names library's outline of its text.
-fn placed<'n>(names: &Names<'n>, lib: LibKey) -> (At, Option<&'n str>) {
+pub(super) fn placed<'n>(names: &Names<'n>, lib: LibKey) -> (At, Option<&'n str>) {
     use blaze_surface::ItemDetail;
     let Some(p) = names.place(lib) else { return (At { file: 0, place: 0 }, None) };
     let file = match p.at {
@@ -1082,6 +1082,12 @@ impl FrontEnd for Front2Program<'_> {
         // `#[panic_handler]` fn, which takes no generic arguments (front2/panic_entry.rs).
         if let Some(handler) = super::panic_entry::bound(self.front.names, &self.front.index, &self.store, item, Alloc::global()) {
             return Ok((handler, List::EMPTY));
+        }
+        // A call of one of alloc's `extern "Rust"` allocator declarations (`__rust_alloc` ..)
+        // runs its default, std's `__rdl_*` fn, which takes no generic arguments
+        // (front2/alloc_shim.rs).
+        if let Some(default) = super::alloc_shim::bound(self.front.names, &self.front.index, &self.store, item, Alloc::global()) {
+            return Ok((default, List::EMPTY));
         }
         let r = self.in_world(i, |w| resolve_instance(w, item, args, ground, Alloc::global()))?;
         Ok((r.item, r.args))
@@ -1345,7 +1351,15 @@ impl FrontEnd for Front2Program<'_> {
     /// The item's key and text, as the old front's `code_of`.
     fn code_of(&self, i: usize) -> ContentId {
         let owner = self.fns[i].key;
-        let text = self.store.fns.get(&owner).map_or("", |h| h.text);
-        blaze_ids::Hasher::new("blaze-ladder front2 code 1").part(&owner.0.to_le_bytes()).part(text.as_bytes()).finish()
+        // The evaluator's identity (consts.rs `item_code_id`): a static's fn pointer keys its
+        // instance by it, and the run finds that fn's slot by the same key.
+        // Its text as the evaluator reads it: a local item's kept text, a library item's own.
+        let text = match (self.store.locals.head(owner), self.front.keys.library_in(self.front.names, owner)) {
+            (Some(local), _) => Some(local.text),
+            // `NamesSource::text_of`'s answer: the names library's item text.
+            (None, Some(lib)) => self.front.names.item_text(lib).map(|t| t.text),
+            (None, None) => self.store.fns.get(&owner).map(|h| h.text),
+        };
+        super::consts::item_code_id(owner, text)
     }
 }

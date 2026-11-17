@@ -39,13 +39,16 @@ pub struct Shown<'f> {
     root: &'f str,
     /// The files drawn in, by their name's subject: one count a file, whichever stage found it.
     files: Vec<blaze_ids::ContentId, &'f Frame>,
+    /// How many bodies said their types were not checked (body_types.rs): the types stage then
+    /// did not run, whatever else was found (main.rs `close`).
+    pub types_unchecked: u32,
 }
 
 impl<'f> Shown<'f> {
     /// The plain views are lines whatever the terminal draws: their bytes are the same anywhere.
     pub fn new(caps: Caps, view: View, root: &'f str, frame: &'f Frame) -> Shown<'f> {
         let caps = if view == View::Person { caps } else { Caps::LINES };
-        Shown { caps, counts: Counts::default(), view, quiet: false, listed: Vec::new_in(frame), fixes: Vec::new_in(frame), root, files: Vec::new_in(frame) }
+        Shown { caps, counts: Counts::default(), view, quiet: false, listed: Vec::new_in(frame), fixes: Vec::new_in(frame), root, files: Vec::new_in(frame), types_unchecked: 0 }
     }
 
     fn file(&mut self, path: &str) {
@@ -232,11 +235,20 @@ pub fn list<'f>(cx: &Cx, root: &Dir<ReadWrite>, prints: &[Print<'_>], wanted: &[
             }
             continue;
         };
+        scratch.file.reset();
         let (file, one) = (&scratch.file, &mut scratch.one);
-        let placed =crate::work::unwinding(|| -> Result<(), CliError> {
+        let placed = crate::work::unwinding(|| -> Result<(), CliError> {
             let mut bytes = Bytes::new_in(file, FILE_ARENA);
             root.read_all(cx, &Path::new(path)?, &mut bytes)?;
-            let text = core::str::from_utf8(bytes.as_slice()).map_err(|_| CliError::Text { what: "a file with a finding is not UTF-8" })?;
+            // A file that is not text has no item to place a finding at (its own finding, a
+            // filed `FileItems` failure, says so): each is listed by its task's name alone.
+            let Ok(text) = core::str::from_utf8(bytes.as_slice()) else {
+                for &i in run {
+                    one.reset();
+                    into.push(unplaced(wanted[i].words, &prints[i], one));
+                }
+                return Ok(());
+            };
             let read = crate::fix::text_id(text.as_bytes());
             let erased = blaze_own::Erased::new(file);
             // The outline every id of the file is made from: one grammar for every file
@@ -329,8 +341,17 @@ pub fn finding(cx: &Cx, l: &Listed<'_>, text: &[u8], shown: &mut Shown<'_>, fram
     if l.fix.is_some() {
         shown.fixes.push(l.id);
     }
-    if shown.quiet {
-        shown.counts.add(Severity::Error, l.fix.is_some());
+    // A body whose types were not checked is no error of the program: it is a note, and it
+    // keeps `check` from saying `ok` (main.rs `close`).
+    let unchecked = l.area == Area::Cli && l.rule == crate::body_types::TYPES_NOT_CHECKED;
+    let severity = if unchecked { Severity::Note } else { Severity::Error };
+    if unchecked {
+        shown.types_unchecked += 1;
+    }
+    // A person sees the count in the closing line ("NOT checked: types"), not a note a body:
+    // on a workspace they are thousands. The agent's and JSON views list each with its why.
+    if shown.quiet || (unchecked && shown.view == View::Person) {
+        shown.counts.add(severity, l.fix.is_some());
         return Ok(());
     }
     let message = core::str::from_utf8(l.words).map_err(|_| CliError::Text { what: "a finding's message is not UTF-8" })?;
@@ -342,7 +363,7 @@ pub fn finding(cx: &Cx, l: &Listed<'_>, text: &[u8], shown: &mut Shown<'_>, fram
         let mut line = AString::new_in(erased.handle());
         match shown.view {
             View::Person => {
-                out.line(cx, format_args!("{}: error[{}]: {message}", l.about, l.rule))?;
+                out.line(cx, format_args!("{}: error[{}]: {message}", l.about, l.code()))?;
                 return Ok(());
             }
             View::Agent | View::Json => {
@@ -355,7 +376,7 @@ pub fn finding(cx: &Cx, l: &Listed<'_>, text: &[u8], shown: &mut Shown<'_>, fram
     };
     shown.file(path);
     let fix = l.fix.map(|change| (Edit { start: change.start, end: change.end, insert: change.insert }, change));
-    draw(cx, shown, Severity::Error, l.area, l.rule, message, path, text, Some(l.item), (l.start, l.end), None, fix, l.id.as_str(), frame, out)
+    draw(cx, shown, severity, l.area, l.rule, message, path, text, Some(l.item), (l.start, l.end), None, fix, l.id.as_str(), frame, out)
 }
 
 /// One plain finding into `line` in `view`.

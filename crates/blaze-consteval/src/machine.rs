@@ -4,6 +4,9 @@
 //! each byte allocated counts against the memory bound; each call against the depth.
 
 mod code;
+mod late;
+#[cfg(test)]
+mod late_tests;
 
 use core::alloc::Allocator;
 
@@ -13,7 +16,7 @@ use blaze_own::{Alloc, Vec};
 use blaze_typeck::{BinOp, FloatTy, IntTy, ItemKey, List, PNode, PTy, PTys, PortableTys, UintTy, UnOp};
 
 pub use code::Codes;
-use code::{EnumFacts, Late, Meta, Num, Op, Reg, TyInfo, Valid};
+use code::{EnumFacts, Meta, Num, Op, Reg, TyInfo, Valid};
 
 use crate::error::{At, ConstError, Op as Arith, PanicPart, Refusal};
 use crate::layout::{self, IntRepr, Layout, LayoutCx};
@@ -314,6 +317,9 @@ pub(crate) enum Plant {
     ComparePointers,
     /// A discriminant is taken from the variant before the one asked.
     DiscriminantOffByOne,
+    /// The old behaviour: a pending refusal met while compiling is kept as if final, so its
+    /// code stays complete (machine/late.rs `Late::makes_incomplete`).
+    KeepPendingCode,
 }
 
 /// The discriminant of `variant` of `adt` (`eval_discriminant`'s rule), reading explicit
@@ -1016,20 +1022,9 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 self.mem.copy(s.ptr, d.ptr, size)?;
             }
             Op::Late { k } => {
-                let stop = match code.lates.get(k as usize).ok_or(malformed("a stop past its code"))? {
-                    Late::Need(n) => Stop::Need(*n),
-                    Late::Refuse(r) => Stop::Refused(r.attach()),
-                };
-                // A stop on what the world does not hold (an ADT's definition, the impl for
-                // an associated item) was compiled in: a world that makes records on demand
-                // (the front end makes the ADT's row or the trait's impl headers and asks
-                // again) must not be answered from this code again, so it is compiled again
-                // when next asked for. Only a REACHED stop does this: one in a branch not
-                // taken refuses nothing and costs no compile.
-                if matches!(stop, Stop::Refused(Refusal::Missing { .. })) {
-                    codes.list[f.code as usize].complete = false;
-                }
-                return Err(stop);
+                // A pending stop made this code incomplete when it was compiled
+                // (machine/late.rs): the next evaluation compiles it again before running it.
+                return Err(code.lates.get(k as usize).ok_or(malformed("a stop past its code"))?.stop());
             }
         }
         Ok(Flow::Next)
@@ -1140,7 +1135,7 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 if field >= v.fields.len {
                     return Err(malformed("a field past its variant"));
                 }
-                Ok(layout::field_ty(&adt, v.fields.start + field, args, self.ground, self.alloc, self.world)?)
+                Ok(layout::field_ty(key, &adt, v.fields.start + field, args, self.ground, self.alloc, self.world)?)
             }
             PNode::Array(e, _) | PNode::Slice(e) => Ok(e),
             _ => Err(malformed("a field of a type with none")),
@@ -1752,6 +1747,9 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
             }
             Intrinsic::BlackBox | Intrinsic::Likely | Intrinsic::Unlikely => Ok(vals.first().ok_or(malformed("`black_box` or `likely` argument"))?.0),
             Intrinsic::ColdPath => Ok(Val::Zst),
+            // The pinned core (intrinsics/mod.rs, `ub_checks`): "In consteval, this function
+            // currently returns `true`."
+            Intrinsic::UbChecks => s(1),
             Intrinsic::PtrMetadata => {
                 let &(v, t) = vals.first().ok_or(malformed("`ptr_metadata` argument"))?;
                 let v = match v {
@@ -1779,6 +1777,12 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
                 let b = vals.get(1).ok_or(malformed("`ptr_guaranteed_cmp` arguments"))?.0;
                 let (Val::S(x), Val::S(y)) = (a, b) else { return s(2) };
                 s(self.guaranteed_cmp(x, y)?)
+            }
+            // The pinned core, library/core/src/intrinsics/mod.rs: "Returns `true` if the actual
+            // type given as `T` requires drop glue": the one rule (blaze-build drop_facts.rs).
+            Intrinsic::NeedsDrop => {
+                let t = *targs.first().ok_or(malformed("`needs_drop` with no type"))?;
+                s(u128::from(crate::drop_ask::needs_drop(self.world, t, self.ground, self.alloc)?))
             }
             // Compiled as a call of its const fn.
             Intrinsic::ConstEvalSelect => Err(malformed("`const_eval_select` run as an intrinsic")),

@@ -6,9 +6,12 @@
 //!
 //! Which units: the target-side `Lib` and `Bin` units the workspace members reach, and the
 //! `ProcMacro` units among them (a proc macro is a crate of the graph, since its macros are
-//! what its dependents' paths name; what it is built from is the host's, so its dependencies
-//! are not followed). Never a `Test` or a `BuildScript` unit. A kept unit depending on a unit
-//! not kept is [`UnitsError::DependencyNotKept`], naming both.
+//! what its dependents' paths name). A dependency's proc macro is kept without its
+//! dependencies (its records come from the module store); a MEMBER's proc macro has its
+//! dependency closure again as crates of the macro side, `wasm32-wasip1`'s (D89 (a), rule 10:
+//! the `macro_side` module), or, with no such toolchain cut, is refused as its own crate
+//! ([`UnitCrates::refused`]). Never a `Test` or a `BuildScript` unit. A kept unit depending on
+//! a unit not kept is [`UnitsError::DependencyNotKept`], naming both.
 //!
 //! The toolchain's units are the closure of `std`, `core` and `alloc` (and bstd, when a kept
 //! unit is of a blaze edition) over the target side's dependencies, as blaze-ladder's
@@ -44,6 +47,10 @@ use edition::PackageEdition;
 
 use crate::graph::{CrateId, Sysroot};
 use crate::resolve::CrateInput;
+
+mod macro_side;
+
+pub use macro_side::RefusedCrate;
 
 #[cfg(test)]
 #[path = "tests/units.rs"]
@@ -97,10 +104,19 @@ pub struct UnitCrates<'a> {
     pub toolchain: usize,
     /// Of the workspace's crates, those with a build script whose record is not joined.
     pub build_scripts: usize,
+    /// The crates of [`Self::crates`] that cannot be made, each with why (rule 20: the list
+    /// is still made; whoever asks for one of these crates' names is given its refusal, by
+    /// [`Self::refusal`]). Sorted by index, each once.
+    pub refused: AVec<'a, RefusedCrate<'a>>,
     alloc: Alloc<'a>,
 }
 
 impl<'a> UnitCrates<'a> {
+    /// Why the crate at `krate` cannot be made, when it cannot: its names are refused with
+    /// this error, naming it, instead of resolved.
+    pub fn refusal(&self, krate: usize) -> Option<&UnitsError<'a>> {
+        self.refused.iter().find(|r| r.krate == krate).map(|r| &r.why)
+    }
     /// The inputs of one `resolve_crates` call, by the same index.
     pub fn inputs(&self) -> AVec<'a, CrateInput<'_>> {
         let mut out = AVec::with_capacity_in(self.crates.len(), self.alloc);
@@ -195,6 +211,10 @@ pub enum UnitsError<'a> {
     RecordWithoutScript { krate: &'a str },
     /// A crate was given a build-script outputs record after one was joined.
     ScriptJoinedTwice { krate: &'a str },
+    /// A member's proc macro `krate` needs the macro side's toolchain crates (`core`, `alloc`,
+    /// `std`, `proc_macro` for `target`, rule 10) and the toolchain was not cut with them.
+    /// A refusal of that one crate ([`UnitCrates::refused`]), never of the list.
+    NoMacroToolchain { krate: &'a str, target: &'static str },
 }
 
 impl fmt::Display for UnitsError<'_> {
@@ -218,6 +238,10 @@ impl fmt::Display for UnitsError<'_> {
             UnitsError::ScriptJoinedTwice { krate } => {
                 write!(f, "crate `{krate}` was given a build-script outputs record twice (rule 21: one record per crate)")
             }
+            UnitsError::NoMacroToolchain { krate, target } => write!(
+                f,
+                "the proc macro `{krate}` is built for `{target}` (rule 10) and the toolchain has no `core`, `alloc`, `std` and `proc_macro` for `{target}`: cut the toolchain for it (D89 (a); the host's crates are not taken instead)"
+            ),
         }
     }
 }
@@ -321,7 +345,10 @@ pub fn unit_crates<'a>(
             script: None,
         });
     }
-    Ok(UnitCrates { crates, sysroot, toolchain: first, build_scripts, alloc })
+    // A member's proc macro is built from the macro side's crates (D89 (a)), or refused alone.
+    let mut refused = AVec::new_in(alloc);
+    macro_side::add_macro_side(graph, lock, members, toolchain, &at_of, &mut crates, &mut build_scripts, &mut refused, alloc)?;
+    Ok(UnitCrates { crates, sysroot, toolchain: first, build_scripts, refused, alloc })
 }
 
 /// The toolchain units reachable from std, core and alloc (and bstd when `blaze`) for

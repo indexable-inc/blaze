@@ -6,7 +6,8 @@
 //! outline, each lowered alone, a member its crate's cfg turns off left out.
 //!
 //! Where-clauses are built by [`super::preds`] into [`Store::preds`]; a trait's predicates and
-//! fn signatures are [`Want::Members`], apart from its head. Not here yet: `where const`
+//! fn signatures are [`Want::Members`], apart from its head; an impl's fn's signature is its
+//! own [`Want::MemberFn`], made when that fn is used ([`member_fn`]). Not here yet: `where const`
 //! clauses (collected, not keyed), attributes (`#[repr]`, ABI, `no_mangle`), consts, statics.
 
 use std::alloc::Global;
@@ -28,6 +29,9 @@ use super::preds::Preds;
 use super::source::NamesSource;
 use super::types::{Bounds, Builder, Env, Heads, ParamBound, SelfTy, TraitAliasHead, Why, intern, intern_list};
 use crate::resolve::Paths;
+
+mod member_fn;
+pub use member_fn::member_fn_want;
 
 /// The most steps one [`Store::ensure`] takes: past it the needs are a cycle.
 const MOST_STEPS: usize = 1 << 16;
@@ -164,6 +168,11 @@ pub struct Maps {
     /// How many lowerings of a written bound's arguments are nested right now
     /// ([`Heads::written_depth`]): zero between any two heads.
     pub written_depth: core::cell::Cell<u32>,
+    /// How many constant evaluations are running now (consts.rs `Consts::value_at` counts
+    /// itself in and out): zero where no evaluator is at work. `Records::consts` is `None`
+    /// both while one runs and for a caller that has no evaluator at all; this tells the two
+    /// apart (check.rs `make`: only the second refuses a head by name).
+    pub evaluating: core::cell::Cell<u32>,
 }
 
 impl Heads for Maps {
@@ -312,7 +321,7 @@ fn discriminants<'n, S: NamesSource<'n>>(b: &Builder<'_, Maps, S>, tys: &mut Por
                 if need.is_some() {
                     continue;
                 }
-                let Some(&PNode::ConstValue { bits: raw, .. }) = tys.view().nodes.get(made.0 as usize) else {
+                let Some(&PNode::ConstValue { bits: raw, .. }) = tys.view().get(made) else {
                     return Err(Why::ConstPath(Box::from(v.text_at(at)?.trim()), cr));
                 };
                 // The bits are the value's in the type's width: sign-extend a signed one.
@@ -395,7 +404,12 @@ pub struct ImplHead {
     pub trait_: Option<ItemKey>,
     pub trait_args: tc::ArgsAfterSelf,
     pub assoc: Vec<(Name, PTy), Global>,
+    /// Its fns by name and key. No signature is made with the head: each is its own
+    /// [`Want::MemberFn`], made when the fn is used (work at item grain).
     pub fns: Vec<(Name, ItemKey), Global>,
+    /// For each of `fns`, in its order: whether its first parameter is `self`, read from its
+    /// text ([`member_fn::takes_self`]): what answering a name needs, without a signature.
+    pub fn_self: Vec<bool, Global>,
     /// Its associated constants (the Reference, "Associated constants"), each with a row in
     /// `Store::fns` as the checker reads one: no inputs, its type the output, and its body
     /// where its value is written (`has_body`: what the constant evaluator lowers).
@@ -416,12 +430,16 @@ pub enum Want {
     /// A trait's predicates (supertraits, where clauses) and its fns' signatures: apart from
     /// its head, which they may need (`where Self::Item: Clone`).
     Members(LibKey),
+    /// The signature of fn `.1` of impl `.0`: its own want, made after the impl's head and
+    /// apart from it ([`member_fn`]), so naming a member never makes a signature.
+    MemberFn(LibKey, ItemKey),
 }
 
 impl Want {
+    /// The library key it is made from: an impl's fn's is its impl's.
     fn key(self) -> LibKey {
         match self {
-            Want::Head(k) | Want::Adt(k) | Want::Impl(k) | Want::Fn(k) | Want::Members(k) => k,
+            Want::Head(k) | Want::Adt(k) | Want::Impl(k) | Want::Fn(k) | Want::Members(k) | Want::MemberFn(k, _) => k,
         }
     }
 }
@@ -448,6 +466,9 @@ pub struct Store<'n> {
     /// made without them, and a body that uses one gets [`super::world_items::Gap::FnHead`]
     /// (a trait's head does not depend on its fns' signatures: `FnMut` and `extern "rust-call"`).
     pub fn_gaps: HashMap<ItemKey, Why, Global>,
+    /// Each impl's frame its fns' signatures are made in ([`member_fn::MemberFrame`]), kept
+    /// when its head is made, by the impl's checker key.
+    member_frames: HashMap<ItemKey, member_fn::MemberFrame, Global>,
     /// Each tuple struct's and tuple variant's constructor fn, by the variant's key: made with
     /// its ADT's head.
     pub ctors: HashMap<ItemKey, CtorSig, Global>,
@@ -483,10 +504,12 @@ pub struct TraitExtra {
     pub consts: Vec<(Name, ItemKey), Global>,
 }
 
-/// The step's result: done, or the head it needs first.
+/// The step's result: done, the head it needs first, or the want it needs first (an impl's
+/// head before one of its fns' signatures).
 enum Step {
     Done,
     Need(LibKey),
+    First(Want),
 }
 
 fn cycle(stack: &[Want]) -> Vec<LibKey, Global> {
@@ -623,7 +646,7 @@ pub(super) fn own_generics<'n, S: NamesSource<'n>>(b: &Builder<'_, Maps, S>, tys
             lf::GenericParam::Type { .. } => i += 1,
             lf::GenericParam::Const { ty, .. } => {
                 let t = b.ty(tys, &env, v, ty)?;
-                match tys.view().nodes.get(t.0 as usize) {
+                match tys.view().get(t) {
                     Some(PNode::Int(_) | PNode::Uint(_) | PNode::Bool | PNode::Char) => {}
                     // A fieldless enum (`const ORD: AtomicOrdering`): const_enum.rs.
                     _ if super::const_enum::accepts(b.heads, tys, t) => {}
@@ -732,6 +755,7 @@ impl<'n> Store<'n> {
             pointers: super::receiver::Pointers::NOT_LOOKED_UP,
             trait_defs: HashMap::new_in(Global),
             fn_gaps: HashMap::new_in(Global),
+            member_frames: HashMap::new_in(Global),
             ctors: HashMap::new_in(Global),
             statics: HashMap::new_in(Global),
             opaques: HashMap::new_in(Global),
@@ -756,22 +780,22 @@ impl<'n> Store<'n> {
         let mut just_made = None;
         for _ in 0..MOST_STEPS {
             let Some(&top) = stack.last() else { return Ok(()) };
-            match self.step(names, keys, top)? {
+            let need = match self.step(names, keys, top)? {
                 Step::Done => {
                     just_made = stack.pop();
+                    continue;
                 }
-                Step::Need(k) => {
-                    let need = self.need(k);
-                    if just_made == Some(need) {
-                        return Err(HeadError::NeedMade { need, by: top });
-                    }
-                    if stack.iter().any(|w| *w == need) {
-                        return Err(HeadError::Cycle(cycle(&stack)));
-                    }
-                    just_made = None;
-                    stack.push(need);
-                }
+                Step::Need(k) => self.need(k),
+                Step::First(w) => w,
+            };
+            if just_made == Some(need) {
+                return Err(HeadError::NeedMade { need, by: top });
             }
+            if stack.iter().any(|w| *w == need) {
+                return Err(HeadError::Cycle(cycle(&stack)));
+            }
+            just_made = None;
+            stack.push(need);
         }
         Err(HeadError::Cycle(cycle(&stack)))
     }
@@ -785,9 +809,23 @@ impl<'n> Store<'n> {
             Want::Impl(_) => self.impls.contains_key(&ck),
             Want::Fn(_) => self.fns.contains_key(&ck),
             Want::Members(_) => self.preds.contains_key(&ck),
+            // Made, or refused as its own gap (`member_fn_head`).
+            Want::MemberFn(_, f) => self.fns.contains_key(&f) || self.fn_gaps.contains_key(&f),
         };
         if done {
             return Ok(Step::Done);
+        }
+        // An impl's fn: its impl's head first (its frame, associated types and clauses), then
+        // its own signature alone.
+        if let Want::MemberFn(impl_, f) = want {
+            if !self.impls.contains_key(&ck) {
+                return Ok(Step::First(Want::Impl(impl_)));
+            }
+            return match self.member_fn(names, keys, impl_, f) {
+                Ok(()) => Ok(Step::Done),
+                Err(Why::Need(k)) => Ok(Step::Need(k)),
+                Err(why) => Err(HeadError::Item(impl_, why)),
+            };
         }
         let resolver = Paths { names };
         // An item declared in a body: its row's text and its enclosing body's module.
@@ -1306,7 +1344,11 @@ impl<'n> Store<'n> {
         let ms = members(names, key).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
         let mut assoc = Vec::new_in(Global);
         let mut fns = Vec::new_in(Global);
-        let mut fn_texts = Vec::new_in(Global);
+        // Each fn's `self` from its text ([`member_fn::takes_self`]): its signature is its own
+        // want ([`Want::MemberFn`]), made when it is used, never with this head (brief 14: a
+        // signature naming `Self::BYTES` of a sibling impl made every lookup of a name in the
+        // type need that constant).
+        let mut fn_self = Vec::new_in(Global);
         let mut const_texts = Vec::new_in(Global);
         for m in &ms {
             let low = lower(names, key, m.text).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
@@ -1318,7 +1360,7 @@ impl<'n> Store<'n> {
                 ItemDetail::Fn { .. } => {
                     let mk = keys.member(ck, MemberKind::Fn, m.name).map_err(|c| Why::Program(format!("{c}").into_boxed_str(), whole))?;
                     fns.push((Name::of(m.name), mk));
-                    fn_texts.push((mk, m.text));
+                    fn_self.push(member_fn::takes_self(&mv)?);
                 }
                 ItemDetail::TypeAlias => {
                     let t = mv.head_opt(head::TY).ok_or(Why::Unsupported("an associated type with no type", whole))?;
@@ -1375,12 +1417,12 @@ impl<'n> Store<'n> {
             self.fns.insert(mk, row);
             consts.push((name, mk));
         }
-        for &(mk, text) in &fn_texts {
-            let low = lower(names, key, text).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
-            self.member_fn_head(names, key, mk, Some(ck), &env, generics, &preds.clauses, &low.view(), text)?;
-        }
+        // The frame its fns' signatures are made in, each by its own want (`Store::member_fn`).
+        let mut frame_bounds = Vec::with_capacity_in(bounds.len(), Global);
+        frame_bounds.extend_from_slice(&bounds);
+        self.member_frames.insert(ck, member_fn::MemberFrame { module, generics, params: ps.clone(), consts: cs.clone(), bounds: frame_bounds, self_: env.self_ });
         self.preds.insert(ck, preds);
-        self.impls.insert(ck, ImplHead { generics, self_ty, trait_, trait_args, assoc, fns, consts, polarity });
+        self.impls.insert(ck, ImplHead { generics, self_ty, trait_, trait_args, assoc, fns, fn_self, consts, polarity });
         self.maps.const_params.insert(key, cs);
         Ok(())
     }

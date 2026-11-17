@@ -227,7 +227,7 @@ pub(crate) fn run<'b>(
                     words.str(" (before the network: ").str(tried).str(")");
                 }
                 let words = bstd::mem::format_in!(held, "{}: {untrusted}", words.as_str());
-                return Ok(Did::FailedSaying(TaskFailure { name, why: Why::Refused { what: "its sources were not fetched now; the next command asks again", rule: "fetch_task::made" } }, held_str(words.as_str(), held)));
+                return Ok(Did::Hole(TaskFailure { name, why: Why::Refused { what: "its sources were not fetched now; the next command asks again", rule: "fetch_task::made" } }, held_str(words.as_str(), held)));
             }
         }
     };
@@ -263,7 +263,7 @@ pub(crate) fn run<'b>(
             // next command may not meet. No record; the job fails with the words, and the
             // answer is not written, so the next command asks again.
             if !lasting && cfg!(feature = "fetch") {
-                return Ok(Did::FailedSaying(TaskFailure { name, why: Why::Refused { what: "its sources were not fetched now (the network's or the store's fault); the next command asks again", rule: "fetch_task::made" } }, held_str(message.as_str(), held)));
+                return Ok(Did::Hole(TaskFailure { name, why: Why::Refused { what: "its sources were not fetched now (the network's or the store's fault); the next command asks again", rule: "fetch_task::made" } }, held_str(message.as_str(), held)));
             }
             record.find(rule, (0, 0), &[message.as_str()]);
             record.out = ContentId::of(REFUSED_DOMAIN, &name.subject.0);

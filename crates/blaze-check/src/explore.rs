@@ -13,6 +13,8 @@ use crate::{
     rt::{self, Runtime},
 };
 
+pub(crate) mod search;
+
 /// How a model is explored. [`Builder::new`] reads the bounds from the environment:
 /// `CHECK_MAX_PREEMPTIONS` (default 3; `none` for no bound), `CHECK_MAX_BRANCHES` (default
 /// 10 000), `CHECK_RANDOM=<runs>` with `CHECK_SEED` and `CHECK_PCT_DEPTH` (default 3) for

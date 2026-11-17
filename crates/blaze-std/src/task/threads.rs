@@ -51,6 +51,8 @@ use super::{
     claim::{Claim, ClaimPlant, Start},
     deque::{DEQUE, Deque, DequePlant, Steal},
     idle::{Idle, IdlePlant, Mark, Woke},
+    ring::{self, PoolPlant, RingEnd},
+    seat::{Current, Named, Seats},
 };
 use crate::cx::{Canceller, Here};
 
@@ -148,11 +150,24 @@ impl Topology {
 pub(crate) struct Plants {
     pub(crate) deque: DequePlant,
     pub(crate) idle: IdlePlant,
+    pub(crate) find: FindPlant,
 }
 
 impl Plants {
-    pub(crate) const NONE: Plants = Plants { deque: DequePlant::None, idle: IdlePlant::None };
+    pub(crate) const NONE: Plants = Plants { deque: DequePlant::None, idle: IdlePlant::None, find: FindPlant::None };
 }
+
+/// A planted bug in [`Pool::find`]'s class order (threads/find_tests.rs's control).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FindPlant {
+    None,
+    /// A foreground worker looks at its group's background queue before the foreground one.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the test's control"))]
+    BackgroundFirst,
+}
+
+#[cfg(all(test, not(blaze_check)))]
+mod find_tests;
 
 /// The type-erased head of every queued task (a [`Job`]): what a queue holds a pointer to.
 #[repr(C)]
@@ -167,6 +182,32 @@ pub(crate) struct Header {
     /// Gives up one reference to the job.
     release: unsafe fn(NonNull<Header>),
     pub(crate) name: &'static str,
+    /// The ring of the batch whose spawn made it (task/ring.rs): it ends into it. Written at
+    /// the making, before the job is published.
+    ring: Option<RingEnd<Header>>,
+    /// Its index in its batch, set by the batch on the scope's thread after the spawn and read
+    /// there when the ring gives it back (`u32::MAX`: not set).
+    tag: AtomicU32,
+}
+
+/// The batch index set on the job `header` heads ([`Queued::set_tag`]).
+///
+/// # Safety
+///
+/// `header` heads a live job (its batch still holds the handle).
+pub(crate) unsafe fn tag_of(header: NonNull<Header>) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe { header.as_ref() }.tag.load(Ordering::Relaxed)
+}
+
+/// Whether the job `header` heads is done (`Acquire`: its result is seen after).
+///
+/// # Safety
+///
+/// `header` heads a live job (its batch still holds the handle).
+pub(crate) unsafe fn done_of(header: NonNull<Header>) -> bool {
+    // SAFETY: the caller's contract.
+    unsafe { header.as_ref() }.done()
 }
 
 impl Header {
@@ -326,6 +367,12 @@ impl<T> Queued<T> {
         self.header().name
     }
 
+    /// Its index in its batch: set by the batch on the scope's thread, read there
+    /// ([`tag_of`]), so `Relaxed`.
+    pub(crate) fn set_tag(&self, tag: u32) {
+        self.header().tag.store(tag, Ordering::Relaxed);
+    }
+
     /// The scope's shared state.
     pub(crate) fn tally(&self) -> &Tally {
         // SAFETY: the handle holds a reference, so the job is alive.
@@ -400,6 +447,8 @@ where
                 discard: discard::<F, T>,
                 release: release::<F, T>,
                 name,
+                ring: ring::take_install(),
+                tag: AtomicU32::new(u32::MAX),
             },
             tally: Arc::clone(tally),
             out: UnsafeCell::new(None),
@@ -437,8 +486,9 @@ where
     // SAFETY: claimed and not yet done: this thread alone touches the result until the store
     // of `DONE` below publishes it.
     unsafe { *job.head.out.get() = Some(ran) };
-    job.head.header.claim.finish();
-    job.head.tally.ended();
+    // SAFETY: a ring is its batch's, which holds this job's handle (and so finishes this task)
+    // before the ring drops.
+    unsafe { ring::end_task(job.head.header.ring, header, PoolPlant::None, || job.head.header.claim.finish(), || job.head.tally.ended()) };
 }
 
 /// Drops a claimed job's body unrun and marks it done, with no result.
@@ -451,8 +501,8 @@ unsafe fn discard<F, T>(header: NonNull<Header>) {
     let job = unsafe { header.cast::<Job<F, T>>().as_ref() };
     // SAFETY: claimed, so this thread alone touches the body.
     drop(unsafe { (*job.body.get()).take() });
-    job.head.header.claim.finish();
-    job.head.tally.ended();
+    // SAFETY: as in `run`.
+    unsafe { ring::end_task(job.head.header.ring, header, PoolPlant::None, || job.head.header.claim.finish(), || job.head.tally.ended()) };
 }
 
 /// Gives up one reference to a job.
@@ -478,15 +528,18 @@ struct Worker {
     /// the worker after it sees `Reserved`.
     mailbox: AtomicPtr<Header>,
     pinned: Lock<VecDeque<JobPtr, Global>>,
+    /// The pinned queue's length, moved under its lock after each push and pop: its own worker
+    /// looks here before it takes the lock, so an empty queue costs no lock.
+    pinned_count: AtomicU32,
     mark: Mark,
     parker: Parker,
     group: u32,
     class: Class,
     /// Its core, by the kernel's number: where its thread pins itself when the topology asks.
     cpu: u32,
-    /// The task it runs now, for a stop's report: a lock taken once at each task's start and
-    /// end, never contended but by that report.
-    current: Lock<&'static str>,
+    /// The task it runs now, for a stop's report: written by this worker alone at each task's
+    /// start and end, with no lock (task/seat.rs `Current`).
+    current: Current,
     /// Its thread left its loop.
     exited: AtomicBool,
     /// Why its loop stopped early (a park the kernel refused): reported at the pool's stop.
@@ -516,6 +569,21 @@ struct Shared {
     next_group: Padded<AtomicU32>,
     /// Whether each thread pins itself to its core (Linux) or sets its class's QoS (macOS).
     pin: bool,
+    /// The seats of joiners outside the pool that steal (task/seat.rs).
+    seats: Padded<Seats>,
+}
+
+/// A joiner outside the pool's seat ([`Pool::adopt`]): while held, it steals from the workers'
+/// deques ([`Pool::steal_seated`]). Given back when dropped.
+pub(crate) struct Seat<'p> {
+    seats: &'p Seats,
+    at: u32,
+}
+
+impl Drop for Seat<'_> {
+    fn drop(&mut self) {
+        self.seats.give(self.at);
+    }
 }
 
 /// What the pool is before it is asked about its workers, and what is the same after: no
@@ -695,11 +763,12 @@ impl Pool {
                     deque: Deque::new(plants.deque),
                     mailbox: AtomicPtr::new(ptr::null_mut()),
                     pinned: Lock::new("bstd.task.pinned", VecDeque::with_capacity_in(PINNED, Global)),
+                    pinned_count: AtomicU32::new(0),
                     mark: Mark::unstarted(),
                     parker: Parker::new(),
                     group: at,
                     class: group.class,
-                    current: Lock::new("bstd.task.current", ""),
+                    current: Current::new(),
                     exited: AtomicBool::new(false),
                     broken: Lock::new("bstd.task.broken", None),
                     stole_near: AtomicU64::new(0),
@@ -722,6 +791,7 @@ impl Pool {
             stop: Padded(AtomicBool::new(false)),
             next_group: Padded(AtomicU32::new(0)),
             pin: topology.pin,
+            seats: Padded(Seats::new()),
         }
     }
 
@@ -914,7 +984,13 @@ impl Pool {
         self.begin();
         let shared = self.shared();
         let worker = &shared.workers[at as usize].0;
-        bounded_push(&mut worker.pinned.lock(), PINNED, job)?;
+        {
+            let mut pinned = worker.pinned.lock();
+            bounded_push(&mut pinned, PINNED, job)?;
+            // Under the lock, after the push; `Release`, before the wake below: a worker that
+            // reads the count after its wake (or in its idle re-check) sees it.
+            worker.pinned_count.fetch_add(1, Ordering::Release);
+        }
         if shared.idle.wake_this(&worker.mark) {
             worker.parker.unpark();
         }
@@ -987,11 +1063,42 @@ impl Pool {
         took
     }
 
+    /// A seat for a joiner outside the pool, if one is free and the pool's tables are made
+    /// (task/seat.rs): held for the join's length, given back before it parks.
+    pub(crate) fn adopt(&self) -> Option<Seat<'_>> {
+        let shared = self.made()?;
+        let at = shared.seats.0.take()?;
+        Some(Seat { seats: &shared.seats.0, at })
+    }
+
+    /// One queued task off a deque of a worker of `class`, for a seated joiner: as a thief
+    /// takes it (one, not half: the joiner has no deque of its own). Run it with
+    /// [`Pool::run_lent`]: the joiner's claim decides whether it is still unstarted. `None` when
+    /// every such deque looked empty or was contended.
+    pub(crate) fn steal_seated(&self, _seat: &Seat<'_>, class: Class) -> Option<JobPtr> {
+        let shared = self.made()?;
+        for worker in shared.workers.iter() {
+            if worker.0.class != class {
+                continue;
+            }
+            match worker.0.deque.steal() {
+                Steal::Taken(job) => return Some(JobPtr(job)),
+                Steal::Empty | Steal::Lost => {}
+            }
+        }
+        None
+    }
+
     /// A task of worker `at`'s own: its pinned queue, its LIFO slot, its deque.
     fn own(&self, at: u32) -> Option<JobPtr> {
         let worker = &self.shared().workers[at as usize].0;
-        if let Some(job) = worker.pinned.lock().pop_front() {
-            return Some(job);
+        // `Acquire`: pairs with `spawn_on`'s `Release`; a zero skips the lock.
+        if worker.pinned_count.load(Ordering::Acquire) != 0 {
+            let mut pinned = worker.pinned.lock();
+            if let Some(job) = pinned.pop_front() {
+                worker.pinned_count.fetch_sub(1, Ordering::Relaxed);
+                return Some(job);
+            }
         }
         if worker.lifo_run.load(Ordering::Relaxed) < LIFO_RUN {
             let job = worker.lifo.swap(ptr::null_mut(), Ordering::Relaxed);
@@ -1015,10 +1122,10 @@ impl Pool {
         // SAFETY: the queue's reference keeps the job alive until the release below.
         let head = unsafe { header.as_ref() };
         if head.claim.by_worker() {
-            let outer = core::mem::replace(&mut *worker.current.lock(), head.name);
+            let outer = worker.current.set(head.name);
             // SAFETY: claimed by this thread just now.
             unsafe { (head.run)(header, Here::Worker(at)) };
-            *worker.current.lock() = outer;
+            worker.current.set(outer);
         }
         // SAFETY: the queue's reference, which this worker took out of its queue.
         unsafe { (head.release)(header) };
@@ -1130,9 +1237,10 @@ impl Pool {
         if let Some(job) = self.own(at) {
             return Some(job);
         }
-        let classes = match worker.class {
-            Class::Foreground => [Class::Foreground, Class::Background],
-            Class::Background => [Class::Background, Class::Foreground],
+        let classes = match (worker.class, self.0.plants.find) {
+            (Class::Foreground, FindPlant::None) => [Class::Foreground, Class::Background],
+            (Class::Foreground, FindPlant::BackgroundFirst) => [Class::Background, Class::Foreground],
+            (Class::Background, _) => [Class::Background, Class::Foreground],
         };
         if let Some(job) = take(own, classes[0]) {
             return Some(job);
@@ -1180,7 +1288,7 @@ impl Pool {
     fn visible(&self, at: u32) -> bool {
         let shared = self.shared();
         let worker = &shared.workers[at as usize].0;
-        !worker.pinned.lock().is_empty()
+        worker.pinned_count.load(Ordering::Acquire) != 0
             || shared.workers.iter().any(|it| !it.0.deque.looks_empty())
             || shared.groups.iter().any(|group| !group.foreground.lock().is_empty() || !group.background.lock().is_empty())
     }
@@ -1207,7 +1315,11 @@ impl Pool {
             let at = u32::try_from(at).unwrap_or(u32::MAX);
             let broken = worker.0.broken.lock().take();
             if broken.is_some() || !worker.0.exited.load(Ordering::Acquire) {
-                stuck.push(Stuck { worker: at, task: *worker.0.current.lock(), broken });
+                let task = match worker.0.current.read() {
+                    Named::Task(name) => name,
+                    Named::Changing => "(between two tasks: its name was being written)",
+                };
+                stuck.push(Stuck { worker: at, task, broken });
             }
         }
         if stuck.is_empty() { None } else { Some(Hung { stuck }) }

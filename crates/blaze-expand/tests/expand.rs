@@ -619,7 +619,14 @@ fn derive(which: BuiltinDerive, item: &str) -> Expansion<'static> {
 
 /// Item position in the Reference's order: a `cfg_attr` applied where it stands, a derive passed
 /// over, each other attribute offered in turn as a possible attribute macro, its call the item
-/// without it; then the derives in order on the item as a derive sees it.
+/// without it and without the derives written before it; then the derives in order on the item
+/// as a derive sees it. The Reference, "Attributes": "active attributes remove themselves from
+/// the form they are on while inert attributes stay on"; "Derive macro helper attributes": a
+/// helper is in scope "for attributes that are applied to that item and are applied lexically
+/// after the derive macro invocation", and "These attributes are inert". A derive written before
+/// an attribute macro is expanded first (rustc_expand `take_first_attr`), so it is not in the
+/// macro's input (else a macro that re-emits its item runs it twice); a helper before it stays.
+/// Expected: `test an_items_attributes_are_walked_in_order ... ok`.
 #[test]
 fn an_items_attributes_are_walked_in_order() {
     let mut unix = |name: &str, _: Option<&str>| Ok::<bool, ()>(name == "unix");
@@ -638,10 +645,23 @@ fn an_items_attributes_are_walked_in_order() {
     assert_eq!(path, "m::at");
     let call = walk.attr_call(attr).expect("the call is made");
     assert_eq!(show(call.args.as_ref().expect("it has arguments")), "x");
-    // The attributes after it as written: the walk has not reached them.
-    assert_eq!(show(&call.item), "# [ inline ] # [ derive ( Debug ) ] # [ repr ( C ) ] # [ cfg ( unix ) ] fn f ( ) { }");
+    // The derive written before it ran first and is cut; the attributes after it as written:
+    // the walk has not reached them.
+    assert_eq!(show(&call.item), "# [ inline ] # [ repr ( C ) ] # [ cfg ( unix ) ] fn f ( ) { }");
+    assert_eq!(call.derives_taken, 1);
     assert_eq!(next(&mut walk, &mut unix).map(|(p, _)| p), Some("repr".into()));
     assert_eq!(next(&mut walk, &mut unix), None);
+
+    // A helper written after a derive and before the macro stays in the macro's input; the
+    // derive does not.
+    let mut helper = blaze_expand::ItemAttrs::new(tokens("#[derive(Clone)] #[serde(x)] #[m] struct S;"));
+    assert_eq!(next(&mut helper, &mut unix).map(|(p, _)| p), Some("serde".into()));
+    let (path, attr) = next(&mut helper, &mut unix).expect("`m` is offered");
+    assert_eq!(path, "m");
+    let call = helper.attr_call(attr).expect("the call is made");
+    assert!(call.args.is_none());
+    assert_eq!(show(&call.item), "# [ serde ( x ) ] struct S ;");
+    assert_eq!(call.derives_taken, 1);
 
     let mut windows = |name: &str, _: Option<&str>| Ok::<bool, ()>(name == "windows");
     let gone = blaze_expand::ItemAttrs::new(tokens("#[cfg(unix)] struct S;")).derives(&mut windows);

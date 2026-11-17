@@ -292,6 +292,13 @@ impl<'w> Texts<'w> {
     pub fn packs(&self) -> &[PackView<'w>] {
         &self.packs
     }
+
+    /// The files read corrected (D58), each `(tree, path in it, corrected text)`: what a reader
+    /// of the packs without the checkout (a pool worker's, blaze-cli body_types.rs) reads in
+    /// place of the pack's bytes, as [`SourceTexts::read`] here does.
+    pub fn corrected(&self) -> &[(u32, &'w str, &'w str)] {
+        &self.corrected
+    }
 }
 
 impl<'w> SourceTexts<'w> for Texts<'w> {

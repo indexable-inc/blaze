@@ -294,7 +294,7 @@ fn reader_traced(sim: &mut Sim, n: u64, boot: u64, plant: Plant, inject: Option<
                 it.store.handed();
                 return it;
             }
-            Some(why) => assert!(injected(why), "a reader broke on its own: {why}"),
+            Some(why) => assert!(injected(why), "a reader broke on its own: {why}\nTRACE-TMP\n{}", trace.as_ref().map(Trace::render).unwrap_or_default()),
         }
     }
     panic!("no reader opened in 50 tries");
@@ -1056,6 +1056,8 @@ fn a_traced_scenario_is_the_untraced_one() {
         (17, 5, 2, Some(1), 40, false),
     ];
     for (seed, rounds, per, cut, fail, durable) in cases {
+        eprintln!("CASE-TMP {seed} {rounds} {per} {cut:?} {fail} {durable}");
+        let _ = scenario_traced(seed, rounds, per, cut, fail, HONEST, durable, None, &mut 0, &mut Some(Trace::default()));
         let mut bare = 0;
         let untraced = scenario_traced(seed, rounds, per, cut, fail, HONEST, durable, None, &mut bare, &mut None);
         let mut traced_taken = 0;

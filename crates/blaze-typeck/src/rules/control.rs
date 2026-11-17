@@ -57,6 +57,40 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let (inputs, output, rust_call) = match self.reads.fn_sig(owner)? {
             Some(sig) => {
                 self.own_params = sig.parent_count + sig.own_count;
+                // A projection's well-formedness at each signature type that mentions one: the
+                // type AS WRITTEN (an alias kept, not normalized: `Lower::Assumed`) is a
+                // `WellFormed` obligation of the body, its where-clauses assumed above. What it
+                // proves: a generic associated type's own clauses at each use (D89 (b);
+                // blaze-solve structural.rs, the `Projection` arm): `x: <u8 as Tr>::Out<NotClone>`
+                // under `type Out<T: Clone>` is E0277. OPEN: rustc's wfcheck asks every signature
+                // type (an ADT's where-clauses at `S<NotClone>`); the rebuilt layer has no
+                // item-level check yet, and this asks only types with a projection.
+                for &t in sig.inputs.iter().chain(core::iter::once(&sig.output)) {
+                    // Whether `t` mentions an alias: a work list over its nodes, bounded (rule 18).
+                    let mut todo: blaze_own::Vec<u32, Alloc<'a>> = blaze_own::Vec::new_in(self.alloc);
+                    todo.push(t.0);
+                    let mut alias = false;
+                    let mut steps = 0u32;
+                    while let Some(i) = todo.pop() {
+                        steps += 1;
+                        if steps > 1 << 16 {
+                            return Err(CheckError::Limit(crate::error::Limit::Table).into());
+                        }
+                        let Some(&n) = sig.types.get(crate::PTy(i)) else {
+                            return Err(CheckError::Malformed(Malformed::TypeOrder { node: i, child: i }).into());
+                        };
+                        if matches!(n, crate::PNode::Alias { .. }) {
+                            alias = true;
+                            break;
+                        }
+                        crate::portable::node_children(sig.types, n, &mut todo)?;
+                    }
+                    if !alias {
+                        continue;
+                    }
+                    let w = self.lower(sig.types, t, Lower::Assumed, Cause::Body)?;
+                    self.ty.register(crate::ty::Obligation { goal: Goal::WellFormed(w), cause: Cause::Body })?;
+                }
                 let mut inputs: blaze_own::Vec<Ty, Alloc<'a>> = blaze_own::Vec::with_capacity_in(sig.inputs.len(), self.alloc);
                 for &t in sig.inputs {
                     inputs.push(self.lower_sig_ty(sig.types, t)?);

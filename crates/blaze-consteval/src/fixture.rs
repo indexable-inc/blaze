@@ -204,6 +204,10 @@ pub struct World {
     /// Lowered body records attached, not yet checked: key, record bytes, item text.
     lowered: StdVec<(ItemKey, StdVec<u8>, String)>,
     anon: u32,
+    /// ADTs declared with a `Drop` impl ([`World::drop_impl_on`]).
+    drop_impls: StdVec<ItemKey>,
+    /// The ADT standing for core's `ManuallyDrop` ([`World::manually_drop_is`]).
+    manually_drop: Option<ItemKey>,
     /// The unit's ground table and layouts, kept between evaluations.
     unit: Option<(PortableTys<'static>, Layouts<Alloc<'static>>, Codes<Alloc<'static>>)>,
 }
@@ -264,8 +268,21 @@ impl World {
             store: StdVec::new(),
             lowered: StdVec::new(),
             anon: 0,
+            drop_impls: StdVec::new(),
+            manually_drop: None,
             unit: None,
         }
+    }
+
+    /// ADT `adt` has a `Drop` impl (`impl Drop for ADT`; by E0367 an impl for the ADT's
+    /// generic parameters, so it applies at every argument).
+    pub fn drop_impl_on(&mut self, adt: ItemKey) {
+        self.drop_impls.push(adt);
+    }
+
+    /// ADT `adt` is core's `ManuallyDrop` (`#[lang = "manually_drop"]`) in this world.
+    pub fn manually_drop_is(&mut self, adt: ItemKey) {
+        self.manually_drop = Some(adt);
     }
 
     /// The item declared as `name`.
@@ -377,6 +394,14 @@ impl World {
         let k = self.fx.func(name, own, inputs, out, StdVec::new());
         self.declare(name, k);
         self.kinds.push((k, FnKind::Intrinsic(what)));
+        k
+    }
+
+    /// A `#[rustc_intrinsic]` fn `name` the table does not hold (`FnKind::UnknownIntrinsic`).
+    pub fn unknown_intrinsic(&mut self, name: &str, own: u32, inputs: &[PTy], out: PTy) -> ItemKey {
+        let k = self.fx.func(name, own, inputs, out, StdVec::new());
+        self.declare(name, k);
+        self.kinds.push((k, FnKind::UnknownIntrinsic));
         k
     }
 
@@ -792,5 +817,18 @@ impl ConstWorld for World {
 
     fn explicit_discriminant(&self, adt: ItemKey, variant: u32) -> Option<ItemKey> {
         self.discs.iter().find(|(k, _)| *k == (adt, variant)).map(|&(_, d)| d)
+    }
+
+    /// The fixture builds no `drop` fn: the ADT's own key stands for it (only whether an impl
+    /// exists is read).
+    fn drop_impl(&self, ty: PTy, ground: &mut PortableTys<'_>) -> Option<Result<Option<ItemKey>, blaze_build::BuildError>> {
+        let PNode::Adt(k, _) = ground.view().node(ty).ok()? else {
+            return Some(Err(blaze_build::BuildError::Malformed { what: "a `Drop` impl asked of a type that is not an ADT" }));
+        };
+        Some(Ok(self.drop_impls.contains(&k).then_some(k)))
+    }
+
+    fn manually_drop(&self) -> Option<Option<ItemKey>> {
+        Some(self.manually_drop)
     }
 }

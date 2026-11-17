@@ -128,7 +128,12 @@ fn dyn_types_through_front2() {
         println!("apit clauses by parameter: {:?}", (0..5).map(on).collect::<Vec<_>>());
         assert_eq!(on(1).len(), 2, "`impl Two`: `Two` and `Sized`");
         assert!(on(1).contains(&sized), "`impl Two` is `Sized`");
-        assert!(!on(2).contains(&sized) && on(2).len() == 1, "`impl Tr + ?Sized`: `Tr` only");
+        // The sized hierarchy (RFC 3729; the pinned core's marker.rs: `#[lang = "meta_sized"]
+        // pub trait MetaSized: PointeeSized`, `pub trait Sized: MetaSized`): `?Sized` relaxes
+        // `Sized` to `MetaSized`, not to nothing (front2_bounds' `relaxed_meta`). Judge-changed
+        // 2026-11-16 by the checks integrator (was "`Tr` only") after the MetaSized piece landed.
+        let meta = checker_of(front.index.lang("meta_sized").expect("core's `MetaSized` is a lang item"));
+        assert!(!on(2).contains(&sized) && on(2).contains(&meta) && on(2).len() == 2, "`impl Tr + ?Sized`: `Tr` and `MetaSized`, no `Sized`");
         assert_eq!(on(4).len(), 2, "the `impl Two` inside `Into<..>`: `Two` and `Sized`");
     }
 
@@ -194,7 +199,6 @@ fn use_future() { let _x: Option<&dyn core::future::Future<Output = u8>> = None;
 fn use_mine_sized() { let _x: Option<&dyn MineSized> = None; }
 fn use_mine() { let _x: Option<&dyn Mine> = None; }
 fn f(x: core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = u8> + Send>>) {}
-async fn g() -> u8 { f(Box::pin(async { 1 })); 0 }
 ";
 
 /// A typed receiver is read from its type as written and resolved (front2/receiver.rs
@@ -207,13 +211,14 @@ async fn g() -> u8 { f(Box::pin(async { 1 })); 0 }
 ///
 /// CLEAN: `dyn Recv` (every listed form, written as `self: T` too), `dyn Future` (core's
 /// `poll(self: Pin<&mut Self>, ..)`), `dyn MineSized` (`self: MyBox<Self>` with `where Self:
-/// Sized`), the head `f(Pin<Box<dyn Future<Output = u8> + Send>>)` and `g`'s call of it with
-/// `Box::pin(async { 1 })`. REFUSED: `dyn Mine` (`self: MyBox<Self>`, a user type without
+/// Sized`) and the head `f(Pin<Box<dyn Future<Output = u8> + Send>>)`. (A call of `f` with
+/// `Box::pin(async { 1 })` needs the unsizing coercion `Pin<Box<async block>>` to
+/// `Pin<Box<dyn Future>>` at an argument, the checker's, not this rule: not here.) REFUSED: `dyn Mine` (`self: MyBox<Self>`, a user type without
 /// `DispatchFromDyn`): E0038. CONTROL (the cause removed): the same `use_recv` over a store whose
 /// pointer types were never looked up (`Pointers::NOT_LOOKED_UP`) is the checker's
 /// `DynUndecided`, not a clean body.
 ///
-/// Prints, last: "receivers: 5 clean, `dyn Mine` refused (E0038), undecided without the pointer types".
+/// Prints, last: "receivers: 4 clean, `dyn Mine` refused (E0038), undecided without the pointer types".
 #[test]
 fn typed_receivers_through_front2() {
     let home = std::env::var("HOME").expect("HOME is set");
@@ -230,6 +235,12 @@ fn typed_receivers_through_front2() {
     let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
     let pointers = blaze_ladder::front2::receiver::Pointers::find(&front.index, front.resolver);
     println!("pointers: {pointers:?}");
+    // A library key's `Debug` prints only its crate: prove `Box`, `Rc` and `Arc` are three items.
+    {
+        use blaze_ladder::front2::receiver::Pointer;
+        let (Pointer::At(b), Pointer::At(r), Pointer::At(a)) = (pointers.boxed, pointers.rc, pointers.arc) else { panic!("alloc's Box, Rc and Arc are all found: {pointers:?}") };
+        assert!(b != r && b != a && r != a, "`Box`, `Rc` and `Arc` are three different items");
+    }
     let mut store = Store::new(front.index.lang("sized"), front.frame);
     store.pointers = pointers;
     let root = names.root(0);
@@ -243,12 +254,11 @@ fn typed_receivers_through_front2() {
     let prepared = Prepares::new_in(Alloc::global());
     let mut buckets = None;
     // (body, clean expected)
-    let cases: [(&'static str, bool); 6] = [
+    let cases: [(&'static str, bool); 5] = [
         ("use_recv", true),
         ("use_future", true),
         ("use_mine_sized", true),
         ("f", true),
-        ("g", true),
         ("use_mine", false),
     ];
     let mut wrong = Vec::new();

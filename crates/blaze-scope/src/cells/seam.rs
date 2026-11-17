@@ -160,6 +160,8 @@ pub struct Shadowed<'a> {
     pub differ_first: AVec<'a, Differ<'a>>,
     /// The cell core's own written lists ([`super::write`]) against the old core's scopes.
     pub written: WrittenAgainst,
+    /// The first modules whose whole written scope differs, a field each.
+    pub scope_first: AVec<'a, ScopeDiffer<'a>>,
 }
 
 /// The scope lists the cell core writes (bindings and glob edges of each module) against the
@@ -191,6 +193,28 @@ pub struct WrittenAgainst {
     /// Root entries of `#[macro_export]` macros written by expansions, which the old path
     /// publishes into the root scope after its fill: held by the cells, compared with nothing.
     pub exports_published_later: u64,
+    /// The whole scope the writer makes ([`super::Cells::scope`]) against the old core's, module
+    /// by module: equal in every field, and per field ([`SCOPE_FIELDS`]) the modules where
+    /// it differs; modules with an unknown import or call are counted apart and not compared.
+    pub scopes_equal: u64,
+    pub scopes_unknown: u64,
+    pub scope_fields: [u64; SCOPE_FIELDS.len()],
+}
+
+/// The fields of a scope the seam compares one by one, in [`WrittenAgainst::scope_fields`]'s
+/// order.
+pub const SCOPE_FIELDS: [&str; 7] = ["bindings", "globs", "errors", "textual", "marks", "traits", "macro_exports"];
+
+/// A module whose written scope differs from the old core's in field `field` (an index of
+/// [`SCOPE_FIELDS`]): the lengths, and for `errors` the first pair that differs.
+#[derive(Debug)]
+pub struct ScopeDiffer<'a> {
+    pub module: ItemKey,
+    pub field: usize,
+    pub old_len: usize,
+    pub cells_len: usize,
+    pub old_error: Option<blaze_surface::ScopeError<&'a str, blaze_surface::Path<'a, &'a str>>>,
+    pub cells_error: Option<blaze_surface::ScopeError<&'a str, blaze_surface::Path<'a, &'a str>>>,
 }
 
 /// A call the fill expanded that the cell core did not resolve to a macro: what it wrote is
@@ -225,7 +249,7 @@ pub(crate) fn shadow<'a, F: ScopeFacts<Name = &'a str>>(
     seam: &dyn Seam,
     alloc: Alloc<'a>,
 ) -> Result<Shadowed<'a>, ShadowRefused> {
-    let deps = BuiltDeps { built, alloc };
+    let deps = BuiltDeps { built, alloc, asks: false };
     let facts = Facts { inner: facts, not_expanded: Cell::new(0), first: Cell::new(None), alloc };
     let start = seam.now();
     let mut c = Cells::load_with(&facts, root, Some(&deps), alloc).map_err(ShadowRefused::Load)?;
@@ -320,6 +344,50 @@ pub(crate) fn shadow<'a, F: ScopeFacts<Name = &'a str>>(
     }
     // The lists the cell core would hand the record writer, module by module.
     let mut written = WrittenAgainst { modules_unread: c.unread.len() as u64, modules_later: blocks as u64, ..WrittenAgainst::default() };
+    // The whole scopes the writer makes, field by field.
+    let ix = c.write_index(alloc);
+    let mut scope_first: AVec<'a, ScopeDiffer<'a>> = AVec::new_in(alloc);
+    for &m in keys.iter() {
+        let Some(resolved) = done.get(&m) else { continue };
+        let Some((ours, unknown)) = c.scope(&ix, m, alloc) else { continue };
+        if unknown > 0 {
+            written.scopes_unknown += 1;
+            continue;
+        }
+        let old = &resolved.scope;
+        let lens = [
+            (old.bindings.len(), ours.bindings.len(), old.bindings[..] == ours.bindings[..]),
+            (old.globs.len(), ours.globs.len(), old.globs[..] == ours.globs[..]),
+            (old.errors.len(), ours.errors.len(), old.errors[..] == ours.errors[..]),
+            (old.textual.len(), ours.textual.len(), old.textual[..] == ours.textual[..]),
+            (old.marks.len(), ours.marks.len(), old.marks[..] == ours.marks[..]),
+            (old.traits.len(), ours.traits.len(), old.traits[..] == ours.traits[..]),
+            (old.macro_exports.len(), ours.macro_exports.len(), old.macro_exports[..] == ours.macro_exports[..]),
+        ];
+        if lens.iter().all(|l| l.2) {
+            written.scopes_equal += 1;
+            continue;
+        }
+        for (field, &(old_len, cells_len, same)) in lens.iter().enumerate() {
+            if same {
+                continue;
+            }
+            written.scope_fields[field] += 1;
+            if scope_first.len() < DIFFER_SHOWN {
+                let at = old.errors.iter().zip(ours.errors.iter()).position(|(a, b)| a != b).unwrap_or(old.errors.len().min(ours.errors.len()));
+                let (old_error, cells_error) = if field == 2 {
+                    // The cell core's scope lives in its run's borrow: its path is copied out.
+                    let copy = |e: &blaze_surface::ScopeError<&'a str, blaze_surface::Path<'_, &'a str>>| {
+                        e.clone().map_path(|p| blaze_surface::Path { kind: p.kind, segments: AVec::from_slice_in(&p.segments, alloc) })
+                    };
+                    (old.errors.get(at).cloned(), ours.errors.get(at).map(copy))
+                } else {
+                    (None, None)
+                };
+                scope_first.push(ScopeDiffer { module: m, field, old_len, cells_len, old_error, cells_error });
+            }
+        }
+    }
     for &m in keys.iter() {
         let Some(resolved) = done.get(&m) else { continue };
         let Some(w) = c.written(m, alloc) else {
@@ -409,6 +477,7 @@ pub(crate) fn shadow<'a, F: ScopeFacts<Name = &'a str>>(
         unknown_first,
         written_first,
         written,
+        scope_first,
         old_fill: old,
         cells_load: loaded,
         cells_solve: solved.saturating_sub(loaded),

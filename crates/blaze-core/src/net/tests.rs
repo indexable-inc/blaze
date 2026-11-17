@@ -18,7 +18,7 @@ fn inherited(fd: i32) -> Address {
 }
 
 fn refused(root: &std::path::Path, at: &Address) -> String {
-    match listen(root, at) {
+    match listen(root, at, &crate::sockopt::Tcp::DEFAULT) {
         Ok(_) => panic!("{at:?} was listened on"),
         Err(error) => error.to_string(),
     }
@@ -29,7 +29,7 @@ fn an_inherited_socket_bound_at_its_name_is_listened_on_through_a_copy() {
     let root = root("ok");
     let socket = root.join("blaze.sock");
     let passed = UnixListener::bind(&socket).unwrap();
-    let listener = listen(&root, &inherited(passed.as_raw_fd())).unwrap();
+    let listener = listen(&root, &inherited(passed.as_raw_fd()), &crate::sockopt::Tcp::DEFAULT).unwrap();
     assert!(listener.is_unix());
     assert_ne!(listener.fd(), passed.as_raw_fd());
     // SAFETY: no pointers.
@@ -118,10 +118,10 @@ fn a_listener_dropped_after_another_took_its_name_leaves_that_ones_socket() {
     let root = root("taken");
     let at = Address::Unix(FileName::new("blaze.sock").unwrap());
     let socket = root.join("blaze.sock");
-    let old = listen(&root, &at).unwrap();
+    let old = listen(&root, &at, &crate::sockopt::Tcp::DEFAULT).unwrap();
     // The next daemon's start unlinks the name it finds no one answering on, then binds.
     std::fs::remove_file(&socket).unwrap();
-    let new = listen(&root, &at).unwrap();
+    let new = listen(&root, &at, &crate::sockopt::Tcp::DEFAULT).unwrap();
     drop(old);
     assert!(socket.exists(), "the old listener removed the new one's socket");
     UnixStream::connect(&socket).expect("the new listener is reached at the name");

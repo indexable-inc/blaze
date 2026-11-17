@@ -1,0 +1,4 @@
+[package]
+name = "ladder-x0-int-13-div-by-zero"
+version = "0.1.0"
+edition = "2024"

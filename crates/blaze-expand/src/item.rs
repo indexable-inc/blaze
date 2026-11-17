@@ -64,10 +64,14 @@ pub enum NextAttr<'a> {
 }
 
 /// An attribute macro's call: its arguments (inside their delimiters) and the item without
-/// the attribute, for [`crate::Call::attr`].
+/// the attribute and without the derives written before it, for [`crate::Call::attr`].
 pub struct AttrCall<'a> {
     pub args: Option<TokenStream<'a>>,
     pub item: TokenStream<'a>,
+    /// How many derive paths the `#[derive(..)]`/`#[derive_const(..)]`s cut from `item` hold:
+    /// they are the first `derives_taken` of [`ItemAttrs::derives`]' uses on the same item, in
+    /// order, and run before the macro (its caller runs them; the macro never sees them).
+    pub derives_taken: usize,
 }
 
 /// One path of a `#[derive(..)]` or `#[derive_const(..)]`, in order.
@@ -173,8 +177,16 @@ impl<'a> ItemAttrs<'a> {
         Ok(())
     }
 
-    /// The call of the attribute macro at `attr` (a [`NextAttr::Call`]'s): its arguments and
-    /// the item without it.
+    /// The call of the attribute macro at `attr` (a [`NextAttr::Call`]'s): its arguments, and
+    /// the item without it and without each `#[derive(..)]`/`#[derive_const(..)]` written
+    /// before it; every other attribute before it (a derive's helper, `#[inline]`, a doc) and
+    /// everything after it stay as written. The Reference, "Attributes": "active attributes
+    /// remove themselves from the form they are on while inert attributes stay on"; "Attribute
+    /// macros": "The second TokenStream is the rest of the item, including other attributes on
+    /// the item"; "Derive macro helper attributes": a helper is in scope "for attributes that
+    /// are applied to that item and are applied lexically after the derive macro invocation".
+    /// A derive written first is expanded first (rustc_expand `take_first_attr`), so it is not
+    /// in the macro's input; [`AttrCall::derives_taken`] counts its paths for the caller.
     pub fn attr_call(&self, attr: Range<u32>) -> Result<AttrCall<'a>, StreamError> {
         let alloc = self.item.allocator();
         let (start, end) = (attr.start as usize, attr.end as usize);
@@ -183,7 +195,26 @@ impl<'a> ItemAttrs<'a> {
             Some(r) => Some(tokens.copy_in(r.start as usize..r.end as usize, alloc)?),
             None => None,
         };
-        Ok(AttrCall { args, item: splice(&self.item, start..end, &self.item, &[])? })
+        let mut item = TokenStream::new_in(alloc);
+        let mut derives_taken = 0;
+        let mut at = 0;
+        // The outer attributes before the call, each read once: a derive is cut, the rest kept.
+        while let Some(close) = outer_attr(&self.item, at).filter(|&close| close < start) {
+            let written = self.item.copy_in(at..close + 1, alloc)?;
+            match derive_meta(&written, 2..index(written.len() - 1), alloc) {
+                Some((_, paths)) => derives_taken += paths.len(),
+                None => {
+                    for t in at..close + 1 {
+                        item.push_from(&self.item, t)?;
+                    }
+                }
+            }
+            at = close + 1;
+        }
+        for t in (at..start).chain(end..self.item.len()) {
+            item.push_from(&self.item, t)?;
+        }
+        Ok(AttrCall { args, item, derives_taken })
     }
 
     /// When no attribute macro took the item: the rest of its outer attributes applied, then its

@@ -128,6 +128,13 @@ pub enum LeafKind {
     Manifest = 1,
     /// A directory the layout listed: the digest of the names it was handed ([`list_dir`]).
     Listing = 2,
+    /// A directory under blaze's folder in the home (`<home>/.blaze`), by its path there: the
+    /// proc-macro module store's listing ([`crate::macros::MODULE_LISTING`]), whose names are
+    /// the modules there by identity (each renamed into place whole). A fact the answer reads
+    /// outside the checkout: in the units' source, so the certificate and the dependency
+    /// graph's source move when a module comes or goes, and a `MacroModule` lookup that found
+    /// none is a filed failure asked again only then ([`read_home_listing`]).
+    HomeListing = 3,
 }
 
 /// A slot of `mod x;`: `x.rs` and `x/mod.rs` are both probed; the row's stamp and id are the one
@@ -488,6 +495,37 @@ pub fn read_listing<'f>(
     Ok(entries)
 }
 
+/// The row of `dir` under blaze's folder in the home (`home`; none with no home, or no such
+/// folder: an absent row), onto `rows`: a [`LeafKind::HomeListing`]. Read once per layout; the
+/// sweep follows it as it follows a listing in the checkout.
+pub fn read_home_listing(cx: &Cx, home: Option<&Dir<ReadWrite>>, stamps: &impl Stamps, dir: &str, rows: &mut Rows<'_>, frame: &Frame) -> Result<(), CliError> {
+    let (flags, stamp, id) = home_listing_now(cx, home, stamps, Plant::None, dir, None, frame)?;
+    rows.push(LeafKind::HomeListing, flags, dir, stamp, id);
+    Ok(())
+}
+
+/// A home listing's row today: `old`'s id kept when its stamp proves the folder unchanged.
+fn home_listing_now(
+    cx: &Cx,
+    home: Option<&Dir<ReadWrite>>,
+    stamps: &impl Stamps,
+    plant: Plant,
+    dir: &str,
+    old: Option<&Leaf>,
+    frame: &Frame,
+) -> Result<(u8, Option<Stamp>, ContentId), CliError> {
+    let Some(home) = home else { return Ok((ABSENT, None, ContentId([0; 32]))) };
+    Ok(match dir_stamp(cx, home, stamps, plant, dir)? {
+        None => (ABSENT, None, ContentId([0; 32])),
+        Some(Some(stamp)) if old.is_some_and(|old| old.stamp == Some(stamp) && !old.absent()) => (0, Some(stamp), old.expect("matched above").id),
+        Some(stamp) => {
+            let entries = list_dir(cx, home, dir, frame)?;
+            let (flags, id) = listing_id(entries.as_ref().map(Listing::entries));
+            (flags, stamp.filter(|_| flags & ABSENT == 0), id)
+        }
+    })
+}
+
 /// A repeat of the last answer's reads: each row looked at again.
 pub struct Follow<S> {
     pub stamps: S,
@@ -514,7 +552,9 @@ impl Followed<'_> {
 impl<S: Stamps> Follow<S> {
     /// Serial: on the bstd pool it was slower (tempo, 2026-11-16: 8.8 ms on one worker, 11.9 to
     /// 12.3 ms on 18), the cost being each stat's trip through the effect layer, not the call.
-    pub fn follow<'f>(&self, cx: &Cx, root: &Dir<ReadWrite>, last: &Leaves<'_>, frame: &'f Frame) -> Result<Followed<'f>, CliError> {
+    /// `home`: blaze's folder in the home, where a [`LeafKind::HomeListing`] row is (none: such
+    /// a row is absent today).
+    pub fn follow<'f>(&self, cx: &Cx, root: &Dir<ReadWrite>, home: Option<&Dir<ReadWrite>>, last: &Leaves<'_>, frame: &'f Frame) -> Result<Followed<'f>, CliError> {
         let cx = cx.span("sweep: stat each path the last answer read, and read only what its stamp does not prove");
         let mut now = Rows::new_in(frame);
         let mut was = Vec::with_capacity_in(last.len(), frame);
@@ -544,6 +584,7 @@ impl<S: Stamps> Follow<S> {
                         (flags, stamp.filter(|_| flags & ABSENT == 0), id)
                     }
                 },
+                LeafKind::HomeListing => home_listing_now(&cx, home, &self.stamps, self.plant, path, Some(&old), frame)?,
             };
             now.push(old.kind, flags, path, stamp, id);
             was.push(old_state);
@@ -629,7 +670,7 @@ impl<'f> Leaves<'f> {
             }
             start = end;
             let at = row_at + ROW * k;
-            if bytes[at] > LeafKind::Listing as u8 {
+            if bytes[at] > LeafKind::HomeListing as u8 {
                 return Err(refuse(at, WireWhy::Tag(bytes[at])));
             }
             if bytes[at + 1] & !FLAGS != 0 {
@@ -665,7 +706,8 @@ impl<'f> Leaves<'f> {
         let kind = match row[0] {
             0 => LeafKind::Slot,
             1 => LeafKind::Manifest,
-            _ => LeafKind::Listing,
+            2 => LeafKind::Listing,
+            _ => LeafKind::HomeListing,
         };
         let stamp = Stamp::get(&row[4..4 + Stamp::BYTES]);
         let mut id = [0; 32];
@@ -850,6 +892,8 @@ mod tests {
                     }
                     listing_id(Some(names.into_iter()))
                 }
+                // No home is given to this sweep: a home row is absent.
+                LeafKind::HomeListing => (ABSENT, ContentId([0; 32])),
             }
         };
         let sweep = |round: &str| -> Result<(std::vec::Vec<(LeafKind, String)>, u64), Broke> {
@@ -858,7 +902,7 @@ mod tests {
             let (last, _) = Leaves::of(&kept).map_err(harness("the leaf table"))?;
             let reads = || io.disk().map(|disk| disk.read).ok_or(Broke::Harness("the world is not simulated".to_string()));
             let before = reads()?;
-            let followed = Follow { stamps: &model, plant }.follow(&cx, &root, &last, frame).map_err(harness("the sweep"))?;
+            let followed = Follow { stamps: &model, plant }.follow(&cx, &root, None, &last, frame).map_err(harness("the sweep"))?;
             let read = reads()? - before;
             let mut changed = std::vec::Vec::new();
             for (i, leaf) in followed.now.rows.iter().enumerate() {
@@ -1017,6 +1061,40 @@ mod tests {
         assert_eq!(id(), before, "the home moved the root's listing");
         write("crates2/b/Cargo.toml");
         assert_ne!(id(), before, "control: a new directory at the root moves its listing");
+    }
+
+    /// The proc-macro module store's listing under the home is a fact the answer reads: the
+    /// sweep follows its `HomeListing` row, so a module renamed into the store moves the layout
+    /// and the units' source (the certificate, the graph's source, each `MacroModule` part's
+    /// key), and a sweep with the store unchanged moves neither: a lookup that found no module
+    /// is then a filed failure, never asked again before the store moves (macros.rs). Expected:
+    /// passes. Without the row (`read_home_listing` not called, the sweep blind to the home),
+    /// the second assertion fails: "a module put in the store moved nothing".
+    #[test]
+    fn a_module_put_in_the_home_store_moves_the_units_source_and_nothing_else_does() {
+        let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+        let frame = cx.frame();
+        let fs = io.need_fs().expect("files");
+        let root = fs.open_dir(&cx, &Path::new("data").expect("a path")).expect("open");
+        let home = fs.open_dir(&cx, &Path::new("home/.blaze").expect("a path")).expect("open");
+        let put = |dir: &Dir<ReadWrite>, path: &str| {
+            dir.publish(&cx, &Path::new(path).expect("a path"), Content::bytes(b"x"), Durable::No).expect("write");
+        };
+        put(&root, "Cargo.toml");
+        put(&home, "v2/proc-macro/modules/aaaa/wasm-sha256");
+        let model = Model { now: Cell::new(10 * TICK), mtimes: RefCell::new(StdMap::new()) };
+        let mut rows = Rows::new_in(frame);
+        read_home_listing(&cx, Some(&home), &&model, crate::macros::MODULE_LISTING, &mut rows, frame).expect("the home's listing");
+        let source = |rows: &Rows<'_>| units_source(rows.rows.iter().map(|leaf| (rows.path(leaf), leaf)), frame);
+        let table = Leaves::bytes_in(&rows, frame).expect("a table");
+        let (last, _) = Leaves::of(&table).expect("the table reads");
+        let follow = || Follow { stamps: &model, plant: Plant::None }.follow(&cx, &root, Some(&home), &last, frame).expect("the sweep");
+        let same = follow();
+        assert!(!same.layout_moved && source(&same.now) == source(&rows), "an unchanged store moved the layout");
+        put(&home, "v2/proc-macro/modules/bbbb/wasm-sha256");
+        let moved = follow();
+        assert!(moved.layout_moved && source(&moved.now) != source(&rows), "a module put in the store moved nothing");
     }
 
     /// A member's `examples/mm.rs` (and `tests/`, `benches/` files) reaches the layout: without

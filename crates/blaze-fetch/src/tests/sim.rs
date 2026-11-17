@@ -455,6 +455,13 @@ fn run(
             }
             match effect {
                 Effect::Lookup { unit, key } => machine.looked(unit, store.contains_key(&key)),
+                // This origin's machine holds no other tool's archives (the local step's own
+                // simulation is `local_step`): every crate goes on to HTTPS.
+                Effect::Local { unit } => {
+                    if machine.local_found(unit, crate::fetch::LocalArchive::Absent, &[]) != crate::fetch::Adopt::Done {
+                        return Err(Broke::Oracle(format!("unit {unit}: nothing found, yet a reservation asked")));
+                    }
+                }
                 Effect::Put { unit, key, record } => {
                     store.insert(key, record.as_slice().to_vec());
                     machine.stored(unit, Ok(()));

@@ -75,6 +75,7 @@
 //! on some seeds: a watch that is ending is still told some of the changes made meanwhile, as a
 //! system that queued them before it saw the unwatch.
 
+mod every_cut;
 mod host;
 mod journal;
 mod kept;
@@ -92,6 +93,10 @@ use blaze_mem::{Slab, Tag as MemTag};
 use std::alloc::Global;
 
 pub use self::{host::Datagrams, journal::Journal, wake::Landed};
+pub use self::every_cut::{
+    AfterCrash, CrashPoint, FileCut, Inject, KINDS, Kind, Left, Refused, Steps, Sweep, Swept, Tear,
+    UnknownKind, every_cut,
+};
 use crate::{
     Access, Address, Cache, Command, Completion, Conn, Done, Driver, Effect, Exit, FileName,
     IoError, LockMode, Meta, RECV_MOST, Span, Tag, spans,
@@ -692,6 +697,9 @@ pub struct Sim {
     /// The waker it hands out, the other threads' acts due and the other processes beside the
     /// poller (`sim/wake.rs`), once a test asked for them ([`Sim::give_wakers`]).
     wakes: Option<Box<wake::Wakes>>,
+    /// The opt-in fault kinds a test switched on ([`Sim::inject`], `sim/every_cut.rs`): none
+    /// unless asked, and a kind off draws no number.
+    inject: every_cut::Inject,
 }
 
 /// A delay drawn up to the simulation's latency.
@@ -797,6 +805,7 @@ impl Sim {
             armed: None,
             descriptors: kept::Descriptors::new(crate::descriptors::MOST),
             wakes: None,
+            inject: every_cut::Inject::NONE,
         };
         // The disk's clock is the wall clock from the start, so its first stamps are of then.
         sim.disk.at(sim.wall_ns());
@@ -2210,7 +2219,8 @@ impl Sim {
             let Receiving { tag, end, most: _, mut into } = self.receiving.remove(at);
             let kept = into.len();
             if let Some(it) = self.ends.get_mut(end) {
-                let n = most.min(RECV_MOST).min(it.inbox.len());
+                // All that came, or with `short-receive` on a drawn part (`sim/every_cut.rs`).
+                let n = every_cut::short_receive(self.inject, &mut self.rng, most.min(RECV_MOST).min(it.inbox.len()));
                 // alloc: none once the asker's buffer has room for what came.
                 into.extend(it.inbox.drain(..n));
             }
@@ -2963,7 +2973,15 @@ impl Driver for Sim {
                     }
                     continue;
                 }
-                Effect::Listen { at, tag } => {
+                Effect::Listen { at, options, tag } => {
+                    let side = crate::sockopt::Side::Listen;
+                    if let Err(refused) =
+                        crate::sockopt::check_tcp(options.get(), side, crate::sockopt::Platform::Simulated)
+                    {
+                        // alloc: an error's message.
+                        self.tell(tag, Done::Failed(IoError(format!("listening at {at:?}: {refused}"))), Of::Op);
+                        continue;
+                    }
                     let at = match at {
                         Address::Inherited { at, .. } => Address::Unix(at),
                         at => at,
@@ -2992,7 +3010,15 @@ impl Driver for Sim {
                     self.tell(tag, done, Of::Op);
                     continue;
                 }
-                Effect::Connect { at, tag } => {
+                Effect::Connect { at, options, tag } => {
+                    let side = crate::sockopt::Side::Connect;
+                    if let Err(refused) =
+                        crate::sockopt::check_tcp(options.get(), side, crate::sockopt::Platform::Simulated)
+                    {
+                        // alloc: an error's message.
+                        self.tell(tag, Done::Failed(IoError(format!("connecting to {at:?}: {refused}"))), Of::Op);
+                        continue;
+                    }
                     let done = match self.listening_at(&at) {
                         _ if self.rng.one_in(u64::from(self.faults.fail_one_in)) => {
                             self.fail(tag).done
@@ -3228,6 +3254,8 @@ impl Driver for Sim {
         if seeds::off(self) {
             return 0;
         }
+        // With `clock-jump` on, the machine may have slept since the last poll (`sim/every_cut.rs`).
+        every_cut::jump_clock(self);
         let before = out.len();
         match self.wakes.is_some() {
             true => self.poll_with_wakes(out, before, until),
@@ -4407,9 +4435,9 @@ mod tests {
         let at = Address::Unix(name("daemon.sock"));
         for seed in 0..500 {
             let mut sim = Sim::new(seed, Faults::default());
-            let mut effects = vec![Effect::Listen { at: at.clone(), tag: Tag(1) }];
+            let mut effects = vec![Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) }];
             sim.submit(&mut effects);
-            effects.push(Effect::Connect { at: at.clone(), tag: Tag(2) });
+            effects.push(Effect::Connect { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(2) });
             let outside = sim.dial(&at).unwrap();
             sim.peer_send(outside, b"from outside");
             let mut client = None;
@@ -4504,7 +4532,7 @@ mod tests {
         let (mut raced, mut clean) = (0, 0);
         for seed in 0..300 {
             let mut sim = Sim::new(seed, Faults::default());
-            sim.submit(&mut vec![Effect::Listen { at: at.clone(), tag: Tag(1) }]);
+            sim.submit(&mut vec![Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) }]);
             let conn = sim.dial(&at).unwrap();
             let mut seen = BTreeMap::new();
             let mut out = Vec::new();
@@ -4582,7 +4610,7 @@ mod tests {
         let at = Address::Unix(name("s.sock"));
         for seed in 0..100 {
             let mut sim = Sim::new(seed, Faults::default());
-            sim.submit(&mut vec![Effect::Listen { at: at.clone(), tag: Tag(1) }]);
+            sim.submit(&mut vec![Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) }]);
             let mut model: HashMap<u64, Old, Global> = HashMap::new_in(Global);
             let mut conns: Vec<Conn> = Vec::new();
             let mut rng = Rng::new(seed ^ 0x5eed);
@@ -4667,11 +4695,11 @@ mod tests {
         let mut sim = Sim::new(2, Faults::default());
         let at = Address::Tcp("127.0.0.1:8080".parse().unwrap());
         let mut effects = vec![
-            Effect::Connect { at: at.clone(), tag: Tag(1) },
-            Effect::Listen { at: at.clone(), tag: Tag(2) },
+            Effect::Connect { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) },
+            Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(2) },
         ];
         sim.submit(&mut effects);
-        effects.push(Effect::Listen { at: at.clone(), tag: Tag(3) });
+        effects.push(Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(3) });
         effects.push(Effect::Unlisten { tag: Tag(2) });
         effects.push(Effect::Unlisten { tag: Tag(4) });
         let mut seen = BTreeMap::new();

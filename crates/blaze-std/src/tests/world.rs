@@ -27,6 +27,7 @@ fn args_and_host_are_the_worlds() {
         name: Arc::from("box"),
         born: Born::Before(Duration::from_millis(3)),
         build_id: crate::host::BuildId::of(&[5; 20]),
+        exe: Some(Arc::from("/box/bin/prog")),
     };
     let io = Io::simulated(world);
     let args = io.args().expect("Io::sim offers args");
@@ -36,6 +37,7 @@ fn args_and_host_are_the_worlds() {
     let host = io.host().expect("Io::sim offers host");
     assert_eq!((host.pid(), host.cores().get(), &*host.name()), (42, 8, "box"));
     assert_eq!(host.build_id().map(|it| it.as_bytes().to_vec()), Ok(vec![5; 20]), "the build id the test set");
+    assert_eq!(host.exe().as_deref(), Ok("/box/bin/prog"), "the program's path the test set");
     // The process began 3 ms before the clock: an instant says 3 ms more since the start.
     let clock = io.clock().expect("Io::sim offers clock");
     let now = clock.now();

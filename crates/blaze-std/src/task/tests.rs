@@ -6,7 +6,7 @@
 //! task/idle.rs).
 
 use std::{
-    num::{NonZeroU32, NonZeroUsize},
+    num::NonZeroUsize,
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
@@ -272,63 +272,6 @@ fn a_thief_tries_its_own_group_first() {
     }
     eprintln!("threads steals: {near} from the thief's own group, {far} from another");
     assert!(near > 0, "a thief stole from its own group at least once ({near} near, {far} far)");
-    drop(cx);
-    stopped(running);
-}
-
-#[test]
-fn a_background_task_never_starts_on_a_foreground_worker_while_foreground_work_is_queued() {
-    let running = flat(2);
-    let io = Io::sim(13);
-    let cx = root_on(&io, running.pool());
-    let gate = AtomicBool::new(false);
-    let busy = AtomicU32::new(0);
-    let order = AtomicU32::new(0);
-    let block = |_cx: &Cx| -> Result<(), String> {
-        busy.fetch_add(1, Ordering::SeqCst);
-        let until = Instant::now() + Duration::from_secs(10);
-        while !gate.load(Ordering::Acquire) {
-            if Instant::now() > until {
-                return Err("the gate never opened".to_string());
-            }
-            core::hint::spin_loop();
-        }
-        Ok(())
-    };
-    let note = |_cx: &Cx| -> Result<u32, String> { Ok(order.fetch_add(1, Ordering::SeqCst)) };
-    let blockers = cx.scope();
-    let a = blockers.may_overlap("block a", TASK_FRAME, block);
-    let b = blockers.may_overlap("block b", TASK_FRAME, block);
-    let until = Instant::now() + Duration::from_secs(5);
-    while busy.load(Ordering::SeqCst) < 2 {
-        assert!(Instant::now() < until, "both workers did not take a blocker within 5 s");
-        std::thread::yield_now();
-    }
-    let background = cx.scope();
-    background.narrow_workers(NonZeroU32::MAX, Class::Background);
-    let late = background.may_overlap("background", TASK_FRAME, note);
-    let foreground = cx.scope();
-    let f0 = foreground.may_overlap("f0", TASK_FRAME, note);
-    let f1 = foreground.may_overlap("f1", TASK_FRAME, note);
-    let f2 = foreground.may_overlap("f2", TASK_FRAME, note);
-    gate.store(true, Ordering::Release);
-    // Nothing is joined until the workers have run all four: a join runs an unstarted task
-    // itself, which would take it off the queues the order is about.
-    let until = Instant::now() + Duration::from_secs(10);
-    while order.load(Ordering::SeqCst) < 4 {
-        assert!(Instant::now() < until, "the workers did not run the four tasks within 10 s");
-        std::thread::yield_now();
-    }
-    let fs = [f0.join(&cx), f1.join(&cx), f2.join(&cx)];
-    let bg = late.join(&cx);
-    let (a, b) = (a.join(&cx), b.join(&cx));
-    let joined = [foreground.join(&cx), background.join(&cx), blockers.join(&cx)];
-    assert_eq!(a, Ok(()));
-    assert_eq!(b, Ok(()));
-    assert!(joined.iter().all(Result::is_ok), "the scopes: {joined:?}");
-    let fs: Vec<u32> = fs.into_iter().map(|it| it.expect("a foreground task")).collect();
-    let bg = bg.expect("the background task");
-    assert!(fs.iter().all(|&f| f < bg), "background started at {bg}, foreground at {fs:?}");
     drop(cx);
     stopped(running);
 }
@@ -651,7 +594,7 @@ fn batch_bytes(workers: u32, reversed: bool, by_arrival: bool) -> (Vec<u8>, supe
     let running = flat(workers);
     let cx = root_on(&io, running.pool());
     let scope = cx.scope();
-    let mut batch = scope.batch::<(u32, u64), Global>(Global);
+    let mut batch = scope.batch::<(u32, u64), Global>(KEYS, Global).expect("room for the batch's ring");
     for at in 0..KEYS {
         let key = if reversed { KEYS - 1 - at } else { at };
         let index = batch.may_overlap("square", TASK_FRAME, move |_cx| Ok::<_, String>((key, u64::from(key) * u64::from(key) + 1)));

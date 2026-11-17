@@ -308,7 +308,7 @@ pub(crate) fn run<'f, 'b>(cx: &Cx, lockfile: &mut Lockfile<'f>, graph: &mut Grap
     let entry = unit_graph_task::run(&graph.inputs, lockfile.lock, records, PackView::open_source_put, unheld, Alloc::global());
     if let Some(error) = unmapped {
         let words = bstd::mem::format_in!(held, "a fetched source record could not be mapped: {error}");
-        return Ok(Did::FailedSaying(
+        return Ok(Did::Hole(
             TaskFailure { name, why: Why::Refused { what: "the dependency graph: a source record could not be mapped (the store's fault); the next command asks again", rule: "graph.rs" } },
             held_str(words.as_str(), held),
         ));
@@ -325,7 +325,7 @@ pub(crate) fn run<'f, 'b>(cx: &Cx, lockfile: &mut Lockfile<'f>, graph: &mut Grap
         }
         Ok(Entry::NotFetched { count }) => {
             let words = bstd::mem::format_in!(held, "the dependency graph is not kept: {count} of the packages it reaches were not fetched this command; the next command asks again");
-            Ok(Did::FailedSaying(TaskFailure { name, why: Why::Refused { what: "the dependency graph: sources not fetched", rule: "unit_graph_task" } }, held_str(words.as_str(), held)))
+            Ok(Did::Hole(TaskFailure { name, why: Why::Refused { what: "the dependency graph: sources not fetched", rule: "unit_graph_task" } }, held_str(words.as_str(), held)))
         }
         Ok(Entry::Made(made)) => {
             let mut record = Made::new_in(name, held);

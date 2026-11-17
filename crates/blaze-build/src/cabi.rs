@@ -126,7 +126,7 @@ pub fn class_of<A: Allocator + Clone>(ls: &mut Layouts<A>, ty: PTy, cx: &mut Lay
         if tl.is_zst() {
             continue;
         }
-        let node = cx.ground.view().nodes.get(t.0 as usize).copied();
+        let node = cx.ground.view().get(t).copied();
         match node {
             // A short vector (layout/simd.rs) is a fundamental type of its own (AAPCS64 5.9):
             // passed in ONE SIMD register, never as an HFA of its lanes or in `x` registers.

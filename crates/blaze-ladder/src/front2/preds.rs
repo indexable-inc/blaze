@@ -45,6 +45,26 @@ impl Default for Preds {
     }
 }
 
+/// Whether `t` is the alias `alias`, or a projection whose self type (its list's first, then
+/// that one's, in turn) is: the rule that tells an associated type's item bounds from its own
+/// clauses ([`Builder::assoc_own_clauses`]; blaze-solve structural.rs applies the same one).
+/// The table is hash-consed (`PortableTys::intern`), so equal types are equal ids.
+fn reaches_alias(tys: &PortableTys<'_>, mut t: PTy, alias: PTy) -> Result<bool, Why> {
+    const MOST: usize = 256;
+    for _ in 0..MOST {
+        if t == alias {
+            return Ok(true);
+        }
+        let view = tys.view();
+        let Some(&PNode::Alias { args, .. }) = view.get(t) else { return Ok(false) };
+        match view.list(args).map_err(|_| Why::Program("a projection's list is past the type table".into(), Range::new(0, 0)))?.first() {
+            Some(&f) => t = f,
+            None => return Ok(false),
+        }
+    }
+    Err(Why::Unsupported("a projection nested past 256 in an associated type's own clause", Range::new(0, 0)))
+}
+
 fn place(v: &View<'_>, r: Result<blaze_lower::BodyRange, lf::BadRow>) -> Result<Range, Why> {
     Ok(v.site(r?)?)
 }
@@ -390,18 +410,10 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
     /// An associated type with type or const parameters of its own (`type Out<T>: B;`): the
     /// caller gives `me` with those parameters after the trait's (`<Self as
     /// Trait<params>>::Out<T>`, the checker's `AssocGenerics`) and an `env` that has them in
-    /// scope (heads.rs `Store::trait_members`). Refused by name: a bound written on such a
-    /// parameter (`type Out<T: Clone>;`): it is a predicate on the parameter, not on the
-    /// alias, and nothing files it yet. The parameters' implied `Sized` is not filed either
-    /// (typeck.md, "Generic associated types").
+    /// scope (heads.rs `Store::trait_members`). Its OWN clauses (a bound on such a parameter,
+    /// `type Out<T: Clone>;`, its where clauses, each own parameter's implied `Sized`) follow
+    /// the item bounds in the same list ([`Self::assoc_own_clauses`], decision D89 (b)).
     pub fn assoc_ty_bounds(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'n>, me: PTy, sized: Option<LibKey>, out: &mut Preds) -> Result<(), Why> {
-        for &n in v.rows(v.list(head::GENERICS))? {
-            if let lf::GenericParam::Type { bounds, .. } = lf::GenericParam::decode(n)?
-                && !v.rows(bounds)?.is_empty()
-            {
-                return Err(Why::Unsupported("a bound on an associated type's own parameter (`type Out<T: Bound>`)", Range::new(0, 0)));
-            }
-        }
         // `type X: ?Sized;` keeps `<Self as Tr>::X: MetaSized` ([`Self::implied_size`]).
         let (mut stated, mut relaxed) = (false, false);
         for &b in v.rows(v.list(head::BOUNDS))? {
@@ -413,6 +425,68 @@ impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> 
             let args = intern_list(tys, &[me])?;
             out.clauses.push(PClause::Trait { trait_: self.heads.checker(s), args });
         }
+        self.assoc_own_clauses(tys, env, v, me, sized, out)
+    }
+
+    /// The OWN clauses of the associated type `v` (decision D89 (b)), appended to `out.clauses`
+    /// after its item bounds: the bounds written on its own type parameters (`type Out<T:
+    /// Clone>;`), its where clauses (`type Out<T> where T: Clone;`), merged in writing order,
+    /// and each own type parameter's implied `Sized` (relaxed by `?Sized` as on any item:
+    /// [`Self::predicates`]). The Reference, "Associated Items", "Associated Types":
+    /// "Associated types may include generic parameters and where clauses"; "Generic
+    /// parameters": a bound on a parameter is the where clause `T: Bound`. `me` is the alias as
+    /// [`Self::assoc_ty_bounds`] takes it, its list the trait's parameters then the item's own,
+    /// so the own parameters start at its length less their count (heads.rs `own_generics`
+    /// numbers them the same way).
+    ///
+    /// What they ARE for the checker: requirements of the projection, not facts of it. The
+    /// solver's well-formedness of `<X as Tr>::Out<A>` proves each with the projection's
+    /// arguments substituted (blaze-solve structural.rs, the `Projection` arm), so `Out<NotClone>`
+    /// is the language's E0277 naming `Clone`; nothing is kept unchecked (rule 3). They share the
+    /// associated item's `Predicates` with its item bounds, and the two kinds are told apart by
+    /// one rule both sides apply: an item bound's self type is the alias itself or a projection
+    /// whose self chain reaches it; an own clause's never is. So an own clause on the alias
+    /// itself (`where Self::Out<T>: Bound`) is refused by name, never filed as an item bound.
+    /// A `where const` condition on an associated type is refused by name (no caller keys it).
+    pub fn assoc_own_clauses(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'n>, me: PTy, sized: Option<LibKey>, out: &mut Preds) -> Result<(), Why> {
+        let mut own = 0u32;
+        for &n in v.rows(v.list(head::GENERICS))? {
+            if !matches!(lf::GenericParam::decode(n)?, lf::GenericParam::Lifetime { .. }) {
+                own += 1;
+            }
+        }
+        if own == 0 && v.rows(v.list(head::WHERE))?.is_empty() {
+            return Ok(());
+        }
+        let Some(&PNode::Alias { args, .. }) = tys.view().get(me) else {
+            return Err(Why::Program("an associated type's own clauses: its alias is no alias node".into(), Range::new(0, 0)));
+        };
+        let len = tys.view().list(args).map_err(|_| Why::Program("an associated type's alias list is past the type table".into(), Range::new(0, 0)))?.len();
+        let base = u32::try_from(len)
+            .ok()
+            .and_then(|l| l.checked_sub(own))
+            .ok_or_else(|| Why::Program("an associated type's alias lists fewer arguments than its own parameters".into(), Range::new(0, 0)))?;
+        let mut mine = Preds::new();
+        self.predicates(tys, env, v, base, None, sized, &mut mine)?;
+        if !mine.conds.is_empty() {
+            return Err(Why::Unsupported("a `where const` condition on an associated type", Range::new(0, 0)));
+        }
+        for c in mine.clauses.iter() {
+            let args = match *c {
+                PClause::Trait { args, .. } | PClause::Projection { args, .. } => args,
+                PClause::Const { .. } => return Err(Why::Unsupported("a `where const` condition on an associated type", Range::new(0, 0))),
+            };
+            let first = tys.view().list(args).map_err(|_| Why::Program("an own clause's list is past the type table".into(), Range::new(0, 0)))?.first().copied();
+            if let Some(s) = first
+                && reaches_alias(tys, s, me)?
+            {
+                return Err(Why::Unsupported(
+                    "a where clause of a generic associated type on the associated type itself (`type Out<T> where Self::Out<T>: Bound`)",
+                    Range::new(0, 0),
+                ));
+            }
+        }
+        out.clauses.extend_from_slice(&mine.clauses);
         Ok(())
     }
 

@@ -30,7 +30,7 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
         if first == "Self" {
             return Ok(match self.self_ {
                 SelfTy::Trait(_) => Some(PathRes { def: Def::TyParam(0), consumed: 1 }),
-                SelfTy::Ty(t, _) => match self.store.tys.view().nodes.get(t.0 as usize) {
+                SelfTy::Ty(t, _) => match self.store.tys.view().get(*t) {
                     Some(PNode::Adt(k, _)) => Some(PathRes { def: Def::Adt(*k), consumed: 1 }),
                     // Any other implementing type (a parameter, an array, a primitive, a
                     // tuple, a reference): the Reference, "Paths", "`Self`": "In an
@@ -86,8 +86,10 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
                 // below treats it as any module's item (its head by `Store::step`). The
                 // Reference, "Statements", "Item declarations": "There is no implicit capture
                 // of the containing function's generic parameters, parameters, and local
-                // variables": a module's item sees none of them.
-                LocalKind::Struct | LocalKind::Enum | LocalKind::Union | LocalKind::TypeAlias => match row.module {
+                // variables": a module's item sees none of them. A trait of a block is the same
+                // (`SpecWriteFmt::spec_write_fmt(x)`, `<T as SpecWriteFmt>::..` in core's
+                // `Write::write_fmt`): the path to it is read at its block's module.
+                LocalKind::Struct | LocalKind::Enum | LocalKind::Union | LocalKind::TypeAlias | LocalKind::Trait => match row.module {
                     Some(m) => {
                         at_module = m;
                         local_type = Some(row);
@@ -226,10 +228,10 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
     /// `X` a path to `B` cannot carry).
     fn alias_def(&self, generics: u32, ty: PTy) -> Option<Def> {
         let view = self.store.tys.view();
-        match *view.nodes.get(ty.0 as usize)? {
+        match *view.get(ty)? {
             PNode::Adt(k, args) => {
                 let args = view.list(args).ok()?;
-                let own = |(i, a): (usize, &PTy)| matches!(view.nodes.get(a.0 as usize), Some(PNode::Param(p) | PNode::ConstParam(p)) if *p as usize == i);
+                let own = |(i, a): (usize, &PTy)| matches!(view.get(*a), Some(PNode::Param(p) | PNode::ConstParam(p)) if *p as usize == i);
                 (args.len() == generics as usize && args.iter().enumerate().all(own)).then_some(Def::Adt(k))
             }
             n if generics == 0 => prim_of(n).map(Def::Prim),
@@ -253,7 +255,7 @@ const MOST_ALIAS_NODES: u32 = 4096;
 /// of an alias is made with every alias in it substituted (types.rs `path_ty`). `None`: any
 /// other aliased type (a tuple, a reference, a projection), or one past [`MOST_ALIAS_NODES`].
 pub(super) fn fixed_alias(view: blaze_typeck::PTys<'_>, generics: u32, ty: PTy) -> Option<(blaze_typeck::ItemKey, Vec<PTy, Global>)> {
-    let PNode::Adt(adt, args) = *view.nodes.get(ty.0 as usize)? else { return None };
+    let PNode::Adt(adt, args) = *view.get(ty)? else { return None };
     let args = view.list(args).ok()?;
     let mut used = Vec::with_capacity_in(generics as usize, Global);
     used.resize(generics as usize, false);
@@ -268,7 +270,7 @@ pub(super) fn fixed_alias(view: blaze_typeck::PTys<'_>, generics: u32, ty: PTy) 
             if steps > MOST_ALIAS_NODES {
                 return None;
             }
-            match *view.nodes.get(t.0 as usize)? {
+            match *view.get(t)? {
                 PNode::Param(i) | PNode::ConstParam(i) => {
                     let slot = used.get_mut(i as usize)?;
                     in_arg += 1;
@@ -362,7 +364,7 @@ impl<'n, H: super::types::Heads, S: super::source::NamesSource<'n>> AliasPaths<'
         let Some((_, of)) = fixed_alias(tys.view(), generics, ty) else { return Ok(None) };
         let same = of.len() == generics as usize && {
             let v = tys.view();
-            of.iter().enumerate().all(|(i, a)| matches!(v.nodes.get(a.0 as usize), Some(PNode::Param(p) | PNode::ConstParam(p)) if *p as usize == i))
+            of.iter().enumerate().all(|(i, a)| matches!(v.get(*a), Some(PNode::Param(p) | PNode::ConstParam(p)) if *p as usize == i))
         };
         if same {
             return Ok(None);

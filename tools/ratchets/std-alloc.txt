@@ -113,7 +113,8 @@ blaze-serde	6	1	0	22
 blaze-serde-derive	7	1	0	93
 blaze-sha256	8	1	0	0
 blaze-shader	11	1	0	192
-blaze-sim	28	1	0	100
+# blaze-sim raised 2026-11-16 by the coordinator (28/100 -> 30/112): `Tape::vec` returns std `Vec<T>` to about fifty crates; moving the engine to blaze-own is ONE cross-crate batch, parked until tempo runs.
+blaze-sim	30	1	0	112
 blaze-solo	21	1	0	111
 blaze-solve	26	0	0	215
 blaze-sort	5	0	0	5

@@ -79,6 +79,9 @@ pub struct Loaded {
     /// By crate index: its build script's outputs record (blaze-world's `ScriptRecords`, filled
     /// from a folder of records), `None` for a crate with no script or no record given.
     pub scripts: Vec<Option<blaze_build_script::OutputsRef<'static>>>,
+    /// The unit graph the crates were made from: a crate of [`Origin::Unit`] is the unit at
+    /// that index (its package's name, its kind: lib, bin, test unit, integration test).
+    pub graph: &'static blaze_unit_graph::UnitGraph<'static>,
     texts: &'static Texts,
 }
 
@@ -279,6 +282,14 @@ pub struct Procs {
     pub packages: Vec<std::sync::Arc<blaze_proc_macro::sandbox::Package>>,
 }
 
+impl Procs {
+    /// Whether crate `krate` is a proc-macro crate the runner registered (its module found or
+    /// compiled): `false` for one it could not register, whose macros' calls are refused.
+    pub fn registered(&self, krate: usize) -> bool {
+        self.keys.get(krate).is_some_and(Option::is_some)
+    }
+}
+
 /// The variables cargo sets for compiling a unit that the manifest decides (the cargo book,
 /// "Environment variables Cargo sets for crates"): `CARGO_PKG_NAME`, `CARGO_PKG_VERSION` and
 /// its `_MAJOR`, `_MINOR`, `_PATCH`, `_PRE` parts, `CARGO_CRATE_NAME`, and
@@ -331,18 +342,24 @@ pub const CARGO_SET: &[&str] = &[
 /// package's files as they are now, a git commit and the folder the store's module identity
 /// names, as the lock does not say it). A crate it cannot register is printed and left
 /// without a key: its macros' calls are refused, one note per crate.
+/// Each crate's calls are shown its OWN package (blaze-world `procs::files`, the rule's one
+/// home): `places[i]` is crate `i`'s place as [`load`] read its sources, so a member gets its
+/// folder and a fetched package its own fetch record's files and manifest; never the
+/// workspace's root (whose manifest, a virtual workspace's, has no `[dependencies]`:
+/// proc-macro-crate's lookup in jsonrpsee's `#[rpc(server)]` failed on it).
 #[expect(clippy::too_many_arguments, reason = "the run's facts, each read once by `load`")]
 fn procs_of(
     modules: &Path,
     out: &Path,
-    root: &Path,
     crates: &UnitCrates<'static>,
     graph: &blaze_unit_graph::UnitGraph<'static>,
     lock: &Lock<'static>,
     lock_text: &str,
     member_dirs: &BTreeMap<u32, PathBuf>,
+    places: &[(String, Place)],
 ) -> Result<Procs, LoadError> {
     use blaze_proc_macro::hook::ProcMacros;
+    use blaze_world::procs::files::{PackageAt, sandbox_files};
     let runtime: &'static blaze_proc_macro::host::Runtime =
         leak(blaze_proc_macro::host::Runtime::new().map_err(|e| LoadError::Procs(format!("the proc-macro runtime: {e}")))?);
     let records: &'static blaze_proc_macro::record::DirStore = leak(blaze_proc_macro::record::DirStore::new(out));
@@ -355,15 +372,18 @@ fn procs_of(
             Origin::Unit(u) => Some(&graph.units[u.index()]),
             Origin::Toolchain { .. } => None,
         };
-        let folder = unit
-            .and_then(|u| member_dirs.get(&u.package.0))
-            .and_then(|dir| dir.strip_prefix(root).ok())
-            .map(|rel| rel.to_string_lossy().into_owned())
-            .unwrap_or_default();
         let version = unit.map_or("", |u| u.version.as_str());
         let package = unit.map_or(c.name, |u| u.name.as_str());
         let env = unit_env(package, version, c.name);
-        let files = blaze_proc_macro::sandbox::Files::Folder(root.join(&folder));
+        let (_, place) = places
+            .get(i)
+            .ok_or_else(|| LoadError::Procs(format!("crate {} ({i}) has no place: {} places for {} crates", c.name, places.len(), crates.crates.len())))?;
+        let at = match (unit, place) {
+            (None, _) => PackageAt::Toolchain,
+            (Some(_), Place::Disk(dir)) => PackageAt::Disk(dir.as_path()),
+            (Some(_), Place::Pack(view, dir)) => PackageAt::Pack { view: *view, dir: dir.as_str() },
+        };
+        let files = sandbox_files(at);
         packages.push(std::sync::Arc::new(blaze_proc_macro::sandbox::Package { files, env }));
         if let Some(unit) = unit
             && matches!(unit.kind, blaze_unit_graph::UnitKind::ProcMacro)
@@ -553,7 +573,7 @@ pub fn load(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts:
     let procs = match modules {
         Some((modules, out)) => {
             let lock_text = core::str::from_utf8(bytes).map_err(|_| LoadError::Lock("not UTF-8".to_string()))?;
-            Some(&*leak(procs_of(modules, out, root, crates, graph, lock, lock_text, &member_dirs)?))
+            Some(&*leak(procs_of(modules, out, crates, graph, lock, lock_text, &member_dirs, &places)?))
         }
         None => None,
     };
@@ -568,7 +588,7 @@ pub fn load(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts:
     let start = Instant::now();
     let names = resolve_crates(inputs, crates.sysroot, texts, &Serial, alloc).map_err(|e| LoadError::Names(e.to_string()))?;
     let resolve_ms = start.elapsed().as_secs_f64() * 1e3;
-    Ok(Loaded { names: leak(names), crates, member, resolve_ms, procs, scripts, texts })
+    Ok(Loaded { names: leak(names), crates, member, resolve_ms, procs, scripts, graph, texts })
 }
 
 /// By crate index, the outputs record of the build script serving it, from the folder `dir`

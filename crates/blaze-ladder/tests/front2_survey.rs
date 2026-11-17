@@ -58,7 +58,7 @@ pub extern \"C\" fn main() -> i32 {
 fn one_refused_fn_is_counted_and_the_survey_goes_on() {
     let files = [SourceFile { path: "src/main.rs", text: PROGRAM }];
     let tc = Toolchain::none();
-    let new = NewFront { package: "ladder", edition: "2024", shelf: None };
+    let new = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
     let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc).unwrap_or_else(|e| panic!("the program's texts: {e}"));
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
@@ -70,7 +70,7 @@ fn one_refused_fn_is_counted_and_the_survey_goes_on() {
     let left: Vec<String> = left_out.iter().map(|(f, class)| format!("{f}: {class}")).collect();
     assert!(left.is_empty(), "front2 tables every fn of the program; left out: {left:?}");
     let mut refused = Vec::new_in(Global);
-    let counts = build_survey(&mut program, &mut refused).unwrap_or_else(|e| panic!("BUILDS: the survey stopped: {e}"));
+    let counts = build_survey(&mut program, &mut refused, blaze_build::OverflowChecks::On).unwrap_or_else(|e| panic!("BUILDS: the survey stopped: {e}"));
     let rows: Vec<String> = refused.iter().map(|(f, class)| format!("{f}: {class}")).collect();
     println!("BUILDS: {} of {} instances ({} refused: {})", counts.built, counts.tried, rows.len(), rows.join("; "));
     assert_eq!(rows.len(), 1, "one refused instance: {rows:?}");

@@ -89,14 +89,18 @@ pub extern \"C\" fn main() -> i32 {
 
 /// What every test builds for: a fixed target and toolchain, nothing of this machine.
 fn builder(tier: Tier) -> Builder {
-    Builder { isa: Isa { lse: true, os: Os::MacOs }, tier, settings: Settings::BASELINE, toolchain: ToolchainId([7; 32]) }
+    Builder { isa: Isa { lse: true, os: Os::MacOs }, tier, settings: Settings::baseline(OVERFLOW), toolchain: ToolchainId([7; 32]) }
 }
+
+/// The overflow setting every walk here builds with and its records are keyed by: `blaze
+/// run`'s (the dev profile's, D101).
+const OVERFLOW: blaze_build::OverflowChecks = blaze_build::OverflowChecks::On;
 
 /// The instances `files` (rooted at `src/main.rs`, of `edition`) reach, built into `store`.
 fn walk(files: &[(String, String)], edition: &str, store: &mut dyn CodeStore, tier: Tier) -> Result<(Vec<Met>, String), String> {
     let views: Vec<SourceFile<'_>> = files.iter().map(|(path, text)| SourceFile { path, text }).collect();
     let shelf = edition.starts_with("blaze-").then(|| format!("{}/.blaze/v2/toolchain", std::env::var("HOME").expect("HOME")));
-    let new = NewFront { package: "ladder", edition, shelf: shelf.as_deref() };
+    let new = NewFront { package: "ladder", edition, shelf: shelf.as_deref(), overflow: OVERFLOW };
     let mut run = RecordRun::new(store, builder(tier));
     build_records_new(&views, "src/main.rs", new, &mut run).map_err(|e| e.to_string())?;
     let summary = run.summary();
@@ -353,4 +357,21 @@ fn the_tier_moves_every_key() {
     let line = format!("tier: {moved} of {} keys moved; the planted key without the tier: {caught} ({equal} of {} equal across tiers)", fast.len(), fast.len());
     println!("{line}");
     assert_eq!(line, "tier: 6 of 6 keys moved; the planted key without the tier: caught (6 of 6 equal across tiers)");
+}
+
+/// D101 and rule 21: the profile's overflow setting is part of every code key, so a dev record
+/// (checked `+`) and a release record (wrapping `+`) of one instance never share a key.
+/// Prints `overflow: 6 of 6 keys moved; the planted key without it: caught (6 of 6 equal)`.
+#[test]
+fn the_overflow_setting_moves_every_key() {
+    let (met, _) = walk_program(PROGRAM, &mut MemoryStore::new_in(Alloc::global()), Tier::Fast);
+    let with = |overflow| Builder { settings: Settings::baseline(overflow), ..builder(Tier::Fast) };
+    let (on, off) = (with(blaze_build::OverflowChecks::On), with(blaze_build::OverflowChecks::Off));
+    let moved = met.iter().filter(|m| code_key(&m.parts, &on) != code_key(&m.parts, &off)).count();
+    // The planted bug: the same oracle over keys made without the setting finds them equal.
+    let equal = met.iter().filter(|m| code_key_planted(&m.parts, &on, KeyPlant::WithoutOverflow) == code_key_planted(&m.parts, &off, KeyPlant::WithoutOverflow)).count();
+    let caught = if equal > 0 { "caught" } else { "MISSED" };
+    let line = format!("overflow: {moved} of {} keys moved; the planted key without it: {caught} ({equal} of {} equal)", met.len(), met.len());
+    println!("{line}");
+    assert_eq!(line, "overflow: 6 of 6 keys moved; the planted key without it: caught (6 of 6 equal)");
 }

@@ -112,8 +112,8 @@ fn a_comparison_of_references_or_of_a_parameter_records_eq_and_one_of_scalars_no
     let (c, e) = checked(&mut o, 1, std::vec![bound], p0, p0, bool_, eq);
     let i = c.callees.column::<0>().iter().position(|&x| x == e).expect("a row on `a == b` at a type parameter");
     assert_eq!(o.fx.name_of(c.callees.column::<1>()[i]), "eq");
-    let args = &c.types.view().lists[c.callees.column::<2>()[i].range()];
-    assert!(matches!(args, [x, y] if x == y && matches!(c.types.view().nodes[x.0 as usize], PNode::Param(0))), "{args:?}");
+    let args = c.types.view().list(c.callees.column::<2>()[i]).expect("the callee's arguments in the body's table");
+    assert!(matches!(args, [x, y] if x == y && matches!(c.types.view().get(*x), Some(PNode::Param(0)))), "{args:?}");
 }
 
 /// `a + b` on `i32` and `&i32` is `Add::add` at `[i32, &i32]`; `-b` on `&i32` is `Neg::neg`

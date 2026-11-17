@@ -15,9 +15,17 @@
 //! the constituent types, `Unpin` for coroutines), pattern types and unsafe binders (no
 //! `TyKind`), the unsafe-fields check of unsafe auto traits (`has_unsafe_fields`: `AdtDef` does
 //! not carry it), `experimental_default_bounds` (`is_default_trait`), and in well-formedness:
-//! the where-clauses of fn items (`FnSigDef` does not carry them), of a closure's parent, of an
-//! associated type's own item, and of inherent, free and opaque aliases (their arguments are
-//! still checked), and `ConstArgHasType` for const parameters (their types are not known here).
+//! the where-clauses of fn items (`FnSigDef` does not carry them), of a closure's parent, and of
+//! inherent, free and opaque aliases (their arguments are still checked), and `ConstArgHasType`
+//! for const parameters (their types are not known here).
+//!
+//! The where-clauses of an associated type's own item (a generic associated type's `type
+//! Out<T: Clone>` and `where` clauses, decision D89 (b)) ARE proved: they arrive in the
+//! trait's `item_bounds` range of that associated type, after its item bounds, and are told
+//! from them by one rule the front end applies too (blaze-ladder front2/preds.rs
+//! `assoc_own_clauses`, which refuses an own clause that would break it): an item bound's
+//! self type is the alias itself or a projection whose self chain reaches it; an own
+//! clause's is not ([`is_item_bound`]).
 
 use blaze_own::{Alloc, Vec};
 
@@ -239,7 +247,6 @@ fn step_wf<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result<S
     if matches!(k, TyKind::Infer(Var { kind: VarKind::Ty | VarKind::Int | VarKind::Float | VarKind::Const, .. })) {
         return Ok(Step::Done(Certainty::Ambiguous));
     }
-    let sized = require_lang(cx, Lang::Sized)?;
     let mut preds: Vec<Pred, Alloc<'_>> = Vec::new_in(cx.alloc);
     // The children whose well-formedness is required (wf.rs `super_visit_with`, one level).
     let mut kids: Vec<Ty, Alloc<'_>> = Vec::new_in(cx.alloc);
@@ -247,12 +254,14 @@ fn step_wf<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result<S
         _ if is_wf_leaf(k) => {}
         // wf.rs: "ty::Slice(subty) => self.require_sized(subty, SliceOrArrayElem)".
         TyKind::Slice(e) => {
+            let sized = require_lang(cx, Lang::Sized)?;
             preds.push(trait_pred(cx, sized, &[e])?);
             kids.push(e);
         }
         // wf.rs: "ty::Array(subty, len) => { self.require_sized(subty, ..); ..
         // ClauseKind::ConstArgHasType(len, usize) }".
         TyKind::Array(e, len) => {
+            let sized = require_lang(cx, Lang::Sized)?;
             preds.push(trait_pred(cx, sized, &[e])?);
             let usize_ = usize_ty(cx)?;
             preds.push(Pred::ConstArgHasType { ct: len, ty: usize_ });
@@ -265,6 +274,7 @@ fn step_wf<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result<S
             for i in 0..l.len {
                 let e = cx.arg(l, i);
                 if i + 1 < l.len {
+                    let sized = require_lang(cx, Lang::Sized)?;
                     preds.push(trait_pred(cx, sized, &[e])?);
                 }
                 kids.push(e);
@@ -328,7 +338,9 @@ fn step_wf<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result<S
         }
         // wf.rs `add_wf_preds_for_alias_term` / `nominal_obligations` of the projection: the
         // trait ref `args[0]: Trait<args[1..parent]>` (the trait's `Self: Trait` predicate) and
-        // the trait's where-clauses (the item's own are not in `AssocDef`: module doc).
+        // the trait's where-clauses, then the item's own where-clauses ("predicates of the
+        // alias's own item", D89 (b)): each own clause of the associated type with the
+        // projection's whole list substituted (the trait's arguments, then the item's own).
         TyKind::Alias(_, AliasKind::Projection, d, args) => {
             let a = cx.assoc(d)?;
             let Some(tr) = a.trait_ else { return Err(malformed()) };
@@ -341,6 +353,15 @@ fn step_wf<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result<S
             let td = cx.trait_def(tr)?;
             for &p in td.where_clauses {
                 preds.push(cx.import_pred(td.portable, p, trait_args)?);
+            }
+            let Some(at) = td.assoc.iter().find(|x| x.def == d) else { return Err(malformed()) };
+            let (start, len) = (at.bounds_start as usize, at.bounds_len as usize);
+            let Some(bounds) = td.item_bounds.get(start..start + len) else { return Err(malformed()) };
+            for &p in bounds {
+                let p = cx.import_pred(td.portable, p, args)?;
+                if !is_item_bound(cx, p, t)? {
+                    preds.push(p);
+                }
             }
             kids.extend_from_slice(&all);
         }
@@ -367,4 +388,44 @@ fn step_wf<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result<S
         }
     }
     Ok(Step::Done(Certainty::Yes))
+}
+
+/// Whether the clause `p` of the projection `alias`'s item-bounds range (imported with the
+/// projection's list) is an ITEM BOUND (a fact of every implementation, assumed for a rigid
+/// alias: alias.rs `push_alias_bounds`) rather than one of the associated type's OWN clauses
+/// (a requirement proved by [`step_wf`]): its self type is `alias`, or a projection whose self
+/// chain (each list's first argument, in turn) reaches `alias`. The module doc's rule, the same
+/// one blaze-ladder front2/preds.rs `reaches_alias` applies. A clause with no self type is
+/// taken as an own clause: proving it is never unsound.
+fn is_item_bound<T: Tys, F: Facts>(cx: &Cx<'_, '_, T, F>, p: Pred, alias: Ty) -> Result<bool, Stop> {
+    let first = match p {
+        Pred::Trait { args, .. } | Pred::HostEffect { args, .. } if args.len > 0 => Some(cx.arg(args, 0)),
+        Pred::Projection { alias: a, .. } => match cx.kind(a) {
+            TyKind::Alias(_, _, _, l) if l.len > 0 => Some(cx.arg(l, 0)),
+            _ => None,
+        },
+        Pred::TypeOutlives { ty, .. } => Some(ty),
+        _ => None,
+    };
+    let Some(mut s) = first else { return Ok(false) };
+    // Each round moves to a strict subterm, so the rounds are at most the term's size.
+    for _ in 0..crate::fold::MAX_WALK {
+        if same_projection(cx, s, alias) {
+            return Ok(true);
+        }
+        match cx.kind(s) {
+            TyKind::Alias(_, AliasKind::Projection, _, l) if l.len > 0 => s = cx.arg(l, 0),
+            _ => return Ok(false),
+        }
+    }
+    Err(Stop::Error(crate::error::SolveError::Limit(crate::error::Limit::Walk)))
+}
+
+/// Whether `x` and `y` are the same projection, rigid or not, their arguments compared after
+/// `resolve`.
+fn same_projection<T: Tys, F: Facts>(cx: &Cx<'_, '_, T, F>, x: Ty, y: Ty) -> bool {
+    let (TyKind::Alias(_, AliasKind::Projection, d1, l1), TyKind::Alias(_, AliasKind::Projection, d2, l2)) = (cx.kind(x), cx.kind(y)) else {
+        return false;
+    };
+    d1 == d2 && l1.len == l2.len && (0..l1.len).all(|i| cx.resolve(cx.arg(l1, i)) == cx.resolve(cx.arg(l2, i)))
 }

@@ -53,20 +53,25 @@ pub mod judge;
 pub mod parent;
 pub mod plan;
 pub mod postings;
+pub mod property;
 pub mod registry;
 pub mod report;
 pub mod result;
 pub mod slots;
 pub mod suite;
+pub mod tapes;
 pub mod tier;
 pub mod viewer;
 pub mod child;
 pub mod oscall;
 pub mod wire;
 pub mod zygote;
+pub mod offer;
 
 #[cfg(test)]
 mod sim;
+#[cfg(test)]
+mod offer_tests;
 
 use blaze_own::AVec;
 use core::fmt;
@@ -290,6 +295,8 @@ impl fmt::Display for Hex<'_> {
 #[cfg_attr(not(test), allow(dead_code, reason = "only the tests plant a bug"))]
 pub(crate) enum Plant {
     None,
+    /// [`offer::offer`] takes a body whatever the running total, past `OfferBound::total`.
+    IgnoreTotal,
     /// [`slots::Slots`] stores a word before the code it names is placed.
     StoreBeforePlace,
     /// [`slots::Slots`] frees a retired body while a thread has yet to clear it.

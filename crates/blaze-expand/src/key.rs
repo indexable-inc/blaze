@@ -30,7 +30,9 @@ unsafe impl Portable for ExpansionKey {}
 /// so the name changes with any change to what a call expands to (a rule's matching, a
 /// derive's output, a token's record). A proc macro's code is its runner's key
 /// ([`DefText::Proc`]), beside this.
-pub const EXPANDER: &str = "blaze-expand expander 1";
+/// 2: an attribute macro's input is without the derives written before it (P18-B, item.rs
+/// `ItemAttrs::attr_call`).
+pub const EXPANDER: &str = "blaze-expand expander 2";
 
 /// A definition as the text a key is made from, before anything is lexed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

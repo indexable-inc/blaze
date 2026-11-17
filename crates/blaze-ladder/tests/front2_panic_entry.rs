@@ -117,7 +117,7 @@ fn on_panic_too(info: &PanicInfo<'_>) -> ! {
 fn run_refusal(text: &str) -> Option<String> {
     let files = [SourceFile { path: "src/main.rs", text }];
     let tc = Toolchain::none();
-    let new = NewFront { package: "ladder", edition: "2024", shelf: None };
+    let new = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
     let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc).unwrap_or_else(|e| panic!("the program's texts: {e}"));
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
@@ -143,7 +143,7 @@ fn a_call_of_panic_impl_reaches_and_binds_the_handler() {
     let text = [HEAD, HANDLER, PANICS].concat();
     let files = [SourceFile { path: "src/main.rs", text: &text }];
     let tc = Toolchain::none();
-    let new = NewFront { package: "ladder", edition: "2024", shelf: None };
+    let new = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
     let texts = ProgramTexts::new(&files, "src/main.rs", new, &tc).unwrap_or_else(|e| panic!("the program's texts: {e}"));
     let user = texts.user();
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
@@ -167,7 +167,7 @@ fn a_call_of_panic_impl_reaches_and_binds_the_handler() {
     let with_body = rows.iter().filter(|(_, body, ..)| *body).count();
     assert_eq!(with_body, 3, "`main`, `panic_fmt` and `on_panic` have bodies: {rows:?}");
     let mut refused = Vec::new_in(Global);
-    let counts = build_survey(&mut program, &mut refused).unwrap_or_else(|e| panic!("the survey stopped: {e}"));
+    let counts = build_survey(&mut program, &mut refused, blaze_build::OverflowChecks::On).unwrap_or_else(|e| panic!("the survey stopped: {e}"));
     let refusals: Vec<String> = refused.iter().map(|(f, class)| format!("{f}: {class}")).collect();
     assert!(refusals.is_empty(), "every body builds, `panic_fmt`'s call bound to `on_panic`: {refusals:?}");
     assert_eq!((counts.built, counts.tried), (3, 3), "`main`, `panic_fmt`, `on_panic`");

@@ -46,8 +46,9 @@ impl LoadItems<'static> for Kept {
         (krate == 0).then_some(self.record)
     }
 
-    fn file(&self, krate: usize, path: &str) -> Option<&'static str> {
-        (krate == 0 && path == PATH).then_some(TEXT)
+    fn file(&self, krate: usize, path: crate::package_path::PackagePath<'_>) -> Option<&'static str> {
+        // The crate's package is at `/` (entry.rs `input`): its record holds `k0/lib.rs`.
+        (krate == 0 && path.in_package("/", Alloc::global()).as_deref() == Some(PATH)).then_some(TEXT)
     }
 
     fn expansion(&self, _krate: usize, _call: ItemKey) -> Option<&'static str> {

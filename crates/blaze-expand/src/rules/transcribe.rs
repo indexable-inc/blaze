@@ -8,6 +8,7 @@ use parser::SyntaxKind;
 use super::{
     Arm, Bound, CallError, ConcatElem, DEPTH_BOUND, DefTok, Engine, Frag, Msg, NONE, Op, RepKind,
     SITE, Sep,
+    copy::{self, Copying, set_last_alone, written},
     input::View,
     linear::{NodeKind, Values},
     matcher::{Fragment, Origin, Toks},
@@ -109,21 +110,21 @@ fn push(
     origin: TokenOrigin,
 ) -> Result<(), ExpandError> {
     join_prev(out, origin);
-    let key = match origin {
-        TokenOrigin::Input(at) => (0, out.call.input().tokens()[at as usize].ctx.raw()),
-        TokenOrigin::AttrArgs(at) => {
-            let args = out.call.attr_args().expect("an origin of the arguments is of an attribute call");
-            (1, args.tokens()[at as usize].ctx.raw())
-        }
-        TokenOrigin::Def(at) => (2, out.def.body().tokens()[at as usize].ctx.raw()),
-        TokenOrigin::Params(at) => {
-            let params = out.def.params().expect("an origin of the parameters is of `macro m(..)`");
-            (3, params.tokens()[at as usize].ctx.raw())
-        }
-        TokenOrigin::Made(transparency) => (4 + transparency as u8, 0),
-    };
+    let key = copy::source_key(out, origin);
+    let ctx = memo_ctx(scratch, out, origin, key)?;
+    out.push_bytes_ctx(kind, text, origin, ctx)
+}
+
+/// The context of this expansion for a token of `origin`, whose source key is `key`
+/// ([`copy::source_key`]): made once per source context, then found in the memo.
+fn memo_ctx(
+    scratch: &mut Scratch<'_>,
+    out: &mut Out<'_, '_>,
+    origin: TokenOrigin,
+    key: (u8, u32),
+) -> Result<Ctx, ExpandError> {
     // Most tokens are of the context the last one was; else the few made so far are searched.
-    let ctx = match scratch.memo.get(scratch.last) {
+    Ok(match scratch.memo.get(scratch.last) {
         Some(&(role, raw, ctx)) if (role, raw) == key => ctx,
         _ => match scratch.memo.iter().position(|it| (it.0, it.1) == key) {
             Some(at) => {
@@ -137,17 +138,7 @@ fn push(
                 ctx
             }
         },
-    };
-    out.push_bytes_ctx(kind, text, origin, ctx)
-}
-
-/// An identifier or literal is written `Alone`, and made joint with the next token by
-/// [`join_prev`] where its source had them joint.
-fn written(kind: TokenKind) -> TokenKind {
-    match kind {
-        TokenKind::Ident { .. } | TokenKind::Literal { .. } => kind.with_spacing(Spacing::Alone),
-        _ => kind,
-    }
+    })
 }
 
 fn push_def(
@@ -160,14 +151,23 @@ fn push_def(
     push(scratch, out, written(def.kind(tok)), def.bytes(tok), tok.origin())
 }
 
-/// Copies `toks` of the view; with `alone`, a last punctuation is made `Alone`.
+/// Copies `toks` of the view; with `alone`, a last punctuation is made `Alone`. With `range`
+/// (the linear matcher's values: [`Copying::RANGES`]) as one run ([`copy::copy_frags`]), else
+/// token by token: the oracle's other side. Both write equal tokens, contexts and origins.
 fn push_view(
     scratch: &mut Scratch<'_>,
     out: &mut Out<'_, '_>,
     view: &View<'_, '_>,
     toks: Toks,
     alone: bool,
+    range: bool,
 ) -> Result<(), ExpandError> {
+    if range && !toks.is_empty() {
+        join_prev(out, view.origin(toks.at));
+        return copy::copy_frags(out, view, 1, |_| toks, alone, |out, origin, key| {
+            memo_ctx(scratch, out, origin, key)
+        });
+    }
     for at in toks.at..toks.end {
         push(scratch, out, written(view.kind(at)), view.bytes(at), view.origin(at))?;
     }
@@ -175,17 +175,6 @@ fn push_view(
         set_last_alone(out);
     }
     Ok(())
-}
-
-/// tt's `extend_with_tt_alone`: the last token not a close, if punctuation, made `Alone`.
-fn set_last_alone(out: &mut Out<'_, '_>) {
-    let tokens = out.exp.tokens.tokens();
-    let last = tokens.iter().rposition(|token| !matches!(token.kind, TokenKind::Close(_)));
-    if let Some(at) = last
-        && matches!(tokens[at].kind, TokenKind::Punct { .. })
-    {
-        out.exp.tokens.set_spacing(at, Spacing::Alone);
-    }
 }
 
 /// `toks` without the one invisible group that is all of it.
@@ -257,7 +246,7 @@ fn follower(engine: &Engine<'_, '_, '_>, next: Option<Op>) -> Follower {
 /// Transcribes `arm`'s template with `bindings` into `out`: `Ok(None)` when it is written,
 /// `Ok(Some(error))` for the template's first error (what was written is the caller's to
 /// truncate).
-pub(crate) fn transcribe<'f, B: Values>(
+pub(crate) fn transcribe<'f, B: Copying>(
     engine: &mut Engine<'_, '_, 'f>,
     arm: &Arm,
     view: &View<'_, 'f>,
@@ -306,6 +295,22 @@ pub(crate) fn transcribe<'f, B: Values>(
                     continue;
                 }
                 Op::Repeat { end, sep, kind } => {
+                    // `$($x)*` over the linear matcher's values, every iteration a token run:
+                    // one copy ([`tt_run`], [`repeat_run`]); every other repetition runs on the
+                    // stack below. Not past the stack's bound: there the stack refuses it.
+                    if B::RANGES
+                        && sep == NONE
+                        && end == at + 2
+                        && scratch.stack.len() < DEPTH_BOUND
+                        && let Op::Var { binder, .. } = program.ops[(at + 1) as usize]
+                        && let Some((node, len)) = tt_run(bindings, &scratch.nesting, binder)
+                    {
+                        scratch.stack[top].at = end;
+                        if let Err(error) = repeat_run(engine, view, bindings, scratch, out, node, len)? {
+                            return Ok(Err(error));
+                        }
+                        continue;
+                    }
                     scratch.stack[top].at = end;
                     scratch.nesting.push(Nesting { idx: 0, hit: false, at_end: false });
                     let mark = out.exp.tokens.mark();
@@ -449,6 +454,65 @@ fn push_entry(scratch: &mut Scratch<'_>, entry: Entry) -> Result<(), Bound> {
     }
 }
 
+/// A `$($x)*` (one metavariable, no separator) whose iterations the copy writes as one run:
+/// `$x`'s node at the repetition and its `len` iterations, when `$x` is repeated at every
+/// repetition around it and at this one, `1 <= len < 65536`, and each iteration's value is a
+/// non-empty token run written as it is (`Fragment::Tokens` of `Raw` or `Ast` origin: what `tt`,
+/// `ident`, `lifetime`, `literal`, `pat`, `meta` bind). Reads only: `None` leaves every other case
+/// (no iteration, the iteration limit, a value put in a group or parenthesized, a binder not
+/// repeated here, a name no binder declares) to the stack machine, which decides it as before.
+fn tt_run<B: Values>(bindings: &B, nesting: &[Nesting], binder: u32) -> Option<(B::Node, u32)> {
+    let mut node = bindings.root(binder)?;
+    for state in nesting {
+        match bindings.kind(node) {
+            NodeKind::Nested(len) if state.idx < len => node = bindings.child(node, state.idx),
+            _ => return None,
+        }
+    }
+    let NodeKind::Nested(len) = bindings.kind(node) else { return None };
+    if len == 0 || len >= 65536 {
+        return None;
+    }
+    for idx in 0..len {
+        match bindings.kind(bindings.child(node, idx)) {
+            NodeKind::Fragment(Fragment::Tokens { toks, origin: Origin::Raw | Origin::Ast })
+                if !toks.is_empty() => {}
+            _ => return None,
+        }
+    }
+    Some((node, len))
+}
+
+/// [`tt_run`]'s repetition written as the stack machine writes it: its steps charged (per
+/// iteration one for `$x` and one for the iteration's end, and the same for the iteration that
+/// finds the end, which writes nothing), each repetition around it marked reached (as `$x`'s
+/// lookup marks it), then every iteration's fragment copied in one run, each made `Alone` at its
+/// end as [`var`] writes it. No iteration is written and then truncated.
+fn repeat_run<B: Values>(
+    engine: &mut Engine<'_, '_, '_>,
+    view: &View<'_, '_>,
+    bindings: &B,
+    scratch: &mut Scratch<'_>,
+    out: &mut Out<'_, '_>,
+    node: B::Node,
+    len: u32,
+) -> Result<Result<(), ExpandError>, Bound> {
+    for _ in 0..2 * (len + 1) {
+        engine.budget.step()?;
+    }
+    for state in scratch.nesting.iter_mut() {
+        state.hit = true;
+    }
+    let frag = |idx: u32| match bindings.kind(bindings.child(node, idx)) {
+        NodeKind::Fragment(Fragment::Tokens { toks, .. }) => toks,
+        other => unreachable!("`tt_run` checked every iteration's value, found {other:?}"),
+    };
+    join_prev(out, view.origin(frag(0).at));
+    Ok(copy::copy_frags(out, view, len, frag, true, |out, origin, key| {
+        memo_ctx(scratch, out, origin, key)
+    }))
+}
+
 fn separator(
     engine: &Engine<'_, '_, '_>,
     scratch: &mut Scratch<'_>,
@@ -548,7 +612,7 @@ fn get_fragment<B: Values>(
 
 /// `$name`.
 #[expect(clippy::too_many_arguments, reason = "the transcriber's state, passed as its parts")]
-fn var<B: Values>(
+fn var<B: Copying>(
     engine: &Engine<'_, '_, '_>,
     view: &View<'_, '_>,
     bindings: &B,
@@ -607,11 +671,11 @@ fn var<B: Values>(
         }
         Value::Fragment(Fragment::Tokens { toks, origin: Origin::Grouped }) => {
             invisible(scratch, out, true)?;
-            push_view(scratch, out, view, strip_invisible(view, toks), true)?;
+            push_view(scratch, out, view, strip_invisible(view, toks), true, B::RANGES)?;
             invisible(scratch, out, false)?;
         }
         Value::Fragment(Fragment::Tokens { toks, origin: Origin::Raw | Origin::Ast }) => {
-            push_view(scratch, out, view, toks, true)?;
+            push_view(scratch, out, view, toks, true, B::RANGES)?;
         }
         Value::Fragment(Fragment::Expr(toks)) => {
             let sub = strip_invisible(view, toks);
@@ -629,7 +693,7 @@ fn var<B: Values>(
             if parenthesized {
                 paren(scratch, out, true)?;
             }
-            push_view(scratch, out, view, sub, true)?;
+            push_view(scratch, out, view, sub, true, B::RANGES)?;
             if parenthesized {
                 paren(scratch, out, false)?;
             }
@@ -648,18 +712,18 @@ fn var<B: Values>(
                     push(scratch, out, TokenKind::Punct { char: ':', spacing: Spacing::Alone }, b"",SITE)?;
                 }
                 prev_ident = end == tree + 1 && matches!(view.kind(tree), TokenKind::Ident { .. });
-                push_view(scratch, out, view, Toks { at: tree, end }, false)?;
+                push_view(scratch, out, view, Toks { at: tree, end }, false, B::RANGES)?;
             }
             invisible(scratch, out, false)?;
         }
         Value::Fragment(Fragment::Ty(toks)) if follower == Follower::Angle => {
             paren(scratch, out, true)?;
-            push_view(scratch, out, view, toks, true)?;
+            push_view(scratch, out, view, toks, true, B::RANGES)?;
             paren(scratch, out, false)?;
         }
         Value::Fragment(Fragment::Ty(toks)) => {
             invisible(scratch, out, true)?;
-            push_view(scratch, out, view, toks, true)?;
+            push_view(scratch, out, view, toks, true, B::RANGES)?;
             invisible(scratch, out, false)?;
         }
         Value::Fragment(Fragment::Empty) => {}
@@ -758,10 +822,8 @@ fn unsuffixed(kind: TokenKind, text: &str) -> &str {
 }
 
 /// Before a token from `next` is written: the last token written, an identifier or literal, is
-/// made joint with it (`JointHidden`) where it followed that token in the stream both were
-/// read from and the source had them joint, else `Alone`. A fragment's last token, joint with
-/// the `,` after it in the call (`[u8, u16]`), is not joint with the `as` the template writes
-/// after it (`$Src as`). Decided at each write, so a token written again after a truncation
+/// made joint with it (`JointHidden`) where [`copy::joint`] says the source had them joint, else
+/// `Alone`. Decided at each write, so a token written again after a truncation
 /// ([`Scratch::truncate`]) decides it again.
 fn join_prev(out: &mut Out<'_, '_>, next: TokenOrigin) {
     let Some(prev) = out.exp.tokens.len().checked_sub(1) else { return };
@@ -770,30 +832,11 @@ fn join_prev(out: &mut Out<'_, '_>, next: TokenOrigin) {
         return;
     }
     let a = out.exp.origins[prev];
-    let stream = match (a, next) {
-        (TokenOrigin::Input(_), TokenOrigin::Input(_)) => Some(out.call.input()),
-        (TokenOrigin::AttrArgs(_), TokenOrigin::AttrArgs(_)) => out.call.attr_args(),
-        (TokenOrigin::Def(_), TokenOrigin::Def(_)) => Some(out.def.body()),
-        (TokenOrigin::Params(_), TokenOrigin::Params(_)) => out.def.params(),
-        _ => None,
+    let spacing = match copy::joint(out, a, next) {
+        true => Spacing::JointHidden,
+        false => Spacing::Alone,
     };
-    let joint = match (stream, source_index(a), source_index(next)) {
-        (Some(stream), Some(i), Some(j)) if i.checked_add(1) == Some(j) => {
-            let (ti, tj) = (stream.tokens()[i as usize], stream.tokens()[j as usize]);
-            ti.kind.spacing() != Spacing::Alone
-                && stream.edition_of(ti.ctx) == stream.edition_of(tj.ctx)
-        }
-        _ => false,
-    };
-    let spacing = if joint { Spacing::JointHidden } else { Spacing::Alone };
     if kind.spacing() != spacing {
         out.exp.tokens.set_spacing(prev, spacing);
-    }
-}
-
-fn source_index(origin: TokenOrigin) -> Option<u32> {
-    match origin {
-        TokenOrigin::Input(at) | TokenOrigin::AttrArgs(at) | TokenOrigin::Def(at) | TokenOrigin::Params(at) => Some(at),
-        TokenOrigin::Made(_) => None,
     }
 }

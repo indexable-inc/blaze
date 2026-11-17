@@ -217,7 +217,7 @@ impl Pool {
         let spawn = self.tag(Asked::Spawn(server));
         // What the profile's `processes` row of the warm process names it by.
         blaze_core::reaped::label(spawn, "warm_server", Some(&command.program.to_string_lossy()));
-        effects.push(Effect::Listen { at: Address::Unix(socket), tag: listen });
+        effects.push(Effect::Listen { at: Address::Unix(socket), options: blaze_core::sockopt::Tcp::DEFAULT, tag: listen });
         // alloc: a spawn, at the edge: the effect owns its command.
         effects.push(Effect::Spawn { command: Box::new(command), tag: spawn });
         self.servers.insert(

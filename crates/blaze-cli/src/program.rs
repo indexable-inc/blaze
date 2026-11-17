@@ -8,8 +8,9 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use blaze_ladder::refusal::SourceFile;
-use blaze_ladder::run::{NewFront, RunError};
-use blaze_manifest::layout::{Entry, Layout, Need, Pass};
+use blaze_ladder::run::{NewFront, OverflowChecks, RunError};
+use blaze_manifest::layout::profile::{self, BuiltinProfile};
+use blaze_manifest::layout::{Entry, Layout, ManifestId, Need, Pass};
 use blaze_own::Vec;
 use bstd::Cx;
 use bstd::env::VarName;
@@ -38,6 +39,31 @@ pub struct Launch<'a> {
 
 /// The bytes of the exchange a hosted program's calls pass through (bstd `Hosting`).
 const EXCHANGE: usize = 4096;
+
+/// `blaze run` in a package with no binary at [`ROOT`], the one root the runner starts: the
+/// package by name and the binary targets it has (name, root), so the answer says what there is
+/// to run. Decided from the package's layout before a source file is read; never the front
+/// end's "no `main`", which a library's root would give without saying why.
+#[derive(Debug)]
+pub struct NoBinary {
+    pub package: std::boxed::Box<str, std::alloc::Global>,
+    /// Empty for a library alone.
+    pub bins: std::vec::Vec<(std::boxed::Box<str, std::alloc::Global>, std::boxed::Box<str, std::alloc::Global>), std::alloc::Global>,
+}
+
+impl core::fmt::Display for NoBinary {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let package = &self.package;
+        if self.bins.is_empty() {
+            return write!(f, "`blaze run`: the package `{package}` has no binary target (no `{ROOT}` and no `[[bin]]`): it is a library, so there is no program to run; `blaze check` and `blaze test` take it");
+        }
+        write!(f, "`blaze run`: the package `{package}` has no binary at `{ROOT}`, the one root `blaze run` starts yet; its binary targets:")?;
+        for (name, root) in self.bins.iter() {
+            write!(f, " `{name}` ({root})")?;
+        }
+        Ok(())
+    }
+}
 
 /// The program's source files, each path with its text, sorted by path: the files the
 /// request's walk opened (`rows`' slots that are present, from `Effect::Open` this command or
@@ -86,6 +112,9 @@ pub fn sources<'f>(cx: &Cx, root: &Dir<ReadWrite>, tables: &[&Rows<'_>], frame: 
 /// through a loader, so a file no `mod` reaches is never read.
 pub fn run(cx: &Cx, root: &Dir<ReadWrite>, launch: &Launch<'_>, frame: &Frame) -> Result<u8, CliError> {
     let cx = cx.span("blaze run: the program");
+    // First: whether the package has a binary to run at all (no source file is read for a
+    // library's `blaze run`).
+    let (package, edition) = package(&cx, root, frame)?;
     let src = root.subdir(&Path::new(SOURCES.trim_end_matches('/'))?);
     let listed = match src.list(&cx, frame) {
         Ok(listed) => Some(listed),
@@ -123,14 +152,14 @@ pub fn run(cx: &Cx, root: &Dir<ReadWrite>, launch: &Launch<'_>, frame: &Frame) -
     let host = NonNull::from(&table).cast::<c_void>();
     // The new front end's inputs: the package as its manifest names it, and the toolchain's
     // shelf under the home the command was started with (read from the command's own `Io`).
-    let (package, edition) = package(&cx, root, frame)?;
     let env = launch.io.env();
     let home = match env.as_ref() {
         Some(env) => env.get(&VarName::new("HOME").map_err(|_| CliError::Text { what: "`HOME` is no variable name" })?).ok().flatten(),
         None => None,
     };
     let shelf = home.map(|home| bstd::mem::format_in!(frame, "{}/{}", home.trim_end_matches('/'), crate::toolchain::SHELF));
-    let new = NewFront { package, edition, shelf: shelf.as_ref().map(|shelf| shelf.as_str()) };
+    let overflow = dev_overflow(&cx, root, frame)?;
+    let new = NewFront { package, edition, shelf: shelf.as_ref().map(|shelf| shelf.as_str()), overflow };
     let ran = blaze_ladder::run::run_program(&files, ROOT, Some(host), new).map_err(CliError::Program);
     // The table points into the host: both are dropped only after the program returned.
     drop(table);
@@ -153,6 +182,24 @@ pub(crate) const NOT_RUN: u8 = 125;
 /// The passes the package's layout may take (units.rs `MOST_PASSES`; rule 18).
 const MOST_PASSES: usize = 64;
 
+/// The `dev` profile's `overflow-checks` (decision D101), which `blaze run` builds the program
+/// with and `blaze check` finds what that build refuses with: on, unless the workspace root's
+/// manifest (`Cargo.toml` at `root`, the checkout's root, which [`package`] requires to be the
+/// workspace's root) says otherwise under `[profile.dev]` (blaze-manifest `layout::profile`).
+/// `blaze export` will take `BuiltinProfile::Release` the same way (off unless set).
+pub fn dev_overflow(cx: &Cx, root: &Dir<ReadWrite>, frame: &Frame) -> Result<OverflowChecks, CliError> {
+    let refused = |why: &dyn core::fmt::Display| CliError::Program(RunError::Manifest { why: Box::from(bstd::mem::format_in!(frame, "{why}").as_str()) });
+    let mut bytes = Bytes::new_in(frame, "the root manifest");
+    root.read_all(cx, &Path::new(ROOT_MANIFEST)?, &mut bytes)?;
+    let text = core::str::from_utf8(bytes.as_slice()).map_err(|_| CliError::Text { what: "the root manifest is not UTF-8" })?;
+    let erased = blaze_own::Erased::new(frame);
+    let on = profile::overflow_checks(text, ManifestId(0), ROOT_MANIFEST, BuiltinProfile::Dev, erased.handle()).map_err(|e| refused(&e))?;
+    Ok(if on { OverflowChecks::On } else { OverflowChecks::Off })
+}
+
+/// The workspace root's manifest, under the checkout's root.
+const ROOT_MANIFEST: &str = "Cargo.toml";
+
 /// The root package's name, and its edition as a manifest writes it (`2024`, `blaze-2026.11`):
 /// what the runner's front end is given ([`NewFront`]). Read by the workspace's one manifest
 /// reader (blaze-manifest `Layout`), so an inherited edition is the workspace's.
@@ -174,6 +221,14 @@ fn package<'f>(cx: &Cx, root: &Dir<ReadWrite>, frame: &'f Frame) -> Result<(&'f 
                 let Some(member) = units.members.iter().find(|member| member.dir.as_str().is_empty()) else {
                     return Err(refused(&"the checkout's root is a workspace with no package of its own, and `blaze run` runs the root's package"));
                 };
+                if !member.bins.iter().any(|bin| bin.root.as_str() == ROOT) {
+                    let owned = |text: &str| std::boxed::Box::<str, std::alloc::Global>::from(text);
+                    let mut bins = std::vec::Vec::new_in(std::alloc::Global);
+                    for bin in member.bins.iter() {
+                        bins.push((owned(bin.name.as_str()), owned(bin.root.as_str())));
+                    }
+                    return Err(CliError::NoBinary(NoBinary { package: owned(member.name.as_str()), bins }));
+                }
                 let edition = match member.edition.blaze {
                     Some(blaze) => blaze.manifest(),
                     None => kept(bstd::mem::format_in!(frame, "{}", member.edition.syntax).as_str())?,

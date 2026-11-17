@@ -73,6 +73,7 @@
 
 mod adt;
 pub mod atoms;
+mod attr_value;
 mod body;
 mod builtin;
 mod call;
@@ -94,7 +95,8 @@ mod record;
 mod rules;
 mod tokens;
 
-pub use crate::rules::{rules_oracle, rules_oracle_counts};
+pub use crate::attr_value::{AttrLiteralError, MOST_ATTR_VALUE_DEPTH, attr_literal};
+pub use crate::rules::{CopyPlant, rules_copy_plant, rules_oracle, rules_oracle_counts};
 pub use crate::{
     body::{
         BodyWord, BodyWords, Fragment, ParserWords, body_words, local_hygiene, parser_words,

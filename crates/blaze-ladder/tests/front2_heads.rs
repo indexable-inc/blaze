@@ -398,16 +398,24 @@ fn census_crate<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, krate: usize, 
                     Err(Refusal { class: CONTAINER_REFUSED.to_string(), file: "-".to_string(), base: None, range: None, owner: None })
                 } else {
                     let filed = r.keys.filed_member(ck, mk, name);
+                    // An impl's fn's signature is its own want (heads.rs `Want::MemberFn`),
+                    // never made with the impl's head: asked here. Its own refusal is its
+                    // `fn_gaps` row; a want that does not settle is the made want's refusal.
+                    let member_made = match (mk, filed) {
+                        (MemberKind::Fn, Some(fk)) if !is_trait => make(&mut r, Want::MemberFn(*k, fk)),
+                        _ => Ok(()),
+                    };
                     match (mk, filed) {
-                        (MemberKind::Fn, Some(fk)) => match r.store.fn_gaps.get(&fk) {
+                        (MemberKind::Fn, Some(fk)) => match (member_made, r.store.fn_gaps.get(&fk)) {
+                            (Err(x), _) => Err(x),
                             // Its range is relative to the member's own text.
-                            Some(why) => {
+                            (Ok(()), Some(why)) => {
                                 let mut x = why_refusal(m.key, why);
                                 x.owner = Some(*k);
                                 Err(x)
                             }
-                            None if r.store.fns.contains_key(&fk) => Ok(()),
-                            None => Err(Refusal { class: "member fn filed but no head in the store".to_string(), file: "heads.rs".to_string(), base: None, range: None, owner: None }),
+                            (Ok(()), None) if r.store.fns.contains_key(&fk) => Ok(()),
+                            (Ok(()), None) => Err(Refusal { class: "member fn filed but no head in the store".to_string(), file: "heads.rs".to_string(), base: None, range: None, owner: None }),
                         },
                         (MemberKind::Const, Some(_)) => Ok(()),
                         (MemberKind::Const, None) if is_trait => Err(Refusal { class: "trait assoc const: no head made (trait_members files none)".to_string(), file: "heads.rs".to_string(), base: None, range: None, owner: None }),

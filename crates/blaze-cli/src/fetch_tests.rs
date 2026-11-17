@@ -152,7 +152,7 @@ fn a_unit_in_cargos_cache_is_adopted_by_the_locks_pin_and_held() {
             assert!(record.findings.is_empty(), "no finding: {:?}", core::str::from_utf8(record.messages.as_slice()));
         }
         Did::Failed(failure) => panic!("the task failed: {failure:?}"),
-        Did::FailedSaying(failure, words) => panic!("the task failed: {failure:?}: {words}"),
+        Did::FailedSaying(failure, words) | Did::Hole(failure, words) => panic!("the task failed: {failure:?}: {words}"),
         Did::Need(_) => panic!("a `Fetch` task needs nothing"),
     }
 

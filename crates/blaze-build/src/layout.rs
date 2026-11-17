@@ -504,6 +504,9 @@ pub enum Refusal {
     NoAdt(ItemKey),
     /// Grounding a field's type was refused.
     Ground(BuildError),
+    /// Grounding the type of field `field` (its row in `Adt::fields`, named `name`) of ADT
+    /// `adt` was refused: `error` says why (a projection no impl answers, an opaque type).
+    FieldGround { adt: ItemKey, field: u32, name: Name, error: BuildError },
     /// A record the layout reads is not made yet (an explicit discriminant's value): nothing
     /// was cached, so asking again once it exists lays the type out afresh.
     Missing(Missing),
@@ -533,6 +536,9 @@ impl fmt::Display for LayoutError {
             Refusal::TooLarge => write!(f, "type {t} is larger than `isize::MAX` bytes"),
             Refusal::NoAdt(key) => write!(f, "type {t}: the world does not know ADT {:#x}", key.0),
             Refusal::Ground(error) => write!(f, "type {t}: grounding a field's type: {error}"),
+            Refusal::FieldGround { adt, field, name, error } => {
+                write!(f, "type {t}: field {field} (name {:#x}) of ADT {:#x}: grounding its type: {error}", name.0, adt.0)
+            }
             Refusal::Missing(m) => write!(f, "type {t}: the record of item {:#x} (an explicit discriminant) is not made yet", m.item.0),
         }
     }
@@ -883,8 +889,9 @@ impl<A: Allocator + Clone> Layouts<A> {
                 if adt.generics as usize != args.len() {
                     return Err(Refusal::Malformed("an ADT type whose argument count is not its generic count"));
                 }
-                for f in adt.fields.iter() {
-                    out.push(ground(adt.types, f.ty, &args, cx.ground, cx.scratch, cx.facts).map_err(Refusal::Ground)?);
+                for (i, f) in adt.fields.iter().enumerate() {
+                    let named = |error| Refusal::FieldGround { adt: key, field: i as u32, name: f.name, error };
+                    out.push(ground(adt.types, f.ty, &args, cx.ground, cx.scratch, cx.facts).map_err(named)?);
                 }
             }
             _ => {}
@@ -1153,7 +1160,9 @@ impl<A: Allocator + Clone> Layouts<A> {
                     let Some(last) = adt.fields.last() else { return Ok(None) };
                     let mut args: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
                     args.extend_from_slice(view.list(l).map_err(|_| Refusal::Malformed("a list past the ground table"))?);
-                    p = ground(adt.types, last.ty, &args, cx.ground, cx.scratch, cx.facts).map_err(Refusal::Ground)?;
+                    let field = adt.fields.len() as u32 - 1;
+                    let named = |error| Refusal::FieldGround { adt: key, field, name: last.name, error };
+                    p = ground(adt.types, last.ty, &args, cx.ground, cx.scratch, cx.facts).map_err(named)?;
                 }
                 PNode::Param(_) | PNode::Alias { .. } | PNode::Opaque(..) | PNode::Infer | PNode::Error => {
                     return Err(Refusal::Malformed("a pointee with no ground form"));

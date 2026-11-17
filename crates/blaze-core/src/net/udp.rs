@@ -47,8 +47,8 @@ const MESSAGES: usize = BATCH_MOST;
 /// `at`, bound, nonblocking and close-on-exec, with each of `options` set. An option the
 /// system refuses fails the bind, naming it.
 pub(crate) fn bind(at: SocketAddr, options: Options) -> Result<UdpSocket, (&'static str, io::Error)> {
-    // std's sockets are made close-on-exec.
-    let socket = UdpSocket::bind(at).map_err(|error| ("the bind", error))?;
+    // Made close-on-exec, its tuning set before the bind (reuse must be).
+    let socket = crate::sockopt::bind_udp(at, &options)?;
     socket.set_nonblocking(true).map_err(|error| ("O_NONBLOCK", error))?;
     let fd = socket.as_raw_fd();
     let v6 = at.is_ipv6();

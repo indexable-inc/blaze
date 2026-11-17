@@ -644,7 +644,9 @@ fn a_stalled_call_an_outer_scope_provides_resolves() {
     w.cr(root).head.prelude = Some(prelude);
     let m = w.module(root, "m", V::Pub);
     w.glob(m, "self::k", V::Priv);
-    let call = w.call(m, "Cl", crate::CallShape::FnLike);
+    // A derive, as written in core (runner 16: it was a function-like call of a derive, which
+    // the sub-namespace rule now refuses).
+    let call = w.call(m, "Cl", crate::CallShape::Derive);
     let ok = cells_of(&w, root, CellPlant::None);
     assert!(matches!(ok.call_outcome(call), Some(Outcome::Called(d)) if d.key == cl), "{:?}", ok.call_outcome(call));
     assert!(matches!(outcome(&ok, m, 0), Outcome::Failed(Unresolved::NotFound)), "{:?}", outcome(&ok, m, 0));
@@ -666,7 +668,8 @@ fn an_enum_glob_brings_no_macro() {
     let m = w.module(root, "m", V::Pub);
     w.item(m, "E", Namespace::Types, crate::DefKind::Enum, V::Pub);
     w.glob(m, "self::E", V::Priv);
-    let call = w.call(m, "Cl", crate::CallShape::FnLike);
+    // A derive, as the doc says (runner 16: it was a function-like call of a derive).
+    let call = w.call(m, "Cl", crate::CallShape::Derive);
     let ok = cells_of(&w, root, CellPlant::None);
     assert_eq!(outcome(&ok, m, 0), Outcome::Outside, "the enum glob itself stays unknown");
     assert!(matches!(ok.call_outcome(call), Some(Outcome::Called(d)) if d.key == cl), "{:?}", ok.call_outcome(call));
@@ -1262,6 +1265,91 @@ fn a_use_of_a_crate_alone_binds_the_crate() {
     assert!(matches!(outcome(&bad, b, 1), Outcome::Outside), "the control, `u`: {:?}", outcome(&bad, b, 1));
 }
 
+/// `use crate as name;` (serde's `pub use crate as serde;` in its `private` module, which every
+/// serde derive's `use serde::private::serde as _serde;` reads; found when the cell core became
+/// the writer: tests::blocks::blocks_read_a_crate_path_given_to_serde_s_derive "`_serde`:
+/// segment 0: not found"). The Reference, `items.use.path`: a `use` path's prefix `crate`
+/// names the crate root; a path of `crate` alone names that module, and with `as name` binds
+/// it in the type namespace like any imported module. The crate: `mod private { pub use crate
+/// as serde; }`, `use private::serde::x as y;`, `pub struct x;`. `serde` is the root, public;
+/// `y` is `x`. Control `CrateRootImportFails`: `serde` fails, and with it `y`.
+/// Prints: "test cells::tests::a_use_of_crate_alone_binds_the_root ... ok".
+#[test]
+fn a_use_of_crate_alone_binds_the_root() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let x = w.item(root, "x", Namespace::Types, crate::DefKind::Other, V::Pub);
+    let private = w.module(root, "private", V::Pub);
+    w.use_as(private, "crate", "serde", V::Pub);
+    w.use_as(root, "private::serde::x", "y", V::Priv);
+    let ok = cells_of(&w, root, CellPlant::None);
+    match outcome(&ok, private, 0) {
+        Outcome::Named(n) => assert_eq!(n[super::ns_at(Namespace::Types)], Some((crate::Def::module(root), crate::Visibility::Public)), "`pub use crate as serde;`"),
+        other => panic!("`serde` is not bound: {other:?}"),
+    }
+    assert_eq!(named_def(outcome(&ok, root, 0), Namespace::Types), Some(x), "`y`: {:?}", outcome(&ok, root, 0));
+    let bad = cells_of(&w, root, CellPlant::CrateRootImportFails);
+    assert!(matches!(outcome(&bad, private, 0), Outcome::Failed(_)), "the control, `serde`: {:?}", outcome(&bad, private, 0));
+    assert!(matches!(outcome(&bad, root, 0), Outcome::Failed(_)), "the control, `y`: {:?}", outcome(&bad, root, 0));
+}
+
+/// tempo_contracts and alloy_provider (c10-r17a: "scope errors old 0 cells 2; .. Macro { ..
+/// segments: [\"rustfmt\", \"skip\"] }, segment: 0, why: NotFound }"). The Reference,
+/// `attributes.tool`: "Tool attributes .. allow external tools .. The tool's name must be a
+/// tool known to the compiler", `rustfmt` and `clippy` among them. The crate: `#[rustfmt::skip]
+/// fn f() {}` with `rustfmt` in the root record's tools. The written scope holds no error; the
+/// control `ToolAttrIsACall` makes the attribute a call whose path fails at `rustfmt`.
+#[test]
+fn a_tool_attribute_is_inert() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    w.cr(root).tools.push("rustfmt");
+    w.call_on(root, "rustfmt::skip", crate::CallShape::Attr, Some(0));
+    assert_eq!(written_errors(&w, root, CellPlant::None), "[]", "a tool attribute is no call");
+    let bad = written_errors(&w, root, CellPlant::ToolAttrIsACall);
+    assert!(bad.contains("rustfmt") && bad.contains("NotFound"), "the control: {bad}");
+}
+
+/// The written scope of `c` planted with `plant` at the load, its errors as text.
+fn written_errors(w: &World, root: ItemKey, plant: CellPlant) -> String {
+    w.expanded.borrow_mut().clear();
+    let mut c = Cells::load_planted(w, root, None, plant, Alloc::global()).expect("the load");
+    let expand = |call: ItemKey, _: crate::Def| {
+        w.expanded.borrow_mut().insert(call);
+    };
+    c.run(w, &expand, &[]).expect("the core runs");
+    let ix = c.write_index(Alloc::global());
+    let (scope, unknown) = c.scope(&ix, root, Alloc::global()).expect("the root is written");
+    assert_eq!(unknown, 0, "{:?}", scope.errors);
+    format!("{:?}", scope.errors)
+}
+
+/// evm2 and reth_engine_tree (c10-r17a: "scope errors old 9 cells 2; error old
+/// Some(RecursionLimit { .. }) cells None"). rustc's default `recursion_limit` is 128 (Reference
+/// `attributes.limits.recursion_limit`: "the maximum depth for potentially infinitely-recursive
+/// compile-time operations like macro expansion"). The crate: `macro_rules! m {}` and a chain of
+/// 131 calls `m!()`, each written in the expansion before it. The call at depth 128 is the
+/// scope's one `RecursionLimit` error and is not expanded; the control `NoRecursionLimit`
+/// expands the whole chain and writes no error.
+#[test]
+fn a_call_at_the_recursion_limit_is_an_error() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    w.rules(root, "m");
+    let mut at = root;
+    let mut chain = Vec::new();
+    for _ in 0..131 {
+        at = w.call(at, "m", crate::CallShape::FnLike);
+        chain.push(at);
+    }
+    // A root call after the chain: its textual read walks down every expansion before it to the
+    // deep call, which must count as grown (c10-r17c hung there in a quiet-point loop).
+    w.call(root, "m", crate::CallShape::FnLike);
+    let deep = format!("RecursionLimit {{ call: {:?} }}", chain[128]);
+    assert_eq!(written_errors(&w, root, CellPlant::None), format!("[{deep}]"), "the call at depth 128");
+    assert_eq!(written_errors(&w, root, CellPlant::NoRecursionLimit), "[]", "the control");
+}
+
 /// mach2 0.5.0 on tempo's graph (edition 2015; c10-g3: "differ 153, cells failed 153, stalls 1").
 /// The Reference, `items.use.path.edition2018`: "In the 2015 edition, `use` paths are relative to
 /// the crate root." and "The 2015 edition does not allow use declarations to reference the extern
@@ -1600,4 +1688,44 @@ fn what_a_stalled_call_took_is_validated_when_the_run_ends() {
     let bad = cells_of(&w, root, CellPlant::SpeculationUnchecked);
     assert!(matches!(bad.call_outcome(call), Some(Outcome::Called(d)) if d.key == cl), "{:?}", bad.call_outcome(call));
     assert_eq!(bad.stats.r6_errors, 0, "the control SpeculationUnchecked");
+}
+
+/// Calls by kind (runner 16). The Reference, `names.resolution.expansion.macros.intro`: "Macros
+/// are split into two sub-namespaces, one for function-like macros, and the other for
+/// attributes and derives. Resolution candidates from the incorrect sub-namespace are
+/// ignored." The crate: a standard prelude holding the derive `Cl`; `mod m { macro_rules! Cl;
+/// pub macro at /* an attribute macro */; Cl!(); #[derive(Cl)] struct S; #[derive(at)] struct
+/// T; }`, and in `mod p { pub macro Cl /* an attribute macro */; #[derive(Cl)] struct U; }`.
+/// `Cl!()` names the `macro_rules!` (textual); `#[derive(Cl)]` in `m` passes over it (wrong
+/// sub-namespace) to the prelude's derive; `#[derive(at)]` selects the attribute macro of its
+/// own sub-namespace and is refused as the wrong kind; in `p` the module's attribute `Cl` is of
+/// the derive's sub-namespace, so it is selected (not passed over to the prelude) and refused.
+/// Control `SubNamespaceIgnored`: `#[derive(Cl)]` in `m` calls the `macro_rules!`, and
+/// `#[derive(at)]` calls the attribute macro.
+/// Prints: "test cells::tests::a_call_reads_only_its_own_sub_namespace ... ok".
+#[test]
+fn a_call_reads_only_its_own_sub_namespace() {
+    use crate::{CallShape, DefKind, MacroShapes};
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let prelude = w.module(root, "prelude", V::Pub);
+    let cl = w.item(prelude, "Cl", Namespace::Macros, DefKind::Macro(MacroShapes::DERIVE), V::Pub);
+    w.cr(root).head.prelude = Some(prelude);
+    let m = w.module(root, "m", V::Pub);
+    let rules = w.rules(m, "Cl");
+    let at = w.item(m, "at", Namespace::Macros, DefKind::Macro(MacroShapes::ATTR), V::Pub);
+    let bang = w.call(m, "Cl", CallShape::FnLike);
+    let derive = w.call(m, "Cl", CallShape::Derive);
+    let wrong = w.call(m, "at", CallShape::Derive);
+    let p = w.module(root, "p", V::Pub);
+    w.item(p, "Cl", Namespace::Macros, DefKind::Macro(MacroShapes::ATTR), V::Pub);
+    let near = w.call(p, "Cl", CallShape::Derive);
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert!(matches!(ok.call_outcome(bang), Some(Outcome::Called(d)) if d.key == rules), "`Cl!()`: {:?}", ok.call_outcome(bang));
+    assert!(matches!(ok.call_outcome(derive), Some(Outcome::Called(d)) if d.key == cl), "`#[derive(Cl)]`: {:?}", ok.call_outcome(derive));
+    assert_eq!(ok.call_outcome(wrong), Some(Outcome::Failed(Unresolved::WrongMacroKind)), "`#[derive(at)]`");
+    assert_eq!(ok.call_outcome(near), Some(Outcome::Failed(Unresolved::WrongMacroKind)), "`#[derive(Cl)]` in `p`");
+    let bad = cells_of(&w, root, CellPlant::SubNamespaceIgnored);
+    assert!(matches!(bad.call_outcome(derive), Some(Outcome::Called(d)) if d.key == rules), "the control: {:?}", bad.call_outcome(derive));
+    assert!(matches!(bad.call_outcome(wrong), Some(Outcome::Called(d)) if d.key == at), "the control: {:?}", bad.call_outcome(wrong));
 }

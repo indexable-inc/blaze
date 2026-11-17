@@ -21,7 +21,7 @@ use blaze_solve::facts::{
     AdtDef, AdtFlags, AssocDef, AssocKind, AssocTy, ConstHolds, Facts, Fetch, FnSigDef, ImplAssoc, ImplFlags, ImplHeader,
     ImplPolarity, ImplSet, Missing, OpaqueDef, Portable, Question as SQ, Seal, TraitDef, TraitFlags as STraitFlags,
 };
-use blaze_solve::prefilter::Columns;
+use blaze_solve::prefilter::{self, Columns, Fingerprint};
 use blaze_solve::term::{
     AliasKind as SAlias, Def as SDef, Lang, List as SList, Mutbl as SMutbl, Polarity, Pred, Rigid, Shape as SShape,
     Ty as STy, TyKind as K,
@@ -157,6 +157,13 @@ pub struct FactCache<'a> {
     impl_defs: Vec<SDef, Alloc<'a>>,
     traits: HashMap<u128, TraitRow, Alloc<'a>>,
     impls: HashMap<(u128, SShape), (Span, u64), Alloc<'a>>,
+    /// Each `impls` entry's fingerprint columns (blaze-solve prefilter.rs): their start in
+    /// `impl_columns` and their stride; `WIDTH * stride` bytes.
+    impl_cols: HashMap<(u128, SShape), (u32, u32), Alloc<'a>>,
+    impl_columns: Vec<u8, Alloc<'a>>,
+    /// One bucket's fingerprints and columns while it is filled (reused).
+    fp_scratch: Vec<Fingerprint, Alloc<'a>>,
+    col_scratch: Vec<u8, Alloc<'a>>,
     headers: HashMap<u128, ImplRow, Alloc<'a>>,
     adts: HashMap<u128, AdtRow, Alloc<'a>>,
     sigs: HashMap<u128, SigRow, Alloc<'a>>,
@@ -402,6 +409,10 @@ impl<'a> FactCache<'a> {
             impl_defs: Vec::new_in(alloc),
             traits: HashMap::new_in(alloc),
             impls: HashMap::new_in(alloc),
+            impl_cols: HashMap::new_in(alloc),
+            impl_columns: Vec::new_in(alloc),
+            fp_scratch: Vec::new_in(alloc),
+            col_scratch: Vec::new_in(alloc),
             headers: HashMap::new_in(alloc),
             adts: HashMap::new_in(alloc),
             sigs: HashMap::new_in(alloc),
@@ -517,13 +528,33 @@ impl<'a> FactCache<'a> {
                 let got = reads.impls_of(ItemKey(d.0), shape(s))?;
                 #[cfg(test)]
                 let got = if self.first_impl_only { &got[..got.len().min(1)] } else { got };
+                // Every header first: the bucket's fingerprint columns are made from them, so
+                // the solver drops an impl whose head cannot match the goal before it imports
+                // the header (prefilter.rs, trait_goals.rs `assemble_impls`). The solver read
+                // every one of them before this too (each was a candidate), one stop and
+                // retry per header; now the bucket's are read in this one fill.
+                for k in got {
+                    if !self.headers.contains_key(&k.0) {
+                        self.fill_impl(*k, reads)?;
+                    }
+                }
                 let start = self.impl_defs.len();
                 self.impl_defs.extend(got.iter().map(|k| SDef(k.0)));
                 let span = Span::of(&self.impl_defs, start);
                 let mut h = StableHasher::new("blaze-typeck impls");
+                self.fp_scratch.clear();
                 for k in got {
                     h.u128(k.0);
+                    let r = self.headers.get(&k.0).ok_or(CheckError::Malformed(Malformed::NoRecord(Question::ImplHeader(*k))))?;
+                    // The columns come from the headers: a header's change changes this answer.
+                    h.u64(r.digest);
+                    let fp = prefilter::fingerprint_impl(self.portable(r.por), r.args);
+                    self.fp_scratch.push(fp);
                 }
+                let stride = prefilter::columns_of(&self.fp_scratch, &mut self.col_scratch);
+                let at = self.impl_columns.len() as u32;
+                self.impl_columns.extend_from_slice(&self.col_scratch);
+                self.impl_cols.insert((d.0, s), (at, stride));
                 self.impls.insert((d.0, s), (span, h.finish()));
                 Ok(())
             }
@@ -565,11 +596,11 @@ impl<'a> FactCache<'a> {
     /// `list` then convert exactly what the answer's handles reach (D62 stage one).
     fn table<'t>(&mut self, q: Question, t: PTys<'t>) -> Conv<'t> {
         self.counted.tables += 1;
-        self.counted.offered += t.nodes.len() as u64;
+        self.counted.offered += t.len() as u64;
         // The table's identity for this call's memo: the world's answers are borrowed for the
         // whole call, so two answers whose tables start at one address are one table (the
         // address is never part of a key, a record or an output; it only finds the memo).
-        let id = (t.nodes.as_ptr() as usize, t.lists.as_ptr() as usize);
+        let id = t.identity();
         let next = self.seen.len() as u32;
         let tab = *self.seen.entry(id).or_insert(next);
         Conv { q, tab, t }
@@ -630,7 +661,7 @@ impl<'a> FactCache<'a> {
     fn list(&mut self, c: Conv<'_>, l: crate::ids::List) -> Result<SList, Stop> {
         let mut terms: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(l.len as usize, self.alloc);
         for i in l.range() {
-            let p = *c.t.lists.get(i as usize).ok_or(CheckError::Malformed(Malformed::NoRecord(c.q)))?;
+            let p = c.t.list_slot(i as usize).ok_or(CheckError::Malformed(Malformed::NoRecord(c.q)))?;
             terms.push(self.ty(c, p)?);
         }
         let start = self.lists.len() as u32;
@@ -650,7 +681,7 @@ impl<'a> FactCache<'a> {
         let mut list = |l: crate::ids::List| -> Result<SList, Stop> {
             let start = lists.len() as u32;
             for i in l.range() {
-                let p = *t.lists.get(i as usize).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))?;
+                let p = t.list_slot(i as usize).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))?;
                 lists.push(ty(p)?);
             }
             Ok(SList { start, len: l.len })
@@ -865,7 +896,7 @@ impl<'a> FactCache<'a> {
         let mut terms: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(h.trait_args.list().len as usize + 1, self.alloc);
         terms.push(self_ty);
         for i in h.trait_args.list().range() {
-            let p = *h.types.lists.get(i).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))?;
+            let p = h.types.list_slot(i).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))?;
             terms.push(self.ty(c, p)?);
         }
         let args = SList { start: self.lists.len() as u32, len: terms.len() as u32 };
@@ -1114,9 +1145,11 @@ impl Facts for FactCache<'_> {
 
     fn impls(&self, _: Seal, t: SDef, shape: SShape) -> Fetch<ImplSet<'_>> {
         let &(span, digest) = self.impls.get(&(t.0, shape)).ok_or(Missing)?;
-        // No fingerprint columns yet (`len` 0 is not the impl count): every impl is a
-        // candidate until the item layer's buckets carry blaze-impls' fingerprints.
-        Ok(ImplSet { impls: span.get(&self.impl_defs), columns: Columns::EMPTY, digest })
+        let &(at, stride) = self.impl_cols.get(&(t.0, shape)).ok_or(Missing)?;
+        let impls = span.get(&self.impl_defs);
+        // `fill_one` writes both entries together, the columns `WIDTH * stride` bytes at `at`.
+        let bytes = &self.impl_columns[at as usize..at as usize + prefilter::WIDTH * stride as usize];
+        Ok(ImplSet { impls, columns: Columns { bytes, stride, len: impls.len() as u32 }, digest })
     }
 
     fn impl_header(&self, _: Seal, i: SDef) -> Fetch<ImplHeader<'_>> {

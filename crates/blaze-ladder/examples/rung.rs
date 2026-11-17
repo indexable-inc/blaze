@@ -16,7 +16,7 @@ fn main() {
     let dir = rungs::ladder().join(&rung);
     let files = rungs::sources(&dir);
     let views: Vec<SourceFile<'_>> = files.iter().map(|(path, text)| SourceFile { path, text }).collect();
-    match blaze_ladder::run::run(&views, "src/main.rs", None) {
+    match blaze_ladder::run::run(&views, "src/main.rs", None, rungs::x::overflow_of(&dir)) {
         Ok(status) => println!("{rung}: status {status}"),
         Err(error) => {
             println!("{rung}: {error}");

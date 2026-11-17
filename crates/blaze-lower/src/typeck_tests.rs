@@ -885,6 +885,56 @@ fn a_macro_block_that_diverges_is_never() {
     assert!(c.diags.is_empty(), "body: {:?}\n{}", c.diags, typed_lines(&fx, body, &c, &ranges));
 }
 
+/// A block's final operand is the last statement LEFT after cfg stripping, not the last one
+/// written. The Reference, "Conditional compilation": "If any predicate is false, the form is
+/// removed from the source code"; "Block expressions": "The syntax for a block is {, then any
+/// inner attributes, then any number of statements, then an optional expression, called the
+/// final operand, and finally a }" and "When a block contains a final operand, the block has
+/// the type and value of that final operand"; "Statements": a block-like expression statement
+/// that omits its `;` "must be type ()" only while it IS a statement. tempo's
+/// zones/node dev.rs `write_owner_only` is this shape (`#[cfg(unix)] { .. }` then
+/// `#[cfg(not(unix))] { .. }` last). `all()` is true and `any()` false whatever the cfg set.
+/// Expected: both bodies check with no diagnostic; cargo prints
+/// "test typeck_tests::the_final_operand_is_chosen_after_cfg_stripping ... ok".
+/// A wrong fix fails it: the `{ 1 }` kept as a statement is a mismatch (`1` against `()`, and
+/// the block `()` against `u32`); the stripped `{ () }` kept as the tail is a mismatch too.
+#[test]
+fn the_final_operand_is_chosen_after_cfg_stripping() {
+    let mut fx = blaze_typeck::fixture::Fx::new();
+    let u32_ = fx.u32();
+    let f = fx.func("f", 0, &[], u32_, std::vec::Vec::new());
+    let g = fx.func("g", 0, &[], u32_, std::vec::Vec::new());
+    fx.finish();
+    let blocks = "fn f() -> u32 {
+    #[cfg(all())]
+    {
+        1
+    }
+
+    #[cfg(any())]
+    {
+        ()
+    }
+}";
+    let (c, ranges, _) = lower_and_check(&fx, f, blocks);
+    assert!(c.diags.is_empty(), "blocks: {:?}\n{}", c.diags, typed_lines(&fx, blocks, &c, &ranges));
+    // A block-like statement still followed by a statement that stays is not the final operand:
+    // `{ 1; }` is `()`, and the kept `2` is the tail.
+    let kept = "fn g() -> u32 {
+    #[cfg(all())]
+    {
+        1;
+    }
+    #[cfg(any())]
+    {
+        ()
+    }
+    2
+}";
+    let (c, ranges, _) = lower_and_check(&fx, g, kept);
+    assert!(c.diags.is_empty(), "kept: {:?}\n{}", c.diags, typed_lines(&fx, kept, &c, &ranges));
+}
+
 /// A closure called with the wrong number of arguments (the Reference, "Call expressions": a
 /// closure operand's call is `Fn::call(&f, (args..))`, its arguments one `Args` tuple; "Closure
 /// types": the closure implements the `Fn*` traits with its parameters as `Args`): E0057, the

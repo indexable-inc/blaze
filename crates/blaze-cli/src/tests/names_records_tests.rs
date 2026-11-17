@@ -28,7 +28,7 @@ impl LoadItems<'static> for OneItems {
         (krate == 0).then_some(self.0)
     }
 
-    fn file(&self, _krate: usize, _path: &str) -> Option<&'static str> {
+    fn file(&self, _krate: usize, _path: blaze_scope::package_path::PackagePath<'_>) -> Option<&'static str> {
         None
     }
 

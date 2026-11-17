@@ -18,6 +18,12 @@
 )]
 mod spawn;
 
+#[allow(
+    unsafe_code,
+    reason = "a linked child: copies of inherited descriptors, the group's kill, the macOS exit watch (kqueue)"
+)]
+pub mod linked;
+
 #[cfg(test)]
 mod tests;
 

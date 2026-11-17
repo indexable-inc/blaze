@@ -14,6 +14,7 @@ use std::alloc::Global;
 use std::ffi::CString;
 use std::sync::Arc;
 
+use blaze_build::InstanceKey;
 use blaze_build::data::{DataError, StaticImage};
 use blaze_emit::{Code, Fixup, Reloc, RelocTo, Routine};
 use blaze_typeck::ItemKey;
@@ -188,8 +189,8 @@ impl core::fmt::Display for PlaceError {
                 write!(f, "slot {slot}: a literal word names reference {place}, which the body's table lacks")
             }
             PlaceError::NoEntry { slot } => write!(f, "the entry's slot {slot} holds no code after the commit"),
-            PlaceError::Statics(DataError::NoFn { .. }) => {
-                write!(f, "a static holds a fn pointer, which the ladder does not place yet (statics are written before the code)")
+            PlaceError::Statics(DataError::NoFn { key }) => {
+                write!(f, "a static points to fn instance {:?}, which the build gave no slot (run.rs `static_fn_slots`)", key.0)
             }
             PlaceError::Statics(error) => write!(f, "the static image: {error:?}"),
             PlaceError::NoMemory { bytes } => write!(f, "no memory for the {bytes}-byte static image"),
@@ -402,20 +403,31 @@ impl Records for Table<'_> {
     }
 }
 
-/// Writes `image` into memory of its own and gives its address. The memory is never freed: the
-/// statics live as long as the placed code does, the whole process. Done before the code is
-/// placed, so a static holding a fn pointer is refused ([`PlaceError::Statics`]).
+/// Memory of its own for `image`, zeroed, and its address: [`place`] writes the image into it
+/// once the slots are declared, when every fn a static points at has an address (its slot's
+/// entry thunk). The memory is never freed: the statics live as long as the placed code does,
+/// the whole process. The code's address words name it before it is written, which is sound:
+/// nothing runs before the placement's commit.
 pub fn load_statics(image: &StaticImage<Global>) -> Result<u64, PlaceError> {
     use core::alloc::{Allocator, Layout};
     let bytes = image.bytes.len().max(1);
     let layout = Layout::from_size_align(bytes, 1usize << image.align).map_err(|_| PlaceError::NoMemory { bytes })?;
     let memory = Global.allocate_zeroed(layout).map_err(|_| PlaceError::NoMemory { bytes })?;
-    let base = memory.as_ptr().cast::<u8>() as u64;
-    // SAFETY: `memory` is a fresh allocation of `bytes` bytes, owned here and never freed or
-    // aliased by another Rust reference; `fill` writes exactly `image.bytes.len()` of them.
-    let out = unsafe { core::slice::from_raw_parts_mut(memory.as_ptr().cast::<u8>(), image.bytes.len()) };
-    image.fill(base, out, |_| None).map_err(PlaceError::Statics)?;
-    Ok(base)
+    Ok(memory.as_ptr().cast::<u8>() as u64)
+}
+
+/// Writes `image` at `base` (from [`load_statics`]), each fn word the entry thunk of the slot
+/// `fns` gives its instance (`fns` sorted by key), from `place`'s declared slots.
+fn write_statics(image: &StaticImage<Global>, base: u64, fns: &[(InstanceKey, u32)], place: Place) -> Result<(), PlaceError> {
+    // SAFETY: `base` is `load_statics`' allocation of at least `image.bytes.len()` bytes for
+    // this image, never freed, and no Rust reference to it is alive (the placed code has not
+    // run: the commit comes after this); `fill` writes exactly `image.bytes.len()` of them.
+    let out = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, image.bytes.len()) };
+    let fn_at = |key: InstanceKey| {
+        let at = fns.binary_search_by_key(&key, |f| f.0).ok()?;
+        place.thunk(Slot(fns[at].1))
+    };
+    image.fill(base, out, fn_at).map_err(PlaceError::Statics)
 }
 
 /// Creates the program's thread-local key in the descriptor static at `desc` (its first
@@ -431,10 +443,19 @@ pub fn create_tls_key(desc: u64) -> Result<(), PlaceError> {
     Ok(())
 }
 
-/// Places `bodies`, body `n` in slot `n`, in one edit. `image` is the program's statics as
-/// written at an address ([`load_statics`]); `tls` is what thread-local words name. `said` is
-/// each stub's refusal in words, by stub number (crate::stub; empty for a program with none).
-pub fn place(bodies: &[Body], vtables: &[VtableImage], image: Option<(&StaticImage<Global>, u64)>, tls: Option<Tls>, said: Box<[Box<str>]>) -> Result<Placed, PlaceError> {
+/// Places `bodies`, body `n` in slot `n`, in one edit. `image` is the program's statics and the
+/// memory reserved for them ([`load_statics`]), written here once the slots are declared, each
+/// fn pointer in it the thunk of the slot `static_fns` gives its instance (sorted by key);
+/// `tls` is what thread-local words name. `said` is each stub's refusal in words, by stub
+/// number (crate::stub; empty for a program with none).
+pub fn place(
+    bodies: &[Body],
+    vtables: &[VtableImage],
+    image: Option<(&StaticImage<Global>, u64)>,
+    static_fns: &[(InstanceKey, u32)],
+    tls: Option<Tls>,
+    said: Box<[Box<str>]>,
+) -> Result<Placed, PlaceError> {
     let stops = Box::new(crate::stub::Stops::new(said));
     let vtables = Vtables::write(vtables)?;
     let page = blaze_launch_rt::sys::page().map_err(|e| PlaceError::Launcher(e.into()))? as u64;
@@ -444,6 +465,10 @@ pub fn place(bodies: &[Body], vtables: &[VtableImage], image: Option<(&StaticIma
     let mut driver = Driver::new(Config { slots, area }).map_err(PlaceError::Launcher)?;
     if !bodies.is_empty() {
         driver.declare(slots).map_err(PlaceError::Launcher)?;
+    }
+    // The statics now: every slot has a word and a thunk, so a fn pointer has its address.
+    if let Some((image, base)) = image {
+        write_statics(image, base, static_fns, driver.place())?;
     }
     let mut binds = Vec::with_capacity_in(bodies.len(), Global);
     for (n, body) in bodies.iter().enumerate() {

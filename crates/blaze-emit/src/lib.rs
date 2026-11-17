@@ -168,12 +168,15 @@ use core::fmt;
 
 use blaze_lir::{Op, View};
 
+mod compose;
 mod enc;
 mod pass;
 mod record;
 mod record_check;
+pub mod table_gen;
 
 pub use record::{Named, Names, Outside, RecordEmitError, emit_record};
+pub use compose::Fast;
 pub use record_check::{AddressWord, emit_record_measured, no_address_word};
 
 #[cfg(test)]

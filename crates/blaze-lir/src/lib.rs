@@ -49,6 +49,10 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
+/// LIR's integer arithmetic, one home: what the evaluator runs and the simplify stage folds by.
+mod arith;
+/// Bodies by identity and what a direct call reaches: the evaluator's and the inliner's seam.
+pub mod body;
 pub mod builder;
 /// The coroutine pass (decision D73): a body with `suspend`s to its `poll`, its state's drop
 /// glue and the state's layout.
@@ -59,10 +63,16 @@ pub mod coroutine;
 pub mod eval;
 pub mod flags;
 pub mod func;
+/// The trivial inliner (D98's first point): small loop-free bodies and `#[inline(always)]`
+/// spliced in front of the fast tier.
+pub mod inline;
 pub mod op;
 pub mod parse;
 pub mod persist;
 pub mod print;
+/// The linear simplify stage in front of the Fast tier (backend-next.md D100 point 1): scalar
+/// replacement of slots that do not escape, then (S2) propagation and dead code.
+pub mod simplify;
 pub mod ty;
 pub mod verify;
 
@@ -82,6 +92,8 @@ pub const VERSION: u64 = 2;
 
 #[cfg(test)]
 mod coroutine_tests;
+#[cfg(test)]
+mod inline_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

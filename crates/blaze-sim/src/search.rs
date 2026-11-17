@@ -15,6 +15,7 @@ use blaze_rng::SplitMix64;
 
 #[cfg(test)]
 use crate::shrink;
+use crate::observe::{ObserveMode, Tally};
 use crate::shrink::Shrinker;
 use crate::tape::{Record, Tail, Tape};
 use crate::text::{self, TextError};
@@ -38,10 +39,13 @@ pub struct Config {
     pub given: Given,
     /// Points some case has to reach, or the check fails.
     pub must_reach: &'static [&'static str],
+    /// What the search does with what it observed of its passing cases (observe.rs): print it
+    /// (`ObserveMode::Observe`, the default) or, once built, fail on it.
+    pub observe: ObserveMode,
 }
 
 impl Config {
-    /// 256 cases from seed 0, 1,000 shrink runs, `Tape::MOST_CHOICES`, nothing given.
+    /// 256 cases from seed 0, 1,000 shrink runs, `Tape::MOST_CHOICES`, nothing given, observed.
     pub const DEFAULT: Config = Config {
         cases: 256,
         first: 0,
@@ -49,7 +53,18 @@ impl Config {
         most_choices: Tape::MOST_CHOICES,
         given: Given::NOTHING,
         must_reach: &[],
+        observe: ObserveMode::Observe,
     };
+
+    /// What the search does with what it observed (observe.rs).
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub const fn observe(mut self, mode: ObserveMode) -> Config {
+        self.observe = mode;
+        self
+    }
 
     /// [`Config::DEFAULT`] with `cases` cases.
     #[blaze::pure]
@@ -413,6 +428,8 @@ pub struct Search {
     drew: bool,
     /// The points passing cases reached, each once.
     reached: Vec<&'static str, Global>,
+    /// What the passing cases of the run drew (observe.rs).
+    tally: Tally,
     found: Option<Found>,
     shrinker: Option<Shrinker>,
     /// The tape the final run replays: the shrinker's best.
@@ -424,10 +441,11 @@ pub struct Search {
 
 impl Search {
     /// A search of `config`. A `Given` with a tape and a seed or a count (which `Given::parse`
-    /// refuses) panics, naming both.
+    /// refuses) panics, naming both; so does `ObserveMode::Enforce`, which is not built yet.
     #[blaze::pure]
     #[blaze::nonblocking]
     pub fn new(config: Config) -> Search {
+        config.observe.in_force();
         let given = &config.given;
         if let Some(tape) = &given.tape {
             if let Some(seed) = given.seed {
@@ -459,6 +477,7 @@ impl Search {
             choices: 0,
             drew: false,
             reached: Vec::new_in(Global),
+            tally: Tally::new(),
             found: None,
             shrinker: None,
             least: Vec::new_in(Global),
@@ -524,6 +543,15 @@ impl Search {
     #[blaze::nonblocking]
     pub(crate) fn most_choices(&self) -> u32 {
         self.config.most_choices
+    }
+
+    /// What the passing cases of the run drew so far (observe.rs); whole once the search is done.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn tally(&self) -> &Tally {
+        &self.tally
     }
 
     /// The most cases this search proposes: its cases, its shrink runs and the final run.
@@ -694,6 +722,7 @@ impl Search {
                         self.reached.push(*point);
                     }
                 }
+                self.tally.case(record);
             }
             Ended::Discarded => self.discarded += 1,
             Ended::Failed(failure) => {

@@ -239,11 +239,21 @@ pub fn fill(record: &mut CodeRecord<'_>, frame: Frame, rows: &[Row]) -> Result<(
     Ok(())
 }
 
-/// A record's unwind rows, read in place from its encoded form and checked whole.
+/// A record's unwind rows, read in place from its encoded form ([`read`]) or taken from rows in
+/// memory ([`of_rows`]: blaze-tier's record), and checked whole either way.
 #[derive(Clone, Copy)]
 pub struct Unwind<'b> {
     frame: Option<Frame>,
-    view: CodeView<'b>,
+    rows: RowsIn<'b>,
+}
+
+/// Where an [`Unwind`]'s rows are.
+#[derive(Clone, Copy)]
+enum RowsIn<'b> {
+    /// A `bzcode01` record's pads.
+    View(CodeView<'b>),
+    /// Rows in memory, for `code_len` bytes of code.
+    Rows { rows: &'b [Row], code_len: u32 },
 }
 
 /// Reads `view`'s unwind rows, checking every one: the frame word's form and bits; each pad's
@@ -251,18 +261,31 @@ pub struct Unwind<'b> {
 /// sorted and disjoint, and that each landing is where its action says.
 pub fn read(view: CodeView<'_>) -> Result<Unwind<'_>, UnwindError> {
     let frame = Frame::of_word(view.frame())?;
-    let pads = view.pads();
+    check(frame, view.pads(), view.code().len() as u64, |i| view.pad(i))?;
+    Ok(Unwind { frame, rows: RowsIn::View(view) })
+}
+
+/// The same [`Unwind`] as [`read`] gives, from a frame and rows in memory for `code_len` bytes
+/// of code (blaze-tier's `Emitted::unwind_frame` and `Emitted::unwind`), checked by the same
+/// rules: a record made by any tier is unwound through by the one entry writer
+/// ([`crate::eh::entry`]).
+pub fn of_rows(frame: Option<Frame>, rows: &[Row], code_len: u32) -> Result<Unwind<'_>, UnwindError> {
+    check(frame, rows.len(), u64::from(code_len), |i| rows[i].pad())?;
+    Ok(Unwind { frame, rows: RowsIn::Rows { rows, code_len } })
+}
+
+/// [`read`]'s rules over `pads` pads of `code` bytes of code, pad `i` given by `pad(i)`.
+fn check(frame: Option<Frame>, pads: usize, code: u64, pad: impl Fn(usize) -> Pad) -> Result<(), UnwindError> {
     let Some(frame) = frame else {
         return match pads {
-            0 => Ok(Unwind { frame: None, view }),
+            0 => Ok(()),
             n => Err(UnwindError::PadsWithoutFrame { pads: n as u32 }),
         };
     };
-    let code = view.code().len() as u64;
     let prologue = frame.prologue();
     let mut end = 0u64;
     for i in 0..pads {
-        let pad = view.pad(i);
+        let pad = pad(i);
         let action = Action::of_code(pad.action).ok_or(UnwindError::PadAction { start: pad.start, action: pad.action })?;
         if pad.len == 0 || pad.start % INST != 0 || pad.len % INST != 0 {
             return Err(UnwindError::PadShape { start: pad.start, len: pad.len });
@@ -287,7 +310,7 @@ pub fn read(view: CodeView<'_>) -> Result<Unwind<'_>, UnwindError> {
             return Err(UnwindError::PadLanding { start: pad.start, landing: pad.landing, action });
         }
     }
-    Ok(Unwind { frame: Some(frame), view })
+    Ok(())
 }
 
 impl<'b> Unwind<'b> {
@@ -298,16 +321,25 @@ impl<'b> Unwind<'b> {
 
     /// The code's bytes: the range the unwind entry covers.
     pub fn code_len(&self) -> u32 {
-        self.view.code().len() as u32
+        match self.rows {
+            RowsIn::View(view) => view.code().len() as u32,
+            RowsIn::Rows { code_len, .. } => code_len,
+        }
     }
 
     pub fn rows(&self) -> usize {
-        self.view.pads()
+        match self.rows {
+            RowsIn::View(view) => view.pads(),
+            RowsIn::Rows { rows, .. } => rows.len(),
+        }
     }
 
-    /// Row `i`, already checked by [`read`].
+    /// Row `i`, already checked by [`read`] or [`of_rows`].
     pub fn row(&self, i: usize) -> Row {
-        let pad = self.view.pad(i);
+        let pad = match self.rows {
+            RowsIn::View(view) => view.pad(i),
+            RowsIn::Rows { rows, .. } => return rows[i],
+        };
         let action = match Action::of_code(pad.action) {
             Some(action) => action,
             None => unreachable!("`read` refused an unknown action"),

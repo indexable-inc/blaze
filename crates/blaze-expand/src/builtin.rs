@@ -964,8 +964,9 @@ fn stringify(out: &mut Out<'_, '_>) -> Result<(), ExpandError> {
 /// written `{ .. }` when its opening brace is `Alone` and it is not empty.
 ///
 /// One pass over the tokens, the trees of each level paired on an explicit stack: the space
-/// between two trees is decided when the second one starts.
-fn stringified(
+/// between two trees is decided when the second one starts. Also what an attribute's
+/// `= stringify!(..)` value reads to ([`crate::attr_value`]).
+pub(crate) fn stringified(
     stream: &TokenStream<'_>,
     alloc: Alloc<'_>,
     into: &mut Buf<'_>,

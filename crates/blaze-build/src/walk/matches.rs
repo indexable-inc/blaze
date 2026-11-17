@@ -41,6 +41,7 @@ use blaze_typeck::{Def, ExprId, List, Lit, Mutbl, Name, PNode, PTy, Pat, PatId};
 
 mod alts;
 mod forms;
+mod irrefutable;
 
 use super::{Home, MatchState, Owner, PTR_BITS, Repr, Shape, Task, V, Walk, malformed, mask, unsupported};
 use crate::BuildError;
@@ -166,10 +167,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         // walk/moves.rs: a scrutinee that needs drop is owned (a local by its field flags, a
         // temporary held to its statement's end), so arms may move parts out of it.
         let m_next = self.matches.len() as u32;
-        let at = match self.own_scrutinee(m_next, e, scrutinee, s, srepr)? {
-            Some((p, off, g)) => At { at: (p, off), g, by_ref: false, copy: false },
-            None => self.tested_place(scrutinee, s, srepr, "a `match` by tests on a temporary that needs drop (its drop point is not built)")?,
-        };
+        let at = self.owned_place(m_next, e, scrutinee, s, srepr)?;
         let (at, g, copy) = (at.at, at.g, at.copy);
         let list = self.body.arms.get(arms.range()).ok_or(malformed("a match's arms past `arms`"))?;
         let repr = self.expr_repr(e)?;
@@ -205,6 +203,18 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         Ok(())
     }
 
+    /// The place match `m` (expression `e`: a `match`, or a `let`-`else` initializer) tests
+    /// its scrutinee at, the scrutinee OWNED (walk/moves.rs `own_scrutinee`): a local by its
+    /// field flags, a temporary that needs drop held in its temporary scope with a word of its
+    /// own (walk/temps.rs `hold_temp`), so the bindings (`move_arm`) may move parts out of it
+    /// and the rest drops at that scope's end, once.
+    pub(super) fn owned_place(&mut self, m: u32, e: ExprId, scrutinee: ExprId, s: V, srepr: Repr) -> Result<At, BuildError> {
+        match self.own_scrutinee(m, e, scrutinee, s, srepr)? {
+            Some((p, off, g)) => Ok(At { at: (p, off), g, by_ref: false, copy: false }),
+            None => self.tested_place(scrutinee, s, srepr, "a scrutinee temporary that needs drop, not owned (its drop point is not built)"),
+        }
+    }
+
     /// The place scrutinee `scrutinee` (its value `s`, held as `srepr`) is tested at: its own
     /// place, or a scalar copied to a slot. A temporary that needs drop is refused with `what`
     /// (a local's place stays its local's, dropped where the local is; a temporary would need
@@ -214,7 +224,10 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let g = self.ground_ty(t).map_err(|error| Self::ty_err(scrutinee, error))?;
         if self.needs_drop(g).map_err(|error| Self::ty_err(scrutinee, error))? {
             let local = self.local_of(scrutinee)?.is_some() && self.adjust_rows(scrutinee).is_empty();
-            if !local {
+            // A place behind a pointer is tested where it is and owned by no one here
+            // (walk/moves.rs `scrutinee_in_place`; a by-value binding of a part that needs
+            // drop is refused by `move_out`).
+            if !local && !self.scrutinee_in_place(scrutinee)? {
                 return Err(unsupported(scrutinee, what));
             }
         }

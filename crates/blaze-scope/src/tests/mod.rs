@@ -26,6 +26,7 @@ use crate::{
 
 mod asked;
 mod asked_digest;
+mod attr_value;
 mod edits;
 mod attrs;
 mod blocks;
@@ -34,6 +35,7 @@ mod expansions;
 mod exports;
 mod fixtures;
 mod items;
+mod items_attr_text;
 mod items_record;
 mod items_grain;
 mod items_owners;

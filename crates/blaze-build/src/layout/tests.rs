@@ -677,6 +677,8 @@ fn random_types(tape: &Tape) -> Result<(), Broke> {
 
 /// Whether a tagged layout's tag occupies bytes no field of a variant may share (a direct
 /// tag), or lives inside the untagged variant's own field (a niche).
+mod field_ground;
+
 mod adt {
     use super::super::{Layout, TagEncoding, Variants};
 

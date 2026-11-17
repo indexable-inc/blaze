@@ -46,6 +46,17 @@ impl<'b> Spelling<'b> {
         Ok(Spelling { by_name })
     }
 
+    /// The spelling of no body: only the synthetic heads ([`FIXED`]). For a world that asks
+    /// questions over ground types and resolves no written path (front2/const_project.rs: a
+    /// projection normalized for a constant's layout); any name it is asked is [`Unspelled`].
+    pub fn fixed() -> Spelling<'static> {
+        let mut by_name = HashMap::with_capacity_in(FIXED.len(), Global);
+        for f in FIXED {
+            by_name.insert(Name::of(f), f);
+        }
+        Spelling { by_name }
+    }
+
     pub fn get(&self, n: Name) -> Result<&'b str, Unspelled> {
         self.by_name.get(&n).copied().ok_or(Unspelled(n))
     }

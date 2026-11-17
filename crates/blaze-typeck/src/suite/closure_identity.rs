@@ -233,8 +233,8 @@ fn a_closure_of_a_generic_fn_at_two_instances_is_two_types() {
     assert_eq!(d, Vec::new());
     let (ta, tb) = (c.expr_ty[ga.ix()], c.expr_ty[gb.ix()]);
     assert_ne!(ta, tb, "two instances, two types");
-    let u8_ = c.types.view().nodes.iter().position(|n| *n == PNode::Uint(UintTy::U8)).map(|i| PTy(i as u32));
-    let u16_ = c.types.view().nodes.iter().position(|n| *n == PNode::Uint(UintTy::U16)).map(|i| PTy(i as u32));
+    let u8_ = c.types.view().nodes().position(|n| *n == PNode::Uint(UintTy::U8)).map(|i| PTy(i as u32));
+    let u16_ = c.types.view().nodes().position(|n| *n == PNode::Uint(UintTy::U16)).map(|i| PTy(i as u32));
     assert_eq!(closure_of(&c, ta), Some((it.gen_, 0, u8_.into_iter().collect())));
     assert_eq!(closure_of(&c, tb), Some((it.gen_, 0, u16_.into_iter().collect())));
 }

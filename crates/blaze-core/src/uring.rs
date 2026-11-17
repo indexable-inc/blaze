@@ -2709,48 +2709,14 @@ fn size_of_file(fd: RawFd) -> io::Result<u64> {
     Ok(stat.st_size as u64)
 }
 
-/// Makes a TCP listener's connections, which they inherit it from, send each write at once.
-fn no_delay(listener: &crate::net::Listener) -> io::Result<()> {
-    if listener.is_unix() {
-        return Ok(());
-    }
-    let on: libc::c_int = 1;
-    // SAFETY: an open socket and an int option of the size given.
-    let set = unsafe {
-        libc::setsockopt(
-            listener.fd(),
-            libc::IPPROTO_TCP,
-            libc::TCP_NODELAY,
-            (&raw const on).cast(),
-            size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if set != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// A socket made for a connect, its writes sent at once where it is TCP's, in the driver's
-/// half of the table.
-fn connect_socket(table: &Rc<Table>, domain: libc::c_int) -> io::Result<Fixed> {
+/// A socket made for a connect, the connect's options set on it before it connects
+/// ([`crate::sockopt::for_stream`]), in the driver's half of the table. A listen's are set by
+/// `crate::net::listen` before its bind; the ring accepts straight into its table, and each
+/// connection keeps the listen's options as Linux copies them (sockopt's test
+/// `an_accepted_connection_carries_the_listen_s_options`).
+fn connect_socket(table: &Rc<Table>, domain: libc::c_int, options: &crate::sockopt::Tcp) -> io::Result<Fixed> {
     let fd = crate::net::stream_socket(domain)?;
-    if domain != libc::AF_UNIX {
-        let on: libc::c_int = 1;
-        // SAFETY: an open socket and an int option of the size given.
-        let set = unsafe {
-            libc::setsockopt(
-                fd.as_raw_fd(),
-                libc::IPPROTO_TCP,
-                libc::TCP_NODELAY,
-                (&raw const on).cast(),
-                size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        };
-        if set != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
+    crate::sockopt::for_stream(fd.as_raw_fd(), domain, options, crate::sockopt::Side::Connect)?;
     table.install(fd)
 }
 
@@ -2994,9 +2960,8 @@ impl Driver for Uring {
                 }
                 Effect::Map { file, extent, .. } => self.map(tag, &file, extent).map(|()| None),
                 Effect::Spawn { command, .. } => self.spawn(tag, command).map(|()| None),
-                Effect::Listen { at: address, .. } => crate::net::listen(&self.root, &address)
+                Effect::Listen { at: address, options, .. } => crate::net::listen(&self.root, &address, &options)
                     .and_then(|listener| {
-                        no_delay(&listener)?;
                         let listener = self.listeners.insert(listener);
                         let id = self.start(
                             Hot::new(tag, Kind::Accept, listener.to_bits()),
@@ -3006,9 +2971,9 @@ impl Driver for Uring {
                         self.listens.insert(tag, id);
                         Ok(None)
                     }),
-                Effect::Connect { at: address, .. } => crate::net::sockaddr(&self.root, &address)
+                Effect::Connect { at: address, options, .. } => crate::net::sockaddr(&self.root, &address)
                     .and_then(|address| {
-                        let socket = connect_socket(&self.table, address.domain)?;
+                        let socket = connect_socket(&self.table, address.domain, &options)?;
                         let tcp = address.domain != libc::AF_UNIX;
                         let connecting = self.connectings.insert(Connecting {
                             socket: Some(socket),
@@ -3600,7 +3565,7 @@ mod tests {
             };
             seen.entry(tag).or_default().push(shown);
             if tag == 2 {
-                effects.push(Effect::Connect { at: at.clone(), tag: Tag(3) });
+                effects.push(Effect::Connect { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(3) });
             }
             let (Some(server), Some(client)) = (server, client) else { return };
             assert_ne!(server, client);
@@ -3679,14 +3644,14 @@ mod tests {
         let at = Address::Unix(FileName::new("run/api.sock").unwrap());
         let root = dir("uring-unix");
         let mut ring = Uring::new(&root).unwrap();
-        ring.submit(&mut vec![Effect::Listen { at: at.clone(), tag: Tag(1) }]);
+        ring.submit(&mut vec![Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) }]);
         assert_eq!(ring.in_flight(), 1);
         assert_eq!(ring.local_addr(Tag(1)), None);
         let ours = round_trip(&mut ring, &at);
         assert_eq!(ours, round_tripped());
         assert!(!root.join("run/api.sock").exists());
         let mut threads = Threads::new(dir("uring-unix-threads"), 2);
-        threads.submit(&mut vec![Effect::Listen { at: at.clone(), tag: Tag(1) }]);
+        threads.submit(&mut vec![Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) }]);
         assert_eq!(ours, round_trip(&mut threads, &at));
     }
 
@@ -3694,7 +3659,7 @@ mod tests {
     fn a_tcp_round_trip() {
         let mut ring = Uring::new(dir("uring-tcp")).unwrap();
         let any = Address::Tcp("127.0.0.1:0".parse().unwrap());
-        ring.submit(&mut vec![Effect::Listen { at: any, tag: Tag(1) }]);
+        ring.submit(&mut vec![Effect::Listen { at: any, options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) }]);
         assert_eq!(ring.in_flight(), 1);
         let at = ring.local_addr(Tag(1)).expect("listening");
         assert_ne!(at.port(), 0);
@@ -3704,7 +3669,7 @@ mod tests {
         // test or process may bind before the connect (it failed 2 runs in 24 that way, told
         // `[Connected { .. }]`).
         let (refusing, _held) = held_refusing_port();
-        let mut effects = vec![Effect::Connect { at: Address::Tcp(refusing), tag: Tag(1) }];
+        let mut effects = vec![Effect::Connect { at: Address::Tcp(refusing), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) }];
         let mut seen = Vec::new();
         run_until_idle(&mut ring, &mut effects, |done, _| seen.push(done.done))
         .expect("the effects end");
@@ -3835,8 +3800,8 @@ mod tests {
         let at = Address::Unix(FileName::new("api.sock").unwrap());
         ring.submit(&mut vec![
             Effect::Spawn { command: sh("exec sleep 60", b""), tag: Tag(1) },
-            Effect::Listen { at: at.clone(), tag: Tag(2) },
-            Effect::Connect { at, tag: Tag(3) },
+            Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(2) },
+            Effect::Connect { at, options: crate::sockopt::Tcp::DEFAULT, tag: Tag(3) },
             Effect::Timer { after: Duration::from_secs(60), tag: Tag(4) },
         ]);
         let mut out = Vec::new();
@@ -4086,8 +4051,8 @@ mod tests {
         let message = |n: usize| -> Vec<u8> { (0..4096).map(|at| (at + n) as u8).collect() };
         let messages = 4 * RECV_BUFFERS as usize * RECV_BUFFER / 4096;
         let mut effects = vec![
-            Effect::Listen { at: at.clone(), tag: Tag(1) },
-            Effect::Connect { at, tag: Tag(2) },
+            Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) },
+            Effect::Connect { at, options: crate::sockopt::Tcp::DEFAULT, tag: Tag(2) },
         ];
         let (mut server, mut client) = (None, None);
         let (mut sent, mut got) = (0, Vec::new());
@@ -5004,8 +4969,8 @@ mod tests {
         let mut ring = Uring::new(&root).unwrap();
         let at = Address::Unix(FileName::new("s.sock").unwrap());
         ring.submit(&mut vec![
-            Effect::Listen { at: at.clone(), tag: Tag(1) },
-            Effect::Connect { at, tag: Tag(2) },
+            Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) },
+            Effect::Connect { at, options: crate::sockopt::Tcp::DEFAULT, tag: Tag(2) },
         ]);
         let (mut server, mut client) = (None, None);
         let mut out = Vec::with_capacity(16);
@@ -5525,8 +5490,8 @@ mod tests {
         let mut ring = Uring::new(&root).unwrap();
         let at = Address::Unix(FileName::new("s.sock").unwrap());
         ring.submit(&mut vec![
-            Effect::Listen { at: at.clone(), tag: Tag(1) },
-            Effect::Connect { at, tag: Tag(2) },
+            Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) },
+            Effect::Connect { at, options: crate::sockopt::Tcp::DEFAULT, tag: Tag(2) },
         ]);
         let mut out = Vec::new();
         poll_until(&mut ring, &mut out, |out| out.len() == 2);
@@ -5605,8 +5570,8 @@ mod tests {
         assert_eq!((ring.provided.unpublished(), ring.provided.shown()), (0, RECV_BUFFERS));
         let at = Address::Unix(FileName::new("s.sock").unwrap());
         ring.submit(&mut vec![
-            Effect::Listen { at: at.clone(), tag: Tag(1) },
-            Effect::Connect { at, tag: Tag(2) },
+            Effect::Listen { at: at.clone(), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(1) },
+            Effect::Connect { at, options: crate::sockopt::Tcp::DEFAULT, tag: Tag(2) },
         ]);
         let mut out = Vec::new();
         poll_until(&mut ring, &mut out, |out| out.len() == 2);
@@ -5670,10 +5635,11 @@ mod tests {
         let mut ring = Uring::new(dir("uring-zero-copy")).unwrap();
         ring.submit(&mut vec![Effect::Listen {
             at: Address::Tcp("127.0.0.1:0".parse().unwrap()),
+            options: crate::sockopt::Tcp::DEFAULT,
             tag: Tag(1),
         }]);
         let at = ring.local_addr(Tag(1)).expect("listening");
-        ring.submit(&mut vec![Effect::Connect { at: Address::Tcp(at), tag: Tag(2) }]);
+        ring.submit(&mut vec![Effect::Connect { at: Address::Tcp(at), options: crate::sockopt::Tcp::DEFAULT, tag: Tag(2) }]);
         let mut out = Vec::new();
         poll_until(&mut ring, &mut out, |out| out.len() == 2);
         let conn = |it: &Done| match it {

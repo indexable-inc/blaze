@@ -41,8 +41,9 @@ pub enum Malformed {
     List { column: &'static str, start: u32, len: u32 },
     /// A portable type whose child is not before it.
     TypeOrder { node: u32, child: u32 },
-    /// A generic parameter index past the arguments it is instantiated with.
-    Param { index: u32, args: u32 },
+    /// A generic parameter index past the arguments it is instantiated with; `site` says which
+    /// list was short and who gave it (rules 3 and 19: the refusal names where it came from).
+    Param { index: u32, args: u32, site: ParamSite },
     /// An expression of the body that no list or parent holds, so the walk never reached it:
     /// the lowering made a node it did not place (a `format_args!` template once lowered as a
     /// literal and then only read, 2026-11-16). A clean body types every node it holds.
@@ -76,6 +77,10 @@ pub enum Malformed {
     /// `ExTrait`s (the Reference, "Trait object types": "not more than one non-auto trait"):
     /// `node` is the offending one.
     ObjectPreds { node: u32 },
+    /// A body's table (an overlay, `PortableTys::over`) made over a table that is itself an
+    /// overlay, or its kept types (`OwnTys::view`) read over a base with fewer than the `base`
+    /// nodes or list entries it was made over (`have`): its ids would name other types.
+    Overlay { base: u32, have: u32 },
 }
 
 /// The driver's own failure.
@@ -149,6 +154,23 @@ impl From<blaze_solve::SolveError> for CheckError {
     fn from(e: blaze_solve::SolveError) -> CheckError {
         CheckError::Solve(e)
     }
+}
+
+/// Where a `Malformed::Param` was refused: the argument list that was short, and who gave it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParamSite {
+    /// A portable type lowered with `Lower::Args` (`Machine::lower`): `at` is the call of
+    /// `Machine::lower` that gave the list (the innermost one; `None` only between the refusal
+    /// in `lower_node` and `lower` filling it in, never in a returned error).
+    Lower { at: Option<&'static core::panic::Location<'static>> },
+    /// An associated type's item bound `X: of<..>` whose argument list was short for `of`'s
+    /// supertrait clause naming `super_` (the clause's trait, or a `where const` clause's
+    /// condition): `infer/facts/item_bounds.rs` `elaborate_item_bounds`.
+    Supertrait { of: ItemKey, super_: ItemKey },
+    /// A const parameter of `owner` whose type `Question::ConstParams(owner)` does not hold.
+    ConstParamType { owner: ItemKey },
+    /// A fn `item` whose signature declares more written generics than it has own ones.
+    ExplicitArgs { item: ItemKey },
 }
 
 /// Why a rule stopped the walk: a fact the world lacks (the run ends with `Outcome::Need`), or

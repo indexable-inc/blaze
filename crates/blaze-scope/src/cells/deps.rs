@@ -57,6 +57,9 @@ pub(crate) trait EnumNames<N> {
 pub(crate) struct BuiltDeps<'q, 'r, 'a> {
     pub(crate) built: &'q crate::resolve::Built<'r, 'a>,
     pub(crate) alloc: Alloc<'q>,
+    /// The cell core writes the crate (the switch): its reads are the crate's read list. The
+    /// seam's shadow run asks nothing, so the old core's read list stays its own.
+    pub(crate) asks: bool,
 }
 
 impl<'a> DepNames<&'a str> for BuiltDeps<'_, '_, 'a> {
@@ -66,7 +69,12 @@ impl<'a> DepNames<&'a str> for BuiltDeps<'_, '_, 'a> {
 
     fn crate_root(&self, krate: CrateItemKey) -> Option<ItemKey> {
         let at = *self.built.by_prefix.get(&krate.prefix())?;
-        self.built.crates.get(at).copied().flatten().filter(|d| d.key() == krate).map(|d| d.root())
+        let dep = self.built.crates.get(at).copied().flatten().filter(|d| d.key() == krate)?;
+        // A question of the crate's read list (crate::asked): the crate `$crate` names.
+        if self.asks {
+            self.built.ask(|| crate::asked::Question::krate(dep, self.alloc));
+        }
+        Some(dep.root())
     }
 
     fn has_enum(&self, key: ItemKey) -> bool {
@@ -74,13 +82,36 @@ impl<'a> DepNames<&'a str> for BuiltDeps<'_, '_, 'a> {
     }
 
     fn name_in(&self, module: ItemKey, ns: Namespace, name: &'a str) -> DepAnswer {
-        match self.built.lookup(module, ns, name, self.alloc) {
+        let found = self.built.lookup(module, ns, name, self.alloc);
+        // Every read of another crate is a question of this crate's read list (crate::asked):
+        // the name's whole answer there (its own binding or its globs'), as `Kind::Lookup`.
+        #[cfg(test)]
+        let noted = !forgets(found);
+        #[cfg(not(test))]
+        let noted = true;
+        if noted && self.asks {
+            self.built.ask(|| crate::asked::Question::lookup(module, ns, name, found, self.alloc));
+        }
+        match found {
             None => DepAnswer::NotFound,
             Some(b) => match b.state {
                 BindingState::Determined => DepAnswer::Found(b.def, b.vis),
                 BindingState::Ambiguous(_) => DepAnswer::Ambiguous(b.def, b.vis),
             },
         }
+    }
+}
+
+/// The read list's planted bugs (tests/asked.rs, `crate::asked::plant`) as the cell core asks:
+/// one question per name read, its whole answer. `ForgetGlobs` forgets an answer a glob brought.
+#[cfg(test)]
+fn forgets(found: Option<crate::Binding>) -> bool {
+    use crate::asked::plant::{PLANT, Plant};
+    match (PLANT.with(core::cell::Cell::get), found) {
+        (Plant::ForgetFound, Some(_)) => true,
+        (Plant::ForgetFailed, None) => true,
+        (Plant::ForgetGlobs, Some(b)) => b.origin == crate::Origin::Glob,
+        _ => false,
     }
 }
 

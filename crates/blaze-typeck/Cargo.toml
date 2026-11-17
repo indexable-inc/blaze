@@ -38,8 +38,8 @@ testing = ["blaze-own/std"]
 blaze-typeck = { path = ".", features = ["testing"] }
 # `check`, `control`: the properties of typeck.md, "Proof".
 blaze-sim.workspace = true
-# `Alloc::global()`: the tests' handle.
-blaze-own = { workspace = true, features = ["std"] }
+# `Alloc::global()`: the tests' handle; `testing::Counting`: the overlay's cost test.
+blaze-own = { workspace = true, features = ["std", "testing"] }
 # The solver's case files and runner (`testing::run`), run over `Terms` by `suite`.
 blaze-solve = { path = "../blaze-solve", features = ["testing"] }
 

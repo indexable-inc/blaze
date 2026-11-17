@@ -11,8 +11,8 @@
 //! The `UnitGraph` job names one `MacroModule` part per proc-macro unit ([`parts`]); its
 //! source is the graph's source with the crate's name and version, so a lock or member edit
 //! asks again and nothing else does. Present: a record whose out is the module's wasm digest.
-//! Absent: one finding naming the crate and the bootstrap command, no record, so the next
-//! command asks again once the store is filled.
+//! Absent: one filed failure naming the crate and the bootstrap command; the store's listing is
+//! in the part's key ([`MODULE_LISTING`]), so the next command asks again once the store moves.
 
 use std::alloc::Global;
 
@@ -34,6 +34,13 @@ const SOURCE_DOMAIN: &str = "blaze-cli macro crate source 1";
 const OUT_DOMAIN: &str = "blaze-cli macro module out 1";
 /// The rule a refusal of this task names.
 const RULE: &str = "macros.rs";
+/// The module store's folder under blaze's folder in the home (`<home>/.blaze`): its listing
+/// (one folder a module, named by the module's key, renamed into place whole by the bootstrap
+/// tool) is a `HomeListing` row of the leaf table, read with the layout (main.rs). It is in the
+/// units' source, so in the dependency graph's source and in each `MacroModule` part's: a part's
+/// key covers which modules exist, and a module the store lacks is a filed failure, asked again
+/// when the listing moves and never before.
+pub(crate) const MODULE_LISTING: &str = "v2/proc-macro/modules";
 
 /// The macro crates of this command's graph, each with its module identity or why it has
 /// none: made once a command, at the first `MacroModule` task that runs.
@@ -123,7 +130,7 @@ pub(crate) fn run<'b>(
     let name = task.name;
     let refused = |what: &'static str| TaskFailure { name, why: Why::Refused { what, rule: RULE } };
     let Some(home) = home else {
-        return Ok(Did::FailedSaying(refused("no home: the module store is under it"), "the proc-macro module store is under the home, and HOME is not set"));
+        return Ok(Did::Hole(refused("no home: the module store is under it"), "the proc-macro module store is under the home, and HOME is not set"));
     };
     let modules = std::path::Path::new(home).join(".blaze/v2");
     if crates.is_none() {
@@ -141,7 +148,7 @@ pub(crate) fn run<'b>(
             Ok(listed) => *crates = Some(listed),
             Err(error) => {
                 let words = bstd::mem::format_in!(held, "the proc-macro crates of the graph could not be listed: {error}");
-                return Ok(Did::FailedSaying(refused("the macro crates could not be listed"), held_str(words.as_str(), held)));
+                return Ok(Did::Hole(refused("the macro crates could not be listed"), held_str(words.as_str(), held)));
             }
         }
     }
@@ -173,11 +180,13 @@ pub(crate) fn run<'b>(
                 modules.join("proc-macro/modules").display(),
                 modules.display(),
             );
+            // Filed: the store's listing is in this part's key ([`MODULE_LISTING`]), so the
+            // failure stands until a module comes or goes.
             Ok(Did::FailedSaying(refused("a proc-macro module the store lacks"), held_str(words.as_str(), held)))
         }
         Err(error) => {
             let words = bstd::mem::format_in!(held, "the proc-macro module store: {error}");
-            Ok(Did::FailedSaying(refused("the module store could not be read"), held_str(words.as_str(), held)))
+            Ok(Did::Hole(refused("the module store could not be read"), held_str(words.as_str(), held)))
         }
     }
 }

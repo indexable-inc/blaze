@@ -90,3 +90,59 @@ fn a_call_that_may_unwind_drops_both_locals_in_reverse_order() {
     assert!(!abort.contains("invoke") && !abort.contains(" cleanup:"), "no landing block under abort:\n{abort}");
     println!("cleanup: f() lands in a cleanup dropping slots {dropped:?}, then resumes; none under abort");
 }
+
+/// `fn main(i: usize) -> u32 { let g = G { x: 1 }; let a = [7u32, 8, 9]; a[i] }` under
+/// `Unwind`: the bounds check's `panic_bounds_check` may unwind (core's `panic_bounds_check`
+/// panics, and a panic unwinds past `g`), so it is an `invoke` whose cleanup drops `g` (one
+/// call) and resumes. A bounds check called with a plain `call` (no landing block: `g` never
+/// dropped on that path) fails. Prints "bounds: the out-of-range call lands in a cleanup with
+/// 1 drop, then resumes".
+#[test]
+fn an_index_out_of_range_drops_the_live_values_when_it_unwinds() {
+    let mut w = TestWorld::new();
+    w.panic = crate::Panic::Unwind;
+    w.func(1, "main", &[USIZE], U32);
+    g_world(&mut w);
+    w.bounds_fn();
+    let mut b = BodyBuf::new();
+    let i = b.bind("i");
+    b.params.push(i);
+    let g = b.bind("g");
+    let g1 = g_lit(&mut b, 1);
+    let a = b.bind("a");
+    let e7 = b.int(7, SU32);
+    let e8 = b.int(8, None);
+    let e9 = b.int(9, None);
+    let arr = b.array(&[e7, e8, e9]);
+    let a_e = b.local(a);
+    let i_e = b.local(i);
+    let ai = b.index(a_e, i_e);
+    let stmts = [Stmt::Let { pat: g, ty: None, init: Some(g1), else_: None }, Stmt::Let { pat: a, ty: None, init: Some(arr), else_: None }];
+    let root = b.block(&stmts, Some(ai));
+    let view = b.view(MAIN, root);
+    let mut cx = InferCtx::new_in(Alloc::global());
+    let checked = match blaze_typeck::check(&view, &w, &mut cx, &Needs::new_in(Alloc::global()), Alloc::global()) {
+        Ok(Outcome::Done(c)) => c,
+        other => panic!("the check did not finish: {:?}", other.err()),
+    };
+    assert!(checked.diags.is_empty(), "diagnostics: {:?}", checked.diags);
+    let sig = w.sig(MAIN).expect("a signature");
+    let mut ground = PortableTys::new_in(Alloc::global());
+    let mut subst = Subst { args: &[], ground: &mut ground, scratch: Alloc::global() };
+    let built = crate::build(&view, &checked, &sig, &mut subst, &TestAdts { world: &w, body: &b }, Global)
+        .unwrap_or_else(|e| panic!("the build failed: {e}"));
+    blaze_lir::verify(built.func.view()).unwrap_or_else(|e| panic!("does not verify: {e}"));
+    let text = blaze_lir::print(built.func.view());
+    assert_eq!(text.lines().filter(|l| l.contains("invoke")).count(), 1, "one invoke, for panic_bounds_check:\n{text}");
+    let mut lines = text.lines().skip_while(|l| !l.ends_with(" cleanup:"));
+    assert!(lines.next().is_some(), "no cleanup block:\n{text}");
+    let body: Vec<&str, Global> = {
+        let mut v = Vec::new_in(Global);
+        v.extend(lines.take_while(|l| l.starts_with("  ")));
+        v
+    };
+    let drops = body.iter().filter(|l| l.contains("call")).count();
+    assert_eq!(drops, 1, "the cleanup drops `g`:\n{text}");
+    assert!(body.last().is_some_and(|l| l.contains("resume")), "the cleanup ends in resume:\n{text}");
+    println!("bounds: the out-of-range call lands in a cleanup with {drops} drop, then resumes");
+}

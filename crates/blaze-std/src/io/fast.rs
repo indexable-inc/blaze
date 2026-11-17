@@ -66,6 +66,8 @@ pub(super) struct Seen {
     pub(super) copies: AtomicU64,
     /// Every effect made inline.
     pub(super) inline: AtomicU64,
+    /// Every effect handed to the driver's queue (`Io::hand_over`), both routes.
+    pub(super) handoffs: AtomicU64,
     /// The test-only switch: every effect of a native world through its queue, as before
     /// piece 7, so the two routes can be compared on one machine.
     pub(super) queued_only: AtomicBool,
@@ -172,6 +174,8 @@ impl Io {
     /// second half of [`Io::submit`] (the simulated disk's ledger, the driver, and the power
     /// cut a `bstd::test` arms).
     pub(super) fn hand_over(&self, mut world: LockGuard<'_, World>, effect: Effect) {
+        #[cfg(test)]
+        self.counted(|seen| &seen.handoffs);
         let World { driver, effects, disk, .. } = &mut *world;
         // A machine whose power `bstd::test` cut takes nothing: its ledger is told nothing.
         if let (Some(disk), Some(_)) = (disk.as_deref_mut(), driver.sim().filter(|sim| !sim.is_off())) {

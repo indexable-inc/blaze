@@ -19,9 +19,14 @@
 //! (`ROOT NOT CHECKED: ..`: walked on from its calls by name). The world's own gaps (a
 //! dependency without records, a proc-macro crate without a module, a build script without
 //! exported outputs) are outside the walk: the world's maker names them (walk_member.rs). The
-//! world reaches the walk whole: proc-macro expansions and build-script outputs are in the
-//! names already (resolved with them), so the walk takes no argument for either; `prepared` is
-//! the declarative macros' prepared definitions a lowering asks for ([`Prepares`]).
+//! world reaches the walk whole: the items' proc-macro expansions and build-script outputs are
+//! in the names already (resolved with them); a BODY's macro calls expand through
+//! [`World::body_sources`]; `prepared` is the declarative macros' prepared definitions a
+//! lowering asks for ([`Prepares`]).
+//!
+//! The builds survey's program ([`Front2Program::make_from`]) is made with no body sources
+//! yet (program.rs is not this file's): in a real world a body with a proc-macro call does not
+//! lower there; the `BUILDS:` line (or `BUILDS: no survey: ..`) says what that cost.
 //!
 //! The lines are the test's own format strings, moved: one phrase of `REACHABLE:`, the test's
 //! `his main`, is the caller's [`Ask::label`], and the test passes exactly `his main`.
@@ -46,6 +51,23 @@ pub struct World<'w, 'n> {
     pub sources: &'w [SourceFile<'w>],
     /// By crate index, the crate's name: how a fn is named in the class lists ([`Shown`]).
     pub crate_names: &'w [&'w str],
+    /// The texts, environment and proc-macro runner a body's macro calls expand with (the
+    /// store's `sources`: what the world's names were expanded with); `None` for a world with
+    /// no proc macros and no `include!` (the hello world's).
+    pub body_sources: Option<&'n dyn crate::front2::body_host::BodySources>,
+    pub receivers: Receivers,
+}
+
+/// Whether the walk's store looks up the pointer types a method's receiver is reached through
+/// (`Box`, `Rc`, `Arc`, `Pin`: receiver.rs `Pointers::find`), as the census and the survey's
+/// program do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Receivers {
+    /// Looked up in the world's index.
+    Found,
+    /// Not looked up: the hello world's walk as measured since list-A (its numbers are the
+    /// measurer's series; a change to it is a change of that series, made on purpose).
+    NotLookedUp,
 }
 
 /// What the walk reads of a root that checked.
@@ -224,6 +246,10 @@ pub fn walk<'n>(world: &World<'_, 'n>, ask: &Ask<'_>, hooks: &mut dyn WalkHooks<
     let prepared = world.prepared;
     let mut front = Front2::new(names, world.frame, world.sources).map_err(WalkError::Front)?;
     let mut store = Store::new(front.index.lang("sized"), front.frame);
+    if world.receivers == Receivers::Found {
+        store.pointers = crate::front2::receiver::Pointers::find(&front.index, front.resolver);
+    }
+    store.sources = world.body_sources;
     let mut buckets = None;
     let mut roots: AVec<'_, LibKey> = AVec::with_capacity_in(ask.roots.len(), alloc);
     for &root in ask.roots {
@@ -385,7 +411,9 @@ pub fn walk<'n>(world: &World<'_, 'n>, ask: &Ask<'_>, hooks: &mut dyn WalkHooks<
         Err(e) => write!(out, "BUILDS: no survey: {e}\n")?,
         Ok(mut program) => {
             let mut refused = Default::default();
-            match crate::run::build_survey(&mut program, &mut refused) {
+            // The survey builds as `blaze run` and `blaze test` do: the dev profile's overflow
+            // checks (D101), which also makes it name a missing `panic_const_*` lang fn.
+            match crate::run::build_survey(&mut program, &mut refused, blaze_build::OverflowChecks::On) {
                 Err(e) => write!(out, "BUILDS: the survey stopped: {e}\n")?,
                 Ok(survey) => {
                     write!(

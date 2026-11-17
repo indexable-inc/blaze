@@ -779,7 +779,7 @@ fn step_impl<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, stage
         if h.polarity != ImplPolarity::Positive || h.trait_ != trait_ {
             return Ok(Step::No);
         }
-        let iargs = cx.fresh_impl_args(&h)?;
+        let iargs = cx.fresh_impl_args_of(cand.d, &h)?;
         let itr = cx.import_list(h.portable, h.args, iargs)?;
         let gargs = args_with_self(cx, args, cand.a)?;
         let gtr = prefix(cx, gargs, tgen)?;

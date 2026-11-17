@@ -33,3 +33,7 @@ mod tests;
 
 pub use clock::MAX_THREADS;
 pub use explore::{Builder, model};
+pub use explore::search::{
+    Found, PriorityBudget, Refused, Runs, SCHEDULE_LINE, SCHEDULE_VERSION, Searched, Strategy,
+    priority_runs,
+};

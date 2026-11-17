@@ -9,18 +9,29 @@
 //! min/max, saturating and overflow operations, `project` of an overflow pair, `icmp`,
 //! `select`, the conversions and `freeze`; stack slots with `slot_addr`, `ptr_add`, `load`,
 //! `store`, `slot_live` and `slot_dead`; and `jump`, `br`, `switch`, `return`, `trap` and
-//! `unreachable`. Anything else (a call, a float, a vector, an instruction with flags, a memory
+//! `unreachable`; of the flags, `ptr_add inbounds`, its promise checked (eval/promises.rs).
+//! Anything else (a call, a float, a vector, an instruction with other flags, a memory
 //! promise) is refused with [`EvalError::Unsupported`], never guessed. Undefined behaviour is
 //! an outcome ([`Outcome::Undefined`]): a comparison of two backends says nothing of a case
 //! with one. Fuel bounds every run.
 
 use std::alloc::Allocator;
 
+pub use crate::arith::Trap;
 use crate::{
-    Block, Flags, IntCond, Op, Value, View,
+    Block, Flags, Op, Value, View,
+    arith::{binary, compare, convert, iconst_value, overflow, sext, unary, wide_value},
     func::SlotId,
     op::Target,
 };
+
+mod calls;
+pub use calls::{Bodies, BodyId, run_calls_in};
+#[cfg(test)]
+mod calls_tests;
+mod promises;
+#[cfg(test)]
+mod promises_tests;
 
 /// A value as the evaluator holds it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -31,17 +42,6 @@ pub enum Val {
     Ptr { slot: u32, offset: i128 },
     /// An overflow operation's `{T, i1}`.
     Pair(u128, bool),
-}
-
-/// Why a run stopped by a trap.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Trap {
-    /// `trap` with its code.
-    Code(u32),
-    /// A division or remainder by zero.
-    DivByZero,
-    /// `sdiv` of the type's minimum by -1.
-    DivOverflow,
 }
 
 /// How a run ended.
@@ -78,6 +78,8 @@ pub enum EvalError {
     Args { want: usize, given: usize },
     /// A value read before anything set it: a function the verifier would refuse.
     Unset { inst: usize, value: Value },
+    /// Call instruction `inst` would open more frames than a run holds (`calls::MAX_DEPTH`).
+    Depth { inst: usize },
 }
 
 impl std::fmt::Display for EvalError {
@@ -92,172 +94,14 @@ impl std::fmt::Display for EvalError {
             EvalError::Unset { inst, value } => {
                 write!(f, "instruction {inst} reads {value}, which nothing set: an unverified function")
             }
+            EvalError::Depth { inst } => {
+                write!(f, "instruction {inst} calls past the evaluator's bound of {} frames", calls::MAX_DEPTH)
+            }
         }
     }
 }
 
 impl std::error::Error for EvalError {}
-
-const fn mask(width: u32) -> u128 {
-    match width {
-        128.. => u128::MAX,
-        width => (1u128 << width) - 1,
-    }
-}
-
-const fn sext(value: u128, width: u32) -> i128 {
-    let shift = 128 - width;
-    ((value << shift) as i128) >> shift
-}
-
-const fn smin(width: u32) -> i128 {
-    match width {
-        128.. => i128::MIN,
-        width => -(1i128 << (width - 1)),
-    }
-}
-
-const fn smax(width: u32) -> i128 {
-    match width {
-        128.. => i128::MAX,
-        width => (1i128 << (width - 1)) - 1,
-    }
-}
-
-/// The 256-bit product of `a` and `b`: its high and low halves.
-const fn wide_mul(a: u128, b: u128) -> (u128, u128) {
-    let (a1, a0) = (a >> 64, a & (u64::MAX as u128));
-    let (b1, b0) = (b >> 64, b & (u64::MAX as u128));
-    let (p00, p01, p10, p11) = (a0 * b0, a0 * b1, a1 * b0, a1 * b1);
-    let mid = (p00 >> 64) + (p01 & (u64::MAX as u128)) + (p10 & (u64::MAX as u128));
-    let low = (p00 & (u64::MAX as u128)) | (mid << 64);
-    let high = p11 + (p01 >> 64) + (p10 >> 64) + (mid >> 64);
-    (high, low)
-}
-
-/// The high half of the `2 * width`-bit product.
-fn mulhi(a: u128, b: u128, width: u32, signed: bool) -> u128 {
-    if width < 128 {
-        let product = match signed {
-            true => (sext(a, width) * sext(b, width) >> width) as u128,
-            false => (a * b) >> width,
-        };
-        return product & mask(width);
-    }
-    let (high, _) = wide_mul(a, b);
-    match signed {
-        // The signed high half from the unsigned: less `b` where `a` is negative, and `a`
-        // where `b` is.
-        true => {
-            let high = if (a as i128) < 0 { high.wrapping_sub(b) } else { high };
-            if (b as i128) < 0 { high.wrapping_sub(a) } else { high }
-        }
-        false => high,
-    }
-}
-
-/// A two-operand integer operation of `width` bits; `Err` for a trap.
-fn binary(op: Op, a: u128, b: u128, width: u32) -> Result<u128, Trap> {
-    let m = mask(width);
-    let (sa, sb) = (sext(a, width), sext(b, width));
-    let clamp = |value: i128| value.clamp(smin(width), smax(width)) as u128 & m;
-    let amount = (b % u128::from(width)) as u32;
-    Ok(match op {
-        Op::Add => a.wrapping_add(b) & m,
-        Op::Sub => a.wrapping_sub(b) & m,
-        Op::Mul => a.wrapping_mul(b) & m,
-        Op::Udiv | Op::Urem | Op::Sdiv | Op::Srem if b == 0 => return Err(Trap::DivByZero),
-        Op::Udiv => a / b,
-        Op::Urem => a % b,
-        Op::Sdiv if sa == smin(width) && sb == -1 => return Err(Trap::DivOverflow),
-        Op::Sdiv => sa.wrapping_div(sb) as u128 & m,
-        // `MIN % -1` is 0, as Cranelift's `srem` gives.
-        Op::Srem => sa.wrapping_rem(sb) as u128 & m,
-        Op::And => a & b,
-        Op::Or => a | b,
-        Op::Xor => a ^ b,
-        Op::Shl => (a << amount) & m,
-        Op::Lshr => a >> amount,
-        Op::Ashr => (sa >> amount) as u128 & m,
-        Op::Rotl | Op::Rotr if amount == 0 => a,
-        Op::Rotl => ((a << amount) | (a >> (width - amount))) & m,
-        Op::Rotr => ((a >> amount) | (a << (width - amount))) & m,
-        Op::Umulhi => mulhi(a, b, width, false),
-        Op::Smulhi => mulhi(a, b, width, true),
-        Op::Umin => a.min(b),
-        Op::Umax => a.max(b),
-        Op::Smin => sa.min(sb) as u128 & m,
-        Op::Smax => sa.max(sb) as u128 & m,
-        Op::UaddSat => match a.checked_add(b) {
-            Some(sum) if sum <= m => sum,
-            _ => m,
-        },
-        Op::UsubSat => a.saturating_sub(b),
-        Op::SaddSat if width == 128 => sa.saturating_add(sb) as u128,
-        Op::SsubSat if width == 128 => sa.saturating_sub(sb) as u128,
-        Op::SaddSat => clamp(sa + sb),
-        Op::SsubSat => clamp(sa - sb),
-        _ => unreachable!("`binary` is called for the operations above"),
-    })
-}
-
-/// An overflow operation's value and whether it overflowed.
-fn overflow(op: Op, a: u128, b: u128, width: u32) -> (u128, bool) {
-    let m = mask(width);
-    let (sa, sb) = (sext(a, width), sext(b, width));
-    let signed = |exact: Option<i128>| match exact {
-        Some(it) => it < smin(width) || it > smax(width),
-        None => true,
-    };
-    match op {
-        Op::UaddOverflow => {
-            let (sum, carry) = a.overflowing_add(b);
-            (sum & m, carry || sum > m)
-        }
-        Op::UsubOverflow => (a.wrapping_sub(b) & m, a < b),
-        Op::UmulOverflow => match a.checked_mul(b) {
-            Some(product) => (product & m, product > m),
-            None => (a.wrapping_mul(b) & m, true),
-        },
-        Op::SaddOverflow => (a.wrapping_add(b) & m, signed(sa.checked_add(sb))),
-        Op::SsubOverflow => (a.wrapping_sub(b) & m, signed(sa.checked_sub(sb))),
-        Op::SmulOverflow => (a.wrapping_mul(b) & m, signed(sa.checked_mul(sb))),
-        _ => unreachable!("`overflow` is called for the overflow operations"),
-    }
-}
-
-fn unary(op: Op, a: u128, width: u32) -> u128 {
-    let m = mask(width);
-    let spare = 128 - width;
-    match op {
-        Op::Neg => a.wrapping_neg() & m,
-        Op::Not => !a & m,
-        Op::Clz => u128::from(a.leading_zeros() - spare),
-        Op::Ctz if a == 0 => u128::from(width),
-        Op::Ctz => u128::from(a.trailing_zeros()),
-        Op::Popcnt => u128::from(a.count_ones()),
-        Op::Bswap if width < 16 => a,
-        Op::Bswap => a.swap_bytes() >> spare,
-        Op::Bitrev => a.reverse_bits() >> spare,
-        _ => unreachable!("`unary` is called for the operations above"),
-    }
-}
-
-fn compare(cond: IntCond, a: u128, b: u128, width: u32) -> bool {
-    let (sa, sb) = (sext(a, width), sext(b, width));
-    match cond {
-        IntCond::Eq => a == b,
-        IntCond::Ne => a != b,
-        IntCond::Ult => a < b,
-        IntCond::Ule => a <= b,
-        IntCond::Ugt => a > b,
-        IntCond::Uge => a >= b,
-        IntCond::Slt => sa < sb,
-        IntCond::Sle => sa <= sb,
-        IntCond::Sgt => sa > sb,
-        IntCond::Sge => sa >= sb,
-    }
-}
 
 /// The stack slots of a run: their bytes, which are initialized, and which slots are live.
 struct Memory<A: Allocator> {
@@ -267,46 +111,31 @@ struct Memory<A: Allocator> {
     live: Vec<bool, A>,
 }
 
-/// One run of a function.
+/// One run of a function and the functions it calls: the running body's view, values and
+/// slots, and the callers waiting on a call.
 struct Run<'a, A: Allocator + Clone> {
     view: View<'a>,
     values: Vec<Option<Val>, A>,
     memory: Memory<A>,
     alloc: A,
+    /// The running body, as `bodies` names it.
+    body: BodyId,
+    /// The callers waiting on a call, the innermost last: fewer than `calls::MAX_DEPTH`.
+    frames: Vec<calls::Frame<'a, A>, A>,
+    /// What a direct `call` runs.
+    bodies: &'a dyn Bodies,
 }
 
 /// Runs `view` from its entry block with `args` for its parameters, at most `fuel`
-/// instructions, every buffer in `alloc`. `view` must be verified (`crate::verify`).
+/// instructions, every buffer in `alloc`. `view` must be verified (`crate::verify`). It
+/// follows no call: [`run_calls_in`] with bodies that give none.
 pub fn run_in<A: Allocator + Clone>(
     view: View<'_>,
     args: &[Val],
     fuel: u64,
     alloc: A,
 ) -> Result<Outcome<A>, EvalError> {
-    let mut starts = Vec::with_capacity_in(view.slots.len(), alloc.clone());
-    let mut size = 0;
-    for slot in view.slots {
-        starts.push(size);
-        size += slot.size as usize;
-    }
-    let mut bytes = Vec::with_capacity_in(size, alloc.clone());
-    bytes.resize(size, 0);
-    let mut init = Vec::with_capacity_in(size, alloc.clone());
-    init.resize(size, false);
-    let mut live = Vec::with_capacity_in(view.slots.len(), alloc.clone());
-    live.resize(view.slots.len(), true);
-    let mut values = Vec::with_capacity_in(view.len(), alloc.clone());
-    values.resize(view.len(), None);
-    let memory = Memory { starts, bytes, init, live };
-    let mut run = Run { view, values, memory, alloc };
-    let entry = view.params(Block(0));
-    if entry.len() != args.len() {
-        return Err(EvalError::Args { want: entry.len(), given: args.len() });
-    }
-    for (inst, &arg) in entry.zip(args) {
-        run.values[inst] = Some(arg);
-    }
-    run.go(Block(0), fuel)
+    run_calls_in(view, BodyId([0; 32]), args, fuel, &calls::NoBodies, alloc)
 }
 
 /// Where a block's terminator sends the run.
@@ -345,31 +174,39 @@ impl<A: Allocator + Clone> Run<'_, A> {
         }
     }
 
-    fn go(&mut self, mut block: Block, mut fuel: u64) -> Result<Outcome<A>, EvalError> {
+    /// Runs from `block` of the running body until the root returns or the run ends. One
+    /// cursor, `inst`, moves through the running body: a direct `call` moves it into the
+    /// callee (its caller waits in `frames`), a callee's `return` back after the call.
+    fn go(&mut self, block: Block, mut fuel: u64) -> Result<Outcome<A>, EvalError> {
+        let mut inst = self.view.params(block).end;
         loop {
-            let body = self.view.params(block).end..self.view.block(block).end;
-            for inst in body {
-                let Some(left) = fuel.checked_sub(1) else { return Ok(Outcome::OutOfFuel) };
-                fuel = left;
-                let op = self.view.op(inst);
-                if self.view.flags(inst) != Flags::NONE {
-                    return Err(EvalError::Unsupported { inst, op, what: "an instruction with flags" });
-                }
-                if op.is_terminator() {
-                    match self.end(inst, op)? {
-                        Next::To(next) => {
-                            block = next;
-                            break;
-                        }
-                        Next::Done(outcome) => return Ok(outcome),
-                    }
-                }
-                match self.step(inst, op)? {
-                    Ok(Some(value)) => self.values[inst] = Some(value),
-                    Ok(None) => {}
-                    Err(outcome) => return Ok(outcome),
-                }
+            let Some(left) = fuel.checked_sub(1) else { return Ok(Outcome::OutOfFuel) };
+            fuel = left;
+            let op = self.view.op(inst);
+            // A promise it can check is modelled (eval/promises.rs); any other flag is refused.
+            if let Some(what) = promises::unmodelled(op, self.view.flags(inst)) {
+                return Err(EvalError::Unsupported { inst, op, what });
             }
+            if op.is_terminator() {
+                inst = match self.end(inst, op)? {
+                    Next::To(next) => self.view.params(next).end,
+                    Next::Done(outcome) => match self.resume(outcome)? {
+                        calls::Resume::At(next) => next,
+                        calls::Resume::Done(outcome) => return Ok(outcome),
+                    },
+                };
+                continue;
+            }
+            if op == Op::Call {
+                inst = self.call(inst)?;
+                continue;
+            }
+            match self.step(inst, op)? {
+                Ok(Some(value)) => self.values[inst] = Some(value),
+                Ok(None) => {}
+                Err(outcome) => return Ok(outcome),
+            }
+            inst += 1;
         }
     }
 
@@ -380,19 +217,11 @@ impl<A: Allocator + Clone> Run<'_, A> {
         let value = match op {
             Op::Iconst => {
                 let width = self.width(inst)?;
-                let word = o.imm();
-                let value = match width {
-                    ..=32 => u128::from(word),
-                    _ => (word as i32 as i128) as u128,
-                };
-                Val::Int(value & mask(width))
+                Val::Int(iconst_value(o.imm(), width))
             }
             Op::IconstWide => {
                 let width = self.width(inst)?;
-                let words = o.constant();
-                let value =
-                    words.iter().rev().fold(0u128, |it, &word| (it << 32) | u128::from(word));
-                Val::Int(value & mask(width))
+                Val::Int(wide_value(o.constant(), width))
             }
             Op::Add | Op::Sub | Op::Mul | Op::Udiv | Op::Sdiv | Op::Urem | Op::Srem | Op::And
             | Op::Or | Op::Xor | Op::Shl | Op::Lshr | Op::Ashr | Op::Rotl | Op::Rotr
@@ -435,10 +264,7 @@ impl<A: Allocator + Clone> Run<'_, A> {
             Op::Zext | Op::Sext | Op::Trunc => {
                 let width = self.width(inst)?;
                 let (a, from) = self.int(inst, o.value())?;
-                Val::Int(match op {
-                    Op::Sext => sext(a, from) as u128 & mask(width),
-                    _ => a & mask(width),
-                })
+                Val::Int(convert(op, a, from, width))
             }
             Op::Freeze => self.get(inst, o.value())?,
             Op::SlotAddr => Val::Ptr { slot: o.slot().0, offset: 0 },
@@ -454,7 +280,17 @@ impl<A: Allocator + Clone> Run<'_, A> {
                     return Err(EvalError::Unsupported { inst, op, what: "a pointer not into a slot" });
                 };
                 let (by, width) = self.int(inst, o.value())?;
-                Val::Ptr { slot, offset: offset.wrapping_add(sext(by, width)) }
+                let by = sext(by, width);
+                if !self.view.flags(inst).contains(Flags::INBOUNDS) {
+                    Val::Ptr { slot, offset: offset.wrapping_add(by) }
+                } else {
+                    let index = SlotId(slot).index();
+                    let size = i128::from(self.view.slots[index].size);
+                    match promises::inbounds_step(offset, by, size, self.memory.live[index]) {
+                        Ok(offset) => Val::Ptr { slot, offset },
+                        Err(why) => return undefined(why),
+                    }
+                }
             }
             Op::Load => {
                 let width = self.width(inst)?;

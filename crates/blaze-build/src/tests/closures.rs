@@ -151,6 +151,11 @@ impl Adts for FxAdts<'_> {
         self.w.fx.adt_of(key)
     }
 
+    /// The fixture's bodies do no arithmetic that overflows: the release setting.
+    fn overflow_checks(&self) -> crate::OverflowChecks {
+        crate::OverflowChecks::Off
+    }
+
     fn facts(&self) -> &dyn LayoutFacts {
         self
     }

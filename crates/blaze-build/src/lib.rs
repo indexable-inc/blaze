@@ -194,6 +194,7 @@
 
 pub mod cabi;
 pub mod data;
+pub mod drop_facts;
 pub mod imports;
 pub mod instance;
 pub mod intrinsics;
@@ -216,6 +217,7 @@ use blaze_lir::{Func, VerifyError};
 use blaze_typeck::{Adt, BodyView, Checked, Expr, ExprId, FmtTrait, FnSig, ItemKey, LangItem, List, Mutbl, PTy, PTys, PatId, PortableTys};
 
 pub use instance::{Instance, InstanceKey, ground, instance_key, instance_key_normalized};
+pub use walk::arith_checks::PanicConst;
 pub use walk::coroutine::{CoroutineFacts, CoroutineOf, StateShape, coroutine_facts, coroutine_of, coroutines_in, identity as coroutine_identity};
 
 /// The instance being built: its generic arguments, types of `ground`, the program's one table
@@ -294,6 +296,16 @@ pub trait Adts {
     fn panic(&self) -> Panic {
         Panic::Abort
     }
+
+    /// Whether `+ - *`, shifts and unary `-` on integers panic on overflow (the Reference,
+    /// [expr.operator.int-overflow]: "Integer operators will panic when they overflow when
+    /// compiled in debug mode. The -C debug-assertions and -C overflow-checks compiler flags
+    /// can be used to control this more directly"); off, they wrap (walk/arith_checks.rs).
+    /// Division and remainder are checked in every build either way. Part of every code
+    /// record's key, as [`Adts::panic`] is. No default (decision D101): every builder context
+    /// says it, from its caller, which reads the profile (Cargo's `overflow-checks`: on in
+    /// `dev` and `test`, off in `release`, the manifest's `[profile.<name>]` overriding).
+    fn overflow_checks(&self) -> OverflowChecks;
 
     /// The trait method `which` names (`Fn::call`, `FnMut::call_mut`, `FnOnce::call_once`): a
     /// closure's body is the instance of its kind's at `[closure, (args..)]`, and a direct call
@@ -464,6 +476,9 @@ pub(crate) enum Planted {
     /// A comparison of two references compares the two ADDRESSES, not the referents (the
     /// wrong answer of rung x0-match-05-nested-enums, 2026-11-16).
     CompareAddresses,
+    /// `MIN % -1` is not checked: it gives the machine's 0 where Rust panics (the wrong answer
+    /// WRONG-NOTES.md S2 found, 2026-11-16).
+    NoRemOverflowCheck,
 }
 
 /// One piece of a `format_args!` template ([`Adts::format_template`]).
@@ -570,6 +585,27 @@ pub enum Panic {
     Abort,
 }
 
+/// Whether integer `+ - *`, shifts and unary `-` panic on overflow ([`Adts::overflow_checks`]).
+/// The Reference, [expr.operator.int-overflow]: "Integer operators will panic when they overflow
+/// when compiled in debug mode. The -C debug-assertions and -C overflow-checks compiler flags can
+/// be used to control this more directly." A profile's setting (decision D101): part of every
+/// code record's key, so two profiles never share code.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum OverflowChecks {
+    /// Overflow calls core's `panic_const_*_overflow` (walk/arith_checks.rs): the `dev` and
+    /// `test` profiles.
+    On,
+    /// Overflow wraps (two's complement): the `release` profile.
+    Off,
+}
+
+impl OverflowChecks {
+    /// Whether overflow is checked.
+    pub const fn on(self) -> bool {
+        matches!(self, OverflowChecks::On)
+    }
+}
+
 /// Why a body was not built.
 #[derive(Debug)]
 pub enum BuildError {
@@ -641,6 +677,10 @@ pub enum BuildError {
     /// the operation and its rule (unwinding in the body, a compound value live across a
     /// suspend, a cancel path that suspends...).
     Coroutine(blaze_lir::coroutine::CoroutineError),
+    /// An unsizing coercion at `expr` the build refuses by the rule `rule` (walk/unsize_nested.rs):
+    /// through ADT `adt` (none: at the pointer itself), `why`: a struct where no field or more
+    /// than one field holding bytes differs, a union, an enum, a nesting past `UNSIZE_DEPTH`.
+    Unsize { expr: ExprId, adt: Option<ItemKey>, why: &'static str, rule: &'static str },
 }
 
 /// What an `.await` and a coroutine's entries need of the library: the answer of
@@ -753,6 +793,10 @@ impl fmt::Display for BuildError {
             BuildError::Lir(error) => write!(f, "blaze-lir's builder refused the function: {error}"),
             BuildError::Verify(error) => write!(f, "the LIR built does not verify: {error}"),
             BuildError::Coroutine(error) => write!(f, "an async block's body was not split: {error}"),
+            BuildError::Unsize { expr, adt: Some(adt), why, rule } => {
+                write!(f, "expression {}: an unsizing coercion through ADT {:#x}: {why} ({rule})", expr.0, adt.0)
+            }
+            BuildError::Unsize { expr, adt: None, why, rule } => write!(f, "expression {}: an unsizing coercion: {why} ({rule})", expr.0),
             BuildError::NoCleanup { what } => {
                 write!(f, "a call that may unwind (panic = unwind): its cleanup is not built exactly: {what} (blaze-build walk/unwind.rs)")
             }

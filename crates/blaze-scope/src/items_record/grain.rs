@@ -178,7 +178,7 @@ impl<'a> ItemsRecord<'a> {
         &self,
         key: ItemKey,
         read: &dyn Fn(super::TextOf<'_>) -> Option<&'a str>,
-        today: &dyn Fn(&'a str, ContentId) -> Option<ItemToday<'a>>,
+        today: &dyn Fn(crate::package_path::PackagePath<'a>, ContentId) -> Option<ItemToday<'a>>,
     ) -> Result<Option<ItemNow<'a>>, ItemsRecordError> {
         let Some(i) = self.find(T_ITEMS, key) else { return Ok(None) };
         let row = self.item_at(i)?.ok_or(ItemsRecordError::Short { what: "an item row", at: i })?;

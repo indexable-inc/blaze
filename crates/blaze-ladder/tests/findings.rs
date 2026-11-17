@@ -8,6 +8,7 @@
 
 mod rungs;
 
+use blaze_build::OverflowChecks;
 use blaze_ladder::refusal::SourceFile;
 use blaze_ladder::run::{build, refusals};
 use rungs::{RUNNING, ladder, sources};
@@ -16,9 +17,10 @@ use rungs::{RUNNING, ladder, sources};
 #[test]
 fn a_running_rung_has_no_findings() {
     for rung in RUNNING {
-        let files = sources(&ladder().join(rung));
+        let dir = ladder().join(rung);
+        let files = sources(&dir);
         let views: Vec<SourceFile<'_>> = files.iter().map(|(path, text)| SourceFile { path, text }).collect();
-        let found = refusals(&views, "src/main.rs");
+        let found = refusals(&views, "src/main.rs", rungs::x::overflow_of(&dir));
         assert!(found.is_empty(), "rung {rung} runs, yet the findings path refuses it: {found:?}");
     }
 }
@@ -37,9 +39,9 @@ fn a_refused_program_has_the_runners_refusal() {
     ];
     for text in programs {
         let views = [SourceFile { path: "src/main.rs", text }];
-        let found = refusals(&views, "src/main.rs");
+        let found = refusals(&views, "src/main.rs", OverflowChecks::On);
         assert!(!found.is_empty(), "`{text}` is refused");
-        let Err(error) = build(&views, "src/main.rs") else { panic!("`{text}` built") };
+        let Err(error) = build(&views, "src/main.rs", OverflowChecks::On) else { panic!("`{text}` built") };
         assert_eq!(error.refusals().as_slice(), found.as_slice(), "`{text}`");
     }
 }

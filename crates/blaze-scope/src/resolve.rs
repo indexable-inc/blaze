@@ -128,8 +128,9 @@ pub struct CrateInput<'a> {
     pub implicit: Implicit,
     /// Its root file's path.
     pub root: &'a str,
-    /// What `file!()` leaves out of a path at its start: a file's shown path is its path
-    /// past this directory.
+    /// The crate's package directory in the caller's path space: a file's path in its package
+    /// ([`SourceFile::package`], what records hold, D96) and its shown path (`file!()`) are both
+    /// its path past this directory.
     pub shown_from: &'a str,
     /// The features turned on, sorted (the graph's record of them).
     pub features: &'a [&'a str],
@@ -145,7 +146,12 @@ pub struct CrateInput<'a> {
 /// A file of a crate, read and outlined once.
 #[derive(Debug)]
 pub struct SourceFile<'a> {
+    /// Its path in the caller's path space (blaze-world's `/<tree>/...`): what the solve reads
+    /// it by, never what a record holds.
     pub path: &'a str,
+    /// Its path in its package, past [`CrateInput::shown_from`] (D96): what a record holds
+    /// and a reader finds the file by, with the crate it reads for.
+    pub package: crate::package_path::PackagePath<'a>,
     /// The path `file!()` gives: past [`CrateInput::shown_from`].
     pub shown: &'a str,
     pub text: &'a str,
@@ -401,6 +407,9 @@ pub enum NamesError<'a> {
     RootRecord { krate: &'a str, error: RecordError },
     /// A crate the graph's waves never reached.
     NotResolved { krate: &'a str },
+    /// The cell core (feature `cells`, the switch) refused the crate.
+    #[cfg(feature = "cells")]
+    Cells { krate: &'a str, error: crate::cells::Unwritten },
 }
 
 impl fmt::Display for NamesError<'_> {
@@ -416,6 +425,8 @@ impl fmt::Display for NamesError<'_> {
             }
             NamesError::RootRecord { krate, error } => write!(f, "crate `{krate}`: its CrateRoot record: {error:?}"),
             NamesError::NotResolved { krate } => write!(f, "crate `{krate}`: not reached by the graph's waves"),
+            #[cfg(feature = "cells")]
+            NamesError::Cells { krate, error } => write!(f, "crate `{krate}`: {error}"),
         }
     }
 }
@@ -953,7 +964,8 @@ fn keep<'a>(text: &str, alloc: Alloc<'a>) -> &'a str {
 
 /// A file read and outlined, kept as long as `alloc`.
 fn file_of<'a>(path: &'a str, text: &'a str, outlined: Outline<'a>, from: &str, alloc: Alloc<'a>) -> &'a SourceFile<'a> {
-    Box::leak(Box::new_in(SourceFile { path, shown: shown(path, from), text, id: file_id(text), outline: outlined }, alloc))
+    let package = crate::package_path::PackagePath::of(path, from, alloc);
+    Box::leak(Box::new_in(SourceFile { path, package, shown: shown(path, from), text, id: file_id(text), outline: outlined }, alloc))
 }
 
 /// A record's bytes copied to blocks aligned as blaze-format reads them in place.
@@ -1026,7 +1038,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     let mut tried: HashMap<&'a str, (), Alloc<'a>> = HashMap::new_in(alloc);
     let mut walked = None;
     for _ in 0..MOST_WALKS {
-        let tree = walk(&set, &cfg, input.key, input.name, root_file, &root_dir, alloc);
+        let tree = walk(&set, &cfg, input.key, input.name, root_file, &root_dir, edition, alloc);
         let mut read: AVec<'a, (&'a str, &'a str)> = AVec::new_in(alloc);
         for path in tree.missing.iter() {
             if set.find(path).is_some() || tried.contains_key(path.as_str()) {
@@ -1150,15 +1162,33 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
         let part = |part: ExpandPart, macro_name: &str, size: usize| par.expand_part(part, macro_name, size);
         let seen = |def: ItemKey, input: &str| par.expand_call(def, input);
         let cx = FillCx { base: &base, run: &run, facts: Facts { base: &base, run: &run }, mark: &mark, part: &part, seen: &seen };
-        // The cell core on the same facts, timed by the caller's clock and compared, the report
-        // handed to the caller; the records stay the fill's.
+        // With a seam: the cell core on the same facts after the fill, timed by the caller's
+        // clock and compared, the report handed to the caller; the records stay the fill's.
+        // Without one (feature `cells`): the switch: the cell core solves and writes the scopes.
         #[cfg(feature = "cells")]
         let seam = par.cells_seam().map(|seam| (seam, seam.now()));
         // The files' blocks that hold impls are modules before the fill starts: it is told
         // of them as of any made module.
         par.stage(crate::task::Stage::Solve);
         make_blocks(&base, &run, &low.bodies);
-        fill.run(&cx, par, &all);
+        #[cfg(feature = "cells")]
+        let by_cells = seam.is_none();
+        #[cfg(not(feature = "cells"))]
+        let by_cells = false;
+        if by_cells {
+            #[cfg(feature = "cells")]
+            {
+                let places = |m: ItemKey| held(run.block_places.lock(), "block places").get(&m).copied();
+                let expand = |call: ItemKey, def: Def| {
+                    let _ = crate::task::Expand::expand(&cx, ExpandRequest { call, def });
+                };
+                let made = |out: &mut AVec<'a, ItemKey>| out.extend(held(run.made.read(), "made modules").keys().copied());
+                fill.done = crate::cells::solve_and_write(&cx.facts, built, &cx.facts, &places, tree.modules[0].key, &expand, &made, alloc)
+                    .map_err(|error| NamesError::Cells { krate: input.name, error })?;
+            }
+        } else {
+            fill.run(&cx, par, &all);
+        }
         #[cfg(feature = "cells")]
         if let Some((seam, fill_start)) = seam {
             let old = seam.now().saturating_sub(fill_start);

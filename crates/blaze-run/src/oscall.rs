@@ -14,14 +14,24 @@
 //! resolved against the workspace root and the test's temporary folder (no `..` left: the
 //! wrapper resolves it), and does what the [`Allowed`] it gets back says.
 //!
-//! Two choices, each a reading of the design:
+//! Three rules, each from the design:
 //!
-//! - Randomness (`getrandom`, `/dev/urandom`) is the test's own: std's `RandomState` reads it in
-//!   nearly every program, so marking it would keep nothing; a result that rests on it shows up
-//!   as a `Flaky` finding at one address (result.rs), which is the answer the design gives.
-//! - A monotonic clock read is the real clock as much as a wall-clock read: what a test does
-//!   with an `Instant` (a timeout, a measured wait) depends on the machine's speed. Both are
-//!   [`NotKept::Clock`]. A `#[bstd::test]` gets the virtual clock and never reaches here.
+//! - Randomness (`getrandom`, `/dev/urandom`) is KEPT when the provider answered it
+//!   (test-selection.md section 2): the sandbox answers it from a seed derived from the test's
+//!   base key (the suite's tool, settings and environment, then the test's name; determinism.md
+//!   section B), the same whatever ran before it, so it is an input of the key, not of the world:
+//!   [`Rule::Own`]. Randomness the provider did not answer (a source no wrapper binds, such as
+//!   `SecRandomCopyBytes` reached as a foreign call) is not kept, by its own row.
+//! - The monotonic and CPU clocks are the process's own ([`Rule::Own`]: test.md "C. End-to-end
+//!   tests"): an async runtime reads `Instant` on every poll, so marking them would make every
+//!   tokio test unkeepable; a pass that rested on timing is a pass, and a failure always reruns
+//!   (D81). The wall clock stays [`NotKept::Clock`]: its value is never equal twice. A
+//!   `#[bstd::test]` gets the virtual clock and never reaches here.
+//! - A spawned WORKSPACE binary (its `CARGO_BIN_EXE_<n>` launcher stub, [`Site::WorkspaceBinary`])
+//!   is a launched program whose own calls are observed by its own wrappers and join the test's
+//!   asks ([`Rule::Traced`]; test-selection.md section 2, "Child processes: kept when traced").
+//!   Any other program stays [`NotKept::Foreign`]. [`classify_with`] takes the workspace
+//!   binaries; [`classify`] knows none.
 
 #![blaze::sans_io]
 
@@ -183,6 +193,9 @@ pub enum Site {
     Constant,
     Random,
     Outside,
+    /// A spawned program that is one of the workspace's binaries: its path is, byte for byte,
+    /// one of the `bins` given to [`key_with`] (the launcher stub `CARGO_BIN_EXE_<n>` names).
+    WorkspaceBinary,
 }
 
 /// A rule's verdict, before the operation's text is put in it.
@@ -196,6 +209,10 @@ pub enum Rule {
     AskOutsideListing,
     AskVar,
     Own,
+    /// A launched workspace program: the spawn itself reads nothing outside the test, and the
+    /// program's own calls reach its own wrappers, whose asks join the test's. Classified as
+    /// [`Class::Own`] for the spawn call.
+    Traced,
     NotKept(NotKept),
     Refuse(Refusal),
 }
@@ -228,8 +245,8 @@ pub const RULES: &[(Kind, Site, Rule)] = &[
     (Kind::Change, Site::Random, Rule::Refuse(Refusal::Write)),
     (Kind::Change, Site::Outside, Rule::Refuse(Refusal::Write)),
     (Kind::ClockWall, Site::None, Rule::NotKept(NotKept::Clock)),
-    (Kind::ClockMonotonic, Site::None, Rule::NotKept(NotKept::Clock)),
-    (Kind::ClockCpu, Site::None, Rule::NotKept(NotKept::Clock)),
+    (Kind::ClockMonotonic, Site::None, Rule::Own),
+    (Kind::ClockCpu, Site::None, Rule::Own),
     (Kind::Env, Site::None, Rule::AskVar),
     (Kind::Random, Site::None, Rule::Own),
     (Kind::ConnectOwnLoopback, Site::None, Rule::Own),
@@ -243,12 +260,22 @@ pub const RULES: &[(Kind, Site, Rule)] = &[
     (Kind::BindLoopback, Site::None, Rule::Own),
     (Kind::BindOther, Site::None, Rule::Refuse(Refusal::Connect)),
     (Kind::Spawn, Site::None, Rule::NotKept(NotKept::Foreign)),
+    (Kind::Spawn, Site::WorkspaceBinary, Rule::Traced),
     (Kind::UnseenDescriptor, Site::None, Rule::NotKept(NotKept::Descriptor)),
     (Kind::Foreign, Site::None, Rule::NotKept(NotKept::Foreign)),
 ];
 
-/// The (kind, site) of an operation, and the text a verdict names (a path, a name, a peer).
+/// The (kind, site) of an operation, and the text a verdict names (a path, a name, a peer),
+/// knowing no workspace binary: every spawn is [`Site::None`]. [`key_with`] with no binaries.
 pub fn key<'p>(op: &Op<'p>) -> (Kind, Site, &'p str) {
+    key_with(op, &[])
+}
+
+/// [`key`], given the workspace binaries as the launcher names them to the test (each
+/// `CARGO_BIN_EXE_<n>`'s value, the stub's path). A spawn whose program equals one of `bins`
+/// byte for byte is [`Site::WorkspaceBinary`]; any other is [`Site::None`]. The match is exact,
+/// never by file name: a `/usr/local/bin/<n>` that shares a binary's name is not the workspace's.
+pub fn key_with<'p>(op: &Op<'p>, bins: &[&str]) -> (Kind, Site, &'p str) {
     let place = |at: Where<'p>| match at {
         Where::Root(path) => (Site::Root, path),
         Where::Temp => (Site::Temp, ""),
@@ -291,7 +318,10 @@ pub fn key<'p>(op: &Op<'p>) -> (Kind, Site, &'p str) {
         }
         Op::Bind { loopback: true } => (Kind::BindLoopback, Site::None, ""),
         Op::Bind { loopback: false } => (Kind::BindOther, Site::None, ""),
-        Op::Spawn { program } => (Kind::Spawn, Site::None, program),
+        Op::Spawn { program } => match bins.iter().any(|bin| *bin == program) {
+            true => (Kind::Spawn, Site::WorkspaceBinary, program),
+            false => (Kind::Spawn, Site::None, program),
+        },
         Op::UnseenDescriptor => (Kind::UnseenDescriptor, Site::None, ""),
         Op::Foreign { symbol } => (Kind::Foreign, Site::None, symbol),
     }
@@ -302,10 +332,18 @@ pub fn rule(kind: Kind, site: Site) -> Option<Rule> {
     RULES.iter().find(|(k, s, _)| *k == kind && *s == site).map(|(_, _, rule)| *rule)
 }
 
-/// The class of `op`. Every [`Op`] has a row ([`RULES`]); a pair without one is refused by name
-/// as a call the profile does not allow, never guessed.
+/// The class of `op`, knowing no workspace binary: [`classify_with`] with none, so every spawn
+/// is [`NotKept::Foreign`].
 pub fn classify<'p>(op: &Op<'p>) -> Class<'p> {
-    let (kind, site, text) = key(op);
+    classify_with(op, &[])
+}
+
+/// The class of `op`, given the workspace binaries ([`key_with`]). Every [`Op`] has a row
+/// ([`RULES`]); a pair without one is refused by name as a call the profile does not allow,
+/// never guessed. A spawn of a workspace binary is [`Rule::Traced`], which is [`Class::Own`] for
+/// the spawn call itself: the launched program's own calls come through its own wrappers.
+pub fn classify_with<'p>(op: &Op<'p>, bins: &[&str]) -> Class<'p> {
+    let (kind, site, text) = key_with(op, bins);
     let Some(rule) = rule(kind, site) else { return Class::Refused { refusal: Refusal::Call, what: kind_name(kind) } };
     match rule {
         Rule::AskFile => Class::Ask(Asked::File(text)),
@@ -315,7 +353,7 @@ pub fn classify<'p>(op: &Op<'p>) -> Class<'p> {
         Rule::AskOutsideFacts => Class::Ask(Asked::OutsideFacts(text)),
         Rule::AskOutsideListing => Class::Ask(Asked::OutsideListing(text)),
         Rule::AskVar => Class::Ask(Asked::Var(text)),
-        Rule::Own => Class::Own,
+        Rule::Own | Rule::Traced => Class::Own,
         Rule::NotKept(why) => Class::NotKept(why),
         Rule::Refuse(refusal) => Class::Refused { refusal, what: refused_what(op, text) },
     }
@@ -358,5 +396,58 @@ pub const fn first_reason(a: NotKept, b: NotKept) -> NotKept {
     match (a as u8) <= (b as u8) {
         true => a,
         false => b,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Class, Clock, Kind, Op, RULES, Rule, Site, classify, classify_with, key, key_with, rule};
+    use crate::plan::NotKept;
+
+    /// test-selection.md section 2, "Child processes: kept when traced", and test.md "C.
+    /// End-to-end tests": a spawn of the launcher stub a `CARGO_BIN_EXE_<n>` names is traced
+    /// (its asks join the test's, so the spawn call itself is the test's own); any other program,
+    /// and the same program when no binaries are given, stays `NotKept::Foreign`. Planted bug
+    /// it catches: matching by file name would trace `/usr/local/bin/shop-server`, which only
+    /// shares the workspace binary's name.
+    /// Prints: `test oscall::tests::a_workspace_binary_is_traced_and_another_program_is_not ... ok`
+    #[test]
+    fn a_workspace_binary_is_traced_and_another_program_is_not() {
+        let stub = "/work/shop/.blaze/v2/bin/shop-server";
+        let bins: [&str; 2] = ["/work/shop/.blaze/v2/bin/shop-cli", stub];
+        let ours = Op::Spawn { program: stub };
+        assert_eq!(key_with(&ours, &bins), (Kind::Spawn, Site::WorkspaceBinary, stub));
+        assert_eq!(rule(Kind::Spawn, Site::WorkspaceBinary), Some(Rule::Traced));
+        assert_eq!(classify_with(&ours, &bins), Class::Own);
+        // Without the binaries, the same spawn is foreign: `classify` knows none.
+        assert_eq!(key(&ours), (Kind::Spawn, Site::None, stub));
+        assert_eq!(classify(&ours), Class::NotKept(NotKept::Foreign));
+        // Another program, and one sharing only the file name, stay not kept.
+        for program in ["/usr/bin/git", "/usr/local/bin/shop-server", "shop-server", ""] {
+            let other = Op::Spawn { program };
+            assert_eq!(key_with(&other, &bins), (Kind::Spawn, Site::None, program), "{program}");
+            assert_eq!(classify_with(&other, &bins), Class::NotKept(NotKept::Foreign), "{program}");
+        }
+        // The traced row is the only `WorkspaceBinary` row, and it is a spawn's.
+        let rows = RULES.iter().filter(|(_, site, _)| *site == Site::WorkspaceBinary).count();
+        assert_eq!(rows, 1);
+    }
+
+    /// test.md "C. End-to-end tests": the monotonic and CPU clocks are kept (an async runtime
+    /// reads `Instant` on every poll), the wall clock is not. Given binaries change no clock's
+    /// class. Planted bug it catches: the old reading (`NotKept::Clock` for `Instant`) fails the
+    /// first assertion.
+    /// Prints: `test oscall::tests::monotonic_and_cpu_clocks_keep_a_test ... ok`
+    #[test]
+    fn monotonic_and_cpu_clocks_keep_a_test() {
+        let bins: [&str; 1] = ["/work/shop/.blaze/v2/bin/shop-server"];
+        for clock in [Clock::Monotonic, Clock::Cpu] {
+            assert_eq!(classify(&Op::Clock(clock)), Class::Own, "{clock:?}");
+            assert_eq!(classify_with(&Op::Clock(clock), &bins), Class::Own, "{clock:?}");
+        }
+        assert_eq!(rule(Kind::ClockMonotonic, Site::None), Some(Rule::Own));
+        assert_eq!(rule(Kind::ClockCpu, Site::None), Some(Rule::Own));
+        assert_eq!(classify(&Op::Clock(Clock::Wall)), Class::NotKept(NotKept::Clock));
+        assert_eq!(classify_with(&Op::Clock(Clock::Wall), &bins), Class::NotKept(NotKept::Clock));
     }
 }

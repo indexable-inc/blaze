@@ -43,8 +43,12 @@ pub fn want_of_item<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey
     })
 }
 
-/// The want for checker key `key`: its own item's, or a member's container's.
+/// The want for checker key `key`: its own item's, an impl's fn's own signature
+/// ([`Want::MemberFn`]), or another member's container's.
 pub fn want_of_key<'n, S: super::source::NamesSource<'n>>(names: S, keys: &Keys, key: ItemKey) -> Result<Want, FillError> {
+    if let Some(want) = super::heads::member_fn_want(names, keys, key) {
+        return Ok(want);
+    }
     // A key in no row of the map is asked of the source (`Keys::library_in`: over records the
     // map is not filled up front; over the solved names the answer is `None` and the key is
     // unknown, as before).

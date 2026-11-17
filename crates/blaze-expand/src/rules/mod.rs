@@ -21,6 +21,7 @@
 //! When no arm matches, every arm of the call's style is matched again with the error
 //! bookkeeping rustc's `failed_to_match_macro` does, so a call that expands pays nothing for it.
 
+mod copy;
 mod failure;
 mod input;
 mod linear;
@@ -369,6 +370,8 @@ pub(crate) struct Program<'a> {
     /// The matchers' nesting, for the linear matcher ([`linear::nest`]).
     pub(crate) nests: linear::Nests<'a>,
 }
+
+pub use copy::{CopyPlant, rules_copy_plant};
 
 /// Whether every call runs both matchers and compares them ([`rules_oracle`]).
 static ORACLE: AtomicBool = AtomicBool::new(false);

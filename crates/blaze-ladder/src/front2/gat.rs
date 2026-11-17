@@ -29,8 +29,15 @@
 //!   filed by the trait's head in `Maps::assoc_where`) and NOT CHECKED: nothing proves it where
 //!   the associated type is used, and nothing requires it of an impl. That gap has one name,
 //!   [`OUTLIVES_NOT_CHECKED`], which the kept clauses are listed under. A clause with a trait
-//!   bound (`where T: Clone`) is a predicate of the associated type the checker would have to
-//!   prove at each use: refused by name, never dropped.
+//!   bound (`where T: Clone`), like a bound on an own parameter (`type Out<T: Clone>`), is one
+//!   of the associated type's OWN clauses (decision D89 (b)): preds.rs
+//!   `Builder::assoc_own_clauses` files them in the item's `Predicates` after its item bounds,
+//!   and blaze-solve's well-formedness of the projection proves them at each use with the
+//!   projection's arguments substituted. In an impl (`type Out<T: Clone> = Vec<T>;`) they are
+//!   the value's assumptions. OPEN (heads.rs's impl-member path, another lane's file): that an
+//!   impl's own clauses are implied by its trait's (the language's E0276, "impl has stricter
+//!   requirements than trait") is not checked yet; an impl's value is not checked for
+//!   well-formedness there either, so nothing yet rests on an impl's own clauses.
 
 use blaze_id::ItemKey as LibKey;
 use blaze_lower::{View, form as lf, head};
@@ -103,8 +110,9 @@ impl AssocWhere {
 
 /// The where clauses of the associated type whose text `v` views (a trait's `type Iter<'a>
 /// where Self: 'a;` or an impl's `type Iter<'a> = .. where Self: 'a;`): each outlives clause
-/// kept ([`OUTLIVES_NOT_CHECKED`]); a clause with a trait bound, a `use<..>` bound or a `where
-/// const` condition refused by name.
+/// kept ([`OUTLIVES_NOT_CHECKED`]); a trait bound passed over HERE because it is the
+/// associated item's own clause, filed and proved by preds.rs `Builder::assoc_own_clauses`
+/// (D89 (b)); a `use<..>` bound or a `where const` condition refused by name.
 pub(super) fn member_where(v: &View<'_>, name: &str) -> Result<AssocWhere, Why> {
     let _ = name;
     let mut kept = AssocWhere::default();
@@ -123,9 +131,11 @@ pub(super) fn member_where(v: &View<'_>, name: &str) -> Result<AssocWhere, Why> 
         for &b in v.rows(bounds)? {
             match lf::Bound::decode(b)? {
                 lf::Bound::Lifetime(l) => kept.push(Outlives { subject, lifetime: Name(v.name(l)?) }, at)?,
-                lf::Bound::Trait { .. } => {
-                    return Err(Why::Unsupported("a where clause with a trait bound on an associated type (`type Out<T> where T: Bound`)", at));
-                }
+                // A trait bound is one of the associated type's own clauses (decision D89 (b)):
+                // in a trait, filed after its item bounds and proved at each use by the
+                // projection's well-formedness (preds.rs `Builder::assoc_own_clauses`); in an
+                // impl, assumed when the value is checked. Not kept here.
+                lf::Bound::Trait { .. } => {}
                 lf::Bound::Use(_) => return Err(Why::Unsupported("a `use<..>` bound in an associated type's where clause", at)),
             }
         }

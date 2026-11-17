@@ -52,14 +52,14 @@ impl core::fmt::Display for Unfilled {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Unfilled::Impl(k) => write!(f, "the candidate impl {k:x} has no header in the store when its question is answered"),
-            Unfilled::Fn(k) => write!(f, "the inherent impl fn {k:?} has no signature in the store when its question is answered"),
+            Unfilled::Fn(k) => write!(f, "the inherent impl fn {k:?} has no `self` flag in its impl's head when its question is answered"),
         }
     }
 }
 
 /// The shape a lowered self type is matched by; `None` for a parameter (a blanket impl).
 pub(crate) fn shape_of(t: PTys<'_>, p: PTy) -> Option<Shape> {
-    Some(match *t.nodes.get(p.0 as usize)? {
+    Some(match *t.get(p)? {
         PNode::Bool => Shape::Bool,
         PNode::Char => Shape::Char,
         PNode::Int(i) => Shape::Int(i),
@@ -618,7 +618,7 @@ pub fn trait_home<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'
     let (generics, self_defaults) = match store.maps.traits.get(&lib) {
         Some(t) => {
             let view = store.tys.view();
-            let all_self = t.defaults.iter().all(|d| d.is_some_and(|p| matches!(view.nodes.get(p.0 as usize), Some(PNode::Param(0)))));
+            let all_self = t.defaults.iter().all(|d| d.is_some_and(|p| matches!(view.get(p), Some(PNode::Param(0)))));
             (Some(t.generics), all_self)
         }
         None => {
@@ -707,8 +707,6 @@ pub struct Buckets {
     pub failed: Vec<(LibKey, Box<str>), Global>,
     /// Why each unread impl's trait path was not filed (in filing order).
     pub unread_why: Vec<(LibKey, Unread), Global>,
-    /// The inherent fns, by shape and name, whose signatures are in `Store::fn_gaps`.
-    gapped: HashMap<(Shape, Name), ItemKey, Global>,
     /// The negative impls, by trait ([`Filed::Negative`]): no trait question's candidates.
     negative: HashMap<ItemKey, Vec<LibKey, Global>, Global>,
     /// Each impl's crate, by key (the index's order): known without reading its header.
@@ -768,7 +766,6 @@ impl Buckets {
             failed: Vec::new_in(Global),
             unread_why: Vec::new_in(Global),
             negative: HashMap::new_in(Global),
-            gapped: HashMap::new_in(Global),
             krates: Vec::new_in(Global),
             homes: HashMap::new_in(Global),
             bare: Vec::new_in(Global),
@@ -1134,7 +1131,8 @@ impl Buckets {
         Ok(())
     }
 
-    /// Answers every inherent fn of `shape` from its candidates' headers and signatures.
+    /// Answers every inherent fn of `shape` from its candidates' headers alone: no fn's
+    /// signature is made or read (brief 14).
     pub fn answer_inherent(&mut self, store: &Store<'_>, shape: Shape, home: Homes) -> Result<(), Unfilled> {
         let view = store.tys.view();
         let mut first_failed = None;
@@ -1148,14 +1146,13 @@ impl Buckets {
             if h.trait_.is_some() || shape_of(view, h.self_ty) != Some(shape) {
                 continue;
             }
-            for &(name, f) in h.fns.iter() {
-                // A fn whose signature could not be made answers no question of its name:
-                // asking for that name is the gap (never an answer without it).
-                if !store.fns.contains_key(&f) && store.fn_gaps.contains_key(&f) {
-                    self.gapped.insert((shape, name), f);
-                    continue;
-                }
-                let self_param = store.fns.get(&f).ok_or(Unfilled::Fn(f))?.self_param;
+            for (at, &(name, f)) in h.fns.iter().enumerate() {
+                // A name is answered from the impl's member list and each fn's `self` read
+                // from its text (`ImplHead::fn_self`), never from a made signature: a fn's
+                // signature is its own want (heads.rs `Want::MemberFn`), made when the fn is
+                // used, and one refused then is the gap of that fn alone (`Gap::FnHead`, from
+                // `fn_sig`). So the answer is the impls' text's, whatever was made before it.
+                let self_param = *h.fn_self.get(at).ok_or(Unfilled::Fn(f))?;
                 push(&mut self.inherent, (shape, name), AssocItem { container: ck, item: f, kind: AssocKind::Fn { self_param } });
             }
             for &(name, c) in h.consts.iter() {
@@ -1211,11 +1208,6 @@ impl Buckets {
     }
 
     /// The inherent fns of `shape` named `name`, once the shape is answered.
-    /// The inherent fn named `name` at `shape` whose signature could not be made, if any.
-    pub fn gapped(&self, shape: Shape, name: Name) -> Option<ItemKey> {
-        self.gapped.get(&(shape, name)).copied()
-    }
-
     pub fn inherent(&self, shape: Shape, name: Name) -> Option<&[AssocItem]> {
         if !self.inherent_done.contains_key(&shape) {
             return None;

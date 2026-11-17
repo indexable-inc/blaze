@@ -214,6 +214,9 @@ pub enum Because {
     /// `expected` counts its declared parameters only: an `impl Trait` parameter is anonymous
     /// and never given explicitly (the Reference, "Impl trait").
     ArgCount { item: ItemKey, expected: u32, got: u32 },
+    /// A rule of the Rust Reference refuses the construct outright, no trait asked: `rule` is
+    /// its identifier (`expr.negate.results`) and `says` its words, quoted.
+    Reference { rule: &'static str, says: &'static str },
 }
 
 /// A goal as a finding keeps it: every argument, `Self` first, a list of the record's type
