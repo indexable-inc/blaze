@@ -201,8 +201,10 @@ pub const ITEM_DOMAIN: &str = "blaze v2 file item merkle 2";
 pub const SIGNATURE_DOMAIN: &str = "blaze v2 file item signature 1";
 
 /// The domain of an entry's names digest ([`Outline::names_digest`]): what name resolution can
-/// observe of it without its types (crate::names_digest).
-pub const NAMES_DOMAIN: &str = "blaze v2 file item names 1";
+/// observe of it without its types (crate::names_digest). `2` since 2026-11-17: a body that
+/// holds items is in it only when the solver scans it (`nested::may_make_module`), no longer
+/// whenever it holds a macro call.
+pub const NAMES_DOMAIN: &str = "blaze v2 file item names 2";
 
 /// The domain of [`Outline::surface`] (the drive's `Surface` part). `v2` since 2026-11-16: the
 /// surface hashes each entry's names digest, no longer its signature digest, so a surface of
@@ -380,7 +382,8 @@ impl Outline<'_> {
     /// entry outside a function's body, in order, its kind, its parent's place and its names
     /// digest ([`Outline::names_digest`]: name, visibility, attributes, a struct's or variant's
     /// form, a `use` tree, an impl's header; the whole entry under a derive or an attribute
-    /// macro, and a macro's or macro call's tokens). A body edit, and an edit to a type, a bound
+    /// macro, a macro's or macro call's tokens, and a body the solver scans for a block's
+    /// module). A body edit (a macro call's argument in it too), and an edit to a type, a bound
     /// or a const's value, leaves it equal (the drive's `Surface` part; blaze-world's `names
     /// --records`).
     pub fn surface(&self) -> ContentId {

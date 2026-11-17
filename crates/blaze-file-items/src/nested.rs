@@ -124,6 +124,27 @@ impl NestedKind {
     }
 }
 
+/// The keywords of the items that make a block a module ([`NestedKind::makes_module`]).
+const MODULE_WORDS: [&str; 6] = ["impl", "struct", "enum", "union", "type", "trait"];
+
+/// Whether `text`, the whole text of a `fn`, `const` or `static` whose body holds an item or a
+/// macro call, may write an item that makes a block a module: it holds one of the keywords of
+/// [`NestedKind::makes_module`] as a word anywhere (in a comment or a string too: six substring
+/// searches, no scan). A word is bounded on both sides by no ASCII letter, digit or `_`, as a
+/// keyword token always is, so a longer name (`has_implicit_path`, `types`) is not one; a
+/// non-ASCII neighbour counts as a bound, so nothing the lexer reads as the keyword is missed.
+/// The one test of both sides: the name solver scans only such a body (blaze-scope
+/// `BodySrc::of`), and an entry's names digest takes the whole entry only for one
+/// (crate::names_digest), so a body the solver never reads (a `println!`, a block's `fn`) is
+/// not in its file's surface.
+pub fn may_make_module(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let in_name = |at: usize| bytes.get(at).is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
+    MODULE_WORDS.iter().any(|word| {
+        text.match_indices(word).any(|(at, _)| !(at > 0 && in_name(at - 1)) && !in_name(at + word.len()))
+    })
+}
+
 /// An open bracket of the body.
 #[derive(Clone, Copy)]
 enum Open {

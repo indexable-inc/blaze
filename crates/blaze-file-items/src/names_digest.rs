@@ -16,7 +16,7 @@
 //! | `visibility` | every declaration's `WrittenVis`, `pub(in path)`'s path | its form and the path's text |
 //! | `attrs` (all but `Doc`) | `cfg`, `cfg_attr`, `derive`, `path`, `macro_use`, `macro_export`, `lang`, `proc_macro*`, `rustc_builtin_macro`, attribute macros | each one's text and whether inner |
 //! | `body`'s first byte (struct, variant) | unit or tuple struct also a value; a braced variant is no value | the form byte |
-//! | `Fn`/`Const`/`Static`'s `body_holds_items` | `BodySrc::of`: the body's blocks are scanned for items | the flag, and the whole digest when set |
+//! | `Fn`/`Const`/`Static`'s `body_holds_items` | `BodySrc::of`: the body's blocks are scanned for items when its text may write a block's module (`nested::may_make_module`) | the flag, and the whole digest when set and the text may (a body of macro calls alone is never read: until 2026-11-17 it was digested whole, and a call's argument, a doc comment or a parameter edited in it reran its crate's names) |
 //! | the whole text under an attribute macro or a derive | the call's input (`CallSrc::input`) | the whole digest ([`Item::hash`]) |
 //! | `Impl`'s header (`impl_header`: the signature without its outer attributes) | the impl's trait path, self type and parameters | [`Item::signature_hash`] |
 //! | `Use`'s `tree` | `use_leaves` | its text |
@@ -170,8 +170,10 @@ fn message(sink: &mut impl Sink, text: &str, edition: u8, item: &Item, attrs: &[
         | ItemDetail::Const { body_holds_items }
         | ItemDetail::Static { body_holds_items } => {
             sink.part(&[u8::from(body_holds_items)]);
-            // `BodySrc::of`: a body that holds items is scanned for the modules its blocks make.
-            whole |= body_holds_items;
+            // `BodySrc::of`: a body that holds items is scanned for the modules its blocks make
+            // when its text may write one, and not read at all otherwise: a body whose items are
+            // macro calls (`println!`) or a block's `fn`s is its own record's, not the names'.
+            whole |= body_holds_items && crate::nested::may_make_module(item.range.of(text));
         }
         ItemDetail::Struct | ItemDetail::Variant { discriminant: _ } => {
             sink.part(&form(text, item));
@@ -331,6 +333,42 @@ mod tests {
             let one = names_digest(&text, Edition::E2024 as u8, item, outline.attrs(item), calls_macros);
             let index = ItemIndex(u32::try_from(at).expect("a small fixture"));
             assert_eq!(outline.names_digest(index), one, "entry {at}: {item:?}");
+        }
+    }
+
+    /// A body is in its file's surface only where the solver reads it: one that holds an item
+    /// or a macro call and may write a block's module (blaze-scope `BodySrc::of`,
+    /// `nested::may_make_module`). A call's argument, a doc comment, a parameter, a block's
+    /// `fn` and a name that holds a keyword (`has_implicit_path`, ripgrep's `search`) edited in a
+    /// body of macro calls leave the surface equal; the same edit in a body
+    /// that writes a struct or a trait in a block, the body's first macro call and an item-position call's
+    /// tokens move it. Control: a digest that takes every macro-holding body whole (until
+    /// 2026-11-17) fails the first loop.
+    #[test]
+    fn a_body_is_in_the_surface_only_where_the_solver_scans_it() {
+        let surface = |text: &str| crate::outline(text, Edition::E2024, Alloc::global()).surface();
+        let base = "/// Docs.\nfn f() { println!(\"a\"); }\nfn g() {}\n";
+        for edited in [
+            "/// Docs.\nfn f() { println!(\"b\"); }\nfn g() {}\n",
+            "/// Other docs.\nfn f() { println!(\"a\"); }\nfn g() {}\n",
+            "/// Docs.\nfn f(x: u8) -> u8 { println!(\"a\"); x }\nfn g() {}\n",
+            "/// Docs.\nfn f() { fn inner() {} println!(\"a\"); }\nfn g() {}\n",
+            "/// Docs.\nfn f() { x.has_implicit_path(); types(); println!(\"a\"); }\nfn g() {}\n",
+        ] {
+            assert_eq!(surface(edited), surface(base), "{edited:?} against {base:?}");
+        }
+        let scanned = "fn f() { struct S; println!(\"a\"); }\n";
+        for (moved, from) in [
+            ("fn f() { struct S; println!(\"b\"); }\n", scanned),
+            ("fn f() { impl S {} println!(\"a\"); }\n", "fn f() { println!(\"a\"); }\n"),
+            ("fn f() {\u{2028}impl S {} println!(\"b\"); }\n", "fn f() {\u{2028}impl S {} println!(\"a\"); }\n"),
+            ("fn f() { {type T = u8;} println!(\"b\"); }\n", "fn f() { {type T = u8;} println!(\"a\"); }\n"),
+            ("fn f() { trait T {} println!(\"b\"); }\n", "fn f() { trait T {} println!(\"a\"); }\n"),
+            ("/// Docs.\nfn f() {}\nfn g() {}\n", base),
+            ("m!(b);\n", "m!(a);\n"),
+            ("macro_rules! m { () => { fn made() {} }; }\nm!();\n", "macro_rules! m { () => { fn made2() {} }; }\nm!();\n"),
+        ] {
+            assert_ne!(surface(moved), surface(from), "{moved:?} against {from:?}");
         }
     }
 }

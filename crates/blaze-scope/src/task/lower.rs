@@ -1523,12 +1523,12 @@ impl<'t> BodySrc<'t> {
             detail,
             ItemDetail::Fn { body_holds_items: true } | ItemDetail::Const { body_holds_items: true } | ItemDetail::Static { body_holds_items: true }
         );
-        // The words of the items that make a block a module
-        // (`blaze_file_items::nested::NestedKind::makes_module`): a body without one costs
-        // six substring searches and no scan. A trait declared in a block makes one too
-        // (core's `Write::write_fmt` declares `trait SpecWriteFmt` in its body).
-        const WORDS: [&str; 6] = ["impl", "struct", "enum", "union", "type", "trait"];
-        (holds && WORDS.iter().any(|w| text.contains(w))).then_some(BodySrc { key, module, text, loc, depth, place })
+        // A body without a word of the items that make a block a module costs six substring
+        // searches and no scan; a trait declared in a block makes one too (core's
+        // `Write::write_fmt` declares `trait SpecWriteFmt` in its body). The same test decides
+        // whether the entry's names digest holds its whole text (blaze-file-items
+        // names_digest.rs): what is not scanned here is not in its file's `Surface`.
+        (holds && blaze_file_items::nested::may_make_module(text)).then_some(BodySrc { key, module, text, loc, depth, place })
     }
 }
 

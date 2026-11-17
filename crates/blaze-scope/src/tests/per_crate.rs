@@ -254,7 +254,25 @@ pub mod m {
 use m::Thing as Private;
 pub use m::deep::*;
 ";
-static TEXTS_BODY: Texts = Texts(&[&[("/a/lib.rs", A)], &[("/b/lib.rs", B)], &[("/c/lib.rs", C_BODY)], &[("/mac/lib.rs", MAC)]]);
+/// `c` with a macro call and a block's `fn` in a body and a doc comment on it: what the names
+/// digest leaves out of the file's surface (blaze-file-items names_digest.rs) when the body
+/// writes no item that makes a block a module.
+const C_MACRO_BODY: &str = "#![no_core]
+#[macro_export]
+macro_rules! from_c { () => { pub fn made_by_c() {} } }
+pub mod m {
+    pub struct Thing;
+    fn shut() {}
+    pub enum Way { Up, Down(u8) }
+    pub mod deep {
+        /// Far, documented.
+        pub fn far() { fn local() {} from_c!(); let _edited = 1; }
+    }
+}
+pub use m::deep::*;
+";
+static TEXTS_MACRO_BODY: Texts = Texts(&[&[("/a/lib.rs", A)], &[("/b/lib.rs", B)], &[("/c/lib.rs", C_MACRO_BODY)], &[("/mac/lib.rs", MAC)]]);
+static TEXTS_BODY: Texts =Texts(&[&[("/a/lib.rs", A)], &[("/b/lib.rs", B)], &[("/c/lib.rs", C_BODY)], &[("/mac/lib.rs", MAC)]]);
 static TEXTS_PUB: Texts = Texts(&[&[("/a/lib.rs", A)], &[("/b/lib.rs", B)], &[("/c/lib.rs", C_PUB)], &[("/mac/lib.rs", MAC)]]);
 static TEXTS_PRIV: Texts = Texts(&[&[("/a/lib.rs", A)], &[("/b/lib.rs", B)], &[("/c/lib.rs", C_PRIV)], &[("/mac/lib.rs", MAC)]]);
 
@@ -282,6 +300,16 @@ fn changed_by(edited: &'static Texts) -> (Vec<&'static str>, Vec<&'static str>) 
 #[test]
 fn a_body_edit_leaves_every_record_byte_equal() {
     assert_eq!(changed_by(&TEXTS_BODY), (vec![], vec![]));
+}
+
+/// A body's macro call (here one that writes an item: the Reference, "Statements", "Item
+/// declarations", scopes it to the body's block), a block's `fn` and a doc comment change no
+/// record either: the solver scans a body only for blocks that make modules (`BodySrc::of`), so
+/// leaving such a body out of its file's surface (blaze-file-items names_digest.rs) hides
+/// nothing the records hold.
+#[test]
+fn a_macro_call_or_a_doc_comment_in_a_body_leaves_every_record_byte_equal() {
+    assert_eq!(changed_by(&TEXTS_MACRO_BODY), (vec![], vec![]));
 }
 
 /// A `pub fn` added to `c::m::deep` changes c's exports record and no other: b reads it through

@@ -1985,6 +1985,54 @@ mod tests {
         );
     }
 
+    /// A body that holds a macro call is a body to the names: the solver scans a body only for
+    /// blocks that make modules (blaze-scope `BodySrc::of`, blaze-file-items
+    /// `nested::may_make_module`), so a call's argument, a doc comment or a parameter edited in
+    /// such a function runs no `Surface` and no names (until 2026-11-17 the names digest took
+    /// such an entry whole, and each of these edits ran the surface and both crates' names
+    /// twice). The call's argument runs its outline and its body; a doc comment or a parameter
+    /// runs its outline and every body of the file, whose keys hold the text around the bodies
+    /// (piece 7, as in `a_body_edit_reruns_no_surface_and_a_signature_edit_one`). A body that
+    /// writes a struct in a block and an item-position call are read by the names, so their
+    /// edits still run the surface and both crates. Control: a digest that took every
+    /// macro-holding body whole makes the first loop's `Surface` 1 and `CrateScope` 2.
+    #[test]
+    fn a_macro_call_in_a_body_reruns_no_surface() {
+        let io = workspace(10);
+        let base = "macro_rules! m { ($e:literal) => {}; }\n".to_owned() + &functions(100);
+        let with = |f: &str| base.replace("fn f00003() {}", f);
+        write(&io, "src/m3.rs", &with("fn f00003() { m!(\"a\"); }"));
+        let first = check(&io, SMALL);
+        assert!(first.failed.is_empty(), "{:?}", first.failed);
+        for (what, edited, runs) in [
+            ("a call's argument", "fn f00003() { m!(\"b\"); }", 2),
+            ("a doc comment", "/// Docs.\nfn f00003() { m!(\"b\"); }", 101),
+            ("a parameter", "/// Docs.\nfn f00003(_x: u8) { m!(\"b\"); }", 101),
+        ] {
+            write(&io, "src/m3.rs", &with(edited));
+            let edit = check(&io, SMALL);
+            assert!(edit.failed.is_empty(), "{what}: {:?}", edit.failed);
+            assert_eq!(
+                (edit.runs, made(&edit.profile, "Surface"), made(&edit.profile, "CrateScope")),
+                (runs, 0, 0),
+                "{what} edited in a body with a macro call runs its file's outline and bodies, no surface and no names:\n{}",
+                edit.profile
+            );
+        }
+        // Read by the names: a body that writes a struct in a block, and an item-position call.
+        for (what, from, to) in [
+            ("a scanned body", with("fn f00003() { struct S; m!(\"a\"); }"), with("fn f00003() { struct S; m!(\"b\"); }")),
+            ("an item-position call", base.clone() + "m!(\"a\");\n", base.clone() + "m!(\"b\");\n"),
+        ] {
+            write(&io, "src/m3.rs", &from);
+            let _ = check(&io, SMALL);
+            write(&io, "src/m3.rs", &to);
+            let edit = check(&io, SMALL);
+            assert!(edit.failed.is_empty(), "{what}: {:?}", edit.failed);
+            assert_eq!((made(&edit.profile, "Surface"), made(&edit.profile, "CrateScope")), (1, 2), "{what} edited runs its surface and both crates' names:\n{}", edit.profile);
+        }
+    }
+
     /// The project's own BINARY reruns its names after a signature edit (the stale answer of
     /// 2026-11-16: blaze-world's `held` kept only libraries and proc macros, so a binary had no
     /// `CrateScope` and an added `pub fn` was never seen). Cold: every crate's names (the
