@@ -211,7 +211,7 @@ const PERMISSION_DENIED: &str = "Permission denied (os error 13)";
 /// What a failure the simulation injected says ([`Faults::fail_one_in`]).
 const FAULT: &str = "injected by the simulation";
 
-#[derive(Debug)]
+#[derive(Clone, Debug)] // clone: a second name of one file's data (`Effect::Link`)
 struct SimFile {
     /// What survives a crash.
     durable: Vec<u8>,
@@ -520,7 +520,7 @@ impl SimFile {
 }
 
 /// A change to a file not yet synced.
-#[derive(Debug)]
+#[derive(Clone, Debug)] // clone: as `SimFile`'s
 enum Op {
     Append(Vec<u8>),
     At(u64, Vec<u8>),
@@ -2699,14 +2699,16 @@ impl Sim {
             // A second name of one file: one inode ([`journal::Disk::linked`]), so both
             // names' looks give the same `ino`, times and change time. The bytes and mode are
             // kept per name (a copy): no place writes or chmods a linked file in place before
-            // its looks, so a test of the store sees no difference.
+            // its looks, so a test of the store sees no difference. What a crash keeps of the
+            // bytes is the inode's, under either name: a link makes nothing durable, so a link
+            // of a file whose bytes were never synced keeps of them what that file would (a
+            // publish that links a temporary file and removes it: bstd `Dir::publish_new`).
             Effect::Link { from, to, .. } => {
-                let SimFile { mode, link, .. } = self.files[&from];
-                // clone: the second name's own record of which sectors hold blocks
-                let blocks = self.files[&from].blocks.clone();
-                let bytes = self.contents(&from);
+                // clone: the second name's own record of the file: its durable bytes and the
+                // changes no sync covered yet.
+                let second = self.files[&from].clone();
                 self.made(&to);
-                *file_mut(&mut self.files, &to) = SimFile { mode, link, blocks, ..SimFile::whole(bytes) };
+                *file_mut(&mut self.files, &to) = second;
                 self.disk.linked(&from, &to, &self.files);
                 self.changed(&to);
                 Done::Linked

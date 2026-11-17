@@ -65,6 +65,9 @@
 //!   order, through the ring (plant: the ring's back index forgets its front).
 //! - [`atomics`]: the named atomics mean what their docs say (their orderings are untested).
 //! - [`ranks`]: one lock-order token a task, back when dropped.
+//! - [`writers`]: processes publishing into one folder at once never fail one another, and a
+//!   reader sees each file absent or whole (plants: a temporary shared across processes, a
+//!   publish that replaces).
 //! - [`ancestors`]: the folders above the start are exactly the granted ones and only read;
 //!   a step past the top and a name back into the start are typed refusals.
 //!
@@ -146,6 +149,7 @@ mod syncs;
 mod unfinished;
 mod walk;
 mod world;
+mod writers;
 
 use std::{fmt, time::Duration};
 
