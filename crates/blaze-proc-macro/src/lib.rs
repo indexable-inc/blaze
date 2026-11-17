@@ -25,6 +25,8 @@ pub mod sandbox;
 
 // With `runtime`: running a module (the bridge, the host, the hook, build scripts).
 #[cfg(feature = "runtime")]
+pub mod fact_pins;
+#[cfg(feature = "runtime")]
 pub mod hook;
 #[cfg(feature = "runtime")]
 pub mod host;
@@ -32,6 +34,8 @@ pub mod host;
 pub mod native_sandbox;
 #[cfg(feature = "runtime")]
 pub mod native_script;
+#[cfg(feature = "runtime")]
+pub mod native_setting;
 #[cfg(feature = "runtime")]
 pub mod native_unit;
 #[cfg(feature = "runtime")]
@@ -51,6 +55,12 @@ pub mod spawn_route;
 #[cfg(feature = "runtime")]
 pub mod wire;
 
+#[cfg(all(test, feature = "runtime"))]
+mod fact_pins_tests;
+#[cfg(all(test, feature = "runtime"))]
+mod native_setting_tests;
+#[cfg(all(test, feature = "runtime"))]
+mod native_setting_nm_tests;
 #[cfg(all(test, feature = "runtime"))]
 mod script_tests;
 #[cfg(all(test, feature = "runtime"))]

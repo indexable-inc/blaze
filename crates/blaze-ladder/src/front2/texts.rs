@@ -3,9 +3,8 @@
 //! first in the caller's order so a refusal's file index is the index the rungs already quote.
 //! A row lends the library's text and outline; nothing is copied.
 //!
-//! The user's crate root holds the appended entry module (`__blaze_entry`, std.md): its row
-//! lends the library's text, which is the caller's file with that module after its last byte,
-//! so every position the caller's file has is the same in it.
+//! The user's crate root is the caller's file as written (D104: nothing is appended; its
+//! `fn main` is `std::main`'s input), so every position the caller's file has is the same in it.
 
 use std::alloc::Global;
 use std::vec::Vec;

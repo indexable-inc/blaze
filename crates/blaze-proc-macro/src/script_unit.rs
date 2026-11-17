@@ -25,7 +25,11 @@ use blaze_unit_graph::{Unit, UnitGraph, UnitId, UnitKind};
 use crate::{
     native_unit::{NativeSetting, NativeUnitError, native_outputs, placed},
     script::{LoadedScript, ScriptError, ScriptRun, ScriptRuntime},
-    script_sandbox::{Script, Tree, owned_env},
+    script_sandbox::{
+        Script, ScriptRoot, Tree,
+        dep_mount::{self, DepProducer, DepViewError, DepViews},
+        owned_env,
+    },
 };
 
 /// What every script of one graph shares.
@@ -43,6 +47,9 @@ pub struct Setting<'s> {
     /// The pinned C toolchain and SDK native scripts run with; `None` where the command has
     /// none (a native script is then refused by name, never run as wasm).
     pub native: Option<NativeSetting<'s>>,
+    /// What the command's setting says about spawns, chosen once per command
+    /// (`crate::fact_pins::command_spawn_setting`): every script of the graph gets it.
+    pub spawn_setting: Arc<crate::spawn_route::SpawnSetting>,
 }
 
 /// A script ready to run: its loaded module, its sandboxed inputs, its environment.
@@ -74,6 +81,8 @@ pub enum UnitScriptError {
     LinksCycle { package: String },
     /// A native script's run (D65): its setting, binary, key, record or run.
     Native(NativeUnitError),
+    /// A `links` dependency's metadata names a path the script cannot be served (brief S1).
+    DepView { package: String, why: DepViewError },
 }
 
 impl std::fmt::Display for UnitScriptError {
@@ -96,6 +105,7 @@ impl std::fmt::Display for UnitScriptError {
             ),
             UnitScriptError::LinksCycle { package } => write!(f, "the build script of {package} is in a cycle of `links` metadata"),
             UnitScriptError::Native(error) => write!(f, "{error}"),
+            UnitScriptError::DepView { package, why } => write!(f, "the build script of {package}: {why}"),
         }
     }
 }
@@ -157,9 +167,10 @@ fn package(unit: &Unit<'_>) -> String {
     format!("{} {}", unit.name.as_str(), unit.version.as_str())
 }
 
-/// `script`'s module loaded and its inputs made: `tree` and `folder` are its package's files
-/// (`script_sandbox::dir_tree` for a workspace member with its folder, `mem_tree` for a
-/// fetched package with an empty folder). `deps` is the `links` metadata of the served unit's
+/// `script`'s module loaded and its inputs made: `tree` and `root` are its package's files
+/// and what it sees (`script_sandbox::dir_tree` of the workspace with `ScriptRoot::member(dir)`
+/// for a member, `mem_tree` with `ScriptRoot::package()` for a fetched package; D96). `deps` is
+/// the `links` metadata of the served unit's
 /// direct dependencies ([`dep_metadata`] of each of [`links_inputs`]); it is in the
 /// environment, so in the run's key.
 #[allow(clippy::too_many_arguments)]
@@ -169,8 +180,26 @@ pub fn prepare<'a>(
     graph: &UnitGraph<'_>,
     script: UnitId,
     tree: Tree,
-    folder: String,
+    root: ScriptRoot,
     deps: &[DepMetadata<'_>],
+    alloc: Alloc<'a>,
+) -> Result<Prepared<'a>, UnitScriptError> {
+    prepare_viewing(runtime, setting, graph, script, tree, root, deps, DepViews::none(), alloc)
+}
+
+/// [`prepare`] with `views`, the read-only mounts of the script's `links` dependencies
+/// ([`dep_mount::view`], brief S1); `deps` are then the values as the script sees them
+/// ([`dep_mount::Viewed::values`]).
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_viewing<'a>(
+    runtime: &ScriptRuntime,
+    setting: &Setting<'_>,
+    graph: &UnitGraph<'_>,
+    script: UnitId,
+    tree: Tree,
+    root: ScriptRoot,
+    deps: &[DepMetadata<'_>],
+    views: DepViews,
     alloc: Alloc<'a>,
 ) -> Result<Prepared<'a>, UnitScriptError> {
     let unit = graph.units.get(script.index()).ok_or(UnitScriptError::NotAScript { unit: script })?;
@@ -190,12 +219,12 @@ pub fn prepare<'a>(
     let wasm = std::fs::read(&path).map_err(|error| UnitScriptError::ReadModule { path, error })?;
     let loaded = runtime.load(&package, &wasm).map_err(UnitScriptError::Script)?;
     let facts = PackageFacts { name: unit.name.as_str(), version: unit.version.as_str(), links: unit.links.as_ref().map(|l| l.as_str()), ..PackageFacts::default() };
-    let given = Given { package: facts, folder: &folder, features: &unit.features, target_cfg: &serves.cfg, target: setting.target, host: setting.host, deps };
+    let given = Given { package: facts, seen: root.seen(), features: &unit.features, target_cfg: &serves.cfg, target: setting.target, host: setting.host, deps };
     let env = blaze_build_script::env(&given, alloc);
     let script = Arc::new(Script {
         package,
         tree,
-        folder,
+        root,
         env: owned_env(&env),
         target: setting.target.to_owned(),
         host: setting.host.to_owned(),
@@ -204,7 +233,8 @@ pub fn prepare<'a>(
         table: Arc::clone(&setting.table),
         spawner: None,
         step: blaze_ids::ContentId::default(),
-        spawn_setting: Arc::new(crate::spawn_route::SpawnSetting::off()),
+        spawn_setting: Arc::clone(&setting.spawn_setting),
+        deps: Arc::new(views),
     });
     Ok(Prepared { loaded, script, env })
 }
@@ -220,7 +250,7 @@ pub fn outputs<'a>(
     graph: &UnitGraph<'_>,
     script: UnitId,
     tree: Tree,
-    folder: String,
+    root: ScriptRoot,
     deps: &[DepMetadata<'_>],
     alloc: Alloc<'a>,
 ) -> Result<ScriptRun<'a>, UnitScriptError> {
@@ -230,12 +260,48 @@ pub fn outputs<'a>(
     }
     match placed(graph, script, setting.mode, alloc) {
         Runner::Wasm => {
-            let prepared = prepare(runtime, setting, graph, script, tree, folder, deps, alloc)?;
+            let prepared = prepare(runtime, setting, graph, script, tree, root, deps, alloc)?;
             runtime.run(&prepared.loaded, prepared.script, &prepared.env, alloc).map_err(UnitScriptError::Script)
         }
         Runner::Native { because } => {
             let serves = served(graph, script).ok_or_else(|| UnitScriptError::ServesNothing { package: package(unit) })?;
-            native_outputs(runtime, setting, graph, script, serves, because, tree, folder, deps, alloc).map_err(UnitScriptError::Native)
+            native_outputs(runtime, setting, graph, script, serves, because, tree, root, deps, alloc).map_err(UnitScriptError::Native)
+        }
+    }
+}
+
+/// [`outputs`] for a script whose `links` dependencies' runs are `producers` (each with its
+/// `links`), so the paths in `deps` are served (brief S1): a wasm script is given the values
+/// as it sees them and the producers' files read-only ([`dep_mount::view`]). A native script
+/// (D112) is still given `deps` as written, with no mounts (not built yet: the native sandbox
+/// would need the same mounts as folders of the host).
+#[allow(clippy::too_many_arguments)]
+pub fn outputs_viewing<'a>(
+    runtime: &ScriptRuntime,
+    setting: &Setting<'_>,
+    graph: &UnitGraph<'_>,
+    script: UnitId,
+    tree: Tree,
+    root: ScriptRoot,
+    deps: &[DepMetadata<'_>],
+    producers: &[(&str, &DepProducer)],
+    alloc: Alloc<'a>,
+) -> Result<ScriptRun<'a>, UnitScriptError> {
+    let unit = graph.units.get(script.index()).ok_or(UnitScriptError::NotAScript { unit: script })?;
+    if unit.kind != UnitKind::BuildScript {
+        return Err(UnitScriptError::NotAScript { unit: script });
+    }
+    match placed(graph, script, setting.mode, alloc) {
+        Runner::Wasm => {
+            let viewed = dep_mount::view(&tree, producers, deps, alloc).map_err(|why| UnitScriptError::DepView { package: package(unit), why })?;
+            let seen: Vec<DepMetadata<'_>> =
+                deps.iter().zip(viewed.values.iter()).map(|(dep, value)| DepMetadata { links: dep.links, key: dep.key, value: value.as_str() }).collect();
+            let prepared = prepare_viewing(runtime, setting, graph, script, tree, root, &seen, viewed.views, alloc)?;
+            runtime.run(&prepared.loaded, prepared.script, &prepared.env, alloc).map_err(UnitScriptError::Script)
+        }
+        Runner::Native { because } => {
+            let serves = served(graph, script).ok_or_else(|| UnitScriptError::ServesNothing { package: package(unit) })?;
+            native_outputs(runtime, setting, graph, script, serves, because, tree, root, deps, alloc).map_err(UnitScriptError::Native)
         }
     }
 }
@@ -304,13 +370,13 @@ pub fn dep_metadata<'o>(links: &'o str, outputs: &'o Outputs<'_>) -> impl Iterat
 
 /// Every build-script unit of `graph` run for the unit it serves, in [`links_order`], keyed by
 /// that unit: what a reader of the outputs by library takes (blaze-world's `ScriptOutputs`).
-/// `files` gives a package's tree and folder, or `None`. A script whose `links` input gave no
+/// `files` gives a package's tree and what its script sees (D96), or `None`. A script whose `links` input gave no
 /// outputs is not run: it fails naming that dependency.
 pub fn outputs_by_served<'a>(
     runtime: &ScriptRuntime,
     setting: &Setting<'_>,
     graph: &UnitGraph<'_>,
-    mut files: impl FnMut(&Unit<'_>) -> Option<(Tree, String)>,
+    mut files: impl FnMut(&Unit<'_>) -> Option<(Tree, ScriptRoot)>,
     alloc: Alloc<'a>,
 ) -> (Vec<(UnitId, ScriptRun<'a>)>, Vec<(UnitId, UnitScriptError)>) {
     let (mut done, mut failed): (Vec<(UnitId, ScriptRun<'a>)>, Vec<(UnitId, UnitScriptError)>) = (Vec::new(), Vec::new());
@@ -318,8 +384,10 @@ pub fn outputs_by_served<'a>(
         Ok(order) => order,
         Err(error) => return (done, vec![(UnitId(u32::MAX), error)]),
     };
-    // Each script's run, by the script unit, for its dependents' metadata.
+    // Each script's run, by the script unit, for its dependents' metadata; and, for a script
+    // whose served unit has `links`, what its dependents' scripts are served of it (brief S1).
     let mut ran_by_script: Vec<(UnitId, usize)> = Vec::new();
+    let mut producers: Vec<(UnitId, DepProducer)> = Vec::new();
     for script in order {
         let unit = &graph.units[script.index()];
         let Some(serves) = served(graph, script) else {
@@ -327,11 +395,16 @@ pub fn outputs_by_served<'a>(
             continue;
         };
         let mut deps = Vec::new();
+        let mut given: Vec<(&str, &DepProducer)> = Vec::new();
         let mut missing = None;
         for (input, links) in links_inputs(graph, script) {
-            match ran_by_script.iter().find(|(s, _)| *s == input) {
-                Some((_, at)) => deps.extend(dep_metadata(links, &done[*at].1.outputs)),
-                None => {
+            let producer = producers.iter().find(|(s, _)| *s == input).map(|(_, producer)| producer);
+            match (ran_by_script.iter().find(|(s, _)| *s == input), producer) {
+                (Some((_, at)), Some(producer)) => {
+                    deps.extend(dep_metadata(links, &done[*at].1.outputs));
+                    given.push((links, producer));
+                }
+                _ => {
                     let dependency = package(&graph.units[input.index()]);
                     missing = Some(UnitScriptError::Dependency { package: package(unit), dependency, links: links.to_owned() });
                     break;
@@ -342,12 +415,18 @@ pub fn outputs_by_served<'a>(
             failed.push((serves, error));
             continue;
         }
-        let Some((tree, folder)) = files(unit) else {
+        let Some((tree, root)) = files(unit) else {
             failed.push((serves, UnitScriptError::NoFiles { package: package(unit) }));
             continue;
         };
-        match outputs(runtime, setting, graph, script, tree, folder, &deps, alloc) {
+        // Brief S1b: what is upstream of this script, for its readers (a forwarded path).
+        let upstream = DepProducer::closure(&given);
+        let ran = outputs_viewing(runtime, setting, graph, script, tree.clone(), root.clone(), &deps, &given, alloc);
+        match ran {
             Ok(ran) => {
+                if graph.units[serves.index()].links.is_some() {
+                    producers.push((script, DepProducer::of(tree, root, &ran.outputs).with_upstream(upstream)));
+                }
                 ran_by_script.push((script, done.len()));
                 done.push((serves, ran));
             }
@@ -377,7 +456,7 @@ mod tests {
         let deps: Vec<_> = dep_metadata("aws-lc", &sys).collect();
         let given = |deps| Given {
             package: PackageFacts { name: "user", version: "1.0.0", ..PackageFacts::default() },
-            folder: "",
+            seen: blaze_expand::seen::SeenRoot::Package,
             features: &[],
             target_cfg: &[],
             target: "aarch64-apple-darwin",

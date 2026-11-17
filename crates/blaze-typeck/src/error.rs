@@ -108,6 +108,14 @@ pub enum CheckError {
     /// its trait `trait_` has `expected` parameters besides `Self` (a list given `Self` first is
     /// one too long): checked where the answer enters, so no goal silently matches no impl.
     ImplTraitArity { impl_: crate::ids::ItemKey, trait_: crate::ids::ItemKey, expected: u32, got: u32 },
+    /// A goal of `trait_` left ambiguous on `opaque` (its self type, the trait then an auto
+    /// trait; or inside the goal's types, where an auto trait of it may be reached through
+    /// impls, structure or an unsizing) because the world gave no hidden type for the opaque
+    /// (`World::opaque_hidden` answered `None`): auto traits "leak" from the hidden type (the
+    /// Reference, "Impl trait", "Auto trait leakage"), so a world that can define it
+    /// (blaze-ladder front2/opaque_auto.rs) does and checks the body again; any other world
+    /// reports it as this named gap (rules/opaque_def.rs `opaque_ambiguity_gap`).
+    OpaqueHiddenUnknown { opaque: crate::ids::ItemKey, trait_: crate::ids::ItemKey },
 }
 
 /// Which recorded fact of a body: the one [`CheckError::UnknownInCleanBody`] names.
@@ -145,6 +153,11 @@ impl core::fmt::Display for CheckError {
                 f,
                 "blaze-typeck: impl {:032x} gives {got} arguments after `Self` to trait {:032x}, which has {expected} besides `Self` (a list with `Self` first?)",
                 impl_.0, trait_.0
+            ),
+            CheckError::OpaqueHiddenUnknown { opaque, trait_ } => write!(
+                f,
+                "blaze-typeck: a goal of the trait {:032x} reaches an auto trait of the opaque type {:032x}: its hidden type was not given by the world",
+                trait_.0, opaque.0
             ),
         }
     }

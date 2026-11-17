@@ -21,7 +21,10 @@ use core::alloc::Allocator;
 
 use blaze_typeck::{ItemKey, PNode, PTy, PTys};
 
+mod outlives;
 mod value;
+
+pub use outlives::container_declares_type_outlives;
 
 pub use value::{CallableRefusal, read_callable_param};
 
@@ -57,11 +60,22 @@ pub struct SigBuf<A: Allocator + Clone> {
     pub regions: Vec<Region, A>,
     pub ends: Vec<u32, A>,
     pub bounds: Vec<(Region, Region), A>,
+    /// `(name, region)`: the fn declares `name: region` on a type parameter (`T: 'a`,
+    /// `where T: Tr + 'static`), the name as written (outlives.rs).
+    pub type_outlives: Vec<(blaze_typeck::Name, Region), A>,
+    /// A type-outlives bound whose left side is not one bare name (`Self: 'a`, `&'b T: 'a`).
+    pub type_outlives_unread: bool,
 }
 
 impl<A: Allocator + Clone> SigBuf<A> {
     pub fn new_in(alloc: A) -> SigBuf<A> {
-        SigBuf { regions: Vec::new_in(alloc.clone()), ends: Vec::new_in(alloc.clone()), bounds: Vec::new_in(alloc) }
+        SigBuf {
+            regions: Vec::new_in(alloc.clone()),
+            ends: Vec::new_in(alloc.clone()),
+            bounds: Vec::new_in(alloc.clone()),
+            type_outlives: Vec::new_in(alloc),
+            type_outlives_unread: false,
+        }
     }
 
     pub fn life(&self) -> SigLife<'_> {
@@ -709,6 +723,8 @@ pub fn read_signature<A: Allocator + Clone>(
     out.regions.clear();
     out.ends.clear();
     out.bounds.clear();
+    out.type_outlives.clear();
+    out.type_outlives_unread = false;
     let mut r = Reader {
         text,
         tys,
@@ -834,5 +850,7 @@ pub fn read_signature<A: Allocator + Clone>(
     if out.regions.iter().any(|x| *x == Region::Hidden(u32::MAX)) {
         return Err(SigRefusal::Unaligned { at: r.at(params.0) });
     }
+    let wheres = if where_at < end { Some((where_at + 1, end)) } else { None };
+    r.type_outlives(generics, wheres, &mut out.type_outlives, &mut out.type_outlives_unread)?;
     Ok(())
 }

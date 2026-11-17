@@ -145,10 +145,22 @@ pub fn run(cx: &Cx, root: &Dir<ReadWrite>, launch: &Launch<'_>, frame: &Frame) -
     }
     // bstd's host takes its arguments and grants as owned strings: once per run, Global.
     let args = launch.args.iter().map(|arg| std::string::String::from(*arg)).collect();
-    let grants = launch.grants.iter().map(|(name, value)| (std::string::String::from(*name), std::string::String::from(*value))).collect();
+    // `--grant <name>=<value>` is the design's order; the host's list is `(kind, name)`
+    // (host_grants.rs): read each, refusing a scope the hosted wire cannot carry.
+    let grants = launch
+        .grants
+        .iter()
+        .enumerate()
+        .map(|(at, (name, value))| {
+            crate::host_grants::host_grant(at + 1, name, value)
+                .map(|(kind, name)| (std::string::String::from(kind), std::string::String::from(name)))
+        })
+        .collect::<Result<std::vec::Vec<_>, _>>()
+        .map_err(CliError::HostGrant)?;
     // clone: the command's world, a refcount.
     // D102: blaze-cli's entry does not hand its heap down yet; this moves with blaze-cli.
-    let hosting = Hosting::new(launch.io.clone(), args, grants, EXCHANGE, blaze_own::SharedAlloc::global());
+    let shared = blaze_own::SharedAlloc::global();
+    let hosting = Hosting::new(launch.io.clone(), args, grants, EXCHANGE, shared);
     let table = hosting.table();
     let host = NonNull::from(&table).cast::<c_void>();
     // The new front end's inputs: the package as its manifest names it, and the toolchain's
@@ -161,7 +173,7 @@ pub fn run(cx: &Cx, root: &Dir<ReadWrite>, launch: &Launch<'_>, frame: &Frame) -
     let shelf = home.map(|home| bstd::mem::format_in!(frame, "{}/{}", home.trim_end_matches('/'), crate::toolchain::SHELF));
     let overflow = dev_overflow(&cx, root, frame)?;
     let new = NewFront { package, edition, shelf: shelf.as_ref().map(|shelf| shelf.as_str()), overflow };
-    let ran = blaze_ladder::run::run_program(&files, ROOT, Some(host), new).map_err(CliError::Program);
+    let ran = blaze_ladder::run::run_program(&files, ROOT, Some(host), new, shared).map_err(CliError::Program);
     // The table points into the host: both are dropped only after the program returned.
     drop(table);
     drop(hosting);

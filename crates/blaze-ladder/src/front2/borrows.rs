@@ -18,13 +18,17 @@
 
 use blaze_flow::loans::{Access, conflicts, for_each_access};
 use blaze_flow::{BorrowFinding, BorrowKind, Flow, Loan, MoveFindingKind, MoveOut, Point, StmtKind, Value};
-use blaze_flow_lower::{AdtFacts, CalleeFacts, Facts, Refusal, SigBuf, SigLife, SigRefusal, lower, read_signature};
+use blaze_flow_lower::{AdtFacts, CalleeFacts, Facts, Refusal, SigBuf, SigLife, SigRefusal, read_signature};
 use blaze_own::{AVec, Alloc};
 use blaze_typeck as tc;
 use core::alloc::Allocator;
 
 use super::body::Body;
+use super::borrow_reads::{AdtAnswer, AskedAdts, HeadAnswer, adt_read, file_borrow_reads, head_read};
 use super::check::{Records, answer_impls, eval_len};
+use super::reads::Read;
+use super::borrows_nested::{FlowOf, NestedFacts, next_nested};
+use super::stalled_goals::{AsyncInteriors, Decision, Stalls, decide_stalled_goals};
 use super::heads::{HeadError, Want, member_fn_want};
 use super::index::Index;
 use super::keys::{Keys, Origin, checker_of};
@@ -70,6 +74,10 @@ pub enum BorrowRefused {
     Lower(Refusal),
     /// A check went past its stated bound (rule 18): a bug of the checker, named.
     Bound(blaze_flow::Bound),
+    /// A closure's or async block's body needs a lifetime relation among its captures,
+    /// parameters and result that its owner would have to prove (the closure's region
+    /// requirements, not built: borrows_nested.rs): at the item-relative range of the first.
+    NestedOutlives { start: u32, end: u32 },
 }
 
 impl BorrowRefused {
@@ -82,6 +90,7 @@ impl BorrowRefused {
             BorrowRefused::TypeTable(_) => "the body's type table could not be read",
             BorrowRefused::Lower(_) => "the flow lowering refused a form",
             BorrowRefused::Bound(_) => "the check went past its bound",
+            BorrowRefused::NestedOutlives { .. } => "a closure or async block needs a lifetime relation its owner must prove (not built)",
         }
     }
 
@@ -89,6 +98,7 @@ impl BorrowRefused {
     pub fn range(&self) -> Option<(u32, u32)> {
         match self {
             BorrowRefused::Lower(r) => Some((r.range.start, r.range.end)),
+            BorrowRefused::NestedOutlives { start, end } => Some((*start, *end)),
             _ => None,
         }
     }
@@ -143,11 +153,21 @@ pub struct BorrowFacts<'a> {
     sigs: AVec<'a, (u128, SigBuf<Alloc<'a>>)>,
     /// Each fn whose signature text was not read, and why.
     sig_refused: AVec<'a, (u128, SigRefusal)>,
+    /// Each head's declared type-outlives bounds and their read rows (front2 call_generics.rs):
+    /// a call of a head that writes lifetimes, with lifetime-carrying generic arguments, is
+    /// related through them (blaze-flow-lower generic_call.rs, pieces BR3 and BR4).
+    calls: super::call_generics::CallBoundsTable<'a>,
+    /// The generic shape of each callee head whose signature was read (blaze-flow-lower
+    /// `read_shape`): a call whose type arguments carry origins is related through it.
+    shapes: AVec<'a, (u128, blaze_flow_lower::ShapeBuf<Alloc<'a>>)>,
     /// The body's owner and its callees, sorted: the fns whose heads were asked.
     items: AVec<'a, u128>,
     /// Each ADT whose `Copy` or `Drop` answer was not known (the census takes it as `false`;
     /// the command refuses the body: [`BorrowRefused::FactUnknown`]).
     unknown: AVec<'a, (u128, &'static str)>,
+    /// One read row per ADT and per head the facts were taken of (front2 borrow_reads.rs),
+    /// for the body's read list (rule 21).
+    reads: AVec<'a, Read>,
 }
 
 impl<'a> BorrowFacts<'a> {
@@ -159,9 +179,18 @@ impl<'a> BorrowFacts<'a> {
             callees: AVec::new_in(alloc),
             sigs: AVec::new_in(alloc),
             sig_refused: AVec::new_in(alloc),
+            calls: super::call_generics::CallBoundsTable::new_in(alloc),
+            shapes: AVec::new_in(alloc),
             items: AVec::new_in(alloc),
             unknown: AVec::new_in(alloc),
+            reads: AVec::new_in(alloc),
         }
+    }
+
+    /// What the facts were read from, as rows of the body's read list (front2
+    /// borrow_reads.rs): one `BorrowAdt` per ADT, one `BorrowHead` per head, unsorted.
+    pub fn reads(&self) -> &[Read] {
+        &self.reads
     }
 
     /// The fns whose heads were asked: the body's owner and its callees, by checker key.
@@ -186,6 +215,9 @@ impl<'a> BorrowFacts<'a> {
 }
 
 impl Facts for BorrowFacts<'_> {
+    fn call_bounds(&self, item: tc::ItemKey) -> Option<blaze_flow_lower::CallBounds<'_>> {
+        self.calls.get(item)
+    }
     fn sig(&self, item: tc::ItemKey) -> Option<SigLife<'_>> {
         let at = self.sigs.binary_search_by_key(&item.0, |(k, _)| *k).ok()?;
         self.sigs.get(at).map(|(_, s)| s.life())
@@ -208,6 +240,10 @@ impl Facts for BorrowFacts<'_> {
     }
     fn param_copy(&self, _: u32) -> bool {
         false
+    }
+    fn shape(&self, item: tc::ItemKey) -> Option<blaze_flow_lower::Shape<'_>> {
+        let at = self.shapes.binary_search_by_key(&item.0, |(k, _)| *k).ok()?;
+        self.shapes.get(at).map(|(_, s)| s.shape())
     }
 }
 
@@ -281,8 +317,12 @@ pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owne
         {
             ensure_one(r, Want::Adt(lib));
         }
-        let Some(row) = r.store.adts.get(&key) else { continue };
+        let Some(row) = r.store.adts.get(&key) else {
+            g.reads.push(adt_read(k, AdtAnswer::NotMade));
+            continue;
+        };
         let kind = row.kind;
+        let (variants_from, fields_from) = (g.variants.len(), g.fields.len());
         for (vi, v) in row.variants.iter().enumerate() {
             let first = g.fields.len() as u32;
             for f in row.fields.get(v.fields.range()).unwrap_or(&[]) {
@@ -298,16 +338,24 @@ pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owne
         if drop_impl.is_none() {
             g.unknown.push((k, "Drop"));
         }
-        let copy = copy.unwrap_or(false);
-        g.adts.push((k, AdtFacts {
-            copy,
+        let copy_taken = copy.unwrap_or(false);
+        let facts = AdtFacts {
+            copy: copy_taken,
             drop_impl: drop_impl.unwrap_or(false),
-            needs_drop: !copy,
+            needs_drop: !copy_taken,
             lifetimes: adt_head_lifetimes(&*r.keys, r.names, key),
             union: kind == tc::AdtKind::Union,
             is_enum: kind == tc::AdtKind::Enum,
             is_box: Some(key) == langs.owned_box,
-        }));
+        };
+        g.adts.push((k, facts));
+        // The row of what was taken (rule 21): the answers as asked, unknown included.
+        let mut variant_lens: AVec<'a, u32> = AVec::new_in(alloc);
+        for &(_, _, _, count) in g.variants[variants_from..].iter() {
+            variant_lens.push(count);
+        }
+        let read = adt_read(k, AdtAnswer::Made { copy, drop_impl, facts, variant_lens: &variant_lens, fields: &g.fields[fields_from..] });
+        g.reads.push(read);
     }
     let mut items: AVec<'a, u128> = AVec::new_in(alloc);
     for k in c.callees.column::<1>().iter() {
@@ -340,17 +388,64 @@ pub fn gather_facts<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, owne
                 None => {}
             }
         }
-        let Some(f) = r.store.fns.get(&key) else { continue };
+        let Some(f) = r.store.fns.get(&key) else {
+            g.reads.push(head_read(k, HeadAnswer::NotMade));
+            continue;
+        };
         let tys = r.store.tys.view();
         let self_ref = f.self_param && f.inputs.first().is_some_and(|&t| matches!(tys.node(t), Ok(tc::PNode::Ref(..))));
-        g.callees.push((k, CalleeFacts { writes_lifetimes: writes_lifetime(f.text), self_ref }));
+        let callee = CalleeFacts { writes_lifetimes: writes_lifetime(f.text), self_ref };
+        g.callees.push((k, callee));
+        let (keys, names) = (&*r.keys, r.names);
+        // Each ADT the reading asks about is part of what this head's row says (rule 21).
+        let asked = AskedAdts::new_in(alloc);
+        let adt_lifetimes = |a: tc::ItemKey| {
+            let lifetimes = adt_head_lifetimes(keys, names, a);
+            asked.note(a, lifetimes);
+            Some(lifetimes)
+        };
+        let mut buf = SigBuf::new_in(alloc);
+        let read = read_signature(f.text, tys, &f.inputs[..], f.output, &adt_lifetimes, &mut buf, alloc);
+        let adts = asked.take_sorted();
+        match read {
+            Ok(()) => {
+                g.reads.push(head_read(k, HeadAnswer::Made { callee, sig: Ok(buf.life()), adts: &adts }));
+                g.sigs.push((k, buf));
+            }
+            Err(why) => {
+                g.reads.push(head_read(k, HeadAnswer::Made { callee, sig: Err(why), adts: &adts }));
+                g.sig_refused.push((k, why));
+            }
+        }
+    }
+    // The generic shape of each head whose lifetime part was read: where its type parameters
+    // stand among its positions (blaze-flow-lower generic_call.rs). A head whose shape cannot
+    // be lined up has none, and a call of it with type arguments that carry origins keeps the
+    // one origin.
+    for &k in items.iter() {
+        if g.sigs.binary_search_by_key(&k, |(x, _)| *x).is_err() {
+            continue;
+        }
+        let Some(f) = r.store.fns.get(&tc::ItemKey(k)) else { continue };
+        let tys = r.store.tys.view();
         let (keys, names) = (&*r.keys, r.names);
         let adt_lifetimes = |a: tc::ItemKey| Some(adt_head_lifetimes(keys, names, a));
-        let mut buf = SigBuf::new_in(alloc);
-        match read_signature(f.text, tys, &f.inputs[..], f.output, &adt_lifetimes, &mut buf, alloc) {
-            Ok(()) => g.sigs.push((k, buf)),
-            Err(why) => g.sig_refused.push((k, why)),
+        let mut shape = blaze_flow_lower::ShapeBuf::new_in(alloc);
+        if blaze_flow_lower::read_shape(tys, &f.inputs[..], f.output, &adt_lifetimes, &mut shape, alloc).is_ok() {
+            g.shapes.push((k, shape));
         }
+    }
+    // Each head's declared type-outlives bounds, from the lifetime part just read and its
+    // container's header (front2 call_generics.rs), and their read rows (rule 21).
+    for &k in items.iter() {
+        let key = tc::ItemKey(k);
+        let head = r.store.fns.get(&key);
+        let sig = g.sigs.binary_search_by_key(&k, |(x, _)| *x).ok().and_then(|i| g.sigs.get(i)).map(|(_, b)| b);
+        let container = match r.keys.origin(key) {
+            Some(Origin::Member { container, .. }) => Some(r.keys.library_in(r.names, *container).and_then(|lib| r.names.text_of(lib)).map(|t| t.text)),
+            _ => None,
+        };
+        g.calls.gather(k, head, sig, container, alloc);
     }
     g.items = items;
     g
@@ -402,7 +497,14 @@ fn invalidated_words<A: Allocator>(flow: &Flow<A>, at: Point, loan: Loan) -> (&'
 
 /// The move and borrow check of `body`, whose type check gave `done`: the facts gathered, the
 /// body lowered to its flow, then the move check and the loans tiers.
-fn borrows_of<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, body: &Body<'n>, done: &tc::Checked<'_>, alloc: Alloc<'a>) -> BorrowVerdict<'a> {
+fn borrows_of<'n, 'a, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    body: &Body<'n>,
+    done: &tc::Checked<'_>,
+    reads: &mut AVec<'a, Read>,
+    interiors: &mut AsyncInteriors<'a>,
+    alloc: Alloc<'a>,
+) -> BorrowVerdict<'a> {
     let mut verdict = BorrowVerdict::new_in(alloc);
     if !done.diags.is_empty() {
         verdict.refused = Some(BorrowRefused::Untyped(Untyped::TypeErrors));
@@ -410,6 +512,9 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, body: &Bod
     }
     let langs = BorrowLangs::of(r.index);
     let facts = gather_facts(r, body.owner, done, langs, alloc);
+    // Everything below reads these facts, a refusal included: all of them are the body's reads.
+    reads.extend_from_slice(facts.reads());
+    reads.extend_from_slice(facts.calls.reads());
     if let Some(&(adt, fact)) = facts.unknown().first() {
         verdict.refused = Some(BorrowRefused::FactUnknown { adt: tc::ItemKey(adt), fact });
         return verdict;
@@ -422,32 +527,67 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, body: &Bod
         }
     };
     let view = body.typeck.view(tys);
-    let lowered = match lower(&view, done, &facts, alloc) {
-        Ok(l) => l,
-        Err(refusal) => {
-            verdict.refused = Some(BorrowRefused::Lower(refusal));
-            return verdict;
-        }
-    };
-    let record = match blaze_flow::check(&lowered.flow, alloc) {
-        Ok(record) => record,
-        Err(bound) => {
-            verdict.refused = Some(BorrowRefused::Bound(bound));
-            return verdict;
-        }
-    };
-    for m in record.moves.iter() {
-        let (code, text) = move_words(m.kind);
-        verdict.findings.push(BorrowDiagnostic { start: m.span.lo, end: m.span.hi, code, text });
-    }
-    for b in record.borrows.iter() {
-        let (span, (code, text)) = match *b {
-            BorrowFinding::Invalidated { at, loan, span } => (span, invalidated_words(&lowered.flow, at, loan)),
-            BorrowFinding::UnprovenOutlives { span, .. } => {
-                (span, ("outlives", "a lifetime must outlive another and the signature does not say so"))
+    // The body's own flow, then each closure's and async block's body as a flow of its own
+    // (borrows_nested.rs), in expression order: the verdict is all of them, and a refusal of
+    // any is the body's (findings already made are kept; the body is still not a pass).
+    let nested = NestedFacts::new(&facts);
+    let mut next = Some(FlowOf::Owner);
+    while let Some(of) = next {
+        // An async block's lowering also gives its exact interior when a goal stalled
+        // (stalled_goals.rs): lowered once, for both.
+        let (flow, params) = match interiors.flow_of(of, &view, done, &nested, alloc) {
+            Ok(f) => f,
+            Err(refusal) => {
+                verdict.refused = Some(BorrowRefused::Lower(refusal));
+                break;
             }
         };
-        verdict.findings.push(BorrowDiagnostic { start: span.lo, end: span.hi, code, text });
+        let record = match blaze_flow::check(&flow, alloc) {
+            Ok(record) => record,
+            Err(bound) => {
+                verdict.refused = Some(BorrowRefused::Bound(bound));
+                break;
+            }
+        };
+        for m in record.moves.iter() {
+            let (code, text) = move_words(m.kind);
+            verdict.findings.push(BorrowDiagnostic { start: m.span.lo, end: m.span.hi, code, text });
+        }
+        for b in record.borrows.iter() {
+            let (span, (code, text)) = match *b {
+                BorrowFinding::Invalidated { at, loan, span } => (span, invalidated_words(&flow, at, loan)),
+                // A nested body's outlives result is its owner's to prove: refused, never a finding.
+                BorrowFinding::UnprovenOutlives { span, .. } if of.is_nested() => {
+                    if verdict.refused.is_none() {
+                        verdict.refused = Some(BorrowRefused::NestedOutlives { start: span.lo, end: span.hi });
+                    }
+                    continue;
+                }
+                // From a placeholder of the body's type parameter (blaze-flow-lower
+                // param_outlives.rs): E0310 when every bound on it was read; else not checked,
+                // by name (as the nested arm above: findings already made are kept).
+                BorrowFinding::UnprovenOutlives { span, from, .. } => match params.iter().find(|p| p.origin == from) {
+                    Some(p) if p.certain => {
+                        (span, ("E0310", "the parameter type may not live long enough: the callee needs a bound the caller does not declare"))
+                    }
+                    Some(p) => {
+                        if verdict.refused.is_none() {
+                            verdict.refused = Some(BorrowRefused::Lower(Refusal {
+                                form: blaze_flow_lower::Form::ParamOutlivesUnread { param: p.param },
+                                range: tc::Range { start: span.lo, end: span.hi },
+                            }));
+                        }
+                        continue;
+                    }
+                    None => (span, ("outlives", "a lifetime must outlive another and the signature does not say so")),
+                },
+            };
+            verdict.findings.push(BorrowDiagnostic { start: span.lo, end: span.hi, code, text });
+        }
+        if verdict.refused.is_some() {
+            break;
+        }
+        next = next_nested(&view, of);
     }
     verdict.findings.sort_unstable();
     verdict.findings.dedup();
@@ -461,9 +601,22 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
     /// [`BorrowRefused::Untyped`]: not checked, never clean.
     pub fn check_borrows<'a>(&mut self, body: BodyRef<'n>, alloc: Alloc<'a>) -> (BodyVerdict<'a>, BorrowVerdict<'a>) {
         let mut borrows: Option<BorrowVerdict<'a>> = None;
-        let verdict = self.check_then(body, alloc, |r, lowered, done| {
-            borrows = Some(borrows_of(r, lowered, done, alloc));
+        let mut reads: AVec<'a, Read> = AVec::new_in(alloc);
+        let mut decision: Option<Decision<'a>> = None;
+        // The check files an auto-trait goal that fails only on an async block's superset
+        // interior as a stalled row; the borrow check lowers each async body once, and the
+        // rows are decided on the exact interiors of those lowerings (stalled_goals.rs).
+        let mut verdict = self.check_then(body, Stalls::Decide, alloc, |r, lowered, done| {
+            let mut interiors = AsyncInteriors::new_in(done, alloc);
+            borrows = Some(borrows_of(r, lowered, done, &mut reads, &mut interiors, alloc));
+            decision = Some(decide_stalled_goals(r, lowered, done, &interiors, &mut reads, alloc));
         });
+        // What the borrow verdict and the decision read, in the body's read list and its
+        // digest (rule 21: borrow_reads.rs, stalled_goals.rs).
+        file_borrow_reads(&mut verdict, &reads, alloc);
+        if let Some(decision) = decision {
+            decision.file(&mut verdict);
+        }
         let borrows = match borrows {
             Some(b) => b,
             None => {

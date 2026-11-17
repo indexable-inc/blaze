@@ -7,6 +7,8 @@ use blaze_own::{Alloc, String, Vec};
 use blaze_sim::Config;
 use blaze_unit_graph::CfgAtom;
 
+use blaze_expand::seen::SeenRoot;
+
 use crate::env::{DepMetadata, Given, PackageFacts, env};
 use crate::instr::{Instr, Line, LinkTo, Malformed, OutputError, OutputLimits, SearchKind, Syntax, flags, lines, parse};
 use crate::key::{CMode, KeyInputs, RunLimits, RunnerKey, base};
@@ -332,7 +334,7 @@ fn a_path_the_script_printed_into_out_dir_names_the_records_file() {
 fn given_env<'a>(features: &'a [blaze_unit_graph::Text<'a>], cfg: &'a [CfgAtom<'a>], deps: &'a [DepMetadata<'a>]) -> Given<'a, 'a> {
     Given {
         package: PackageFacts { name: "zstd-sys", version: "2.1.2+zstd.1.5.7", authors: "a:b", links: Some("zstd"), ..PackageFacts::default() },
-        folder: "",
+        seen: SeenRoot::Package,
         features,
         target_cfg: cfg,
         target: "aarch64-apple-darwin",
@@ -359,8 +361,12 @@ fn the_environment_of_a_unit() {
     let given = given_env(&features, &cfg, &deps);
     let env = env(&given, alloc);
     let get = |name: &str| env.get(name).unwrap_or_else(|| panic!("{name} unset"));
-    assert_eq!(get("CARGO_MANIFEST_DIR"), "/workspace");
-    assert_eq!(get("CARGO_MANIFEST_PATH"), "/workspace/Cargo.toml");
+    // D96 (2): a dependency's script sees the one package root, never `/workspace`.
+    assert_eq!(get("CARGO_MANIFEST_DIR"), "/package");
+    assert_eq!(get("CARGO_MANIFEST_PATH"), "/package/Cargo.toml");
+    // D96 (3): a member's sees its dir under its workspace.
+    let member = Given { seen: SeenRoot::member("crates/zstd").expect("a plain dir"), ..given };
+    assert_eq!(crate::env::env(&member, alloc).get("CARGO_MANIFEST_DIR"), Some("/workspace/crates/zstd"));
     assert_eq!(get("CARGO_MANIFEST_LINKS"), "zstd");
     assert_eq!(get("CARGO_FEATURE_ZDICT_BUILDER"), "1");
     assert_eq!(get("CARGO_CFG_TARGET_FEATURE"), "aes,neon");
@@ -410,11 +416,13 @@ fn missed(key: impl Fn(&KeyInputs<'_>) -> ContentId) -> Option<&'static str> {
     const SDK: &str = "macos-sdk 27.2";
     let native = KeyInputs { runner: RunnerKey::Native { compiler: [4; 32], target: "aarch64-apple-darwin", sysroot: SDK, host_tools: &[] }, ..at };
     // D71: a granted perl, and the same perl with another binary.
-    let perl = [crate::key::HostToolKey { name: "perl", digest: [8; 32] }];
-    let other_perl = [crate::key::HostToolKey { name: "perl", digest: [9; 32] }];
+    let perl = [crate::key::HostToolKey { name: "perl", digest: [8; 32], runs_out_dir: false }];
+    let other_perl = [crate::key::HostToolKey { name: "perl", digest: [9; 32], runs_out_dir: false }];
+    // D112, rule 21: the same perl whose row also grants starting what is under OUT_DIR.
+    let perl_out_dir = [crate::key::HostToolKey { name: "perl", digest: [8; 32], runs_out_dir: true }];
     let with_perl = KeyInputs { runner: RunnerKey::Native { compiler: [4; 32], target: "aarch64-apple-darwin", sysroot: SDK, host_tools: &perl }, ..at };
     let row = [probe::Row { key: ContentId([7; 32]), accepted: true }];
-    let changed: [(&str, KeyInputs<'_>, KeyInputs<'_>); 11] = [
+    let changed: [(&str, KeyInputs<'_>, KeyInputs<'_>); 12] = [
         ("module", at, KeyInputs { module: [2; 32], ..at }),
         ("env", at, KeyInputs { env: &env_b, ..at }),
         ("answers", at, KeyInputs { answers: Table { rows: &row }.id(), ..at }),
@@ -430,8 +438,43 @@ fn missed(key: impl Fn(&KeyInputs<'_>) -> ContentId) -> Option<&'static str> {
             with_perl,
             KeyInputs { runner: RunnerKey::Native { compiler: [4; 32], target: "aarch64-apple-darwin", sysroot: SDK, host_tools: &other_perl }, ..at },
         ),
+        (
+            "host tool runs_out_dir",
+            with_perl,
+            KeyInputs { runner: RunnerKey::Native { compiler: [4; 32], target: "aarch64-apple-darwin", sysroot: SDK, host_tools: &perl_out_dir }, ..at },
+        ),
     ];
     changed.iter().find(|(_, from, to)| key(from) == key(to)).map(|(name, _, _)| *name)
+}
+
+/// D112, rule 21: two host-tool rows that differ only in `runs_out_dir` (the grant to start
+/// what the script wrote under OUT_DIR, which widens the sandbox) give two run keys. The rows
+/// are parsed from text by `host_tools` and keyed by `HostToolKey::of`, as native_unit keys
+/// them; a key that drops the field (in `base` or in `of`) gives one key and fails here.
+/// Prints "runs_out_dir keyed: two rows, two keys".
+#[test]
+fn a_row_changed_only_in_runs_out_dir_changes_the_key() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let yes = r#"{"host_tools": {"t": {"sh": {"path": "/bin/sh", "reads": "", "runs": "", "needed_by": "x", "runs_out_dir": "yes"}, "names": "sh"}}}"#;
+    let no = r#"{"host_tools": {"t": {"sh": {"path": "/bin/sh", "reads": "", "runs": "", "needed_by": "x", "runs_out_dir": "no"}, "names": "sh"}}}"#;
+    let features = [String::from_str_in("std", alloc)];
+    let e = env(&given_env(&features, &[], &[]), alloc);
+    let key_of = |text: &str| -> ContentId {
+        let tools = crate::host_tools::host_tools(text, "t", alloc).expect("a whole row");
+        let keys = [crate::key::HostToolKey::of(&tools[0], "sh", [8; 32])];
+        let inputs = KeyInputs {
+            module: [1; 32],
+            env: &e,
+            answers: Table::EMPTY.id(),
+            c_mode: CMode::Built,
+            limits: LIMITS,
+            runner: RunnerKey::Native { compiler: [4; 32], target: "aarch64-apple-darwin", sysroot: "macos-sdk 27.2", host_tools: &keys },
+        };
+        base(&inputs, &mut Vec::new_in(alloc))
+    };
+    assert_eq!(key_of(yes), key_of(yes), "one row, one key");
+    assert_ne!(key_of(yes), key_of(no), "rows differing only in runs_out_dir share a key (rule 21)");
+    println!("runs_out_dir keyed: two rows, two keys");
 }
 
 #[test]

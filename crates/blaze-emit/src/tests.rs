@@ -127,10 +127,11 @@ fn refuses_what_it_does_not_emit() {
     let code = emitted(float.view(), &[]).unwrap_or_else(|e| panic!("{e}"));
     assert!(calls(&code, crate::Routine::Fmod), "`frem` at `f64` calls `fmod`");
 
-    // `fminnum` is still refused by name (pass/float.rs).
+    // `fminnum` is emitted since INTRINSICS P7b (pass/float/math.rs: one `fminnm`). Judge-changed
+    // 2026-11-16 by the builder integrator: it was "still refused by name" before P7b-2.
     let min = one(&[Ty::F64, Ty::F64], Ty::F64, |b, v| b.binary(Op::FminNum, Flags::NONE, v[0], v[1]));
-    let refused = emitted(min.view(), &[]).err();
-    assert!(matches!(refused, Some(EmitError::Unsupported { op: Op::FminNum, .. })), "{refused:?}");
+    let emitted_min = emitted(min.view(), &[]);
+    assert!(emitted_min.is_ok(), "{:?}", emitted_min.err());
 
     let (caller, _) = caller_of(Ty::I32);
     assert_eq!(emitted(caller.view(), &[]).err(), Some(EmitError::NoVia { place: 0 }));

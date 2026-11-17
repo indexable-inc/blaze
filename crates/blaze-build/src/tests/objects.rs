@@ -15,6 +15,7 @@ use crate::layout::{LayoutFacts, Missing, ReprAttrs, ValidRange};
 use crate::vtable::{ObjectMethod, ObjectTrait};
 use crate::{Abi, Adts, Built, Intrinsic, Subst};
 
+mod boxed_slice;
 mod nested_unsize;
 
 /// ```text

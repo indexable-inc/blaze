@@ -94,16 +94,12 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
     }
 
     fn resolve(&self, i: usize, item: ItemKey, args: List, ground: &mut PortableTys<'_>) -> Result<(ItemKey, List), ResolveError> {
-        // As `Front2Program::resolve`. Both helpers read only the solved names; over records
-        // `check_one` has already refused every body that calls anything (a callee's row asks
-        // `placed`, which refuses by name), so a body with a call never reaches here over them.
-        if let Some(names) = self.front.names.solved() {
-            if let Some(handler) = crate::front2::panic_entry::bound(names, &self.front.index, &self.store, item, Alloc::global()) {
-                return Ok((handler, List::EMPTY));
-            }
-            if let Some(default) = crate::front2::alloc_shim::bound(names, &self.front.index, &self.store, item, Alloc::global()) {
-                return Ok((default, List::EMPTY));
-            }
+        // As `Front2Program::resolve`, over this program's names source.
+        if let Some(handler) = crate::front2::panic_entry::bound(self.front.names, &self.front.index, &self.store, item, Alloc::global()) {
+            return Ok((handler, List::EMPTY));
+        }
+        if let Some(default) = crate::front2::alloc_shim::bound(self.front.names, &self.front.index, &self.store, item, Alloc::global()) {
+            return Ok((default, List::EMPTY));
         }
         let r = self.in_world(i, |w| resolve_instance(w, item, args, ground, Alloc::global()))??;
         Ok((r.item, r.args))
@@ -111,6 +107,10 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
 
     fn selects(&self, i: usize, trait_: ItemKey, ty: PTy, ground: &mut PortableTys<'_>) -> Result<bool, ResolveError> {
         Ok(self.in_world(i, |w| select_impl(w, trait_, &[ty], ground, Alloc::global()))??.is_some())
+    }
+
+    fn adt_drop_impl(&self, i: usize, drop_trait: ItemKey, adt: ItemKey, alloc: Alloc<'_>) -> Result<Option<ItemKey>, ResolveError> {
+        self.in_world(i, |w| blaze_typeck::adt_drop_impl(w, drop_trait, adt, alloc))?
     }
 
     /// Every row has its head in the store or is a ctor: `row` makes no row otherwise.
@@ -274,10 +274,11 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
         self.store.opaques.get(&opaque).copied()
     }
 
-    /// `check_one` refuses a body naming a `dyn` principal ([`LazyRefusal::NotLazyYet`]), so
-    /// no build of this program asks.
-    fn object_trait(&self, _t: ItemKey) -> Option<blaze_build::vtable::ObjectTrait<'_>> {
-        None
+    /// The table `check_one` made for a principal the checked bodies name (fill.rs
+    /// `body_objects`), as `Front2Program::object_trait`.
+    fn object_trait(&self, t: ItemKey) -> Option<blaze_build::vtable::ObjectTrait<'_>> {
+        let o = self.objects.get(&t)?;
+        Some(blaze_build::vtable::ObjectTrait { supers: &o.supers, methods: &o.methods, shape: o.shape })
     }
 
     /// `crate::module::Name`, over the source's questions (module path, name).
@@ -368,12 +369,13 @@ impl<'n, S: NamesSource<'n>> FrontEnd for LazyProgram<'n, S> {
         true
     }
 
-    /// `check_one` refuses a body naming a static ([`LazyRefusal::NotLazyYet`]).
-    fn static_item(&self, _key: ItemKey) -> Option<StaticItem> {
-        None
+    /// A static a checked body named (fill.rs `body_statics`), as `Front2Program::static_item`.
+    fn static_item(&self, key: ItemKey) -> Option<StaticItem> {
+        self.statics.kind(key)
     }
 
+    /// The statics made so far, sorted by key: each one's own data record.
     fn static_records(&self) -> &[(ItemKey, DataRecord<Global>)] {
-        &[]
+        &self.statics.values
     }
 }

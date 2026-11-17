@@ -204,8 +204,9 @@ impl Buckets {
             if self.lazy_filed[krate] || !(self.admits(all, krate) || self.admits(bare, krate) || self.admits(blanket, krate)) {
                 continue;
             }
-            // A proc-macro unit's impls answer no question of the program's (`Index::new`).
-            if names.proc_macro(krate) == Some(true) {
+            // A proc-macro unit the program reaches answers none of its questions; the
+            // program's own crate (0) does, a proc macro's too (linked.rs `links_unit`).
+            if !crate::front2::linked::links_unit(krate == 0, names.proc_macro(krate) == Some(true)) {
                 continue;
             }
             let Some(crate_key) = names.crate_key(krate) else { continue };

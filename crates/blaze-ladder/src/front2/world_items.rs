@@ -21,7 +21,7 @@ use blaze_typeck::{
 };
 
 use super::buckets::Buckets;
-use super::fill::{FillError, want_of_key};
+use super::fill::FillError;
 use super::heads::{Store, Want};
 use super::index::Index;
 use super::keys::{Keys, MemberKind, Origin, checker_of};
@@ -77,6 +77,9 @@ pub enum Gap {
     Fill(FillError),
     /// A lang variant in no enum of its crate.
     VariantOfNoEnum(LibKey),
+    /// An auto trait of an opaque whose hidden type could not be given
+    /// ([`super::opaque_auto::HiddenFail`]: its defining body's refusal, or the E0391 cycle).
+    Hidden(super::opaque_auto::HiddenFail),
     /// An impl whose trait path the names do not resolve as written (so it was a candidate of
     /// every question) and whose header could not be made: the header's error.
     UnreadImpl(LibKey, Box<str>),
@@ -89,6 +92,13 @@ pub enum Gap {
     FnHead(ItemKey, Box<str>),
     /// A body names an item declared in a block whose form has no record here yet.
     Local(super::locals::LocalGap),
+    /// A closure of ANOTHER body with no answer from its owner's checked record
+    /// ([`super::foreign_closures`]): the owner, the ordinal, and the text naming the owner
+    /// by its path and why.
+    ForeignClosure { owner: ItemKey, ordinal: u32, text: Box<str> },
+    /// A question refused by what its key is ([`super::by_origin::KindGap`]): a made want with
+    /// no answer, a variant index past its ADT's, an unfiled anonymous constant, ..
+    Kind(super::by_origin::KindGap),
 }
 
 impl core::fmt::Display for Gap {
@@ -120,10 +130,13 @@ impl core::fmt::Display for Gap {
             Gap::Resolve(e) => write!(f, "{e}"),
             Gap::Fill(e) => write!(f, "{e}"),
             Gap::VariantOfNoEnum(k) => write!(f, "the lang variant {k:x} is in no enum of its crate"),
+            Gap::Hidden(h) => write!(f, "{h}"),
             Gap::FnHead(k, why) => write!(f, "the member fn {k:?} has no signature: {why}"),
             Gap::Local(g) => write!(f, "{g}"),
             Gap::UnreadImpl(k, why) => write!(f, "the impl {k:x}, a candidate filed without its trait or self type (unread as written), has no header: {why}"),
             Gap::RefusedImpl { impl_, place, why } => write!(f, "the impl {impl_:x} at {place}, a candidate of this question, has a refused header: {why}"),
+            Gap::ForeignClosure { text, .. } => write!(f, "{text}"),
+            Gap::Kind(g) => write!(f, "{g}"),
         }
     }
 }
@@ -206,12 +219,12 @@ impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {
         Err(Missing)
     }
 
-    /// `Missing`, noting the want that makes `key`'s record.
+    /// `Missing`, noting the want that makes `key`'s record, by what `key` is
+    /// ([`super::by_origin::want_unmade`]): a kind no want makes is its named gap, and a want
+    /// already made (whose answer is still not in the store) is `KindGap::MadeWithoutRow`,
+    /// never asked again.
     pub(super) fn want<T>(&self, key: ItemKey) -> Fetch<T> {
-        match want_of_key(self.names, self.keys, key) {
-            Ok(w) => self.fill(Fill::Store(w)),
-            Err(e) => self.gap(Gap::Fill(e)),
-        }
+        self.unmade(super::by_origin::want_unmade(self.names, self.keys, self.store, key))
     }
 
     /// A member fn's signature row: made, a typed gap where it could not be made, else asked
@@ -263,12 +276,12 @@ impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {
     }
 
     /// A variant's (or a struct's, index 0) definition as the body names it.
+    /// An index past the made ADT's variants is `KindGap::NoVariant` naming the ADT and the
+    /// index ([`super::by_origin::ctor_def`]), never "unknown key".
     pub(super) fn ctor(&self, adt: LibKey, variant: u32) -> Fetch<Def> {
-        let k = checker_of(adt);
-        let Some(a) = self.store.adts.get(&k) else { return self.fill(Fill::Store(Want::Adt(adt))) };
-        match a.variants.get(variant as usize) {
-            Some(v) => Ok(Def::Ctor { adt: k, variant, kind: v.ctor }),
-            None => self.gap(Gap::Fill(FillError::UnknownKey(k))),
+        match super::by_origin::ctor_def(self.names, self.keys, self.store, adt, variant) {
+            Ok(def) => Ok(def),
+            Err(u) => self.unmade(u),
         }
     }
 }
@@ -308,20 +321,30 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
             Some(Origin::Member { kind: MemberKind::Fn, .. }) => self.want(item),
             Some(Origin::Member { kind: MemberKind::Ctor, container, .. }) => self.ctor_owner(item, *container),
             Some(Origin::Member { .. }) => Ok(None),
-            // A key in no row of the map is asked of the source (`Keys::library_in`: over
-            // records no item is filed up front); a key of nothing has no signature.
-            Some(Origin::Item(_)) | None => match self.keys.library_in(self.names, item) {
-                None => Ok(None),
-                Some(lib) => match self.resolver().detail(lib) {
-                    Some(ItemDetail::Fn { .. } | ItemDetail::Const { .. } | ItemDetail::Static { .. }) => self.want(item),
-                    Some(_) => Ok(None),
+            // What the key is, from the one classifier (super::by_origin::kind_of_key): the
+            // library's outline, or the kind a body's lowering filed for an item declared in a
+            // body (whose key the library holds no entry for: hello-main-ctorfn). A key in no
+            // row of the map is asked of the source (`Keys::library_in`); a key of nothing has
+            // no signature. A key the library holds no entry for is refused by name, never
+            // read as a variant (a path to a fn is never asked as a ctor).
+            Some(Origin::Item(_)) | None => {
+                use super::by_origin::{ItemKind, KeyKind};
+                match super::by_origin::kind_of_key(self.names, self.keys, item) {
+                    Ok(KeyKind::Item(ItemKind::Fn(_) | ItemKind::Const(_) | ItemKind::Static(_))) => self.want(item),
                     // A variant: its enum's head makes its ctor fn.
-                    None => match self.enum_of(lib) {
-                        Some((e, _)) => self.ctor_owner(item, checker_of(e)),
-                        None => self.gap(Gap::CtorFn(item)),
-                    },
-                },
-            },
+                    Ok(KeyKind::Item(ItemKind::Variant { enum_, .. })) => self.ctor_owner(item, checker_of(enum_)),
+                    // A member keyed by the library: its container's head makes it (by kind;
+                    // a made head still without it is `KindGap::MadeWithoutRow`).
+                    Ok(KeyKind::Item(ItemKind::LibMember { .. })) => self.want(item),
+                    Ok(KeyKind::Item(
+                        ItemKind::Adt(_) | ItemKind::Trait(_) | ItemKind::TraitAlias(_) | ItemKind::Impl(_) | ItemKind::TypeAlias(_) | ItemKind::Other { .. },
+                    )) => Ok(None),
+                    // A member's key (filed under `Origin::Member`, answered above).
+                    Ok(KeyKind::MemberFn { .. } | KeyKind::MemberConst { .. } | KeyKind::MemberType { .. } | KeyKind::Ctor { .. } | KeyKind::Anon { .. }) => Ok(None),
+                    Err(FillError::UnknownKey(_)) => Ok(None),
+                    Err(e) => self.gap(Gap::Fill(e)),
+                }
+            }
         }
     }
 
@@ -337,7 +360,9 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
                 let why = self.store.fn_gaps.get(&item).map(|w| format!("{w:?}")).unwrap_or_default();
                 self.gap(Gap::FnHead(item, why.into_boxed_str()))
             }
-            None => self.want(item),
+            // By what the key is: an opaque's bounds come with its fn's head, an anonymous
+            // constant's with its own filing; any other kind's row with its own want.
+            None => self.unmade(super::by_origin::predicates_unmade(self.names, self.keys, self.store, item)),
         }
     }
 
@@ -415,6 +440,11 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
         let Some(lib) = self.keys.library_in(self.names, container) else { return Ok(None) };
         let (Some(t), Some(extra)) = (self.store.maps.traits.get(&lib), self.store.trait_defs.get(&container)) else {
             return match self.resolver().detail(lib) {
+                // Its head is made only when one of its members has this name: method
+                // resolution asks every trait in scope, and a trait that declares no such item
+                // is no candidate, so its head (refused or not) is never read for this name
+                // (member_names.rs; the made head answers from the same member list).
+                Some(ItemDetail::Trait | ItemDetail::Impl) if !super::member_names::may_declare(self.names, lib, name) => Ok(None),
                 Some(ItemDetail::Trait | ItemDetail::Impl) => self.want(container),
                 _ => Ok(None),
             };
@@ -474,7 +504,7 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
                             let Some(t) = self.store.maps.traits.get(&owner) else { return self.fill(Fill::Store(Want::Head(owner))) };
                             match t.fns.iter().find(|(n, _)| *n == name) {
                                 Some(&(_, f)) => Ok(Some(Def::Fn(f))),
-                                None => self.gap(Gap::Fill(FillError::UnknownKey(checker_of(lib)))),
+                                None => self.gap(Gap::Lang(item, "the trait's head holds no fn of its `#[lang]` name")),
                             }
                         }
                         Some(ItemDetail::Impl) => {
@@ -499,25 +529,53 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
         self.gap(Gap::BodyRecord(tc::Question::Const(item)))
     }
 
-    /// An opaque type a fn's head made: its hidden type is not told (`None`): a body sees
-    /// only its bounds (the Reference, "Impl trait", "Abstract return types"; auto traits that
-    /// leak from the hidden type need the defining body's record: not made yet). Any other key
-    /// is a gap.
+    /// An opaque type a fn's head made: `None` (a body sees only its bounds: the Reference,
+    /// "Impl trait", "Abstract return types") unless the running check's own leak list holds it
+    /// (an auto trait of it was asked: "Auto trait leakage"), then its hidden type from its
+    /// defining body's filed check ([`super::opaque_auto`]). A filed record with no hidden type
+    /// for it, and any key no head made, is a gap.
     fn opaque_hidden(&self, _: Seal, item: ItemKey) -> Fetch<Option<Hidden<'_>>> {
-        match self.store.opaques.get(&item) {
-            Some(_) => Ok(None),
-            None => self.gap(Gap::BodyRecord(tc::Question::Opaque(item))),
+        let Some(&(owner, _)) = self.store.opaques.get(&item) else {
+            return self.gap(Gap::BodyRecord(tc::Question::Opaque(item)));
+        };
+        match self.store.hidden.answer(item, owner) {
+            super::opaque_auto::HiddenAnswer::Known(h) => Ok(Some(h)),
+            super::opaque_auto::HiddenAnswer::Opaque => Ok(None),
+            super::opaque_auto::HiddenAnswer::NoneGiven => self.gap(Gap::BodyRecord(tc::Question::Opaque(item))),
         }
     }
-    /// A closure of another body: its facts are in the owner's checked record, which this
-    /// world does not hold yet (the RUN path's, typeck.md "A closure's identity"): a gap.
-    fn closure(&self, _: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<tc::ClosureFacts<'_>>> {
-        self.gap(Gap::BodyRecord(tc::Question::Closure(owner, ordinal)))
+    /// Async block `ordinal` of `owner` (an `async fn`'s hidden type is its root block by
+    /// identity, `PNode::Coroutine`): its output and interior from the owner's filed check
+    /// (`Store::hidden`); a gap while that body is not filed.
+    fn coroutine(&self, _: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<tc::CoroutineFacts<'_>>> {
+        match self.store.hidden.coroutine(owner, ordinal) {
+            Some(f) => Ok(Some(f)),
+            None => self.gap(Gap::BodyRecord(tc::Question::Coroutine(owner, ordinal))),
+        }
     }
-    /// No attribute is read into the store yet (`#[non_exhaustive]`, `#[fundamental]`): the
-    /// open item "attrs" in the README; answered empty as the old front end did.
+    /// A closure of another body: its kind and signature from its owner's checked record, filed
+    /// in the store where that check finished clean ([`super::foreign_closures`]; typeck.md "A
+    /// closure's identity"). The checker records the question with its answer's digest, so it
+    /// is in this body's read list (rule 21). An owner with no clean record, or an ordinal it
+    /// does not hold, is a gap naming the owner by its path and the ordinal (rule 19).
+    fn closure(&self, _: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<tc::ClosureFacts<'_>>> {
+        match self.store.closures.get(owner, ordinal) {
+            Ok((kind, sig)) => Ok(Some(tc::ClosureFacts { kind, sig, types: self.store.tys.view() })),
+            Err(why) => {
+                let path = super::check::key_shown_in(self.names, self.keys, self.store, owner);
+                let text = format!("{}", super::foreign_closures::gap_text(owner, &path, ordinal, why)).into_boxed_str();
+                self.gap(Gap::ForeignClosure { owner, ordinal, text })
+            }
+        }
+    }
+    /// No ADT attribute is read into the store yet (`#[non_exhaustive]`, `#[fundamental]`):
+    /// the open item "attrs" in the README; answered empty as the old front end did.
     /// An enum's discriminant type ([`super::heads::discr_ty`]: `isize` with no primitive
     /// repr, else the repr's integer), from its made head; a struct or union has none to give.
+    /// A fn item's (the callee of a borrowed call, blaze-typeck rules/promote.rs): read from
+    /// its made head's text ([`super::fn_attrs::fn_type_attrs`], `#[rustc_promotable]`); a
+    /// ctor fn carries none. A fn's key is never asked for as an ADT (rung
+    /// x0-drop-11-zst-temporary: "a fn (asked for as an ADT)").
     fn attrs(&self, _: Seal, item: ItemKey) -> Fetch<TypeAttrs> {
         if let Some(a) = self.store.adts.get(&item) {
             return Ok(match a.kind {
@@ -525,9 +583,36 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
                 _ => TypeAttrs(0),
             });
         }
-        match self.keys.library_in(self.names, item) {
-            Some(lib) => self.fill(Fill::Store(Want::Adt(lib))),
-            None => self.gap(Gap::Fill(FillError::UnknownKey(item))),
+        if let Some(f) = self.store.fns.get(&item) {
+            return match super::fn_attrs::fn_type_attrs(self.names, f) {
+                Ok(attrs) => Ok(attrs),
+                Err(e) => self.gap(Gap::FnHead(item, format!("{e}").into_boxed_str())),
+            };
+        }
+        if self.store.ctors.contains_key(&item) {
+            return Ok(TypeAttrs(0));
+        }
+        if let Some(why) = self.store.fn_gaps.get(&item) {
+            return self.gap(Gap::FnHead(item, format!("{why:?}").into_boxed_str()));
+        }
+        match self.keys.origin(item) {
+            Some(Origin::Member { kind: MemberKind::Fn, .. }) => self.want(item),
+            // A ctor fn's row is made with its ADT's head.
+            Some(Origin::Member { kind: MemberKind::Ctor, container, .. }) => self.want(*container),
+            Some(Origin::Member { .. }) => self.gap(Gap::Fill(FillError::NotAHead(tc::Question::Attrs(item)))),
+            Some(Origin::Item(_)) | None => match self.keys.library_in(self.names, item) {
+                None => self.gap(Gap::Fill(FillError::UnknownKey(item))),
+                Some(lib) => match self.resolver().detail(lib) {
+                    Some(ItemDetail::Struct | ItemDetail::Enum | ItemDetail::Union) => self.fill(Fill::Store(Want::Adt(lib))),
+                    Some(ItemDetail::Fn { .. }) => self.want(item),
+                    // A variant's ctor: its enum's head makes its row.
+                    None => match self.enum_of(lib) {
+                        Some((e, _)) => self.fill(Fill::Store(Want::Adt(e))),
+                        None => self.gap(Gap::Fill(FillError::UnknownKey(item))),
+                    },
+                    Some(_) => self.gap(Gap::Fill(FillError::NotAHead(tc::Question::Attrs(item)))),
+                },
+            },
         }
     }
 
@@ -567,12 +652,14 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
     }
 
     /// The item's const generic parameters as its head made them (`Maps::const_params`: a
-    /// fn's with its container's first); an item whose head is not made has none to give, and
-    /// the checker asks for its head (`fn_sig`, `adt`, `impl_header`) before its parameters.
+    /// fn's with its container's first), by what the item is
+    /// ([`super::by_origin::const_params_of`]): a head not made is wanted, never answered "no
+    /// const parameters"; a kind with none to give is refused by name.
     fn const_params(&self, _: Seal, item: ItemKey) -> Fetch<tc::ConstParams<'_>> {
-        let made = self.keys.library_in(self.names, item).and_then(|lib| self.store.maps.const_params.get(&lib)).map(|c| &c[..]);
-        let params = made.or_else(|| self.store.fns.get(&item).map(|f| &f.consts[..])).unwrap_or(&[]);
-        Ok(tc::ConstParams { params, types: self.types() })
+        match super::by_origin::const_params_of(self.names, self.keys, self.store, item) {
+            Ok(params) => Ok(tc::ConstParams { params, types: self.types() }),
+            Err(u) => self.unmade(u),
+        }
     }
 
     /// The generics of the trait's associated type `name` as the trait's head counted them

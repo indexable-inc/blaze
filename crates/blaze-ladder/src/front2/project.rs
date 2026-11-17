@@ -19,7 +19,7 @@ use super::FrontError;
 use super::body::{Body, BodyError};
 use super::lower_made::{LowerTarget, lower_made};
 use super::buckets::Buckets;
-use super::check::{CheckFail, Records, BuildOrder, check_body_filed, eval_len};
+use super::check::{CheckFail, Records, BuildOrder, eval_len};
 use super::consts::{ConstFail, Consts};
 use super::heads::{HeadError, Store, Want};
 use super::keys::{MemberKind, checker_of};
@@ -30,6 +30,9 @@ use super::spell::Spelling;
 use super::types::Why;
 use super::world_items::Gap;
 use crate::refusal::SourceFile;
+
+/// A head as the drive's `Signature` record (D114): the unit, its digest, its place.
+pub mod head_digest;
 
 /// How many constants an array length in one body's heads may name before the body is
 /// refused ([`Refused::Lengths`]): reach.rs's and the census's `MOST_LENS`.
@@ -167,6 +170,13 @@ impl<'n> ProjectWorld<'n, &'n source::Records<'n>> {
         store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
         Ok(ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(alloc), alloc, by_chain: None })
     }
+
+    /// The run's sources a body's macro calls expand with (the crate's environment, texts and
+    /// proc-macro runner: [`super::body_host::BodySources`]), set once by the command before
+    /// any body; until then every body `env!`, include and proc macro is refused by name.
+    pub fn set_body_sources(&mut self, sources: &'n dyn super::body_host::BodySources) {
+        self.store.sources = Some(sources);
+    }
 }
 
 impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
@@ -215,13 +225,17 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
     /// Checks one body: lowered, its heads made (an array length's constant evaluated as met),
     /// then checked over the command's records.
     pub fn check<'a>(&mut self, body: BodyRef<'n>, alloc: Alloc<'a>) -> BodyVerdict<'a> {
-        self.check_then(body, alloc, |_, _, _| {})
+        self.check_then(body, super::stalled_goals::Stalls::Gap, alloc, |_, _, _| {})
     }
 
     /// [`ProjectWorld::check`], then `then` over the records, the lowered body and its
     /// `Checked` record when the check finished (front2/borrows.rs `check_borrows`: the move
     /// and borrow check takes both, so nothing is lowered or type checked twice).
-    pub(super) fn check_then<'a, F>(&mut self, body: BodyRef<'n>, alloc: Alloc<'a>, then: F) -> BodyVerdict<'a>
+    ///
+    /// `stalls`: what the check does with an auto-trait goal of an async block's future that
+    /// fails only on its superset interior (front2 stalled_goals.rs): `Decide` only for a `then`
+    /// that decides every stalled row (`check_borrows`).
+    pub(super) fn check_then<'a, F>(&mut self, body: BodyRef<'n>, stalls: super::stalled_goals::Stalls, alloc: Alloc<'a>, then: F) -> BodyVerdict<'a>
     where
         F: FnOnce(&mut Records<'_, 'n, S>, &Body<'n>, &blaze_typeck::Checked<'static>),
     {
@@ -260,7 +274,7 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         // no view of it is held here); a type read through this view is refused, never wrong.
         let written = lowered.typeck.view(blaze_typeck::PTys::EMPTY);
         let mut asked = Asked::new_in(alloc);
-        let checked = check_body_filed(&mut r, &lowered, &scope, None, Some(&mut asked));
+        let checked = super::body_reads::check_body_filed_as(&mut r, &lowered, &scope, None, Some(&mut asked), stalls);
         // The buckets as the check left them: what each impl question read, per crate.
         let buckets = r.buckets.as_ref();
         let whole = |list: &blaze_typeck::ReadList<'_>| -> Result<BodyReads<'a>, ReadsError> {

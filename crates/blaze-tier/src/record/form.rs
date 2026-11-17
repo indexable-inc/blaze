@@ -576,7 +576,7 @@ fn digest(bytes: &[u8]) -> [u8; DIGEST] {
 
 /// The number of a `bzcodeNN` head; `None` for bytes that are no code record's head.
 fn form_number(head: &[u8]) -> Option<u8> {
-    let digit = |b: u8| b.is_ascii_digit().then_some(b - b'0');
+    let digit = |b: u8| b.is_ascii_digit().then(|| b - b'0');
     match head {
         [b'b', b'z', b'c', b'o', b'd', b'e', tens, ones] => Some(digit(*tens)? * 10 + digit(*ones)?),
         _ => None,

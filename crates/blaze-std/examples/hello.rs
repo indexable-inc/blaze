@@ -3,11 +3,10 @@
 
 #![feature(macro_attr)]
 
-use bstd::{Cx, Io, entry::Error};
+use bstd::{Cx, entry::Error, out::Out};
 
 #[bstd::main]
-fn main(cx: &Cx, io: Io) -> Result<(), Error> {
-    let out = io.need_out()?;
+fn main(cx: &Cx, out: Out) -> Result<(), Error> {
     out.line(cx, "hello from bstd")?;
     Ok(())
 }

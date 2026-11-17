@@ -35,9 +35,8 @@
 //! is not known. A missing `panic_cannot_unwind` is [`BuildError::NoLangFn`], as rustc refuses
 //! a program without it.
 //!
-//! NOT BUILT HERE (other pieces): a drop at a scope's normal exit is a plain call (walk.rs
-//! `drop_at`), so a destructor that panics in a nounwind body's normal path is not turned into
-//! a terminate by this piece (piece P6 gives exit drops their unwind edges).
+//! Every drop call in such a body (walk/unwind_ladder.rs `drop_call`: a scope's exit drops, a
+//! discarded value's, a temporary's) lands on the same `terminate` block.
 
 use core::alloc::Allocator;
 

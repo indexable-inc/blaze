@@ -42,6 +42,7 @@ use blaze_typeck::{Def, ExprId, List, Lit, Mutbl, Name, PNode, PTy, Pat, PatId};
 mod alts;
 mod forms;
 mod irrefutable;
+mod ref_bind;
 
 use super::{Home, MatchState, Owner, PTR_BITS, Repr, Shape, Task, V, Walk, malformed, mask, unsupported};
 use crate::BuildError;

@@ -30,16 +30,10 @@ const ORDERS: u64 = 64;
 /// (oracle.rs `known_import`). Since 2026-11-16 18:3x (the old fill deleted, NAMES runner 19);
 /// r2c, r3b, r5f, r5g, r7d, r7f and r7g were the old fill's and pass on the cells.
 pub(super) const KNOWN: &[(&str, &str)] = &[
-    ("r6a", "MISSING R6 ERROR: an expansion writes a name an import already read outward: the cells resolve it and write no `Ambiguous` error (\"no ambiguity of `n`: errors []\"); the cells decide R6 (`import_has_r6`) but the writer does not write its error"),
-    ("r6e", "R6: an expansion writes the first segment an import read outward, and a later segment is missing in both: no ambiguity error written (wide seed 39)"),
-    ("r6h", "MISSING R6 ERROR, nested expansion not enclosing the use: \"no ambiguity of `n`: errors []\", as r6a"),
-    ("r8b", "MISSING R8 ERROR: a macro-written `extern crate` replacing a name: \"no error for the `extern crate` replacing `n`\""),
-    ("r8d", "MISSING ERROR: a macro-written root `extern crate e3 as m1;` naming the dependency's extern-prelude name is not reported when no path reads `m1`"),
     ("x1", "THE TESTS' DRIVER, not the cells: a body's block (a module with no `mod` line) is never loaded by `cells::solve_world` (the command loads it through `places`/`load_more_at`; cells/tests.rs `a_blocks_module_reads_the_textual_scope_around_its_body` passes)"),
     ("x2", "THE TESTS' DRIVER, not the cells: the root's `#[macro_export]` list of macros an expansion wrote is published after the cells by resolve.rs (`publish_expanded_exports`), which `cells::solve_world` does not run; cells/tests.rs `an_export_below_a_module_an_expansion_declared_is_in_the_root` passes"),
-    ("r7s_dep_extern", "R7 with the glob's source in a dependency (crate 2) beside an extern-prelude name: \"no ambiguity of `n`: errors []\"; NOT ATTRIBUTED: the cells or the tests' dependency reader (`cells::world::SolvedCrates`)"),
-    ("r7s_dep_extern_without", "as r7s_dep_extern, the dependency's module without the name: \"`u` names None, the rule says Some(..)\"; NOT ATTRIBUTED"),
-    ("k1", "WRONG KIND: the cells write every ambiguity found through a module's names as glob-vs-glob (cells/mod.rs `Value::Ambiguous` arms) where the rule says glob-vs-outer: the import fails as it should, its error names the wrong kind (oracle wide tape '1 0*12 1 0 0 0 2 3 0*16')"),
+    ("r7s_dep_extern", "R7 with the glob's source in a dependency (crate 3 `lib`, `use lib::m::*;`, `m` itself a glob of `k`) beside the extern prelude's `n` (crate 2): \"no ambiguity of `n`: errors []\". NOT R6/R8 (no expansion in this world: `r6`/`r8` are not involved; names-R6-R8, 2026-11-16). The same glob passes beside the standard prelude (r7s_dep_std) and a local glob passes beside the extern prelude (r7s_chain*_extern): the class is the root's `Globs` cell of a FOREIGN glob source with the outer candidate in the extern prelude, read through `DepNames` (`cells::world::SolvedCrates::name_in`, crates solved 2 then 3); first step: run this case with --nocapture printing the root's errors and `u`'s outcome"),
+    ("r7s_dep_extern_without", "as r7s_dep_extern, the dependency's module without the name: \"`u` names None, the rule says Some(..)\" although crate 2 holds `x`: the use is not resolved through the extern prelude either, so the first step is the same run; NOT R6/R8"),
 ];
 
 /// A tape whose first choices are drawn from `seed` (small values, so each is in range), calm after.
@@ -516,6 +510,26 @@ fn r7g_self_glob_vs_standard_prelude() {
     w.glob(n, "crate", V::Priv);
     w.glob(root, "crate", V::Priv);
     rule("r7g", &w, &|s| ambiguous(s, n, "n"));
+}
+
+/// R7's kind (was KNOWN k1, the oracle's wide tape '1 0*12 1 0 0 0 2 3 0*16'): an import failed
+/// by glob-vs-outer says so, not glob-vs-glob: extern prelude `n`; `mod a { pub mod n { pub
+/// struct k; } } use crate::a::*; use n::k;`. The Reference
+/// (`names.resolution.expansion.imports.ambiguity.glob-vs-outer`): "Names in imports and macro
+/// invocations may not be resolved through glob imports when there is another candidate
+/// available in an outer scope": `use n::k`'s first segment has the glob's `a::n` and the
+/// dependency, different definitions, and only one glob brings `n`: the one error is the
+/// import's, failed at segment 0, ambiguous glob vs outer. Before the fix: "errors [Import { ..
+/// why: Ambiguous(GlobVsGlob) }], the rule says 1 import(s) failing Ambiguous(GlobVsOuter)".
+#[test]
+fn r7h_glob_vs_outer_names_its_kind() {
+    let (mut w, root, _) = with_dep();
+    let a = w.module(root, "a", V::Priv);
+    let n = w.module(a, "n", V::Pub);
+    ty(&mut w, n, "k");
+    w.glob(root, "crate::a", V::Priv);
+    w.use_(root, "n::k", V::Priv);
+    rule("r7h", &w, &|s| failed_imports(s, root, Unresolved::Ambiguous(crate::AmbiguityKind::GlobVsOuter), 1));
 }
 
 /// R5 with R7, the oracle's wide seed 107 shrunk: `use n::*; use crate::m0::*;` at the root,

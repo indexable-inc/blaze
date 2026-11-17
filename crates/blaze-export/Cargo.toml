@@ -26,10 +26,13 @@ blaze-sha256.workspace = true
 # The `bzcode02` code record (`RecordView`, `read`, `from_v1`) and its placer's two shared rules
 # (`page_offset`, `calls`): export at the optimized tier (optimized.rs).
 blaze-tier.workspace = true
+# The native image (`Image`, its regions and fixups) and the library table: the native library
+# record's dylib (native_dylib.rs, NATIVE.md W4).
+blaze-native = { path = "../blaze-native" }
 
 [dev-dependencies]
 # `Alloc::global()`, the handle the tests hand every function.
-blaze-own = { workspace = true, features = ["std"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
 
 [lints]
 workspace = true

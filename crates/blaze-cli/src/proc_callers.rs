@@ -1,0 +1,169 @@
+//! Where each locked package's files are, as the names world placed them: the ONE answer the
+//! proc-macro runner (proc_runner.rs) shows a macro of, for the crate a call is written in
+//! (piece pm-call-expand-deps, 2026-11-16; rules 9, 21, 30).
+//!
+//! Why it is here: the runner gave a package only to checkout crates (`/0/..`), so a
+//! fn-like, attribute or derive proc-macro call written in a crate of a FETCHED package
+//! (tempo's dependencies: `sol!` in alloy's crates, serde's derives, thiserror's, clap's) was
+//! refused (`HostWhy::Refused`) before the macro ran. The fetched package's files are already
+//! reached by one path: blaze-world's `Fetched::place` over blaze-unit-graph's `StoreSources`,
+//! a registry or git package's fetch record mapped in place (`Place::Pack`), a path package
+//! its checkout folder (`Place::Checkout`). [`Placing`] wraps that path while the names world
+//! is made and keeps each answer; nothing opens a second view of the store.
+//!
+//! Lifetimes: the names world is `World<'f>`, its pack views `PackView<'f>`, but the sandbox
+//! serves a fetched package's files as `&'static [u8]` (blaze-proc-macro `Files::Listed`, lent
+//! to the Wasmtime worker). The records' bytes ARE held to the end of the command (names.rs
+//! `Folder` reads them into the names frame, which is leaked), so names.rs types its
+//! `StoreSources` and `Fetched` at `'static` and hands the world this wrapper, which gives the
+//! same `Place` at the world's shorter `'f` (a `Place` is covariant) and keeps the `'static` one.
+//!
+//! What the macro sees stays what blaze-world's `procs::files::sandbox_files` gives (its one
+//! home): the calling crate's own package, its files read in place from its record, at the
+//! sandbox's `/package`; nothing else (rule 9).
+
+use blaze_manifest::lock::LockId;
+use blaze_own::{Alloc, Vec};
+use blaze_world::{Packages, Place, WorldError};
+
+/// The places answered while the names world was made: each `(package, place)`, sorted by
+/// package (a package placed twice answers the same place: `StoreSources` keeps each view).
+pub(crate) struct Placed<'a> {
+    by_package: Vec<(LockId, Place<'static>), Alloc<'a>>,
+}
+
+impl Placed<'_> {
+    /// Where the package `package` is, as the world was told; `None`: the world never placed
+    /// it (no unit of it was listed), which the runner refuses by the crate's name.
+    pub(crate) fn of(&self, package: LockId) -> Option<Place<'static>> {
+        let at = self.by_package.partition_point(|(id, _)| *id < package);
+        self.by_package.get(at).filter(|(id, _)| *id == package).map(|(_, place)| *place)
+    }
+}
+
+/// The world's `Packages` while it is made: every answer of `inner` passed on and kept.
+pub(crate) struct Placing<'p, 'a, P> {
+    inner: &'p mut P,
+    seen: Vec<(LockId, Place<'static>), Alloc<'a>>,
+}
+
+impl<'p, 'a, P: Packages<'static>> Placing<'p, 'a, P> {
+    pub(crate) fn new(inner: &'p mut P, alloc: Alloc<'a>) -> Placing<'p, 'a, P> {
+        Placing { inner, seen: Vec::new_in(alloc) }
+    }
+
+    /// The places kept, sorted by package (stable: the first answer of a package first).
+    pub(crate) fn finish(self) -> Placed<'a> {
+        let mut by_package = self.seen;
+        by_package.sort_by_key(|(id, _)| *id);
+        Placed { by_package }
+    }
+}
+
+impl<'f, P: Packages<'static>> Packages<'f> for Placing<'_, '_, P> {
+    fn place(&mut self, package: LockId) -> Result<Place<'f>, WorldError<'f>> {
+        let place = match self.inner.place(package) {
+            Ok(place) => place,
+            Err(error) => return Err(error),
+        };
+        self.seen.push((package, place));
+        Ok(place)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! A crate of a fetched registry package is shown its own record's files, served at the
+    //! sandbox's `/package`. Rust's rule: the Reference, "Procedural Macros": a proc macro is
+    //! "run during compilation" on the crate that invokes it; Cargo's "Environment variables
+    //! Cargo sets for crates": `CARGO_MANIFEST_DIR` is "the directory containing the manifest
+    //! of your package", the package the call is written in (alloy's `sol!` reads its JSON ABI
+    //! files from under it, which is why `sol!` in a registry crate needs them).
+    //!
+    //! The oracle: through the wrapper, at a world's shorter lifetime, the fetched package's
+    //! place is kept, and `sandbox_files` of it lists the record's `Cargo.toml` and
+    //! `abi/Token.json` with their bytes. The control is a planted copy of the runner's old
+    //! caller rule (a package only for a `shown_from` under `/0/`): it gives the same crate
+    //! nothing, the refusal this piece removes.
+    //!
+    //! Expected (`lanecheck.sh blaze-cli test proc_callers`):
+    //! `test proc_callers::tests::a_fetched_crate_is_shown_its_own_record ... ok`
+
+    use blaze_fetch::Mode;
+    use blaze_fetch::SourceId;
+    use blaze_fetch::pack::{Builder, Kind, Limits, PackView};
+    use blaze_manifest::lock::LockId;
+    use blaze_proc_macro::sandbox::Files;
+    use blaze_world::procs::files::{PackageAt, sandbox_files};
+    use blaze_world::{Packages, Place, WorldError};
+
+    use super::Placing;
+
+    const MANIFEST: &str = "[package]\nname = \"tok\"\nversion = \"1.0.0\"\nedition = \"2021\"\n";
+    const ABI: &str = "[{\"type\":\"function\",\"name\":\"transfer\"}]";
+    const LIB: &str = "alloy_sol_types::sol!(Token, \"abi/Token.json\");\n";
+    /// The archive's SHA-256 the lock would state.
+    const SHA: [u8; 32] = [9; 32];
+
+    /// The fetch store as blaze-world's `Fetched` answers it: package 0 a member at `app`,
+    /// package 1 the registry crate `tok 1.0.0`, its record's files at the record's root.
+    struct Store {
+        view: PackView<'static>,
+    }
+
+    impl Packages<'static> for Store {
+        fn place(&mut self, package: LockId) -> Result<Place<'static>, WorldError<'static>> {
+            match package.0 {
+                0 => Ok(Place::Checkout { dir: "app" }),
+                1 => Ok(Place::Pack { view: self.view, dir: "" }),
+                _ => Err(WorldError::PathNotPlaced { package: "unknown" }),
+            }
+        }
+    }
+
+    /// A world's ask, at its own lifetime `'f` (shorter than the store's).
+    fn ask<'f, P: Packages<'f>>(packages: &mut P, package: LockId) -> Place<'f> {
+        match packages.place(package) {
+            Ok(place) => place,
+            Err(error) => panic!("package {}: {error}", package.0),
+        }
+    }
+
+    /// The runner's caller rule before this piece (proc_runner.rs `make`): a package only for
+    /// a crate placed under the checkout.
+    fn old_rule_has_package(shown_from: &str) -> bool {
+        shown_from.starts_with("/0/") || shown_from == "/0"
+    }
+
+    #[test]
+    fn a_fetched_crate_is_shown_its_own_record() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let limits = Limits { most_files: 16, most_bytes: 1 << 16, most_path: 128 };
+        let mut builder = Builder::new(Kind::Crate, SHA, limits, 0, alloc).expect("a builder");
+        for (path, text) in [("Cargo.toml", MANIFEST), ("abi/Token.json", ABI), ("src/lib.rs", LIB)] {
+            builder.file(path, Mode::File, text.as_bytes()).expect("a file");
+        }
+        let bytes: &'static [u8] = std::boxed::Box::leak(builder.finish().expect("a pack").to_vec().into_boxed_slice());
+        let source = SourceId::Crate { name: "tok", version: "1.0.0", sha256: SHA };
+        let view = PackView::open_source_put(&source, bytes).expect("the record is the crate's");
+        let mut store = Store { view };
+        let mut placing = Placing::new(&mut store, alloc);
+        // The world asks in its own order, a package more than once.
+        {
+            let _member = ask(&mut placing, LockId(0));
+            let _fetched = ask(&mut placing, LockId(1));
+            let _again = ask(&mut placing, LockId(1));
+        }
+        let placed = placing.finish();
+        assert!(matches!(placed.of(LockId(0)), Some(Place::Checkout { dir: "app" })), "the member's place was not kept");
+        assert!(placed.of(LockId(2)).is_none(), "a package the world never placed has a place");
+        let Some(Place::Pack { view, dir }) = placed.of(LockId(1)) else { panic!("the fetched package's place was not kept") };
+        let Files::Listed(files) = sandbox_files(PackageAt::Pack { view, dir }) else { panic!("a fetched package is not served from its record") };
+        let shown: std::vec::Vec<(&str, &[u8])> = files.iter().map(|(path, bytes)| (path.as_str(), *bytes)).collect();
+        assert_eq!(shown, [("Cargo.toml", MANIFEST.as_bytes()), ("abi/Token.json", ABI.as_bytes()), ("src/lib.rs", LIB.as_bytes())], "the macro is shown its own package's files");
+        // The control: the old rule had no package for this crate (tree 1, the first fetched
+        // package's tree), so its calls were refused before the macro ran.
+        assert!(!old_rule_has_package("/1/"), "the planted old rule showed a fetched crate a package");
+        println!("fetched crate shown {} files of its own record", shown.len());
+    }
+}

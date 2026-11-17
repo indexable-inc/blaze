@@ -1680,6 +1680,9 @@ impl crate::names::World<N> for Records<'_> {
     fn no_implicit_prelude(&self, module: ItemKey) -> bool {
         self.s.chain.get(&module).is_some_and(|c| c.iter().any(|m| self.w.modules[m].no_implicit_prelude))
     }
+    fn anonymous(&self, module: ItemKey) -> bool {
+        self.w.modules.get(&module).is_some_and(|info| info.name.is_some_and(|n| crate::blocks::is_block_module(n.as_ref())))
+    }
 }
 
 /// R9 on the solver's side: the one-segment path `name` in the type namespace at `m`, read
@@ -1736,10 +1739,6 @@ fn known_import(want: Imp, got: Option<Unresolved>, early: bool) -> Option<&'sta
         // The same false NotFound upstream, the ambiguous name used at a middle segment
         // (`self::m2::m0::*`): the solver answers NotFound at `m0` (deep tape, r16-deep2.txt).
         (Imp::Failed(Unresolved::Ambiguous(crate::AmbiguityKind::GlobVsGlob)), Some(b)) if same_why(Unresolved::NotFound, b) => "r2c",
-        // The cell core reports every ambiguity it finds through a module's names as
-        // glob-vs-glob (cells/mod.rs, `Value::Ambiguous`): the import fails as it should, its
-        // error names the wrong kind.
-        (Imp::Failed(Unresolved::Ambiguous(crate::AmbiguityKind::GlobVsOuter)), Some(Unresolved::Ambiguous(crate::AmbiguityKind::GlobVsGlob))) => "k1",
         _ => return None,
     };
     super::name_rules::KNOWN.iter().any(|(n, _)| *n == name).then_some(name)

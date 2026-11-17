@@ -61,9 +61,10 @@ fn a_ring_of_globs_reaches_its_fixpoint() {
 }
 
 /// Rule: a derive's helper attributes are in scope for the attributes after it on the same
-/// item, and only there; the helper list is a read of the read list.
+/// item, and only there (the Reference, "Derive macro helper attributes"). Expected: "test
+/// blaze-scope: exit 0; 1 passed, 0 failed"; without names-attr-3's helper scope
+/// (`Cells::derive_helper`) `after` fails NotFound.
 #[test]
-#[ignore = "CELLS GAP P18-D (cells-core.md runner 19): the cells do not answer a derive's helper attributes: `#[serde]` after `#[derive(Ser)]` NotFound"]
 fn derive_helpers_scope_the_attributes_after_them() {
     let mut w = World::new();
     let dep_root = w.root(2, Edition::E2021);
@@ -84,20 +85,33 @@ fn derive_helpers_scope_the_attributes_after_them() {
 }
 
 /// Rule: a built-in attribute is inert, and an attribute macro of a nearer scope with its
-/// name is ambiguous with it.
+/// name is ambiguous with it (Reference "Built-in attributes index"; "Names" / name
+/// resolution: an ambiguous name is error E0659; rustc's built-in attribute scope comes after
+/// the module's own and the `#[macro_use]` prelude's names). `#[inline]` at the root with no
+/// macro of the name: no error; `#[inline]` in `m` beside `use super::inline;` of an attribute
+/// macro: `Ambiguous(BuiltinAttr)`. `test` is no built-in attribute (the pinned library:
+/// `#[rustc_builtin_macro] pub macro test`, a prelude macro), so `#[test]` in `m` beside
+/// `use super::test;` names that macro with no ambiguity (names-attr-3). Expected: "test
+/// blaze-scope: exit 0; 1 passed, 0 failed"; without names-G2-G3's built-in attribute scope
+/// `#[inline]` fails NotFound; with `test` in the root's `builtin_attrs` `#[test]` is ambiguous.
 #[test]
-#[ignore = "CELLS GAP G3 (cells-core.md runner 19): the cells take a builtin attribute call (`#[inline]`) as a macro path and fail it NotFound; the command's lowering drops builtin attributes before the cells, so no shadowing ambiguity is reported"]
 fn builtin_attributes_are_inert_and_shadowing_them_is_ambiguous() {
     let mut w = World::new();
     let root = w.root(1, Edition::E2021);
-    let inline = w.call_on(root, "inline", CallShape::Attr, Some(1));
     let m = w.module(root, "m", V::Priv);
+    // `n` binds no `inline`: a module's scope holds its own items, not its parent's.
+    let n = w.module(root, "n", V::Priv);
+    let inline = w.call_on(n, "inline", CallShape::Attr, Some(1));
+    w.item(root, "inline", Namespace::Macros, DefKind::Macro(crate::MacroShapes::ATTR), V::Priv);
     w.item(root, "test", Namespace::Macros, DefKind::Macro(crate::MacroShapes::ATTR), V::Priv);
-    let test = w.call_on(m, "test", CallShape::Attr, Some(1));
+    let shadowed = w.call_on(m, "inline", CallShape::Attr, Some(1));
+    let test = w.call_on(m, "test", CallShape::Attr, Some(2));
+    w.use_(m, "super::inline", V::Priv);
     w.use_(m, "super::test", V::Priv);
     let s = solved(&w);
-    assert_eq!(macro_error(&s, root, inline), None, "{:?}", s.errors(root));
-    assert_eq!(macro_error(&s, m, test), Some(Unresolved::Ambiguous(AmbiguityKind::BuiltinAttr)));
+    assert_eq!(macro_error(&s, m, shadowed), Some(Unresolved::Ambiguous(AmbiguityKind::BuiltinAttr)));
+    assert_eq!(macro_error(&s, m, test), None, "`test` is a prelude macro: {:?}", s.errors(m));
+    assert_eq!(macro_error(&s, n, inline), None, "{:?}", s.errors(n));
 }
 
 /// Rule: `use Trait as _;` binds no name and brings the trait into scope.
@@ -235,10 +249,11 @@ fn builtin_types_are_the_last_layer() {
     assert_eq!(s.def(root, Namespace::Types, "byte"), Some(u8_mod));
 }
 
-/// Rule: `pub(in path)` names a module by path, an alias of an ancestor included; a path to a
-/// module that is no ancestor is an error.
+/// Rule: `pub(in path)` names a module by path, an alias of an ancestor included (Reference
+/// `vis.scoped.in`: "`path` must be a simple path which resolves to an ancestor module of the
+/// item"); a path to a module that is no ancestor is an error at that item, which is then
+/// private to its module (`g`: `Restricted(b)`), and the crate still resolves.
 #[test]
-#[ignore = "CELLS GAP G1 (cells-core.md runner 19): a `pub(in path)` naming no ancestor makes the cells refuse the crate's load (`CellError::BadVisibility`), not one `RestrictedNotAncestor` error"]
 fn pub_in_path_through_an_alias() {
     let mut w = World::new();
     let root = w.root(1, Edition::E2021);

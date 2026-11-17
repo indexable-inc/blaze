@@ -38,7 +38,11 @@ use crate::task::{First, MacroBody, MacroSrc, Par, Variant};
 const MAGIC: [u8; 4] = *b"BZCS";
 // 2: a body block holding a statement-position macro call is a block module
 // (macro-block-modules-1, 2026-11-16): block ordinals and made modules change.
-const VERSION: u32 = 2;
+// 3: a built-in derive is its own macro body (tag 5) with its `attributes(..)` text
+// (names-attr-4); a version-2 record is refused (`NotThisRecord`) and the crate solved again.
+// 4: a written `self`/`super` and `pub(self)`/`pub(super)`/private in a block's module count
+// from the module around the body (super-in-block-1, 2026-11-16): block modules' scopes change.
+const VERSION: u32 = 4;
 const ALIGN: usize = 16;
 const NO_CHAIN: u32 = u32::MAX;
 
@@ -269,6 +273,7 @@ pub fn read_record<'a>(bytes: &'a [u8], alloc: Alloc<'a>) -> Result<DepScope<'a>
                 let kind = ProcKind::from_byte(rest.u8().map_err(short)?).ok_or(RecordRead::BadByte { at, what: "proc-macro kind" })?;
                 MacroBody::Proc { kind, helpers: rest.str_u32().map_err(short)? }
             }
+            5 => MacroBody::BuiltinDerive { helpers: rest.str_u32().map_err(short)? },
             _ => return Err(RecordRead::BadByte { at, what: "macro body tag" }),
         };
         macros.insert(def, MacroSrc { name, body, module, export, local_inner });
@@ -613,6 +618,7 @@ fn write_part<'b>(
             MacroBody::BuiltinFn(_) => 2,
             MacroBody::BuiltinOther(_) => 3,
             MacroBody::Proc { .. } => 4,
+            MacroBody::BuiltinDerive { .. } => 5,
         };
         out.u8(tag);
         out.str(m.name)?;
@@ -624,6 +630,7 @@ fn write_part<'b>(
                 out.str(body)?;
             }
             MacroBody::BuiltinOther(shape) => out.u8(shape.byte()),
+            MacroBody::BuiltinDerive { helpers } => out.str(helpers)?,
             MacroBody::Proc { kind, helpers } => {
                 out.u8(kind.byte());
                 out.str(helpers)?;

@@ -88,6 +88,10 @@ mod fast;
 mod native_in;
 /// [`Io::sip_key`]: a hash key from the world's random source.
 mod sip_key;
+/// [`LentDriver`]: the world's backend lent to a state machine over `blaze_core::Driver`
+/// (blaze-cas's plain store under the command), fenced to one directory.
+mod lend;
+pub use lend::LentDriver;
 #[cfg(test)]
 mod tests;
 
@@ -949,6 +953,36 @@ impl Io {
         }
     }
 
+    /// Standard input, if the host offers the standard streams (the offer `out` is: one for
+    /// all three).
+    pub fn input(&self) -> Option<crate::input::In> {
+        match self.offers.out || self.plant == Plant::OffersIgnored {
+            true => Some(crate::input::In::new(self.clone())),
+            false => None,
+        }
+    }
+
+    /// Standard input, which `main` requires.
+    pub fn need_input(&self) -> Result<crate::input::In, Missing> {
+        self.input().ok_or(Missing { capability: "input" })
+    }
+
+    /// Whether standard input is a terminal: the kernel's answer for a native world
+    /// (descriptor 0, read when asked), never for a simulated world (its host scripts no
+    /// terminal input) or a hosted run (the wire does not carry it).
+    pub(crate) fn input_is_terminal(&self) -> bool {
+        if let Reach::Hosted = self.reach {
+            return false;
+        }
+        let mut world = self.world().lock();
+        let World { driver, .. } = &mut *world;
+        match driver {
+            #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
+            Backend::Native(_) => matches!(crate::rt::tty::read_fd(0), crate::term::Tty::Terminal(_)),
+            Backend::Sim(_) | Backend::Guest(_) => false,
+        }
+    }
+
     /// `parts`, in order, on this world's `stream`, as one write: kept by the simulated host
     /// ([`SimHost::out`], [`SimHost::err`]), or written to the process's by `rt`.
     /// A hosted run's goes straight to its host's `write` ([`crate::guest::write_to`]).
@@ -1010,6 +1044,12 @@ impl Io {
     pub fn gpu(&self) -> Option<Gpu> {
         let native = self.world().lock().driver.sim().is_none();
         Gpu::offered(native)
+    }
+
+    /// The graphics device, which `main` requires (a whole `gpu` grant): refused by name where
+    /// the world has none (the simulation, and every target but native macOS for now).
+    pub fn need_gpu(&self) -> Result<Gpu, Missing> {
+        self.gpu().ok_or(Missing { capability: "gpu" })
     }
 
     /// The terminal as a device, if the host offers one (the simulation does).

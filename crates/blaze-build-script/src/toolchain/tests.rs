@@ -1,7 +1,10 @@
 use blaze_own::{AString, AVec, Alloc, Vec};
 use blaze_unit_graph::UnitId;
 
-use super::{ClangPin, Mode, NATIVE_EVERY_MODE, PIN, PinError, Sysroot, clang_pin, depfile_reads, headers_digest, placement, sysroot};
+use super::{
+    CInputs, ClangPin, Mode, NATIVE_EVERY_MODE, PIN, PinError, Shelf, Sysroot, c_env, clang_major, clang_pin, depfile_reads, headers_digest, placement,
+    sysroot,
+};
 use crate::native::Runner;
 
 fn hex(bytes: &[u8; 32]) -> std::string::String {
@@ -53,6 +56,31 @@ fn the_headers_digest_is_of_the_set() {
     let mut changed = [("usr/include/stdio.h", [1; 32]), ("usr/include/stdlib.h", [3; 32])];
     assert_eq!(headers_digest(&mut one), headers_digest(&mut two));
     assert_ne!(headers_digest(&mut one), headers_digest(&mut changed));
+}
+
+/// D112 N5: bindgen's libclang is told the shelf's resource dir by the pin's major (reth-mdbx-sys:
+/// "'stdarg.h' file not found" without it); a table without a numeric `version` is refused.
+/// Prints "test toolchain::tests::bindgen_is_told_the_shelf_resource_dir ... ok".
+#[test]
+fn bindgen_is_told_the_shelf_resource_dir() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let major = clang_major(PIN).expect("the pin's version");
+    assert_eq!(major, "23");
+    let shelf = "/h/.blaze/v2/toolchain/clang/5d3179db";
+    let c = CInputs {
+        shelf: Shelf { dir: shelf, clang_major: major },
+        sysroot: "/sdk",
+        out_dir: "/o",
+        package: "/p",
+        seen: blaze_expand::seen::SeenRoot::Package,
+        macos_min: "11.0",
+    };
+    let env = c_env(&c, alloc);
+    let args = env.iter().find(|(k, _)| k.as_str() == "BINDGEN_EXTRA_CLANG_ARGS").map(|(_, v)| v.as_str());
+    assert_eq!(args, Some("-isysroot /sdk -resource-dir /h/.blaze/v2/toolchain/clang/5d3179db/lib/clang/23"));
+    assert_eq!(clang_major("{\"version\": \"x.1\"}"), Err(PinError::NoVersion));
+    assert_eq!(clang_major("{\"version\": \"23\"}"), Err(PinError::NoVersion));
+    assert_eq!(clang_major("{}"), Err(PinError::NoVersion));
 }
 
 /// D69 (3): native for build and run; check keeps wasm but for the five that give nothing so.

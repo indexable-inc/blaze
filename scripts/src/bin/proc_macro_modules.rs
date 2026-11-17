@@ -62,6 +62,10 @@ const DOC: &str = r#"proc_macro_modules: build proc-macro crates to wasm32-wasip
                default features are used and the output says "assumed default", required
     fetch_store   blaze-fetch's store folder (records/<key>): a git source's commit is read from its
                verified pack; required only for crates the lock pins to git
+    vendor_from   blaze-fetch's store folder (records/<key>): the fetch step writes <work>/vendor from
+               its verified records (the crates' lock closures and std's own lock), with no
+               `cargo vendor` and no network; a package it does not hold is refused by name.
+               Absent: `cargo vendor` (the network)
     unsandboxed_build_scripts   run the build with no sandbox where none can be made (false)
     build_seconds   the deadline of each crate's build (900)
 
@@ -82,6 +86,12 @@ use blaze_script::input::{self, Fields, Input, InputError};
 // The build-script mode: a folder of its own, so cargo does not take it for a binary.
 #[path = "proc_macro_modules/build_scripts.rs"]
 mod build_scripts;
+// `vendor_from`: the fetch step from blaze's fetch store, no network (D112 N2).
+#[path = "proc_macro_modules/store_vendor.rs"]
+mod store_vendor;
+// A script workspace's `[features]` lines keep their build-dependency enables (D112 N6).
+#[path = "proc_macro_modules/script_features.rs"]
+mod script_features;
 
 /// What a run is given.
 struct Args {
@@ -92,6 +102,9 @@ struct Args {
     crates: Vec<Wanted>,
     /// blaze-fetch's store (`records/<key>`), where a git source's commit is read from.
     fetch_store: Option<PathBuf>,
+    /// blaze-fetch's store the fetch step vendors from instead of `cargo vendor` (D112 N2,
+    /// [`Plan::vendor_from`]): no network.
+    vendor_from: Option<PathBuf>,
     unsandboxed_build_scripts: bool,
     build_seconds: u64,
 }
@@ -118,7 +131,7 @@ impl Input for Wanted {
 
 impl Input for Args {
     const FIELDS: &'static [&'static str] =
-        &["checkout", "store", "work", "tree", "crates", "fetch_store", "unsandboxed_build_scripts", "build_seconds"];
+        &["checkout", "store", "work", "tree", "crates", "fetch_store", "vendor_from", "unsandboxed_build_scripts", "build_seconds"];
 
     fn parse(f: &Fields<'_>) -> Result<Args, InputError> {
         let build_seconds = f.int("build_seconds", Some(900))?;
@@ -131,6 +144,10 @@ impl Input for Args {
             fetch_store: match f.get("fetch_store") {
                 None => None,
                 Some(_) => Some(PathBuf::from(f.str("fetch_store", None)?)),
+            },
+            vendor_from: match f.get("vendor_from") {
+                None => None,
+                Some(_) => Some(PathBuf::from(f.str("vendor_from", None)?)),
             },
             unsandboxed_build_scripts: f.bool("unsandboxed_build_scripts", Some(false))?,
             build_seconds: u64::try_from(build_seconds)
@@ -161,6 +178,9 @@ enum Failure {
     Conflict { key: String, held: String, made: String },
     /// A manifest is not one this tool can rewrite.
     Manifest { path: PathBuf, why: String },
+    /// With `vendor_from`: the packages the build needs that the fetch store cannot give, each
+    /// named; nothing is fetched from the network instead.
+    Unvendored { store: PathBuf, missing: Vec<store_vendor::Missing> },
 }
 
 impl fmt::Display for Failure {
@@ -184,6 +204,15 @@ impl fmt::Display for Failure {
                 "the store holds module {key} with wasm {held}, and this build made {made}: one key, two values (rule 21); the key misses an input"
             ),
             Failure::Manifest { path, why } => write!(f, "{}: {why}", path.display()),
+            Failure::Unvendored { store, missing } => {
+                write!(
+                    f,
+                    "the fetch store {} cannot give {} package(s) the build needs, and with \"vendor_from\" nothing is fetched from the network:",
+                    store.display(),
+                    missing.len()
+                )?;
+                missing.iter().try_for_each(|it| write!(f, "\n  {it}"))
+            }
         }
     }
 }
@@ -1705,7 +1734,7 @@ fn decls_export(wasm: &[u8]) -> Option<String> {
     None
 }
 
-fn main_with(args: &Args) -> i32 {
+fn main_with(args: &Args, heap: &blaze_own::Heap) -> i32 {
     let env = |name: &str| std::env::var(name).unwrap_or_default();
     let home = env("HOME");
     let fail = |failure: Failure| -> ! { blaze_script::fail(SCRIPT, &failure.to_string()) };
@@ -1756,7 +1785,12 @@ fn main_with(args: &Args) -> i32 {
     };
     println!("{SCRIPT}: toolchain {} at {}", plan.tool.name, plan.tool.sysroot.display());
     let started = Instant::now();
-    plan.fetch().unwrap_or_else(|failure| fail(failure));
+    // A macro crate's member is its whole manifest: every dependency it declares is resolved.
+    match &args.vendor_from {
+        Some(store) => plan.vendor_from(store, |manifest| manifest.to_owned(), heap.alloc()),
+        None => plan.fetch(),
+    }
+    .unwrap_or_else(|failure| fail(failure));
     correct_vendored(&plan.work.join("vendor")).unwrap_or_else(|failure| fail(failure));
     println!("{SCRIPT}: fetched in {:.1}s", started.elapsed().as_secs_f64());
     let mut failed = 0;
@@ -1796,11 +1830,12 @@ fn main() {
         let args: Vec<OsString> = std::env::args_os().skip(1).collect();
         wrap(args, &macro_crate);
     }
+    let heap = blaze_own::Heap::process();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
-        [one] if build_scripts::asked(one) => blaze_script::exit(build_scripts::main_with(one)),
+        [one] if build_scripts::asked(one) => blaze_script::exit(build_scripts::main_with(one, heap)),
         [one] => {
-            let status = main_with(&input::parse::<Args>(one, SCRIPT));
+            let status = main_with(&input::parse::<Args>(one, SCRIPT), heap);
             blaze_script::exit(status);
         }
         _ => {

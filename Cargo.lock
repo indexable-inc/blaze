@@ -413,6 +413,7 @@ dependencies = [
  "blaze-fetch",
  "blaze-file-items",
  "blaze-h1",
+ "blaze-hash",
  "blaze-http",
  "blaze-id",
  "blaze-ids",
@@ -423,6 +424,7 @@ dependencies = [
  "blaze-mem",
  "blaze-own",
  "blaze-proc-macro",
+ "blaze-producers",
  "blaze-remote",
  "blaze-report",
  "blaze-run",
@@ -433,6 +435,7 @@ dependencies = [
  "blaze-surface",
  "blaze-tar",
  "blaze-text",
+ "blaze-toml",
  "blaze-toolchain",
  "blaze-typeck",
  "blaze-unit-graph",
@@ -520,15 +523,6 @@ dependencies = [
  "blaze-sys",
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "blaze-coroutine"
-version = "0.0.0"
-dependencies = [
- "blaze-flow",
- "blaze-own",
- "blaze-sim",
 ]
 
 [[package]]
@@ -620,6 +614,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-code",
  "blaze-ids",
+ "blaze-native",
  "blaze-own",
  "blaze-sha256",
  "blaze-tier",
@@ -1057,6 +1052,7 @@ dependencies = [
  "blaze-sim",
  "blaze-std",
  "blaze-surface",
+ "blaze-tier",
  "blaze-toolchain",
  "blaze-typeck",
  "blaze-unit-graph",
@@ -1083,6 +1079,7 @@ dependencies = [
  "blaze-code",
  "blaze-core",
  "blaze-launch",
+ "blaze-native",
  "blaze-own",
  "blaze-queue",
  "blaze-run",
@@ -1363,6 +1360,15 @@ dependencies = [
  "libc",
  "tracing",
  "wasmtime",
+]
+
+[[package]]
+name = "blaze-producers"
+version = "0.0.0"
+dependencies = [
+ "blaze-ids",
+ "blaze-own",
+ "blaze-toml",
 ]
 
 [[package]]

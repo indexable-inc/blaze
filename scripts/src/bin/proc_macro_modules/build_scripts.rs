@@ -193,20 +193,19 @@ fn library(tool: &Toolchain, tree: &Path, _work: &Path) -> Result<(PathBuf, Stri
     Ok((to, shim_digest, rt_digest))
 }
 
-/// The member's manifest: the package's name, version and edition, the unit's `features` each
-/// declared empty (so `cfg!(feature = ...)` in the script sees exactly them), its
-/// build-dependencies as dependencies, and its script as the one binary.
-///
-/// Not handled: a feature that turns on an optional build-dependency (none in tempo's graph);
-/// the build then fails naming the missing crate.
-fn script_manifest(original: &str, script: &Path, name: &str, version: &str, features: &[String]) -> String {
+/// The member's manifest: the package's name, version and edition, the unit's `features` (so
+/// `cfg!(feature = ...)` in the script sees exactly them), each with its entries that name a
+/// build-dependency or a feature (`script_features`, D112 N6: `bindgen-runtime =
+/// ["bindgen/runtime"]` stays, so bindgen is built with `runtime`), its build-dependencies as
+/// dependencies, and its script as the one binary.
+pub(super) fn script_manifest(original: &str, script: &Path, name: &str, version: &str, features: &[String]) -> String {
     let edition = table_value(original, "package", "edition").map_or("2015", |it| it.trim_matches('"'));
     let mut out = format!(
         "[package]\nname = {name:?}\nversion = {version:?}\nedition = {edition:?}\npublish = false\nautobins = false\nautoexamples = false\nautotests = false\nautobenches = false\n\n[[bin]]\nname = \"build-script-build\"\npath = {:?}\n\n[features]\n",
         script.display().to_string()
     );
     for feature in features {
-        out.push_str(&format!("{feature:?} = []\n"));
+        out.push_str(&super::script_features::script_feature_line(original, feature));
     }
     let mut keep = false;
     for line in original.lines() {
@@ -245,11 +244,12 @@ fn script_only(manifest: &str) -> String {
         }
     }
     out.push_str("\n[lib]\n");
-    // Its feature names, each empty: the fetch names the unit's features, and none of them may
-    // turn on a dependency the script does not build with.
+    // Its features, each with only its entries that name a build-dependency or a feature: the
+    // fetch names the unit's features, and none of them may turn on a dependency the script
+    // does not build with, while `bindgen/runtime` and the like must stay (D112 N6).
     out.push_str("\n[features]\n");
     for feature in feature_names(manifest) {
-        out.push_str(&format!("{feature:?} = []\n"));
+        out.push_str(&super::script_features::script_feature_line(manifest, &feature));
     }
     let mut keep = false;
     for line in manifest.lines() {
@@ -271,7 +271,7 @@ fn script_only(manifest: &str) -> String {
 
 /// The names the build-dependency tables of `manifest` declare (`name = ...` in
 /// `[build-dependencies]`, or `[build-dependencies.name]`, and their `[target.*]` forms).
-fn build_dep_names(manifest: &str) -> Vec<String> {
+pub(super) fn build_dep_names(manifest: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut inside = false;
     for line in manifest.lines() {
@@ -535,7 +535,7 @@ impl Plan<'_> {
 }
 
 /// The mode's run: every script asked for built and kept; 1 when any failed.
-pub(super) fn main_with(text: &str) -> i32 {
+pub(super) fn main_with(text: &str, heap: &blaze_own::Heap) -> i32 {
     let Wrapped(args, native) = input::parse::<Wrapped>(text, SCRIPT);
     let args = &args;
     let native = native.as_ref();
@@ -578,7 +578,11 @@ pub(super) fn main_with(text: &str) -> i32 {
     };
     println!("{SCRIPT}: build scripts; toolchain {} at {}", plan.tool.name, plan.tool.sysroot.display());
     let started = Instant::now();
-    plan.fetch().unwrap_or_else(|failure| fail(failure));
+    match &args.vendor_from {
+        Some(store) => plan.vendor_from(store, script_only, heap.alloc()),
+        None => plan.fetch(),
+    }
+    .unwrap_or_else(|failure| fail(failure));
     println!("{SCRIPT}: fetched in {:.1}s", started.elapsed().as_secs_f64());
     let mut failed = 0;
     for (at, wanted) in args.crates.iter().enumerate() {

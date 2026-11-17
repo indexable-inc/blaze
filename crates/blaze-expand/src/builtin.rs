@@ -577,7 +577,8 @@ fn include(
     }
     // `include!` reads the file as text, the same fact `include_str!` reads.
     let (kind, how) = match inclusion {
-        Inclusion::Tokens | Inclusion::Str => (ReadKind::IncludeStr, IncludeAs::Str),
+        Inclusion::Tokens => (ReadKind::IncludeStr, IncludeAs::Tokens),
+        Inclusion::Str => (ReadKind::IncludeStr, IncludeAs::Str),
         Inclusion::Bytes => (ReadKind::IncludeBytes, IncludeAs::Bytes),
     };
     // The read list's subject: the root-relative path a host with a read root answers (D60),

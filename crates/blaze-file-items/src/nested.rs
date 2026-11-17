@@ -30,6 +30,13 @@ use blaze_surface::Range;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Block {
     pub parent: Option<u32>,
+    /// The outer attributes of the statement of its parent block it is written in: before it
+    /// (`#[cfg(feature = "tracing")] { .. }`) or before the statement holding it
+    /// (`#[cfg(x)] let s = { .. };`, `#[cfg(x)] f(|| { .. });`); empty at [`Block::open`] when
+    /// none are. The Reference, "Statements" and "Expression attributes": a statement's outer
+    /// attributes, `cfg` among them, apply to the whole statement, so a false `cfg` removes
+    /// every block in it.
+    pub attrs: Range,
     /// The offset of its `{`.
     pub open: u32,
     /// The offset after its `}`.
@@ -52,6 +59,9 @@ pub enum NestedKind {
     TypeAlias,
     Mod,
     MacroRules,
+    /// `macro name(..) { .. }` or `macro name { .. }` (`decl_macro`; std's `macro spec_str`
+    /// in `OsString::push`'s body, called right after it).
+    Macro,
     ExternBlock,
 }
 
@@ -190,6 +200,8 @@ fn item_word(word: &str) -> Option<NestedKind> {
         "trait" => NestedKind::Trait,
         "type" => NestedKind::TypeAlias,
         "mod" => NestedKind::Mod,
+        // A keyword in every edition (the Reference, "Keywords", reserved): never a plain name.
+        "macro" => NestedKind::Macro,
         _ => return None,
     })
 }
@@ -226,6 +238,9 @@ pub fn scan<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
     let mut fresh = false;
     // Where the statement started, when attributes or a visibility came first.
     let mut stmt_start: Option<u32> = None;
+    // Per block, by id: the outer attributes of the expression or `let` statement under way in
+    // it ([`Block::attrs`] of the blocks written inside that statement).
+    let mut stmt_attrs: AVec<'a, Option<Range>> = AVec::new_in(alloc);
     let mut lead = Lead::None;
     // The start of a path that began the statement (a statement call's name).
     let mut path_start: Option<u32> = None;
@@ -343,7 +358,20 @@ pub fn scan<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                 }
                 (TokenKind::OpenBrace, None) => {
                     let id = offset(out.blocks.len());
-                    out.blocks.push(Block { parent: stack.iter().rev().find_map(|o| if let Open::Brace(b) = o { Some(*b) } else { None }), open: offset(start), close: 0 });
+                    let parent = stack.iter().rev().find_map(|o| if let Open::Brace(b) = o { Some(*b) } else { None });
+                    let none = Range { start: offset(start), end: offset(start) };
+                    let attrs = match (block, parent) {
+                        // A block statement: its own attributes; a new statement of the parent.
+                        (Some(b), _) if fresh => {
+                            stmt_attrs[b as usize] = None;
+                            stmt_start.map_or(none, |s| Range { start: s, end: offset(start) })
+                        }
+                        // Inside a statement of the parent, maybe within its parens.
+                        (_, Some(p)) => stmt_attrs[p as usize].unwrap_or(none),
+                        (_, None) => none,
+                    };
+                    stmt_attrs.push(None);
+                    out.blocks.push(Block { parent, attrs, open: offset(start), close: 0 });
                     Open::Brace(id)
                 }
                 // `#[..]`, `#![..]` and `pub(..)` leave the statement at its start.
@@ -392,6 +420,7 @@ pub fn scan<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
         };
         match kind {
             TokenKind::Semi => {
+                stmt_attrs[block as usize] = None;
                 fresh = true;
                 stmt_start = None;
                 lead = Lead::None;
@@ -451,7 +480,10 @@ pub fn scan<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                     _ => Lead::None,
                 };
                 if next == Lead::None {
-                    // An expression or a `let`: the statement is under way.
+                    // An expression or a `let`: the statement is under way, under the outer
+                    // attributes written before it.
+                    stmt_attrs[block as usize] =
+                        stmt_start.filter(|s| text[*s as usize..].starts_with('#')).map(|s| Range { start: s, end: offset(start) });
                     fresh = false;
                     stmt_start = None;
                     path_start = (lead == Lead::None && !not_a_macro(word)).then_some(begin);

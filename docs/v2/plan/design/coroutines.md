@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: The coroutine transform (crates/blaze-coroutine). What turns the body of an `async fn` or an `async` block (later a generator) into a state and one `resume` function the code builder builds as ordinary code. The small form it works on; which locals are saved (liveness with borrows); the state and its tags; the rewrite; drop on cancel as a per-point cancel path; where `.await` is desugared; the simulation that proves it with five planted bugs; the adapter from a checked body and back; what the builder needs.
+summary: The coroutine transform, in two homes - crates/blaze-flow/src/suspend.rs (which locals a body saves) and crates/blaze-lir/src/coroutine.rs (the split into `poll` and `drop`, and the state). What turns the body of an `async fn` or an `async` block (later a generator) into a state and one `poll` function the code builder builds as ordinary code. Which locals are saved (liveness with borrows); the state and its tags; the split; drop on cancel as a per-point cancel path; where `.await` is desugared; the simulations that prove it with planted bugs; the lowering from a checked body; what the builder needs.
 date: 2026-11-16
 ---
 # Coroutines: the state, `resume`, and drop on cancel
@@ -8,8 +8,10 @@ date: 2026-11-16
 A coroutine is the sibling of a closure (codegen.md, "Closures and the Fn traits"): a closure is an
 environment and a body function taking it; a coroutine is an environment that also holds a tag and
 the locals that outlive a suspension, and a body function that starts with a `match` on the tag.
-The interface crate is `crates/blaze-coroutine`: the form, the analysis, the rewrite, and a
-simulation with planted bugs. Nothing in it knows the checker or the builder (rule 79).
+It has two homes (one concept, one home each; the first interface crate, `crates/blaze-coroutine`,
+was deleted once both held): `crates/blaze-flow/src/suspend.rs`, which locals a body saves, per
+body on the flow form, and `crates/blaze-lir/src/coroutine.rs`, the split of one LIR function into
+`poll` and `drop` and the state's layout (decision D73). Neither knows the checker (rule 79).
 
 ## Sources, quoted
 
@@ -50,30 +52,33 @@ simulation with planted bugs. Nothing in it knows the checker or the builder (ru
 
 ## The design
 
-1. **A value and one function.** The value is the state. `resume(state: Pin<&mut State>, cx: &mut
+1. **A value and one function.** The value is the state. `poll(state: Pin<&mut State>, cx: &mut
    Context<'_>) -> Poll<Output>` is built by the ordinary builder. An `async fn` only makes the
    state (its arguments become the upvars, the tag `Unresumed`) and returns it; nothing runs.
-2. **The form** (`ir.rs`): numbered locals (`0..upvars` are the upvars), blocks as ranges of one
-   statement array, a terminator per block. Statements define, use, borrow, load and store through
-   a reference, call, poll, drop, and end a local's storage. `Suspend { point, resume, drop }` is
-   the only suspension: where to go on when polled again, and where to go when the state is
-   dropped while parked there. The cancel path ends in `Cancelled`.
-3. **Which locals are saved** (`live.rs`, `layout.rs`). A local is saved when, at some `Suspend`,
-   it is live by use on the resume or the cancel path, or it may have been borrowed and its storage
-   has not ended. The second rule is what makes the state self-referential: a saved reference
-   points at a saved local, so the state must not move once polled. That is the promise `Pin<&mut
-   State>` carries, and why the checker never makes the future `Unpin`. Every other local stays an
-   ordinary local of `resume`, new at each poll. `cx` is one of those: it is "the current task
-   context" of each poll and is never saved.
-4. **The state** holds the upvars first, in order (so a state before its first poll is a closure
-   environment plus a tag), then one slot per saved local in declaration order, and the tag:
-   `Unresumed = 0`, `Returned = 1`, `Panicked = 2`, point `k` is `3 + k`.
-5. **The rewrite** (`transform.rs`) is small because the form was chosen for it: each `Suspend`
-   becomes `Park(point)` (store the tag, return `Poll::Pending`), and the head `match` is a table,
-   `Machine::entry(tag)`: start, the resume block of point `k`, or the library's panic "`async fn`
-   resumed after completion". `Return(v)` in a machine stores `Returned` and returns `Ready(v)`.
-6. **Drop on cancel** is a second function from the same blocks: `Machine::drop_entry(tag)` is the
-   cancel path of point `k`; at `Unresumed` a block that drops the upvars; at `Returned` nothing.
+2. **The suspension in the flow form** (crates/blaze-flow, `StmtKind::Suspend { resume, cancel }`):
+   where to go on when polled again, and where to go when the state is dropped while parked there.
+   An async block's body is its own flow (crates/blaze-flow-lower/src/coroutine.rs `lower_async`):
+   its upvars are its arguments, `.await` is the Reference's loop, and each cancel path is the
+   drops a `return` there makes. So async bodies are move- and borrow-checked like any body.
+3. **Which locals are saved** (crates/blaze-flow/src/suspend.rs `saved`). A local is saved when, at
+   some `Suspend`, it is maybe storage-live and either live by use on its resume or cancel path, or
+   maybe borrowed since its `StorageLive`. The second rule is what makes the state
+   self-referential: a saved reference points at a saved local, so the state must not move once
+   polled. That is the promise `Pin<&mut State>` carries, and why the checker never makes the
+   future `Unpin`. Every other local stays an ordinary local of `poll`, new at each poll. `cx` is
+   one of those: it is "the current task context" of each poll and is never saved. The saved
+   locals' types are the exact interior (blaze-flow-lower coroutine.rs `interior`), known per body
+   before any instance.
+4. **The split** (crates/blaze-lir/src/coroutine.rs `split`, decision D73): the builder builds the
+   body as an ordinary LIR function, each await ending a block in `suspend point, resume, cancel`,
+   and one pass splits it into `poll` and `drop(state)` with a `StateLayout`. The section "The LIR
+   pass" below is its full statement.
+5. **The state** holds the upvars first, in order (so a state before its first poll is a closure
+   environment plus a tag), then the kept slots and values by falling alignment, then the tag:
+   `UNRESUMED = 0`, `RETURNED = 1`, `PANICKED = 2`, point `k` is `FIRST_POINT + k` (3 + k), in the
+   narrowest of `i8`, `i16`, `i32`.
+6. **Drop on cancel** is the second output from the same blocks: `drop` switches on the tag into
+   point `k`'s cancel path; at `Unresumed` the block that drops the upvars; at `Returned` nothing.
 
 ## Decisions (where the Reference is silent)
 
@@ -92,7 +97,7 @@ simulation with planted bugs. Nothing in it knows the checker or the builder (ru
   path saves them with no special rule.
 - D3. A local's home never changes: saved means every access goes to the state, from its first
   write. No copy out at a suspension and back at a resume: that moves a local a saved reference
-  points at (planted bug `SavedByCopy`).
+  points at (on LIR: every `slot_addr` of a kept slot is the state pointer plus its offset).
 - D4. Borrows are counted coarsely: borrowed once, kept until `StorageDead`. Exact (the loan's
   liveness from blaze-flow) is a later refinement and can only save fewer locals.
 - D5. Upvars are always saved, and dropped at `Unresumed` in declaration order: the Reference
@@ -100,43 +105,38 @@ simulation with planted bugs. Nothing in it knows the checker or the builder (ru
 - D6. `Panicked` is reserved and never stored yet: the rebuilt path aborts on a panic (flow.md
   section 1). With unwinding, a poll that unwinds stores it first.
 - D7. A cancel path may not suspend and may not return a value (no async drop); a resume path may
-  not reach `Cancelled`. Both are refused by name (`TransformError`).
+  not reach `cancelled`. Each is refused by name (blaze-lir `CoroutineError::SuspendOnCancel`,
+  `ReturnOnCancel`, `CancelledOnResume`).
 - D8. One slot per saved local, no overlap. Overlap is the later optimisation: two saved locals
   may share bytes when their storage is never live at once. It needs `StorageLive` beside
-  `StorageDead` at statement grain and the conflict matrix; `Layout::across` is its first input.
-- D9. `Layout::across` is also the checker's owed exact interior (rules/coroutine.rs, "Owed"): the
-  types of the locals saved at some point, in place of today's superset.
+  `StorageDead` at statement grain and the conflict matrix; blaze-flow's `saved` is its first
+  input.
+- D9. blaze-flow's `saved` is also the checker's exact interior (blaze-flow-lower coroutine.rs
+  `interior`): the types of the locals saved at some point, in place of the superset.
 
-## Proof by simulation (`interp.rs`, `tests.rs`)
+## Proof by simulation (blaze-lir coroutine_tests.rs; blaze-flow suspend_tests.rs)
 
-One executor gives the statements their meaning; two drivers use it. The direct run keeps one
-frame alive and treats `Suspend` as "yielded at k, go on or cancel". The machine run keeps only
-the state between polls: a new frame each poll, entry by the tag, `Park` to leave. A reference
-into a frame of an earlier poll is a fault. For random bodies from a grammar (straight code,
-branches, counted loops, an await inside a loop, a borrow held across an await, a write through
-it, early return, moves before and after an await, drop flags), every schedule of Pending and
-Ready answers, and a cancel after every yield (and before the first poll, and after the return),
-the two traces (calls with arguments, polls, drops in order, yields, the final value) are equal.
-Planted bugs, each caught by a control: `LiveLeftOut`, `BorrowsNotCounted`, `CancelDropsAll`,
-`ResumeNext`, `SavedByCopy`. Ten hand-written bodies have their traces written out.
+The split (crates/blaze-lir/src/coroutine_tests.rs): one interpreter gives the LIR operations
+their meaning; two drivers use it. The direct run keeps one frame alive from the first poll to the
+end and treats `suspend` as "this poll returned; go on at the resume block, or at the cancel block
+if the state is dropped here". The machine run keeps only the state between polls: a new frame for
+each call of `poll`, then `drop` when the schedule cancels. A pointer into the frame of an earlier
+call is a fault, as is a load of bytes nothing wrote. For random bodies, every schedule of Pending
+and Ready answers and a cancel after every yield, the two traces are equal. Planted bugs, each
+caught by a control: `SlotLeftOut`, `NoReloadOnCancel`, `TagAfterReturn`, `ResumeNext`
+(blaze-lir coroutine.rs `Plant`).
 
-## From a checked body and back (the next leg)
+The saved set (crates/blaze-flow/src/suspend_tests.rs): a local used after the suspension is
+saved, one dead before it is not, one used only on the cancel path is saved, and a borrowed local
+is saved even when unused after; the last has a planted control (`SavedPlant::NoBorrows`). The
+exact interior (crates/blaze-flow-lower/src/coroutine_tests.rs) has its control
+`InteriorPlant::EveryLocal`.
 
-```rust
-// crates/blaze-coroutine-lower, beside blaze-flow-lower
-pub fn lower<A: Allocator + Clone, F: Facts>(
-    body: &BodyView<'_>, checked: &Checked, root: ExprId, facts: &F, alloc: A,
-) -> Result<Lowered<A>, LowerError>;
-pub struct Lowered<A: Allocator> {
-    pub body: blaze_coroutine::Body<A>,
-    /// What each local is: a binding, a temporary of an expression, an await's future, a flag.
-    pub local_of: Vec<Origin, A>,
-    /// The `Expr::Await` of each point.
-    pub point_of: Vec<ExprId, A>,
-}
-```
+## From a checked body and back
 
-In: the same walk blaze-flow-lower does (one mid-level form per body, D61), with three additions:
+In: the walk blaze-flow-lower does (one mid-level form per body, D61; built as
+crates/blaze-flow-lower/src/coroutine.rs `lower_async`, a second output of blaze-flow-lower itself,
+so there is one walk from the typed body to statements), with three additions:
 `Expr::Await` becomes the Reference's loop (a local for the future, `Poll`, a switch, `Suspend`),
 each `Suspend` gets a cancel path made by the routine that makes a `return`'s exit, and a binding
 whose initialisation depends on the path gets a flag local (blaze-flow moves.rs `drop_kind` says
@@ -146,8 +146,7 @@ not compiled when this was written), its root is the node a written `async move 
 (`Expr::AsyncBlock { body, capture: Capture::Move }`, the parameter `let`s first in `body`), its
 type `TyView::Future(root, T, interior)` is the fn's hidden type in `Checked::hidden`, and its
 parameters are that block's by-move captures. So `root` is always an `Expr::AsyncBlock`, and the
-fn itself is an ordinary body that makes the state and returns it. Best is to make it a second output of blaze-flow-lower itself, so there is one
-walk from the typed body to statements, not two.
+fn itself is an ordinary body that makes the state and returns it.
 
 Back (decision D73, which replaced hooks in the walk: homes for named bindings alone are unsound,
 since the walk keeps temporaries in stack slots and its cached values do not dominate a resume

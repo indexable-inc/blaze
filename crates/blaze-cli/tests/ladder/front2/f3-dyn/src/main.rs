@@ -34,8 +34,7 @@ fn through_ref(a: &dyn Area) -> u32 {
     a.area()
 }
 
-fn main(cx: &Cx, io: Io) -> Result<(), Error> {
-    let out = io.need_out()?;
+fn main(cx: &Cx, out: Out) -> Result<(), Error> {
     let mut drops = 0;
     let square = Square(5);
     // 25 + 2 * 3 + 2 * 4 + 3 = 42 when every call goes to its own impl.

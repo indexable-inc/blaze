@@ -89,7 +89,8 @@ pub(crate) enum Outer {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Event {
     Close,
-    Open,
+    /// The written block at this index of [`Nested::blocks`].
+    Open(u32),
     Item(u32),
     Call(u32),
 }
@@ -135,8 +136,11 @@ pub(crate) fn written<'a>(nested: &Nested<'_>, alloc: Alloc<'a>) -> AVec<'a, boo
 }
 
 /// The module text of the blocks of `text` (scanned to `nested`) that `written` keeps: for
-/// each, a `mod` holding `use super::*;` (an explicit declaration shadows a glob import:
-/// innermost first) and EVERY item statement and statement call of the block, in text order
+/// each, a `mod` holding FIRST `use super::*;` (an explicit declaration shadows a glob import:
+/// innermost first). That glob is the block's lexical scope. The cells know it by its place,
+/// the first import of the module's own text, and resolve it to the module's own parent, where
+/// a written `super` passes over blocks (`Cells::lexical_glob`). Then comes EVERY item
+/// statement and statement call of the block, in text order
 /// (a `macro_rules!` before its uses). With [`Outer::Inline`] the outermost block (block 0,
 /// the calling block) has no `mod` line: its items and calls are written at the top level.
 pub(crate) fn render<'a>(text: &str, nested: &Nested<'_>, written: &[bool], outer: Outer, alloc: Alloc<'a>) -> AString<'a> {
@@ -146,7 +150,7 @@ pub(crate) fn render<'a>(text: &str, nested: &Nested<'_>, written: &[bool], oute
     for (b, block) in nested.blocks.iter().enumerate() {
         let inlined = matches!(outer, Outer::Inline { .. }) && b == 0;
         if is_written(b as u32) && !inlined {
-            events.push((block.open, Event::Open));
+            events.push((block.open, Event::Open(b as u32)));
             events.push((block.close, Event::Close));
         }
     }
@@ -171,7 +175,20 @@ pub(crate) fn render<'a>(text: &str, nested: &Nested<'_>, written: &[bool], oute
     let mut ordinal = 0u32;
     for (_, event) in events.iter() {
         match *event {
-            Event::Open => {
+            Event::Open(b) => {
+                // The block's outer attributes go on its module: a false `cfg` removes the
+                // block and so the module, its items and its calls with it (hyper's `trace!`:
+                // `#[cfg(feature = "tracing")] { tracing::trace!(..); }`). The Reference,
+                // "Conditional compilation": a false `cfg` removes the thing it is on.
+                let block = nested.blocks[b as usize];
+                let attrs = &text[block.attrs.start as usize..block.attrs.end as usize];
+                // Outer ones only (`#[..]`, `# [..]` in an expansion's printed tokens): an
+                // inner `#![..]` at the start of the block around is that block's own.
+                let outer_attr = attrs.strip_prefix('#').is_some_and(|rest| rest.trim_start().starts_with('['));
+                if outer_attr {
+                    out.push_str(attrs);
+                    out.push_str("\n");
+                }
                 // Writing to an own string does not fail.
                 let _ = match outer {
                     Outer::Module => writeln!(out, "mod {BLOCK_MODULE}{ordinal} {{\nuse super::*;"),

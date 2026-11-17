@@ -57,6 +57,15 @@ pub(crate) enum Plant {
     /// so it can invent an auto trait (`suite::dyn_objects::control_coercion_invents_auto`).
     #[cfg(test)]
     UnsizeUnasked,
+    /// `start_body` does not select after lowering the signature, so a body value binds the
+    /// output's projection variable first and the projection fails with no place
+    /// (`suite::deferred_place::signature_projection_is_settled_before_the_body`).
+    #[cfg(test)]
+    SignatureUnsettled,
+    /// The lub of two fn items is not tried: two fn items of one signature at one coercion site
+    /// are E0308 (`suite::fn_item_lub::control_without_the_lub_the_second_arm_is_e0308`).
+    #[cfg(test)]
+    FnLubOff,
 }
 
 /// What the context expects of an expression (rustc's `Expectation`).
@@ -316,11 +325,20 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     /// (`<T as IntoFuture>::IntoFuture`): part of the enclosing future's interior.
     pub awaited: Vec<(ExprId, Ty), Alloc<'a>>,
     pub coerce_many: Vec<CoerceMany, Alloc<'a>>,
+    /// Each coercion site's value sources so far, `(site, expression)`, in push order; a `!`
+    /// source is not listed. Read when the site's fn items meet at a fn pointer
+    /// (rules/coerce_lub.rs): each earlier source then records `ReifyFnPointer` (rustc's
+    /// `CoerceMany::pushed` expressions).
+    pub coerce_sources: Vec<(u32, ExprId), Alloc<'a>>,
     pub breaks: Vec<BreakCtx, Alloc<'a>>,
     /// The innermost body's return site (the fn's, or a closure's).
     pub ret_sites: Vec<u32, Alloc<'a>>,
     /// One per open body, as `ret_sites`: whether it is async (where `.await` may be).
     pub async_sites: Vec<bool, Alloc<'a>>,
+    /// Arguments whose formal input the call's expected type made unsized (`str`, a slice, a
+    /// trait object): the type, an `RvalueLikeUnsized` hint for the argument only
+    /// (rules/expect_inputs.rs), taken when the argument is checked.
+    pub unsized_arg_hints: Vec<(ExprId, Ty), Alloc<'a>>,
     /// The adjustments of the coercion being tried, moved to `adjust` once it commits.
     pub adj_scratch: Vec<(AdjustKind, Ty), Alloc<'a>>,
     /// Each opaque this body defines and its hidden type's variable (rules/opaque_def.rs).
@@ -329,6 +347,11 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     pub opening: bool,
     /// The promoted borrows (rules/promote.rs `analyze_promotions`), sorted by expression.
     pub promoted: Vec<ExprId, Alloc<'a>>,
+    /// What an auto-trait goal of a future that failed only on the superset interior becomes:
+    /// the gap, or under `check_deferring` a stalled row (src/stalled.rs).
+    pub interior: crate::stalled::Interior,
+    /// The stalled auto-trait goals, in the order they failed (src/stalled.rs).
+    pub stalled: Vec<crate::stalled::PendingStalled, Alloc<'a>>,
 }
 
 impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
@@ -399,13 +422,17 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             futures: Vec::new_in(alloc),
             awaited: Vec::new_in(alloc),
             coerce_many: Vec::new_in(alloc),
+            coerce_sources: Vec::new_in(alloc),
             breaks: Vec::new_in(alloc),
             ret_sites: Vec::new_in(alloc),
             async_sites: Vec::new_in(alloc),
+            unsized_arg_hints: Vec::new_in(alloc),
             adj_scratch: Vec::new_in(alloc),
             defining: Vec::new_in(alloc),
             opening: false,
             promoted: Vec::new_in(alloc),
+            interior: crate::stalled::Interior::Gap,
+            stalled: Vec::new_in(alloc),
             alloc,
         })
     }
@@ -602,13 +629,18 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 // The first source is coerced to the expected type.
                 if self.coerce(Some(e), ty, cm.expected, false)? { Some(cm.expected) } else { None }
             }
-            Some(e) => self.coercion_lub(e, merged, ty)?,
+            Some(e) => self.coercion_lub(site, e, merged, ty)?,
         };
         match ok {
             Some(t) => {
                 let entry = &mut self.coerce_many[site as usize];
                 entry.final_ty = Some(t);
                 entry.pushed += 1;
+                if let Some(e) = e
+                    && !self.is_never(ty)
+                {
+                    self.coerce_sources.push((site, e));
+                }
             }
             None => {
                 let code = if cm.pushed == 0 { DiagCode::Mismatch } else { DiagCode::IncompatibleArms };
@@ -619,9 +651,22 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         Ok(())
     }
 
-    /// `try_find_coercion_lub`, first cut: the new source coerced to the merged type, else the
-    /// two unified as their least upper bound (equal, regions being erased).
-    fn coercion_lub(&mut self, e: ExprId, merged: Ty, ty: Ty) -> Result<Option<Ty>, Stop> {
+    /// `try_find_coercion_lub`: two fn items (or a fn item and a closure that captures nothing)
+    /// meet at their fn pointer, every source reified (rules/coerce_lub.rs); else the new source
+    /// coerced to the merged type, else the two unified as their least upper bound (equal,
+    /// regions being erased).
+    fn coercion_lub(&mut self, site: u32, e: ExprId, merged: Ty, ty: Ty) -> Result<Option<Ty>, Stop> {
+        #[cfg(test)]
+        let fn_lub_on = self.plant != Plant::FnLubOff;
+        #[cfg(not(test))]
+        let fn_lub_on = true;
+        if fn_lub_on {
+            match self.fn_lub(site, e, merged, ty)? {
+                crate::rules::coerce_lub::FnLub::NotFns => {}
+                crate::rules::coerce_lub::FnLub::Merged(t) => return Ok(Some(t)),
+                crate::rules::coerce_lub::FnLub::Mismatch => return Ok(None),
+            }
+        }
         if self.coerce(Some(e), ty, merged, false)? {
             return Ok(Some(merged));
         }
@@ -816,7 +861,23 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             if matches!(err.kind, crate::ty::FulfillErrorKind::Unsatisfied)
                 && let Some(gap) = self.coroutine_interior_gap(err.obligation.goal)?
             {
-                return Err(gap.into());
+                // Under `check_deferring`: a stalled row holding the finding the goal becomes if
+                // it fails on the exact interior (src/stalled.rs), made as the unmet-goal finding
+                // below is made; otherwise the gap.
+                match (self.interior, err.obligation.goal) {
+                    (crate::stalled::Interior::Defer, crate::ty::Goal::Trait { trait_, args }) => {
+                        let ty = self.ty.list_get(args, 0);
+                        let leaf = self.failed_leaf(trait_, args)?.map(|(trait_, args)| PendingGoal::Trait { trait_, args });
+                        let (because, unmet) = match err.because {
+                            Some(b) => (Some(b), None),
+                            None => (None, Some((PendingGoal::Trait { trait_, args }, leaf))),
+                        };
+                        let diag = PendingDiag { code: DiagCode::Unsatisfied, at, expected: None, found: Some(ty), name: None, because, unmet };
+                        self.stalled.push(crate::stalled::PendingStalled { trait_, ty, diag });
+                        continue;
+                    }
+                    _ => return Err(gap.into()),
+                }
             }
             match err.kind {
                 crate::ty::FulfillErrorKind::Ambiguous => {

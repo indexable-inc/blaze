@@ -9,6 +9,7 @@
 //! | [`layout`] | the whole program laid out: equal records folded, ordered by profile then call graph, every call in reach a direct `bl`, C names through one GOT, relro parts and data in their regions, every word the loader fixes |
 //! | [`start`] | the start records the loader enters (dyld's `LC_MAIN` wrapper; Linux's `_start` into glibc's `__libc_start_main`) |
 //! | [`macho`] | the Mach-O writer: `__PAGEZERO`, `__TEXT`, `__DATA_CONST`, `__DATA`, `__LINKEDIT`, chained fixups, `LC_MAIN`, libSystem, `LC_UUID` of the content |
+//! | [`native_dylib`] | the program's native library record as a Mach-O `MH_DYLIB` around a `blaze_native` image: chained fixups by flat lookup, export trie, one `LC_LOAD_DYLIB` per install name, signed (NATIVE.md W4) |
 //! | [`sign`] | the ad-hoc code signature (one code directory of SHA-256 page hashes) |
 //! | [`elf`] | the ELF writer: PIE, `PT_INTERP`, the dynamic section, RELA, `PT_GNU_RELRO`, `PT_GNU_STACK`, a build id of the content |
 //! | [`check`] | readers that check a written file against the formats' structures (bounds, alignment, fixups, page hashes) |
@@ -33,6 +34,7 @@ pub mod export;
 pub mod input;
 pub mod layout;
 pub mod macho;
+pub mod native_dylib;
 pub mod optimized;
 mod plant;
 pub mod sign;

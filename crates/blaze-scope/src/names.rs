@@ -19,8 +19,8 @@ use core::fmt;
 use blaze_id::{CrateItemKey, ItemKey};
 use blaze_own::{AVec, Alloc};
 use blaze_surface::{
-    BindingState, CrateRootBuilder, Def, DefKind, Edition, Namespace, Node, Passed, PathKind, ScopeBuilder, Sources, Through,
-    Visibility, through,
+    BindingState, CrateRootBuilder, Def, DefKind, Edition, Namespace, Node, Passed, PathKind, RefusedWhy, ScopeBuilder, ScopeError,
+    Sources, Through, Visibility, through,
 };
 
 use crate::builtin::builtin_type_in;
@@ -41,6 +41,17 @@ pub trait World<N> {
     fn variants(&self, owner: ItemKey) -> Option<&[Variant<N>]>;
     /// Whether `module` or an ancestor is `#[no_implicit_prelude]`.
     fn no_implicit_prelude(&self, module: ItemKey) -> bool;
+    /// Whether `module` is a block's module ([`crate::blocks::is_block_module`]): anonymous,
+    /// passed over by a written `self` and `super` ([`written_up`]).
+    fn anonymous(&self, module: ItemKey) -> bool;
+}
+
+/// The module a written `self` (`n == 0`) or `super` written `n` times names from the module
+/// whose chain is `chain`: the `n`th module of the chain that is no block's module (the
+/// Reference, `paths.qualifiers.mod-self` and `paths.qualifiers.super`; a block is an anonymous
+/// scope). The cells' `Cells::up` is the same function. `None`: past the crate's root.
+fn written_up<N: Name, W: World<N>>(world: &W, chain: &[ItemKey], n: u8) -> Option<ItemKey> {
+    chain.iter().copied().filter(|m| !world.anonymous(*m)).nth(usize::from(n))
 }
 
 /// Why a path did not resolve; `at` is the index of the segment that did not.
@@ -63,6 +74,10 @@ pub enum Why {
     Unbounded,
     /// The path has no segments.
     Empty,
+    /// No binding of the segment in `module`, whose macro call `call` was refused (its scope
+    /// holds [`ScopeError::Refused`]): the name may be one the call would have written, so it
+    /// is unknown because of that call, never "not found" (rules 3 and 19).
+    Refused { module: ItemKey, call: ItemKey, why: RefusedWhy },
 }
 
 /// A path that did not resolve: the module it is written in, the failing segment, and why.
@@ -84,9 +99,22 @@ impl fmt::Display for PathError {
             Why::NotRead { .. } => "dependency source not read",
             Why::Unbounded => "a lookup through globs past its bound",
             Why::Empty => "no segments",
+            Why::Refused { why, .. } => why.text(),
         };
-        write!(f, "a path in module {:x}: segment {}: {why}", self.module, self.at)
+        write!(f, "a path in module {:x}: segment {}: {why}", self.module, self.at)?;
+        if let Why::Refused { module, call, .. } = self.why {
+            write!(f, " (macro call {call:x} in module {module:x})")?;
+        }
+        Ok(())
     }
+}
+
+/// The first refused macro call of `module`'s scope (none held: `None`), as [`Why::Refused`].
+fn refused_in<N: Name, W: World<N>>(world: &W, module: ItemKey) -> Option<Why> {
+    world.scope(module)?.errors.iter().find_map(|e| match e {
+        ScopeError::Refused { call, why, .. } => Some(Why::Refused { module, call: *call, why: *why }),
+        _ => None,
+    })
 }
 
 /// A path as written: how it begins and its segments.
@@ -156,9 +184,13 @@ fn walk<N: Name, W: World<N>>(world: &W, module: ItemKey, ns: Namespace, path: W
         // `::x` in edition 2015 is the crate root's `x`.
         PathKind::Abs if root.head.edition == Edition::E2015 => (Some(root.head.root_module), 0),
         PathKind::Crate => (Some(root.head.root_module), 0),
-        PathKind::SelfMod => (Some(module), 0),
-        PathKind::Super(n) => match chain.get(usize::from(n)) {
-            Some(m) => (Some(*m), 0),
+        // A written `self` or `super` passes over blocks' modules ([`written_up`]).
+        PathKind::SelfMod => match written_up::<N, W>(world, chain, 0) {
+            Some(m) => (Some(m), 0),
+            None => return Err(fail(0, Why::SuperPastRoot)),
+        },
+        PathKind::Super(n) => match written_up::<N, W>(world, chain, n) {
+            Some(m) => (Some(m), 0),
             None => return Err(fail(0, Why::SuperPastRoot)),
         },
         PathKind::DollarCrate(krate) => match world.root(krate) {
@@ -194,12 +226,15 @@ fn walk<N: Name, W: World<N>>(world: &W, module: ItemKey, ns: Namespace, path: W
             Some(m) => match name.as_ref() {
                 "super" => {
                     let c = world.chain(m).ok_or(fail(at, Why::NotRead { module: m }))?;
-                    Def::module(*c.get(1).ok_or(fail(at, Why::SuperPastRoot))?)
+                    Def::module(written_up::<N, W>(world, c, 1).ok_or(fail(at, Why::SuperPastRoot))?)
                 }
                 "self" => Def::module(m),
                 _ => {
                     let found = in_source(world, Def::module(m), ns_here, name, alloc).map_err(|why| fail(at, why))?;
-                    let p = found.ok_or(fail(at, Why::NotFound))?;
+                    let p = match found {
+                        Some(p) => p,
+                        None => return Err(fail(at, refused_in(world, m).unwrap_or(Why::NotFound))),
+                    };
                     if !visible(p.vis, chain, root.head.krate) {
                         return Err(fail(at, Why::Private));
                     }
@@ -299,8 +334,8 @@ fn lexical<N: Name, W: World<N>>(
 ) -> Result<Def, Why> {
     match name.as_ref() {
         "crate" => return Ok(Def::module(root.head.root_module)),
-        "self" => return Ok(Def::module(module)),
-        "super" => return chain.get(1).map(|m| Def::module(*m)).ok_or(Why::SuperPastRoot),
+        "self" => return written_up::<N, W>(world, chain, 0).map(Def::module).ok_or(Why::SuperPastRoot),
+        "super" => return written_up::<N, W>(world, chain, 1).map(Def::module).ok_or(Why::SuperPastRoot),
         _ => {}
     }
     if ns == Namespace::Macros {
@@ -352,7 +387,8 @@ fn lexical<N: Name, W: World<N>>(
             return Ok(def);
         }
     }
-    Err(Why::NotFound)
+    // Found in no layer: unknown when the module's own refused call could have written it.
+    Err(refused_in(world, module).unwrap_or(Why::NotFound))
 }
 
 /// `name` in `source` (a module, through its globs, or an enum).

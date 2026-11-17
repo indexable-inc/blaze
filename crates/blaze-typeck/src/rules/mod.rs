@@ -15,6 +15,7 @@ use crate::world::World;
 pub(crate) mod adt;
 pub(crate) mod assoc_args;
 pub(crate) mod async_fmt;
+pub(crate) mod await_impl;
 pub(crate) mod async_fn;
 pub(crate) mod block;
 pub(crate) mod builtin_ops;
@@ -25,6 +26,7 @@ pub(crate) mod call;
 pub(crate) mod cast;
 pub(crate) mod closure;
 pub(crate) mod coerce;
+pub(crate) mod coerce_lub;
 pub(crate) mod coerce_nested;
 pub(crate) mod control;
 pub(crate) mod coroutine;
@@ -89,10 +91,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
     }
 
-    /// `Expectation::rvalue_hint`: an unsized expected type is only a hint.
+    /// `Expectation::rvalue_hint`: an unsized expected type is only a hint (rustc: `ty::Slice |
+    /// ty::Str | ty::Dynamic` give `ExpectRvalueLikeUnsized`).
     pub(crate) fn rvalue_hint(&mut self, t: Ty) -> Expectation {
         match self.view(t) {
-            TyView::Str | TyView::Slice(_) => Expectation::RvalueLikeUnsized(t),
+            TyView::Str | TyView::Slice(_) | TyView::Dynamic(_) => Expectation::RvalueLikeUnsized(t),
             _ => Expectation::HasType(t),
         }
     }
@@ -136,7 +139,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     continue;
                 }
                 let formal = if (i as u32) < formals { self.ty.list_get(f.l, i as u32) } else { self.common.err };
-                let expect = self.rvalue_hint(formal);
+                // An unsized input the call's expected type gave is the argument's hint; it is
+                // still coerced to the formal (rustc `check_argument_types`: `coerced_ty =
+                // expectation.only_has_type().unwrap_or(formal_input_ty)`).
+                let expect = match self.take_unsized_arg_hint(arg) {
+                    Some(t) => Expectation::RvalueLikeUnsized(t),
+                    None => self.rvalue_hint(formal),
+                };
                 self.resume(f, state)?;
                 self.push_expr(arg, expect, Then::Coerce { to: formal, two_phase: true })?;
                 return Ok(true);

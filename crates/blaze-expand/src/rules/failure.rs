@@ -42,6 +42,8 @@ struct Best {
     found: Option<Found>,
     at: At,
     remaining: Seen,
+    /// The rule (definition order) that got here.
+    arm: u32,
 }
 
 /// The tracker the matcher calls at each location and token.
@@ -50,11 +52,13 @@ pub(crate) struct Tracker<'f> {
     closes: Vec<(Delim, At), &'f Frame>,
     remaining: Option<Seen>,
     best: Option<Best>,
+    /// The rule being matched now (set by [`match_failure`] before each).
+    arm: u32,
 }
 
 impl<'f> Tracker<'f> {
     fn new_in(frame: &'f Frame) -> Self {
-        Tracker { position: 0, closes: Vec::new_in(frame), remaining: None, best: None }
+        Tracker { position: 0, closes: Vec::new_in(frame), remaining: None, best: None, arm: 0 }
     }
 
     pub(crate) fn start(&mut self) {
@@ -98,7 +102,7 @@ impl<'f> Tracker<'f> {
                 (Some(found), at)
             }
         };
-        self.best = Some(Best { position: self.position, found, at, remaining });
+        self.best = Some(Best { position: self.position, found, at, remaining, arm: self.arm });
     }
 
     fn token_at(&self, view: &View<'_, '_>, src: Level) -> (Found, At) {
@@ -162,6 +166,7 @@ pub(crate) fn match_failure<'f>(
     for idx in 0..engine.program.arms.len() {
         let arm = engine.program.arms[idx];
         if arm.style == style {
+            track.arm = crate::tokens::index(idx);
             matcher::match_(engine, &arm, view, buffers, scratch, Some(&mut track))?;
         }
     }
@@ -179,7 +184,7 @@ pub(crate) fn match_failure<'f>(
         Ok(text) => text,
         Err(error) => return Ok(Err(error)),
     };
-    Ok(Ok(Some(Diagnostic::NoRuleMatched { rules, token, expected, at: Some(best.at) })))
+    Ok(Ok(Some(Diagnostic::NoRuleMatched { rules, closest: Some(best.arm), token, expected, at: Some(best.at) })))
 }
 
 /// Which keyword an identifier is, for its description.

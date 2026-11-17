@@ -2,7 +2,7 @@
 //! second answered from the record.
 //!
 //! `script_run <store> <module.wasm> <package folder> <name> <version>`: the package folder is
-//! served read-only at `/workspace`; the environment is `blaze_build_script::env`'s for a dev
+//! served read-only at `/package` (a dependency, D96); the environment is `blaze_build_script::env`'s for a dev
 //! check on aarch64-apple-darwin with no features.
 
 use std::{path::Path, sync::Arc, time::Instant};
@@ -45,13 +45,14 @@ fn main() {
     let alloc = Alloc::global();
     let wasm = std::fs::read(module).unwrap_or_else(|e| panic!("{module}: {e}"));
     let package = PackageFacts { name, version, ..PackageFacts::default() };
-    let given = Given { package, folder: "", features: &[], target_cfg: &[], target: TARGET, host: TARGET, deps: &[] };
+    // The folder is a package's copy: it runs as a dependency, at `/package` (D96).
+    let given = Given { package, seen: blaze_expand::seen::SeenRoot::Package, features: &[], target_cfg: &[], target: TARGET, host: TARGET, deps: &[] };
     let env = blaze_build_script::env(&given, alloc);
     let table = Arc::new(pinned_rows(TARGET, KNOWN, alloc).to_vec());
     let script = Arc::new(Script {
         package: format!("{name} {version}"),
         tree: dir_tree(Path::new(folder)),
-        folder: String::new(),
+        root: blaze_proc_macro::script_sandbox::ScriptRoot::package(),
         env: owned_env(&env),
         target: TARGET.to_owned(),
         host: TARGET.to_owned(),
@@ -60,7 +61,8 @@ fn main() {
         table,
         spawner: None,
         step: blaze_ids::ContentId::default(),
-        spawn_setting: Arc::new(blaze_proc_macro::spawn_route::SpawnSetting::off()),
+        spawn_setting: Arc::new(blaze_proc_macro::fact_pins::command_spawn_setting(TARGET, alloc).unwrap_or_else(|e| panic!("{e}"))),
+        deps: Arc::new(blaze_proc_macro::script_sandbox::dep_mount::DepViews::none()),
     });
     let runtime = script_runtime(Path::new(store));
     let started = Instant::now();

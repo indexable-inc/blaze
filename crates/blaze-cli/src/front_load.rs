@@ -407,4 +407,68 @@ mod tests {
             other => panic!("an empty store gave {other:?}"),
         }
     }
+
+    /// The prelude reached through TWO crates' globs, as hello world reaches `Result`: the
+    /// program's implicit prelude is `std::prelude::rust_2021` (the Rust Reference, "Preludes":
+    /// the standard library prelude is `std::prelude::rust_20xx`, glob-imported into every
+    /// module), which globs `core::prelude::rust_2021`, itself a glob of `core::prelude::v1`
+    /// (the pinned library's own library/std/src/prelude/mod.rs and library/core/src/prelude/
+    /// mod.rs). `Result` and `Option` resolve at the program's root through the command's
+    /// loader as they do in the solved names.
+    const PRE_CORE: &str = "#![no_core]\npub mod result { pub enum Result<T, E> { Ok(T), Err(E) } }\npub mod option { pub enum Option<T> { None, Some(T) } }\npub mod prelude {\n    pub mod v1 {\n        pub use crate::option::Option::{self, None, Some};\n        pub use crate::result::Result::{self, Err, Ok};\n    }\n    pub mod rust_2021 { pub use super::v1::*; }\n}\n";
+    const PRE_STD: &str = "#![no_core]\npub mod prelude {\n    pub mod rust_2021 { pub use core::prelude::rust_2021::*; }\n}\n";
+    const PRE_APP: &str = "pub fn head() -> Result<(), ()> { loop {} }\n";
+
+    struct PreludeFiles;
+
+    impl<'a> SourceTexts<'a> for PreludeFiles {
+        fn read(&self, _krate: usize, path: &str) -> Option<&'a str> {
+            match path {
+                "/0/app/lib.rs" => Some(PRE_APP),
+                "/1/std/lib.rs" => Some(PRE_STD),
+                "/2/core/lib.rs" => Some(PRE_CORE),
+                _ => None,
+            }
+        }
+    }
+
+    /// Prints `front load: Result and Option through two preludes' globs, solved and over the store`.
+    #[test]
+    fn a_prelude_through_two_crates_globs_resolves_over_the_store() {
+        let inputs = [input("app", "/0/app/lib.rs", &[]), input("std", "/1/std/lib.rs", &[("core", 2)]), input("core", "/2/core/lib.rs", &[])];
+        let sysroot = Sysroot { core: Some(blaze_scope::graph::CrateId(2)), alloc: None, std: Some(blaze_scope::graph::CrateId(1)), bstd: None };
+        let names = blaze_scope::resolve::resolve_crates(&inputs, sysroot, &PreludeFiles, &blaze_scope::task::Serial, Alloc::global())
+            .unwrap_or_else(|e| panic!("the three crates' names: {e:?}"));
+        let names: &'static Names<'static> = std::boxed::Box::leak(std::boxed::Box::new(names));
+        let keys: std::vec::Vec<CrateItemKey> = names.crates().iter().map(|c| c.key).collect();
+        let payloads: &'static [blaze_own::Vec<u8, std::alloc::Global>] = std::vec::Vec::leak(payloads(names));
+        let g = Alloc::global();
+        // The readers in the command's order (body_types.rs `prepare`): the owner, then its
+        // dependencies, then the sysroot's crates; here app, core, std, not the world's order.
+        let order = [0usize, 2, 1];
+        let read: std::vec::Vec<CrateRecords<'static>> = order
+            .iter()
+            .map(|at| crate_records(scope_name(keys[*at]), &payloads[*at], keys[*at], g).unwrap_or_else(|e| panic!("{e}")))
+            .collect();
+        let read: &'static [CrateRecords<'static>] = std::vec::Vec::leak(read);
+        let packages: &'static [&'static str] = std::vec::Vec::leak(order.iter().map(|_| "/").collect());
+        let load: &'static StoreLoad<'static> = std::boxed::Box::leak(std::boxed::Box::new(StoreLoad::new(read, packages, &PreludeFiles, g)));
+        let crate_names: &'static [&'static str] = std::vec::Vec::leak(order.iter().map(|at| &*std::string::String::from(names.crates()[*at].name).leak()).collect());
+        let log: &'static Log<'static> = std::boxed::Box::leak(std::boxed::Box::new(Log::new(crate_names, g)));
+        let frame: &'static Frame = std::boxed::Box::leak(std::boxed::Box::new(Frame::new(bstd::mem::Tag::Other).expect("a frame")));
+        let records: &'static Records<'static> = std::boxed::Box::leak(std::boxed::Box::new(Records::new(load.keys(g), load, log, frame, g)));
+        let app = names.crates().iter().position(|c| c.name == "app").expect("the app crate");
+        let stored_app = order.iter().position(|at| *at == app).expect("app among the readers");
+        for word in ["Result", "Option"] {
+            let segments = [word];
+            let written = blaze_scope::names::Written { kind: blaze_surface::PathKind::Plain, segments: &segments[..] };
+            let solved_root = NamesSource::root_module(names, app).expect("the solved root");
+            let solved = NamesSource::walk(names, solved_root, Namespace::Types, written);
+            let stored_root = NamesSource::root_module(records, stored_app).expect("the stored root");
+            let stored = NamesSource::walk(records, stored_root, Namespace::Types, written);
+            assert!(solved.is_ok(), "`{word}` in the solved names: {solved:?}");
+            assert_eq!(format!("{solved:?}"), format!("{stored:?}"), "`{word}` over the store differs from the solved names; the reader logged {:?}", &*log.errors());
+        }
+        println!("front load: Result and Option through two preludes' globs, solved and over the store");
+    }
 }

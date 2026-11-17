@@ -5,11 +5,12 @@
 //! 1. `make_dir(a, Durable::Yes)` waits for a sync of the names of the directory `a` is in
 //!    before it returns (the disk's ledger, `DiskCounts::name_syncs`), and after a crash `a`
 //!    is there, a directory. Plant: [`Plant::DurableSkipsNameSync`] (the `_synced` form skips
-//!    the name sync), caught on every seed. A second control proves the crash is real: a file
-//!    published unsynced under `a` before the crash is lost or torn on at least one seed.
-//!    The ledger, not the crash, is what catches the plant today: the simulation keeps a made
-//!    directory's name through any crash ("durable as it is made, which is looser than a
-//!    disk": blaze-core `Sim::names`), so a synced make and an unsynced one survive alike.
+//!    the name sync), caught by the crash: the simulation journals a made directory as a change
+//!    of its parent's names (blaze-core `sim/host/dir_names.rs`), so on some seed the crash
+//!    loses `a` ([`Finding::MadeLost`]); on a seed whose crash happened to keep it, the ledger,
+//!    checked after the crash, catches it ([`Finding::NoNameSync`]). A second control proves
+//!    the crash is real: a file published unsynced under `a` before the crash is lost or torn
+//!    on at least one seed.
 //! 2. `remove_dir` of a directory that holds a file fails naming it (`FsOp::RemoveDir`, the
 //!    directory's name) and removes nothing under it; once emptied it is removed and stays
 //!    removed through a crash; a make over a name that is there is `FsKind::Exists`, a remove
@@ -90,9 +91,6 @@ fn made_then_crashed(seed: u64, plant: Plant) -> Result<bool, Finding> {
     let before = name_syncs(&io)?;
     let made = top.make_dir(&cx, &path("a"), Durable::Yes).map_err(harness(seed, "make_dir(a, Durable::Yes)"))?;
     let after = name_syncs(&io)?;
-    if after <= before {
-        return Err(Finding::NoNameSync { seed, before, after });
-    }
     if made.name().name().map(FileName::as_str) != Some("a") {
         // clone: a finding's name, a refcount.
         return Err(Finding::WrongDir { seed, made: made.name().clone() });
@@ -105,6 +103,11 @@ fn made_then_crashed(seed: u64, plant: Plant) -> Result<bool, Finding> {
         Some(meta) if meta.dir => {}
         Some(_) => return Err(Finding::MadeIsFile { seed }),
         None => return Err(Finding::MadeLost { seed }),
+    }
+    // The ledger last: a skipped name sync that this seed's crash happened to keep is caught
+    // here.
+    if after <= before {
+        return Err(Finding::NoNameSync { seed, before, after });
     }
     let mut into = cx.bytes();
     match made.read_all(&cx, &path("torn"), &mut into) {
@@ -131,15 +134,28 @@ fn a_made_dir_survives_a_crash_when_synced() {
     assert!(torn > 0, "no seed of {SEEDS} lost or tore the unsynced file under a: the crash tore nothing, so it proves nothing");
 }
 
-/// Control of (1): a `_synced` make that skips its name sync is caught, on every seed.
+/// Control of (1): a `_synced` make that skips its name sync is caught on every seed of
+/// [`SEEDS`], and on at least one by the crash itself losing `a` ([`Finding::MadeLost`]): a
+/// change of a name not synced is undone one time in three (blaze-core `Sim::crash_cut`), so
+/// all 64 seeds keep `a` with odds (2/3)^64, and the seeds are fixed, so the run is the same
+/// every time. The search is bounded by [`SEEDS`].
 ///
 /// Prints `test tests::dirs::a_made_dir_test_catches_a_skipped_name_sync ... ok`.
 #[test]
 fn a_made_dir_test_catches_a_skipped_name_sync() {
+    let (mut lost, mut first) = (0u32, None);
     for seed in 0..SEEDS {
-        let found = made_then_crashed(seed, Plant::DurableSkipsNameSync);
-        assert!(matches!(found, Err(Finding::NoNameSync { .. })), "seed {seed}: the planted skipped name sync was not caught: {found:?}");
+        match made_then_crashed(seed, Plant::DurableSkipsNameSync) {
+            Err(Finding::MadeLost { seed }) => {
+                lost += 1;
+                first = first.or(Some(seed));
+            }
+            Err(Finding::NoNameSync { .. }) => {}
+            found => panic!("seed {seed}: the planted skipped name sync was not caught: {found:?}"),
+        }
     }
+    std::println!("skipped name sync: a lost on {lost} of {SEEDS} seeds, the first seed {first:?}");
+    assert!(lost > 0, "no seed of {SEEDS} lost the directory made without its parent's sync: the crash cannot lose a directory, so it proves nothing");
 }
 
 /// One seed of (2).

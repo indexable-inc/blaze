@@ -33,6 +33,10 @@
 //! removed is a change of a name a crash may undo (the name holds what it held before, a
 //! renamed file is back under its old name), until [`Effect::SyncDir`] of its directory (for a
 //! rename, the new name's). A file's [`Effect::Sync`] makes its bytes durable, never its name.
+//! A directory made ([`Effect::MakeDir`]) or removed ([`Effect::RemoveDir`]) is a change of a
+//! name of its parent's the same way (`sim/host/dir_names.rs`): undone, a directory made goes
+//! with everything under it and one removed is back; a directory's own sync makes the names in
+//! it durable, never its own name.
 //! [`Effect::Write`] and [`Effect::Rename`] sync their directories before they complete, as
 //! the native drivers do. A crash tears the bytes of an unsynced write by [`SECTOR`]s whether
 //! or not it undoes it. A clone holds
@@ -249,6 +253,13 @@ enum Named {
     /// The file under `from` renamed to `to`, in place of `was`. Undone, the file is back
     /// under `from` and `was` under `to`.
     Moved { from: FileName, to: FileName, was: Option<SimFile> },
+    /// The directory `dir` made where none was ([`Effect::MakeDir`]): a change of a name of its
+    /// parent's. Undone, it goes, with every file and directory under it
+    /// (`sim/host/dir_names.rs`).
+    MadeDir { dir: FileName },
+    /// The empty directory `dir` removed ([`Effect::RemoveDir`]). Undone, it is back, holding
+    /// the names whose removal the same crash undoes.
+    RemovedDir { dir: FileName },
 }
 
 impl Named {
@@ -257,25 +268,30 @@ impl Named {
         match self {
             Named::Put { file, .. } | Named::Gone { file, .. } => file == name,
             Named::Moved { from, to, .. } => from == name || to == name,
+            Named::MadeDir { dir } | Named::RemovedDir { dir } => dir == name,
         }
     }
 
-    /// Whether it and `other` change a name in common: undoing the earlier of the two undoes
-    /// the later.
+    /// Whether it and `other` change a name in common, or one is a directory's change and the
+    /// other changes a name at or under that directory ([`Named::holds`]): undoing the earlier
+    /// of the two undoes the later.
     fn shares(&self, other: &Named) -> bool {
-        match self {
+        let common = match self {
             Named::Put { file, .. } | Named::Gone { file, .. } => other.touches(file),
             Named::Moved { from, to, .. } => other.touches(from) || other.touches(to),
-        }
+            Named::MadeDir { dir } | Named::RemovedDir { dir } => other.touches(dir),
+        };
+        common || self.holds(other) || other.holds(self)
     }
 
     /// The directory whose sync makes it durable: the file's, or for a rename the new name's
     /// (`fs.rs`'s `rename` and the ring's syncs that one first, and the old name's directory
-    /// too where it is another).
+    /// too where it is another), or for a directory made or removed its parent.
     fn dir(&self) -> &str {
         match self {
             Named::Put { file, .. } | Named::Gone { file, .. } => parent_of(file),
             Named::Moved { to, .. } => parent_of(to),
+            Named::MadeDir { dir } | Named::RemovedDir { dir } => parent_of(dir),
         }
     }
 }
@@ -587,8 +603,10 @@ pub struct Sim {
     /// The changes of names no sync of their directory has covered, oldest first: a crash may
     /// undo any of them, with every later one that shares a name ([`Sim::crash`]). A name is
     /// durable only once its directory is synced; a file's sync makes its bytes durable,
-    /// never its name. Directories made ([`Effect::MakeDir`]) are not in it: a directory's own
-    /// name is durable as it is made, which is looser than a disk (std.md, "The disk model").
+    /// never its name. A directory made ([`Effect::MakeDir`]) or removed
+    /// ([`Effect::RemoveDir`]) is in it as a change of a name of its parent's, durable once the
+    /// parent is synced; a directory's own sync never makes its own name durable
+    /// (`sim/host/dir_names.rs`).
     names: Vec<Named>,
     /// The folders above the root, nearest first ([`Sim::set_above`]): read-only, so they are
     /// plain bytes, outside the disk's journal and its crashes.
@@ -1159,20 +1177,23 @@ impl Sim {
                         self.files.insert(to, was.durable_only(keep_barriers));
                     }
                 }
+                Named::MadeDir { dir } => self.undo_made_dir(&dir),
+                Named::RemovedDir { dir } => self.undo_removed_dir(dir),
             }
         }
     }
 
     /// A sync of the directory `dir` (`""`, the root) completed: every change of a name in it
     /// is durable, and every earlier change that shares a name with one of those (undoing it
-    /// would undo the later one).
+    /// would undo the later one), except a directory's change under which the later one is: a
+    /// directory's sync makes the names in it durable, never its own ([`Named::kept_by`]).
     fn sync_names(&mut self, dir: &str) {
         let mut synced: Vec<bool> = Vec::with_capacity_in(self.names.len(), Global);
         synced.extend(self.names.iter().map(|named| named.dir() == dir));
         for i in (0..self.names.len()).rev() {
             if synced[i] {
                 for earlier in 0..i {
-                    if self.names[earlier].shares(&self.names[i]) {
+                    if self.names[earlier].kept_by(&self.names[i]) {
                         synced[earlier] = true;
                     }
                 }

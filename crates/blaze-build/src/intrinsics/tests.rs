@@ -105,9 +105,9 @@ fn the_table_is_sorted_whole_and_refuses_what_it_lacks() {
         assert_eq!(e.which.entry().name, e.name, "one row per intrinsic");
         assert!(!e.meaning.is_empty() && !e.built.is_empty());
     }
-    // `simd_add` is intrinsics/simd.rs's row now; `simd_shuffle` is in no table.
-    let refused = Which::named("simd_shuffle").unwrap_err();
-    assert_eq!(refused.to_string(), "intrinsic `simd_shuffle` is not in blaze's intrinsics table (crates/blaze-build/src/intrinsics.rs)");
+    // `simd_add` and `simd_shuffle` are intrinsics/simd.rs's rows now; `simd_funnel_shl` is in no table.
+    let refused = Which::named("simd_funnel_shl").unwrap_err();
+    assert_eq!(refused.to_string(), "intrinsic `simd_funnel_shl` is not in blaze's intrinsics table (crates/blaze-build/src/intrinsics.rs)");
 }
 
 /// Two-operand integer intrinsics, each case `(intrinsic, T, x, y, results)`, run.

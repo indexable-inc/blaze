@@ -48,6 +48,7 @@ use std::alloc::Global;
 
 use crate::CliError;
 use crate::front_load::{CrateRecords, StoreLoad};
+use crate::job_texts::JobTexts;
 use crate::store::Store;
 use crate::work::{Facts, Record, held_str};
 
@@ -74,8 +75,10 @@ pub const BORROWS_NOT_CHECKED: u16 = 20;
 /// changes at the flip: every body's borrow verdict is already in its record.
 pub const BORROWS_ARE_ERRORS: bool = false;
 
-/// The domain of a body part's source ([`body_source`]).
-const SOURCE_DOMAIN: &str = "blaze-cli body check source 2";
+/// The domain of a body part's source ([`body_source`]). 3: every member asked for the file is
+/// in the read list (`TypesJob::members`); a "2" record of a file no member listed read only the
+/// graph and could stand after its crate came to list it, so none is found again.
+const SOURCE_DOMAIN: &str = "blaze-cli body check source 3";
 
 /// The body checker's identity is not typed in here (decision D105): it is the table's
 /// `Row::BodyChecker` (blaze_ids::producer), handed to the drive's tool by the entry
@@ -169,6 +172,55 @@ pub(crate) struct TypesJob<'j> {
     /// note standing (rule 21: the note's input is whether there is a graph; the root's units
     /// do not hold the dependencies, so their out does not move). `None` with a graph.
     units: Option<(Name, ContentId)>,
+    /// Every member's `CrateScope` (name, out) whose items record was asked whether it lists
+    /// the file: read by every body, owner or not, since "no crate's names record lists this
+    /// file" is an answer from them (rule 21: without them a module file created under a
+    /// standing crate left the note standing in that home, never in a fresh one).
+    members: &'j [(Name, ContentId)],
+    /// All of the above as each body reads them ([`reads_of`]): sorted by name, one each.
+    reads: &'j [(Name, ContentId)],
+}
+
+impl TypesJob<'_> {
+    /// Whether a body task handed `inputs` reads what this job was prepared from: every read
+    /// it lists ([`FileTypes::new`]: the graph, the members asked, each owner's crates) is an
+    /// input with the same out, and with no graph, the task was handed none either. Then
+    /// [`prepare`] over `inputs` makes this job again, so the task joins it unprepared: one
+    /// prepare a file a round, not one a body (RUNNER 17, the blaze clone: 331,542 prepares,
+    /// 51.6 s of the main thread).
+    /// O(inputs x log reads): each input is searched in the job's sorted reads.
+    pub(crate) fn covered_by(&self, inputs: &[blaze_drive::Input]) -> bool {
+        if self.graph.is_none() {
+            return !inputs.iter().any(|input| input.name == Name::unit_graph());
+        }
+        // Each read marked once, so an input named twice cannot stand for a missing one.
+        let mut seen: std::vec::Vec<bool, Global> = std::vec::Vec::new_in(Global);
+        seen.resize(self.reads.len(), false);
+        for input in inputs {
+            if let Ok(at) = self.reads.binary_search_by_key(&input.name, |(name, _)| *name) {
+                if self.reads[at].1 != input.out {
+                    return false;
+                }
+                seen[at] = true;
+            }
+        }
+        seen.iter().all(|s| *s)
+    }
+}
+
+/// A job's reads, sorted by name, one each: the graph or the absent units, the members
+/// asked, each owner's crates. Every body of the job reads exactly these.
+fn reads_of<'j>(graph: Option<(Name, ContentId)>, units: Option<(Name, ContentId)>, members: &[(Name, ContentId)], owners: &[Owner<'_>], jobs: &'j Frame) -> &'j [(Name, ContentId)] {
+    let mut reads: Vec<(Name, ContentId), &'j Frame> = Vec::new_in(jobs);
+    reads.extend(graph);
+    reads.extend(units);
+    reads.extend(members.iter().copied());
+    for owner in owners {
+        reads.extend(owner.readers.iter().map(|r| (r.name, r.out)));
+    }
+    reads.sort_unstable_by_key(|(name, _)| *name);
+    reads.dedup_by_key(|(name, _)| *name);
+    reads.leak()
 }
 
 /// The note of a body in a command with no unit graph.
@@ -180,6 +232,42 @@ pub(crate) enum Prepared<'j> {
     Waited(Name),
     Refused(&'static str),
     Ready(&'j TypesJob<'j>),
+}
+
+/// The command's names world (`facts.names`) over the unit graph `graph`, made once a command
+/// when none is made yet: its own step, so the work list times it apart from the reads of the
+/// crates' records ([`prepare`]; work.rs's row `BODY_WORLD`). Inner `Err`: the world could not
+/// be made (the `CrateScope` tasks say why).
+pub(crate) fn names_world<'f>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    store: &mut dyn Store,
+    facts: &mut Facts<'f, impl crate::sweep::Stamps>,
+    graph: &blaze_drive::Input,
+    frame: &'f Frame,
+    alloc: Alloc<'_>,
+) -> Result<Result<(), &'static str>, CliError> {
+    if facts.names.is_some() {
+        return Ok(Ok(()));
+    }
+    if facts.laid.is_none() {
+        facts.laid = Some(crate::units::lay(cx, root, &facts.stamps, &mut facts.rows, facts.fetch_env.toolchain, frame, alloc)?);
+    }
+    let lock = facts.laid.as_ref().and_then(|laid| laid.lock.as_ref()).map(|lockfile| lockfile.lock);
+    let members = crate::names::member_dirs(facts.laid.as_ref());
+    let read = crate::work::payload(cx, store, graph, frame)?;
+    let made = {
+        let _cx = cx.span("names: make the world");
+        crate::names::world(cx, root, read.payload(), lock, members, &facts.fetch_env)
+    };
+    match made {
+        Ok(made) => {
+            crate::names::tell_public(store, &made);
+            facts.names = Some(made);
+            Ok(Ok(()))
+        }
+        Err(_) => Ok(Err("the crates' inputs could not be made (names.rs `world`): the `CrateScope` tasks say why")),
+    }
 }
 
 /// The crates a `BodyCheck` task reads, from its inputs, or what it needs first (see the
@@ -211,34 +299,21 @@ pub(crate) fn prepare<'f: 'j, 'j>(
         if facts.laid.is_none() {
             facts.laid = Some(crate::units::lay(&cx, root, &facts.stamps, &mut facts.rows, facts.fetch_env.toolchain, frame, alloc)?);
         }
-        // No graph this command (main.rs gives the drive none to `Start`): the drive has no
-        // such task to answer a want of it; each body says so, reading nothing more.
-        if facts.laid.as_ref().is_some_and(|laid| laid.graph.is_none()) {
+        // No graph this command (no lock matched: main.rs gives the drive none to `Start`): the
+        // drive has no such task to answer a want of it; each body says so, reading nothing
+        // more. A layout read late (here, when nothing it read moved) has a graph whenever the
+        // lock matched (`Laid::has_graph`): the want is then answered by the last answer's row.
+        if facts.laid.as_ref().is_some_and(|laid| !laid.has_graph()) {
             let units = Some((Name::unit_graph(), blaze_drive::key::ABSENT));
-            let job = TypesJob { owners: &[], packs: &[], corrected: &[], path: held_str(real, jobs), graph: None, units };
+            let reads = reads_of(None, units, &[], &[], jobs);
+            let job = TypesJob { owners: &[], packs: &[], corrected: &[], path: held_str(real, jobs), graph: None, units, members: &[], reads };
             return Ok(Prepared::Ready(blaze_own::Box::leak(blaze_own::Box::new_in(job, jobs))));
         }
         return Ok(Prepared::Need(need_one(Name::unit_graph())));
     };
     let graph_read = (graph.name, graph.out);
-    if facts.names.is_none() {
-        if facts.laid.is_none() {
-            facts.laid = Some(crate::units::lay(&cx, root, &facts.stamps, &mut facts.rows, facts.fetch_env.toolchain, frame, alloc)?);
-        }
-        let lock = facts.laid.as_ref().and_then(|laid| laid.lock.as_ref()).map(|lockfile| lockfile.lock);
-        let members = crate::names::member_dirs(facts.laid.as_ref());
-        let read = crate::work::payload(&cx, store, graph, frame)?;
-        let made = {
-            let _cx = cx.span("names: make the world");
-            crate::names::world(&cx, root, read.payload(), lock, members, &facts.fetch_env)
-        };
-        match made {
-            Ok(made) => {
-                crate::names::tell_public(store, &made);
-                facts.names = Some(made);
-            }
-            Err(_) => return Ok(Prepared::Refused("the crates' inputs could not be made (names.rs `world`): the `CrateScope` tasks say why")),
-        }
+    if let Err(what) = names_world(&cx, root, store, facts, graph, frame, alloc)? {
+        return Ok(Prepared::Refused(what));
     }
     let Some(names) = facts.names.as_ref() else { return Err(CliError::Text { what: "the names world, made above, is gone" }) };
     let kept = &mut facts.bodies;
@@ -270,8 +345,10 @@ pub(crate) fn prepare<'f: 'j, 'j>(
     if !wants.is_empty() {
         return Ok(Prepared::Need(wants));
     }
-    // The owners: the members whose items record lists the file.
+    // The owners: the members whose items record lists the file; `asked`: every member asked,
+    // the body's reads whatever the answer (`TypesJob::members`).
     let mut owners: std::vec::Vec<usize, Global> = std::vec::Vec::new_in(Global);
+    let mut asked: Vec<(Name, ContentId), &'j Frame> = Vec::with_capacity_in(members.len(), jobs);
     for at in members.iter().copied() {
         let Some(input) = input_at(at) else { continue };
         let records = match kept.records(&cx, store, input, crates[at].input.key, jobs) {
@@ -288,13 +365,19 @@ pub(crate) fn prepare<'f: 'j, 'j>(
         // and member, and the command's frame must not grow with that (a 4,000-body check
         // filled it: draw_tests, 2026-11-16).
         let holds = (0..items.files()).any(|i| matches!(items.file(i as u32), Ok(Some(row)) if row.path.in_package(package, Alloc::global()).as_deref().and_then(|p| p.strip_prefix("/0/")) == Some(real)));
+        asked.push((input.name, input.out));
         if holds {
             owners.push(at);
         }
     }
-    // Each owner's crates: its dependencies followed to the end, and the sysroot's.
-    let sysroot = [world.sysroot.core, world.sysroot.alloc, world.sysroot.std, world.sysroot.bstd];
-    let mut sets: std::vec::Vec<std::vec::Vec<usize, Global>, Global> = std::vec::Vec::new_in(Global);
+    // Each owner's crates and its lang crates: the ONE rule of which crates a body's checking
+    // may see (blaze-world check_scope.rs): one side's dependency closure (a proc macro's bodies
+    // on the macro side, rule 10), the target's sysroot on the target side, a proc macro the
+    // owner names seen for its macros only, and the lang crates chosen by id and side, so the
+    // two sides' cores never meet in one table (pm-small, 2026-11-16 19:51: "the lang item
+    // `AsyncGenFinished` is declared twice"). The scope's inputs are in the body's read list
+    // (the unit graph's out and each seen crate's `CrateScope`: `FileTypes::new`).
+    let mut scopes: std::vec::Vec<blaze_world::check_scope::CheckScope<'_>, Global> = std::vec::Vec::new_in(Global);
     // A `#![no_core]` owner (its names record's root head says so) links no sysroot crate and
     // declares its own lang items, as front2's solved index takes it (`Index::new`).
     let mut no_core: std::vec::Vec<bool, Global> = std::vec::Vec::new_in(Global);
@@ -313,47 +396,34 @@ pub(crate) fn prepare<'f: 'j, 'j>(
         no_core.push(root.head.no_core);
     }
     for (owner, no_core) in owners.iter().copied().zip(no_core.iter().copied()) {
-        let mut set: std::vec::Vec<usize, Global> = std::vec::Vec::new_in(Global);
-        set.push(owner);
-        if !no_core {
-            set.extend(sysroot.iter().flatten().map(|id| id.0 as usize).filter(|at| *at != owner));
-        }
-        let mut next = 0;
-        while next < set.len() {
-            let at = set[next];
-            next += 1;
-            for (_, dep) in crates[at].input.deps.iter() {
-                if !set.contains(dep) {
-                    set.push(*dep);
-                }
-            }
-        }
-        for at in set.iter().copied() {
+        let scope = match blaze_world::check_scope::check_scope(world, owner, no_core, alloc) {
+            Ok(scope) => scope,
+            // A refused owner's own names task names it; a broken list is named by the rule.
+            Err(refused) => return Ok(Prepared::Refused(refused.rule())),
+        };
+        for at in scope.crates() {
             if input_at(at).is_none() {
                 want(at, &mut wants);
             }
         }
-        sets.push(set);
+        scopes.push(scope);
     }
     if !wants.is_empty() {
         return Ok(Prepared::Need(wants));
     }
-    let mut built: Vec<Owner<'j>, &'j Frame> = Vec::with_capacity_in(sets.len(), jobs);
-    for (set, no_core) in sets.iter_mut().zip(no_core.iter().copied()) {
-        // The owner at 0, then the rest in the world's order.
-        set[1..].sort_unstable();
-        let mut readers: Vec<Reader<'j>, &'j Frame> = Vec::with_capacity_in(set.len(), jobs);
+    let mut built: Vec<Owner<'j>, &'j Frame> = Vec::with_capacity_in(scopes.len(), jobs);
+    for scope in scopes.iter() {
+        // The owner at 0, then the rest in the world's order (the scope's order).
+        let mut readers: Vec<Reader<'j>, &'j Frame> = Vec::with_capacity_in(scope.readers().len(), jobs);
         let mut lang: Vec<usize, &'j Frame> = Vec::new_in(jobs);
-        for (place, at) in set.iter().copied().enumerate() {
+        lang.extend(scope.lang_places());
+        for at in scope.crates() {
             let Some(input) = input_at(at) else { return Err(CliError::Text { what: "a crate needed above has no input" }) };
             let records = match kept.records(&cx, store, input, crates[at].input.key, jobs) {
                 Ok(records) => records,
                 Err(what) => return Ok(Prepared::Refused(what)),
             };
             let crate_name = crates[at].input.name;
-            if place == 0 || (!no_core && matches!(crate_name, "core" | "alloc" | "std" | "bstd" | "blaze_std")) {
-                lang.push(place);
-            }
             let package = held_str(crates[at].input.shown_from, jobs);
             readers.push(Reader { name: input.name, out: input.out, crate_name, package, records });
         }
@@ -363,53 +433,12 @@ pub(crate) fn prepare<'f: 'j, 'j>(
     // the world is borrowed through `facts` here, the job outlives that borrow.
     let packs: &'j [PackView<'j>] = Vec::from_slice_in(world.texts.packs(), jobs).leak();
     let corrected: &'j [(u32, &'j str, &'j str)] = Vec::from_slice_in(world.texts.corrected(), jobs).leak();
-    let job = TypesJob { owners: built.leak(), packs, corrected, path: held_str(real, jobs), graph: Some(graph_read), units: None };
+    let (owners, members) = (built.leak(), asked.leak());
+    let reads = reads_of(Some(graph_read), None, members, owners, jobs);
+    let job = TypesJob { owners, packs, corrected, path: held_str(real, jobs), graph: Some(graph_read), units: None, members, reads };
     Ok(Prepared::Ready(blaze_own::Box::leak(blaze_own::Box::new_in(job, jobs))))
 }
 
-/// The world's texts as a pool worker reads them: the packs and corrections the command read,
-/// and the checkout's files read here, each once a job, into the job's frame.
-struct JobTexts<'n> {
-    cx: &'n Cx,
-    root: &'n Dir<ReadWrite>,
-    frame: &'n Frame,
-    packs: &'n [PackView<'n>],
-    corrected: &'n [(u32, &'n str, &'n str)],
-    read: RefCell<std::vec::Vec<(&'n str, Option<&'n str>), Global>>,
-}
-
-impl<'n> JobTexts<'n> {
-    fn checkout(&self, inner: &str) -> Option<&'n str> {
-        if inner.split('/').any(|part| part == ".." || part == ".") {
-            return None;
-        }
-        let at = Path::new(inner).ok()?;
-        let mut bytes = Bytes::new_in(self.frame, "a body check's checkout files");
-        self.root.read_all(self.cx, &at, &mut bytes).ok()?;
-        let held: &'n Bytes<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(bytes, self.frame));
-        core::str::from_utf8(held.as_slice()).ok()
-    }
-}
-
-impl<'n> SourceTexts<'n> for JobTexts<'n> {
-    fn read(&self, _krate: usize, path: &str) -> Option<&'n str> {
-        let rest = path.strip_prefix('/')?;
-        let (tree, inner) = rest.split_once('/')?;
-        let tree: usize = tree.parse().ok()?;
-        if let Some((_, _, text)) = self.corrected.iter().find(|(t, p, _)| *t as usize == tree && *p == inner) {
-            return Some(text);
-        }
-        if tree != 0 {
-            return core::str::from_utf8(self.packs.get(tree - 1)?.find(inner)?.bytes).ok();
-        }
-        if let Some((_, text)) = self.read.borrow().iter().find(|(p, _)| *p == inner) {
-            return *text;
-        }
-        let text = self.checkout(inner);
-        self.read.borrow_mut().push((held_str(inner, self.frame), text));
-        text
-    }
-}
 
 /// One owner's front end over records, made once a file job.
 struct Checker<'n> {
@@ -424,8 +453,8 @@ struct Checker<'n> {
 /// A file job's type checks: per owner its checker, or why none could be made.
 pub(crate) struct FileTypes<'n> {
     owners: std::vec::Vec<Result<Checker<'n>, &'n str>, Global>,
-    /// Every owner's crates' (`CrateScope` name, out), sorted: each body's read list.
-    reads: std::vec::Vec<(Name, ContentId), Global>,
+    /// The job's reads ([`TypesJob::reads`]): each body's read list.
+    reads: &'n [(Name, ContentId)],
     frame: &'n Frame,
     /// The command has no unit graph ([`NO_GRAPH`]).
     graphless: bool,
@@ -437,18 +466,12 @@ impl<'n> FileTypes<'n> {
     /// Each owner's checker over `job`, the file's text `text` as the job read it.
     pub(crate) fn new(cx: &'n Cx, root: &'n Dir<ReadWrite>, job: &'n TypesJob<'n>, text: &'n str, frame: &'n Frame) -> FileTypes<'n> {
         let g = Alloc::global();
-        let mut reads: std::vec::Vec<(Name, ContentId), Global> = std::vec::Vec::new_in(Global);
-        reads.extend(job.graph);
-        reads.extend(job.units);
         let mut owners = std::vec::Vec::with_capacity_in(job.owners.len(), Global);
         for owner in job.owners.iter() {
-            reads.extend(owner.readers.iter().map(|r| (r.name, r.out)));
             let _built = cx.span("body types: build a reader");
             owners.push(checker(cx, root, job, owner, text, frame, g));
         }
-        reads.sort_unstable_by_key(|(name, _)| *name);
-        reads.dedup_by_key(|(name, _)| *name);
-        FileTypes { owners, reads, frame, graphless: job.graph.is_none(), cx }
+        FileTypes { owners, reads: job.reads, frame, graphless: job.graph.is_none(), cx }
     }
 
     /// The types of the body at `item` of `outline` (over `text`) into `made`, its record so
@@ -497,7 +520,7 @@ impl<'n> FileTypes<'n> {
                         } else {
                             "the record has no expansion row for the call (the loader was never asked)"
                         };
-                        bstd::mem::format_in!(self.frame, "the records did not answer: the expansion text of macro call {call:x} in crate `{name}` ({krate:x}), read while checking item `{}`: {which}", item.name.map_or("<unnamed>", |r| text.get(r.start as usize..r.end as usize).unwrap_or("<cut>")))
+                        bstd::mem::format_in!(self.frame, "the records did not answer: the expansion text of macro call {call:x} in crate `{name}` ({krate:x}), read while checking item `{}`: {which}", crate::item_name::shown_name(item, text))
                     }
                     _ => bstd::mem::format_in!(self.frame, "the records did not answer: {error}"),
                 }
@@ -567,7 +590,7 @@ impl<'n> FileTypes<'n> {
             if let Some(refused) = &borrows.refused
                 && !matches!(refused, BorrowRefused::Untyped(_))
             {
-                let name = item.name.map_or("<unnamed>", |r| text.get(r.start as usize..r.end as usize).unwrap_or("<cut>"));
+                let name = crate::item_name::shown_name(item, text);
                 let words = bstd::mem::format_in!(self.frame, "body `{name}`: {}: {refused:?}", refused.text());
                 made.find(BORROWS_NOT_CHECKED, refused.range().unwrap_or((0, 0)), &[words.as_str()]);
             }
@@ -590,7 +613,7 @@ fn checker<'n>(cx: &'n Cx, root: &'n Dir<ReadWrite>, job: &'n TypesJob<'n>, owne
     let mut read = std::vec::Vec::new_in(Global);
     read.push((job.path, Some(text)));
     let texts: &'n JobTexts<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(
-        JobTexts { cx, root, frame, packs: job.packs, corrected: job.corrected, read: RefCell::new(read) },
+        JobTexts { cx, root, frame, packs: job.packs, corrected: job.corrected, env: None, read: RefCell::new(read) },
         frame,
     ));
     let load: &'n StoreLoad<'n> = blaze_own::Box::leak(blaze_own::Box::new_in(StoreLoad::new(crates, packages, texts, g), frame));

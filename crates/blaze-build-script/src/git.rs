@@ -43,8 +43,28 @@ pub trait GitFiles {
     /// `path`, absolute as a worktree's `.git` file names it, from the served tree's root;
     /// `None` when it is outside the tree.
     fn within<'p>(&self, path: &'p str) -> Option<&'p str>;
+    /// Appends the target text of the symlink `rel` (its own bytes, as `readlink` gives them) to
+    /// `into`. The link is never followed: git stores a link as a blob of exactly this text
+    /// (`ce_compare_link`), so its target may name anything, inside the tree or not. A reader
+    /// that cannot read links keeps this default, and `status` refuses by name.
+    fn read_link(&mut self, rel: &str, into: &mut AVec<'_, u8>) -> Result<(), LinkUnread> {
+        let _ = (rel, into);
+        Err(LinkUnread::ReaderCannot)
+    }
 }
 
+/// Why [`GitFiles::read_link`] gave no target.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LinkUnread {
+    /// `rel` is absent or not a symlink (it changed since its stat).
+    NotALink,
+    /// The link is there and `readlink` failed (permissions, or an I/O error).
+    Unreadable,
+    /// This reader of the checkout does not serve link targets.
+    ReaderCannot,
+}
+
+pub use crate::git_attributes::Attribute;
 pub use blaze_git_fetch::Oid;
 pub use blaze_git_fetch::store::{CommitWhy, StoreWhy};
 
@@ -350,11 +370,14 @@ pub enum Refused {
     Submodule,
     /// A tracked file whose type changed (a folder or link where a file was).
     TypeChanged,
-    /// A tracked symlink whose stat changed: comparing its target is not built.
-    SymlinkNotBuilt,
-    /// A file to hash under attributes that may change its bytes (a filter, an encoding, an
-    /// end-of-line rule, or a CR under `text=auto`): blaze applies no attributes.
+    /// A tracked symlink whose stat changed, whose target text could not be read to compare.
+    LinkUnread(LinkUnread),
+    /// A file holding a CR, to hash with no `text` attribute in force: git then converts by
+    /// `core.autocrlf`, which blaze does not read (a global config may set it).
     AttributesNotApplied,
+    /// An attributes file names a byte-changing form blaze does not apply (only `* text=auto`
+    /// in the top `.gitattributes` or `info/attributes` is applied).
+    AttributeNotBuilt(Attribute),
     /// A file in the worktree that is not tracked: git lists it unless an ignore rule covers
     /// it, and blaze has no ignore rules (D54).
     Untracked,
@@ -397,8 +420,11 @@ impl core::fmt::Display for Refused {
             Refused::ConfigNotRead => f.write_str("`core.filemode` may be off in git's config, which blaze does not read"),
             Refused::Submodule => f.write_str("a checked-out submodule (its own status counts)"),
             Refused::TypeChanged => f.write_str("a tracked file whose type changed"),
-            Refused::SymlinkNotBuilt => f.write_str("a tracked symlink whose stat changed (comparing its target is not built)"),
-            Refused::AttributesNotApplied => f.write_str("a file to hash under attributes that may change its bytes (blaze applies none)"),
+            Refused::LinkUnread(LinkUnread::NotALink) => f.write_str("a tracked symlink is no longer a link"),
+            Refused::LinkUnread(LinkUnread::Unreadable) => f.write_str("a tracked symlink whose stat changed cannot be read (`readlink` failed)"),
+            Refused::LinkUnread(LinkUnread::ReaderCannot) => f.write_str("a tracked symlink whose stat changed, served by a reader that cannot read link targets (`GitFiles::read_link` not given)"),
+            Refused::AttributesNotApplied => f.write_str("a file holding a CR, to hash with no `text` attribute in force: git would consult `core.autocrlf`, which blaze does not read"),
+            Refused::AttributeNotBuilt(which) => write!(f, "an attributes file names the byte-changing form {which:?}, which blaze does not apply (gitattributes(5); only `* text=auto` in the top `.gitattributes` or `info/attributes` is)"),
             Refused::Untracked => f.write_str("an untracked file: git lists it unless an ignore rule covers it, and blaze has no ignore rules (D54)"),
             Refused::DescribeNotBuilt => f.write_str("`describe` with tags present walks history to a tag; blaze's capped walk (D54) is not built yet"),
             Refused::CannotAnswerYet => f.write_str("blaze cannot answer this git question yet"),

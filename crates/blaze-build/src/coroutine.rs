@@ -707,6 +707,9 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 at
             }
         };
+        // `tmp`'s storage ends on the Ready edge (ASYNC.md D-A6), so the state's bytes for it
+        // are free for what a later await keeps.
+        let fut_slot = self.await_slot(e, at, "`.await` of a future not in a slot of its own: its storage cannot end on the Ready edge")?;
 
         // Step 3's type: `Pin<&mut Held>`; the loop's result type: `Poll<Output>`.
         let fut_ref = self.ground.intern(PNode::Ref(Mutbl::Mut, held)).map_err(full)?;
@@ -749,6 +752,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         self.emit_call(Callee::Direct(reference), &[prepr, Repr::Ptr], &[ppass, cpass], rrepr, rpass)?;
         let r = self.pop()?;
         let rat = self.place(r, rrepr)?;
+        let poll_slot = self.await_slot(e, rat, "`.await` whose `Poll` is not in a slot of its own: its storage cannot end on the Ready edge")?;
         let d = self.read_discriminant(id, rat)?;
         let ready_case = self.discriminant_case(id, items.ready)?;
         let ready = self.create();
@@ -790,11 +794,37 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             }
             _ => return Err(unsupported(e, "a `Poll` whose `Ready` variant is not one field")),
         };
+        // The payload is moved out of the `Poll` before its storage ends: an aggregate (held
+        // as a place in the `Poll` slot) is copied to a temporary of its own; a scalar is
+        // already loaded.
+        let value = match value {
+            V::Place(..) => {
+                let to = self.temp(orepr);
+                self.store(value, orepr, to)?;
+                V::Place(to.0, to.1)
+            }
+            other => other,
+        };
+        self.b.slot_dead(poll_slot);
         if held_drops {
             self.drop_at(held, at)?;
         }
+        self.b.slot_dead(fut_slot);
         self.push_val(value, None);
         Ok(())
+    }
+
+    /// The slot whose whole storage the place `at` is: an `.await`'s future or its `Poll`,
+    /// each a fresh temporary of this walk (`temp`, or a call's result slot), whose
+    /// `slot_dead` the Ready edge writes. Refused by name when it is not one: a `slot_dead`
+    /// of a slot that also holds something else would end that too.
+    fn await_slot(&self, e: ExprId, at: (Value, i32), refused: &'static str) -> Result<SlotId, BuildError> {
+        let view = self.b.func().view();
+        let ix = at.0.index();
+        if at.1 == 0 && ix < view.len() && view.op(ix) == Op::SlotAddr {
+            return Ok(SlotId(view.data[ix]));
+        }
+        Err(unsupported(e, refused))
     }
 }
 

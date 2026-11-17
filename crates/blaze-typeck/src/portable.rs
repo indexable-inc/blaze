@@ -590,6 +590,13 @@ const _: fn() = || {
 };
 
 impl<'a> PortableTys<'a> {
+    /// The allocator this table's own part lives in: its maker's, handed down (D102), so a
+    /// question asked over the table (the run path's `drop_impl`) allocates its scratch there
+    /// and fetches no allocator of its own.
+    pub fn alloc(&self) -> Alloc<'a> {
+        *self.nodes.allocator()
+    }
+
     /// An empty table.
     pub fn new_in(alloc: Alloc<'a>) -> PortableTys<'a> {
         PortableTys {

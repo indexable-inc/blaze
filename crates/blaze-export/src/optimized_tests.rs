@@ -7,7 +7,7 @@
 use blaze_code::a64::{adrp_ldr_target, bl_target, read32};
 use blaze_code::record::{CodeRecord, CodeView, Site, SiteKind, Space, Symbol, Target};
 use blaze_own::{AVec, Alloc, Vec};
-use blaze_tier::record::{Emitted, LoopHeader, Poll, Reloc, RelocKind, encode, read, seal};
+use blaze_tier::record::{Declare, DeclaredKind, Declares, Emitted, LoopHeader, Poll, Reloc, RelocKind, declare, encode, read, seal};
 
 use crate::check;
 use crate::export::export;
@@ -59,15 +59,34 @@ fn rec(code: &[u32], sites: &[(u32, SiteKind, Target)], outside: &[(u32, &str)])
     out
 }
 
-/// `v1`'s record in `bzcode02`, encoded.
+/// These tests' declarer: each in-program target declared by its space (the export reads no
+/// declared row; the section is blaze-tier declared_tests.rs's subject).
+struct BySpace;
+
+impl Declares for BySpace {
+    fn declared(&self, t: Target) -> Option<Declare<'_>> {
+        let d = |kind, name: &'static [u8]| Some(Declare { kind, item: 1, name });
+        match t.space {
+            Space::Func => d(DeclaredKind::Instance, b"an instance"),
+            Space::Static => d(DeclaredKind::Static, b""),
+            Space::Vtable => d(DeclaredKind::Vtable, b"a vtable"),
+            Space::Tls => d(DeclaredKind::ThreadLocal, b""),
+            Space::Outside => None,
+        }
+    }
+}
+
+/// `v1`'s record in `bzcode03`, encoded.
 fn v2(v1: &[u8]) -> AVec<'static, u8> {
     let mut out = Vec::new_in(Alloc::global());
-    v1_to_v2(CodeView::read(v1).unwrap(), &mut out, Alloc::global()).unwrap();
+    v1_to_v2(CodeView::read(v1).unwrap(), &BySpace, &mut out, Alloc::global()).unwrap();
     out
 }
 
-/// A sealed, encoded `bzcode02` record of `e`.
+/// A sealed, encoded `bzcode03` record of `e`.
 fn sealed(e: Emitted<'static>) -> AVec<'static, u8> {
+    let mut e = e;
+    declare(&mut e, &BySpace).unwrap();
     let mut out = Vec::new_in(Alloc::global());
     encode(&seal(e).unwrap(), &mut out);
     out

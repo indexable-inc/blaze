@@ -1,10 +1,11 @@
 //! A build script's view of the world: WASI preview 1 answered as Cargo's environment, with no
 //! ambient authority (docs/v2/plan/design/build-scripts.md).
 //!
-//! - The package's workspace is served read-only at `/workspace` (a dependency's own folder
-//!   is its workspace), from a folder of the checkout or from bytes the caller read out of the
-//!   package's record ([`Tree`]). Each path opened or looked at is recorded by its path from
-//!   the workspace root with the digest of what was found: the record's read list.
+//! - The package's tree is served read-only at what the crate sees (decision D96,
+//!   [`ScriptRoot`]): a dependency's package at `/package`, a member's workspace at
+//!   `/workspace` with the member at its dir; from a folder of the checkout or from bytes the
+//!   caller read out of the package's record ([`Tree`]). Each path opened or looked at is
+//!   recorded by its path from the tree's root with the digest of what was found: the read list.
 //! - `OUT_DIR` (`/target/debug/build/<name>-<hash>/out`) is writable and in memory, bounded
 //!   in bytes and files ([`RunLimits`]). Its ancestors are folders with one entry each. Any
 //!   other path, a write outside `OUT_DIR` and a link out of the workspace stop the script
@@ -27,14 +28,48 @@ use std::sync::Arc;
 use blaze_build_script::key::{CMode, RunLimits};
 use blaze_build_script::git::{self, GitFiles};
 use blaze_build_script::probe::{self, Request, Row, Snippet, Table};
+use blaze_expand::seen::{MemberDirError, SeenRoot};
 use blaze_ids::ContentId;
 use blaze_own::Alloc;
 use blaze_wasi::{Answer, Dirent, Errno, Filestat, Filetype, Open, ROOT_FD, Stop, System};
 
 pub use crate::sandbox::Read;
 
-/// The virtual folder the workspace is served at.
-pub const WORKSPACE: &str = "/workspace";
+/// A script's read-only view of its `links` dependencies' files (brief S1).
+pub mod dep_mount;
+use dep_mount::DepViews;
+
+/// What a script sees as its package's root (decision D96), owned for [`Script`]: a
+/// dependency's package is the tree, served at `/package`; a member's workspace is the tree,
+/// served at `/workspace`, the member at its dir in it. Read only through [`ScriptRoot::seen`],
+/// so the mount points keep one home (`blaze_expand::seen`, rule 30) and a dependency is never
+/// mistaken for a workspace's root package (both had the folder `""`; rule 76).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptRoot {
+    /// `None`: a dependency; `Some(dir)`: a member at `dir`, checked by `SeenRoot::member`.
+    member: Option<String>,
+}
+
+impl ScriptRoot {
+    /// A dependency's (registry, git, toolchain) script: it sees `/package`.
+    pub const fn package() -> ScriptRoot {
+        ScriptRoot { member: None }
+    }
+
+    /// A workspace member's script at `dir` under the workspace (`""`: its root package); a
+    /// `dir` that is not a plain path under it is refused by name.
+    pub fn member(dir: &str) -> Result<ScriptRoot, MemberDirError<'_>> {
+        SeenRoot::member(dir)?;
+        Ok(ScriptRoot { member: Some(dir.to_owned()) })
+    }
+
+    pub fn seen(&self) -> SeenRoot<'_> {
+        match &self.member {
+            None => SeenRoot::Package,
+            Some(dir) => SeenRoot::Member { dir },
+        }
+    }
+}
 
 /// How much of standard error is kept.
 pub(crate) const STDERR_TAIL: usize = 64 << 10;
@@ -83,7 +118,7 @@ impl Tree {
                 let Ok(real) = std::fs::canonicalize(&path) else { return Ok(None) };
                 let root = std::fs::canonicalize(root).map_err(|e| format!("the workspace folder {} cannot be resolved: {e}", root.display()))?;
                 if !real.starts_with(&root) {
-                    return Err(format!("{WORKSPACE}/{rel} is a link out of the workspace"));
+                    return Err(format!("`{rel}` (from the served tree's root) is a link out of the tree"));
                 }
                 if real.is_dir() {
                     let mut entries = Vec::new();
@@ -128,8 +163,8 @@ pub struct Script {
     /// `name version`, for errors.
     pub package: String,
     pub tree: Tree,
-    /// The package's folder in the tree, `/`-separated, empty for its root.
-    pub folder: String,
+    /// What the script sees as its root: where `tree` is served and the package's folder in it.
+    pub root: ScriptRoot,
     /// The environment, `(name, value)` sorted by name, paths in it virtual.
     pub env: Vec<(String, String)>,
     /// The target the script is run for, which a try-compile's key holds.
@@ -149,6 +184,9 @@ pub struct Script {
     /// What the command's setting says about spawns: whether hvbox is allowed (only which
     /// refusal), the pinned tools, the guest userland, the derived facts' pins.
     pub spawn_setting: Arc<crate::spawn_route::SpawnSetting>,
+    /// The read-only mounts of its `links` dependencies' files (brief S1); what they serve is
+    /// in the run's key ([`DepViews::key`]). `DepViews::none()` for a script given none.
+    pub deps: Arc<DepViews>,
 }
 
 /// `env`'s variables owned, for [`Script::env`].
@@ -162,9 +200,9 @@ impl Script {
         self.env.iter().find(|(name, _)| name == "OUT_DIR").map_or("", |(_, value)| value.as_str())
     }
 
-    /// The folder the script runs in.
+    /// The folder the script runs in: its `CARGO_MANIFEST_DIR` (D96).
     pub fn cwd(&self) -> String {
-        if self.folder.is_empty() { WORKSPACE.to_owned() } else { format!("{WORKSPACE}/{}", self.folder) }
+        self.root.seen().to_string()
     }
 }
 
@@ -353,6 +391,11 @@ enum Place {
     Out(String),
     /// An ancestor of `OUT_DIR` (`/`, `/target`, ...): its one entry.
     Above(Vec<u8>),
+    /// Under a `links` dependency's read-only mount: its index in `Script::deps` and the path
+    /// from the mount (brief S1).
+    Dep { mount: usize, rel: String },
+    /// An ancestor of a dependency's mount (and maybe of `OUT_DIR`): its entries, sorted.
+    Ancestor(Vec<(Vec<u8>, Filetype)>),
 }
 
 /// `a/./b/../c` from `/`, as parts; `None` when it climbs above `/`.
@@ -432,7 +475,8 @@ impl ScriptSandbox {
         let Some(parts) = parts(text) else {
             return Err(self.refuse(Refusal::Path(format!("named /{text}, which climbs above the root"))));
         };
-        if parts.first() == Some(&"workspace") {
+        let mount = self.script.root.seen().mount();
+        if parts.first().is_some_and(|first| mount.strip_prefix('/') == Some(*first)) {
             return Ok(Place::Work(parts[1..].join("/")));
         }
         let out_dir = self.script.out_dir().to_owned();
@@ -440,10 +484,13 @@ impl ScriptSandbox {
         if parts.len() >= out.len() && parts[..out.len()] == out[..] {
             return Ok(Place::Out(parts[out.len()..].join("/")));
         }
+        if let Some(place) = self.script.deps.place(&parts, &out) {
+            return Ok(place);
+        }
         if parts.len() < out.len() && out[..parts.len()] == parts[..] {
             return Ok(Place::Above(out[parts.len()].as_bytes().to_vec()));
         }
-        Err(self.refuse(Refusal::Path(format!("named /{}, outside {WORKSPACE} and OUT_DIR ({out_dir})", parts.join("/")))))
+        Err(self.refuse(Refusal::Path(format!("named /{}, outside {mount} and OUT_DIR ({out_dir})", parts.join("/")))))
     }
 
     /// `path` named from the descriptor `at`, as a path from the root: the root's descriptor
@@ -498,7 +545,8 @@ impl ScriptSandbox {
     }
 
     fn work_write(&mut self, rel: &str) -> Stop {
-        self.refuse(Refusal::Path(format!("wrote {WORKSPACE}/{rel}, outside OUT_DIR, the only folder a build script may write")))
+        let mount = self.script.root.seen().mount();
+        self.refuse(Refusal::Path(format!("wrote {mount}/{rel}, outside OUT_DIR, the only folder a build script may write")))
     }
 
     /// `path_create_directory`.
@@ -520,8 +568,9 @@ impl ScriptSandbox {
                 self.out.insert(rel, None);
                 Ok(Ok(()))
             }
-            Place::Above(_) => Ok(Err(Errno::EXIST)),
+            Place::Above(_) | Place::Ancestor(_) => Ok(Err(Errno::EXIST)),
             Place::Work(rel) => Err(self.work_write(&rel)),
+            Place::Dep { mount, rel } => Err(self.dep_write(mount, &rel)),
         }
     }
 
@@ -545,6 +594,7 @@ impl ScriptSandbox {
                 }
             },
             Place::Work(rel) => Err(self.work_write(&rel)),
+            Place::Dep { mount, rel } => Err(self.dep_write(mount, &rel)),
             _ => Ok(Err(Errno::PERM)),
         }
     }
@@ -558,6 +608,7 @@ impl ScriptSandbox {
         let (from, to) = match (self.place(&from)?, self.place(&to)?) {
             (Place::Out(from), Place::Out(to)) if !from.is_empty() && !to.is_empty() => (from, to),
             (Place::Work(rel), _) | (_, Place::Work(rel)) => return Err(self.work_write(&rel)),
+            (Place::Dep { mount, rel }, _) | (_, Place::Dep { mount, rel }) => return Err(self.dep_write(mount, &rel)),
             _ => return Ok(Err(Errno::PERM)),
         };
         let Some(Some(_)) = self.out.get(&from) else {
@@ -644,7 +695,8 @@ impl ScriptSandbox {
                 self.record(format!("file:{rel}"), bytes.as_deref().map(digest));
                 bytes
             }
-            Place::Above(_) => None,
+            Place::Dep { mount, rel } => self.dep_file(mount, &rel)?,
+            Place::Above(_) | Place::Ancestor(_) => None,
         })
     }
 
@@ -699,9 +751,8 @@ impl ScriptSandbox {
                 let words: Vec<&str> = owned_words.iter().map(String::as_str).collect();
                 let command = words.join(" ");
                 let folder = match &spawned.cwd {
-                    None => Some(self.script.folder.clone()),
-                    Some(cwd) if cwd == WORKSPACE => Some(String::new()),
-                    Some(cwd) => cwd.strip_prefix(WORKSPACE).and_then(|rest| rest.strip_prefix('/')).map(str::to_owned),
+                    None => Some(self.script.root.seen().folder().to_owned()),
+                    Some(cwd) => self.script.root.seen().in_tree(cwd).map(str::to_owned),
                 };
                 let script = Arc::clone(&self.script);
                 let answered = match folder.as_deref().map(|folder| (folder, git_subject(folder, &words))) {
@@ -922,6 +973,23 @@ impl GitFiles for GitView<'_> {
         }
         rest.strip_prefix('/')
     }
+
+    /// `readlink` of `rel`'s last part, reached like every path here (each folder on the way a
+    /// real folder, no link passed through): the link's own text, never followed, so nothing
+    /// outside the tree is read. Like `stat`, not a read of the record: the git answer is (D54).
+    /// A record's tree (`Tree::Mem`) holds no links.
+    fn read_link(&mut self, rel: &str, into: &mut blaze_own::AVec<'_, u8>) -> Result<(), git::LinkUnread> {
+        let tree: &Tree = self.tree;
+        let Tree::Dir(root) = tree else { return Err(git::LinkUnread::NotALink) };
+        let path = self.inside(root, rel).ok_or(git::LinkUnread::NotALink)?;
+        let target = std::fs::read_link(&path).map_err(|e| match e.kind() {
+            // EINVAL (not a link) and ENOENT: what git sees as a type change.
+            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound => git::LinkUnread::NotALink,
+            _ => git::LinkUnread::Unreadable,
+        })?;
+        into.extend_from_slice(target.as_os_str().as_encoded_bytes());
+        Ok(())
+    }
 }
 
 impl System for ScriptSandbox {
@@ -1104,6 +1172,8 @@ impl System for ScriptSandbox {
                 }
                 Ok(Ok(self.slot(Opened::Ro { bytes: Vec::new(), pos: 0, entries: Some(vec![(entry, Filetype::Directory)]), folder: path.to_vec() })))
             }
+            Place::Dep { mount, rel } => self.dep_open(mount, &rel, path, how),
+            Place::Ancestor(entries) => self.ancestor_open(entries, path, writes),
             Place::Out(rel) => {
                 match self.out.get(&rel) {
                     Some(None) => {
@@ -1157,7 +1227,8 @@ impl System for ScriptSandbox {
                 self.record(format!("stat:{rel}"), found.map(|(filetype, size)| stat_digest(filetype, size)));
                 Ok(found.map(|(filetype, size)| filestat(filetype, size)).ok_or(Errno::NOENT))
             }
-            Place::Above(_) => Ok(Ok(filestat(Filetype::Directory, 0))),
+            Place::Above(_) | Place::Ancestor(_) => Ok(Ok(filestat(Filetype::Directory, 0))),
+            Place::Dep { mount, rel } => self.dep_stat(mount, &rel),
             Place::Out(rel) => Ok(match self.out.get(&rel) {
                 Some(Some(bytes)) => Ok(filestat(Filetype::RegularFile, bytes.len() as u64)),
                 Some(None) => Ok(filestat(Filetype::Directory, 0)),

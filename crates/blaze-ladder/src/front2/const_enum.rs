@@ -25,16 +25,18 @@
 //!
 //! The smallest general form is taken here: the parameter's type is an enum with no generic
 //! parameters whose every variant is a unit variant ([`fieldless`], filed with the enum's head
-//! in `Maps::fieldless_enums`; [`accepts`] is what `own_generics` asks). Its value is ONE
+//! in `Maps::fieldless_enums`; which TYPES a const parameter may have is const_param_ty.rs
+//! `admits`, the one rule `own_generics` asks). Its value is ONE
 //! VARIANT: the node `PortableTys::variant_value` makes, `ConstValue { ty: Adt(enum, []),
 //! bits: the variant's index }` ([`term`]). The enum's key is in the value, so two values are
 //! equal only when they are the same variant of the same enum: a variant of another enum with
 //! the same index is a different term, and where the parameter's type is known it is refused
 //! as a mismatch ([`Term::OtherEnum`]).
 //!
-//! Still refused, by name: a const parameter of any other non-primitive type (a struct, a
-//! tuple, an array, a reference, `&'static str`, an enum with fields or with generics): the
-//! text `own_generics` had. A const argument of an enum type that is not a path to a variant
+//! Still refused, by name: a VALUE of any other non-primitive type (a struct's, a tuple's, an
+//! array's, a reference's, `&'static str`'s, an enum's with fields or with generics: a value
+//! tree, which has no node; the parameter itself has a head, const_param_ty.rs). A const
+//! argument of an enum type that is not a path to a variant
 //! ([`NOT_A_VARIANT`]: a constant item of that type, an expression that computes a variant):
 //! a constant's evaluated bits are its discriminant as the layout stores it, not its
 //! variant's index, and nothing here maps one to the other yet.
@@ -45,7 +47,6 @@ use blaze_lower::{View, form as lf, head};
 use blaze_surface::{ItemDetail, Range};
 use blaze_typeck::{ItemKey, PNode, PTy, PortableTys};
 
-use super::heads::Maps;
 use super::keys::checker_of;
 use super::source::NamesSource;
 use super::types::{Why, intern, intern_list};
@@ -79,16 +80,6 @@ pub(super) fn fieldless<'n, S: NamesSource<'n>>(names: S, key: LibKey, v: &View<
     Ok(Some(rows.len() as u32))
 }
 
-/// Whether `t` may be a const parameter's type as a fieldless enum: an `Adt` node with no
-/// arguments whose head filed it in `Maps::fieldless_enums` (its head is made before any
-/// path to it has a type, so an enum not filed there is not fieldless).
-pub(super) fn accepts(heads: &Maps, tys: &PortableTys<'_>, t: PTy) -> bool {
-    match tys.view().get(t) {
-        Some(PNode::Adt(k, l)) if l.len == 0 => heads.fieldless_enums.contains_key(k),
-        _ => false,
-    }
-}
-
 /// What a written const argument is where the parameter's type is `want`.
 pub(super) enum Term {
     /// `want` is no enum type (an integer, `bool`, `char`, a hole): the caller's own reading.
@@ -101,8 +92,9 @@ pub(super) enum Term {
 }
 
 /// The const argument `text` (braces already taken off, trimmed) for a parameter of type
-/// `want`. Where `want` is an `Adt` with no arguments (a fieldless enum: `own_generics`
-/// accepts no other ADT as a const parameter's type) the argument must be a path that
+/// `want`. Where `want` is an `Adt` with no arguments (a fieldless enum's value is a unit
+/// variant; a struct's is a value tree, so for a struct this refuses every argument by name)
+/// the argument must be a path that
 /// `resolve` (the value namespace, from the argument's module) names a variant with: of that
 /// enum it is [`Term::Is`] its value, the node `PortableTys::variant_value` makes; of another
 /// enum [`Term::OtherEnum`]. Anything else there is refused by name ([`NOT_A_VARIANT`]).

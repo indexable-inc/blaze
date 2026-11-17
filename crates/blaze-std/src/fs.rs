@@ -118,6 +118,9 @@ pub use read_sized::SizedError;
 // A whole file mapped read-only (`Dir::map_read`): a large plain array read in place.
 mod map_read;
 
+// The boot the files are read in (`Fs::boot`): the files capability's own fact (D104 B1).
+mod boot;
+
 // A walk over folders, bounded by its caller: the visitor chooses each folder's sub-folders.
 mod walk;
 

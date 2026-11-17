@@ -29,8 +29,8 @@ blaze-git-fetch.workspace = true
 blaze-spawn.workspace = true
 
 [dev-dependencies]
-# `Alloc::global()` in the tests and the census.
-blaze-own = { workspace = true, features = ["std"] }
+# `Alloc::global()` in the tests and the census; `testing::heap()`, a test's root allocator (D102).
+blaze-own = { workspace = true, features = ["std", "testing"] }
 blaze-sim.workspace = true
 # The census reads the lock and every package's manifest, as blaze-unit-graph's example does.
 blaze-manifest = { workspace = true, default-features = false }

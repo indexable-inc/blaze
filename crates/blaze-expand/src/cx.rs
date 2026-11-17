@@ -40,10 +40,17 @@ pub trait ExpandCx {
     ) -> Result<Produced<'a>, HostError>;
 }
 
-/// How an included file is read.
+/// How an included file is read, which the host is told so it can tell a module file from
+/// data: `include!`'s file is Rust whose items or expression join the crate (its host reads it
+/// as a module file, whose surface the names read); `include_str!`'s and `include_bytes!`'s are
+/// data (bytes whose digest a reader's read list holds, never a module).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum IncludeAs {
+    /// `include!`: the file's tokens.
+    Tokens,
+    /// `include_str!`: a string literal of the file's text.
     Str,
+    /// `include_bytes!`: a byte string literal of the file's bytes.
     Bytes,
 }
 

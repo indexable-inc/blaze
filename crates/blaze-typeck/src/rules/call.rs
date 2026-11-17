@@ -172,7 +172,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         self.adjust_autoderef(callee, &steps, i);
                         // The call's expected type decides what it can of the formal inputs
                         // before an argument is typed (rules/expect_inputs.rs).
-                        self.expected_inputs(f.expect, inputs, output)?;
+                        self.expected_inputs(f.expect, inputs, output, arg_ids)?;
                         return self.start_args(f, e, arg_ids, inputs, output, 2, true);
                     }
                 }

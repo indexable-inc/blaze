@@ -1530,6 +1530,162 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
       a merge mid-command leaves the mapped get answering. The larger cost is the count:
       121k gets for a tree, in proportion to the tree, not the edit (the certificate fixes
       the repeat; the forward check fixes the edit).
+      TESTS 18:53-18:56: "mixcheck test blaze-cli: exit 0; 1 passed, 0 failed" for
+      `edits_of_module_files_answer_as_a_fresh_home` (tree b980692f16, live blaze-scope);
+      the whole suite a minute later on tree 1af222ac1d with blaze-scope from its OLDER green
+      snapshot: "121 passed, 7 failed" (fresh-home oracles, the fix tests' `NeedCycle` on a
+      `BodyCheck`, "no crate's names record lists this file"). Not attributed to RUNNER 16's
+      edits, and not proved otherwise: rerun the suite once blaze-scope is green live.
+      ## HAND-ON 18:57 (runner 16). Next: (1) when NAMES fixes the `include_str!` stop,
+      run the clone check twice with blaze-r16-d or newer (`--stats`), quoting the
+      "certificate stood|missed" line and the repeat's store reads. (2) The open list:
+      `run_after_check` NoMain, the `test` arm, names off the main thread (25 s of serial
+      CrateScope on the clone), D101 (WRONG ANSWERS 6's batch). (3) The 17 GB footprint of
+      the clone check is unexplained: ask the profile first.
+    - RUNNER 17 2026-11-16 (uncommitted; run files in port27/drive-1116/r17/, `clonerun.sh <bin>
+      <tag> [secs]`: scratch HOME, toolchain shelf synced, `timeout` OUTSIDE `/usr/bin/time` (b1's
+      instruction count was `timeout`'s), MSL=1 adds `malloc_history -callTree`).
+      ITEM 1, CrateScope ON THE POOL. Why it was main-thread: the world's texts read through a
+      `!Sync` `&dyn Tree` into one frame, `&mut dyn Store`, `Prepares`/`CrateEnv` hold an `Alloc`,
+      and `resolve_crate` ran on `Alloc::global()`. Now names/scope.rs: `prepare` (main: the
+      deps' export bytes read once a round into `ScopeRound`, aligned, cached by key) -> a Sync
+      `ScopeJob` -> `resolve` on a worker in its own frame (`SCOPE_FRAME`) -> `settle` + `answer`
+      (main); blaze-scope crate_env.rs `EnvLent` lends the env (`clone_in` into the task's frame);
+      job_texts.rs holds `JobTexts` (moved from body_types). A panic fails its task
+      (`Why::Panicked`). Test pooled_scope_tests.rs: 4 workers vs 1 write equal record ids;
+      planted `Plant::ScopeShareByPlace` fails on "ORACLE": "2 passed, 0 failed" (tree
+      2fcdee417d). Clone: BEFORE blaze-r16-d (e57a81757b) 75.09 s, 993354816722 instr, 17133467448
+      peak, "task CrateScope 0 2861x 26648934142"; AFTER blaze-r17-a (b183b5e3e0) 52.06 s,
+      887756825138 instr, 8190172576 peak, "task CrateScope 0 1345x 68798967", "pooled CrateScope
+      (worker ns) 0 1523x 33230714527". The simulation runs `Inline`: thread safety is by the
+      types (ScopeJob: Sync, checked by the compiler), not by the test.
+      ITEM 2, MEMORY: the profile has no Global-heap rows; vmmap: 10 GB of 10.9 is "Malloc Small"
+      (frames are 300 MB). `malloc_history` at 45 s (m1.mh45.txt): 5181M in 111,403
+      `Vec<key::Name>` grown at request.rs `Ran::Need` `job.needs.push` (disassembly: after
+      `add_job`/`get_mut`); 997M the command frame's chunk reserve; 329M store `chunks::put`.
+      FIX 1 (blaze-drive): `set_state` frees a job's needs as it settles; `Plant::KeepSettledNeeds`;
+      the sim's answer oracle `kept_needs() == 0`; `control_needs_kept_past_settling_are_caught`;
+      "48 passed, 0 failed". NOT THE PEAK: blaze-r17-b still "110515 (5180M)" at 45 s: those
+      jobs are BodyChecks that never settle. ROOT (body_types.rs `prepare`, runner 5's): every
+      body Needs EVERY workspace member's CrateScope (~1,400 names), opens each member's items
+      record to find its owner, reads every member (`asked`): "jobs made: BodyCheck (main ns) 0
+      331542x 51554714272" of "jobs made 0 976x 51875806723"; "machine step 0 143339x
+      22729433899"; and one failed crate blocks every body ("110962 task(s) not run").
+      FIX 2 (agreed with runner 5 and the coordinator; ONE batch): `Kind::Owners = 16` (leg 2
+      agreed; D115's Script is 17, wiring/blaze-drive/d115-1.md goes after) and
+      `key::owners_of(surface) = Name { kind: Owners, subject: surface.subject }`, plus a
+      blaze-cli home.rs `row_of` arm `Owners => Row::Names`. A machine FACT, never a task: in
+      `digest(read)`, an `Owners` read waits until every CrateScope job settled (one barrier: a
+      counter kept in `set_state`/`add_job`, waiters woken at zero, all CrateScope parts made jobs
+      on the first ask), then its out is a digest of the sorted CrateScope names `posted` lists
+      as readers of the Surface; emit hands `Task.owners` sorted. Sim oracle: an edit that moves
+      a file's owner moves the body; plant: a stale owner set. Runner 5 then Needs owners + their
+      closure once per file job and deletes `asked`/`members`; reads only the scopes opened.
+      work.rs `made_row`: "jobs made" split by kind (live).
+      FIX 2 AS ABOVE IS WITHDRAWN (20:06, nothing written; the batch token was taken and given
+      back unused): waiting for every CrateScope to SETTLE is today's shape under a new name (the
+      coordinator's constraint: a body waits only for its owners and their closure; one failed
+      scope blocks only its dependents). REPLACEMENT, owners by the MODULE TREE, not by scopes:
+      a file's owners are the crate roots whose outline tree reaches it, and that tree is
+      already in the drive: Units parts each crate root's file, and each FileItems record parts
+      its `mod` files (`PathOf { module: true }`, kept in `part_locs` as (locate, place, parent)).
+      So `owners_of(file)` = follow parents up to the roots, with NO scope run. Needed: (i)
+      `part_locs` keeps EVERY parent of a part (a file that is a module of two crates has two;
+      today a later insert overwrites); (ii) completeness: the fact settles once every FileItems
+      reachable from the Units' roots is settled (outlines only, pooled and cheap): a barrier of
+      the allowed kind (named and outlined, never resolved); an outline that fails hides only its
+      own subtree; (iii) out = digest of the sorted root names, `Task.owners` = those roots (the
+      cli maps a root to its crate and its CrateScope by the world); (iv) on an incremental run
+      the parents come from the kept rows (old FileItems/Units rows found by key), no barrier.
+      Agrees with the names lane's outline: a module under a macro, attribute or out-of-tree
+      `#[path]` is already an error, so the outline tree IS the scope's file set. Test: one
+      crate's scope fails; the bodies of crates not depending on it are checked and printed;
+      "task(s) not run" counts only its dependents; plant: owners from one parent only.
+      PART READS (coordinator's D114 ruling (1)), the drive side in ten lines, NOT built:
+      (1) A read is (name, part, digest); `part` is `Whole` or a 128-bit cell key. (2) Record
+      form: `reads` stays sorted by name; a parallel column `read_parts` (u8 tag + 16 bytes,
+      Whole elided by a bitmap) so a reader of only Whole reads pays one bit. (3) `Row.readers`
+      becomes (reader, part): `posted` keys by name and holds (reader, part) lists. (4) On a
+      changed record, `dirty_readers` calls the kind's pure `part(bytes, cell) -> digest|Absent`
+      once per distinct cell (sorted, deduped), compares with each reader's recorded digest,
+      and dirties only movers; Whole readers compare the out as today. (5) The kind's `part`
+      fn is registered by kind in the drive (a table `Kind -> fn`), sans-IO over mapped bytes.
+      (6) `digest(read)` takes the part; `made_split`/stale checks compare per part. (7) Writers
+      of read lists (one batch): blaze-drive record.rs/answers.rs/request.rs; blaze-cli work.rs
+      (`Made.reads`), names/scope.rs `answer`, body_types.rs, macros.rs, unit_graph_task; the
+      sim's `Made`. (8) Wire: answers.rs page rows add the column; old homes are rebuilt
+      (rule 26). (9) Sim: a reader of cell A is not dirtied by a change to cell B; plant: all
+      readers dirtied. (10) Cost: one `part` search per distinct (changed record, cell).
+      OWED: (2) of the coordinator, FileItems re-reads its file at run time and files it under
+      the sweep's id: hash the bytes read, compare, typed `Changed { path }`, proof type over
+      verified bytes, sim with an edit between sweep and task, plant: compare skipped.
+      CERTIFIED REPEAT (item 3), blaze-r17-c (d7c05cf264) twice: c1 84.09 s; c2 (repeat, load
+      25.5-20.6) "332462 runs, 121497 store reads (10529 found), 4704 opens, certificate
+      missed", 60.94 s, 864512373820 instr, 5359162456 peak; "store gets 121497 hits 10529
+      puts 33". The repeat redoes it all: the cold run put only 33 records, its 110,962 bodies
+      unrun behind failed tasks (the MacroModule "store lacks" blaze-serde-derive in the
+      scratch home; source-refused path packages). Owed: why a run with failures puts no
+      CrateScope/Surface records (10,529 found are FileItems-class); the owners fix unblocks
+      the bodies. Item 4:
+      `run_after_check` NoMain is done in the tree (it answers `NoBinary`).
+    - RUNNER 18 2026-11-16 20:10-20:40 (uncommitted, tree d288fe5cc0 + the lanes' edits).
+      ITEM 0, PUTS UNDER A FAILURE. Runner 17's "the cold run put only 33" was a misreading:
+      c1 (r17/c1.profile.txt) "store gets 121330 hits 0 puts 10864"; c2 "gets 121497 hits
+      10529 puts 33" (33 is the REPEAT's own puts) and found Units 181, UnitGraph 1, FileItems
+      4704, CrateScope 450, MacroModule 20, Surface 4704, made 0 of each. What the repeat redid:
+      "BodyCheck ... entries 331542 needs 221028" (no body ran: "jobs made: BodyCheck (main
+      ns) 331542x 36938324366", "machine step 140277x 22604154105") and the failed CrateScopes
+      (rule 20, `Ran::Failed` keeps no record): item 1's cause. `finish` withholds the
+      certificate for FAILED tasks only; findings certify (the coordinator: right rule). Guard:
+      sim.rs `a_request_with_a_failure_puts_every_settled_record`, control
+      `control_puts_dropped_on_a_failure_are_caught` (Plant::DropPutsOnFailure in `put`):
+      "test blaze-drive: exit 0; 2 passed, 0 failed".
+      ITEM 2, VERIFIED BYTES, GREEN. blaze-drive verified.rs: `Verified<'b>` (private field)
+      made only by `verify(name, bytes, expect, id, plant)`; `Why::Changed`;
+      `Request::file_content_of(task)` (the sweep's id of the task's file). blaze-cli work.rs:
+      `Job.expect` (from `job_of`), `verified_text` (the one way to text: verify, then UTF-8)
+      in `outline_file` and `bodies_syntax`; `Unread::Changed` -> `Why::Changed` in `pooled`,
+      `pooled_bodies`, the `Spawned::One` arm; `filed` never files `Changed`; main.rs after
+      `after_answer`: `CliError::Changed { paths }` "changed while the command ran; run again
+      (nothing of these was kept)". Sim: World `edited_at_run`, `verify_plant`;
+      `a_file_changed_after_the_sweep_puts_nothing` (oracle: no record of the file, no
+      `last`), control `control_a_skipped_content_compare_is_caught`
+      (Plant::SkipContentCompare). "test blaze-drive: exit 0; 52 passed, 0 failed" (20:33);
+      "mixcheck blaze-cli: check ok (all targets) at 20:32; tree b591f1c4a3; taken from their
+      last green snapshots: blaze-build blaze-scope". Gap: blaze_file_items::outline takes
+      `&str`, so the proof binds inside blaze-cli (no other path to text there), not by the
+      parser's signature.
+      ITEM 1, OWNERS, RULED (A) by the coordinator 20:30, NOT WRITTEN. Owners is a kept row
+      the machine computes (never a task): owners(F) = union of owners(P) over F's parents P,
+      a root (a Units part) adding itself; read list = each parent's FileItems/Units name and
+      each parent's Owners name with their outs; out = digest of the sorted root names;
+      payload = the sorted root FileItems names (the body reads it with `work::payload`; NOT a
+      `Task.owners` field: told to PIPELINE runner 6, ad6bd1ddec7d4f387). A home settling with
+      a FileItems part ADDED or REMOVED against its old parts (`settle`, the `old_parts`
+      loop) dirties that part's Owners (only if it has a job or an old row); descendants
+      follow by readers. Cold: settles when no Units/FileItems job is unsettled (a counter in
+      `add_job`/`set_state`, waiters woken at zero; a failed outline hides only its subtree,
+      named). Warm: no barrier, the row stands unless dirtied; recompute parents = old row's
+      parent reads that still list F + this run's homes listing F (`part_locs` must keep
+      EVERY parent: today `insert` overwrites, request.rs `settle`). Owed: `Kind::Owners = 16`,
+      KINDS 16, `ALL`/`from_u8`/`name`/`stage`, blaze-cli home.rs `row_of` arm; a cycle of
+      `#[path]` files must be a named failure, not a hang. Sim cases, each with a plant
+      (coordinator): two parents kept (plant: last parent wins); a new `mod x;` elsewhere gives
+      x a new owner and its bodies rerun (plant: added parts not dirtied); a parent removed
+      drops the owner, and a body no root owns is named in the answer as not checked (never
+      silently dropped). Then the brief's test (one crate's scope fails; other crates' bodies
+      checked; "task(s) not run" counts only its dependents) and the clone before/after
+      ("jobs made: BodyCheck", "machine step", peak) on clonerun.sh. Runner 5's condition:
+      every body read-lists the Owners input itself.
+      ITEM 3: not started. d115-scripts-in-command.md lines 14-26 and 65-66 say what the
+      scripts lane expects of `key::content_of(path)` and `Ask::facts`; nothing in the tree.
+      ITEM 4 (part reads): not started.
+      FILED WITH THE DRIVE by PIPELINE runner 6 (20:45), not looked at: two NeedCycles on a
+      BodyCheck, one BodyCheck left unsettled with nothing out: (1) blaze-cli main.rs test
+      `edits_of_module_files`, BLAZE_SIM_TAPE='0 1 1'; (2) fix_tests (2 tests, among them
+      `an_edit_above`), BLAZE_SIM_TAPE='0*3 5'. Runner 5: removing the member reads turns (1)
+      back into the history-dependent note, so both may change once the owners batch deletes
+      `asked`/`members`; re-run both after item 1 before reading the cycle.
 - Owed, not now: `run` after `check` writes its own certificate, because the command is in
   the key. That costs 3.5 ms against the second run's 1.0 ms on hello-world. A coarse proof
   covers all under it: `check`'s certificate should stand for `run`'s check part.
@@ -1686,3 +1842,282 @@ registry and toolchain crates found by key in the machine store or bucket; `Macr
 
 At once: 1, 4, 5, 8, 10, 16 (separate crates or files); then 2, 3, 12, 14 and 6; then 7, 15;
 then 9, 13; then 11, 17.
+
+## Check times: the end state in numbers (D114, 2026-11-16 evening; the coordinator's design)
+
+Andrew, 19:42, after a cold `blaze check` of blaze's own clone took 52 s: "u should fix architecture to have
+crazy short check times", "i want it to be incredibly impressive". The grain and the keys above stand. What
+follows is why the command is 10 to 30 times off its own floors today, the rules that close that, and the
+numbers the command is held to. Each number is a line of `--stats`, quoted with the tree and the load.
+
+**Held to** (wall, a quiet machine; W = the workspace's own bodies; dependencies and std are never checked
+on this machine: their records come by key from the shared cache, and until that cache exists their first
+check is the one cold cost):
+
+| Case | Any size | Today (measured 2026-11-16) |
+|---|---|---|
+| nothing changed | 2 ms | hello 2 to 3; tempo 13; the blaze clone: never, its check stops before the certificate |
+| one body edited | 5 ms, plus 2 ms a MB of the edited file | 110 (hello: 58 one body check, 44 "prepare") |
+| one signature edited | 5 ms, plus its readers x one body / cores | every body of the file (100 in the test) |
+| one `pub` item added | 5 ms, plus the module group's cells and the readers of what it shadows | its whole crate re-solved |
+| a branch switch of 5,000 files, checked before by anyone | 200 ms (5,000 outlines / cores, then finds) | not measured |
+| cold, W = 60,000 bodies | 1 s on 128 cores, 8 s on a 10-core Mac | 52 s for the blaze clone (888 G instructions) |
+| first error on the screen | 50 ms after start when it is in a changed file | after the whole answer |
+
+**Why today is slow, by the profile** (each is a rule broken, not a tuning):
+1. RECORDS ARE DECODED, NOT READ. A job's "prepare" copies whole crate records out of a pack and builds
+   readers over them (44 ms for one edited body; the names reader decodes a whole module scope on first use;
+   the expansion texts are copied with their crate's record on every command). RULE: a record is its own
+   index. Every record form is sorted columns (blaze-columns `enc`) answered by a search in the mapped bytes:
+   a lookup allocates nothing and touches the pages it needs; opening a crate's names, items or heads is one
+   index search and a pointer. A fresh process answers its first lookup in microseconds. A job's setup is
+   O(the crates its body names) pointer lookups, on the worker, never on the main thread.
+2. THE COMMAND'S STORE COPIES. blaze-cli's `PackStore` (one pack a command, read by `pread` into frames,
+   never synced, merged past eight) is a stand-in; blaze-cas's plain store (immutable segments mapped once a
+   process, a two-slot head, compaction with a grace period) is the store. RULE: the command maps segments
+   read-only and hands out slices; the page cache is the only cache (rule 51). After a restart a command
+   verifies only the segments it reads, each once a boot; nothing is verified in proportion to the store.
+3. A SERIAL SECTION GROWS WITH THE WORKSPACE. 31 of the clone's 52 s is the main thread making jobs; names
+   ran on the main thread until 19:35 (26.6 s). RULE: the main thread only decides WHICH tasks are ready (1
+   to 2 us a step, batches by home); everything that reads a record or text runs on the pool; no serial
+   section may exceed 1 ms at any size, and `--stats` prints the longest one.
+4. THE GRAIN STOPS AT THE FILE AND THE CRATE. A body's source covers its file's text around bodies, so a
+   signature edit re-checks the file; `CrateScope` is a crate; a signature edited elsewhere that leaves the
+   exports equal moves NO body's read (a stale check can stand: correctness, first). RULE: one kind a fact:
+   `Signature` (an item's head, keyed by its text and its generics' context), `ModuleScope` and `Group` (the
+   names solver's cells: a module, or the modules a glob cycle ties), `ImplBucket` (the impls of one trait
+   for one self shape), `Expansion` (one call under `call_key`). A body's READ LIST names each fact it used
+   with that fact's digest (read-addressed.md); it is valid by its key, or else by that list checked against
+   today. Early cutoff at every kind: a fact whose digest is equal moves nobody.
+5. WORK IS NOT ORDERED BY WHAT THE PERSON IS LOOKING AT. RULE: ready tasks run changed-first (the swept
+   files' bodies, then their readers, then the rest), and a finding is printed when it is found, in a stable
+   order within its file; the answer's order is restored at the end for the record.
+6. THE CHECKER'S OWN COST IS NOT KNOWN. A body costs 1.56 ms mean in the drive and 0.35 ms in the run path's
+   walk; neither has a profile by phase. OWED: spans for solve, unify, method lookup, coercion and borrow
+   check on tempo's bodies; the floor for a body is set from that, not guessed.
+
+**Lints** are the same machine at the same grain (rule 81): a lint pass over one body is a task keyed like its
+check with a read list; errors print before the answer, advice after, and a repeat prints both from records.
+
+**Pieces** (one writer or lane each; the order is by what the table loses most to): (a) the in-place readers
+for names, items, heads and expansion texts, and the job's setup on the worker; (b) the command on
+blaze-cas's store, the stand-in deleted; (c) the serial sections out (the driver lane has the first); (d) the
+`Signature` kind and bodies' read lists by signature digest, with the stale-check test first; (e)
+`ModuleScope` and `Group` from the solver's cells; (f) `ImplBucket`; (g) changed-first order and findings as
+they are found; (h) the checker's spans by phase, then its floor.
+
+## Build scripts in the command (D115, 2026-11-16 evening; the coordinator's design)
+
+Found 19:44: the `blaze` command runs NO build script. names.rs hands the world `scripts: None` ("each crate
+with a script is resolved without them"); `script_unit::Setting` is built only by an example and a test. So
+`check`, `run` and `build` of any project with a `build.rs` see no `OUT_DIR`, no `cargo:rustc-cfg`, no
+`env!` a script set: tempo has 106 scripts (99 give outputs in the example today), and 107 of its bodies
+fail for want of one script's bindings. The harness proved the runtime; the command never called it.
+
+**End state**: a script run is a drive task, kind `Script`, one a (script unit, target): the design's own
+grain ("one body, instance, macro call or script run per task"). Not a step inside the job that makes the
+world: 106 runs in one job is a serial section that grows with the workspace (D114's rule 3).
+- KEY: the script runtime's producer id, the script unit's identity (its package and the digest of its
+  sources and of its own dependencies' code), the target, the unit's features and cfg, the profile facts a
+  script may see. Nothing of the machine: the roots are `/package` or `/workspace/<dir>` (D96).
+- READ LIST: every fact the run asked for: each environment variable by name, each file it read outside its
+  package by workspace-relative path, each probe answered from the facts table, and the OUTPUT RECORD of each
+  script whose `DEP_<LINKS>_*` it read (an edge to another `Script` task: the links graph).
+- OUT: one record: the `cargo:` lines in order, and `OUT_DIR` as a tree record (paths, modes, content ids;
+  the files' bytes as their own records, so equal generated files are shared).
+- READERS: the unit's `FileItems` and `CrateScope` read the record for cfg, `env!` values and an
+  `include!(concat!(env!("OUT_DIR"), ..))`; a body's read list names the generated file's digest, so a
+  script whose output is byte-equal after its sources changed moves nobody (early cutoff).
+- WHERE IT RUNS: in blaze (the wasm or LIR runtime, sandboxed) on the pool; the scripts that spawn native
+  tools through the D112 runner, whose records are local and never shared. One choice point.
+- FAILURE: a finding naming the script, its package and the line it failed on; the unit that needs it is
+  "not checked: its build script failed" by name, and the rest of the answer goes on (rule 20).
+- A dependency's script output comes from the shared cache by key like any record; only a workspace
+  member's script, or one whose inputs changed, runs here.
+
+**Pieces**: (1) `Kind::Script` in blaze-drive key.rs with its name and source, and work.rs's task: the
+`script_unit` run of ONE unit with the setting made once at the command's edge (rule 75: the facts table,
+the native setting, the SDK); (2) the world takes script records from the drive's reads
+(`blaze_world::ScriptRecords`), `scripts: None` and its note deleted; (3) the `DEP_*` edges as reads; (4)
+`CrateInput::script` on the body path (front_load.rs); (5) tempo: the line "N of 106 scripts made by the
+command", then the 107 bodies.
+
+**Two rulings (19:48, on the implementing lane's questions).** (1) A script's output is a READ, never part
+of a key: it is not known before the script runs. The crate's key is its identity without the script's digest
+(blaze-world's `world` takes no scripts; `UnitKeyParts.script` goes); each task that needs what a script made
+Needs its own unit's `Script` record and joins it at task time; a dependent is cut off by its dependency's
+`CrateScope` out digest as today. There is no world-grain barrier and no kind `World`. A code record's crate
+fact (D106) folds the crate's `Script` out digest, since the crate key no longer does. (2) The drive's record
+is the only cache of a script run: the script runtime's own record store is deleted from the command's path
+in the same batch (rules 30, 77).
+(3, 20:33) Every unit reads the `Script` of ITS OWN side: a package built for the macro side runs its script
+for that side and takes that run's cfg (proc-macro2 and syn's dependencies set theirs so); none only when
+the package has no script. The script a unit reads is named by one function of the parts of its crate key,
+so two units under one crate key cannot name two scripts; the world refuses the case by name all the same.
+(4) A kind's number is taken when its batch lands, never reserved: `Script` is 16.
+
+## D114 rulings (2026-11-16 20:00; the coordinator's, on the implementing lanes' questions)
+
+### Part reads (the drive; every fine fact below is read this way)
+
+A read is (name, PART, digest). The part is `Whole`, or one CELL of the record (a 128-bit key). A kind that has
+cells gives one pure function, `part(record bytes, cell) -> digest | Absent`: a search in the mapped bytes. A
+reader's entry is valid when today's record gives the same digest for that cell; `Absent` is a value, so a
+name that was looked up and not found is a read like any other. Forward from a change: the changed record's
+readers (the drive's `Row.readers`) are each asked their cells; only a reader whose cell moved is dirty. At
+5,000 readers of one module that is 5,000 searches, about 1 ms of pool time; a posting by cell is a later
+step, only if a profile asks for it. One change to the read list's form, made once, all writers in the batch
+(rule 24).
+
+### Names at module grain (piece (e); replaces the lane's page where they differ)
+
+A name is resolved by walking LINKS over tables made from text. Nothing of another module is copied into a
+module's record, and no module waits for another unless a name can only come from a macro's output.
+
+1. TWO TABLES A MODULE. Its OUTLINE, from text alone (the file's items record): each declared name by
+   namespace, each `use` as a link (the written path, its rename, its visibility), each glob as a link, each
+   item-position macro call (its path, its input's digest), its `macro_rules!` in order, and `#[macro_use]`,
+   `#[path]` and cfg. No wait, ever. Its `ModuleScope`, ONLY for a module that has item-position macro calls:
+   the names those calls made once fully expanded (declarations, use links, glob links, modules,
+   `macro_rules!`, `#[macro_export]` macros), the textual macro scope at its end, and the solve's findings.
+   Key: the producer, the crate's context, the module's identity, its outline's digest. Reads: the cells it
+   looked up to resolve ITS CALLS' paths, and each `Expansion` by call key. A module with no such call has no
+   task (rule 77). A module's EXPLICIT TABLE is its outline and what its calls made.
+2. LOOKUP IS A FUNCTION, NOT A RECORD. `lookup(module, namespace, name, from)`: the outline (a declaration
+   answers; a use link is followed, segment by segment); else, when the module has item-position calls, what
+   they made (its `ModuleScope`); else its glob links, each followed as seen from this module, equal
+   definitions merged and different ones `Ambiguous` (an error only where used); else the preludes, by
+   today's rules. A lookup already on the walk's stack gives nothing (the least fixed point: a glob cycle; an
+   import cycle is `Unresolved`, named). The rules have ONE home (rule 30): the walk is the cell core deciding
+   one cell on demand over settled tables, not a second resolver (it can: an entry `decide(module,
+   namespace, name, layer)`, an index from bound name to items, the walk's stack for waiters, modules loaded
+   at first read; inside one module or group the core speculates and time-checks as today).
+   WHEN A `ModuleScope` IS NOT SETTLED YET (corrected 20:31 by the count on tempo: 73.7% of 144,679 modules
+   have calls, derives and attributes among them; a wait at every such read made cycles of up to 88 modules):
+   two kinds of lookup. One that DRIVES AN EXPANSION (a derive's, attribute's or bang macro's path) never
+   waits when it FINDS something: it is answered from the tables as they are, as rustc itself resolves, and
+   the unsettled module's cell is logged as a read of `Absent`. If that module settles without the name, the
+   read stands: every program rustc accepts (it refuses the rest, so there the speculative answer is the
+   final one). If it settles WITH the name, the reader's read moved: it reruns over settled tables, where the
+   rules give the answer and its ambiguity; a third rerun for one cell is refused, naming it (rule 18). Only
+   a macro path NOT FOUND waits, on the pending modules along its walk. A lookup of a TYPE or VALUE name by
+   `Imports` or a body waits for the `ModuleScope` of each module on its walk that has calls and lacks the
+   name in text: one direction only. Built-in attribute names are not looked up through modules while
+   solving (rustc makes one ambiguous with any other macro of its name, so in an accepted program the
+   built-in is the answer); that ambiguity is an `Imports` finding, checked once.
+3. READS ARE PER CELL. Every hop is a part read (table, (namespace, name), digest or `Absent`). A `pub fn`
+   added to a module moves exactly the askers that looked that name up there; a change that leaves a cell
+   equal moves nobody; a glob is not coarse.
+4. `Imports`, a leaf kind, one a module: its own use items resolved to final definitions (column RESOLVED),
+   its traits in scope (column TRAITS: declared, imported, `as _`; a glob's by a part read of the source's
+   TRAITS), and the findings (unresolved, private). What the module's bodies search first: one search for an
+   imported name. Materialised only for the module's own use items (tens a module), never a glob's names. It
+   reads outlines and `ModuleScope`s, never another `Imports`, so it is never in a cycle.
+5. WAITS AND GROUPS. Only `ModuleScope` tasks wait on each other, and only for a macro path NOT FOUND (point
+   2). A cycle of such waits, found by the drive as it runs, is one `Group`: its members' calls solved in one
+   cell core to quiet (the core as it is), keyed by the sorted members' identities and outline digests and
+   the crate's context; each member keeps its own record. Counted on tempo 20:29 under the first form of the
+   rule (a wait for any name absent from text): 254,139 distinct waits, 173,829 of them macro names, 696
+   cycles, the largest 88 modules (slatedb); and 0 bytes of today's 82.7 MB of scopes are glob names (129,707
+   glob edges, 8.8 MB). Owed under the corrected rule: macro paths not found from text, links and preludes
+   when pending calls are taken to have made nothing; the cycles among those; speculative answers the final
+   tables contradict (expected 0).
+6. `ExportedMacros`, its own kind, one a crate: the `#[macro_export]` macros in text (from outlines, no wait)
+   and those calls made (each `ModuleScope`'s column, by part read). A macro lookup at a crate's root answers
+   from text first; only a name absent there, in a crate with pending calls, waits on this.
+7. `CrateScope` stays as it is until this path gives equal answers on tempo; then it and the materialised
+   `Resolved` scopes are deleted (rule 30). It does not become an assembler: a parent's cell for `mod a` holds
+   a's IDENTITY, a's tables are found by name, and today's outline digest is in their key, never in the parent.
+8. WHY LINKS. A materialised glob copies its source's names into every importer (libc's names times its
+   importers; a prelude times its crate) and makes every export change of the source a change of every
+   importer. A link costs no bytes and no re-solve; its cost is hops at read time, bounded by `Imports`' one
+   search for explicit imports and a memo a job for the rest.
+9. FLOORS. A `pub fn` added: one outline (2 ms a MB), the cell checks of that module's askers (1 us each), the
+   re-checks of the askers of that name. A `use` added: one `Imports`, and that module's bodies whose cell
+   moved. Cold: no solve for a module without calls. Today: the whole crate re-solved; tempo's names 5.1 s.
+
+### Signatures (piece (d))
+
+One `Signature` is one head the checker asks for (one `heads::Want`: a trait with its members' fn signatures;
+an impl's fn its own), named by (file, item chain), its out the digest of the head records it makes. A body's
+source is its own text's hash alone; `around_bodies` goes. Checkout crates only: another crate's heads are
+covered by that crate's identity. FIRST CUT, marked coarse: a body reads its own file's `Surface` whole for
+what `around` covered (uses, `macro_rules!`, attributes); when (e) lands that read becomes the cells the body
+looked up. Until then an item added to a file re-checks that file's bodies.
+
+A RECORD HOLDS NOTHING ITS READ LIST DOES NOT COVER (ruled 20:36 on the red test's "types NOT checked"
+line): the crate's items row copied each entry's head hash while the scope's reads (the files' `Surface`)
+leave types out, so a type-only edit left the row stale and valid. The row keeps the item's identity (file,
+entry, chain) and its name-level facts; the head is read from TODAY's file record. Proof by test: scopes
+over texts differing only in a parameter's type, a return type and a bound give items records of equal
+bytes; the plant puts the head back.
+
+FACTS A BODY MAKES (the same stale-check class; found by the critic of run.md; each gets its red test before
+its fix): (i) HIDDEN TYPES: the type behind an `impl Trait` return or an `async fn`'s future, with what leaks
+(its auto traits; for code, its layout): a part `Hidden` of the owner's `BodyCheck` record, read by digest by
+whoever asked. (ii) CONST AND STATIC VALUES: kind `ConstValue`, read by the signatures whose types name it,
+by bodies, by code. (iii) ITEMS IN A BODY THAT THE CRATE SEES (an `impl`, a `#[macro_export]` macro): outline
+entries; the outline goes into a body whose tokens hold `impl` or `macro_export`, so the surface and
+`ImplBucket` see them. (iv) POSITIONS: a body whose expansion used `line!()` or `column!()` reads its item's
+place in the file's `Lines` record; a panic location is data bound from `Lines` when the program is placed;
+no code record holds an absolute line (rule 71). Tests owed first: a future that stops being `Send` reaches
+its caller; a const's value reaches `[u8; N]`; an impl removed inside a body is missed by its users.
+
+### The store under the command (piece (b))
+
+1. ONE STORE A USER, one root (`<home>/v2/store`). Every checkout and worktree reads and writes it: sharing
+   across worktrees is the store being one, not a chain of three. The store writes nothing in a checkout. The
+   old `shared/`, `own/` and a checkout's `.blaze/v2/packs/` are an old home: reported by name, rebuilt,
+   neither migrated nor deleted by the command.
+2. A NAMESPACE, NOT A PLACE. `Sharing::place` becomes the record's namespace: `PUBLIC` when every name in it
+   is public AND this machine may write it (a trusted builder); else `LOCAL`. On a developer's machine
+   everything computed is `LOCAL`; `PUBLIC` records arrive only verified, from an origin. `Place`, `Layered`'s
+   three stores and `Machine::Off` go.
+3. WHAT WAS THE CHECKOUT'S. Only the leaf table is about a checkout (path, stamp, content id): it and the
+   last answer's key for EACH request shape hang from one named root a checkout (`Driven::root`), named by a
+   digest of the checkout's path. Certificates, answers and pages are keyed by content and found by any
+   worktree with equal content. A root's name is the one place a digest of a machine's path stands; roots are
+   `LOCAL`, never sealed or published, and the put scan keeps paths out of shared namespaces (rule 25).
+4. NO HOME is a typed refusal naming `HOME` (rule 3): there is no second place.
+5. ONE DRIVER A PROCESS. `PlainPlace<D: Driver>` is generic (rule 78), tested on the simulation; the command
+   gives it the driver bstd lends: one new bstd seam, a driver rooted at a `Dir<ReadWrite>`, which submits and
+   polls on the command's backend, yields only completions of effects submitted through it, and refuses a
+   path outside its directory as `Fs` does. No second native driver in the command.
+6. IN PLACE. A get returns `&'m [u8]`, where `'m` borrows `Maps`: the command's one append-only owner of
+   mappings and of this command's own puts, made before the store and dropped after every reader. One
+   `unsafe`, inside `Maps`, its assumption stated (a mapping is never unmapped or moved while `Maps` lives; a
+   retired segment's file may be unlinked, its mapping stands). No lifetime cast at a call site.
+7. THE OPEN MAPS NOTHING. It reads the head and the manifest (as today: no format change; compaction keeps
+   at most `SEGMENTS_MOST` segments a namespace, and a store naming more than 64 is a finding). The main
+   thread's get maps a segment at its first probe, so a command whose certificate stands maps one or two.
+   Pool tasks read through the lock-free handle, which cannot map: every named segment is mapped ONCE, when a
+   request's first pool task is about to start. An unsealed segment of an earlier boot is length-checked at
+   its first probe and checked whole at its first hit, once a boot. A get probes segments largest first (a
+   key holds one value, so order changes no answer, and an old record is in the big segment); a root is a
+   name in the newest manifest, not a probe. `--stats` prints the open's time, segments mapped of named, and
+   probes a get. LATER, only when an after-restart profile names the store's page-ins: index runs apart from
+   payload segments, merged geometrically after the answer (at most four; one interpolated page a run);
+   durable and concurrent, so its own DST first.
+8. A RECORD RUN NATIVELY STAYS LOCAL. A `Script` record says how it was run; the sharing seam answers `LOCAL`
+   for one run through the native runner (D112), and so, by the public-reads rule, for everything that read it.
+
+### A body's owners, and what it waits for (ruled 20:07 to 20:31)
+
+Measured on the clone (runner 17): every body Needed every workspace member's `CrateScope` (about 1,400
+names): 51.6 s of main-thread "jobs made", 5.2 GB of need lists, one failed crate blocking 110,962 bodies,
+and any crate's name change invalidating every body. RULE: a body waits only for its file's OWNERS and their
+dependency closure, and reads only the scopes its check opened. OWNERS is a kept fact the machine computes
+from the module tree it already holds, never from scopes: owners(file) is the union of its parents' owners,
+a crate root adding itself; its read list is each parent's items record and each parent's owners; a parent
+that gains or loses a `mod` dirties that file's owners. Cold, it settles when every file reachable from the
+roots is OUTLINED (named and parsed, never resolved: the one barrier allowed); warm, there is none. Refused:
+waiting for every scope to settle (today's shape under a new name). Test: one crate's scope fails; bodies of
+crates that do not depend on it are checked and printed.
+
+### The bytes a task parses are the bytes its key names (ruled 20:05; in at 20:33)
+
+A task that reads a file by path hashes what it read; when that is not the content id in its key it stops
+with a typed `Changed`, files nothing, and the command refuses its answer naming the paths. No re-read, no
+retry (rules 3, 74, 80). Before this, an edit between the sweep and the task filed new text under the old
+id, in a store every worktree reads. Owed: the parser's entry takes the proof type, so it holds in every
+crate, not only in blaze-cli.

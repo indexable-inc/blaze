@@ -37,12 +37,6 @@ fn surfaces(w: &World) -> Result<Vec<(CrateItemKey, MemSurface<'static>)>, Strin
     Ok(out)
 }
 
-/// `fixtures::restricted`'s place in `fixtures::all`: CELLS GAP G1 (cells-core.md, runner 19):
-/// its `pub(in path)` naming no ancestor makes the cell core refuse the crate's load
-/// (`CellError::BadVisibility`) where the rule is one `RestrictedNotAncestor` error in the
-/// scope; skipped by name here until the cells write that error.
-const RESTRICTED: usize = 6;
-
 /// `fixtures::prelude`'s place in `fixtures::all`.
 const PRELUDE: usize = 8;
 
@@ -54,8 +48,8 @@ const NEGATIVE: usize = 14;
 #[test]
 fn every_resolved_scope_round_trips_through_its_record() {
     for (i, w) in fixtures::all().iter().enumerate() {
-        // PRELUDE: CELLS GAP G5 (an import under the preludes left unknown), as RESTRICTED.
-        if i == RESTRICTED || i == PRELUDE || i == NEGATIVE {
+        // PRELUDE: CELLS GAP G5 (an import under the preludes left unknown).
+        if i == PRELUDE || i == NEGATIVE {
             continue;
         }
         let solved = solve(w, None).unwrap_or_else(|e| panic!("fixture {i}: {e}"));
@@ -83,7 +77,7 @@ fn every_resolved_scope_round_trips_through_its_record() {
 fn record_facts_resolve_as_the_working_forms_do() {
     let mut through_records = 0usize;
     for (i, w) in fixtures::all().iter().enumerate() {
-        if w.roots.len() != 1 || i == RESTRICTED {
+        if w.roots.len() != 1 {
             continue;
         }
         let mut by_crate = surfaces(w).unwrap_or_else(|e| panic!("fixture {i}: {e}"));

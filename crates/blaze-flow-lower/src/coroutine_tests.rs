@@ -18,11 +18,9 @@ use blaze_typeck::{
 use crate::coroutine::{InteriorPlant, interior_planted};
 use crate::{AdtFacts, CalleeFacts, Facts, LoweredAsync, lower_async};
 
-/// Every ADT of the fixtures is a plain struct with no `Copy` impl, no lifetimes, needing drop;
-/// `Ready` is a `Future` (its impl below), and no other operand of an `.await` is.
-struct AsyncFacts {
-    ready: Option<PTy>,
-}
+/// Every ADT of the fixtures is a plain struct with no `Copy` impl, no lifetimes, needing drop.
+/// Nothing is said of futures: an `.await`'s future is the record's (`Checked::awaited`).
+struct AsyncFacts;
 
 impl Facts for AsyncFacts {
     fn adt(&self, _: ItemKey) -> Option<AdtFacts> {
@@ -39,9 +37,6 @@ impl Facts for AsyncFacts {
     }
     fn param_copy(&self, _: u32) -> bool {
         false
-    }
-    fn is_future(&self, ty: PTy) -> Option<bool> {
-        Some(self.ready == Some(ty))
     }
 }
 
@@ -135,7 +130,7 @@ fn case(inner: fn(&mut Bb) -> ExprId) -> Case {
     let s = b.semi(call);
     let root = b.block(&[s], None);
     let c = checked(&fx, &b, it.owner, root);
-    let facts = AsyncFacts { ready: adt_ty(&c, it.ready) };
+    let facts = AsyncFacts;
     Case { b, c, block, facts, it }
 }
 
@@ -256,7 +251,7 @@ fn a_moved_local_is_not_in_the_interior() {
     assert!(rc.is_some(), "the record names Rc<i32>");
     let got = interior_of(&k, InteriorPlant::None);
     assert_eq!(rc_not_in(&got, rc), Ok(()));
-    assert_eq!(got, vec![k.facts.ready.expect("Ready")], "the interior is the awaited future alone");
+    assert_eq!(got, vec![adt_ty(&k.c, k.it.ready).expect("Ready")], "the interior is the awaited future alone");
     std::println!("interior without the moved Rc: ok");
     let planted = interior_of(&k, InteriorPlant::EveryLocal);
     match rc_not_in(&planted, rc) {
@@ -276,10 +271,16 @@ fn a_moved_local_is_not_in_the_interior() {
 fn a_local_live_across_the_await_is_in_the_interior() {
     let k = case(live_across);
     let rc = adt_ty(&k.c, k.it.rc).expect("the record names Rc<i32>");
-    let ready = k.facts.ready.expect("Ready");
+    let ready = adt_ty(&k.c, k.it.ready).expect("Ready");
     let got = interior_of(&k, InteriorPlant::None);
     let mut want = vec![rc, ready];
     want.sort_unstable();
     assert_eq!(got, want, "the interior is the live Rc<i32> and the awaited Ready, sorted");
     std::println!("interior with the live Rc: {} types", got.len());
 }
+
+/// The whole path of an auto trait on an async block's future (async plan P13).
+mod send;
+
+/// An `.await` on a library future, held by the record's type (coroutine.rs `await_done`).
+mod await_operand;

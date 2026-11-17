@@ -10,6 +10,13 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+# Decision D105: every kind's task runner is in this crate today (work.rs, names.rs, macros.rs,
+# body_types.rs map inputs to records and verdicts to findings), so every row holds this crate's
+# own files (not its dependencies: each runner's library is in its row's closure) until the
+# runners move into their producers' crates (remote-read.md piece 6); then each name goes.
+[package.metadata.blaze]
+producer-own = ["expander", "lowering", "body-checker", "names", "code-builder"]
+
 [[bin]]
 name = "blaze"
 path = "src/main.rs"
@@ -18,6 +25,11 @@ doctest = false
 [dependencies]
 # The request machine, its records and keys, the line table and the profile.
 blaze-drive.workspace = true
+# The store under the command (D114 (b), store/plain_place.rs): blaze-cas's plain store, its
+# vocabulary (blaze-keyed's `Namespace`, `Tag`, `StoreError`), and the arena's index by key.
+blaze-cas.workspace = true
+blaze-keyed.workspace = true
+blaze-hash.workspace = true
 # The system, reached only through bstd: the files, the output, the host's core count, frames.
 # `requests`: bstd's `Http` alone (blaze-h1 over `Net`), for the shared cache's http origin.
 blaze-std = { workspace = true, features = ["requests"] }
@@ -95,6 +107,14 @@ fetch = ["dep:blaze-http"]
 # command that expands nothing does not run it; without it the binary still looks modules up.
 sandbox = ["blaze-proc-macro/runtime"]
 
+# build/producers.rs: each producer's source digest (decision D105), the sans-IO walk and its
+# inputs' types. By path: the workspace entry of blaze-ids turns on serde adapters. blaze-own's
+# `std` for `Heap::process`, the build step's own entry.
+[build-dependencies]
+blaze-producers = { path = "../blaze-producers" }
+blaze-own = { workspace = true, features = ["std"] }
+blaze-toml.workspace = true
+
 [dev-dependencies]
 # `check` and `control`: the sweep's simulation and its planted-bug control.
 blaze-sim.workspace = true
@@ -107,8 +127,6 @@ blaze-sha256.workspace = true
 # The HTTP origin's test publishes a signed origin (`read::publish`, behind `sign`) of segments
 # sealed by blaze-cas.
 blaze-remote = { workspace = true, default-features = false, features = ["sign"] }
-blaze-cas.workspace = true
-blaze-keyed.workspace = true
 
 [lints]
 workspace = true

@@ -22,16 +22,18 @@
 //! `lang_start::<T>`, `T` its `main`'s return type: [`Entry2::Rust`]. The builder makes the C
 //! entry that calls it (L1b); this file only names the two fns and `T`.
 //!
-//! The four starts ([`Entry2`]): bstd's hosted entry (a blaze edition, the appended
-//! `__blaze_entry`), a C `main` the program exports itself (`#![no_main]`), the Rust start, and
-//! the crate root's `fn main` called directly: a `#![no_core]` or `#![no_std]` root (no std, so
-//! no `lang_start` of the library's; such a root names its own start) or a blaze-edition root
-//! without the appended entry. The last is today's form, kept for those roots only; a Rust
-//! program with std never takes it.
+//! The four starts ([`Entry2`]): bstd's hosted entry (a blaze edition: the
+//! `bstd_hosted_start` that `std::main` makes of the root's `fn main`, D104), a C `main` the
+//! program exports itself (`#![no_main]`), the Rust start, and the crate root's `fn main`
+//! called directly: a program that links no `#[lang = "start"]` (a `#![no_core]` root, a
+//! `#![no_std]` root that writes no `extern crate std`, a program run with no library at
+//! all). Which one is decided from what the crate graph links ([`linked_lang_start`]), never from the edition
+//! alone; a Rust program that links std never takes the direct call.
 
 use std::{boxed::Box, string::String};
 
 use blaze_id::ItemKey as LibKey;
+use blaze_own::Alloc;
 use blaze_scope::resolve::Names;
 use blaze_typeck as tc;
 use blaze_typeck::PTy;
@@ -66,8 +68,8 @@ pub enum Entry2 {
     CMain(LibKey),
     /// A Rust program with std: through the library's `#[lang = "start"]`.
     Rust(RustStart),
-    /// The crate root's `fn main`, called directly: a `#![no_core]` or `#![no_std]` root, or a
-    /// blaze-edition root with no appended entry ([`through_lang_start`] is false for both).
+    /// The crate root's `fn main`, called directly: a program that links no `#[lang = "start"]`
+    /// ([`linked_lang_start`] is `None`).
     Direct(LibKey),
 }
 
@@ -82,22 +84,37 @@ impl Entry2 {
     }
 }
 
-/// Whether the program's crate (index 0) starts through `#[lang = "start"]` when it exports no
-/// entry of its own: a Rust edition (its `std` is Rust's, not bstd) with std linked (neither
-/// `#![no_core]` nor `#![no_std]`).
-pub fn through_lang_start(names: &Names<'_>) -> bool {
-    let Some(root) = names.crates().first() else { return false };
-    matches!(root.implicit.std, StdIs::Rust) && !root.root_attrs.no_core && !root.root_attrs.no_std
-}
-
-/// The item `#[lang = "start"]` declares, read from every crate's lang table (the names
-/// library's `tables.langs`, as [`super::index::Index::new`] gathers them; a proc-macro unit is
-/// never linked, so skipped). None is [`Front2Refusal::NoLangStart`] naming the crates looked
-/// in; two different items is [`Front2Refusal::Start`] naming both.
-pub fn lang_start(names: &Names<'_>) -> Result<LibKey, Front2Refusal> {
+/// The library item the program starts through when it exports no entry of its own: `Some`
+/// for [`Entry2::Rust`], `None` for [`Entry2::Direct`].
+///
+/// Rust's rule: a binary's `main` is run by the `start` lang item of the crates LINKED into it,
+/// and a crate links what it names: its extern prelude (its dependencies, and the `core` and
+/// `std` the Reference's "Preludes" add, less what `#![no_std]` and `#![no_core]` take away:
+/// "If the `no_std` attribute is specified, then the `std` crate is not added to the extern
+/// prelude"; blaze-scope graph.rs `externs` is the one reading of it) and each `extern crate`
+/// it writes; linking is transitive; a proc-macro unit is never linked. So:
+/// - crate 0 of a blaze edition (its `std` is bstd): `None`; its entry is exported (D104);
+/// - a `#[lang = "start"]` among the linked crates: `Some` (std's `rt::lang_start`);
+/// - none, and Rust's `std` linked: [`Front2Refusal::NoLangStart`] naming the crates looked
+///   in, never a direct call that would skip `rt::init` and `rt::cleanup`;
+/// - none, and no `std` linked (a `#![no_core]` root, a `#![no_std]` root without `extern
+///   crate std`, a program run with no library, as the ladder's shelf-less rungs): `None`;
+/// - two different items declared `#[lang = "start"]`: [`Front2Refusal::Start`] naming both.
+///
+/// `alloc` holds the walk's two lists for the call.
+pub fn linked_lang_start(names: &Names<'_>, alloc: Alloc<'_>) -> Result<Option<LibKey>, Front2Refusal> {
+    let crates = names.crates();
+    let Some(root) = crates.first() else { return Ok(None) };
+    if !matches!(root.implicit.std, StdIs::Rust) {
+        return Ok(None);
+    }
+    // The crates crate 0 links: the one reading of the link rule (linked.rs).
+    let linked = super::linked::Linked::of(names, &[0], alloc).map_err(|e| Front2Refusal::Front(super::FrontError::Roots(e)))?;
+    // The `#[lang = "start"]` items of the linked crates (the names library's `tables.langs`,
+    // as [`super::index::Index::new`] gathers them), in crate order.
     let mut found: Option<LibKey> = None;
-    for c in names.crates().iter() {
-        if c.implicit.proc_macro {
+    for (i, c) in crates.iter().enumerate() {
+        if !linked.links(i) {
             continue;
         }
         for l in c.tables.langs.iter() {
@@ -115,19 +132,24 @@ pub fn lang_start(names: &Names<'_>) -> Result<LibKey, Front2Refusal> {
             }
         }
     }
-    found.ok_or_else(|| Front2Refusal::NoLangStart { shelf: searched(names) })
+    let std_linked = names.graph().sysroot().std.is_some_and(|s| linked.links(s.index()));
+    match found {
+        Some(key) => Ok(Some(key)),
+        None if std_linked => Err(Front2Refusal::NoLangStart { shelf: searched(names) }),
+        None => Ok(None),
+    }
 }
 
-/// The Rust start of the root's `main` (`main` is its key, found by the caller): the library's
-/// `lang_start` and `main`'s return type, read from `main`'s head, made in `store` here. A
+/// The Rust start of the root's `main` (`main` is its key, found by the caller; `lang_start`
+/// the item [`linked_lang_start`] found): `main`'s return type, read from `main`'s head, made
+/// in `store` here. A
 /// `main` of a shape the Reference forbids is refused by name: parameters, generic parameters,
 /// an ABI other than Rust, `unsafe`. That `T: Termination` holds is the checker's question at
 /// `lang_start::<T>`, not answered here.
 ///
 /// The signature takes `store` and `keys` beside LADDER.md L1a's `(names, main)`: a `PTy` is an
 /// index into a type table, and only the program's store holds the one the back half reads.
-pub fn rust_start<'n>(names: &'n Names<'n>, main: LibKey, store: &mut Store<'n>, keys: &mut Keys) -> Result<RustStart, Front2Refusal> {
-    let lang_start = lang_start(names)?;
+pub fn rust_start<'n>(names: &'n Names<'n>, lang_start: LibKey, main: LibKey, store: &mut Store<'n>, keys: &mut Keys) -> Result<RustStart, Front2Refusal> {
     store.ensure(names, keys, Want::Fn(main)).map_err(|error| Front2Refusal::Lower(BodyError::Head { item: main, error }))?;
     let Some(head) = store.fns.get(&checker_of(main)) else {
         return Err(Front2Refusal::NoHead { function: shown(names, main).into_boxed_str() });

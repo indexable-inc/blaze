@@ -23,6 +23,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ar;
+pub mod descriptor;
 pub mod elf;
 pub mod image;
 pub mod layout;

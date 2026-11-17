@@ -154,9 +154,22 @@ pub fn v1_to_v2<'a>(view: CodeView<'_>, by: &dyn Declares, out: &mut AVec<'a, u8
         };
         r.outside(name);
     }
-    let sealed = seal(from_v1(r, alloc)?)?;
+    let mut e = from_v1(r, alloc)?;
+    declare(&mut e, by)?;
+    let sealed = seal(e)?;
     encode(&sealed, out);
     Ok(())
+}
+
+/// The start records' declarer: each fn they name is bound by this export (`main`,
+/// `lang_start`, a start piece), never followed by a walk; they name nothing else in the
+/// program, so any other target is refused by `declare`, by name.
+pub struct StartBound;
+
+impl Declares for StartBound {
+    fn declared(&self, t: Target) -> Option<Declare<'_>> {
+        (t.space == Space::Func).then_some(Declare { kind: DeclaredKind::Bound, item: 0, name: &[] })
+    }
 }
 
 /// Every member's unwind rows, made one blaze-code `Unwind` each from the rows in `rows` (which
@@ -203,7 +216,7 @@ pub fn export_optimized<'a>(program: &ProgramIn02<'_>, platform: Platform, out: 
     let mut made: AVec<'a, (Symbol, AVec<'a, u8>)> = Vec::with_capacity_in(start.records.len(), alloc);
     for (symbol, view) in start.views() {
         let mut bytes: AVec<'a, u8> = Vec::new_in(alloc);
-        v1_to_v2(view, &mut bytes, alloc).map_err(|error| ExportError::Record { symbol, error })?;
+        v1_to_v2(view, &StartBound, &mut bytes, alloc).map_err(|error| ExportError::Record { symbol, error })?;
         made.push((symbol, bytes));
     }
     let mut members: AVec<'_, Member02<'_>> = Vec::with_capacity_in(program.functions.len() + made.len(), alloc);

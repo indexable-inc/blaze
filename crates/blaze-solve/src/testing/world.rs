@@ -953,7 +953,7 @@ impl World {
                 let portable = Portable { nodes: &self.table.nodes, lists: &self.table.lists };
                 let fps: Vec<prefilter::Fingerprint> =
                     list.iter().map(|d| prefilter::fingerprint_impl(portable, self.impls[d].args)).collect();
-                let mut columns = blaze_own::Vec::new_in(Alloc::global());
+                let mut columns = blaze_own::Vec::new_in(blaze_own::testing::heap().alloc());
                 let stride = prefilter::columns_of(&fps, &mut columns);
                 let mut digest = 0x51u64;
                 for d in &list {

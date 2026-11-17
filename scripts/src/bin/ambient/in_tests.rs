@@ -526,7 +526,7 @@ fn renamed(value: &str) -> Option<&str> {
 /// The crates (by their path under crates/) on the rebuilt path: [`REBUILT_FROM`] and every
 /// workspace package it builds with, directly or through others.
 fn rebuilt_path(root: &Path) -> Result<BTreeSet<String>, TreeError> {
-    let (_, manifests) = tree_files(root);
+    let (_, manifests) = tree_files(root)?;
     let mut by_name: BTreeMap<String, String> = BTreeMap::new();
     let mut deps: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for parts in manifests.iter().filter(|it| !test_path(it)) {
@@ -661,6 +661,8 @@ pub(super) fn selftest() {
         let made = full.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&full, text));
         made.unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &format!("{path} is not written: {e}")));
     };
+    // The root workspace: what the counts read (tree_files).
+    put("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
     put("crates/a/Cargo.toml", "[package]\nname = \"a\"\n");
     put(
         "crates/a/src/lib.rs",

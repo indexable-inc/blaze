@@ -119,16 +119,22 @@ pub fn check_body_asked<'n, S: NamesSource<'n>>(
     asked: Option<&mut super::reads::Asked<'_>>,
 ) -> Result<tc::Checked<'static>, CheckFail> {
     let mut done = check_rounds(r, body, scope, count, asked)?;
+    // Its opaques' hidden types, for an auto trait asked by another body (front2 opaque_auto.rs).
+    super::opaque_auto::file(r, body, &done)?;
     let filed = done.file_out();
     let digest = ReadsDigest::of(&filed.reads, Alloc::global());
     drop(filed);
     r.store.reads.file(body.typeck.owner, digest)?;
+    // Its closures, for a body that names one outside its owner (front2 foreign_closures.rs).
+    let store = &mut *r.store;
+    store.closures.file(body.typeck.owner, &done, &mut store.tys);
     Ok(done)
 }
 
 /// [`check_body_asked`] for the one caller that files a clean check's list whole (`project.rs`:
-/// the body's facts): the `Checked`, its list and needs moved out beside it. Nothing is filed
-/// in the store: the caller holds the list.
+/// the body's facts): the `Checked`, its list and needs moved out beside it. Its read list is
+/// not filed in the store (the caller holds it); its closures are, as `check_body_asked` files
+/// them (front2 foreign_closures.rs).
 pub fn check_body_filed<'n, S: NamesSource<'n>>(
     r: &mut Records<'_, 'n, S>,
     body: &Body<'_>,
@@ -136,7 +142,27 @@ pub fn check_body_filed<'n, S: NamesSource<'n>>(
     count: Option<(&mut tc::Tally, &dyn tc::Clock)>,
     asked: Option<&mut super::reads::Asked<'_>>,
 ) -> Result<(tc::Checked<'static>, tc::Filed<'static>), CheckFail> {
-    let mut done = check_rounds(r, body, scope, count, asked)?;
+    check_body_filed_as(r, body, scope, count, asked, super::stalled_goals::Stalls::Gap)
+}
+
+/// [`check_body_filed`] with the check's entry for a stalled auto-trait goal named (front2
+/// stalled_goals.rs `Stalls`): `ProjectWorld::check_borrows` alone passes `Stalls::Decide`.
+pub fn check_body_filed_as<'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    body: &Body<'_>,
+    scope: &BodyScope<'_>,
+    count: Option<(&mut tc::Tally, &dyn tc::Clock)>,
+    asked: Option<&mut super::reads::Asked<'_>>,
+    stalls: super::stalled_goals::Stalls,
+) -> Result<(tc::Checked<'static>, tc::Filed<'static>), CheckFail> {
+    let mut done = super::check::check_rounds_as(r, body, scope, count, asked, stalls)?;
+    // Its opaques' hidden types, for an auto trait asked by another body (front2 opaque_auto.rs).
+    super::opaque_auto::file(r, body, &done)?;
     let filed = done.file_out();
+    // Its closures, for a body that names one outside its owner (front2 foreign_closures.rs):
+    // the same filing as `check_body_asked`'s, so a closure is found whichever path checked
+    // its owner, and the owner is never checked again for it (rule 77).
+    let store = &mut *r.store;
+    store.closures.file(body.typeck.owner, &done, &mut store.tys);
     Ok((done, filed))
 }

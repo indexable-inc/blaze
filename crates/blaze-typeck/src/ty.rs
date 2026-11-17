@@ -160,6 +160,12 @@ pub struct FulfillError {
     pub because: Option<crate::diag::Because>,
 }
 
+/// How many inference variables of each kind (type, integer, float, const, in that order)
+/// existed at one moment ([`TypeCtx::var_mark`]): a variable whose index is at or past its
+/// kind's count was made after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VarMark(pub [u32; 4]);
+
 /// The type tables, the inference table and the solver, as the driver uses them. Becomes the
 /// type context of blaze-ty over `rustc_type_ir::Interner` and the next solver's
 /// `FulfillmentCtxt`.
@@ -188,6 +194,14 @@ pub trait TypeCtx {
     fn resolve(&mut self, t: Ty) -> Result<Ty, CheckError>;
     /// Whether a type of `l`, resolved, still holds an inference variable.
     fn list_has_infer(&mut self, l: TyList) -> bool;
+    /// How many variables of each kind exist now: the mark [`TypeCtx::list_has_infer_since`]
+    /// compares with.
+    fn var_mark(&self) -> VarMark;
+    /// Whether a type of `l`, resolved, holds a type, integer, float or const variable made
+    /// after `mark` was taken (rustc's `fudge_inference_if_ok`: a variable made inside a probe
+    /// is gone after its rollback; one made before is the same variable after it). Region
+    /// variables are not counted, as `list_has_infer` does not count them.
+    fn list_has_infer_since(&mut self, l: TyList, mark: VarMark) -> bool;
     /// Makes `a` and `b` equal, binding variables. `Ok(false)`: they cannot be, and nothing was
     /// bound (the context rolls back its own partial work).
     fn unify(&mut self, a: Ty, b: Ty) -> Result<bool, CheckError>;

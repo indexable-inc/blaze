@@ -358,6 +358,35 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             };
             closures.push((e, kind, sig));
         }
+        // The stalled auto-trait goals (src/stalled.rs), each with the finding it becomes when it
+        // fails on the exact interior, made as a finding of `diags` is made below.
+        let mut stalled: Vec<crate::stalled::Stalled, Alloc<'a>> = Vec::with_capacity_in(self.stalled.len(), alloc);
+        for si in 0..self.stalled.len() {
+            let s = self.stalled[si];
+            let d = s.diag;
+            let ty = self.export(&mut ex, s.ty, d.at)?;
+            let found = match d.found {
+                Some(t) => Some(self.export(&mut ex, t, d.at)?),
+                None => None,
+            };
+            let at = self.range_of(d.at);
+            if at.end <= at.start {
+                return Err(CheckError::DiagWithoutPlace { code: d.code, name: d.name });
+            }
+            let because = match d.unmet {
+                Some((goal, leaf)) => {
+                    let goal = self.export_goal(&mut ex, goal, d.at)?;
+                    let leaf = match leaf {
+                        Some(l) => Some(self.export_goal(&mut ex, l, d.at)?),
+                        None => None,
+                    };
+                    Some(crate::diag::Because::Unmet { goal, leaf })
+                }
+                None => d.because,
+            };
+            let diag = Diag { code: d.code, at, expected: None, found, name: d.name, because };
+            stalled.push(crate::stalled::Stalled { trait_: s.trait_, ty, diag });
+        }
         let mut diags: Vec<Diag, Alloc<'a>> = Vec::with_capacity_in(self.diags.len(), alloc);
         let mut i = 0;
         // Exporting a diagnostic's types may add an E0282 diagnostic once; the loop reaches it.
@@ -482,11 +511,29 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         let mut promoted: Vec<crate::ids::ExprId, Alloc<'a>> = Vec::with_capacity_in(self.promoted.len(), alloc);
         promoted.extend_from_slice(&self.promoted);
+        // The future each `.await` holds while suspended (rules/async_fmt.rs `expr_await`):
+        // what the flow lowering's `.await` holds across its suspension (blaze-flow-lower
+        // coroutine.rs). A future not wholly known adds no finding here (the body's own
+        // diagnostics say why) and no row: the lowering refuses that `.await` by name.
+        let mut awaited: Vec<(crate::ids::ExprId, PTy), Alloc<'a>> = Vec::with_capacity_in(self.awaited.len(), alloc);
+        for i in 0..self.awaited.len() {
+            let (e, t) = self.awaited[i];
+            let n = self.diags.len();
+            let p = self.export(&mut ex, t, At::Expr(e))?;
+            if self.diags.len() == n {
+                awaited.push((e, p));
+            } else {
+                self.diags.truncate(n);
+            }
+        }
+        awaited.sort_unstable_by_key(|r| r.0);
         let (reads, needs) = self.reads.finish(alloc);
         Ok(Checked {
             suggests,
             hidden,
             promoted,
+            stalled,
+            awaited,
             types: ex.out,
             expr_ty,
             pat_ty,

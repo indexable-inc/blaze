@@ -13,22 +13,21 @@
 //!   read after), `&mut c` is refused: ONE finding, E0502, whose range covers `&mut c`.
 //! - `clean`: a move then a use of the new owner, nothing borrowed across a write: an empty
 //!   verdict, and not refused.
-//! - `with_closure`: a body with a closure: the lowering takes no closure body yet
-//!   (blaze-flow-lower `Form::Closure`), so the verdict is `refused` (Lower) with NO finding:
-//!   never a clean verdict for a body that was not checked.
+//! - `with_closure`: a body with a closure: the closure's body is checked as its own flow
+//!   (blaze-flow-lower `lower_closure`, front2 borrows_nested.rs) and the call of it is a
+//!   shared use of the closure value: an empty verdict, and not refused.
 //!
 //! Prints, per body, a line `borrows <name>: <findings> refused <refusal>`; the expected ones:
 //! "borrows moved: [E0382 at \"a\"] refused None", "borrows both: [E0502 at \"&mut c\"] refused
-//! None", "borrows clean: [] refused None", "borrows with_closure: [] refused Some(Lower(..
-//! Closure ..))". Needs the installed toolchain under `$HOME/.blaze/v2/toolchain`.
+//! None", "borrows clean: [] refused None", "borrows with_closure: [] refused None". Needs the
+//! installed toolchain under `$HOME/.blaze/v2/toolchain`.
 
 #![feature(allocator_api)]
 
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
-use blaze_ladder::front2::borrows::{BorrowRefused, BorrowVerdict};
+use blaze_ladder::front2::borrows::BorrowVerdict;
 use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
 use blaze_ladder::refusal::SourceFile;
-use blaze_flow_lower::Form;
 
 const EDITION: &str = "blaze-2026.11";
 
@@ -139,12 +138,10 @@ fn own_bodies_move_and_borrow_checked() {
     assert!(types.is_clean(), "clean's types: {types:?}");
     assert!(v.is_clean(), "clean: {v:?}");
 
-    // A form the lowering refuses: `refused`, never a finding and never clean.
+    // A body with a closure: the closure's body checked on its own; clean.
     let closure = find("with_closure");
     let (types, v) = world.check_borrows(closure, heap.alloc());
     println!("borrows with_closure: {}", shown(text_of(closure), &v));
     assert!(types.is_clean(), "with_closure's types: {types:?}");
-    assert!(v.findings.is_empty(), "with_closure: {v:?}");
-    assert!(matches!(v.refused, Some(BorrowRefused::Lower(r)) if r.form == Form::Closure), "with_closure: {v:?}");
-    assert!(!v.is_clean());
+    assert!(v.is_clean(), "with_closure: {v:?}");
 }

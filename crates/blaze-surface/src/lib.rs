@@ -72,6 +72,7 @@ mod proof;
 mod shape;
 mod through;
 mod through_scratch;
+pub mod builtin_attrs;
 pub mod tool_attrs;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -115,7 +116,7 @@ pub use crate::module_decls::{
     MacroRulesDecl, ModuleDeclsView, ModuleInfo, UseDecl,
 };
 pub use crate::module_scope::{
-    AnonImport, GlobEdge, ScopeBuilder, ScopeError, ScopeView, Site, TextualDef, TextualMark,
+    AnonImport, GlobEdge, RefusedWhy, ScopeBuilder, ScopeError, ScopeView, Site, TextualDef, TextualMark,
     Unresolved, UseSite, globs_digest, textual_digest, GLOBS_DOMAIN, TEXTUAL_DOMAIN,
 };
 pub use crate::names::{ModuleFile, ModuleFileView, TextualEntry, TextualEntryView};

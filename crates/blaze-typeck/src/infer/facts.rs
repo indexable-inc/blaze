@@ -1140,6 +1140,77 @@ impl<'a> FactCache<'a> {
                     self.nodes.push(K::Coroutine(SDef(crate::coroutine_id::coroutine_def(owner, ordinal)), SList { start, len: 2 }));
                     Some(t)
                 }
+                // A closure of the defining body (`fn f() -> impl Fn(u8) -> u8 { |x| x }`): the
+                // term a body makes for it (infer/mod.rs `TyView::ClosureOf`): def from its
+                // identity, args `[owner args.., kind, rust-call sig, ()]`, its kind and
+                // signature from the owner's check (`Question::Closure`). Its `args` are the
+                // defining fn's own parameters (writeback writes them so), the parameters the
+                // facts are in, so no substitution; any other `args` is refused by name.
+                PNode::Closure { owner, ordinal, args } => {
+                    let mut identity = true;
+                    for i in args.range() {
+                        let p = h.types.list_slot(i as usize).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))?;
+                        identity &= matches!(h.types.node(p).map_err(Stop::from)?, PNode::Param(j) if j as usize == i as usize - args.start as usize);
+                    }
+                    if !identity {
+                        return Err(CheckError::Unported("an opaque's hidden closure at arguments other than its owner's own").into());
+                    }
+                    let cq = Question::Closure(owner, ordinal);
+                    let Some(facts) = reads.closure(owner, ordinal)? else {
+                        return Err(CheckError::Malformed(Malformed::BodyTypeInRecord(cq)).into());
+                    };
+                    let hc = self.table(q, h.types);
+                    let mut all: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(args.len as usize + 3, self.alloc);
+                    for i in args.range() {
+                        let p = h.types.list_slot(i as usize).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))?;
+                        all.push(self.ty(hc, p)?);
+                    }
+                    // The kind: the solver's `CLOSURE_FN*` value as a `usize` constant.
+                    let kind = match facts.kind {
+                        crate::ty::ClosureKind::Fn => blaze_solve::term::CLOSURE_FN,
+                        crate::ty::ClosureKind::FnMut => blaze_solve::term::CLOSURE_FN_MUT,
+                        crate::ty::ClosureKind::FnOnce => blaze_solve::term::CLOSURE_FN_ONCE,
+                    };
+                    let k = STy(self.nodes.len() as u32);
+                    self.nodes.push(K::ConstValue(blaze_solve::term::ValTy::Uint(uint(UintTy::Usize)), u128::from(kind)));
+                    all.push(k);
+                    // The rust-call signature (`rust_call_sig`): `fn((inputs..,)) -> output`.
+                    let fc = self.table(cq, facts.types);
+                    let PNode::FnPtr(io, _) = facts.types.node(facts.sig).map_err(Stop::from)? else {
+                        return Err(CheckError::Malformed(Malformed::NoRecord(cq)).into());
+                    };
+                    let Some(last) = io.len.checked_sub(1) else {
+                        return Err(CheckError::Malformed(Malformed::NoRecord(cq)).into());
+                    };
+                    let mut ins: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(last as usize, self.alloc);
+                    let mut out = None;
+                    for (n, i) in io.range().enumerate() {
+                        let p = facts.types.list_slot(i as usize).ok_or(CheckError::Malformed(Malformed::NoRecord(cq)))?;
+                        let s = self.ty(fc, p)?;
+                        if n as u32 == last { out = Some(s) } else { ins.push(s) }
+                    }
+                    let out = out.ok_or(CheckError::Malformed(Malformed::NoRecord(cq)))?;
+                    let start = self.lists.len() as u32;
+                    self.lists.extend_from_slice(&ins);
+                    let tupled = STy(self.nodes.len() as u32);
+                    self.nodes.push(K::Tuple(SList { start, len: last }));
+                    let start = self.lists.len() as u32;
+                    self.lists.push(tupled);
+                    self.lists.push(out);
+                    let sig = STy(self.nodes.len() as u32);
+                    self.nodes.push(K::FnPtr(SList { start, len: 2 }, blaze_solve::term::FnPtrHeader::RUST));
+                    all.push(sig);
+                    // The upvars: `()`, as `TyView::ClosureOf` makes them (the wiring's "Known limit").
+                    let start = self.lists.len() as u32;
+                    let unit = STy(self.nodes.len() as u32);
+                    self.nodes.push(K::Tuple(SList { start, len: 0 }));
+                    all.push(unit);
+                    let start = self.lists.len() as u32;
+                    self.lists.extend_from_slice(&all);
+                    let t = STy(self.nodes.len() as u32);
+                    self.nodes.push(K::Closure(SDef(crate::coroutine_id::closure_of_def(owner, ordinal)), SList { start, len: all.len() as u32 }));
+                    Some(t)
+                }
                 _ => {
                     let c = self.table(q, h.types);
                     Some(self.ty(c, h.ty)?)
@@ -1162,8 +1233,14 @@ impl<'a> FactCache<'a> {
         d ^= digest("blaze-typeck opaque bound supertraits", &supers_read);
         if let Some(h) = hidden {
             d ^= digest("blaze-typeck opaque hidden", &reads.digest(q)?);
-            if let PNode::Coroutine { owner, ordinal, .. } = h.types.node(h.ty).map_err(Stop::from)? {
-                d ^= digest("blaze-typeck opaque hidden coroutine", &reads.digest(Question::Coroutine(owner, ordinal))?);
+            match h.types.node(h.ty).map_err(Stop::from)? {
+                PNode::Coroutine { owner, ordinal, .. } => {
+                    d ^= digest("blaze-typeck opaque hidden coroutine", &reads.digest(Question::Coroutine(owner, ordinal))?);
+                }
+                PNode::Closure { owner, ordinal, .. } => {
+                    d ^= digest("blaze-typeck opaque hidden closure", &reads.digest(Question::Closure(owner, ordinal))?);
+                }
+                _ => {}
             }
         }
         let row = OpaqueRow { bounds: Span::of(&self.preds, start), hidden: hidden_ty, por: self.end(por), digest: d };

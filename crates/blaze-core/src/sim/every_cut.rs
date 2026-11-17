@@ -307,7 +307,8 @@ pub enum Refused {
     InFlight { after: usize, effects: usize },
     /// A moment with a mapping for writing held, which a crash folds.
     MappedForWriting { after: usize },
-    /// A moment with directories made, which the rebuilt disk would not hold.
+    /// A moment with directories made, or a directory's change of a name not synced, which the
+    /// rebuilt disk would not hold.
     DirectoriesMade { after: usize },
     /// A step's poll told a completion of another effect, or more than one.
     NotOneAtATime { step: &'static str, tag: Tag },
@@ -403,6 +404,8 @@ fn copy_named(named: &Named) -> Named {
         Named::Moved { from, to, was } => {
             Named::Moved { from: from.clone(), to: to.clone(), was: was.as_ref().map(copy_file) }
         }
+        Named::MadeDir { dir } => Named::MadeDir { dir: dir.clone() },
+        Named::RemovedDir { dir } => Named::RemovedDir { dir: dir.clone() },
     }
 }
 
@@ -509,7 +512,9 @@ impl Steps<'_> {
         if !self.sim.drawn.is_empty() {
             return Err(Refused::MappedForWriting { after });
         }
-        if self.sim.made_under(&DirName::Root).next().is_some() {
+        if self.sim.made_under(&DirName::Root).next().is_some()
+            || self.sim.names.iter().any(|named| named.dir_changed().is_some())
+        {
             return Err(Refused::DirectoriesMade { after });
         }
         for (name, file) in self.sim.files.iter() {
@@ -822,6 +827,9 @@ fn left_by(disk: &DiskCopy, files: &[FileCut], undone: &[bool]) -> AfterCrash {
                 if let Some(was) = was {
                     put(&mut left, put_back(to, was));
                 }
+            }
+            Named::MadeDir { .. } | Named::RemovedDir { .. } => {
+                unreachable!("a moment holding a directory's change of a name is refused at `Steps::keep` (Refused::DirectoriesMade)")
             }
         }
     }

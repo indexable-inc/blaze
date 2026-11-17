@@ -296,6 +296,7 @@ pub(crate) fn macro_digest(src: Option<MacroSrc<'_>>) -> ContentId {
                 MacroBody::BuiltinFn(name) => h.update(&[2]).part(name.as_bytes()),
                 MacroBody::BuiltinOther(shape) => h.update(&[3, shape.byte()]),
                 MacroBody::Proc { kind, helpers } => h.update(&[4, kind.byte()]).part(helpers.as_bytes()),
+                MacroBody::BuiltinDerive { helpers } => h.update(&[5]).part(helpers.as_bytes()),
             };
             h.id(&module.0).update(&[u8::from(export), u8::from(local_inner)]);
         }

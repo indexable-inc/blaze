@@ -60,6 +60,7 @@ impl Default for Buffers {
                 messages: Vec::new_in(alloc),
                 keys: Vec::new_in(alloc),
                 names: Vec::new_in(alloc),
+                file_names: crate::names_digest::file_names_digest("", &[]),
                 own_flags: ItemFlags::NONE,
                 flags: ItemFlags::NONE,
             },
@@ -76,13 +77,14 @@ std::thread_local! {
 impl blaze_mem::scratch::Shelved for Buffers {
     fn empty(&mut self) {
         let Buffers { out, working } = self;
-        let Outline { items, attrs, file_attrs, errors, messages, keys, names, own_flags, flags } = out;
+        let Outline { items, attrs, file_attrs, errors, messages, keys, names, file_names, own_flags, flags } = out;
         items.clear();
         attrs.clear();
         errors.clear();
         messages.clear();
         keys.clear();
         names.clear();
+        *file_names = crate::names_digest::file_names_digest("", &[]);
         *file_attrs = AttrSpan::default();
         *own_flags = ItemFlags::NONE;
         *flags = ItemFlags::NONE;

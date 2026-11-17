@@ -155,6 +155,12 @@ pub struct Maps {
     /// [`super::const_qpath::eval_asked`], which `check::eval_len` calls. A value is in
     /// `const_bits` and a refusal in `anon_failed`, under the leaf's need key.
     pub qpaths: core::cell::RefCell<super::const_qpath::Table>,
+    /// The inherent constant leaves the type builder asked for (`Self::MAX_SIZE`,
+    /// `InlineExtension::MAX`: [`Heads::inherent_leaves`]), each one's state and type;
+    /// answered by [`super::const_inherent::eval_asked`] (`check::eval_len`) or
+    /// [`super::const_inherent::first`] (the evaluator's work list). A value is in
+    /// `const_bits` and a refusal in `anon_failed`, under the leaf's need key.
+    pub inherents: core::cell::RefCell<super::const_inherent::Table>,
     /// Each item's const generic parameters (index, declared type), sorted by index: a
     /// struct's, enum's, union's, trait's and alias's own (made with its head, what
     /// [`Heads::const_params`] reads), an impl's own, and a fn's with its container's first
@@ -203,6 +209,9 @@ impl Heads for Maps {
     }
     fn qpath_ty(&self, need: LibKey) -> Option<PNode> {
         self.qpaths.borrow().ty(need)
+    }
+    fn inherent_leaves(&self) -> Option<&core::cell::RefCell<super::const_inherent::Table>> {
+        Some(&self.inherents)
     }
     fn adt_generics(&self, adt: LibKey) -> Option<(u32, &[Option<PTy>])> {
         self.generics.get(&adt).map(|(g, d)| (*g, &d[..]))
@@ -481,6 +490,9 @@ pub struct Store<'n> {
     /// `impl Future`), by its key ([`super::keys::opaque_key`]): its fn and its index. Its
     /// bounds are in `preds` under the same key, with the opaque type as `Self`.
     pub opaques: HashMap<ItemKey, (ItemKey, u32), Global>,
+    /// The hidden types of the opaques defined by the bodies checked clean in this command,
+    /// and the running check's leak list ([`super::opaque_auto`]).
+    pub hidden: super::opaque_auto::HiddenTable<'static>,
     /// The items declared inside the bodies lowered so far, kept in the command's frame: a
     /// local item's head is made from its row ([`super::locals`]).
     pub locals: super::locals::Locals<'n>,
@@ -496,6 +508,10 @@ pub struct Store<'n> {
     /// Each body checked clean in this run: its read list's digest, by owner, filed where the
     /// check finished (front2 body_reads.rs); the list itself is dropped there.
     pub reads: super::body_reads::Digests,
+    /// Each closure of each body checked clean in this run (its kind and signature, in `tys`),
+    /// filed beside `reads`: what the world answers a closure of ANOTHER body from
+    /// ([`super::foreign_closures`]).
+    pub closures: super::foreign_closures::ClosureRows<Global>,
 }
 
 /// A trait's clauses on `Self` and its associated types with their keys and defaults (in the
@@ -557,20 +573,12 @@ pub(super) fn anon_params(v: &View<'_>, base: u32, out: &mut Vec<(lf::TypeId, u3
             out.push((t, base + out.len() as u32));
             for &b in v.rows(bounds)? {
                 if let lf::Bound::Trait { ty, .. } = lf::Bound::decode(b)? {
-                    // The path (its type arguments are its children), then its bindings' types.
-                    kids.push(ty);
-                    if let lf::TypeRef::Path(p) = v.ty(ty)? {
-                        for &sn in v.segments(v.path(p)?)? {
-                            let s = lf::Segment::decode(sn)?;
-                            if !s.has_args || s.parenthesized {
-                                continue;
-                            }
-                            for &a in v.rows(s.args)? {
-                                if let lf::GenericArg::AssocType { ty: bound_ty, .. } = lf::GenericArg::decode(a)? {
-                                    kids.push(bound_ty);
-                                }
-                            }
-                        }
+                    // The path's type arguments, then its bindings' types; an associated type
+                    // bound (`Error: Into<E>`) holds no type of the path: its bounds are
+                    // clauses lowered by `Builder::bound` (bound_kids.rs). A bound that is no
+                    // path is walked as a type.
+                    if !super::bound_kids::bound_path_kids(v, ty, &mut kids)? {
+                        kids.push(ty);
                     }
                 }
             }
@@ -637,9 +645,10 @@ fn params(tys: &mut PortableTys<'_>, from: u32, to: u32, consts: &[(u32, PTy)]) 
 /// The generic parameters of `v`'s item from index `base` (the Reference, "Generic
 /// parameters"): each type and const parameter by name into `ps`, and each const parameter's
 /// index and declared type into `consts` (its type is read in the item's module with no
-/// parameters in scope: the Reference, "Const generics": "The only allowed types of const
-/// parameters are `u8` .. `usize`, `char` and `bool`", none of which names a parameter).
-/// Their count.
+/// parameters in scope: a const parameter's type may not name one, E0770). The type is any
+/// the pinned core's `ConstParamTy_` impls can cover (integers, `char`, `bool`, a struct or
+/// enum, tuples and arrays of those, `&T`, `&str`, `&[T]`: [`super::const_param_ty::admits`],
+/// which refuses every other type by name). Their count.
 pub(super) fn own_generics<'n, S: NamesSource<'n>>(b: &Builder<'_, Maps, S>, tys: &mut PortableTys<'_>, module: LibKey, v: &View<'_>, base: u32, ps: &mut Vec<(Name, u32), Global>, consts: &mut Vec<(u32, PTy), Global>) -> Result<u32, Why> {
     let n = param_names(v, base, ps, Consts::Keep)?;
     let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[] };
@@ -651,14 +660,13 @@ pub(super) fn own_generics<'n, S: NamesSource<'n>>(b: &Builder<'_, Maps, S>, tys
             lf::GenericParam::Type { .. } => i += 1,
             lf::GenericParam::Const { ty, .. } => {
                 let t = b.ty(tys, &env, v, ty)?;
-                match tys.view().get(t) {
-                    Some(PNode::Int(_) | PNode::Uint(_) | PNode::Bool | PNode::Char) => {}
-                    // A fieldless enum (`const ORD: AtomicOrdering`): const_enum.rs.
-                    _ if super::const_enum::accepts(b.heads, tys, t) => {}
-                    _ => {
-                        let r = v.site(v.row_range(list.start + k as u32)?)?;
-                        return Err(Why::Unsupported("a const parameter whose type is not an integer, `char` or `bool` (`adt_const_params`)", r));
-                    }
+                // By the type's shape (const_param_ty.rs): `const ASSUME: Assume` (a struct,
+                // core's `TransmuteFrom`), `const ORD: AtomicOrdering` (a fieldless enum),
+                // `const FIELDS: &'static str`. A VALUE of a non-scalar type is refused where it
+                // is read (types.rs `const_term`), never here.
+                if let Err(no) = super::const_param_ty::admits(tys, t, blaze_own::Alloc::global()) {
+                    let r = v.site(v.row_range(list.start + k as u32)?)?;
+                    return Err(Why::Unsupported(no.text(), r));
                 }
                 consts.push((i, t));
                 i += 1;
@@ -764,10 +772,12 @@ impl<'n> Store<'n> {
             ctors: HashMap::new_in(Global),
             statics: HashMap::new_in(Global),
             opaques: HashMap::new_in(Global),
+            hidden: super::opaque_auto::HiddenTable::new_in(Alloc::global()),
             locals: super::locals::Locals::new(frame),
             lives: super::lifetimes::Lives::new_in(Alloc::global()),
             sources: None,
             reads: super::body_reads::Digests::new(),
+            closures: super::foreign_closures::ClosureRows::new_in(Global),
         }
     }
 
@@ -809,15 +819,8 @@ impl<'n> Store<'n> {
     fn step<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, want: Want) -> Result<Step, HeadError> {
         let key = want.key();
         let ck = checker_of(key);
-        let done = match want {
-            Want::Head(k) => self.maps.generics.contains_key(&k) || self.maps.traits.contains_key(&k) || self.maps.aliases.contains_key(&k) || self.maps.trait_aliases.contains_key(&k),
-            Want::Adt(_) => self.adts.contains_key(&ck),
-            Want::Impl(_) => self.impls.contains_key(&ck),
-            Want::Fn(_) => self.fns.contains_key(&ck),
-            Want::Members(_) => self.preds.contains_key(&ck),
-            // Made, or refused as its own gap (`member_fn_head`).
-            Want::MemberFn(_, f) => self.fns.contains_key(&f) || self.fn_gaps.contains_key(&f),
-        };
+        // The one test the world's answers share (front2 by_origin.rs `Store::made`).
+        let done = self.made(want);
         if done {
             return Ok(Step::Done);
         }
@@ -1016,6 +1019,9 @@ impl<'n> Store<'n> {
         if written & sig::UNSAFE != 0 {
             flags |= tc::TraitFlags::UNSAFE;
         }
+        // `#[rustc_coinductive]` (core's `Sized`, `MetaSized`, `PointeeSized`): a cycle through
+        // the trait's own steps holds (library/core/src/marker.rs: "`Sized` being coinductive,
+        // despite having supertraits, is okay as there are no user-written impls").
         let mut ps = Vec::new_in(Global);
         let mut cs = Vec::new_in(Global);
         let b = Builder { resolver: Paths { names }, heads: &self.maps };
@@ -1120,6 +1126,13 @@ impl<'n> Store<'n> {
                 let lib = keys.library_in(names, trait_).ok_or(Why::Program(format!("the supertrait {trait_:?} has no library key").into_boxed_str(), whole))?;
                 supers.push((lib, args));
             }
+        }
+        // A trait's `Self` is `MetaSized` unless its header states a sizedness (self_size.rs;
+        // core's `Write::write_fmt` needs it for its block impl's `W: ?Sized` at `W = Self`): a
+        // clause of every member's env, as `Self: Trait` is; not a supertrait (vtables).
+        if let Some(meta) = super::self_size::implied_self_size(&self.maps, key, &supers, self.sized)? {
+            let self_list = intern_list(&mut self.tys, &[me])?;
+            inherited.push(PClause::Trait { trait_: self.maps.checker(meta), args: self_list });
         }
         self.maps.supers.insert(key, supers);
         let mut assoc = Vec::new_in(Global);

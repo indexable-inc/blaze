@@ -54,7 +54,7 @@
 
 use blaze_lower::head;
 use blaze_own::Alloc;
-use blaze_scope::resolve::Names;
+use super::source::NamesSource;
 use blaze_typeck::ItemKey;
 
 use super::check::Records;
@@ -135,15 +135,17 @@ pub fn local_name<'n>(store: &Store<'n>, key: ItemKey) -> Result<Option<&'n str>
 /// body: read from its own text's attribute rows, as its `#[link_name]` is. `Ok(false)` for
 /// every item no such block declares and for a declaration with no `#[lang]`. `alloc` holds
 /// the signature's lowering, dropped on return.
-pub fn declares(names: &Names<'_>, store: &Store<'_>, key: ItemKey, alloc: Alloc<'_>) -> Result<bool, Refused> {
+pub fn declares<'n, S: NamesSource<'n>>(names: S, store: &Store<'_>, key: ItemKey, alloc: Alloc<'_>) -> Result<bool, Refused> {
     let Some(f) = store.locals.foreign(key) else { return Ok(false) };
     if f.kind != ForeignKind::Fn {
         return Ok(false);
     }
     let local = store.locals.head(key).ok_or(Refused::NoHead)?;
     let krate = names.crate_of(local.lib).ok_or(Refused::NoCrate)?;
-    let atoms = names.krate(krate).cfg.atoms();
-    let sig = blaze_lower::lower_signature(local.text, names.edition(krate), &mut CrateCfg(atoms), alloc).map_err(|_| Refused::Attrs)?;
+    // Over records an unanswered fact is in the source's log; the crate is refused here.
+    let atoms = names.cfg_atoms(krate).ok_or(Refused::NoCrate)?;
+    let edition = names.edition_of(krate).ok_or(Refused::NoCrate)?;
+    let sig = blaze_lower::lower_signature(local.text, edition, &mut CrateCfg(atoms), alloc).map_err(|_| Refused::Attrs)?;
     let v = sig.view();
     for &n in v.rows(v.list(head::ATTRS)).map_err(|_| Refused::Attrs)? {
         let a = v.attr(n).map_err(|_| Refused::Attrs)?;
@@ -160,7 +162,7 @@ pub fn declares(names: &Names<'_>, store: &Store<'_>, key: ItemKey, alloc: Alloc
 /// has its handler: the program's `#[panic_handler]` fn (not generic: no arguments). `None`
 /// for every other item, and for a declaration [`reached`] refused (it is then in no table,
 /// and its caller is refused with that cause).
-pub fn bound(names: &Names<'_>, index: &Index<'_>, store: &Store<'_>, item: ItemKey, alloc: Alloc<'_>) -> Option<ItemKey> {
+pub fn bound<'n, S: NamesSource<'n>>(names: S, index: &Index<'_>, store: &Store<'_>, item: ItemKey, alloc: Alloc<'_>) -> Option<ItemKey> {
     match declares(names, store, item, alloc) {
         Ok(true) => index.lang(HANDLER_ROW).map(checker_of),
         Ok(false) | Err(_) => None,

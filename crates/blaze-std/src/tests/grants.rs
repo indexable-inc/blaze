@@ -74,11 +74,6 @@ macro_rules! manifest {
 
 // The programs, each a `main` of another shape.
 
-fn everything(cx: &Cx, io: Io) -> Result<(), Error> {
-    io.need_out()?.line(cx, "everything")?;
-    Ok(())
-}
-
 fn streams(cx: &Cx, out: Out, err: Out, args: Args, _clock: Clock) -> Result<(), Error> {
     out.line(cx, "to out")?;
     err.line(cx, "to err")?;
@@ -124,12 +119,7 @@ fn launch_cat(io: &Io, fd3: Option<&[u8]>) -> (Status, StdString, bool) {
 
 #[test]
 fn every_shape_of_main_is_filled_and_runs() {
-    // Started with no spec: an `Io` is the process's world, as before grants.
-    let io = Io::sim(1);
     let mut said = StdString::new();
-    let status = launch_in(manifest!(io: Io), None, io.clone(), &mut said, blaze_own::testing::heap().shared(),crate::launch_body!(everything; io: Io));
-    assert_eq!((status, said.as_str(), written(&io).as_str()), (Status::OK, "", "everything\n"));
-
     // What fills itself needs no spec; `out` and `err` are the two streams.
     let io = Io::sim(2);
     let manifest = manifest!(out: Out, err: Out, args: Args, clock: Clock);
@@ -181,6 +171,18 @@ fn the_manifest_is_data_printed_when_asked() {
          {\"fills_itself\":false,\"kind\":\"dir\",\"name\":\"data\",\"write\":false}],\"version\":1}\n"
     );
     assert_eq!(<Dir<ReadOnly> as Grant>::KIND, Kind::Dir { write: false });
+}
+
+/// D104: the owner's hello, `fn main(cx: &Cx, out: Out)`, says in its manifest that it takes
+/// standard output and nothing else: one parameter `out` of kind `out`, which fills itself. A
+/// `main` that still took a whole world could say nothing of what it reaches.
+#[test]
+fn the_hello_world_manifest_is_out_alone() {
+    let manifest = manifest!(out: Out);
+    assert_eq!(manifest.params, &[Param::new("out", Kind::Out)]);
+    assert!(Kind::Out.fills_itself());
+    let json = manifest.write(a());
+    assert_eq!(json.as_str(), "{\"params\":[{\"fills_itself\":true,\"kind\":\"out\",\"name\":\"out\"}],\"version\":1}");
 }
 
 /// Each refusal: `main` never runs, nothing is written, the status is `REFUSED`, and the words
@@ -292,7 +294,7 @@ fn plan(tape: &Tape) -> RunSpec<LaunchAlloc> {
     let mut spec = RunSpec::defaults(args, env, text("/w"), a());
     const NAMES: [&str; 4] = ["data", "api", "vars", "io"];
     for _ in 0..tape.below(5, "grants") {
-        let scope = match tape.below(5, "scope") {
+        let scope = match tape.below(6, "scope") {
             // A folder is a bstd path (relative, plain): the reader refuses any other.
             0 => dir_scope(tape.pick(&["fixtures", "a/b_2", "data.d"], "path").expect("paths"), tape.coin("write")),
             1 => Scope::Net { at: text("example.com:8080"), listen: tape.coin("listen") },
@@ -301,8 +303,9 @@ fn plan(tape: &Tape) -> RunSpec<LaunchAlloc> {
                 names.push(text("CC"));
                 Scope::Env { names }
             }
-            3 => Scope::Everything,
-            _ => Scope::Whole { capability: text("rng") },
+            3 => Scope::Whole { capability: text("fs"), device: None },
+            4 => Scope::Whole { capability: text("camera"), device: Some(text("front")) },
+            _ => Scope::Whole { capability: text("rng"), device: None },
         };
         let mut one = granted(tape.pick(&NAMES, "name").expect("names"), scope);
         if tape.coin("provider") {

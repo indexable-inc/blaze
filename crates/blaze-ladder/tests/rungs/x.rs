@@ -133,6 +133,30 @@ pub fn x_rungs(front2: &Path) -> Vec<String> {
     names
 }
 
+/// Every WHOLE std rung's directory name (`s<digit>-*`: std programs, run by the example
+/// runner's census when its prefix starts with `s`), sorted; a folder not whole yet is named on
+/// standard error and left out, as in [`x_rungs`].
+#[allow(dead_code)]
+pub fn std_rungs(front2: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(front2).expect("the ladder's front2 directory") {
+        let entry = entry.expect("a directory entry");
+        let name = entry.file_name().into_string().expect("a UTF-8 rung name");
+        let dir = entry.path();
+        let std_rung = name.len() > 2 && name.as_bytes()[0] == b's' && name.as_bytes()[1].is_ascii_digit() && name.as_bytes()[2] == b'-';
+        if !std_rung || !dir.is_dir() {
+            continue;
+        }
+        if ["Cargo.toml", "expected", "src/main.rs"].iter().all(|f| dir.join(f).is_file()) {
+            names.push(name);
+        } else {
+            eprintln!("front2_rungs: {name} is not whole yet (Cargo.toml, expected, src/main.rs): left out");
+        }
+    }
+    names.sort();
+    names
+}
+
 /// `x0-*` are the runnable twins (no_core, edition 2024, success is status 42); `x-*` the same
 /// checks on the blaze edition over the real `core` (success is 0).
 pub fn family(rung: &str) -> &'static str {

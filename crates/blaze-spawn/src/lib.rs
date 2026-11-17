@@ -23,6 +23,8 @@
 extern crate std;
 
 pub mod answer;
+/// The digests a request and an answer hold: one home for the proc-macro route and the sandbox.
+pub mod digest;
 pub mod executor;
 pub mod request;
 
@@ -30,6 +32,7 @@ pub mod request;
 mod tests;
 
 pub use answer::{AnswerError, Seen, SpawnAnswer, Status, Written};
+pub use digest::{TreeError, file_digest, tree_digest};
 pub use executor::{Executor, Files, NoSandbox, Off, SpawnRefused};
 pub use request::{
     Input, MACHINE_V1, Machine, Personality, RequestError, SpawnRequest, Tool, fixed_env,

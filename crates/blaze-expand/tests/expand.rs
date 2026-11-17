@@ -1097,6 +1097,22 @@ fn no_rule_matching_is_a_typed_error_naming_the_rules() {
     );
 }
 
+/// The matcher names the rule that got furthest (rule 19: the failed arm). `a b d` against
+/// `(a) => {}; (a b c) => {}`: rule 1 stops at token 1 (`b` where its input should end), rule 2
+/// gets further (it takes `a b`, wants `c`, finds `d` at token 2), so the
+/// failure says "rule 2 of 2" (the Reference, "Macros By Example": "tries each macro rule in
+/// turn ... If no rule matches, an error is reported"; which rule to blame is blaze's choice,
+/// the furthest). Expected line: "test the_closest_rule_is_named ... ok".
+#[test]
+fn the_closest_rule_is_named() {
+    let cx = TestCx::new();
+    let exp = call_fn(&rules("(a) => {}; (a b c) => {}", 1), "a b d", &cx);
+    assert!(matches!(exp.diagnostics[..], [Diagnostic::NoRuleMatched { rules: 2, closest: Some(1), .. }]), "{:?}", exp.diagnostics);
+    let failed = blaze_expand::Failed::of(&exp, blaze_own::testing::heap().alloc()).expect("no rule matched is a failure");
+    let shown = std::format!("{failed}");
+    assert!(shown.contains("rule 2 of 2"), "{shown}");
+}
+
 #[test]
 fn nested_calls_are_listed_not_expanded() {
     let cx = TestCx::new();

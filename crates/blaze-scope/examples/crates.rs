@@ -821,6 +821,14 @@ fn note_text(c: &CrateNames<'static>, note: &NamesNote<'static>) -> (String, Str
                     (format!("macro diagnostic: {what}"), format!("{at}: {macro_name}!"))
                 }
                 ExpandNote::NotItems { macro_name, message } => ("an expansion that does not read as items (syntax errors)".to_string(), format!("{at}: {macro_name}!: {message}")),
+                ExpandNote::Failed { path, implicit, failed } => {
+                    let what = match failed.diagnostic {
+                        Diagnostic::NoRuleMatched { .. } => "no rule matched",
+                        _ => "another error",
+                    };
+                    let implicit = if *implicit { " (implicit, D104)" } else { "" };
+                    (format!("failed call: {what}"), format!("{at}: {path}{implicit}: {failed}"))
+                }
             }
         }
         NamesNote::Made { name, at: loc, note } => {

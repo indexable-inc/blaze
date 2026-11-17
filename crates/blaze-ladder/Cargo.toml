@@ -10,6 +10,12 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+# The producers this crate's code makes values for (decision D105,
+# docs/v2/plan/design/producer-id.md): front2 checks bodies and the run path builds code, both
+# here, so both rows hold the whole crate until it is split.
+[package.metadata.blaze]
+producer = ["body-checker", "code-builder"]
+
 [lib]
 doctest = false
 
@@ -32,6 +38,8 @@ blaze-build.workspace = true
 blaze-flow.workspace = true
 blaze-flow-lower.workspace = true
 blaze-emit.workspace = true
+# The code record's form (`bzcode03`) and its declared section (D106): `declare`, `Declares`.
+blaze-tier.workspace = true
 # A `const` item's value: evaluated once, its record the build reads (`Adts::const_value`).
 blaze-consteval.workspace = true
 # The slot table and code area the program's bodies are placed in, and its wire types.

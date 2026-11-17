@@ -14,7 +14,7 @@ use blaze_git_fetch::{
 };
 use blaze_own::{AString, AVec, Alloc, String, Vec};
 
-use crate::git::{FileKind, GitFile, GitFiles, Refused, StoreFile};
+use crate::git::{FileKind, GitFile, GitFiles, LinkUnread, Refused, StoreFile};
 
 /// The most bytes of one object, inflated; a larger one is refused.
 pub const MOST_OBJECT: u64 = 64 << 20;
@@ -501,8 +501,9 @@ pub(crate) fn parse_index<'i>(bytes: &[u8], alloc: Alloc<'i>) -> Result<Index<'i
 /// model: `filemode` set false (git then ignores the executable bit, blaze compares it), or an
 /// `[include]`/`[includeIf]` section (another file, unread). Read line by line as git's config
 /// syntax has it (`key = value`, keys case-insensitive; booleans `false`, `no`, `off`, `0`).
-/// Other keys only make git hash more (`trustctime`, `checkStat`) or matter only for a CR,
-/// which is refused anyway.
+/// Other keys only make git hash more (`trustctime`, `checkStat`), matter only for a CR in a
+/// file no `text` attribute covers (`core.autocrlf`; refused), or not at all on clean once
+/// `text=auto` is in force (`core.eol`, `core.autocrlf`, `core.safecrlf`: see git_attributes).
 fn config_changes_status(config: &[u8]) -> bool {
     config.split(|b| *b == b'\n').any(|line| {
         let line = line.trim_ascii();
@@ -522,14 +523,6 @@ fn index_path_ok(path: &str) -> bool {
     !path.is_empty() && path.split('/').all(|part| !part.is_empty() && part != "." && part != ".." && !part.eq_ignore_ascii_case(".git"))
 }
 
-/// Whether an attributes file can make the bytes `status` hashes differ from the file's own:
-/// it names a filter, `ident`, an encoding or an end-of-line rule. blaze applies no attributes,
-/// so a file it must hash under such rules is refused rather than guessed. (`text=auto` alone
-/// changes only CRLF, so a file with no CR hashes as its raw bytes.)
-fn attributes_change_bytes(attributes: &[u8]) -> bool {
-    [&b"filter="[..], b"ident", b"working-tree-encoding", b"eol=", b"crlf"].iter().any(|word| attributes.windows(word.len()).any(|window| window == *word))
-}
-
 /// A path as `status --porcelain` prints it, when git would print it unquoted (no control
 /// byte, `"`, `\` or byte past ASCII: `core.quotePath`'s default).
 fn plain(path: &str) -> Result<&str, Refused> {
@@ -544,7 +537,8 @@ fn plain(path: &str) -> Result<&str, Refused> {
 /// A tracked file is clean when its stat (size, mtime, ctime, inode, device, owner) equals the
 /// entry's and its mtime is older than the index file's (git's racy-git rule: an entry written
 /// in the same instant as the index may hide a later change of the same size, so git hashes
-/// it); else when its bytes hash as a blob to the entry's id. Staged changes: the index's cache
+/// it); else when its bytes hash as a blob to the entry's id (a symlink's bytes are its target
+/// text, read and never followed: git's `ce_compare_link`). Staged changes: the index's cache
 /// tree root must equal HEAD's tree, else refused (walking HEAD's tree is not built).
 /// Cost: one index read, one stat per entry, a hash per file whose stat differs; with
 /// `untracked`, a listing of every folder and a stat per name. Floor: the stats.
@@ -563,16 +557,34 @@ pub(crate) fn status<'a>(gitdir: &str, common: &str, work: &str, untracked: bool
     if files.read(&join(common, "config", alloc), &mut config) && config_changes_status(&config) {
         return Err(Refused::ConfigNotRead);
     }
+    // Every attributes file is read; any byte-changing form but `* text=auto` at the top is
+    // refused by name, so `text_auto` is the one rule in force, on every path or on none.
     let mut attributes = Vec::new_in(alloc);
-    let mut risky = false;
-    for entry in index.entries.iter() {
-        if entry.path.as_str() == ".gitattributes" || entry.path.ends_with("/.gitattributes") {
-            attributes.clear();
-            risky |= files.read(&join(work, &entry.path, alloc), &mut attributes) && attributes_change_bytes(&attributes);
-        }
+    // The top files first, so that a nested file is read knowing whether `text=auto` is already
+    // on every path. (The index's byte order puts `.config/.gitattributes` before the top
+    // `.gitattributes`, so one pass would not do.)
+    use crate::git_attributes::{AttributesFile, sets_text_auto};
+    let mut text_auto = false;
+    if index.entries.iter().any(|entry| entry.path.as_str() == ".gitattributes") && files.read(&join(work, ".gitattributes", alloc), &mut attributes) {
+        text_auto |= sets_text_auto(&attributes, AttributesFile::Top)?;
     }
     attributes.clear();
-    risky |= files.read(&join(common, "info/attributes", alloc), &mut attributes) && attributes_change_bytes(&attributes);
+    if files.read(&join(common, "info/attributes", alloc), &mut attributes) {
+        text_auto |= sets_text_auto(&attributes, AttributesFile::Top)?;
+    }
+    let nested = AttributesFile::Nested { top_sets_auto: text_auto };
+    for entry in index.entries.iter() {
+        if entry.path.ends_with("/.gitattributes") {
+            attributes.clear();
+            if files.read(&join(work, &entry.path, alloc), &mut attributes) {
+                // A nested file adds no path the top rule does not already cover.
+                sets_text_auto(&attributes, nested)?;
+            }
+        }
+    }
+    // The object store, opened at the first file whose clean asks its index blob.
+    let mut store: Option<Store<'a>> = None;
+    let mut blob = Vec::new_in(alloc);
     let mut out = String::new_in(alloc);
     let mut content = Vec::new_in(alloc);
     for entry in index.entries.iter() {
@@ -619,15 +631,37 @@ pub(crate) fn status<'a>(gitdir: &str, common: &str, work: &str, untracked: bool
         let changed = if mode_differs {
             true
         } else {
-            if want_kind == FileKind::Symlink {
-                return Err(Refused::SymlinkNotBuilt);
-            }
             content.clear();
-            if !files.read(&path, &mut content) {
-                return Err(Refused::TypeChanged);
-            }
-            if risky || content.contains(&b'\r') {
-                return Err(Refused::AttributesNotApplied);
+            if want_kind == FileKind::Symlink {
+                // A link's blob is its target text (git's `ce_compare_link`); no attribute
+                // applies to it, and it is never followed.
+                files.read_link(&path, &mut content).map_err(|why| match why {
+                    LinkUnread::NotALink => Refused::TypeChanged,
+                    LinkUnread::Unreadable | LinkUnread::ReaderCannot => Refused::LinkUnread(why),
+                })?;
+            } else {
+                if !files.read(&path, &mut content) {
+                    return Err(Refused::TypeChanged);
+                }
+                if text_auto {
+                    // git convert.c `crlf_to_git` under CRLF_AUTO: a text file with CR LF pairs
+                    // is converted unless its index blob is text holding CR LF already.
+                    if crate::git_attributes::auto_may_convert(&content) {
+                        let opened = match store.take() {
+                            Some(opened) => opened,
+                            None => Store::open(common, files, alloc)?,
+                        };
+                        let kind = opened.read(&entry.id, files, alloc, &mut blob)?;
+                        store = Some(opened);
+                        // `has_crlf_in_index` reads a blob; another kind reads as none.
+                        if kind != Kind::Blob || !crate::git_attributes::blob_has_crlf(&blob) {
+                            // Text under `auto` has no lone CR: every CR starts a CR LF pair.
+                            content.retain(|b| *b != b'\r');
+                        }
+                    }
+                } else if content.contains(&b'\r') {
+                    return Err(Refused::AttributesNotApplied);
+                }
             }
             Oid::of(Kind::Blob, &content) != entry.id
         };

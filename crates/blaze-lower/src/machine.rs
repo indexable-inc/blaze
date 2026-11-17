@@ -32,6 +32,9 @@ use crate::form::*;
 use crate::columns::View;
 use crate::{Cfg, CfgAnswer, Lowered, Need, ValueName, ValueNames, lit};
 
+/// Where a body-local `macro_rules!` template's locals and labels resolve: at its definition.
+mod def_site;
+
 /// What an item declared in one of the body's blocks makes `name` at `scope`, for a pattern:
 /// `None` when no such item is in the value namespace there (the module's answer is asked).
 fn local_value(v: &View<'_>, scope: ScopeId, name: NameIdx) -> Option<ValueName> {
@@ -314,6 +317,9 @@ pub struct Machine<'t, 'c, 'a> {
     /// of `scopes` it was written at: the Reference's textual scope ("Macros By Example",
     /// Scoping): visible after its statement, in nested blocks too, until its block ends.
     local_macros: AVec<'a, LocalMacroAt>,
+    /// Each local hygiene an expansion's words carry, with the definition its template
+    /// resolves locals and labels at (def_site.rs).
+    template_sites: AVec<'a, def_site::TemplateSite>,
     /// Whether the feed has an expander: without one a call stays a macro call node.
     pub(crate) expanding: bool,
 }
@@ -336,6 +342,10 @@ struct LocalMacroAt {
     name: Range,
     item: Range,
     depth: u32,
+    /// How many `locals` were bound and `entries` open where it is written: the locals and
+    /// labels its template sees (def_site.rs).
+    locals: u32,
+    entries: u32,
 }
 
 /// A body's macro call waiting for its expansion: the call's range, its path's and its
@@ -489,6 +499,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             words: Vec::new_in(alloc),
             request: None,
             local_macros: Vec::new_in(alloc),
+            template_sites: Vec::new_in(alloc),
             expanding: false,
         };
         if matches!(mode, Mode::Body | Mode::AnonConst) {
@@ -527,10 +538,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
     /// module states the rule).
     pub(crate) fn local_key(&self, name: NameIdx) -> u64 {
         let hash = self.out.names[name.0 as usize];
-        match self.hygiene_at(self.out.name_ranges[name.0 as usize].start) {
-            0 => hash,
-            hygiene => hash ^ hygiene.rotate_left(17),
-        }
+        def_site::keyed(hash, self.hygiene_at(self.out.name_ranges[name.0 as usize].start))
     }
 
     /// The cfg set, lent to the expander for one call: a `cfg!` in the body is answered by the
@@ -554,13 +562,9 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
     /// its rules (the text inside the definition's delimiters).
     pub(crate) fn local_macros(&self) -> impl Iterator<Item = crate::driver::LocalMacro<'_>> + '_ {
         let text = self.text();
-        self.local_macros.iter().filter_map(move |l| {
-            let name = l.name.of(text);
-            let after = text.get(l.name.end as usize..l.item.end as usize)?.trim();
-            let tree = after.strip_suffix(';').map_or(after, str::trim_end);
-            let rules = tree.get(1..tree.len().checked_sub(1)?)?;
-            Some(crate::driver::LocalMacro { name, rules })
-        })
+        self.local_macros
+            .iter()
+            .filter_map(move |l| def_site::rules_of(text, l).map(|rules| crate::driver::LocalMacro { name: l.name.of(text), rules }))
     }
 
     /// Where `request`'s input is: the item's text, or tokens of an expansion lowered here.
@@ -607,6 +611,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             ranges.push(Range::new(start, end));
             self.words.push(ExpWord { start, hygiene: w.hygiene, expansion, token: w.token, end: w.end });
         }
+        self.note_templates(request, &out.words.words);
         ranges
     }
 
@@ -826,7 +831,8 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 self.vals.push(Val { v: V::Skipped(top.kind), id: NONE, node, range });
                 if top.kind == MACRO_RULES && self.skip_name.start != NONE {
                     let depth = idx(self.scopes.len());
-                    self.local_macros.push(LocalMacroAt { name: self.skip_name, item: range, depth });
+                    let (locals, entries) = (idx(self.locals.len()), idx(self.entries.len()));
+                    self.local_macros.push(LocalMacroAt { name: self.skip_name, item: range, depth, locals, entries });
                 }
                 self.after_child();
                 return;
@@ -1110,11 +1116,6 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         }
     }
 
-    pub(crate) fn lookup(&self, name: u64) -> Option<PatId> {
-        let at = *self.top.get(&name)?;
-        (at >= self.barrier).then(|| PatId(self.locals[at as usize].pat))
-    }
-
     pub(crate) fn push_pending(&mut self, name: u64, pat: PatId) {
         self.pending.push((name, pat.0));
     }
@@ -1143,13 +1144,15 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
     }
 
     /// The entry a `break` (`want_loop` false) or `continue` (true) with `label` leaves.
-    fn find_entry(&self, label: u64, want_loop: bool) -> Result<usize, DiagKind> {
+    /// The entry a `break`/`continue` of label key `label` (0: none) leaves; a label is
+    /// matched only among the first `below` entries (def_site.rs `find_label`).
+    fn find_entry(&self, label: u64, want_loop: bool, below: usize) -> Result<usize, DiagKind> {
         for i in (0..self.entries.len()).rev() {
             let e = self.entries[i];
             match e.kind {
                 Jk::Barrier => break,
                 _ if label != 0 => {
-                    if e.label == label {
+                    if e.label == label && i < below {
                         return match (e.kind, want_loop) {
                             (Jk::Block, true) => Err(DiagKind::ContinueToBlock),
                             _ => Ok(i),
@@ -2185,11 +2188,14 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 return;
             }
             BREAK_EXPR | CONTINUE_EXPR => {
-                let label = self.first(f, V::Lifetime).map_or(0, |l| self.local_key(NameIdx(l.id)));
+                let label = self.first(f, V::Lifetime).map(|l| NameIdx(l.id));
                 let value = self.first(f, V::Expr).map(|v| ExprId(v.id));
                 self.done(f);
                 let want_loop = f.kind == CONTINUE_EXPR;
-                let found = self.find_entry(label, want_loop);
+                let found = match label {
+                    Some(name) => self.find_label(name, want_loop),
+                    None => self.find_entry(0, want_loop, usize::MAX),
+                };
                 let e = if want_loop {
                     self.put_expr(Expr::Continue { target: None }, r)
                 } else {
@@ -2711,7 +2717,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             && matches!(seg.kind, SegKind::Ident | SegKind::SelfMod)
             && !seg.has_args
             && let Some(name) = seg.name
-            && let Some(pat) = self.lookup(self.local_key(name))
+            && let Some(pat) = self.lookup_name(name)
         {
             return Expr::Local { pat, path: p };
         }

@@ -108,8 +108,11 @@ Not kept, by name: before the run from the effect facts of its asks (real clock,
 socket, inline assembly, an unbound foreign call); after it from the launcher, which binds the
 OS imports (open, stat, readdir, getenv, clock_gettime, connect, getrandom, spawn) to recording
 wrappers; the sandbox refuses a write outside the test's temporary folder and the test fails
-naming the path. A `#[bstd::test]` gets the fake world (virtual clock, files in memory, a seeded
-generator) and is always kept.
+naming the path. A `#[bstd::test]` names what it takes after `cx` (D109: each parameter a grant
+made from the fake world, narrowed to it: virtual clock, files in memory, a seeded generator);
+its manifest and setup (what its grants start with) are data in the test binary and are the run
+spec its `TestInputs` digest covers; it is always kept. One that takes `cx` alone meets no fault
+and is run once.
 
 **After an edit of one body**: the request names the instances whose code moved (C) and the
 head's read table, answered now, the reads that moved (R). The suite's postings record (sorted

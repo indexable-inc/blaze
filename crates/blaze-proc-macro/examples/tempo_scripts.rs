@@ -9,6 +9,11 @@
 //! from its record; a member's from the checkout, read-only. The checkout is never written.
 //! With `discover` before the packages, each script is run until it asks no try-compile the
 //! pinned table lacks, and every such question is printed whole: the rows to write.
+//! With `native <shelf> <sdk>` first, a script placed native for `check` (D112: toolchain.rs
+//! `NATIVE_EVERY_MODE`, chosen by `native_unit::placed` alone) runs twice in the Seatbelt native
+//! runner with the pinned clang unpacked on `<shelf>` and the macOS SDK `<sdk>`, its host binary
+//! from the interim builder's `native` mode in `<blaze store>/build-script/modules`, its work under
+//! `<blaze store>/native-work/tempo_scripts`; without it such a script is refused by name.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -32,9 +37,16 @@ use blaze_own::{Alloc, Vec as AVec};
 use blaze_proc_macro::{
     record::{DirStore, native_world},
     script::{ScriptError, ScriptRuntime, ScriptWhy},
-    script_sandbox::{Refusal, Script, SpawnRefusal, Tree, dir_tree, mem_tree},
-    script_unit::{Prepared, Setting, links_inputs, links_order, prepare},
+    script_sandbox::{
+        Refusal, Script, ScriptRoot, SpawnRefusal, Tree,
+        dep_mount::{DepProducer, view},
+        dir_tree, mem_tree,
+    },
+    native_setting::native_setting,
+    native_unit::placed,
+    script_unit::{Prepared, Setting, links_inputs, links_order, outputs, prepare_viewing},
 };
+use blaze_build_script::native::Runner;
 use blaze_build_script::env::DepMetadata;
 use blaze_unit_graph::{Ask, CfgAtom, Package, Pass, Records, Resolution, Resolver, StoreSources, TargetDesc, UnitId, UnitKind};
 
@@ -167,8 +179,12 @@ impl Records<'static> for Folder {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let [_, checkout, fetch_store, store, wanted @ ..] = &args[..] else {
-        eprintln!("usage: tempo_scripts <checkout> <blaze-fetch store> <blaze store> [discover] <package>...");
+        eprintln!("usage: tempo_scripts <checkout> <blaze-fetch store> <blaze store> [native <shelf> <sdk>] [discover] <package>...");
         std::process::exit(2);
+    };
+    let (native_args, wanted) = match wanted {
+        [first, shelf, sdk, rest @ ..] if first == "native" => (Some((shelf.as_str(), sdk.as_str())), rest),
+        _ => (None, wanted),
     };
     let (discover, wanted) = match wanted {
         [first, rest @ ..] if first == "discover" => (true, rest),
@@ -235,8 +251,13 @@ fn main() {
     let runtime = script_runtime(&store);
     let table = Arc::new(pinned_rows(TARGET, KNOWN, alloc).to_vec());
     // `check`'s placement: C requests deferred; the bindgen class (D69's NATIVE_EVERY_MODE)
-    // would be refused by name here, as no shelf is given (this example calls `prepare`, the
-    // wasm step, directly).
+    // runs native with `native <shelf> <sdk>` (D112), and is refused by name without it.
+    let work = store.join("native-work/tempo_scripts");
+    let work = work.to_str().unwrap_or_else(|| panic!("{}: not UTF-8", work.display())).to_owned();
+    let native_owned = native_args.map(|(shelf, sdk)| native_setting(shelf, sdk, &work, TARGET, alloc).unwrap_or_else(|e| panic!("{e}")));
+    if let Some(owned) = &native_owned {
+        println!("native: shelf {}, SDK {} (version {}), work {}", owned.shelf.as_str(), owned.sdk.as_str(), owned.sdk_version.as_str(), owned.work.as_str());
+    }
     let setting = Setting {
         store: &store,
         target: TARGET,
@@ -244,10 +265,12 @@ fn main() {
         table: Arc::clone(&table),
         c_mode: CMode::Deferred,
         mode: blaze_build_script::toolchain::Mode::Check,
-        native: None,
+        native: native_owned.as_ref().map(|owned| owned.setting()),
+        // The derived facts' pins (brief P): the host's userland read here, once.
+        spawn_setting: Arc::new(blaze_proc_macro::fact_pins::command_spawn_setting(TARGET, alloc).unwrap_or_else(|e| panic!("{e}"))),
     };
     let units = &graph.units;
-    let mut trees: BTreeMap<LockId, (Tree, String)> = BTreeMap::new();
+    let mut trees: BTreeMap<LockId, (Tree, ScriptRoot)> = BTreeMap::new();
     // `dependents`: for each package named, how many library units of the graph depend on its
     // library, directly or through others (a work list over the reversed edges).
     if dependents {
@@ -281,6 +304,9 @@ fn main() {
     // the scripts of its direct dependents run. Each first run's metadata, by script unit.
     let order = links_order(&graph).unwrap_or_else(|e| panic!("{e}"));
     let mut metadata: BTreeMap<UnitId, Vec<(String, String)>> = BTreeMap::new();
+    // Each first run of a script whose served unit has `links`: what its dependents' scripts
+    // are served of it (brief S1).
+    let mut producers: BTreeMap<UnitId, DepProducer> = BTreeMap::new();
     for name in &every {
         if !order.iter().any(|s| units[s.index()].name.as_str() == name) {
             println!("{name}: no build-script unit in the graph");
@@ -300,7 +326,7 @@ fn main() {
             let (tree, folder) = trees
                 .entry(unit.package)
                 .or_insert_with(|| match member_dirs.get(&unit.package) {
-                    Some(dir) => (dir_tree(&root), dir.clone()),
+                    Some(dir) => (dir_tree(&root), ScriptRoot::member(dir).unwrap_or_else(|e| panic!("{package}: {e}"))),
                     None => {
                         let (view, dir) = sources.files(unit.package).unwrap_or_else(|e| panic!("{e}"));
                         // A fetched git source answers `git` from the lock's commit (D54).
@@ -310,7 +336,7 @@ fn main() {
                             }
                             LockSource::Path | LockSource::Registry { .. } => None,
                         };
-                        (mem_tree(view.files().map(|f| (f.path, f.bytes)), dir.as_str(), git), String::new())
+                        (mem_tree(view.files().map(|f| (f.path, f.bytes)), dir.as_str(), git), ScriptRoot::package())
                     }
                 })
                 .clone();
@@ -330,8 +356,69 @@ fn main() {
             for dep in &deps {
                 println!("    given DEP_{}_{}={:?}", dep.links.to_uppercase().replace('-', "_"), dep.key.to_uppercase().replace('-', "_"), dep.value);
             }
+            // The one choice point (D112): a script placed native runs through the real path's
+            // native runner, twice (the second from its record), never as wasm.
+            if let Runner::Native { because } = placed(&graph, UnitId(at as u32), setting.mode, alloc) {
+                let because = &units[because.index()];
+                println!("  native (its closure holds {} {}, D112)", because.name.as_str(), because.version.as_str());
+                // The first run's metadata, kept once `deps` (borrowing `metadata`) is done.
+                let mut first_metadata: Option<Vec<(String, String)>> = None;
+                for pass in ["first", "second"] {
+                    let started = Instant::now();
+                    match outputs(&runtime, &setting, &graph, UnitId(at as u32), tree.clone(), folder.clone(), &deps, alloc) {
+                        Ok(ran) => {
+                            let o = &ran.outputs;
+                            println!("  {pass}: {:?}, from the record: {}, spawns {}", started.elapsed(), ran.from_record, ran.spawns);
+                            if pass == "second" {
+                                continue;
+                            }
+                            first_metadata = Some(o.metadata.iter().map(|(k, v)| (k.as_str().to_owned(), v.as_str().to_owned())).collect());
+                            if served.links.is_some() {
+                                let given: Vec<(&str, &DepProducer)> = inputs.iter().filter_map(|(input, links)| producers.get(input).map(|producer| (*links, producer))).collect();
+                                let upstream = DepProducer::closure(&given);
+                                producers.insert(UnitId(at as u32), DepProducer::of(tree.clone(), folder.clone(), o).with_upstream(upstream));
+                            }
+                            for (key, value) in o.metadata.iter() {
+                                println!("    metadata {}={:?}", key.as_str(), value.as_str());
+                            }
+                            for (cfg, value) in o.cfgs.iter() {
+                                println!("    cfg {}{}", cfg.as_str(), value.as_ref().map_or(String::new(), |v| format!("={:?}", v.as_str())));
+                            }
+                            for (key, value) in o.env.iter() {
+                                println!("    env {}={:?}", key.as_str(), value.as_str());
+                            }
+                            for file in o.files.iter() {
+                                println!("    file {} ({} bytes)", file.name.as_str(), file.bytes.len());
+                            }
+                            println!("    reads {}", ran.reads.len());
+                        }
+                        Err(error) => println!("  {pass}: {error}"),
+                    }
+                }
+                drop(deps);
+                if let Some(pairs) = first_metadata {
+                    metadata.insert(UnitId(at as u32), pairs);
+                }
+                continue;
+            }
+            // Brief S1: the `links` dependencies' paths as this script sees them, and their
+            // files served read-only.
+            let given: Vec<(&str, &DepProducer)> = inputs.iter().filter_map(|(input, links)| producers.get(input).map(|producer| (*links, producer))).collect();
+            let upstream = DepProducer::closure(&given);
+            let viewed = match view(&tree, &given, &deps, alloc) {
+                Ok(viewed) => viewed,
+                Err(error) => {
+                    println!("  not run: {error}");
+                    continue;
+                }
+            };
+            let deps: Vec<DepMetadata<'_>> =
+                deps.iter().zip(viewed.values.iter()).map(|(dep, value)| DepMetadata { links: dep.links, key: dep.key, value: value.as_str() }).collect();
+            for dep in deps.iter().filter(|dep| !metadata.values().flatten().any(|(_, value)| value == dep.value)) {
+                println!("    seen as DEP_{}_{}={:?}", dep.links.to_uppercase().replace('-', "_"), dep.key.to_uppercase().replace('-', "_"), dep.value);
+            }
             let started = Instant::now();
-            let Prepared { loaded, script, env } = match prepare(&runtime, &setting, &graph, UnitId(at as u32), tree, folder, &deps, alloc) {
+            let Prepared { loaded, script, env } = match prepare_viewing(&runtime, &setting, &graph, UnitId(at as u32), tree.clone(), folder.clone(), &deps, viewed.views, alloc) {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     println!("  {error}");
@@ -381,6 +468,9 @@ fn main() {
                             continue;
                         }
                         metadata.insert(UnitId(at as u32), o.metadata.iter().map(|(k, v)| (k.as_str().to_owned(), v.as_str().to_owned())).collect());
+                        if served.links.is_some() {
+                            producers.insert(UnitId(at as u32), DepProducer::of(tree.clone(), folder.clone(), o).with_upstream(upstream.clone()));
+                        }
                         for (key, value) in o.metadata.iter() {
                             println!("    metadata {}={:?}", key.as_str(), value.as_str());
                         }
@@ -430,7 +520,8 @@ fn main() {
 /// `include!` of `OUT_DIR` among them) is printed with its first line.
 fn outline_root(script: &Script, served: &blaze_unit_graph::Unit<'_>, out: &blaze_build_script::Outputs<'_>) {
     let root = served.root.as_str();
-    let rel = if script.folder.is_empty() { root.to_owned() } else { format!("{}/{root}", script.folder) };
+    let folder = script.root.seen().folder();
+    let rel = if folder.is_empty() { root.to_owned() } else { format!("{folder}/{root}") };
     let Some(bytes) = script.tree.file(&rel) else {
         println!("  outline: no file {rel}");
         return;

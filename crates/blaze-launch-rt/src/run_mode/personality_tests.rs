@@ -197,6 +197,7 @@ fn run(bind: bool) -> Seen {
             Act::Wake { .. } => {}
             Act::Promote { .. } => panic!("the personality tests publish no optimized record"),
             Act::Stop(stop) => panic!("the run stopped: {stop:?}"),
+            Act::Native { record } => panic!("the personality tests send no native library: {record:?}"),
         }
     }
     Seen { placed, memory, p_local }

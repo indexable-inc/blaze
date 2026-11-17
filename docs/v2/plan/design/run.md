@@ -11,7 +11,165 @@ blaze-run machines after it (Parent, Slots, FirstCall) are its parts: decision R
 run path calls them") is withdrawn. Still later: an edit applied to a program while it runs
 (blaze-launch's staged edits and gates); now an edit is a new record, published on the next run.
 
-## End state (corrected 2026-11-16, within bottom.md section 11)
+## End state (D113, 2026-11-16 evening: the whole run, redone)
+
+Andrew, 19:30, after a hello world run took 15.9 s ("thought that libraries were cached? it should be sub
+second"): "completely redesign blaze run to be sota": incremental time first (large crates and files, after a
+restart, nothing running), then the remote cache, memory, cold time, disk cleanup that never blocks, disk use;
+128 cores best, a typical Mac good; shared across worktrees with no setting; only changed tests rerun.
+
+**The fault being removed.** Measured 18:12 on hello world: 16.2 s of 16.3 s is library work redone on every
+run (names of core, alloc and std 5.1 s; 18,900 library bodies checked and lowered 9.3 s; instances built
+1.8 s; the program's own code about 10 ms). The run path checked a body BEFORE it could compute the key of its
+code, held a table of the whole program, and resolved every crate's names up front. `blaze check` on the same
+tree repeats in 2 to 3 ms (28.5 M instructions, measured 19:0x) because its answer is found by key.
+
+**One rule.** A run does work in proportion to what changed and to what the program then executes, never to
+the size of the program, its crates or its files. Seven stages; the first four ARE `blaze check`'s request
+machine (blaze-drive), not a second mechanism (rule 30); the last three are the child and the parent below.
+
+1. **Sweep** (blaze-cli sweep.rs, built, as `check` has it). A repeat stats exactly the paths the LAST ANSWER
+   READ (its leaf table in the checkout's pointer file: path, a 40-byte stamp of length, mtime, ctime, inode
+   and device, and the content id); it never walks the checkout, so a `target/` of 374,012 entries beside the
+   sources costs nothing (measured), and a locked dependency is not looked at. The stamp is a HINT that decides
+   only whether a file is read and hashed again: every key is from content, and a task that later reads the
+   file hashes what it read and stops with a typed `Changed` when that is not the id in its key (a command
+   works on the tree its sweep saw, or says the tree moved; it never files new bytes under an old id). A
+   stamp younger than the sweep by less than the volume's time grain is not kept, so that file is hashed again
+   next time (git's racy-clean rule; the planted bug `RacyTrusted` is caught). The grain and the clock are the
+   VOLUME's: a local volume's grain by its file system (10 ms where stamps are finer, 1 s or 2 s where they
+   are not) against the machine's clock; a volume whose clock is not the machine's (a network or shared
+   folder) against the stamp of an unnamed file made on it as the sweep starts. The device number is not in
+   the stamp (it moves across restarts on Linux). Serial on purpose at today's sizes: tempo's 870
+   read files cost 0.51 ms at a stat each; the pool and one bulk read a folder were measured slower. At 100k
+   read files the same loop is about 60 ms, which is over the floor: there the stats go to the pool by folder
+   (`Effect::StatMany`, owed) and, where the platform keeps a change journal across a restart (macOS FSEvents
+   by event id; blaze-vfs watch.rs has the watcher, unwired), the journal narrows which rows are statted; a
+   journal that says "history lost" narrows nothing. No daemon is needed; a helper with an expiry may hold a
+   watch and narrow the same way (rule 70).
+2. **Certificate** (blaze-drive `cert_key`, as built): the tool, the command and every input's digest. When it
+   stands, the gate's answer is found and the start list (stage 7) is placed as it is: nothing is resolved,
+   checked or built. Its key is the root of the leaf table kept as a tree by directory, recomputed along
+   changed paths only, never over every file. Certificates, answers and pages are keyed by content in the
+   user's one store (drive.md, "The store under the command"); only the leaf table (path, stamp, content id)
+   is a checkout's, with the last answer's key for EACH request shape, so `check`, `run` and `test` in turn
+   re-hash nothing. A NEW worktree hashes its files once (blake3, all cores) and then finds every record by
+   key (D96): worktrees share with no setting. Owed, and designed: a file git tracks and its index calls
+   clean is not read at all: its content id comes from a kept map (git blob id to content id; local, or an
+   organisation's from its trusted builder), so a branch switch or a pull reads only what nobody has seen.
+3. **Forward** (the drive's request machine, as `check`): from changed files to changed ITEMS, then to the
+   tasks whose read lists name a changed fact. A body edit moves no other task's KEY; what the body MAKES is
+   an output with its own digest, and its readers rerun when that digest moves: the hidden type behind an
+   `impl Trait` or an `async fn` (its auto traits for a caller's check, its layout for a caller's code), a
+   const's or static's value, an item written in the body that the whole crate sees (an `impl`, an exported
+   macro), and the lines of the items below it (drive.md, "D114 rulings", "Facts a body makes"). So an edit
+   that grows one future re-lays the states that hold it, and an edit that leaves every made fact equal moves
+   nobody. No dependency graph is built or held.
+4. **The gate**, BEFORE the start. Scope: the WORKSPACE bodies the program reaches (AGENTS.md, Scope): the
+   request's root is `main`'s check; each `BodyCheck` record names the items its body calls or names, and the
+   machine's ordinary need-walk follows them (a call through a trait or `dyn` reaches every impl the program's
+   crates hold: a superset, front2 reach.rs's rule). There is no table of the program: the reach is the
+   request's task set, kept with its answer, and after an edit only the changed bodies' new names extend it.
+   Each check is found by key or made at item grain on every core. An error stops the run before the program
+   starts: a program that does not type-check must not have run half way, and with checks found by key the
+   gate costs milliseconds (cold, it is the workspace's reached bodies, once). `Gate::Beside` stays for
+   `test` only, verdicts held until the check ends. A DEPENDENCY's bodies are not in the gate: their checks
+   come by key from the shared cache; one that is missing is made at its code's first ask, and a refusal
+   there is blaze's own failure (that crate builds on the pinned nightly), reported as one, naming the body.
+   Starting at once with every effect held until the gate settles (output commit) was weighed and refused: it
+   wins only while the gate is slow, which this design removes, and a held network send blocks the program
+   anyway.
+5. **Code is a drive task like a check** (D106, corrected). `Code(instance, tier)`: key = the instance's
+   symbol, its body's text key, the builder's producer id (D105), target, tier, the profile's facts (the
+   panic strategy among them); valid by that key, or else by its READ LIST checked against today: the
+   `BodyCheck` record it was lowered from, each callee as a name (never its body, unless a tier inlined it:
+   then that body's `BodyCheck` too), each signature, const value, static initialiser, vtable shape and
+   hidden type whose layout or value it used, each by its own digest. No crate-wide fact is in it: adding a
+   `pub fn` to a base crate moves no code record above it. `Code` TAKES `BodyCheck`'s record as its proof: the
+   record holds the typed body (what lowering needs), so a code miss lowers and builds and never checks again
+   (rule 74; `make_instance`'s second check and its second front-end entry are deleted). Code is asked for
+   lazily, at a first call, or behind (stage 6); nothing is walked or built before the start except the start
+   list's rows. A code record holds positions relative to its item; a panic's location is DATA placed from
+   the file's `Lines` record (item to line), so lines moving above a function re-place a few words and
+   rebuild nothing.
+6. **Start before everything is built**: the child and the parent below, as corrected this morning: slots,
+   stubs, first calls, compiled behind in the last run's order. Always in its own process (D103).
+7. **After.** Two things, apart. THE START LIST: a hint, one mutable root a (program, request shape) and
+   user: the certificate it was written under, then the instances first called inside the start window (a
+   cap of 8,192 rows), each as (symbol, the code record's key then), in first-call order. Next start, if the
+   certificate is the same one, the rows are placed as they are, nothing looked up; if not (an edit, an undo,
+   another worktree), a row is only a symbol: its code is found through the drive like any first call, so an
+   old list can cost time and never run old code. Last writer wins; it is never shared by content, because
+   its order is a fact of one run. A TEST'S RESULT (test.md, "End state", which this follows and does not
+   restate): a record whose asks are the functions the test ENTERED (mark stubs; placing ahead is off in a
+   test's child), each answered by its code's identity today, and every outside read (a file through a
+   grant, a variable, a host fact), traced at the seam and added to the checkout's leaf table so the sweep
+   sees it. A test that started a thread is judged by its static reach. A plain `#[test]` on std is kept the
+   same way under the hosted world: its entropy is seeded from its id, its opens and reads are traced; one
+   that read the clock is kept (a pass is one valid sample of this code on these inputs), one that used a
+   socket beyond loopback or an unsandboxed spawn is not, by name. A suite's asks are stored as one common set
+   and each test's difference. A helper with an expiry tiers hot functions up from samples (backend-next.md)
+   and writes records; it never builds on its own.
+
+**Floors** (ms; "measured" where a run in the notes gave it; the rest derived and to be replaced by spans):
+
+| Stage | hello world | 1M lines, 100k files | Today |
+|---|---|---|---|
+| blaze starts | 1.5 | 1.5 | target.md |
+| sweep, nothing changed | under 0.1 | 60 serial (0.6 us a stat, measured on tempo's 870: 0.51); 2 to 8 with `StatMany` or a journal | tempo 0.51 measured |
+| certificate, one read | 2 | 2 | hello 2 to 3 measured; tempo 13 against a floor of 2 (drive.md) |
+| start to `main` (spawn 1, maps 0.3, placing behind) | about 5 | about 5 (placing is behind `main`) | 15,900 (ratio 3,000) |
+| one body edited: + hash and split its file, 1 check, 1 Fast build | about +3 | about +3, plus 2 a MB of the edited file (target; the outline is 12.8 a MB today, tempo.md) | 110 on `check` (measured); run: 15,900 |
+| a signature edited: + its readers' checks | readers x one check / cores | same | every body of the file (drive.md, D114) |
+| a `pub` item added in a base crate | one outline, its askers' cell checks (1 us each) | same: no code record above it moves | every crate above re-solved; every code key above moved |
+| another command after this one (`check`, then `run`, then `test`) | no file hashed again | same (one leaf table a checkout, a last answer a shape) | every file hashed, a full walk |
+| a new worktree, equal content | hash once, then finds | 100k files hashed on all cores; none once the git-blob map is in | no memo |
+| a branch switch of 5,000 files, each seen before by anyone | 5,000 finds: about 5 | same | not measured |
+| after a restart, nothing changed | the stats, cold: to measure (macOS: the change journal narrows them; Linux: every stat, in batches) | same | not measured |
+| after a pull CI certified | three round trips: the certificate, its pages in one batch, code by range | same | not built |
+| cold, nothing in any cache | the reached workspace bodies / cores, plus names (5.1 s today for core, alloc and std alone) | bodies / cores | 16,300 on one core |
+
+A body's check costs 0.35 ms mean in the run path's walk and 1.56 ms in the drive (both measured, on different
+paths); its floor is not known until the checker has spans by phase (drive.md, D114 point 6).
+
+The cold row is why std and the dependencies come built from the shared cache (remote-read): then cold is
+the workspace's own bodies. The first run on a machine pulls by key; after `git pull`, a certificate for the
+same inputs if CI made one, else records by key in batches, signed statements checked before bytes are mapped.
+
+**Unknowns this design rests on, each owed a measurement**: a slot call's cost in call-bound code (below:
+"about 1%, up to 5%"); the bulk directory read's cost after a restart with a cold cache; how many first calls
+tempo makes before its first useful output (the wait compiled-behind must hide).
+
+**The critic's findings (20:07, verdict REVISE) and where each is answered.** B1, keys that miss inputs
+(a future's layout, a const's value, an impl in a body, lines): stages 3 and 5, and drive.md "Facts a body
+makes". B2, a snapshot that was not one, and the wrong clock: stage 1 (verified bytes are in the tree since
+20:33; the volume's grain and clock are owed). B3, test results kept unsoundly: stage 7 follows test.md
+(entered, not bound; reach for a threaded test; outside reads traced; plain `#[test]` kept under the hosted
+world). M1, the run record (an undo replaying old code, last writer, O(rows), per checkout): the start list,
+a hint whose rows are symbols. M2, crate-wide facts in code keys and a body checked twice: stage 5. M3,
+worktrees, command switches, restarts, pulls: stage 2 and the floor rows. M4, the gate said twice: stage 4
+and "The gate" below; holding effects until the gate settles is refused there with its reason. M5, one
+placing thread and a barrier a publish: "Who places" below. Minors: the floor table's numbers; a suite's asks
+stored as a common set and differences; the parent's state dropped when idle; the pin and the run segment.
+
+**Where the tree breaks the one rule today** (read 2026-11-16; each is a piece, in this order):
+- A STALE CHECK CAN STAND: a signature edited in another file or crate that leaves its crate's exports equal
+  moves no body's read (body_types.rs's own gap (a)). Correctness first: a body's read list names the
+  signatures it used, each by its own digest.
+- SIGNATURE GRAIN: a body's source is its item's hash and the file's text "around bodies", so one parameter
+  edited re-checks every body of that file (100 in the drive's own test); the `Signature` kind is defined and
+  not built. With it a signature edit costs its readers and nothing else.
+- NAMES ARE PER CRATE: an added `pub fn` re-solves its whole crate (tempo: 1034 crates in 5.1 s; `CrateScope`
+  runs on the main thread). The solver's cells and the per-module kinds (`ModuleScope`, `Group`: defined, not
+  built) become the records, so an outline edit in an enormous crate costs its module's cells.
+- THE COMMAND'S STORE IS A STAND-IN: blaze-cli store.rs `PackStore` writes one pack a command, whole, never
+  synced, and merges past eight; blaze-cas's store (mapped segments read in place, generations, compaction
+  with a grace period) is not what the command uses. Until it is, "read in place", crash safety and cleanup
+  that never blocks are not true of what a person runs.
+- `Code` answers `NotBuilt` in the drive: the run path's records are the ladder's own; stage 5 puts them under
+  the drive's `Code` name with the key above.
+
+### The child and the parent (the corrected end state of this morning, kept; D113's stage 6)
 
 > Withdrawn from the architect's first draft (coordinator, 14:30): the eager build before `main`, the image bound
 > ahead of time at fixed addresses with an edit rewriting posted words, and the patched clone. Kept: record, bundles.
@@ -46,6 +204,13 @@ the parent makes it then (blaze-run `Parent`: single flight however many threads
 Two threads on one stub: one ask, one placement, both proceed through the same word. A woken waiter returns
 from a kernel wait (a context synchronization event); a fresh caller fetches bytes never fetched since their
 invalidation, because a freed range is reused only after every thread passed an epoch (blaze-run `Slots`).
+**Who places** (corrected: one control thread placing every record, with a barrier across all cores at each
+publish, grows with the cores): a KNOWN record is placed by the thread that needs it, through the write view;
+code space by an atomic bump; one flight a slot by a compare-and-swap of its word (unbound, placing, bound);
+offers and asks of the parent stay with the control thread. The barrier across cores belongs to the REUSE of
+a freed range, once an epoch, not to a publish at addresses never executed: the piece's writer quotes the
+architecture manual's paragraph for that in the test's doc before relying on it; until then publishes are
+batched, one barrier a batch.
 **Executable memory**: workspace code is copied into two views of one memory, read+execute where it runs and
 read+write where the control thread writes (macOS `mach_vm_remap`, Linux a memfd mapped twice; blaze-launch-rt
 sys.rs; measured there 2026-11-15: runs ad hoc signed, killed under the hardened runtime even with `allow-jit`,
@@ -55,20 +220,29 @@ about 50-100 us a file) are taken for bundles only: one per function would be a 
 **Compiled behind**: each publish queues its record's unknown Func targets at `Callee` priority, ordered by
 the run record's first-call order; the parent compiles them on idle workers (never the last free one) and
 offers each unasked; the child places an offer at once, so a first call usually finds its word bound.
-**Run record**: at exit the parent files, under (program manifest, checkout), each symbol's code record in
-first-call order. **Repeat, nothing changed**: blaze's start 1.5 ms + certificate 2 ms (target.md) + spawn
-of the launcher 1 ms + bundle maps and binds 0.3 ms; the control thread then places the run record's rows in
-order ahead of `main` while `main` runs (placing is not compiling): about 5 ms to `main`'s first instruction,
-5.2 ms for hello world to finish. Floor: a linked file started after the same certificate, 4.5 ms: ratio 1.15.
-**After an edit of one body**: its instances' rows in the run record are stale, so the parent compiles them at
-start at `History` priority on idle cores; the new record is put under its key and published in this run's
-slot. Nothing is patched in a file, and no other record changes (callers reach it through the slot).
+**Start list** (stage 7; it replaces this morning's "run record"): at exit the parent writes one mutable root
+a (program, request shape) and user: the certificate it ran under, then the instances first called inside the
+start window (at most 8,192 rows), each as (symbol, its code record's key then), in first-call order; equal
+to the last one, it is not written. **Repeat, nothing changed**: blaze's start 1.5 ms + certificate 2 ms
+(target.md) + spawn of the launcher 1 ms + bundle maps and binds 0.3 ms; the list's certificate is today's,
+so its rows are placed as they are, ahead of `main` while `main` runs (placing is not compiling): about 5 ms
+to `main`'s first instruction, 5.2 ms for hello world to finish. Floor: a linked file started after the same
+certificate, 4.5 ms: ratio 1.15. **After an edit of one body**: the forward step has dirtied the `Code` tasks
+that read what moved; a row whose task is dirty is compiled at start at `History` priority on idle cores and
+published in this run's slot; every other row stands unlooked-at. Nothing is patched in a file, and no other
+record changes (callers reach it through the slot). **Another certificate with no forward step from the
+list's** (an undo, another worktree, a pull): each row is only a symbol, found through the drive (about 1 us a
+row); old code is never placed. **Records made while the program runs** are appended by the parent to one
+RUN SEGMENT (a file of this run, mapped by the child as it grows; no record byte crosses the socket), and
+committed to the store as one segment at exit and at most every 10 s; a crash loses only what was not yet
+committed. The parent pins the program's records under a named root while it lives, so compaction keeps them;
+it drops its front-end state after a second without an ask and remakes it from records (rule 70).
 **Panics** unwind (strategy in the key): records carry the unwind word and landing pads; an entry is registered
 before its word is stored, taken back when the body is freed (launch-rt unwind.rs); one finder for the code
 area where the system has one (macOS `__unw_add_find_dynamic_unwind_sections`), else an FDE each (rule 45).
-**The check beside**: drive.rs's `Gate::Beside` starts the program with `StartProgram` and on the first error
-says `Stop`: the parent kills the child, prints the findings, fails the command; a program that ends first is
-reported only when the check has ended (bottom.md section 11).
+**The gate** is BEFORE the start for `run` (stage 4): the child is spawned when the reached workspace bodies'
+checks are answered clean. `Gate::Beside` (`StartProgram` at once, `Stop` on the first error, a program that
+ends first reported only when the check has ended: bottom.md section 11) is `test`'s alone.
 **Tiers**: fast records call through slots; the hot counter and `Tier` make an optimized record, published
 with one word store (`Slots::publish`); the next run's run record names it while its read list stands.
 **Bundles**: dependency crates at the top tier (std, core and alloc one bundle), laid out by blaze-code
@@ -132,7 +306,9 @@ patched after an edit. **Cost to the program**: a call through a slot is a load 
 10. Compiled behind (the parent's `Callee` queue fed to idle workers, offers placed). Test: tempo's start
     waits on fewer than 5% of its first calls.
 11. || Unwinding (emitter pads, unwind word, registration before the store). Test: `catch_unwind` catches.
-12. The check beside on the real path (parent carries `Stop`). Test: a lint error stops a running program.
+12. The gate before the start on the real path. Tests: a type error in a reached workspace body stops
+    `blaze run` before the child is spawned; one in an unreached body does not (`blaze check` reports it);
+    `blaze test` starts beside and holds verdicts until the check ends.
 13. Delete: ladder place.rs's in-process run, blaze-code `Image` and its postings, the launcher's sidecar.
 14. Tier-up, then `blaze export`, then symbolize and the debug object.
 
@@ -445,7 +621,7 @@ other; nothing is in the environment that the spec does not list), its current d
 grants with their scopes, its limits (memory, time), and where its input and output go. It is the
 sandbox spec of std.md's "Sandboxes", so there is one such type. `blaze run --spec` prints it as
 JSON without starting anything; `blaze run --spec-from FILE` takes one (read strictly: an unknown
-field is an error); a bstd program can read its own through `Io`. Its digest joins the program's
+field is an error); a bstd program reads its own through the grant `spec: Spec`. Its digest joins the program's
 identity in the key of a run or a test result, so a test is reused only under the same spec, and
 "why did this rerun" can answer "the spec changed: this variable".
 
@@ -462,8 +638,10 @@ other is filled by a grant of that name, from the command line (`--grant data=fi
 `--grant api=api.example.com:443`) or the package's manifest, where a reviewer reads it. A
 parameter with no grant is a refusal before the run that prints the line to add; never a prompt,
 never a failure halfway. A test says what it takes the same way
-(`fn reads(cx: &Cx, tmp: Dir<ReadWrite>)`), and the runner fills it. `Io`, the bag `main` takes
-today, stays as the grant of everything, for a script, and `blaze run` names it as that.
+(`fn reads(cx: &Cx, tmp: Dir<ReadWrite>)`), and the runner fills it. D104: a whole `Io` cannot
+be asked for; `fn main(cx: &Cx, io: Io)` is refused at the parameter with the kinds to name
+instead. `Io` stays bstd's own world handle (the launcher makes grants from it) and a test's
+simulated world.
 
 **Capabilities are values.** A capability is narrowed and handed on (`data.subdir(..)`,
 `.read_only()`), never widened and never made from nothing, so a library, a dependency included,
@@ -613,13 +791,12 @@ is inherited by every child the program starts and is part of the environment th
 a file needs a path the program can see and someone to delete it. A pipe holds any length, is gone
 when read, reaches only this process, and needs no `unsafe` (opened as `/dev/fd/3`). The variable
 says the descriptor is the parent's: an inherited 3 (a jobserver's pipe) is never read. No mark
-is an ordinary start (only what fills itself, and `Io`, is filled); a marked descriptor that does
+is an ordinary start (only what fills itself is filled); a marked descriptor that does
 not close within 5 seconds, or holds anything but the header and a spec, is a refusal.
 `bstd manifest\n` instead prints the program's manifest as JSON and runs nothing.
 
-Departures, as built: an `Io` parameter fills itself on an ordinary start (so every
-`fn main(cx: &Cx, io: Io)` runs from a shell as before) and needs `--grant io=everything` under a
-spec; standard output and error are both `Out`, told apart by the parameter's name (`out`, `err`);
+Departures, as built: standard output and error are both `Out`, told apart by the parameter's
+name (`out`, `err`); no `Io` parameter and no `everything` scope (D104: `main` names each grant);
 input and the core count are not parameters yet (bstd has no types for them).
 
 Owed: the grant's place in the manifest; the trusted-crate list (who may add to it, pinned how);

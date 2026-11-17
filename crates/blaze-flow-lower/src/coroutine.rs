@@ -34,14 +34,18 @@
 //! R:  Drop(fut) if it needs one; StorageDead(fut); r is the await's value (a temporary)
 //! ```
 //!
-//! Three choices where the record does not name a type, each stated:
-//! - `fut`'s type is the operand's: `<T as IntoFuture>::IntoFuture` is `T` exactly when
-//!   `T: Future` (the library's blanket impl, core/src/future/into_future.rs: `impl<F: Future>
-//!   IntoFuture for F { type Output = F::Output; type IntoFuture = F; fn into_future(self) ->
-//!   Self::IntoFuture { self } }`), and `into_future` is then the identity, so `fut` is related to
-//!   the operand position by position. An operand not known to be a `Future`
-//!   ([`Facts::is_future`]) is refused by name ([`Form::AwaitOperand`]): the type it holds is not
-//!   in the record.
+//! Three choices, each stated:
+//! - `fut`'s type is the record's: the type checker decided `<T as IntoFuture>::IntoFuture` when
+//!   it checked the `.await` (`Checked::awaited_of`); the lowering reads it and never solves it.
+//!   No row (a future not wholly known): refused by name ([`Form::AwaitOperand`]). When it is
+//!   the operand's own type, `into_future` is the identity: the library's blanket impl
+//!   (core/src/future/into_future.rs:138: `impl<F: Future> IntoFuture for F { type Output =
+//!   F::Output; type IntoFuture = F; fn into_future(self) -> Self::IntoFuture { self } }`) is the
+//!   only impl that can name `Self` there (`type IntoFuture: Future<..>` makes `Self: Future`,
+//!   and the blanket impl would then overlap any other), so `fut` is related to the operand
+//!   position by position. Otherwise `into_future` is the selected impl's (the type check
+//!   records it as the `.await`'s callee: blaze-typeck rules/await_impl.rs), related by that
+//!   known head as any call is (await_call.rs); no callee row is refused by name.
 //! - `r`, the `Poll<T>` the call returns, is given the await's output type `T`: `Poll<T>` has
 //!   exactly the origin positions of `T` (core/src/task/poll.rs: `pub enum Poll<T> { Ready(T),
 //!   Pending }`, no lifetime parameter of its own), and the Ready payload is all of `r` there is.
@@ -361,30 +365,32 @@ impl<F: Facts, A: Allocator + Clone> Lower<'_, '_, F, A> {
         if v.ty.wrap.is_some() {
             return self.refuse(Form::AwaitOperand, e);
         }
-        let fty = v.ty.ty;
-        let held = match self.node(fty, e)? {
-            // A coroutine implements `Future` (the solver's builtin, blaze-solve builtin.rs).
-            PNode::Future(..) | PNode::Coroutine { .. } => true,
-            _ => self.facts.is_future(fty) == Some(true),
-        };
-        if !held {
+        // The future `tmp` holds across the suspension, `<T as IntoFuture>::IntoFuture`, as the
+        // type checker decided it at this `.await` (module doc): read, never solved here.
+        let Some(held) = self.ck.awaited_of(e) else {
             return self.refuse(Form::AwaitOperand, e);
-        }
+        };
         let span = self.span(e);
-        let ft = TyD::of(fty);
-        // Step 1: `fut = into_future(op)`, the identity on a future.
+        let ft = TyD::of(held);
+        // Step 1: `fut = into_future(op)`.
         let fut = self.temp(ft, e)?;
         let fp = self.place_of(fut);
         let a = self.operand(v, e)?;
         self.b.call(&[a], fp, span);
-        if let At::Place(p) = v.at {
-            self.relate(p, fp, ft, e)?;
+        if held == v.ty.ty {
+            // The blanket impl's identity (module doc): position by position.
+            if let At::Place(p) = v.at {
+                self.relate(p, fp, ft, e)?;
+            }
+        } else {
+            // The selected impl's `into_future(self) -> Self::IntoFuture`, by its head.
+            self.relate_into_future(v, fp, ft, e)?;
         }
         let (head, ready, pending, cancel) = (self.b.block(), self.b.block(), self.b.block(), self.b.block());
         self.b.goto(head, span);
         // Steps 3 and 4: pin, poll.
         self.b.start(head);
-        let pin = self.new_local_with(TyD { wrap: Some(Mutbl::Mut), ty: fty }, false, None, e)?;
+        let pin = self.new_local_with(TyD { wrap: Some(Mutbl::Mut), ty: held }, false, None, e)?;
         self.b.stmt(StmtKind::StorageLive(pin), span);
         self.borrow(fp, ft, BorrowKind::Mut, pin, e)?;
         let out = TyD::of(self.expr_ty(e)?);

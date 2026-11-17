@@ -39,7 +39,7 @@ use blaze_scope::resolve::{CrateInput, SourceTexts};
 use blaze_scope::prepares::Prepares;
 use blaze_scope::task::Serial;
 use blaze_unit_graph::{Records, StoreSources};
-use blaze_world::{Fetched, Toolchain, Tree, World};
+use blaze_world::{Fetched, Listed, Tree, World, WorldError};
 use bstd::cx::Cx;
 use bstd::fs::{Dir, ReadOnly, ReadWrite};
 use bstd::path::Path;
@@ -51,15 +51,23 @@ use crate::store::Store;
 use crate::work::{Did, Made, held_str};
 
 pub(crate) mod expansion_texts;
+mod scope;
 pub(crate) mod sections;
 
 // The subject and source domains name the payload's form ([`sections::FORM`] 4) and its producer:
 // an old home's records (form 1: exports then inner; form 2: no tests section; "3": form 3 by
 // the old name fill, before blaze-scope's cell core became the writer; "4": form 3, without the
-// expansion texts) are under other names, never found, made again.
-const SUBJECT_DOMAIN: &str = "blaze-cli crate scope 5";
-const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 5";
-const OUT_DOMAIN: &str = "blaze-cli crate scope out 1";
+// expansion texts; "5": an out of the names record alone, see [`OUT_DOMAIN`]) are under other
+// names, never found, made again.
+const SUBJECT_DOMAIN: &str = "blaze-cli crate scope 6";
+const SOURCE_DOMAIN: &str = "blaze-cli crate scope source 6";
+/// The out: the names record AND the checkout files the crate holds ([`crate_out`]). "1" was
+/// the names record alone, but a body's check reads its crate's items record to find which
+/// crate owns its file (body_types.rs `prepare`): a module file created gave a new record at
+/// an EQUAL out, so a reader handed the old record (settled standing, then made again: the
+/// drive does not re-enter readers of an equal out) kept "no crate's names record lists this
+/// file" while a fresh home did not (rule 21; main.rs `edits_of_module_files_answer_as_a_fresh_home`).
+const OUT_DOMAIN: &str = "blaze-cli crate scope out 2";
 /// The rule a refusal of this task names.
 const RULE: &str = "names.rs";
 
@@ -184,7 +192,7 @@ impl<'b> Records<'b> for Folder {
 }
 
 /// One crate made this command: its payload, out, and the checkout files its resolution read.
-struct Resolved {
+pub(crate) struct Resolved {
     /// The record's payload ([`sections::write`]).
     payload: blaze_own::Vec<u8, Global>,
     out: ContentId,
@@ -482,15 +490,11 @@ pub(crate) fn world<'f>(
     let decoded = blaze_unit_graph::record::decode(graph_record, Alloc::global()).map_err(NamesError::Graph)?;
     let decoded: &'static blaze_unit_graph::record::Decoded<'static> = std::boxed::Box::leak(std::boxed::Box::new(decoded));
     let graph = &decoded.graph;
-    let needs = blaze_world::needs(graph);
     // The files read for the names step live to the end of the command: a context of the
     // command's (its deadline) and a frame of their own, both held to the end.
     let cx: &'static Cx = std::boxed::Box::leak(std::boxed::Box::new(cx.until(cx.deadline())));
     let frame: &'static Frame = std::boxed::Box::leak(std::boxed::Box::new(Frame::with_reserve(NAMES_FRAME, bstd::mem::Tag::Other).map_err(|_| NamesError::Frame)?));
     let mut shelf = crate::toolchain::HomeShelf::open(cx, &env.fs, home, frame).map_err(NamesError::Shelf)?;
-    let toolchain = Toolchain::open(&mut shelf, env.toolchain, crate::graph::TRIPLE, needs, Alloc::global())
-        .map_err(|e| NamesError::Toolchain(std::format!("{e}")))?;
-    let toolchain: &'f Toolchain<'f, crate::toolchain::Held<'static>> = std::boxed::Box::leak(std::boxed::Box::new(toolchain));
     let reader: &'static Reader = std::boxed::Box::leak(std::boxed::Box::new(Reader { cx, root: root.read_only(), frame }));
     let sources = StoreSources::new(lock, Folder::of(reader, env)?, PackView::open_source_put, Alloc::global())
         .map_err(|e| NamesError::Sources(std::format!("{e}")))?;
@@ -532,7 +536,13 @@ pub(crate) fn world<'f>(
     let paths: &'f [(LockId, &'f str)] = std::vec::Vec::leak(paths);
     let checkout: &'f ReadTree = std::boxed::Box::leak(std::boxed::Box::new(ReadTree(reader)));
     let mut packages = Fetched { store: sources, paths, lock, alloc: Alloc::global() };
-    let world = blaze_world::world(graph, lock, toolchain, &mut packages, checkout, None, Alloc::global())
+    // The crate list (blaze-scope's units list, the one home) and the toolchain crates it needs.
+    let listed = blaze_world::open_list(&mut shelf, env.toolchain, crate::graph::TRIPLE, graph, lock, &mut packages, Alloc::global()).map_err(|e| match e {
+        WorldError::Toolchain(_) => NamesError::Toolchain(std::format!("{e}")),
+        other => NamesError::World(std::format!("{other}")),
+    })?;
+    let listed: &'f Listed<'f, crate::toolchain::Held<'static>> = std::boxed::Box::leak(std::boxed::Box::new(listed));
+    let world = blaze_world::world(graph, lock, listed, &mut packages, checkout, None, Alloc::global())
         .map_err(|e| NamesError::World(std::format!("{e}")))?;
     let mut by_subject = std::vec::Vec::new();
     let mut by_key = std::vec::Vec::new();
@@ -586,35 +596,6 @@ pub(crate) fn parts(names: &Names<'_>) -> std::vec::Vec<(Name, ContentId), Globa
     parts
 }
 
-/// The world's texts, listing each checkout file read (tree 0: `/0/<path>`) and each looked
-/// for and not found.
-struct Recording<'r, 'w> {
-    inner: &'r blaze_world::Texts<'w>,
-    read: RefCell<std::vec::Vec<String, Global>>,
-    absent: RefCell<std::vec::Vec<String, Global>>,
-}
-
-impl<'w> SourceTexts<'w> for Recording<'_, 'w> {
-    fn read(&self, krate: usize, path: &str) -> Option<&'w str> {
-        let text = self.inner.read(krate, path);
-        // A file there is read as its `Surface`; a probe that found nothing (a module's other
-        // place, `m.rs` beside `m/mod.rs`, a missing `mod x;`) as its `Surface`'s absence.
-        if let Some(inner) = path.strip_prefix("/0/") {
-            match text {
-                Some(_) => self.read.borrow_mut().push(String::from(inner)),
-                None => self.absent.borrow_mut().push(String::from(inner)),
-            }
-        }
-        text
-    }
-
-    /// The world's environment of the crate (D96: `CARGO_MANIFEST_DIR` the root it sees).
-    fn crate_env(&self, krate: usize) -> Option<&blaze_scope::crate_env::CrateEnv<'w>> {
-        self.inner.crate_env(krate)
-    }
-}
-
-
 /// The surface name of a checkout file.
 /// The name a file the resolver read is listed by: the slot `a/x.rs` for `a/x/mod.rs` found
 /// through `mod x;`, else the path itself. A `mod.rs` file is a slot's exactly when the
@@ -641,210 +622,6 @@ fn surface(path: &str) -> Name {
     Name::new(Kind::Surface, Name::file(path.as_bytes()).subject)
 }
 
-/// One `CrateScope` task.
-#[expect(clippy::too_many_arguments, reason = "a task's edge: each argument one handle or frame of it")]
-pub(crate) fn run<'f, 'b>(
-    cx: &Cx,
-    root: &Dir<ReadWrite>,
-    store: &mut dyn Store,
-    names: &mut Option<Names<'f>>,
-    lock: Option<&'f Lock<'static>>,
-    members: Option<&[(LockId, blaze_unit_graph::Text<'_>)]>,
-    env: &FetchEnv<'_>,
-    task: &Task<'_>,
-    frame: &Frame,
-    held: &'b Frame,
-) -> Result<Did<'b>, CliError> {
-    let cx = cx.span("crate scope: resolve one crate's names");
-    let name = task.name;
-    let refused = |what: &'static str| TaskFailure { name, why: Why::Refused { what, rule: RULE } };
-    if names.is_none() {
-        let Some(graph) = task.inputs.iter().find(|input: &&Input| input.name == Name::unit_graph()) else {
-            let mut wants = blaze_own::Vec::with_capacity_in(1, held);
-            wants.push(Want { name: Name::unit_graph(), home: Name::unit_graph() });
-            return Ok(Did::Need(wants));
-        };
-        let read = crate::work::payload(&cx, store, graph, frame)?;
-        match world(&cx, root, read.payload(), lock, members, env) {
-            Ok(made) => {
-                tell_public(store, &made);
-                *names = Some(made);
-            }
-            Err(error) => {
-                let words = bstd::mem::format_in!(held, "names not resolved: {error}");
-                return Ok(Did::FailedSaying(refused("the crates' inputs could not be made"), held_str(words.as_str(), held)));
-            }
-        }
-    }
-    let names = names.as_mut().expect("made above");
-    let Ok(at) = names.by_subject.binary_search_by_key(&name.subject, |(subject, _)| *subject).map(|i| names.by_subject[i].1) else {
-        return Ok(Did::FailedSaying(refused("a crate the world does not hold"), "a `CrateScope` part names a crate this command's world does not hold"));
-    };
-    // Any need that failed this command (a dependency's names, a file's surface whose outline
-    // failed): this crate fails `Waited` on it, alone (rule 20); asking again would loop.
-    if let Some(failed) = task.failed.first() {
-        return Ok(Did::Failed(TaskFailure { name, why: Why::Waited { on: *failed } }));
-    }
-    let crates = &names.world.crates;
-    let input = crates[at].input;
-    // The records it reads, by crate index: direct dependencies, the sysroot crates, then each
-    // a `Need` named (any `CrateScope` input beyond those).
-    let mut local: std::vec::Vec<usize, Global> = std::vec::Vec::new();
-    let place = |global: usize, local: &mut std::vec::Vec<usize, Global>| match local.iter().position(|g| *g == global) {
-        Some(p) => p,
-        None => {
-            local.push(global);
-            local.len() - 1
-        }
-    };
-    let mut own_deps: std::vec::Vec<(&'f str, usize), Global> = std::vec::Vec::with_capacity(input.deps.len());
-    for &(dep, index) in input.deps {
-        own_deps.push((dep, place(index, &mut local)));
-    }
-    let sysroot = names.world.sysroot;
-    let all = [sysroot.core, sysroot.alloc, sysroot.std, sysroot.bstd];
-    // A toolchain crate is given only the sysroot crates below it (its dependencies' closure),
-    // or `core` and `alloc` would each wait on the other; any other crate is given all of them.
-    let below = {
-        let mut seen: std::vec::Vec<bool, Global> = std::vec::Vec::new();
-        seen.resize(crates.len(), false);
-        let mut stack: std::vec::Vec<usize, Global> = std::vec::Vec::new();
-        stack.extend(input.deps.iter().map(|(_, index)| *index));
-        while let Some(g) = stack.pop() {
-            if !core::mem::replace(&mut seen[g], true) {
-                stack.extend(crates[g].input.deps.iter().map(|(_, index)| *index));
-            }
-        }
-        seen
-    };
-    let toolchain = at < names.world.toolchain_crates as usize;
-    let mut mapped = [None; 4];
-    for (slot, s) in mapped.iter_mut().zip(all) {
-        *slot = s.filter(|s| s.index() != at && (!toolchain || below[s.index()])).map(|s| place(s.index(), &mut local));
-    }
-    for input in task.inputs.iter().filter(|input| input.name.kind == Kind::CrateScope) {
-        if let Ok(i) = names.by_subject.binary_search_by_key(&input.name.subject, |(subject, _)| *subject) {
-            place(names.by_subject[i].1, &mut local);
-        }
-    }
-    // Hashed once per crate, never per input compared (as body_types.rs `input_at`).
-    let have = |g: usize| {
-        let name = name_of(crates[g].input.key);
-        task.inputs.iter().find(|input| input.name == name)
-    };
-    let missing: std::vec::Vec<usize, Global> = local.iter().copied().filter(|g| have(*g).is_none()).collect();
-    if !missing.is_empty() {
-        let mut wants = blaze_own::Vec::with_capacity_in(missing.len(), held);
-        wants.extend(missing.iter().map(|g| Want { name: name_of(crates[*g].input.key), home: Name::unit_graph() }));
-        return Ok(Did::Need(wants));
-    }
-    let made_at = names.made.binary_search_by_key(&name.subject, |(subject, _)| *subject);
-    if made_at.is_err() {
-        let mut deps: std::vec::Vec<&'static [u8], Global> = std::vec::Vec::with_capacity(local.len());
-        for g in local.iter() {
-            let read = crate::work::payload(&cx, store, have(*g).expect("checked above"), frame)?;
-            let record = match sections::sections(read.payload()) {
-                Ok(parts) => parts.exports,
-                Err(error) => {
-                    let words = bstd::mem::format_in!(held, "crate `{}`: the record of its dependency `{}`: {error}", input.name, crates[*g].input.name);
-                    return Ok(Did::FailedSaying(refused("a dependency's record"), held_str(words.as_str(), held)));
-                }
-            };
-            #[cfg(test)]
-            sections::watch(crates[*g].input.name, read.payload());
-            deps.push(blaze_scope::resolve::aligned(record, Alloc::global()));
-        }
-        let me = local.len();
-        let own = |s: Option<CrateId>| s.filter(|s| s.index() == at).map(|_| CrateId(me as u32));
-        let ids = mapped.map(|p| p.map(|p| CrateId(p as u32)));
-        let local_sysroot = Sysroot { core: ids[0].or(own(all[0])), alloc: ids[1].or(own(all[1])), std: ids[2].or(own(all[2])), bstd: ids[3].or(own(all[3])) };
-        let own_deps: &'f [(&'f str, usize)] = std::vec::Vec::leak(own_deps);
-        let local_input = CrateInput { deps: own_deps, ..input };
-        let texts = Recording { inner: &names.world.texts, read: RefCell::new(std::vec::Vec::new()), absent: RefCell::new(std::vec::Vec::new()) };
-        let done = {
-            let _cx = cx.span("crate scope: resolve_crate");
-            resolve_crate(&local_input, &deps, local_sysroot, &texts, at, &Serial, names.prepares, Alloc::global())
-        };
-        let done = match done {
-            Ok(done) => Ok(done),
-            Err(CrateScopeError::Need(keys)) => {
-                let mut wants = blaze_own::Vec::with_capacity_in(keys.len(), held);
-                for key in keys.iter() {
-                    let Ok(i) = names.by_key.binary_search_by_key(key, |(k, _)| *k) else {
-                        return Ok(Did::FailedSaying(refused("a needed crate the world does not hold"), "the resolution needs a crate's record this command's world does not hold"));
-                    };
-                    wants.push(Want { name: name_of(crates[names.by_key[i].1].input.key), home: Name::unit_graph() });
-                }
-                return Ok(Did::Need(wants));
-            }
-            // The crate's typed failure is its answer (work.rs, `filed`): a record whose out
-            // says failed, with the files it read so far as its read list, so it stands until
-            // one of them moves and a reader of it fails `Waited` on it.
-            Err(error) => Err(std::format!("crate `{}`: its names could not be resolved: {error:?}", input.name)),
-        };
-        let (out, payload, findings, failed) = match done {
-            Ok(done) => {
-                names.resolved += 1;
-                match scope_record(&done, input.name) {
-                    Ok(record) => {
-                        names.unresolved += u64::from(record.unresolved);
-                        (ContentId::of(OUT_DOMAIN, &done.record), record.payload, record.findings, record.tests_refused)
-                    }
-                    Err(unwritten) => (crate::work::failed_out(), sections::write(0, [&[][..]; sections::SECTIONS]), blaze_own::Vec::new_in(Global), Some(std::format!("{unwritten}"))),
-                }
-            }
-            Err(words) => (crate::work::failed_out(), sections::write(0, [&[][..]; sections::SECTIONS]), blaze_own::Vec::new_in(Global), Some(words)),
-        };
-        // The drive names a module file by its slot (`x.rs` for `x/mod.rs` too, sweep.rs): a
-        // read of either place is a read of the slot's `Surface`.
-        let (mut read, mut lacked) = (texts.read.into_inner(), texts.absent.into_inner());
-        read.sort_unstable();
-        lacked.sort_unstable();
-        let (mut files, mut absent) = (read.clone(), lacked.clone());
-        let looked = |slot: &str| [&read, &lacked].iter().any(|list| list.binary_search_by(|path| path.as_str().cmp(slot)).is_ok());
-        for path in files.iter_mut().chain(absent.iter_mut()) {
-            *path = slot_of(core::mem::take(path), looked);
-        }
-        files.sort_unstable();
-        files.dedup();
-        absent.sort_unstable();
-        absent.dedup();
-        absent.retain(|path| files.binary_search(path).is_err());
-        let resolved = Resolved { out, payload, files, absent, findings, failed };
-        let i = names.made.binary_search_by_key(&name.subject, |(subject, _)| *subject).unwrap_err();
-        names.made.insert(i, (name.subject, resolved));
-    }
-    let i = names.made.binary_search_by_key(&name.subject, |(subject, _)| *subject).expect("made above");
-    let resolved = &names.made[i].1;
-    // Each checkout file it read is read as its `Surface`: ask for those not given yet, with
-    // the dependencies' records again, so the entry after holds them all.
-    let unread: std::vec::Vec<&String, Global> = resolved.files.iter().filter(|path| !task.inputs.iter().any(|input| input.name == surface(path))).collect();
-    if !unread.is_empty() {
-        let mut wants = blaze_own::Vec::with_capacity_in(unread.len() + local.len(), held);
-        wants.extend(unread.iter().map(|path| Want { name: surface(path), home: Name::file(path.as_bytes()) }));
-        wants.extend(local.iter().map(|g| Want { name: name_of(crates[*g].input.key), home: Name::unit_graph() }));
-        return Ok(Did::Need(wants));
-    }
-    let mut made = Made::new_in(name, held);
-    made.out = resolved.out;
-    made.payload.extend_from_slice(&resolved.payload);
-    for finding in resolved.findings.iter() {
-        let words = core::str::from_utf8(&finding.message).map_err(|_| CliError::Text { what: "a path's segment is not UTF-8" })?;
-        made.find(UNRESOLVED, finding.at, &[words]);
-    }
-    if let Some(words) = &resolved.failed {
-        made.find(crate::work::TASK_FAILED, (0, 0), &[words.as_str()]);
-    }
-    for path in resolved.files.iter() {
-        let input = task.inputs.iter().find(|input| input.name == surface(path)).expect("checked above");
-        made.reads.push((input.name, input.out));
-    }
-    for path in resolved.absent.iter() {
-        made.reads.push((surface(path), blaze_drive::key::ABSENT));
-    }
-    for g in local.iter() {
-        let input = have(*g).expect("checked above");
-        made.reads.push((input.name, input.out));
-    }
-    Ok(Did::Done(made))
-}
+#[cfg(test)]
+pub(crate) use scope::scope_made;
+pub(crate) use scope::{Prepared, Resolution, SCOPE_FRAME, SCOPE_JOBS, ScopeJob, ScopeRound, answer, prepare, resolve, run, settle};

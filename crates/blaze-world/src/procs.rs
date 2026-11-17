@@ -110,6 +110,38 @@ pub fn identify(
     unit: &Unit<'_>,
     path_dir: impl Fn(LockId) -> Option<PathBuf>,
 ) -> Result<Result<MacroIdentity, Unidentified>, ProcsError> {
+    identify_by(lock, locked, git_folders, unit, |id| match path_dir(id) {
+        None => Ok(None),
+        Some(dir) => {
+            let mut listed = package_files(&dir).map_err(|error| ProcsError::Files { at: dir.clone(), error })?;
+            Ok(Some(files_digest(&mut listed)))
+        }
+    })
+}
+
+/// [`identify`], a path package's sources given as their digest: `path_files` is the hex of
+/// [`files_digest`] over the package's files, which the caller read through its own effects
+/// (blaze-cli's `MacroFiles` leaf row, whose id the module lookup's key already holds), or
+/// `None` for a path package it has no files of (then `PathWithoutFolder`, by name).
+pub fn identify_files(
+    lock: &Lock<'_>,
+    locked: &LockedPackages<'_>,
+    git_folders: &BTreeMap<String, String>,
+    unit: &Unit<'_>,
+    path_files: impl Fn(LockId) -> Option<String>,
+) -> Result<Result<MacroIdentity, Unidentified>, ProcsError> {
+    identify_by(lock, locked, git_folders, unit, |id| Ok(path_files(id)))
+}
+
+/// The one home of a macro crate's identity: [`identify`] and [`identify_files`] differ only in
+/// how a path package's files digest is had (`path_files`: `None` when it has none).
+fn identify_by(
+    lock: &Lock<'_>,
+    locked: &LockedPackages<'_>,
+    git_folders: &BTreeMap<String, String>,
+    unit: &Unit<'_>,
+    path_files: impl FnOnce(LockId) -> Result<Option<String>, ProcsError>,
+) -> Result<Result<MacroIdentity, Unidentified>, ProcsError> {
     let (package, version) = (unit.name.as_str(), unit.version.as_str());
     let named = || (package.to_string(), version.to_string());
     let locked_package = lock.package(unit.package);
@@ -125,14 +157,13 @@ pub fn identify(
                 return Ok(Err(Unidentified::GitFolderUnknown { package, version }));
             }
         },
-        LockSource::Path => {
-            let Some(dir) = path_dir(unit.package) else {
+        LockSource::Path => match path_files(unit.package)? {
+            Some(files_sha256) => OwnedSource::Path(files_sha256),
+            None => {
                 let (package, version) = named();
                 return Ok(Err(Unidentified::PathWithoutFolder { package, version }));
-            };
-            let mut listed = package_files(&dir).map_err(|error| ProcsError::Files { at: dir.clone(), error })?;
-            OwnedSource::Path(files_digest(&mut listed))
-        }
+            }
+        },
     };
     let deps = match locked.closure(package, version) {
         Ok(deps) => deps,

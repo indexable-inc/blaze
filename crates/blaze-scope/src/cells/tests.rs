@@ -1090,7 +1090,8 @@ fn r8_a_macro_written_root_extern_crate_adds_a_name_and_never_replaces_one() {
     let ok = with_dep(&w, root, dep, CellPlant::None);
     assert_eq!(named_def(outcome(&ok, b, 0), Namespace::Types), Some(x), "`u`: {:?}", outcome(&ok, b, 0));
     assert_eq!(named_def(outcome(&ok, b, 1), Namespace::Types), Some(x), "`t`: {:?}", outcome(&ok, b, 1));
-    assert_eq!(&ok.r8[..], &["n"][..], "R8's error names the replaced name");
+    let replaced: Vec<_> = ok.r8.iter().map(|r| r.1.name).collect();
+    assert_eq!(&replaced[..], &["n"][..], "R8's error names the replaced name");
     let bad = with_dep(&w, root, dep, CellPlant::R8AddsNothing);
     assert!(matches!(outcome(&bad, b, 0), Outcome::Failed(Unresolved::NotFound)), "the control R8AddsNothing: {:?}", outcome(&bad, b, 0));
     let bad = with_dep(&w, root, dep, CellPlant::R8MacroReplaces);
@@ -1362,7 +1363,8 @@ fn a_call_at_the_recursion_limit_is_an_error() {
 /// lexically it waits on itself: the stall); `kern_return` is the root's module, not the empty
 /// one beside the import; `S` is visible in `task_info`; `u` is not found (no extern prelude).
 /// The reference solver agrees on every import. Control `Use2015Lexical`: `use mem;` and the
-/// `kern_return` import fail, `u` resolves, and `pub(in task_info)` refuses the load.
+/// `kern_return` import fail, `u` resolves, and `pub(in task_info)` is `task_info`'s
+/// `RestrictedNotAncestor` error (names-G1: never a refused load).
 /// Prints: "test cells::tests::a_2015_use_path_starts_at_the_crate_root ... ok".
 #[test]
 fn a_2015_use_path_starts_at_the_crate_root() {
@@ -1395,7 +1397,21 @@ fn a_2015_use_path_starts_at_the_crate_root() {
     w.item(ti, "S", Namespace::Types, crate::DefKind::Other, V::In("task_info"));
     let mut vis = cells_of(&w, root, CellPlant::None);
     assert!(matches!(vis.ask(ti, Namespace::Types, "S").expect("asks"), Some(Value::Found(_, crate::Visibility::Restricted(k))) if k == ti));
-    assert!(Cells::load_planted(&w, root, None, CellPlant::Use2015Lexical, Alloc::global()).is_err(), "the control, `pub(in task_info)`");
+    // The control: a 2015 path from no module names no ancestor, the item's own error in
+    // `task_info`'s scope (names-G1: an error at the item, never a refused load).
+    let alloc = blaze_own::testing::heap().alloc();
+    let good = with_dep(&w, root, dep, CellPlant::None);
+    let gix = good.write_index(alloc);
+    let (gscope, _) = good.scope(&gix, ti, alloc).expect("`task_info` is written");
+    assert!(!gscope.errors.iter().any(|e| matches!(e, blaze_surface::ScopeError::RestrictedNotAncestor { .. })), "`pub(in task_info)`: {:?}", gscope.errors);
+    let bad = with_dep(&w, root, dep, CellPlant::Use2015Lexical);
+    let ix = bad.write_index(alloc);
+    let (scope, _) = bad.scope(&ix, ti, alloc).expect("`task_info` is written");
+    assert!(
+        scope.errors.iter().any(|e| matches!(e, blaze_surface::ScopeError::RestrictedNotAncestor { .. })),
+        "the control, `pub(in task_info)`: {:?}",
+        scope.errors
+    );
 }
 
 /// Two derives of one item named through a glob (zerocopy's `byteorder`: `use super::*;` and

@@ -268,11 +268,27 @@ fn tree(a: u8, b: u8) -> Tree {
     Tree::Mem { files: Arc::new(vec![("a.txt".to_owned(), vec![b'a', a]), ("b.txt".to_owned(), vec![b'b', b])]), git: None }
 }
 
+/// D96: a dependency's script runs in `/package` and a member's in `/workspace/<dir>`, and a
+/// member dir that leaves the workspace is refused; the plan as data, nothing run. Remove the
+/// `ScriptRoot` mount (serve every tree at `/workspace` again) and the first assert fails.
+/// Prints nothing; passes.
+#[test]
+fn script_root_mounts_a_dependency_at_package_and_a_member_in_its_workspace() {
+    use crate::script_sandbox::ScriptRoot;
+    let dependency = Script { root: ScriptRoot::package(), ..Script::clone(&script("dep", Tree::Mem { files: Arc::new(Vec::new()), git: None }, Vec::new())) };
+    assert_eq!(dependency.cwd(), "/package");
+    let member = Script { root: ScriptRoot::member("crates/app").expect("a plain dir"), ..Script::clone(&dependency) };
+    assert_eq!(member.cwd(), "/workspace/crates/app");
+    assert_eq!(ScriptRoot::member("").expect("the root package").seen().to_string(), "/workspace");
+    assert!(ScriptRoot::member("../x").is_err());
+}
+
 fn script(name: &str, tree: Tree, env: Vec<(String, String)>) -> Arc<Script> {
     Arc::new(Script {
         package: format!("{name} 0.0.0"),
         tree,
-        folder: String::new(),
+        // The workspace's root package: the wasm fixtures name `workspace/a.txt`.
+        root: crate::script_sandbox::ScriptRoot::member("").expect("the root package"),
         env,
         target: "aarch64-apple-darwin".to_owned(),
         host: "aarch64-apple-darwin".to_owned(),
@@ -282,6 +298,7 @@ fn script(name: &str, tree: Tree, env: Vec<(String, String)>) -> Arc<Script> {
         spawner: None,
         step: blaze_ids::ContentId::default(),
         spawn_setting: Arc::new(crate::spawn_route::SpawnSetting::off()),
+        deps: Arc::new(crate::script_sandbox::dep_mount::DepViews::none()),
     })
 }
 

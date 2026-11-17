@@ -101,6 +101,11 @@ pub enum Which {
     RotateRight,
     Likely,
     Unlikely,
+    /// The validity assertions: decided at the instance by the layout (intrinsics/validity.rs),
+    /// built by the walk (walk/validity.rs) as nothing or a `panic_nounwind` call.
+    AssertInhabited,
+    AssertZeroValid,
+    AssertMemUninitializedValid,
     Assume,
     ColdPath,
     /// alloc's `__rust_no_alloc_shim_is_unstable_v2`: no rustc intrinsic, a fn rustc's
@@ -136,6 +141,9 @@ pub enum Which {
     PtrGuaranteedCmp,
     ThreeWayCompare,
     SliceGetUnchecked,
+    /// `type_name::<T>()`: evaluated by blaze-consteval only (core calls it in a `const`
+    /// block); its text is type_name.rs's.
+    TypeName,
     /// core's `ub_checks()`: `true` in a constant (blaze-consteval machine.rs `intrinsic`);
     /// built from its body `cfg!(ub_checks)` (front2 tables an intrinsic with a body by its body).
     UbChecks,
@@ -169,7 +177,10 @@ pub const TABLE: &[Entry] = &[
     e("align_of", Which::AlignOf, "The minimum alignment of a type.", "a constant from the layout"),
     e("align_of_val", Which::AlignOfVal, "The required alignment of the referenced value.", "a constant: a slice tail's alignment is static; `dyn` refused"),
     e("arith_offset", Which::ArithOffset, "Calculates the offset from a pointer, potentially wrapping.", "`ptr_add` of `delta * size`, no promise").stepping(ElementArg::Is(0)),
-    e("assume", Which::Assume, "Informs the optimizer that a condition is always true. If the condition is false, the behavior is undefined.", "`assume`"),
+    e("assert_inhabited", Which::AssertInhabited, "A guard for unsafe functions that cannot ever be executed if `T` is uninhabited: This will statically either panic, or do nothing.", "nothing, or (T uninhabited: an enum with no variant whose fields are all inhabited) a call of `panic_nounwind` \"attempted to instantiate uninhabited type `T`\" (intrinsics/validity/exact.rs, walk/validity.rs)"),
+    e("assert_mem_uninitialized_valid", Which::AssertMemUninitializedValid, "A guard for `std::mem::uninitialized`. This will statically either panic, or do nothing.", "nothing, or (the value of T whose every byte is 0x01 invalid, an enum by the variant that fill selects: intrinsics/validity/exact.rs) a call of `panic_nounwind` \"attempted to leave type `T` uninitialized, which is invalid\""),
+    e("assert_zero_valid", Which::AssertZeroValid, "A guard for unsafe functions that cannot ever be executed if `T` does not permit zero-initialization: This will statically either panic, or do nothing.", "nothing, or (the all-zero value of T invalid, an enum by the variant whose tag reads 0: intrinsics/validity/exact.rs) a call of `panic_nounwind` \"attempted to zero-initialize type `T`, which is invalid\""),
+    e("assume", Which::Assume,"Informs the optimizer that a condition is always true. If the condition is false, the behavior is undefined.", "`assume`"),
     e("atomic_and", Which::AtomicAnd, "Bitwise and with the current value, returning the previous value.", "`atomic_rmw and`"),
     e("atomic_cxchg", Which::AtomicCxchg, "Stores a value if the current value is the same as the `old` value, with the returned `T` being the previous value and the returned `bool` being whether the exchange was successful.", "`cmpxchg` with both orderings"),
     e("atomic_cxchgweak", Which::AtomicCxchgWeak, "Stores a value if the current value is the same as the `old` value, with the returned `T` being the previous value and the returned `bool` being whether the exchange was successful. The comparison may spuriously fail.", "`cmpxchg weak`"),
@@ -224,6 +235,7 @@ pub const TABLE: &[Entry] = &[
     e("three_way_compare", Which::ThreeWayCompare, "Does a three-way comparison between the two arguments, which must be of character or integer (signed or unsigned) type.", "two `icmp`s (`slt`/`sgt`, or `ult`/`ugt` for unsigned and `char`) and two `select`s to `Ordering`'s -1/0/1"),
     e("transmute", Which::Transmute, "Reinterprets the bits of a value of one type as another type.", "the bits kept (`expose`/`from_exposed`/`bitcast` between scalar kinds); an aggregate through memory"),
     e("transmute_unchecked", Which::TransmuteUnchecked, "Like [`transmute`], but even less checked at compile-time: rather than giving an error for `size_of::<Src>() != size_of::<Dst>()`, it's **Undefined Behavior** at runtime.", "as `transmute`; sizes must still agree here"),
+    e("type_name", Which::TypeName, "Gets a static string slice containing the name of a type.", "nothing at run time (\"can only be called at compile-time\"): blaze-consteval evaluates it to the text of type_name.rs"),
     e("ub_checks", Which::UbChecks, "Returns whether we should perform some UB-checking at runtime.", "its body, `cfg!(ub_checks)`; `true` in a constant"),
     e("unaligned_volatile_load", Which::UnalignedVolatileLoad, "Performs a volatile load from the `src` pointer The pointer is not required to be aligned.", "`load volatile`, alignment 1"),
     e("unaligned_volatile_store", Which::UnalignedVolatileStore, "Performs a volatile store to the `dst` pointer. The pointer is not required to be aligned.", "`store volatile`, alignment 1"),
@@ -907,10 +919,16 @@ pub fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
         // A call of its run-time fn, which only the walk can make (lib.rs, "Intrinsics").
         W::ConstEvalSelect => return Err(s.shape("`const_eval_select` reached the intrinsic builder: the walk calls its run-time fn")),
         W::CatchUnwind => return Err(s.shape("`catch_unwind` reached the intrinsic builder: the walk builds its landing block")),
+        W::AssertInhabited | W::AssertZeroValid | W::AssertMemUninitializedValid => {
+            return Err(s.shape("a validity assertion reached the intrinsic builder: the walk builds it (walk/validity.rs)"));
+        }
         // core's `ub_checks` has a body (`cfg!(ub_checks)`), which front2 builds as the fn
         // (front2/program/tabled.rs: an intrinsic is tabled only without a body). A table call
         // would need the build's own `ub_checks` setting, which no builder context carries yet.
         W::UbChecks => return Err(IntrinsicError::Unsupported { which: c.which, why: "`ub_checks` as a table call (front2 builds its `cfg!(ub_checks)` body)" }),
+        // core/src/intrinsics/mod.rs: "this can only be called at compile-time as backends do
+        // not have an implementation for it"; core's `type_name` wraps it in a `const` block.
+        W::TypeName => return Err(s.shape("`type_name` reached the intrinsic builder: it is evaluated in its `const` block (blaze-consteval)")),
     };
     Ok(out)
 }
@@ -1046,7 +1064,9 @@ fn location<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
 
 mod element;
 pub mod simd;
+mod simd_vec;
 pub mod target;
+pub mod validity;
 #[cfg(test)]
 mod tests;
 

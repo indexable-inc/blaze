@@ -15,14 +15,14 @@
 //! (`drop_in_place::<U>`, a thin pointer) on `data + i * stride`. A `str`, or an element that
 //! needs no drop, builds an empty body.
 //!
-//! A panic inside one element's drop would, in Rust, go on to drop the rest of the elements
-//! while unwinding; the build does not unwind (a panic aborts), so no landing pad is built here
-//! and none is guessed.
+//! A panic inside one element's drop goes on, in Rust, to drop the rest of the elements while
+//! unwinding: under `panic = unwind` element i's drop is an `invoke` whose landing drops
+//! elements i+1.. by the same loop (walk/unwind_ladder.rs `elements`).
 
 use core::alloc::Allocator;
 
 use blaze_lir::builder::MemAttrs;
-use blaze_lir::{Flags, IntCond, Op, Ty, Value};
+use blaze_lir::{Flags, Ty, Value};
 use blaze_typeck::{PNode, PTy};
 
 use super::{TyErr, Walk, malformed};
@@ -62,24 +62,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         let (stride, _) = self.size_align(repr);
         let data = self.b.load(Ty::PTR, Flags::NONE, w, 0, MemAttrs::aligned(3));
         let len = self.b.load(Ty::I64, Flags::NONE, w, 8, MemAttrs::aligned(3));
-        let header = self.create();
-        let body = self.create();
-        let exit = self.create();
         let zero = self.b.iconst(Ty::I64, 0);
-        self.jump(header, &[zero]);
-        self.begin(header);
-        let i = self.b.param(Ty::I64);
-        let more = self.b.icmp(IntCond::Ult, i, len);
-        self.br(more, (body, &[]), (exit, &[]));
-        self.begin(body);
-        let s = self.b.iconst(Ty::I64, u128::from(stride));
-        let off = self.b.binary(Op::Mul, Flags::NONE, i, s);
-        let ep = self.b.ptr_add(Flags::NONE, data, off);
-        self.drop_at(elem, (ep, 0))?;
-        let one = self.b.iconst(Ty::I64, 1);
-        let next = self.b.binary(Op::Add, Flags::NONE, i, one);
-        self.jump(header, &[next]);
-        self.begin(exit);
-        Ok(())
+        self.elements(elem, data, zero, len, stride)
     }
 }

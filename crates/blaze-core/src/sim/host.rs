@@ -23,8 +23,10 @@
 //! clock, and random bytes are the seed's numbers.
 //!
 //! The simulated disk's directories are those some file is under; a directory made empty is
-//! one more, there until removed, through a crash too. Watches and journals are told of none,
-//! and [`Effect::Entries`] and [`Effect::Stamp`] do not see one with nothing under it.
+//! one more, there until removed. Its making and its removal are changes of a name of its
+//! parent's, which a crash may undo until the parent is synced (`dir_names.rs`). Watches and
+//! journals are told of none, and [`Effect::Entries`] and [`Effect::Stamp`] do not see one
+//! with nothing under it.
 
 use std::{
     collections::VecDeque,
@@ -90,6 +92,9 @@ pub(super) enum Plant {
     /// The loose rule: a file's sync makes its name durable too, as if its directory were
     /// synced.
     FileSyncKeepsName,
+    /// The loose rule for directories: a directory made or removed is durable as it is, as if
+    /// its parent were synced (nothing journaled: `dir_names.rs`).
+    DirNamesDurable,
 }
 
 /// A UDP socket bound, and the datagrams it got and no receive took yet.
@@ -716,8 +721,9 @@ impl Sim {
     }
 
     /// The machine loses power: every socket goes, with what was on its way to one and every
-    /// receive and read waiting. What was written stays written, what was read stays read, and
-    /// a directory made stays made.
+    /// receive and read waiting. What was written stays written and what was read stays read;
+    /// what a crash does to a directory made or removed is `Sim::crash_with`'s, by its name
+    /// (`dir_names.rs`).
     pub(super) fn host_crash(&mut self) {
         self.host.socks.clear();
         self.host.flying.clear();
@@ -770,7 +776,9 @@ impl Sim {
             }
         }
         let at = self.host.made.binary_search(&dir).expect_err("not made, looked up above");
-        self.host.made.insert(at, dir);
+        // clone: the journal's own name of it, a refcount.
+        self.host.made.insert(at, dir.clone());
+        self.dir_named(super::Named::MadeDir { dir });
         Done::MadeDir
     }
 
@@ -798,11 +806,15 @@ impl Sim {
                 self.changed(&file);
             }
             self.host.made.retain(|it| !it.is_under(dir));
+            // clone: the journal's own name of it, a refcount.
+            self.dir_named(super::Named::RemovedDir { dir: dir.clone() });
             return Done::RemovedDir;
         }
         match self.host.made.binary_search(dir) {
             Ok(at) => {
                 self.host.made.remove(at);
+                // clone: the journal's own name of it, a refcount.
+                self.dir_named(super::Named::RemovedDir { dir: dir.clone() });
                 Done::RemovedDir
             }
             // alloc: an error's message.
@@ -819,6 +831,8 @@ impl Sim {
         }
     }
 }
+
+mod dir_names;
 
 #[cfg(test)]
 mod tests;

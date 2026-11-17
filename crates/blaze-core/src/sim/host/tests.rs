@@ -505,6 +505,12 @@ fn a_directory_made_is_listed_stated_and_removed_empty() {
         Effect::MakeDir { dir: name("x"), tag: Tag(5) },
     ];
     run_until_idle(&mut sim, &mut effects, |it, _| answers.push(it.done)).unwrap();
+    // x's name is its parent's, the root's: durable once the root is synced (dir_names.rs).
+    let mut effects = vec![Effect::SyncDir { dir: crate::DirName::Root, tag: Tag(8) }];
+    run_until_idle(&mut sim, &mut effects, |it, _| {
+        assert!(matches!(it.done, Done::Synced), "the root's sync: {:?}", it.done)
+    })
+    .unwrap();
     sim.crash();
     let mut effects = vec![Effect::RemoveDir { dir: name("x"), tag: Tag(6) }];
     run_until_idle(&mut sim, &mut effects, |it, _| answers.push(it.done)).unwrap();
@@ -541,6 +547,9 @@ fn each_planted_bug_is_caught() {
             | Plant::SyncCoversLess
             | Plant::FileSyncKeepsName => {
                 unreachable!("{plant:?} is the disk's, caught by its own controls (sim/world.rs)")
+            }
+            Plant::DirNamesDurable => {
+                unreachable!("{plant:?} is caught by its own controls (sim/host/dir_names/tests.rs)")
             }
         })
     };

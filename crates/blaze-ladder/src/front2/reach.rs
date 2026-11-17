@@ -273,7 +273,7 @@ fn check_failed(r: &Records<'_, '_>, e: &CheckFail) -> Reached {
 }
 
 /// A fn's name for messages: a member's as `container::name`.
-pub(crate) fn fn_shown(r: &Records<'_, '_>, k: ItemKey) -> String {
+pub(crate) fn fn_shown<'n, S: super::source::NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -> String {
     match r.keys.origin(k) {
         Some(Origin::Member { container, name, .. }) => format!("{}::{name}", item_shown(r, *container)),
         _ => item_shown(r, k),

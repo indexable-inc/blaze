@@ -1,11 +1,13 @@
 //! The program's entry (docs/v2/plan/design/std.md, "The blaze edition: opting in"): what
 //! stands between the process's start and a `main` that takes its world as parameters.
 //!
-//! A crate of the blaze edition writes `fn main(cx: &Cx, io: Io) -> Result<(), E>` (or a
-//! shorter form the entry rule allows), and blaze's front end appends the one call that runs
-//! it: [`run`] of a closure that hands `main` the roots it asked for and gives what it
-//! returned to [`Outcome::status`]. Nothing here is a compiler special case: the call is
-//! ordinary code, and a program not of the edition can write it itself.
+//! A crate of the blaze edition writes `fn main(cx: &Cx, out: Out) -> Result<(), E>`: after the
+//! context, each parameter is a grant it names (D104: `out: Out`, `args: Args`, `clock: Clock`,
+//! `data: Dir<ReadOnly>`, ...; a whole `Io` cannot be asked for). The root's `fn main` is
+//! expanded by [`main!`](crate::main) with no attribute written, into [`run`] of a closure that
+//! makes each grant and hands it over, and gives what `main` returned to [`Outcome::status`].
+//! Nothing here is a compiler special case: the expansion is ordinary code, and a program not
+//! of the edition writes `#[bstd::main]` for the same.
 //!
 //! - [`run`] is the process's: it makes the native [`Io`] from what the process was started
 //!   with, and is the one place that happens.
@@ -17,8 +19,8 @@
 //!
 //! The root context's bounds are bstd's to pick, since `main` has no caller: they are the
 //! named constants [`MAIN_BUDGET`] and [`MAIN_SCRATCH`] (std.md, "The second rule": a bound
-//! bstd must pick is a named `pub const`). A program that wants others takes `io` alone and
-//! makes its own context with [`Io::cx`].
+//! bstd must pick is a named `pub const`). A program that wants narrower ones makes a child
+//! context ([`Cx::until`]).
 
 use alloc::{
     borrow::ToOwned as _,
@@ -192,7 +194,7 @@ pub fn launch_in<R: Outcome>(
         let (args, env) = (blaze_own::Vec::new_in(alloc), blaze_own::Vec::new_in(alloc));
         crate::spec::RunSpec::defaults(args, env, blaze_own::String::from_str_in("/", alloc), alloc)
     };
-    match crate::grant::prepare(manifest, delivered, defaults, alloc) {
+    match crate::grant::prepare(manifest, delivered, defaults, &[], alloc) {
         crate::grant::Prepared::Manifest(text) => match io.write_out(crate::out::Stream::Out, &[text.as_bytes(), b"\n"]) {
             Ok(()) => Status::OK,
             Err(why) => {
@@ -204,7 +206,7 @@ pub fn launch_in<R: Outcome>(
             let _ = write!(said, "{}", text.as_str());
             Status::REFUSED
         }
-        crate::grant::Prepared::Run { spec, started, fake } => {
+        crate::grant::Prepared::Run { spec, started, fake, taken: _ } => {
             run_in(io, said, crate::grant::main_of(manifest, &spec, started, fake.as_ref(), body))
         }
     }
@@ -257,10 +259,15 @@ macro_rules! main {
                 }
                 $crate::guest::start(table, hosted)
             }
-            $crate::entry::launch(&MANIFEST, $crate::launch_body!(rooted;))
+            $crate::entry::launch_with(
+                $crate::entry::Os::process(),
+                $crate::entry::Heap::process(),
+                &MANIFEST,
+                $crate::launch_body!(rooted;),
+            )
         }
     };
-    attr() (
+    attr($($default:tt)*) (
         $(#[$meta:meta])*
         $vis:vis fn main($cx:tt : $cxty:ty $(, $name:tt : $ty:ty)* $(,)?) $(-> $returns:ty)? $body:block
     ) => {
@@ -269,8 +276,10 @@ macro_rules! main {
             fn main($cx: $cxty $(, $name: $ty)*) $(-> $returns)? $body
             /// The program's manifest: what it takes, as data in the binary.
             static MANIFEST: $crate::grant::Manifest = $crate::grant::Manifest::new(&[
-                $( $crate::grant::Param::new(stringify!($name), <$ty as $crate::grant::Grant>::KIND) ),*
-            ]);
+                $( $crate::grant::Param::of::<$ty>(stringify!($name)) ),*
+            ])
+            // The attribute's defaults (grant/defaults.rs), checked here as the crate compiles.
+            .with_defaults(&$crate::__grant_spellings!($($default)*));
             /// The start of the program hosted by `blaze run` (run.md, "The hosted world"):
             /// each parameter asked of the host, then `main`, over the host's table.
             #[unsafe(no_mangle)]
@@ -284,21 +293,31 @@ macro_rules! main {
                 }
                 $crate::guest::start(table, hosted)
             }
-            $crate::entry::launch(&MANIFEST, $crate::launch_body!(main; $($name : $ty),*))
+            $crate::entry::launch_with(
+                $crate::entry::Os::process(),
+                $crate::entry::Heap::process(),
+                &MANIFEST,
+                $crate::launch_body!(main; $($name : $ty),*),
+            )
         }
     };
 }
 
-/// The launcher's body for a `main` whose parameters after `cx` are `$name: $ty`: each checked,
-/// then, when every one passed, each made and `main` called. For [`main!`] and for a test that
-/// runs a program through [`launch_in`].
+/// The launcher's body for a `main` whose parameters after `cx` are `$name: $ty`: each checked
+/// by making it, once, in written order (crate::grant's made.rs); when every one was made and
+/// the spec grants nothing else, `main` is called with the values the checks made; else every
+/// problem is the refusal, and what was made is dropped in order. For [`main!`] and for a test
+/// that runs a program through [`launch_in`].
 #[macro_export]
 macro_rules! launch_body {
     ($main:ident; $($name:tt : $ty:ty),*) => {
         |given: &mut $crate::grant::Given<'_>| {
-            $( given.check::<$ty>(stringify!($name)); )*
-            let filled = given.filled()?;
-            ::core::result::Result::Ok($main(filled.cx() $(, filled.make::<$ty>(stringify!($name)))*))
+            let checking = given.checking();
+            $( let checking = checking.check::<$ty>(stringify!($name)); )*
+            let filled = checking.filled()?;
+            let cx = filled.cx();
+            let $crate::__made!($($name),*) = filled.hand_out();
+            ::core::result::Result::Ok($main(cx $(, $name)*))
         }
     };
 }

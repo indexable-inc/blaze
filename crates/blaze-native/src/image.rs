@@ -19,9 +19,11 @@
 //! - `Got` (on a new page: the writable segment starts here): one 8-byte cell per distinct
 //!   target a GOT reloc, a branch to an import or a compact unwind personality reaches; on ELF
 //!   also a 16-byte pair per TLS descriptor and a cell per initial-exec TLS offset.
-//! - `Data`: the descriptor `__blaze_native_v1` first (NATIVE.md 3.4: magic `BNL1`, the word
-//!   and init counts, `word_at` and `init_at` as image-relative numbers, not pointers), then
-//!   the members' data, and read-only data that holds an absolute pointer (it needs a fixup).
+//! - `Data` (on a new page after a non-empty `Got`): the descriptor `__blaze_native_v1` first
+//!   (BNL2, descriptor.rs: the word, init and pointer counts, their image-relative addresses
+//!   and the names table's), then its names table (word order), then its pointer rows (one per
+//!   `FixTo::Word` fixup, sorted by cell), then the members' data, and read-only data that
+//!   holds an absolute pointer (it needs a fixup).
 //! - `Words`: one 8-byte cell per [`Image::words`] name; the launcher fills cell i.
 //! - `Inits`: the members' initializer pointers in link order; `Image::inits` of them.
 //! - `ThreadVars`, `ThreadData`, `ThreadZero`: Mach-O `__thread_vars`, `__thread_data`,
@@ -41,7 +43,9 @@ pub struct Placed { pub region: Region, pub at: u64, pub len: u64, pub align_log
 
 /// What a 64-bit pointer at a fixup's address becomes at load: `Rebase` the image's base plus
 /// `target`; `Import` the address of import `index` (an index of [`Image::imports`]) plus
-/// `addend`; `Word` the value the launcher writes into word `index`.
+/// `addend`; `Word` the function of word `index`. A `Word` cell is the launcher's to write (the
+/// descriptor's pointer rows list it): a dylib writer emits no dynamic fixup for it; an
+/// executable writer (W9) makes it a direct reference to the Rust function.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FixTo { Rebase { target: u64 }, Import { index: u32, addend: i64 }, Word { index: u32 } }
 
@@ -80,10 +84,8 @@ impl Image<'_> {
     }
 }
 
-/// The descriptor's magic, "BNL1" (NATIVE.md 3.4).
-pub const DESCRIPTOR_MAGIC: u32 = 0x424e_4c31;
-/// The descriptor's size: magic, words, inits, pad (u32 each), word_at, init_at (u64 each).
-pub const DESCRIPTOR_LEN: u64 = 32;
+/// The descriptor's tag and size: BNL2, 48 bytes; its form's one home is descriptor.rs.
+pub use crate::descriptor::{LEN as DESCRIPTOR_LEN, MAGIC as DESCRIPTOR_MAGIC};
 /// The descriptor's exported name as the symbol table holds it (C `__blaze_native_v1`; Mach-O
 /// adds the leading `_`, so `dlsym(handle, "__blaze_native_v1")` finds it on both).
 pub fn descriptor_name(platform: Platform) -> &'static [u8] {

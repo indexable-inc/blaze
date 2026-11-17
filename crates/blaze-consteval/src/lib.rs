@@ -208,6 +208,12 @@ pub trait ConstWorld: LayoutFacts {
     fn manually_drop(&self) -> Option<Option<ItemKey>> {
         None
     }
+
+    /// The names `type_name` prints a type with (blaze-build type_name.rs): the paths of
+    /// items. `None`, the default: `type_name` is refused by name, never printed without them.
+    fn type_names(&self) -> Option<&dyn blaze_build::type_name::TypeNames> {
+        None
+    }
 }
 
 /// The bounds of one evaluation (rule 18): each passed is a typed refusal naming the constant.

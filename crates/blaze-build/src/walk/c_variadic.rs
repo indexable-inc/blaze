@@ -36,16 +36,23 @@ use crate::{Abi, BuildError};
 
 /// Why a C-variadic call is refused, by name.
 const NOT_C: &str = "`...` on a fn of an ABI other than \"C\" or \"system\" (the Reference, [items.extern.variadic.conventions])";
+const UNWINDING: &str = "a call of a C-variadic fn of an unwinding ABI (\"C-unwind\", \"system-unwind\"): built as a plain call with no landing pad, so not built until a rung asks";
+const UNSAID: &str = "a call of a C-variadic fn whose unwind category (\"C\" or \"C-unwind\") the build's `Adts::nounwind` does not say";
 const UNPROMOTED: &str = "a variable argument narrower than `c_int`, a `bool` or an `f32` (C's default promotions; the checker refuses it, E0617)";
 const AGGREGATE: &str = "an aggregate, a wide pointer or a value-less type passed to `...` (not built)";
 
 impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
-    /// The ABI a C-variadic fn `item` of `abi` is called with, or its refusal by name.
-    pub(super) fn c_variadic_abi(e: ExprId, abi: Abi) -> Result<(), BuildError> {
-        match abi {
-            // The builder's `Abi` has no `system` or unwinding form: the front end maps them.
-            Abi::C => Ok(()),
-            Abi::Rust | Abi::RustCall => Err(unsupported(e, NOT_C)),
+    /// Whether a C-variadic callee of `abi` whose unwind category is `nounwind`
+    /// ([`crate::Adts::nounwind`]) is built (as a plain call: module doc), or its refusal by name.
+    /// The builder's `Abi` has no `system` or unwinding form (the front end maps "C", "C-unwind",
+    /// "system" and "system-unwind" to [`Abi::C`]), so the unwinding forms are told apart by
+    /// `nounwind`: only `Some(true)` (the Reference's "non-unwinding" category) is built.
+    pub(super) fn c_variadic_abi(e: ExprId, abi: Abi, nounwind: Option<bool>) -> Result<(), BuildError> {
+        match (abi, nounwind) {
+            (Abi::C, Some(true)) => Ok(()),
+            (Abi::C, Some(false)) => Err(unsupported(e, UNWINDING)),
+            (Abi::C, None) => Err(unsupported(e, UNSAID)),
+            (Abi::Rust | Abi::RustCall, _) => Err(unsupported(e, NOT_C)),
         }
     }
 
@@ -117,5 +124,32 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         };
         self.push_val(v, None);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_typeck::ExprId;
+
+    use super::Walk;
+    use crate::Abi;
+
+    /// A C-variadic callee is built only when its ABI is "C"-family AND non-unwinding: the
+    /// Reference, "Functions", [items.fn.extern.unwind.behavior]: "The \"unwinding\" ABI
+    /// category refers to \"Rust\" ..., \"C-unwind\", and any other ABI with -unwind in its
+    /// name"; a variadic call is a plain `call` (module doc), so an unwinding callee is refused
+    /// by name. A fix that kept matching on `Abi` alone builds the `Some(false)` and `None`
+    /// cases and fails here.
+    ///
+    /// Line: `c variadic abi: C nounwind built; C-unwind, unsaid, Rust refused`.
+    #[test]
+    fn a_c_variadic_callee_of_an_unwinding_abi_is_refused() {
+        type W<'x, 'c, 't> = Walk<'x, 'c, 't, std::alloc::Global>;
+        let e = ExprId(0);
+        assert!(W::c_variadic_abi(e, Abi::C, Some(true)).is_ok(), "\"C\" (nounwind) is built");
+        assert!(W::c_variadic_abi(e, Abi::C, Some(false)).is_err(), "\"C-unwind\" is refused");
+        assert!(W::c_variadic_abi(e, Abi::C, None).is_err(), "an unsaid category is refused");
+        assert!(W::c_variadic_abi(e, Abi::Rust, Some(false)).is_err(), "\"Rust\" is refused");
+        println!("c variadic abi: C nounwind built; C-unwind, unsaid, Rust refused");
     }
 }

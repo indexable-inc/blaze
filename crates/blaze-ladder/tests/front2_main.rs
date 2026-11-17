@@ -29,13 +29,12 @@ use blaze_surface::{Namespace, PathKind};
 /// His `Cargo.toml`'s edition line.
 const EDITION: &str = "blaze-2026.11";
 
-/// His `src/main.rs`, as written.
-const MAIN: &str = "fn main(cx: &Cx, io: Io) -> Result<(), Error> {
-    io.need_out()?.line(cx, \"Hello, world!\")?;
+/// His `src/main.rs`, as written (D104: `main` names its grants; no whole `Io`).
+const MAIN: &str = "fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+    out.line(cx, \"Hello, world!\")?;
     Ok(())
 }
 ";
-
 /// `crate::name` of a library key, for the work list.
 fn shown(names: &Names<'_>, crates: &[&str], key: blaze_id::ItemKey) -> String {
     let krate = names.crate_of(key).and_then(|c| crates.get(c).copied()).unwrap_or("?");
@@ -121,10 +120,12 @@ fn shared_records_hold_no_body_type() {
 
 /// An inherent const a macro call writes inside an impl body (core's `impl u32 { uint_impl! {
 /// .. } }` makes `MAX`) is a member front2 reads from `Names::members`: a body naming it
-/// type-checks clean.
+/// type-checks clean. The body is a plain fn `most`, not the root's `main`: under a blaze
+/// edition the root's `main` is `std::main`'s input (D104) and a lookup of `main` finds the
+/// launcher it writes, not the written body (see [`a_plain_main_is_std_mains_input`]).
 #[test]
 fn a_macro_written_member_checks() {
-    const BODY: &str = "fn main() {\n    let _most: u32 = u32::MAX;\n}\n";
+    const BODY: &str = "fn most() {\n    let _most: u32 = u32::MAX;\n}\n";
     let home = std::env::var("HOME").expect("HOME is set");
     let shelf = format!("{home}/.blaze/v2/toolchain");
     let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
@@ -137,15 +138,16 @@ fn a_macro_written_member_checks() {
     let sources = [SourceFile { path: "src/main.rs", text: BODY }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
         let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
-    let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &["main"] }, Alloc::global())
-        .unwrap_or_else(|e| panic!("`main`: {e}"));
-    let main = found.whole(1).unwrap_or_else(|| panic!("`main` not named")).key;
+    assert!(names.notes(0).is_empty(), "crate 0's notes: {:?}", names.notes(0));
+    let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &["most"] }, Alloc::global())
+        .unwrap_or_else(|e| panic!("`most`: {e}"));
+    let main = found.whole(1).unwrap_or_else(|| panic!("`most` not named")).key;
     let mut store = Store::new(front.index.lang("sized"), front.frame);
     let mut buckets = None;
     let prepared = Prepares::new_in(Alloc::global());
-    let body = lower_fn(&names, prepared, &mut front.keys, &mut store, main).unwrap_or_else(|e| panic!("lowering `main`: {e}"));
+    let body = lower_fn(&names, prepared, &mut front.keys, &mut store, main).unwrap_or_else(|e| panic!("lowering `most`: {e}"));
     let view = body.lowered.view();
-    let spell = Spelling::of(&view).unwrap_or_else(|e| panic!("spelling `main`: {e:?}"));
+    let spell = Spelling::of(&view).unwrap_or_else(|e| panic!("spelling `most`: {e:?}"));
     let scope = body.scope(&spell);
     let mut consts = Consts::default();
     let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
@@ -158,6 +160,37 @@ fn a_macro_written_member_checks() {
     }
     let clean = checked.as_ref().is_ok_and(|done| done.diags.is_empty());
     assert!(clean, "{line}");
+}
+
+/// D104: a blaze-edition binary's root `fn main()` that takes nothing is `std::main`'s input
+/// (blaze-scope `IMPLICIT_MAIN`), and bstd's `main!` has an arm for it (crates/blaze-std/src/
+/// entry.rs, "A `main` that takes nothing"), whose output is the launcher `fn main() -> Exit`
+/// filed in the root under its written name (the Reference, "Attribute macros": the item is
+/// replaced by the macro's output, whose items resolve at the call site). So after names
+/// settle, crate 0 has no note and `main` is found in the root module. Prints
+/// `plain main: the root's `main` is std::main's launcher; notes 0`.
+/// Fails, naming the `Expand` note, while the pinned toolchain's bstd lacks that arm (PINNED
+/// `ad2d1aaa..`, bstd pack `b926e476..`: one arm, `fn main($cx:tt : ..)`): the control.
+#[test]
+fn a_plain_main_is_std_mains_input() {
+    const BODY: &str = "fn main() {}\n";
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let files = [("/hello-world/src/main.rs".to_string(), BODY.to_string())];
+    let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
+    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    assert!(names.notes(0).is_empty(), "crate 0's notes: {:?}", names.notes(0));
+    let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &["main"] }, Alloc::global())
+        .unwrap_or_else(|e| panic!("`main` after std::main: {e}"));
+    let main = found.whole(1).unwrap_or_else(|| panic!("`main` not named")).key;
+    let text = names.item_text(main).unwrap_or_else(|| panic!("`main` ({main:x}) has no text"));
+    // The launcher, not the written `fn main() {}`: it returns the program's exit.
+    assert!(text.text.contains("->"), "the root's `main` is the written one, not std::main's launcher: {:?}", text.text);
+    println!("plain main: the root's `main` is std::main's launcher; notes {}", names.notes(0).len());
 }
 
 /// His main walked by the library's walk (front2/program/walk_report.rs `walk`, which holds
@@ -583,57 +616,28 @@ fn report(mut out: String, start: Instant) {
     }
 }
 
-/// D59's interim choice, from the root file's outline alone: each `main` shape's roots, the
-/// refusal of a third parameter by the rule's name, and nothing appended beside an exported
-/// entry or on a Rust edition.
-#[test]
-fn the_entry_is_chosen_by_mains_shape() {
-    use blaze_ladder::front2::entry::{EntryError, Roots, append};
-    let cfg: [(&str, Option<&str>); 0] = [];
-    let e = blaze_surface::Edition::E2024;
-    let choose = |text: &str, blaze: bool| {
-        let mut t = text.to_string();
-        let got = append(&mut t, e, blaze, &cfg).map(|a| a.map(|a| a.roots));
-        if let Ok(Some(r)) = got {
-            assert_eq!(t, format!("{text}{}", r.text()), "the module is appended after the user's last byte");
-        } else {
-            assert_eq!(t, text, "nothing appended");
-        }
-        got
-    };
-    assert_eq!(choose("fn main() {}\n", true), Ok(Some(Roots::None)));
-    assert_eq!(choose("fn main(cx: &Cx) {}\n", true), Ok(Some(Roots::Cx)));
-    assert_eq!(choose("fn main(io: Io) {}\n", true), Ok(Some(Roots::Io)));
-    assert_eq!(choose(MAIN, true), Ok(Some(Roots::CxIo)));
-    assert_eq!(choose(MAIN, false), Ok(None));
-    assert_eq!(choose("fn main() {}\n#[unsafe(no_mangle)]\npub extern \"C\" fn bstd_hosted_start() -> i32 { 0 }\n", true), Ok(None));
-    assert_eq!(choose("fn main() {}\nmod m {\n    #[export_name = \"main\"]\n    fn start() {}\n}\n", true), Ok(None));
-    let three = "fn main(cx: &Cx, io: Io, more: u8) {}\n";
-    match choose(three, true) {
-        Err(EntryError::TooManyRoots { params: 3, range }) => {
-            assert_eq!(&three[range.start as usize..range.end as usize], "&Cx, io: Io, more: u8", "reported at main's parameters");
-        }
-        other => panic!("a three-parameter `main` is refused by `entry-takes-roots`: {other:?}"),
-    }
-    assert!(matches!(choose("async fn main() {}\n", true), Err(EntryError::NotPlain { .. })));
-}
-
-/// The entry programs of D59's must-keep-passing list through the run path's front half
-/// (`run::build_new` over the installed toolchain), each as far as it gets today: built, or
-/// its named refusal. With `FRONT2_ENTRY_LIST` set, the lines are written there.
+/// D104: every blaze `main` is `std::main`'s input, through the run path's front half
+/// (`run::build_new` over the installed toolchain), each as far as it gets. The owner's hello
+/// builds; a `main` that asks a whole world is refused in the words `Grant`'s
+/// `#[diagnostic::on_unimplemented]` gives, which name what to write instead. With
+/// `FRONT2_ENTRY_LIST` set, the lines are written there.
 #[test]
 fn the_entry_programs_as_far_as_each_gets() {
-    use blaze_ladder::run::{NewFront, RunError, build_new};
+    use blaze_ladder::run::{NewFront, build_new};
     let home = std::env::var("HOME").expect("HOME is set");
     let shelf = format!("{home}/.blaze/v2/toolchain");
-    let programs: [(&str, &str); 5] = [
+    // `Io` is in no prelude (D104): the old shape names it by path, so the refusal is `Grant`'s,
+    // not an unresolved name.
+    let whole = "use std::Io;\n\nfn main(cx: &Cx, io: Io) -> Result<(), Error> {\n    io.need_out()?.line(cx, \"Hello, world!\")?;\n    Ok(())\n}\n";
+    let programs: [(&str, &str); 4] = [
         ("main()", "fn main() {}\n"),
         ("main(cx: &Cx)", "fn main(cx: &Cx) {\n    let _ = cx;\n}\n"),
-        ("main(io: Io)", "fn main(io: Io) -> Result<(), Error> {\n    io.need_out()?;\n    Ok(())\n}\n"),
-        ("main(cx: &Cx, io: Io)", MAIN),
-        ("main(cx: &Cx, io: Io, more: u8)", "fn main(cx: &Cx, io: Io, more: u8) {}\n"),
+        ("main(cx: &Cx, out: Out)", MAIN),
+        ("main(cx: &Cx, io: Io)", whole),
     ];
-    let mut out = String::from("ENTRY PROGRAMS (D59 interim, edition blaze-2026.11):\n");
+    let mut out = String::from("ENTRY PROGRAMS (D104, edition blaze-2026.11):\n");
+    // Every row runs and is printed; what each missed is said at the end, all together.
+    let mut missed: Vec<String> = Vec::new();
     for (shape, text) in programs {
         let files = [SourceFile { path: "src/main.rs", text }];
         let got = build_new(&files, "src/main.rs", NewFront { package: "entry", edition: EDITION, shelf: Some(&shelf), overflow: blaze_build::OverflowChecks::On });
@@ -642,19 +646,25 @@ fn the_entry_programs_as_far_as_each_gets() {
             Err(e) => format!("REFUSED: {e}"),
         };
         out.push_str(&format!("{shape}: {}\n", line.chars().take(600).collect::<String>()));
-        if shape.ends_with("more: u8)") {
-            match got {
-                Err(RunError::Entry { range, why, .. }) => {
-                    assert!(why.contains("entry-takes-roots"), "{why}");
-                    assert_eq!(&text[range.start as usize..range.end as usize], "&Cx, io: Io, more: u8");
+        match shape {
+            "main(cx: &Cx, out: Out)" if got.is_err() => missed.push(format!("the owner's hello builds: {line}")),
+            "main(cx: &Cx, io: Io)" => match got {
+                Ok(_) => missed.push(String::from("a `main` taking a whole `Io` is refused, not built")),
+                Err(refused) => {
+                    let shown = format!("{refused}");
+                    // Without d104-A-6 the words are the bare goal `Io: Grant`; with `impl Grant
+                    // for Io` left in bstd it builds.
+                    if !shown.contains("`main` cannot take a `Io`") || !shown.contains("cannot be asked for") {
+                        missed.push(format!("the `Io` row is refused in `Grant`'s words, naming what to write: {shown}"));
+                    }
                 }
-                Err(other) => panic!("a three-parameter `main` is refused by `entry-takes-roots`, not: {other}"),
-                Ok(_) => panic!("a three-parameter `main` is refused by `entry-takes-roots`, not built"),
-            }
+            },
+            _ => {}
         }
     }
     print!("{out}");
     if let Ok(path) = std::env::var("FRONT2_ENTRY_LIST") {
         std::fs::write(&path, &out).unwrap_or_else(|e| panic!("writing the entry list to {path}: {e}"));
     }
+    assert!(missed.is_empty(), "{} of the entry programs missed:\n{}", missed.len(), missed.join("\n"));
 }

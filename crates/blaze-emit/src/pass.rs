@@ -738,6 +738,20 @@ impl<A: Allocator> Pass<'_, '_, A> {
             | Op::Fdiv
             | Op::Frem
             | Op::Fneg
+            | Op::Fabs
+            | Op::Sqrt
+            | Op::Floor
+            | Op::Ceil
+            | Op::Ftrunc
+            | Op::Nearest
+            | Op::Fround
+            | Op::FminNum
+            | Op::FmaxNum
+            | Op::Fminimum
+            | Op::Fmaximum
+            | Op::Fcopysign
+            | Op::Fma
+            | Op::Fmuladd
             | Op::Fcmp
             | Op::Fpext
             | Op::Fptrunc

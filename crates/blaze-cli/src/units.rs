@@ -59,6 +59,17 @@ pub struct Laid<'f> {
     pub graph: Option<crate::graph::Graph<'f>>,
 }
 
+impl Laid<'_> {
+    /// Whether the command has a unit graph: the lock matched (`parts`), whether or not `main`
+    /// made the graph's job from it yet. A layout read late (a task's, when nothing the layout
+    /// read moved) has its `parts` and no `graph`: the graph's record is then found by the last
+    /// answer's row, and its absence is no fact of the workspace (rule 26: the edited home and
+    /// a fresh one give one answer).
+    pub fn has_graph(&self) -> bool {
+        self.graph.is_some() || self.parts.is_some()
+    }
+}
+
 /// Read the workspace's layout from the checkout's root: every manifest and listing it asks for
 /// is pushed onto `rows`.
 pub fn lay<'f, 'l>(
@@ -147,6 +158,12 @@ pub fn lay<'f, 'l>(
                 let made = member_units(Name::manifest(paths.text(id).as_bytes()), member, texts.text(id), toolchain, frame);
                 root_made.parts.push(Part { name: made.name, locate: Locate::Source(member_source(&made)), place: 0 });
                 members.push((made.name, made));
+                // A member proc-macro crate's files, whole: its module key holds them, so they are
+                // in the units' source (macro_files.rs, rule 21), each file and folder with its
+                // stamp, so the next sweep proves the crate unchanged by stats alone (rule 77).
+                if member.lib.iter().any(|lib| lib.proc_macro) {
+                    crate::macro_files::read_row(&cx, root, stamps, member.dir.as_str(), rows, frame)?;
+                }
             }
         }
         // A refusal is a finding on the line it names: the root's, or a member's whose own

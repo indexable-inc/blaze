@@ -63,7 +63,7 @@ fn text(exp: &Expansion<'_>, text: Text) -> String {
 /// A diagnostic in words, its notes read.
 pub fn diagnostic(exp: &Expansion<'_>, d: &Diagnostic) -> String {
     match *d {
-        Diagnostic::NoRuleMatched { rules, token, expected, at } => format!(
+        Diagnostic::NoRuleMatched { rules, token, expected, at, .. } => format!(
             "no rule of {rules} matched at {:?}: found {:?}, expected {:?}",
             at,
             token.map(|it| text(exp, it)),

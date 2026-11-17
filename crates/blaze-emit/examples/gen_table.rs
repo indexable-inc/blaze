@@ -4,9 +4,13 @@
 //! table to. Run from the workspace's root (the files are under the directory the command
 //! started in): `cargo run -p blaze-emit --example gen_table`; commit both files.
 //!
-//! It is one of blaze's own tools (batch B1, D104): it takes bstd's whole world through
-//! `bstd::entry::run` (it writes under the directory it started in, on a start with no run
-//! spec), not as a `main` parameter, which D104 bars.
+//! It is one of blaze's own tools (batch B1, D104): its `fn main` takes the OS root and hands
+//! it to `bstd::entry::run_with`, which makes the native world (it writes under the directory
+//! it started in, on a start with no run spec); the world is not a `main` parameter, which
+//! D104 bars. COUNTED DEBT (D104): `write_table` still holds a whole `Io` where it uses two
+//! capabilities (files, read-write, under `crates/blaze-emit/table`, and standard output); the
+//! end state is `#[bstd::main] fn main(cx: &Cx, table: Dir<ReadWrite>, out: Out)`, once an
+//! ordinary start can grant a folder (wiring/blaze-emit/d104-B-gen_table.md, HOLD).
 //!
 //! The table is made for arm64 on macOS with no optional features; its templates are the same on
 //! Linux (only the head's os byte differs).
@@ -25,7 +29,7 @@ const MACHINE: Machine = Machine { arch: Arch::Arm64, os: Os::MacOs, features: 0
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 fn main() -> Exit {
-    bstd::entry::run(|cx, io| write_table(cx, io))
+    bstd::entry::run_with(bstd::entry::Os::process(), |cx, io| write_table(cx, io))
 }
 
 /// The table and its pin written under `crates/blaze-emit/table`, and one line saying so.

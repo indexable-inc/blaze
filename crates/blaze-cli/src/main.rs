@@ -25,16 +25,22 @@
 #![forbid(unsafe_code)]
 
 mod body_types;
+mod item_name;
 mod checkout;
 mod fetch;
 mod fix;
 mod front_load;
 mod home;
+mod job_texts;
+mod macro_files;
 mod macros;
 mod names;
 mod phases;
 mod print;
+mod producers;
 mod program;
+// `--grant <parameter>=<scope>` as bstd's host's `(kind, name)` (run.md; D104 lane's finding).
+mod host_grants;
 // `blaze run` of a Rust-edition program: in its own process, under the run parent (D103).
 mod own_process;
 // The run parent's sans-IO half; its driver loop waits on the bstd surface its head names.
@@ -59,7 +65,7 @@ use core::fmt;
 
 use blaze_drive::{
     Answer, Ask, Command, Config, DriveError, Effect, Event, FileEntry, Gate, Print, Request, Settled, Space, TableFull,
-    Tool, WireError, Why,
+    WireError, Why,
 };
 use blaze_ladder::refusal::{Refusal, SourceFile};
 use blaze_ladder::run::RunError;
@@ -97,6 +103,12 @@ pub enum CliError {
     /// A crate's names read a checkout file that no units record and no file's outline lists
     /// (`DriveError::NoPart`, named: the package and the file's path).
     Unlisted(names::Unlisted),
+    /// Files whose bytes, read by their tasks, were not the sweep's (`Why::Changed`): the answer
+    /// is refused naming them, nothing of theirs was put; checkout-relative, one a line.
+    Changed { paths: std::string::String },
+    /// A member proc-macro crate's files could not be read whole for its module key
+    /// (macro_files.rs), named by path.
+    MacroFiles(macro_files::MacroFilesError),
     /// The checkout's leaf table is not one.
     Leaves(WireError),
     /// A file the outline cannot read: not UTF-8, or past 4 GiB.
@@ -114,10 +126,16 @@ pub enum CliError {
     /// `blaze run` in a package with no binary to run (program.rs): a failure before any
     /// program starts, so [`program::NOT_RUN`] like every other one of `run` (L6).
     NoBinary(program::NoBinary),
+    /// A `--grant` that cannot reach a hosted program (host_grants.rs): before it starts, so
+    /// [`program::NOT_RUN`] (L6).
+    HostGrant(host_grants::HostGrantError),
     /// A named origin's read path stopped the command (store.rs; a miss is not this).
     Remote(store::RemoteError),
     /// The running binary carries no linker id, the tool identity every key starts from.
     BuildId(bstd::host::NoBuildId),
+    /// The build's producer digests name other rows than this binary's table (producers.rs):
+    /// a bug of the build step, refused by name (decision D105).
+    Producers(blaze_ids::producer::SourcesRefused),
     /// The pool could not run or join a batch's tasks (its frame not made, or a wait that
     /// stopped); a task's own panic or refusal is a failed task, never this.
     Pool(bstd::task::TaskError),
@@ -148,6 +166,8 @@ impl fmt::Display for CliError {
             CliError::Out(error) => write!(f, "{error}"),
             CliError::Drive(error) => write!(f, "{error}"),
             CliError::Unlisted(unlisted) => write!(f, "{unlisted}"),
+            CliError::Changed { paths } => write!(f, "changed while the command ran; run again (nothing of these was kept):\n{paths}"),
+            CliError::MacroFiles(error) => write!(f, "{error}"),
             CliError::Leaves(error) => write!(f, "the checkout's leaf table (in a pointer of .blaze/v2/at), of this build's form, is malformed: {error}"),
             CliError::Text { what } => write!(f, "{what}"),
             CliError::Table(full) => write!(f, "{full}"),
@@ -155,8 +175,10 @@ impl fmt::Display for CliError {
             CliError::Ran { command, error } => write!(f, "blaze {command}: {error}"),
             CliError::OwnProcess(error) => write!(f, "{error}"),
             CliError::NoBinary(no) => write!(f, "{no}"),
+            CliError::HostGrant(error) => write!(f, "{error}"),
             CliError::Remote(error) => write!(f, "{error}"),
             CliError::BuildId(error) => write!(f, "{error}: blaze keys every record by its own code and will not run without that id"),
+            CliError::Producers(error) => write!(f, "{error}"),
             CliError::Pool(error) => write!(f, "{error}"),
             CliError::Input { name, why } => write!(f, "the input {name} a task needed could not be read: {why}"),
             CliError::Shelf(error) => write!(f, "{error}"),
@@ -179,7 +201,7 @@ macro_rules! from {
     };
 }
 
-from!(Missing(Missing), Path(PathError), Fs(FsError), Out(OutError), Drive(DriveError), Table(TableFull), BuildId(bstd::host::NoBuildId));
+from!(Missing(Missing), Path(PathError), Fs(FsError), Out(OutError), Drive(DriveError), Table(TableFull), BuildId(bstd::host::NoBuildId), Producers(blaze_ids::producer::SourcesRefused));
 
 /// `blaze run` and `test` fail on any finding, lints included (bottom.md 11); `check` reports.
 /// A body whose types were not checked (`body_types::TYPES_NOT_CHECKED`) says what the command
@@ -284,9 +306,23 @@ fn choice(word: &str) -> Result<Choice, CliError> {
     }
 }
 
+/// The process's entry: the OS root taken here, once, and handed to bstd's entry, which makes
+/// the native world over it and runs [`run`] (port27/bstd-capabilities.md P3, `rt::run_with`).
+///
+/// COUNTED DEBT (decision D104; port27/d104-b1-entries.md, piece 2): `run` still holds a whole
+/// world (`Io`) inside. It is no longer asked for as a grant (D104 bars a `main` from naming
+/// `Io`), but the end state is `#[bstd::main] fn main(cx: &Cx, args: Args, env: Env, out: Out,
+/// err: Out, fs: Fs, net: Net, clock: Clock, host: Host, ..)` with every function below taking
+/// only the capabilities it uses. Not through `#[bstd::main]` today, so the command has no
+/// manifest static (nobody asks `blaze` for one), no `bstd_hosted_start` (blaze is never
+/// hosted) and reads no run spec on file descriptor 3 (no parent in the tree sets
+/// `BSTD_RUN_SPEC` for it).
+fn main() -> bstd::entry::Exit {
+    bstd::entry::run_with(bstd::entry::Os::process(), |cx, io| run(cx, io))
+}
+
 /// The status: 0 for a check that passed; `blaze run`'s, the status its program's `main` ended with.
-#[bstd::main]
-fn main(cx: &Cx, io: Io) -> Result<Status, Error> {
+fn run(cx: &Cx, io: Io) -> Result<Status, Error> {
     let mut phases = Phases::new(io.need_clock()?);
     let out = io.need_out()?;
     let err = io.need_err()?;
@@ -362,11 +398,11 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
     };
     let host = io.need_host()?;
     let workers = host.cores().get();
-    // Every producer's identity, made once here and handed down (decision D105, rule 75): today
-    // each from the running binary's linker id (bstd `Host::build_id`), so a blaze built from
-    // other code shares no record or certificate with this one (rules 21, 52).
-    let producers = blaze_ids::producer::Producers::of_build(host.build_id()?.as_bytes());
-    let tool = home::tool(&producers);
+    // Every producer's identity, made once here and handed down (decision D105, rule 75): each
+    // source row the digest of its producer's crates as this binary was built, the rest the
+    // binary's linker id (bstd `Host::build_id`): a release that leaves a producer's crates alone
+    // keeps its records' keys (producers.rs; rules 21, 52).
+    let producers = producers::table(host.build_id()?.as_bytes())?;
     let origin = store::NamedOrigin::of(cx, &fs, io.net().as_ref(), flags.origin, flags.origin_key)?;
     // The terminal's abilities, from the conventional variables and the findings' stream, read
     // here at the edge: whether it is a terminal, and how wide.
@@ -398,7 +434,7 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
     };
     // The request as this command makes it; it takes what it prints into and gives it back.
     let mut ask = |mut shown, ran: &mut Option<u8>, phases: &mut Phases| {
-        let finished = request(cx, &root, (checkout_at, var("SSL_CERT_FILE"), var("SSL_CERT_DIR"), var("HOME"), cargo_home.as_ref().map(|cargo| cargo.as_str()), var("PWD"), blaze_toolchain::PINNED), origin.as_ref(), (command, word), workers, tool, work::Sizes::USUAL, &launch, frame, out, err, ran, &mut shown, phases);
+        let finished = request(cx, &root, (checkout_at, var("SSL_CERT_FILE"), var("SSL_CERT_DIR"), var("HOME"), cargo_home.as_ref().map(|cargo| cargo.as_str()), var("PWD"), blaze_toolchain::PINNED), origin.as_ref(), (command, word), workers, &producers, work::Sizes::USUAL, &launch, frame, out, err, ran, &mut shown, phases);
         finished.map(|finished| (finished, shown))
     };
     // The whole request, behind the command's one edge for a panic (rule 20): a command that
@@ -606,7 +642,7 @@ fn kept<'f>(req: &Request<'_>, followed: &sweep::Followed<'_>, rows: &Rows<'_>, 
             // (a gap: one dropped stays until the table is made again cold).
             let keep = match leaf.kind {
                 LeafKind::Slot => leaf.absent() || req.holds(path.as_bytes()),
-                LeafKind::Manifest | LeafKind::Listing | LeafKind::HomeListing => !slots_only,
+                LeafKind::Manifest | LeafKind::Listing | LeafKind::HomeListing | LeafKind::MacroFiles | LeafKind::MacroFile | LeafKind::MacroFolder => !slots_only,
             };
             if keep {
                 kept.push(leaf.kind, leaf.flags, path, leaf.stamp, leaf.id);
@@ -632,7 +668,8 @@ fn request<'f>(
     origin: Option<&store::NamedOrigin>,
     (command, word): (Command, &'static str),
     workers: u32,
-    tool: Tool,
+    // Every producer's id (D105), made once at the entry: the whole tool and each kind's below.
+    producers: &blaze_ids::producer::Producers,
     sizes: work::Sizes,
     launch: &program::Launch<'_>,
     frame: &'f Frame,
@@ -644,6 +681,9 @@ fn request<'f>(
 ) -> Result<Finished<'f>, CliError> {
     let cx = cx.span("blaze request");
     let began = phases.now();
+    // The whole tool (the certificate, the pointer, the walk from the last answer, the store's
+    // producer name) and each kind's (its tasks' keys): home.rs.
+    let (tool, tools) = (home::tool(producers), home::tools(producers));
     // The pointer file (seal.rs): one read for the last answer and the leaf table. Missing,
     // another form's or torn, it is absent: a note after the findings, and the request answers in full.
     // It is this tool's, for this request's shape (`.blaze/v2/at/<name>`, blaze-drive
@@ -755,7 +795,7 @@ fn request<'f>(
     let mut gone: Vec<&[u8], &Frame> = Vec::new_in(frame);
     for (i, leaf) in followed.now.rows.iter().enumerate() {
         let path = followed.now.path(leaf);
-        if !matches!(leaf.kind, LeafKind::Listing | LeafKind::HomeListing) && leaf.absent() && followed.was[i].0 & sweep::ABSENT == 0 {
+        if !matches!(leaf.kind, LeafKind::Listing | LeafKind::HomeListing | LeafKind::MacroFiles | LeafKind::MacroFile | LeafKind::MacroFolder) && leaf.absent() && followed.was[i].0 & sweep::ABSENT == 0 {
             gone.push(path.as_bytes());
         }
         if leaf.kind != LeafKind::Slot || leaf.absent() {
@@ -776,7 +816,7 @@ fn request<'f>(
     files.dedup_by(|a, b| a.path == b.path);
     gone.sort_unstable();
     gone.dedup();
-    let config = Config { tool, workers, most_entries: 64, most_jobs: 1 << 24, is_error: every_rule };
+    let config = Config { tool, tools, workers, most_entries: 64, most_jobs: 1 << 24, is_error: every_rule };
     // The machine allocates from the global heap, named (rule 11): what it hands out to be
     // performed (a record's bytes to `Put`, a page) is freed once performed, so the request's
     // footprint is its keys, rows and findings, not every record it wrote (rule 51: a record
@@ -992,6 +1032,19 @@ fn request<'f>(
     let mut answer = answer;
     store.after_answer(&cx, &mut answer.profile)?;
     phases.mark_in("store after answer", frame);
+    // A file read that was not the sweep's text (`Why::Changed`): the answer is refused, naming
+    // each, after the store kept every other record this command settled (verified bytes).
+    let mut changed = std::string::String::new();
+    for fail in failed.iter().filter(|fail| matches!(fail.failure.why, blaze_drive::Why::Changed)) {
+        let path = fail.path.unwrap_or("(a file with no path)");
+        if !changed.lines().any(|line| line == path) {
+            changed.push_str(path);
+            changed.push('\n');
+        }
+    }
+    if !changed.is_empty() {
+        return Err(CliError::Changed { paths: changed });
+    }
     let rows = kept(&req, &followed, &facts.rows, frame);
     let at = phases.now();
     // `blaze run` with findings: the program's refusals too, from its lowering alone.
@@ -1345,7 +1398,7 @@ mod tests {
         resolved: u32,
         /// Its profile's lines, each kind's counts: what a failing count names.
         profile: std::string::String,
-        /// The errors it found.
+        /// The errors it found (`Counts.errors`): notes are not counted.
         errors: u32,
         /// The exit status `command` returns for it (`close`), `None` where `close` failed.
         status: Option<u8>,
@@ -1383,7 +1436,9 @@ mod tests {
     mod fix_tests;
     mod members_tests;
     mod names_records_tests;
+    mod pooled_scope_tests;
     mod refused_targets_tests;
+    mod signature_grain_tests;
 
     fn write(io: &Io, path: &str, text: &str) {
         let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
@@ -1458,6 +1513,11 @@ mod tests {
 
     /// [`ask_view`] with the command's own frame of `command_frame` bytes (a task's, as `main`
     /// gives it, but for a test of what the command keeps there).
+    std::thread_local! {
+        /// The workers a test's commands are given (`--workers`): 1 unless a test sets it.
+        static WORKERS: core::cell::Cell<u32> = const { core::cell::Cell::new(1) };
+    }
+
     fn ask_framed<W: fix::Writer + Default>(io: &Io, command: (Command, &'static str), sizes: work::Sizes, view: View, fix: Option<&[&str]>, command_frame: usize) -> Result<Checked, CliError> {
         let cx = io.cx(BUDGET, command_frame).expect("a root context");
         let frame = cx.frame();
@@ -1468,16 +1528,16 @@ mod tests {
         let mut ran = None;
         let launch = program::Launch { io, grants: &[], args: &[] };
         let said = words(command.0, &out, &err);
-        let tool = match sizes.plant {
-            work::Plant::BodyChecker(older) => home::tool(
-                &blaze_ids::producer::Producers::for_tests(b"test")
-                    .planted_for_tests(blaze_ids::producer::Row::BodyChecker, older.as_bytes()),
-            ),
-            _ => home::tool(&blaze_ids::producer::Producers::for_tests(b"test")),
+        let producers = match sizes.plant {
+            work::Plant::Producer(row, older) => {
+                blaze_ids::producer::Producers::for_tests(b"test").planted_for_tests(row, older.as_bytes())
+            }
+            _ => blaze_ids::producer::Producers::for_tests(b"test"),
         };
         let toolchain = shelf(io);
         let mut run = |mut shown, ran: &mut Option<u8>, phases: &mut Phases| {
-            let finished = request(&cx, &root, ("ws", None, None, Some("/h"), None, Some("/"), toolchain), None, command, 1, tool, sizes, &launch, frame, said, &err, ran, &mut shown, phases);
+            let workers = WORKERS.with(core::cell::Cell::get);
+            let finished = request(&cx, &root, ("ws", None, None, Some("/h"), None, Some("/"), toolchain), None, command, workers, &producers, sizes, &launch, frame, said, &err, ran, &mut shown, phases);
             finished.map(|finished| (finished, shown))
         };
         let (finished, shown) = match fix {
@@ -1508,7 +1568,9 @@ mod tests {
             body_jobs: phases.times(work::BODY_JOBS),
             resolved: finished.resolved,
             profile: finished.answer.profile.to_string(),
-            errors: finished.answer.findings,
+            // The errors as the closing line counts them (`close`): a note (a stage that did not
+            // run, its why) is listed but is no error.
+            errors: shown.counts.errors,
             refused: false,
             ids: shown.listed.iter().map(|l| (l.code().to_owned(), l.id.as_str().to_owned())).collect(),
             words: shown.listed.iter().map(|l| std::string::String::from_utf8_lossy(l.words).into_owned()).collect(),
@@ -1529,6 +1591,9 @@ mod tests {
         let created = check(&io, work::Sizes::USUAL);
         assert!(created.failed.is_empty(), "{:?}", created.failed);
         assert_eq!(created.errors, 0, "the created file clears the error: findings {:?} {:?}\n{}", created.ids, created.words, created.profile);
+        // Nor a note: a fresh home on these files checks the bodies against the unit graph (the
+        // members' own lock), so the edited home must too (rule 26), never say it has no graph.
+        assert!(created.words.is_empty(), "the edited home lists what a fresh one does not: {:?}\n{}", created.words, created.profile);
     }
 
     /// An answer with errors is certified: a task's typed failure is filed as its record with
@@ -1661,7 +1726,9 @@ mod tests {
                 write(&fresh_io, path, text);
             }
             let (fresh, fresh_lines) = ask_now(&fresh_io, work::Sizes::USUAL)?;
-            if (home.errors, home.status, &home_lines) != (fresh.errors, fresh.status, &fresh_lines) {
+            // Every finding's words too, notes included: `errors` counts no note, and a note one
+            // home gives and a fresh one does not is the same history dependence (rule 26).
+            if (home.errors, home.status, &home_lines, &home.words) != (fresh.errors, fresh.status, &fresh_lines, &fresh.words) {
                 let tree: std::vec::Vec<&str> = files.iter().map(|(p, _)| *p).collect();
                 return Err(blaze_sim::Broke::Oracle(format!(
                     "differs from a fresh home at step {step} on {tree:?}: fresh {:?} {:?} {:?} {fresh_lines:?}, home {:?} {:?} {:?} {home_lines:?}; the files {files:?}\nFRESH\n{}\nHOME\n{}",
@@ -1804,13 +1871,45 @@ mod tests {
         let io = Io::simulated(SimWorld::new(9, Limits::USUAL));
         write(&io, "Cargo.toml", MANIFEST);
         write(&io, "src/lib.rs", "pub fn f() -> u32 { \"x\" }\npub fn g() -> u32 { 1 }\n");
-        let older = work::Sizes { plant: work::Plant::BodyChecker("blaze body checker 2026-11-16.0"), ..work::Sizes::USUAL };
+        let older = work::Sizes {
+            plant: work::Plant::Producer(blaze_ids::producer::Row::BodyChecker, "an older body checker"),
+            ..work::Sizes::USUAL
+        };
         let by_older = check(&io, older);
         assert_eq!(made(&by_older.profile, "BodyCheck"), 2, "{}", by_older.profile);
         let today = check(&io, work::Sizes::USUAL);
         assert_eq!(made(&today.profile, "BodyCheck"), 2, "an older checker's body records were read\n{}", today.profile);
         let again = check(&io, work::Sizes::USUAL);
         assert_eq!(made(&again.profile, "BodyCheck"), 0, "{}", again.profile);
+    }
+
+    /// Each kind's key holds its own producer (D105, home.rs `tools`): a names solver built from
+    /// other code makes the scopes again and leaves every body record standing (its key holds the
+    /// body checker's row, which did not move, and the scopes it read came out the same). The
+    /// control (rule 23): the body checker's row moved instead makes every body again. Without
+    /// the split (every kind keyed by the whole tool, as before piece 3) the first half makes 2.
+    #[test]
+    fn a_moved_names_producer_leaves_body_records_standing() {
+        let io = Io::simulated(SimWorld::new(9, Limits::USUAL));
+        write(&io, "Cargo.toml", MANIFEST);
+        write(&io, "src/lib.rs", "pub fn f() -> u32 { \"x\" }\npub fn g() -> u32 { 1 }\n");
+        let today = check(&io, work::Sizes::USUAL);
+        assert_eq!(made(&today.profile, "BodyCheck"), 2, "{}", today.profile);
+        let names = work::Sizes {
+            plant: work::Plant::Producer(blaze_ids::producer::Row::Names, "an older names solver"),
+            ..work::Sizes::USUAL
+        };
+        let by_names = check(&io, names);
+        let scopes = ["CrateScope", "ModuleScope", "Group"].map(|kind| made(&by_names.profile, kind)).iter().sum::<u32>();
+        assert!(scopes > 0, "a moved names solver made no scope again\n{}", by_names.profile);
+        assert_eq!(made(&by_names.profile, "BodyCheck"), 0, "a moved names solver made bodies again\n{}", by_names.profile);
+        let checker = work::Sizes {
+            plant: work::Plant::Producer(blaze_ids::producer::Row::BodyChecker, "an older body checker"),
+            ..work::Sizes::USUAL
+        };
+        let by_checker = check(&io, checker);
+        assert_eq!(made(&by_checker.profile, "BodyCheck"), 2, "the control: a moved body checker\n{}", by_checker.profile);
+        std::println!("producers: a moved names solver made {scopes} scopes and 0 bodies; a moved checker made 2 bodies");
     }
 
     /// What the simulated host's standard output holds.

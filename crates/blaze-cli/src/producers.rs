@@ -9,11 +9,13 @@
 
 use blaze_ids::{
     Hasher,
-    producer::{Producers, Sources, SourcesRefused},
+    producer::{Producers, Row, Sources, SourcesRefused},
 };
 
-/// The build's digest of each producer's source.
-const SOURCES: Sources = include!(concat!(env!("OUT_DIR"), "/producer_sources.rs"));
+/// The build's digest of each producer's source, `None` where the build step could not say it
+/// (it warned at build time naming the crate and the row; the generated file says why).
+const SOURCES: [(&str, Option<[u8; 32]>); Row::FROM_SOURCE.len()] =
+    include!(concat!(env!("OUT_DIR"), "/producer_sources.rs"));
 
 const BITS_DOMAIN: &str = "blaze-cli producer build bits 1";
 
@@ -25,11 +27,19 @@ const BITS_DOMAIN: &str = "blaze-cli producer build bits 1";
 /// with another value, so the two must not share records (remote-read.md, "the two build
 /// settings"). Overflow checks follow debug assertions under the workspace's profiles (the root
 /// manifest sets neither apart), so the one bit stands for both.
+///
+/// A row the step could not digest (a lock of another moment than the sources, as a snapshot mix
+/// builds) is keyed by the build id instead: piece 1's key, which every rebuilt blaze moves, so
+/// that row's records are made again and never read stale; the other rows keep theirs.
 pub fn table(build_id: &[u8]) -> Result<Producers, SourcesRefused> {
     let bits = [u8::from(cfg!(debug_assertions))];
-    let rows = SOURCES.rows.map(|(name, digest)| {
+    let rows = SOURCES.map(|(name, digest)| {
         let mut hasher = Hasher::new(BITS_DOMAIN);
-        hasher.part(&digest).part(&bits);
+        match digest {
+            Some(digest) => hasher.part(b"source").part(&digest),
+            None => hasher.part(b"build id").part(build_id),
+        };
+        hasher.part(&bits);
         (name, hasher.finish().0)
     });
     Producers::of_sources(build_id, &Sources { rows })

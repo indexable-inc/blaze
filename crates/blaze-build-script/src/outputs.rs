@@ -489,6 +489,12 @@ impl<'b> OutputsRef<'b> {
         self.out_dir
     }
 
+    /// The record's bytes, as [`OutputsRef::open`] took them: a reader that must outlive this
+    /// borrow copies them into its own frame and opens them again.
+    pub fn bytes(&self) -> &'b [u8] {
+        self.bytes
+    }
+
     /// The digest of everything of the record the served crate's text can read: its `OUT_DIR`,
     /// its cfgs, its env pairs and its files (names and bytes). A crate's key covers this, so
     /// two records that differ in any of these are two keys; what the crate cannot read (link

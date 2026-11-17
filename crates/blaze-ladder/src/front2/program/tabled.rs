@@ -30,6 +30,7 @@ struct Row<'n> {
     kind: FnKind,
     at: At,
     abi: Abi,
+    nounwind: bool,
     symbol: Box<str>,
     export: Option<Box<str>>,
     lits: Literals,
@@ -55,6 +56,7 @@ pub(super) fn table_one<'n>(
             path,
             at: r.at,
             abi: r.abi,
+            nounwind: r.nounwind,
             symbol: r.symbol,
             export: r.export,
             lits: r.lits,
@@ -77,15 +79,13 @@ fn row<'n>(
     let Some(head) = store.fns.get(&key) else {
         return Err(Front2Refusal::NoHead { function: function() });
     };
-    let abi = match head.header.abi {
-        tc::Abi::Rust => Abi::Rust,
-        tc::Abi::C => Abi::C,
-        tc::Abi::RustCall => Abi::RustCall,
-        // The builder spreads no other ABI's arguments.
-        abi => return Err(Front2Refusal::Abi { function: function(), abi }),
-    };
+    // The head's ABI, a foreign block's overriding it (head_abi.rs: one rule for the table's
+    // rows and for the builder's question of a fn left out).
+    // The calling convention AND the unwind category ("C" aborts, "C-unwind" unwinds: one
+    // `Abi::C` for the builder, the category kept beside it).
+    let own = super::head_abi::head_abi(names, store, key, &function)?;
     let symbols = symbols_of(names, head.lib, head.text, path)?;
-    let (at, foreign) = placed(names, head.lib);
+    let (at, foreign) = placed(names, head.lib).map_err(|_| Front2Refusal::Unplaced { function: function() })?;
     // A fn an `extern` block in a BODY declares is foreign as a module-level one is: the
     // names library places no local item, so its block's ABI and its declared name are the
     // store's (front2/panic_entry.rs `local_abi`, `local_name`).
@@ -139,15 +139,9 @@ fn row<'n>(
         }
         _ => None,
     };
-    // A foreign fn's own text carries no ABI: its block's does.
-    let abi = match foreign {
-        None => abi,
-        Some("C" | "C-unwind") => Abi::C,
-        Some("Rust") => Abi::Rust,
-        Some("rust-call") => Abi::RustCall,
-        Some(_) => return Err(Front2Refusal::Abi { function: function(), abi: head.header.abi }),
-    };
-    Ok(Row { body, checked, kind, at, abi, symbol, export: symbols.export, lits, intrinsic })
+    // `#[rustc_nounwind]` makes any fn nounwind (core/src/panicking.rs:88-92).
+    let nounwind = own.nounwind || symbols.nounwind;
+    Ok(Row { body, checked, kind, at, abi: own.abi, nounwind, symbol, export: symbols.export, lits, intrinsic })
 }
 
 /// The cause a survey files a left-out fn under: the refusal without the fn's own name or

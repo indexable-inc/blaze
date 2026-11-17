@@ -58,7 +58,7 @@ use crate::task::{
     CallSrc, Cfg, DollarCrate, Fill, FillEnv, FillReport, Files, First, Fragment, Held, ImplSrc,
     ItemText, LangSrc, Loc, LowerCx, LowerNote, Lowered, MacroBody, MacroSrc, Member, ModMade, Par,
     PreludeImport, RootInput, RootNote, RootPlan, TaskError, Tree, Variant, WalkNote, Where,
-    crate_root, file_attrs, lower, walk,
+    crate_root, crate_tools, file_attrs, lower, walk,
 };
 use crate::task::{joined, pop_dir};
 use crate::task::ExpandPart;
@@ -77,6 +77,25 @@ pub trait SourceTexts<'a> {
     /// The text of the file at `path` (absolute, `/`-separated, without `.` or `..`) of the
     /// crate at `krate` (its index in the inputs), or `None` when it has no such file.
     fn read(&self, krate: usize, path: &str) -> Option<&'a str>;
+
+    /// The bytes of the file at `path` (as [`SourceTexts::read`]'s) that the file `from` (the
+    /// calling file, absolute) reads as DATA by `include_str!` or `include_bytes!`, or `None`
+    /// when there is no such file. Data is no module: a source that records what a crate read
+    /// records it as a read of the bytes, never as a module file wanting its surface
+    /// (blaze-cli names.rs). By default the file is read as [`SourceTexts::read`] reads it,
+    /// for a source that keeps no read list; a file that is not UTF-8 is then `None`.
+    fn read_data(&self, krate: usize, from: &str, path: &str) -> Option<&'a [u8]> {
+        let _ = from;
+        self.read(krate, path).map(str::as_bytes)
+    }
+
+    /// An include of the crate at `krate` that left its own package and stayed inside the
+    /// workspace (decision D111: allowed and reported): a source that files findings files it
+    /// as a warning at the call (blaze-cli names/include_outside.rs). Asked before the file
+    /// is read. By default nothing is filed (a source with no record: a test's table).
+    fn left_package(&self, krate: usize, left: crate::include_place::LeftPackage<'_>) {
+        let _ = (krate, left);
+    }
 
     /// The key the proc-macro runner knows the proc-macro crate at `krate` by (blaze-proc-macro's
     /// `hook::crate_key` of its module key): what its macros' definitions name it by. `None`:
@@ -295,10 +314,14 @@ pub struct ExpansionText<'a> {
 /// A macro call's expansion: what it adds to its module.
 #[derive(Debug)]
 pub struct Expansion<'a> {
-    /// Empty when the call is not expanded (the note says why).
+    /// Empty when the call is not expanded: then `refused` says why (a refused call), or the
+    /// call wrote nothing (a derive of a cfg-off item, a statement call that declares nothing).
     pub decls: DeclsBuilder<'a, &'a str>,
     /// `None` when no text was made.
     pub made: Option<&'a ExpansionText<'a>>,
+    /// The call's expansion was refused ([`crate::refused`]): its module's scope says so, and
+    /// a name looked up behind it is unknown, never absent.
+    pub refused: Option<crate::refused::Refused<'a>>,
 }
 
 /// Which text of a call did not lex.
@@ -330,8 +353,16 @@ pub enum ExpandNote<'a> {
     /// first: the nested call's path as written, and why.
     Eager { macro_name: &'a str, nested: &'a str, why: EagerRefusal },
     Expand { macro_name: &'a str, error: ExpandError },
-    /// A diagnostic of the macro's (its expansion is kept).
+    /// A diagnostic of the macro's that is no error (a proc macro's warning, note or help): its
+    /// expansion is kept.
     Diagnostic { macro_name: &'a str, diagnostic: Diagnostic },
+    /// The call FAILED: its expansion holds an error ([`Diagnostic::is_error`]: no rule matched,
+    /// `compile_error!`, a proc macro's error). It writes nothing and is stored refused
+    /// ([`crate::refused`]), so a name looked up behind it answers `Why::Refused` with this
+    /// call's key, which [`crate::failed_call::FailedCall::of`] joins to this note. `path` is the
+    /// macro as written (`::std::main` for the implicit call of D104: `implicit`), `failed` the
+    /// expansion's own reason with its words.
+    Failed { path: &'a str, implicit: bool, failed: blaze_expand::Failed<'a> },
     /// The expansion does not read as items: the outline's first syntax error.
     NotItems { macro_name: &'a str, message: &'a str },
 }
@@ -462,6 +493,37 @@ pub struct CrateNames<'a> {
     pub failed: HashMap<ItemKey, TaskError, Alloc<'a>>,
     pub report: FillReport,
     pub notes: AVec<'a, NamesNote<'a>>,
+    /// The cell core's `Full` cell reads, for D116's counts.
+    pub d116_reads: AVec<'a, D116Read<'a>>,
+    pub d116_calls: AVec<'a, D116Call<'a>>,
+}
+
+/// (reader module, reader kind (0 a cell, 1 an import, 2 a call), module read, namespace, name,
+/// the module had calls not expanded then, reads).
+pub type D116Read<'a> = (ItemKey, u8, ItemKey, blaze_surface::Namespace, &'a str, bool, u64);
+
+/// A call's path answer, for D116's counts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum D116Answer {
+    Found(Def),
+    Ambiguous(Def),
+    NotFound,
+    Outside,
+    /// Refused for another reason (private, wrong macro kind, ...).
+    Refused,
+}
+
+/// One macro call's path, answered from text, links and preludes with every pending call taken to
+/// have made nothing: `[static (all calls pending), dynamic (those not in at its first read)]`.
+#[derive(Debug)]
+pub struct D116Call<'a> {
+    pub module: ItemKey,
+    pub module_path: AVec<'a, &'a str>,
+    pub path: AVec<'a, &'a str>,
+    /// The module its leaf was looked up in.
+    pub cur: [ItemKey; 2],
+    pub spec: [D116Answer; 2],
+    pub last: D116Answer,
 }
 
 impl<'a> CrateNames<'a> {
@@ -492,6 +554,11 @@ impl<'a> CrateNames<'a> {
     /// A module's place, walked or made.
     pub(crate) fn info(&self, module: ItemKey) -> Option<ModuleInfo<&'a str>> {
         self.decls.get(&module).map(|it| it.0).or_else(|| self.made.get(&module).map(|m| m.info))
+    }
+
+    /// Whether `module` is a block's module ([`crate::blocks::is_block_module`]).
+    pub(crate) fn anonymous(&self, module: ItemKey) -> bool {
+        self.info(module).is_some_and(|info| info.name.is_some_and(crate::blocks::is_block_module))
     }
 }
 
@@ -725,6 +792,10 @@ impl<'a> World<&'a str> for Names<'a> {
         let c = self.crates[at];
         let Some(chain) = c.chains.get(&module) else { return false };
         chain.iter().any(|m| c.info(*m).is_some_and(|info| info.no_implicit_prelude))
+    }
+
+    fn anonymous(&self, module: ItemKey) -> bool {
+        self.crate_of(module).is_some_and(|at| self.crates[at].anonymous(module))
     }
 }
 
@@ -1070,9 +1141,12 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     // Each walked module's own text, lowered.
     par.stage(crate::task::Stage::Lower);
     let listed = if input.implicit.proc_macro { sources.proc_exports(index) } else { None };
-    let mut low = lower_modules(input.key, edition, &cfg, &set, &tree, listed, &mut notes, par, alloc);
+    // The root's attributes first: its `#![register_tool]`s are the crate's tools, which every
+    // module's lowering reads to know an item's taker (names-attr-3).
     let root = set.files[root_file as usize];
     let attrs = file_attrs(&cfg, &root.outline, root.text, alloc);
+    let tools = crate_tools(&attrs, alloc);
+    let mut low = lower_modules(input.key, input.implicit.entry, edition, &cfg, &tools, &set, &tree, listed, &mut notes, par, alloc);
     let root_attrs = RootAttrs { no_std: attrs.no_std, no_core: attrs.no_core, arbitrary_ints: attrs.arbitrary_ints };
     let plan = root_plan(graph, id, root_attrs, built, &mut notes, alloc);
     if let Some(name) = plan.injected {
@@ -1144,6 +1218,8 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     let run = Run::new_in(set, prepares, alloc);
     let mut fill: Fill<'a, &'a str> = Fill::new_in(alloc);
     fill.first = first;
+    let added_externs: AVec<'a, (&'a str, ItemKey)>;
+    let (d116_reads, d116_calls);
     {
         let base = Base {
             index,
@@ -1176,8 +1252,21 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
             let _ = crate::task::Expand::expand(&cx, ExpandRequest { call, def });
         };
         let made = |out: &mut AVec<'a, ItemKey>| out.extend(held(run.made.read(), "made modules").keys().copied());
-        fill.done = crate::cells::solve_and_write(&cx.facts, built, &cx.facts, &places, tree.modules[0].key, &expand, &made, alloc)
+        let solved = crate::cells::solve_and_write(&cx.facts, built, &cx.facts, &places, tree.modules[0].key, &expand, &made, alloc)
             .map_err(|error| NamesError::Cells { krate: input.name, error })?;
+        fill.done = solved.done;
+        added_externs = solved.added_externs;
+        d116_reads = solved.d116_reads;
+        d116_calls = solved.d116_calls;
+    }
+    // The extern prelude of the record is the whole one: the root's macro-written `extern crate`
+    // items' names too (libc's `cfg_if! { extern crate rustc_std_workspace_core as core; }`
+    // under `no_core`), which a walk over the record (names.rs `walk`, `lexical`) reads; none of
+    // them was in it before (cells R8), so the merge only adds.
+    if !added_externs.is_empty() {
+        crate_root_record.extern_prelude.extend_from_slice(&added_externs);
+        crate_root_record.extern_prelude.sort_by(|a, b| a.0.cmp(b.0));
+        crate_root_record.extern_prelude.dedup_by_key(|it| it.0);
     }
     par.stage(crate::task::Stage::Publish);
     let mut done = core::mem::replace(&mut fill.done, HashMap::new_in(alloc));
@@ -1188,6 +1277,10 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     for name in crate::task::publish_expanded_exports(&mut done, &in_made, tree.modules[0].key, &mut crate_root_record, alloc) {
         notes.push(NamesNote::Root(RootNote::MacroExportedTwice { name }));
     }
+    // Each refused call into its module's scope: what a dependent's lookup behind it reads.
+    let expansions_now = held(run.expansions.lock(), "expansions");
+    crate::refused::write_refused(&mut done, &expansions_now, alloc);
+    drop(expansions_now);
     let failed = core::mem::replace(&mut fill.failed, HashMap::new_in(alloc));
     let report = fill.report;
 
@@ -1221,6 +1314,8 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
         failed,
         report,
         notes,
+        d116_reads,
+        d116_calls,
     })
 }
 
@@ -1235,8 +1330,10 @@ fn held<T>(value: LockResult<T>, what: &str) -> T {
 
 fn lower_modules<'a, P: Par>(
     krate: CrateItemKey,
+    entry: bool,
     edition: Edition,
     cfg: &Cfg<'a, 'a>,
+    tools: &[&'a str],
     set: &FileSet<'a>,
     tree: &Tree<'a, 'a>,
     listed: Option<&'a [ProcExport<'a>]>,
@@ -1266,7 +1363,7 @@ fn lower_modules<'a, P: Par>(
                 None => ProcDecls::Text,
                 Some(list) => ProcDecls::Module { here: if i == 0 { list } else { &[] } },
             };
-            lower(LowerCx { krate, edition, cfg, walked: tree, procs }, fragment, alloc)
+            lower(LowerCx { krate, tools, edition, cfg, walked: tree, procs, entry: entry && i == 0 }, fragment, alloc)
         },
         &mut parts,
     );
@@ -1394,6 +1491,18 @@ impl<'a, S> Base<'_, 'a, S> {
     fn expansion_procs(&self) -> ProcDecls<'a> {
         if self.listed { ProcDecls::Module { here: &[] } } else { ProcDecls::Text }
     }
+
+    /// Macro `def`'s source: this crate's lowered tables (a proc macro is declared by its
+    /// crate's text, never by an expansion), else its defining crate's record, the read asked so
+    /// the crate's key holds it.
+    fn macro_src(&self, def: ItemKey) -> Option<MacroSrc<'a>> {
+        if let Some(src) = self.tables.macros.get(&def) {
+            return Some(*src);
+        }
+        let src = self.built.of(def).and_then(|d| d.macro_of(def));
+        self.built.ask(|| crate::asked::Question::macro_src(def, src, self.alloc));
+        src
+    }
 }
 
 /// What the expansions of one crate add, shared by the fill's threads.
@@ -1493,6 +1602,24 @@ impl<'a, S> ScopeFacts for Facts<'_, 'a, S> {
     fn expansion(&self, call: ItemKey) -> Result<Option<DeclsBuilder<'_, &'a str>>, SurfaceError> {
         Ok(held(self.run.expansions.lock(), "expansions").get(&call).map(|e| e.decls.clone()))
     }
+
+    /// A derive's helpers from its `attributes(..)`, as written: a proc derive's
+    /// (`#[proc_macro_derive(D, attributes(h))]`) and a built-in derive's, which the pinned
+    /// library writes the same way (core/src/default.rs `#[rustc_builtin_macro(Default,
+    /// attributes(default))]`), kept in its record (names-attr-4). A macro that is no derive
+    /// declares none.
+    fn derive_helpers(&self, derive: ItemKey, out: &mut AVec<'_, &'a str>) -> Result<(), SurfaceError> {
+        let Some(src) = self.base.macro_src(derive) else {
+            return Err(SurfaceError::NoRecord { fact: "MacroSrc", item: derive });
+        };
+        match src.body {
+            MacroBody::Proc { kind: ProcKind::Derive, helpers } | MacroBody::BuiltinDerive { helpers } => {
+                out.extend(ProcAttr::helper_names(helpers));
+                Ok(())
+            }
+            MacroBody::Rules(_) | MacroBody::Macro2 { .. } | MacroBody::BuiltinFn(_) | MacroBody::BuiltinOther(_) | MacroBody::Proc { .. } => Ok(()),
+        }
+    }
 }
 
 struct FillCx<'r, 'a, S> {
@@ -1514,9 +1641,24 @@ impl<'a, S: SourceTexts<'a>> crate::task::Expand for FillCx<'_, 'a, S> {
     fn expand(&self, request: ExpandRequest) -> crate::task::Expanded {
         (self.mark)(crate::task::Stage::Expand);
         (self.part)(ExpandPart::Find, "", 0);
-        let (decls, made) = expand_decls(self.base, self.run, request, self.part, self.seen).unwrap_or_else(|| (DeclsBuilder::new_in(self.base.alloc), None));
+        // A refused call is stored REFUSED, never as an empty expansion (rules 3 and 19): its
+        // module's scope then holds the refusal (`crate::refused::write_refused`), and a name
+        // looked up behind it is unknown because of it, not absent.
+        let env = crate::refused::EnvRefusal::new_in(self.base.alloc);
+        let expansion = match expand_decls(self.base, self.run, request, self.part, self.seen, &env) {
+            Some((decls, made)) => Expansion { decls, made, refused: None },
+            None => {
+                let src = self.base.tables.calls.get(&request.call).copied().or_else(|| held(self.run.tables.read(), "tables").calls.get(&request.call).copied());
+                // `OUT_DIR` is set for the package (it has a build script) but not known: no
+                // outputs record is joined (crate_env.rs `CrateEnv::of`).
+                let out_dir_unknown = self.base.script.is_none()
+                    && self.base.sources.crate_env(self.base.index).is_some_and(|e| e.get("OUT_DIR") == Err(crate::crate_env::EnvUnknown));
+                let refused = crate::refused::Refused::of(src.map(|s| (s.module, s.name)), env.first(), out_dir_unknown);
+                Expansion { decls: DeclsBuilder::new_in(self.base.alloc), made: None, refused: Some(refused) }
+            }
+        };
         (self.part)(ExpandPart::Store, "", 0);
-        held(self.run.expansions.lock(), "expansions").insert(request.call, Expansion { decls, made });
+        held(self.run.expansions.lock(), "expansions").insert(request.call, expansion);
         (self.part)(ExpandPart::End, "", 0);
         (self.mark)(crate::task::Stage::Solve);
         crate::task::Expanded::Made
@@ -1574,18 +1716,9 @@ impl<'r, 'a, S: SourceTexts<'a>> FillEnv<&'a str> for FillCx<'r, 'a, S> {
     }
 
     fn derive_helpers(&self, derive: ItemKey) -> Option<&str> {
-        // A proc macro is declared by the lowering of its crate's text, never by an expansion,
-        // so this crate's lowered tables or the defining crate's hold it.
-        let src = match self.base.tables.macros.get(&derive) {
-            Some(src) => *src,
-            None => {
-                let src = self.base.built.of(derive).and_then(|d| d.macro_of(derive));
-                self.base.built.ask(|| crate::asked::Question::macro_src(derive, src, self.base.alloc));
-                src?
-            }
-        };
+        let src = self.base.macro_src(derive)?;
         match src.body {
-            MacroBody::Proc { kind: ProcKind::Derive, helpers } => Some(helpers),
+            MacroBody::Proc { kind: ProcKind::Derive, helpers } | MacroBody::BuiltinDerive { helpers } => Some(helpers),
             _ => None,
         }
     }
@@ -1612,6 +1745,14 @@ struct Host<'r, 'a, S> {
     package: &'a str,
     /// The calling crate's index.
     krate: usize,
+    /// The calling file's text and the byte offset of the call's path in it (the topmost
+    /// call's: a call inside an expansion is placed at the call that made it): where
+    /// `line!()` and `column!()` in eager input are counted.
+    text: &'a str,
+    call_at: u32,
+    /// The calling module's path (`krate::a::b`): what `module_path!()` answers; `None` for a
+    /// module with no place (refused by name).
+    module_path: Option<&'r str>,
     sources: &'r S,
     alloc: Alloc<'a>,
 }
@@ -1638,21 +1779,47 @@ impl<'a, S: SourceTexts<'a>> ExpandCx for Host<'_, 'a, S> {
     /// the crate's texts. These texts hold the package alone, so the bound here is the package
     /// (`SourceOrigin::Package`); a member's item-position read under its source root (D60)
     /// needs the root from `SourceTexts`, not given yet.
-    fn include(&self, written: &str, _: IncludeAs) -> Result<Included<'_>, HostError> {
+    ///
+    /// The kind decides the read: `include!`'s file is a module file ([`SourceTexts::read`]:
+    /// its items join the crate, its surface is what the names read); `include_str!`'s and
+    /// `include_bytes!`'s are data ([`SourceTexts::read_data`], named with the calling file):
+    /// a read of the bytes, never a module (tempo's `crates/node/tests/assets/
+    /// test-genesis.json`, 2026-11-16: read as a module, it stopped the check). A path leaving
+    /// the package is `Outside` for every kind, refused by the expansion by name.
+    fn include(&self, written: &str, how: IncludeAs) -> Result<Included<'_>, HostError> {
         // The one place the path is made: the modules the file writes are found from it too.
         let seen = self.sources.crate_env(self.krate).map(|env| env.seen());
-        let Some(path) = crate::included::included_file(self.package, seen, self.path, written, self.alloc) else {
+        // D111: a member reads under the workspace root, a dependency under its package;
+        // outside that, `Outside`, refused by the expansion by its path and the rule.
+        let Some(place) = crate::include_place::include_place(self.package, seen, self.path, written, self.alloc) else {
             return Ok(Included::Outside);
         };
-        Ok(self.sources.read(self.krate, &path).map_or(Included::Missing, |text| Included::Bytes(text.as_bytes())))
+        let path = place.path;
+        if place.outside_package {
+            let call = match how {
+                IncludeAs::Tokens => "include",
+                IncludeAs::Str => "include_str",
+                IncludeAs::Bytes => "include_bytes",
+            };
+            self.sources.left_package(self.krate, crate::include_place::LeftPackage { from: self.path, at: self.call_at, call, path: &path });
+        }
+        let found = match how {
+            IncludeAs::Tokens => self.sources.read(self.krate, &path).map(str::as_bytes),
+            IncludeAs::Str | IncludeAs::Bytes => self.sources.read_data(self.krate, self.path, &path),
+        };
+        Ok(found.map_or(Included::Missing, Included::Bytes))
     }
 
     /// Asked only from eager input (`concat!(file!(), ..)`: a plain call is a hole). One answer
     /// with the body host (front2 body_host.rs), D96 (5): `file!()` is the crate's shown path
-    /// ([`CrateEnv::shown_file`](crate::crate_env::CrateEnv::shown_file)); `line!()` and
-    /// `column!()` are refused, as `place` is not told which call asks, so no item-relative
-    /// position can be given (never a made-up 1); `module_path!()` is refused, as this host is
-    /// not told the calling module (never ""). A refusal is the call's error, named.
+    /// ([`CrateEnv::shown_file`](crate::crate_env::CrateEnv::shown_file)); `module_path!()` the
+    /// calling module's path, as the body host gives it. core `macros/mod.rs`, `line!`: "the
+    /// returned line is not necessarily the line of the line! invocation itself, but rather the
+    /// first macro invocation leading up to the expansion"; `column!`: the same, "1-based ...
+    /// counted in UTF-8 characters" from the line's start: so both are the call this host was
+    /// made for (the topmost one), counted in its file's text. The answer is a read of the
+    /// expansion, asked again before a kept one is reused (`Reads::hold`): the record holds
+    /// no position, only what the call read. A refusal is the call's error, named.
     fn place(&self, what: PlaceOf) -> Result<HostPlace<'_>, HostError> {
         let refused = HostError { ask: HostAsk::Place, why: HostWhy::Refused };
         match what {
@@ -1662,7 +1829,17 @@ impl<'a, S: SourceTexts<'a>> ExpandCx for Host<'_, 'a, S> {
                 });
                 shown.as_ref().map(|text| HostPlace::Text(text.as_str())).ok_or(refused)
             }
-            PlaceOf::Line | PlaceOf::Column | PlaceOf::ModulePath => Err(refused),
+            PlaceOf::ModulePath => self.module_path.map(HostPlace::Text).ok_or(refused),
+            PlaceOf::Line | PlaceOf::Column => {
+                let unreadable = HostError { ask: HostAsk::Place, why: HostWhy::Unreadable };
+                let before = self.text.get(..self.call_at as usize).ok_or(unreadable)?;
+                let line_start = before.rfind('\n').map_or(0, |at| at + 1);
+                let number = match what {
+                    PlaceOf::Line => before.bytes().filter(|b| *b == b'\n').count() + 1,
+                    _ => before[line_start..].chars().count() + 1,
+                };
+                Ok(HostPlace::Number(u32::try_from(number).map_err(|_| unreadable)?))
+            }
         }
     }
 
@@ -1809,6 +1986,7 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     request: ExpandRequest,
     part: PartMark<'_>,
     seen: &dyn Fn(ItemKey, &str),
+    refused_env: &crate::refused::EnvRefusal<'a>,
 ) -> Option<(DeclsBuilder<'a, &'a str>, Option<&'a ExpansionText<'a>>)> {
     let alloc = base.alloc;
     let call = request.call;
@@ -1850,6 +2028,11 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     seen(def_key, src.input);
     let site = CallSite { edition, panic_edition: edition, ctx: Ctx::root(edition) };
     let file = held(base_files(run), "files").files[src.loc.file as usize];
+    // The calling module's path, for `module_path!()`: a walked module's, or one a macro made.
+    let module_path: Option<&str> = match base.tree.by_key.get(&src.module) {
+        Some(&i) => Some(base.tree.modules[i].path.as_str()),
+        None => held(run.made.read(), "made modules").get(&src.module).map(|it| it.path),
+    };
     let host = || Host {
         cfg: base.cfg,
         file: shown(file.path, base.shown_from),
@@ -1857,6 +2040,9 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
         path: file.path,
         package: base.shown_from,
         krate: base.index,
+        text: file.text,
+        call_at: src.loc.offset,
+        module_path,
         sources: base.sources,
         alloc,
     };
@@ -1873,7 +2059,7 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     let keyed = kept.keeps()
         && match mac.body {
             MacroBody::Rules(_) | MacroBody::Macro2 { .. } => true,
-            MacroBody::BuiltinOther(CallShape::Derive) => src.kind == CallShape::Derive,
+            MacroBody::BuiltinDerive { .. } => src.kind == CallShape::Derive,
             MacroBody::Proc { .. } => runner.is_some(),
             MacroBody::BuiltinFn(_) | MacroBody::BuiltinOther(_) => false,
         };
@@ -1927,6 +2113,19 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     let derive_facts;
     let call_of = match src.kind {
         CallShape::FnLike => Call::fn_like(&input, site),
+        CallShape::Attr if src.implicit => {
+            // D104: no attribute names the call; it stands outermost, so the item is all of
+            // the input, each `#[cfg_attr]` applied (blaze-expand `ItemAttrs::implicit_call`).
+            let made = match ItemAttrs::new(input).implicit_call(atom) {
+                Ok(made) => made,
+                Err(error) => {
+                    item_note(error);
+                    return None;
+                }
+            };
+            (args, item) = (made.args, made.item);
+            Call::attr(args.as_ref(), &item, site)
+        }
         CallShape::Attr => {
             let mut walk = ItemAttrs::new(input);
             let attr = loop {
@@ -2024,13 +2223,14 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     let run_part = match mac.body {
         MacroBody::Rules(_) | MacroBody::Macro2 { .. } => ExpandPart::RunRules,
         MacroBody::BuiltinFn(_) => ExpandPart::RunBuiltin,
-        MacroBody::BuiltinOther(_) => ExpandPart::RunDerive,
+        MacroBody::BuiltinDerive { .. } | MacroBody::BuiltinOther(_) => ExpandPart::RunDerive,
         MacroBody::Proc { .. } => ExpandPart::RunProc,
     };
     part(run_part, mac.name, input_tokens);
     let expanded = match base.script {
-        Some(out) => eager.expand(def, &call_of, &ScriptCx { inner: host(), out }),
-        None => eager.expand(def, &call_of, &host()),
+        // Each refused `env!` read is noted: the cause a refusal names (`crate::refused`).
+        Some(out) => eager.expand(def, &call_of, &crate::refused::Watched { inner: &ScriptCx { inner: host(), out }, env: refused_env }),
+        None => eager.expand(def, &call_of, &crate::refused::Watched { inner: &host(), env: refused_env }),
     };
     let expansion = match expanded {
         Ok(expansion) => expansion,
@@ -2058,6 +2258,14 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     expansion
     }
     };
+    // A call whose expansion holds an error FAILED (the Reference, "Macros By Example": if no
+    // rule matches, "an error is reported"): it writes nothing, and what it might have written
+    // is unknown because of it, never absent (rules 19 and 54). Returning `None` stores it
+    // refused (`FillCx::expand`, `crate::refused`); the note keeps the matcher's own reason.
+    if let Some(failed) = blaze_expand::Failed::of(&expansion, alloc) {
+        note(ExpandNote::Failed { path: src.name, implicit: src.implicit, failed });
+        return None;
+    }
     for diagnostic in expansion.diagnostics.iter() {
         note(ExpandNote::Diagnostic { macro_name: mac.name, diagnostic: *diagnostic });
     }
@@ -2088,7 +2296,7 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
             // again, driven by the solve, `src.depth + 1` deep.
             let in_block = held(run.made.read(), "made modules")
                 .get(&src.module)
-                .is_some_and(|m| m.info.name.is_some_and(|name| name.starts_with(crate::blocks::BLOCK_MODULE)));
+                .is_some_and(|m| m.info.name.is_some_and(crate::blocks::is_block_module));
             if !in_block {
                 note(ExpandNote::NotItems { macro_name: mac.name, message: made.outline.message(error) });
                 (text, made)
@@ -2123,7 +2331,7 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
         made: false,
         members_of: src.owner,
     };
-    let mut out = lower(LowerCx { krate: base.key, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs() }, fragment, alloc);
+    let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false }, fragment, alloc);
     // Entered only by a call that makes modules: one that makes none stays in `Lower` for the
     // few moves below (what the part costs is what `make_modules` does: a module's file read,
     // outlined and lowered).
@@ -2194,7 +2402,7 @@ fn make_blocks<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, bo
             made: false,
             members_of: None,
         };
-        let mut out = lower(LowerCx { krate: base.key, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs() }, fragment, alloc);
+        let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false }, fragment, alloc);
         let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
         let place = Made { text, outline: &made.outline, at: Where::Expansion(body.loc), place: At::Expansion(call), dir: None };
         {
@@ -2207,7 +2415,7 @@ fn make_blocks<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, bo
         // The outermost block's `mod` declaration: dropped, so the body's module binds nothing.
         out.decls = DeclsBuilder::new_in(alloc);
         add_lowered(run, call, At::Expansion(call), out);
-        held(run.expansions.lock(), "expansions").insert(call, Expansion { decls: DeclsBuilder::new_in(alloc), made: Some(made) });
+        held(run.expansions.lock(), "expansions").insert(call, Expansion { decls: DeclsBuilder::new_in(alloc), made: Some(made), refused: None });
     }
 }
 
@@ -2386,12 +2594,13 @@ pub fn definition_of<'a>(
             Some(which) => MacroDefinition::builtin_fn(which, def_at, alloc),
             None => return Err(ExpandNote::BuiltinUnknown { name }),
         },
-        MacroBody::BuiltinOther(CallShape::Derive) if shape == CallShape::Derive => {
+        MacroBody::BuiltinDerive { .. } if shape == CallShape::Derive => {
             match BuiltinDerive::ALL.into_iter().find(|it| it.name() == mac.name) {
                 Some(which) => MacroDefinition::builtin_derive(which, def_at, alloc),
                 None => return Err(ExpandNote::BuiltinUnknown { name: mac.name }),
             }
         }
+        MacroBody::BuiltinDerive { .. } => return Err(ExpandNote::BuiltinOtherCalled { shape: CallShape::Derive, macro_name: mac.name }),
         MacroBody::BuiltinOther(shape) => return Err(ExpandNote::BuiltinOtherCalled { shape, macro_name: mac.name }),
         MacroBody::Proc { kind, helpers } => {
             // No runner holds its crate: the call has no definition here.
@@ -2566,7 +2775,7 @@ fn make_modules<'a, S: SourceTexts<'a>>(
             made: true,
             members_of: None,
         };
-        let mut out = lower(LowerCx { krate: base.key, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs() }, fragment, alloc);
+        let mut out = lower(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false }, fragment, alloc);
         bodies.extend(out.bodies.iter().copied());
         let mut chain = AVec::with_capacity_in(parent_chain.len() + 1, alloc);
         chain.push(m.key);

@@ -51,13 +51,13 @@ fn facts(f: impl FnOnce(&mut CrateFacts<'static>)) -> CrateFacts<'static> {
     c
 }
 
-/// 52 answers, pairwise distinct; prints (no `std` line added, so libtest's own line):
+/// 54 answers, pairwise distinct; prints (no `std` line added, so libtest's own line):
 /// `test tests::asked_digest::answer_digests_differ_in_every_field_and_every_variant ... ok`.
 #[test]
 fn answer_digests_differ_in_every_field_and_every_variant() {
     let g = Alloc::global();
     let base_reaches: &'static [CrateItemKey] = &[CrateItemKey(ContentId([2; 32])), CrateItemKey(ContentId([3; 32]))];
-    let digests: [ContentId; 52] = [
+    let digests: [ContentId; 54] = [
         // NameAnswer: both variants, and each field of `Found` (each choice of each enum field).
         name_digest(&NameAnswer::Absent),
         name_digest(&found(|_, _, _, _| {})),
@@ -98,6 +98,8 @@ fn answer_digests_differ_in_every_field_and_every_variant() {
         macro_digest(mac(|m| m.body = MacroBody::Proc { kind: ProcKind::FnLike, helpers: "a" })),
         macro_digest(mac(|m| m.body = MacroBody::Proc { kind: ProcKind::Attr, helpers: "a" })),
         macro_digest(mac(|m| m.body = MacroBody::Proc { kind: ProcKind::FnLike, helpers: "h" })),
+        macro_digest(mac(|m| m.body = MacroBody::BuiltinDerive { helpers: "" })),
+        macro_digest(mac(|m| m.body = MacroBody::BuiltinDerive { helpers: "h" })),
         macro_digest(mac(|m| m.module = k(2))),
         macro_digest(mac(|m| m.export = true)),
         macro_digest(mac(|m| m.local_inner = true)),

@@ -11,8 +11,9 @@ pub struct ArgList(Source);
 
 #[derive(Clone)]
 enum Source {
-    /// The process's own, checked UTF-8 at start ([`crate::rt::block`]).
-    Process(&'static [&'static str]),
+    /// The process's own, checked UTF-8 at start ([`crate::rt::block`]), less the `skip`
+    /// arguments after the program's name the launcher took (an ordinary start's `--grant`s).
+    Process { args: &'static [&'static str], skip: usize },
     Given(Arc<[String]>),
 }
 
@@ -25,7 +26,12 @@ impl ArgList {
 
     /// The process's own, borrowed from its start block.
     pub(crate) fn process(block: &'static crate::rt::block::Block) -> ArgList {
-        ArgList(Source::Process(&block.args))
+        ArgList::process_after(block, 0)
+    }
+
+    /// The process's own less the `skip` arguments after its name, which the launcher took.
+    pub(crate) fn process_after(block: &'static crate::rt::block::Block, skip: usize) -> ArgList {
+        ArgList(Source::Process { args: &block.args, skip })
     }
 
     #[blaze::nopanic]
@@ -33,7 +39,10 @@ impl ArgList {
     #[blaze::nonblocking]
     fn get(&self, at: usize) -> Option<&str> {
         match &self.0 {
-            Source::Process(args) => args.get(at).copied(),
+            Source::Process { args, skip } => match at {
+                0 => args.first().copied(),
+                _ => args.get(at.saturating_add(*skip)).copied(),
+            },
             Source::Given(args) => args.get(at).map(String::as_str),
         }
     }
@@ -43,7 +52,7 @@ impl ArgList {
     #[blaze::nonblocking]
     fn len(&self) -> usize {
         match &self.0 {
-            Source::Process(args) => args.len(),
+            Source::Process { args, skip } => args.len().saturating_sub(*skip),
             Source::Given(args) => args.len(),
         }
     }

@@ -10,16 +10,19 @@
 //! the textual list with each child's mark, the `use .. as _` traits, and the `#[macro_export]`
 //! macros an expansion wrote (published to the root by the record writer, as before).
 //!
-//! Not written (counted by the seam's whole-scope comparison, c10-r17a): `Inconsistent`, `RestrictedNotAncestor` (a bad `pub(in ..)`
-//! refuses the cell core's load), a second item of one name (`Duplicate` of explicit entries:
-//! see `add_explicit`), and R6/R8's errors as `Ambiguous`.
+//! A visibility naming no ancestor is its module's `RestrictedNotAncestor` errors, first, in a
+//! fixed order (vis.rs `vis_errors`).
+//!
+//! Not written (counted by the seam's whole-scope comparison, c10-r17a): `Inconsistent`, a second item of one name (`Duplicate` of explicit entries:
+//! see `add_explicit`). R6's errors (cells/early.rs) are written at their use or call, R8's at
+//! the expansion that wrote the `extern crate`, as `Ambiguous`.
 
 use blaze_id::ItemKey;
 use blaze_own::{ABTreeMap, AVec, Alloc};
-use blaze_surface::{AnonImport, Binding, GlobEdge, Path, ScopeBuilder, ScopeEntry, ScopeError, TextualDef, TextualMark, Unresolved, UseSite};
+use blaze_surface::{AnonImport, Binding, GlobEdge, Path, ScopeBuilder, ScopeEntry, ScopeError, Site, TextualDef, TextualMark, Unresolved, UseSite};
 
 use super::{CellPlant, Cells, FragId, ItemId, NAMESPACES, Outcome, Slot, ns_at};
-use crate::{BindingState, Def, DefKind, Namespace, Origin};
+use crate::{AmbiguityKind, BindingState, Def, DefKind, Namespace, Origin};
 
 /// One module's bindings and glob edges as the cell core decided them.
 pub(crate) struct Written<'a, N> {
@@ -74,6 +77,15 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             if self.published_later(origin, frag) {
                 continue;
             }
+            // A `pub(in path)` read through the cells: where it ended (vis.rs); a cell on its
+            // path unknown leaves the scope not the answer.
+            let vis = match self.entry_vis_final(m, ns, name, vis) {
+                Some(v) => v,
+                None => {
+                    unknown += 1;
+                    vis
+                }
+            };
             let binding = Binding { def, vis, origin, expansion: self.depth(frag), state: BindingState::Determined };
             bindings.push(ScopeEntry { ns, name, binding });
         }
@@ -91,7 +103,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         }
                     }
                     Some(Outcome::Outside) | None => unknown += 1,
-                    Some(Outcome::Failed(_) | Outcome::Glob(_) | Outcome::Called(_)) => {}
+                    Some(Outcome::Failed(_) | Outcome::Glob(_) | Outcome::Called(_) | Outcome::Inert) => {}
                 }
             }
             for ns in NAMESPACES {
@@ -183,6 +195,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 out.errors.push(ScopeError::ExternCrate { name });
             }
         }
+        self.vis_errors(m, &ix.call, alloc, &mut out.errors);
         // The walk: (fragment, next slot, next import, the module's own fragment or a
         // `#[macro_use]` child's carried out). Slots and imports merge by text position.
         let mut stack: AVec<'o, (FragId, usize, usize, bool)> = AVec::new_in(alloc);
@@ -212,7 +225,15 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 let Some(i) = next_use else { continue };
                 let it = &self.items[i as usize];
                 let site = UseSite { expansion: ix.call[f as usize], index: ui as u32 };
+                // R6: the use's first segment took one candidate and an expansion not enclosing
+                // it wrote another. Its error stands in for a later segment's failure: that path
+                // read an ambiguous first segment, so the failure says nothing (r6e, D56).
+                let early = self.r6.get(&i).copied();
+                if let Some(e) = early {
+                    out.errors.push(e.error(Site::Import(site), path(i)));
+                }
                 match it.outcome {
+                    Some(Outcome::Failed(_)) if early.is_some() => {}
                     Some(Outcome::Failed(why)) => out.errors.push(ScopeError::Import { site, path: path(i), segment: it.seg, why }),
                     Some(Outcome::Named(b)) if b.iter().all(Option::is_none) => {
                         let last = it.segments.len().saturating_sub(1) as u32;
@@ -247,7 +268,13 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     }
                     // `written` counted the named imports and globs; an `as _` import here.
                     Some(Outcome::Outside) | None if it.binds.is_none() && !it.glob => unknown += 1,
-                    Some(Outcome::Outside | Outcome::Glob(_) | Outcome::Called(_)) | None => {}
+                    Some(Outcome::Outside | Outcome::Glob(_) | Outcome::Called(_) | Outcome::Inert) | None => {}
+                }
+                // GlobVsExpanded at the use's first segment (`Cells::validate_expanded`).
+                for ns in NAMESPACES {
+                    if let Some(&(name, first, second)) = self.glob_vs_expanded.get(&(i, ns)) {
+                        out.errors.push(ScopeError::Ambiguous { site: Site::Import(site), ns, name, kind: AmbiguityKind::GlobVsExpanded, first, second });
+                    }
                 }
                 continue;
             }
@@ -279,6 +306,10 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                             out.errors.push(ScopeError::RecursionLimit { call: at.key });
                         }
                     } else if own {
+                        // R6 for a macro call's first segment.
+                        if let (Some(e), Some(at)) = (self.r6.get(&c), it.call) {
+                            out.errors.push(e.error(Site::Call(at.key), path(c)));
+                        }
                         match it.outcome {
                             Some(Outcome::Failed(why)) => {
                                 if let Some(at) = it.call {
@@ -286,7 +317,15 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                                 }
                             }
                             Some(Outcome::Outside) | None => unknown += 1,
-                            Some(Outcome::Called(_) | Outcome::Named(_) | Outcome::Glob(_)) => {}
+                            Some(Outcome::Called(_) | Outcome::Named(_) | Outcome::Glob(_) | Outcome::Inert) => {}
+                        }
+                        // GlobVsExpanded at the call path's first segment.
+                        if let Some(at) = it.call {
+                            for ns in NAMESPACES {
+                                if let Some(&(name, first, second)) = self.glob_vs_expanded.get(&(c, ns)) {
+                                    out.errors.push(ScopeError::Ambiguous { site: Site::Call(at.key), ns, name, kind: AmbiguityKind::GlobVsExpanded, first, second });
+                                }
+                            }
                         }
                     }
                     if let Some(e) = it.expansion {
@@ -294,6 +333,13 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         if own {
                             for &(ns, name, def) in ix.explicit[e as usize].iter() {
                                 bind(ns, name, def, &mut out.errors);
+                            }
+                            // R8: a root `extern crate .. as n;` this expansion wrote beside a
+                            // dependency's `n`, at the call that wrote it.
+                            if let Some(at) = it.call {
+                                for &(_, r8) in self.r8.iter().filter(|r| r.0 == e) {
+                                    out.errors.push(r8.error(Site::Call(at.key), path(c)));
+                                }
                             }
                         }
                     }

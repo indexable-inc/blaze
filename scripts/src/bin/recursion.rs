@@ -461,6 +461,7 @@ fn selftest(tests: &Tests) {
         let made = full.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&full, text));
         made.unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &format!("{path} is not written: {e}")));
     };
+    put("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
     put("crates/a/Cargo.toml", "[package]\nname = \"a\"\n");
     put("crates/a/src/lib.rs", FIXTURE);
     put("crates/a/tests/it.rs", "fn r() { r() }\n");

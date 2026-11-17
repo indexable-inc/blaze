@@ -223,6 +223,32 @@ impl<'a> CrateEnv<'a> {
         Ok(CrateEnv { vars, unknown, bin_exe_unknown: facts.test_or_bench, seen: facts.seen, package, read_folder, script: facts.script })
     }
 
+    /// This environment copied whole into `alloc`, borrowing nothing of `self`: a reader that
+    /// outlives the world's borrow (a pool body job's frame) holds its crates' environments so.
+    /// The build script's outputs record is copied byte for byte and opened again; an error
+    /// from that second open says the record's bytes are not what opened before.
+    pub fn clone_in<'b>(&self, alloc: Alloc<'b>) -> Result<CrateEnv<'b>, blaze_build_script::outputs::RecordError> {
+        let text = |s: &str| AString::from_str_in(s, alloc);
+        let mut vars: AVec<'b, (AString<'b>, AString<'b>)> = AVec::with_capacity_in(self.vars.len(), alloc);
+        vars.extend(self.vars.iter().map(|(n, v)| (text(n.as_str()), text(v.as_str()))));
+        let mut unknown: AVec<'b, &'static str> = AVec::with_capacity_in(self.unknown.len(), alloc);
+        unknown.extend(self.unknown.iter().copied());
+        let seen = match self.seen {
+            SeenRoot::Package => SeenRoot::Package,
+            SeenRoot::Member { dir } => SeenRoot::Member { dir: blaze_own::Box::leak(text(dir).into_boxed_str()) },
+        };
+        let package = self.package.as_ref().map(|(name, version)| (text(name.as_str()), text(version.as_str())));
+        let script = match self.script {
+            None => None,
+            Some(record) => {
+                let mut bytes: AVec<'b, u8> = AVec::with_capacity_in(record.bytes().len(), alloc);
+                bytes.extend_from_slice(record.bytes());
+                Some(OutputsRef::open(bytes.leak())?)
+            }
+        };
+        Ok(CrateEnv { vars, unknown, bin_exe_unknown: self.bin_exe_unknown, seen, package, read_folder: text(self.read_folder.as_str()), script })
+    }
+
     /// The variable `name`: its value, `None` when the crate is compiled without it (`env!` of
     /// it is the Reference's compile error), or [`EnvUnknown`] when cargo sets it and this
     /// build does not know its value.
@@ -270,6 +296,33 @@ impl<'a> CrateEnv<'a> {
     /// Every variable with its value, sorted by name.
     pub fn vars(&self) -> impl Iterator<Item = (&str, &str)> {
         self.vars.iter().map(|(n, v)| (n.as_str(), v.as_str()))
+    }
+}
+
+/// A crate's environment lent to another thread to be COPIED there ([`CrateEnv::clone_in`]),
+/// and nothing else: a pool worker's task (blaze-cli names.rs, a `CrateScope` off the main
+/// thread) makes its own in its own frame. `CrateEnv` itself is not `Sync`: its collections
+/// hold [`Alloc`] handles of an allocator that may be one thread's frame.
+#[derive(Clone, Copy)]
+pub struct EnvLent<'e, 'a>(&'e CrateEnv<'a>);
+
+// SAFETY: the one way through an `EnvLent` is `copy_in`, which calls `clone_in`: that reads the
+// env's vectors and strings through shared borrows (their buffers only) and allocates through
+// the `alloc` it is given, never through an `Alloc` handle the env's own collections hold, so
+// no allocator of the lending thread is called from another. The shared borrow `'e` means no
+// thread mutates or drops the env while it is lent. An `OutputsRef` is plain borrowed bytes.
+unsafe impl Sync for EnvLent<'_, '_> {}
+// SAFETY: as for `Sync`: the value is one shared borrow, used only as described there.
+unsafe impl Send for EnvLent<'_, '_> {}
+
+impl<'e, 'a> EnvLent<'e, 'a> {
+    pub fn new(env: &'e CrateEnv<'a>) -> EnvLent<'e, 'a> {
+        EnvLent(env)
+    }
+
+    /// The lent environment copied whole into `alloc` ([`CrateEnv::clone_in`]).
+    pub fn copy_in<'b>(self, alloc: Alloc<'b>) -> Result<CrateEnv<'b>, blaze_build_script::outputs::RecordError> {
+        self.0.clone_in(alloc)
     }
 }
 
@@ -400,6 +453,26 @@ mod tests {
         assert_eq!(member.shown_file("src/lib.rs", alloc).as_ref().map(|s| s.as_str()), Some("crates/node/src/lib.rs"));
         let toolchain = CrateEnv::of(EnvFacts { package: None, ..facts("1.0.0") }, alloc).expect("no version to read");
         assert!(toolchain.shown_file("src/lib.rs", alloc).is_none());
+    }
+
+    /// `clone_in` gives an environment that answers every read as the original does and
+    /// borrows nothing of it: the facts' member dir is a string dropped before the copy is
+    /// read (a pool body job holds its crates' environments so, past the world's borrow).
+    /// Expected line: `test crate_env::tests::a_copied_environment_answers_alone ... ok`.
+    #[test]
+    fn a_copied_environment_answers_alone() {
+        let alloc = Alloc::global();
+        let copy = {
+            let dir = std::string::String::from("crates/node");
+            let facts = EnvFacts { seen: SeenRoot::member(dir.as_str()).expect("a plain dir"), test_or_bench: true, ..facts("1.2.0") };
+            let env = CrateEnv::of(facts, alloc).expect("a SemVer version");
+            env.clone_in(alloc).expect("no script record to open")
+        };
+        assert_eq!(copy.get("CARGO_MANIFEST_DIR"), Ok(Some("/workspace/crates/node")));
+        assert_eq!(copy.get("CARGO_PKG_VERSION_MINOR"), Ok(Some("2")));
+        assert_eq!(copy.get("CARGO_BIN_EXE_node"), Err(EnvUnknown));
+        assert_eq!(copy.shown_file("src/lib.rs", alloc).as_ref().map(|s| s.as_str()), Some("crates/node/src/lib.rs"));
+        assert_eq!(copy.read_folder(), "/7/");
     }
 
     /// A toolchain crate has no package: its `CARGO_PKG_NAME` is unknown, never unset.

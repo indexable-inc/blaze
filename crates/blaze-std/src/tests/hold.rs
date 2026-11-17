@@ -31,7 +31,7 @@ use crate::{
 const EXCHANGE: usize = 4096;
 
 fn host(io: Io, hold: Hold) -> Box<Hosting> {
-    Hosting::holding(io, vec!["toucher".to_owned()], vec![("everything".to_owned(), "io".to_owned())], EXCHANGE, Holding::of(hold), blaze_own::testing::heap().shared())
+    Hosting::holding(io, vec!["toucher".to_owned()], Vec::new(), EXCHANGE, Holding::of(hold), blaze_own::testing::heap().shared())
 }
 
 /// Every capability the hosted wire offers, touched once each.
@@ -48,21 +48,21 @@ fn touch(cx: &Cx, io: &Io, said: &str) -> Result<(), Error> {
 }
 
 fn toucher(cx: &Cx, io: Io) -> Status {
-    let Some(io) = guest::grant::<Io>(&io, "io") else { return Status::REFUSED };
+    let Some(_out) = guest::grant::<crate::out::Out>(&io, "out") else { return Status::REFUSED };
     let ran = touch(cx, &io, "to out");
     guest::finish(&io, ran)
 }
 
 /// As `toucher`, but its first line says other words: the program a replay must stop.
 fn other_toucher(cx: &Cx, io: Io) -> Status {
-    let Some(io) = guest::grant::<Io>(&io, "io") else { return Status::REFUSED };
+    let Some(_out) = guest::grant::<crate::out::Out>(&io, "out") else { return Status::REFUSED };
     let ran = touch(cx, &io, "TO OUT");
     guest::finish(&io, ran)
 }
 
 /// As `toucher` with no randomness asked: the control for the coverage test.
 fn toucher_without_rng(cx: &Cx, io: Io) -> Status {
-    let Some(io) = guest::grant::<Io>(&io, "io") else { return Status::REFUSED };
+    let Some(_out) = guest::grant::<crate::out::Out>(&io, "out") else { return Status::REFUSED };
     let ran = (|| {
         io.need_out()?.line(cx, "to out")?;
         Ok::<(), Error>(())
@@ -175,7 +175,7 @@ fn plan(tape: &Tape) -> (Vec<Step>, usize) {
             1 => Step::Clock { which: *tape.one_of(&[wire::clock::MONOTONIC, wire::clock::WALL], "a clock") },
             2 => Step::Arg { index: tape.below(3, "an index") },
             3 => Step::Grant {
-                kind: *tape.one_of(&["everything", "out"], "a kind"),
+                kind: *tape.one_of(&["dir", "out"], "a kind"),
                 name: *tape.one_of(&["io", "nope"], "a name"),
             },
             _ => Step::Random { len: 1 + tape.below(16, "random bytes") },

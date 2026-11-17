@@ -304,6 +304,10 @@ struct BodyTypes<'b, S> {
     /// ([`super::world_paths::AliasPaths`]).
     locals: &'b super::locals::Locals<'b>,
     owner: ItemKey,
+    /// An `async fn`'s written return type (its id in the body's view) and the type its head
+    /// made of it in return position ([`super::async_output`]): the coroutine's output
+    /// `to_typeck` reads, never lowered again in the body's env (which has no return opaques).
+    async_ret: Option<(lf::TypeId, PTy)>,
 }
 
 impl<'b, 'n, S: NamesSource<'n>> BodyTypes<'b, S> {
@@ -335,6 +339,11 @@ impl<'b, 'n, S: NamesSource<'n>> BodyTypes<'b, S> {
 
 impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
     fn ty(&mut self, view: &View<'_>, t: lf::TypeId, tys: &mut PortableTys<'_>) -> Result<PTy, Refused> {
+        if let Some((at, out)) = self.async_ret {
+            if at == t {
+                return Ok(out);
+            }
+        }
         let env = self.env_at(view, t)?;
         match self.builder.ty(tys, &env, view, t) {
             Ok(ty) => Ok(ty),
@@ -681,6 +690,22 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     let at = super::locals::Enclosing { owner, item, krate, module, text };
     store.locals.keep(names, keys, at, &view, Alloc::global()).map_err(|error| BodyError::Head { item, error })?;
 
+    // An `async fn`'s coroutine output is its written return type in RETURN position (the
+    // Reference, "Async functions": `async fn f() -> T` is `fn f() -> impl Future<Output = T>`;
+    // an `impl Trait` in `T` is one of `f`'s opaques): the head's `T`, read from the head
+    // ([`super::async_output`]). A free fn's head is made here when it is not yet (a member's
+    // was made by `lower_member_into`); lowered again into a finished table (`into`), the head
+    // was made by the first lowering, and its absence is refused by the fn's key.
+    let async_ret = match super::async_output::written(&view) {
+        None => None,
+        Some(t) => {
+            if super::async_output::of(store, owner).is_none() && into.is_none() {
+                store.ensure(names, keys, Want::Fn(item)).map_err(|error| BodyError::Head { item, error })?;
+            }
+            Some((t, super::async_output::of(store, owner).ok_or(BodyError::NoHead(owner))?))
+        }
+    };
+
     // The body's blocks that are modules holding a local type: a written type is read there.
     let blocks: &'n [super::locals::BlockModule] = store.locals.body(owner).map_or(&[], |b| b.blocks);
 
@@ -694,6 +719,7 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             blocks,
             locals: &store.locals,
             owner,
+            async_ret,
         };
         // Each round converts into a fresh overlay of the records' table (read in place, never
         // copied): a refused round's types are dropped with it, none reaches `store.tys`, and

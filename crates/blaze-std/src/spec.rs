@@ -8,7 +8,7 @@
 //! | `args` | the command line, the program's name first |
 //! | `env` | every environment variable by name and value: nothing else is in the program's [`crate::env::Env`] |
 //! | `dir` | the directory it is started in, absolute: the root its file names are beneath, and the one every folder grant is relative to |
-//! | `grants` | by name, each a [`Scope`] (a folder with rights, a network endpoint, named variables, everything, or one whole capability), its [`Provider`] and its [`Layers`] when they differ from the run's |
+//! | `grants` | by name, each a [`Scope`] (a folder with rights, a network endpoint, named variables, or one whole capability: never everything, D104), its [`Provider`] and its [`Layers`] when they differ from the run's |
 //! | `provider`, `layers` | the run-wide defaults of both (run.md, "How a run is held") |
 //! | `seed` | what a fake provider's world is seeded from |
 //! | `limits` | memory (bytes) and time (milliseconds), each or none |
@@ -36,7 +36,7 @@ use blaze_json::{Duplicates, Limits as JsonLimits, What, WriteOptions};
 use blaze_own::{String, Vec};
 use blaze_text::{Put, Show, Shown, Writes as _};
 
-use crate::{env::VarName, grant::Kind, io::Offers, net::HostPort, path::Path};
+use crate::{env::VarName, io::Offers, net::HostPort, path::Path};
 
 /// The spec's format version: the `version` field of every spec.
 pub const VERSION: u64 = 1;
@@ -55,7 +55,8 @@ pub const SPEC_LIMITS: JsonLimits =
 const DIGEST_DOMAIN: &str = "bstd.run-spec.v1";
 
 /// A grant's name: a parameter of `main`, as written (`data`, `api`, `_`): ASCII letters,
-/// digits and `_`, not starting with a digit, at most [`GrantName::MOST`] bytes.
+/// digits and `_`, not starting with a digit, at most [`GrantName::MOST`] bytes; or a `Many`'s
+/// member, `<parameter>.<member>`, each side such a name (crate::grant::is_grant_name).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct GrantName<A: Allocator>(String<A>);
 
@@ -64,7 +65,7 @@ impl<A: Allocator + Clone> GrantName<A> {
 
     /// `raw` as a grant's name, or why it is none.
     pub fn new(raw: &str, alloc: A) -> Result<GrantName<A>, BadName> {
-        match is_name(raw) {
+        match crate::grant::is_grant_name(raw) {
             true => Ok(GrantName(String::from_str_in(raw, alloc))),
             false => Err(BadName),
         }
@@ -112,10 +113,10 @@ pub enum Scope<A: Allocator> {
     Net { at: String<A>, listen: bool },
     /// The environment variables of these names, sorted, each once.
     Env { names: Vec<String<A>, A> },
-    /// Everything: the grant an [`crate::Io`] parameter takes (a script's world).
-    Everything,
-    /// One root capability whole, by its name in [`Offers::NAMES`] (`fs`, `rng`, `host`, ...).
-    Whole { capability: String<A> },
+    /// One root capability whole, by its name in [`Offers::NAMES`] (`fs`, `rng`, `host`, ...)
+    /// or `crate::grant::BY_MACHINE` (`gpu`); with a `device`, only that device of it (a
+    /// capability of `crate::grant::ONE_DEVICE`: `audio`, `audio_in`, `camera`, ...).
+    Whole { capability: String<A>, device: Option<String<A>> },
 }
 
 impl<A: Allocator> Scope<A> {
@@ -125,7 +126,6 @@ impl<A: Allocator> Scope<A> {
             Scope::Dir { .. } => "dir",
             Scope::Net { .. } => "net",
             Scope::Env { .. } => "env",
-            Scope::Everything => "everything",
             Scope::Whole { .. } => "whole",
         }
     }
@@ -538,8 +538,13 @@ fn granted_value<A: Allocator + Clone>(granted: &Granted<A>, a: &A) -> Value<A> 
             }
             Value::List(list)
         }
-        Scope::Everything => Value::Map(Map::new_in(a.clone())),
-        Scope::Whole { capability } => text(capability.as_str(), a),
+        Scope::Whole { capability, device: None } => text(capability.as_str(), a),
+        Scope::Whole { capability, device: Some(device) } => {
+            let mut one = Map::new_in(a.clone());
+            put(&mut one, "capability", text(capability.as_str(), a), a);
+            put(&mut one, "device", text(device.as_str(), a), a);
+            Value::Map(one)
+        }
     };
     put(&mut map, granted.scope.kind_name(), scope, a);
     if let Some(provider) = granted.provider {
@@ -599,7 +604,7 @@ fn read_stream<A: Allocator + Clone>(at: &Cursor<'_, '_, A>) -> Result<Stream<A>
 }
 
 /// The scope keys a grant object may hold, one of them.
-const SCOPES: [&str; 5] = ["dir", "net", "env", "everything", "whole"];
+const SCOPES: [&str; 4] = ["dir", "net", "env", "whole"];
 
 fn read_grants<A: Allocator + Clone>(at: &Cursor<'_, '_, A>, alloc: A) -> Result<Vec<Granted<A>, A>, SpecError<A>> {
     let mut grants: Vec<Granted<A>, A> = Vec::new_in(alloc.clone());
@@ -613,13 +618,13 @@ fn read_grants<A: Allocator + Clone>(at: &Cursor<'_, '_, A>, alloc: A) -> Result
             for key in SCOPES {
                 if let Some(c) = f.cursor_opt(key)? {
                     if scope.is_some() {
-                        return Err(c.invalid("grant", &"a grant has one scope: one of `dir`, `net`, `env`, `everything`, `whole`"));
+                        return Err(c.invalid("grant", &"a grant has one scope: one of `dir`, `net`, `env`, `whole`"));
                     }
                     scope = Some(read_scope(key, &c, alloc.clone())?);
                 }
             }
             let Some(scope) = scope else {
-                return Err(value.invalid("grant", &"a grant has a scope: one of `dir`, `net`, `env`, `everything`, `whole`"));
+                return Err(value.invalid("grant", &"a grant has a scope: one of `dir`, `net`, `env`, `whole` (a whole world cannot be granted: D104)"));
             };
             let provider = match f.cursor_opt("provider")? {
                 Some(c) => Some(read_provider(&c)?),
@@ -644,7 +649,9 @@ fn read_scope<A: Allocator + Clone>(key: &str, at: &Cursor<'_, '_, A>, alloc: A)
         "dir" => at.fields(|f| {
             let path_at = f.cursor("path")?;
             let path: String<A> = path_at.get()?;
-            if let Err(why) = Path::new(path.as_str()) {
+            if path.as_str() != crate::grant::START_FOLDER
+                && let Err(why) = Path::new(path.as_str())
+            {
                 return Err(path_at.invalid("folder", &why));
             }
             Ok(Scope::Dir { path, write: f.take("write")? })
@@ -673,12 +680,24 @@ fn read_scope<A: Allocator + Clone>(key: &str, at: &Cursor<'_, '_, A>, alloc: A)
             names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
             Ok(Scope::Env { names })
         }
-        "everything" => at.fields(|_| Ok(Scope::Everything)),
+        _ if matches!(at.value(), Value::Map(_)) => at.fields(|f| {
+            let capability_at = f.cursor("capability")?;
+            let capability: String<A> = capability_at.get()?;
+            if !crate::grant::narrows_to_device(capability.as_str()) {
+                return Err(capability_at.invalid("capability", &"not one a grant narrows to a device (`bstd::grant::ONE_DEVICE`)"));
+            }
+            let device_at = f.cursor("device")?;
+            let device: String<A> = device_at.get()?;
+            if crate::name::refused(device.as_str()).is_some() {
+                return Err(device_at.invalid("device name", &"1 to 255 bytes, no control byte, no space at either end"));
+            }
+            Ok(Scope::Whole { capability, device: Some(device) })
+        }),
         _ => {
             let capability: String<A> = at.get()?;
-            match Offers::NAMES.contains(&capability.as_str()) {
-                true => Ok(Scope::Whole { capability }),
-                false => Err(at.invalid("capability", &"not one of bstd's capabilities (`Offers::NAMES`)")),
+            match crate::grant::is_whole_capability(capability.as_str()) {
+                true => Ok(Scope::Whole { capability, device: None }),
+                false => Err(at.invalid("capability", &"not one of bstd's capabilities (`Offers::NAMES`, `grant::BY_MACHINE`)")),
             }
         }
     }
@@ -720,38 +739,15 @@ pub fn grant_arg<A: Allocator + Clone>(
     alloc: A,
 ) -> Result<Granted<A>, GrantArgError> {
     let (name, value) = arg.split_once('=').ok_or(GrantArgError::NoEquals)?;
-    let param = manifest.param(name).ok_or(GrantArgError::NoParameter)?;
+    // A `Many`'s member (`inputs.a`) is taken by its parameter (`inputs`).
+    let param = manifest.taker(name).ok_or(GrantArgError::NoParameter)?;
     let name = GrantName::new(name, alloc.clone()).map_err(|_| GrantArgError::NoParameter)?;
-    let wants = param.kind.scope_form();
-    let bad = GrantArgError::Value { wants };
-    let scope = match param.kind {
-        Kind::Dir { write } => {
-            Path::new(value).map_err(|_| bad.clone())?;
-            Scope::Dir { path: String::from_str_in(value, alloc), write }
-        }
-        Kind::Net => {
-            let (listen, endpoint) = match value.strip_prefix("listen:") {
-                Some(endpoint) => (true, endpoint),
-                None => (false, value),
-            };
-            HostPort::parse(endpoint).map_err(|_| bad.clone())?;
-            Scope::Net { at: String::from_str_in(endpoint, alloc), listen }
-        }
-        Kind::Env => {
-            let mut names: Vec<String<A>, A> = Vec::new_in(alloc.clone());
-            for name in value.split(',') {
-                VarName::new(name).map_err(|_| bad.clone())?;
-                if !names.iter().any(|it| it == name) {
-                    names.push(String::from_str_in(name, alloc.clone()));
-                }
-            }
-            names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-            Scope::Env { names }
-        }
-        Kind::Everything if value == "everything" => Scope::Everything,
-        Kind::Whole(capability) if value == "whole" => Scope::Whole { capability: String::from_str_in(capability, alloc) },
-        Kind::Everything | Kind::Whole(_) => return Err(bad),
-        Kind::Args | Kind::Out | Kind::Clock | Kind::Mem | Kind::Spec => return Err(GrantArgError::FillsItself),
+    // A `OneOf`'s value names its alternative: `dir:..`, `read:..`, `net:..`, `env:..`, `fs:whole`.
+    let (kind, value) = match param.form {
+        crate::grant::Form::OneOf(kinds) => crate::grant::compose_alternative(kinds, value)
+            .ok_or(GrantArgError::Value { wants: "<alternative>:<scope> (dir, read, net, env, or a capability's name)" })?,
+        crate::grant::Form::One | crate::grant::Form::Optional | crate::grant::Form::Many => (param.kind, value),
     };
+    let scope = crate::grant::compose_scope(kind, param.narrow, value, alloc)?;
     Ok(Granted { name, scope, provider: None, layers: None })
 }

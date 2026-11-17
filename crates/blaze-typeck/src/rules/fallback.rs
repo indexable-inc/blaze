@@ -62,6 +62,9 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         // A mutable place through an overloaded deref calls `DerefMut` (rules/mut_places.rs);
         // before `select_all`, so the `DerefMut` goals it registers are proven with the rest.
         self.mut_places()?;
+        // Each `.await`'s callee: the `IntoFuture` impl the body's solver selects
+        // (rules/await_impl.rs); before `select_all`, which reports an ambiguous operand.
+        self.await_impls()?;
         self.select_all()
     }
 }

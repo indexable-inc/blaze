@@ -32,19 +32,30 @@
 //! argument is checked against the formal as the coercion site it already was
 //! (`Machine::next_arg`, `Then::Coerce`).
 //!
-//! Two kinds of resolved input say nothing, as in rustc:
-//! - one that is `str`, a slice or a trait object (`Expectation::rvalue_hint`:
-//!   `ExpectRvalueLikeUnsized` has no `only_has_type`): `Box::new(v)` expected as
-//!   `Box<dyn Tr>` resolves its input to `dyn Tr`, which no argument has;
-//! - one that still holds an inference variable. rustc replaces the variables the probe made
-//!   by fresh ones (`fudge_inference_if_ok`); the table here has no such operation, and a type
-//!   holding none is the same type after the rollback, so only those are taken. Said plainly:
-//!   this takes fewer hints than rustc does (an ADT whose LAST FIELD is unsized is also not
-//!   looked through: `struct_tail` is not asked).
+//! A resolved input that is `str`, a slice or a trait object binds no formal
+//! (`Expectation::rvalue_hint`: `ExpectRvalueLikeUnsized` has no `only_has_type`): `Box::new(v)`
+//! expected as `Box<dyn Tr>` resolves its input to `dyn Tr`, which no argument has. It is the
+//! argument's hint instead (`Machine::unsized_arg_hints`, taken by `next_arg`), as in rustc,
+//! where the argument is checked with that expectation and coerced to the formal: a closure
+//! takes its signature from it (`Box::new(|tx| tx.clone())` expected as
+//! `Box<dyn FnMut(&T)>`: rules/closure.rs `deduce_sig`).
+//!
+//! A resolved input says nothing when it holds an inference variable THE PROBE MADE. rustc
+//! replaces those by fresh ones (`fudge_inference_if_ok`); the table here has no such
+//! operation, so such an input is not taken. A variable made BEFORE the probe (the callee's
+//! own generic arguments) is the same variable after the rollback, so an input holding only
+//! those is taken (`TypeCtx::list_has_infer_since`): `vec![a, b]` is
+//! `box_assume_init_into_vec_unsafe::<T, N>(write_box_via_move(Box::new_uninit(), [a, b]))`
+//! (the pinned library/alloc/src/macros.rs), whose input `Box<MaybeUninit<[P; ?N]>>` under an
+//! expected `Vec<P>` still holds its own `?N`, and only through it does `P` reach the array's
+//! elements as their coercion target (rung s6-async-04; suite/expect_fudge.rs). Said plainly:
+//! this takes fewer hints than rustc does (an input holding a variable the probe made; an ADT
+//! whose LAST FIELD is unsized is also not looked through: `struct_tail` is not asked).
 
 use blaze_own::{Alloc, Vec};
 
 use crate::error::Stop;
+use crate::ids::ExprId;
 use crate::machine::{Expectation, Machine};
 use crate::ty::{Ty, TyList, TyView, TypeCtx};
 use crate::world::World;
@@ -55,14 +66,24 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// bound when the call has no expected type, when `output` cannot be the expected type
     /// (the mismatch is reported once, at the call, by whoever gave the expectation), or for
     /// an input the expected type does not decide.
-    pub(crate) fn expected_inputs(&mut self, expect: Expectation, inputs: TyList, output: Ty) -> Result<(), Stop> {
+    pub(crate) fn expected_inputs(
+        &mut self,
+        expect: Expectation,
+        inputs: TyList,
+        output: Ty,
+        args: &[ExprId],
+    ) -> Result<(), Stop> {
         let Some(expected) = expect.only_has_type() else { return Ok(()) };
         let n = self.ty.list_len(inputs);
         if n == 0 || self.is_ty_var(expected) || self.is_err(expected) || self.is_err(output) {
             return Ok(());
         }
-        let mut hints: Vec<Option<Ty>, Alloc<'a>> = Vec::with_capacity_in(n as usize, self.alloc);
+        // Per input: `HasType(t)` binds the formal to `t`; `RvalueLikeUnsized(t)` is the
+        // argument's hint only (`rvalue_hint`: `str`, a slice, a trait object).
+        let mut hints: Vec<Option<Expectation>, Alloc<'a>> = Vec::with_capacity_in(n as usize, self.alloc);
         let fits = self.probe(|m| -> Result<bool, Stop> {
+            // The variables that outlive the probe: those that exist before it.
+            let mark = m.ty.var_mark();
             if !m.unify(output, expected)? {
                 return Ok(false);
             }
@@ -70,9 +91,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 let formal = m.ty.list_get(inputs, i);
                 let resolved = m.ty.resolve(formal)?;
                 let one = m.mk_list(&[resolved])?;
-                let says_nothing = m.ty.list_has_infer(one)
-                    || matches!(m.ty.view(resolved), TyView::Str | TyView::Slice(_) | TyView::Dynamic(_) | TyView::Error);
-                hints.push(if says_nothing { None } else { Some(resolved) });
+                let says_nothing = m.ty.list_has_infer_since(one, mark) || matches!(m.ty.view(resolved), TyView::Error);
+                hints.push(if says_nothing { None } else { Some(m.rvalue_hint(resolved)) });
             }
             Ok(true)
         })?;
@@ -80,13 +100,32 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             return Ok(());
         }
         for (i, hint) in hints.iter().enumerate() {
-            let Some(hint) = *hint else { continue };
-            let formal = self.ty.list_get(inputs, i as u32);
-            // `hint` is `formal` under the probe's bindings, so the two unify; `false` binds
-            // nothing (`TypeCtx::unify`), and the argument is then checked against the formal
-            // as written, where any mismatch is reported.
-            self.unify(formal, hint)?;
+            match *hint {
+                Some(Expectation::HasType(t)) => {
+                    let formal = self.ty.list_get(inputs, i as u32);
+                    // `t` is `formal` under the probe's bindings, so the two unify; `false`
+                    // binds nothing (`TypeCtx::unify`), and the argument is then checked
+                    // against the formal as written, where any mismatch is reported.
+                    self.unify(formal, t)?;
+                }
+                Some(Expectation::RvalueLikeUnsized(t)) => {
+                    // An argument past the formals (E0061, reported by `start_args`) has none.
+                    let Some(&arg) = args.get(i) else { continue };
+                    match self.unsized_arg_hints.iter_mut().find(|(e, _)| *e == arg) {
+                        Some(row) => row.1 = t,
+                        None => self.unsized_arg_hints.push((arg, t)),
+                    }
+                }
+                Some(Expectation::None | Expectation::Castable(_)) | None => {}
+            }
         }
         Ok(())
+    }
+
+    /// The unsized type the call's expected type gave argument `arg` as its hint
+    /// ([`Machine::expected_inputs`]), taken once by `next_arg`.
+    pub(crate) fn take_unsized_arg_hint(&mut self, arg: ExprId) -> Option<Ty> {
+        let at = self.unsized_arg_hints.iter().position(|&(e, _)| e == arg)?;
+        Some(self.unsized_arg_hints.remove_shift(at).1)
     }
 }

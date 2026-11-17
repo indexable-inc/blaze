@@ -343,8 +343,9 @@ mod tests {
     }
 
     /// `new` with `--bstd` writes a package of the blaze edition: the opt-in in the manifest,
-    /// bstd named where it was said to be, and a `main` that takes its world and writes its
-    /// line through `Out`.
+    /// bstd named where it was said to be, and a `main` that names the one grant it uses,
+    /// `out: Out` (D104), and writes its line through it. Judge-changed (coordinator, D104):
+    /// the template no longer takes a whole `Io` (crates/blaze-new, d104-B-lib).
     #[test]
     fn new_writes_a_package_of_the_blaze_edition_where_bstd_is_named() {
         let dir = tempfile::tempdir().unwrap();
@@ -359,8 +360,9 @@ mod tests {
             "{manifest}"
         );
         let source = std::fs::read_to_string(cwd.join("hello/src/main.rs")).unwrap();
-        assert!(source.contains("fn main(cx: &Cx, io: Io) -> Result<(), Error>"), "{source}");
-        assert!(source.contains("io.need_out()?.line(cx, \"Hello, world!\")?;"), "{source}");
+        assert!(source.contains("fn main(cx: &Cx, out: Out) -> Result<(), Error>"), "{source}");
+        assert!(source.contains("out.line(cx, \"Hello, world!\")?;"), "{source}");
+        assert!(!source.contains("Io"), "D104: a `main` asks for no whole world: {source}");
         assert!(!source.contains("println"), "nothing ambient: {source}");
         // A library of the edition has no test module yet.
         let read = self::read(&["--vcs", "none", "--lib", "--bstd", "../bstd", "shelf"]);

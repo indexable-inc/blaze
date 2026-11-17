@@ -171,6 +171,7 @@ fn answers<'n, S: NamesSource<'n>>(names: S, item: ItemKey) -> String {
     out.push_str(&format!("text {:?}\n", names.text_of(item)));
     out.push_str(&format!("name {:?} home {:?} has_text {} ctor {}\n", names.name_of(item), names.home_of(item), names.has_text(item), names.is_ctor(item)));
     out.push_str(&format!("place {:?}\n", names.place_of(item).map(|p| (p.krate, p.at, p.item))));
+    out.push_str(&format!("item_start {:?}\n", names.item_start(item)));
     out.push_str(&format!("kind {:?} detail {:?}\n", names.kind_of_item(item), names.detail_of(item)));
     out.push_str(&format!("want {}\n", match fill::want_of_item(names, item) {
         Ok(_) => "a head".to_string(),

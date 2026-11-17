@@ -7,9 +7,9 @@
 
 use core::fmt;
 
-use blaze_drive::Tool;
+use blaze_drive::{Kind, Tool};
 use blaze_ids::ContentId;
-use blaze_ids::producer::Producers;
+use blaze_ids::producer::{Producers, Row};
 
 /// A file at a fixed path whose bytes are another form than this build's.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -47,7 +47,42 @@ pub fn current<'b>(file: &'static str, bytes: &'b [u8], magic: &'static [u8; 4])
 /// or a form's bump is a new key for every record (rule 21) and an old home's records are
 /// misses. Nothing in it is typed in by hand.
 pub fn tool(producers: &Producers) -> Tool {
-    let mut id = ContentId::of("blaze-cli tool 4", &producers.digest().0);
+    with_forms(ContentId::of("blaze-cli tool 4", &producers.digest().0))
+}
+
+/// Each kind's tool, by `Kind::index` (decision D105): the row of the producer that makes the
+/// kind ([`row_of`]) and every form, so an edit to one producer moves only the keys of its kinds
+/// and a release that leaves a producer's crates alone keeps its records. The certificate and the
+/// pointer keep [`tool`], which every producer moves.
+pub fn tools(producers: &Producers) -> [Tool; blaze_drive::key::KINDS] {
+    Kind::ALL.map(|kind| with_forms(ContentId::of("blaze-cli kind tool 1", &producers.row(row_of(kind)).0)))
+}
+
+/// The producer that makes each kind of record: one exhaustive match, so a new kind is placed
+/// here or does not compile.
+pub fn row_of(kind: Kind) -> Row {
+    match kind {
+        Kind::Expansion => Row::Expander,
+        Kind::BodyCheck => Row::BodyChecker,
+        Kind::CrateScope | Kind::ModuleScope | Kind::Group => Row::Names,
+        Kind::Code => Row::CodeBuilder,
+        // No row of their own yet: the binary's id, so any rebuilt blaze makes them again.
+        // `Signature` and `ImplBucket` are the checker's, placed when a test shows their records
+        // made by the body checker's code alone.
+        Kind::Units
+        | Kind::UnitGraph
+        | Kind::Fetch
+        | Kind::FileItems
+        | Kind::Surface
+        | Kind::Signature
+        | Kind::ImplBucket
+        | Kind::Test
+        | Kind::MacroModule => Row::Whole,
+    }
+}
+
+/// `id` chained with every form this build writes: a form's bump is a new key (rule 21).
+fn with_forms(mut id: ContentId) -> Tool {
     for magic in blaze_drive::FORMATS.iter().map(|(_, magic)| *magic).chain([crate::sweep::LEAVES_MAGIC]) {
         let mut chained = [0u8; 36];
         chained[..32].copy_from_slice(&id.0);

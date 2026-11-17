@@ -72,6 +72,7 @@ fn attempt(place: &Place, attempt: &str, deadline: Duration, plant: Plant) -> Re
         env: &[(ATTEMPT, attempt)],
         dir: &place.package,
         deadline,
+        exec_under: &[],
     };
     let ran = run_planted(&run, plant, Alloc::global())?;
     let stdout = std::string::String::from_utf8_lossy(&ran.stdout);
@@ -128,6 +129,7 @@ fn attempt_with_tools(place: &Place, attempt: &str, package: &str) -> std::strin
         env: &[(ATTEMPT, attempt), ("PATH", path.as_str())],
         dir: &place.package,
         deadline: LONG,
+        exec_under: &[],
     };
     let ran = run_planted(&run, Plant::None, alloc).expect("the confined run");
     let stdout = std::string::String::from_utf8_lossy(&ran.stdout);
@@ -238,6 +240,7 @@ fn a_grant_that_cannot_be_said_runs_nothing() {
         env: &[],
         dir: &place.package,
         deadline: LONG,
+        exec_under: &[],
     };
     let refused = run_planted(&run, Plant::None, Alloc::global());
     assert!(matches!(&refused, Err(NativeRefusal::Grant { why }) if why.contains("/tmp/../etc")), "{refused:?}");

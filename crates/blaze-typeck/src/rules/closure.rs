@@ -28,7 +28,7 @@ use crate::body::{Expr, Pat, Stmt, UnOp};
 use crate::columns::CaptureKind;
 use crate::diag::At;
 use crate::error::{CheckError, Limit, Stop};
-use crate::ids::{ExprId, FnPtrHeader, LangItem, List, Mutbl, Name, PatId};
+use crate::ids::{ExprId, FnPtrHeader, ItemKey, LangItem, List, Mutbl, Name, PatId};
 use crate::machine::{Expectation, Flow, Frame, Machine, PendingClosure, Then};
 use crate::portable::PTy;
 use crate::ty::{Ty, TyList, TyView, TypeCtx, Var, VarKind};
@@ -57,8 +57,53 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 };
                 Ok(self.ty.closure_hint(t, [fn_, fn_mut, fn_once], Name::of("Output")))
             }
+            // rustc `deduce_closure_signature` on `ty::Dynamic`: a closure expected as
+            // `dyn FnMut(&T) + Send` (through `&`, or as `Box::new`'s argument hint:
+            // rules/expect_inputs.rs) takes the object's `Fn*` signature.
+            TyView::Dynamic(rows) => {
+                let (Some(fn_), Some(fn_mut), Some(fn_once)) =
+                    (self.lang(LangItem::Fn)?, self.lang(LangItem::FnMut)?, self.lang(LangItem::FnOnce)?)
+                else {
+                    return Ok(None);
+                };
+                Ok(self.object_closure_sig(rows, [fn_, fn_mut, fn_once], fn_once))
+            }
             _ => Ok(None),
         }
+    }
+
+    /// The signature a trait object (its predicate rows `rows`: an `ExTrait` principal, then
+    /// `ExProj`s, then `ExAuto`s) gives a closure expected as it. rustc's
+    /// `deduce_sig_from_projection` on the object's projection bounds: the `FnOnce<Args>::Output
+    /// = R` row (library/core/src/ops/function.rs: `trait FnOnce<Args: Tuple> { type Output; }`)
+    /// gives the inputs `Args` (a tuple) and the output `R`. With no such row, an `Fn*`
+    /// principal's `Args` gives the inputs alone, as a variable's pending `Fn*` goal does
+    /// (`closure_hint`). `None` when no row names an `Fn*` trait at a tuple.
+    fn object_closure_sig(&mut self, rows: TyList, fn_traits: [ItemKey; 3], fn_once: ItemKey) -> Option<(TyList, Option<Ty>)> {
+        let output_name = Name::of("Output");
+        let mut from_principal = None;
+        // Bounded by the object's rows.
+        for i in 0..self.ty.list_len(rows) {
+            let row = self.ty.list_get(rows, i);
+            match self.view(row) {
+                TyView::ExProj { trait_, name, args_term }
+                    if trait_ == fn_once && name == output_name && self.ty.list_len(args_term) == 2 =>
+                {
+                    let args = self.ty.shallow_resolve(self.ty.list_get(args_term, 0));
+                    if let TyView::Tuple(inputs) = self.view(args) {
+                        return Some((inputs, Some(self.ty.list_get(args_term, 1))));
+                    }
+                }
+                TyView::ExTrait(k, args) if fn_traits.contains(&k) && self.ty.list_len(args) == 1 => {
+                    let a = self.ty.shallow_resolve(self.ty.list_get(args, 0));
+                    if let TyView::Tuple(inputs) = self.view(a) {
+                        from_principal = Some((inputs, None));
+                    }
+                }
+                _ => {}
+            }
+        }
+        from_principal
     }
 
     /// `f.t` is the closure's type, `f.u` its output, `f.a` its return site, `f.b` the

@@ -7,8 +7,25 @@
 //! nothing in it relies on a library loaded for its initialisers alone (an Objective-C category,
 //! a `+load` method, a constructor with no symbol bound), which this flag would drop.
 //! `tests/links.rs` holds the result: the binary links libSystem and nothing else.
+//!
+//! It also digests each producer's source (decision D105, build/producers.rs) into
+//! `$OUT_DIR/producer_sources.rs`, which src/producers.rs includes. A row it cannot digest is a
+//! warning, never a stop; only the disk failing under it stops the build, by name.
 
-fn main() {
+#[path = "build/producers.rs"]
+mod producers;
+
+fn main() -> std::process::ExitCode {
+    #[expect(clippy::disallowed_methods, reason = "cargo hands a build script its directories only as `CARGO_MANIFEST_DIR` and `OUT_DIR`")]
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR for every build script");
+    #[expect(clippy::disallowed_methods, reason = "cargo hands a build script its directories only as `CARGO_MANIFEST_DIR` and `OUT_DIR`")]
+    let out_dir = std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR for every build script");
+    // The build step is a program's entry: it names the process's heap (D102).
+    let alloc = blaze_own::Heap::process().alloc();
+    if let Err(failed) = producers::write(std::path::Path::new(&manifest_dir), std::path::Path::new(&out_dir), alloc) {
+        eprintln!("error: {failed}");
+        return std::process::ExitCode::FAILURE;
+    }
     #[expect(clippy::disallowed_methods, reason = "cargo hands a build script its target only as `CARGO_CFG_TARGET_OS`")]
     let os = std::env::var("CARGO_CFG_TARGET_OS").expect("cargo sets CARGO_CFG_TARGET_OS for every build script");
     if os == "macos" {
@@ -21,4 +38,5 @@ fn main() {
         println!("cargo::rustc-link-arg=-Wl,--build-id=sha1");
     }
     println!("cargo::rerun-if-changed=build.rs");
+    std::process::ExitCode::SUCCESS
 }

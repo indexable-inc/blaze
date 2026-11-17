@@ -3,6 +3,7 @@
 //! from the prompt's rules: the program replaced by the pinned tool, the arguments kept in order,
 //! the environment `fixed_env` and nothing else, host paths refused by name.
 
+use blaze_expand::seen::SeenRoot;
 use blaze_ids::ContentId;
 use blaze_own::{Alloc, String};
 use blaze_spawn::{Input, SpawnRequest, Tool, fixed_env};
@@ -24,13 +25,14 @@ fn context<'c>(tools: &'c [Tool<'c>], present: &'c [(&'c str, ContentId)]) -> CC
         step: ContentId::of("c_request test step", b"zstd-sys build script"),
         clang: tool("clang", 1, "/toolchain/bin/clang"),
         tools,
+        seen: SeenRoot::Package,
         package_tree: ContentId::of("c_request test tree", b"zstd-sys 2.0.16"),
         sysroot: Input::Tree {
             path: String::from_str_in("/sdk", Alloc::global()),
             digest: ContentId::of("c_request test sdk", b"MacOSX26.1.sdk"),
         },
         out_present: present,
-        cwd: "/workspace",
+        cwd: "/package",
         userland: ContentId::of("c_request test userland", b"25B78"),
     }
 }
@@ -47,13 +49,13 @@ const ZSTD: &[&str] = &[
     "/sdk",
     "-ffile-prefix-map=/out=/out",
     "-I",
-    "/workspace/zstd/lib",
-    "-I/workspace/zstd/lib/common",
+    "/package/zstd/lib",
+    "-I/package/zstd/lib/common",
     "-DZSTD_MULTITHREAD=1",
     "-o",
     "/out/xxhash.o",
     "-c",
-    "/workspace/zstd/lib/common/xxhash.c",
+    "/package/zstd/lib/common/xxhash.c",
 ];
 
 fn joined(argv: &[&str]) -> std::string::String {
@@ -86,10 +88,10 @@ fn a_zstd_request_pins_clang_and_keeps_its_arguments() {
     let writes: std::vec::Vec<&str> = req.writes.iter().map(|path| path.as_str()).collect();
     assert_eq!(writes, ["/out"]);
     assert_eq!(req.reads.len(), 2);
-    assert!(req.reads.iter().any(|read| matches!(read, Input::Tree { path, digest } if path.as_str() == "/workspace" && *digest == at.package_tree)));
+    assert!(req.reads.iter().any(|read| matches!(read, Input::Tree { path, digest } if path.as_str() == "/package" && *digest == at.package_tree)));
     assert!(req.reads.iter().any(|read| matches!(read, Input::Tree { path, .. } if path.as_str() == "/sdk")));
     assert_eq!(req.present.len(), 1);
-    assert_eq!(req.cwd.as_str(), "/workspace");
+    assert_eq!(req.cwd.as_str(), "/package");
     assert!(req.stdin.is_empty());
 }
 
@@ -118,8 +120,8 @@ fn gcc_is_renamed_and_python_is_refused() {
     let tools = others();
     let at = context(&tools, &[]);
     for (argv, pinned) in [
-        ("gcc\0-c\0/workspace/a.c\0-o\0/out/a.o", "clang"),
-        ("/usr/bin/g++\0-c\0/workspace/a.cc", "clang++"),
+        ("gcc\0-c\0/package/a.c\0-o\0/out/a.o", "clang"),
+        ("/usr/bin/g++\0-c\0/package/a.cc", "clang++"),
         ("ar\0crs\0/out/liba.a\0/out/a.o", "llvm-ar"),
     ] {
         assert_eq!(request(argv, &at).program.name.as_str(), pinned, "{argv:?}");
@@ -132,22 +134,24 @@ fn gcc_is_renamed_and_python_is_refused() {
     }
     let no_tools: [Tool<'static>; 0] = [];
     let bare = context(&no_tools, &[]);
-    assert!(matches!(to_spawn("g++\0-c\0/workspace/a.cc", &bare, Alloc::global()), Err(CRequestError::ToolNotPinned { .. })));
+    assert!(matches!(to_spawn("g++\0-c\0/package/a.cc", &bare, Alloc::global()), Err(CRequestError::ToolNotPinned { .. })));
 }
 
 /// An argument naming a host path is refused naming that argument: `-I/Users/x` joined, a path
-/// climbing out of `/workspace` with `..`, and a prefix map whose old side is the host's; the
-/// control `-I/workspace/inc` is accepted.
+/// climbing out of `/package` with `..`, a prefix map whose old side is the host's, and (D96) a
+/// dependency naming `/workspace`, which is a member's mount, not its own; the control
+/// `-I/package/inc` is accepted.
 /// Expected: `test c_request_tests::a_host_include_is_refused ... ok`.
 #[test]
 fn a_host_include_is_refused() {
     let tools = others();
     let at = context(&tools, &[]);
     for (argv, bad) in [
-        ("cc\0-I/Users/x\0-c\0/workspace/a.c", "-I/Users/x"),
-        ("cc\0-c\0/workspace/../Users/x/a.c", "/workspace/../Users/x/a.c"),
-        ("cc\0-ffile-prefix-map=/Users/x/out=/out\0-c\0/workspace/a.c", "-ffile-prefix-map=/Users/x/out=/out"),
-        ("cc\0-c\0/workspacex/a.c", "/workspacex/a.c"),
+        ("cc\0-I/Users/x\0-c\0/package/a.c", "-I/Users/x"),
+        ("cc\0-c\0/package/../Users/x/a.c", "/package/../Users/x/a.c"),
+        ("cc\0-ffile-prefix-map=/Users/x/out=/out\0-c\0/package/a.c", "-ffile-prefix-map=/Users/x/out=/out"),
+        ("cc\0-c\0/packagex/a.c", "/packagex/a.c"),
+        ("cc\0-c\0/workspace/a.c", "/workspace/a.c"),
     ] {
         match to_spawn(argv, &at, Alloc::global()) {
             Err(CRequestError::HostPath { arg }) => assert_eq!(arg.text(argv), Some(bad), "{argv:?}"),
@@ -155,5 +159,5 @@ fn a_host_include_is_refused() {
             Ok(_) => panic!("{argv:?}: a host path was accepted"),
         }
     }
-    assert!(to_spawn("cc\0-I/workspace/inc\0-isysroot\0/sdk\0-c\0/workspace/a.c", &at, Alloc::global()).is_ok());
+    assert!(to_spawn("cc\0-I/package/inc\0-isysroot\0/sdk\0-c\0/package/a.c", &at, Alloc::global()).is_ok());
 }

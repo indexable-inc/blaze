@@ -20,7 +20,7 @@ use blaze_toolchain::Shelf;
 use blaze_unit_graph::{CfgAtom, Resolver, StdIs, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
 use edition::{BlazeEdition, Edition as Syntax, PackageEdition};
 
-use crate::{Packages, Place, Script, ScriptOutputs, Toolchain, Tree, World, WorldError, needs, world};
+use crate::{Listed, Packages, Place, Script, ScriptOutputs, Toolchain, Tree, World, WorldError, open_list, world};
 
 fn g() -> Alloc<'static> {
     blaze_own::testing::heap().alloc()
@@ -56,6 +56,18 @@ fn toolchain_of(needs: crate::Needs, std: &str, cfg: &'static [(&'static str, Op
     let (id, files) = crate::fixture::shelf(TRIPLE, std, cfg, blaze_own::testing::heap().alloc());
     let tc = Toolchain::open(&mut Memory(files.into_iter().collect()), id, TRIPLE, needs, g()).unwrap_or_else(|e| panic!("{e}"));
     StdBox::leak(StdBox::new(tc))
+}
+
+/// The crate list of `graph` over the fixture's toolchain ([`toolchain`]'s, target side only),
+/// its members placed by `store`.
+fn listed_or(graph: &'static UnitGraph<'static>, lock: &'static Lock<'static>, store: &mut Store) -> Result<&'static Listed<'static, StdVec<u8>>, WorldError<'static>> {
+    let (id, files) = crate::fixture::shelf(TRIPLE, crate::fixture::STD, &[("target_os", Some("macos")), ("unix", None)], blaze_own::testing::heap().alloc());
+    let listed = open_list(&mut Memory(files.into_iter().collect()), id, TRIPLE, graph, lock, store, g())?;
+    Ok(StdBox::leak(StdBox::new(listed)))
+}
+
+fn listed(graph: &'static UnitGraph<'static>, lock: &'static Lock<'static>, store: &mut Store) -> &'static Listed<'static, StdVec<u8>> {
+    listed_or(graph, lock, store).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// The workspace's lock: two members, four registry packages.
@@ -230,14 +242,14 @@ fn store(lock: &'static Lock<'static>) -> Store {
         // one named by what `file!()` gives it: `/package/src/util-1.0.0/src/lib.rs`.
         (
             "util",
-            "pub fn thing() {}\n#[rustc_builtin_macro]\nmacro_rules! include { () => {} }\n#[rustc_builtin_macro]\nmacro_rules! concat { () => {} }\n#[rustc_builtin_macro]\nmacro_rules! env { () => {} }\n#[rustc_builtin_macro]\nmacro_rules! file { () => {} }\ninclude!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/more.rs\"));\ninclude!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/\", file!()));\n",
+            "pub fn thing() {}\n#[rustc_builtin_macro]\nmacro_rules! include { () => {} }\n#[rustc_builtin_macro]\nmacro_rules! concat { () => {} }\n#[rustc_builtin_macro]\nmacro_rules! env { () => {} }\n#[rustc_builtin_macro]\nmacro_rules! file { () => {} }\ninclude!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/more.rs\"));\ninclude!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/\", file!()));\n#[rustc_builtin_macro]\nmacro_rules! line { () => {} }\n#[rustc_builtin_macro]\nmacro_rules! column { () => {} }\n#[rustc_builtin_macro]\nmacro_rules! module_path { () => {} }\n  #[allow(unused)] include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/\", module_path!(), \"-\", line!(), \"-\", column!(), \".rs\"));\n",
         ),
         ("helper", "pub fn help() {}\n"),
         ("derive_it", "extern crate proc_macro;\n#[proc_macro_derive(It)]\npub fn it(_: proc_macro::TokenStream) -> proc_macro::TokenStream { loop {} }\n"),
         ("testkit", "pub fn check() {}\n"),
     ] {
         let p = pack(
-            &[("src/lib.rs", text), ("src/more.rs", "pub fn more() {}\n"), ("src/util-1.0.0/src/lib.rs", "pub fn named() {}\n")],
+            &[("src/lib.rs", text), ("src/more.rs", "pub fn more() {}\n"), ("src/util-1.0.0/src/lib.rs", "pub fn named() {}\n"), ("src/util-18-20.rs", "pub fn placed() {}\n")],
             blaze_own::testing::heap().alloc(),
         );
         packs.insert(name, StdBox::leak(p.into_boxed_slice()));
@@ -274,9 +286,9 @@ fn lock() -> &'static Lock<'static> {
 fn made(order: &[u32; 9], scripts: Option<&dyn ScriptOutputs<'static>>) -> World<'static> {
     let lock = lock();
     let graph = graph(lock, order);
-    let tc = toolchain(needs(graph));
     let mut store = store(lock);
-    world(graph, lock, tc, &mut store, checkout(), scripts, g()).unwrap_or_else(|e| panic!("{e}"))
+    let listed = listed(graph, lock, &mut store);
+    world(graph, lock, listed, &mut store, checkout(), scripts, g()).unwrap_or_else(|e| panic!("{e}"))
 }
 
 fn by_name<'w>(w: &'w World<'static>, name: &str) -> StdVec<&'w crate::Crate<'static>> {
@@ -289,13 +301,14 @@ const IN_ORDER: [u32; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
 fn the_inputs_hold_what_each_unit_is_given() {
     let w = made(&IN_ORDER, None);
     let names: StdVec<&str> = w.crates.iter().map(|c| c.input.name).collect();
-    // The toolchain first (proc_macro for derive_it, bstd for blz), then the held units: no
-    // build script, no host-side helper (a proc macro's dependency is not followed); the test
-    // target is a crate of its own beside its library (a `check` answers for its names too).
+    // The toolchain first (proc_macro for derive_it, bstd for blz), then the list's units: no
+    // build script, no host-side helper (a dependency's proc macro is kept without its
+    // dependencies), no target-side helper (unit 8: no member reaches it); the test target is a
+    // crate of its own beside its library (a `check` answers for its names too).
     assert_eq!(&names[..5], ["core", "alloc", "std", "proc_macro", "bstd"]);
     let mut held: StdVec<&str> = names[5..].to_vec();
     held.sort();
-    assert_eq!(held, ["app", "app", "blz", "derive_it", "helper", "testkit", "util"]);
+    assert_eq!(held, ["app", "app", "blz", "derive_it", "testkit", "util"]);
     assert_eq!(w.crate_of_unit[1], None, "a build script is no crate");
     assert_eq!(w.crate_of_unit[2], None, "the proc macro's host-side helper is no crate");
     let (lib, test) = (w.crate_of_unit[5].expect("the library is a crate"), w.crate_of_unit[6].expect("a test target is a crate"));
@@ -358,7 +371,7 @@ fn a_build_scripts_cfg_joins_its_library() {
 /// table gives std, and only std, the atom (toolchain.rs `STD_SCRIPT_CFG`).
 #[test]
 fn std_carries_its_build_script_cfg() {
-    let tc = toolchain(crate::Needs { std: true, bstd: false, proc_macro: false });
+    let tc = toolchain(crate::Needs { bstd: false, proc_macro: false });
     let std = &tc.crates()[tc.std().unwrap_or_else(|| panic!("no std"))];
     assert!(std.cfg.contains(&("backtrace_in_libstd", None)), "std's cfg: {:?}", std.cfg);
     let core = &tc.crates()[tc.core().unwrap_or_else(|| panic!("no core"))];
@@ -383,7 +396,7 @@ fn a_crates_key_covers_its_scripts_files_and_env() {
 /// pack: a toolchain bump moves them all). Control: the same inputs give equal keys.
 #[test]
 fn a_toolchain_crates_key_covers_its_target_and_dependencies() {
-    let needs = crate::Needs { std: true, bstd: false, proc_macro: true };
+    let needs = crate::Needs { bstd: false, proc_macro: true };
     let std = "#![no_std]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }";
     let mac: &[(&str, Option<&str>)] = &[("target_os", Some("macos")), ("unix", None)];
     let linux: &[(&str, Option<&str>)] = &[("target_os", Some("linux")), ("unix", None)];
@@ -415,16 +428,17 @@ fn the_same_graph_in_any_order_gives_equal_bytes() {
 }
 
 #[test]
-fn a_dependency_on_a_unit_not_held_is_refused_by_name() {
+fn a_dependency_on_a_unit_not_kept_is_refused_by_name() {
     let lock = lock();
     let mut units = graph(lock, &IN_ORDER).units.clone();
     // app's library made to depend on helper's host-side unit.
     units[5].deps.push(UnitDep { name: t("helper"), unit: UnitId(2) });
     let graph: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(g()), resolver: Resolver::V2 }));
-    let tc = toolchain(needs(graph));
     let mut store = store(lock);
-    match world(graph, lock, tc, &mut store, checkout(), None, g()) {
-        Err(WorldError::DependencyNotHeld { krate, dep, for_host, .. }) => assert_eq!((krate, dep, for_host), ("app", "helper", true)),
+    match listed_or(graph, lock, &mut store) {
+        Err(WorldError::Units(blaze_scope::units::UnitsError::DependencyNotKept { krate, dep, dep_for_host, .. })) => {
+            assert_eq!((krate, dep, dep_for_host), ("app", "helper", true))
+        }
         Err(other) => panic!("another error: {other}"),
         Ok(_) => panic!("taken"),
     }
@@ -434,10 +448,10 @@ fn a_dependency_on_a_unit_not_held_is_refused_by_name() {
 fn an_absent_source_is_an_error_naming_the_package() {
     let lock = lock();
     let graph = graph(lock, &IN_ORDER);
-    let tc = toolchain(needs(graph));
     let mut store = store(lock);
     store.packs.remove("testkit");
-    match world(graph, lock, tc, &mut store, checkout(), None, g()) {
+    let listed = listed(graph, lock, &mut store);
+    match world(graph, lock, listed, &mut store, checkout(), None, g()) {
         Err(e) => assert!(format!("{e}").contains("testkit"), "{e}"),
         Ok(_) => panic!("taken"),
     }
@@ -515,6 +529,26 @@ fn file_in_a_dependency_is_its_name_version_and_path() {
     std::println!("D96 file!: util-1.0.0/src/lib.rs");
 }
 
+/// `module_path!()`, `line!()` and `column!()` in eager input at item position have real
+/// answers (before, refused: the call lost every name it declared). util's line 18 is
+/// `  #[allow(unused)] include!(concat!(.., module_path!(), "-", line!(), "-", column!(), ".rs"))`:
+/// core `macros/mod.rs`: `module_path!` "expands to a string that represents the current
+/// module path" (util's root: `util`); `line!`/`column!` give "the first macro invocation
+/// leading up to the expansion" (the `include!`, whose path starts at character 20: the
+/// attribute and the indent are not the call), "1-based". Only that answer reads
+/// `src/util-18-20.rs` (`pub fn placed`). Prints `D96 place: util-18-20.rs`.
+#[test]
+fn module_path_line_and_column_in_eager_input_are_the_call_s() {
+    let w = made(&IN_ORDER, None);
+    let inputs = w.inputs(g());
+    let names = w.resolve(&inputs, &Serial, g()).unwrap_or_else(|e| panic!("{e}"));
+    let at = w.crates.iter().position(|c| c.input.name == "util").expect("util");
+    let c = names.krate(at);
+    let made: StdVec<&str> = c.expansions.values().filter_map(|e| e.made.map(|m| m.text)).collect();
+    assert!(made.contains(&"pub fn placed( ) { }"), "util's include by module_path!/line!/column!: {made:?}; notes: {:?}", c.notes);
+    std::println!("D96 place: util-18-20.rs");
+}
+
 /// D96 P3, rule 21: a member sees `/workspace/<its dir>` (`env!("CARGO_MANIFEST_DIR")`,
 /// `file!()`), so its directory is an input of everything made for it and must be in its crate
 /// key: one member moved from `app` to `crates/app` gets another key, and its dependent `blz`
@@ -523,12 +557,12 @@ fn file_in_a_dependency_is_its_name_version_and_path() {
 fn a_members_directory_is_in_its_crate_key() {
     let lock = lock();
     let graph = graph(lock, &IN_ORDER);
-    let tc = toolchain(needs(graph));
     let mut here = store(lock);
     let mut moved = store(lock);
     moved.app_dir = "crates/app";
-    let a = world(graph, lock, tc, &mut here, checkout(), None, g()).unwrap_or_else(|e| panic!("{e}"));
-    let b = world(graph, lock, tc, &mut moved, checkout(), None, g()).unwrap_or_else(|e| panic!("{e}"));
+    let (listed_here, listed_moved) = (listed(graph, lock, &mut here), listed(graph, lock, &mut moved));
+    let a = world(graph, lock, listed_here, &mut here, checkout(), None, g()).unwrap_or_else(|e| panic!("{e}"));
+    let b = world(graph, lock, listed_moved, &mut moved, checkout(), None, g()).unwrap_or_else(|e| panic!("{e}"));
     let key = |w: &World<'static>, name: &str| by_name(w, name)[0].input.key;
     assert_ne!(key(&a, "app"), key(&b, "app"), "`app` moved to crates/app kept its key: its directory is not in it");
     assert_ne!(key(&a, "blz"), key(&b, "blz"), "`blz` depends on the moved `app`");
@@ -552,9 +586,9 @@ fn a_dependencys_records_are_equal_in_two_workspaces() {
     // A target-side library depends on the target's helper, not the host's.
     units[3].deps[0].unit = UnitId(8);
     let other: &'static UnitGraph<'static> = StdBox::leak(StdBox::new(UnitGraph { units, unavailable: AVec::new_in(g()), resolver: Resolver::V2 }));
-    let tc = toolchain(needs(other));
     let mut store = store(lock);
-    let second = world(other, lock, tc, &mut store, checkout(), None, g()).unwrap_or_else(|e| panic!("{e}"));
+    let listed = listed(other, lock, &mut store);
+    let second = world(other, lock, listed, &mut store, checkout(), None, g()).unwrap_or_else(|e| panic!("{e}"));
     assert_ne!(first.toolchain_crates, second.toolchain_crates, "the two workspaces keep the same toolchain crates");
 
     let (a_inputs, b_inputs) = (first.inputs(g()), second.inputs(g()));

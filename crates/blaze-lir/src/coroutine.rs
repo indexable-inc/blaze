@@ -39,9 +39,11 @@
 //!
 //! # Out
 //!
-//! The state ([`StateLayout`]): the upvars' bytes first, then the kept slots and values by
-//! falling alignment (slots before values, each in its own order), then the tag: `Unresumed`
-//! 0, `Returned` 1, `Panicked` 2, point `k` is `3 + k`, in the narrowest of `i8`, `i16`, `i32`.
+//! The state ([`StateLayout`]): the upvars' bytes first, then the kept slots, two of them
+//! sharing bytes when no point of the body has both storage-live (coroutine_overlap.rs; the
+//! design's D8), then the kept values, one field each, by falling alignment (each by its id),
+//! then the tag: `Unresumed` 0, `Returned` 1, `Panicked` 2, point `k` is `3 + k`, in the
+//! narrowest of `i8`, `i16`, `i32`.
 //!
 //! `poll`, of the body's signature: its entry block loads the tag and switches: 0 to the body's
 //! start, `3 + k` to point `k`'s resume block, anything else to a trap (the library's "`async
@@ -64,7 +66,7 @@
 //! live across a suspend.
 //!
 //! Owed: debug rows of kept slots (a `VarRec` names a slot; a kept local needs "the state
-//! plus an offset"), so the outputs drop them; storage overlap (the design's D8).
+//! plus an offset"), so the outputs drop them.
 
 use std::alloc::Allocator;
 use std::fmt;
@@ -80,6 +82,9 @@ use crate::{
 #[path = "coroutine_unwind.rs"]
 mod unwind;
 pub use unwind::{Panics, split_with};
+
+#[path = "coroutine_overlap.rs"]
+mod overlap;
 
 /// The tag of a state never polled.
 pub const UNRESUMED: u32 = 0;
@@ -172,6 +177,10 @@ pub enum Plant {
     ResumeNext,
     /// A `resume` without `Panicked` stored at the tag first.
     NoPoisonOnUnwind,
+    /// Every pair of kept slots taken as conflicting: no two share bytes (overlap off).
+    NoOverlap,
+    /// No pair of kept slots taken as conflicting: every one at the first offset.
+    OverlapConflicting,
 }
 
 /// Why a body is not split.
@@ -279,9 +288,11 @@ pub fn split_planted_with<A: Allocator + Clone>(
 ) -> Result<Split<A>, CoroutineError> {
     verify(view).map_err(CoroutineError::Verify)?;
     let body = read(view, shape, panics, &alloc)?;
-    let kept = kept_slots(&body, plant, &alloc);
+    let live = overlap::addressed(&body, &alloc);
+    let kept = kept_slots(&body, &live, plant, &alloc);
+    let conflicts = overlap::conflicts(&body, &live, &kept, plant, &alloc);
     let crossing = crossing_values(&body, &alloc);
-    let plan = plan(&body, &kept, &crossing, &alloc)?;
+    let plan = plan(&body, &kept, &conflicts, &crossing, &alloc)?;
     let poll = emit(&body, &plan, Which::Poll, plant, &alloc)?;
     let drop = emit(&body, &plan, Which::Drop, plant, &alloc)?;
     Ok(Split { poll, drop, layout: plan.layout })
@@ -487,67 +498,19 @@ fn read<'a, A: Allocator + Clone>(
 }
 
 /// Per slot, whether the state keeps it: whether at some suspend its address may have been
-/// taken and its storage not ended (the module's first rule).
-fn kept_slots<A: Allocator + Clone>(body: &Body<'_, A>, plant: Plant, alloc: &A) -> Vec<bool, A> {
-    let view = &body.view;
-    let (blocks, slots) = (view.blocks(), view.slots.len());
-    let words = slots.div_ceil(64);
-    let held = |b: usize| body.in_poll[b] || body.in_drop[b];
-    // Per block: the slots whose last marker in it is an address or a `slot_live` (`made`),
-    // or a `slot_dead` (`ended`); the slots that may be addressed where it starts and ends.
-    let mut made = filled(blocks * words, 0u64, alloc);
-    let mut ended = filled(blocks * words, 0u64, alloc);
-    let mut at_start = filled(blocks * words, 0u64, alloc);
-    let mut at_end = filled(blocks * words, 0u64, alloc);
-    for b in (0..blocks).filter(|&b| held(b)) {
-        for at in view.block(Block(b as u32)) {
-            let op = view.op(at);
-            if !matches!(op, Op::SlotAddr | Op::SlotLive | Op::SlotDead) {
-                continue;
-            }
-            let slot = view.data[at] as usize;
-            let (word, bit) = (b * words + slot / 64, 1u64 << (slot % 64));
-            if op == Op::SlotDead {
-                made[word] &= !bit;
-                ended[word] |= bit;
-            } else {
-                made[word] |= bit;
-                ended[word] &= !bit;
-            }
-        }
-    }
-    // The least fixed point, by a work list: a block is done again when its start grew.
-    let mut queued = filled(blocks, false, alloc);
-    let mut work = Vec::with_capacity_in(blocks, alloc.clone());
-    for b in (0..blocks).rev().filter(|&b| held(b)) {
-        queued[b] = true;
-        work.push(b as u32);
-    }
-    while let Some(b) = work.pop() {
-        let b = b as usize;
-        queued[b] = false;
-        for w in 0..words {
-            at_end[b * words + w] = made[b * words + w] | (at_start[b * words + w] & !ended[b * words + w]);
-        }
-        successors(view, view.terminator(Block(b as u32)), |to, _| {
-            let to = to.index();
-            let mut grew = false;
-            for w in 0..words {
-                let out = at_end[b * words + w];
-                let start = &mut at_start[to * words + w];
-                grew |= out & !*start != 0;
-                *start |= out;
-            }
-            if grew && !queued[to] {
-                queued[to] = true;
-                work.push(to as u32);
-            }
-        });
-    }
+/// taken and its storage not ended (the module's first rule; `live` is that analysis,
+/// coroutine_overlap.rs `addressed`).
+fn kept_slots<A: Allocator + Clone>(
+    body: &Body<'_, A>,
+    live: &overlap::Addressed<A>,
+    plant: Plant,
+    alloc: &A,
+) -> Vec<bool, A> {
+    let (slots, words) = (body.view.slots.len(), live.words);
     let mut kept = filled(slots, false, alloc);
     for suspend in body.suspends.iter() {
         for (slot, keep) in kept.iter_mut().enumerate() {
-            *keep |= at_end[suspend.block as usize * words + slot / 64] & (1u64 << (slot % 64)) != 0;
+            *keep |= live.at_end[suspend.block as usize * words + slot / 64] & (1u64 << (slot % 64)) != 0;
         }
     }
     // Planted (test builds only): the first kept slot stays on the stack.
@@ -679,6 +642,7 @@ fn align_up(at: u64, align: u8) -> u64 {
 fn plan<A: Allocator + Clone>(
     body: &Body<'_, A>,
     kept: &[bool],
+    conflicts: &[u64],
     crossing: &[bool],
     alloc: &A,
 ) -> Result<Plan<A>, CoroutineError> {
@@ -688,6 +652,7 @@ fn plan<A: Allocator + Clone>(
     let mut slot_row = filled(kept.len(), NONE, alloc);
     let mut home = filled(view.len(), DIRECT, alloc);
     let mut fields = Vec::new_in(alloc.clone());
+    let mut sizes = Vec::new_in(alloc.clone());
     let mut rows = 0u32;
     for (slot, &keep) in kept.iter().enumerate() {
         let rec = view.slots[slot];
@@ -695,12 +660,27 @@ fn plan<A: Allocator + Clone>(
             if rec.align >= 32 {
                 return Err(CoroutineError::TooLarge);
             }
+            sizes.push((rec.size, rec.align));
             fields.push(StateField { what: Saved::Slot(SlotId(slot as u32)), offset: 0, size: rec.size, align: rec.align });
         } else {
             slot_row[slot] = rows;
             rows += 1;
         }
     }
+    // The kept slots, in slot order as `conflicts` numbers them: two share bytes when no
+    // point has both storage-live (coroutine_overlap.rs; the design's D8).
+    let placed = overlap::offsets(&sizes, conflicts, body.shape.prefix_size, alloc)?;
+    let mut at = u64::from(body.shape.prefix_size);
+    let mut align = body.shape.prefix_align;
+    for (field, &offset) in fields.iter_mut().zip(placed.iter()) {
+        field.offset = offset;
+        at = at.max(u64::from(offset) + u64::from(field.size));
+        align = align.max(field.align);
+        if let Saved::Slot(slot) = field.what {
+            slot_offset[slot.index()] = offset;
+        }
+    }
+    let slots = fields.len();
     for (value, _) in crossing.iter().enumerate().filter(|it| *it.1) {
         let remade = match view.op(value) {
             Op::SlotAddr => kept[view.data[value] as usize],
@@ -720,27 +700,33 @@ fn plan<A: Allocator + Clone>(
         let align = (size.next_power_of_two().trailing_zeros() as u8).min(4);
         fields.push(StateField { what: Saved::Value(Value(value as u32)), offset: 0, size, align });
     }
-    // By falling alignment; slots before values; each in its own order. The key is total, so
-    // the order is the same on any machine.
+    // The values past the slots, one field each, by falling alignment then value. The key is
+    // total, so the order is the same on any machine.
+    fields[slots..].sort_unstable_by_key(|it| {
+        let id = match it.what {
+            Saved::Slot(slot) => slot.0,
+            Saved::Value(value) => value.0,
+        };
+        (u8::MAX - it.align, id)
+    });
+    for field in fields[slots..].iter_mut() {
+        at = align_up(at, field.align);
+        field.offset = u32::try_from(at).map_err(|_| CoroutineError::TooLarge)?;
+        at += u64::from(field.size);
+        align = align.max(field.align);
+        if let Saved::Value(value) = field.what {
+            home[value.index()] = field.offset;
+        }
+    }
+    // `StateLayout::fields` is in offset order; slots sharing an offset, then a slot before a
+    // value, each by its id: a total key.
     fields.sort_unstable_by_key(|it| {
         let (kind, id) = match it.what {
             Saved::Slot(slot) => (0u8, slot.0),
             Saved::Value(value) => (1u8, value.0),
         };
-        (u8::MAX - it.align, kind, id)
+        (it.offset, kind, id)
     });
-    let mut at = u64::from(body.shape.prefix_size);
-    let mut align = body.shape.prefix_align;
-    for field in fields.iter_mut() {
-        at = align_up(at, field.align);
-        field.offset = u32::try_from(at).map_err(|_| CoroutineError::TooLarge)?;
-        at += u64::from(field.size);
-        align = align.max(field.align);
-        match field.what {
-            Saved::Slot(slot) => slot_offset[slot.index()] = field.offset,
-            Saved::Value(value) => home[value.index()] = field.offset,
-        }
-    }
     let points = body.suspends.last().map_or(0, |it| it.point + 1);
     // The highest tag stored or switched on.
     let top = u64::from(FIRST_POINT) + u64::from(points);

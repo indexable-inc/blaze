@@ -526,3 +526,6 @@ fn await_output_mismatch_is_refused() {
     let codes: Vec<DiagCode> = c.diags.iter().map(|d| d.code).collect();
     assert_eq!(codes, std::vec![DiagCode::Unsatisfied], "{:?}", c.diags);
 }
+
+/// Auto-trait goals decided on the exact interior (src/stalled.rs).
+mod stalled;

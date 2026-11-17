@@ -145,17 +145,23 @@ fn said(changes: &[Change]) -> String {
 }
 
 /// A change of a name of the simulation's as the world's: the names by number, and what an
-/// undo puts back as its durable bytes.
-fn named(named: &SimNamed) -> Named {
+/// undo puts back as its durable bytes. A directory's change has no world's form (the world is
+/// one directory of files) and is the harness's error, by name.
+fn named(named: &SimNamed) -> Result<Named, Broke> {
     // clone: a test's copy of what a crash would put back
     let was = |was: &Option<SimFile>| was.as_ref().map(|it| it.durable.clone());
-    match named {
+    Ok(match named {
         SimNamed::Put { file, was: before } => Named::Put { file: number(file), was: was(before) },
         SimNamed::Gone { file, was } => Named::Gone { file: number(file), was: was.durable.clone() },
         SimNamed::Moved { from, to, was: before } => {
             Named::Moved { from: number(from), to: number(to), was: was(before) }
         }
-    }
+        SimNamed::MadeDir { dir } | SimNamed::RemovedDir { dir } => {
+            return Err(harness(format!(
+                "{dir}: a directory's change of a name, which the disk world (one directory of files) does not hold"
+            )));
+        }
+    })
 }
 
 /// The refinement's relation: the simulation's disk is the world's.
@@ -187,7 +193,7 @@ fn same(sim: &Sim, world: &Disk) -> Result<(), Broke> {
             }
         }
     }
-    let names: Vec<Named> = sim.names.iter().map(named).collect();
+    let names: Vec<Named> = sim.names.iter().map(named).collect::<Result<_, _>>()?;
     if names != world.names {
         return Err(oracle(format!(
             "the changes of names a crash may undo are {names:?} in the simulation and {:?} in the world",

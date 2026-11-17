@@ -48,6 +48,7 @@
 //! by.
 
 mod extra;
+pub mod panic;
 pub mod profile;
 mod raw;
 #[cfg(test)]

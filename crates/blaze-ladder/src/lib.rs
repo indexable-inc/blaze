@@ -16,6 +16,7 @@
 pub mod body_ids;
 mod class_chain;
 pub mod code_records;
+pub mod declared_names;
 mod emit_class;
 pub mod crates;
 mod fn_shim;

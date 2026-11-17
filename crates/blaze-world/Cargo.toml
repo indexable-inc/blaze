@@ -10,6 +10,11 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+# The producers this crate's code makes values for (decision D105,
+# docs/v2/plan/design/producer-id.md): its source and its workspace dependencies' are the row.
+[package.metadata.blaze]
+producer = ["names"]
+
 [lib]
 doctest = false
 

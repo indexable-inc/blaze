@@ -4,8 +4,9 @@
 //! Both answer through the same solver the checker uses (an [`InferCtx`]), not a second
 //! matcher: each impl of the trait in the self type's bucket (and the blanket bucket) is
 //! instantiated with fresh variables, its trait reference related to the goal's, and its
-//! where-clauses proved; the impl that survives is the answer. Coherence leaves at most one;
-//! two is a typed error naming both. Every read goes through `Reads`, the one seam; a question
+//! where-clauses proved; of the impls that survive, the one that specializes every other is
+//! the answer (specialize.rs: the pinned library's `min_specialization`); none such is a typed
+//! `Overlap` naming two. Every read goes through `Reads`, the one seam; a question
 //! the world cannot answer is [`ResolveError::Missing`], never a guess.
 
 use blaze_own::{Alloc, Vec};
@@ -77,6 +78,24 @@ impl From<Stop> for ResolveError {
 pub(crate) trait ClosureSource {
     /// `Question::Closure(owner, ordinal)`'s answer imported at `args`: `TyView::ClosureOf`.
     fn closure_of(&mut self, cx: &mut InferCtx<'_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, CheckError>;
+
+    /// An async block's future of the body being decided (`PNode::Future(e, output,
+    /// interior)` of `types`): only src/stalled.rs's source answers one (with the block's exact
+    /// interior); every other source refuses it, as `import` always did.
+    #[allow(clippy::too_many_arguments)]
+    fn future_of(
+        &mut self,
+        cx: &mut InferCtx<'_>,
+        types: PTys<'_>,
+        e: crate::ids::ExprId,
+        output: PTy,
+        interior: PTy,
+        subst: &[Ty],
+        depth: u32,
+    ) -> Result<Ty, CheckError> {
+        let _ = (cx, types, e, output, interior, subst, depth);
+        Err(CheckError::Limit(Limit::Export))
+    }
 }
 
 /// No closure can occur (an impl header, a where-clause): one is refused as a body type.
@@ -107,7 +126,7 @@ impl<W: World> ClosureSource for Asked<'_, '_, '_, W> {
             }
         };
         let n = cx.list_len(args);
-        let mut subst: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(n as usize, Alloc::global());
+        let mut subst: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(n as usize, cx.alloc());
         for i in 0..n {
             subst.push(cx.list_get(args, i));
         }
@@ -117,7 +136,7 @@ impl<W: World> ClosureSource for Asked<'_, '_, '_, W> {
 }
 
 /// Imports portable type `t` of `types` into `cx`, `Param(i)` becoming `subst[i]`.
-fn import(cx: &mut InferCtx<'_>, src: &mut dyn ClosureSource, types: PTys<'_>, t: PTy, subst: &[Ty], depth: u32) -> Result<Ty, CheckError> {
+pub(crate) fn import(cx: &mut InferCtx<'_>, src: &mut dyn ClosureSource, types: PTys<'_>, t: PTy, subst: &[Ty], depth: u32) -> Result<Ty, CheckError> {
     if depth > MAX_DEPTH {
         return Err(CheckError::Limit(Limit::Export));
     }
@@ -157,7 +176,7 @@ fn import(cx: &mut InferCtx<'_>, src: &mut dyn ClosureSource, types: PTys<'_>, t
         PNode::Dynamic(l) => TyView::Dynamic(import_list(cx, src, types,l, subst, d)?),
         PNode::ExTrait(k, l) => TyView::ExTrait(k, import_list(cx, src, types,l, subst, d)?),
         PNode::ExProj { trait_, name, args, term } => {
-            let mut v: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(args.len as usize + 1, Alloc::global());
+            let mut v: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(args.len as usize + 1, cx.alloc());
             for &a in types.list(args)? {
                 v.push(import(cx, src, types,a, subst, d)?);
             }
@@ -170,7 +189,8 @@ fn import(cx: &mut InferCtx<'_>, src: &mut dyn ClosureSource, types: PTys<'_>, t
             let args = import_list(cx, src, types, args, subst, d)?;
             return src.closure_of(cx, owner, ordinal, args, d);
         }
-        PNode::Future(..) | PNode::Infer => return Err(CheckError::Limit(Limit::Export)),
+        PNode::Future(e, output, interior) => return src.future_of(cx, types, e, output, interior, subst, d),
+        PNode::Infer => return Err(CheckError::Limit(Limit::Export)),
         // A future of another body imported at ground arguments: its facts are its owner's
         // check, which this import does not read yet: refused by name, never guessed.
         PNode::Coroutine { owner, ordinal, .. } => {
@@ -180,7 +200,7 @@ fn import(cx: &mut InferCtx<'_>, src: &mut dyn ClosureSource, types: PTys<'_>, t
     cx.mk(v)
 }
 
-fn import_list(
+pub(crate) fn import_list(
     cx: &mut InferCtx<'_>,
     src: &mut dyn ClosureSource,
     types: PTys<'_>,
@@ -189,7 +209,7 @@ fn import_list(
     depth: u32,
 ) -> Result<crate::ty::TyList, CheckError> {
     let items = types.list(l)?;
-    let mut v: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(items.len(), Alloc::global());
+    let mut v: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(items.len(), cx.alloc());
     for &p in items {
         v.push(import(cx, src, types,p, subst, depth)?);
     }
@@ -271,7 +291,7 @@ pub(crate) fn export(cx: &mut InferCtx<'_>, t: Ty, ground: &mut PortableTys<'_>,
         },
         TyView::ExProj { trait_, name, args_term } => {
             let n = cx.list_len(args_term);
-            let mut v: Vec<PTy, Alloc<'_>> = Vec::with_capacity_in(n as usize, Alloc::global());
+            let mut v: Vec<PTy, Alloc<'_>> = Vec::with_capacity_in(n as usize, cx.alloc());
             for i in 0..n {
                 let t = cx.list_get(args_term, i);
                 match export(cx, t, ground, d)? {
@@ -308,7 +328,7 @@ fn export_list(
     depth: u32,
 ) -> Result<Option<List>, CheckError> {
     let n = cx.list_len(l);
-    let mut v: Vec<PTy, Alloc<'_>> = Vec::with_capacity_in(n as usize, Alloc::global());
+    let mut v: Vec<PTy, Alloc<'_>> = Vec::with_capacity_in(n as usize, cx.alloc());
     for i in 0..n {
         let t = cx.list_get(l, i);
         match export(cx, t, ground, depth)? {
@@ -457,7 +477,7 @@ fn select_in<W: World>(
     if args.is_empty() {
         return Err(ResolveError::NotGround { item: trait_ });
     }
-    let mut tys: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(args.len(), Alloc::global());
+    let mut tys: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(args.len(), cx.alloc());
     for &p in args {
         // A closure among the arguments is imported through `Question::Closure`.
         let mut src = Asked { reads: &mut *reads, need: None };
@@ -474,9 +494,13 @@ fn select_in<W: World>(
     let goal_args = cx.mk_list(&tys)?;
     let self_ty = cx.list_get(goal_args, 0);
     let Some(shape) = shape_of(cx.view(self_ty), cx) else { return Err(ResolveError::NotGround { item: trait_ }) };
-    let mut found: Option<(ItemKey, crate::ty::TyList)> = None;
+    // Every holding impl, in selection order, with its arguments in `cx` (walk AJ P9: the
+    // pinned alloc's `min_specialization` pairs, `impl<T: Display + ?Sized> ToString for T`
+    // beside `impl ToString for str`, both hold at `str`).
+    let mut holding: Vec<ItemKey, Alloc<'_>> = Vec::new_in(cx.alloc());
+    let mut holding_args: Vec<crate::ty::TyList, Alloc<'_>> = Vec::new_in(cx.alloc());
     let buckets = [shape, Shape::Param];
-    let mut seen: Vec<ItemKey, Alloc<'_>> = Vec::new_in(Alloc::global());
+    let mut seen: Vec<ItemKey, Alloc<'_>> = Vec::new_in(cx.alloc());
     for b in buckets {
         for &imp in reads.impls_of(trait_, b)? {
             if seen.contains(&imp) {
@@ -484,14 +508,16 @@ fn select_in<W: World>(
             }
             seen.push(imp);
             if let Some(impl_args) = try_impl(cx, reads, imp, trait_, goal_args)? {
-                if let Some((first, _)) = found {
-                    return Err(ResolveError::Overlap { trait_, first, second: imp });
-                }
-                found = Some((imp, impl_args));
+                holding.push(imp);
+                holding_args.push(impl_args);
             }
         }
     }
-    let Some((imp, impl_args)) = found else { return Ok(None) };
+    if holding.is_empty() {
+        return Ok(None);
+    }
+    let i = crate::specialize::most_specific(cx, reads, trait_, &holding)?;
+    let (imp, impl_args) = (holding[i], holding_args[i]);
     match export_list(cx, impl_args, ground, 0)? {
         Some(l) => Ok(Some((imp, l))),
         None => Err(ResolveError::NotGround { item: imp }),
@@ -557,7 +583,7 @@ pub fn resolve_instance<W: World>(
     let trait_ = parent.container;
     let all: Vec<PTy, Alloc<'_>> = {
         let s = ground.view().list(args)?;
-        let mut v = Vec::with_capacity_in(s.len(), Alloc::global());
+        let mut v = Vec::with_capacity_in(s.len(), alloc);
         v.extend_from_slice(s);
         v
     };
@@ -571,7 +597,7 @@ pub fn resolve_instance<W: World>(
     };
     match reads.assoc_item(imp, parent.name)? {
         Some(a) => {
-            let mut v: Vec<PTy, Alloc<'_>> = Vec::with_capacity_in(all.len(), Alloc::global());
+            let mut v: Vec<PTy, Alloc<'_>> = Vec::with_capacity_in(all.len(), alloc);
             v.extend_from_slice(ground.view().list(impl_args)?);
             v.extend_from_slice(&all[n..]);
             Ok(Resolved { item: a.item, args: ground.intern_list(&v)? })

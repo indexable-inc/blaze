@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze's own standard library, written from scratch on core and alloc. No ambient authority (main receives an Io and every function touches only what it is handed), sans-IO underneath (one Io over io_uring, kqueue, IOCP and the simulation), and every blaze crate moves onto it.
+summary: blaze's own standard library, written from scratch on core and alloc. No ambient authority (main names each capability it uses and every function touches only what it is handed), sans-IO underneath (one Io over io_uring, kqueue, IOCP and the simulation), and every blaze crate moves onto it.
 date: 2026-11-10
 ---
 # bstd: blaze's standard library
@@ -13,8 +13,9 @@ no way to run a program under a simulated world.
 `bstd` is blaze's own standard library. It is written from scratch on `core` and `alloc` and does
 not use Rust's `std`. Three properties define it:
 
-1. **Capabilities.** `main` receives an `Io`. A function can touch only what it is handed, so its
-   signature is the complete list of what it can do.
+1. **Capabilities.** `main` names each capability it uses as a parameter (`out: Out`,
+   `data: Dir<ReadOnly>`, `api: Net`, ...); a whole `Io` cannot be asked for (D104). A function
+   can touch only what it is handed, so its signature is the complete list of what it can do.
 2. **Sans-IO.** Every operation is an effect handed to one driver. The same `Io` runs on
    io_uring, kqueue, IOCP and the deterministic simulation, and code above it cannot tell which.
 3. **Explicit context and memory.** Every task has a `Cx` that says how long it may run, whether
@@ -29,12 +30,13 @@ driver layer it starts from (`crates/blaze-core`) and S1's interface over it
 (`crates/blaze-std`).
 
 ```rust
-fn main(cx: &Cx, io: Io) -> Result<(), Error> {
-    let data: Dir<ReadWrite> = io.fs().open_dir(cx, path!("data"))?;
+// Each grant is named in the signature (D104): the folder `data`, the variables `env`, the
+// network `api` and the clock; `blaze run` refuses to start it without the grants it lacks.
+fn main(cx: &Cx, data: Dir<ReadWrite>, env: Env, api: Net, clock: Clock) -> Result<(), Error> {
     let cfg: Dir<ReadOnly> = data.read_only();               // narrow
-    let key = StripeKey::from_env(&io.env().only(&[var!("STRIPE_KEY")]))?;
-    let api = io.net().connect_only(host!("api.stripe.com:443"));   // one host
-    let cx = cx.until(io.clock().after(Duration::from_secs(5)));   // a deadline only shrinks
+    let key = StripeKey::from_env(&env.only(&[var!("STRIPE_KEY")]))?;
+    let api = api.connect_only(host!("api.stripe.com:443"));   // one host
+    let cx = cx.until(clock.after(Duration::from_secs(5)));   // a deadline only shrinks
     charge(&cx, &key, &api, &cfg)
 }
 
@@ -540,7 +542,8 @@ not ambient and is never fetched from a thread-local; `main` receives the root o
 
 Rules that hold for all of them:
 
-- **Unforgeable.** Private fields; only `main`'s `Io` or narrowing makes one.
+- **Unforgeable.** Private fields; only the launcher (a grant `main` names) or narrowing makes
+  one.
 - **Narrowing never widens**, and it happens in the OS too: `read_only()` reopens the handle with
   fewer rights, so trusted `unsafe` code cannot write through it.
 - **Permissions are types.** `P` is `ReadOnly`, `ReadWrite` or `ReadWriteExec`; methods are gated
@@ -552,7 +555,7 @@ Rules that hold for all of them:
 - **Clone is allowed.** Copying authority you hold adds none.
 
 **Nothing is global.** Everything a program can reach outside its own values comes down from
-`main`'s `Io` and `Cx`:
+`main`'s grants and `Cx`:
 
 - There is no `std::env::var`, no arguments function, no current directory, no process-wide
   clock, random source, exit, signal handler or standard stream: each is a capability above.
@@ -1105,6 +1108,7 @@ State at hand-off: items 5, 7 and 8 are accepted. Their code is in the tree and 
    which run each driver against the simulation on a real disk. The history of the design
    follows:
    - **The rule:** a name (create, rename, unlink) is durable only once its directory is synced. A file's sync covers its bytes, never its name.
+     A directory made or removed is a create or unlink of a name of its PARENT's, durable only once the parent is synced; a directory's own sync covers the names in it, never its own (2026-11-16: `Sim` journals `MadeDir`/`RemovedDir`, `sim/host/dir_names.rs`; before, a made directory survived every crash, looser than a disk).
    - **What is in the tree:** `world/disk.rs` keeps a log of names (`Named { Put, Gone, Moved }`)
      that `sync_names()` clears, and a crash is `Cuts { files, undone }`, undone entries closed
      forward (undoing one undoes every later entry that shares a name) and undone newest first.
@@ -1381,8 +1385,8 @@ fn size_of(points: &mut Nested, s: &Struct) -> u64 {
     s.fields.iter().map(|f| points.call(layout, &f.ty).size).sum()   // a nested point
 }
 
-fn main(cx: &Cx, io: Io) -> Result<(), Error> {
-    let eval = Eval::memo(&io.need_mem()?, limit)?;    // or direct(), stored(..), handler(..)
+fn main(cx: &Cx, mem: Mem) -> Result<(), Error> {
+    let eval = Eval::memo(&mem, limit)?;    // or direct(), stored(..), handler(..)
     let size = eval.call(cx, size_of, &my_struct);
     ..
 }
@@ -1473,8 +1477,8 @@ fn compile(cx: &Cx, run: &Runner) -> Result<(), Error> {
   command over the same inputs is a store hit ([caching](caching.md)), which is how blaze already
   treats build scripts. A `Vm` over a view of the Merkle tree ([vfs](vfs.md)) gives its output as
   the difference between two roots.
-- **A bstd program inside one** gets an `Io` built from the spec: its `main` sees those
-  capabilities and no others. Any other program sees an ordinary system that happens to contain
+- **A bstd program inside one** gets its grants made from the spec: its `main` is handed the
+  ones it names and no others. Any other program sees an ordinary system that happens to contain
   only what was granted.
 
 This is one design for what blaze has three of today (the build-script sandbox, the proc-macro
@@ -2201,18 +2205,21 @@ single-file program); two that disagree, or a version that is no edition's, are 
 | | under the edition | built |
 |---|---|---|
 | `std` | names the dependency called `bstd`; Rust's `std` has no name in the crate (`core` is unchanged, `alloc` is by `extern crate alloc`). So `std::fs`, `std::env`, `println!` and the rest of Rust std's ambient authority are not reachable by any path. Decided 2026-11-16 (toolchain.md): the toolchain's bstd is bound to one extern name, `std`; `bstd` is not a second name (rule 30), and a path written `bstd::..` is a finding whose fix rewrites it to `std::..`. Canonical item paths in records and in what tools print stay the crate's own (`bstd::cx::Cx`). A Rust-edition crate that depends on bstd names it by its manifest line, as before. There is no opt-in to Rust's `std` under the edition | yes |
-| the prelude | `std::prelude::blaze_2026_11`: `core`'s Rust 2024 prelude, `Cx`, `Io`, the entry's `Error`, `core`'s macros (`assert_eq!`, `panic!`, `write!`, ..), and for memory `Vec`, `Box`, bstd's `String` and `format_in!` ("Memory under the edition") | yes |
-| the entry | rule `entry-takes-roots`: `main`'s parameters are roots the runtime makes, each at most once, in the runtime's order, `&Cx` then `Io`. So `fn main()`, `fn main(cx: &Cx)`, `fn main(io: Io)` and `fn main(cx: &Cx, io: Io)`, by the rule and not by a list (`hir_ty::entry::takes`). It returns anything that is a `bstd::entry::Outcome` (a trait: `()`, a `Status`, a `Result` of one and an error that can be shown; a program's own type may implement it) | yes |
-| the root context | `main(cx, ..)` gets one with the named bounds `entry::MAIN_BUDGET` (no deadline) and `MAIN_SCRATCH`; a program that wants others takes `io` alone and calls `io.cx(budget, scratch)` | yes |
+| the prelude | `std::prelude::blaze_2026_11`: `core`'s Rust 2024 prelude, `Cx`, the grant types a `main` may take (`Out`, `Args`, `Clock`, `Mem`, `Spec`, `Dir` with `ReadOnly`/`ReadWrite`, `Net`, `Env`, and the whole capabilities `Fs`, `Rng`, `Host`, `Term`, ..), the entry's `Error`, `core`'s macros (`assert_eq!`, `panic!`, `write!`, ..), and for memory `Vec`, `Box`, bstd's `String` and `format_in!` ("Memory under the edition"). Not `Io` (D104) | yes |
+| the entry | D104: `main` names each capability it uses. After an optional `cx: &Cx`, each parameter is a grant: its type the kind (every `impl Grant for` in bstd's grant.rs), its name the grant's name (`out: Out` is standard output, `err: Out` standard error, `data: Dir<ReadOnly>` the folder granted as `data`). A whole `Io` cannot be asked for: `fn main(cx: &Cx, io: Io)` is refused at the parameter, with the kinds to name instead. `fn main()` takes nothing. It returns anything that is a `bstd::entry::Outcome` (a trait: `()`, a `Status`, a `Result` of one and an error that can be shown; a program's own type may implement it) | yes |
+| the root context | `main(cx, ..)` gets one with the named bounds `entry::MAIN_BUDGET` (no deadline) and `MAIN_SCRATCH`; a program that wants narrower ones makes a child context (`cx.until(..)`) | yes |
 | a test | takes the same roots, handed the simulation's (`Io::sim(seed)`, the seed printed on failure); `#[test(native)]` asks for the real one | S5b |
 
-The entry is library code. blaze appends one module to the program's root
-(`__blaze_entry`, as a test harness is appended; it is in the root's content, so in the
-crate's key) whose `main` is `std::entry::run(|cx, io| crate::main(cx, io))` with exactly the
-roots `main` takes; `run` makes the native `Io` (the start directory as its root, the command
-line, the environment), calls `main`, prints a failure as `error: <what>` on standard error
-and exits 0 or 1. `entry::run_in(io, ..)` is the same on an `Io` a test made. Standard output
-is the capability `Out` (`io.out()`), in the simulation and natively.
+The entry is library code. In the blaze edition the root's `fn main` is expanded by bstd's
+`main!` attribute macro with no attribute written (D104), the same path a written
+`#[bstd::main]` takes in a Rust-edition crate: it keeps the function, puts its manifest (each
+parameter's name and kind) in the binary, and makes the process's `main`, which makes each
+grant from the run spec (or, started from a shell with no spec, the kinds that fill
+themselves: `args`, `out`, `clock`, `mem`, `spec`), refuses to start with every missing grant
+listed, calls `main`, prints a failure as `error: <what>` on standard error and exits 0 or 1.
+`entry::run_in(io, ..)` runs a body on an `Io` a test made (`Io` stays bstd's own world handle
+and a test's simulated world). Standard output is the grant `out: Out`, in the simulation and
+natively.
 
 **Saying something** is one call, whatever is said: `out.line(cx, "text")?` and
 `out.line(cx, format_args!("x = {x}"))?` (`write` for no line feed), on anything `Display`,
@@ -2264,7 +2271,7 @@ side by side, and by the fixtures of every crate that existed before.
   `bstd::Io`) and handing over capabilities it made (`bstd::entry::run`, `Io::sim`).
 
 **`blaze new`** writes a package of the latest blaze edition (the opt-in, and a `main(cx:
-&Cx, io: Io) -> Result<(), Error>` that writes its line through `io.need_out()?`) and
+&Cx, out: Out) -> Result<(), Error>` that writes its line through `out`) and
 `blaze new --rust` the plain Rust package, byte for byte cargo's. Until blaze ships bstd
 (S5d) a package of the edition names bstd as a dependency by path, so the edition is the
 default only where `--bstd <PATH>` says where bstd is; without it `blaze new` still writes
@@ -2291,7 +2298,7 @@ Interface first, bottom last, so nothing waits on the runtime and every step lan
 |---|---|---|
 | S1 | The crate `crates/blaze-std` (`bstd`): `Cx`, `Io`, every capability above, the allocators, the scopes and deadlines, the errors, over `blaze-core`'s drivers and its simulation; the second rule applied to all of it ("What each API makes explicit"), with the Files design | its simulation tests pass; one planted bug per invariant is caught (for files: a publish that reports done before its rename, a `Durable::Yes` that skipped the directory sync, a `Flushed` handed out before its flush) |
 | S2 | The `ambient` and `unsafe` effects, `#![blaze::capabilities]`, `blaze explain trusted` | a crate with the attribute that calls `std::fs` is refused, naming the call path |
-| S3 | blaze's crates move, leaves first: a sans-IO core takes nothing, a driver takes the piece it needs, `blaze`'s `main` takes `Io`. Each move is a `.clippy.toml` ban and `blaze check --fix` (rule `fix-through-blaze-lints`) | every crate in `crates/` has `#![blaze::capabilities]` |
+| S3 | blaze's crates move, leaves first: a sans-IO core takes nothing, a driver takes the piece it needs, `blaze`'s `main` names the grants it uses (D104). Each move is a `.clippy.toml` ban and `blaze check --fix` (rule `fix-through-blaze-lints`) | every crate in `crates/` has `#![blaze::capabilities]` |
 | S1b | `bstd::{sync, cell}`: the table of "Shared mutation", token cells, `Freeze` as a bound, typed names (`HostPort`, `VarName`) in place of strings, and bans on the removed names | misuse tests: two live `get_mut` on one token do not compile; a static that is not `Freeze` is refused |
 | S1c | Tracing on bstd: the span in `Cx` and the scheduler's own events first; then the compile-time site table and the ring; then reflection encoders and redaction; disabled-site patching and keep-or-drop last | the emit budget holds; the ring's simulation test and the round trip pass |
 | S1d | The facade: bstd re-exports the crates of "What is in it", the interner and helper crates are merged, and the piece crates' names are banned outside bstd | `blaze check` with the bans on; no blaze crate outside bstd names a piece crate |
@@ -2342,12 +2349,13 @@ with its path, or put on the trusted list with a reason.
 - **Context is a parameter**, as Go's `context` and Zig's allocator are, never a thread-local: a
   thread-local context is ambient authority over time and memory.
 - **No global heap.** Out of memory fails a task, never the process.
-- **`fn main(cx: &Cx, io: Io)`**, or fewer of the roots, in that order ("The blaze edition:
-  opting in").
+- **`main` names each capability it uses** (D104): `fn main(cx: &Cx, out: Out, data:
+  Dir<ReadOnly>)`, each grant by its type and name; a whole `Io` cannot be asked for ("The
+  blaze edition: opting in").
 - **The opt-in is the manifest's `edition`**, carried to the front end as a crate attribute.
 - **Structured tasks with deadlines**, as Trio's scopes.
-- **Standard output and standard error are each a capability** (`io.out()`, `io.err()`, one
-  type `Out`). Reversed 2026-11-12 from "standard error is not a capability": a program that
+- **Standard output and standard error are each a capability** (`out: Out`, `err: Out`: one
+  type, the parameter's name says which). Reversed 2026-11-12 from "standard error is not a capability": a program that
   reports on standard error is saying something to whoever started it, as on standard output.
 - **No revocation** until something needs it.
 - **No default for a cost or a guarantee** (the second rule); a policy that changes an effect

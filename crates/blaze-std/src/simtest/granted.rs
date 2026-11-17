@@ -21,7 +21,11 @@
 //!   a `macro_rules!` attribute cannot list a directory, and each `include_bytes!` names the one
 //!   file it reads, so the key of the test sees every read), the environment (`env(LANG = "C")`),
 //!   the command line (`args("--fast")`), standard input (`input = b"..\n"`). Defaults: an empty
-//!   folder, an empty environment, no arguments, an input that has ended.
+//!   folder, an empty environment, no arguments, an input that has ended. A fixture DIRECTORY
+//!   (every file under `fixtures/ledger`, unnamed) is a build-time read that needs the
+//!   language's help: a macro that lists a directory reads the machine, and that listing is a
+//!   read of the test's key, so it waits for blaze's own build-time read with its key. Nobody
+//!   adds a run-time read of the machine to get it.
 //! - **The faults a seed explores are those that can reach a parameter** ([`reach`], a `const
 //!   fn` over the kinds): a test with no `Dir<ReadWrite>` meets no crash, one with nothing but
 //!   `cx`, `Out`, `Args` or `Env` meets no fault at all and is run ONCE, as the pure function
@@ -44,11 +48,10 @@ use blaze_core::{
     },
 };
 use blaze_own::{String, Vec};
-use blaze_text::{PutDisplay as _, Writes as _};
+use blaze_text::Writes as _;
 
 use super::{BUDGET, Outcome, listed};
 use crate::{
-    cx::Cx,
     grant::{Given, Kind, LaunchAlloc, Manifest, Param, Problem, Refused, Spec, Started, Want},
     host::Exit,
     io::{Io, Limits, SimWorld},
@@ -129,6 +132,10 @@ pub struct Setup {
     pub env: Option<&'static [Var]>,
     pub args: Option<&'static [&'static str]>,
     pub input: Option<&'static [u8]>,
+    /// `cases = N`: cases per world seed of a test with drawn parameters (drawn.rs `CASES`).
+    pub cases: Option<u32>,
+    /// `kept`: the crate's `sim-kept.tapes` text and its package name, replayed first.
+    pub kept: Option<(&'static str, &'static str)>,
 }
 
 /// A fault kind's bit.
@@ -170,6 +177,8 @@ impl Setup {
         env: None,
         args: None,
         input: None,
+        cases: None,
+        kept: None,
     };
 
     #[must_use]
@@ -187,6 +196,29 @@ impl Setup {
             panic!("bstd::test: `without(..)` names one fault kind twice");
         }
         self.left_out |= bit(fault);
+        self
+    }
+
+    /// `cases = N`: 1 to 4096 cases per world seed (each a whole world run).
+    #[must_use]
+    pub const fn cases(mut self, n: u32) -> Setup {
+        if self.cases.is_some() {
+            panic!("bstd::test: `cases = ..` is given twice");
+        }
+        if n == 0 || n > 4096 {
+            panic!("bstd::test: `cases = N` is 1 to 4096: each case is a whole world run");
+        }
+        self.cases = Some(n);
+        self
+    }
+
+    /// `kept`: the crate's `sim-kept.tapes` (its text, compiled in) replayed first.
+    #[must_use]
+    pub const fn kept(mut self, text: &'static str, krate: &'static str) -> Setup {
+        if self.kept.is_some() {
+            panic!("bstd::test: `kept` is given twice");
+        }
+        self.kept = Some((text, krate));
         self
     }
 
@@ -379,6 +411,9 @@ pub struct Planned {
     pub once: bool,
     /// Its seeds, when it is not run once.
     pub seeds: Seeds,
+    /// How many parameters are drawn from a tape (simtest/param.rs `drawn`); 0: none, and the
+    /// test is run by the grants' runner alone.
+    pub drawn: u32,
 }
 
 impl Planned {
@@ -416,7 +451,30 @@ impl Planned {
             }
             f += 1;
         }
-        Planned { faults, once, seeds }
+        Planned { faults, once, seeds, drawn: 0 }
+    }
+
+    /// The plan of a test with `drawn` drawn parameters: its cases are drawn from a tape per
+    /// world seed (simtest/drawn.rs), so it is not run once even when no fault reaches it (it
+    /// then runs its cases under ONE world seed). `cases` and `kept` on a test that draws
+    /// nothing, and `real` with drawn values (replayed by seed and tape, which the machine is
+    /// not), are refused.
+    pub const fn drawing(mut self, setup: &Setup, drawn: u32) -> Planned {
+        if drawn == 0 {
+            if setup.cases.is_some() {
+                panic!("bstd::test: `cases = N` on a test with no drawn parameter: it has no cases; remove it");
+            }
+            if setup.kept.is_some() {
+                panic!("bstd::test: `kept` on a test with no drawn parameter: it keeps no tape; remove it");
+            }
+            return self;
+        }
+        if setup.real {
+            panic!("bstd::test: `real` with drawn parameters: a drawn case is replayed by seed and tape, which the machine is not");
+        }
+        self.drawn = drawn;
+        self.once = false;
+        self
     }
 }
 
@@ -451,7 +509,7 @@ pub enum SetupError {
 }
 
 impl SetupError {
-    fn line(&self, out: &mut String<LaunchAlloc>) {
+    pub(super) fn line(&self, out: &mut String<LaunchAlloc>) {
         match self {
             SetupError::GrantName { param } => {
                 out.str("the parameter `").str(param).str("` is no grant's name");
@@ -495,7 +553,7 @@ pub fn spec_of(test: &Test, alloc: LaunchAlloc) -> Result<Spec, SetupError> {
                 names.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
                 Scope::Env { names }
             }
-            Kind::Whole(capability) => Scope::Whole { capability: String::from_str_in(capability, alloc) },
+            Kind::Whole(capability) => Scope::Whole { capability: String::from_str_in(capability, alloc), device: None },
             // The rest fill themselves (`Kind::fills_itself`, and `In`), or were refused as the
             // crate compiled (a whole `Io`, by `Setup::checked`).
             _ => continue,
@@ -507,13 +565,13 @@ pub fn spec_of(test: &Test, alloc: LaunchAlloc) -> Result<Spec, SetupError> {
 }
 
 /// A fixture's file: its name in the simulated tree and its bytes.
-struct Laid {
+pub(super) struct Laid {
     name: FileName,
     bytes: &'static [u8],
 }
 
 /// Every fixture's file of `setup`, named beneath its folder, once per test.
-fn laid(setup: &Setup, alloc: LaunchAlloc) -> Result<Vec<Laid, LaunchAlloc>, SetupError> {
+pub(super) fn laid(setup: &Setup, alloc: LaunchAlloc) -> Result<Vec<Laid, LaunchAlloc>, SetupError> {
     let mut laid = Vec::new_in(alloc);
     for dir in setup.dirs() {
         for file in dir.files {
@@ -529,7 +587,7 @@ fn laid(setup: &Setup, alloc: LaunchAlloc) -> Result<Vec<Laid, LaunchAlloc>, Set
 /// The simulated world of `seed` for a test set up by `setup`: its environment and command
 /// line, each fixture's file laid durably (as by a person before the program starts: the
 /// seed's faults are armed after), the standard input given and ended.
-fn boot(seed: u64, setup: &Setup, laid: &[Laid]) -> Io {
+pub(super) fn boot(seed: u64, setup: &Setup, laid: &[Laid]) -> Io {
     let mut world = SimWorld::new(seed, Limits::USUAL);
     // alloc: once per seed, SimWorld's own environment and command line (its fields' types).
     world.env = setup.env.unwrap_or(&[]).iter().map(|var| (var.name.into(), var.value.into())).collect();
@@ -556,7 +614,15 @@ fn ended<R: Outcome>(io: &Io, ran: Result<Result<R, Refused>, alloc::boxed::Box<
             let mut text = String::new_in(alloc);
             refusal(&refused, &mut text);
             // alloc: a failure's message, in the form `Ended` holds.
-            Ended::Panicked(text.as_str().into())
+            let text: alloc::string::String = text.as_str().into();
+            // A grant's making that failed in the world (a folder's open, an injected fault)
+            // is the program's start failing, as a process's start fails on a machine: given
+            // up, so restarted under faults and a failure once they are healed. Any other
+            // problem is the attribute and the signature disagreeing: a failure at once.
+            match refused.problems.iter().all(|problem| matches!(problem, Problem::Param { want: Want::Failed(_), .. })) {
+                true => Ended::GaveUp(text),
+                false => Ended::Panicked(text),
+            }
         }
         Err(payload) => match payload.downcast::<Exit>() {
             Ok(_) if io.with_sim(|sim| sim.is_off()) == Some(true) => Ended::PowerLost,
@@ -585,6 +651,7 @@ fn refusal(refused: &Refused, out: &mut String<LaunchAlloc>) {
                     Want::NotOffered(missing) => out.str("the test's world offers no `").str(missing.capability).str("`"),
                     Want::NotBuilt(what) => out.str("its `").str(what).str("` is not built yet"),
                     Want::Failed(said) => out.str(said.as_str()),
+                    Want::NoneOf(_) => out.str("none of its alternatives is set up by the attribute"),
                 };
             }
             Problem::NoParam { name, given } => {
@@ -594,8 +661,30 @@ fn refusal(refused: &Refused, out: &mut String<LaunchAlloc>) {
     }
 }
 
+/// One start of a test in `io`: a root context of [`BUDGET`], the launcher's [`Given`] over
+/// `io` and `spec`, and `body` (which fills the parameters and calls the test) under
+/// `catch_unwind`; how it ended ([`ended`]: a power cut's unwind, an exit, a panic, a refusal).
+/// The one start every world of a test goes through, the drawn half's too.
+pub(crate) fn start<B, R>(io: &Io, spec: &Spec, manifest: &'static Manifest, alloc: LaunchAlloc, body: &B) -> Ended
+where
+    B: Fn(&mut Given<'_>) -> Result<R, Refused>,
+    R: Outcome,
+{
+    let cx = match io.cx(BUDGET, TASK_FRAME) {
+        Ok(cx) => cx,
+        // alloc: a failure's message.
+        Err(stopped) => return Ended::Panicked(alloc::format!("bstd::test: a start's root context: {stopped}")),
+    };
+    let ran = {
+        let mut given = Given::new(&cx, io, None, spec, Started::WithSpec, manifest);
+        catch_unwind(AssertUnwindSafe(|| body(&mut given)))
+    };
+    drop(cx);
+    ended(io, ran, alloc)
+}
+
 /// A test's world for one seed: the simulated world, the test's spec and its body.
-struct Granting<'p, B> {
+struct TestWorld<'p, B> {
     io: Io,
     spec: &'p Spec,
     manifest: &'static Manifest,
@@ -603,23 +692,13 @@ struct Granting<'p, B> {
     alloc: LaunchAlloc,
 }
 
-impl<B, R> World for Granting<'_, B>
+impl<B, R> World for TestWorld<'_, B>
 where
     B: Fn(&mut Given<'_>) -> Result<R, Refused>,
     R: Outcome,
 {
     fn run(&mut self) -> Ended {
-        let cx = match self.io.cx(BUDGET, TASK_FRAME) {
-            Ok(cx) => cx,
-            // alloc: a failure's message.
-            Err(stopped) => return Ended::Panicked(alloc::format!("bstd::test: a start's root context: {stopped}")),
-        };
-        let ran = {
-            let mut given = Given::new(&cx, &self.io, None, self.spec, Started::WithSpec, self.manifest);
-            catch_unwind(AssertUnwindSafe(|| (self.body)(&mut given)))
-        };
-        drop(cx);
-        ended(&self.io, ran, self.alloc)
+        start(&self.io, self.spec, self.manifest, self.alloc, self.body)
     }
 
     fn crash(&mut self) {
@@ -640,36 +719,119 @@ where
 fn given_by_the_person() -> Result<SeedsGiven, alloc::string::String> {
     let block = crate::rt::process_start()?;
     let env = crate::env::Env::new(crate::env::Vars::process(block), crate::Plant::None);
-    let read = |name: &'static str| -> Result<Option<&str>, alloc::string::String> {
-        let var = crate::env::VarName::new(name).map_err(|_| alloc::format!("{name} is no variable's name"))?;
-        env.get(&var).map_err(|_| alloc::format!("{name} could not be read"))
+    SeedsGiven::parse(var(&env, seeds::SEED_VAR)?, var(&env, seeds::SEEDS_VAR)?)
+}
+
+/// `BLAZE_SIM_TAPE` of the test entry's environment, as `given_by_the_person` reads the seed:
+/// one case's tape as blaze-sim's text, for the drawn half.
+#[cfg(any(test, feature = "sim-draws"))]
+fn tape_by_the_person() -> Result<Option<alloc::string::String>, alloc::string::String> {
+    let block = crate::rt::process_start()?;
+    let env = crate::env::Env::new(crate::env::Vars::process(block), crate::Plant::None);
+    // alloc: once per test, the tape's text out of the environment it is read from.
+    Ok(var(&env, blaze_sim::search::TAPE)?.map(alloc::string::String::from))
+}
+
+/// A test with drawn parameters (D109): the person's seed, count and tape, the crate's kept
+/// tapes when the attribute says `kept`, then simtest/drawn.rs; a failure panics with its block.
+#[cfg(any(test, feature = "sim-draws"))]
+fn drawn_entry<B, R>(test: &Test, alloc: LaunchAlloc, body: &B)
+where
+    B: Fn(&mut Given<'_>, &super::param::Draws<'_>) -> Result<R, Refused>,
+    R: Outcome,
+{
+    let (world, tape) = match given_by_the_person().and_then(|world| tape_by_the_person().map(|tape| (world, tape))) {
+        Ok(given) => given,
+        Err(why) => panic!("bstd::test: {why}"),
     };
-    SeedsGiven::parse(read(seeds::SEED_VAR)?, read(seeds::SEEDS_VAR)?)
+    let kept = test.setup.kept.map(|(text, krate)| blaze_sim::kept::File::new(text, krate));
+    let given = super::drawn::DrawnGiven { world, tape: tape.as_deref() };
+    if let Err(report) = super::drawn::run(test, given, kept, alloc, body) {
+        panic!("{}", report.as_str());
+    }
+}
+
+/// The variable `name` of the test entry's environment.
+fn var<'e>(env: &'e crate::env::Env, name: &'static str) -> Result<Option<&'e str>, alloc::string::String> {
+    // alloc: an error's message.
+    let var = crate::env::VarName::new(name).map_err(|_| alloc::format!("{name} is no variable's name"))?;
+    // alloc: an error's message.
+    env.get(&var).map_err(|_| alloc::format!("{name} could not be read"))
 }
 
 /// What `#[bstd::test]` expands to when its parameters are grants: `body` (the launcher's,
 /// [`launch_body!`](crate::launch_body)) run in each seed's world, or once (the module's doc);
-/// a failure panics with [`report`]'s block, which the test harness prints. `heap` and `os`
-/// are the test entry's roots (D102), as `main!` hands its launcher.
-pub fn granted<B, R>(test: Test, heap: &'static blaze_own::Heap, os: &'static blaze_core::Os, body: B)
+/// a failure panics with [`report`]'s block, which the test harness prints. `heap` is the
+/// test entry's heap (D102). It takes no `Os`: a simulated test touches no real OS, and a
+/// `real` one is rooted in `bstd::test`'s own native world, so the attribute's expansion
+/// names no root of real-OS authority (tests/reach.rs keeps that to the driver's backends).
+pub fn granted<B, R>(test: Test, heap: &'static blaze_own::Heap, body: B)
+where
+    B: Fn(&mut Given<'_>, &super::param::Draws<'_>) -> Result<R, Refused>,
+    R: Outcome,
+{
+    let alloc: LaunchAlloc = heap.shared();
+    // A test with drawn parameters: the drawn half's runner (simtest/drawn.rs). Without
+    // `sim-draws` no type is drawn (no blanket impl), so `drawn` is 0.
+    #[cfg(any(test, feature = "sim-draws"))]
+    if test.planned.drawn > 0 {
+        return drawn_entry(&test, alloc, &body);
+    }
+    let body = |given: &mut Given<'_>| body(given, &super::param::Draws::NONE);
+    if test.setup.real {
+        return real(&test, &body, alloc);
+    }
+    // The person's seed and count narrow only a test that has seeds: one run once has none.
+    let given = match test.planned.once {
+        true => SeedsGiven::NOTHING,
+        false => match given_by_the_person() {
+            Ok(given) => given,
+            Err(why) => panic!("bstd::test: {why}"),
+        },
+    };
+    let broken = match simulated(&test, given, alloc, &body) {
+        Ok(_) => return,
+        Err(broken) => broken,
+    };
+    let mut text = String::new_in(alloc);
+    match &broken.failed {
+        Failed::Seed { run, at, of, replay, .. } => {
+            report(&test, &listed(test.module, test.name), run, (*at, *of), replay, broken.last.as_ref(), &mut text);
+        }
+        other => {
+            text.str("bstd::test: ");
+            blaze_text::PutDisplay::put_display(&mut text, other);
+        }
+    }
+    panic!("{}", text.as_str());
+}
+
+/// A test that did not pass in the simulation: how, and the last world it ran in (the
+/// failing seed's second run), whose `out` and `err` the report shows.
+pub struct Broken {
+    pub failed: Failed,
+    pub last: Option<Io>,
+}
+
+/// `test`'s `body` in the simulation, as a value: under its seeds (or the seed or count
+/// `given` in their place), or once when no fault can reach it. What [`granted`] runs, and
+/// what a test of the runner itself calls.
+pub fn simulated<B, R>(test: &Test, given: SeedsGiven, alloc: LaunchAlloc, body: &B) -> Result<seeds::Passed, Broken>
 where
     B: Fn(&mut Given<'_>) -> Result<R, Refused>,
     R: Outcome,
 {
-    let alloc: LaunchAlloc = heap.shared();
-    let made = spec_of(&test, alloc).and_then(|spec| laid(test.setup, alloc).map(|laid| (spec, laid)));
-    let (spec, laid) = match made {
-        Ok(made) => made,
+    let set_up = spec_of(test, alloc).and_then(|spec| laid(test.setup, alloc).map(|laid| (spec, laid)));
+    let (spec, laid) = match set_up {
+        Ok(set_up) => set_up,
         Err(why) => {
             let mut text = String::new_in(alloc);
-            text.str("bstd::test: `").str(test.name).str("` could not be set up: ");
+            text.str("`").str(test.name).str("` could not be set up: ");
             why.line(&mut text);
-            panic!("{}", text.as_str());
+            // alloc: a failure's message, in the form `Failed` holds.
+            return Err(Broken { failed: Failed::Given(text.as_str().into()), last: None });
         }
     };
-    if test.setup.real {
-        return real(&test, os, &spec, &laid, &body, alloc);
-    }
     let listed = listed(test.module, test.name);
     let name = Name { package: test.package, test: &listed };
     let mut last: Option<Io> = None;
@@ -677,80 +839,94 @@ where
         let io = boot(seed, test.setup, &laid);
         // clone: the world's handle, kept for what `out` and `err` wrote if this seed fails.
         last = Some(io.clone());
-        Granting { io, spec: &spec, manifest: test.manifest, body: &body, alloc }
+        TestWorld { io, spec: &spec, manifest: test.manifest, body, alloc }
     };
-    let failed = match test.planned.once {
-        // No fault can reach it: one run, of the seed every fault-free world is the same as.
+    let ran = match test.planned.once {
+        // No fault can reach it: one run, in a world with no fault, which every seed's is.
         true => {
             let run = seeds::one(0, &test.planned.seeds, &mut world);
             match run.verdict {
-                Ok(()) => return,
-                Err(_) => (run, 1, 1, Replay::Same),
+                Ok(()) => Ok(seeds::Passed { seeds: 1, starts: u64::from(run.starts), counts: run.counts }),
+                Err(_) => Err(Failed::Seed {
+                    package: test.package.into(),
+                    // alloc: once per failure, its name and its run.
+                    test: listed.clone(),
+                    at: 1,
+                    of: 1,
+                    run: alloc::boxed::Box::new(run),
+                    replay: Replay::Same,
+                }),
             }
         }
-        false => {
-            let given = match given_by_the_person() {
-                Ok(given) => given,
-                Err(why) => panic!("bstd::test: {why}"),
-            };
-            match seeds::run(test.planned.seeds, given, name, &mut world) {
-                Ok(_) => return,
-                Err(Failed::Seed { run, at, of, replay, .. }) => (*run, at, of, replay),
-                Err(other) => panic!("bstd::test: {other}"),
-            }
-        }
+        false => seeds::run(test.planned.seeds, given, name, &mut world),
     };
-    let (run, at, of, replay) = failed;
-    let mut text = String::new_in(alloc);
-    report(&test, &listed, &run, (at, of), &replay, last.as_ref(), &mut text);
-    panic!("{}", text.as_str());
+    ran.map_err(|failed| Broken { failed, last })
 }
 
-/// The test on the machine: its grants beneath a directory made for it, run once.
-#[cfg(any(test, feature = "testing"))]
-fn real<B, R>(test: &Test, os: &'static blaze_core::Os, spec: &Spec, laid: &[Laid], body: &B, alloc: LaunchAlloc)
+/// One seed of `test`'s `body`: its verdict, its counts and its trace, under the test's plan
+/// (a test of the runner: one seed twice is one trace).
+pub fn one_seed<B, R>(test: &Test, seed: u64, alloc: LaunchAlloc, body: &B) -> Result<Run, SetupError>
 where
     B: Fn(&mut Given<'_>) -> Result<R, Refused>,
     R: Outcome,
 {
-    let _ = os; // `bstd::test::native` takes the test root itself (blaze_core::testing::os).
-    let failed = |said: &dyn core::fmt::Display| -> ! {
+    let spec = spec_of(test, alloc)?;
+    let laid = laid(test.setup, alloc)?;
+    let mut world = |seed: u64| TestWorld { io: boot(seed, test.setup, &laid), spec: &spec, manifest: test.manifest, body, alloc };
+    Ok(seeds::one(seed, &test.planned.seeds, &mut world))
+}
+
+/// The test on the machine: its grants beneath a directory made for it, run once.
+#[cfg(any(test, feature = "testing"))]
+fn real<B, R>(test: &Test, body: &B, alloc: LaunchAlloc)
+where
+    B: Fn(&mut Given<'_>) -> Result<R, Refused>,
+    R: Outcome,
+{
+    fn could_not(test: &Test, said: &dyn core::fmt::Display, alloc: LaunchAlloc) -> ! {
         let mut text = String::new_in(alloc);
         text.str("bstd::test: `").str(test.name).str("` (real) could not be set up: ");
-        text.put_display(said);
+        blaze_text::PutDisplay::put_display(&mut text, said);
         panic!("{}", text.as_str());
+    }
+    let set_up = spec_of(test, alloc).and_then(|spec| laid(test.setup, alloc).map(|laid| (spec, laid)));
+    let (spec, laid) = match set_up {
+        Ok(set_up) => set_up,
+        Err(why) => {
+            let mut text = String::new_in(alloc);
+            why.line(&mut text);
+            could_not(test, &text.as_str(), alloc)
+        }
     };
+    let spec = &spec;
     // Ambient until batch P5-temp: TempDir reads TMPDIR itself; then the entry's Env hands it.
     let dir = match blaze_core::temp::TempDir::new("bstd-test-") {
         Ok(dir) => dir,
-        Err(why) => failed(&why),
+        Err(why) => could_not(test, &why, alloc),
     };
     let io = match crate::rt::testing_native::native(dir.path()) {
         Ok(io) => io,
-        Err(why) => failed(&why),
+        Err(why) => could_not(test, &why, alloc),
     };
     let cx = match io.cx(BUDGET, TASK_FRAME) {
         Ok(cx) => cx,
-        Err(stopped) => failed(&stopped),
+        Err(stopped) => could_not(test, &stopped, alloc),
     };
     let fs = match io.need_fs() {
         Ok(fs) => fs,
-        Err(why) => failed(&why),
+        Err(why) => could_not(test, &why, alloc),
     };
-    for file in laid {
+    for file in laid.iter() {
         let lay = crate::path::Path::new(file.name.as_str())
             .map_err(|why| alloc::format!("{why}"))
             .and_then(|path| fs.root().publish_synced(&cx, &path, crate::fs::Content::bytes(file.bytes)).map_err(|why| alloc::format!("{why}")));
         if let Err(why) = lay {
-            failed(&why);
+            could_not(test, &why, alloc);
         }
     }
-    let ran = {
-        let mut given = Given::new(&cx, &io, None, spec, Started::WithSpec, test.manifest);
-        catch_unwind(AssertUnwindSafe(|| body(&mut given)))
-    };
+    // The fixture's context ends before the test's own start makes its root.
     drop(cx);
-    let why = match ended(&io, ran, alloc) {
+    let why = match start(&io, spec, test.manifest, alloc, body) {
         Ended::Well => return,
         Ended::GaveUp(why) => why,
         Ended::Panicked(why) => why,
@@ -765,7 +941,7 @@ where
 }
 
 #[cfg(not(any(test, feature = "testing")))]
-fn real<B, R>(test: &Test, _: &'static blaze_core::Os, _: &Spec, _: &[Laid], _: &B, alloc: LaunchAlloc)
+fn real<B, R>(test: &Test, _: &B, alloc: LaunchAlloc)
 where
     B: Fn(&mut Given<'_>) -> Result<R, Refused>,
     R: Outcome,
@@ -784,11 +960,9 @@ fn takes(manifest: &Manifest, out: &mut String<LaunchAlloc>) {
     }
     for param in manifest.params {
         out.str(", ").str(param.name).str(": ").str(param.kind.name());
-        match param.kind {
-            Kind::Dir { write: true } => out.str(" (writes)"),
-            Kind::Dir { write: false } => out.str(" (reads)"),
-            _ => out,
-        };
+        if let Kind::Dir { write } = param.kind {
+            out.str(if write { " (writes)" } else { " (reads)" });
+        }
     }
     out.str("\n");
 }
@@ -847,6 +1021,22 @@ pub fn report(
     world: Option<&Io>,
     out: &mut String<LaunchAlloc>,
 ) {
+    report_drawn(test, listed, run, (at, of), replay, world, None, out);
+}
+
+/// [`report`] of a case with drawn parameters (D109): `drawn` adds each drawn parameter's
+/// shrunk value and the tape, and the replay line gives the tape beside the seed.
+#[expect(clippy::too_many_arguments, reason = "report's seven and the drawn block, one call site each")]
+pub fn report_drawn(
+    test: &Test,
+    listed: &str,
+    run: &Run,
+    (at, of): (u32, u32),
+    replay: &Replay,
+    world: Option<&Io>,
+    drawn: Option<&super::param::DrawnReport<'_>>,
+    out: &mut String<LaunchAlloc>,
+) {
     let plan = &run.plan;
     let (start, why) = match &run.verdict {
         Err(broke) => (broke.start, broke.why.as_str()),
@@ -862,9 +1052,13 @@ pub fn report(
             out.str("seed ").int(plan.seed).str(" (").int(at).str(" of ").int(of).str("), start ").int(start).str(" of ").int(run.starts).str("\n");
             out.str("faults in play: ");
             fault_names(test.planned.faults, out);
-            out.str(" (a failure 1 in ").int(plan.fail_one_in).str(", late by up to ").int(plan.max_latency.as_micros()).str(" us, a power cut 1 in ");
+            out.str(" (a failure 1 in ").int(plan.fail_one_in).str(", late by up to ").int(u64::try_from(plan.max_latency.as_micros()).unwrap_or(u64::MAX)).str(" us, a power cut 1 in ");
             out.int(plan.crash_one_in).str(", at most ").int(plan.cuts_most).str(" cuts; 0: none)\n");
         }
+    }
+    if let Some(drawn) = drawn {
+        out.str(drawn.values);
+        out.str("tape: ").str(drawn.tape).str("\n");
     }
     out.str("why: ").str(why).str("\n");
     out.str("did: ").int(run.counts.effects).str(" effects, ").int(run.counts.failures).str(" failed, ").int(run.counts.cuts).str(" power cuts\n");
@@ -877,10 +1071,13 @@ pub fn report(
             out.str(" (the program or its world takes a choice from outside the seed)\n  first:  ").str(first).str("\n  second: ").str(second).str("\n");
         }
     }
+    // What `Out` wrote is the simulated host's (`SimHost::out`, `err`: io.rs `write_out`), not
+    // the simulation's own streams (`Sim::output`, which only a program on blaze-core's sim
+    // host writes).
     if let Some(io) = world {
-        let _: Option<()> = io.with_sim(|sim| {
-            stream("out", sim.output(blaze_core::Stream::Stdout), out);
-            stream("err", sim.output(blaze_core::Stream::Stderr), out);
+        let _: Option<()> = io.script(|host| {
+            stream("out", &host.out, out);
+            stream("err", &host.err, out);
         });
     }
     let lines = run.trace.lines().count();
@@ -892,6 +1089,10 @@ pub fn report(
     out.str("replay: ");
     if !test.planned.once {
         out.str(seeds::SEED_VAR).str("=").int(plan.seed).str(" ");
+    }
+    if let Some(drawn) = drawn {
+        // The tape's text holds spaces: one shell word in single quotes (it holds none).
+        out.str("BLAZE_SIM_TAPE='").str(drawn.tape).str("' ");
     }
     out.str("blaze test -p ").str(test.package).str(" ").str(listed).str(" -- --exact");
 }
@@ -983,6 +1184,15 @@ const fn relative(path: &str) -> bool {
 #[macro_export]
 macro_rules! __test_setup {
     (@ $s:expr ;) => { $s };
+    (@ $s:expr ; cases = $n:literal $(, $($rest:tt)*)?) => {
+        $crate::__test_setup!(@ $s.cases($n) ; $($($rest)*)?)
+    };
+    (@ $s:expr ; kept $(, $($rest:tt)*)?) => {
+        $crate::__test_setup!(@ $s.kept(
+            ::core::include_str!(::core::concat!(::core::env!("CARGO_MANIFEST_DIR"), "/sim-kept.tapes")),
+            ::core::env!("CARGO_PKG_NAME"),
+        ) ; $($($rest)*)?)
+    };
     (@ $s:expr ; real $(, $($rest:tt)*)?) => {
         $crate::__test_setup!(@ $s.real() ; $($($rest)*)?)
     };
@@ -1013,7 +1223,7 @@ macro_rules! __test_setup {
     (@ $s:expr ; $($other:tt)*) => {
         ::core::compile_error!(::core::concat!(
             "bstd::test: an argument it does not take: `", ::core::stringify!($($other)*),
-            "`; it takes `seed = N`, `without(IoFailures, Delays, Crashes)`, `real`, ",
+            "`; it takes `seed = N`, `without(IoFailures, Delays, Crashes)`, `real`, `cases = N`, `kept`, ",
             "`<dir> = files(\"path\" => b\"..\", ..)`, `<net> = connect(\"host:port\")` or `listen(..)`, ",
             "`env(NAME = \"value\", ..)`, `args(\"..\", ..)`, `input = b\"..\"`"
         ))

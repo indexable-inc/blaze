@@ -44,7 +44,7 @@ use crate::world::{TraitFlags, World};
 
 /// The gap of an auto trait of an async block's future that failed on the superset interior
 /// (the module doc, 2).
-pub(crate) const INTERIOR_GAP: &str = "an auto trait (`Send`, `Sync`) of an async block's future that fails only on a value not known to be live across an `.await` (liveness across `.await` is not computed)";
+pub const INTERIOR_GAP: &str = "an auto trait (`Send`, `Sync`) of an async block's future that fails only on a value not known to be live across an `.await` (liveness across `.await` is not computed)";
 
 /// The most type nodes read to find a future inside a type (rule 18). A type larger than this
 /// is answered as holding one: the gap, never a wrong "no".

@@ -30,8 +30,13 @@ use blaze_surface::{
     WrittenVis,
 };
 
+use blaze_surface::builtin_attrs::{BUILTIN_ATTRS, PRELUDE_ATTR_MACROS, read_by_toolchain};
+use blaze_surface::tool_attrs::TOOLS;
+
 use super::Variant;
 use super::attr_value::{AttrCall, AttrValueRefusal, attr_string, read_call};
+
+mod helper_checks;
 
 // ---------------------------------------------------------------------------------------------
 // Keys.
@@ -393,6 +398,9 @@ impl<'s, 'a> Cfg<'s, 'a> {
                 None => break,
             };
             let name = prelude_attr(head(content));
+            if let Some(path) = cells_answer(head(content)) {
+                attrs.checks.push(path);
+            }
             match name {
                 "cfg" => match self.eval(args(content)) {
                     Some(true) => {}
@@ -441,6 +449,11 @@ impl<'s, 'a> Cfg<'s, 'a> {
                     attrs.local_inner |= args(content).contains("local_inner_macros");
                 }
                 "macro_use" => attrs.macro_use = true,
+                // The Reference, `attributes.testing.test.enabled`: "Test functions are only
+                // compiled when in test mode"; out of it the item is gone as a false `cfg`'s
+                // is (quick-xml's `#[test] fn pi() { use pretty_assertions::assert_eq; .. }`
+                // named a dev-dependency no library build holds).
+                "test" if self.eval("test") != Some(true) => attrs.cfg_ok = false,
                 // `#[lang = stringify!($lang)]` (core's `panic_const!`): kept as a call and
                 // read in `Lower::attrs` (task/attr_value.rs). `doc` and `deprecated` values
                 // are not read here at all: nothing in the build depends on them.
@@ -459,10 +472,15 @@ impl<'s, 'a> Cfg<'s, 'a> {
                 "global_allocator" => attrs.lang = Some("global_allocator"),
                 "rustc_builtin_macro" => {
                     attrs.builtin = true;
-                    let arg = SplitTop::new(args(content)).next().map_or("", str::trim);
+                    // `#[rustc_builtin_macro(Default, attributes(default))]` (the pinned library,
+                    // core/src/default.rs): the name, then the helpers as a proc derive writes
+                    // them (`ProcAttr::read`'s split).
+                    let mut parts = SplitTop::new(args(content));
+                    let arg = parts.next().map_or("", str::trim);
                     if !arg.is_empty() {
                         attrs.builtin_name = Some(arg);
                     }
+                    attrs.builtin_helpers = parts.map(str::trim).find(|part| head(part) == "attributes").map_or("", args);
                 }
                 "proc_macro" | "proc_macro_attribute" | "proc_macro_derive" => {
                     if let Some(it) = ProcAttr::read(content) {
@@ -489,13 +507,24 @@ impl<'s, 'a> Cfg<'s, 'a> {
                     // An attribute macro: a path no tool owns, or a name neither built in nor
                     // written after a derive (there it is the derive's helper, inert). The
                     // first one, outermost, takes the item (the Reference's order).
-                    let tool = name.split_once("::").map(|(first, _)| TOOLS.contains(&first) || attrs.tools.contains(&first));
+                    // The tool's segment trimmed (`tool_segment`): an expansion's text spaces
+                    // its tokens (`rustfmt :: skip`, alloy-sol-macro's `BYTECODE` static), and a
+                    // tool's attribute is inert however its path is spaced (task/tool_attr_spaced.rs).
+                    // A tool here is one of `TOOLS`; a tool the crate root registers is known to
+                    // the lowering alone (`LowerCx::tools`), which takes the first of `takers`
+                    // whose first segment is none of the crate's tools (`Lower::attrs`). An item's
+                    // own `register_tool` registers nothing (the Reference, `attributes.tool`:
+                    // a crate-level attribute).
+                    let tool = tool_segment(name).map(|first| TOOLS.contains(&first));
                     let candidate = match tool {
                         Some(tool) => !tool,
                         None => !is_builtin_attr(name) && attrs.derives.is_empty(),
                     };
-                    if candidate && attrs.attr_macro.is_none() {
-                        attrs.attr_macro = Some(name);
+                    if candidate {
+                        attrs.takers.push(name);
+                        if attrs.attr_macro.is_none() {
+                            attrs.attr_macro = Some(name);
+                        }
                     }
                     if !is_builtin_attr(name) {
                         attrs.others.push(name);
@@ -506,9 +535,33 @@ impl<'s, 'a> Cfg<'s, 'a> {
     }
 }
 
-/// The tools whose attributes (`#[rustfmt::skip]`) are inert without a `register_tool`.
-/// `blaze` is blaze's own tool (its extensions, rule 6).
-pub const TOOLS: &[&str] = &["blaze", "clippy", "diagnostic", "miri", "rust_analyzer", "rustdoc", "rustfmt"];
+/// The attribute's path as written when the cells answer it, not the lowering (names-G2-G3-2):
+/// a one-segment built-in attribute's name (the built-in attribute scope: `Outcome::Inert`, or
+/// E0659 when a nearer scope binds an attribute macro of the name), or a path whose first
+/// segment is a tool's (`#[rustfmt::skip]`, Reference `attributes.tool`: inert). Not sent:
+/// `cfg`, `cfg_attr` and `unsafe(..)`, read before any name exists (rustc strips them before
+/// resolution; the attribute inside `unsafe(..)` is read next and sent); the prelude's
+/// attribute macros ([`PRELUDE_ATTR_MACROS`]); a `rustc_` name (no table lists them; only the
+/// toolchain's crates write them); a derive's helper (sent by `Lower::helper_checks`, after the
+/// item's derives, names-attr-4).
+fn cells_answer(path: &str) -> Option<&str> {
+    let path = path.trim();
+    match tool_segment(path) {
+        Some(first) => TOOLS.contains(&first).then_some(path),
+        None => {
+            let read_here = matches!(path, "cfg" | "cfg_attr" | "unsafe") || PRELUDE_ATTR_MACROS.contains(&path);
+            (BUILTIN_ATTRS.contains(&path) && !read_here).then_some(path)
+        }
+    }
+}
+
+/// An attribute path's first segment, trimmed, when it has two or more: the segment a tool
+/// would be (an expansion's text spaces its tokens, `rustfmt :: skip`: e0425-1). The one place
+/// the lowering splits an attribute path for a tool: the taker test in `Cfg::attr` and
+/// [`cells_answer`] both read it.
+fn tool_segment(path: &str) -> Option<&str> {
+    path.split_once("::").map(|(first, _)| first.trim())
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum CTok<'a> {
@@ -646,6 +699,9 @@ pub struct Attrs<'t, 'a> {
     pub path_call: Option<AttrCall<'t>>,
     pub builtin: bool,
     pub builtin_name: Option<&'t str>,
+    /// What is inside `#[rustc_builtin_macro(Name, attributes(..))]`'s `attributes(..)`, as
+    /// [`ProcAttr::helpers`]: a built-in derive's helpers (names-attr-4); empty when none.
+    pub builtin_helpers: &'t str,
     pub prelude_import: bool,
     pub no_implicit_prelude: bool,
     pub no_std: bool,
@@ -653,11 +709,20 @@ pub struct Attrs<'t, 'a> {
     /// `#![blaze::arbitrary_ints]` (docs/v2/plan/design/arbitrary-ints.md).
     pub arbitrary_ints: bool,
     pub tools: AVec<'a, &'t str>,
-    /// Attribute names that are neither built in nor a tool's: attribute macros, not lowered.
+    /// One-segment attribute names that are neither built in nor a tool's: an attribute macro
+    /// (the item's taker) or, after a derive, a derive's helper, which `Lower::helper_checks`
+    /// sends to the cells (names-attr-4).
     pub others: AVec<'a, &'t str>,
+    /// The attributes the cells answer ([`cells_answer`]), as written, in order: sent by
+    /// `Lower::attr_checks` when the item is kept.
+    pub checks: AVec<'a, &'t str>,
     /// The outermost attribute macro, as written (`bstd::main`): the item is its input, and
-    /// declares nothing until the call expands.
+    /// declares nothing until the call expands. `Cfg::attr` sets the first of `takers`;
+    /// `Lower::attrs` sets it again knowing the crate's tools.
     pub attr_macro: Option<&'t str>,
+    /// Every attribute that takes the item unless its first segment is a tool the crate root
+    /// registers, outermost first (names-attr-3).
+    pub takers: AVec<'a, &'t str>,
     /// `#[proc_macro]`, `#[proc_macro_attribute]` or `#[proc_macro_derive(Name, attributes(..))]`
     /// on a function: the macro it exports (the last one written, as rustc refuses two).
     pub proc_macro: Option<ProcAttr<'t>>,
@@ -740,6 +805,7 @@ impl<'a> Attrs<'_, 'a> {
             path_call: None,
             builtin: false,
             builtin_name: None,
+            builtin_helpers: "",
             prelude_import: false,
             no_implicit_prelude: false,
             no_std: false,
@@ -747,33 +813,20 @@ impl<'a> Attrs<'_, 'a> {
             arbitrary_ints: false,
             tools: AVec::new_in(alloc),
             others: AVec::new_in(alloc),
+            checks: AVec::new_in(alloc),
             attr_macro: None,
+            takers: AVec::new_in(alloc),
             proc_macro: None,
         }
     }
 }
 
-/// The attribute names the toolchain reads itself.
-pub const BUILTIN_ATTRS: &[&str] = &[
-    "allow", "automatically_derived", "cfg", "cfg_attr", "cfg_eval", "cold", "collapse_debuginfo",
-    "coverage", "crate_name", "crate_type", "debugger_visualizer", "default", "deny", "deprecated",
-    "derive", "diagnostic", "doc", "expect", "export_name", "feature", "forbid", "global_allocator",
-    "ignore", "inline", "instruction_set", "lang", "link", "link_name", "link_ordinal",
-    "link_section", "linkage", "macro_escape", "macro_export", "macro_use", "must_not_suspend",
-    "must_use", "naked", "no_builtins", "no_core", "no_implicit_prelude", "no_link", "no_main",
-    "no_mangle", "no_std", "non_exhaustive", "optimize", "panic_handler", "path", "prelude_import",
-    "proc_macro", "proc_macro_attribute", "proc_macro_derive", "recursion_limit", "register_tool",
-    "repr", "should_panic", "stable", "target_feature", "test", "thread_local", "track_caller",
-    "type_length_limit", "unsafe", "unstable", "used", "warn", "windows_subsystem", "const_trait",
-    "derive_const", "fundamental", "marker", "may_dangle", "ffi_const", "ffi_pure",
-    "omit_gdb_pretty_printer_section", "allow_internal_unstable", "allow_internal_unsafe",
-    "pointee", "unstable_feature_bound", "align", "sanitize", "loop_match", "const_continue",
-    "patchable_function_entry", "define_opaque", "type_const", "coroutine", "custom_mir",
-    "do_not_recommend", "on_unimplemented", "rustfmt", "clippy",
-];
-
+/// An attribute the lowering never takes for an item's attribute macro by its name alone: a
+/// path (a tool's or a macro's, decided by `Cfg::attr` and `Lower::attrs`) or a name the
+/// toolchain reads itself (`blaze_surface::builtin_attrs`: built-in attributes, the prelude's
+/// attribute macros, `rustc_` names). A derive's helper (`default`) is none of these.
 pub fn is_builtin_attr(name: &str) -> bool {
-    name.starts_with("rustc_") || name.contains("::") || BUILTIN_ATTRS.contains(&name)
+    name.contains("::") || read_by_toolchain(name)
 }
 
 /// The attribute's content: `#[a(b)]` and `#![a(b)]` give `a(b)`.
@@ -1481,7 +1534,12 @@ pub enum MacroBody<'t> {
     Rules(&'t str),
     Macro2 { params: Option<&'t str>, body: &'t str },
     BuiltinFn(&'t str),
-    /// A builtin derive or attribute (`#[rustc_builtin_macro] macro Clone`): not run here.
+    /// A builtin derive (`#[rustc_builtin_macro(Default, attributes(default))] macro Default`):
+    /// run by blaze-expand's builtin derives. `helpers` as [`ProcAttr::helpers`], the library's
+    /// own text, kept in the records (names-attr-4).
+    BuiltinDerive { helpers: &'t str },
+    /// A builtin attribute (`#[rustc_builtin_macro] macro test`): not run here. A derive is
+    /// [`MacroBody::BuiltinDerive`].
     BuiltinOther(CallShape),
     /// A proc macro a proc-macro crate exports: run by the crate's module, never here.
     /// `helpers` as [`ProcAttr::helpers`].
@@ -1508,6 +1566,48 @@ pub struct CallSrc<'t> {
     pub kind: CallShape,
     pub loc: Loc,
     pub depth: u16,
+    /// An attribute call no attribute in the text names ([`IMPLICIT_MAIN`], D104): it stands
+    /// outermost, and its item is the whole input (blaze-expand `ItemAttrs::implicit_call`).
+    pub implicit: bool,
+}
+
+/// The attribute macro a blaze-edition binary's root `fn main` is the input of when none is
+/// written (D104; blaze-unit-graph `Implicit::entry`): bstd's `#[bstd::main]`, which the edition
+/// names `std`. Absolute, so no item of the program shadows it.
+pub const IMPLICIT_MAIN: &str = "::std::main";
+
+/// The symbol of a hosted program's start (bstd's `guest::start`, run.md "The hosted world").
+const HOSTED_START: &str = "bstd_hosted_start";
+
+/// Whether the root file's text exports the program's entry itself (D104): a free fn, at the
+/// file's top or in inline modules, its `cfg` true, exported as `bstd_hosted_start` or `main`
+/// by `#[no_mangle]`, `#[unsafe(no_mangle)]` or `#[export_name = ".."]`. Such a file writes its
+/// own start, and its `fn main` is nobody's input. A loop over the outline, no recursion.
+fn exports_entry(cfg: &Cfg<'_, '_>, outline: &Outline<'_>, text: &str, alloc: Alloc<'_>) -> bool {
+    outline.items().iter().any(|item| {
+        if !matches!(item.detail, ItemDetail::Fn { .. }) {
+            return false;
+        }
+        let mut up = item.parent;
+        while let Some(p) = up {
+            let parent = outline.item(p);
+            if !matches!(parent.detail, ItemDetail::Mod { inline: true, .. }) {
+                return false;
+            }
+            up = parent.parent;
+        }
+        let own_name = || item.name.map(|r| unraw(item.text(text, r)));
+        let exported = outline.attrs(item).iter().filter(|a| a.kind != AttrKind::Doc).find_map(|a| {
+            let content = strip_attr(item.text(text, a.range));
+            match head(content) {
+                "no_mangle" => own_name(),
+                "unsafe" if args(content).trim() == "no_mangle" => own_name(),
+                "export_name" => attr_string(content).0,
+                _ => None,
+            }
+        });
+        matches!(exported, Some(HOSTED_START | "main")) && item_attrs(cfg, outline, item, text, alloc).cfg_ok
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1706,6 +1806,9 @@ impl Lowered<'_, '_> {
 /// What every fragment of a crate is lowered under.
 pub struct LowerCx<'c, 'p, W: ?Sized> {
     pub krate: CrateItemKey,
+    /// The crate's tools ([`crate_tools`]: `TOOLS` and the root's `register_tool`s): an
+    /// attribute whose path starts with one never takes its item (names-attr-3).
+    pub tools: &'c [&'c str],
     /// The crate's edition: a `macro_rules!` body's arms are lexed in it ([`rules_shapes`]).
     pub edition: Edition,
     pub cfg: &'c Cfg<'c, 'c>,
@@ -1713,6 +1816,11 @@ pub struct LowerCx<'c, 'p, W: ?Sized> {
     pub walked: &'c W,
     /// Where its procedural macros are declared from.
     pub procs: ProcDecls<'p>,
+    /// D104: this is the root module's own fragment of a crate whose `Implicit::entry` is set:
+    /// its top-level `fn main` is [`IMPLICIT_MAIN`]'s input unless an attribute macro is
+    /// written on it or the file exports its own entry ([`exports_entry`]). False for every
+    /// other module and every expansion.
+    pub entry: bool,
 }
 
 impl<W: ?Sized> Clone for LowerCx<'_, '_, W> {
@@ -1747,8 +1855,15 @@ pub struct Fragment<'c, 't> {
 
 /// Lowers `fragment`'s items under `cx`.
 pub fn lower<'p: 't, 't, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fragment: Fragment<'_, 't>, alloc: Alloc<'a>) -> Lowered<'t, 'a> {
+    let entry = cx.entry
+        && fragment.items.is_none()
+        && fragment.depth == 0
+        && matches!(fragment.at, Where::File(_))
+        && !exports_entry(cx.cfg, fragment.outline, fragment.text, alloc);
     let mut low = Lower {
+        entry,
         krate: cx.krate,
+        tools: cx.tools,
         edition: cx.edition,
         cfg: cx.cfg,
         walked: cx.walked,
@@ -1764,6 +1879,8 @@ pub fn lower<'p: 't, 't, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fra
         alloc,
         stack: AVec::new_in(alloc),
         seen: HashMap::new_in(alloc),
+        checked: HashSet::new_in(alloc),
+        checks_sent: 0,
         out: Lowered {
             decls: DeclsBuilder::new_in(alloc),
             macros: AVec::new_in(alloc),
@@ -1822,7 +1939,11 @@ fn children_run(outline: &Outline<'_>, parent: Option<ItemIndex>) -> (usize, usi
 }
 
 struct Lower<'c, 't, 'a, W: ?Sized> {
+    /// [`LowerCx::entry`], and the file exports no entry of its own.
+    entry: bool,
     krate: CrateItemKey,
+    /// [`LowerCx::tools`].
+    tools: &'c [&'c str],
     edition: Edition,
     cfg: &'c Cfg<'c, 'c>,
     walked: &'c W,
@@ -1840,6 +1961,10 @@ struct Lower<'c, 't, 'a, W: ?Sized> {
     stack: AVec<'a, &'t str>,
     /// How many entries of each owner, kind and name this fragment has keyed: [`Lower::key`].
     seen: HashMap<(ItemKey, &'t str, &'t str), u32, Alloc<'a>>,
+    /// The attribute checks sent, by path and textual span: [`Lower::attr_checks`].
+    checked: HashSet<(&'t str, usize), Alloc<'a>>,
+    /// How many of `out.decls.calls` are attribute checks.
+    checks_sent: usize,
     out: Lowered<'t, 'a>,
 }
 
@@ -1872,6 +1997,35 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         self.pos
     }
 
+    /// Sends a kept item's `checks` (its attributes [`cells_answer`] picks) to the cells as
+    /// attribute calls with no input (names-G2-G3-2): each is answered there and never
+    /// expanded (`Outcome::Inert`; `Ambiguous(BuiltinAttr)`, E0659, when a nearer scope binds an
+    /// attribute macro of a built-in's name; a tool's path inert as read). One per path and
+    /// textual span: a one-segment attribute reads its module's scope, the same along the whole
+    /// fragment, and the textual scope, which grows only at a `macro_rules!`, a `mod` or a call;
+    /// so a later check of the same path in the same span reads what the first read.
+    fn attr_checks(&mut self, idx: ItemIndex, at: u32, checks: &[&'t str]) {
+        for &path in checks {
+            let d = &self.out.decls;
+            let span = d.macro_rules.len() + d.mods.len() + d.calls.len() - self.checks_sent;
+            if !self.checked.insert((path, span)) {
+                continue;
+            }
+            let Some(parsed) = parse_path(path, self.krate, self.alloc) else {
+                self.note(LowerNoteKind::AttrMacroNotLowered { attr: path }, at, path);
+                continue;
+            };
+            let call = self.key(self.owner, "attr check", path);
+            let pos = self.next_pos();
+            self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: Some(idx.0) });
+            // No input: a check is never `Called`, so never expanded; only its place is read
+            // (an error's location, blaze-cli names.rs).
+            let src = CallSrc { module: self.module, owner: None, name: path, input: "", kind: CallShape::Attr, loc: self.loc(at), depth: self.depth, implicit: false };
+            self.out.calls.push((call, src));
+            self.checks_sent += 1;
+        }
+    }
+
     fn attrs(&mut self, item: &Item) -> Attrs<'t, 'a> {
         let mut attrs = Attrs::new_in(self.alloc);
         let outline = self.outline;
@@ -1881,6 +2035,11 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             }
             self.cfg.attr(&mut attrs, strip_attr(item.text(self.text, attr.range)), &mut self.stack);
         }
+        // The item's taker: the first attribute that takes it whose first segment is none of the
+        // crate's tools (a tool the root registers included: the Reference, `attributes.tool`).
+        // A tool's attribute is inert and the item is kept, never the input of a call the cells
+        // then skip (names-attr-3: the item vanished).
+        attrs.attr_macro = attrs.takers.iter().copied().find(|p| tool_segment(p).is_none_or(|t| !self.tools.contains(&t)));
         // A value written as a macro call (`#[lang = stringify!(x)]`), read where the crate's
         // edition and the allocator are at hand (task/attr_value.rs); one that does not read
         // is refused by name and leaves the attribute unset.
@@ -1956,7 +2115,16 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         // macros, so the attribute can change the function's body, which no name outside the
         // crate reads, and not what the crate exports. Its call is not made.
         let proc_fn = attrs.proc_macro.is_some() && matches!(item.detail, ItemDetail::Fn { .. });
-        if let Some(path) = attrs.attr_macro.filter(|_| !proc_fn) {
+        // D104: a blaze binary's root `fn main` with no attribute macro written is the input of
+        // `std::main`, as if `#[::std::main]` stood outermost: the same call as a written one.
+        let implicit = self.entry
+            && !proc_fn
+            && attrs.attr_macro.is_none()
+            && item.parent.is_none()
+            && name == Some("main")
+            && matches!(item.detail, ItemDetail::Fn { .. });
+        let written = attrs.attr_macro.filter(|_| !proc_fn);
+        if let Some(path) = written.or(implicit.then_some(IMPLICIT_MAIN)) {
             // The item is the call's input: what it declares is the expansion's (its derives
             // and later attribute macros too, lowered from the expansion).
             let call = self.key(self.owner, "attr", path);
@@ -1966,7 +2134,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             };
             let pos = self.next_pos();
             self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: Some(idx.0) });
-            let src = CallSrc { module: self.module, owner: None, name: path, input: whole, kind: CallShape::Attr, loc: self.loc(at), depth: self.depth };
+            let src = CallSrc { module: self.module, owner: None, name: path, input: whole, kind: CallShape::Attr, loc: self.loc(at), depth: self.depth, implicit };
             self.out.calls.push((call, src));
             return false;
         }
@@ -1976,6 +2144,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         // TokenStream"), so the input has no text of its own; the expansion's items have theirs.
         let impl_header = matches!(item.detail, ItemDetail::Impl).then(|| self.impl_header(item));
         self.out.texts.push(ItemText { key, module: self.module, item: idx, name, impl_header, text: whole });
+        self.attr_checks(idx, at, &attrs.checks);
         for &path in attrs.derives.iter() {
             let call = self.key(self.owner, "derive", path);
             let Some(parsed) = parse_path(path, self.krate, self.alloc) else {
@@ -1984,9 +2153,10 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             };
             let pos = self.next_pos();
             self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Derive, pos, item: Some(idx.0) });
-            let src = CallSrc { module: self.module, owner: None, name: path, input: whole, kind: CallShape::Derive, loc: self.loc(at), depth: self.depth };
+            let src = CallSrc { module: self.module, owner: None, name: path, input: whole, kind: CallShape::Derive, loc: self.loc(at), depth: self.depth, implicit: false };
             self.out.calls.push((call, src));
         }
+        self.helper_checks(idx, item, &attrs);
         if let Some(lang) = attrs.lang {
             let loc = self.loc(at);
             self.out.langs.push(LangSrc { name: lang, key, loc });
@@ -2154,7 +2324,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
                 let (shape, body) = if attrs.builtin {
                     let which = attrs.builtin_name.unwrap_or(name);
                     if BuiltinDerive::ALL.into_iter().any(|it| it.name() == which) {
-                        (MacroShapes::DERIVE, MacroBody::BuiltinOther(CallShape::Derive))
+                        (MacroShapes::DERIVE, MacroBody::BuiltinDerive { helpers: attrs.builtin_helpers })
                     } else if BuiltinAttr::ALL.into_iter().any(|it| it.name() == which) {
                         (MacroShapes::ATTR, MacroBody::BuiltinOther(CallShape::Attr))
                     } else {
@@ -2214,8 +2384,11 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             name: path_text,
             input: inside(item.text(text, input)),
             kind: CallShape::FnLike,
-            loc: self.loc(at),
+            // The call's place is its path's start, not the item's (an attribute before the
+            // call is no part of it): where `line!()`/`column!()` in its eager input count from.
+            loc: self.loc(item.in_file(path).start),
             depth: self.depth,
+            implicit: false,
         };
         self.out.calls.push((call, src));
     }
@@ -2250,6 +2423,7 @@ impl<'t, 'a: 't, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             let key = self.key(key_owner, "assoc", name.unwrap_or(""));
             let whole = &text[item.range.start as usize..item.range.end as usize];
             members.push(Member { key, name, item: idx, detail: item.detail, text: whole, written_by });
+            self.attr_checks(idx, item.range.start, &attrs.checks);
             if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(item.range.start), self.depth, (self.owner, self.pos)) {
                 self.out.bodies.push(body);
             }
@@ -2513,15 +2687,21 @@ pub fn crate_root<'t, 'a>(
     }
     exports.sort();
     cr.macro_exports.extend_from_slice(&exports);
-    // The tool namespaces (`blaze` among them): one table, blaze-surface's.
-    let mut tools: AVec<'a, &'t str> = AVec::from_slice_in(&blaze_surface::tool_attrs::TOOLS, alloc);
-    tools.extend_from_slice(&attrs.tools);
+    // The tool namespaces (`blaze` among them): the lowering's own set, the same function.
+    cr.tools.extend_from_slice(&crate_tools(attrs, alloc));
+    // The built-in attribute scope: built-in attributes only (sorted in their one home); the
+    // prelude's attribute macros (`test`, `derive`) are macros an import may shadow.
+    cr.builtin_attrs.extend_from_slice(BUILTIN_ATTRS);
+    cr
+}
+
+/// The crate's tool namespaces: `TOOLS` (`blaze` among them) and the root's
+/// `#![register_tool(..)]`s (`root` is the root file's attributes), sorted, each once. What every
+/// module's lowering reads ([`LowerCx::tools`]) and the root record holds (the cells' tools).
+pub fn crate_tools<'t, 'a>(root: &Attrs<'t, '_>, alloc: Alloc<'a>) -> AVec<'a, &'t str> {
+    let mut tools: AVec<'a, &'t str> = AVec::from_slice_in(&TOOLS, alloc);
+    tools.extend_from_slice(&root.tools);
     tools.sort_unstable();
     tools.dedup();
-    cr.tools.extend_from_slice(&tools);
-    let mut builtin: AVec<'a, &'t str> = AVec::from_slice_in(BUILTIN_ATTRS, alloc);
-    builtin.sort_unstable();
-    builtin.dedup();
-    cr.builtin_attrs.extend_from_slice(&builtin);
-    cr
+    tools
 }

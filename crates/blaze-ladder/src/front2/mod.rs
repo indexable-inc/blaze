@@ -11,6 +11,7 @@
 //! | [`types`] | a written type to a portable one through the resolver; `Why::Need` for a head not lowered yet |
 
 pub mod anon;
+mod async_output;
 mod back_needs;
 pub mod block_crates;
 pub mod expansion_blocks;
@@ -18,37 +19,51 @@ pub mod block_traits;
 pub mod body;
 pub mod body_host;
 pub mod body_reads;
+pub mod borrow_reads;
 pub mod borrows;
+pub mod borrows_print;
+pub mod borrows_nested;
+mod bound_kids;
 pub mod buckets;
+pub mod call_generics;
 pub mod check;
+pub mod by_origin;
 pub mod const_at;
 mod const_args_in_bounds;
 mod const_enum;
 mod const_open;
+mod const_param_ty;
+pub mod const_inherent;
 pub mod const_project;
 pub mod const_qpath;
 pub mod const_select;
 pub mod consts;
 pub(crate) mod coroutines;
 pub mod dyn_ty;
-pub mod entry;
 pub mod fill;
+pub mod fn_attrs;
 pub(crate) mod fmt_template;
 pub mod gat;
 pub mod glob_uses;
+pub mod foreign_closures;
 pub mod foreign_locals;
 pub mod head_record;
 pub mod heads;
 pub mod index;
 pub mod keys;
+pub mod linked;
 pub mod langs;
 pub mod lifetimes;
 pub mod locals;
+mod member_names;
 pub mod lower_made;
+pub mod on_unimplemented;
+pub mod opaque_auto;
 pub mod own_trait;
 pub mod alloc_shim;
 pub mod panic_entry;
 pub mod pattern_ty;
+pub mod nested_exports;
 pub mod preds;
 pub mod program;
 pub mod project;
@@ -57,9 +72,11 @@ pub mod reach;
 pub mod reads;
 pub mod receiver;
 pub mod scoped;
+mod self_size;
 pub mod shared_keys;
 pub mod source;
 pub mod spell;
+pub mod stalled_goals;
 pub mod start;
 pub mod statics;
 pub mod test_entry;
@@ -69,26 +86,14 @@ pub mod types;
 pub mod world_items;
 pub mod world_paths;
 mod adt_paths;
+mod static_shown;
 mod written;
+pub mod header_written;
 
 use blaze_scope::resolve::Names;
 
 use crate::refusal::SourceFile;
 use crate::resolve::Resolver;
-
-/// The text appended to the program's root: the module `__blaze_entry`, whose hosted start
-/// calls `crate::main` with the roots `fn main(cx: &Cx, io: Io)` takes (docs/v2/plan/design/
-/// std.md, the entry; bstd's `guest::start` and `guest::finish`).
-pub const ENTRY_CX_IO: &str = "\nmod __blaze_entry {\n    #[unsafe(no_mangle)]\n    pub extern \"C\" fn bstd_hosted_start(table: *const std::wire::HostTable) -> i32 {\n        fn hosted(cx: &std::Cx, io: std::Io) -> std::entry::Status {\n            let ran = crate::main(cx, io.clone());\n            std::guest::finish(&io, ran)\n        }\n        std::guest::start(table, hosted)\n    }\n}\n";
-
-/// [`ENTRY_CX_IO`] for `fn main()` (D59's interim, [`entry`]).
-pub const ENTRY_NONE: &str = "\nmod __blaze_entry {\n    #[unsafe(no_mangle)]\n    pub extern \"C\" fn bstd_hosted_start(table: *const std::wire::HostTable) -> i32 {\n        fn hosted(_cx: &std::Cx, io: std::Io) -> std::entry::Status {\n            let ran = crate::main();\n            std::guest::finish(&io, ran)\n        }\n        std::guest::start(table, hosted)\n    }\n}\n";
-
-/// [`ENTRY_CX_IO`] for `fn main(cx: &Cx)`.
-pub const ENTRY_CX: &str = "\nmod __blaze_entry {\n    #[unsafe(no_mangle)]\n    pub extern \"C\" fn bstd_hosted_start(table: *const std::wire::HostTable) -> i32 {\n        fn hosted(cx: &std::Cx, io: std::Io) -> std::entry::Status {\n            let ran = crate::main(cx);\n            std::guest::finish(&io, ran)\n        }\n        std::guest::start(table, hosted)\n    }\n}\n";
-
-/// [`ENTRY_CX_IO`] for `fn main(io: Io)`.
-pub const ENTRY_IO: &str = "\nmod __blaze_entry {\n    #[unsafe(no_mangle)]\n    pub extern \"C\" fn bstd_hosted_start(table: *const std::wire::HostTable) -> i32 {\n        fn hosted(_cx: &std::Cx, io: std::Io) -> std::entry::Status {\n            let ran = crate::main(io.clone());\n            std::guest::finish(&io, ran)\n        }\n        std::guest::start(table, hosted)\n    }\n}\n";
 
 /// Why the front end could not start.
 #[derive(Debug)]
@@ -96,6 +101,8 @@ pub enum FrontError {
     Texts(texts::TextsError),
     Key(keys::KeyClash),
     Lang(index::LangTwice),
+    /// The program's roots name no crate set (linked.rs).
+    Roots(linked::RootsError),
 }
 
 impl core::fmt::Display for FrontError {
@@ -104,6 +111,7 @@ impl core::fmt::Display for FrontError {
             FrontError::Texts(e) => write!(f, "{e}"),
             FrontError::Key(e) => write!(f, "{e}"),
             FrontError::Lang(e) => write!(f, "{e}"),
+            FrontError::Roots(e) => write!(f, "{e}"),
         }
     }
 }
@@ -124,12 +132,25 @@ pub struct Front2<'n, S = &'n Names<'n>> {
 
 impl<'n> Front2<'n> {
     /// The front end over `names`, the program's crate at index 0 and its files `user` as the
-    /// caller gave them. Every item, variant and impl the library keys is filed in the key map
-    /// here, so a clash stops the program before any item is lowered. `frame` is the caller's,
-    /// alive for the command.
+    /// caller gave them: [`Front2::for_program`] for the program crate 0 links. `frame` is the
+    /// caller's, alive for the command.
     pub fn new(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>]) -> Result<Front2<'n>, FrontError> {
+        // The closure is a bitmap for this call alone; this constructor takes no allocator
+        // (its callers' signature), so the program's top allocator is named here (owed: one
+        // handed down).
+        let linked = linked::Linked::of(names, &[0], blaze_own::Alloc::global()).map_err(FrontError::Roots)?;
+        Self::for_program(names, frame, user, &linked)
+    }
+
+    /// The front end over `names` for ONE program, the crates `linked` links (linked.rs), and
+    /// its files `user`. Its lang rows are the linked crates' alone (the per-program ones,
+    /// `#[global_allocator]` and `#[panic_handler]`, are one per program, not per workspace);
+    /// a library-only survey passes the library crates as its roots. Every item, variant and
+    /// impl the library keys is filed in the key map here, so a clash stops the program before
+    /// any item is lowered. `frame` is the caller's, alive for the command.
+    pub fn for_program(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], linked: &linked::Linked<'_>) -> Result<Front2<'n>, FrontError> {
         let texts = texts::Texts::new(names, user).map_err(FrontError::Texts)?;
-        let index = index::Index::new(names).map_err(FrontError::Lang)?;
+        let index = index::Index::new(names, linked).map_err(FrontError::Lang)?;
         let mut keys = keys::Keys::new();
         for (krate, c) in names.crates().iter().enumerate() {
             for (key, _, _) in names.items(krate) {

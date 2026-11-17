@@ -105,6 +105,18 @@ pub struct Checked<'a> {
     /// Each `&expr` promoted to a `'static` slot (rules/promote.rs), sorted: the builder makes
     /// it the address of a constant row, never a frame temporary.
     pub promoted: Vec<crate::ids::ExprId, Alloc<'a>>,
+    /// Each auto-trait goal of an async block's future that failed only on the superset
+    /// interior, left for the exact one (src/stalled.rs), in the order it failed. Empty except
+    /// under `check_deferring`; a caller deciding them passes them to `decide_stalled`.
+    pub stalled: Vec<crate::stalled::Stalled, Alloc<'a>>,
+    /// Each `.await` and the future it holds while suspended, `<E as IntoFuture>::IntoFuture`
+    /// (the Reference, "Await expressions", steps 1-2: `IntoFuture::into_future` of the
+    /// operand, evaluated to the future `tmp` that is polled), as the check decided it
+    /// (rules/async_fmt.rs `expr_await`), sorted by expression; read with
+    /// [`Checked::awaited_of`]. The flow lowering's `.await` takes it as the type of its
+    /// `tmp` (blaze-flow-lower coroutine.rs), so an async block's exact interior holds it. An
+    /// `.await` whose future is not wholly known has no row.
+    pub awaited: Vec<(ExprId, PTy), Alloc<'a>>,
 }
 
 /// Two two-column tables are equal column by column.
@@ -151,6 +163,14 @@ impl<'a> Checked<'a> {
         Some(self.const_args.column::<1>()[at])
     }
 
+    /// The future the `.await` at `e` holds while suspended (`<E as IntoFuture>::IntoFuture`,
+    /// a type of `types`), or `None` for an expression that is no `.await` or whose future
+    /// is not wholly known.
+    pub fn awaited_of(&self, e: ExprId) -> Option<PTy> {
+        let at = self.awaited.binary_search_by_key(&e, |r| r.0).ok()?;
+        Some(self.awaited[at].1)
+    }
+
     /// Equal results ignoring the read list and needs: what the read-list property compares.
     pub fn same_result(&self, other: &Checked<'a>) -> bool {
         self.types == other.types
@@ -169,6 +189,8 @@ impl<'a> Checked<'a> {
             && self.suggests == other.suggests
             && self.hidden == other.hidden
             && self.promoted == other.promoted
+            && self.stalled == other.stalled
+            && self.awaited == other.awaited
     }
 }
 
@@ -196,6 +218,8 @@ impl<'a> core::fmt::Debug for Checked<'a> {
             .field("suggests", &self.suggests)
             .field("hidden", &self.hidden)
             .field("promoted", &self.promoted)
+            .field("stalled", &self.stalled)
+            .field("awaited", &self.awaited)
             .field("reads", &self.reads)
             .field("needs", &self.needs)
             .finish()

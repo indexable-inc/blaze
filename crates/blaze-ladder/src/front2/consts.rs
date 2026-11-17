@@ -610,6 +610,11 @@ impl<'n> Consts<'n> {
     /// `Maps::anon_failed`, so the head that wrote it is refused by name and only that head.
     /// A failure that itself names a constant to evaluate first is returned for the list.
     fn first<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, c: LibKey) -> Result<(), ConstFail> {
+        // An inherent constant leaf a head asked while this evaluation ran
+        // (front2/const_inherent.rs): answered and filed with this evaluator.
+        if let Some(done) = super::const_inherent::first(self, r, prepared, c) {
+            return done;
+        }
         let item = super::keys::checker_of(c);
         let anonymous = super::anon::need_key(item) == c;
         super::anon::file_asked(&mut *r.store, &mut *r.keys).map_err(|e| ConstFail::Eval(format!("constant {item:?}: {e}").into_boxed_str()))?;

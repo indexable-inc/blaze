@@ -218,8 +218,8 @@ impl fmt::Display for Phases {
         if let Some(h) = self.frames {
             writeln!(
                 f,
-                "frames       most held (bytes): request {} · a task's scratch {} · a batch's records {} · a record read back {}",
-                h.request, h.scratch, h.batch, h.got
+                "frames       most held (bytes): request {} · a task's scratch {} · a batch's records {} · a record read back {} · a crate scope {} · a file's body job {}",
+                h.request, h.scratch, h.batch, h.got, h.scope, h.bodies
             )?;
         }
         let held = &self.held;

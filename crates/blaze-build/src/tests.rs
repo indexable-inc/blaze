@@ -280,6 +280,8 @@ struct TestWorld {
     deref_fn: Option<ItemKey>,
     /// The ADT `Adts::lang_adt(ManuallyDrop)` answers.
     manually_drop: Option<ItemKey>,
+    /// The ADT `Adts::lang_adt(OwnedBox)` answers (tests/box_moves.rs).
+    owned_box: Option<ItemKey>,
     /// The fixture solver of `LayoutFacts::normalize`: `<self_ as Deref>::Target = target`,
     /// both types of this world's table (tests/projections.rs).
     projs: Vec<(PTy, PTy), Global>,
@@ -332,6 +334,7 @@ impl TestWorld {
             deref_assoc: Vec::new_in(Global),
             deref_fn: None,
             manually_drop: None,
+            owned_box: None,
             projs: Vec::new_in(Global),
             where_clauses: Vec::new_in(Global),
             index: None,
@@ -749,7 +752,11 @@ impl Adts for TestAdts<'_> {
     }
 
     fn lang_adt(&self, item: LangItem) -> Option<ItemKey> {
-        (item == LangItem::ManuallyDrop).then_some(self.world.manually_drop).flatten()
+        match item {
+            LangItem::ManuallyDrop => self.world.manually_drop,
+            LangItem::OwnedBox => self.world.owned_box,
+            _ => None,
+        }
     }
 
     fn drop_impl(&self, ty: PTy, ground: &mut PortableTys<'_>) -> Result<Option<ItemKey>, BuildError> {
@@ -3438,6 +3445,9 @@ fn a_match_by_value_refuses_what_it_does_not_build() {
 mod objects;
 
 #[cfg(target_arch = "aarch64")]
+mod box_moves;
+
+#[cfg(target_arch = "aarch64")]
 mod closures;
 
 mod forms;
@@ -3447,6 +3457,7 @@ mod casts;
 mod matches;
 mod guards;
 mod promote;
+mod target_intr;
 #[cfg(target_arch = "aarch64")]
 mod operators;
 #[cfg(target_arch = "aarch64")]
@@ -3455,6 +3466,7 @@ mod moves;
 mod moves_places;
 mod nounwind;
 mod unwind;
+mod unwind_ladder;
 mod operand_cleanup_edges;
 #[cfg(target_arch = "aarch64")]
 mod temps;
@@ -3471,6 +3483,8 @@ mod discard;
 mod lets;
 #[cfg(target_arch = "aarch64")]
 mod irrefutable;
+#[cfg(target_arch = "aarch64")]
+mod ref_bind;
 mod wide;
 mod halfquad;
 mod index;

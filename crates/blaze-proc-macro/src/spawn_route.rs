@@ -20,7 +20,9 @@ use blaze_own::Alloc;
 use blaze_spawn::{Executor, Files, Input, MACHINE_V1, NoSandbox, Personality, SpawnAnswer, SpawnRefused, SpawnRequest, Status, Tool, Written};
 use blaze_wasi::Stop;
 
-use crate::script_sandbox::{Malformed, Refusal, STDERR_TAIL, Script, ScriptSandbox, SpawnRefusal, Tree, WORKSPACE, git_words};
+use blaze_expand::seen::SeenRoot;
+
+use crate::script_sandbox::{Malformed, Refusal, STDERR_TAIL, Script, ScriptSandbox, SpawnRefusal, Tree, git_words};
 
 /// One spawn as the shim encoded it, whole: what `decode` used to read past (the environment
 /// and the two output modes) is kept, because the executor's request holds the child's whole
@@ -198,6 +200,12 @@ impl SpawnSetting {
         SpawnSetting { hvbox_allowed: false, tools: Vec::new(), userland: None, pins: None }
     }
 
+    /// The derived facts answered from `pins`, and nothing else: hvbox not allowed, no tool
+    /// pinned, no userland (brief P; the pins from `crate::fact_pins::command_spawn_setting`).
+    pub fn facts_only(pins: FactPins) -> SpawnSetting {
+        SpawnSetting { hvbox_allowed: false, tools: Vec::new(), userland: None, pins: Some(pins) }
+    }
+
     /// Why a spawn finds no sandbox: the owner's word first, then the missing pin.
     pub fn no_sandbox(&self) -> NoSandbox {
         if self.hvbox_allowed { NoSandbox::ToolNotPinned } else { NoSandbox::OwnerHasNotAllowed }
@@ -209,7 +217,7 @@ impl core::fmt::Debug for Script {
         f.debug_struct("Script")
             .field("package", &self.package)
             .field("tree", &self.tree)
-            .field("folder", &self.folder)
+            .field("root", &self.root)
             .field("env", &self.env)
             .field("target", &self.target)
             .field("host", &self.host)
@@ -261,17 +269,18 @@ pub(crate) fn hex(bytes: &[u8; 32]) -> String {
     out
 }
 
-/// The bytes behind a request's reads and present files: the served tree at `/workspace` and
-/// the in-memory `OUT_DIR`, by guest path.
+/// The bytes behind a request's reads and present files: the served tree at the script's mount
+/// (`/package` or `/workspace`, D96) and the in-memory `OUT_DIR`, by guest path.
 struct SpawnFiles<'s> {
     tree: &'s [(String, Vec<u8>)],
+    seen: SeenRoot<'s>,
     sandbox: &'s ScriptSandbox,
     out_dir: &'s str,
 }
 
 impl Files for SpawnFiles<'_> {
     fn bytes(&self, path: &str) -> Option<&[u8]> {
-        if let Some(rel) = path.strip_prefix(WORKSPACE).and_then(|rest| rest.strip_prefix('/')) {
+        if let Some(rel) = self.seen.in_tree(path) {
             let at = self.tree.binary_search_by(|(have, _)| have.as_str().cmp(rel)).ok()?;
             return Some(self.tree[at].1.as_slice());
         }
@@ -387,7 +396,7 @@ impl ScriptSandbox {
         let mut stdin = blaze_own::Vec::new_in(alloc);
         stdin.extend_from_slice(&spawned.stdin);
         let mut reads = blaze_own::Vec::new_in(alloc);
-        reads.push(Input::Tree { path: text(WORKSPACE), digest: tree_digest(tree) });
+        reads.push(Input::Tree { path: text(script.root.seen().mount()), digest: tree_digest(tree) });
         let mut writes = blaze_own::Vec::new_in(alloc);
         writes.push(text(out_dir));
         let mut present = blaze_own::Vec::new_in(alloc);
@@ -413,7 +422,7 @@ impl ScriptSandbox {
             Err(why) => return Err(self.refuse(Refusal::Spawn(SpawnRefusal::Executor(format!("`{program}`: its spawn request is refused: {why:?}"))))),
         };
         let key = request.key(alloc);
-        let answered = executor.answer(&request, &SpawnFiles { tree, sandbox: &*self, out_dir }, alloc);
+        let answered = executor.answer(&request, &SpawnFiles { tree, seen: script.root.seen(), sandbox: &*self, out_dir }, alloc);
         let answer: SpawnAnswer<'_> = match answered {
             Ok(answer) => answer,
             Err(SpawnRefused::NoSandbox { why, .. }) => return Err(self.refuse(no_sandbox(why))),

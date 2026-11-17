@@ -194,6 +194,8 @@ pub mod image;
 /// The simulated host behind the capabilities blaze-core has no effect for, and how a call
 /// on one fails.
 pub mod hosted;
+/// Standard input: `In`, the byte stream a program was started with.
+pub mod input;
 pub mod io;
 /// The keychain: `Keys`, by named key, and the `Secret` a fetch gives.
 pub mod keys;
@@ -209,6 +211,8 @@ pub mod mem;
 pub mod name;
 mod narrow;
 pub mod net;
+/// The whole network, a `main` grant narrowed by the program itself (`Network`, D104 B1).
+pub mod network;
 /// Handing a URL to the user's default application: `Opener`, narrowed to a scheme.
 pub mod opener;
 pub mod out;
@@ -409,8 +413,8 @@ pub mod http {
 
 /// Testing. `#[bstd::test]` (the attribute, [`test!`]) is the default test of a bstd program:
 /// a function shaped like `main` run on the simulation under [`test::Seeds`], 256 by default,
-/// with every [`test::Fault`] kind on unless it leaves one out by name, a failure saying its
-/// seed and the line that replays it ([`test::run`]; docs/v2/plan/design/bstd-sim-test.md).
+/// with the [`test::Fault`] kinds its parameters can meet on unless it leaves one out by name, a failure saying its
+/// seed and the line that replays it ([`test::granted`]; docs/v2/plan/design/bstd-sim-test.md).
 /// Then blaze-core's seeded simulation itself ([`test::Sim`]: a virtual clock, shuffled
 /// completions, failures, crashes), the model checker for lock-free code ([`test::model`], its
 /// shims in [`test::checked`]), and allocation counting ([`test::Counting`], [`test::measure`]).
@@ -424,7 +428,23 @@ pub mod test {
         seeds::{Broke, Counts, Ended, Failed, Fault, Given, Passed, Plan, Replay, Run, Seeds},
     };
 
-    pub use crate::simtest::{BUDGET, Outcome, one, run, seeded};
+    pub use crate::simtest::{BUDGET, Outcome, seeded};
+    /// `#[bstd::test]` with grants (D109): the attribute's setup, the plan by parameter kind,
+    /// the test entry, and its one-block report.
+    pub use crate::simtest::granted::{
+        ALL_FAULTS, Broken, Endpoint, File, Files, MOST_GRANTS, Planned, Setup, SetupError, Test, Var, bit, granted,
+        one_seed, reach, report, simulated, spec_of,
+    };
+    /// What makes each parameter of a `#[bstd::test]` (D109): a capability or a drawn value.
+    pub use crate::simtest::param::{
+        Draws, DrawnReport, From, Making, Param, Slot, drawn, grant_count, grants, slot,
+    };
+    /// The drawn half (D109), with bstd's feature `sim-draws`.
+    #[cfg(any(test, feature = "sim-draws"))]
+    pub use crate::simtest::drawn::{CASES, CASES_MOST, DrawnGiven, TAPE_SALT, cases};
+    /// A type of a user's drawn in a test: `bstd::test::AnyIn`, `bstd::test::any_in_by_any!`.
+    #[cfg(feature = "sim-draws")]
+    pub use blaze_sim::{Any, AnyIn, any_in_by_any};
 
     /// A native world over a test's directory, made with a test's root of real-OS authority
     /// (`blaze_core::testing::os()`): the one way a test makes a native world once batch B1
@@ -463,7 +483,6 @@ pub mod prelude {
         pub use crate::{
             cx::Cx,
             entry::Error,
-            io::Io,
             mem::{String, format_in},
         };
 
@@ -480,6 +499,7 @@ pub mod prelude {
             fs::{Dir, Fs, ReadOnly, ReadWrite},
             grant::Spec,
             host::Host,
+            input::In,
             keys::Keys,
             locale::Locale,
             mem::Mem,

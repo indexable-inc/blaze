@@ -9,15 +9,22 @@
 //! checkout is read, never built or written.
 //!
 //! A call's path is resolved by a stand-in until blaze-scope's `Names::macro_path` resolves
-//! macro paths: among the macro crates the lock reaches from the file's package (for `a::m`,
-//! from its dependency `a`), the exports of that name and kind, the nearest in the lock's
-//! dependency graph winning; two at the same distance are ambiguous and counted, never
-//! guessed. A single-segment attribute the language defines (`test`, `inline`, ..) is the
-//! language's.
+//! macro paths: first its first segment is read through the file's `use` items (`uses.rs`:
+//! under `use tokio::select;`, `select!` is `tokio::select!`), then among the macro crates the
+//! lock reaches from the file's package (for `a::m`, from its dependency `a`), the exports of
+//! that name and kind, the nearest in the lock's dependency graph winning; two at the same
+//! distance are ambiguous and counted, never guessed. A call read through a `use` that names no
+//! proc macro there is counted apart and never matched by name to another crate's. A
+//! single-segment attribute the language defines (`test`, `inline`, ..) is the language's.
 
 #![feature(allocator_api)]
 
 mod common;
+#[path = "tempo_pipeline/uses.rs"]
+mod uses;
+#[cfg(test)]
+#[path = "tempo_pipeline/resolve_tests.rs"]
+mod resolve_tests;
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -50,6 +57,7 @@ use blaze_proc_macro::{
 use blaze_surface::Edition;
 
 use common::{expansion_records, modules, package_dir, package_of, sources};
+use uses::{Bound, Uses};
 
 /// A git macro crate's commit and folder in its repository, from the identity the bootstrap
 /// builder wrote beside its module (`git <commit> <path>`).
@@ -149,6 +157,9 @@ struct Names {
     dist: Mutex<HashMap<usize, Arc<Vec<u32>>>>,
     unresolved: Mutex<BTreeMap<String, u64>>,
     ambiguous: Mutex<BTreeMap<String, u64>>,
+    /// Calls read through a `use` of their file that name no proc macro there, by the path as
+    /// written, as read, and why.
+    through_use: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Names {
@@ -158,10 +169,11 @@ impl Names {
     }
 }
 
-/// The resolver for one file: [`Names`] from the file's package.
+/// The resolver for one file: [`Names`] from the file's package, through the file's `use`s.
 struct Resolve<'n> {
     names: &'n Names,
     member: usize,
+    uses: &'n Uses,
 }
 
 impl<'d> MacroNames<'d> for Resolve<'_> {
@@ -181,14 +193,35 @@ impl<'d> MacroNames<'d> for Resolve<'_> {
 
 impl Resolve<'_> {
     /// The proc macro `path` names among the lock's packages by distance, `None` when none or
-    /// more than one nearest.
+    /// more than one nearest. Its first segment is read through the file's `use` items first.
     fn find<'d, 'a>(&self, path: &str, kind: ProcKind, alloc: Alloc<'a>) -> Option<Resolved<'d, 'a>> {
-        let segs: Vec<&str> = path.split([':', ' ']).filter(|it| !it.is_empty()).collect();
-        let name = *segs.last()?;
-        if segs.len() == 1 && kind == ProcKind::Attr && BUILTIN_ATTRS.contains(&name) {
+        let written: Vec<&str> = path.split([':', ' ']).filter(|it| !it.is_empty()).collect();
+        let name = *written.last()?;
+        if written.len() == 1 && kind == ProcKind::Attr && BUILTIN_ATTRS.contains(&name) {
             return None;
         }
-        if segs.len() > 1 && matches!(segs[0], "rustfmt" | "clippy" | "diagnostic" | "rustdoc") {
+        if written.len() > 1 && matches!(written[0], "rustfmt" | "clippy" | "diagnostic" | "rustdoc") {
+            return None;
+        }
+        // The Reference, "Use declarations" and "Paths": a path's first segment is the name its
+        // scope binds; a `use` of the file binding it decides which crate the call is of
+        // (`use tokio::select;`: `select!` is tokio's `macro_rules!`, never commonware's proc
+        // macro of the same name).
+        let through: Option<Vec<&str>> = match self.uses.get(written[0]) {
+            Some(Bound::Path(target)) if !(written.len() == 1 && target.len() == 1) => {
+                Some(target.iter().map(String::as_str).chain(written[1..].iter().copied()).collect())
+            }
+            Some(Bound::Path(_)) | None => None,
+            Some(Bound::Twice) => {
+                self.count_through(kind, &written, &written, "the file's `use`s bind it to two paths");
+                return None;
+            }
+        };
+        let segs: &[&str] = through.as_deref().unwrap_or(&written);
+        // The name as read (`use commonware_macros::select as cs;`: `cs!` is `select`).
+        let name = *segs.last()?;
+        if through.is_some() && matches!(segs[0], "crate" | "self" | "super") {
+            self.count_through(kind, &written, segs, "a `use` of the file's own crate: not followed by the stand-in");
             return None;
         }
         let from_member = self.names.dist(self.member);
@@ -199,7 +232,15 @@ impl Resolve<'_> {
                     .min_by_key(|i| from_member[*i]);
                 // A path whose first segment no package the lock reaches is named (`core::..`,
                 // `std::..`, a module of the crate) names no dependency's proc macro here.
-                reached?
+                match reached {
+                    Some(at) => at,
+                    None => {
+                        if through.is_some() {
+                            self.count_through(kind, &written, segs, "a `use` of a crate the lock does not reach");
+                        }
+                        return None;
+                    }
+                }
             }
             _ => self.member,
         };
@@ -215,6 +256,10 @@ impl Resolve<'_> {
         }
         let count = |map: &Mutex<BTreeMap<String, u64>>| *map.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(label.clone()).or_default() += 1;
         match best[..] {
+            [] if through.is_some() => {
+                self.count_through(kind, &written, segs, "the crate the `use` names reaches no proc macro of that name");
+                None
+            }
             [] => {
                 count(&self.names.unresolved);
                 None
@@ -235,6 +280,13 @@ impl Resolve<'_> {
                 None
             }
         }
+    }
+
+    /// A call read through a `use` of its file and left there: counted apart, by the path as
+    /// written, as read and why.
+    fn count_through(&self, kind: ProcKind, written: &[&str], read: &[&str], why: &str) {
+        let label = format!("{kind:?} {} = {} ({why})", written.join("::"), read.join("::"));
+        *self.names.through_use.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(label).or_default() += 1;
     }
 }
 
@@ -356,7 +408,8 @@ impl ExpandCx for Counted<'_, '_> {
                             })
                             .collect::<Vec<_>>()
                             .join(" ");
-                        entry.push((format!("{message}\n      input: {}", given.chars().take(600).collect::<String>()), String::new()));
+                        // The whole input: a derive's input is read in full when its macro refuses it.
+                        entry.push((format!("{message}\n      input: {given}"), String::new()));
                     }
                 }
                 if let Some(message) = produced.diagnostics.iter().find_map(|d| match d {
@@ -578,7 +631,10 @@ fn main() {
     let lock_text = std::fs::read_to_string(checkout.join("Cargo.lock")).expect("the checkout's lock");
     let lock = read_lock(&lock_text);
     let mut built = modules(store, checkout);
-    let runtime = Runtime::new().expect("the runtime");
+    // The process heap, named once at the entry: the runtime's, and every allocator the file
+    // loop hands down.
+    let heap = blaze_own::Heap::process();
+    let runtime = Runtime::new(heap).expect("the runtime");
     let records = expansion_records(&out);
     let mut procs = ProcMacros::new(&runtime, &records, Limits::STANDARD);
     let mut macros = Vec::new();
@@ -627,7 +683,14 @@ fn main() {
         registered += 1;
     }
     println!("macro crates: {registered} registered, {} with a module", procs.crates().filter(|c| c.2).count());
-    let names = Names { lock, macros, dist: Mutex::new(HashMap::new()), unresolved: Mutex::new(BTreeMap::new()), ambiguous: Mutex::new(BTreeMap::new()) };
+    let names = Names {
+        lock,
+        macros,
+        dist: Mutex::new(HashMap::new()),
+        unresolved: Mutex::new(BTreeMap::new()),
+        ambiguous: Mutex::new(BTreeMap::new()),
+        through_use: Mutex::new(BTreeMap::new()),
+    };
     let root_manifest = std::fs::read_to_string(checkout.join("Cargo.toml")).unwrap_or_default();
     let files = sources(checkout);
     let threads = std::thread::available_parallelism().map_or(8, |n| n.get().min(12));
@@ -654,7 +717,13 @@ fn main() {
                         let Some(member) = (0..names.lock.len()).find(|i| names.lock[*i].path && names.lock[*i].name == pkg_name) else {
                             continue;
                         };
-                        let resolve = Resolve { names: &names, member };
+                        // A file that does not lex has no `use` read: said, and its calls resolved
+                        // by name alone (the driver refuses its text the same way).
+                        let uses = Uses::of(&text, edition, heap.alloc()).unwrap_or_else(|e| {
+                            println!("  {}: does not lex ({e:?}): its `use` items not read", path.display());
+                            Uses::default()
+                        });
+                        let resolve = Resolve { names: &names, member, uses: &uses };
                         let cx = Counted { cx: ProcCx { inner: Host { package: Arc::clone(&package) }, procs: &procs, package, edition }, labels: &labels, tally: &tally, panics: &panics };
                         let rules: &[(&str, blaze_expand::Prepared<'_>)] = &[];
                         let at = DefAt {
@@ -768,7 +837,11 @@ fn main() {
             }
             for (label, messages) in panics.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
                 for (message, _) in messages {
-                    println!("  panic of {label}: {}", message.chars().take(400).collect::<String>());
+                    // A `compile_error` entry carries its call's whole input; a panic's message is cut.
+                    match label.ends_with("(compile_error)") {
+                        true => println!("  panic of {label}: {message}"),
+                        false => println!("  panic of {label}: {}", message.chars().take(400).collect::<String>()),
+                    }
                 }
             }
             let mut by_cause: BTreeMap<String, (u64, String)> = BTreeMap::new();
@@ -801,6 +874,7 @@ fn main() {
             };
             show("unresolved (no macro crate the lock reaches exports it)", &names.unresolved);
             show("ambiguous", &names.ambiguous);
+            show("through the file's `use` (not sent to a proc macro of another crate)", &names.through_use);
             show("failed expansions, by what and path", &failed);
         }
     }

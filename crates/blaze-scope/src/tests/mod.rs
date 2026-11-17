@@ -26,8 +26,15 @@ mod asked_digest;
 mod attr_value;
 mod attrs;
 mod blocks;
+mod block_cfg;
 mod macro_blocks;
 mod entry;
+mod failed_call;
+mod failed_record;
+mod implicit_main;
+mod main_call;
+mod include_data;
+mod include_roots;
 mod expansions;
 mod exports;
 mod fixtures;
@@ -38,14 +45,20 @@ mod items_grain;
 mod items_owners;
 mod items_buckets;
 mod more;
+mod builtin_attrs_reach_cells;
+mod names_attr_3;
+mod names_attr_4;
 mod names_record;
 mod name_rules;
 mod oracle;
 /// The reference solver's seam a solver core is compared through (oracle.rs).
 pub(crate) use oracle::{B, Imp, reference_imports, reference_world};
 mod per_crate;
+mod prelude_records;
+mod super_in_block;
 mod procs;
 mod records;
+mod refused;
 mod rules;
 mod tests_record;
 
@@ -189,7 +202,9 @@ impl World {
             prelude: None,
         };
         let mut cr = CrateRootBuilder::new_in(head, Alloc::global());
-        cr.builtin_attrs.extend_from_slice(&["derive", "inline", "test"]);
+        // Built-in attributes only: `derive` and `test` are the prelude's attribute macros
+        // (blaze_surface::builtin_attrs), never in the built-in attribute scope.
+        cr.builtin_attrs.extend_from_slice(&["inline"]);
         self.roots.insert(krate, cr);
         root
     }
@@ -332,6 +347,11 @@ impl ScopeFacts for World {
             Some(d) => Ok(Some(d.clone())),
             None => Err(SurfaceError::NoRecord { fact: "Expansion", item: call }),
         }
+    }
+
+    fn derive_helpers(&self, derive: ItemKey, out: &mut blaze_own::AVec<'_, N>) -> Result<(), SurfaceError> {
+        out.extend(self.helpers.get(&derive).into_iter().flatten().copied());
+        Ok(())
     }
 }
 

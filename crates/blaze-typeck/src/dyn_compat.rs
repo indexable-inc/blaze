@@ -346,8 +346,10 @@ pub(crate) fn verdict<W: World>(reads: &mut Reads<'_, '_, W>, trait_: ItemKey) -
 /// A fact the world lacks is `Stop::Need`; a trait it cannot decide is `CheckError::
 /// DynUndecided`, never compatible.
 pub fn item_dyn_findings<W: World>(world: &W, item: ItemKey, out: &mut Vec<crate::diag::Diag, Alloc<'_>>) -> Result<(), Stop> {
-    let mut reads = Reads::new_in(world, Alloc::global());
-    let mut roots: Vec<PTy, Alloc<'_>> = Vec::new_in(Alloc::global());
+    // The caller's allocator, the one `out` lives in (D102).
+    let alloc = *out.allocator();
+    let mut reads = Reads::new_in(world, alloc);
+    let mut roots: Vec<PTy, Alloc<'_>> = Vec::new_in(alloc);
     let types = if let Some(adt) = reads.adt(item)? {
         roots.extend(adt.fields.iter().map(|f| f.ty));
         adt.types
@@ -358,10 +360,10 @@ pub fn item_dyn_findings<W: World>(world: &W, item: ItemKey, out: &mut Vec<crate
     } else {
         return Err(CheckError::Malformed(Malformed::NoRecord(Question::FnSig(item))).into());
     };
-    let mut seen_nodes: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(types.len(), Alloc::global());
+    let mut seen_nodes: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(types.len(), alloc);
     seen_nodes.resize(types.len(), false);
-    let mut traits: Vec<ItemKey, Alloc<'_>> = Vec::new_in(Alloc::global());
-    let mut kids: Vec<PTy, Alloc<'_>> = Vec::new_in(Alloc::global());
+    let mut traits: Vec<ItemKey, Alloc<'_>> = Vec::new_in(alloc);
+    let mut kids: Vec<PTy, Alloc<'_>> = Vec::new_in(alloc);
     // Children are pushed reversed so the walk meets types in written order.
     roots.reverse();
     while let Some(p) = roots.pop() {

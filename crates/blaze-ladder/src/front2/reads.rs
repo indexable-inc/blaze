@@ -106,6 +106,14 @@ pub enum FactKind {
     CrateBucket = 21,
     /// An async block's facts. `key`: its owner's body; `detail`: its ordinal.
     Coroutine = 22,
+    /// What the move and borrow check took about an ADT (front2 borrow_reads.rs): whether it
+    /// is `Copy`, implements `Drop`, its fields, whether its head declares lifetimes. `key`:
+    /// the ADT; `detail`: 0. Listed only by `ProjectWorld::check_borrows`.
+    BorrowAdt = 23,
+    /// What the move and borrow check took about a fn's head (front2 borrow_reads.rs): the
+    /// lifetime part read from its text, whether it writes a lifetime, whether it takes
+    /// `&self`. `key`: the fn; `detail`: 0. Listed only by `ProjectWorld::check_borrows`.
+    BorrowHead = 24,
 }
 
 /// One fact a body's check asked for (module docs). Ordered as its bytes are

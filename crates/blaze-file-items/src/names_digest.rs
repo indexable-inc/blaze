@@ -36,41 +36,42 @@
 //! is left out (AGENTS.md rule 21, `keys-cover-every-input`).
 //!
 //! An attribute is taken to be an attribute macro, or to hold one (`cfg_attr`, `unsafe(..)`),
-//! unless its name is one of [`INERT`] (a subset of blaze-scope's `BUILTIN_ATTRS`) or a `rustc_`
+//! unless its name is [`inert`] (`blaze_surface::builtin_attrs`, the solver's own list) or a `rustc_`
 //! name, or its path starts with a tool of `blaze_surface::tool_attrs::TOOLS`: a name missing from
 //! the list only costs a solve, never an answer. Only entries the solver lowers one by one
 //! (`Lower::item`: the file's, a module's and an extern block's) have an attribute macro called; a
 //! trait's or an impl's member (`Lower::assoc`), a variant and a field have none called, so theirs
 //! do not make the entry whole: a derive or an attribute macro on their owner does.
+//!
+//! The file's own inner attributes are no entry's: [`file_names_digest`] holds each one's text
+//! but a doc comment's (blaze-scope task/lower.rs `file_attrs`: the root's `register_tool`,
+//! `no_std`, `no_core`, a module's `cfg`, `macro_use`, `no_implicit_prelude`), and
+//! [`Outline::surface`](crate::Outline::surface) hashes it first (names-attr-4).
 
 use blaze_ids::{ContentId, Domain};
 use blaze_own::AVec;
 
 use crate::digest::{BATCH, BATCH_BYTES, Compress, Sink};
+use blaze_surface::builtin_attrs::BUILTIN_ATTRS;
 use blaze_surface::tool_attrs::TOOLS;
 use blaze_surface::{Attr, AttrKind, Item, ItemDetail, Range, Rename, WrittenVis};
 
 /// [`NAMES_DOMAIN`](crate::NAMES_DOMAIN), its context key derived once.
 static NAMES: Domain = Domain::new(crate::NAMES_DOMAIN);
 
-/// Attribute names the name solver reads no item text for: each is in blaze-scope's
-/// `BUILTIN_ATTRS` (task/lower.rs), so the solver never calls it as an attribute macro, and what it
-/// reads of one is the attribute's own text, which the digest holds. Left out on purpose: `derive`,
-/// `derive_const` (the item is the derive's input), `cfg_attr` and `unsafe` (each holds another
-/// attribute) and `cfg_eval` (a built-in attribute macro).
-pub(crate) const INERT: &[&str] = &[
-    "align", "allow", "allow_internal_unsafe", "allow_internal_unstable", "automatically_derived",
-    "cfg", "cold", "collapse_debuginfo", "const_trait", "coverage", "crate_name", "crate_type",
-    "debugger_visualizer", "default", "deny", "deprecated", "diagnostic", "doc", "expect",
-    "export_name", "feature", "ffi_const", "ffi_pure", "forbid", "fundamental", "global_allocator",
-    "ignore", "inline", "instruction_set", "lang", "link", "link_name", "link_ordinal", "link_section",
-    "linkage", "macro_export", "macro_use", "marker", "may_dangle", "must_not_suspend", "must_use",
-    "naked", "no_builtins", "no_core", "no_implicit_prelude", "no_link", "no_main", "no_mangle",
-    "no_std", "non_exhaustive", "optimize", "panic_handler", "path", "prelude_import", "proc_macro",
-    "proc_macro_attribute", "proc_macro_derive", "recursion_limit", "register_tool", "repr",
-    "should_panic", "stable", "target_feature", "test", "thread_local", "track_caller",
-    "type_length_limit", "unstable", "used", "warn", "windows_subsystem",
-];
+/// The domain of [`file_names_digest`].
+static FILE_NAMES: Domain = Domain::new("blaze v2 file inner attributes names 1");
+
+/// Whether an attribute named `name` makes the name solver read no item text: a built-in
+/// attribute (`blaze_surface::builtin_attrs::BUILTIN_ATTRS`, the list the solver's lowering
+/// reads), so the solver never calls it as an attribute macro and reads only the attribute's own
+/// text, which the digest holds; or the prelude's `test` and `global_allocator`, which the
+/// lowering reads itself and keeps the item for. Left out on purpose: `cfg_attr` and `unsafe`
+/// (each holds another attribute), `derive` and `derive_const` (the item is the derive's input),
+/// `cfg_eval` and `define_opaque` (built-in attribute macros), and a derive's helper (`default`).
+pub(crate) fn inert(name: &str) -> bool {
+    (BUILTIN_ATTRS.binary_search(&name).is_ok() && !matches!(name, "cfg_attr" | "unsafe")) || matches!(name, "global_allocator" | "test")
+}
 
 /// Each entry of `items` (an outline of `text` in the edition whose hash byte is `edition`, its
 /// `hash` and `signature_hash` set, its attributes in `attrs`) its names digest, in order, into
@@ -108,6 +109,20 @@ pub(crate) fn names_digests<C: Compress>(
             count = 0;
         }
     }
+}
+
+/// The digest of a file's inner attributes `attrs` (its `file_attrs`) in `text`: each one's text
+/// but a doc comment's, in order. What the name solver reads of them (names-attr-4): an edit to
+/// `#![register_tool(x)]` moves it, a crate doc comment or blank lines between them do not.
+pub(crate) fn file_names_digest(text: &str, attrs: &[Attr]) -> ContentId {
+    let mut hasher = blaze_ids::Hasher::of(&FILE_NAMES);
+    for attr in attrs {
+        if attr.kind == AttrKind::Doc {
+            continue;
+        }
+        hasher.part(attr.range.of(text).as_bytes());
+    }
+    hasher.finish()
 }
 
 /// Whether the solver lowers the entries written in an entry of `detail` one by one
@@ -245,7 +260,7 @@ fn takes_the_item(kind: AttrKind, written: &str) -> bool {
         AttrKind::Doc | AttrKind::Cfg | AttrKind::Path { literal: _ } | AttrKind::MacroExport => false,
         AttrKind::CfgAttr => true,
         AttrKind::Other => match head(written) {
-            Head::Name(name) => !(name.starts_with("rustc_") || INERT.contains(&name)),
+            Head::Name(name) => !(name.starts_with("rustc_") || inert(name)),
             Head::Path(first) => !TOOLS.contains(&first),
             Head::Unread => true,
         },

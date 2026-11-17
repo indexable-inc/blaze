@@ -357,11 +357,12 @@ fn procs_of(
     lock_text: &str,
     member_dirs: &BTreeMap<u32, PathBuf>,
     places: &[(String, Place)],
+    heap: &'static blaze_own::Heap,
 ) -> Result<Procs, LoadError> {
     use blaze_proc_macro::hook::ProcMacros;
     use blaze_world::procs::files::{PackageAt, sandbox_files};
     let runtime: &'static blaze_proc_macro::host::Runtime =
-        leak(blaze_proc_macro::host::Runtime::new().map_err(|e| LoadError::Procs(format!("the proc-macro runtime: {e}")))?);
+        leak(blaze_proc_macro::host::Runtime::new(heap).map_err(|e| LoadError::Procs(format!("the proc-macro runtime: {e}")))?);
     let records: &'static blaze_proc_macro::record::DirStore = leak(blaze_proc_macro::record::DirStore::new(out));
     let mut procs = ProcMacros::new(runtime, records, blaze_proc_macro::host::Limits::STANDARD);
     let mut macro_units = Vec::new();
@@ -457,8 +458,8 @@ impl SourceTexts<'static> for Texts {
 /// proc macro's call is refused.
 /// `tests`: each member's library is also a test unit (Cargo's "Development dependencies": its
 /// `#[cfg(test)]` modules walked, its dev-dependencies in scope), beside its library unit.
-pub fn load(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts: Option<&Path>, tests: bool) -> Result<Loaded, LoadError> {
-    let alloc = Alloc::global();
+pub fn load(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts: Option<&Path>, tests: bool, heap: &'static blaze_own::Heap) -> Result<Loaded, LoadError> {
+    let alloc = heap.alloc();
     let lock_path = root.join("Cargo.lock");
     let bytes = std::fs::read(&lock_path).map_err(|error| LoadError::Read { path: lock_path.clone(), error })?;
     let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
@@ -518,6 +519,11 @@ pub fn load(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts:
     // (nix's `apple_targets`, rustix's `libc`, curve25519-dalek's `curve25519_dalek_bits="64"`)
     // and of its key.
     let mut unit_list = unit_crates(graph, lock, &members, view, TRIPLE, alloc).map_err(|e| LoadError::Crates(e.to_string()))?;
+    // A crate refused alone (a member proc macro with no wasm32-wasip1 cut) is still in the
+    // list, with no deps: its paths would read as NotFound, so say why first.
+    for r in unit_list.refused.iter() {
+        println!("  units: crate {} ({}): refused: {}", unit_list.crates[r.krate].name, r.krate, r.why);
+    }
     let script_list = script_records(scripts, graph, &unit_list)?;
     unit_list.join_scripts(&script_list).map_err(|e| LoadError::Crates(e.to_string()))?;
     let crates = leak(unit_list);
@@ -576,7 +582,7 @@ pub fn load(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts:
     let procs = match modules {
         Some((modules, out)) => {
             let lock_text = core::str::from_utf8(bytes).map_err(|_| LoadError::Lock("not UTF-8".to_string()))?;
-            Some(&*leak(procs_of(modules, out, crates, graph, lock, lock_text, &member_dirs, &places)?))
+            Some(&*leak(procs_of(modules, out, crates, graph, lock, lock_text, &member_dirs, &places, heap)?))
         }
         None => None,
     };
@@ -587,7 +593,9 @@ pub fn load(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts:
     let texts: &'static Texts = leak(Texts { places, roots: read_roots, procs, envs });
     // `inputs` carries each joined record (`UnitCrates::join_scripts`, above).
     let scripts = script_list;
-    let inputs = leak(crates.inputs());
+    // A refused crate (a member proc macro the shelf has no wasm32-wasip1 side for) is never
+    // resolved with no dependencies (rule 3): the load stops, naming it and the fix.
+    let inputs = leak(crates.checked_inputs().map_err(|refused| LoadError::Crates(refused.why.to_string()))?);
     let start = Instant::now();
     let names = resolve_crates(inputs, crates.sysroot, texts, &Serial, alloc).map_err(|e| LoadError::Names(e.to_string()))?;
     let resolve_ms = start.elapsed().as_secs_f64() * 1e3;
@@ -605,7 +613,11 @@ fn script_records(
 ) -> Result<Vec<Option<blaze_build_script::OutputsRef<'static>>>, LoadError> {
     let Some(dir) = dir else { return Ok(vec![None; crates.crates.len()]) };
     let mut given = Vec::new();
-    for c in crates.crates.iter() {
+    // A macro-side crate (`UnitCrates::macro_from`) is built for wasm32-wasip1: its build
+    // script's record would be that run's, which no exporter writes yet. The host's record is
+    // another side's facts (rule 21), so none is joined: the crate is counted apart in
+    // `build_scripts`.
+    for c in crates.crates.iter().take(crates.macro_from) {
         let Origin::Unit(u) = c.origin else { continue };
         let unit = &graph.units[u.index()];
         if unit.build_script.is_none() {
@@ -623,8 +635,9 @@ fn script_records(
     Ok(crates
         .crates
         .iter()
-        .map(|c| match c.origin {
-            Origin::Unit(u) => records.outputs(u),
+        .enumerate()
+        .map(|(at, c)| match c.origin {
+            Origin::Unit(u) if at < crates.macro_from => records.outputs(u),
             _ => None,
         })
         .collect())

@@ -138,6 +138,20 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             Some(CoroutineKind::Async { output }) if !async_root => self.lower_body_ty(output, At::Body)?,
             _ => output,
         };
+        // The signature's projections are settled in the param env before the body runs
+        // (rustc's `check_fn` takes the signature normalized): lowering `X::A` gave a variable
+        // and an obligation of the signature, with no place in the body. Selected only later, a
+        // body value would bind the variable first and the obligation would fail with no place
+        // (`DiagWithoutPlace`); selected now, `X: Tr<A = u8>` makes it `u8` and a value that does
+        // not fit is a mismatch at that value. What stays ambiguous (an opaque's bounds on its
+        // hidden type) stays pending.
+        #[cfg(test)]
+        let settle = self.plant != crate::machine::Plant::SignatureUnsettled;
+        #[cfg(not(test))]
+        let settle = true;
+        if settle {
+            self.select()?;
+        }
         let site = self.new_coerce_many(output)?;
         self.ret_sites.push(site);
         self.async_sites.push(self.body.coroutine.is_some() && !async_root);

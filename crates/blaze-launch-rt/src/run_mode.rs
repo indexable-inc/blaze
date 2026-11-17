@@ -62,6 +62,7 @@ use blaze_run::first_call::{self, Do, FirstCall, Woken};
 use blaze_run::{CodeRef, FindingsRef, Nanos, SlotId, ThreadId, Why};
 
 use crate::code_unwind::{self, Step};
+use crate::native_lib::{DlNatives, NativeError, Natives as _, PATH_MOST, RecordFiles};
 
 /// The exit status of a program blaze stopped: it could not build or start it, or stopped it
 /// at a function it cannot build (decision D86: what `env` and `timeout` use for the tool's
@@ -125,6 +126,9 @@ pub enum Act {
     Wake { thread: Thread, slot: SlotId },
     /// End the process with [`STOPPED`], saying why.
     Stop(Stop),
+    /// Load the program's native library `record` ([`RunMode::load_native`]): its slots are
+    /// stubbed, its words and pointer cells filled; its init list goes to the first thread.
+    Native { record: RecordId },
 }
 
 /// Where a record's code is placed: the area in first-call order, or the hot region in the order
@@ -241,6 +245,11 @@ pub enum RunModeError {
     PersonalityTwice { slot: Slot },
     /// The run's unwind registry could not be made, installed or written (unwind_reg.rs).
     Unwinder(crate::unwind_reg::RegError),
+    /// A record names C name `symbol` before the program's native library was loaded: names
+    /// bind through it only (NATIVE.md 3.7).
+    NoNativeLibrary { symbol: CodeSymbol },
+    /// The program's native library could not be loaded (native_lib.rs).
+    Native(NativeError),
 }
 
 impl From<WireError> for RunModeError {
@@ -318,6 +327,11 @@ impl fmt::Display for RunModeError {
                 slot.0
             ),
             RunModeError::Unwinder(why) => write!(f, "the run's unwind registry: {why}"),
+            RunModeError::NoNativeLibrary { symbol } => write!(
+                f,
+                "the C name of symbol {symbol} is asked before the program's native library was loaded (NATIVE.md 3.7: the parent's `Native` comes first)"
+            ),
+            RunModeError::Native(why) => write!(f, "{why}"),
         }
     }
 }
@@ -389,6 +403,9 @@ pub struct RunMode<'a> {
     /// The local slot of the program's `eh_personality` fn, once the parent's `Personality`
     /// named it (run_mode/personality.rs); every entry made after names its entry thunk.
     personality: Option<SlotId>,
+    /// The program's native library: waiting for the parent's `Native`, declared, or loaded
+    /// (run_mode/native.rs).
+    native: native::NativeState<'a>,
     alloc: Alloc<'a>,
 }
 
@@ -411,6 +428,7 @@ impl<'a> RunMode<'a> {
             closed: false,
             stopped: false,
             personality: None,
+            native: native::NativeState::Waiting,
             alloc,
         }
     }
@@ -495,30 +513,14 @@ impl<'a> RunMode<'a> {
         match down {
             Down::Declare { pairs } => {
                 for Declared { symbol, slot: wire } in pairs.iter() {
-                    if wire.0 >= MOST_SLOTS {
-                        return Err(RunModeError::SlotPast { slot: wire, most: MOST_SLOTS });
-                    }
-                    let (local, new) = self.slots.number(CodeSymbol(symbol.0))?;
+                    let (local, new) = self.declare_pair(symbol, wire)?;
                     if new {
                         out.push(Act::Stub { slot: local });
-                    }
-                    let at = wire.0 as usize;
-                    if self.slots.to_local.len() <= at {
-                        self.slots.to_local.resize(at + 1, NONE);
-                    }
-                    let had_local = self.slots.to_local[at];
-                    let had_wire = self.slots.to_wire[local.index()];
-                    match (had_local, had_wire) {
-                        (NONE, NONE) => {
-                            self.slots.to_local[at] = local.0;
-                            self.slots.to_wire[local.index()] = wire.0;
-                        }
-                        (l, w) if l == local.0 && w == wire.0 => {}
-                        _ => return Err(RunModeError::Redeclared { slot: wire, symbol }),
                     }
                 }
                 Ok(())
             }
+            Down::Native { library, words } => self.on_native(library, words, out),
             Down::Publish { slot, tier, record } => {
                 if tier != Tier::Zero {
                     // A promotion (D100 point 13): the slot's fast code is bound, the optimized
@@ -579,6 +581,31 @@ impl<'a> RunMode<'a> {
                 self.carry_dos(&dos, None, out)
             }
         }
+    }
+
+    /// One pair the parent declared (in `Declare` or `Native`): `symbol` runs through the
+    /// parent's slot `wire`, fixed for the run. The local slot, and whether it is new (its
+    /// words must name its stub before anything names it: the caller stubs it).
+    fn declare_pair(&mut self, symbol: WireSymbol, wire: Slot) -> Result<(SlotId, bool), RunModeError> {
+        if wire.0 >= MOST_SLOTS {
+            return Err(RunModeError::SlotPast { slot: wire, most: MOST_SLOTS });
+        }
+        let (local, new) = self.slots.number(CodeSymbol(symbol.0))?;
+        let at = wire.0 as usize;
+        if self.slots.to_local.len() <= at {
+            self.slots.to_local.resize(at + 1, NONE);
+        }
+        let had_local = self.slots.to_local[at];
+        let had_wire = self.slots.to_wire[local.index()];
+        match (had_local, had_wire) {
+            (NONE, NONE) => {
+                self.slots.to_local[at] = local.0;
+                self.slots.to_wire[local.index()] = wire.0;
+            }
+            (l, w) if l == local.0 && w == wire.0 => {}
+            _ => return Err(RunModeError::Redeclared { slot: wire, symbol }),
+        }
+        Ok((local, new))
     }
 
     /// The first-call machine's effects as acts and wire frames. `asker` is the thread whose
@@ -876,24 +903,17 @@ impl<'p> Folder<'p> {
     }
 }
 
-/// The longest path a record's file has, its NUL included.
-const PATH_MOST: usize = 1024;
+/// The native library's file is `dlopen`ed in place from the same folder (native_lib.rs).
+impl RecordFiles for Folder<'_> {
+    fn folder(&self) -> &[u8] {
+        self.path
+    }
+}
 
 impl RecordSource for Folder<'_> {
     fn bytes(&self, id: RecordId) -> Result<&[u8], RunModeError> {
-        let len = self.path.len() + 1 + 64 + 1;
-        if len > PATH_MOST {
-            return Err(RunModeError::StorePath { len });
-        }
         let mut path = [0u8; PATH_MOST];
-        path[..self.path.len()].copy_from_slice(self.path);
-        path[self.path.len()] = b'/';
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        for (index, byte) in id.0.iter().enumerate() {
-            let at = self.path.len() + 1 + index * 2;
-            path[at] = HEX[usize::from(byte >> 4)];
-            path[at + 1] = HEX[usize::from(byte & 0xf)];
-        }
+        crate::native_lib::record_path(self.path, id, &mut path)?;
         let missing = |errno| RunModeError::Missing { record: id, errno };
         // SAFETY: `path` is a NUL-terminated C string (zeroed past what was written above).
         let fd = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
@@ -1444,6 +1464,11 @@ fn control<S: RecordSource>(
                 Act::Stop(Stop::ParentGone { waiting }) => stop_with(format_args!(
                     "blaze: the program's parent (`blaze run`) is gone while {waiting} threads wait for code"
                 )),
+                // Until native-W8-1's GROUP D (the driver's load) goes in with the parent's send of
+                // `Down::Native`, no parent sends one: a native library here is refused by name.
+                Act::Native { record } => stop_with(format_args!(
+                    "blaze: the parent sent native library {record:?}, which this launcher does not load yet (native-W8-1 GROUP D)"
+                )),
             };
             if let Err(why) = carried {
                 stop_with(format_args!("blaze: the program stopped: its code could not come: {why}"));
@@ -1476,6 +1501,7 @@ impl fmt::Display for WhyText {
     }
 }
 
+mod native;
 mod personality;
 
 #[cfg(test)]

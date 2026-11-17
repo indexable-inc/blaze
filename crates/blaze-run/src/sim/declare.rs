@@ -255,6 +255,12 @@ impl Sim {
                     slot.0
                 )));
             }
+            Down::Native { words, .. } => {
+                return Err(Broke::Oracle(format!(
+                    "the parent sent `Native` with {} words: this simulation's parent has no native library",
+                    words.len()
+                )));
+            }
         };
         drop(self.down.drain(..took));
         match got {

@@ -105,6 +105,8 @@ mod tests {
                 files.binary_search_by(|(path, _)| path.as_str().cmp("Cargo.toml")).ok().map(|at| files[at].1.to_vec()),
             ),
             Files::Folder(dir) => Shown::Folder(dir.clone()),
+            // D96 (3): a member's manifest is at its dir in its workspace.
+            Files::Member { workspace, root } => Shown::Folder(workspace.join(root.seen().folder())),
         }
     }
 

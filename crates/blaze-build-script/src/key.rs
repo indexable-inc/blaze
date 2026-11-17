@@ -77,17 +77,29 @@ pub enum RunnerKey<'k> {
     /// are the record's read list ([`crate::toolchain::headers_digest`]), not its key.
     ///
     /// `host_tools`: the host tools it is granted (D71, [`crate::host_tools`]), sorted by name,
-    /// each by the SHA-256 of its binary; none adds nothing, so the keys of native records
-    /// without one stand.
+    /// each by the SHA-256 of its binary and its row's `runs_out_dir` grant (D112, rule 21);
+    /// none adds nothing, so the keys of native records without one stand.
     Native { compiler: [u8; 32], target: &'k str, sysroot: &'k str, host_tools: &'k [HostToolKey<'k>] },
 }
 
-/// A granted host tool as the key sees it: its name and its binary's SHA-256 (never its path,
-/// which is the machine's).
+/// A granted host tool as the key sees it: its name, its binary's SHA-256 (never its path,
+/// which is the machine's) and its row's grant to start what the script wrote under OUT_DIR.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct HostToolKey<'k> {
     pub name: &'k str,
     pub digest: [u8; 32],
+    /// The row's `runs_out_dir` ([`crate::host_tools::HostTool::runs_out_dir`]): it widens the
+    /// script's sandbox, so a row changed only there gives another key (D112, rule 21). Made
+    /// by [`HostToolKey::of`] from the row itself, so no caller can leave it out.
+    pub runs_out_dir: bool,
+}
+
+impl<'k> HostToolKey<'k> {
+    /// The key of one program `tool`'s row grants: `name` the tool's name (or `<tool>+<path>`
+    /// for a program it starts), `digest` that program's SHA-256; the grant comes from the row.
+    pub fn of(tool: &crate::host_tools::HostTool<'_>, name: &'k str, digest: [u8; 32]) -> HostToolKey<'k> {
+        HostToolKey { name, digest, runs_out_dir: tool.runs_out_dir }
+    }
 }
 
 /// The domain of the base key; a change to what it covers takes the next number.
@@ -118,7 +130,7 @@ pub fn base(inputs: &KeyInputs<'_>, scratch: &mut blaze_own::AVec<'_, u8>) -> Co
         if !host_tools.is_empty() {
             hasher.part(b"host-tools").update(&(host_tools.len() as u64).to_le_bytes());
             for tool in host_tools {
-                hasher.part(tool.name.as_bytes()).part(&tool.digest);
+                hasher.part(tool.name.as_bytes()).part(&tool.digest).update(&[tool.runs_out_dir as u8]);
             }
         }
     }

@@ -3,8 +3,8 @@
 //! what cargo writes, byte for byte: the manifest, the source file, the ignore file, the
 //! repository, and the workspace's `members`. For a package of a blaze edition
 //! (docs/v2/plan/design/std.md, "The blaze edition: opting in") the manifest says
-//! `edition = "blaze-2026.11"` and the source is on bstd: a `main` that takes `&Cx` and `Io`
-//! and writes its line through `Out`. Which it writes when no edition is asked is
+//! `edition = "blaze-2026.11"` and the source is on bstd: a `main` that takes `&Cx` and the
+//! one grant it uses, `out: Out` (D104), and writes its line through it. Which it writes when no edition is asked is
 //! [`default_edition`]. cargo runs rustfmt on the source file it writes, which is formatted already;
 //! blaze runs no rustfmt. A git repository is made by `git init`, where cargo has libgit2.
 //!
@@ -63,11 +63,12 @@ pub fn default_edition(bstd: bool) -> &'static str {
     }
 }
 
-/// The `main.rs` of a package of a blaze edition: its world as parameters, its line through
-/// the `Out` capability, any error of either call returned to the entry.
+/// The `main.rs` of a package of a blaze edition: each grant it uses named as a parameter
+/// (D104: here only standard output, `out: Out`), its line through it, the write's error
+/// returned to the entry.
 const BLAZE_MAIN: &str = "\
-fn main(cx: &Cx, io: Io) -> Result<(), Error> {
-    io.need_out()?.line(cx, \"Hello, world!\")?;
+fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+    out.line(cx, \"Hello, world!\")?;
     Ok(())
 }
 ";

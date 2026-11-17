@@ -163,22 +163,53 @@ pub(crate) fn check_rounds<'n, S: NamesSource<'n>>(
     r: &mut Records<'_, 'n, S>,
     body: &Body<'_>,
     scope: &BodyScope<'_>,
+    count: Option<(&mut tc::Tally, &dyn tc::Clock)>,
+    asked: Option<&mut super::reads::Asked<'_>>,
+) -> Result<tc::Checked<'static>, CheckFail> {
+    check_rounds_as(r, body, scope, count, asked, super::stalled_goals::Stalls::Gap)
+}
+
+/// [`check_rounds`] with the check's entry for an auto-trait goal of an async block's future
+/// that fails only on the superset interior named (front2 stalled_goals.rs `Stalls`): only
+/// `ProjectWorld::check_borrows` passes `Stalls::Decide`, and it decides every stalled row.
+pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    body: &Body<'_>,
+    scope: &BodyScope<'_>,
     mut count: Option<(&mut tc::Tally, &dyn tc::Clock)>,
     mut asked: Option<&mut super::reads::Asked<'_>>,
+    stalls: super::stalled_goals::Stalls,
 ) -> Result<tc::Checked<'static>, CheckFail> {
     let owner = body.typeck.owner;
     let mut hints = Needs::new_in(Alloc::global());
     let mut all_gaps: Vec<Gap, Global> = Vec::new_in(Global);
+    // The opaques whose hidden types this check reads, grown only by its own gaps
+    // (front2/opaque_auto.rs): its answers never depend on what was checked before it.
+    let mut leaks = r.store.hidden.new_leaks();
     for round in 0..MOST_ROUNDS {
+        r.store.hidden.set_leaking(&leaks);
         let tys = body.tys.view(&r.store.tys).map_err(|error| CheckFail::Check { owner, error })?;
         let view: BodyView<'_> = body.typeck.view(tys);
         let world = world_at(r, scope);
         let mut cx = InferCtx::new_in(Alloc::global());
         let out = match &mut count {
             Some((tally, clock)) => tc::check_counted(&view, &world, &mut cx, &hints, tally, *clock, Alloc::global()),
+            // Stalled goals decided after the async bodies' flows (front2 stalled_goals.rs).
+            None if stalls == super::stalled_goals::Stalls::Decide => tc::check_deferring(&view, &world, &mut cx, &hints, Alloc::global()),
             None => tc::check(&view, &world, &mut cx, &hints, Alloc::global()),
-        }
-        .map_err(|error| CheckFail::Check { owner, error })?;
+        };
+        // An auto trait of another fn's opaque: its defining body filed (checked only if no
+        // clean check of it is filed yet), the opaque leaked to this check, the round again.
+        let out = match out {
+            Ok(out) => out,
+            Err(error) => {
+                drop(world);
+                if super::opaque_auto::after_auto_gap(r, owner, &error, &mut leaks)? {
+                    continue;
+                }
+                return Err(CheckFail::Check { owner, error });
+            }
+        };
         if let Some((tally, _)) = &mut count {
             cx.add_solver_counts(&mut tally.solve);
         }
@@ -296,23 +327,29 @@ pub(crate) fn item_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>,k: ItemK
 /// text as filed in `store.fns` (front2/anon.rs `file_asked`), a member's container's path
 /// and its name; else that the store gives no path.
 pub(crate) fn key_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -> Box<str, Global> {
+    key_shown_in(r.names, &*r.keys, &*r.store, k)
+}
+
+/// [`key_shown`] over the parts a body's world holds (`BodyWorld`: its names, key map and
+/// store), for a gap that names an item (front2 foreign_closures.rs).
+pub(crate) fn key_shown_in<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, k: ItemKey) -> Box<str, Global> {
     let path_of = |lib: LibKey| -> Option<String> {
-        let name = r.names.name_of(lib)?;
-        Some(match r.names.home_of(lib).and_then(|m| r.names.module_path(m)) {
+        let name = names.name_of(lib)?;
+        Some(match names.home_of(lib).and_then(|m| names.module_path(m)) {
             Some(module) => format!("{module}::{name}"),
             None => String::from(name),
         })
     };
-    let shown = match r.keys.origin(k) {
-        Some(Origin::Member { kind: super::keys::MemberKind::Anon, .. }) => match r.store.fns.get(&k) {
+    let shown = match keys.origin(k) {
+        Some(Origin::Member { kind: super::keys::MemberKind::Anon, .. }) => match store.fns.get(&k) {
             Some(h) => format!("the anonymous constant `{}`", h.text),
             None => String::from("an anonymous constant not filed in the store"),
         },
-        Some(Origin::Member { container, name, .. }) => match r.keys.library_in(r.names, *container).and_then(path_of) {
+        Some(Origin::Member { container, name, .. }) => match keys.library_in(names, *container).and_then(path_of) {
             Some(c) => format!("`{c}::{name}`"),
             None => format!("`{name}` of {container:?}"),
         },
-        _ => match r.keys.library_in(r.names, k).and_then(path_of) {
+        _ => match keys.library_in(names, k).and_then(path_of) {
             Some(p) => format!("`{p}`"),
             None => String::from("no path in the store"),
         },
@@ -391,7 +428,7 @@ fn ty_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>,tys: tc::PTys<'_>, t:
 
 /// What a diagnostic is about, printed: an unmet goal entire, the leaf where-clause first when
 /// the checker names one (`Error: From<Other>` because `Result<u8, Error>: FromResidual<..>`).
-fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>,tys: tc::PTys<'_>, d: &tc::Diag) -> Box<str> {
+pub(super) fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>,tys: tc::PTys<'_>, d: &tc::Diag) -> Box<str> {
     let ty = |t: Option<tc::PTy>| t.map(|t| ty_shown(r, tys, t));
     let s = match d.because {
         Some(tc::Because::Unmet { goal, leaf }) => {
@@ -405,9 +442,15 @@ fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>,tys: tc::PTys<'_>, 
                     tc::UnmetGoal::Projection { name, term, .. } => format!("`<{self_} as {tr}>::{name:?} == {}`", ty_shown(r, tys, term)),
                 }
             };
-            match leaf {
+            let unmet = match leaf {
                 Some(l) => format!("{} because {}", shown(l), shown(goal)),
                 None => shown(goal),
+            };
+            // D104: the failed trait's own words first (the leaf's, the one a person fixes),
+            // the goal after them.
+            match trait_words(r, tys, leaf.unwrap_or(goal)) {
+                Some(words) => format!("{words} ({unmet})"),
+                None => unmet,
             }
         }
         Some(tc::Because::NoLangItem(l)) => format!("no lang item {l:?}"),
@@ -417,6 +460,55 @@ fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>,tys: tc::PTys<'_>, 
         None => format!("found {:?}, expected {:?}, name {:?}", ty(d.found), ty(d.expected), d.name),
     };
     s.into_boxed_str()
+}
+
+/// The words a trait gives by `#[diagnostic::on_unimplemented]` for its bound unmet at `g`
+/// ([`super::on_unimplemented`]): the message, `: ` the label, and `; note: ` each note, with
+/// `{Self}` the self type shown and `{This}` the trait's name. `None` when `g` is a projection
+/// or the trait has no such attribute (or no text). An attribute that does not read is said in
+/// the finding, never passed over.
+fn trait_words<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, tys: tc::PTys<'_>, g: tc::UnmetGoal) -> Option<String> {
+    use super::on_unimplemented::{Lit, Words, find, write_value};
+    let tc::UnmetGoal::Trait { trait_, args } = g else { return None };
+    let text = r.keys.library_in(r.names, trait_).and_then(|lib| r.names.text_of(lib))?;
+    let this = item_shown(r, trait_);
+    let self_ = tys.list(args).ok().and_then(|l| l.first().map(|&t| ty_shown(r, tys, t)));
+    let fill = |name: &str| match name {
+        "Self" => self_.as_deref(),
+        "This" => Some(this.as_str()),
+        _ => None,
+    };
+    let unread = |why: &dyn core::fmt::Display| Some(format!("the trait `{this}`'s `#[diagnostic::on_unimplemented]` does not read ({why})"));
+    let words = match find(text.text).and_then(|found| found.map(Words::of).transpose()) {
+        Ok(Some(words)) => words,
+        Ok(None) => return None,
+        Err(e) => return unread(&e),
+    };
+    let mut out = String::new();
+    let mut put = |lit: Lit<'_>, out: &mut String| match write_value(lit, 0, &fill, out) {
+        Ok(read) => read.map_err(|e| format!("{e}")),
+        Err(core::fmt::Error) => Err(String::from("a String refused a write")),
+    };
+    let mut wrote = Ok(());
+    match words.message {
+        Some(message) => wrote = put(message, &mut out),
+        None => out.push_str("an unmet bound"),
+    }
+    if let Some(label) = words.label {
+        out.push_str(": ");
+        wrote = wrote.and_then(|()| put(label, &mut out));
+    }
+    let notes = words.notes(|note| {
+        out.push_str("; note: ");
+        if wrote.is_ok() {
+            wrote = put(note, &mut out);
+        }
+    });
+    match (notes, wrote) {
+        (Ok(()), Ok(())) => Some(out),
+        (Err(e), _) => unread(&e),
+        (_, Err(e)) => unread(&e),
+    }
 }
 
 /// The world a body written at `scope` is checked in, over `r`'s records as they are now.
@@ -645,6 +737,12 @@ pub fn eval_len<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,c: LibKey) ->
     if r.consts.is_some() && super::const_qpath::eval_asked(r, c) {
         return Ok(());
     }
+    // An inherent constant leaf (`Self::MAX_SIZE`: front2/const_inherent.rs) is answered by
+    // the impl member constant's evaluation, every asked leaf in the same round, its refusal
+    // filed for the head that wrote it.
+    if r.consts.is_some() && super::const_inherent::eval_asked(r, c) {
+        return Ok(());
+    }
     let Some((consts, prepared)) = r.consts.take() else {
         return Err(ConstFail::Nested { item: checker_of(c), shown: key_shown(r, checker_of(c)) });
     };
@@ -802,7 +900,7 @@ fn lower_heads<'n, S: NamesSource<'n>>(names: S, keys: &mut Keys, store: &mut St
                 // A refused candidate is a named gap of the questions it is a candidate of
                 // (`Gap::RefusedImpl`, `Gap::UnreadImpl`), never left out of their answers and
                 // never the end of a body that asks none of them.
-                Err(e) => b.fail(k, format!("{e}").into_boxed_str()),
+                Err(e) => b.fail(k, super::header_written::head_failed(names, k, &e)),
             }
         }
     }

@@ -16,15 +16,17 @@
 //!   `out` is standard output, `err` standard error, and an `Out` of any other name is a
 //!   compile error ([`Param::new`] is evaluated as the crate compiles). One type for one kind,
 //!   and the name is what the spec and the command line say anyway.
-//! - [`Io`] is a `Grant` of [`Kind::Everything`], so `fn main(cx: &Cx, io: Io)` keeps working
-//!   and is named as taking everything. Started with no run spec (an ordinary start, from a
-//!   shell), it is filled with the process's world, as before; started with one, it needs the
-//!   grant `everything` like any other.
+//! - **A whole world cannot be asked for** (D104): [`Io`] is not a `Grant`. A `main` names each
+//!   capability it uses, so its manifest says what it reaches and anything else can be withheld;
+//!   `fn main(cx: &Cx, io: Io)` is a compile error at `Io`, whose note names what to write.
+//!   `Io` stays bstd's own world handle (the launcher makes every grant from it) and a test's
+//!   simulated world.
 //! - [`Manifest`] is the program's list of parameters, each one's name and kind: a `static` in
 //!   the binary, printed as JSON when file descriptor 3 asks (`bstd manifest`), so a tool learns
 //!   what a built program takes without running its `main`.
 //! - [`Given`] is the launcher's side: every parameter is made from the spec before `main`
-//!   runs; every problem (no grant, a grant of the wrong kind, one that would widen, one for a
+//!   runs, ONCE: its check is its making, and `main` is handed what the check made
+//!   ([`Checking`], [`Filled`]); every problem (no grant, a grant of the wrong kind, one that would widen, one for a
 //!   parameter `main` lacks, a capability the host does not offer) is collected, and then all
 //!   are printed at once, each with the line that fixes it, and the program exits
 //!   [`Status::REFUSED`] without starting `main`. Nothing prompts.
@@ -47,6 +49,33 @@ use crate::{
     spec::{Granted, Layers, Provider, RunSpec, Scope},
 };
 
+mod compose;
+mod defaults;
+mod made;
+mod one_device;
+
+pub use compose::{
+    Alternatives, Chosen2, Chosen3, Chosen4, Connect, Form, Listen, Many, Maybe, Narrow, OneOf, START_FOLDER, is_grant_name, member_of,
+};
+pub use defaults::{OrdinaryError, Shape, Spelling, ordinary_grants};
+pub use made::{Checking, Filled};
+pub use one_device::{BY_MACHINE, ONE_DEVICE, is_whole_capability, narrows_to_device};
+
+/// The alternative a `--grant` value names, for spec.rs `grant_arg` (compose.rs `alternative_of`).
+pub fn compose_alternative<'v>(kinds: &[Kind], value: &'v str) -> Option<(Kind, &'v str)> {
+    compose::alternative_of(kinds, value)
+}
+
+/// The scope a `--grant` value gives a kind, for spec.rs `grant_arg` (compose.rs `scope_of`).
+pub fn compose_scope<A: Allocator + Clone>(
+    kind: Kind,
+    narrow: Narrow,
+    value: &str,
+    alloc: A,
+) -> Result<Scope<A>, crate::spec::GrantArgError> {
+    compose::scope_of(kind, narrow, value, alloc)
+}
+
 /// The allocator a launcher's spec and problems are in: the heap's handle, which the entry
 /// (`rt::launch`, or a test through [`crate::entry::launch_in`]) hands down (D102).
 pub type LaunchAlloc = SharedAlloc<'static>;
@@ -58,6 +87,9 @@ pub enum Kind {
     Args,
     /// Standard output (named `out`) or standard error (named `err`). Fills itself.
     Out,
+    /// Standard input ([`crate::input::In`]), named `input` (`in` is Rust's keyword). Fills
+    /// itself: the process's own stream reaches nothing outside it.
+    In,
     /// The clock ([`crate::clock::Clock`]). Fills itself.
     Clock,
     /// Named arenas ([`crate::mem::Mem`]). Fills itself.
@@ -70,8 +102,6 @@ pub enum Kind {
     Net,
     /// Named environment variables ([`crate::env::Env`]).
     Env,
-    /// Everything: [`Io`], a script's world.
-    Everything,
     /// One root capability whole, by its name in [`crate::io::Offers::NAMES`].
     Whole(&'static str),
 }
@@ -80,11 +110,11 @@ impl Kind {
     /// Whether a parameter of this kind is filled with no grant: it reaches nothing outside
     /// the process.
     pub const fn fills_itself(self) -> bool {
-        matches!(self, Kind::Args | Kind::Out | Kind::Clock | Kind::Mem | Kind::Spec)
+        matches!(self, Kind::Args | Kind::Out | Kind::In | Kind::Clock | Kind::Mem | Kind::Spec)
     }
 
     /// The kinds that fill themselves ([`Kind::fills_itself`]).
-    pub const FILLS_ITSELF: [Kind; 5] = [Kind::Args, Kind::Out, Kind::Clock, Kind::Mem, Kind::Spec];
+    pub const FILLS_ITSELF: [Kind; 6] = [Kind::Args, Kind::Out, Kind::In, Kind::Clock, Kind::Mem, Kind::Spec];
 
     /// Whether the kind named `name` in the manifest's JSON (and on the hosted wire) fills
     /// itself: what a host answers with no grant (crate::hosting's `grant`).
@@ -97,13 +127,13 @@ impl Kind {
         match self {
             Kind::Args => "args",
             Kind::Out => "out",
+            Kind::In => "in",
             Kind::Clock => "clock",
             Kind::Mem => "mem",
             Kind::Spec => "spec",
             Kind::Dir { .. } => "dir",
             Kind::Net => "net",
             Kind::Env => "env",
-            Kind::Everything => "everything",
             Kind::Whole(_) => "whole",
         }
     }
@@ -114,9 +144,8 @@ impl Kind {
             Kind::Dir { .. } => "<folder>",
             Kind::Net => "<host>:<port>",
             Kind::Env => "<NAME>,<NAME>",
-            Kind::Everything => "everything",
             Kind::Whole(_) => "whole",
-            Kind::Args | Kind::Out | Kind::Clock | Kind::Mem | Kind::Spec => "",
+            Kind::Args | Kind::Out | Kind::In | Kind::Clock | Kind::Mem | Kind::Spec => "",
         }
     }
 
@@ -125,6 +154,7 @@ impl Kind {
         match self {
             Kind::Args => "Args",
             Kind::Out => "Out",
+            Kind::In => "In",
             Kind::Clock => "Clock",
             Kind::Mem => "Mem",
             Kind::Spec => "Spec",
@@ -132,17 +162,19 @@ impl Kind {
             Kind::Dir { write: true } => "Dir<ReadWrite>",
             Kind::Net => "Net",
             Kind::Env => "Env",
-            Kind::Everything => "Io",
             Kind::Whole(name) => name,
         }
     }
 }
 
-/// One parameter of `main`: its name and its kind.
+/// One parameter of `main`: its name, its kind, and how it takes its grants (compose.rs: one,
+/// optional, one of, many; a network direction). [`Param::of`] reads all from the type.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Param {
     pub name: &'static str,
     pub kind: Kind,
+    pub form: Form,
+    pub narrow: Narrow,
 }
 
 const fn same(a: &str, b: &str) -> bool {
@@ -167,10 +199,13 @@ impl Param {
         if matches!(kind, Kind::Out) && !same(name, "out") && !same(name, "err") {
             panic!("an `Out` parameter of `main` is named `out` (standard output) or `err` (standard error)");
         }
+        if matches!(kind, Kind::In) && !same(name, "input") {
+            panic!("an `In` parameter of `main` (standard input) is named `input`");
+        }
         if !crate::spec::is_name(name) {
             panic!("a parameter of `main` is named by ASCII letters, digits and `_`, at most 64 bytes");
         }
-        Param { name, kind }
+        Param { name, kind, form: Form::One, narrow: Narrow::None }
     }
 }
 
@@ -179,11 +214,14 @@ impl Param {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Manifest {
     pub params: &'static [Param],
+    /// The attribute's defaults of an ordinary start (defaults.rs), checked by
+    /// [`Manifest::with_defaults`]; none unless the attribute spells some.
+    pub defaults: &'static [Spelling],
 }
 
 impl Manifest {
     pub const fn new(params: &'static [Param]) -> Manifest {
-        Manifest { params }
+        Manifest { params, defaults: &[] }
     }
 
     /// The parameter named `name`.
@@ -208,8 +246,9 @@ impl Manifest {
                 Kind::Whole(capability) => {
                     map.insert(key("capability"), Value::Text(key(capability)));
                 }
-                Kind::Args | Kind::Out | Kind::Clock | Kind::Mem | Kind::Spec | Kind::Net | Kind::Env | Kind::Everything => {}
+                Kind::Args | Kind::Out | Kind::In | Kind::Clock | Kind::Mem | Kind::Spec | Kind::Net | Kind::Env => {}
             }
+            compose::write_shape(param, &mut map, a.clone());
             params.push(Value::Map(map));
         }
         let mut root = Map::new_in(a.clone());
@@ -272,6 +311,8 @@ pub enum Want {
     NotBuilt(&'static str),
     /// The grant was there and right, and making the capability failed: what was said.
     Failed(String<LaunchAlloc>),
+    /// A `OneOf` none of whose alternatives (these kinds, in written order) is granted.
+    NoneOf(&'static [Kind]),
 }
 
 /// One problem the launcher found: the parameter (or a grant's name), its kind, and what was
@@ -315,6 +356,7 @@ impl Problem {
                     Want::Failed(said) => {
                         out.str(said.as_str());
                     }
+                    Want::NoneOf(kinds) => compose::none_of_fix(name, kinds, out),
                 }
             }
             Problem::NoParam { name, given } => {
@@ -382,6 +424,8 @@ impl<R: Outcome> Outcome for Launched<R> {
 pub struct Granting<'g> {
     pub cx: &'g Cx,
     pub name: &'static str,
+    /// The grant's own name when it is not the parameter's: a [`Many`]'s member (`inputs.a`).
+    member: Option<&'g str>,
     given: &'g Given<'g>,
 }
 
@@ -391,9 +435,9 @@ impl<'g> Granting<'g> {
         self.given.spec.alloc()
     }
 
-    /// The spec's grant of this parameter's name.
+    /// The spec's grant of this parameter's name (of the member's, for a [`Many`]'s member).
     pub fn granted(&self) -> Option<&'g Granted<LaunchAlloc>> {
-        self.given.spec.get().grant(self.name)
+        self.given.spec.get().grant(self.member.unwrap_or(self.name))
     }
 
     /// How the program was started.
@@ -440,16 +484,26 @@ impl<'g> Granting<'g> {
     }
 }
 
-/// A type `main` may take after `cx` (the module's doc).
+/// A type `main` may take after `cx` (the module's doc). `Io` is not one (D104): the note says
+/// what to write instead, at the parameter.
 #[diagnostic::on_unimplemented(
     message = "`main` cannot take a `{Self}`",
     label = "not a capability `main` may take",
-    note = "the kinds: `Out` (named `out` or `err`), `Args`, `Clock`, `Mem`, `Spec` fill themselves; \
-            `Dir<ReadOnly>`, `Dir<ReadWrite>`, `Net`, `Env`, `Io` (everything) and the whole capabilities \
-            (`Fs`, `Rng`, `Host`, `Http`, ...) are granted by name (bstd::grant::Grant)"
+    note = "a `main` names each capability it uses; a whole world (`Io`) cannot be asked for. Write \
+            `out: Out` (standard output), `err: Out` (standard error), `args: Args`, `clock: Clock`, \
+            `mem: Mem`, `spec: Spec` or `input: In` (standard input), which fill themselves; or, granted by name, `data: Dir<ReadOnly>` \
+            or `Dir<ReadWrite>` (a folder), `api: Net` (one endpoint), `env: Env` (named variables), \
+            or a whole capability (`Fs`, `Rng`, `Host`, `Http`, ...) (bstd::grant::Grant)"
 )]
 pub trait Grant: Sized {
     const KIND: Kind;
+
+    /// How it takes its grants (compose.rs): one, needed, unless it is a `Maybe`, `OneOf` or
+    /// `Many`, whose form is checked here as the crate compiles.
+    const FORM: Form = Form::One;
+
+    /// The network direction its type says ([`Connect`], [`Listen`]).
+    const NARROW: Narrow = Narrow::None;
 
     /// The capability, made from what the launcher holds.
     fn grant(from: &Granting<'_>) -> Result<Self, Want>;
@@ -459,23 +513,6 @@ pub trait Grant: Sized {
     fn hosted(io: &Io, name: &str) -> Option<Self> {
         let _ = (io, name);
         None
-    }
-}
-
-impl Grant for Io {
-    const KIND: Kind = Kind::Everything;
-
-    fn grant(from: &Granting<'_>) -> Result<Io, Want> {
-        match from.started() {
-            // clone: the world's handle, as `run_in` hands one.
-            Started::Ordinary => Ok(from.process().clone()),
-            Started::WithSpec => from.scope("everything").map(|(_, io)| io.clone()),
-        }
-    }
-
-    fn hosted(io: &Io, _: &str) -> Option<Io> {
-        // clone: the world's handle.
-        Some(io.clone())
     }
 }
 
@@ -551,6 +588,9 @@ fn granted_dir(from: &Granting<'_>, wants_write: bool) -> Result<Dir<ReadWrite>,
         blaze_text::PutDisplay::put_display(&mut said, why);
         Want::Failed(said)
     };
+    if path.as_str() == START_FOLDER {
+        return Ok(fs.root());
+    }
     let path = Path::new(path.as_str()).map_err(|why| failed(&why))?;
     fs.open_dir(from.cx, &path).map_err(|why| failed(&why))
 }
@@ -615,9 +655,20 @@ macro_rules! whole {
             const KIND: Kind = Kind::Whole($name);
 
             fn grant(from: &Granting<'_>) -> Result<$ty, Want> {
+                // An ordinary start: the person who typed the command runs it with their own
+                // authority, so a whole capability the manifest names is the process's; the
+                // manifest's work there is to drop what `main` did not name (coordinator's
+                // decision 1, 2026-11-16). A spec start gives only what it grants.
+                if from.started() == Started::Ordinary {
+                    return from.process().$need().map_err(Want::NotOffered);
+                }
                 let (scope, io) = from.scope("whole")?;
                 match scope {
-                    Scope::Whole { capability } if capability.as_str() == $name => io.$need().map_err(Want::NotOffered),
+                    Scope::Whole { capability, device: None } if capability.as_str() == $name => io.$need().map_err(Want::NotOffered),
+                    // One device of a capability this type cannot narrow to a device.
+                    Scope::Whole { capability, device: Some(_) } if capability.as_str() == $name => {
+                        Err(Want::WrongKind { given: "device" })
+                    }
                     _ => Err(Want::WrongKind { given: scope.kind_name() }),
                 }
             }
@@ -627,6 +678,7 @@ macro_rules! whole {
 
 whole! {
     crate::fs::Fs => "fs", need_fs;
+    crate::network::Network => "net", need_network;
     crate::rng::Rng => "rng", need_rng;
     crate::host::Host => "host", need_host;
     crate::streams::Streams => "streams", need_streams;
@@ -641,14 +693,11 @@ whole! {
     crate::opener::Opener => "opener", need_opener;
     crate::power::Power => "power", need_power;
     crate::audio::Audio => "audio", need_audio;
-    crate::device::Camera => "camera", need_camera;
     crate::device::Screen => "screen", need_screen;
     crate::device::Location => "location", need_location;
-    crate::device::Bluetooth => "bluetooth", need_bluetooth;
-    crate::device::Usb => "usb", need_usb;
-    crate::device::Serial => "serial", need_serial;
     crate::device::Clipboard => "clipboard", need_clipboard;
     crate::device::Notify => "notify", need_notify;
+    crate::gpu::Gpu => "gpu", need_gpu;
 }
 
 // Requests, behind bstd's `net` feature.
@@ -657,8 +706,9 @@ whole! {
     crate::requests::Http => "http", need_http;
 }
 
-/// The launcher's state while it fills `main`'s parameters: the macro checks each, then
-/// makes each once every check passed.
+/// The launcher's state while it fills `main`'s parameters: the spec, the worlds and the
+/// manifest each parameter is made from. [`Given::checking`] (made.rs) checks each parameter by
+/// MAKING it, once, and keeps what it made for `main` (rule 74).
 pub struct Given<'g> {
     cx: &'g Cx,
     real: &'g Io,
@@ -666,12 +716,6 @@ pub struct Given<'g> {
     spec: &'g Spec,
     started: Started,
     manifest: &'static Manifest,
-    problems: Vec<Problem, LaunchAlloc>,
-}
-
-/// Proof that every parameter of `main` passed its check: what [`Filled::make`] takes.
-pub struct Filled<'f> {
-    given: &'f Given<'f>,
 }
 
 impl<'g> Given<'g> {
@@ -683,72 +727,46 @@ impl<'g> Given<'g> {
         started: Started,
         manifest: &'static Manifest,
     ) -> Given<'g> {
-        Given { cx, real, fake, spec, started, manifest, problems: Vec::new_in(spec.alloc()) }
-    }
-
-    /// The parameter `name` of type `T` made and dropped: a problem it has is kept.
-    pub fn check<T: Grant>(&mut self, name: &'static str) {
-        let made = T::grant(&Granting { cx: self.cx, name, given: self });
-        if let Err(want) = made {
-            self.problems.push(Problem::Param { name, kind: T::KIND, want });
-        }
-    }
-
-    /// Every check passed, and the spec grants nothing `main` does not take: the proof the
-    /// parameters are made with; else every problem.
-    pub fn filled(&mut self) -> Result<Filled<'_>, Refused> {
-        for granted in self.spec.get().grants.iter() {
-            if self.manifest.param(granted.name.as_str()).is_none() {
-                // clone: a grant's name, for its problem.
-                let name = String::from_str_in(granted.name.as_str(), self.spec.alloc());
-                self.problems.push(Problem::NoParam { name, given: granted.scope.kind_name() });
-            }
-        }
-        match self.problems.is_empty() {
-            true => Ok(Filled { given: self }),
-            false => {
-                let problems = core::mem::replace(&mut self.problems, Vec::new_in(self.spec.alloc()));
-                Err(Refused { problems, started: self.started })
-            }
-        }
-    }
-}
-
-impl Filled<'_> {
-    pub fn cx(&self) -> &Cx {
-        self.given.cx
-    }
-
-    /// The parameter `name` of type `T`: its check passed, and making it again from the same
-    /// spec and worlds gives it (a grant's making is a function of them).
-    pub fn make<T: Grant>(&self, name: &'static str) -> T {
-        match T::grant(&Granting { cx: self.given.cx, name, given: self.given }) {
-            Ok(made) => made,
-            Err(want) => unreachable!("bstd::grant: `{name}` passed its check and then failed: {want:?}"),
-        }
+        Given { cx, real, fake, spec, started, manifest }
     }
 }
 
 /// What a launcher does before `main`, once it knows what file descriptor 3 held.
 pub enum Prepared {
-    /// Run `main` with this spec: the fake world made when the spec asks for one.
-    Run { spec: Spec, started: Started, fake: Option<Io> },
+    /// Run `main` with this spec: the fake world made when the spec asks for one, and how many
+    /// arguments after the program's name an ordinary start's `--grant`s took (0 with a spec).
+    Run { spec: Spec, started: Started, fake: Option<Io>, taken: usize },
     /// Print this manifest and exit [`Status::OK`].
     Manifest(String<LaunchAlloc>),
     /// Exit [`Status::REFUSED`], saying this.
     Refuse(String<LaunchAlloc>),
 }
 
-/// The launcher's decision from what file descriptor 3 held (`None`: it was closed) and the
-/// spec of an ordinary start (`defaults`); what it makes is in `alloc`, the entry's (D102).
+/// The launcher's decision from what file descriptor 3 held (`None`: it was closed), the spec
+/// of an ordinary start (`defaults`) and its command line (`args`, the program's name first:
+/// its leading `--grant`s, then the attribute's defaults, are an ordinary start's grants,
+/// defaults.rs); what it makes is in `alloc`, the entry's (D102).
 pub fn prepare(
     manifest: &'static Manifest,
     delivered: Option<&[u8]>,
     defaults: impl FnOnce() -> RunSpec<LaunchAlloc>,
+    args: &[&str],
     alloc: LaunchAlloc,
 ) -> Prepared {
+    let mut taken = 0;
     let (spec, started) = match delivered {
-        None => (defaults(), Started::Ordinary),
+        None => {
+            let mut spec = defaults();
+            match ordinary_grants(manifest, args, &mut spec, alloc) {
+                Ok(took) => taken = took,
+                Err(why) => {
+                    let mut said = String::new_in(alloc);
+                    blaze_text::PutDisplay::put_display(&mut said, &why);
+                    return Prepared::Refuse(said);
+                }
+            }
+            (spec, Started::Ordinary)
+        }
         Some(bytes) => match crate::spec::read_delivery(bytes, alloc) {
             Ok(crate::spec::Asked::Manifest) => return Prepared::Manifest(manifest.write(alloc)),
             Ok(crate::spec::Asked::Run(spec)) => (spec, Started::WithSpec),
@@ -765,7 +783,7 @@ pub fn prepare(
         world.args = spec.args.iter().map(|arg| arg.as_str().into()).collect();
         Io::simulated(world)
     });
-    Prepared::Run { spec: Spec::new(spec, alloc), started, fake }
+    Prepared::Run { spec: Spec::new(spec, alloc), started, fake, taken }
 }
 
 /// Whether the run or any grant asks for the fake provider.

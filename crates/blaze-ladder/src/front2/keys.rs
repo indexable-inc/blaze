@@ -9,7 +9,6 @@
 //! map, so one table answers "what is this checker key".
 
 use std::alloc::Global;
-use std::boxed::Box;
 
 use blaze_hash::HashMap;
 use blaze_id::ItemKey as LibKey;
@@ -63,6 +62,10 @@ impl core::fmt::Display for KeyClash {
 /// The map from checker keys to what they stand for.
 pub struct Keys {
     origins: HashMap<ItemKey, Origin, Global>,
+    /// The kind of each item declared in a body ([`Keys::local`]): the names library keys no
+    /// such item and holds no outline entry for it, so what it is is told here, beside its
+    /// origin, and never guessed from a missing entry.
+    locals: HashMap<ItemKey, super::locals::LocalKind, Global>,
 }
 
 /// The checker key of a library key: its first 16 bytes.
@@ -75,7 +78,7 @@ pub fn checker_of(key: LibKey) -> ItemKey {
 
 impl Keys {
     pub fn new() -> Keys {
-        Keys { origins: HashMap::new_in(Global) }
+        Keys { origins: HashMap::new_in(Global), locals: HashMap::new_in(Global) }
     }
 
     /// Files `key` and returns its checker key; a different library key already filed under
@@ -95,6 +98,24 @@ impl Keys {
     pub fn filed_member(&self, container: ItemKey, kind: MemberKind, name: &str) -> Option<ItemKey> {
         let k = member_key(container, kind, name);
         self.origins.contains_key(&k).then_some(k)
+    }
+
+    /// Files the item `key` declared in a body (front2 locals.rs `Locals::keep`; its key is
+    /// derived by nested_exports.rs `local_key`) with what kind of item it is, and returns its
+    /// checker key. Its origin is [`Origin::Item`] like a module item's; its kind is read by
+    /// [`Keys::local_kind`] (front2 by_origin.rs `kind_of_key`), since the names library holds
+    /// no outline entry for it. The kind is a part of the key's derivation (its tag), so one
+    /// key is never filed with two kinds.
+    pub fn local(&mut self, key: LibKey, kind: super::locals::LocalKind) -> Result<ItemKey, KeyClash> {
+        let k = self.item(key)?;
+        self.locals.insert(k, kind);
+        Ok(k)
+    }
+
+    /// The kind of the body-local item `key` if [`Keys::local`] filed it; `None` for every
+    /// other key.
+    pub fn local_kind(&self, key: ItemKey) -> Option<super::locals::LocalKind> {
+        self.locals.get(&key).copied()
     }
 }
 

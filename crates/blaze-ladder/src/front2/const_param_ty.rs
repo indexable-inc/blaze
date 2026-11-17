@@ -171,7 +171,7 @@ pub(super) fn admits(tys: &PortableTys<'_>, t: PTy, alloc: Alloc<'_>) -> Result<
             PNode::Ptr(..) => return Err(NotConstParamTy::RawPointer),
             PNode::FnPtr(..) | PNode::FnDef(..) => return Err(NotConstParamTy::Fn),
             PNode::Never => return Err(NotConstParamTy::Never),
-            PNode::Closure { .. } | PNode::Future(..) => return Err(NotConstParamTy::Closure),
+            PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } => return Err(NotConstParamTy::Closure),
             PNode::Dynamic(_) => return Err(NotConstParamTy::TraitObject),
             PNode::Param(_) | PNode::ConstParam(_) => return Err(NotConstParamTy::Parameter),
             PNode::Alias { .. } | PNode::Opaque(..) => return Err(NotConstParamTy::Projection),

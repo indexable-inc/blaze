@@ -25,7 +25,8 @@
 use blaze_own::{AVec, Alloc, Vec};
 
 use crate::Platform;
-use crate::image::{DESCRIPTOR_LEN, DESCRIPTOR_MAGIC, FixTo, Fixup, Image, Import, Placed, Region, TlsReloc, descriptor_name};
+use crate::descriptor::{Descriptor, MAGIC as DESCRIPTOR_MAGIC, NAME_ROW_LEN, POINTER_ROW_LEN};
+use crate::image::{DESCRIPTOR_LEN, FixTo, Fixup, Image, Import, Placed, Region, TlsReloc, descriptor_name};
 use crate::object::{Bind, Def, Reloc, RelocKind, RelocTo, SectionKind};
 use crate::resolve::{Input, Origin, Plan, Resolution};
 use crate::unwind::{self, Row, UnwindInfoError};
@@ -67,6 +68,10 @@ pub enum LayoutError<'a> {
     Unwind { from: Origin<'a>, why: &'static str }, Alloc,
     Unplaced { name: &'a [u8], from: Origin<'a> },
     UnknownLayout { page: u64, header_reserve: u64 },
+    /// The descriptor reserved `counted` pointer rows (the relocations whose target is a Rust
+    /// word) and relocation made `found` `FixTo::Word` fixups: the count's test and `apply`'s
+    /// disagree (BNL2, descriptor.rs).
+    PointerRows { counted: u32, found: u32 },
 }
 
 /// An allocation the caller's allocator refused.
@@ -359,6 +364,21 @@ impl<'p, 'a> Lay<'p, 'a> {
                 Ok((t, name))
             }
         }
+    }
+
+    /// The pointer rows BNL2 reserves: every 64-bit absolute relocation whose target is a Rust
+    /// word (the case `apply` records as a `FixTo::Word` fixup), counted before any address is
+    /// known, so the rows sit right after the descriptor; [`LayoutError::PointerRows`] if
+    /// relocation finds another number.
+    fn count_word_pointers(&self) -> Result<u32, LayoutError<'a>> {
+        let mut n: u32 = 0;
+        self.each_reloc(|me, o, _s, _index, r| {
+            if matches!(r.kind, RelocKind::Abs64) && matches!(me.target_raw(o, r.to, r.addend), Ok((Target::Rust { .. }, _))) {
+                n += 1;
+            }
+            Ok(())
+        })?;
+        Ok(n)
     }
 
     /// `target_raw`, refusing a place the layout did not lay.
@@ -1144,11 +1164,22 @@ pub fn lay<'a>(plan: &Plan<'a>, inputs: &[Input<'a>], layout: Layout, alloc: All
     }
     let got_log2 = if me.cells.iter().any(|c| matches!(c, Cell::TlsDesc(_))) { 4 } else { 3 };
     at = me.set_region(Region::Got, got_at, cell - got_at, got_log2);
-    // Data: the descriptor first, then the members' data.
+    // Data: on a new page after a non-empty Got (so a writer maps the Got alone, read-only once
+    // bound: W4's `__DATA_CONST`, W5's `PT_GNU_RELRO`), the descriptor first, then the members'
+    // data. An empty Got leaves `at` on its page already.
     let data_log2 = me.region_align(Region::Data);
-    let descriptor_at = align(at, data_log2.max(3));
+    let descriptor_at = align(at.next_multiple_of(layout.page), data_log2.max(3));
     me.regions[ri(Region::Data)].2 = data_log2.max(3);
-    at = me.place(Region::Data, descriptor_at + DESCRIPTOR_LEN);
+    // BNL2 (descriptor.rs): the descriptor, its names table (word order: rows, then the
+    // bytes), its pointer rows (8-aligned), then the members' data.
+    let mut names_len = NAME_ROW_LEN * plan.words.len() as u64;
+    for w in plan.words.iter() {
+        names_len += w.len() as u64;
+    }
+    let pointers = me.count_word_pointers()?;
+    let name_at = descriptor_at + DESCRIPTOR_LEN;
+    let pointer_at = align(name_at + names_len, 3);
+    at = me.place(Region::Data, pointer_at + POINTER_ROW_LEN * u64::from(pointers));
     let data_end = at;
     me.regions[ri(Region::Data)].0 = descriptor_at;
     me.regions[ri(Region::Data)].1 = data_end - descriptor_at;
@@ -1219,13 +1250,30 @@ pub fn lay<'a>(plan: &Plan<'a>, inputs: &[Input<'a>], layout: Layout, alloc: All
         k += 1;
         me.write_x16(veneer_at, X16_ADD, dest, 0).ok_or(LayoutError::OutOfRange { kind: RelocKind::Page21, from: me.origin(0), offset: 0 })?;
     }
-    // The descriptor (NATIVE.md 3.4): image-relative numbers, so it needs no fixup.
-    me.put32(descriptor_at, DESCRIPTOR_MAGIC);
-    me.put32(descriptor_at + 4, plan.words.len() as u32);
-    me.put32(descriptor_at + 8, inits as u32);
-    me.put32(descriptor_at + 12, 0);
-    me.put64(descriptor_at + 16, me.words_at);
-    me.put64(descriptor_at + 24, inits_at);
+    // The descriptor (BNL2, descriptor.rs): image-relative numbers, so it needs no fixup.
+    let descriptor = Descriptor {
+        magic: DESCRIPTOR_MAGIC,
+        words: plan.words.len() as u32,
+        inits: inits as u32,
+        pointers,
+        word_at: me.words_at,
+        init_at: inits_at,
+        pointer_at,
+        name_at,
+    };
+    let d = descriptor.to_bytes();
+    let i = (descriptor_at - layout.header_reserve) as usize;
+    me.bytes[i..i + d.len()].copy_from_slice(&d);
+    // The names table: row k is (offset from `name_at`, length) of word k's name.
+    let mut text = NAME_ROW_LEN * plan.words.len() as u64;
+    for (k, w) in plan.words.iter().enumerate() {
+        let row = name_at + NAME_ROW_LEN * k as u64;
+        me.put32(row, text as u32);
+        me.put32(row + 4, w.len() as u32);
+        let j = (name_at + text - layout.header_reserve) as usize;
+        me.bytes[j..j + w.len()].copy_from_slice(w);
+        text += w.len() as u64;
+    }
 
     // Every relocation, then the GOT.
     let mut sites: AVec<'a, (u32, u32, u32)> = Vec::new_in(alloc);
@@ -1235,6 +1283,25 @@ pub fn lay<'a>(plan: &Plan<'a>, inputs: &[Input<'a>], layout: Layout, alloc: All
         me.apply(o, s, &r)?;
     }
     me.fill_got()?;
+    // BNL2's pointer rows: each `FixTo::Word` cell (C data holding a Rust function's address),
+    // sorted by cell; the launcher writes each with its word's slot thunk (one address per
+    // function).
+    let mut rows: AVec<'a, (u64, u32)> = Vec::new_in(alloc);
+    for f in me.fixups.iter() {
+        if let FixTo::Word { index } = f.to {
+            push(&mut rows, (f.at, index))?;
+        }
+    }
+    if rows.len() as u64 != u64::from(pointers) {
+        return Err(LayoutError::PointerRows { counted: pointers, found: rows.len() as u32 });
+    }
+    rows.sort_unstable();
+    for (k, &(cell, word)) in rows.iter().enumerate() {
+        let row = pointer_at + POINTER_ROW_LEN * k as u64;
+        me.put64(row, cell);
+        me.put32(row + 8, word);
+        me.put32(row + 12, 0);
+    }
 
     // The unwind index, now that every address is known.
     let unwind_at = me.region_at(Region::UnwindInfo);

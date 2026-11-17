@@ -1,0 +1,241 @@
+//! The move and borrow check's reads, filed in the body's read list (front2 reads.rs) beside
+//! the type check's (rule 21, keys cover every input).
+//!
+//! The borrow verdict of a body reads facts the type check's list may not hold: whether each
+//! ADT the body's types name is `Copy` and implements `Drop`, its fields and whether its head
+//! declares lifetimes, and each callee's (and the owner's) signature as its TEXT says it (the
+//! lifetime part `read_signature` reads, whether it writes a lifetime, whether it takes
+//! `&self`). The type check asks none of that for a body that only moves a value: an ADT that
+//! gains `impl Copy` (or a callee whose head gains `<'a>`) left the body's list, and so its
+//! digest, unchanged, while its borrow notes changed. Each such fact is now a row:
+//!
+//! - [`FactKind::BorrowAdt`] about the ADT: its answer the digest of what the borrow check took
+//!   (made or not; `Copy` and `Drop` as answered, unknown included; the flags; each variant's
+//!   field names in order);
+//! - [`FactKind::BorrowHead`] about the fn: its answer the digest of the head as the borrow check
+//!   read it (made or not; the two callee flags; the lifetime part read, or why it was refused;
+//!   each ADT the reading asked about and whether its head declares lifetimes).
+//!
+//! The answer is a digest of the borrow check's OWN derived facts, not of the text they came
+//! from, so an edit inside a callee's body (which its item text holds) moves no caller's list.
+//! These rows are made where the facts are gathered (borrows.rs `gather_facts`: one home) and
+//! filed by [`file_borrow_reads`] into the verdict of [`super::project::ProjectWorld::check_borrows`];
+//! a body whose types were not checked clean was not borrow checked and lists none.
+
+use core::cell::RefCell;
+
+use blaze_flow_lower::{AdtFacts, CalleeFacts, Region, SigLife, SigRefusal};
+use blaze_own::{AVec, Alloc};
+use blaze_typeck as tc;
+use blaze_typeck::StableHasher;
+
+use super::project::BodyVerdict;
+use super::reads::{Fact, FactKind, Read, ReadsError};
+
+/// The domain of a [`FactKind::BorrowAdt`] answer.
+const ADT_DOMAIN: &str = "blaze-ladder front2 borrow adt read v1";
+/// The domain of a [`FactKind::BorrowHead`] answer.
+const HEAD_DOMAIN: &str = "blaze-ladder front2 borrow head read v1";
+
+/// What the borrow check took about one ADT.
+pub enum AdtAnswer<'f> {
+    /// The store could not make its row: the lowering refuses a body that needs it.
+    NotMade,
+    Made {
+        /// `Copy` as the selection answered it (`None`: not known).
+        copy: Option<bool>,
+        /// `Drop` as the selection answered it (`None`: not known).
+        drop_impl: Option<bool>,
+        facts: AdtFacts,
+        /// Its variants in order, each as the number of its fields; their names, in order, are
+        /// `fields`, variant after variant.
+        variant_lens: &'f [u32],
+        fields: &'f [tc::Name],
+    },
+}
+
+/// What the borrow check took about one fn's head.
+pub enum HeadAnswer<'s> {
+    /// The store could not make its head: a call of it is related coarsely.
+    NotMade,
+    Made {
+        callee: CalleeFacts,
+        /// The lifetime part `read_signature` read, or why it refused the text.
+        sig: Result<SigLife<'s>, SigRefusal>,
+        /// Each ADT the reading asked about, sorted, with whether its head declares lifetimes.
+        adts: &'s [(u128, bool)],
+    },
+}
+
+fn option_bool(h: &mut StableHasher, v: Option<bool>) {
+    h.tag(match v {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    });
+}
+
+fn flag(h: &mut StableHasher, v: bool) {
+    h.tag(u8::from(v));
+}
+
+fn region(h: &mut StableHasher, r: Region) {
+    let (tag, n) = match r {
+        Region::Static => (0, 0),
+        Region::Named(n) => (1, n),
+        Region::Anon(n) => (2, n),
+        Region::SelfTy(n) => (3, n),
+        Region::Hidden(n) => (4, n),
+    };
+    h.tag(tag);
+    h.u32(n);
+}
+
+fn refusal(h: &mut StableHasher, why: SigRefusal) {
+    let (tag, a, b) = match why {
+        SigRefusal::Token { at } => (0, at, 0),
+        SigRefusal::NoFn => (1, 0, 0),
+        SigRefusal::ParamCount { text, head } => (2, text, head),
+        SigRefusal::Unaligned { at } => (3, at, 0),
+        SigRefusal::TwoLifetimesOneOrigin { at } => (4, at, 0),
+        SigRefusal::ElisionUndecided { at } => (5, at, 0),
+        SigRefusal::ObjectDefault { at } => (6, at, 0),
+        SigRefusal::Unknown => (7, 0, 0),
+        SigRefusal::TypeNode => (8, 0, 0),
+        SigRefusal::Bound => (9, 0, 0),
+    };
+    h.tag(tag);
+    h.u32(a);
+    h.u32(b);
+}
+
+/// The row of what the borrow check took about the ADT `adt`.
+pub fn adt_read(adt: u128, answer: AdtAnswer<'_>) -> Read {
+    let mut h = StableHasher::new(ADT_DOMAIN);
+    match answer {
+        AdtAnswer::NotMade => h.tag(0),
+        AdtAnswer::Made { copy, drop_impl, facts, variant_lens, fields } => {
+            h.tag(1);
+            option_bool(&mut h, copy);
+            option_bool(&mut h, drop_impl);
+            let AdtFacts { copy: c, drop_impl: d, needs_drop, lifetimes, union, is_enum, is_box } = facts;
+            for v in [c, d, needs_drop, lifetimes, union, is_enum, is_box] {
+                flag(&mut h, v);
+            }
+            h.u32(variant_lens.len() as u32);
+            for &len in variant_lens {
+                h.u32(len);
+            }
+            h.u32(fields.len() as u32);
+            for name in fields {
+                h.u64(name.0);
+            }
+        }
+    }
+    Read { fact: Fact { kind: FactKind::BorrowAdt, key: adt, detail: 0 }, answer: Some(h.finish()) }
+}
+
+/// The row of what the borrow check took about the head of the fn `item`.
+pub fn head_read(item: u128, answer: HeadAnswer<'_>) -> Read {
+    let mut h = StableHasher::new(HEAD_DOMAIN);
+    match answer {
+        HeadAnswer::NotMade => h.tag(0),
+        HeadAnswer::Made { callee, sig, adts } => {
+            h.tag(1);
+            let CalleeFacts { writes_lifetimes, self_ref } = callee;
+            flag(&mut h, writes_lifetimes);
+            flag(&mut h, self_ref);
+            match sig {
+                Ok(life) => {
+                    h.tag(1);
+                    h.u32(life.regions.len() as u32);
+                    for &r in life.regions {
+                        region(&mut h, r);
+                    }
+                    h.u32(life.ends.len() as u32);
+                    for &e in life.ends {
+                        h.u32(e);
+                    }
+                    h.u32(life.bounds.len() as u32);
+                    for &(a, b) in life.bounds {
+                        region(&mut h, a);
+                        region(&mut h, b);
+                    }
+                }
+                Err(why) => {
+                    h.tag(2);
+                    refusal(&mut h, why);
+                }
+            }
+            h.u32(adts.len() as u32);
+            for &(adt, lifetimes) in adts {
+                h.u128(adt);
+                flag(&mut h, lifetimes);
+            }
+        }
+    }
+    Read { fact: Fact { kind: FactKind::BorrowHead, key: item, detail: 0 }, answer: Some(h.finish()) }
+}
+
+/// A recorder of the ADTs `read_signature` asks about (its `adt_lifetimes` is a `&dyn Fn`):
+/// each asked ADT with the answer given.
+pub struct AskedAdts<'a> {
+    asked: RefCell<AVec<'a, (u128, bool)>>,
+    alloc: Alloc<'a>,
+}
+
+impl<'a> AskedAdts<'a> {
+    pub fn new_in(alloc: Alloc<'a>) -> AskedAdts<'a> {
+        AskedAdts { asked: RefCell::new(AVec::new_in(alloc)), alloc }
+    }
+
+    /// Notes that the reading asked about `adt` and was told `lifetimes`.
+    pub fn note(&self, adt: tc::ItemKey, lifetimes: bool) {
+        self.asked.borrow_mut().push((adt.0, lifetimes));
+    }
+
+    /// Every ADT asked, sorted, each once; the recorder is left empty for the next head.
+    pub fn take_sorted(&self) -> AVec<'a, (u128, bool)> {
+        let mut out = core::mem::replace(&mut *self.asked.borrow_mut(), AVec::new_in(self.alloc));
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
+/// Files the borrow check's `rows` into the body's read list in `verdict` (sorted by fact, one
+/// row per fact) and makes its digest again. A list already refused stays refused; one fact
+/// with two answers refuses the list by name (rule 21), never merged.
+pub fn file_borrow_reads<'a>(verdict: &mut BodyVerdict<'a>, rows: &[Read], alloc: Alloc<'a>) {
+    if rows.is_empty() {
+        return;
+    }
+    let Ok(list) = &mut verdict.facts else { return };
+    list.rows.extend_from_slice(rows);
+    list.rows.sort_unstable();
+    let mut kept = 0;
+    let mut two: Option<ReadsError> = None;
+    for i in 0..list.rows.len() {
+        let row = list.rows[i];
+        if kept > 0 && list.rows[kept - 1].fact == row.fact {
+            if let (Some(first), Some(second)) = (list.rows[kept - 1].answer, row.answer)
+                && first != second
+                && two.is_none()
+            {
+                two = Some(ReadsError::TwoAnswers { fact: row.fact, first, second });
+            }
+            continue;
+        }
+        list.rows[kept] = row;
+        kept += 1;
+    }
+    list.rows.truncate(kept);
+    if let Some(why) = two {
+        verdict.facts = Err(why);
+        verdict.reads = None;
+        return;
+    }
+    if verdict.reads.is_some() {
+        verdict.reads = Some(list.digest(alloc));
+    }
+}

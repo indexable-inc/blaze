@@ -142,10 +142,6 @@ pub enum RunError {
     /// The package's manifest does not say what the run needs of it (its name, its edition):
     /// the command's reader's words (blaze-cli program.rs `package`).
     Manifest { why: Box<str, Global> },
-    /// The rule `entry-takes-roots` (D59): `main`'s shape has no entry module, or a finding
-    /// inside the appended `__blaze_entry`, reported at `main`'s parameters in the root file
-    /// `file` (the user never wrote the appended text).
-    Entry { file: u32, range: blaze_surface::Range, why: Box<str> },
     /// The program ran and called a function this build could not make (its slot held a stub,
     /// crate::stub): the program was stopped at that call. `refusal` is why that function was
     /// not built; `not_built` of the `reached` instances the program reaches have a stub.
@@ -252,7 +248,6 @@ impl core::fmt::Display for RunError {
             RunError::Edition { written } => write!(f, "the edition `{written}` is none the names library knows"),
             RunError::Names { shown } => write!(f, "the names library: {shown}"),
             RunError::Manifest { why } => write!(f, "the package's manifest: {why}"),
-            RunError::Entry { why, .. } => write!(f, "{why}"),
             RunError::NotBuilt { refusal, not_built, reached } => write!(
                 f,
                 "the program called a function this build of blaze cannot build yet and was stopped there: {refusal} ({not_built} of {reached} reachable functions are not built yet)"
@@ -304,19 +299,6 @@ impl RunError {
         let function = match self {
             RunError::Lower { refusals, .. } => return refusals,
             RunError::Place(_) => return out,
-            RunError::Entry { file, range, ref why } => {
-                out.push(Refusal {
-                    file: Some(file),
-                    rule: RefusalRule::Program,
-                    place: 0,
-                    start: range.start,
-                    end: range.end,
-                    secondary: None,
-                    construct: None,
-                    message: why.clone(),
-                });
-                return out;
-            }
             ref other => other.function_at(),
         };
         out.push(Refusal {
@@ -335,7 +317,7 @@ impl RunError {
     /// Where the function this error is about is written, when it names one.
     fn function_at(&self) -> Option<At> {
         match *self {
-            RunError::Lower { .. } | RunError::Place(_) | RunError::Entry { .. } => None,
+            RunError::Lower { .. } | RunError::Place(_) => None,
             // The function that was called and is not built: its refusal's own place.
             RunError::NotBuilt { ref refusal, .. } => refusal.function_at(),
             RunError::Check { ref function, .. }
@@ -974,12 +956,21 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
         self.4.coroutines.items
     }
 
-    /// `ty`'s `Drop` impl, selected by the checker's solver against the `drop` lang trait; its
-    /// `drop` fn as the trait's, which the instance loop resolves to the impl's. Impls are
-    /// found by the trait, never by the module: any body's world sees them all.
+    /// `ty`'s `Drop` impl, found by the ground type's head; its `drop` fn as the trait's, which
+    /// the instance loop resolves to the impl's. Only a struct, enum or union can implement
+    /// `Drop` (E0120; the Reference, "Destructors"): a closure, tuple, array, pointer, `dyn` or
+    /// primitive has none and drops only its parts, so it is answered without the solver (a
+    /// closure's selection would import it, which needs its owner's checked record). An ADT's
+    /// impl covers every instance (E0366/E0367), so it is found in the ADT's own bucket with no
+    /// argument imported (blaze-typeck `adt_drop_impl`). Impls are found by the trait, never by
+    /// the module: any body's world sees them all.
     fn drop_impl(&self, ty: PTy, ground: &mut PortableTys<'_>) -> Result<Option<ItemKey>, BuildError> {
         let Some((trait_, f)) = self.0.drop_trait() else { return Ok(None) };
-        if !self.0.selects(self.1, trait_, ty, ground).map_err(BuildError::Select)? {
+        let PNode::Adt(adt, _) = ground.view().node(ty).map_err(|_| BuildError::Malformed { what: "a type past the ground table" })? else {
+            return Ok(None);
+        };
+        // The scratch lives in the ground table's allocator: the caller's, handed down (D102).
+        if self.0.adt_drop_impl(self.1, trait_, adt, ground.alloc()).map_err(BuildError::Select)?.is_none() {
             return Ok(None);
         }
         f.map(Some).ok_or(BuildError::Malformed { what: "the `drop` lang trait has no `drop` fn" })
@@ -1012,8 +1003,14 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
     }
 
     fn abi(&self, item: ItemKey) -> Option<Abi> {
-        let i = self.0.fn_index(item)?;
-        (i < self.0.fn_count()).then(|| self.0.function(i).abi)
+        self.0.fn_abi(item)
+    }
+    /// From the front end (`FrontEnd::nounwind`, front2 program/head_abi.rs): `extern
+    /// "C"`/"system" and `#[rustc_nounwind]` fns are nounwind; "Rust", "rust-call", "C-unwind"
+    /// and "system-unwind" fns are not (the Reference, "Functions",
+    /// [items.fn.extern.unwind.behavior]).
+    fn nounwind(&self, owner: ItemKey) -> Option<bool> {
+        self.0.nounwind(owner)
     }
 
     fn c_variadic(&self, item: ItemKey) -> Option<u32> {
@@ -1225,8 +1222,9 @@ fn static_image<P: FrontEnd>(
 /// `host` is the host's table (bstd's `wire::HostTable`, built by bstd's `Hosting`): a program
 /// that starts at bstd's hosted entry is called with it, and refused without one; any other
 /// program does not read it.
-pub fn run(files: &[SourceFile<'_>], root: &str, host: Option<NonNull<c_void>>, overflow: OverflowChecks) -> Result<u8, RunError> {
-    run_with(files, root, host, FrontChoice::Old(overflow))
+/// `alloc` holds what the run keeps past the program (a trap's names): the caller's.
+pub fn run(files: &[SourceFile<'_>], root: &str, host: Option<NonNull<c_void>>, overflow: OverflowChecks, alloc: blaze_own::SharedAlloc<'static>) -> Result<u8, RunError> {
+    run_with(files, root, host, FrontChoice::Old(overflow), alloc)
 }
 
 /// Which front end answers the back half (crate::seam): one explicit input of the runner. The
@@ -1255,23 +1253,24 @@ pub struct NewFront<'a> {
 }
 
 /// [`run`] through the front end `choice` names.
-pub fn run_with(files: &[SourceFile<'_>], root: &str, host: Option<NonNull<c_void>>, choice: FrontChoice<'_>) -> Result<u8, RunError> {
+pub fn run_with(files: &[SourceFile<'_>], root: &str, host: Option<NonNull<c_void>>, choice: FrontChoice<'_>, alloc: blaze_own::SharedAlloc<'static>) -> Result<u8, RunError> {
     let built = match choice {
         FrontChoice::Old(overflow) => build(files, root, overflow)?,
         FrontChoice::New(new) => build_new(files, root, new)?,
     };
-    run_built(built, host)
+    run_built(built, host, alloc)
 }
 
 /// The last stage of [`run`]: `built` placed in this process and its entry called; the
 /// program's status.
-pub fn run_built(built: Built, host: Option<NonNull<c_void>>) -> Result<u8, RunError> {
-    ran_built(built, host).map(|ran| ran.status)
+pub fn run_built(built: Built, host: Option<NonNull<c_void>>, alloc: blaze_own::SharedAlloc<'static>) -> Result<u8, RunError> {
+    ran_built(built, host, alloc).map(|ran| ran.status)
 }
 
 /// [`run_built`], with the count of instances not built; a called stub is
-/// [`RunError::NotBuilt`] with that instance's refusal.
-pub fn ran_built(mut built: Built, host: Option<NonNull<c_void>>) -> Result<Ran, RunError> {
+/// [`RunError::NotBuilt`] with that instance's refusal. A trap's names are kept in `alloc`, the
+/// caller's (D102: no allocator is fetched here).
+pub fn ran_built(mut built: Built, host: Option<NonNull<c_void>>, alloc: blaze_own::SharedAlloc<'static>) -> Result<Ran, RunError> {
     let entry = match (built.start, host) {
         (Start::Plain(entry), _) => entry,
         (Start::Hosted, Some(table)) => Entry::Hosted(table),
@@ -1312,7 +1311,7 @@ pub fn ran_built(mut built: Built, host: Option<NonNull<c_void>>) -> Result<Ran,
         place::Ended::Stub(_) => Err(RunError::Place(PlaceError::NoEntry { slot: 0 })),
         // A trap in the placed code: the program's own failure, by name (crate::trap).
         place::Ended::Trap { code, slot, offset, callers } => Err(RunError::Trapped {
-            trap: crate::trap::Trap::new(code, slot, offset, &callers, &built.paths, blaze_own::SharedAlloc::global()),
+            trap: crate::trap::Trap::new(code, slot, offset, &callers, &built.paths, alloc),
         }),
     }
 }
@@ -1362,25 +1361,16 @@ pub fn build_new(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>) -> Res
 /// (the program's crate at index 0, resolved from `texts`). For a caller that resolved the
 /// names itself (examples/front2_rungs.rs: the toolchain library once, `crates::library`).
 pub fn build_over(names: &blaze_scope::resolve::Names<'_>, files: &[SourceFile<'_>], texts: &ProgramTexts) -> Result<Built, RunError> {
-    let (root_file, appended) = (texts.root_file, texts.appended);
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).map_err(|e| RunError::Names { shown: std::format!("the command's frame: {e}").into_boxed_str() })?;
     let mut program = Front2Program::new(names, &frame, files).map_err(RunError::Front2)?;
-    build_with(&mut program, texts.overflow).map_err(|error| match (appended, error.function_at()) {
-        // A finding inside text the user never wrote is reported at `main`'s parameters.
-        (Some(a), Some(at)) if at.file as usize == root_file && at.place >= a.user_len => RunError::Entry {
-            file: root_file as u32,
-            range: a.params,
-            why: std::format!("the entry module cannot call `main` with its roots ({}): {error}", crate::front2::entry::RULE).into_boxed_str(),
-        },
-        _ => error,
-    })
+    build_with(&mut program, texts.overflow)
 }
 
 /// `blaze run`'s call on the new front end: the program of `files` built with a STUB for each
 /// reached function this build of blaze cannot make ([`build_stubbed`]), placed and its entry
 /// called. `Ok` is the program's own status with the two counts the command's closing note
 /// prints ([`Ran`]); a called stub is [`RunError::NotBuilt`] naming that function's refusal.
-pub fn run_program(files: &[SourceFile<'_>], root: &str, host: Option<NonNull<c_void>>, new: NewFront<'_>) -> Result<Ran, RunError> {
+pub fn run_program(files: &[SourceFile<'_>], root: &str, host: Option<NonNull<c_void>>, new: NewFront<'_>, alloc: blaze_own::SharedAlloc<'static>) -> Result<Ran, RunError> {
     let tc = crate::library_set::toolchain_for(files, root, new, Alloc::global())?;
     let texts = ProgramTexts::new(files, root, new, &tc)?;
     let user = texts.user();
@@ -1388,7 +1378,7 @@ pub fn run_program(files: &[SourceFile<'_>], root: &str, host: Option<NonNull<c_
     let crates = inputs.crates();
     let names = inputs.resolve(&crates).map_err(|e| RunError::Names { shown: std::format!("{e}").into_boxed_str() })?;
     let built = build_stubbed(&names, files, &texts)?;
-    ran_built(built, host)
+    ran_built(built, host, alloc)
 }
 
 /// [`build_over`] for a run that starts although some reached function cannot be built: a
@@ -1406,7 +1396,6 @@ pub fn run_program(files: &[SourceFile<'_>], root: &str, host: Option<NonNull<c_
 /// out ([`Front2Program::own_left_out`]). Only a library's function blaze cannot check or
 /// build is left behind a stub.
 pub fn build_stubbed(names: &blaze_scope::resolve::Names<'_>, files: &[SourceFile<'_>], texts: &ProgramTexts) -> Result<Built, RunError> {
-    let (root_file, appended) = (texts.root_file, texts.appended);
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).map_err(|e| RunError::Names { shown: std::format!("the command's frame: {e}").into_boxed_str() })?;
     // The survey front leaves a fn it refuses out of the program (each caller's build then
     // names it: [`RunError::LeftOut`]); its list of them is the seam's `left_out`, read there.
@@ -1423,15 +1412,7 @@ pub fn build_stubbed(names: &blaze_scope::resolve::Names<'_>, files: &[SourceFil
     if let Some((item, why)) = program.own_left_out() {
         return Err(RunError::Front2(Front2Refusal::OwnLeftOut { item, why }));
     }
-    let built = build_from(&mut program, None, None, true, texts.overflow).map_err(|error| match (appended, error.function_at()) {
-        // As [`build_over`]: a finding inside text the user never wrote is at `main`'s parameters.
-        (Some(a), Some(at)) if at.file as usize == root_file && at.place >= a.user_len => RunError::Entry {
-            file: root_file as u32,
-            range: a.params,
-            why: std::format!("the entry module cannot call `main` with its roots ({}): {error}", crate::front2::entry::RULE).into_boxed_str(),
-        },
-        _ => error,
-    })?;
+    let built = build_from(&mut program, None, None, true, texts.overflow)?;
     built.ok_or(RunError::NoMain)
 }
 

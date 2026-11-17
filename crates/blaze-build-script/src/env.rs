@@ -1,7 +1,7 @@
 //! The environment a script is given: exactly what the Cargo Book's "Environment variables
 //! Cargo sets for build scripts" documents, computed from the unit graph, and nothing of the
-//! machine. Paths are the sandbox's view: the package at `/workspace/<folder>` (the workspace
-//! root for a member, the unpacked package for a dependency) and `OUT_DIR` an in-memory folder
+//! machine. Paths are the sandbox's view (decision D96): a dependency's package at `/package`, a
+//! member at `/workspace/<dir>` with its workspace above it, and `OUT_DIR` an in-memory folder
 //! at `/target/debug/build/<name>-<config>/out`, the shape scripts parse (tempo-node takes the
 //! profile from its fourth part from the end).
 //!
@@ -24,12 +24,10 @@
 
 #![blaze::sans_io]
 
+use blaze_expand::seen::SeenRoot;
 use blaze_ids::Hasher;
 use blaze_own::{AString, AVec, Alloc, String, Vec};
 use blaze_unit_graph::{CfgAtom, Text};
-
-/// Where the package is served in the sandbox.
-pub const WORKSPACE: &str = "/workspace";
 
 /// The manifest's package facts a script is told (`CARGO_PKG_*`); an absent value is `""`.
 #[derive(Clone, Copy, Debug, Default)]
@@ -61,8 +59,9 @@ pub struct DepMetadata<'s> {
 #[derive(Clone, Copy, Debug)]
 pub struct Given<'s, 'u> {
     pub package: PackageFacts<'s>,
-    /// The package's folder under [`WORKSPACE`], `/`-separated, empty for the root.
-    pub folder: &'s str,
+    /// What the script sees as its package's root (D96): `SeenRoot::Package` for a dependency
+    /// (`/package`), `SeenRoot::member(dir)` for a workspace member (`/workspace/<dir>`).
+    pub seen: SeenRoot<'s>,
     /// The unit's features, sorted.
     pub features: &'s [Text<'u>],
     /// The cfgs of the target the crate is built for, sorted (the library unit's).
@@ -140,10 +139,11 @@ pub fn env<'a>(given: &Given<'_, '_>, alloc: Alloc<'a>) -> Env<'a> {
     let mut set = |name: AString<'a>, value: &str| vars.push((name, String::from_str_in(value, alloc)));
     let named = |name: &str| String::from_str_in(name, alloc);
 
-    let mut dir = String::from_str_in(WORKSPACE, alloc);
-    if !given.folder.is_empty() {
+    // D96: the mount and the folder in it come from `SeenRoot`, their one home.
+    let mut dir = String::from_str_in(given.seen.mount(), alloc);
+    if !given.seen.folder().is_empty() {
         dir.push('/');
-        dir.push_str(given.folder);
+        dir.push_str(given.seen.folder());
     }
     let mut manifest = dir.clone_in(alloc);
     manifest.push_str("/Cargo.toml");

@@ -96,7 +96,7 @@ mod entry {
 #[test]
 fn a_no_mangle_fn_in_a_module_is_the_entry() {
     let files = [SourceFile { path: "src/main.rs", text: ENTRY_IN_A_MODULE }];
-    let status = run_with(&files, "src/main.rs", None, FrontChoice::New(NEW)).unwrap_or_else(|e| panic!("NO_MANGLE ENTRY: refused: {e}"));
+    let status = run_with(&files, "src/main.rs", None, FrontChoice::New(NEW), blaze_own::testing::heap().shared()).unwrap_or_else(|e| panic!("NO_MANGLE ENTRY: refused: {e}"));
     println!("NO_MANGLE ENTRY: status {status}");
     assert_eq!(status, 42);
 }
@@ -114,10 +114,10 @@ fn a_no_mangle_fn_in_a_module_is_the_entry() {
 fn a_function_not_built_and_never_called_costs_a_count() {
     let text = [HEAD, NEVER_CALLED].concat();
     let files = [SourceFile { path: "src/main.rs", text: &text }];
-    let ran = run_program(&files, "src/main.rs", None, NEW).unwrap_or_else(|e| panic!("the stub run stopped: {e}"));
+    let ran = run_program(&files, "src/main.rs", None, NEW, blaze_own::testing::heap().shared()).unwrap_or_else(|e| panic!("the stub run stopped: {e}"));
     println!("STUB RUN: status {}; {} of {} reachable functions are not built; none was called", ran.status, ran.not_built, ran.reached);
     assert_eq!((ran.status, ran.not_built, ran.reached), (3, 1, 2));
-    let strict = run_with(&files, "src/main.rs", None, FrontChoice::New(NEW));
+    let strict = run_with(&files, "src/main.rs", None, FrontChoice::New(NEW), blaze_own::testing::heap().shared());
     let refused = match strict {
         Err(e) => format!("{e}"),
         Ok(status) => panic!("the strict run built `half` (status {status}): this test needs a form the builder refuses"),
@@ -136,7 +136,7 @@ fn a_function_not_built_and_never_called_costs_a_count() {
 fn a_called_function_that_is_not_built_stops_the_program_by_name() {
     let text = [HEAD, CALLED].concat();
     let files = [SourceFile { path: "src/main.rs", text: &text }];
-    let stopped = match run_program(&files, "src/main.rs", None, NEW) {
+    let stopped = match run_program(&files, "src/main.rs", None, NEW, blaze_own::testing::heap().shared()) {
         Err(e) => e,
         Ok(ran) => panic!("the program ran to status {} through a function that is not built", ran.status),
     };
@@ -203,18 +203,18 @@ fn a_raised_unwind_stops_the_run_by_name() {
     let program = |go: &str| [RAISES, "\nmod entry {\n    #[unsafe(no_mangle)]\n    pub extern \"C\" fn main() -> i32 {\n        super::main(", go, ")\n    }\n}\n"].concat();
     let quiet = program("0");
     let files = [SourceFile { path: "src/main.rs", text: &quiet }];
-    let ran = run_program(&files, "src/main.rs", None, NEW).unwrap_or_else(|e| panic!("the raise was never called, yet the run stopped: {e}"));
+    let ran = run_program(&files, "src/main.rs", None, NEW, blaze_own::testing::heap().shared()).unwrap_or_else(|e| panic!("the raise was never called, yet the run stopped: {e}"));
     assert_eq!((ran.status, ran.not_built), (3, 0), "a raise not called changes nothing and is not counted");
     let raising = program("1");
     let files = [SourceFile { path: "src/main.rs", text: &raising }];
-    let stopped = match run_program(&files, "src/main.rs", None, NEW) {
+    let stopped = match run_program(&files, "src/main.rs", None, NEW, blaze_own::testing::heap().shared()) {
         Err(e) => e,
         Ok(ran) => panic!("the raise ran to status {}", ran.status),
     };
     println!("RAISE: stopped: {stopped}");
     let RunError::UnwindRaised { function } = &stopped else { panic!("not `UnwindRaised`: {stopped}") };
     assert!(format!("{function}").contains("raise"), "the stop names `raise`: {function}");
-    let strict = match run_with(&files, "src/main.rs", None, FrontChoice::New(NEW)) {
+    let strict = match run_with(&files, "src/main.rs", None, FrontChoice::New(NEW), blaze_own::testing::heap().shared()) {
         Err(e) => e,
         Ok(status) => panic!("the strict run's raise ran to status {status}"),
     };
@@ -247,8 +247,8 @@ fn a_static_of_fn_pointers_calls_through_its_words() {
     // edit that adds the `+` adds its lang fn too.
     text.push_str("\n#[lang = \"panic_const_add_overflow\"]\nfn panic_const_add_overflow() -> ! {\n    loop {}\n}\n");
     let files = [SourceFile { path: "src/main.rs", text: &text }];
-    let strict = run_with(&files, "src/main.rs", None, FrontChoice::New(NEW)).unwrap_or_else(|e| panic!("STATIC FN POINTERS (strict): {e}"));
-    let ran = run_program(&files, "src/main.rs", None, NEW).unwrap_or_else(|e| panic!("STATIC FN POINTERS: {e}"));
+    let strict = run_with(&files, "src/main.rs", None, FrontChoice::New(NEW), blaze_own::testing::heap().shared()).unwrap_or_else(|e| panic!("STATIC FN POINTERS (strict): {e}"));
+    let ran = run_program(&files, "src/main.rs", None, NEW, blaze_own::testing::heap().shared()).unwrap_or_else(|e| panic!("STATIC FN POINTERS: {e}"));
     println!("STATIC FN POINTERS: status {strict} (strict), status {}, {} not built", ran.status, ran.not_built);
     assert_eq!((strict, ran.status, ran.not_built), (42, 42, 0));
 }

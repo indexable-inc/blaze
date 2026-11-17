@@ -9,6 +9,7 @@ mod rungs;
 use blaze_ladder::refusal::SourceFile;
 
 fn main() {
+    let heap = blaze_own::Heap::process();
     let Some(rung) = std::env::args().nth(1) else {
         eprintln!("usage: rung <directory under crates/blaze-cli/tests/ladder>");
         std::process::exit(2);
@@ -16,7 +17,7 @@ fn main() {
     let dir = rungs::ladder().join(&rung);
     let files = rungs::sources(&dir);
     let views: Vec<SourceFile<'_>> = files.iter().map(|(path, text)| SourceFile { path, text }).collect();
-    match blaze_ladder::run::run(&views, "src/main.rs", None, rungs::x::overflow_of(&dir)) {
+    match blaze_ladder::run::run(&views, "src/main.rs", None, rungs::x::overflow_of(&dir), heap.shared()) {
         Ok(status) => println!("{rung}: status {status}"),
         Err(error) => {
             println!("{rung}: {error}");

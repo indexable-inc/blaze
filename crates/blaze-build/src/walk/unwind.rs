@@ -30,10 +30,8 @@
 //!   not owned and passes. Refused: an aggregate literal being built whose fields need drop
 //!   (`S { a: String::new(), b: f() }`), of which the walk cannot say what is stored.
 //!
-//! NOT BUILT, and not refused because it is no wrong answer of the kind a cleanup could give:
-//! a drop at a scope's normal exit is a plain call, so a destructor that panics there skips the
-//! scope's remaining drops (Rust drops them); MISSING: an unwind edge from each exit drop to a
-//! cleanup of the entries before it.
+//! A drop at a scope's normal exit, and each drop of a drop glue, carries its own unwind
+//! ladder (walk/unwind_ladder.rs): a destructor that panics there still drops the rest.
 //!
 //! - In an `async` body every call made through [`Walk::call_unwinding`] lands, with or
 //!   without something to drop: its cleanup's `resume` is where the coroutine pass stores
@@ -58,7 +56,7 @@ use crate::{BuildError, Panic};
 
 impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// A block of `kind` (a landing block), noted as not yet reached.
-    fn landing_block(&mut self, kind: BlockKind) -> Block {
+    pub(super) fn landing_block(&mut self, kind: BlockKind) -> Block {
         let block = self.b.create_block(kind);
         self.reached.push(false);
         block

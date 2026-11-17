@@ -853,8 +853,9 @@ impl Buckets {
             }
             self.lazy_filed[krate] = true;
             filed += 1;
-            // A proc-macro unit's impls answer no question of the program's (`Index::new`).
-            if names.proc_macro(krate) == Some(true) {
+            // A proc-macro unit the program reaches answers none of its questions; the
+            // program's own crate (0) does, a proc macro's too (linked.rs `links_unit`).
+            if !super::linked::links_unit(krate == 0, names.proc_macro(krate) == Some(true)) {
                 continue;
             }
             // The impls whose header text is read: every impl of a source with no impl rows,

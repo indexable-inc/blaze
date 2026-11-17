@@ -22,9 +22,13 @@
 //! module is named by its ordinal among the body's written blocks, in text order, so its key
 //! and its impls' keys change only with an edit to the same body.
 //!
-//! Known differences from the Reference, each owed: `super::` written inside a nested item
-//! names the item's module, not that module's parent; a private item of a block is private to
-//! its block's module, where the language's privacy boundary is the enclosing module.
+//! A block's module is anonymous ([`is_block_module`]), as the Reference's block is ("Block
+//! expressions": an anonymous scope, no module): a written `self` names the nearest module
+//! around it that is no block's and `super` that module's parent (`paths.qualifiers.mod-self`,
+//! `paths.qualifiers.super`; the cells' `Cells::up`, names.rs `written_up`), and a private,
+//! `pub(self)` or `pub(super)` item of a block counts from that module (`vis.scoped`). Only the
+//! `use super::*;` the render opens each block's module with reaches the block's own parent:
+//! it is the block's lexical scope (the cells' `Cells::lexical_glob`).
 //!
 //! A macro call in statement position makes its block written: it is written into the
 //! block's module and expanded there by the one expansion driver (it may declare items: the
@@ -44,6 +48,15 @@ use blaze_own::{AString, AVec, Alloc};
 
 /// The name of the module of a body's `ordinal`th written block.
 pub const BLOCK_MODULE: &str = "__blaze_block_";
+
+/// Whether a module named `name` is a block's module, written for a body's block
+/// ([`BLOCK_MODULE`]) or for a block an expansion writes
+/// ([`crate::expanded_blocks::EXPANSION_BLOCK`], which starts with it): an anonymous scope,
+/// never the module a written `self`, `super`, `pub(self)` or `pub(super)` names. The name is
+/// an input of the module's key, so this is a function of the key. The one test of it.
+pub fn is_block_module(name: &str) -> bool {
+    name.starts_with(BLOCK_MODULE)
+}
 
 /// Which blocks of `nested` are written as modules: one that holds an item that makes a
 /// module ([`blaze_file_items::nested::NestedKind::makes_module`]) or a macro call in

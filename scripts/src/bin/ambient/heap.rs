@@ -181,7 +181,9 @@ struct HeapSite {
 type HeapCounts = BTreeMap<String, (Vec<HeapSite>, Vec<HeapSite>)>;
 
 fn count_heap(root: &Path) -> Result<HeapCounts, TreeError> {
-    let Walked { scanned, skipped, .. } = walk(root)?;
+    // Test code here is `testing`: test code, and `cfg(any(test, feature = "testing"))` modules
+    // (a test's root, which takes `testing::heap()`).
+    let Walked { scanned, testing, .. } = walk(root)?;
     let mut out: HeapCounts = BTreeMap::new();
     let mut manifests: BTreeMap<Vec<String>, bool> = BTreeMap::new();
     for (parts, found) in scanned {
@@ -189,7 +191,7 @@ fn count_heap(root: &Path) -> Result<HeapCounts, TreeError> {
             continue;
         }
         let path = parts.join("/");
-        let whole_test = skipped.contains(&path);
+        let whole_test = testing.contains(&path);
         let krate = crate_of(root, &parts, &mut manifests);
         let (outside, inside) = out.entry(krate).or_default();
         // An entry file's `fn main` takes the heap freely: that is where it is taken.
@@ -462,6 +464,23 @@ pub(super) fn selftest() {
         split.heap == vec![(1, HeapUse::Global)] && split.test_heap == vec![(4, HeapUse::Global)],
         &format!("test code's call is the test's: {:?} {:?}", split.heap, split.test_heap),
     );
+    // A `cfg(any(test, feature = "testing"))` item is a test's root for the heap columns (D102):
+    // its call is the test's; the item after it is not; and a module it declares out of line
+    // is marked so its file is too (walk).
+    let testing = "#[cfg(any(test, feature = \"testing\"))]\npub fn fixture() { Alloc::global(); }\nfn g() { Alloc::global(); }\n\
+                   #[cfg(any(feature = \"testing\", test))]\npub mod testing;\nmod plain;\n";
+    let split = scan_file(testing);
+    expect(
+        split.heap == vec![(3, HeapUse::Global)] && split.test_heap == vec![(2, HeapUse::Global)],
+        &format!("a `testing` item's call is the test's: {:?} {:?}", split.heap, split.test_heap),
+    );
+    let marks: Vec<(&str, bool, bool)> = split.mods.iter().map(|it| (it.name.as_str(), it.in_test, it.in_testing)).collect();
+    expect(marks == vec![("testing", false, true), ("plain", false, false)], &format!("a `testing` module is marked: {marks:?}"));
+    let whole = scan_file("#![cfg(any(test, feature = \"testing\"))]\nfn f() { Alloc::global(); }\n");
+    expect(whole.heap.is_empty() && whole.test_heap.len() == 1, "a `testing` file is a test's root");
+    // Only that cfg: a feature of another name is the crate's code.
+    let other = scan_file("#[cfg(any(test, feature = \"std\"))]\nfn f() { Alloc::global(); }\n");
+    expect(other.heap == vec![(2, HeapUse::Global)], &format!("another feature is code: {:?}", other.heap));
     // The list: a crate over its row is refused, naming the added line; under is a note.
     let site = |line| HeapSite { path: "crates/a/src/lib.rs".to_owned(), line, what: HeapUse::Global };
     let counts: HeapCounts = BTreeMap::from([("a".to_owned(), (vec![site(3), site(9)], Vec::new()))]);

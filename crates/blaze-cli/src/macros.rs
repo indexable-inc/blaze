@@ -19,9 +19,10 @@ use std::alloc::Global;
 use blaze_drive::{Input, Kind, Name, Task, TaskFailure, Want, Why};
 use blaze_ids::ContentId;
 use blaze_own::Alloc;
+use blaze_manifest::lock::LockId;
 use blaze_proc_macro::module::{LockedPackages, ModuleError, find_module};
 use blaze_unit_graph::{Unit, UnitKind};
-use blaze_world::procs::{MacroIdentity, Unidentified, git_folders, identify};
+use blaze_world::procs::{MacroIdentity, Unidentified, git_folders, identify_files};
 use bstd::cx::Cx;
 use bstd::mem::Frame;
 
@@ -45,6 +46,35 @@ pub(crate) const MODULE_LISTING: &str = "v2/proc-macro/modules";
 /// The macro crates of this command's graph, each with its module identity or why it has
 /// none: made once a command, at the first `MacroModule` task that runs.
 pub type MacroCrates = std::vec::Vec<(ContentId, Result<MacroIdentity, Unidentified>), Global>;
+
+/// Where a command's macro crates are: the home (the module store is under it), the checkout
+/// relative to where blaze was started ("" for there: `FetchEnv::checkout`), each workspace
+/// member's lock entry and folder, relative to the checkout (`names::member_dirs`; `None` when
+/// the members were not matched to the lock this command), and the command's leaf rows, which
+/// hold each member macro crate's files digest (macro_files.rs).
+pub(crate) struct Place<'p, 'r> {
+    pub home: Option<&'p str>,
+    pub checkout: &'p str,
+    pub members: Option<&'p [(LockId, blaze_unit_graph::Text<'static>)]>,
+    pub rows: &'p crate::sweep::Rows<'r>,
+}
+
+impl Place<'_, '_> {
+    /// The files digest of the member `id` (hex, `blaze_proc_macro::module::files_digest`) as
+    /// its `MacroFiles` row holds it: what a path macro crate's module key holds, by
+    /// package-relative paths and bytes (rule 25), and what the lookup's own key holds through
+    /// the units' source (rule 21); `None` for a package that is no member, or a member no row
+    /// of which was read (then `PathWithoutFolder`, by name).
+    fn member_files(&self, id: LockId) -> Option<std::string::String> {
+        let (_, dir) = self.members?.iter().find(|(member, _)| *member == id)?;
+        crate::macro_files::member_hex(self.rows, dir.as_str())
+    }
+
+    /// The checkout as the bootstrap tool's `checkout` input takes it.
+    fn checkout_shown(&self) -> &str {
+        if self.checkout.is_empty() { "." } else { self.checkout }
+    }
+}
 
 /// A macro crate's subject: its name and version.
 fn subject(unit: &Unit<'_>) -> ContentId {
@@ -96,18 +126,18 @@ impl core::fmt::Display for MacrosError {
     }
 }
 
-/// Every macro crate of the graph `graph_record` with its identity, over `lock` and the module
-/// store `modules` (its git folders).
-fn list(graph_record: &[u8], lock: &crate::fetch::Lockfile<'_>, modules: &std::path::Path) -> Result<MacroCrates, MacrosError> {
+/// Every macro crate of the graph `graph_record` with its identity, over `lock`, the module
+/// store `modules` (its git folders) and `place` (a member's folder).
+fn list(graph_record: &[u8], lock: &crate::fetch::Lockfile<'_>, modules: &std::path::Path, place: &Place<'_, '_>) -> Result<MacroCrates, MacrosError> {
     let decoded = blaze_unit_graph::record::decode(graph_record, Alloc::global()).map_err(MacrosError::Graph)?;
     let text = core::str::from_utf8(lock.text).map_err(|_| MacrosError::LockText)?;
     let locked = LockedPackages::read(text);
     let folders = git_folders(modules).map_err(MacrosError::Procs)?;
     let mut crates = std::vec::Vec::new_in(Global);
     for unit in decoded.graph.units.iter().filter(|unit| matches!(unit.kind, UnitKind::ProcMacro)) {
-        // A path macro crate's identity is its files' digest, which no key here holds yet: its
-        // folder is not given, so it is named as not identified (drive.md, owed).
-        let identity = identify(lock.lock, &locked, &folders, unit, |_| None).map_err(MacrosError::Procs)?;
+        // A member macro crate's identity is its files' digest, read from its folder; a path
+        // package that is no member has no folder here and is named as not identified.
+        let identity = identify_files(lock.lock, &locked, &folders, unit, |id| place.member_files(id)).map_err(MacrosError::Procs)?;
         crates.push((subject(unit), identity));
     }
     crates.sort_unstable_by_key(|(subject, _)| *subject);
@@ -121,7 +151,7 @@ pub(crate) fn run<'b>(
     store: &mut dyn Store,
     lock: Option<&crate::fetch::Lockfile<'_>>,
     crates: &mut Option<MacroCrates>,
-    home: Option<&str>,
+    place: Place<'_, '_>,
     task: &Task<'_>,
     frame: &Frame,
     held: &'b Frame,
@@ -129,7 +159,7 @@ pub(crate) fn run<'b>(
     let cx = cx.span("macro module: look the module up");
     let name = task.name;
     let refused = |what: &'static str| TaskFailure { name, why: Why::Refused { what, rule: RULE } };
-    let Some(home) = home else {
+    let Some(home) = place.home else {
         return Ok(Did::Hole(refused("no home: the module store is under it"), "the proc-macro module store is under the home, and HOME is not set"));
     };
     let modules = std::path::Path::new(home).join(".blaze/v2");
@@ -141,7 +171,7 @@ pub(crate) fn run<'b>(
         };
         let read = crate::work::payload(&cx, store, graph, frame)?;
         let listed = match lock {
-            Some(lock) => list(read.payload(), lock, &modules),
+            Some(lock) => list(read.payload(), lock, &modules, &place),
             None => Err(MacrosError::NoLock),
         };
         match listed {
@@ -176,12 +206,14 @@ pub(crate) fn run<'b>(
             });
             let words = bstd::mem::format_in!(
                 held,
-                "{package} {version}: no compiled proc-macro module in {} (key {key}); build it with `toolrun.sh proc_macro_modules` (input: {{\"store\": \"{}\", \"crates\": [{{\"name\": \"{package}\", \"version\": \"{version}\", \"features\": [{features}]}}]}})",
+                "{package} {version}: no compiled proc-macro module in {} (key {key}); build it with `toolrun.sh proc_macro_modules` (input: {{\"checkout\": \"{}\", \"store\": \"{}\", \"crates\": [{{\"name\": \"{package}\", \"version\": \"{version}\", \"features\": [{features}]}}]}})",
                 modules.join("proc-macro/modules").display(),
+                place.checkout_shown(),
                 modules.display(),
             );
-            // Filed: the store's listing is in this part's key ([`MODULE_LISTING`]), so the
-            // failure stands until a module comes or goes.
+            // Filed: the store's listing is in this part's key ([`MODULE_LISTING`]), and a
+            // member's files are too (its `MacroFiles` row), so the failure stands until a
+            // module comes or goes, or the member's files move.
             Ok(Did::FailedSaying(refused("a proc-macro module the store lacks"), held_str(words.as_str(), held)))
         }
         Err(error) => {

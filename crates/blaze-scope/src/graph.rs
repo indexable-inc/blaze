@@ -374,8 +374,6 @@ impl<'a, N: Name> CrateGraph<'a, N> {
         let sys = self.sysroot;
         let units = sys.units();
         let implicit = c.implicit;
-        // The crate `std` names: Rust's, or bstd under a blaze edition (blaze-unit-graph's rule).
-        let std_crate = implicit.extern_crate("std", &units).and_then(Sysroot::crate_of);
         // A sysroot crate is nameable from the crates resolved after it (`sysroot_before`).
         let built_from = self.built_from[id.index()];
         let not_self = |k: Option<CrateId>| {
@@ -418,8 +416,16 @@ impl<'a, N: Name> CrateGraph<'a, N> {
         let (macro_use, std_prelude) = if attrs.no_core {
             (None, None)
         } else {
-            let core = units.core;
-            let injected = if attrs.no_std { not_self(Sysroot::crate_of(core)) } else { not_self(std_crate) };
+            // The injected `#[macro_use] extern crate std;` (`core` under `#![no_std]`) names
+            // its crate as every `extern crate` does: by the extern prelude's entry of that name
+            // (the rule's `std`: Rust's, or bstd under a blaze edition, blaze-unit-graph's rule).
+            // A dependency named `core` or `std` is that entry (the macro side's own, D89 (a);
+            // `core = { package = "rustc-std-workspace-core" }`), else the sysroot's added above.
+            // Taking the sysroot's always gave a macro-side crate the target side's preludes:
+            // every glob of its own side's `core` macros then had another outer candidate
+            // (`Ambiguous(GlobVsOuter)`, tempo l3d: libc's `assert!`).
+            let name = word(if attrs.no_std { "core" } else { "std" });
+            let injected = prelude.iter().find(|d| d.name == name).map(|d| d.krate);
             // `#![no_std]`: core's prelude of the syntax edition; else the rule's prelude.
             let module = if attrs.no_std { rust_prelude(c.edition) } else { implicit.prelude.module() };
             let path = injected.map(|krate| PreludePath { krate, path: [word("prelude"), word(module)] });
@@ -433,8 +439,10 @@ impl<'a, N: Name> CrateGraph<'a, N> {
 /// `built_from` bits are these: when it comes before the first sysroot crate the crate is
 /// built into (a crate built into none comes after all). So `core` precedes `alloc` precedes
 /// `std` precedes bstd, `std`'s own dependencies (libc, hashbrown) come after `core` and
-/// `alloc` but before `std`, and no order between sysroot crates makes a cycle.
-fn sysroot_before(built_from: u8, bit: usize) -> bool {
+/// `alloc` but before `std`, and no order between sysroot crates makes a cycle. Public: a
+/// driver that resolves one crate at a time (blaze-cli names/scope.rs) gives each crate the
+/// sysroot crates by this one rule.
+pub fn sysroot_before(built_from: u8, bit: usize) -> bool {
     (bit as u32) < built_from.trailing_zeros()
 }
 
@@ -582,6 +590,45 @@ mod tests {
         assert_eq!(e.std_prelude, Some(PreludePath { krate: CrateId(0), path: ["prelude", "rust_2024"] }));
         let e = g.externs(CrateId(0), RootAttrs { no_std: true, no_core: true, ..RootAttrs::default() });
         assert!(e.prelude.is_empty() && e.macro_use.is_none() && e.std_prelude.is_none());
+    }
+
+    /// Expected line: `test graph::tests::the_injected_crate_is_the_extern_preludes ... ok`.
+    ///
+    /// The injected `#[macro_use] extern crate` and the standard prelude name their crate by the
+    /// extern prelude's entry, as every `extern crate` does (the Reference, "Extern prelude":
+    /// "The `core` crate is always added to the extern prelude. The `std` crate is added as long
+    /// as the `no_std` attribute is not specified in the crate root"): `libc`, whose
+    /// dependencies name `core` and `std` (the macro side's copies, D89 (a)), is given those,
+    /// never the sysroot's (the target side's). Before: the sysroot's, and on tempo libc's
+    /// `use crate::prelude::*` bringing its side's `assert` beside the target core's was
+    /// `Ambiguous(GlobVsOuter)`. The control: `app`, without such dependencies, keeps the
+    /// sysroot's.
+    #[test]
+    fn the_injected_crate_is_the_extern_preludes() {
+        let sys = Sysroot { core: Some(CrateId(0)), alloc: Some(CrateId(1)), std: Some(CrateId(2)), bstd: None };
+        let g = graph(
+            std::vec![
+                krate("core", &[], rust()),
+                krate("alloc", &[], rust()),
+                krate("std", &[], rust()),
+                krate("core", &[], rust()),
+                krate("std", &[("core", 3)], rust()),
+                krate("libc", &[("core", 3), ("std", 4)], rust()),
+                krate("app", &[], rust()),
+            ],
+            sys,
+        )
+        .expect("no cycle");
+        let libc = CrateId(5);
+        let e = g.externs(libc, RootAttrs { no_std: true, ..RootAttrs::default() });
+        assert_eq!(e.macro_use, Some(CrateId(3)), "the side's core, its extern prelude's `core`");
+        assert_eq!(e.std_prelude, Some(PreludePath { krate: CrateId(3), path: ["prelude", "rust_2024"] }));
+        let e = g.externs(libc, RootAttrs::default());
+        assert_eq!(e.macro_use, Some(CrateId(4)), "the side's std, its extern prelude's `std`");
+        assert_eq!(e.std_prelude.map(|p| p.krate), Some(CrateId(4)));
+        let control = g.externs(CrateId(6), RootAttrs::default());
+        assert_eq!(control.macro_use, Some(CrateId(2)), "the control: the sysroot's std");
+        assert_eq!(control.std_prelude.map(|p| p.krate), Some(CrateId(2)));
     }
 
     /// The sysroot comes before every crate without a dependency line on it, in the order

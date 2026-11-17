@@ -49,7 +49,7 @@ fn every_running_rung_ends_as_expected() {
         // The error is shown after fd 1 is back: a panic while it is the pipe loses its words.
         let mut failed = None;
         let overflow = rungs::x::overflow_of(&dir);
-        let (status, out) = capture(|| match blaze_ladder::run::run(&views, "src/main.rs", None, overflow) {
+        let (status, out) = capture(|| match blaze_ladder::run::run(&views, "src/main.rs", None, overflow, blaze_own::testing::heap().shared()) {
             Ok(status) => status,
             Err(error) => {
                 failed = Some(error.to_string());

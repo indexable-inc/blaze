@@ -41,6 +41,7 @@ use blaze_typeck::{Checked, ItemKey};
 
 use super::check::Records;
 use super::heads::CrateCfg;
+use super::source::NamesSource;
 
 /// The most statics one program evaluates: a bound on the work list (rule 18); past it the
 /// program is refused by the static it stopped at.
@@ -66,7 +67,7 @@ impl Statics {
 /// at, evaluated once by the evaluator in `r.consts`, by a work list in key order. Returns the
 /// statics made and each static refused with its words (the evaluator's refusal, no head, an
 /// attribute row that does not read): a run stops at the first, a survey files them.
-pub fn static_values<'c>(r: &mut Records<'_, '_>, bodies: impl Iterator<Item = &'c Checked<'static>>) -> (Statics, Vec<(ItemKey, Box<str>), Global>) {
+pub fn static_values<'c, 'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, bodies: impl Iterator<Item = &'c Checked<'static>>) -> (Statics, Vec<(ItemKey, Box<str>), Global>) {
     let mut todo: Vec<ItemKey, Global> = Vec::new_in(Global);
     for c in bodies {
         todo.extend(c.expr_defs.column::<1>().iter().filter_map(|d| match d {
@@ -111,7 +112,7 @@ pub fn static_values<'c>(r: &mut Records<'_, '_>, bodies: impl Iterator<Item = &
 }
 
 /// Static `k`'s record (copied out of the evaluator's arena) and its kind.
-fn one_static(r: &mut Records<'_, '_>, k: ItemKey) -> Result<(DataRecord<Global>, StaticItem), Box<str>> {
+fn one_static<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, k: ItemKey) -> Result<(DataRecord<Global>, StaticItem), Box<str>> {
     let Some((consts, prepared)) = r.consts.take() else {
         return Err(Box::from("no evaluator: the program's records hold none"));
     };
@@ -127,10 +128,11 @@ fn one_static(r: &mut Records<'_, '_>, k: ItemKey) -> Result<(DataRecord<Global>
         DataRecord { allocs }
     });
     r.consts = Some((consts, prepared));
+    // The refusal WHOLE, on one line (rule 19: a cut at 200 characters hid Class Q's gap, the
+    // key that had no row, in the middle of its number; hello run 8s, 2026-11-16).
     let record = made.map_err(|e| {
         let said = format!("{e}");
-        let cut = said.char_indices().nth(200).map_or(&*said, |(i, _)| &said[..i]);
-        Box::<str>::from(cut)
+        said.chars().map(|c| if c == '\n' { ' ' } else { c }).collect::<Box<str>>()
     })?;
     // The head is made by the path's resolution (world_paths.rs) or by the evaluation's check.
     let Some(&m) = r.store.statics.get(&k) else {
@@ -142,12 +144,13 @@ fn one_static(r: &mut Records<'_, '_>, k: ItemKey) -> Result<(DataRecord<Global>
 
 /// Whether static `k`'s signature carries `#[thread_local]` (its attribute rows, read as
 /// program.rs `symbols_of` reads a fn's).
-fn thread_local_of(r: &Records<'_, '_>, k: ItemKey) -> Result<bool, Box<str>> {
+fn thread_local_of<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, k: ItemKey) -> Result<bool, Box<str>> {
     let refuse = |why: String| Box::<str>::from(format!("its attributes: {why}"));
     let f = r.store.fns.get(&k).ok_or_else(|| refuse(String::from("no head in the store")))?;
     let krate = r.names.crate_of(f.lib).ok_or_else(|| refuse(format!("no crate holds {:x}", f.lib)))?;
-    let atoms = r.names.krate(krate).cfg.atoms();
-    let sig = blaze_lower::lower_signature(f.text, r.names.edition(krate), &mut CrateCfg(atoms), Alloc::global())
+    let atoms = r.names.cfg_atoms(krate).ok_or_else(|| refuse(format!("crate {krate}'s cfg was not answered by the names source")))?;
+    let edition = r.names.edition_of(krate).ok_or_else(|| refuse(format!("crate {krate}'s edition was not answered by the names source")))?;
+    let sig = blaze_lower::lower_signature(f.text, edition, &mut CrateCfg(atoms), Alloc::global())
         .map_err(|_| refuse(String::from("its signature needs a `cfg` the crate does not answer")))?;
     let v = sig.view();
     for &n in v.rows(v.list(head::ATTRS)).map_err(|e| refuse(format!("{e:?}")))? {

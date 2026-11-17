@@ -59,7 +59,7 @@ pub enum LazyRefusal {
     Check { function: Box<str>, error: CheckFail },
     /// A row the build asks for (the fn's own, or a callee's head) is refused, as
     /// `program/tabled.rs` `row` refuses it.
-    Row { function: Box<str>, refusal: Front2Refusal },
+    Row { function: Box<str>, refusal: Box<Front2Refusal> },
     /// A head (a fn's signature, its container's) could not be made.
     Head { item: Box<str>, why: Box<str> },
     /// An ADT the body's types name has no row.
@@ -73,6 +73,9 @@ pub enum LazyRefusal {
     /// The helper `helper` reads only the solved names (`&Names`), and this program's names are
     /// each crate's records: it needs its `NamesSource` form (the notes name each).
     NeedsSolvedNames { helper: &'static str, item: Box<str> },
+    /// The names source did not answer `question` about `item` (over records the error is in
+    /// the source's log, naming the crate and the record).
+    Unanswered { question: &'static str, item: Box<str> },
     /// The types table did not fork.
     Table { function: Box<str> },
 }
@@ -91,6 +94,7 @@ impl core::fmt::Display for LazyRefusal {
             LazyRefusal::Const { constant, why } => write!(f, "front2 (lazy): the constant `{constant}`: {why}"),
             LazyRefusal::NotLazyYet { method, item } => write!(f, "front2 (lazy): `{method}` about `{item}` has no per-body form yet"),
             LazyRefusal::NeedsSolvedNames { helper, item } => write!(f, "front2 (lazy): `{helper}` (asked about `{item}`) reads only solved names, not each crate's records"),
+            LazyRefusal::Unanswered { question, item } => write!(f, "front2 (lazy): the names source did not answer `{question}` about `{item}` (its error is in the source's log)"),
             LazyRefusal::Table { function } => write!(f, "front2 (lazy): the types table did not fork for `{function}`"),
         }
     }
@@ -193,6 +197,14 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     live: AVec<'n, Option<Live<'n>>>,
     /// Each constant a checked body read by value, by key, sorted: the seam's `const_record`.
     const_values: AVec<'n, (ItemKey, DataRecord<Global>)>,
+    /// Each static a checked body named (and each static their records point at), evaluated
+    /// once, sorted by key: the seam's `static_item` and `static_records` (fill.rs
+    /// `body_statics`).
+    statics: crate::front2::statics::Statics,
+    /// The object table of each `dyn` principal a checked body's types name, and of every
+    /// supertrait under it, made once per trait: the seam's `object_trait` (fill.rs
+    /// `body_objects`).
+    objects: HashMap<ItemKey, ObjectTable, Global>,
     /// The seam's own lang answers ([`SEAM_LANGS`]), looked up when the program is made.
     langs: [(LangItem, Option<ItemKey>); SEAM_LANGS.len()],
     /// The program's entry row: set by the first `check_one` of the key given as the entry.
@@ -249,12 +261,20 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             rows: Rows::new_in(alloc),
             live: AVec::new_in(alloc),
             const_values: AVec::new_in(alloc),
+            statics: crate::front2::statics::Statics { values: Vec::new_in(Global), kinds: Vec::new_in(Global) },
+            objects: HashMap::new_in(Global),
             langs,
             entry_key: entry,
             projection_why: RefCell::new(None),
             counts: LazyCounts::default(),
             alloc,
         })
+    }
+
+    /// How many statics and object tables (supertraits included) the bodies checked so far
+    /// made: for the tests (front2_lazy_data.rs).
+    pub fn data_counts(&self) -> (usize, usize) {
+        (self.statics.kinds.len(), self.objects.len())
     }
 
     /// What the program did so far.

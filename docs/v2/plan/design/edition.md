@@ -117,7 +117,8 @@ features some of them are written with):
 `with` clause (a parameter passed by name from the caller's scope, so the functions in between
 need not list it) would only save typing in the middle of a call chain. It is not built, and it
 is reconsidered only if threading turns out to be the main complaint once blaze's own crates are
-on bstd. `main` is `fn main(cx: &Cx, io: Io)`.
+on bstd. `main` names each capability it uses (D104): `fn main(cx: &Cx, out: Out)`, each grant
+by its type and name; a whole `Io` cannot be asked for.
 
 **10. `&uniq`.**
 - `&uniq T`, `&uniq self`, `&uniq expr` and `ref uniq` in patterns are exactly `&mut T`,

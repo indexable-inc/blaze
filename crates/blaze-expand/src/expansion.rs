@@ -363,10 +363,11 @@ impl IncludeFailure {
 /// has no tokens.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Diagnostic {
-    /// No rule of the `rules` rules matched. `token` is the token the rule that got furthest
-    /// stopped at (`None` at the end of the input), `expected` what that rule wanted there,
-    /// both as rustc words them; `at` where.
-    NoRuleMatched { rules: u32, token: Option<Text>, expected: Text, at: Option<TokenOrigin> },
+    /// No rule of the `rules` rules matched. `closest` is the rule that got furthest (its index
+    /// in definition order; the first of equals; `None` where the matcher kept no tracker),
+    /// `token` the token it stopped at (`None` at the end of the input), `expected` what that
+    /// rule wanted there, both as rustc words them; `at` where.
+    NoRuleMatched { rules: u32, closest: Option<u32>, token: Option<Text>, expected: Text, at: Option<TokenOrigin> },
     /// A rule matched and its transcription failed (a binding used at the wrong depth).
     Binding { message: Text, at: Option<TokenOrigin> },
     /// A rule left input unmatched.
@@ -543,9 +544,16 @@ impl<'a> Expansion<'a> {
             }
         };
         match diagnostic {
-            Diagnostic::NoRuleMatched { rules, token, expected, at } => {
+            Diagnostic::NoRuleMatched { rules, closest, token, expected, at } => {
                 out.put(&[0]);
                 out.put(&rules.to_be_bytes());
+                match closest {
+                    None => out.put(&[0]),
+                    Some(arm) => {
+                        out.put(&[1]);
+                        out.put(&arm.to_be_bytes());
+                    }
+                }
                 match token {
                     None => out.put(&[0]),
                     Some(token) => {

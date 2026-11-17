@@ -33,12 +33,48 @@ pub fn shelf(
     cfg: &'static [(&'static str, Option<&'static str>)],
     alloc: Alloc<'_>,
 ) -> (ToolchainId, StdVec<(StdString, StdVec<u8>)>) {
+    shelf_of(&[(triple, cfg)], std, false, alloc)
+}
+
+/// [`shelf`] whose std depends on a crate of library/ beneath it, `cfg_if` (`Role::Library`,
+/// on core), as the real std does: the toolchain list holds it, and a program that needs no
+/// Rust std does not open it.
+pub fn shelf_with_std_dep(
+    triple: &'static str,
+    std: &str,
+    cfg: &'static [(&'static str, Option<&'static str>)],
+    alloc: Alloc<'_>,
+) -> (ToolchainId, StdVec<(StdString, StdVec<u8>)>) {
+    shelf_of(&[(triple, cfg)], std, true, alloc)
+}
+
+/// [`shelf`] cut for `triple` and for `wasm32-wasip1` (`macro_cfg` its atoms), the macro side a
+/// member proc macro is built for (D89 (a), rule 10): the same units for both targets.
+pub fn shelf_with_macro_side(
+    triple: &'static str,
+    std: &str,
+    cfg: &'static [(&'static str, Option<&'static str>)],
+    macro_cfg: &'static [(&'static str, Option<&'static str>)],
+    alloc: Alloc<'_>,
+) -> (ToolchainId, StdVec<(StdString, StdVec<u8>)>) {
+    shelf_of(&[(triple, cfg), ("wasm32-wasip1", macro_cfg)], std, false, alloc)
+}
+
+/// The fixture's shelf cut for each of `targets` (its triple and atoms), every target with the
+/// same units; with `std_dep`, std depends on `cfg_if`, a sixth crate.
+fn shelf_of(
+    targets: &[(&'static str, &'static [(&'static str, Option<&'static str>)])],
+    std: &str,
+    std_dep: bool,
+    alloc: Alloc<'_>,
+) -> (ToolchainId, StdVec<(StdString, StdVec<u8>)>) {
     let library = pack(
         &[
             ("core/src/lib.rs", "#![no_core]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }"),
             ("alloc/src/lib.rs", "#![no_std]\npub mod vec {}"),
             ("std/src/lib.rs", std),
             ("proc_macro/src/lib.rs", "#![no_std]\npub struct TokenStream;"),
+            ("cfg_if/src/lib.rs", "#![no_std]"),
         ],
         alloc,
     );
@@ -62,7 +98,10 @@ pub fn shelf(
         row("std", "std", "std", Role::Std, &library),
         row("proc_macro", "proc_macro", "proc_macro", Role::ProcMacro, &library),
         row("blaze-std", "bstd", "crates/blaze-std", Role::Bstd, &bstd),
+        row("cfg_if", "cfg_if", "cfg_if", Role::Library, &library),
     ];
+    // Without `std_dep`, the shelf is the five crates it always was.
+    let crates = if std_dep { &crates[..] } else { &crates[..5] };
     let lib = |krate: u32, deps: &'static [(&'static str, u32)]| UnitIn {
         krate,
         kind: blaze_toolchain::UnitKind::Lib,
@@ -71,9 +110,19 @@ pub fn shelf(
         features: &[],
         deps,
     };
-    let units = [lib(0, &[]), lib(1, &[("core", 0)]), lib(2, &[("alloc", 1), ("core", 0)]), lib(3, &[("core", 0), ("std", 2)]), lib(4, &[("alloc", 1), ("core", 0)])];
-    let targets = [TargetIn { triple, units: &units, cfg }];
-    let manifest = record::write(&crates, &targets, alloc).expect("a record").to_vec();
+    let plain = [lib(0, &[]), lib(1, &[("core", 0)]), lib(2, &[("alloc", 1), ("core", 0)]), lib(3, &[("core", 0), ("std", 2)]), lib(4, &[("alloc", 1), ("core", 0)])];
+    // With `std_dep`: std (unit 2) also on `cfg_if` (unit 5, on core).
+    let with_dep = [
+        lib(0, &[]),
+        lib(1, &[("core", 0)]),
+        lib(2, &[("alloc", 1), ("cfg_if", 5), ("core", 0)]),
+        lib(3, &[("core", 0), ("std", 2)]),
+        lib(4, &[("alloc", 1), ("core", 0)]),
+        lib(5, &[("core", 0)]),
+    ];
+    let units: &[UnitIn<'_>] = if std_dep { &with_dep } else { &plain };
+    let cut: StdVec<TargetIn<'_>> = targets.iter().map(|(triple, cfg)| TargetIn { triple, units, cfg }).collect();
+    let manifest = record::write(crates, &cut, alloc).expect("a record").to_vec();
     let id = ToolchainView::id_of_bytes(&manifest);
     let mut files = StdVec::new();
     files.push((blaze_toolchain::Hex::of(&id.0).as_str().to_string(), manifest));

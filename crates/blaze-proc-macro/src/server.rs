@@ -302,7 +302,7 @@ impl Server {
     /// rustc passes them, so `#[m]` gets empty arguments, never none (its client reads a
     /// handle for each); a derive or a fn-like macro gets its one input.
     pub fn new(edition: Edition, limits: ServerLimits, call: &ProcCall<'_>, scratch: Alloc<'static>, run_input: &mut Vec<u8>) -> Result<Server, ServerError> {
-        let empty = TokenStream::new_in(Alloc::global());
+        let empty = TokenStream::new_in(scratch);
         let input = call.input;
         let attr = match call.kind {
             ProcKind::Attr => Some(call.attr_args.unwrap_or(&empty)),

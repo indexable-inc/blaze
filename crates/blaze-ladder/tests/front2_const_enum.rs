@@ -37,9 +37,9 @@
 //! other: Mismatch             load::<u8, { Other::X }>(p): `Other::X` has `Ord::A`'s index and
 //!                             discriminant and is still not an `Ord`
 //! bad: no head, "mismatched types"    fn bad(w: W<{ Other::X }>)
-//! st: no head, "adt_const_params"     fn st<const V: S>() for `struct S;`: still refused
-//! fl: no head, "adt_const_params"     fn fl<const V: F>() for `enum F { P(u8), Q }`: still refused
 //! ```
+//!
+//! A const parameter of a struct or data enum: tests/front2_const_param_adt.rs.
 //!
 //! and the check script's line: `test blaze-ladder: exit 0; 1 passed, 0 failed`.
 //! Needs the installed toolchain under `$HOME/.blaze/v2/toolchain`, as tests/front2_params.rs.
@@ -61,8 +61,6 @@ const MAIN: &str = "fn main(cx: &Cx, io: Io) -> Result<(), Error> {
 }
 enum Ord { A = 0, B = 1 }
 enum Other { X = 0 }
-struct S;
-enum F { P(u8), Q }
 struct W<const O: Ord>;
 fn load<T: Copy, const O: Ord>(p: *const T) -> T { loop {} }
 fn la(p: *const u8) -> u8 { load::<u8, { Ord::A }>(p) }
@@ -71,8 +69,6 @@ fn same(w: W<{ Ord::A }>) -> W<{ Ord::A }> { w }
 fn differ(w: W<{ Ord::A }>) -> W<{ Ord::B }> { w }
 fn other(p: *const u8) -> u8 { load::<u8, { Other::X }>(p) }
 fn bad(w: W<{ Other::X }>) {}
-fn st<const V: S>() {}
-fn fl<const V: F>() {}
 ";
 
 /// What a body must say.
@@ -92,10 +88,8 @@ const BODIES: [(&str, Says, &str); 5] = [
 ];
 
 /// The fns whose head must be refused, each with a text its refusal must hold.
-const NO_HEAD: [(&str, &str, &str); 3] = [
+const NO_HEAD: [(&str, &str, &str); 1] = [
     ("bad", "mismatched types", "`W<{ Other::X }>` in a signature: a variant of another enum than the parameter's"),
-    ("st", "adt_const_params", "a const parameter of a struct type stays refused under the old text"),
-    ("fl", "adt_const_params", "a const parameter of an enum with a field stays refused under the old text"),
 ];
 
 #[test]

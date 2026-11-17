@@ -111,7 +111,8 @@ fn the_simd_table_is_sorted_and_every_row_is_named() {
         assert_eq!(e.which.entry().name, e.name, "one row per intrinsic");
     }
     assert_eq!(Which::named("simd_eq"), Ok(Which::Simd(SimdOp::Eq)));
-    assert!(Which::named("simd_reduce_or").is_err(), "an intrinsic hashbrown's NEON calls do not reach stays refused");
+    assert_eq!(Which::named("simd_reduce_or"), Ok(Which::Simd(SimdOp::ReduceOr)), "a vector row (intrinsics/simd_vec.rs)");
+    assert!(Which::named("simd_funnel_shl").is_err(), "an intrinsic not in the table stays refused by name");
 }
 
 /// `vceq_u8(v, vdup_n_u8(3))` of `[1, 2, ..., 8]`: lane 2 all ones, the rest 0.

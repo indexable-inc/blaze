@@ -21,33 +21,75 @@ const MOST_HEAD: usize = 200;
 /// head with the item it is declared in and its key in hex.
 pub(crate) fn static_shown(r: &Records<'_, '_>, k: ItemKey) -> String {
     let Some(local) = r.store.locals.head(k) else { return fn_shown(r, k) };
-    let mut head = String::new();
-    // The declaration's head: the lines that are not a comment or an attribute, joined by one
-    // space, up to the initializer's `=`.
-    'lines: for line in local.text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("//") || line.starts_with("#[") || line.starts_with("#![") {
+    let enclosing = fn_shown(r, local.enclosing);
+    match static_name(local.text) {
+        Some(name) => format!("static `{name}`, declared in the body of `{enclosing}` (key {:#034x})", k.0),
+        // No `static <name>` in its text (not reached for a kept static row): the text is shown,
+        // cut and said so, never a guessed name.
+        None => {
+            let mut text: String = local.text.chars().take(MOST_HEAD).collect();
+            if local.text.chars().count() > MOST_HEAD {
+                text.push_str(&format!(" (text cut at {MOST_HEAD} characters)"));
+            }
+            format!("a static whose text names none (`{text}`), declared in the body of `{enclosing}` (key {:#034x})", k.0)
+        }
+    }
+}
+
+/// The name a static's text declares: the identifier after the keyword `static` (and after
+/// `mut`), read outside string literals (a `#[doc = ".."]` may say "static") and `//` comments,
+/// however the text is spaced: an expansion's text is printed token by token on one line
+/// (`# [doc = ".."] static MANIFEST : $crate :: grant :: Manifest = ..`). A loop over bytes; the
+/// slices end at ASCII bytes only, so they are on char boundaries.
+fn static_name(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let mut at = 0usize;
+    let mut after_static = false;
+    while at < bytes.len() {
+        let c = bytes[at];
+        if c == b'"' {
+            at += 1;
+            while at < bytes.len() && bytes[at] != b'"' {
+                at += if bytes[at] == b'\\' { 2 } else { 1 };
+            }
+            at += 1;
             continue;
         }
-        for word in line.split_whitespace() {
-            if word == "=" || word.starts_with('=') {
-                break 'lines;
+        if c == b'/' && bytes.get(at + 1) == Some(&b'/') {
+            while at < bytes.len() && bytes[at] != b'\n' {
+                at += 1;
             }
-            if !head.is_empty() {
-                head.push(' ');
-            }
-            match word.split_once('=') {
-                Some((before, _)) => {
-                    head.push_str(before);
-                    break 'lines;
-                }
-                None => head.push_str(word),
-            }
+            continue;
         }
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            let start = at;
+            while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_' || bytes[at] >= 0x80) {
+                at += 1;
+            }
+            let word = text.get(start..at)?;
+            match (after_static, word) {
+                (false, "static") => after_static = true,
+                (true, "mut") => {}
+                (true, name) => return Some(name),
+                (false, _) => {}
+            }
+            continue;
+        }
+        at += 1;
     }
-    if head.chars().count() > MOST_HEAD {
-        let cut: String = head.chars().take(MOST_HEAD).collect();
-        head = format!("{cut} (head cut at {MOST_HEAD} characters)");
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    /// An expansion's one-line text, a doc attribute saying "static" first: the name is
+    /// `MANIFEST` (the Reference, "Static items": `static` then the identifier).
+    /// Expected: passes; before the fix the shown head was "# [ doc".
+    #[test]
+    fn static_name_past_attributes() {
+        let t = "# [doc = \" a static manifest \"] static MANIFEST : $crate :: grant :: Manifest = $crate :: grant :: Manifest :: new (& []) ;";
+        assert_eq!(super::static_name(t), Some("MANIFEST"));
+        assert_eq!(super::static_name("/// static docs\nstatic mut N: u8 = 0;"), Some("N"));
+        assert_eq!(super::static_name("const X: u8 = 0;"), None);
     }
-    format!("`{head}`, declared in the body of `{}` (key {:#034x})", fn_shown(r, local.enclosing), k.0)
 }

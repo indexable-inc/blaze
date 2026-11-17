@@ -78,7 +78,7 @@ pub fn launch_with<R: crate::entry::Outcome>(
     let defaults = || -> RunSpec<LaunchAlloc> {
         RunSpec::defaults(blaze_own::Vec::new_in(alloc), blaze_own::Vec::new_in(alloc), blaze_own::String::from_str_in(".", alloc), alloc)
     };
-    match prepare(manifest, delivered.as_deref(), defaults, alloc) {
+    match prepare(manifest, delivered.as_deref(), defaults, &block.args, alloc) {
         Prepared::Manifest(text) => match write_out(Stream::Out, &[text.as_bytes(), b"\n"]) {
             Ok(()) => Exit(Status::OK),
             Err(why) => {
@@ -90,10 +90,13 @@ pub fn launch_with<R: crate::entry::Outcome>(
             error_line(said.as_str());
             Exit(Status::REFUSED)
         }
-        Prepared::Run { spec, started, fake } => {
+        Prepared::Run { spec, started, fake, taken } => {
             let world = match started {
-                // A command reads every folder above the one it was started in.
-                Started::Ordinary => open_native(os, ArgList::process(block), Vars::process(block), start_dir(), u8::MAX),
+                // A command reads every folder above the one it was started in; its command line
+                // is the process's, less the `--grant`s the launcher took.
+                Started::Ordinary => {
+                    open_native(os, ArgList::process_after(block, taken), Vars::process(block), start_dir(), u8::MAX)
+                }
                 // A spec-made world is the spec's alone: its command line, environment and
                 // directory (`RunSpec::read` refuses a directory that is not absolute).
                 Started::WithSpec => {

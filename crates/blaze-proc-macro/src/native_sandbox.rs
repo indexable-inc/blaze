@@ -23,7 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use blaze_build_script::native::{Grant, GrantError, seatbelt};
+use blaze_build_script::native::{Grant, GrantError, seatbelt_with};
 use blaze_own::Alloc;
 
 /// What a Linux process reads before `main`: the dynamic loader's cache and the multiarch
@@ -40,6 +40,10 @@ pub struct NativeRun<'g> {
     /// The working directory: the package's folder, inside the grant.
     pub dir: &'g str,
     pub deadline: Duration,
+    /// Folders under which any program may be started (and read): `[OUT_DIR]` for a script
+    /// granted a host tool whose row says `runs_out_dir` (D112: sh running configure's test
+    /// programs, blaze-build-script host_tools), else empty.
+    pub exec_under: &'g [&'g str],
 }
 
 /// How a run ended inside its sandbox.
@@ -155,7 +159,7 @@ fn kill_group(pid: u32) {
 
 #[cfg(target_os = "macos")]
 fn confined(run: &NativeRun<'_>, plant: Plant, alloc: Alloc<'_>) -> Result<Command, NativeRefusal> {
-    let profile = seatbelt(&run.grant, alloc).map_err(refused)?;
+    let profile = seatbelt_with(&run.grant, run.exec_under, alloc).map_err(refused)?;
     let launcher = std::path::Path::new("/usr/bin/sandbox-exec");
     if !launcher.exists() {
         return Err(NativeRefusal::NoSandbox { why: "/usr/bin/sandbox-exec is missing".to_owned() });
@@ -169,13 +173,13 @@ fn confined(run: &NativeRun<'_>, plant: Plant, alloc: Alloc<'_>) -> Result<Comma
 #[cfg(target_os = "linux")]
 fn confined(run: &NativeRun<'_>, plant: Plant, alloc: Alloc<'_>) -> Result<Command, NativeRefusal> {
     // The same checks the profile makes, so a grant refused on one host is refused on both.
-    _ = seatbelt(&run.grant, alloc).map_err(refused)?;
+    _ = seatbelt_with(&run.grant, run.exec_under, alloc).map_err(refused)?;
     let mut command = Command::new(run.grant.program);
     command.args(run.args);
     if plant == Plant::NoConfinement {
         return Ok(command);
     }
-    let ruleset = linux::Ruleset::of(&run.grant)?;
+    let ruleset = linux::Ruleset::of(&run.grant, run.exec_under)?;
     let filter = linux::socket_filter();
     // SAFETY: the closure runs in the forked child before exec and makes only system calls
     // (no allocation, no lock): `prctl`, `unshare`, `seccomp` and `landlock_restrict_self` over
@@ -230,7 +234,7 @@ mod linux {
     }
 
     impl Ruleset {
-        pub(super) fn of(grant: &Grant<'_>) -> Result<Ruleset, NativeRefusal> {
+        pub(super) fn of(grant: &Grant<'_>, exec_under: &[&str]) -> Result<Ruleset, NativeRefusal> {
             // SAFETY: a null attribute and size 0 with the version flag asks the ABI only.
             let abi = unsafe { libc::syscall(libc::SYS_landlock_create_ruleset, std::ptr::null::<u8>(), 0usize, 1u32) };
             if abi < 3 {
@@ -259,6 +263,11 @@ mod linux {
             }
             for path in grant.write {
                 ruleset.add(path, handled)?;
+            }
+            // The folders whose programs may be started (D112), as the macOS profile's
+            // `exec_under` lets them: started and read.
+            for path in exec_under {
+                ruleset.add(path, EXECUTE | READ_FILE | READ_DIR)?;
             }
             ruleset.add("/dev/null", READ_FILE | WRITE_FILE)?;
             Ok(ruleset)

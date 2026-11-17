@@ -1303,6 +1303,76 @@ impl Effect {
             | Effect::Above { tag, .. } => *tag,
         }
     }
+
+    /// The effect's tag, to be changed: for a driver lent over another's backend, which gives
+    /// each effect a tag of that backend's and maps its completion back (bstd `io::LentDriver`).
+    pub fn tag_mut(&mut self) -> &mut Tag {
+        match self {
+            Effect::ReadAll { tag, .. }
+            | Effect::Read { tag, .. }
+            | Effect::ReadInto { tag, .. }
+            | Effect::ReadMany { tag, .. }
+            | Effect::WriteFrom { tag, .. }
+            | Effect::ReadLink { tag, .. }
+            | Effect::Append { tag, .. }
+            | Effect::Sync { tag, .. }
+            | Effect::Barrier { tag, .. }
+            | Effect::WriteBack { tag, .. }
+            | Effect::SyncDir { tag, .. }
+            | Effect::Truncate { tag, .. }
+            | Effect::Write { tag, .. }
+            | Effect::WriteUnsynced { tag, .. }
+            | Effect::List { tag, .. }
+            | Effect::WriteAt { tag, .. }
+            | Effect::Rename { tag, .. }
+            | Effect::RenameUnsynced { tag, .. }
+            | Effect::Mode { tag, .. }
+            | Effect::Seal { tag, .. }
+            | Effect::Private { tag, .. }
+            | Effect::Times { tag, .. }
+            | Effect::Clone { tag, .. }
+            | Effect::CopyData { tag, .. }
+            | Effect::Prewarm { tag, .. }
+            | Effect::Link { tag, .. }
+            | Effect::Stat { tag, .. }
+            | Effect::Lstat { tag, .. }
+            | Effect::Remove { tag, .. }
+            | Effect::Lock { tag, .. }
+            | Effect::Unlock { tag, .. }
+            | Effect::Watch { tag, .. }
+            | Effect::Journal { tag, .. }
+            | Effect::Unwatch { tag }
+            | Effect::Stamp { tag, .. }
+            | Effect::Entries { tag, .. }
+            | Effect::Flush { tag, .. }
+            | Effect::Timer { tag, .. }
+            | Effect::Map { tag, .. }
+            | Effect::MapWrite { tag, .. }
+            | Effect::Spawn { tag, .. }
+            | Effect::Kill { tag }
+            | Effect::Listen { tag, .. }
+            | Effect::Unlisten { tag }
+            | Effect::Connect { tag, .. }
+            | Effect::Recv { tag, .. }
+            | Effect::Send { tag, .. }
+            | Effect::Hangup { tag, .. }
+            | Effect::Pressure { tag }
+            | Effect::Bind { tag, .. }
+            | Effect::SendTo { tag, .. }
+            | Effect::RecvFrom { tag, .. }
+            | Effect::Unbind { tag, .. }
+            | Effect::Resolve { tag, .. }
+            | Effect::ReadStdin { tag, .. }
+            | Effect::WriteOut { tag, .. }
+            | Effect::Now { tag }
+            | Effect::Random { tag, .. }
+            | Effect::Roots { tag, .. }
+            | Effect::MakeDir { tag, .. }
+            | Effect::RemoveDir { tag, .. }
+            | Effect::Ancestors { tag, .. }
+            | Effect::Above { tag, .. } => tag,
+        }
+    }
 }
 
 /// Whether an [`Effect::ReadInto`] or [`Effect::WriteFrom`] goes through the system's page cache.

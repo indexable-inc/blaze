@@ -27,7 +27,7 @@ use alloc::vec::Vec;
 use core::alloc::Allocator;
 
 use super::cbor::{Reader, Writer};
-use super::{LONGEST_FRAME, List, Listed, RecordId, WireError, id, personality, tier, tier_name, variant};
+use super::{LONGEST_FRAME, List, Listed, RecordId, WireError, id, native, personality, tier, tier_name, variant};
 use crate::{Slot, Thread, Tier};
 
 /// The version of the run wire's bodies. A reader of another refuses the message by name
@@ -94,6 +94,11 @@ pub enum Down<'a> {
     /// naming the program's `eh_personality` fn and before any `Publish`: every placed record's
     /// unwind entry names that slot's entry thunk (wire/personality.rs).
     Personality { slot: Slot },
+    /// The program's native library record `library` (NATIVE.md 3.1) and, in its word order, the
+    /// Rust functions its C code calls: pair i's slot's entry thunk fills the library's word i.
+    /// Sent once, first, before any `Declare` of the entry; each pair declares its slot as a
+    /// `Declare` pair does (wire/native.rs).
+    Native { library: RecordId, words: List<'a, Declared> },
 }
 
 impl Listed<'_> for Declared {
@@ -254,6 +259,7 @@ impl<'a> Down<'a> {
                 to.bytes(&record.0);
             }
             Down::Personality { slot } => personality::write(to, slot),
+            Down::Native { library, words } => native::write(to, library, words),
             Down::Failed { need, why } => {
                 variant(to, "Failed", 2);
                 to.text("why");
@@ -288,6 +294,10 @@ impl<'a> Down<'a> {
                 Down::Publish { slot, tier, record }
             }
             personality::NAME => Down::Personality { slot: personality::read(&mut from)? },
+            native::NAME => {
+                let (library, words) = native::read(&mut from)?;
+                Down::Native { library, words }
+            }
             "Failed" => {
                 from.map(2, "Failed, a map of 2")?;
                 from.key("why")?;

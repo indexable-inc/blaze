@@ -5,7 +5,9 @@
 //! - The record's base is [`blaze_build_script::key::base`]: the module's SHA-256, the whole
 //!   environment, the answers it could be given, the C mode and the limits. Its read-list is
 //!   what the script read of its workspace (`file:`, `dir:`, `stat:` subjects, valued now by
-//!   [`answer_now`]), so a changed file misses exactly the runs that read it.
+//!   [`crate::script_sandbox::answer_now`]), so a changed file misses exactly the runs that read
+//!   it; a derived fact's subject is answered again with the command's pins
+//!   ([`crate::fact_pins::read_now`]), so other pins miss exactly the runs that asked it.
 //! - The answer is [`Outputs`] in canonical bytes: the instructions, the files of `OUT_DIR`
 //!   and the C requests deferred.
 //! - A failed run is not kept: a script that exits non-zero, traps or is stopped gives a
@@ -37,7 +39,8 @@ use crate::{
     host::{MAX_WASM_STACK, fuel_cost},
     module::sha256_hex,
     record::DirStore,
-    script_sandbox::{Read, Refusal, Script, ScriptSandbox, Tree, answer_now},
+    script_sandbox::{Read, Refusal, Script, ScriptSandbox, Tree},
+    spawn_route::FactPins,
 };
 
 /// The import module of the process shim's calls.
@@ -393,7 +396,9 @@ impl ScriptRuntime {
             runner: RunnerKey::Wasm,
         };
         let mut scratch = blaze_own::Vec::new_in(Alloc::global());
-        key::base(&inputs, &mut scratch)
+        // Brief S1: the `links` dependencies' files the sandbox serves are not text of this
+        // script; their content is in the key (`DepViews::key`: the base itself with none).
+        script.deps.key(key::base(&inputs, &mut scratch))
     }
 
     /// `script`'s outputs: from its record when one answers under what its reads are now, else
@@ -402,7 +407,8 @@ impl ScriptRuntime {
         let package = script.package.clone();
         let named = |why: ScriptWhy| ScriptError { package: package.clone(), why };
         let base = self.base(loaded, &script, env);
-        if let Some(outputs) = self.find(&base, &script.tree, alloc).map_err(|why| named(ScriptWhy::Record(why)))? {
+        let pins = script.spawn_setting.pins.as_ref();
+        if let Some(outputs) = self.find_answering(&base, &script.tree, pins, alloc).map_err(|why| named(ScriptWhy::Record(why)))? {
             return Ok(ScriptRun { outputs, base, from_record: true, reads: Vec::new(), fuel: 0, peak_memory: 0, spawns: 0 });
         }
         let ran = self.fresh(loaded, script, base, alloc)?;
@@ -451,12 +457,19 @@ impl ScriptRuntime {
         Ok(ScriptRun { outputs, base, from_record: false, reads, fuel, peak_memory: host.limiter.peak, spawns: host.sandbox.spawns })
     }
 
-    /// The outputs kept under `base` for what its reads are in `tree` now.
+    /// The outputs kept under `base` for what its reads are in `tree` now, with no fact pins: a
+    /// list that read a derived fact is passed over (a native run, which asks none).
     pub fn find<'a>(&self, base: &ContentId, tree: &Tree, alloc: Alloc<'a>) -> Result<Option<Outputs<'a>>, RecordError> {
+        self.find_answering(base, tree, None, alloc)
+    }
+
+    /// [`Self::find`] with each derived fact's read answered again with `pins`, the command's
+    /// (brief P, rule 21): the same pins reuse the record, other pins miss it, and `None` passes
+    /// over a list that read a fact, so its script runs again and is refused there by name.
+    pub fn find_answering<'a>(&self, base: &ContentId, tree: &Tree, pins: Option<&FactPins>, alloc: Alloc<'a>) -> Result<Option<Outputs<'a>>, RecordError> {
         let found = lookup(&self.records, Bounds::STANDARD, base, |name| {
             let subject = std::str::from_utf8(name).ok()?;
-            let now = answer_now(tree, subject).ok()?;
-            Some(now.map_or(Digest::Nothing, Digest::Is))
+            crate::fact_pins::read_now(tree, subject, pins, alloc)
         })
         .map_err(RecordError::Chain)?;
         match found {

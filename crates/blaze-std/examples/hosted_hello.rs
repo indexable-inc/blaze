@@ -10,11 +10,11 @@
 use bstd::{Io, hosting::Hosting, wire::HostTable};
 
 mod program {
-    use bstd::{Cx, Io, entry::Error};
+    use bstd::{Cx, entry::Error, out::Out};
 
     #[bstd::main]
-    pub fn main(cx: &Cx, io: Io) -> Result<(), Error> {
-        io.need_out()?.line(cx, "Hello, world!")?;
+    pub fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+        out.line(cx, "Hello, world!")?;
         Ok(())
     }
 }
@@ -28,7 +28,8 @@ unsafe extern "C" {
 #[inline(never)]
 fn host(heap: &'static blaze_own::Heap) -> (i32, Option<Vec<u8>>) {
     let io = Io::sim(1);
-    let hosting = Hosting::new(io.clone(), vec![String::from("hello")], vec![(String::from("everything"), String::from("io"))], 4096, heap.shared());
+    // No grant: `out` fills itself (D104; `Kind::fills_itself`), so the host answers it unasked.
+    let hosting = Hosting::new(io.clone(), vec![String::from("hello")], Vec::new(), 4096, heap.shared());
     let table = hosting.table();
     #[expect(unsafe_code, reason = "the host's call of the program's start, as `blaze run` makes it")]
     // SAFETY: `table` is `hosting`'s, which lives across the call: the start's contract.

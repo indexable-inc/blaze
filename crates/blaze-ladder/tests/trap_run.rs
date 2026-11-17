@@ -67,7 +67,7 @@ const NEW: NewFront<'static> = NewFront { package: "ladder", edition: "2024", sh
 #[test]
 fn a_trap_in_placed_code_names_its_function_and_caller() {
     let files = [SourceFile { path: "src/main.rs", text: PROGRAM }];
-    let ended = match run_program(&files, "src/main.rs", None, NEW) {
+    let ended = match run_program(&files, "src/main.rs", None, NEW, blaze_own::testing::heap().shared()) {
         Err(e) => e,
         Ok(ran) => panic!("the program returned status {} past an `unreachable`", ran.status),
     };

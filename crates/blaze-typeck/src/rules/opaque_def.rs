@@ -29,12 +29,11 @@
 //! - Each defined opaque's hidden type is written to the record (`Checked::hidden`, by
 //!   writeback through `defined_hidden`).
 //!
-//! Owed: the world does not yet answer `opaque_hidden` from `Checked::hidden` (blaze-ladder
-//! front2 world_items.rs), so a CALLER's auto-trait goal on an opaque (`Send`) stays ambiguous
-//! in the solver (blaze-solve structural.rs: "ambiguous until it does") and is the typed gap
-//! of `opaque_ambiguity_gap`. That gap is `CheckError::Unported(&'static str)`: it cannot name
-//! the opaque's key; the variant wanted is `OpaqueHiddenUnknown { opaque, trait_ }` (not
-//! additive: blaze-real's and blaze-ladder's matches on `CheckError` are exhaustive).
+//! A CALLER's auto-trait goal on an opaque (`Send`) whose hidden type the world did not give
+//! stays ambiguous in the solver (blaze-solve structural.rs: "ambiguous until it does") and is
+//! the typed gap `CheckError::OpaqueHiddenUnknown { opaque, trait_ }` of
+//! `opaque_ambiguity_gap`; blaze-ladder's front2 (opaque_auto.rs) then has the opaque's defining
+//! body checked and checks the caller again with the hidden type given.
 
 use crate::error::Stop;
 use crate::ids::{ExprId, ItemKey};
@@ -122,28 +121,64 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         got
     }
 
-    /// A goal left ambiguous whose self type is an opaque: its hidden type is not recorded (the
-    /// world answers `opaque_hidden` with `None`), so an auto trait of it (`Send`, which "leaks"
-    /// from the hidden type) has no answer yet. A typed gap naming the form, never E0283.
+    /// A goal left ambiguous on an opaque whose hidden type is not recorded (the world answers
+    /// `opaque_hidden` with `None`): an auto trait of it (`Send`, which "leaks" from the hidden
+    /// type) has no answer yet. A typed gap naming the opaque, never E0283.
     ///
-    /// Only an AUTO trait is the gap (the Reference, "Abstract return types": the caller "may
-    /// only use the methods declared by the specified Trait", auto traits excepted: they are
-    /// read from the hidden type): any other ambiguous trait goal on an opaque is decided from
-    /// its bounds alone, so its ambiguity is the ordinary E0283.
+    /// 1. The goal's SELF type is the opaque: only an AUTO trait is the gap (the Reference,
+    ///    "Abstract return types": the caller "may only use the methods declared by the
+    ///    specified Trait", auto traits excepted: they are read from the hidden type); any other
+    ///    ambiguous trait goal on an opaque is decided from its bounds alone, so its ambiguity
+    ///    is the ordinary E0283.
+    /// 2. Otherwise the auto trait may be reached INSIDE the goal ("Auto trait leakage" holds
+    ///    at any depth): `Option<O>: Send` structurally, or `Pin<Box<O>>: CoerceUnsized<Pin<Box<dyn
+    ///    Future + Send>>>` through two impls and an unsizing (rung s9-app-03). The solver does
+    ///    not say which leaf was ambiguous, so the first opaque met in the goal's types (left to
+    ///    right, outermost first) that this body does not define and whose hidden type the world
+    ///    does not give is the gap. A superset: if that opaque was not the cause, the next round
+    ///    has its hidden type and reports the ordinary E0283 (this rule then passes it by).
     pub(crate) fn opaque_ambiguity_gap(&mut self, goal: Goal) -> Result<Option<crate::error::CheckError>, Stop> {
+        // The most type nodes one goal's walk visits (rule 18); interned types are acyclic, so
+        // only a shared subtree met many times can reach it.
+        const MOST_GOAL_NODES: u32 = 1 << 16;
         let Goal::Trait { trait_, args } = goal else { return Ok(None) };
-        if self.ty.list_len(args) == 0 {
+        let n = self.ty.list_len(args);
+        if n == 0 {
             return Ok(None);
         }
         let this = self.ty.shallow_resolve(self.ty.list_get(args, 0));
-        if !matches!(self.view(this), crate::ty::TyView::Opaque(..)) {
-            return Ok(None);
+        if let crate::ty::TyView::Opaque(opaque, _) = self.view(this) {
+            let auto = match self.reads.trait_def(trait_)? {
+                Some(def) => def.flags.0 & crate::world::TraitFlags::AUTO != 0,
+                None => false,
+            };
+            return Ok(auto.then_some(crate::error::CheckError::OpaqueHiddenUnknown { opaque, trait_ }));
         }
-        let auto = match self.reads.trait_def(trait_)? {
-            Some(def) => def.flags.0 & crate::world::TraitFlags::AUTO != 0,
-            None => false,
-        };
-        Ok(auto.then_some(crate::error::CheckError::Unported("an auto trait of an opaque type: its hidden type is not recorded yet")))
+        let mut work: blaze_own::Vec<Ty, blaze_own::Alloc<'a>> = blaze_own::Vec::new_in(self.alloc);
+        let mut kids: blaze_own::Vec<Ty, blaze_own::Alloc<'a>> = blaze_own::Vec::new_in(self.alloc);
+        for i in (0..n).rev() {
+            work.push(self.ty.list_get(args, i));
+        }
+        let mut met = 0u32;
+        while let Some(t) = work.pop() {
+            met += 1;
+            if met > MOST_GOAL_NODES {
+                return Err(crate::error::CheckError::Limit(crate::error::Limit::Steps).into());
+            }
+            let v = self.view(t);
+            if let crate::ty::TyView::Opaque(opaque, _) = v
+                && !self.defining.iter().any(|&(d, _)| d == opaque)
+                && self.reads.opaque_hidden(opaque)?.is_none()
+            {
+                return Ok(Some(crate::error::CheckError::OpaqueHiddenUnknown { opaque, trait_ }));
+            }
+            kids.clear();
+            self.ty_children(v, &mut kids);
+            while let Some(k) = kids.pop() {
+                work.push(k);
+            }
+        }
+        Ok(None)
     }
 
     fn close_one(&mut self, k: ItemKey, cause: Cause) -> Result<(), Stop> {

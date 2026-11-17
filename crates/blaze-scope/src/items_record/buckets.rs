@@ -296,6 +296,10 @@ impl<'n, 'a> World<&'a str> for OwnNames<'n, 'a> {
         let Some(chain) = self.0.chains.get(&module) else { return false };
         chain.iter().any(|m| self.0.info(*m).is_some_and(|info| info.no_implicit_prelude))
     }
+
+    fn anonymous(&self, module: ItemKey) -> bool {
+        self.0.anonymous(module)
+    }
 }
 
 impl HeadNames for OwnNames<'_, '_> {

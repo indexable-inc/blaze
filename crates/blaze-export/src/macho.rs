@@ -30,7 +30,7 @@ use blaze_own::{AVec, Alloc, Vec};
 use crate::bytes;
 use crate::eh_out::EhSections;
 use crate::error::ExportError;
-use crate::layout::{FixTo, Laid, Plan};
+use crate::layout::{FixTo, Fixup, Laid, Plan};
 use crate::plant::{self, Plant};
 use crate::sign;
 
@@ -38,49 +38,49 @@ use crate::sign;
 pub const BASE: u64 = 0x1_0000_0000;
 pub const PAGE: u64 = 0x4000;
 
-const MH_MAGIC_64: u32 = 0xFEED_FACF;
-const CPU_TYPE_ARM64: u32 = 0x0100_000C;
+pub(crate) const MH_MAGIC_64: u32 = 0xFEED_FACF;
+pub(crate) const CPU_TYPE_ARM64: u32 = 0x0100_000C;
 const MH_EXECUTE: u32 = 2;
 /// `MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE`.
 const MH_FLAGS: u32 = 0x1 | 0x4 | 0x80 | 0x20_0000;
 
 const LC_SEGMENT_64: u32 = 0x19;
-const LC_SYMTAB: u32 = 0x2;
-const LC_DYSYMTAB: u32 = 0xB;
-const LC_LOAD_DYLIB: u32 = 0xC;
+pub(crate) const LC_SYMTAB: u32 = 0x2;
+pub(crate) const LC_DYSYMTAB: u32 = 0xB;
+pub(crate) const LC_LOAD_DYLIB: u32 = 0xC;
 const LC_LOAD_DYLINKER: u32 = 0xE;
-const LC_UUID: u32 = 0x1B;
-const LC_CODE_SIGNATURE: u32 = 0x1D;
-const LC_FUNCTION_STARTS: u32 = 0x26;
-const LC_BUILD_VERSION: u32 = 0x32;
+pub(crate) const LC_UUID: u32 = 0x1B;
+pub(crate) const LC_CODE_SIGNATURE: u32 = 0x1D;
+pub(crate) const LC_FUNCTION_STARTS: u32 = 0x26;
+pub(crate) const LC_BUILD_VERSION: u32 = 0x32;
 const LC_MAIN: u32 = 0x8000_0028;
-const LC_DYLD_CHAINED_FIXUPS: u32 = 0x8000_0034;
+pub(crate) const LC_DYLD_CHAINED_FIXUPS: u32 = 0x8000_0034;
 
-const VM_PROT_READ: u32 = 1;
-const VM_PROT_WRITE: u32 = 2;
-const VM_PROT_EXECUTE: u32 = 4;
+pub(crate) const VM_PROT_READ: u32 = 1;
+pub(crate) const VM_PROT_WRITE: u32 = 2;
+pub(crate) const VM_PROT_EXECUTE: u32 = 4;
 /// `SG_READ_ONLY`: dyld makes the segment read-only once its fixups are done.
-const SG_READ_ONLY: u32 = 0x10;
+pub(crate) const SG_READ_ONLY: u32 = 0x10;
 
 /// `S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS`.
-const S_CODE: u32 = 0x8000_0000 | 0x400;
-const S_REGULAR: u32 = 0;
+pub(crate) const S_CODE: u32 = 0x8000_0000 | 0x400;
+pub(crate) const S_REGULAR: u32 = 0;
 /// ld64's `__eh_frame` flags: `S_COALESCED | S_ATTR_NO_TOC | S_ATTR_STRIP_STATIC_SYMS |
 /// S_ATTR_LIVE_SUPPORT`.
-const S_EH_FRAME: u32 = 0x6800_000B;
-const S_ZEROFILL: u32 = 0x1;
+pub(crate) const S_EH_FRAME: u32 = 0x6800_000B;
+pub(crate) const S_ZEROFILL: u32 = 0x1;
 const S_NON_LAZY_SYMBOL_POINTERS: u32 = 0x6;
 
-const PLATFORM_MACOS: u32 = 1;
+pub(crate) const PLATFORM_MACOS: u32 = 1;
 /// macOS 12.0 (`xxxx.yy.zz` in nibbles): the first whose dyld binds every executable through
 /// chained fixups of `DYLD_CHAINED_PTR_64_OFFSET`.
 const MIN_MACOS: u32 = 0x000C_0000;
 
 const DYLD: &str = "/usr/lib/dyld";
-const LIB_SYSTEM: &str = "/usr/lib/libSystem.B.dylib";
+pub(crate) const LIB_SYSTEM: &str = "/usr/lib/libSystem.B.dylib";
 /// libSystem's versions as a `dylib_command` names them: current 1311.0.0, compatibility 1.0.0.
-const LIB_SYSTEM_CURRENT: u32 = 1311 << 16;
-const LIB_SYSTEM_COMPAT: u32 = 1 << 16;
+pub(crate) const LIB_SYSTEM_CURRENT: u32 = 1311 << 16;
+pub(crate) const LIB_SYSTEM_COMPAT: u32 = 1 << 16;
 
 /// `DYLD_CHAINED_PTR_64_OFFSET`: a rebase's target is an image offset.
 const DYLD_CHAINED_PTR_64_OFFSET: u16 = 6;
@@ -114,7 +114,7 @@ const MAX_COMMANDS: u64 = SEGMENT // __PAGEZERO
     + 56 // LC_LOAD_DYLIB
     + 16 // LC_FUNCTION_STARTS
     + 16; // LC_CODE_SIGNATURE
-const HEADER: u64 = 32;
+pub(crate) const HEADER: u64 = 32;
 /// Where the code starts: past the header and every load command, 16-aligned.
 pub const TEXT_AT: u64 = (HEADER + MAX_COMMANDS + 15) & !15;
 
@@ -144,30 +144,92 @@ struct Seg {
     fixups: bool,
 }
 
-/// The chained fixups blob, and each fixup slot's encoded value by file offset.
-fn chained<'a>(laid: &Laid<'_, '_>, segs: &[Seg], alloc: Alloc<'a>) -> Result<(AVec<'a, u8>, AVec<'a, (u64, u64)>), ExportError> {
-    let mut slots: AVec<'a, (u64, u64)> = Vec::with_capacity_in(laid.fixups.len(), alloc);
-    for (k, f) in laid.fixups.iter().enumerate() {
+/// What a chained slot becomes, in neither writer's own terms: the executable's [`FixTo`] and
+/// the native dylib's (`native_dylib.rs`, `blaze_native::image::FixTo`) both map to it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Chain {
+    /// The image's runtime address plus `target`, an image offset.
+    Rebase { target: u64 },
+    /// The address import row `import` names.
+    Bind { import: u32 },
+}
+
+/// A segment as `dyld_chained_starts_in_image` counts it: every segment in load-command order,
+/// `fixups` set on those whose `[vm, vm + vm_size)` (image offsets) holds chained slots.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ChainSeg {
+    pub vm: u64,
+    pub vm_size: u64,
+    pub fixups: bool,
+}
+
+/// The import table's row form (`dyld_chained_fixups_header::imports_format`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ImportRows {
+    /// `DYLD_CHAINED_IMPORT`: 32-bit rows, an 8-bit ordinal, a weak bit, a 23-bit name offset.
+    Plain,
+    /// `DYLD_CHAINED_IMPORT_ADDEND64`: 16-byte rows, a 16-bit ordinal, a weak bit, a 32-bit name
+    /// offset, a 64-bit addend.
+    Addend64,
+}
+
+/// `DYLD_CHAINED_IMPORT_ADDEND64`.
+const DYLD_CHAINED_IMPORT_ADDEND64: u32 = 3;
+
+/// One import row; its symbol name in the pool is `lead` then `name`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ChainImport<'n> {
+    pub lead: &'static [u8],
+    pub name: &'n [u8],
+    pub ordinal: u16,
+    pub weak: bool,
+    pub addend: i64,
+}
+
+/// A value too wide for the chained form's field `what`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ChainTooLarge {
+    pub what: &'static str,
+    pub len: u64,
+}
+
+/// The chained fixups blob (`dyld_chained_fixups_header`, the starts, the import rows, the
+/// symbol pool), and each slot's encoded `DYLD_CHAINED_PTR_64_OFFSET` value by file offset.
+/// `fixups` are sorted by address, `slot` reads one as (image offset, what it becomes); `import`
+/// gives row `i` of `imports`. Shared by the executable ([`write`]) and the native dylib
+/// (`native_dylib.rs`): one encoder of the format.
+pub(crate) fn chained_fixups<'a, 'n, F>(
+    fixups: &[F],
+    slot: impl Fn(&F) -> (u64, Chain),
+    segs: &[ChainSeg],
+    rows: ImportRows,
+    imports: usize,
+    import: impl Fn(usize) -> ChainImport<'n>,
+    alloc: Alloc<'a>,
+) -> Result<(AVec<'a, u8>, AVec<'a, (u64, u64)>), ChainTooLarge> {
+    let mut slots: AVec<'a, (u64, u64)> = Vec::with_capacity_in(fixups.len(), alloc);
+    for (k, f) in fixups.iter().enumerate() {
+        let (at, to) = slot(f);
         let page_of = |at: u64| at / PAGE;
-        let next = match laid.fixups.get(k + 1) {
-            Some(n) if page_of(n.at) == page_of(f.at) => (n.at - f.at) / STRIDE,
+        let next = match fixups.get(k + 1).map(&slot) {
+            Some((n, _)) if page_of(n) == page_of(at) => (n - at) / STRIDE,
             _ => 0,
         };
-        let value = match f.to {
-            FixTo::Rebase { target } => {
+        let value = match to {
+            Chain::Rebase { target } => {
                 if target >= 1 << 36 {
-                    return Err(ExportError::TooLarge { what: "a chained rebase's 36-bit target", len: target });
+                    return Err(ChainTooLarge { what: "a chained rebase's 36-bit target", len: target });
                 }
                 target | (next << 51)
             }
-            FixTo::Bind { import } => {
+            Chain::Bind { import } => {
                 if import >= 1 << 24 {
-                    return Err(ExportError::TooLarge { what: "a chained bind's 24-bit ordinal", len: u64::from(import) });
+                    return Err(ChainTooLarge { what: "a chained bind's 24-bit ordinal", len: u64::from(import) });
                 }
                 u64::from(import) | (next << 51) | (1 << 63)
             }
         };
-        slots.push((f.at, value));
+        slots.push((at, value));
     }
 
     let mut blob: AVec<'a, u8> = Vec::new_in(alloc);
@@ -191,7 +253,7 @@ fn chained<'a>(laid: &Laid<'_, '_>, segs: &[Seg], alloc: Alloc<'a>) -> Result<(A
         bytes::set32(&mut blob, infos_at + 4 * s, (at - starts_at) as u32);
         let pages = (seg.vm_size / PAGE) as usize;
         if pages > usize::from(u16::MAX) {
-            return Err(ExportError::TooLarge { what: "a segment's 16-bit page count", len: seg.vm_size });
+            return Err(ChainTooLarge { what: "a segment's 16-bit page count", len: seg.vm_size });
         }
         bytes::u32(&mut blob, (22 + 2 * pages) as u32);
         bytes::u16(&mut blob, PAGE as u16);
@@ -204,27 +266,50 @@ fn chained<'a>(laid: &Laid<'_, '_>, segs: &[Seg], alloc: Alloc<'a>) -> Result<(A
             bytes::u16(&mut blob, DYLD_CHAINED_PTR_START_NONE);
         }
         // Each page's first fixup (fixups are sorted by address).
-        for f in laid.fixups.iter().filter(|f| f.at >= seg.vm && f.at < seg.vm + seg.vm_size).rev() {
-            let page = ((f.at - seg.vm) / PAGE) as usize;
-            let offset = ((f.at - seg.vm) % PAGE) as u16;
+        for (at, _) in fixups.iter().map(&slot).filter(|&(at, _)| at >= seg.vm && at < seg.vm + seg.vm_size).rev() {
+            let page = ((at - seg.vm) / PAGE) as usize;
+            let offset = ((at - seg.vm) % PAGE) as u16;
             blob[first + 2 * page..first + 2 * page + 2].copy_from_slice(&offset.to_le_bytes());
         }
     }
-    bytes::pad(&mut blob, 4);
+    match rows {
+        ImportRows::Plain => bytes::pad(&mut blob, 4),
+        ImportRows::Addend64 => bytes::pad(&mut blob, 8),
+    }
     let imports_at = blob.len();
-    let mut name_at = 0u32;
-    for import in laid.imports.iter() {
-        if name_at >= 1 << 23 {
-            return Err(ExportError::TooLarge { what: "a chained import's 23-bit name offset", len: u64::from(name_at) });
+    let mut name_at = 0u64;
+    for i in 0..imports {
+        let row = import(i);
+        match rows {
+            ImportRows::Plain => {
+                if name_at >= 1 << 23 {
+                    return Err(ChainTooLarge { what: "a chained import's 23-bit name offset", len: name_at });
+                }
+                if row.ordinal > 0xFF {
+                    return Err(ChainTooLarge { what: "a DYLD_CHAINED_IMPORT row's 8-bit ordinal", len: u64::from(row.ordinal) });
+                }
+                if row.addend != 0 {
+                    return Err(ChainTooLarge { what: "an addend in a DYLD_CHAINED_IMPORT row, which holds none", len: row.addend as u64 });
+                }
+                // `dyld_chained_import`: lib_ordinal, weak_import, name_offset.
+                bytes::u32(&mut blob, u32::from(row.ordinal) | (u32::from(row.weak) << 8) | ((name_at as u32) << 9));
+            }
+            ImportRows::Addend64 => {
+                if name_at > u64::from(u32::MAX) {
+                    return Err(ChainTooLarge { what: "a chained import's 32-bit name offset", len: name_at });
+                }
+                // `dyld_chained_import_addend64`: lib_ordinal, weak_import, reserved, name_offset; addend.
+                bytes::u64(&mut blob, u64::from(row.ordinal) | (u64::from(row.weak) << 16) | (name_at << 32));
+                bytes::u64(&mut blob, row.addend as u64);
+            }
         }
-        // `dyld_chained_import`: lib_ordinal 1 (libSystem), not weak, the name's offset.
-        bytes::u32(&mut blob, 1 | (name_at << 9));
-        name_at += import.name.len() as u32 + 2;
+        name_at += (row.lead.len() + row.name.len() + 1) as u64;
     }
     let symbols_at = blob.len();
-    for import in laid.imports.iter() {
-        blob.push(b'_');
-        blob.extend_from_slice(import.name.as_bytes());
+    for i in 0..imports {
+        let row = import(i);
+        blob.extend_from_slice(row.lead);
+        blob.extend_from_slice(row.name);
         blob.push(0);
     }
     bytes::pad(&mut blob, 8);
@@ -232,32 +317,63 @@ fn chained<'a>(laid: &Laid<'_, '_>, segs: &[Seg], alloc: Alloc<'a>) -> Result<(A
     bytes::set32(&mut blob, 4, starts_at as u32);
     bytes::set32(&mut blob, 8, imports_at as u32);
     bytes::set32(&mut blob, 12, symbols_at as u32);
-    bytes::set32(&mut blob, 16, laid.imports.len() as u32);
-    bytes::set32(&mut blob, 20, DYLD_CHAINED_IMPORT);
+    bytes::set32(&mut blob, 16, imports as u32);
+    let format = match rows {
+        ImportRows::Plain => DYLD_CHAINED_IMPORT,
+        ImportRows::Addend64 => DYLD_CHAINED_IMPORT_ADDEND64,
+    };
+    bytes::set32(&mut blob, 20, format);
     bytes::set32(&mut blob, 24, 0); // symbols_format: not compressed
     Ok((blob, slots))
 }
 
-fn segment(out: &mut AVec<'_, u8>, seg: &Seg, nsects: u32) {
-    bytes::u32(out, LC_SEGMENT_64);
-    bytes::u32(out, (SEGMENT + SECTION * u64::from(nsects)) as u32);
-    bytes::name16(out, seg.name);
-    bytes::u64(out, if seg.name == "__PAGEZERO" { 0 } else { BASE + seg.vm });
-    bytes::u64(out, seg.vm_size);
-    bytes::u64(out, seg.file);
-    bytes::u64(out, seg.file_size);
-    bytes::u32(out, seg.prot);
-    bytes::u32(out, seg.prot);
-    bytes::u32(out, nsects);
-    bytes::u32(out, seg.flags);
+/// The chained fixups blob, and each fixup slot's encoded value by file offset: the
+/// executable's imports are libSystem's (ordinal 1), named with the platform's `_`.
+fn chained<'a>(laid: &Laid<'_, '_>, segs: &[Seg], alloc: Alloc<'a>) -> Result<(AVec<'a, u8>, AVec<'a, (u64, u64)>), ExportError> {
+    let mut chain_segs: AVec<'a, ChainSeg> = Vec::with_capacity_in(segs.len(), alloc);
+    for seg in segs {
+        chain_segs.push(ChainSeg { vm: seg.vm, vm_size: seg.vm_size, fixups: seg.fixups });
+    }
+    let slot = |f: &Fixup| {
+        let to = match f.to {
+            FixTo::Rebase { target } => Chain::Rebase { target },
+            FixTo::Bind { import } => Chain::Bind { import },
+        };
+        (f.at, to)
+    };
+    let import = |i: usize| ChainImport { lead: b"_", name: laid.imports[i].name.as_bytes(), ordinal: 1, weak: false, addend: 0 };
+    chained_fixups(&laid.fixups, slot, &chain_segs, ImportRows::Plain, laid.imports.len(), import, alloc)
+        .map_err(|e| ExportError::TooLarge { what: e.what, len: e.len })
 }
 
-/// `section_64`: `addr` an image offset, `offset` its file offset (0 for zero fill).
+/// `segment_command_64` at address `vmaddr` (`maxprot` = `initprot` = `prot`), for the
+/// executable ([`segment`]) and the native dylib (`native_dylib.rs`, whose `__TEXT` is at 0).
 #[allow(clippy::too_many_arguments)]
-fn section(out: &mut AVec<'_, u8>, name: &str, seg: &str, addr: u64, size: u64, offset: u64, align: u32, flags: u32, reserved1: u32) {
+pub(crate) fn segment_command(out: &mut AVec<'_, u8>, name: &str, vmaddr: u64, vm_size: u64, file: u64, file_size: u64, prot: u32, nsects: u32, flags: u32) {
+    bytes::u32(out, LC_SEGMENT_64);
+    bytes::u32(out, (SEGMENT + SECTION * u64::from(nsects)) as u32);
+    bytes::name16(out, name);
+    bytes::u64(out, vmaddr);
+    bytes::u64(out, vm_size);
+    bytes::u64(out, file);
+    bytes::u64(out, file_size);
+    bytes::u32(out, prot);
+    bytes::u32(out, prot);
+    bytes::u32(out, nsects);
+    bytes::u32(out, flags);
+}
+
+fn segment(out: &mut AVec<'_, u8>, seg: &Seg, nsects: u32) {
+    let vmaddr = if seg.name == "__PAGEZERO" { 0 } else { BASE + seg.vm };
+    segment_command(out, seg.name, vmaddr, seg.vm_size, seg.file, seg.file_size, seg.prot, nsects, seg.flags);
+}
+
+/// `section_64` at address `addr`, `offset` its file offset (0 for zero fill).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn section_command(out: &mut AVec<'_, u8>, name: &str, seg: &str, addr: u64, size: u64, offset: u64, align: u32, flags: u32, reserved1: u32) {
     bytes::name16(out, name);
     bytes::name16(out, seg);
-    bytes::u64(out, BASE + addr);
+    bytes::u64(out, addr);
     bytes::u64(out, size);
     bytes::u32(out, offset as u32);
     bytes::u32(out, align);
@@ -269,7 +385,13 @@ fn section(out: &mut AVec<'_, u8>, name: &str, seg: &str, addr: u64, size: u64, 
     bytes::u32(out, 0);
 }
 
-fn linkedit_data(out: &mut AVec<'_, u8>, cmd: u32, off: u64, size: u64) {
+/// `section_64`: `addr` an image offset, `offset` its file offset (0 for zero fill).
+#[allow(clippy::too_many_arguments)]
+fn section(out: &mut AVec<'_, u8>, name: &str, seg: &str, addr: u64, size: u64, offset: u64, align: u32, flags: u32, reserved1: u32) {
+    section_command(out, name, seg, BASE + addr, size, offset, align, flags, reserved1);
+}
+
+pub(crate) fn linkedit_data(out: &mut AVec<'_, u8>, cmd: u32, off: u64, size: u64) {
     bytes::u32(out, cmd);
     bytes::u32(out, 16);
     bytes::u32(out, off as u32);

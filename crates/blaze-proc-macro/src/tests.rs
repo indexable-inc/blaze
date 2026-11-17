@@ -259,7 +259,7 @@ struct Setup {
 }
 
 fn setup(body: &[u8], macros: u32) -> Setup {
-    let runtime = Runtime::new().expect("the runtime");
+    let runtime = Runtime::new(blaze_own::testing::heap()).expect("the runtime");
     let module = module(wasm(body), macros);
     let loaded = runtime.load(&module).expect("the module loads");
     Setup { runtime, module, loaded }
@@ -460,7 +460,7 @@ fn compiled_path(runtime: &Runtime, module: &ModuleRecord) -> PathBuf {
 #[test]
 fn a_second_runtime_loads_the_compiled_record_without_compiling() {
     let dir = folder("compiled");
-    let first = Runtime::new().expect("the runtime");
+    let first = Runtime::new(blaze_own::testing::heap()).expect("the runtime");
     let module = reader_in(&dir);
     let loaded = first.load(&module).expect("it compiles");
     assert!(loaded.compiled);
@@ -468,7 +468,7 @@ fn a_second_runtime_loads_the_compiled_record_without_compiling() {
     assert!(Arc::ptr_eq(&loaded, &first.load(&module).expect("it is loaded")), "one load per runtime");
     assert_eq!(first.compiles(), 1);
     let fresh = Setup { runtime: first, module, loaded };
-    let second = Runtime::new().expect("the runtime");
+    let second = Runtime::new(blaze_own::testing::heap()).expect("the runtime");
     let module = reader_in(&dir);
     let loaded = second.load(&module).expect("it loads from its record");
     assert!(!loaded.compiled);
@@ -482,7 +482,7 @@ fn a_second_runtime_loads_the_compiled_record_without_compiling() {
 #[test]
 fn a_compiled_record_with_a_flipped_byte_is_refused_and_compiled_again() {
     let dir = folder("flipped");
-    let first = Runtime::new().expect("the runtime");
+    let first = Runtime::new(blaze_own::testing::heap()).expect("the runtime");
     let module = reader_in(&dir);
     first.load(&module).expect("it compiles");
     let path = compiled_path(&first, &module);
@@ -490,13 +490,13 @@ fn a_compiled_record_with_a_flipped_byte_is_refused_and_compiled_again() {
     let at = bytes.len() / 2;
     bytes[at] ^= 1;
     std::fs::write(&path, &bytes).expect("the flipped record");
-    let second = Runtime::new().expect("the runtime");
+    let second = Runtime::new(blaze_own::testing::heap()).expect("the runtime");
     let loaded = second.load(&module).expect("it compiles again");
     assert!(loaded.compiled);
     assert_eq!(second.compiles(), 1);
     let findings = second.take_findings();
     assert!(matches!(&findings[..], [CompiledFinding { record, why: Refused::Digest { .. }, .. }] if *record == path), "{findings:?}");
-    let third = Runtime::new().expect("the runtime");
+    let third = Runtime::new(blaze_own::testing::heap()).expect("the runtime");
     assert!(!third.load(&module).expect("it loads").compiled, "the record written again is loaded");
 }
 
@@ -504,22 +504,22 @@ fn a_compiled_record_with_a_flipped_byte_is_refused_and_compiled_again() {
 #[test]
 fn a_compiled_record_of_another_setting_is_not_loaded() {
     let dir = folder("settings");
-    let standard = Runtime::new().expect("the runtime");
+    let standard = Runtime::new(blaze_own::testing::heap()).expect("the runtime");
     let module = reader_in(&dir);
     standard.load(&module).expect("it compiles");
-    let other = Runtime::with_settings(&Settings { optimize: false, ..Settings::standard() }).expect("the runtime");
+    let other = Runtime::with_settings(&Settings { optimize: false, ..Settings::standard() }, blaze_own::testing::heap()).expect("the runtime");
     assert_ne!(other.code_key(&module), standard.code_key(&module));
     let loaded = other.load(&module).expect("it compiles");
     assert!(loaded.compiled);
     assert_eq!(other.compiles(), 1);
-    let again = Runtime::new().expect("the runtime");
+    let again = Runtime::new(blaze_own::testing::heap()).expect("the runtime");
     assert!(!again.load(&module).expect("it loads").compiled, "the standard record is still there");
 }
 
 /// Two workers of one runtime asking for one module at once: one compiles, the other waits.
 #[test]
 fn two_workers_loading_one_module_compile_it_once() {
-    let runtime = Runtime::new().expect("the runtime");
+    let runtime = Runtime::new(blaze_own::testing::heap()).expect("the runtime");
     let module = reader_in(&folder("two-loads"));
     let (a, b) = std::thread::scope(|s| {
         let a = s.spawn(|| runtime.load(&module).expect("it loads"));
@@ -751,7 +751,7 @@ fn proc_def(krate: blaze_id::CrateItemKey, name: &str) -> blaze_expand::MacroDef
 /// A crate with no module is one finding naming it and its version, however many calls meet it.
 #[test]
 fn a_missing_module_is_one_finding_per_crate() {
-    let runtime = Runtime::new().expect("the runtime");
+    let runtime = Runtime::new(blaze_own::testing::heap()).expect("the runtime");
     let store_dir = folder("missing");
     let records = records_at(&store_dir);
     let key = crate::hook::crate_key("absent");

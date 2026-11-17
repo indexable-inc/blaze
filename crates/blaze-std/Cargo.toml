@@ -32,6 +32,9 @@ blaze-http = { workspace = true, optional = true }
 blaze-h1 = { workspace = true, optional = true }
 # `url` and `net::HostPort`: checked addresses, their one home.
 blaze-url.workspace = true
+# blaze's test engine, for `#[bstd::test]`'s DRAWN parameters (D109). Behind `sim-draws`, which a
+# crate turns on in its [dev-dependencies]: a build without tests never compiles it.
+blaze-sim = { workspace = true, optional = true }
 blaze-ids.workspace = true
 # The run spec (`spec`): a strict data model, and JSON with sorted keys.
 blaze-data.workspace = true
@@ -78,6 +81,9 @@ net = ["requests", "dep:blaze-http", "blaze-http/h3"]
 # `bstd::requests` (`Http`) alone: blaze-h1's sans-IO HTTP/1.1 core driven over `Net`, with no
 # TLS stack and none of blaze-http. blaze-cli's shared-cache origin turns on this one.
 requests = ["dep:blaze-h1"]
+# `#[bstd::test]`'s drawn parameters (D109): `fn t(cx: &Cx, xs: Vec<u32, _>)`, each value drawn
+# from a tape by blaze-sim, shrunk and replayed. Turn it on in [dev-dependencies] only.
+sim-draws = ["dep:blaze-sim"]
 # `bstd::image`: PNG decode and encode, and its zlib.
 image = ["dep:blaze-deflate"]
 # `bstd::test::native`: a test's native world, from a test's root of real-OS authority

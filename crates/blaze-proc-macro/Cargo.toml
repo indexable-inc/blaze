@@ -10,6 +10,10 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+# Decision D105: an expansion runs a proc macro's wasm here, so this crate is the expander's too.
+[package.metadata.blaze]
+producer = ["expander"]
+
 [lib]
 doctest = false
 
@@ -56,6 +60,8 @@ blaze-fetch.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+# `blaze_own::testing::heap()`: a test's root allocator (D102).
+blaze-own = { workspace = true, features = ["std", "testing"] }
 # `clang_shelf`: the pinned C toolchain's archive fetched over HTTPS, streamed (D69).
 blaze-http.workspace = true
 # A test's table of source corrections, read with the lexer's scalar width.

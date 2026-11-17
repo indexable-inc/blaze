@@ -18,10 +18,15 @@
 //!
 //! `frem` and the conversions to and from `i128` are calls (pass/runtime.rs).
 //!
-//! Refused by name: the min/max/rounding family, `fma`, `f16` and `f128`, and the two
-//! conditions that need two flags (`one`, `ueq`).
+//! The float functions (`fabs`, `sqrt`, the roundings, the min/max pairs, `fcopysign`, `fma`,
+//! `fmuladd`) are pass/float/math.rs's.
+//!
+//! Refused by name: `f16` and `f128`, and the two conditions that need two flags (`one`,
+//! `ueq`).
 
 use std::alloc::Allocator;
+
+mod math;
 
 use blaze_lir::{FloatCond, Op, Scalar, Ty, Value};
 
@@ -235,7 +240,22 @@ impl<A: Allocator> Pass<'_, '_, A> {
             }
             // A call of `fmod`/`fmodf` (pass/runtime.rs).
             Op::Frem => return self.frem(inst, op),
-            _ => return Err(unsupported(inst, op, "this float operation (min/max, rounding, `fma`, `sqrt`, `copysign`, `fabs`)")),
+            // pass/float/math.rs.
+            Op::Fabs
+            | Op::Sqrt
+            | Op::Floor
+            | Op::Ceil
+            | Op::Ftrunc
+            | Op::Nearest
+            | Op::Fround
+            | Op::FminNum
+            | Op::FmaxNum
+            | Op::Fminimum
+            | Op::Fmaximum
+            | Op::Fcopysign
+            | Op::Fma
+            | Op::Fmuladd => return self.float_math(inst, op),
+            _ => return Err(unsupported(inst, op, "this float operation (none other is routed here: a router bug)")),
         }
         Ok(())
     }

@@ -15,7 +15,7 @@
 //! unresolved paths point into, and the peak footprint. A measurement (rule 82), not a test.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::{path::{Path, PathBuf}, process::ExitCode};
 use std::time::Instant;
 
 use blaze_fetch::{PackView, SourceId};
@@ -266,7 +266,7 @@ fn print_top(title: &str, map: &BTreeMap<String, (usize, String)>, n: usize) {
     }
 }
 
-fn main() {
+fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let (Some(root), Some(store)) = (args.get(1).map(PathBuf::from), args.get(2).map(PathBuf::from)) else {
         eprintln!("usage: workspace <workspace dir> <blaze-fetch store folder>");
@@ -366,7 +366,15 @@ fn main() {
         places.push((c.shown_from.as_str().to_string(), place));
     }
     let texts = Texts { places };
-    let inputs = crates.inputs();
+    // A refused crate (a member proc macro the shelf has no wasm32-wasip1 side for) is not
+    // resolved with no dependencies: the run stops, naming it (rule 3).
+    let inputs = match crates.checked_inputs() {
+        Ok(inputs) => inputs,
+        Err(refused) => {
+            eprintln!("the workspace's crates: {}", refused.why);
+            return ExitCode::from(2);
+        }
+    };
     let tc_ms = t_tc.elapsed().as_secs_f64() * 1e3;
     let procs = crates.crates.iter().filter(|c| c.implicit.proc_macro).count();
     println!(
@@ -494,4 +502,5 @@ fn main() {
         print_top("\nmodules refused", &fails, 5);
     }
     println!("\nmemory        lifetime peak phys_footprint {:.1} MiB", max_footprint() as f64 / (1 << 20) as f64);
+    ExitCode::SUCCESS
 }

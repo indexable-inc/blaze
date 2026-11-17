@@ -132,8 +132,20 @@ pub trait FrontEnd {
     fn resolve(&self, i: usize, item: ItemKey, args: List, ground: &mut PortableTys<'_>) -> Result<(ItemKey, List), ResolveError>;
     /// Whether trait `trait_` has an impl for `ty`, selected in fn `i`'s world.
     fn selects(&self, i: usize, trait_: ItemKey, ty: PTy, ground: &mut PortableTys<'_>) -> Result<bool, ResolveError>;
+    /// ADT `adt`'s `Drop` impl, by the ADT's item alone in fn `i`'s world (blaze-typeck
+    /// `adt_drop_impl`): a `Drop` impl covers every instance of its ADT (E0366/E0367), so no
+    /// argument is imported and nothing is selected. Its scratch lives in `alloc`, the caller's.
+    fn adt_drop_impl(&self, i: usize, drop_trait: ItemKey, adt: ItemKey, alloc: Alloc<'_>) -> Result<Option<ItemKey>, ResolveError>;
     fn sig(&self, i: usize) -> FnSig<'_>;
     fn fn_index(&self, key: ItemKey) -> Option<usize>;
+    /// The ABI fn `key` is declared with: a fact of its head, never of its body (the
+    /// Reference, "Functions": "Functions may qualify their signatures with an ABI"). The
+    /// builder asks it of every fn it builds or calls (`Adts::abi`), a dynamic call's trait fn
+    /// included, whose body the program may leave out. Default: the tabled fn's.
+    fn fn_abi(&self, key: ItemKey) -> Option<Abi> {
+        let i = self.fn_index(key)?;
+        (i < self.fn_count()).then(|| self.function(i).abi)
+    }
     /// Every body checked, by index: `None` for a fn without one. A body with any diagnostic
     /// or gap is a refusal, never a `Some`.
     fn check_all(&mut self) -> Result<Vec<Option<Checked<'static>>, Global>, RunError>;
@@ -173,6 +185,15 @@ pub trait FrontEnd {
     /// callee" refusals of a call or a type naming it then say this cause instead of only the
     /// symptom. `None` in a run (a run stops at the first such cause) and for the old front.
     fn left_out(&self, _key: ItemKey) -> Option<&str> {
+        None
+    }
+    /// Whether fn `key` is NOUNWIND (front2 program/head_abi.rs `BuildAbi`): its ABI is of the
+    /// Reference's "non-unwinding" category ("C", "system"; not "Rust", "rust-call" or an ABI
+    /// ending in "-unwind"), or it is `#[rustc_nounwind]`. For a fn with a body: a panic that
+    /// reaches its edge aborts (blaze-build's `Adts::nounwind`); for a foreign declaration: a
+    /// call of it never unwinds. `None`: not tabled, or a front end that does not answer (the
+    /// old front); the builder then refuses an `extern` body under `panic = unwind` by name.
+    fn nounwind(&self, _key: ItemKey) -> Option<bool> {
         None
     }
     /// The item the library marks `#[lang = "name"]`, for the builder's own items the
@@ -317,6 +338,10 @@ impl FrontEnd for Front<'_> {
 
     fn selects(&self, i: usize, trait_: ItemKey, ty: PTy, ground: &mut PortableTys<'_>) -> Result<bool, ResolveError> {
         Ok(select_impl(&Front::world(self, i), trait_, &[ty], ground, Alloc::global())?.is_some())
+    }
+
+    fn adt_drop_impl(&self, i: usize, drop_trait: ItemKey, adt: ItemKey, alloc: Alloc<'_>) -> Result<Option<ItemKey>, ResolveError> {
+        blaze_typeck::adt_drop_impl(&Front::world(self, i), drop_trait, adt, alloc)
     }
 
     fn sig(&self, i: usize) -> FnSig<'_> {

@@ -11,6 +11,10 @@
 //! - [`names`]: how a symbol is named in IR and read back from a remark.
 //! - [`read_lsda`] (P8b): LLVM's LSDA read back into blaze's unwind rows
 //!   (`blaze_code::unwind::Row`); blaze-code eh.rs makes the LSDA again at placement.
+//! - [`read`] (D3): LLVM's object (arm64 Mach-O, aarch64 ELF) read back into the new code
+//!   record, `blaze_tier::Emitted`: one relocation a site, the frame (from the compact entry or
+//!   either format's `__eh_frame`) checked against blaze's one frame form, the LSDA's rows;
+//!   anything the record cannot say refused by name (x86-64's relocations among them).
 //!
 //! The contract with LLVM: its own inliner decides inside the offered bodies; NO pass infers a
 //! fact about a callee from an offered body; blaze supplies the facts as attributes; the
@@ -29,10 +33,12 @@ pub mod lower;
 pub mod lower_target;
 pub mod names;
 pub mod pipeline;
+pub mod read;
 pub mod read_lsda;
 pub mod remarks;
 
 pub use compile::{Linked, LlvmError, Severity, bitcode, compile, default_pipeline, init, triple};
 pub use lower::{CalleeFacts, LowerError, Lowered, Offered, lower};
 pub use pipeline::Pipeline;
+pub use read::{ObjName, ReadError, read_object};
 pub use remarks::{Remark, RemarkError};

@@ -39,6 +39,12 @@ pub const MODULE_AT_BOTH: u16 = 4;
 
 const OUT_DOMAIN: &str = "blaze-cli parts out 1";
 
+/// The frame of one file's body job on the pool: its owners' front end over records (the world,
+/// the readers) and its bodies' checks, a size of its own like a crate scope's
+/// (`names::SCOPE_FRAME`), never a task's scratch (`Sizes::scratch`, which a test makes as
+/// small as one outline: the body job then refused its world, draw_tests 2026-11-16).
+const BODY_FRAME: usize = TASK_FRAME;
+
 /// The finding number of a task's typed failure, filed as its answer ([`filed`]): its one
 /// argument is the failure's words.
 pub const TASK_FAILED: u16 = 16;
@@ -71,7 +77,8 @@ fn filed(failure: &TaskFailure, task: &Task<'_>) -> bool {
         return false;
     }
     match failure.why {
-        Why::Panicked { .. } => false,
+        // A file read that is not the swept text: never filed under the swept id (rule 21).
+        Why::Panicked { .. } | Why::Changed => false,
         Why::Waited { .. } => true,
         Why::NotBuilt | Why::Refused { .. } => failure.name.kind != Kind::CrateScope,
     }
@@ -259,6 +266,9 @@ pub struct Frames {
     /// What the pooled jobs of one [`run_batches`] call read while they run (each job's path):
     /// reset when the call's scope has joined, so nothing a job needs is held past its run.
     pub jobs: Frame,
+    /// What the pooled `CrateScope` jobs of one [`run_batches`] call read (their dependencies'
+    /// exports records, once a round each: `names::ScopeRound`): reset with `jobs`.
+    pub scopes: Frame,
 }
 
 /// The most each of [`Frames`] holds, and a bug to plant (the tests' controls).
@@ -282,9 +292,13 @@ pub enum Plant {
     /// A filed failure keeps no reads ([`filed_record`]): it stands after an input it was
     /// handed changed, which the filed-failure test must catch.
     FiledWithoutReads,
-    /// The command's tool has this seed as its body checker's row (D105,
-    /// `Producers::planted_for_tests`): an older checker's records, for the producer test.
-    BodyChecker(&'static str),
+    /// The command's producers' table has this seed as this row (D105,
+    /// `Producers::planted_for_tests`): an older producer's records, for the producer tests.
+    Producer(blaze_ids::producer::Row, &'static str),
+    /// A round's crate scope jobs share their dependencies' records by PLACE in each crate's
+    /// list, not by record key (names/scope.rs `ScopeRound`): the bug a state shared across a
+    /// round's jobs makes, which the pooled-records test must catch.
+    ScopeShareByPlace,
 }
 
 impl Sizes {
@@ -297,6 +311,7 @@ impl Sizes {
             scratch: Frame::with_reserve(self.scratch, Tag::Other).map_err(|_| CliError::Text { what: "a task's scratch frame could not be reserved" })?,
             batch: Frame::with_reserve(self.batch, Tag::Other).map_err(|_| CliError::Text { what: "a batch's frame could not be reserved" })?,
             jobs: Frame::with_reserve(self.batch, Tag::Other).map_err(|_| CliError::Text { what: "the pooled jobs' frame could not be reserved" })?,
+            scopes: Frame::with_reserve(crate::names::SCOPE_JOBS, Tag::Other).map_err(|_| CliError::Text { what: "the crate scope jobs' frame could not be reserved" })?,
         })
     }
 }
@@ -330,6 +345,11 @@ pub struct HighWater {
     pub jobs: usize,
     /// The request's own frame at the answer.
     pub request: usize,
+    /// One crate scope's resolution on the pool, in its own frame (`names::SCOPE_FRAME`), not
+    /// a task's scratch: a crate's names are as large as the crate.
+    pub scope: usize,
+    /// One file's body job on the pool, in its own frame ([`BODY_FRAME`]).
+    pub bodies: usize,
 }
 
 /// Run every task of `batches` (every batch the request has out), then answer the machine once
@@ -354,7 +374,7 @@ pub fn run_batches<'f, 'r>(
     let began = phases.now();
     let steps_before = phases.request.steps;
     unwind_refusals();
-    let Frames { scratch, batch: held, jobs } = frames;
+    let Frames { scratch, batch: held, jobs, scopes } = frames;
     // Every batch's `FileItems` tasks go to the pool at once, each in its own frame, so the
     // pool is as wide as every batch the request has handed out (it hands out one a worker);
     // then each batch is answered in turn: its other tasks run here, its pooled ones joined.
@@ -372,6 +392,8 @@ pub fn run_batches<'f, 'r>(
         // What a job reads while it runs lives in the jobs' frame, reset below once the scope
         // has joined: the command's own frame takes nothing per task (memory by lifetime).
         let jobs: &Frame = jobs;
+        // The round's crate scope jobs share their dependencies' records, read once a round.
+        let mut round = crate::names::ScopeRound::new(&*scopes, facts.plant == Plant::ScopeShareByPlace);
         // The round's body jobs being gathered: each file's job and its bodies so far, over
         // every batch (a batch is of one home; two batches may be of the same one).
         let mut files: Vec<(Job<'_>, Vec<(Name, u32), &Frame>, &crate::body_types::TypesJob<'_>), Global> = Vec::new_in(Global);
@@ -382,7 +404,8 @@ pub fn run_batches<'f, 'r>(
                     tasks.push(Spawned::Waited(on));
                     continue;
                 }
-                tasks.push(match task.name.kind {
+                let made_at = phases.now();
+                let spawned = match task.name.kind {
                     Kind::FileItems => match job_of(req, facts, task, jobs) {
                         Ok(job) => Spawned::One(scope.may_overlap("outline", task_frame, {
                             let clock = &clock;
@@ -390,55 +413,80 @@ pub fn run_batches<'f, 'r>(
                         })),
                         Err(what) => Spawned::Refused(what),
                     },
+                    // A crate's names on the pool: its job made here from record bytes
+                    // (names/scope.rs); a task with no resolution to make answers here.
+                    Kind::CrateScope if builds(Kind::CrateScope) => match unwinding(|| scope_job(&cx, root, store, facts, task, frame, &mut round, alloc)) {
+                        Err(Panicked) => Spawned::Refused("a crate scope's job panicked while it was made (its words are on the error stream)"),
+                        Ok(Ok(Some(job))) => Spawned::Scope(scope.may_overlap("crate scope", crate::names::SCOPE_FRAME, {
+                            let clock = &clock;
+                            move |cx: &Cx| Ok::<_, core::convert::Infallible>(pooled_scope(cx, root, job, clock))
+                        })),
+                        Ok(Ok(None)) => Spawned::Here,
+                        Ok(Err(CliError::Text { what })) => Spawned::Refused(what),
+                        Ok(Err(error)) => return Err(error),
+                    },
                     Kind::BodyCheck => {
                         // The crates its types read come first (body_types.rs): a task that
                         // lacks them answers `Need`, and joins its file's job only with them.
+                        // A body joins its file's job of this round when its inputs are what that
+                        // job was prepared from (`TypesJob::covered_by`): prepared once a file a
+                        // round, not once a body. One whose inputs differ is prepared over its
+                        // own and gets a job of its own, never checked over another's reads.
                         let path = req.file_of(task);
-                        let known = files.iter().position(|(job, _, _)| Some(job.slot.as_bytes()) == path && job.edition == task.edition);
-                        let job = match known {
-                            Some(group) => Ok((None, files[group].0.slot, files[group].0.flags)),
-                            None => job_of(req, facts, task, jobs).map(|job| {
-                                let (slot, flags) = (job.slot, job.flags);
-                                (Some(job), slot, flags)
-                            }),
-                        };
-                        match job {
-                            Err(what) => Spawned::Refused(what),
-                            Ok((job, slot, flags)) => {
-                                let real = crate::sweep::real_path(slot, flags, jobs);
-                                let real = core::str::from_utf8(real.leak()).map_err(|_| CliError::Text { what: "a path is not UTF-8" })?;
-                                match crate::body_types::prepare(&cx, root, store, facts, task, real, frame, jobs, alloc)? {
-                                    crate::body_types::Prepared::Need(wants) => Spawned::Need(wants),
-                                    crate::body_types::Prepared::Waited(on) => Spawned::Waited(on),
-                                    crate::body_types::Prepared::Refused(what) => Spawned::Refused(what),
-                                    crate::body_types::Prepared::Ready(types) => {
-                                        let group = match (known, job) {
-                                            (Some(group), _) => group,
-                                            (None, Some(job)) => {
-                                                files.push((job, Vec::new_in(jobs), types));
-                                                files.len() - 1
-                                            }
-                                            (None, None) => return Err(CliError::Text { what: "a body's file job was neither found nor made" }),
-                                        };
-                                        let bodies = &mut files[group].1;
-                                        match bodies.try_push((task.name, task.place)) {
-                                            Ok(()) => Spawned::Body { group, at: bodies.len() - 1 },
-                                            Err(_) => Spawned::Refused(JOBS_FULL),
+                        let known = files.iter().position(|(job, _, types)| Some(job.slot.as_bytes()) == path && job.edition == task.edition && types.covered_by(&task.inputs));
+                        let group = match known {
+                            Some(group) => Ok(group),
+                            None => match job_of(req, facts, task, jobs) {
+                                Err(what) => Err(Spawned::Refused(what)),
+                                Ok(job) => {
+                                    let real = crate::sweep::real_path(job.slot, job.flags, jobs);
+                                    let real = core::str::from_utf8(real.leak()).map_err(|_| CliError::Text { what: "a path is not UTF-8" })?;
+                                    // The names world, made once a command, timed apart from the
+                                    // reads of the crates' records that `prepare` does next.
+                                    let mut world = Ok(());
+                                    if facts.names.is_none()
+                                        && let Some(graph) = task.inputs.iter().find(|input| input.name == Name::unit_graph())
+                                    {
+                                        let world_at = phases.now();
+                                        world = crate::body_types::names_world(&cx, root, store, facts, graph, frame, alloc)?;
+                                        phases.worked(BODY_WORLD, phases.since(world_at));
+                                    }
+                                    match world.map(|()| crate::body_types::prepare(&cx, root, store, facts, task, real, frame, jobs, alloc)) {
+                                        Err(what) => Err(Spawned::Refused(what)),
+                                        Ok(Err(error)) => return Err(error),
+                                        Ok(Ok(crate::body_types::Prepared::Need(wants))) => Err(Spawned::Need(wants)),
+                                        Ok(Ok(crate::body_types::Prepared::Waited(on))) => Err(Spawned::Waited(on)),
+                                        Ok(Ok(crate::body_types::Prepared::Refused(what))) => Err(Spawned::Refused(what)),
+                                        Ok(Ok(crate::body_types::Prepared::Ready(types))) => {
+                                            files.push((job, Vec::new_in(jobs), types));
+                                            Ok(files.len() - 1)
                                         }
                                     }
+                                }
+                            },
+                        };
+                        match group {
+                            Err(spawned) => spawned,
+                            Ok(group) => {
+                                let bodies = &mut files[group].1;
+                                match bodies.try_push((task.name, task.place)) {
+                                    Ok(()) => Spawned::Body { group, at: bodies.len() - 1 },
+                                    Err(_) => Spawned::Refused(JOBS_FULL),
                                 }
                             }
                         }
                     }
                     _ => Spawned::Here,
-                });
+                };
+                phases.worked(made_row(task.name.kind), phases.since(made_at));
+                tasks.push(spawned);
             }
             pending.push(tasks);
         }
         groups.try_reserve_exact(files.len()).map_err(|_| CliError::Text { what: "the list of a round's body jobs could not be made" })?;
         for (file, bodies, types) in files {
             let job = BodiesJob { file, bodies: bodies.leak(), types };
-            groups.push(Group::Running(scope.may_overlap("bodies", task_frame, {
+            groups.push(Group::Running(scope.may_overlap("bodies", BODY_FRAME, {
                 let clock = &clock;
                 move |cx: &Cx| Ok::<_, core::convert::Infallible>(pooled_bodies(cx, root, &job, clock))
             })));
@@ -459,8 +507,9 @@ pub fn run_batches<'f, 'r>(
     drop(groups);
     let joined = scope.join(&cx).map_err(CliError::Pool);
     // Every job has ended: nothing reads the jobs' frame now.
-    high.jobs = high.jobs.max(jobs.peak());
+    high.jobs = high.jobs.max(jobs.peak()).max(scopes.peak());
     jobs.reset();
+    scopes.reset();
     // The batches' steps are counted as steps, not twice as runs.
     let stepped = phases.request.steps - steps_before;
     phases.request.runs += phases.since(began).saturating_sub(stepped);
@@ -475,6 +524,8 @@ enum Spawned<'s> {
     Refused(&'static str),
     /// A `FileItems` task's own pool handle.
     One(bstd::task::Task<'s, Pooled>),
+    /// A `CrateScope` task's resolution on the pool (names/scope.rs).
+    Scope(bstd::task::Task<'s, PooledScope>),
     /// A `BodyCheck` task: the `at`th body of the round's `group`th file job.
     Body { group: usize, at: usize },
     /// An input it was handed is a filed failure ([`failed_input`]): it fails `Waited` on it,
@@ -551,8 +602,9 @@ fn answer_batch<'f, 'r>(
                     && let Group::Running(handle) = core::mem::replace(slot, Group::Taken)
                 {
                     let joined = handle.join(&cx).map_err(CliError::Pool)?;
-                    high.scratch = high.scratch.max(joined.used);
+                    high.bodies = high.bodies.max(joined.used);
                     phases.worked(BODY_JOBS, joined.ns);
+                    phases.worked(BODY_SETUP, joined.setup_ns);
                     if let Some(error) = joined.stopped {
                         return Err(error.into());
                     }
@@ -570,6 +622,26 @@ fn answer_batch<'f, 'r>(
                 phases.worked(row_of(task.name.kind), ns);
                 (done, ns)
             }
+            (Spawned::Scope(handle), _) => {
+                let joined = handle.join(&cx).map_err(CliError::Pool)?;
+                high.scope = high.scope.max(joined.used);
+                phases.worked(SCOPES, joined.ns);
+                // Filed here, on the main thread: a need is the answer; a made crate is
+                // answered by the serial step, which now finds it made (its surfaces, its record).
+                let done = match joined.did {
+                    Err(why) => Did::Failed(TaskFailure { name: task.name, why }),
+                    Ok(resolution) => {
+                        let Some(names) = facts.names.as_mut() else {
+                            return Err(CliError::Text { what: "the names world a crate scope's job was made from is gone" });
+                        };
+                        match crate::names::settle(names, task, resolution, held) {
+                            Some(did) => did,
+                            None => run_one(&cx, root, store, facts, task, frame, held, scratch, high, alloc)?,
+                        }
+                    }
+                };
+                (done, joined.ns)
+            }
             (Spawned::One(handle), _) => {
                 let joined = handle.join(&cx).map_err(CliError::Pool)?;
                 high.scratch = high.scratch.max(joined.used);
@@ -578,6 +650,7 @@ fn answer_batch<'f, 'r>(
                 let did = match joined.did {
                     Ok(did) => did,
                     Err(Unread::Text(what)) => Err(Why::Refused { what, rule: "blaze-cli work.rs" }),
+                    Err(Unread::Changed) => Err(Why::Changed),
                     Err(Unread::Path(error)) => return Err(CliError::Path(error)),
                     Err(Unread::Fs(error)) => return Err(CliError::Fs(error)),
                 };
@@ -680,12 +753,31 @@ fn answer_batch<'f, 'r>(
 /// The profile's row of the body jobs, one a file a round: its times are the files read and
 /// outlined for their bodies ([`Phases::times`]).
 pub(crate) const BODY_JOBS: &str = "pooled body jobs, one a file a round (worker ns)";
+/// Of [`BODY_JOBS`], each job's setup: its owners' readers and front end over the records
+/// (body_types.rs `FileTypes::new`), before any body is checked.
+pub(crate) const BODY_SETUP: &str = "of those, the setup: readers and the world over records (worker ns)";
 
+/// The profile's row of the pooled `CrateScope` resolutions.
+pub(crate) const SCOPES: &str = "pooled CrateScope (worker ns)";
+
+/// Of the `BodyCheck` jobs made on the main thread, the names world made once a command
+/// (body_types.rs `names_world`); the rest of that row is the reads of the crates' records.
+pub(crate) const BODY_WORLD: &str = "of BodyCheck jobs made, the names world (main ns)";
 /// The profile's row of the `BodyCheck` tasks.
 pub(crate) const BODIES: &str = "pooled BodyCheck (worker ns)";
 
 /// A task kind's row in the profile's frame lines (`Phases::took` for a task run on the main
 /// thread, `Phases::worked` for a pooled one).
+/// The main thread's time making one task's job, by its kind: the parts of "jobs made".
+fn made_row(kind: Kind) -> &'static str {
+    match kind {
+        Kind::FileItems => "jobs made: FileItems (main ns)",
+        Kind::CrateScope => "jobs made: CrateScope (main ns)",
+        Kind::BodyCheck => "jobs made: BodyCheck (main ns)",
+        _ => "jobs made: answered here (main ns)",
+    }
+}
+
 fn row_of(kind: Kind) -> &'static str {
     match kind {
         Kind::Units => "task Units",
@@ -911,7 +1003,9 @@ fn run<'f, 'b>(
                 facts.laid = Some(crate::units::lay(&cx, root, &facts.stamps, &mut facts.rows, facts.fetch_env.toolchain, frame, alloc)?);
             }
             let lock = facts.laid.as_ref().and_then(|laid| laid.lock.as_ref());
-            crate::macros::run(&cx, store, lock, &mut facts.macros, facts.fetch_env.home, task, frame, held)
+            let members = crate::names::member_dirs(facts.laid.as_ref());
+            let place = crate::macros::Place { home: facts.fetch_env.home, checkout: facts.fetch_env.checkout, members, rows: &facts.rows };
+            crate::macros::run(&cx, store, lock, &mut facts.macros, place, task, frame, held)
         }
         Kind::CrateScope => {
             if facts.laid.is_none() {
@@ -919,7 +1013,7 @@ fn run<'f, 'b>(
             }
             let lock = facts.laid.as_ref().and_then(|laid| laid.lock.as_ref()).map(|lockfile| lockfile.lock);
             let members = crate::names::member_dirs(facts.laid.as_ref());
-            crate::names::run(&cx, root, store, &mut facts.names, lock, members, &facts.fetch_env, task, frame, held)
+            crate::names::run(&cx, root, store, &mut facts.names, lock, members, &facts.fetch_env, task, held)
         }
         _ => unreachable!("`builds` said yes to {:?} and `run` has no arm for it", task.name.kind),
     }
@@ -935,6 +1029,9 @@ struct Job<'a> {
     flags: u8,
     edition: u8,
     plant: Plant,
+    /// The content id the sweep gave the file, which the task's key holds: the bytes read are
+    /// compared with it before any parse (`blaze_drive::verified`).
+    expect: ContentId,
 }
 
 /// Why a task's job could not be made when the frame of one round's jobs is full: the task
@@ -960,7 +1057,8 @@ fn job_of<'j>(req: &Request<'_>, facts: &Facts<'_, impl crate::sweep::Stamps>, t
     held.try_extend_from_slice(path).map_err(|_| JOBS_FULL)?;
     let slot: &'j [u8] = held.leak();
     let slot = core::str::from_utf8(slot).map_err(|_| "a path is not UTF-8")?;
-    Ok(Job { name: task.name, slot, flags: facts.found.flags(slot.as_bytes()), edition: task.edition, plant: facts.plant })
+    let expect = req.file_content_of(task).ok_or("a file's or a body's task whose file the sweep did not find")?;
+    Ok(Job { name: task.name, slot, flags: facts.found.flags(slot.as_bytes()), edition: task.edition, plant: facts.plant, expect })
 }
 
 /// A file's outline as its `FileItems` record, worked in `scratch` and built in `into`: the
@@ -987,7 +1085,7 @@ fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, job: &Job<'
             }
             let mut bytes = Bytes::new_in(scratch, "a source file");
             root.read_all(cx, &Path::new(path)?, &mut bytes)?;
-            let text = core::str::from_utf8(bytes.as_slice()).map_err(|_| Unread::Text("a source file is not UTF-8"))?;
+            let text = verified_text(job, bytes.as_slice())?;
             if u32::try_from(text.len()).is_err() {
                 return Err(Unread::Text("a source file past 4 GiB"));
             }
@@ -1158,12 +1256,12 @@ fn parser_edition(edition: Edition) -> parser::Edition {
 /// each body asked for is found by its place and parsed ([`body_syntax`]), its outcome pushed
 /// to `did` in the order asked. A body's panic fails that body alone. An `Err` is the file's
 /// (unread, not text): `pooled_bodies` gives it to every body not yet answered.
-fn bodies_syntax(cx: &Cx, root: &Dir<ReadWrite>, job: &BodiesJob<'_>, scratch: &Frame, did: &mut BodiesDid) -> Result<(), Unread> {
+fn bodies_syntax(cx: &Cx, root: &Dir<ReadWrite>, job: &BodiesJob<'_>, scratch: &Frame, did: &mut BodiesDid, clock: &bstd::clock::Clock, setup_ns: &mut u64) -> Result<(), Unread> {
     let real = crate::sweep::real_path(job.file.slot, job.file.flags, scratch);
     let path = core::str::from_utf8(&real).map_err(|_| Unread::Text("a path is not UTF-8"))?;
     let mut bytes = Bytes::new_in(scratch, "a source file");
     root.read_all(cx, &Path::new(path)?, &mut bytes)?;
-    let text = core::str::from_utf8(bytes.as_slice()).map_err(|_| Unread::Text("a source file is not UTF-8"))?;
+    let text = verified_text(&job.file, bytes.as_slice())?;
     if u32::try_from(text.len()).is_err() {
         return Err(Unread::Text("a source file past 4 GiB"));
     }
@@ -1180,7 +1278,11 @@ fn bodies_syntax(cx: &Cx, root: &Dir<ReadWrite>, job: &BodiesJob<'_>, scratch: &
     }
     starts.sort_unstable();
     // The bodies' types (body_types.rs): each owner's front end over records, made once a job.
+    // Its setup (each owner's readers and world over the records) is a row of its own
+    // ([`BODY_SETUP`]): D114 piece (a) is judged by it.
+    let set_up = clock.now();
     let mut types = crate::body_types::FileTypes::new(cx, root, job.types, text, scratch);
+    *setup_ns = clock.now().since(set_up).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
     for (name, place) in job.bodies.iter().copied() {
         let found = starts.binary_search_by_key(&place, |(start, _)| *start).ok().map(|at| &outline.items()[starts[at].1 as usize]);
         let (used, limit) = (scratch.peak() as u64, scratch.reserved() as u64);
@@ -1267,6 +1369,19 @@ pub(crate) enum Unread {
     Text(&'static str),
     Path(bstd::path::PathError),
     Fs(bstd::fs::FsError),
+    /// The bytes read are not the content id the task's key holds (`verified_text`): the task
+    /// fails `Why::Changed`, puts nothing, and the command's answer is refused naming the file.
+    Changed,
+}
+
+/// The text of `bytes`, which `job`'s task read from its file, once their content id is the one
+/// its key was made from: the only way a task reading a file by path gets text to parse (the
+/// [`blaze_drive::verified::Verified`] proof). A difference is [`Unread::Changed`]: no re-read,
+/// no retry (rule 3).
+fn verified_text<'b>(job: &Job<'_>, bytes: &'b [u8]) -> Result<&'b str, Unread> {
+    let id = |read: &[u8]| ContentId::of(crate::sweep::FILE_DOMAIN, read);
+    let verified = blaze_drive::verified::verify(job.name, bytes, job.expect, id, blaze_drive::Plant::None).map_err(|_| Unread::Changed)?;
+    core::str::from_utf8(verified.bytes()).map_err(|_| Unread::Text("a source file is not UTF-8"))
 }
 
 impl From<Unread> for CliError {
@@ -1275,6 +1390,7 @@ impl From<Unread> for CliError {
             Unread::Path(error) => CliError::Path(error),
             Unread::Fs(error) => CliError::Fs(error),
             Unread::Text(what) => CliError::Text { what },
+            Unread::Changed => CliError::Text { what: "a file changed while the command ran; run again" },
         }
     }
 }
@@ -1353,6 +1469,7 @@ fn pooled(cx: &Cx, root: &Dir<ReadWrite>, job: &Job<'_>, clock: &bstd::clock::Cl
     let did = match ran {
         Ok(Ok(done)) => Ok(done),
         Ok(Err(Unread::Text(what))) => Ok(Err(Why::Refused { what, rule: "blaze-cli work.rs" })),
+        Ok(Err(Unread::Changed)) => Ok(Err(Why::Changed)),
         Ok(Err(error)) => Err(error),
         Err(Panicked) => Ok(Err(Why::Panicked { used: used as u64, limit: limit as u64 })),
     };
@@ -1370,6 +1487,8 @@ struct PooledBodies {
     stopped: Option<Unread>,
     used: usize,
     ns: u64,
+    /// Of `ns`, the time its setup took ([`BODY_SETUP`]).
+    setup_ns: u64,
 }
 
 /// `job` on a pool worker, in the worker's task frame, as [`pooled`] runs a file's outline: a
@@ -1379,11 +1498,13 @@ fn pooled_bodies(cx: &Cx, root: &Dir<ReadWrite>, job: &BodiesJob<'_>, clock: &bs
     let began = clock.now();
     let scratch = cx.frame();
     let mut did: BodiesDid = Vec::with_capacity_in(job.bodies.len(), Global);
-    let ran = unwinding(|| bodies_syntax(cx, root, job, scratch, &mut did));
+    let mut setup_ns = 0;
+    let ran = unwinding(|| bodies_syntax(cx, root, job, scratch, &mut did, clock, &mut setup_ns));
     let (used, limit) = (scratch.peak(), scratch.reserved());
     let (rest, stopped) = match ran {
         Ok(Ok(())) => (None, None),
         Ok(Err(Unread::Text(what))) => (Some(Why::Refused { what, rule: "blaze-cli work.rs" }), None),
+        Ok(Err(Unread::Changed)) => (Some(Why::Changed), None),
         Ok(Err(error)) => (None, Some(error)),
         Err(Panicked) => (Some(Why::Panicked { used: used as u64, limit: limit as u64 }), None),
     };
@@ -1392,7 +1513,54 @@ fn pooled_bodies(cx: &Cx, root: &Dir<ReadWrite>, job: &BodiesJob<'_>, clock: &bs
             did.push(Some(Err(why)));
         }
     }
-    PooledBodies { did, stopped, used, ns: clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)) }
+    PooledBodies { did, stopped, used, ns: clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)), setup_ns }
+}
+
+/// A `CrateScope` task's job, made on the main thread (names/scope.rs `prepare`), or `None`
+/// when the task has no resolution to make now (a need, a failure, a crate made already): it
+/// is then run here, in `answer_batch`, as before.
+#[expect(clippy::too_many_arguments, reason = "a task's edge: each argument one handle or frame of it")]
+fn scope_job<'f: 'j, 'j>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    store: &mut dyn Store,
+    facts: &mut Facts<'f, impl crate::sweep::Stamps>,
+    task: &Task<'_>,
+    frame: &'f Frame,
+    round: &mut crate::names::ScopeRound<'j>,
+    alloc: blaze_own::Alloc<'_>,
+) -> Result<Option<&'j crate::names::ScopeJob<'j>>, CliError> {
+    if facts.laid.is_none() {
+        facts.laid = Some(crate::units::lay(cx, root, &facts.stamps, &mut facts.rows, facts.fetch_env.toolchain, frame, alloc)?);
+    }
+    let lock = facts.laid.as_ref().and_then(|laid| laid.lock.as_ref()).map(|lockfile| lockfile.lock);
+    let members = crate::names::member_dirs(facts.laid.as_ref());
+    // An answer without a resolution is dropped here and made again by the serial step: the
+    // round's frame holds its few words until the round ends.
+    let held = round.frame();
+    match crate::names::prepare(cx, root, store, &mut facts.names, lock, members, &facts.fetch_env, task, round, held)? {
+        crate::names::Prepared::Resolve(job) => Ok(Some(job)),
+        crate::names::Prepared::Answer(_) | crate::names::Prepared::Made => Ok(None),
+    }
+}
+
+/// A `CrateScope` resolution's outcome on the pool: the resolution, or why it failed (a panic,
+/// a full frame); the frame's peak; the time.
+struct PooledScope {
+    did: Result<crate::names::Resolution, Why>,
+    used: usize,
+    ns: u64,
+}
+
+/// `job` on a pool worker, in the worker's task frame, as [`pooled`] runs a file's outline: a
+/// panic or a full frame fails this crate alone (rule 20); the pool never sees it.
+fn pooled_scope(cx: &Cx, root: &Dir<ReadWrite>, job: &crate::names::ScopeJob<'_>, clock: &bstd::clock::Clock) -> PooledScope {
+    let began = clock.now();
+    let scratch = cx.frame();
+    let ran = unwinding(|| crate::names::resolve(cx, root, job, scratch));
+    let (used, limit) = (scratch.peak(), scratch.reserved());
+    let did = ran.map_err(|Panicked| Why::Panicked { used: used as u64, limit: limit as u64 });
+    PooledScope { did, used, ns: clock.now().since(began).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)) }
 }
 
 /// What a reader of a parts list sees: the parts' names, how each is found and where.

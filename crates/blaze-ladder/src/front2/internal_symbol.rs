@@ -166,6 +166,9 @@ pub enum InternalRefused {
     Attrs { name: Box<str> },
     /// The definition's key is another item's in the key map.
     KeyClash { name: Box<str> },
+    /// The declaration's place (and so its block's ABI) is not in the names library
+    /// (program.rs `placed`'s `Unplaced`, D106 piece Z).
+    Unplaced { name: Box<str> },
 }
 
 impl InternalRefused {
@@ -185,6 +188,7 @@ impl InternalRefused {
             InternalRefused::NotInRustBlock { .. } => "`#[rustc_std_internal_symbol]` on a declaration outside an `extern \"Rust\"` block",
             InternalRefused::Attrs { .. } => "a `#[rustc_std_internal_symbol]` fn whose attributes do not read",
             InternalRefused::KeyClash { .. } => "the `#[rustc_std_internal_symbol]` definition's key is another item's in the key map",
+            InternalRefused::Unplaced { .. } => "a declaration the names library does not place (its block's ABI is unknown)",
         }
     }
 
@@ -194,7 +198,8 @@ impl InternalRefused {
             InternalRefused::NoDefinition { name }
             | InternalRefused::NotInRustBlock { name }
             | InternalRefused::Attrs { name }
-            | InternalRefused::KeyClash { name } => format!("`{name}`: {}", self.class()).into_boxed_str(),
+            | InternalRefused::KeyClash { name }
+            | InternalRefused::Unplaced { name } => format!("`{name}`: {}", self.class()).into_boxed_str(),
             InternalRefused::DefinedTwice { name, first, second } => format!("`{name}`: {} (`{first}` and `{second}`)", self.class()).into_boxed_str(),
             InternalRefused::NoPanicRuntime { .. } => Box::from(self.class()),
         }
@@ -356,7 +361,7 @@ pub fn declares(names: &Names<'_>, store: &Store<'_>, key: ItemKey, alloc: Alloc
     if Shim::ALL.iter().any(|s| s.declared() == name) {
         return Ok(None);
     }
-    let (_, placed_abi) = super::program::placed(names, h.lib);
+    let (_, placed_abi) = super::program::placed(names, h.lib).map_err(|_| InternalRefused::Unplaced { name: Box::from(name) })?;
     let Some(abi) = placed_abi.or_else(|| super::panic_entry::local_abi(store, key)) else { return Ok(None) };
     let attrs = || InternalRefused::Attrs { name: Box::from(name) };
     let krate = names.crate_of(h.lib).ok_or_else(attrs)?;

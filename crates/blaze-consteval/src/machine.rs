@@ -1786,6 +1786,24 @@ impl<'w, 'l, 'g, 't, 'a, W: ConstWorld, L: Layout, K: Allocator + Clone> Machine
             }
             // Compiled as a call of its const fn.
             Intrinsic::ConstEvalSelect => Err(malformed("`const_eval_select` run as an intrinsic")),
+            // The pinned core, library/core/src/intrinsics/mod.rs: "Gets a static string slice
+            // containing the name of a type": the ground type printed by the one printer
+            // (blaze-build type_name.rs), its bytes an immutable data allocation, the value the
+            // pair of its address and length (as a string literal's, `Op::Str`).
+            Intrinsic::TypeName => {
+                let t = *targs.first().ok_or(malformed("`type_name` with no type"))?;
+                let world = self.world;
+                let names = world.type_names().ok_or(unsupported("`type_name` in a world that names no items (`ConstWorld::type_names`)"))?;
+                let text = blaze_build::type_name::type_name_text(self.ground.view(), t, names, self.alloc).map_err(|error| match error {
+                    blaze_build::type_name::TypeNameError::NoPath { item } => Stop::Refused(Refusal::Missing { what: "the path of an item `type_name` prints", item }),
+                    other => unsupported(other.what()),
+                })?;
+                let len = text.len() as u64;
+                let id = self.mem.allocate(len, 0, true, Origin::Data)?;
+                self.mem.fill(id, text.as_bytes(), &[])?;
+                self.mem.get_mut(id)?.mutable = false;
+                Ok(Val::Pair(Scalar::Ptr(Pointer { alloc: id, offset: 0 }), Scalar::Int(u128::from(len))))
+            }
             // A row of the table the evaluator does not compute: refused by its name.
             other => Err(unsupported(other.entry().name)),
         }

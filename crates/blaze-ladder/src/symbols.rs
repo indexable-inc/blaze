@@ -401,12 +401,26 @@ pub fn tls_symbol(item: ItemKey) -> Symbol {
 /// The symbol of the vtable `table`: its principal's key, then the trees of its concrete type
 /// and of the trait's arguments after `Self`.
 pub fn vtable_symbol(table: VtableRef, ground: PTys<'_>, scratch: Alloc<'_>) -> Result<Symbol, SymbolError> {
-    let mut name: AVec<'_, u8> = Vec::new_in(scratch);
-    name.extend_from_slice(&table.principal.0.to_le_bytes());
-    encode_trees(&[table.concrete], ground, scratch, &mut name)?;
+    let mut trees: AVec<'_, u8> = Vec::new_in(scratch);
+    vtable_trees(table, ground, scratch, &mut trees)?;
+    Ok(vtable_symbol_of_parts(table.principal, &trees, scratch))
+}
+
+/// The trees a vtable's symbol and its declared row hold after the principal: its concrete
+/// type's, then the trait's arguments' after `Self`, appended to `out`.
+pub fn vtable_trees(table: VtableRef, ground: PTys<'_>, scratch: Alloc<'_>, out: &mut AVec<'_, u8>) -> Result<(), SymbolError> {
+    encode_trees(&[table.concrete], ground, scratch, out)?;
     let args = ground.list(table.args).map_err(|_| SymbolError::NotGround { what: "a vtable's argument list past the ground table" })?;
-    encode_trees(args, ground, scratch, &mut name)?;
-    Ok(Symbol(ContentId::of(VTABLE_DOMAIN, &name).0))
+    encode_trees(args, ground, scratch, out)
+}
+
+/// The symbol of the vtable of `principal` whose trees are `trees` ([`vtable_trees`]): what a
+/// declared `Vtable` row (blaze-tier record/declared.rs) holds, hashed as [`vtable_symbol`] does.
+pub fn vtable_symbol_of_parts(principal: ItemKey, trees: &[u8], scratch: Alloc<'_>) -> Symbol {
+    let mut name: AVec<'_, u8> = Vec::with_capacity_in(16 + trees.len(), scratch);
+    name.extend_from_slice(&principal.0.to_le_bytes());
+    name.extend_from_slice(trees);
+    Symbol(ContentId::of(VTABLE_DOMAIN, &name).0)
 }
 
 /// The program's thread-local descriptor static: one a program.

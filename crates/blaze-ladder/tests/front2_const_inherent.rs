@@ -1,0 +1,146 @@
+//! Inherent constant leaves in heads (front2/const_inherent.rs): an array length or a const
+//! argument written as a path to an inherent impl's associated constant, `T::NAME`,
+//! `Self::NAME`, `<T>::NAME`, is the value of that constant item, evaluated by its own key.
+//!
+//! The Reference, "Array types": "The size is a constant expression of type `usize`";
+//! "Constant evaluation", "Const context": "Array type length expressions" are const contexts;
+//! "Paths", "`Self`": "In an implementation, it refers to the type being implemented" (and in
+//! a struct's definition, to the struct); "Associated Items", "Associated Constants": an
+//! inherent impl's constant is "a constant associated with a type". The forms are tempo's
+//! census 14 refusals: http's `struct InlineExtension([u8; InlineExtension::MAX], u8)`,
+//! const-oid's `bytes: [u8; Self::MAX_SIZE]`, zone_p2p's `fn encode(&self) -> [u8;
+//! Self::ENCODED_LEN]`, and a leaf inside arithmetic (`<U32>::USIZE * 8`'s shape).
+//!
+//! CONTROL: with the substitution in types.rs `Builder::const_term` taken out (the block that
+//! calls `const_inherent::substitute`), `ext` and `oid` print "not checked: .." naming
+//! `ConstPath("InlineExtension::MAX: constant ..: a body it needs: checking ..: .. an array
+//! length names: Nested ..")` (the anonymous constant's check reads the struct's row, whose
+//! field holds this very length), and the test fails.
+//! Needs the installed toolchain under `$HOME/.blaze/v2/toolchain`, as tests/front2_items.rs.
+
+#![feature(allocator_api)]
+
+use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+use blaze_ladder::front2::Front2;
+use blaze_ladder::front2::body::lower_fn;
+use blaze_ladder::front2::check::{BuildOrder, Records, check_body};
+use blaze_ladder::front2::consts::Consts;
+use blaze_ladder::front2::heads::Store;
+use blaze_ladder::front2::spell::Spelling;
+use blaze_ladder::refusal::SourceFile;
+use blaze_lower::scoped::Prepares;
+use blaze_own::Alloc;
+use blaze_scope::names::{self, Written};
+use blaze_surface::{Namespace, PathKind};
+
+const EDITION: &str = "blaze-2026.11";
+
+/// Each fn of `fns` in the crate `text`, lowered and checked in order over one store: its
+/// name and its outcome ("clean", the diagnostics, or the failure as printed). The harness of
+/// tests/front2_items.rs.
+fn check_fns(text: &str, fns: &[&str]) -> Vec<(String, String)> {
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let files = [("/hello-world/src/main.rs".to_string(), text.to_string())];
+    let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
+    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let sources = [SourceFile { path: "src/main.rs", text }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
+    let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let prepared = Prepares::new_in(Alloc::global());
+    let mut store = Store::new(front.index.lang("sized"), front.frame);
+    let (mut buckets, mut consts) = (None, Consts::default());
+    let mut got = Vec::new();
+    for &n in fns {
+        let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &[n] }, Alloc::global())
+            .unwrap_or_else(|e| panic!("`{n}`: {e}"));
+        let k = found.whole(1).unwrap_or_else(|| panic!("`{n}` not named")).key;
+        let outcome = match lower_fn(&names, prepared, &mut front.keys, &mut store, k) {
+            Err(e) => format!("not lowered: {e}"),
+            Ok(body) => {
+                let view = body.lowered.view();
+                let spell = Spelling::of(&view).unwrap_or_else(|e| panic!("spelling `{n}`: {e:?}"));
+                let scope = body.scope(&spell);
+                let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
+                match check_body(&mut records, &body, &scope) {
+                    Ok(done) if done.diags.is_empty() => "clean".to_string(),
+                    Ok(done) => {
+                        let d: Vec<String> = done.diags.iter().map(|d| format!("{} at {:?}: `{}`", d.code.code(), d.at, text.get(d.at.start as usize..d.at.end as usize).unwrap_or("?"))).collect();
+                        format!("diags {d:?}")
+                    }
+                    Err(e) => format!("not checked: {e}"),
+                }
+            }
+        };
+        got.push((n.to_string(), outcome));
+    }
+    got
+}
+
+/// The four forms each check clean, and each length IS the constant's value: the returned
+/// array type is written with the number (`[u8; 15]`), so a wrong value is E0308.
+/// Expected lines: "inherent leaves: ext: clean", "inherent leaves: oid: clean",
+/// "inherent leaves: tip: clean", "inherent leaves: wide: clean".
+#[test]
+fn inherent_constant_leaves_in_heads_check_clean() {
+    const TEXT: &str = "struct InlineExtension([u8; InlineExtension::MAX], u8);
+impl InlineExtension {
+    const MAX: usize = 15;
+}
+struct ObjectIdentifier { length: u8, bytes: [u8; Self::MAX_SIZE] }
+impl ObjectIdentifier {
+    const MAX_SIZE: usize = 39;
+}
+struct PeerTip { at: u64 }
+impl PeerTip {
+    const ENCODED_LEN: usize = 8 + 32 + 8 + 32;
+    fn encode(&self) -> [u8; Self::ENCODED_LEN] { [0u8; 80] }
+}
+struct Wide { bits: [u8; <Wide>::BYTES * 8] }
+impl Wide {
+    const BYTES: usize = 4;
+}
+fn ext(e: InlineExtension) -> [u8; 15] { e.0 }
+fn oid(o: ObjectIdentifier) -> [u8; 39] { o.bytes }
+fn tip(p: &PeerTip) -> [u8; 80] { p.encode() }
+fn wide(w: Wide) -> [u8; 32] { w.bits }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["ext", "oid", "tip", "wide"]);
+    let lines: Vec<String> = got.iter().map(|(n, o)| format!("inherent leaves: {n}: {o}")).collect();
+    for l in &lines {
+        println!("{l}");
+    }
+    assert!(got.iter().all(|(_, o)| o == "clean"), "{}", lines.join("\n"));
+}
+
+/// `[u8; Self::N]` with `N = 4` is `[u8; 4]`, never `[u8; 3]`: returning it where `[u8; 3]` is
+/// written is a type mismatch (the Reference, "Array types": arrays of different sizes are
+/// different types; E0308). A leaf answered with a wrong value, or not compared at all,
+/// fails this. Expected line: "inherent mismatch: bad: diags [\"E0308 at ..\"]" (a line
+/// holding E0308), and "inherent mismatch: good: clean".
+#[test]
+fn a_length_of_another_value_is_a_mismatch() {
+    const TEXT: &str = "struct S { a: [u8; Self::N] }
+impl S {
+    const N: usize = 4;
+}
+fn bad(s: S) -> [u8; 3] { s.a }
+fn good(s: S) -> [u8; 4] { s.a }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["bad", "good"]);
+    let lines: Vec<String> = got.iter().map(|(n, o)| format!("inherent mismatch: {n}: {o}")).collect();
+    for l in &lines {
+        println!("{l}");
+    }
+    let outcome = |n: &str| got.iter().find(|(m, _)| m == n).map(|(_, o)| o.as_str()).unwrap_or("");
+    // The check reports a body's diagnostics as its failure ("not checked: .. 1 diagnostics /
+    // E0308 ..") or as `diags [..]`: either way the outcome names E0308.
+    assert!(outcome("bad").contains("E0308"), "{}", lines.join("\n"));
+    assert_eq!(outcome("good"), "clean", "{}", lines.join("\n"));
+}

@@ -891,7 +891,7 @@ mod tests {
         assert_eq!(TrapCode::of(7), TrapCode::Lir(7));
         let paths: [Box<str>; 2] = [Box::from("main"), Box::from("boom")];
         let callers = Callers::new(&[Located::Body { slot: 0, offset: 0x24 }], WalkEnd::Entered);
-        let trap = Trap::new(TrapCode::Unreachable, 1, 0x18, &callers, &paths, SharedAlloc::global());
+        let trap = Trap::new(TrapCode::Unreachable, 1, 0x18, &callers, &paths, blaze_own::testing::heap().shared());
         assert_eq!(trap.line(), "the program trapped (`brk #0xff02`, unreachable) in `boom` +0x18, called from `main` +0x24");
         assert_eq!(trap.function(), "boom");
         println!("LINE: {trap}");

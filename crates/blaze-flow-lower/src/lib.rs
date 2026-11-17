@@ -29,6 +29,17 @@ use blaze_typeck::{
 };
 
 pub mod sig;
+/// Calls of known generic heads, by their signature instantiated with the call's type
+/// arguments and their declared bounds (pieces BR4 and BR3: census 3's false findings in
+/// derived `eq`/`cmp`/`partial_cmp`, and the `CallWritesLifetimes` refusals), and the
+/// `format_args!` flow (`write!`).
+mod generic_call;
+/// Step 1 of an `.await` whose future is not its operand: `into_future` by its recorded head.
+mod await_call;
+pub use generic_call::{CallBounds, Mark, Shape, ShapeBuf, read_shape};
+/// A caller's own type parameters under a callee's `T: 'a` (static-param-gap-1).
+mod param_outlives;
+pub use param_outlives::ParamOrigin;
 mod super_let;
 #[cfg(test)]
 mod tests;
@@ -40,6 +51,10 @@ pub mod coroutine;
 mod coroutine_tests;
 
 pub use coroutine::{LoweredAsync, interior, lower_async};
+
+pub mod closure;
+
+pub use closure::{lower_async_fn, lower_closure};
 
 /// What the lowering needs to know about an ADT (flow.md section 7, question (e)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +124,21 @@ pub trait Facts {
     fn is_future(&self, _ty: PTy) -> Option<bool> {
         None
     }
+    /// The generic shape of callee `item`'s head ([`read_shape`]): where its generic
+    /// parameters stand among its positions. With [`Facts::sig`], a call whose type arguments
+    /// carry origins is related by the instantiated signature (generic_call.rs); `None`: such
+    /// a call keeps the one origin of `unify_call`.
+    fn shape(&self, _item: ItemKey) -> Option<Shape<'_>> {
+        None
+    }
+    /// The type-outlives bounds callee `item` declares (`T: 'a`; generic_call.rs
+    /// [`CallBounds`]). With [`Facts::sig`] and [`Facts::shape`], a call whose type arguments
+    /// carry origins, or whose head writes lifetimes, is related by the instantiated
+    /// signature. `None`: not known, and such a call keeps `unify_call`'s one origin, or is
+    /// refused [`Form::CallWritesLifetimes`] when the head writes lifetimes.
+    fn call_bounds(&self, _item: ItemKey) -> Option<CallBounds<'_>> {
+        None
+    }
     /// The index of field `name` of `variant`.
     fn field(&self, adt: ItemKey, variant: u32, name: Name) -> Option<u32>;
     /// The number of fields of `variant`.
@@ -127,8 +157,9 @@ pub enum Form {
     /// An `async` closure, or an `.await` inside a closure, within an async block
     /// (coroutine.rs): its body is no part of the block's flow.
     AsyncClosure,
-    /// An `.await` whose operand is not known to implement `Future` (`Facts::is_future`): the
-    /// future it holds, `<T as IntoFuture>::IntoFuture`, is not a type of the record.
+    /// An `.await` whose held future, `<T as IntoFuture>::IntoFuture`, has no row in the
+    /// record (`Checked::awaited_of`: not wholly known), or whose operand is a reference the
+    /// record does not name.
     AwaitOperand,
     /// The table given to `interior` does not hold the record's types at their indices.
     InteriorTable,
@@ -154,6 +185,23 @@ pub enum Form {
     /// A call through a value (a fn pointer, a closure, a `dyn Fn`, an `F: Fn(..)`) whose own
     /// signature's lifetimes are not known, with an argument or result that carries one.
     CalleeValueUnknown,
+    /// The callee's head names its generic parameter `param` (`PNode::Param`, parents first),
+    /// but the call's argument list from the type checker has only `args`: a malformed record,
+    /// never related another way (generic_call.rs `call_by_generic_signature`).
+    CalleeParamPastArgs { callee: ItemKey, param: u32, args: u32 },
+    /// A call of `callee` whose type argument for its parameter `param` is under a
+    /// type-outlives bound this does not relate: the head declares `T: 'a` over an argument
+    /// whose lifetimes the lowering does not hold as positions (a type parameter of the caller,
+    /// an alias, an opaque type, a trait object, a closure), or the argument carries a lifetime
+    /// under a bound the reader did not resolve (the container's header declares one). Not
+    /// checked rather than accepted (generic_call.rs `call_by_generic_signature`).
+    CallOutlivesUnread { callee: ItemKey, param: u32 },
+    /// The body's type parameter `param` is required to outlive a lifetime its read bounds do
+    /// not prove, and some bound on it was not read (a trait bound, its container's header, a
+    /// type in its signature whose implied bounds are not read): not checked rather than
+    /// reported (param_outlives.rs). Made by the borrow check's caller from
+    /// [`Lowered::params`], not by the lowering.
+    ParamOutlivesUnread { param: u32 },
     /// The signature's lifetime part does not have one region per origin position of the
     /// body's parameters and return type.
     SigUnaligned,
@@ -202,6 +250,9 @@ pub struct Stats {
 pub struct Lowered<A: Allocator + Clone> {
     pub flow: Flow<A>,
     pub stats: Stats,
+    /// The placeholders standing for the body's type parameters (param_outlives.rs): an
+    /// `UnprovenOutlives` from one is E0310 when `certain`, else `Form::ParamOutlivesUnread`.
+    pub params: Vec<ParamOrigin, A>,
 }
 
 /// A planted bug for the fixtures' controls; `None` outside them.
@@ -257,7 +308,7 @@ pub fn lower_planted<A: Allocator + Clone, F: Facts>(
     l.run()?;
     let stats = l.stats;
     let flow = l.b.finish().map_err(|_| Refusal { form: Form::Builder, range: range_of(body, body.root) })?;
-    Ok(Lowered { flow, stats })
+    Ok(Lowered { flow, stats, params: l.param_origs })
 }
 
 fn range_of(body: &BodyView<'_>, e: ExprId) -> Range {
@@ -389,6 +440,15 @@ struct Lower<'b, 'c, F: Facts, A: Allocator + Clone> {
     is_target: Vec<bool, A>,
     /// The signature's regions and their placeholder origins (`'static` among them once met).
     uni: Vec<(Region, Origin), A>,
+    /// The placeholders of the body's type parameters met so far (param_outlives.rs).
+    param_origs: Vec<ParamOrigin, A>,
+    /// `(param, reference placeholder)`: the signature's `&'x U` implies `U: 'x`.
+    param_implied: Vec<(u32, Origin), A>,
+    /// Parameters met in the signature where its implied bounds are not read.
+    param_unsure: Vec<u32, A>,
+    /// No parameter's bounds are fully read: true until `signature` lays them, and set again
+    /// when it meets a type whose implied bounds are not read.
+    param_all_unsure: bool,
     ret_block: Block,
     stats: Stats,
     plant: Plant,
@@ -447,6 +507,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             super_ext: Vec::new_in(alloc.clone()),
             is_target,
             uni: Vec::new_in(alloc.clone()),
+            param_origs: Vec::new_in(alloc.clone()),
+            param_implied: Vec::new_in(alloc.clone()),
+            param_unsure: Vec::new_in(alloc.clone()),
+            param_all_unsure: true,
             ret_block: Block(0),
             stats: Stats::default(),
             plant: Plant::None,
@@ -1299,6 +1363,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         if sig.ends.len() != nparams as usize {
             return self.refuse(Form::SigUnaligned, root);
         }
+        // The signature is laid: its types' implied bounds on the type parameters are read
+        // below (`sig_param_bounds` sets this again where it cannot read them).
+        self.param_all_unsure = false;
         let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
         let mut lo = 0usize;
         for i in 0..=nparams as usize {
@@ -1332,6 +1399,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             if i < nparams as usize {
                 self.vars.push(l);
             }
+            self.sig_param_bounds(t, start, root)?;
             self.ref_ranges(t, root, &mut ranges)?;
             for j in 0..ranges.len() {
                 let (at, inner) = ranges[j];
@@ -2298,6 +2366,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 ps.push(tp);
                 self.unify(&ps);
             }
+            // `Arguments<'a>` holds each argument as `&'a T`: each position flows into `'a`,
+            // nothing flows back (generic_call.rs `fmt_args_flow`, piece BR4).
+            _ if fmt => self.fmt_args_flow(&parts, tp),
             _ => self.unify_call(&parts, tp, e)?,
         }
         self.push_place(tp, ty);
@@ -2416,7 +2487,20 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             None => false,
         };
         let facts: &'b F = self.facts;
+        // A declared `T: 'a` over an argument with no origin position that holds a type
+        // parameter of the body (or a type not placed): `call_by_signature` reads no bounds, so
+        // such a call goes by `call_by_generic_signature` or is refused (param_outlives.rs).
+        // A head whose lifetime part was read but whose bounds were not filed: every argument
+        // is under a bound not read.
+        let owes = match callee {
+            Some((item, g)) if facts.sig(item).is_some() => match facts.call_bounds(item) {
+                Some(b) => self.owes_type_outlives(b, g, e)?,
+                None => self.owes_type_outlives(CallBounds { outlives: &[], unread_below: u32::MAX, trait_bounded: &[] }, g, e)?,
+            },
+            _ => None,
+        };
         if !generic_origins
+            && owes.is_none()
             && let Some((item, _)) = callee
             && let Some(life) = facts.sig(item)
             && self.call_by_signature(life, &vs, tp, ty, e)?
@@ -2424,6 +2508,28 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             self.stats.calls_by_signature += 1;
             self.push_place(tp, ty);
             return Ok(());
+        }
+        // A known head whose type arguments carry origins (derived `eq`:
+        // `PartialEq::eq(&__self_0, &__arg1_0)` with `Self = &F`, piece BR4), or that writes
+        // lifetimes `call_by_signature` above could not line up (`pick::<&u8>`, piece BR3): by
+        // its signature instantiated with them and its declared bounds, never through one hub
+        // (generic_call.rs); and a call that `owes` a bound over a caller's type parameter
+        // (param_outlives.rs).
+        if sig.is_some_and(|s| generic_origins || owes.is_some() || s.writes_lifetimes)
+            && let Some((item, g)) = callee
+            && let Some(life) = facts.sig(item)
+            && let Some(shape) = facts.shape(item)
+            && let Some(bounds) = facts.call_bounds(item)
+            && self.call_by_generic_signature(item, life, shape, bounds, g, &vs, tp, ty, e)?
+        {
+            self.stats.calls_by_signature += 1;
+            self.push_place(tp, ty);
+            return Ok(());
+        }
+        if let Some(param) = owes
+            && let Some((item, _)) = callee
+        {
+            return self.refuse(Form::CallOutlivesUnread { callee: item, param }, e);
         }
         match sig {
             Some(s) if s.writes_lifetimes => return self.refuse(Form::CallWritesLifetimes, e),

@@ -205,6 +205,7 @@ mod normalize;
 pub mod read_back;
 pub mod start;
 pub mod tls;
+pub mod type_name;
 pub mod vtable;
 mod walk;
 
@@ -290,6 +291,13 @@ pub trait Adts {
     /// declares it. The build refuses a use of an absent one with [`BuildError::NoLangFn`].
     fn lang_fn(&self, name: &str) -> Option<ItemKey> {
         let _ = name;
+        None
+    }
+
+    /// The names a type is printed with (type_name.rs): the paths of items, for the messages
+    /// of the validity assertions (walk/validity.rs). `None`, the default: such a message is
+    /// refused by name ([`BuildError::Intrinsic`]), never printed without its paths.
+    fn type_names(&self) -> Option<&dyn type_name::TypeNames> {
         None
     }
 
@@ -521,6 +529,11 @@ pub(crate) enum Planted {
     /// `MIN % -1` is not checked: it gives the machine's 0 where Rust panics (the wrong answer
     /// WRONG-NOTES.md S2 found, 2026-11-16).
     NoRemOverflowCheck,
+    /// A box whose contents moved out is dropped by its whole glue (the moved contents dropped
+    /// again: tests/box_moves.rs's control).
+    MovedBoxDroppedWhole,
+    /// A box whose contents moved out is never freed (a leak: tests/box_moves.rs's control).
+    MovedBoxNotFreed,
 }
 
 /// One piece of a `format_args!` template ([`Adts::format_template`]).

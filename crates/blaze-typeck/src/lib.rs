@@ -26,6 +26,7 @@ mod columns;
 /// `coroutines_in` shares) and the solver def of `(owner, ordinal)`.
 pub mod coroutine_id;
 mod diag;
+mod drop_impl;
 /// Dyn compatibility: the rule's one home (facts in, verdict out).
 pub mod dyn_compat;
 mod error;
@@ -37,11 +38,14 @@ pub mod infer;
 mod impl_kinds;
 mod instance;
 mod intern;
+mod specialize;
 mod machine;
 mod portable;
 /// A kept check's read list asked again of today's world (read-addressed.md, "End state").
 mod replay;
 mod rules;
+/// Auto-trait goals of an async block's future decided on its exact interior (async plan P13).
+mod stalled;
 mod ty;
 mod world;
 
@@ -63,6 +67,9 @@ use blaze_own::Alloc;
 pub use infer::{InferCtx, InferSnapshot};
 pub use replay::{Replay, replay};
 pub use instance::{ResolveError, Resolved, normalize_projection, resolve_instance, select_impl};
+pub use drop_impl::adt_drop_impl;
+pub use rules::async_fn::INTERIOR_GAP;
+pub use stalled::{Stalled, StalledError, check_deferring, decide_stalled, decide_stalled_listed};
 pub use asks::{Ask, AskLog, Clock, Order, QUESTION_KINDS, R_THRESHOLD, Restarts, Solve, Tally, entries_histogram, question_kind, restarts};
 pub use body::{
     Anchor, Arm, BinOp, BindAnn, BodyPath, BodyView, Capture, CoroutineKind, Expr, FieldInit, FieldPat, FmtTrait, FmtUse,
@@ -122,7 +129,7 @@ pub(crate) fn check_with<'a, W: World, C: TypeCtx>(
     alloc: Alloc<'a>,
 ) -> Result<Outcome<'a>, CheckError> {
     let reads = Reads::new_in(world, alloc);
-    run(body, reads, ty, hints, plant, alloc).map(|(o, _)| o)
+    run(body, reads, ty, hints, plant, stalled::Interior::Gap, alloc).map(|(o, _)| o)
 }
 
 /// `check` that also writes the ask log (asks.rs), reading `clock`: the measurement that
@@ -136,7 +143,7 @@ pub fn check_logged<'a, 'w, W: World, C: TypeCtx>(
     alloc: Alloc<'a>,
 ) -> Result<(Outcome<'a>, AskLog<'a>), CheckError> {
     let reads = Reads::logged_in(world, clock, alloc);
-    let (o, log) = run(body, reads, ty, hints, Plant::None, alloc)?;
+    let (o, log) = run(body, reads, ty, hints, Plant::None, stalled::Interior::Gap, alloc)?;
     let log = log.ok_or(CheckError::Malformed(Malformed::HoleInAnswer))?;
     Ok((o, log))
 }
@@ -156,7 +163,7 @@ pub fn check_counted<'a, 'w, W: World, C: TypeCtx>(
     let mut mine = Tally::default();
     let out = {
         let reads = Reads::counted_in(world, &mut mine, clock, alloc);
-        run(body, reads, ty, hints, Plant::None, alloc).map(|(o, _)| o)
+        run(body, reads, ty, hints, Plant::None, stalled::Interior::Gap, alloc).map(|(o, _)| o)
     };
     mine.checks = 1;
     mine.check_ns = clock.now_ns().saturating_sub(start);
@@ -170,6 +177,7 @@ fn run<'a, 'w, W: World, C: TypeCtx>(
     ty: &mut C,
     hints: &Needs<'_>,
     plant: Plant,
+    interior: stalled::Interior,
     alloc: Alloc<'a>,
 ) -> Result<(Outcome<'a>, Option<AskLog<'a>>), CheckError> {
     if hints.questions.is_empty() {
@@ -179,6 +187,7 @@ fn run<'a, 'w, W: World, C: TypeCtx>(
         reads.prefetch(&hints.questions);
     }
     let mut m = Machine::new_in(*body, reads, ty, plant, alloc)?;
+    m.interior = interior;
     let walked = walk(&mut m);
     let log = m.reads.take_log();
     // A run that met a hole makes no result: not its types, not its diagnostics, not an
@@ -204,7 +213,7 @@ pub(crate) fn check_hole_plant<'a, W: World, C: TypeCtx>(
 ) -> Result<Outcome<'a>, CheckError> {
     let mut reads = Reads::new_in(world, alloc);
     reads.hole_plant = plant;
-    run(body, reads, ty, hints, Plant::None, alloc).map(|(o, _)| o)
+    run(body, reads, ty, hints, Plant::None, stalled::Interior::Gap, alloc).map(|(o, _)| o)
 }
 
 /// The walk and the end sequence (typeck.md, "The walk and its queues").

@@ -631,6 +631,8 @@ fn empty_record(a: Alloc<'_>) -> Checked<'_> {
         suggests: blaze_typeck::suggest::Suggests::new_in(a),
         hidden: blaze_own::Vec::new_in(a),
         promoted: blaze_own::Vec::new_in(a),
+        stalled: blaze_own::Vec::new_in(a),
+        awaited: blaze_own::Vec::new_in(a),
     }
 }
 

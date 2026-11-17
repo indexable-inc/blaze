@@ -27,6 +27,9 @@ blaze-own.workspace = true
 # `code_unwind`: a code record's unwind entry (blaze-code eh.rs), registered before its slot's
 # word is published.
 blaze-code = { path = "../blaze-code" }
+# `native_lib`: the native library record's descriptor (BNL2), whose one home is blaze-native's
+# descriptor.rs (sans-IO, no_std).
+blaze-native = { path = "../blaze-native" }
 # `sample`: the sample ring's entry (`sample::SampleEntry`), piece 0 of code generation.
 blaze-tier.workspace = true
 # `stub_wait`: a stub's kernel wait to a deadline and the control thread's bell
@@ -38,7 +41,7 @@ libc.workspace = true
 
 [dev-dependencies]
 # examples/fork_smoke: `Alloc::global()`, the handle a test program hands the zygote.
-blaze-own = { workspace = true, features = ["std"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
 # sample/tests.rs: the frame check's property and planted-bug control, the pace's property.
 blaze-sim.workspace = true
 # stub_wait_tests.rs: the stub path's allocation count (`#[global_allocator]` of the test binary).

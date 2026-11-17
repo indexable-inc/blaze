@@ -33,7 +33,7 @@
 use blaze_expand::seen::SeenRoot;
 use blaze_expand::{ExpandCx, HostAsk, HostError, HostWhy, IncludeAs, Included, MacroDefinition, Place, PlaceOf, ProcCall, Produced, TokenStream};
 use blaze_id::ItemKey as LibKey;
-use blaze_own::Alloc;
+use blaze_own::{AString, Alloc};
 use blaze_scope::resolve::{At, SourceTexts};
 
 use super::heads::CrateCfg;
@@ -59,6 +59,13 @@ pub trait BodySources {
     /// under it is the package's file. `None`: no environment, and such a path is outside.
     fn seen(&self, krate: usize) -> Option<SeenRoot<'_>> {
         let _ = krate;
+        None
+    }
+    /// What `file!()` gives for the file at `path` (package-relative) in the crate: the item
+    /// host's answer (`blaze_scope::crate_env::CrateEnv::shown_file`, D96 (4)). `None`: no
+    /// environment naming the package, and the read is refused.
+    fn shown_file<'b>(&self, krate: usize, path: &str, alloc: Alloc<'b>) -> Option<AString<'b>> {
+        let _ = (krate, path, alloc);
         None
     }
     /// The file at `path` when `path` is under the crate's build script's `OUT_DIR`: `Some` of
@@ -91,6 +98,10 @@ impl<'s, 'a: 's, S: SourceTexts<'a>> BodySources for Sourced<'s, S> {
         self.0.crate_env(krate).map(|env| env.seen())
     }
 
+    fn shown_file<'b>(&self, krate: usize, path: &str, alloc: Alloc<'b>) -> Option<AString<'b>> {
+        self.0.crate_env(krate)?.shown_file(path, alloc)
+    }
+
     fn script_file(&self, krate: usize, path: &str) -> Option<Option<&[u8]>> {
         let script = self.0.crate_env(krate)?.script()?;
         script.file_at(path)
@@ -101,7 +112,8 @@ impl<'s, 'a: 's, S: SourceTexts<'a>> BodySources for Sourced<'s, S> {
     }
 }
 
-/// The body's file: its path (absolute, under the package) and the path `file!()` gives.
+/// The body's file: its path (absolute, under the package) and its package-relative path,
+/// from which `file!()`'s answer is made ([`BodySources::shown_file`]).
 #[derive(Clone, Copy)]
 struct BodyFile<'h> {
     path: &'h str,
@@ -115,6 +127,8 @@ pub struct BodyHost<'h> {
     /// `None`: the body's text is in a macro's expansion, or the names are records (no file
     /// table): its includes and `file!()` are refused by name.
     file: Option<BodyFile<'h>>,
+    /// `file!()`'s answer, made on the first ask; `None` inside: refused.
+    shown_file: core::cell::OnceCell<Option<AString<'h>>>,
     module_path: Option<&'h str>,
     atoms: &'h [(&'h str, Option<&'h str>)],
     alloc: Alloc<'h>,
@@ -132,7 +146,7 @@ impl<'h> BodyHost<'h> {
             },
             _ => None,
         };
-        BodyHost { sources, krate, file, module_path: names.module_path(module), atoms: names.cfg_atoms(krate).unwrap_or(&[]), alloc }
+        BodyHost { sources, krate, file, shown_file: core::cell::OnceCell::new(), module_path: names.module_path(module), atoms: names.cfg_atoms(krate).unwrap_or(&[]), alloc }
     }
 }
 
@@ -163,7 +177,12 @@ impl ExpandCx for BodyHost<'_> {
 
     fn place(&self, what: PlaceOf) -> Result<Place<'_>, HostError> {
         match what {
-            PlaceOf::File => self.file.map(|f| Place::Text(f.shown)).ok_or(refused(HostAsk::Place)),
+            // D96 (4): the item host's answer, byte-equal (one read, one answer in both layers).
+            PlaceOf::File => {
+                let file = self.file.ok_or(refused(HostAsk::Place))?;
+                let shown = self.shown_file.get_or_init(|| self.sources.and_then(|s| s.shown_file(self.krate, file.shown, self.alloc)));
+                shown.as_ref().map(|text| Place::Text(text.as_str())).ok_or(refused(HostAsk::Place))
+            }
             PlaceOf::ModulePath => self.module_path.map(Place::Text).ok_or(refused(HostAsk::Place)),
             // Not told which call asks: no item-relative position to answer (module doc).
             PlaceOf::Line | PlaceOf::Column => Err(refused(HostAsk::Place)),
@@ -203,6 +222,12 @@ mod tests {
         fn seen(&self, krate: usize) -> Option<blaze_expand::seen::SeenRoot<'_>> {
             (krate == 0).then_some(blaze_expand::seen::SeenRoot::Package)
         }
+        fn shown_file<'b>(&self, krate: usize, path: &str, alloc: Alloc<'b>) -> Option<blaze_own::AString<'b>> {
+            // As `CrateEnv::shown_file` for the dependency tempo-node 1.0.0.
+            let mut out = blaze_own::AString::new_in(alloc);
+            core::fmt::Write::write_fmt(&mut out, format_args!("tempo-node-1.0.0/{path}")).ok()?;
+            (krate == 0).then_some(out)
+        }
         fn script_file(&self, _: usize, _: &str) -> Option<Option<&[u8]>> {
             None
         }
@@ -216,6 +241,7 @@ mod tests {
             sources,
             krate: 0,
             file: Some(BodyFile { path: "/package/3/src/lib.rs", shown: "src/lib.rs" }),
+            shown_file: core::cell::OnceCell::new(),
             module_path: Some("tempo_node::rpc"),
             atoms: &[("unix", None)],
             alloc: Alloc::global(),
@@ -233,7 +259,8 @@ mod tests {
         static SOURCES: One = One;
         let h = host(Some(&SOURCES));
         assert_eq!(h.env("CARGO_PKG_NAME"), Ok(Some("tempo-node")));
-        assert_eq!(h.place(PlaceOf::File), Ok(Place::Text("src/lib.rs")));
+        // D96 (4): a dependency's file by name and version, as the item host answers it.
+        assert_eq!(h.place(PlaceOf::File), Ok(Place::Text("tempo-node-1.0.0/src/lib.rs")));
         assert_eq!(h.place(PlaceOf::ModulePath), Ok(Place::Text("tempo_node::rpc")));
         assert_eq!(h.include("abi.json", IncludeAs::Str), Ok(Included::Bytes(&b"[]"[..])));
         assert_eq!(h.include("../../outside.rs", IncludeAs::Str), Ok(Included::Outside));

@@ -68,3 +68,14 @@ pub fn coroutine_def(owner: ItemKey, ordinal: u32) -> u128 {
     h.u32(ordinal);
     u128::from(h.finish())
 }
+
+/// The solver's def of closure `ordinal` of `owner` seen from outside its body (a body that
+/// imports `PNode::Closure`, infer/mod.rs `TyView::ClosureOf`; an opaque's hidden closure,
+/// infer/facts.rs `fill_opaque`): a hash of the identity alone, so every reader names one
+/// closure with one def. The domain string is the one `TyView::ClosureOf` used inline.
+pub fn closure_of_def(owner: ItemKey, ordinal: u32) -> u128 {
+    let mut h = StableHasher::new("blaze-typeck closure of");
+    h.u128(owner.0);
+    h.u32(ordinal);
+    u128::from(h.finish())
+}

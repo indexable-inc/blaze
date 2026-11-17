@@ -56,6 +56,7 @@ pub mod code_unwind;
 pub mod control;
 pub mod drive;
 pub mod fault;
+pub mod native_lib;
 pub mod observe;
 pub mod records;
 pub mod retired;

@@ -47,6 +47,9 @@ use blaze_hash::HashMap;
 use blaze_id::ItemKey as LibKey;
 use blaze_typeck::{self as tc, Checked, ItemKey, PNode, PTy, Shape};
 
+mod slots;
+
+use self::slots::{IN_TABLE, Tables};
 use super::{AMBIENT, Census, Reached, note_edges};
 use crate::front2::back_needs::BackNeeds;
 use crate::front2::buckets::shape_of;
@@ -91,6 +94,12 @@ enum AtParam {
 #[derive(Default)]
 pub(super) struct Coerced {
     shapes: HashMap<Shape, (), Global>,
+    /// Each `(principal, shape)` coerced: a table the program makes, whose every slot is reached
+    /// at the shape (slots.rs).
+    tables: HashMap<(ItemKey, Shape), (), Global>,
+    /// The principal of every `dyn` the read bodies' types hold: the tables whose slots are
+    /// asked as at an instance when a coercion could not be read (`open_all`).
+    named: HashMap<ItemKey, (), Global>,
     open: Vec<ItemKey, Global>,
     /// A coercion that could not be read (a type the record does not hold, the step bound):
     /// every trait fn met on `dyn` is asked as at an instance.
@@ -105,6 +114,7 @@ impl Coerced {
     /// rules/coerce_nested.rs) to the `dyn` the target holds.
     pub(super) fn read(&mut self, c: &Checked<'_>) {
         let t = c.types.view();
+        slots::name_principals(t, &mut self.named);
         let exprs = c.adjusts.column::<0>();
         let kinds = c.adjusts.column::<1>();
         let tys = c.adjusts.column::<2>();
@@ -139,8 +149,11 @@ impl Coerced {
                     // were read where that object was made.
                     (PNode::Dynamic(_), PNode::Dynamic(_)) => {}
                     (_, PNode::Dynamic(l)) => match (shape_of(t, from), tc::object_principal(t, *l)) {
-                        (Some(s), _) => {
+                        (Some(s), p) => {
                             self.shapes.insert(s, ());
+                            if let Some(p) = p {
+                                self.tables.insert((p, s), ());
+                            }
                         }
                         (None, Some(p)) => self.open.push(p),
                         // A `dyn` of auto traits alone has no method in its vtable (the
@@ -190,6 +203,8 @@ pub(super) struct Instances {
     unread_shapes: Vec<Shape, Global>,
     at_param: HashMap<ItemKey, AtParam, Global>,
     coerced: Coerced,
+    /// The slots of the tables the coercions make (slots.rs).
+    tables: Tables,
 }
 
 impl Instances {
@@ -227,7 +242,7 @@ impl Instances {
             self.coerced.read(c);
         }
         self.bodies_read = census.bodies.len();
-        let fns = self.met(r, census, needs);
+        let fns = self.met(r, census, needs, inits);
         if fns.is_empty() {
             return false;
         }
@@ -272,12 +287,17 @@ impl Instances {
                     };
                     shapes.extend(filed.iter().chain(self.unread_shapes.iter()).chain(lowered.iter()).copied().filter(|s| met.contains_key(s)));
                 }
-            } else {
+            } else if m.how & AT_OBJECT != 0 {
                 shapes.extend_from_slice(&coerced);
+            } else {
+                // A slot fn no call names: the shapes coerced to a principal whose table holds it.
+                shapes.extend_from_slice(self.tables.shapes_of(m.f));
             }
             shapes.sort_unstable();
             shapes.dedup();
-            let source = match m.how & BY_BUILDER != 0 {
+            // A slot's fn is the table's (made where a body coerces, whichever it is): from
+            // `AMBIENT`, so every entry's reach holds it.
+            let source = match m.how & (BY_BUILDER | IN_TABLE) != 0 {
                 true => AMBIENT,
                 false => m.f,
             };
@@ -297,7 +317,7 @@ impl Instances {
                         // functions"), walked once as the trait's own member. A required fn
                         // left out is the checker's E0046, never reached here.
                         None => {
-                            if self.declared.contains_key(&m.f) && r.store.fns.get(&m.f).is_some_and(|h| h.has_body) {
+                            if (self.declared.contains_key(&m.f) || m.how & IN_TABLE != 0) && r.store.fns.get(&m.f).is_some_and(|h| h.has_body) {
                                 queue.push((m.f, None));
                             }
                         }
@@ -310,7 +330,7 @@ impl Instances {
     }
 
     /// The trait fns to ask about this round, each once, sorted by key, with how each was met.
-    fn met(&mut self, r: &mut Records<'_, '_>, census: &mut Census<'_>, needs: &BackNeeds) -> Vec<Met, Global> {
+    fn met(&mut self, r: &mut Records<'_, '_>, census: &mut Census<'_>, needs: &BackNeeds, inits: &Coerced) -> Vec<Met, Global> {
         let mut fns: Vec<Met, Global> = Vec::new_in(Global);
         for (k, outcome) in census.fns.iter() {
             let how = match outcome {
@@ -354,6 +374,10 @@ impl Instances {
                 }
             }
         }
+        // Every slot of every table the coercions make (the Reference, "Trait objects": the
+        // vtable holds each method of the trait and its supertraits for the concrete type),
+        // called or not.
+        self.tables.add(r, [&self.coerced, inits], &mut fns);
         fns.sort_unstable_by_key(|m| m.f);
         let mut out: Vec<Met, Global> = Vec::with_capacity_in(fns.len(), Global);
         for m in fns {

@@ -55,7 +55,7 @@ fn world(seed: u64) -> Io {
 }
 
 fn held(io: Io, holding: Holding) -> Box<Hosting> {
-    Hosting::holding(io, vec!["layered".to_owned()], vec![("everything".to_owned(), "io".to_owned())], EXCHANGE, holding, blaze_own::testing::heap().shared())
+    Hosting::holding(io, vec!["layered".to_owned()], Vec::new(), EXCHANGE, holding, blaze_own::testing::heap().shared())
 }
 
 fn holding(hold: Hold, dry: bool, ask: Option<Box<dyn Decide + Send>>, fakes: Fakes) -> Holding {

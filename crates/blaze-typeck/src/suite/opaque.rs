@@ -279,7 +279,7 @@ fn a_method_on_an_opaque_bound_by_a_pattern() {
 /// which the world does not record yet, so `{ need_send(plain()); None }` is the typed gap
 /// naming that, never E0283 "cannot satisfy" (what it was before rules/opaque_def.rs's gap).
 #[test]
-#[should_panic(expected = "an auto trait of an opaque type")]
+#[should_panic(expected = "OpaqueHiddenUnknown")]
 fn send_of_an_opaque_is_a_gap_until_its_hidden_type_is_recorded() {
     let (fx, user) = next_world();
     let mut b = Bb::new();

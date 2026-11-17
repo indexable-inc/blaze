@@ -60,7 +60,8 @@ fn slots_in(line: &str) -> impl Iterator<Item = u32> + '_ {
 #[test]
 fn a_call_that_may_unwind_drops_both_locals_in_reverse_order() {
     let text = two_locals_and_a_call(crate::Panic::Unwind);
-    assert_eq!(text.lines().filter(|l| l.contains("invoke")).count(), 1, "one invoke, for f():\n{text}");
+    // f()'s, and b's drop at the block's end (its ladder lands dropping a: tests/unwind_ladder.rs).
+    assert_eq!(text.lines().filter(|l| l.contains("invoke")).count(), 2, "two invokes, f() and b's drop:\n{text}");
     let mut lines = text.lines().skip_while(|l| !l.ends_with(" cleanup:"));
     assert!(lines.next().is_some(), "no cleanup block:\n{text}");
     let body: Vec<&str, Global> = {

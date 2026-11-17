@@ -279,6 +279,9 @@ pub struct Runtime {
     findings: Mutex<Vec<CompiledFinding>>,
     /// Where its calls' time went ([`Runtime::timed`] gives the clock).
     parts: Parts,
+    /// The heap each call's server lexes in (D102: handed in by the runtime's maker; a `&Heap`,
+    /// not an `Alloc`, so the runtime stays `Sync` for its load workers).
+    heap: &'static blaze_own::Heap,
 }
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -317,12 +320,12 @@ pub struct Loaded {
 
 impl Runtime {
     /// The runtime with the standard [`Settings`].
-    pub fn new() -> Result<Runtime, RuntimeError> {
-        Runtime::with_settings(&Settings::standard())
+    pub fn new(heap: &'static blaze_own::Heap) -> Result<Runtime, RuntimeError> {
+        Runtime::with_settings(&Settings::standard(), heap)
     }
 
-    /// The runtime with `settings`.
-    pub fn with_settings(settings: &Settings) -> Result<Runtime, RuntimeError> {
+    /// The runtime with `settings`; its calls' servers lex in `heap`.
+    pub fn with_settings(settings: &Settings, heap: &'static blaze_own::Heap) -> Result<Runtime, RuntimeError> {
         let engine = Engine::new(&settings.config()).map_err(|e| RuntimeError::Engine(format!("{e:#}")))?;
         let mut bytes = Bytes::default();
         bytes.write(b"blaze proc-macro host 2\n");
@@ -345,13 +348,14 @@ impl Runtime {
             temps: AtomicU64::new(0),
             findings: Mutex::new(Vec::new()),
             parts: Parts::counted(),
+            heap,
         })
     }
 
     /// The runtime with the standard [`Settings`], its calls' parts timed by `clock` (a
     /// profile's driver gives its own: rule 75).
-    pub fn timed(clock: Clock) -> Result<Runtime, RuntimeError> {
-        let mut runtime = Runtime::new()?;
+    pub fn timed(clock: Clock, heap: &'static blaze_own::Heap) -> Result<Runtime, RuntimeError> {
+        let mut runtime = Runtime::new(heap)?;
         runtime.parts = Parts::timed(clock);
         Ok(runtime)
     }
@@ -778,7 +782,7 @@ impl Runtime {
         let failed = |why: String| named(CallError::Failed(why));
         let mut mark = self.parts.start();
         let mut run_input = Vec::new();
-        let server = Server::new(edition, limits.server, call, Alloc::global(), &mut run_input).map_err(|error| match error {
+        let server = Server::new(edition, limits.server, call, self.heap.alloc(), &mut run_input).map_err(|error| match error {
             ServerError::Limit(limit) => named(CallError::Limit { limit, why: error.to_string() }),
             _ => failed(format!("its input could not be served: {error}")),
         })?;

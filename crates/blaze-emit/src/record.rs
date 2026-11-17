@@ -12,6 +12,8 @@ use core::fmt;
 
 use blaze_code::record::{CodeRecord, NO_TARGET, OWN_CODE, OWN_RELRO, Site, SiteKind, Space, Target, Word};
 use blaze_lir::View;
+use blaze_lir::func::RefId;
+use blaze_lir::legalize::{self, LegalizeError, QuadRoutines, SoftFloat};
 use blaze_own::Alloc;
 
 use crate::{
@@ -40,6 +42,20 @@ pub enum RecordEmitError {
     /// A word of data holds the address of `of`, a C name, plus `addend`: a name is bound by
     /// `dlsym` alone (`blaze_code::image::ImageError::OutsideAddend` would refuse it later).
     CAddend { of: Outside, addend: i64 },
+    /// blaze-lir's legalize refused the function (a vector, `f16` or `f128` form it does not
+    /// make scalar, or an `f128` routine not bound).
+    Legalize(LegalizeError),
+}
+
+/// No `f128` routine is bound to the record emitter yet: the program's compiler_builtins
+/// routines are bound by INTRINSICS.md P5b. An `f128` operation is refused by name
+/// ([`LegalizeError::NoRoutine`]).
+struct Unbound;
+
+impl QuadRoutines for Unbound {
+    fn routine(&self, _: SoftFloat) -> Option<RefId> {
+        None
+    }
 }
 
 impl fmt::Display for RecordEmitError {
@@ -49,6 +65,7 @@ impl fmt::Display for RecordEmitError {
             RecordEmitError::NoSymbol { of } => write!(f, "{of} has no symbol: a code record names every target by (space, symbol) (run.md, \"The code record\")"),
             RecordEmitError::CName { of } => write!(f, "{of} was given a C name: only a function or a static is bound by `dlsym`"),
             RecordEmitError::CAddend { of, addend } => write!(f, "data holds the address of {of}, a C name, plus {addend}: a C name is bound by `dlsym` alone, with no addend"),
+            RecordEmitError::Legalize(why) => why.fmt(f),
         }
     }
 }
@@ -75,6 +92,19 @@ pub(crate) fn emit_record_up_to<'a>(
     inline_most: u64,
     alloc: Alloc<'a>,
 ) -> Result<(CodeRecord<'a>, u32), RecordEmitError> {
+    // The Reference tier takes no vector, `f16` or `f128` arithmetic (INTRINSICS.md 3.2): a
+    // function holding any is made scalar first, on a copy in `alloc`; one holding none is
+    // emitted as it is.
+    let legal;
+    let func = match legalize::needed(&func).map_err(RecordEmitError::Legalize)? {
+        false => func,
+        true => {
+            let mut owned = func.to_func_in(alloc);
+            legalize::legalize(&mut owned, &Unbound, alloc).map_err(RecordEmitError::Legalize)?;
+            legal = owned;
+            legal.view()
+        }
+    };
     let mut out = Code::new_in(alloc);
     let mut form = Form::new_in(alloc);
     pass::run(func, &[], isa, inline_most, &mut out.bytes, &mut out.fixups, &mut out.relocs, Some(&mut form))

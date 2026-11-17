@@ -362,6 +362,7 @@ mod tests {
                 Down::Publish { slot, record, .. } => std::format!("Publish {} {}", slot.0, record.0[0]),
                 Down::Failed { why, .. } => std::format!("Failed {why:?}"),
                 Down::Personality { slot } => std::format!("Personality {}", slot.0),
+                Down::Native { library, words } => std::format!("Native {} {}", library.0[0], words.len()),
             });
             at += len;
         }

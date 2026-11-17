@@ -1,6 +1,5 @@
-//! The coroutine pass ([`crate::coroutine`]) against its oracle, by the method of
-//! crates/blaze-coroutine's simulation (docs/v2/plan/design/coroutines.md, "Proof by
-//! simulation"; decision D73: "the LIR pass is tested the same way, on LIR").
+//! The coroutine pass ([`crate::coroutine`]) against its oracle (docs/v2/plan/design/coroutines.md,
+//! "Proof by simulation"; decision D73: "the LIR pass is tested the same way, on LIR").
 //!
 //! One interpreter gives the operations their meaning; two drivers use it. The direct run is
 //! the body as the builder wrote it: one frame alive from the first poll to the end, a
@@ -1023,3 +1022,7 @@ fn paths_that_end_the_wrong_way_are_refused() {
 /// A panic inside a poll (ASYNC.md D-A5), on this file's interpreter.
 #[path = "coroutine_unwind_tests.rs"]
 mod unwind;
+
+/// Overlap of kept slots (ASYNC.md D-A6), on this file's interpreter.
+#[path = "coroutine_overlap_tests.rs"]
+mod overlap;

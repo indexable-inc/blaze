@@ -158,6 +158,17 @@ pub trait NamesSource<'n>: Copy {
     /// Question 10: an item's place.
     fn place_of(self, key: ItemKey) -> Option<Place>;
 
+    /// Question 10b: where an item's text begins: the text it is in (a file, or an expansion)
+    /// and its outline entry's first byte there. `None`: the item has no text (over records
+    /// the row without a place is filed in the log). Reads no text.
+    fn item_start(self, key: ItemKey) -> Option<(blaze_scope::resolve::At, u32)>;
+
+    /// Question 10c: the abi of the `extern` block that declares `key`, unquoted as written,
+    /// `"C"` when none is written (the Reference, items.extern.abi.default): `Some(Some(abi))`;
+    /// `Some(None)`: no `extern` block declares it (every member, every module-level item
+    /// outside one); `None`: not answered (over records the error is in the log).
+    fn extern_abi(self, key: ItemKey) -> Option<Option<&'n str>>;
+
     /// Question 11, the kind: what an item's outline entry is, without its detail's data.
     fn kind_of_item(self, key: ItemKey) -> Option<ItemKind>;
 
@@ -356,6 +367,24 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
 
     fn place_of(self, key: ItemKey) -> Option<Place> {
         self.place(key)
+    }
+
+    fn item_start(self, key: ItemKey) -> Option<(blaze_scope::resolve::At, u32)> {
+        let Place { krate, at, item } = self.place(key)?;
+        let (_, outline) = self.outline_at(krate, at)?;
+        Some((at, outline.item(item).range.start))
+    }
+
+    fn extern_abi(self, key: ItemKey) -> Option<Option<&'n str>> {
+        // An item with no place is declared by no block: as `program::placed` answered.
+        let Some(Place { krate, at, item }) = self.place(key) else { return Some(None) };
+        let Some((text, outline)) = self.outline_at(krate, at) else { return Some(None) };
+        let Some(parent) = outline.item(item).parent else { return Some(None) };
+        let block = outline.item(parent);
+        let ItemDetail::ExternBlock { abi } = block.detail else { return Some(None) };
+        let Some(r) = abi else { return Some(Some("C")) };
+        let written = text.get((block.range.start + r.start) as usize..(block.range.start + r.end) as usize)?;
+        Some(Some(crate::front::unquote(written.trim().strip_prefix("extern").unwrap_or(written))))
     }
 
     fn kind_of_item(self, key: ItemKey) -> Option<ItemKind> {
@@ -999,6 +1028,35 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         // nested in a body moves the entries after it.
         let row = self.row_now(krate, key)?.row;
         Some(Place { krate, at: row.text?.at, item: row.outline })
+    }
+
+    fn item_start(self, key: ItemKey) -> Option<(blaze_scope::resolve::At, u32)> {
+        let krate = self.items.crate_of(key)?;
+        self.items_of(krate)?;
+        // Today's place (item_grain.rs): the row's span is in today's text of its file.
+        let row = self.row_now(krate, key)?.row;
+        let Some(span) = row.text else {
+            self.log.put(SourceError::Items { krate, name: self.log.name(krate), error: ItemsRecordError::NoPlace { key } });
+            return None;
+        };
+        Some((span.at, span.start))
+    }
+
+    fn extern_abi(self, key: ItemKey) -> Option<Option<&'n str>> {
+        // A member of a trait or an impl is never an `extern` block's.
+        if self.member_owner(key).is_some() {
+            return Some(None);
+        }
+        match self.kind_of_item(key)? {
+            // Only a fn or a static can be a foreign item; whether an `extern` block declares
+            // this one is a field the items row does not hold yet (wiring d106-z-source-2.md
+            // reads it): refused by name, never guessed "not foreign".
+            ItemKind::Function | ItemKind::Static => {
+                self.gap("extern_abi: whether an `extern` block declares this fn or static, and its abi (the items row's `foreign` field, NAMES runner 20)", Some(key));
+                None
+            }
+            _ => Some(None),
+        }
     }
 
     fn kind_of_item(self, key: ItemKey) -> Option<ItemKind> {

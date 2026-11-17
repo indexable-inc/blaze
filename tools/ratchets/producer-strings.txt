@@ -1,0 +1,9 @@
+# The typed-in producer strings in key code (decision D105), outside test code, by crate (its
+# directory under crates/): a hash domain with a date, two or more numbers, a name for
+# code, or a literal passed to `producer(..)`. Only falls; a crate with no row is held to 0.
+# The way down: the producer's id from the entry's table (`blaze_ids::producer`).
+# Written by scripts/src/bin/ambient.rs (`{"command": "producers-write"}`), checked by
+# `{"command": "producers-check"}`.
+# crate	count
+blaze-cond	1
+blaze-run	1

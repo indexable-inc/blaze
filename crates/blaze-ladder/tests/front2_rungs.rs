@@ -40,7 +40,7 @@ use rungs::{ladder, x};
 fn verdict_of(rung: &str) -> (&'static str, String) {
     let dir = ladder().join("front2").join(rung);
     let shelf = x::shelf();
-    let verdict = x::run_one(&dir, Some(shelf.as_str()), |views, new| run_with(views, x::ROOT, None, FrontChoice::New(new)));
+    let verdict = x::run_one(&dir, Some(shelf.as_str()), |views, new| run_with(views, x::ROOT, None, FrontChoice::New(new), blaze_own::testing::heap().shared()));
     x::verdict_line(&dir, verdict)
 }
 

@@ -26,7 +26,13 @@ use crate::wire::{NAME_BYTES, Reader, WireError, Writer};
 /// The machine's bounds and the tool.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
+    /// The whole tool: every producer and every form. The certificate, the pointer and the walk
+    /// from the last answer hold it: they speak for the whole command.
     pub tool: Tool,
+    /// Each kind's tool, by [`Kind::index`]: the producer that makes that kind and every form
+    /// (decision D105), so an edit to one producer moves only the keys of the kinds it makes.
+    /// A task's key holds its kind's ([`Config::tool_of`]).
+    pub tools: [Tool; key::KINDS],
     /// Runs out at once: the machine's worker count (one code path sized by the machine).
     pub workers: u32,
     /// The most times one job may be run or settled: past it, [`DriveError::Reentries`].
@@ -36,6 +42,13 @@ pub struct Config {
     /// Whether a finding of this rule is an error: findings carry no level (rule 81), the
     /// command's policy says which fail it (`blaze run` and `test` fail on any, lints included).
     pub is_error: fn(u16) -> bool,
+}
+
+impl Config {
+    /// The tool a task of `kind` is keyed by.
+    pub fn tool_of(&self, kind: Kind) -> Tool {
+        self.tools[kind.index()]
+    }
 }
 
 /// How `run` and `test` hold the program to the check of its scope (drive.md, "The gate";
@@ -269,6 +282,10 @@ pub enum Why {
     /// A task this one needs failed this command (its own failure is printed); this one has
     /// no record and prints nothing of its own: the closing note counts it.
     Waited { on: Name },
+    /// The task's file (its name's) changed between the sweep and the task's read: the bytes
+    /// read are not the content id its key holds (`verified::verify`). It puts nothing, and the
+    /// command's answer is refused naming the file: no re-read, no retry (rule 3).
+    Changed,
 }
 
 impl fmt::Display for TaskFailure {
@@ -282,6 +299,7 @@ impl fmt::Display for TaskFailure {
             ),
             Why::Refused { what, rule } => write!(f, "{}: {what} ({rule})", self.name),
             Why::Waited { on } => write!(f, "{}: needs {on}, which failed", self.name),
+            Why::Changed => write!(f, "{}: changed while the command ran; run again", self.name),
         }
     }
 }
@@ -1038,6 +1056,16 @@ impl<'a> Request<'a> {
         }
     }
 
+    /// The content id the sweep gave the file [`Request::file_of`] names: what a task reading
+    /// that file by path compares its bytes with (`verified::verify`).
+    pub fn file_content_of(&self, task: &Task<'_>) -> Option<ContentId> {
+        let index = match task.file {
+            Some(index) => index as usize,
+            None => self.file_index(&file_of(task.base, task.home).subject)?,
+        };
+        Some(self.files.ids()[index])
+    }
+
     /// The path of file `index` (a [`Task::file`] or [`Print::file`]).
     pub fn path(&self, index: u32) -> &[u8] {
         let at = self.files.path_ats()[index as usize] as usize;
@@ -1324,6 +1352,9 @@ impl<'a> Request<'a> {
     }
 
     fn put(&mut self, key: Key, bytes: Vec<u8, Alloc<'a>>, out: &mut AVec<'_, Effect<'a>>) {
+        if self.plant == Plant::DropPutsOnFailure && !self.failures.is_empty() {
+            return;
+        }
         self.profile.puts += 1;
         out.push(Effect::Put { key, bytes });
     }
@@ -1513,10 +1544,19 @@ impl<'a> Request<'a> {
     }
 
     /// Every state change goes here, so the settled count is kept without a scan.
+    /// Settling frees the job's needs: a later run of it is handed its record's reads as
+    /// hints (`to_run`), never these. Kept, they were the clone's largest holder: 5181M in
+    /// 111,403 lists at 45 s (RUNNER 17, `malloc_history`, 2026-11-16).
     fn set_state(&mut self, name: Name, state: State) {
+        let (alloc, keep) = (self.alloc, self.plant == Plant::KeepSettledNeeds);
         if let Some(job) = self.jobs.get_mut(&name) {
             match (job.state == State::Settled, state == State::Settled) {
-                (false, true) => self.settled += 1,
+                (false, true) => {
+                    self.settled += 1;
+                    if !keep {
+                        job.needs = Vec::new_in(alloc);
+                    }
+                }
                 (true, false) => self.settled -= 1,
                 _ => {}
             }
@@ -1700,6 +1740,11 @@ impl<'a> Request<'a> {
 
     /// The machine's own bookkeeping so far: probes of every table, ring entries skipped, wakes
     /// and waits (the linearity test's count; parallel.md change 3).
+    /// Room the settled jobs' need lists still hold, in names: zero once settling frees them.
+    pub fn kept_needs(&self) -> usize {
+        self.jobs.iter().filter(|(_, job)| job.state == State::Settled).map(|(_, job)| job.needs.capacity()).sum()
+    }
+
     pub fn bookkeeping(&self) -> u64 {
         self.jobs.ops()
             + self.now.ops()
@@ -2173,13 +2218,13 @@ impl<'a> Request<'a> {
         }
         let locate = locate.expect("found above");
         let (source, key) = match locate {
-            Locate::Source(source) => (source, key::task_key(self.config.tool, name, &source)),
+            Locate::Source(source) => (source, key::task_key(self.config.tool_of(name.kind), name, &source)),
             Locate::Key(key) => (key.0, key),
             // A fork of a file's task reads its base's file.
             Locate::File { edition } => match self.file_index(&self.cond_of(name).0.subject) {
                 Some(index) => {
                     let source = key::file_source(self.files.ids()[index], edition);
-                    (source, key::task_key(self.config.tool, name, &source))
+                    (source, key::task_key(self.config.tool_of(name.kind), name, &source))
                 }
                 // A file the request does not hold yet, its path named by a part: open it.
                 None if !self.absent_files.contains(&Name::new(Kind::FileItems, self.cond_of(name).0.subject))
@@ -2250,7 +2295,7 @@ impl<'a> Request<'a> {
         job.locate = Some(Locate::File { edition });
         job.place = place;
         job.source = source;
-        job.key = key::task_key(self.config.tool, name, &source);
+        job.key = key::task_key(self.config.tool_of(name.kind), name, &source);
         let findings = [Finding { rule, start: 0, end: 0, message: &message }];
         let output = Output { name, out: source, reads: &[], parts: &[], paths: &[], findings: &findings, payload: &[] };
         self.made(&output, out)

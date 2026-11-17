@@ -10,6 +10,7 @@
 //! Sans-IO: text in, text and lists out.
 #![blaze::sans_io]
 
+use blaze_expand::seen::SeenRoot;
 use blaze_ids::{ContentId, Hasher};
 use blaze_own::{AString, AVec, Alloc, String, Vec};
 
@@ -43,6 +44,9 @@ pub enum PinError<'t> {
     Malformed { target: &'t str, field: &'static str },
     /// The target's C library headers are not pinned (`null`): no native script runs there.
     NoSysroot { target: &'t str },
+    /// The table's top-level `version` is missing or not `<major>.<rest>` with a numeric major:
+    /// libclang's resource dir (`lib/clang/<major>`) cannot be named.
+    NoVersion,
 }
 
 impl core::fmt::Display for PinError<'_> {
@@ -53,6 +57,10 @@ impl core::fmt::Display for PinError<'_> {
             PinError::NoSysroot { target } => write!(
                 f,
                 "{PIN_PATH}: no sysroot pinned for {target}: its C library headers (a glibc sysroot by digest, D69) are not fetched yet, so no native build script runs there"
+            ),
+            PinError::NoVersion => write!(
+                f,
+                "{PIN_PATH}: no top-level `version` of the form `<major>.<minor>.<patch>`: libclang's resource dir `lib/clang/<major>` on the shelf cannot be named (D112 N5)"
             ),
         }
     }
@@ -145,10 +153,24 @@ pub fn sysroot<'t>(text: &'t str, target: &'t str) -> Result<Sysroot, PinError<'
     }
 }
 
+/// The major of the pinned clang (`version` in the table `text`, [`PIN`]): the name of its
+/// resource dir under the shelf's `lib/clang/`. Refused by name when absent or not numeric.
+pub fn clang_major<'t>(text: &'t str) -> Result<&'t str, PinError<'t>> {
+    let version = scalar(text, "version").ok_or(PinError::NoVersion)?;
+    let (major, _) = version.split_once('.').ok_or(PinError::NoVersion)?;
+    if major.is_empty() || !major.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(PinError::NoVersion);
+    }
+    Ok(major)
+}
+
 /// The unpacked toolchain on the shelf: `<home>/.blaze/v2/toolchain/clang/<sha256 hex>`.
 #[derive(Clone, Copy, Debug)]
 pub struct Shelf<'s> {
     pub dir: &'s str,
+    /// The pinned clang's major ([`clang_major`]): its builtin headers are under
+    /// `<dir>/lib/clang/<clang_major>`.
+    pub clang_major: &'s str,
 }
 
 impl<'s> Shelf<'s> {
@@ -163,6 +185,29 @@ impl<'s> Shelf<'s> {
     pub fn programs<'a>(&self, alloc: Alloc<'a>) -> [AString<'a>; 3] {
         [self.path("bin/clang", alloc), self.path("bin/clang++", alloc), self.path("bin/llvm-ar", alloc)]
     }
+    /// clang's resource dir (builtin headers such as `stdarg.h`): `<dir>/lib/clang/<major>`,
+    /// what the shelf's `clang -print-resource-dir` prints. The shelf's clang binary finds it
+    /// itself; libclang loaded in a script's process (bindgen) does not, so it is named.
+    pub fn resource_dir<'a>(&self, alloc: Alloc<'a>) -> AString<'a> {
+        let mut out = self.path("lib/clang/", alloc);
+        out.push_str(self.clang_major);
+        out
+    }
+}
+
+/// What the shelf holds of the pinned archive, each under the archive's top folder
+/// (`LLVM-23.1.4-macOS-ARM64/`), sorted: the unpack list's one home. The compilers, the linker
+/// (`ld64.lld`, a link to `lld`), `llvm-ar` (`AR`), `llvm-nm` (nm-row: `NM`, the host-tool row
+/// `nm` in the pin table: tikv-jemalloc-sys's configure dumps symbols with it), libclang and its
+/// resource folder. `bin/clang.cfg` and `bin/clang++.cfg` are written on the shelf, not unpacked.
+pub const SHELF_MEMBERS: [&str; 9] =
+    ["bin/clang", "bin/clang++", "bin/clang-23", "bin/ld64.lld", "bin/lld", "bin/llvm-ar", "bin/llvm-nm", "lib/clang", "lib/libclang.dylib"];
+
+/// The first of [`SHELF_MEMBERS`] that `present` (the caller's look at `<shelf>/<member>`) says
+/// the shelf lacks, by name: a shelf unpacked before a member was added is refused naming it,
+/// never run without it. `None` when every member is there. Sans-IO.
+pub fn shelf_missing(mut present: impl FnMut(&str) -> bool) -> Option<&'static str> {
+    SHELF_MEMBERS.into_iter().find(|member| !present(*member))
 }
 
 /// What a native script's C environment is made from.
@@ -174,8 +219,9 @@ pub struct CInputs<'c> {
     /// The script's `OUT_DIR` and package folder, as the process sees them.
     pub out_dir: &'c str,
     pub package: &'c str,
-    /// `name-version`, the package's name in mapped paths.
-    pub package_name: &'c str,
+    /// What the script sees as its root: `package` (the served tree's real folder) is mapped to
+    /// its `mount()`, the same path the script was told (D96).
+    pub seen: SeenRoot<'c>,
     /// The deployment target the record is keyed by.
     pub macos_min: &'c str,
 }
@@ -203,14 +249,16 @@ pub fn c_env<'a>(c: &CInputs<'_>, alloc: Alloc<'a>) -> AVec<'a, (AString<'a>, AS
         c.out_dir,
         "=/out -ffile-prefix-map=",
         c.package,
-        "=/workspace/",
-        c.package_name,
+        "=",
+        c.seen.mount(),
         " -fdebug-compilation-dir=. -MD -Wno-unused-command-line-argument",
     ]);
     let mut env: AVec<'a, (AString<'a>, AString<'a>)> = Vec::new_in(alloc);
     let mut put = |k: &str, v: AString<'a>| env.push((text(&[k]), v));
     put("AR", ar);
-    put("BINDGEN_EXTRA_CLANG_ARGS", text(&["-isysroot ", c.sysroot]));
+    // D112 N5: libclang in the script's process finds no builtin headers by itself.
+    let resource_dir = c.shelf.resource_dir(alloc);
+    put("BINDGEN_EXTRA_CLANG_ARGS", text(&["-isysroot ", c.sysroot, " -resource-dir ", resource_dir.as_str()]));
     put("CC", clang);
     put("CFLAGS", flags.clone());
     put("CXX", clangxx);

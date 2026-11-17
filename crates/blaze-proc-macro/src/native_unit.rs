@@ -39,6 +39,13 @@ pub const MACOS_MIN: &str = "11.0";
 
 /// Where `script` (a build-script unit) runs for `mode`: the closure's verdict
 /// ([`native::runner`]) placed by the mode ([`toolchain::placement`], D69 (3)).
+///
+/// This is THE one place a script is given the native runner; nothing else chooses it.
+/// D112: the five tool-spawning scripts (`toolchain::NATIVE_EVERY_MODE`, and
+/// tikv-jemalloc-sys for build/run) run in the Seatbelt native runner until the deterministic
+/// sandbox runs; records local. A script placed native runs with the command's
+/// [`NativeSetting`] (made once by [`crate::native_setting::command_native_setting`]) or is
+/// refused by name ([`NativeUnitError::NoNativeSetting`]); it is never tried as wasm (rule 3).
 pub fn placed(graph: &UnitGraph<'_>, script: UnitId, mode: Mode, alloc: Alloc<'_>) -> Runner {
     toolchain::placement(native::runner(graph, script, alloc), mode, graph.units[script.index()].name.as_str())
 }
@@ -211,7 +218,7 @@ pub fn native_outputs<'a>(
     serves: UnitId,
     because: UnitId,
     tree: Tree,
-    folder: String,
+    root: crate::script_sandbox::ScriptRoot,
     deps: &[DepMetadata<'_>],
     alloc: Alloc<'a>,
 ) -> Result<ScriptRun<'a>, NativeUnitError> {
@@ -239,7 +246,7 @@ pub fn native_outputs<'a>(
     // The same environment as the wasm path: the unit's features, the served unit's cfg.
     let serves_unit = &graph.units[serves.index()];
     let facts = PackageFacts { name, version, links: unit.links.as_ref().map(|l| l.as_str()), ..PackageFacts::default() };
-    let given = Given { package: facts, folder: &folder, features: &unit.features, target_cfg: &serves_unit.cfg, target: setting.target, host: setting.host, deps };
+    let given = Given { package: facts, seen: root.seen(), features: &unit.features, target_cfg: &serves_unit.cfg, target: setting.target, host: setting.host, deps };
     let env = blaze_build_script::env(&given, alloc);
 
     // D71: the host tools the table grants this package, each at its real path, by digest.
@@ -269,7 +276,7 @@ pub fn native_outputs<'a>(
             }
             let (dir, file) = program.rsplit_once('/').unwrap_or(("/", program));
             let digest = blaze_sha256::digest(&read_file(if dir.is_empty() { "/" } else { dir }, file)?);
-            tool_keys.push(HostToolKey { name: names[at].as_str(), digest });
+            tool_keys.push(HostToolKey::of(tool, names[at].as_str(), digest));
             at += 1;
         }
     }
@@ -316,8 +323,8 @@ pub fn native_outputs<'a>(
         }
     };
     let out_dir = fresh_folder(native.work, &format!("out/{key_hex}"), &[], &package)?;
-    let package_name = format!("{name}-{version}");
-    let c = CInputs { shelf: Shelf { dir: native.shelf }, sysroot: native.sdk, out_dir: &out_dir, package: &package_dir, package_name: &package_name, macos_min: MACOS_MIN };
+    let clang_major = toolchain::clang_major(PIN).map_err(|e| pin(e.to_string()))?;
+    let c = CInputs { shelf: Shelf { dir: native.shelf, clang_major }, sysroot: native.sdk, out_dir: &out_dir, package: &package_dir, seen: root.seen(), macos_min: MACOS_MIN };
     let run = NativeScript { program: &program, c, env: &env, reads: &[], host_tools: &tools, limits: RunLimits::STANDARD, deadline: native.deadline };
     let ran = run_script(&run, alloc).map_err(NativeUnitError::Run)?;
 
@@ -405,7 +412,7 @@ mod tests {
         let cfg = [CfgAtom::flag("unix", alloc)];
         let given = Given {
             package: PackageFacts { name: "zstd-sys", version: "1.0.0", ..PackageFacts::default() },
-            folder: "",
+            seen: blaze_expand::seen::SeenRoot::Package,
             features: &[],
             target_cfg: &cfg,
             target: "aarch64-apple-darwin",

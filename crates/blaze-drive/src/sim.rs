@@ -99,6 +99,11 @@ struct World {
     /// A file whose `FileItems` task fails (a planted panic, an oversize file): its surface,
     /// and each crate reading it, fail `Waited`; the request goes on.
     failing_file: Option<usize>,
+    /// A file edited after the sweep and before its `FileItems` task reads it: the task reads
+    /// the edited bytes, while its key holds the swept id.
+    edited_at_run: Option<usize>,
+    /// The control's plant handed to `verified::verify` by the fake executor.
+    verify_plant: Plant,
 }
 
 /// A crate of the names step: its identity (what blaze-world's `UnitInput::key` hashes), the
@@ -326,6 +331,8 @@ impl World {
             macros: StdVec::new(),
             modules_absent: false,
             failing_file: None,
+            edited_at_run: None,
+            verify_plant: Plant::None,
         }
     }
 
@@ -497,6 +504,15 @@ fn execute(world: &World, task: &Task<'static>) -> Result<Answered, Broke> {
             if world.failing_file == Some(f) {
                 return Ok(Answered::Failed(TaskFailure { name, why: Why::Panicked { used: 0, limit: 0 } }));
             }
+            // The task reads its file now; an edit after the sweep shows here, and the bytes
+            // are compared with the id the key was made from before anything is parsed.
+            let mut read = world.bytes(f);
+            if world.edited_at_run == Some(f) {
+                read.extend_from_slice(b" edited after the sweep");
+            }
+            if let Err(failure) = crate::verified::verify(name, &read, world.id(f), |bytes| key::digest("sim file", bytes), world.verify_plant) {
+                return Ok(Answered::Failed(failure));
+            }
             let mut parts = StdVec::new();
             for (i, item) in world.files[f].iter().enumerate() {
                 let place = u32::try_from(i).unwrap_or(u32::MAX);
@@ -616,6 +632,10 @@ struct Setup {
     plant: Plant,
     /// The tool's identity (the binary's build id in blaze-cli).
     tool: &'static [u8],
+    /// The kind whose producer is made from other code (D105): its tool and the whole tool move.
+    moved: Option<Kind>,
+    /// Whether each kind is keyed by its own tool, or (planted) by the whole one.
+    split: Split,
     /// A first request hands only the manifests and opens each file where a units record says,
     /// as blaze-cli's cold run does; otherwise every file is handed at `Start`.
     opens: bool,
@@ -629,7 +649,33 @@ fn every_rule(_: u16) -> bool {
 }
 
 fn config(workers: u32, tool: &[u8]) -> Config {
-    Config { tool: Tool(key::digest("sim tool", tool)), workers, most_entries: 32, most_jobs: 1 << 20, is_error: every_rule }
+    config_moved(workers, tool, None, Split::PerKind)
+}
+
+/// Whether each kind's key holds its own producer's tool (D105), or, the planted bug, every
+/// kind's the whole tool (a producer left out of its kind's key: any producer's edit reruns all).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Split {
+    PerKind,
+    LeftOut,
+}
+
+/// [`config`] with the producer of `moved` made from other code: the whole tool moves with it (it
+/// holds every producer); each other kind's tool stays.
+fn config_moved(workers: u32, tool: &[u8], moved: Option<Kind>, split: Split) -> Config {
+    let mut whole_bytes = StdVec::from(tool);
+    if let Some(kind) = moved {
+        whole_bytes.push(kind as u8);
+    }
+    let whole = Tool(key::digest("sim tool", &whole_bytes));
+    let tools = Kind::ALL.map(|kind| match split {
+        Split::LeftOut => whole,
+        Split::PerKind => {
+            let domain = if moved == Some(kind) { "sim kind tool moved" } else { "sim kind tool" };
+            Tool(key::digest(domain, &[tool, &[kind as u8]].concat()))
+        }
+    });
+    Config { tool: whole, tools, workers, most_entries: 32, most_jobs: 1 << 20, is_error: every_rule }
 }
 
 const ASK: Ask<'static> = Ask { command: Command::Check, args: b"", gate: Gate::Beside, space: Space::NONE };
@@ -640,7 +686,7 @@ fn workers(tape: &Tape) -> u32 {
 }
 
 fn setup(tape: &Tape, plant: Plant) -> Setup {
-    Setup { workers: workers(tape), ask: ASK, plant, tool: SIM_TOOL, opens: tape.one_in(2, "open the files") }
+    Setup { workers: workers(tape), ask: ASK, plant, tool: SIM_TOOL, moved: None, split: Split::PerKind, opens: tape.one_in(2, "open the files") }
 }
 
 /// The most events one request takes in the sim (rule 18): a toy build is far below it.
@@ -732,7 +778,12 @@ fn request_with(
         Some(lock) => key::digest("sim units and lock", &[units_source(&files).0, graph_source(lock).0].concat()),
     };
 
-    let mut req = Request::planted_in(config(setup.workers, setup.tool), setup.ask, setup.plant, blaze_own::testing::heap().alloc());
+    let mut req = Request::planted_in(
+        config_moved(setup.workers, setup.tool, setup.moved, setup.split),
+        setup.ask,
+        setup.plant,
+        blaze_own::testing::heap().alloc(),
+    );
     let table: Settled<Global> = Settled::new_in(1 << 12, Global);
     let mut out: Vec<Effect<'static>, Alloc<'static>> = Vec::new_in(blaze_own::testing::heap().alloc());
     let mut ended = Ended {
@@ -908,6 +959,9 @@ fn request_with(
             }
         }
         if let Some(answer) = ended.answer {
+            // A settled job holds no needs: they are freed as it settles (RUNNER 17).
+            let kept = req.kept_needs();
+            oracle(kept == 0, || format!("settled jobs keep room for {kept} needs"))?;
             // The answer is the last thing the machine says: a program it started has exited
             // first, or its exit would step an answered machine.
             oracle(!ended.started || exited, || String::from("answered while the program it started is running"))?;
@@ -1076,6 +1130,12 @@ fn flights(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The planted kept needs (the clone's largest holder, 2026-11-16) fail the answer's oracle.
+#[test]
+fn control_needs_kept_past_settling_are_caught() {
+    control(SimConfig::cases(300), Plant::None, Plant::KeepSettledNeeds, "settled jobs keep room", flights);
+}
+
 #[test]
 fn one_flight_per_key() {
     check(SimConfig::cases(300), |tape| flights(tape, Plant::None));
@@ -1099,6 +1159,35 @@ fn a_repeat_runs_nothing_for_one_read() {
         oracle(answer.profile.certified, || String::from("a repeat did not stand on its certificate"))?;
         oracle(again.prints == first.prints, || String::from("a repeat printed other findings"))
     });
+}
+
+/// D105: each kind's key holds its own producer's tool. With the body checker's producer moved
+/// (and so the whole tool, which holds every producer: no certificate, no pointer stands), the
+/// body checks run again and no other kind runs: every other record is found under its unchanged
+/// key. Without the split (every kind keyed by the whole tool, the planted `Split::LeftOut`) every
+/// kind runs again: the control below.
+fn a_moved_kind(tape: &Tape, split: Split) -> Result<(), Broke> {
+    let world = World::draw(tape);
+    let mut store = Store::default();
+    let (_, first) = finished(request(tape, &world, None, &mut store, None, Plant::None)?)?;
+    let bodies = first.runs.get(&Kind::BodyCheck).copied().unwrap_or(0);
+    let moved = Setup { moved: Some(Kind::BodyCheck), split, ..setup(tape, Plant::None) };
+    let (_, ended) = finished(request_with(tape, &world, Some(&world), &mut store, first.last.as_deref(), moved)?)?;
+    let others: StdVec<(Kind, u32)> =
+        ended.runs.iter().filter(|(kind, _)| **kind != Kind::BodyCheck).map(|(kind, n)| (*kind, *n)).collect();
+    oracle(others.is_empty(), || format!("a moved body checker also ran {others:?}"))?;
+    let again = ended.runs.get(&Kind::BodyCheck).copied().unwrap_or(0);
+    oracle(bodies == 0 || again > 0, || format!("a moved body checker ran none of {bodies} bodies again"))
+}
+
+#[test]
+fn a_moved_producer_reruns_its_own_kind_alone() {
+    check(SimConfig::cases(100), |tape| a_moved_kind(tape, Split::PerKind));
+}
+
+#[test]
+fn control_a_producer_left_out_of_its_kind_is_caught() {
+    control(SimConfig::cases(200), Split::PerKind, Split::LeftOut, "a moved body checker also ran", a_moved_kind);
 }
 
 /// The tool's identity is in every key: a binary built from other code shares no record and no
@@ -1326,7 +1415,7 @@ fn one_two_and_sixteen_workers_write_equal_bytes() {
         let opens = tape.one_in(2, "open the files");
         for workers in [1, 2, 16] {
             let mut store = Store::default();
-            let setup = Setup { workers, ask: ASK, plant: Plant::None, tool: SIM_TOOL, opens };
+            let setup = Setup { workers, ask: ASK, plant: Plant::None, tool: SIM_TOOL, moved: None, split: Split::PerKind, opens };
             let (_, ended) = finished(request_with(tape, &world, None, &mut store, None, setup)?)?;
             answers.push((store.records, ended.prints));
         }
@@ -1358,6 +1447,8 @@ fn gates(tape: &Tape, plant: Plant) -> Result<(), Broke> {
         ask: Ask { command: Command::Run, args: b"", gate, space: Space::NONE },
         plant,
         tool: SIM_TOOL,
+        moved: None,
+        split: Split::PerKind,
         opens: tape.one_in(2, "open the files"),
     };
     let (answer, ended) = finished(request_with(tape, &world, None, &mut store, None, setup)?)?;
@@ -1913,6 +2004,66 @@ fn a_failed_crate_leaves_its_dependents_without_a_record() {
         })?;
         same_as_fresh(tape, &fixed, &store, &ended)
     });
+}
+
+/// A request in which one task fails puts every other record it settled (a request with
+/// findings is the normal state while a person edits: the coordinator's rule, 2026-11-16), and
+/// the repeat, nothing changed, finds them all: its found and standing jobs are at least the
+/// first's made ones, and it makes none but what failed.
+fn a_failure_keeps_the_rest(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    let mut world = names_world(tape);
+    if world.crates.len() < 2 {
+        return Ok(());
+    }
+    world.crates[0].fails = true;
+    let mut store = Store::default();
+    let (answer, first) = finished(request(tape, &world, None, &mut store, None, plant)?)?;
+    let made: u32 = answer.profile.kinds.iter().map(|k| k.made).sum();
+    oracle(answer.failed > 0, || "the planted crate did not fail".into())?;
+    let (again, _) = finished(request(tape, &world, Some(&world), &mut store, first.last.as_deref(), plant)?)?;
+    let kept: u32 = again.profile.kinds.iter().map(|k| k.found + k.standing).sum();
+    let remade: u32 = again.profile.kinds.iter().map(|k| k.made).sum();
+    oracle(kept >= made && remade == 0, || {
+        format!("a request with a failure put {} records of {made} made; the repeat found or stood {kept} and made {remade}", answer.profile.puts)
+    })
+}
+
+#[test]
+fn a_request_with_a_failure_puts_every_settled_record() {
+    check(SimConfig::cases(200), |tape| a_failure_keeps_the_rest(tape, Plant::None));
+}
+
+#[test]
+fn control_puts_dropped_on_a_failure_are_caught() {
+    control(SimConfig::cases(500), Plant::None, Plant::DropPutsOnFailure, "the repeat found or stood", a_failure_keeps_the_rest);
+}
+
+/// An edit lands between the sweep and a file's task (the coordinator's ruling: verified
+/// bytes). The task compares what it read with the id its key holds, fails `Changed`, and puts
+/// nothing: no record of the file is under the swept id, and the request is not certified.
+fn an_edit_after_the_sweep(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    let mut world = World::draw(tape);
+    if world.files.is_empty() {
+        return Ok(());
+    }
+    world.edited_at_run = Some(0);
+    world.verify_plant = plant;
+    let mut store = Store::default();
+    let (answer, ended) = finished(request(tape, &world, None, &mut store, None, Plant::None)?)?;
+    let file = file_name(0);
+    let filed = store.records.values().any(|bytes| matches!(crate::record::open(bytes), Ok(crate::record::Stored::Whole(view)) if view.name == file));
+    oracle(!filed, || format!("a record of {file} was put under the swept id though its bytes changed before the read"))?;
+    oracle(answer.failed > 0 && ended.last.is_none(), || format!("{} failed and last written {}: the changed file must leave the answer uncertified", answer.failed, ended.last.is_some()))
+}
+
+#[test]
+fn a_file_changed_after_the_sweep_puts_nothing() {
+    check(SimConfig::cases(200), |tape| an_edit_after_the_sweep(tape, Plant::None));
+}
+
+#[test]
+fn control_a_skipped_content_compare_is_caught() {
+    control(SimConfig::cases(300), Plant::None, Plant::SkipContentCompare, "under the swept id", an_edit_after_the_sweep);
 }
 
 // --- One pointer a (tool, shape) (pointers.rs) -------------------------------------------------

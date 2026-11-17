@@ -153,8 +153,47 @@ impl MakerState {
 
     /// Fn `key` checked, once a run: its index, `None` when the front end has no body for it.
     /// A newly checked body with a closure or an async block re-makes the closure and coroutine
-    /// tables over the bodies checked so far.
+    /// tables over the bodies checked so far. Every OTHER fn whose closure a checked body's
+    /// types hold is checked too, before this returns (its closure's facts are in its body):
+    /// by a work list, each owner once.
     fn ensure<P: FrontEnd>(&mut self, program: &mut P, key: ItemKey, checks: &mut CheckCount) -> Result<Option<usize>, RunError> {
+        /// The most closure owners one ensure follows (rule 18).
+        const MOST_OWNERS: usize = 4096;
+        let first = self.ensure_one(program, key, checks)?;
+        let mut todo: AVec<'_, ItemKey> = blaze_own::Vec::new_in(self.work.alloc);
+        self.owners_named(key, &mut todo);
+        let mut steps = 0;
+        while let Some(owner) = todo.pop() {
+            if self.asked.binary_search_by_key(&owner, |r| r.0).is_ok() {
+                continue;
+            }
+            steps += 1;
+            if steps > MOST_OWNERS {
+                return Err(RunError::OneBody { key, why: "more closure owners named than the most one ensure follows" });
+            }
+            self.ensure_one(program, owner, checks)?;
+            self.owners_named(owner, &mut todo);
+        }
+        Ok(first)
+    }
+
+    /// Each closure owner other than `key` that `key`'s checked body's types name, pushed on
+    /// `todo` (in node order: deterministic for one body).
+    fn owners_named(&self, key: ItemKey, todo: &mut AVec<'_, ItemKey>) {
+        let Some(Some(i)) = self.asked.binary_search_by_key(&key, |r| r.0).ok().map(|n| self.asked[n].1) else { return };
+        let Some(Some(done)) = self.checked.get(i) else { return };
+        let view = done.types.view();
+        for n in view.nodes() {
+            if let blaze_typeck::PNode::Closure { owner, .. } = *n
+                && owner != key
+            {
+                todo.push(owner);
+            }
+        }
+    }
+
+    /// [`MakerState::ensure`] of one key, owners not followed.
+    fn ensure_one<P: FrontEnd>(&mut self, program: &mut P, key: ItemKey, checks: &mut CheckCount) -> Result<Option<usize>, RunError> {
         let slot = match self.asked.binary_search_by_key(&key, |r| r.0) {
             Ok(n) => return Ok(self.asked[n].1),
             Err(n) => n,

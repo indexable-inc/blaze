@@ -292,7 +292,7 @@ impl World {
 
     /// The type written `text` (`u8`, `[i32; 4]`, `&[u8]`, a declared ADT) in the world's table.
     pub fn ty(&mut self, text: &str) -> PTy {
-        let alloc = Alloc::global();
+        let alloc = blaze_own::testing::heap().alloc();
         // A written type is lowered in a body: a `let`'s.
         let probe = std::format!("const T: () = {{ let _x: {text}; }};");
         let lowered = lower_body(&probe, Edition::E2024, &mut NoCfg, &mut blaze_lower::NoModule, alloc).unwrap_or_else(|_| panic!("`{text}`: cfg"));
@@ -489,7 +489,7 @@ impl World {
     /// its cause; the rest join the world.
     pub fn try_build(&mut self) -> StdVec<(ItemKey, Skip)> {
         self.fx.finish();
-        let alloc = Alloc::global();
+        let alloc = blaze_own::testing::heap().alloc();
         let mut failed = StdVec::new();
         for (key, text) in core::mem::take(&mut self.texts) {
             let lowered = lower_body(&text, Edition::E2024, &mut NoCfg, &mut blaze_lower::NoModule, alloc).unwrap_or_else(|_| panic!("{text}: cfg"));
@@ -511,7 +511,7 @@ impl World {
 
     fn check_body(&mut self, key: ItemKey, view: &View<'_>) -> Result<(), Skip> {
         let text = String::from(view.item());
-        let alloc = Alloc::global();
+        let alloc = blaze_own::testing::heap().alloc();
         let mut tys = PortableTys::new_in(alloc);
         let body = to_typeck(view, key, &mut tys, &mut Names { adts: &self.adt_names }, alloc).map_err(Skip::Convert)?;
         let lits = LitTable::of(view, &body)?;
@@ -533,7 +533,7 @@ impl World {
 
     /// A type written in a lowered record, in the world's table.
     fn written(&mut self, v: &View<'_>, t: TypeId) -> Result<PTy, Skip> {
-        let mut tys = PortableTys::new_in(Alloc::global());
+        let mut tys = PortableTys::new_in(blaze_own::testing::heap().alloc());
         let p = Names { adts: &self.adt_names }.ty(v, t, &mut tys).map_err(Skip::Convert)?;
         Ok(self.import(tys.view(), p))
     }
@@ -684,7 +684,7 @@ impl World {
     }
 
     pub fn eval_item(&mut self, item: ItemKey) -> Result<&ConstRecord<Alloc<'static>>, ConstError<'static>> {
-        let alloc = Alloc::global();
+        let alloc = blaze_own::testing::heap().alloc();
         let mut settle = Settle::new(Need { kind: NeedKind::Value, item, args: List::EMPTY }, 64, alloc);
         let mut last = None;
         // The unit's ground table and layouts: one for every evaluation of the world.
@@ -780,7 +780,7 @@ impl LayoutFacts for World {
         let Some(d) = self.explicit_discriminant(key, variant) else { return Ok(None) };
         // The value read is the discriminant's: its item is the need.
         let missing = blaze_build::layout::Missing { item: d };
-        let ik = instance_key(self.code_id(d), List::EMPTY, PTys::EMPTY, Alloc::global()).map_err(|_| missing)?;
+        let ik = instance_key(self.code_id(d), List::EMPTY, PTys::EMPTY, blaze_own::testing::heap().alloc()).map_err(|_| missing)?;
         let r = self.store.iter().find(|r| r.key == RecordKey::of(ik)).ok_or(missing)?;
         let bits = 8 * r.data.allocs[0].bytes.len() as u32;
         let v = int_of(r);

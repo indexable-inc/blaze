@@ -12,7 +12,7 @@ use core::fmt;
 use core::hash::Hash;
 
 use blaze_id::{CrateItemKey, ItemKey};
-use blaze_own::Alloc;
+use blaze_own::{AVec, Alloc};
 use blaze_surface::{
     CrateRootBuilder, DeclsBuilder, ExpandedDecls, Items, ModuleInfo, NotBuilt, SurfaceError,
 };
@@ -44,6 +44,15 @@ pub trait ScopeFacts {
 
     /// What the call's expansion adds to its module, or `None` while it is not expanded.
     fn expansion(&self, call: ItemKey) -> Result<Option<ExpandedDecls<'_, Self::Name>>, SurfaceError>;
+
+    /// The helper attributes derive `derive` declares (`#[proc_macro_derive(D, attributes(h))]`),
+    /// pushed to `out` in any order. The cells ask it only of a derive call that a one-segment
+    /// attribute on its item follows (their helper scope). Facts that do not hold a derive's
+    /// helpers refuse it by name, never answer "none".
+    fn derive_helpers(&self, derive: ItemKey, out: &mut AVec<'_, Self::Name>) -> Result<(), SurfaceError> {
+        let _ = out;
+        Err(NotBuilt { method: "derive_helpers", item: derive }.into())
+    }
 }
 
 /// [`ScopeFacts`] over the records an [`Items`] reads: names are the records' string-table

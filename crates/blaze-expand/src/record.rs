@@ -92,7 +92,9 @@ type Root = [Slice<u8>; COLUMNS];
 /// The record's schema: its name, its version and the root's layout.
 pub const EXPANSION_SCHEMA: SchemaHash = blaze_format::schema_of(&[
     Part::Str("blaze-expand Expansion"),
-    Part::U64(1),
+    // 2: `NoRuleMatched` holds the closest rule (`closest`), 2026-11-16. A version-1 record
+    // fails `open_as` and is made again (rule 26).
+    Part::U64(2),
     Part::Schema(<Root as Record>::SCHEMA),
 ]);
 
@@ -438,9 +440,11 @@ fn write_diagnostic(c: &mut Columns<'_>, diagnostic: Diagnostic) {
     let tag = |c: &mut Columns<'_>, tag: u8| c.put(column, &[tag]);
     let origin = |c: &mut Columns<'_>, at: Option<TokenOrigin>| c.leb(column, origin_option(at));
     match diagnostic {
-        Diagnostic::NoRuleMatched { rules, token, expected, at } => {
+        Diagnostic::NoRuleMatched { rules, closest, token, expected, at } => {
             tag(c, 0);
             c.leb(column, u64::from(rules));
+            // 0: no tracker ran; else the rule's index plus one.
+            c.leb(column, closest.map_or(0, |arm| u64::from(arm) + 1));
             match token {
                 None => c.put(column, &[0]),
                 Some(token) => {
@@ -934,9 +938,10 @@ fn read_diagnostics(
         let diagnostic = match col.byte()? {
             0 => {
                 let rules = col.u32()?;
+                let closest = col.u32()?.checked_sub(1);
                 let token = if present(col)? { Some(note(col)?) } else { None };
                 let expected = note(col)?;
-                Diagnostic::NoRuleMatched { rules, token, expected, at: origin(col)? }
+                Diagnostic::NoRuleMatched { rules, closest, token, expected, at: origin(col)? }
             }
             1 => {
                 let message = note(col)?;

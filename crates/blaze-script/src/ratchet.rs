@@ -110,7 +110,12 @@ pub struct Hit<T> {
 /// `scan` is given each file's text and returns its sites, as (line from 1, what), test code
 /// included: the sites on a test line or in a test file are dropped here.
 pub fn walk<T>(script: &str, root: &Path, tests: &Tests, mut scan: impl FnMut(&str) -> Vec<(usize, T)>) -> BTreeMap<String, Vec<Hit<T>>> {
-    let files = rust_files(root);
+    // Only the root workspace's code: a directory under crates/ it does not hold (its own
+    // workspace, or a parked crate) is not built and not counted.
+    let manifest = root.join("Cargo.toml");
+    let Ok(text) = std::fs::read_to_string(&manifest) else { fail(script, &format!("{} could not be read", manifest.display())) };
+    let members = Members::of(&text);
+    let files: Vec<Vec<String>> = rust_files(root).into_iter().filter(|parts| parts.len() < 2 || members.holds(&parts[..2].join("/"))).collect();
     let known: BTreeSet<String> = files.iter().map(|it| it.join("/")).collect();
     let mut scanned: Vec<(Vec<String>, Vec<(usize, T)>)> = Vec::new();
     let mut test: BTreeSet<String> = BTreeSet::new();
@@ -346,6 +351,66 @@ pub fn module_files(parts: &[String], name: &str) -> [String; 2] {
 
 /// The `.rs` files under crates/, sorted part by part, each as its parts from the root, none
 /// under a directory named `target`. Directories that are links are not entered.
+/// The root manifest's `[workspace]` `members` and `exclude` (each a path from the root; a
+/// member may end in `/*`, one directory level), read from the quoted strings of the two arrays.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Members {
+    pub globs: Vec<String>,
+    pub exclude: BTreeSet<String>,
+}
+
+impl Members {
+    pub fn of(manifest: &str) -> Members {
+        let mut out = Members::default();
+        // Which array the lines are in: none, `members` (true) or `exclude`; only under `[workspace]`.
+        let (mut in_workspace, mut array): (bool, Option<bool>) = (false, None);
+        for line in manifest.split('\n') {
+            let code = line.split('#').next().unwrap_or("").trim();
+            if code.starts_with('[') && array.is_none() {
+                in_workspace = code == "[workspace]";
+                continue;
+            }
+            if !in_workspace {
+                continue;
+            }
+            let rest = match array {
+                Some(_) => code,
+                None => match code.split_once('=') {
+                    Some((key, value)) if matches!(key.trim(), "members" | "exclude") => {
+                        array = Some(key.trim() == "members");
+                        value.trim()
+                    }
+                    _ => continue,
+                },
+            };
+            let Some(members) = array else { continue };
+            for (at, quoted) in rest.split('"').enumerate() {
+                if at % 2 == 1 {
+                    match members {
+                        true => out.globs.push(quoted.to_owned()),
+                        false => {
+                            out.exclude.insert(quoted.to_owned());
+                        }
+                    }
+                }
+            }
+            if rest.contains(']') {
+                array = None;
+            }
+        }
+        out
+    }
+
+    /// The workspace holds the directory `dir` (a path from the root): a member and not excluded.
+    pub fn holds(&self, dir: &str) -> bool {
+        !self.exclude.contains(dir)
+            && self.globs.iter().any(|glob| match glob.strip_suffix("/*") {
+                Some(parent) => dir.rsplit_once('/').is_some_and(|(above, _)| above == parent),
+                None => glob == dir,
+            })
+    }
+}
+
 pub fn rust_files(root: &Path) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     let mut todo = vec![vec!["crates".to_owned()]];

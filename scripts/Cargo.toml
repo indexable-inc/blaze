@@ -37,5 +37,9 @@ blaze-build-script.workspace = true
 blaze-manifest = { workspace = true, default-features = false }
 edition.workspace = true
 
+[dev-dependencies]
+# store_vendor's tests: a test's root allocator (`blaze_own::testing::heap()`, D102).
+blaze-own = { workspace = true, features = ["std", "testing"] }
+
 [lints]
 workspace = true

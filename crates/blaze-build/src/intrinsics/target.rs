@@ -31,12 +31,21 @@ use blaze_lir::{Builder, Full, Op, Ty, Value};
 
 use crate::BuildError;
 
+pub mod float;
+#[cfg(test)]
+mod float_tests;
 #[cfg(test)]
 mod tests;
 
-/// A target intrinsic blaze builds: each `fn(i32 imm)`, returning nothing.
+/// A target intrinsic blaze builds: a barrier or hint, `fn(i32 imm)` returning nothing (the
+/// four below), or a generic float function, built as its LIR float operation
+/// ([`Target::Float`], target/float.rs).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Target {
+    /// `llvm.<fn>.<shape>` of target/float.rs (`llvm.roundeven.v4f32` and kin): LIR's float
+    /// operation lane by lane, no `target_intrinsic` (INTRINSICS.md 3.3: "a generic name with
+    /// an LIR op maps to it").
+    Float(float::FloatCall),
     /// `llvm.aarch64.isb`: instruction synchronization barrier, `isb #imm`.
     Aarch64Isb,
     /// `llvm.aarch64.dmb`: data memory barrier, `dmb #imm`.
@@ -47,7 +56,8 @@ pub enum Target {
     Aarch64Hint,
 }
 
-/// Every target intrinsic, in declaration order.
+/// Every barrier and hint, in declaration order (the float functions are target/float.rs's
+/// `FNS` at its `SHAPES`).
 pub const ALL: [Target; 4] = [Target::Aarch64Isb, Target::Aarch64Dmb, Target::Aarch64Dsb, Target::Aarch64Hint];
 
 /// The most bytes of an unknown name [`UnknownTarget`] keeps.
@@ -93,6 +103,9 @@ impl core::error::Error for UnknownTarget {}
 
 /// The target intrinsic whose link name is exactly `link_name`.
 pub fn named(link_name: &str) -> Result<Target, UnknownTarget> {
+    if let Some(call) = float::named(link_name) {
+        return Ok(Target::Float(call));
+    }
     ALL.iter().copied().find(|t| t.link_name() == link_name).ok_or_else(|| UnknownTarget::of(link_name))
 }
 
@@ -104,6 +117,7 @@ impl Target {
             Target::Aarch64Dmb => "llvm.aarch64.dmb",
             Target::Aarch64Dsb => "llvm.aarch64.dsb",
             Target::Aarch64Hint => "llvm.aarch64.hint",
+            Target::Float(call) => call.link_name(),
         }
     }
 }
@@ -114,6 +128,11 @@ impl Target {
 /// immediate in the instruction, so any other value is refused by name here, before a
 /// backend sees it.
 pub fn build<A: Allocator + Clone>(b: &mut Builder<A, Full>, t: Target, imm: Value) -> Result<(), BuildError> {
+    // A float function is its LIR operation, built by the walk (walk/target_intr.rs), never a
+    // `target_intrinsic` of `fn(i32)`.
+    if let Target::Float(_) = t {
+        return Err(BuildError::Target { target: t, expr: None, why: "a generic float function built as a barrier (a build bug)" });
+    }
     // `ty` answers `Ty::NONE` for a value past the function's, so the index below is in range
     // once the type is `i32`.
     if b.ty(imm) != Ty::I32 {

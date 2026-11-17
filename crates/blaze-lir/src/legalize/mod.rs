@@ -130,6 +130,13 @@ pub fn legalize<'a>(
     Ok(stats)
 }
 
+/// Whether [`legalize`] would rewrite `view` (it holds a vector, or an `f16` or `f128` value):
+/// a caller that keeps its input when nothing needs rewriting (the record emitter) asks this
+/// before copying the function. A scalable vector is refused here.
+pub fn needed(view: &View<'_>) -> Result<bool, LegalizeError> {
+    needs(view)
+}
+
 /// Whether any instruction's type is a vector, an `f16` or `f128` scalar, or a compound: the
 /// forms the pass rewrites or must refuse. A scalable vector is refused here.
 fn needs(view: &View<'_>) -> Result<bool, LegalizeError> {
@@ -519,6 +526,11 @@ impl<'v, 'r, 'a> Out<'v, 'r, 'a> {
             offset => rec.align.min(offset.trailing_zeros() as u8),
         };
         let lane = MemAttrsRec { range: 0, align, src_align: 0, pointee_align: rec.pointee_align, bits: rec.bits };
+        // A row that claims nothing is written as none (verify.rs, `mem_attrs`): a byte lane
+        // at an odd offset keeps no alignment, and may keep nothing else.
+        if lane == MemAttrsRec::default() {
+            return 0;
+        }
         if let Some(row) = self.func.mem_attrs.iter().position(|have| *have == lane) {
             return row as u32 + 1;
         }

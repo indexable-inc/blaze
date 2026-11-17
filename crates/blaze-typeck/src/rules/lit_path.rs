@@ -368,9 +368,18 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         // checker has no code: refused by name.
                         return Err(CheckError::Unported("generic arguments on `Self` in a value path (E0109)").into());
                     }
-                    match self.impl_self_adt_args(at, cause, k)? {
-                        Some(args) => args,
-                        None => return Ok(self.common.err),
+                    if adt.generics == 0 {
+                        // An ADT with no generic parameters has one argument list, the empty
+                        // one, so `Self` needs nothing from an impl: the body may be in none.
+                        // front2's anonymous constant `[u8; Self::BYTES]` of an `impl L` (anon.rs
+                        // `Ask::of_self`, filed with `Self` = `L` and no container) is checked
+                        // as `const _: usize = Self::BYTES;` and has no assoc parent.
+                        self.common.empty
+                    } else {
+                        match self.impl_self_adt_args(at, cause, k)? {
+                            Some(args) => args,
+                            None => return Ok(self.common.err),
+                        }
                     }
                 } else {
                     self.explicit_args(at, Some(segs[consumed - 1]), k, 0, adt.generics)?

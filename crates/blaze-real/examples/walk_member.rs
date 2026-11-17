@@ -105,7 +105,7 @@ fn main() {
     let t0 = Instant::now();
     // The test units are in the graph only when asked for (names_load `load`'s `tests`).
     let tests = !matches!(target, Target::Bin(_));
-    let loaded = match names_load::load(&root, &store, Some((modules.as_path(), modules_out.as_path())), Some(scripts.as_path()), tests) {
+    let loaded = match names_load::load(&root, &store, Some((modules.as_path(), modules_out.as_path())), Some(scripts.as_path()), tests, blaze_own::Heap::process()) {
         Ok(l) => l,
         Err(e) => stop(&out_file, &format!("WALK {member} {target_text}: REFUSED: the world did not load: {e} (tree {tree})")),
     };

@@ -22,9 +22,12 @@
 
 pub mod c_request;
 pub mod cx;
+pub mod dep_paths;
 pub mod env;
+pub mod fact_pins;
 pub mod facts;
 pub mod git;
+mod git_attributes;
 mod git_objects;
 pub mod host_tools;
 pub mod instr;
@@ -39,7 +42,15 @@ pub mod toolchain;
 #[cfg(test)]
 mod c_request_tests;
 #[cfg(test)]
+mod nm_row_tests;
+#[cfg(test)]
+mod fact_pins_tests;
+#[cfg(test)]
 mod facts_tests;
+#[cfg(test)]
+mod git_attributes_tests;
+#[cfg(test)]
+mod git_link_tests;
 #[cfg(test)]
 mod git_tests;
 #[cfg(test)]

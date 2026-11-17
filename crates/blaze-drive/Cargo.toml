@@ -10,6 +10,11 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+# Decision D105: the drive writes every record's envelope and read list and decides what stands,
+# so its code is part of every producer's row.
+[package.metadata.blaze]
+producer = ["expander", "lowering", "body-checker", "names", "code-builder"]
+
 [lib]
 doctest = false
 

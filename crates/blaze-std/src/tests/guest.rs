@@ -21,18 +21,26 @@ use crate::{
 
 const EXCHANGE: usize = 4096;
 
-fn hello(cx: &Cx, io: Io) -> Result<(), Error> {
-    io.need_out()?.line(cx, "Hello, world!")?;
+fn hello(cx: &Cx, out: crate::out::Out) -> Result<(), Error> {
+    out.line(cx, "Hello, world!")?;
     Ok(())
 }
 
 /// What `#[bstd::main]` makes of `hello` for a hosted start.
 fn hosted_hello(cx: &Cx, io: Io) -> Status {
-    let ran = hello(cx, match guest::grant::<Io>(&io, "io") {
+    let ran = hello(cx, match guest::grant::<crate::out::Out>(&io, "out") {
         Some(granted) => granted,
         None => return Status::REFUSED,
     });
     guest::finish(&io, ran)
+}
+
+/// A program that asks the endpoint `api`, which a host gives only by a grant.
+fn hosted_net(_cx: &Cx, io: Io) -> Status {
+    match guest::grant::<crate::net::Net>(&io, "api") {
+        Some(_) => Status::OK,
+        None => Status::REFUSED,
+    }
 }
 
 fn host(io: Io, grants: &[(&str, &str)]) -> Box<Hosting> {
@@ -43,7 +51,7 @@ fn host(io: Io, grants: &[(&str, &str)]) -> Box<Hosting> {
 #[test]
 fn a_hosted_hello_writes_its_line_and_ends_ok() {
     let io = Io::sim(1);
-    let hosting = host(io.clone(), &[("everything", "io")]);
+    let hosting = host(io.clone(), &[]);
     let table = hosting.table();
     let status = guest::start(&table, hosted_hello);
     assert_eq!(status, 0);
@@ -76,14 +84,14 @@ fn a_kind_that_fills_itself_is_answered_with_no_grant() {
 fn a_grant_the_host_withholds_refuses_the_start() {
     let io = Io::sim(2);
     let hosting = host(io.clone(), &[("out", "io")]);
-    let status = guest::start(&hosting.table(), hosted_hello);
+    let status = guest::start(&hosting.table(), hosted_net);
     assert_eq!(status, i32::from(Status::REFUSED.0));
     assert_eq!(io.script(|host| host.out.clone()), Some(Vec::new()));
 }
 
 #[test]
 fn a_table_of_another_version_or_size_or_exchange_is_refused_before_any_call() {
-    let hosting = host(Io::sim(3), &[("everything", "io")]);
+    let hosting = host(Io::sim(3), &[]);
     let failed = i32::from(Status::FAILED.0);
     assert_eq!(guest::start(core::ptr::null(), hosted_hello), failed);
     let mut table = hosting.table();
@@ -120,7 +128,7 @@ fn smuggler(_cx: &Cx, io: Io) -> Status {
 #[test]
 fn a_hosted_world_is_reached_only_inside_its_run() {
     let io = Io::sim(5);
-    let hosting = host(io.clone(), &[("everything", "io")]);
+    let hosting = host(io.clone(), &[]);
     assert_eq!(guest::start(&hosting.table(), smuggler), 0, "another thread was refused during the run");
     let kept = SMUGGLED.with(|kept| kept.borrow_mut().take()).expect("the program kept its Io");
     let out = kept.out().expect("a hosted world offers out");
@@ -135,7 +143,7 @@ fn a_hosted_world_is_reached_only_inside_its_run() {
 /// A sleep is an escaped `Effect::Timer`: the host waits for it on its driver, whose clock
 /// moves by the sleep; the program's clock is the host's.
 fn sleeper(cx: &Cx, io: Io) -> Status {
-    let clock = match guest::grant::<Io>(&io, "io").and_then(|io| io.clock()) {
+    let clock = match guest::grant::<crate::clock::Clock>(&io, "clock") {
         Some(clock) => clock,
         None => return Status::REFUSED,
     };
@@ -150,7 +158,7 @@ fn sleeper(cx: &Cx, io: Io) -> Status {
 #[test]
 fn an_escaped_timer_is_waited_for_by_the_host() {
     let io = Io::sim(4);
-    let hosting = host(io.clone(), &[("everything", "io")]);
+    let hosting = host(io.clone(), &[]);
     let before = io.clock().expect("the simulation's clock").now();
     assert_eq!(guest::start(&hosting.table(), sleeper), 0);
     let after = io.clock().expect("the simulation's clock").now();

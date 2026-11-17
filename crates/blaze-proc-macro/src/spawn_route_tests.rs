@@ -26,7 +26,7 @@ use crate::spawn_route::{Decoded, PinnedTool, Route, SpawnSetting, child_env, he
 const LIMITS: RunLimits = RunLimits { fuel: 1 << 26, memory: 16 << 20, out_dir_bytes: 1 << 20, out_dir_files: 16, output: 1 << 20, line: 256 << 10 };
 
 /// A spawn request in the shim's encoding.
-fn shim(argv: &[&str], env_clear: bool, env_ops: &[(bool, &str, &str)], cwd: Option<&str>, stdin: &[u8], modes: [u8; 2]) -> Vec<u8> {
+pub(crate) fn shim(argv: &[&str], env_clear: bool, env_ops: &[(bool, &str, &str)], cwd: Option<&str>, stdin: &[u8], modes: [u8; 2]) -> Vec<u8> {
     let mut out = Vec::new();
     let put = |out: &mut Vec<u8>, bytes: &[u8]| {
         out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -50,11 +50,13 @@ fn shim(argv: &[&str], env_clear: bool, env_ops: &[(bool, &str, &str)], cwd: Opt
     out
 }
 
-fn script(c_mode: CMode, spawner: Option<Arc<dyn Executor + Send + Sync>>, spawn_setting: SpawnSetting) -> Arc<Script> {
+pub(crate) fn script(c_mode: CMode, spawner: Option<Arc<dyn Executor + Send + Sync>>, spawn_setting: SpawnSetting) -> Arc<Script> {
     Arc::new(Script {
         package: "spawner 0.0.0".to_owned(),
         tree: Tree::Mem { files: Arc::new(vec![("gen.pl".to_owned(), b"print \"ret\\n\";\n".to_vec())]), git: None },
-        folder: String::new(),
+        // The workspace's root package: its tree is served at `/workspace` (the model reads
+        // `/workspace/gen.pl`).
+        root: crate::script_sandbox::ScriptRoot::member("").expect("the root package"),
         env: vec![("OUT_DIR".to_owned(), "/out".to_owned())],
         target: "aarch64-apple-darwin".to_owned(),
         host: "aarch64-apple-darwin".to_owned(),
@@ -64,6 +66,7 @@ fn script(c_mode: CMode, spawner: Option<Arc<dyn Executor + Send + Sync>>, spawn
         spawner,
         step: ContentId([3; 32]),
         spawn_setting: Arc::new(spawn_setting),
+        deps: Arc::new(crate::script_sandbox::dep_mount::DepViews::none()),
     })
 }
 

@@ -462,7 +462,7 @@ pub enum Stop<'h> {
 }
 
 /// Writes `v` in decimal.
-fn push_dec(out: &mut String<Alloc<'static>>, mut v: u128) {
+fn push_dec(out: &mut String<Alloc<'_>>, mut v: u128) {
     let mut digits = [0u8; 39];
     let mut n = 0;
     loop {
@@ -483,7 +483,7 @@ fn push_dec(out: &mut String<Alloc<'static>>, mut v: u128) {
 /// holds them) as a typed literal expression: `4usize`, `true`, `'\u{41}'`, and a negative
 /// integer as `(-127i8 - 1i8)` (every literal in it is in range: the Reference, "Integer
 /// literal expressions"). `false` for a type that is not `bool`, `char` or an integer.
-fn push_literal(out: &mut String<Alloc<'static>>, ty: PNode, bits: u128) -> bool {
+pub(super) fn push_literal(out: &mut String<Alloc<'_>>, ty: PNode, bits: u128) -> bool {
     let Some(prim) = prim_name(ty) else { return false };
     match ty {
         PNode::Bool => out.push_str(if bits & 1 == 1 { "true" } else { "false" }),

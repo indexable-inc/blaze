@@ -1596,7 +1596,7 @@ fn diagnose(
     let diagnostic = match error {
         CallError::NoMatchingRule(at) => {
             let expected = out.note("")?;
-            Diagnostic::NoRuleMatched { rules, token: None, expected, at: Some(at) }
+            Diagnostic::NoRuleMatched { rules, closest: None, token: None, expected, at: Some(at) }
         }
         CallError::Binding(at, msg) => {
             let message = out.note_display(&MsgText { msg, engine })?;

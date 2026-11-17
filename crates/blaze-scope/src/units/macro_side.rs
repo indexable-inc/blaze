@@ -4,6 +4,9 @@
 //! `wasm32-wasip1`'s cfg, each under a key of its own (rule 21: the side is an input of the
 //! names, since the cfg differs), with that target's `core`, `alloc`, `std` and `proc_macro`.
 //!
+//! A member's proc macro and its library test harness (the same code, units/macro_crate.rs)
+//! are both taken here, the harness given the side's `proc_macro` as the proc macro is.
+//!
 //! Only a MEMBER's proc macro is given its dependencies: a dependency's proc macro stays a
 //! crate without them, its macros' records coming from the module store. Until the
 //! toolchain is cut for `wasm32-wasip1` each member proc macro is refused by name, as its own
@@ -15,9 +18,12 @@
 //! macro-side crate names its side's `core`, `alloc`, `std` and `proc_macro` by explicit
 //! dependencies, which win over the sysroot's in [`crate::graph::CrateGraph::externs`]. Known
 //! gap, stated: under these explicit names `alloc` and `proc_macro` are in the extern prelude
-//! without an `extern crate` (a superset of Rust's rule), a `#![no_std]` crate keeps `std`
-//! nameable, and the injected std prelude is the target side's std's (the same names). The
-//! end state is a sysroot per side in the graph.
+//! without an `extern crate` (a superset of Rust's rule), and a `#![no_std]` crate keeps `std`
+//! nameable. The injected `#[macro_use] extern crate` and the standard prelude are the side's
+//! own: the injection names its crate by the extern prelude's entry (graph.rs `externs`), as
+//! Rust's does (taking the target side's gave every glob of a side `core`'s macros a second,
+//! different candidate: tempo's libc `assert!`, `Ambiguous(GlobVsOuter)`; test
+//! tests/macro_side_prelude.rs). The end state is a sysroot per side in the graph.
 //!
 //! Sans-IO, like its parent: nothing here reads a file.
 
@@ -93,7 +99,7 @@ pub(super) fn add_macro_side<'a>(
     let units = &graph.units;
     let mut macros: AVec<'a, usize> = AVec::new_in(alloc);
     for (at, u) in units.iter().enumerate() {
-        if at_of[at] != usize::MAX && u.kind == UnitKind::ProcMacro && members.iter().any(|m| m.id() == u.package) {
+        if at_of[at] != usize::MAX && super::macro_crate::is_macro_crate(units, at) && members.iter().any(|m| m.id() == u.package) {
             macros.push(at);
         }
     }
@@ -210,7 +216,7 @@ pub(super) fn add_macro_side<'a>(
             }
             deps.push((d.name.as_str(), to));
         }
-        add_side_externs(&mut deps, side, implicit(u.edition, &u.kind).std);
+        add_side_externs(&mut deps, side, super::macro_crate::unit_implicit(units, at).std);
         crates[at_of[at]].deps = deps;
     }
     Ok(())

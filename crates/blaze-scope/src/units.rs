@@ -49,7 +49,9 @@ use edition::PackageEdition;
 use crate::graph::{CrateId, Sysroot};
 use crate::resolve::CrateInput;
 
+mod macro_crate;
 mod macro_side;
+mod names_refusal;
 
 pub use macro_side::RefusedCrate;
 
@@ -60,6 +62,22 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/units_script.rs"]
 mod script_tests;
+
+#[cfg(test)]
+#[path = "tests/macro_side_names.rs"]
+mod macro_side_names;
+
+#[cfg(test)]
+#[path = "tests/no_macro_toolchain_named.rs"]
+mod no_macro_toolchain_named;
+
+#[cfg(test)]
+#[path = "tests/macro_crate_prelude.rs"]
+mod macro_crate_prelude;
+
+#[cfg(test)]
+#[path = "tests/macro_side_prelude.rs"]
+mod macro_side_prelude;
 
 /// The profile's atoms a toolchain unit is lowered under, beside its target's: `dev`, as the
 /// unit graph gives a workspace unit.
@@ -139,6 +157,11 @@ pub struct UnitCrates<'a> {
     /// is still made; whoever asks for one of these crates' names is given its refusal, by
     /// [`Self::refusal`]). Sorted by index, each once.
     pub refused: AVec<'a, RefusedCrate<'a>>,
+    /// The crates at this index and past it are the macro side's (`macro_side`: a member proc
+    /// macro's dependency closure under `wasm32-wasip1`'s cfg, and that target's toolchain
+    /// crates); [`Self::crates`]'s length when there are none. A loader gives such a crate
+    /// only facts of that side (never the host's build-script record).
+    pub macro_from: usize,
     alloc: Alloc<'a>,
 }
 
@@ -271,7 +294,7 @@ impl fmt::Display for UnitsError<'_> {
             }
             UnitsError::NoMacroToolchain { krate, target } => write!(
                 f,
-                "the proc macro `{krate}` is built for `{target}` (rule 10) and the toolchain has no `core`, `alloc`, `std` and `proc_macro` for `{target}`: cut the toolchain for it (D89 (a); the host's crates are not taken instead)"
+                "the proc macro `{krate}` is built for `{target}` (rule 10) and the toolchain shelf has no {target} side (its `core`, `alloc`, `std` and `proc_macro`): its names are not resolved without them, and the host's crates are not taken instead; cut the shelf with its macro side (scripts/src/bin/toolchain_cut.rs with `\"macro_side\": true`, D89 (a))"
             ),
         }
     }
@@ -315,7 +338,7 @@ pub fn unit_crates<'a>(
     let blaze = units
         .iter()
         .enumerate()
-        .any(|(at, u)| reached[at] && kept(u) && matches!(implicit(u.edition, &u.kind).std, StdIs::Bstd(_)));
+        .any(|(at, u)| reached[at] && kept(u) && matches!(macro_crate::unit_implicit(units, at).std, StdIs::Bstd(_)));
 
     let mut crates: AVec<'a, UnitCrate<'a>> = AVec::new_in(alloc);
     let sysroot = toolchain_crates(toolchain, triple, blaze, &mut crates, alloc)?;
@@ -366,7 +389,9 @@ pub fn unit_crates<'a>(
             origin: Origin::Unit(UnitId(at as u32)),
             key: unit_key(u, lock.package(u.package).source_text.as_str(), alloc),
             edition: edition_of(u.edition.syntax),
-            implicit: implicit(u.edition, &u.kind),
+            // A proc macro's library test harness is given what the proc macro is (`proc_macro`
+            // in its extern prelude): units/macro_crate.rs, the one rule.
+            implicit: macro_crate::unit_implicit(units, at),
             root,
             shown_from: base,
             seen: seen_of(members, u.package),
@@ -379,8 +404,9 @@ pub fn unit_crates<'a>(
     }
     // A member's proc macro is built from the macro side's crates (D89 (a)), or refused alone.
     let mut refused = AVec::new_in(alloc);
+    let macro_from = crates.len();
     macro_side::add_macro_side(graph, lock, members, toolchain, &at_of, &mut crates, &mut build_scripts, &mut refused, alloc)?;
-    Ok(UnitCrates { crates, sysroot, toolchain: first, build_scripts, refused, alloc })
+    Ok(UnitCrates { crates, sysroot, toolchain: first, build_scripts, refused, macro_from, alloc })
 }
 
 /// The toolchain units reachable from std, core and alloc (and bstd when `blaze`) for

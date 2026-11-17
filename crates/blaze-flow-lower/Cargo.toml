@@ -22,7 +22,7 @@ blaze-own.workspace = true
 [dev-dependencies]
 # `fixture`: hand-written bodies checked by the real type checker, lowered and checked here.
 blaze-typeck = { workspace = true, features = ["testing"] }
-blaze-own = { workspace = true, features = ["std"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
 
 [lints]
 workspace = true

@@ -126,7 +126,7 @@ type GoalResult = (u32, bool, String, String);
 
 fn run_case<T: Tys>(case: &CaseA, decls: &[(u32, &DeclA)], tys: &mut T) -> Parsed<Vec<GoalResult>> {
     let world = World::build(decls)?;
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let mut scratch = Scratch::new_in(alloc);
     let mut vars: HashMap<String, crate::term::Ty> = HashMap::new();
     let mut solver = Solver::new_in(alloc);

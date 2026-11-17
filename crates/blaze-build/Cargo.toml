@@ -36,7 +36,7 @@ testing = ["dep:blaze-emit", "dep:blaze-inproc"]
 blaze-typeck = { workspace = true, features = ["testing"] }
 # The evaluator a built function's result is compared with.
 blaze-lir = { workspace = true, features = ["eval"] }
-blaze-own = { workspace = true, features = ["std"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
 blaze-sim.workspace = true
 # Thread-locals' two-thread test: the getter emitted and run for real.
 blaze-emit.workspace = true

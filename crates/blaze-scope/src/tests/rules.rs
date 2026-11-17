@@ -112,7 +112,6 @@ fn private_item_invisible_through_glob_from_outside() {
 /// item so restricted is private to a module outside it, and a `pub(in path)` naming no
 /// ancestor is an error.
 #[test]
-#[ignore = "CELLS GAP G1 (cells-core.md runner 19): a `pub(in path)` naming no ancestor makes the cells refuse the crate's load (`CellError::BadVisibility`), not one `RestrictedNotAncestor` error"]
 fn pub_crate_and_pub_in_path() {
     let (w, k) = fixtures::restricted();
     let s = solved(&w);
@@ -239,7 +238,6 @@ fn module_written_by_a_macro_resolves_like_a_walked_one() {
 /// Rule: a name a macro expansion adds may not shadow a glob binding an early resolution of
 /// the module already used (rustc's GlobVsExpanded, "time travel").
 #[test]
-#[ignore = "CELLS GAP G4 (cells-core.md runner 19): the cells write no `Ambiguous { kind: GlobVsExpanded }` error for an expanded item shadowing a used glob (errors [])"]
 fn expanded_item_shadowing_a_used_glob_is_ambiguous() {
     let (w, k) = fixtures::glob_vs_expanded();
     let s = solved(&w);

@@ -4,7 +4,7 @@
 //! left made into the same outputs record a wasm script's run gives ([`Outputs`]):
 //!
 //! - its standard output with the real `OUT_DIR` and package folder written as the key's
-//!   (`/target/debug/build/<name>-<config>/out`, `/workspace`), so every run of one key gives
+//!   (`/target/debug/build/<name>-<config>/out`, `/package` or `/workspace/<dir>`), so every run of one key gives
 //!   the same bytes (rule 25);
 //! - every file it left under `OUT_DIR`, but clang's `-MD` dependency files, which are read
 //!   into the headers read (each sysroot file's path under the sysroot and the SHA-256 of its
@@ -20,7 +20,7 @@ use blaze_build_script::{
     Env,
     instr::OutputLimits,
     key::RunLimits,
-    host_tools::HostTool,
+    host_tools::{self, HostTool},
     native::Grant,
     outputs::{FileLimits, Outputs},
     toolchain::{CInputs, c_env, depfile_reads, headers_digest, map_paths},
@@ -235,8 +235,14 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
     vars.push(("PATH", path.as_str()));
     vars.push(("TMPDIR", c.out_dir));
 
+    // D112: a script granted a tool that runs what the script built under OUT_DIR (sh running
+    // configure's test programs) links those programs: the pinned linker too (the shelf's
+    // clang.cfg says `-fuse-ld=lld`; clang starts `ld64.lld`, a link to `lld`), and it may start
+    // what is under OUT_DIR. Every other script is granted neither.
+    let runs_out_dir = host_tools::runs_out_dir(script.host_tools);
+    let linker: &[&str] = if runs_out_dir { &["bin/ld64.lld", "bin/lld"] } else { &[] };
     let mut exec: AVec<'a, AString<'a>> = Vec::new_in(alloc);
-    for name in ["bin/clang-23", "bin/clang", "bin/clang++", "bin/llvm-ar"] {
+    for name in ["bin/clang-23", "bin/clang", "bin/clang++", "bin/llvm-ar"].iter().chain(linker) {
         let mut path: AString<'a> = String::from_str_in(c.shelf.dir, alloc);
         path.push('/');
         path.push_str(name);
@@ -262,6 +268,8 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
         }
     }
     let writes = [c.out_dir];
+    let out_only = [c.out_dir];
+    let exec_under: &[&str] = if runs_out_dir { &out_only } else { &[] };
     let started = Instant::now();
     let ran = run(
         &NativeRun {
@@ -270,6 +278,7 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
             env: &vars,
             dir: c.package,
             deadline: script.deadline,
+            exec_under,
         },
         alloc,
     )

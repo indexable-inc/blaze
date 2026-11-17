@@ -1079,7 +1079,7 @@ fn main() {
             _ => None,
         };
         // `--tests` (after the positional arguments): the members' test units too.
-        bodies_named(&root, store, modules, scripts.as_deref(), args.iter().any(|a| a == "--tests"));
+        bodies_named(&root, store, modules, scripts.as_deref(), args.iter().any(|a| a == "--tests"), blaze_own::Heap::process());
     }
     dependencies(&present, cores);
 }
@@ -1956,12 +1956,12 @@ fn miss_cause(why: &blaze_lower::by_name::NotExpanded<'_>) -> String {
 /// Stage h again, over the members' crates of the workspace's names: every fn, const and
 /// static of every file each crate's module walk read, lowered with its calls resolved through
 /// [`BodyNames`] for its module.
-fn bodies_named(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts: Option<&Path>, tests: bool) {
+fn bodies_named(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts: Option<&Path>, tests: bool, heap: &'static blaze_own::Heap) {
     use blaze_scope::resolve::At;
     use blaze_surface::ItemIndex;
     println!("h'. bodies, every body call resolved through the workspace's names (blaze-scope `Names::item_at`)");
     let watch = Watch::start();
-    let loaded = match names_load::load(root, store, modules, scripts, tests) {
+    let loaded = match names_load::load(root, store, modules, scripts, tests, heap) {
         Ok(loaded) => loaded,
         Err(error) => {
             println!("  stopped: {error}");

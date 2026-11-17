@@ -174,6 +174,7 @@ fn carry(
             Act::Promote { slot, record } => mode.promote(slot, record, source, memory, plant).expect("the record promotes"),
             Act::Wake { thread, slot } => woken.push((thread, slot, memory.stored.get(slot.index()).copied().unwrap_or(false))),
             Act::Stop(stop) => panic!("the run stopped: {stop:?}"),
+            Act::Native { record } => panic!("this simulation's parent sends no native library: {record:?}"),
         }
     }
     acts.clear();

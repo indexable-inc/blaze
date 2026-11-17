@@ -155,6 +155,11 @@ fn solve_err(e: blaze_solve::Stop) -> Result<(), CheckError> {
 }
 
 impl<'a> InferCtx<'a> {
+    /// The allocator the check's caller handed in (D102): what this check's scratch lives in.
+    pub(crate) fn alloc(&self) -> Alloc<'a> {
+        self.alloc
+    }
+
     pub fn new_in(alloc: Alloc<'a>) -> InferCtx<'a> {
         InferCtx {
             alloc,
@@ -555,10 +560,7 @@ impl<'a> TypeCtx for InferCtx<'a> {
             // then rustc's `[kind, sig, upvars]` (upvars `()`: the captures are the owner's).
             TyView::ClosureOf { owner, ordinal, args, sig, kind } => {
                 use blaze_solve::term::{CLOSURE_FN, CLOSURE_FN_MUT, CLOSURE_FN_ONCE};
-                let mut h = crate::hash::StableHasher::new("blaze-typeck closure of");
-                h.u128(owner.0);
-                h.u32(ordinal);
-                let def = self.terms.bdef(SDef(u128::from(h.finish())));
+                let def = self.terms.bdef(SDef(crate::coroutine_id::closure_of_def(owner, ordinal)));
                 let k = match kind {
                     crate::ty::ClosureKind::Fn => CLOSURE_FN,
                     crate::ty::ClosureKind::FnMut => CLOSURE_FN_MUT,
@@ -824,6 +826,48 @@ impl<'a> TypeCtx for InferCtx<'a> {
                 Err(_) => true,
             }
         })
+    }
+
+    fn var_mark(&self) -> crate::ty::VarMark {
+        let count = |k: blaze_ty::VarKind| self.terms.cx.vars.var_count(k) as u32;
+        crate::ty::VarMark([
+            count(blaze_ty::VarKind::Ty),
+            count(blaze_ty::VarKind::Int),
+            count(blaze_ty::VarKind::Float),
+            count(blaze_ty::VarKind::Const),
+        ])
+    }
+
+    fn list_has_infer_since(&mut self, args: TyList, mark: crate::ty::VarMark) -> bool {
+        let l = self.slist(args);
+        let mut work = Vec::new_in(self.alloc);
+        for i in 0..l.len {
+            let t = self.terms.list_get(l, i);
+            let mut made = false;
+            // `visit` resolves each node it meets (`shallow_resolve`), so a bound variable is
+            // seen as its value.
+            let walked = blaze_solve::fold::visit(&self.terms, &mut work, t, |_, k| {
+                if let blaze_solve::term::TyKind::Infer(v) = k {
+                    made |= match terms::var_of_index(v.index) {
+                        Some(id) => match id.kind {
+                            blaze_ty::VarKind::Ty => id.index >= mark.0[0],
+                            blaze_ty::VarKind::Int => id.index >= mark.0[1],
+                            blaze_ty::VarKind::Float => id.index >= mark.0[2],
+                            blaze_ty::VarKind::Const => id.index >= mark.0[3],
+                            blaze_ty::VarKind::Region => false,
+                        },
+                        // Not an index this context makes: say it holds one (no hint taken).
+                        None => true,
+                    };
+                }
+                true
+            });
+            // A walk past its limit says it holds one: the hint is not taken.
+            if walked.is_err() || made {
+                return true;
+            }
+        }
+        false
     }
 
     fn unify(&mut self, a: Ty, b: Ty) -> Result<bool, CheckError> {

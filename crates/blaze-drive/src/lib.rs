@@ -44,6 +44,7 @@ pub mod run;
 pub mod settled;
 pub mod table;
 pub mod unit_graph_task;
+pub mod verified;
 pub mod worker;
 mod wire;
 
@@ -109,4 +110,13 @@ pub enum Plant {
     /// One finding held by two names' records (a library's and its test unit's names) prints
     /// and counts once a name.
     PrintEachName,
+    /// A settled job keeps the needs its runs were handed, at the capacity they grew to (the
+    /// clone's 5.2 GB of `Name` lists, 2026-11-16).
+    KeepSettledNeeds,
+    /// Puts are dropped once the request holds a failure: a request with findings would leave
+    /// nothing it computed for the next one (the coordinator's rule, 2026-11-16 20:10).
+    DropPutsOnFailure,
+    /// A task that read a file by path parses its bytes without comparing them with the
+    /// content id its key was made from (`verified::verify`).
+    SkipContentCompare,
 }

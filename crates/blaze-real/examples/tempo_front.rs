@@ -4,8 +4,9 @@
 //!
 //! The names are loaded as `stages` loads them (examples/names_load: the unit graph, the fetch
 //! store, the proc-macro modules, the build scripts' records), over the whole graph; the front
-//! end is made over those names (`Front2::new` with no program files: every crate is a library
-//! here, with the package, edition and cfg its unit gave). Then, for the named crate:
+//! end is made over those names (`Front2::for_program` with no program files, a library-only
+//! survey: its roots are the library crates, so no binary's, test's or example's lang rows are
+//! filed; each crate with the package, edition and cfg its unit gave). Then, for the named crate:
 //! 1. EVERY HEAD (tests/front2_heads.rs's wants and classes): built, or refused by reason, with
 //!    the front2 file whose text raises it.
 //! 2. EVERY BODY (tests/front2_census.rs's lowering, check and classes): one set of records
@@ -61,7 +62,6 @@ const SOURCES: &[(&str, &str)] = &[
     ("check.rs", include_str!("../../blaze-ladder/src/front2/check.rs")),
     ("consts.rs", include_str!("../../blaze-ladder/src/front2/consts.rs")),
     ("dyn_ty.rs", include_str!("../../blaze-ladder/src/front2/dyn_ty.rs")),
-    ("entry.rs", include_str!("../../blaze-ladder/src/front2/entry.rs")),
     ("fill.rs", include_str!("../../blaze-ladder/src/front2/fill.rs")),
     ("heads.rs", include_str!("../../blaze-ladder/src/front2/heads.rs")),
     ("index.rs", include_str!("../../blaze-ladder/src/front2/index.rs")),
@@ -265,7 +265,10 @@ fn gap_class(g: &Gap, names: &Names<'_>) -> String {
         Gap::Lang(_, s) => format!("gap Lang: {s}"),
         Gap::BuiltinTypePath(s) => format!("gap BuiltinTypePath: {s}"),
         // The reason without the impl's key: one class per reason, the key in the examples.
-        Gap::UnreadImpl(_, s) => format!("gap UnreadImpl: {}", refusal_reason(s)),
+        Gap::UnreadImpl(_, s) => match blaze_ladder::front2::header_written::split_written(s) {
+            (reason, Some(path)) => format!("gap UnreadImpl: {} {path}", refusal_reason(reason)),
+            (reason, None) => format!("gap UnreadImpl: {}", refusal_reason(reason)),
+        },
         Gap::RefusedImpl { impl_, why, .. } => {
             let tr = names.item_text(*impl_).map_or("(no text)".to_string(), |t| t.impl_header.map_or_else(|| impl_trait(t.text), impl_trait));
             format!("gap RefusedImpl [{tr}]: {}", refusal_reason(why))
@@ -1018,9 +1021,8 @@ fn print_blockers(names: &Names<'_>, title: &str, blockers: &BTreeMap<blaze_id::
 /// The proc-macro runner's findings, one line each (a call it refused or that failed is never
 /// a silent empty expansion: blaze-proc-macro's `Finding`, as stages.rs prints them), then
 /// every error an expansion emitted (`compile_error!`, a proc macro's error or panic), naming
-/// the crate it was written in, the macro and the call. The message itself is not printed:
-/// blaze-scope's `ExpandNote::Diagnostic` keeps the diagnostic's text range but not the
-/// expansion's text table it points into.
+/// the crate it was written in, the macro, the call and the message (blaze-scope's
+/// `ExpandNote::Failed` keeps the expansion's words: `blaze_expand::Failed`).
 fn print_proc_findings(loaded: &names_load::Loaded) {
     use blaze_expand::{Diagnostic, ProcLevel};
     use blaze_scope::resolve::{ExpandNote, NamesNote};
@@ -1031,14 +1033,14 @@ fn print_proc_findings(loaded: &names_load::Loaded) {
     }
     for (k, c) in loaded.names.crates().iter().enumerate() {
         for note in loaded.names.notes(k) {
-            let NamesNote::Expand { call, at, note: ExpandNote::Diagnostic { macro_name, diagnostic } } = note else { continue };
-            let what = match diagnostic {
+            let NamesNote::Expand { call, at, note: ExpandNote::Failed { path, failed, .. } } = note else { continue };
+            let what = match failed.diagnostic {
                 Diagnostic::CompileError { .. } => "compile_error!",
                 Diagnostic::ProcMacro { level: ProcLevel::Error, .. } => "a proc macro's error",
                 Diagnostic::ProcMacroPanicked { .. } => "a proc macro's panic",
                 _ => continue,
             };
-            println!("expansion error: crate {}: {what} from the call of `{macro_name}` ({call:?} at {at:?})", c.name);
+            println!("expansion error: crate {}: {what} from the call of `{path}` ({call:?} at {at:?}): {failed}", c.name);
         }
     }
 }
@@ -1064,7 +1066,7 @@ fn main() {
         }
     }));
     let t0 = Instant::now();
-    let loaded = match names_load::load(&root, &store, Some((modules.as_path(), modules_out.as_path())), Some(scripts.as_path()), false) {
+    let loaded = match names_load::load(&root, &store, Some((modules.as_path(), modules_out.as_path())), Some(scripts.as_path()), false, blaze_own::Heap::process()) {
         Ok(l) => l,
         Err(e) => {
             println!("stopped: the names: {e}");
@@ -1080,14 +1082,30 @@ fn main() {
     let t1 = Instant::now();
     // The command's frame, alive as long as the names (the whole run).
     let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame")));
-    let mut front = match Front2::new(names, frame, &[]) {
-        Ok(f) => f,
+    // A library-only survey: the roots are the library crates (a toolchain crate, or a unit of
+    // kind `lib`); a binary, test or example unit is its own program with its own
+    // `#[global_allocator]`, and its lang rows are not this survey's (front2 linked.rs).
+    let libs: Vec<usize> = (0..names.crates().len())
+        .filter(|&k| match loaded.crates.crates[k].origin {
+            blaze_scope::units::Origin::Toolchain { .. } => true,
+            blaze_scope::units::Origin::Unit(u) => loaded.graph.units[u.index()].kind == blaze_unit_graph::UnitKind::Lib,
+        })
+        .collect();
+    let linked = match blaze_ladder::front2::linked::Linked::of(names, &libs, blaze_own::Heap::process().alloc()) {
+        Ok(l) => l,
         Err(e) => {
-            println!("stopped: Front2::new: {e}");
+            println!("stopped: the library roots: {e}");
             std::process::exit(1);
         }
     };
-    println!("front2: Front2::new over every crate in {:.1}s; {} lang items; {}", t1.elapsed().as_secs_f64(), front.index.lang_count(), mem());
+    let mut front = match Front2::for_program(names, frame, &[], &linked) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("stopped: Front2::for_program: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("front2: Front2::for_program over {} library roots ({} crates linked) in {:.1}s; {} lang items; {}", linked.roots().len(), linked.crates().count(), t1.elapsed().as_secs_f64(), front.index.lang_count(), mem());
     for want in args[6].split(',') {
         let ks: Vec<usize> = names.crates().iter().enumerate().filter(|(k, c)| c.name == want && loaded.member.get(*k).copied().unwrap_or(false)).map(|(k, _)| k).collect();
         if ks.is_empty() {

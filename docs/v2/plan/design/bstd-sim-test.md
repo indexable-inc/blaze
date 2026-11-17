@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: The attribute `#[bstd::test]` runs a test shaped like `main` (it takes a `Cx` and an `Io`) on the deterministic simulation under 256 seeds by default, with IO failures, delays and power cuts on unless the test leaves one out by name; a failure prints its seed and a one-line replay command, and the seed replays to the same trace byte for byte. The runner is `blaze_core::sim::seeds`, on the one simulation; bstd adds the attribute and the unwind of a power cut.
+summary: The attribute `#[bstd::test]` runs a test that takes a `Cx` and an `Io` (its simulated world) on the deterministic simulation under 256 seeds by default, with IO failures, delays and power cuts on unless the test leaves one out by name; a failure prints its seed and a one-line replay command, and the seed replays to the same trace byte for byte. The runner is `blaze_core::sim::seeds`, on the one simulation; bstd adds the attribute and the unwind of a power cut.
 date: 2026-11-12
 ---
 # Simulation is the default test of a bstd program
@@ -17,7 +17,8 @@ fn the_ledger_keeps_what_it_committed(cx: &Cx, io: Io) -> Result<(), Error> { ..
 fn a_report_is_rendered(cx: &Cx, io: Io) { .. }
 ```
 
-A test has `main`'s shape (std.md, "Decided"): the program is the test. Each seed makes one
+A test takes a `Cx` and the whole simulated world, `io: Io` (D104 keeps this for tests; a
+`main` instead names each grant it uses): the program is the test. Each seed makes one
 simulated world (`Io::sim(seed)`) and runs the program in it to its end, again after each power
 cut, until the plan's faults are spent; then the faults are healed and the program has to end
 well. What a failure prints:

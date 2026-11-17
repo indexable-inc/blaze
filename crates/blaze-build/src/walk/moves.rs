@@ -46,15 +46,18 @@ use blaze_typeck::{AdjustKind, Expr, ExprId, PNode, PTy, Pat, PatId, UnOp};
 use super::{Held, NO_EXPR, Owner, Repr, Shape, V, Walk, malformed, unsupported};
 use crate::BuildError;
 
+mod boxes;
 mod field_scrutinee;
 
 /// One step down a value: a struct's or tuple's field (its row of `layout_fields`), a field of
-/// an enum's variant `v` (its row), an array's element `k`.
+/// an enum's variant `v` (its row), an array's element `k`, a `Box`'s contents (at its data
+/// pointer: walk/moves/boxes.rs).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Step {
     Field(u32),
     Variant { v: u32, row: u32 },
     Elem(u32),
+    Deref,
 }
 
 /// A part moved out of the value whose word is slot `mask`: bit `bit`, its path
@@ -127,6 +130,9 @@ impl<A: Allocator + Clone> Moves<A> {
 struct Node {
     g: PTy,
     off: i32,
+    /// The pointer `off` is from, under a `Box`'s contents (`None`: the dropped value's own
+    /// place, `at`).
+    base: Option<Value>,
     depth: u32,
     rep: Option<u32>,
     field_bit: Option<u32>,
@@ -137,6 +143,8 @@ enum Do {
     Visit(Node),
     Begin(Block),
     Jump(Block),
+    /// The `Box` of type `g` at `place`, its contents visited: its allocation freed alone.
+    BoxFree { g: PTy, place: (Value, i32) },
 }
 
 /// A pattern reached while finding a binding's path: the pattern, its type, its parent's
@@ -481,7 +489,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         // The switch's flags are an enum's only (a struct's word holds parts alone).
         let l = self.layout(g).map_err(|_| malformed("a value with a moves word and no layout"))?;
         let switch_bits = switch_bits && matches!(self.layouts[l as usize].shape, Shape::Enum { .. });
-        self.drop_tree(Node { g, off: 0, depth: 0, rep: ps.first().copied(), field_bit: None }, at, mask, switch_bits, &ps)
+        self.drop_tree(Node { g, off: 0, base: None, depth: 0, rep: ps.first().copied(), field_bit: None }, at, mask, switch_bits, &ps)
     }
 
     /// Drops node `root` of a value at `at` (word `mask`, parts `ps`), part by part.
@@ -493,6 +501,10 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 Do::Begin(b) => self.begin(b),
                 Do::Jump(b) => self.jump(b, &[]),
                 Do::Visit(n) => self.drop_node(n, at, mask, switch_bits && n.depth == 0, ps, &mut todo)?,
+                Do::BoxFree { g, place } => {
+                    let p = self.address(place);
+                    self.drop_box_free(g, p)?;
+                }
             }
         }
         Ok(())
@@ -504,45 +516,13 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     }
 
     /// The local and the path (appended to `steps`, root first: its start and length) of
-    /// place expression `e` when it is a chain of struct or tuple fields of a local with field
-    /// flags (`Owned::rest`), with no adjustment on the way (no dereference); `None` otherwise,
-    /// `steps` as it was. `drops`: some container on the path implements `Drop` (E0509 for a
-    /// move out).
+    /// place expression `e` when it is a chain of struct or tuple fields and `Box` contents
+    /// (an overloaded `*b` of a box, a base's autoderef through boxes) of a local with field
+    /// flags (`Owned::rest`), with no other adjustment on the way; `None` otherwise, `steps`
+    /// as it was. `drops`: some container on the path implements `Drop` (E0509 for a move
+    /// out; a box's contents are no such field). walk/moves/boxes.rs `place_path`.
     fn field_path(&mut self, e: ExprId) -> Result<Option<(PatId, SlotId, u32, u32, bool)>, BuildError> {
-        let start = self.moves.steps.len() as u32;
-        let mut drops = false;
-        let mut cur = e;
-        let x = loop {
-            match self.expr(cur)? {
-                Expr::Paren(inner) => cur = inner,
-                Expr::Local(x) => break Some(x),
-                Expr::Field { base, .. } | Expr::TupleField { base, .. } if self.adjust_rows(base).is_empty() => {
-                    let col = self.checked.fields.column::<0>();
-                    let row = col.binary_search(&cur).map_err(|_| malformed("a field access without its record row"))?;
-                    let k = self.checked.fields.column::<2>()[row];
-                    let Repr::Agg(l) = self.adjusted_repr(base)? else { break None };
-                    if self.layouts[l as usize].is_union {
-                        break None;
-                    }
-                    let Shape::Fields { first, len } = self.layouts[l as usize].shape else { break None };
-                    if k >= len {
-                        return Err(malformed("a field index past its aggregate's fields"));
-                    }
-                    drops |= self.layouts[l as usize].drop_fn.is_some();
-                    self.moves.steps.push(Step::Field(first + k));
-                    cur = base;
-                }
-                _ => break None,
-            }
-        };
-        let rest = x.and_then(|x| self.owned[x.ix()]).and_then(|o| o.rest);
-        let (Some(x), Some(mask)) = (x, rest) else {
-            self.moves.steps.truncate(start as usize);
-            return Ok(None);
-        };
-        self.moves.steps[start as usize..].reverse();
-        let len = self.moves.steps.len() as u32 - start;
-        Ok(Some((x, mask, start, len, drops)))
+        self.place_path(e, 0)
     }
 
     /// `let a = t.f.g;`: a move out of a local's field by a place expression `e` (its value
@@ -757,7 +737,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 bits |= 1u64 << q.bit;
             }
         }
-        self.drop_tree(Node { g, off: 0, depth: me.len, rep: ps.first().copied(), field_bit: None }, at, mask, false, &ps)?;
+        self.drop_tree(Node { g, off: 0, base: None, depth: me.len, rep: ps.first().copied(), field_bit: None }, at, mask, false, &ps)?;
         self.store(v, repr, at)?;
         let fa = self.b.slot_addr(mask);
         let word = self.b.load(Ty::I64, Flags::NONE, fa, 0, MemAttrs::aligned(3));
@@ -777,66 +757,6 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         }
     }
 
-    /// `scan_flags`, with `parent` per expression: a local some field of which is moved out by
-    /// a place expression (`let a = t.f;`: a chain of fields of the local, of a type that needs
-    /// drop, in a value context) gets field flags (`partial`). A chain used in place (borrowed,
-    /// assigned to, the base of a further field or index, matched) moves nothing.
-    pub(super) fn scan_field_moves(&mut self, parent: &[(u32, bool)]) -> Result<(), BuildError> {
-        for i in 0..self.body.exprs.len() {
-            let e = ExprId(i as u32);
-            if !matches!(self.expr(e)?, Expr::Field { .. } | Expr::TupleField { .. }) {
-                continue;
-            }
-            // The context: the parent of the outermost parenthesis around it.
-            let mut c = i as u32;
-            while let Some(&(up, _)) = parent.get(c as usize)
-                && up != NO_EXPR
-                && let Expr::Paren(_) = self.expr(ExprId(up))?
-            {
-                c = up;
-            }
-            let up = parent.get(c as usize).map_or(NO_EXPR, |&(up, _)| up);
-            let rows = self.adjust_rows(ExprId(c));
-            let borrowed_first = matches!(
-                self.checked.adjusts.column::<1>().get(rows.start).filter(|_| !rows.is_empty()),
-                Some(AdjustKind::Borrow { .. } | AdjustKind::Deref { .. })
-            );
-            let in_place = borrowed_first
-                || up != NO_EXPR
-                    && match self.expr(ExprId(up))? {
-                        Expr::Ref { operand, .. } | Expr::RawRef { operand, .. } => operand.0 == c,
-                        Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Index { base, .. } => base.0 == c,
-                        Expr::Assign { lhs, .. } | Expr::AssignOp { lhs, .. } => lhs.0 == c,
-                        // [expr.cmp.place]: a comparison's operands are borrowed in place.
-                        Expr::Binary { op, lhs, rhs } if super::operators::comparison(op) => lhs.0 == c || rhs.0 == c,
-                        Expr::Match { scrutinee, .. } => scrutinee.0 == c,
-                        Expr::Let { init, .. } => init.0 == c,
-                        _ => false,
-                    };
-            if in_place {
-                continue;
-            }
-            // Down the chain to its local, if it is one (locals only: an inline constant's body
-            // names none, so every chain reached is typed in this body).
-            let mut cur = e;
-            let x = loop {
-                match self.expr(cur)? {
-                    Expr::Paren(inner) | Expr::Field { base: inner, .. } | Expr::TupleField { base: inner, .. } => cur = inner,
-                    Expr::Local(x) => break Some(x),
-                    _ => break None,
-                }
-            };
-            let Some(x) = x else { continue };
-            // The field's own type: what moves (a coercion after it applies to the moved value).
-            let t = self.expr_ty(e)?;
-            let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
-            if self.needs_drop(g).map_err(|error| Self::ty_err(e, error))? {
-                *self.partial.get_mut(x.ix()).ok_or(malformed("a local past `pats`"))? = true;
-            }
-        }
-        Ok(())
-    }
-
     /// Whether part `q`'s path is at least `depth + 1` long and starts with part `rep`'s first
     /// `depth` steps then `next` (any step when `None`).
     fn under(&self, q: u32, rep: u32, depth: u32, next: Option<Step>) -> bool {
@@ -854,7 +774,10 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         if !self.needs_drop(n.g).map_err(|_| malformed("a moved-from part's type has no drop answer"))? {
             return Ok(());
         }
-        let place = (at.0, at.1 + n.off);
+        let place = match n.base {
+            Some(base) => (base, n.off),
+            None => (at.0, at.1 + n.off),
+        };
         let exact = n.rep.and_then(|r| {
             ps.iter().copied().find(|&q| {
                 let (qp, rp) = (self.moves.parts[q as usize], self.moves.parts[r as usize]);
@@ -890,9 +813,14 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             todo.push(Do::Jump(skip));
         }
         let l = self.layout(n.g).map_err(|_| malformed("a moved-from part with no layout"))?;
+        // A `Box` with a moved part under it: its contents at the data pointer, then its
+        // allocation freed alone (walk/moves/boxes.rs).
+        if let Some(t) = self.box_arg(n.g).map_err(boxes::from_ty)? {
+            return self.box_node(n, t, place, ps, todo);
+        }
         let child = |this: &Self, step: Step, g: PTy, off: i32, field_bit: Option<u32>| {
             let rep = n.rep.and_then(|r| ps.iter().copied().find(|&q| this.under(q, r, n.depth, Some(step))));
-            Node { g, off: n.off + off, depth: n.depth + 1, rep, field_bit }
+            Node { g, off: n.off + off, base: n.base, depth: n.depth + 1, rep, field_bit }
         };
         match self.layouts[l as usize].shape {
             Shape::Fields { .. } if self.layouts[l as usize].is_union => return Err(malformed("a move out of a union's field")),

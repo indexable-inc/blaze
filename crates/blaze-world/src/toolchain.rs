@@ -42,10 +42,11 @@ fn std_script_cfg<'w>(triple: &'w str) -> Result<&'static [&'static str], WorldE
     STD_SCRIPT_CFG.iter().find(|(t, _)| *t == triple).map(|(_, atoms)| *atoms).ok_or(WorldError::NoStdScriptCfg { triple })
 }
 
-/// Which toolchain crates a graph needs beyond core and alloc ([`crate::needs`]).
+/// Which toolchain crates a graph needs beyond core, alloc and Rust's std ([`crate::needs`]).
+/// Rust's std is not asked: every toolchain crate's implicit is Rust's (bstd's closure included),
+/// so every world names it, and blaze-scope's list keeps it for every program (units.rs).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Needs {
-    pub std: bool,
     pub bstd: bool,
     pub proc_macro: bool,
 }
@@ -102,10 +103,9 @@ impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
         let mut keep_unit: AVec<'w, bool> = AVec::with_capacity_in(all.len(), alloc.clone());
         keep_unit.extend(all.iter().map(|_| false));
         let mut todo: AVec<'w, usize> = AVec::new_in(alloc.clone());
-        todo.extend([sys.core.0 as usize, sys.alloc.0 as usize]);
-        if needs.std || needs.proc_macro {
-            todo.push(sys.std.0 as usize);
-        }
+        // core, alloc and Rust's std always: every toolchain crate's implicit (below) is Rust's,
+        // so bstd and its closure (blaze_ids, ...) name Rust's `std` too.
+        todo.extend([sys.core.0 as usize, sys.alloc.0 as usize, sys.std.0 as usize]);
         if needs.bstd {
             todo.push(sys.bstd.0 as usize);
         }
@@ -252,7 +252,7 @@ impl<'w, B: AsRef<[u8]>> Toolchain<'w, B> {
         if tc.core().is_none() {
             return Err(WorldError::NoToolchainCrate { role: "core" });
         }
-        if (needs.std || needs.proc_macro) && tc.std().is_none() {
+        if tc.std().is_none() {
             return Err(WorldError::NoToolchainCrate { role: "std" });
         }
         if needs.bstd && tc.bstd().is_none() {

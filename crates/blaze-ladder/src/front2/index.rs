@@ -12,6 +12,8 @@ use blaze_hash::HashMap;
 use blaze_id::ItemKey as LibKey;
 use blaze_scope::resolve::Names;
 
+use super::linked::Linked;
+
 /// One impl of the program's crates.
 #[derive(Clone, Copy, Debug)]
 pub struct ImplAt<'n> {
@@ -48,33 +50,40 @@ fn keys_of<'n>(found: HashMap<&'n str, (LibKey, usize), Global>) -> HashMap<&'n 
     langs
 }
 
-/// Every impl, and every lang item by its name.
+/// Every impl, and every lang item of ONE program by its name.
 pub struct Index<'n> {
     pub impls: Vec<ImplAt<'n>, Global>,
     langs: HashMap<&'n str, LibKey, Global>,
+    /// What the lang rows are a function of (with the names; rule 21): the roots of the
+    /// program they were filed for ([`Linked::roots`]), or, from records, the lang crates
+    /// given, sorted. Two indexes of different scope are two programs' and never shared.
+    scope: Vec<usize, Global>,
 }
 
 impl<'n> Index<'n> {
-    pub fn new(names: &'n Names<'n>) -> Result<Index<'n>, LangTwice> {
+    /// The impls and the lang items of the program `linked`: each linked crate's own rows
+    /// (the names library's `tables.impls` and `tables.langs`, filed once per crate) joined
+    /// over the closure. A crate the program does not link adds no row: another binary of the
+    /// workspace, a test or example unit (`#[global_allocator]` and `#[panic_handler]` are one
+    /// per program, not per workspace), and the macro side (a member proc macro and the
+    /// wasm32 core, alloc and std only it reaches: a second core's impls of one trait for one
+    /// type beside the target core's would be duplicate impls, as its lang rows were
+    /// duplicate lang items). Two linked crates declaring one lang name differently is
+    /// [`LangTwice`], naming both crates.
+    pub fn new(names: &'n Names<'n>, linked: &Linked<'_>) -> Result<Index<'n>, LangTwice> {
         let mut impls = Vec::new_in(Global);
         let mut langs: HashMap<&'n str, (LibKey, usize), Global> = HashMap::new_in(Global);
         let named = |krate: usize| {
             let c = &names.crates()[krate];
             (std::string::String::from(c.name), c.files.first().map_or(std::string::String::from("no file"), |file| std::string::String::from(file.path)))
         };
-        // A `#![no_core]` program (the program's crate is index 0, `Front2::new`) links no
-        // toolchain crate (crates.rs `Toolchain::none`): its own lang items are the program's,
-        // and a toolchain crate resolved beside it declares none of them. Owed: such a program
-        // resolves no toolchain crate at all (run.rs `run_program` opens the shelf first).
-        let no_core = names.crates().first().is_some_and(|c| c.root_attrs.no_core);
+        // One rule for impls and lang rows: the linked crates. It covers what two special
+        // cases did before: a `#![no_core]` root's closure holds no toolchain crate, and a
+        // proc-macro unit is never linked (it runs at build time in the sandbox), nor is what
+        // only it reaches (linked.rs). A ROOT that is a proc-macro unit (a proc macro's own
+        // program) is linked, as its own.
         for (krate, c) in names.crates().iter().enumerate() {
-            if no_core && krate != 0 {
-                continue;
-            }
-            // A proc-macro unit (the unit graph's kind, carried as `implicit.proc_macro`) runs
-            // at build time in the sandbox; its items are never linked into the program, so
-            // none of its impls can answer a question of the program's.
-            if c.implicit.proc_macro {
+            if !linked.links(krate) {
                 continue;
             }
             impls.extend(c.tables.impls.iter().map(|i| ImplAt { krate, key: i.key, module: i.module, header: i.header }));
@@ -92,7 +101,15 @@ impl<'n> Index<'n> {
         }
         // By key: the order selection reads them in is a function of the records.
         impls.sort_by_key(|i| i.key);
-        Ok(Index { impls, langs: keys_of(langs) })
+        let mut scope = Vec::with_capacity_in(linked.roots().len(), Global);
+        scope.extend_from_slice(linked.roots());
+        Ok(Index { impls, langs: keys_of(langs), scope })
+    }
+
+    /// What the lang rows are a function of: the program's roots (or, from records, the lang
+    /// crates given), sorted.
+    pub fn scope(&self) -> &[usize] {
+        &self.scope
     }
 
     /// The lang items the crates `lang_crates` declare, from any source of names, and no impl
@@ -124,7 +141,11 @@ impl<'n> Index<'n> {
                 return Err(twice);
             }
         }
-        Ok(Index { impls: Vec::new_in(Global), langs: keys_of(langs) })
+        let mut scope = Vec::with_capacity_in(lang_crates.len(), Global);
+        scope.extend_from_slice(lang_crates);
+        scope.sort_unstable();
+        scope.dedup();
+        Ok(Index { impls: Vec::new_in(Global), langs: keys_of(langs), scope })
     }
 
     /// The item `#[lang = "name"]` declares.

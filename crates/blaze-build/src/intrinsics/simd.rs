@@ -14,10 +14,14 @@
 //! `or`/`xor`, `simd_add`/`sub`/`mul`, `simd_neg`, `simd_splat`, `simd_extract`/`simd_insert`
 //! (the index must be a constant, as the declaration says: anything else is refused by name)
 //! and `simd_select`: what hashbrown's NEON group (`vceq_u8`, `vcltz_s8`, `vcgez_s8`,
-//! `vdup_n_u8`, `vget_lane_u64`, `vorr_u8`) and the vector types' `splat` reach. Every other
-//! `simd_*` intrinsic (the reductions, `simd_bitmask`, `simd_shuffle`, the casts, ...) is not in
-//! the table and is refused by name as any intrinsic the table lacks. `f16` lanes are refused
-//! by name (`f16` is not built). A fn declared in an `extern "unadjusted"` block with a
+//! `vdup_n_u8`, `vget_lane_u64`, `vorr_u8`) and the vector types' `splat` reach. The other rows
+//! (the reductions, `simd_bitmask`, `simd_shuffle`, the casts, shifts, divisions, saturating
+//! arithmetic, float rounding, `fma`, masked and gathered accesses) are built as one LIR vector
+//! operation each by intrinsics/simd_vec.rs. A `simd_*` intrinsic not in the table
+//! (`simd_funnel_shl`, `simd_select_bitmask`, `simd_fsin`, the pointer casts, ...) is refused by
+//! name as any intrinsic the table lacks. `f16` and `f128` lanes are built as any float lane
+//! (walk/halfquad.rs; blaze-lir's legalize widens or calls for them before the Reference and
+//! Fast tiers). A fn declared in an `extern "unadjusted"` block with a
 //! `link_name = "llvm.aarch64.neon.*"` is not an intrinsic of this table: front2 refuses its
 //! ABI by name.
 
@@ -55,6 +59,48 @@ pub enum SimdOp {
     Extract,
     Insert,
     Select,
+    // Built as one LIR vector operation each (intrinsics/simd_vec.rs).
+    Div,
+    Rem,
+    Shl,
+    Shr,
+    Cast,
+    As,
+    Fabs,
+    Fsqrt,
+    Floor,
+    Ceil,
+    Round,
+    RoundTiesEven,
+    Trunc,
+    Fma,
+    RelaxedFma,
+    MinimumNumberNsz,
+    MaximumNumberNsz,
+    Bswap,
+    Bitreverse,
+    Ctlz,
+    Ctpop,
+    Cttz,
+    SaturatingAdd,
+    SaturatingSub,
+    Shuffle,
+    ReduceAddOrdered,
+    ReduceAddUnordered,
+    ReduceMulOrdered,
+    ReduceMulUnordered,
+    ReduceAll,
+    ReduceAny,
+    ReduceMax,
+    ReduceMin,
+    ReduceAnd,
+    ReduceOr,
+    ReduceXor,
+    Bitmask,
+    MaskedLoad,
+    MaskedStore,
+    Gather,
+    Scatter,
 }
 
 /// The `simd_*` rows, sorted by name; each meaning the first sentence of the declaration's doc
@@ -62,20 +108,61 @@ pub enum SimdOp {
 pub const TABLE: &[Entry] = &[
     e("simd_add", Which::Simd(SimdOp::Add), "Adds two simd vectors elementwise.", "per lane: `add` (wrapping) or `fadd`"),
     e("simd_and", Which::Simd(SimdOp::And), "\"And\"s vectors elementwise.", "per lane: `and`"),
+    e("simd_as", Which::Simd(SimdOp::As), "Numerically casts a vector, elementwise.", "one vector `sext`/`zext`/`trunc`/`fpext`/`fptrunc`/`sitofp`/`uitofp`/`fptosi`/`fptoui` (saturating)"),
+    e("simd_bitmask", Which::Simd(SimdOp::Bitmask), "Truncates an integer vector to a bitmask.", "`icmp ne 0`, then one `bitmask` (lane 0 lowest)"),
+    e("simd_bitreverse", Which::Simd(SimdOp::Bitreverse), "Reverses bits of each element.", "one vector `bitrev`"),
+    e("simd_bswap", Which::Simd(SimdOp::Bswap), "Swaps bytes of each element.", "one vector `bswap`"),
+    e("simd_cast", Which::Simd(SimdOp::Cast), "Numerically casts a vector, elementwise.", "one vector conversion; float to integer `in_range` (as `to_int_unchecked`)"),
+    e("simd_ceil", Which::Simd(SimdOp::Ceil), "Rounds up each element to the next highest integer-valued float.", "one vector `ceil`"),
+    e("simd_ctlz", Which::Simd(SimdOp::Ctlz), "Counts the leading zeros of each element.", "one vector `clz`"),
+    e("simd_ctpop", Which::Simd(SimdOp::Ctpop), "Counts the number of ones in each element.", "one vector `popcnt`"),
+    e("simd_cttz", Which::Simd(SimdOp::Cttz), "Counts the trailing zeros of each element.", "one vector `ctz`"),
+    e("simd_div", Which::Simd(SimdOp::Div), "Divides `lhs` by `rhs` elementwise.", "one vector `udiv`/`sdiv` (`nonzero`, signed `nsw`) or `fdiv`"),
     e("simd_eq", Which::Simd(SimdOp::Eq), "Tests elementwise equality of two vectors.", "per lane: `icmp eq` or `fcmp oeq`, then 0 or all ones"),
     e("simd_extract", Which::Simd(SimdOp::Extract), "Extracts an element from a vector.", "a `load` of the lane at the constant index"),
+    e("simd_fabs", Which::Simd(SimdOp::Fabs), "Returns absolute value of a vector, elementwise.", "one vector `fabs`"),
+    e("simd_floor", Which::Simd(SimdOp::Floor), "Rounds down each element to the next lowest integer-valued float.", "one vector `floor`"),
+    e("simd_fma", Which::Simd(SimdOp::Fma), "Computes `(x*y) + z` for each element, but without any intermediate rounding.", "one vector `fma`"),
+    e("simd_fsqrt", Which::Simd(SimdOp::Fsqrt), "Takes the square root of each element.", "one vector `sqrt`"),
+    e("simd_gather", Which::Simd(SimdOp::Gather), "Reads a vector of pointers.", "one `gather` on the mask `!= 0`"),
     e("simd_ge", Which::Simd(SimdOp::Ge), "Tests if `x` is greater than or equal to `y`, elementwise.", "per lane: `icmp sge`/`uge` or `fcmp oge`, then 0 or all ones"),
     e("simd_gt", Which::Simd(SimdOp::Gt), "Tests if `x` is greater than `y`, elementwise.", "per lane: `icmp sgt`/`ugt` or `fcmp ogt`, then 0 or all ones"),
     e("simd_insert", Which::Simd(SimdOp::Insert), "Inserts an element into a vector, returning the updated vector.", "every lane copied, the one at the constant index replaced"),
     e("simd_le", Which::Simd(SimdOp::Le), "Tests if `x` is less than or equal to `y`, elementwise.", "per lane: `icmp sle`/`ule` or `fcmp ole`, then 0 or all ones"),
     e("simd_lt", Which::Simd(SimdOp::Lt), "Tests if `x` is less than `y`, elementwise.", "per lane: `icmp slt`/`ult` or `fcmp olt`, then 0 or all ones"),
+    e("simd_masked_load", Which::Simd(SimdOp::MaskedLoad), "Reads a vector of pointers.", "one `masked_load` on the mask `!= 0`, aligned to one byte"),
+    e("simd_masked_store", Which::Simd(SimdOp::MaskedStore), "Writes to a vector of pointers.", "one `masked_store` on the mask `!= 0`, aligned to one byte"),
+    e("simd_maximum_number_nsz", Which::Simd(SimdOp::MaximumNumberNsz), "Returns the maximum of two vectors, elementwise.", "one vector `fmax_num nsz`"),
+    e("simd_minimum_number_nsz", Which::Simd(SimdOp::MinimumNumberNsz), "Returns the minimum of two vectors, elementwise.", "one vector `fmin_num nsz`"),
     e("simd_mul", Which::Simd(SimdOp::Mul), "Multiplies two simd vectors elementwise.", "per lane: `mul` (wrapping) or `fmul`"),
     e("simd_ne", Which::Simd(SimdOp::Ne), "Tests elementwise inequality equality of two vectors.", "per lane: `icmp ne` or `fcmp une`, then 0 or all ones"),
     e("simd_neg", Which::Simd(SimdOp::Neg), "Negates a vector elementwise.", "per lane: `neg` (wrapping) or `fneg`"),
     e("simd_or", Which::Simd(SimdOp::Or), "\"Ors\" vectors elementwise.", "per lane: `or`"),
+    e("simd_reduce_add_ordered", Which::Simd(SimdOp::ReduceAddOrdered), "Adds elements within a vector from left to right.", "`reduce_add` then `add` of the start, or `reduce_fadd` from the start"),
+    e("simd_reduce_add_unordered", Which::Simd(SimdOp::ReduceAddUnordered), "Adds elements within a vector in arbitrary order.", "`reduce_add`, or `reduce_fadd reassoc` from -0.0"),
+    e("simd_reduce_all", Which::Simd(SimdOp::ReduceAll), "Checks if all mask values are true.", "`reduce_and`, then `!= 0`"),
+    e("simd_reduce_and", Which::Simd(SimdOp::ReduceAnd), "Logical \"and\"s all elements together.", "one `reduce_and`"),
+    e("simd_reduce_any", Which::Simd(SimdOp::ReduceAny), "Checks if any mask value is true.", "`reduce_or`, then `!= 0`"),
+    e("simd_reduce_max", Which::Simd(SimdOp::ReduceMax), "Returns the maximum element of a vector.", "one `reduce_umax`/`reduce_smax`/`reduce_fmax`"),
+    e("simd_reduce_min", Which::Simd(SimdOp::ReduceMin), "Returns the minimum element of a vector.", "one `reduce_umin`/`reduce_smin`/`reduce_fmin`"),
+    e("simd_reduce_mul_ordered", Which::Simd(SimdOp::ReduceMulOrdered), "Multiplies elements within a vector from left to right.", "`reduce_mul` then `mul` of the start, or `reduce_fmul` from the start"),
+    e("simd_reduce_mul_unordered", Which::Simd(SimdOp::ReduceMulUnordered), "Multiplies elements within a vector in arbitrary order.", "`reduce_mul`, or `reduce_fmul reassoc` from 1.0"),
+    e("simd_reduce_or", Which::Simd(SimdOp::ReduceOr), "Logical \"ors\" all elements together.", "one `reduce_or`"),
+    e("simd_reduce_xor", Which::Simd(SimdOp::ReduceXor), "Logical \"exclusive ors\" all elements together.", "one `reduce_xor`"),
+    e("simd_relaxed_fma", Which::Simd(SimdOp::RelaxedFma), "Computes `(x*y) + z` for each element, non-deterministically executing either a fused multiply-add or two operations with rounding of the intermediate result.", "one vector `fmuladd`"),
+    e("simd_rem", Which::Simd(SimdOp::Rem), "Returns remainder of two vectors elementwise.", "one vector `urem`/`srem` (`nonzero`, signed `nsw`) or `frem`"),
+    e("simd_round", Which::Simd(SimdOp::Round), "Rounds each element to the closest integer-valued float.", "one vector `fround` (ties away from zero)"),
+    e("simd_round_ties_even", Which::Simd(SimdOp::RoundTiesEven), "Rounds each element to the closest integer-valued float.", "one vector `nearest` (ties to even)"),
+    e("simd_saturating_add", Which::Simd(SimdOp::SaturatingAdd), "Adds two simd vectors elementwise, with saturation.", "one vector `uadd_sat`/`sadd_sat`"),
+    e("simd_saturating_sub", Which::Simd(SimdOp::SaturatingSub), "Subtracts two simd vectors elementwise, with saturation.", "one vector `usub_sat`/`ssub_sat`"),
+    e("simd_scatter", Which::Simd(SimdOp::Scatter), "Writes to a vector of pointers.", "one `scatter` on the mask `!= 0`"),
     e("simd_select", Which::Simd(SimdOp::Select), "Selects elements from a mask.", "per lane: `select` on the mask lane `!= 0`"),
+    e("simd_shl", Which::Simd(SimdOp::Shl), "Shifts vector left elementwise, with UB on overflow.", "one vector `shl in_range`"),
+    e("simd_shr", Which::Simd(SimdOp::Shr), "Shifts vector right elementwise, with UB on overflow.", "one vector `lshr`/`ashr in_range`"),
+    e("simd_shuffle", Which::Simd(SimdOp::Shuffle), "Shuffles two vectors by const indices.", "one `shuffle` of the const's indices"),
     e("simd_splat", Which::Simd(SimdOp::Splat), "Creates a vector where every lane has the provided value.", "a `store` of the value into every lane"),
     e("simd_sub", Which::Simd(SimdOp::Sub), "Subtracts `rhs` from `lhs` elementwise.", "per lane: `sub` (wrapping) or `fsub`"),
+    e("simd_trunc", Which::Simd(SimdOp::Trunc), "Returns the integer part of each element as an integer-valued float.", "one vector `ftrunc`"),
     e("simd_xor", Which::Simd(SimdOp::Xor), "\"Exclusive ors\" vectors elementwise.", "per lane: `xor`"),
 ];
 
@@ -86,13 +173,13 @@ pub(super) fn named(name: &str) -> Option<Which> {
 
 /// What a lane is to the operations.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(super) enum Kind {
     Int { signed: bool },
     Float,
     Ptr,
 }
 
-fn kind(p: Prim) -> Kind {
+pub(super) fn kind(p: Prim) -> Kind {
     match p {
         Prim::Int { signed, .. } => Kind::Int { signed },
         Prim::Ptr => Kind::Ptr,
@@ -100,14 +187,10 @@ fn kind(p: Prim) -> Kind {
     }
 }
 
-/// The lanes of vector type `t`, refused by name when `t` is not a vector or its lanes are
-/// `f16`.
-fn lanes<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(s: &mut B<'_, '_, '_, '_, LA, S, A>, t: PTy) -> Result<Lanes, IntrinsicError> {
-    let l = s.cx.layouts.lanes(t, s.cx.cx)?.ok_or(s.shape("a type that should be a vector is not a `repr(simd)` type"))?;
-    if matches!(l.elem, Prim::F16 | Prim::F128) {
-        return Err(IntrinsicError::Unsupported { which: s.which, why: "a vector of `f16` or `f128` lanes" });
-    }
-    Ok(l)
+/// The lanes of vector type `t`, refused by name when `t` is not a vector. `f16` and `f128`
+/// lanes are float lanes (P2 builds both; blaze-lir's legalize widens or calls for them).
+pub(super) fn lanes<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(s: &mut B<'_, '_, '_, '_, LA, S, A>, t: PTy) -> Result<Lanes, IntrinsicError> {
+    s.cx.layouts.lanes(t, s.cx.cx)?.ok_or(s.shape("a type that should be a vector is not a `repr(simd)` type"))
 }
 
 /// Lane `i`'s byte offset. A vector is at most 16 bytes (layout/simd.rs), so it fits.
@@ -334,5 +417,7 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
             }
             Out::At(out)
         }
+        // Every other row: one LIR vector operation (intrinsics/simd_vec.rs).
+        _ => return super::simd_vec::build(s, c, op),
     })
 }

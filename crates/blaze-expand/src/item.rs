@@ -326,8 +326,49 @@ fn splice<'a>(item: &TokenStream<'a>, cut: Range<usize>, attr: &TokenStream<'_>,
     Ok(out)
 }
 
+/// An attribute of the element [`derive_input`] is reading, held until the element is known to
+/// stay.
+enum HeldAttr<'a> {
+    /// Tokens of the item as written (`#[serde(skip)]`, a doc comment's `#[doc = ".."]`).
+    Written(Range<usize>),
+    /// What a `#[cfg_attr]` leaves: each meta of `attr` (its tokens from the `#`) as `#[meta]`.
+    Left { attr: TokenStream<'a>, metas: AVec<'a, Range<u32>> },
+}
+
+/// The held attributes of the element, in order, out to `out`; none held after.
+fn flush_held<'a>(out: &mut TokenStream<'a>, item: &TokenStream<'a>, held: &mut AVec<'a, HeldAttr<'a>>) -> Result<(), StreamError> {
+    for h in held.iter() {
+        match h {
+            HeldAttr::Written(range) => {
+                for m in range.clone() {
+                    out.push_from(item, m)?;
+                }
+            }
+            HeldAttr::Left { attr, metas } => {
+                for meta in metas.iter() {
+                    out.push_from(attr, 0)?;
+                    out.push_from(attr, 1)?;
+                    for m in meta.clone() {
+                        out.push_from(attr, m as usize)?;
+                    }
+                    out.push_from(attr, attr.len() - 1)?;
+                }
+            }
+        }
+    }
+    held.clear();
+    Ok(())
+}
+
 /// The item a derive sees ([`Derives::input`]), from `item` with its outer attributes applied.
 /// An attribute starts an element after `{`, `(`, `,` or another attribute.
+///
+/// The Reference, "Conditional compilation": a false `cfg` removes the thing it is on, and a
+/// derive's input is the item after `cfg` and `cfg_attr` are applied: a field or variant whose
+/// `cfg` is false goes WITH EVERY ATTRIBUTE IT CARRIES, the ones written before the `cfg` too
+/// (`#[command(flatten)] #[cfg(feature = "x")] f: F,`; a doc comment is a `#[doc]` of the same
+/// field). So the element's attributes are held until a token that is not an attribute shows
+/// it stays; each is read once, in order, and nothing after the first false `cfg` is asked.
 fn derive_input<'a, E>(
     item: &TokenStream<'a>,
     atom: &mut dyn FnMut(&str, Option<&str>) -> Result<bool, E>,
@@ -335,6 +376,7 @@ fn derive_input<'a, E>(
     let alloc = item.allocator();
     let list = item.tokens();
     let mut out = TokenStream::new_in(alloc);
+    let mut held: AVec<'a, HeldAttr<'a>> = Vec::new_in(alloc);
     let starts_element = |at: usize| {
         at == 0 || matches!(list[at - 1].kind, TokenKind::Open(_) | TokenKind::Punct { char: ',', .. } | TokenKind::Close(Delim::Bracket))
     };
@@ -342,6 +384,8 @@ fn derive_input<'a, E>(
     while at < list.len() {
         let close = if starts_element(at) { outer_attr(item, at) } else { None };
         let Some(close) = close else {
+            // Not an attribute: the element stays, with the attributes held for it.
+            flush_held(&mut out, item, &mut held)?;
             out.push_from(item, at)?;
             at += 1;
             continue;
@@ -352,6 +396,7 @@ fn derive_input<'a, E>(
                 let holds = cfg_holds(item, at, close, alloc, atom)?;
                 at = close + 1;
                 if !holds {
+                    held.clear();
                     at = element_end(list, at);
                 }
             }
@@ -359,7 +404,7 @@ fn derive_input<'a, E>(
                 let attr = item.copy_in(at..close + 1, alloc)?;
                 let metas = cfg_attr_metas(&attr, alloc, atom).map_err(|error| ItemAttrsError::CfgAttr { token: index(at), error })?;
                 // What it leaves, with any derive it leaves gone and a `cfg` it leaves applied.
-                let mut kept: AVec<'_, Range<u32>> = Vec::new_in(alloc);
+                let mut kept: AVec<'a, Range<u32>> = Vec::new_in(alloc);
                 let mut removed = false;
                 for meta in metas.iter() {
                     if derive_meta(&attr, meta.clone(), alloc).is_some() {
@@ -377,26 +422,20 @@ fn derive_input<'a, E>(
                 }
                 at = close + 1;
                 if removed {
+                    held.clear();
                     at = element_end(list, at);
                 } else {
-                    for meta in kept.iter() {
-                        out.push_from(&attr, 0)?;
-                        out.push_from(&attr, 1)?;
-                        for m in meta.clone() {
-                            out.push_from(&attr, m as usize)?;
-                        }
-                        out.push_from(&attr, attr.len() - 1)?;
-                    }
+                    held.push(HeldAttr::Left { attr, metas: kept });
                 }
             }
             _ => {
-                for m in at..=close {
-                    out.push_from(item, m)?;
-                }
+                held.push(HeldAttr::Written(at..close + 1));
                 at = close + 1;
             }
         }
     }
+    // Attributes with nothing after them (no item is written so): kept as written.
+    flush_held(&mut out, item, &mut held)?;
     Ok(out)
 }
 

@@ -90,10 +90,10 @@ pub(super) enum Keys {
     PlantedPath,
 }
 
-fn tool_for(at: &str, keys: Keys) -> Tool {
+fn producers_for(at: &str, keys: Keys) -> blaze_ids::producer::Producers {
     match keys {
-        Keys::FromText => home::tool(&blaze_ids::producer::Producers::for_tests(b"test")),
-        Keys::PlantedPath => home::tool(&blaze_ids::producer::Producers::for_tests(format!("test at /{at}").as_bytes())),
+        Keys::FromText => blaze_ids::producer::Producers::for_tests(b"test"),
+        Keys::PlantedPath => blaze_ids::producer::Producers::for_tests(format!("test at /{at}").as_bytes()),
     }
 }
 
@@ -118,7 +118,7 @@ pub(super) fn check_with(io: &Io, at: &'static str, keys: Keys, home: &'static s
     let said = words(command.0, &out, &err);
     let toolchain = shelf(io, home);
     let before = stdout(io).len();
-    let finished = request(&cx, &root, (at, None, None, Some(home), None, Some("/"), toolchain), origin, command, 1, tool_for(at, keys), work::Sizes::USUAL, &launch, frame, said, &err, &mut ran, &mut shown, &mut phases)
+    let finished = request(&cx, &root, (at, None, None, Some(home), None, Some("/"), toolchain), origin, command, 1, &producers_for(at, keys), work::Sizes::USUAL, &launch, frame, said, &err, &mut ran, &mut shown, &mut phases)
         .expect("the request answers");
     let status = close(&cx, command.0, &finished, &shown, ran, 0, frame, said).ok().map(|status| status.0);
     let printed = stdout(io);

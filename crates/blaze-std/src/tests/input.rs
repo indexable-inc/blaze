@@ -1,7 +1,8 @@
 //! Standard input ([`In`]) on the simulation: a world whose test scripted `ab\n` and then the
 //! input's end (blaze-core `Sim::stdin`, `Sim::stdin_ends`) reads exactly those bytes, then `0`
-//! (the end), on every seed; a read asking for one byte reads `a` alone and the next read goes
-//! on from `b`. Plant: [`InPlant::KeepsSlot`] (a read keeps the slot it asked for, not the count
+//! (the end), on every seed, however the sim splits them into short reads (each read gives at
+//! least one byte while bytes are left, never more than asked); a read asking for one byte reads
+//! `a` alone and the reads after go on from `b`. Plant: [`InPlant::KeepsSlot`] (a read keeps the slot it asked for, not the count
 //! that came, so a short read leaves zeros after what came), caught.
 //!
 //! The Rust Reference does not speak of standard input; the contract is blaze-core's
@@ -26,9 +27,17 @@ enum Finding {
     NoInput,
     /// A read failed.
     Read { seed: u64, at: &'static str, error: InError },
-    /// A read gave other bytes than the scripted ones.
+    /// The reads gave other bytes than the scripted ones.
     Bytes { seed: u64, at: &'static str, read: usize, held: [u8; 8], len: usize },
+    /// One read said it gave more than it was asked for.
+    TooMany { seed: u64, at: &'static str, most: usize, read: usize },
+    /// The input did not end within [`READS`] reads.
+    NoEnd { seed: u64, at: &'static str },
 }
+
+/// The most reads one stretch of the test makes: the sim gives each read at least one byte
+/// while bytes are left, so `ab\n` ends within four.
+const READS: usize = 8;
 
 /// `io`'s standard input, with `bytes` scripted and then the end.
 fn scripted(io: &Io, bytes: &[u8]) -> Result<In, Finding> {
@@ -40,33 +49,52 @@ fn scripted(io: &Io, bytes: &[u8]) -> Result<In, Finding> {
     io.need_input().map_err(|_| Finding::NoInput)
 }
 
-/// One read of at most `most` bytes, which must add exactly `want`.
-fn read_exactly(seed: u64, at: &'static str, input: &In, cx: &crate::cx::Cx, most: usize, want: &[u8], plant: InPlant) -> Result<(), Finding> {
-    let mut into = cx.bytes();
-    let read = input.read_in(cx, most, &mut into, plant).map_err(|error| Finding::Read { seed, at, error })?;
-    if read == want.len() && into.as_slice() == want {
+/// `into` against `want`: equal, or the finding naming what the reads held.
+fn holds(seed: u64, at: &'static str, read: usize, into: &[u8], want: &[u8]) -> Result<(), Finding> {
+    if into == want {
         return Ok(());
     }
     let mut held = [0u8; 8];
     let len = into.len().min(held.len());
-    held[..len].copy_from_slice(&into.as_slice()[..len]);
+    held[..len].copy_from_slice(&into[..len]);
     Err(Finding::Bytes { seed, at, read, held, len: into.len() })
 }
 
-/// One seed: `ab\n` read whole then the end; and in a second world, one byte then the rest.
+/// Reads of at most `most` bytes each until one gives `0` (the end), which must add exactly
+/// `want` in all. A read may give fewer bytes than asked (the sim picks how many, as a pipe
+/// does), never more, and never `0` while bytes are left.
+fn read_to_end(seed: u64, at: &'static str, input: &In, cx: &crate::cx::Cx, most: usize, want: &[u8], plant: InPlant) -> Result<(), Finding> {
+    let mut into = cx.bytes();
+    let mut total = 0;
+    for _ in 0..READS {
+        let read = input.read_in(cx, most, &mut into, plant).map_err(|error| Finding::Read { seed, at, error })?;
+        if read > most {
+            return Err(Finding::TooMany { seed, at, most, read });
+        }
+        if read == 0 {
+            return holds(seed, at, total, into.as_slice(), want);
+        }
+        total += read;
+    }
+    Err(Finding::NoEnd { seed, at })
+}
+
+/// One seed: `ab\n` read to the end in reads of at most 16 bytes, then the end again; and in a
+/// second world a read asking for one byte gets `a` alone, and the rest reads on from `b`.
 fn run(seed: u64, plant: InPlant) -> Result<(), Finding> {
     let io = Io::sim(seed);
     let cx = root(&io);
     let input = scripted(&io, b"ab\n")?;
-    read_exactly(seed, "the whole input", &input, &cx, 16, b"ab\n", plant)?;
-    read_exactly(seed, "after the end", &input, &cx, 16, b"", plant)?;
+    read_to_end(seed, "the whole input", &input, &cx, 16, b"ab\n", plant)?;
+    read_to_end(seed, "after the end", &input, &cx, 16, b"", plant)?;
 
     let io = Io::sim(seed);
     let cx = root(&io);
     let input = scripted(&io, b"ab\n")?;
-    read_exactly(seed, "one byte asked", &input, &cx, 1, b"a", plant)?;
-    read_exactly(seed, "the rest", &input, &cx, 16, b"b\n", plant)?;
-    read_exactly(seed, "after the end", &input, &cx, 16, b"", plant)
+    let mut first = cx.bytes();
+    let read = input.read_in(&cx, 1, &mut first, plant).map_err(|error| Finding::Read { seed, at: "one byte asked", error })?;
+    holds(seed, "one byte asked", read, first.as_slice(), b"a")?;
+    read_to_end(seed, "the rest", &input, &cx, 16, b"b\n", plant)
 }
 
 /// The invariant, on every seed of [`SEEDS`].

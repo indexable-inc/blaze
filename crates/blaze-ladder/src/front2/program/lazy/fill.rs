@@ -50,7 +50,8 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         }
         self.adt_rows(&checked)?;
         self.body_consts(&checked)?;
-        self.refuse_not_lazy(&checked)?;
+        self.body_statics(&checked, &function)?;
+        self.body_objects(&checked, &function)?;
         self.refork(i, made, &function)?;
         Ok(Some((i, checked)))
     }
@@ -106,7 +107,7 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
             return Ok(i as usize);
         }
         let path = self.shown(key);
-        let refuse = |refusal: Front2Refusal| LazyRefusal::Row { function: Box::from(path.as_str()), refusal };
+        let refuse = |refusal: Front2Refusal| LazyRefusal::Row { function: Box::from(path.as_str()), refusal: Box::new(refusal) };
         // A ctor is the language's: tabled as one; the build makes its value.
         if self.store.ctors.contains_key(&key) {
             let at = match self.front.keys.library(key) {
@@ -135,9 +136,8 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         let local = |why: crate::front2::panic_entry::Refused| Front2Refusal::Attrs { function: Box::from(path.as_str()), why: why.form().into() };
         let foreign = foreign.or_else(|| crate::front2::panic_entry::local_abi(&self.store, key));
         let declared_name = crate::front2::panic_entry::local_name(&self.store, key).map_err(local).map_err(&refuse)?;
-        let solved = self.solved_for("panic_entry::declares, alloc_shim::declares", &path)?;
-        let panic_entry = crate::front2::panic_entry::declares(solved, &self.store, key, Alloc::global()).map_err(local).map_err(&refuse)?;
-        let alloc_shim = crate::front2::alloc_shim::declares(solved, &self.store, key, Alloc::global())
+        let panic_entry = crate::front2::panic_entry::declares(self.front.names, &self.store, key, Alloc::global()).map_err(local).map_err(&refuse)?;
+        let alloc_shim = crate::front2::alloc_shim::declares(self.front.names, &self.store, key, Alloc::global())
             .map_err(|why| refuse(Front2Refusal::Attrs { function: Box::from(path.as_str()), why: why.detail() }))?;
         // As tabled.rs `row`, less its `NoBody` arm: a fn with a body is `Free` here whether or
         // not `check_one` made the body yet (the seam's `function(i).body` is `Some` once it has).
@@ -196,16 +196,10 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         i
     }
 
-    /// The solved names, or the typed refusal naming `helper`: what a helper not yet over
-    /// [`NamesSource`] needs (the notes list each with the question it lacks).
-    fn solved_for(&self, helper: &'static str, item: &str) -> Result<&'n Names<'n>, LazyRefusal> {
-        self.front.names.solved().ok_or_else(|| LazyRefusal::NeedsSolvedNames { helper, item: Box::from(item) })
-    }
-
-    /// `placed` over the solved names; over records it needs two questions the source does not
-    /// ask yet (`item_start`, `extern_abi`: NAMES runner 19's names for them).
+    /// `placed` over this program's names source; an unanswered `extern_abi` is refused by
+    /// name (never taken for "not foreign").
     fn placed_of(&self, lib: LibKey, item: &str) -> Result<(At, Option<&'n str>), LazyRefusal> {
-        Ok(placed(self.solved_for("placed (item_start, extern_abi)", item)?, lib))
+        placed(self.front.names, lib).map_err(|_| LazyRefusal::Unanswered { question: "extern_abi", item: Box::from(item) })
     }
 
     /// A fn's name for messages and its row's path, as reach.rs `fn_shown` makes it (a
@@ -257,7 +251,7 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         }
         if let Some(k) = self.store.adts.iter().filter(|(_, a)| a.narrowed).map(|(k, _)| *k).min() {
             let adt = self.shown(k).into_boxed_str();
-            return Err(LazyRefusal::Row { function: adt.clone(), refusal: Front2Refusal::Layout { adt } });
+            return Err(LazyRefusal::Row { function: adt.clone(), refusal: Box::new(Front2Refusal::Layout { adt }) });
         }
         Ok(())
     }
@@ -280,22 +274,57 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         Ok(())
     }
 
-    /// What this body's build would ask that has no per-body form yet: refused here, by name,
-    /// before the build asks (never an empty answer to the getter).
-    fn refuse_not_lazy(&self, checked: &Checked<'static>) -> Result<(), LazyRefusal> {
-        // A static: its value is made with the program's (`made_statics` over every body);
-        // per body it is a declared data record (D106 item 5).
-        if let Some(k) = checked.expr_defs.column::<1>().iter().find_map(|d| match d {
-            tc::Def::Static(k, _) => Some(*k),
-            _ => None,
-        }) {
-            return Err(LazyRefusal::NotLazyYet { method: "static_item, static_records", item: self.shown(k).into_boxed_str() });
+    /// Each static `checked` names that this program has not made, with each static their
+    /// records point at, evaluated once (statics.rs `static_values`, the one home) and merged
+    /// into the sorted `statics`. A refused static stops the run, naming it (as `make_from`'s
+    /// run does: never an empty answer to the getter).
+    fn body_statics(&mut self, checked: &Checked<'static>, function: &str) -> Result<(), LazyRefusal> {
+        let new = checked.expr_defs.column::<1>().iter().any(|d| match d {
+            tc::Def::Static(k, _) => self.statics.kind(*k).is_none(),
+            _ => false,
+        });
+        if !new {
+            return Ok(());
         }
-        // A `dyn` principal: its table is made by `object_tables` over every body's types.
-        if let Some(&k) = dyn_principals(core::iter::once(checked.types.view())).last() {
-            return Err(LazyRefusal::NotLazyYet { method: "object_trait", item: self.shown(k).into_boxed_str() });
+        let (made, refused) = {
+            let mut r = self.records(true);
+            crate::front2::statics::static_values(&mut r, core::iter::once(checked))
+        };
+        if let Some((k, why)) = refused.into_iter().next() {
+            let static_ = self.shown(k).into_boxed_str();
+            return Err(LazyRefusal::Row { function: Box::from(function), refusal: Box::new(Front2Refusal::Static { static_, why }) });
+        }
+        let crate::front2::statics::Statics { values, kinds } = made;
+        for (k, record) in values {
+            if let Err(at) = self.statics.values.binary_search_by_key(&k, |(x, _)| *x) {
+                self.statics.values.insert(at, (k, record));
+            }
+        }
+        for (k, kind) in kinds {
+            if let Err(at) = self.statics.kinds.binary_search_by_key(&k, |(x, _)| *x) {
+                self.statics.kinds.insert(at, (k, kind));
+            }
         }
         Ok(())
+    }
+
+    /// The object table of each `dyn` principal `checked`'s types or the heads' table name
+    /// (what `make_from` asks over every body: here over this one) that this program has not
+    /// made, with every supertrait under it (program.rs `object_tables`, the one home). A
+    /// refused trait stops the run, naming it.
+    fn body_objects(&mut self, checked: &Checked<'static>, function: &str) -> Result<(), LazyRefusal> {
+        let mut asked = dyn_principals([self.store.tys.view(), checked.types.view()].into_iter());
+        asked.retain(|k| !self.objects.contains_key(k));
+        if asked.is_empty() {
+            return Ok(());
+        }
+        let mut objects = core::mem::replace(&mut self.objects, HashMap::new_in(Global));
+        let made = {
+            let mut r = self.records(true);
+            object_tables(&mut r, asked, &mut objects, None)
+        };
+        self.objects = objects;
+        made.map_err(|refusal| LazyRefusal::Row { function: Box::from(function), refusal: Box::new(refusal) })
     }
 
     /// The types table forked afresh from the heads' and each live body lowered again into it,
@@ -309,7 +338,7 @@ impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
         }
         let again = lower_again(names, prepared, &mut self.front.keys, &mut self.store, &made, &mut tys).map_err(lower)?;
         self.tys = Some(tys);
-        let lits = literals(&again, function).map_err(|refusal| LazyRefusal::Row { function: Box::from(function), refusal })?;
+        let lits = literals(&again, function).map_err(|refusal| LazyRefusal::Row { function: Box::from(function), refusal: Box::new(refusal) })?;
         let live = Live { row: i as u32, made, again, lits };
         let slot = match self.live.iter().position(Option::is_none) {
             Some(free) => {

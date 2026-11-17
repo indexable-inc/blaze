@@ -149,6 +149,36 @@ impl Unresolved {
     }
 }
 
+/// Why a macro call's expansion was refused: what [`ScopeError::Refused`] holds, and what a
+/// path that looks a name up behind it answers (blaze-scope `names::Why::Refused`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub enum RefusedWhy {
+    /// `env!("OUT_DIR")` of a package whose build script's outputs are missing: cargo sets
+    /// `OUT_DIR` for a package with a build script ("the folder in which all output and
+    /// intermediate artifacts should be placed", the cargo book), and no outputs record is
+    /// joined, so the script has not run here. The error's name is `OUT_DIR`.
+    BuildScriptOutputs,
+    /// An `env!` (or `option_env!`) of a variable this build could not answer; the error's name
+    /// is the variable.
+    UnknownEnv,
+    /// Any other refusal (a definition not held, a lex error, a proc macro's failure); the
+    /// error's name is the macro's path as written, the crate's notes hold the whole reason.
+    Expansion,
+}
+
+impl RefusedWhy {
+    /// What a name behind such a call is, in words.
+    pub fn text(self) -> &'static str {
+        match self {
+            RefusedWhy::BuildScriptOutputs => {
+                "unknown: a macro call that could write it was refused: `env!(\"OUT_DIR\")` of a package whose build script's outputs are missing (the build script has not run)"
+            }
+            RefusedWhy::UnknownEnv => "unknown: a macro call that could write it was refused: an `env!` of a variable this build could not answer",
+            RefusedWhy::Expansion => "unknown: a macro call that could write it was refused (the crate's notes say why)",
+        }
+    }
+}
+
 /// An error of user code, kept in the scope as a value (a resolver never panics on one). `P`
 /// is a path: [`Path`] in a working form, [`PathView`] read from a record.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -173,6 +203,9 @@ pub enum ScopeError<N, P> {
     Inconsistent { site: Site, ns: Namespace, name: N, early: Def, last: Def },
     /// A macro call nested deeper than the recursion limit.
     RecursionLimit { call: ItemKey },
+    /// A macro call of the module whose expansion was refused: what it might have written is
+    /// unknown, never absent. `name`: the variable for an `env!` refusal, else the macro's path.
+    Refused { call: ItemKey, name: N, why: RefusedWhy },
 }
 
 impl<N, P> ScopeError<N, P> {
@@ -189,6 +222,7 @@ impl<N, P> ScopeError<N, P> {
             E::Ambiguous { site, ns, name, kind, first, second } => E::Ambiguous { site, ns, name, kind, first, second },
             E::Inconsistent { site, ns, name, early, last } => E::Inconsistent { site, ns, name, early, last },
             E::RecursionLimit { call } => E::RecursionLimit { call },
+            E::Refused { call, name, why } => E::Refused { call, name, why },
         }
     }
 }
@@ -286,7 +320,8 @@ impl<N, P> ScopeError<N, P> {
             | ScopeError::WiderReexport { .. }
             | ScopeError::Ambiguous { .. }
             | ScopeError::Inconsistent { .. }
-            | ScopeError::RecursionLimit { .. } => None,
+            | ScopeError::RecursionLimit { .. }
+            | ScopeError::Refused { .. } => None,
         }
     }
 
@@ -308,6 +343,7 @@ impl<N, P> ScopeError<N, P> {
                 E::Inconsistent { site: *site, ns: *ns, name, early: *early, last: *last }
             }
             E::RecursionLimit { call } => E::RecursionLimit { call: *call },
+            E::Refused { call, name, why } => E::Refused { call: *call, name, why: *why },
         }
     }
 }
@@ -324,6 +360,9 @@ byte_enum! {
         Ambiguous = 6 => "ambiguous",
         Inconsistent = 7 => "inconsistent",
         RecursionLimit = 8 => "recursion limit",
+        RefusedScript = 9 => "refused: build script outputs",
+        RefusedEnv = 10 => "refused: unknown env",
+        RefusedExpansion = 11 => "refused expansion",
     }
 }
 
@@ -671,6 +710,14 @@ fn error_row<N: AsRef<str>>(
             (ErrorTag::Inconsistent, Some(*site), Some(name), *ns, None, None, Some(*early), Some(*last))
         }
         E::RecursionLimit { call } => (ErrorTag::RecursionLimit, Some(Site::Call(*call)), None, Namespace::Types, None, None, None, None),
+        E::Refused { call, name, why } => {
+            let tag = match why {
+                RefusedWhy::BuildScriptOutputs => ErrorTag::RefusedScript,
+                RefusedWhy::UnknownEnv => ErrorTag::RefusedEnv,
+                RefusedWhy::Expansion => ErrorTag::RefusedExpansion,
+            };
+            (tag, Some(Site::Call(*call)), Some(name), Namespace::Types, None, None, None, None)
+        }
     };
     let segment = match error {
         E::Import { segment, .. } | E::Macro { segment, .. } => *segment,
@@ -851,6 +898,9 @@ impl<'a> ScopeView<'a> {
                 ErrorTag::Ambiguous => E::Ambiguous { site, ns: row.ns, name, kind: row.ambiguity, first, second },
                 ErrorTag::Inconsistent => E::Inconsistent { site, ns: row.ns, name, early: first, last: second },
                 ErrorTag::RecursionLimit => E::RecursionLimit { call: ItemKey(row.site_key) },
+                ErrorTag::RefusedScript => E::Refused { call: ItemKey(row.site_key), name, why: RefusedWhy::BuildScriptOutputs },
+                ErrorTag::RefusedEnv => E::Refused { call: ItemKey(row.site_key), name, why: RefusedWhy::UnknownEnv },
+                ErrorTag::RefusedExpansion => E::Refused { call: ItemKey(row.site_key), name, why: RefusedWhy::Expansion },
             }
         })
     }

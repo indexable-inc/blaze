@@ -96,7 +96,7 @@ fn main() -> ExitCode {
     feature_list.sort_unstable();
     feature_list.dedup();
     let features: std::vec::Vec<blaze_unit_graph::Text<'_>> = feature_list.iter().map(|f| blaze_unit_graph::Text::from_str_in(f, alloc)).collect();
-    let given = Given { package, folder: "", features: &features, target_cfg: &cfg, target: TARGET, host: TARGET, deps: &[] };
+    let given = Given { package, seen: blaze_expand::seen::SeenRoot::Package, features: &features, target_cfg: &cfg, target: TARGET, host: TARGET, deps: &[] };
     let env = blaze_build_script::env(&given, alloc);
     // D71: the host tools the pin table grants this package (sha3-asm: perl), each by its
     // binary's digest in the key.
@@ -104,17 +104,17 @@ fn main() -> ExitCode {
     let tools = host_tools::granted(&table_tools, name, alloc);
     // Each tool under its name, then each program it starts under `<tool>+<path>`, as
     // native_unit keys them.
-    let names: std::vec::Vec<(std::string::String, &str)> = tools
+    let names: std::vec::Vec<(std::string::String, &str, &host_tools::HostTool<'_>)> = tools
         .iter()
-        .flat_map(|tool| tool.programs().map(move |p| (if p == tool.path { tool.name.to_owned() } else { format!("{}+{p}", tool.name) }, p)))
+        .flat_map(|tool| tool.programs().map(move |p| (if p == tool.path { tool.name.to_owned() } else { format!("{}+{p}", tool.name) }, p, tool)))
         .collect();
     let tool_keys: std::vec::Vec<HostToolKey<'_>> = names
         .iter()
-        .map(|(name, program)| {
+        .map(|(name, program, tool)| {
             let (dir, file) = program.rsplit_once('/').expect("an absolute tool path");
             let mut sha = blaze_sha256::Sha256::new();
             sha.update(&read(if dir.is_empty() { "/" } else { dir }, file));
-            HostToolKey { name: name.as_str(), digest: sha.finish() }
+            HostToolKey::of(tool, name.as_str(), sha.finish())
         })
         .collect();
     let inputs = KeyInputs {
@@ -135,11 +135,11 @@ fn main() -> ExitCode {
     let mut records: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
     for (pass, package_dir, out_dir) in [("A", pkg_a, out_a), ("B", pkg_b, out_b)] {
         let c = CInputs {
-            shelf: Shelf { dir: shelf },
+            shelf: Shelf { dir: shelf, clang_major: blaze_build_script::toolchain::clang_major(PIN).unwrap_or_else(|e| panic!("{e}")) },
             sysroot: sdk,
             out_dir,
             package: package_dir,
-            package_name: &format!("{name}-{version}"),
+            seen: blaze_expand::seen::SeenRoot::Package,
             macos_min: "11.0",
         };
         let script = NativeScript { program: script, c, env: &env, reads: &[], host_tools: &tools, limits: RunLimits::STANDARD, deadline: Duration::from_secs(600) };

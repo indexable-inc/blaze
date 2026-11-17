@@ -122,6 +122,7 @@ use blaze_script::{
     finding::{self, Finding},
     git,
     input::{self, Fields, Input, InputError},
+    ratchet::Members,
     read_text, universal_newlines,
 };
 
@@ -141,6 +142,12 @@ use heap::HeapUse;
 #[path = "ambient/reach.rs"]
 mod reach;
 use reach::ReachUse;
+
+/// The producer-string ratchet (D105): typed-in producer versions in hash domains, read by the
+/// same walk.
+#[path = "ambient/producers.rs"]
+mod producers;
+use producers::ProducerUse;
 
 const SCRIPT: &str = "ambient";
 /// The list, from the root.
@@ -216,6 +223,9 @@ impl Input for Args {
                     "reach-write",
                     "reach-report",
                     "reach-sites",
+                    "producers-check",
+                    "producers-write",
+                    "producers-sites",
                 ],
                 None,
             )?,
@@ -410,6 +420,22 @@ fn cfg_test_end(line: &str, inner: bool) -> Option<usize> {
     (close > 0 && inside.as_bytes()[close - 1] == b')').then(|| at + open.len() + "all(test".len() + close + 1)
 }
 
+/// The byte of `line` after the attribute it starts with when that attribute is
+/// `#[cfg(any(test, feature = "testing"))]` (either order, any spacing): a module only tests
+/// and other crates' tests reach (blaze-solve `testing/`, blaze-consteval `fixture.rs`). It is
+/// a test's root for the HEAP columns only (D102, the coordinator's answer of 2026-11-16): it
+/// takes `blaze_own::testing::heap()`. The `std` and effect counts still read it as code.
+fn cfg_testing_end(line: &str, inner: bool) -> Option<usize> {
+    let trimmed = line.trim_start();
+    let at = line.len() - trimmed.len();
+    let open = if inner { "#![cfg(" } else { "#[cfg(" };
+    let rest = trimmed.strip_prefix(open)?;
+    let close = rest.find(']')?;
+    let cond: String = rest[..close].chars().filter(|c| !c.is_whitespace()).collect();
+    let testing = matches!(cond.as_str(), "any(test,feature=\"testing\"))" | "any(feature=\"testing\",test))");
+    testing.then(|| at + open.len() + close + 1)
+}
+
 /// The byte of `line` after the attribute it starts with when its path ends in the word `test`
 /// (`#[test]`, `#[tokio::test(..)]`): untyped.rs's `test_fn`, `\A\s*#\[(?:\w+::)*test\b[^\]]*\]`.
 fn test_attr_end(line: &str) -> Option<usize> {
@@ -492,10 +518,17 @@ struct Scanned {
     /// outside its test code, and on it.
     heap: Vec<(usize, HeapUse)>,
     test_heap: Vec<(usize, HeapUse)>,
+    /// `#![cfg(any(test, feature = "testing"))]`: the whole file is a test's root for the heap
+    /// columns ([`cfg_testing_end`]); its heap uses are in `test_heap`.
+    testing: bool,
     /// The calls that reach the clock, the environment, randomness, exit or a whole world with
     /// no caller handing it ([`ReachUse`], reach.rs), outside its test code, and on it.
     reach: Vec<(usize, ReachUse)>,
     test_reach: Vec<(usize, ReachUse)>,
+    /// The typed-in producer strings in its key code ([`ProducerUse`], producers.rs), outside
+    /// its test code, and on it.
+    producers: Vec<(usize, ProducerUse)>,
+    test_producers: Vec<(usize, ProducerUse)>,
     /// Its text says `#![no_std]` (read for a test target's root).
     no_std: bool,
 }
@@ -509,6 +542,9 @@ struct ModDecl {
     path: Option<String>,
     /// Test code declares it.
     in_test: bool,
+    /// Test code or a `cfg(any(test, feature = "testing"))` item declares it: a test's root for
+    /// the heap columns ([`cfg_testing_end`]).
+    in_testing: bool,
 }
 
 /// The file a `#[path = "<file>"]` on `line` names, if any.
@@ -522,6 +558,8 @@ fn path_attr(line: &str) -> Option<&str> {
 fn scan_file(text: &str) -> Scanned {
     let lines: Vec<&str> = text.split('\n').collect();
     let mut test = vec![false; lines.len()];
+    // The lines under `cfg(any(test, feature = "testing"))`: test code for the heap columns.
+    let mut testing = vec![false; lines.len()];
     let mut out = Scanned::default();
     // A `#[path]` on an attribute line, waiting for the `mod` it is on.
     let mut path: Option<&str> = None;
@@ -541,9 +579,22 @@ fn scan_file(text: &str) -> Scanned {
                 *it = true;
             }
         }
+        if cfg_testing_end(line, true).is_some() {
+            out.testing = true;
+        }
+        if let Some(end) = cfg_testing_end(line, false) {
+            let last = match item_end(text, start + end) {
+                Some(end) => at + text[start..end - 1].matches('\n').count(),
+                None => at,
+            };
+            for it in &mut testing[at..=last] {
+                *it = true;
+            }
+        }
         let named = path_attr(line).or(path);
         if let Some(name) = module_decl(line) {
-            out.mods.push(ModDecl { name: name.to_owned(), path: named.map(str::to_owned), in_test: test[at] });
+            let in_test = test[at];
+            out.mods.push(ModDecl { name: name.to_owned(), path: named.map(str::to_owned), in_test, in_testing: in_test || testing[at] });
             path = None;
         } else if line.trim_start().starts_with("#[") {
             path = named;
@@ -558,12 +609,21 @@ fn scan_file(text: &str) -> Scanned {
             it.in_test = true;
         }
     }
+    let whole_testing = whole || out.testing;
+    if whole_testing {
+        for it in &mut out.mods {
+            it.in_testing = true;
+        }
+    }
     // One scan; each site is on test code's side of the line or on the other, by `test`.
     let (sites, effects) = all_sites(text);
     (out.test_sites, out.sites) = sites.into_iter().partition(|(line, _)| whole || test[line - 1]);
     (out.test_effects, out.effects) = effects.into_iter().partition(|(line, _)| whole || test[line - 1]);
-    (out.test_heap, out.heap) = heap::heap_uses(text).into_iter().partition(|(line, _)| whole || test[line - 1]);
+    (out.test_heap, out.heap) =
+        heap::heap_uses(text).into_iter().partition(|(line, _)| whole_testing || test[line - 1] || testing[line - 1]);
     (out.test_reach, out.reach) = reach::reach_uses(text).into_iter().partition(|(line, _)| whole || test[line - 1]);
+    (out.test_producers, out.producers) =
+        producers::producer_uses(text).into_iter().partition(|(line, _)| whole || test[line - 1]);
     out.no_std = declares_no_std(text);
     out
 }
@@ -971,7 +1031,10 @@ fn module_files(parts: &[String], name: &str) -> [String; 2] {
 /// The `.rs` files and the manifests under crates/, each sorted part by part, each as its parts
 /// from the root, none under a directory named `target`. Directories that are links are not
 /// entered.
-fn tree_files(root: &Path) -> (Vec<Vec<String>>, Vec<Vec<String>>) {
+fn tree_files(root: &Path) -> Result<(Vec<Vec<String>>, Vec<Vec<String>>), TreeError> {
+    let manifest = root.join("Cargo.toml");
+    let text = std::fs::read_to_string(&manifest).map_err(|e| TreeError::Unreadable { path: "Cargo.toml".to_owned(), why: e.to_string() })?;
+    let members = Members::of(&text);
     let (mut sources, mut manifests) = (Vec::new(), Vec::new());
     let mut todo = vec![vec!["crates".to_owned()]];
     // Bounded: each directory is listed once, and links to directories are not followed.
@@ -983,6 +1046,11 @@ fn tree_files(root: &Path) -> (Vec<Vec<String>>, Vec<Vec<String>>) {
             let mut parts = dir.clone();
             parts.push(name.clone());
             let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            // A directory right under crates/ that the root workspace does not hold (its own
+            // workspace, or a parked crate) is not the repository's code: not counted.
+            if is_dir && parts.len() == 2 && !members.holds(&parts.join("/")) {
+                continue;
+            }
             if is_dir && name != "target" {
                 todo.push(parts);
             } else if !is_dir && name.ends_with(".rs") {
@@ -994,7 +1062,7 @@ fn tree_files(root: &Path) -> (Vec<Vec<String>>, Vec<Vec<String>>) {
     }
     sources.sort();
     manifests.sort();
-    (sources, manifests)
+    Ok((sources, manifests))
 }
 
 /// The crate of the file `parts`: the nearest directory above it, under crates/, with a
@@ -1079,6 +1147,9 @@ fn crate_root(root: &Path, parts: &[String]) -> Result<Option<String>, TreeError
 struct Walked {
     scanned: Vec<(Vec<String>, Scanned)>,
     skipped: BTreeSet<String>,
+    /// `skipped`, and the files a `cfg(any(test, feature = "testing"))` module holds, with
+    /// every module they declare: a test's root for the heap columns only (heap.rs).
+    testing: BTreeSet<String>,
     children: BTreeMap<String, Vec<String>>,
     packages: Vec<Vec<String>>,
 }
@@ -1113,11 +1184,12 @@ fn count(root: &Path) -> Result<BTreeMap<String, Vec<Site>>, TreeError> {
 
 /// The tree's files scanned, and which are test code (see [`Walked`]).
 fn walk(root: &Path) -> Result<Walked, TreeError> {
-    let (files, packages) = tree_files(root);
+    let (files, packages) = tree_files(root)?;
     let known: BTreeSet<String> = files.iter().map(|it| it.join("/")).collect();
     let mut scanned: Vec<(Vec<String>, Scanned)> = Vec::new();
     // The files not counted: test code, and the modules it declares.
     let mut skipped: BTreeSet<String> = BTreeSet::new();
+    let mut testing: BTreeSet<String> = BTreeSet::new();
     let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for parts in files {
         let path = parts.join("/");
@@ -1128,6 +1200,9 @@ fn walk(root: &Path) -> Result<Walked, TreeError> {
         let found = scan_file(&text);
         if test_path(&parts) || found.test {
             skipped.insert(path.clone());
+        }
+        if found.testing {
+            testing.insert(path.clone());
         }
         for decl in &found.mods {
             let files = match &decl.path {
@@ -1140,6 +1215,9 @@ fn walk(root: &Path) -> Result<Walked, TreeError> {
                 }
                 if decl.in_test {
                     skipped.insert(file.clone());
+                }
+                if decl.in_testing {
+                    testing.insert(file.clone());
                 }
                 children.entry(path.clone()).or_default().push(file);
             }
@@ -1156,7 +1234,18 @@ fn walk(root: &Path) -> Result<Walked, TreeError> {
             }
         }
     }
-    Ok(Walked { scanned, skipped, children, packages })
+    // The same for the heap's wider test code: what skipped code is, and the `testing` modules.
+    testing.extend(skipped.iter().cloned());
+    let mut todo: Vec<String> = testing.iter().cloned().collect();
+    // Bounded: as above.
+    while let Some(path) = todo.pop() {
+        for child in children.get(&path).into_iter().flatten() {
+            if testing.insert(child.clone()) {
+                todo.push(child.clone());
+            }
+        }
+    }
+    Ok(Walked { scanned, skipped, testing, children, packages })
 }
 
 /// The list as `write` writes it: the header, then `<crate><TAB><std><TAB><is_std><TAB><alloc>
@@ -1445,6 +1534,10 @@ fn main_with(it: &Args) {
         reach::main_with(&it.command, it.base.as_deref(), &root);
         return;
     }
+    if it.command.starts_with("producers-") {
+        producers::main_with(&it.command, it.base.as_deref(), &root);
+        return;
+    }
     let counts = count(&root).unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
     if it.command == "findings" {
         let found = counts.iter().flat_map(|(krate, sites)| {
@@ -1698,6 +1791,22 @@ fn selftest() {
         made.unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &format!("{path} is not written: {e}")));
     };
     let uses_std = "use std::fs;\n";
+    // The root workspace: `crates/*`, less a parked crate; `crates/own` is its own workspace,
+    // excluded too. Neither is counted: planted below with a `std` use each.
+    put("Cargo.toml", "[package]\nname = \"root\"\n\n[workspace]\nmembers = [\n    \"crates/*\", # all\n    \"scripts\",\n]\nexclude = [\n    \"crates/parked\",\n    \"crates/own\",\n]\n");
+    put("crates/parked/Cargo.toml", "[package]\nname = \"parked\"\n");
+    put("crates/parked/src/lib.rs", uses_std);
+    put("crates/own/Cargo.toml", "[workspace]\n");
+    put("crates/own/host/src/lib.rs", uses_std);
+    let read = Members::of(&std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap_or_else(|e| failed(&e)));
+    expect(
+        read.globs == ["crates/*", "scripts"] && read.exclude == BTreeSet::from(["crates/parked".to_owned(), "crates/own".to_owned()]),
+        &format!("the root workspace read: {read:?}"),
+    );
+    expect(
+        read.holds("crates/a") && read.holds("scripts") && !read.holds("crates/parked") && !read.holds("crates/a/b") && !read.holds("tools/x"),
+        "membership",
+    );
     put("crates/a/Cargo.toml", "[package]\nname = \"a\"\n");
     put("crates/a/src/lib.rs", FIXTURE);
     put("crates/a/src/x.rs", "#[cfg(test)]\nmod t;\n");
@@ -1809,6 +1918,7 @@ fn selftest() {
     in_tests::selftest();
     heap::selftest();
     reach::selftest();
+    producers::selftest();
     println!("{SCRIPT} selftest: ok");
 }
 
@@ -1818,7 +1928,13 @@ fn main() {
         [one] if one == "selftest" => selftest(),
         [one] => main_with(&input::parse::<Args>(one, SCRIPT)),
         _ => {
-            eprintln!("usage: {SCRIPT} '<json>' | selftest\n\n{DOC}{}{}{}", in_tests::TESTS_DOC, heap::HEAP_DOC, reach::REACH_DOC);
+            eprintln!(
+                "usage: {SCRIPT} '<json>' | selftest\n\n{DOC}{}{}{}{}",
+                in_tests::TESTS_DOC,
+                heap::HEAP_DOC,
+                reach::REACH_DOC,
+                producers::PRODUCERS_DOC
+            );
             std::process::exit(1);
         }
     }

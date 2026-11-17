@@ -57,7 +57,10 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// Raised on any change of the form: an old record is then [`HeadRecordError::Version`].
 /// 2: an impl's record holds one `self` flag per fn (`ImplHead::fn_self`, brief 14).
 /// 3: a fn's record holds its C-variadic flag after its body flag (`FnHead::c_variadic`).
-pub const VERSION: u32 = 3;
+/// 4: a trait's flags carry `COINDUCTIVE` from `#[rustc_coinductive]` (census 14, brief A).
+/// 5: a trait member's predicates hold `Self: MetaSized` unless the trait states a sizedness
+/// (self_size.rs).
+pub const VERSION: u32 = 5;
 /// The digest domains: the record's out digest and a fn text's check.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";

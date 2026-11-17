@@ -1433,6 +1433,9 @@ const STT_FILE: u8 = 4;
 const STT_TLS: u8 = 6;
 const R_ABS64: u32 = 257;
 const R_PREL32: u32 = 261;
+/// x86-64 psABI: the section type of `.eh_frame` on x86-64 (bytes in the file, like
+/// `SHT_PROGBITS`).
+const SHT_X86_64_UNWIND: u32 = 0x7000_0001;
 
 #[derive(Clone, Copy)]
 struct ESect<'o> {
@@ -1635,6 +1638,7 @@ fn read_elf<'a>(o: &[u8], symbol: &str, mut out: Out<'a, '_>, alloc: Alloc<'a>) 
         let bytes: &[u8] = match (role, ty) {
             (Role::Empty | Role::Note, _) => &[],
             (Role::Code | Role::Relro | Role::EhFrame | Role::Lsda | Role::Personality, SHT_PROGBITS) => bytes_at(o, offset, size, "section bytes")?,
+            (Role::EhFrame, SHT_X86_64_UNWIND) if x86 => bytes_at(o, offset, size, "section bytes")?,
             (Role::Code | Role::Relro | Role::EhFrame | Role::Lsda | Role::Personality, ty) => return Err(ReadError::SectionType { name: oname, kind: ty }),
             (_, SHT_NULL) => &[],
             _ => bytes_at(o, offset, size, "section bytes")?,

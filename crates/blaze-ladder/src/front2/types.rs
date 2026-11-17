@@ -191,6 +191,12 @@ pub trait Heads {
     fn qpath_ty(&self, _need: LibKey) -> Option<PNode> {
         None
     }
+    /// The inherent constant leaves asked of these heads (`Self::MAX_SIZE`:
+    /// [`super::const_inherent`]); `None` where these heads have no evaluator behind them (the
+    /// default), and the expression is read as written.
+    fn inherent_leaves(&self) -> Option<&core::cell::RefCell<super::const_inherent::Table>> {
+        None
+    }
     /// Why the anonymous constant under need key `key` has no value (the evaluator's refusal,
     /// as printed), once it was tried: the head that wrote it is then refused, naming the
     /// expression and this reason, and only that head. `None`: not tried, or it has a value.
@@ -679,6 +685,12 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             return Err(program(format!("`{text}` is a type parameter; a constant is expected here"), r));
         }
         let ty = want(tys)?;
+        // A parameter whose type has no value node (a reference, tuple, array or generic ADT:
+        // `R<{ "k" }, T>`) takes no value here: refused by name, never read as bits (a
+        // constant item's evaluated bits of a `&str` are an address, not its value).
+        if !super::const_param_ty::value_has_node(tys.view().get(ty)) {
+            return Err(Why::Unsupported(super::const_param_ty::NO_VALUE_NODE, r));
+        }
         // A parameter of a fieldless enum type takes a path to a unit variant, whose value is
         // that variant under the enum's key (const_enum.rs); nothing below reads an enum.
         match super::const_enum::term(tys, &|abs, segs| self.resolver.path(env.module, abs, segs, Ns::Value), ty, text, r)? {
@@ -687,6 +699,39 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 return Err(program(format!("mismatched types: the const argument `{text}` is a variant of another enum than its parameter's type"), r));
             }
             super::const_enum::Term::NotEnum => {}
+        }
+        // An inherent associated constant leaf (`Self::MAX_SIZE`, `InlineExtension::MAX`,
+        // `<W>::N`) is the impl member constant's value, evaluated by its own key
+        // (front2/const_inherent.rs), never through the type's row, whose fields may hold this
+        // very length; the expression goes on with each leaf's value in its place.
+        let inherent_resolve = |abs: bool, segs: &[&str]| self.resolver.path(env.module, abs, segs, Ns::Type);
+        let self_adt = super::const_inherent::ground_self_adt(tys.view(), env);
+        // The substituted text is kept in the allocator of the type table this call holds.
+        let substituted = match super::const_inherent::substitute(self.heads, &inherent_resolve, self_adt, text, tys.alloc()) {
+            Ok(done) => done,
+            Err(super::const_inherent::Stop::Need(need)) => return Err(Why::NeedConst(need, r)),
+            Err(super::const_inherent::Stop::Failed { start, end, need }) => {
+                let leaf = text.get(start..end).unwrap_or(text);
+                // The typed refusal, printed into the head's `Why` as every head refusal is.
+                let shown = match self.heads.inherent_leaves() {
+                    Some(table) => super::const_inherent::refusal(table, need, |why| match why {
+                        Some(why) => format!("{leaf}: {why}"),
+                        None => format!("{leaf}: refused, and its refusal is not in the table"),
+                    }),
+                    None => format!("{leaf}: refused where these heads keep no inherent leaves"),
+                };
+                return Err(Why::ConstPath(shown.into_boxed_str(), r));
+            }
+            Err(super::const_inherent::Stop::Cycle { start, end }) => {
+                let leaf = text.get(start..end).unwrap_or(text);
+                return Err(Why::ConstPath(format!("{leaf}: the inherent constant is needed while it is being evaluated (a constant that needs itself)").into_boxed_str(), r));
+            }
+            Err(super::const_inherent::Stop::Full) => {
+                return Err(Why::Unsupported("more inherent constant leaves than front2/const_inherent.rs keeps (rule 18)", r));
+            }
+        };
+        if let Some(done) = &substituted {
+            text = done.as_str();
         }
         // A literal is one token, `-` before it for a signed one: `1usize << 0` is an
         // expression, never a literal with the suffix `usize << 0`.
@@ -960,10 +1005,13 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         // of its name, so this comes before the names library).
         if !abs && texts.len() == 2 {
             if let Some(&(_, i)) = env.params.iter().find(|(n, _)| *n == Name::of(texts[0])) {
-                if !kids.is_empty() {
-                    return Err(Why::Unsupported("type arguments on a parameter's associated type (`T::X<A>`)", r));
+                // `T::X<A>` is `<T as Tr>::X<A>` (the Reference, "Paths", "Paths in types";
+                // "Associated Items", generic associated types): `kids` are the arguments
+                // written on `X`'s own segment, the parameter's segment taking none.
+                if segs[0].has_args {
+                    return Err(Why::Unsupported("generic arguments on a type parameter (`T<A>::X`)", r));
                 }
-                return self.param_assoc(tys, env, v, i, Name::of(texts[1]), r, shown);
+                return self.param_assoc(tys, env, v, i, Name::of(texts[1]), kids, r, shown);
             }
         }
         let found = match self.resolver.path(env.module, abs, &texts, Ns::Type) {
@@ -1021,13 +1069,16 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         }
     }
 
-    /// `T::name` with `T` the parameter `param`: `<T as Tr>::name` for the one trait `Tr` among
-    /// `T`'s bounds in `env`, supertraits included, that declares `name`. While the bounds are
-    /// themselves being lowered (`Bounds::Building`) and none lowered so far declares it, the
-    /// bounds of `T` as written in the header `v` are read ([`super::written`]: `T:
-    /// Tr<T::X> + Declares`, a bound naming `X` before the bound that declares it).
+    /// `T::name<own..>` with `T` the parameter `param`: `<T as Tr>::name<own..>` for the one
+    /// trait `Tr` among `T`'s bounds in `env`, supertraits included, that declares `name`, the
+    /// arguments `own` written on `name`'s segment being the generic associated type's own
+    /// ([`Self::assoc_with_args`]; none is [`Self::alias`]). While the bounds are themselves
+    /// being lowered (`Bounds::Building`) and none lowered so far declares it, the bounds of `T`
+    /// as written in the header `v` are read ([`super::written`]: `T: Tr<T::X> + Declares`, a
+    /// bound naming `X` before the bound that declares it); with own arguments that case is
+    /// refused by name.
     #[expect(clippy::too_many_arguments, reason = "the path, where it is written, and the parameter")]
-    fn param_assoc(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, param: u32, name: Name, r: Range, shown: &str) -> Result<PTy, Why> {
+    fn param_assoc(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, param: u32, name: Name, own: &[PTy], r: Range, shown: &str) -> Result<PTy, Why> {
         let (bounds, done) = match env.bounds {
             Bounds::Building(b) => (b, false),
             Bounds::Done(b) => (b, true),
@@ -1041,7 +1092,8 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             }
         }
         match found.as_slice() {
-            &[(t, a)] => self.alias(tys, t, name, a, r, shown),
+            &[(t, a)] => self.assoc_with_args(tys, t, name, a, own, r, shown),
+            [] if !done && !own.is_empty() => Err(Why::Unsupported("`T::X<A>` in a bound written before the bound of `T` that declares `X`", r)),
             [] if !done => match self.written_param_assoc(tys, env, v, param, name, r, shown)? {
                 Some(t) => Ok(t),
                 None => Err(Why::Unsupported("`T::X` in a bound written before the bound of `T` that declares `X`", r)),

@@ -58,11 +58,19 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 at
             }
         };
+        self.bind_pattern_at(root, At { at: place, g, by_ref: false, copy: false }, true)
+    }
+
+    /// Binds irrefutable pattern `root` at `at`, by a work list. `owned`: the place is the
+    /// binder's own (a `let`'s value moved in, a parameter's copy), so a by-value binding takes
+    /// its part; else (a `let` initializer's place, ref_bind.rs) nothing in it moves and an
+    /// explicit `ref` takes its address.
+    pub(super) fn bind_pattern_at(&mut self, root: PatId, at: At, owned: bool) -> Result<(), BuildError> {
         // (pattern, its part's place, whether the part is the binder's own: not behind a
         // reference the pattern followed).
         let mut todo: Vec<(PatId, At, bool), A> = Vec::new_in(self.alloc.clone());
         let mut parts: Vec<(PatId, At), A> = Vec::new_in(self.alloc.clone());
-        todo.push((root, At { at: place, g, by_ref: false, copy: false }, true));
+        todo.push((root, at, owned));
         while let Some((p, at, owned)) = todo.pop() {
             let pat = self.pat(p)?;
             match pat {

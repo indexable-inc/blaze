@@ -47,13 +47,16 @@ mod moves;
 mod slice_glue;
 mod strs;
 mod super_let;
+mod target_intr;
 mod temps;
 mod unsize_nested;
 mod unsized_tail;
 mod nounwind;
 mod coroutine_panics;
 mod unwind;
+mod unwind_ladder;
 mod val_stack;
+mod validity;
 mod wide_cmp;
 
 /// The target's pointer width: the ladder runs on AArch64.
@@ -513,6 +516,11 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     nounwind: bool,
     /// The body's one `terminate` landing block, once a call needed it (walk/nounwind.rs).
     terminate: Option<Block>,
+    /// The drops a ladder's landing built now owes after the current step, performed last
+    /// pushed first (walk/unwind_ladder.rs).
+    owed: Vec<unwind_ladder::DropStep, A>,
+    /// Where a drop call made now goes (walk/unwind_ladder.rs `drop_call`).
+    rung: unwind_ladder::Rung,
 }
 
 fn unsupported(expr: ExprId, what: &'static str) -> BuildError {
@@ -745,6 +753,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         cleanup: false,
         nounwind: false,
         terminate: None,
+        owed: Vec::new_in(alloc.clone()),
+        rung: unwind_ladder::Rung::Off,
     }
     }
 
@@ -1923,16 +1933,16 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let item = self.adts.lang_fn(DROP_FN).ok_or(BuildError::NoLangFn { expr: None, name: DROP_FN })?;
         let args = self.ground.intern_list(&[g]).map_err(|_| malformed("the ground table is full"))?;
         let p = self.address(at);
-        self.call_ptr(Instance { item, args }, p);
-        Ok(())
+        self.call_ptr(Instance { item, args }, p)
     }
 
-    /// A call of `instance`, a fn of one pointer parameter and no result, with `p`.
-    fn call_ptr(&mut self, instance: Instance, p: Value) {
+    /// A drop call of `instance`, a fn of one pointer parameter and no result, with `p`: plain,
+    /// or an `invoke` when an unwind ladder says so (walk/unwind_ladder.rs `drop_call`).
+    fn call_ptr(&mut self, instance: Instance, p: Value) -> Result<(), BuildError> {
         let place = self.ref_place(instance);
         let reference = self.b.reference(RefKind::Func, place);
         let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
-        self.b.call(Flags::NONE, reference, sig, &[p]);
+        self.drop_call(Callee::Direct(reference), sig, &[p])
     }
 
     /// Binding `p`, just bound (`init`) or declared without a value, joins the innermost drop
@@ -2165,24 +2175,14 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
 
     /// Whether a binding from `start` of `scope_pats` on may be dropped here.
     fn pending_from(&self, start: usize) -> bool {
-        self.scope_pats[start..].iter().any(|&h| match h {
-            Held::Rest { .. } | Held::Moved { .. } | Held::Temp { .. } => true,
-            Held::Pat(p) => match self.owned[p.ix()] {
-                Some(Owned { flag: Some(_), .. }) => true,
-                Some(Owned { flag: None, .. }) => self.init[p.ix()],
-                None => false,
-            },
-        })
+        self.scope_pats[start..].iter().any(|&h| self.held_pending(h))
     }
 
     /// Drops the entries from `start` of `scope_pats` on, last declared first, for an exit
-    /// that leaves their scopes (`break`, `continue`, `return`).
+    /// that leaves their scopes (`break`, `continue`, `return`), each with its unwind ladder
+    /// (walk/unwind_ladder.rs `drop_scope`).
     fn drop_from(&mut self, start: usize) -> Result<(), BuildError> {
-        for i in (start..self.scope_pats.len()).rev() {
-            let h = self.scope_pats[i];
-            self.drop_held(h, false)?;
-        }
-        Ok(())
+        self.drop_scope(start, false)
     }
 
     /// A value about to outlive the drops of the bindings from `start` on: an aggregate place is
@@ -2441,8 +2441,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 c = up;
             }
         }
-        // A field moved out by a place expression gives its local field flags (walk/moves.rs).
-        self.scan_field_moves(&parent)?;
+        // A part moved out by a place expression (a field, a box's contents) gives its local
+        // field flags (walk/moves/boxes.rs).
+        self.scan_part_moves(&parent)?;
         self.expr_parent = parent;
         self.scan_temp_scopes()
     }
@@ -2492,57 +2493,22 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             return Ok(());
         }
         let l = self.layout(g).map_err(sig_err)? as usize;
-        // A `Box<T>`'s contents go first, then its `Drop` impl (the library's, which frees).
+        // A `Box<T>`'s contents go first, then its `Drop` impl (the library's, which frees)
+        // and its own fields: that second half alone is the drop of a box whose contents moved
+        // out (walk/moves/boxes.rs `drop_box_free`).
         if let PNode::Adt(k, list) = self.ground_node(g).map_err(sig_err)?
             && self.adts.lang_adt(LangItem::OwnedBox) == Some(k)
         {
-            self.drop_box_contents(list, p)?;
+            // The contents, then the free: the free is owed if the contents' glue unwinds
+            // (walk/unwind_ladder.rs).
+            return self.drops_with_ladder(
+                &[unwind_ladder::DropStep::BoxContents { list, p }, unwind_ladder::DropStep::BoxFree { g, p }],
+                false,
+            );
         }
-        if let Some(item) = self.layouts[l].drop_fn {
-            let args = self.ground.intern_list(&[g]).map_err(|_| malformed("the ground table is full"))?;
-            self.call_ptr(Instance { item, args }, p);
-        }
-        match self.layouts[l].shape {
-            // A union's fields are never dropped.
-            Shape::Fields { .. } if self.layouts[l].is_union => {}
-            Shape::Fields { first, len } => self.drop_fields(p, first, len)?,
-            // The live variant's fields (the reference, "Destructors"): a `switch` on the
-            // discriminant, as a `match` reads it, to each variant with a field that needs
-            // drop; every other variant (and a niche's `None`) drops nothing.
-            Shape::Enum { id, first, len } => {
-                let exit = self.create();
-                let mut cases = Vec::with_capacity_in(len as usize, self.alloc.clone());
-                let mut bodies = Vec::with_capacity_in(len as usize, self.alloc.clone());
-                for v in 0..len {
-                    let (ff, fl) = self.layout_variants[(first + v) as usize];
-                    if !self.fields_need_drop(ff, fl) {
-                        continue;
-                    }
-                    let block = self.create();
-                    cases.push((self.discriminant_case(id, v)?, block));
-                    bodies.push((block, ff, fl));
-                }
-                let d = self.read_discriminant(id, (p, 0))?;
-                self.switch(d, exit, &cases);
-                for &(block, ff, fl) in bodies.iter() {
-                    self.begin(block);
-                    self.drop_fields(p, ff, fl)?;
-                    self.jump(exit, &[]);
-                }
-                self.begin(exit);
-            }
-            Shape::Array { elem: Repr::Agg(el), len, stride } if self.layouts[el as usize].needs_drop => {
-                let et = self.layouts[el as usize].ty;
-                let (i, ep, _, header, exit) = self.array_loop(len, stride, (p, 0), (p, 0));
-                self.drop_at(et, (ep, 0))?;
-                let one = self.b.iconst(Ty::I64, 1);
-                let next = self.b.binary(Op::Add, Flags::NONE, i, one);
-                self.jump(header, &[next]);
-                self.begin(exit);
-            }
-            Shape::Array { .. } => {}
-        }
-        Ok(())
+        // Its own `Drop`, then its parts (fields; the live variant's fields; elements), each
+        // with its unwind ladder (walk/unwind_ladder.rs `drop_impl_then_parts`, `drop_parts`).
+        self.drop_impl_then_parts(g, l, p)
     }
 
     /// The contents of the `Box<T>` at `p` (`list` its arguments), dropped by its glue before
@@ -2550,8 +2516,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// the contents, then calls `Drop::drop`", which deallocates by `Layout::for_value_raw`, so
     /// a zero-sized `T`, never allocated, is never freed). The box's first word is the data
     /// pointer (its pointer field, nested or not, is at offset 0); for `T = dyn Tr` the second
-    /// is the table, whose word 0 is `T`'s glue ([`Self::dyn_glue`]). A slice or `str` box's
-    /// elements are refused by name.
+    /// is the table, whose word 0 is `T`'s glue ([`Self::dyn_glue`]). For `T = [U]` or `str`
+    /// the box is the wide pointer itself (data at 0, length at 8): its elements' glue, first to
+    /// last (walk/slice_glue.rs; nothing for `str` or a `U` that needs no drop); the box's
+    /// `Drop` then frees `len * size_of::<U>()` bytes, as std's does by `Layout::for_value_raw`.
     fn drop_box_contents(&mut self, list: List, p: Value) -> Result<(), BuildError> {
         let sig_err = |error: TyErr| match error {
             TyErr::Unsupported(what) => BuildError::UnsupportedSig { what },
@@ -2569,11 +2537,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             PNode::Dynamic(_) => {
                 let data = self.b.load(Ty::PTR, Flags::NONE, p, 0, MemAttrs::aligned(3));
                 let vt = self.b.load(Ty::PTR, Flags::NONE, p, 8, MemAttrs::aligned(3));
-                self.dyn_glue(data, vt);
+                self.dyn_glue(data, vt)?;
             }
-            PNode::Slice(_) | PNode::Str => {
-                return Err(BuildError::UnsupportedSig { what: "the drop of a boxed slice's or `str`'s elements" });
-            }
+            PNode::Slice(_) | PNode::Str => self.slice_glue(t, p)?,
             _ => {
                 if self.needs_drop(t).map_err(sig_err)? {
                     let data = self.b.load(Ty::PTR, Flags::NONE, p, 0, MemAttrs::aligned(3));
@@ -2587,7 +2553,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// The drop of the trait object at `data` whose table is `vt` (vtable.rs: word 0 is the
     /// concrete type's `drop_in_place`, 0 when it needs none): a call of word 0 with `data`,
     /// skipped when the word is 0.
-    fn dyn_glue(&mut self, data: Value, vt: Value) {
+    fn dyn_glue(&mut self, data: Value, vt: Value) -> Result<(), BuildError> {
         let word = self.b.load(Ty::I64, Flags::NONE, vt, 0, MemAttrs::aligned(3));
         let zero = self.b.iconst(Ty::I64, 0);
         let set = self.b.icmp(IntCond::Ne, word, zero);
@@ -2597,29 +2563,15 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         self.begin(yes);
         let f = self.b.load(Ty::PTR, Flags::NONE, vt, 0, MemAttrs::aligned(3));
         let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
-        self.b.call_indirect(Flags::NONE, f, sig, &[data]);
+        self.drop_call(Callee::Pointer(f), sig, &[data])?;
         self.jump(next, &[]);
         self.begin(next);
+        Ok(())
     }
 
     /// Whether any of `layout_fields[first..first + len]` needs drop.
     fn fields_need_drop(&self, first: u32, len: u32) -> bool {
         self.layout_fields[first as usize..(first + len) as usize].iter().any(|&(_, _, repr)| self.repr_needs_drop(repr))
-    }
-
-    /// Drops each of `layout_fields[first..first + len]` that needs drop, at its offset from
-    /// `p`, in declaration order.
-    fn drop_fields(&mut self, p: Value, first: u32, len: u32) -> Result<(), BuildError> {
-        for i in first..first + len {
-            let (_, off, repr) = self.layout_fields[i as usize];
-            if let Repr::Agg(fl) = repr
-                && self.layouts[fl as usize].needs_drop
-            {
-                let ft = self.layouts[fl as usize].ty;
-                self.drop_at(ft, (p, off as i32))?;
-            }
-        }
-        Ok(())
     }
 
     // The function.
@@ -2689,7 +2641,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             {
                 let data = self.b.load(Ty::PTR, Flags::NONE, q, 0, MemAttrs::aligned(3));
                 let vt = self.b.load(Ty::PTR, Flags::NONE, q, 8, MemAttrs::aligned(3));
-                self.dyn_glue(data, vt);
+                self.dyn_glue(data, vt)?;
                 self.b.ret(&[]);
                 if let Some(error) = self.b.error() {
                     return Err(BuildError::Lir(error.clone()));
@@ -3140,7 +3092,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let t = self.checked.adjusts.column::<2>()[self.adjust_rows(e).start + n as usize];
                 let repr = self.repr_at(e, t)?;
                 if self.repr_needs_drop(repr) {
-                    return Err(unsupported(e, "a move out of a dereference whose type needs drop"));
+                    // A move out of a `Box`'s contents (walk/moves/boxes.rs); any other
+                    // dereference is refused there by name.
+                    let v = self.move_box_contents(e, n, at, repr)?;
+                    self.push_val(v, None);
+                    return Ok(());
                 }
                 let v = self.load(repr, at);
                 self.push_val(v, None);
@@ -3185,10 +3141,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let mark = self.scope_marks.pop().ok_or(malformed("a block's drop scope out of order"))? as usize;
                 let repr = self.expr_repr(e)?;
                 let v = self.settle(v, repr, mark)?;
-                for i in (mark..self.scope_pats.len()).rev() {
-                    let h = self.scope_pats[i];
-                    self.drop_held(h, true)?;
-                    if let Held::Pat(p) = h {
+                // Last declared first, each with its unwind ladder (walk/unwind_ladder.rs); each
+                // binding's own drop reads only its own `owned`, so they are cleared after.
+                self.drop_scope(mark, true)?;
+                for i in mark..self.scope_pats.len() {
+                    if let Held::Pat(p) = self.scope_pats[i] {
                         self.owned[p.ix()] = None;
                     }
                 }
@@ -3200,12 +3157,19 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Task::PushNone => self.push_val(V::None, None),
             Task::Let(p, init) => {
                 let v = self.pop()?;
+                // The same answer `stmt` had: `v` is the initializer's place (walk/matches/ref_bind.rs).
+                let borrows = match init {
+                    Some(e) => self.let_borrows_place(p, e)?,
+                    None => false,
+                };
                 let fresh = match (init, v, self.pat(p)?) {
+                    _ if borrows => None,
                     (Some(e), V::Place(at, off), Pat::Bind { .. }) if self.live && self.is_fresh(e)? => Some((at, off)),
                     _ => None,
                 };
                 match fresh {
                     Some(at) => self.bind_at(p, at)?,
+                    None if borrows => self.bind_let_place(p, v)?,
                     None => self.bind_value(p, v)?,
                 }
                 let from = self.scope_pats.len();
@@ -3368,8 +3332,14 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let v = self.pop()?;
                 let p = self.scalar(v, Ty::PTR)?;
                 let repr = self.expr_repr(e)?;
+                // A builtin `*` of a reference or raw pointer read as a value. Every place
+                // expression context (a scrutinee, a borrow's or field's operand, an assignment's
+                // left side, a `let` initializer bound by `ref`) builds `*p` by `Task::Place`; a
+                // `Box`'s `*` is the check's overloaded dereference (walk/moves/boxes.rs), never
+                // this task. So a needs-drop value here is a move out of a place behind a pointer,
+                // which the check refuses (E0507; the Reference, [expr.move.movable-place]).
                 if self.repr_needs_drop(repr) {
-                    return Err(unsupported(e, "a move out of a dereference whose type needs drop"));
+                    return Err(malformed("a move out of a dereference whose type needs drop, which the check refuses (E0507)"));
                 }
                 let v = self.load(repr, (p, 0));
                 self.push_val(v, None);
@@ -3650,10 +3620,20 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let AdjustKind::Deref { overloaded: Some(m) } = kinds[n] else {
             return Err(malformed("a deref call on an adjustment that is not an overloaded dereference"));
         };
+        let mut_after = kinds[n + 1..].iter().any(|k| matches!(k, AdjustKind::Borrow { mutbl: Mutbl::Mut, .. }));
+        let self_t = self.ty_before(e, n)?;
+        let target_t = self.checked.adjusts.column::<2>()[rows.start + n];
+        let g_self = self.ground_ty(self_t).map_err(|error| Self::ty_err(e, error))?;
+        let g_target = self.ground_ty(target_t).map_err(|error| Self::ty_err(e, error))?;
+        // A `Box`'s dereference is the builtin one (walk/moves/boxes.rs): alloc's
+        // `Deref::deref` for a box is `&**self`, which would call itself.
+        if self.box_arg(g_self).map_err(|error| Self::ty_err(e, error))?.is_some() {
+            return self.box_deref_builtin(e, m, g_self, g_target);
+        }
         // A place borrowed `&mut` through `Deref::deref` would be written through a shared
         // reference: the check must record `DerefMut` there (rustc's
         // `convert_place_derefs_to_mutable`), and the build never upgrades it on its own.
-        if m == Mutbl::Not && kinds[n + 1..].iter().any(|k| matches!(k, AdjustKind::Borrow { mutbl: Mutbl::Mut, .. })) {
+        if m == Mutbl::Not && mut_after {
             return Err(unsupported(e, "a `&mut` borrow through an overloaded dereference the check recorded as `Deref::deref`, not `DerefMut::deref_mut`"));
         }
         let name = match m {
@@ -3661,11 +3641,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Mutbl::Mut => "deref_mut",
         };
         let item = self.adts.deref_fn(m).ok_or(BuildError::NoLangFn { expr: Some(e), name })?;
-        let self_t = self.ty_before(e, n)?;
-        let target_t = self.checked.adjusts.column::<2>()[rows.start + n];
-        let g_self = self.ground_ty(self_t).map_err(|error| Self::ty_err(e, error))?;
-        let g_target = self.ground_ty(target_t).map_err(|error| Self::ty_err(e, error))?;
-        let g_arg = self.ground.intern(PNode::Ref(m, g_self)).map_err(|_| malformed("the ground table is full"))?;
+        let g_arg =self.ground.intern(PNode::Ref(m, g_self)).map_err(|_| malformed("the ground table is full"))?;
         let g_ret = self.ground.intern(PNode::Ref(m, g_target)).map_err(|_| malformed("the ground table is full"))?;
         let arepr = self.repr(g_arg).map_err(|error| Self::ty_err(e, error))?;
         if arepr != Repr::Ptr {
@@ -4004,29 +3980,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let list = self.body.expr_lists.get(args.range()).ok_or(malformed("a call's arguments past `expr_lists`"))?;
         let which = match which {
             Intrinsic::Table(which) => which,
-            // A target intrinsic (THREADS.md D1, intrinsics/target.rs): `fn(i32 imm)`, the
-            // immediate a constant (the library passes `arg::SY` and the like), no result.
-            Intrinsic::Target(t) => {
-                let &[arg] = list else {
-                    return Err(BuildError::Target { target: t, expr: Some(e), why: "a call of other than its one immediate argument" });
-                };
-                let base = self.vals.len().checked_sub(1).ok_or(malformed("an intrinsic's arguments missing from the value stack (a build bug)"))?;
-                let v = self.vals[base];
-                self.truncate_vals(base);
-                // After a diverging argument the call is unreachable: nothing to build.
-                if self.live {
-                    let at = self.adjusted_ty(arg)?;
-                    let repr = self.repr_at(arg, at)?;
-                    let ty = repr.scalar().ok_or(BuildError::Target { target: t, expr: Some(e), why: "an immediate that is not a scalar" })?;
-                    let imm = self.scalar(v, ty)?;
-                    intrinsics::target::build(&mut self.b, t, imm).map_err(|error| match error {
-                        BuildError::Target { target, why, .. } => BuildError::Target { target, expr: Some(e), why },
-                        other => other,
-                    })?;
-                }
-                self.push_val(V::None, None);
-                return Ok(());
-            }
+            // A target intrinsic (THREADS.md D1, INTRINSICS.md P7b): a barrier or hint, or a
+            // generic float function (walk/target_intr.rs).
+            Intrinsic::Target(t) => return self.target_intrinsic(e, list, t),
         };
         // No site is passed: a `#[track_caller]` location is not built.
         if which == Which::CallerLocation {
@@ -4045,6 +4001,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
         if which == Which::CatchUnwind {
             return self.catch_unwind(e, list.len());
+        }
+        // Decided here by `T`'s layout: nothing, or the `panic_nounwind` call (walk/validity.rs).
+        if let Some(check) = intrinsics::validity::Check::of(which) {
+            return self.validity_check(e, which, check, gl, list.len());
         }
         let mut generics = Vec::new_in(self.alloc.clone());
         let n_generics = self.ground.view().list(gl).map_err(|_| malformed("a list past the ground table"))?.len();
@@ -4488,7 +4448,14 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             Stmt::Let { pat, init: Some(init), else_: None, .. } => {
                 self.work.push(Task::Let(pat, Some(init)));
-                self.work.push(Task::Eval(init));
+                // `let ref x = <place>;`: a `let` initializer is a place expression context
+                // (the Reference, "Place Expressions and Value Expressions"): its place, not its
+                // value (walk/matches/ref_bind.rs).
+                if self.let_borrows_place(pat, init)? {
+                    self.work.push(Task::Place(init));
+                } else {
+                    self.work.push(Task::Eval(init));
+                }
             }
             Stmt::Let { pat, init: None, else_: None, .. } => {
                 if !matches!(self.pat(pat)?, Pat::Wild) {
@@ -5200,7 +5167,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         // A C-variadic callee: its declared count splits the arguments (walk/c_variadic.rs).
         let declared = self.adts.c_variadic(item).map(|d| d as usize);
         if declared.is_some() {
-            Self::c_variadic_abi(e, abi)?;
+            Self::c_variadic_abi(e, abi, self.adts.nounwind(item))?;
         }
         for (k, &a) in list.iter().enumerate() {
             let t = self.adjusted_ty(a)?;

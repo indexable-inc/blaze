@@ -86,7 +86,7 @@ impl LocalKind {
 
     /// The tag a key is derived with: the names library's (blaze-scope task/lower.rs
     /// `kind_tag`), so a local item's key is made as a module item's is.
-    fn tag(self) -> &'static str {
+    pub(super) fn tag(self) -> &'static str {
         match self {
             LocalKind::Fn => "Function",
             LocalKind::Const => "Const",
@@ -287,12 +287,6 @@ pub struct Locals<'n> {
     foreign: HashMap<ItemKey, LocalForeign<'n>, &'n Frame>,
 }
 
-/// The `n`th hex digit of `k`, most significant first.
-fn hex_digit(k: u128, n: usize) -> u8 {
-    let d = ((k >> (124 - 4 * n)) & 0xf) as u8;
-    if d < 10 { b'0' + d } else { b'a' + d - 10 }
-}
-
 impl<'n> Locals<'n> {
     pub fn new(frame: &'n Frame) -> Locals<'n> {
         Locals { frame, bodies: HashMap::new_in(frame), heads: HashMap::new_in(frame), foreign: HashMap::new_in(frame) }
@@ -331,12 +325,7 @@ impl<'n> Locals<'n> {
     /// The key every local item of `at`'s body is derived under: the body's own, by its
     /// item and its checker key (a member's body is not its container's).
     fn parent(crate_key: blaze_id::CrateItemKey, at: Enclosing<'_>) -> LibKey {
-        let mut hex = [0u8; 32];
-        for (n, b) in hex.iter_mut().enumerate() {
-            *b = hex_digit(at.owner.0, n);
-        }
-        let name = core::str::from_utf8(&hex).unwrap_or("");
-        blaze_scope::task::key_of(crate_key, at.item, "Body", name, 0)
+        super::nested_exports::body_key(crate_key, at.item, at.owner)
     }
 
     /// Keeps the local items of the body `at` lowered to `view`, once per body: their rows in
@@ -450,10 +439,9 @@ impl<'n> Locals<'n> {
                             None => range,
                         };
                         let ordinal = rows.iter().filter(|r| r.kind == kind && r.name == d.name).count() as u32;
-                        let mut key = blaze_scope::task::key_of(crate_key, parent, kind.tag(), d.name, ordinal);
-                        key.0.0[8] |= LibKey::INNER;
+                        let key = super::nested_exports::local_key(crate_key, parent, kind.tag(), d.name, ordinal);
                         rows.push(Row { scope: s as u32, kind, name: d.name, key, range, path: &[], abs: false, module: None });
-                        let ck = keys.item(key).map_err(HeadError::Key)?;
+                        let ck = keys.local(key, kind).map_err(HeadError::Key)?;
                         self.heads.insert(ck, LocalHead { lib: key, kind, text: d.text, module: at.module, enclosing: at.owner, scope: s as u32, range });
                         self.foreign.insert(ck, LocalForeign { kind: d.kind, abi, safe: d.safe });
                     }
@@ -506,10 +494,9 @@ impl<'n> Locals<'n> {
                 // was checked first).
                 let last = rows.len() - 1;
                 let ordinal = rows[..last].iter().filter(|r| r.kind == kind && r.name == name).count() as u32;
-                let mut key = blaze_scope::task::key_of(crate_key, parent, kind.tag(), name, ordinal);
-                key.0.0[8] |= LibKey::INNER;
+                let key = super::nested_exports::local_key(crate_key, parent, kind.tag(), name, ordinal);
                 rows[last].key = key;
-                let ck = keys.item(key).map_err(HeadError::Key)?;
+                let ck = keys.local(key, kind).map_err(HeadError::Key)?;
                 self.heads.insert(ck, LocalHead { lib: key, kind, text, module: at.module, enclosing: at.owner, scope: s as u32, range });
             }
         }

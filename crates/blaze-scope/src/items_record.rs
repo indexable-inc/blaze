@@ -55,8 +55,10 @@ const MAGIC: [u8; 4] = *b"BZIT";
 /// version-2 record is refused the same way. 4: the variant table ([`variants`]) and the bucket
 /// index ([`buckets`]), added after them; a version-3 record is refused the same way. 5: a file
 /// row's path is its [`PackagePath`] (D96), never the caller's `/<tree>/...`; a version-4
-/// record is refused the same way.
-const VERSION: u32 = 5;
+/// record is refused the same way. 6: a built-in derive is its own body kind
+/// ([`BODY_BUILTIN_DERIVE`], its helpers in the strings: names-attr-4); a version-5 record is
+/// refused the same way.
+const VERSION: u32 = 6;
 const ALIGN: usize = 16;
 const HEADER: usize = 256;
 const KEYS_AT: usize = 160;
@@ -137,6 +139,7 @@ const BODY_MACRO2: u8 = 1;
 const BODY_BUILTIN_FN: u8 = 2;
 const BODY_BUILTIN_OTHER: u8 = 3;
 const BODY_PROC: u8 = 4;
+const BODY_BUILTIN_DERIVE: u8 = 5;
 
 /// The digest domain of an expansion's text (a file's is its `SourceFile::id`).
 const EXPANSION_DOMAIN: &str = "blaze-scope expansion text 1";
@@ -756,6 +759,7 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
             MacroBody::BuiltinFn(name) => ((NONE, 0, 0), strings.put(name)?, BODY_BUILTIN_FN, 0),
             MacroBody::BuiltinOther(shape) => ((NONE, 0, 0), (0, 0), BODY_BUILTIN_OTHER, shape.byte()),
             MacroBody::Proc { kind, helpers } => ((NONE, 0, 0), strings.put(helpers)?, BODY_PROC, kind.byte()),
+            MacroBody::BuiltinDerive { helpers } => ((NONE, 0, 0), strings.put(helpers)?, BODY_BUILTIN_DERIVE, 0),
         };
         macro_rows.extend_from_slice(&key.0.0);
         for n in [module_at(m.module)?, name.0, name.1, body.0, body.1, body.2, second.0, second.1] {
@@ -992,6 +996,7 @@ pub enum MacroBodyAt<'a> {
     BuiltinFn(&'a str),
     BuiltinOther(CallShape),
     Proc { kind: ProcKind, helpers: &'a str },
+    BuiltinDerive { helpers: &'a str },
 }
 
 /// A macro definition: [`MacroSrc`] with its body's place for its text.
@@ -1446,6 +1451,7 @@ impl<'a> ItemsRecord<'a> {
                 kind: ProcKind::from_byte(sub).ok_or(ItemsRecordError::Byte { what: "a proc macro kind", byte: sub })?,
                 helpers: self.str_at("a proc macro's helpers", second_at, second_len)?,
             },
+            BODY_BUILTIN_DERIVE => MacroBodyAt::BuiltinDerive { helpers: self.str_at("a builtin derive's helpers", second_at, second_len)? },
             other => return Err(ItemsRecordError::Byte { what: "a macro body kind", byte: other }),
         };
         Ok(Some(MacroRow {
@@ -1475,6 +1481,7 @@ impl<'a> ItemsRecord<'a> {
             MacroBodyAt::BuiltinFn(name) => MacroBody::BuiltinFn(name),
             MacroBodyAt::BuiltinOther(shape) => MacroBody::BuiltinOther(shape),
             MacroBodyAt::Proc { kind, helpers } => MacroBody::Proc { kind, helpers },
+            MacroBodyAt::BuiltinDerive { helpers } => MacroBody::BuiltinDerive { helpers },
         };
         Ok(Some(MacroSrc { name: row.name, body, module: row.module, export: row.export, local_inner: row.local_inner }))
     }

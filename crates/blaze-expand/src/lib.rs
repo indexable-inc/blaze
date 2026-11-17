@@ -84,6 +84,7 @@ mod derive;
 mod error;
 mod expand;
 mod expansion;
+mod failed;
 mod item;
 pub mod kept;
 pub mod kept_set;
@@ -116,6 +117,7 @@ pub use crate::{
         LocalInner, MacroContent, MacroDefinition, MacroKind, ProcKind,
     },
     error::{ExpandError, LexError, RulesLimit, Stream, StreamError, Table, Unbuilt},
+    failed::Failed,
     expand::{Prepared, expand, expand_prepared, prepare},
     expansion::{
         Diagnostic, Expanded, Expansion, Held, Hole, HoleOf, IncludeFailure, NestedCall, NestedKind,

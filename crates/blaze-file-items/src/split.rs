@@ -590,6 +590,10 @@ impl<'o, 'a> Assembled<'o, 'a> {
             messages: Vec::new_in(alloc),
             keys: Vec::new_in(alloc),
             names: Vec::with_capacity_in(self.len(), alloc),
+            file_names: self
+                .parts
+                .first()
+                .map_or_else(|| crate::names_digest::file_names_digest("", &[]), |part| part.outline.file_names),
             own_flags: self.parts.first().map_or(ItemFlags::NONE, |part| part.outline.own_flags),
             flags: self.flags,
         };

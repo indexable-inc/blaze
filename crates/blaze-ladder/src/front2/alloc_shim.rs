@@ -85,7 +85,7 @@
 
 use blaze_lower::head;
 use blaze_own::Alloc;
-use blaze_scope::resolve::Names;
+use super::source::NamesSource;
 use blaze_typeck::ItemKey;
 use std::boxed::Box;
 use std::format;
@@ -159,6 +159,9 @@ pub enum Refused {
     OwnAllocator { shim: Shim, static_path: Box<str> },
     /// The default's key is another item's in the key map.
     KeyClash { shim: Shim },
+    /// The names source did not answer a fact the declaration needs (its crate's cfg or
+    /// edition, or whether an `extern` block declares it): the error is in the source's log.
+    Unanswered { shim: Shim },
 }
 
 impl Refused {
@@ -174,13 +177,14 @@ impl Refused {
                 "a program with its own `#[global_allocator]` static: the built-in attribute's expansion (the `__rust_*` fns calling its `GlobalAlloc` methods) is not built by blaze yet"
             }
             Refused::KeyClash { .. } => "the default allocator fn's key is another item's in the key map",
+            Refused::Unanswered { .. } => "an allocator declaration (`extern \"Rust\"` `__rust_*`) about which the names records did not answer (the error is in the source's log)",
         }
     }
 
     /// The whole refusal: the class, the declaration and what it names.
     pub fn detail(&self) -> Box<str> {
         let (shim, extra) = match self {
-            Refused::Attrs { shim } | Refused::KeyClash { shim } => (*shim, Box::<str>::from("")),
+            Refused::Attrs { shim } | Refused::KeyClash { shim } | Refused::Unanswered { shim } => (*shim, Box::<str>::from("")),
             Refused::NoDefault { shim } | Refused::DefaultTwice { shim } => (*shim, format!(" (`{}`)", shim.default_fn().unwrap_or("")).into_boxed_str()),
             Refused::OwnAllocator { shim, static_path } => (*shim, format!(" (the static `{static_path}`)").into_boxed_str()),
         };
@@ -198,20 +202,22 @@ impl core::fmt::Display for Refused {
 /// named one of [`Shim::ALL`]'s symbols with no `#[link_name]` naming another. `Ok(None)` for
 /// every other item (a fn of an `extern "C"` block named so is a C symbol like any other).
 /// `alloc` holds the signature's lowering, dropped on return.
-pub fn declares(names: &Names<'_>, store: &Store<'_>, key: ItemKey, alloc: Alloc<'_>) -> Result<Option<Shim>, Refused> {
+pub fn declares<'n, S: NamesSource<'n>>(names: S, store: &Store<'_>, key: ItemKey, alloc: Alloc<'_>) -> Result<Option<Shim>, Refused> {
     let Some(h) = store.fns.get(&key) else { return Ok(None) };
     if h.has_body || h.container.is_some() {
         return Ok(None);
     }
-    let Some(shim) = names.item_text(h.lib).and_then(|t| t.name).and_then(Shim::of_symbol) else { return Ok(None) };
-    let (_, abi) = super::program::placed(names, h.lib);
+    let Some(shim) = names.name_of(h.lib).and_then(Shim::of_symbol) else { return Ok(None) };
+    let unanswered = || Refused::Unanswered { shim };
+    let (_, abi) = super::program::placed(names, h.lib).map_err(|_| unanswered())?;
     if abi != Some("Rust") {
         return Ok(None);
     }
     let refuse = || Refused::Attrs { shim };
     let krate = names.crate_of(h.lib).ok_or_else(refuse)?;
-    let atoms = names.krate(krate).cfg.atoms();
-    let sig = blaze_lower::lower_signature(h.text, names.edition(krate), &mut CrateCfg(atoms), alloc).map_err(|_| refuse())?;
+    let atoms = names.cfg_atoms(krate).ok_or_else(unanswered)?;
+    let edition = names.edition_of(krate).ok_or_else(unanswered)?;
+    let sig = blaze_lower::lower_signature(h.text, edition, &mut CrateCfg(atoms), alloc).map_err(|_| refuse())?;
     let v = sig.view();
     for &n in v.rows(v.list(head::ATTRS)).map_err(|_| refuse())? {
         let a = v.attr(n).map_err(|_| refuse())?;
@@ -226,46 +232,52 @@ pub fn declares(names: &Names<'_>, store: &Store<'_>, key: ItemKey, alloc: Alloc
 }
 
 /// The item's path in the names library (`crate::module::Name`), for a refusal.
-fn path_of(names: &Names<'_>, lib: LibKey) -> Box<str> {
-    let name = names.item_text(lib).and_then(|t| t.name).unwrap_or("_");
-    let module = names.crate_of(lib).zip(names.module_of(lib)).and_then(|(k, m)| names.krate(k).path_of(m));
-    match module {
+fn path_of<'n, S: NamesSource<'n>>(names: S, lib: LibKey) -> Box<str> {
+    let name = names.name_of(lib).unwrap_or("_");
+    match names.home_of(lib).and_then(|m| names.module_path(m)) {
         Some(m) => format!("{m}::{name}").into_boxed_str(),
         None => Box::from(name),
     }
 }
 
-/// Whether `lib` is a fn item (its outline's kind).
-fn is_fn(names: &Names<'_>, lib: LibKey) -> bool {
-    use blaze_surface::ItemDetail;
-    let Some(p) = names.place(lib) else { return false };
-    let Some((_, outline)) = names.outline_at(p.krate, p.at) else { return false };
-    matches!(outline.item(p.item).detail, ItemDetail::Fn { .. })
-}
-
 /// The one fn of the graph named `name` (a proc-macro unit's items are never linked into the
 /// program and are skipped, as the index skips them).
-fn default_named(names: &Names<'_>, shim: Shim, name: &str) -> Result<LibKey, Refused> {
+///
+/// Over records this reads every crate's item rows (`each_item`: rows, no text): the default
+/// lives in a crate the calling body need not name (std's `__rdl_*` for alloc's `__rust_*`).
+/// Asked only for a body that calls an allocator declaration, once per declaration. The end
+/// form is a per-crate table of `#[rustc_std_internal_symbol]` fns by name in the items record
+/// (the notes, "## Piece Z", item 1, asked of NAMES runner 20).
+fn default_named<'n, S: NamesSource<'n>>(names: S, shim: Shim, name: &str) -> Result<LibKey, Refused> {
     let mut found: Option<LibKey> = None;
-    for (krate, c) in names.crates().iter().enumerate() {
-        if c.implicit.proc_macro {
-            continue;
+    let mut twice = false;
+    for krate in 0..names.crate_count() {
+        match names.proc_macro(krate) {
+            Some(true) => continue,
+            Some(false) => {}
+            None => return Err(Refused::Unanswered { shim }),
         }
-        for (key, _, _) in names.items(krate) {
-            if names.item_text(key).and_then(|t| t.name) != Some(name) || !is_fn(names, key) {
-                continue;
+        let read = names.each_item(krate, &mut |key, _| {
+            if names.name_of(key) != Some(name) || names.kind_of_item(key) != Some(blaze_surface::ItemKind::Function) {
+                return;
             }
             if found.is_some_and(|f| f != key) {
-                return Err(Refused::DefaultTwice { shim });
+                twice = true;
             }
             found = Some(key);
+        });
+        if !read {
+            return Err(Refused::Unanswered { shim });
+        }
+        if twice {
+            return Err(Refused::DefaultTwice { shim });
         }
     }
     found.ok_or(Refused::NoDefault { shim })
 }
 
 /// The fn a call of the declaration `shim` runs: its default, or the refusal.
-fn target(names: &Names<'_>, index: &Index<'_>, shim: Shim) -> Result<Option<LibKey>, Refused> {
+fn target<'n, S: NamesSource<'n>>(names: S, index: &Index<'_>, shim: Shim) -> Result<Option<LibKey>, Refused> {
     if let Some(own) = index.lang(OWN_ALLOCATOR_ROW) {
         return Err(Refused::OwnAllocator { shim, static_path: path_of(names, own) });
     }
@@ -278,7 +290,7 @@ fn target(names: &Names<'_>, index: &Index<'_>, shim: Shim) -> Result<Option<Lib
 /// The fn a call of `item` runs, when `item` is an allocator declaration with a default
 /// (not generic: no arguments). `None` for every other item, the marker, and a declaration
 /// [`reached`] refused (it is then in no table, and its caller is refused with that cause).
-pub fn bound(names: &Names<'_>, index: &Index<'_>, store: &Store<'_>, item: ItemKey, alloc: Alloc<'_>) -> Option<ItemKey> {
+pub fn bound<'n, S: NamesSource<'n>>(names: S, index: &Index<'_>, store: &Store<'_>, item: ItemKey, alloc: Alloc<'_>) -> Option<ItemKey> {
     match declares(names, store, item, alloc) {
         Ok(Some(shim)) => target(names, index, shim).ok().flatten().map(checker_of),
         Ok(None) | Err(_) => None,

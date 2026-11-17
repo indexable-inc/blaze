@@ -127,6 +127,8 @@ mod chunks;
 mod compact;
 /// Who made each record of a pack (pack format 3), and an old pack's refusal by name.
 mod producers;
+/// The store on blaze-cas's plain store (D114 (b)): `Maps` lends records in place.
+pub(crate) mod plain_place;
 pub use producers::PackError;
 use blaze_own::alloc_ref::SharedAlloc;
 /// The store at a real home's size: what a get reads, what a repeated command writes, the

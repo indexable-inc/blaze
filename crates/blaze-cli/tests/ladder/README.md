@@ -292,9 +292,12 @@ and the real bstd (`blaze-std`) as a path dependency. Between 7c and that:
 2. All of bstd's own code through the new front end: `core` and `alloc` beneath it (rung 8 and
    up), `fmt::Display` and `format_args!` (bstd's `Out::line` takes `impl Display`), closures,
    `impl Trait` arguments, statics.
-3. bstd's entry: the edition's `main(cx: &Cx, io: Io) -> Result<(), Error>` becomes the C entry
-   bstd's `main` macro makes, which builds the `Cx` and `Io` (7c writes this entry out by hand).
-4. The edition's prelude: `Cx`, `Io`, `Error`, `Result`, `Ok` in scope with no `use`.
+3. bstd's entry: the edition's `main(cx: &Cx, out: Out) -> Result<(), Error>` (D104: `main`
+   names each grant it uses; a whole `Io` cannot be asked for) becomes the C entry bstd's
+   `main` macro makes, which builds the `Cx` and each grant (7c writes an older entry, taking
+   its own `Io`, out by hand).
+4. The edition's prelude: `Cx`, the grant types (`Out`, `Args`, `Clock`, `Dir`, ...), `Error`,
+   `Result`, `Ok` in scope with no `use`.
 
 ## Where the skeleton shortcuts the design (a list that shrinks)
 

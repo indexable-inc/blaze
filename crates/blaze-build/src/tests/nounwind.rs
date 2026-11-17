@@ -60,7 +60,7 @@ fn words(line: &str) -> impl Iterator<Item = &str> + '_ {
 }
 
 /// Under `Unwind`, `extern "C" fn main() { f(); }` (and the same with a live `G` local) has
-/// exactly one `invoke` (for `f()`), whose unwind block is the one `terminate` block; that
+/// one `invoke` for `f()`, and with the local one for its drop, whose unwind block is the one `terminate` block; that
 /// block makes one call, of `panic_cannot_unwind`, and ends in `unreachable`; no `cleanup`
 /// block is built (no destructor runs: [items.fn.extern.abort]); the function's header says
 /// `nounwind`. Under `Abort` the call is plain (no invoke, no landing block). A Rust fn's call
@@ -78,7 +78,8 @@ fn an_extern_c_bodys_call_lands_on_terminate() {
             v.extend(text.lines().filter(|l| words(l).any(|w| w == "invoke")));
             v
         };
-        assert_eq!(invokes.len(), 1, "one invoke, for f() (local {local}):\n{text}");
+        // With the local, its drop at the block's end lands on terminate too (walk/unwind_ladder.rs `drop_call`).
+        assert_eq!(invokes.len(), 1 + usize::from(local), "f()'s invoke, and a's drop's (local {local}):\n{text}");
         assert!(!text.lines().any(|l| l.ends_with(" cleanup:")), "no cleanup in a nounwind body (local {local}):\n{text}");
         let terminates: Vec<&str, Global> = {
             let mut v = Vec::new_in(Global);
@@ -87,7 +88,7 @@ fn an_extern_c_bodys_call_lands_on_terminate() {
         };
         assert_eq!(terminates.len(), 1, "one terminate block (local {local}):\n{text}");
         let name = terminates[0].split(' ').next().unwrap_or("");
-        assert!(words(invokes[0]).any(|w| w == name), "the invoke's unwind edge is {name} (local {local}):\n{text}");
+        assert!(invokes.iter().all(|i| words(i).any(|w| w == name)), "every invoke's unwind edge is {name} (local {local}):\n{text}");
         let body: Vec<&str, Global> = {
             let mut v = Vec::new_in(Global);
             v.extend(text.lines().skip_while(|l| !l.ends_with(" terminate:")).skip(1).take_while(|l| l.starts_with("  ")));

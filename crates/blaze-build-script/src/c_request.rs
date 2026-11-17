@@ -5,27 +5,26 @@
 //! those texts a [`SpawnRequest`] for the deterministic sandbox: the program is replaced by the
 //! pinned tool (`clang` for `cc`/`clang`/`gcc`, `clang++` for `c++`/`clang++`/`g++`, `llvm-ar`
 //! for `ar`; any other C tool only by a pinned tool of its own name), the arguments are kept in
-//! order, the package tree (at `/workspace`) and the SDK are the reads, `/out` is the one
+//! order, the package tree (at its mount: `/package` for a dependency, `/workspace` for a
+//! member, decision D96) and the SDK are the reads, `/out` is the one
 //! writable folder, and the environment is `fixed_env` and nothing else (cc's environment is in
 //! its arguments). The text stays the record; the request is derived from it, so the layout does
 //! not change, and two derivations of one text give one key.
 //!
 //! An argument naming a path outside the guest's view (anything absolute not under
-//! `/workspace`, `/out` or the sysroot's guest path, or climbing out of one with `..`) is refused
+//! the tree's mount, `/out` or the sysroot's guest path, or climbing out of one with `..`) is refused
 //! by name ([`CRequestError::HostPath`]): the `-ffile-prefix-map` rule of build-scripts.md "The
 //! record" should have mapped it already, and a host path in a key would make the key the
 //! machine's (rule 25).
 
 #![blaze::sans_io]
 
+use blaze_expand::seen::SeenRoot;
 use blaze_ids::ContentId;
 use blaze_own::{AString, AVec, Alloc, String, Vec};
 use blaze_spawn::{Input, MACHINE_V1, Personality, RequestError, SpawnRequest, Tool};
 
 use crate::probe::is_c_tool;
-
-/// The guest path of the package tree.
-pub const WORKSPACE: &str = "/workspace";
 /// The guest path of `OUT_DIR`, the one writable folder.
 pub const OUT: &str = "/out";
 
@@ -37,7 +36,9 @@ pub struct CContext<'c> {
     pub clang: Tool<'c>,
     /// Every other pinned tool (`clang++`, `llvm-ar`, and what the program may start), by name.
     pub tools: &'c [Tool<'c>],
-    /// The package's source tree, seen at [`WORKSPACE`].
+    /// What the script sees as its root: the package tree is served at its `mount()` (D96).
+    pub seen: SeenRoot<'c>,
+    /// The package's source tree (a member's: its workspace), served at `seen.mount()`.
     pub package_tree: ContentId,
     /// The SDK, at its guest path.
     pub sysroot: Input<'c>,
@@ -89,7 +90,7 @@ pub enum CRequestError {
     NotCTool { program: ArgAt },
     /// A C toolchain program with no pinned tool for it in the context.
     ToolNotPinned { program: ArgAt },
-    /// An argument naming a path outside `/workspace`, `/out` and the sysroot's guest path.
+    /// An argument naming a path outside the tree's mount, `/out` and the sysroot's guest path.
     HostPath { arg: ArgAt },
     /// The spawn request itself was refused by `SpawnRequest::new`.
     Request(RequestRule),
@@ -121,7 +122,7 @@ impl core::fmt::Display for Shown<'_> {
             }
             CRequestError::HostPath { arg } => write!(
                 f,
-                "argument {} `{}` names a path outside /workspace, /out and the sysroot: a host path in a spawn \
+                "argument {} `{}` names a path outside the package tree's mount, /out and the sysroot: a host path in a spawn \
                  request makes its key the machine's (rule 25; the -ffile-prefix-map rule should have mapped it)",
                 arg.index,
                 text(arg)
@@ -177,8 +178,8 @@ fn under(path: &str, root: &str) -> bool {
 /// Whether every absolute path in `arg` is inside the guest's view: the whole argument, the
 /// path joined to a [`JOINED`] flag, and each `=`-separated part (`--sysroot=/x`,
 /// `-ffile-prefix-map=/a=/b`).
-fn in_view(arg: &str, sysroot: &str) -> bool {
-    let ok = |path: &str| !path.starts_with('/') || under(path, WORKSPACE) || under(path, OUT) || under(path, sysroot);
+fn in_view(arg: &str, mount: &str, sysroot: &str) -> bool {
+    let ok = |path: &str| !path.starts_with('/') || under(path, mount) || under(path, OUT) || under(path, sysroot);
     if !ok(arg) {
         return false;
     }
@@ -224,7 +225,7 @@ pub fn to_spawn<'a>(argv_nul: &str, at: &CContext<'_>, alloc: Alloc<'a>) -> Resu
             program = Some((place, text));
             continue;
         }
-        if !in_view(text, sysroot) {
+        if !in_view(text, at.seen.mount(), sysroot) {
             return Err(CRequestError::HostPath { arg: place });
         }
         args.push(own(text, alloc));
@@ -242,7 +243,7 @@ pub fn to_spawn<'a>(argv_nul: &str, at: &CContext<'_>, alloc: Alloc<'a>) -> Resu
     let mut tools: AVec<'a, Tool<'a>> = Vec::new_in(alloc);
     at.tools.iter().for_each(|tool| tools.push(own_tool(tool, alloc)));
     let mut reads: AVec<'a, Input<'a>> = Vec::new_in(alloc);
-    reads.push(Input::Tree { path: own(WORKSPACE, alloc), digest: at.package_tree });
+    reads.push(Input::Tree { path: own(at.seen.mount(), alloc), digest: at.package_tree });
     reads.push(own_input(&at.sysroot, alloc));
     let mut writes: AVec<'a, AString<'a>> = Vec::new_in(alloc);
     writes.push(own(OUT, alloc));

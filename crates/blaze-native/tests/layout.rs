@@ -130,8 +130,8 @@ fn adrp_add_resolved() {
     let image = laid(&p);
     let (text, _) = at(&image, Region::Text);
     let (data, _) = at(&image, Region::Data);
-    // The descriptor (32 bytes) is Data's first item; the section follows at 8-byte alignment.
-    let target = data + 32 + 0x10;
+    // The descriptor (48 bytes, BNL2) is Data's first item; the section follows at 8-byte alignment.
+    let target = data + 48 + 0x10;
     assert_eq!(adrp_page(word(&image, text), text), target & !0xfff);
     assert_eq!(imm12(word(&image, text + 4)), target & 0xfff);
     assert_ne!(target & !0xfff, text & !0xfff, "the test wants a nonzero page delta");
@@ -196,7 +196,8 @@ fn init_pointers_land_in_inits_region() {
     assert!(image.fixups.contains(&Fixup { at: inits, to: FixTo::Rebase { target: text } }));
     assert_eq!(image.descriptor_at, data, "the descriptor is Data's first item");
     let d = image.descriptor_at;
-    assert_eq!((word(&image, d), word(&image, d + 4), word(&image, d + 8)), (0x424e_4c31, 0, 1));
+    // BNL2 (descriptor.rs): tag, words, inits, pointer rows.
+    assert_eq!((word(&image, d), word(&image, d + 4), word(&image, d + 8), word(&image, d + 12)), (0x424e_4c32, 0, 1, 0));
     assert_eq!(dword(&image, d + 24), inits);
     assert!(image.exports.iter().any(|e| *e == (&b"___blaze_native_v1"[..], d)));
     println!("init_pointers_land_in_inits_region: 1 init at {inits:#x}, descriptor at {d:#x}");

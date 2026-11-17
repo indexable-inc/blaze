@@ -54,5 +54,18 @@ fn refused(error: RecordEmitError) -> TierError {
         RecordEmitError::CAddend { of: _, addend: _ } => {
             TierError::Refused { tier: TIER, inst: None, what: "data holding a C name's address plus an addend" }
         }
+        RecordEmitError::Legalize(why) => match why {
+            blaze_lir::legalize::LegalizeError::Refused { inst, op: _, what } => {
+                TierError::Refused { tier: TIER, inst: Some(inst as u32), what }
+            }
+            blaze_lir::legalize::LegalizeError::NoRoutine(_) => {
+                TierError::Refused { tier: TIER, inst: None, what: "an `f128` operation whose compiler_builtins routine is not bound (INTRINSICS.md P5b)" }
+            }
+            blaze_lir::legalize::LegalizeError::Scalable => TierError::Refused { tier: TIER, inst: None, what: "a scalable vector" },
+            blaze_lir::legalize::LegalizeError::Full { table } => TierError::TooLarge { tier: TIER, what: table },
+            blaze_lir::legalize::LegalizeError::Verify(_) => {
+                TierError::Refused { tier: TIER, inst: None, what: "legalize's output does not verify (a bug of blaze-lir's legalize)" }
+            }
+        },
     }
 }

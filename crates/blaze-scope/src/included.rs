@@ -17,7 +17,7 @@
 //! `mod y { mod z; }` in the included file then looks under that folder's `y/`, as in any file.
 
 use blaze_expand::seen::SeenRoot;
-use blaze_expand::{ReadAnswer, ReadKind, ReadRoot, Reads, SourceOrigin, include_target};
+use blaze_expand::{ReadAnswer, ReadKind, Reads};
 use blaze_own::{AString, Alloc};
 
 /// The absolute path of the file an `include!` written in the file `calling` (absolute, under
@@ -28,23 +28,12 @@ use blaze_own::{AString, Alloc};
 /// `env!("CARGO_MANIFEST_DIR")` gives) is the package's file at the rest of the path; any other
 /// absolute path names the machine and is outside. `None` when the calling file is not under
 /// the package or the path leaves it (the texts hold the package alone).
+///
+/// Decision D111 (amending D60): a workspace member's include may read under the workspace
+/// root, a dependency's only under its package: [`crate::include_place::include_place`], the
+/// one home of the rule; this is its path alone.
 pub fn included_file<'a>(package: &str, seen: Option<SeenRoot<'_>>, calling: &str, written: &str, alloc: Alloc<'a>) -> Option<AString<'a>> {
-    let (folder, written) = match seen.and_then(|seen| seen.under(written)) {
-        Some(rest) => ("", rest),
-        None => {
-            let folder = calling.rsplit_once('/').map_or("", |(dir, _)| dir);
-            (folder.strip_prefix(package.trim_end_matches('/'))?, written)
-        }
-    };
-    let root = ReadRoot { origin: SourceOrigin::Package, package: "" };
-    let target = include_target(root, folder, written, alloc).ok()?;
-    let mut path = AString::new_in(alloc);
-    path.push_str(package.trim_end_matches('/'));
-    for segment in target.iter() {
-        path.push('/');
-        path.push_str(segment);
-    }
-    Some(path)
+    crate::include_place::include_place(package, seen, calling, written, alloc).map(|place| place.path)
 }
 
 /// The folder of the file one `include!` call read, from the call's own read list: the one

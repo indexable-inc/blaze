@@ -279,14 +279,14 @@ fn library_of(tc: &'static Toolchain, edition: &str) -> Result<&'static Library<
 
 /// One program built and run over `library` (IN A CHILD: see the module doc): `run_with`'s
 /// stages, the names resolved for the program's crate alone.
-fn run_over(library: &'static Library<'static>, views: &[SourceFile<'_>], new: NewFront<'_>) -> Result<u8, RunError> {
+fn run_over(library: &'static Library<'static>, views: &[SourceFile<'_>], new: NewFront<'_>, alloc: blaze_own::SharedAlloc<'static>) -> Result<u8, RunError> {
     let texts = kept(ProgramTexts::new(views, x::ROOT, new, library.toolchain())?);
     let user: &'static UserCrate<'static> = kept(texts.user());
     let inputs: &'static Inputs<'static> = kept(library.inputs_for(user));
     let crates = inputs.crates();
     let names = library.names(inputs, &crates).map_err(|e| RunError::Names { shown: format!("{e}").into_boxed_str() })?;
     let built = build_over(&names, views, texts)?;
-    run_built(built, None)
+    run_built(built, None, alloc)
 }
 
 #[cfg(target_os = "macos")]
@@ -311,7 +311,7 @@ fn threaded() -> bool {
     threads.trim() != "1"
 }
 
-fn run() -> Result<i32, Stop> {
+fn run(heap: &'static blaze_own::Heap) -> Result<i32, Stop> {
     let mut args = std::env::args().skip(1);
     let (Some(ladder), Some(out)) = (args.next(), args.next()) else { return Err(Stop::Usage) };
     let prefix = args.next().filter(|p| p != "-").unwrap_or_default();
@@ -321,7 +321,9 @@ fn run() -> Result<i32, Stop> {
     };
     let out = PathBuf::from(out);
     let front2 = Path::new(&ladder).join("front2");
-    let names: Vec<String> = x::x_rungs(&front2).into_iter().filter(|n| n.starts_with(&prefix)).collect();
+    // A prefix starting with `s` asks for the std rungs (`s<digit>-*`), the std census's.
+    let listed = if prefix.starts_with('s') { x::std_rungs(&front2) } else { x::x_rungs(&front2) };
+    let names: Vec<String> = listed.into_iter().filter(|n| n.starts_with(&prefix)).collect();
     let out_error = |error| Stop::Out { path: out.clone(), error };
     let first = format!("FRONT2 X RUNGS: started, {} rungs, {secs} s each at most", names.len());
     println!("{first}");
@@ -337,7 +339,10 @@ fn run() -> Result<i32, Stop> {
     // selected rung on the shelf has.
     let shelf = x::shelf();
     let mut libraries: Vec<(String, &'static Library<'static>)> = Vec::new();
-    let mut editions: Vec<String> = names.iter().map(|n| x::edition_of(&front2.join(n))).filter(|e| x::on_shelf(e)).collect();
+    // The std census (`s` prefix): a std rung is a Rust-edition program over the real `std`, so
+    // every selected rung builds against the shelf, whatever its edition.
+    let std_census = prefix.starts_with('s');
+    let mut editions: Vec<String> = names.iter().map(|n| x::edition_of(&front2.join(n))).filter(|e| std_census || x::on_shelf(e)).collect();
     editions.sort();
     editions.dedup();
     if !editions.is_empty() {
@@ -359,10 +364,13 @@ fn run() -> Result<i32, Stop> {
 
     let mut rung = |name: &str| -> (&'static str, String) {
         let dir = front2.join(name);
-        let verdict = x::run_one(&dir, Some(shelf.as_str()), |views, new| match libraries.iter().find(|(e, _)| e == new.edition) {
-            Some((_, library)) if new.shelf.is_some() => run_over(*library, views, new),
+        let verdict = x::run_one(&dir, Some(shelf.as_str()), |views, new| {
+            let new = if std_census { NewFront { shelf: Some(shelf.as_str()), ..new } } else { new };
+            match libraries.iter().find(|(e, _)| e == new.edition) {
+            Some((_, library)) if new.shelf.is_some() => run_over(*library, views, new, heap.shared()),
             // A `no_core` twin: no toolchain crate, nothing shared.
-            _ => run_with(views, x::ROOT, None, FrontChoice::New(new)),
+            _ => run_with(views, x::ROOT, None, FrontChoice::New(new), heap.shared()),
+            }
         });
         x::verdict_line(&dir, verdict)
     };
@@ -371,7 +379,7 @@ fn run() -> Result<i32, Stop> {
 }
 
 fn main() {
-    match run() {
+    match run(blaze_own::Heap::process()) {
         Ok(status) => std::process::exit(status),
         Err(stop) => {
             eprintln!("front2_rungs: {stop}");

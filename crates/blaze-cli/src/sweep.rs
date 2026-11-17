@@ -135,6 +135,20 @@ pub enum LeafKind {
     /// graph's source move when a module comes or goes, and a `MacroModule` lookup that found
     /// none is a filed failure asked again only then ([`read_home_listing`]).
     HomeListing = 3,
+    /// A workspace member proc-macro crate's folder, whole (macro_files.rs): its id is
+    /// `blaze_proc_macro::module::files_digest` of every file under it, the digest its module
+    /// key holds. In the units' source, so an edit of any of its files moves the dependency
+    /// graph's source and each `MacroModule` part's. No stamp of its own: it stands while every
+    /// [`LeafKind::MacroFile`] and [`LeafKind::MacroFolder`] row beneath it does
+    /// (`macro_files::proven`), so an unchanged crate is read no byte.
+    MacroFiles = 4,
+    /// A file of a member proc-macro crate: its stamp and its id (`FILE_DOMAIN`), read with the
+    /// crate's digest from one read; followed as a manifest is.
+    MacroFile = 5,
+    /// A folder of a member proc-macro crate: its stamp and the [`listing_id`] of the entries
+    /// the files digest walks (`macro_files::walked`); followed as a listing is, so a file made
+    /// or removed beneath the crate moves a row.
+    MacroFolder = 6,
 }
 
 /// A slot of `mod x;`: `x.rs` and `x/mod.rs` are both probed; the row's stamp and id are the one
@@ -166,7 +180,7 @@ impl Leaf {
     }
 
     /// What a reader of the row sees: the flags that say where it was found, and the id.
-    fn state(&self) -> (u8, ContentId) {
+    pub(crate) fn state(&self) -> (u8, ContentId) {
         (self.flags & (AT_MOD_RS | ABSENT | BOTH), self.id)
     }
 }
@@ -224,7 +238,8 @@ pub fn units_source<'r>(rows: impl Iterator<Item = (&'r str, &'r Leaf)>, frame: 
 
 /// What is at `path`: the stamp (settled, else none) and the content id, reusing `old`'s id when
 /// its stamp proves the file unchanged; `None` when no file is there (a directory is none).
-fn look(
+/// The stat comes before the read: `bytes` holds what was read, whenever one was.
+pub(crate) fn look(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     stamps: &impl Stamps,
@@ -462,7 +477,7 @@ pub fn listing_id<'e>(entries: Option<impl Iterator<Item = (&'e str, bool)>>) ->
 }
 
 /// The stamp of directory `dir` (its entries' last change), settled, or none.
-fn dir_stamp(cx: &Cx, root: &Dir<ReadWrite>, stamps: &impl Stamps, plant: Plant, dir: &str) -> Result<Option<Option<Stamp>>, CliError> {
+pub(crate) fn dir_stamp(cx: &Cx, root: &Dir<ReadWrite>, stamps: &impl Stamps, plant: Plant, dir: &str) -> Result<Option<Option<Stamp>>, CliError> {
     let meta = match dir.is_empty() {
         // The checkout's root: its stamp is not asked (a listing of it is listed again).
         true => return Ok(Some(None)),
@@ -560,6 +575,9 @@ impl<S: Stamps> Follow<S> {
         let mut was = Vec::with_capacity_in(last.len(), frame);
         let mut bytes = Bytes::new_in(frame, "a file the last answer read");
         let mut layout_moved = false;
+        // The `MacroFiles` rows, decided after the loop: their files' and folders' rows come
+        // after them in the table's (kind, path) order.
+        let mut crates: Vec<usize, &Frame> = Vec::new_in(frame);
         for i in 0..last.len() {
             let old = last.row(i);
             let path = last.path(i);
@@ -567,7 +585,7 @@ impl<S: Stamps> Follow<S> {
             let (flags, stamp, id) = match old.kind {
                 LeafKind::Slot => slot_now(&cx, root, &self.stamps, self.plant, path, old.flags & MODULE != 0, Some(&old), &mut bytes, frame)?,
                 LeafKind::Manifest if old.absent() && self.plant == Plant::AbsentForgotten => (ABSENT, None, old.id),
-                LeafKind::Manifest => {
+                LeafKind::Manifest | LeafKind::MacroFile => {
                     let reuse = old.stamp.filter(|_| !old.absent()).map(|stamp| (stamp, old.id));
                     match look(&cx, root, &self.stamps, self.plant, path, reuse, &mut bytes)? {
                         Some((stamp, id)) => (0, stamp, id),
@@ -585,10 +603,28 @@ impl<S: Stamps> Follow<S> {
                     }
                 },
                 LeafKind::HomeListing => home_listing_now(&cx, home, &self.stamps, self.plant, path, Some(&old), frame)?,
+                // Kept here and decided below, when its files' and folders' rows are followed.
+                LeafKind::MacroFiles => {
+                    crates.push(i);
+                    (old.flags, None, old.id)
+                }
+                LeafKind::MacroFolder => crate::macro_files::folder_now(&cx, root, &self.stamps, self.plant, path, Some(&old), frame)?,
             };
             now.push(old.kind, flags, path, stamp, id);
             was.push(old_state);
             if old.kind != LeafKind::Slot && now.rows[i].state() != old_state {
+                layout_moved = true;
+            }
+        }
+        // A member macro crate's digest stands, no file of it read, while every row of its files
+        // and folders does; else the layout reads the crate whole once (macro_files.rs
+        // `read_row`: the digest and the files' ids from one read), and the row reads as moved
+        // (zeros) until then.
+        for &i in crates.iter() {
+            let stands = crate::macro_files::proven(&now, &was, now.path(&now.rows[i]));
+            if !stands {
+                now.rows[i].flags = 0;
+                now.rows[i].id = ContentId([0; 32]);
                 layout_moved = true;
             }
         }
@@ -601,15 +637,18 @@ const LEAVES: &str = "a pointer in .blaze/v2/at (its leaf table)";
 /// What the last answer read, as rows read in place:
 ///
 /// ```text
-/// "BCL4" | rows u32 | name bytes u32 | 0 u32
+/// "BCL6" | rows u32 | name bytes u32 | 0 u32
 /// names: the paths' bytes, then rows x end u32
 /// rows:  rows x (kind u8, flags u8, 0 u16, stamp [40], digest [32])   sorted by (kind, path)
 /// ```
 ///
-/// A stamp of zeros is none (an inode of 0 proves nothing). BCL3 was the whole checkout's tree
+/// A stamp of zeros is none (an inode of 0 proves nothing). BCL5 had no `MacroFile` and
+/// `MacroFolder` kinds (member-macro-stamp-1: a member proc-macro crate's files and folders, each
+/// with its stamp). BCL4 had no `MacroFiles` kind
+/// (member-macro-module-2: a member proc-macro crate's files, whole). BCL3 was the whole checkout's tree
 /// (directories and files), the walk this replaces; BCL2 a row a file with its whole path; BCL1
 /// had no stamp: each an older form, reported and rebuilt.
-pub(crate) const LEAVES_MAGIC: &[u8; 4] = b"BCL4";
+pub(crate) const LEAVES_MAGIC: &[u8; 4] = b"BCL6";
 
 const HEADER: usize = 16;
 const ROW: usize = 4 + Stamp::BYTES + 32;
@@ -670,7 +709,7 @@ impl<'f> Leaves<'f> {
             }
             start = end;
             let at = row_at + ROW * k;
-            if bytes[at] > LeafKind::HomeListing as u8 {
+            if bytes[at] > LeafKind::MacroFolder as u8 {
                 return Err(refuse(at, WireWhy::Tag(bytes[at])));
             }
             if bytes[at + 1] & !FLAGS != 0 {
@@ -707,7 +746,10 @@ impl<'f> Leaves<'f> {
             0 => LeafKind::Slot,
             1 => LeafKind::Manifest,
             2 => LeafKind::Listing,
-            _ => LeafKind::HomeListing,
+            3 => LeafKind::HomeListing,
+            4 => LeafKind::MacroFiles,
+            5 => LeafKind::MacroFile,
+            _ => LeafKind::MacroFolder,
         };
         let stamp = Stamp::get(&row[4..4 + Stamp::BYTES]);
         let mut id = [0; 32];
@@ -894,6 +936,8 @@ mod tests {
                 }
                 // No home is given to this sweep: a home row is absent.
                 LeafKind::HomeListing => (ABSENT, ContentId([0; 32])),
+                // No member proc-macro crate in this sweep's workspace: no such row is made.
+                LeafKind::MacroFiles | LeafKind::MacroFile | LeafKind::MacroFolder => (ABSENT, ContentId([0; 32])),
             }
         };
         let sweep = |round: &str| -> Result<(std::vec::Vec<(LeafKind, String)>, u64), Broke> {

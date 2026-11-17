@@ -10,9 +10,23 @@
 //! as before (only granted programs may be started). Which tools a script gets is decided from
 //! text (the table and the package's name) before the run; nothing searches `PATH` for it.
 //! Sans-IO: the caller resolves and digests the path.
+//!
+//! D112: tikv-jemalloc-sys's script is granted `sh`, `make` (the real binary behind the xcrun
+//! shim, never xcrun), `hostname` and `uname`; sh's `runs` are the programs its configure and
+//! make's recipes start. A row's `runs_out_dir` ([`HostTool::runs_out_dir`], [`runs_out_dir`])
+//! says the tool starts what the script wrote under OUT_DIR (configure's test programs): only
+//! then may the script's sandbox start programs there (native.rs `seatbelt_with`'s
+//! `exec_under`).
+//!
+//! nm-row: a row's program is on the machine (`path`, its resolved real path) or on the pinned
+//! toolchain's shelf (`shelf`, one of [`crate::toolchain::SHELF_MEMBERS`]) ([`Place`]). `nm` is
+//! the shelf's `llvm-nm`, from the same pinned LLVM as its clang and lld, never the machine's
+//! `/usr/bin/nm` (an xcrun shim). [`HostTool::programs_in`] names every program at its real
+//! path. A row with `env` is named to the script by that variable ([`tool_env`]: `NM`) and its
+//! folder is not on `PATH` ([`path_folders`]); a shelf row must have one.
 #![blaze::sans_io]
 
-use blaze_own::{AVec, Alloc, Vec};
+use blaze_own::{AString, AVec, Alloc, String, Vec};
 
 use crate::toolchain::{PIN_PATH, object, scalar};
 
@@ -37,12 +51,27 @@ pub fn marked(kind: &[u8]) -> bool {
     kind == RUN_KIND_HOST_TOOL
 }
 
+/// Where a row's own program is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Place {
+    /// On the machine: `path` is its resolved real path (`"path"` in the row).
+    Machine,
+    /// On the pinned toolchain's shelf: `path` is a member of
+    /// [`crate::toolchain::SHELF_MEMBERS`] under the shelf (`"shelf"` in the row; nm-row).
+    Shelf,
+}
+
 /// One tool's row.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct HostTool<'t> {
     pub name: &'t str,
-    /// The resolved real path: granted read and execute.
+    /// Its own program, granted read and execute: the resolved real path ([`Place::Machine`]) or
+    /// the shelf member ([`Place::Shelf`]); [`HostTool::program_in`] names it whole.
     pub path: &'t str,
+    pub place: Place,
+    /// The variable that names its program to the script (`NM` for nm), set by [`tool_env`];
+    /// `None`: found by the `PATH` search, as before. A shelf row always has one.
+    pub env: Option<&'t str>,
     /// The folders its runtime reads, space-separated: granted read-only.
     pub reads: &'t str,
     /// The programs the tool itself starts, space-separated real paths, sorted: granted
@@ -51,6 +80,10 @@ pub struct HostTool<'t> {
     pub runs: &'t str,
     /// The packages whose scripts are known to start it, space-separated, sorted.
     pub needed_by: &'t str,
+    /// Whether it starts programs the script wrote under its OUT_DIR (`"runs_out_dir": "yes"`;
+    /// D112: sh running configure's test programs): the script granted it may start what is
+    /// under its OUT_DIR. Every row says yes or no; nothing is assumed.
+    pub runs_out_dir: bool,
 }
 
 impl<'t> HostTool<'t> {
@@ -64,10 +97,26 @@ impl<'t> HostTool<'t> {
         self.runs.split(' ').filter(|r| !r.is_empty())
     }
 
-    /// Every program granted for it, its own path first: what the sandbox may start and the
-    /// key digests.
-    pub fn programs(&self) -> impl Iterator<Item = &'t str> + use<'t> {
-        core::iter::once(self.path).chain(self.run_paths())
+    /// Its own program at its real path: `path`, or `<shelf>/<path>` for a shelf row.
+    pub fn program_in<'a>(&self, shelf: &str, alloc: Alloc<'a>) -> AString<'a> {
+        let mut out: AString<'a> = String::new_in(alloc);
+        if self.place == Place::Shelf {
+            out.push_str(shelf);
+            out.push('/');
+        }
+        out.push_str(self.path);
+        out
+    }
+
+    /// Every program granted for it at its real path, its own first ([`HostTool::program_in`]),
+    /// then those it starts: what the sandbox may start and the key digests.
+    pub fn programs_in<'a>(&self, shelf: &str, alloc: Alloc<'a>) -> AVec<'a, AString<'a>> {
+        let mut out: AVec<'a, AString<'a>> = Vec::new_in(alloc);
+        out.push(self.program_in(shelf, alloc));
+        for run in self.run_paths() {
+            out.push(String::from_str_in(run, alloc));
+        }
+        out
     }
 
     /// Whether `package`'s script is known to start it.
@@ -116,16 +165,77 @@ pub fn host_tools<'t, 'a>(text: &'t str, target: &'t str, alloc: Alloc<'a>) -> R
         if !body.starts_with('{') {
             return Err(malformed("object"));
         }
-        let path = scalar(body, "path").filter(|p| p.starts_with('/')).ok_or(malformed("path"))?;
+        // nm-row: the machine's program by its real path, or a member of the shelf; never both.
+        let (path, place) = match (scalar(body, "path"), scalar(body, "shelf")) {
+            (Some(path), None) if path.starts_with('/') => (path, Place::Machine),
+            (None, Some(member)) if member.starts_with("bin/") && crate::toolchain::SHELF_MEMBERS.iter().any(|m| *m == member) => (member, Place::Shelf),
+            (_, Some(_)) => return Err(malformed("shelf")),
+            _ => return Err(malformed("path")),
+        };
+        // The variable naming it: upper case, one row's; a shelf row must have one (the shelf's
+        // folder is never on `PATH`).
+        let env = scalar(body, "env");
+        let env_whole = match env {
+            None => place == Place::Machine,
+            Some(var) => {
+                !var.is_empty()
+                    && var.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+                    && !out.iter().any(|other: &HostTool<'t>| other.env == Some(var))
+            }
+        };
+        if !env_whole {
+            return Err(malformed("env"));
+        }
         let reads = scalar(body, "reads").ok_or(malformed("reads"))?;
         let runs = scalar(body, "runs").ok_or(malformed("runs"))?;
         if runs.split(' ').filter(|r| !r.is_empty()).any(|r| !r.starts_with('/')) {
             return Err(malformed("runs"));
         }
         let needed_by = scalar(body, "needed_by").ok_or(malformed("needed_by"))?;
-        out.push(HostTool { name, path, reads, runs, needed_by });
+        let runs_out_dir = match scalar(body, "runs_out_dir") {
+            Some("yes") => true,
+            Some("no") => false,
+            _ => return Err(malformed("runs_out_dir")),
+        };
+        out.push(HostTool { name, path, place, env, reads, runs, needed_by, runs_out_dir });
     }
     Ok(out)
+}
+
+/// Whether any of `tools` (one script's grant) starts programs the script wrote under its
+/// OUT_DIR: then, and only then, the sandbox lets the script start what is under OUT_DIR
+/// (D112).
+pub fn runs_out_dir(tools: &[HostTool<'_>]) -> bool {
+    tools.iter().any(|tool| tool.runs_out_dir)
+}
+
+/// The variables that name `tools`' (one script's grant) programs to it, each row's `env` set to
+/// its program at its real path under `shelf` (nm-row: `NM=<shelf>/bin/llvm-nm` for
+/// tikv-jemalloc-sys's configure), sorted by variable. Rows without `env` give nothing.
+pub fn tool_env<'a>(tools: &[HostTool<'_>], shelf: &str, alloc: Alloc<'a>) -> AVec<'a, (AString<'a>, AString<'a>)> {
+    let mut out: AVec<'a, (AString<'a>, AString<'a>)> = Vec::new_in(alloc);
+    for tool in tools {
+        if let Some(var) = tool.env {
+            out.push((String::from_str_in(var, alloc), tool.program_in(shelf, alloc)));
+        }
+    }
+    out.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    out
+}
+
+/// The folders the script's `PATH` holds for `tools` (one script's grant), sorted and unique:
+/// the folder of each row found by search (no `env`; sha3-asm starts `Command::new("perl")` and
+/// reads no variable). A row named by a variable, and so every shelf row, adds none: nothing
+/// else in its folder is found by name.
+pub fn path_folders<'t, 'a>(tools: &[HostTool<'t>], alloc: Alloc<'a>) -> AVec<'a, &'t str> {
+    let mut out: AVec<'a, &'t str> = Vec::new_in(alloc);
+    for tool in tools.iter().filter(|tool| tool.env.is_none()) {
+        let (folder, _) = tool.path.rsplit_once('/').unwrap_or(("", tool.path));
+        out.push(if folder.is_empty() { "/" } else { folder });
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// The tools `package`'s script is granted, from `tools` (one target's rows), in order.
@@ -143,7 +253,8 @@ pub fn granted<'t, 'a>(tools: &[HostTool<'t>], package: &str, alloc: Alloc<'a>) 
 mod tests {
     use blaze_own::Alloc;
 
-    use super::{HostToolError, MARK, RUN_KIND, RUN_KIND_HOST_TOOL, granted, host_tools, marked, run_kind};
+    use super::{HostToolError, MARK, RUN_KIND, RUN_KIND_HOST_TOOL, granted, host_tools, marked, run_kind, runs_out_dir};
+    use crate::native::{Grant, seatbelt_with};
     use crate::toolchain::PIN;
 
     /// The checked-in table grants perl, at its real path with the system's Perl folders, to
@@ -154,11 +265,12 @@ mod tests {
     fn the_pin_table_grants_perl_to_sha3_asm_only() {
         let alloc = Alloc::global();
         let mac = host_tools(PIN, "aarch64-apple-darwin", alloc).expect("the macOS row");
-        assert_eq!(mac.len(), 1);
-        let perl = mac[0];
+        assert_eq!(mac.iter().map(|t| t.name).collect::<std::vec::Vec<_>>(), ["hostname", "make", "nm", "perl", "sh", "uname"]);
+        let perl = *mac.iter().find(|t| t.name == "perl").expect("perl's row");
         assert_eq!((perl.name, perl.path), ("perl", "/usr/bin/perl"));
+        assert!(!perl.runs_out_dir);
         assert_eq!(perl.read_folders().collect::<std::vec::Vec<_>>(), ["/System/Library/Perl", "/private/var/select/sh"]);
-        assert_eq!(perl.programs().collect::<std::vec::Vec<_>>(), ["/usr/bin/perl", "/bin/bash", "/bin/sh"]);
+        assert_eq!(perl.programs_in("/shelf", alloc).iter().map(|p| p.as_str()).collect::<std::vec::Vec<_>>(), ["/usr/bin/perl", "/bin/bash", "/bin/sh"]);
         assert_eq!(granted(&mac, "sha3-asm", alloc).len(), 1);
         assert_eq!(granted(&mac, "zstd-sys", alloc).len(), 0);
         // A prefix of a listed package is not the package.
@@ -182,7 +294,132 @@ mod tests {
     /// Unsorted names are refused, never read in some order.
     #[test]
     fn unsorted_names_are_refused() {
-        let text = r#"{"host_tools": {"t": {"names": "perl make", "make": {"path": "/usr/bin/make", "reads": "", "runs": "", "needed_by": "x"}, "perl": {"path": "/usr/bin/perl", "reads": "", "runs": "", "needed_by": "y"}}}}"#;
+        let text = r#"{"host_tools": {"t": {"names": "perl make", "make": {"path": "/usr/bin/make", "reads": "", "runs": "", "needed_by": "x", "runs_out_dir": "no"}, "perl": {"path": "/usr/bin/perl", "reads": "", "runs": "", "needed_by": "y", "runs_out_dir": "no"}}}}"#;
         assert_eq!(host_tools(text, "t", Alloc::global()).err(), Some(HostToolError::Unsorted { target: "t" }));
+    }
+
+    /// D112: a row without `runs_out_dir`, or with a value other than yes or no, is refused by
+    /// name; nothing is assumed for it. Prints "runs_out_dir refused: missing and maybe".
+    #[test]
+    fn a_row_must_say_whether_it_runs_out_dir() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let missing = r#"{"host_tools": {"t": {"sh": {"path": "/bin/sh", "reads": "", "runs": "", "needed_by": "x"}, "names": "sh"}}}"#;
+        let maybe = r#"{"host_tools": {"t": {"sh": {"path": "/bin/sh", "reads": "", "runs": "", "needed_by": "x", "runs_out_dir": "maybe"}, "names": "sh"}}}"#;
+        let want = Some(HostToolError::Malformed { target: "t", tool: "sh", field: "runs_out_dir" });
+        assert_eq!(host_tools(missing, "t", alloc).err(), want);
+        assert_eq!(host_tools(maybe, "t", alloc).err(), want);
+        let yes = r#"{"host_tools": {"t": {"sh": {"path": "/bin/sh", "reads": "", "runs": "", "needed_by": "x", "runs_out_dir": "yes"}, "names": "sh"}}}"#;
+        assert!(host_tools(yes, "t", alloc).expect("a whole row")[0].runs_out_dir);
+        println!("runs_out_dir refused: missing and maybe");
+    }
+
+    /// D112 (main's ruling, wave 3): a row whose grant widens the sandbox (`runs_out_dir` yes:
+    /// today sh for tikv-jemalloc-sys, which also lets the script's links use the shelf's
+    /// ld64.lld and lld) says in the pin table that it holds only for D112's interim and that
+    /// its records stay local. A row given that grant without the word fails here. Prints
+    /// "runs_out_dir rows say interim: sh".
+    #[test]
+    fn a_row_that_runs_out_dir_says_it_is_d112_interim() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mac = host_tools(PIN, "aarch64-apple-darwin", alloc).expect("the macOS row");
+        let (rows, _) = crate::toolchain::object(PIN, "host_tools", 0).expect("the table");
+        let (row, _) = crate::toolchain::object(rows, "aarch64-apple-darwin", 0).expect("the macOS row");
+        let mut said: std::vec::Vec<&str> = std::vec::Vec::new();
+        for tool in mac.iter().filter(|t| t.runs_out_dir) {
+            let (body, _) = crate::toolchain::object(row, tool.name, 0).expect("the tool's row");
+            let interim = crate::toolchain::scalar(body, "interim").unwrap_or("");
+            assert!(interim.starts_with("D112 interim:") && interim.contains("local"), "{}: a runs_out_dir row says it is D112's interim, records local", tool.name);
+            said.push(tool.name);
+        }
+        assert_eq!(said, ["sh"]);
+        println!("runs_out_dir rows say interim: {}", said.join(" "));
+    }
+
+    /// D112: tikv-jemalloc-sys's script is granted sh, make, hostname and uname at their real
+    /// paths (make the developer folder's real binary, never the `/usr/bin/make` xcrun shim nor
+    /// xcrun), sh's runs are sorted and hold the shell and the tools configure starts, and only
+    /// sh's row runs what the script wrote under OUT_DIR; sha3-asm keeps perl alone. Prints
+    /// "jemalloc tools: hostname make sh uname; runs out dir: sh".
+    #[test]
+    fn the_pin_table_grants_tikv_jemalloc_sys_its_shell_tools() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mac = host_tools(PIN, "aarch64-apple-darwin", alloc).expect("the macOS row");
+        let jemalloc = granted(&mac, "tikv-jemalloc-sys", alloc);
+        let names: std::vec::Vec<&str> = jemalloc.iter().map(|t| t.name).collect();
+        assert_eq!(names, ["hostname", "make", "nm", "sh", "uname"]);
+        let row = |name: &str| *jemalloc.iter().find(|t| t.name == name).expect("a granted row");
+        assert_eq!(row("sh").path, "/bin/sh");
+        assert_eq!(row("make").path, "/Applications/Xcode.app/Contents/Developer/usr/bin/make");
+        assert_eq!(row("hostname").path, "/bin/hostname");
+        assert_eq!(row("uname").path, "/usr/bin/uname");
+        for tool in jemalloc.iter() {
+            assert!(
+                tool.programs_in("/shelf", alloc).iter().all(|p| p.as_str() != "/usr/bin/make" && !p.as_str().ends_with("/xcrun")),
+                "{}: no shim, no xcrun",
+                tool.name
+            );
+        }
+        let sh = row("sh");
+        let runs: std::vec::Vec<&str> = sh.run_paths().collect();
+        let mut sorted = runs.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(runs, sorted, "sh's runs are sorted and unique");
+        for program in ["/bin/bash", "/bin/mkdir", "/bin/rm", "/usr/bin/sed", "/usr/bin/install", "/usr/bin/awk"] {
+            assert!(runs.contains(&program), "sh runs {program}");
+        }
+        assert!(row("make").run_paths().any(|p| p == "/bin/sh"), "make's recipes run under /bin/sh");
+        let out_dir: std::vec::Vec<&str> = jemalloc.iter().filter(|t| t.runs_out_dir).map(|t| t.name).collect();
+        assert_eq!(out_dir, ["sh"]);
+        assert!(runs_out_dir(&jemalloc));
+        let sha3 = granted(&mac, "sha3-asm", alloc);
+        assert_eq!(sha3.iter().map(|t| t.name).collect::<std::vec::Vec<_>>(), ["perl"]);
+        assert!(!runs_out_dir(&sha3));
+        println!("jemalloc tools: {}; runs out dir: {}", names.join(" "), out_dir.join(" "));
+    }
+
+    /// D112: the Seatbelt profile of tikv-jemalloc-sys's grant, made as blaze-proc-macro's
+    /// `native_script` makes it (each tool's programs executed; OUT_DIR in `exec_under` when
+    /// [`runs_out_dir`]), lets the script start sh, make, hostname, uname, bash and sed, and
+    /// anything under its OUT_DIR; it never names the `/usr/bin/make` shim. sha3-asm's profile
+    /// does not let it start what is under its OUT_DIR. A wrong fix (no rows, or the OUT_DIR grant
+    /// for every script) fails here. Prints "jemalloc profile: exec grants and out dir; sha3-asm:
+    /// perl, no out dir".
+    #[test]
+    fn the_jemalloc_profile_holds_the_exec_grants() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mac = host_tools(PIN, "aarch64-apple-darwin", alloc).expect("the macOS row");
+        let out = "/w/out";
+        let exec_section = |package: &str| -> std::string::String {
+            let tools = granted(&mac, package, alloc);
+            let owned: std::vec::Vec<blaze_own::AString<'_>> = tools.iter().flat_map(|t| t.programs_in("/shelf", alloc)).collect();
+            let exec: std::vec::Vec<&str> = owned.iter().map(|p| p.as_str()).collect();
+            let writes = [out];
+            let grant = Grant { program: "/w/script", exec: &exec, read: &[], write: &writes };
+            let out_only = [out];
+            let exec_under: &[&str] = if runs_out_dir(&tools) { &out_only } else { &[] };
+            let profile = seatbelt_with(&grant, exec_under, alloc).expect("a sayable grant");
+            let start = profile.find("(allow process-exec").expect("the exec section");
+            let end = profile[start..].find(")\n").expect("its end") + start;
+            profile[start..end].to_owned()
+        };
+        let jemalloc = exec_section("tikv-jemalloc-sys");
+        let programs = [
+            "/bin/sh",
+            "/Applications/Xcode.app/Contents/Developer/usr/bin/make",
+            "/bin/hostname",
+            "/usr/bin/uname",
+            "/bin/bash",
+            "/usr/bin/sed",
+        ];
+        for program in programs {
+            assert!(jemalloc.contains(&format!("(literal \"{program}\")")), "{program} in {jemalloc}");
+        }
+        assert!(jemalloc.contains("(subpath \"/w/out\")"), "OUT_DIR started from: {jemalloc}");
+        assert!(!jemalloc.contains("(literal \"/usr/bin/make\")"), "the shim: {jemalloc}");
+        let sha3 = exec_section("sha3-asm");
+        assert!(sha3.contains("(literal \"/usr/bin/perl\")"), "{sha3}");
+        assert!(!sha3.contains("/w/out"), "sha3-asm starts nothing under OUT_DIR: {sha3}");
+        println!("jemalloc profile: exec grants and out dir; sha3-asm: perl, no out dir");
     }
 }

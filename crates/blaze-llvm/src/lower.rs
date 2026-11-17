@@ -13,10 +13,12 @@
 //! `!noundef`, `!invariant.load`, parameter facts) are given to LLVM; the promises and hints
 //! LLVM is not given are dropped by LIR's own rule (a promise or hint may be dropped):
 //! `slot_live`/`slot_dead`, a load's range and pointee alignment, `nontemporal`, `nuw` on
-//! `ptr_add`. Every form not lowered is refused BY NAME (`LowerError::Refused`): unwinding
-//! (`invoke`, landing blocks, `resume`), coroutines (`suspend`, `cancelled`), `asm!`, target
-//! intrinsics, thread-locals, `stack_pointer`, scalable vectors, masked and gathered memory,
-//! `swizzle`, `bitmask`, the float reductions with a start value.
+//! `ptr_add`. Every form not lowered is refused BY NAME (`LowerError::Refused`): coroutines
+//! (`suspend`, `cancelled`), `asm!`, target intrinsics, thread-locals, `stack_pointer`, scalable
+//! vectors, masked and gathered memory, `swizzle`, `bitmask`, the float reductions with a start
+//! value. Unwinding (`invoke`, landing blocks, `resume`, the personality) is lowered by the child
+//! module lower_eh.rs (UNWIND.md 3.8, P8a); a landing block reached by anything but an unwind edge
+//! is `LowerError::Landing`.
 //!
 //! Names: every symbol is `bz` and 64 hex digits (names.rs); a C name is itself. Values are
 //! `%v<index>`, blocks `%b<index>`, an edge carrying arguments its own block `%e<inst>_<k>`
@@ -40,6 +42,10 @@ use blaze_tier::{Named, Names, Outside};
 
 use crate::compile::Linked;
 use crate::names::{ir_name, ir_name_str, symbol_in};
+
+// Unwinding's forms (UNWIND.md 3.8, P8a): a child module, so it writes through `Emit`.
+#[path = "lower_eh.rs"]
+mod eh;
 
 /// A callee offered to the inliner (D100 point 9): in LIR (lowered here as an
 /// `available_externally` body) or in its optimized bitcode (linked by [`crate::bitcode`]).
@@ -81,6 +87,9 @@ pub enum LowerError {
     Offered { symbol: Symbol, what: &'static str },
     /// Two `CalleeFacts` rows for one symbol.
     Facts { symbol: Symbol },
+    /// Landing block `block` reached by `by`: only an invoke's unwind edge may reach one (LIR's
+    /// rule, blaze-lir verify.rs, and LLVM's for a block that starts with `landingpad`).
+    Landing { body: Symbol, block: u32, by: &'static str },
     /// Writing the text failed (an allocator's refusal surfaces as `fmt::Error`).
     Text,
 }
@@ -96,6 +105,9 @@ impl fmt::Display for LowerError {
             LowerError::CName { body, what } => write!(f, "LIR to LLVM: {body} names a C name that {what}"),
             LowerError::Offered { symbol, what } => write!(f, "LIR to LLVM: the offered callee {symbol} is {what}"),
             LowerError::Facts { symbol } => write!(f, "LIR to LLVM: two fact rows for {symbol}"),
+            LowerError::Landing { body, block, by } => {
+                write!(f, "LIR to LLVM: {body} block {block}: a landing block reached by {by}; only an unwind edge reaches one")
+            }
             LowerError::Text => f.write_str("LIR to LLVM: writing the module's text failed"),
         }
     }
@@ -259,6 +271,7 @@ impl<'f, 'n, 'c, 'o, 'a> Emit<'f, 'n, 'c, 'o, 'a> {
         }
         self.out.push(')');
         self.fn_attrs()?;
+        self.personality()?;
         self.out.push_str(" {\nentry:\n");
         for (k, slot) in view.slots.iter().enumerate() {
             writeln!(self.out, "  %ss{k} = alloca [{} x i8], align {}", slot.size, 1u64 << slot.align)?;
@@ -276,6 +289,9 @@ impl<'f, 'n, 'c, 'o, 'a> Emit<'f, 'n, 'c, 'o, 'a> {
                 if target.block.0 == 0 {
                     return Err(self.refuse(Some(term), "a branch to the entry block"));
                 }
+                if view.block_kind(target.block).is_landing() {
+                    return Err(self.landing(target.block, "a jump, branch or switch"));
+                }
                 let wanted = view.params(target.block).len();
                 if target.args.len() != wanted {
                     return Err(self.refuse(Some(term), "an edge whose arguments are not its target's parameters"));
@@ -289,11 +305,12 @@ impl<'f, 'n, 'c, 'o, 'a> Emit<'f, 'n, 'c, 'o, 'a> {
 
         for b in 0..view.blocks() {
             let block = Block(b as u32);
-            if view.block_kind(block).is_landing() {
-                return Err(self.refuse(None, "a landing block (unwinding)"));
-            }
+            let kind = view.block_kind(block);
             writeln!(self.out, "b{b}:")?;
-            if b > 0 {
+            if kind.is_landing() {
+                // Its one parameter comes from the landing pad, never from an edge.
+                self.landing_head(block, kind)?;
+            } else if b > 0 {
                 self.phis(block, &edges)?;
             }
             let range = view.block(block);
@@ -421,7 +438,7 @@ impl<'f, 'n, 'c, 'o, 'a> Emit<'f, 'n, 'c, 'o, 'a> {
         let mut sigs: AVec<'a, u32> = Vec::new_in(self.cx.alloc);
         sigs.resize(view.refs.len(), NONE);
         for inst in 0..view.len() {
-            if matches!(view.op(inst), Op::Call | Op::TailCall) {
+            if matches!(view.op(inst), Op::Call | Op::TailCall | Op::Invoke) {
                 let mut o = view.operands(inst);
                 let r = o.reference();
                 let sig = o.sig();
@@ -1570,7 +1587,10 @@ impl<'f, 'n, 'c, 'o, 'a> Emit<'f, 'n, 'c, 'o, 'a> {
                 };
                 self.intrinsic(Some((inst, ty)), base, &[view.ty(a)], &[Arg::V(a)])?;
             }
-            Op::Call | Op::CallIndirect | Op::TailCall | Op::TailCallIndirect => self.call(inst, op)?,
+            Op::Call | Op::CallIndirect | Op::TailCall | Op::TailCallIndirect | Op::Invoke | Op::InvokeIndirect => {
+                self.call(inst, op)?
+            }
+            Op::Resume => self.resume(inst)?,
             Op::Project => {
                 let (a, member) = (o.value(), o.imm());
                 self.lhs(inst)?;
@@ -1672,7 +1692,6 @@ impl<'f, 'n, 'c, 'o, 'a> Emit<'f, 'n, 'c, 'o, 'a> {
             Op::StackPointer => return Err(self.refuse(Some(inst), "`stack_pointer`")),
             Op::TargetIntrinsic => return Err(self.refuse(Some(inst), "a target intrinsic")),
             Op::Asm | Op::AsmBr => return Err(self.refuse(Some(inst), "`asm!`")),
-            Op::Invoke | Op::InvokeIndirect | Op::Resume => return Err(self.refuse(Some(inst), "unwinding")),
             Op::Suspend | Op::Cancelled => return Err(self.refuse(Some(inst), "a coroutine's suspension")),
         }
         Ok(())
@@ -1773,9 +1792,11 @@ impl<'f, 'n, 'c, 'o, 'a> Emit<'f, 'n, 'c, 'o, 'a> {
     fn call(&mut self, inst: usize, op: Op) -> Result<(), LowerError> {
         let view = self.view;
         let mut o = view.operands(inst);
-        let direct = matches!(op, Op::Call | Op::TailCall);
+        let direct = matches!(op, Op::Call | Op::TailCall | Op::Invoke);
         let (callee, pointer) = if direct { (Some(o.reference()), None) } else { (None, Some(o.value())) };
         let sig = view.sig(o.sig());
+        // An invoke's return and unwind blocks, in that order, before its arguments.
+        let invoke = matches!(op, Op::Invoke | Op::InvokeIndirect).then(|| (o.block(), o.block()));
         let args = o.values();
         let tail = matches!(op, Op::TailCall | Op::TailCallIndirect);
         let has_result = !sig.rets.is_empty();
@@ -1788,7 +1809,11 @@ impl<'f, 'n, 'c, 'o, 'a> Emit<'f, 'n, 'c, 'o, 'a> {
         } else {
             self.out.push_str("  ");
         }
-        self.out.push_str(if tail { "musttail call " } else { "call " });
+        self.out.push_str(match (tail, invoke.is_some()) {
+            (true, _) => "musttail call ",
+            (false, true) => "invoke ",
+            (false, false) => "call ",
+        });
         self.conv(sig.conv, Some(inst))?;
         self.ret_text(sig)?;
         if sig.bits & SigRec::VARIADIC != 0 {
@@ -1825,7 +1850,11 @@ impl<'f, 'n, 'c, 'o, 'a> Emit<'f, 'n, 'c, 'o, 'a> {
             self.out.push(' ');
             self.val(arg)?;
         }
-        self.out.push_str(")\n");
+        self.out.push(')');
+        if let Some((normal, unwind)) = invoke {
+            self.invoke_edges(inst, normal, unwind)?;
+        }
+        self.out.push('\n');
         if tail {
             if has_result {
                 self.out.push_str("  ret ");

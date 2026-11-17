@@ -54,6 +54,9 @@ Not now:
 
 ## How work is done
 
+- The main agent designs: every architecture, spec, floor and trade-off is its own work, written into the
+  design doc before a lane starts. Lanes implement from it; a lane that meets a design question stops and
+  asks. A critic may attack a design; no lane writes one (28, 29, 62).
 - Work in parallel: lanes write in one directory and never wait on a compile or on a yes (35, 48).
 - Until `blaze run` exists again, a merge's proof is the whole build and its tests, quoted (68).
 - Every command has a timeout; a hang is a bug to report, never one to wait out (69, 18).
@@ -61,7 +64,7 @@ Not now:
 - A simple, exactly specified edit (one expression replaced by another across a crate, a rename) goes
   to Codex, which is cheap and literal: `bunx @openai/codex@latest exec -m gpt-6.1-terra -c
   model_reasoning_effort='"high"'`, one crate a job, with the files, the exact replacement and what
-  not to touch; then read its diff and compile it. Design and judgement stay with the lane.
+  not to touch; then read its diff and compile it. Judgement stays with the lane, design with the main agent.
 - Build, test and land: docs/contributing.md. Every doc: docs/README.md.
 
 ## Rules

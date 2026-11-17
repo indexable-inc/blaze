@@ -22,15 +22,19 @@ use blaze_own::{ABTreeMap, ABTreeSet, AVec, Alloc};
 use blaze_surface::{DeclsBuilder, SurfaceError};
 
 use crate::facts::ScopeFacts;
-use crate::{AmbiguityKind, CallShape, Def, DefKind, Edition, ExternTarget, Namespace, Origin, Path, PathKind, Rename, Unresolved, UseForm, Visibility, WrittenVis};
+use crate::{AmbiguityKind, CallShape, Def, DefKind, Edition, ExternTarget, Namespace, Origin, PathKind, Rename, Unresolved, UseForm, Visibility};
 
 mod deps;
+mod early;
 mod switch;
 #[cfg(test)]
 mod tests;
+mod vis;
 #[cfg(test)]
 mod world;
 mod write;
+
+use early::EarlyAmbiguity;
 
 #[cfg(test)]
 pub(crate) use world::solve_world;
@@ -105,6 +109,10 @@ pub enum Outcome {
     Outside,
     /// A macro call's path: the macro it names. Its expansion follows.
     Called(Def),
+    /// A one-segment attribute naming a built-in attribute (`#[inline]`) that no nearer scope
+    /// binds: inert, no macro and no expansion (Reference `attributes.builtin`, "Built-in
+    /// attributes index": "built-in attributes"; rustc's built-in attribute scope).
+    Inert,
 }
 
 /// Why an import or a call is [`Outcome::Outside`]: the form this core does not follow, by name.
@@ -146,7 +154,8 @@ pub enum BadVis {
     WithoutIn,
     /// `pub(in path)` starting with neither `crate`, `self` nor `super`.
     Start,
-    /// The segment at this index is not the next module down toward the item.
+    /// The segment at this index is not the next module down toward the item: on a `use` or
+    /// `extern crate`, whose `pub(in path)` the core does not read through names (vis.rs).
     Segment(usize),
 }
 
@@ -154,7 +163,8 @@ pub enum BadVis {
 #[derive(Clone, Debug)]
 pub enum CellError {
     Facts { module: ItemKey, error: SurfaceError },
-    /// `pub(in path)` naming no ancestor, `pub(path)` or `pub(super)` at the root.
+    /// A `use` or `extern crate` whose `pub(in path)` leaves the module chain (vis.rs): refused
+    /// by name. A visibility naming no ancestor is its item's scope error, never this.
     BadVisibility { module: ItemKey, why: BadVis },
     /// A cycle's least fixed point did not settle within its bound.
     NoFixpoint { module: ItemKey, cells: usize },
@@ -162,6 +172,8 @@ pub enum CellError {
     NotExpanded { call: ItemKey },
     /// Reading the call's expansion failed.
     Expansion { call: ItemKey, error: SurfaceError },
+    /// Reading the helper attributes of derive `derive`, called by `call`, failed.
+    Helpers { call: ItemKey, derive: ItemKey, error: SurfaceError },
     /// A bug in when cells decide: an expansion writes a name into `module` whose cell was
     /// already decided "not there" (finality, bottom.md section 6).
     DecidedTooEarly { module: ItemKey, ns: Namespace },
@@ -174,6 +186,7 @@ impl fmt::Display for CellError {
         match self {
             CellError::NotExpanded { call } => write!(f, "call {call:?}: expanded by the driver, but the facts have no expansion"),
             CellError::Expansion { call, error } => write!(f, "call {call:?}: reading its expansion: {error}"),
+            CellError::Helpers { call, derive, error } => write!(f, "call {call:?}: reading the helper attributes of derive {derive:?}: {error}"),
             CellError::DecidedTooEarly { module, ns } => {
                 write!(f, "module {module:?}: an expansion writes a {ns:?} name whose cell was decided not found (a bug in the core)")
             }
@@ -397,6 +410,16 @@ struct CallAt {
 /// `names.resolution.expansion.macros.intro`: "Macros are split into two sub-namespaces, one
 /// for function-like macros, and the other for attributes and derives. Resolution candidates
 /// from the incorrect sub-namespace are ignored."). Not a macro: never.
+/// What the built-in attribute scope binds a built-in attribute's name to (rustc's
+/// `Res::NonMacroAttr(Builtin)`), read only by the attribute call that names it, which is then
+/// [`Outcome::Inert`]: never bound in a module, never written to a record. Its first eight
+/// bytes (`builtin ` with a space) are no builtin type's (`builtin\0`) and, but by a 2^-64
+/// chance, no item's (an item key starts with its crate's hash).
+const BUILTIN_ATTR: Def = Def {
+    key: ItemKey(blaze_id::ContentId(*b"builtin attribute\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0")),
+    kind: DefKind::Other,
+};
+
 fn same_sub(def: Def, shape: CallShape) -> bool {
     let DefKind::Macro(s) = def.kind else { return false };
     match shape {
@@ -536,13 +559,14 @@ enum Hold {
 #[derive(Clone, Copy)]
 enum Taken<N> {
     /// R6's watch: a later write of the name into the module by an expansion that does not
-    /// enclose the call is the error.
-    Watch(ModId, Namespace, N, Def),
+    /// enclose the call is the error, of the kind given (the definition taken was an outer
+    /// scope's or a glob's).
+    Watch(ModId, Namespace, N, Def, AmbiguityKind),
     /// The module's `Globs` cell of the name, read again when the run ends: the definition
     /// taken, and whether the globs brought it (else an outer scope did, and the globs had none).
     Globs(CellId, Def, bool),
     /// The error is known already (a definition an expansion wrote beside another candidate).
-    Error,
+    Error(EarlyAmbiguity<N>),
 }
 
 /// Where a module's own view of a name came from (R6, R7).
@@ -596,13 +620,38 @@ pub(crate) struct Cells<'a, N> {
     /// The crate's tool namespaces (`rustfmt`, `clippy`, `blaze`, the root's `register_tool`s),
     /// from its root record: an attribute whose path starts with one is inert.
     tools: AVec<'a, N>,
+    /// The toolchain's built-in attribute names (`inline`, `test`, ...), from the root record:
+    /// the built-in attribute scope of a one-segment attribute call ([`Outcome::Inert`]).
+    builtin_attrs: AVec<'a, N>,
+    /// The root's `#![blaze::arbitrary_ints]`: `u24`, `i80` are builtin types in this crate's
+    /// language prelude (docs/v2/plan/design/arbitrary-ints.md, "The opt-in").
+    arbitrary_ints: bool,
+    /// The item each call is written on (`MacroCallDecl::item`), by call: a derive's helper
+    /// scope is its item's ([`Cells::derive_helper`]).
+    call_on: ABTreeMap<'a, ItemId, u32>,
+    /// The derive calls on each item of each fragment, in text order.
+    derives_on: ABTreeMap<'a, (FragId, u32), AVec<'a, ItemId>>,
+    /// The last place of a one-segment attribute call on each item of each fragment: a derive
+    /// before it has its helpers read when it expands ([`Cells::expand_call`]).
+    attr_after: ABTreeMap<'a, (FragId, u32), u32>,
+    /// Each derive's helper attributes, sorted, by the derive's key.
+    helpers: ABTreeMap<'a, ItemKey, AVec<'a, N>>,
     /// R6's watches: a use whose plain first segment took an outer binding while its module could
     /// still grow, by module and name.
-    watches: ABTreeMap<'a, (ModId, Namespace, N), AVec<'a, (ItemId, Def)>>,
+    /// Each with the definition taken and the ambiguity a later write makes of it.
+    watches: ABTreeMap<'a, (ModId, Namespace, N), AVec<'a, (ItemId, Def, AmbiguityKind)>>,
     /// Names an expansion wrote into a module as items or `mod`s: the fragment that wrote each.
     written: ABTreeMap<'a, (ModId, Namespace, N), FragId>,
-    /// The uses an R6 error is reported for.
-    pub(crate) r6: ABTreeSet<'a, ItemId>,
+    /// The uses and calls an R6 error is reported for, each with its error (the least, when
+    /// one item meets two: `EarlyAmbiguity`'s order), written by `scope` at the item.
+    pub(crate) r6: ABTreeMap<'a, ItemId, EarlyAmbiguity<N>>,
+    /// GlobVsExpanded's candidates: a use whose plain first segment took a name an expansion
+    /// wrote into its module, by the use and namespace: the name, the expanded definition and
+    /// the module's `Globs` cell of the name, read when the run ends ([`Cells::validate_expanded`]).
+    expanded_uses: ABTreeMap<'a, (ItemId, Namespace), (N, Def, CellId)>,
+    /// GlobVsExpanded's errors, by the use and namespace: the name, the expanded definition and
+    /// the different one the module's globs bring.
+    pub(crate) glob_vs_expanded: ABTreeMap<'a, (ItemId, Namespace), (N, Def, Def)>,
     pub(crate) stats: CellStats,
     pub(crate) plant: CellPlant,
     /// Items are evaluated from the last id first (and so their calls expanded in that order):
@@ -624,8 +673,13 @@ pub(crate) struct Cells<'a, N> {
     dep_roots: AVec<'a, (N, ItemKey)>,
     /// The `extern crate` items naming no dependency: the module and the name written.
     pub(crate) bad_extern: AVec<'a, (ItemKey, N)>,
-    /// R8's errors: a macro-written root `extern crate .. as n;` whose `n` a dependency holds.
-    pub(crate) r8: AVec<'a, N>,
+    /// Visibilities naming no ancestor wherever names resolve: each its item's error (vis.rs).
+    bad_vis: AVec<'a, vis::BadVisAt<'a, N>>,
+    /// Explicit entries whose `pub(in path)` is read through the cells, by entry (vis.rs).
+    vis_paths: ABTreeMap<'a, (ModId, Namespace, N), vis::VisPath<'a, N>>,
+    /// R8's errors: a macro-written root `extern crate .. as n;` whose `n` a dependency holds,
+    /// each with the fragment (an expansion at the root) it is written in.
+    pub(crate) r8: AVec<'a, (FragId, EarlyAmbiguity<N>)>,
     /// The modules a `mod` line names whose text the facts do not hold, in the order met.
     pub(crate) unread: AVec<'a, ItemKey>,
     /// R6's watches for the extern prelude: a use whose first segment took a later outer scope's
@@ -645,6 +699,12 @@ pub(crate) struct Cells<'a, N> {
     /// made come after (their `#[macro_export]` macros are published to the root by the
     /// record writer, not read from the root record).
     walked: ModId,
+    /// D116 counts (names example `--d116-counts`): each `Full` cell read by (reader module, module, namespace, name, module's growth > 0 then).
+    pub(crate) d116_reads: blaze_hash::HashMap<((ModId, u8), ModId, Namespace, N, bool), u64, Alloc<'a>>,
+    /// The reader: its module and kind (0 a cell, 1 an import, 2 a call).
+    d116_reader: (ModId, u8),
+    /// Each item's first evaluation: how many fragments were in then.
+    pub(crate) d116_first: blaze_hash::HashMap<ItemId, u32, Alloc<'a>>,
 }
 
 /// A read of a cell by an item: decided, or the item now waits on it.
@@ -721,9 +781,17 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 macro_use: false,
             },
             tools: AVec::new_in(alloc),
+            builtin_attrs: AVec::new_in(alloc),
+            arbitrary_ints: false,
+            call_on: ABTreeMap::new_in(alloc),
+            derives_on: ABTreeMap::new_in(alloc),
+            attr_after: ABTreeMap::new_in(alloc),
+            helpers: ABTreeMap::new_in(alloc),
             watches: ABTreeMap::new_in(alloc),
             written: ABTreeMap::new_in(alloc),
-            r6: ABTreeSet::new_in(alloc),
+            r6: ABTreeMap::new_in(alloc),
+            expanded_uses: ABTreeMap::new_in(alloc),
+            glob_vs_expanded: ABTreeMap::new_in(alloc),
             stats: CellStats::default(),
             plant,
             backward: false,
@@ -734,6 +802,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             macro_use: AVec::new_in(alloc),
             dep_roots: AVec::new_in(alloc),
             bad_extern: AVec::new_in(alloc),
+            bad_vis: AVec::new_in(alloc),
+            vis_paths: ABTreeMap::new_in(alloc),
             r8: AVec::new_in(alloc),
             unread: AVec::new_in(alloc),
             extern_watches: ABTreeMap::new_in(alloc),
@@ -742,6 +812,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             taken: AVec::new_in(alloc),
             weak_error: None,
             walked: 0,
+            d116_reads: blaze_hash::HashMap::new_in(alloc),
+            d116_reader: (0, 0),
+            d116_first: blaze_hash::HashMap::new_in(alloc),
         };
         // The dependencies by name before any text is read: an `extern crate` of any module
         // names one.
@@ -749,6 +822,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             let r = facts.crate_root(info.krate).map_err(|error| CellError::Facts { module: root, error })?;
             cells.dep_roots.extend(r.deps.iter().map(|d| (d.name, d.root)));
             cells.tools.extend(r.tools.iter().copied());
+            cells.builtin_attrs.extend(r.builtin_attrs.iter().copied());
+            cells.arbitrary_ints = r.head.arbitrary_ints;
         }
         let made = cells.make_modules(facts, &[root])?;
         cells.walked = cells.modules.len() as ModId;
@@ -948,17 +1023,15 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         let alloc = self.alloc;
         let fid = self.frags.len() as FragId;
         let mut slots: AVec<'a, (u32, Slot<N>)> = AVec::new_in(alloc);
-        for it in d.items.iter() {
-            let vis = self.vis_of(m, &it.vis)?;
-            self.add_explicit(m, it.ns, it.name, (it.def, vis, Origin::Declared, fid))?;
+        for (k, it) in d.items.iter().enumerate() {
+            self.add_declared(m, it.ns, it.name, it.def, &it.vis, fid, (vis::ORD_ITEM, k as u32))?;
             self.stats.names_declared += 1;
             if up.is_some() {
                 self.wrote(m, it.ns, it.name, it.def, fid);
             }
         }
-        for c in d.mods.iter() {
-            let vis = self.vis_of(m, &c.vis)?;
-            self.add_explicit(m, Namespace::Types, c.name, (Def::module(c.module), vis, Origin::Declared, fid))?;
+        for (k, c) in d.mods.iter().enumerate() {
+            self.add_declared(m, Namespace::Types, c.name, Def::module(c.module), &c.vis, fid, (vis::ORD_MOD, k as u32))?;
             self.stats.names_declared += 1;
             if up.is_some() {
                 self.wrote(m, Namespace::Types, c.name, Def::module(c.module), fid);
@@ -969,8 +1042,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             self.modules[child as usize].mod_line = Some((fid, c.pos));
             slots.push((c.pos, Slot::Mod(child, c.macro_use)));
         }
-        for ec in d.extern_crates.iter() {
-            let vis = self.vis_of(m, &ec.vis)?;
+        for (k, ec) in d.extern_crates.iter().enumerate() {
+            let vis = self.import_vis(m, &ec.vis, vis::VisAt { module: m, frag: fid, ord: (vis::ORD_EXTERN_CRATE, k as u32) })?;
             self.extern_crate(m, ec.target, ec.rename, vis, fid, up.is_some())?;
         }
         for r in d.macro_rules.iter() {
@@ -1031,6 +1104,17 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 deep,
             });
             self.call_ids.insert(c.call, id);
+            if let Some(on) = c.item {
+                self.call_on.insert(id, on);
+                match c.kind {
+                    CallShape::Derive => self.derives_on.entry((fid, on)).or_insert_with(|| AVec::new_in(alloc)).push(id),
+                    CallShape::Attr if c.path.kind == PathKind::Plain && c.path.segments.len() == 1 => {
+                        let last = self.attr_after.entry((fid, on)).or_insert(c.pos);
+                        *last = (*last).max(c.pos);
+                    }
+                    CallShape::Attr | CallShape::FnLike => {}
+                }
+            }
             slots.push((c.pos, Slot::Call(id)));
             if deep {
                 // Never resolved, never waited on: its scope's `RecursionLimit` error.
@@ -1046,8 +1130,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         // Positions are unique in a fragment: no sort order is left open.
         slots.sort_unstable_by_key(|s| s.0);
         self.frags.push(Frag { module: m, up, slots });
-        for u in d.uses.iter() {
-            let vis = self.vis_of(m, &u.vis)?;
+        for (k, u) in d.uses.iter().enumerate() {
+            let vis = self.import_vis(m, &u.vis, vis::VisAt { module: m, frag: fid, ord: (vis::ORD_USE, k as u32) })?;
             let (glob, binds) = match u.leaf {
                 UseForm::Glob => (true, None),
                 UseForm::Named { rename, .. } => {
@@ -1151,9 +1235,10 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         if m != self.root || self.plant == CellPlant::R8AddsNothing {
             return Ok(());
         }
-        if self.outer.externs.binary_search_by(|e| e.0.cmp(&name)).is_ok() {
+        if let Ok(k) = self.outer.externs.binary_search_by(|e| e.0.cmp(&name)) {
             if matches!(rename, Rename::To(_)) {
-                self.r8.push(name);
+                let first = Def::module(self.outer.externs[k].1);
+                self.r8.push((fid, EarlyAmbiguity { ns: Namespace::Types, name, kind: AmbiguityKind::MoreExpandedVsOuter, first, second: Some(def) }));
                 if self.plant == CellPlant::R8MacroReplaces {
                     self.outer.added.insert(name, root);
                 }
@@ -1169,7 +1254,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             let ws: AVec<'a, (ItemId, Def)> = AVec::from_slice_in(ws, self.alloc);
             for &(u, od) in ws.iter() {
                 if od != def && !self.encloses(f, self.items[u as usize].at) {
-                    self.r6_error(u);
+                    let e = EarlyAmbiguity { ns: Namespace::Types, name, kind: AmbiguityKind::MoreExpandedVsOuter, first: od, second: Some(def) };
+                    self.r6_error(u, e);
                 }
             }
         }
@@ -1183,6 +1269,20 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             (Some(at), Some(Outcome::Called(def))) => (self.items[i as usize].module, at, def),
             _ => return Ok(()),
         };
+        // Read now, before `grown` wakes its waiters (such an attribute among them,
+        // [`Cells::derive_helper`]); only where an attribute follows, so a derive no attribute
+        // follows never asks (a built-in derive's helpers are refused by the facts).
+        if at.shape == CallShape::Derive
+            && !self.helpers.contains_key(&def.key)
+            && let Some(&on) = self.call_on.get(&i)
+            && self.attr_after.get(&(at.frag, on)).is_some_and(|&last| last > at.pos)
+        {
+            let mut names: AVec<'a, N> = AVec::new_in(self.alloc);
+            facts.derive_helpers(def.key, &mut names).map_err(|error| CellError::Helpers { call: at.key, derive: def.key, error })?;
+            names.sort_unstable();
+            names.dedup();
+            self.helpers.insert(def.key, names);
+        }
         expand(at.key, def);
         let d = match facts.expansion(at.key) {
             Ok(Some(d)) => d,
@@ -1219,50 +1319,53 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     // -----------------------------------------------------------------------------------------
     // Visibility (R4).
 
-    fn vis_of(&self, m: ModId, v: &WrittenVis<Path<'_, N>>) -> Result<Visibility, CellError> {
-        let module = &self.modules[m as usize];
-        let bad = |why| CellError::BadVisibility { module: module.key, why };
-        let at = match v {
-            WrittenVis::Pub => return Ok(Visibility::Public),
-            WrittenVis::Crate => return Ok(Visibility::Crate(self.krate)),
-            WrittenVis::Private | WrittenVis::SelfOnly => m,
-            WrittenVis::Super => module.parent.ok_or(bad(BadVis::AboveRoot))?,
-            WrittenVis::WithoutIn(_) => return Err(bad(BadVis::WithoutIn)),
-            WrittenVis::In(p) => {
-                let mut at = match p.kind {
-                    PathKind::Crate => self.root,
-                    PathKind::SelfMod => m,
-                    PathKind::Super(n) => self.up(m, n).ok_or(bad(BadVis::AboveRoot))?,
-                    // Reference `vis.scoped.edition2018`: "The 2015 edition may also use paths
-                    // starting with `::` or modules from the crate root."
-                    PathKind::Plain | PathKind::Abs if self.edition == Edition::E2015 && self.plant != CellPlant::Use2015Lexical => self.root,
-                    PathKind::Plain | PathKind::Abs | PathKind::DollarCrate(_) => return Err(bad(BadVis::Start)),
-                };
-                // The target must be an ancestor (Reference `vis.scoped.in`): each segment names
-                // the next module down the asker's own chain, so the walk reads no entries.
-                let start = self.modules[at as usize].key;
-                let mut i = module.chain.iter().position(|&k| k == start).ok_or(bad(BadVis::Segment(0)))?;
-                for (j, s) in p.segments.iter().enumerate() {
-                    let next = i.checked_sub(1).ok_or(bad(BadVis::Segment(j)))?;
-                    let down = *self.by_key.get(&module.chain[next]).ok_or(bad(BadVis::Segment(j)))?;
-                    if self.modules[down as usize].name != Some(*s) {
-                        return Err(bad(BadVis::Segment(j)));
-                    }
-                    at = down;
-                    i = next;
-                }
-                at
-            }
-        };
-        Ok(if at == self.root { Visibility::Crate(self.krate) } else { Visibility::Restricted(self.modules[at as usize].key) })
+    // A written visibility's walk, its errors and `pub(in path)` through an import: vis.rs.
+
+    /// Whether `m` is a block's module ([`crate::blocks::is_block_module`]): an anonymous
+    /// scope, passed over by a written `self` and `super`.
+    fn anonymous(&self, m: ModId) -> bool {
+        self.modules[m as usize].name.is_some_and(|n| crate::blocks::is_block_module(n.as_ref()))
     }
 
-    fn up(&self, m: ModId, n: u8) -> Option<ModId> {
+    /// The module a written `self` names from `m`: `m`, or for a block's module the nearest
+    /// module around it that is no block's (the Reference, `paths.qualifiers.mod-self`; a block
+    /// is an anonymous scope). A block's module is made under its body's module, which is
+    /// loaded first, so its parent is always held and the walk ends at a module that is no
+    /// block's.
+    fn normal(&self, m: ModId) -> ModId {
         let mut at = m;
+        while self.anonymous(at) {
+            let Some(p) = self.modules[at as usize].parent else { break };
+            at = p;
+        }
+        at
+    }
+
+    /// The module `super` written `n` times names from `m` (`n == 0`: `self`): [`Cells::normal`]
+    /// of `m`, then `n` times its parent's [`Cells::normal`] (the Reference,
+    /// `paths.qualifiers.super`). `None`: past the root.
+    fn up(&self, m: ModId, n: u8) -> Option<ModId> {
+        let mut at = self.normal(m);
         for _ in 0..n {
-            at = self.modules[at as usize].parent?;
+            at = self.normal(self.modules[at as usize].parent?);
         }
         Some(at)
+    }
+
+    /// Whether import `i` is the `use super::*;` a block's module opens with
+    /// ([`crate::expanded_blocks::render`] writes it as the first import of the module's own
+    /// text): the block's lexical scope. It reaches the module's own parent (the block around
+    /// it, or the body's module), where a written `super` passes over blocks ([`Cells::up`]). A
+    /// `use super::*;` the user wrote in the block comes after it and keeps Rust's meaning.
+    fn lexical_glob(&self, i: ItemId) -> bool {
+        let it = &self.items[i as usize];
+        it.call.is_none()
+            && it.glob
+            && it.index == 0
+            && it.kind == PathKind::Super(1)
+            && it.segments.is_empty()
+            && it.at == self.modules[it.module as usize].text
+            && self.anonymous(it.module)
     }
 
     fn visible(&self, v: Visibility, from: ModId) -> bool {
@@ -1379,6 +1482,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     }
 
     fn cell(&mut self, m: ModId, ns: Namespace, name: N, layer: Layer) -> CellId {
+        if layer == Layer::Full {
+            *self.d116_reads.entry((self.d116_reader, m, ns, name, self.modules[m as usize].growth > 0)).or_insert(0) += 1;
+        }
         let key = (m, cell_slot(ns, layer), name);
         if let Some(&c) = self.cell_ids.get(&key) {
             return c;
@@ -1462,10 +1568,12 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         if self.cells[c as usize].value.is_some() {
             return;
         }
+        let reader = core::mem::replace(&mut self.d116_reader, (self.cells[c as usize].module, 0));
         match self.cell_value(c, None, Skip::No) {
             Step::Done(v) => self.decide(c, v),
             Step::Wait(on) => self.cell_waits(c, on),
         }
+        self.d116_reader = reader;
     }
 
     /// `c`'s value from its inputs; `guess` gives the current value of the cells of a cycle.
@@ -1484,7 +1592,12 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     }
                 }
                 if let Some(&(def, vis, ..)) = self.modules[m as usize].explicit.get(&(ns, name)) {
-                    return Step::Done(Value::Found(def, vis));
+                    // A `pub(in path)` read through the cells waits on them (vis.rs).
+                    return match self.entry_vis(m, ns, name, vis, guess) {
+                        Step::Done(Some(vis)) => Step::Done(Value::Found(def, vis)),
+                        Step::Done(None) => Step::Done(Value::Outside),
+                        Step::Wait(on) => Step::Wait(on),
+                    };
                 }
                 let mut found = None;
                 let mut outside = false;
@@ -1698,6 +1811,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
 
     /// Item `i`'s answer from its reads; `hold`: what holds a plain first segment's lookup.
     fn try_item(&mut self, i: ItemId, guess: Option<&Guess<'a>>, hold: Hold) -> Step<Outcome> {
+        self.d116_reader = (self.items[i as usize].module, 1 + u8::from(self.items[i as usize].call.is_some()));
+        self.d116_first.entry(i).or_insert(self.frags.len() as u32);
         let (m, kind, glob, binds, ivis) = {
             let it = &self.items[i as usize];
             (it.module, it.kind, it.glob, it.binds, it.vis)
@@ -1711,6 +1826,25 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         } else {
             kind
         };
+        // A derive's helper (the Reference, "Procedural Macros", "Derive macro helper
+        // attributes"): a one-segment attribute after a derive on its item, named in that
+        // derive's helpers, is inert. The innermost scope of an attribute (rustc's
+        // `Scope::DeriveHelpers`), so read before the textual scope.
+        if let Some(at) = self.items[i as usize].call
+            && at.shape == CallShape::Attr
+            && kind == PathKind::Plain
+            && self.items[i as usize].segments.len() == 1
+        {
+            let name = self.items[i as usize].segments[0];
+            match self.derive_helper(i, at, name, guess) {
+                Step::Done(true) => return Step::Done(Outcome::Inert),
+                Step::Done(false) => {}
+                Step::Wait(n) => {
+                    self.items[i as usize].waits.push(n);
+                    return Step::Wait(n);
+                }
+            }
+        }
         if let Some(at) = self.items[i as usize].call
             && kind == PathKind::Plain
             && self.items[i as usize].segments.len() == 1
@@ -1719,7 +1853,12 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             // A one-segment call looks in the textual scope first (Reference `macros.by-example.scope`).
             let name = self.items[i as usize].segments[0];
             match self.textual(at.frag, at.pos, name, Some(at.shape), guess) {
-                Step::Done(Some(def)) => return Step::Done(self.called(at, def)),
+                // An attribute `macro_rules!` named like a built-in attribute: the textual scope
+                // is nearer than the built-in attribute scope, and the two are ambiguous.
+                Step::Done(Some(_)) if self.builtin_attr(at, name) => {
+                    return Step::Done(Outcome::Failed(Unresolved::Ambiguous(AmbiguityKind::BuiltinAttr)));
+                }
+                Step::Done(Some(def)) => return Step::Done(self.called(i, at, def)),
                 Step::Done(None) => {}
                 Step::Wait(n) => {
                     self.items[i as usize].waits.push(n);
@@ -1733,7 +1872,13 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         let mut first = 0;
         let mut cur = match kind {
             PathKind::Crate => self.root,
-            PathKind::SelfMod => m,
+            // A block's lexical glob reaches the scope around the block ([`Cells::lexical_glob`]).
+            PathKind::Super(1) if self.lexical_glob(i) => match self.modules[m as usize].parent {
+                Some(p) => p,
+                None => return Step::Done(Outcome::Failed(Unresolved::NoParent)),
+            },
+            // A written `self` or `super` passes over blocks' modules ([`Cells::up`]).
+            PathKind::SelfMod => self.normal(m),
             PathKind::Super(n) => match self.up(m, n) {
                 Some(p) => p,
                 None => return Step::Done(Outcome::Failed(Unresolved::NoParent)),
@@ -1802,8 +1947,11 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         for k in first..steps {
             let s = self.items[i as usize].segments[k];
             self.items[i as usize].seg = k as u32;
+            // The kind of an ambiguity `first_segment` answers (`GlobVsOuter` where a glob's
+            // candidate meets a different outer one); every other ambiguity here is two globs'.
+            let mut amb_kind = AmbiguityKind::GlobVsGlob;
             let v = if kind == PathKind::Plain && k == 0 {
-                match self.first_segment(m, Namespace::Types, s, i, guess, hold) {
+                match self.first_segment(m, Namespace::Types, s, i, guess, hold, &mut amb_kind) {
                     Step::Done(v) => v,
                     Step::Wait(n) => {
                         self.items[i as usize].waits.push(n);
@@ -1825,7 +1973,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 Value::Found(_, vis) | Value::Ambiguous(_, vis) if !self.visible(vis, m) => {
                     return Step::Done(Outcome::Failed(Unresolved::Private));
                 }
-                Value::Ambiguous(..) => return Step::Done(Outcome::Failed(Unresolved::Ambiguous(AmbiguityKind::GlobVsGlob))),
+                Value::Ambiguous(..) => return Step::Done(Outcome::Failed(Unresolved::Ambiguous(amb_kind))),
                 Value::Found(def, vis) if def.kind == DefKind::Enum && self.enum_at(def.key).is_some() => {
                     // Through an enum whose variants are held: its variants are its names.
                     if let Some(e) = self.enum_at(def.key) {
@@ -1860,9 +2008,10 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         if let Some(at) = self.items[i as usize].call {
             // The path-based scope of a call: the leaf in the macro namespace. In its own module
             // the call reads its own view, which does not wait on its own growth.
+            let mut amb_kind = AmbiguityKind::GlobVsGlob;
             let v = if kind == PathKind::Plain && len == 1 {
                 // A one-segment call the textual scope missed: lexically, R6.
-                self.first_segment(m, Namespace::Macros, leaf, i, guess, hold)
+                self.first_segment(m, Namespace::Macros, leaf, i, guess, hold, &mut amb_kind)
             } else if cur == m {
                 match self.own_view(m, Namespace::Macros, leaf, i, Skip::Call(i), guess) {
                     Step::Done((v, _)) => Step::Done(v),
@@ -1874,6 +2023,23 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     Read::Wait(c) => Step::Wait(Node::Cell(c)),
                 }
             };
+            // A built-in attribute's name (`outer_of`'s built-in attribute scope): the built-in
+            // attribute, inert, when no nearer scope binds an attribute macro of the name; else
+            // the nearer one and the built-in are ambiguous (E0659, rustc's
+            // `AmbiguityKind::BuiltinAttr`: "built-in attribute vs any other name").
+            if kind == PathKind::Plain
+                && len == 1
+                && self.builtin_attr(at, leaf)
+                && let Step::Done(found) = &v
+            {
+                match *found {
+                    Value::Found(d, _) if d == BUILTIN_ATTR => return Step::Done(Outcome::Inert),
+                    Value::Found(..) | Value::Ambiguous(..) => {
+                        return Step::Done(Outcome::Failed(Unresolved::Ambiguous(AmbiguityKind::BuiltinAttr)));
+                    }
+                    Value::NotFound | Value::Outside => {}
+                }
+            }
             return match v {
                 Step::Wait(n) => {
                     self.items[i as usize].waits.push(n);
@@ -1884,14 +2050,15 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 Step::Done(Value::Found(_, vis) | Value::Ambiguous(_, vis)) if !self.visible(vis, m) => {
                     Step::Done(Outcome::Failed(Unresolved::Private))
                 }
-                Step::Done(Value::Ambiguous(..)) => Step::Done(Outcome::Failed(Unresolved::Ambiguous(AmbiguityKind::GlobVsGlob))),
-                Step::Done(Value::Found(def, _)) => Step::Done(self.called(at, def)),
+                Step::Done(Value::Ambiguous(..)) => Step::Done(Outcome::Failed(Unresolved::Ambiguous(amb_kind))),
+                Step::Done(Value::Found(def, _)) => Step::Done(self.called(i, at, def)),
             };
         }
         // An import never justifies itself: of its own name in its own module it reads the globs.
         let layer = if cur == m && binds == Some(leaf) { Layer::Globs } else { Layer::Full };
         let mut out = [None; 3];
         let (mut found, mut hidden, mut amb, mut wait, mut outside) = (false, false, false, None, false);
+        let mut amb_kind = AmbiguityKind::GlobVsGlob;
         let lexical = kind == PathKind::Plain && len == 1;
         let mut textual_open = false;
         let types_only = self.items[i as usize].types_only;
@@ -1929,7 +2096,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         Read::Ready(Value::Found(def, if exported { Visibility::Public } else { Visibility::Crate(self.krate) }))
                     }
                     // Else the leaf is a first segment (R6-R8), in each namespace.
-                    None => match self.first_segment(m, ns, leaf, i, guess, hold) {
+                    None => match self.first_segment(m, ns, leaf, i, guess, hold, &mut amb_kind) {
                         Step::Done(v) => Read::Ready(v),
                         Step::Wait(n) => {
                             self.items[i as usize].waits.push(n);
@@ -1967,8 +2134,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             }
         }
         if amb {
-            // An ambiguous namespace fails the import at once (R2).
-            return Step::Done(Outcome::Failed(Unresolved::Ambiguous(AmbiguityKind::GlobVsGlob)));
+            // An ambiguous namespace fails the import at once (R2, R7 by its kind).
+            return Step::Done(Outcome::Failed(Unresolved::Ambiguous(amb_kind)));
         }
         if let Some(w) = wait {
             return Step::Wait(w);
@@ -2008,7 +2175,12 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         }
         if let Some(&(def, vis, ..)) = self.modules[m as usize].explicit.get(&(ns, name)) {
             let from = self.written.get(&(m, ns, name)).map_or(From::Own, |&f| From::Wrote(f));
-            return Step::Done((Value::Found(def, vis), from));
+            let value = match self.entry_vis(m, ns, name, vis, guess) {
+                Step::Done(Some(vis)) => Value::Found(def, vis),
+                Step::Done(None) => Value::Outside,
+                Step::Wait(on) => return Step::Wait(on),
+            };
+            return Step::Done((value, from));
         }
         let (mut found, mut outside) = (None, false);
         let named_count = self.modules[m as usize].named.get(&name).map_or(0, |v| v.len());
@@ -2177,6 +2349,15 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 return Step::Done(Some(Value::Outside));
             }
         }
+        if ns == Namespace::Macros
+            && sub == Some(CallShape::Attr)
+            && self.builtin_attrs.contains(&name)
+        {
+            // The built-in attribute scope, after the `#[macro_use]` prelude and before the
+            // standard prelude (rustc's `Scope::BuiltinAttrs`): an attribute call's name that is
+            // a built-in attribute is bound to it here. An import passes no `sub`: never bound.
+            return Step::Done(Some(Value::Found(BUILTIN_ATTR, Visibility::Public)));
+        }
         if let Some(p) = self.outer.local {
             // A name the standard prelude lacks goes on to the language prelude.
             return match self.read(p, ns, name, Layer::Full, guess) {
@@ -2204,9 +2385,47 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// `core::macros::builtin`, reached through the standard prelude (Reference, "Preludes").
     fn builtin(&self, ns: Namespace, name: N) -> Option<Value> {
         match ns {
-            Namespace::Types => crate::builtin_type(name.as_ref()).map(|d| Value::Found(d, Visibility::Public)),
+            // Under `#![blaze::arbitrary_ints]` an integer of any width too (`u24`, `i80`).
+            Namespace::Types => crate::builtin_type_in(name.as_ref(), self.arbitrary_ints).map(|d| Value::Found(d, Visibility::Public)),
             Namespace::Macros | Namespace::Values => None,
         }
+    }
+
+    /// Call `at` is an attribute whose one-segment name `name` is a built-in attribute's.
+    fn builtin_attr(&self, at: CallAt, name: N) -> bool {
+        at.shape == CallShape::Attr && self.builtin_attrs.contains(&name)
+    }
+
+    /// Whether attribute call `i` (one segment, `name`, written at `at`) names a helper of a
+    /// derive written before it on the same item of the same fragment: in scope on the item the
+    /// derive is applied to, from the derive on (the Reference, "Derive macro helper
+    /// attributes"). A derive not grown yet is waited for (its helpers are read as it expands,
+    /// [`Cells::expand_call`], before it grows); under a stall's guess its guessed outcome is
+    /// taken, and a derive whose helpers are not read yet then gives none. Reads only the
+    /// derives of the call's own item (`derives_on`), never the module's calls.
+    fn derive_helper(&self, i: ItemId, at: CallAt, name: N, guess: Option<&Guess<'a>>) -> Step<bool> {
+        let Some(&on) = self.call_on.get(&i) else { return Step::Done(false) };
+        let Some(derives) = self.derives_on.get(&(at.frag, on)) else { return Step::Done(false) };
+        for &d in derives.iter() {
+            let it = &self.items[d as usize];
+            if it.pos >= at.pos {
+                continue;
+            }
+            let outcome = if it.grown {
+                it.outcome
+            } else {
+                match guess.and_then(|g| g.items.get(&d)) {
+                    Some(&o) => o,
+                    None => return Step::Wait(Node::Item(d)),
+                }
+            };
+            if let Some(Outcome::Called(def)) = outcome
+                && self.helpers.get(&def.key).is_some_and(|h| h.binary_search(&name).is_ok())
+            {
+                return Step::Done(true);
+            }
+        }
+        Step::Done(false)
     }
 
     /// A plain path's first segment `name` (or a one-segment path's leaf) in `ns` at `m`, asked
@@ -2222,7 +2441,11 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// "All name resolution candidates selected during macro expansion are considered
     /// speculative. Once the crate has been fully expanded, all speculative import resolutions
     /// are validated to ensure that macro expansion did not introduce any new ambiguities.").
-    fn first_segment(&mut self, m: ModId, ns: Namespace, name: N, me: ItemId, guess: Option<&Guess<'a>>, hold: Hold) -> Step<Value> {
+    ///
+    /// `amb_kind`: set to `GlobVsOuter` when the answer is ambiguous because a glob's candidate
+    /// meets a different outer one (`...ambiguity.glob-vs-outer`); left as it is otherwise.
+    #[expect(clippy::too_many_arguments, reason = "the lookup's inputs, and the ambiguity kind it answers beside its value")]
+    fn first_segment(&mut self, m: ModId, ns: Namespace, name: N, me: ItemId, guess: Option<&Guess<'a>>, hold: Hold, amb_kind: &mut AmbiguityKind) -> Step<Value> {
         let weak = hold == Hold::NamedImport;
         let view = if weak { self.weak_view(m, ns, name, me) } else { self.own_view(m, ns, name, me, Skip::Growth, guess) };
         let (inner, from) = match view {
@@ -2256,7 +2479,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     && od != d
                     && self.plant != CellPlant::GlobBeatsOuter
                 {
-                    // `...ambiguity.glob-vs-outer`: the import fails at its first segment.
+                    // `...ambiguity.glob-vs-outer`: the import fails at its first segment, and
+                    // its error names this kind (not two globs').
+                    *amb_kind = AmbiguityKind::GlobVsOuter;
                     return Step::Done(Value::Ambiguous(d, v));
                 }
                 // Every candidate a macro call's path selects is speculative (the rule quoted
@@ -2287,27 +2512,45 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     if let Value::Found(gd, _) | Value::Ambiguous(gd, _) = globbed
                         && gd != d
                     {
+                        let e = EarlyAmbiguity { ns, name, kind: AmbiguityKind::GlobVsExpanded, first: gd, second: Some(d) };
                         if weak {
-                            self.taken.push(Taken::Error);
+                            self.taken.push(Taken::Error(e));
                         } else if guess.is_none() {
-                            self.r6_error(me);
+                            self.r6_error(me, e);
                         }
                         return Step::Done(globbed);
                     }
                 }
+                if let From::Wrote(_) = from
+                    && !weak
+                    && guess.is_none()
+                {
+                    // GlobVsExpanded (rustc's "forbid expanded shadowing to avoid time travel"):
+                    // the name an expansion wrote into `m` shadows a glob candidate this use
+                    // would have taken before the expansion (Reference
+                    // `names.resolution.expansion.expansion-order-stability`: "names in the
+                    // fully expanded AST must resolve to the same definition regardless of the
+                    // order in which macros are expanded and imports are resolved"). The
+                    // module's globs are read when the run ends (`validate_expanded`), never
+                    // waited on here: a glob of `m` may itself wait on this use.
+                    let g = self.cell(m, ns, name, Layer::Globs);
+                    self.expanded_uses.insert((me, ns), (name, d, g));
+                }
                 if let From::Wrote(f) = from
                     && let Some(o) = outer
-                    && outer_def.is_some_and(|od| od != d)
+                    && let Some(od) = outer_def
+                    && od != d
                     && !self.encloses(f, self.items[me as usize].at)
                 {
                     // R6 in the other order: the inner definition came first, from an expansion
                     // that does not enclose the use, beside a different outer binding. The
                     // answer is the one every order gives: the outer binding, with the error at
                     // the expansion's definition (wide seed 8 with calls: the reference's).
+                    let e = EarlyAmbiguity { ns, name, kind: AmbiguityKind::MoreExpandedVsOuter, first: od, second: Some(d) };
                     if weak {
-                        self.taken.push(Taken::Error);
+                        self.taken.push(Taken::Error(e));
                     } else if guess.is_none() {
-                        self.r6_error(me);
+                        self.r6_error(me, e);
                     }
                     if self.plant != CellPlant::InnerAfterWrite {
                         return Step::Done(o);
@@ -2322,7 +2565,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         return Step::Wait(Node::Item(me));
                     }
                     let g = self.cell(m, ns, name, Layer::Globs);
-                    self.taken.push(Taken::Watch(m, ns, name, d));
+                    self.taken.push(Taken::Watch(m, ns, name, d, AmbiguityKind::GlobVsExpanded));
                     self.taken.push(Taken::Globs(g, d, true));
                 } else if from == From::Glob
                     && let Some(j) = self.growing(m, me, guess)
@@ -2342,7 +2585,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     // a valid definition"); a later write of the name by an expansion that
                     // does not enclose this use is the error, by the watch.
                     if guess.is_none() {
-                        self.watches.entry((m, ns, name)).or_insert_with(|| AVec::new_in(self.alloc)).push((me, d));
+                        self.watches.entry((m, ns, name)).or_insert_with(|| AVec::new_in(self.alloc)).push((me, d, AmbiguityKind::GlobVsExpanded));
                     }
                 }
                 Step::Done(inner)
@@ -2362,7 +2605,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     }
                     if let Some(od) = outer_def {
                         let g = self.cell(m, ns, name, Layer::Globs);
-                        self.taken.push(Taken::Watch(m, ns, name, od));
+                        self.taken.push(Taken::Watch(m, ns, name, od, AmbiguityKind::MoreExpandedVsOuter));
                         self.taken.push(Taken::Globs(g, od, false));
                     }
                     Step::Done(o)
@@ -2378,7 +2621,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         if let Some(od) = outer_def
                             && self.growing(m, me, None).is_some()
                         {
-                            self.watches.entry((m, ns, name)).or_insert_with(|| AVec::new_in(self.alloc)).push((me, od));
+                            self.watches.entry((m, ns, name)).or_insert_with(|| AVec::new_in(self.alloc)).push((me, od, AmbiguityKind::MoreExpandedVsOuter));
                         }
                         // The binding of a scope after the extern prelude, while a root call
                         // may still write `extern crate .. as name;` (R6 for the extern prelude).
@@ -2421,8 +2664,18 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         false
     }
 
-    fn r6_error(&mut self, me: ItemId) {
-        if self.r6.insert(me) {
+    /// R6's error `e` at item `me` (a use or a call). A second error at one item keeps the
+    /// least, so what is written does not depend on which the work met first (rule 25).
+    fn r6_error(&mut self, me: ItemId, e: EarlyAmbiguity<N>) {
+        let mut new = false;
+        let had = self.r6.entry(me).or_insert_with(|| {
+            new = true;
+            e
+        });
+        if e < *had {
+            *had = e;
+        }
+        if new {
             self.stats.r6_errors += 1;
         }
     }
@@ -2435,11 +2688,11 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             return;
         }
         let Some(ws) = self.watches.get(&(m, ns, name)) else { return };
-        let ws: AVec<'a, (ItemId, Def)> = AVec::from_slice_in(ws, self.alloc);
-        for &(u, od) in ws.iter() {
+        let ws: AVec<'a, (ItemId, Def, AmbiguityKind)> = AVec::from_slice_in(ws, self.alloc);
+        for &(u, od, kind) in ws.iter() {
             // The outer definition itself is no other candidate (D57).
             if od != def && !self.encloses(f, self.items[u as usize].at) {
-                self.r6_error(u);
+                self.r6_error(u, EarlyAmbiguity { ns, name, kind, first: od, second: Some(def) });
             }
         }
     }
@@ -2448,12 +2701,31 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// else refused by name. Its sub-namespace's candidates alone were looked at
     /// ([`same_sub`]), so what is refused here is the other shape of that sub-namespace (an
     /// attribute macro named by `#[derive(..)]`, a derive by `#[..]`) or, for a path of two or
-    /// more segments, any macro the path's module holds under that name.
-    fn called(&self, at: CallAt, def: Def) -> Outcome {
+    /// more segments, any macro the path's module holds under that name. Call `i` in a derive
+    /// helper's place ([`Cells::after_derive`]: names-attr-4's helper checks, which have no
+    /// input) that is no helper and finds an attribute macro is refused `WrongMacroKind`, never
+    /// called: on a variant or a field rustc refuses it too ("expected non-macro attribute, found
+    /// attribute macro"); on the item itself rustc would expand it after the derives, which the
+    /// lowering does not build (it reads a one-segment name after a derive as a helper), so it
+    /// is refused by this name, never expanded with no input or dropped.
+    fn called(&self, i: ItemId, at: CallAt, def: Def) -> Outcome {
         match def.kind {
-            DefKind::Macro(s) if s.accepts(at.shape) || self.plant == CellPlant::SubNamespaceIgnored => Outcome::Called(def),
+            DefKind::Macro(s) if s.accepts(at.shape) || self.plant == CellPlant::SubNamespaceIgnored => {
+                if self.after_derive(i, at) { Outcome::Failed(Unresolved::WrongMacroKind) } else { Outcome::Called(def) }
+            }
             _ => Outcome::Failed(Unresolved::WrongMacroKind),
         }
+    }
+
+    /// Whether attribute call `i`, written at `at`, follows a derive written on its item in its
+    /// fragment: a derive helper's place (the Reference, "Derive macro helper attributes").
+    /// Reads only the derives of the call's own item (`derives_on`).
+    fn after_derive(&self, i: ItemId, at: CallAt) -> bool {
+        if at.shape != CallShape::Attr {
+            return false;
+        }
+        let Some(&on) = self.call_on.get(&i) else { return false };
+        self.derives_on.get(&(at.frag, on)).is_some_and(|derives| derives.iter().any(|&d| self.items[d as usize].pos < at.pos))
     }
 
     /// The text of `m` defines a `macro_rules!` named `name`.
@@ -2664,6 +2936,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             }
             if !self.quiet_point()? {
                 self.validate_speculated();
+                self.validate_expanded();
                 return Ok(());
             }
         }
@@ -2698,7 +2971,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
 
     /// An R6 error is reported for import `index` of fragment `frag` (keyed as in `outcome`).
     pub(crate) fn import_has_r6(&self, frag: ItemKey, index: u32) -> bool {
-        self.import_at(frag, index).is_some_and(|i| self.r6.contains(&i))
+        self.import_at(frag, index).is_some_and(|i| self.r6.contains_key(&i))
     }
 
     /// A call's outcome, by its key.
@@ -2750,6 +3023,10 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                             if self.cells[g as usize].value.is_none() {
                                 out.push(Node::Cell(g));
                             }
+                        }
+                        // An explicit entry's `pub(in path)` read through the cells (vis.rs).
+                        if let Some(on) = self.vis_wait(m, ns, name) {
+                            out.push(on);
                         }
                     }
                     Layer::Globs => {
@@ -2959,7 +3236,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             let mut changed = false;
             for &n in members {
                 let step = match n {
-                    Node::Cell(c) => match self.cell_value(c, Some(&guess), Skip::No) {
+                    Node::Cell(c) => match (self.d116_reader = (self.cells[c as usize].module, 0), self.cell_value(c, Some(&guess), Skip::No)).1 {
                         Step::Done(v) => Step::Done(GuessStep::Cell(Some(v).filter(|v| *v != Value::NotFound))),
                         Step::Wait(on) => Step::Wait(on),
                     },
@@ -3089,7 +3366,34 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 Some(Value::NotFound) if !globbed => {}
                 // Unknown here, or not decided: no other answer is shown.
                 Some(Value::Outside) | None => {}
-                Some(Value::Found(..) | Value::Ambiguous(..) | Value::NotFound) => self.r6_error(i),
+                Some(v @ (Value::Found(..) | Value::Ambiguous(..) | Value::NotFound)) => {
+                    // The globs' answer now: another definition beside the one taken, or none
+                    // (the candidate the stall took is gone, no second definition to name).
+                    let second = match v {
+                        Value::Found(d, _) | Value::Ambiguous(d, _) => Some(d),
+                        Value::NotFound | Value::Outside => None,
+                    };
+                    let c = &self.cells[g as usize];
+                    let e = EarlyAmbiguity { ns: c.ns, name: c.name, kind: AmbiguityKind::GlobVsOuter, first: def, second };
+                    self.r6_error(i, e);
+                }
+            }
+        }
+    }
+
+    /// GlobVsExpanded, when the run ends: each use whose plain first segment took a name an
+    /// expansion wrote into its module ([`Cells::first_segment`] records it) is the error where
+    /// the module's globs, decided now, bring a different definition of the name (the Reference
+    /// `names.resolution.expansion.expansion-order-stability`, quoted there). Globs bringing
+    /// nothing or the same definition are no other candidate (D57); a `Globs` cell unknown here
+    /// (`Outside`) or not decided shows nothing. Idempotent: `ask` runs the loop's end again.
+    fn validate_expanded(&mut self) {
+        for (&key, &(name, def, g)) in self.expanded_uses.iter() {
+            match self.cells[g as usize].value {
+                Some(Value::Found(gd, _) | Value::Ambiguous(gd, _)) if gd != def => {
+                    self.glob_vs_expanded.insert(key, (name, def, gd));
+                }
+                Some(Value::Found(..) | Value::Ambiguous(..) | Value::NotFound | Value::Outside) | None => {}
             }
         }
     }
@@ -3143,7 +3447,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             // `#[derive(Clone)]` in a module whose globs wait on its own derives takes the
             // standard prelude's; `cfg_select!` there is unknown, never failed), and nothing
             // else is guessed: every later segment is read from a decided cell.
-            if let Step::Done(o @ (Outcome::Called(_) | Outcome::Outside)) = self.stalled_call(i, &calls) {
+            if let Step::Done(o @ (Outcome::Called(_) | Outcome::Inert | Outcome::Outside)) = self.stalled_call(i, &calls) {
                 picked.push((i, o));
                 for k in 0..self.taken.len() {
                     kept.push((i, self.taken[k]));
@@ -3158,9 +3462,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             self.stats.stalls += 1;
             for &(i, t) in kept.iter() {
                 match t {
-                    Taken::Watch(m, ns, name, def) => self.watches.entry((m, ns, name)).or_insert_with(|| AVec::new_in(alloc)).push((i, def)),
+                    Taken::Watch(m, ns, name, def, kind) => self.watches.entry((m, ns, name)).or_insert_with(|| AVec::new_in(alloc)).push((i, def, kind)),
                     Taken::Globs(g, def, globbed) => self.speculated.push((i, g, def, globbed)),
-                    Taken::Error => self.r6_error(i),
+                    Taken::Error(e) => self.r6_error(i, e),
                 }
             }
             for &(i, o) in picked.iter() {

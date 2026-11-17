@@ -206,8 +206,11 @@ pub const NAMES_DOMAIN: &str = "blaze v2 file item names 1";
 
 /// The domain of [`Outline::surface`] (the drive's `Surface` part). `v2` since 2026-11-16: the
 /// surface hashes each entry's names digest, no longer its signature digest, so a surface of
-/// `v1` is never compared with one of `v2` and every record keyed by one is made again.
-pub const SURFACE_DOMAIN: &str = "blaze-cli surface v2";
+/// `v1` is never compared with one of `v2` and every record keyed by one is made again. `v3`
+/// since names-attr-4: it also hashes the file's inner attributes (`Outline::file_names`), which
+/// the name solver reads (`#![register_tool]`, `#![no_std]`, a module's `#![cfg]`); a `v2`
+/// surface is never compared with a `v3` one.
+pub const SURFACE_DOMAIN: &str = "blaze-cli surface v3";
 
 /// The outline of `text`, a source file of `edition`, in `alloc`: every item it declares at any
 /// module-level nesting, in source order, and the syntax errors of the parse. It always
@@ -312,6 +315,10 @@ pub struct Outline<'a> {
     /// hashes. A column of the outline, not a field of blaze-surface's `Item`, so the record's
     /// form is unchanged; position-free, so a part's are the whole file's.
     names: AVec<'a, ContentId>,
+    /// The digest of the file's inner attributes but its doc comments, by their text
+    /// (crate::names_digest::file_names_digest): what the name solver reads of them, hashed
+    /// first by [`Outline::surface`] (names-attr-4, rule 21).
+    file_names: ContentId,
     /// The flags of the file's own tokens, outside every entry.
     own_flags: ItemFlags,
     /// `own_flags` and every entry's together.
@@ -334,6 +341,7 @@ impl Outline<'_> {
             messages: exact(&self.messages, alloc),
             keys: exact(&self.keys, alloc),
             names: exact(&self.names, alloc),
+            file_names: self.file_names,
             own_flags: self.own_flags,
             flags: self.flags,
         }
@@ -382,10 +390,13 @@ impl Outline<'_> {
     /// form, a `use` tree, an impl's header; the whole entry under a derive or an attribute
     /// macro, and a macro's or macro call's tokens). A body edit, and an edit to a type, a bound
     /// or a const's value, leaves it equal (the drive's `Surface` part; blaze-world's `names
-    /// --records`).
+    /// --records`). First the file's inner attributes but its doc comments, by their text
+    /// (`file_names`): the root's `#![register_tool]`, `#![no_std]`, `#![no_core]`, a module's
+    /// `#![cfg]`, which every module's lowering or the crate's prelude reads.
     pub fn surface(&self) -> ContentId {
         let items = &self.items;
         let mut hasher = blaze_ids::Hasher::new(SURFACE_DOMAIN);
+        hasher.id(&self.file_names);
         let mut at = 0;
         while at < items.len() {
             let item = &items[at];
@@ -475,6 +486,7 @@ impl PartialEq for Outline<'_> {
             && self.messages[..] == other.messages[..]
             && self.keys[..] == other.keys[..]
             && self.names[..] == other.names[..]
+            && self.file_names == other.file_names
             && self.own_flags == other.own_flags
             && self.flags == other.flags
     }

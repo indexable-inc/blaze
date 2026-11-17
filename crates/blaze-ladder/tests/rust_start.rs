@@ -22,7 +22,7 @@
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::Front2;
 use blaze_ladder::front2::heads::Store;
-use blaze_ladder::front2::start::{Entry2, rust_start, through_lang_start};
+use blaze_ladder::front2::start::{Entry2, linked_lang_start, rust_start};
 use blaze_ladder::refusal::SourceFile;
 use blaze_own::Alloc;
 use blaze_scope::names::{self, Written};
@@ -49,13 +49,16 @@ fn rust_start_of_hello() {
     let mut store = Store::new(front.index.lang("sized"), front.frame);
 
     // An edition-2024 root with std, exporting nothing: the Rust start.
-    assert!(through_lang_start(&names), "an edition-2024 root with std starts through `#[lang = \"start\"]`");
+    let lang_start = linked_lang_start(&names, blaze_own::testing::heap().alloc())
+        .unwrap_or_else(|e| panic!("the start rule: {e}"))
+        .expect("an edition-2024 root with std starts through `#[lang = \"start\"]`");
     let written = Written { kind: PathKind::Plain, segments: &["main"] };
     let found = names::path(&names, names.root(0), Namespace::Values, written, Alloc::global()).ok();
     let main = found.and_then(|f| f.whole(1)).expect("the crate root's `fn main` resolves").key;
 
-    let start = rust_start(&names, main, &mut store, &mut front.keys).unwrap_or_else(|e| panic!("rust_start: {e}"));
+    let start = rust_start(&names, lang_start, main, &mut store, &mut front.keys).unwrap_or_else(|e| panic!("rust_start: {e}"));
     assert_eq!(start.main, main);
+    assert_eq!(start.lang_start, lang_start);
     assert_eq!(Entry2::Rust(start).root(), main, "the walk starts at `main`; `lang_start` is reached beside it");
 
     // The `#[lang = "start"]` item is std's `rt::lang_start`.

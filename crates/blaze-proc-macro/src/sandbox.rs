@@ -30,6 +30,9 @@ pub enum Files {
     /// A record's files (a fetched package's, read in place from its fetch record), by their
     /// path from the package's folder, sorted by path, each once.
     Listed(std::sync::Arc<[(String, &'static [u8])]>),
+    /// A workspace member's (D96 (3)): its workspace's folder on disk, served at `/workspace`
+    /// with the member at `root`'s dir in it; paths are from the workspace's folder.
+    Member { workspace: PathBuf, root: crate::script_sandbox::ScriptRoot },
 }
 
 impl std::fmt::Debug for Files {
@@ -37,6 +40,7 @@ impl std::fmt::Debug for Files {
         match self {
             Files::Folder(dir) => write!(f, "Folder({})", dir.display()),
             Files::Listed(files) => write!(f, "Listed({} files)", files.len()),
+            Files::Member { workspace, root } => write!(f, "Member({} at {})", workspace.display(), root.seen()),
         }
     }
 }
@@ -48,6 +52,15 @@ enum Found {
 }
 
 impl Files {
+    /// What a macro served these files sees as its package's root (D96): `/package` for a
+    /// dependency's, `/workspace/<dir>` for a member's.
+    pub fn seen(&self) -> blaze_expand::seen::SeenRoot<'_> {
+        match self {
+            Files::Folder(_) | Files::Listed(_) => blaze_expand::seen::SeenRoot::Package,
+            Files::Member { root, .. } => root.seen(),
+        }
+    }
+
     /// The folder on disk of `rel` (a path from the package's folder), when it is in it.
     /// `Err`: a link out of the package's folder, named.
     fn real(root: &Path, rel: &str) -> Result<Option<PathBuf>, String> {
@@ -71,7 +84,9 @@ impl Files {
 
     fn find(&self, rel: &str) -> Result<Option<Found>, String> {
         match self {
-            Files::Folder(root) => Ok(Files::real(root, rel)?.and_then(|real| stat_of(&real)).map(|(filetype, size)| if filetype == Filetype::Directory { Found::Folder } else { Found::File(size) })),
+            Files::Folder(root) | Files::Member { workspace: root, .. } => {
+                Ok(Files::real(root, rel)?.and_then(|real| stat_of(&real)).map(|(filetype, size)| if filetype == Filetype::Directory { Found::Folder } else { Found::File(size) }))
+            }
             Files::Listed(files) => {
                 if let Ok(at) = files.binary_search_by(|(path, _)| path.as_str().cmp(rel)) {
                     return Ok(Some(Found::File(files[at].1.len() as u64)));
@@ -84,7 +99,7 @@ impl Files {
     /// The bytes of the file `rel`; `None` when absent.
     fn bytes(&self, rel: &str) -> Result<Option<Vec<u8>>, String> {
         match self {
-            Files::Folder(root) => Ok(Files::real(root, rel)?.and_then(|real| std::fs::read(real).ok())),
+            Files::Folder(root) | Files::Member { workspace: root, .. } => Ok(Files::real(root, rel)?.and_then(|real| std::fs::read(real).ok())),
             Files::Listed(files) => Ok(files.binary_search_by(|(path, _)| path.as_str().cmp(rel)).ok().map(|at| files[at].1.to_vec())),
         }
     }
@@ -92,7 +107,7 @@ impl Files {
     /// The entries of the folder `rel`, sorted by name.
     fn listing(&self, rel: &str) -> Result<Vec<(Vec<u8>, Filetype)>, String> {
         match self {
-            Files::Folder(root) => Ok(Files::real(root, rel)?.map(|real| listing(&real)).unwrap_or_default()),
+            Files::Folder(root) | Files::Member { workspace: root, .. } => Ok(Files::real(root, rel)?.map(|real| listing(&real)).unwrap_or_default()),
             Files::Listed(files) => {
                 let mut entries: Vec<(Vec<u8>, Filetype)> = Vec::new();
                 for rest in Files::under(files, rel) {
@@ -132,9 +147,9 @@ pub struct Package {
 }
 
 impl Package {
-    /// The folder the macro runs in.
+    /// The folder the macro runs in: the root it sees (`CARGO_MANIFEST_DIR`, D96).
     pub fn cwd(&self) -> String {
-        PACKAGE.to_owned()
+        self.files.seen().to_string()
     }
 }
 
@@ -279,9 +294,15 @@ impl Sandbox {
                 part => parts.push(part),
             }
         }
-        match parts.split_first() {
-            Some((first, rest)) if PACKAGE.strip_prefix('/') == Some(*first) => Ok(rest.join("/")),
-            _ => Err(self.refuse(format!("named /{text}, outside {PACKAGE}, the package's own folder, the only one a macro may read"))),
+        // The one home of the mount points: `SeenRoot::in_tree` (a member's path is from its
+        // workspace's folder, a dependency's from its package's).
+        let full = format!("/{}", parts.join("/"));
+        let seen = self.package.files.seen();
+        let mount = seen.mount();
+        let rel = seen.in_tree(&full).map(str::to_owned);
+        match rel {
+            Some(rel) => Ok(rel),
+            None => Err(self.refuse(format!("named /{text}, outside {mount}, the tree the macro is served, the only one it may read"))),
         }
     }
 
@@ -467,5 +488,35 @@ impl System for Sandbox {
 
     fn exit(&mut self, code: u32) -> Stop {
         Stop(format!("exited with code {code} (`std::process::exit`), which an expansion may not"))
+    }
+}
+
+#[cfg(test)]
+mod seen_tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use super::{Files, Package, Sandbox};
+    use crate::script_sandbox::ScriptRoot;
+
+    /// D96 (3): a member's macro runs in `/workspace/<dir>` and opens its workspace's files by
+    /// their path from the workspace's folder; `/package` is not its tree. A dependency's runs
+    /// in `/package`. The cargo book: "CARGO_MANIFEST_DIR — The directory containing the
+    /// manifest of your package." No macro runs (plan only). Expected line:
+    /// `test sandbox::seen_tests::a_member_s_macro_runs_in_its_workspace_dir ... ok`.
+    #[test]
+    fn a_member_s_macro_runs_in_its_workspace_dir() {
+        let root = ScriptRoot::member("crates/m").unwrap_or_else(|e| panic!("{e}"));
+        let member = Package { files: Files::Member { workspace: PathBuf::from("/nonexistent-ws"), root }, env: Vec::new() };
+        assert_eq!(member.cwd(), "/workspace/crates/m");
+        let dependency = Package { files: Files::Listed(Arc::from(Vec::new())), env: Vec::new() };
+        assert_eq!(dependency.cwd(), "/package");
+        let mut sandbox = Sandbox::new(Arc::new(member));
+        assert_eq!(sandbox.resolve(b"/workspace/crates/m/Cargo.toml").ok().as_deref(), Some("crates/m/Cargo.toml"));
+        assert_eq!(sandbox.resolve(b"workspace/Cargo.toml").ok().as_deref(), Some("Cargo.toml"));
+        assert!(sandbox.resolve(b"/package/Cargo.toml").is_err(), "a member's macro is not served /package");
+        let mut dep = Sandbox::new(Arc::new(dependency));
+        assert_eq!(dep.resolve(b"/package/src/lib.rs").ok().as_deref(), Some("src/lib.rs"));
+        assert!(dep.resolve(b"/workspace/x").is_err());
     }
 }
