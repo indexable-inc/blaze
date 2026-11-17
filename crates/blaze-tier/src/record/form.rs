@@ -1,4 +1,5 @@
-//! The one new code record's on-disk form, `bzcode02` (D100 point 11): [`seal`] puts an
+//! The one new code record's on-disk form, `bzcode03` (D100 point 11; D106 added the declared
+//! instances, declared.rs, and the closing digest): [`seal`] puts an
 //! [`Emitted`] in its one canonical form and checks every rule of it once, [`encode`] writes a
 //! [`Sealed`] record's bytes, [`read`] reads them in place as a [`RecordView`], checking every tag
 //! and every rule again (bytes from a store or a fetch are checked once, here: rule 74), and
@@ -27,10 +28,15 @@
 //!
 //! Layout (little-endian; every section starts 8-aligned from the record's first byte): `MAGIC`;
 //! `frame: u32` (the frame's size below the frame record); the unwind frame word (blaze-code
-//! unwind.rs's `Frame::word`, 0 for none); fifteen `u32` counts (code bytes, relro bytes, targets,
+//! unwind.rs's `Frame::word`, 0 for none); sixteen `u32` counts (code bytes, relro bytes, targets,
 //! relocations, words, pads, unwind rows, loop headers, live values, polls, inline frames,
-//! positions, reads, names, text bytes); `flags: u32` (0); then the sections in that order, each
-//! padded to 8:
+//! positions, reads, names, declared instances, text bytes); `flags: u32` (0); a reserved `u32`
+//! (0); then the sections in that order, each padded to 8; then the DIGEST: 32 bytes of BLAKE3
+//! (domain [`DIGEST_DOMAIN`]) over every byte before it, so any changed byte of a shared record
+//! is refused ([`FormError::Digest`]). The names' text holds the C names, then the declared
+//! names, in row order, tiling it exactly. A record of another form number (`bzcode02`) is
+//! refused naming both numbers ([`FormError::OtherForm`]): an old record is reported and
+//! rebuilt, never migrated (rule 26).
 //!
 //! | section | row |
 //! |---|---|
@@ -46,6 +52,7 @@
 //! | position (16) | `at`, `frame`, `span_lo`, `span_hi`, each `u32` |
 //! | read (64) | fact 32, digest 32 |
 //! | name (40) | symbol 32, text `at: u32`, `len: u32` |
+//! | declared instance (64) | symbol 32, `item: u128`, kind `u8`, 3 zero, name `at: u32`, `len: u32`, 4 zero (declared.rs) |
 //!
 //! Relocation kinds by byte: Page21 0, PageOff12 1, Branch26 2, GotPage21 3, GotPageOff12 4, Abs64
 //! 5, Pc32 6, GotPc32 7 (piece 0's discriminants).
@@ -54,19 +61,28 @@ use core::fmt;
 
 use blaze_code::record::{DecodeError, OWN_CODE, OWN_RELRO, Pad, RecordError, Space, Symbol, Target, Word};
 use blaze_code::unwind::{Action, Frame, INST, Row, UnwindError};
+use blaze_ids::Hasher;
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_run::InstanceKey;
 use blaze_run::parent::Read;
 
+use super::declared::{self, Declared, DeclaredKind, DeclaredRow};
 use super::{Emitted, InlineFrame, Live, LoopHeader, OUTERMOST, Place, Poll, Position, Reloc, RelocKind};
 use crate::Reg;
 
-/// The first eight bytes of every encoded record of this form.
-pub const MAGIC: [u8; 8] = *b"bzcode02";
+/// The first eight bytes of every encoded record of this form: the ONE place its number is.
+pub const MAGIC: [u8; 8] = *b"bzcode03";
 
-/// The bytes before the sections: magic, frame, unwind word, fifteen counts, flags.
-const HEAD: usize = 80;
-const SECTIONS: usize = 15;
+/// [`MAGIC`]'s number, for [`FormError::OtherForm`].
+const FORM_NUMBER: u8 = (MAGIC[6] - b'0') * 10 + (MAGIC[7] - b'0');
+
+/// The bytes before the sections: magic, frame, unwind word, sixteen counts, flags, reserved.
+const HEAD: usize = 88;
+const SECTIONS: usize = 16;
+
+/// The digest that ends every record: its bytes and its hash domain.
+const DIGEST: usize = 32;
+const DIGEST_DOMAIN: &str = "blaze-tier code record bzcode03 digest";
 
 const CODE: usize = 0;
 const RELRO: usize = 1;
@@ -82,10 +98,11 @@ const FRAMES: usize = 10;
 const POSITIONS: usize = 11;
 const READS: usize = 12;
 const NAMES: usize = 13;
-const TEXT: usize = 14;
+const DECLARED: usize = 14;
+const TEXT: usize = 15;
 
 /// Each section's row in bytes (1 for the byte sections).
-const ROW: [usize; SECTIONS] = [1, 1, 40, 24, 16, 16, 16, 12, 12, 8, 48, 16, 64, 40, 1];
+const ROW: [usize; SECTIONS] = [1, 1, 40, 24, 16, 16, 16, 12, 12, 8, 48, 16, 64, 40, declared::ROW_BYTES, 1];
 
 /// Each section's name, for [`FormError::Tag`] and [`FormError::TooLarge`].
 const SECTION_NAME: [&str; SECTIONS] = [
@@ -103,6 +120,7 @@ const SECTION_NAME: [&str; SECTIONS] = [
     "positions",
     "read list",
     "names",
+    "declared instances",
     "names' text",
 ];
 
@@ -194,6 +212,31 @@ pub enum FormError {
     NameUnused { symbol: Symbol },
     /// An outside target `symbol` has no name kept.
     NameMissing { symbol: Symbol },
+    /// The bytes are a code record of form `bzcode{found}`; this blaze reads `bzcode{reads}`
+    /// only. An old record is reported and rebuilt, never migrated (rule 26).
+    OtherForm { found: u8, reads: u8 },
+    /// The closing digest is not the digest of the bytes before it: a changed byte.
+    Digest,
+    /// The head's reserved word is not 0.
+    Reserved { word: u32 },
+    /// Row `row` of `section` (the C names, then the declared names) does not start where the
+    /// one before it ends in the names' text, or the rows do not end at the text's end.
+    TextLayout { section: &'static str, row: u32 },
+    /// The declared name of `symbol` is past the text the producer gave.
+    DeclaredText { symbol: Symbol },
+    /// Two different declared rows have the symbol `symbol`.
+    DeclaredTwice { symbol: Symbol },
+    /// Declared row `row` is not after the one before it by symbol.
+    DeclaredUnsorted { row: u32 },
+    /// The declared row of `symbol` has an item or a name its kind does not take
+    /// (declared.rs's table).
+    DeclaredShape { symbol: Symbol, kind: DeclaredKind },
+    /// A row declares `symbol` as a `kind`, and no target of that kind's space is it.
+    DeclaredUnused { symbol: Symbol, kind: DeclaredKind },
+    /// The in-program target `symbol` in `space` has no declared row.
+    DeclaredMissing { symbol: Symbol, space: Space },
+    /// The target `symbol` is in `space` and its declared row is a `kind` of another space.
+    DeclaredSpace { symbol: Symbol, space: Space, kind: DeclaredKind },
     /// [`super::from_v1`]: the `bzcode01` record did not seal.
     V1Record(RecordError),
     /// [`super::from_v1`]: the sealed `bzcode01` record did not read back.
@@ -205,7 +248,7 @@ impl fmt::Display for FormError {
         let rule = "(blaze-tier record/form.rs, D100 point 11)";
         match *self {
             FormError::TooLarge { what } => write!(f, "a code record's {what} is longer than a u32 counts {rule}"),
-            FormError::Magic => write!(f, "the bytes are not a code record: no `bzcode02` head {rule}"),
+            FormError::Magic => write!(f, "the bytes are not a code record: no `bzcode` head {rule}"),
             FormError::Length { need, have } => write!(f, "a code record's head counts {need} bytes; it has {have} {rule}"),
             FormError::Flags { flags } => write!(f, "a code record's flags are {flags:#x}; this form defines none {rule}"),
             FormError::Tag { section, row, byte } => write!(f, "a code record's {section} row {row} has the unknown tag {byte} {rule}"),
@@ -258,8 +301,34 @@ impl fmt::Display for FormError {
             FormError::NameText { symbol } => write!(f, "a code record's name of {symbol} is past its text or not UTF-8 {rule}"),
             FormError::NameUnused { symbol } => write!(f, "a code record keeps a name for {symbol}, which no outside target is {rule}"),
             FormError::NameMissing { symbol } => write!(f, "a code record names the outside symbol {symbol} but keeps no name for it {rule}"),
-            FormError::V1Record(error) => write!(f, "{error} (turning a bzcode01 record into bzcode02)"),
-            FormError::V1Decode(error) => write!(f, "{error} (turning a bzcode01 record into bzcode02)"),
+            FormError::OtherForm { found, reads } => write!(
+                f,
+                "a `bzcode{found:02}` code record: this blaze reads only `bzcode{reads:02}`; an old record is reported and rebuilt, never migrated (rule 26) {rule}"
+            ),
+            FormError::Digest => write!(f, "a code record's closing digest does not match its bytes: a byte changed in the store or on the way {rule}"),
+            FormError::Reserved { word } => write!(f, "a code record's reserved head word is {word:#x}, not 0 {rule}"),
+            FormError::TextLayout { section, row } => {
+                write!(f, "a code record's {section} row {row} does not start where the one before it ends in the names' text {rule}")
+            }
+            FormError::DeclaredText { symbol } => write!(f, "the declared name of {symbol} is past the text it was given (blaze-tier record/declared.rs, D106)"),
+            FormError::DeclaredTwice { symbol } => write!(f, "a code record declares {symbol} twice, differently (blaze-tier record/declared.rs, D106)"),
+            FormError::DeclaredUnsorted { row } => write!(f, "a code record's declared row {row} is not after the one before it by symbol (blaze-tier record/declared.rs, D106)"),
+            FormError::DeclaredShape { symbol, kind } => {
+                write!(f, "a code record declares {symbol} as a {kind} with an item or a name a {kind} does not take (blaze-tier record/declared.rs, D106)")
+            }
+            FormError::DeclaredUnused { symbol, kind } => write!(
+                f,
+                "a code record declares {symbol} as a {kind}, and no target of its code is it: a walk would follow a symbol the code never names (blaze-tier record/declared.rs, D106)"
+            ),
+            FormError::DeclaredMissing { symbol, space } => write!(
+                f,
+                "a code record's code names {symbol} ({space:?}) and its section does not declare it: a walk could not make its key (blaze-tier record/declared.rs, D106)"
+            ),
+            FormError::DeclaredSpace { symbol, space, kind } => {
+                write!(f, "a code record's target {symbol} is in {space:?} and is declared as a {kind} (blaze-tier record/declared.rs, D106)")
+            }
+            FormError::V1Record(error) => write!(f, "{error} (turning a bzcode01 record into bzcode03)"),
+            FormError::V1Decode(error) => write!(f, "{error} (turning a bzcode01 record into bzcode03)"),
         }
     }
 }
@@ -304,6 +373,7 @@ pub fn seal<'a>(e: Emitted<'a>) -> Result<Sealed<'a>, FormError> {
         e.positions.len(),
         e.reads.len(),
         e.names.len(),
+        e.declared.len(),
         e.text.len(),
     ];
     for (section, &len) in lens.iter().enumerate() {
@@ -372,6 +442,8 @@ pub fn seal<'a>(e: Emitted<'a>) -> Result<Sealed<'a>, FormError> {
         e.names.push((symbol, at as u32, len));
     }
     drop(names);
+    // The declared rows by symbol, equal rows merged, their names after the C names.
+    declared::seal_rows(&mut e, &text, alloc)?;
     drop(text);
     let unwind_word = match e.unwind_frame {
         Some(frame) => frame.word().map_err(FormError::Unwind)?,
@@ -404,11 +476,14 @@ pub fn encode(s: &Sealed<'_>, out: &mut AVec<'_, u8>) {
         r.positions.len(),
         r.reads.len(),
         r.names.len(),
+        r.declared.len(),
         r.text.len(),
     ];
     for count in counts {
         put32(out, count as u32);
     }
+    // The flags, then the reserved word.
+    put32(out, 0);
     put32(out, 0);
     out.extend_from_slice(&r.code);
     pad8(out, start);
@@ -483,8 +558,29 @@ pub fn encode(s: &Sealed<'_>, out: &mut AVec<'_, u8>) {
         put32(out, at);
         put32(out, len);
     }
+    for row in r.declared.iter() {
+        declared::put_row(out, row);
+    }
     out.extend_from_slice(&r.text);
     pad8(out, start);
+    let sum = digest(&out[start..]);
+    out.extend_from_slice(&sum);
+}
+
+/// The closing digest of a record's bytes before it.
+fn digest(bytes: &[u8]) -> [u8; DIGEST] {
+    let mut h = Hasher::new(DIGEST_DOMAIN);
+    h.update(bytes);
+    h.finish().0
+}
+
+/// The number of a `bzcodeNN` head; `None` for bytes that are no code record's head.
+fn form_number(head: &[u8]) -> Option<u8> {
+    let digit = |b: u8| b.is_ascii_digit().then_some(b - b'0');
+    match head {
+        [b'b', b'z', b'c', b'o', b'd', b'e', tens, ones] => Some(digit(*tens)? * 10 + digit(*ones)?),
+        _ => None,
+    }
 }
 
 fn put32(out: &mut AVec<'_, u8>, v: u32) {
@@ -581,23 +677,38 @@ pub struct RecordView<'b> {
     parts: [&'b [u8]; SECTIONS],
 }
 
-/// Reads the record at the start of `bytes`, which must be exactly one record. The lengths,
-/// every tag byte and every rule [`seal`] checks are checked here, once.
+/// Reads the record at the start of `bytes`, which must be exactly one record. The form number,
+/// the digest, the lengths, every tag byte and every rule [`seal`] checks are checked here, once.
 pub fn read(bytes: &[u8]) -> Result<RecordView<'_>, FormError> {
-    if bytes.len() < HEAD {
-        return Err(FormError::Length { need: HEAD as u64, have: bytes.len() as u64 });
+    let least = (HEAD + DIGEST) as u64;
+    if bytes.len() < MAGIC.len() {
+        return Err(FormError::Length { need: least, have: bytes.len() as u64 });
     }
     if bytes[..8] != MAGIC {
-        return Err(FormError::Magic);
+        return Err(match form_number(&bytes[..8]) {
+            Some(found) => FormError::OtherForm { found, reads: FORM_NUMBER },
+            None => FormError::Magic,
+        });
+    }
+    if (bytes.len() as u64) < least {
+        return Err(FormError::Length { need: least, have: bytes.len() as u64 });
+    }
+    let body = bytes.len() - DIGEST;
+    if digest(&bytes[..body]) != bytes[body..] {
+        return Err(FormError::Digest);
     }
     let frame = get32(bytes, 8);
     let unwind_frame = Frame::of_word(get32(bytes, 12)).map_err(FormError::Unwind)?;
-    let flags = get32(bytes, 76);
+    let flags = get32(bytes, 16 + 4 * SECTIONS);
     if flags != 0 {
         return Err(FormError::Flags { flags });
     }
+    let reserved = get32(bytes, 20 + 4 * SECTIONS);
+    if reserved != 0 {
+        return Err(FormError::Reserved { word: reserved });
+    }
     let mut counts = [0u64; SECTIONS];
-    let mut need = HEAD as u64;
+    let mut need = least;
     for (i, count) in counts.iter_mut().enumerate() {
         *count = u64::from(get32(bytes, 16 + 4 * i));
         need += up8(*count * ROW[i] as u64);
@@ -638,6 +749,12 @@ pub fn read(bytes: &[u8]) -> Result<RecordView<'_>, FormError> {
         let byte = parts[LIVE][row * ROW[LIVE] + 4];
         if byte > 2 {
             return Err(tag(LIVE, row, byte));
+        }
+    }
+    for row in 0..counts[DECLARED] as usize {
+        let at = row * ROW[DECLARED];
+        if let Err(byte) = declared::check_row_bytes(&parts[DECLARED][at..at + ROW[DECLARED]]) {
+            return Err(tag(DECLARED, row, byte));
         }
     }
     let view = RecordView { bytes, frame, unwind_frame, parts };
@@ -813,6 +930,26 @@ impl<'b> RecordView<'b> {
         core::str::from_utf8(self.parts[TEXT].get(at as usize..at as usize + len as usize)?).ok()
     }
 
+    /// The count of declared instances (D106: what a walk follows from this record).
+    pub fn declared_count(&self) -> usize {
+        self.rows_of(DECLARED)
+    }
+
+    /// Declared row `i`, its name borrowed from the record's bytes.
+    pub fn declared(&self, i: usize) -> Declared<'b> {
+        declared::view_of(self.declared_raw(i), self.parts[TEXT])
+    }
+
+    /// The declared row of `symbol` (a target's), by halving over the sorted rows.
+    pub fn declared_of(&self, symbol: Symbol) -> Option<Declared<'b>> {
+        let i = search(self.declared_count(), |i| self.declared_raw(i).symbol, &symbol)?;
+        Some(self.declared(i))
+    }
+
+    fn declared_raw(&self, i: usize) -> DeclaredRow {
+        declared::row_of_bytes(self.row_of(DECLARED, i))
+    }
+
     /// The record back in memory, in `alloc`: what was sealed, so sealing it again encodes to
     /// these bytes.
     pub fn to_emitted<'a>(&self, alloc: Alloc<'a>) -> Emitted<'a> {
@@ -856,6 +993,9 @@ impl<'b> RecordView<'b> {
         }
         for i in 0..self.names() {
             e.names.push(self.name_row(i));
+        }
+        for i in 0..self.declared_count() {
+            e.declared.push(self.declared_raw(i));
         }
         e.text.extend_from_slice(self.parts[TEXT]);
         e
@@ -906,6 +1046,8 @@ trait Rows {
     fn read_row(&self, i: usize) -> Read;
     fn names(&self) -> usize;
     fn name_row(&self, i: usize) -> (Symbol, u32, u32);
+    fn declared_rows(&self) -> usize;
+    fn declared_row(&self, i: usize) -> DeclaredRow;
     fn text(&self) -> &[u8];
 }
 
@@ -994,6 +1136,12 @@ impl Rows for Mem<'_, '_> {
     fn name_row(&self, i: usize) -> (Symbol, u32, u32) {
         self.0.names[i]
     }
+    fn declared_rows(&self) -> usize {
+        self.0.declared.len()
+    }
+    fn declared_row(&self, i: usize) -> DeclaredRow {
+        self.0.declared[i]
+    }
     fn text(&self) -> &[u8] {
         &self.0.text
     }
@@ -1080,6 +1228,12 @@ impl Rows for RecordView<'_> {
     }
     fn name_row(&self, i: usize) -> (Symbol, u32, u32) {
         RecordView::name_row(self, i)
+    }
+    fn declared_rows(&self) -> usize {
+        self.declared_count()
+    }
+    fn declared_row(&self, i: usize) -> DeclaredRow {
+        self.declared_raw(i)
     }
     fn text(&self) -> &[u8] {
         self.parts[TEXT]
@@ -1266,7 +1420,16 @@ fn check(r: &impl Rows) -> Result<(), FormError> {
             return Err(FormError::ReadsUnsorted { row: i as u32 });
         }
     }
-    check_names(r)
+    check_names(r)?;
+    declared::check(
+        r.declared_rows(),
+        |i| r.declared_row(i),
+        r.targets(),
+        |i| r.target(i),
+        r.names(),
+        |i| r.name_row(i),
+        r.text().len(),
+    )
 }
 
 /// The unwind frame and rows by blaze-code unwind.rs's rules (its `read`, on this form's rows).

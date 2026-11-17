@@ -54,6 +54,7 @@
 use core::fmt;
 
 use blaze_code::record::{MAGIC, Symbol};
+use blaze_ids::producer::{CodeBuilder, ProducerId};
 use blaze_ids::{ContentId, Hasher};
 use blaze_own::{AVec, Alloc, Vec};
 pub use blaze_run::parent::Read;
@@ -88,7 +89,9 @@ pub trait BodyIds {
 /// The key of the code record of the instance `symbol` (the module doc, "The key"). `body.reads`
 /// are today's (the caller checked each against [`BodyIds::today`]); `facts` are sorted by fact
 /// and unique.
-pub fn record_key(symbol: Symbol, body: &BodyId<'_>, facts: &[Read], builder: &Builder) -> CodeKey {
+/// `producer` is the code builder's identity (D105): code made by another builder is another
+/// key, never read as current.
+pub fn record_key(symbol: Symbol, body: &BodyId<'_>, facts: &[Read], builder: &Builder, producer: &ProducerId<CodeBuilder>) -> CodeKey {
     let mut h = Hasher::new(KEY_DOMAIN);
     h.part(&symbol.0);
     h.id(&body.key);
@@ -115,6 +118,7 @@ pub fn record_key(symbol: Symbol, body: &BodyId<'_>, facts: &[Read], builder: &B
     h.part(&builder.toolchain.0);
     h.part(&ENTRY_FORM.to_le_bytes());
     h.part(&MAGIC);
+    h.id(producer.id());
     CodeKey(h.finish())
 }
 
@@ -499,6 +503,7 @@ impl<'a> Walk<'a> {
         ids: &dyn BodyIds,
         store: &mut dyn CodeStore,
         builder: &Builder,
+        producer: &ProducerId<CodeBuilder>,
         make: &mut M,
         form: &dyn Form,
         most: usize,
@@ -539,7 +544,7 @@ impl<'a> Walk<'a> {
                 }
                 facts.sort_unstable();
                 facts.dedup();
-                key = record_key(self.symbols[row], &body, &facts, builder);
+                key = record_key(self.symbols[row], &body, &facts, builder, producer);
                 if let Some(bytes) = store.get(key).map_err(WalkError::Store)? {
                     form.declared(bytes, &mut declared).map_err(|why| WalkError::Entry { tabled, found: true, why })?;
                     found = true;
@@ -730,7 +735,8 @@ mod tests {
         let mut model = Model { alloc, calls: 0 };
         let mut entry: AVec<'_, u8> = Vec::new_in(alloc);
         name_of(MAIN, None, &mut entry);
-        walk.run((ItemKey(MAIN), &entry), ids, store, &builder(), &mut model, &Toy, 64).expect("the model program walks");
+        let producer = blaze_ids::producer::Producers::for_tests(b"d106 walk model").get::<CodeBuilder>();
+        walk.run((ItemKey(MAIN), &entry), ids, store, &builder(), &producer, &mut model, &Toy, 64).expect("the model program walks");
         (walk.counts(), model.calls)
     }
 

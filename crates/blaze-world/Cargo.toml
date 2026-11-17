@@ -59,6 +59,8 @@ blaze-proc-macro = { workspace = true, features = ["runtime"] }
 # examples/names.rs: the registration (src/procs.rs) behind its feature.
 blaze-world = { workspace = true, features = ["procs-run"] }
 blaze-expand.workspace = true
+# examples/names.rs: every producer's id (D105).
+blaze-ids.workspace = true
 # examples/names.rs `--records`: a checkout file's surface (what a crate's names read of it).
 blaze-file-items.workspace = true
 

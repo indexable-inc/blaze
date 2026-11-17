@@ -57,7 +57,7 @@ const A64: &str = "pub struct Elem;
 
 static TEXTS: Texts = Texts(&[&[("/package/0/src/lib.rs", USER)], &[("/package/1/src/lib.rs", DEP), ("/package/1/src/a64.rs", A64)]]);
 
-const RUST: Implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false };
+const RUST: Implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false };
 
 /// The outputs record of a build script that printed `printed`.
 fn record(printed: &str) -> OutputsRef<'static> {

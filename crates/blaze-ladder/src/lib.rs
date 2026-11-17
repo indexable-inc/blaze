@@ -13,6 +13,7 @@
 #![feature(allocator_api)]
 #![feature(thread_local)]
 
+pub mod body_ids;
 mod class_chain;
 pub mod code_records;
 mod emit_class;

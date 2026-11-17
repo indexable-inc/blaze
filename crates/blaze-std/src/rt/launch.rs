@@ -35,7 +35,24 @@ const SPEC_FD: &str = "/dev/fd/3";
 
 /// The process's `main` of a `#[bstd::main]` program: what file descriptor 3 asks, then
 /// `main` with every parameter made, or the refusal and [`Status::REFUSED`].
+///
+/// It reaches the process's roots itself (the OS's and the heap's): [`launch_with`], to which
+/// the program's entry hands them, is the form to call; this one goes in batch B1
+/// (port27/bstd-capabilities.md).
 pub fn launch<R: crate::entry::Outcome>(
+    manifest: &'static Manifest,
+    body: impl FnOnce(&mut Given<'_>) -> Result<R, Refused>,
+) -> Exit {
+    launch_with(blaze_core::Os::process(), blaze_own::Heap::process(), manifest, body)
+}
+
+/// [`launch`] with the roots handed down by the program's entry, its `fn main`, where
+/// `blaze_core::Os::process()` and `blaze_own::Heap::process()` are taken (D102, plan
+/// port27/bstd-capabilities.md P3): `os` makes the native world, `heap` every allocation the
+/// launcher makes.
+pub fn launch_with<R: crate::entry::Outcome>(
+    os: &'static blaze_core::Os,
+    heap: &'static blaze_own::Heap,
     manifest: &'static Manifest,
     body: impl FnOnce(&mut Given<'_>) -> Result<R, Refused>,
 ) -> Exit {
@@ -53,8 +70,8 @@ pub fn launch<R: crate::entry::Outcome>(
             return Exit(Status::FAILED);
         }
     };
-    // The process's entry: where its heap is taken, once, and handed down (D102).
-    let alloc: SharedAlloc<'static> = blaze_own::Heap::process().shared();
+    // The heap the process's entry took, once, and handed down (D102).
+    let alloc: SharedAlloc<'static> = heap.shared();
     // An ordinary start's spec holds no command line, environment or directory: the world reads
     // the process's own, where the kernel left them (std.md, "What a program pays for at
     // start"), so nothing is copied into it, sorted, or copied back out.
@@ -76,7 +93,7 @@ pub fn launch<R: crate::entry::Outcome>(
         Prepared::Run { spec, started, fake } => {
             let world = match started {
                 // A command reads every folder above the one it was started in.
-                Started::Ordinary => open_native(ArgList::process(block), Vars::process(block), start_dir(), u8::MAX),
+                Started::Ordinary => open_native(os, ArgList::process(block), Vars::process(block), start_dir(), u8::MAX),
                 // A spec-made world is the spec's alone: its command line, environment and
                 // directory (`RunSpec::read` refuses a directory that is not absolute).
                 Started::WithSpec => {
@@ -85,7 +102,7 @@ pub fn launch<R: crate::entry::Outcome>(
                     let env: Vec<(String, String)> =
                         given.env.iter().map(|(name, value)| (name.as_str().to_string(), value.as_str().to_string())).collect();
                     // No folder above the spec's directory until a grant names levels.
-                    open_native(ArgList::given(args), Vars::given(env), std::path::Path::new(given.dir.as_str()), 0)
+                    open_native(os, ArgList::given(args), Vars::given(env), std::path::Path::new(given.dir.as_str()), 0)
                 }
             };
             run_io(world, main_of(manifest, &spec, started, fake.as_ref(), body))

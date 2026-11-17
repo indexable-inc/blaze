@@ -890,6 +890,22 @@
    "recommended": "The coordinator calls the batch when the integrators report empty queues; one lane moves files by `git mv` and fixes paths; nothing else lands during it.",
    "why": "Rules 14, 30 and 31: semantics belong in the front end's crates; a regression in the command on 2026-11-16 came from three lanes editing logic in blaze-cli.",
    "state": "decided by the coordinator; waits for an empty queue"
+  },
+  {
+   "id": "D108",
+   "date": "2026-11-16",
+   "decision": "bstd and the own types under it cannot panic: every function of crates/blaze-std and crates/blaze-own (then blaze-core, blaze-mem, blaze-hash, which bstd stands on) is `nopanic`, enforced, and a failure is explicit: a typed error in the signature, a proof type that takes the failing case away (a checked index, a checked length, a non-zero divisor), or an operation that says what it does at the edge (checked, wrapping, saturating). A user's own code may still panic, and a panic still fails its task with a typed error. Today this is NOT true, by the design's own words (std.md: \"the one thing left ambient is a panic\"): a rough count outside test paths on 2026-11-16 found in crates/blaze-std 26 `panic!`, 88 `.expect(`, 15 `unreachable!` and about 100 asserts, before indexing and arithmetic are counted.",
+   "recommended": "A census by kind and a plan with ready prompts first (port27 notes, bstd-nopanic.md); then a ratchet in scripts that counts may-panic sites per crate and only falls; then crate by crate. The effect attribute's own check takes over from the ratchet when blaze checks blaze.",
+   "why": "The owner, 18:36: \"in blaze std library nothing can panic right? that would be ideal so everything could be explicit\". It is the same rule as the capabilities (rule 75): a failure path the signature does not show is ambient.",
+   "state": "the owner's stated ideal; census and plan started, nothing changed in the code yet"
+  },
+  {
+   "id": "D109",
+   "date": "2026-11-16",
+   "decision": "A test names what it takes in its signature, as `main` does (D104): `#[bstd::test] fn a_ledger_keeps_what_it_committed(cx: &Cx, data: Dir<ReadWrite>, clock: Clock)`. After `cx`, each parameter is made for the test by its TYPE: a capability (a `Grant`) comes from the test's simulated world, narrowed to that one thing; a whole `Io` cannot be asked for. The attribute holds only what is not a capability: the seed, the fault kinds left out, and what a grant starts with (a directory's fixture, an environment's variables). The test attribute expands through the launcher's test entry, the same granting `main` goes through (one mechanism). A test that takes only `cx` is a pure function of its code and is run once per code identity; a test's parameter list says which fault kinds can reach it, so seeds are spent only on those. A test on the real machine says so in the attribute and gets its grants under a directory made for it. Generated inputs (a case drawn from a tape, blaze-sim's engine) are parameters too, told apart from capabilities by their type; that half is designed with this and built after.",
+   "recommended": "One writer: the seam (which trait makes a parameter for a test), the attribute's new expansion beside the old, the 18 tests in the tree ported, then the whole-`Io` test form deleted.",
+   "why": "The owner, 18:39: \"can tests specify capabilities they are getting ... could be part of fn param\". It is D104 for the other entry a program has; today `#[bstd::test]` takes `fn(cx: &Cx, io: Io)`, the form D104 removes from `main`.",
+   "state": "confirmed by the owner 18:41 (\"ok yea improve tests\"); writer started"
   }
  ]
 }

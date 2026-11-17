@@ -12,6 +12,7 @@
 //! and the choice changes nothing.
 
 use std::{
+    env,
     ffi::OsString,
     fmt,
     sync::atomic::{AtomicU8, Ordering},
@@ -83,7 +84,14 @@ impl std::error::Error for MarkRefused {}
     reason = "the launcher's mark, read once at the entry point, typed, with no default for another value"
 )]
 pub fn choose_from_env() -> Result<Waits, MarkRefused> {
-    choose_from(std::env::var_os(SANDBOXED).as_deref())
+    match env::var_os(SANDBOXED) {
+        None => choose_from(None),
+        Some(mark) => match mark.to_str() {
+            Some(text) => choose_from(Some(text)),
+            // Not text, so not the launcher's `1`: refused naming it, as any other value.
+            None => Err(MarkRefused(mark)),
+        },
+    }
 }
 
 /// Chooses this process's driver, once.

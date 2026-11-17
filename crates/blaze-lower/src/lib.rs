@@ -372,8 +372,8 @@
 //!
 //! # Keys (rule 21)
 //!
-//! - A signature record's key is [`signature_key`]: [`SIGNATURE_KEY_DOMAIN`] (which names this
-//!   lowering's version and the parser's), the edition, whether the item has a body, and the
+//! - A signature record's key is [`signature_key`]: [`SIGNATURE_KEY_DOMAIN`] (a subject key: the
+//!   lowering's code is the filer's `ProducerId`, D105), the edition, whether the item has a body, and the
 //!   item's signature text (blaze-file-items' `signature` range for a fn, const or static; the
 //!   whole item for the rest). Its read list: the `cfg` atoms it asked ([`View::cfg_reads`]).
 //! - A body record's key is [`body_key`]: [`BODY_KEY_DOMAIN`], the edition and the item's
@@ -463,14 +463,14 @@ pub use crate::form::*;
 pub use crate::machine::Mode;
 pub use crate::type_text::{TypeTextRefused, lower_type_text, lower_type_text_expanding};
 
-/// The domain of [`signature_key`]: this lowering's version and the parser's.
-pub const SIGNATURE_KEY_DOMAIN: &str = "blaze v2 lower signature 3, parser 1";
-/// The domain of [`body_key`]. 10: an expansion's key (`blaze_expand::call_key`, the one key
-/// of a call's expansion) holds the expander's code, so a lowered body's expansion keys moved.
-/// 11: a `super let` row carries the `LET_SUPER` flag bit (async P11, super_let.rs).
-pub const BODY_KEY_DOMAIN: &str = "blaze v2 lower body 11, parser 1";
-/// The domain of [`anon_const_key`].
-pub const ANON_CONST_KEY_DOMAIN: &str = "blaze v2 lower anon const 3, parser 1";
+/// The domain of [`signature_key`], a subject key: what is asked, never which code answers
+/// (decision D105: a cache of lowered records mixes in the lowering's `ProducerId`). Its number
+/// is the key's layout.
+pub const SIGNATURE_KEY_DOMAIN: &str = "blaze v2 lower signature key 1";
+/// The domain of [`body_key`], a subject key (see [`SIGNATURE_KEY_DOMAIN`]).
+pub const BODY_KEY_DOMAIN: &str = "blaze v2 lower body key 1";
+/// The domain of [`anon_const_key`], a subject key (see [`SIGNATURE_KEY_DOMAIN`]).
+pub const ANON_CONST_KEY_DOMAIN: &str = "blaze v2 lower anon const key 1";
 
 /// What one name is in the value namespace at a body's module, as an identifier pattern sees
 /// it (the Reference, "Identifier patterns": "Path patterns take precedence over identifier

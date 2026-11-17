@@ -763,6 +763,8 @@ struct KeptDir<'w> {
     /// `--expansions`: each crate's expansions set kept (`<hex>.x`); the bytes written this run
     /// and their digest, summed as the other records' are.
     keeps_expansions: bool,
+    /// Every producer's id (D105): an example is an entry, its build identity its own bytes.
+    producers: blaze_ids::producer::Producers,
     x_bytes: AtomicU64,
     x_digest: AtomicU64,
     /// `--solve-again`: no crate is found, so every crate is solved again (with `--expansions`
@@ -963,8 +965,8 @@ impl blaze_scope::crate_scope::Kept for KeptDir<'_> {
     }
 
     /// `--expansions`: each crate's expansions kept as one set, `<hex>.x` beside its kept file.
-    fn keeps_expansions(&self) -> bool {
-        self.keeps_expansions
+    fn keeps_expansions(&self) -> Option<blaze_ids::producer::ProducerId<blaze_ids::producer::Expander>> {
+        self.keeps_expansions.then(|| self.producers.get::<blaze_ids::producer::Expander>())
     }
 
     /// The crate's last set, whether or not its files changed (a copy aligned as the set asks:
@@ -1677,6 +1679,7 @@ fn main() {
                 names_digest: AtomicU64::new(0),
                 keeps_names: !args.iter().any(|a| a == "--no-names"),
                 keeps_expansions: args.iter().any(|a| a == "--expansions"),
+                producers: blaze_ids::producer::Producers::of_build(&std::fs::read(std::env::current_exe().expect("the example's own path")).expect("the example's own bytes")),
                 x_bytes: AtomicU64::new(0),
                 x_digest: AtomicU64::new(0),
                 solve_again: args.iter().any(|a| a == "--solve-again"),

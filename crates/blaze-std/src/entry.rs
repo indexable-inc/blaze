@@ -32,7 +32,7 @@ use crate::{
     mem::TASK_FRAME,
 };
 
-pub use crate::rt::{Exit, run};
+pub use crate::rt::{Exit, run, run_with};
 
 /// How long the root context of [`run`] lasts: for ever. A program's own deadline is a child
 /// context ([`Cx::until`]), which only narrows.
@@ -166,7 +166,13 @@ pub(crate) fn run_on<R: Outcome>(
 }
 
 /// The process's `main` of a `#[bstd::main]` program (the run spec read from file descriptor 3).
-pub use crate::rt::{SPEC_MARK, SPEC_MARK_VALUE, launch};
+pub use crate::rt::{SPEC_MARK, SPEC_MARK_VALUE, launch, launch_with};
+/// The two roots a program's entry takes, once, in its `fn main`, and hands down to
+/// [`launch_with`] / [`run_with`]: the authority to touch the real OS and the process's heap
+/// (D102; port27/bstd-capabilities.md P3). Named here so the `main!` macro's expansion reaches
+/// them as `$crate::entry::Os` and `$crate::entry::Heap` in a crate that depends on bstd alone.
+pub use blaze_core::Os;
+pub use blaze_own::Heap;
 
 /// [`launch`] on a world its caller made: what file descriptor 3 would hold is
 /// `delivered` (`None`: closed), the process's world is `io`, and a manifest asked for is
@@ -214,6 +220,10 @@ pub fn launch_in<R: Outcome>(
 /// fn main(cx: &Cx, out: Out, data: Dir<ReadOnly>) -> Result<(), bstd::entry::Error> { .. }
 /// ```
 ///
+/// In a blaze edition no attribute is written: the binary root's `fn main` is this macro's
+/// input unasked (D104; blaze-scope `IMPLICIT_MAIN`). A `main` that takes nothing is taken too,
+/// as one whose manifest is empty.
+///
 /// It keeps the function as written, puts the program's manifest in the binary as a `static`
 /// ([`crate::grant::Manifest`]), and makes the process's `main` the launcher
 /// ([`crate::rt::launch`]): every parameter made from the run spec before `main` runs, or every
@@ -223,6 +233,33 @@ pub fn launch_in<R: Outcome>(
 /// `#[bstd::test]` is, so it needs no proc macro.
 #[macro_export]
 macro_rules! main {
+    // A `main` that takes nothing (D104): no context and no grant. It is wrapped as one that
+    // takes `cx` and nothing else, so it starts, is hosted and is launched as every `main` is,
+    // with an empty manifest.
+    attr() (
+        $(#[$meta:meta])*
+        $vis:vis fn main() $(-> $returns:ty)? $body:block
+    ) => {
+        $(#[$meta])*
+        $vis fn main() -> $crate::entry::Exit {
+            fn main() $(-> $returns)? $body
+            fn rooted(_cx: &$crate::Cx) $(-> $returns)? {
+                main()
+            }
+            /// The program's manifest: it takes nothing.
+            static MANIFEST: $crate::grant::Manifest = $crate::grant::Manifest::new(&[]);
+            /// The start of the program hosted by `blaze run` (run.md, "The hosted world").
+            #[unsafe(no_mangle)]
+            pub extern "C" fn bstd_hosted_start(table: *const $crate::wire::HostTable) -> i32 {
+                fn hosted(cx: &$crate::Cx, io: $crate::Io) -> $crate::entry::Status {
+                    let ran = rooted(cx);
+                    $crate::guest::finish(&io, ran)
+                }
+                $crate::guest::start(table, hosted)
+            }
+            $crate::entry::launch(&MANIFEST, $crate::launch_body!(rooted;))
+        }
+    };
     attr() (
         $(#[$meta:meta])*
         $vis:vis fn main($cx:tt : $cxty:ty $(, $name:tt : $ty:ty)* $(,)?) $(-> $returns:ty)? $body:block

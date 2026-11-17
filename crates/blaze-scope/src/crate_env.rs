@@ -104,6 +104,9 @@ pub struct CrateEnv<'a> {
     bin_exe_unknown: bool,
     /// The root the crate sees (D96).
     seen: SeenRoot<'a>,
+    /// The package's name and version as the lock gives them (never a build script's
+    /// `rustc-env` pair): what `file!()` names a dependency by. `None`: a toolchain crate.
+    package: Option<(AString<'a>, AString<'a>)>,
     /// The folder its files are read under, with its trailing `/` (the caller's path space).
     read_folder: AString<'a>,
     script: Option<OutputsRef<'a>>,
@@ -216,7 +219,8 @@ impl<'a> CrateEnv<'a> {
         }
         unknown.sort_unstable();
         unknown.dedup();
-        Ok(CrateEnv { vars, unknown, bin_exe_unknown: facts.test_or_bench, seen: facts.seen, read_folder, script: facts.script })
+        let package = facts.package.map(|(name, version)| (AString::from_str_in(name, alloc), AString::from_str_in(version, alloc)));
+        Ok(CrateEnv { vars, unknown, bin_exe_unknown: facts.test_or_bench, seen: facts.seen, package, read_folder, script: facts.script })
     }
 
     /// The variable `name`: its value, `None` when the crate is compiled without it (`env!` of
@@ -242,6 +246,20 @@ impl<'a> CrateEnv<'a> {
     /// absolute include path is taken under.
     pub fn seen(&self) -> SeenRoot<'a> {
         self.seen
+    }
+
+    /// What `file!()` gives for the file at `path` in the crate's package (package-relative,
+    /// `src/lib.rs`), D96 (4): a dependency's `<name>-<version>/src/lib.rs`, a member's
+    /// workspace-relative `crates/app/src/lib.rs` ([`SeenRoot::write_shown`], the one form both
+    /// hosts give, so one call's read is answered byte-equal in the item and the body layer).
+    /// `None` for a toolchain crate (no package in the lock, so no name and version to show):
+    /// the host refuses the read then, never answers a path without them (rule 3).
+    pub fn shown_file<'b>(&self, path: &str, alloc: Alloc<'b>) -> Option<AString<'b>> {
+        let (name, version) = self.package.as_ref()?;
+        let mut out = AString::new_in(alloc);
+        // An arena string takes any length: writing cannot fail.
+        let _ = self.seen.write_shown((name.as_str(), version.as_str()), path, &mut Into(&mut out));
+        Some(out)
     }
 
     /// The build script's joined outputs record: its `OUT_DIR` files are read from it.
@@ -367,6 +385,21 @@ mod tests {
         assert_eq!(env.get("OUT_DIR"), Err(EnvUnknown));
         assert_eq!(env.get("CARGO_BIN_EXE_tempo"), Ok(None));
         assert!(CrateEnv::of(facts("1.2"), Alloc::global()).is_err(), "a version without three parts is refused by name");
+    }
+
+    /// D96 (4): `file!()` names a dependency's file `<name>-<version>/<path>` and a member's
+    /// workspace-relative (`crates/node/src/lib.rs`), never the package-relative `src/lib.rs`
+    /// every crate shared before; a toolchain crate (no package) gets no answer, so the host
+    /// refuses the read. A build script's `rustc-env` cannot rename it. Prints nothing; passes.
+    #[test]
+    fn file_names_a_dependency_by_package_and_a_member_from_its_workspace() {
+        let alloc = Alloc::global();
+        let dependency = CrateEnv::of(facts("1.2.0"), alloc).expect("a SemVer version");
+        assert_eq!(dependency.shown_file("src/lib.rs", alloc).as_ref().map(|s| s.as_str()), Some("tempo-node-1.2.0/src/lib.rs"));
+        let member = CrateEnv::of(EnvFacts { seen: SeenRoot::member("crates/node").expect("a plain dir"), ..facts("1.2.0") }, alloc).expect("a SemVer version");
+        assert_eq!(member.shown_file("src/lib.rs", alloc).as_ref().map(|s| s.as_str()), Some("crates/node/src/lib.rs"));
+        let toolchain = CrateEnv::of(EnvFacts { package: None, ..facts("1.0.0") }, alloc).expect("no version to read");
+        assert!(toolchain.shown_file("src/lib.rs", alloc).is_none());
     }
 
     /// A toolchain crate has no package: its `CARGO_PKG_NAME` is unknown, never unset.

@@ -928,7 +928,10 @@ impl World {
         for d in order {
             let i = &self.impls[&d];
             let self_ty = self.table.lists[i.args.start as usize];
-            let shape = shape_of_kind(self.table.nodes[self_ty.0 as usize]).unwrap_or(Shape::Blanket);
+            // Filed as the solver asks (object_shape.rs): an object by its principal.
+            let (nodes, lists) = (&self.table.nodes, &self.table.lists);
+            let first = |l: List| if l.len > 0 { Some(nodes[lists[l.start as usize].0 as usize]) } else { None };
+            let shape = crate::object_shape::shape_with_principal(nodes[self_ty.0 as usize], first).unwrap_or(Shape::Blanket);
             by_trait.entry(i.trait_).or_default().push((d, shape));
         }
         for (tr, impls) in by_trait {

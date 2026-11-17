@@ -383,6 +383,9 @@ struct Lower<'b, 'c, F: Facts, A: Allocator + Clone> {
     targets: Vec<Target, A>,
     two_phase: Vec<Loan, A>,
     extended: Vec<bool, A>,
+    /// Per block met as an extending expression of a `let` (`mark_extended`): the block and the
+    /// drop scopes open then; where its `super let` bindings go (super_let.rs).
+    super_ext: Vec<(u32, u32), A>,
     is_target: Vec<bool, A>,
     /// The signature's regions and their placeholder origins (`'static` among them once met).
     uni: Vec<(Region, Origin), A>,
@@ -441,6 +444,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             targets: Vec::new_in(alloc.clone()),
             two_phase: Vec::new_in(alloc.clone()),
             extended,
+            super_ext: Vec::new_in(alloc.clone()),
             is_target,
             uni: Vec::new_in(alloc.clone()),
             ret_block: Block(0),
@@ -2964,6 +2968,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             }
             TStmt::Let { pat, init: None, .. } => {
                 // Declared, not initialized: each binding's storage is live, its value not.
+                let from = self.vars.len();
                 let mut stack: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
                 stack.push(pat);
                 let mut steps = 0usize;
@@ -2988,6 +2993,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                     }
                     self.sub_pats(x, &mut stack)?;
                 }
+                self.place_super_let(s, from, self.body.root)?;
             }
             TStmt::Let { init: Some(init), .. } => {
                 self.mark_extended(init)?;
@@ -3029,7 +3035,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                         stack.push(f.expr);
                     }
                 }
-                Expr::Block { tail: Some(t), .. } => stack.push(t),
+                Expr::Block { tail: Some(t), .. } => {
+                    self.note_extending_block(e);
+                    stack.push(t);
+                }
                 _ => {}
             }
         }
@@ -3045,6 +3054,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         let v = self.pop(root)?;
         match else_ {
             Some(x) => {
+                self.super_let_else(s, x)?;
                 let p = self.as_place(v, x)?;
                 let (bind, eb) = (self.b.block(), self.b.block());
                 self.b.switch(p, &[bind, eb], self.span(x));
@@ -3058,7 +3068,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             }
             None => {
                 let from = init.map(|i| self.span(i));
-                self.bind_pattern_from(pat, v, from)?
+                let vars_from = self.vars.len();
+                self.bind_pattern_from(pat, v, from)?;
+                self.place_super_let(s, vars_from, root)?;
             }
         }
         Ok(())

@@ -85,6 +85,7 @@ use crate::{
 /// What a world reads and does without its lock: the native clock, inline file calls, lent
 /// writes (std.md, "End state: efficiency", pieces 6, 7 and 11).
 mod fast;
+mod native_in;
 /// [`Io::sip_key`]: a hash key from the world's random source.
 mod sip_key;
 #[cfg(test)]
@@ -666,31 +667,14 @@ impl Io {
     }
 
     /// The target's own driver over `world.root`.
+    ///
+    /// The authority to touch the real system from nowhere: it reaches the process's root
+    /// itself. Its one home is [`Io::native_in`], which takes the root (`&blaze_core::Os`);
+    /// this form goes in batch B1 (port27/bstd-capabilities.md) with its callers moved to
+    /// `native_in` (an entry's `Os::process()`, a test's `bstd::test::native`).
     #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
     pub fn native(world: NativeWorld<'_>) -> Result<Io, OpenError> {
-        let refused = |why: String| OpenError {
-            // alloc: an error's message.
-            root: world.root.display().to_string(),
-            why,
-        };
-        // alloc: an error's message.
-        let driver = blaze_core::native(world.root, world.threads).map_err(|error| refused(error.to_string()))?;
-        // alloc: an error's message.
-        let host = crate::native::host_facts(world.host_name, driver.now()).map_err(|error| refused(error.to_string()))?;
-        Ok(Io::over(Start {
-            // alloc: once per process, the driver.
-            driver: Backend::Native(Box::new(driver)),
-            seed: world.seed,
-            above: world.above,
-            env: world.env,
-            args: world.args,
-            host,
-            offers: crate::host::OFFERS,
-            limits: world.limits,
-            hosted: None,
-            disk: None,
-            plant: Plant::None,
-        }))
+        Io::native_in(blaze_core::Os::process(), world)
     }
 
     /// The world of the hosted run the calling thread is in ([`crate::guest::Run`]), offering

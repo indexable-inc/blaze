@@ -9,6 +9,10 @@
 //! | its build script, a proc-macro target | as a Rust edition unit | | | |
 //! | a proc macro | also `proc_macro` | | | |
 //!
+//! A blaze-edition binary (a `bin` or an example) is also given its entry ([`Implicit::entry`],
+//! D104): its root's `fn main` is the input of `std::main` (bstd's `#[bstd::main]`) with no
+//! attribute written, so the parameters it names are its grants.
+//!
 //! bstd has one extern name, `std`; `bstd::..` in a blaze-edition crate is a finding (names'
 //! Cli 8), never a second name (rule 30). There is no opt-in to Rust's `std` under the edition.
 //! The toolchain's own crates (core, alloc, std and what they are built from) are not given
@@ -73,6 +77,9 @@ pub struct Implicit {
     pub prelude: Prelude,
     /// `proc_macro` in its extern prelude: a proc-macro unit.
     pub proc_macro: bool,
+    /// D104: the root's `fn main` is expanded by `std::main` unasked (a blaze-edition binary:
+    /// [`Implicit::binary`]). The names library reads it (blaze-scope `LowerCx::entry`).
+    pub entry: bool,
 }
 
 /// What a unit of `edition` and `kind` is given. A build script and a proc-macro target are
@@ -84,10 +91,22 @@ pub fn implicit(edition: PackageEdition, kind: &UnitKind<'_>) -> Implicit {
         Some(blaze) if !host_side => (StdIs::Bstd(blaze), Prelude::Blaze(blaze)),
         _ => (StdIs::Rust, Prelude::Rust(edition.syntax)),
     };
-    Implicit { std, prelude, proc_macro: matches!(kind, UnitKind::ProcMacro) }
+    let it = Implicit { std, prelude, proc_macro: matches!(kind, UnitKind::ProcMacro), entry: false };
+    match kind {
+        UnitKind::Bin(_) | UnitKind::Example(_) => it.binary(),
+        _ => it,
+    }
 }
 
 impl Implicit {
+    /// What a binary of this unit's edition is given: under a blaze edition, its entry
+    /// ([`Implicit::entry`]); a Rust edition's binary writes its own `fn main`. The one home of
+    /// the rule: [`implicit`] asks it for a `bin` or an example, and a caller that builds a
+    /// program crate without a unit kind (blaze-ladder's program crate) asks it directly.
+    pub const fn binary(self) -> Implicit {
+        Implicit { entry: matches!(self.std, StdIs::Bstd(_)), ..self }
+    }
+
     /// The extern prelude it adds, sorted by name: (name, toolchain unit). `alloc` is not in
     /// it; [`Implicit::extern_crate`] gives it to `extern crate alloc;`.
     pub fn externs(&self, sysroot: &Sysroot) -> impl Iterator<Item = (&'static str, ToolchainUnit)> {
@@ -144,6 +163,22 @@ mod tests {
             assert_eq!(it.extern_crate("bstd", &SYSROOT), None);
             assert_eq!(it.extern_crate("alloc", &SYSROOT), Some(SYSROOT.alloc));
         }
+    }
+
+    /// D104: only a blaze-edition binary's root `fn main` is `std::main`'s input. A library, a
+    /// test harness, a build script and a proc macro of the edition are not entries, nor is any
+    /// unit of a Rust edition (its `fn main` is Rust's). A planted `entry: true` on `Lib` fails
+    /// the first loop.
+    #[test]
+    fn a_blaze_binary_is_an_entry_and_nothing_else_is() {
+        let blaze = PackageEdition::of_manifest("blaze-2026.11").expect("the edition");
+        let rust = PackageEdition::of_manifest("2024").expect("an edition");
+        for kind in [UnitKind::Lib, UnitKind::Test { bin: None }, UnitKind::BuildScript, UnitKind::ProcMacro] {
+            assert!(!implicit(blaze, &kind).entry, "{kind:?} of the blaze edition is no entry");
+        }
+        assert!(implicit(blaze, &UnitKind::Lib).binary().entry, "a blaze program crate is one");
+        assert!(!implicit(rust, &UnitKind::Lib).binary().entry, "a Rust binary writes its own main");
+        assert!(!implicit(blaze, &UnitKind::BuildScript).binary().entry, "a build script is a Rust unit");
     }
 
     #[test]

@@ -25,9 +25,10 @@ comments and strings skipped; a call inside a macro's arguments counts.
     command   heap-check    each crate at or under its row; one over is refused, naming its
                             sites (the new ones given `base`); one under is said, to be
                             lowered by `heap-write`
-              heap-write    writes the list from the tree; refuses when a crate is over its
-                            row (the list only falls; a new program's entry is the one reason
-                            to raise `process`, by hand, saying so in the change)
+              heap-write    writes the list from the tree; a row never rises (each column the
+                            lower of row and count), so a crate over its row is named and
+                            stays over; a raise is by hand, with a `#` comment above the row
+                            saying why, which every write keeps
               heap-report   each crate's calls outside test code and in it, by column, the
                             largest first: the migration's table
               heap-sites    each call outside test code: crate, path:line, column
@@ -235,6 +236,33 @@ fn render_heap(counts: &HeapCounts) -> String {
     out
 }
 
+/// The rows `heap-write` keeps over an existing list: each column the lower of the row and the
+/// count; a crate with no row is held at 0.
+fn held_rows(counts: &HeapCounts, rows: &BTreeMap<String, HeapRow>) -> BTreeMap<String, HeapRow> {
+    let mut out = BTreeMap::new();
+    for (krate, held) in rows {
+        let now = counts.get(krate).map_or([0; 4], |(outside, _)| tally_heap(outside));
+        let row: HeapRow = core::array::from_fn(|at| now[at].min(held[at]));
+        if row != [0; 4] {
+            out.insert(krate.clone(), row);
+        }
+    }
+    out
+}
+
+/// The list with `rows`, each under the comment lines `notes` keeps for it.
+fn render_heap_rows(rows: &BTreeMap<String, HeapRow>, notes: &BTreeMap<String, std::vec::Vec<String>>) -> String {
+    let mut out = HEAP_HEADER.to_owned();
+    for (krate, row) in rows {
+        for note in notes.get(krate).into_iter().flatten() {
+            out.push_str(note);
+            out.push('\n');
+        }
+        out.push_str(&format!("{krate}\t{}\t{}\t{}\t{}\n", row[0], row[1], row[2], row[3]));
+    }
+    out
+}
+
 /// A row of the list that is not one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HeapListError {
@@ -372,16 +400,21 @@ pub(super) fn main_with(command: &str, base: Option<&str>, root: &Path) {
         None => fail(SCRIPT, &format!("{HEAP_LIST} could not be read: every crate is held to its row there (command `heap-write` makes it)")),
     };
     if command == "heap-write" {
-        // The first write takes the tree as it stands; after it, rows only fall.
-        if listed.is_some() {
-            let (over, _) = heap_problems(&counts, &rows, None);
-            if !over.is_empty() {
-                let lines: Vec<String> = over.iter().map(|w| format!("{SCRIPT}: {w}")).collect();
-                eprintln!("{}\n{SCRIPT}: {HEAP_LIST} is not written: the list only falls", lines.join("\n"));
-                std::process::exit(1);
+        // The first write takes the tree as it stands; after it, a row never rises: each column
+        // is the lower of the row and the count (a crate with no row is held at 0), so a crate
+        // over its row stays over until its uses are moved or the row is raised by hand, with a
+        // comment above it saying why (kept by every write).
+        let text = match &listed {
+            Some(text) => {
+                let (over, _) = heap_problems(&counts, &rows, None);
+                for w in &over {
+                    println!("{SCRIPT}: {w}");
+                }
+                render_heap_rows(&held_rows(&counts, &rows), &super::row_notes(text, HEAP_HEADER))
             }
-        }
-        if let Err(e) = std::fs::write(root.join(HEAP_LIST), render_heap(&counts)) {
+            None => render_heap(&counts),
+        };
+        if let Err(e) = std::fs::write(root.join(HEAP_LIST), text) {
             fail(SCRIPT, &format!("{HEAP_LIST} is not written: {e}"));
         }
         println!("{SCRIPT}: wrote {HEAP_LIST}: outside tests {}", summary(totals(|it| &it.0)));
@@ -443,5 +476,9 @@ pub(super) fn selftest() {
     expect(over.is_empty() && under.len() == 1, &format!("under its row is a note: {over:?} {under:?}"));
     let rendered = render_heap(&counts);
     expect(parse_heap_rows(&rendered) == Ok(BTreeMap::from([("a".to_owned(), [2, 0, 0, 0])])), "the list reads back");
+    // A write never raises a row: `a` at 2 over its 1 keeps 1; a crate with no row is held at 0.
+    let kept = held_rows(&counts, &held);
+    expect(kept == BTreeMap::from([("a".to_owned(), [1, 0, 0, 0])]), &format!("a write keeps the lower: {kept:?}"));
+    expect(held_rows(&counts, &BTreeMap::new()).is_empty(), "a crate with no row stays without one");
     expect(parse_heap_rows("a\t1\t0\n").is_err() && parse_heap_rows("a\t1\t0\t0\t0\na\t1\t0\t0\t0\n").is_err(), "a bad row is refused");
 }

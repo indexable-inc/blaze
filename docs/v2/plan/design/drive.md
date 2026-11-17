@@ -1496,6 +1496,40 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
       `a_module_put_in_the_home_store_moves_the_units_source_and_nothing_else_does`: passes;
       without the row: "a module put in the store moved nothing". Also `store.name_tool(tool)`
       after `Layered::open` (main.rs).
+      CLONE, 18:20-18:50 (every store pack of an older format, so cold): blaze-r16-c (tree
+      277a6b8093) ran past 900 s with no output (r16/d3, exit 124). Not a hang: `sample` at
+      50 s (r16/d4a) shows `names::run` > `resolve_crate`, 1058 of 2968; at 130 s (r16/d4b)
+      `body_types::prepare`, 1277 of 3213, of which 1226 are in `blaze_blake3::
+      derive_key_with`. The cause: body_types.rs `input_at` hashed `name_at(at)` (a
+      `ContentId::of`) INSIDE `task.inputs.iter().find(..)`, once per (crate, input) pair,
+      per member, per body; names.rs `have` did the same. FIX: the name is hashed once per
+      lookup (both closures). AFTER, blaze-r16-d (tree e57a81757b, greenmix 18:44): the cold
+      run ends before 130 s (r16/d5); then e1 65.76 s real, 60.11 user, 993020641121
+      instructions, 17101207280 bytes peak, load 21.2; e2 72.05 s, 59.64 user,
+      994968232777, 17126209264, load 22.8. NOT removal-proved (the trees differ); the
+      profile is the evidence. Both end exit 1 on a stop that is not mine: "the names of
+      package `blaze-diagnostics` read `crates/blaze-diagnostics/src/tests/lints/bodies/
+      calls/methods/non_fmt_panic/core.rs`, which no manifest's targets and no file's `mod`
+      lines list". That file is an `include_str!` (non_fmt_panic.rs:28). blaze-scope
+      resolve.rs `include` ignores its `IncludeAs` and reads through `SourceTexts::read`, and
+      names.rs `Recording` lists every read as a module file wanting a `Surface`. A stopped
+      request writes no certificate, so ITEM 2 IS NOT YET MEASURED on the clone: the repeat
+      redoes it all (e2's profile: "task CrateScope 2861x 25453937584", "jobs made 782x
+      36761617063" main-thread ns). Owed to NAMES: data includes are read as file content
+      (a digest in the read list), never as a module's `Surface`.
+      ITEM 3, THE STORE GET with the inline pread (blaze-r16-d, e2's profile): "effect get
+      242660x 115651545" ns (2 effects a get: about 121330 gets), about 0.95 µs a get,
+      against runner 15's 31 µs ("effect get 243858x 3779997663"): 33 times less, at the
+      ~1 µs floor written above. MAPPED-PACK BRIEF (for main to assign; no longer on the
+      critical path): bstd `File::map` over `Effect::Map`, read-only, at `PackStore::open`
+      for each pack verified that boot; `get_into` copies from the mapping (or `get_ref`
+      borrows it for the command's life); a pack a merge removed stays mapped until exit
+      (its unlink does not unmap), which deletes the `pack.removed`/`gone` re-check path;
+      the index rows stay as today. Floor: a binary search per pack plus one copy, under
+      0.5 µs. Test: a store test that a get reads equal bytes mapped and by pread, and that
+      a merge mid-command leaves the mapped get answering. The larger cost is the count:
+      121k gets for a tree, in proportion to the tree, not the edit (the certificate fixes
+      the repeat; the forward check fixes the edit).
 - Owed, not now: `run` after `check` writes its own certificate, because the command is in
   the key. That costs 3.5 ms against the second run's 1.0 ms on hello-world. A coarse proof
   covers all under it: `check`'s certificate should stand for `run`'s check part.

@@ -891,7 +891,28 @@ impl<'n> Store<'n> {
                 }
                 made
             }
-            (_, d) => return Err(HeadError::NotAHead(key, crate::front::detail_name(d))),
+            // Rule 19: every detail named (the shared names say "this item" for the kinds the
+            // old front end made, which here are a head asked for under another want).
+            (w, d) => {
+                let what = match (w, d) {
+                    (Want::Head(_), ItemDetail::Fn { .. }) => "a fn (asked for as a type's or trait's head: a `Why::Need` of a fn's key)",
+                    (Want::Adt(_), ItemDetail::Fn { .. }) => "a fn (asked for as an ADT)",
+                    (Want::Impl(_), ItemDetail::Fn { .. }) => "a fn (asked for as an impl)",
+                    (Want::Members(_), ItemDetail::Fn { .. }) => "a fn (asked for as a trait's members)",
+                    (Want::MemberFn(..), ItemDetail::Fn { .. }) => "a fn (asked for as an impl's member fn)",
+                    (_, d) => match d {
+                    ItemDetail::Struct => "a struct (asked for as other than an ADT)",
+                    ItemDetail::Enum => "an enum (asked for as other than an ADT)",
+                    ItemDetail::Trait => "a trait (asked for as other than a trait)",
+                    ItemDetail::Fn { .. } => "a fn (asked for as other than a fn)",
+                    ItemDetail::Mod { .. } => "a module",
+                    ItemDetail::Use { .. } => "a `use`",
+                    ItemDetail::ExternBlock { .. } => "an `extern` block",
+                    d => crate::front::detail_name(d),
+                    },
+                };
+                return Err(HeadError::NotAHead(key, what));
+            }
         };
         match got {
             Ok(()) => Ok(Step::Done),

@@ -161,7 +161,8 @@ pub fn wants_impls(mode: TypingMode, st: &State, resps: &crate::canon::Responses
 /// for the self type's shape that survive the prefilter, then the object candidates.
 pub fn assemble_impls<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, st: &State, out: &mut Vec<Cand, Alloc<'_>>) -> Result<(), Stop> {
     let g = goal_of(cx, st)?;
-    let Some(shape) = crate::term::shape_of_kind(cx.kind(g.self_ty)) else {
+    // An object's impls are filed by its principal (object_shape.rs).
+    let Some(shape) = crate::object_shape::shape_of_ty(&*cx.tys, g.self_ty) else {
         // An unresolved self type never gets here (forced ambiguity above).
         return Err(malformed());
     };

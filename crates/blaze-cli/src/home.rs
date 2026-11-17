@@ -9,6 +9,7 @@ use core::fmt;
 
 use blaze_drive::Tool;
 use blaze_ids::ContentId;
+use blaze_ids::producer::Producers;
 
 /// A file at a fixed path whose bytes are another form than this build's.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -41,22 +42,12 @@ pub fn current<'b>(file: &'static str, bytes: &'b [u8], magic: &'static [u8; 4])
     }
 }
 
-/// The tool every key holds: the running binary's linker id (bstd's `Host::build_id`), and every
-/// form it writes, so other code or a form's bump is a new key for every record (rule 21) and an
-/// old home's records are misses; and the body checker's producer
-/// ([`crate::body_types::BODY_CHECKER`]), which a checker fix bumps.
-pub fn tool(build_id: &[u8]) -> Tool {
-    tool_of(build_id, crate::body_types::BODY_CHECKER)
-}
-
-/// [`tool`] with the body checker's producer named: another one only in a test, which plants
-/// an older checker.
-pub fn tool_of(build_id: &[u8], body_checker: &str) -> Tool {
-    let mut id = ContentId::of("blaze-cli tool 3", build_id);
-    let mut checker = [0u8; 64];
-    checker[..32].copy_from_slice(&id.0);
-    checker[32..].copy_from_slice(&ContentId::of("blaze-cli tool 3 body checker", body_checker.as_bytes()).0);
-    id = ContentId::of("blaze-cli tool 3 with body checker", &checker);
+/// The tool every key holds: every producer's id (decision D105: the table the entry makes once,
+/// today each row from the running binary's linker id) and every form it writes, so other code
+/// or a form's bump is a new key for every record (rule 21) and an old home's records are
+/// misses. Nothing in it is typed in by hand.
+pub fn tool(producers: &Producers) -> Tool {
+    let mut id = ContentId::of("blaze-cli tool 4", &producers.digest().0);
     for magic in blaze_drive::FORMATS.iter().map(|(_, magic)| *magic).chain([crate::sweep::LEAVES_MAGIC]) {
         let mut chained = [0u8; 36];
         chained[..32].copy_from_slice(&id.0);

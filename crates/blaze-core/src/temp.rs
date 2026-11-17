@@ -6,7 +6,7 @@
 //! there.
 
 use std::{
-    io,
+    env, io,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU32, Ordering},
 };
@@ -29,11 +29,11 @@ pub use given::platform;
 pub fn base() -> PathBuf {
     #[cfg(unix)]
     {
-        base_in(std::env::var_os("TMPDIR").as_deref(), &platform())
+        base_in(env::var_os("TMPDIR").as_deref().map(Path::new), &platform())
     }
     #[cfg(not(unix))]
     {
-        std::env::temp_dir()
+        env::temp_dir()
     }
 }
 

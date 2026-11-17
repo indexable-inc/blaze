@@ -141,6 +141,20 @@ pub trait FrontEnd {
     /// body [`FrontEnd::check_all`] handed over for `i`: what a code record's key holds of what
     /// the check read. `None` where none was filed, which the caller refuses by name.
     fn body_reads(&self, i: usize, checked: &Checked<'static>) -> Option<crate::front2::body_reads::ReadsDigest>;
+    /// D106: makes fn `key`'s row, lowers and checks its ONE body, and makes what that body's
+    /// build asks the `&self` getters (its callees' heads, the ADT rows its types name, its
+    /// constants, statics and dyn tables): its index and its checked body, handed over owned
+    /// (as `check_all` hands them). `Ok(None)`: no such fn, or it has no checked body. Asked
+    /// once per key per run (run/make_one.rs `MakerState::ensure`). The default refuses by name:
+    /// a front end that checks only the whole program has no one-body form.
+    fn check_one(&mut self, key: ItemKey) -> Result<Option<(usize, Checked<'static>)>, RunError> {
+        Err(RunError::OneBody { key, why: "this front end checks only the whole program (`FrontEnd::check_all`); the record walk asks one body at a time (`FrontEnd::check_one`)" })
+    }
+    /// D106: the instance of fn `i` the walk asked for is made; a lazy program may drop that
+    /// body's lowering and literals. Nothing by default.
+    fn done(&mut self, i: usize) {
+        let _ = i;
+    }
     fn fn_lang(&self, l: FnLang) -> Option<ItemKey>;
     /// The `drop` lang trait and its `drop` fn.
     fn drop_trait(&self) -> Option<(ItemKey, Option<ItemKey>)>;

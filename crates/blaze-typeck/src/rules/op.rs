@@ -418,7 +418,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     // so a variable that later resolves to an unsigned type is refused when the
                     // obligation is solved ([`NEG_UNSIGNED`]); the builtin type is kept for
                     // inference. A concrete signed integer or float has core's impl: nothing owed.
-                    if false && op == UnOp::Neg
+                    if op == UnOp::Neg
                         && matches!(self.view(t), TyView::Infer(Var { kind: VarKind::Int, .. }))
                         && let Some(tr) = self.lang(LangItem::Neg)?
                     {

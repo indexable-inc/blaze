@@ -784,7 +784,11 @@ unsafe extern "C" fn grant(host: *mut c_void, kind_at: usize, kind_len: usize, n
         return Answer::refused(code::OUT_OF_RANGE);
     };
     hosting.through(Call::Grant { kind: kind.to_vec(), name: name.to_vec() }, None, || {
-        let given = hosting.grants.iter().any(|(granted_kind, granted)| granted_kind.as_bytes() == kind && granted.as_bytes() == name);
+        // A kind that fills itself reaches nothing outside the process: the launcher fills it
+        // with no grant, and so does the host (D104: `fn main(cx: &Cx, out: Out)` runs with no
+        // `--grant`).
+        let given = crate::grant::Kind::fills_itself_named(kind)
+            || hosting.grants.iter().any(|(granted_kind, granted)| granted_kind.as_bytes() == kind && granted.as_bytes() == name);
         if given { Answer::ok(0) } else { Answer::refused(code::REFUSED) }
     })
 }

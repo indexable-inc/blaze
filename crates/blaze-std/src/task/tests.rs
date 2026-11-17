@@ -551,7 +551,7 @@ fn a_program_that_spawns_nothing_starts_no_thread() {
     if std::env::var_os(NO_THREAD_CHILD).is_some() {
         let before = threads_now();
         let root = std::env::temp_dir();
-        let world = crate::rt::open_native(crate::args::ArgList::given(Vec::new()), crate::env::Vars::given(Vec::new()), &root, 0);
+        let world = crate::rt::open_native(blaze_core::testing::os(), crate::args::ArgList::given(Vec::new()), crate::env::Vars::given(Vec::new()), &root, 0);
         crate::rt::run_io(world, |cx, _io| {
             let scope = cx.scope();
             scope.join(cx).expect("an empty scope");

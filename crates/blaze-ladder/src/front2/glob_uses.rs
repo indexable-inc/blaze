@@ -483,7 +483,18 @@ pub fn by_uses<'n, 'a, S: NamesSource<'n>>(
         } else if local_names.contains(&first) {
             // An item of a block: read at the module of the block the `use` is written in.
             let (i, range) = leaves_of[n];
-            let Some(m) = block_uses[i].at.and_then(|at| blocks.module_at(at)) else {
+            let m = match block_uses[i].at {
+                Some(at) => blocks.module_at(at),
+                // Written by an expansion: read at the block module the names library filed for
+                // the expansion of the statement call around the use's site
+                // (super::expansion_blocks::start_module).
+                None => blocks.modules.as_ref().and_then(|ms| {
+                    let krate = paths.names.crate_of(module)?;
+                    let crate_key = paths.names.crate_key(krate)?;
+                    super::expansion_blocks::start_module(paths.names, crate_key, &blocks.nested, ms, block_uses[i].site, first, alloc)
+                }),
+            };
+            let Some(m) = m else {
                 return Err(LocalGap { item, form: THROUGH_LOCAL, range });
             };
             let path = copy(&uses[n].written, alloc);

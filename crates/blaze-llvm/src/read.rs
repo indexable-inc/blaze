@@ -3,7 +3,7 @@
 //!
 //! [`read_object`] reads a 64-bit little-endian relocatable object by hand: Mach-O for arm64
 //! (`MH_OBJECT`, `CPU_TYPE_ARM64`) or ELF for aarch64 (`ET_REL`, `EM_AARCH64`). It reads the
-//! section, symbol and relocation tables, nothing else, and gives:
+//! section, symbol and relocation tables and the unwind sections, nothing else, and gives:
 //!
 //! - `code`: the one executable section's bytes (`__TEXT,__text`; ELF's one non-empty
 //!   `SHF_EXECINSTR` section). The function named `symbol` must be its one defined global and
@@ -34,7 +34,13 @@
 //! name's text is kept for `dlsym` ([`Emitted::names`]); a name `names` does not know is refused
 //! ([`ReadError::UnknownName`]).
 //! - `unwind_frame` and `unwind`: the frame from the compact unwind entry (Mach-O) or the one
-//!   FDE's call-frame program (ELF's `.eh_frame`), checked against blaze-code unwind.rs's ONE
+//!   FDE's call-frame program (ELF's `.eh_frame`; Mach-O's `__TEXT,__eh_frame` where the
+//!   compact entry says DWARF mode, LLVM's form for a frame the compact encoding cannot say, such
+//!   as `x30` saved with no frame record). D100 point 10, "A code record carries its unwind rows
+//!   and landing pads": LLVM's unwind sections are READ into the record's frame and rows, never
+//!   carried and never refused as sections; one call-frame reader (`eh_frame`) serves both
+//!   formats, each resolving the pointer fields by its own relocations (`EhPointers`). The
+//!   frame is checked against blaze-code unwind.rs's ONE
 //!   frame form (CFA `x29 + 16`, `x29` at CFA - 16, `x30` at CFA - 8, the `k`th saved pair's
 //!   lower register at CFA - 32 - 16k and its higher at CFA - 24 - 16k); the rows from the LSDA
 //!   by crate::read_lsda (the one LSDA reader). A frame the form cannot say is REFUSED BY NAME
@@ -61,6 +67,11 @@
 //! and `LC_VERSION_MIN_MACOSX` (partition the symbol table, name the OS version); ELF's empty
 //! `.note.GNU-stack` (asks a linker for a non-executable stack) and any section of no bytes and
 //! no relocations (it holds nothing to lose).
+//!
+//! x86-64 ELF objects (`EM_X86_64`) are read to their first relocation and refused there by its
+//! name ([`ReadError::NotYetSited`]: the record has `Pc32` and `GotPc32` rows, and this reader
+//! writes none yet); one with no relocation is refused as a form ([`ReadError::Format`]): the
+//! record has no x86-64 frame form or call check here.
 //!
 //! Every multi-byte field is little-endian (both hosts in scope are arm64). Nothing here
 //! panics on malformed bytes: every read is bounds-checked and refused as
@@ -176,6 +187,9 @@ pub enum ReadError {
     NoSuchSection { index: u64 },
     /// A relocation kind with no row in the record (`kind` is its name, `number` its type).
     Relocation { section: ObjName, at: u64, kind: &'static str, number: u32 },
+    /// An x86-64 relocation (`kind` its name, `number` its type): the record has rows for some
+    /// (`Pc32`, `GotPc32`), and this reader writes none of them yet.
+    NotYetSited { section: ObjName, at: u64, kind: &'static str, number: u32 },
     /// A relocation of a known kind in a shape this reader does not read (`what`).
     RelocationShape { section: ObjName, at: u64, what: &'static str },
     /// A Mach-O instruction relocation at `at` whose instruction field is not zero.
@@ -191,9 +205,11 @@ pub enum ReadError {
     NameText { name: ObjName },
     /// A relocation at `at` targets a section that is neither code nor relro.
     TargetSection { name: ObjName, at: u64 },
-    /// A compact unwind encoding with a mode or bits this reader does not read (DWARF mode
-    /// among them).
+    /// A compact unwind encoding with a mode or bits this reader does not read.
     UnwindEncoding { encoding: u32 },
+    /// Mach-O's compact entry and `__TEXT,__eh_frame` do not fit together (`what` says how): the
+    /// frame described twice, or DWARF mode with no FDE.
+    EhFrameUse { what: &'static str },
     /// More than one unwind entry: the text holds more than one described function.
     UnwindEntries { count: u64 },
     /// The unwind entry covers `[start, start + len)`, not the function's `code` bytes.
@@ -246,6 +262,10 @@ impl fmt::Display for ReadError {
             ReadError::Relocation { section, at, kind, number } => {
                 write!(f, "the relocation at byte {at} of {section} is {kind} (type {number}), which no code record row expresses {rule}")
             }
+            ReadError::NotYetSited { section, at, kind, number } => write!(
+                f,
+                "the relocation at byte {at} of {section} is {kind} (type {number}); x86-64 sites (the record's Pc32 and GotPc32 rows) are refused by name until this reader writes them {rule}"
+            ),
             ReadError::RelocationShape { section, at, what } => write!(f, "the relocation at byte {at} of {section} is {what} {rule}"),
             ReadError::ImplicitAddend { at, inst } => {
                 write!(f, "the instruction {inst:#010x} at code byte {at} carries a nonzero field under its relocation; Mach-O addends come by ARM64_RELOC_ADDEND {rule}")
@@ -260,8 +280,9 @@ impl fmt::Display for ReadError {
                 write!(f, "the relocation at byte {at} targets section {name}, which is neither the record's code nor its relro {rule}")
             }
             ReadError::UnwindEncoding { encoding } => {
-                write!(f, "the compact unwind encoding {encoding:#010x} is not a frame or frameless form this reader reads (DWARF mode is refused) {rule}")
+                write!(f, "the compact unwind encoding {encoding:#010x} is not a frame, frameless or DWARF form this reader reads {rule}")
             }
+            ReadError::EhFrameUse { what } => write!(f, "the object's compact unwind entry and `__TEXT,__eh_frame` do not fit together: {what} {rule}"),
             ReadError::UnwindEntries { count } => write!(f, "the object has {count} unwind entries; a record describes one function {rule}"),
             ReadError::UnwindCover { start, len, code } => {
                 write!(f, "the unwind entry covers {len} bytes from {start}, not the function's {code} bytes from 0 {rule}")
@@ -551,6 +572,11 @@ struct Calls<'c> {
 impl Calls<'_> {
     fn region(&mut self, lo: u64, hi: u64, state: &CfiState) -> Result<(), ReadError> {
         let hi = hi.min(self.code.len() as u64);
+        // `lo` comes from a call-frame program's advances (any u64): past the code nothing is
+        // checked, and below it `next_multiple_of` cannot overflow.
+        if lo >= hi {
+            return Ok(());
+        }
         let mut at = lo.next_multiple_of(4);
         while at + 4 <= hi {
             let inst = u32_at(self.code, at, "instruction")?;
@@ -805,6 +831,11 @@ const UNWIND_ENTRY: u64 = 32;
 const UNWIND_MODE: u32 = 0x0F00_0000;
 const UNWIND_FRAME: u32 = 0x0400_0000;
 const UNWIND_FRAMELESS: u32 = 0x0200_0000;
+/// `UNWIND_ARM64_MODE_DWARF`: the frame is the FDE's in `__TEXT,__eh_frame`. LLVM writes the mode
+/// alone in an object (the FDE-offset bits are a linker's); any other bit is refused.
+const UNWIND_DWARF: u32 = 0x0300_0000;
+/// Mach-O's `S_COALESCED`, the section type LLVM gives `__TEXT,__eh_frame`.
+const S_COALESCED: u32 = 0xb;
 /// The frame mode's saved pairs: x19_x20 .. x27_x28 (bits 0..4), d8_d9 .. d14_d15 (bits 8..11).
 const UNWIND_FRAME_PAIRS: u32 = 0x0000_0F1F;
 const UNWIND_FRAMELESS_SIZE: u32 = 0x00FF_F000;
@@ -814,8 +845,10 @@ const UNWIND_FRAMELESS_SIZE: u32 = 0x00FF_F000;
 enum Role {
     Code,
     Relro,
-    /// Mach-O's `__LD,__compact_unwind`; ELF's `.eh_frame`.
-    Unwind,
+    /// Mach-O's `__LD,__compact_unwind`.
+    Compact,
+    /// ELF's `.eh_frame`; Mach-O's `__TEXT,__eh_frame`.
+    EhFrame,
     Lsda,
     /// No bytes, no relocations.
     Empty,
@@ -896,7 +929,8 @@ fn macho_role(seg: &[u8], name: &[u8], size: u64, nreloc: u32) -> Option<Role> {
         (b"__TEXT", b"__text") => Some(Role::Code),
         (b"__TEXT", b"__const" | b"__cstring" | b"__literal4" | b"__literal8" | b"__literal16") => Some(Role::Relro),
         (b"__DATA" | b"__DATA_CONST", b"__const") => Some(Role::Relro),
-        (b"__LD", b"__compact_unwind") => Some(Role::Unwind),
+        (b"__LD", b"__compact_unwind") => Some(Role::Compact),
+        (b"__TEXT", b"__eh_frame") => Some(Role::EhFrame),
         (b"__TEXT", b"__gcc_except_tab") => Some(Role::Lsda),
         _ if size == 0 && nreloc == 0 => Some(Role::Empty),
         _ => None,
@@ -995,6 +1029,9 @@ fn read_macho<'a>(o: &[u8], symbol: &str, mut out: Out<'a, '_>, alloc: Alloc<'a>
     }
     let ncmds = u32_at(o, 16, "Mach-O header")?;
     let cmds_end = 32 + u64::from(u32_at(o, 20, "Mach-O header")?);
+    // The whole command area before any command in it: a cut there is refused even where it
+    // falls in bytes no command's field is read from.
+    bytes_at(o, 32, cmds_end - 32, "load commands")?;
     let mut sects: AVec<'a, MSect<'_>> = Vec::new_in(alloc);
     let mut symtab: Option<(u64, u32, &[u8])> = None;
     let mut at = 32u64;
@@ -1027,7 +1064,10 @@ fn read_macho<'a>(o: &[u8], symbol: &str, mut out: Out<'a, '_>, alloc: Alloc<'a>
                     if role != Role::Empty {
                         // S_REGULAR, S_CSTRING_LITERALS, S_4BYTE_LITERALS, S_8BYTE_LITERALS,
                         // S_16BYTE_LITERALS: bytes in the file; zero-fill and the rest are not.
-                        if !matches!(kind, 0x0 | 0x2 | 0x3 | 0x4 | 0xe) {
+                        // `__eh_frame` is S_COALESCED (a linker may merge its entries); its bytes
+                        // are in the file like the rest.
+                        let plain = matches!(kind, 0x0 | 0x2 | 0x3 | 0x4 | 0xe) || (role == Role::EhFrame && kind == S_COALESCED);
+                        if !plain {
                             return Err(ReadError::SectionType { name, kind });
                         }
                         bytes = bytes_at(o, u64::from(offset), size, "section bytes")?;
@@ -1085,23 +1125,28 @@ fn read_macho<'a>(o: &[u8], symbol: &str, mut out: Out<'a, '_>, alloc: Alloc<'a>
     }
     out.e.code.try_extend_from_slice(text.bytes).map_err(ReadError::Alloc)?;
 
-    let mut unwind: Option<MSect<'_>> = None;
+    // The code's and relro's relocations first: a relocation with no row is refused by its name
+    // before anything about the frame is asked.
+    let (mut compact, mut eh): (Option<MSect<'_>>, Option<MSect<'_>>) = (None, None);
     for sect in sects.iter() {
         match sect.role {
             Role::Code => macho_code_relocs(&m, sect, &mut out)?,
             Role::Relro => macho_relro_relocs(&m, sect, &mut out)?,
             Role::Lsda if sect.nreloc != 0 => return Err(ReadError::LsdaRelocation { section: sect.name }),
-            Role::Unwind => match unwind {
-                Some(_) => return Err(ReadError::Section { name: sect.name }),
-                None => unwind = Some(*sect),
-            },
+            Role::Compact | Role::EhFrame => {
+                let slot = match sect.role == Role::Compact {
+                    true => &mut compact,
+                    false => &mut eh,
+                };
+                if slot.is_some() {
+                    return Err(ReadError::Section { name: sect.name });
+                }
+                *slot = Some(*sect);
+            }
             _ => {}
         }
     }
-    let (frame, lsda) = match unwind {
-        Some(cu) => macho_unwind(&m, &cu, &out.e.code[..])?,
-        None => (None, None),
-    };
+    let (frame, lsda) = macho_unwind(&m, compact.as_ref(), eh.as_ref(), &out.e.code[..], alloc)?;
     out.finish(frame, lsda, alloc)
 }
 
@@ -1183,14 +1228,64 @@ fn macho_relro_relocs(m: &MachO<'_, '_>, sect: &MSect<'_>, out: &mut Out<'_, '_>
     Ok(())
 }
 
-/// The compact unwind entry: the frame, and the LSDA's bytes from the function's table on.
-fn macho_unwind<'o>(m: &MachO<'o, '_>, cu: &MSect<'o>, code: &[u8]) -> Result<(Option<Frame>, Option<&'o [u8]>), ReadError> {
+/// What the compact unwind entry says.
+#[derive(Clone, Copy)]
+enum CompactSays<'o> {
+    /// No entry: the object describes no frame there.
+    None,
+    /// DWARF mode: the frame is the FDE's in `__TEXT,__eh_frame`.
+    Dwarf,
+    /// The frame (none: frameless) and the LSDA's bytes from the function's table on.
+    Read(Option<Frame>, Option<&'o [u8]>),
+}
+
+/// The function's frame and LSDA: from the compact entry, or from `__TEXT,__eh_frame`'s one FDE
+/// where the entry says DWARF mode (or where there is no entry). An `__eh_frame` beside an entry
+/// that describes the frame itself is refused: the object would say the frame twice, and this
+/// reader does not pick one.
+fn macho_unwind<'o>(
+    m: &MachO<'o, '_>,
+    cu: Option<&MSect<'o>>,
+    eh: Option<&MSect<'o>>,
+    code: &[u8],
+    alloc: Alloc<'_>,
+) -> Result<(Option<Frame>, Option<&'o [u8]>), ReadError> {
+    let says = match cu {
+        Some(cu) => macho_compact(m, cu, code)?,
+        None => CompactSays::None,
+    };
+    match (says, eh) {
+        (CompactSays::Dwarf | CompactSays::None, Some(eh)) => macho_eh_frame(m, eh, code, alloc),
+        (CompactSays::Dwarf, None) => Err(ReadError::EhFrameUse { what: "the compact entry says DWARF mode and the object has no `__TEXT,__eh_frame`" }),
+        (CompactSays::None, None) => Ok((None, None)),
+        (CompactSays::Read(..), Some(_)) => Err(ReadError::EhFrameUse { what: "an FDE beside a compact entry that describes the frame itself" }),
+        (CompactSays::Read(frame, lsda), None) => Ok((frame, lsda)),
+    }
+}
+
+/// `__TEXT,__eh_frame`'s one FDE, by the call-frame reader both formats share, over Mach-O's
+/// relocations there (the difference pair and the GOT pointer; any other kind is refused by its
+/// name).
+fn macho_eh_frame<'o>(m: &MachO<'o, '_>, eh: &MSect<'o>, code: &[u8], alloc: Alloc<'_>) -> Result<(Option<Frame>, Option<&'o [u8]>), ReadError> {
+    let mut relocs: AVec<'_, MReloc> = Vec::new_in(alloc);
+    for i in 0..eh.nreloc {
+        let r = m.relocs(eh, i)?;
+        if !matches!(r.ty, 0 | 1 | 7) {
+            return Err(ReadError::Relocation { section: eh.name, at: r.at, kind: macho_reloc_name(r.ty), number: u32::from(r.ty) });
+        }
+        relocs.try_push(r).map_err(|refused| ReadError::Alloc(refused.why))?;
+    }
+    eh_frame(eh.bytes, &MachEh { m, sect: eh, relocs: &relocs[..] }, code)
+}
+
+/// The compact unwind entry.
+fn macho_compact<'o>(m: &MachO<'o, '_>, cu: &MSect<'o>, code: &[u8]) -> Result<CompactSays<'o>, ReadError> {
     if cu.size % UNWIND_ENTRY != 0 {
         return Err(ReadError::Truncated { what: "compact unwind entry", at: cu.size - cu.size % UNWIND_ENTRY });
     }
     let count = cu.size / UNWIND_ENTRY;
     if count == 0 {
-        return Ok((None, None));
+        return Ok(CompactSays::None);
     }
     if count > 1 {
         return Err(ReadError::UnwindEntries { count });
@@ -1264,6 +1359,15 @@ fn macho_unwind<'o>(m: &MachO<'o, '_>, cu: &MSect<'o>, code: &[u8]) -> Result<(O
         return Err(ReadError::LsdaWithoutPersonality);
     }
     let frame = match encoding & UNWIND_MODE {
+        UNWIND_DWARF => {
+            if encoding != UNWIND_DWARF {
+                return Err(ReadError::UnwindEncoding { encoding });
+            }
+            if personality || lsda.is_some() {
+                return Err(ReadError::EhFrameUse { what: "a DWARF-mode compact entry that also names a personality or an LSDA (the FDE's CIE and augmentation name them)" });
+            }
+            return Ok(CompactSays::Dwarf);
+        }
         UNWIND_FRAME => {
             if encoding & !(UNWIND_MODE | UNWIND_FRAME_PAIRS) != 0 {
                 return Err(ReadError::UnwindEncoding { encoding });
@@ -1282,7 +1386,7 @@ fn macho_unwind<'o>(m: &MachO<'o, '_>, cu: &MSect<'o>, code: &[u8]) -> Result<(O
         0 if encoding == 0 => None,
         _ => return Err(ReadError::UnwindEncoding { encoding }),
     };
-    Ok((frame, lsda))
+    Ok(CompactSays::Read(frame, lsda))
 }
 
 /// The rules libunwind reads from a compact frame-mode encoding (libunwind
@@ -1308,9 +1412,10 @@ fn compact_state(encoding: u32) -> CfiState {
 }
 
 // ---------------------------------------------------------------------------------------------
-// ELF (aarch64).
+// ELF (aarch64; x86-64 read to its first relocation, refused there by name).
 
 const EM_AARCH64: u16 = 183;
+const EM_X86_64: u16 = 62;
 const ET_REL: u16 = 1;
 const SHT_NULL: u32 = 0;
 const SHT_PROGBITS: u32 = 1;
@@ -1379,6 +1484,23 @@ fn elf_reloc_name(ty: u32) -> &'static str {
     }
 }
 
+/// `R_X86_64_*`'s names, for a refusal (System V x86-64 psABI, table "Relocation Types").
+fn elf_x86_reloc_name(ty: u32) -> &'static str {
+    match ty {
+        1 => "R_X86_64_64",
+        2 => "R_X86_64_PC32",
+        4 => "R_X86_64_PLT32",
+        9 => "R_X86_64_GOTPCREL",
+        10 => "R_X86_64_32",
+        11 => "R_X86_64_32S",
+        19..=23 | 34 | 35 => "an R_X86_64 TLS relocation",
+        24 => "R_X86_64_PC64",
+        41 => "R_X86_64_GOTPCRELX",
+        42 => "R_X86_64_REX_GOTPCRELX",
+        _ => "an R_X86_64 type with no name here",
+    }
+}
+
 fn elf_role(name: &[u8], ty: u32, flags: u64, size: u64) -> Option<Role> {
     match ty {
         SHT_NULL | SHT_STRTAB => return Some(Role::Strings),
@@ -1392,7 +1514,7 @@ fn elf_role(name: &[u8], ty: u32, flags: u64, size: u64) -> Option<Role> {
         return Some(if size == 0 { Role::Empty } else { Role::Code });
     }
     if name == b".eh_frame" {
-        return Some(Role::Unwind);
+        return Some(Role::EhFrame);
     }
     if name.starts_with(b".gcc_except_table") {
         return Some(Role::Lsda);
@@ -1443,6 +1565,9 @@ impl<'o> Elf<'o, '_> {
             shndx if shndx >= SHN_LORESERVE => Err(ReadError::SymbolKind { name, kind: "an absolute, common or extended-index symbol" }),
             shndx => {
                 let sect = self.sect(u64::from(shndx))?;
+                if s.value > sect.size {
+                    return Err(ReadError::SymbolKind { name, kind: "a symbol past the end of its section" });
+                }
                 match sect.role {
                     Role::Code => Ok(Dest::Code(s.value)),
                     Role::Relro => Ok(Dest::Relro(sect.relro_at + s.value)),
@@ -1463,6 +1588,8 @@ impl<'o> Elf<'o, '_> {
 }
 
 fn read_elf<'a>(o: &[u8], symbol: &str, mut out: Out<'a, '_>, alloc: Alloc<'a>) -> Result<Emitted<'a>, ReadError> {
+    // The whole 64-byte header before any field of it.
+    bytes_at(o, 0, 64, "ELF header")?;
     let ident = bytes_at(o, 0, 16, "ELF header")?;
     if ident[4] != 2 || ident[5] != 1 || ident[6] != 1 {
         return Err(ReadError::Format { what: "an ELF file that is not 64-bit little-endian version 1" });
@@ -1470,9 +1597,11 @@ fn read_elf<'a>(o: &[u8], symbol: &str, mut out: Out<'a, '_>, alloc: Alloc<'a>) 
     if u16_at(o, 16, "ELF header")? != ET_REL {
         return Err(ReadError::Format { what: "an ELF file that is not a relocatable object (ET_REL)" });
     }
-    if u16_at(o, 18, "ELF header")? != EM_AARCH64 {
-        return Err(ReadError::Format { what: "an ELF object for a machine other than aarch64" });
-    }
+    let x86 = match u16_at(o, 18, "ELF header")? {
+        EM_AARCH64 => false,
+        EM_X86_64 => true,
+        _ => return Err(ReadError::Format { what: "an ELF object for a machine other than aarch64 or x86-64" }),
+    };
     let shoff = u64_at(o, 0x28, "ELF header")?;
     if u16_at(o, 0x3a, "ELF header")? != 64 {
         return Err(ReadError::Format { what: "an ELF object whose section headers are not 64 bytes" });
@@ -1482,27 +1611,31 @@ fn read_elf<'a>(o: &[u8], symbol: &str, mut out: Out<'a, '_>, alloc: Alloc<'a>) 
     if shnum == 0 || shstrndx >= shnum {
         return Err(ReadError::Format { what: "an ELF object with extended section numbering" });
     }
-    let shstr_at = shoff + 64 * shstrndx;
-    let shstrtab = bytes_at(o, u64_at(o, shstr_at + 24, "section header")?, u64_at(o, shstr_at + 32, "section header")?, "section names")?;
+    // The whole section header table before any header in it. LLVM writes it last, so a cut
+    // anywhere in the object falls in it, also in a field this reader does not use
+    // (`sh_entsize`), and is refused here; every header offset below is inside it.
+    let headers = bytes_at(o, shoff, 64 * shnum, "section header table")?;
+    let shstr_at = 64 * shstrndx;
+    let shstrtab = bytes_at(o, u64_at(headers, shstr_at + 24, "section header")?, u64_at(headers, shstr_at + 32, "section header")?, "section names")?;
     let mut sects: AVec<'a, ESect<'_>> = Vec::new_in(alloc);
     let mut text: Option<usize> = None;
     let mut symtab: Option<usize> = None;
     for i in 0..shnum {
-        let h = shoff + 64 * i;
-        let name = cstr_at(shstrtab, u64::from(u32_at(o, h, "section header")?), "section name")?;
+        let h = 64 * i;
+        let name = cstr_at(shstrtab, u64::from(u32_at(headers, h, "section header")?), "section name")?;
         let oname = ObjName::of(&[name]);
-        let ty = u32_at(o, h + 4, "section header")?;
-        let flags = u64_at(o, h + 8, "section header")?;
-        let offset = u64_at(o, h + 24, "section header")?;
-        let size = u64_at(o, h + 32, "section header")?;
-        let link = u32_at(o, h + 40, "section header")?;
-        let info = u32_at(o, h + 44, "section header")?;
-        let align = u64_at(o, h + 48, "section header")?;
+        let ty = u32_at(headers, h + 4, "section header")?;
+        let flags = u64_at(headers, h + 8, "section header")?;
+        let offset = u64_at(headers, h + 24, "section header")?;
+        let size = u64_at(headers, h + 32, "section header")?;
+        let link = u32_at(headers, h + 40, "section header")?;
+        let info = u32_at(headers, h + 44, "section header")?;
+        let align = u64_at(headers, h + 48, "section header")?;
         let role = elf_role(name, ty, flags, size).ok_or(ReadError::Section { name: oname })?;
         let bytes: &[u8] = match (role, ty) {
             (Role::Empty | Role::Note, _) => &[],
-            (Role::Code | Role::Relro | Role::Unwind | Role::Lsda | Role::Personality, SHT_PROGBITS) => bytes_at(o, offset, size, "section bytes")?,
-            (Role::Code | Role::Relro | Role::Unwind | Role::Lsda | Role::Personality, ty) => return Err(ReadError::SectionType { name: oname, kind: ty }),
+            (Role::Code | Role::Relro | Role::EhFrame | Role::Lsda | Role::Personality, SHT_PROGBITS) => bytes_at(o, offset, size, "section bytes")?,
+            (Role::Code | Role::Relro | Role::EhFrame | Role::Lsda | Role::Personality, ty) => return Err(ReadError::SectionType { name: oname, kind: ty }),
             (_, SHT_NULL) => &[],
             _ => bytes_at(o, offset, size, "section bytes")?,
         };
@@ -1572,8 +1705,8 @@ fn read_elf<'a>(o: &[u8], symbol: &str, mut out: Out<'a, '_>, alloc: Alloc<'a>) 
     let mut unwind: Option<usize> = None;
     for (index, rela) in sects.iter().enumerate() {
         match rela.role {
-            Role::Unwind if unwind.is_some() => return Err(ReadError::Section { name: rela.oname }),
-            Role::Unwind => unwind = Some(index),
+            Role::EhFrame if unwind.is_some() => return Err(ReadError::Section { name: rela.oname }),
+            Role::EhFrame => unwind = Some(index),
             _ => {}
         }
         if rela.role != Role::Rela {
@@ -1583,6 +1716,9 @@ fn read_elf<'a>(o: &[u8], symbol: &str, mut out: Out<'a, '_>, alloc: Alloc<'a>) 
         let n = rela.size / 24;
         for i in 0..n {
             let (at, sym, ty, addend) = Elf::rela(rela, i)?;
+            if x86 {
+                return Err(ReadError::NotYetSited { section: target.oname, at, kind: elf_x86_reloc_name(ty), number: ty });
+            }
             let refuse = ReadError::Relocation { section: target.oname, at, kind: elf_reloc_name(ty), number: ty };
             match target.role {
                 Role::Code => {
@@ -1610,7 +1746,7 @@ fn read_elf<'a>(o: &[u8], symbol: &str, mut out: Out<'a, '_>, alloc: Alloc<'a>) 
                     let dest = e.dest_of_symbol(sym, at)?;
                     out.reloc(target.relro_at + at, true, RelocKind::Abs64, dest, addend)?;
                 }
-                Role::Unwind => {
+                Role::EhFrame => {
                     if ty != R_PREL32 {
                         return Err(refuse);
                     }
@@ -1629,8 +1765,11 @@ fn read_elf<'a>(o: &[u8], symbol: &str, mut out: Out<'a, '_>, alloc: Alloc<'a>) 
             }
         }
     }
+    if x86 {
+        return Err(ReadError::Format { what: "an x86-64 ELF object (its relocations are refused by name; the record has no x86-64 frame form here)" });
+    }
     let (frame, lsda) = match unwind {
-        Some(index) => elf_unwind(&e, &sects[index], &eh, &out.e.code[..])?,
+        Some(index) => eh_frame(sects[index].bytes, &ElfEh { e: &e, eh: &eh[..] }, &out.e.code[..])?,
         None => (None, None),
     };
     out.finish(frame, lsda, alloc)
@@ -1646,10 +1785,184 @@ fn enc_size(enc: u8, at: u64) -> Result<usize, ReadError> {
     }
 }
 
-/// `.eh_frame`'s one FDE: its frame, checked at every call, and its LSDA.
-fn elf_unwind<'o>(e: &Elf<'o, '_>, sect: &ESect<'o>, eh: &[(u64, u32, i64)], code: &[u8]) -> Result<(Option<Frame>, Option<&'o [u8]>), ReadError> {
-    let bytes = sect.bytes;
-    let reloc_at = |at: u64| eh.iter().find(|r| r.0 == at).map(|r| (r.1, r.2));
+// ---------------------------------------------------------------------------------------------
+// The call-frame reader both formats share: ELF's `.eh_frame` and Mach-O's `__TEXT,__eh_frame`
+// differ only in how a pointer field is relocated.
+
+/// How one format's relocations resolve the pointer fields of an `.eh_frame`: each at byte `at`
+/// of the section, of DWARF pointer encoding `enc`, holding `raw` as written.
+trait EhPointers<'o> {
+    /// The CIE's personality pointer: `Ok` when it names [`PERSONALITY`].
+    fn personality(&self, at: u64, enc: u8, raw: u64) -> Result<(), ReadError>;
+    /// The FDE's start, as an offset in the code.
+    fn start(&self, at: u64, enc: u8, raw: u64) -> Result<i64, ReadError>;
+    /// The FDE's LSDA pointer: the LSDA's bytes from the function's table on, or `None` for a
+    /// zero pointer with no relocation.
+    fn lsda(&self, at: u64, enc: u8, raw: u64) -> Result<Option<&'o [u8]>, ReadError>;
+}
+
+/// ELF: one RELA entry per pointer field, (offset, symbol, addend); the field's own bytes are
+/// the linker's to write.
+struct ElfEh<'e, 'o, 's> {
+    e: &'e Elf<'o, 's>,
+    eh: &'e [(u64, u32, i64)],
+}
+
+impl ElfEh<'_, '_, '_> {
+    fn reloc_at(&self, at: u64) -> Option<(u32, i64)> {
+        self.eh.iter().find(|r| r.0 == at).map(|r| (r.1, r.2))
+    }
+}
+
+impl<'o> EhPointers<'o> for ElfEh<'_, 'o, '_> {
+    fn personality(&self, at: u64, enc: u8, _raw: u64) -> Result<(), ReadError> {
+        let (sym, _) = self.reloc_at(at).ok_or(ReadError::Cfi { at, what: "a personality pointer with no relocation", op: enc })?;
+        let s = self.e.sym(sym)?;
+        if s.name != ELF_PERSONALITY_REF && s.name != PERSONALITY.as_bytes() {
+            return Err(ReadError::Personality { name: ObjName::of(&[s.name]) });
+        }
+        Ok(())
+    }
+
+    fn start(&self, at: u64, enc: u8, _raw: u64) -> Result<i64, ReadError> {
+        let (sym, addend) = self.reloc_at(at).ok_or(ReadError::Cfi { at, what: "an FDE's start with no relocation", op: enc })?;
+        match self.e.dest_of_symbol(sym, at)? {
+            Dest::Code(off) => plus(off, addend),
+            _ => Err(ReadError::Cfi { at, what: "an FDE whose start is not in the code", op: enc }),
+        }
+    }
+
+    fn lsda(&self, at: u64, enc: u8, raw: u64) -> Result<Option<&'o [u8]>, ReadError> {
+        let Some((sym, addend)) = self.reloc_at(at) else {
+            return match raw {
+                0 => Ok(None),
+                _ => Err(ReadError::Cfi { at, what: "a nonzero LSDA pointer with no relocation", op: enc }),
+            };
+        };
+        let s = self.e.sym(sym)?;
+        if s.shndx == SHN_UNDEF || s.shndx >= SHN_LORESERVE {
+            return Err(ReadError::LsdaAddress { at });
+        }
+        let target = self.e.sect(u64::from(s.shndx))?;
+        if target.role != Role::Lsda {
+            return Err(ReadError::LsdaAddress { at });
+        }
+        let off = (s.value as i64).checked_add(addend).filter(|&o| o >= 0).ok_or(ReadError::LsdaAddress { at })?;
+        Ok(Some(target.bytes.get(off as usize..).ok_or(ReadError::LsdaAddress { at: off as u64 })?))
+    }
+}
+
+/// Mach-O (arm64): a pc-relative field is one `ARM64_RELOC_SUBTRACTOR` followed by one
+/// `ARM64_RELOC_UNSIGNED` at its offset (the word becomes `A - B + contents`, A the UNSIGNED's
+/// symbol, B the SUBTRACTOR's); the personality is one `ARM64_RELOC_POINTER_TO_GOT`.
+struct MachEh<'m, 'o, 's> {
+    m: &'m MachO<'o, 's>,
+    sect: &'m MSect<'o>,
+    relocs: &'m [MReloc],
+}
+
+impl<'o> MachEh<'_, 'o, '_> {
+    fn shape(&self, at: u64, what: &'static str) -> ReadError {
+        ReadError::RelocationShape { section: self.sect.name, at, what }
+    }
+
+    /// The object address of a defined symbol.
+    fn address(&self, index: u32) -> Result<u64, ReadError> {
+        let s = self.m.sym(index)?;
+        match s.kind {
+            N_SECT => Ok(s.value),
+            _ => Err(ReadError::SymbolKind { name: ObjName::of(&[s.name]), kind: "an undefined or absolute symbol in an `__eh_frame` pointer" }),
+        }
+    }
+
+    /// The object address the pc-relative field at `at` points to (the field's own address plus
+    /// `A - B + contents`), or `None` with no relocation there.
+    fn pointer(&self, at: u64, enc: u8, raw: u64) -> Result<Option<u64>, ReadError> {
+        let Some(i) = self.relocs.iter().position(|r| r.at == at) else {
+            return Ok(None);
+        };
+        let pair = "not one ARM64_RELOC_SUBTRACTOR followed by one ARM64_RELOC_UNSIGNED, both external, not pc-relative, of the field's size";
+        if self.relocs.iter().filter(|r| r.at == at).count() != 2 {
+            return Err(self.shape(at, pair));
+        }
+        let (Some(sub), Some(uns)) = (self.relocs.get(i).copied(), self.relocs.get(i + 1).copied()) else {
+            return Err(self.shape(at, pair));
+        };
+        let length = match enc_size(enc, at)? {
+            8 => 3u8,
+            4 => 2,
+            _ => return Err(ReadError::Cfi { at, what: "a 2-byte difference pointer", op: enc }),
+        };
+        let fits = sub.ty == 1 && uns.ty == 0 && uns.at == at && sub.ext && uns.ext && !sub.pcrel && !uns.pcrel && sub.length == length && uns.length == length;
+        if !fits {
+            return Err(self.shape(at, pair));
+        }
+        if enc & 0x70 != 0x10 || enc & 0x80 != 0 {
+            return Err(ReadError::Cfi { at, what: "a difference pointer whose encoding is not pc-relative and direct", op: enc });
+        }
+        let field = self.sect.addr.wrapping_add(at);
+        let to = self.address(uns.symnum)?;
+        let from = self.address(sub.symnum)?;
+        Ok(Some(field.wrapping_add(to).wrapping_sub(from).wrapping_add(field_value(raw, enc) as u64)))
+    }
+
+    /// The section of bytes holding object address `addr`, and the offset in it.
+    fn find(&self, addr: u64) -> Option<(MSect<'o>, u64)> {
+        self.m.sects.iter().find_map(|s| addr.checked_sub(s.addr).filter(|&off| off < s.size).map(|off| (*s, off)))
+    }
+}
+
+impl<'o> EhPointers<'o> for MachEh<'_, 'o, '_> {
+    fn personality(&self, at: u64, enc: u8, _raw: u64) -> Result<(), ReadError> {
+        // The word is the distance to the personality's GOT slot: the linker's to write.
+        let mut here = self.relocs.iter().filter(|r| r.at == at);
+        let (Some(r), None) = (here.next(), here.next()) else {
+            return Err(ReadError::Cfi { at, what: "a personality pointer with no relocation, or with more than one", op: enc });
+        };
+        let got = r.ty == 7 && r.pcrel && r.length == 2 && r.ext;
+        if !got || enc & 0x80 == 0 || enc & 0x70 != 0x10 || enc_size(enc, at)? != 4 {
+            return Err(self.shape(at, "a personality pointer that is not one 4-byte pc-relative ARM64_RELOC_POINTER_TO_GOT under an indirect pc-relative encoding"));
+        }
+        let s = self.m.sym(r.symnum)?;
+        match s.name.split_first() {
+            Some((b'_', rest)) if rest == PERSONALITY.as_bytes() => Ok(()),
+            _ => Err(ReadError::Personality { name: ObjName::of(&[s.name]) }),
+        }
+    }
+
+    fn start(&self, at: u64, enc: u8, raw: u64) -> Result<i64, ReadError> {
+        let addr = self.pointer(at, enc, raw)?.ok_or(ReadError::Cfi { at, what: "an FDE's start with no relocation", op: enc })?;
+        match self.find(addr) {
+            Some((s, off)) if s.role == Role::Code => plus(off, 0),
+            _ => Err(ReadError::Cfi { at, what: "an FDE whose start is not in the code", op: enc }),
+        }
+    }
+
+    fn lsda(&self, at: u64, enc: u8, raw: u64) -> Result<Option<&'o [u8]>, ReadError> {
+        match self.pointer(at, enc, raw)? {
+            None if raw == 0 => Ok(None),
+            None => Err(ReadError::Cfi { at, what: "a nonzero LSDA pointer with no relocation", op: enc }),
+            Some(addr) => match self.find(addr) {
+                Some((s, off)) if s.role == Role::Lsda => Ok(Some(s.bytes.get(off as usize..).ok_or(ReadError::LsdaAddress { at: addr })?)),
+                _ => Err(ReadError::LsdaAddress { at: addr }),
+            },
+        }
+    }
+}
+
+/// A field's bytes `raw` as its encoding's value: sign-extended for `sdata2` and `sdata4` (LSB
+/// 5.0, "DWARF Exception Header Encoding"), as written otherwise.
+fn field_value(raw: u64, enc: u8) -> i64 {
+    match enc & 0x0f {
+        0xa => i64::from(raw as u16 as i16),
+        0xb => i64::from(raw as u32 as i32),
+        _ => raw as i64,
+    }
+}
+
+/// An `.eh_frame`'s one FDE (ELF's, or Mach-O's `__TEXT,__eh_frame`): its frame, checked at
+/// every call, and its LSDA. `p` resolves the pointer fields by the object's own relocations.
+fn eh_frame<'o, P: EhPointers<'o>>(bytes: &'o [u8], p: &P, code: &[u8]) -> Result<(Option<Frame>, Option<&'o [u8]>), ReadError> {
     // The entries: CIEs and exactly one FDE.
     let mut pos = 0u64;
     let mut fde: Option<(u64, u64, u64)> = None;
@@ -1701,7 +2014,7 @@ fn elf_unwind<'o>(e: &Elf<'o, '_>, sect: &ESect<'o>, eh: &[(u64, u32, i64)], cod
     let (mut fde_enc, mut lsda_enc, mut personality) = (0u8, None, false);
     if let Some((b'z', letters)) = aug.split_first() {
         let len = c.uleb()?;
-        let end = c.pos as u64 + len;
+        let end = (c.pos as u64).checked_add(len).ok_or(ReadError::Truncated { what: "CIE augmentation", at: cie_at })?;
         for &letter in letters {
             match letter {
                 b'R' => fde_enc = c.u8()?,
@@ -1709,12 +2022,8 @@ fn elf_unwind<'o>(e: &Elf<'o, '_>, sect: &ESect<'o>, eh: &[(u64, u32, i64)], cod
                 b'P' => {
                     let enc = c.u8()?;
                     let at = c.at();
-                    c.take(enc_size(enc, at)?)?;
-                    let (sym, _) = reloc_at(at).ok_or(ReadError::Cfi { at, what: "a personality pointer with no relocation", op: enc })?;
-                    let s = e.sym(sym)?;
-                    if s.name != ELF_PERSONALITY_REF && s.name != PERSONALITY.as_bytes() {
-                        return Err(ReadError::Personality { name: ObjName::of(&[s.name]) });
-                    }
+                    let raw = c.unsigned(enc_size(enc, at)?)?;
+                    p.personality(at, enc, raw)?;
                     personality = true;
                 }
                 _ => return Err(ReadError::Cfi { at: cie_at, what: "an augmentation letter this reader does not read", op: letter }),
@@ -1735,35 +2044,21 @@ fn elf_unwind<'o>(e: &Elf<'o, '_>, sect: &ESect<'o>, eh: &[(u64, u32, i64)], cod
     let mut d = Cursor { bytes: bytes_at(bytes, 0, fde_end, "FDE")?, pos: fde_at as usize + 8, base: 0 };
     let pc_at = d.at();
     let size = enc_size(fde_enc, pc_at)?;
-    d.take(size)?;
+    let raw = d.unsigned(size)?;
     let range = d.unsigned(size)?;
-    let (sym, addend) = reloc_at(pc_at).ok_or(ReadError::Cfi { at: pc_at, what: "an FDE's start with no relocation", op: fde_enc })?;
+    let start = p.start(pc_at, fde_enc, raw)?;
     let code_len = code.len() as u64;
-    match e.dest_of_symbol(sym, pc_at)? {
-        Dest::Code(off) if (off as i64).wrapping_add(addend) == 0 && range == code_len => {}
-        Dest::Code(off) => return Err(ReadError::UnwindCover { start: (off as i64).wrapping_add(addend) as u64, len: range, code: code_len }),
-        _ => return Err(ReadError::Cfi { at: pc_at, what: "an FDE whose start is not in the code", op: fde_enc }),
+    if start != 0 || range != code_len {
+        return Err(ReadError::UnwindCover { start: start as u64, len: range, code: code_len });
     }
     let mut lsda = None;
     if aug.first() == Some(&b'z') {
         let len = d.uleb()?;
-        let end = d.pos as u64 + len;
+        let end = (d.pos as u64).checked_add(len).ok_or(ReadError::Truncated { what: "FDE augmentation", at: fde_at })?;
         if let Some(enc) = lsda_enc {
             let at = d.at();
             let raw = d.unsigned(enc_size(enc, at)?)?;
-            match reloc_at(at) {
-                Some((sym, addend)) => {
-                    let s = e.sym(sym)?;
-                    let target = e.sect(u64::from(s.shndx))?;
-                    if s.shndx == SHN_UNDEF || s.shndx >= SHN_LORESERVE || target.role != Role::Lsda {
-                        return Err(ReadError::LsdaAddress { at });
-                    }
-                    let off = (s.value as i64).checked_add(addend).filter(|&o| o >= 0).ok_or(ReadError::LsdaAddress { at })?;
-                    lsda = Some(target.bytes.get(off as usize..).ok_or(ReadError::LsdaAddress { at: off as u64 })?);
-                }
-                None if raw == 0 => {}
-                None => return Err(ReadError::Cfi { at, what: "a nonzero LSDA pointer with no relocation", op: enc }),
-            }
+            lsda = p.lsda(at, enc, raw)?;
         }
         d.pos = usize::try_from(end).map_err(|_| ReadError::Truncated { what: "FDE augmentation", at: end })?;
         if d.pos > d.bytes.len() {

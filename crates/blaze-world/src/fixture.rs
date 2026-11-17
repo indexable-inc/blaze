@@ -11,10 +11,11 @@ use blaze_own::Alloc;
 use blaze_toolchain::record::{self, CrateIn, Role, TargetIn, UnitIn};
 use blaze_toolchain::{ToolchainId, ToolchainView};
 
-/// A tree pack of `files` (path, text).
-pub fn pack(files: &[(&str, &str)]) -> StdVec<u8> {
+/// A tree pack of `files` (path, text), built in `alloc` (a test's, from
+/// `blaze_own::testing::heap()`).
+pub fn pack(files: &[(&str, &str)], alloc: Alloc<'_>) -> StdVec<u8> {
     let limits = Limits { most_files: 64, most_bytes: 1 << 20, most_path: 256 };
-    let mut builder = Builder::new(Kind::Tree, [7; 32], limits, 0, Alloc::global()).expect("a builder");
+    let mut builder = Builder::new(Kind::Tree, [7; 32], limits, 0, alloc).expect("a builder");
     for (path, text) in files {
         builder.file(path, Mode::File, text.as_bytes()).expect("a file");
     }
@@ -25,15 +26,23 @@ pub fn pack(files: &[(&str, &str)]) -> StdVec<u8> {
 pub const STD: &str = "#![no_std]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }";
 
 /// The fixture's shelf for `triple`: its id and each file, by its 64-hex name, as a shelf
-/// holds them. `std` is std's crate root; `cfg` the target's atoms.
-pub fn shelf(triple: &'static str, std: &str, cfg: &'static [(&'static str, Option<&'static str>)]) -> (ToolchainId, StdVec<(StdString, StdVec<u8>)>) {
-    let library = pack(&[
-        ("core/src/lib.rs", "#![no_core]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }"),
-        ("alloc/src/lib.rs", "#![no_std]\npub mod vec {}"),
-        ("std/src/lib.rs", std),
-        ("proc_macro/src/lib.rs", "#![no_std]\npub struct TokenStream;"),
-    ]);
-    let bstd = pack(&[("crates/blaze-std/src/lib.rs", "#![no_std]\npub mod prelude { pub mod blaze_2026_11 {} }")]);
+/// holds them. `std` is std's crate root; `cfg` the target's atoms; `alloc` the test's.
+pub fn shelf(
+    triple: &'static str,
+    std: &str,
+    cfg: &'static [(&'static str, Option<&'static str>)],
+    alloc: Alloc<'_>,
+) -> (ToolchainId, StdVec<(StdString, StdVec<u8>)>) {
+    let library = pack(
+        &[
+            ("core/src/lib.rs", "#![no_core]\npub mod prelude { pub mod rust_2021 {} pub mod rust_2024 {} }"),
+            ("alloc/src/lib.rs", "#![no_std]\npub mod vec {}"),
+            ("std/src/lib.rs", std),
+            ("proc_macro/src/lib.rs", "#![no_std]\npub struct TokenStream;"),
+        ],
+        alloc,
+    );
+    let bstd = pack(&[("crates/blaze-std/src/lib.rs", "#![no_std]\npub mod prelude { pub mod blaze_2026_11 {} }")], alloc);
     let digest = |p: &[u8]| blaze_toolchain::shelf::pack_digest(p).expect("a pack's footer");
     let row = |name: &'static str, lib: &'static str, dir: &'static str, role: Role, p: &[u8]| CrateIn {
         name,
@@ -64,7 +73,7 @@ pub fn shelf(triple: &'static str, std: &str, cfg: &'static [(&'static str, Opti
     };
     let units = [lib(0, &[]), lib(1, &[("core", 0)]), lib(2, &[("alloc", 1), ("core", 0)]), lib(3, &[("core", 0), ("std", 2)]), lib(4, &[("alloc", 1), ("core", 0)])];
     let targets = [TargetIn { triple, units: &units, cfg }];
-    let manifest = record::write(&crates, &targets, Alloc::global()).expect("a record").to_vec();
+    let manifest = record::write(&crates, &targets, alloc).expect("a record").to_vec();
     let id = ToolchainView::id_of_bytes(&manifest);
     let mut files = StdVec::new();
     files.push((blaze_toolchain::Hex::of(&id.0).as_str().to_string(), manifest));

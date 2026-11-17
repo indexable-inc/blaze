@@ -166,7 +166,7 @@ impl<'a> ItemAttrs<'a> {
     /// it. No arguments, and no derive is taken (a derive on a fn is refused by the macro's own
     /// expansion, as written).
     pub fn implicit_call<E>(mut self, atom: &mut dyn FnMut(&str, Option<&str>) -> Result<bool, E>) -> Result<AttrCall<'a>, ItemAttrsError<E>> {
-        if false { self.apply_later_cfg_attrs(0, atom)?; }
+        self.apply_later_cfg_attrs(0, atom)?;
         Ok(AttrCall { args: None, item: self.item, derives_taken: 0 })
     }
 

@@ -545,7 +545,7 @@ enum Reach {
 }
 
 /// The hosted hello's entry: `#[bstd::main]` is bstd's `macro_rules! main` (blaze-std
-/// entry.rs), an `attr()` arm. On `fn main(cx: &Cx, io: Io)` it makes the process's
+/// entry.rs), an `attr()` arm. On `fn main(cx: &Cx, out: Out)` (D104: a grant by name) it makes the process's
 /// `main() -> Exit`, holding the written `main`, the `MANIFEST` static, and
 /// `bstd_hosted_start` with its local `hosted`: every one an item lowered from the
 /// expansion's words, its bodies clean.
@@ -583,8 +583,8 @@ fn bstd_main_makes_the_hosted_entry() {
         }
     };";
     let text = "#[bstd::main]
-pub fn main(cx: &Cx, io: Io) -> Result<(), Error> {
-    io.need_out()?.line(cx, \"Hello, world!\")?;
+pub fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+    out.line(cx, \"Hello, world!\")?;
     Ok(())
 }
 ";

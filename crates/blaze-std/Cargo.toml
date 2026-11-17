@@ -80,6 +80,9 @@ net = ["requests", "dep:blaze-http", "blaze-http/h3"]
 requests = ["dep:blaze-h1"]
 # `bstd::image`: PNG decode and encode, and its zlib.
 image = ["dep:blaze-deflate"]
+# `bstd::test::native`: a test's native world, from a test's root of real-OS authority
+# (`blaze_core::testing::os()`); a crate's dev-dependencies turn it on, never its build.
+testing = ["blaze-core/testing", "blaze-own/testing"]
 # `bstd::video`: the MP4 muxer, and the HEVC encoder on VideoToolbox on macOS, which links
 # VideoToolbox, CoreMedia, CoreVideo, CoreFoundation, IOSurface, libobjc and Foundation.
 video = [
@@ -93,6 +96,8 @@ video = [
 blaze-sim.workspace = true
 # `blaze_own::testing::heap()`: a test's root allocator capability (D102).
 blaze-own = { workspace = true, features = ["testing"] }
+# `blaze_core::testing::os()`: a test's root of real-OS authority (`bstd::test::native`).
+blaze-core = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

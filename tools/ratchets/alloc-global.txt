@@ -6,31 +6,23 @@
 # `{"command": "heap-check"}`.
 # crate	global	shared_global	test_heap	process
 blaze-build-script	1	0	0	0
-blaze-cli	54	11	0	0
-blaze-columns	0	0	8	0
-blaze-cond	0	0	1	0
+blaze-cli	47	11	0	0
 blaze-consteval	15	0	0	0
 blaze-emit	1	0	0	0
 blaze-expand	16	0	0	0
-blaze-export	10	0	0	0
+blaze-export	4	0	0	0
 blaze-fetch	2	0	0	0
-blaze-file-items	1	0	33	0
+blaze-file-items	1	0	0	0
 blaze-ladder	126	0	0	0
-blaze-launch-rt	2	0	0	0
+blaze-launch-rt	1	0	0	0
 blaze-launcher	0	1	0	0
-blaze-lint	0	0	6	0
 blaze-llvm	1	0	0	0
 blaze-lower	7	0	0	0
-blaze-proc-macro	31	0	0	0
+blaze-proc-macro	30	0	0	0
 blaze-profile	2	0	0	0
 blaze-real	50	0	0	0
-blaze-report	0	0	5	0
 blaze-scope	3	0	0	0
 blaze-solve	5	0	0	0
-blaze-sort	0	0	2	0
-blaze-squeeze	0	0	6	0
 blaze-std	0	0	0	2
-blaze-ty	0	0	5	0
 blaze-typeck	24	0	0	0
-blaze-unit-graph	0	0	1	0
-blaze-world	5	0	0	0
+blaze-world	3	0	0	0

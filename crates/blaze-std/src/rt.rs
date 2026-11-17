@@ -47,7 +47,10 @@ pub(crate) mod image;
 pub(crate) mod tty;
 // The launcher of `#[bstd::main]`: the run spec read from file descriptor 3 (crate::grant).
 mod launch;
-pub use launch::{SPEC_MARK, SPEC_MARK_VALUE, launch};
+pub use launch::{SPEC_MARK, SPEC_MARK_VALUE, launch, launch_with};
+// A test's native world, from a test's root of real-OS authority (`bstd::test::native`).
+#[cfg(any(test, feature = "testing"))]
+pub(crate) mod testing_native;
 
 /// The threads the native driver runs file calls on where it has a pool (kqueue, IOCP): a
 /// bound bstd picks for a program's entry, named (std.md, "The second rule").
@@ -86,7 +89,14 @@ impl std::process::Termination for Exit {
 /// [`POOL_STOP`], else the process fails naming them) and the process exits at once: the
 /// kernel frees the threads and tables, with no teardown.
 pub fn run<R: Outcome>(main: impl FnOnce(&Cx, Io) -> R) -> Exit {
-    run_io(native(), main)
+    run_with(blaze_core::Os::process(), main)
+}
+
+/// [`run`] with the root of real-OS authority handed down by the program's entry (its `fn
+/// main`, where `blaze_core::Os::process()` is taken, plan port27/bstd-capabilities.md P3): the
+/// form an entry calls. [`run`], which reaches the root itself, goes in batch B1.
+pub fn run_with<R: Outcome>(os: &'static blaze_core::Os, main: impl FnOnce(&Cx, Io) -> R) -> Exit {
+    run_io(native(os), main)
 }
 
 /// [`run`] in the world `world` made, or saying why it could not be: the one home of the
@@ -563,10 +573,10 @@ mod machine {
     }
 }
 
-/// The process's world, or why it cannot be made.
-fn native() -> Result<Io, String> {
+/// The process's world, made with the root of real-OS authority `os`, or why it cannot be made.
+fn native(os: &blaze_core::Os) -> Result<Io, String> {
     let block = process_start()?;
-    open_native(ArgList::process(block), Vars::process(block), start_dir(), u8::MAX)
+    open_native(os, ArgList::process(block), Vars::process(block), start_dir(), u8::MAX)
 }
 
 /// The root of a world over the directory the process was started in: `.`, so the start reads
@@ -583,8 +593,9 @@ pub(crate) fn process_start() -> Result<&'static block::Block, String> {
 }
 
 /// The native world over `root` with `args` and `env`: the process's, or a run spec's; it may
-/// read `above` folders above `root` (`u8::MAX`: up to the filesystem's root).
-pub(crate) fn open_native(args: ArgList, env: Vars, root: &RootPath, above: u8) -> Result<Io, String> {
+/// read `above` folders above `root` (`u8::MAX`: up to the filesystem's root). Made with the
+/// root of real-OS authority `os`, handed down from the entry.
+pub(crate) fn open_native(os: &blaze_core::Os, args: ArgList, env: Vars, root: &RootPath, above: u8) -> Result<Io, String> {
     let world = NativeWorld {
         root,
         above,
@@ -598,7 +609,7 @@ pub(crate) fn open_native(args: ArgList, env: Vars, root: &RootPath, above: u8) 
         limits: Limits::USUAL,
     };
     // alloc: an error's message.
-    Io::native(world).map_err(|error| error.to_string())
+    Io::native_in(os, world).map_err(|error| error.to_string())
 }
 
 /// `said` on standard error, as `error: <said>` and a line feed. A standard error that

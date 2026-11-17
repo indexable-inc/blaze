@@ -83,6 +83,15 @@ impl Kind {
         matches!(self, Kind::Args | Kind::Out | Kind::Clock | Kind::Mem | Kind::Spec)
     }
 
+    /// The kinds that fill themselves ([`Kind::fills_itself`]).
+    pub const FILLS_ITSELF: [Kind; 5] = [Kind::Args, Kind::Out, Kind::Clock, Kind::Mem, Kind::Spec];
+
+    /// Whether the kind named `name` in the manifest's JSON (and on the hosted wire) fills
+    /// itself: what a host answers with no grant (crate::hosting's `grant`).
+    pub fn fills_itself_named(name: &[u8]) -> bool {
+        Kind::FILLS_ITSELF.iter().any(|kind| kind.name().as_bytes() == name)
+    }
+
     /// Its name in the manifest's JSON.
     pub const fn name(self) -> &'static str {
         match self {

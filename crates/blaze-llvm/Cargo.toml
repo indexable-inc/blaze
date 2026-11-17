@@ -32,7 +32,7 @@ blaze-own.workspace = true
 blaze-core.workspace = true
 
 [dev-dependencies]
-blaze-own = { workspace = true, features = ["std"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
 
 [lints]
 workspace = true

@@ -123,7 +123,7 @@ pub use crate::{
     },
     item::{AttrCall, DeriveUse, Derives, ItemAttrs, ItemAttrsError, NextAttr},
     key::{
-        CallKey, EXPANDER, ExpansionKey, call_key, call_key_of, expansion_key,
+        CallKey, ExpansionKey, call_key, call_key_of, expansion_key, kept_key,
     },
     limit::{Depth, LimitReached, RecursionLimit},
     nested::find_calls,

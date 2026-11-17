@@ -32,6 +32,7 @@ use std::sync::Mutex;
 
 use blaze_expand::CallKey;
 use blaze_expand::kept::{KeptError, KeptSet, SetEntry, SetSource, write_set};
+use blaze_ids::producer::{Expander, ProducerId};
 use blaze_own::{AVec, Alloc};
 
 /// One of this solve's expansions: found in the earlier set (its index there), or made now
@@ -67,6 +68,9 @@ pub enum Planted {
 /// for a push, never across an expansion.
 pub struct KeptExpansions<'k, 'a> {
     keeps: bool,
+    /// The expander whose expansions this set holds (decision D105): every key it files or
+    /// finds is `kept_key(expander, call)`. `None` exactly when nothing is kept.
+    expander: Option<ProducerId<Expander>>,
     earlier: Option<KeptSet<'k>>,
     now: Mutex<AVec<'a, (CallKey, Now<'a>)>>,
     found: AtomicUsize,
@@ -82,6 +86,7 @@ impl<'k, 'a> KeptExpansions<'k, 'a> {
     pub fn none(alloc: Alloc<'a>) -> KeptExpansions<'k, 'a> {
         KeptExpansions {
             keeps: false,
+            expander: None,
             earlier: None,
             now: Mutex::new(AVec::new_in(alloc)),
             found: AtomicUsize::new(0),
@@ -92,9 +97,10 @@ impl<'k, 'a> KeptExpansions<'k, 'a> {
         }
     }
 
-    /// A solve that keeps its expansions, with the crate's `earlier` set when one was kept
-    /// (aligned to [`blaze_expand::kept::ALIGN`] bytes; its table is checked here, once).
-    pub fn open(earlier: Option<&'k [u8]>, alloc: Alloc<'a>) -> Result<KeptExpansions<'k, 'a>, KeptError> {
+    /// A solve that keeps the expansions `expander` makes, with the crate's `earlier` set when
+    /// one was kept (aligned to [`blaze_expand::kept::ALIGN`] bytes; its table is checked here,
+    /// once). An earlier set made by another expander finds nothing: its keys hold that one.
+    pub fn open(expander: ProducerId<Expander>, earlier: Option<&'k [u8]>, alloc: Alloc<'a>) -> Result<KeptExpansions<'k, 'a>, KeptError> {
         // A set of an earlier layout is detected by its magic and rebuilt by this solve (an old
         // home after an upgrade), never read as this one.
         let earlier = match earlier.map(KeptSet::open) {
@@ -102,12 +108,27 @@ impl<'k, 'a> KeptExpansions<'k, 'a> {
             Some(Err(KeptError::OldForm)) | None => None,
             Some(Err(error)) => return Err(error),
         };
-        Ok(KeptExpansions { keeps: true, earlier, ..KeptExpansions::none(alloc) })
+        Ok(KeptExpansions { keeps: true, expander: Some(expander), earlier, ..KeptExpansions::none(alloc) })
     }
 
     /// [`KeptExpansions::open`] with a planted bug, for the test that must catch it.
-    pub fn open_planted(earlier: Option<&'k [u8]>, planted: Planted, alloc: Alloc<'a>) -> Result<KeptExpansions<'k, 'a>, KeptError> {
-        Ok(KeptExpansions { planted, ..KeptExpansions::open(earlier, alloc)? })
+    pub fn open_planted(
+        expander: ProducerId<Expander>,
+        earlier: Option<&'k [u8]>,
+        planted: Planted,
+        alloc: Alloc<'a>,
+    ) -> Result<KeptExpansions<'k, 'a>, KeptError> {
+        Ok(KeptExpansions { planted, ..KeptExpansions::open(expander, earlier, alloc)? })
+    }
+
+    /// The key `call`'s expansion is kept under: the call's key and this set's expander.
+    fn kept(&self, call: CallKey) -> CallKey {
+        match self.expander {
+            Some(expander) => blaze_expand::kept_key(expander, call),
+            // `keeps` is false: resolve.rs makes no call key, so nothing reaches here (rule 3:
+            // stop, naming it, rather than file a key without its producer).
+            None => panic!("a call's kept key was asked of a solve that keeps no expansions (D105, expansions.rs)"),
+        }
     }
 
     /// Whether this solve keeps expansions at all: when not, no call's key is made.
@@ -130,6 +151,7 @@ impl<'k, 'a> KeptExpansions<'k, 'a> {
     }
 
     fn push(&self, key: CallKey, now: Now<'a>) {
+        let key = self.kept(key);
         match self.now.lock() {
             Ok(mut list) => list.push((key, now)),
             Err(_) => panic!("a fill thread panicked holding the kept expansions lock"),
@@ -139,7 +161,7 @@ impl<'k, 'a> KeptExpansions<'k, 'a> {
     /// The earlier solve's entry under `key`, opened, with its index for [`Self::found`].
     pub(crate) fn find(&self, key: &CallKey) -> Result<Option<(usize, SetEntry<'k>)>, KeptError> {
         let Some(set) = self.earlier else { return Ok(None) };
-        match set.position(key) {
+        match set.position(&self.kept(*key)) {
             Some(index) => Ok(Some((index, set.entry(index)?))),
             None => Ok(None),
         }

@@ -63,7 +63,12 @@ pub(super) fn worktree(io: &Io, at: &str) {
 /// blaze-world's fixture toolchain on the shelf of the home `home` (absolute; as main.rs's
 /// tests place it): its id.
 fn shelf(io: &Io, home: &str) -> blaze_toolchain::ToolchainId {
-    let (id, files) = blaze_world::fixture::shelf(graph::TRIPLE, blaze_world::fixture::STD, &[("target_os", Some("macos")), ("unix", None)]);
+    let (id, files) = blaze_world::fixture::shelf(
+        graph::TRIPLE,
+        blaze_world::fixture::STD,
+        &[("target_os", Some("macos")), ("unix", None)],
+        blaze_own::testing::heap().alloc(),
+    );
     for (name, bytes) in files {
         let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
         let path = Path::new(&format!("{}/{}/{name}", home.trim_start_matches('/'), toolchain::SHELF)).expect("a path");
@@ -87,8 +92,8 @@ pub(super) enum Keys {
 
 fn tool_for(at: &str, keys: Keys) -> Tool {
     match keys {
-        Keys::FromText => home::tool(b"test"),
-        Keys::PlantedPath => home::tool(format!("test at /{at}").as_bytes()),
+        Keys::FromText => home::tool(&blaze_ids::producer::Producers::for_tests(b"test")),
+        Keys::PlantedPath => home::tool(&blaze_ids::producer::Producers::for_tests(format!("test at /{at}").as_bytes())),
     }
 }
 

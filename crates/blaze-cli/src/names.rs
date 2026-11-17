@@ -727,7 +727,11 @@ pub(crate) fn run<'f, 'b>(
             place(names.by_subject[i].1, &mut local);
         }
     }
-    let have = |g: usize| task.inputs.iter().find(|input| input.name == name_of(crates[g].input.key));
+    // Hashed once per crate, never per input compared (as body_types.rs `input_at`).
+    let have = |g: usize| {
+        let name = name_of(crates[g].input.key);
+        task.inputs.iter().find(|input| input.name == name)
+    };
     let missing: std::vec::Vec<usize, Global> = local.iter().copied().filter(|g| have(*g).is_none()).collect();
     if !missing.is_empty() {
         let mut wants = blaze_own::Vec::with_capacity_in(missing.len(), held);

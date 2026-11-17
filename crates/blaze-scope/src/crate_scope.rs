@@ -25,6 +25,7 @@ use blaze_format::cursor::{self, Reader};
 use blaze_format::FormatError;
 use blaze_hash::HashMap;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
+use blaze_ids::producer::{Expander, ProducerId};
 use blaze_own::{AVec, Alloc, Box};
 use blaze_surface::{BuildError, CallShape, Edition, GlobEdge, Namespace, ProcKind, RecordBytes, ScopeBuilder, ScopeView, Unresolved, Visibility};
 
@@ -746,10 +747,11 @@ pub trait Kept: Sync {
     /// bytes `made` was given and found with them.
     fn items(&self, _krate: usize, _items: &[u8]) {}
 
-    /// Whether each solved crate's expansions are kept ([`crate::expansions`]): when not, no
-    /// call's key is made and nothing is collected.
-    fn keeps_expansions(&self) -> bool {
-        false
+    /// Whether each solved crate's expansions are kept ([`crate::expansions`]), and by which
+    /// expander's code (decision D105: the id the program's entry hands down, never a typed-in
+    /// name): when `None`, no call's key is made and nothing is collected.
+    fn keeps_expansions(&self) -> Option<ProducerId<Expander>> {
+        None
     }
 
     /// `krate`'s expansions from its last solve ([`Kept::expansions_made`]'s bytes), WHETHER OR
@@ -1052,15 +1054,15 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
                 // The crate's expansions kept between solves ([`crate::expansions`]): asked for
                 // whether or not its files changed, collected anew by each try, told once the
                 // solve finished.
-                let keeper = kept.filter(|k| k.keeps_expansions());
+                let keeper = kept.and_then(|k| k.keeps_expansions().map(|expander| (k, expander)));
                 let kept_expansions = match keeper {
-                    Some(k) => crate::expansions::KeptExpansions::open_planted(k.expansions(at), k.expansions_planted(), alloc)
+                    Some((k, expander)) => crate::expansions::KeptExpansions::open_planted(expander, k.expansions(at), k.expansions_planted(), alloc)
                         .unwrap_or_else(|e| panic!("the kept expansions of `{}` did not open: {e}", input.name)),
                     None => crate::expansions::KeptExpansions::none(alloc),
                 };
                 match resolve_crate_decoded(&local_input, &deps, local_sysroot, sources, at, par, leak_private, prepares, &kept_expansions, alloc) {
                     Ok(done) => {
-                        if let Some(k) = keeper {
+                        if let Some((k, _)) = keeper {
                             par.stage(crate::task::Stage::ExpansionsRecord);
                             let set = kept_expansions.record(alloc).unwrap_or_else(|e| panic!("the kept expansions of `{}` did not write: {e}", input.name));
                             k.expansions_made(at, &set);

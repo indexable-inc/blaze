@@ -113,3 +113,39 @@ pub fn module_of<'n, S: NamesSource<'n>>(
     }
     Ok(found.or_else(|| names.binds(calling, ns, name).then_some(calling)))
 }
+
+/// Where a `use` an expansion wrote (its site starts at `site`: `BlockUse::site`) reads a path
+/// whose first segment is `first`, an item of a block: the first written block of the
+/// expansion of the statement call around the site whose module has `first` in the type
+/// namespace (its own item, or the calling block's through the block's `use super::*`), else
+/// the calling block's module when it has it; `None` when no statement call holds the site or
+/// no such module has it (the caller refuses by name).
+pub fn start_module<'n, S: NamesSource<'n>>(
+    names: S,
+    krate: CrateItemKey,
+    nested: &Nested<'_>,
+    modules: &[Option<ItemKey>],
+    site: u32,
+    first: &str,
+    alloc: Alloc<'_>,
+) -> Option<ItemKey> {
+    let call = nested.calls.iter().position(|c| c.range.start <= site && site < c.range.end)?;
+    let (calling, call_key) = statement_call_key(krate, nested, modules, call)?;
+    // `self::name` walked in a module: its own binding, then its glob edges (NamesSource::binds).
+    let has = |module: ItemKey, ns: Namespace, name: &str| {
+        names
+            .walk(module, ns, blaze_scope::names::Written { kind: blaze_surface::PathKind::SelfMod, segments: &[name] })
+            .is_ok_and(|found| found.consumed == 1)
+    };
+    for ordinal in 0..MOST_EXPANSION_BLOCKS {
+        let block = blaze_scope::expanded_blocks::expansion_block_name(call_key, ordinal, alloc);
+        if !has(calling, Namespace::Types, block.as_str()) {
+            break;
+        }
+        let module = blaze_scope::task::key_of(krate, call_key, "mod", block.as_str(), 0);
+        if has(module, Namespace::Types, first) {
+            return Some(module);
+        }
+    }
+    has(calling, Namespace::Types, first).then_some(calling)
+}

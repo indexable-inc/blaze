@@ -1872,6 +1872,7 @@ name = "blaze-tier"
 version = "0.0.0"
 dependencies = [
  "blaze-code",
+ "blaze-ids",
  "blaze-lir",
  "blaze-own",
  "blaze-run",
@@ -2032,6 +2033,7 @@ dependencies = [
  "blaze-fetch",
  "blaze-file-items",
  "blaze-id",
+ "blaze-ids",
  "blaze-lex",
  "blaze-manifest",
  "blaze-own",

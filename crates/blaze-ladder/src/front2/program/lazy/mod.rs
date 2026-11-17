@@ -1,0 +1,298 @@
+//! D106 piece Y: the program FILLED ONE BODY AT A TIME, the end state of `blaze run`'s front
+//! end (decision D106, docs/v2/plan/decisions.json; design and its legs in
+//! blaze-int-1112-notes/port27/d106-run-on-records.md, "## Piece Y").
+//!
+//! [`super::Front2Program`] is made by a census: every fn `main` reaches is lowered, checked and
+//! tabled before the back half asks anything (`make_from`), about 6 KB a row. [`LazyProgram`]
+//! answers the same seam ([`crate::seam::FrontEnd`]) with NO census: its state is columns that
+//! grow by one row when a body is asked for, and the one body (or the few) the instance being
+//! made needs. The back half's per-instance step (run/make_one.rs, piece X) drives it:
+//!
+//! 1. `check_one(key)` (`&mut self`, the ONE place a row is added): fn `key`'s row; its body
+//!    lowered (each head and constant the lowering names made first: `lower_made`) and checked
+//!    ONCE; then everything the build of THAT body asks the `&self` getters: a head row of each
+//!    fn it calls, the row of each ADT its types name, the value of each constant it reads. The
+//!    `Checked` is handed over owned (the program keeps none).
+//! 2. the build of the instance reads the `&self` getters, which answer from the columns.
+//! 3. `done(i)`: the instance is made; the program drops row `i`'s body (its lowering and
+//!    literals). A row's head facts stay (a few words): a later instance calling it reads them.
+//!
+//! Why `&mut self` alone adds rows: the seam's getters lend `&'_` data (`FnFacts`, `FnSig`,
+//! `Adt`, `PTys`) out of the program, so nothing may be added under `&self`; `fn_index` answers
+//! only rows already made.
+//!
+//! THE NAMES SOURCE `S` (rule 78: one seam, each instantiation tested equal): `&Names` (the
+//! names this command solved: what the equal-answers test compares with `Front2Program` over,
+//! so only lazy-vs-whole differs) or `&source::Records` (each crate's names record opened on
+//! the first question about that crate: the end state). Where a helper still reads only the
+//! solved names (`NamesSource::solved`), the records instantiation refuses by name
+//! ([`LazyRefusal::NeedsSolvedNames`]); the list is in the notes, "## Piece Y".
+//!
+//! The types table: each `check_one` forks the head store's table afresh and lowers again into
+//! it only the bodies still live, so the table is the heads made plus the few live bodies, never
+//! every body the run made (today's `tys` holds every tabled body's types). A body's type index
+//! is valid until the next `check_one`: the step reads them while it builds that instance.
+
+mod fill;
+mod front_end;
+
+use super::*;
+
+use blaze_hash::HashMap as Map;
+use blaze_own::{AString, AVec};
+
+use crate::front2::source::NamesSource;
+
+/// Why the lazy program did not answer, naming the method or step and the item (rule 19).
+#[derive(Debug)]
+pub enum LazyRefusal {
+    /// `check_one` was asked about a key no row, item or filed member has: over records the key
+    /// map is filled as heads are made, so a member is known only once its container's head is.
+    UnknownKey { key: ItemKey },
+    /// `check_one` asked twice of one key: the step asks each key once (piece X's contract).
+    AskedTwice { key: ItemKey },
+    /// The body's lowering refused (`lower_made`).
+    Lower { function: Box<str>, error: BodyError },
+    /// The body's names could not be spelled.
+    Spell { function: Box<str> },
+    /// The body's check found a diagnostic, a gap or a refusal: never built.
+    Check { function: Box<str>, error: CheckFail },
+    /// A row the build asks for (the fn's own, or a callee's head) is refused, as
+    /// `program/tabled.rs` `row` refuses it.
+    Row { function: Box<str>, refusal: Front2Refusal },
+    /// A head (a fn's signature, its container's) could not be made.
+    Head { item: Box<str>, why: Box<str> },
+    /// An ADT the body's types name has no row.
+    Adt { adt: Box<str>, why: Box<str> },
+    /// A constant the body reads by value: the evaluator refused it.
+    Const { constant: Box<str>, why: Box<str> },
+    /// A step not made lazy yet: `method` of the seam would be asked about `item` by this
+    /// body's build, and the lazy program has no per-body form of it yet (the notes, "## Piece
+    /// Y", say what each needs). Refused at `check_one`, before the build asks.
+    NotLazyYet { method: &'static str, item: Box<str> },
+    /// The helper `helper` reads only the solved names (`&Names`), and this program's names are
+    /// each crate's records: it needs its `NamesSource` form (the notes name each).
+    NeedsSolvedNames { helper: &'static str, item: Box<str> },
+    /// The types table did not fork.
+    Table { function: Box<str> },
+}
+
+impl core::fmt::Display for LazyRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            LazyRefusal::UnknownKey { key } => write!(f, "front2 (lazy): no item, filed member or row has key {key:?}"),
+            LazyRefusal::AskedTwice { key } => write!(f, "front2 (lazy): the body of {key:?} was asked for twice in one run"),
+            LazyRefusal::Lower { function, error } => write!(f, "front2 (lazy): `{function}`'s body did not lower: {error:?}"),
+            LazyRefusal::Spell { function } => write!(f, "front2 (lazy): `{function}`'s names could not be spelled"),
+            LazyRefusal::Check { function, error } => write!(f, "front2 (lazy): `{function}` did not check clean: {error:?}"),
+            LazyRefusal::Row { refusal, .. } => write!(f, "front2 (lazy): {refusal}"),
+            LazyRefusal::Head { item, why } => write!(f, "front2 (lazy): the head of `{item}`: {why}"),
+            LazyRefusal::Adt { adt, why } => write!(f, "front2 (lazy): the ADT `{adt}`'s row: {why}"),
+            LazyRefusal::Const { constant, why } => write!(f, "front2 (lazy): the constant `{constant}`: {why}"),
+            LazyRefusal::NotLazyYet { method, item } => write!(f, "front2 (lazy): `{method}` about `{item}` has no per-body form yet"),
+            LazyRefusal::NeedsSolvedNames { helper, item } => write!(f, "front2 (lazy): `{helper}` (asked about `{item}`) reads only solved names, not each crate's records"),
+            LazyRefusal::Table { function } => write!(f, "front2 (lazy): the types table did not fork for `{function}`"),
+        }
+    }
+}
+
+/// A byte range of [`Rows::text`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Span {
+    at: u32,
+    len: u32,
+}
+
+/// The program's rows, one per fn asked about, as columns (struct of arrays; rule 11): a row
+/// is its index in every column. Nothing here is a body: a row with a live body points into
+/// [`LazyProgram::live`].
+struct Rows<'n> {
+    key: AVec<'n, ItemKey>,
+    kind: AVec<'n, FnKind>,
+    abi: AVec<'n, Abi>,
+    at: AVec<'n, At>,
+    path: AVec<'n, Span>,
+    symbol: AVec<'n, Span>,
+    export: AVec<'n, Option<Span>>,
+    intrinsic: AVec<'n, Option<Intrinsic>>,
+    /// The slot of [`LazyProgram::live`] holding the row's body; `None`: no body made, or done.
+    live: AVec<'n, Option<u32>>,
+    /// Whether `check_one` was asked of the row (each key once).
+    checked: AVec<'n, bool>,
+    /// Every row's path, symbol and export, end to end.
+    text: AString<'n>,
+    by_key: Map<ItemKey, u32, Alloc<'n>>,
+}
+
+impl<'n> Rows<'n> {
+    fn new_in(alloc: Alloc<'n>) -> Rows<'n> {
+        Rows {
+            key: AVec::new_in(alloc),
+            kind: AVec::new_in(alloc),
+            abi: AVec::new_in(alloc),
+            at: AVec::new_in(alloc),
+            path: AVec::new_in(alloc),
+            symbol: AVec::new_in(alloc),
+            export: AVec::new_in(alloc),
+            intrinsic: AVec::new_in(alloc),
+            live: AVec::new_in(alloc),
+            checked: AVec::new_in(alloc),
+            text: AString::new_in(alloc),
+            by_key: Map::new_in(alloc),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.key.len()
+    }
+
+    fn put(&mut self, s: &str) -> Span {
+        let at = self.text.len() as u32;
+        self.text.push_str(s);
+        Span { at, len: s.len() as u32 }
+    }
+
+    fn str(&self, s: Span) -> &str {
+        &self.text[s.at as usize..(s.at + s.len) as usize]
+    }
+}
+
+/// A body made for the instance being built: its first lowering (whose scope `resolve` and
+/// `selects` read), the same body lowered again into the program's table (what `function`
+/// lends), and its literals. Dropped by `done`.
+struct Live<'n> {
+    row: u32,
+    made: Body<'n>,
+    again: Body<'n>,
+    lits: Literals,
+}
+
+/// What the lazy program did, for the counts a test and the run's line quote.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LazyCounts {
+    /// Bodies lowered and checked (`check_one` calls that found a fn).
+    pub checked: u32,
+    /// Rows made (each fn asked about: a checked one or a callee's head).
+    pub rows: u32,
+    /// Bodies live now.
+    pub live: u32,
+}
+
+/// The program filled one body at a time (module docs).
+pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
+    front: Front2<'n, S>,
+    store: Store<'n>,
+    buckets: Option<Buckets>,
+    consts: Consts<'n>,
+    prepared: &'n Prepares<'n>,
+    /// The head store's table forked, then each live body lowered again into it (module docs);
+    /// `None` until the first `check_one` (the seam's `types` is then the empty table).
+    /// `'static` (so `Alloc::global()` at the fork) because `lower_again` takes that table type.
+    tys: Option<PortableTys<'static>>,
+    rows: Rows<'n>,
+    live: AVec<'n, Option<Live<'n>>>,
+    /// Each constant a checked body read by value, by key, sorted: the seam's `const_record`.
+    const_values: AVec<'n, (ItemKey, DataRecord<Global>)>,
+    /// The seam's own lang answers ([`SEAM_LANGS`]), looked up when the program is made.
+    langs: [(LangItem, Option<ItemKey>); SEAM_LANGS.len()],
+    /// The program's entry row: set by the first `check_one` of the key given as the entry.
+    entry_key: Option<ItemKey>,
+    projection_why: RefCell<Option<Box<str>>>,
+    counts: LazyCounts,
+    alloc: Alloc<'n>,
+}
+
+impl<'n> LazyProgram<'n> {
+    /// Over the names this command solved: `entry` is the key of the fn the process starts at
+    /// (`main`, or the exported entry), which nothing here lowers until `check_one` asks it.
+    pub fn new(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], entry: Option<ItemKey>, alloc: Alloc<'n>) -> Result<LazyProgram<'n>, Front2Refusal> {
+        let front = Front2::new(names, frame, user).map_err(Front2Refusal::Front)?;
+        Self::over(front, entry, alloc)
+    }
+}
+
+impl<'n> LazyProgram<'n, &'n crate::front2::source::Records<'n>> {
+    /// Over each crate's records: `Front2::from_records` reads only the lang rows of
+    /// `lang_crates`; every other crate's names record is opened on the first question about
+    /// it. What a record could not answer is in `records.errors()`: the CALLER reads it after
+    /// each `check_one` (the seam has no source), and a body checked over a log that is not
+    /// empty is void.
+    pub fn from_records(
+        records: &'n crate::front2::source::Records<'n>,
+        frame: &'n blaze_mem::Frame,
+        lang_crates: &[usize],
+        entry: Option<ItemKey>,
+        alloc: Alloc<'n>,
+    ) -> Result<LazyProgram<'n, &'n crate::front2::source::Records<'n>>, Front2Refusal> {
+        let front = Front2::from_records(records, frame, lang_crates).map_err(Front2Refusal::Front)?;
+        Self::over(front, entry, alloc)
+    }
+}
+
+impl<'n, S: NamesSource<'n>> LazyProgram<'n, S> {
+    fn over(front: Front2<'n, S>, entry: Option<ItemKey>, alloc: Alloc<'n>) -> Result<LazyProgram<'n, S>, Front2Refusal> {
+        let mut store = Store::new(front.index.lang("sized"), front.frame);
+        store.pointers = super::super::receiver::Pointers::find(&front.index, front.resolver);
+        let mut langs = [(LangItem::Drop, None); SEAM_LANGS.len()];
+        for (slot, item) in langs.iter_mut().zip(SEAM_LANGS) {
+            // As `lang_of` in program.rs, over any source.
+            let found = super::super::langs::find(&front.index, front.resolver, item).map_err(|why| Front2Refusal::Lang { item, why })?;
+            *slot = (item, found.map(checker_of));
+        }
+        Ok(LazyProgram {
+            front,
+            store,
+            buckets: None,
+            consts: Consts::default(),
+            prepared: Prepares::new_in(alloc),
+            tys: None,
+            rows: Rows::new_in(alloc),
+            live: AVec::new_in(alloc),
+            const_values: AVec::new_in(alloc),
+            langs,
+            entry_key: entry,
+            projection_why: RefCell::new(None),
+            counts: LazyCounts::default(),
+            alloc,
+        })
+    }
+
+    /// What the program did so far.
+    pub fn counts(&self) -> LazyCounts {
+        self.counts
+    }
+
+    /// The front end, for a test that reads the names source (`Records::opened`).
+    pub fn front(&self) -> &Front2<'n, S> {
+        &self.front
+    }
+
+    /// The checker's records over this program's parts: one borrow, as `const_at` makes them.
+    fn records(&mut self, consts: bool) -> Records<'_, 'n, S> {
+        Records {
+            names: self.front.names,
+            keys: &mut self.front.keys,
+            index: &self.front.index,
+            store: &mut self.store,
+            buckets: &mut self.buckets,
+            order: BuildOrder::AsAsked,
+            consts: if consts { Some((&mut self.consts, self.prepared)) } else { None },
+        }
+    }
+
+    /// Row `i`'s live body, `None` when none is made or it was done.
+    fn live_of(&self, i: usize) -> Option<&Live<'n>> {
+        let slot = (*self.rows.live.get(i)?)?;
+        self.live.get(slot as usize)?.as_ref()
+    }
+
+    /// The live body of the fn `owner`, by key.
+    fn live_by_key(&self, owner: ItemKey) -> Option<&Live<'n>> {
+        self.live_of(*self.rows.by_key.get(&owner)? as usize)
+    }
+
+    /// A lang item of [`SEAM_LANGS`], as looked up when the program was made.
+    fn made_lang(&self, item: LangItem) -> Option<ItemKey> {
+        self.langs.iter().find(|(l, _)| *l == item).and_then(|(_, k)| *k)
+    }
+}

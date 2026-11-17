@@ -12,6 +12,11 @@
 //! READ LIST (blaze-run's [`Read`] rows: the simplifier's spliced bodies at Fast, exactly the
 //! inlined set and the fact records of callees still called at Optimized, point 7).
 //!
+//! New in `bzcode03` (D106): the DECLARED INSTANCES ([`DeclaredRow`], declared.rs): for each
+//! in-program target the data its record's key is made from without the body, so `blaze run`
+//! follows a found record to what it calls. A producer fills them with [`declare`] before the
+//! seal; the tiers' emitters leave them empty (their caller holds the names).
+//!
 //! Positions are item-relative (rule 71): code offsets from the record's first code byte, spans
 //! as byte ranges in the item's text, values by LIR index. Sorted at the boundary (rule 25), as
 //! each row's documentation says; the seal refuses an unsorted list by name.
@@ -24,14 +29,18 @@ use blaze_run::parent::Read;
 
 use crate::Reg;
 
+mod declared;
 mod form;
 mod place;
 mod v1;
 
+pub use declared::{Declare, Declared, DeclaredKind, DeclaredRow, Declares, declare};
 pub use form::{FormError, MAGIC, RecordView, Sealed, encode, read, seal};
 pub use place::{calls, page_offset, place};
 pub use v1::from_v1;
 
+#[cfg(test)]
+mod declared_tests;
 #[cfg(test)]
 mod form_tests;
 
@@ -160,6 +169,9 @@ pub struct Emitted<'a> {
     pub reads: AVec<'a, Read>,
     /// Each C name a target uses: its symbol and its text's range in `text`.
     pub names: AVec<'a, (Symbol, u32, u32)>,
+    /// Each in-program target's key data (declared.rs): its name's range in `text`. The seal
+    /// sorts them by symbol and refuses any that disagree with the targets.
+    pub declared: AVec<'a, DeclaredRow>,
     pub text: AVec<'a, u8>,
 }
 
@@ -183,6 +195,7 @@ impl<'a> Emitted<'a> {
             positions: Vec::new_in(alloc),
             reads: Vec::new_in(alloc),
             names: Vec::new_in(alloc),
+            declared: Vec::new_in(alloc),
             text: Vec::new_in(alloc),
         }
     }

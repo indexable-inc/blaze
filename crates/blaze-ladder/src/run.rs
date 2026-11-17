@@ -40,6 +40,9 @@ use crate::place::{self, Body, Entry, PlaceError, Target, VtableImage, VtableWor
 use crate::tls_index::{self, TlsVars};
 use crate::class_chain::class_chain;
 
+/// D106: one missing instance made for the record walk (body_ids.rs `Walk`).
+pub mod make_one;
+
 /// A function a stage refused: its path, for the words, and where its item is, for the finding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Named {
@@ -109,6 +112,10 @@ pub enum RunError {
     Place(PlaceError),
     /// The program has no `main` at its crate root.
     NoMain,
+    /// D106's one-instance maker (run/make_one.rs) could not make the instance of fn `key`:
+    /// `why` names the cause (a front end that checks only the whole program, a fn with no
+    /// checked body, the maker's own state).
+    OneBody { key: ItemKey, why: &'static str },
     /// A lang item the back half asks for that the front end refused to answer.
     Lang(crate::seam::LangRefusal),
     /// `main`'s signature is not one the skeleton calls.
@@ -226,6 +233,7 @@ impl core::fmt::Display for RunError {
             }
             RunError::Place(error) => write!(f, "{error}"),
             RunError::NoMain => write!(f, "the crate root has no `main`"),
+            RunError::OneBody { key, why } => write!(f, "fn {:#x}: {why} (D106: the record walk makes one instance at a time)", key.0),
             RunError::Lang(l) => write!(f, "the lang item {:?}: {} (rule no-fallback: no build without it)", l.item, l.why),
             RunError::MainShape { main, what } => write!(f, "`{main}`: {what}"),
             RunError::NoHost { start } => {
@@ -351,6 +359,7 @@ impl RunError {
             RunError::TooManyInstances
             | RunError::OverflowDisagrees { .. }
             | RunError::NoMain
+            | RunError::OneBody { .. }
             | RunError::Lang(_)
             | RunError::Statics { .. }
             | RunError::Tls { .. }

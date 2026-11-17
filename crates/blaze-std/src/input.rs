@@ -42,6 +42,15 @@ use crate::{
     pending::{self, Pending},
 };
 
+/// The planted bug of the read's test (`tests/input.rs`): the bytes kept are the slot asked
+/// for, not the count read, so a short read leaves zeros after what came. Only the test that
+/// must catch it plants it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum InPlant {
+    None,
+    KeepsSlot,
+}
+
 /// Why a read of standard input did not happen.
 #[derive(Debug)]
 pub enum InWhy {
@@ -112,13 +121,23 @@ impl In {
     /// to `into`; how many, `0` once the input has ended. Its [`In::read_into`], waited for
     /// under `cx`'s span `bstd.in.read`, until `cx`'s deadline. `into` is as it was on an error.
     pub fn read(&self, cx: &Cx, most: usize, into: &mut Bytes<'_>) -> Result<usize, InError> {
+        self.read_in(cx, most, into, InPlant::None)
+    }
+
+    /// [`In::read`], with the test's planted bug when `plant` says so.
+    pub(crate) fn read_in(&self, cx: &Cx, most: usize, into: &mut Bytes<'_>, plant: InPlant) -> Result<usize, InError> {
         let cx = cx.span("bstd.in.read");
         cx.stopped_by(self.io.now())?;
         let start = into.len();
-        let slot = into.grow_zeroed(most.min(RECV_MOST))?;
+        let asked = most.min(RECV_MOST);
+        let slot = into.grow_zeroed(asked)?;
         match self.read_into(slot).wait(&cx) {
             Ok(read) => {
-                into.truncate(start + read);
+                let kept = match plant {
+                    InPlant::None => read,
+                    InPlant::KeepsSlot => asked,
+                };
+                into.truncate(start + kept);
                 Ok(read)
             }
             Err(error) => {

@@ -1170,6 +1170,75 @@ fn render(counts: &BTreeMap<String, Vec<Site>>) -> String {
     out
 }
 
+/// What command `write` writes, and what it found.
+struct Written {
+    /// Each crate's row: where it had one, the lower of the row and its count in each column
+    /// (`write` never raises a row, so "over its row" always means a raise); where it had none,
+    /// its count.
+    rows: BTreeMap<String, Row>,
+    /// The crates that had no row and got one.
+    fresh: Vec<String>,
+    /// The crates over their rows in some column.
+    over: Vec<String>,
+}
+
+fn written_rows(counts: &BTreeMap<String, Vec<Site>>, rows: &BTreeMap<String, Row>) -> Written {
+    let mut out = Written { rows: BTreeMap::new(), fresh: Vec::new(), over: Vec::new() };
+    let crates: BTreeSet<&String> = counts.keys().chain(rows.keys()).collect();
+    for krate in crates {
+        let now = counts.get(krate).map_or([0; 4], |sites| tally(sites));
+        let row = match rows.get(krate) {
+            Some(held) => {
+                if now.iter().zip(held).any(|(n, h)| n > h) {
+                    out.over.push(krate.clone());
+                }
+                core::array::from_fn(|at| now[at].min(held[at]))
+            }
+            None => {
+                if now != [0; 4] {
+                    out.fresh.push(krate.clone());
+                }
+                now
+            }
+        };
+        if row != [0; 4] {
+            out.rows.insert(krate.clone(), row);
+        }
+    }
+    out
+}
+
+/// The list with `rows`: the header, then each row that is not all zero, sorted, each under the
+/// comment lines `notes` keeps for it (why a row was raised by hand).
+fn render_rows(rows: &BTreeMap<String, Row>, notes: &BTreeMap<String, Vec<String>>) -> String {
+    let mut out = HEADER.to_owned();
+    for (krate, [named_std, is_std, alloc, vec_box]) in rows {
+        for note in notes.get(krate).into_iter().flatten() {
+            out.push_str(note);
+            out.push('\n');
+        }
+        out.push_str(&format!("{krate}\t{named_std}\t{is_std}\t{alloc}\t{vec_box}\n"));
+    }
+    out
+}
+
+/// The comment lines of the list `text` past its `header`, by the row they stand above.
+fn row_notes(text: &str, header: &str) -> BTreeMap<String, Vec<String>> {
+    let header = header.split('\n').filter(|it| !it.is_empty()).count();
+    let mut notes = BTreeMap::new();
+    let mut pending = Vec::new();
+    for line in text.split('\n').skip(header) {
+        if line.starts_with('#') {
+            pending.push(line.to_owned());
+        } else if let Some(krate) = line.split('\t').next().filter(|it| !it.is_empty()) {
+            if !pending.is_empty() {
+                notes.insert(krate.to_owned(), std::mem::take(&mut pending));
+            }
+        }
+    }
+    notes
+}
+
 /// The list's rows.
 fn parse_rows(text: &str) -> Result<BTreeMap<String, Row>, ListError> {
     let mut rows = BTreeMap::new();
@@ -1303,7 +1372,11 @@ fn problems(
                     }
                     (_, None) => "give `base`, the commit the change is against, to have the new ones named".to_owned(),
                 };
-                out.push(format!("`{krate}` has {now} {what} outside tests, over {shown} in {LIST} ({new}): {} ({RULE})", kind.instead()));
+                out.push(format!(
+                    "`{krate}` has {now} {what} outside tests, over {shown} in {LIST} by {} ({new}): {} ({RULE})",
+                    now - held,
+                    kind.instead()
+                ));
             } else if now < held {
                 let lower = match now_row {
                     [0, 0, 0, 0] => "remove the row".to_owned(),
@@ -1380,12 +1453,24 @@ fn main_with(it: &Args) {
         finding::print(SCRIPT, &KINDS.map(Kind::finding), found.collect());
         return;
     }
-    let text = render(&counts);
     if it.command == "write" {
-        if let Err(e) = std::fs::write(root.join(LIST), &text) {
+        let listed = read_text(&root.join(LIST)).unwrap_or_default();
+        let rows = parse_rows(&listed).unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
+        let written = written_rows(&counts, &rows);
+        if let Err(e) = std::fs::write(root.join(LIST), render_rows(&written.rows, &row_notes(&listed, HEADER))) {
             fail(SCRIPT, &format!("{LIST} is not written: {e}"));
         }
         println!("{SCRIPT}: wrote {LIST}: {}", summary(&counts));
+        if !written.fresh.is_empty() {
+            println!("{SCRIPT}: {} crates had no row and got one at today's count: {}", written.fresh.len(), written.fresh.join(", "));
+        }
+        if !written.over.is_empty() {
+            println!(
+                "{SCRIPT}: {} crates are over their rows, which stay (a row never rises by `write`; raise one by hand, named in the change): {}",
+                written.over.len(),
+                written.over.join(", ")
+            );
+        }
         return;
     }
     let Some(listed) = read_text(&root.join(LIST)) else {
@@ -1403,7 +1488,7 @@ fn main_with(it: &Args) {
         None => (None, None),
     };
     let mut wrong = problems(&counts, &rows, base_rows.as_ref(), added.as_ref());
-    if wrong.is_empty() && listed != text {
+    if wrong.is_empty() && listed != render_rows(&written_rows(&counts, &rows).rows, &row_notes(&listed, HEADER)) {
         wrong.push(format!(
             "{LIST} is not as command `write` writes it (its header, then a sorted `<crate><TAB><std><TAB><is_std><TAB><alloc><TAB><vec_box>` row per crate with a site): run it"
         ));
@@ -1638,6 +1723,17 @@ fn selftest() {
     let want = BTreeMap::from([("a".to_owned(), a), ("b/c".to_owned(), sites_of("crates/b/c/mod.rs", &[(2, Kind::Alloc)]))]);
     expect(counts == want, &format!("the tree's sites: {}", shown(&counts)));
     expect(total(&counts) == [3, 1, 3, 7], &format!("the totals: {:?}", total(&counts)));
+    // `write` never raises a row: `a` over its `std` 0 keeps 0 there and is named; `b/c`, with
+    // no row, gets one at its count.
+    let written = written_rows(&counts, &BTreeMap::from([("a".to_owned(), [0, 9, 9, 9])]));
+    expect(
+        written.over == ["a"] && written.fresh == ["b/c"] && written.rows.get("a").is_some_and(|it| it[0] == 0 && it[1] == 1),
+        &format!("write's rows: {:?}, fresh {:?}, over {:?}", written.rows, written.fresh, written.over),
+    );
+    // A hand-raised row's comment stays above it through `write`.
+    let notes = BTreeMap::from([("b/c".to_owned(), vec!["# b/c raised by hand: why".to_owned()])]);
+    let listed = render_rows(&written.rows, &notes);
+    expect(row_notes(&listed, HEADER) == notes && listed.contains("# b/c raised by hand: why\nb/c\t"), &format!("the notes kept: {listed}"));
 
     // The ratchet. As recorded, nothing is wrong, and the list reads back as it was written.
     let rows = parse_rows(&render(&counts)).unwrap_or_else(|e| failed(&e));

@@ -4,23 +4,32 @@
 //! table to. Run from the workspace's root (the files are under the directory the command
 //! started in): `cargo run -p blaze-emit --example gen_table`; commit both files.
 //!
+//! It is one of blaze's own tools (batch B1, D104): it takes bstd's whole world through
+//! `bstd::entry::run` (it writes under the directory it started in, on a start with no run
+//! spec), not as a `main` parameter, which D104 bars.
+//!
 //! The table is made for arm64 on macOS with no optional features; its templates are the same on
 //! Linux (only the head's os byte differs).
-
-#![feature(macro_attr)]
 
 use blaze_emit::table_gen::generate;
 use blaze_own::{Alloc, Vec};
 use blaze_tier::{Arch, Machine, Os};
 use bstd::fs::{Content, Durable};
-use bstd::{Cx, Io, entry::Error};
+use bstd::{
+    Cx, Io,
+    entry::{Error, Exit},
+};
 
 const MACHINE: Machine = Machine { arch: Arch::Arm64, os: Os::MacOs, features: 0 };
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
-#[bstd::main]
-fn main(cx: &Cx, io: Io) -> Result<(), Error> {
+fn main() -> Exit {
+    bstd::entry::run(|cx, io| write_table(cx, io))
+}
+
+/// The table and its pin written under `crates/blaze-emit/table`, and one line saying so.
+fn write_table(cx: &Cx, io: Io) -> Result<(), Error> {
     // The program's top names the allocator it hands down (blaze-own, `Alloc::global`).
     let alloc = Alloc::global();
     let mut table = Vec::new_in(alloc);

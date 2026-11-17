@@ -153,10 +153,10 @@ mod tests {
             ("crates/rpc/rpc-eth-api/Cargo.toml", DEP_MANIFEST),
             ("crates/rpc/rpc-eth-api/src/core.rs", "pub trait EthApi {}"),
             ("crates/rpc/rpc-eth-api/src/lib.rs", "mod core;"),
-        ]);
+        ], blaze_own::testing::heap().alloc());
         let git: &'static [u8] = std::boxed::Box::leak(git.into_boxed_slice());
         let git = PackView::open_verified(git).expect("a pack");
-        let registry = pack(&[("Cargo.toml", DEP_MANIFEST), ("src/lib.rs", "")]);
+        let registry = pack(&[("Cargo.toml", DEP_MANIFEST), ("src/lib.rs", "")], blaze_own::testing::heap().alloc());
         let registry: &'static [u8] = std::boxed::Box::leak(registry.into_boxed_slice());
         let registry = PackView::open_verified(registry).expect("a pack");
 

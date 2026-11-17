@@ -282,8 +282,8 @@ pub enum Plant {
     /// A filed failure keeps no reads ([`filed_record`]): it stands after an input it was
     /// handed changed, which the filed-failure test must catch.
     FiledWithoutReads,
-    /// The command's tool names this body checker, not [`crate::body_types::BODY_CHECKER`]
-    /// (home.rs `tool_of`): an older checker's records, for the producer test.
+    /// The command's tool has this seed as its body checker's row (D105,
+    /// `Producers::planted_for_tests`): an older checker's records, for the producer test.
     BodyChecker(&'static str),
 }
 

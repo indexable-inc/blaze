@@ -37,7 +37,7 @@ use crate::error::Stop;
 use crate::facts::{AdtFlags, Facts, TraitDef};
 use crate::term::{
     AliasKind, Certainty, Children, Flags, GoalSource, Lang, Polarity, Pred, Shape, Ty, TyKind, UintTy, Var, VarKind,
-    children, is_region, shape_of_kind,
+    children, is_region,
 };
 use crate::trait_goals::TraitGoal;
 use crate::tys::Tys;
@@ -111,7 +111,9 @@ pub fn assemble_auto<T: Tys, F: Facts>(
     // after unification and processing nested goals it does not hold) will disqualify the
     // built-in auto impl" (`for_each_relevant_impl`: the impls of the self type's simplified
     // type, and the blanket ones).
-    let Some(shape) = shape_of_kind(k) else { return Err(malformed()) };
+    let Some(shape) = crate::object_shape::shape_with_principal(k, |l| if l.len > 0 { Some(cx.tys.kind(cx.tys.list_get(l, 0))) } else { None }) else {
+        return Err(malformed());
+    };
     let set = cx.impls(g.trait_, shape)?;
     for &i in set.impls {
         let h = cx.impl_header(i)?;
@@ -120,7 +122,10 @@ pub fn assemble_auto<T: Tys, F: Facts>(
         }
         let Some(&s) = h.portable.lists.get(h.args.start as usize) else { return Err(malformed()) };
         let Some(&sk) = h.portable.nodes.get(s.0 as usize) else { return Err(malformed()) };
-        match shape_of_kind(sk) {
+        // The header's self type in its portable nodes: an object's principal is the node of
+        // its list's first entry.
+        let first = |l: crate::term::List| if l.len > 0 { h.portable.lists.get(l.start as usize).and_then(|p| h.portable.nodes.get(p.0 as usize)).copied() } else { None };
+        match crate::object_shape::shape_with_principal(sk, first) {
             Some(Shape::Blanket) => return Ok(()),
             Some(x) if x == shape => return Ok(()),
             _ => {}

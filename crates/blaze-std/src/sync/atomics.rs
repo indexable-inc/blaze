@@ -12,12 +12,13 @@
 //! None of them waits: a reader that wants to wait for a flag or a value waits on a [`crate::sync::Chan`]
 //! or a [`crate::sync::Flight`], whose waits take `cx`.
 
-use core::{
-    cell::UnsafeCell,
-    fmt,
-    mem::MaybeUninit,
-    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
-};
+use core::{cell::UnsafeCell, fmt, mem::MaybeUninit};
+// Under the model checker every named atomic is a schedule point, so a model over code built on
+// them (`sync::once`'s) sees their loads and stores; outside a model the shims are `std`'s.
+#[cfg(blaze_check)]
+use blaze_check::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+#[cfg(not(blaze_check))]
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use crate::Plant;
 

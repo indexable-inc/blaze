@@ -22,6 +22,7 @@ use crate::expansions::Planted;
 use crate::graph::Sysroot;
 use crate::resolve::{CrateInput, aligned};
 use crate::task::{ExpandPart, Par};
+use blaze_ids::producer::{Expander, ProducerId, Producers, Row};
 
 const WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -79,14 +80,21 @@ fn crates(cfg: &'static [(&'static str, Option<&'static str>)]) -> [CrateInput<'
 /// again by every call (`find` finds nothing), so what a call expands is what the kept
 /// expansions did not answer.
 struct Sets {
-    keeps: bool,
+    /// The expander that keeps the sets, `None` when none are kept; moved by [`Sets::made_by`].
+    expander: Mutex<Option<ProducerId<Expander>>>,
     planted: Planted,
     sets: Mutex<Vec<Option<&'static [u8]>>>,
 }
 
 impl Sets {
     fn new(keeps: bool, planted: Planted) -> Sets {
-        Sets { keeps, planted, sets: Mutex::new(vec![None; 2]) }
+        let expander = keeps.then(|| Producers::for_tests(b"test").get::<Expander>());
+        Sets { expander: Mutex::new(expander), planted, sets: Mutex::new(vec![None; 2]) }
+    }
+
+    /// The next solves keep their expansions by `expander`.
+    fn made_by(&self, expander: ProducerId<Expander>) {
+        *self.expander.lock().unwrap_or_else(|p| panic!("expander: {p}")) = Some(expander);
     }
 
     fn set(&self, krate: usize) -> &'static [u8] {
@@ -101,8 +109,8 @@ impl Kept for Sets {
 
     fn made(&self, _krate: usize, _record: &[u8], _inner: &[u8], _read: &[u8]) {}
 
-    fn keeps_expansions(&self) -> bool {
-        self.keeps
+    fn keeps_expansions(&self) -> Option<ProducerId<Expander>> {
+        *self.expander.lock().unwrap_or_else(|p| panic!("expander: {p}"))
     }
 
     fn expansions(&self, krate: usize) -> Option<&[u8]> {
@@ -198,6 +206,28 @@ fn a_re_solve_after_a_name_edit_expands_no_unchanged_derive_again() {
     solve(&crates, &TEXTS, &none);
     let (without, _) = solve(&crates, &TEXTS_RENAMED, &none);
     assert_eq!(without, (5, 1, 0), "without kept expansions every call runs again and none is keyed");
+}
+
+/// D105's causal test (rule 23): a set kept by one expander is found by the same expander id
+/// after another producer's id moved (the names row), and by no other expander: the
+/// expander's id moved, every call runs again; solved once more by it, none runs.
+///
+/// Prints nothing; passes as `tests::expansions::a_set_kept_by_another_expander_is_never_found ... ok`.
+#[test]
+fn a_set_kept_by_another_expander_is_never_found() {
+    let crates = crates(&[]);
+    let sets = Sets::new(true, Planted::None);
+    let (first, _) = solve(&crates, &TEXTS, &sets);
+    assert_eq!(first, (5, 1, 6), "the first solve runs every call");
+    let today = Producers::for_tests(b"test");
+    sets.made_by(today.planted_for_tests(Row::Names, b"older").get::<Expander>());
+    let (names_moved, _) = solve(&crates, &TEXTS, &sets);
+    assert_eq!(names_moved, (0, 0, 6), "another producer moved: every kept expansion is found");
+    sets.made_by(today.planted_for_tests(Row::Expander, b"older").get::<Expander>());
+    let (expander_moved, _) = solve(&crates, &TEXTS, &sets);
+    assert_eq!(expander_moved, (5, 1, 6), "the expander moved: no expansion of the older one is found");
+    let (again, _) = solve(&crates, &TEXTS, &sets);
+    assert_eq!(again, (0, 0, 6), "the same expander again finds its own");
 }
 
 /// The read list: `Gated`'s derive asked the cfg atom `on` (its field's `#[cfg(on)]`), which is

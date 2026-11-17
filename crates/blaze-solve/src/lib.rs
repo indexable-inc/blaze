@@ -25,6 +25,7 @@ pub mod eval;
 pub mod facts;
 pub mod fold;
 pub mod fulfill;
+pub mod object_shape;
 pub mod prefilter;
 pub mod search;
 pub mod term;

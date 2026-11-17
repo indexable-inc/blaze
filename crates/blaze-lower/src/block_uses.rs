@@ -47,6 +47,11 @@ pub struct BlockUse<'a> {
     pub text: &'a str,
     /// Where the item starts in the enclosing item's text; `None` when an expansion wrote it.
     pub at: Option<u32>,
+    /// Where its site starts in the enclosing item's text ([`View::site`]): `at` for a `use`
+    /// written there, the outermost macro call's start for one an expansion wrote (which
+    /// statement call's expansion declared it: the names library files that expansion's blocks
+    /// as modules under the call).
+    pub site: u32,
 }
 
 /// What the `use`s around a pattern make of its name.
@@ -84,7 +89,12 @@ pub fn in_scope<'a, 'b>(v: &View<'b>, scope: ScopeId, name: u64, own_item: bool,
         for i in block.items.start..block.items.start + block.items.len {
             let item = v.local_item(v.row(RowIdx(i))?)?;
             if item.syntax == USE as u16 {
-                found.uses.push(BlockUse { depth, text: v.text_at(item.range)?, at: v.item_relative(item.range).map(|r| r.start) });
+                found.uses.push(BlockUse {
+                    depth,
+                    text: v.text_at(item.range)?,
+                    at: v.item_relative(item.range).map(|r| r.start),
+                    site: v.site(item.range)?.start,
+                });
             } else if let Some(n) = item.name {
                 declares |= v.name(n)? == name;
                 found.locals.push(v.name_text(n)?);

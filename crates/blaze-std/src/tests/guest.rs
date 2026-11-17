@@ -51,6 +51,27 @@ fn a_hosted_hello_writes_its_line_and_ends_ok() {
     assert_eq!(hosting.exited(), None, "main returned; nothing called exit");
 }
 
+/// What `#[bstd::main]` makes of `fn main(cx: &Cx, out: Out)` (the owner's hello, D104) for a
+/// hosted start.
+fn hosted_granted_hello(cx: &Cx, io: Io) -> Status {
+    let out = match guest::grant::<crate::out::Out>(&io, "out") {
+        Some(granted) => granted,
+        None => return Status::REFUSED,
+    };
+    let ran: Result<(), Error> = out.line(cx, "Hello, world!").map_err(Error::from);
+    guest::finish(&io, ran)
+}
+
+/// `out` fills itself: the host answers it with no grant, as the launcher does. With the host's
+/// old rule (only what `grants` lists) the start is refused and this fails.
+#[test]
+fn a_kind_that_fills_itself_is_answered_with_no_grant() {
+    let io = Io::sim(5);
+    let hosting = host(io.clone(), &[]);
+    assert_eq!(guest::start(&hosting.table(), hosted_granted_hello), 0);
+    assert_eq!(io.script(|host| host.out.clone()), Some(b"Hello, world!\n".to_vec()));
+}
+
 #[test]
 fn a_grant_the_host_withholds_refuses_the_start() {
     let io = Io::sim(2);

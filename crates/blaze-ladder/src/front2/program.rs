@@ -106,6 +106,12 @@ pub enum Front2Refusal {
     /// front ([`Front2Program::own_left_out`]): the program's own finding, so a run stops
     /// before it starts (a library's left-out fn only stops a program that calls it).
     OwnLeftOut { item: Box<str>, why: Box<str> },
+    /// A Rust program with std starts through the library's `#[lang = "start"]` (start.rs),
+    /// and no crate declares one: `shelf` names the crates looked in, each with its root file.
+    NoLangStart { shelf: Box<str> },
+    /// The Rust start refuses `item` (the root's `main`, or two `#[lang = "start"]` items):
+    /// `what` says which rule (start.rs [`super::start::rust_start`]).
+    Start { item: Box<str>, what: &'static str },
 }
 
 impl core::fmt::Display for Front2Refusal {
@@ -144,6 +150,8 @@ impl core::fmt::Display for Front2Refusal {
             Front2Refusal::TwoEntries { symbol, first, second } => {
                 write!(f, "front2: `{first}) and `{second}) are both exported as `{symbol}`, the process's entry")
             }
+            Front2Refusal::NoLangStart { shelf } => write!(f, "the shelf has no `#[lang = \"start\"]` item: {shelf}"),
+            Front2Refusal::Start { item, what } => write!(f, "front2: the Rust start: `{item}` {what}"),
         }
     }
 }
@@ -236,6 +244,8 @@ pub struct Front2Program<'n> {
     /// with it, checking a body or making an impl row it has not made yet (const_at.rs).
     consts: Consts<'n>,
     prepared: &'n Prepares<'n>,
+    /// Where the process starts (start.rs); `None` for a test unit's suite.
+    start: Option<super::start::Entry2>,
 }
 
 /// Where a program's walk starts.
@@ -476,6 +486,12 @@ impl<'n> Front2Program<'n> {
         Self::make(names, frame, user, None)
     }
 
+    /// Where the process starts ([`super::start::Entry2`]): what the builder makes the C entry
+    /// from (LADDER.md L1b); `None` for a test unit's suite.
+    pub fn start(&self) -> Option<super::start::Entry2> {
+        self.start
+    }
+
     /// The program with every fn that checks clean tabled and every other one LEFT OUT (each
     /// named in `left_out` with its cause), for a survey of what the back half builds
     /// ([`crate::run::build_survey`]); never run: a left-out fn's caller cannot be built.
@@ -533,13 +549,27 @@ impl<'n> Front2Program<'n> {
     fn make_from(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], mut left_out: Option<&mut Vec<(Box<str>, Box<str>), Global>>, starts: Starts<'_>) -> Result<Made<'n>, Front2Refusal> {
         let mut front = Front2::new(names, frame, user).map_err(Front2Refusal::Front)?;
         let mut roots: Vec<LibKey, Global> = Vec::new_in(Global);
+        // Made before the roots: a Rust program's start reads `main`'s head (start.rs).
+        let mut store = Store::new(front.index.lang("sized"), front.frame);
+        store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
+        let mut start2: Option<super::start::Entry2> = None;
         let tests = match starts {
             Starts::Main => {
                 let written = Written { kind: PathKind::Plain, segments: &["main"] };
                 let found = names::path(names, names.root(0), Namespace::Values, written, Alloc::global()).map_err(|_| Front2Refusal::NoMain)?;
                 let rust_main: LibKey = found.whole(1).ok_or(Front2Refusal::NoMain)?.key;
-                // The walk and `entry()` start at the process's entry (the rule: [`exported_entry`]).
-                roots.push(exported_entry(names)?.unwrap_or(rust_main));
+                // The process's entry (the rule: [`exported_entry`], then start.rs): an exported
+                // entry, else a Rust program with std through `#[lang = "start"]`, else the
+                // root's `fn main` called directly. The walk and `entry()` start at its root.
+                let entry = match exported_entry(names)? {
+                    Some(e) => e,
+                    None if super::start::through_lang_start(names) => {
+                        super::start::Entry2::Rust(super::start::rust_start(names, rust_main, &mut store, &mut front.keys)?)
+                    }
+                    None => super::start::Entry2::Direct(rust_main),
+                };
+                roots.push(entry.root());
+                start2 = Some(entry);
                 false
             }
             Starts::Tests(list) => {
@@ -547,8 +577,6 @@ impl<'n> Front2Program<'n> {
                 true
             }
         };
-        let mut store = Store::new(front.index.lang("sized"), front.frame);
-        store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
         let mut buckets = None;
         let prepared = Prepares::new_in(Alloc::global());
         let mut mains: Vec<Body<'n>, Global> = Vec::with_capacity_in(roots.len(), Global);
@@ -610,6 +638,16 @@ impl<'n> Front2Program<'n> {
             also.sort_unstable();
             also.dedup();
         }
+        // A Rust program's start: `lang_start` is reached beside `main` like any fn it calls;
+        // its instance at `T` is the builder's (LADDER.md L1b).
+        if let Some(super::start::Entry2::Rust(s)) = start2 {
+            let k = records.keys.item(s.lang_start).map_err(|clash| Front2Refusal::Unchecked {
+                function: Box::from("lang_start"),
+                class: Box::from("key clash"),
+                first: format!("{clash}").into_boxed_str(),
+            })?;
+            also.push(k);
+        }
         let mut walk_from = Vec::with_capacity_in(mains.len(), Global);
         for ((m, c), scope) in mains.iter().zip(checked.iter_mut()).zip(scopes.iter()) {
             let first = match c {
@@ -635,11 +673,12 @@ impl<'n> Front2Program<'n> {
                 Reached::Failed { class, detail } if let Some(out) = left_out.as_deref_mut() => {
                     out.push((fn_shown(&records, *k).into_boxed_str(), class.clone()));
                     // The cause a caller's build names ([`RunError::LeftOut`]'s `why`): the class
-                    // and its detail, on one line, cut at 160 characters (walk-AH Brief 2).
-                    let mut why = String::with_capacity(class.len() + 2 + 160);
+                    // and its WHOLE detail, on one line (rule 19: an error names the thing; a cut
+                    // at 160 characters hid the failing goal of Class O, 2026-11-16).
+                    let mut why = String::with_capacity(class.len() + 2 + detail.len());
                     why.push_str(class);
                     why.push_str(": ");
-                    why.extend(detail.chars().take(160).map(|c| if c == '\n' { ' ' } else { c }));
+                    why.extend(detail.chars().map(|c| if c == '\n' { ' ' } else { c }));
                     left.insert(*k, why.into_boxed_str());
                 }
                 Reached::Failed { class, detail } => {
@@ -839,7 +878,7 @@ impl<'n> Front2Program<'n> {
         rows.extend(mains.iter().map(|m| (m.owner, by_key.get(&m.owner).copied())));
         // The evaluator is kept, not dropped: the build pulls constants at instances' ground
         // arguments from it (`FrontEnd::const_at`, const_at.rs).
-        let program = Front2Program { front, store, tys, buckets, fns, by_key, entry, objects, langs, left, const_values: values, statics, projection_why: core::cell::RefCell::new(None), edges, consts, prepared };
+        let program = Front2Program { front, store, tys, buckets, fns, by_key, entry, objects, langs, left, const_values: values, statics, projection_why: core::cell::RefCell::new(None), edges, consts, prepared, start: start2 };
         Ok(Made { program, roots: rows, shapes })
     }
 
@@ -878,7 +917,7 @@ impl<'n> Front2Program<'n> {
 /// each fn's attribute rows through its signature's lowering ([`symbols_of`]), the fns listed by
 /// the names library ([`Names::items`]); two fns under one symbol is [`Front2Refusal::TwoEntries`].
 /// The answer is a function of the program: candidates are ordered by key, never by the map.
-fn exported_entry(names: &Names<'_>) -> Result<Option<LibKey>, Front2Refusal> {
+fn exported_entry(names: &Names<'_>) -> Result<Option<super::start::Entry2>, Front2Refusal> {
     use blaze_surface::ItemDetail;
     let mut found: Vec<(u8, LibKey, Box<str>), Global> = Vec::new_in(Global);
     for (key, _module, place) in names.items(0) {
@@ -912,7 +951,8 @@ fn exported_entry(names: &Names<'_>) -> Result<Option<LibKey>, Front2Refusal> {
             first: first.clone(),
             second: second.clone(),
         }),
-        [(_, key, _), ..] => Ok(Some(*key)),
+        [(0, key, _), ..] => Ok(Some(super::start::Entry2::Hosted(*key))),
+        [(_, key, _), ..] => Ok(Some(super::start::Entry2::CMain(*key))),
     }
 }
 

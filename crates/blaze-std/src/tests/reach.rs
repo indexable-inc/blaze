@@ -30,6 +30,8 @@ const REACHES: &[&str] = &[
     "blaze_core::cores::machine",
     "blaze_core::wait::process_age",
     "blaze_core::native(",
+    "blaze_core::native_in(",
+    "Os::process()",
     "extern \"C\" {",
     "getrandom",
     "mach_absolute_time",
@@ -37,9 +39,17 @@ const REACHES: &[&str] = &[
 ];
 
 /// The driver's backends, where the names above belong: the native runtime, the native
-/// backend's host facts, and the one line of `io.rs` that makes the native driver.
+/// backend's host facts, the one line of `io/native_in.rs` that makes the native driver with
+/// the root of real-OS authority, and the places that take that root: the `main!` macro's
+/// process main (entry.rs) and, until batch B1 deletes it, `Io::native` (io.rs), which reaches
+/// it itself.
 fn allowed(file: &str, reach: &str) -> bool {
-    file == "rt.rs" || file.starts_with("rt/") || file == "native.rs" || (file == "io.rs" && reach == "blaze_core::native(")
+    file == "rt.rs"
+        || file.starts_with("rt/")
+        || file == "native.rs"
+        || (file == "io/native_in.rs" && reach == "blaze_core::native_in(")
+        || (file == "io.rs" && reach == "Os::process()")
+        || (file == "entry.rs" && reach == "Os::process()")
 }
 
 /// Files that are tests, which run on the host's std and are not the program.

@@ -23,6 +23,23 @@ use prelude::*;
 #[lang = "owned_box"]
 pub struct Box<T: ?Sized>(*mut T);
 
+// Declared as the pinned core declares it (library/core/src/ops/deref.rs, without `const` and
+// the attributes), with alloc's impl for `Box`: `*b` on a box is the builtin dereference, but
+// the checker reads the lang item for it.
+#[lang = "deref"]
+pub trait Deref: PointeeSized {
+    #[lang = "deref_target"]
+    type Target: ?Sized;
+    fn deref(&self) -> &Self::Target;
+}
+
+impl<T: ?Sized> Deref for Box<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &**self
+    }
+}
+
 impl<T: ?Sized> Drop for Box<T> {
     fn drop(&mut self) {
         log(9);
@@ -73,8 +90,9 @@ fn moved_into_call(heap: &mut [u64; 4]) {
 
 fn partly_moved(heap: &mut [u64; 4]) {
     let b: Box<P> = Box(heap as *mut [u64; 4] as *mut P);
-    // Written `(*b).a`: this twin's box has no `Deref` impl, and the checker's autoderef
-    // does not yet take a box's built-in deref for a field (E0609 on `b.a`).
+    // Written `(*b).a`: the move out of a field goes through the box's builtin dereference
+    // (`b.a` autoderefs the same way in rustc; this checker gave E0609 for it without a
+    // `Deref` impl: it is kept explicit so the rung is about the move, not the autoderef).
     let x = (*b).a;
     let _ = &x;
 }

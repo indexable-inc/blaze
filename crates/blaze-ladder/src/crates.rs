@@ -337,7 +337,9 @@ impl<'t> Inputs<'t> {
             name: self.user.name,
             key: CrateItemKey(ContentId::of("blaze program crate", self.user.name.as_bytes())),
             edition: syntax,
-            implicit: implicit(self.user.edition, &blaze_unit_graph::UnitKind::Lib),
+            // The program crate is a binary: under a blaze edition its root's `fn main` is
+            // `std::main`'s input (D104, `Implicit::binary`).
+            implicit: implicit(self.user.edition, &blaze_unit_graph::UnitKind::Lib).binary(),
             root: self.user.root,
             shown_from: self.user.dir,
             features: &[],

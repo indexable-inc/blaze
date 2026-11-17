@@ -362,9 +362,11 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
     };
     let host = io.need_host()?;
     let workers = host.cores().get();
-    // The tool's identity: the running binary's linker id (bstd `Host::build_id`), so a blaze
-    // built from other code shares no record or certificate with this one (rules 21, 52).
-    let tool = home::tool(host.build_id()?.as_bytes());
+    // Every producer's identity, made once here and handed down (decision D105, rule 75): today
+    // each from the running binary's linker id (bstd `Host::build_id`), so a blaze built from
+    // other code shares no record or certificate with this one (rules 21, 52).
+    let producers = blaze_ids::producer::Producers::of_build(host.build_id()?.as_bytes());
+    let tool = home::tool(&producers);
     let origin = store::NamedOrigin::of(cx, &fs, io.net().as_ref(), flags.origin, flags.origin_key)?;
     // The terminal's abilities, from the conventional variables and the findings' stream, read
     // here at the edge: whether it is a terminal, and how wide.
@@ -1351,6 +1353,8 @@ mod tests {
         refused: bool,
         /// Each finding's (code, id), in the order listed.
         ids: std::vec::Vec<(std::string::String, std::string::String)>,
+        /// Each finding's words, in the same order: what a failing assertion quotes.
+        words: std::vec::Vec<std::string::String>,
     }
 
     impl Checked {
@@ -1369,6 +1373,7 @@ mod tests {
                 status: Some(1),
                 refused: true,
                 ids: std::vec::Vec::new(),
+                words: std::vec::Vec::new(),
             }
         }
     }
@@ -1404,7 +1409,12 @@ mod tests {
     /// blaze-world's fixture toolchain, cut for this machine's triple, written on the shelf of
     /// the home `/h` (as `main` would be given `HOME=/h`, started in `/`): its id.
     fn shelf(io: &Io) -> blaze_toolchain::ToolchainId {
-        let (id, files) = blaze_world::fixture::shelf(graph::TRIPLE, blaze_world::fixture::STD, &[("target_os", Some("macos")), ("unix", None)]);
+        let (id, files) = blaze_world::fixture::shelf(
+            graph::TRIPLE,
+            blaze_world::fixture::STD,
+            &[("target_os", Some("macos")), ("unix", None)],
+            blaze_own::testing::heap().alloc(),
+        );
         for (name, bytes) in files {
             let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
             let path = Path::new(&format!("h/{}/{name}", toolchain::SHELF)).expect("a path");
@@ -1459,8 +1469,11 @@ mod tests {
         let launch = program::Launch { io, grants: &[], args: &[] };
         let said = words(command.0, &out, &err);
         let tool = match sizes.plant {
-            work::Plant::BodyChecker(older) => home::tool_of(b"test", older),
-            _ => home::tool(b"test"),
+            work::Plant::BodyChecker(older) => home::tool(
+                &blaze_ids::producer::Producers::for_tests(b"test")
+                    .planted_for_tests(blaze_ids::producer::Row::BodyChecker, older.as_bytes()),
+            ),
+            _ => home::tool(&blaze_ids::producer::Producers::for_tests(b"test")),
         };
         let toolchain = shelf(io);
         let mut run = |mut shown, ran: &mut Option<u8>, phases: &mut Phases| {
@@ -1498,6 +1511,7 @@ mod tests {
             errors: finished.answer.findings,
             refused: false,
             ids: shown.listed.iter().map(|l| (l.code().to_owned(), l.id.as_str().to_owned())).collect(),
+            words: shown.listed.iter().map(|l| std::string::String::from_utf8_lossy(l.words).into_owned()).collect(),
         })
     }
 
@@ -1514,7 +1528,7 @@ mod tests {
         write(&io, "src/x.rs", "pub fn f() {}\n");
         let created = check(&io, work::Sizes::USUAL);
         assert!(created.failed.is_empty(), "{:?}", created.failed);
-        assert_eq!(created.errors, 0, "the created file clears the error:\n{}", created.profile);
+        assert_eq!(created.errors, 0, "the created file clears the error: findings {:?} {:?}\n{}", created.ids, created.words, created.profile);
     }
 
     /// An answer with errors is certified: a task's typed failure is filed as its record with
@@ -1650,8 +1664,8 @@ mod tests {
             if (home.errors, home.status, &home_lines) != (fresh.errors, fresh.status, &fresh_lines) {
                 let tree: std::vec::Vec<&str> = files.iter().map(|(p, _)| *p).collect();
                 return Err(blaze_sim::Broke::Oracle(format!(
-                    "differs from a fresh home at step {step} on {tree:?}: home {:?} {:?} {home_lines:?}, fresh {:?} {:?} {fresh_lines:?}\n{}",
-                    home.errors, home.status, fresh.errors, fresh.status, home.profile
+                    "differs from a fresh home at step {step} on {tree:?}: fresh {:?} {:?} {:?} {fresh_lines:?}, home {:?} {:?} {:?} {home_lines:?}; the files {files:?}\nFRESH\n{}\nHOME\n{}",
+                    fresh.errors, fresh.status, fresh.words, home.errors, home.status, home.words, fresh.profile, home.profile
                 )));
             }
             let (again, _) = ask_now(&io, sizes)?;
@@ -1781,9 +1795,9 @@ mod tests {
     }
 
     /// A body's record made by an older body checker is never read after a checker fix
-    /// (`body_types::BODY_CHECKER`, in the tool): the same text, checked by the older producer
+    /// (`Row::BodyChecker` of the producers' table, in the tool, D105): the same text, checked by the older producer
     /// and then by today's, makes every body again; today's twice makes none. Without the
-    /// producer in the key (home.rs `tool_of` ignoring it) the second check makes 0 and the
+    /// producer in the key (home.rs `tool` leaving the table out) the second check makes 0 and the
     /// older answer is served.
     #[test]
     fn a_body_record_of_an_older_checker_is_made_again() {

@@ -37,6 +37,7 @@ pub mod fuse;
 pub mod keyed;
 mod many;
 pub mod names;
+pub mod producer;
 pub use blaze_radix as radix;
 pub use blaze_rng as rng;
 mod std_hash;

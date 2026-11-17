@@ -77,47 +77,14 @@ pub const BORROWS_ARE_ERRORS: bool = false;
 /// The domain of a body part's source ([`body_source`]).
 const SOURCE_DOMAIN: &str = "blaze-cli body check source 2";
 
-/// THE PRODUCER of a body's check record (D87): one named value for all the code a body's
-/// answer depends on, until the build derives each stage's code identity (D87's end state).
-/// It is in every key through the tool (home.rs `tool`), beside the record forms' magics: the
-/// `FileItems` record that lists a body's source is made by this code too, so a key of the
-/// body alone would find last time's file record and through it last time's body key.
-/// BUMP IT (the date and a count) with any change to what a body check answers: blaze-typeck
-/// (the checker and its rules), blaze-solve (the trait solver), blaze-lower (the body's
-/// lowering), blaze-ladder front2 (heads, the records reader, project.rs `check`), and this
-/// file's mapping of a verdict to findings. A record made by an older producer is then a miss
-/// by key and the body is made again (test `a_body_record_of_an_older_checker_is_made_again`).
-/// The binary's linker id, also in the tool, moves with any code today; this one keeps the
-/// promise where it does not (a shared cache across builds of one checker).
-/// 2026-11-16.1: built-in operators on literal variables answered without the solver;
-/// `Deref { overloaded: Some(Mut) }` for mutable places through an overloaded deref; unsizing
-/// through nested pointers; the impl prefilter.
-/// 2026-11-16.2: `Self::X` in an impl takes the impl's own arguments (hello-D-2); a block's
-/// final operand is chosen after cfg stripping (census14-F).
-/// 2026-11-16.3: an async fn's hidden type is its block's future by identity
-/// (`PNode::Coroutine`, async P3).
-/// 2026-11-16.4: an opaque type's bounds elaborated with supertraits (walk AJ P2); an impl's
-/// generics instantiated by kind, const parameters as consts (walk AJ P1).
-/// 2026-11-16.5: constant promotion fills `Checked::promoted` (async P10); `AsyncFn*` bounds
-/// answered by the solver's builtin rule and an async closure's future named
-/// `PNode::Coroutine { ordinal: CLOSURE_BASE + n }` (async P9).
-/// 2026-11-16.6: `asm!` lowers to an `Expr::Asm` row (intr P9a): a body with `asm!` is
-/// refused by the checker's lowering bridge by name instead of at the macro call.
-/// 2026-11-16.7: a C-variadic foreign fn's call takes its `...` arguments, held to C's
-/// promotions (E0617, variadic-1).
-/// 2026-11-16.8: one key per expansion: a body's expansion scopes are keyed by
-/// `blaze_expand::call_key`, which now holds the expander's code (expansion key lane).
-/// 2026-11-16.9: the move and borrow check (blaze-flow-lower, blaze-flow; front2/borrows.rs)
-/// runs per body: its findings ([`BORROWS`]) and refusals ([`BORROWS_NOT_CHECKED`]) are in the
-/// body's record. From now on a change to blaze-flow or blaze-flow-lower bumps this too.
-/// 2026-11-16.10: `super let` kept on the lowered `let` row and lent as
-/// `BodyView::super_lets`; the builder gives its binding its block's temporary scope (async P11).
-pub const BODY_CHECKER: &str = "blaze body checker 2026-11-16.10";
+/// The body checker's identity is not typed in here (decision D105): it is the table's
+/// `Row::BodyChecker` (blaze_ids::producer), handed to the drive's tool by the entry
+/// (main.rs, home.rs `tool`), and it moves with the checker's code, never by hand.
 
 /// A body part's source: its item's text digest `item` and `around`, the digest of its file
 /// with every checked body cut out ([`around_bodies`]): what the body's check reads of its own
 /// file. (Before piece 7 it was `item` alone, which no sibling signature edit moved.) The
-/// checker's own identity is in the tool ([`BODY_CHECKER`]).
+/// checker's own identity is in the tool (`Row::BodyChecker`, D105).
 pub(crate) fn body_source(item: ContentId, around: ContentId) -> ContentId {
     let mut h = blaze_ids::Hasher::new(SOURCE_DOMAIN);
     h.update(&item.0).update(&around.0);
@@ -278,7 +245,13 @@ pub(crate) fn prepare<'f: 'j, 'j>(
     let world = names.world();
     let crates = &world.crates;
     let name_at = |at: usize| crate::names::name_of(crates[at].input.key);
-    let input_at = |at: usize| task.inputs.iter().find(|input| input.name == name_at(at));
+    // The name is hashed once per lookup, never per input compared: inside `find` it was a
+    // blake3 key derivation per (crate, input) pair, per member, per body (RUNNER 16: 1226 of
+    // 3213 main-thread samples of a cold clone check in `derive_key_with`).
+    let input_at = |at: usize| {
+        let name = name_at(at);
+        task.inputs.iter().find(|input| input.name == name)
+    };
     let mut wants: std::vec::Vec<Want, Global> = std::vec::Vec::new_in(Global);
     let want = |at: usize, wants: &mut std::vec::Vec<Want, Global>| {
         let name = name_at(at);
@@ -551,7 +524,22 @@ impl<'n> FileTypes<'n> {
             if checker.load.unserved().len() > unserved {
                 made.find(TYPES_NOT_CHECKED, (0, 0), &["a macro call's expansion text is not in its crate's record (StoreLoad::expansion, names/expansion_texts.rs)"]);
             } else if let Some(refused) = &verdict.refused {
-                let words = bstd::mem::format_in!(self.frame, "{}: {refused:?}", refused.text());
+                // A head that did not resolve names its item by name and quotes the item's
+                // text from the records (rule 19): a key alone says nothing to a reader.
+                let named = match refused {
+                    blaze_ladder::front2::project::Refused::Check(blaze_ladder::front2::check::CheckFail::Head {
+                        error: blaze_ladder::front2::heads::HeadError::Item(key, _),
+                        ..
+                    }) => blaze_ladder::front2::source::NamesSource::text_of(checker.records, *key),
+                    _ => None,
+                };
+                let words = match named {
+                    Some(it) => {
+                        let shown = it.text.get(..it.text.len().min(240)).unwrap_or(it.text);
+                        bstd::mem::format_in!(self.frame, "{}: {refused:?}; the item is `{}`: {shown:?}", refused.text(), it.name.unwrap_or("_"))
+                    }
+                    None => bstd::mem::format_in!(self.frame, "{}: {refused:?}", refused.text()),
+                };
                 made.find(TYPES_NOT_CHECKED, (0, 0), &[words.as_str()]);
             } else if let Some(gap) = verdict.gaps.first() {
                 let words = bstd::mem::format_in!(self.frame, "{} questions the front end cannot answer yet, the first {gap:?}", verdict.gaps.len());

@@ -18,7 +18,7 @@ use blaze_run::parent::Read;
 use super::form::{FormError, encode, read, seal};
 use super::place::place;
 use super::v1::from_v1;
-use super::{Emitted, InlineFrame, Live, LoopHeader, OUTERMOST, Place, Poll, Position, Reloc, RelocKind};
+use super::{Declare, DeclaredKind, Declares, Emitted, InlineFrame, Live, LoopHeader, OUTERMOST, Place, Poll, Position, Reloc, RelocKind, declare};
 use crate::Reg;
 
 const STP_FRAME: u32 = 0xA9BF_7BFD;
@@ -43,6 +43,20 @@ fn func(name: &str) -> Target {
 
 fn outside(name: &str) -> Target {
     Target { space: Space::Outside, symbol: Symbol::of_name(name) }
+}
+
+/// These tests' declarer: each fn target an instance named by its symbol's bytes, each static a
+/// static (the section itself is declared_tests.rs's subject).
+struct BySymbol;
+
+impl Declares for BySymbol {
+    fn declared(&self, t: Target) -> Option<Declare<'_>> {
+        match t.space {
+            Space::Func => Some(Declare { kind: DeclaredKind::Instance, item: 1, name: b"an instance" }),
+            Space::Static => Some(Declare { kind: DeclaredKind::Static, item: 2, name: b"" }),
+            _ => None,
+        }
+    }
 }
 
 fn push_code(code: &mut AVec<'_, u8>, insts: &[u32]) {
@@ -98,10 +112,11 @@ fn every(alloc: Alloc<'static>) -> Emitted<'static> {
     e.text.extend_from_slice(b"unusedputs");
     e.names.push((Symbol::of_name("unused"), 0, 6));
     e.names.push((Symbol::of_name("puts"), 6, 4));
+    declare(&mut e, &BySymbol).unwrap();
     e
 }
 
-/// Prints `bzcode02: a record with every section reads back and encodes to equal bytes`.
+/// Prints `bzcode03: a record with every section reads back and encodes to equal bytes`.
 /// Fails if a section is not written, read or sealed alike (the second encoding differs), or if
 /// the seal does not merge the duplicate target, renumber the call, or drop the unused name.
 #[test]
@@ -127,10 +142,10 @@ fn every_section_round_trips_to_equal_bytes() {
     let mut second: AVec<'static, u8> = Vec::new_in(alloc);
     encode(&again, &mut second);
     assert!(first[..] == second[..], "the second encoding differs");
-    println!("bzcode02: a record with every section reads back and encodes to equal bytes");
+    println!("bzcode03: a record with every section reads back and encodes to equal bytes");
 }
 
-/// Prints `bzcode02: each unsorted list is refused by its own variant`. Fails if a list the
+/// Prints `bzcode03: each unsorted list is refused by its own variant`. Fails if a list the
 /// caller sorts is sorted quietly or refused under another list's name (the control seals).
 #[test]
 fn each_unsorted_list_is_refused_by_its_own_variant() {
@@ -164,7 +179,7 @@ fn each_unsorted_list_is_refused_by_its_own_variant() {
     let mut e = every(alloc);
     e.reads.push(Read { fact: [3; 32], digest: [9; 32] });
     assert_eq!(seal(e).err(), Some(FormError::ReadsUnsorted { row: 2 }), "a repeated fact is refused too");
-    println!("bzcode02: each unsorted list is refused by its own variant");
+    println!("bzcode03: each unsorted list is refused by its own variant");
 }
 
 /// The run's reservation: the slot words at `TABLE`, the thunk words 64 KiB after them (another
@@ -224,7 +239,7 @@ fn inst(code: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
 }
 
-/// Prints `bzcode02: from_v1 places to the bytes bzcode01's place makes (call, load, relro, words)`.
+/// Prints `bzcode03: from_v1 places to the bytes bzcode01's place makes (call, load, relro, words)`.
 /// The oracle is blaze-code's `bzcode01` `place`. Fails if one site kind maps wrong: a load or
 /// call made `Page21` + `PageOff12` reaches the thunk instead of the word, and a call not seen as
 /// a call loads the thunk word instead of the slot word.
@@ -242,7 +257,8 @@ fn from_v1_places_like_bzcode01() {
     let mut old_relro = [0u8; 24];
     blaze_code::place::place(&old_view, symbol, at, &mut Table, &mut old_code, &mut old_relro).unwrap();
 
-    let emitted = from_v1(v1_record(alloc), alloc).unwrap();
+    let mut emitted = from_v1(v1_record(alloc), alloc).unwrap();
+    declare(&mut emitted, &BySymbol).unwrap();
     let sealed = seal(emitted).unwrap();
     let mut new_bytes: AVec<'static, u8> = Vec::new_in(alloc);
     encode(&sealed, &mut new_bytes);
@@ -255,5 +271,5 @@ fn from_v1_places_like_bzcode01() {
     assert_eq!(adrp_ldr_target(inst(&old_code, 12), inst(&old_code, 16), at.code + 12), Some(THUNK_WORDS + 8), "the oracle's load reaches g's thunk word");
     assert!(code == old_code, "code differs from bzcode01's place");
     assert!(relro == old_relro, "relro differs from bzcode01's place");
-    println!("bzcode02: from_v1 places to the bytes bzcode01's place makes (call, load, relro, words)");
+    println!("bzcode03: from_v1 places to the bytes bzcode01's place makes (call, load, relro, words)");
 }

@@ -13,7 +13,7 @@ blaze-base64	0	0	1	0
 blaze-bench	13	1	0	34
 blaze-blake3	21	0	0	9
 # blaze-build 198 -> 270 on 2026-11-16 (coordinator): unwind-P5's value-type stack (walk.rs 439, 693) follows the crate's `Vec<_, A>` form; moving walk.rs to blaze-own is one batch for the whole crate, parked until tempo runs.
-blaze-build	3	1	0	270
+blaze-build	3	1	0	248
 blaze-build-script	15	1	0	68
 blaze-bytes	6	1	0	19
 blaze-cargo	791	1	5	1371
@@ -35,7 +35,7 @@ blaze-diagnostics	123	1	2	1525
 blaze-doc	41	1	0	384
 blaze-ed25519	3	0	0	1
 blaze-emit	5	1	0	31
-blaze-expand	0	0	0	0
+blaze-export	12	0	0	0
 blaze-fetch	58	1	0	40
 blaze-file-items	7	0	1	3
 blaze-fmt	200	1	0	1034
@@ -50,7 +50,6 @@ blaze-glob	12	1	0	22
 blaze-global	28	1	0	260
 blaze-graph	181	1	3	506
 blaze-h1	0	0	2	1
-blaze-h1-net	0	0	1	0
 blaze-hash	0	0	4	0
 blaze-hashcons	6	1	2	8
 blaze-host	8	1	4	81
@@ -86,7 +85,6 @@ blaze-memchr	2	0	1	4
 blaze-memo	92	1	8	90
 blaze-memo-macros	2	1	0	36
 blaze-metadata	11	1	0	82
-blaze-native	0	0	0	0
 blaze-new	22	1	0	26
 blaze-own	6	0	14	0
 blaze-pack	0	0	10	82
@@ -107,7 +105,7 @@ blaze-report	7	1	0	72
 blaze-resolve	92	1	0	267
 blaze-rng	1	1	0	0
 blaze-run	2	0	0	1
-blaze-scope	117	0	0	388
+blaze-scope	116	0	0	378
 blaze-screen	0	0	11	132
 blaze-script	113	1	0	224
 blaze-semver	0	0	3	0
@@ -121,7 +119,6 @@ blaze-solo	21	1	0	111
 blaze-solve	26	0	0	215
 blaze-sort	5	0	0	5
 blaze-source	18	1	0	21
-blaze-spawn	0	0	0	0
 blaze-spin	3	1	0	0
 blaze-sql	0	0	11	74
 blaze-sqlite	4	1	0	14
@@ -218,7 +215,7 @@ hir-ty-identity	9	1	2	75
 hir-ty-lean	24	1	1	780
 hir-ty-linear	2	1	0	37
 hir-ty-matchck	15	1	0	108
-hir-ty-mir	197	1	0	896
+hir-ty-mir	193	1	0	878
 hir-ty-print	23	1	1	33
 hir-ty-pure	57	1	3	444
 hir-ty-share	14	1	0	20

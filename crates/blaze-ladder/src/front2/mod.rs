@@ -60,6 +60,7 @@ pub mod scoped;
 pub mod shared_keys;
 pub mod source;
 pub mod spell;
+pub mod start;
 pub mod statics;
 pub mod test_entry;
 pub mod texts;

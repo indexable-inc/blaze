@@ -60,7 +60,7 @@ use blaze_code::record::{CodeRecord, CodeView, OWN_CODE, OWN_RELRO, Space, Symbo
 use blaze_code::unwind::{self, Row, Unwind};
 use blaze_ids::Hasher;
 use blaze_own::{AVec, Alloc, Vec};
-use blaze_tier::record::{FormError, RecordView, Reloc, RelocKind, calls, encode, from_v1, page_offset, read, seal};
+use blaze_tier::record::{Declare, DeclaredKind, Declares, FormError, RecordView, Reloc, RelocKind, calls, declare, encode, from_v1, page_offset, read, seal};
 
 use crate::eh_out::{eh_room_rows, eh_sections_rows};
 use crate::error::ExportError;
@@ -126,8 +126,8 @@ pub struct Member02<'r> {
 /// blaze-code `CodeRecord` and converted by blaze-tier's `from_v1` (the one home of the
 /// site-to-relocation rule), then sealed and encoded. Each outside target is given its name
 /// through `CodeRecord::outside`, which adds the target a second time; the seal merges equal
-/// targets.
-pub fn v1_to_v2<'a>(view: CodeView<'_>, out: &mut AVec<'a, u8>, alloc: Alloc<'a>) -> Result<(), FormError> {
+/// targets. Its in-program targets are declared by `by` (bzcode03, D106).
+pub fn v1_to_v2<'a>(view: CodeView<'_>, by: &dyn Declares, out: &mut AVec<'a, u8>, alloc: Alloc<'a>) -> Result<(), FormError> {
     let mut r = CodeRecord::new_in(alloc);
     r.code.extend_from_slice(view.code());
     r.relro.extend_from_slice(view.relro());

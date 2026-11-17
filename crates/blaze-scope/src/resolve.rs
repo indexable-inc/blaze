@@ -1598,7 +1598,13 @@ impl<'r, 'a, S: SourceTexts<'a>> FillEnv<&'a str> for FillCx<'r, 'a, S> {
 /// the sources' runner ([`SourceTexts::run_proc_macro`]).
 struct Host<'r, 'a, S> {
     cfg: &'r Cfg<'a, 'a>,
+    /// The calling file's package-relative path (`src/lib.rs`).
     file: &'a str,
+    /// What `file!()` answers, made from `file` on the first ask ([`CrateEnv::shown_file`],
+    /// D96 (4)); `None` inside: the crate's environment does not name its package, refused.
+    ///
+    /// [`CrateEnv::shown_file`]: crate::crate_env::CrateEnv::shown_file
+    shown_file: core::cell::OnceCell<Option<AString<'a>>>,
     /// The calling file's path (absolute): where `include!`'s path starts.
     path: &'a str,
     /// The package's folder: the one folder an `include!` may read in (no build script output
@@ -1641,12 +1647,23 @@ impl<'a, S: SourceTexts<'a>> ExpandCx for Host<'_, 'a, S> {
         Ok(self.sources.read(self.krate, &path).map_or(Included::Missing, |text| Included::Bytes(text.as_bytes())))
     }
 
+    /// Asked only from eager input (`concat!(file!(), ..)`: a plain call is a hole). One answer
+    /// with the body host (front2 body_host.rs), D96 (5): `file!()` is the crate's shown path
+    /// ([`CrateEnv::shown_file`](crate::crate_env::CrateEnv::shown_file)); `line!()` and
+    /// `column!()` are refused, as `place` is not told which call asks, so no item-relative
+    /// position can be given (never a made-up 1); `module_path!()` is refused, as this host is
+    /// not told the calling module (never ""). A refusal is the call's error, named.
     fn place(&self, what: PlaceOf) -> Result<HostPlace<'_>, HostError> {
-        Ok(match what {
-            PlaceOf::Line | PlaceOf::Column => HostPlace::Number(1),
-            PlaceOf::File => HostPlace::Text(self.file),
-            PlaceOf::ModulePath => HostPlace::Text(""),
-        })
+        let refused = HostError { ask: HostAsk::Place, why: HostWhy::Refused };
+        match what {
+            PlaceOf::File => {
+                let shown = self.shown_file.get_or_init(|| {
+                    self.sources.crate_env(self.krate).and_then(|env| env.shown_file(self.file, self.alloc))
+                });
+                shown.as_ref().map(|text| HostPlace::Text(text.as_str())).ok_or(refused)
+            }
+            PlaceOf::Line | PlaceOf::Column | PlaceOf::ModulePath => Err(refused),
+        }
     }
 
     fn run_proc_macro<'b>(&self, def: &MacroDefinition<'_>, call: ProcCall<'_>, alloc: Alloc<'b>) -> Result<Produced<'b>, HostError> {
@@ -1836,6 +1853,7 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     let host = || Host {
         cfg: base.cfg,
         file: shown(file.path, base.shown_from),
+        shown_file: core::cell::OnceCell::new(),
         path: file.path,
         package: base.shown_from,
         krate: base.index,

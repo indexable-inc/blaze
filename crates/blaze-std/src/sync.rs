@@ -10,6 +10,7 @@
 //! | build a table, then share it read-only | [`Building`] then [`Frozen`] |
 //! | readers that never block a writer who replaces the whole value | [`Swap`] |
 //! | compute a key once while others asking for it wait | [`Flight`] |
+//! | make one value once while others asking for it wait | [`Once`] |
 //! | hand values from one task to another | [`Chan`] (bounded only) |
 //! | count, flag, publish once, number events | [`Counter`], [`Flag`], [`PublishOnce`], [`Seq`] |
 //! | hold two locks | [`RankedLock`], in rank order ([`ranks`]) |
@@ -21,7 +22,8 @@
 //! | [`Shared`] / [`LocalShared`] | handles over `alloc::sync::Arc` / `alloc::rc::Rc` ([`crate::own`]) |
 //! | [`Lock`], [`RwLock`] | `blaze_core::lock::{Lock, ReadLock}`, the named locks (rule `standard-structures`) |
 //! | [`LocalLock`], [`LocalOnce`], [`LocalLazy`] | `core::cell::{RefCell, OnceCell, LazyCell}`, each checking in a debug build that it ends on the thread that made it ([`home`]) |
-//! | `Once`, `Lazy` | `OnceLock`, `LazyLock`: not here until bstd's own wait is under them; [`PublishOnce`] meanwhile |
+//! | [`Once`] | `OnceLock`, a value: its waiters wait through the `Cx`, and no lock is held while it is made |
+//! | `Lazy` | `LazyLock`: not here; a [`Once`] beside the function that makes it |
 //! | [`raw::Atomic`] | `core::sync::atomic::Atomic<T>`, the one generic atomic, under a longer name: prefer the named ones |
 //! | [`SpinWait`] | `blaze_spin::SpinWait`, the one bounded spin |
 //! | [`reclaim`] | `blaze_reclaim`: memory freed once every task that could read it ended |
@@ -54,6 +56,10 @@ pub mod home;
 pub mod ranks;
 #[expect(unsafe_code, reason = "`Swap`'s published pointer and its reclamation, with their SAFETY")]
 pub mod swap;
+// A value made once by its first asker while the others wait through their `Cx`.
+mod once;
+#[cfg(test)]
+mod once_tests;
 
 pub use atomics::{Counter, Flag, PublishOnce, Seq};
 pub use chan::{Chan, Closed, RecvError, SendError};
@@ -61,13 +67,14 @@ pub use flight::{Flight, FlightError};
 pub use freeze::{Building, Frozen};
 pub use home::{LocalLazy, LocalLock, LocalOnce};
 pub use ranks::{Order, Rank, RankedGuard, RankedLock, Unranked};
+pub use once::{Once, OnceError};
 pub use swap::Swap;
 
 pub use crate::own::{LocalShared, Released, Shared};
 
-// `Once` and `Lazy`, the two that wait on first use, are Rust std's `OnceLock` and `LazyLock`
-// and stay out of bstd until bstd's own wait is under them (S4's ban list,
-// `crates/blaze-std/src/rt.rs`). A value published once is [`PublishOnce`], which never waits.
+// `Once` is Rust std's `OnceLock` on bstd's own wait (the `Cx`'s); `Lazy` (`LazyLock`) stays out
+// (S4's ban list, `crates/blaze-std/src/rt.rs`). A value published once with no waiting at all
+// is [`PublishOnce`].
 
 pub use blaze_core::lock::{LockGuard, ReadGuard, Signal, WriteGuard};
 

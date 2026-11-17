@@ -5,6 +5,7 @@
 
 use blaze_id::{ContentId, Portable};
 use blaze_ids::Hasher;
+use blaze_ids::producer::{Expander, ProducerId};
 use blaze_surface::DefSite;
 
 use crate::{
@@ -28,17 +29,18 @@ unsafe impl Portable for CallKey {}
 // SAFETY: a content hash.
 unsafe impl Portable for ExpansionKey {}
 
-/// The expander's code identity (rule 52): a kept expansion is a result of this crate's code,
-/// so the name changes with any change to what a call expands to (a rule's matching, a
-/// derive's output, a token's record). A proc macro's code is its runner's key (the
-/// `ProcMacro { krate }` of its [`MacroContent`]), beside this.
-/// 2: an attribute macro's input is without the derives written before it (P18-B, item.rs
-/// `ItemAttrs::attr_call`).
-/// 3: D96: `env!("CARGO_MANIFEST_DIR")` answers the root the crate sees (`/package`,
-/// `/workspace/<dir>`), and an include of an absolute path under it is served.
-/// 4: one key per expansion: [`call_key`] holds this name, and the names library's kept
-/// expansions are keyed by it (the text key is gone).
-pub const EXPANDER: &str = "blaze-expand expander 4";
+/// The key an expansion is KEPT under (decision D105, docs/v2/plan/design/producer-id.md): the
+/// call's key (what is asked) and the expander's code identity (what answers, rule 52), which
+/// the program's entry hands down ([`blaze_ids::producer::Producers`]). A set of kept
+/// expansions is filed and searched by it alone, so an expansion made by other expander code
+/// is never found. A proc macro's code is its runner's key (the `ProcMacro { krate }` of its
+/// [`MacroContent`]), in the call key.
+pub fn kept_key(expander: ProducerId<Expander>, call: CallKey) -> CallKey {
+    let mut hasher = Hasher::new("blaze v2 expand kept 1");
+    hasher.id(expander.id());
+    hasher.id(&call.0);
+    CallKey(hasher.finish())
+}
 
 /// The key of `call` of `def`, computed before the work: [`call_key_of`] of the definition's
 /// content and site.
@@ -49,7 +51,7 @@ pub fn call_key(def: &MacroDefinition<'_>, call: &Call<'_>) -> CallKey {
 /// The one key of a call's expansion, from the definition's identity (`content`, `site`: what a
 /// macro definition record's head holds, so a caller need not read its streams) and the call.
 /// Its inputs, each once (rule 21), and nothing else:
-/// - the expander's code: [`EXPANDER`];
+/// - (not the expander's code: a call's key says what is asked; [`kept_key`] adds who answers);
 /// - the definition's [`MacroContent`]: its kind (a builtin's name; a proc macro's runner crate
 ///   and export name), its rules or body and parameters as TOKENS (comments and spaces are not
 ///   inputs), its derive helpers, edition, `#[macro_export]`, `local_inner_macros` and
@@ -67,8 +69,7 @@ pub fn call_key(def: &MacroDefinition<'_>, call: &Call<'_>) -> CallKey {
 /// facts before a kept expansion is taken ([`expansion_key`] adds them). So the same call at
 /// two places is one key, and one whose output depends on where it is says so by its reads.
 pub fn call_key_of(content: MacroContent, site: DefSite, call: &Call<'_>) -> CallKey {
-    let mut hasher = Hasher::new("blaze v2 expand call 2");
-    hasher.part(EXPANDER.as_bytes());
+    let mut hasher = Hasher::new("blaze v2 expand call 3");
     hasher.id(&content.0);
     hasher.id(&site.krate.0);
     match site.module {

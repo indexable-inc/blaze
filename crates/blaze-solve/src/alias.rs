@@ -44,7 +44,7 @@ use crate::facts::{AssocKind, Facts, ImplPolarity, Portable};
 use crate::fold;
 use crate::term::{
     AliasKind, Certainty, Def, Flags, GoalSource, Lang, List, Polarity, Pred, Rigid, Ty, TyKind, TypingMode, Var,
-    VarKind, shape_of_kind,
+    VarKind,
 };
 use crate::trait_goals::TraitGoal;
 use crate::tys::Tys;
@@ -371,7 +371,7 @@ fn assemble_normalizes_to<T: Tys, F: Facts>(
             if cx.is_lang(item, Lang::Metadata)? {
                 out.push(cand(Source::Builtin(BuiltinSource::Misc), Rule::Metadata, self_ty));
             }
-            match shape_of_kind(cx.kind(self_ty)) {
+            match crate::object_shape::shape_of_ty(&*cx.tys, self_ty) {
                 None => out.push(forced_ambiguity(Source::Builtin(BuiltinSource::Misc))),
                 Some(shape) => {
                     let set = cx.impls(trait_, shape)?;

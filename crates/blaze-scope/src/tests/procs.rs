@@ -97,7 +97,7 @@ static FILES: WithRunner = WithRunner(&[&[("/user/lib.rs", USER)], &[("/dep/lib.
 
 fn crates() -> [CrateInput<'static>; 3] {
     let macros = input("macros", "/macros/lib.rs", &[]);
-    let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: true };
+    let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: true, entry: false };
     [
         input("user", "/user/lib.rs", &[("dep", 1), ("macros", 2)]),
         input("dep", "/dep/lib.rs", &[("macros", 2)]),
@@ -198,7 +198,7 @@ pub struct Point;
         }
     }
     static LISTED: Listed = Listed;
-    let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: true };
+    let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: true, entry: false };
     let crates = [input("user", "/user/lib.rs", &[("macros", 1)]), CrateInput { implicit, ..input("macros", "/macros/lib.rs", &[]) }];
     let names = resolved(&crates, &LISTED);
     let g = Alloc::global();

@@ -24,9 +24,12 @@ blaze-code = { path = "../blaze-code" }
 blaze-run.workspace = true
 # `AVec` and `Alloc`: every list in the caller's allocator.
 blaze-own.workspace = true
+# The domain-separated BLAKE3 `Hasher`: the digest that ends every `bzcode03` record. By path,
+# as blaze-code takes it: the workspace entry turns on its `serde` adapter.
+blaze-ids = { path = "../blaze-ids" }
 
 [dev-dependencies]
-blaze-own = { workspace = true, features = ["std"] }
+blaze-own = { workspace = true, features = ["std", "testing"] }
 # tests/features.rs checks the feature table row by row against rustc's tables and the
 # apple-m1 CPU set this crate holds (`TargetArch::rustc_table`, `cpus::features`).
 target-features.workspace = true

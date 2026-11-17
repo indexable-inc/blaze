@@ -53,7 +53,7 @@ fn toolchain(needs: crate::Needs) -> &'static Toolchain<'static, StdVec<u8>> {
 }
 
 fn toolchain_of(needs: crate::Needs, std: &str, cfg: &'static [(&'static str, Option<&'static str>)]) -> &'static Toolchain<'static, StdVec<u8>> {
-    let (id, files) = crate::fixture::shelf(TRIPLE, std, cfg);
+    let (id, files) = crate::fixture::shelf(TRIPLE, std, cfg, blaze_own::testing::heap().alloc());
     let tc = Toolchain::open(&mut Memory(files.into_iter().collect()), id, TRIPLE, needs, g()).unwrap_or_else(|e| panic!("{e}"));
     StdBox::leak(StdBox::new(tc))
 }
@@ -226,16 +226,20 @@ impl Packages<'static> for Store {
 fn store(lock: &'static Lock<'static>) -> Store {
     let mut packs: StdMap<&'static str, &'static [u8]> = StdMap::new();
     for (name, text) in [
-        // util reads a file of its own by the root it sees (D96): `/package/src/more.rs`.
+        // util reads a file of its own by the root it sees (D96): `/package/src/more.rs`; and
+        // one named by what `file!()` gives it: `/package/src/util-1.0.0/src/lib.rs`.
         (
             "util",
-            "pub fn thing() {}\n#[rustc_builtin_macro]\nmacro_rules! include { () => {} }\n#[rustc_builtin_macro]\nmacro_rules! concat { () => {} }\n#[rustc_builtin_macro]\nmacro_rules! env { () => {} }\ninclude!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/more.rs\"));\n",
+            "pub fn thing() {}\n#[rustc_builtin_macro]\nmacro_rules! include { () => {} }\n#[rustc_builtin_macro]\nmacro_rules! concat { () => {} }\n#[rustc_builtin_macro]\nmacro_rules! env { () => {} }\n#[rustc_builtin_macro]\nmacro_rules! file { () => {} }\ninclude!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/more.rs\"));\ninclude!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/\", file!()));\n",
         ),
         ("helper", "pub fn help() {}\n"),
         ("derive_it", "extern crate proc_macro;\n#[proc_macro_derive(It)]\npub fn it(_: proc_macro::TokenStream) -> proc_macro::TokenStream { loop {} }\n"),
         ("testkit", "pub fn check() {}\n"),
     ] {
-        let p = pack(&[("src/lib.rs", text), ("src/more.rs", "pub fn more() {}\n")]);
+        let p = pack(
+            &[("src/lib.rs", text), ("src/more.rs", "pub fn more() {}\n"), ("src/util-1.0.0/src/lib.rs", "pub fn named() {}\n")],
+            blaze_own::testing::heap().alloc(),
+        );
         packs.insert(name, StdBox::leak(p.into_boxed_slice()));
     }
     Store { lock, packs, asked: vec![], app_dir: "app" }
@@ -488,8 +492,27 @@ fn an_include_under_the_crates_own_root_is_served() {
     let at = w.crates.iter().position(|c| c.input.name == "util").expect("util");
     let c = names.krate(at);
     let made: StdVec<&str> = c.expansions.values().filter_map(|e| e.made.map(|m| m.text)).collect();
-    assert_eq!(made, ["pub fn more( ) { }"], "util's include of its own file by CARGO_MANIFEST_DIR; notes: {:?}", c.notes);
+    assert!(made.contains(&"pub fn more( ) { }"), "util's include of its own file by CARGO_MANIFEST_DIR: {made:?}; notes: {:?}", c.notes);
     std::println!("D96 P4: util read /package/src/more.rs");
+}
+
+/// D96 (4): `file!()` in a dependency names its file `<name>-<version>/<path>` (here
+/// `util-1.0.0/src/lib.rs`), the same in every workspace and saying which crate; util includes
+/// `concat!(env!("CARGO_MANIFEST_DIR"), "/src/", file!())`, and only that answer reads its
+/// `src/util-1.0.0/src/lib.rs` (`pub fn named`). Before, the item host answered the
+/// package-relative `src/lib.rs`, which names `/package/src/src/lib.rs`: no such file. core
+/// `macros/mod.rs`, `file!`: "Expands to the file name in which it was invoked." Prints
+/// `D96 file!: util-1.0.0/src/lib.rs`.
+#[test]
+fn file_in_a_dependency_is_its_name_version_and_path() {
+    let w = made(&IN_ORDER, None);
+    let inputs = w.inputs(g());
+    let names = w.resolve(&inputs, &Serial, g()).unwrap_or_else(|e| panic!("{e}"));
+    let at = w.crates.iter().position(|c| c.input.name == "util").expect("util");
+    let c = names.krate(at);
+    let made: StdVec<&str> = c.expansions.values().filter_map(|e| e.made.map(|m| m.text)).collect();
+    assert!(made.contains(&"pub fn named( ) { }"), "util's include by file!(): {made:?}; notes: {:?}", c.notes);
+    std::println!("D96 file!: util-1.0.0/src/lib.rs");
 }
 
 /// D96 P3, rule 21: a member sees `/workspace/<its dir>` (`env!("CARGO_MANIFEST_DIR")`,

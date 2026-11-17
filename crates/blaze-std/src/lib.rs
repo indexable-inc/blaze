@@ -426,6 +426,12 @@ pub mod test {
 
     pub use crate::simtest::{BUDGET, Outcome, one, run, seeded};
 
+    /// A native world over a test's directory, made with a test's root of real-OS authority
+    /// (`blaze_core::testing::os()`): the one way a test makes a native world once batch B1
+    /// deletes `Io::native`. Behind the `testing` feature.
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::rt::testing_native::native;
+
     /// The model checker's shims, with std's API: a crate's code switches to them under
     /// `cfg(blaze_check)`.
     pub mod checked {
@@ -438,7 +444,8 @@ pub mod test {
 /// has one a Rust edition.
 pub mod prelude {
     /// The prelude of `edition = "blaze-2026.11"`: `core`'s prelude of Rust 2024, the types
-    /// a `main` names (`Cx`, `Io` and the entry's `Error`), and `core`'s macros that Rust's `std` hands on from its
+    /// a `main` names (`Cx`, the entry's `Error`, and every grant: `Out`, `Args`, `Clock`,
+    /// `Dir<ReadOnly>`, `Net`, `Env`, the whole capabilities), and `core`'s macros that Rust's `std` hands on from its
     /// root. The collections are here by their types, to be made in an allocator the code
     /// was handed (`Vec::new_in(cx.frame())`, `Box::new_in(value, alloc)`); `String` is
     /// bstd's, which is made in one, with `format_in!` in place of `format!`. `vec!` and
@@ -459,6 +466,36 @@ pub mod prelude {
             io::Io,
             mem::{String, format_in},
         };
+
+        // Every type a `main` may take as a grant (crate::grant, each `impl Grant for`), so
+        // a program names what it takes without a `use` (D104).
+        pub use crate::{
+            args::Args,
+            audio::Audio,
+            automation::Automation,
+            clock::Clock,
+            code::Code,
+            device::{Bluetooth, Camera, Clipboard, Location, Notify, Screen, Serial, Usb},
+            env::Env,
+            fs::{Dir, Fs, ReadOnly, ReadWrite},
+            grant::Spec,
+            host::Host,
+            keys::Keys,
+            locale::Locale,
+            mem::Mem,
+            net::Net,
+            opener::Opener,
+            out::Out,
+            power::Power,
+            rng::Rng,
+            roots::Roots,
+            streams::Streams,
+            term::Term,
+            user::User,
+            window::Window,
+        };
+        #[cfg(feature = "requests")]
+        pub use crate::requests::Http;
     }
 }
 
