@@ -279,3 +279,43 @@ fn a_body_edit_runs_two_tasks_there_and_none_in_the_other_worktree() {
     assert_eq!((adopted.runs, adopted.written), (0, 0), "worktree one, given the text worktree two built, ran or wrote:\n{}", adopted.profile);
     assert_eq!((adopted.errors, &adopted.findings), (one.errors, &one.findings), "the same edit moved worktree one's findings");
 }
+
+/// A workspace of one member under a `crates/*` glob, in the worktree at `at`.
+fn workspace(io: &Io, at: &str) {
+    write(io, at, "Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n");
+    write(io, at, "crates/a/Cargo.toml", "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(io, at, "crates/a/src/lib.rs", A);
+}
+
+/// (v) What git and cargo keep in a checkout's root is no input of its units: worktree one is
+/// a clone (`.git` a directory) where cargo has run (`target/`), worktree two a `git worktree
+/// add` (`.git` a file). Two's first check runs no task, `Units` and `UnitGraph` included. Its
+/// controls, in two: a member folder made under the glob, then a manifest edited, each lay out
+/// the units again. Without sweep.rs's filter of the root's listing the first assertion fails:
+/// `Units` and `UnitGraph` made in two (2026-11-17, 45 / 71 / 129 ms on hello / gauntlet /
+/// ripgrep for a second checkout's first check, against 15 / 37 / 87 for a third).
+#[test]
+fn a_worktree_and_a_built_clone_have_one_units_key() {
+    let io = Io::simulated(SimWorld::new(14, Limits::USUAL));
+    workspace(&io, ONE);
+    write(&io, ONE, ".git/HEAD", "ref: refs/heads/main\n");
+    write(&io, ONE, "target/debug/.cargo-lock", "");
+    workspace(&io, TWO);
+    write(&io, TWO, ".git", "gitdir: ../one/.git/worktrees/two\n");
+    let one = check_in(&io, ONE, Keys::FromText);
+    assert!(made(&one.profile, "Units") >= 1, "the clone's cold check laid out no units:\n{}", one.profile);
+    let two = check_in(&io, TWO, Keys::FromText);
+    assert_eq!(
+        (two.runs, made(&two.profile, "Units"), made(&two.profile, "UnitGraph")),
+        (0, 0, 0),
+        "the worktree's first check laid out the clone's units again:\n{}",
+        two.profile
+    );
+    write(&io, TWO, "crates/b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(&io, TWO, "crates/b/src/lib.rs", B);
+    let member = check_in(&io, TWO, Keys::FromText);
+    assert!(made(&member.profile, "Units") >= 1, "control: a new member did not lay out the units:\n{}", member.profile);
+    write(&io, TWO, "crates/b/Cargo.toml", "[package]\nname = \"b\"\nversion = \"0.2.0\"\nedition = \"2024\"\n");
+    let manifest = check_in(&io, TWO, Keys::FromText);
+    assert!(made(&manifest.profile, "Units") >= 1, "control: an edited manifest did not lay out the units:\n{}", manifest.profile);
+}
