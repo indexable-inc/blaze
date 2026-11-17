@@ -2,26 +2,28 @@
 //! and borrow check are filed under in blaze's store, and the rest of what
 //! `hir_ty::body_store` asks above hir-ty.
 //!
-//! - [`identity`]: a body's identity (section 3): its crate's inputs, its owner's interface, its
-//!   own HIR as `hir_def::item_hash` writes it with no spans, each id of it by what it is in
-//!   every database, what each of its paths resolves to, the traits in scope and the module
-//!   chain. One tracked query per body, with early cutoff.
-//! - [`reads`]: what each read of a step stands for (section 6): covered by the identity, one
-//!   fact, or refused.
+//! - [`identity`]: a body's key, made before the body is lowered
+//!   (docs/v2/plan/design/end-state/engine.md 4.2, the `Fn` record; restore.md, "The entry's
+//!   key, made before lowering"): its crate's settings, its owner by key, its module chain and
+//!   its item's own text. Nothing it resolves is in it: what a step resolves is a fact of the
+//!   step's shape, negatives included. One tracked query per body, with early cutoff.
+//! - [`reads`]: what each row of a step's read list stands for (section 6), the one table of
+//!   fact boundary kinds and their rules ([`reads::BOUNDARIES`], marked by
+//!   [`reads::mark_boundaries`]), and the keys of a body's owner and container, which its
+//!   identity hashes.
 //! - [`values`]: each fact's value now (section 5), lane items' and this crate's own.
 //! - [`keys`]: the item key of a definition a record names, and back.
-//! - [`impls`]: the identities of impls and head defs that the impl-set hashes name them by,
-//!   installed once per database ([`impls::install`]).
 //! - [`presentation`](mod@presentation): the names and positions of a body that reach the output (section 3.7),
 //!   hashed apart from its identity, for codegen to key debuginfo, symbols and locations by.
 //!
 //! [`Bodies`] is what the driver gives `hir_ty::body_store::install`.
 
 #![forbid(unsafe_code)]
-#![feature(allocator_api)]
+#![feature(allocator_api, register_tool)]
+// `#[blaze::renders_positions]` and `#[expect(blaze::reads_positions)]`; inert under rustc.
+#![register_tool(blaze)]
 
 pub mod identity;
-pub mod impls;
 pub mod keys;
 pub mod presentation;
 pub mod reads;
@@ -42,24 +44,26 @@ use hir_ty::{
     next_solver::{SolverDefId, goal_store::FactRef},
 };
 
-/// Lane item-hash's side of `hir_ty::body_store`.
+/// Lane item-hash's side of `hir_ty::body_store`: a body's steps are filed under its key made
+/// before lowering ([`identity::early_identity`]) and every name its steps look up is a fact
+/// of their shape ([`reads::fact_of`], over the rows of the memo's read list). The identity made from the lowered, resolved body
+/// and the switch between the two (`RecordedNames`, `reads::Names`) are deleted
+/// (end-state/engine.md section 5); `.clippy.toml` bans their names.
 pub struct Bodies;
 
 impl BodyFacts for Bodies {
     fn identity(&self, db: &Db, def: DefWithBodyId) -> Option<ContentId> {
-        identity::identity(db, def).ok()
+        identity::early_identity(db, def).ok()
     }
 
-    fn classify(
+    fn fact_of(
         &self,
         db: &Db,
         def: DefWithBodyId,
         step: Step,
-        read: blaze_query::db::DatabaseKeyIndex,
-        kind: blaze_query::db::ReadKind,
-        name: &'static str,
+        read: blaze_memo::Read,
     ) -> Classified {
-        reads::classify(db, def, step, read, kind, name)
+        reads::fact_of(db, def, step, read)
     }
 
     fn value(&self, db: &Db, def: DefWithBodyId, fact: FactRef) -> Option<ContentId> {

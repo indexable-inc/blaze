@@ -43,7 +43,7 @@ pub struct GlobalAsm {
 /// or `None` when `call` expands to something else. The item tree keeps no item for one
 /// (`item_tree::lower`): the code generator finds a crate's in its modules' macro calls
 /// ([`crate::item_scope::ItemScope::iter_macro_invoc`]) and asks this of each.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn global_asm(db: &Db, module: ModuleId, call: MacroCallId) -> Option<GlobalAsm> {
     let file = HirFileId::MacroFile(call);
     let items = ast::MacroItems::cast(file.root(db))?;

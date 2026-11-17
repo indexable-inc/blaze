@@ -1,0 +1,14 @@
+{
+ "id": "dst-1113-17",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code, dst-1113",
+ "where": "my own run scripts on blaze-vm (`/root/wt/dst-1113/final.sh`, `final3.sh`, `base3.sh`, `eng1.sh`, `land3.sh`)",
+ "what": "Every line of the form `timeout .. cargo .. > log 2>&1; echo \"$(date -u +%T) cargo ..: exit=$? in ..\"` printed `exit=0` whatever cargo returned: bash expands `$(date ..)` first and `$?` is then the status of that substitution. So `cargo check --workspace --all-targets --keep-going: exit=0 in 121 s` was printed for a run in which `blaze-std` did not compile (10 errors, the same blaze-only syntax as on main), `cargo test ..: exit=0` for a run with six failing tests, and `cargo test -p blaze-lints: exit=0 in 1500 s` for a run its timeout ended. I told the user the workspace check exits 0 on the branch; it does not, there or on main.",
+ "cost": "one false statement to the user, corrected in the same hour; the test tables were read from the result lines and are right",
+ "cause": "`$?` read after a command substitution in the same word",
+ "whys": "a status was carried to its report through shell text; the script was never run on a failing command; scripts-take-typed-input and the how-to on checked exit statuses say to check statuses, and nothing checks a hand-written VM script",
+ "class": "an exit status that is reported without being the status of the command it names",
+ "prevention": "save the status on the next line (`c=$?`) before any expansion, as verify.sh's `one()` already did; better, one runner on the VM that takes the command as a typed value and writes its status, time and load itself, so no lane writes this line by hand. Not built.",
+ "workaround": "read results from cargo's own lines (`could not compile`, `test result`), which is what the tables used",
+ "state": "open"
+}

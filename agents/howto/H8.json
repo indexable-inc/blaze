@@ -1,0 +1,9 @@
+{
+ "id": "H8",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "task": "Test incremental, concurrent or durable behaviour",
+ "do": "Write it against the sans-IO core under the simulation, as a revision case where it is an edit sequence (crates/blaze-engine/tests/revisions/), with a planted-bug control; use a real daemon only for what a kernel alone shows.",
+ "why": "Rule simulate-first.",
+ "state": "current"
+}

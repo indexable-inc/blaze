@@ -22,6 +22,7 @@ fn options(level: MirOptLevel) -> MirOptions {
         inline: level == MirOptLevel::Release,
         heap_to_stack: false,
         world: None,
+        tier: MirOptions::at(level).tier,
     }
 }
 
@@ -36,7 +37,7 @@ fn optimized<T>(
     let fx = fixture::db(fixture);
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let func = function(&db, name);
         let body = db
             .optimized_mir_body(func.into(), options(level))

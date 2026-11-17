@@ -72,15 +72,24 @@ fn each_command_its_request() {
     assert_eq!(targets.features, ["a", "b"]);
     assert_eq!(targets.profile, "dev");
 
+    // `test` runs in the daemon, which reruns only the tests whose executed code or reads
+    // changed: selection is the default.
     let test = request_of(&invocation(words(os(&["blaze", "t", "parse", "--", "--exact"]))));
-    let Request::Build { targets, .. } = test else { panic!("{test:?}") };
-    assert_eq!(targets.profile, "test");
-
-    let reached = request_of(&invocation(words(os(&["blaze", "test", "--reached", "parse"]))));
-    let Request::Test { filter, all, targets, .. } = reached else { panic!("{reached:?}") };
+    let Request::Test { filter, all, args, targets, .. } = test else { panic!("{test:?}") };
     assert_eq!((filter, all), (vec!["parse".to_owned()], false));
-    // `--reached` is blaze's: cargo's command line does not have it.
+    assert_eq!((args, targets.profile.as_str()), (vec!["--exact".to_owned()], "test"));
+
+    let run_all = request_of(&invocation(words(os(&["blaze", "test", "--run-all", "parse"]))));
+    let Request::Test { filter, all, targets, .. } = run_all else { panic!("{run_all:?}") };
+    assert_eq!((filter, all), (vec!["parse".to_owned()], true));
+    // `--run-all` is blaze's: cargo's command line does not have it.
     assert_eq!(targets.cargo.unwrap().args, ["parse"]);
+
+    // What the daemon does not run stays the CLI's: listing the binaries, and the doc tests.
+    let no_run = request_of(&invocation(words(os(&["blaze", "test", "--no-run"]))));
+    assert!(matches!(no_run, Request::Build { .. }), "{no_run:?}");
+    let doc = request_of(&invocation(words(os(&["blaze", "test", "--doc"]))));
+    assert!(matches!(doc, Request::Build { .. }), "{doc:?}");
 
     let check =
         request_of(&invocation(words(os(&["blaze", "check", "--baselines", "b", "--fix"]))));
@@ -112,13 +121,9 @@ fn ub_runs_every_selected_test_in_the_daemon() {
     assert_eq!(ub, Some(Ub { seed: Some(7), schedules: None }));
     assert_eq!(targets.cargo.unwrap().args, ["parse"]);
 
-    let both = request_of(&invocation(words(os(&["blaze", "test", "--ub", "--reached"]))));
-    let Request::Test { all, ub, .. } = both else { panic!("{both:?}") };
-    assert_eq!((all, ub), (false, Some(Ub { seed: None, schedules: None })));
-
-    let reached = request_of(&invocation(words(os(&["blaze", "test", "--reached"]))));
-    let Request::Test { ub, .. } = reached else { panic!("{reached:?}") };
-    assert_eq!(ub, None, "opt-in");
+    let selected = request_of(&invocation(words(os(&["blaze", "test"]))));
+    let Request::Test { all, ub, .. } = selected else { panic!("{selected:?}") };
+    assert_eq!((all, ub), (false, None), "`--ub` is opt-in");
 
     let asked = invocation(words(os(&["blaze", "test", "--ub", "--no-run"])));
     let cargo = place::cargo(&asked, &place(), Vec::new(), Vec::new(), false, None).unwrap();
@@ -128,6 +133,7 @@ fn ub_runs_every_selected_test_in_the_daemon() {
 #[test]
 fn ub_results_print_as_libtest_prints_them() {
     let failed = TestResult {
+        ran: None,
         binary: "/w/target/debug/deps/foo-1".to_owned(),
         name: "tests::aliasing".to_owned(),
         outcome: TestOutcome::Failed,
@@ -136,6 +142,7 @@ fn ub_results_print_as_libtest_prints_them() {
                 .to_vec(),
         millis: 0,
         cached: None,
+        not_kept: None,
         outside: false,
         executable: 0,
     };
@@ -159,14 +166,16 @@ fn ub_results_print_as_libtest_prints_them() {
 }
 
 #[test]
-fn the_summary_names_the_tests_that_ran_outside_the_sandbox() {
+fn the_client_names_no_test_that_ran_outside_the_sandbox() {
     let result = |name: &str, outside: bool| TestResult {
+        ran: None,
         binary: "/w/target/debug/deps/foo-1".to_owned(),
         name: name.to_owned(),
         outcome: TestOutcome::Passed,
         output: Vec::new(),
         millis: 1,
         cached: None,
+        not_kept: None,
         outside,
         executable: 0,
     };
@@ -178,21 +187,27 @@ fn the_summary_names_the_tests_that_ran_outside_the_sandbox() {
     ];
     let (then, out, err) = driven(
         &mut FakeApi::answering(responses.clone()),
-        &["blaze", "test", "--reached"],
+        &["blaze", "test"],
         &mut Fake::default(),
     );
     assert_eq!(then, Then::Exit(0));
     assert!(out.contains("test tests::writes_home ... ok\n"), "{out}");
+    // How many ran outside, and why, is the daemon's one counted note
+    // (`serve::unit::test::outside_note`), sent as a diagnostic: the client lists no names.
+    assert!(!err.contains("outside the sandbox"), "{err}");
+    assert!(!err.contains("tests::writes_home") && !err.contains("tests::dials"), "{err}");
+    // The run's last line: its counts, from the results the daemon sent.
+    let last = err.lines().last().unwrap();
     assert!(
-        err.ends_with(
-            "note: 2 tests ran outside the sandbox, so they run every time and their passes are never kept: \
-             tests::writes_home, tests::dials\n"
+        last.starts_with(
+            "blaze: tests ok selected=3 ran=3 passed=3 failed=0 ignored=0 measured=0 filtered_out=0 \
+             cached=0 binaries=1 unbuilt=0 elapsed_ms="
         ),
         "{err}"
     );
     let (_, _, quiet) = driven(
         &mut FakeApi::answering(responses),
-        &["blaze", "test", "--reached", "-q"],
+        &["blaze", "test", "-q"],
         &mut Fake::default(),
     );
     assert!(!quiet.contains("note:"), "cargo's notes are silent under -q: {quiet}");
@@ -244,8 +259,9 @@ fn a_word_far_from_every_command_is_given_no_guess_and_the_whole_list() {
 
 #[test]
 fn every_command_suggested_is_one() {
-    // `blaze daemon` alone is no command: it takes a verb.
-    for name in COMMANDS.iter().filter(|it| **it != "daemon") {
+    // `blaze daemon` alone is no command: it takes a verb. `blaze serve` is the daemon itself,
+    // started by `main` before the command line is parsed (`cli::main`), never by `args::parse`.
+    for name in COMMANDS.iter().filter(|it| !matches!(**it, "daemon" | "serve")) {
         assert_ne!(
             args::parse(vec![OsString::from(*name)]),
             Ok(Asked::Unknown((*name).to_owned())),
@@ -317,46 +333,196 @@ fn tests_built() -> Vec<Response> {
     ]
 }
 
+/// What a `blaze test --doc` build answers: as [`tests_built`], its artifacts the doc tests
+/// alone, as cargo's `--doc` builds no test executable.
+fn docs_built() -> Vec<Response> {
+    let mut responses = tests_built();
+    for response in &mut responses {
+        if let Response::Built { artifacts, .. } = response {
+            artifacts.retain(|it| it.kind == blaze_api::ArtifactKind::Doctest);
+            assert_eq!(artifacts.len(), 1, "the fixture has one doc test target");
+        }
+    }
+    responses
+}
+
 fn driven(api: &mut FakeApi, words: &[&str], programs: &mut Fake) -> (Then, String, String) {
     let asked = invocation(self::words(os(words)));
     let request = request_of(&asked);
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let shown =
         Shown { quiet: asked.flags.quiet, verbose: asked.flags.verbose, ..Shown::default() };
+    let options = blaze_screen::Options {
+        quiet: shown.quiet,
+        verbose: shown.verbose > 0,
+        ..blaze_screen::Options::of(match asked.command() {
+            Command::Run => blaze_screen::Command::Run,
+            Command::Test => blaze_screen::Command::Test,
+            Command::Check => blaze_screen::Command::Check,
+            _ => blaze_screen::Command::Build,
+        })
+    };
+    let mut screen = show::Show::piped(options, &mut err);
     let then =
-        drive(api, &asked, &place(), request, shown, Instant::now(), &mut out, &mut err, programs)
+        drive(api, &asked, &place(), request, shown, Instant::now(), &mut out, &mut screen, programs)
             .unwrap();
+    drop(screen);
     (then, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
 }
 
+/// A test the daemon ran, of the lib's test executable, which passed or failed.
+fn daemon_result(name: &str, passed: bool) -> Response {
+    Response::TestResult(TestResult {
+        ran: None,
+        binary: "/w/target/debug/deps/foo-0123abcd".to_owned(),
+        name: name.to_owned(),
+        outcome: if passed { TestOutcome::Passed } else { TestOutcome::Failed },
+        output: if passed { Vec::new() } else { b"assertion failed".to_vec() },
+        millis: 1,
+        cached: None,
+        not_kept: None,
+        outside: false,
+        executable: 0,
+    })
+}
+
+/// `tests_built`'s build with `results` the daemon ran, before its `Done`.
+fn tests_ran(results: Vec<Response>) -> Vec<Response> {
+    let mut responses = tests_built();
+    let done = responses.pop();
+    responses.extend(results);
+    responses.extend(done);
+    responses
+}
+
+/// `blaze test` runs its test executables in the daemon (one `Test` request) and the doc tests
+/// after its results, in the CLI: under `--fail-fast` a failed daemon test stops the run before
+/// them, and under `--no-fail-fast` they run past it and the run still fails.
 #[test]
-fn under_fail_fast_a_failing_test_executable_stops_the_tests() {
-    let mut api = FakeApi::answering(tests_built());
-    let mut programs = Fake { ends: vec![("foo-0123abcd", Ended::Code(101))], ..Fake::default() };
+fn under_fail_fast_a_failing_test_stops_the_tests() {
+    let mut api = FakeApi::answering(tests_ran(vec![daemon_result("tests::parses", false)]));
+    let mut programs = Fake::default();
     let (then, out, err) = driven(&mut api, &["blaze", "test", "--fail-fast"], &mut programs);
-    assert_eq!(then, Then::Exit(101));
-    assert_eq!(out, "");
-    let lines: Vec<&str> = err.lines().collect();
-    assert_eq!(lines[0], "   Compiling foo v0.1.0 (/w/foo)");
+    assert_eq!(then, Then::Exit(Exit::Failed.code()));
+    assert!(out.contains("test tests::parses ... FAILED\n"), "{out}");
+    assert!(programs.ran.is_empty(), "no doc test runs past a failure under --fail-fast: {err}");
+    assert!(!err.contains("Doc-tests"), "{err}");
     assert!(
-        lines[1].starts_with("    Finished `test` profile [unoptimized + debuginfo] target(s) in "),
+        err.lines().last().unwrap().starts_with("blaze: tests failed selected=1 ran=1 passed=0 failed=1 "),
         "{err}"
     );
-    assert_eq!(
-        &lines[2..],
-        [
-            "     Running unittests src/lib.rs (target/debug/deps/foo-0123abcd)",
-            "error: test failed, to rerun pass `--lib`",
-        ]
-    );
-    assert_eq!(programs.ran.len(), 1);
-    assert!(matches!(api.asked.as_slice(), [Request::Build { .. }]));
+    assert!(matches!(api.asked.as_slice(), [Request::Test { .. }]), "the daemon runs the tests");
 
-    let mut programs = Fake { ends: vec![("foo-0123abcd", Ended::Code(101))], ..Fake::default() };
+    let mut api = FakeApi::answering(tests_ran(vec![daemon_result("tests::parses", false)]));
+    let mut programs = Fake::default();
     let (then, _, err) = driven(&mut api, &["blaze", "test", "--no-fail-fast"], &mut programs);
-    assert_eq!(then, Then::Exit(101));
-    assert_eq!(programs.ran.len(), 4);
-    assert!(err.ends_with("   Doc-tests foo\nerror: 1 target failed:\n    `--lib`\n"), "{err}");
+    assert_eq!(then, Then::Exit(Exit::Failed.code()));
+    assert_eq!(programs.ran.len(), 1, "the doc tests run past the failure: {err}");
+    assert!(err.contains("   Doc-tests foo\n"), "{err}");
+    assert!(
+        err.lines().last().unwrap().starts_with("blaze: tests failed selected=2 ran=2 passed=1 failed=1 "),
+        "{err}"
+    );
+}
+
+/// A doc test is neither selected nor kept: after the daemon's results, the doc tests run every
+/// time, and the run says so once (not under `-q`). A failing doc test fails the run whose
+/// daemon tests all passed.
+#[test]
+fn doc_tests_run_every_time_after_the_daemons_results_and_say_so() {
+    let mut api = FakeApi::answering(tests_ran(vec![daemon_result("tests::parses", true)]));
+    let mut programs = Fake::default();
+    let (then, out, err) = driven(&mut api, &["blaze", "test"], &mut programs);
+    assert_eq!(then, Then::Exit(0), "{err}");
+    assert!(out.contains("test tests::parses ... ok\n"), "{out}");
+    assert_eq!(programs.ran.len(), 1, "the doc tests, run here: {err}");
+    assert!(err.contains(&format!("note: {}\n", super::test::DOC_TESTS_NOT_KEPT)), "{err}");
+    assert!(err.contains("   Doc-tests foo\n"), "{err}");
+    assert!(err.lines().last().unwrap().starts_with("blaze: tests ok selected=2 ran=2 passed=2 failed=0 "), "{err}");
+
+    let mut api = FakeApi::answering(tests_ran(vec![daemon_result("tests::parses", true)]));
+    let mut programs = Fake { ends: vec![("foo-doctests", Ended::Code(101))], ..Fake::default() };
+    let (then, _, err) = driven(&mut api, &["blaze", "test", "-q"], &mut programs);
+    assert_eq!(then, Then::Exit(Exit::Failed.code()), "{err}");
+    assert!(!err.contains("note:"), "cargo's notes are silent under -q: {err}");
+    assert!(err.contains("error: 1 target failed:\n    `--doc`\n"), "{err}");
+}
+
+/// The instance (agents.json A39) through the whole command, off a terminal: the build passes,
+/// every test executable the CLI runs (the doc tests, under `--doc`) says its filter left out
+/// all it has and exits 0, and the command is refused with blaze's code for a run of none,
+/// naming the nearest tests; `--no-tests pass` is cargo's exit 0.
+#[test]
+fn a_test_run_that_ran_nothing_is_refused_through_the_whole_command() {
+    let nothing = blaze_screen::Tally { filtered_out: 6, ..blaze_screen::Tally::default() };
+    let mut programs = Fake { counts: Some(nothing), names: vec!["tests::parses"], ..Fake::default() };
+    let (then, out, err) =
+        driven(&mut FakeApi::answering(docs_built()), &["blaze", "test", "--doc", "parsse"], &mut programs);
+    assert_eq!(then, Then::Exit(Exit::NoTests.code()));
+    assert_eq!(out, "");
+    // The doc tests alone ran, and nothing lists a doc test's names: no nearest is said (the
+    // daemon's runs below name the nearest, from what it said of each executable).
+    assert!(
+        err.contains(
+            "error: no test ran: `blaze test --doc parsse` matched none of the 6 tests in 1 test executable\n\
+             note: a run of no test is refused"
+        ),
+        "{err}"
+    );
+    assert!(!err.contains("     Running "), "under `--doc` no test executable runs: {err}");
+    assert!(
+        err.lines().last().unwrap().starts_with("blaze: tests failed selected=0 ran=0 passed=0 failed=0 "),
+        "{err}"
+    );
+    assert!(err.ends_with(" why=\"no test ran\"\n"), "{err}");
+
+    let mut programs = Fake { counts: Some(nothing), ..Fake::default() };
+    let words = ["blaze", "test", "--doc", "parsse", "--no-tests", "pass"];
+    let (then, _, err) = driven(&mut FakeApi::answering(docs_built()), &words, &mut programs);
+    assert_eq!(then, Then::Exit(0), "{err}");
+    assert!(err.lines().last().unwrap().starts_with("blaze: tests ok selected=0 ran=0 "), "{err}");
+
+    // The daemon's run of `blaze test`: no result, and doc tests that ran none, is a run of
+    // none.
+    let mut programs = Fake { counts: Some(nothing), ..Fake::default() };
+    let (then, _, err) =
+        driven(&mut FakeApi::answering(tests_built()), &["blaze", "test", "parsse"], &mut programs);
+    assert_eq!(then, Then::Exit(Exit::NoTests.code()), "{err}");
+    assert!(err.contains("error: no test ran: `blaze test parsse`"), "{err}");
+
+    // The daemon's own runs (`blaze test`, `--ub`): no result at all is a run of none too.
+    let none = vec![Response::Done { ok: true }];
+    let (then, _, err) =
+        driven(&mut FakeApi::answering(none.clone()), &["blaze", "test", "--ub", "parsse"], &mut Fake::default());
+    assert_eq!(then, Then::Exit(Exit::NoTests.code()), "{err}");
+    assert!(err.contains("error: no test ran: `blaze test parsse` selected no test executable\n"), "{err}");
+    // What the daemon said of each executable it filtered: the counts and the nearest names.
+    let said = vec![
+        Response::TestsOf(blaze_api::TestsOf {
+            tests: 6,
+            binary: "foo".to_owned(),
+            nearest: vec![blaze_api::Near { name: "tests::parses".to_owned(), distance: 1 }],
+            executable: 0,
+            filtered_out: 6,
+        }),
+        Response::Done { ok: true },
+    ];
+    let (then, _, err) =
+        driven(&mut FakeApi::answering(said), &["blaze", "test", "--ub", "parsse"], &mut Fake::default());
+    assert_eq!(then, Then::Exit(Exit::NoTests.code()), "{err}");
+    assert!(
+        err.contains(
+            "error: no test ran: `blaze test parsse` matched none of the 6 tests in 1 test executable\n\
+             note: the nearest that exist: tests::parses\n"
+        ),
+        "{err}"
+    );
+    let (then, _, _) = driven(
+        &mut FakeApi::answering(none),
+        &["blaze", "test", "--ub", "parsse", "--no-tests=pass"],
+        &mut Fake::default(),
+    );
+    assert_eq!(then, Then::Exit(0));
 }
 
 #[test]
@@ -366,7 +532,7 @@ fn a_failed_build_runs_nothing() {
     let (then, _, err) = driven(&mut api, &["blaze", "test", "--fail-fast"], &mut programs);
     assert_eq!(then, Then::Exit(101));
     assert!(programs.ran.is_empty());
-    assert_eq!(err, "   Compiling foo v0.1.0 (/w/foo)\n");
+    assert_eq!(err, "blaze: failed errors=0 warnings=0 unbuilt=0 elapsed_ms=0\n");
 
     let mut api = FakeApi { hangs_up: true, ..FakeApi::answering(vec![foo_compiling()]) };
     let (then, _, err) = driven(&mut api, &["blaze", "build"], &mut programs);
@@ -439,16 +605,16 @@ fn by_default_the_tests_that_built_run_past_a_failed_unit() {
             })
             .collect()
     };
+    // The daemon ran the tests that built and sent their results: they are shown, the doc
+    // tests run after them here, and the run fails.
     for words in [&["blaze", "test"][..], &["blaze", "test", "--keep-going"]] {
-        let mut api = FakeApi::answering(failed(tests_built()));
+        let mut api = FakeApi::answering(failed(tests_ran(vec![daemon_result("tests::parses", true)])));
         let mut programs = Fake::default();
-        let (then, _, err) = driven(&mut api, words, &mut programs);
+        let (then, out, err) = driven(&mut api, words, &mut programs);
         assert_eq!(then, Then::Exit(101), "{words:?}");
-        assert_eq!(programs.ran.len(), 4, "{words:?}: {err}");
-        assert!(
-            err.contains("     Running unittests src/lib.rs (target/debug/deps/foo-0123abcd)"),
-            "{err}"
-        );
+        assert!(out.contains("test tests::parses ... ok\n"), "{words:?}: {out}");
+        assert_eq!(programs.ran.len(), 1, "{words:?}: the doc tests: {err}");
+        assert!(err.contains("   Doc-tests foo\n"), "{err}");
     }
 
     // Under `--fail-fast` nothing runs.
@@ -474,7 +640,9 @@ fn run_becomes_its_program() {
     assert_eq!(exec.program, PathBuf::from("target/debug/foo"));
     assert_eq!(exec.args, [OsString::from("a"), OsString::from("b")]);
     assert_eq!(exec.cwd, PathBuf::from("/w"));
-    assert!(err.ends_with("     Running `target/debug/foo a b`\n"), "{err}");
+    // The program's command line is said only under `-v`: what a `run` shows is the build's
+    // one line, which names the program it placed.
+    assert_eq!(err, "blaze: ok built=0 cached=0 warnings=0 elapsed_ms=0 program=/w/target/debug/foo\n");
 
     let two = [
         crate::cli::run::tests::artifact("foo", "bin", "foo", false, Some("foo")),
@@ -496,8 +664,8 @@ fn run_becomes_its_program() {
 
 #[test]
 fn doc_writes_its_pages_and_says_what_cargo_doc_says() {
-    let dir = std::env::temp_dir().join(format!("blaze-cli-doc-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let made = blaze_core::temp::TempDir::for_test("blaze-cli-doc-");
+    let dir = made.path().to_path_buf();
     std::fs::create_dir_all(dir.join("old")).unwrap();
     std::fs::write(dir.join("old/index.html"), "").unwrap();
     std::fs::write(dir.join("crates.js"), "window.BLAZE_CRATES = [\"gone\",\"old\"];\n").unwrap();
@@ -543,10 +711,7 @@ fn doc_writes_its_pages_and_says_what_cargo_doc_says() {
         [" Documenting foo v0.1.0 (/w/foo)", " Documenting dep v1.0.0"],
         "{err}"
     );
-    assert!(
-        lines[2].starts_with("    Finished `dev` profile [unoptimized + debuginfo] target(s) in "),
-        "{err}"
-    );
+    assert!(lines[2].starts_with("blaze: ok built=0 cached=0 "), "{err}");
     assert_eq!(lines[3], format!("   Generated {}", dir.join("foo/index.html").display()), "{err}");
     assert_eq!(std::fs::read_to_string(dir.join("foo/index.html")).unwrap(), "<html>foo</html>");
     assert_eq!(std::fs::read_to_string(dir.join("dep/index.html")).unwrap(), "dep");
@@ -579,4 +744,298 @@ fn doc_writes_its_pages_and_says_what_cargo_doc_says() {
         "nothing is written outside the documentation's directory"
     );
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The words of `typed` (after the program's name) as the thin `blaze` reads them.
+fn thin_asked(typed: &[&str]) -> blaze_thin::route::Asked {
+    let words: Vec<OsString> = typed.iter().map(OsString::from).collect();
+    match blaze_thin::route::words(&words) {
+        blaze_thin::route::Route::Cargo(asked) => asked,
+        other => panic!("{typed:?} is not the thin blaze's: {other:?}"),
+    }
+}
+
+/// The invariant: for every command line the thin `blaze` sends itself (blaze-thin's
+/// `route`), its request is this CLI's, byte for byte in the API's deterministic CBOR, and it
+/// runs the program with the arguments this CLI's parser gives it. So the daemon builds one
+/// thing whichever sent it, and the engine can go on with an answer the thin `blaze` began
+/// (`resume`, which refuses any other request).
+#[test]
+fn the_thin_blaze_sends_this_clis_request_byte_for_byte() {
+    let env = vec![("HOME".to_owned(), "/u".to_owned()), ("PATH".to_owned(), "/usr/bin".to_owned())];
+    let files = vec![("/u/.cargo/config.toml".to_owned(), b"[build]\n".to_vec())];
+    let table: &[&[&str]] = &[
+        &["build"],
+        &["b"],
+        &["build", "-q"],
+        &["build", "--quiet", "-r"],
+        &["build", "--release"],
+        &["run"],
+        &["r", "-q"],
+        &["run", "-q", "a", "--", "b"],
+        &["run", "--release", "--", "--x", "--", "y"],
+        &["run", "-r", "-q", "-"],
+    ];
+    let frame = |it: &Request| blaze_api::frames::encode(&blaze_api::Envelope::new(2, it)).unwrap();
+    for typed in table {
+        let thin = thin_asked(typed);
+        let asked = invocation(typed.iter().map(OsString::from).collect());
+        for (color, width) in [(false, None), (true, Some(100))] {
+            let cargo =
+                place::cargo(&asked, &place(), env.clone(), files.clone(), color, width).unwrap();
+            let cli = request(&asked, cargo).unwrap();
+            let sent = blaze_thin::request::Sent {
+                cwd: "/w".to_owned(),
+                root: "/w".to_owned(),
+                env: env.clone(),
+                files: files.clone(),
+                color,
+                width,
+            };
+            let thin_request = blaze_thin::request::request(&thin, sent);
+            assert_eq!(frame(&thin_request), frame(&cli), "{typed:?}");
+        }
+        assert_eq!(thin.program, asked.program, "{typed:?}");
+        assert_eq!(thin.quiet, asked.flags.quiet, "{typed:?}");
+        assert_eq!(thin.command.name(), asked.command().name(), "{typed:?}");
+    }
+}
+
+/// The control of the test above: a request that differs in one word is other bytes, so the
+/// equality there is of the whole request.
+#[test]
+fn a_request_of_other_words_is_other_bytes() {
+    let frame = |it: &Request| blaze_api::frames::encode(&blaze_api::Envelope::new(2, it)).unwrap();
+    let quiet = request_of(&invocation(os(&["build", "-q"]).collect()));
+    let long = request_of(&invocation(os(&["build", "--quiet"]).collect()));
+    assert_ne!(frame(&quiet), frame(&long));
+}
+
+/// Every setting the daemon keeps for its life is read from a variable the thin `blaze`
+/// leaves to the engine (blaze-thin's `route::refuses`), or one it holds to the daemon's
+/// itself (`route::CHECKED_HERE`, `route::drifted`): the check that the daemon keeps what the
+/// command sets is never skipped for a command that sets one.
+#[test]
+fn every_setting_the_daemon_keeps_is_a_variable_the_thin_blaze_leaves_to_the_engine() {
+    for name in crate::serve::settings::STARTED_WITH {
+        let checked = blaze_thin::route::CHECKED_HERE.contains(name);
+        assert!(blaze_thin::route::refuses(name) != checked, "{name}");
+    }
+    for name in blaze_thin::route::CHECKED_HERE {
+        assert!(crate::serve::settings::STARTED_WITH.contains(name), "{name} is no daemon setting");
+    }
+    for name in [client_rows::PROFILE, client_rows::LAUNCHED, blaze_core::cores::VAR, "BLAZE_STATS", "BLAZE_UI"] {
+        assert!(blaze_thin::route::refuses(name), "{name}");
+    }
+}
+
+/// A line of cargo's with its time taken out: `Finished ... in <time>` and what follows it.
+fn untimed(said: &str) -> String {
+    let lines = said.lines().map(|line| match line.split_once(" target(s) in ") {
+        Some((before, after)) => {
+            let rest = after.split_once('s').map_or("", |(_, rest)| rest);
+            format!("{before} target(s) in <time>{rest}")
+        }
+        None => line.to_owned(),
+    });
+    lines.collect::<Vec<_>>().join("\n")
+}
+
+/// A build's answer with nothing to do: every unit fresh, the outputs, the work, the `Done`.
+fn plain_answer() -> Vec<Response> {
+    let foo = crate::cli::run::tests::artifact("foo", "bin", "foo", false, Some("foo"));
+    let fresh = Response::Unit(UnitStarted {
+        package_id: "path+file:///w/foo#0.1.0".to_owned(),
+        name: "foo".to_owned(),
+        version: "0.1.0".to_owned(),
+        source: Some("(/w/foo)".to_owned()),
+        verb: Verb::Fresh,
+        package: 0,
+    });
+    let built = Response::Built {
+        members: 1,
+        artifacts: vec![foo],
+        profile: "`dev` profile [unoptimized + debuginfo]".to_owned(),
+    };
+    let worked = Response::Work(blaze_api::Worked {
+        why: None,
+        storage: None,
+        tiers: Some(blaze_api::Tiers::of(blaze_api::Goal::Edit).with(38, 100)),
+        link: blaze_api::LinkKind::Patched,
+        found: 1,
+        green: 4,
+        links: vec![blaze_api::Linked {
+            how: blaze_api::LinkHow::Unchanged,
+            path: "/w/target/debug/foo".to_owned(),
+        }],
+        reran: 0,
+        misses: 0,
+        served: Vec::new(),
+        build_id: None,
+        compiled: 0,
+        critical_path_us: 0,
+        steps_us: Vec::new(),
+        placed: blaze_api::PlacedBytes::default(),
+    });
+    vec![fresh, built, worked, Response::Done { ok: true }]
+}
+
+/// The invariant: what the thin `blaze` prints of an answer it takes as plain
+/// (blaze-thin's `answer`) is what this CLI prints of the same responses, and the program it
+/// runs is the one this CLI runs, from the same directory with the same arguments and
+/// variables. Anything it does not take as plain it hands to this CLI, so the two never print
+/// one answer two ways.
+#[test]
+fn the_thin_blaze_prints_a_plain_answer_as_this_cli_does() {
+    use blaze_thin::answer::{Exec, Plain, Step};
+    let table: &[&[&str]] =
+        &[&["build"], &["build", "-q"], &["run"], &["run", "-q"], &["run", "a", "--", "b=1"]];
+    for typed in table {
+        let thin = thin_asked(typed);
+        let mut plain = Plain::new();
+        let steps: Vec<Step> = plain_answer().into_iter().map(|it| plain.take(it)).collect();
+        assert_eq!(steps, [Step::More, Step::More, Step::More, Step::Done], "{typed:?}");
+        let options = blaze_screen::Options {
+            quiet: thin.quiet,
+            ..blaze_screen::Options::of(match thin.command {
+                blaze_thin::route::Command::Build => blaze_screen::Command::Build,
+                blaze_thin::route::Command::Run => blaze_screen::Command::Run,
+            })
+        };
+        let said = plain.shown(
+            options,
+            blaze_screen::Caps::PIPE,
+            &blaze_report::terminal::Terminal::PIPE,
+            std::time::Duration::ZERO,
+            None,
+        );
+
+        let mut api = FakeApi::answering(plain_answer());
+        let mut words = vec!["blaze"];
+        words.extend(typed.iter());
+        let (then, out, err) = driven(&mut api, &words, &mut Fake::default());
+        assert_eq!(out, "", "{typed:?}");
+        match thin.command {
+            blaze_thin::route::Command::Build => assert_eq!(then, Then::Exit(0), "{typed:?}"),
+            blaze_thin::route::Command::Run => {
+                let program = plain.program().expect("the one bin runs");
+                let exec = Exec::of(
+                    program.executable.as_deref().unwrap(),
+                    &program.env,
+                    &thin.program,
+                    std::path::Path::new("/w"),
+                );
+                let Then::Exec(cli) = then else { panic!("{typed:?}: {then:?}: {err}") };
+                assert_eq!(
+                    (exec.program, exec.args, exec.env, exec.cwd),
+                    (cli.program, cli.args, cli.env, cli.cwd),
+                    "{typed:?}"
+                );
+            }
+        }
+        assert_eq!(untimed(&said), untimed(&err), "{typed:?}");
+    }
+}
+
+/// An edit's answer: a unit compiled and ended with no diagnostic, the outputs, the work with
+/// a step computed again and its image spliced, the `Done`.
+fn built_answer() -> Vec<Response> {
+    let mut answer = plain_answer();
+    answer[0] = foo_compiling();
+    let Response::Work(worked) = &mut answer[2] else { panic!("the work is third") };
+    worked.misses = 1;
+    worked.found = 0;
+    worked.compiled = 1;
+    worked.links[0].how = blaze_api::LinkHow::Spliced;
+    let foo = crate::cli::run::tests::artifact("foo", "bin", "foo", false, Some("foo"));
+    let ended = Response::UnitEnded(blaze_api::UnitOf {
+        id: 0,
+        test: false,
+        target: foo.target,
+        doctest: false,
+        package_id: "path+file:///w/foo#0.1.0".to_owned(),
+        manifest_path: "/w/foo/Cargo.toml".to_owned(),
+        primary: true,
+    });
+    answer.insert(1, ended);
+    answer
+}
+
+/// The invariant of the test above for an edit's answer (a unit compiled, its image spliced):
+/// for a `run` and a quiet `build`, which say nothing of what the build recomputed, the thin
+/// `blaze` prints what this CLI prints of the same responses and runs the program it runs.
+/// The control: a `build` that is not quiet says why it recomputed, which is this CLI's
+/// printer's, and the thin `blaze` hands that answer over at its first unit.
+#[test]
+fn the_thin_blaze_prints_an_edits_answer_as_this_cli_does() {
+    use blaze_thin::answer::{Exec, Plain, Step};
+    let table: &[&[&str]] = &[&["build", "-q"], &["run"], &["run", "-q"], &["run", "a", "--", "b=1"]];
+    for typed in table {
+        let thin = thin_asked(typed);
+        let reports = thin.command == blaze_thin::route::Command::Build && !thin.quiet;
+        let mut plain = Plain::of(reports);
+        let steps: Vec<Step> = built_answer().into_iter().map(|it| plain.take(it)).collect();
+        assert_eq!(steps, [Step::More, Step::More, Step::More, Step::More, Step::Done], "{typed:?}");
+        let shown = blaze_thin::answer::Shown::pipe(
+            match thin.command {
+                blaze_thin::route::Command::Build => blaze_screen::Command::Build,
+                blaze_thin::route::Command::Run => blaze_screen::Command::Run,
+            },
+            false,
+        );
+        let said = plain.said(&shown, thin.quiet, std::time::Duration::ZERO);
+
+        let mut api = FakeApi::answering(built_answer());
+        let mut words = vec!["blaze"];
+        words.extend(typed.iter());
+        let (then, out, err) = driven(&mut api, &words, &mut Fake::default());
+        assert_eq!(out, "", "{typed:?}");
+        match thin.command {
+            blaze_thin::route::Command::Build => assert_eq!(then, Then::Exit(0), "{typed:?}"),
+            blaze_thin::route::Command::Run => {
+                let program = plain.program().expect("the one bin runs");
+                let exec = Exec::of(
+                    program.executable.as_deref().unwrap(),
+                    &program.env,
+                    &thin.program,
+                    std::path::Path::new("/w"),
+                );
+                let Then::Exec(cli) = then else { panic!("{typed:?}: {then:?}: {err}") };
+                assert_eq!(
+                    (exec.program, exec.args, exec.env, exec.cwd),
+                    (cli.program, cli.args, cli.env, cli.cwd),
+                    "{typed:?}"
+                );
+            }
+        }
+        assert_eq!(untimed(&said), untimed(&err), "{typed:?}");
+        if !thin.quiet {
+            // One line, the screen's (docs/terminal.md): no line a unit, no `link:` for a splice.
+            assert!(said.starts_with("blaze: ok built=1 "), "{said}");
+        }
+    }
+    let build = thin_asked(&["build"]);
+    assert!(build.command == blaze_thin::route::Command::Build && !build.quiet);
+    let first = built_answer().into_iter().next().expect("a unit");
+    assert!(matches!(Plain::of(true).take(first), Step::HandOver(_)));
+}
+
+/// The control of the tests above, and the other half of the thin `blaze`'s rule: each response
+/// this CLI's printer says more of than cargo's status lines is one the thin `blaze` does not
+/// take, so it is this CLI that prints it.
+#[test]
+fn what_this_clis_printer_says_more_of_the_thin_blaze_hands_over() {
+    use blaze_thin::answer::{Plain, Step};
+    let handed = |response: Response| matches!(Plain::new().take(response), Step::HandOver(_));
+    assert!(matches!(Plain::of(true).take(foo_compiling()), Step::HandOver(_)));
+    assert!(handed(Response::Done { ok: false }));
+    assert!(handed(Response::Error(blaze_api::ApiError::new("no", None))));
+    assert!(handed(Response::Diagnostic(blaze_api::Diagnostic::note("said".to_owned()))));
+    let mut recomputed = plain_answer();
+    let Response::Work(worked) = &mut recomputed[2] else { panic!("the work is third") };
+    worked.misses = 1;
+    let mut plain = Plain::of(true);
+    let steps: Vec<bool> =
+        recomputed.into_iter().map(|it| matches!(plain.take(it), Step::HandOver(_))).collect();
+    assert_eq!(steps[..3], [false, false, true]);
 }

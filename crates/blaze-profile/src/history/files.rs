@@ -29,13 +29,14 @@
 #![deny(blaze::sans_io_core)]
 
 use std::{
+    alloc::{Allocator, Global},
     collections::{BTreeMap, BTreeSet, VecDeque},
     io,
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use blaze_core::{Completion, Done, Effect, FileName, IoError, LockMode, Mapping, Meta, Tag};
+use blaze_core::{Completion, Done, Effect, Extent, FileName, IoError, LockMode, Mapping, Meta, Tag};
 use parquet::file::properties::WriterProperties;
 
 use super::{
@@ -162,8 +163,8 @@ pub(crate) struct Flushed {
     /// Files merged into others, and the files those merges made.
     pub(crate) merged: u32,
     pub(crate) compacted: u32,
-    /// Files the cap retired.
-    pub(crate) deleted: u32,
+    /// What the cap retired.
+    pub(crate) capped: Capped,
     /// What failed after the commit: a merge, the cap, a reap.
     pub(crate) deferred: Vec<HistoryError>,
     /// Crash records consumed that could not be deleted: the next open deletes them unread.
@@ -180,7 +181,7 @@ impl Flushed {
             bytes: 0,
             merged: 0,
             compacted: 0,
-            deleted: 0,
+            capped: Capped::default(),
             // alloc: empty until something fails
             deferred: Vec::new(),
             // alloc: empty until something fails
@@ -200,6 +201,8 @@ pub(crate) struct Opened {
     pub(crate) crashes: crash::Recovered,
     /// Why a dead daemon's rows could not be read back: the next flush answers it.
     pub(crate) postmortem: Option<HistoryError>,
+    /// What the cap retired as the history opened.
+    pub(crate) capped: Capped,
 }
 
 /// A pin a reader holds ([`Outcome::Pinned`]): let go of by [`Files::unpin`].
@@ -241,8 +244,8 @@ pub(crate) enum Recovery {
 pub(crate) enum Outcome {
     Opened(Result<Opened, HistoryError>),
     Flushed(Flushed),
-    /// Of [`Files::recount`]: the files the cap retired.
-    Recounted(Result<u32, HistoryError>),
+    /// Of [`Files::set_cap`]: what the cap retired.
+    Recounted(Result<Capped, HistoryError>),
     /// Of [`Files::write_listed`]: the bytes written.
     WroteListed(Result<u64, HistoryError>),
     Read(Result<Manifest, HistoryError>),
@@ -297,14 +300,26 @@ pub(crate) struct Files<H: Host> {
 
 /// What the core keeps of the history between operations.
 struct State {
+    /// The bytes of Parquet the history keeps past its kept builds ([`past_cap_in`]). Only the
+    /// Parquet files count: until 2026-11-14 the flight recorder's mapping and the crash records
+    /// beside them were counted first, and a mapping (3.3 MiB and 2 MiB a ring: 55 MiB for a
+    /// daemon on 18 cores) is more than [`super::CAP_LEAST`], so a new home's cap left no room
+    /// for any file and every trim retired every build it could. Those files are the recorder's,
+    /// bounded by its own constants, and no trim can retire them; counting them only turned the
+    /// recorder's size into lost builds.
     cap: u64,
+    /// How many of the last finished builds the cap never retires ([`super::KEEP_BUILDS`]).
+    keep: usize,
+    /// The planted bug of the cap's simulation test, if any.
+    #[cfg(test)]
+    rule: CapRule,
     /// The files written, oldest first, and their bytes all told.
     kept: VecDeque<Kept>,
     total: u64,
-    /// Bytes of the directory's files the cap counts that are not Parquet: the flight
-    /// recorders' mappings and the crash records.
-    side: u64,
     last_build: u64,
+    /// The builds under way, as the history last said ([`Files::running`]): the cap retires no
+    /// file holding a row of one ([`past_cap_in`]).
+    running: BTreeSet<u64>,
     /// The next flush number a postmortem's files take.
     seq: u64,
     /// The manifest may name retired files still on disk: a reap looks.
@@ -316,6 +331,17 @@ struct State {
     /// Each table's writer properties, by its place in [`crate::schema::TABLES`]: what a
     /// merge writes with.
     properties: Vec<WriterProperties>,
+}
+
+impl State {
+    /// How the cap decides: by its rule, but where a test planted a bug.
+    fn rule(&self) -> CapRule {
+        #[cfg(test)]
+        let rule = self.rule;
+        #[cfg(not(test))]
+        let rule = CapRule::Kept;
+        rule
+    }
 }
 
 /// The effects asked for and not yet handed to the driver, the tags, and the clock.
@@ -522,16 +548,6 @@ fn listing<H: Host>(cx: &Cx<'_, H>, done: Done) -> Result<Vec<(String, Meta)>, H
     }
 }
 
-/// Bytes of the files the cap counts that are not Parquet: each flight recorder mapping
-/// (`flight-<pid>.map`: this process's, reserved whole as it is made, and one a postmortem
-/// refused and left) and each crash record (`crash.<pid>`, one page, and `crash.<pid>.refused`).
-fn side_bytes(listing: &[(String, Meta)]) -> u64 {
-    listing
-        .iter()
-        .filter(|(name, _)| name.starts_with("crash.") || postmortem::pid_of(name).is_some())
-        .map(|(_, meta)| meta.len)
-        .sum()
-}
 
 /// Whether the hidden file `name` of a history's directory is one a write left half done: of a
 /// process that is gone, of this one, or of a blaze before hidden names carried the writer's
@@ -684,7 +700,7 @@ impl Read {
                     self.names.sort_unstable();
                     for at in 0..self.names.len() {
                         let file = cx.file(&self.names[at]);
-                        cx.ask(Wait::Files, |tag| Effect::Map { file, tag });
+                        cx.ask(Wait::Files, |tag| Effect::Map { file, extent: Extent::Whole, tag });
                     }
                     if self.legacy {
                         let file = cx.file(manifest::LEGACY_RETIRED);
@@ -1154,23 +1170,310 @@ impl Place {
 
 // --- The cap ------------------------------------------------------------------------------
 
-/// The unit the cap retires a kept file with: its build, or the file alone when of no build.
-fn unit_of(at: usize, kept: &Kept) -> (u64, Option<usize>) {
-    (kept.name.build, (kept.name.build == 0).then_some(at))
+/// What the cap retired in one trim. Never silent: the history says it as a WARN event
+/// (`History::said_capped`), so `blaze explain problems` names the builds whose rows went.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Capped {
+    pub(crate) files: u32,
+    /// The rows those files held, as their entries count them.
+    pub(crate) rows: u64,
+    pub(crate) bytes: u64,
+    /// The lowest and highest build a retired file was named for or held rows of; `None`:
+    /// only files of no build.
+    pub(crate) builds: Option<[u64; 2]>,
+    /// The bytes still past the cap after the trim: what the kept builds (the running ones and
+    /// the last [`super::KEEP_BUILDS`] finished) and the newest flush's files of no build hold
+    /// beyond it, which no trim retires. 0 while the history fits.
+    pub(crate) over: u64,
 }
 
-/// Whether the kept file at `at` goes with the units `gone`.
-fn goes(gone: &BTreeSet<(u64, Option<usize>)>, at: usize, kept: &Kept) -> bool {
-    kept.listed == Listed::Listed && gone.contains(&unit_of(at, kept))
+impl Capped {
+    fn add(&mut self, kept: &Kept) {
+        self.files += 1;
+        self.rows += kept.entry.rows;
+        self.bytes += kept.bytes;
+        if let Some([lo, hi]) = builds_of(kept) {
+            self.builds = Some(match self.builds {
+                Some([a, b]) => [a.min(lo), b.max(hi)],
+                None => [lo, hi],
+            });
+        }
+    }
 }
 
-/// The oldest builds retired until the rest fit under the cap: a build's files go all at once,
-/// every table of it, so a reader of a build reads all of it or none. The files of no build
-/// (named 0: flushes of an idle daemon) go one at a time. A build is as old as its newest
-/// file's flush; the newest flush's build is kept. Retired in one commit, deleted once no pin
-/// holds them ([`Reap`]). How many.
+/// The builds a kept file belongs to, for the cap: the build it is named for and every build
+/// its rows are of ([`Entry::builds`]). A flush is named for the highest build of its rows, so
+/// while two builds run at once a file named for the later one holds the earlier one's rows
+/// too. A range its footer could not bound (`[0, u64::MAX]`) says nothing, and the name
+/// stands alone. `None`: a file of no build (named 0, no row of a build).
+fn builds_of(kept: &Kept) -> Option<[u64; 2]> {
+    let named = (kept.name.build != 0).then_some([kept.name.build; 2]);
+    let held = kept
+        .entry
+        .builds
+        .filter(|it| *it != [0, u64::MAX])
+        .map(|[a, b]| [a.min(b), a.max(b)]);
+    match (named, held) {
+        (Some([a, b]), Some([lo, hi])) => Some([a.min(lo), b.max(hi)]),
+        (one, other) => one.or(other),
+    }
+}
+
+/// The files the cap retires, by their place in `kept` (oldest first), so that what is left
+/// fits under `cap`, or as near as the rules allow.
+///
+/// The invariant: the history holds, whole, every build still running (in `running`) and the
+/// last `keep` finished builds (the `keep` highest-numbered builds any file holds rows of that
+/// are not running: a daemon numbers its builds upward, past every build the directory holds,
+/// so the highest are the last), whatever the cap and whatever flushes come after; beyond them
+/// the cap retires oldest first, a unit at a time. These are what `blaze slow`, `blaze why` and
+/// a diff of two builds ask about. A build the rule keeps stays even when it alone is past the
+/// cap (the trim then says what is over, [`Capped::over`]).
+///
+/// No build loses a part of its rows. The unit that goes is a set of builds whose files chain
+/// together: files whose build ranges ([`builds_of`]) overlap are one unit, all retired at once,
+/// every table of them, and a unit holding a build the rule keeps is kept whole. A file of no
+/// build goes alone, and before any build's: the files of no build (what a daemon wrote between
+/// builds, its own heartbeat mostly) go first, oldest first, and only then units of builds,
+/// oldest first (a unit is as old as its newest file's flush), so a daemon left idle never
+/// pushes a build's rows out while rows of no build are left to go (until 2026-11-11 age alone
+/// decided: a daemon idle for two days wrote its way through the cap and every build before it).
+/// The newest flush's own files of no build stay too, so a reader that asked for a flush reads
+/// what it wrote; they protect nothing else.
+///
+/// Until 2026-11-14 what was kept was stated in flushes: the unit of the newest flush, and the
+/// running builds. Every reader asks the daemon to flush before it reads, and a flush of no
+/// build's rows (the timer's, a query's) was then the newest flush with no build in it: past the
+/// cap every build before it went. So asking about the last build was what retired it: on a new
+/// home (cap 8 MiB, under one cold build's rows) `blaze debug sql` showed builds 1 and 6, and the
+/// next query showed none. Until 2026-11-11 the unit was the build a file was named for alone: a
+/// long build whose flushes also held a later, shorter build's rows had those files named for the
+/// later build and retired with it, while it ran, with nothing said (an 80-minute build's history
+/// kept its last five minutes of `task` spans).
+///
+/// Its cost: one pass over the files kept and a sort of their units, done once a flush past the
+/// cap, against a floor of reading each file's entry once.
+///
+/// `rule` is [`CapRule::Kept`] but where a test plants a bug.
+fn past_cap_in<'a>(
+    kept: impl Iterator<Item = &'a Kept> + Clone,
+    total: u64,
+    cap: u64,
+    running: &BTreeSet<u64>,
+    keep: usize,
+    rule: CapRule,
+) -> BTreeSet<usize> {
+    // alloc: empty unless past the cap
+    let mut gone = BTreeSet::new();
+    if total > cap {
+        units_past_cap(kept, total, cap, running, keep, rule, &mut gone);
+    }
+    gone
+}
+
+/// How [`past_cap_in`] decides: the rule, or a bug a test plants to show its oracle catches it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CapRule {
+    /// What the cap does.
+    Kept,
+    /// Whatever is oldest first, files of no build or not, as until 2026-11-11: the planted bug
+    /// of the order's test.
+    #[cfg(test)]
+    OldestFirst,
+    /// The newest flush's unit and the running builds kept, and no finished build by count, as
+    /// until 2026-11-14: a flush with no build in it retires the last build.
+    #[cfg(test)]
+    NewestFlushOnly,
+    /// The kept builds set aside only while what is left of the others can still meet the cap:
+    /// past it they go too, oldest first. The cap checked before the kept builds are set aside.
+    #[cfg(test)]
+    CapBeforeKept,
+}
+
+impl CapRule {
+    /// Whether the last finished builds are kept by count.
+    fn keeps_by_count(self) -> bool {
+        match self {
+            CapRule::Kept => true,
+            #[cfg(test)]
+            CapRule::OldestFirst | CapRule::CapBeforeKept => true,
+            #[cfg(test)]
+            CapRule::NewestFlushOnly => false,
+        }
+    }
+
+    /// Whether the files of no build go before any build's.
+    fn no_build_first(self) -> bool {
+        match self {
+            CapRule::Kept => true,
+            #[cfg(test)]
+            CapRule::NewestFlushOnly | CapRule::CapBeforeKept => true,
+            #[cfg(test)]
+            CapRule::OldestFirst => false,
+        }
+    }
+
+    /// Whether the kept builds go too while the history is still past its cap.
+    fn kept_go_past_cap(self) -> bool {
+        match self {
+            CapRule::Kept => false,
+            #[cfg(test)]
+            CapRule::OldestFirst | CapRule::NewestFlushOnly => false,
+            #[cfg(test)]
+            CapRule::CapBeforeKept => true,
+        }
+    }
+}
+
+/// The builds the rule keeps whole: every one in `running`, and the `keep` highest-numbered of
+/// the others any file of `kept` holds rows of, sorted. A file whose rows span `lo..=hi` says
+/// builds `lo` and `hi` had rows; one between them is in the same unit whatever it is.
+fn kept_builds<'a, R: Allocator + Clone + std::alloc::AllocatorClone, A: Allocator + Clone>(
+    kept: impl Iterator<Item = &'a Kept>,
+    running: &BTreeSet<u64, R>,
+    keep: usize,
+    alloc: A,
+) -> Vec<u64, A> {
+    let mut known = Vec::new_in(alloc.clone());
+    for it in kept {
+        if let Some([lo, hi]) = builds_of(it) {
+            known.push(lo);
+            known.push(hi);
+        }
+    }
+    known.sort_unstable();
+    known.dedup();
+    let mut held = Vec::with_capacity_in(running.len() + keep.min(known.len()), alloc);
+    held.extend(running.iter().copied());
+    held.extend(known.iter().rev().filter(|it| !running.contains(*it)).take(keep).copied());
+    held.sort_unstable();
+    held
+}
+
+/// [`past_cap_in`] by the rule itself, as the cap's tests read it.
+#[cfg(test)]
+fn past_cap<'a>(
+    kept: impl Iterator<Item = &'a Kept> + Clone,
+    total: u64,
+    cap: u64,
+    running: &BTreeSet<u64>,
+    keep: usize,
+) -> BTreeSet<usize> {
+    past_cap_in(kept, total, cap, running, keep, CapRule::Kept)
+}
+
+/// [`past_cap_in`] once the history is past its cap: the units, the kept builds set aside, then
+/// the rest retired oldest first into `gone`, the caller's set, of the caller's allocator.
+fn units_past_cap<'a, R: Allocator + Clone + std::alloc::AllocatorClone, A: Allocator + Clone + std::alloc::AllocatorClone>(
+    kept: impl Iterator<Item = &'a Kept> + Clone,
+    total: u64,
+    cap: u64,
+    running: &BTreeSet<u64, R>,
+    keep: usize,
+    rule: CapRule,
+    gone: &mut BTreeSet<usize, A>,
+) {
+    let listed = || kept.clone().enumerate().filter(|(_, it)| it.listed == Listed::Listed);
+    let newest = kept.clone().last().map_or(0, |it| it.name.last);
+    // The builds kept whole, set aside before the cap is looked at: what the rule promises
+    // holds whatever the cap is. Counted over the listed files only: a file not yet listed is
+    // no reader's, and the cap does not retire it either.
+    let keep = if rule.keeps_by_count() { keep } else { 0 };
+    let held = kept_builds(listed().map(|(_, it)| it), running, keep, Global);
+    let holds = |[lo, hi]: [u64; 2]| {
+        held.get(held.partition_point(|it| *it < lo)).is_some_and(|it| *it <= hi)
+    };
+    // The build ranges, merged where they overlap: each merged range is one unit.
+    let mut ranges = Vec::new_in(Global);
+    ranges.extend(listed().filter_map(|(_, it)| builds_of(it)));
+    ranges.sort_unstable();
+    let mut merged: Vec<[u64; 2], Global> = Vec::with_capacity_in(ranges.len(), Global);
+    for [lo, hi] in ranges {
+        if let Some(last) = merged.last_mut().filter(|last| lo <= last[1]) {
+            last[1] = last[1].max(hi);
+        } else {
+            merged.push([lo, hi]);
+        }
+    }
+    // A file's unit: the merged range its builds lie in (by its low end), or itself alone.
+    let unit_of = |at: usize, kept: &Kept| -> (u64, Option<usize>) {
+        match builds_of(kept) {
+            Some([lo, _]) => {
+                let found = merged.partition_point(|it| it[0] <= lo);
+                (merged[found.saturating_sub(1)][0], None)
+            }
+            None => (0, Some(at)),
+        }
+    };
+    // Each unit: its newest flush, its bytes, and whether a build the rule keeps has rows in it.
+    // alloc: once a flush past the cap
+    let mut units: BTreeMap<(u64, Option<usize>), (u64, u64, bool)> = BTreeMap::new();
+    for (at, kept) in listed() {
+        let unit = units.entry(unit_of(at, kept)).or_insert((0, 0, false));
+        unit.0 = unit.0.max(kept.name.last);
+        unit.1 += kept.bytes;
+        unit.2 |= builds_of(kept).is_some_and(holds);
+    }
+    let no_build_first = rule.no_build_first();
+    // Sorted by whether it is a build's (those after the files of none), then by age.
+    let mut order = Vec::with_capacity_in(units.len(), Global);
+    order.extend(units.into_iter().map(|(key, (last, bytes, held))| {
+        (no_build_first && key.1.is_none(), last, key, bytes, held)
+    }));
+    order.sort_unstable();
+    // alloc: once a flush past the cap
+    let mut going = BTreeSet::new();
+    let mut left = total;
+    for &(_, last, key, bytes, held) in &order {
+        if left <= cap {
+            break;
+        }
+        // The newest flush's own files of no build stay; they protect nothing else. Until
+        // 2026-11-14 the newest flush's unit, whatever it held, was what stayed.
+        let newest_flush = last == newest && (key.1.is_some() || !rule.keeps_by_count());
+        if held || newest_flush {
+            continue;
+        }
+        left -= bytes;
+        going.insert(key);
+    }
+    if rule.kept_go_past_cap() {
+        // The planted bug: past the cap still, the kept builds that are not running go too.
+        for &(_, _, key, bytes, held) in &order {
+            if left <= cap {
+                break;
+            }
+            let live = key.1.is_none()
+                && merged
+                    .iter()
+                    .find(|it| it[0] == key.0)
+                    .is_some_and(|&[lo, hi]| running.range(lo..=hi).next().is_some());
+            if held && !live {
+                left -= bytes;
+                going.insert(key);
+            }
+        }
+    }
+    for (at, kept) in listed() {
+        if going.contains(&unit_of(at, kept)) {
+            gone.insert(at);
+        }
+    }
+}
+
+/// Whether the kept file at `at` goes with the files `gone` ([`past_cap_in`]).
+fn goes(gone: &BTreeSet<usize>, at: usize, kept: &Kept) -> bool {
+    kept.listed == Listed::Listed && gone.contains(&at)
+}
+
+/// The oldest builds retired until the rest fit under the cap ([`past_cap_in`]): a build's files
+/// go all at once, every table of it and every file that holds a row of it, so a reader of a
+/// build reads all of it or none; the running builds, the last [`super::KEEP_BUILDS`] finished
+/// and the newest flush's files of no build are kept. Retired in one commit, which also says
+/// the highest build retired ([`manifest::CappedBuilds`]), deleted once no pin holds them
+/// ([`Reap`]). What went, counted, and what is still over ([`Capped`]).
 struct Trim {
-    gone: Option<BTreeSet<(u64, Option<usize>)>>,
+    gone: Option<BTreeSet<usize>>,
     change: Change,
 }
 
@@ -1179,41 +1482,9 @@ impl Trim {
         Trim { gone: None, change: Change::new() }
     }
 
-    /// The units past the cap, oldest first, or none.
-    fn plan(st: &State) -> BTreeSet<(u64, Option<usize>)> {
-        // alloc: empty unless past the cap
-        let mut gone = BTreeSet::new();
-        // The mappings and crash records take their room first; the Parquet files the rest.
-        let cap = st.cap.saturating_sub(st.side);
-        if st.total <= cap {
-            return gone;
-        }
-        let newest = st.kept.back().map_or(0, |it| it.name.last);
-        // Each unit: its newest flush, and its bytes.
-        // alloc: once a flush past the cap
-        let mut units: BTreeMap<(u64, Option<usize>), (u64, u64)> = BTreeMap::new();
-        // A file not yet listed is the next flush's to list, not the cap's.
-        for (at, kept) in st.kept.iter().enumerate().filter(|(_, it)| it.listed == Listed::Listed) {
-            let unit = units.entry(unit_of(at, kept)).or_insert((0, 0));
-            unit.0 = unit.0.max(kept.name.last);
-            unit.1 += kept.bytes;
-        }
-        // alloc: once a flush past the cap
-        let mut order: Vec<(u64, (u64, Option<usize>), u64)> =
-            units.into_iter().map(|(key, (last, bytes))| (last, key, bytes)).collect();
-        order.sort_unstable();
-        let mut total = st.total;
-        for (last, key, bytes) in order {
-            if total <= cap {
-                break;
-            }
-            if last == newest {
-                continue;
-            }
-            total -= bytes;
-            gone.insert(key);
-        }
-        gone
+    /// The files past the cap, or none.
+    fn plan(st: &State) -> BTreeSet<usize> {
+        past_cap_in(st.kept.iter(), st.total, st.cap, &st.running, st.keep, st.rule())
     }
 
     fn resume<H: Host>(
@@ -1221,10 +1492,10 @@ impl Trim {
         cx: &mut Cx<'_, H>,
         st: &mut State,
         done: Option<Vec<Done>>,
-    ) -> Step<Result<u32, HistoryError>> {
+    ) -> Step<Result<Capped, HistoryError>> {
         let gone = self.gone.get_or_insert_with(|| Trim::plan(st));
         if gone.is_empty() {
-            return Step::Ready(Ok(0));
+            return Step::Ready(Ok(Capped { over: st.total.saturating_sub(st.cap), ..Capped::default() }));
         }
         let step = self.change.resume(cx, st, done, |_, st, held| {
             held.retire(
@@ -1234,6 +1505,17 @@ impl Trim {
                     .filter(|&(at, kept)| goes(gone, at, kept))
                     .map(|(_, kept)| kept.file.as_str()),
             );
+            let through = st
+                .kept
+                .iter()
+                .enumerate()
+                .filter(|&(at, kept)| goes(gone, at, kept))
+                .filter_map(|(_, kept)| builds_of(kept))
+                .map(|[_, hi]| hi)
+                .max();
+            if let Some(through) = through {
+                held.capped_builds(through);
+            }
             st.reaping = true;
             Ok(())
         });
@@ -1241,19 +1523,19 @@ impl Trim {
             Step::Pending => Step::Pending,
             Step::Ready(Err(error)) => Step::Ready(Err(error)),
             Step::Ready(Ok(())) => {
-                let before = st.kept.len();
                 let mut at = 0;
-                let mut bytes = 0;
+                let mut capped = Capped::default();
                 st.kept.retain(|kept| {
                     let retired = goes(gone, at, kept);
                     at += 1;
                     if retired {
-                        bytes += kept.bytes;
+                        capped.add(kept);
                     }
                     !retired
                 });
-                st.total -= bytes;
-                Step::Ready(Ok(u32::try_from(before - st.kept.len()).unwrap_or(u32::MAX)))
+                st.total -= capped.bytes;
+                capped.over = st.total.saturating_sub(st.cap);
+                Step::Ready(Ok(capped))
             }
         }
     }
@@ -1719,7 +2001,7 @@ impl Compact {
                     let Some(merge) = self.merges.pop_front() else { return Step::Ready(Ok(())) };
                     for input in &merge.inputs {
                         let file = cx.file(input);
-                        cx.ask(Wait::Merge, |tag| Effect::Map { file, tag });
+                        cx.ask(Wait::Merge, |tag| Effect::Map { file, extent: Extent::Whole, tag });
                     }
                     self.merge = Some(merge);
                     self.stage = Merging::Map;
@@ -2005,7 +2287,7 @@ impl Recover {
                                 cx.locks.push(lock);
                                 self.locks.push((pid, lock));
                                 let file = cx.file(&postmortem::file_name(pid));
-                                cx.ask(Wait::Files, |tag| Effect::Map { file, tag });
+                                cx.ask(Wait::Files, |tag| Effect::Map { file, extent: Extent::Whole, tag });
                             }
                             // Its process is alive, or another reader holds it.
                             Done::Contended => {}
@@ -2299,6 +2581,8 @@ struct Open {
     postmortem: Option<HistoryError>,
     trim: Trim,
     reap: Reap,
+    /// What the trim retired, for [`Opened::capped`].
+    capped: Capped,
 }
 
 impl Open {
@@ -2366,7 +2650,6 @@ impl Open {
             .make_contiguous()
             .sort_unstable_by(|a, b| (a.name.last, &a.file).cmp(&(b.name.last, &b.file)));
         st.total = st.kept.iter().map(|it| it.bytes).sum();
-        st.side = side_bytes(&self.listing);
         let last = st.kept.iter().map(|it| it.name.last).max().unwrap_or(0);
         st.seq = last.max(held.manifest().flushed()) + 1;
         // What a past commit consumed of a mapping or crash record since deleted is forgotten.
@@ -2607,7 +2890,10 @@ impl Open {
                 Opening::Trim => match self.trim.resume(cx, st, done.take()) {
                     Step::Pending => return Step::Pending,
                     Step::Ready(Err(error)) => return Step::Ready(Err(error)),
-                    Step::Ready(Ok(_)) => self.stage = Opening::Reap,
+                    Step::Ready(Ok(capped)) => {
+                        self.capped = capped;
+                        self.stage = Opening::Reap;
+                    }
                 },
                 Opening::Reap => match self.reap.resume(cx, st, done.take()) {
                     Step::Pending => return Step::Pending,
@@ -2618,6 +2904,7 @@ impl Open {
                             last_build: st.last_build,
                             crashes: std::mem::take(&mut self.crashes),
                             postmortem: self.postmortem.take(),
+                            capped: self.capped,
                         }))));
                     }
                 },
@@ -2635,7 +2922,7 @@ enum Flushing {
     /// A planted bug's second commit, of what the first left out.
     LateChange,
     RemoveCrashes,
-    Side,
+    RemovedCrashes,
     Compact,
     Trim,
     Reap,
@@ -2821,35 +3108,21 @@ impl FlushJob {
                         let file = cx.file(&self.removing[at]);
                         cx.ask(Wait::Files, |tag| Effect::Remove { file, tag });
                     }
-                    self.stage = Flushing::Side;
+                    self.stage = Flushing::RemovedCrashes;
                     return Step::Pending;
                 }
-                Flushing::Side => {
+                Flushing::RemovedCrashes => {
+                    // The deletes' completions: one that failed is consumed already, and the
+                    // next open deletes it unread.
                     let done = round(done.take());
-                    if !self.removing.is_empty() {
-                        // The deletes' completions: one that failed is consumed already, and
-                        // the next open deletes it unread.
-                        for (name, it) in std::mem::take(&mut self.removing).into_iter().zip(done) {
-                            if let Done::Failed(error) = it {
-                                self.out.undeleted.push(crash::CrashError::Io {
-                                    path: cx.path(&name),
-                                    doing: "deleting a recovered crash record",
-                                    error: io::Error::other(error.0),
-                                });
-                            }
+                    for (name, it) in std::mem::take(&mut self.removing).into_iter().zip(done) {
+                        if let Done::Failed(error) = it {
+                            self.out.undeleted.push(crash::CrashError::Io {
+                                path: cx.path(&name),
+                                doing: "deleting a recovered crash record",
+                                error: io::Error::other(error.0),
+                            });
                         }
-                        // Crash records deleted since the cap last counted them.
-                        let dir = cx.dir.clone(); // clone: a refcount
-                        cx.ask(Wait::Files, |tag| Effect::List { dir, tag });
-                        return Step::Pending;
-                    }
-                    // The listing: one that fails leaves the count as it was, said.
-                    let Some(it) = done.into_iter().next() else {
-                        unreachable!("one completion an effect")
-                    };
-                    match listing(cx, it) {
-                        Ok(listing) => st.side = side_bytes(&listing),
-                        Err(error) => self.out.deferred.push(error),
                     }
                     self.compact = Some(Compact::new(st, self.ended));
                     self.stage = Flushing::Compact;
@@ -2875,8 +3148,8 @@ impl FlushJob {
                 }
                 Flushing::Trim => match self.trim.resume(cx, st, done.take()) {
                     Step::Pending => return Step::Pending,
-                    Step::Ready(Ok(deleted)) => {
-                        self.out.deleted = deleted;
+                    Step::Ready(Ok(capped)) => {
+                        self.out.capped = capped;
                         self.stage = Flushing::Reap;
                     }
                     Step::Ready(Err(error)) => {
@@ -2914,19 +3187,19 @@ impl FlushJob {
 
 #[derive(Clone, Copy)]
 enum Recounting {
-    Start,
-    List,
     Trim,
     Reap,
 }
 
-/// The side files counted again (the recorder's mapping was just made), then the cap and the
-/// reap.
+/// The cap applied again (it was just set anew), then the reap. No listing: only the Parquet
+/// files the manifest lists count against the cap, and those are already counted.
 struct Recount {
+    /// The new cap, taken into the state the first time the job runs.
+    cap: Option<u64>,
     stage: Recounting,
     trim: Trim,
     reap: Reap,
-    deleted: u32,
+    capped: Capped,
 }
 
 impl Recount {
@@ -2936,26 +3209,16 @@ impl Recount {
         st: &mut State,
         mut done: Option<Vec<Done>>,
     ) -> Step<Result<Outcome, HistoryError>> {
+        if let Some(cap) = self.cap.take() {
+            st.cap = cap;
+        }
         loop {
             match self.stage {
-                Recounting::Start => {
-                    let dir = cx.dir.clone(); // clone: a refcount
-                    cx.ask(Wait::Files, |tag| Effect::List { dir, tag });
-                    self.stage = Recounting::List;
-                    return Step::Pending;
-                }
-                Recounting::List => {
-                    match listing(cx, only(done.take())) {
-                        Ok(listing) => st.side = side_bytes(&listing),
-                        Err(error) => return Step::Ready(Err(error)),
-                    }
-                    self.stage = Recounting::Trim;
-                }
                 Recounting::Trim => match self.trim.resume(cx, st, done.take()) {
                     Step::Pending => return Step::Pending,
                     Step::Ready(Err(error)) => return Step::Ready(Err(error)),
-                    Step::Ready(Ok(deleted)) => {
-                        self.deleted = deleted;
+                    Step::Ready(Ok(capped)) => {
+                        self.capped = capped;
                         self.stage = Recounting::Reap;
                     }
                 },
@@ -2963,7 +3226,7 @@ impl Recount {
                     return match self.reap.resume(cx, st, done.take()) {
                         Step::Pending => Step::Pending,
                         Step::Ready(Err(error)) => Step::Ready(Err(error)),
-                        Step::Ready(Ok(_)) => Step::Ready(Ok(Outcome::Recounted(Ok(self.deleted)))),
+                        Step::Ready(Ok(_)) => Step::Ready(Ok(Outcome::Recounted(Ok(self.capped)))),
                     };
                 }
             }
@@ -3559,8 +3822,12 @@ impl<H: Host> Files<H> {
                 cap: u64::MAX,
                 kept: VecDeque::new(),
                 total: 0,
-                side: 0,
+                keep: super::KEEP_BUILDS,
+                #[cfg(test)]
+                rule: CapRule::Kept,
                 last_build: 0,
+                // alloc: empty until a build starts
+                running: BTreeSet::new(),
                 seq: 1,
                 reaping: false,
                 manifest: Manifest::new(),
@@ -3583,6 +3850,19 @@ impl<H: Host> Files<H> {
     #[cfg(test)]
     pub(crate) fn plant(&mut self, plant: Plant) {
         self.plant = plant;
+    }
+
+    /// How many finished builds the cap keeps whole: a test draws a small number so the cap
+    /// meets builds beyond them within a few steps.
+    #[cfg(test)]
+    pub(crate) fn keep_builds(&mut self, keep: usize) {
+        self.state.keep = keep;
+    }
+
+    /// The rule the cap retires by: a test plants a wrong one to show its oracle catches it.
+    #[cfg(test)]
+    pub(crate) fn cap_rule(&mut self, rule: CapRule) {
+        self.state.rule = rule;
     }
 
     pub(crate) fn host(&self) -> &H {
@@ -3618,6 +3898,22 @@ impl<H: Host> Files<H> {
         self.state.last_build = self.state.last_build.max(build);
     }
 
+    /// Notes that build `build` started (`running`) or ended: while it runs, the cap retires
+    /// no file that holds a row of it.
+    /// Whether that changed what is noted: a second start of a build, or an end of one
+    /// never noted as started, does not.
+    pub(crate) fn running(&mut self, build: u64, running: bool) -> bool {
+        match running {
+            true => self.state.running.insert(build),
+            false => self.state.running.remove(&build),
+        }
+    }
+
+    /// Whether any build is noted as running.
+    pub(crate) fn any_running(&self) -> bool {
+        !self.state.running.is_empty()
+    }
+
     fn push(&mut self, job: Job) {
         self.queue.push_back(job);
         if self.running.is_none() {
@@ -3649,6 +3945,7 @@ impl<H: Host> Files<H> {
             postmortem: None,
             trim: Trim::new(),
             reap: Reap::new(),
+            capped: Capped::default(),
         })));
     }
 
@@ -3676,13 +3973,16 @@ impl<H: Host> Files<H> {
         })));
     }
 
-    /// Counts the side files again, then the cap and the reap: [`Outcome::Recounted`].
-    pub(crate) fn recount(&mut self) {
+    /// Holds the history to `cap` bytes from now on, then applies the cap and the reap:
+    /// [`Outcome::Recounted`]. The cap is set when the job runs, not when it is asked for, so a
+    /// flush queued before it trims by the cap it was queued under.
+    pub(crate) fn set_cap(&mut self, cap: u64) {
         self.push(Job::Recount(Box::new(Recount {
-            stage: Recounting::Start,
+            cap: Some(cap),
+            stage: Recounting::Trim,
             trim: Trim::new(),
             reap: Reap::new(),
-            deleted: 0,
+            capped: Capped::default(),
         })));
     }
 

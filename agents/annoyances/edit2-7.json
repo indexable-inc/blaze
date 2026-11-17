@@ -1,0 +1,11 @@
+{
+ "id": "edit2-7",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+ "where": "blaze: the profile's rows of a link",
+ "what": "The spans of one `unit link` did not line up (`3 spans with no parent row, 26 past their parent`), and 13.7 ms at its end, the `Built` and its 12,000 functions being freed, was under no span: `blaze slow` printed no finding for it. It was found only by grouping the CPU samples by frame (`drop_glue::<CompiledFunction>`).",
+ "cost": "half an hour before the drop was seen at all",
+ "cause": "a value dropped at the end of a task is inside the task's span and under no span of its own",
+ "workaround": "a query over `samples` joined to `spans`, by innermost frame",
+ "state": "fixed for this drop (the `Built` goes back to the driver, edit2-1111); open for the next large drop"
+}

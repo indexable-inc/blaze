@@ -1117,10 +1117,10 @@ fn probed(kind: Probe) -> Result<(), String> {
 /// Makes a sandbox around nothing, as `kind` says: `Ok` when it could be made, why not
 /// otherwise, with what would let it be where that is known.
 fn probe(kind: Probe) -> Result<(), String> {
+    // alloc: the probe's directory, once per process; the error, once, names it.
+    let made = blaze_core::temp::TempDir::new("blaze-sandbox-probe-").map_err(|it| it.to_string())?;
     // alloc: the probe's directory, once per process.
-    let dir = std::env::temp_dir().join(format!("blaze-sandbox-probe-{}", std::process::id()));
-    // alloc: the error, once.
-    std::fs::create_dir_all(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
+    let dir = made.path().to_path_buf();
     // The probe's spec, once per process: the directory is each of its parts.
     let spec = match kind {
         // clone: the probe's spec, once per process.
@@ -1154,7 +1154,7 @@ fn probe(kind: Probe) -> Result<(), String> {
         Probe::Writable | Probe::Overlays => Also::default(),
     };
     let ended = backend(&spec, None, also);
-    _ = std::fs::remove_dir_all(&dir);
+    drop(made);
     let restricted =
         std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns");
     let hint = match restricted.is_ok_and(|it| it.trim() == "1") {
@@ -1264,12 +1264,11 @@ mod tests {
     /// the live record too, which a line seen before is not appended to again.
     #[test]
     fn a_line_seen_before_allocates_nothing() {
-        let dir = std::env::temp_dir().join(format!("blaze-record-budget-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = blaze_core::temp::TempDir::for_test("blaze-record-budget-");
         let live = dir.join("live");
         std::fs::write(&live, "").unwrap();
         let spec = Spec { overlays: vec!["/ws".into()], record_reads: true, ..Spec::default() };
-        let mut recorder = Recorder::new(&spec, &["/tmp"]);
+        let mut recorder = Recorder::new(&spec, &["/own"]);
         recorder.live(&live).unwrap();
         recorder.interposed();
         let seen = |recorder: &mut Recorder| {
@@ -1297,7 +1296,6 @@ mod tests {
         });
         assert_eq!(std::fs::read_to_string(&live).unwrap(), written, "no line twice");
         assert_eq!(recorder.live_failed(), None);
-        _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A process's call of a kind is described once, a run's calls and programs up to their
@@ -1374,36 +1372,34 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_container_is_known_by_its_marks() {
-        let root =
-            std::env::temp_dir().join(format!("blaze-container-test-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&root);
+        let made = blaze_core::temp::TempDir::for_test("blaze-container-test-");
+        let root = made.path();
         std::fs::create_dir_all(root.join("proc/1")).unwrap();
         std::fs::create_dir_all(root.join("run")).unwrap();
-        assert_eq!(container(&root, None), None);
-        assert_eq!(container(&root, Some("")), None);
-        assert_eq!(container(&root, Some("podman")).as_deref(), Some("`container=podman`"));
+        assert_eq!(container(root,None), None);
+        assert_eq!(container(root,Some("")), None);
+        assert_eq!(container(root,Some("podman")).as_deref(), Some("`container=podman`"));
         std::fs::write(root.join("proc/1/cgroup"), "0::/\n").unwrap();
-        assert_eq!(container(&root, None), None);
+        assert_eq!(container(root,None), None);
         std::fs::write(root.join("proc/1/cgroup"), "12:pids:/kubepods/burstable/pod1/abc\n")
             .unwrap();
-        assert_eq!(container(&root, None).as_deref(), Some("/proc/1/cgroup naming kubepods"));
+        assert_eq!(container(root,None).as_deref(), Some("/proc/1/cgroup naming kubepods"));
         std::fs::write(root.join("run/.containerenv"), "").unwrap();
-        assert_eq!(container(&root, None).as_deref(), Some("/run/.containerenv"));
+        assert_eq!(container(root,None).as_deref(), Some("/run/.containerenv"));
         std::fs::write(root.join(".dockerenv"), "").unwrap();
-        let known = container(&root, Some("podman")).unwrap();
+        let known = container(root,Some("podman")).unwrap();
         assert_eq!(known, "/.dockerenv");
         let hint = container_hint(&known);
         assert!(hint.contains("container (/.dockerenv)"), "{hint}");
         assert!(hint.contains("--security-opt seccomp=unconfined"), "{hint}");
         assert!(hint.contains("`BLAZE_SANDBOX=off`"), "{hint}");
-        _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(unix)]
     #[test]
     fn a_socket_the_read_set_names_may_be_connected_to_and_nothing_below_it() {
         let spec = Spec { readable: vec!["/req/1/s".into()], ..Spec::default() };
-        let recorder = Recorder::new(&spec, &["/tmp"]);
+        let recorder = Recorder::new(&spec, &["/own"]);
         assert!(recorder.may_connect("/req/1/s"));
         assert!(!recorder.may_connect("/req/1/s/x") && !recorder.may_connect("/req/1/t"));
     }
@@ -1418,7 +1414,7 @@ mod tests {
             record_reads: true,
             ..Spec::default()
         };
-        let mut recorder = Recorder::new(&spec, &["/proc", "/tmp"]);
+        let mut recorder = Recorder::new(&spec, &["/proc", "/own"]);
         recorder.read(1, "/etc/hosts");
         recorder.read(1, "/bin/t");
         recorder.read(1, "/ws/target/t");
@@ -1436,13 +1432,12 @@ mod tests {
         assert!(!recorder.marked(7, 1, b"/.blaze-env/HOME"), "no interposer, no variables");
         recorder.listed(7, "/ws/src");
         recorder.untraceable(7, blaze_core::Untraceable::Random);
-        assert!(recorder.may_write("/ws/target/x") && recorder.may_write("/tmp"));
+        assert!(recorder.may_write("/ws/target/x") && recorder.may_write("/own"));
         assert!(!recorder.may_write("/wsx") && !recorder.may_write("/etc/x"));
-        assert!(recorder.may_connect("/tmp/s.sock") && recorder.may_connect("/ws/target/s"));
+        assert!(recorder.may_connect("/own/s.sock") && recorder.may_connect("/ws/target/s"));
         assert!(!recorder.may_connect("/proc/1/root/run/docker.sock"));
         assert!(!recorder.may_connect("/run/docker.sock") && !recorder.may_connect("/etc/s"));
-        let dir = std::env::temp_dir().join(format!("blaze-record-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = blaze_core::temp::TempDir::for_test("blaze-record-test-");
         let file = dir.join("record");
         recorder.write(&file);
         let text = std::fs::read_to_string(&file).unwrap();
@@ -1459,25 +1454,23 @@ mod tests {
             lines[4],
             Line { reached: Reached::Read, test: "tests::a".into(), what: "/ws/data.txt".into() }
         );
-        _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
     #[test]
     fn the_live_record_has_each_line_once_as_it_is_seen() {
-        let dir = std::env::temp_dir().join(format!("blaze-live-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = blaze_core::temp::TempDir::for_test("blaze-live-test-");
         let live = dir.join("live");
         std::fs::write(&live, "E\t\t*\n").unwrap();
         let spec = Spec { overlays: vec!["/ws".into()], record_reads: true, ..Spec::default() };
-        let mut recorder = Recorder::new(&spec, &["/tmp"]);
+        let mut recorder = Recorder::new(&spec, &["/own"]);
         recorder.live(&live).unwrap();
         recorder.interposed();
         assert!(recorder.marked(7, 7, b"/.blaze-test/tests::a"));
         recorder.read(7, "/ws/a");
         assert_eq!(std::fs::read_to_string(&live).unwrap(), "E\t\t*\nR\ttests::a\t/ws/a\n");
         recorder.read(7, "/ws/a");
-        recorder.read(7, "/tmp/scratch");
+        recorder.read(7, "/own/scratch");
         assert!(recorder.marked(7, 7, b"/.blaze-env/HOME"));
         assert!(recorder.marked(8, 7, b"/.blaze-clock"));
         recorder.listed(7, "/ws");
@@ -1497,7 +1490,6 @@ mod tests {
             ]
         );
         assert_eq!(recorder.live_failed(), None);
-        _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

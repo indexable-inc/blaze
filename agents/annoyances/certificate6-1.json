@@ -1,0 +1,20 @@
+{
+ "id": "A-certificate6-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane certificate6",
+ "where": "crates/blaze-cargo/src/serve/job.rs (Jobs::add), serve/plane.rs, serve/job/certify.rs",
+ "what": "Nothing can run off the daemon's loop unless a job owns it: a plane task is added to a job's request (Jobs::add needs self.jobs[id].request). So a request certificate's check, which is made before there is a job, can only use the loop's own effects (Stat, ReadAll): an output no stamp vouches for is hashed on the loop, an outside read no watch vouches for is hashed on the loop, and the library's fingerprint after a restart can only be taken by making the request a job first (1 job and 1 task where the bar is 0).",
+ "cost": "gap B closed short of the bar; gap C not closed by three lanes in a row; after a restart every output and every outside file of a certificate is hashed on the loop",
+ "cause": "the plane's unit of work is a job's task; the daemon has no work of its own",
+ "whys": [
+  "why hashed on the loop: the check has no job and only a job has tasks",
+  "why no job: the check is what decides whether there is one",
+  "why only a job has tasks: Jobs::add routes a batch's completions by job id",
+  "why: the daemon was built as a server of jobs, with nothing it does for itself (a start-up look, a check)"
+ ],
+ "class": "work that belongs to the daemon, not to a request, has no owner and so lands on the loop or is bolted onto the first job",
+ "prevention": "one plane request of the daemon's own, opened as it starts: its tasks (the library's look, a certificate check's hashes) complete to the loop with a typed value and no job",
+ "workaround": "a request that comes before the library is looked at becomes a job of one stage and is checked when it is in (Jobs::certify_late)",
+ "fix": "none yet: written as the next gap in docs/v2/plan/design/certificate.md, State, and /tmp/certificate6/next.md",
+ "state": "open"
+}

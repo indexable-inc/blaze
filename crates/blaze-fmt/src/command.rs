@@ -51,7 +51,7 @@ pub fn main(args: Vec<String>) -> i32 {
         let mut words: Vec<String> = rest.iter().map(|it| (*it).clone()).collect();
         words.extend(files);
         if let Some(edition) = edition {
-            words.extend(["--edition".to_owned(), edition.to_string()]);
+            words.extend(["--edition".to_owned(), edition.rust_syntax()]);
         }
         let status = crate::cli::main(words);
         if code == 0 {

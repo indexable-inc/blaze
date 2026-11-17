@@ -1,0 +1,14 @@
+about = "A second home whose store is a copy of the first's (the layer another machine fetched) runs the program making only its own code: the standard library's functions are bound from their records under keys that hold what this home calls the files, so the only functions made are the workspace's the run calls, and no build walks. A bind key that missed an input would serve a record made otherwise; `a_launched_run_of_six_dependencies_prints_what_the_built_program_prints` is the case where that shows in the output."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "SECOND\n"
+spans = { "codegen walk" = 0 }
+
+[[revision]]
+steps = ["home second"]
+action = "run"
+prints = "SECOND\n"
+redone_within = ["app::main", "app::shout"]
+spans = { "codegen walk" = 0 }

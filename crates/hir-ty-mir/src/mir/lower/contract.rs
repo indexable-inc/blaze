@@ -291,7 +291,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 None => "a value of the body".to_owned(), // alloc: error path
             };
             not_supported!(
-                "checking the `ensures` of `{path}` at run time: the clause `{text}` moves out                  of {what}, which is still used after the clause: read it by reference (`match                  &r {{ .. }}`, a `ref` binding, a method that takes `&self`)"
+                "checking the `ensures` of `{path}` at run time: the clause `{text}` moves out \
+                 of {what}, which is still used after the clause: read it by reference (`match \
+                 &r {{ .. }}`, a `ref` binding, a method that takes `&self`)"
             );
         }
         Ok(())
@@ -339,6 +341,12 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
 
     /// What the abort of a broken `clause` says: the function, the clause as written, and
     /// where.
+    #[expect(
+        blaze::reads_positions,
+        reason = "a broken contract's abort message carries the clause's file, line and column into the \
+                  lowered MIR, so the body's MIR changes on an edit above it: the place must come from a \
+                  `Location` the link fills, as `line!()`'s does (`location::slots_lines`)"
+    )]
     fn broken_message(&self, func: FunctionId, kind: SpecClauseKind, clause: ExprId) -> String {
         let path = self.fn_path(func);
         let text = hir_def::expr_store::pretty::print_expr_hir(

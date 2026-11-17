@@ -1,7 +1,7 @@
 //! The evaluator's word is the evaluated crate's: a `usize` and an address take as many bytes
 //! as its target's data layout says, whichever crate the process evaluated before.
 
-use hegel::{TestCase, generators as gs};
+use blaze_sim::Config;
 
 use super::*;
 
@@ -36,14 +36,16 @@ const GOAL: u64 = (!0usize) as u64;
 }
 
 /// No crate's word leaks into another's: one process evaluates wasm32 and native crates in an
-/// order Hegel picks, and each sees its own.
-#[hegel::test]
-fn a_crates_word_is_its_own_whatever_ran_before(tc: TestCase) {
-    let order: Vec<bool> = tc.draw(gs::vecs(gs::booleans()).min_size(1).max_size(6));
-    for wasm in order {
-        match wasm {
-            true => check_number(WASM32, 408),
-            false => check_number(NATIVE, 816),
+/// order the tape picks, and each sees its own.
+#[test]
+fn a_crates_word_is_its_own_whatever_ran_before() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let order: Vec<bool> = tape.vec(1..=6, "order", |tape| tape.bool("wasm"));
+        for wasm in order {
+            match wasm {
+                true => check_number(WASM32, 408),
+                false => check_number(NATIVE, 816),
+            }
         }
-    }
+    })
 }

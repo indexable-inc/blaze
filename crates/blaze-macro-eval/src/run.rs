@@ -119,6 +119,8 @@ pub(crate) struct Expansion<'a> {
     pub(crate) inputs: &'a [Stream],
     /// The def, call and mixed sites.
     pub(crate) sites: [Span; 3],
+    /// The table the sites' contexts are words of: the calling crate's arena.
+    pub(crate) contexts: blaze_memo::ArenaId,
     pub(crate) edition: Edition,
     /// Whether the calling crate enables `forced_keywords`.
     pub(crate) forced_keywords: bool,
@@ -129,8 +131,8 @@ pub(crate) struct Expansion<'a> {
 pub(crate) struct Ran {
     /// The output, or the macro's panic message.
     pub(crate) output: Result<Stream, String>,
-    /// Whether it learned of a span what its key does not say.
-    pub(crate) asked: bool,
+    /// What it first learned of a span that its key does not say, if anything.
+    pub(crate) asked: Option<crate::server::Asked>,
     pub(crate) tracked: Vec<String>,
     pub(crate) emitted: Vec<Emitted>,
     /// What it read, each line as `assemble_seen` takes it.
@@ -244,7 +246,7 @@ struct Memory<'a, 'db> {
 /// `error` as the expansion's error. Its types print through the attached database, so it is
 /// rendered with `db` attached: the caller may run outside any attach (the daemon's loop).
 pub(crate) fn stop_of(db: &Db, error: &MirEvalError<'_>) -> Stop {
-    blaze_query::db::attach(db, || Stop(describe::describe(db, error)))
+    blaze_memo::attach(db, || Stop(describe::describe(db, error)))
 }
 
 impl Guest for Memory<'_, '_> {
@@ -448,7 +450,7 @@ fn evaluate(
         return Err(Stop("was given nothing to expand".to_owned())); // alloc: error path
     };
     let state = RefCell::new(State {
-        server: Server::new(last.sites, last.edition, last.forced_keywords),
+        server: Server::new(last.sites, last.contexts, last.edition, last.forced_keywords),
         os: Os::in_dir(env, cwd),
         shims: HashMap::new_in(Global),
         stop: None,
@@ -459,7 +461,7 @@ fn evaluate(
     // The evaluator's error borrows the state; made a `Stop` before the state is taken back.
     // Attached, as a query's run is: a run ahead (`speculate`) is on a pool task outside any
     // query, and the evaluator's errors and logs format the types they name.
-    let output = blaze_query::db::attach(db, || {
+    let output = blaze_memo::attach(db, || {
         on_evaluator(db, what, bridge, &state, preset, expansions, spent).map_err(|e| {
             spent.over = over_budget(&e);
             stop_of(db, &e)
@@ -558,8 +560,12 @@ fn expand_all<'db>(
     let mut config = Vec::new(); // alloc: once per run, as above
     for (at, expansion) in expansions.iter().enumerate() {
         if at > 0 {
-            state.borrow_mut().server =
-                Server::new(expansion.sites, expansion.edition, expansion.forced_keywords);
+            state.borrow_mut().server = Server::new(
+                expansion.sites,
+                expansion.contexts,
+                expansion.edition,
+                expansion.forced_keywords,
+            );
             spent.steps += eval.steps_spent();
             eval.set_budget(budget);
         }

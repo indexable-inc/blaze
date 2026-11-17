@@ -1,0 +1,14 @@
+{
+ "id": "body-entries-session-per-serve",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of 4c T2+T3, int-1112",
+ "where": "crates/blaze-cargo/src/serve/front_carry.rs bodies::serve, crates/hir-ty/src/body_store/entries.rs Posted",
+ "what": "Each serve of a crate's body entries built a new kernel session and hashed and mapped every file again, and its rows answered only at the revision they were posted at: a body edit under dependents looked up every body's every step again (12,234 of 12,246 inferences rerun on reth, 58-77 s). Making the session carried needed three things the tree lacked at once: a home for per-crate state between serves (the deps Session had none), a way for unreached rows to answer at the next revision (Posted was keyed by revision only), and a way to say each read kind's difference without a producer for every kind (BodyDelta had an always-dirty path).",
+ "cost": "the 4c plan's T2 spans hir-ty, front_carry, deps, unit, compile, work, job and local in one batch",
+ "cause": "the serve was written as a pure lookup over a fresh world, so the state an incremental serve needs had no owner",
+ "class": "a step written stateless per call where its cost is only small if it keeps what it saw last time",
+ "prevention": "a driver of the kernel owns its session per container from the start (bodies::Sessions, lent per crate); rows answer under a stamp the driver gives once it has unposted what moved",
+ "workaround": "none",
+ "fix": "bodies::Kept (session, file map, posted rows) lent through Sessions; entries::stamp(db, krate, since) and unpost; BodyDelta::say values every kind no producer says; the session root marked per crate once durable (local::BodiesMark, Jobs::body_sessions). Controls: KEEP_ALL, CLEAN_IDENTITIES, MARK_EARLY.",
+ "state": "written, not yet compiled"
+}

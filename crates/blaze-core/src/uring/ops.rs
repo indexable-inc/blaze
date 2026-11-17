@@ -113,6 +113,9 @@ pub(super) const STOPPING: u8 = 1 << 1;
 /// that bypasses the page cache, and the open of its file ([`POSITIONAL`]): asked for by its
 /// effect ([`crate::Cache::Bypassed`]), never chosen by the driver.
 pub(super) const DIRECT: u8 = 1 << 2;
+/// A [`Kind::Sync`] of the file's data alone ([`crate::Effect::Barrier`]: `IORING_FSYNC_DATASYNC`,
+/// `fdatasync`), told as [`crate::Done::Ordered`] (the bit [`DIRECT`] is).
+pub(super) const DATA: u8 = 1 << 2;
 /// The output pipe read is the spawn's standard error.
 pub(super) const STDERR: u8 = 1 << 3;
 /// Its names are in the second of [`Paths`]' arenas.
@@ -145,8 +148,20 @@ pub(super) const NOT_REGULAR: u8 = 1 << 3;
 /// ([`Kind::ReadInto`], [`Kind::WriteFrom`]): opened without `O_APPEND`, which on Linux puts a
 /// positional write at the end, and with [`DIRECT`] `O_DIRECT` (the bit [`WHOLE`] is).
 pub(super) const POSITIONAL: u8 = 1 << 3;
+/// A [`Kind::Open`] of a kept file for a sync or a barrier alone, of a name no request kept:
+/// `O_RDONLY`, as a file sealed read-only refuses an open for writing (`Kept::read_only`; the
+/// bit [`FINISHED`] is).
+pub(super) const READ_ONLY: u8 = 1 << 6;
 /// A [`Kind::ReadInto`] at `IOPRIO_CLASS_IDLE` (the bit [`WHOLE`] is).
 pub(super) const IDLE: u8 = 1 << 3;
+/// A [`Kind::ReadInto`] that is one part of an [`crate::Effect::ReadMany`]: its tag is the
+/// batch's, its part's index is in its cold record's `names[3]`, and its end is told to the
+/// batch, not as a completion of its own (the bit [`SECOND`] is; a read has no path names).
+pub(super) const PART: u8 = 1 << 4;
+/// A [`Kind::Map`] of a range of the file, its offset in the cold record's `at` and its length
+/// in `names[3]` (low half) and `names[4]` (high half) (the bit [`FINISHED`] and [`READ_ONLY`]
+/// are, a send's and an open's).
+pub(super) const RANGE: u8 = 1 << 6;
 
 /// In [`Cold::slots`]: none.
 pub(super) const NO_SLOT: u32 = u32::MAX;
@@ -169,7 +184,8 @@ pub(super) struct Hot {
     /// [`ABANDONED`], [`STOPPING`], [`DIRECT`], [`STDERR`], [`SECOND`], [`ZERO_COPY`],
     /// [`FINISHED`], [`WHOLE`], [`MAKE`], [`MADE`], [`NO_FOLLOW`] (a [`Kind::Stat`]'s) and
     /// [`NOT_REGULAR`] (a [`Kind::Clone`]'s). The last two share [`WHOLE`]'s (and [`STDERR`]'s)
-    /// bit, read only for those kinds.
+    /// bit, read only for those kinds; [`READ_ONLY`] (a [`Kind::Open`]'s) shares
+    /// [`FINISHED`]'s.
     pub flags: u8,
     /// The links asked of the kernel whose last completion is not in yet, a bit each.
     pub links: u8,
@@ -280,6 +296,8 @@ impl Ops {
         self.hot.contains(id)
     }
 
+    /// How many operations are in flight: what the tests compare with their model.
+    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.hot.len()
     }

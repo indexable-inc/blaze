@@ -1,6 +1,6 @@
 ---
 name: changing-code
-description: "How a change that spans the tree is made: moves through blaze-lints bans and `blaze check --fix`/`--replace`, whole ports of shared signatures, one concept in one home, the best long-term design, and a spec before a design. Load before renaming or moving a type, path or API, changing a shared signature, removing a duplicate, or choosing a design. Tests for persisted, durable or concurrent state are the `testing` skill."
+description: "How a change that spans the tree is made: a type before a lint before a rule, moves through blaze-lints bans and `blaze check --fix`/`--replace`, Rust edited only with edit tools or `ast-grep`, whole ports of shared signatures, one concept in one home, the best long-term design, a spec before a design, and stopping at the second fix to one mechanism. Load before renaming or moving a type, path or API, changing a shared signature, adding a lint, removing a duplicate, fixing a mechanism a second time, or choosing a design. Tests for persisted, durable or concurrent state are the `testing` skill."
 ---
 
 # Changing code across blaze
@@ -9,18 +9,31 @@ description: "How a change that spans the tree is made: moves through blaze-lint
 
 ## fix-through-blaze-lints (rule 13)
 
-A change that moves a type, path, API or idiom across the code is a ban with a `replacement` in
-`.clippy.toml` (mirrored in the hot crates' `clippy.toml`), which blaze-lints'
-`disallowed_types`/`disallowed_methods`/`disallowed_macros` enforce with a MachineApplicable fix, or
-a `blaze::` lint where the rule needs types or MIR; either is applied with `blaze check --fix`, and
-its count lives in `crates/blaze-lints/baselines/`, which may only shrink (the merge gate's
-`lint-baselines` job, docs/cargo.md#lints, holds them, and its `blaze.<lint>.txt` files are the
-ratchet's: every blaze lint is `deny` except in the crates a file lists,
+Reach for astlog first for any change of many sites, and for the question before it. astlog is
+blaze's Datalog over its own syntax trees and semantic database
+(docs/v2/plan/design/astlog-sema.md): a rules file under tools/astlog/rules/ matches Rust code
+patterns with `$name` metavariables and joins them with what the front end knows (`type-of`,
+`resolves`, `callee`, `implements`, `references`, enclosing items), so a rule says what the code
+means, not how it is spelled. Before a refactor, a query (`blaze check --query FILE`) lists every
+site the change must touch, the hard ones included (every expression of an id type cast to an
+integer or used as an index, say), so they are known up front and not found by breaking the build;
+then the same file's `(rewrite ..)` actions make the edit (`blaze check --rules FILE`, `--dry-run`
+first, the diff read), and the file is checked in so the change can be run again and reviewed
+against intent. Do not write a one-off script that loops over compile errors, and do not hand a
+mechanical change of many sites to lanes to make by hand: write the rule. Where blaze cannot yet
+check a crate, say so, fix that, and use the compiler's error list for that crate meanwhile. A
+change that moves a type, path, API or idiom across the code and must keep holding afterward is a
+ban with a `replacement` in `.clippy.toml` (mirrored in the hot crates' `clippy.toml`), which
+blaze-lints' `disallowed_types`/`disallowed_methods`/`disallowed_macros` enforce with a
+MachineApplicable fix, or a `blaze::` lint where the rule needs types or MIR; either is applied with
+`blaze check --fix`, and its count lives in `crates/blaze-lints/baselines/`, which may only shrink
+(the merge gate's `lint-baselines` job, docs/cargo.md#lints, holds them, and its `blaze.<lint>.txt`
+files are the ratchet's: every blaze lint is `deny` except in the crates a file lists,
 docs/lints.md#workspace-levels-and-the-ratchet); a one-off move of a path is `blaze check --replace
 A=B`. Both find code by name resolution (imports, renames, globs, re-exports, macro output), never
-by text, and leave it compiling and lint-clean, so the rule keeps holding after the port. `sed`,
-`rg` replace and syntax-only rewriters (astlog) are for syntax-only shapes, scoped and checked by a
-build afterward.
+by text, and leave it compiling and lint-clean, so the rule keeps holding after the port. A shape
+that is syntax only goes through `ast-grep` (or astlog), scoped and checked by a build afterward;
+never `sed`, `rg` replace or a script that rewrites Rust as text (`edit-rust-by-syntax`).
 
 ## whole-ports (rule 24)
 
@@ -31,10 +44,12 @@ half-ported tree blocks every lane's run.
 
 ## best-long-term-design (rule 28)
 
-Pick the best long-term design, not the least work: own the layer or port rustc's rule properly, and
-spend the effort on proving it right: real crates' own test suites passing under blaze, Hegel
-property tests and deterministic simulation of blaze's own invariants (`testing` skill), and fuzzing
-of parsers of hostile bytes.
+Build only what you are proud of, on the first iteration too: the first version of a design is
+already the one you would defend, never a placeholder to improve later; then iterate. Pick the best
+long-term design, not the least work: own the layer or port rustc's rule properly, and spend the
+effort on proving it right: real crates' own test suites passing under blaze, property tests and
+deterministic simulation of blaze's own invariants (`testing` skill), and fuzzing of parsers of
+hostile bytes.
 
 See [docs/contributing.md#what-a-change-needs](../../../docs/contributing.md#what-a-change-needs).
 
@@ -72,7 +87,18 @@ instruction that says what to do instead, or a change to the interface so the mi
 expressed. The fix is not done until the guard exists and has been run over the whole tree. Do it
 proactively: you do not wait to be asked, and you say in your report what the cause was and what now
 guards it. A guard that only describes the one instance you found is not one; state the general rule
-it enforces.
+it enforces. Do it for small things as much as large: a command that needed a flag you forgot, a
+test that passed while running nothing, a number that had to be retracted, a file that two lanes
+both edited. The method is five whys, written down: why did it happen; why was that possible; why
+did nothing catch it; why was the easy path the wrong one; why does the system have that shape. Stop
+when the answer is a property of the design rather than an event (`the test filter matched nothing`
+is an event; `a run that executes zero checks reports success` is a property). Then name the class
+(every instance that property allows, not the one you met), and choose the strongest prevention you
+can build, in the order `type-then-lint-then-rule` gives. Then solve it: build the prevention in the
+same change or the next, run it over the whole tree, and land it; do not stop at the write-up.
+Record the chain in the annoyance's row under `agents/annoyances/` (`whys`, `class`, `prevention`),
+so the next agent sees the class, not the anecdote. When several rows share a class, that class is
+the work: one architectural change, not one patch per row.
 
 See [docs/contributing.md#what-a-change-needs](../../../docs/contributing.md#what-a-change-needs).
 
@@ -104,5 +130,166 @@ invites the mistake (`own-the-language`). The size of the right fix is not a rea
 wrong one (`best-long-term-design`); if it is large, say so, start it, and give it a ledger row. Say
 in the change what the unease was and what cause was removed, so the next reader does not rediscover
 it.
+
+## sota-first (rule 62)
+
+When something is behind the state of the art, do not improve it a notch at a time. Work out what
+the best known design is (read the competitor's code, the literature, the profile), decide the end
+state, and build that end state directly: split it into its independent pieces and run them at once
+in parallel lanes (`agents-are-a-cost`), merge them into one tree, verify, measure. An intermediate
+version is built only where the end state cannot be reached without it or where it is itself the
+measurement that decides the design; it is never the plan. Incremental polishing of a design that is
+known to be the wrong shape is waste: replace the shape. Then prove the result where it counts, in
+this order: the real target projects build and pass their own tests under blaze (tempoxyz/tempo and
+paradigmxyz/reth first, `verify-on-real-projects`), and the head-to-head against the best competitor
+on the same machine is won on every row (`incremental-first` says which rows come first). A change
+is not finished at "the micro-benchmark improved"; it is finished when the real targets work and the
+comparison is won, or when what still blocks that is written down with its evidence.
+
+## agents-json (rule 63)
+
+`agents/howto/<name>.json` is the right way to do a recurring task here (build blaze, time it,
+replace a running binary, where work runs): `id`, `date`, `who`, `task`, `do` (the exact command or
+a short recipe), `why`, `state` (current, or superseded by another row). They are few: read all of
+them before starting (`python3 -I harness/v2/agents.py '{"howto": true}'`) and do the task their
+way; when you find a better way, add a row under a new name and set the old one's state.
+`agents/annoyances/<lane>-<n>.json` is whatever slowed, surprised or annoyed you, however slightly
+(a tool's quirk, a trap in the tree, a missing command, your own repeated mistake): `id`, `date`,
+`who` (the model id and name and whether you are the main agent or a lane, or the person's name),
+`where` (the tool or the part of blaze), `what` happened in one or two sentences with the exact
+command or message, `cost`, `cause` if known, `whys` (the chain down to a property of the design:
+`guard-the-cause`), `class` (the whole kind of problem that property allows), `prevention` (the
+architectural change that makes the class impossible, and its state), `workaround`, `fix`, and
+`state` (open, accepted, or fixed with the commit). There are hundreds, so never read them all:
+before working in an area, search it (`'{"find": "watcher flush"}'` prints one line per row;
+`"full": true` or `'{"show": "<id>"}'` the whole row; `'{"classes": true}'` the open classes). Add a
+row the moment it happens, without waiting to be asked and without judging whether it is important:
+`'{"add": {"kind": "annoyance", "lane": "<your lane>", "row": {...}}}'` picks the next free number
+and prints the id. A row's id is its file name, so two lanes never take one id and adding a row
+never conflicts with anyone's; a row is never overwritten or deleted: set its state. Do not tidy an
+annoyance into a lesson; say what happened. What must always hold is a rule (tools/agents/rules.ts),
+not a row; a how-to that keeps being broken, or a class with several rows, becomes a rule or an
+architectural change (`guard-the-cause`, `unease-is-work`). `'{"check": true}'` holds the files to
+their fields.
+
+## end-state-not-hill-climb (rule 66)
+
+A sequence of correct local fixes can stay inside a wrong design for weeks, because each fix has a
+real cause and a real measurement and so looks like progress. Guard against it. (1) Count fixes by
+mechanism and by symptom, not by cause: the second fix in one week to one mechanism (the memory
+gate, admission, a validity check, a loader) or for one symptom (a no-op that walks, memory that
+grows, a restart that recomputes, a cache that misses) stops all work on it, yours and every lane's,
+before that second fix lands. (2) The stop ends only with an outside verdict: someone outside the
+work (a fresh agent given the code and the best competing system's source but not your reasoning, or
+a person) reads both and says whether the mechanism should exist at all; the question is not how to
+fix it. A mechanism that should not exist is deleted with what made it needed, not fixed. (3) Write
+the end state before more code: one short spec that starts from what the thing must do, states the
+invariant, and says how the best existing systems solve it (read their source; name the file); the
+spec covers the whole path the symptom runs through, not the component the last bug was in, and has
+the same outside review before building; a frame you have held for days is not checked by you. (4)
+Build the end state directly and delete what it replaces in the same piece of work: a new mechanism
+beside the old ones (a fourth validity check, a third store for one thing, a second way a crate is
+loaded) is a failure of this rule, and so is a switch that selects between the old path and the new
+one for longer than the build of the new one. (5) Judge by end-to-end measurements on the real
+targets, taken on a quiet machine, before and after; a day of work with no end-to-end number is a
+day off course. The signs to stop on: a fast path that is an exception to a slower default and must
+survive a list of conditions; a list of special cases that keeps growing; a second mechanism added
+to cover the first one's gap; a fix whose explanation was a guess; work described as written and not
+compiled for more than one round. The speed of the next fix is never a reason to keep the design.
+
+See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-is-run).
+
+## within-ten-percent-of-the-floor (rule 67)
+
+Aim at the floor from the start: the first design is drawn against it, never a design to be tuned
+toward it later. Missing it is allowed; aiming lower is not. Build something you are proud of on the
+first try, then iterate (`best-long-term-design`). The floor is what an oracle that already knows
+exactly which results changed would do: redo those and the direct readers of each changed value (a
+reader must rerun to learn whether its own value changed), plus unavoidable I/O (a process start, a
+socket round trip, the bytes of the result). The bar is bookkeeping of at most max(10% of that work,
+a few milliseconds); under a few milliseconds a percentage means nothing. Before building: (1) write
+the floor for each operation the design serves (no-op, comment edit, body edit, interface edit under
+many dependents, restart, idle memory, peak memory, bytes on disk) and the design's cost beside it
+as a formula in the things that grow (entries, reads, files, dependents), and reject a cost that
+grows with what is reachable where the floor grows with what changed; (2) count constants too: a
+check that costs microseconds where a mark costs nanoseconds is off by a hundred before any
+asymptotics; (3) where two measures trade (an index that buys time for memory or disk; small when
+idle against instant after idle), pick the point and say which measure pays; (4) say plainly what no
+design reaches (direct readers rerun; every instantiation of an edited generic is recompiled; a
+restart on Linux stats every file) so nobody designs around it. After building: every edit-loop
+measurement reports results changed, direct readers rerun, everything else touched, and the ratio of
+the last to the first two; a ratio over 1.1 is a defect with an owner. The compiler's own throughput
+(type checking, LLVM) has no theoretical best and is compared with the best existing tools instead.
+An outside review of the cost table comes before the build (end-state-not-hill-climb).
+
+See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-is-run).
+
+## edit-rust-by-syntax (rule 72)
+
+Every change to a `.rs` file goes through the agent's edit tools (Edit, or Write after a Read) or a
+tool that parses Rust: an astlog rules file (`blaze check --rules`) for a change of many sites that
+depends on what the code means, `blaze check --fix` or `--replace` for anything resolved by name
+(`fix-through-blaze-lints`), and `ast-grep` (`ast-grep run --lang rust --pattern '<pattern>'
+--rewrite '<rewrite>' <paths>`) for a syntax-only shape across many files, scoped to the paths
+named, with the diff read afterward. Never `cat <<EOF > x.rs`, `sed -i`, `perl -pi`, `awk`, `rg
+--replace` written back, or a Python, TypeScript or shell script that writes Rust as strings: they
+write what the quoting made of the text, miss what the pattern did not foresee, and leave nothing a
+reviewer can check against intent. A checked-in generator of Rust (a build script, a script that
+writes a table) is code itself, reviewed as code, and exempt. A lane brief says this in one line.
+
+## type-then-lint-then-rule (rule 73)
+
+When a mistake can happen again (yours, a lane's, one in the tree), build the strongest prevention
+you can, in this order. (1) A type or a signature that cannot express the mistake: an allocator
+parameter with no default, a position type that is item-relative, a lock that cannot be made without
+a name, a key type built only from all its inputs, one home for the concept, a tool whose only mode
+is the right one. (2) Where no type can hold it, make it loud: the wrong thing fails at once, naming
+itself. (3) A lint with a MachineApplicable fix (`fix-through-blaze-lints`), deny by default and run
+over the whole tree in the same change; or a gate check or a simulation invariant where a lint
+cannot see the mistake. (4) Only last, a line in tools/agents/rules.ts, a skill or a how-to: a rule
+relies on its reader, so it is the weakest guard. Design every API so the obvious call is the
+correct one: the safe form is the short one, and the risky form is longer and named for its risk.
+Before adding a lint, list the lints that already cover the same mistake (`.clippy.toml`'s bans,
+`crates/blaze-lints`, `docs/lints.md`) and extend the one that covers it, or say in the change why
+none does.
+
+## correct-by-construction (rule 76)
+
+What `type-then-lint-then-rule` means by a type, for any code here: a value that carries an
+obligation, a proof or a meaning is a type that states it, so the wrong program does not compile. A
+value that must be handed over or consumed (a lease, a reservation, a write to commit or abort) is
+linear (`#[blaze::linear]`): dropping it is an error. What was checked is a proof type only its
+checker can make (`verify-once`). A key, a digest or an id is its own type (a digest per record
+kind, a dense id per table), never raw bytes, a `u64` or a `usize`, so two kinds cannot be mixed and
+a key cannot be built from part of its inputs. A length, an offset or a count is a newtype with
+checked arithmetic, and item-relative and absolute positions are two types
+(`item-relative-positions`). A state is an enum or a typestate, not a flag beside the data, and a
+unit (bytes, pages, nanoseconds) is in the type. How: before writing a function that takes a bare
+integer, bytes or a bool, ask what the value means and what must be true of it, and make that the
+type; where the language cannot state it, extend the language (`own-the-language`).
+
+## strategy-is-a-type-parameter (rule 78)
+
+Where blaze can do one thing several ways (keep results resident or not, run a task here or on a
+remote worker, an IO backend, how outputs are placed), the choice is a type parameter at one seam
+(`Driver<M: Memo, X: Executor>` is the first use), never a runtime flag, a `dyn` object or a `cfg`:
+it costs nothing per call, and every instantiation is compiled in the one binary and kept building.
+Each instantiation is tested observationally equal to the others: the same requests under the
+simulation give byte-identical records and answers (`Resident` refines `RecordsOnly`), with a
+planted divergence the test catches. The seam is one place, and the code on either side does not
+know which strategy runs. Which instantiation a command uses is chosen once, up front, from stated
+facts and reported (`no-fallback`), never switched mid-run. How: name the trait for the decision,
+not for an implementation, and put the equality test beside it.
+
+## interfaces-first (rule 79)
+
+A rewrite of a part, or a new subsystem, starts with its interface: one small crate of the types,
+traits and sans-IO state machines the rest is written against (`blaze-keyed` for the target design),
+compiling, with a simulation that drives it and an oracle. Other builders then write against it,
+each in new crates beside the old code (`agents-are-a-cost`, `fan-out-write-only`), never by editing
+the old code in place; the old code is switched off and deleted as soon as its replacement passes
+(`end-state-not-hill-climb`), in the same piece of work. The interface crate changes only by whole
+ports (`whole-ports`). How: before splitting work across lanes, land the interface crate on the
+green head; every brief names it and the crate the lane owns.
 
 <!-- End of the generated rules. Hand-written notes follow. -->

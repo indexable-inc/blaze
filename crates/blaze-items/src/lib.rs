@@ -25,7 +25,7 @@
 //! an item's normalized form; [`hash`] fills the forms' slots and gives the four hashes
 //! ([`hashes`]); [`facts`] gives each [`Fact`] its value; `index` holds the negative-fact
 //! indexes; [`table`] holds hashes and facts as columns ([`HashColumns`], [`FactSet`]);
-//! [`goals`] gives the persistent goal cache its keys and facts. Each is computed by `#[blaze_query::tracked]` queries over the front end's database, so
+//! [`goals`] gives the persistent goal cache its keys and facts. Each is computed by `#[blaze_memo::tracked]` queries over the front end's database, so
 //! an edit recomputes only the forms it touched and stops where a hash comes out equal.
 //!
 //! Memory (docs/v2/plan/design/memory.md): a crate's tables (its key index, its hash columns)
@@ -35,7 +35,9 @@
 //! the item it names, so hashing nests as deep as the graph of refs, past the frames a worker
 //! keeps warm. Preimages are written into the worker's scratch buffers.
 
-#![feature(allocator_api, allocator_ext)]
+#![feature(allocator_api, allocator_ext, register_tool)]
+// `#[blaze::renders_positions]` and `#[expect(blaze::reads_positions)]`; inert under rustc.
+#![register_tool(blaze)]
 #![forbid(unsafe_code)]
 
 mod bound;
@@ -43,6 +45,7 @@ mod facts;
 pub mod field_order;
 mod form;
 pub mod goals;
+mod identity;
 pub mod hash;
 mod index;
 pub mod key;
@@ -78,7 +81,7 @@ pub use table::{FactSet, HashColumns, crate_hashes};
 
 /// Which item, in one database: its dense ids, never hashed, never kept past the database.
 /// [`ItemKey`] is what is kept.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, blaze_query::Supertype)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, blaze_memo::Home)]
 pub enum ItemId {
     Function(FunctionId),
     Adt(AdtId),
@@ -167,9 +170,9 @@ impl ItemId {
     }
 }
 
-/// Which item: stable across edits of what it is, changed by a rename or a move.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-pub struct ItemKey(pub ContentId);
+/// Which item: stable across edits of what it is, changed by a rename or a move. Its home is
+/// blaze-id, below every crate that names items (docs/v2/plan/design/identity.md).
+pub use blaze_id::ItemKey;
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub enum ItemKind {
@@ -227,12 +230,16 @@ pub struct ItemHashes {
 }
 
 /// rustc's simplified self type (`SimplifiedType`), hashed: the key under which impls and
-/// method candidates are found.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+/// method candidates are found. A hash, so it names no arena (`blaze_memo::Home`).
+#[derive(
+    Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, blaze_memo::Home,
+)]
 pub struct SimplifiedType(pub ContentId);
 
-/// A name, hashed: `Hasher::new(NAME_DOMAIN).update(name)`.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+/// A name, hashed: `Hasher::new(NAME_DOMAIN).update(name)`. Names no arena.
+#[derive(
+    Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, blaze_memo::Home,
+)]
 pub struct NameHash(pub ContentId);
 
 pub const NAME_DOMAIN: &str = "blaze v2 name 1";
@@ -314,6 +321,29 @@ pub enum Fact {
     /// made (rustc keeps the two apart too: `explicit_item_bounds` and `fn_sig` are not
     /// `collect_return_position_impl_trait_in_trait_tys`).
     RpititTys(ItemKey),
+    /// The inherent impls whose simplified self type is T, in the asking crate and every crate
+    /// it loads (blocks included), each by its key and signature: what
+    /// `InherentImpls::in_crate_for_self_ty` gives a body of the asking crate. Changes when an
+    /// impl of T is added, removed or changes its signature, not for an impl of another type.
+    InherentImpls(SimplifiedType),
+    /// The impls of a trait (by its key) in the asking crate and every crate it loads, each by
+    /// its key and signature: what `TraitImpls::for_crate_and_trait` gives a body of the asking
+    /// crate. Changes when an impl of that trait is added, removed or changed.
+    TraitImpls(ItemKey),
+    /// The traits the asking crate sees that have a value item named N, each by its key and the
+    /// signatures of those items: what `in_crate_trait_value_items` gives. Changes when a trait
+    /// gains, loses or changes an item named N, not for an item of another name.
+    TraitsNamed(NameHash),
+    /// The traits in a module's trait scope (by the module's key) that have a value item named
+    /// N, each by its key and those items' signatures: what `module_items_named` gives.
+    ScopeTraitsNamed {
+        scope: ItemKey,
+        name: NameHash,
+    },
+    /// Every trait and inherent impl declared in a block (by the key of the block's module),
+    /// each by its key and signature: what `TraitImpls::for_block` and `InherentImpls::for_block`
+    /// give a body that is not the block's owner.
+    BlockImpls(ItemKey),
 }
 
 /// The facts' query kinds, in [`blaze_query::kinds::FACTS`].
@@ -342,7 +372,12 @@ pub mod kinds {
     pub const CRATE: QueryKind = QueryKind(0x1012);
     pub const HIDDEN_TYPES: QueryKind = QueryKind(0x1013);
     pub const RPITIT_TYS: QueryKind = QueryKind(0x1014);
-    // 0x1800..0x1810 are lane item-hash's (`blaze_item_hash::values`): facts lane items does
+    pub const INHERENT_IMPLS: QueryKind = QueryKind(0x1015);
+    pub const TRAIT_IMPLS: QueryKind = QueryKind(0x1016);
+    pub const TRAITS_NAMED: QueryKind = QueryKind(0x1017);
+    pub const SCOPE_TRAITS_NAMED: QueryKind = QueryKind(0x1018);
+    pub const BLOCK_IMPLS: QueryKind = QueryKind(0x1019);
+    // 0x1800..0x1820 are lane item-hash's (`blaze_item_hash::values`): facts lane items does
     // not hash, listed in `blaze_item_hash::values::kinds`. None is defined here.
 }
 
@@ -371,6 +406,11 @@ impl Fact {
             Fact::Crate(_) => kinds::CRATE,
             Fact::HiddenTypes(_) => kinds::HIDDEN_TYPES,
             Fact::RpititTys(_) => kinds::RPITIT_TYS,
+            Fact::InherentImpls(_) => kinds::INHERENT_IMPLS,
+            Fact::TraitImpls(_) => kinds::TRAIT_IMPLS,
+            Fact::TraitsNamed(_) => kinds::TRAITS_NAMED,
+            Fact::ScopeTraitsNamed { .. } => kinds::SCOPE_TRAITS_NAMED,
+            Fact::BlockImpls(_) => kinds::BLOCK_IMPLS,
         }
     }
 
@@ -391,7 +431,12 @@ impl Fact {
             | Fact::DropCheck(it)
             | Fact::Derive(it)
             | Fact::HiddenTypes(it)
-            | Fact::RpititTys(it) => hasher.id(&it.0),
+            | Fact::RpititTys(it)
+            | Fact::TraitImpls(it)
+            | Fact::BlockImpls(it) => hasher.id(&it.0),
+            Fact::InherentImpls(self_ty) => hasher.id(&self_ty.0),
+            Fact::TraitsNamed(name) => hasher.id(&name.0),
+            Fact::ScopeTraitsNamed { scope, name } => hasher.id(&scope.0).id(&name.0),
             Fact::Field { ty, field } => hasher.id(&ty.0).update(&field.to_le_bytes()),
             Fact::Method { self_ty, name } => hasher.id(&self_ty.0).id(&name.0),
             Fact::Implements { trait_, self_ty } | Fact::Vtable { trait_, self_ty } => {

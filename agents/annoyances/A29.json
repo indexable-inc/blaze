@@ -1,0 +1,11 @@
+{
+ "id": "A29",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "git",
+ "what": "`git stash` is banned and worktrees share one object store, so bisecting a merge meant detached-HEAD reverts in the shared worktree and remembering to check the branch out again.",
+ "cost": "small",
+ "cause": "rule worktree-per-lane",
+ "workaround": "a throwaway worktree per bisect when the disk allows",
+ "state": "accepted"
+}

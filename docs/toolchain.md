@@ -46,7 +46,15 @@ the standard library is part of a compiler.
   (`crates/blaze-cargo/src/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
   still says `1.101.0-nightly (16d1ffac1 2026-10-26)`.
 - **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>`, the machine's: every `BLAZE_HOME` reads
-  this one copy (`BLAZE_HOME` moves a daemon's settings and state, not the toolchain), found
+  this one copy (`BLAZE_HOME` moves a daemon's settings and state, not the toolchain).
+  `BLAZE_TOOLCHAINS=<dir>` names another directory in place of `~/.blaze/toolchains`
+  (`toolchain::own::toolchains`), for a machine whose home is small, read-only or not there;
+  the daemon keeps the one it was started with. `~` is the user's home as blaze finds it
+  everywhere (`blaze_core::home::user`): `HOME` when it is set and not empty, else the
+  system's record of the user (`getpwuid_r` of the effective uid; on Windows `USERPROFILE`,
+  then the profile directory), so a systemd unit, a CI runner or cron with no `HOME` finds
+  the same copy a shell does. With neither, blaze stops, saying what it tried and naming
+  `BLAZE_TOOLCHAINS`. It is found
   with nothing run (`crates/blaze-cargo/src/toolchain.rs`, `found`). rustup's directory is never
   read, not even when it has the same nightly: a toolchain found by its directory's name is
   trusted by name, whatever was installed there ([v2/plan/toolchain-c.md](v2/plan/design/toolchain-c.md),
@@ -149,6 +157,17 @@ blaze tracks the latest Rust nightly. `.github/workflows/toolchain-bump.yaml` ru
    tree of nightly features (#967) to the new pin: an issue for each new language feature, and
    a comment and a close on the issue of each one stabilized or removed. The workflow does not
    run it yet; it is run by hand after the merge.
+7. blaze's registry of rustc's lints (`crates/blaze-lint-defs/src/rustc.rs`: every lint with
+   its level, text and flags, the groups, the renamed and removed names) is written from
+   rustc's source at the new commit by the bump itself
+   (`blaze run -q -p scripts --bin lint_table -- '{"command": "write", "rust": "<checkout>"}'`),
+   and the gate's `lint_table check` fails a tree whose registry was written from another
+   commit than `library/UPSTREAM`'s, or was edited. What the new lints, levels and wordings
+   ask of blaze-diagnostics is then its tests' to show. A bump that crosses a release also
+   reads that release's "Language" section against [language.md](language.md) and adds its
+   cases to `crates/blaze-diagnostics/src/tests/stabilized.rs` and
+   `crates/hir-ty-mir/src/tests/mir/stabilized.rs`. The feature gates of blaze-diagnostics
+   are still a hand copy.
 
 Fixes for what a nightly breaks (layouts, the ABI, std's source, intrinsics, borrow-check
 verdicts) are pushed to `toolchain/bump`. The next day's run merges main into it and moves it to

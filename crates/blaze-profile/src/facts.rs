@@ -79,7 +79,8 @@ pub struct CrateDepRow {
 }
 
 /// A row of the schema's `query_counts` table: what the query engine counted of one query
-/// function by the end of a build (`blaze_query::db::Counts`, field for field).
+/// function by the end of a build (the tracked engine's `Counts`, field for field, until its
+/// deletion; blaze-units' `blaze_query::Database::take_counts` still fills its own fields).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QueryCountRow {
     pub build_id: u64,
@@ -100,6 +101,28 @@ pub struct QueryCountRow {
     pub ran_changed: u64,
     pub ran_untracked: u64,
     pub ran_cycle: u64,
+    /// How its rows were proved unchanged.
+    pub validity: Validity,
+}
+
+/// The validity census columns of a `query_counts` row (the deleted tracked engine's `Validity`, field for
+/// field): how the query's rows of an earlier view were proved unchanged, each under the first
+/// proof to answer in the engine's order, and what proving by edges cost. Each field is the
+/// column of its name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Validity {
+    pub proved_seal: u64,
+    pub proved_durability: u64,
+    pub proved_summary: u64,
+    pub proved_floor_durability: u64,
+    pub proved_floor_summary: u64,
+    pub proved_walk_end: u64,
+    pub proved_reach: u64,
+    pub proved_first: u64,
+    pub edge_walked: u64,
+    pub edge_gave_up: u64,
+    pub edge_claimed: u64,
+    pub edges_compared: u64,
 }
 
 /// What a `provenance` row says happened ([`ProvenanceRow::outcome`]).
@@ -121,7 +144,7 @@ impl RunOutcome {
 }
 
 /// A row of the schema's `provenance` table: one entry of the query engine's run log
-/// (`blaze_query::db::LoggedRun`).
+/// (the deleted tracked engine's `LoggedRun`; the session memo keeps no run log).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProvenanceRow {
     pub build_id: u64,
@@ -138,6 +161,9 @@ pub struct ProvenanceRow {
     pub cause_kind: Option<&'static str>,
     /// For an untracked read: its name.
     pub what: Option<&'static str>,
+    /// How many logged runs it stands for (`provenance.weight`): 1, or the log's sampling rate
+    /// for a sample of the runs past its bound.
+    pub weight: u32,
 }
 
 /// What the schema's `key_parts` table holds of one thing a build computed again: a row each
@@ -253,6 +279,10 @@ pub struct TestRunRow {
 /// The children reaped since the last flush took them: pushed by whichever thread reaped one,
 /// taken by the history's flush. Unbounded as a queue, bounded in practice by the children a
 /// flush interval reaps; a process with no history never installs the observer that fills it.
+#[expect(
+    blaze::process_static,
+    reason = "drained by each history flush: bounded by the children one flush interval reaps"
+)]
 static CHILDREN: crossbeam_queue::SegQueue<ProcessRow> = crossbeam_queue::SegQueue::new();
 
 /// Has every child a driver reaps from now on queued as a `processes` row, each label naming
@@ -405,6 +435,18 @@ pub fn query_counts(rows: &[QueryCountRow]) -> Result<RecordBatch, ArrowError> {
         count(|it| it.ran_changed),
         count(|it| it.ran_untracked),
         count(|it| it.ran_cycle),
+        count(|it| it.validity.proved_seal),
+        count(|it| it.validity.proved_durability),
+        count(|it| it.validity.proved_summary),
+        count(|it| it.validity.proved_floor_durability),
+        count(|it| it.validity.proved_floor_summary),
+        count(|it| it.validity.proved_walk_end),
+        count(|it| it.validity.proved_reach),
+        count(|it| it.validity.proved_first),
+        count(|it| it.validity.edge_walked),
+        count(|it| it.validity.edge_gave_up),
+        count(|it| it.validity.edge_claimed),
+        count(|it| it.validity.edges_compared),
     ];
     RecordBatch::try_new(batches::schema_of(&schema::QUERY_COUNTS), columns)
 }
@@ -422,6 +464,7 @@ pub fn provenance(rows: &[ProvenanceRow]) -> Result<RecordBatch, ArrowError> {
         column(StringArray::from_iter(rows.iter().map(|it| it.cause_key.as_deref()))),
         dict(rows.iter().map(|it| it.cause_kind)),
         column(StringArray::from_iter(rows.iter().map(|it| it.what))),
+        column(UInt32Array::from_iter(rows.iter().map(|it| Some(it.weight)))),
     ];
     RecordBatch::try_new(batches::schema_of(&schema::PROVENANCE), columns)
 }
@@ -583,21 +626,21 @@ mod tests {
     /// Every row lands in exactly one run, in order, and a run holds more than `most` bytes of
     /// text only when it is a single row: what keeps one flush's `key_parts` under the 2 GiB a
     /// `Utf8` column holds (#1726).
-    #[hegel::test(test_cases = 300)]
-    fn runs_keep_every_row_once_in_order_under_the_cap(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let sizes: Vec<usize> =
-            tc.draw(gs::vecs(gs::integers::<usize>().max_value(1 << 12)).max_size(200));
-        let most = tc.draw(gs::integers::<usize>().max_value(1 << 13));
-        let rows: Vec<(usize, usize)> = sizes.iter().copied().enumerate().collect();
-        let mut seen = Vec::new();
-        for run in runs(&rows, |it| it.1, most) {
-            assert!(!run.is_empty(), "a run holds a row");
-            let bytes: usize = run.iter().map(|it| it.1).sum();
-            assert!(run.len() == 1 || bytes <= most, "{bytes} bytes in {} rows over {most}", run.len());
-            seen.extend(run.iter().map(|it| it.0));
-        }
-        assert_eq!(seen, (0..rows.len()).collect::<Vec<_>>());
+    #[test]
+    fn runs_keep_every_row_once_in_order_under_the_cap() {
+        blaze_sim::check(blaze_sim::Config::cases(300), |tape| {
+            let sizes: Vec<usize> = tape.vec(0..=200, "sizes", |tape| tape.int_in(0..=1usize << 12, "size"));
+            let most = tape.int_in(0..=1usize << 13, "most");
+            let rows: Vec<(usize, usize)> = sizes.iter().copied().enumerate().collect();
+            let mut seen = Vec::new();
+            for run in runs(&rows, |it| it.1, most) {
+                assert!(!run.is_empty(), "a run holds a row");
+                let bytes: usize = run.iter().map(|it| it.1).sum();
+                assert!(run.len() == 1 || bytes <= most, "{bytes} bytes in {} rows over {most}", run.len());
+                seen.extend(run.iter().map(|it| it.0));
+            }
+            assert_eq!(seen, (0..rows.len()).collect::<Vec<_>>());
+        });
     }
 
     #[test]
@@ -666,6 +709,7 @@ mod tests {
             cause_key: Some("`FileText.text`(Id(2))".into()),
             cause_kind: Some("input"),
             what: None,
+            weight: 1,
         };
         let read = ProvenanceRow {
             outcome: RunOutcome::UntrackedRead,
@@ -673,9 +717,16 @@ mod tests {
             cause_key: None,
             cause_kind: None,
             what: Some("the proc macro's output"),
+            weight: 64,
             ..changed.clone()
         };
         let batch = provenance(&[changed, read]).unwrap();
+        let weight = batch.column(schema::PROVENANCE.column("weight").unwrap());
+        assert_eq!(
+            weight.as_primitive::<UInt32Type>().values().to_vec(),
+            vec![1u32, 64],
+            "a sample of the runs past the log's bound says how many it stands for"
+        );
         let at = |name: &str| schema::PROVENANCE.column(name).unwrap();
         assert_eq!(
             batch.column(at("cause_key")).as_string::<i32>().value(0),

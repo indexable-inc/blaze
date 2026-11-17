@@ -24,6 +24,7 @@ pub const DEV_ORIGIN: &str = "http://localhost:5173";
 
 /// A server's token: 16 bytes from the operating system's random source, as 32 lowercase hex
 /// characters. New each time a server starts.
+#[derive(Clone)] // clone: once a server, the driver's copy for its link beside the core's
 pub struct Token(String);
 
 impl Token {

@@ -1,0 +1,11 @@
+{
+ "id": "memstrat-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+ "where": "the brief's premise: Relax's memory",
+ "what": "The brief gave Relax's warm run of hello-world as 37.8 MB resident and 23.9 MB footprint. That run had failed: `relax run --quiet hello` from the project's parent directory finds no manifest, exits 1 after 10 ms, and `/usr/bin/time -l` reports the failed process. The real warm run is 87 MB resident (footprint 50), a comment edit 117 (71), a body edit 127 (79), cold 250 (162).",
+ "cost": "the target the strategy is held to was off by a factor of two to three until measured again",
+ "cause": "an exit status and an output nobody checked (H2 says to)",
+ "workaround": "every run's status and output are checked in this lane's relax_measure.py",
+ "state": "fixed in this lane's numbers; the guard is H2 and memstrat-h3"
+}

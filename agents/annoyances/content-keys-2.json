@@ -1,0 +1,12 @@
+{
+ "id": "content-keys-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane content-keys-1112",
+ "where": "paths in keys, across the tree",
+ "what": "Three mechanisms write a path against what it is under, each its own: blaze-usercode's roots (`Roots::port`, six roles, reversible), hir-def's image key markers (`Base`: `\\0PKG`, `\\0OUT_DIR`, `\\0ABSOLUTE`, with `held_by`), and blaze-diagnostics' check outcome markers. Unit records had none and held absolute paths in the unit, the plan, the run environment, the crate's content, its source root's content and the root's spelling. This lane put unit records on the roots; the image key's markers are still a second home.",
+ "cost": "an hour to find which one a unit key should use",
+ "cause": "each kind of record was made portable by the lane that needed it",
+ "workaround": "none",
+ "fix": "move `Base` onto roots (one-concept-one-home), then ban a path's `as_str().as_bytes()` into a `Hasher` outside base-db's content IDs with a lint",
+ "state": "open"
+}

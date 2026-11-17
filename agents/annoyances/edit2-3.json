@@ -1,0 +1,11 @@
+{
+ "id": "edit2-3",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+ "where": "copying blaze's pinned LLVM between two ix VMs",
+ "what": "`ix shell a -- tar -cf - dir | ix shell b -- tar -xf -` through the Mac moved 355 MB in about 20 minutes (0.3 MB/s), and a foreground wait on it is moved to the background after three minutes.",
+ "cost": "20 minutes before the first build could start",
+ "cause": "the bytes go VM to Mac to VM through two interactive shells; there is no VM-to-VM copy and no fetch of the pinned LLVM by its hash on a fresh VM",
+ "workaround": "started the clone and rustup meanwhile",
+ "state": "open: a lane's VM should fetch the pinned LLVM itself (`blaze` does, cargo's build of blaze does not)"
+}

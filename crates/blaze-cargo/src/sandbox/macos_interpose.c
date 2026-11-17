@@ -60,7 +60,13 @@
 // read (an initializer that runs first is answered from the entries, and its reads noted as the
 // constructor ends). What walks the environment then sees the visible variables alone, which
 // the run's key has, until the process says it walks it (std's `__blaze_environ_walked`): then
-// every lent variable is put back in the environment, and `E\t<test>\t* <why>` is noted. A
+// every lent variable is put back in the environment, and `E\t<test>\t* <why>` is noted.
+// What is lent so is the walk set (`blaze_usercode::confine::walk_sees`): a variable outside
+// it is an entry `__BLAZE_NAMED=NAME=VALUE` instead, answered by name and noted the same way
+// and never put back, so the whole environment a walk reads is the visible variables and the
+// walk set, the same in every shell. Those go on, as the entries they are, to a program the
+// process runs with its own environment before it walked it; a program macOS protects, which
+// loads no copy of this library, can't read them. A
 // program the process runs with its own environment gets the lent variables back in it, as
 // with no sandbox, and the visible names in `__BLAZE_VISIBLE_CHILD`: running it is no read.
 // Its own copy of this library lends it what is not visible when its executable exports
@@ -136,6 +142,10 @@ extern int32_t CCRandomGenerateBytes(void *, size_t);
 #define WHITEOUT "\x01blaze-whiteout\x01"
 #define SCOPE_VAR "__BLAZE_SANDBOX_SCOPE"
 #define LENT "__BLAZE_LENT"
+// A variable lent by name alone, `__BLAZE_NAMED=NAME=VALUE` (`sandbox/v2.rs`, `NAMED`): one
+// outside the walk set. Answered by `getenv` like a lent one, and never put back in the
+// environment, whoever walks it.
+#define NAMED "__BLAZE_NAMED"
 // The visible names, `NAME=NAME=...` (`sandbox/v2.rs`, `VISIBLE`): from the launcher, to the
 // program it lends to; from this library, to each program a process runs, which lends to
 // itself when it proves it says its walks.
@@ -1265,6 +1275,8 @@ __attribute__((noinline)) static void env_read(const char *name) {
 // the kernel put it. Set as the library loads, before the program runs.
 static char **lent;
 static unsigned char *lent_gone;
+// Of each whether it is lent by name alone (an entry `NAMED`): never put back for a walk.
+static unsigned char *lent_named;
 static size_t lent_count;
 // Whether every lent variable is back in the environment: the process walked it.
 static _Atomic int lent_back;
@@ -1285,12 +1297,15 @@ static int lending(void) {
     return lent_count && !atomic_load_explicit(&lent_back, memory_order_acquire);
 }
 
-// The value of `name` lent and not taken away, while it is lent.
+// The value of `name` lent and not taken away: of one lent until a walk, while it is lent;
+// of one lent by name alone, always.
 static char *lent_value(const char *name) {
-    if (!lending() || !name) return NULL;
+    if (!lent_count || !name) return NULL;
+    int back = atomic_load_explicit(&lent_back, memory_order_acquire);
     size_t len = strlen(name);
     for (size_t i = 0; i < lent_count; i++)
-        if (!lent_gone[i] && entry_of(lent[i], name, len)) return lent[i] + len + 1;
+        if (!lent_gone[i] && (lent_named[i] || !back) && entry_of(lent[i], name, len))
+            return lent[i] + len + 1;
     return NULL;
 }
 
@@ -1298,9 +1313,12 @@ static char *lent_value(const char *name) {
 // runs before this library's constructor is answered.
 static char *encoded_value(const char *name) {
     size_t len = strlen(name);
-    for (char **it = *_NSGetEnviron(); it && *it; it++)
+    for (char **it = *_NSGetEnviron(); it && *it; it++) {
         if (!strncmp(*it, LENT "=", sizeof LENT) && entry_of(*it + sizeof LENT, name, len))
             return *it + sizeof LENT + len + 1;
+        if (!strncmp(*it, NAMED "=", sizeof NAMED) && entry_of(*it + sizeof NAMED, name, len))
+            return *it + sizeof NAMED + len + 1;
+    }
     return NULL;
 }
 
@@ -1347,7 +1365,7 @@ static void lend_back(void) {
         size_t have = 0, add = 0;
         while (env && env[have]) have++;
         for (size_t i = 0; i < lent_count; i++)
-            if (!lent_gone[i] && !has(env, lent[i])) add++;
+            if (!lent_gone[i] && !lent_named[i] && !has(env, lent[i])) add++;
         size_t bytes = (have + add + 1) * sizeof(char *);
         char **all = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (all == MAP_FAILED) {
@@ -1359,7 +1377,7 @@ static void lend_back(void) {
         size_t n = 0;
         for (size_t i = 0; i < have; i++) all[n++] = env[i];
         for (size_t i = 0; i < lent_count; i++)
-            if (!lent_gone[i] && !has(env, lent[i])) all[n++] = lent[i];
+            if (!lent_gone[i] && !lent_named[i] && !has(env, lent[i])) all[n++] = lent[i];
         all[n] = NULL;
         *where = all;
         atomic_store_explicit(&lent_back, 1, memory_order_release);
@@ -1393,14 +1411,22 @@ static void take_lent(void) {
     char **env = *_NSGetEnviron();
     size_t n = 0;
     for (char **it = env; it && *it; it++)
-        if (!strncmp(*it, LENT "=", sizeof LENT)) n++;
+        if (!strncmp(*it, LENT "=", sizeof LENT) || !strncmp(*it, NAMED "=", sizeof NAMED)) n++;
     if (!n) return;
     lent = malloc(n * sizeof *lent);
     lent_gone = calloc(n, 1);
-    if (!lent || !lent_gone) out_of_memory();
-    for (char **it = env; it && *it; it++)
-        if (!strncmp(*it, LENT "=", sizeof LENT)) lent[lent_count++] = *it + sizeof LENT;
+    lent_named = calloc(n, 1);
+    if (!lent || !lent_gone || !lent_named) out_of_memory();
+    for (char **it = env; it && *it; it++) {
+        if (!strncmp(*it, LENT "=", sizeof LENT)) {
+            lent[lent_count++] = *it + sizeof LENT;
+        } else if (!strncmp(*it, NAMED "=", sizeof NAMED)) {
+            lent_named[lent_count] = 1;
+            lent[lent_count++] = *it + sizeof NAMED;
+        }
+    }
     unsetenv(LENT);
+    unsetenv(NAMED);
 }
 
 // The variables of the environment that are not visible, taken out of it as the library
@@ -1412,12 +1438,17 @@ static void lend_rest(void) {
     for (char **it = env; it && *it; it++)
         if (!is_visible(*it)) n++;
     if (!n) return;
-    lent = malloc(n * sizeof *lent);
-    lent_gone = calloc(n, 1);
-    if (!lent || !lent_gone) out_of_memory();
-    for (char **it = env; it && *it && lent_count < n; it++)
+    // After what `take_lent` took (the variables lent by name alone, passed on as entries).
+    size_t first = lent_count, most = lent_count + n;
+    lent = realloc(lent, most * sizeof *lent);
+    lent_gone = realloc(lent_gone, most);
+    lent_named = realloc(lent_named, most);
+    if (!lent || !lent_gone || !lent_named) out_of_memory();
+    memset(lent_gone + first, 0, n);
+    memset(lent_named + first, 0, n);
+    for (char **it = env; it && *it && lent_count < most; it++)
         if (!is_visible(*it)) lent[lent_count++] = *it;
-    for (size_t i = 0; i < lent_count; i++) {
+    for (size_t i = first; i < lent_count; i++) {
         size_t len = strcspn(lent[i], "=");
         char *name = strndup(lent[i], len);
         if (!name) out_of_memory();
@@ -1833,6 +1864,7 @@ static void environment(char *const envp[], size_t lent_n, char **out, size_t ro
     for (char *const *it = envp; it && *it && n + lent_n + ADDED + 1 < room; it++) {
         if (!strncmp(*it, "__BLAZE_SANDBOX=", 16) || !strncmp(*it, "__BLAZE_SANDBOX_EXEC=", 21) ||
             !strncmp(*it, SCOPE_VAR "=", sizeof SCOPE_VAR) || !strncmp(*it, LENT "=", sizeof LENT) ||
+            !strncmp(*it, NAMED "=", sizeof NAMED) ||
             !strncmp(*it, VISIBLE "=", sizeof VISIBLE) || !strncmp(*it, CHILD_VISIBLE "=", sizeof CHILD_VISIBLE))
             continue;
         if (!strncmp(*it, "DYLD_INSERT_LIBRARIES=", 22)) {
@@ -1844,7 +1876,9 @@ static void environment(char *const envp[], size_t lent_n, char **out, size_t ro
     out[n] = NULL;
     for (size_t i = 0, added = 0; i < lent_count && added < lent_n && n + ADDED + 1 < room; i++) {
         if (lent_gone[i] || has(out, lent[i])) continue;
-        out[n++] = lent[i];
+        // One lent by name alone goes on as its whole entry (`NAMED=NAME=VALUE`, which is
+        // where the kernel put it, `sizeof NAMED` bytes before its name).
+        out[n++] = lent_named[i] ? lent[i] - sizeof NAMED : lent[i];
         out[n] = NULL;
         added++;
     }

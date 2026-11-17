@@ -1,0 +1,11 @@
+{
+ "id": "redit-7",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+ "where": "reth under blaze",
+ "what": "`reth-node-ethereum` does not compile at all-1111 (1474ed0ab0): `cannot find type _0 in this scope` in a `tokio::select!` of `snap/run.rs:338` and three E0310 at `node.rs:340`. Every measurement of `-p reth-node-ethereum` is of a build that failed, which `blaze debug edits` refuses.",
+ "cost": "the edit loop had to be measured on its 30 workspace dependencies",
+ "cause": "two front-end bugs, not this lane's",
+ "workaround": "`-p` each workspace dependency of reth-node-ethereum",
+ "state": "open (the real-projects lane)"
+}

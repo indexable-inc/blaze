@@ -1,0 +1,11 @@
+{
+ "id": "edit2-6",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+ "where": "blaze: `blaze explain edit_work` after a `blaze run`",
+ "what": "With no `build=`, `blaze explain edit_work` reads the last build, which after every edit is the `store kept front end` build that follows it and counted nothing: `build 326 counted no work in any stage`. The edit's own build is the one before.",
+ "cost": "a few minutes each time, and a query written by hand to find the build",
+ "cause": "the view's default is the newest build of any kind",
+ "workaround": "`build=N` with N from `select max(build_id) from builds where command like 'run%' and misses > 0`",
+ "state": "open: the default should be the last build that counted work"
+}

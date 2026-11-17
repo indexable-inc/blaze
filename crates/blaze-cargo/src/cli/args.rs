@@ -55,11 +55,15 @@ impl Clap for Command {
                 COMPILE_TIME_DEPS,
                 MANIFEST,
                 REFUSED,
+                GOAL,
+                PREBUILT,
+                NO_DAEMON,
             ],
             Command::Check => &[
                 GLOBAL,
                 CHECK_ONLY,
                 BASELINES,
+                LEVELS,
                 FUTURE,
                 MESSAGE,
                 SILENT,
@@ -75,6 +79,9 @@ impl Clap for Command {
                 COMPILE_TIME_DEPS,
                 MANIFEST,
                 REFUSED,
+                GOAL,
+                PREBUILT,
+                NO_DAEMON,
             ],
             Command::Run => &[
                 GLOBAL,
@@ -91,14 +98,18 @@ impl Clap for Command {
                 MANIFEST,
                 REPORTS,
                 REFUSED,
+                GOAL,
+                PREBUILT,
+                NO_DAEMON,
             ],
             Command::Test => &[
-                GLOBAL, RUNNING, FUTURE, MESSAGE, PACKAGES, TARGETS, TEST_ONLY, FEATURES, JOBS,
-                KEEP_GOING, RELEASE, PROFILE, TARGET, REPORTS, MANIFEST, REFUSED,
+                GLOBAL, RUNNING, FUTURE, MESSAGE, PACKAGES, TARGETS, TEST_ONLY, NO_TESTS, FEATURES,
+                JOBS, KEEP_GOING, RELEASE, PROFILE, TARGET, REPORTS, MANIFEST, REFUSED, GOAL,
+                PREBUILT,
             ],
             Command::Bench => &[
-                GLOBAL, RUNNING, MESSAGE, SILENT, PACKAGES, TARGETS, FEATURES, JOBS, KEEP_GOING,
-                PROFILE, TARGET, REPORTS, MANIFEST, REFUSED,
+                GLOBAL, RUNNING, MESSAGE, SILENT, PACKAGES, TARGETS, NO_TESTS, FEATURES, JOBS,
+                KEEP_GOING, PROFILE, TARGET, REPORTS, MANIFEST, REFUSED,
             ],
             Command::Doc => &[
                 GLOBAL,
@@ -335,37 +346,93 @@ const MANIFEST: &[Flag] = &[
     Flag::new("manifest-path", Some('m'), Takes::Value, "PATH"),
     Flag::pointing(Some("path"), None, Points::Arg("--manifest-path")),
 ];
-/// `--reached` and `--ub*` are blaze's (extensions, opt-in): only the tests an edit reached run;
-/// the tests run in blaze's MIR evaluator, checked for undefined behavior (`hir-ty-ub`).
+/// `--run-all` and `--ub*` are blaze's: `blaze test` reruns only a test whose executed code or
+/// reads changed (docs/cargo.md, "Which tests run"), and `--run-all` runs every test asked,
+/// still keeping what each run learns; the `--ub` tests run in blaze's MIR evaluator, checked
+/// for undefined behavior (`hir-ty-ub`). `--reached`, the flag that once opted into selection,
+/// is refused naming both: selection is the default, and never a flag accepted and ignored.
 const TEST_ONLY: &[Flag] = &[
     Flag::switch("doc"),
-    Flag::switch("reached"),
+    Flag::switch("run-all"),
+    Flag::pointing(Some("reached"), None, Points::Says(REACHED_GONE)),
     Flag::switch("ub"),
     Flag::new("ub-seed", None, Takes::Value, "N"),
     Flag::new("ub-schedules", None, Takes::Value, "K"),
 ];
 
+/// What `--reached` is refused with.
+pub const REACHED_GONE: &str = "`blaze test` already reruns only the tests whose executed code or \
+     reads changed, by default; `--run-all` runs every test asked";
+
+/// `--no-tests fail|pass` is blaze's, for `test` and `bench`: what a run that ran no test is.
+/// `fail` (the default) refuses it, naming the selection that matched nothing
+/// ([`super::test::refusal`]); `pass` is cargo's and libtest's behaviour, exit 0. The name and
+/// the values are cargo-nextest's.
+const NO_TESTS: &[Flag] = &[Flag {
+    possible: &["fail", "pass"],
+    ..Flag::new("no-tests", None, Takes::Value, "fail|pass")
+}];
+
 /// `--refused N|all` is blaze's: how many of the functions blaze could not compile a build's
 /// error names, the first `N` or every one ([`blaze_api::Cargo::refused`]).
 const REFUSED: &[Flag] = &[Flag::new("refused", None, Takes::Value, "N|all")];
 
+/// `--goal edit|max` is blaze's: what the build waits for before it answers
+/// ([`blaze_api::Goal`], docs/v2/plan/design/tiers.md). `edit` answers once every function has
+/// tier 0 code; `max` once every function has its optimized code. Without it the profile
+/// says: `dev` edits, `release` is `max` ([`blaze_api::Goal::of_profile`]). `check` takes it
+/// and compiles no program, so one command line serves all four.
+const GOAL: &[Flag] =
+    &[Flag { possible: blaze_api::Goal::NAMES, ..Flag::new("goal", None, Takes::Value, "GOAL") }];
+
+/// `--no-prebuilt` is blaze's: this request takes no record from a pack source (packs.json's
+/// `remote`, an R2 bucket) and builds what the home's store and the machine's layer miss from
+/// source, the per-request form of packs.json's `"prebuilt": false`
+/// ([`blaze_api::Cargo::prebuilt`]).
+const PREBUILT: &[Flag] = &[Flag::switch("no-prebuilt")];
+
+/// `check --no-daemon` is blaze's: this process resolves the checkout, runs the keyed driver's
+/// host with the front end and files the records under `<home>/v2/keyed`, with no daemon
+/// (`blaze_command`). Asked for, never taken in place of a daemon that is not there; a
+/// checkout it cannot build yet is refused by name.
+const NO_DAEMON: &[Flag] = &[Flag::switch("no-daemon")];
+
 /// `check`'s edits, blaze's: `--fix` makes every machine-applicable suggestion of the check
 /// ([`super::fix`]), only those of each `--lint NAME` when any is given; `--replace FROM=TO`
 /// retargets every reference to the item `FROM` to `TO` by name resolution
-/// ([`super::replace`]), and checks nothing.
+/// ([`super::replace`]), and checks nothing; `--rules FILE` makes every rewrite of an astlog
+/// rules file the same way, after the replaces; `--dry-run` prints the diff either would write
+/// and writes nothing; `--query FILE` prints what a rules file derives and finds, and writes
+/// nothing (docs/v2/plan/design/astlog-sema.md).
 const CHECK_ONLY: &[Flag] = &[
     Flag::switch("fix"),
     Flag::new("lint", None, Takes::Value, "NAME").many(),
     Flag::new("replace", None, Takes::Value, "FROM=TO").many(),
+    Flag::new("rules", None, Takes::Value, "FILE"),
+    Flag::new("query", None, Takes::Value, "FILE"),
+    Flag::switch("dry-run"),
 ];
 
 /// `check`'s baselines, blaze's (`blaze_lints::baseline`): `--baselines DIR` checks the run's
-/// counts against the baselines in `DIR`, `--bless-baselines` lowers them to the run's, and
+/// counts against the baselines in `DIR`, `--bless-baselines` lowers them to the run's (to the
+/// crates it measured, when the run failed: `cli/baselines.rs`), and
 /// `--new-baseline LINT[,LINT...]`, given any number of times, starts each `LINT`'s at the run's.
 const BASELINES: &[Flag] = &[
     Flag::new("baselines", None, Takes::Value, "DIR"),
     Flag::switch("bless-baselines"),
     Flag::new("new-baseline", None, Takes::Value, "LINT").many(),
+];
+
+/// `check`'s lint levels, blaze's, spelled as rustc's long flags: `--deny LINT` sets `LINT`'s
+/// level for every workspace member of the run, after every level the manifests set, any
+/// number of times and in the order given ([`blaze_units::lint_level`]). They go to the
+/// daemon's load with cargo's flags, since a level is an input of the plan. Another command
+/// given one is refused saying so ([`Said::CheckOnly`]).
+const LEVELS: &[Flag] = &[
+    Flag::new("allow", None, Takes::Value, "LINT").many(),
+    Flag::new("warn", None, Takes::Value, "LINT").many(),
+    Flag::new("deny", None, Takes::Value, "LINT").many(),
+    Flag::new("forbid", None, Takes::Value, "LINT").many(),
 ];
 
 /// The flags read here and never handed to the daemon's load: blaze's own, which the client
@@ -374,17 +441,24 @@ fn blaze_only(flag: &Flag) -> bool {
     matches!(
         flag.long,
         Some(
-            "reached"
+            "run-all"
                 | "ub"
                 | "ub-seed"
                 | "ub-schedules"
+                | "no-tests"
                 | "refused"
+                | "goal"
                 | "baselines"
                 | "bless-baselines"
                 | "new-baseline"
                 | "fix"
                 | "lint"
                 | "replace"
+                | "rules"
+                | "query"
+                | "dry-run"
+                | "no-prebuilt"
+                | "no-daemon"
         )
     )
 }
@@ -425,10 +499,19 @@ pub enum Asked {
     Why(Vec<OsString>),
     /// `blaze reach [ROOT]`, with the words after it ([`super::reach::main`]).
     Reach(Vec<OsString>),
+    /// `blaze prove`, with the words after it ([`super::prove::main`]).
+    Prove(Vec<OsString>),
     /// `blaze slow`, with the words after it ([`super::observe::slow`]).
     Slow(Vec<OsString>),
     /// `blaze doctor`, with the words after it ([`super::doctor::main`]).
     Doctor(Vec<OsString>),
+    /// `blaze audit [pin|fetch]`, with the words after it ([`super::audit::main`]).
+    Audit(Vec<OsString>),
+    /// `blaze diagnostics`, with the words after it ([`super::diagnostics::main`]).
+    Diagnostics(Vec<OsString>),
+    /// `blaze agents install|hook|status|remove`, with the words after `agents`
+    /// ([`super::agents::main`]).
+    Agents(Vec<OsString>),
     /// `blaze pprof FILE|URL ...`, with the words after it ([`super::pprof::main`]).
     Pprof(Vec<OsString>),
     /// `blaze perf record|runs|diff ...`, with the words after it ([`super::perf::main`]).
@@ -466,8 +549,8 @@ pub enum DaemonVerb {
 pub struct Invocation {
     pub command: Option<Command>,
     /// The words before `--`, as typed, flags typed before the command first: cargo's to read.
-    /// None of `run`'s program arguments, nor blaze's own `--reached`, `--ub*` and `--refused`,
-    /// nor `-C`.
+    /// None of `run`'s program arguments, nor blaze's own `--reached`, `--ub*`, `--refused`
+    /// and `--goal`, nor `-C`.
     pub args: Vec<String>,
     /// `test`'s and `bench`'s `TESTNAME`.
     pub filter: Option<String>,
@@ -538,8 +621,67 @@ pub fn refused(asked: &Invocation) -> Option<String> {
                 format!("`blaze doc` writes no JSON messages for the pages yet (`--message-format {it}`)")
             })
         }
+        Command::Check if flags.query.is_some() && (flags.rules.is_some() || !flags.replace.is_empty() || flags.dry_run) => {
+            Some("`--query` writes nothing: run `--rules`, `--replace` and `--dry-run` apart".to_owned())
+        }
+        Command::Check if flags.dry_run && flags.rules.is_none() && flags.replace.is_empty() => {
+            Some("`--dry-run` shows the edits `--rules` or `--replace` would make: give one of them".to_owned())
+        }
+        // The view a rules file runs over is the daemon's of the whole checkout; nothing yet
+        // narrows it, so a selection would be accepted and change nothing.
+        Command::Check
+            if (flags.query.is_some() || flags.rules.is_some() || !flags.replace.is_empty())
+                && !flags.selection.is_empty() =>
+        {
+            let given: Vec<String> = flags.selection.iter().map(|it| format!("`--{it}`")).collect(); // alloc: a refusal's few flags
+            Some(format!(
+                "{} reads the daemon's view of the whole checkout, which no build selection narrows yet, \
+                 so {} would change nothing: run it without",
+                rules_mode(flags),
+                given.join(", ")
+            ))
+        }
+        // `replaced` writes a diff or a status line, never JSON.
+        Command::Check
+            if flags.query.is_none()
+                && (flags.rules.is_some() || !flags.replace.is_empty())
+                && flags.message_format.iter().flat_map(|it| it.split(',')).any(|it| it.to_ascii_lowercase().starts_with("json")) =>
+        {
+            Some(format!(
+                "{} writes a diff or a status line and no JSON messages yet, so `--message-format` json \
+                 would change nothing: run it without",
+                rules_mode(flags)
+            ))
+        }
+        // No build runs, no lock file is read and nothing is fetched or configured: these
+        // would be accepted and change nothing.
+        Command::Check
+            if (flags.query.is_some() || flags.rules.is_some() || !flags.replace.is_empty())
+                && !flags.build_only.is_empty() =>
+        {
+            Some(format!(
+                "{} runs no build, reads no lock file, fetches nothing and sends no cargo config, \
+                 so `{}` would change nothing: run it without",
+                rules_mode(flags),
+                flags.build_only.join("`, `")
+            ))
+        }
+        Command::Check
+            if (flags.rules.is_some() || flags.query.is_some())
+                && (flags.fix || flags.baselines.is_some() || !flags.lint_levels.is_empty()) =>
+        {
+            Some("`--rules` and `--query` check nothing: run `--fix`, `--baselines` and lint levels apart".to_owned())
+        }
         Command::Check if !flags.replace.is_empty() && (flags.fix || flags.baselines.is_some()) => {
             Some("`--replace` makes its edits and checks nothing: run `--fix` and `--baselines` apart".to_owned())
+        }
+        // A level given to a run that lints nothing would set nothing.
+        Command::Check if !flags.lint_levels.is_empty() && (asked.lock || !flags.replace.is_empty()) => {
+            let what = if asked.lock { "`blaze lock`" } else { "`--replace`" };
+            Some(format!(
+                "{what} checks nothing, so `{}` would set no lint's level: give it to a `blaze check`",
+                flags.lint_levels[0]
+            ))
         }
         Command::Check if flags.fix && flags.baselines.is_some() => {
             Some("`--fix` changes the findings `--baselines` counts: run them apart".to_owned())
@@ -559,6 +701,15 @@ pub fn refused(asked: &Invocation) -> Option<String> {
             )
         }
         _ => None,
+    }
+}
+
+/// Which of `--query`, `--rules` and `--replace` a refusal names, the first given.
+fn rules_mode(flags: &Flags) -> &'static str {
+    match (&flags.query, &flags.rules) {
+        (Some(_), _) => "`--query`",
+        (None, Some(_)) => "`--rules`",
+        (None, None) => "`--replace`",
     }
 }
 
@@ -598,13 +749,20 @@ pub struct Flags {
     /// lists what failed and what each failure left unbuilt. Passed on to the daemon.
     /// `--keep-going` and `--no-fail-fast` are accepted and change nothing.
     pub fail_fast: bool,
-    pub reached: bool,
+    /// `--run-all`: every test asked runs, none reported cached; what each run learns is still
+    /// kept.
+    pub run_all: bool,
+    /// `--no-tests pass`: a run that ran no test is a pass, as cargo and libtest have it.
+    /// Without it such a run is refused ([`super::test::refusal`]).
+    pub no_tests_pass: bool,
     /// `--ub`, or either of its values, which imply it.
     pub ub: bool,
     pub ub_seed: Option<u64>,
     pub ub_schedules: Option<u32>,
     /// `--refused`: `None` without it, `Some(None)` for `all`, else `Some(Some(N))`.
     pub refused: Option<Option<u32>>,
+    /// `--goal`: `None` without it, for the profile's own goal.
+    pub goal: Option<blaze_api::Goal>,
     /// `--unit-graph` and `--timings`, by name, as given.
     pub reports: Vec<&'static str>,
     /// `check`'s `--fix`, and each `--lint` it is narrowed to.
@@ -612,14 +770,76 @@ pub struct Flags {
     pub lints: Vec<String>,
     /// `check`'s `--replace`, each `FROM=TO` as given.
     pub replace: Vec<String>,
+    /// `check`'s `--rules` and `--query`, each a rules file's path as given, and `--dry-run`.
+    pub rules: Option<String>,
+    pub query: Option<String>,
+    pub dry_run: bool,
     /// `check`'s `--baselines`, `--bless-baselines` and each `--new-baseline`.
     pub baselines: Option<String>,
     pub bless_baselines: bool,
     pub new_baselines: Vec<String>,
+    /// `--no-prebuilt`: no record of this request comes from a pack source.
+    pub no_prebuilt: bool,
+    /// `check`'s, `build`'s and `run`'s `--no-daemon`: the request runs in this process
+    /// ([`NO_DAEMON`]).
+    pub no_daemon: bool,
+    /// `check`'s `--allow`, `--warn`, `--deny` and `--forbid`, each as one flag
+    /// (`--deny=blaze::todo`), in the order given, as the daemon's load keeps them
+    /// (`Asked::lint_levels` of blaze-units).
+    pub lint_levels: Vec<String>,
+    /// Each flag of [`SELECTS_A_BUILD`] given, by its long name, in order.
+    pub selection: Vec<&'static str>,
+    /// Each flag of [`STEERS_A_BUILD`] given, and each `-Z` but `unstable-options`, as typed
+    /// in short: what a build reads and `--query`, `--rules` and `--replace` would not.
+    pub build_only: Vec<String>,
 }
+
+/// The flags that steer how a build runs: its jobs, what it does past a failure, the lock
+/// file and the network, cargo's config. `--query`, `--rules` and `--replace` run no build,
+/// read no lock file, fetch nothing, and send none of the config, so they refuse each by name
+/// ([`refused`]). `-Z unstable-options` is read: it allows `-C`, which they honour.
+const STEERS_A_BUILD: &[&str] =
+    &["jobs", "keep-going", "fail-fast", "no-fail-fast", "locked", "frozen", "offline", "no-locked", "config"];
+
+/// The flags that choose what a build compiles and reports: packages, features, profile,
+/// target and targets. `--query`, `--rules` and `--replace` read the checkout as the daemon's
+/// view opens it, so they refuse each of these by name ([`refused`]).
+const SELECTS_A_BUILD: &[&str] = &[
+    "package",
+    "workspace",
+    "all",
+    "exclude",
+    "features",
+    "all-features",
+    "no-default-features",
+    "release",
+    "profile",
+    "target",
+    "lib",
+    "bin",
+    "bins",
+    "example",
+    "examples",
+    "test",
+    "tests",
+    "bench",
+    "benches",
+    "all-targets",
+    "unit-graph",
+    "timings",
+];
 
 impl Flags {
     fn read(&mut self, flag: &Flag, value: Option<&str>) {
+        if let Some(name) = flag.long.filter(|it| SELECTS_A_BUILD.contains(it)) {
+            self.selection.push(name);
+        }
+        if let Some(name) = flag.long.filter(|it| STEERS_A_BUILD.contains(it)) {
+            self.build_only.push(format!("--{name}"));
+        }
+        if flag.long.is_none() && flag.short == Some('Z') && value != Some("unstable-options") {
+            self.build_only.push(format!("-Z {}", value.unwrap_or_default()));
+        }
         let owned = || value.map(str::to_owned);
         match flag.long.unwrap_or("") {
             "manifest-path" => self.manifest_path = owned(),
@@ -657,7 +877,9 @@ impl Flags {
             "no-run" => self.no_run = true,
             "fail-fast" => self.fail_fast = true,
             "no-fail-fast" | "keep-going" => {}
-            "reached" => self.reached = true,
+            "run-all" => self.run_all = true,
+            // `check_value` held it to `fail` and `pass` first.
+            "no-tests" => self.no_tests_pass = value.is_some_and(|it| it.eq_ignore_ascii_case("pass")),
             "ub" => self.ub = true,
             name @ ("unit-graph" | "timings") => self.reports.push(name),
             // `check_value` parsed them first.
@@ -670,14 +892,25 @@ impl Flags {
                 self.ub_schedules = value.and_then(|it| it.parse().ok());
             }
             "refused" => self.refused = value.map(|it| it.parse().ok()),
+            // `check_value` held it to the goals' names first.
+            "goal" => self.goal = value.and_then(blaze_api::Goal::named),
             "fix" => self.fix = true,
             "lint" => self.lints.extend(owned()),
             "replace" => self.replace.extend(owned()),
+            "rules" => self.rules = owned(),
+            "query" => self.query = owned(),
+            "dry-run" => self.dry_run = true,
             "baselines" => self.baselines = owned(),
             "bless-baselines" => self.bless_baselines = true,
+            "no-prebuilt" => self.no_prebuilt = true,
+            "no-daemon" => self.no_daemon = true,
             "new-baseline" => {
                 let lints = value.unwrap_or_default().split(',');
                 self.new_baselines.extend(lints.filter(|it| !it.is_empty()).map(str::to_owned));
+            }
+            // `check_value` held each to a lint's name first.
+            level @ ("allow" | "warn" | "deny" | "forbid") => {
+                self.lint_levels.extend(value.map(|lint| format!("--{level}={lint}")));
             }
             _ => {}
         }
@@ -727,11 +960,17 @@ pub enum Said {
         value: String,
         flag: &'static Flag,
     },
-    /// A number clap's `value_parser` refuses, with why (`invalid digit found in string`).
-    NotNumber {
+    /// A value the flag's own parser refuses, with why: a number clap's `value_parser` does
+    /// (`invalid digit found in string`), a lint's level `blaze_units::lint_level` does.
+    Invalid {
         value: String,
         flag: &'static Flag,
         why: String,
+    },
+    /// One of `check`'s lint levels ([`LEVELS`]) given to `command`, which takes none.
+    CheckOnly {
+        flag: &'static Flag,
+        command: Command,
     },
     /// A flag that takes one value, or none, given again.
     Twice {
@@ -767,12 +1006,24 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
             Some("explain") => return Ok(Asked::Explain(words.collect())),
             Some("why") => return Ok(Asked::Why(words.collect())),
             Some("reach") => return Ok(Asked::Reach(words.collect())),
+            Some("prove") => return Ok(Asked::Prove(words.collect())),
             Some("slow") => return Ok(Asked::Slow(words.collect())),
             Some("doctor") => return Ok(Asked::Doctor(words.collect())),
+            Some("audit") => return Ok(Asked::Audit(words.collect())),
+            Some("diagnostics") => return Ok(Asked::Diagnostics(words.collect())),
+            Some("agents") => return Ok(Asked::Agents(words.collect())),
             Some("pprof") => return Ok(Asked::Pprof(words.collect())),
             Some("perf") => return Ok(Asked::Perf(words.collect())),
             Some("clean") => return Ok(Asked::Clean(words.collect())),
             Some("cache") => return Ok(Asked::Cache(words.collect())),
+            // `blaze store verify` is the same command's (`cli::cache`).
+            Some("store") => {
+                return Ok(Asked::Cache(std::iter::once("store".into()).chain(words).collect()));
+            }
+            // `blaze gc ...` is `blaze cache gc ...`.
+            Some("gc") => {
+                return Ok(Asked::Cache(std::iter::once("gc".into()).chain(words).collect()));
+            }
             Some("fetch-url") => return Ok(Asked::FetchUrl(words.collect())),
             Some("fmt") => return Ok(Asked::Fmt(words.collect())),
             Some("new") => return Ok(Asked::New { init: false, words: words.collect() }),
@@ -930,6 +1181,9 @@ fn command_line_after(
                 None => (long, None),
             };
             let Some(flag) = command.flag(|it| it.long == Some(name)) else {
+                if let Some(flag) = LEVELS.iter().find(|it| it.long == Some(name)) {
+                    return Err(refused(Said::CheckOnly { flag, command }, &[]));
+                }
                 let similar = similar(command, name);
                 if let Some(flag) =
                     similar.and_then(|it| command.flag(|flag| flag.long == Some(it)))
@@ -1110,24 +1364,29 @@ fn run_program(asked: &mut Invocation, words: impl Iterator<Item = OsString>) {
 
 fn check_value(flag: &'static Flag, value: Option<&str>) -> Result<(), Said> {
     let Some(value) = value else { return Ok(()) };
-    let not_number = |why: String| Said::NotNumber { value: value.to_owned(), flag, why };
+    let invalid = |why: String| Said::Invalid { value: value.to_owned(), flag, why };
     match flag.long {
+        // A lint's name, and no level below `deny` for `blaze::unreachable`.
+        Some(level @ ("allow" | "warn" | "deny" | "forbid")) => {
+            let refused = blaze_units::lint_level::refused(level, value);
+            return refused.map_or(Ok(()), |why| Err(invalid(why)));
+        }
         Some("ub-seed") => {
-            return value.parse::<u64>().map(drop).map_err(|it| not_number(it.to_string()));
+            return value.parse::<u64>().map(drop).map_err(|it| invalid(it.to_string()));
         }
         Some("refused") if value == "all" => return Ok(()),
         Some("refused") => {
             return value
                 .parse::<u32>()
                 .map(drop)
-                .map_err(|it| not_number(format!("{it}: a count, or `all`")));
+                .map_err(|it| invalid(format!("{it}: a count, or `all`")));
         }
         // `value_parser!(u32).range(1..)`.
         Some("ub-schedules") => {
             return match value.parse::<u32>() {
-                Ok(0) => Err(not_number(format!("0 is not in 1..={}", u32::MAX))),
+                Ok(0) => Err(invalid(format!("0 is not in 1..={}", u32::MAX))),
                 Ok(_) => Ok(()),
-                Err(error) => Err(not_number(error.to_string())),
+                Err(error) => Err(invalid(error.to_string())),
             };
         }
         _ => {}
@@ -1332,10 +1591,14 @@ pub fn refusal(usage: &Usage, color: bool) -> String {
             paint(say::VALID, &flag.shown()),
             usage_line(&[])
         ),
-        Said::NotNumber { value, flag, why } => format!(
+        Said::Invalid { value, flag, why } => format!(
             "{error} invalid value '{}' for '{}': {why}{more}",
             paint(say::WARN, value),
             paint(say::VALID, &flag.shown())
+        ),
+        Said::CheckOnly { flag, command } => format!(
+            "{error} {}{more}",
+            blaze_units::lint_level::check_only(flag.long.unwrap_or_default(), command.name())
         ),
         Said::Twice { flag } => format!(
             "{error} the argument '{}' cannot be used multiple times{}{more}",

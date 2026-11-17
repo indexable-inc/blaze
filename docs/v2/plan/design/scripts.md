@@ -298,6 +298,8 @@ the row says otherwise. `state`: `written` (the Rust is in the tree, not yet com
 | share | written | `... share.py '{"engine": {"kind": "v2", "blaze": "<blaze>"}, "out": "/root/sh-py.json", "work": "/root/sh-py"}'`, and with `"programs": ["type_id", "statics"], "jobs": 1` | `R share -- <the same>` with `/root/sh-rs.json` and `/root/sh-rs` | the outcome lines in the programs' order, the summary and the status, with the work path and each `blaze_s` normalized; the out files equal after the same normalizing and with `host`, `started`, `ended` taken out. Then with `"programs": ["nope"]`, `"jobs": 0`, `"dir": "/nope"`, `"engine": {"kind": "v2", "blaze": "/nope"}`, a `.rs` with no `.stdout` in a copy of the programs (`"dir"` naming it), no argument: the same lines, status 1 (the lone `.rs`: an `error` outcome, status 1); `"work"` on a file system blaze cannot clone on (tmpfs `/tmp` on a VM): status 1 from both, the Python's a traceback |
 | debug_side | written | `uv run --frozen python harness/v2/debug_side.py selftest` | `R debug_side -- selftest` | output (`debug_side.py selftest: ok`), status 0 |
 | debug_side | written | `... debug_side.py '{"engine": {"kind": "v2", "blaze": "<blaze>"}, "out": "/root/ds-py.json", "work": "/root/ds-py"}'` | `R debug_side -- <the same>` with `/root/ds-rs.json` and `/root/ds-rs` | the outcome lines (sizes, build id, backtrace, gdb, lldb), the summary and the status, with the work path normalized; the out files equal with `host`, `started`, `ended` taken out and the work path normalized. `"engine": {"kind": "v2", "blaze": "/nope"}`, `{}`, no argument: the same lines, status 1; `"work"` on tmpfs as for share |
+| nostd | written | `uv run --frozen python harness/v2/nostd.py selftest` | `R nostd -- selftest` | output (`nostd.py selftest: ok`), status 0 |
+| nostd | written | `... nostd.py '{"command": "check"}'`, `"progress"`, `"list"`, and `"list"` with `"root": "."` | `R nostd -- <the same>` | output and status on a clean tree. Then with ban lists of the wrong shape (`banned` missing, `sys` a string) and one listing a path twice and a path that names nothing (`check`, `progress`); then planted together, a crate `crates/blaze-core-x` (after `blaze-core` by parts, before it by text) with a `std::{fs, time::Instant, net}` group, a CRLF file with a byte that is not UTF-8, a test module, a `tests/` file, `extern crate std` with `libc::`, and `extern crate std` under its `target/`: the same lines and status for `check`, `progress`, `list`. `{}`, `{"command": "lst"}`, `"bans": 3`, an unknown field, `[]`, no argument, two arguments: the same lines, status 1. A ban list that is not there: status 1 from both, the Python's a traceback |
 
 Known differences, on purpose: the words of a JSON syntax error are serde_json's; a heading's
 anchor keeps a character by Rust's `char::is_alphanumeric` and a table of combining-mark blocks
@@ -321,7 +323,10 @@ refusal in `main`, a section reader's `ValueError` or `struct.error` on a short 
 `<script>: <Type>: <message>` line, status 1, still with no report written; a program that does
 not start in a missing directory is named by its program, not the directory;
 `PYTHON_CPU_COUNT` is not read. `share`'s selftest says the `repr` of a failed check's values in
-Rust's `Debug` (`["a"]` for `['a']`); only a failing selftest shows it.
+Rust's `Debug` (`["a"]` for `['a']`); only a failing selftest shows it, as `nostd`'s. `nostd`
+ends with a line where the Python raised on a file it could not read, a ban list that is not
+there, and a manifest or lock file that is not TOML; its module pattern's lookahead is tried by
+hand after each candidate (no candidate can start inside a failed one, so the counts agree).
 
 ## Appendix: every Python file
 
@@ -477,8 +482,10 @@ Rust's `Debug` (`["a"]` for `['a']`); only a failing selftest shows it.
 | harness/v2/lean_differential.py | 205 | LIVE | named in lean/Blaze/Tests/Fnv1aMain.lean (+2) |
 | harness/v2/lean_gate.py | 478 | LIVE | run by .github/workflows/blaze.yaml |
 | harness/v2/ledger.py | 325 | SWITCHED | deleted: scripts/src/bin/ledger.rs agreed with it on blaze 0.20261105.4 (2026-11-11) |
+| harness/v2/loop_syscalls.py | 385 | LIVE | a ledger check in docs/v2/plan/objectives.json; not yet ported: it builds fixture.py's smoke workspace through budgets.py, both still Python |
 | harness/v2/macroeval_corpus.py | 534 | LIVE | used by live harness/v2/proof.py |
 | harness/v2/mir_semantics.py | 451 | LIVE | a ledger check in docs/v2/plan/objectives.json |
+| harness/v2/nostd.py | 278 | LIVE | a ledger check in docs/v2/plan/objectives.json; ported to scripts/src/bin/nostd.rs, parity not yet run |
 | harness/v2/oracle.py | 800 | LIVE | a ledger check in docs/v2/plan/objectives.json |
 | harness/v2/pins.py | 78 | LIVE | run by .github/workflows/realprojects.yaml |
 | harness/v2/proof.py | 468 | LIVE | used by live harness/v2/report.py |

@@ -8,8 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config as SimConfig, Tape};
 
 use super::*;
 
@@ -31,16 +30,16 @@ struct Case {
     rounds: Vec<Round>,
 }
 
-fn draw_case(tc: &TestCase) -> Case {
-    let rounds = tc.draw(gs::integers::<u8>().min_value(1).max_value(4));
+fn draw_case(tape: &Tape) -> Case {
+    let rounds = tape.int_in(1..=4u8, "rounds");
     Case {
-        seed: tc.draw(gs::integers()),
-        fail_one_in: [0, 9, 4][usize::from(tc.draw(gs::integers::<u8>().max_value(2)))],
+        seed: tape.next_u64("sim seed"),
+        fail_one_in: [0, 9, 4][usize::from(tape.int_in(0..=2u8, "fail one in"))],
         rounds: (0..rounds)
             .map(|_| Round {
-                puts: tc.draw(gs::integers::<u64>().min_value(1).max_value(24)),
-                polls: tc.draw(gs::integers::<u64>().max_value(40)),
-                settles: tc.draw(gs::integers::<u8>().max_value(3)) == 0,
+                puts: tape.int_in(1..=24u64, "puts"),
+                polls: tape.int_in(0..=40u64, "polls before the crash"),
+                settles: tape.int_in(0..=3u8, "settles") == 0,
             })
             .collect(),
     }
@@ -189,12 +188,12 @@ fn crashes(case: &Case, plant: bool) -> Result<(), String> {
 /// The invariant: after a crash at any point of any number of commits, under injected IO
 /// failures, the store opens; each pack's checks file holds the checks of the blocks its head
 /// names, and the store holds the same; every put reported durable reads back the bytes it was
-/// given; and no value reads back other bytes than were put. `HEGEL_TEST_CASES=<n>` runs it
+/// given; and no value reads back other bytes than were put. `BLAZE_SIM_SEEDS=<n>` runs it
 /// longer.
 #[test]
 fn a_crash_leaves_every_pack_and_its_checks_as_the_head_names_them() {
-    super::model_check::run_cases(48, |tc| {
-        let case = draw_case(&tc);
+    blaze_sim::check(SimConfig::cases(48), |tape| {
+        let case = draw_case(tape);
         if let Err(why) = crashes(&case, false) {
             panic!("{case:?}: {why}");
         }
@@ -259,6 +258,13 @@ pub(super) fn head_before_syncs_caught() -> (u64, String) {
     caught.expect("the oracle missed the planted head written before its syncs")
 }
 
+/// Whether a store that did not open says its head names bytes that are not on the disk:
+/// said by the open's own scan ("its head names ..."), or, since packs are read through the
+/// pool, by the pool's load of the pack, which got fewer bytes than the head commits.
+pub(super) fn names_what_is_not_there(why: &str) -> bool {
+    why.contains("its head names") || (why.contains(" bytes of the ") && why.contains(" committed there"))
+}
+
 /// The planted-bug control (bug 7): with the head written before the syncs of its packs and
 /// their checks complete, the directed case fails under some seed's crash, and fails as that
 /// bug does: the store does not open, because its head names bytes of a pack, or checks of
@@ -267,7 +273,7 @@ pub(super) fn head_before_syncs_caught() -> (u64, String) {
 fn the_oracle_catches_a_head_written_before_its_syncs() {
     let (seed, why) = head_before_syncs_caught();
     assert!(
-        why.contains("did not open") && why.contains("its head names"),
+        why.contains("did not open") && names_what_is_not_there(&why),
         "seed {seed}: caught, but not as a head naming what is not durable: {why}"
     );
 }
@@ -524,8 +530,8 @@ fn a_read_at_the_pinned_bound_waits_its_ticks_and_is_refused_naming_the_bound() 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[test]
 fn a_store_with_a_loader_loads_what_is_read_and_again_once_it_is_given_back() {
-    let root = std::env::temp_dir().join(format!("blaze-cas-loader-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&root);
+    let held = blaze_core::temp::TempDir::for_test("blaze-cas-loader-");
+    let root = held.path().to_path_buf();
     let loader = || Loader::Thread { root: root.clone() };
     {
         let mut driven = Driven::open_with(&root, loader()).unwrap();
@@ -561,5 +567,4 @@ fn a_store_with_a_loader_loads_what_is_read_and_again_once_it_is_given_back() {
         );
     }
     drop(driven);
-    _ = std::fs::remove_dir_all(&root);
 }

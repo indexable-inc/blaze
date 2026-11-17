@@ -1,0 +1,14 @@
+{
+ "id": "program-oracle-compared-layout",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane: crates/blaze-program, merge-1113, round 3",
+ "where": "crates/blaze-program/src/tests/world.rs (trace, check, fresh)",
+ "what": "Two oracles of the program simulation were wrong, not the code under test, and two rounds of fixes went at the code: the run oracle printed a static's raw bytes (its relocated field holds an address, so any move of the function it points at made a correct run differ), and the fresh build it compared against was built all at the fast tier, so after any tier-up the node sets could not match. The failure messages said only 'a run differs' and 'N nodes against M', so the cause had to be guessed in a lane that cannot run anything.",
+ "cost": "two compile-and-test rounds of the main agent spent on fixes aimed at the wrong cause",
+ "cause": "an oracle that compares a layout quantity (an address) as behaviour, and a reference build that does not take the same state (the tier of each row) as the system under test; failure messages that do not name the node",
+ "class": "an oracle not derived from the same rule as the code it checks, with failures that do not name the differing thing",
+ "prevention": "build the reference with the code's own rule (here Program::seeds with Program::top_tier); compare content, never addresses; every oracle failure names the first differing node and how (first_difference)",
+ "workaround": "none needed now",
+ "fix": "world.rs: Event::Static carries the static's view; fresh() takes the top-tier set; first_difference names missing/extra row, other key or other bytes",
+ "state": "fixed, unverified until the main agent runs the tests"
+}

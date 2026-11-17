@@ -118,7 +118,7 @@ const HEADER: usize = 32;
 const SEGMENT: usize = 72;
 const SECTION: usize = 80;
 const NLIST: usize = 16;
-const UNWIND_INFO: &str = "__unwind_info";
+pub(crate) const UNWIND_INFO: &str = "__unwind_info";
 /// How far from the base a Mach-O image's regions reach, their room included: a section's
 /// file offset is 32 bits (and every region's is its address less the base), `__unwind_info`
 /// names a function by a 32-bit offset from the base, and a dev executable runs in 4 GiB of
@@ -1779,22 +1779,22 @@ impl MachO {
         let exported: blaze_hash::HashSet<&str, std::alloc::Global> =
             // alloc: one set per link, sized once by the exports
             placed.exports.iter().map(|it| it.name.as_str()).collect();
-        let mut locals: Vec<(u64, &str)> = Vec::with_capacity(placed.functions.len());
-        // alloc: none unless kept, one index per function
-        let mut locals_of = Vec::with_capacity(if keep { placed.functions.len() } else { 0 });
-        for function in placed.functions {
-            let local = function.name.as_deref().filter(|it| !exported.contains(it));
-            if keep {
-                locals_of.push(if local.is_some() { locals.len() as u32 } else { u32::MAX });
-            }
-            if let Some(name) = local {
-                locals.push((function.addr, name));
-            }
+        // The locals by their names' hash, never by address ([`crate::model::local_order`]):
+        // an edited function keeps its entry and its name's place.
+        let functions = placed.functions;
+        let order = crate::model::local_order(functions, |name| !exported.contains(&name), std::alloc::Global);
+        let mut locals: Vec<(u64, &str), std::alloc::Global> = Vec::with_capacity_in(order.len(), std::alloc::Global);
+        let mut locals_of: Vec<u32, std::alloc::Global> =
+            Vec::with_capacity_in(if keep { functions.len() } else { 0 }, std::alloc::Global);
+        if keep {
+            locals_of.resize(functions.len(), u32::MAX);
         }
-        if !locals.is_sorted() {
-            locals.sort_unstable();
-            // The locals aren't in the functions' order: a patch can't find them by it.
-            locals_of.clear();
+        for (at, nth) in order.iter().enumerate() {
+            let function = &functions[*nth as usize];
+            locals.push((function.addr, function.name.as_deref().unwrap_or_default()));
+            if keep {
+                locals_of[*nth as usize] = at as u32;
+            }
         }
 
         // The defined: what the image exports and, in an executable, its header.
@@ -2158,8 +2158,8 @@ fn section_in(ranges: &[(u64, u64, u8)], addr: u64, what: &str) -> Result<u8, Li
 }
 
 /// Patches the kept symbol table's locals for the functions that changed in place
-/// ([`Delta::functions`], every run of the same length): each local or not as before, with a
-/// name of the same length, and the locals still in order. `false` where one isn't, and
+/// ([`Delta::functions`], every run of the same length): each local or not as before, under
+/// the same name, so in the same place of the locals' order. `false` where one isn't, and
 /// `symbols` is then to be built again; its bytes are a full build's either way.
 fn patch_locals(
     symbols: &mut Symbols,
@@ -2205,28 +2205,19 @@ fn patch_locals(
             as usize;
         let (prefix, rest) = spelled(name);
         let len = prefix.len() + rest.len();
+        // The same name: the locals are ordered by it ([`crate::model::local_order`]), so
+        // another one, of any length, takes another entry, and the table is built.
         let Some(stored) = symbols.strings.get(strx..strx + len + 1) else { return Ok(false) };
-        if stored[len] != 0 || stored[..len].contains(&0) {
+        if stored[len] != 0
+            || stored[..prefix.len()] != *prefix.as_bytes()
+            || stored[prefix.len()..len] != *rest.as_bytes()
+        {
             return Ok(false);
         }
         let sect = section_in(ranges, function.addr, name)?;
         let entry = &mut symbols.nlist[entry..entry + NLIST];
         entry[5] = sect;
         entry[8..16].copy_from_slice(&function.addr.to_le_bytes());
-        symbols.strings[strx..strx + prefix.len()].copy_from_slice(prefix.as_bytes());
-        symbols.strings[strx + prefix.len()..strx + len].copy_from_slice(rest.as_bytes());
-    }
-    // In order: a full build sorts the locals by (address, name) only when they aren't.
-    let key =
-        |nth: usize| (functions[nth].addr, functions[nth].name.as_deref().unwrap_or_default());
-    let locals_of = &symbols.locals_of;
-    for nth in changed().filter(|&it| locals_of[it] != u32::MAX) {
-        let before = (0..nth).rev().find(|&it| locals_of[it] != u32::MAX);
-        let after = (nth + 1..functions.len()).find(|&it| locals_of[it] != u32::MAX);
-        if before.is_some_and(|it| key(it) > key(nth)) || after.is_some_and(|it| key(nth) > key(it))
-        {
-            return Ok(false);
-        }
     }
     Ok(true)
 }

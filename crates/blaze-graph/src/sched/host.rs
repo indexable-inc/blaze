@@ -380,6 +380,49 @@ pub fn waits_now() -> super::Waits {
     super::Waits(waits)
 }
 
+/// [`waits_now`] into `into` (cleared first), each job by its observed id ([`observed`]), with
+/// the observed id of the job its wait is on (a job it joins, a key's claimer), if any: the
+/// task watchdog's look, which allocates nothing once `into` has grown to the most jobs parked
+/// at once.
+pub fn waits_now_into(into: &mut Vec<(u64, super::StallWait, Option<u64>)>) {
+    into.clear();
+    for root in roots() {
+        let g = lock(&root);
+        g.world.waits_each(|job, wait| {
+            let on = match wait {
+                super::StallWait::Job(other) => Some(other),
+                super::StallWait::Key { claimer, .. } => claimer,
+                super::StallWait::Counter(_) | super::StallWait::Pool(_) => None,
+            };
+            into.push((g.world.observed(job), wait, on.map(|it| g.world.observed(it))));
+        });
+    }
+}
+
+/// The parked job the observer numbers `observed` (a generation and a slot, so a slot reused
+/// by a later job is never failed in its place) wakes to fail with a [`super::Stopped`] of
+/// [`super::StopReason::Stuck`], at its wait's end ([`fail_if_stalled`]), as a stall's jobs
+/// fail: the task watchdog found it still for `still_ns`. Whether it was parked in some
+/// scheduler and could be woken ([`World::fail_stuck`]).
+pub fn fail_stuck(observed: u64, still_ns: u64) -> bool {
+    for root in roots() {
+        let mut g = lock(&root);
+        let mut found = None;
+        g.world.waits_each(|job, _| {
+            if found.is_none() && g.world.observed(job) == observed {
+                found = Some(job);
+            }
+        });
+        let Some(job) = found else { continue };
+        let woke = g.world.fail_stuck(job, still_ns);
+        if woke {
+            woke_failing(&mut g, 1);
+        }
+        return woke;
+    }
+    false
+}
+
 /// A wait of `job`, of scheduler `sched`, ended: if a stall or its pool's stop ended it, the
 /// job fails with that, here.
 #[inline(never)]
@@ -542,6 +585,28 @@ impl<'a> Host<'a> {
             ended,
             inside,
         }
+    }
+
+    /// Gives back what this worker's stacks hold for no job, as it parks after an idle
+    /// daemon's ask (`blaze_mem::frame::settle_spare`): each idle fiber is told to exit and
+    /// dropped, its stack unmapped and so its pages returned, and the pages of the worker's
+    /// own thread stack below the calling frame are given back
+    /// ([`super::stack::give_back_below_here`]). The next job makes a fiber again
+    /// ([`Host::run`]). Called on the worker's own thread stack, outside any fiber. The bytes
+    /// of the thread's stack it advised.
+    ///
+    /// # Errors
+    ///
+    /// Where the thread's stack could not be found or the kernel refused the advice, naming
+    /// the range: a refusal over a live stack is a bug in how the range was found, which the
+    /// pool stops on as on a refused park, never a page kept quietly.
+    pub(crate) fn give_back_stacks(&mut self) -> std::io::Result<usize> {
+        let _switch = DriverSpan::open(Driving::Switch);
+        for fiber in self.idle.drain(..) {
+            exit(fiber);
+        }
+        // The vector's room stays: a worker's own, made once.
+        super::stack::give_back_below_here()
     }
 
     /// Runs `job` (one the pool was given, or a parked one given back) on a fiber until it ends
@@ -1049,7 +1114,7 @@ pub(crate) fn before_claim() -> Result<(), super::NoProgress> {
     let waiting = crate::pump::Waiting::begin(
         crate::wait::WaitKind::Key,
         &mut |it| gave_way.name_wait(it),
-        || Some(gave_way.owner),
+        || crate::wait::Owner::Job(gave_way.owner),
     );
     let waited = wait(Wait::Key(gave_way.flight));
     drop(waiting);

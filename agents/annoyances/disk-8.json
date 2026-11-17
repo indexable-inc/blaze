@@ -1,0 +1,11 @@
+{
+ "id": "disk-8",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+ "where": "blaze: the idle daemon",
+ "what": "An idle daemon still wakes its loop every 50 ms, its profile drain every 50 ms and its stop guard every 100 ms, each a span, and plots ten counters every 50 ms: 45 span rows and 235 counter rows a second with nothing happening, 0.15 MB a minute of history after this lane's changes (1.2 MB before).",
+ "cost": "about 220 MB a day of history for a daemon left running, which the cap now takes back first",
+ "cause": "polling loops where a wait on an event would do, and gauges written whether or not they changed",
+ "workaround": "the cap retires rows of no build before any build's (e8aec1d91a)",
+ "state": "open: the ticks themselves are the runtime's"
+}

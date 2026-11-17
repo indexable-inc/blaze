@@ -1928,7 +1928,7 @@ pub(crate) fn type_name<'db>(db: &'db Db, ty: Ty<'db>) -> String {
     // `Debug` names a type only through the attached database: attach it here, where the
     // text is made, on whatever worker the check runs.
     hir_ty_print::rustc_type_name(db, ty)
-        .unwrap_or_else(|| blaze_query::db::attach(db, || format!("{ty:?}")))
+        .unwrap_or_else(|| blaze_memo::attach(db, || format!("{ty:?}")))
 }
 
 fn variant_name(db: &Db, v: EnumVariantId) -> String {

@@ -1,0 +1,11 @@
+{
+ "id": "edit2-11",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+ "where": "blaze-link: compaction",
+ "what": "A stage compacted every list of the image (O(image), 14 ms) every seventh edit of hello world: the jump table's cells are one piece whose rebase list names every filled slot, a body edit fills one slot and empties another, and the whole of the last list (12,000 entries) is garbage each time. Nothing said a compaction ran: it was inside `link patch`.",
+ "cost": "2 ms an edit on average and 14 ms every seventh, seen as `link patch` between 8 and 26 ms",
+ "cause": "one threshold for seven lists, and a list re-pushed whole for one entry",
+ "workaround": "none needed",
+ "state": "fixed on edit2-1111: `link compact` is a span naming the list, and the loader's lists compact alone (a pass over the pieces); open: the cells' rebase list is still made whole by an edit that fills a slot"
+}

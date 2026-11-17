@@ -129,7 +129,7 @@ pub fn declared(db: &Db, adt: AdtId) -> bool {
 
 /// Why the shape of `adt` cannot be program-lifetime, or `None` when it can: the half of the
 /// fact reflection states (the module docs say which).
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn shape(db: &Db, adt: AdtId) -> Option<Refused> {
     let refuse = |why, path: &str, of: String| {
         Some(Refused { ty: adt_name(db, adt), why, path: path.into(), of: of.into() })

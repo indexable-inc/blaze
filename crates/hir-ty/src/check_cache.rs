@@ -12,19 +12,21 @@
 //! mode.
 
 pub(crate) mod ids;
+pub(crate) mod pages;
 mod part;
+pub mod port;
+pub mod runtime;
 #[cfg(test)]
 mod tests;
 
 use std::sync::Arc;
 
-use base_db::{Crate, Db};
+use base_db::{Crate, Db, Given};
 use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Domain, Hasher};
 use hir_def::{
     DefWithBodyId, HasModule,
     deps::{Held as _, ImageBuf, body_key},
-    expr_store::Body,
 };
 use std::alloc::Global;
 
@@ -33,7 +35,7 @@ use self::{
     ids::IdKind,
     part::{BodyRef, PartRef},
 };
-use crate::{InferenceResult, infer::persist::Nodes};
+use crate::InferenceResult;
 
 /// The domain of a bodies part's key.
 pub const BODIES_DOMAIN: &str = "blaze v2 dependency bodies 1";
@@ -81,10 +83,15 @@ pub fn open(bytes: &[u8]) -> Result<(), String> {
 }
 
 /// Has `db` serve the bodies of each crate of `parts` from its part, which [`open`] accepted:
-/// one that does not open here is a panic naming its crate. The same parts as now (the same
-/// buffers) change nothing.
+/// one that does not open here is a panic naming its crate. Each crate's part is given to that
+/// crate ([`base_db::Edit::give`], kind [`BodiesSlot`], all in one commit, so every crate id
+/// the caller holds from before is to be taken again by its key after it), never kept in one
+/// map of every crate: a map
+/// of every crate is a value of the session arena that names every crate's ids, so it would
+/// borrow every crate arena and any crate's change would drop the session's (rule 2). A crate
+/// given the same buffer as now is not given it again; a crate with a part before and none
+/// in `parts` has it taken away.
 pub fn set_served(db: &mut Db, parts: HashMap<Crate, ImageBuf, Global>) {
-    use blaze_query::db::{Durability, Setter};
     for (&krate, buf) in &parts {
         if let Err(why) = part::open(buf.bytes()) {
             panic!(
@@ -94,32 +101,35 @@ pub fn set_served(db: &mut Db, parts: HashMap<Crate, ImageBuf, Global>) {
             );
         }
     }
-    let current = ServedBodies::try_get(&*db);
-    if let Some(it) = current {
-        let now = &it.parts(&*db).0;
-        let same = now.len() == parts.len()
-            && parts
-                .iter()
-                .all(|(krate, buf)| now.get(krate).is_some_and(|it| Arc::ptr_eq(it, buf)));
-        if same {
-            return;
-        }
+    // Each gift by the crate's key, decided in this snapshot and given in one edit: the
+    // commit drops each given crate's arena, and every id of it with it (`parts`' keys too).
+    let crates = base_db::all_crates(&*db);
+    let mut gifts: Vec<(base_db::CrateKey, Given), Global> = Vec::new_in(Global);
+    for &krate in crates.iter() {
+        let now = krate.given::<BodiesSlot, PartBuf>(&*db);
+        let given = match (now, parts.get(&krate)) {
+            (None, None) => continue,
+            (Some(now), Some(buf)) if Arc::ptr_eq(&now.0, buf) => continue,
+            (Some(_), None) => Given::default(),
+            // clone: a counted reference to the part's buffer
+            (_, Some(buf)) => Given::new(PartBuf(buf.clone())),
+        };
+        gifts.push((krate.key(&*db), given));
     }
-    // alloc: setup: the one input value, once per session
-    let served = Served(Arc::new(parts));
-    match current {
-        Some(it) => {
-            it.set_parts(db).with_durability(Durability::HIGH).to(served);
-        }
-        None => {
-            _ = ServedBodies::new(db, Durability::HIGH, served);
-        }
+    drop(crates);
+    if gifts.is_empty() {
+        return;
     }
+    let mut edit = db.edit();
+    for (key, given) in gifts {
+        edit.give::<BodiesSlot>(key, given);
+    }
+    _ = edit.commit();
 }
 
 /// Whether `def`'s body is served and its borrow check passed where it was checked:
 /// `hir_ty_borrowck::gate::checked` then runs no borrow check. `false` for a body that is not
-/// served.
+/// served, and always under an item store in `Mode::Trace` ([`served_body`]).
 pub fn served_passed(db: &Db, def: DefWithBodyId) -> bool {
     served_body(db, def).is_some_and(|(_, body)| body.passed())
 }
@@ -131,51 +141,22 @@ pub fn served_passed(db: &Db, def: DefWithBodyId) -> bool {
 pub fn served_inference(db: &Db, def: DefWithBodyId) -> Option<InferenceResult<'_>> {
     let (krate, body) = served_body(db, def)?;
     let items = served_items(db, krate);
-    // The record's nodes are checked against the body's store, so a hit lowers the body
-    // (its macros expanded) even where nothing else needs it. The record's own type columns
-    // would cap the maps without it, but only if every resolved node has a type, which
-    // nothing here proves, and they bound the allocation, not that a node is the body's.
-    let nodes = Nodes::of(Body::of(db, def));
+    // The record's nodes are checked against the counts of the body's store its writer kept
+    // beside it (`BodyRef::nodes`): the part's key covers the crate's sources, so they are
+    // the store's here, and a hit lowers no body (it did, for `Nodes::of`: one `body_query`
+    // a served body, `a_served_body_is_read_without_lowering_it`).
+    let nodes = body.nodes();
     let result = body
         .inference(db, krate, items, nodes)
         .unwrap_or_else(|why| corrupt(db, krate, Some(def), &why));
     Some(result)
 }
 
-/// The parts of the crates whose bodies are served, set by [`set_served`].
-#[blaze_query::input(singleton, debug)]
-pub(crate) struct ServedBodies {
-    #[returns(ref)]
-    parts: Served,
-}
+/// The kind of a crate's slot holding its bodies part ([`set_served`]).
+pub(crate) struct BodiesSlot;
 
-/// The parts, by crate. Compares by identity: [`set_served`] gives a new one only when a part
-/// changed.
-#[derive(Clone)]
-pub(crate) struct Served(Arc<HashMap<Crate, ImageBuf, Global>>);
-
-impl PartialEq for Served {
-    fn eq(&self, other: &Served) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-impl Eq for Served {}
-
-impl std::hash::Hash for Served {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::ptr::hash(Arc::as_ptr(&self.0), state);
-    }
-}
-
-impl std::fmt::Debug for Served {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Served").field("crates", &self.0.len()).finish()
-    }
-}
-
-/// One crate's part, compared by the buffer it is: what a body's inference reads of the served
-/// parts, so setting them again leaves the bodies of a crate whose part is the same buffer valid.
+/// One crate's part, compared by the buffer it is: [`set_served`] gives a crate a part again
+/// only when its buffer is another.
 #[derive(Clone)]
 struct PartBuf(ImageBuf);
 
@@ -193,21 +174,19 @@ impl std::fmt::Debug for PartBuf {
     }
 }
 
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-fn served_part(db: &Db, krate: Crate) -> Option<PartBuf> {
-    ServedBodies::try_get(db)?.parts(db).0.get(&krate).cloned().map(PartBuf)
-}
-
-/// The crate's items, made in this database once per crate: what each body's ids name.
-#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
-fn served_items(db: &Db, krate: Crate) -> Box<[(IdKind, u64)]> {
+/// The crate's items, made in this database once per crate (kept in the crate's arena): what
+/// each body's ids name.
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
+fn served_items<'db>(db: &'db Db, krate: Crate) -> &'db [(IdKind, u64)] {
     let part = view(db, krate).expect("the items of a crate with a part");
-    part.items(db, krate).unwrap_or_else(|why| corrupt(db, krate, None, &why))
+    let items = part.items(db, krate).unwrap_or_else(|why| corrupt(db, krate, None, &why));
+    blaze_memo::keep_slice(blaze_memo::Database::memo(db), &items)
 }
 
-/// The part of `krate`, opened in place, `None` when it has none.
+/// The part of `krate`, opened in place, `None` when it has none. Reads the crate's slot alone
+/// (`Crate::given`): the read a body's inference makes of the served parts.
 fn view(db: &Db, krate: Crate) -> Option<PartRef<'_>> {
-    let buf = served_part(db, krate).as_ref()?;
+    let buf = krate.given::<BodiesSlot, PartBuf>(db)?;
     Some(part::view(buf.0.bytes()).unwrap_or_else(|why| corrupt(db, krate, None, &why)))
 }
 
@@ -215,8 +194,15 @@ fn view(db: &Db, krate: Crate) -> Option<PartRef<'_>> {
 /// is in a block (it has no key) or the part lists it as left out. A body of a served crate whose
 /// key the part neither records nor lists is a panic naming it: the writing database gave its
 /// bodies other keys, and inferring it instead would hide that.
+///
+/// Never under an item store in `Mode::Trace` (`body_store::tracing`): there no step's answer
+/// comes from anywhere but its own run, so neither [`served_inference`] nor [`served_passed`]
+/// reads a part, whatever parts the database was given. The one door to both, so neither can.
 fn served_body(db: &Db, def: DefWithBodyId) -> Option<(Crate, BodyRef<'_>)> {
-    ServedBodies::try_get(db)?;
+    // Nor under `Mode::Given`, where a body's answers are its body record's alone.
+    if crate::body_store::tracing(db) || crate::body_store::given(db) {
+        return None;
+    }
     let krate = def.krate(db);
     let part = view(db, krate)?;
     let key = body_key(db, def)?;

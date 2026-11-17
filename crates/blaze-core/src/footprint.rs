@@ -149,16 +149,20 @@ fn footprint(pid: libc::pid_t) -> io::Result<Usage> {
 mod tests {
     use super::*;
 
-    fn spawn(script: &str) -> std::process::Child {
+    /// A shell running `script`, by its pid: a driver holds a process by its pid and reaps it
+    /// ([`end`]), so no `Child` is kept.
+    #[expect(
+        blaze::untied_child,
+        reason = "reaped by pid through `crate::process::reap`, as a driver reaps; a guard's kill on drop would signal a pid already reaped"
+    )]
+    fn spawn(script: &str) -> libc::pid_t {
         let mut command = std::process::Command::new("/bin/sh");
         command.args(["-c", script]).env_clear().stdout(std::process::Stdio::piped());
-        command.spawn().unwrap()
+        command.spawn().unwrap().id() as libc::pid_t
     }
 
     /// Waits for it to exit, stops the watch, then reaps it, as a driver does.
-    fn end(child: std::process::Child, watch: Watch) -> (libc::c_int, u64) {
-        let pid = child.id() as libc::pid_t;
-        drop(child);
+    fn end(pid: libc::pid_t, watch: Watch) -> (libc::c_int, u64) {
         crate::process::wait_exited(pid).unwrap();
         let peak = watch.stop();
         let (status, _) = crate::process::reap(pid).unwrap();
@@ -171,7 +175,7 @@ mod tests {
         // Doubles a string until it is a gigabyte, unless it is stopped first.
         let child =
             spawn(r#"x=a; i=0; while [ $i -lt 30 ]; do x="$x$x"; i=$((i+1)); done; exit 0"#);
-        let watch = Watch::start(child.id() as libc::pid_t, limit);
+        let watch = Watch::start(child, limit);
         let (status, peak) = end(child, watch);
         assert!(libc::WIFSIGNALED(status), "it ran to its end: {status:#x}");
         assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
@@ -181,7 +185,7 @@ mod tests {
     #[test]
     fn a_process_within_its_limit_runs_to_its_end() {
         let child = spawn("exit 3");
-        let watch = Watch::start(child.id() as libc::pid_t, 1 << 30);
+        let watch = Watch::start(child, 1 << 30);
         let (status, peak) = end(child, watch);
         assert!(!libc::WIFSIGNALED(status));
         assert_eq!(libc::WEXITSTATUS(status), 3);
@@ -193,12 +197,12 @@ mod tests {
     #[test]
     fn a_watch_taken_out_names_nothing_once_its_slot_is_another_s() {
         let first = spawn("sleep 0.2; exit 0");
-        let watch = Watch::start(first.id() as libc::pid_t, 1 << 30);
+        let watch = Watch::start(first, 1 << 30);
         let late = Watch { id: watch.id, pid: watch.pid };
         let (status, _) = end(first, watch);
         assert!(!libc::WIFSIGNALED(status));
         let second = spawn("sleep 0.2; exit 0");
-        let live = Watch::start(second.id() as libc::pid_t, 1 << 30);
+        let live = Watch::start(second, 1 << 30);
         assert_eq!(late.remove(), 0, "a stale handle");
         drop(late);
         assert!(entries().as_ref().unwrap().contains(live.id), "the live watch is left as it is");
@@ -212,8 +216,8 @@ mod tests {
         let grows =
             spawn(r#"x=a; i=0; while [ $i -lt 30 ]; do x="$x$x"; i=$((i+1)); done; exit 0"#);
         let small = spawn("sleep 0.3; exit 0");
-        let small_watch = Watch::start(small.id() as libc::pid_t, 1 << 30);
-        let grows_watch = Watch::start(grows.id() as libc::pid_t, 32 << 20);
+        let small_watch = Watch::start(small, 1 << 30);
+        let grows_watch = Watch::start(grows, 32 << 20);
         let (grew, _) = end(grows, grows_watch);
         let (stayed, _) = end(small, small_watch);
         assert!(libc::WIFSIGNALED(grew) && libc::WTERMSIG(grew) == libc::SIGKILL, "{grew:#x}");

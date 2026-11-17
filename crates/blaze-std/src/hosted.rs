@@ -71,6 +71,10 @@ impl fmt::Display for Refused {
 }
 
 impl From<Stopped> for Refused {
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn from(stopped: Stopped) -> Refused {
         Refused::Stopped(stopped)
     }
@@ -81,6 +85,10 @@ impl From<Stopped> for Refused {
 /// through [`Io::script`].
 #[derive(Debug)]
 pub struct SimHost {
+    /// Everything written to standard output ([`crate::out::Out`]), in order.
+    pub out: Vec<u8>,
+    /// Everything written to standard error, in order.
+    pub err: Vec<u8>,
     pub term: SimTerm,
     /// The keychain.
     pub keys: Vec<SimKey>,
@@ -130,8 +138,12 @@ impl SimHost {
     /// A quiet host: a terminal of 80 by 24, the user `sim`, the locale of
     /// [`Locale::simulated`], a full battery, and nothing else (no keys, anchors, processes,
     /// windows, devices or names).
+    #[blaze::nonblocking]
     pub fn new() -> SimHost {
         SimHost {
+            // alloc: none, nothing written yet.
+            out: Vec::new(),
+            err: Vec::new(),
             term: SimTerm::new(),
             // alloc: none, the simulated host's empty tables (this and each below).
             keys: Vec::new(),
@@ -163,6 +175,7 @@ impl SimHost {
 }
 
 impl Default for SimHost {
+    #[blaze::nonblocking]
     fn default() -> SimHost {
         SimHost::new()
     }

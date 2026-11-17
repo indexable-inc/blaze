@@ -51,10 +51,12 @@ impl<'db> InternedConst<'db> {
     pub(crate) fn intern(kind: ConstKind<'db>) -> Self {
         Self::at(CONSTS.intern(kind, || {
             let computed = FlagComputation::for_const_kind(&kind);
+            let (tag, home) = persist::tag_and_home(&kind);
             table::RowInfo {
-                tag: persist::tag(&kind),
+                tag,
                 flags: computed.flags,
                 binder: computed.outer_exclusive_binder,
+                home,
             }
         }))
     }
@@ -199,7 +201,7 @@ impl<'db> ConstExt<'db> for Const<'db> {
 
 /// A constant as kept in a query result: its row, which stays valid in every revision, as an
 /// interned value is never freed.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StoredConst {
     index: NonZeroU32,
 }
@@ -220,6 +222,32 @@ impl std::fmt::Debug for StoredConst {
 }
 
 impl_foldable_for_stored_type!(StoredConst);
+
+table::holds_by_visit!(ConstKind<'static>);
+
+impl<'db> table::Homed for InternedConst<'db> {
+    /// Its row's home, written when the row was added.
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        CONSTS.home(self.index)
+    }
+}
+
+impl<'db> table::Homed for Const<'db> {
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        table::Homed::home(&self.0)
+    }
+}
+
+impl table::Homed for StoredConst {
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        CONSTS.home(self.index)
+    }
+}
+
+crate::next_solver::interner::memo_home!(InternedConst<'db>, StoredConst);
 
 pub type PlaceholderConst<'db> = rustc_type_ir::PlaceholderConst<DbInterner<'db>>;
 
@@ -317,7 +345,7 @@ mod tests {
 
     fn free_const_alias(is_rigid: IsRigid) -> ConstKind<'static> {
         let def_id =
-            FreeConstAliasId(blaze_query::db::FromId::from_id(blaze_query::db::Id::from_u32(1)));
+            FreeConstAliasId(blaze_memo::Id::from_gid(blaze_memo::Gid::for_test(1)));
         ConstKind::Alias(
             is_rigid,
             AliasConst::from_checked_parts(AliasConstKind::Free { def_id }, GenericArgs::empty()),

@@ -1,0 +1,11 @@
+{
+ "id": "newproj-5",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane newproj-1111",
+ "where": "`ix shell vm -- bash -c '... pkill -f abab.py ...'`",
+ "what": "Met the row of another lane again: `pkill -f` inside `ix shell -- bash -c` killed its own shell, since its command line holds the pattern, and the rest of the line did not run, silently.",
+ "cost": "a restart of a measuring run that never started",
+ "cause": "as that row says",
+ "workaround": "a script file run by `bash file`, and `pgrep -f 'abab[.]py'`",
+ "state": "open"
+}

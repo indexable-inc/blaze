@@ -1,0 +1,14 @@
+{
+ "id": "store-forgets-only-whole-packs",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor 3e, int-1112",
+ "where": "crates/blaze-cas: collect.rs (a key is forgotten with its pack), whole.rs (file-* not named), lib.rs names_step",
+ "what": "A value that is a file of its own (`file-<content>`, machine code and hot values of 4 MiB and up) could leave the store only when the collector retired its whole pack after two unused periods, so a home kept every build's object files on disk: the hello home was 917 MB against Relax's 72 MB. The store had no way to forget one record: its tables are append-only and the head listed only removed packs and removed files.",
+ "cost": "disk row of the head-to-head lost 8-19x; three lanes wrote around it (placed/ names, census) without the primitive",
+ "cause": "the only deletion primitive was pack-granular, so any finer deletion had to wait for a whole pack to die",
+ "class": "a deletion primitive coarser than the unit that becomes dead (rule 65 for deletion)",
+ "prevention": "the store forgets one record (src/forget.rs: its offset in its pack's list, in the head from format 7, filtered by TierView::gone), under the collector's own root rule asked of one key",
+ "workaround": "none",
+ "fix": "Store::forget / forget_due; names_step asks it for a file-* no path names; tests: collect.rs a_record_forgotten_alone_is_gone_and_a_pinned_one_is_kept with controls ForgetIgnoresRoots and ForgetUnlisted, tests.rs a_file_of_its_own_goes_with_its_record_once_no_path_names_it. Written, not built yet.",
+ "state": "open"
+}

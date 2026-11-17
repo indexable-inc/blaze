@@ -181,7 +181,7 @@ impl<'db> Operand {
 
 /// The index of a field (whether of a struct/enum variant, tuple, or closure).
 /// For a struct/enum it converts from and to the LocalFieldId, for a tuple or closure it's simply the index.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, blaze_query::Value, PartialOrd, Ord, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct FieldIndex(pub u32);
 
 impl FieldIndex {
@@ -405,6 +405,27 @@ pub type PlaceElem = ProjectionElem<LocalId>;
 // a binder's universe only).
 unsafe impl<W: crate::next_solver::WorldExposer> GenericTypeVisitable<W> for PlaceElem {
     fn generic_visit_with(&self, _: &mut W) {}
+}
+
+/// A projection's home: a downcast's variant's arena (the one id an element holds); every
+/// other element is plain data (fields, locals, offsets, a binder's universe).
+impl crate::next_solver::interner::table::Homed for PlaceElem {
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        match *self {
+            ProjectionElem::Downcast(VariantId::StructId(it)) => Some(blaze_memo::Id::gid(it).arena()),
+            ProjectionElem::Downcast(VariantId::UnionId(it)) => Some(blaze_memo::Id::gid(it).arena()),
+            ProjectionElem::Downcast(VariantId::EnumVariantId(it)) => {
+                Some(blaze_memo::Id::gid(it).arena())
+            }
+            ProjectionElem::Deref
+            | ProjectionElem::Field(_)
+            | ProjectionElem::Index(_)
+            | ProjectionElem::ConstantIndex { .. }
+            | ProjectionElem::Subslice { .. }
+            | ProjectionElem::ReflectedField(_) => None,
+        }
+    }
 }
 
 interned_slice!(ProjectionStorage, Projection, StoredProjection, projection, PlaceElem, PlaceElem);
@@ -1664,14 +1685,14 @@ pub struct UnreachableAfterCall {
 }
 
 /// A body whose code an optimized body has in it: rustc's `Instance` of an inlined callee.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InlinedBody<'db> {
     Fn(FunctionId),
     Closure(InternedClosureId<'db>),
 }
 
 /// One instance an optimized body inlined, listed once however often it was.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct InlinedCallee<'db> {
     pub body: InlinedBody<'db>,
     /// With regions erased, in the caller's generic parameters (instantiated by
@@ -1684,7 +1705,7 @@ pub struct InlinedCallee<'db> {
 
 /// rustc's inlined `SourceScope`: the code of `callees[callee]`, inlined at `call_site` (a span
 /// of the body, itself `Inlined` when the call was in an inlined body).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InlinedScope {
     pub callee: u32,
     pub call_site: MirSpan,
@@ -1692,14 +1713,14 @@ pub struct InlinedScope {
 
 /// What `MirSpan::Inlined(n)` is, `n` indexing [`Inlined::spans`]: `span` of the body of the
 /// callee of `scopes[scope]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InlinedSpan {
     pub scope: u32,
     pub span: MirSpan,
 }
 
 /// The local an inlined callee's binding is in (its debug info).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InlinedBinding {
     pub scope: u32,
     pub binding: BindingId,
@@ -1708,7 +1729,7 @@ pub struct InlinedBinding {
 
 /// `promoted_locals` of an inlined callee: `expr` is of the expression store of
 /// `callees[callee]`, evaluated with its `args`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InlinedPromoted {
     pub local: LocalId,
     pub callee: u32,
@@ -1719,7 +1740,7 @@ pub struct InlinedPromoted {
 /// `bool`, `char` or integer, its bits; of an enum, its discriminant as an `i128`'s bits (what
 /// `Rvalue::Discriminant` gives and `SwitchInt` compares). A value is compared truncated to
 /// the size of the operand it is compared with.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ArgFact {
     /// The value is this one, one of those the function compares the parameter with.
     Is(u128),
@@ -1732,9 +1753,11 @@ pub enum ArgFact {
 /// rustc has none of. Each fact is of the parameter at its index in `param_locals`; they are
 /// sorted by it, each index once, and never empty. The copy has `base`'s signature, ABI and
 /// attributes, and is called with the arguments `base` would be: only its body differs.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub struct Specialization {
     pub base: FunctionId,
+    /// Values only: no id, so no arena.
+    #[home(skip)]
     pub facts: Box<[(u32, ArgFact)]>,
 }
 
@@ -1769,7 +1792,7 @@ impl Display for Knowing<'_> {
 /// the method `clone.base` is the impl's item for). A reader that
 /// knows nothing of specializations (the interpreter, the reference walk) calls the base, with
 /// the same result.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SpecializedCall {
     pub block: BasicBlockId,
     pub clone: Specialization,
@@ -1780,7 +1803,7 @@ pub struct SpecializedCall {
 
 /// What an optimized body inlined, and which of its calls go to specialized copies. Empty in
 /// every body as it is built.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, blaze_query::Value)] // clone: inside `MirBody`
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)] // clone: inside `MirBody`
 pub struct Inlined<'db> {
     pub callees: Vec<InlinedCallee<'db>>,
     pub scopes: Vec<InlinedScope>,
@@ -1856,7 +1879,7 @@ impl Inlined<'_> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)] // clone: monomorphizing and optimizing copy the body they start from, once per query answer
+#[derive(Debug, Clone, PartialEq, Eq)] // clone: monomorphizing and optimizing copy the body they start from, once per query answer
 pub struct MirBody<'db> {
     pub basic_blocks: Arena<BasicBlock>,
     pub locals: Arena<Local>,
@@ -1996,7 +2019,7 @@ fn hash_by_key<K: Hash + Eq + Copy, V: Hash, H: Hasher>(
 /// What a body means, which depends on the passes it has been through. The IDE only ever
 /// asks for [`MirPhase::Built`]; the interpreter and the code generator run
 /// [`MirPhase::Runtime`], which is computed on its own (`runtime_mir_body` and the like).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum MirPhase {
     /// As lowering builds it, as rustc's MIR building does. A `Drop` drops what the place holds
     /// if it holds anything, which the code that runs it has to keep track of. Calls and drops
@@ -2016,7 +2039,7 @@ pub enum MirPhase {
 /// The locals an `async` body has on top of the ones it declares. Its parameters are a
 /// reference to the future and the `&mut Context` of the current `poll`, and the return slot
 /// has the type of the block's value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CoroutineLocals {
     /// The `Poll` that `Return` and `Yield` hand to the caller of `poll`.
     pub poll: LocalId,
@@ -2337,7 +2360,7 @@ impl MirBody<'_> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, blaze_query::Value)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub enum MirSpan {
     ExprId(ExprId),
     /// Where the expression ends: what leaving a scope does is taken to be written there.
@@ -2696,7 +2719,7 @@ fn same_predicates<'db>(
     within(a_bounds, b_bounds) && within(b_bounds, a_bounds)
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, blaze_query::Value)] // clone: an error a query answers with, copied out of its memo
+#[derive(Clone, PartialEq, Eq, Hash)] // clone: an error a query answers with, copied out of its memo
 pub enum MirEvalError<'db> {
     ConstEvalError(String, Box<ConstEvalError<'db>>),
     LayoutError(LayoutError, StoredTy),
@@ -2758,13 +2781,13 @@ pub enum MirEvalError<'db> {
 /// What the evaluator refused under blaze's `#![feature(blaze_comptime)]`
 /// (docs/v2/plan/design/comptime.md, "Phase 2b"), and where: the body and the place in it of
 /// the call or cast, when known. The frames around it are the `InFunction`s it is wrapped in.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ComptimeError<'db> {
     pub kind: ComptimeErrorKind<'db>,
     pub at: Option<(InferBodyId<'db>, MirSpan)>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ComptimeErrorKind<'db> {
     /// A call in a const context through `through` reached `callee` (with `args`; a trait's
     /// method named by the impl's that runs), which is not const: not a `const fn`, not a
@@ -2785,7 +2808,7 @@ pub enum ComptimeErrorKind<'db> {
 }
 
 /// How a call reached its target without naming it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Dispatch {
     /// Through a function pointer.
     FnPointer,
@@ -2795,7 +2818,7 @@ pub enum Dispatch {
 }
 
 /// How a pointer's address was read as an integer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AddressRead {
     /// An `as` cast to an integer (`PointerExposeAddress`: `ptr as usize`, `expose_provenance`).
     Cast,
@@ -2815,7 +2838,7 @@ impl std::fmt::Display for AddressRead {
 /// A comptime form of generic MIR (`#![feature(blaze_comptime)]`) that a pass met where it
 /// handles none: a pass that runs only on monomorphic MIR, which monomorphization's expansion
 /// leaves without any, or a pass that does not handle the form yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ComptimeUnexpanded {
     pub form: MirComptimeForm,
     /// The pass that met it.
@@ -2823,7 +2846,7 @@ pub struct ComptimeUnexpanded {
 }
 
 /// The comptime forms of generic MIR.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MirComptimeForm {
     /// [`TerminatorKind::ComptimeFor`].
     ForHead,
@@ -2918,7 +2941,7 @@ impl std::fmt::Debug for MirEvalError<'_> {
 }
 
 /// What an evaluation ran out of: its budget of steps or of bytes, of this size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Budget {
     Steps(u64),
     Memory(u64),
@@ -2964,7 +2987,7 @@ pub fn pad16(it: &[u8], is_signed: IsSigned) -> [u8; 16] {
 }
 
 // FIXME: Make this smaller, its stored in database queries
-#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)] // clone: an error a query answers with, copied out of its memo
+#[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: an error a query answers with, copied out of its memo
 pub enum MirLowerError<'db> {
     ConstEvalError(Box<str>, Box<ConstEvalError<'db>>),
     LayoutError(LayoutError),
@@ -3007,6 +3030,9 @@ pub enum MirLowerError<'db> {
     /// A trait method's `impl Trait` normalized to the impl's item for it, which has no value:
     /// `crate::rpitit::RpititError::message`, naming the impl's method and the item.
     RpititValue(Box<str>),
+    /// A `line!()` or `column!()` whose value is asked where it is a constant, of a call
+    /// written in no file's text: `crate::body_store::placed_literal`'s message, naming it.
+    UnplacedLiteral(Box<str>),
 }
 
 impl From<LayoutError> for MirLowerError<'_> {
@@ -3043,7 +3069,7 @@ pub fn is_by_move_coroutine<'db>(
 }
 
 /// How much of rustc's optimization pipeline runs: rustc's `-Zmir-opt-level`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, blaze_memo::Home)]
 pub enum MirOptLevel {
     /// None: the body is the runtime body.
     Off,
@@ -3075,7 +3101,7 @@ impl MirOptLevel {
 /// What a MIR body is optimized for: the level, whether rustc's UB checks are inserted
 /// (`sess.ub_checks()` of the crate the body is of), and whether the code generator emits
 /// lifetime markers (rustc removes storage markers only when it doesn't).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, blaze_memo::Home)]
 pub struct MirOptions {
     pub level: MirOptLevel,
     pub ub_checks: bool,
@@ -3095,6 +3121,13 @@ pub struct MirOptions {
     /// and only where the code generator builds a body for one final binary whose every
     /// instance it walked; `None` everywhere else, and in every body inlined into another.
     pub world: Option<devirt::DevirtWorld>,
+    /// The tier the body's code is built at ([`crate::facts::Tier`]), given by the code
+    /// generator's `Build::options`: which of blaze's passes that read past the body may run
+    /// (`hir-ty-mir`'s `optimize::passes_at`, each still under the settings above) and whether
+    /// the facts those read spend proofs ([`crate::facts::proofs_at`]). The pass list is so an
+    /// input of the body's key: a tier 0 body, which no pass on facts or inliner touched, is
+    /// never served for an optimizing one, nor the other way.
+    pub tier: crate::facts::Tier,
 }
 
 impl MirOptions {
@@ -3102,8 +3135,11 @@ impl MirOptions {
     /// nothing inlined (rustc's CTFE MIR is not, and the interpreter reads no [`Inlined`]).
     /// Allocations go to the stack wherever the level optimizes: the interpreter runs no
     /// `#[global_allocator]` a program could read, and every test that runs a program at each
-    /// level checks that this changes nothing it prints.
+    /// level checks that this changes nothing it prints. The tier is the one the level is of
+    /// ([`crate::facts::Tier`]): optimizing at level 2, the only one `SpendFacts` runs at.
     pub fn at(level: MirOptLevel) -> MirOptions {
+        use crate::facts::Tier;
+        let tier = if level >= MirOptLevel::Release { Tier::Optimizing } else { Tier::Zero };
         MirOptions {
             level,
             ub_checks: false,
@@ -3111,6 +3147,7 @@ impl MirOptions {
             inline: false,
             heap_to_stack: level != MirOptLevel::Off,
             world: None,
+            tier,
         }
     }
 
@@ -3289,6 +3326,11 @@ mod tests {
             [(MirOptLevel::Off, false), (MirOptLevel::Debug, false), (MirOptLevel::Release, true)]
         {
             let heap_to_stack = level != MirOptLevel::Off;
+            // Optimizing only at level 2, the one `SpendFacts` runs at.
+            let tier = match lifetime_markers {
+                true => crate::facts::Tier::Optimizing,
+                false => crate::facts::Tier::Zero,
+            };
             assert_eq!(
                 MirOptions::at(level),
                 MirOptions {
@@ -3297,7 +3339,8 @@ mod tests {
                     lifetime_markers,
                     inline: false,
                     heap_to_stack,
-                    world: None
+                    world: None,
+                    tier,
                 }
             );
         }

@@ -70,16 +70,9 @@ pub fn pick<'a>(artifacts: &'a [Artifact], flags: &Flags) -> Result<&'a Artifact
     }
 }
 
-/// The executable as cargo runs it from `cwd`: below it, relative, and `./foo` for one in it.
-pub fn shown_exe(path: &Path, cwd: &Path) -> PathBuf {
-    match path.strip_prefix(cwd) {
-        Ok(relative) if relative.file_name() == Some(relative.as_os_str()) => {
-            Path::new(".").join(relative)
-        }
-        Ok(relative) => relative.to_owned(),
-        Err(_) => path.to_owned(),
-    }
-}
+// The executable as cargo runs it from `cwd` (below it, relative, and `./foo` for one in it):
+// blaze-thin's, which the thin `blaze` runs a program by too.
+pub use blaze_thin::answer::shown_exe;
 
 /// A program cargo runs: `Compilation::target_process`, its runner first.
 #[derive(Clone, PartialEq, Eq, Debug)]

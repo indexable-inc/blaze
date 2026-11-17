@@ -1,7 +1,19 @@
 //! The front end's one database, [`Db`], and the query inputs it holds: files, source
 //! roots and the crate graph.
+//!
+//! A [`Db`] is a world the driver writes (plain data by stable key, [`world`]) and a snapshot
+//! of `blaze_memo` inputs made from it at each commit ([`Edit::commit`]). The session's
+//! singletons ([`LibraryRoots`], [`LocalRoots`], [`ProcessEnv`], the crate list and
+//! [`FrontSettings`]) are in the session arena; each crate's inputs in its own.
+//!
+//! Cost (rule 67): a read of a singleton or a list ([`all_crates`], [`source_root_crates`],
+//! [`primary_crates`]) is one input read and one index of the snapshot's table; the lists are
+//! made once per commit, O(crates).
 
 #![feature(allocator_api, allocator_ext)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 #![forbid(unsafe_code)]
 
 #[cfg(test)]
@@ -12,10 +24,11 @@ pub mod crate_attrs;
 mod db;
 mod editioned_file_id;
 mod extensions;
+pub use extensions::SaidBlazeEdition;
 mod file_set;
 mod files;
+mod handles;
 mod input;
-pub mod maintain;
 mod named;
 mod reparse;
 mod settings;
@@ -24,8 +37,8 @@ mod table;
 pub mod target;
 #[cfg(test)]
 mod tests;
-pub mod trees;
 mod view;
+mod world;
 
 use std::{str::FromStr as _, sync::atomic::AtomicUsize};
 
@@ -36,21 +49,29 @@ pub use crate::{
         CRATE_ATTR_FILE_NAME, CrateAttrError, applied_crate_attr_files, crate_attr_error,
         crate_attr_files, crate_attr_owner,
     },
-    db::{Db, Reader, RunOrder, Shared, executions, set_run_order},
-    editioned_file_id::EditionedFileId,
-    files::{AliasError, ExpansionRead, Files, ReadBy},
+    db::{
+        Committed, Db, Edit, MakeGiven, Reader, RunOrder, Shared, par_for_each, par_for_each_small, par_map,
+        set_run_order, WrittenCrate,
+    },
+    editioned_file_id::{EditionedFileId, NoText},
+    files::{AliasError, Disk, ExpansionRead, Files, Port, ReadBy},
+    handles::{
+        FileSourceRootInput, FileText, GivenFile, INCLUDED_READ, IncludedFile, LOOKS_EVERY_TIME, RawFile, ReadError,
+        SourceRootInput, VfsFileRoot, VfsRoot, VfsText, line_index,
+    },
     input::{
         BuiltCrateData, BuiltDependency, BuiltFor, Crate, CrateBuilder, CrateBuilderId,
         CrateDataBuilder, CrateDisplayName, CrateGraphBuilder, CrateName, CrateNamed, CrateOrigin,
-        CrateType, CrateTypes, CratesIdMap, CratesMap, DependencyBuilder, Env, ExtraCrateData,
-        LangCrateOrigin, ProcMacroLoadingError, ProcMacroPaths, ReleaseChannel, SourceRoot,
-        SourceRootId, TargetKind, UniqueCrateData, UnnamedCrate,
+        CRATE_ITEM_KEY_DOMAIN, CrateSlot, CrateType, CrateTypes, CratesIdMap, DependencyBuilder, Env,
+        ExtraCrateData, crate_item_key,
+        GIVEN_MORE, Given, LangCrateOrigin, ProcMacroLoadingError, ProcMacroPaths, ReleaseChannel,
+        SourceRoot, SourceRootId, TargetKind, UnnamedCrate, WorldDependency, take_given,
     },
-    maintain::{Implied, Maintained, Maintainer, Reads, Trigger, Written},
     named::NAMED_PATHS_DOMAIN,
     reparse::Reparse,
-    settings::{BorrowckMode, FrontSettings},
+    settings::{BorrowckMode, FrontSettings, FrontSettingsData, SettingField},
     view::{ViewChange, ViewError, ViewFile, ViewRoot},
+    world::{CrateKey, Plant, WorldCrateData},
 };
 pub use crate::{
     file_set::{FileSet, FileSetConfig, FileSetConfigBuilder},
@@ -59,44 +80,19 @@ pub use crate::{
 use blaze_hash::HashSet;
 pub use blaze_ids::ContentId;
 use blaze_ids::Hasher;
-use blaze_query::db::{Durability, Setter};
-pub use blaze_query::db::{par_for_each, par_map};
+use blaze_memo::Database as _;
+pub use blaze_vfs::outside::{Look, LookKind, Looks};
 pub use paths::{AbsPath, AbsPathBuf};
 pub use semver::{BuildMetadata, Prerelease, Version, VersionReq};
 pub use span::FileId;
 use std::alloc::Global;
-use triomphe::Arc;
 
 pub type FxIndexSet<T> = indexmap::IndexSet<T, blaze_hash::FixedState>;
 pub type FxIndexMap<K, V> = indexmap::IndexMap<K, V, blaze_hash::FixedState>;
 
-#[macro_export]
-macro_rules! impl_intern_key {
-    ($id:ident, $loc:ident) => {
-        #[blaze_query::interned(unsafe(no_lifetime))]
-        #[derive(PartialOrd, Ord)]
-        pub struct $id {
-            #[returns(ref)]
-            pub loc: $loc,
-        }
-
-        // If we derive this the query engine prints the values recursively, and this causes us to blow.
-        impl ::std::fmt::Debug for $id {
-            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-                f.debug_tuple(stringify!($id))
-                    .field(&format_args!("{:04x}", self.0.as_u32()))
-                    .finish()
-            }
-        }
-    };
-}
-
-pub const DEFAULT_FILE_TEXT_LRU_CAP: u16 = 16;
-pub const DEFAULT_BORROWCK_LRU_CAP: u16 = 2024;
-
 /// The set of roots for crates.io libraries.
 /// Files in libraries are assumed to never change.
-#[blaze_query::input(singleton, debug)]
+#[blaze_memo::input(singleton, debug)]
 pub struct LibraryRoots {
     #[returns(ref)]
     pub roots: HashSet<SourceRootId, Global>,
@@ -104,40 +100,54 @@ pub struct LibraryRoots {
 
 /// The set of "local" (that is, from the current workspace) roots.
 /// Files in local roots are assumed to change frequently.
-#[blaze_query::input(singleton, debug)]
+#[blaze_memo::input(singleton, debug)]
 pub struct LocalRoots {
     #[returns(ref)]
     pub roots: HashSet<SourceRootId, Global>,
 }
 
 /// The variables of the process a build is for, which `env!` and `option_env!` read where
-/// the crate's own have nothing: those of whoever asked for the build.
-/// Its content ID is [`Env::content`] of its variables.
-#[blaze_query::input(singleton, debug)]
+/// the crate's own have nothing: those of whoever asked for the build
+/// ([`Edit::set_process_env`]). Its content ID is [`Env::content`] of its variables.
+#[blaze_memo::input(singleton, debug)]
 pub struct ProcessEnv {
     #[returns(ref)]
     #[get(vars_field)]
-    #[set(set_vars_field)]
     vars: Env,
     #[returns(copy)]
     #[get(content_field)]
-    #[set(set_content_field)]
     content: InputId,
 }
 
 impl ProcessEnv {
-    pub fn vars<'db, Db: ?Sized + blaze_query::db::Database>(self, db: &'db Db) -> &'db Env {
+    pub fn vars<'db, Db: ?Sized + blaze_memo::Database>(self, db: &'db Db) -> &'db Env {
         self.vars_field(db)
     }
 
-    pub fn content<Db: ?Sized + blaze_query::db::Database>(self, db: &Db) -> ContentId {
+    pub fn content<Db: ?Sized + blaze_memo::Database>(self, db: &Db) -> ContentId {
         self.content_field(db).id()
     }
 }
 
 /// The variable `key` of the process the build is for.
+///
+/// Read through a memo a variable ([`process_var`]), never the map itself: a query that
+/// reads one variable reads that variable's memo, whose value is the same when another
+/// variable changes, so a reader of it is checked and kept. Until 2026-11-11 every reader read
+/// [`ProcessEnv`]'s one field of all the variables, and a request whose environment differed
+/// in any variable, read by nothing, had every reader of any variable (each `env!` and
+/// `option_env!` expansion, and all that reads those) verified or run again.
 pub fn process_env_var(db: &Db, key: &str) -> Option<String> {
-    ProcessEnv::try_get(db)?.vars(db).get(key)
+    process_var(db, intern::Symbol::intern(key)).map(str::to_owned)
+}
+
+/// The process's variable `name` ([`ProcessEnv`]): the one reader of the map of all of them.
+/// Its key covers what it reads (rule keys-cover-every-input): the name is its argument and
+/// the map its one read. Homed in the session arena (a name names no crate), kept there.
+#[blaze_memo::tracked(returns(copy))]
+fn process_var<'db>(db: &'db Db, name: intern::Symbol) -> Option<&'db str> {
+    let value = ProcessEnv::try_get(db)?.vars(db).get(name.as_str())?;
+    Some(blaze_memo::keep_str(db.memo(), &value))
 }
 
 /// What of the process's variables the database's crates read: each `env!` or `option_env!`
@@ -146,11 +156,12 @@ pub fn process_env_var(db: &Db, key: &str) -> Option<String> {
 /// alone, or of a variable the crate has of its own ([`own_env_var`]), read none of the
 /// process's ([`env_var`]). The log is never cleared, so it holds every read any value of the
 /// database was made from, and a few more: what a front end kept from one build to the next is
-/// keyed by in the process's environment.
-pub fn process_env_reads(db: &Db) -> Vec<(Crate, String)> {
+/// keyed by in the process's environment. By [`CrateKey`]: the log outlives every snapshot.
+pub fn process_env_reads(db: &Db) -> Vec<(CrateKey, String)> {
     let mut read = db.files().env_read();
-    read.retain(|(krate, name)| {
-        !krate.data(db).origin.is_lang() && own_env_var(db, *krate, name).is_none()
+    read.retain(|(key, name)| {
+        let krate = db.krate(*key);
+        !krate.data(db).origin.is_lang() && own_env_var(db, krate, name).is_none()
     });
     read
 }
@@ -160,63 +171,31 @@ pub fn process_env_reads(db: &Db) -> Vec<(Crate, String)> {
 /// crate's variables ([`Crate::env`]), so no crate's content, identity or image key holds it.
 /// A crate sees it through [`own_env_var`], and whatever is keyed by what a crate made covers
 /// it through the `env!` log, as the crate's read of it with its value then
-/// ([`PrimaryCrates`]).
+/// ([`primary_crates`]).
 pub const PRIMARY_PACKAGE: &str = "CARGO_PRIMARY_PACKAGE";
 
-/// The crates of the request's primary packages ([`PRIMARY_PACKAGE`]), sorted. None of the
-/// standard library's: it reads its own variables alone, as a std built elsewhere does.
-#[blaze_query::input(singleton, debug)]
-pub struct PrimaryCrates {
-    #[returns(clone)]
-    crates: std::sync::Arc<[Crate]>,
-}
-
-/// The crates of the primary packages ([`PrimaryCrates`]), sorted.
+/// The crates of the request's primary packages ([`PRIMARY_PACKAGE`],
+/// [`Edit::set_primary_crates`]), sorted. None of the standard library's: it reads its own
+/// variables alone, as a std built elsewhere does.
+///
+/// The driver's read: it is no input, so a query reads [`is_primary`] of its crate instead,
+/// and a request that makes another crate primary drops that crate's arena alone.
 pub fn primary_crates(db: &Db) -> std::sync::Arc<[Crate]> {
-    PrimaryCrates::try_get(db).map_or(std::sync::Arc::default(), |it| it.crates(db))
+    std::sync::Arc::clone(&db.snap().table.primary)
 }
 
-/// Whether `krate` is of a primary package of the build ([`PrimaryCrates`]).
+/// Whether `krate` is of a primary package of the build ([`primary_crates`]).
+///
+/// Read from the crate's own flag ([`Crate::given`], given by [`Edit::set_primary_crates`]),
+/// never from the list: the list is one value for every crate, so a request that makes another
+/// crate primary would be a write every crate that asked had read.
 pub fn is_primary(db: &Db, krate: Crate) -> bool {
     !krate.data(db).origin.is_lang()
-        && PrimaryCrates::try_get(db).is_some_and(|it| it.crates(db).binary_search(&krate).is_ok())
+        && krate.given::<PrimaryFlag, bool>(db).copied().unwrap_or(false)
 }
 
-/// Has builds from here on take `crates` as those of the primary packages ([`PrimaryCrates`]).
-/// The maintainers run again only when a crate that read [`PRIMARY_PACKAGE`] became primary or
-/// stopped being so, as [`set_process_env`] does for the process's variables.
-pub fn set_primary_crates(db: &mut Db, mut crates: Vec<Crate>) {
-    crates.sort_unstable();
-    crates.dedup();
-    let crates: std::sync::Arc<[Crate]> = crates.into();
-    let read: Vec<Crate> = db
-        .files()
-        .env_read()
-        .into_iter()
-        .filter(|(_, name)| name == PRIMARY_PACKAGE)
-        .map(|(krate, _)| krate)
-        .collect();
-    db.write("set_primary_crates", |db| match PrimaryCrates::try_get(&*db) {
-        Some(primary) => {
-            let was = primary.crates(&*db);
-            if was == crates {
-                return;
-            }
-            let moved = read
-                .iter()
-                .any(|it| was.binary_search(it).is_ok() != crates.binary_search(it).is_ok());
-            primary.set_crates(db).to(crates);
-            if moved {
-                db.note(maintain::Note::Crates);
-            }
-        }
-        None => {
-            // MEDIUM: of the request, like the crate graph; set again only when it moves.
-            PrimaryCrates::new(db, Durability::MEDIUM, crates);
-            db.note(maintain::Note::Crates);
-        }
-    })
-}
+/// The kind of a crate's flag "of a primary package" ([`Edit::give`]).
+pub(crate) struct PrimaryFlag;
 
 /// The variable `name` as `krate` has it of its own: its variables ([`Crate::env`]), then
 /// [`PRIMARY_PACKAGE`] when it is primary ([`is_primary`]).
@@ -262,271 +241,17 @@ pub fn macro_env(db: &Db, krate: Crate) -> &Env {
     }
 }
 
-/// [`macro_env`] of a primary crate, made once per crate.
-#[blaze_query::tracked(returns(ref))]
+/// [`macro_env`] of a primary crate, made once per crate: an `Env` owns its map, dropped with
+/// the crate's arena.
+#[blaze_memo::tracked(returns(ref), owns)]
 fn primary_macro_env(db: &Db, krate: Crate) -> Env {
     given_macro_env(krate.env(db), true).into_owned()
 }
 
-/// Has builds from here on be for a process with the variables `vars`. The maintainers run
-/// again only when a variable the crates read ([`process_env_reads`]) has another value: no
-/// maintained state was made from any other, and a query that reads one later reads it here.
-pub fn set_process_env(db: &mut Db, vars: Env) {
-    let read = process_env_reads(db);
-    db.write("set_process_env", |db| {
-        let content = InputId(vars.content());
-        match ProcessEnv::try_get(&*db) {
-            Some(env) => {
-                if env.content_field(&*db) == content {
-                    return;
-                }
-                let was = env.vars(&*db);
-                let moved = read.iter().any(|(_, name)| was.get(name) != vars.get(name));
-                env.set_vars_field(db).to(vars);
-                env.set_content_field(db).to(content);
-                if moved {
-                    db.note(maintain::Note::Crates);
-                }
-            }
-            None => {
-                // MEDIUM: of the request, like the crate graph; set again only when a
-                // variable changes, never by an edit to a source file.
-                ProcessEnv::new(db, Durability::MEDIUM, vars, content);
-                db.note(maintain::Note::Crates);
-            }
-        }
-    })
-}
-
-/// A file's text. Set only through [`Files`] (and the [`Db`] methods that call it),
-/// which keeps [`FileText::content`] the content ID of the text and its appended module.
-#[blaze_query::input(debug)]
-pub struct FileText {
-    #[returns(ref)]
-    #[get(text_field)]
-    #[set(set_text_field)]
-    text: syntax::Text,
-    pub file_id: FileId,
-    /// The module a crate root's text ends with that the compiler wrote, not the file on disk:
-    /// blaze's test harness or list of proc macros. rustc injects its own after it applies
-    /// the crate's `#![cfg]`, so a root that `#![cfg]` takes away still has it.
-    #[default]
-    #[returns(copy)]
-    #[get(appended_root_module_field)]
-    #[set(set_appended_root_module_field)]
-    appended_root_module: Option<&'static str>,
-    #[returns(copy)]
-    #[get(content_field)]
-    #[set(set_content_field)]
-    content: InputId,
-    /// What [`EditionedFileId::parse`] makes the text's parse from: set with the text, and not
-    /// in the content ID, as the parse is the same whatever it holds.
-    #[returns(ref)]
-    #[get(reparse_field)]
-    #[set(set_reparse_field)]
-    reparse: Reparse,
-}
-
-impl FileText {
-    /// A file text's content ID is of the blaze-vfs ID of its text's bytes
-    /// (`ContentId::of(blaze_vfs::FILE_DOMAIN, ..)`), then of its appended root module (0, or 1
-    /// and the module), which changes what the crate root is. Building on the vfs ID means a
-    /// view's file, whose vfs ID is given and checked, is hashed once. The file's ID and path
-    /// are not in it.
-    pub const DOMAIN: &'static str = "blaze v2 file text 2";
-    /// The content ID a file of a source root has when it has neither text nor bytes (an alias
-    /// of a file whose bytes are not UTF-8). A file of the VFS whose bytes are not UTF-8 has
-    /// the content ID of its bytes instead ([`Files::file_content`]), which `include_bytes!`
-    /// and `include_str!` read.
-    pub const NO_TEXT_DOMAIN: &'static str = "blaze v2 file without text 1";
-
-    pub fn content_of(text: &str, appended_root_module: Option<&str>) -> ContentId {
-        FileText::content_of_file(
-            ContentId::of(blaze_vfs::FILE_DOMAIN, text.as_bytes()),
-            appended_root_module,
-        )
-    }
-
-    /// [`FileText::content_of`] from the blaze-vfs ID of the text's bytes, without reading them.
-    pub fn content_of_file(file: ContentId, appended_root_module: Option<&str>) -> ContentId {
-        let mut hasher = Hasher::new(FileText::DOMAIN);
-        hasher.id(&file).opt_part(appended_root_module);
-        hasher.finish()
-    }
-
-    /// What [`FileText::content_of_file`] hashes under [`FileText::DOMAIN`], appended to `out`:
-    /// for hashing many in one batch.
-    pub(crate) fn content_bytes(
-        file: &ContentId,
-        appended_root_module: Option<&str>,
-        out: &mut Vec<u8>,
-    ) {
-        out.extend_from_slice(&file.0);
-        content::opt_bytes(out, appended_root_module);
-    }
-
-    pub fn no_text() -> ContentId {
-        files::no_text()
-    }
-
-    /// The text, which the file's parse tree shares ([`EditionedFileId::parse`]): the VFS's
-    /// bytes as they are, a heap file's allocation or a range of the mapped image.
-    pub fn text<'db, Db: ?Sized + blaze_query::db::Database>(
-        self,
-        db: &'db Db,
-    ) -> &'db syntax::Text {
-        self.text_field(db)
-    }
-
-    /// See the field: the module the compiler appends to a crate root.
-    pub fn appended_root_module<Db: ?Sized + blaze_query::db::Database>(
-        self,
-        db: &Db,
-    ) -> Option<&'static str> {
-        self.appended_root_module_field(db)
-    }
-
-    pub fn content<Db: ?Sized + blaze_query::db::Database>(self, db: &Db) -> ContentId {
-        self.content_field(db).id()
-    }
-}
-
-/// Where the lines of a file's text are ([`span::LineIndex`]): made the first time a
-/// diagnostic, `line!`/`column!`, a caller location, a proc macro's `Span::line` or debug info
-/// asks for a line or a column of the text, once per text, and never on load.
-#[blaze_query::tracked(returns(ref))]
-pub fn line_index(db: &Db, text: FileText) -> span::LineIndex {
-    span::LineIndex::new(text.text(db))
-}
-
-/// Why a file `include_bytes!` or `include_str!` names could not be read: the error's kind and
-/// the OS's code where it has one, which is what rustc's "couldn't read" message prints.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ReadError {
-    kind: std::io::ErrorKind,
-    os: Option<i32>,
-}
-
-impl ReadError {
-    pub fn of(error: &std::io::Error) -> ReadError {
-        ReadError { kind: error.kind(), os: error.raw_os_error() }
-    }
-}
-
-impl std::fmt::Display for ReadError {
-    /// As `std::io::Error` writes itself: "No such file or directory (os error 2)".
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.os {
-            Some(code) => std::fmt::Display::fmt(&std::io::Error::from_raw_os_error(code), f),
-            None => std::fmt::Display::fmt(&self.kind, f),
-        }
-    }
-}
-
-/// The contents of a file named by `include_bytes!` or `include_str!`, or why it can't be read.
-#[blaze_query::input(debug)]
-pub struct IncludedFile {
-    #[returns(ref)]
-    #[get(read_field)]
-    #[set(set_read_field)]
-    read: Result<std::sync::Arc<[u8]>, ReadError>,
-    #[returns(copy)]
-    #[get(content_field)]
-    #[set(set_content_field)]
-    content: InputId,
-}
-
-impl IncludedFile {
-    /// Of its bytes (1 and the bytes), or of why it could not be read (0 and the error's
-    /// text): a message that names the error changes with it.
-    pub const DOMAIN: &'static str = "blaze v2 included file 2";
-
-    pub fn content_of(read: Result<&[u8], &ReadError>) -> ContentId {
-        let mut hasher = Hasher::new(IncludedFile::DOMAIN);
-        match read {
-            // alloc: the error's text, on the error path
-            Err(error) => hasher.update(&[0]).part(error.to_string().as_bytes()),
-            Ok(bytes) => hasher.update(&[1]).part(bytes),
-        };
-        hasher.finish()
-    }
-
-    /// The file at `path` read from disk now, as the front end reads a file outside the VFS
-    /// ([`Files::included_file`] reads the path its view has it at).
-    pub fn read_now(path: &std::path::Path) -> Result<std::sync::Arc<[u8]>, ReadError> {
-        // Read from the disk every time, and counted as a look at it: no watch vouches for
-        // the file (`blaze_vfs::outside::looks`).
-        blaze_vfs::outside::looked(path);
-        std::fs::read(path).map(Into::into).map_err(|it| ReadError::of(&it))
-    }
-
-    /// [`IncludedFile::content`] of the file at `path` as it is on disk now
-    /// ([`IncludedFile::read_now`]): what a unit record that read it is filed by.
-    pub fn content_now(path: &std::path::Path) -> ContentId {
-        IncludedFile::content_of(IncludedFile::read_now(path).as_deref())
-    }
-
-    pub fn read<'db, Db: ?Sized + blaze_query::db::Database>(
-        self,
-        db: &'db Db,
-    ) -> &'db Result<std::sync::Arc<[u8]>, ReadError> {
-        self.read_field(db)
-    }
-
-    pub fn bytes<'db, Db: ?Sized + blaze_query::db::Database>(
-        self,
-        db: &'db Db,
-    ) -> Option<&'db std::sync::Arc<[u8]>> {
-        self.read_field(db).as_ref().ok()
-    }
-
-    pub fn content<Db: ?Sized + blaze_query::db::Database>(self, db: &Db) -> ContentId {
-        self.content_field(db).id()
-    }
-}
-
-#[blaze_query::input(debug)]
-pub struct FileSourceRootInput {
-    #[returns(copy)]
-    pub source_root_id: SourceRootId,
-}
-
-/// A source root. Its content ID is of its files' paths and content IDs and `is_library`
-/// ([`SourceRoot::DOMAIN`]), kept by [`Files`] as either changes.
-#[blaze_query::input(debug)]
-pub struct SourceRootInput {
-    #[returns(ref)]
-    #[get(source_root_field)]
-    #[set(set_source_root_field)]
-    source_root: Arc<SourceRoot>,
-    #[returns(copy)]
-    #[get(content_field)]
-    #[set(set_content_field)]
-    content: InputId,
-}
-
-impl SourceRootInput {
-    pub fn source_root<Db: ?Sized + blaze_query::db::Database>(self, db: &Db) -> Arc<SourceRoot> {
-        // clone: the owned copy this API hands out; a reader that only looks uses `source_root_ref`.
-        self.source_root_field(db).clone()
-    }
-
-    /// [`SourceRootInput::source_root`] without a clone of the `Arc` (a write to the count
-    /// every reader of the root shares).
-    pub fn source_root_ref<'db, Db: ?Sized + blaze_query::db::Database>(
-        self,
-        db: &'db Db,
-    ) -> &'db SourceRoot {
-        self.source_root_field(db)
-    }
-
-    pub fn content<Db: ?Sized + blaze_query::db::Database>(self, db: &Db) -> ContentId {
-        self.content_field(db).id()
-    }
-}
-
 static NEXT_NONCE: AtomicUsize = AtomicUsize::new(0);
 
+/// What tells two databases of one process apart ([`Db::nonce`]), and two id spaces of one
+/// database: what a holder of ids outside the memo keys by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Nonce(usize);
 
@@ -628,7 +353,6 @@ impl CrateWorkspaceData {
         let mut hasher = Hasher::new(CrateWorkspaceData::DOMAIN);
         match &self.target {
             Ok(target) => hasher.update(&[0]).id(&target.content()),
-            // alloc: the error's text, once per workspace's content ID (setup, an error path).
             Err(error) => hasher.update(&[1]).part(error.to_string().as_bytes()),
         };
         hasher.opt_part(self.toolchain.as_ref().map(Version::to_string));
@@ -661,110 +385,273 @@ pub fn toolchain_channel(db: &Db, krate: Crate) -> Option<ReleaseChannel> {
     krate.workspace_data(db).toolchain.as_ref().and_then(|v| ReleaseChannel::from_str(&v.pre).ok())
 }
 
-/// The kind of an input made from `krate`'s sources (a maintainer's per-crate state), by the
-/// crate's origin, which every crate has: `LOW` for a workspace crate (`Local`), `HIGH` for the
-/// standard library (`Lang`), rustc's crates and registry, git and vendored dependencies
-/// (`Library`). blaze-lower gives a crate the origin that matches its source root (a path
-/// package's root is local, every other package's a library's); a registry library's doctest
-/// crates are `Library` too (blaze-lower `doctests`). A library crate's input stated `LOW`
-/// would have every query over it verify again after each workspace edit.
-pub fn crate_durability(db: &Db, krate: Crate) -> Durability {
-    match krate.data(db).origin {
-        CrateOrigin::Local { .. } => Durability::LOW,
-        CrateOrigin::Library { .. } | CrateOrigin::Lang(_) | CrateOrigin::Rustc { .. } => {
-            Durability::HIGH
-        }
-    }
-}
-
-#[blaze_query::input(singleton, debug)]
-struct AllCrates {
-    #[returns(clone)]
-    crates: std::sync::Arc<[Crate]>,
+/// The crate graph's list: one input of its content ID in the list's own open arena
+/// (`world::LIST_ARENA`), which every reader of the list reads ([`list_input`]: its handle is
+/// kept in the snapshot's table, as a crate's is; not a singleton, which the engine keeps in
+/// the session arena alone), beside the list itself in the snapshot's table ([`all_crates`], [`source_root_crates`], a [`listed_by_prefix`] that
+/// found none). The list's content is of each listed crate's item key and root file's path in
+/// order (`world::List`, [`CRATE_GRAPH_DOMAIN`]), so a crate added, taken out, put elsewhere
+/// or written where its item key moves ([`crate_item_key`]: its cfg, edition, dependencies,
+/// ...) makes that arena again, which drops the runs that read it and their borrowers: no
+/// crate declares it, and the session does not hold it. A write of a crate's env, workspace
+/// data or lints, or of what of its data and extra data the item key leaves out, moves its
+/// content ID, not the list: it drops that crate's arena and its dependents' alone.
+#[blaze_memo::input(debug)]
+pub(crate) struct AllCrates {
     #[returns(copy)]
     content: InputId,
 }
 
-/// The crate graph's content ID is of its crates' content IDs, in topological order.
-pub const CRATE_GRAPH_DOMAIN: &str = "blaze v2 crate graph 1";
-
-fn crate_graph_content(db: &Db, crates: &[Crate]) -> ContentId {
-    let mut hasher = Hasher::new(CRATE_GRAPH_DOMAIN);
-    content::len(&mut hasher, crates.len());
-    for krate in crates {
-        hasher.id(&krate.content(db));
-    }
-    hasher.finish()
+/// The snapshot's crate-list input ([`AllCrates`], in `world::LIST_ARENA`): `None` before the
+/// first commit made the list's arena. A lookup of the table; reading its `content` is the
+/// read of the list (a borrow of the list's arena).
+fn list_input(db: &Db) -> Option<AllCrates> {
+    db.snap().table.list_input
 }
+
+/// The domain of the crate list's digest (`world::List`): each listed crate's item key and
+/// root file's path, in topological order.
+pub const CRATE_GRAPH_DOMAIN: &str = "blaze v2 crate graph 2";
 
 /// The content ID of [`all_crates`].
 pub fn all_crates_content(db: &Db) -> ContentId {
-    match AllCrates::try_get(db) {
+    match list_input(db) {
         Some(all) => all.content(db).id(),
-        None => crate_graph_content(db, &[]),
-    }
-}
-
-/// Sets the crate graph's content ID from its crates' as they are.
-pub(crate) fn refresh_crate_graph_content(db: &mut Db) {
-    let Some(all) = AllCrates::try_get(&*db) else { return };
-    let content = InputId(crate_graph_content(&*db, &all.crates(&*db)));
-    if all.content(&*db) != content {
-        all.set_content(db).to(content);
-    }
-}
-
-pub fn set_all_crates_with_durability(
-    db: &mut Db,
-    crates: impl IntoIterator<Item = Crate>,
-    durability: Durability,
-) {
-    // alloc: the crate graph's list, once per set (setup).
-    let crates: std::sync::Arc<[Crate]> = crates.into_iter().collect();
-    db.write_crates("set_all_crates_with_durability", |db| {
-        let content = InputId(crate_graph_content(&*db, &crates));
-        match AllCrates::try_get(&*db) {
-            Some(all) => {
-                all.set_crates(db).with_durability(durability).to(crates);
-                all.set_content(db).with_durability(durability).to(content);
-            }
-            None => {
-                _ = AllCrates::new(db, durability, crates, content);
-            }
+        None => {
+            let mut hasher = Hasher::new(CRATE_GRAPH_DOMAIN);
+            content::len(&mut hasher, 0);
+            hasher.finish()
         }
-    })
+    }
 }
 
 /// Returns the crates in topological order.
 ///
 /// **Warning**: do not use this query in `hir-*` crates! It kills incrementality across crate metadata modifications.
 pub fn all_crates(db: &Db) -> std::sync::Arc<[Crate]> {
-    AllCrates::try_get(db).map_or(std::sync::Arc::default(), |all_crates| all_crates.crates(db))
-}
-
-// FIXME: VFS rewrite should allow us to get rid of this wrapper
-#[doc(hidden)]
-#[blaze_query::interned]
-pub struct InternedSourceRootId {
-    #[returns(copy)]
-    pub id: SourceRootId,
-}
-
-/// Crates whose root file is in `id`.
-pub fn source_root_crates(db: &Db, id: SourceRootId) -> &[Crate] {
-    #[blaze_query::tracked(returns(deref))]
-    pub fn source_root_crates(db: &Db, root: SourceRootInput) -> Box<[Crate]> {
-        let crates = AllCrates::get(db).crates(db);
-        blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
-            let mut found = Vec::new_in(frame);
-            found.extend(crates.iter().copied().filter(|&krate| {
-                let root_file = krate.data(db).root_file_id;
-                db.source_root(db.file_source_root(root_file).source_root_id(db)) == root
-            }));
-            Box::from(&found[..]) // alloc: the memo's value, made again only when the crate graph changes.
-        })
+    match list_input(db) {
+        Some(all) => {
+            // The read: the list's content, of the list's own arena (`world::LIST_ARENA`).
+            _ = all.content(db);
+            std::sync::Arc::clone(&db.snap().table.all)
+        }
+        None => std::sync::Arc::default(),
     }
-    source_root_crates(db, db.source_root(id))
+}
+
+/// The prefix a crate's item key is found by ([`listed_by_prefix`]): its first 8 bytes read
+/// little-endian, the crate prefix every item key of the crate begins with (blaze-items'
+/// `crate_prefix`).
+pub fn key_prefix(item_key: &ContentId) -> u64 {
+    u64::from_le_bytes(*item_key.0.first_chunk().expect("a content ID is 32 bytes"))
+}
+
+/// The listed crate whose item key ([`crate_item_key`]) begins with `prefix`
+/// ([`key_prefix`]), if one does: one binary search of the snapshot's table, made each commit
+/// the list moved.
+///
+/// What it reads is what its answer depends on, and no more:
+/// - a crate found is read through its own [`Crate`] input (its data, an input of its own
+///   arena): the asker borrows that crate, whose arena a write that moves its item key off
+///   `prefix` (its cfg, its dependencies) or takes it out of the list marks. A second crate
+///   that took the prefix is a clash, which stops the build ([`listed_clash`]);
+/// - none found reads the list ([`AllCrates`], its own open arena): a crate that takes the
+///   prefix moves the list, so the runs that found none are dropped with it.
+///
+/// So a build script's cfg written drops that crate, its dependents and the runs that found
+/// no crate; never a crate that found another crate's key. Until round 28 every lookup read a
+/// session query of every crate's key (`crates_by_prefix`), so each cfg written, and each
+/// crate added, dropped every arena.
+///
+/// # Panics
+///
+/// Where the list has a clash ([`listed_clash`]): a key resolved in a build that check stops.
+pub fn listed_by_prefix(db: &Db, prefix: u64) -> Option<Crate> {
+    let table = &db.snap().table;
+    if let Some([krate, other]) = table.clash {
+        panic!(
+            "base-db: a crate key looked up in a crate list where the crates {krate:?} and {other:?} share \
+             the prefix of their item keys (`listed_clash`, which a build checks before any key is resolved)"
+        );
+    }
+    match table.by_prefix.binary_search_by_key(&prefix, |&(it, _)| it) {
+        Ok(at) => {
+            let key = table.by_prefix[at].1;
+            let krate = db.crate_at(key).unwrap_or_else(|| {
+                panic!(
+                    "base-db: the crate list's prefix index names the crate {key:?}, which this snapshot's \
+                     table has no crate for (the index and the table are made in one commit)"
+                )
+            });
+            // The read: the found crate's own input, so the asker borrows its arena.
+            _ = krate.data(db);
+            Some(krate)
+        }
+        Err(_) => {
+            if let Some(all) = list_input(db) {
+                _ = all.content(db);
+            }
+            None
+        }
+    }
+}
+
+/// The first two listed crates whose item keys share a prefix ([`key_prefix`]), by key; none
+/// where every prefix is one crate's. Read off the snapshot's table, outside any run: what a
+/// build checks once its crate graph is set, before any key is resolved.
+pub fn listed_clash(db: &Db) -> Option<[CrateKey; 2]> {
+    db.snap().table.clash
+}
+
+/// A kind of gift that says where a value can be read, never what it is: the kind's promise,
+/// stated once here, is that every reader of the gift computes the same value with it as
+/// without it (an image's lang items are the ones the crate's def map collects; a crate's
+/// constants filed under a key are the ones its evaluation gives). So a gift of the kind is
+/// no input of any arena: it lives in the snapshot's table ([`Crate::located`]), and its first
+/// gift to a crate marks no arena, however much the crate's arena holds
+/// ([`Edit::give_located`]). A gift that replaces one under another fact, or a withdrawal
+/// ([`Edit::take_located`]), marks the crate: the value held may be one the inputs no longer
+/// give, and whatever read it goes with the crate's arena (each reader of a crate's gift
+/// reads it in that crate's arena or in a dependent's, each of which borrows it).
+///
+/// A kind given located is given and read that way only: [`Edit::give`] or [`Edit::give_by`]
+/// of a kind a crate holds located stops, as does [`Edit::give_located`] of one it holds as a
+/// slot.
+pub trait Located: 'static {}
+
+/// The kind of the planted-bug control of the located-gift tests.
+#[cfg(test)]
+pub(crate) struct LocatedForTests;
+
+#[cfg(test)]
+impl Located for LocatedForTests {}
+
+/// Crates whose root file is in `id`, in the crate graph's order.
+///
+/// What it is made from is read: the list ([`AllCrates`]: a crate's root file is in its
+/// content) and the root ([`SourceRootInput::content`]: a file moved into or out of it is in
+/// its content). One index of the snapshot's table.
+pub fn source_root_crates(db: &Db, id: SourceRootId) -> &[Crate] {
+    let Some(all) = list_input(db) else { return &[] };
+    _ = all.content(db);
+    _ = db.source_root(id).content(db);
+    db.snap().table.root_crates.get(&id).map_or(&[], |it| &it[..])
+}
+
+/// The domain of [`crate_root_content`] for a crate whose source root holds another crate's
+/// `OUT_DIR`.
+pub const OWN_ROOT_DOMAIN: &str = "blaze v2 source root content without other crates' OUT_DIRs 1";
+
+/// The `OUT_DIR`s of the other crates of `krate`'s source root, sorted, each without a
+/// trailing separator: the directories of that root whose files `krate` is not made from.
+/// Kept in the crate's arena.
+///
+/// A field of the crate's own input, made by the world each commit (`world::out_dirs_of`):
+/// until round 28 this query read the list of its root's crates and each one's variables,
+/// so every crate's arena read the crate list, and a crate added anywhere (the second `hi`
+/// crate of `check` after `run`) dropped every arena. Now a commit marks a crate's arena when
+/// its own dirs move (a crate of its root added, taken out or given another `OUT_DIR`), and
+/// nothing else of the list reaches it.
+///
+/// A build script's run is applied by putting the files it left in `OUT_DIR` into its
+/// package's source root (`blaze_lower::Lowered::ran`), where the crates given that `OUT_DIR`
+/// (the package's library and binaries) `include!` them. The build script's own crate
+/// (`build.rs`) is of the same source root and is given no `OUT_DIR`: those files are what
+/// its run makes, never what it is made from. Decided by the crates' env, which the plan
+/// sets before any run, so it is the same before a run is applied and after.
+#[blaze_memo::tracked(returns(copy))]
+pub fn other_out_dirs<'db>(db: &'db Db, krate: Crate) -> &'db [&'db str] {
+    let memo = db.memo();
+    blaze_memo::keep_iter(memo, krate.out_dirs(db).iter().map(|dir| blaze_memo::keep_str(memo, dir)))
+}
+
+/// Whether `path` is a file below one of `dirs` ([`other_out_dirs`]).
+pub fn below_any(path: &str, dirs: &[&str]) -> bool {
+    dirs.iter().any(|dir| path.strip_prefix(dir).is_some_and(|rest| rest.starts_with(['/', '\\'])))
+}
+
+/// The content of `krate`'s source root as `krate` is made from it: what a key or an identity
+/// of the crate holds for "every file of its source root".
+///
+/// The invariant: it does not change when a build script's run is applied for a crate the
+/// run's `OUT_DIR` was not given to.
+///
+/// The root's own content ID ([`SourceRootInput::content`]) for a crate whose root holds no
+/// other crate's `OUT_DIR` (every crate but a build script's, and those of a package whose
+/// script is not run for them). For a crate whose root does ([`other_out_dirs`]): each
+/// other file's path and content, sorted by path. Until 2026-11-11 every key took the
+/// root's content whole, so a library package's build script was keyed by the files its own
+/// run left: its unit identity and its image key moved once it had run, and the first build
+/// after a cold one compiled each such script again, asked the store for its image and its
+/// dependencies', and so read the standard library from images it had resolved a build
+/// before.
+///
+/// Why leaving them out covers every input (rule 21). A crate reads a file of its source
+/// root by a path its source or its env gives it. `OUT_DIR` is a directory of the build
+/// directory named by a hash of the build's own plan; the crate's env does not hold it
+/// (that is what [`other_out_dirs`] selects by) and its source cannot name it before the
+/// plan that hashes that source exists.
+#[blaze_memo::tracked(returns(copy))]
+pub fn crate_root_content(db: &Db, krate: Crate) -> ContentId {
+    let root = db.source_root(db.file_source_root(krate.data(db).root_file_id).source_root_id(db));
+    let others = other_out_dirs(db, krate);
+    if others.is_empty() {
+        return root.content(db);
+    }
+    let set = root.source_root_ref(db);
+    blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
+        let mut files = Vec::new_in(frame);
+        for file in set.iter() {
+            // A file with no path on disk is under no directory.
+            let path = set.path_for_file(&file);
+            if path.and_then(|it| it.as_path()).is_some_and(|it| below_any(it.as_str(), others)) {
+                continue;
+            }
+            files.push((path.map(|it| it.to_string()).unwrap_or_default(), db.file_content(file)));
+        }
+        files.sort_unstable();
+        let mut hasher = Hasher::new(OWN_ROOT_DOMAIN);
+        hasher.update(&[u8::from(set.is_library)]).update(&(files.len() as u64).to_le_bytes());
+        for (path, content) in &files {
+            hasher.part(path.as_bytes()).id(content);
+        }
+        hasher.finish()
+    })
+}
+
+/// The domain of [`crate_root_ported`].
+const PORTED_ROOT_DOMAIN: &str = "blaze v2 crate ported files 1";
+
+/// [`crate_root_content`] for a key that must not say where the checkout is: the same files
+/// (every file of `krate`'s source root but those under another crate's `OUT_DIR`,
+/// [`other_out_dirs`], the one selection both make), each as its path written by
+/// [`Files::ported`] and its content ID, sorted by that path. A file with no path on disk is
+/// under no directory and has the empty path, as there.
+///
+/// The invariants: [`crate_root_content`]'s (a run applied for another crate leaves it), and
+/// the same files in another checkout, whose paths differ only in where the build's
+/// directories are, give the same ID.
+#[blaze_memo::tracked(returns(copy))]
+pub fn crate_root_ported(db: &Db, krate: Crate) -> ContentId {
+    let root = db.source_root(db.file_source_root(krate.data(db).root_file_id).source_root_id(db));
+    let others = other_out_dirs(db, krate);
+    let set = root.source_root_ref(db);
+    let mut files: Vec<(Vec<u8>, ContentId), Global> = Vec::new_in(Global);
+    for file in set.iter() {
+        let path = set.path_for_file(&file);
+        if path.and_then(|it| it.as_path()).is_some_and(|it| below_any(it.as_str(), others)) {
+            continue;
+        }
+        let path = path.map(|it| it.to_string()).unwrap_or_default();
+        files.push((db.files().ported(path.as_bytes()).into_owned(), db.file_content(file)));
+    }
+    files.sort_unstable();
+    let mut hasher = Hasher::new(PORTED_ROOT_DOMAIN);
+    hasher.update(&[u8::from(set.is_library)]).update(&(files.len() as u64).to_le_bytes());
+    for (path, content) in &files {
+        hasher.part(path).id(content);
+    }
+    hasher.finish()
 }
 
 pub fn relevant_crates(db: &Db, file_id: FileId) -> &[Crate] {

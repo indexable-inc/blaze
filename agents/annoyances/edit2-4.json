@@ -1,0 +1,11 @@
+{
+ "id": "edit2-4",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+ "where": "blaze-link's tests under cargo",
+ "what": "`cargo test -p blaze-link --lib` does not compile on all-1111 (e453ac295a): `tests::Linked` has no `Debug` and `tests.rs:1794` calls `unwrap_err` on a `Result<Linked, _>`.",
+ "cost": "one failed test run; no test of the linker could be run until it was fixed",
+ "cause": "a test added by a lane that builds with blaze, where nothing compiled the test target under cargo",
+ "workaround": "`#[derive(Debug)]` on the test's `Linked` (on edit2-1111)",
+ "state": "fixed on edit2-1111 (the derive)"
+}

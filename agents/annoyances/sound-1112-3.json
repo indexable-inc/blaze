@@ -1,0 +1,17 @@
+{
+ "id": "sound-1112-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane sound-1112",
+ "where": "the one integration checkout: `git commit -- <file>` of a file two lanes edit",
+ "what": "Lane onsave-1112 was adding a step (`wait N ms`) to the revision harness in the same working directory while this lane committed crates/hir-ty-codegen/v2/edits/revisions.rs: the commit (a35c6a040e) took the other lane`s arm `Step::Wait` with it, without the variant in spec.rs that was still uncommitted, and origin/int-1112 did not compile hir-ty-codegen`s tests for three commits (73e94c355f among them) until fab0b734cf committed the rest of the step.",
+ "cost": "one queue round of this lane (about 12 minutes waiting) and a tree whose tests did not compile for other lanes",
+ "cause": "a path-limited commit takes the whole file as it is on disk, and two lanes had hunks in it",
+ "whys": [
+  "the lanes share one working directory and commit by path",
+  "paths were assigned by directory, and the harness directory was this lane`s while another lane had a reason to add a step"
+ ],
+ "class": "two writers of one file in one working directory",
+ "prevention": "before a commit, `git diff --no-ext-diff -- <files>` and commit only when every hunk is the lane`s own (or `git add -p`); a lane that needs a step in another lane`s file asks for it",
+ "workaround": "commit the other lane`s remaining hunks of the same change",
+ "state": "open"
+}

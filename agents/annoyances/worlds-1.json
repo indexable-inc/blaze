@@ -1,0 +1,14 @@
+{
+ "id": "worlds-1",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane worlds (V15) under proofs-1113",
+ "where": "crates/hir-ty-lean/src/body.rs (fold) and translate.rs (Cond::Discriminant, simplify) against hir-ty-mir pattern_matching.rs",
+ "what": "An or-pattern in a `match` (`Change::At(at, more) | Change::Sectors(at, more) => ..`) was refused as `a discriminant read that no match follows`: hir-ty-mir lowers it in two passes (check, then bind), so the MIR reads the discriminant, enters a labelled block for the or-pattern, and switches inside it, and the structured normal form puts the read before the block, apart from its switch. Once that folded, the second test showed up in the model as a nested match on the same value with a `Result.fail Error.unreachable` arm for the variant the outer arm took.",
+ "cost": "about two hours to find, after a survey of every world function",
+ "cause": "MIR lowering tests an or-pattern twice and the translator read each MIR test literally, as a new match",
+ "whys": "pattern lowering binds in a second pass; structured reconstruction keeps the label; fold only joined a read to a switch in the same block; translate had no notion of which variants a place can still be",
+ "class": "a lowering that repeats a test the translator cannot see as redundant makes the model show dead arms or refuse",
+ "prevention": "done: fold joins a read to the switch under a label; translate knows the bound or remaining variants of a place and skips a test they decide; simplify flattens a match on x in the `_` arm of a match on x; tests `the_worlds_constructs_become_their_models` (kind, either, size)",
+ "workaround": "none needed now",
+ "state": "fixed"
+}

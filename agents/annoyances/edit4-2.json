@@ -1,0 +1,11 @@
+{
+ "id": "edit4-2",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+ "where": "blaze-link: the kept tables of an ELF image",
+ "what": "Every kept table of the ELF writer (`.rela.dyn`, `.eh_frame_hdr`, the symbol table) was patched only when `Delta::same_regions` held, and it never holds for a body edit: new code goes into the patch region, whose size changes. So each was made whole on every edit of a real program, and `.rela.dyn`'s patch path, with its tests, ran only in tests, whose fixtures set `same_regions: true` by hand.",
+ "cost": "303 KB of `.rela.dyn` written an edit, and the tables' 1 to 2 MiB allocated; an hour to see that the patch path was never taken (the first slot design changed nothing measured)",
+ "cause": "the writer's tests build their `Delta` by hand and none comes from a stage of the core that places new code",
+ "workaround": "`Delta::same_places` for `.rela.dyn` (regions keep their places, sizes may change); found by printing the gate's inputs in `tests::patch::a_same_size_body_edit_writes_the_function_and_a_constant`",
+ "state": "fixed for `.rela.dyn` on edit4-1111 (17 KB an edit where it was 300 KB); open: `.eh_frame_hdr` and the symbol table are still made whole each edit, and no test drives the writer's patch paths from a real stage"
+}

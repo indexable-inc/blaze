@@ -51,9 +51,8 @@ blaze-inproc.workspace = true
 # as a build does, each function's IR from hir-ty-codegen.
 base-db.workspace = true
 blaze-format.workspace = true
-blaze-lower.workspace = true
 blaze-macro-eval.workspace = true
-blaze-query.workspace = true
+blaze-memo.workspace = true
 blaze-units.workspace = true
 blaze-vfs.workspace = true
 hir-ty-codegen.workspace = true
@@ -62,6 +61,12 @@ serde_json.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
+# The launcher the slot-calling code is made for (`src/tests/launched.rs`): real tier 0
+# code placed in its mapping, bound on first call and replaced while a thread calls it.
+blaze-launch.workspace = true
+blaze-launch-rt.workspace = true
+blake3.workspace = true
+crossbeam-channel.workspace = true
 
 [features]
 default = ["llvm-stencils"]

@@ -1,0 +1,11 @@
+{
+ "id": "mem2-5",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+ "where": "blaze: `blaze explain memory`",
+ "what": "Every memory view is of a build at its footprint's peak. An idle daemon's question (what do you hold now, after the builds) had no view: `blaze explain memory` picks the last build with memory rows, often a 2 ms store task, and prints empty tables.",
+ "cost": "several hand-written queries",
+ "cause": "the views were made for the self-build's peak",
+ "workaround": "`blaze explain memory_held_now`; the idle line in serve.log (`idle: the kept front end of ... holds`)",
+ "state": "fixed on mem2-1111 (276ba7e15a, and the idle line)"
+}

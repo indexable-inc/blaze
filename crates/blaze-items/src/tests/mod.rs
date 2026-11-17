@@ -9,9 +9,13 @@ mod goals;
 mod hashes;
 mod mem;
 mod narrow;
+mod own_tables;
 mod table;
 
-use hir_def::{ModuleDefId, nameres::crate_def_map};
+use std::alloc::Global;
+
+use blaze_memo::testing::Ran;
+use hir_def::{ModuleDefId, ModuleId, nameres::crate_def_map};
 use hir_expand::fixture;
 
 use crate::{ItemId, key};
@@ -66,6 +70,16 @@ pub(crate) fn item(db: &TestDB, path: &str) -> ItemId {
     }
 }
 
+/// The module of the fixture's crate named `name`.
+#[track_caller]
+pub(crate) fn module(db: &TestDB, name: &str) -> ModuleId {
+    crate_def_map(db, fixture::test_crate(db))
+        .modules(db)
+        .map(|(id, _)| id)
+        .find(|id| id.name(db).is_some_and(|it| it.as_str() == name))
+        .unwrap_or_else(|| panic!("no module `{name}`"))
+}
+
 /// The database of a one-file fixture, and a way to set that file's text.
 pub(crate) fn single(text: &str) -> (TestDB, base_db::FileId) {
     let fx = fixture::db(text);
@@ -75,6 +89,31 @@ pub(crate) fn single(text: &str) -> (TestDB, base_db::FileId) {
     (db, file)
 }
 
+/// Sets `file`'s text in a new snapshot: one edit and its commit. A file's id and a crate's key
+/// are the same across it; every other id (an item's, a [`base_db::Crate`]) is of the snapshot
+/// it was taken in, taken again after.
 pub(crate) fn edit(db: &mut TestDB, file: base_db::FileId, text: &str) {
-    db.set_file_text(file, text);
+    let mut edit = db.edit();
+    edit.set_file_text(file, text);
+    _ = edit.commit();
+}
+
+/// What `work` ran, from the database's run log (a fixture's database logs its runs): the runs
+/// before it are taken off first, so none of them is counted as its.
+pub(crate) fn runs_of(db: &TestDB, work: impl FnOnce()) -> Vec<Ran, Global> {
+    let log = db.runs().expect("a fixture's database logs its runs");
+    _ = log.take();
+    work();
+    log.take()
+}
+
+/// How many of `runs` ran the query of the kind named `kind` (its generated `KIND_NAME`),
+/// whatever its key.
+pub(crate) fn count(runs: &[Ran], kind: &str) -> usize {
+    runs.iter().filter(|it| it.query == kind).count()
+}
+
+/// Whether any of `runs` ran the query of the kind named `kind` (its `KIND_NAME`).
+pub(crate) fn ran(runs: &[Ran], kind: &str) -> bool {
+    count(runs, kind) > 0
 }

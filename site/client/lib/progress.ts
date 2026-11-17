@@ -4,7 +4,8 @@
  * map (learn.ts) and the sidebar's lesson marks (side.ts) read it.
  *
  * `lessons` is keyed by each node's key on the course (render: course.rs): a lesson's name (`builds`), an update's
- * `updates/<slug>`. `seen` and `fresh` are what's new: `seen` the updates the site had when the reader was last here,
+ * `updates/<slug>`. Lesson 1 was the home page, `index`, until the intro took `/` and it moved to `/start`: a store
+ * written before that is read with its `index` as `start`. `seen` and `fresh` are what's new: `seen` the updates the site had when the reader was last here,
  * `fresh` those that appeared since and are still new to them. Both are optional, so a store written before them
  * reads the same.
  *
@@ -25,8 +26,11 @@ export function load(): Saved {
 		const raw = localStorage.getItem(KEY);
 		if (raw) {
 			const s: unknown = JSON.parse(raw);
-			if (s && typeof s === 'object' && 'v' in s && s.v === 1 && 'lessons' in s && s.lessons && typeof s.lessons === 'object')
+			if (s && typeof s === 'object' && 'v' in s && s.v === 1 && 'lessons' in s && s.lessons && typeof s.lessons === 'object') {
 				memory = s as Saved;
+				const { index, ...rest } = memory.lessons;
+				if (index) memory.lessons = { start: index, ...rest };
+			}
 		}
 	} catch {
 		// No storage, or not ours: keep what this visit has.

@@ -1,0 +1,14 @@
+{
+ "id": "made-values-live-in-two-crates",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), host round 2 lane 'made facts', port-memo-1113",
+ "where": "crates/blaze-items/src/facts.rs const_value, hidden_types; crates/blaze-item-hash/src/values.rs escaped; crates/hir-ty-pure/src/own.rs own_effects",
+ "what": "The brief pointed at blaze-item-hash/src/values.rs for the form of the made values ConstValue and HiddenTypes, but they live in blaze-items/src/facts.rs, and the four kinds a body makes (ConstValue, HiddenType, Escaped, Effects) are now in three crates.",
+ "cost": "a search across crates to find the form to follow",
+ "cause": "a made fact's value is written next to whatever analysis computes it, with no one module listing the kinds a body makes and where each value comes from",
+ "class": "one concept (a body's made facts) with no home, so a reader cannot find all its members from one place",
+ "prevention": "one table in blaze-front/src/facts.rs (or blaze-keyed's FactKind doc) naming, per made kind, the function that gives its value",
+ "workaround": "rg for FactKind::Escaped and the made kinds",
+ "fix": "not yet",
+ "state": "open"
+}

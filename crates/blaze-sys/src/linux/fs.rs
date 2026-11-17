@@ -252,6 +252,56 @@ pub fn fdatasync(fd: Fd) -> Result<(), Errno> {
     raw::check(unsafe { raw::syscall1(nr::FDATASYNC, arg(fd)) }).map(|_| ())
 }
 
+/// What an [`lseek`] looks for from its offset.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum Whence {
+    /// `SEEK_DATA`: the first offset at or after the one given that holds data.
+    Data = 3,
+    /// `SEEK_HOLE`: the first offset at or after the one given that is in a hole; a file's
+    /// end counts as one.
+    Hole = 4,
+}
+
+/// `lseek` with `SEEK_DATA` or `SEEK_HOLE`: where the file's next data, or its next hole,
+/// begins at or after `at`. [`Errno::Nxio`] when there is none: `at` is at or past the
+/// file's end, or (for data) only a hole lies between `at` and the end. A file system that
+/// keeps no record of holes says every byte is data. It moves the descriptor's position,
+/// which nothing that uses `pread`, `pwrite` or [`copy_file_range`] reads. Used by
+/// `Effect::CopyData` to copy a file's data and none of its holes.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn lseek(fd: Fd, at: u64, whence: Whence) -> Result<u64, Errno> {
+    // SAFETY: the call takes numbers and no memory.
+    raw::check(unsafe { raw::syscall3(nr::LSEEK, arg(fd), at as usize, whence as usize) })
+        .map(|found| found as u64)
+}
+
+/// `copy_file_range`: up to `len` bytes of `from` at `from_at` copied by the kernel to `to`
+/// at `to_at`, through no memory of this process; the bytes copied, which may be fewer (0 at
+/// `from`'s end), so the caller loops. Neither descriptor's position moves, as both offsets
+/// are given. Between two files of one file system on every kernel that has the call (4.5),
+/// and across file systems from 5.3; [`Errno::XDev`] before that. A file system that can
+/// share blocks may share them instead of copying. Used by `Effect::CopyData`.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn copy_file_range(from: Fd, from_at: u64, to: Fd, to_at: u64, len: u64) -> Result<usize, Errno> {
+    let (mut from_at, mut to_at) = (from_at as i64, to_at as i64);
+    // SAFETY: the two offsets are live `loff_t`s of this frame the kernel reads and advances
+    // during the call and does not keep; the rest are numbers. Flags are 0, the only value.
+    raw::check(unsafe {
+        raw::syscall6(
+            nr::COPY_FILE_RANGE,
+            arg(from),
+            core::ptr::from_mut(&mut from_at) as usize,
+            arg(to),
+            core::ptr::from_mut(&mut to_at) as usize,
+            len as usize,
+            0,
+        )
+    })
+}
+
 flag_set! {
     /// `sync_file_range`'s flags.
     SyncRange: u32 {

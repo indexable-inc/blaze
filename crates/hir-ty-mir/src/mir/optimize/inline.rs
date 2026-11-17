@@ -346,10 +346,7 @@ impl<'a, 'f, 'db> Inliner<'a, 'f, 'db> {
             Ok(it) => it,
             Err(error) => {
                 // A type's `Debug` reads the attached database.
-                blaze_query::db::attach(
-                    db,
-                    || tracing::debug!(callee = ?site.callee, ?error, "not inlined: not monomorphized"),
-                );
+                blaze_memo::attach(db, || tracing::debug!(callee = ?site.callee, ?error, "not inlined: not monomorphized"));
                 return None;
             }
         };
@@ -609,16 +606,26 @@ fn callee_options(db: &Db, caller: Crate, callee: Crate, options: MirOptions) ->
 /// `options` as rustc's shipped standard library was optimized with: `-O`, not incremental
 /// and without UB checks, so its inliner ran (`Inline::is_enabled`). What a body of the
 /// toolchain's crates is built into another's under ([`callee_options`]), and what rustc
-/// decided their [`cross_crate_inlinable`] with ([`shipped_cross_crate_inlinable`]).
+/// decided their [`cross_crate_inlinable`] with ([`shipped_cross_crate_inlinable`]). Its tier
+/// is [`Tier::Shipped`](crate::facts::Tier::Shipped): rustc's pipeline, which has no pass on
+/// facts, so neither a copy built into a caller nor the one answer of which library functions
+/// are inlinable asks an effect summary. A caller at the optimizing tier still spends facts on
+/// the calls a callee's copy brought, in its own `SpendFacts` after `Inline`.
 fn shipped(options: MirOptions) -> MirOptions {
-    MirOptions { level: MirOptLevel::Release, ub_checks: false, inline: true, ..options }
+    MirOptions {
+        level: MirOptLevel::Release,
+        ub_checks: false,
+        inline: true,
+        tier: crate::facts::Tier::Shipped,
+        ..options
+    }
 }
 
 /// rustc's `cross_crate_inlinable` of a function whose bodies are optimized with `options`:
 /// whether other crates may build its body into theirs. rustc infers it for a small leaf
 /// function only where its inliner runs and the build is not incremental, which `inline`
 /// says.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn cross_crate_inlinable(db: &Db, func: FunctionId, options: MirOptions) -> bool {
     if let Some(written) = written_cross_crate_inlinable(db, func) {
         return written;
@@ -646,7 +653,7 @@ pub(crate) fn shipped_cross_crate_inlinable(db: &Db, func: FunctionId) -> bool {
 /// decides of `func` from its attributes and signature alone, before it looks at how its
 /// crate is built: `None` where it goes on to infer it from the optimized body. Memoized: the
 /// code generator asks it of every instance it describes (`home::compiled_by_user`).
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub(crate) fn written_cross_crate_inlinable(db: &Db, func: FunctionId) -> Option<bool> {
     let attrs = Attrs::of_fn(db, func);
     // Globally shared: it is named from outside the crate, so no copy is made in another.

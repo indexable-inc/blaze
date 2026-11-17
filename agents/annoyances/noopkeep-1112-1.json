@@ -1,0 +1,17 @@
+{
+ "id": "noopkeep-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane noopkeep-1112",
+ "where": "crates/blaze-cargo/src/serve/tests.rs `of_graph`: the fake plan of the daemon's simulation",
+ "what": "The fake plan returns `lock: Some(Cargo.lock)` for every plan of every view, whatever the view holds. A real load asks for a lock write only when the file is missing or stale. So every simulated build wrote the lock file, no kept plan ever had `lock: None`, and `record_answer` refused every recording as `Unkept::Planned`: the daemon's simulation never kept a no-op answer through this plan, and a change to lock handling cannot be judged by it without reading each test.",
+ "cost": "not measured; about an hour of this lane designing `lock_into_view` around a plan that asks again for bytes the view holds",
+ "cause": "the fake was written to show that a lock write is placed, and was reused as the default plan",
+ "whys": [
+  "one fake plan serves every daemon test",
+  "the fake does not read the view it is asked on, so it cannot say `nothing to write`"
+ ],
+ "class": "a test double that does not model the property under change",
+ "prevention": "make the fake's lock write a function of the view (ask for Cargo.lock only when the view lacks it or holds other bytes), so the simulation covers lock files entering the view and the no-op lane after them; not done by this lane (serve/tests.rs is outside its paths)",
+ "workaround": "`lock_into_view` compares by content: a lock write whose bytes the view already holds changes nothing and is passed on as before",
+ "state": "open"
+}

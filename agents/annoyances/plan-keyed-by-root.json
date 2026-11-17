@@ -1,0 +1,14 @@
+{
+ "id": "plan-keyed-by-root",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executors of task E3 and E3b of /tmp/plan/12-edit-floor.md, int-1112",
+ "where": "crates/blaze-cargo/src/serve/job.rs Jobs::open, Jobs::planned, LastPlan; serve/job/plan_reads.rs; serve/unit/compile.rs store, PendingRecord, file_records; serve/work.rs Compiled::record",
+ "what": "A checkout's kept plan was matched by one key, its view's root and config hashed together, so every body or comment edit moved the key and the plan was asked again (1.97 ms on six dependencies, build 58), came back equal, and was found equal by comparing every unit; and a build's request certificate was written as the build ended, before what the build put after its answer (its kept front end's records) was durable.",
+ "cost": "about 2 ms of every edit's 47.5 ms on six dependencies; and a crash between the answer and the store's commit could leave a certificate that answers over records the store lost",
+ "cause": "the plan's identity was taken from the whole view's root instead of from what the plan read; the certificate's order was tied to the build's end instead of to the durability of what it rests on",
+ "class": "a cache keyed by a coarser input than the one its value read (granular-caching); a commit record written before the records it names are durable",
+ "prevention": "a kept value carries the reads its engine recorded and is kept while those reads are equal (plan_reads::holds over Vfs::diff); a record that names others is written only once their puts are durable (Jobs::certify_held)",
+ "workaround": "none",
+ "fix": "LastPlan keeps PlanReads from blaze_query::Pinned::inputs_of::<Plan> and its root held open; Jobs::open re-keys a plan of the request's shape whose reads hold over the views' difference, so Arc<Units> stays the same pointer. Jobs::heard holds a build's Ended until its Settling is gone, and Jobs::lose drops it. Tests: plan_reads::tests (control Plant::ListingBlind), serve::tests::a_crash_after_the_answer_leaves_no_certificate_without_its_record (control job::CERTIFY_FIRST). E3b: store no longer encodes or files the unit record before the answer: it fills Compiled::record (a PendingRecord: the record's parts, its outputs' tie and the front end's path_reads tie read on the unit's task), and unit::file_records encodes and files it after the answer (spans `unit record encode`, `unit record file`) as KeptPuts of the after-answer task, so certify_settled waits for them. Not done: job.rs's wiring of Compiled::record into Does::StoreKept and a task for builds that keep no front end (/tmp/plan/handoff-12-E3b.md, the tree does not compile until it lands), and `body entries kept` after the answer (needs front_carry.rs bodies::keep over a kept front end and the loop marking its sessions; same handoff).",
+ "state": "open"
+}

@@ -369,11 +369,6 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         expected: &Expectation<'db>,
         is_read: ExprIsRead,
     ) -> Ty<'db> {
-        // Every expression is inferred and ids are dense, so one in 64 bounds how long a
-        // cancelled revision runs on, without two dependent loads per expression.
-        if tgt_expr.into_raw().into_u32() % 64 == 0 {
-            blaze_query::db::unwind_if_cancelled(self.db);
-        }
         // An expression is inferred within the one it is in: rustc's 5,204-arm `else if`.
         crate::next_solver::ensure_sufficient_stack(|| {
             self.infer_expr_inner_here(tgt_expr, expected, is_read)
@@ -1282,7 +1277,13 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         // `check_expr_struct_fields`).
         for field in hir_fields {
             let hygiene = self.store.record_field_hygiene(field.expr);
-            let name = &VariantFields::name_written(self.db, variant, field.name, hygiene);
+            let name = &VariantFields::name_written(
+                self.db,
+                self.resolver.ctx_table(),
+                variant,
+                field.name,
+                hygiene,
+            );
             let field_type = if let Some(i) = remaining_fields.remove(name) {
                 seen_fields.insert(*name, i);
 
@@ -1434,7 +1435,20 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 {
                     debug!(?remaining_fields);
 
-                    // FIXME: Emit an error: missing fields.
+                    // rustc's `report_missing_fields`: E0063 is a type check error, so it taints
+                    // the body (and the item a closure with it is in) as every other one here
+                    // does, and nothing builds MIR of it. In the order of the variant's fields.
+                    let missed_fields: Vec<hir_def::LocalFieldId> = variant_fields
+                        .fields()
+                        .iter()
+                        .filter(|(_, field)| remaining_fields.contains_key(&field.name))
+                        .map(|(id, _)| id)
+                        .collect(); // alloc: the diagnostic's own list, only when fields are missing
+                    self.push_diagnostic(InferenceDiagnostic::RecordMissingFields {
+                        record: expr.into(),
+                        variant,
+                        missed_fields,
+                    });
                 }
             }
         }
@@ -1974,7 +1988,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     (_, Some(variant)) => (VariantId::EnumVariantId(variant), args),
                     (AdtId::EnumId(it), None) => {
                         let ctxt = offset.field_hygiene(index).syntax_context();
-                        let Some(it) = EnumVariants::variant_written(self.db, it, name, ctxt)
+                        let table = self.resolver.ctx_table();
+                        let Some(it) = EnumVariants::variant_written(self.db, table, it, name, ctxt)
                         else {
                             return;
                         };
@@ -1987,7 +2002,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 _ => return,
             };
             let hygiene = offset.field_hygiene(index);
-            let Some(local_id) = of.fields(self.db).field_written(self.db, of, name, hygiene)
+            let table = self.resolver.ctx_table();
+            let Some(local_id) = of.fields(self.db).field_written(self.db, table, of, name, hygiene)
             else {
                 return;
             };
@@ -2016,6 +2032,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         let frame = self.frame;
         // The name is looked up hygienically among each ADT's fields (rustc's `check_field`).
         let hygiene = self.store.member_hygiene(field_expr);
+        let table = self.resolver.ctx_table();
         let mut autoderef = self.table.autoderef_with_tracking(receiver_ty, field_expr.into());
         let mut private_field = None;
         let res = autoderef.by_ref().find_map(|(derefed_ty, _)| {
@@ -2047,14 +2064,16 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                         return Some((Either::Left(field), record.ty(at)?));
                     }
                     hir_def::AdtId::StructId(s) => {
-                        let local_id =
-                            s.fields(self.db).field_written(self.db, s.into(), name, hygiene)?;
+                        let local_id = s
+                            .fields(self.db)
+                            .field_written(self.db, table, s.into(), name, hygiene)?;
                         let field = FieldId { parent: s.into(), local_id };
                         (field, parameters)
                     }
                     hir_def::AdtId::UnionId(u) => {
-                        let local_id =
-                            u.fields(self.db).field_written(self.db, u.into(), name, hygiene)?;
+                        let local_id = u
+                            .fields(self.db)
+                            .field_written(self.db, table, u.into(), name, hygiene)?;
                         let field = FieldId { parent: u.into(), local_id };
                         (field, parameters)
                     }
@@ -2068,6 +2087,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     let TyKind::Adt(_, parameters) = base.kind() else { return None };
                     let local_id = variant.fields(self.db).field_written(
                         self.db,
+                        table,
                         variant.into(),
                         name,
                         hygiene,

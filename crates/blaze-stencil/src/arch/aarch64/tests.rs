@@ -51,6 +51,7 @@ pub(crate) const LINUX: Target = Target {
     probe_stack: true,
     probe_log2: 12,
     counts: true,
+    slots: false,
 };
 const MACOS: Target = Target { os: Os::MacOs, cpu: Cpu::AppleM1, tls: TlsModel::MachO, ..LINUX };
 const LINUX_STATIC: Target = Target { pic: false, ..LINUX };
@@ -669,6 +670,65 @@ fn calls_and_addresses_relocate_as_cranelifts() {
     let ours = whole(&callers(CallConv::SystemV, I64), &LINUX);
     let bl = ours.relocs.iter().find(|reloc| reloc.kind == Reloc::Arm64Call).expect("a bl");
     assert_eq!(ours.words[bl.at as usize / 4], 0x9400_0000);
+}
+
+/// The code's shape (docs/v2/plan/design/launcher.md, "Step 3"): under `Target::slots` a call
+/// of a named function is `adrp x16; ldr x16, [x16, lo12]; blr x16` against the callee's GOT
+/// entry (its slot word), colocated or not; a return call loads the word into `x17` and ends
+/// in `br x17`; and a colocated function's address is `adrp; add`, never a GOT load. A GOT
+/// relocation against a function is therefore always a call, and any other is its address:
+/// the launcher tells them apart by kind.
+#[test]
+fn under_slots_a_call_loads_the_slot_word_and_an_address_is_the_thunk() {
+    for os in [LINUX, MACOS] {
+        let target = Target { slots: true, ..os };
+        let func = build(sig(conv(&target), &[I64], &[I64]), |b, params| {
+            let near = import(b, 1, sig(conv(&target), &[I64], &[I64]), true);
+            let call = b.ins().call(near, &[params[0]]);
+            let result = b.inst_results(call)[0];
+            let addr = b.ins().func_addr(I64, near);
+            let sum = b.ins().iadd(result, addr);
+            b.ins().return_(&[sum]);
+        });
+        let out = whole(&func, &target);
+        let near = Name::User { namespace: 1, index: 1 };
+        let of: Vec<(Reloc, u32)> = out
+            .relocs
+            .iter()
+            .filter(|it| it.name == near)
+            .map(|it| (it.kind, out.words[it.at as usize / 4]))
+            .collect();
+        assert_eq!(
+            of,
+            [
+                // The call: `adrp x16`, `ldr x16, [x16]`, and after them `blr x16`.
+                (Reloc::Aarch64AdrGotPage21, 0x9000_0010),
+                (Reloc::Aarch64Ld64GotLo12Nc, 0xf940_0210),
+                // The address: `adrp x16`, `add x16, x16, #0`.
+                (Reloc::Aarch64AdrPrelPgHi21, 0x9000_0010),
+                (Reloc::Aarch64AddAbsLo12Nc, 0x9100_0210),
+            ],
+            "{:?}",
+            target.os
+        );
+        let load = out.relocs.iter().find(|it| it.kind == Reloc::Aarch64Ld64GotLo12Nc);
+        let after = load.expect("the word's load").at as usize / 4 + 1;
+        assert_eq!(out.words[after], 0xd63f_0200, "blr x16");
+        assert!(out.relocs.iter().all(|it| it.kind != Reloc::Arm64Call), "a direct call");
+
+        let tail = build(sig(CallConv::Tail, &[I64], &[I64]), |b, p| {
+            let f = import(b, 1, sig(CallConv::Tail, &[I64], &[I64]), true);
+            b.ins().return_call(f, &[p[0]]);
+        });
+        let out = whole(&tail, &target);
+        let kinds: Vec<Reloc> = out.relocs.iter().filter(|it| it.name == near).map(|it| it.kind).collect();
+        assert_eq!(kinds, [Reloc::Aarch64AdrGotPage21, Reloc::Aarch64Ld64GotLo12Nc]);
+        let call = out.span(ir::Opcode::ReturnCall, &tail);
+        assert_eq!(call[call.len() - 1], 0xd61f_0220, "br x17");
+    }
+    // The control: without `slots` the colocated call is `bl`.
+    let plain = whole(&callers(CallConv::SystemV, I64), &LINUX);
+    assert!(plain.relocs.iter().any(|it| it.kind == Reloc::Arm64Call));
 }
 
 #[test]

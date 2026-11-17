@@ -1,0 +1,12 @@
+{
+ "id": "bstd-5",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-builds-1112",
+ "where": "crates/hir-ty-mir/tests/mir (fixtures)",
+ "what": "A test that slices the source by a diagnostic's range has to slice the text after the fixture's `//- minicore:` line: I put that line inside the string I sliced and got `\"pub fn \"` where the call was. And an intrinsic of a made-up name (`raw`) makes `mir_body` fail (`UnknownIntrinsic`), so a check that reads MIR answers nothing for the whole body.",
+ "cost": "two rounds of the shared build (about 25 minutes with the queue)",
+ "cause": "the fixture's header is not part of the file; lowering looks an intrinsic up by name",
+ "workaround": "copy `tests/mir/const_check.rs`'s `check` helper's shape; use a real intrinsic's name (`variant_count`)",
+ "fix": "a shared `refused_text(src, name)` helper in tests/mir/main.rs that every span-slicing test uses",
+ "state": "open"
+}

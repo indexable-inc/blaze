@@ -1,0 +1,11 @@
+{
+ "id": "memstrat-10",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+ "where": "the task's size",
+ "what": "The scope grew mid-task to building four steps (allocator, dependency front ends as records with sealed leaves, pool eviction under a budget, restart from records). Steps b and d are a redesign of what name resolution, method resolution and the query engine hold for a dependency (ids stable across processes, def maps read in place); this lane built a and c, measured the reader shed of b and left it off, and wrote the order for the rest.",
+ "cost": "the report has to say not built for b2 to b4 and d",
+ "cause": "the size was known from the records section's own order (five steps, one built in a day)",
+ "workaround": "none",
+ "state": "open: b2 to b4 and d want lanes of their own, one a kind of record"
+}

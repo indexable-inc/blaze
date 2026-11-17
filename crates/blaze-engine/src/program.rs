@@ -22,14 +22,7 @@ pub fn main() -> ExitCode {
     // script, whose filter refuses io_uring), each thread's wait ring otherwise. Read from the
     // launcher's mark, never found by trying the ring (`blaze_core::wait::choose_from_env`).
     if let Err(why) = blaze_core::wait::choose_from_env() {
-        eprintln!("error: {why}");
-        return ExitCode::FAILURE;
-    }
-    // C's and C++'s allocations (LLVM's) are blaze's allocator's, counted to the running task's
-    // tag as Rust's are (`malloc.rs`); a process where they are not stops here, saying why.
-    #[cfg(feature = "native")]
-    if let Err(why) = crate::malloc::check() {
-        eprintln!("error: {why}");
+        blaze_report::errln!("error: {why}");
         return ExitCode::FAILURE;
     }
     // A bug blaze reports and goes on past (`stdx::assert::reported`) is said by the daemon in
@@ -46,28 +39,15 @@ pub fn main() -> ExitCode {
     // What the daemon runs off its loop to keep blaze's update state fresh (`update.rs`).
     blaze_cargo::release::set_updates(update::tick);
     // What every stored template is keyed by: the code generator's code, which build.rs worked
-    // out, never this executable's bytes (`hir_ty_codegen::v2::code`).
-    if let Err(why) = hir_ty_codegen::v2::CodegenCode::from_hex(env!("BLAZE_CODEGEN_CODE"))
-        .and_then(hir_ty_codegen::v2::set_code)
-    {
-        eprintln!("error: {why}");
-        return ExitCode::FAILURE;
-    }
-    // What images, stored goals and bodies and kept expansions are keyed by: the front end's
-    // code, worked out in the same walk (`blaze_cargo::serve::front_end_code`).
-    if let Err(why) = blaze_cargo::serve::FrontEndCode::from_hex(env!("BLAZE_FRONT_END_CODE"))
-        .and_then(blaze_cargo::serve::set_front_end_code)
-    {
-        eprintln!("error: {why}");
-        return ExitCode::FAILURE;
-    }
-    // What unit records and the standard library's shared directory are keyed by, with the two
-    // above: the code of what makes a record, worked out in the same walk
-    // (`blaze_cargo::serve::record_makers`), never this executable's bytes.
-    if let Err(why) = blaze_cargo::serve::RecordCode::from_hex(env!("BLAZE_RECORD_CODE"))
-        .and_then(blaze_cargo::serve::set_record_code)
-    {
-        eprintln!("error: {why}");
+    // out, never this executable's bytes (`hir_ty_codegen::v2::code`). What images, stored
+    // goals and bodies and kept expansions are keyed by: the front end's code, worked out in
+    // the same walk (`blaze_cargo::serve::front_end_code`). What unit records and the standard
+    // library's shared directory are keyed by, with those two: the code of what makes a record
+    // (`blaze_cargo::serve::record_makers`). Handed over together, with the developer's
+    // `BLAZE_DEV_TOOLCHAIN_AS` when it is set: the identities to key as in their place
+    // (`blaze_cargo::serve::dev_toolchain`).
+    if let Err(why) = hand_over_codes() {
+        blaze_report::errln!("error: {why}");
         return ExitCode::FAILURE;
     }
     if as_rustc::is_me() {
@@ -103,8 +83,8 @@ pub fn main() -> ExitCode {
         // `--version` answers in any workspace: which blaze this is, and why the one pinned
         // can't run here.
         Err(why) if asks_version => {
-            println!("{}", blaze_cargo::version());
-            println!("this blaze does not run here: {why}");
+            blaze_report::outln!("{}", blaze_cargo::version());
+            blaze_report::outln!("this blaze does not run here: {why}");
             return ExitCode::SUCCESS;
         }
         Err(why) => return failed(&why),
@@ -117,19 +97,11 @@ pub fn main() -> ExitCode {
         Some("version-resolve") => versions::resolve_command(rest()).map(|()| 0),
         Some("update") => update::command(rest()),
         Some("--version" | "-V") if words.len() == 1 => {
-            println!("{}", blaze_cargo::version());
-            println!("{}", versions::why_this_one(ignore_pin));
+            blaze_report::outln!("{}", blaze_cargo::version());
+            blaze_report::outln!("{}", versions::why_this_one(ignore_pin));
             Ok(0)
         }
         _ => {
-            #[cfg(feature = "native")]
-            if let Err(error) = crate::huge::huge_pages_for_mimalloc() {
-                return failed(&format!("{error:#}"));
-            }
-            // Freed pages leave the footprint as they are freed, in the client and the
-            // daemon alike.
-            #[cfg(feature = "native")]
-            crate::heaps::purge_at_once();
             // `IX_PROF=<dir>`: this process (the client, or the daemon it starts) is sampled
             // until it ends and its profile written to `<dir>`; with `<dir>` a target
             // directory's `layout`, the next build of blaze there lays its code out by it
@@ -273,7 +245,7 @@ fn pinned_elsewhere(words: &[OsString], given: bool) -> Result<Ran, String> {
     // A build of the tree runs the pinned release as a release does, and says so: what runs is
     // not the blaze that was built.
     if for_tree {
-        eprintln!(
+        blaze_report::errln!(
             "blaze: blaze {}, a build of blaze's source tree, runs blaze {wanted} here, as {shown} pins {}; {ignoring}",
             pin::OURS,
             pin::pinned_text(&named)
@@ -286,7 +258,7 @@ fn pinned_elsewhere(words: &[OsString], given: bool) -> Result<Ran, String> {
     })?;
     // A release from before pins says only its version.
     if matches!(text.as_slice(), [it] if it == "--version" || it == "-V") {
-        println!("blaze {} runs blaze {wanted} here, as {shown} pins it:", pin::OURS);
+        blaze_report::outln!("blaze {} runs blaze {wanted} here, as {shown} pins it:", pin::OURS);
     }
     if says_updates(words) {
         update::say(&wanted, Pinned::of(&named).as_policy(), Some(&manifest));
@@ -341,7 +313,7 @@ fn run_default(words: &[OsString], manifest: Option<std::path::PathBuf>) -> Resu
         )
     })?;
     if matches!(words, [it] if it == "--version" || it == "-V") {
-        println!("blaze {} runs blaze {runs}, the default `blaze update` installed:", pin::OURS);
+        blaze_report::outln!("blaze {} runs blaze {runs}, the default `blaze update` installed:", pin::OURS);
     }
     if says_updates(words) {
         update::say(&runs, update::Pin::None, manifest.as_deref());
@@ -393,7 +365,7 @@ fn channel_version(channel: &str) -> Result<String, ChannelError> {
 }
 
 fn failed(why: &str) -> ExitCode {
-    eprintln!("error: {why}");
+    blaze_report::errln!("error: {why}");
     ExitCode::FAILURE
 }
 
@@ -425,4 +397,23 @@ mod tests {
             );
         }
     }
+}
+
+/// The three code identities the build script worked out, handed to the process, with the
+/// value of `BLAZE_DEV_TOOLCHAIN_AS` when the environment sets it.
+fn hand_over_codes() -> Result<(), String> {
+    use blaze_cargo::serve::{FrontEndCode, RecordCode, dev_toolchain};
+    let built = dev_toolchain::Codes {
+        codegen: hir_ty_codegen::v2::CodegenCode::from_hex(env!("BLAZE_CODEGEN_CODE"))?.0,
+        front_end: FrontEndCode::from_hex(env!("BLAZE_FRONT_END_CODE"))?.0,
+        record: RecordCode::from_hex(env!("BLAZE_RECORD_CODE"))?.0,
+    };
+    let assumed = match std::env::var(dev_toolchain::VAR) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!("{} is not UTF-8", dev_toolchain::VAR));
+        }
+    };
+    dev_toolchain::hand_over(built, assumed.as_deref())
 }

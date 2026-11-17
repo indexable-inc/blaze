@@ -1,0 +1,11 @@
+{
+ "id": "edit4-1",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+ "where": "the brief's numbers: memos verified a body edit",
+ "what": "The brief said a body edit of hello world still verifies about 21,000 memos, 13,593 of them `FunctionSignature::kept` and 1,051 `AttrFlags::query`. On the branch's base (all-1111 at e59419ab97, 30 edits on a Linux VM, `query_counts`) it was 6,937: `positions_stamp` 4,841, `FunctionSignature::kept` 356, `item_key` 277, `signature_of` 273, `TraitImpls::for_crate_and_trait` 240, then 20 to 28 each of some forty per-crate queries.",
+ "cost": "the plan started from a caller to find that the base no longer had",
+ "cause": "the numbers were of an earlier tree; nothing in the brief said which",
+ "workaround": "measured the base first (`/root/scripts/edits.py` on the VM: memos by query per edit)",
+ "state": "open: a brief's number should carry its commit (rule measure-the-exact-tree)"
+}

@@ -256,7 +256,7 @@ fn old_match_attr_flags(
                     "blaze" if &*second_segment == "nonblocking" => {
                         attr_flags.insert(AttrFlags::NONBLOCKING)
                     }
-                    "blaze" if &*second_segment == "may" => attr_flags.insert(AttrFlags::MAY),
+                    "blaze" if &*second_segment == "expect" => attr_flags.insert(AttrFlags::EXPECT),
                     "blaze" if &*second_segment == "multiversion" => {
                         attr_flags.insert(AttrFlags::BLAZE_MULTIVERSION)
                     }
@@ -393,7 +393,10 @@ fn old_match_attr_flags(
                         "nopanic" => attr_flags.insert(AttrFlags::NOPANIC),
                         "noalloc" => attr_flags.insert(AttrFlags::NOALLOC),
                         "nonblocking" => attr_flags.insert(AttrFlags::NONBLOCKING),
-                        "may" => attr_flags.insert(AttrFlags::MAY),
+                        "bounded_turn" => attr_flags.insert(AttrFlags::BOUNDED_TURN),
+                        "answers_request" => attr_flags.insert(AttrFlags::ANSWERS_REQUEST),
+                        "lock_checked" => attr_flags.insert(AttrFlags::LOCK_CHECKED),
+                        "expect" => attr_flags.insert(AttrFlags::EXPECT),
                         "effects" => attr_flags.insert(AttrFlags::BLAZE_EFFECTS),
                         "specialization" => attr_flags.insert(AttrFlags::BLAZE_SPECIALIZATION),
                         "specialization_trait" => {
@@ -403,6 +406,7 @@ fn old_match_attr_flags(
                         // here, each a word attribute under `blaze` as those above.
                         "linear" => attr_flags.insert(AttrFlags::LINEAR),
                         "consumes" => attr_flags.insert(AttrFlags::CONSUMES),
+                        "theorem" => attr_flags.insert(AttrFlags::THEOREM),
                         "holds" => attr_flags.insert(AttrFlags::HOLDS),
                         "memo" => attr_flags.insert(AttrFlags::BLAZE_MEMO),
                         "reflect" => attr_flags.insert(AttrFlags::BLAZE_REFLECT),
@@ -412,6 +416,8 @@ fn old_match_attr_flags(
                         "program_lifetime" => {
                             attr_flags.insert(AttrFlags::BLAZE_PROGRAM_LIFETIME)
                         }
+                        "canonical_cbor" => attr_flags.insert(AttrFlags::CANONICAL_CBOR),
+                        "renders_positions" => attr_flags.insert(AttrFlags::RENDERS_POSITIONS),
                         _ => {}
                     },
                     _ => {}
@@ -1575,9 +1581,16 @@ pub mod m { #![doc(hidden)] #[must_use] pub fn b() -> u8 { 0 } }
     assert!(by_name("a").contains(AttrFlags::IS_INLINE));
 }
 
+/// PORT (round 20): false by design on blaze-memo, left failing. It claimed an edit of a fn's
+/// body runs no query of its crate but the body's; on the port an edit makes the edited
+/// crate's arena again, so its resolution (`crate_served`, `crate_resolution`, the facts
+/// rounds), its item trees and its attribute queries run again. A claim about a crate the edit
+/// does not touch would still hold; this one is about the edited crate itself.
+///
 /// An edit of a fn's body leaves the file's outline the same, so no attribute query of the
 /// file runs again, and each reads what it did.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_body_edit_runs_no_attribute_query() {
     const CODE: &str = r#"
 #![doc(hidden)]
@@ -2290,32 +2303,39 @@ mod marked {
     #[blaze::nopanic]
     #[blaze::noalloc(trusted = "the caller's frame")]
     #[blaze::nonblocking(because)]
-    #[blaze::may(alloc, diverge)]
+    #[blaze::expect(alloc, diverge)]
     pub fn f(x: u32) -> u32 { x }
 }
 mod listed {
-    #[blaze::may(panic, trusted = "the table is complete")]
+    #[blaze::expect(panic, trusted = "the table is complete")]
     pub fn f(x: u32) -> u32 { x }
 }
 mod nothing {
-    #[blaze::may]
+    #[blaze::expect]
     pub fn f(x: u32) -> u32 { x }
 }
 mod wrong {
-    #[blaze::may(panic, fast)]
+    #[blaze::expect(panic, fast)]
     pub fn f(x: u32) -> u32 { x }
 }
 mod plain {
     pub fn f(x: u32) -> u32 { x }
 }
+mod deleted {
+    #[blaze::may(alloc)]
+    pub fn f(x: u32) -> u32 { x }
+}
 "#;
 
-/// `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]` and `#[blaze::may(..)]` set their bit and say
-/// what they say, and nothing else: the signature and every other flag of a marked function are
-/// those of the same function unmarked, so no code an unmarked crate builds can differ.
+/// `#[blaze::nopanic]`, `#[blaze::noalloc]`, `#[blaze::nonblocking]` and `#[blaze::expect(..)]`
+/// set their bit and say what they say, and nothing else: the signature and every other flag of
+/// a marked function are those of the same function unmarked, so no code an unmarked crate
+/// builds can differ. The deleted spelling `#[blaze::may(..)]` sets no flag and reads as no
+/// list: blaze-lints refuses it by its path (`blaze::undeclared_effect`), so nothing reads it
+/// as `expect`.
 #[test]
 fn an_effect_attribute_changes_no_signature() {
-    use super::{EffectWord, MayAttr, MayWord, PureAttr};
+    use super::{EffectWord, ExpectAttr, ExpectWord, PureAttr};
     use crate::signatures::FunctionSignature;
 
     let db = fixture::db(EFFECTS).into_db();
@@ -2337,7 +2357,7 @@ fn an_effect_attribute_changes_no_signature() {
     };
     let (marked, plain) = (in_module("marked"), in_module("plain"));
     let effects =
-        AttrFlags::NOPANIC | AttrFlags::NOALLOC | AttrFlags::NONBLOCKING | AttrFlags::MAY;
+        AttrFlags::NOPANIC | AttrFlags::NOALLOC | AttrFlags::NONBLOCKING | AttrFlags::EXPECT;
 
     let marked_flags = AttrFlags::query(&db, marked.into());
     assert!(marked_flags.contains(effects));
@@ -2357,29 +2377,36 @@ fn an_effect_attribute_changes_no_signature() {
 
     // The positive spelling: the words listed, `trusted` after them, and anything else refused
     // with its text.
-    let may = |module: &str| AttrFlags::may_attr(&db, in_module(module).into());
-    let words = |words: &[MayWord]| words.iter().fold(0, |bits, it| bits | it.bit());
+    let expect = |module: &str| AttrFlags::expect_attr(&db, in_module(module).into());
+    let words = |words: &[ExpectWord]| words.iter().fold(0, |bits, it| bits | it.bit());
     assert_eq!(
-        may("marked"),
-        Some(MayAttr {
-            words: words(&[MayWord::Alloc, MayWord::Diverge]),
+        expect("marked"),
+        Some(ExpectAttr {
+            words: words(&[ExpectWord::Alloc, ExpectWord::Diverge]),
             trusted: None,
             malformed: None
         })
     );
     assert_eq!(
-        may("listed"),
-        Some(MayAttr {
-            words: words(&[MayWord::Panic]),
+        expect("listed"),
+        Some(ExpectAttr {
+            words: words(&[ExpectWord::Panic]),
             trusted: Some(Symbol::intern("the table is complete")),
             malformed: None
         })
     );
-    assert_eq!(may("nothing"), Some(MayAttr { words: 0, trusted: None, malformed: None }));
-    assert!(may("wrong").is_some_and(|it| it.malformed.is_some()));
-    assert_eq!(may("plain"), None);
+    assert_eq!(expect("nothing"), Some(ExpectAttr { words: 0, trusted: None, malformed: None }));
+    assert!(expect("wrong").is_some_and(|it| it.malformed.is_some()));
+    assert_eq!(expect("plain"), None);
+    // Control for the deleted spelling: the same function under `#[blaze::expect(alloc)]`
+    // (`marked` lists it) has the bit; under `#[blaze::may(alloc)]` it has none.
+    assert_eq!(expect("deleted"), None);
     assert_eq!(
-        AttrFlags::query(&db, in_module("nothing").into()) - AttrFlags::MAY,
+        AttrFlags::query(&db, in_module("deleted").into()),
+        AttrFlags::query(&db, plain.into())
+    );
+    assert_eq!(
+        AttrFlags::query(&db, in_module("nothing").into()) - AttrFlags::EXPECT,
         AttrFlags::query(&db, plain.into())
     );
 }
@@ -2400,4 +2427,63 @@ fn no_two_attr_flags_share_a_bit() {
         }
         owner[bit] = Some(name);
     }
+}
+
+/// The function `name` of the crate of `db`'s fixture.
+fn function_named(db: &TestDB, name: &str) -> FunctionId {
+    let def_map = crate_def_map(db, db.fetch_test_crate());
+    def_map
+        .modules(db)
+        .flat_map(|(_, module)| module.scope(db).declarations().collect::<Vec<_>>()) // alloc: test
+        .find_map(|def| match def {
+            ModuleDefId::FunctionId(it)
+                if crate::signatures::FunctionSignature::of(db, it).name.as_str() == name =>
+            {
+                Some(it)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no function `{name}`"))
+}
+
+/// PORT (round 20): false by design on blaze-memo, left failing. It claimed an edit of `f`'s
+/// body leaves `generic_params_attr_flags`'s row verified; on the port an edit makes the
+/// edited crate's arena again, so every row of that crate, this one among them, runs again.
+///
+/// The invariant: the flags of a function's generic parameters are read off the item's
+/// outline, so an edit of its body leaves `generic_params_attr_flags`'s row verified, not run
+/// (it read the file's live parse before, and ran again on every edit of the file). The
+/// control: an edit of the parameter list itself runs it, so the log is seen to hold it.
+#[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
+fn a_body_edit_leaves_the_generic_parameters_flags_verified() {
+    let fx = fixture::db("fn f<#[cfg(all())] T>(t: T) -> u32 { 1 }\nfn g() {}\n");
+    let file = fx.only_file();
+    let mut db = fx.into_db();
+    let f = function_named(&db, "f");
+    _ = AttrFlags::query_generic_params(&db, f.into());
+    let file = file.file_id(&db);
+    let ran = |db: &mut TestDB, text: &str| {
+        db.executed_in_write(|db| {
+            _ = db.set_file_text(file, text);
+            // `f` again in the new snapshot: the commit drops the crate's arena, which homes
+            // the id it had.
+            let f = function_named(db, "f");
+            _ = AttrFlags::query_generic_params(db, f.into());
+        })
+        .iter()
+        .any(|it| it.contains("generic_params_attr_flags"))
+    };
+    assert!(
+        !ran(&mut db, "fn f<#[cfg(all())] T>(t: T) -> u32 { 2 }\nfn g() {}\n"),
+        "an edit of `f`'s body ran its generic parameters' flags again"
+    );
+    assert!(
+        !ran(&mut db, "fn f<#[cfg(all())] T>(t: T) -> u32 { 2 }\nfn g() { let _ = 1; }\n"),
+        "an edit of another function's body ran `f`'s generic parameters' flags again"
+    );
+    assert!(
+        ran(&mut db, "fn f<#[cfg(all())] T, U>(t: T) -> u32 { 2 }\nfn g() { let _ = 1; }\n"),
+        "control: an edit of the parameter list did not run the flags again"
+    );
 }

@@ -34,7 +34,7 @@ use super::{
 };
 
 /// Why a function is not const-pure.
-#[derive(Debug, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Impure {
     /// What the function that does it does, said of it: "reads or writes mutable state:
     /// `CALLS` is `AtomicU64`, which is not `Freeze`".
@@ -78,7 +78,7 @@ pub fn is_const_pure(db: &Db, func: FunctionId) -> bool {
 
 /// Why `func`, a function const code may call (a `const fn`, or a method of a trait or of an
 /// `impl` of one), is not const-pure, if it is not.
-#[blaze_query::tracked(returns(ref), cycle_result = const_purity_cycle_result)]
+#[blaze_memo::tracked(returns(ref), owns, cycle_result = const_purity_cycle_result)]
 pub fn const_purity<'db>(db: &'db Db, func: FunctionId) -> Option<Impure> {
     let unknown =
         // alloc: the impurity the query keeps, only when there is one
@@ -181,11 +181,7 @@ pub fn const_purity<'db>(db: &'db Db, func: FunctionId) -> Option<Impure> {
 
 /// Every function of a cycle of calls gets what this gives, so it can't say pure for one that
 /// is not.
-fn const_purity_cycle_result(
-    _db: &Db,
-    _: blaze_query::db::Id,
-    _func: FunctionId,
-) -> Option<Impure> {
+fn const_purity_cycle_result(_db: &Db, _func: FunctionId) -> Option<Impure> {
     Some(Impure {
         // alloc: the impurity the query keeps
         what: "calls itself back".to_owned(),

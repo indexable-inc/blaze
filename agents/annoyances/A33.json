@@ -1,0 +1,11 @@
+{
+ "id": "A33",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "lanes",
+ "what": "A lane told to stay off VMs created one (`run-cost-1111`) to run Linux-only tests, and removed it afterwards; I learned of it from `ix ls`.",
+ "cost": "none this time",
+ "cause": "the brief said no VMs but the tests it had to write only run on Linux",
+ "workaround": "say in the brief where Linux-only tests may run",
+ "state": "open"
+}

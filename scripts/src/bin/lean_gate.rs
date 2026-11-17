@@ -83,7 +83,7 @@ const LEDGER: &str = "docs/v2/plan/objectives.json";
 const MANIFEST: &str = "lean/analysis/lake-manifest.json";
 /// A package's name, its directory, and the directories its modules are found under, in order.
 const PACKAGES: [(&str, &str, &[&str]); 2] =
-    [("core", "lean", &["lean", "crates/blaze-graph/lean"]), ("analysis", "lean/analysis", &["lean/analysis"])];
+    [("core", "lean", &["lean", "crates/blaze-graph/lean", "crates/blaze-core/lean"]), ("analysis", "lean/analysis", &["lean/analysis"])];
 const SORRY: &str = "declaration uses 'sorry'";
 
 fn package_dir(package: &str) -> &'static str {
@@ -691,7 +691,7 @@ fn axioms(p: &Patterns, root: &Path, lake: &Path, package: &str, listed: &Listed
         return (Vec::new(), Said::new());
     }
     let (code, log) = {
-        let tmp = TempDir::new("lean-gate-").unwrap_or_else(|e| fail(SCRIPT, &e));
+        let tmp = TempDir::new("lean-gate-").unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
         let file = tmp.path().join("Axioms.lean");
         if let Err(e) = std::fs::write(&file, axioms_file(&theorems)) {
             fail(SCRIPT, &blaze_script::os_error(&e, &file.display().to_string()));

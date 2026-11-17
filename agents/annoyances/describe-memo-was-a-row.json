@@ -1,0 +1,19 @@
+{
+ "id": "describe-memo-was-a-row",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor, int-1112 track 5b T2",
+ "where": "crates/hir-ty-codegen/v2/frontend.rs (described_memo, counted_memo, deleted), v2/frontend/witnesses.rs (new)",
+ "what": "A function's describe and its count were tracked rows of the query database, each taking every read of the instance's monomorphization as its edges, though one reader (the walk) reads each once and keeps it: on tempo's cold build described_memo held 3.87 M rows (2.22 GiB), about 8.1 GiB of values and a share of 2,053 M edges, at a 142 GiB peak. The rows served two things only: a kept walk's describe taken without running it, and the keys of the changed set.",
+ "whys": [
+  "the changed set was named by the engine per function, so whatever it should name had to be a row",
+  "the engine had no way to give a run's reads as keys without making the run a row (no witness frame)",
+  "a value read once and a value read by many were held the same way: as a persistent memo"
+ ],
+ "cost": "the describe rows, values and edges at every cold build's peak; the scoped-memo lane could not mark it (task-scoped-memos)",
+ "cause": "the changed set's index (a fact -> the rows that read it) was the engine's edge graph, so the index forced the rows",
+ "class": "an index held as rows of the thing indexed; a value read once held as a memo",
+ "prevention": "a run that is no row records its reads below HIGH as keys (`blaze_query::db::witnessed`); the front end keeps read key -> runs (`frontend/witnesses.rs`) and answers the changed set from `changed_keys_since`; `a_build_leaves_no_row_of_a_describe` fails if a describe becomes a row again",
+ "workaround": "none",
+ "fix": "described_memo, Memoed, memoed and counted_memo deleted; describe/redescribe/each_build/counted/changed_since read the postings. Controls: postings dropped (WitnessPlant::DropsReads) and a hold with no value compare (IgnoresValue) fail a_warm_patch_asks_exactly_the_instances_whose_describe_read_the_edit.",
+ "state": "fixed, not yet built or run"
+}

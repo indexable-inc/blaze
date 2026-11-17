@@ -1,0 +1,14 @@
+{
+ "id": "two-answer-caches-in-hir-ty",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor, host round 2 lane \"trace\" (Mode::Trace), port-memo-1113",
+ "where": "crates/hir-ty/src/check_cache.rs `served_body` (read by infer.rs:2139 `served_inference` and hir-ty-borrowck gate.rs `served_passed`), crates/hir-ty/src/check_cache/runtime.rs `served`; crates/hir-ty/src/body_store.rs `Store::lookup`",
+ "what": "Making the item store's `Mode::Trace` look nothing up was not enough: hir-ty has a second answer cache (the old bodies parts, `check_cache`) whose readers sit in the queries themselves, outside the item store, so 'no step's answer comes from anywhere but its run' had to be enforced again at `check_cache::served_body`. Its runtime-MIR reader (`check_cache::runtime::served`) is a third door, not guarded, as no body step reads runtime MIR.",
+ "cost": "finding every reader of a stored answer by grep over hir-ty and hir-ty-borrowck",
+ "cause": "the old dependency-bodies cache was never folded into the item store when the item store came; each cache added its own hit site to the queries",
+ "class": "two caches of one answer, each with its own hit site, so a rule about where answers come from has to be stated at each",
+ "prevention": "one home for stored answers: the old bodies parts served through the item store's lookup (or deleted), so `Store::lookup` is the only hit site and a mode decides there",
+ "workaround": "`body_store::tracing(db)` checked first in `check_cache::served_body`",
+ "fix": "not written: deleting or folding `check_cache` is a change across hir-ty, hir-ty-borrowck and the driver",
+ "state": "open"
+}

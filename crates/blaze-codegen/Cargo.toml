@@ -24,9 +24,10 @@ blaze-ids.workspace = true
 blaze-items.workspace = true
 blaze-kernel.workspace = true
 blaze-mem.workspace = true
-blaze-query.workspace = true
+blaze-report.workspace = true
 blaze-serde.workspace = true
 blaze-store-check.workspace = true
+crossbeam-queue.workspace = true
 hashbrown.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -34,8 +35,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+blaze-sim.workspace = true
 crossbeam-channel.workspace = true
-hegeltest.workspace = true
 
 [target.'cfg(blaze_check)'.dependencies]
 blaze-check.workspace = true

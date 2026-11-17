@@ -399,7 +399,9 @@ fn ret<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), Error> {
 
 /// What a call calls.
 enum Callee {
-    /// A named function: `bl` when it is colocated, its address loaded otherwise.
+    /// A named function: `bl` when it is colocated, its address loaded otherwise. Never near
+    /// under `Target::slots`: the load is then of the callee's slot word (its GOT entry), so
+    /// the call runs whatever the slot is bound to.
     Named { name: Name, near: bool },
     /// The address in a value.
     Value(ir::Value),
@@ -424,7 +426,7 @@ fn call<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), Error> 
                     "a patchable call, whose patch metadata the glue does not write",
                 ));
             }
-            (Callee::Named { name: cx.name(&ext.name)?, near: ext.colocated }, all)
+            (Callee::Named { name: cx.name(&ext.name)?, near: ext.colocated && !target.slots }, all)
         }
         _ => {
             let (callee, args) = all
@@ -517,7 +519,7 @@ fn return_call<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), 
     let (callee, args) = match func.dfg.insts[inst] {
         Data::Call { func_ref, .. } => {
             let ext = &func.dfg.ext_funcs[func_ref];
-            (Callee::Named { name: cx.name(&ext.name)?, near: ext.colocated }, all)
+            (Callee::Named { name: cx.name(&ext.name)?, near: ext.colocated && !target.slots }, all)
         }
         _ => {
             let (callee, args) = all
@@ -652,12 +654,7 @@ fn load_name(buf: &mut Buf<'_>, target: &Target, rd: u8, name: Name, near: bool,
             buf.put4(inst::add(rd, rd, tmp));
         }
     } else if near {
-        let at = buf.len();
-        buf.reloc(at, Reloc::Aarch64AdrPrelPgHi21, name, offset);
-        buf.put4(inst::adrp(rd));
-        let at = buf.len();
-        buf.reloc(at, Reloc::Aarch64AddAbsLo12Nc, name, offset);
-        buf.put4(inst::add_imm(rd, rd, 0, false, false));
+        near_name(buf, rd, name, offset);
     } else {
         buf.put4(inst::ldr_lit(rd, 8));
         buf.put4(inst::b(3));
@@ -667,7 +664,20 @@ fn load_name(buf: &mut Buf<'_>, target: &Target, rd: u8, name: Name, near: bool,
     }
 }
 
-/// `func_addr`, `symbol_value`: the address into `x16`, then to the result's slot.
+/// `name + offset` into `rd` by `adrp` and `add`: the name is within 4 GiB.
+fn near_name(buf: &mut Buf<'_>, rd: u8, name: Name, offset: i64) {
+    let at = buf.len();
+    buf.reloc(at, Reloc::Aarch64AdrPrelPgHi21, name, offset);
+    buf.put4(inst::adrp(rd));
+    let at = buf.len();
+    buf.reloc(at, Reloc::Aarch64AddAbsLo12Nc, name, offset);
+    buf.put4(inst::add_imm(rd, rd, 0, false, false));
+}
+
+/// `func_addr`, `symbol_value`: the address into `x16`, then to the result's slot. Under
+/// `Target::slots` a colocated function's address is taken by `adrp` and `add` even in
+/// position-independent code: it is the function's entry thunk, which the launcher keeps
+/// within reach of every body, and a GOT load would read as a load of its slot word.
 fn address<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), Error> {
     let (func, target) = (cx.func(), cx.target());
     let (name, near, offset) = match func.dfg.insts[inst] {
@@ -697,8 +707,12 @@ fn address<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), Erro
         },
         _ => return Err(Error::at(inst, "an address of no function or global")),
     };
+    let thunk = target.slots && near && matches!(func.dfg.insts[inst], Data::FuncAddr { .. });
     let name = cx.name(name)?;
-    load_name(cx.buf(), target, X16, name, near, offset);
+    match thunk {
+        true => near_name(cx.buf(), X16, name, offset),
+        false => load_name(cx.buf(), target, X16, name, near, offset),
+    }
     result(cx, inst, X16)
 }
 

@@ -10,8 +10,8 @@ use blaze_format::SpanRef;
 use object::{Object as _, ObjectSection as _};
 
 use super::{
-    Change, Debug, Disk, Format, Image, Linked, Output, Position, SpanTable, Sparse, TO, function,
-    id, name, output, wide_key,
+    Change, Debug, Disk, Format, Image, Linked, Output, Position, Span, SpanTable, Sparse, TO,
+    function, id, name, output, wide_key,
 };
 
 /// Each function by name with its rows as (offset in the function, file, line): what a
@@ -68,7 +68,10 @@ fn resolved<'a>(get: impl Fn(&str) -> &'a [u8]) -> Resolved {
 fn program(count: u32) -> (Vec<CompiledFunction>, Vec<u8>) {
     let spans = SpanTable {
         files: vec!["src/main.rs".into(), "src/lib.rs".into()],
-        spans: (0..16).map(|it| Position { file: it % 2, line: 3 + it * 5, column: 1 }).collect(),
+        spans: (0..16)
+            .map(|it| Span::At(Position { file: it % 2, line: 3 + it * 5, column: 1 }))
+            .collect(),
+        bases: Vec::new(),
     }
     .encode();
     let functions = (0..count).map(|n| lined(n, n)).collect();
@@ -198,6 +201,9 @@ fn an_image_and_its_side_file_resolve_as_debug_info_inside() {
     let write = image.debug_file().unwrap().expect("an image with its debug info beside it");
     assert_eq!((write.name.as_str(), write.base), ("app.debug", None));
     let side = write.apply(Format::Elf, None).unwrap();
+    // The view a writer of the file is given is the file its writes make.
+    let view = image.debug_file_view();
+    assert_eq!(*view, side);
     let want = inside(&with_disk, TO);
     assert_eq!(want.len(), 12 * 3, "every function and both rows of each");
     assert_eq!(beside(&image, &disk, TO, &side), want);
@@ -217,6 +223,18 @@ fn an_image_and_its_side_file_resolve_as_debug_info_inside() {
     assert_eq!((write.all, write.encoded), (None, 1), "the update followed the link's change");
     assert_eq!(write.base, crate::debug_file_id(Format::Elf, &side));
     let patched = write.apply(Format::Elf, Some(&side)).unwrap();
+    // The view after the patch is the patched file, and the view taken before it, still
+    // held by whoever was placing the first file, is that file still: the update wrote a
+    // copy. The sums the seal is made of read the blocks the patch wrote, not the file.
+    assert_eq!(*image.debug_file_view(), patched);
+    assert_eq!(*view, side, "a view held across an update is the file it was taken of");
+    assert!(
+        write.summed > 0 && write.summed < side.len() as u64,
+        "{} bytes summed of {}: the blocks the patch wrote, each once",
+        write.summed,
+        side.len()
+    );
+    drop(view);
     let want = inside(&with_disk, TO);
     assert_eq!(beside(&image, &disk, TO, &patched), want);
     assert!(want.contains(&("f5".into(), 0, "src/lib.rs".into(), 3 + 9 * 5)));

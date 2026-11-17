@@ -7,9 +7,9 @@
 use std::time::Duration;
 
 use blaze_mem::Frame;
-use hegel::TestCase;
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn, Seeds, check, control, root, world};
+use super::{check, control, root, world};
 use crate::{Plant, cx::Cx};
 
 /// A task's frame in this test: small, as its tasks allocate nothing.
@@ -32,19 +32,19 @@ struct Plan {
     makes: Vec<(Make, u64)>,
 }
 
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
-    let makes = (0..d.int(1, 32))
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
+    let makes = (0..tape.int_in(1..=32u64, "makes"))
         .enumerate()
         .map(|(made, _)| {
-            let make = match d.int(0, 3) {
+            let make = match tape.int_in(0..=3u64, "make") {
                 // Up to twice the root's budget: some later than it.
-                0 => Make::Until(d.int(0, 2 * super::BUDGET.as_millis() as u64)),
+                0 => Make::Until(tape.int_in(0..=2 * super::BUDGET.as_millis() as u64, "until ms")),
                 1 => Make::Span,
                 2 => Make::Scope,
                 _ => Make::Task,
             };
-            (make, d.int(0, made as u64))
+            (make, tape.int_in(0..=made as u64, "from"))
         })
         .collect();
     Plan { seed, makes }
@@ -85,12 +85,12 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
 /// The invariant: a child `Cx` never has a later deadline than its parent. Whatever tree of
 /// `until`, `span`, scopes and tasks grows from the root, each context's deadline is at or
 /// before the one it was made from.
-#[hegel::test(test_cases = 200)]
-fn a_child_context_never_has_a_later_deadline(tc: TestCase) {
-    check(plan(&mut Drawn(&tc)), run);
+#[test]
+fn a_child_context_never_has_a_later_deadline() {
+    blaze_sim::check(Config::cases(200), |tape| check(plan(tape), run));
 }
 
 #[test]
 fn the_oracle_catches_until_that_widens() {
-    control(Plant::UntilWidens, |seeds: &mut Seeds| plan(seeds), run);
+    control(Plant::UntilWidens, plan, run);
 }

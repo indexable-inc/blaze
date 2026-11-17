@@ -1,0 +1,11 @@
+{
+ "id": "A25",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "blaze: memory",
+ "what": "blaze building blaze needs about 175 GB, so it fits only on 256 GB VMs and was stopped at its ceiling on every smaller one.",
+ "cost": "most of the morning",
+ "cause": "front-end results live on the heap for the whole build",
+ "workaround": "cargo builds blaze for now",
+ "state": "open"
+}

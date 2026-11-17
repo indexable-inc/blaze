@@ -675,6 +675,54 @@ fn another_panic_strategy_is_another_graph() {
     assert_eq!(RUNS.with(|it| it.get()), 2);
 }
 
+/// The invariant: where a standard library's units are placed ([`StdKey::placement`]) moves
+/// with every field of its key but the crates asked, and never with those. Each field is an
+/// input of every unit (rule 21); the crates asked only choose which units there are.
+#[test]
+fn a_std_is_placed_by_every_input_of_its_units_and_not_by_the_crates_asked() {
+    let tree = MemTree::default();
+    let root = library(&tree);
+    let other_root = tree.root(&[("UPSTREAM", b"commit 0".as_slice())]);
+    let base = key(root);
+    let with_test =
+        StdKey { crates: vec!["std".to_owned(), "test".to_owned()], ..key(root) };
+    assert_ne!(base.id(), with_test.id(), "the units' query is keyed by the crates asked");
+    assert_eq!(base.placement(), with_test.placement());
+    let moved: [(&str, StdKey); 15] = [
+        ("library", StdKey { library: library_mount(other_root, COMMIT), ..key(root) }),
+        ("triple", StdKey { triple: "aarch64-unknown-linux-gnu".to_owned(), ..key(root) }),
+        ("profile", StdKey { profile: "fast".to_owned(), ..key(root) }),
+        ("panic", StdKey { panic: "abort".to_owned(), ..key(root) }),
+        ("opt_level", StdKey { opt_level: "3".to_owned(), ..key(root) }),
+        ("debug_assertions", StdKey { debug_assertions: false, ..key(root) }),
+        ("overflow_checks", StdKey { overflow_checks: false, ..key(root) }),
+        ("debuginfo", StdKey { debuginfo: "0".to_owned(), ..key(root) }),
+        ("features", StdKey { features: vec!["panic-unwind".to_owned()], ..key(root) }),
+        ("host", StdKey { host: "aarch64-unknown-linux-gnu".to_owned(), ..key(root) }),
+        ("rustflags", StdKey { rustflags: vec!["--cfg=x".to_owned()], ..key(root) }),
+        ("profile_root", StdKey { profile_root: "release".to_owned(), ..key(root) }),
+        ("macro_wasm", StdKey { macro_wasm: true, ..key(root) }),
+        ("runs_here", StdKey { runs_here: false, ..key(root) }),
+        ("codegen_backend", StdKey { codegen_backend: Some("stencil".to_owned()), ..key(root) }),
+    ];
+    for (field, key) in &moved {
+        assert_ne!(base.placement(), key.placement(), "`{field}` moved and the place did not");
+    }
+}
+
+/// The control of `a_std_is_placed_by_every_input_of_its_units_and_not_by_the_crates_asked`: a
+/// placement that is the whole key's ID, as it was, is told apart by the crates asked.
+#[test]
+fn the_oracle_catches_a_place_that_moves_with_the_crates_asked() {
+    let tree = MemTree::default();
+    let root = library(&tree);
+    let base = key(root);
+    let with_test =
+        StdKey { crates: vec!["std".to_owned(), "test".to_owned()], ..key(root) };
+    let planted = |key: &StdKey| key.id();
+    assert_ne!(planted(&base), planted(&with_test));
+}
+
 #[test]
 fn every_view_shares_one_standard_library() {
     let (db, tree, root) = setup();

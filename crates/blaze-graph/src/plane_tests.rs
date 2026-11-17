@@ -19,7 +19,7 @@ use std::alloc::Global;
 use crate::{
     machine::{Config, Error, Input, Machine, NodeId, Outcome, Output, Pool, Spec},
     plane::{
-        Budget, Counts, Key, Memo, NodeRef, Nodes, Plane, PlaneConfig, PlaneInput, PlaneOutput,
+        Counts, Key, Memo, NodeRef, Nodes, Plane, PlaneConfig, PlaneInput, PlaneOutput,
         RequestId, RequestStats,
     },
     trace::{Trace, render},
@@ -33,7 +33,7 @@ fn name(id: u32) -> String {
     format!("<{id}>")
 }
 
-fn node(id: u32, deps: &[u32], pool: Pool, cost: u64, key: Option<Key>, memory: u64) -> Spec {
+fn node(id: u32, deps: &[u32], pool: Pool, cost: u64, key: Option<Key>) -> Spec {
     Spec {
         id: NodeId(id),
         kind: NodeKind::Codegen,
@@ -42,24 +42,19 @@ fn node(id: u32, deps: &[u32], pool: Pool, cost: u64, key: Option<Key>, memory: 
         pool,
         cost,
         key,
-        memory,
     }
 }
 
 fn work(id: u32, deps: &[u32], cost: u64) -> Spec {
-    node(id, deps, Pool::Work, cost, None, 0)
+    node(id, deps, Pool::Work, cost, None)
 }
 
 fn keyed(id: u32, deps: &[u32], cost: u64, k: u8) -> Spec {
-    node(id, deps, Pool::Work, cost, Some(key(k)), 0)
+    node(id, deps, Pool::Work, cost, Some(key(k)))
 }
 
 fn config(io: usize, work: usize) -> PlaneConfig {
-    PlaneConfig { io, work, budget: None, starve_after: 0 }
-}
-
-fn budget(bytes: u64) -> Option<Budget> {
-    Some(Budget { bytes, from: "the test's budget".to_owned(), kept_back: 0 })
+    PlaneConfig { io, work }
 }
 
 fn open(plane: &mut Plane<impl Memo>, request: u32, weight: u32, keep_going: bool) {
@@ -173,9 +168,7 @@ fn as_plane(input: Input) -> PlaneInput {
 }
 
 fn one_request(config: Config) -> Plane {
-    let mut plane =
-        Plane::new(PlaneConfig { io: config.io, work: config.work, budget: None, starve_after: 0 })
-            .unwrap();
+    let mut plane = Plane::new(PlaneConfig { io: config.io, work: config.work }).unwrap();
     let input = PlaneInput::Open {
         at_ns: 0,
         request: RequestId(0),
@@ -220,7 +213,7 @@ fn one_request_without_keys_or_budget_says_what_the_machine_says() {
                 deps.sort_unstable();
                 deps.dedup();
                 let pool = if random.one_in(3) { Pool::Io } else { Pool::Work };
-                nodes.push(node(next, &deps, pool, random.below(10), None, 0));
+                nodes.push(node(next, &deps, pool, random.below(10), None));
                 ids.push(next);
                 next += 1;
             }
@@ -463,7 +456,6 @@ fn as_nodes(first: u32, specs: &[Spec]) -> Nodes {
             pool: spec.pool,
             cost: spec.cost,
             key: spec.key,
-            memory: spec.memory,
         });
         assert_eq!(id, spec.id);
     }
@@ -580,7 +572,7 @@ fn nodes_as_columns_say_what_nodes_as_specs_say() {
                         }
                         let key = random.one_in(3).then(|| key(random.below(4) as u8));
                         let pool = if random.one_in(4) { Pool::Io } else { Pool::Work };
-                        let mut spec = node(id, &deps, pool, random.below(50), key, 0);
+                        let mut spec = node(id, &deps, pool, random.below(50), key);
                         spec.kind = kinds[random.below(3) as usize];
                         spec.name = format!("{}é{id}", "x".repeat(random.below(4) as usize));
                         spec
@@ -620,9 +612,9 @@ fn nodes_as_columns_say_what_nodes_as_specs_say() {
 #[test]
 fn a_batch_of_columns_is_one_record() {
     let specs = vec![
-        node(3, &[5], Pool::Work, 1, None, 0),
-        node(4, &[], Pool::Io, 2, Some(key(1)), 0),
-        node(5, &[4, 1], Pool::Work, 3, None, 0),
+        node(3, &[5], Pool::Work, 1, None),
+        node(4, &[], Pool::Io, 2, Some(key(1))),
+        node(5, &[4, 1], Pool::Work, 3, None),
     ];
     let mut each = Plane::new(config(1, 2)).unwrap();
     let mut together = Plane::new(config(1, 2)).unwrap();
@@ -851,255 +843,16 @@ fn a_cancelled_request_does_not_wait_for_another_requests_task() {
     assert_eq!(finished(&out), [(1, true)]);
 }
 
+/// The invariant (admission by threads alone): a task starts as soon as a thread of its pool
+/// is free, and none waits while one is free.
 #[test]
-fn a_task_bigger_than_the_budget_fails_naming_itself() {
-    let mut plane = Plane::new(PlaneConfig { budget: budget(10), ..config(1, 2) }).unwrap();
+fn a_task_starts_when_a_thread_of_its_pool_is_free() {
+    let mut plane = Plane::new(config(1, 2)).unwrap();
     open(&mut plane, 1, 1, true);
-    let out = add(
-        &mut plane,
-        1,
-        vec![node(1, &[], Pool::Work, 1, None, 11), node(2, &[], Pool::Work, 1, None, 10)],
-    );
-    assert_eq!(runs(&out), [2]);
-    let Some(NodeState::Failed { why }) = plane.state(NodeId(1)) else {
-        panic!("{:?}", plane.state(NodeId(1)))
-    };
-    assert!(why.starts_with("<1> needs"), "{why}");
-    assert!(why.contains("more than blaze may use here"), "{why}");
-    assert!(why.contains("the test's budget"), "{why}");
-}
-
-/// One that fits the budget but not beside what the process holds outside its grants starts
-/// once nothing granted memory runs (waiting could never make room: memadmit), says how far
-/// the process is over while it waits, and holds back every other task with memory while it
-/// runs but what fits beside it.
-#[test]
-fn a_task_that_fits_the_budget_starts_alone_whatever_the_process_holds() {
-    let mut plane = Plane::new(PlaneConfig { budget: budget(10), ..config(1, 2) }).unwrap();
-    open(&mut plane, 1, 1, true);
-    plane.step(PlaneInput::Held { at_ns: 0, bytes: 4 }).unwrap();
-    assert_eq!(runs(&add(&mut plane, 1, vec![node(1, &[], Pool::Work, 1000, None, 2)])), [1]);
-    // 2 granted, 8 held: 2 free, under the 7 asked. It waits for the grant, not the rest.
-    plane.step(PlaneInput::Held { at_ns: 0, bytes: 8 }).unwrap();
-    assert_eq!(
-        runs(&add(&mut plane, 1, vec![node(2, &[], Pool::Work, 100, None, 7)])),
-        Vec::<u32>::new()
-    );
-    assert_eq!(plane.short(), 5, "8 held less 2 granted is 6 besides; 7 wants 5 of them let go");
-    let out = built(&mut plane, 1);
-    assert_eq!(runs(&out), [2], "nothing granted memory runs: it starts though 8 are held");
-    assert_eq!(plane.short(), 0);
-    assert!(matches!(plane.state(NodeId(2)), Some(NodeState::Running)));
-    // 7 granted, 8 held: 2 free. 3 waits for the grant of 7, then starts alone in turn.
-    assert_eq!(
-        runs(&add(&mut plane, 1, vec![node(3, &[], Pool::Work, 1, None, 3)])),
-        Vec::<u32>::new()
-    );
-    assert_eq!(runs(&built(&mut plane, 2)), [3]);
-}
-
-/// A task the room between two turns of the machine's ledger holds back is short of nothing:
-/// the next turn starts it, so the driver lets go of no kept front end for it. Counted against
-/// the room it was short of all the process holds besides its grants, at every build.
-#[test]
-fn a_task_that_waits_for_the_ledgers_turn_is_short_of_nothing() {
-    let mut plane = Plane::new(PlaneConfig { budget: budget(10), ..config(1, 2) }).unwrap();
-    open(&mut plane, 1, 1, true);
-    plane.step(PlaneInput::Held { at_ns: 0, bytes: 4 }).unwrap();
-    assert_eq!(runs(&add(&mut plane, 1, vec![node(1, &[], Pool::Work, 1000, None, 2)])), [1]);
-    // A turn: 10 allowed, and the room until the next is what is charged now, 4, and a lease
-    // of twice the grant started since the last, 4.
-    plane.step(PlaneInput::Allowance { at_ns: 0, bytes: 10 }).unwrap();
-    assert_eq!(plane.room(), 8);
-    // 5 fits the 10 allowed beside the 4 held, and not the room: it waits for the turn.
-    assert_eq!(
-        runs(&add(&mut plane, 1, vec![node(2, &[], Pool::Work, 100, None, 5)])),
-        Vec::<u32>::new()
-    );
-    assert!(plane.held_back());
-    assert_eq!(plane.short(), 0, "the turn makes the room; nothing need be let go");
-    let out = plane.step(PlaneInput::Allowance { at_ns: 1, bytes: 10 }).unwrap();
-    assert_eq!(runs(&out), [2]);
-}
-
-/// With work, a turn of the ledger leaves a lease past the charge (1/16 of the ceiling, or
-/// twice the largest grant started since the last turn if more), and a task that fits it
-/// starts in the step that adds it, with no turn between.
-#[test]
-fn a_task_that_fits_the_lease_starts_as_it_is_added_with_no_turn() {
-    let mut plane = Plane::new(PlaneConfig { budget: budget(160), ..config(1, 4) }).unwrap();
-    open(&mut plane, 1, 1, true);
-    plane.step(PlaneInput::Held { at_ns: 0, bytes: 40 }).unwrap();
-    // A turn with a request open and nothing started yet: 40 charged and 160 / 16 leased.
-    assert!(plane.step(PlaneInput::Allowance { at_ns: 0, bytes: 160 }).unwrap().is_empty());
-    assert_eq!((plane.room(), plane.lease()), (50, 10));
-    assert!(!plane.turn_wanted());
-    // 8 fits the 10 leased: it starts in the step that adds it.
-    assert_eq!(runs(&add(&mut plane, 1, vec![node(1, &[], Pool::Work, 100, None, 8)])), [1]);
-    assert!(!plane.held_back() && !plane.turn_wanted());
-    // The 8 granted are within the 40 held, so the lease is whole, and 9 more start too.
-    assert_eq!(runs(&add(&mut plane, 1, vec![node(2, &[], Pool::Work, 100, None, 9)])), [2]);
-    assert_eq!(plane.granted(), 17);
-    assert_eq!(plane.room(), 50, "no turn was taken");
-    // What is held grows to 48: 2 of the lease are left, a quarter of it and no less.
-    plane.step(PlaneInput::Held { at_ns: 1, bytes: 48 }).unwrap();
-    assert!(!plane.turn_wanted());
-    // At 49 the lease is in its last quarter, and the allowance has more: a turn is wanted
-    // now, before a task is held back.
-    plane.step(PlaneInput::Held { at_ns: 1, bytes: 49 }).unwrap();
-    assert!(plane.turn_wanted() && !plane.held_back());
-    // The turn: 49 charged, and twice the largest grant started since the last, 18, leased.
-    plane.step(PlaneInput::Allowance { at_ns: 2, bytes: 160 }).unwrap();
-    assert_eq!((plane.room(), plane.lease()), (67, 18));
-    assert!(!plane.turn_wanted());
-}
-
-/// A task past the lease and within the allowance is held back by the room alone: it is short
-/// of nothing, a turn is wanted at once, and that turn starts it.
-#[test]
-fn a_task_past_the_lease_waits_for_the_turn_and_no_longer() {
-    let mut plane = Plane::new(PlaneConfig { budget: budget(160), ..config(1, 4) }).unwrap();
-    open(&mut plane, 1, 1, true);
-    plane.step(PlaneInput::Held { at_ns: 0, bytes: 40 }).unwrap();
-    plane.step(PlaneInput::Allowance { at_ns: 0, bytes: 160 }).unwrap();
-    assert_eq!(runs(&add(&mut plane, 1, vec![node(1, &[], Pool::Work, 100, None, 8)])), [1]);
-    // 30 is past the 10 leased and within the 120 the allowance leaves beside the 40 held.
-    assert_eq!(
-        runs(&add(&mut plane, 1, vec![node(2, &[], Pool::Work, 10, None, 30)])),
-        Vec::<u32>::new()
-    );
-    assert!(plane.held_back() && plane.turn_wanted());
-    assert_eq!(plane.short(), 0);
-    let out = plane.step(PlaneInput::Allowance { at_ns: 1, bytes: 160 }).unwrap();
-    assert_eq!(runs(&out), [2]);
-    // 40 held (the 38 granted are within it), and twice the 30 started leased.
-    assert_eq!((plane.room(), plane.lease()), (100, 60));
-    assert!(!plane.held_back() && !plane.turn_wanted());
-    // A task the allowance itself holds back wants no turn at once: one changes nothing for
-    // it until another daemon lets go.
-    assert_eq!(
-        runs(&add(&mut plane, 1, vec![node(3, &[], Pool::Work, 1, None, 130)])),
-        Vec::<u32>::new()
-    );
-    assert!(plane.held_back() && !plane.turn_wanted());
-}
-
-/// A plane with no work leases nothing: its room is its charge, so the ledger records what it
-/// holds and no more. A request of the idle class with nothing ready is no work; a lease
-/// held as the work ends is given back at a turn wanted at once.
-#[test]
-fn an_idle_planes_room_has_no_lease() {
-    let mut plane = Plane::new(PlaneConfig { budget: budget(160), ..config(1, 4) }).unwrap();
-    plane.step(PlaneInput::Held { at_ns: 0, bytes: 40 }).unwrap();
-    plane.step(PlaneInput::Allowance { at_ns: 0, bytes: 160 }).unwrap();
-    assert_eq!((plane.room(), plane.lease()), (40, 0));
-    assert!(!plane.turn_wanted());
-    open_as(&mut plane, 1, 1, true, true);
-    plane.step(PlaneInput::Allowance { at_ns: 1, bytes: 160 }).unwrap();
-    assert_eq!((plane.room(), plane.lease()), (40, 0), "an idle request with nothing ready");
-    // A request not idle is work: the next turn leases.
-    open(&mut plane, 2, 1, true);
-    plane.step(PlaneInput::Allowance { at_ns: 2, bytes: 160 }).unwrap();
-    assert_eq!((plane.room(), plane.lease()), (50, 10));
-    // It ends with nothing run: the lease is held for no work, and a turn gives it back.
-    assert_eq!(finished(&close(&mut plane, 2)), [(2, true)]);
-    assert!(plane.turn_wanted());
-    plane.step(PlaneInput::Allowance { at_ns: 3, bytes: 160 }).unwrap();
-    assert_eq!((plane.room(), plane.lease()), (40, 0));
-    assert!(!plane.turn_wanted());
-}
-
-/// Under a pressure cap the budget is held at the cap: tasks start only within it, none starts
-/// alone past it, a task too big is still judged against the configured budget, and lifting
-/// the cap starts what waited for it.
-#[test]
-fn under_a_pressure_cap_nothing_starts_past_it() {
-    let config = PlaneConfig { budget: budget(10), starve_after: 100, ..config(1, 4) };
-    let mut plane = Plane::new(config).unwrap();
-    open(&mut plane, 1, 1, true);
-    plane.step(PlaneInput::Held { at_ns: 0, bytes: 4 }).unwrap();
-    plane.step(PlaneInput::Cap { at_ns: 0, bytes: Some(6) }).unwrap();
-    // 6 capped, 4 held: 2 free. Nothing granted, yet 3 does not start alone; 2 fits.
-    let out = add(
-        &mut plane,
-        1,
-        vec![node(1, &[], Pool::Work, 100, None, 3), node(2, &[], Pool::Work, 10, None, 2)],
-    );
-    assert_eq!(runs(&out), [2]);
-    assert_eq!(plane.short(), 1, "of the 4 held besides, 1 let go makes room for 3");
-    // Released down to 1: 6 capped less 2 granted is 4 free, and 3 starts within the cap.
-    let out = plane.step(PlaneInput::Held { at_ns: 0, bytes: 1 }).unwrap();
-    assert_eq!(runs(&out), [1]);
-    // 8 fits the configured 10, never the cap, and is not refused for it.
-    let out = add(&mut plane, 1, vec![node(3, &[], Pool::Work, 1, None, 8)]);
-    assert!(runs(&out).is_empty(), "{out:?}");
-    assert_eq!(plane.state(NodeId(3)), Some(&NodeState::Ready));
-    built(&mut plane, 1);
-    built(&mut plane, 2);
-    // Nothing granted, 8 over the cap: it waits until the pressure passes.
-    let out = plane.step(PlaneInput::Cap { at_ns: 0, bytes: None }).unwrap();
-    assert_eq!(runs(&out), [3]);
-}
-
-/// A task passed over for memory `starve_after` times holds back every task with memory, of
-/// any pool, until it fits, and then starts before the smaller ones behind it.
-#[test]
-fn a_task_passed_over_starts_before_smaller_ones_behind_it() {
-    let mut plane =
-        Plane::new(PlaneConfig { io: 2, work: 4, budget: budget(10), starve_after: 2 }).unwrap();
-    open(&mut plane, 1, 1, true);
-    let mut nodes =
-        vec![node(1, &[], Pool::Work, 1000, None, 5), node(2, &[], Pool::Work, 100, None, 8)];
-    nodes.extend((3..9).map(|id| node(id, &[], Pool::Work, 10 - u64::from(id), None, 2)));
-    let out = add(&mut plane, 1, nodes);
-    assert_eq!(runs(&out), [1, 3, 4]);
-    assert_eq!(plane.holding(), Some(NodeId(2)));
-    assert_eq!(plane.granted(), 9);
-    // Held back too: another pool's task with memory; not one with none.
-    let out = add(
-        &mut plane,
-        1,
-        vec![node(9, &[], Pool::Io, 1, None, 1), node(10, &[], Pool::Io, 1, None, 0)],
-    );
-    assert_eq!(runs(&out), [10]);
-    assert_eq!(runs(&built(&mut plane, 3)), Vec::<u32>::new());
-    assert_eq!(runs(&built(&mut plane, 1)), [2]);
-    assert_eq!(plane.holding(), None);
-    assert_eq!(plane.granted(), 10);
-    let out = built(&mut plane, 2);
-    assert_eq!(runs(&out), [9, 5, 6, 7]);
-}
-
-/// A task predicted the whole budget (a program never measured) runs alone: it waits while any
-/// task granted memory runs, starts once none does though the process holds memory besides,
-/// and while it runs only tasks with no memory start.
-#[test]
-fn a_task_predicted_the_whole_budget_runs_alone() {
-    let mut plane =
-        Plane::new(PlaneConfig { io: 1, work: 4, budget: budget(10), starve_after: 100 }).unwrap();
-    open(&mut plane, 1, 1, true);
-    plane.step(PlaneInput::Held { at_ns: 0, bytes: 4 }).unwrap();
-    assert_eq!(runs(&add(&mut plane, 1, vec![node(1, &[], Pool::Work, 1000, None, 3)])), [1]);
-    let out = add(
-        &mut plane,
-        1,
-        vec![
-            node(2, &[], Pool::Work, 100, None, 10),
-            node(3, &[], Pool::Work, 10, None, 2),
-            node(4, &[], Pool::Work, 1, None, 0),
-        ],
-    );
-    assert_eq!(runs(&out), [3, 4], "the whole budget does not fit beside what runs");
-    assert_eq!(runs(&built(&mut plane, 1)), Vec::<u32>::new());
-    assert_eq!(runs(&built(&mut plane, 3)), [2], "nothing granted memory runs: it starts");
-    assert_eq!(plane.granted(), 10);
-    let out = add(
-        &mut plane,
-        1,
-        vec![node(5, &[], Pool::Work, 1, None, 1), node(6, &[], Pool::Work, 1, None, 0)],
-    );
-    assert_eq!(runs(&out), [6], "beside it, only what holds no memory");
-    assert_eq!(runs(&built(&mut plane, 2)), [5]);
+    let nodes = (1..5).map(|id| work(id, &[], 5 - u64::from(id))).collect();
+    assert_eq!(runs(&add(&mut plane, 1, nodes)), [1, 2]);
+    assert_eq!(runs(&built(&mut plane, 1)), [3]);
+    assert_eq!(runs(&built(&mut plane, 2)), [4]);
 }
 
 /// With one thread and every request ready, each request's starts keep to its weight.
@@ -1198,7 +951,6 @@ impl std::ops::Deref for ModelDb {
 #[derive(Default)]
 struct Model {
     seed: u64,
-    budget: Option<u64>,
     specs: HashMap<u32, Spec, Global>,     // alloc: a test's model
     request_of: HashMap<u32, u32, Global>, // alloc: a test's model
     nodes_of: HashMap<u32, Vec<u32>, Global>, // alloc: a test's model
@@ -1207,7 +959,6 @@ struct Model {
     /// The tasks running, by the node they run as.
     running: Vec<u32>,
     running_keys: HashSet<Key, Global>, // alloc: a test's model
-    granted: u64,
     /// What the database has: keys whose task ended well, some that failed, less those
     /// dropped since.
     db: ModelDb,
@@ -1264,12 +1015,9 @@ impl Model {
         }
     }
 
-    /// Takes the outputs of one step, checking each; `holding` is the node the plane said held
-    /// back the others before it.
-    fn take(&mut self, plane: &Plane<DbMemo>, outputs: Vec<PlaneOutput>, holding: Option<NodeId>) {
+    /// Takes the outputs of one step, checking each.
+    fn take(&mut self, plane: &Plane<DbMemo>, outputs: Vec<PlaneOutput>) {
         let seed = self.seed;
-        let mut first_with_memory = true;
-        let mut held_settled = false;
         for output in &outputs {
             match output {
                 PlaneOutput::Said { request, record } => match &record.event {
@@ -1306,23 +1054,9 @@ impl Model {
                                 );
                             }
                         }
-                        if let NodeState::Failed { why } = state
-                            && why != "boom"
-                            && why != "open"
-                        {
-                            let spec = &self.specs[id];
-                            assert!(why.starts_with(&spec.name), "seed {seed}: {why}");
-                            // The one failure for memory: a prediction over the budget. One under
-                            // it starts alone, never fails (memadmit).
-                            let budget = self.budget.expect("a failure of memory has a budget");
-                            assert!(
-                                why.contains("more than blaze may use here"),
-                                "seed {seed}: {why}"
-                            );
-                            assert!(spec.memory > budget, "seed {seed}: {why}");
-                        }
-                        if state.settled() && holding == Some(NodeId(*id)) {
-                            held_settled = true;
+                        // The plane fails a node only as its work did.
+                        if let NodeState::Failed { why } = state {
+                            assert!(why == "boom" || why == "open", "seed {seed}: #{id} {why}");
                         }
                         self.states.insert(*id, state.clone());
                     }
@@ -1376,40 +1110,24 @@ impl Model {
                             "seed {seed}: #{id} runs a key the database has"
                         );
                     }
-                    self.granted += spec.memory;
-                    if let Some(budget) = self.budget {
-                        assert!(self.granted <= budget, "seed {seed}: {} granted", self.granted);
-                    }
-                    if spec.memory > 0 && first_with_memory {
-                        first_with_memory = false;
-                        if let Some(held) = holding
-                            && !held_settled
+                    // Admission is by threads alone, so a request's order is its priority's.
+                    let mut memo = HashMap::new_in(Global); // alloc: a test's model
+                    let request = self.request_of[&id.0];
+                    let mine = self.priority(id.0, &mut memo);
+                    for other in &self.nodes_of[&request] {
+                        if self.states.get(other) == Some(&NodeState::Ready)
+                            && self.specs[other].pool == spec.pool
                         {
-                            let held = &self.specs[&held.0];
-                            let same =
-                                held.id == spec.id || (held.key.is_some() && held.key == spec.key);
-                            assert!(same, "seed {seed}: #{id} starts while {} is held", held.id);
+                            let theirs = self.priority(*other, &mut memo);
+                            assert!(
+                                theirs <= mine,
+                                "seed {seed}: #{id} at {mine} before #{other} at {theirs}"
+                            );
                         }
                     }
-                    if plane.config().budget.is_none() {
-                        let mut memo = HashMap::new_in(Global); // alloc: a test's model
-                        let request = self.request_of[&id.0];
-                        let mine = self.priority(id.0, &mut memo);
-                        for other in &self.nodes_of[&request] {
-                            if self.states.get(other) == Some(&NodeState::Ready)
-                                && self.specs[other].pool == spec.pool
-                            {
-                                let theirs = self.priority(*other, &mut memo);
-                                assert!(
-                                    theirs <= mine,
-                                    "seed {seed}: #{id} at {mine} before #{other} at {theirs}"
-                                );
-                            }
-                        }
-                    }
-                    // With no budget, an idle request's task starts only while no request not
-                    // idle has a task ready in its pool.
-                    if self.budget.is_none() && self.idle.contains(&self.request_of[&id.0]) {
+                    // An idle request's task starts only while no request not idle has a task
+                    // ready in its pool.
+                    if self.idle.contains(&self.request_of[&id.0]) {
                         for (other, state) in &self.states {
                             let theirs = self.request_of[other];
                             assert!(
@@ -1426,7 +1144,7 @@ impl Model {
                 PlaneOutput::Yield { id } => {
                     assert!(self.running.contains(&id.0), "seed {seed}: #{id} yields, not running");
                     let r = self.request_of[&id.0];
-                    assert!(self.idle.contains(&r), "seed {seed}: #{id} of request {r} yields");
+                    assert!(self.idle.contains(&r), "seed {seed}: #{id} of request {r} yields, not idle");
                     assert!(self.yielding.insert(id.0), "seed {seed}: #{id} asked twice");
                 }
                 PlaneOutput::Finished { request, ok } => {
@@ -1447,42 +1165,36 @@ impl Model {
                 }
             }
         }
-        assert_eq!(plane.granted(), self.granted, "seed {seed}");
         // Nothing waits for a thread while nothing runs.
         if self.running.is_empty() {
             for (id, state) in &self.states {
-                assert_ne!(*state, NodeState::Ready, "seed {seed}: #{id} ready, nothing runs");
+                assert!(*state != NodeState::Ready, "seed {seed}: #{id} ready, nothing runs");
             }
         }
-        if let Some(held) = plane.holding() {
-            assert!(self.budget.is_some(), "seed {seed}");
-            assert_eq!(self.states[&held.0], NodeState::Ready, "seed {seed}");
-        }
         self.outputs.extend(outputs);
+    }
+
+    /// A running task stopped, by its end or by giving way: what it held as running.
+    fn stopped(&mut self, id: u32) {
+        self.running.retain(|&it| it != id);
+        self.yielding.remove(&id);
+        if let Some(key) = self.specs[&id].key {
+            self.running_keys.remove(&key);
+        }
     }
 
     /// A running task is done: what the model keeps of it, and what its work puts in the
     /// database before the plane is told: the value, and a failure too if `keep_failure`.
     fn finish(&mut self, id: u32, outcome: &Outcome, keep_failure: bool) -> Option<(Key, Outcome)> {
-        self.running.retain(|&it| it != id);
-        self.yielding.remove(&id);
-        let spec = &self.specs[&id];
-        self.granted -= spec.memory;
-        let key = spec.key?;
-        self.running_keys.remove(&key);
+        self.stopped(id);
+        let key = self.specs[&id].key?;
         (keep_failure || !matches!(outcome, Outcome::Failed { .. } | Outcome::FailedOpen { .. }))
             .then(|| (key, outcome.clone()))
     }
 
     /// A running task gave way: it holds nothing, runs no key, and was no start.
     fn yielded(&mut self, id: u32) {
-        self.running.retain(|&it| it != id);
-        self.yielding.remove(&id);
-        let spec = &self.specs[&id];
-        self.granted -= spec.memory;
-        if let Some(key) = spec.key {
-            self.running_keys.remove(&key);
-        }
+        self.stopped(id);
         let r = self.request_of[&id];
         *self.ran.get_mut(&r).expect("a start of its request") -= 1;
     }
@@ -1505,8 +1217,6 @@ enum Act {
 /// were named so far.
 #[derive(Debug, PartialEq)]
 struct Seen {
-    holding: Option<NodeId>,
-    granted: u64,
     counts: Counts,
     stats: Vec<Option<RequestStats>>,
     states: Vec<Option<NodeState>>,
@@ -1515,8 +1225,6 @@ struct Seen {
 impl Seen {
     fn of(plane: &Plane<DbMemo>, requests: u32, nodes: u32) -> Seen {
         Seen {
-            holding: plane.holding(),
-            granted: plane.granted(),
             counts: plane.counts(),
             stats: (0..requests).map(|r| plane.stats(RequestId(r))).collect(),
             states: (0..nodes).map(|id| plane.state(NodeId(id)).cloned()).collect(),
@@ -1525,8 +1233,6 @@ impl Seen {
 
     fn of_reference(plane: &reference::Plane<impl Memo>, requests: u32, nodes: u32) -> Seen {
         Seen {
-            holding: plane.holding(),
-            granted: plane.granted(),
             counts: plane.counts(),
             stats: (0..requests).map(|r| plane.stats(RequestId(r))).collect(),
             states: (0..nodes).map(|id| plane.state(NodeId(id)).cloned()).collect(),
@@ -1582,30 +1288,16 @@ fn shuffle<T>(random: &mut SplitMix64, items: &mut [T]) {
 
 /// One random run of many requests, checked after every step. With `release`, each request
 /// is released as it is opened; with `idle`, some are opened idle, some of those promoted,
-/// and a task asked to give way mostly does. Without, the run is that of before idle
-/// requests were.
+/// and a task asked to give way mostly does; now and then a running task gives way unasked
+/// (a wait that would close a cycle, posted again whole).
 fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
     let mut random = SplitMix64::new(seed);
-    let budget = (!random.one_in(3)).then(|| 100 + random.below(900));
-    let starve_after = random.below(5) as u32;
-    let config = PlaneConfig {
-        io: 1 + random.below(3) as usize,
-        work: 1 + random.below(4) as usize,
-        budget: budget.and_then(self::budget),
-        starve_after,
-    };
+    let config = PlaneConfig { io: 1 + random.below(3) as usize, work: 1 + random.below(4) as usize };
     let (plane, db) = with_db(config.clone());
     let keys = 1 + random.below(12) as u8;
-    let memory = |random: &mut SplitMix64| match budget {
-        None => random.below(1000),
-        Some(budget) if random.one_in(15) => budget + 1 + random.below(budget),
-        Some(budget) if random.one_in(4) => 0,
-        Some(budget) => random.below(budget / 2 + 1),
-    };
-    let by_key: Vec<(u64, Pool)> = (0..keys)
-        .map(|_| (memory(&mut random), if random.one_in(3) { Pool::Io } else { Pool::Work }))
-        .collect();
-    let mut model = Model { seed, budget, db: ModelDb(Arc::clone(&db)), ..Model::default() };
+    let by_key: Vec<Pool> =
+        (0..keys).map(|_| if random.one_in(3) { Pool::Io } else { Pool::Work }).collect();
+    let mut model = Model { seed, db: ModelDb(Arc::clone(&db)), ..Model::default() };
     let mut planned: Vec<Planned> = (0..1 + random.below(5))
         .map(|_| Planned {
             weight: 1 + random.below(4) as u32,
@@ -1634,14 +1326,13 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
                 deps.dedup();
                 let id = *next_id;
                 *next_id += 1;
-                let (key, memory, pool) = if random.one_in(2) {
+                let (key, pool) = if random.one_in(2) {
                     let k = random.below(u64::from(keys)) as u8;
-                    (Some(key(k)), by_key[usize::from(k)].0, by_key[usize::from(k)].1)
+                    (Some(key(k)), by_key[usize::from(k)])
                 } else {
-                    let pool = if random.one_in(3) { Pool::Io } else { Pool::Work };
-                    (None, memory(random), pool)
+                    (None, if random.one_in(3) { Pool::Io } else { Pool::Work })
                 };
-                nodes.push(node(id, &deps, pool, random.below(10), key, memory));
+                nodes.push(node(id, &deps, pool, random.below(10), key));
                 known.push(id);
             }
             if random.one_in(3) {
@@ -1651,9 +1342,6 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
         };
     let mut at = 0u64;
     let mut steps = 0u64;
-    // Whether a pressure cap is on ([`PlaneInput::Cap`]): under one, nothing running is no
-    // stall but the pause it asks for, until it is lifted.
-    let mut capped = false;
     loop {
         let all_over = planned
             .iter()
@@ -1665,7 +1353,6 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
         steps += 1;
         assert!(steps < 100_000, "seed {seed}: no end");
         at += random.below(3);
-        let holding = driver.plane.holding();
         let roll = random.below(100);
         let live: Vec<u32> = (0..planned.len() as u32)
             .filter(|r| planned[*r as usize].opened && !model.finished.contains_key(r))
@@ -1675,20 +1362,6 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
             model.cancelled.insert(r);
             planned[r as usize].closed = true;
             driver.act(Act::Cancel(at, RequestId(r)), next_id)
-        } else if roll < 8 && budget.is_some() {
-            let budget = budget.unwrap_or(0);
-            if random.one_in(5) {
-                capped = !capped;
-                let bytes = capped.then(|| random.below(budget + budget / 4));
-                driver.act(Act::Step(PlaneInput::Cap { at_ns: at, bytes }), next_id)
-            } else {
-                let bytes = if random.one_in(10) {
-                    random.below(budget * 2)
-                } else {
-                    random.below(budget / 3)
-                };
-                driver.act(Act::Step(PlaneInput::Held { at_ns: at, bytes }), next_id)
-            }
         } else if roll < 10 && !model.db.lock().is_empty() {
             let dropped = {
                 let db = model.db.lock();
@@ -1751,10 +1424,6 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
                     planned[r].closed = true;
                     driver.act(Act::Step(PlaneInput::Close { at_ns: at, request }), next_id)
                 }
-            } else if capped && model.running.is_empty() {
-                // The pressure passes: what waited for it starts.
-                capped = false;
-                driver.act(Act::Step(PlaneInput::Cap { at_ns: at, bytes: None }), next_id)
             } else {
                 assert!(
                     !model.running.is_empty(),
@@ -1764,9 +1433,12 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
             }
         } else {
             let id = model.running[random.below(model.running.len() as u64) as usize];
-            if model.yielding.contains(&id) && !random.one_in(4) {
+            // A task asked to give way mostly does; now and then one does unasked.
+            let asked = model.yielding.contains(&id) && !random.one_in(4);
+            if asked || random.one_in(12) {
                 model.yielded(id);
-                driver.act(Act::Step(PlaneInput::Yielded { at_ns: at, id: NodeId(id) }), next_id)
+                let input = PlaneInput::Yielded { at_ns: at, id: NodeId(id) };
+                driver.act(Act::Step(input), next_id)
             } else {
                 let outcome = match random.below(10) {
                     0 => Outcome::Failed { why: "boom".to_owned() },
@@ -1798,7 +1470,7 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
                 driver.act(Act::Step(input), next_id)
             }
         };
-        model.take(&driver.plane, outputs, holding);
+        model.take(&driver.plane, outputs);
     }
     assert!(model.running.is_empty(), "seed {seed}");
     for (id, state) in &model.states {
@@ -1812,13 +1484,15 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
 }
 
 /// Random requests under many seeds, checked after every step: nothing runs before its deps;
-/// no key runs twice at once; a key the database has never runs; granted memory never exceeds
-/// the budget; a held task starts before any other with memory; a failure for memory names its
-/// node; the critical path goes first within a request, as priorities kept as nodes are added
-/// match those counted again from the whole graph; every request ends, ok exactly when nothing
-/// of it failed and it was not cancelled; with no budget an idle request's task starts only
-/// while no other has one ready in its pool, and only an idle request's running task is asked
-/// to give way, once.
+/// no key runs twice at once; a key the database has never runs; nothing fails but as its
+/// work did; the critical path goes first within a request, as priorities kept as nodes are
+/// added match those counted again from the whole graph; every request ends, ok exactly when
+/// nothing of it failed and it was not cancelled; an idle request's task starts only while no
+/// other has one ready in its pool; only an idle request's running task is asked to give way,
+/// once a run; and nothing ready waits while nothing runs.
+///
+/// The invariant: admission is by threads alone, so a ready task waits only for a thread of
+/// its pool.
 #[test]
 fn random_requests_keep_the_rules() {
     let mut steps = 0;
@@ -1831,10 +1505,7 @@ fn random_requests_keep_the_rules() {
             for output in &run.outputs {
                 match output {
                     PlaneOutput::Run { critical: it, .. } => critical[usize::from(*it)] += 1,
-                    PlaneOutput::Yield { .. } => {
-                        assert!(idle, "seed {seed}: a yield with no idle request");
-                        yields += 1;
-                    }
+                    PlaneOutput::Yield { .. } => yields += 1,
                     _ => {}
                 }
             }
@@ -1900,7 +1571,7 @@ fn replay(seed: u64, simulated: &Simulated) {
 
 /// The plane in columns says what the plane before them said, act by act over the random
 /// runs, kept or released: the same outputs, and after each act the same states, stats,
-/// counts, granted memory and held task. So the heaps keep the ready sets' order, the edge
+/// and counts. So the heap a request keeps per pool keeps its ready set's order, the edge
 /// lists the dependents' order, the member lists the members' order, and a reused slot or
 /// buffer changes nothing.
 #[test]
@@ -1957,7 +1628,7 @@ fn batches_in_any_order_and_refused_ones_match_the_reference() {
             };
             let key = random.one_in(3).then(|| self::key(random.below(4) as u8));
             let pool = if random.one_in(3) { Pool::Io } else { Pool::Work };
-            nodes.push(node(id, &deps, pool, random.below(10), key, 0));
+            nodes.push(node(id, &deps, pool, random.below(10), key));
         }
         shuffle(random, &mut nodes);
         (nodes, fresh)
@@ -1965,12 +1636,8 @@ fn batches_in_any_order_and_refused_ones_match_the_reference() {
     let mut refused = 0;
     for seed in 0..400u64 {
         let mut random = SplitMix64::new(seed);
-        let config = PlaneConfig {
-            io: 1 + random.below(2) as usize,
-            work: 1 + random.below(3) as usize,
-            budget: None,
-            starve_after: 0,
-        };
+        let config =
+            PlaneConfig { io: 1 + random.below(2) as usize, work: 1 + random.below(3) as usize };
         let mut plane = Plane::new(config.clone()).unwrap();
         let mut model = reference::Plane::new(config).unwrap();
         let mut both = |plane: &mut Plane, model: &mut reference::Plane, input: PlaneInput| {
@@ -2056,7 +1723,7 @@ fn a_long_lived_plane_says_to_each_request_what_a_fresh_one_says() {
             .map(|id| {
                 let deps: Vec<u32> = (0..id).filter(|_| random.one_in(4)).collect();
                 let key = random.one_in(2).then(|| key(random.below(6) as u8));
-                node(id, &deps, Pool::Work, random.below(10), key, 0)
+                node(id, &deps, Pool::Work, random.below(10), key)
             })
             .collect();
         let mut fresh = Plane::new(config(2, 3)).unwrap();
@@ -2132,17 +1799,6 @@ fn an_idle_request_runs_only_on_what_no_other_can_use() {
     assert_eq!(runs(&add(&mut plane, 1, vec![work(1, &[], 1)])), [1]);
     let out = add(&mut plane, 2, (10..13).map(|id| work(id, &[], 1)).collect());
     assert_eq!(runs(&out), [10, 11]);
-
-    // With a budget, it starts while the task not idle that is ready does not fit.
-    let mut plane = Plane::new(PlaneConfig { budget: budget(10), ..config(1, 2) }).unwrap();
-    open(&mut plane, 1, 1, true);
-    open_as(&mut plane, 2, 1, true, true);
-    let ahead = vec![node(1, &[], Pool::Work, 1, None, 6), node(2, &[], Pool::Work, 1, None, 6)];
-    assert_eq!(runs(&add(&mut plane, 1, ahead)), [1]);
-    let out = add(&mut plane, 2, vec![node(10, &[], Pool::Work, 1, None, 3)]);
-    assert_eq!(runs(&out), [10]);
-    assert!(yields(&out).is_empty(), "giving way would not let 2 fit");
-    assert_eq!(runs(&built(&mut plane, 1)), [2]);
 }
 
 /// A promoted request takes its share from the plane's virtual time on, as a request that
@@ -2179,10 +1835,10 @@ fn a_promoted_request_takes_its_share() {
     assert!(plane.step(over).unwrap().is_empty());
 }
 
-/// A task not idle that waits only for the thread or the memory of running idle tasks has
-/// the newest of them asked to give way, once, and as few as it takes; given way, the idle
-/// task's node is ready again and the thread is the other's. One that ends before it gives
-/// way frees what it held as ever.
+/// A task not idle that waits only for the thread of running idle tasks has the newest of
+/// them asked to give way, once, and as few as it takes; given way, the idle task's node is
+/// ready again and the thread is the other's. One that ends before it gives way frees its
+/// thread as ever.
 #[test]
 fn a_yield_frees_the_thread_for_the_foreground() {
     let mut plane = Plane::new(config(1, 1)).unwrap();
@@ -2192,8 +1848,9 @@ fn a_yield_frees_the_thread_for_the_foreground() {
     let out = add(&mut plane, 1, vec![work(1, &[], 1)]);
     assert!(runs(&out).is_empty());
     assert_eq!(yields(&out), [10]);
-    let held = plane.step(PlaneInput::Held { at_ns: 0, bytes: 0 }).unwrap();
-    assert!(yields(&held).is_empty(), "asked once");
+    // Any step dispatches again; one that changes nothing asks no one again.
+    let unknown = PlaneInput::Promote { at_ns: 0, request: RequestId(99) };
+    assert!(yields(&plane.step(unknown).unwrap()).is_empty(), "asked once");
     let not_running = PlaneInput::Yielded { at_ns: 1, id: NodeId(11) };
     assert_eq!(plane.step(not_running), Err(Error::NotRunning(NodeId(11))));
     let out = plane.step(PlaneInput::Yielded { at_ns: 1, id: NodeId(10) }).unwrap();
@@ -2202,16 +1859,14 @@ fn a_yield_frees_the_thread_for_the_foreground() {
     assert_eq!(plane.stats(RequestId(2)).unwrap().ran, 0);
     assert_eq!(runs(&built(&mut plane, 1)), [10]);
 
-    let mut plane = Plane::new(PlaneConfig { budget: budget(10), ..config(1, 2) }).unwrap();
+    let mut plane = Plane::new(config(1, 2)).unwrap();
     open_as(&mut plane, 2, 1, true, true);
-    let idle = vec![node(10, &[], Pool::Work, 1, None, 4), node(11, &[], Pool::Work, 1, None, 4)];
-    assert_eq!(runs(&add(&mut plane, 2, idle)), [10, 11]);
+    assert_eq!(runs(&add(&mut plane, 2, vec![work(10, &[], 1), work(11, &[], 1)])), [10, 11]);
     open(&mut plane, 1, 1, true);
-    let out = add(&mut plane, 1, vec![node(1, &[], Pool::Work, 1, None, 5)]);
-    assert_eq!(yields(&out), [11], "one frees the thread and enough memory");
+    let out = add(&mut plane, 1, vec![work(1, &[], 1)]);
+    assert_eq!(yields(&out), [11], "the newest, and one frees the thread");
     let out = built(&mut plane, 11);
     assert_eq!(runs(&out), [1]);
-    assert_eq!(plane.granted(), 9);
 }
 
 /// A node of a request not idle that joins an idle request's task not started makes it ready
@@ -2267,7 +1922,7 @@ fn a_busy_idle_request_does_not_delay_the_foreground() {
     let mut beside = one_request(trace.config);
     open_as(&mut beside, 1, 4, true, true);
     let busy = (0..64u32)
-        .map(|at| node(BUSY + at, &[], if at % 3 == 0 { Pool::Io } else { Pool::Work }, 1, None, 0))
+        .map(|at| node(BUSY + at, &[], if at % 3 == 0 { Pool::Io } else { Pool::Work }, 1, None))
         .collect();
     let first = add(&mut beside, 1, busy);
     assert_eq!(runs(&first).len(), trace.config.io + trace.config.work, "every thread is busy");

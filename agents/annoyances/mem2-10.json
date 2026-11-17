@@ -1,0 +1,11 @@
+{
+ "id": "mem2-10",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+ "where": "blaze-cargo under cargo",
+ "what": "`#![blaze::sans_io]` at the top of a module file does not compile in blaze-cargo under cargo (custom inner attributes are unstable; blaze-query enables the feature, blaze-cargo does not).",
+ "cost": "one failed build",
+ "cause": "the feature gate is per crate",
+ "workaround": "`#[blaze::sans_io]` on the `mod` line",
+ "state": "open"
+}

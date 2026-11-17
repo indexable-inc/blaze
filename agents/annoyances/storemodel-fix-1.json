@@ -1,0 +1,20 @@
+{
+ "id": "storemodel-fix-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane storemodel-fix",
+ "where": "crates/blaze-storemodel (the model checker of the store and kernel protocol), crates/blaze-storemodel/src/fs.rs",
+ "what": "`cargo test -p blaze-storemodel` on the Mac: 1 pass, 10 fail, 3 ignored. Every failing test stopped at its first step, before exploring anything: `the crash model has no rule for WriteUnsynced { file: \"store/.shares-blocks\" .. }`. The store's open had begun to try one clone in its own directory (lane storegc, to decide PlaceBy on ext4 and tmpfs), which asks WriteUnsynced and Clone; the model's file system had a rule for neither. Reading on, it had none for Barrier either, which a commit asks of its packs and checks in place of a sync, nor for seven more file effects blaze-cas can ask (WriteBack, RenameUnsynced, Prewarm, Seal, Lstat, List, Entries). So the model's properties (what is kept survives any crash, a restore serves only what a writer fully wrote, two values under one identity are refused, every wait ends) were checked by nothing while the store's commit and open changed under them.",
+ "cost": "not measured how many days the checker was dark (I run no git in this lane); this lane's work to bring it back: the rules, a scenario of the open, and the tests of the rules",
+ "cause": "the model's rule for an effect it did not know was a panic at run time in a crate whose tests nothing ran after a change to the crate it checks",
+ "whys": [
+  "the tests failed at their first step: the model's `match` over `Effect` ended in `other => panic!(\"no rule\")`",
+  "the store began to ask effects the model had no rule for: the lane that changed blaze-cas ran blaze-cas's tests, not those of the crate that model-checks blaze-cas",
+  "nothing says which crates check a crate: blaze-storemodel is named in no workflow, no `harness/ci.py` line and (until this lane) no row of docs/harness.md; its only gate is being a member of the workspace under `harness/unittests.py`, and objective D10's check (`run blaze-storemodel as a check with a planted bug`) is still to write",
+  "a missing rule was found at run time, by whoever ran the model, not at compile time, by whoever added or began to use the effect",
+  "the `match` had a catch-all arm, so the compiler could not say that `Effect` had grown past the model"
+ ],
+ "class": "a checker that stopped checking: a proof whose harness fails or passes without exercising what it proves, and nobody is told (A39, vacuous success, from the failing side: red that no one reads)",
+ "prevention": "built here: `Files::change` in crates/blaze-storemodel/src/fs.rs names every variant of `blaze_core::Effect` with no catch-all, so an effect added to blaze-core does not compile (`cargo check --workspace`, which every lane's tree passes) until it has a rule or is listed as having none; every file effect blaze-cas asks today has a rule; the open has a scenario of its own that fails unless the search saw a crash leave each file the open's try makes; docs/harness.md's store table and the design doc say which changes run it. Not built (the main agent's, shared files): D10's check, a `harness/ci.py` line that runs `-p blaze-storemodel` and fails when a test's `executions` or `crash states checked` is 0, and a rule that a lane's check list includes the crates that depend on what it changed (reverse dependencies of the crate, from `cargo metadata`), not only the crate itself",
+ "workaround": "after any change under crates/blaze-cas, crates/blaze-kernel, crates/blaze-record or to `blaze_core::Effect`: `cargo test -p blaze-storemodel`",
+ "state": "fixed in the tree for the effect class; open for the gate (D10, for the main agent)"
+}

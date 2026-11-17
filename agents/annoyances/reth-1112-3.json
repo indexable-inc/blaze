@@ -1,0 +1,20 @@
+{
+ "id": "reth-1112-3",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane reth-1112",
+ "where": "blaze: a proc-macro crate built as two units (Lowered::macros)",
+ "what": "A proc-macro crate that a build plans twice (two profiles: `misses` cause `twice`, key parts `plan` and `profile` differ; 22 of reth's units) is one crate in the front end, and each unit gave the crate its expanders as it ended: the crate had the module of whichever unit ended last, `ProcMacros` was written once or twice in every build with nothing changed, and the order differed from build to build (events `a proc-macro crate's expanders loaded`: runs 2d62a1037d and 438aa907e9 in turn).",
+ "cost": "found only after the first fix left one write per build on a three-crate fixture",
+ "cause": "two values (two modules) under one key (the front end's crate), the last writer winning",
+ "whys": [
+  "why written: the crate's expanders were replaced each build",
+  "why: two units load two modules for one crate",
+  "why two: the plan builds the crate under two profiles and the front end has one crate per package target",
+  "why undetected: nothing refuses a second, different value for a crate's expanders in one build (rule keys-cover-every-input)",
+  "property: a front-end input keyed by crate is fed by units keyed by crate and profile"
+ ],
+ "class": "two values under one key decided by timing: an input whose writers are more finely keyed than it is",
+ "prevention": "built (6fd7961cf9): `ProcMacroExpander::replaces`: the same code built into another module replaces the held one only when its module is the lesser, so the crate's expanders are a function of the build. Not built: the same for a build script's run classes is there already (`applies_for_class`); a general refusal when two units of one build give one crate different inputs is open",
+ "fix": "6fd7961cf9: the fixture's third build writes 0 inputs, runs 0 rows",
+ "state": "fixed 6fd7961cf9"
+}

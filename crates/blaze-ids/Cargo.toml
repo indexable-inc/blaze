@@ -27,8 +27,8 @@ thin-vec.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+blaze-sim.workspace = true
 postcard.workspace = true
-hegeltest.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(blaze_check)'.dependencies]

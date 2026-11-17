@@ -1,0 +1,32 @@
+about = "A build of an unchanged tree writes no input of the query engine, makes no unit and keeps every record, whatever the tree holds: here a proc macro (whose expanders every build loads again) that asks the database where its input's spans are (the join of two items' spans, a line), on a struct a `macro_rules!` made. Until 2026-11-12 each load of a proc macro's expanders wrote the map of every crate's macros at HIGH (a build of reth with nothing changed wrote 53 inputs and verified 23 million rows), and a unit whose expansion asked such a question was made again in every build, its record never kept (46 units of reth). The first build after the cold one is not held to it: a proc-macro crate the store has not seen before reports its expansions' reads unknown, so the units that call it are made twice (rev2's known). The controls are where the causes are: blaze-query's `the_oracle_catches_an_equal_set_that_opens_a_view`, hir-def's `the_oracle_catches_a_crate_given_the_macros_it_has_as_a_change` and blaze-macro-eval's `a_question_no_key_covers_is_the_one_an_expansion_is_said_to_have_asked`."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+args = ["-p", "app"]
+prints = "4 4\n"
+
+[[revision]]
+steps = []
+action = "run"
+args = ["-p", "app"]
+prints = "4 4\n"
+max_units = 0
+max_unkept = 0
+
+[revision.known]
+max_units = "the first build after a cold one makes again the units that call a proc macro the store had not seen (its verdict is Unseen in the cold build, so its expansions' reads are not known and those units' records are not kept: `blaze why` step `unit record`); 2 here, 217 of reth's (2026-11-12)"
+
+[[revision]]
+steps = []
+action = "run"
+args = ["-p", "app"]
+prints = "4 4\n"
+redone = []
+max_units = 0
+max_records = 0
+max_unkept = 0
+max_written = 0
+max_executed = 200
+max_verified = 2000
+link = "none"

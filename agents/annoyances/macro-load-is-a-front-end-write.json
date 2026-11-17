@@ -1,0 +1,14 @@
+{
+ "id": "macro-load-is-a-front-end-write",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane: crates/blaze-expansion, int-1113",
+ "where": "crates/hir-expand/src/proc_macro.rs (ProcMacros::give(&mut Db, ..)); crates/blaze-cargo/src/serve/unit.rs (macros); crates/blaze-cargo/src/serve/job.rs (Ask::Macros); crates/proc-macro-api/src/kept/verdict.rs",
+ "what": "Loading a proc macro's compiled module is a write into the front end's database, so it waits for and cancels every reader in flight, whether or not it uses that macro; the outside audit of 2026-11-13 ties the `blaze check --workspace` stall at 920 of 3,406 units to it. Separately, a call's kept result is trusted by a per-module Verdict (Unseen/Stateless/Settles/Stateful) guessed from behaviour, not by a key that names the state the call starts from.",
+ "cost": "every macro crate that finishes compiling stops the whole front end once; a stateful macro's kept output is right only while the verdict's guess holds",
+ "cause": "the expander table is an input of the database, set when a module appears, instead of a record the call reads by a key known before the module exists; and a call's key leaves out the expander's starting state",
+ "class": "late-arriving work products installed by mutating shared state that unrelated readers depend on, and cache keys that leave out an input the value depends on (state carried between calls)",
+ "prevention": "the module is a record keyed by its crate's unit key and reached through one seam (blaze_expansion::modules::Modules) that parks only its users; the call's key holds StateIn, and a stateful module's calls are chained in source order (blaze_expansion::chain)",
+ "workaround": "none in this lane: the crate is written, the wiring is another lane's",
+ "fix": "crates/blaze-expansion (records, machine, seam, chain, with simulations whose plants include the global write and state carried across calls); wiring not yet",
+ "state": "open"
+}

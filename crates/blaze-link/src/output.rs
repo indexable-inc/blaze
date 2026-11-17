@@ -86,6 +86,10 @@ pub struct LinkArgs {
     pub undefined: Undefined,
     /// ELF `-z nodelete` of a shared library: `DF_1_NODELETE`, never unloaded.
     pub nodelete: bool,
+    /// ELF `--export-dynamic-symbol PATTERN` of an executable, each pattern once in the order
+    /// given: every name the image defines that one matches ([`crate::args::glob`]) is
+    /// exported, and kept for it (`Stage::export_for_libraries`).
+    pub export_dynamic: Vec<String>,
 }
 
 /// What a symbol nothing on the link line defines becomes.

@@ -38,7 +38,7 @@ use std::sync::LazyLock;
 
 use base_db::{Crate, Db, LangCrateOrigin};
 use blaze_hash::{FixedState, HashMap, HashSet};
-use blaze_query::db::{AsId, FromId};
+use blaze_memo::Id as _;
 use cranelift_codegen::ir::{InstBuilder, Value, types};
 use hir_def::{
     AdtId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, HasModule, ItemContainerId, Lookup,
@@ -87,14 +87,14 @@ fn is_codec(db: &Db, func: FunctionId) -> bool {
 
 /// The closure that `#[blaze::cache]` put the body of `func` in, when it is a cached
 /// function: the one it asks for the code of.
-pub(super) fn cached_closure(db: &Db, func: FunctionId) -> Option<blaze_query::db::Id> {
+pub(super) fn cached_closure(db: &Db, func: FunctionId) -> Option<blaze_memo::Gid> {
     if !hir_ty::fn_cache::uses_fn_cache(db, func.krate(db)) {
         return None;
     }
-    cached_closure_of(db, func).map(|it| it.as_id())
+    cached_closure_of(db, func).map(|it| it.gid())
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 fn cached_closure_of<'db>(db: &'db Db, func: FunctionId) -> Option<InternedClosureId<'db>> {
     let body = db.mir_body(func.into()).ok()?;
     body.basic_blocks.iter().find_map(|(_, block)| {
@@ -152,7 +152,7 @@ impl std::fmt::Display for Uncompiled {
 
 /// The hash of the code of the closure a cached function keeps its body in and of all it
 /// reaches, or why the function can't be cached.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(super) fn cache_code(
     db: &Db,
     closure: Instance,
@@ -235,7 +235,7 @@ pub(super) fn written_code<'db>(
 ) -> Option<&'db std::result::Result<u128, Uncached>> {
     let id = (*cached_closure_of(db, func))?;
     let closure = Instance {
-        def: InstanceDef::Closure(id.as_id()),
+        def: InstanceDef::Closure(id.gid()),
         args: instance.args,
         checked: instance.checked,
     };
@@ -405,7 +405,7 @@ impl Kind {
 pub(super) fn cached_name(db: &Db, closure: &Instance) -> String {
     // alloc: the text the cached function is given, or its error, once a cached function
     let InstanceDef::Closure(id) = closure.def else { return "?".to_owned() };
-    match InternedClosureId::from_id(id).loc(db).owner {
+    match InternedClosureId::from_gid(id).loc(db).owner {
         InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => {
             function_name(db, func, closure.args.as_ref())
         }
@@ -720,7 +720,7 @@ impl<'db> Walk<'db> {
                                 self.look_into(at, InferBodyId::DefWithBodyId(func.into()), None)
                             }
                             InstanceDef::Closure(id) => {
-                                let closure = InternedClosureId::from_id(id);
+                                let closure = InternedClosureId::from_gid(id);
                                 self.look_into(at, closure.loc(db).owner, Some(closure));
                             }
                             _ => {}
@@ -770,10 +770,10 @@ impl<'db> Walk<'db> {
             Node::Instance(instance, _) => match instance.def {
                 InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => func.krate(db),
                 InstanceDef::Closure(id) => {
-                    InternedClosureId::from_id(id).loc(db).owner.module(db).krate(db)
+                    InternedClosureId::from_gid(id).loc(db).owner.module(db).krate(db)
                 }
                 InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
-                    InternedCoroutineId::from_id(id).loc(db).owner.module(db).krate(db)
+                    InternedCoroutineId::from_gid(id).loc(db).owner.module(db).krate(db)
                 }
                 _ => return false,
             },
@@ -833,7 +833,6 @@ impl<'db> Walk<'db> {
                 | DataRequest::Vtable { .. }
                 | DataRequest::Location(_)
                 | DataRequest::Declaration(_)
-                | DataRequest::FilePath(_)
                 | DataRequest::Text(_) => {}
             }
         }
@@ -858,6 +857,11 @@ impl<'db> Walk<'db> {
 
     /// Looks through the MIR of code of the workspace for what its machine code does not
     /// tell: a raw pointer dereferenced, or an address taken as a number.
+    #[expect(
+        blaze::reads_positions,
+        reason = "the cache's purity walk keeps the reason a function is impure worded with where it is: keep \
+                  the span, and word the place where the reason is shown"
+    )]
     fn look_into(
         &mut self,
         at: u32,
@@ -977,6 +981,11 @@ impl<'db> Walk<'db> {
         told
     }
 
+    #[expect(
+        blaze::reads_positions,
+        reason = "the cache's purity walk words where a call site is inside its own run: keep the site, and word \
+                  the place where the reason is shown"
+    )]
     fn site_location(&self, at: u32, site: Site) -> Option<String> {
         let db = self.db;
         let body = match &self.nodes[at as usize].node {
@@ -984,7 +993,7 @@ impl<'db> Walk<'db> {
             Node::Instance(instance, _) => match instance.def {
                 InstanceDef::Fn(func) => db.mir_body(func.into()).ok()?,
                 InstanceDef::Closure(id) => {
-                    db.mir_body_for_closure(InternedClosureId::from_id(id)).ok()?
+                    db.mir_body_for_closure(InternedClosureId::from_gid(id)).ok()?
                 }
                 _ => return None,
             },
@@ -1342,7 +1351,7 @@ fn describe(db: &Db, node: &Node) -> String {
                     push(&["`", function_name(db, func, args).as_str(), "`"])
                 }
                 InstanceDef::Closure(id) => {
-                    let at = InternedClosureId::from_id(id).loc(db);
+                    let at = InternedClosureId::from_gid(id).loc(db);
                     match at.owner {
                         InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func))
                             if cached_closure(db, func) == Some(id) =>
@@ -1373,6 +1382,7 @@ fn describe(db: &Db, node: &Node) -> String {
 }
 
 /// File, line and column of a place in a body, the file relative to the workspace.
+#[blaze::renders_positions]
 pub(super) fn location(db: &Db, owner: InferBodyId<'_>, span: MirSpan) -> Option<String> {
     let owner = match owner {
         InferBodyId::DefWithBodyId(owner) => owner,
@@ -1699,7 +1709,7 @@ impl<'db> FunctionCx<'_, 'db> {
         let parent = GenericArgs::new_from_slice(args.as_closure().parent_args());
         let parent = super::erase_regions(self.interner, parent);
         let closure = Instance {
-            def: InstanceDef::Closure(id.0.as_id()),
+            def: InstanceDef::Closure(id.0.gid()),
             args: parent.store(),
             checked: self.cg.checked,
         };

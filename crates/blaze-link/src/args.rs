@@ -128,6 +128,10 @@ pub enum LinkOption {
     Name(String),
     /// ELF `-z nodelete` of a shared library.
     NoDelete,
+    /// ELF `--export-dynamic-symbol PATTERN` of an executable: each name the image defines
+    /// that the pattern matches ([`glob`]) is in its dynamic symbol table, for `dlsym` and
+    /// the libraries it loads.
+    ExportDynamic(String),
     /// What blaze's linker does to every image anyway, and why that is the option.
     Already(&'static str),
     /// What asks nothing of the image blaze writes, and why.
@@ -172,8 +176,9 @@ mod why {
                                    yet (`LC_LOAD_WEAK_DYLIB`, `LC_REEXPORT_DYLIB`)";
     pub(super) const EXPORT_DYNAMIC: &str = "blaze's linker exports from an executable only the \
                                              symbols a shared library it links also defines or \
-                                             refers to (ELF), and a shared library exports what \
-                                             its crate exports";
+                                             refers to and those `--export-dynamic-symbol` \
+                                             names (ELF), and a shared library exports what its \
+                                             crate exports";
     pub(super) const SCRIPT: &str = "blaze's linker reads only the linker scripts system libraries \
                                      ship (`GROUP`, `INPUT`, `AS_NEEDED`), not a layout script";
     pub(super) const STATIC: &str = "blaze links a dynamic, position-independent image with the C \
@@ -223,6 +228,9 @@ mod reason {
                                    writes its own";
     pub(super) const WARNINGS: &str = "it only silences ld64's warnings";
     pub(super) const NOT_UNLOADED: &str = "an executable is never unloaded";
+    pub(super) const SHARED_EXPORTS: &str = "it adds to an executable's dynamic symbol table; a \
+                                             shared library's holds what its crate exports, as \
+                                             the version script rustc links one with decides";
 }
 
 /// One word of the linker's command line: its text, the argument it came from, and whether
@@ -552,6 +560,7 @@ fn gnu(word: Word<'_>, value: Option<&str>, kind: Kind) -> Read {
         "-pie" | "--pie" => (LinkOption::Already(reason::PIE), 0),
         "-O0" | "-O1" | "-O2" if !word.driver => (LinkOption::NoEffect(reason::LD_O), 0),
         "--export-dynamic" | "-E" | "-export-dynamic" => return Err(why::EXPORT_DYNAMIC),
+        "--export-dynamic-symbol" | "-export-dynamic-symbol" => (export_dynamic(next()?, kind)?, 1),
         "-static" | "-Bstatic" | "--no-dynamic-linker" | "-no-pie" | "--no-pie" => {
             return Err(why::STATIC);
         }
@@ -590,6 +599,12 @@ fn gnu(word: Word<'_>, value: Option<&str>, kind: Kind) -> Read {
                     };
                 }
             }
+            for prefix in ["--export-dynamic-symbol=", "-export-dynamic-symbol="] {
+                if let Some(pattern) = text.strip_prefix(prefix) {
+                    return Ok((export_dynamic(pattern, kind)?, 0));
+                }
+            }
+            // `--export-dynamic-symbol-list FILE` too: a file of patterns, which is not read.
             if ["--version-script", "--export-dynamic-symbol", "--dynamic-list"]
                 .iter()
                 .any(|it| text.starts_with(it))
@@ -605,6 +620,89 @@ fn gnu(word: Word<'_>, value: Option<&str>, kind: Kind) -> Read {
             return Err(why::UNKNOWN);
         }
     })
+}
+
+/// GNU ld's and lld's `--export-dynamic-symbol PATTERN`.
+fn export_dynamic(pattern: &str, kind: Kind) -> Result<LinkOption, &'static str> {
+    if pattern.is_empty() {
+        return Err(why::NO_VALUE);
+    }
+    Ok(match kind {
+        // alloc: the pattern the output owns
+        Kind::Executable => LinkOption::ExportDynamic(pattern.to_owned()),
+        Kind::Shared => LinkOption::NoEffect(reason::SHARED_EXPORTS),
+    })
+}
+
+/// Whether `name` matches `pattern` as GNU ld and lld match a symbol pattern (`fnmatch`
+/// without flags): `*` is any run of bytes, `?` any one, `[...]` one of a set (`a-z` a
+/// range, a leading `!` or `^` the bytes not in it, a `]` first is itself), `\` takes the
+/// next byte as itself, and any other byte is itself. A `[` with no `]` is itself.
+pub fn glob(pattern: &str, name: &str) -> bool {
+    let (pattern, name) = (pattern.as_bytes(), name.as_bytes());
+    // Where the last `*` was, and how much of the name it has taken: a mismatch after it
+    // gives it one byte more. Linear in the name for each star, no recursion.
+    let (mut p, mut n) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        let step = match pattern.get(p) {
+            Some(b'*') => {
+                star = Some((p, n));
+                p += 1;
+                continue;
+            }
+            Some(b'?') => Some(p + 1),
+            Some(b'[') => match set(&pattern[p..], name[n]) {
+                Some((true, len)) => Some(p + len),
+                Some((false, _)) => None,
+                None => (name[n] == b'[').then_some(p + 1),
+            },
+            Some(b'\\') if p + 1 < pattern.len() => (pattern[p + 1] == name[n]).then_some(p + 2),
+            Some(&byte) => (byte == name[n]).then_some(p + 1),
+            None => None,
+        };
+        match (step, star) {
+            (Some(next), _) => {
+                p = next;
+                n += 1;
+            }
+            (None, Some((at, taken))) => {
+                star = Some((at, taken + 1));
+                p = at + 1;
+                n = taken + 1;
+            }
+            (None, None) => return false,
+        }
+    }
+    pattern[p..].iter().all(|&it| it == b'*')
+}
+
+/// Of a pattern at its `[`: whether the set holds `byte`, and the set's length with its
+/// brackets; `None` when no `]` closes it.
+fn set(pattern: &[u8], byte: u8) -> Option<(bool, usize)> {
+    let mut at = 1;
+    let negated = matches!(pattern.get(at), Some(b'!' | b'^'));
+    if negated {
+        at += 1;
+    }
+    let first = at;
+    let mut holds = false;
+    loop {
+        let low = *pattern.get(at)?;
+        if low == b']' && at > first {
+            return Some((holds != negated, at + 1));
+        }
+        match (pattern.get(at + 1), pattern.get(at + 2)) {
+            (Some(b'-'), Some(&high)) if high != b']' => {
+                holds |= (low..=high).contains(&byte);
+                at += 3;
+            }
+            _ => {
+                holds |= low == byte;
+                at += 1;
+            }
+        }
+    }
 }
 
 /// GNU ld's and lld's `-z KEYWORD`.
@@ -699,6 +797,11 @@ pub fn apply(
                 }
             }
             LinkOption::NoDelete => output.link.nodelete = true,
+            LinkOption::ExportDynamic(pattern) => {
+                if !output.link.export_dynamic.contains(&pattern) {
+                    output.link.export_dynamic.push(pattern);
+                }
+            }
             LinkOption::Already(_) | LinkOption::NoEffect(_) => {}
         }
     }

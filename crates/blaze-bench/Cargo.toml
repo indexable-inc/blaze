@@ -14,11 +14,12 @@ blaze-rng.workspace = true
 
 [dev-dependencies]
 blaze-cas.workspace = true
-blaze-codegen.workspace = true
+blaze-core.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
+blaze-mem.workspace = true
+blaze-memo.workspace = true
 blaze-profile.workspace = true
-blaze-query.workspace = true
 tracing.workspace = true
 
 [[bench]]
@@ -27,10 +28,6 @@ harness = false
 
 [[bench]]
 name = "query_hit"
-harness = false
-
-[[bench]]
-name = "dedupe"
 harness = false
 
 [[bench]]

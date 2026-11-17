@@ -1,0 +1,30 @@
+[package]
+name = "blaze-launch-rt"
+description = "blaze's launcher under the `edit` goal (docs/v2/plan/design/launcher.md), step 2: the drivers of blaze-launch's core. A real code area (macOS `MAP_JIT`, Linux a memfd mapped twice), the slot words, gates and lazy stubs as machine code, a thread's epoch report at a safepoint, and the control thread that speaks the patch protocol over a Unix socket"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# On `std`, not bstd: blaze-launch's src/lib.rs says why and when that changes.
+[dependencies]
+blaze-launch.workspace = true
+# The one channel (rule standard-structures): what threads tell the control thread.
+crossbeam-channel.workspace = true
+# The one queue (rule standard-structures): what threads say to the control thread.
+crossbeam-queue.workspace = true
+# A record's id is the BLAKE3 hash of its bytes: checked when the daemon gives one.
+blake3.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

@@ -22,16 +22,24 @@ pub struct Handle {
     writer: blaze_core::lock::Lock<Writer>,
     /// The driver's root, which the store's file names are under.
     root: PathBuf,
+    /// The store's own directory under `root` ([`Store::dir`]): what tells a layer's store
+    /// from the home's when both share a driver.
+    dir: FileName,
 }
 
 static INSTALLED: OnceLock<Handle> = OnceLock::new();
+
+/// The machine's layer's handle (handoff-7A section 3): the store every home opens as a
+/// layer below its own (`Config::layers`), written by the daemon that made it.
+static LAYER: OnceLock<Handle> = OnceLock::new();
 
 impl Handle {
     /// A handle on `store`, which must be open, whose driver's root is `root`.
     #[expect(clippy::disallowed_types, reason = "makes `Handle::writer`, which allows it")]
     pub fn new(store: &mut Store, root: PathBuf) -> Handle {
         let writer = blaze_core::lock::Lock::new("cas.handle.writer", store.writer());
-        Handle { reader: store.reader(), writer, root }
+        // clone: once a handle, a name
+        Handle { reader: store.reader(), writer, root, dir: store.dir().clone() }
     }
 
     /// Makes `handle` the process's, for [`Handle::installed`]. A process has one store, so a
@@ -52,6 +60,59 @@ impl Handle {
     /// (a test, a fuzz target, a tool run without the daemon).
     pub fn installed() -> Option<&'static Handle> {
         INSTALLED.get()
+    }
+
+    /// Makes `handle`, on the machine's layer (the store each home opens below its own), the
+    /// process's, for [`Handle::layer`]: what a sealed crate built in a home, and a pack
+    /// fetched on a miss for one, is put through, so every home reads it. The same contract
+    /// as [`Handle::install`]: one a process, a second refused naming the first's root, and
+    /// never the home's own store (refused naming both).
+    ///
+    /// The home's store reads the layer live from then on ([`Store::read_live`]): what is
+    /// put through the layer's handle is found by the home's readers in the same build, so
+    /// a sealed crate's records and outputs are put into the layer alone. The home is
+    /// installed first; a layer with no home to read it is refused.
+    pub fn install_layer(handle: Handle) -> Result<&'static Handle, String> {
+        let Some(home) = INSTALLED.get() else {
+            // alloc: the error of a layer installed before its home
+            return Err(format!(
+                "the layer {} under {} is installed before the process's home store, which reads it live: install the home first",
+                handle.dir.as_str(),
+                handle.root.display()
+            ));
+        };
+        if home.root == handle.root && home.dir == handle.dir {
+            // alloc: the error of a layer that is the home's store
+            return Err(format!(
+                "the layer {} under {} is the home's own store: a layer is another store, which every home reads",
+                handle.dir.as_str(),
+                handle.root.display()
+            ));
+        }
+        if let Some(installed) = LAYER.get() {
+            // alloc: the error of a second layer in one process
+            return Err(format!(
+                "the process has a layer's store already, under {}",
+                installed.root.display()
+            ));
+        }
+        home.reader.shared.read_live(&handle.reader.shared)?;
+        let mut given = Some(handle);
+        let installed = LAYER.get_or_init(|| given.take().expect("taken only here"));
+        match given {
+            None => Ok(installed),
+            // alloc: the error of a second layer in one process
+            Some(_) => Err(format!(
+                "the process has a layer's store already, under {}",
+                installed.root.display()
+            )),
+        }
+    }
+
+    /// The machine's layer's handle, once the daemon has installed one ([`Handle::install_layer`]);
+    /// none in a process with no layer.
+    pub fn layer() -> Option<&'static Handle> {
+        LAYER.get()
     }
 
     pub fn reader(&self) -> &Reader {

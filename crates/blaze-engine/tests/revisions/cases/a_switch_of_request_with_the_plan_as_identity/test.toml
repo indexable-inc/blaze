@@ -1,0 +1,21 @@
+about = "The control of `switches_of_request_are_no_ops` (test-the-cause): with the planted bug `BLAZE_FRONT_END_PER_PLAN=1`, the plan's units are the kept front end's identity again, so the build after a test lets the front end go and lowers the workspace anew, and misses the bound that case holds. The miss is listed as known: when it stops failing, the bound no longer rests on the front end keeping its crate graph, and this case fails."
+drivers = ["real"]
+
+[[revision]]
+action = "build"
+env = { BLAZE_FRONT_END_PER_PLAN = "1" }
+
+[[revision]]
+steps = []
+action = "test"
+says = ["test tests::f_adds_one ... ok"]
+
+[[revision]]
+steps = []
+action = "build"
+redone = []
+max_units = 0
+max_executed = 2000
+
+[revision.known]
+max_executed = "the control: the planted bug makes the plan the front end's identity, so this build lowers the workspace again (618,000 to 820,000 engine memos measured 2026-11-12)"

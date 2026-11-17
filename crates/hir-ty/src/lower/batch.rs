@@ -12,7 +12,7 @@ use std::alloc::Allocator;
 use base_db::{Crate, Db};
 use blaze_ids::radix;
 use blaze_mem::Frame;
-use blaze_query::db::AsId;
+use blaze_memo::Id as _;
 use hir_def::{AdtId, ImplId, ModuleDefId, ModuleId, VariantId, nameres::crate_def_map};
 
 use crate::{
@@ -37,6 +37,11 @@ use crate::{
 /// allocations per item. A workspace crate is edited, so its items keep a query each. An edited
 /// path dependency is a library too: it recomputes its batch, a crate's worth of signatures, on
 /// each edit of one of them.
+///
+/// A variant's field types are read through a query of the variant that copies its row out
+/// (`lower::batched_field_types`), so a reader depends on that row alone and the item store
+/// keeps a body that read it under the variant's ADT, not the crate: one memo per variant
+/// read, not per variant of the crate.
 pub(crate) fn batched_crate(db: &Db, module: ModuleId) -> Option<Crate> {
     if module.block(db).is_some() {
         return None;
@@ -46,7 +51,7 @@ pub(crate) fn batched_crate(db: &Db, module: ModuleId) -> Option<Crate> {
 }
 
 /// The diagnostics and anonymous constants of the rows that have any, ascending by row.
-#[derive(Debug, Default, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct SideTable<'db> {
     pub(super) rows: Box<[u32]>,
     /// Where each of `rows` starts in `diagnostics`; it ends where the next starts.
@@ -142,7 +147,7 @@ fn exact<T>(items: &mut Vec<T, &Frame>) -> Box<[T]> {
 }
 
 /// One kind of signature of a crate's items: the items ascending, a value for each.
-#[derive(Debug, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Batch<'db, K, V> {
     pub(super) keys: Box<[K]>,
     pub(super) values: Box<[V]>,
@@ -236,7 +241,7 @@ impl<'db> CrateImplPredicates<'db> {
 
 /// The field types of every variant of a crate's modules: the structs, the unions and each
 /// variant of the enums, ascending, their fields one CSR list.
-#[derive(Debug, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct CrateFieldTypes<'db> {
     pub(super) variants: Box<[VariantId]>,
     /// The fields of `variants[i]` are `fields[starts[i]..starts[i + 1]]`: one more than
@@ -269,6 +274,11 @@ impl<'db> CrateFieldTypes<'db> {
 
     /// The batch of `lower` of each of `variants`, which are ascending and distinct.
     /// Each variant is lowered in a task of its own, as [`Batch::build`]'s items are.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "the batch's starts are u32 and a crate's fields are not bounded below 2^32 \
+                  before this: a larger crate needs a typed refusal"
+    )]
     pub(crate) fn build(
         variants: &[VariantId],
         frame: &Frame,
@@ -314,13 +324,14 @@ fn module_variants<A: Allocator>(db: &Db, krate: Crate, alloc: A) -> Vec<Variant
             }
         }
     }
+    // `gid_order` orders as the ids do, so this is `VariantId`'s order.
     radix::sort_copy_by_key(&mut variants, |&it| {
         let (kind, id) = match it {
-            VariantId::EnumVariantId(it) => (0, it.as_id()),
-            VariantId::StructId(it) => (1, it.as_id()),
-            VariantId::UnionId(it) => (2, it.as_id()),
+            VariantId::EnumVariantId(it) => (0, it.gid()),
+            VariantId::StructId(it) => (1, it.gid()),
+            VariantId::UnionId(it) => (2, it.gid()),
         };
-        radix::pack_32(kind, id.as_u32())
+        radix::pack_64(kind, gid_order(id))
     });
     variants.dedup();
     variants
@@ -332,13 +343,21 @@ fn module_impls<A: Allocator>(db: &Db, krate: Crate, alloc: A) -> Vec<ImplId, A>
     for (_, module) in crate_def_map(db, krate).modules(db) {
         impls.extend(module.scope(db).impls());
     }
-    radix::sort_copy_by_key(&mut impls, |it| it.as_id().as_u32());
+    radix::sort_copy_by_key(&mut impls, |it| gid_order(it.gid()));
     impls.dedup();
     impls
 }
 
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-fn crate_field_types<'db>(db: &'db Db, krate: Crate) -> CrateFieldTypes<'db> {
+/// A sort key that orders as `Gid`'s `Ord` does (arena index, its generation, then the index
+/// in it): this process's order of ids, for a sort, never a persisted word.
+fn gid_order(id: blaze_memo::Gid) -> u64 {
+    let arena = id.arena();
+    let arena = (u64::from(arena.index()) << 12) | u64::from(arena.generation());
+    (arena << 32) | u64::from(id.local())
+}
+
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
+pub fn crate_field_types<'db>(db: &'db Db, krate: Crate) -> CrateFieldTypes<'db> {
     blaze_mem::frame::current(|frame| {
         let variants = module_variants(db, krate, frame);
         CrateFieldTypes::build(&variants, frame, |variant, item| {
@@ -356,8 +375,8 @@ fn crate_field_types<'db>(db: &'db Db, krate: Crate) -> CrateFieldTypes<'db> {
 /// said. Without one, a batch that is only a member of an outer cycle (it read a provisional
 /// row of a query below it on the stack, such as a type alias cycle, which reports its own
 /// E0391) keeps the self types it lowered instead of having them replaced.
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-fn crate_impl_self_tys<'db>(db: &'db Db, krate: Crate) -> CrateImplSelfTys<'db> {
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
+pub fn crate_impl_self_tys<'db>(db: &'db Db, krate: Crate) -> CrateImplSelfTys<'db> {
     blaze_mem::frame::current(|frame| {
         let impls = module_impls(db, krate, frame);
         Batch::build(&impls, frame, |impl_id, item| lower_impl_self_ty(db, impl_id, item))
@@ -373,8 +392,8 @@ fn crate_impl_self_tys<'db>(db: &'db Db, krate: Crate) -> CrateImplSelfTys<'db> 
 /// panics naming the cycle. A fallback here gave every impl of the
 /// crate no trait, so each trait impl looked inherent: its methods resolved as inherent
 /// methods and coherence never saw it.
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-fn crate_impl_traits<'db>(db: &'db Db, krate: Crate) -> CrateImplTraits<'db> {
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
+pub fn crate_impl_traits<'db>(db: &'db Db, krate: Crate) -> CrateImplTraits<'db> {
     let self_tys = CrateImplSelfTys::of(db, krate);
     blaze_mem::frame::current(|frame| {
         Batch::build(&self_tys.keys, frame, |impl_id, item| {
@@ -400,8 +419,8 @@ fn crate_impl_traits<'db>(db: &'db Db, krate: Crate) -> CrateImplTraits<'db> {
 /// also matters when the batch is only a member of an outer cycle (it read a provisional row of
 /// a query below it on the stack): a `cycle_result` would replace its value with the fallback,
 /// and the outer head finalizes that, while without one it keeps the predicates it lowered.
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-fn crate_impl_predicates<'db>(db: &'db Db, krate: Crate) -> CrateImplPredicates<'db> {
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
+pub fn crate_impl_predicates<'db>(db: &'db Db, krate: Crate) -> CrateImplPredicates<'db> {
     let self_tys = CrateImplSelfTys::of(db, krate);
     blaze_mem::frame::current(|frame| {
         Batch::build(&self_tys.keys, frame, |impl_id, item| {

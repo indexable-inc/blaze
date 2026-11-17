@@ -1,0 +1,14 @@
+{
+ "id": "int-1112-vfs-cache-dirs",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor, int-1112 VFS view lane",
+ "where": "crates/blaze-vfs/src/watch.rs (the watcher) and crates/blaze-cargo/src/serve/heads.rs (`excluded`, `Checkout::keeps`, removed)",
+ "what": "A daemon serving the blaze checkout died twice building crates/harness: its main thread stamped, read and hashed crates/harness/target (285,048 files, 45 GB) until the loop-stall guard (exit 76) or the memory ceiling (exit 77, 95 GiB) killed it; a controlled 4 GiB file panicked the main thread in journal.rs (`a record under 4 GiB`).",
+ "cost": "two dead daemons, every request on the checkout failed; a whole build directory read into the head",
+ "cause": "what is out of the view was a path rule in the driver (`target` at the root, `.git`), outside the watcher's core, so a target directory anywhere else was source; and nothing bounded a file's size before the journal framed it in 32 bits",
+ "class": "a rule about what a core may take in living in its driver as a path filter, so the core (and its reference and tests) never saw it; an input bound enforced by a panic at the far end instead of a refusal at the edge",
+ "prevention": "the rule's one home is crates/blaze-vfs/src/watch/view.rs (fixed names plus `CACHEDIR.TAG` at any depth), followed by the watcher and its reference and held by `a_cache_directory_is_out_of_the_view_and_comes_back_without_its_tag` with planted controls; a file over `MOST_FILE_BYTES` is `Watched::TooLarge` before any read (`a_file_over_the_bound_is_named_never_read_and_its_batch_commits`)",
+ "workaround": "none",
+ "fix": "written, not yet compiled (int-1112): view.rs, watch.rs, reference.rs, tests.rs, heads.rs, Sim::grow; then (round 2) `heads::excluded` deleted, its callers (job.rs `lock_ops`, job/written.rs, fetch/local.rs) on `blaze_vfs::watch::fixed_out`, and the name banned in .clippy.toml; the journal's last `a record under 4 GiB` expect is a typed refusal (`RecordTooLarge`, `CommitError::Record`) for a directory or head, and SEEN records split to fit; a commit the head refuses is `Watched::Refused`, and a watcher's reservation failure a `MemError` from `Watcher::new`",
+ "state": "open"
+}

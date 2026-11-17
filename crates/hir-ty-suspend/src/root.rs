@@ -5,6 +5,7 @@
 
 use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
 use blaze_hash::HashSet;
+use blaze_memo::Database as _;
 use hir_def::{
     AssocItemId, FunctionId, ModuleDefId, ModuleId, TraitId,
     nameres::{ModuleData, crate_def_map},
@@ -25,11 +26,11 @@ const LAYER: [&str; 2] = ["sched", "stack"];
 const ROOT: (&str, &str) = ("Yielder", "suspend");
 
 /// A crate graph's roots, or why one is missing.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Roots {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Roots<'db> {
     /// `Yielder::suspend` of each `blaze_graph` the graph has (one per version); empty when it
     /// has none, and then nothing is walked.
-    pub(crate) found: Box<[FunctionId]>,
+    pub(crate) found: &'db [FunctionId],
     /// A `blaze_graph` whose stack layer has no `Yielder::suspend`: an error, never an empty walk.
     pub(crate) missing: Option<MissingRoot>,
 }
@@ -76,9 +77,9 @@ impl MissingRoot {
 
 /// The roots of `krate`'s crate graph: the stack layer's `Yielder::suspend` of each
 /// `blaze_graph` the graph has.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn roots(db: &Db, krate: Crate) -> Roots {
-    let mut found = Vec::new(); // alloc: the roots, once per crate graph, one per blaze_graph
+#[blaze_memo::tracked(returns(ref))]
+pub(crate) fn roots<'db>(db: &'db Db, krate: Crate) -> Roots<'db> {
+    let mut found = Vec::new_in(Global);
     let mut seen = HashSet::new_in(Global);
     let mut stack = vec![krate]; // alloc: the walk of the crate graph, once per crate
     while let Some(at) = stack.pop() {
@@ -90,7 +91,7 @@ pub(crate) fn roots(db: &Db, krate: Crate) -> Roots {
                 Ok(suspend) => found.push(suspend),
                 Err(missing) => {
                     return Roots {
-                        found: Box::default(),
+                        found: &[],
                         missing: Some(MissingRoot { krate: at, missing }),
                     };
                 }
@@ -98,7 +99,7 @@ pub(crate) fn roots(db: &Db, krate: Crate) -> Roots {
         }
         stack.extend(at.data(db).dependencies.iter().map(|dep| dep.crate_id));
     }
-    Roots { found: found.into_boxed_slice(), missing: None }
+    Roots { found: blaze_memo::keep_slice(db.memo(), &found), missing: None }
 }
 
 fn is_named(db: &Db, krate: Crate, name: &str) -> bool {
@@ -133,8 +134,8 @@ fn inherent_method(
     };
     let name = Symbol::intern(method);
     let self_ty = SimplifiedType::Adt(SolverDefId::AdtId(adt));
-    InherentImpls::for_crate(db, krate)
-        .for_self_ty(&self_ty)
+    // The type's inherent impls alone, not the crate's whole table.
+    InherentImpls::in_crate_for_self_ty(db, krate, hir_ty::method_resolution::SelfTyKey(self_ty))
         .iter()
         .find_map(|&imp| {
             imp.impl_items(db).items.iter().find_map(|(it, item)| match *item {
@@ -146,7 +147,7 @@ fn inherent_method(
 }
 
 /// `core::marker::Send` of `krate`'s graph.
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 pub(crate) fn send_trait(db: &Db, krate: Crate) -> Option<TraitId> {
     let core = home_crate(db, krate, LangCrateOrigin::Core)?;
     let root = crate_def_map(db, core).root_module_id();

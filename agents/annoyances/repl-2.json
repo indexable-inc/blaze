@@ -1,0 +1,18 @@
+{
+ "id": "repl-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane repl-clean-1112",
+ "where": "crates/harness/mcp/src/typecheck.ts, first version in this lane",
+ "what": "The type checker's TypeScript process was started lazily by the first cell that needed a check, inside that cell's async context, so the cell owned it: cancelling that cell killed the checker and the next cell was refused with `the type checker failed (Connection is closed.)`. No test showed it; I saw `Killed: pid … (…/@typescript/…)` in a real stop's reply while reading replies by hand.",
+ "cost": "found by luck before anyone used it; fifteen minutes",
+ "cause": "ownership follows AsyncLocalStorage, and anything started lazily inherits the context of whoever touched it first",
+ "whys": [
+  "why possible: a process the kernel needs for its whole life was started on first use inside a cell",
+  "why not caught: every test started its checker outside a cell",
+  "property: 'whoever starts it owns it' applied to kernel-lifetime helpers"
+ ],
+ "class": "a kernel-lifetime resource created lazily in a cell's context is owned, and ended, by that cell",
+ "prevention": "tasks.ts `outsideTask(fn)` runs kernel-owned work in no cell; the checker starts through it and is warmed at kernel start; typecheck.test.ts admits a cell from inside a task on a fresh checker and asserts the task owns nothing (it fails, naming the pid, when outsideTask is removed)",
+ "fix": "done in this lane",
+ "state": "fixed on branch repl-clean-1112 (not merged)"
+}

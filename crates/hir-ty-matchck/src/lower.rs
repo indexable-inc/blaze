@@ -230,6 +230,10 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                         self.cx.has_deref_pat.set(true);
                         Constructor::DerefPattern(*lowered.ty())
                     }
+                    PatAdjust::UnionMember => {
+                        lowered = self.union_member_pat(pat, ty, lowered)?;
+                        continue;
+                    }
                 };
                 // alloc: the fields `DeconstructedPat::new` takes.
                 lowered = Self::new_pat(ctor, vec![lowered.at_index(0)], 1, ty, pat);
@@ -304,10 +308,12 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                 let variant_fields = variant.fields(db);
                 let arity = variant_fields.fields().len();
                 let mut fields = Vec::with_capacity(args.len());
+                // The body's contexts are of its crate's table.
+                let table = hir_ty::ctx_table(self.cx.krate);
                 for field in args {
                     let hygiene = self.body.record_field_hygiene(field.pat);
                     let fid = variant_fields
-                        .field_written(db, variant, &field.name, hygiene)
+                        .field_written(db, table, variant, &field.name, hygiene)
                         .ok_or(LowerError::Failed)?;
                     let idx = u32::from(fid.into_raw()) as usize;
                     fields.push(self.lower(field.pat)?.at_index(idx));
@@ -420,6 +426,41 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
             fields.push(self.lower(arg)?.at_index(idx));
         }
         Ok(fields)
+    }
+
+    /// blaze: `member`, a pattern of one member of the error union `union`
+    /// (`PatAdjust::UnionMember`), as the pattern of the union it stands for: core's
+    /// `ErrorUnion` struct around the variant of its `Repr` enum that holds the member
+    /// (`hir_ty::error_union`). So a `match` on a union is checked as the match on that enum
+    /// it is: exhaustive when every member is covered, and a missing member is a witness.
+    fn union_member_pat(
+        &self,
+        pat: PatId,
+        union: Ty<'db>,
+        member: Pat<'a, 'db>,
+    ) -> Result<Pat<'a, 'db>, LowerError> {
+        let interner = self.cx.infcx.interner;
+        let members = hir_ty::error_union::members(interner, union).ok_or(LowerError::Failed)?;
+        let at =
+            hir_ty::error_union::member_index(members, *member.ty()).ok_or(LowerError::Failed)?;
+        let TyKind::Adt(def, args) = union.kind() else { return Err(LowerError::Failed) };
+        let AdtId::StructId(of_union) = def.def_id() else { return Err(LowerError::Failed) };
+        let (_, repr) = self
+            .cx
+            .variant_fields(args, VariantId::StructId(of_union))
+            .next()
+            .ok_or(LowerError::Failed)?;
+        let variant = hir_ty::error_union::repr_variant(self.cx.db, repr, at)
+            .ok_or(LowerError::Failed)?;
+        // alloc: the one field `DeconstructedPat::new` takes, twice.
+        let held = self.variant_pat(
+            pat,
+            repr,
+            VariantId::EnumVariantId(variant),
+            vec![member.at_index(0)],
+            1,
+        )?;
+        self.variant_pat(pat, union, VariantId::StructId(of_union), vec![held.at_index(0)], 1)
     }
 
     fn variant_pat(

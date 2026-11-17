@@ -15,13 +15,12 @@ mod tests;
 use std::mem::{self, offset_of};
 
 use base_db::Db;
-use blaze_format::{
-    ALIGN, FormatError, Part, Placed, Record, SchemaHash, Slice, Writer, open_as, schema_of,
-};
+use blaze_format::{ALIGN, FormatError, Part, Placed, Record, SchemaHash, Slice, Writer, open_as};
 use blaze_ids::ContentId;
 use hir_def::{
     DefWithBodyId, ExpressionStoreOwnerId, HasModule,
     expr_store::Body,
+    expr_store::ExpressionStore,
     hir::{ClosureKind, CoroutineKind, CoroutineSource, Expr, ExprId, Movability},
 };
 use hir_expand::{
@@ -30,20 +29,22 @@ use hir_expand::{
 };
 
 use super::{
-    BodyFacts, INSTALLED, Lookup, Step,
+    BodyFacts, Lookup, REGISTRY, Reads, Step,
     infer::{Keyed, items_of},
     with_crate_attrs,
 };
+use rustc_type_ir::inherent::IntoKind;
+
 use crate::{
-    InferBodyId,
+    InferBodyId, InferenceResult,
     check_cache::ids::{self, Table},
-    db::{HirDatabase, InternedClosure},
+    db::{HirDatabase, InternedClosure, closure_exprs},
     mir::{
         MirBody, MirLowerError, MirOwner,
-        persist::{self, Locations},
+        persist::{self, Bounds, Locations},
     },
     next_solver::{
-        DbInterner,
+        DbInterner, TyKind,
         persist::{TABLE_SCHEMA, TyTableWriter},
     },
 };
@@ -57,37 +58,160 @@ type Built<'db> = Result<MirBody<'db>, MirLowerError<'db>>;
 /// A `concat!` of no location is kept as a slot too, which reads back as the same constant. The
 /// source map changes with every edit above the body, and only a body that calls one of these
 /// macros reads it.
-#[blaze_query::tracked(returns(deref), mem_tag = Mir)]
-pub fn location_literals(db: &Db, def: DefWithBodyId) -> Box<[ExprId]> {
+#[blaze_memo::tracked(returns(copy), mem_tag = Mir)]
+pub fn location_literals<'db>(db: &'db Db, def: DefWithBodyId) -> &'db [ExprId] {
     let body = Body::of(db, def);
-    let located = |kind: MacroDefKind| {
-        matches!(
-            kind,
-            MacroDefKind::BuiltIn(
-                _,
-                BuiltinFnLikeExpander::Line
-                    | BuiltinFnLikeExpander::Column
-                    | BuiltinFnLikeExpander::File
-                    | BuiltinFnLikeExpander::ModulePath
-            ) | MacroDefKind::BuiltInEager(_, EagerExpander::Concat)
-        )
-    };
-    if !body.macro_calls().iter().any(|call| located(call.loc(db).def.kind)) {
-        return Box::default();
+    if !calls_location_macro(db, body) {
+        return &[];
     }
     let source_map = Body::unmoved_source_map(db, def);
-    body.exprs()
-        .filter(|(_, expr)| matches!(expr, Expr::Literal(_)))
-        .filter(|&(id, _)| {
-            source_map
-                .expr_syntax(id)
-                .ok()
-                .and_then(|source| source.file_id.macro_file())
-                .is_some_and(|call| located(call.loc(db).def.kind))
-        })
-        .map(|(id, _)| id)
-        // alloc: the query's value, of a body that called a location macro
-        .collect()
+    blaze_memo::keep_iter(
+        blaze_memo::Database::memo(db),
+        body.exprs()
+            .filter(|(_, expr)| matches!(expr, Expr::Literal(_)))
+            .filter(|&(id, _)| {
+                source_map
+                    .expr_syntax(id)
+                    .ok()
+                    .and_then(|source| source.file_id.macro_file())
+                    .is_some_and(|call| located(call.loc(db).def.kind))
+            })
+            .map(|(id, _)| id),
+    )
+}
+
+/// Whether a macro `kind` makes a literal of where it is called: `line!`, `column!`, `file!`,
+/// `module_path!`, or a `concat!` (which may hold one of them).
+fn located(kind: MacroDefKind) -> bool {
+    matches!(
+        kind,
+        MacroDefKind::BuiltIn(
+            _,
+            BuiltinFnLikeExpander::Line
+                | BuiltinFnLikeExpander::Column
+                | BuiltinFnLikeExpander::File
+                | BuiltinFnLikeExpander::ModulePath
+        ) | MacroDefKind::BuiltInEager(_, EagerExpander::Concat)
+    )
+}
+
+/// Whether `body` calls a macro that makes a literal of where it is called ([`located`]):
+/// whether [`location_literals`] reads the source map. Of the body's macro calls alone.
+pub(super) fn calls_location_macro(db: &Db, body: &Body) -> bool {
+    body.macro_calls().iter().any(|call| located(call.loc(db).def.kind))
+}
+
+/// The literal of expression `expr` of `owner`'s store as the program has it, when `line!()`
+/// or `column!()` made it: the expander writes a placeholder (hir-expand's
+/// `PLACE_PLACEHOLDER`), never the value, so a line added above the code changes no HIR body,
+/// and this is where it becomes the line or column the call is written at in the end
+/// (`written_place`, rustc's `expansion_cause`), of the suffix the expansion gave it. `Ok(None)`
+/// for any other expression. `Err` names a call written nowhere a place can be read (no
+/// file's text): a refusal, never a zero.
+///
+/// The one rule every reader of a literal's value takes for those two macros: MIR lowering
+/// where the value is a constant (a `const fn`, a `const` or `static`, `const { .. }`, a
+/// promoted borrow, a `#[track_caller]` function, a pattern, an `asm!` constant), the
+/// evaluator's literal fast path, a const generic's normal form and a MIR record's slot. MIR
+/// of a function that reads its `line!()` where the code runs takes none of this
+/// (`hir_ty_mir::mir::location::slots_lines`).
+#[blaze::renders_positions]
+pub fn placed_literal(
+    db: &Db,
+    owner: ExpressionStoreOwnerId,
+    expr: ExprId,
+) -> Result<Option<hir_def::hir::Literal>, String> {
+    use hir_def::hir::Literal;
+    let store = ExpressionStore::of(db, owner);
+    let Expr::Literal(Literal::Uint(_, suffix)) = store.expr(expr) else { return Ok(None) };
+    let Some((call, line)) = place_call(db, owner, expr) else { return Ok(None) };
+    let name = if line { "line!" } else { "column!" };
+    let (at_line, at_column) = hir_expand::builtin::written_place(db, call)
+        // alloc: an error
+        .ok_or_else(|| format!("`{name}()` in {owner:?}: the call is not in its file's text"))?;
+    let value = if line { at_line } else { at_column };
+    Ok(Some(Literal::Uint(u128::from(value), *suffix)))
+}
+
+/// The `line!()` (`true`) or `column!()` (`false`) call whose placeholder the literal `expr`
+/// of `owner`'s store is, read from the source map without a position: `None` for any other
+/// expression. A reader that needs only what every place is (a `u32` of at least 1, so never
+/// a zero divisor) asks this, and so reads no line.
+#[expect(
+    blaze::reads_positions,
+    reason = "which expansion a literal came from is read off the unmoved source map, whose ids \
+              hold no line: the answer is the call, never where it is"
+)]
+pub fn place_call(
+    db: &Db,
+    owner: ExpressionStoreOwnerId,
+    expr: ExprId,
+) -> Option<(hir_expand::MacroCallId, bool)> {
+    place_call_in(db, owner, ExpressionStore::of(db, owner), expr)
+}
+
+/// Whether the literal `expr` of `store` stands for a `line!()` or `column!()`, for a caller
+/// that holds the store the expression is in. That store is `owner`'s own, or one lowered apart
+/// from it (a type read on its own, as an editor's query does: its ids are not the owner's).
+///
+/// The invariant: an expression is only ever read from the store it is in. For a store lowered
+/// apart, the owner's source map does not hold its expressions, so which literal a place macro
+/// wrote can't be told; where such a store calls a place macro at all, every integer literal of
+/// it is answered `true`, and its const is made as an anon const, which is right for both.
+pub fn is_place(db: &Db, owner: ExpressionStoreOwnerId, store: &ExpressionStore, expr: ExprId) -> bool {
+    if !matches!(store.expr(expr), Expr::Literal(hir_def::hir::Literal::Uint(..)))
+        || !calls_place_macro(db, store)
+    {
+        return false;
+    }
+    if !core::ptr::eq(store, ExpressionStore::of(db, owner)) {
+        return true;
+    }
+    place_call_in(db, owner, store, expr).is_some()
+}
+
+#[expect(
+    blaze::reads_positions,
+    reason = "which expansion a literal came from is read off the unmoved source map, whose ids \
+              hold no line: the answer is the call, never where it is"
+)]
+fn place_call_in(
+    db: &Db,
+    owner: ExpressionStoreOwnerId,
+    store: &ExpressionStore,
+    expr: ExprId,
+) -> Option<(hir_expand::MacroCallId, bool)> {
+    if !matches!(store.expr(expr), Expr::Literal(hir_def::hir::Literal::Uint(..)))
+        || !calls_place_macro(db, store)
+    {
+        return None;
+    }
+    let file_id = match owner {
+        ExpressionStoreOwnerId::Body(def) => {
+            Body::unmoved_source_map(db, def).expr_syntax(expr).ok().map(|it| it.file_id)
+        }
+        _ => {
+            let (_, source_map) = ExpressionStore::with_source_map(db, owner);
+            source_map.expr_syntax(expr).ok().map(|it| it.file_id)
+        }
+    };
+    let call = file_id.and_then(|it| it.macro_file())?;
+    Some((call, place_macro(call.loc(db).def.kind)?))
+}
+
+/// Whether a macro `kind` is `line!` (`Some(true)`) or `column!` (`Some(false)`).
+fn place_macro(kind: MacroDefKind) -> Option<bool> {
+    match kind {
+        MacroDefKind::BuiltIn(_, BuiltinFnLikeExpander::Line) => Some(true),
+        MacroDefKind::BuiltIn(_, BuiltinFnLikeExpander::Column) => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether `store` lowered a call of `line!` or `column!`: only then can an integer literal of
+/// it be a placeholder [`placed_literal`] gives the value of. Of its macro calls alone.
+pub fn calls_place_macro(db: &Db, store: &ExpressionStore) -> bool {
+    store.macro_calls().iter().any(|call| place_macro(call.loc(db).def.kind).is_some())
 }
 
 /// The location literals of `def`, for its records, with the address width of its crate's
@@ -95,6 +219,8 @@ pub fn location_literals(db: &Db, def: DefWithBodyId) -> Box<[ExprId]> {
 fn locations(db: &Db, def: DefWithBodyId) -> R<Locations<'_>> {
     let layout = db.target_data_layout(def.krate(db)).map_err(|error| error.to_string())?;
     Ok(Locations {
+        db,
+        owner: ExpressionStoreOwnerId::Body(def),
         store: Body::of(db, def),
         exprs: location_literals(db, def),
         word: layout.pointer_size().bytes_usize(),
@@ -104,23 +230,35 @@ fn locations(db: &Db, def: DefWithBodyId) -> R<Locations<'_>> {
 blaze_format::record! {
     /// A MIR answer: where its anonymous constants' type table is, the body's `mir::persist`
     /// buffer, its ids, and the items they name, each by its key and its kind at the same index.
+    /// Then the counts of the body's store its writer had (`exprs`, `pats`, `bindings`: what
+    /// every index of the body is checked against, `persist::Bounds`), and whether the body
+    /// has location literals (`located`, 0 or 1): so a reader that is not given the body's text
+    /// reads the answer with no lowering, as `check_cache::runtime`'s entries are read. Last,
+    /// the expressions of the body's closures, `async` blocks and coroutines in order
+    /// (`db::closure_exprs`, by raw index): what a closure's id is interned by
+    /// (`db::ClosureKey`, its place among them), so a closure of a body given without its text
+    /// is the same closure, with the same key, as where the body was lowered.
     #[derive(Clone, Copy)]
-    struct MirAnswerRoot: 1 {
+    struct MirAnswerRoot: 2 {
         locs: u64,
         body: Slice<u8>,
         ids: Slice<u8>,
         items: Slice<ContentId>,
         kinds: Slice<u8>,
-        reserved: u64,
+        exprs: u32,
+        pats: u32,
+        bindings: u32,
+        located: u32,
+        closures: Slice<u32>,
     }
 }
 
-const _: () = assert!(size_of::<MirAnswerRoot>() == 48);
+const _: () = assert!(size_of::<MirAnswerRoot>() == 64);
 
-/// The schema of a MIR answer and of everything its bytes are made with; [`place`] adds the
-/// owner's place to it, and [`super::with_crate_attrs`] the crate attributes that change MIR.
-const SCHEMA: SchemaHash = schema_of(&[
-    Part::Str("blaze v2 item store MIR 1"),
+/// The schema of a MIR answer and of everything its bytes are made with; [`schema_of`] adds the
+/// owner's [`place`] to it, and [`super::with_crate_attrs`] the crate attributes that change MIR.
+const SCHEMA: SchemaHash = blaze_format::schema_of(&[
+    Part::Str("blaze v2 item store MIR 2"),
     Part::Schema(<MirAnswerRoot as Record>::SCHEMA),
     Part::Schema(persist::SCHEMA),
     Part::Schema(TABLE_SCHEMA),
@@ -128,7 +266,7 @@ const SCHEMA: SchemaHash = schema_of(&[
 ]);
 
 /// What a [`place`] part is when the owner has none of it.
-const NONE: u64 = u64::MAX;
+pub(crate) const NONE: u64 = u64::MAX;
 
 #[cfg(test)]
 thread_local! {
@@ -151,7 +289,7 @@ pub(crate) fn built<'db>(
     owner: MirOwner<'db>,
     run: impl FnOnce() -> Built<'db>,
 ) -> Built<'db> {
-    if INSTALLED.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+    if REGISTRY.is_empty() {
         return run();
     }
     stored(db, owner, run)
@@ -159,7 +297,8 @@ pub(crate) fn built<'db>(
 
 #[inline(never)]
 fn stored<'db>(db: &'db Db, owner: MirOwner<'db>, run: impl FnOnce() -> Built<'db>) -> Built<'db> {
-    let Some((def, schema)) = place(db, owner) else { return run() };
+    let Some((def, at)) = place(db, owner) else { return run() };
+    let schema = schema_of(db, def, at);
     match lookup_mir(db, def, owner, schema) {
         Lookup::Off => ran(run),
         Lookup::Miss => {
@@ -192,13 +331,68 @@ fn stored<'db>(db: &'db Db, owner: MirOwner<'db>, run: impl FnOnce() -> Built<'d
     }
 }
 
-/// The body `owner`'s record is filed under, and the schema of its answers: [`SCHEMA`] with
-/// which MIR owner of the body it is and its place there. `None` for an owner of no body.
-fn place<'db>(db: &'db Db, owner: MirOwner<'db>) -> Option<(DefWithBodyId, SchemaHash)> {
-    let (tag, closure): (u64, InternedClosure<'db>) = match owner {
+/// Which MIR owner of a body a record is of, and where in the body: the four numbers
+/// [`SCHEMA`] is extended by for the owner's answers ([`schema_of`]). `tag` is 0 for the body
+/// or an anonymous constant of it, 1 for a closure, 2 for a coroutine, 3 for a by-move
+/// coroutine; `anon` is an anonymous constant's expression and whether it may use the body's
+/// generic parameters ([`in_body`]); `expr` a closure's or coroutine's expression and `kind`
+/// its [`kind_code`]; each [`NONE`] where the owner has none of it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Place {
+    pub tag: u8,
+    pub anon: u64,
+    pub expr: u64,
+    pub kind: u64,
+}
+
+impl Place {
+    /// The body's own MIR.
+    pub const BODY: Place = Place { tag: 0, anon: NONE, expr: NONE, kind: NONE };
+
+    /// Its stable bytes: `tag`, then `anon`, `expr` and `kind`, each little-endian.
+    pub fn bytes(self) -> [u8; 25] {
+        let mut out = [0; 25];
+        out[0] = self.tag;
+        out[1..9].copy_from_slice(&self.anon.to_le_bytes());
+        out[9..17].copy_from_slice(&self.expr.to_le_bytes());
+        out[17..25].copy_from_slice(&self.kind.to_le_bytes());
+        out
+    }
+
+    /// The place [`Place::bytes`] wrote as `bytes`.
+    pub fn read(bytes: &[u8; 25]) -> Place {
+        let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"));
+        Place { tag: bytes[0], anon: word(1), expr: word(9), kind: word(17) }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The planted bug of the owners' oracle's control: [`place`] gives [`Place::BODY`] for
+    /// every owner, as a filing that kept one MIR entry a body would.
+    pub(super) static ONE_PLACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn planted(place: Place) -> Place {
+    match ONE_PLACE.with(std::cell::Cell::get) {
+        true => Place::BODY,
+        false => place,
+    }
+}
+
+#[cfg(not(test))]
+fn planted(place: Place) -> Place {
+    place
+}
+
+/// The body `owner`'s record is filed under, and its place there: which MIR owner of the body
+/// it is and where. `None` for an owner of no body.
+pub(super) fn place<'db>(db: &'db Db, owner: MirOwner<'db>) -> Option<(DefWithBodyId, Place)> {
+    let (tag, closure): (u8, InternedClosure<'db>) = match owner {
         MirOwner::Body(body) => {
             let (def, anon) = in_body(db, body)?;
-            return Some((def, with_crate_attrs(db, def, schema_at(0, anon, NONE, NONE))));
+            return Some((def, planted(Place { tag: 0, anon, expr: NONE, kind: NONE })));
         }
         MirOwner::Closure(it) => (1, it.loc(db)),
         MirOwner::Coroutine(it) => (2, it.loc(db)),
@@ -206,13 +400,60 @@ fn place<'db>(db: &'db Db, owner: MirOwner<'db>) -> Option<(DefWithBodyId, Schem
     };
     let InternedClosure { owner, expr, kind } = closure;
     let (def, anon) = in_body(db, owner)?;
-    let schema = schema_at(tag, anon, u64::from(expr.into_raw().into_u32()), kind_code(kind));
-    Some((def, with_crate_attrs(db, def, schema)))
+    let place = Place { tag, anon, expr: u64::from(expr.into_raw().into_u32()), kind: kind_code(kind) };
+    Some((def, planted(place)))
+}
+
+/// The schema of the answers of `def`'s MIR owner at `place`: [`SCHEMA`] with the place, and
+/// the crate attributes that change MIR ([`super::with_crate_attrs`]).
+pub(super) fn schema_of(db: &Db, def: DefWithBodyId, place: Place) -> SchemaHash {
+    with_crate_attrs(db, def, schema_at(u64::from(place.tag), place.anon, place.expr, place.kind))
+}
+
+/// The MIR owners of `def` an entry keys, each with its [`place`]: the body, then each closure
+/// and `async` coroutine written in it, reached or not, in the order of their expressions (the
+/// kinds MIR lowering makes a body of, as the borrow check finds them). Not here: an anonymous
+/// constant's MIR, a by-move coroutine's and a `gen` coroutine's.
+pub(super) fn owners<'db>(db: &'db Db, def: DefWithBodyId) -> Vec<(Place, MirOwner<'db>)> {
+    // alloc: the body's owners, a handful
+    let mut out = Vec::new();
+    let mut push = |owner: MirOwner<'db>| {
+        // A closure inside one of the body's anonymous constants (an array length) is in the
+        // body's inference, which the constants' are merged into, and is no owner of the
+        // body's own lowering: the constant's body lowers it.
+        if let Some((_, place)) = place(db, owner)
+            && place.anon == NONE
+        {
+            out.push((place, owner));
+        }
+    };
+    push(MirOwner::Body(InferBodyId::DefWithBodyId(def)));
+    let infer = InferenceResult::of(db, def);
+    let store = ExpressionStore::of(db, ExpressionStoreOwnerId::Body(def));
+    for (expr, written) in store.exprs() {
+        let Expr::Closure {
+            closure_kind:
+                ClosureKind::Closure
+                | ClosureKind::Coroutine { kind: CoroutineKind::Async, .. }
+                | ClosureKind::CoroutineClosure(CoroutineKind::Async),
+            ..
+        } = written
+        else {
+            continue;
+        };
+        match infer.expr_ty(expr).kind() {
+            TyKind::Closure(id, _) => push(MirOwner::Closure(id.0)),
+            TyKind::CoroutineClosure(id, _) => push(MirOwner::Closure(id.0.as_closure(db))),
+            TyKind::Coroutine(id, _) => push(MirOwner::Coroutine(id.0)),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// The body `owner` is of, and where in it when `owner` is an anonymous constant of it: its
 /// expression and whether it may use the body's generic parameters.
-fn in_body(db: &Db, owner: InferBodyId<'_>) -> Option<(DefWithBodyId, u64)> {
+pub(crate) fn in_body(db: &Db, owner: InferBodyId<'_>) -> Option<(DefWithBodyId, u64)> {
     match owner {
         InferBodyId::DefWithBodyId(def) => Some((def, NONE)),
         InferBodyId::AnonConstId(it) => {
@@ -231,7 +472,7 @@ fn in_body(db: &Db, owner: InferBodyId<'_>) -> Option<(DefWithBodyId, u64)> {
 }
 
 fn schema_at(tag: u64, anon: u64, expr: u64, kind: u64) -> SchemaHash {
-    schema_of(&[
+    blaze_format::schema_of(&[
         Part::Schema(SCHEMA),
         Part::U64(tag),
         Part::U64(anon),
@@ -240,7 +481,7 @@ fn schema_at(tag: u64, anon: u64, expr: u64, kind: u64) -> SchemaHash {
     ])
 }
 
-fn kind_code(kind: ClosureKind) -> u64 {
+pub(crate) fn kind_code(kind: ClosureKind) -> u64 {
     let coroutine = |kind: CoroutineKind| match kind {
         CoroutineKind::Async => 0,
         CoroutineKind::Gen => 1,
@@ -262,7 +503,8 @@ fn kind_code(kind: ClosureKind) -> u64 {
     }
 }
 
-/// `owner`'s stored MIR, made in this database; `def` and `schema` are its [`place`].
+/// `owner`'s stored MIR, made in this database; `def` and `schema` are its [`place`] and its
+/// [`schema_of`].
 fn lookup_mir<'db>(
     db: &'db Db,
     def: DefWithBodyId,
@@ -282,7 +524,7 @@ fn offer_mir<'db>(
     owner: MirOwner<'db>,
     schema: SchemaHash,
     body: &MirBody<'db>,
-    reads: Option<blaze_query::db::Reads>,
+    reads: Option<Reads>,
 ) {
     let mut unreadable = None;
     super::offer(db, def, Step::Mir, schema, reads, |facts, out| {
@@ -339,8 +581,18 @@ fn format_error(error: FormatError) -> String {
     error.to_string()
 }
 
+/// What an answer keeps of the body's store ([`MirAnswerRoot`]'s last five fields): its counts,
+/// whether it has location literals, and its closures' expressions.
+#[derive(Clone, Copy)]
+struct Nodes<'a> {
+    bounds: Bounds,
+    located: bool,
+    closures: &'a [ExprId],
+}
+
 /// `body`, MIR of `def`, as its answer's bytes, written over `out`: its buffer inside a
-/// relocating scope, then its ids, each item by its key.
+/// relocating scope, then its ids, each item by its key, then the counts of the body's store.
+/// The writer has the body's store: the body was just built from it.
 pub(super) fn encode<'db>(
     db: &'db Db,
     // dyn: the store's facts, one call per item the body names
@@ -349,11 +601,29 @@ pub(super) fn encode<'db>(
     body: &MirBody<'db>,
     out: &mut Vec<u8>,
 ) -> Result<(), EncodeError> {
-    let interner = DbInterner::new_with(db, def.krate(db));
-    let mut table = Table::default();
+    let nodes = Nodes {
+        bounds: Bounds::of(Body::of(db, def)),
+        located: !location_literals(db, def).is_empty(),
+        closures: closure_exprs(db, ExpressionStoreOwnerId::Body(def)),
+    };
     // alloc: the reason a body is not stored
     let locations = locations(db, def)?;
-    let record = ids::relocating(&mut table, || persist::write(db, body, Some(locations)))
+    write_answer(db, facts, def, body, nodes, Some(locations), out)
+}
+
+fn write_answer<'db>(
+    db: &'db Db,
+    // dyn: as `encode`
+    facts: &dyn BodyFacts,
+    def: DefWithBodyId,
+    body: &MirBody<'db>,
+    nodes: Nodes<'_>,
+    locations: Option<Locations<'_>>,
+    out: &mut Vec<u8>,
+) -> Result<(), EncodeError> {
+    let interner = DbInterner::new_with(db, def.krate(db));
+    let mut table = Table::default();
+    let record = ids::relocating(&mut table, || persist::write(db, body, locations))
         .map_err(|why| match why {
             // alloc: the reason a body is not stored
             persist::WriteError::Unwritable(why) => EncodeError::Refused(why.to_owned()),
@@ -362,11 +632,17 @@ pub(super) fn encode<'db>(
     let mut locs = TyTableWriter::new(interner);
     let mut items = Keyed::new(db, facts, def);
     let words = ids::write_with(db, &mut table, &mut locs, &mut items)?;
+    testing::plant(&mut items);
 
     let mut writer = Writer::with_buffer(SCHEMA, mem::take(out));
     let words = Placed::push(&mut writer, &words);
     let keys = Placed::push(&mut writer, &items.keys);
     let kinds = Placed::push(&mut writer, &items.kinds);
+    let closures = Placed::push_each(
+        &mut writer,
+        nodes.closures.len(),
+        nodes.closures.iter().map(|expr| expr.into_raw().into_u32()),
+    );
     // The body is a buffer of its own, read in place: at an aligned offset.
     let record_at = writer.bytes.len().next_multiple_of(ALIGN);
     writer.bytes.resize(record_at, 0);
@@ -384,7 +660,11 @@ pub(super) fn encode<'db>(
         ids: words.slice(field(offset_of!(MirAnswerRoot, ids))),
         items: keys.slice(field(offset_of!(MirAnswerRoot, items))),
         kinds: kinds.slice(field(offset_of!(MirAnswerRoot, kinds))),
-        reserved: 0,
+        exprs: nodes.bounds.exprs,
+        pats: nodes.bounds.pats,
+        bindings: nodes.bounds.bindings,
+        located: u32::from(nodes.located),
+        closures: closures.slice(field(offset_of!(MirAnswerRoot, closures))),
     };
     let written = writer.push(&root);
     debug_assert_eq!(written, at, "`Writer::next` is not where `push` writes");
@@ -393,7 +673,10 @@ pub(super) fn encode<'db>(
 }
 
 /// The MIR in the answer `bytes` of a MIR owner of `def`, made in this database: its items by
-/// their keys first, then its ids against them, then its body, read through them.
+/// their keys first, then its ids against them, then its body, read through them, each index
+/// of the body checked against the counts the answer keeps. Nothing of the body's store is read
+/// unless the body has location literals, whose values are read off it; in [`super::Mode::Given`]
+/// such a body is refused ([`super::Unserved::LOCATED`]), as the body's text is not there.
 pub(super) fn decode<'db>(
     db: &'db Db,
     // dyn: the store's facts, one call per item the body names
@@ -402,9 +685,14 @@ pub(super) fn decode<'db>(
     bytes: &[u8],
 ) -> R<MirBody<'db>> {
     let root = open_as::<MirAnswerRoot>(bytes, SCHEMA).map_err(format_error)?;
-    if root.reserved != 0 {
+    let located = match root.located {
+        0 => false,
+        1 => true,
         // alloc: the reason an answer does not read
-        return Err("a MIR answer with reserved bytes set".to_owned());
+        other => return Err(format!("a MIR answer whose location flag is {other}")),
+    };
+    if located && super::given(db) {
+        super::Unserved::of(def, Step::Mir, None, super::Unserved::LOCATED, String::new()).throw();
     }
     let words = root.ids.follow(bytes).map_err(format_error)?;
     let record = root.body.follow(bytes).map_err(format_error)?;
@@ -413,6 +701,115 @@ pub(super) fn decode<'db>(
     let items = items_of(db, facts, def, keys, kinds)?;
     let interner = DbInterner::new_with(db, def.krate(db));
     let mut table = ids::read(db, interner, &items, words, bytes, root.locs)?;
-    let locations = locations(db, def)?;
-    ids::relocating(&mut table, || persist::read(db, record, locations)).map_err(format_error)
+    let bounds = Bounds { exprs: root.exprs, pats: root.pats, bindings: root.bindings };
+    let locations = match located {
+        true => Some(locations(db, def)?),
+        false => None,
+    };
+    ids::relocating(&mut table, || persist::read_in(db, record, bounds, locations)).map_err(format_error)
+}
+
+/// The closures' expressions of `def`, a body given from its record ([`super::Mode::Given`]):
+/// the list its body place's MIR answer keeps, which `db::closure_exprs` gives in place of a
+/// walk of the body's store, absent here. Read off the answer's root alone; its fact is listed
+/// as any given answer's is. Asked inside `closure_exprs`' query, whose memo keeps the list.
+pub(crate) fn given_closure_exprs(db: &Db, def: DefWithBodyId) -> &[ExprId] {
+    let schema = schema_of(db, def, Place::BODY);
+    let found = super::lookup(db, def, Step::Mir, schema, |_, bytes| {
+        let root = open_as::<MirAnswerRoot>(bytes, SCHEMA).map_err(format_error)?;
+        let closures = root.closures.follow(bytes).map_err(format_error)?;
+        if !closures.is_sorted_by(|a, b| a < b) {
+            // alloc: the reason an answer does not read
+            return Err("a MIR answer whose closures are not in the order of their expressions".to_owned());
+        }
+        Ok(blaze_memo::keep_iter(
+            blaze_memo::Database::memo(db),
+            closures.iter().map(|&raw| ExprId::from_raw(la_arena::RawIdx::from_u32(raw))),
+        ))
+    });
+    match found {
+        Lookup::Hit { value, verify: _ } => value,
+        // `Mode::Given` answers or refuses; only a caller outside it reaches here, which
+        // `db::closure_exprs` never is.
+        Lookup::Off | Lookup::Miss => {
+            panic!("`given_closure_exprs` of {def:?} with no store in `Mode::Given`: `db::closure_exprs` asks it only there")
+        }
+    }
+}
+
+/// What a test of the MIR record reads and plants, outside this crate: blaze-front's tests of a
+/// body record served in another database. Not for the build.
+#[doc(hidden)]
+pub mod testing {
+    use std::cell::Cell;
+
+    use super::*;
+    use crate::check_cache::ids::IdKind;
+
+    /// A planted bug of the transport, each a control of a test that a served body equals the
+    /// one lowered from its source.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Plant {
+        None,
+        /// The last type (a struct, an enum or a union) the body names is left out of its
+        /// answer's items, as a transport that kept no such type would.
+        DropType,
+        /// The first item the body names is written by its id in the writer's database, not by
+        /// its key, as a transport that kept a database id would.
+        DatabaseId,
+    }
+
+    thread_local! {
+        static PLANT: Cell<Plant> = const { Cell::new(Plant::None) };
+    }
+
+    /// Runs `f` with `plant` planted in every MIR answer this thread writes.
+    pub fn planted<T>(plant: Plant, f: impl FnOnce() -> T) -> T {
+        let was = PLANT.with(|it| it.replace(plant));
+        let out = f();
+        PLANT.with(|it| it.set(was));
+        out
+    }
+
+    /// The planted bug, if any, applied to the items an answer is about to list. One
+    /// thread-local load per MIR answer written, nothing else.
+    pub(super) fn plant(items: &mut Keyed<'_, '_>) {
+        match PLANT.with(Cell::get) {
+            Plant::None => {}
+            Plant::DropType => {
+                let types = [IdKind::Struct as u8, IdKind::Enum as u8, IdKind::Union as u8];
+                if let Some(at) = items.kinds.iter().rposition(|kind| types.contains(kind)) {
+                    items.keys.remove(at);
+                    items.kinds.remove(at);
+                }
+            }
+            Plant::DatabaseId => {
+                if let Some(bits) = items.bits_at(0) {
+                    let mut key = [0u8; 32];
+                    key[..8].copy_from_slice(&bits.to_le_bytes());
+                    items.keys[0] = ContentId(key);
+                }
+            }
+        }
+    }
+
+    /// `body`, MIR of `def`, as an answer's bytes with no count of the body's store and no
+    /// location slot: what two databases write equal bytes of when the bodies are one MIR, its
+    /// items by key and its types by content, whatever ids each database gave them. The
+    /// structural comparison of a served body with one lowered from its source. A location
+    /// literal is written as its constant (no slot), which a given body never has
+    /// ([`super::super::Unserved::LOCATED`]).
+    pub fn portable<'db>(
+        db: &'db Db,
+        // dyn: the facts the answer's items are keyed by
+        facts: &dyn BodyFacts,
+        def: DefWithBodyId,
+        body: &MirBody<'db>,
+    ) -> Result<Vec<u8>, String> {
+        let nodes = Nodes { bounds: Bounds { exprs: 0, pats: 0, bindings: 0 }, located: false, closures: &[] };
+        // alloc: the answer's bytes, once per body compared
+        let mut out = Vec::new();
+        write_answer(db, facts, def, body, nodes, None, &mut out).map_err(|why| why.to_string())?;
+        Ok(out)
+    }
 }

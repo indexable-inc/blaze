@@ -1,0 +1,13 @@
+{
+ "id": "telemetry-1112-4",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane telemetry-1112",
+ "where": "blaze: the daemon's pool has no span for a parked worker's wake, and the loop's turns between lowering and the first unit have none (crates/blaze-graph, crates/blaze-cargo/src/serve/job.rs)",
+ "what": "The lane was to add spans for the 5 to 11 ms gap in every edit build between two stages. blaze-graph opens no tracing span at all (its workers are seen through `switches` rows), so a wake span is a change to the scheduler's park and unpark paths, which are outside the lane's paths and cannot be written blind without a run.",
+ "cost": "outcome 4's two spans are not written; the gap is still seen only as uncovered time (`blaze explain account`'s `uncovered_ms`, the smoke's `uncovered_ms` and `turn_uncovered_ms` bounds)",
+ "cause": "not looked into past reading that crates/blaze-graph/src has no `info_span!`",
+ "class": "time no span names (every-wait-says-what)",
+ "prevention": "not built: the pool records `parked -> ready -> resumed` as a `wake` span (or the `switches` rows' `ready` to `resumed` stretch is made a row of `uncovered_time`'s cover), and the loop's turn opens a span naming the stage it advances",
+ "workaround": "`blaze explain worker_states`, `blaze slow`'s gaps",
+ "state": "open, for the lane that owns blaze-graph's pool"
+}

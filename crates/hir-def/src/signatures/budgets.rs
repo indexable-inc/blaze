@@ -89,7 +89,8 @@ fn enum_variants_miss_is_its_map() {
     let e = enum_of(&db);
     let _ = variants_syntax(&db, e);
     let _ = AttrFlags::query(&db, e.into());
-    let len = blaze_alloc_count::assert_at_most(2, "an enum-variants miss", || {
+    // The miss is a run, which the test database logs: counted around the budget.
+    let len = crate::test_db::assert_at_most_beside_runs(&db, 2, "an enum-variants miss", || {
         EnumVariants::of(&db, e).0.variants.len()
     });
     assert_eq!(len, 2);

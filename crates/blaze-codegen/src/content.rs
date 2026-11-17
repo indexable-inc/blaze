@@ -182,6 +182,7 @@ pub fn target_into(hasher: &mut Hasher, target: &Target) {
         Target::Coverage(array) => hasher.update(&[7]).update(&array.to_le_bytes()),
         Target::Counter(key) => hasher.update(&[8]).id(&key.0),
         Target::ProfileCounters => hasher.update(&[9]),
+        Target::Text(id) => hasher.update(&[10]).id(id),
     };
 }
 
@@ -383,6 +384,7 @@ mod tests {
             Target::Coverage(0),
             Target::Counter(InstanceKey(id)),
             Target::ProfileCounters,
+            Target::Text(id),
         ]
     }
 
@@ -401,7 +403,8 @@ mod tests {
                 | Target::Position(_)
                 | Target::Coverage(_)
                 | Target::Counter(_)
-                | Target::ProfileCounters => {}
+                | Target::ProfileCounters
+                | Target::Text(_) => {}
             }
         }
         let ids: std::collections::BTreeSet<ContentId> = targets.iter().map(target_id).collect();
@@ -485,6 +488,7 @@ mod tests {
             Target::Coverage(1),
             Target::Counter(key),
             Target::ProfileCounters,
+            Target::Text(id),
         ];
         let mut ids: Vec<ContentId> = targets.iter().map(target_id).collect();
         ids.sort_unstable();

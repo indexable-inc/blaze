@@ -112,27 +112,6 @@ const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 #[cfg(not(blaze_check))]
 pub const STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The pools whose workers run threads of their own, while they live: what a heap give-back
-/// wakes ([`wake_for_give_back`]). Pushed as such a pool starts, pruned of dropped ones then.
-#[cfg(not(blaze_check))]
-static LIVE: Lock<Vec<std::sync::Weak<Shared>>> = Lock::new("graph.pool.live", Vec::new());
-
-/// Wakes every idle worker of every live pool, so it gives back the free pages its heaps keep
-/// as it goes idle again ([`blaze_mem::tag::settle_heap`] in [`Local::park`]) rather than at its
-/// next job: what [`blaze_mem::tag::ask_heap_give_back`] calls, and a purge then waits for
-/// every worker's give-back (docs/memory-footprint.md, step 2). A worker woken with no job
-/// parks again; nothing is signalled.
-#[cfg(not(blaze_check))]
-fn wake_for_give_back() {
-    // Taken out of the lock before any wake: a wake is a system call (rule
-    // standard-structures: a lock is held for a field update alone).
-    // alloc: a few pools, once a purge
-    let live: Vec<Arc<Shared>> = LIVE.lock().iter().filter_map(std::sync::Weak::upgrade).collect();
-    for shared in live {
-        shared.unpark_workers();
-    }
-}
-
 /// What the queues hold: a pointer to a job's [`Header`], which says how to run it. One pointer
 /// (8 bytes on 64-bit targets), so a line of a deque's buffer holds eight jobs there.
 pub(crate) struct Job(NonNull<Header>);
@@ -707,6 +686,10 @@ impl Slot {
 /// What an idle worker's park waits for, as its wait and its error name it.
 #[cfg(not(blaze_check))]
 const IDLE_PARK: &str = "a job for an idle worker, or its pool's next due wait";
+/// What an idle worker gave back before it parked, when the kernel refused it: its idle
+/// fibers' stacks and its own stack's pages below its frame ([`crate::sched::Host`]).
+#[cfg(not(blaze_check))]
+const IDLE_STACKS: &str = "an idle worker's stack pages given back before it parks";
 
 /// Why a pool stopped for an error ([`Pool::broken`]): one of its workers could not go on. Its
 /// message names the worker, its group and the wait or the panic, and is what every scope on
@@ -907,6 +890,10 @@ unsafe impl Send for Drivers {}
 unsafe impl Sync for Drivers {}
 
 #[cfg(not(blaze_check))]
+#[expect(
+    blaze::process_static,
+    reason = "the pools this thread drives, each removed by its pool's drop: bounded by the pools alive on the thread"
+)]
 thread_local! {
     /// The pools this thread drives ([`Drivers`]), in the order they were made.
     static DRIVEN: RefCell<Vec<*const Drivers>> = const { RefCell::new(Vec::new()) };
@@ -989,13 +976,9 @@ impl Pool {
     }
 
     /// A pool whose workers have threads of their own when `threaded`, else are driven by the
-    /// calling thread ([`Pool::driven`]).
-    fn make(
-        topology: &Topology,
-        bind: bool,
-        stealing: Stealing,
-        threaded: bool,
-    ) -> io::Result<Pool> {
+    /// calling thread ([`Pool::driven`]). One with threads runs every worker at once; a driven
+    /// pool runs one job at a time on its driving thread.
+    fn make(topology: &Topology, bind: bool, stealing: Stealing, threaded: bool) -> io::Result<Pool> {
         radix::set_ambient(ambient);
         if !threaded && bind {
             return Err(io::Error::new(
@@ -1103,14 +1086,6 @@ impl Pool {
             #[cfg(blaze_check)]
             unreachable!("the model checker's targets have threads");
         }
-        #[cfg(not(blaze_check))]
-        {
-            let mut live = LIVE.lock();
-            live.retain(|it| it.strong_count() > 0);
-            live.push(Arc::downgrade(&shared)); // alloc: a pool's entry, once a pool
-            drop(live);
-            blaze_mem::tag::heap_wakes_by(wake_for_give_back);
-        }
         let (ready_tx, ready_rx) = crossbeam_channel::unbounded::<io::Result<()>>();
         let mut threads = Vec::with_capacity(deques.len());
         let mut failed = None;
@@ -1130,9 +1105,6 @@ impl Pool {
                     // clone: a reference count, once per worker thread
                     let after = Arc::clone(&shared);
                     if ok {
-                        // A worker counts for every heap give-back while its loop runs: a purge
-                        // waits for its give-back before it reads the footprint.
-                        let _settles = blaze_mem::tag::count_heap_settles();
                         let group = shared.slots[index].group as usize;
                         let local = Local {
                             shared,
@@ -1275,6 +1247,12 @@ impl Pool {
 
     pub fn workers(&self) -> usize {
         self.shared.slots.len()
+    }
+
+    /// How many of its workers it may run at once: every one. What a loop splits its work by
+    /// ([`crate::par::threads`]).
+    pub fn threads(&self) -> usize {
+        self.shared.allowed()
     }
 
     /// This thread's index among this pool's workers, if it is one of them: for tables kept
@@ -1453,9 +1431,9 @@ pub(crate) fn scope_here<'env, R>(f: impl FnOnce(&Scope<'env>) -> R) -> R {
     }
 }
 
-/// The workers of the pool [`scope_here`] runs on.
+/// The workers the pool [`scope_here`] runs on may run at once now ([`Pool::threads`]).
 pub(crate) fn threads_here() -> usize {
-    with_local(|local| local.shared.slots.len()).unwrap_or_else(|| crate::exec::shared().workers())
+    with_local(|local| local.shared.allowed()).unwrap_or_else(|| crate::exec::shared().threads())
 }
 
 /// [`Pool::scope`] on the pool `shared` is of, which outlives the call. The caller's job opens
@@ -1563,7 +1541,7 @@ fn run_jobs(shared: &Shared, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
 // has run (a job's panic is caught and given to its `done`).
 unsafe impl radix::Workers for Pool {
     fn threads(&self) -> usize {
-        self.workers()
+        self.shared.allowed()
     }
 
     // dyn: the trait's signature, as for `run_jobs`
@@ -1579,7 +1557,7 @@ struct Here<'a>(&'a Shared);
 // every job of it has run; the worker's `Local` keeps the pool's `Shared` for as long as it works.
 unsafe impl radix::Workers for Here<'_> {
     fn threads(&self) -> usize {
-        self.0.slots.len()
+        self.0.allowed()
     }
 
     // dyn: the trait's signature, as for `run_jobs`
@@ -2033,6 +2011,11 @@ fn take(next: &AtomicPtr<Header>) -> Option<Job> {
 }
 
 impl Shared {
+    /// The workers it may run at once: all of them.
+    fn allowed(&self) -> usize {
+        self.slots.len()
+    }
+
     fn unpark_workers(&self) {
         for slot in &self.slots {
             slot.parker.unpark();
@@ -2163,7 +2146,8 @@ impl Shared {
                     self.idle.0.fetch_add(SEARCHING.wrapping_sub(SLEEPING), Ordering::SeqCst);
                     #[cfg(not(blaze_check))]
                     slot.parker.unpark();
-                    #[cfg(blaze_check)]
+                    // A driven worker sleeps in its driving thread's park (`block`), which no
+                    // parker reaches: that thread is unparked too, as `unpark_workers` does.
                     if let Some(thread) = slot.thread.get() {
                         thread.unpark();
                     }
@@ -2440,13 +2424,18 @@ impl Local {
     /// sleeps wakes it. Whether it was woken to search, as its waker counted it. `park` is how:
     /// [`Local::park`] for a worker of its own thread, a turn given back for a driven one.
     fn sleep(&self, ended: &impl Fn() -> bool, park: impl FnOnce()) -> bool {
+        self.sleep_unless(&|| ended() || self.shared.any_work(), park)
+    }
+
+    /// As [`Local::sleep`], but parks unless `ready`, looked at once marked asleep.
+    fn sleep_unless(&self, ready: &impl Fn() -> bool, park: impl FnOnce()) -> bool {
         let shared = &*self.shared;
         let (slot, group) = (&shared.slots[self.index], &shared.groups[self.group]);
         slot.sleeping.store(true, Ordering::SeqCst);
         group.sleepers.fetch_add(1, Ordering::SeqCst);
         shared.idle.0.fetch_add(SLEEPING, Ordering::SeqCst);
         fence(Ordering::SeqCst);
-        if !ended() && !shared.any_work() {
+        if !ready() {
             park();
         }
         if slot.sleeping.compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed).is_ok()
@@ -2466,7 +2455,11 @@ impl Local {
     ///
     /// The park's, when the kernel refused the wait: the worker did not park, and stops the
     /// pool with it ([`work`]).
-    fn park(&self, ended: &impl Fn() -> bool) -> Result<(), blaze_core::wait::WaitError> {
+    fn park(
+        &self,
+        ended: &impl Fn() -> bool,
+        runner: &mut Runner<'_>,
+    ) -> Result<(), blaze_core::wait::WaitError> {
         let shared = &*self.shared;
         let slot = &shared.slots[self.index];
         #[cfg(not(blaze_check))]
@@ -2481,9 +2474,13 @@ impl Local {
             // A timed wait of a pool's job ends only as a worker of its scheduler looks at
             // the clock.
             let due = crate::sched::until_due(&shared.sched);
-            // Outside any job: the free pages this thread's heaps keep go back if a release
-            // asked since it last gave them (memcap5); nothing otherwise.
-            blaze_mem::tag::settle_heap();
+            // Outside any job: the frame memory it keeps warm, if an idle daemon asked for it;
+            // then its idle fibers' stacks, unmapped, and the pages of its own stack below this frame.
+            if blaze_mem::frame::settle_spare() {
+                runner
+                    .give_back_stacks()
+                    .map_err(|why| blaze_core::wait::WaitError::io(IDLE_STACKS, why))?;
+            }
             crate::sched::idle(&shared.sched, true);
             let parked = DriverSpan::open(Driving::Idle);
             let waited = if shared.parked.load(Ordering::Acquire) != 0
@@ -2511,7 +2508,7 @@ impl Local {
         }
         #[cfg(blaze_check)]
         {
-            let _ = (slot, ended);
+            let _ = (slot, ended, runner);
             thread::park();
             Ok(())
         }
@@ -2614,16 +2611,18 @@ fn work(local: &Local, turns: Option<&crate::sched::Turns<'_>>) {
     let ran = || debug_assert!(turns.is_none(), "the model checker's pools have threads");
     // The error of a park the kernel refused, until the loop stops the pool with it.
     let refused: Cell<Option<blaze_core::wait::WaitError>> = Cell::new(None);
-    let park = |ended: &dyn Fn() -> bool| match turns {
+    let park = |ended: &dyn Fn() -> bool, runner: &mut Runner<'_>| match turns {
         #[cfg(not(blaze_check))]
         Some(turns) => {
+            // A driven worker's thread is its driver's: its stack is not this worker's to give.
+            let _ = runner;
             crate::sched::idle(&local.shared.sched, true);
             hand_back(local, &outer, turns, crate::sched::Turn::Idle);
             crate::sched::idle(&local.shared.sched, false);
             crate::sched::fire_due(&local.shared.sched);
         }
         _ => {
-            if let Err(error) = local.park(&ended) {
+            if let Err(error) = local.park(&ended, runner) {
                 refused.set(Some(error));
             }
         }
@@ -2723,14 +2722,14 @@ fn work(local: &Local, turns: Option<&crate::sched::Turns<'_>>) {
                     shared.parked.load(Ordering::Acquire) == 0
                         || shared.abandoned.load(Ordering::SeqCst)
                 };
-                searching = local.sleep(&drained, || park(&drained));
+                searching = local.sleep(&drained, || park(&drained, &mut runner));
                 continue;
             }
             break;
         }
         search = None;
         let ended = || shared.stop.load(Ordering::SeqCst);
-        searching = local.sleep(&ended, || park(&ended));
+        searching = local.sleep(&ended, || park(&ended, &mut runner));
     }
     drop(search);
     drop(runner);
@@ -5255,7 +5254,7 @@ mod broken {
 mod victims {
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use hegel::{TestCase, generators as gs};
+    use blaze_sim::{Config, Tape};
 
     use super::{Pool, Stealing, Victims, pick_two, worker_seed, xorshift};
     use crate::topology::{Cpu, Topology};
@@ -5267,15 +5266,16 @@ mod victims {
     /// Over generated groups, deque lengths and seeds: each pick draws two workers other than
     /// `me`, is the one of the longer deque (the first on a tie), is none only when both are
     /// empty, and the same seed draws the same picks again.
-    #[hegel::test(test_cases = 200)]
-    fn a_two_choices_pick_is_the_longer_of_two_others_and_replays_for_a_seed(tc: TestCase) {
-        let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(8));
-        let me =
-            tc.draw(gs::booleans()).then(|| tc.draw(gs::integers::<usize>().max_value(count - 1)));
-        let lens: Vec<usize> =
-            (0..count).map(|_| tc.draw(gs::integers::<usize>().max_value(4))).collect();
-        let (seed, index) =
-            (tc.draw(gs::integers::<u64>()), tc.draw(gs::integers::<usize>().max_value(255)));
+    #[test]
+    fn a_two_choices_pick_is_the_longer_of_two_others_and_replays_for_a_seed() {
+        blaze_sim::check(Config::cases(200), |tape| two_choices(tape))
+    }
+
+    fn two_choices(tape: &Tape) {
+        let count = tape.int_in(1..=8usize, "workers");
+        let me = tape.bool("me in the group").then(|| tape.index(count, "me"));
+        let lens: Vec<usize> = (0..count).map(|_| tape.int_in(0..=4usize, "deque len")).collect();
+        let (seed, index) = (tape.int::<u64>("pool seed"), tape.int_in(0..=255usize, "worker index"));
         let workers: Vec<u32> = (0..count).map(|it| (BASE + it) as u32).collect();
         let len = |worker: usize| lens[worker - BASE];
         let run = || {
@@ -5342,8 +5342,12 @@ mod victims {
     /// A worker per generated topology's CPU, one job per node of a generated tree, each
     /// node's job a scope of its children's (so jobs pile up in deques and are stolen), under
     /// either [`Victims`]: every job runs exactly once and the scope at the root ends.
-    #[hegel::test(test_cases = 32)]
-    fn every_job_of_a_tree_runs_once_under_either_victims(tc: TestCase) {
+    #[test]
+    fn every_job_of_a_tree_runs_once_under_either_victims() {
+        blaze_sim::check(Config::cases(32), |tape| every_job_runs_once(tape))
+    }
+
+    fn every_job_runs_once(tape: &Tape) {
         fn run(pool: &Pool, children: &[Vec<usize>], ran: &[AtomicU32], at: usize) {
             ran[at].fetch_add(1, Ordering::Relaxed);
             let mut spin = 0u64;
@@ -5356,14 +5360,14 @@ mod victims {
                 }
             });
         }
-        let groups = tc.draw(gs::integers::<u32>().min_value(1).max_value(2));
-        let each = tc.draw(gs::integers::<u32>().min_value(1).max_value(3));
-        let victims = if tc.draw(gs::booleans()) { Victims::TwoChoices } else { Victims::Walk };
-        let seed = tc.draw(gs::integers::<u64>());
-        let nodes = tc.draw(gs::integers::<usize>().min_value(1).max_value(40));
+        let groups = tape.int_in(1..=2u32, "groups");
+        let each = tape.int_in(1..=3u32, "cpus a group");
+        let victims = if tape.bool("two choices") { Victims::TwoChoices } else { Victims::Walk };
+        let seed = tape.int::<u64>("pool seed");
+        let nodes = tape.int_in(1..=40usize, "nodes");
         let mut children: Vec<Vec<usize>> = vec![Vec::new(); nodes];
         for node in 1..nodes {
-            let parent = tc.draw(gs::integers::<usize>().max_value(node - 1));
+            let parent = tape.index(node, "parent");
             children[parent].push(node);
         }
         let topology = Topology {

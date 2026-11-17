@@ -147,6 +147,11 @@ pub(crate) fn pin_check(
             prefix.display()
         ));
     }
+    // A prefix with a link manifest says its version as data, compared above: its `llvm-config`
+    // is never run, so a prefix for another platform than the host's is linked too.
+    if pin_has_manifest(&built) {
+        return Ok(config);
+    }
     let said = pin_said(&config)
         .map_err(|e| format!("{PIN_PREFIX} is `{}`, and {e}", prefix.display()))?;
     if said != pin.version {
@@ -177,6 +182,77 @@ fn pin_said(config: &std::path::Path) -> Result<String, String> {
     String::from_utf8(out.stdout)
         .map(|it| it.trim().to_owned())
         .map_err(|_| format!("`{} --version` printed no UTF-8", config.display()))
+}
+
+/// Whether the marker `json` holds the link manifest `.github/scripts/llvm.py build` writes
+/// (`"manifest": 1` and the fields [`pin_answer`] reads): what `llvm-config` said when the
+/// prefix was built, kept as data.
+#[allow(dead_code, reason = "an includer that only keys by the pin reads no manifest")]
+pub(crate) fn pin_has_manifest(json: &str) -> bool {
+    json.contains("\"manifest\"")
+}
+
+/// What `llvm-config <query>` would print for the prefix whose marker is `json`, from its link
+/// manifest and without running anything: `None` when the marker has no manifest (a prefix
+/// built before it; its `llvm-config` is run, on the host it was built for), else the answer or
+/// why the manifest has none. `prefix` is where the archive is unpacked (`{prefix}` in a flag)
+/// and `msvc` whether the target names a library `NAME.lib`.
+#[allow(dead_code, reason = "an includer that only keys by the pin reads no manifest")]
+pub(crate) fn pin_answer(
+    json: &str,
+    prefix: &std::path::Path,
+    msvc: bool,
+    query: &[&str],
+) -> Option<Result<String, String>> {
+    if !pin_has_manifest(json) {
+        return None;
+    }
+    let root = prefix.display().to_string();
+    let list = |key: &str| -> Result<String, String> {
+        Ok(pin_list(json, key)?.iter().map(|it| it.replace("{prefix}", &root)).collect::<Vec<_>>().join(" "))
+    };
+    Some(match query {
+        ["--version"] => pin_field(json, "version"),
+        ["--libdir"] => Ok(prefix.join("lib").display().to_string()),
+        ["--libnames", "--link-static"] => pin_list(json, "libs").map(|libs| {
+            let file = |it: &String| if msvc { format!("{it}.lib") } else { format!("lib{it}.a") };
+            libs.iter().map(file).collect::<Vec<_>>().join(" ")
+        }),
+        ["--libnames", "--link-shared"] => {
+            Err("blaze's LLVM is one static library, and has no shared one".to_owned())
+        }
+        ["--system-libs", "--link-static" | "--link-shared"] => list("system_libs"),
+        ["--cflags"] => list("cflags"),
+        ["--cxxflags"] => list("cxxflags"),
+        ["--build-mode"] => pin_field(json, "build_mode"),
+        ["--targets-built"] => list("targets_built"),
+        _ => Err(format!("the manifest in {PIN_MARKER} has no answer for `{}`", query.join(" "))),
+    })
+}
+
+/// The strings of `"key": ["a", "b"]` in `json`: the manifest's lists, whose items hold no
+/// quote or escape (llvm.py refuses to write one that would).
+#[allow(dead_code, reason = "an includer that only keys by the pin reads no manifest")]
+pub(crate) fn pin_list(json: &str, key: &str) -> Result<Vec<String>, String> {
+    let quoted = format!("\"{key}\"");
+    let at = json.find(&quoted).ok_or_else(|| format!("no \"{key}\""))?;
+    let rest = json[at + quoted.len()..].trim_start();
+    let list = rest
+        .strip_prefix(':')
+        .map(str::trim_start)
+        .and_then(|it| it.strip_prefix('['))
+        .ok_or_else(|| format!("\"{key}\" is not a list"))?;
+    let end = list.find(']').ok_or_else(|| format!("\"{key}\" has no closing bracket"))?;
+    let mut out = Vec::new();
+    for item in list[..end].split(',').map(str::trim).filter(|it| !it.is_empty()) {
+        let inner = item
+            .strip_prefix('"')
+            .and_then(|it| it.strip_suffix('"'))
+            .filter(|it| !it.contains(['"', '\\']))
+            .ok_or_else(|| format!("\"{key}\" holds `{item}`, not a plain string"))?;
+        out.push(inner.to_owned());
+    }
+    Ok(out)
 }
 
 /// The string value of `"key": "value"` in `json`. The keys asked for are top-level and unique

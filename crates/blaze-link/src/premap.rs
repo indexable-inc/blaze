@@ -21,7 +21,9 @@
 //!
 //! Every thread-local reference of such an image is a fixed offset from the thread pointer
 //! ([`crate::state::State::tls_at`]): the initial-exec and local-exec models. A dynamic one
-//! (a `__tls_get_addr` pair, a TLS descriptor) is an error, never a slower path.
+//! (a `__tls_get_addr` pair, a TLS descriptor) is an error, never a slower path; an AArch64
+//! ELF executable has no descriptor, each relaxed to one of the two
+//! ([`crate::reloc::in_output`]).
 
 use blaze_codegen::{Arch, CompiledFunction, InstanceKey, Static, Target};
 use blaze_core::FileName;

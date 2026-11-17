@@ -175,6 +175,26 @@ pub fn run(path: &str) -> Result<(), String> {
     let seq =
         std::env::var("HARNESS_NATIVE_SHOT_SEQ").ok().map(|s| nums(&s)).filter(|v| v.len() == 2);
     let mut frames = 0u32;
+    // A replay of explicit live world calls for visual checks (the same typed API as the native window).
+    // HARNESS_NATIVE_SHOT_CALLS names JSON [{at: seconds, call: <world_api::Call>}]; these are never journaled.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ShotCall { at: f32, call: crate::world_api::Call }
+    let mut calls: Vec<ShotCall> = match std::env::var("HARNESS_NATIVE_SHOT_CALLS") {
+        Ok(path) => {
+            let size = std::fs::metadata(&path).map_err(|e| format!("shot calls {path}: {e}"))?.len();
+            if size > 1024 * 1024 { return Err(format!("shot calls {path} exceeds 1 MiB")); }
+            let source = std::fs::read_to_string(&path).map_err(|e| format!("shot calls {path}: {e}"))?;
+            let mut calls: Vec<ShotCall> = serde_json::from_str(&source).map_err(|e| format!("shot calls {path}: {e}"))?;
+            if calls.len() > 128 || calls.iter().any(|c| !c.at.is_finite() || c.at < 0.0 || c.at > secs) {
+                return Err(format!("shot calls {path}: at most 128 calls, each between 0 and {secs} seconds"));
+            }
+            calls.sort_by(|a, b| a.at.total_cmp(&b.at));
+            calls
+        }
+        Err(std::env::VarError::NotPresent) => Vec::new(),
+        Err(e) => return Err(format!("HARNESS_NATIVE_SHOT_CALLS: {e}")),
+    };
     // HARNESS_NATIVE_SHOT_WHEEL `x,y,dy,t[,dx]`: a trackpad swipe of `dy` (and `dx`) points (negative: toward the end)
     // over (x, y) from t seconds, under natural scrolling: a began, changed events over 8 frames, an ended.
     let mut wheel = std::env::var("HARNESS_NATIVE_SHOT_WHEEL")
@@ -213,6 +233,10 @@ pub fn run(path: &str) -> Result<(), String> {
             app.fill_genui_gallery(*root, tree);
         }
         frames += 1;
+        while calls.first().is_some_and(|c| t >= c.at) {
+            let call = calls.remove(0);
+            app.world_call(call.call).map_err(|e| format!("shot world call at {}s: {e}", call.at))?;
+        }
         // The last hover's shape, resolved by the frame after it moved.
         if let Some((x, y)) = hovered.take() {
             eprintln!("harness-native: hover {x},{y} pointer {}", app.pointer_line());

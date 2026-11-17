@@ -167,6 +167,7 @@ diagnostics![AnyDiagnostic<'db> ->
     ComptimeUnsupported,
     ReflectedMemberUnmet<'db>,
     ConstCheckError,
+    ComptimeCall,
     ConstEvalFailed,
     ConstImpure,
     CannotBeDereferenced<'db>,
@@ -276,12 +277,14 @@ diagnostics![AnyDiagnostic<'db> ->
     ReturnOutsideFunction,
     TailCallRefused,
     TailCallTrackCaller,
+    LoopMatchRefused,
     UnsafeBinderCastOfNonBinder<'db>,
     InvalidConstArg,
     NotAStructPath<'db>,
     AutoderefRecursionLimit<'db>,
     MethodOnUnknownRawPointee,
     TyvarBehindRawPointer,
+    MethodCallOnDivergingInferVar,
     InheritedRefMutabilityMismatch,
     FnTraitArgsNotTuple,
     SelfCtorNotTupleOrUnit<'db>,
@@ -815,6 +818,19 @@ pub struct ConstCheckError {
     pub context: hir_ty_mir::mir::const_check::ConstContext,
 }
 
+/// A call of a compile-time-only function (`#[rustc_comptime]`) where the call would run:
+/// rustc's "comptime functions can only be called at compile time".
+#[derive(Debug)]
+pub struct ComptimeCall {
+    pub node: InFile<SyntaxNodePtr>,
+    pub callee: Function,
+}
+
+impl ComptimeCall {
+    /// rustc's message, which has no error code.
+    pub const MESSAGE: &'static str = hir_ty_mir::mir::const_check::comptime::MESSAGE;
+}
+
 /// A `const fn` whose result at run time depends on more than its arguments: "const fn reads
 /// or writes mutable state: `CALLS` is `AtomicU64`, which is not `Freeze`".
 #[derive(Debug)]
@@ -878,6 +894,8 @@ pub enum Unplaced {
     ConstCheck { code: &'static str, message: String },
     /// `check_tail_calls`'s, its message.
     TailCall(&'static str),
+    /// The `#[loop_match]` checks', its message.
+    LoopMatch(&'static str),
     /// Type lowering's (a signature's, a field's, a type alias's), which its node in the store's
     /// source map could not place: the lowering diagnostic as hir-ty has it.
     Lowering(String),
@@ -1831,6 +1849,26 @@ impl GenericDef {
     pub fn bound_source(self, db: &Db, bound_index: u32) -> Option<BoundSource> {
         bound_source(db, GenericDefId::try_from(self).ok()?, bound_index)
     }
+
+    /// The bounds written on the item that its header already implies
+    /// (`#![feature(blaze_implied_bounds)]`): `T: X` on `impl<T: X> C<T>` where `struct C<A:
+    /// X>`. Empty without the feature.
+    pub fn written_implied_bounds(self, db: &Db) -> Vec<InFile<AstPtr<ast::TypeBound>>> {
+        let Ok(def) = GenericDefId::try_from(self) else {
+            // alloc: empty, allocates nothing
+            return Vec::new();
+        };
+        let found = blaze_mem::frame::task(blaze_mem::Tag::Diagnostics, |_| {
+            hir_ty::written_implied_predicates(db, def)
+        });
+        found
+            .into_iter()
+            .filter_map(|index| match bound_source(db, def, index)? {
+                BoundSource::Written(ptr) => Some(ptr),
+                _ => None,
+            })
+            .collect() // alloc: a lint's findings, one per bound said twice
+    }
 }
 
 pub(crate) fn bound_source(db: &Db, def: GenericDefId, bound_index: u32) -> Option<BoundSource> {
@@ -1849,6 +1887,25 @@ pub(crate) fn bound_source(db: &Db, def: GenericDefId, bound_index: u32) -> Opti
         }
         // A `where const { .. }` condition is no bound on a type: nothing points at it yet.
         PredicateSource::WhereConst { .. } => return None,
+        // `#![feature(blaze_implied_bounds)]`: the bound where the type or trait the header
+        // names declares it, the `index`th of its sources but its implied ones.
+        PredicateSource::Implied { from, index } => {
+            let declared = blaze_mem::frame::task(blaze_mem::Tag::Diagnostics, |_| {
+                hir_ty::predicate_sources(db, from)
+            });
+            let position = declared
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| {
+                    !matches!(
+                        it,
+                        PredicateSource::ImpliedTrait(_) | PredicateSource::Implied { .. }
+                    )
+                })
+                .nth(index as usize)?
+                .0;
+            return bound_source(db, from, position as u32);
+        }
         PredicateSource::Written { def, index } => {
             let (params, _, source_map) = GenericParams::with_source_map(db, def);
             let bound = match *params.where_predicates().get(index as usize)? {
@@ -2110,6 +2167,15 @@ pub struct TailCallRefused {
     pub kind: TailCallErrorKind<InFile<ExprOrPatPtr>>,
 }
 
+pub use hir_ty_mir::mir::loop_match::{LoopMatchErrorKind, NotEarlyWhy as LoopMatchNotEarly};
+
+/// A `#[loop_match]` loop or `#[const_continue]` break rustc refuses:
+/// `hir_ty_mir::mir::loop_match::LoopMatchError` at its syntax.
+#[derive(Debug)]
+pub struct LoopMatchRefused {
+    pub kind: LoopMatchErrorKind<InFile<ExprOrPatPtr>>,
+}
+
 /// A tail call of a `#[track_caller]` function: the lint `tail_call_track_caller`.
 #[derive(Debug)]
 pub struct TailCallTrackCaller {
@@ -2155,6 +2221,13 @@ pub struct MethodOnUnknownRawPointee {
 /// unknown pointee in edition 2015, a hard error from 2018.
 #[derive(Debug)]
 pub struct TyvarBehindRawPointer {
+    pub site: SpanSyntax,
+}
+
+/// `method_call_on_diverging_infer_var` "method call on a diverging inference variable": a
+/// method called on a value whose type is only known to come from a coercion of `!`.
+#[derive(Debug)]
+pub struct MethodCallOnDivergingInferVar {
     pub site: SpanSyntax,
 }
 
@@ -3040,7 +3113,8 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                         };
 
                         for &impl_ in
-                            TraitImpls::for_crate(self.db, self.krate).blanket_impls(trait_)
+                            TraitImpls::for_crate_and_trait(self.db, self.krate, trait_)
+                                .blanket_impls(trait_)
                         {
                             if impl_ == def {
                                 continue;
@@ -3529,6 +3603,9 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         if hir_ty_tailck::has_become(body) {
             self.collect_tail_calls(def, placing.get());
         }
+        if body.has_loop_match() {
+            self.collect_loop_match(def, placing.get());
+        }
 
         for diagnostic in BodyValidationDiagnostic::collect(self.db, def, self.style_lints) {
             self.acc.extend(AnyDiagnostic::body_validation_diagnostic(
@@ -3558,7 +3635,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                 self.collect_anon_const_valtree(source_map, konst);
             }
         }
-        self.collect_const_eval(def, body, infer, &placing);
+        self.collect_const_eval(def, body, &placing);
     }
 
     /// What `check_tail_calls` refuses of the body's `become`s, and the tail calls of
@@ -3594,13 +3671,31 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         }
     }
 
+    /// What rustc refuses of the body's `#[loop_match]` loops and `#[const_continue]` breaks.
+    fn collect_loop_match(&mut self, def: DefWithBodyId, source_map: &ExpressionStoreSourceMap) {
+        let check = hir_ty_mir::mir::loop_match::loop_match_check(self.db, def);
+        for error in check.errors() {
+            // clone: the refusal's type, once per refusal
+            let placed = (error.kind.clone()).try_map(|expr| source_map.expr_syntax(expr));
+            match placed {
+                Ok(kind) => self.acc.push(LoopMatchRefused { kind }.into()),
+                Err(SyntheticSyntax) => self.acc.push(
+                    UnplacedDiagnostic {
+                        owner: unplaced_owner(self.db, def.into(), source_map),
+                        what: Unplaced::LoopMatch(error.kind.message()),
+                    }
+                    .into(),
+                ),
+            }
+        }
+    }
+
     /// [`ConstEvalFailed`] of `def` when it is a free `const` or a `static` whose body has no
     /// error of its own: rustc evaluates no body an earlier error taints.
     fn collect_const_eval(
         &mut self,
         def: DefWithBodyId,
         body: &Body,
-        infer: &InferenceResult<'db>,
         placing: &Placing<'db>,
     ) {
         use hir_def::{
@@ -3629,7 +3724,9 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             }
             DefWithBodyId::FunctionId(_) | DefWithBodyId::VariantId(_) => return,
         };
-        if infer.has_type_mismatches() || infer.is_erroneous() || !infer.diagnostics().is_empty() {
+        // rustc evaluates no body an error before MIR taints, whether or not it is borrow
+        // checked (`BLAZE_BORROWCK=off`).
+        if hir_ty_borrowck::tainted_by_errors(db, def).is_some() {
             return;
         }
         let borrowck = hir_ty_borrowck::borrowck(db, def);
@@ -3844,6 +3941,26 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                 }
                 .into(),
             );
+        }
+        // Every function, `const` or not: what is left in its body after its `const { .. }`
+        // blocks runs when it does.
+        let comptime = hir_ty_mir::mir::const_check::comptime::comptime_calls(self.db, def);
+        for call in &comptime.calls {
+            let Some(node) = node_of(call.span) else {
+                self.acc.push(
+                    UnplacedDiagnostic {
+                        owner: unplaced_owner(self.db, def.into(), placing.get()),
+                        what: Unplaced::ConstCheck {
+                            code: "",
+                            // alloc: error path, a reported error's message
+                            message: ComptimeCall::MESSAGE.to_owned(),
+                        },
+                    }
+                    .into(),
+                );
+                continue;
+            };
+            self.acc.push(ComptimeCall { node, callee: call.callee.into() }.into());
         }
         // `blaze::const_impure` is fn-cache's lint: no other crate's `const fn` is walked for it.
         if let DefWithBodyId::FunctionId(func) = def
@@ -4939,6 +5056,9 @@ impl<'db> AnyDiagnostic<'db> {
             InferenceDiagnostic::TyvarBehindRawPointer { span } => {
                 TyvarBehindRawPointer { site: span_syntax(*span)? }.into()
             }
+            InferenceDiagnostic::MethodCallOnDivergingInferVar { span } => {
+                MethodCallOnDivergingInferVar { site: span_syntax(*span)? }.into()
+            }
             &InferenceDiagnostic::InheritedRefMutabilityMismatch { pat } => {
                 InheritedRefMutabilityMismatch { pat: pat_syntax(pat)? }.into()
             }
@@ -5861,7 +5981,7 @@ fn unplaced_inference_text<'db>(
             "E0730: cannot pattern-match on an array without a fixed length".to_owned()
         }
         InferenceDiagnostic::ExpectedArrayOrSlicePat { found, .. } => {
-            format!("E0529: expected an array or slice, found `{}`", ty(found))
+            blaze_report::say!("E0529: expected an array or slice, found ", blaze_report::say::Code(&ty(found))).flat()
         }
         InferenceDiagnostic::InvalidRangePatType { .. } => {
             "E0029: only `char` and numeric types are allowed in range patterns".to_owned()
@@ -6041,6 +6161,9 @@ fn unplaced_inference_text<'db>(
         }
         InferenceDiagnostic::TyvarBehindRawPointer { .. } => {
             "type annotations needed: a method call on a raw pointer with an unknown pointee type".to_owned()
+        }
+        InferenceDiagnostic::MethodCallOnDivergingInferVar { .. } => {
+            "method call on a diverging inference variable".to_owned()
         }
         InferenceDiagnostic::InheritedRefMutabilityMismatch { .. } => {
             "E0308: mismatched types: cannot match inherited `&` with `&mut` pattern".to_owned()

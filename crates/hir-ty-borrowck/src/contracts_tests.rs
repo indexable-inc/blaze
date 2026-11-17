@@ -45,7 +45,7 @@ fn function(db: &Db, name: &str) -> FunctionId {
 fn an_ensures_that_binds_is_borrow_checked_clean() {
     let fx = fixture::db(SOURCE);
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let function = function(&db, "key");
         for mode in [Mode::Nll, Mode::Polonius] {
             let result = borrowck_in_mode(&db, function.into(), mode);

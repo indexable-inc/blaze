@@ -23,9 +23,9 @@
 
 use std::cell::RefCell;
 
-use hegel::TestCase;
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn, Seeds, check, control, root, world};
+use super::{check, control, root, world};
 use crate::{
     Plant,
     cx::Cx,
@@ -60,8 +60,8 @@ fn sum(_: &mut Nested<'_>, (a, b): (u64, u64)) -> u64 {
 /// One call of a plan: [`sum`] or [`mix`], and its arguments.
 type Asked = (bool, u64, u64);
 
-fn asked(d: &mut impl Draw, most: u64) -> Asked {
-    (d.coin(), d.int(0, most), d.int(0, most))
+fn asked(tape: &Tape, most: u64) -> Asked {
+    (tape.coin("is sum"), tape.int_in(0..=most, "a"), tape.int_in(0..=most, "b"))
 }
 
 fn ask(eval: &Eval<'_>, cx: &Cx, (is_sum, a, b): Asked) -> u64 {
@@ -92,12 +92,12 @@ struct Values {
     calls: Vec<Asked>,
 }
 
-fn values(d: &mut impl Draw) -> Values {
-    let seed = d.int(0, u64::MAX);
-    let memo = d.coin();
-    let entries = d.int(0, 16) as usize;
+fn values(tape: &Tape) -> Values {
+    let seed = tape.next_u64("sim seed");
+    let memo = tape.coin("memo");
+    let entries = tape.int_in(0..=16u64, "entries") as usize;
     // Few values, so calls repeat and differ in one argument or in the point alone.
-    let calls = (0..d.int(1, 32)).map(|_| asked(d, 3)).collect();
+    let calls = (0..tape.int_in(1..=32u64, "calls")).map(|_| asked(tape, 3)).collect();
     Values { seed, memo, entries, calls }
 }
 
@@ -134,19 +134,19 @@ fn run_values(plan: &Values, plant: Plant) -> Result<(), String> {
 /// The invariant: `Eval` gives a memo point's own value. Under `direct` and `memo`, every call
 /// gives what the plain function gives and what the same call gave before, for two points
 /// called with the same arguments.
-#[hegel::test(test_cases = 200)]
-fn a_call_gives_the_points_own_value(tc: TestCase) {
-    check(values(&mut Drawn(&tc)), run_values);
+#[test]
+fn a_call_gives_the_points_own_value() {
+    blaze_sim::check(Config::cases(200), |tape| check(values(tape), run_values));
 }
 
 #[test]
 fn the_oracle_catches_a_key_that_ignores_an_argument() {
-    control(Plant::KeyIgnoresLast, |seeds: &mut Seeds| values(seeds), run_values);
+    control(Plant::KeyIgnoresLast, values, run_values);
 }
 
 #[test]
 fn the_oracle_catches_two_points_sharing_entries() {
-    control(Plant::MemoSharesPoints, |seeds: &mut Seeds| values(seeds), run_values);
+    control(Plant::MemoSharesPoints, values, run_values);
 }
 
 // Limits.
@@ -181,12 +181,12 @@ struct Limits {
     calls: Vec<Asked>,
 }
 
-fn limits(d: &mut impl Draw) -> Limits {
-    let seed = d.int(0, u64::MAX);
+fn limits(tape: &Tape) -> Limits {
+    let seed = tape.next_u64("sim seed");
     // From an arena too small for one entry to one with room for all.
-    let bytes = d.pick(&[256usize, 2048, 16 << 10, ROOMY]);
-    let limit = MemoLimit { entries: d.int(0, 12) as usize, bytes };
-    let calls = (0..d.int(1, 96)).map(|_| asked(d, 7)).collect();
+    let bytes = *tape.one_of(&[256usize, 2048, 16 << 10, ROOMY], "memo bytes");
+    let limit = MemoLimit { entries: tape.int_in(0..=12u64, "entries") as usize, bytes };
+    let calls = (0..tape.int_in(1..=96u64, "calls")).map(|_| asked(tape, 7)).collect();
     Limits { seed, limit, calls }
 }
 
@@ -240,14 +240,14 @@ fn run_limits(plan: &Limits, plant: Plant) -> Result<(), String> {
 
 /// The invariant: a memo never holds more entries or bytes than its limit, and until it has
 /// dropped or refused an entry each distinct call's body runs at most once.
-#[hegel::test(test_cases = 200)]
-fn a_memo_stays_within_its_limit(tc: TestCase) {
-    check(limits(&mut Drawn(&tc)), run_limits);
+#[test]
+fn a_memo_stays_within_its_limit() {
+    blaze_sim::check(Config::cases(200), |tape| check(limits(tape), run_limits));
 }
 
 #[test]
 fn the_oracle_catches_a_memo_that_never_evicts() {
-    control(Plant::MemoNeverEvicts, |seeds: &mut Seeds| limits(seeds), run_limits);
+    control(Plant::MemoNeverEvicts, limits, run_limits);
 }
 
 // Provenance.
@@ -306,11 +306,11 @@ struct Traced {
     shapes: Vec<u64>,
 }
 
-fn traced(d: &mut impl Draw) -> Traced {
-    let seed = d.int(0, u64::MAX);
-    let memo = d.coin();
-    let pool: Vec<u64> = (0..3).map(|_| d.int(0, (1 << 20) - 1)).collect();
-    let shapes = (0..d.int(1, 8)).map(|_| d.pick(&pool)).collect();
+fn traced(tape: &Tape) -> Traced {
+    let seed = tape.next_u64("sim seed");
+    let memo = tape.coin("memo");
+    let pool: Vec<u64> = (0..3).map(|_| tape.int_in(0..=(1u64 << 20) - 1, "shape")).collect();
+    let shapes = (0..tape.int_in(1..=8u64, "calls")).map(|_| *tape.one_of(&pool, "which shape")).collect();
     Traced { seed, memo, shapes }
 }
 
@@ -392,14 +392,14 @@ fn run_traced(plan: &Traced, plant: Plant) -> Result<(), String> {
 
 /// The invariant: the graph `Provenance` writes holds exactly the calls made, each under the
 /// call whose body made it, in order.
-#[hegel::test(test_cases = 200)]
-fn provenance_records_the_calls_made(tc: TestCase) {
-    check(traced(&mut Drawn(&tc)), run_traced);
+#[test]
+fn provenance_records_the_calls_made() {
+    blaze_sim::check(Config::cases(200), |tape| check(traced(tape), run_traced));
 }
 
 #[test]
 fn the_oracle_catches_calls_put_under_the_grandparent() {
-    control(Plant::NestedUnderGrandparent, |seeds: &mut Seeds| traced(seeds), run_traced);
+    control(Plant::NestedUnderGrandparent, traced, run_traced);
 }
 
 // Handlers.

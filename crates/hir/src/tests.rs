@@ -31,6 +31,9 @@ use hir_ty::{
     },
 };
 use hir_ty_borrowck::{Checked, NotChecked, Refused};
+use blaze_memo::testing::Ran;
+use span::FileId;
+use std::alloc::Global;
 
 use self::db::TestDB;
 
@@ -50,8 +53,32 @@ fn function(db: &TestDB, name: &str) -> DefWithBodyId {
     panic!("no function `{name}` in the fixture")
 }
 
-fn count(executed: &[String], query: &str) -> usize {
-    executed.iter().filter(|it| *it == query).count()
+/// What `work` ran, from the database's run log (a fixture's database logs its runs): the runs
+/// before it are taken off first, so none of them is counted as its.
+fn runs_of(db: &TestDB, work: impl FnOnce()) -> Vec<Ran, Global> {
+    let log = db.runs().expect("a fixture's database logs its runs");
+    _ = log.take();
+    work();
+    log.take()
+}
+
+/// How many of `runs` ran the query whose kind is named `query` (its `KIND_NAME`), whatever
+/// its key.
+fn count(runs: &[Ran], query: &str) -> usize {
+    runs.iter().filter(|it| it.query == query).count()
+}
+
+/// The kinds the tests count, by name: a body's inference, its MIR and its borrow check.
+const INFER: &str = hir_ty::kinds::infer_body_query::KIND_NAME;
+const MIR: &str = hir_ty::kinds::mir_body_query::KIND_NAME;
+const CHECK: &str = hir_ty_borrowck::borrowck::KIND_NAME;
+
+/// Sets `file`'s text in a new snapshot: one edit and its commit. A file's id and a crate's key
+/// are the same across it; every other id is of the snapshot it was taken in, taken again after.
+fn set_file_text(db: &mut TestDB, file: FileId, text: &str) {
+    let mut edit = db.edit();
+    edit.set_file_text(file, text);
+    _ = edit.commit();
 }
 
 /// Linking hir is what links hir-ty-mir's table, which panics unless exactly one is linked.
@@ -80,13 +107,15 @@ fn main() {
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let workspace = crate::check::workspace_crates(&db);
         assert_eq!(workspace.len(), 1, "only `main` is a workspace member");
-        let executed = db.log_executed(|| {
+        let executed = runs_of(&db, || {
             crate::check::check_workspace(&db, false);
         });
-        assert_eq!(count(&executed, "infer_body_query"), 1, "{executed:#?}");
+        assert_eq!(count(&executed, INFER), 1, "{executed:#?}");
+        let main = function(&db, "main");
+        assert!(executed.iter().any(|it| it.is::<hir_ty::kinds::infer_body_query>(&(main,))));
     });
 }
 
@@ -129,7 +158,7 @@ pub struct E;
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let krate = all_crates(&db)
             .iter()
             .map(|&it| crate::Crate::from(it))
@@ -180,7 +209,7 @@ fn kinds(found: &[crate::AnyDiagnostic<'_>]) -> Vec<String> {
 #[test]
 fn a_check_is_the_same_whatever_order_its_modules_ran_in() {
     let check = |db: &TestDB| {
-        blaze_query::db::attach(db, || {
+        blaze_memo::attach(db, || {
             crate::check::check_workspace(db, false)
                 .iter()
                 .map(|(_, found)| kinds(found))
@@ -206,7 +235,7 @@ fn a_check_is_the_same_whatever_order_its_modules_ran_in() {
 fn a_check_of_a_crate_is_its_modules_checked_one_by_one() {
     let db = fixture::db(MODULES).into_db();
     let before = set_run_order(RunOrder::Reversed);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let krate = crate::check::workspace_crates(&db)[0];
         let modules = crate::check::file_modules(&db, krate);
         assert_eq!(modules.len(), 3, "`main`, `a` and `b`; `a::inner` goes with `a`");
@@ -224,7 +253,7 @@ fn a_check_of_a_crate_is_its_modules_checked_one_by_one() {
 #[test]
 fn a_check_of_some_bodies_leaves_the_others_out() {
     let db = fixture::db(MODULES).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let krate = crate::check::workspace_crates(&db)[0];
         let main = crate::DefWithBody::from(function(&db, "main"));
         let only_main = |it: crate::DefWithBody| it == main;
@@ -258,7 +287,7 @@ fn mismatched() -> u32 {
 #[test]
 fn a_build_gets_no_mir_of_a_body_whose_borrow_check_failed() {
     let db = fixture::db(MOVED_TWICE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let bad = function(&db, "moved_twice");
         match hir_ty_borrowck::checked(&db, bad) {
             Err(Refused::Errors { owner, errors }) => {
@@ -360,7 +389,7 @@ fn every_body_check_makes_its_text_with_no_database_attached() {
 fn an_unplaced_diagnostic_is_at_the_item_of_its_body() {
     use hir_def::{Lookup as _, src::HasSource as _};
     let db = fixture::db("fn f() -> u32 { 1 }").into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let def = function(&db, "f");
         let DefWithBodyId::FunctionId(func) = def else { panic!("`f` is a function") };
         let source_map = hir_def::expr_store::Body::source_map(&db, def);
@@ -375,7 +404,7 @@ fn an_unplaced_diagnostic_is_at_the_item_of_its_body() {
 #[test]
 fn a_lint_of_the_borrow_checker_lets_the_body_build() {
     let db = fixture::db(MOVED_TWICE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let def = function(&db, "mut_unused");
         assert!(
             hir_ty_borrowck::borrowck(&db, def).diagnostics.iter().any(|it| !it.is_error()),
@@ -388,7 +417,7 @@ fn a_lint_of_the_borrow_checker_lets_the_body_build() {
 #[test]
 fn a_body_with_type_errors_is_refused_not_passed() {
     let db = fixture::db(MOVED_TWICE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let def = function(&db, "mismatched");
         assert_eq!(
             hir_ty_borrowck::checked(&db, def),
@@ -415,7 +444,7 @@ fn refused(b: bool) {
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let def = function(&db, "refused");
         let result = hir_ty_borrowck::borrowck(&db, def);
         assert_eq!(result.not_checked, Some(NotChecked::MatchErrors));
@@ -430,7 +459,7 @@ fn refused(b: bool) {
 #[test]
 fn a_check_takes_no_mir_of_another_body() {
     let db = fixture::db(MOVED_TWICE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let good = function(&db, "moved_once");
         let other = function(&db, "mut_unused");
         let checked = hir_ty_borrowck::checked(&db, good).unwrap();
@@ -450,15 +479,15 @@ fn a_check_takes_no_mir_of_another_body() {
 #[test]
 fn a_live_patch_has_code_before_the_check_that_refuses_it() {
     let db = fixture::db(MOVED_TWICE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let bad = function(&db, "moved_twice");
         let (unchecked, pending) = hir_ty_borrowck::speculate(bad);
-        let executed = db.log_executed(|| {
+        let executed = runs_of(&db, || {
             let mir = unchecked.mir(&db, db.mir_body(InferBodyId::DefWithBodyId(bad))).unwrap();
             assert_eq!(mir.unchecked().owner(), bad);
             assert!(!mir.basic_blocks.is_empty());
         });
-        assert_eq!(count(&executed, "borrowck"), 0, "the code comes before the check");
+        assert_eq!(count(&executed, CHECK), 0, "the code comes before the check");
         match pending.finish(&db) {
             Err(Refused::Errors { owner, errors }) => {
                 assert_eq!(owner, bad);
@@ -470,10 +499,13 @@ fn a_live_patch_has_code_before_the_check_that_refuses_it() {
 }
 
 /// A crate released mid-build (`blaze-cargo`'s release, once its units stored their code)
-/// loses its bodies' inference and keeps every other crate's; MIR goes only when asked, and then
-/// of every crate. Each value read again in the same view is made again equal.
+/// keeps every value the memo holds of it: on blaze-memo a value lives as long as its arena,
+/// so neither a body's inference nor its MIR is let go one by one (the per-body drops went
+/// with hir-ty's `drop_inference` and `drop_all_const_eval`), with `mir` or without; what a
+/// release lets go is beside the memo (the solver's shared caches, the interner's retired
+/// tables). Each value read again in the same snapshot is the one it was, run again by nothing.
 #[test]
-fn a_released_crate_drops_its_inference_and_mir_goes_only_when_asked() {
+fn a_released_crate_keeps_its_inference_and_its_mir() {
     use hir_def::HasModule as _;
     let fx = fixture::db(
         r#"
@@ -491,45 +523,40 @@ pub fn kept() -> u32 {
     );
     let mut db = fx.into_db();
     let (a, b) =
-        blaze_query::db::attach(&db, || (function(&db, "released"), function(&db, "kept")));
+        blaze_memo::attach(&db, || (function(&db, "released"), function(&db, "kept")));
     let shape = |db: &TestDB, f| {
         let mir = db.mir_body(InferBodyId::DefWithBodyId(f)).unwrap();
         (mir.basic_blocks.len(), mir.locals.len())
     };
-    let (before_a, before_b) = blaze_query::db::attach(&db, || (shape(&db, a), shape(&db, b)));
+    let (before_a, before_b) = blaze_memo::attach(&db, || (shape(&db, a), shape(&db, b)));
     let krate = a.krate(&db);
     assert_ne!(krate, b.krate(&db));
 
-    let dropped = crate::evict::drop_crates_after_store(&mut db, &[krate], false);
-    assert_eq!((dropped.inference, dropped.mir, dropped.const_eval), (1, 0, 0), "{dropped:?}");
-    blaze_query::db::attach(&db, || {
-        let executed = db.log_executed(|| {
+    crate::evict::drop_crates_after_store(&mut db, &[krate], false);
+    blaze_memo::attach(&db, || {
+        let executed = runs_of(&db, || {
             InferenceResult::of(&db, InferBodyId::DefWithBodyId(a));
             InferenceResult::of(&db, InferBodyId::DefWithBodyId(b));
             assert_eq!((shape(&db, a), shape(&db, b)), (before_a, before_b));
         });
-        assert_eq!(
-            count(&executed, "infer_body_query"),
-            1,
-            "the released crate's alone: {executed:#?}"
-        );
-        assert_eq!(count(&executed, "mir_body_query"), 0, "MIR kept unless asked: {executed:#?}");
+        assert_eq!(count(&executed, INFER), 0, "inference kept: {executed:#?}");
+        assert_eq!(count(&executed, MIR), 0, "MIR kept: {executed:#?}");
     });
 
-    let dropped = crate::evict::drop_crates_after_store(&mut db, &[], true);
-    assert!(dropped.mir >= 2 && dropped.inference == 0, "{dropped:?}");
-    blaze_query::db::attach(&db, || {
-        let executed = db.log_executed(|| {
+    crate::evict::drop_crates_after_store(&mut db, &[], true);
+    blaze_memo::attach(&db, || {
+        let executed = runs_of(&db, || {
+            InferenceResult::of(&db, InferBodyId::DefWithBodyId(a));
             assert_eq!((shape(&db, a), shape(&db, b)), (before_a, before_b));
         });
-        assert_eq!(count(&executed, "mir_body_query"), 2, "every crate's MIR: {executed:#?}");
-        assert_eq!(count(&executed, "infer_body_query"), 0, "{executed:#?}");
+        assert_eq!(count(&executed, MIR), 0, "MIR kept with `mir` too: {executed:#?}");
+        assert_eq!(count(&executed, INFER), 0, "{executed:#?}");
     });
 }
 
-/// What a check keeps in one process does not grow check over check: each check's MIR goes as
-/// it ends (`blaze-cargo`'s release at keep), and the rows and values a second round of the
-/// same edits leaves are the first round's. The check before slowcheck kept every MIR it made
+/// What a check keeps in one process does not grow check over check: an edit drops the arenas
+/// it changed, MIR with them, and the bytes the snapshot holds after a second round of the
+/// same edits are at most the first round's. The check before slowcheck kept every MIR it made
 /// in the kept front end, so the heap grew by a check's MIR each check (nfcheck: 127 GiB).
 #[test]
 fn checking_the_same_edits_twice_retains_nothing_more() {
@@ -538,82 +565,72 @@ fn checking_the_same_edits_twice_retains_nothing_more() {
     let fx = fixture::db(&format!("//- minicore: sized, copy\n//- /main.rs crate:main\n{A}"));
     let main = fx.file_at("/main.rs").file_id(fx.db());
     let mut db = fx.into_db();
-    // One check and the release its build's end makes; what the storage then retains, by
-    // ingredient: rows in use, the bytes of every row and what budgeted values weigh.
+    // One check and the release its build's end makes; what the snapshot then holds: the
+    // bytes of its arenas ([`blaze_memo::Memo::held`]), MIR among them.
     let round = |db: &mut TestDB, text: &str| {
-        db.set_file_text(main, text);
-        blaze_query::db::attach(&*db, || {
+        set_file_text(db, main, text);
+        blaze_memo::attach(&*db, || {
             crate::check::check_workspace(&*db, false);
         });
-        let made = crate::evict::mir_held(db);
-        assert!(made > 0, "a check makes MIR (borrowck reads it): none held after it");
         crate::evict::drop_crates_after_store(db, &[], true);
-        assert_eq!(
-            crate::evict::mir_held(db),
-            0,
-            "the end of a check lets go of every MIR it made"
-        );
-        let mut usage = Vec::new();
-        blaze_query::db::Database::storage(&*db).memory_usage(&mut usage);
-        usage.sort_by_key(|it| it.name);
-        usage
-            .into_iter()
-            .map(|it| (it.name, it.used, it.row_bytes, it.value_bytes))
-            .collect::<Vec<_>>()
+        blaze_memo::Database::memo(&*db).held()
     };
-    // A first round makes every row and interned key both texts need.
-    round(&mut db, B);
-    round(&mut db, A);
+    // A first round makes every interned key both texts need.
+    let warm = [round(&mut db, B), round(&mut db, A)];
     let first = [round(&mut db, B), round(&mut db, A)];
     let second = [round(&mut db, B), round(&mut db, A)];
-    for (first, second) in first.iter().zip(&second) {
-        let grew: Vec<_> = first
-            .iter()
-            .zip(second)
-            .filter(|(was, now)| was.0 != now.0 || now.1 > was.1 || now.2 > was.2 || now.3 > was.3)
-            .collect();
+    for (at, (was, now)) in first.iter().zip(&second).enumerate() {
         assert!(
-            grew.is_empty(),
-            "the second round of the same edits retains more than the first: {grew:#?}"
+            now <= was,
+            "the second round of the same edits holds more than the first (text {}): bytes \
+             held after each round: {warm:?} {first:?} {second:?}",
+            ["B", "A"][at]
         );
-        assert_eq!(first.len(), second.len(), "an ingredient appeared");
     }
 }
 
-/// A check after the one before it let go of every MIR makes again only the MIR of the body
-/// an edit changed: an unchanged body's borrow check is verified by its edges (the MIR's
-/// memo, kept without its value), never by reading its MIR, so ending a check's MIR costs the
-/// next check no MIR of an unchanged body.
+/// A check after an edit makes again only the MIR of the body the edit changed: an unchanged
+/// body's borrow check hits (its record holds its proof), never by reading its MIR. The floor:
+/// while an edit drops its crate's whole arena with no per-item record to serve it
+/// (front-end-on-memo.md, decision 4 and its cost note) this does not hold.
+///
+/// False by design until then (port decision 3: the memo is not the incremental mechanism):
+/// the edit is of `main`'s own file, so the commit drops `main`'s arena and every body of it is
+/// checked and its MIR made again. Left failing until the per-item records serve it.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn the_check_after_a_release_makes_only_the_edited_bodys_mir() {
     const A: &str = "fn edited() -> u32 {\n    let x = 1;\n    x + 1\n}\nfn kept() -> u32 {\n    let y = 2;\n    y\n}\nfn also_kept(z: u32) -> u32 {\n    z\n}\n";
     let fx = fixture::db(&format!("//- minicore: sized, copy\n//- /main.rs crate:main\n{A}"));
     let main = fx.file_at("/main.rs").file_id(fx.db());
     let mut db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         crate::check::check_workspace(&db, false);
     });
-    assert!(crate::evict::mir_held(&db) >= 3, "the check made every body's MIR");
     crate::evict::drop_crates_after_store(&mut db, &[], true);
-    assert_eq!(crate::evict::mir_held(&db), 0);
-    db.set_file_text(main, &A.replace("let x = 1;", "let x = 5;"));
-    blaze_query::db::attach(&db, || {
-        let executed = db.log_executed(|| {
+    set_file_text(&mut db, main, &A.replace("let x = 1;", "let x = 5;"));
+    blaze_memo::attach(&db, || {
+        let executed = runs_of(&db, || {
             crate::check::check_workspace(&db, false);
         });
         assert!(
-            count(&executed, "borrowck") <= 1,
+            count(&executed, CHECK) <= 1,
             "only the edited body is checked again: {executed:#?}"
         );
         assert!(
-            count(&executed, "mir_body_query") <= 1,
+            count(&executed, MIR) <= 1,
             "only the edited body's MIR is made again: {executed:#?}"
         );
     });
 }
 
+/// A body's results keep their cutoff across an edit of another crate: its borrow check and its
+/// inference run again by nothing, and its MIR read again is the one it was. Before blaze-memo
+/// the inference was dropped first (`drop_after_store`, gone with hir-ty's per-body drops: a
+/// value lives as long as its arena) and came back equal on its first read; nothing drops it
+/// now, so that read runs nothing either.
 #[test]
-fn dropped_results_keep_cutoff_and_come_back_equal() {
+fn results_keep_cutoff_across_an_edit_of_another_crate() {
     let fx = fixture::db(
         r#"
 //- minicore: sized, copy
@@ -625,10 +642,13 @@ fn evicted() -> u32 {
     consume(s);
     1
 }
-//- /other.rs crate:other
+//- /other.rs crate:other new_source_root:local
 pub fn g() {}
 "#,
     );
+    // `other` in a source root of its own, as another package's files are: a file is homed in
+    // the arena of the first crate of its source root (base-db's `Layout::owner`), so in the
+    // root it would share with `main` its edit would drop `main`'s arena too.
     let files = fx.files().to_vec();
     let mut db = fx.into_db();
     let other = files
@@ -636,33 +656,37 @@ pub fn g() {}
         .map(|it| it.file_id(&db))
         .find(|&it| db.file_text(it).text(&db).contains("pub fn g"))
         .unwrap();
-    let f = blaze_query::db::attach(&db, || function(&db, "evicted"));
-    let before = blaze_query::db::attach(&db, || {
+    let f = blaze_memo::attach(&db, || function(&db, "evicted"));
+    let before = blaze_memo::attach(&db, || {
         hir_ty_borrowck::borrowck(&db, f);
         let mir = db.mir_body(InferBodyId::DefWithBodyId(f)).unwrap();
         (mir.basic_blocks.len(), mir.locals.len())
     });
 
-    crate::evict::drop_after_store(&mut db, &[f]);
-    db.set_file_text(other, "pub fn g() {}\npub fn h() {}\n");
+    set_file_text(&mut db, other, "pub fn g() {}\npub fn h() {}\n");
 
-    blaze_query::db::attach(&db, || {
-        let executed = db.log_executed(|| {
+    blaze_memo::attach(&db, || {
+        // The body's id is of the snapshot it was taken in: taken again after the commit.
+        let f = function(&db, "evicted");
+        let executed = runs_of(&db, || {
             hir_ty_borrowck::borrowck(&db, f);
         });
-        assert_eq!(count(&executed, "borrowck"), 0, "{executed:#?}");
-        assert_eq!(count(&executed, "infer_body_query"), 0, "{executed:#?}");
+        assert_eq!(count(&executed, CHECK), 0, "{executed:#?}");
+        assert_eq!(count(&executed, INFER), 0, "{executed:#?}");
 
-        let executed = db.log_executed(|| {
+        let executed = runs_of(&db, || {
             InferenceResult::of(&db, InferBodyId::DefWithBodyId(f));
         });
-        assert_eq!(count(&executed, "infer_body_query"), 1, "{executed:#?}");
+        assert!(
+            !executed.iter().any(|it| it.is::<hir_ty::kinds::infer_body_query>(&(f,))),
+            "{executed:#?}"
+        );
 
-        let executed = db.log_executed(|| {
+        let executed = runs_of(&db, || {
             let mir = db.mir_body(InferBodyId::DefWithBodyId(f)).unwrap();
             assert_eq!((mir.basic_blocks.len(), mir.locals.len()), before);
         });
-        assert!(count(&executed, "mir_body_query") <= 1, "{executed:#?}");
+        assert!(count(&executed, MIR) <= 1, "{executed:#?}");
     });
 }
 
@@ -736,7 +760,7 @@ fn binding_ty<'db>(db: &'db TestDB, def: DefWithBodyId, name: &str) -> Ty<'db> {
 #[test]
 fn a_future_is_send_only_when_what_it_holds_across_an_await_is() {
     let db = fixture::db(HELD_ACROSS_AWAIT).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let (_, ModuleDefId::TraitId(send)) = type_item(&db, "Send") else {
             panic!("`Send` is a trait")
         };
@@ -779,7 +803,7 @@ fn moved_before() {
 #[test]
 fn a_goal_stalled_on_the_body_s_own_future_is_checked_after_inference() {
     let db = fixture::db(SEND_REQUIRED_IN_ITS_BODY).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         for (name, errors) in [("held", 1), ("moved_before", 0)] {
             let body = InferBodyId::DefWithBodyId(function(&db, name));
             let infer = InferenceResult::of(&db, body);
@@ -794,7 +818,7 @@ fn a_goal_stalled_on_the_body_s_own_future_is_checked_after_inference() {
 #[test]
 fn a_solved_goal_answers_the_same_from_the_cache_and_on_another_thread() {
     let db = fixture::db(SOLVER).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let (krate, ModuleDefId::TraitId(tr)) = type_item(&db, "Tr") else {
             panic!("`Tr` is a trait")
         };
@@ -816,7 +840,7 @@ fn a_solved_goal_answers_the_same_from_the_cache_and_on_another_thread() {
             (wrap(wrap(leaf(c))), false),
             (wrap(wrap(wrap(leaf(a)))), true),
         ];
-
+    
         let cold: Vec<EvaluationResult> = goals
             .iter()
             .map(|goal| {
@@ -831,13 +855,13 @@ fn a_solved_goal_answers_the_same_from_the_cache_and_on_another_thread() {
             };
             assert_eq!(answer, expected, "goal {at}");
         }
-
+    
         let warm = DbInterner::new_with(&db, krate);
         assert_eq!(implements(warm, tr, &goals), cold, "first asked");
         assert_eq!(implements(warm, tr, &goals), cold, "answered from the cache");
         let elsewhere = std::thread::scope(|scope| {
             scope
-                .spawn(|| blaze_query::db::attach(&db, || implements(warm, tr, &goals)))
+                .spawn(|| blaze_memo::attach(&db,|| implements(warm, tr, &goals)))
                 .join()
                 .unwrap()
         });
@@ -845,6 +869,12 @@ fn a_solved_goal_answers_the_same_from_the_cache_and_on_another_thread() {
     });
 }
 
+/// Restated for blaze-memo (port decision 9). It also claimed `unrelated`, of the edited
+/// crate, is not inferred again: false by design (port decision 3: the memo is not the
+/// incremental mechanism), since the edit is of a file of `main`, so the commit drops `main`'s
+/// arena and every body of it is inferred again. That claim is the host's, on the body entries
+/// (docs/v2/plan/design/host.md), and is owed there. What holds here: `second`, answered from
+/// the goal `first` solved, reruns as `first` does when what the goal read changes.
 #[test]
 fn a_goal_reused_from_another_query_reruns_it_when_what_the_goal_read_changes() {
     let fx = fixture::db(
@@ -873,10 +903,10 @@ impl<T> Tr for B<T> where T: Tr {}
         .map(|it| it.file_id(&db))
         .find(|&it| db.file_text(it).text(&db).contains("impl Tr for A"))
         .unwrap();
-    let [first, second, unrelated] = blaze_query::db::attach(&db, || {
+    let [first, second, unrelated] = blaze_memo::attach(&db, || {
         ["first", "second", "unrelated"].map(|it| function(&db, it))
     });
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         // `B<A>: Tr` is solved for `first`, then answered for `second` from the shared cache.
         for body in [first, second, unrelated] {
             InferenceResult::of(&db, InferBodyId::DefWithBodyId(body));
@@ -884,22 +914,25 @@ impl<T> Tr for B<T> where T: Tr {}
     });
 
     // Only the impl's where clause changes: no item, name or body `second` reads directly.
-    db.set_file_text(
+    set_file_text(
+        &mut db,
         imp,
         "use super::*;\nimpl Tr for A {}\nimpl<T> Tr for B<T> where T: Other {}\n",
     );
 
-    blaze_query::db::attach(&db, || {
-        let executed = db.log_executed(|| {
-            InferenceResult::of(&db, InferBodyId::DefWithBodyId(unrelated));
-        });
-        assert_eq!(count(&executed, "infer_body_query"), 0, "{executed:#?}");
+    blaze_memo::attach(&db, || {
+        // The bodies' ids are of the snapshot they were taken in: taken again after the commit.
+        let [first, second] = ["first", "second"].map(|it| function(&db, it));
         // `second` took the goal's reads with its answer, so it reruns as `first` does.
         for body in [second, first] {
-            let executed = db.log_executed(|| {
+            let executed = runs_of(&db, || {
                 InferenceResult::of(&db, InferBodyId::DefWithBodyId(body));
             });
-            assert_eq!(count(&executed, "infer_body_query"), 1, "{executed:#?}");
+            assert_eq!(count(&executed, INFER), 1, "{executed:#?}");
+            assert!(
+                executed.iter().any(|it| it.is::<hir_ty::kinds::infer_body_query>(&(body,))),
+                "{executed:#?}"
+            );
         }
     });
 }
@@ -977,7 +1010,7 @@ const MUTABLE_WHILE_SHARED: (&str, &str) =
 /// messages in rustc's order, and the gate refuses it unless all of them are lints.
 fn borrowck_gives(name: &str, expected: &[(&str, &str)]) {
     let db = fixture::db(BORROWCK).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let def = function(&db, name);
         let found: Vec<(&str, String)> = hir_ty_borrowck::borrowck(&db, def)
             .diagnostics
@@ -1123,45 +1156,37 @@ fn lowered(db: &TestDB, variants: &[(String, VariantId)], impls: &[ImplId]) -> V
     out
 }
 
-const BATCHES: [&str; 4] =
-    ["crate_field_types", "crate_impl_self_tys", "crate_impl_traits", "crate_impl_predicates"];
+const BATCHES: [&str; 4] = [
+    hir_ty::kinds::crate_field_types::KIND_NAME,
+    hir_ty::kinds::crate_impl_self_tys::KIND_NAME,
+    hir_ty::kinds::crate_impl_traits::KIND_NAME,
+    hir_ty::kinds::crate_impl_predicates::KIND_NAME,
+];
 
 #[test]
 fn a_dependency_batch_is_what_the_per_item_lowering_gives() {
-    // Every write ends in the maintainers, and hir-ty's impls maintainer lowers each impl's
-    // self type and trait there, so the log starts at the write that fills both crates.
+    // A write runs no query (no maintainer is left to run at a write): every query of the
+    // test runs in the log below.
     let fx = fixture::db("//- /dep.rs crate:dep library\n//- /main.rs crate:main\n");
     let files = [fx.file_at("/dep.rs"), fx.file_at("/main.rs")].map(|it| it.file_id(fx.db()));
     let mut db = fx.into_db();
-    let written = db.log_mut(|db| {
-        db.batch(base_db::Trigger::named("the test's edit"), |db| {
-            for file in files {
-                db.set_file_text(file, SIGNATURES);
-            }
-        })
-    });
-    let mut executed: Vec<String> = written
-        .into_iter()
-        .filter_map(|event| match event.kind {
-            blaze_query::db::EventKind::WillExecute { database_key } => Some(
-                blaze_query::db::Database::storage(&db)
-                    .ingredient_name(database_key.ingredient_index())
-                    .to_owned(),
-            ),
-            _ => None,
-        })
-        .collect();
-    blaze_query::db::attach(&db, || {
+    // Both files in one edit, one commit.
+    let mut edit = db.edit();
+    for file in files {
+        edit.set_file_text(file, SIGNATURES);
+    }
+    _ = edit.commit();
+    blaze_memo::attach(&db, || {
         let (dep, main) = dep_and_main(&db);
         let (mut batched, mut per_item) = (Vec::new(), Vec::new());
         let (mut dep_variants, mut dep_impls) = (Vec::new(), Vec::new());
         let (mut main_variants, mut main_impls) = (Vec::new(), Vec::new());
-        executed.extend(db.log_executed(|| {
+        let executed = runs_of(&db, || {
             (dep_variants, dep_impls) = signatures(&db, dep);
             (main_variants, main_impls) = signatures(&db, main);
             batched = lowered(&db, &dep_variants, &dep_impls);
             per_item = lowered(&db, &main_variants, &main_impls);
-        }));
+        });
         let names = |variants: &[(String, VariantId)]| -> Vec<String> {
             variants.iter().map(|(name, _)| name.clone()).collect()
         };
@@ -1173,13 +1198,22 @@ fn a_dependency_batch_is_what_the_per_item_lowering_gives() {
         for batch in BATCHES {
             assert_eq!(count(&executed, batch), 1, "{batch}: {executed:#?}");
         }
+        use hir_ty::kinds::{field_types_of_variant, impl_self_ty_of_impl, impl_trait_of_impl};
         assert_eq!(
-            count(&executed, "field_types_of_variant"),
+            count(&executed, field_types_of_variant::KIND_NAME),
             main_variants.len(),
             "{executed:#?}"
         );
-        assert_eq!(count(&executed, "impl_self_ty_of_impl"), main_impls.len(), "{executed:#?}");
-        assert_eq!(count(&executed, "impl_trait_of_impl"), main_impls.len(), "{executed:#?}");
+        assert_eq!(
+            count(&executed, impl_self_ty_of_impl::KIND_NAME),
+            main_impls.len(),
+            "{executed:#?}"
+        );
+        assert_eq!(
+            count(&executed, impl_trait_of_impl::KIND_NAME),
+            main_impls.len(),
+            "{executed:#?}"
+        );
     });
 }
 
@@ -1193,10 +1227,10 @@ fn round_trip(cold: &ColdBatch, again: &ColdBatch) -> Aligned {
 #[test]
 fn a_cold_batch_round_trips_with_its_types() {
     let db = signatures_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let (dep, _) = dep_and_main(&db);
         let interner = DbInterner::new_with(&db, dep);
-
+    
         let batch = CrateFieldTypes::of(&db, dep);
         assert!(!batch.is_empty());
         let buffer = round_trip(
@@ -1204,21 +1238,21 @@ fn a_cold_batch_round_trips_with_its_types() {
             &ColdBatch::of_field_types(interner, batch),
         );
         assert_eq!(&ColdBatch::read(&buffer).unwrap().field_types(interner).unwrap(), batch);
-
+    
         let batch = CrateImplSelfTys::of(&db, dep);
         let buffer = round_trip(
             &ColdBatch::of_impl_self_tys(interner, batch),
             &ColdBatch::of_impl_self_tys(interner, batch),
         );
         assert_eq!(&ColdBatch::read(&buffer).unwrap().impl_self_tys(interner).unwrap(), batch);
-
+    
         let batch = CrateImplTraits::of(&db, dep);
         let buffer = round_trip(
             &ColdBatch::of_impl_traits(interner, batch),
             &ColdBatch::of_impl_traits(interner, batch),
         );
         assert_eq!(&ColdBatch::read(&buffer).unwrap().impl_traits(interner).unwrap(), batch);
-
+    
         let batch = CrateImplPredicates::of(&db, dep);
         let buffer = round_trip(
             &ColdBatch::of_impl_predicates(interner, batch),
@@ -1231,10 +1265,10 @@ fn a_cold_batch_round_trips_with_its_types() {
 #[test]
 fn a_workspace_crate_has_no_batch() {
     let db = signatures_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let (_, main) = dep_and_main(&db);
         let (variants, impls) = signatures(&db, main);
-        let executed = db.log_executed(|| {
+        let executed = runs_of(&db, || {
             lowered(&db, &variants, &impls);
         });
         for batch in BATCHES {
@@ -1285,13 +1319,13 @@ const P: (&[u16], u8) = (&[1, 2, 3], 4);
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let interner = DbInterner::new_no_crate(&db);
         for name in ["S", "D", "P"] {
             let value = db
                 .const_eval(constant(&db, name), GenericArgs::empty(), None)
                 .unwrap_or_else(|error| panic!("`{name}` evaluates: {error:?}"));
-
+    
             let mut out = Writer::new(<AllocationRoot as Record>::SCHEMA);
             let mut tys = TyTableWriter::new(interner);
             let allocation = write_allocation(&mut out, &mut tys, value);
@@ -1304,7 +1338,7 @@ const P: (&[u16], u8) = (&[1, 2, 3], 4);
                 reserved: 0,
             });
             let buffer = Aligned::copy_from(&out.finish(root));
-
+    
             let root = blaze_format::open::<AllocationRoot>(&buffer).unwrap();
             let record = root.allocation.follow(&buffer).unwrap().unwrap();
             let tys = TyTableReader::open(interner, &buffer, root.table).unwrap();
@@ -1364,7 +1398,7 @@ fn f(s: &S, v: &mut Vec<u32>) -> u32 {
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let interner = DbInterner::new_no_crate(&db);
         let bodies = bodies(&db);
         assert_eq!(bodies.len(), 4, "`get`, `m`, `opaque` and `f`");

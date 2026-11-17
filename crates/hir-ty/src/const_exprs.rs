@@ -304,6 +304,13 @@ impl<'db> Cx<'db> {
             }
             Expr::Literal(Literal::Bool(value)) => Some(Norm::Bool(*value)),
             Expr::Literal(Literal::Int(value, _)) => Some(Norm::Int(Poly::constant(*value))),
+            // A `line!()` or `column!()` is a placeholder in the store, its value where it is
+            // written (`body_store::placed_literal`): no normal form of its own.
+            Expr::Literal(Literal::Uint(..))
+                if crate::body_store::calls_place_macro(self.db, self.store) =>
+            {
+                None
+            }
             Expr::Literal(Literal::Uint(value, _)) => {
                 Some(Norm::Int(Poly::constant(i128::try_from(*value).ok()?)))
             }

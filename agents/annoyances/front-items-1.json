@@ -1,0 +1,14 @@
+{
+ "id": "front-items-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane front-items",
+ "where": "crates/blaze-front-items (a new crate written by a write-only lane)",
+ "what": "I wrote the new crate's Cargo.toml several tool calls before its src/lib.rs. `crates/*` makes every directory with a manifest a workspace member, so cargo could not load the workspace (`can't find library blaze_front_items`) and every other lane's compile and test was blocked until the main agent noticed and told me.",
+ "cost": "every lane's builds blocked for the minutes between the manifest and the lib",
+ "cause": "a glob workspace member list makes a half-written crate a whole-workspace failure, and a write-only lane cannot see that it broke the load",
+ "class": "a partial write that is visible to everyone (save points that do not compile, rule 24)",
+ "prevention": "a new crate's manifest and its lib.rs are written in the same step, and a module is declared in lib.rs only once its file exists; a gate check could refuse a `crates/*/Cargo.toml` with no `src/lib.rs` or `src/main.rs` before any lane's build runs",
+ "workaround": "write lib.rs first, with no modules, then the manifest",
+ "fix": "none in the tree yet (the rule is in the lane brief)",
+ "state": "open"
+}

@@ -27,6 +27,9 @@
 // and calls it.
 #![deny(unsafe_code)]
 #![feature(allocator_api, allocator_ext)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 pub mod arch;
 pub mod buf;
@@ -68,6 +71,13 @@ pub struct Target {
     /// (`Name::Counter`), as a tiered run's does to choose what to compile again. Code built
     /// to keep (a `blaze build`'s, a test's) counts nothing and names no counter cell.
     pub counts: bool,
+    /// The code is for blaze's launcher (docs/v2/plan/design/launcher.md, "Step 3"): a call
+    /// of a named function loads the callee's slot word and branches to what it holds, never
+    /// to the callee itself, whether or not it is colocated; the address of a colocated
+    /// function is taken PC-relative, never from the GOT, so the two relocations differ in
+    /// kind and the launcher reads them apart: a GOT relocation against a function is its
+    /// slot word, any other is its entry thunk.
+    pub slots: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

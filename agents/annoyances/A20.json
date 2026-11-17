@@ -1,0 +1,11 @@
+{
+ "id": "A20",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "the harness (Claude Code)",
+ "what": "Reminders that the user has not heard from me arrive in the middle of multi-step tool sequences, so status lines are written before there is a result.",
+ "cost": "small, frequent",
+ "cause": "long sequences of tool calls",
+ "workaround": "one sentence, then continue",
+ "state": "accepted"
+}

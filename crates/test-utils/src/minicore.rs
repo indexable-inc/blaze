@@ -22,6 +22,7 @@
 //!     borrow_mut: borrow
 //!     cell: copy, drop
 //!     clone: sized
+//!     closure_methods: option, result, fn
 //!     coerce_pointee: derive, sized, unsize, coerce_unsized, dispatch_from_dyn
 //!     reborrow: derive, copy
 //!     const_param_ty: derive, eq
@@ -40,8 +41,10 @@
 //!     eq: sized, unary_ops, builtin_impls
 //!     error: fmt
 //!     error_union: error, from, clone, hash
+//!     expect: option, fmt
 //!     float_consts: unary_ops, builtin_impls
 //!     fmt: option, result, transmute, coerce_unsized, copy, clone, derive
+//!     fmt_write: fmt
 //!     fn: sized, tuple
 //!     from: sized, result
 //!     future: pin
@@ -58,16 +61,26 @@
 //!     int_impl: size_of, transmute
 //!     num_methods:
 //!     int_wrapping:
+//!     int_overflow: non_zero, from, result, option, iterator
+//!     int_cast: from
+//!     int_methods: int_overflow, int_wrapping
+//!     io_error:
 //!     iterator: option
 //!     iterators: iterator, fn
 //!     iterators_more: iterators, clone
 //!     manually_drop: drop
+//!     mem_take: default, option
 //!     matches:
 //!     mul:
 //!     non_null: pat
 //!     non_zero: pat, transmute, option, copy
 //!     option: panic
+//!     option_methods: option, result, default
 //!     ord: eq, option
+//!     ord_methods: ord
+//!     ord_ops: ord, clone, copy, derive
+//!     option_clone: option, clone
+//!     option_from: option, from
 //!     panic: fmt
 //!     panic_location: panic
 //!     pat: panic
@@ -75,6 +88,8 @@
 //!     pin:
 //!     pointee: copy, send, sync, ord, hash, unpin, phantom_data
 //!     range:
+//!     reach: slice, option, result
+//!     blaze_unreachable: panic
 //!     new_range:
 //!     receiver: deref
 //!     record: clone, copy
@@ -82,15 +97,22 @@
 //!     send: sized
 //!     size_of: sized
 //!     sized:
+//!     string: vec, eq
 //!     slice:
 //!     str: sized, result
+//!     str_methods: str, eq
+//!     sub:
 //!     sync: sized
+//!     time: add, sub, ord_ops, option, int_bounds
 //!     transmute:
 //!     try: infallible
+//!     try_bodies: try, from
 //!     tuple:
 //!     unary_ops:
 //!     unpin: sized
 //!     unsize: sized
+//!     vec: allocator_api, index, reach, deref_mut, option, default, fn, clone
+//!     vec_eq: vec, eq
 //!     write: fmt
 //!     todo: panic
 //!     unimplemented: panic
@@ -205,6 +227,24 @@ pub mod marker {
     impl<T: PointeeSized> Copy for PhantomData<T> {}
     // endregion:copy
 
+    // region:default
+    impl<T: PointeeSized> crate::default::Default for PhantomData<T> {
+        fn default() -> Self {
+            Self
+        }
+    }
+    // endregion:default
+
+    // region:eq
+    // `marker.rs`: equal whatever `T` is.
+    impl<T: PointeeSized> crate::cmp::PartialEq for PhantomData<T> {
+        fn eq(&self, _other: &PhantomData<T>) -> bool {
+            true
+        }
+    }
+    impl<T: PointeeSized> crate::cmp::Eq for PhantomData<T> {}
+    // endregion:eq
+
     // endregion:phantom_data
 
     // region:discriminant
@@ -243,6 +283,18 @@ pub mod marker {
 
     #[rustc_builtin_macro]
     pub macro ConstParamTy($item:item) {}
+
+    // As library/core/src/marker.rs: the scalars, and (bounded on `unsized_const_params`
+    // there, which hir-ty checks on the parameter's type) `str`, slices and references.
+    macro_rules! const_param_ty_impls {
+        ($($t:ty)*) => { $(impl ConstParamTy_ for $t {})* };
+    }
+    const_param_ty_impls! {
+        usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 bool char () str
+    }
+    impl<T: ConstParamTy_, const N: usize> ConstParamTy_ for [T; N] {}
+    impl<T: ConstParamTy_> ConstParamTy_ for [T] {}
+    impl<T: ConstParamTy_ + ?Sized> ConstParamTy_ for &T {}
     // endregion:const_param_ty
 
     // region:eq
@@ -288,6 +340,16 @@ pub mod default {
     }
     impl Default for () {
         fn default() -> Self {}
+    }
+    impl<T> Default for [T; 0] {
+        fn default() -> [T; 0] {
+            []
+        }
+    }
+    impl<T: Default> Default for [T; 3] {
+        fn default() -> [T; 3] {
+            [T::default(), T::default(), T::default()]
+        }
     }
     // endregion:builtin_impls
 }
@@ -489,7 +551,8 @@ pub mod convert {
     }
     // endregion:as_mut
     // region:infallible
-    pub enum Infallible {}
+    // An alias of `!`, as in core since Rust 1.100.
+    pub type Infallible = !;
     // endregion:infallible
 }
 
@@ -536,6 +599,8 @@ pub mod mem {
 
     // region:drop
     pub fn drop<T>(_x: T) {}
+    // A stand-in: core's runs no drop of `_x` (`ManuallyDrop::new`), which no test here reads.
+    pub fn forget<T>(_x: T) {}
     pub const fn replace<T>(dest: &mut T, src: T) -> T {
         unsafe {
             let result = crate::ptr::read(dest);
@@ -544,6 +609,15 @@ pub mod mem {
         }
     }
     // endregion:drop
+
+    // region:mem_take
+    pub const fn swap<T>(x: &mut T, y: &mut T) {
+        loop {}
+    }
+    pub fn take<T: crate::default::Default>(dest: &mut T) -> T {
+        loop {}
+    }
+    // endregion:mem_take
 
     // region:transmute
     #[rustc_intrinsic]
@@ -570,7 +644,24 @@ pub mod mem {
     // endregion:offset_of
 }
 
+// region:discriminant
+pub mod intrinsics {
+    /// `core::intrinsics::discriminant_value` (`library/core/src/intrinsics/mod.rs`): what a
+    /// derived `==` and a derived order of an enum read first.
+    #[rustc_intrinsic]
+    pub const fn discriminant_value<T>(v: &T) -> <T as crate::marker::DiscriminantKind>::Discriminant;
+}
+// endregion:discriminant
+
 pub mod ptr {
+    // region:int_cast
+    // The functions `blaze::as_cast`'s fixes write for a reference or an address to a pointer.
+    pub const fn from_ref<T: crate::marker::PointeeSized>(r: &T) -> *const T { loop {} }
+    pub const fn from_mut<T: crate::marker::PointeeSized>(r: &mut T) -> *mut T { loop {} }
+    pub const fn with_exposed_provenance<T>(addr: usize) -> *const T { loop {} }
+    pub const fn with_exposed_provenance_mut<T>(addr: usize) -> *mut T { loop {} }
+    // endregion:int_cast
+
     // region:drop
     #[lang = "drop_in_place"]
     pub unsafe fn drop_in_place<T: crate::marker::PointeeSized>(to_drop: *mut T) {
@@ -649,7 +740,8 @@ pub mod ops {
         #[lang = "coerce_unsized"]
         pub trait CoerceUnsized<T> {}
 
-        impl<'a, T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<&'a mut U> for &'a mut T {}
+        // The lifetime may shorten, as in core since Rust 1.98 (rust-lang/rust#149219).
+        impl<'a, 'b: 'a, T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<&'a mut U> for &'b mut T {}
         impl<'a, 'b: 'a, T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<&'a U> for &'b mut T {}
         impl<'a, T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<*mut U> for &'a mut T {}
         impl<'a, T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<*const U> for &'a mut T {}
@@ -831,6 +923,7 @@ pub mod ops {
         // endregion:slice
     }
     pub use self::index::{Index, IndexMut};
+    pub use self::index::SliceIndex; // :vec
     // endregion:index
 
     // region:range
@@ -866,7 +959,66 @@ pub mod ops {
             pub const fn new(start: Idx, end: Idx) -> Self {
                 Self { start, end, exhausted: false }
             }
+            pub const fn start(&self) -> &Idx {
+                &self.start
+            }
+            pub const fn end(&self) -> &Idx {
+                &self.end
+            }
         }
+
+        // region:ord
+        impl<Idx: crate::cmp::PartialOrd<Idx>> Range<Idx> {
+            pub fn contains<U>(&self, item: &U) -> bool
+            where
+                Idx: crate::cmp::PartialOrd<U>,
+                U: ?Sized + crate::cmp::PartialOrd<Idx>,
+            {
+                loop {}
+            }
+            pub fn is_empty(&self) -> bool {
+                loop {}
+            }
+        }
+        impl<Idx: crate::cmp::PartialOrd<Idx>> RangeInclusive<Idx> {
+            pub fn contains<U>(&self, item: &U) -> bool
+            where
+                Idx: crate::cmp::PartialOrd<U>,
+                U: ?Sized + crate::cmp::PartialOrd<Idx>,
+            {
+                loop {}
+            }
+            pub fn is_empty(&self) -> bool {
+                loop {}
+            }
+        }
+        // endregion:ord
+
+        // region:clone
+        impl<Idx: crate::clone::Clone> crate::clone::Clone for Range<Idx> {
+            fn clone(&self) -> Self {
+                loop {}
+            }
+        }
+        impl<Idx: crate::clone::Clone> crate::clone::Clone for RangeInclusive<Idx> {
+            fn clone(&self) -> Self {
+                loop {}
+            }
+        }
+        // endregion:clone
+
+        // region:eq
+        impl<Idx: crate::cmp::PartialEq> crate::cmp::PartialEq for Range<Idx> {
+            fn eq(&self, _other: &Self) -> bool {
+                loop {}
+            }
+        }
+        impl<Idx: crate::cmp::PartialEq> crate::cmp::PartialEq for RangeInclusive<Idx> {
+            fn eq(&self, _other: &Self) -> bool {
+                loop {}
+            }
+        }
+        // endregion:eq
 
         #[lang = "RangeToInclusive"]
         pub struct RangeToInclusive<Idx> {
@@ -1110,15 +1262,19 @@ pub mod ops {
     // endregion:async_fn
 
     // region:try
-    mod try_ {
-        use crate::convert::Infallible;
-
+    // Where core defines it (library/core/src/ops/control_flow.rs), so its path is core's.
+    mod control_flow {
         pub enum ControlFlow<B, C = ()> {
             #[lang = "Continue"]
             Continue(C),
             #[lang = "Break"]
             Break(B),
         }
+    }
+    mod try_ {
+        use super::control_flow::ControlFlow;
+        use crate::convert::Infallible;
+
         pub trait FromResidual<R = <Self as Try>::Residual> {
             #[lang = "from_residual"]
             fn from_residual(residual: R) -> Self;
@@ -1185,13 +1341,30 @@ pub mod ops {
             }
         }
 
+        // region:!try_bodies
         impl<#[blaze::linear] T> FromResidual for Option<T> {
+            // endregion:!try_bodies
+            // region:try_bodies
+            // As core writes it (library/core/src/option.rs, rust-lang/rust#99940): the
+            // residual by name, not by the trait's default.
+        impl<#[blaze::linear] T> FromResidual<Option<Infallible>> for Option<T> {
+            // endregion:try_bodies
+            // region:!try_bodies
             fn from_residual(x: Option<Infallible>) -> Self {
                 match x {
                     None => None,
                     Some(_) => loop {},
                 }
             }
+            // endregion:!try_bodies
+            // region:try_bodies
+            // core's own body (library/core/src/option.rs): `Option<!>` has no `Some`.
+            fn from_residual(residual: Option<Infallible>) -> Self {
+                match residual {
+                    None => None,
+                }
+            }
+            // endregion:try_bodies
         }
 
         impl<T> const Residual<T> for Option<Infallible> {
@@ -1221,12 +1394,22 @@ pub mod ops {
         impl<#[blaze::linear] T, E, F: From<E>> FromResidual<Result<Infallible, E>>
             for Result<T, F>
         {
+            // region:!try_bodies
             fn from_residual(residual: Result<Infallible, E>) -> Self {
                 match residual {
                     Err(e) => Err(F::from(e)),
                     Ok(_) => loop {},
                 }
             }
+            // endregion:!try_bodies
+            // region:try_bodies
+            // core's own body (library/core/src/result.rs): `Result<!, E>` has no `Ok`.
+            fn from_residual(residual: Result<Infallible, E>) -> Self {
+                match residual {
+                    Err(e) => Err(From::from(e)),
+                }
+            }
+            // endregion:try_bodies
         }
 
         impl<T, E> const Residual<T> for Result<Infallible, E> {
@@ -1235,7 +1418,8 @@ pub mod ops {
         // endregion:from
         // endregion:result
     }
-    pub use self::try_::{ControlFlow, FromResidual, Residual, Try};
+    pub use self::control_flow::ControlFlow;
+    pub use self::try_::{FromResidual, Residual, Try};
     // endregion:try
 
     // region:add
@@ -1266,6 +1450,35 @@ pub mod ops {
     add_impl! { usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 f16 f32 f64 f128 }
     // endregion:builtin_impls
     // endregion:add
+
+    // region:sub
+    #[lang = "sub"]
+    pub const trait Sub<Rhs = Self> {
+        type Output;
+        fn sub(self, rhs: Rhs) -> Self::Output;
+    }
+
+    #[lang = "sub_assign"]
+    pub const trait SubAssign<Rhs = Self> {
+        fn sub_assign(&mut self, rhs: Rhs);
+    }
+
+    // region:builtin_impls
+    macro_rules! sub_impl {
+        ($($t:ty)*) => ($(
+            impl const Sub for $t {
+                type Output = $t;
+                fn sub(self, other: $t) -> $t { self - other }
+            }
+            impl SubAssign for $t {
+                fn sub_assign(&mut self, other: $t) { *self -= other; }
+            }
+        )*)
+    }
+
+    sub_impl! { usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 f16 f32 f64 f128 }
+    // endregion:builtin_impls
+    // endregion:sub
 
     // region:mul
     #[lang = "mul"]
@@ -1438,17 +1651,111 @@ pub mod cmp {
     #[lang = "partial_ord"]
     pub trait PartialOrd<Rhs: PointeeSized = Self>: PartialEq<Rhs> + PointeeSized {
         fn partial_cmp(&self, other: &Rhs) -> Option<Ordering>;
+        // region:ord_ops
+        fn lt(&self, other: &Rhs) -> bool {
+            match self.partial_cmp(other) {
+                Some(Ordering::Less) => true,
+                _ => false,
+            }
+        }
+        fn le(&self, other: &Rhs) -> bool {
+            match self.partial_cmp(other) {
+                Some(Ordering::Less | Ordering::Equal) => true,
+                _ => false,
+            }
+        }
+        fn gt(&self, other: &Rhs) -> bool {
+            match self.partial_cmp(other) {
+                Some(Ordering::Greater) => true,
+                _ => false,
+            }
+        }
+        fn ge(&self, other: &Rhs) -> bool {
+            match self.partial_cmp(other) {
+                Some(Ordering::Greater | Ordering::Equal) => true,
+                _ => false,
+            }
+        }
+        // endregion:ord_ops
     }
 
     pub trait Ord: Eq + PartialOrd<Self> + PointeeSized {
         fn cmp(&self, other: &Self) -> Ordering;
+        // region:ord_methods
+        fn max(self, _other: Self) -> Self
+        where
+            Self: Sized,
+        {
+            loop {}
+        }
+        fn min(self, _other: Self) -> Self
+        where
+            Self: Sized,
+        {
+            loop {}
+        }
+        fn clamp(self, _min: Self, _max: Self) -> Self
+        where
+            Self: Sized,
+        {
+            loop {}
+        }
+        // endregion:ord_methods
     }
 
+    // region:ord_methods
+    pub fn max<T: Ord>(_v1: T, _v2: T) -> T {
+        loop {}
+    }
+    pub fn min<T: Ord>(_v1: T, _v2: T) -> T {
+        loop {}
+    }
+    // endregion:ord_methods
+
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)] // :ord_ops
+    #[lang = "Ordering"] // :ord_ops
+    #[repr(i8)] // :ord_ops
     pub enum Ordering {
         Less = -1,
         Equal = 0,
         Greater = 1,
     }
+
+    // region:ord_ops
+    impl Ordering {
+        pub const fn is_eq(self) -> bool {
+            self as i8 == 0
+        }
+        pub const fn is_ne(self) -> bool {
+            self as i8 != 0
+        }
+        pub const fn is_lt(self) -> bool {
+            (self as i8) < 0
+        }
+        pub const fn is_gt(self) -> bool {
+            (self as i8) > 0
+        }
+        pub const fn is_le(self) -> bool {
+            (self as i8) <= 0
+        }
+        pub const fn is_ge(self) -> bool {
+            (self as i8) >= 0
+        }
+        pub const fn reverse(self) -> Ordering {
+            match self {
+                Ordering::Less => Ordering::Greater,
+                Ordering::Equal => Ordering::Equal,
+                Ordering::Greater => Ordering::Less,
+            }
+        }
+        pub const fn then(self, other: Ordering) -> Ordering {
+            match self {
+                Ordering::Equal => other,
+                _ => self,
+            }
+        }
+    }
+    // endregion:ord_ops
 
     // region:derive
     #[rustc_builtin_macro]
@@ -1515,6 +1822,24 @@ pub mod cmp {
             Ord::cmp(*self, *other)
         }
     }
+    // Arrays' comparisons (`library/core/src/array/mod.rs:409`, `:445`): the elements', in
+    // order. Bodies are stubs, as `max` and `min`'s are.
+    impl<T: PartialEq, const N: usize> PartialEq for [T; N] {
+        fn eq(&self, _other: &[T; N]) -> bool {
+            true
+        }
+    }
+    impl<T: Eq, const N: usize> Eq for [T; N] {}
+    impl<T: PartialOrd, const N: usize> PartialOrd for [T; N] {
+        fn partial_cmp(&self, _other: &[T; N]) -> Option<Ordering> {
+            None
+        }
+    }
+    impl<T: Ord, const N: usize> Ord for [T; N] {
+        fn cmp(&self, _other: &[T; N]) -> Ordering {
+            Ordering::Equal
+        }
+    }
 
     // endregion:ord
 }
@@ -1542,6 +1867,14 @@ pub mod fmt {
         pub fn write_str(&mut self, _data: &str) -> Result {
             Ok(())
         }
+
+        // region:fmt_write
+        // What `write!` calls (library/core/src/fmt/mod.rs: `pub fn write_fmt(&mut self, fmt:
+        // Arguments<'_>) -> Result`).
+        pub fn write_fmt(&mut self, _args: Arguments<'_>) -> Result {
+            Ok(())
+        }
+        // endregion:fmt_write
     }
 
     impl DebugTuple {
@@ -1717,12 +2050,43 @@ pub mod fmt {
 
 // region:slice
 pub mod slice {
+    // region:vec
+    pub use crate::ops::SliceIndex;
+    // endregion:vec
+
     #[lang = "slice"]
     impl<T> [T] {
         #[lang = "slice_len_fn"]
         pub fn len(&self) -> usize {
             loop {}
         }
+
+        // region:reach
+        pub fn is_empty(&self) -> bool {
+            self.len() == 0
+        }
+
+        pub fn first(&self) -> Option<&T> {
+            if let [first, ..] = self { Some(first) } else { None }
+        }
+        // endregion:reach
+
+        // region:vec
+        pub fn get<I>(&self, index: I) -> Option<&I::Output>
+        where
+            I: SliceIndex<Self>,
+        {
+            loop {}
+        }
+
+        pub const fn last(&self) -> Option<&T> {
+            loop {}
+        }
+
+        pub const fn swap(&mut self, a: usize, b: usize) {
+            loop {}
+        }
+        // endregion:vec
 
         // region:iterator
         pub fn iter(&self) -> crate::iter::Iter<'_, T> {
@@ -1761,6 +2125,28 @@ pub mod option {
     impl<T: Copy> Copy for Option<T> {}
     // endregion:copy
 
+    // region:option_clone
+    impl<T> crate::clone::Clone for Option<T>
+    where
+        T: crate::clone::Clone,
+    {
+        fn clone(&self) -> Self {
+            match self {
+                Some(x) => Some(x.clone()),
+                None => None,
+            }
+        }
+    }
+    // endregion:option_clone
+
+    // region:mem_take
+    impl<T> crate::default::Default for Option<T> {
+        fn default() -> Option<T> {
+            None
+        }
+    }
+    // endregion:mem_take
+
     // The methods that hand a payload on or panic, which admit a linear one.
     impl<#[blaze::linear] T> Option<T> {
         pub const fn is_some(&self) -> bool {
@@ -1780,6 +2166,15 @@ pub mod option {
                 None => panic!("called `Option::unwrap()` on a `None` value"),
             }
         }
+
+        // region:expect
+        pub const fn expect(self, _msg: &str) -> T {
+            match self {
+                Some(val) => val,
+                None => panic!("called `Option::expect()` on a `None` value"),
+            }
+        }
+        // endregion:expect
 
         pub const fn as_ref(&self) -> Option<&T> {
             match self {
@@ -1801,6 +2196,20 @@ pub mod option {
         pub fn and<U>(self, _optb: Option<U>) -> Option<U> {
             loop {}
         }
+        // region:option_methods
+        pub fn take(&mut self) -> Option<T> {
+            loop {}
+        }
+        pub fn replace(&mut self, _value: T) -> Option<T> {
+            loop {}
+        }
+        pub fn unwrap_or_default(self) -> T
+        where
+            T: crate::default::Default,
+        {
+            loop {}
+        }
+        // endregion:option_methods
         pub fn unwrap_or(self, default: T) -> T {
             match self {
                 Some(val) => val,
@@ -1808,6 +2217,7 @@ pub mod option {
             }
         }
         // region:fn
+        // region:!closure_methods
         pub fn and_then<U, F>(self, _f: F) -> Option<U>
         where
             F: FnOnce(T) -> Option<U>,
@@ -1833,8 +2243,129 @@ pub mod option {
         {
             loop {}
         }
+        // endregion:!closure_methods
         // endregion:fn
     }
+
+    // region:closure_methods
+    // core's own bodies (library/core/src/option.rs), without the `[const]` and `Destruct`
+    // bounds core adds for const evaluation.
+    impl<T> Option<T> {
+        pub fn is_some_and(self, f: impl FnOnce(T) -> bool) -> bool {
+            match self {
+                None => false,
+                Some(x) => f(x),
+            }
+        }
+
+        pub fn is_none_or(self, f: impl FnOnce(T) -> bool) -> bool {
+            match self {
+                None => true,
+                Some(x) => f(x),
+            }
+        }
+
+        pub fn map<U, F>(self, f: F) -> Option<U>
+        where
+            F: FnOnce(T) -> U,
+        {
+            match self {
+                Some(x) => Some(f(x)),
+                None => None,
+            }
+        }
+
+        pub fn inspect<F: FnOnce(&T)>(self, f: F) -> Self {
+            if let Some(ref x) = self {
+                f(x);
+            }
+
+            self
+        }
+
+        pub fn map_or<U, F>(self, default: U, f: F) -> U
+        where
+            F: FnOnce(T) -> U,
+        {
+            match self {
+                Some(t) => f(t),
+                None => default,
+            }
+        }
+
+        pub fn map_or_else<U, D, F>(self, default: D, f: F) -> U
+        where
+            D: FnOnce() -> U,
+            F: FnOnce(T) -> U,
+        {
+            match self {
+                Some(t) => f(t),
+                None => default(),
+            }
+        }
+
+        pub fn ok_or_else<E, F>(self, err: F) -> crate::result::Result<T, E>
+        where
+            F: FnOnce() -> E,
+        {
+            match self {
+                Some(v) => crate::result::Result::Ok(v),
+                None => crate::result::Result::Err(err()),
+            }
+        }
+
+        pub fn and_then<U, F>(self, f: F) -> Option<U>
+        where
+            F: FnOnce(T) -> Option<U>,
+        {
+            match self {
+                Some(x) => f(x),
+                None => None,
+            }
+        }
+
+        pub fn filter<P>(self, predicate: P) -> Self
+        where
+            P: FnOnce(&T) -> bool,
+        {
+            if let Some(x) = self {
+                if predicate(&x) {
+                    return Some(x);
+                }
+            }
+            None
+        }
+
+        pub fn or_else<F>(self, f: F) -> Option<T>
+        where
+            F: FnOnce() -> Option<T>,
+        {
+            match self {
+                x @ Some(_) => x,
+                None => f(),
+            }
+        }
+
+        pub fn unwrap_or_else<F>(self, f: F) -> T
+        where
+            F: FnOnce() -> T,
+        {
+            match self {
+                Some(x) => x,
+                None => f(),
+            }
+        }
+    }
+    // endregion:closure_methods
+
+    // region:option_from
+    // core's own (library/core/src/option.rs).
+    impl<T> crate::convert::From<T> for Option<T> {
+        fn from(val: T) -> Option<T> {
+            Some(val)
+        }
+    }
+    // endregion:option_from
 }
 // endregion:option
 
@@ -1847,6 +2378,22 @@ pub mod result {
         Err(E),
     }
     impl<T, E> Result<T, E> {
+        // region:reach
+        pub const fn is_ok(&self) -> bool {
+            match self {
+                Ok(_) => true,
+                Err(_) => false,
+            }
+        }
+        // endregion:reach
+        // region:option_methods
+        pub const fn is_err(&self) -> bool {
+            loop {}
+        }
+        pub fn err(self) -> crate::option::Option<E> {
+            loop {}
+        }
+        // endregion:option_methods
         pub const fn or<F>(self, res: Result<T, F>) -> Result<T, F> {
             match self {
                 Ok(v) => Ok(v),
@@ -1906,6 +2453,84 @@ pub mod result {
         // endregion:fn
     }
 
+    // region:closure_methods
+    // core's own bodies (library/core/src/result.rs), without the `[const]` and `Destruct`
+    // bounds core adds for const evaluation.
+    impl<T, E> Result<T, E> {
+        pub fn is_ok_and<F>(self, f: F) -> bool
+        where
+            F: FnOnce(T) -> bool,
+        {
+            match self {
+                Err(_) => false,
+                Ok(x) => f(x),
+            }
+        }
+
+        pub fn is_err_and<F>(self, f: F) -> bool
+        where
+            F: FnOnce(E) -> bool,
+        {
+            match self {
+                Ok(_) => false,
+                Err(e) => f(e),
+            }
+        }
+
+        pub fn map<U, F>(self, op: F) -> Result<U, E>
+        where
+            F: FnOnce(T) -> U,
+        {
+            match self {
+                Ok(t) => Ok(op(t)),
+                Err(e) => Err(e),
+            }
+        }
+
+        pub fn map_or<U, F>(self, default: U, f: F) -> U
+        where
+            F: FnOnce(T) -> U,
+        {
+            match self {
+                Ok(t) => f(t),
+                Err(_) => default,
+            }
+        }
+
+        pub fn map_or_else<U, D, F>(self, default: D, f: F) -> U
+        where
+            D: FnOnce(E) -> U,
+            F: FnOnce(T) -> U,
+        {
+            match self {
+                Ok(t) => f(t),
+                Err(e) => default(e),
+            }
+        }
+
+        pub fn inspect<F>(self, f: F) -> Self
+        where
+            F: FnOnce(&T),
+        {
+            if let Ok(ref t) = self {
+                f(t);
+            }
+
+            self
+        }
+
+        pub fn and_then<U, F>(self, op: F) -> Result<U, E>
+        where
+            F: FnOnce(T) -> Result<U, E>,
+        {
+            match self {
+                Ok(t) => op(t),
+                Err(e) => Err(e),
+            }
+        }
+    }
+    // endregion:closure_methods
+
     // The methods that hand the `Ok` payload on and drop or print the `Err` one, which admit a
     // linear `Ok` payload only.
     impl<#[blaze::linear] T, E> Result<T, E> {
@@ -1920,6 +2545,19 @@ pub mod result {
                 Err(_) => panic!("called `Result::unwrap()` on an `Err` value"),
             }
         }
+
+        // region:expect
+        #[track_caller]
+        pub fn expect(self, _msg: &str) -> T
+        where
+            E: crate::fmt::Debug,
+        {
+            match self {
+                Ok(t) => t,
+                Err(_) => panic!("called `Result::expect()` on an `Err` value"),
+            }
+        }
+        // endregion:expect
         // endregion:fmt
 
         // region:option
@@ -2247,6 +2885,15 @@ pub mod iter {
                 {
                     self
                 }
+                // region:int_overflow
+                fn sum<S>(self) -> S
+                where
+                    Self: Sized,
+                    S: crate::iter::Sum<Self::Item>,
+                {
+                    loop {}
+                }
+                // endregion:int_overflow
                 // region:ord
                 fn min(self) -> Option<Self::Item>
                 where
@@ -2407,6 +3054,16 @@ pub mod iter {
         pub use self::collect::{FromIterator, IntoIterator, Iter};
     }
     pub use self::traits::{FromIterator, IntoIterator, Iterator};
+    // region:int_overflow
+    pub trait Sum<A = Self>: Sized {
+        fn sum<I: Iterator<Item = A>>(iter: I) -> Self;
+    }
+    impl Sum for u32 {
+        fn sum<I: Iterator<Item = u32>>(_iter: I) -> u32 {
+            loop {}
+        }
+    }
+    // endregion:int_overflow
     pub(crate) use self::traits::Iter;
 }
 // endregion:iterator
@@ -2421,6 +3078,14 @@ pub mod str {
         fn from_str(s: &str) -> Result<Self, Self::Err>;
     }
     impl str {
+        // region:str_methods
+        pub const fn len(&self) -> usize {
+            self.as_bytes().len()
+        }
+        pub const fn is_empty(&self) -> bool {
+            self.len() == 0
+        }
+        // endregion:str_methods
         pub const fn as_bytes(&self) -> &[u8] {
             unsafe { &*(self as *const str as *const [u8]) }
         }
@@ -2428,8 +3093,134 @@ pub mod str {
             FromStr::from_str(self)
         }
     }
+
+    // region:str_methods
+    impl crate::cmp::PartialEq for str {
+        fn eq(&self, other: &str) -> bool {
+            loop {}
+        }
+    }
+    // endregion:str_methods
 }
 // endregion:str
+
+// region:time
+pub mod time {
+    use crate::ops::{Add, AddAssign, Sub, SubAssign};
+
+    const NANOS_PER_SEC: u32 = 1_000_000_000;
+
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct Duration {
+        secs: u64,
+        nanos: u32, // Always 0 <= nanos < NANOS_PER_SEC
+    }
+
+    // region:default
+    impl crate::default::Default for Duration {
+        fn default() -> Duration {
+            Duration { secs: 0, nanos: 0 }
+        }
+    }
+    // endregion:default
+
+    impl Duration {
+        pub const ZERO: Duration = Duration::from_nanos(0);
+        pub const MAX: Duration = Duration::new(u64::MAX, NANOS_PER_SEC - 1);
+
+        pub const fn new(secs: u64, nanos: u32) -> Duration {
+            if nanos < NANOS_PER_SEC {
+                Duration { secs, nanos }
+            } else {
+                loop {}
+            }
+        }
+        pub const fn from_secs(secs: u64) -> Duration {
+            Duration { secs, nanos: 0 }
+        }
+        pub const fn from_millis(millis: u64) -> Duration {
+            loop {}
+        }
+        pub const fn from_micros(micros: u64) -> Duration {
+            loop {}
+        }
+        pub const fn from_nanos(nanos: u64) -> Duration {
+            const NANOS_PER_SEC: u64 = self::NANOS_PER_SEC as u64;
+            let secs = nanos / NANOS_PER_SEC;
+            let subsec_nanos = (nanos % NANOS_PER_SEC) as u32;
+            Duration { secs, nanos: subsec_nanos }
+        }
+        pub const fn is_zero(&self) -> bool {
+            self.secs == 0 && self.nanos == 0
+        }
+        pub const fn as_secs(&self) -> u64 {
+            self.secs
+        }
+        pub const fn subsec_millis(&self) -> u32 {
+            loop {}
+        }
+        pub const fn subsec_micros(&self) -> u32 {
+            loop {}
+        }
+        pub const fn subsec_nanos(&self) -> u32 {
+            self.nanos
+        }
+        pub const fn as_millis(&self) -> u128 {
+            loop {}
+        }
+        pub const fn as_micros(&self) -> u128 {
+            loop {}
+        }
+        pub const fn as_nanos(&self) -> u128 {
+            loop {}
+        }
+        pub const fn abs_diff(self, other: Duration) -> Duration {
+            loop {}
+        }
+        pub const fn checked_add(self, rhs: Duration) -> Option<Duration> {
+            loop {}
+        }
+        pub const fn saturating_add(self, rhs: Duration) -> Duration {
+            loop {}
+        }
+        pub const fn checked_sub(self, rhs: Duration) -> Option<Duration> {
+            loop {}
+        }
+        pub const fn saturating_sub(self, rhs: Duration) -> Duration {
+            loop {}
+        }
+        pub const fn checked_mul(self, rhs: u32) -> Option<Duration> {
+            loop {}
+        }
+    }
+
+    impl Add for Duration {
+        type Output = Duration;
+        fn add(self, rhs: Duration) -> Duration {
+            loop {}
+        }
+    }
+
+    impl AddAssign for Duration {
+        fn add_assign(&mut self, rhs: Duration) {
+            loop {}
+        }
+    }
+
+    impl Sub for Duration {
+        type Output = Duration;
+        fn sub(self, rhs: Duration) -> Duration {
+            loop {}
+        }
+    }
+
+    impl SubAssign for Duration {
+        fn sub_assign(&mut self, rhs: Duration) {
+            loop {}
+        }
+    }
+}
+// endregion:time
 
 // region:panic
 pub mod panic {
@@ -2809,6 +3600,16 @@ pub mod pat {
 }
 // endregion:pat
 
+// region:blaze_unreachable
+pub mod blaze {
+    /// `blaze::unreachable!()` (docs/v2/plan/design/proved-unreachable.md).
+    #[rustc_builtin_macro(blaze_unreachable)]
+    pub macro unreachable() {
+        /* compiler built-in */
+    }
+}
+// endregion:blaze_unreachable
+
 // region:non_zero
 pub mod num {
     #[repr(transparent)]
@@ -2838,6 +3639,40 @@ pub mod num {
     #[rustc_diagnostic_item = "NonZero"]
     #[repr(transparent)]
     pub struct NonZero<T: ZeroablePrimitive>(T::NonZeroInner);
+
+    // region:reach
+    impl NonZero<u32> {
+        pub const fn get(self) -> u32 {
+            unsafe { crate::mem::transmute(self) }
+        }
+    }
+    // endregion:reach
+
+    // region:int_overflow
+    pub struct TryFromIntError(pub(crate) ());
+
+    macro_rules! impl_try_from_int {
+        ($($from:ty => $($to:ty)*;)*) => {
+            $($(
+                impl crate::convert::TryFrom<$from> for $to {
+                    type Error = TryFromIntError;
+                    fn try_from(_value: $from) -> crate::result::Result<$to, TryFromIntError> {
+                        loop {}
+                    }
+                }
+            )*)*
+        }
+    }
+
+    impl_try_from_int! {
+        u64 => u8 u16 u32 i8 i16 i32 i64 usize isize;
+        u32 => u8 u16 i8 i16 i32;
+        usize => u8 u16 u32 i8 i16 i32 i64 isize;
+        i64 => u8 u16 u32 u64 i8 i16 i32 usize isize;
+        i32 => u8 u16 u32 u64 i8 i16 usize;
+        isize => u8 u16 u32 u64 i8 i16 i32 usize;
+    }
+    // endregion:int_overflow
 }
 // endregion:non_zero
 
@@ -2904,6 +3739,143 @@ impl_int_wrapping! {
 }
 // endregion:int_wrapping
 
+// region:int_overflow
+macro_rules! impl_int_overflow {
+    ($($t:ty)*) => {
+        $(
+            impl $t {
+                pub const fn checked_add(self, _rhs: Self) -> crate::option::Option<Self> {
+                    loop {}
+                }
+                pub const fn checked_sub(self, _rhs: Self) -> crate::option::Option<Self> {
+                    loop {}
+                }
+                pub const fn checked_mul(self, _rhs: Self) -> crate::option::Option<Self> {
+                    loop {}
+                }
+                pub const fn checked_neg(self) -> crate::option::Option<Self> {
+                    loop {}
+                }
+                pub const fn checked_shl(self, _rhs: u32) -> crate::option::Option<Self> {
+                    loop {}
+                }
+                pub const fn checked_shr(self, _rhs: u32) -> crate::option::Option<Self> {
+                    loop {}
+                }
+                pub const fn overflowing_add(self, _rhs: Self) -> (Self, bool) {
+                    loop {}
+                }
+                pub const fn strict_add(self, _rhs: Self) -> Self {
+                    loop {}
+                }
+                pub const fn pow(self, _exp: u32) -> Self {
+                    loop {}
+                }
+            }
+        )*
+    }
+}
+
+impl_int_overflow! {
+    usize u8 u16 u32 u64 u128
+    isize i8 i16 i32 i64 i128
+}
+
+macro_rules! impl_int_abs {
+    ($($t:ty)*) => {
+        $(
+            impl $t {
+                pub const fn abs(self) -> Self {
+                    loop {}
+                }
+            }
+        )*
+    }
+}
+
+impl_int_abs! { isize i8 i16 i32 i64 i128 }
+// endregion:int_overflow
+
+// region:int_methods
+// The integer methods `hir-ty-lean` models, as stubs: their bodies are never read.
+macro_rules! impl_int_methods {
+    ($($t:ty, $bytes:literal;)*) => {
+        $(
+            impl $t {
+                pub const BITS: u32 = $bytes * 8;
+                pub const fn leading_zeros(self) -> u32 { loop {} }
+                pub const fn trailing_zeros(self) -> u32 { loop {} }
+                pub const fn count_ones(self) -> u32 { loop {} }
+                pub const fn count_zeros(self) -> u32 { loop {} }
+                pub const fn reverse_bits(self) -> Self { loop {} }
+                pub const fn swap_bytes(self) -> Self { loop {} }
+                pub const fn rotate_left(self, _n: u32) -> Self { loop {} }
+                pub const fn rotate_right(self, _n: u32) -> Self { loop {} }
+                pub const fn saturating_mul(self, _rhs: Self) -> Self { loop {} }
+                pub const fn saturating_pow(self, _exp: u32) -> Self { loop {} }
+                pub const fn wrapping_neg(self) -> Self { loop {} }
+                pub const fn wrapping_shl(self, _rhs: u32) -> Self { loop {} }
+                pub const fn wrapping_shr(self, _rhs: u32) -> Self { loop {} }
+                pub const fn wrapping_div(self, _rhs: Self) -> Self { loop {} }
+                pub const fn wrapping_rem(self, _rhs: Self) -> Self { loop {} }
+                pub const fn wrapping_pow(self, _exp: u32) -> Self { loop {} }
+                pub const fn checked_div(self, _rhs: Self) -> crate::option::Option<Self> { loop {} }
+                pub const fn checked_rem(self, _rhs: Self) -> crate::option::Option<Self> { loop {} }
+                pub const fn checked_pow(self, _exp: u32) -> crate::option::Option<Self> { loop {} }
+                pub const fn overflowing_sub(self, _rhs: Self) -> (Self, bool) { loop {} }
+                pub const fn overflowing_mul(self, _rhs: Self) -> (Self, bool) { loop {} }
+                pub const fn is_multiple_of(self, _rhs: Self) -> bool { loop {} }
+                pub const fn to_le_bytes(self) -> [u8; $bytes] { loop {} }
+                pub const fn to_be_bytes(self) -> [u8; $bytes] { loop {} }
+                pub const fn to_ne_bytes(self) -> [u8; $bytes] { loop {} }
+                pub const fn from_le_bytes(_bytes: [u8; $bytes]) -> Self { loop {} }
+                pub const fn from_be_bytes(_bytes: [u8; $bytes]) -> Self { loop {} }
+                // region:!int_impl
+                pub const fn from_ne_bytes(_bytes: [u8; $bytes]) -> Self { loop {} }
+                // endregion:!int_impl
+            }
+        )*
+    }
+}
+
+impl_int_methods! {
+    usize, 8; u8, 1; u16, 2; u32, 4; u64, 8; u128, 16;
+    isize, 8; i8, 1; i16, 2; i32, 4; i64, 8; i128, 16;
+}
+
+macro_rules! impl_uint_methods {
+    ($($t:ty)*) => {
+        $(
+            impl $t {
+                pub const fn is_power_of_two(self) -> bool { loop {} }
+                pub const fn next_power_of_two(self) -> Self { loop {} }
+                pub const fn div_ceil(self, _rhs: Self) -> Self { loop {} }
+                pub const fn abs_diff(self, _other: Self) -> Self { loop {} }
+            }
+        )*
+    }
+}
+
+impl_uint_methods! { usize u8 u16 u32 u64 u128 }
+
+macro_rules! impl_sint_methods {
+    ($($t:ty => $u:ty;)*) => {
+        $(
+            impl $t {
+                pub const fn unsigned_abs(self) -> $u { loop {} }
+                pub const fn abs_diff(self, _other: Self) -> $u { loop {} }
+                pub const fn signum(self) -> Self { loop {} }
+                pub const fn wrapping_abs(self) -> Self { loop {} }
+            }
+        )*
+    }
+}
+
+impl_sint_methods! {
+    isize => usize; i8 => u8; i16 => u16; i32 => u32; i64 => u64; i128 => u128;
+}
+// endregion:int_methods
+
 // region:int_bounds
 macro_rules! impl_int_bounds {
     ($($t:ty: $min:literal, $max:literal;)*) => {
@@ -2955,6 +3927,153 @@ impl_num_methods! {
     powf: f32 f64
 }
 // endregion:num_methods
+
+// region:int_cast
+// What `blaze::as_cast`'s fixes call in place of `as`, as the pinned nightly's core has them:
+// the lossless `From` impls between numbers, `bool` and `char`, `cast_signed` and
+// `cast_unsigned`, `widen` and `truncate` (`integer_widen_truncate`, same sign only), and the
+// pointer methods and functions that name a cast.
+pub mod int_cast {
+    use crate::convert::From;
+    use crate::marker::PointeeSized;
+
+    macro_rules! impl_from {
+        ($($from:ty => $($to:ty)*;)*) => {$($(
+            impl From<$from> for $to {
+                fn from(_: $from) -> $to { loop {} }
+            }
+        )*)*};
+    }
+
+    impl_from! {
+        u8 => u16 u32 u64 u128 usize i16 i32 i64 i128 isize f32 f64 char;
+        u16 => u32 u64 u128 usize i32 i64 i128 f32 f64;
+        u32 => u64 u128 i64 i128 f64;
+        u64 => u128 i128;
+        i8 => i16 i32 i64 i128 isize f32 f64;
+        i16 => i32 i64 i128 isize f32 f64;
+        i32 => i64 i128 f64;
+        i64 => i128;
+        bool => u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize;
+        char => u32 u64 u128;
+        f32 => f64;
+    }
+
+    macro_rules! impl_sign {
+        ($($u:ty, $s:ty;)*) => {$(
+            impl $u {
+                pub const fn cast_signed(self) -> $s { loop {} }
+            }
+            impl $s {
+                pub const fn cast_unsigned(self) -> $u { loop {} }
+            }
+        )*};
+    }
+
+    impl_sign! {
+        u8, i8; u16, i16; u32, i32; u64, i64; u128, i128; usize, isize;
+    }
+
+    /// The types `x.truncate::<T>()` narrows a `Self` to.
+    pub trait TruncateTarget<T> {}
+    /// The types `x.widen::<T>()` widens a `Self` to.
+    pub trait WidenTarget<T> {}
+
+    macro_rules! impl_targets {
+        ($($from:ty: truncate $($narrow:ty)*; widen $($wide:ty)*;)*) => {$(
+            $(impl TruncateTarget<$narrow> for $from {})*
+            $(impl WidenTarget<$wide> for $from {})*
+            impl $from {
+                pub const fn truncate<T>(self) -> T where Self: TruncateTarget<T> { loop {} }
+                pub const fn widen<T>(self) -> T where Self: WidenTarget<T> { loop {} }
+            }
+        )*};
+    }
+
+    impl_targets! {
+        u8: truncate; widen u16 u32 u64 u128 usize;
+        u16: truncate u8; widen u32 u64 u128 usize;
+        u32: truncate u16 u8; widen u64 u128;
+        u64: truncate u32 u16 u8; widen u128;
+        u128: truncate u64 u32 u16 u8; widen;
+        usize: truncate u16 u8; widen;
+        i8: truncate; widen i16 i32 i64 i128 isize;
+        i16: truncate i8; widen i32 i64 i128 isize;
+        i32: truncate i16 i8; widen i64 i128;
+        i64: truncate i32 i16 i8; widen i128;
+        i128: truncate i64 i32 i16 i8; widen;
+        isize: truncate i16 i8; widen;
+    }
+
+    impl<T: PointeeSized> *const T {
+        pub const fn cast<U>(self) -> *const U { loop {} }
+        pub const fn cast_mut(self) -> *mut T { loop {} }
+        pub fn addr(self) -> usize { loop {} }
+        pub fn expose_provenance(self) -> usize { loop {} }
+    }
+
+    impl<T: PointeeSized> *mut T {
+        pub const fn cast<U>(self) -> *mut U { loop {} }
+        pub const fn cast_const(self) -> *const T { loop {} }
+        pub fn addr(self) -> usize { loop {} }
+        pub fn expose_provenance(self) -> usize { loop {} }
+    }
+}
+// endregion:int_cast
+
+// region:io_error
+// `std::io::Error` where the pinned nightly's library defines it: `core::io::error::Error`
+// (library/core/src/io/error.rs, re-exported as `core::io::Error` and by std), its one field a
+// stand-in for the real `Repr`. `other` is alloc's incoherent inherent method
+// (library/alloc/src/io/error.rs), here without its `E: Into<Box<dyn Error + Send + Sync>>`
+// bound, which needs `Box`.
+pub mod io {
+    mod error {
+        pub struct Error {
+            repr: u64,
+        }
+
+        impl Error {
+            pub fn other<E>(_error: E) -> Error {
+                loop {}
+            }
+        }
+    }
+
+    pub use self::error::Error;
+}
+// endregion:io_error
+
+// region:string
+// `alloc::string::String` (lang item `String`, library/alloc/src/string.rs), with its derived
+// `PartialEq` written out.
+pub mod string {
+    #[lang = "String"]
+    pub struct String {
+        vec: crate::vec::Vec<u8>,
+    }
+
+    impl crate::cmp::PartialEq for String {
+        fn eq(&self, _other: &String) -> bool {
+            loop {}
+        }
+    }
+
+    impl String {
+        pub const fn new() -> String {
+            loop {}
+        }
+    }
+
+    // region:default
+    impl crate::default::Default for String {
+        fn default() -> String {
+            String::new()
+        }
+    }
+    // endregion:default
+}
+// endregion:string
 
 // region:error
 pub mod error {
@@ -3182,8 +4301,176 @@ pub mod alloc {
         }
         // endregion:global_allocator
     }
+
+    // region:vec
+    #[lang = "global_alloc_ty"]
+    pub struct Global;
+    // region:vec_eq
+    impl crate::clone::Clone for Global {
+        fn clone(&self) -> Self {
+            Global
+        }
+    }
+    // endregion:vec_eq
+    unsafe impl Allocator for Global {
+        fn allocate(&self, layout: Layout) -> Result<*mut u8, AllocError> {
+            loop {}
+        }
+        unsafe fn deallocate(&self, ptr: *mut u8, layout: Layout) {}
+    }
+    // endregion:vec
 }
 // endregion:allocator_api
+
+// region:vec
+pub mod vec {
+    use crate::alloc::{Allocator, Global};
+    use crate::ops::{Deref, DerefMut, Index, IndexMut};
+    use crate::slice::SliceIndex;
+
+    pub struct Vec<T, A: Allocator = Global> {
+        ptr: *mut T,
+        cap: usize,
+        len: usize,
+        alloc: A,
+    }
+
+    impl<T> Vec<T> {
+        pub const fn new() -> Self {
+            loop {}
+        }
+        pub fn with_capacity(capacity: usize) -> Self {
+            loop {}
+        }
+    }
+
+    impl<T, A: Allocator> Vec<T, A> {
+        pub const fn new_in(alloc: A) -> Self {
+            loop {}
+        }
+        pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
+            loop {}
+        }
+        pub const fn capacity(&self) -> usize {
+            loop {}
+        }
+        pub fn truncate(&mut self, len: usize) {
+            loop {}
+        }
+        pub const fn as_slice(&self) -> &[T] {
+            loop {}
+        }
+        pub const fn as_mut_slice(&mut self) -> &mut [T] {
+            loop {}
+        }
+        pub fn swap_remove(&mut self, index: usize) -> T {
+            loop {}
+        }
+        pub fn insert(&mut self, index: usize, element: T) {
+            loop {}
+        }
+        pub fn remove(&mut self, index: usize) -> T {
+            loop {}
+        }
+        pub fn retain<F>(&mut self, mut f: F)
+        where
+            F: FnMut(&T) -> bool,
+        {
+            loop {}
+        }
+        pub fn push(&mut self, value: T) {
+            loop {}
+        }
+        pub fn pop(&mut self) -> Option<T> {
+            loop {}
+        }
+        pub fn clear(&mut self) {
+            loop {}
+        }
+        pub const fn len(&self) -> usize {
+            loop {}
+        }
+        pub const fn is_empty(&self) -> bool {
+            loop {}
+        }
+    }
+
+    impl<T: Clone, A: Allocator> Vec<T, A> {
+        pub fn extend_from_slice(&mut self, other: &[T]) {
+            loop {}
+        }
+    }
+
+    pub fn from_elem<T: Clone>(elem: T, n: usize) -> Vec<T> {
+        loop {}
+    }
+
+    impl<T, A: Allocator> Deref for Vec<T, A> {
+        type Target = [T];
+        fn deref(&self) -> &[T] {
+            loop {}
+        }
+    }
+
+    impl<T, A: Allocator> DerefMut for Vec<T, A> {
+        fn deref_mut(&mut self) -> &mut [T] {
+            loop {}
+        }
+    }
+
+    impl<T, I: SliceIndex<[T]>, A: Allocator> Index<I> for Vec<T, A> {
+        type Output = I::Output;
+        fn index(&self, index: I) -> &Self::Output {
+            loop {}
+        }
+    }
+
+    impl<T, I: SliceIndex<[T]>, A: Allocator> IndexMut<I> for Vec<T, A> {
+        fn index_mut(&mut self, index: I) -> &mut Self::Output {
+            loop {}
+        }
+    }
+
+    impl<T> crate::default::Default for Vec<T> {
+        fn default() -> Vec<T> {
+            loop {}
+        }
+    }
+
+    // region:vec_eq
+    impl<T: crate::clone::Clone, A: Allocator + crate::clone::Clone> crate::clone::Clone for Vec<T, A> {
+        fn clone(&self) -> Self {
+            loop {}
+        }
+    }
+
+    impl<T, U, A1: Allocator, A2: Allocator> crate::cmp::PartialEq<Vec<U, A2>> for Vec<T, A1>
+    where
+        T: crate::cmp::PartialEq<U>,
+    {
+        fn eq(&self, other: &Vec<U, A2>) -> bool {
+            loop {}
+        }
+    }
+    // endregion:vec_eq
+
+    // region:drop
+    impl<T, A: Allocator> Drop for Vec<T, A> {
+        fn drop(&mut self) {}
+    }
+    // endregion:drop
+}
+
+#[macro_export]
+macro_rules! vec {
+    () => (
+        $crate::vec::Vec::new()
+    );
+    ($elem:expr; $n:expr) => (
+        $crate::vec::from_elem($elem, $n)
+    );
+}
+// endregion:vec
 
 pub mod prelude {
     pub mod v1 {
@@ -3226,6 +4513,7 @@ pub mod prelude {
             env, option_env,                              // :env
             cfg,                                          // :cfg
             matches,                                      // :matches
+            vec, vec::Vec,                                // :vec
         };
     }
 
@@ -3243,6 +4531,7 @@ pub mod prelude {
 
     pub mod rust_2024 {
         pub use super::v1::*;
+        pub use crate::future::{Future, IntoFuture};    // :future
     }
 }
 

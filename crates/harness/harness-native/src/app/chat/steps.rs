@@ -548,7 +548,9 @@ pub(super) fn fill(row: View<'_>, o: &Out) {
                 let path = rest.find('/').map_or("", |i| &rest[i..]);
                 if let Some(k) = l.part("link") {
                     k.text(view::table::host(url));
-                    k.action(&view.map_or_else(|| format!("open:{url}"), |v| format!("web:show:{v}")));
+                    // The view the page opened in, with its address: a view gone since (closed, or its host
+                    // restarted) opens the address again (browser.rs `web_action`).
+                    k.action(&view.map_or_else(|| format!("open:{url}"), |v| format!("web:show:{v}:{url}")));
                     tooltip(k, url);
                 }
                 if let Some(p) = l.part("path") {

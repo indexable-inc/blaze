@@ -1,0 +1,13 @@
+{
+ "id": "envkeys-1112-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane envkeys-1112",
+ "where": "the profile history thread (`blaze-history`, crates/blaze-cargo/src/serve/observe.rs keep_history/keep)",
+ "what": "Read from the code: the thread ends only at shutdown or by a panic inside it; nothing catches the panic. After it the daemon keeps building, every send of a build`s rows (misses, key_parts) returns Err and the rows are dropped, with no tracing line and nothing said to the build`s client; the signs are the panic text in serve.log, one `history:` line in `blaze daemon status`, and `blaze why` failing. Which panic ended it in tempo`s home on the VM was not determined (that home was not to be touched).",
+ "cost": "the tempo rerun could not be explained from its profile: no misses rows; lane reth-1112 depends on those rows",
+ "cause": "a panic in one flush is the end of all profile rows for the daemon`s life, silently (rule panics-fail-one-job is not held for this thread)",
+ "class": "a failure that is not loud",
+ "prevention": "catch the unwind per message in keep(), fail that flush with a typed error, say `the profile history ended: <panic>` once to every later build`s client, and restart the thread; a test that plants a panic in a flush and asks the next build for its misses rows",
+ "workaround": "grep serve.log of the home for `panicked` and `blaze daemon status` for `history:` before trusting an empty misses table",
+ "state": "open"
+}

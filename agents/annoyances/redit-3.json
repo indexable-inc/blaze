@@ -1,0 +1,11 @@
+{
+ "id": "redit-3",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+ "where": "blaze: `hir_def::deps::serve`",
+ "what": "A serve that turns crates from resolved to read from images (22 of the standard library's in a small project's first edit) said nothing: no span field, no event, no line of `blaze why` names the crates or that their key did or did not move.",
+ "cost": "two instrumented builds before the cause of reth's panics could be stated",
+ "cause": "the serve's writes are three whole-map inputs; which crates changed is not recorded",
+ "workaround": "none needed",
+ "state": "fixed on redit-1111 (a6c36805a9, cf4bfe2bf8: events naming the crates that gained or lost an image, and each crate whose key moved with both keys)"
+}

@@ -19,7 +19,7 @@ use base_db::Db;
 use blaze_codegen::backend::FrontRef;
 use blaze_hash::{FixedState, HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher, bits::BitSet};
-use blaze_query::db::AsId;
+use blaze_memo::Id as _;
 use cranelift_codegen::ir::{self, ArgumentPurpose};
 use hashbrown::{HashTable, hash_table::Entry};
 use hir_def::{
@@ -98,8 +98,9 @@ impl Walking {
     /// [`Build::WALK`], and where a unit of the instance MIR-inlines, each of
     /// [`Build::WALKS_INLINED`] against the program's world. It is the same list for every kind
     /// of instance and every crate: a unit builds each under its own settings, and even where
-    /// the instance's own MIR is the same under all of them (a body of the library's, inlined
-    /// in every unit; a shim, which has none) the `#[inline(always)]` callees of other crates
+    /// the instance's own MIR is the same under all of them (a shim, which has none; a body
+    /// of the library's is MIR-inlined only where the unit inlines, `Build::options`) the
+    /// `#[inline(always)]` callees of other crates
     /// it builds in are built under them (`always_inlinable_callee`), their bodies MIR-inlined
     /// where the unit inlines: core's `<&A as PartialEq<&B>>::eq` builds in smol_str's
     /// `<SmolStr as PartialEq<str>>::eq`, whose code inlined asks for `Repr::as_str` and
@@ -248,7 +249,7 @@ fn memo<'db>(
     match walked {
         Ok(walked) => Ok(Some(walked)),
         // alloc: the error's message
-        Err(what) => Err(blaze_query::db::attach(db, || {
+        Err(what) => Err(blaze_memo::attach(db, || {
             format!("the references of {}: {what}", super::Named(db, instance))
         })),
     }
@@ -256,7 +257,7 @@ fn memo<'db>(
 
 // Nothing in its arguments is ever collected (the query database frees no interned value),
 // so they stay interned and are never verified.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 fn code_walk<'db>(
     db: &'db Db,
     instance: Instance,
@@ -270,7 +271,7 @@ fn code_walk<'db>(
 /// `lang_start`'s walk: the library's body, whose `#[inline(always)]` callees of other crates
 /// (`main`'s return type's `Termination::report`) a unit builds in under its own settings, so
 /// it is walked under each of them as any instance is ([`Walking::builds`]).
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 fn start_walk(db: &Db, main: FunctionId, inlined: bool) -> Result<Walked, String> {
     let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) };
     scratch(db, env, &Walking::plain(inlined).builds(), |walk| walk.start_shim(main))
@@ -313,8 +314,8 @@ fn code_refs(
     }
     // The body each pass walks, as a unit under its settings reads it: under `WALK` first, so
     // the list starts with what a unit that inlines nothing asks for. A body of the library's
-    // or a coroutine is the same MIR under each (the library's is inlined in every unit, a
-    // coroutine has nothing inlined into it), and is walked under each all the same: the
+    // is inlined only under the passes that inline (`Build::options`), and a coroutine has
+    // nothing inlined into it under any; each is walked under every pass all the same: the
     // callees it builds in are built under the pass's settings ([`Walking::builds`]).
     // alloc: inline, one body a pass
     let mut bodies: SmallVec<[(Build, _); 3]> = SmallVec::new();
@@ -546,6 +547,10 @@ impl Listed {
         self.requests += 1;
     }
 
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a reference's place is a u32 in the codegen record; a function with 2^32 references needs a typed refusal from lowering"
+    )]
     fn next(&self) -> u32 {
         u32::try_from(self.refs.len()).expect("fewer than 2^32 references")
     }
@@ -832,7 +837,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         for callee in &body.inlined.callees {
             let def = match callee.body {
                 InlinedBody::Fn(func) => InstanceDef::Fn(func),
-                InlinedBody::Closure(closure) => InstanceDef::Closure(closure.as_id()),
+                InlinedBody::Closure(closure) => InstanceDef::Closure(closure.gid()),
             };
             let at = self.call_place(def, callee.args.as_ref())?;
             if !matches!(self.found.listed.refs[at as usize], FrontRef::Function(_)) {
@@ -1837,7 +1842,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     _ => unreachable!(),
                 };
                 let parent_args = GenericArgs::new_from_slice(parent_args);
-                let def = InstanceDef::Closure(id.as_id());
+                let def = InstanceDef::Closure(id.gid());
                 let body = self.fx.body_types(def, parent_args).map_err(told)?;
                 if body.params.len() != arg_tys.len() + 1 {
                     // alloc: the error's message

@@ -36,6 +36,32 @@ pub(crate) fn expand_rules(
     })
 }
 
+/// The input an `attr(..)` rule matches for `#[m(args)] item`: two parenthesized groups, the
+/// arguments (empty for `#[m]` and `#[m()]`) and the item, each token with its own span. The
+/// arguments' group is spanned by their delimiters, or by `call_site` for `#[m]`.
+pub(crate) fn attr_input(
+    item: &tt::TopSubtree,
+    args: Option<&tt::TopSubtree>,
+    call_site: Span,
+) -> tt::TopSubtree {
+    let item_delimiter = item.top_subtree().delimiter;
+    let args_delimiter = args.map_or(tt::DelimSpan::from_single(call_site), |args| {
+        args.top_subtree().delimiter.delim_span()
+    });
+    let len = item.token_trees().len() + args.map_or(0, |args| args.token_trees().len()) + 2;
+    // alloc: the call's input, once per attribute call of a macro with `attr(..)` rules.
+    let mut builder = tt::TopSubtreeBuilder::with_capacity(item_delimiter, len);
+    builder.open(tt::DelimiterKind::Parenthesis, args_delimiter.open);
+    if let Some(args) = args {
+        builder.extend_with_tt(args.token_trees());
+    }
+    builder.close(args_delimiter.close);
+    builder.open(tt::DelimiterKind::Parenthesis, item_delimiter.open);
+    builder.extend_with_tt(item.token_trees());
+    builder.close(item_delimiter.close);
+    builder.build()
+}
+
 /// [`expand_rules`] with every match and transcription temporary in `frame` and the output
 /// written out by `build`: [`tt::TopSubtreeBuilder::build`] for a tree that is kept, with its
 /// parser words, or [`tt::TopSubtreeBuilder::build_in`] a caller's frame for a temporary.

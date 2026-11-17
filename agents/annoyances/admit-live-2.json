@@ -1,0 +1,19 @@
+{
+ "id": "admit-live-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane admit-live",
+ "where": "crates/blaze-graph/src/plane.rs (`Plane::pick`), crates/blaze-graph/src/footprint.rs (`Charge::alone_ok`, deleted), crates/blaze-cargo/src/serve/plane.rs (`Plane::poll`)",
+ "what": "The smoke's second build stalled with one task not settled: `program (Codegen)`, Ready for 16.75 s with nothing else running, never granted, at 12.9 of 190.9 GiB, until the 2 s stall bound. The client was told `waiting for the system's memory pressure to pass` (printed for any wait with 0 granted tasks), the admission span of a wait in which nothing fit said `a work thread`, and the stall said `no task ran or was ready` beside nodes it listed Ready.",
+ "cost": "a stalled build per daemon that meets it; two lanes; a first lane briefed on the wrong mechanism by the labels",
+ "cause": "read from the code (awaited-stall-1): a task that fits only alone started only on a footprint reading taken after a purge; the plane asked one purge and no other until such a reading; the driver lets a purge go unanswered when nothing waits as it lands. That this is what held the program task was not measured on the stalled build.",
+ "whys": [
+  "why did it wait: with nothing running, the start was gated on a reading only the driver could supply",
+  "why did the reading never come: the plane's wait was ended by another component's obligation, stated in a comment, and that component's rule changed",
+  "why no test caught it: the footprint simulation's driver always chased a purge and its oracle was safety alone (the ceiling)",
+  "why was the gate there: so a task let in alone would not grow into memory a purge gives back; the ceiling's gate already purges for exactly that growth",
+  "property: liveness that depends on a protocol across the core/driver line, with no oracle stating it"
+ ],
+ "class": "a wait whose waker is another component's unstated obligation, and a start gated on information that cannot change the answer",
+ "prevention": "the invariant on `Plane::pick`: when no running task holds a grant, the first ready task starts in that step, whatever its forecast, the readings, a cap or the allowance (the one wait left is a ledger turn, asked level-triggered); `Charge::alone_ok` and the purge precondition are gone; the footprint simulation checks liveness after every plane step under a driver that lets purges go, with the old rule as its planted bug (`the_oracle_catches_a_task_alone_that_waits_for_a_purged_reading`); the reference model states the same rule; labels: the admission span says memory when `waits_for_memory` held the node, the client line and the stall say what is true",
+ "state": "written on int-1112, not compiled or run by the lane"
+}

@@ -1,0 +1,21 @@
+{
+ "id": "A-certificate-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane certificate-1112",
+ "where": "crates/blaze-cargo/src/serve/job.rs, serve/job/noop.rs",
+ "what": "A repeated request is answered without a walk only as an exception: the kept answer lives in memory, is kept only of a build that walked everything and made nothing, and has eight ways to be refused (plan made anew, a lock file, a look, a link in a path, another job). A restart, an edit build, or a build script that globs each make the next no-op a whole walk (1,162 jobs for a hello-world).",
+ "cost": "every first request after a restart or an edit: 160-700 ms on a hello-world, 2.0-2.8 s on reth; a day of lanes chasing single refusals",
+ "cause": "the walk is the default and the answer is a cache of the walk, resting on evidence only the live process has (watch generations)",
+ "whys": [
+  "why a walk: the kept answer was refused or absent",
+  "why absent: it is memory's, and only of a build that made nothing",
+  "why memory's: what it rests on is the watches' generation, which a restart loses",
+  "why watches: the answer never recorded its inputs by content, only that nothing was heard",
+  "why: it was added beside the walk as a fast path, not designed as the primary answer"
+ ],
+ "class": "a fast path whose evidence is process state instead of content: correct only while the process lives, and refused by every case the process cannot vouch for",
+ "prevention": "the request certificate (docs/v2/plan/design/certificate.md): one store record of every input by content with six named reasons to fail; process state (watches) only skips looks, never decides",
+ "workaround": "none",
+ "fix": "serve/job/certificate.rs written (record, codec, check, tests); the daemon's hunks are the handover in certificate.md, State",
+ "state": "open"
+}

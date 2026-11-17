@@ -9,7 +9,7 @@ A blaze extension (AGENTS.md rule 4: opt-in, inert under rustc with
 `#![feature(register_tool)] #![register_tool(blaze)]`). A function marked `#[blaze::pure]`
 promises that, given equal arguments, it returns an equal result and changes nothing but what
 its arguments reach, through every call it can make. The deny-by-default lint `blaze::pure`
-holds the promise ([lints.md](../../../lints.md#pure)). The kernel memoizes a compute step on
+holds the promise. The kernel memoizes a compute step on
 it: the step's result is kept by the identity of its instance graph and its arguments.
 
 The check is the walk that proves build scripts pure

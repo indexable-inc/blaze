@@ -1,0 +1,16 @@
+{
+ "id": "sound-1112-5",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane sound-1112",
+ "where": "blaze: a splice refused once fails every build after it",
+ "what": "The oracle's smoke run (oracle::each_kind_once_builds_as_clean, twice: with and without the proc macro; tree ae8cc5328b): the build script's cfg file flipped (`flavor` under cfg(spicy) swapped for its twin in vendor/made) fails `linking ...: staging the change: linking: the function app::main (InstanceKey(92bf546eb7a5)) is removed with nothing put in its slot, and the GOT cell of the function app::main ... still calls it` (the known refusal of case a_cfg_twin_chosen_by_a_build_script), and then the next builds, after a body edit of the library and after an edit of the proc macro, fail with the same message, same instance key: 3 failed builds in a row in one run, 2 in the other, where a clean build of each revision succeeds.",
+ "cost": "a daemon that cannot build the project again until it is stopped (not tried: whether a stop clears it)",
+ "cause": "not found",
+ "whys": [
+  "the refused splice leaves the kept image and the walk as they were, and the next build stages the same change"
+ ],
+ "class": "a failure kept as state",
+ "prevention": "a refused splice ends in a full link (rule no-fallback says stop: then the state it stops in must be one the next build recovers from); the oracle's case replays it: BLAZE_ORACLE_REPLAY='parts made; scriptcfg; body=1'",
+ "workaround": "blaze stop (not verified)",
+ "state": "open, for the lane that owns the splice"
+}

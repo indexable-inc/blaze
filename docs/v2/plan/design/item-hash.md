@@ -27,7 +27,7 @@ Prior art, and what is taken from each:
 
 | prior art | taken |
 |---|---|
-| Unison: a definition is the hash of its AST, names are metadata | the identity hashes content with every reference by hash, no names of the item itself, no positions |
+| Unison: a definition is the hash of its AST, names are metadata | the identity hashes content with no name of the item itself and no positions; a reference is by its target's key and hash (D51), not by hash alone, since Rust's types are nominal |
 | Build Systems à la Carte: constructive traces (Shake's cloud, Bazel's action cache) | dynamic dependencies (which impls a solve read) are a trace stored beside the key: a shape lists the facts read, the answer is filed under their values |
 | Bazel, Nix: actions keyed by declared inputs, outputs by content | the a-priori part of the key is everything a body can read that is known before running it |
 | rustc: `DefPathHash`, `hir_owner` hashes, the SVH | `ItemKey` is our `DefPathHash`; the identity is a `hir_owner` hash with resolved references in place of `DefPathHash`es, so it is stable across sessions as rustc's is not across crate edits |
@@ -43,6 +43,16 @@ Prior art, and what is taken from each:
   visibility, a trait's items, layout-affecting attributes (`repr`, `align`, `packed`,
   `transparent`, `non_exhaustive`), visibility as "public, crate, or the module n levels up",
   plus what a body leaks (section 4). Computed by `blaze_items::hash::interface_hash`.
+  What validates a type-check result names each target by key as well as by hash (D51): the
+  signature hash, and a fact's value that spells a form (a field's type, a closure's captures, a
+  constant's type). `struct Meters(u32)` and `struct Feet(u32)` have one hash, so a hash alone
+  made `fn f(m: Meters)` and `fn f(f: Feet)` one signature, and a caller's stored inference and
+  MIR were served stale after the edit. A rename keeps the item's own hashes and moves every
+  signature hash that names it; inside a strongly connected component a reference is the
+  member's position and its key. The interface, layout, code and deep hashes stay name-free:
+  they key what codegen compiles, which depends on shapes only, and which item a compiled body
+  calls or names is bound by key beside its code (the bound hash, the instance keys), never
+  inside it.
 - **Identity** (new, `blaze_item_hash::identity`): *what a body's results are a function of*,
   known before running them. Section 3.
 
@@ -139,7 +149,7 @@ a type or an impl changes that fact's key and the body misses once.
 
 | entry kind | hashed as |
 |---|---|
-| an item (`Function`, `Struct`, ..., `EnumVariant`) | its item key and its signature hash (a variant: its enum's) |
+| an item (`Function`, `Struct`, ..., `EnumVariant`) | its item key and its signature hash (a variant: its enum's), which names every item it refers to by key and hash (section 2) |
 | a macro (`Macro2`, `MacroRules`, `ProcMacro`) | its item key and its signature hash (its rules or its expander's identity) |
 | `Crate` | its crate key |
 | `Block` | its index among the body's blocks (blocks are the body's own) and whether it holds items |
@@ -254,6 +264,20 @@ classified by `BodyFacts::classify`:
   entry names the part of section 3 that covers it (the body and its scopes by content, the def
   map by names, the owner's signature by owner, the crate's data by crate inputs).
 - **fact**: it stands for one fact of section 5; the fact goes into the shape.
+- **read through**: its value is a function of its own row's reads and of nothing else, and no
+  fact is keyed by its arguments (a type's layout, `layout_of_ty_query` and
+  `layout_of_adt_query`, keyed by a type and an environment whose interned ids are one
+  process's; and the derived tables a layout reads: a struct's flags, an enum's discriminants,
+  a `bits` struct's packing, a field's bit width, the plan's ranks of an ADT's fields). The store
+  brings the row up to date by its key (`blaze_query::db::refresh`, the engine's own verify,
+  which also gives the running query a read edge on it) and classifies the row's reads in its
+  place, through again where one is read through, down to covered reads, facts or refusals. So
+  a body's MIR that reads `size_of::<S>()` is traced as the facts that decide `S`'s layout (its
+  fields' types, its `#[repr]` in its `Attrs` fact, its variants and fields in its `Fields`
+  fact, each variant's discriminant as its `ConstValue`, the target, the build's field order
+  plan as `FieldOrder`), and no type is ever keyed. Cutoff is by those inputs, not by the
+  layout: a field's type edited to another of the same layout still misses. A row a store
+  answered, or one that cannot be brought up to date (a cycle through it), is refused by name.
 - **refused**: anything else. The result is not stored and the refusal is counted by query name
   (as the goal store's `inexpressible`). A refused body is inferred as it always is; nothing is
   answered another way.
@@ -449,7 +473,7 @@ rest is stated here as what remains.
 | signatures, generics and bounds, types' fields and layout attributes, visibility, re-exports, impls, attributes a check reads (`must_use`, `deprecated`) | every dependent | kept as text in the interface text |
 | exported macros' tokens | expansion in the dependent | kept as text |
 | bodies it instantiates, evaluates, inlines or types through: a type or const parameter (of the fn, its `impl`, its trait), `const`, `#[inline]`, `impl Trait`, `async`, a body that defines an item | check and codegen | kept as text (`blaze_lower::code::plain_body` refuses each) |
-| every other body | codegen only: its walk compiles or finds every instance it reaches, across crates | a unit that builds code is keyed by its dependencies' code text, deeply (`Narrowed::code`); only a unit that only checks is keyed by their interfaces (`Narrowed::checked`) |
+| every other body | a program's codegen and link: its walk compiles or finds every instance it reaches, across crates; an optimized library's inliner | a program's unit, and an optimized library's, is keyed by its dependencies' code text, deeply (`Narrowed::code`); a unit that only checks, and since 2026-11-12 a library built at `opt-level` 0, by their interfaces (`Narrowed::checked`, `Narrowed::built`: store.md, "Early cutoff between crates") |
 | cfg, features, edition, env, target, a build script's cfgs and `OUT_DIR` files | every dependent | the crate's settings (`Crate::content`) and files, in every identity |
 | what blaze's extensions prove over callee bodies (effects, contracts, `fn_info`'s code identity) | a check | a crate that names them, or depends on a workspace crate that does, takes and gives no interface |
 | a proc macro's, build script's or const macro crate's code | run by the dependent | its interface is its code |
@@ -474,8 +498,9 @@ keeps its text: it is an error, which a shape would hide.
 changed or removed at a line's end or after the last line; spaces before a line's end; blank
 lines at a file's end): no unit's key, in the edited crate itself or above it, so no unit, no
 codegen and no link runs. A plain body's edit that keeps its lines: no checking dependent's
-key. Any body edit: every unit that builds code above it, which then finds every function but
-the edited one in the store.
+key. A plain body's edit that keeps its lines: also no library built at `opt-level` 0 above it
+(2026-11-12, written, not yet run). Any body edit: every program above it, and every optimized
+library, which then finds every function but the edited one in the store.
 
 **What it does not, and why.**
 

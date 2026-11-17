@@ -18,8 +18,9 @@ use hir_def::{
 use hir_expand::name::Name;
 use intern::Symbol;
 use rustc_ast_ir::Mutability;
+use blaze_ids::bits::BitSlice;
 use rustc_type_ir::{
-    InferTy, TypeVisitableExt, Upcast, Variance, elaborate,
+    InferTy, TyVid, TypeVisitableExt, Upcast, Variance, elaborate,
     fast_reject::{DeepRejectCtxt, TreatParams, simplify_type},
     inherent::{BoundExistentialPredicates as _, IntoKind, Ty as _},
 };
@@ -319,8 +320,13 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
         self_ty: Ty<'db>,
         allow_unstable: bool,
     ) -> PickResult<'db> {
-        let scope_items =
-            self.traits_in_scope.named(self.infcx.interner.db, item_name, item_hygiene, self.frame);
+        let scope_items = self.traits_in_scope.named(
+            self.infcx.interner.db,
+            self.resolver.ctx_table(),
+            item_name,
+            item_hygiene,
+            self.frame,
+        );
         let choice = ProbeForNameChoice {
             private_candidate: None,
             item_name,
@@ -495,18 +501,36 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
                     )
                     .unwrap_or_else(|_| panic!("instantiating {:?} failed?", ty));
                 let ty = self.infcx.deeply_resolve_ignoring_regions(ty.value);
-                match ty.kind() {
-                    TyKind::Infer(InferTy::TyVar(_)) => {
-                        let raw_pointer =
-                            bad_ty.reached_raw_pointer && !self.features.arbitrary_self_types;
-                        if let Some(errors) = self.errors {
-                            errors.unknown_receiver.set(Some((ty, raw_pointer)));
-                        }
+                if let TyKind::Infer(InferTy::TyVar(vid)) = ty.kind()
+                    && self.is_diverging(vid)
+                {
+                    // A type variable a coercion of `!` made: it is set to `!`, and `!` is
+                    // probed for the method below, with the lint
+                    // `method_call_on_diverging_infer_var` (Rust 1.99, rust-lang/rust#156047:
+                    // with `Infallible` an alias of `!`, code that called a method on an
+                    // `Infallible` now calls it on such a variable).
+                    if let Some(errors) = self.errors {
+                        errors.diverging_receiver.set(true);
                     }
-                    TyKind::Error(_) => {}
-                    _ => panic!("unexpected bad final type in method autoderef"),
-                };
-                return Choice::final_choice_from_err(choice, MethodError::ErrorReported);
+                    let never = self.infcx.interner.default_types().types.never;
+                    let cause = ObligationCause::new(self.call_span);
+                    // A variable takes `!` with no obligation left over.
+                    let unified = self.infcx.at(&cause, self.param_env).eq(ty, never);
+                    debug_assert!(unified.is_ok_and(|it| it.obligations.is_empty()));
+                } else {
+                    match ty.kind() {
+                        TyKind::Infer(InferTy::TyVar(_)) => {
+                            let raw_pointer =
+                                bad_ty.reached_raw_pointer && !self.features.arbitrary_self_types;
+                            if let Some(errors) = self.errors {
+                                errors.unknown_receiver.set(Some((ty, raw_pointer)));
+                            }
+                        }
+                        TyKind::Error(_) => {}
+                        _ => panic!("unexpected bad final type in method autoderef"),
+                    };
+                    return Choice::final_choice_from_err(choice, MethodError::ErrorReported);
+                }
             }
         }
 
@@ -523,6 +547,16 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
             facts.module_dependent = probe_cx.module_dependent;
             Choice::choose(probe_cx)
         })
+    }
+
+    /// Whether `vid` is, or is related by subtyping to, a type variable a coercion of `!`
+    /// made (rustc's `diverging_type_vars`, by `sub_unification_table_root_var`).
+    fn is_diverging(&self, vid: TyVid) -> bool {
+        let Some(words) = self.diverging_type_vars else { return false };
+        let root = self.infcx.sub_unification_table_root_var(vid);
+        BitSlice::<u32>::from_words(words)
+            .iter()
+            .any(|var| self.infcx.sub_unification_table_root_var(TyVid::from_u32(var)) == root)
     }
 
     fn method_autoderef_steps(
@@ -840,10 +874,13 @@ impl<'db, 'f> ProbeChoice<'db> for ProbeForNameChoice<'db, 'f> {
         let db = this.db();
         let name = this.choice.item_name;
         let hygiene = this.choice.item_hygiene;
+        let table = this.ctx.resolver.ctx_table();
         let item = match items {
-            ItemsOf::Impl(id) => inherent_value_item(db, id, impl_item_name(db, id, name, hygiene)),
+            ItemsOf::Impl(id) => {
+                inherent_value_item(db, id, impl_item_name(db, table, id, name, hygiene))
+            }
             ItemsOf::Trait(id) => {
-                this.choice.trait_items.get(db, id, trait_item_name(db, id, name, hygiene))
+                this.choice.trait_items.get(db, id, trait_item_name(db, table, id, name, hygiene))
             }
         }
         .filter(|id| this.mode == Mode::Path || matches!(id, CandidateId::FunctionId(_)));

@@ -1,0 +1,39 @@
+about = "After a build, a run and then a build of the same source make nothing again and run few engine memos (2026-11-11: `build` then `run` were not no-ops); the third of one command in a row is answered as the last one was, with no walk."
+drivers = ["real"]
+
+[[revision]]
+action = "build"
+
+[[revision]]
+steps = []
+action = "run"
+prints = "2 4\n"
+redone = []
+max_units = 0
+max_executed = 200
+max_verified = 2000
+link = "none"
+
+[revision.known]
+max_executed = "the first `run` after a `build` of the same source runs about 840 engine memos (843, 841 seen), though it makes no unit again: `build` then `run` is not a no-op (2026-11-11)"
+max_verified = "and verifies about 58,500 cached results"
+
+[[revision]]
+steps = []
+action = "build"
+redone = []
+max_units = 0
+max_executed = 200
+max_verified = 2000
+link = "none"
+
+[[revision]]
+steps = ["build"]
+action = "build"
+noop = true
+
+[[revision]]
+steps = ["run", "run"]
+action = "run"
+prints = "2 4\n"
+noop = true

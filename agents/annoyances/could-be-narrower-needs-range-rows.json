@@ -1,0 +1,14 @@
+{
+ "id": "could-be-narrower-needs-range-rows",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane blaze-findings",
+ "where": "crates/blaze-lints/src/blaze/weight/rows.rs `Arg` join; crates/blaze-lints/src/blaze/suggest/could_be_narrower.rs",
+ "what": "`could_be_narrower` for parameters and fields (the owner's case: a type that could be more specific) needs every call's argument as a value range, but the workspace use rows only keep `Unseen | Same(Constant) | Varies` per parameter, so only function results (one body) are built.",
+ "cost": "the lint covers returns only; params and fields wait for a range variant in another lane's rows and for the fold to be wired",
+ "cause": "the workspace use rows were designed for one question (is it always the same constant) instead of as per-site observations that any join can fold",
+ "class": "workspace facts stored pre-joined for one lint, so a second lint over the same sites needs its own pass",
+ "prevention": "store per-site observations as `ItemRows` records and let each lint be a `fold::Join` over them (constant_argument is `Same`, could_be_narrower is `Narrow`), one pass of rows for both",
+ "workaround": "none: the params/fields case is designed in could_be_narrower.rs's module doc, not built",
+ "fix": "not yet",
+ "state": "open"
+}

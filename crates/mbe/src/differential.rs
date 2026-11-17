@@ -16,11 +16,19 @@ use span::{
 };
 use tt::{TextRange, TextSize};
 
-use crate::{DeclarativeMacro, MacroCallStyle, expander};
+use crate::{DeclarativeMacro, MacroCall, expander};
 
 const EDITIONS: [Edition; 3] = [Edition::Edition2015, Edition::Edition2021, Edition::Edition2024];
-const STYLES: [MacroCallStyle; 3] =
-    [MacroCallStyle::FnLike, MacroCallStyle::Attr, MacroCallStyle::Derive];
+/// The calls every input is expanded as; an attribute's with no arguments and with the input as
+/// its arguments too.
+fn calls(input: &tt::TopSubtree) -> [MacroCall<'_>; 4] {
+    [
+        MacroCall::FnLike,
+        MacroCall::Attr { args: None },
+        MacroCall::Attr { args: Some(input) },
+        MacroCall::Derive,
+    ]
+}
 
 fn anchor(file: u32, edition: Edition) -> SpanAnchor {
     SpanAnchor {
@@ -58,12 +66,16 @@ fn assert_same(
     let call_site = call_site();
     let mut expansions = Vec::new();
     assert_same_parses(db, input, &|| format!("{}\nthe input", what()));
-    for style in STYLES {
+    for call in calls(input) {
+        let style = call.style();
+        let what = || format!("{}\ncall: {call:?}", what());
+        let call_input = mac.input(input, call, call_site);
+        let input = call_input.as_ref().unwrap_or(input);
         let new = expander::expand_rules(db, &mac.rules, input, |_| (), style, call_site)
             .map(|(tree, arm, _)| (tree, arm));
         let old = expander::model::expand_rules(db, &mac.rules, input, |_| (), style, call_site);
-        assert_eq!(new, old, "{}\nstyle: {style:?}", what());
-        assert_same_parses(db, &new.value.0, &|| format!("{}\nstyle: {style:?}", what()));
+        assert_eq!(new, old, "{}", what());
+        assert_same_parses(db, &new.value.0, &what);
         expansions.push(new.value.0);
         if marked {
             let marker = |span: &mut Span| span.range = TextRange::empty(TextSize::from(7));
@@ -71,7 +83,7 @@ fn assert_same(
                 .map(|(tree, arm, _)| (tree, arm));
             let old =
                 expander::model::expand_rules(db, &mac.rules, input, marker, style, call_site);
-            assert_eq!(new, old, "{}\nstyle: {style:?}, marked", what());
+            assert_eq!(new, old, "{}, marked", what());
         }
     }
     expansions
@@ -99,7 +111,7 @@ fn caught<T>(f: impl FnOnce() -> T) -> Option<T> {
 /// matcher's.
 fn assert_same_parses(db: &Db, tt: &tt::TopSubtree, what: &impl Fn() -> String) {
     use syntax_bridge::reference;
-    let mut edition = |ctx: SyntaxContext| ctx.edition(db);
+    let mut edition = |ctx: SyntaxContext| ctx.edition();
     for view in [tt.view().strip_invisible(), tt.token_trees(), tt.view().as_token_trees()] {
         let new = caught(|| syntax_bridge::to_parser_input(view, &mut edition));
         let old = caught(|| reference::to_parser_input(view, &mut edition));
@@ -246,6 +258,10 @@ const CORPUS: &[(&str, &[&str])] = &[
         &["x", "1"],
     ),
     (
+        "attr( $a:ident ) ( $x:ident ) => { attr $a $x }; attr( $( $a:tt )* ) [ $( $x:tt )* ] => { $( $a )* ; $( $x )* }; ( $x:ident ) => { fnlike $x };",
+        &["x", "1", "a b", ""],
+    ),
+    (
         "( $a:ident += $b:expr ) => { $a = $a + $b }; ( $a:ident :: $b:ident ) => { $a :: $b }; ( $a:ident ..= $b:literal ) => { $a .. $b };",
         &["x += 1", "x + = 1", "a::b", "a :: b", "a ..= 1", "a ..=", "a"],
     ),
@@ -280,7 +296,7 @@ const EDITION_PAIRS: [(Edition, Edition); 3] = [
 
 #[test]
 fn corpus() {
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     for &(decl, inputs) in CORPUS {
         for (pair, (def_edition, call_edition)) in EDITION_PAIRS.into_iter().enumerate() {
             let def = token_tree(0, def_edition, decl).expect("a corpus macro lexes");
@@ -309,7 +325,7 @@ fn corpus() {
 
 #[test]
 fn long_fragments() {
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let mut texts = vec![
         "a < b < c < d < e < f < g < h < i < j > > > > > > > > > , x".to_owned(),
         "Vec :: < u8 > :: new ( ) . iter ( ) . map ( | x | x + 1 ) . collect :: < Vec < _ > > ( ) ;"
@@ -343,7 +359,7 @@ fn benchmark_macros() {
     if test_utils::skip_slow_tests() {
         return;
     }
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let rules = crate::benchmark::macro_rules_fixtures();
     let invocations = crate::benchmark::invocation_fixtures(&db, &rules);
     for (id, input) in &invocations {
@@ -667,7 +683,7 @@ const INPUTS_PER_MACRO: usize = 5;
 
 #[test]
 fn random_macros() {
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let seeds = if test_utils::skip_slow_tests() { SEEDS } else { SLOW_SEEDS };
     let mut checked = 0;
     for seed in 0..seeds {

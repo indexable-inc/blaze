@@ -194,8 +194,78 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 /// daemon's plane says it ([`record`]).
 static CAUGHT: OnceLock<fn() -> bool> = OnceLock::new();
 
+/// Distinct panic sites (`file:line:column`) whose repeats the log counts ([`again`]); a site
+/// past them is printed in full every time, as before.
+const SITES: usize = 256;
+/// Repeats of a site that each get a line; past them a line at each power of two.
+const EACH: u64 = 8;
+
+/// A site's hash (never 0) and how many panics it raised.
+static SITE: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
+static TIMES: [AtomicU64; SITES] = [const { AtomicU64::new(0) }; SITES];
+
+/// FNV-1a of a location, never 0. No allocation: the hook runs where the allocator may have
+/// failed.
+fn site_hash(file: &str, line: u32, column: u32) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in file.bytes().chain(line.to_le_bytes()).chain(column.to_le_bytes()) {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash.max(1)
+}
+
+/// How many panics the site of hash `site` has raised, this one counted, in the tables given;
+/// `None` when the tables hold [`SITES`] other sites (it is then printed in full).
+fn times(sites: &[AtomicU64], counts: &[AtomicU64], site: u64) -> Option<u64> {
+    let len = sites.len();
+    for probe in 0..len {
+        let at = (site as usize).wrapping_add(probe) % len;
+        let held = match sites[at].compare_exchange(0, site, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => site,
+            Err(held) => held,
+        };
+        if held == site {
+            return Some(counts[at].fetch_add(1, Ordering::AcqRel) + 1);
+        }
+    }
+    None
+}
+
+/// Whether the `n`th panic of a site (`n >= 2`) gets its one line: each of the first
+/// [`EACH`], then each power of two, so a site that panics 150,000 times costs 22 lines, not
+/// 150,000 backtraces (a day's `serve.log` was 2.2 GB of them, 2026-11-11).
+const fn again(n: u64) -> bool {
+    n <= EACH || n.is_power_of_two()
+}
+
+/// Prints a panic a job's boundary catches: the first of its site as the hook before did
+/// (`printed`: std's message and backtrace); a repeat as one line with its count, or nothing
+/// between the counts [`again`] names. None is lost: each is a `panics` row with its own
+/// stack, and the job that caught it reports it. A panic nothing catches is always printed
+/// whole: it ends its thread, and the log's last lines must say why.
+fn print(info: &std::panic::PanicHookInfo<'_>, caught: bool, printed: &dyn Fn(&std::panic::PanicHookInfo<'_>)) {
+    let Some(location) = info.location().filter(|_| caught) else { return printed(info) };
+    let site = site_hash(location.file(), location.line(), location.column());
+    match times(&SITE, &TIMES, site) {
+        None | Some(1) => printed(info),
+        Some(n) if again(n) => {
+            let message = info.payload_as_str().unwrap_or("(a payload that is not text)");
+            let line = message.lines().next().unwrap_or("");
+            let cut = line.char_indices().nth(200).map_or(line.len(), |(at, _)| at);
+            eprintln!(
+                "blaze: panic at {location}, the {n}th caught at this site (its backtrace is with the first, \
+                 earlier in this log or in `serve.log.1`; each is a row of `panics`; said next at the {}th): {}",
+                if n < EACH { n + 1 } else { (n + 1).next_power_of_two() },
+                &line[..cut],
+            );
+        }
+        Some(_) => {}
+    }
+}
+
 /// Has every panic of the process written to the ring as it is raised, then printed by the hook
-/// that was there before (std's). `caught` says whether a panic raised on the calling thread is
+/// that was there before (std's), a repeat of a caught one as a line with its count
+/// ([`print`]). `caught` says whether a panic raised on the calling thread is
 /// caught by a job's boundary (blaze-cargo's plane: a plane task's, or a pool job's on its
 /// fiber), for the row's `caught`. Once a process; a later call does nothing, so the hook never
 /// wraps itself and writes each panic once (tests call it each).
@@ -208,7 +278,7 @@ pub fn record(caught: fn() -> bool) {
         // alloc: the process's one panic hook
         std::panic::set_hook(Box::new(move |info| {
             raised(info.payload_as_str(), info.location());
-            printed(info);
+            print(info, caught(), &printed);
         }));
     });
 }
@@ -325,7 +395,8 @@ pub(crate) fn system_thread_name(out: &mut [u8]) -> usize {
 }
 
 /// Where the newest panic raised with `message` (`None` for a payload that is no text) that no
-/// catcher took yet was raised, `<file:line:column> on thread <name>`, taking it: what the plane
+/// catcher took yet was raised, `<file:line:column> on thread <name>`, then the spans the thread
+/// was inside (`, inside `outer` > `inner``, where it was inside any), taking it: what the plane
 /// says of a task's panic it caught. `None` when the ring holds no such panic: one raised past
 /// [`KEPT`] ago, or an unwind no hook saw (the query engine's typed payloads).
 pub fn claim(message: Option<&str>) -> Option<String> {
@@ -340,13 +411,22 @@ pub fn claim(message: Option<&str>) -> Option<String> {
         }
         let location = slot.location.text().unwrap_or_else(|| "an unknown place".to_owned()); // alloc: a panic caught, once
         let thread = slot.thread.text().unwrap_or_default();
+        // The spans the thread was inside as it panicked, outermost first: what it was doing,
+        // which the location alone (a solver's assertion, say) does not tell.
+        let opened = (slot.opened.load(Ordering::Relaxed) as usize).min(OPEN);
+        let mut inside = String::new(); // alloc: none until a span is named; a panic caught, once
+        for name in slot.open[..opened].iter().filter_map(|it| it.text()) {
+            inside.push_str(if inside.is_empty() { ", inside `" } else { " > `" });
+            inside.push_str(&name);
+            inside.push('`');
+        }
         fence(Ordering::Acquire);
         if slot.seq.load(Ordering::Relaxed) != 2 * n + 2 {
             continue;
         }
         // alloc: a panic caught, once
         return Some(format!(
-            "{location} on thread {}",
+            "{location} on thread {}{inside}",
             if thread.is_empty() { "<unnamed>" } else { &thread }
         ));
     }
@@ -624,6 +704,31 @@ pub fn top_frames(stack: &[String], top: usize) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A site's panics are counted apart from every other site's, 150,000 of them are said
+    /// in 22 lines (the first whole), and a site the table has no room for is told apart
+    /// (printed whole), never counted as another's.
+    #[test]
+    fn a_repeated_panic_is_a_line_and_a_count() {
+        let sites: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+        let counts: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+        let a = site_hash("crates/a.rs", 7, 3);
+        let b = site_hash("crates/a.rs", 7, 4);
+        assert_ne!(a, b);
+        let mut lines = 0;
+        for n in 1..=150_000u64 {
+            assert_eq!(times(&sites, &counts, a), Some(n));
+            lines += u64::from(n == 1 || again(n));
+        }
+        assert_eq!(lines, 22);
+        assert_eq!(times(&sites, &counts, b), Some(1), "another site's first");
+        assert_eq!(times(&sites, &counts, b), Some(2));
+        for other in 0..2 {
+            assert_eq!(times(&sites, &counts, site_hash("crates/b.rs", other, 0)), Some(1));
+        }
+        assert_eq!(times(&sites, &counts, site_hash("crates/c.rs", 1, 1)), None, "the table is full");
+        assert_eq!(times(&sites, &counts, a), Some(150_001), "and still counts the sites it holds");
+    }
 
     #[inline(never)]
     fn panics_in_a_job(text: &str) {

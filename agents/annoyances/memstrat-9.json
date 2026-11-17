@@ -1,0 +1,11 @@
+{
+ "id": "memstrat-9",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane memstrat-1111",
+ "where": "measure.py: the restart rows",
+ "what": "On the VM (tmpfs) the restart rows of the base binary ended `ok=False`: the first run after the restart, or the first edit after it, did not print what was expected; on the Mac the same binary's ended `ok=True`. The script does not say which of the two failed or print the output.",
+ "cost": "a restart row that cannot be trusted on the VM",
+ "cause": "not looked into; could be a stale answer after a restart, which would be a bug in blaze, or the script",
+ "workaround": "none",
+ "state": "open: for the restart lane; the script should print the failing run's output"
+}

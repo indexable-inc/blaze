@@ -60,14 +60,25 @@ pub(crate) mod wasm;
 pub use crate::llvm::pgo::Profile;
 pub use allocator::allocations_unobserved;
 pub use backend::Backends;
-pub use frontend::{BodyChecks, Databases, HirFrontend};
+pub use frontend::{BodyChecks, Databases, HirFrontend, Walks, kept_walks};
+pub use frontend::described::{
+    Head,
+    plan::{
+        Edge, Edges, PLAN_MAGIC, PartReads, PlanAsk, PlanFailed, PlanPart, PlanView, Planned,
+        STATIC_ASK_LEN,
+        STATIC_ASK_MAGIC, STATIC_PLAN_MAGIC, StaticHead, StaticPlanView, static_ask,
+    },
+};
 pub use global_asm::GlobalAsmObject;
 pub use hashes::ItemHashes;
-pub use linked::{Assumed, InputsWork, LinkInputs, Table, span_table_id, span_tables_of};
+pub use linked::{
+    Assumed, InputsWork, LinkInputs, OwnerSpans, Table, owner_span_tables, span_table_id,
+    span_tables_of,
+};
 pub use lowered::{Lowering, lowered};
 #[cfg(feature = "llvm")]
 pub use release::{give_profile, profile_id};
-pub use roots::{RootKind, RootTest, Roots, harness::MODULE as HARNESS_MODULE};
+pub use roots::{RootKind, RootTest, Roots, harness::MODULE as HARNESS_MODULE, kept_record};
 pub use toolchain::{CodegenCode, Runs, code, select, set_code, toolchain, toolchain_for};
 
 /// What the items lane says of the front end's items by content (docs/v2/plan/design/item-hash.md): the
@@ -88,9 +99,10 @@ pub trait Hashes: Sync {
     /// ([`blaze_codegen::template::own_anchor`]) and its instance fills
     /// (docs/v2/plan/design/name-free-identity.md).
     fn template_code(&self, db: &Db, body: Body) -> Result<CodeHash, String>;
-    /// What a compiled body reads of names beside its code, which every key of it holds: the
-    /// names of the files its `file!()` reads and, when `told` (a debugger is told of its
-    /// locals), what their types' identities read (`hir_ty_share::code::told_names`). With
+    /// What a compiled body reads of names beside its code, which every key of it holds: when
+    /// `told` (a debugger is told of its locals), what their types' identities read
+    /// (`hir_ty_share::code::told_names`); never a file's name (a `file!()` is a span the
+    /// link names). With
     /// whether that is all of it: not when a told local's type holds an alias, which neither
     /// the code nor the instance's arguments key, so its template is kept under its code.
     fn names_read(&self, db: &Db, body: Body, told: bool) -> Result<(ContentId, bool), String>;
@@ -206,11 +218,11 @@ impl Hashes for HashSource {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Body {
     Item(DefWithBodyId),
-    Closure(blaze_query::db::Id),
+    Closure(blaze_memo::Gid),
     /// The `Future::poll` of an `async` block.
-    Coroutine(blaze_query::db::Id),
+    Coroutine(blaze_memo::Gid),
     /// The future an `async` closure gives when called by value though it could be again.
-    CoroutineByMove(blaze_query::db::Id),
+    CoroutineByMove(blaze_memo::Gid),
 }
 
 /// A function instance as the front end holds it.
@@ -247,8 +259,8 @@ pub(crate) enum Kind {
     Allocator(allocator::Forward),
 }
 
-/// A static as the front end holds it.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// A static as the front end holds it: homed where its item is (its crate's arena).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, blaze_memo::Home)]
 pub struct HirStatic(pub StaticId);
 
 /// A function whose IR is built, waiting for its backend.
@@ -361,10 +373,20 @@ pub(crate) enum DataPlace {
     Own,
     /// A position the program observes: a `#[track_caller]` location, a panic's.
     Position(SpanRef),
-    /// The bytes of a `&str` made at compile time: `file!()`, with what is `concat!`ed to it.
-    Text(String),
+    /// A `&str` made at compile time of literals and files' names: a `concat!` with `file!()`.
+    /// The link writes it (`blaze_codegen::text`): no name of a file is read here.
+    Text(Vec<TextSlot>),
     /// A `core::panic::Location` of no place the program has a span of.
     Nowhere,
+}
+
+/// One part of a [`DataPlace::Text`], in order: `blaze_codegen::text::TextPart`, owned.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: inside `Places`
+pub(crate) enum TextSlot {
+    /// Literal text, as the program wrote it (`line!()` and `column!()` among it).
+    Bytes(String),
+    /// The name of the file of the span, which the link writes.
+    File(SpanRef),
 }
 
 /// Whether the build compiles code that runs at build time: a build script, a proc macro, or a
@@ -395,7 +417,7 @@ pub(crate) fn failed_in_front(
 ) -> CodegenError {
     // alloc: the error's message, its parts kept apart for the reader
     let (named, why) =
-        blaze_query::db::attach(db, || (Named(db, instance).to_string(), why.to_string()));
+        blaze_memo::attach(db, || (Named(db, instance).to_string(), why.to_string()));
     let front = frontend::item_of(db, &instance.0).ok().map(|id| {
         // clone: the error's parts, kept beside its message
         Box::new(blaze_codegen::FrontItem { id, named: named.clone(), why: why.clone() })
@@ -457,7 +479,7 @@ pub(crate) fn undescribed(
     CodegenError {
         unit: InstanceKey(ContentId::default()),
         item: item.unwrap_or(ItemKey(ContentId::default())),
-        what: blaze_query::db::attach(db, || format!("{instance:?}: {what}")), // alloc: the error's message
+        what: blaze_memo::attach(db, || format!("{instance:?}: {what}")), // alloc: the error's message
         front: None,
     }
 }

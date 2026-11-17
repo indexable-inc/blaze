@@ -1,0 +1,12 @@
+{
+ "id": "A34",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "unit keys (crates/blaze-cargo/src/serve/unit/compile.rs:1218-1228)",
+ "what": "A build from a terminal of another width, or piped, recompiles every unit: `note: recomputed 28 steps because the diagnostics' width changed`; the owner saw `blaze run` alternate between 0.09 s and 4.92 s on hello-world.",
+ "cost": "5 s per run for the owner, and confusion; my piped check runs caused some of it",
+ "cause": "colour, short diagnostics and the diagnostics' width are parts of a unit's key because the record holds rendered text",
+ "workaround": "none",
+ "fix": "store diagnostics as data, render when the answer is written (lane diagkey-1111)",
+ "state": "open"
+}

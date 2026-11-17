@@ -1,0 +1,11 @@
+{
+ "id": "explicit-arith-2",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane explicit-arith",
+ "where": "crates/blaze-lints, measuring a lint on a real crate",
+ "what": "There is no way to run one blaze lint over a real workspace crate (blaze-std, blaze-mem) from a cargo-built test without a blaze daemon: no project loader in the tree, and fixtures cannot hold a crate with real core and its dependency graph, so site counts for the deny plan came from a text scan.",
+ "cost": "30 minutes",
+ "cause": "the only path from a crate on disk to a lint run is blaze check",
+ "workaround": "a syntactic upper bound counted by script (arith-logs/count_sites.py)",
+ "state": "open"
+}

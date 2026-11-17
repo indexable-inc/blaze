@@ -1,0 +1,11 @@
+{
+ "id": "diagkey-7",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane diagkey-1111",
+ "where": "the daemon's loop, step `observe, watch and say`",
+ "what": "A daemon of this lane's build (e838cddbc) ended itself with exit status 76 (LOOP_STALLED) at the end of a cold build of hello world: `loop stuck: the loop has not finished a turn and nothing moved for 120 s`, its main thread inside `loop turn: observe, watch and say` for 120.1 s, every worker idle. Two cargo builds were running on the same 32-core VM (load average about 50), and the daemon's process had 514 s of system time. The base's daemon under the same load had the same step at 2.6 s a turn (`loop stalled ... step=observe, watch and say ms=2604`, 17 times in one build). It did not happen again in four cold builds on the quiet VM, base or lane.",
+ "cost": "one failed `blaze run` (395 s) and twenty minutes reading logs",
+ "cause": "not measured: the flight recording holds the spans the threads were inside and no stack, and the VM has no gdb, perf or strace; that it is load is a guess from the base's 2.6 s turns in the same step",
+ "workaround": "measured again with nothing else running",
+ "state": "open: a stall's flight recording could hold the stalled thread's stack"
+}

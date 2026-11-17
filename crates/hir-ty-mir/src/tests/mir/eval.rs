@@ -19,6 +19,8 @@ use crate::mir::{
 };
 
 fn eval_main(db: &TestDB, file_id: EditionedFileId) -> Result<(String, String), MirEvalError<'_>> {
+    // What the program checks itself with must be able to fail.
+    crate::tests::assertion_helpers::hold(db, file_id);
     let unoptimized = eval_main_at(db, file_id, MirOptLevel::Off);
     // rustc's MIR optimizations change nothing a program does.
     for level in [MirOptLevel::Debug, MirOptLevel::Release] {
@@ -42,7 +44,7 @@ pub(super) fn eval_main_at(
     file_id: EditionedFileId,
     level: MirOptLevel,
 ) -> Result<(String, String), MirEvalError<'_>> {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let module_id = db.module_for_file(file_id.file_id(db));
         let def_map = module_id.def_map(db);
         let scope = &def_map.module(db, module_id).scope(db);
@@ -86,7 +88,7 @@ pub(super) fn eval_main_at(
     })
 }
 
-fn check_pass(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
+pub(super) fn check_pass(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
     check_pass_and_stdio(ra_fixture, "", "");
 }
 
@@ -115,15 +117,16 @@ fn check_pass_and_stdio_in(
     expand_derives: bool,
 ) {
     let _tracing = setup_tracing();
-    let fx = fixture::db(ra_fixture);
-    let file_ids = fx.files().to_vec();
-    let mut db = fx.into_db();
+    let mut fx = fixture::db(ra_fixture);
     if expand_derives {
-        hir_def::nameres::set_expand_builtin_derives(&mut db, true);
+        crate::test_db::expand_builtin_derives(&mut fx);
     }
     // As a build does, for `Location::caller` and `file!()`.
-    crate::mir::location::name_sources(&mut db, "fixture", |_, _, _| Some("main.rs".to_owned()));
-    blaze_query::db::attach(&db, || {
+    crate::test_db::name_sources(&mut fx, "fixture", "main.rs");
+    // Taken after the commits above, which make the arenas again.
+    let file_ids = fx.files().to_vec();
+    let db = fx.into_db();
+    blaze_memo::attach(&db, || {
         let file_id = *file_ids.last().unwrap();
         let x = eval_main(&db, file_id);
         match x {
@@ -171,7 +174,7 @@ fn check_panic(#[rust_analyzer::rust_fixture] ra_fixture: &str, expected_panic: 
     let fx = fixture::db(ra_fixture);
     let file_ids = fx.files().to_vec();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let file_id = *file_ids.last().unwrap();
         let e = eval_main(&db, file_id).unwrap_err();
         assert_eq!(
@@ -188,7 +191,7 @@ pub(super) fn check_error_with(
     let fx = fixture::db(ra_fixture);
     let file_ids = fx.files().to_vec();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let file_id = *file_ids.last().unwrap();
         let e = eval_main(&db, file_id).unwrap_err();
         let shown = format!("{e:?}");
@@ -418,6 +421,37 @@ fn main() {
     );
 }
 
+/// A field whose declared type is an alias holds an enum: matching the field in place reads
+/// its discriminant through the alias. The variant is the second, so a discriminant read as 0
+/// takes the wrong arm.
+#[test]
+fn match_in_place_on_a_field_of_an_alias_type() {
+    check_pass(
+        r#"
+//- minicore: sized
+fn should_not_reach() {
+    _ // FIXME: replace this function with panic when that works
+}
+
+enum E<T0, T1> { M0(T0), M1(T1) }
+trait Members { type Repr; }
+impl<T0, T1> Members for (T0, T1) { type Repr = E<T0, T1>; }
+struct W<M: Members>(M::Repr);
+
+fn main() {
+    let w: W<(u8, u32)> = W(E::M1(3));
+    match w.0 {
+        E::M0(_) => should_not_reach(),
+        E::M1(x) => if x != 3 { should_not_reach() },
+    }
+    if let E::M0(_) = &w.0 {
+        should_not_reach();
+    }
+}
+    "#,
+    );
+}
+
 #[test]
 fn drop_struct_field() {
     check_pass(
@@ -453,8 +487,8 @@ fn main() {
             should_not_reach();
         }
     }
-    // FIXME: this should be 3
-    if s.get() != 2 {
+    // `xt.2`, the moved-out `x1` and the dropped `xt.0`.
+    if s.get() != 3 {
         should_not_reach();
     }
 }
@@ -465,6 +499,8 @@ fn main() {
 #[test]
 fn drop_glue_of_a_long_list_of_boxes() {
     // A level of native stack a node overflowed it: smoke's const_heap drops a list of 1000.
+    // 10,000 nodes: each is two `Drop` impls run, and the evaluator of a test build takes
+    // about 0.4 ms a node.
     check_pass(
         r#"
 //- minicore: drop, add, cell
@@ -485,6 +521,11 @@ pub struct Box<T: ?Sized> {
     inner: *mut T,
 }
 
+// As alloc's: without a `Drop` impl a box has no drop glue, and its contents are not dropped.
+impl<T: ?Sized> Drop for Box<T> {
+    fn drop(&mut self) {}
+}
+
 struct X<'a>(&'a Cell<i32>);
 impl<'a> Drop for X<'a> {
     fn drop(&mut self) {
@@ -502,12 +543,12 @@ fn main() {
     {
         let mut list = List::Nil;
         let mut i = 0;
-        while i < 100000 {
+        while i < 10000 {
             list = List::Cons(X(&s), box_new(list));
             i += 1;
         }
     }
-    if s.get() != 100000 {
+    if s.get() != 10000 {
         should_not_reach();
     }
 }
@@ -3260,7 +3301,7 @@ fn main() {}
     );
     let file_ids = fx.files().to_vec();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let module_id = db.module_for_file(file_ids[0].file_id(&db));
         let inc = module_id
             .def_map(&db)

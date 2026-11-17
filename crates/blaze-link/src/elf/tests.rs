@@ -1364,7 +1364,8 @@ fn many_slid_addresses_are_relocated_as_the_model_does() {
     assert!(error.what.contains("text relocation"), "{}", error.what);
 }
 
-/// `.symtab` and `.strtab` built in parallel chunks: every function in order with its name,
+/// `.symtab` and `.strtab` built in parallel chunks: every function in the locals' order (by
+/// its name's hash, `local_order`) with its name,
 /// unnamed functions left out, an empty name at offset 0, then the exports and imports.
 #[test]
 fn many_functions_are_named_in_the_symbol_table() {
@@ -1411,7 +1412,9 @@ fn many_functions_are_named_in_the_symbol_table() {
     let endian = file.endian();
     let sections = file.elf_section_table();
     let symtab = sections.symbols(endian, data, elf::SHT_SYMTAB).unwrap();
-    let named: Vec<&Function> = image.functions.iter().filter(|it| it.name.is_some()).collect();
+    let named: Vec<&Function> =
+        crate::model::local_order(&image.functions, |_| true, std::alloc::Global).iter().map(|at| &image.functions[*at as usize]).collect();
+    assert_eq!(named.len(), image.functions.iter().filter(|it| it.name.is_some()).count());
     let symbols = symtab.symbols();
     assert_eq!(symbols.len(), 1 + named.len() + 2);
     let (_, shdr) = sections.section_by_name(endian, b".symtab").unwrap();
@@ -1787,6 +1790,7 @@ fn delta<'a>(
         binds: &[],
         same_names: true,
         same_regions: true,
+        same_places: true,
         written,
         from,
     }
@@ -1850,25 +1854,90 @@ fn a_relink_patches_rela_dyn_as_a_build_makes_it() {
     assert_eq!(patched(&image), [1, 1, 1], "every table patched");
 }
 
-/// A function renamed to a name of its length and one resized: their local symbols
-/// rewritten in the kept tail are the tail a build makes; a name of another length is built.
+/// What a file's parts say by name, wherever its symbol table put each symbol: the program
+/// headers, every section but the symbol table's (by name, address and size), and every
+/// named symbol. A patched symbol table keeps each local where it was placed, so its bytes are
+/// a full link's only until a function comes or goes; this is what stays equal after.
+#[derive(PartialEq, Eq, Debug)]
+struct Named {
+    segments: Vec<(u64, u64, u64)>,
+    sections: Vec<(String, u64, u64)>,
+    symbols: Vec<(String, u64, u64, String)>,
+}
+
+fn named(parts: &[(u64, Vec<u8>)]) -> Named {
+    use object::{Object as _, ObjectSection as _, ObjectSegment as _, ObjectSymbol as _};
+    let end = parts.iter().map(|(at, bytes)| *at as usize + bytes.len()).max().unwrap_or(0);
+    let mut file = vec![0u8; end];
+    for (at, bytes) in parts {
+        file[*at as usize..][..bytes.len()].copy_from_slice(bytes);
+    }
+    let elf = object::File::parse(&*file).unwrap();
+    let segments = elf.segments().map(|it| (it.address(), it.size(), it.file_range().1)).collect();
+    let sections = (elf.sections())
+        .filter_map(|it| {
+            let name = it.name().ok()?.to_owned();
+            (!matches!(name.as_str(), ".symtab" | ".strtab")).then(|| (name, it.address(), it.size()))
+        })
+        .collect();
+    let mut symbols: Vec<(String, u64, u64, String)> = (elf.symbols())
+        .filter_map(|it| {
+            let name = it.name().ok()?;
+            let what = format!("{:?} {:?} {:?}", it.kind(), it.scope(), it.section());
+            (!name.is_empty()).then(|| (name.to_owned(), it.address(), it.size(), what))
+        })
+        .collect();
+    symbols.sort();
+    Named { segments, sections, symbols }
+}
+
+/// [`relinks_as_built`] for a relink that places or frees a local: the same tables, and the
+/// file's parts the same by [`named`]. The first's.
+fn relinks_as_named(
+    image: &Fixture,
+    synthesis: u64,
+    delta: &Delta<'_>,
+) -> (Vec<(Class, Vec<u8>)>, Vec<(u64, Vec<u8>)>) {
+    let relinked = image.build(&image.writer, synthesis, Some(delta));
+    let fresh = Elf { output: image.writer.output.clone(), last: None };
+    let built = image.build(&fresh, synthesis, None);
+    assert_eq!(relinked.0, built.0, "the synthetic regions");
+    assert_eq!(named(&relinked.1), named(&built.1), "the file's parts, by name");
+    relinked
+}
+
+/// A function resized and one moved, their names kept: their local symbols rewritten in the
+/// kept tail are the tail a build makes. A function renamed (to a name of its length, and of
+/// another), and one whose name is dropped, are patched too: the old name's entry is freed and
+/// the new one takes a free entry and run of names (the freed one first), so the file is a
+/// full link's by name ([`named`]), every local where it was placed.
 #[test]
 fn a_relink_patches_the_symbol_table_as_a_build_makes_it() {
     let mut image = relinked();
     let (_, first) = image.build(&image.writer, 1, None);
-    image.functions[7].name = Some(relinked_name(7, 'g').as_str().into());
     image.functions[3].size = 12;
+    image.functions[7].size = 8;
     let functions = [splice(3..4, 3..4), splice(7..8, 7..8)];
     let (_, parts) = relinks_as_built(&image, 2, &delta(1, &functions, &[], &[], &[]));
     assert_ne!(parts, first);
     assert_eq!(patched(&image)[2], 1);
 
+    image.functions[7].name = Some(relinked_name(7, 'g').as_str().into());
+    relinks_as_named(&image, 3, &delta(2, &[splice(7..8, 7..8)], &[], &[], &[]));
+    assert_eq!(patched(&image)[2], 2, "a name of its length is patched");
     image.functions[7].name = Some("_ZN4test1g7E".into());
-    relinks_as_built(&image, 3, &delta(2, &[splice(7..8, 7..8)], &[], &[], &[]));
-    assert_eq!(patched(&image)[2], 1, "a name of another length is built");
+    relinks_as_named(&image, 4, &delta(3, &[splice(7..8, 7..8)], &[], &[], &[]));
+    assert_eq!(patched(&image)[2], 3, "a name of another length is patched");
     image.functions[7].name = None;
-    relinks_as_built(&image, 4, &delta(3, &[splice(7..8, 7..8)], &[], &[], &[]));
-    assert_eq!(patched(&image)[2], 1, "a name dropped is built");
+    relinks_as_named(&image, 5, &delta(4, &[splice(7..8, 7..8)], &[], &[], &[]));
+    assert_eq!(patched(&image)[2], 4, "a name dropped is patched");
+    // A function added after the last, named: it takes a free entry of the room.
+    let mut added = image.functions[RELINKED - 1].clone();
+    (added.name, added.fde) = (Some(relinked_name(RELINKED, 'f').as_str().into()), None);
+    image.functions.push(added);
+    let at = RELINKED as u32;
+    relinks_as_named(&image, 6, &delta(5, &[splice(at..at, at..at + 1)], &[], &[], &[]));
+    assert_eq!(patched(&image)[2], 5, "a function added is patched");
 }
 
 /// An FDE's target moved: its `.eh_frame_hdr` entry patched from the FDEs walked again is the
@@ -1903,10 +1972,71 @@ fn a_relink_patches_eh_frame_hdr_as_a_build_makes_it() {
     assert_eq!(patched(&image)[1], 1, "a table out of order is built");
 }
 
-/// A delta from a synthesis the writer's tables are not of, and one with splices of another
-/// length, are built whole.
+/// What a loader applies of a `.rela.dyn`: each entry that is not `R_*_NONE`, in address
+/// order. The entries' order in the table is no part of it.
+fn applied(rela: &[u8]) -> Vec<[u8; 24]> {
+    assert_eq!(rela.len() % 24, 0, "whole entries");
+    let mut entries: Vec<[u8; 24]> = rela
+        .chunks_exact(24)
+        .map(|it| <[u8; 24]>::try_from(it).unwrap())
+        .filter(|it| it[8..16] != [0; 8])
+        .collect();
+    entries.sort_unstable();
+    entries
+}
+
+fn dynamic_tag(dynamic: &[u8], tag: elf::DynamicTag) -> Option<u64> {
+    dynamic.chunks_exact(16).find_map(|it| {
+        let read = |at: usize| u64::from_le_bytes(it[at..at + 8].try_into().unwrap());
+        (read(0) == tag.0 as u64).then(|| read(8))
+    })
+}
+
+/// Builds the image with its own writer, which kept its last tables, and with a fresh writer
+/// from nothing: every table and part is the build's, but `.rela.dyn`, which a loader has to
+/// take as it takes the build's (the same entries applied, each once; the entries
+/// `DT_RELACOUNT` counts all `RELATIVE`; `DT_RELASZ` the table's length), and `.dynamic`,
+/// the same but for those two. The first's tables.
+fn relinks_as_loaded(image: &Fixture, synthesis: u64, delta: &Delta<'_>) -> Vec<(Class, Vec<u8>)> {
+    let relinked = image.build(&image.writer, synthesis, Some(delta));
+    let fresh = Elf { output: image.writer.output.clone(), last: None };
+    let built = image.build(&fresh, synthesis, None);
+    let apart = [Class::Synthetic(super::RELA_DYN), Class::Synthetic(super::DYNAMIC)];
+    // The headers hold `.rela.dyn`'s length: a table with an empty slot is longer. The symbol
+    // table keeps its locals where they were placed: the parts are compared by name.
+    if table(&relinked.0, super::RELA_DYN).len() == table(&built.0, super::RELA_DYN).len() {
+        assert_eq!(named(&relinked.1), named(&built.1), "the file's parts, by name");
+    }
+    for ((class, kept), (_, whole)) in relinked.0.iter().zip(&built.0) {
+        if !apart.contains(class) {
+            assert_eq!(kept, whole, "{class:?}");
+        }
+    }
+    let (rela, whole) = (table(&relinked.0, super::RELA_DYN), table(&built.0, super::RELA_DYN));
+    assert_eq!(applied(rela), applied(whole), "the entries a loader applies");
+    let dynamic = table(&relinked.0, super::DYNAMIC);
+    assert_eq!(dynamic_tag(dynamic, elf::DT_RELASZ), Some(rela.len() as u64));
+    let counted = dynamic_tag(dynamic, elf::DT_RELACOUNT).unwrap() as usize;
+    let relative = (elf::R_X86_64_RELATIVE.0 as u64).to_le_bytes();
+    assert!(
+        rela.chunks_exact(24).take(counted).all(|it| it[8..16] == relative),
+        "an entry `DT_RELACOUNT` counts is not `RELATIVE`"
+    );
+    let same_but = |tag: u64| tag == elf::DT_RELASZ.0 as u64 || tag == elf::DT_RELACOUNT.0 as u64;
+    let rest = |dynamic: &[u8]| -> Vec<Vec<u8>> {
+        let entries = dynamic.chunks_exact(16);
+        let tag = |it: &[u8]| u64::from_le_bytes(it[..8].try_into().unwrap());
+        entries.filter(|it| !same_but(tag(it))).map(<[u8]>::to_vec).collect()
+    };
+    assert_eq!(rest(dynamic), rest(table(&built.0, super::DYNAMIC)), "`.dynamic`'s other entries");
+    relinked.0
+}
+
+/// A delta from a synthesis the writer's tables are not of is built whole. One with splices
+/// of another length patches the symbol table by place and `.rela.dyn` by slot: the entry of
+/// the address added is the table's last, and a loader applies what it applies of a build's.
 #[test]
-fn a_relink_from_another_synthesis_or_of_another_length_is_built() {
+fn a_relink_from_another_synthesis_is_built_and_one_of_another_length_takes_a_slot() {
     let mut image = relinked();
     image.build(&image.writer, 1, None);
     let (text, data) = (image.at(&Class::Text), image.at(&Class::Data));
@@ -1924,8 +2054,83 @@ fn a_relink_from_another_synthesis_or_of_another_length_is_built() {
     let rebase = [splice(8..8, 8..9)];
     let functions = [splice(39..40, 39..39)];
     let written = [(data + 16 * 6 + 8, 8)];
-    relinks_as_built(&image, 3, &delta(2, &functions, &rebase, &[], &written));
-    assert_eq!(patched(&image), [0, 0, 0], "a splice of another length is built");
+    let tables = relinks_as_loaded(&image, 3, &delta(2, &functions, &rebase, &[], &written));
+    assert_eq!(patched(&image), [1, 0, 1], "`.rela.dyn` by slot and the symbol table by place, `.eh_frame_hdr` built");
+    let rela = table(&tables, super::RELA_DYN);
+    let added = &rela[24 * (RELINKED + 1)..24 * (RELINKED + 2)];
+    assert_eq!(added[..8], (data + 16 * 6 + 8).to_le_bytes(), "the address added takes the run's last slot");
+
+    // The address taken out again leaves the run as it was; then function 3's pointer goes
+    // and the slot it leaves, an empty one in the middle, is the next address's.
+    image.put(&Class::Data, 16 * 6 + 8, &[0; 8]);
+    image.rebase.remove(8);
+    let written = [(data + 16 * 6 + 8, 8)];
+    relinks_as_loaded(&image, 4, &delta(3, &[], &[splice(8..9, 8..8)], &[], &written));
+    image.put(&Class::Data, 16 * 3, &[0; 8]);
+    image.rebase.remove(4);
+    let written = [(data + 16 * 3, 8)];
+    let tables = relinks_as_loaded(&image, 5, &delta(4, &[], &[splice(4..5, 4..4)], &[], &written));
+    let rela = table(&tables, super::RELA_DYN);
+    assert_eq!(rela[24 * 4..24 * 5], [0; 24], "the slot of the address gone is `R_X86_64_NONE`");
+    assert_eq!(dynamic_tag(table(&tables, super::DYNAMIC), elf::DT_RELACOUNT), Some(4));
+    image.put(&Class::Data, 16 * 30 + 8, &(text + 16).to_le_bytes());
+    // With function 3's pointer gone, function 30's is the list's entry 30.
+    image.rebase.insert(31, data + 16 * 30 + 8);
+    let written = [(data + 16 * 30 + 8, 8)];
+    let tables = relinks_as_loaded(&image, 6, &delta(5, &[], &[splice(31..31, 31..32)], &[], &written));
+    let rela = table(&tables, super::RELA_DYN);
+    assert_eq!(rela[24 * 4..24 * 4 + 8], (data + 16 * 30 + 8).to_le_bytes(), "the empty slot is taken first");
+    assert_eq!(patched(&image)[0], 4);
+}
+
+/// What an edit that takes one slid address out and puts two in elsewhere (a function's
+/// constants gone, the new body's placed in the patch room) writes of `.rela.dyn` in an
+/// image of `n` functions: the entries the writer wrote, and the entries of the table that
+/// differ from the link before. `whole` plants the writer that makes the table whole for a
+/// splice of another length, as it did until 2026-11-11.
+fn moved_addresses_cost(n: usize, whole: bool) -> (u32, usize) {
+    let mut image = relinked_of(n);
+    let (first, _) = image.build(&image.writer, 1, None);
+    image.writer.last().unwrap().rela.whole = whole;
+    let (text, data) = (image.at(&Class::Text), image.at(&Class::Data));
+    image.put(&Class::Data, 16 * 100, &[0; 8]);
+    image.put(&Class::Data, 16 * 700 + 8, &(text + 16).to_le_bytes());
+    image.put(&Class::Data, 16 * 701 + 8, &(text + 32).to_le_bytes());
+    let was = image.rebase.clone();
+    image.rebase.retain(|it| *it != data + 16 * 100);
+    image.rebase.extend([data + 16 * 700 + 8, data + 16 * 701 + 8]);
+    image.rebase.sort_unstable();
+    assert_eq!((was[101], was[702], was[703]), (data + 16 * 100, data + 16 * 701, data + 16 * 702));
+    let rebase = [splice(101..102, 101..101), splice(702..702, 701..702), splice(703..703, 703..704)];
+    let written = [(data + 16 * 100, 8), (data + 16 * 700 + 8, 8), (data + 16 * 701 + 8, 8)];
+    let tables = relinks_as_loaded(&image, 2, &delta(1, &[], &rebase, &[], &written));
+    let (old, new) = (table(&first, super::RELA_DYN), table(&tables, super::RELA_DYN));
+    let differ = old.chunks(24).zip(new.chunks(24)).filter(|(a, b)| a != b).count()
+        + old.len().abs_diff(new.len()) / 24;
+    let last = image.writer.last().unwrap();
+    assert_eq!(last.rela.patched, u32::from(!whole));
+    (last.rela.entries, differ)
+}
+
+/// The counter: a one-function edit's change of the slid addresses (one out, two in
+/// elsewhere) writes the same few entries of `.rela.dyn` in an image of 1,000 functions as
+/// in one of 16,000, and the table differs from the link before's in as few.
+#[test]
+fn an_edit_that_moves_slid_addresses_writes_their_entries_alone() {
+    let costs = [1_000, 16_000].map(|n| moved_addresses_cost(n, false));
+    assert_eq!(costs[0], costs[1], "the same entries among 1,000 functions as among 16,000");
+    let (written, differ) = costs[0];
+    assert!(written <= 6 && differ <= 6, "{written} entries written, {differ} differ: one out, two in, the binds moved");
+}
+
+/// The control of [`an_edit_that_moves_slid_addresses_writes_their_entries_alone`]: a writer
+/// that makes the table whole for such an edit moves every entry after the address taken
+/// out, and the counter says its cost follows the image.
+#[test]
+fn the_oracle_catches_a_table_made_whole_for_an_address_moved() {
+    let costs = [1_000, 16_000].map(|n| moved_addresses_cost(n, true));
+    assert_ne!(costs[0].1, costs[1].1, "a table made whole was counted as the edit's");
+    assert!(costs[1].1 >= 15_000, "{} entries differ among 16,000 functions", costs[1].1);
 }
 
 /// How many of the 16 KiB pages of `new` a writer copied rather than shared with `old`.

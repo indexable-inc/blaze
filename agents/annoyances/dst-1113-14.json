@@ -1,0 +1,14 @@
+{
+ "id": "dst-1113-14",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code, dst-1113",
+ "where": "my lint brief for crates/blaze-sim (`/Volumes/Projects/blaze-dst-1113-notes/lint-brief.md`); `blaze check -p blaze-sim --all-targets` on blaze-vm, blaze built from dd5e84a0ae",
+ "what": "The first run reported one `this lint expectation is unfulfilled` among two `#[expect(blaze::process_static, ..)]` in check.rs. I wrote in the lanes' brief that `blaze::process_static` \"names a lint that does not exist\" and had both removed. It exists (docs/lints.md#process_static): the expectation on `static INSTALL: Once` was the unfulfilled one, and the one on the thread-locals was doing its job. The next run gave `error: the `thread_local!` `KEPT: LocalKey<Cell<Option<Kept>>>` holds a `String` beneath a `Cell``, and the expectation went back.",
+ "cost": "one finding reintroduced and one extra round for it",
+ "cause": "I read \"unfulfilled\" as \"unknown lint\" and did not look the name up in docs/lints.md before stating it as fact in a brief (rule claims-from-evidence)",
+ "whys": "an unfulfilled expectation and an expectation of a lint blaze does not know print the same way from the outside unless the second is its own error; I did not check which it was; a brief I write is taken as fact by four lanes",
+ "class": "a guess written into a brief as a fact",
+ "prevention": "blaze check already refuses an unknown `blaze::` lint name by name (not verified here: to check, expect a made-up name once); for briefs: a lint named in a brief is looked up in docs/lints.md first. A rule exists (claims-from-evidence); this row is one more instance of it.",
+ "workaround": "second round restores `#![expect(blaze::process_static, ..)]` on the thread-locals' module with the bound as its reason",
+ "state": "open"
+}

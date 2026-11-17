@@ -261,7 +261,7 @@ fn of_is_the_lowering_with_the_source_map() {
                 $Sig::lower(&$db, id, source, None, lowering)
             });
             assert_eq!(*of, file, "{id:?}: `of` and its file's lowering");
-            assert!(*map == file_map, "{id:?}: {map:#?}\nfrom the file: {file_map:#?}");
+            assert!(**map == file_map, "{id:?}: {map:#?}\nfrom the file: {file_map:#?}");
         }};
     }
     for fixture in FIXTURES {
@@ -290,7 +290,7 @@ fn of_is_the_lowering_with_the_source_map() {
                 VariantFields::lower(&db, id, None, lowering, frame)
             });
             assert_eq!(*of, file, "{id:?}: `of` and its file's lowering");
-            assert!(*map == file_map, "{id:?}: {map:#?}\nfrom the file: {file_map:#?}");
+            assert!(**map == file_map, "{id:?}: {map:#?}\nfrom the file: {file_map:#?}");
         }
     }
 }
@@ -314,7 +314,9 @@ fn of_builds_no_source_map() {
             |it: &&String| it.contains("::relative") || it.contains("::with_source_map");
         let built: Vec<_> = log.iter().filter(builds_a_map).collect();
         assert!(built.is_empty(), "{fixture}\n{built:#?}");
-        assert!(log.iter().any(|it| it.contains("::kept")), "{fixture}\n{log:#?}");
+        // `of` read the signature lowered alone: `lowered`, the query `kept` routes to for a
+        // crate no image serves (`kept` is no query of its own).
+        assert!(log.iter().any(|it| it.contains("::lowered(")), "{fixture}\n{log:#?}");
     }
 }
 

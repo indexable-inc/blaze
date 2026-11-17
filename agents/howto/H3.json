@@ -1,0 +1,9 @@
+{
+ "id": "H3",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "task": "Replace a blaze binary that may be running",
+ "do": "Remove the old file, then copy the new one; stop the old daemon by its pid first (a rebuilt blaze cannot stop an older daemon). Never `pkill -f`.",
+ "why": "macOS kills a process whose binary was overwritten in place (Killed: 9); `pkill -f` matches the calling shell.",
+ "state": "current"
+}

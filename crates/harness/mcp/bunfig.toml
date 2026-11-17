@@ -1,0 +1,4 @@
+# Tests never touch the person's harness: test-setup.ts gives each run its own empty state directory, so no cell a test
+# runs is posted to a live daemon, run through it, or written into a real session's journal.
+[test]
+preload = ["./src/test-setup.ts"]

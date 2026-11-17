@@ -27,7 +27,7 @@ use std::{borrow::Cow, convert::Infallible, iter::Peekable, ops::ControlFlow};
 use base_db::{Crate, Db, EditionedFileId};
 use blaze_hash::HashSet;
 use blaze_mem::Frame;
-use blaze_query::db::{AsId, FromId};
+use blaze_memo::Id;
 use cfg::{CfgExpr, CfgOptions};
 use either::Either;
 use hir_expand::{
@@ -93,6 +93,20 @@ fn attrs_from_ast_id_loc<'db, N: AstIdNode + Typed + Into<syntax::ast::AnyHasAtt
     )
 }
 
+/// The generic parameter list of the item `lookup` is, off the item's outline
+/// ([`item_node`] with [`Tree::Outline`]): what an edit of a body of its file leaves equal.
+fn outline_generic_params<'db, N: AstIdNode + Typed>(
+    db: &'db Db,
+    lookup: impl Lookup<Data = impl AstIdLoc<Ast = N> + HasModule> + Copy,
+) -> Option<ast::GenericParamList<'db>>
+where
+    for<'t> N::Of<'t>: ast::HasGenericParams<'t>,
+{
+    let loc = lookup.lookup(db);
+    let node = item_node(db, loc.ast_id(), loc.module(db), Tree::Outline);
+    ast::HasGenericParams::generic_param_list(&node)
+}
+
 /// The node at `id`, an item of `module`, off the tree `tree` says: for [`Tree::Outline`], an
 /// item of a block of a body is read off that body's syntax.
 fn item_node<'db, N: AstIdNode + Typed>(
@@ -101,6 +115,10 @@ fn item_node<'db, N: AstIdNode + Typed>(
     module: ModuleId,
     tree: Tree,
 ) -> N::Of<'db> {
+    // An item of a crate given by its address whose file has no text here is refused, typed,
+    // naming the crate and the file, before any tree of the file is read; one whose text has
+    // no such item is refused where its id is looked up (`hir_expand::files::ptr_in`).
+    demand_text(db, module.krate(db), id.file_id);
     if tree == Tree::Outline
         && let Some(node) = crate::signatures::outline_item(db, id)
             .or_else(|| crate::signatures::body_item(db, id, module))
@@ -110,8 +128,20 @@ fn item_node<'db, N: AstIdNode + Typed>(
     id.to_view(db)
 }
 
-/// The root of `file`, off the tree `tree` says.
-fn file_root(db: &Db, file: EditionedFileId, tree: Tree) -> ast::SourceFile<'_> {
+/// The guard every read of a file's syntax here goes through first
+/// (`nameres::frozen::pages::demand_text`): nothing for a crate built from its files; for a
+/// crate given by its address, a typed refusal ([`crate::nameres::frozen::Unreadable`], naming
+/// the crate and the file) where the file's text is not in this snapshot or is not what the
+/// crate's pages were made from, never a base-db `file_text` panic and never a read of other
+/// text.
+#[inline]
+fn demand_text(db: &Db, krate: Crate, file: HirFileId) {
+    crate::nameres::frozen::pages::demand_text(db, krate, file);
+}
+
+/// The root of `file`, a file of `krate`, off the tree `tree` says.
+fn file_root(db: &Db, krate: Crate, file: EditionedFileId, tree: Tree) -> ast::SourceFile<'_> {
+    demand_text(db, krate, file.into());
     match tree {
         Tree::Outline => crate::signatures::outline_root(db, file),
         Tree::Live => file.parse(db).view(),
@@ -151,8 +181,9 @@ impl FileAttrFlags {
 }
 
 /// The [`FileAttrFlags`] of `file` for `krate`'s cfg.
-#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 fn file_attr_flags(db: &Db, file: EditionedFileId, krate: Crate) -> FileAttrFlags {
+    demand_text(db, krate, file.into());
     blaze_mem::frame::current(|frame| {
         let (root, ast_id_map) = crate::signatures::outline_with_ids(db, file);
         let mut cfg_options = None;
@@ -592,9 +623,17 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                     (Some(Word::blaze), Some(Word::nonblocking)) => {
                         attr_flags.insert(AttrFlags::NONBLOCKING)
                     }
-                    // `#[blaze::may(panic, alloc)]`: the list is [`AttrFlags::may_attr`]'s to
+                    // `#[blaze::bounded_turn(trusted = "why")]` and `answers_request`: the
+                    // arguments are [`AttrFlags::role_attr`]'s to read and refuse.
+                    (Some(Word::blaze), Some(Word::bounded_turn)) => {
+                        attr_flags.insert(AttrFlags::BOUNDED_TURN)
+                    }
+                    (Some(Word::blaze), Some(Word::answers_request)) => {
+                        attr_flags.insert(AttrFlags::ANSWERS_REQUEST)
+                    }
+                    // `#[blaze::expect(panic, alloc)]`: the list is [`AttrFlags::expect_attr`]'s to
                     // read and refuse.
-                    (Some(Word::blaze), Some(Word::may)) => attr_flags.insert(AttrFlags::MAY),
+                    (Some(Word::blaze), Some(Word::expect)) => attr_flags.insert(AttrFlags::EXPECT),
                     // `#[blaze::multiversion("x86-64-v3", "avx512f")]`; the levels are
                     // [`AttrFlags::multiversion_levels`]'s to read.
                     (Some(Word::blaze), Some(Word::multiversion)) => {
@@ -743,6 +782,10 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 }
                 (Some(Word::blaze), Some(Word::may_suspend)) => AttrFlags::MAY_SUSPEND,
                 (Some(Word::blaze), Some(Word::sans_io)) => AttrFlags::SANS_IO,
+                (Some(Word::blaze), Some(Word::canonical_cbor)) => AttrFlags::CANONICAL_CBOR,
+                (Some(Word::blaze), Some(Word::renders_positions)) => {
+                    AttrFlags::RENDERS_POSITIONS
+                }
                 (Some(Word::blaze), Some(Word::capabilities)) => AttrFlags::CAPABILITIES,
                 (Some(Word::blaze), Some(Word::checkfree)) => AttrFlags::CHECKFREE,
                 (Some(Word::blaze), Some(Word::pure)) => AttrFlags::PURE,
@@ -755,11 +798,15 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 (Some(Word::blaze), Some(Word::nopanic)) => AttrFlags::NOPANIC,
                 (Some(Word::blaze), Some(Word::noalloc)) => AttrFlags::NOALLOC,
                 (Some(Word::blaze), Some(Word::nonblocking)) => AttrFlags::NONBLOCKING,
+                (Some(Word::blaze), Some(Word::bounded_turn)) => AttrFlags::BOUNDED_TURN,
+                (Some(Word::blaze), Some(Word::answers_request)) => AttrFlags::ANSWERS_REQUEST,
+                (Some(Word::blaze), Some(Word::lock_checked)) => AttrFlags::LOCK_CHECKED,
                 (Some(Word::blaze), Some(Word::norefcount)) => AttrFlags::NOREFCOUNT,
-                (Some(Word::blaze), Some(Word::may)) => AttrFlags::MAY,
+                (Some(Word::blaze), Some(Word::expect)) => AttrFlags::EXPECT,
                 (Some(Word::blaze), Some(Word::effects)) => AttrFlags::BLAZE_EFFECTS,
                 (Some(Word::blaze), Some(Word::linear)) => AttrFlags::LINEAR,
                 (Some(Word::blaze), Some(Word::consumes)) => AttrFlags::CONSUMES,
+                (Some(Word::blaze), Some(Word::theorem)) => AttrFlags::THEOREM,
                 (Some(Word::blaze), Some(Word::holds)) => AttrFlags::HOLDS,
                 (Some(Word::blaze), Some(Word::memo)) => AttrFlags::BLAZE_MEMO,
                 (Some(Word::blaze), Some(Word::reflect)) => AttrFlags::BLAZE_REFLECT,
@@ -930,10 +977,13 @@ fn word(name: &str) -> Option<Word> {
 name_set! {
     /// An attribute name the flags or the value queries read.
     enum Word {
+    answers_request,
     automatically_derived,
     bench,
     bits,
     blaze,
+    bounded_turn,
+    canonical_cbor,
     capabilities,
     checkfree,
     clippy,
@@ -945,6 +995,7 @@ name_set! {
     deprecated,
     diagnostic,
     effects,
+    expect,
     differentiable,
     do_not_recommend,
     doc,
@@ -962,10 +1013,10 @@ name_set! {
     link_ordinal,
     link_section,
     linkage,
+    lock_checked,
     macro_export,
     macro_style,
     marker,
-    may,
     may_dangle,
     may_suspend,
     memo,
@@ -989,6 +1040,7 @@ name_set! {
     program_lifetime,
     pure,
     reflect,
+    renders_positions,
     repr,
     rust_analyzer,
     rustc_allocator,
@@ -1039,6 +1091,7 @@ name_set! {
     specialization_trait,
     stable,
     target_feature,
+    theorem,
     thread_local,
     track_caller,
     unstable,
@@ -1234,6 +1287,20 @@ bitflags::bitflags! {
         /// `#[blaze::nonblocking]` or `#[blaze::nonblocking(..)]`: as [`AttrFlags::NOPANIC`],
         /// for no call that blocks the thread (`blaze::nonblocking`).
         const NONBLOCKING = 1 << 99;
+        /// `#[blaze::bounded_turn]` or `#[blaze::bounded_turn(..)]`: as
+        /// [`AttrFlags::NOPANIC`], for a turn of a loop thread that does no blocking call, IO,
+        /// sync or lock (`blaze::loop_turn_effects`, docs/v2/plan/design/effect-summary.md).
+        const BOUNDED_TURN = 1 << 115;
+        /// `#[blaze::answers_request]` or `#[blaze::answers_request(..)]`: as
+        /// [`AttrFlags::NOPANIC`], for an answer path that never syncs a file to the disk
+        /// (`blaze::sync_on_answer_path`).
+        const ANSWERS_REQUEST = 1 << 116;
+        /// `#[blaze::lock_checked]` on a function, or `#![blaze::lock_checked]` on a module
+        /// (for every function in it and its children): the function asked for its locks to be
+        /// proved, so `blaze::lock_order` and `blaze::lock_across_wait` refuse what they can't
+        /// see under it, where elsewhere an unknown is silent
+        /// (docs/v2/plan/design/effect-summary.md).
+        const LOCK_CHECKED = 1 << 117;
         /// `#[blaze::memo]`, a word, on a function: a blaze extension (inert under rustc with
         /// `#![register_tool(blaze)]`), the function is a memo point of `bstd::eval`
         /// (docs/v2/plan/design/std.md, "Eval"). It is held pure as if written
@@ -1242,13 +1309,15 @@ bitflags::bitflags! {
         /// It changes diagnostics and which trait goals hold, never code: no codegen key reads
         /// it.
         const BLAZE_MEMO = 1 << 112;
-        /// `#[blaze::may]` or `#[blaze::may(..)]` on a function, a trait or (as an inner
-        /// attribute) a module or the crate: the effects it may have, the positive spelling of
-        /// the three above and the only one of `diverge` (docs/v2/plan/design/effects.md). Inert
-        /// under rustc with `#![register_tool(blaze)]`; [`AttrFlags::may_attr`] reads the list.
-        const MAY = 1 << 101;
+        /// `#[blaze::expect]` or `#[blaze::expect(..)]` on a function, a trait or (as an inner
+        /// attribute) a module or the crate: the effects it is expected to have, exactly on a
+        /// function that writes its own list, the positive spelling of the three above and the
+        /// only one of `diverge` (docs/v2/plan/design/effects.md). Inert under rustc with
+        /// `#![register_tool(blaze)]`; [`AttrFlags::expect_attr`] reads the list. The deleted
+        /// spelling `#[blaze::may(..)]` sets nothing: blaze-lints refuses it by its path.
+        const EXPECT = 1 << 101;
         /// `#![blaze::effects]` at a crate's root: every function of the crate with no
-        /// `#[blaze::may(..)]` of its own, and no module's above it, may have no effect, checked
+        /// `#[blaze::expect(..)]` of its own, and no module's above it, may have no effect, checked
         /// (the gate the blaze edition will turn on; `blaze::undeclared_effect`).
         const BLAZE_EFFECTS = 1 << 102;
         /// `#[blaze::sealed]`, a word, on a trait: a blaze extension (inert under rustc with
@@ -1276,6 +1345,14 @@ bitflags::bitflags! {
         /// function has a derivative blaze can be asked for. It changes no code of a function
         /// that is not asked for its derivative: no codegen key reads it.
         const DIFFERENTIABLE = 1 << 103;
+        /// `#[blaze::renders_positions]`, a word, on a function: a blaze extension (inert under
+        /// rustc with `#![register_tool(blaze)]`), read by blaze-lints' `blaze::reads_positions`.
+        /// The function words a diagnostic or produces debug info, so it may read positions
+        /// and the live parse (a body's source map, a file's parse, an `AstIdMap`), and so may
+        /// what it calls; a query crate's function without it may not, since a result that read
+        /// positions reruns on every edit above it. It changes diagnostics, never code: no
+        /// codegen key reads it.
+        const RENDERS_POSITIONS = 1 << 104;
         /// `#[blaze::drop(early)]` on a struct, enum or union with a `Drop` impl: a blaze
         /// extension (inert under rustc with `#![register_tool(blaze)]`). Under
         /// `#![blaze::early_drop]` a value of the type is dropped after its last use
@@ -1288,6 +1365,13 @@ bitflags::bitflags! {
         /// `#[blaze::drop(early, trusted = "why")]`: [`AttrFlags::DROP_EARLY`] asserted, the
         /// destructor not checked (a pooled buffer whose drop gives it back to its pool).
         const DROP_TRUSTED = 1 << 107;
+        /// `#![blaze::canonical_cbor]`, a word, inner, on a module or a crate root: a blaze
+        /// extension (inert under rustc with `#![register_tool(blaze)]`), read by blaze-lints'
+        /// `blaze::cbor_field_order`. Every struct and struct variant under it that derives
+        /// serde's `Serialize` is written in RFC 8949's core deterministic CBOR, so it declares
+        /// its fields in the order of their keys' encoding (shorter first, then bytewise) and
+        /// the encoder writes them as they come. It changes diagnostics, never code.
+        const CANONICAL_CBOR = 1 << 108;
         /// `#[blaze::linear]`, a word: a blaze extension (inert under rustc with
         /// `#![register_tool(blaze)]`), read by `hir-ty-linear`
         /// (docs/v2/plan/design/linear.md). On a struct or enum: a value of it may not be
@@ -1299,6 +1383,12 @@ bitflags::bitflags! {
         /// linear types its by-value parameters have end, so in its body those types are not
         /// linear (`hir-ty-linear`). It changes diagnostics, never code.
         const CONSUMES = 1 << 111;
+        /// `#[blaze::theorem]`, a word, on a function that returns `bool`: a blaze extension
+        /// (inert under rustc with `#![register_tool(blaze)]`). The function is a statement:
+        /// for every argument it returns `true`. `hir-ty-lean` states that of its model in
+        /// Lean, where a proof is checked (docs/v2/plan/design/proofs-for-sans-io.md). It
+        /// changes no code: the function is compiled as written.
+        const THEOREM = 1 << 118;
         /// `#[blaze::holds]`, a word, on a struct or enum: a value of it holds a value of each
         /// of its type arguments although no field does (behind a raw or counted pointer), so
         /// it holds a linear value when an argument does, and the bodies of its own crate's
@@ -1362,7 +1452,7 @@ pub fn cli_crate_attrs(db: &Db, krate: Crate) -> impl Iterator<Item = InFile<ast
 }
 
 /// Whether the crate root declares `#![no_std]`, looking through `cfg_attr` gating.
-#[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
 pub(crate) fn crate_supports_no_std(db: &Db, krate: Crate) -> bool {
     fn contains_no_std(meta: ast::Meta<'_>) -> bool {
         match meta {
@@ -1375,6 +1465,7 @@ pub(crate) fn crate_supports_no_std(db: &Db, krate: Crate) -> bool {
         }
     }
 
+    crate::nameres::frozen::pages::demand_root_text(db, krate);
     let root_file = krate.root_file_id(db).parse(db).view();
     root_file
         .attrs()
@@ -1397,12 +1488,12 @@ fn attrs_source(
             let krate = def_map.krate();
             let (definition, declaration, crate_attrs) = match def_map.module(db, id).origin {
                 ModuleOrigin::CrateRoot { definition } => {
-                    let definition_source = file_root(db, definition, tree);
+                    let definition_source = file_root(db, krate, definition, tree);
                     let definition = InFile::new(definition.into(), definition_source.into());
                     (definition, None, base_db::applied_crate_attr_files(db, krate))
                 }
                 ModuleOrigin::File { declaration, declaration_tree_id, definition, .. } => {
-                    let definition_source = file_root(db, definition, tree);
+                    let definition_source = file_root(db, krate, definition, tree);
                     let definition = InFile::new(definition.into(), definition_source.into());
                     let declaration = InFile::new(declaration_tree_id.file_id(), declaration);
                     let declaration = declaration.with_value(item_node(db, declaration, id, tree));
@@ -1415,6 +1506,7 @@ fn attrs_source(
                     (definition, None, &[][..])
                 }
                 ModuleOrigin::BlockExpr { block, .. } => {
+                    demand_text(db, krate, block.file_id);
                     let definition = block.to_view(db);
                     (block.with_value(definition.into()), None, &[][..])
                 }
@@ -1513,7 +1605,16 @@ fn collect_attrs_in<'db, BreakValue>(
 /// The value of the `#[name = value]` attribute of `owner`, with the macros in it expanded:
 /// rustc expands the expression of a key-value attribute before it reads it
 /// (`rustc_expand::expand::InvocationCollector::visit_attribute` walks into `AttrArgs::Eq`).
+///
+/// The owner's fact where one is kept (`deps::facts`): a value written as a literal is kept,
+/// one a macro writes reads which macro its path names and is made again each time.
 pub(crate) fn symbol_attr(db: &Db, owner: AttrDefId, name: &str) -> Option<Symbol> {
+    crate::deps::facts::of_attrs(db, name, owner, || symbol_attr_made(db, owner, name))
+}
+
+/// [`symbol_attr`] off the owner's syntax, and whether the value read nothing but the
+/// attributes' text (no macro in it).
+fn symbol_attr_made(db: &Db, owner: AttrDefId, name: &str) -> (Option<Symbol>, bool) {
     let (source, outer_mod_decl, crate_attrs, krate) = attrs_source(db, owner, Tree::Live);
     let value =
         collect_attrs_in(
@@ -1529,8 +1630,17 @@ pub(crate) fn symbol_attr(db: &Db, owner: AttrDefId, name: &str) -> Option<Symbo
                 },
                 _ => ControlFlow::Continue(()),
             },
-        )?;
-    attr_value(db, owner, krate, value)
+        );
+    let Some(value) = value else { return (None, true) };
+    let mut written = value.value;
+    while let ast::Expr::ParenExpr(paren) = written {
+        match paren.expr() {
+            Some(inner) => written = inner,
+            None => break,
+        }
+    }
+    let literal = !matches!(written, ast::Expr::MacroExpr(_));
+    (attr_value(db, owner, krate, value), literal)
 }
 
 /// The string a key-value attribute's value is, with the macros in it expanded by the
@@ -1646,6 +1756,45 @@ pub struct RustcLayoutScalarValidRange {
     pub end: Option<u128>,
 }
 
+/// As a fact's entry holds it: each bound a tag, then its four 32-bit words, low first.
+impl crate::deps::facts::Value for RustcLayoutScalarValidRange {
+    fn put(&self, _: crate::deps::facts::Ctx, out: &mut crate::deps::facts::Out) -> bool {
+        for bound in [self.start, self.end] {
+            match bound {
+                None => out.u8(0),
+                Some(it) => {
+                    out.u8(1);
+                    for word in 0..4 {
+                        out.u32((it >> (32 * word)) as u32);
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn take(
+        _: crate::deps::facts::Ctx,
+        input: &mut crate::deps::facts::In<'_>,
+    ) -> Result<RustcLayoutScalarValidRange, String> {
+        let mut bound = || -> Result<Option<u128>, String> {
+            match input.u8()? {
+                0 => Ok(None),
+                1 => {
+                    let mut it = 0u128;
+                    for word in 0..4 {
+                        it |= u128::from(input.u32()?) << (32 * word);
+                    }
+                    Ok(Some(it))
+                }
+                // alloc: error path
+                tag => Err(format!("a layout scalar bound of tag {tag}")),
+            }
+        };
+        Ok(RustcLayoutScalarValidRange { start: bound()?, end: bound()? })
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct DeriveInfo {
     pub trait_name: Symbol,
@@ -1703,6 +1852,27 @@ pub enum NativeLibKind {
     RawDylib,
     /// A `kind` other than these (`"link-arg"`, or one rustc refuses), as written.
     Other(Symbol),
+}
+
+/// Every library the `#[link(...)]`s of `owner` name, each with the `cfg(...)` it is linked
+/// under, in the order written: what [`AttrFlags::native_libs`] keeps, before the crate's cfg
+/// picks.
+fn written_libs(db: &Db, owner: ExternBlockId) -> Box<[(NativeLib, Option<CfgExpr>)]> {
+    blaze_mem::frame::current(|frame| {
+        let mut libs = Vec::new_in(frame);
+        collect_attrs::<Infallible>(db, AttrDefId::ExternBlockId(owner), |attr| {
+            if let ast::Meta::TokenTreeMeta(attr) = &attr
+                && path_is(attr.path(), "link")
+                && let Some(tt) = attr.token_tree()
+                && let Some(lib) = parse_link_tt(tt)
+            {
+                libs.push(lib);
+            }
+            ControlFlow::Continue(())
+        });
+        // alloc: the fact's libraries, exact, made once per extern block
+        libs.drain(..).collect()
+    })
 }
 
 /// The library of a `link(...)`, and the `cfg(...)` it is linked under. `None` for one with no
@@ -1908,21 +2078,57 @@ impl EffectWord {
         }
     }
 
-    /// The word of `#[blaze::may(..)]` this spelling promises the absence of.
-    pub const fn may(self) -> MayWord {
+    /// The word of `#[blaze::expect(..)]` this spelling promises the absence of.
+    pub const fn absent(self) -> ExpectWord {
         match self {
-            EffectWord::Nopanic => MayWord::Panic,
-            EffectWord::Noalloc => MayWord::Alloc,
-            EffectWord::Nonblocking => MayWord::Block,
+            EffectWord::Nopanic => ExpectWord::Panic,
+            EffectWord::Noalloc => ExpectWord::Alloc,
+            EffectWord::Nonblocking => ExpectWord::Block,
         }
     }
 }
 
-/// A word of `#[blaze::may(..)]`: an effect a function is allowed to have. The positive
-/// spelling: what is not listed, the function does not have.
+/// The role attributes `hir-ty-pure` checks over the effect summary
+/// (docs/v2/plan/design/effect-summary.md): what a function is to the daemon, each the absence
+/// of a set of effects through every callee. Unlike an [`EffectWord`], no word of
+/// `#[blaze::expect(..)]` spells one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum RoleWord {
+    /// `#[blaze::bounded_turn]`: a loop thread's turn, which must not block, do IO, sync or
+    /// take a lock.
+    BoundedTurn,
+    /// `#[blaze::answers_request]`: an answer path, which must not sync a file to the disk.
+    AnswersRequest,
+}
+
+impl RoleWord {
+    /// Every role word, in the order of its index.
+    pub const ALL: [RoleWord; 2] = [RoleWord::BoundedTurn, RoleWord::AnswersRequest];
+
+    /// The word, as written after `blaze::`.
+    pub const fn text(self) -> &'static str {
+        match self {
+            RoleWord::BoundedTurn => "bounded_turn",
+            RoleWord::AnswersRequest => "answers_request",
+        }
+    }
+
+    /// The flag that says an item carries it.
+    pub const fn flag(self) -> AttrFlags {
+        match self {
+            RoleWord::BoundedTurn => AttrFlags::BOUNDED_TURN,
+            RoleWord::AnswersRequest => AttrFlags::ANSWERS_REQUEST,
+        }
+    }
+}
+
+/// A word of `#[blaze::expect(..)]`: an effect a function is expected to have. The positive
+/// spelling: what is not listed, the function does not have; on a function's own list, what
+/// is listed it has (`blaze::unfulfilled_effect`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
-pub enum MayWord {
+pub enum ExpectWord {
     /// `panic`: it may panic or abort (the absence `#[blaze::nopanic]` promises).
     Panic,
     /// `alloc`: it may call the global allocator (`#[blaze::noalloc]`).
@@ -1934,36 +2140,36 @@ pub enum MayWord {
     Diverge,
 }
 
-impl MayWord {
+impl ExpectWord {
     /// Every word, in the order of its index and the order a list is written in.
-    pub const ALL: [MayWord; 4] =
-        [MayWord::Panic, MayWord::Alloc, MayWord::Block, MayWord::Diverge];
+    pub const ALL: [ExpectWord; 4] =
+        [ExpectWord::Panic, ExpectWord::Alloc, ExpectWord::Block, ExpectWord::Diverge];
 
     /// The word, as written in the list.
     pub const fn text(self) -> &'static str {
         match self {
-            MayWord::Panic => "panic",
-            MayWord::Alloc => "alloc",
-            MayWord::Block => "block",
-            MayWord::Diverge => "diverge",
+            ExpectWord::Panic => "panic",
+            ExpectWord::Alloc => "alloc",
+            ExpectWord::Block => "block",
+            ExpectWord::Diverge => "diverge",
         }
     }
 
     /// The word written `text`.
-    pub fn of(text: &str) -> Option<MayWord> {
-        MayWord::ALL.into_iter().find(|it| it.text() == text)
+    pub fn of(text: &str) -> Option<ExpectWord> {
+        ExpectWord::ALL.into_iter().find(|it| it.text() == text)
     }
 
-    /// Its bit in a [`MayAttr::words`].
+    /// Its bit in a [`ExpectAttr::words`].
     pub const fn bit(self) -> u8 {
         1 << self as u8
     }
 }
 
-/// What `#[blaze::may(..)]` on an item says.
+/// What `#[blaze::expect(..)]` on an item says.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct MayAttr {
-    /// The words listed, a [`MayWord::bit`] each.
+pub struct ExpectAttr {
+    /// The words listed, a [`ExpectWord::bit`] each.
     pub words: u8,
     /// `trusted = "why"` after the words: the list is taken at its word, not checked.
     pub trusted: Option<Symbol>,
@@ -1972,17 +2178,17 @@ pub struct MayAttr {
     pub malformed: Option<Symbol>,
 }
 
-impl MayAttr {
+impl ExpectAttr {
     /// Whether `word` is listed.
-    pub const fn has(&self, word: MayWord) -> bool {
+    pub const fn has(&self, word: ExpectWord) -> bool {
         self.words & word.bit() != 0
     }
 }
 
-/// What the arguments of `#[blaze::may(..)]` say: words of [`MayWord`] separated by commas
+/// What the arguments of `#[blaze::expect(..)]` say: words of [`ExpectWord`] separated by commas
 /// (each once, a trailing comma allowed), then at most one `trusted = "why"`.
-fn may_args(tt: ast::TokenTree<'_>) -> MayAttr {
-    let malformed = |words| MayAttr {
+fn expect_args(tt: ast::TokenTree<'_>) -> ExpectAttr {
+    let malformed = |words| ExpectAttr {
         words,
         trusted: None,
         malformed: Some(Symbol::intern(&tt.syntax().text().to_string())),
@@ -2007,7 +2213,7 @@ fn may_args(tt: ast::TokenTree<'_>) -> MayAttr {
                 _ => return malformed(words),
             }
         } else {
-            match MayWord::of(key.text()) {
+            match ExpectWord::of(key.text()) {
                 Some(word) if words & word.bit() == 0 => words |= word.bit(),
                 _ => return malformed(words),
             }
@@ -2018,7 +2224,7 @@ fn may_args(tt: ast::TokenTree<'_>) -> MayAttr {
             Some(_) => return malformed(words),
         }
     }
-    MayAttr { words, trusted, malformed: None }
+    ExpectAttr { words, trusted, malformed: None }
 }
 
 /// Whether `path` is the two segments `blaze::<word>`.
@@ -2104,22 +2310,149 @@ fn extract_cfgs(result: &mut Vec<CfgExpr, &Frame>, attr: ast::Meta<'_>) -> Contr
     ControlFlow::Continue(())
 }
 
-/// What dropping an [`AttrFlags::docs`] value frees: the box and the docs' heap.
-fn docs_bytes(docs: &Option<Box<Docs>>) -> usize {
-    docs.as_deref().map_or(0, |it| size_of::<Docs>() + it.heap_bytes())
+/// The attribute flags of `def`'s generic parameters ([`AttrFlags::query_generic_params`] for a
+/// definition with any), read off the item's outline. A fact boundary
+/// (`crate::kinds::generic_params_attr_flags`): the borrow check reads it for a `Drop` impl's
+/// `#[may_dangle]`, and blaze-item-hash answers a row of it by the item's `Attrs` fact, which
+/// hashes these flags (`values::attrs_of`); the signature form does not.
+///
+/// The header fact `generic param flags` of `def` (its header holds every parameter and its
+/// attributes, and a trait's own attributes, which its `Self` takes): of a crate given by its
+/// address (`unsafe impl<#[may_dangle] T> Drop for Vec<T>`, which a dependent's drop check
+/// reads) it is read from its entry, with no text. Its value is each flagged parameter's index
+/// and flags, so a definition whose parameters have no attribute keeps two empty lists.
+/// Floor and cost: `deps::facts`'s, one entry a definition with parameters whose flags are
+/// asked.
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
+pub fn generic_params_attr_flags(
+    db: &Db,
+    def: GenericDefId,
+) -> (ArenaMap<LocalLifetimeParamId, AttrFlags>, ArenaMap<LocalTypeOrConstParamId, AttrFlags>) {
+    use crate::deps::facts::{Part, at, fact};
+
+    /// Each flagged parameter's index and flags, in order.
+    type Flagged = Box<[(u32, AttrFlags)]>;
+
+    let (kind, place) = match def {
+        GenericDefId::AdtId(AdtId::StructId(it)) => (1, at(db, it)),
+        GenericDefId::AdtId(AdtId::UnionId(it)) => (2, at(db, it)),
+        GenericDefId::AdtId(AdtId::EnumId(it)) => (3, at(db, it)),
+        GenericDefId::FunctionId(it) => (4, at(db, it)),
+        GenericDefId::StaticId(it) => (6, at(db, it)),
+        GenericDefId::ConstId(it) => (7, at(db, it)),
+        GenericDefId::TraitId(it) => (8, at(db, it)),
+        GenericDefId::TypeAliasId(it) => (9, at(db, it)),
+        GenericDefId::ImplId(it) => (13, at(db, it)),
+    };
+    let (lifetimes, type_and_consts): (Flagged, Flagged) =
+        fact(db, "generic param flags", "", kind, Some(place), Part::Header, || {
+            let (lifetimes, type_and_consts) = generic_params_attr_flags_made(db, def);
+            let flagged = |map: Vec<(u32, AttrFlags)>| map.into_boxed_slice();
+            ((flagged(lifetimes), flagged(type_and_consts)), true)
+        });
+    fn index<T>(raw: u32) -> la_arena::Idx<T> {
+        la_arena::Idx::from_raw(la_arena::RawIdx::from_u32(raw))
+    }
+    blaze_mem::frame::current(|frame| {
+        let mut lifetime_ids = Vec::new_in(frame);
+        lifetime_ids.extend(lifetimes.iter().map(|&(at, flags)| (index(at), flags)));
+        let mut type_or_const_ids = Vec::new_in(frame);
+        type_or_const_ids.extend(type_and_consts.iter().map(|&(at, flags)| (index(at), flags)));
+        (exact_arena_map(&lifetime_ids), exact_arena_map(&type_or_const_ids))
+    })
 }
 
-/// What dropping an [`AttrFlags::fields_docs`] value frees: the map's slots and each field's docs.
-fn fields_docs_bytes(docs: &ArenaMap<LocalFieldId, Option<Box<Docs>>>) -> usize {
-    crate::heap::arena_map_bytes(docs, docs_bytes)
+/// [`generic_params_attr_flags`] off `def`'s outline: each flagged parameter's index and flags.
+fn generic_params_attr_flags_made(
+    db: &Db,
+    def: GenericDefId,
+) -> (Vec<(u32, AttrFlags), Global>, Vec<(u32, AttrFlags), Global>) {
+    {
+        let mut cfg_options = None;
+        let mut cfg_options = || *cfg_options.get_or_insert_with(|| def.krate(db).cfg_options(db));
+
+        let mut flags_of = |attrs: ast::AstChildren<'_, ast::Attr<'_>>| {
+            let mut attr_flags = AttrFlags::empty();
+            expand_cfg_attr_view(attrs, &mut cfg_options, |attr, _| {
+                match_attr_flags(&mut attr_flags, attr)
+            });
+            attr_flags
+        };
+        // One walk of the written params, each zipped with its id in order, as
+        // `HasChildSourceView` finds one of them. The list is read off the item's outline
+        // ([`Tree::Outline`]), never the file's live parse, so an edit of a body of the file (this
+        // item's or another's) leaves this query's row as it was.
+        let generic_params = GenericParams::of(db, def);
+        let list = match def {
+            GenericDefId::FunctionId(it) => outline_generic_params(db, it),
+            GenericDefId::TypeAliasId(it) => outline_generic_params(db, it),
+            GenericDefId::AdtId(AdtId::StructId(it)) => outline_generic_params(db, it),
+            GenericDefId::AdtId(AdtId::UnionId(it)) => outline_generic_params(db, it),
+            GenericDefId::AdtId(AdtId::EnumId(it)) => outline_generic_params(db, it),
+            GenericDefId::TraitId(it) => outline_generic_params(db, it),
+            GenericDefId::ImplId(it) => outline_generic_params(db, it),
+            GenericDefId::ConstId(_) | GenericDefId::StaticId(_) => None,
+        };
+
+        let raw = |id: la_arena::RawIdx| u32::from(id);
+        // alloc: the fact's lists, a pair a flagged parameter; most definitions have none
+        let mut lifetimes = Vec::new_in(Global);
+        let lifetime_params = list.into_iter().flat_map(|it| it.lifetime_params());
+        for ((lifetime_id, _), lifetime) in generic_params.iter_lt().zip(lifetime_params) {
+            let attr_flags = flags_of(lifetime.attrs());
+            if !attr_flags.is_empty() {
+                lifetimes.push((raw(lifetime_id.into_raw()), attr_flags));
+            }
+        }
+
+        // alloc: as above
+        let mut type_and_consts = Vec::new_in(Global);
+        let mut ids = generic_params.iter_type_or_consts().map(|(id, _)| id);
+        // For traits the first type index is `Self`, the trait itself.
+        if let GenericDefId::TraitId(id) = def
+            && let Some(self_id) = ids.next()
+        {
+            let loc = id.lookup(db);
+            let node = item_node(db, loc.ast_id(), loc.module(db), Tree::Outline);
+            let attr_flags = flags_of(node.attrs());
+            if !attr_flags.is_empty() {
+                type_and_consts.push((raw(self_id.into_raw()), attr_flags));
+            }
+        }
+        let type_or_const_params = list.into_iter().flat_map(|it| it.type_or_const_params());
+        for (type_or_const_id, type_or_const) in ids.zip(type_or_const_params) {
+            let attr_flags = flags_of(type_or_const.attrs());
+            if !attr_flags.is_empty() {
+                type_and_consts.push((raw(type_or_const_id.into_raw()), attr_flags));
+            }
+        }
+
+        (lifetimes, type_and_consts)
+    }
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 impl AttrFlags {
-    #[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
+    #[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
     pub fn query(db: &Db, owner: AttrDefId) -> AttrFlags {
-        let mut column = |file: EditionedFileId, krate: Crate| file_attr_flags(db, file, krate);
-        column_flags(db, owner, &mut column).unwrap_or_else(|| walked_flags(db, owner))
+        // Of a crate read from an image's pages, the flags its image holds of the item (no
+        // file of the crate is read).
+        if let Some(flags) = crate::deps::signatures::served_attr_flags(db, owner) {
+            return flags;
+        }
+        // A module's attributes are not one row, so no item entry holds them: its fact, keyed
+        // by its rows (`deps::facts::module_place`), which stability's inheritance reads of each
+        // module above an item with no `#[stable]` of its own.
+        if let AttrDefId::ModuleId(_) = owner {
+            return crate::deps::facts::of_attrs(db, "flags", owner, || {
+                (walked_flags(db, owner), true)
+            });
+        }
+        // The item's own entry where one is kept (rule 65), else walked off its syntax and kept.
+        crate::nameres::frozen::entries::items::attr_flags(db, owner, || {
+            let mut column = |file: EditionedFileId, krate: Crate| file_attr_flags(db, file, krate);
+            column_flags(db, owner, &mut column).unwrap_or_else(|| walked_flags(db, owner))
+        })
     }
 
     #[inline]
@@ -2131,8 +2464,23 @@ impl AttrFlags {
 
         /// The flags of each field the cfg leaves in, indexed by `LocalFieldId`: 16 bytes a
         /// field, read by index.
-        #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+        #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
         fn field_attr_flags(db: &Db, variant: VariantId) -> Box<[AttrFlags]> {
+            // A fact of the variant's header, which holds every field and its attributes (a
+            // `cfg` among them puts the crate's cfg in the key).
+            use crate::deps::facts::{Part, at, fact};
+            let (kind, place) = match variant {
+                VariantId::StructId(it) => (1, at(db, it)),
+                VariantId::UnionId(it) => (2, at(db, it)),
+                VariantId::EnumVariantId(it) => (5, at(db, it)),
+            };
+            fact(db, "field flags", "", kind, Some(place), Part::Header, || {
+                (field_attr_flags_made(db, variant), true)
+            })
+        }
+
+        /// [`field_attr_flags`] off the variant's syntax.
+        fn field_attr_flags_made(db: &Db, variant: VariantId) -> Box<[AttrFlags]> {
             blaze_mem::frame::current(|frame| {
                 let mut result = Vec::new_in(frame);
                 for_each_field(db, variant, Tree::Outline, |_, cfg_options, field| {
@@ -2162,63 +2510,7 @@ impl AttrFlags {
         if params_count_excluding_self == 0 {
             return const { &(ArenaMap::new(), ArenaMap::new()) };
         }
-        return generic_params_attr_flags(db, def);
-
-        #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
-        fn generic_params_attr_flags(
-            db: &Db,
-            def: GenericDefId,
-        ) -> (ArenaMap<LocalLifetimeParamId, AttrFlags>, ArenaMap<LocalTypeOrConstParamId, AttrFlags>)
-        {
-            blaze_mem::frame::current(|frame| {
-                let mut cfg_options = None;
-                let mut cfg_options =
-                    || *cfg_options.get_or_insert_with(|| def.krate(db).cfg_options(db));
-
-                let mut flags_of = |attrs: ast::AstChildren<'_, ast::Attr<'_>>| {
-                    let mut attr_flags = AttrFlags::empty();
-                    expand_cfg_attr_view(attrs, &mut cfg_options, |attr, _| {
-                        match_attr_flags(&mut attr_flags, attr)
-                    });
-                    attr_flags
-                };
-                // One walk of the written params, each zipped with its id in order, as
-                // `HasChildSourceView` finds one of them.
-                let generic_params = GenericParams::of(db, def);
-                let (_, list) = def.file_id_and_params_of_view(db);
-
-                let mut lifetimes = Vec::new_in(frame);
-                let lifetime_params = list.into_iter().flat_map(|it| it.lifetime_params());
-                for ((lifetime_id, _), lifetime) in generic_params.iter_lt().zip(lifetime_params) {
-                    let attr_flags = flags_of(lifetime.attrs());
-                    if !attr_flags.is_empty() {
-                        lifetimes.push((lifetime_id, attr_flags));
-                    }
-                }
-
-                let mut type_and_consts = Vec::new_in(frame);
-                let mut ids = generic_params.iter_type_or_consts().map(|(id, _)| id);
-                // For traits the first type index is `Self`, the trait itself.
-                if let GenericDefId::TraitId(id) = def
-                    && let Some(self_id) = ids.next()
-                {
-                    let attr_flags = flags_of(id.lookup(db).source_view(db).value.attrs());
-                    if !attr_flags.is_empty() {
-                        type_and_consts.push((self_id, attr_flags));
-                    }
-                }
-                let type_or_const_params =
-                    list.into_iter().flat_map(|it| it.type_or_const_params());
-                for (type_or_const_id, type_or_const) in ids.zip(type_or_const_params) {
-                    let attr_flags = flags_of(type_or_const.attrs());
-                    if !attr_flags.is_empty() {
-                        type_and_consts.push((type_or_const_id, attr_flags));
-                    }
-                }
-
-                (exact_arena_map(&lifetimes), exact_arena_map(&type_and_consts))
-            })
-        }
+        generic_params_attr_flags(db, def)
     }
 
     #[inline]
@@ -2248,7 +2540,7 @@ impl AttrFlags {
 
     /// [`AttrFlags::is_cfg_enabled_for`] of an owner as the view every attribute owner is:
     /// one instance for every kind of owner.
-    pub(crate) fn is_cfg_enabled_in(
+    pub fn is_cfg_enabled_in(
         owner: ast::AnyHasAttrs<'_>,
         cfg_options: &CfgOptions,
     ) -> Result<(), CfgExpr> {
@@ -2286,7 +2578,7 @@ impl AttrFlags {
         }
         return link_name(db, owner);
 
-        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
+        #[blaze_memo::tracked(returns(clone), mem_tag = Nameres)]
         fn link_name(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             symbol_attr(db, owner, "link_name")
         }
@@ -2301,7 +2593,7 @@ impl AttrFlags {
         }
         return diagnostic_item(db, owner);
 
-        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
+        #[blaze_memo::tracked(returns(clone), mem_tag = Nameres)]
         fn diagnostic_item(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             symbol_attr(db, owner, "rustc_diagnostic_item")
         }
@@ -2309,40 +2601,44 @@ impl AttrFlags {
 
     /// The native libraries the `#[link(...)]`s of an `extern` block link its crate against,
     /// those whose `cfg(...)` the crate does not have left out, in the order written.
-    #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+    #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
     pub fn native_libs(db: &Db, owner: ExternBlockId) -> Box<[NativeLib]> {
         let krate = owner.lookup(db).container.krate(db);
-        blaze_mem::frame::current(|frame| {
-            let mut libs = Vec::new_in(frame);
-            collect_attrs::<Infallible>(db, AttrDefId::ExternBlockId(owner), |attr| {
-                if let ast::Meta::TokenTreeMeta(attr) = &attr
-                    && path_is(attr.path(), "link")
-                    && let Some(tt) = attr.token_tree()
-                    && let Some((lib, cfg)) = parse_link_tt(tt)
-                    && cfg.is_none_or(|it| krate.cfg_options(db).check(&it) != Some(false))
-                {
-                    libs.push(lib);
-                }
-                ControlFlow::Continue(())
-            });
+        // The fact is every `#[link]` with its `cfg(..)` as written, which reads no cfg (one in
+        // a `cfg_attr` is in its key): the crate's cfg picks among them here, on every read.
+        let written: Box<[(NativeLib, Option<CfgExpr>)]> = crate::deps::facts::of_attrs(
+            db,
+            "link",
+            AttrDefId::ExternBlockId(owner),
+            || (written_libs(db, owner), true),
+        );
+        written
+            .into_iter()
+            .filter(|(_, cfg)| {
+                cfg.as_ref().is_none_or(|it| krate.cfg_options(db).check(it) != Some(false))
+            })
+            .map(|(lib, _)| lib)
             // alloc: the memo's libraries, exact; nothing for an extern block without `#[link]`
-            libs.drain(..).collect()
-        })
+            .collect()
     }
 
     /// The module a wasm module imports the functions of an `extern` block from,
     /// `#[link(wasm_import_module = "...")]`: they are its imports, not a library's.
-    #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
+    #[blaze_memo::tracked(returns(clone), mem_tag = Nameres)]
     pub fn wasm_import_module(db: &Db, owner: ExternBlockId) -> Option<Symbol> {
-        collect_attrs(db, AttrDefId::ExternBlockId(owner), |attr| {
-            if let ast::Meta::TokenTreeMeta(attr) = &attr
-                && path_is(attr.path(), "link")
-                && let Some(tt) = attr.token_tree()
-                && let Some(module) = link_symbol(tt, "wasm_import_module")
-            {
-                return ControlFlow::Break(module);
-            }
-            ControlFlow::Continue(())
+        let owner = AttrDefId::ExternBlockId(owner);
+        crate::deps::facts::of_attrs(db, "wasm_import_module", owner, || {
+            let found = collect_attrs(db, owner, |attr| {
+                if let ast::Meta::TokenTreeMeta(attr) = &attr
+                    && path_is(attr.path(), "link")
+                    && let Some(tt) = attr.token_tree()
+                    && let Some(module) = link_symbol(tt, "wasm_import_module")
+                {
+                    return ControlFlow::Break(module);
+                }
+                ControlFlow::Continue(())
+            });
+            (found, true)
         })
     }
 
@@ -2354,7 +2650,7 @@ impl AttrFlags {
         }
         return link_section(db, owner);
 
-        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
+        #[blaze_memo::tracked(returns(clone), mem_tag = Nameres)]
         fn link_section(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             symbol_attr(db, owner, "link_section")
         }
@@ -2368,7 +2664,7 @@ impl AttrFlags {
         }
         return linkage(db, owner);
 
-        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
+        #[blaze_memo::tracked(returns(clone), mem_tag = Nameres)]
         fn linkage(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             symbol_attr(db, owner, "linkage")
         }
@@ -2382,7 +2678,7 @@ impl AttrFlags {
         }
         return export_name(db, owner);
 
-        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
+        #[blaze_memo::tracked(returns(clone), mem_tag = Nameres)]
         fn export_name(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             symbol_attr(db, owner, "export_name")
         }
@@ -2399,7 +2695,7 @@ impl AttrFlags {
         }
         return pure_attr(db, owner);
 
-        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
+        #[blaze_memo::tracked(returns(clone), mem_tag = Nameres)]
         fn pure_attr(db: &Db, owner: AttrDefId) -> Option<PureAttr> {
             collect_attrs(db, owner, |attr| {
                 let read = match attr {
@@ -2417,26 +2713,26 @@ impl AttrFlags {
         }
     }
 
-    /// What `#[blaze::may(..)]` on `owner` (a function, a trait, or a module or the crate's root
-    /// for the inner attribute) says ([`MayAttr`]); `None` without it, one bit test.
+    /// What `#[blaze::expect(..)]` on `owner` (a function, a trait, or a module or the crate's root
+    /// for the inner attribute) says ([`ExpectAttr`]); `None` without it, one bit test.
     #[inline]
-    pub fn may_attr(db: &Db, owner: AttrDefId) -> Option<MayAttr> {
-        if !AttrFlags::query(db, owner).contains(AttrFlags::MAY) {
+    pub fn expect_attr(db: &Db, owner: AttrDefId) -> Option<ExpectAttr> {
+        if !AttrFlags::query(db, owner).contains(AttrFlags::EXPECT) {
             return None;
         }
-        return may_attr(db, owner);
+        return expect_attr(db, owner);
 
-        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
-        fn may_attr(db: &Db, owner: AttrDefId) -> Option<MayAttr> {
+        #[blaze_memo::tracked(returns(clone), mem_tag = Nameres)]
+        fn expect_attr(db: &Db, owner: AttrDefId) -> Option<ExpectAttr> {
             collect_attrs(db, owner, |attr| {
                 let read = match attr {
-                    ast::Meta::PathMeta(attr) if is_blaze_word(attr.path(), "may") => {
-                        MayAttr { words: 0, trusted: None, malformed: None }
+                    ast::Meta::PathMeta(attr) if is_blaze_word(attr.path(), "expect") => {
+                        ExpectAttr { words: 0, trusted: None, malformed: None }
                     }
-                    ast::Meta::TokenTreeMeta(attr) if is_blaze_word(attr.path(), "may") => {
+                    ast::Meta::TokenTreeMeta(attr) if is_blaze_word(attr.path(), "expect") => {
                         match attr.token_tree() {
-                            Some(tt) => may_args(tt),
-                            None => MayAttr { words: 0, trusted: None, malformed: None },
+                            Some(tt) => expect_args(tt),
+                            None => ExpectAttr { words: 0, trusted: None, malformed: None },
                         }
                     }
                     _ => return ControlFlow::Continue(()),
@@ -2455,7 +2751,7 @@ impl AttrFlags {
         }
         return differentiable_attr(db, owner);
 
-        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
+        #[blaze_memo::tracked(returns(clone), mem_tag = Nameres)]
         fn differentiable_attr(db: &Db, owner: AttrDefId) -> Option<DifferentiableAttr> {
             collect_attrs(db, owner, |attr| {
                 let read = match attr {
@@ -2490,12 +2786,49 @@ impl AttrFlags {
 
         /// The effect attributes of `owner` at once, by [`EffectWord`]'s index: an
         /// item with one of them has the others read in the same pass over its attributes.
-        #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+        #[blaze_memo::tracked(returns(ref), mem_tag = Nameres)]
         fn effect_attrs(db: &Db, owner: AttrDefId) -> [Option<PureAttr>; 3] {
             let mut read: [Option<PureAttr>; 3] = [None, None, None];
             for effect in EffectWord::ALL {
                 let word = effect.text();
                 read[effect as usize] = collect_attrs(db, owner, |attr| {
+                    let it = match attr {
+                        ast::Meta::PathMeta(attr) if is_blaze_word(attr.path(), word) => {
+                            PureAttr::Checked
+                        }
+                        ast::Meta::TokenTreeMeta(attr) if is_blaze_word(attr.path(), word) => {
+                            match attr.token_tree() {
+                                Some(tt) => pure_args(tt),
+                                None => PureAttr::Checked,
+                            }
+                        }
+                        _ => return ControlFlow::Continue(()),
+                    };
+                    ControlFlow::Break(it)
+                });
+            }
+            read
+        }
+    }
+
+    /// What `#[blaze::bounded_turn]` or `#[blaze::answers_request]` (`role`) on `owner` says,
+    /// in the shape of [`AttrFlags::effect_attr`]'s: checked, trusted with its reason, or
+    /// malformed; `None` without it, one bit test.
+    #[inline]
+    pub fn role_attr(db: &Db, owner: AttrDefId, role: RoleWord) -> Option<PureAttr> {
+        if !AttrFlags::query(db, owner).contains(role.flag()) {
+            return None;
+        }
+        // clone: a handle of an interned reason
+        return role_attrs(db, owner)[role as usize].clone();
+
+        /// The role attributes of `owner` at once, by [`RoleWord`]'s index.
+        #[blaze_memo::tracked(returns(ref), mem_tag = Nameres)]
+        fn role_attrs(db: &Db, owner: AttrDefId) -> [Option<PureAttr>; 2] {
+            let mut read: [Option<PureAttr>; 2] = [None, None];
+            for role in RoleWord::ALL {
+                let word = role.text();
+                read[role as usize] = collect_attrs(db, owner, |attr| {
                     let it = match attr {
                         ast::Meta::PathMeta(attr) if is_blaze_word(attr.path(), word) => {
                             PureAttr::Checked
@@ -2522,25 +2855,34 @@ impl AttrFlags {
         if !AttrFlags::query(db, owner).contains(AttrFlags::BLAZE_BITS) {
             return None;
         }
-        return blaze_bits(db, owner);
+        blaze_bits(db, owner)
+    }
 
-        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
-        fn blaze_bits(db: &Db, owner: AttrDefId) -> Option<BitsBacking> {
-            collect_attrs(db, owner, |attr| {
-                let read = match attr {
-                    ast::Meta::PathMeta(attr) if is_blaze_bits(attr.path()) => {
-                        BitsBacking::Smallest
-                    }
-                    ast::Meta::TokenTreeMeta(attr) if is_blaze_bits(attr.path()) => {
-                        match attr.token_tree() {
-                            Some(tt) => bits_args(tt),
-                            None => BitsBacking::Smallest,
-                        }
-                    }
-                    _ => return ControlFlow::Continue(()),
-                };
-                ControlFlow::Break(read)
-            })
+    /// The conditions the `#[blaze::invariant(..)]` attributes on `owner` state, each as written
+    /// between its parentheses, in source order; empty without one. A blaze extension (inert
+    /// under rustc with `#![register_tool(blaze)]`), read and refused by
+    /// `hir_ty_pure::refined` (docs/v2/plan/design/refined-values.md). Every bit of
+    /// [`AttrFlags`] is taken, so this is a query of its own, asked only of a struct a body
+    /// builds, writes or takes.
+    pub fn blaze_invariants(db: &Db, owner: AttrDefId) -> &[Box<str>] {
+        return blaze_invariants(db, owner);
+
+        #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
+        fn blaze_invariants(db: &Db, owner: AttrDefId) -> Box<[Box<str>]> {
+            // alloc: the invariants of one type, few; the query's value
+            let mut found: Vec<Box<str>> = Vec::new();
+            collect_attrs::<Infallible>(db, owner, |attr| {
+                if let ast::Meta::TokenTreeMeta(attr) = attr
+                    && is_blaze_word(attr.path(), "invariant")
+                    && let Some(tt) = attr.token_tree()
+                {
+                    let text = tt.syntax().text().to_string(); // alloc: the condition's text, once per attribute
+                    let inner = text.get(1..text.len().saturating_sub(1)).unwrap_or("");
+                    found.push(Box::from(inner.trim())); // alloc: as above
+                }
+                ControlFlow::Continue(())
+            });
+            found.into_boxed_slice()
         }
     }
 
@@ -2583,17 +2925,20 @@ impl AttrFlags {
 
         return lang_item(db, owner);
 
-        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
+        #[blaze_memo::tracked(returns(clone), mem_tag = Nameres)]
         fn lang_item(db: &Db, owner: AttrDefId) -> Option<Symbol> {
-            collect_attrs(db, owner, |attr| {
-                if let ast::Meta::KeyValueMeta(attr) = attr
-                    && path_is(attr.path(), "lang")
-                    && let Some(value) = string_value(attr)
-                {
-                    ControlFlow::Break(Symbol::intern(&value))
-                } else {
-                    ControlFlow::Continue(())
-                }
+            crate::deps::facts::of_attrs(db, "lang", owner, || {
+                let found = collect_attrs(db, owner, |attr| {
+                    if let ast::Meta::KeyValueMeta(attr) = attr
+                        && path_is(attr.path(), "lang")
+                        && let Some(value) = string_value(attr)
+                    {
+                        ControlFlow::Break(Symbol::intern(&value))
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                });
+                (found, true)
             })
         }
     }
@@ -2612,8 +2957,13 @@ impl AttrFlags {
     ///
     /// Prefer [`AttrFlags::repr()`] in non-perf-sensitive places as it also has a check that
     /// that the ADT has repr.
-    #[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
+    #[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
     pub fn repr_assume_has(db: &Db, owner: AdtId) -> Option<ReprOptions> {
+        crate::deps::facts::of_attrs(db, "repr", owner.into(), || (Self::repr_made(db, owner), true))
+    }
+
+    /// [`Self::repr_assume_has`] off the type's syntax.
+    fn repr_made(db: &Db, owner: AdtId) -> Option<ReprOptions> {
         let mut result = None;
         collect_attrs::<Infallible>(db, owner.into(), |attr| {
             let mut current = None;
@@ -2658,28 +3008,33 @@ impl AttrFlags {
     }
 
     /// Call this only if there are legacy const generics, to save memory.
-    #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+    #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
     pub(crate) fn legacy_const_generic_indices(db: &Db, owner: FunctionId) -> Option<Box<[u32]>> {
-        blaze_mem::frame::current(|frame| {
-            let result = collect_attrs(db, owner.into(), |attr| {
-                if let ast::Meta::TokenTreeMeta(attr) = attr
-                    && path_is(attr.path(), "rustc_legacy_const_generics")
-                    && let Some(tt) = attr.token_tree()
-                {
-                    let result = parse_rustc_legacy_const_generics(tt, frame);
-                    ControlFlow::Break(result)
-                } else {
-                    ControlFlow::Continue(())
-                }
+        let what = "rustc_legacy_const_generics";
+        crate::deps::facts::of_attrs(db, what, owner.into(), || {
+            let made = blaze_mem::frame::current(|frame| {
+                let result = collect_attrs(db, owner.into(), |attr| {
+                    if let ast::Meta::TokenTreeMeta(attr) = attr
+                        && path_is(attr.path(), "rustc_legacy_const_generics")
+                        && let Some(tt) = attr.token_tree()
+                    {
+                        let result = parse_rustc_legacy_const_generics(tt, frame);
+                        ControlFlow::Break(result)
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                });
+                result.filter(|it| !it.is_empty())
             });
-            result.filter(|it| !it.is_empty())
+            (made, true)
         })
     }
 
     // There aren't typically many crates, so it's okay to always make this a query without a flag.
-    #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+    #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
     pub fn doc_html_root_url(db: &Db, krate: Crate) -> Option<SmolStr> {
         let root_file_id = krate.root_file_id(db);
+        crate::nameres::frozen::pages::demand_root_text(db, krate);
         let syntax = root_file_id.parse(db).view();
         let crate_attrs = cli_crate_attrs(db, krate).map(|attr| attr.value);
 
@@ -2714,46 +3069,7 @@ impl AttrFlags {
         if !AttrFlags::query(db, owner.into()).contains(AttrFlags::HAS_TARGET_FEATURE) {
             return const { &HashSet::with_hasher_in(blaze_hash::FixedState, Global) };
         }
-
-        return target_features(db, owner);
-
-        #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
-        fn target_features(db: &Db, owner: FunctionId) -> HashSet<Symbol, Global> {
-            blaze_mem::frame::current(|frame| {
-                let mut found = Vec::new_in(frame);
-                collect_attrs::<Infallible>(db, owner.into(), |attr| {
-                    if let ast::Meta::TokenTreeMeta(attr) = attr
-                        && path_is(attr.path(), "target_feature")
-                        && let Some(tt) = attr.token_tree()
-                    {
-                        let mut tt = TokenTreeChildren::new(tt);
-                        while let Some(NodeOrToken::Token(enable_ident)) = tt.next()
-                            && enable_ident.text() == "enable"
-                            && let Some(NodeOrToken::Token(eq_token)) = tt.next()
-                            && eq_token.kind() == T![=]
-                            && let Some(NodeOrToken::Token(features)) = tt.next()
-                            && let Some(features) = ast::String::cast(features)
-                            && let Ok(features) = features.value()
-                        {
-                            found.extend(features.split(',').map(Symbol::intern));
-                            if tt
-                                .next()
-                                .and_then(NodeOrToken::into_token)
-                                .is_none_or(|it| it.kind() != T![,])
-                            {
-                                break;
-                            }
-                        }
-                    }
-                    ControlFlow::Continue(())
-                });
-                // alloc: the memo's set, once: room for every feature named (a feature named
-                // twice is the one case with room to spare)
-                let mut set = HashSet::with_capacity_in(found.len(), Global);
-                set.extend(found.drain(..));
-                set
-            })
-        }
+        target_features(db, owner)
     }
 
     /// The features `#[target_feature(enable = ..)]` names, in the order the attributes name
@@ -2883,8 +3199,16 @@ impl AttrFlags {
 
         return rustc_layout_scalar_valid_range(db, owner);
 
-        #[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
+        /// A layout input: the attribute fact `rustc_layout_scalar_valid_range`, so of a crate
+        /// given by its address (`NonNull`, `NonZero` of `core`) it is read from its entry with
+        /// no text. Its value is two integers of the attributes' own tokens, kept always.
+        #[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
         fn rustc_layout_scalar_valid_range(db: &Db, owner: AdtId) -> RustcLayoutScalarValidRange {
+            let what = "rustc_layout_scalar_valid_range";
+            crate::deps::facts::of_attrs(db, what, owner.into(), || (made(db, owner), true))
+        }
+
+        fn made(db: &Db, owner: AdtId) -> RustcLayoutScalarValidRange {
             let mut result = RustcLayoutScalarValidRange::default();
             collect_attrs::<Infallible>(db, owner.into(), |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
@@ -2922,8 +3246,15 @@ impl AttrFlags {
                 .unwrap_or_default(),
         };
 
-        #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+        /// The attribute fact `doc alias`: of a crate given by its address, read from its entry
+        /// with no text. Aliases are the attributes' own literals, kept always.
+        #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
         fn doc_aliases(db: &Db, owner: AttrDefId) -> Box<[Symbol]> {
+            let made = || (doc_aliases_made(db, owner), true);
+            crate::deps::facts::of_attrs(db, "doc alias", owner, made)
+        }
+
+        fn doc_aliases_made(db: &Db, owner: AttrDefId) -> Box<[Symbol]> {
             blaze_mem::frame::current(|frame| {
                 let mut result = Vec::new_in(frame);
                 collect_attrs::<Infallible>(db, owner, |attr| {
@@ -2934,7 +3265,7 @@ impl AttrFlags {
             })
         }
 
-        #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+        #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
         fn fields_doc_aliases(
             db: &Db,
             variant: VariantId,
@@ -2966,28 +3297,24 @@ impl AttrFlags {
             }
         };
 
-        // We LRU this query because it is only used by IDE.
-        #[blaze_query::tracked(returns(ref), lru, weigh = cfgs_bytes, mem_tag = Nameres)]
+        #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
         fn cfgs(db: &Db, owner: AttrDefId) -> Option<CfgExpr> {
-            blaze_mem::frame::current(|frame| {
-                let mut result = Vec::new_in(frame);
-                collect_attrs::<Infallible>(db, owner, |attr| extract_cfgs(&mut result, attr));
-                match result.len() {
-                    0 => None,
-                    1 => result.into_iter().next(),
-                    // alloc: the memo's value, exact, only for an item whose flag says `#[cfg]`
-                    _ => Some(CfgExpr::All(result.drain(..).collect())),
-                }
+            crate::deps::facts::of_attrs(db, "cfg", owner, || {
+                let made = blaze_mem::frame::current(|frame| {
+                    let mut result = Vec::new_in(frame);
+                    collect_attrs::<Infallible>(db, owner, |attr| extract_cfgs(&mut result, attr));
+                    match result.len() {
+                        0 => None,
+                        1 => result.into_iter().next(),
+                        // alloc: the memo's value, exact, only for an item whose flag says `#[cfg]`
+                        _ => Some(CfgExpr::All(result.drain(..).collect())),
+                    }
+                });
+                (made, true)
             })
         }
 
-        /// What dropping a `cfgs` value frees: the expression's heap.
-        fn cfgs_bytes(cfg: &Option<CfgExpr>) -> usize {
-            cfg.as_ref().map_or(0, CfgExpr::heap_bytes)
-        }
-
-        // We LRU this query because it is only used by IDE.
-        #[blaze_query::tracked(returns(ref), lru, weigh = fields_cfgs_bytes, mem_tag = Nameres)]
+        #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
         fn fields_cfgs(db: &Db, variant: VariantId) -> ArenaMap<LocalFieldId, Option<CfgExpr>> {
             blaze_mem::frame::current(|frame| {
                 collect_field_attrs(db, variant, Tree::Outline, frame, |cfg_options, field| {
@@ -3006,11 +3333,6 @@ impl AttrFlags {
                 })
             })
         }
-
-        /// What dropping a `fields_cfgs` value frees: the map's slots and each field's cfgs.
-        fn fields_cfgs_bytes(cfgs: &ArenaMap<LocalFieldId, Option<CfgExpr>>) -> usize {
-            crate::heap::arena_map_bytes(cfgs, cfgs_bytes)
-        }
     }
 
     #[inline]
@@ -3020,7 +3342,7 @@ impl AttrFlags {
         }
         return doc_keyword(db, owner);
 
-        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
+        #[blaze_memo::tracked(returns(clone), mem_tag = Nameres)]
         fn doc_keyword(db: &Db, owner: ModuleId) -> Option<Symbol> {
             collect_attrs(db, AttrDefId::ModuleId(owner), |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
@@ -3040,8 +3362,7 @@ impl AttrFlags {
         }
     }
 
-    // We LRU this query because it is only used by IDE.
-    #[blaze_query::tracked(returns(as_deref), lru, weigh = docs_bytes, mem_tag = Nameres)]
+    #[blaze_memo::tracked(returns(as_deref), owns, mem_tag = Nameres)]
     pub fn docs(db: &Db, owner: AttrDefId) -> Option<Box<Docs>> {
         let (source, outer_mod_decl, _crate_attrs, krate) = attrs_source(db, owner, Tree::Live);
         let inner_attrs_node = docs::inner_docs_node(source.value);
@@ -3064,8 +3385,7 @@ impl AttrFlags {
         Self::fields_docs(db, field.parent).get(field.local_id).and_then(|it| it.as_deref())
     }
 
-    // We LRU this query because it is only used by IDE.
-    #[blaze_query::tracked(returns(ref), lru, weigh = fields_docs_bytes, mem_tag = Nameres)]
+    #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
     pub fn fields_docs(db: &Db, variant: VariantId) -> ArenaMap<LocalFieldId, Option<Box<Docs>>> {
         let krate = variant.module(db).krate(db);
         blaze_mem::frame::current(|frame| {
@@ -3091,7 +3411,7 @@ impl AttrFlags {
 
         return derive_info(db, owner).as_ref();
 
-        #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+        #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
         fn derive_info(db: &Db, owner: MacroId) -> Option<DeriveInfo> {
             blaze_mem::frame::current(|frame| {
                 collect_attrs(db, owner.into(), |attr| {
@@ -3139,34 +3459,7 @@ impl AttrFlags {
         if !self.contains(AttrFlags::IS_UNSTABLE) {
             return None;
         }
-
-        return unstable_feature(db, owner);
-
-        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
-        fn unstable_feature(db: &Db, owner: AttrDefId) -> Option<Symbol> {
-            collect_attrs(db, owner, |attr| {
-                if let ast::Meta::TokenTreeMeta(attr) = attr
-                    && path_is(attr.path(), "unstable")
-                    && let Some(tt) = attr.token_tree()
-                {
-                    let mut tt = TokenTreeChildren::new(tt);
-                    // Technically the `feature = "..."` always comes first, but it's not a requirement.
-                    while let Some(token) = tt.next() {
-                        if let NodeOrToken::Token(token) = token
-                            && token.text() == "feature"
-                            && let Some(NodeOrToken::Token(eq)) = tt.next()
-                            && eq.kind() == T![=]
-                            && let Some(NodeOrToken::Token(feature)) = tt.next()
-                            && let Some(feature) = ast::String::cast(feature)
-                            && let Ok(feature) = feature.value()
-                        {
-                            return ControlFlow::Break(Symbol::intern(&feature));
-                        }
-                    }
-                }
-                ControlFlow::Continue(())
-            })
-        }
+        unstable_feature(db, owner)
     }
 
     /// Returns `None` if there is no `#[must_use]`, `Some(None)` if there is a `#[must_use]` without a message,
@@ -3177,16 +3470,19 @@ impl AttrFlags {
         }
         return Some(must_use_message(db, owner));
 
-        #[blaze_query::tracked(returns(as_deref), mem_tag = Nameres)]
+        #[blaze_memo::tracked(returns(as_deref), owns, mem_tag = Nameres)]
         fn must_use_message(db: &Db, owner: AttrDefId) -> Option<Box<str>> {
-            collect_attrs(db, owner, |attr| {
-                if let ast::Meta::KeyValueMeta(attr) = attr
-                    && path_is(attr.path(), "must_use")
-                    && let Some(message) = string_value(attr)
-                {
-                    return ControlFlow::Break(Box::from(&*message));
-                }
-                ControlFlow::Continue(())
+            crate::deps::facts::of_attrs(db, "must_use", owner, || {
+                let found = collect_attrs(db, owner, |attr| {
+                    if let ast::Meta::KeyValueMeta(attr) = attr
+                        && path_is(attr.path(), "must_use")
+                        && let Some(message) = string_value(attr)
+                    {
+                        return ControlFlow::Break(Box::from(&*message));
+                    }
+                    ControlFlow::Continue(())
+                });
+                (found, true)
             })
         }
     }
@@ -3199,8 +3495,14 @@ impl AttrFlags {
         }
         return define_opaque(db, owner);
 
-        #[blaze_query::tracked(returns(deref), mem_tag = Nameres)]
+        #[blaze_memo::tracked(returns(deref), owns, mem_tag = Nameres)]
         fn define_opaque(db: &Db, owner: FunctionId) -> Box<[ModPath]> {
+            let what = "define_opaque";
+            crate::deps::facts::of_attrs(db, what, owner.into(), || (made(db, owner), true))
+        }
+
+        /// [`define_opaque`] off the function's syntax.
+        fn made(db: &Db, owner: FunctionId) -> Box<[ModPath]> {
             blaze_mem::frame::current(|frame| {
                 let mut result = Vec::new_in(frame);
                 let mut tokens = Vec::new_in(frame);
@@ -3253,8 +3555,14 @@ impl AttrFlags {
         }
         return must_implement_one_of(db, owner);
 
-        #[blaze_query::tracked(returns(as_deref), mem_tag = Nameres)]
+        #[blaze_memo::tracked(returns(as_deref), owns, mem_tag = Nameres)]
         pub fn must_implement_one_of(db: &Db, owner: TraitId) -> Option<Box<[Name]>> {
+            let what = "rustc_must_implement_one_of";
+            crate::deps::facts::of_attrs(db, what, owner.into(), || (made(db, owner), true))
+        }
+
+        /// [`must_implement_one_of`] off the trait's syntax.
+        fn made(db: &Db, owner: TraitId) -> Option<Box<[Name]>> {
             blaze_mem::frame::current(|frame| {
                 let mut names = Vec::new_in(frame);
                 collect_attrs(db, owner.into(), |attr| {
@@ -3277,6 +3585,108 @@ impl AttrFlags {
                 })
             })
         }
+    }
+}
+
+// The attribute queries another crate names by kind (`crate::kinds`): at module level and
+// `pub`, so their generated kind is nameable; read each through its `AttrFlags` method, which
+// tests the flag first. Their kind names are the ones they had nested in those methods
+// (`hir_def::attrs::blaze_bits`, `target_features`, `unstable_feature`): `module_path!` names
+// the module, not the function a query is written in.
+
+/// [`AttrFlags::blaze_bits`] of an owner whose flags have `BLAZE_BITS`, stored.
+#[blaze_memo::tracked(returns(clone), mem_tag = Nameres)]
+pub fn blaze_bits(db: &Db, owner: AttrDefId) -> Option<BitsBacking> {
+    collect_attrs(db, owner, |attr| {
+        let read = match attr {
+            ast::Meta::PathMeta(attr) if is_blaze_bits(attr.path()) => BitsBacking::Smallest,
+            ast::Meta::TokenTreeMeta(attr) if is_blaze_bits(attr.path()) => {
+                match attr.token_tree() {
+                    Some(tt) => bits_args(tt),
+                    None => BitsBacking::Smallest,
+                }
+            }
+            _ => return ControlFlow::Continue(()),
+        };
+        ControlFlow::Break(read)
+    })
+}
+
+/// [`AttrFlags::target_features`] of a function whose flags have `HAS_TARGET_FEATURE`, stored.
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
+pub fn target_features(db: &Db, owner: FunctionId) -> HashSet<Symbol, Global> {
+    return crate::deps::facts::of_attrs(db, "target_feature", owner.into(), || {
+        (made(db, owner), true)
+    });
+
+    /// [`target_features`] off the function's syntax.
+    fn made(db: &Db, owner: FunctionId) -> HashSet<Symbol, Global> {
+        blaze_mem::frame::current(|frame| {
+            let mut found = Vec::new_in(frame);
+            collect_attrs::<Infallible>(db, owner.into(), |attr| {
+                if let ast::Meta::TokenTreeMeta(attr) = attr
+                    && path_is(attr.path(), "target_feature")
+                    && let Some(tt) = attr.token_tree()
+                {
+                    let mut tt = TokenTreeChildren::new(tt);
+                    while let Some(NodeOrToken::Token(enable_ident)) = tt.next()
+                        && enable_ident.text() == "enable"
+                        && let Some(NodeOrToken::Token(eq_token)) = tt.next()
+                        && eq_token.kind() == T![=]
+                        && let Some(NodeOrToken::Token(features)) = tt.next()
+                        && let Some(features) = ast::String::cast(features)
+                        && let Ok(features) = features.value()
+                    {
+                        found.extend(features.split(',').map(Symbol::intern));
+                        if tt
+                            .next()
+                            .and_then(NodeOrToken::into_token)
+                            .is_none_or(|it| it.kind() != T![,])
+                        {
+                            break;
+                        }
+                    }
+                }
+                ControlFlow::Continue(())
+            });
+            // alloc: the memo's set, once: room for every feature named (a feature named
+            // twice is the one case with room to spare)
+            let mut set = HashSet::with_capacity_in(found.len(), Global);
+            set.extend(found.drain(..));
+            set
+        })
+    }
+}
+
+/// [`AttrFlags::unstable_feature`] of an owner whose flags have `IS_UNSTABLE`, stored.
+#[blaze_memo::tracked(returns(clone), mem_tag = Nameres)]
+pub fn unstable_feature(db: &Db, owner: AttrDefId) -> Option<Symbol> {
+    return crate::deps::facts::of_attrs(db, "unstable", owner, || (made(db, owner), true));
+
+    /// [`unstable_feature`] off the owner's syntax.
+    fn made(db: &Db, owner: AttrDefId) -> Option<Symbol> {
+        collect_attrs(db, owner, |attr| {
+            if let ast::Meta::TokenTreeMeta(attr) = attr
+                && path_is(attr.path(), "unstable")
+                && let Some(tt) = attr.token_tree()
+            {
+                let mut tt = TokenTreeChildren::new(tt);
+                // Technically the `feature = "..."` always comes first, but it's not a requirement.
+                while let Some(token) = tt.next() {
+                    if let NodeOrToken::Token(token) = token
+                        && token.text() == "feature"
+                        && let Some(NodeOrToken::Token(eq)) = tt.next()
+                        && eq.kind() == T![=]
+                        && let Some(NodeOrToken::Token(feature)) = tt.next()
+                        && let Some(feature) = ast::String::cast(feature)
+                        && let Ok(feature) = feature.value()
+                    {
+                        return ControlFlow::Break(Symbol::intern(&feature));
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        })
     }
 }
 
@@ -3315,13 +3725,13 @@ pub fn disabled_sanitizers(db: &Db, def: FunctionId) -> u8 {
 }
 
 /// [`disabled_sanitizers`] of the items of `module`.
-#[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
 fn module_disabled_sanitizers(db: &Db, module: ModuleId) -> u8 {
     let inherited = match module.containing_module_inside_def_map(db) {
-        Some(parent) => module_disabled_sanitizers(db, ModuleId::from_id(parent.as_id())),
+        Some(parent) => module_disabled_sanitizers(db, ModuleId::from_gid(parent.gid())),
         None => match module.block(db) {
             // A block is no item of rustc's: its items' parent is what the block is in.
-            Some(block) => return block_disabled_sanitizers(db, BlockId::from_id(block.as_id())),
+            Some(block) => return block_disabled_sanitizers(db, BlockId::from_gid(block.gid())),
             None => 0,
         },
     };
@@ -3331,7 +3741,7 @@ fn module_disabled_sanitizers(db: &Db, module: ModuleId) -> u8 {
 /// [`disabled_sanitizers`] of the items of `block`: the set of the module holding it, then the
 /// `#[sanitize]` of each item and closure between the two, outermost first, through the macro
 /// calls the block was expanded from.
-#[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
 fn block_disabled_sanitizers(db: &Db, block: BlockId) -> u8 {
     let outer = block.module(db);
     let krate = outer.krate(db);
@@ -3371,7 +3781,10 @@ fn block_disabled_sanitizers(db: &Db, block: BlockId) -> u8 {
             (ast::to_node(ptr, ast::Node::root(tree)).parent(), stop)
         }
         _ => (
-            ast_id.to_view(db).syntax().parent(),
+            {
+                demand_text(db, krate, file_id);
+                ast_id.to_view(db).syntax().parent()
+            },
             outer_block.map(|it| (it.file_id, it.to_range(db))),
         ),
     };
@@ -3409,7 +3822,7 @@ fn block_disabled_sanitizers(db: &Db, block: BlockId) -> u8 {
         file_id = call.file_id;
         node = call.value.parent();
     }
-    let module = module_disabled_sanitizers(db, ModuleId::from_id(outer.as_id()));
+    let module = module_disabled_sanitizers(db, ModuleId::from_gid(outer.gid()));
     sets.iter().rev().fold(module, |disabled, sets| sets.apply(disabled))
 }
 
@@ -3418,7 +3831,12 @@ fn own_disabled_sanitizers(db: &Db, owner: AttrDefId, inherited: u8) -> u8 {
     if !AttrFlags::query(db, owner).contains(AttrFlags::HAS_SANITIZE) {
         return inherited;
     }
-    collect_attrs(db, owner, sanitize_sets).map_or(inherited, |sets| sets.apply(inherited))
+    // The fact is the sets as written (rare: only an item with `#[sanitize]` asks), so what the
+    // item inherits is no input of it.
+    let written: Option<(u8, u8)> = crate::deps::facts::of_attrs(db, "sanitize", owner, || {
+        (collect_attrs(db, owner, sanitize_sets).map(|it| (it.on, it.off)), true)
+    });
+    written.map_or(inherited, |(on, off)| SanitizeSets { on, off }.apply(inherited))
 }
 
 /// One `#[sanitize(..)]`: the sanitizers it turns on and those it turns off.

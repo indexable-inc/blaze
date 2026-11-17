@@ -50,6 +50,7 @@ pub mod request;
 pub mod store;
 pub mod tree;
 pub mod unpack;
+pub mod verified;
 
 #[cfg(test)]
 mod tests;

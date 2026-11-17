@@ -1,5 +1,5 @@
-//! Built MIR through the item store: a body's MIR and its closure's, built and flushed in one
-//! database, are read in a fresh one whose ids differ with no MIR built, equal to the same MIR
+//! Built MIR through the item store: a body's MIR and its closure's, built in one database and
+//! kept by the kernel's entries (`body_store::tests::kept_by_the_kernel`), are read in a fresh one whose ids differ with no MIR built, equal to the same MIR
 //! built there; both databases encode it to the same bytes; a lowering error is never stored; a
 //! corrupt answer is an error naming the body; a hit allocates only what decoding makes; a
 //! record holds a slot for each location literal and reads it where the body is now.
@@ -9,14 +9,13 @@
 
 use std::sync::Arc;
 
-use base_db::{Db, all_crates};
+use base_db::{Crate, Db, all_crates};
 use blaze_alloc_count::measure;
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
-use blaze_query::db::{Durability, Setter};
+use blaze_ids::ContentId;
 use hir_def::{
     AdtId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, ModuleDefId, StructId, VariantId,
-    deps::ImageStore,
     expr_store::{Body, ExpressionStore},
     hir::{BindingId, ClosureKind, Expr, ExprId},
     nameres::{crate_def_map, demand::crate_body_owners},
@@ -27,14 +26,14 @@ use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 use rustc_type_ir::inherent::Ty as _;
 use std::alloc::Global;
 
-use super::{RAN, built, decode, encode, lookup_mir, place};
+use super::{ONE_PLACE, RAN, built, decode, encode, lookup_mir, place, schema_of};
 use crate::{
     CallableDefId, InferBodyId, MemoryMap,
     body_store::{
         BodyFacts, Flushed, Lookup, Mode, Step, StepCounts,
-        record::{self, AnswerKey, ShapeRef},
         tests::{
-            BUILD, Defs, FIXTURE, Memory, Session, db_of, function, second, session, without_steps,
+            Defs, FIXTURE, Memory, Session, crate_named, db_of, function, kept_by_the_kernel, second, session,
+            without_steps,
         },
     },
     db::{InternedClosure, InternedClosureId},
@@ -43,23 +42,68 @@ use crate::{
         MirPhase, MirSpan, Operand, OperandKind, Place, Projection, ProjectionElem, Rvalue,
         Statement, StatementKind, Terminator, TerminatorKind,
     },
-    next_solver::{DbInterner, Ty, default_types, goal_store::solver_version},
+    next_solver::{DbInterner, Ty, default_types},
 };
 
-/// What a test asks the store for: the MIR of `closures` or of its closure, or a lowering that
-/// fails.
-#[blaze_query::input]
+/// The function every [`Ask`] is of.
+const ASKED: &str = "closures";
+
+/// What a test asks the store for: the MIR of [`ASKED`] or of its closure, or a lowering that
+/// fails. Made with its snapshot ([`asking`]), before any id of it can be taken, so it names
+/// its body by the function's name.
+#[blaze_memo::input]
 struct Ask {
-    #[returns(copy)]
-    def: DefWithBodyId,
     #[returns(copy)]
     closure: bool,
     #[returns(copy)]
     fails: bool,
 }
 
+/// Every [`Ask`] of a database [`asking`] made, by `closure` then `fails`.
+#[blaze_memo::input(singleton)]
+struct Asks {
+    #[returns(copy)]
+    asks: [[Ask; 2]; 2],
+}
+
+/// The fact the asks are made under ([`asking`]).
+fn asks_fact() -> blaze_memo::Fact {
+    blaze_memo::Fact {
+        id: ContentId::of("body store test: the asks", ASKED.as_bytes()),
+        digest: ContentId::of("body store test: the asks' fields", ASKED.as_bytes()),
+    }
+}
+
+/// `db` with every [`Ask`] made in its session arena, held by [`Asks`]: inputs are made only
+/// while a snapshot is built, so the asks are a maker of the session arena (`Edit::set_given`)
+/// and its commit makes them. Each ask's fact is known by its fields, which are its digest.
+fn asking(mut db: Db) -> Db {
+    let make = |_: &blaze_memo::Builder, inputs: &blaze_memo::Inputs<'_>| {
+        let ask = |closure: bool, fails: bool| {
+            let fields = [u8::from(closure), u8::from(fails)];
+            let fact = blaze_memo::Fact {
+                id: ContentId::of("body store test: an ask", &fields),
+                digest: ContentId::of("body store test: an ask's fields", &fields),
+            };
+            Ask::new(inputs, fact, closure, fails)
+        };
+        let asks = [[ask(false, false), ask(false, true)], [ask(true, false), ask(true, true)]];
+        Asks::set(inputs, asks_fact(), asks);
+    };
+    let mut edit = db.edit();
+    edit.set_given(None, asks_fact(), Box::new_in(make, Global));
+    _ = edit.commit();
+    db
+}
+
+/// The [`Ask`] of `db` ([`asking`]) for the MIR of [`ASKED`] (or of its closure), failing where
+/// `fails` says.
+fn new_ask(db: &Db, closure: bool, fails: bool) -> Ask {
+    Asks::get(db).asks(db)[usize::from(closure)][usize::from(fails)]
+}
+
 fn owner_of<'db>(db: &'db Db, ask: Ask) -> MirOwner<'db> {
-    let def = ask.def(db);
+    let def = function(db, ASKED);
     match ask.closure(db) {
         false => MirOwner::Body(InferBodyId::DefWithBodyId(def)),
         true => MirOwner::Closure(closure_of(db, def)),
@@ -67,8 +111,16 @@ fn owner_of<'db>(db: &'db Db, ask: Ask) -> MirOwner<'db> {
 }
 
 /// What a built-MIR query does with the store: `providers::compute` at `MirStage::Built`.
-#[blaze_query::tracked(returns(ref))]
-fn built_mir<'db>(db: &'db Db, ask: Ask) -> Result<MirBody<'db>, MirLowerError<'db>> {
+///
+/// Keyed by the crate [`ASKED`] is in as well ([`built_mir_in`]): the lowering reads that
+/// crate's arena, and a key of the session's [`Ask`] alone is homed at the session arena,
+/// which may read no crate's.
+fn built_mir<'db>(db: &'db Db, ask: Ask) -> &'db Result<MirBody<'db>, MirLowerError<'db>> {
+    built_mir_in(db, ask, crate_named(db, "main"))
+}
+
+#[blaze_memo::tracked(returns(ref), owns)]
+fn built_mir_in<'db>(db: &'db Db, ask: Ask, _krate: Crate) -> Result<MirBody<'db>, MirLowerError<'db>> {
     let owner = owner_of(db, ask);
     built(db, owner, || match ask.fails(db) {
         true => Err(MirLowerError::Loop),
@@ -77,9 +129,14 @@ fn built_mir<'db>(db: &'db Db, ask: Ask) -> Result<MirBody<'db>, MirLowerError<'
 }
 
 /// The MIR of `closures` with its first block's call returning to a block past the body's:
-/// written, it does not read back. What a lowering or writer bug would offer.
-#[blaze_query::tracked(returns(ref))]
-fn unreadable_mir<'db>(db: &'db Db, ask: Ask) -> Result<MirBody<'db>, MirLowerError<'db>> {
+/// written, it does not read back. What a lowering or writer bug would offer. Keyed by the
+/// crate as [`built_mir`] is.
+fn unreadable_mir<'db>(db: &'db Db, ask: Ask) -> &'db Result<MirBody<'db>, MirLowerError<'db>> {
+    unreadable_mir_in(db, ask, crate_named(db, "main"))
+}
+
+#[blaze_memo::tracked(returns(ref), owns)]
+fn unreadable_mir_in<'db>(db: &'db Db, ask: Ask, _krate: Crate) -> Result<MirBody<'db>, MirLowerError<'db>> {
     let owner = owner_of(db, ask);
     built(db, owner, || {
         let mut body = mir_of(db, owner);
@@ -284,7 +341,7 @@ fn mir_of<'db>(db: &'db Db, owner: MirOwner<'db>) -> MirBody<'db> {
 }
 
 fn ask(s: &Session, closure: bool) -> Ask {
-    Ask::new(&s.db, Durability::LOW, function(&s.db, "closures"), closure, false)
+    new_ask(&s.db, closure, false)
 }
 
 /// `owner`'s MIR in stable form: its answer's bytes, every id by its key.
@@ -300,7 +357,7 @@ fn stable<'db>(s: &'db Session, owner: MirOwner<'db>) -> Vec<u8> {
 fn stored() -> (Arc<Memory>, Defs, [Vec<u8>; 2]) {
     let memory = Arc::new(Memory::default());
     let defs = Defs::default();
-    let first = session(db_of(FIXTURE), &memory, &defs, None, Mode::Serve);
+    let first = session(asking(db_of(FIXTURE)), &memory, &defs, None, Mode::Serve);
     let mut forms = [Vec::new(), Vec::new()];
     for closure in [false, true] {
         let ask = ask(&first, closure);
@@ -308,32 +365,18 @@ fn stored() -> (Arc<Memory>, Defs, [Vec<u8>; 2]) {
         assert_eq!(*built, mir_of(&first.db, owner_of(&first.db, ask)));
         forms[usize::from(closure)] = stable(&first, owner_of(&first.db, ask));
     }
+    kept_by_the_kernel(&first, &memory);
     let flushed = first.installed.flush().unwrap();
-    assert_eq!(flushed.written, 2, "the body's MIR and its closure's, each a record: {flushed:?}");
-    assert_eq!(memory.len(), 4, "a shape and an answer each");
+    assert_eq!(flushed.written, 0, "a served step's record is the kernel's entry: {flushed:?}");
+    assert_eq!(memory.len(), 0, "nothing is filed in the item store's records");
+    assert_eq!(memory.entries(), 2, "the body's MIR and its closure's, each an entry");
     (memory, defs, forms)
 }
 
-/// Where `owner`'s MIR answer is in `memory`, from its shape in slot 0: its store key and its
-/// answer key.
-fn answer_of<'db>(
-    memory: &Memory,
-    s: &'db Session,
-    owner: MirOwner<'db>,
-) -> (blaze_ids::ContentId, blaze_ids::ContentId) {
-    let (def, schema) = place(&s.db, owner).unwrap();
-    let identity = s.facts.identity(&s.db, def).expect("a module's function has an identity");
-    let base = record::base_key(&identity, Step::Mir, &schema, &solver_version(&BUILD));
-    let shape_key = record::shape_key(&base, 0);
-    let shape =
-        memory.get(&record::shape_at(Step::Mir, &shape_key)).unwrap().expect("a shape in slot 0");
-    let shape = ShapeRef::open(shape.bytes(), &base).unwrap();
-    let mut key = AnswerKey::new(&shape_key);
-    for fact in shape.facts() {
-        key.value(&s.facts.value(&s.db, def, fact).unwrap());
-    }
-    let answer_key = key.finish();
-    (record::answer_at(Step::Mir, &answer_key), answer_key)
+/// The schema `owner`'s MIR is filed under.
+fn schema_of_mir<'db>(s: &'db Session, owner: MirOwner<'db>) -> blaze_format::SchemaHash {
+    let (def, at) = place(&s.db, owner).expect("the test's owners are a body's");
+    schema_of(&s.db, def, at)
 }
 
 #[test]
@@ -342,16 +385,20 @@ fn a_body_and_its_closure_are_two_records_under_the_body() {
     let def = function(&db, "closures");
     let body = MirOwner::Body(InferBodyId::DefWithBodyId(def));
     let closure = MirOwner::Closure(closure_of(&db, def));
-    let (body_def, body_schema) = place(&db, body).unwrap();
-    let (closure_def, closure_schema) = place(&db, closure).unwrap();
+    let (body_def, body_place) = place(&db, body).unwrap();
+    let (closure_def, closure_place) = place(&db, closure).unwrap();
     assert_eq!((body_def, closure_def), (def, def), "a closure's MIR is filed under its body");
-    assert_ne!(body_schema, closure_schema, "and apart from the body's own");
+    assert_ne!(
+        schema_of(&db, def, body_place),
+        schema_of(&db, def, closure_place),
+        "and apart from the body's own"
+    );
 }
 
 #[test]
 fn stored_mir_is_read_in_a_fresh_database_without_building_it() {
     let (memory, defs, forms) = stored();
-    let fresh = session(second(FIXTURE), &memory, &defs, None, Mode::Serve);
+    let fresh = session(asking(second(FIXTURE)), &memory, &defs, None, Mode::Serve);
     assert_ne!(
         function(&db_of(FIXTURE), "closures"),
         function(&fresh.db, "closures"),
@@ -383,9 +430,8 @@ fn stored_mir_is_read_in_a_fresh_database_without_building_it() {
 fn a_lowering_error_is_never_stored() {
     let memory = Arc::new(Memory::default());
     let defs = Defs::default();
-    let mut first = session(db_of(FIXTURE), &memory, &defs, None, Mode::Serve);
-    let failing =
-        Ask::new(&first.db, Durability::LOW, function(&first.db, "closures"), false, true);
+    let first = session(asking(db_of(FIXTURE)), &memory, &defs, None, Mode::Serve);
+    let failing = new_ask(&first.db, false, true);
     assert!(built_mir(&first.db, failing).is_err());
     assert_eq!(
         without_steps(first.installed.flush().unwrap()),
@@ -394,26 +440,28 @@ fn a_lowering_error_is_never_stored() {
     );
     assert_eq!(memory.len(), 0);
 
-    failing.set_fails(&mut first.db).to(false);
+    // The ask with `fails` off: another input, made with the snapshot as every ask is
+    // ([`asking`]), so another key of the query.
+    let failing = new_ask(&first.db, false, false);
     reset_ran();
     assert!(built_mir(&first.db, failing).is_ok());
     assert_eq!(ran(), 1, "the body is built once it lowers");
-    assert_eq!(first.installed.flush().unwrap().written, 1);
+    assert_eq!(first.installed.flush().unwrap().written, 0, "a served step's record is the kernel's entry");
 }
 
 #[test]
 fn a_corrupt_answer_is_an_error_naming_the_body() {
     let (memory, defs, _) = stored();
-    let probe = session(db_of(FIXTURE), &Arc::new(Memory::default()), &defs, None, Mode::Serve);
-    let (at, answer_key) = answer_of(&memory, &probe, owner_of(&probe.db, ask(&probe, false)));
+    let probe = session(asking(db_of(FIXTURE)), &Arc::new(Memory::default()), &defs, None, Mode::Serve);
+    let schema = schema_of_mir(&probe, owner_of(&probe.db, ask(&probe, false)));
     drop(probe);
 
     let mut garbage = vec![0u8; 256];
     garbage[..16].copy_from_slice(b"not a MIR answer");
-    memory.set(at, &record::write_answer(&answer_key, &garbage));
-    let fresh = session(second(FIXTURE), &memory, &defs, None, Mode::Serve);
+    memory.set_answer_under("closures", Step::Mir, schema, &garbage);
+    let fresh = session(asking(second(FIXTURE)), &memory, &defs, None, Mode::Serve);
     let ask = ask(&fresh, false);
-    let def = ask.def(&fresh.db);
+    let def = function(&fresh.db, ASKED);
     reset_ran();
     let read = built_mir(&fresh.db, ask).as_ref().expect("built again, it lowers");
     assert_eq!(ran(), 1, "the body is built, which gives the same MIR");
@@ -428,9 +476,9 @@ fn a_corrupt_answer_is_an_error_naming_the_body() {
 #[cfg_attr(not(debug_assertions), ignore = "the read-back runs only with debug assertions")]
 fn a_body_that_does_not_read_back_is_an_error_naming_it() {
     let memory = Arc::new(Memory::default());
-    let s = session(db_of(FIXTURE), &memory, &Defs::default(), None, Mode::Serve);
+    let s = session(asking(db_of(FIXTURE)), &memory, &Defs::default(), None, Mode::Serve);
     let ask = ask(&s, false);
-    let def = ask.def(&s.db);
+    let def = function(&s.db, ASKED);
     assert!(unreadable_mir(&s.db, ask).is_ok(), "the body is still the query's answer");
     let error = s.installed.flush().expect_err("a body offered that does not read back");
     assert!(
@@ -445,7 +493,7 @@ fn a_body_that_does_not_read_back_is_an_error_naming_it() {
 #[test]
 fn verify_builds_every_hit_and_a_difference_is_an_error_naming_the_body() {
     let (memory, defs, _) = stored();
-    let same = session(second(FIXTURE), &memory, &defs, None, Mode::Verify);
+    let same = session(asking(second(FIXTURE)), &memory, &defs, None, Mode::Verify);
     reset_ran();
     for closure in [false, true] {
         let _ = built_mir(&same.db, ask(&same, closure));
@@ -459,14 +507,14 @@ fn verify_builds_every_hit_and_a_difference_is_an_error_naming_the_body() {
     drop(same);
 
     // The body's answer swapped for its closure's: it decodes, and differs.
-    let probe = session(db_of(FIXTURE), &Arc::new(Memory::default()), &defs, None, Mode::Serve);
-    let (at, body_key) = answer_of(&memory, &probe, owner_of(&probe.db, ask(&probe, false)));
+    let probe = session(asking(db_of(FIXTURE)), &Arc::new(Memory::default()), &defs, None, Mode::Serve);
+    let schema = schema_of_mir(&probe, owner_of(&probe.db, ask(&probe, false)));
     let closure_bytes = stable(&probe, owner_of(&probe.db, ask(&probe, true)));
     drop(probe);
-    memory.set(at, &record::write_answer(&body_key, &closure_bytes));
-    let wrong = session(second(FIXTURE), &memory, &defs, None, Mode::Verify);
+    memory.set_answer_under("closures", Step::Mir, schema, &closure_bytes);
+    let wrong = session(asking(second(FIXTURE)), &memory, &defs, None, Mode::Verify);
     let ask = ask(&wrong, false);
-    let def = ask.def(&wrong.db);
+    let def = function(&wrong.db, ASKED);
     let _ = built_mir(&wrong.db, ask);
     let error = wrong.installed.flush().expect_err("a stored MIR that differs from building it");
     assert!(error.contains(&format!("{def:?}")) && error.contains("differs"), "{error}");
@@ -475,15 +523,14 @@ fn verify_builds_every_hit_and_a_difference_is_an_error_naming_the_body() {
 #[test]
 fn a_hit_allocates_only_the_decoded_mir() {
     let (memory, defs, _) = stored();
-    let fresh = session(second(FIXTURE), &memory, &defs, None, Mode::Serve);
+    let fresh = session(asking(second(FIXTURE)), &memory, &defs, None, Mode::Serve);
     for closure in [false, true] {
         let owner = owner_of(&fresh.db, ask(&fresh, closure));
-        let (def, schema) = place(&fresh.db, owner).unwrap();
+        let (def, at) = place(&fresh.db, owner).unwrap();
+        let schema = super::schema_of(&fresh.db, def, at);
         // Warm: the identity, the facts' values and every type the MIR interns.
         assert!(matches!(lookup_mir(&fresh.db, def, owner, schema), Lookup::Hit { .. }));
-        let (at, answer_key) = answer_of(&memory, &fresh, owner);
-        let answer = memory.get(&at).unwrap().unwrap();
-        let body = Aligned::copy_from(record::open_answer(answer.bytes(), &answer_key).unwrap());
+        let body = Aligned::copy_from(&memory.answer_under("closures", Step::Mir, schema));
         let (decoded, decoding) = measure(|| decode(&fresh.db, &*fresh.facts, def, &body));
         drop(decoded.unwrap());
         let (found, hit) = measure(|| lookup_mir(&fresh.db, def, owner, schema));
@@ -686,11 +733,119 @@ fn a_location_macro_in_a_pattern_is_refused() {
 
 #[test]
 fn no_store_builds_as_without_one() {
-    let db = second(FIXTURE);
-    let def = function(&db, "closures");
+    let db = asking(second(FIXTURE));
+    let def = function(&db, ASKED);
     let owner = MirOwner::Body(InferBodyId::DefWithBodyId(def));
-    let (_, schema) = place(&db, owner).unwrap();
+    let (_, at) = place(&db, owner).unwrap();
+    let schema = super::schema_of(&db, def, at);
     assert!(matches!(lookup_mir(&db, def, owner, schema), Lookup::Off));
-    let ask = Ask::new(&db, Durability::LOW, def, false, false);
+    let ask = new_ask(&db, false, false);
     assert_eq!(*built_mir(&db, ask).as_ref().unwrap(), mir_of(&db, owner_of(&db, ask)));
+}
+
+/// A function with a closure and an `async` block: three MIR owners, each its own entry.
+const OWNERS: &str = r#"
+//- minicore: sized, copy, fn, future
+//- /main.rs crate:main deps:core new_source_root:local
+pub fn owners() -> u32 {
+    let id = |x: u32| x;
+    let _later = async { 2u32 };
+    id(1)
+}
+"#;
+
+/// The invariant: each MIR owner of a body has its own place and schema: `places` are
+/// distinct, and the place `place_of` finds by an owner's schema is that owner's. `Err` names
+/// the first owner that breaks it.
+fn owners_apart() -> Result<(), String> {
+    use crate::body_store::entries::{mir_schema, place_of};
+    let db = db_of(OWNERS);
+    let def = function(&db, "owners");
+    // The owners' places as `place` files them (where the control plants its bug), not the
+    // lowering's (`entries::places`), which no owner is asked for.
+    let places: Vec<_> = super::owners(&db, def).into_iter().map(|(at, _)| at).collect();
+    assert_eq!(places.len(), 3, "the body, its closure and its `async` block: {places:?}");
+    for (n, &at) in places.iter().enumerate() {
+        if places[..n].contains(&at) {
+            return Err(format!("two owners of `owners` at {at:?}"));
+        }
+        let found = place_of(&db, def, mir_schema(&db, def, at));
+        if found != Some(at) {
+            return Err(format!("the owner at {at:?} is found at {found:?} by its schema"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn each_owner_of_a_body_has_its_own_place_and_schema() {
+    owners_apart().unwrap();
+}
+
+/// Closures where the body's inference types them and where it does not: nested, in an inline
+/// `const` block (inferred inside the body), in an array length (a body of its own), an
+/// `async` closure, and an `async fn`, whose body is an `async` block. The array length is in a
+/// type annotation: its anonymous constant's inference is merged into the body's, so the
+/// body's inference types `g` (at a place inside the constant, which `owners` leaves out),
+/// and nothing evaluates it. A repeat count (`[0u8; { .. }]`) would be evaluated during
+/// inference (`infer_array_repeat_expr`, through MIR), and this crate's test build has no MIR
+/// (`coroutine_witness_tests`' `no_build`).
+const PLACES: &str = r#"
+//- minicore: sized, copy, fn, future, async_fn
+//- /main.rs crate:main deps:core new_source_root:local
+pub fn places() -> u32 {
+    let outer = |x: u32| { let inner = move || x; inner() };
+    let k = const { let f = || 3u32; 4u32 };
+    let _a: [u8; { let g = || 5usize; 6 }];
+    let c = async |y: u32| y;
+    let _ = c;
+    outer(k)
+}
+pub async fn later(n: u32) -> u32 { let h = |m: u32| m; h(n) }
+"#;
+
+/// The invariant `entries::places` states: the places the body's lowering gives, with no
+/// inference, are those of the MIR owners its inference gives (`owners`), in order. The
+/// control: a lowering that takes an array length's closure for the body's own (the walk with
+/// no anonymous constant left out) gives a place no owner is at, and the two lists differ.
+///
+/// To move: inferring `places` evaluates the array length `{ let g = || 5usize; 6 }`, and a
+/// const evaluation builds MIR, which this crate's test binary cannot (it registers only the
+/// coroutine-witness `Mir` table, whose `no_build` is `unreachable!`). It belongs with
+/// hir-ty-mir's tests; every item it uses but `owners` is public (`body_store::lowering`,
+/// `Lowered`, `Closure`; `entries::run_mir` checks the same equality for a place there).
+/// Fails here until it is moved; what it claims is still true.
+#[test]
+fn the_lowering_gives_the_places_the_inference_does() {
+    use crate::body_store::lowering;
+    let db = db_of(PLACES);
+    for name in ["places", "later"] {
+        let def = function(&db, name);
+        let owned: Vec<_> = super::owners(&db, def).into_iter().map(|(at, _)| at).collect();
+        let lowered: Vec<_> = lowering(&db, def).places().collect();
+        assert_eq!(lowered, owned, "`{name}`: the lowering's places and the inference's");
+        assert!(owned.len() > 1, "`{name}` has closures: {owned:?}");
+        // The control: every closure taken as the body's own.
+        let every_own: Vec<_, std::alloc::Global> = lowering(&db, def)
+            .closures
+            .iter()
+            .map(|it| crate::body_store::Closure { own: true, ..*it })
+            .collect();
+        let every: Vec<_> = crate::body_store::Lowered { closures: &every_own, ..lowering(&db, def) }
+        .places()
+        .collect();
+        if name == "places" {
+            assert_ne!(every, owned, "the array length's closure taken for the body's went unseen");
+        }
+    }
+}
+
+/// The control: owners all filed at one place ([`ONE_PLACE`]) share it, and the oracle finds
+/// them.
+#[test]
+fn the_oracle_catches_owners_filed_at_one_place() {
+    ONE_PLACE.with(|it| it.set(true));
+    let caught = owners_apart();
+    ONE_PLACE.with(|it| it.set(false));
+    assert!(caught.is_err(), "the planted bug went unseen");
 }

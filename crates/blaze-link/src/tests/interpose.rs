@@ -218,6 +218,42 @@ fn an_executable_exports_what_its_shared_libraries_name() {
     assert_interposed(&Linked::of(&file));
 }
 
+/// `--export-dynamic-symbol` patterns export what they match of the executable's names, an
+/// object's and Rust's, though no library names them and nothing in the image calls them:
+/// code made at run time finds them by `dlsym` (evm2-jit's `__revmc_builtin_*`). A hidden
+/// name a pattern matches stays out, as does a name none matches. The control is
+/// `an_executable_exports_what_its_shared_libraries_name`, where the same inputs linked with
+/// no pattern export neither `only_ours` nor `rust_only`.
+#[test]
+fn an_executable_exports_what_its_export_dynamic_symbol_patterns_match() {
+    let (object, libc, rust) = (allocator(), libc(), rust());
+    let mut out = output(false);
+    out.link.export_dynamic = vec!["only_*".to_owned(), "rust_onl?".to_owned(), "calloc".to_owned()];
+    let link = || {
+        // clone: the test's two links of one output
+        let mut image = Image::new(name(TO), out.clone()).unwrap();
+        let mut disk = Disk::default();
+        disk.link(&mut image, first(&rust, natives(&object, 101, &libc))).unwrap();
+        contents(disk.file(TO))
+    };
+    let (a, b) = (link(), link());
+    assert!(a == b, "two links of the same inputs differ");
+    let mut file = super::Sparse::default();
+    file.write(0, &a);
+    let linked = Linked::of(&file);
+    let (addr, size, kind, weak) = found(&linked, "only_ours").expect("`only_ours` is exported");
+    assert_eq!(code(&linked, addr), returns(15), "`only_ours` is the object's");
+    assert_eq!((size, kind, weak), (6, elf::STT_FUNC, false));
+    let (addr, _, kind, _) = found(&linked, "rust_only").expect("`rust_only` is exported");
+    assert_eq!(code(&linked, addr), returns(17), "`rust_only` is Rust's");
+    assert_eq!(kind, elf::STT_FUNC);
+    for name in ["_start", "calloc"] {
+        assert!(!dynamic(&linked, name), "`{name}` is in `.dynsym`");
+    }
+    // What the libraries name is exported as without the patterns.
+    assert!(found(&linked, "malloc").is_some() && found(&linked, "realloc").is_some());
+}
+
 /// A name hidden by any object that mentions it is hidden (ELF takes the most constraining
 /// visibility), and is not exported though its definition is default.
 #[test]

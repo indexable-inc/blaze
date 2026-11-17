@@ -1,5 +1,4 @@
-use hegel::generators as gs;
-use hegel::{Generator, PrintableGenerator, TestCase};
+use blaze_sim::{Config, Tape};
 
 use super::*;
 
@@ -386,96 +385,104 @@ fn an_exactly_sized_vector_never_grows() {
 }
 
 /// A value of every length: `bits` random bits, so short encodings are drawn as often as long.
-fn sized() -> impl PrintableGenerator<u64> {
-    gs::tuples!(gs::integers::<u32>().max_value(64), gs::integers::<u64>()).map(|(bits, value)| {
-        match bits {
-            64 => value,
-            bits => value & ((1 << bits) - 1),
-        }
-    })
+fn sized(tape: &Tape) -> u64 {
+    let bits: u32 = tape.int_in(0..=64, "bits");
+    let value: u64 = tape.int("value");
+    match bits {
+        64 => value,
+        bits => value & ((1 << bits) - 1),
+    }
 }
 
-#[hegel::test]
-fn writes_match_the_reference(tc: TestCase) {
-    let value = tc.draw(sized());
-    let sign = tc.draw(gs::booleans());
-    let lead: usize = tc.draw(gs::integers().max_value(11));
-    let signed = if sign { !value as i64 } else { value as i64 };
-    let mut ours = vec![0xaa; lead];
-    let mut theirs = vec![0xaa; lead];
-    write_u64(&mut ours, value);
-    reference::uleb(&mut theirs, value);
-    assert_eq!(&ours, &theirs);
-    assert_eq!(len_u64(value), ours.len() - lead);
-    write_i64(&mut ours, signed);
-    reference::sleb(&mut theirs, signed);
-    assert_eq!(&ours, &theirs);
-    assert_eq!(len_i64(signed), ours.len() - lead - len_u64(value));
-    let mut place = [0; MAX_LEN];
-    let len = put_i64(&mut place, signed);
-    assert_eq!(&place[..len], &theirs[lead + len_u64(value)..]);
+#[test]
+fn writes_match_the_reference() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let value = sized(tape);
+        let sign = tape.bool("sign");
+        let lead: usize = tape.int_in(0..=11, "lead");
+        let signed = if sign { !value as i64 } else { value as i64 };
+        let mut ours = vec![0xaa; lead];
+        let mut theirs = vec![0xaa; lead];
+        write_u64(&mut ours, value);
+        reference::uleb(&mut theirs, value);
+        assert_eq!(&ours, &theirs);
+        assert_eq!(len_u64(value), ours.len() - lead);
+        write_i64(&mut ours, signed);
+        reference::sleb(&mut theirs, signed);
+        assert_eq!(&ours, &theirs);
+        assert_eq!(len_i64(signed), ours.len() - lead - len_u64(value));
+        let mut place = [0; MAX_LEN];
+        let len = put_i64(&mut place, signed);
+        assert_eq!(&place[..len], &theirs[lead + len_u64(value)..]);
+    });
 }
 
-#[hegel::test]
-fn reads_match_the_reference(tc: TestCase) {
-    let bytes: Vec<u8> = tc.draw(gs::binary().max_size(23));
-    let at: usize = tc.draw(gs::integers().max_value(3));
-    let reads = |read: &dyn Fn(&mut usize) -> Option<i128>| {
-        let mut at = at;
-        (read(&mut at), at)
-    };
-    let ours = reads(&|at| read_u64(&bytes, at).ok().map(i128::from));
-    let theirs = reads(&|at| reference::read_uleb(&bytes, at).map(i128::from));
-    assert_eq!(ours, theirs);
-    let ours = reads(&|at| read_i64(&bytes, at).ok().map(i128::from));
-    let theirs = reads(&|at| reference::read_sleb(&bytes, at).map(i128::from));
-    assert_eq!(ours, theirs);
-    let ours = reads(&|at| read_u32(&bytes, at).ok().map(i128::from));
-    let theirs = reads(&|at| reference::read_unsigned(&bytes, at, 32).map(i128::from));
-    assert_eq!(ours, theirs);
-    let ours = reads(&|at| read_i32(&bytes, at).ok().map(i128::from));
-    let theirs = reads(&|at| reference::read_signed(&bytes, at, 32).map(i128::from));
-    assert_eq!(ours, theirs);
-    let ours = reads(&|at| skip(&bytes, at).ok().map(|()| 0));
-    let theirs = reads(&|at| reference::skip(&bytes, at).map(|()| 0));
-    assert_eq!(ours, theirs);
-}
-
-#[hegel::test]
-fn written_values_read_back(tc: TestCase) {
-    let value = tc.draw(sized());
-    let sign = tc.draw(gs::booleans());
-    let tail: Vec<u8> = tc.draw(gs::binary().max_size(9));
-    let signed = if sign { !value as i64 } else { value as i64 };
-    let mut bytes = Vec::new();
-    write_u64(&mut bytes, value);
-    write_i64(&mut bytes, signed);
-    bytes.extend_from_slice(&tail);
-    let mut at = 0;
-    assert_eq!(read_u64(&bytes, &mut at), Ok(value));
-    assert_eq!(read_i64(&bytes, &mut at), Ok(signed));
-    assert_eq!(at, bytes.len() - tail.len());
-}
-
-#[hegel::test]
-fn padded_matches_the_reference(tc: TestCase) {
-    let value: i32 = tc.draw(gs::integers());
-    let len: usize = tc.draw(gs::integers().min_value(1).max_value(MAX_LEN));
-    let wide: i64 = tc.draw(gs::integers());
-    assert_eq!(padded_u32(value as u32), reference::padded(i64::from(value as u32), false));
-    assert_eq!(padded_i32(value), reference::padded(value.into(), true));
-    let (mut ours, mut theirs) = ([0; MAX_LEN], [0; MAX_LEN]);
-    let fits = len_i64(wide) <= len;
-    assert_eq!(put_padded_i64(&mut ours[..len], wide).is_ok(), fits);
-    if fits {
-        reference::put_padded(&mut theirs[..len], wide);
+#[test]
+fn reads_match_the_reference() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let bytes: Vec<u8> = tape.bytes(0..=23, "bytes");
+        let at: usize = tape.int_in(0..=3, "at");
+        let reads = |read: &dyn Fn(&mut usize) -> Option<i128>| {
+            let mut at = at;
+            (read(&mut at), at)
+        };
+        let ours = reads(&|at| read_u64(&bytes, at).ok().map(i128::from));
+        let theirs = reads(&|at| reference::read_uleb(&bytes, at).map(i128::from));
         assert_eq!(ours, theirs);
-        assert_eq!(read_i64(&ours[..len], &mut 0), Ok(wide));
-    }
-    let wide = wide as u64;
-    let fits = len_u64(wide) <= len;
-    assert_eq!(put_padded_u64(&mut ours[..len], wide).is_ok(), fits);
-    if fits {
-        assert_eq!(read_u64(&ours[..len], &mut 0), Ok(wide));
-    }
+        let ours = reads(&|at| read_i64(&bytes, at).ok().map(i128::from));
+        let theirs = reads(&|at| reference::read_sleb(&bytes, at).map(i128::from));
+        assert_eq!(ours, theirs);
+        let ours = reads(&|at| read_u32(&bytes, at).ok().map(i128::from));
+        let theirs = reads(&|at| reference::read_unsigned(&bytes, at, 32).map(i128::from));
+        assert_eq!(ours, theirs);
+        let ours = reads(&|at| read_i32(&bytes, at).ok().map(i128::from));
+        let theirs = reads(&|at| reference::read_signed(&bytes, at, 32).map(i128::from));
+        assert_eq!(ours, theirs);
+        let ours = reads(&|at| skip(&bytes, at).ok().map(|()| 0));
+        let theirs = reads(&|at| reference::skip(&bytes, at).map(|()| 0));
+        assert_eq!(ours, theirs);
+    });
+}
+
+#[test]
+fn written_values_read_back() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let value = sized(tape);
+        let sign = tape.bool("sign");
+        let tail: Vec<u8> = tape.bytes(0..=9, "tail");
+        let signed = if sign { !value as i64 } else { value as i64 };
+        let mut bytes = Vec::new();
+        write_u64(&mut bytes, value);
+        write_i64(&mut bytes, signed);
+        bytes.extend_from_slice(&tail);
+        let mut at = 0;
+        assert_eq!(read_u64(&bytes, &mut at), Ok(value));
+        assert_eq!(read_i64(&bytes, &mut at), Ok(signed));
+        assert_eq!(at, bytes.len() - tail.len());
+    });
+}
+
+#[test]
+fn padded_matches_the_reference() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let value: i32 = tape.int("value");
+        let len: usize = tape.int_in(1..=MAX_LEN, "len");
+        let wide: i64 = tape.int("wide");
+        assert_eq!(padded_u32(value as u32), reference::padded(i64::from(value as u32), false));
+        assert_eq!(padded_i32(value), reference::padded(value.into(), true));
+        let (mut ours, mut theirs) = ([0; MAX_LEN], [0; MAX_LEN]);
+        let fits = len_i64(wide) <= len;
+        assert_eq!(put_padded_i64(&mut ours[..len], wide).is_ok(), fits);
+        if fits {
+            reference::put_padded(&mut theirs[..len], wide);
+            assert_eq!(ours, theirs);
+            assert_eq!(read_i64(&ours[..len], &mut 0), Ok(wide));
+        }
+        let wide = wide as u64;
+        let fits = len_u64(wide) <= len;
+        assert_eq!(put_padded_u64(&mut ours[..len], wide).is_ok(), fits);
+        if fits {
+            assert_eq!(read_u64(&ours[..len], &mut 0), Ok(wide));
+        }
+    });
 }

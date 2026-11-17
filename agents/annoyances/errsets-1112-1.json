@@ -1,0 +1,19 @@
+{
+ "id": "errsets-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane errsets-1112",
+ "where": "crates/parser, error unions (E3)",
+ "what": "On origin/main 136432aa02 two tests of the feature were red: syntax's union_types_parse_only_under_the_extension and hir-ty's question_mark_widens_a_member_or_a_subset. `Result<(), A | B>` was a syntax error (\"expected R_ANGLE\"): generic_arg parses a name-first argument itself and never went on to the union's `|`. The form the feature exists for did not parse, three days after it landed.",
+ "cost": "30 minutes to find; the feature was unusable in a Result since 2026-11-09",
+ "cause": "the tests were written with the feature and not run on the merged tree",
+ "whys": [
+  "the change was merged with its own tests red",
+  "merges are admin merges without CI for some lanes",
+  "no gate runs the front-end crates' cargo tests on main"
+ ],
+ "class": "a test that is red on main and nobody is told",
+ "prevention": "the green head of rule fan-out-write-only covers check-compiling only; a nightly run of cargo test -p for the front-end crates with a baseline of known failures that may only shrink; not built",
+ "workaround": "",
+ "fix": "73f282a02b (branch bstd-error-sets)",
+ "state": "fixed: 73f282a02b"
+}

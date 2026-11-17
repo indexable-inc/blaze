@@ -1,6 +1,7 @@
 # rustc's `rustc_abi`, as it is at the toolchain in `harness/toolchain` (nightly-2026-10-25,
 # rustc 1.101.0-nightly 12433c307 2026-10-24): `src` is `compiler/rustc_abi/src` of
-# rust-lang/rust at commit 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0, unchanged. It takes the
+# rust-lang/rust at commit 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0, unchanged but for blaze's four lines at the top of
+# `src/lib.rs` (its `#![blaze::trust(unsafe, ..)]`, kept by harness/toolchain_bump.py). It takes the
 # place of the crates.io `ra-ap-rustc_abi`, whose snapshots are of no stable release.
 [package]
 name = "rustc_abi"

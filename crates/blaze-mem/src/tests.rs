@@ -1322,6 +1322,42 @@ fn frame_task_leaves_at_most_the_warm_shelf_however_much_it_held() {
     .expect("the task's thread");
 }
 
+/// An idle daemon's ask reaches each thread once: a thread that kept frames warm gives them
+/// back as it next settles ([`frame::settle_spare`], what a pool worker does as it parks) and
+/// not again until asked again, and what it warms after is kept until the next ask. On threads
+/// of their own; the ask is the process's, so each thread is held only to what it does after an
+/// ask it saw. The cause, tested by removing it: without the ask, `settle_spare` trims nothing
+/// and the shelf stays warm (the first assertion after `warm`).
+#[test]
+fn a_thread_gives_its_warm_frames_back_once_an_idle_daemon_asked() {
+    fn warm() -> usize {
+        frame::task(Tag::Codegen, |frame| {
+            for _ in 0..64 {
+                frame.alloc_slice_fill_with(100 << 10, |i| i as u8);
+            }
+        });
+        frame::spare_bytes()
+    }
+    thread::spawn(|| {
+        // Whatever was asked before this thread began is answered with nothing warm.
+        frame::settle_spare();
+        assert!(warm() > 0, "a task leaves its thread's shelf warm");
+        // Another test's ask may land between any two lines here: settle until this thread
+        // has answered every ask so far, then warm again and see no trim without an ask.
+        while frame::settle_spare() {}
+        let kept = warm();
+        assert!(kept > 0);
+        if !frame::settle_spare() {
+            assert_eq!(frame::spare_bytes(), kept, "nobody asked: the shelf stays warm");
+        }
+        frame::ask_spare_trim();
+        assert!(frame::settle_spare(), "an ask this thread has not answered");
+        assert_eq!(frame::spare_bytes(), 0, "the asked thread keeps nothing warm");
+    })
+    .join()
+    .expect("the thread");
+}
+
 /// A task of a build-shaped run: scratch of a drawn size (a few KB, a few MB or tens of MB),
 /// read back, with up to `depth` tasks inside it that run while it still holds its own.
 /// Returns the most one task of it asked for.
@@ -1648,103 +1684,6 @@ fn frame_measure_counts_inner_tasks_on_top_of_outer_and_allocates_nothing() {
     );
     let ((), none) = frame::measure(|| ());
     assert_eq!(none, 0);
-}
-
-#[test]
-fn frame_cap_waits_past_its_limit_until_bytes_come_back() {
-    let (cap, _spills) = frame::Cap::new(100, 100);
-    let held = cap.reserve(80).expect("fits");
-    let waiter = thread::spawn(move || cap.reserve(40).map(|grant| grant.bytes()));
-    while cap.waiting() == 0 {
-        thread::yield_now();
-    }
-    assert_eq!(cap.held(), 80);
-    drop(held);
-    assert_eq!(waiter.join().expect("the waiter"), Ok(40));
-    assert_eq!(cap.held(), 0, "a grant gives its bytes back when it drops");
-}
-
-#[test]
-fn frame_cap_cancels_the_newest_wait_when_every_holder_waits() {
-    let (cap, _spills) = frame::Cap::new(100, 100);
-    let mine = cap.reserve(60).expect("fits");
-    let (go, ready) = crossbeam_channel::unbounded();
-    let older = thread::spawn(move || {
-        let first = cap.reserve(30).expect("fits");
-        go.send(()).expect("the test waits for it");
-        let more = cap.reserve(30).map(|grant| grant.bytes());
-        (first.bytes(), more)
-    });
-    ready.recv().expect("the older thread holds its bytes");
-    while cap.waiting() == 0 {
-        thread::yield_now();
-    }
-    assert_eq!(
-        cap.reserve(50).map(|grant| grant.bytes()),
-        Err(frame::Cancelled),
-        "with every holder waiting, the newest wait is cancelled"
-    );
-    drop(mine);
-    assert_eq!(older.join().expect("the older waiter"), (30, Ok(30)), "the older wait goes on");
-}
-
-#[test]
-fn frame_cancel_unwinds_its_task_and_says_so_until_the_outermost_task_ends() {
-    frame::task(Tag::Infer, |_| {
-        let unwound = std::panic::catch_unwind(|| frame::task(Tag::Mir, |_| frame::cancel()));
-        let payload = unwound.expect_err("a cancel unwinds");
-        assert!(payload.is::<frame::Cancelled>(), "its payload is `Cancelled`");
-        assert!(frame::cancelling(), "still inside the outer task");
-    });
-    assert!(!frame::cancelling(), "the outermost task has ended");
-}
-
-#[test]
-#[should_panic(expected = "frame::cancel outside any frame::task")]
-fn frame_cancel_outside_any_task_stops() {
-    frame::cancel();
-}
-
-#[test]
-fn frame_cap_says_each_pass_of_spill_at() {
-    let (cap, spills) = frame::Cap::new(1000, 500);
-    let a = cap.reserve(600).expect("fits");
-    let b = cap.reserve(100).expect("fits");
-    assert_eq!(spills.ready().collect::<Vec<_>>(), [100], "one pass, with the bytes over it");
-    drop((a, b));
-    let c = cap.reserve(700).expect("fits");
-    assert_eq!(spills.ready().collect::<Vec<_>>(), [200], "passed again after falling under it");
-    drop(c);
-}
-
-#[test]
-#[should_panic(expected = "a reserve of 200 bytes, more than the cap of 100")]
-fn frame_cap_stops_on_a_reserve_past_its_whole_limit() {
-    let (cap, _spills) = frame::Cap::new(100, 100);
-    _ = cap.reserve(200);
-}
-
-#[test]
-fn frame_task_past_the_thread_shelf_reserves_from_the_cap() {
-    // Every test's task frames reserve from it while it is set, so it never makes one wait.
-    let (cap, _spills) = frame::Cap::new(1 << 50, 1 << 50);
-    let capped = thread::spawn(move || {
-        frame::set_cap(Some(cap));
-        frame::task(Tag::Codegen, |frame| {
-            let big = frame.alloc_slice_fill_with(8 << 20, |i| i as u8);
-            assert!(frame::capped() >= 8 << 20, "a span's pages are reserved from the cap");
-            assert!(cap.held() >= 8 << 20);
-            assert_eq!(big[12_345], 12_345usize as u8);
-        });
-        let left = frame::capped();
-        frame::set_cap(None);
-        left
-    });
-    assert_eq!(
-        capped.join().expect("the capped task"),
-        0,
-        "a span on the shelf holds none of the cap"
-    );
 }
 
 #[test]
@@ -2768,14 +2707,14 @@ fn scratch_lent_buffers_return_to_the_shelf_of_the_thread_that_drops_them() {
 #[test]
 fn scratch_paths_are_lent_empty_and_kept_warm() {
     scratch::with_path(|path| {
-        path.push("/tmp");
+        path.push("/scratch");
         path.push("blaze");
         assert!(path.ends_with("blaze"));
     });
     let (_, used) = measure(|| {
         scratch::with_path(|path| {
             assert!(path.as_os_str().is_empty());
-            path.push("/tmp");
+            path.push("/scratch");
             path.push("blaze");
         })
     });
@@ -2898,16 +2837,16 @@ fn format_in_writes_into_the_allocator_it_is_given_and_allocates_nothing_global_
     let work = || {
         frame::task(Tag::Other, |frame| {
             let before = frame.used();
-            let unit = crate::format_in!(frame, "{}-{:03}", "unit", 7);
+            let unit = format_in!(frame, "{}-{:03}", "unit", 7);
             assert_eq!(unit, "unit-007");
             assert!(
                 frame.contains(unit.as_ptr()) && frame.used() > before,
                 "the text is the frame's"
             );
-            let plain = crate::format_in!(frame, "no arguments");
+            let plain = format_in!(frame, "no arguments");
             assert_eq!(plain, "no arguments");
             let name = "syn";
-            assert_eq!(crate::format_in!(frame, "{name}@{}", 2), "syn@2");
+            assert_eq!(format_in!(frame, "{name}@{}", 2), "syn@2");
             unit.len()
         })
     };

@@ -28,19 +28,23 @@ rustc_apfloat.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 smallvec.workspace = true
+# The body lints' sweep is a span (`lints::bodies::sweep`): how many bodies were asked and in how
+# many a lint was found.
+tracing.workspace = true
 unicode-ident.workspace = true
 unicode-normalization.workspace = true
 unicode-security.workspace = true
 
 base-db.workspace = true
-blaze-api.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
 blaze-lint-defs.workspace = true
 blaze-mem.workspace = true
+blaze-memo.workspace = true
 blaze-phf.workspace = true
-blaze-query.workspace = true
+# Messages written with `say!`, whose parts are typed (`blaze_report::say`).
+blaze-report.workspace = true
 cfg.workspace = true
 hir.workspace = true
 hir-def.workspace = true
@@ -60,7 +64,7 @@ tt.workspace = true
 [dev-dependencies]
 blaze-core.workspace = true
 blaze-alloc-count.workspace = true
-hegeltest.workspace = true
+blaze-sim.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 
 [lints]

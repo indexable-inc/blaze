@@ -1,0 +1,14 @@
+{
+ "id": "record-counts-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane record-counts",
+ "where": "crates/blaze-kernel/src/store.rs (`Looking`, `Keeping`), crates/hir-def/src/deps/filed.rs (`Slots`)",
+ "what": "`blaze_record::Store` now has to give a `Tally` (the one count of lookups, hits, read-lists read and reads valued), and three of its implementors are handles made for one call over a store somebody else owns: nothing that lives as long as a build holds the kernel's store, so the kernel's tally is a process static (`store::LOOKUPS`, read with `blaze_kernel::take_lookups`), and hir-def's is handed in by each caller (`find_by_reads`' `lookups`).",
+ "cost": "the kernel's counts are a process's, not a kernel's or a build's: two kernels in one process (its tests) count into one, and nothing in a build reports them yet, since no build drives the kernel's lookup",
+ "cause": "the kernel takes its store as an argument of each call (`&G`, `&mut P`) and has no object for a store over a build; lane kernel-api was rewriting `lib.rs` and `nest.rs` while this was written, so the count could not be threaded through `find_key` and `keep`",
+ "class": "a statistic with no owner: a count kept beside a handle that does not outlive the call",
+ "prevention": "`Store::tally` has no default, so a new store handle has to say where its lookups are counted",
+ "workaround": "the static",
+ "fix": "when the kernel's API settles, the object that owns a build's store (`nest.rs`'s `Engine` or its door) owns the `Tally`, per step where it is cheap, and the driver says it as a `record lookups` event with `store = \"kernel\"`",
+ "state": "open, for lane kernel-api: written on int-1112, not compiled or run by this lane (write-only)"
+}

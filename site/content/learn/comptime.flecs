@@ -1,0 +1,112 @@
+// Lesson: compile-time reflection, blaze's gate `blaze_comptime` (docs/v2/plan/design/comptime.md; API in
+// library/core/src/reflect.rs). Every example is adapted from a passing test:
+//   hash_fields          crates/hir-ty-mir/src/tests/mir/comptime_parity.rs  a_for_const_hash_feeds_the_hasher_what_derive_hash_does
+//   reflected (Debug)    crates/hir-ty-mir/src/tests/mir/comptime.rs         a_for_const_debug_prints_what_the_hand_written_one_does
+//   if const             crates/hir-ty-mir/src/tests/mir/comptime.rs         an_if_const_dead_arm_is_never_evaluated
+//   encode / Bad         crates/hir-ty/src/tests/comptime_solver.rs          encode_of_a_struct_with_a_field_lacking_the_bound_names_the_field
+//   by_dyn               crates/hir-ty-mir/src/tests/consteval/comptime.rs   a_dyn_call_in_const_is_checked_when_evaluated
+//   (the fn-pointer case, a_fn_pointer_call_in_const_is_checked_when_evaluated, failed on 2026-11-12: not taught)
+//   const static PAUSE   crates/hir-ty-mir/src/tests/consteval/comptime.rs   a_const_static_block_formats_and_leaks, ..._may_not_do_io
+// Not built (say so, nothing more): fn_info's answer (intrinsic `blaze_fn_info` has no evaluator arm), field filters,
+// moving out of `x.[f]`, building enum variants, `type_of!` (phase 3, design only).
+site {
+  learn {
+    comptime : Page {
+      Narrow
+      // Order 7, like extensions: the path tie-breaks on the name, so this comes right after const_exprs.
+      Lesson: {7, "Write a function once, and let it loop over any struct's fields at compile time.", "inline"}
+      (InTheme, themes.beyond)
+      (Requires, site.learn.const_exprs)
+      Title: {"Compile-time reflection"}
+      Description: {"blaze's opt-in `blaze_comptime` extension: `for const` loops over a struct's fields, checked once, unrolled per type."}
+
+      Step idea("One function, every struct") {
+        P why("Today, code that walks a struct's fields is a derive macro: a program that writes more code. blaze lets you write it as a plain generic function.")
+        Code hash(lang: "rust", text: `#![feature(blaze_comptime)]
+
+        fn hash_fields<T, H: Hasher>(t: &T, state: &mut H)
+        where for<F: Field<T>> F::Type: Hash \{
+            for const f in fields_of::<T>() \{
+                Hash::hash(&t.[f], state);
+            }
+        }`)
+        Dim same("It feeds the hasher exactly what `#[derive(Hash)]` does.")
+      }
+
+      Step loop("The loop and the field") {
+        Code show(lang: "rust", text: `for const f in fields_of::<T>() \{
+            put(f.name());
+            put(": ");
+            Show::show(&t.[f]);
+        }`)
+        P unroll("`for const` is unrolled once per field, in declaration order. `t.[f]` is the field `f` names, with that field's own type.")
+        Dim out("For `S \{ a: 7, b: true }` it prints what a hand-written `Debug` does: `S \{ a: 7, b: true }`.")
+      }
+
+      Step once("Checked once, not per type") {
+        Code bound(lang: "rust", text: `fn encode<T: Struct>(_: &T)
+        where for<F: Field<T>> F::Type: Encode \{}
+
+        pub struct Bad \{ pub a: u8, pub n: NoEncode, pub c: bool }
+        encode(&Bad \{ .. }); // error: field \`n\``)
+        P rule("The bound reads \"for every field `F` of `T`\". The body is type-checked once against it. A caller whose struct breaks it is refused at the call, naming the field.")
+      }
+
+      Step once_q("Check: where is the error?") {
+        Quiz q(prompt: "`encode` needs every field to be `Encode`. `Bad`'s field `n` isn't. What does blaze report?") {
+          Choice inside("An error inside `encode`'s loop, once it is unrolled for `Bad`.", "The body was already checked against the bound. Nothing fails after unrolling.")
+          Choice call("An error at the call `encode(&Bad \{ .. })`, naming field `n`.", "Right. The bound is checked at the call, field by field, and the first field that fails is named.") {
+            Right
+          }
+          Choice none("Nothing: `n` is skipped.", "No field is skipped quietly. A field that breaks the bound is an error.")
+        }
+      }
+
+      Step prune("`if const` per field") {
+        Code guard(lang: "rust", text: `for const f in fields_of::<T>() \{
+            if const \{ before(f, 2) } \{
+                Show::show(&t.[f]);
+            } else \{
+                const \{ panic!("never evaluated") };
+            }
+        }`)
+        P dead("In each copy of the loop the condition is a constant, so the arm it rules out is removed before anything evaluates it.")
+      }
+
+      Step calls("`dyn` calls in const") {
+        Code by_dyn(lang: "rust", text: `const fn by_dyn(x: &dyn Get) -> u8 \{ x.get() }
+
+        const A: u8 = by_dyn(&Seven); // const impl: 7
+        const B: u8 = by_dyn(&Eight); // error: Eight's \`get\``)
+        P eval("With the feature, a `dyn` call in a `const fn` is checked when it runs, against the method it reaches. A plain impl's method is refused, and the error names it.")
+      }
+
+      Step block("Run anything at compile time") {
+        Code pause(lang: "rust", text: `const SYM: &str = "spin";
+        const PAUSE: &str = const static \{
+            let args = [Arg \{ value: SYM, fmt: display },
+                        Arg \{ value: SYM, fmt: display }];
+            format([".globl ", "\\n", ":\\npause\\nret\\n"], args).leak()
+        };`)
+        P what("A `const static` block runs ordinary code: the heap, `dyn`, function pointers, non-const functions. Here `PAUSE` is `.globl spin`, `spin:`, `pause`, `ret`.")
+        Dim fenced("I/O and reading a pointer's address are refused, naming the call, so the result can't depend on the machine.")
+      }
+
+      Step block_q("Check: what may it do?") {
+        Quiz q(prompt: "Which of these does a `const static` block refuse?") {
+          Choice heap("Growing a buffer on the heap, then `leak()`ing it as a `&'static str`.", "That's allowed: the leaked text becomes part of the constant.")
+          Choice io("Calling `write` to print a byte.", "Right. I/O would make the constant depend on the machine, so the call is refused, naming `write`.") {
+            Right
+          }
+          Choice dyn_call("Calling a non-const method through `dyn Write`.", "That's allowed: inside `const static` nothing is const-checked.")
+        }
+      }
+
+      Step status("Where it stands") {
+        P now("Experimental: written and tested inside blaze. A crate without `#![feature(blaze_comptime)]` is unchanged, and the new forms are refused there, naming the feature.")
+        Dim later("Not built yet: `fn_info`, field filters, moving out of `x.[f]`, building enum variants, and types made by const code (`type_of!`).")
+        Dim design("Design: [comptime.md](https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/design/comptime.md).")
+      }
+    }
+  }
+}

@@ -1,0 +1,12 @@
+# hello on bstd (crates/blaze-std), which only blaze builds; shaped as harness/v2/smoke/edition.
+# versus.py rewrites the path below to `<tree>/crates/blaze-std` in its copy.
+[package]
+name = "bstd-hello"
+version = "0.1.0"
+edition = "blaze-2026.11"
+
+[dependencies]
+bstd = { package = "blaze-std", path = "../../../../crates/blaze-std" }
+
+# Its own workspace, wherever the harness copies it.
+[workspace]

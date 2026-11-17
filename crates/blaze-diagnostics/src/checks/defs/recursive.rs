@@ -442,7 +442,7 @@ fn all_params_in_repr(
 }
 
 /// rustc's `def_span` of an ADT: from where it starts to the end of its name or generics.
-fn def_span(cx: &Cx<'_, '_>, adt: hir::Adt) -> Option<Span> {
+pub(super) fn def_span(cx: &Cx<'_, '_>, adt: hir::Adt) -> Option<Span> {
     let source = cx.vsema.source(adt)?;
     let node = source.value;
     let start = item_range(node.syntax()).start();

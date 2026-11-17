@@ -1,0 +1,11 @@
+{
+ "id": "disk-2",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+ "where": "blaze-profile: the mapping's reservation on macOS",
+ "what": "`F_PREALLOCATE` asked with `F_ALLOCATECONTIG` alone succeeds with whatever contiguous run it found: a 3.4 MiB ask came back with 20 KiB reserved and no error, so the mapping's promise (no SIGBUS on a full disk) held only because the 516 MiB ask happened to fail and fall through to `F_ALLOCATEALL`.",
+ "cost": "found only because the new test's oracle checks the blocks the file holds",
+ "cause": "the code never read `fst_bytesalloc`",
+ "workaround": "none needed",
+ "state": "fixed in 31664bef18: all or nothing, and the bytes given are checked"
+}

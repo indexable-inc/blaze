@@ -7,7 +7,6 @@
 use std::{cell::RefCell, fmt::Write, sync::Arc};
 
 use blaze_hash::HashMap;
-use blaze_query::db::FromId;
 use hir_def::{
     AdtId, AssocItemId, CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup, ModuleDefId,
     StaticId, TraitId, expr_store::Body, item_scope::ItemScope, nameres::crate_def_map,

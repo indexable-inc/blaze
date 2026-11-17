@@ -1576,6 +1576,7 @@ fn delta<'a>(
         binds: &[],
         same_names,
         same_regions: true,
+        same_places: true,
         written,
         from,
     }
@@ -1657,9 +1658,9 @@ fn a_relink_patches_the_symbol_table_as_a_full_build_writes_it() {
     let before = nlist(&cached);
     assert!(before.is_some());
 
-    // The helper moves and is renamed to a name of the same length.
+    // The helper moves under its name: its entry is patched where it is.
+    let name = parts.functions[1].name.clone().unwrap();
     parts.functions[1].addr = TEXT + 6;
-    parts.functions[1].name = Some("_ZN5hello6helper17hfedcba9876543210E".into());
     let splices = [Splice { old: 1..2, new: 1..2 }];
     let since = delta(1, true, &[], &splices);
     let slices = parts.slices();
@@ -1671,20 +1672,27 @@ fn a_relink_patches_the_symbol_table_as_a_full_build_writes_it() {
     let read = read(&file);
     let names: Vec<(String, u64)> =
         symbols(&file, &read).into_iter().map(|it| (it.0, it.4)).collect();
-    assert!(names.contains(&("__ZN5hello6helper17hfedcba9876543210E".to_owned(), TEXT + 6)));
+    assert!(names.contains(&(format!("_{name}"), TEXT + 6)), "{names:?}");
 
-    // A name of another length is built again, and still a full build's bytes.
-    parts.functions[1].name = Some("_ZN5hello5other17hfedcba9876543210E".into());
+    // Renamed, to a name of the same length too: the locals are ordered by name
+    // (`crate::model::local_order`), so the table is built again, and still a full build's.
+    parts.functions[1].name = Some("_ZN5hello6helper17hfedcba9876543210E".into());
     let since = delta(2, true, &[], &splices);
     let slices = parts.slices();
     let third = Placed { synthesis: 3, delta: Some(&since), ..parts.placed(&slices) };
     let file = written(&cached, &third);
-    assert_ne!(nlist(&cached), before);
+    assert_ne!(nlist(&cached), before, "a renamed function's table is built");
+    assert_eq!(file, written(&super::writer(&parts.output).unwrap(), &parts.placed(&slices)));
+    parts.functions[1].name = Some("_ZN5hello5other17hfedcba9876543210E".into());
+    let since = delta(3, true, &[], &splices);
+    let slices = parts.slices();
+    let third = Placed { synthesis: 4, delta: Some(&since), ..parts.placed(&slices) };
+    let file = written(&cached, &third);
     assert_eq!(file, written(&super::writer(&parts.output).unwrap(), &parts.placed(&slices)));
 
     // A delta from a link the writer didn't keep (a rollback) patches nothing.
     let since = delta(1, true, &[], &[]);
-    let fourth = Placed { synthesis: 4, delta: Some(&since), ..parts.placed(&slices) };
+    let fourth = Placed { synthesis: 5, delta: Some(&since), ..parts.placed(&slices) };
     assert_eq!(
         written(&cached, &fourth),
         written(&super::writer(&parts.output).unwrap(), &parts.placed(&slices))

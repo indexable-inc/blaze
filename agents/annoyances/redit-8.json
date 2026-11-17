@@ -1,0 +1,11 @@
+{
+ "id": "redit-8",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+ "where": "my own method: `/root/bin/latest`",
+ "what": "The run scripts read the blaze to use from one file, `/root/bin/latest`, at each step: installing a newer blaze while a cold-build-then-edit chain ran would have run the edit under another binary and home. Caught before it happened.",
+ "cost": "none; one check",
+ "cause": "a shared mutable pointer between a build lane and a measuring chain",
+ "workaround": "pinned `latest` until the chain ended; a chain should take its binary as an argument",
+ "state": "fixed in my scripts"
+}

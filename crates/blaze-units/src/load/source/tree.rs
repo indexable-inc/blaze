@@ -1,7 +1,10 @@
 //! Packages found in a tree of files: a git checkout as cargo 1.99's `GitSource` finds them
 //! (`RecursivePathSource::read_packages` in `src/sources/path.rs`), a `directory` source as its
 //! `DirectorySource` does (`src/sources/directory.rs`). Copied from v1's
-//! `crates/blaze-registry/src/{git,directory}.rs`, every read through the view's mounts.
+//! `crates/blaze-registry/src/{git,directory}.rs`, every read through the mounts of the
+//! configuration the workspace is read with ([`ConfigOf`]): the view's for a workspace of the
+//! view, its own for one keyed by nothing of the view (the standard library's, whose vendored
+//! directory source is under its library mount and no mount of the view's).
 
 use std::collections::BTreeMap;
 
@@ -13,7 +16,8 @@ use semver::Version;
 use serde::Deserialize;
 use std::alloc::Global;
 
-use crate::load::files::{Found, normal_text as normalize, read_dir, read_file};
+use crate::load::config::ConfigOf;
+use crate::load::files::{Found, normal_text as normalize};
 
 /// A package of a checkout: its name, its version, and its directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,17 +41,18 @@ struct Walk {
 /// the others (`first_package`).
 pub(crate) fn checkout_package(
     cx: &mut Cx<'_>,
+    config: &ConfigOf,
     root: &str,
     id: PackageId,
 ) -> Result<anyhow::Result<String>, Cancelled> {
     let mut walk = Walk::default();
-    if let Err(error) = walk_dir(cx, root, root, &mut walk)? {
+    if let Err(error) = walk_dir(cx, config, root, root, &mut walk)? {
         return Ok(Err(error));
     }
     if walk.packages.is_empty() {
         return Ok(Err(match walk.errors.pop() {
             Some(error) => error,
-            None => match read_file(cx, &format!("{root}/cargo.toml"))? {
+            None => match config.read_file(cx, &format!("{root}/cargo.toml"))? {
                 Found::Here(_) => anyhow!(
                     "Could not find Cargo.toml in `{root}`, but found cargo.toml please try to \
                      rename it to Cargo.toml"
@@ -74,6 +79,7 @@ fn is_here<T>(found: &Found<T>) -> bool {
 /// root, and `target` beside a manifest, are not looked in.
 fn walk_dir(
     cx: &mut Cx<'_>,
+    config: &ConfigOf,
     root: &str,
     dir: &str,
     walk: &mut Walk,
@@ -83,26 +89,26 @@ fn walk_dir(
             return Ok(Ok(()));
         }
         let git = format!("{dir}/.git");
-        if is_here(&read_file(cx, &git)?) || is_here(&read_dir(cx, &git)?) {
+        if is_here(&config.read_file(cx, &git)?) || is_here(&config.read_dir(cx, &git)?) {
             return Ok(Ok(()));
         }
     }
     if base_name(dir) == "target"
         && let Some((parent, _)) = dir.rsplit_once('/')
-        && is_here(&read_file(cx, &format!("{parent}/Cargo.toml"))?)
+        && is_here(&config.read_file(cx, &format!("{parent}/Cargo.toml"))?)
     {
         return Ok(Ok(()));
     }
-    if is_here(&read_file(cx, &format!("{dir}/Cargo.toml"))?) {
-        read_nested(cx, root, dir, walk)?;
+    if is_here(&config.read_file(cx, &format!("{dir}/Cargo.toml"))?) {
+        read_nested(cx, config, root, dir, walk)?;
     }
-    let names = match read_dir(cx, dir)? {
+    let names = match config.read_dir(cx, dir)? {
         Found::Here(names) => names,
         Found::Absent => return Ok(Ok(())),
         Found::Unmounted => return Ok(Err(anyhow!("`{dir}` is under no mount of the view"))),
     };
     for (name, is_dir) in names {
-        if is_dir && let Err(error) = walk_dir(cx, root, &format!("{dir}/{name}"), walk)? {
+        if is_dir && let Err(error) = walk_dir(cx, config, root, &format!("{dir}/{name}"), walk)? {
             return Ok(Err(error));
         }
     }
@@ -115,12 +121,18 @@ fn base_name(path: &str) -> &str {
 
 /// cargo's `read_nested_packages`: the package of `dir` and of each `path` dependency it names,
 /// once each. A manifest that does not read is skipped, as cargo skips one in a git source.
-fn read_nested(cx: &mut Cx<'_>, root: &str, dir: &str, walk: &mut Walk) -> Result<(), Cancelled> {
+fn read_nested(
+    cx: &mut Cx<'_>,
+    config: &ConfigOf,
+    root: &str,
+    dir: &str,
+    walk: &mut Walk,
+) -> Result<(), Cancelled> {
     if !walk.visited.insert(dir.to_owned()) {
         return Ok(());
     }
     let manifest_path = format!("{dir}/Cargo.toml");
-    let manifest = match read_table(cx, &manifest_path)? {
+    let manifest = match read_table(cx, config, &manifest_path)? {
         Ok(Some(manifest)) => manifest,
         Ok(None) => {
             walk.errors.push(anyhow!("failed to read `{manifest_path}`"));
@@ -138,7 +150,7 @@ fn read_nested(cx: &mut Cx<'_>, root: &str, dir: &str, walk: &mut Walk) -> Resul
         walk.errors.push(anyhow!("failed to parse manifest at `{manifest_path}`"));
         return Ok(());
     };
-    let workspace = match workspace_root(cx, root, dir, package)? {
+    let workspace = match workspace_root(cx, config, root, dir, package)? {
         Ok(workspace) => workspace,
         Err(error) => {
             walk.errors.push(error);
@@ -164,7 +176,7 @@ fn read_nested(cx: &mut Cx<'_>, root: &str, dir: &str, walk: &mut Walk) -> Resul
     };
     walk.packages.push(Package { name: name.to_owned(), version, dir: dir.to_owned() });
     for path in nested_paths(&manifest, dir, workspace.as_ref()) {
-        read_nested(cx, root, &path, walk)?;
+        read_nested(cx, config, root, &path, walk)?;
     }
     Ok(())
 }
@@ -172,9 +184,10 @@ fn read_nested(cx: &mut Cx<'_>, root: &str, dir: &str, walk: &mut Walk) -> Resul
 /// A TOML file: `None` when there is none.
 fn read_table(
     cx: &mut Cx<'_>,
+    config: &ConfigOf,
     path: &str,
 ) -> Result<anyhow::Result<Option<toml::Table>>, Cancelled> {
-    Ok(match read_file(cx, path)? {
+    Ok(match config.read_file(cx, path)? {
         Found::Here(bytes) => match String::from_utf8(bytes) {
             Ok(text) => match toml::from_str::<toml::Table>(&text) {
                 Ok(table) => Ok(Some(table)),
@@ -193,13 +206,14 @@ fn read_table(
 /// `root` (cargo's `find_workspace_root`, which a checkout's root bounds).
 fn workspace_root(
     cx: &mut Cx<'_>,
+    config: &ConfigOf,
     root: &str,
     dir: &str,
     package: &toml::Table,
 ) -> Result<anyhow::Result<Option<(String, toml::Table)>>, Cancelled> {
     if let Some(explicit) = package.get("workspace").and_then(toml::Value::as_str) {
         let at = normalize(&format!("{dir}/{explicit}"));
-        return Ok(match read_table(cx, &format!("{at}/Cargo.toml"))? {
+        return Ok(match read_table(cx, config, &format!("{at}/Cargo.toml"))? {
             Ok(Some(table)) => Ok(Some((at, table))),
             Ok(None) => Err(anyhow!("failed to read `{at}/Cargo.toml`")),
             Err(error) => Err(error),
@@ -207,7 +221,7 @@ fn workspace_root(
     }
     let mut at = dir.to_owned();
     loop {
-        match read_table(cx, &format!("{at}/Cargo.toml"))? {
+        match read_table(cx, config, &format!("{at}/Cargo.toml"))? {
             Ok(Some(table)) if table.contains_key("workspace") => return Ok(Ok(Some((at, table)))),
             Ok(_) => {}
             Err(error) if at != dir => return Ok(Err(error)),
@@ -285,12 +299,13 @@ struct Vendored {
 /// names (`checksum`). `source` is how cargo names the directory source in its messages.
 pub(crate) fn vendored_package(
     cx: &mut Cx<'_>,
+    config: &ConfigOf,
     root: &str,
     source: &str,
     id: PackageId,
     checksum: Option<&str>,
 ) -> Result<anyhow::Result<String>, Cancelled> {
-    let names = match read_dir(cx, root)? {
+    let names = match config.read_dir(cx, root)? {
         Found::Here(names) => names,
         Found::Absent => {
             return Ok(Err(anyhow!("No such file or directory (os error 2)")
@@ -299,7 +314,7 @@ pub(crate) fn vendored_package(
         Found::Unmounted => {
             return Ok(Err(anyhow!(
                 "blaze reads the directory source `{root}` in place, and it is under no mount of \
-                 the view"
+                 the workspace's configuration"
             )));
         }
     };
@@ -309,7 +324,7 @@ pub(crate) fn vendored_package(
             continue;
         }
         let dir = format!("{root}/{name}");
-        match read_vendored(cx, &dir)? {
+        match read_vendored(cx, config, &dir)? {
             Ok(Some(package)) => packages.push(package),
             Ok(None) => {}
             Err(error) => return Ok(Err(error)),
@@ -347,7 +362,7 @@ pub(crate) fn vendored_package(
         }
         _ => {}
     }
-    if let Err(error) = verify(cx, found)? {
+    if let Err(error) = verify(cx, config, found)? {
         return Ok(Err(error));
     }
     Ok(Ok(format!("{}/Cargo.toml", found.dir)))
@@ -356,10 +371,11 @@ pub(crate) fn vendored_package(
 /// A subdirectory of a directory source: a package when it has a `Cargo.toml`.
 fn read_vendored(
     cx: &mut Cx<'_>,
+    config: &ConfigOf,
     dir: &str,
 ) -> Result<anyhow::Result<Option<Vendored>>, Cancelled> {
     let manifest_path = format!("{dir}/Cargo.toml");
-    let manifest = match read_table(cx, &manifest_path)? {
+    let manifest = match read_table(cx, config, &manifest_path)? {
         Ok(Some(manifest)) => manifest,
         Ok(None) => return Ok(Ok(None)),
         Err(error) => return Ok(Err(error)),
@@ -389,7 +405,7 @@ fn read_vendored(
     };
     let name = name.to_owned();
     let checksum_path = format!("{dir}/.cargo-checksum.json");
-    let text = match read_file(cx, &checksum_path)? {
+    let text = match config.read_file(cx, &checksum_path)? {
         Found::Here(bytes) => bytes,
         _ => {
             return Ok(Err(anyhow!("failed to read `{checksum_path}`").context(format!(
@@ -409,10 +425,14 @@ fn read_vendored(
 }
 
 /// cargo's `DirectorySource::verify`: every file listed has the sha256 listed.
-fn verify(cx: &mut Cx<'_>, package: &Vendored) -> Result<anyhow::Result<()>, Cancelled> {
+fn verify(
+    cx: &mut Cx<'_>,
+    config: &ConfigOf,
+    package: &Vendored,
+) -> Result<anyhow::Result<()>, Cancelled> {
     for (file, expected) in &package.checksums.files {
         let path = format!("{}/{file}", package.dir);
-        let Found::Here(bytes) = read_file(cx, &path)? else {
+        let Found::Here(bytes) = config.read_file(cx, &path)? else {
             return Ok(Err(anyhow!("No such file or directory (os error 2)")
                 .context(format!("failed to calculate checksum of: {path}"))));
         };

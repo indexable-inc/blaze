@@ -1,7 +1,7 @@
 use std::alloc::Global;
 use std::{collections::HashMap, sync::Arc};
 
-use base_db::{Crate, Db, Env};
+use base_db::{Crate, CrateKey, Db, Env};
 use blaze_format::Aligned;
 use blaze_ids::ContentId;
 use hir_def::deps::{self as deps, ImageBuf, ImageStore};
@@ -289,6 +289,10 @@ fn an_empty_outcome_reads_without_allocating() {
     assert_eq!(empty.len(), HEADER + 2);
     let flags = flags(&["--cap-lints", "allow"]);
     let inputs = inputs(&flags);
+    // What a process does once before its first hash (the hash backend's start-up,
+    // `blake3_servil::initialize`, and the domain's context key) is not a read's: under a test
+    // runner that gives each test a process of its own it would land in the measurement.
+    let _ = key(ContentId([1; 32]), &inputs);
     let read =
         blaze_alloc_count::assert_at_most(0, "an empty outcome read and its key made", || {
             let _ = key(ContentId([1; 32]), &inputs);
@@ -312,12 +316,8 @@ fn checked_with(
     let fx = fixture::db(fixture);
     let files = fx.files().to_vec();
     let mut db = fx.into_db();
-    if !vars.is_empty() {
-        base_db::set_process_env(
-            &mut db,
-            Env::from_iter(vars.iter().map(|&(name, value)| (name.into(), value.into()))),
-        );
-    }
+    // The files' names by their stable `FileId`s, taken before the commit of `vars`: `files`
+    // are interned ids of this snapshot, dead once a commit drops their arena.
     let names: HashMap<FileId, String> = files
         .iter()
         .zip(
@@ -328,7 +328,8 @@ fn checked_with(
         )
         .map(|(file, path)| (file.file_id(&db), format!("{dir}/{path}")))
         .collect();
-    let diags = blaze_query::db::attach(&db, || {
+    set_process_env(&mut db, vars);
+    let diags = blaze_memo::attach(&db, || {
         let lib = hir::Crate::from(crate_named(&db, "lib"));
         crate::check::check_crate(&db, lib, Files::new(&names, root), &Options::default())
     });
@@ -410,16 +411,67 @@ impl ImageStore for Memory {
     fn reads_now(&self, _: &Env, _: &[u8]) -> Result<ContentId, String> {
         Err("the fixture's crates read nothing".to_owned())
     }
+
+    // dyn: `ImageStore::pages`'s signature, once per crate read from pages
+    fn pages(&self, key: &ContentId) -> Result<Option<std::sync::Arc<dyn hir_def::deps::PageSource>>, String> {
+        // A test's store holds each value whole: no part of one is read alone.
+        Ok(hir_def::deps::whole_pages(self.get(key)?, std::alloc::Global))
+    }
+
+    // dyn: `ImageStore::for_each`'s signature, one call per batch of crates
+    fn for_each(&self, count: usize, task: &(dyn Fn(usize) + Sync)) {
+        // A test's store runs a batch in order on its own thread: the same result.
+        (0..count).for_each(task);
+    }
+}
+
+/// `db` in a process with the variables `vars`, set in a commit of their own: none when `vars`
+/// is empty.
+fn set_process_env(db: &mut Db, vars: &[(&str, &str)]) {
+    if vars.is_empty() {
+        return;
+    }
+    let env = Env::from_iter(vars.iter().map(|&(name, value)| (name.into(), value.into())));
+    let mut edit = db.edit();
+    edit.set_process_env(env);
+    _ = edit.commit();
 }
 
 /// `core`'s and `lib`'s images made and kept in `store` from `db`, with the keys they are filed
-/// under.
+/// under. The store is cold, so the serve finds nothing to give and `db` commits nothing: the
+/// store reads the snapshot the serve did.
 fn imaged(db: &mut Db, store: &Memory) -> (ContentId, ContentId) {
     let all = base_db::all_crates(db).to_vec();
-    let served = deps::serve(db, &all, BUILD, store, deps::Mode::Serve).unwrap();
-    assert!(served.hits.is_empty());
-    let stored = deps::store(db, &served, store).unwrap();
-    (stored.filed[&crate_named(db, "core")], stored.filed[&crate_named(db, "lib")])
+    let (served, found) = deps::serve(db, &all, BUILD, store, deps::Mode::Serve).unwrap();
+    assert!(served.hits.is_empty() && found.is_empty());
+    let stored = deps::store(db, &served, store, deps::Which::Sealed).unwrap();
+    (stored.filed[&crate_named(db, "core").key(db)], stored.filed[&crate_named(db, "lib").key(db)])
+}
+
+/// The stable id a test's driver gives `krate`'s slots under: of its name, which a fixture
+/// gives each crate once.
+fn stable_id(db: &Db, krate: Crate) -> ContentId {
+    ContentId::of("blaze-diagnostics test crate", krate.named(db).to_string().as_bytes())
+}
+
+/// The driver's serve of every crate of `db` from `store`: `hir_def::deps::serve` over this
+/// snapshot, then the next one committed with each image found given to its crate
+/// (`deps::give_image`). The keys of the crates read from an image: the commit drops the arenas
+/// of the crates given one, so every crate id taken before it is to be taken again.
+fn serve_images(db: &mut Db, store: &Memory) -> Vec<CrateKey> {
+    let all = base_db::all_crates(db).to_vec();
+    let (served, found) = deps::serve(db, &all, BUILD, store, deps::Mode::Serve).unwrap();
+    // The serve's hits are stable keys already.
+    let hits: Vec<CrateKey> = served.hits.iter().copied().collect();
+    let given: Vec<(Crate, ContentId, deps::Image)> = (found.into_iter())
+        .map(|(krate, image)| (krate, stable_id(db, krate), image))
+        .collect();
+    let mut edit = db.edit();
+    for (krate, krate_id, image) in given {
+        deps::give_image(&mut edit, krate, krate_id, image);
+    }
+    _ = edit.commit();
+    hits
 }
 
 /// A second database of `fixture`, its images served from `store`.
@@ -427,15 +479,9 @@ fn served_db(fixture: &str, vars: &[(&str, &str)], store: &Memory) -> Db {
     let fx = fixture::db(fixture);
     let _ = fx.files().to_vec();
     let mut db = fx.into_db();
-    if !vars.is_empty() {
-        base_db::set_process_env(
-            &mut db,
-            Env::from_iter(vars.iter().map(|&(name, value)| (name.into(), value.into()))),
-        );
-    }
-    let all = base_db::all_crates(&db).to_vec();
-    let images = deps::serve(&mut db, &all, BUILD, store, deps::Mode::Serve).unwrap();
-    assert!(images.hits.contains(&crate_named(&db, "lib")));
+    set_process_env(&mut db, vars);
+    let hits = serve_images(&mut db, store);
+    assert!(hits.contains(&crate_named(&db, "lib").key(&db)));
     db
 }
 
@@ -457,7 +503,8 @@ fn a_served_dependency_reads_its_outcome_and_bodies_in_a_second_database() {
     let kept = super::store(&db, &checked, &Served::default(), root, &store).unwrap();
     assert!(kept.refused.is_empty(), "{:?}", kept.refused);
     assert_eq!(kept.keys.len(), 2);
-    assert_ne!(kept.keys[&lib], kept.keys[&core]);
+    let (core_key, lib_key) = (core.key(&db), lib.key(&db));
+    assert_ne!(kept.keys[&lib_key], kept.keys[&core_key]);
     // Kept again, the same bytes: a key names one value.
     let again = super::store(&db, &checked, &Served::default(), root, &store).unwrap();
     assert_eq!(again.keys, kept.keys);
@@ -466,44 +513,56 @@ fn a_served_dependency_reads_its_outcome_and_bodies_in_a_second_database() {
     assert_eq!(alone.refused, [(lib, Refused::Dependency { name: "core".to_owned() })]);
     assert!(alone.keys.is_empty());
 
-    // A second database serves both, under the same check keys.
+    // A second database serves both, under the same check keys. A serve that gives bodies
+    // commits, so each crate's id is taken again after every serve; its key holds.
     let mut second = served_db(FIXTURE, &[], &store);
-    let (core2, lib2) = (crate_named(&second, "core"), crate_named(&second, "lib"));
-    assert_eq!(image_key(&second, lib2), Some(lib_image));
-    let checks = fresh(&mut second, &[(lib2, inputs), (core2, inputs)], &store);
+    let core2 = crate_named(&second, "core").key(&second);
+    let lib2 = crate_named(&second, "lib").key(&second);
+    assert_eq!(image_key(&second, second.krate(lib2)), Some(lib_image));
+    let both = asked(&second, &[lib2, core2], inputs);
+    let checks = fresh(&mut second, &both, &store);
     assert!(checks.has(lib2) && checks.has(core2));
-    assert_eq!((checks.keys[&lib2], checks.keys[&core2]), (kept.keys[&lib], kept.keys[&core]));
-    let outcome = read(&second, &checks, lib2, root).unwrap().unwrap();
+    assert_eq!(
+        (checks.keys[&lib2], checks.keys[&core2]),
+        (kept.keys[&lib_key], kept.keys[&core_key])
+    );
+    let outcome = read(&second, &checks, second.krate(lib2), root).unwrap().unwrap();
     assert_eq!(outcome, Outcome::new(diags.clone(), false));
 
     // `lib` asked without `core`: no check key for its dependency, so a miss.
-    let alone = fresh(&mut second, &[(lib2, inputs)], &store);
+    let lib_alone = asked(&second, &[lib2], inputs);
+    let alone = fresh(&mut second, &lib_alone, &store);
     assert!(!alone.has(lib2) && alone.keys.is_empty());
 
     // Served a crate at a time: `lib` asked after `core` is keyed by what `core` was found under,
     // and `core` keeps what it had.
     let mut stepped = Served::default();
-    serve(&mut second, &[(core2, inputs)], &store, &mut stepped).unwrap();
+    let core_alone = asked(&second, &[core2], inputs);
+    serve(&mut second, &core_alone, &store, &mut stepped).unwrap();
     assert!(stepped.has(core2) && !stepped.has(lib2));
-    serve(&mut second, &[(lib2, inputs)], &store, &mut stepped).unwrap();
+    let lib_alone = asked(&second, &[lib2], inputs);
+    serve(&mut second, &lib_alone, &store, &mut stepped).unwrap();
     assert!(stepped.has(core2) && stepped.has(lib2));
     assert_eq!(stepped.keys, checks.keys);
     // Asked again under the same keys: the same, without a lookup.
-    serve(&mut second, &[(lib2, inputs), (core2, inputs)], &store, &mut stepped).unwrap();
+    let both = asked(&second, &[lib2, core2], inputs);
+    serve(&mut second, &both, &store, &mut stepped).unwrap();
     assert_eq!(stepped.keys, checks.keys);
     assert_eq!(
-        read(&second, &stepped, lib2, root).unwrap().unwrap(),
+        read(&second, &stepped, second.krate(lib2), root).unwrap().unwrap(),
         Outcome::new(diags.clone(), false)
     );
 
     // Other lint flags: the same check keys and bodies, another outcome key, the crate checked.
     let other = self::flags(&["--cap-lints", "warn"]);
     let other = self::inputs(&other);
-    let missed = fresh(&mut second, &[(lib2, other), (core2, other)], &store);
-    assert_eq!(missed.keys[&lib2], kept.keys[&lib]);
-    assert!(!missed.has(lib2) && read(&second, &missed, lib2, root).is_none());
+    let both = asked(&second, &[lib2, core2], other);
+    let missed = fresh(&mut second, &both, &store);
+    assert_eq!(missed.keys[&lib2], kept.keys[&lib_key]);
+    assert!(!missed.has(lib2) && read(&second, &missed, second.krate(lib2), root).is_none());
     // The same crates asked again under the other flags lose their outcomes, keep their bodies.
-    serve(&mut second, &[(lib2, other), (core2, other)], &store, &mut stepped).unwrap();
+    let both = asked(&second, &[lib2, core2], other);
+    serve(&mut second, &both, &store, &mut stepped).unwrap();
     assert!(!stepped.has(lib2) && !stepped.has(core2));
     assert_eq!(stepped.keys, checks.keys);
 
@@ -563,14 +622,11 @@ fn a_bodys_process_variable_files_the_outcome_by_its_value() {
         let fx = fixture::db(READING);
         let _ = fx.files().to_vec();
         let mut db = fx.into_db();
-        base_db::set_process_env(
-            &mut db,
-            Env::from_iter([("BLAZE_CHECK_CACHE_TEST".into(), value.into())]),
-        );
-        let all = base_db::all_crates(&db).to_vec();
-        deps::serve(&mut db, &all, BUILD, &store, deps::Mode::Serve).unwrap();
+        set_process_env(&mut db, &[("BLAZE_CHECK_CACHE_TEST", value)]);
+        _ = serve_images(&mut db, &store);
         let (core, lib) = (crate_named(&db, "core"), crate_named(&db, "lib"));
-        fresh(&mut db, &[(core, inputs), (lib, inputs)], &store).has(lib)
+        let lib_key = lib.key(&db);
+        fresh(&mut db, &[(core, inputs), (lib, inputs)], &store).has(lib_key)
     };
     assert!(served_with("1"));
     assert!(!served_with("2"));
@@ -593,13 +649,19 @@ fn a_bodies_part_under_its_key_that_does_not_open_is_an_error() {
         items_broken: false,
     }];
     let kept = super::store(&first, &core, &Served::default(), "/w", &store).unwrap();
-    let core_key = kept.keys[&core[0].krate];
+    let core_key = kept.keys[&core[0].krate.key(&first)];
     // `lib` reads nothing, so its part is under its key itself.
     store.put(bodies_key(lib_image, &[core_key], inputs.borrowck), b"not a part".to_vec()).unwrap();
     let mut db = served_db(FIXTURE, &[], &store);
     let asked = [(crate_named(&db, "core"), inputs), (crate_named(&db, "lib"), inputs)];
     let error = serve(&mut db, &asked, &store, &mut Served::default()).err().unwrap();
     assert!(error.contains("crate lib") && error.contains("do not read"), "{error}");
+}
+
+/// The crates `keys` names in the snapshot `db` holds now, each checked with `inputs`: what a
+/// [`serve`] is asked, taken again after every commit.
+fn asked<'a>(db: &Db, keys: &[CrateKey], inputs: Inputs<'a>) -> Vec<(Crate, Inputs<'a>)> {
+    keys.iter().map(|&key| (db.krate(key), inputs)).collect()
 }
 
 /// What [`serve`] finds of `crates` asked first.
@@ -681,14 +743,16 @@ fn header_bytes(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-#[hegel::test]
-fn any_bytes_read_as_before_the_cursor(tc: hegel::TestCase) {
-    let mut bytes = tc.draw(hegel::generators::binary().max_size(23));
-    let magic = tc.draw(hegel::generators::booleans());
-    if magic && bytes.len() >= 4 {
-        bytes[..4].copy_from_slice(&MAGIC);
-    }
-    assert_eq!(header(&bytes), header_reference(&bytes));
+#[test]
+fn any_bytes_read_as_before_the_cursor() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+        let mut bytes = tape.bytes(0..=23, "bytes");
+        let magic = tape.bool("magic");
+        if magic && bytes.len() >= 4 {
+            bytes[..4].copy_from_slice(&MAGIC);
+        }
+        assert_eq!(header(&bytes), header_reference(&bytes));
+    });
 }
 
 /// The copy of `absolute` this file had before it called hir-def's.
@@ -724,8 +788,15 @@ fn a_path_is_absolute_as_the_old_copy_said() {
     }
 }
 
-#[hegel::test]
-fn any_path_is_absolute_as_the_old_copy_said(tc: hegel::TestCase) {
-    let path = tc.draw(hegel::generators::from_regex("[/\\\\a-zA-Z0-9:._~é$]{0,6}"));
-    assert_eq!(hir_def::deps::absolute(&path), absolute_reference(&path));
+/// Paths of up to six characters, each a slash, a backslash, an ASCII letter or digit, or one of
+/// `:._~é$`.
+const PATH_CHARACTERS: &str =
+    "/\\abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:._~é$";
+
+#[test]
+fn any_path_is_absolute_as_the_old_copy_said() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+        let path = tape.text_from(PATH_CHARACTERS, 0..=6, "path");
+        assert_eq!(hir_def::deps::absolute(&path), absolute_reference(&path));
+    });
 }

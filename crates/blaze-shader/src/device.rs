@@ -47,7 +47,7 @@ pub struct DeviceBuild {
 /// front end's own values (a MIR terminator, a projection, a lowering error) is their `Debug`,
 /// made while `db` is attached so that it can read it.
 pub fn device_msl(db: &Db, krate: Crate) -> Result<DeviceBuild, Error> {
-    blaze_query::db::attach(db, || build(db, krate))
+    blaze_memo::attach(db, || build(db, krate))
 }
 
 fn build(db: &Db, krate: Crate) -> Result<DeviceBuild, Error> {

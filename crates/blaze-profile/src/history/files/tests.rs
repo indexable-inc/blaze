@@ -1,5 +1,5 @@
 //! The history's files core under blaze-core's simulator (`testing` skill, dst-not-review): one
-//! Hegel test draws flushes, build ends, crashes at any completion, crashes during the reopen,
+//! property test draws flushes, build ends, crashes at any completion, crashes during the reopen,
 //! crash records, and a swarm of fault classes (failed effects, a full disk, failing syncs,
 //! another writer holding the manifest's lock), runs the real core against [`Sim`], and after
 //! every crash and reopen checks one invariant: every row ever handed to the history is, exactly
@@ -19,18 +19,18 @@
 //! - A table's file that fails to place keeps its rows for the next flush, re-marked in the
 //!   recorder as that flush's, as the daemon does (history.rs keeps a failed table's rows).
 //!
-//! Replay: a control or [`replay_one_seed`] names a seed of [`plan_of`]; the Hegel test prints
-//! its whole plan, the simulator's seed in it.
+//! Replay: a failure prints its least tape and the line that replays it; the plan, the
+//! simulator's seed in it, is a note of the report.
 
-use std::{fmt, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, cast::AsArray, types::Int64Type};
 use arrow_schema::{DataType, Field, Schema};
 use blaze_core::{
     Driver,
-    sim::{Faults, Rng, Sim},
+    sim::{Faults, Sim},
 };
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Broke, Config, Tape};
 use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
 
 use super::*;
@@ -53,11 +53,8 @@ const STEP_CAP: u32 = 10_000;
 /// Opens in a row that may fail with an injected error before the history is said not to open.
 const OPEN_TRIES: u32 = 200;
 
-/// Seeds of [`plan_of`] a control searches for one its plant breaks.
-const CONTROL_SEEDS: u64 = 128;
-
-/// The seed [`replay_one_seed`] runs, and its plant: set them to what a failure names.
-const REPLAY: (u64, Plant) = (0, Plant::None);
+/// The cases a control searches for a plan its plant breaks.
+const CONTROL: Config = Config::cases(128);
 
 // --- The plan ------------------------------------------------------------------------------
 
@@ -117,91 +114,58 @@ struct Swarm {
     records: bool,
 }
 
-/// A source of draws: Hegel's (shrunk, replayed by Hegel) or a seed's ([`plan_of`]).
-trait Draw {
-    /// In `lo..=hi`.
-    fn int(&mut self, lo: u64, hi: u64) -> u64;
-
-    fn coin(&mut self) -> bool {
-        self.int(0, 1) == 1
-    }
-
-    fn one_in(&mut self, n: u64) -> bool {
-        self.int(0, n - 1) == 0
-    }
-}
-
-struct Drawn<'a>(&'a TestCase);
-
-impl Draw for Drawn<'_> {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        self.0.draw(gs::integers::<u64>().min_value(lo).max_value(hi))
-    }
-}
-
-impl Draw for Rng {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        match (hi - lo).checked_add(1) {
-            Some(n) => lo + self.below(n),
-            None => self.next_u64(),
-        }
-    }
-}
-
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
     let swarm = Swarm {
-        fail: d.coin(),
-        fill: d.coin(),
-        fail_syncs: d.one_in(4),
-        contend: d.coin(),
-        records: d.coin(),
+        fail: tape.coin("failed effects"),
+        fill: tape.coin("full disks"),
+        fail_syncs: tape.one_in(4, "failing syncs"),
+        contend: tape.coin("contended locks"),
+        records: tape.coin("crash records"),
     };
     let fail_one_in = match swarm.fail {
-        true => d.int(20, 200) as u32,
+        true => tape.int_in(20..=200u32, "fail one in"),
         false => 0,
     };
-    let latency_us = d.int(0, 500);
-    let n = d.int(1, MOST_ACTS);
+    let latency_us = tape.int_in(0..=500u64, "latency us");
+    let n = tape.int_in(1..=MOST_ACTS, "acts");
     // alloc: a plan, once a case
-    let acts = (0..n).map(|_| act(d, &swarm)).collect();
+    let acts = (0..n).map(|_| tape.span("act", |tape| act(tape, &swarm))).collect();
     Plan { seed, fail_one_in, latency_us, acts }
 }
 
-fn act(d: &mut impl Draw, swarm: &Swarm) -> Act {
-    match d.int(0, 9) {
-        0 => Act::Crash(crash_point(d, swarm)),
+fn act(tape: &Tape, swarm: &Swarm) -> Act {
+    // Calm is a flush: a crash with nothing in flight is the act that is not quiet.
+    match tape.int_in(0..=9u8, "act") {
+        9 => Act::Crash(crash_point(tape, swarm)),
         _ => Act::Flush {
-            rows: d.int(0, 5) as u8,
-            end: d.one_in(4),
-            fault: fault(d, swarm),
-            crash: d.one_in(4).then(|| crash_point(d, swarm)),
+            rows: tape.int_in(0..=5u8, "rows"),
+            end: tape.one_in(4, "the build ends"),
+            fault: fault(tape, swarm),
+            crash: tape.one_in(4, "the flush crashes").then(|| crash_point(tape, swarm)),
         },
     }
 }
 
-fn crash_point(d: &mut impl Draw, swarm: &Swarm) -> Crash {
+fn crash_point(tape: &Tape, swarm: &Swarm) -> Crash {
     Crash {
-        at: d.int(0, 63) as u32,
-        record: swarm.records && d.coin(),
-        reopen_at: d.one_in(4).then(|| d.int(0, 63) as u32),
+        at: tape.int_in(0..=63u32, "crash at"),
+        record: swarm.records && tape.coin("leaves a crash record"),
+        reopen_at: tape.one_in(4, "the reopen crashes").then(|| tape.int_in(0..=63u32, "reopen crash at")),
     }
 }
 
-fn fault(d: &mut impl Draw, swarm: &Swarm) -> Fault {
-    match d.int(0, 5) {
-        0 if swarm.fill => Fault::Fill { room: d.int(0, 4096) },
-        1 if swarm.fail_syncs => Fault::FailSyncs,
-        2 if swarm.contend => {
-            Fault::Contend { release_at: d.int(0, 40) as u32, timeout: d.one_in(3) }
-        }
+fn fault(tape: &Tape, swarm: &Swarm) -> Fault {
+    // Calm is no fault: the classes are 1..=3.
+    match tape.int_in(0..=5u8, "fault") {
+        1 if swarm.fill => Fault::Fill { room: tape.int_in(0..=4096u64, "room") },
+        2 if swarm.fail_syncs => Fault::FailSyncs,
+        3 if swarm.contend => Fault::Contend {
+            release_at: tape.int_in(0..=40u32, "release at"),
+            timeout: tape.one_in(3, "the lock wait times out"),
+        },
         _ => Fault::None,
     }
-}
-
-/// The plan seed `seed` makes: what the controls search and [`REPLAY`] replays.
-fn plan_of(seed: u64) -> Plan {
-    plan(&mut Rng::new(seed))
 }
 
 // --- Rows as Parquet ------------------------------------------------------------------------
@@ -417,21 +381,6 @@ impl Host for TestHost {
 enum Driven {
     Done(Outcome),
     Crashed,
-}
-
-/// What broke a run: the oracle (a bug of the core, or a plant), or the test itself.
-enum Broke {
-    Oracle(String),
-    Harness(String),
-}
-
-impl fmt::Display for Broke {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Broke::Oracle(why) => write!(f, "the oracle failed: {why}"),
-            Broke::Harness(why) => write!(f, "the test broke: {why}"),
-        }
-    }
 }
 
 /// Another process holding the manifest's lock while a job runs ([`Fault::Contend`]).
@@ -992,32 +941,20 @@ impl World {
 
 /// The invariant: whatever the faults, wherever the power goes out, every row handed to the
 /// history is listed, handed back or left to read, exactly once, and the history opens.
-#[hegel::test(test_cases = 200)]
-fn every_row_is_in_the_history_once_after_any_crash(tc: TestCase) {
-    let plan = plan(&mut Drawn(&tc));
-    if let Err(broke) = run(&plan, Plant::None) {
-        panic!("{broke}\nreplay: simulator seed {}, plan {plan:?}", plan.seed);
-    }
+#[test]
+fn every_row_is_in_the_history_once_after_any_crash() {
+    blaze_sim::check(Config::cases(200), |tape| {
+        let plan = plan(tape);
+        tape.note(format_args!("plan {plan:?}"));
+        run(&plan, Plant::None)
+    });
 }
 
-/// A plant the oracle must catch in one of [`CONTROL_SEEDS`] seeded plans (test-the-cause on
-/// the test itself): a green DST with a blind oracle proves nothing.
+/// A plant the oracle must catch in one of [`CONTROL`]'s plans (test-the-cause on the test
+/// itself): a green DST with a blind oracle proves nothing. Any of the oracle's findings is the
+/// catch, as before; the test's own trouble fails the control.
 fn control(plant: Plant) {
-    for seed in 0..CONTROL_SEEDS {
-        match run(&plan_of(seed), plant) {
-            Err(Broke::Oracle(why)) => {
-                eprintln!(
-                    "{plant:?} caught at seed {seed} (REPLAY = ({seed}, Plant::{plant:?})): {why}"
-                );
-                return;
-            }
-            Err(broke @ Broke::Harness(_)) => panic!("seed {seed}, {plant:?}: {broke}"),
-            Ok(()) => {}
-        }
-    }
-    panic!(
-        "the oracle caught Plant::{plant:?} at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak"
-    );
+    blaze_sim::control(CONTROL, Plant::None, plant, "", |tape, plant| run(&plan(tape), plant));
 }
 
 #[test]
@@ -1030,7 +967,7 @@ fn the_oracle_catches_what_a_flush_consumed_marked_after_its_commit() {
     control(Plant::MarkAfterCommit);
 }
 
-/// The plan Hegel shrank on 2026-11-04, written out: pid 106's flush of row 5 fails to place
+/// The plan the property test shrank to on 2026-11-04, written out: pid 106's flush of row 5 fails to place
 /// its file (an injected failure), so the row is kept for the next flush; that flush's file
 /// fails to place too, its commit is done, and the power goes out on the next completion,
 /// before the test can re-mark the row as the next flush's. The core used to commit a flush
@@ -1064,11 +1001,683 @@ fn a_row_whose_file_was_not_placed_survives_a_crash_after_that_flush() {
     }
 }
 
-/// One seeded plan, [`REPLAY`]'s: set it to a seed a failure names to run that case alone.
-#[test]
-fn replay_one_seed() {
-    let (seed, plant) = REPLAY;
-    if let Err(broke) = run(&plan_of(seed), plant) {
-        panic!("seed {seed}, Plant::{plant:?}: {broke}");
+// --- The cap --------------------------------------------------------------------------------
+
+/// A listed `spans` file of flush `seq`, named for `named`, holding rows of `builds`.
+fn capped_file(named: u64, seq: u64, builds: Option<[u64; 2]>, bytes: u64) -> Kept {
+    let name = Name { build: named, table: table("spans"), first: seq, last: seq, level: 0 };
+    Kept {
+        name,
+        file: name.file_name(),
+        bytes,
+        entry: Entry { builds, ..entry(10, FIRST_PID) },
+        ours: Ours::Ours,
+        listed: Listed::Listed,
     }
+}
+
+/// The builds the cap must keep whole, worked out apart from the core: every running build and
+/// the `keep` highest of the others at an end of a file's range. A number strictly inside a
+/// range may be no build at all (build ids skip), so it is not counted; a build there is in
+/// one unit with both ends. The simulation below holds the core to the stronger promise, every
+/// build that had rows counted, which this definition implies.
+fn kept_builds_reference(kept: &[Kept], running: &BTreeSet<u64>, keep: usize) -> BTreeSet<u64> {
+    let builds: BTreeSet<u64> = kept.iter().filter_map(builds_of).flatten().collect();
+    let mut held = running.clone();
+    held.extend(builds.iter().rev().filter(|it| !running.contains(*it)).take(keep).copied());
+    held
+}
+
+/// What the cap must hold of the files `gone` of `kept`, or what it broke: no build keeps a
+/// part of its rows, nothing of a kept build goes (every running one and the last `keep`
+/// finished), and the newest flush's file of no build stays.
+fn cap_oracle(
+    kept: &[Kept],
+    gone: &BTreeSet<usize>,
+    running: &BTreeSet<u64>,
+    keep: usize,
+) -> Result<(), String> {
+    let held = kept_builds_reference(kept, running, keep);
+    let builds: BTreeSet<u64> =
+        kept.iter().filter_map(builds_of).flat_map(|[lo, hi]| lo..=hi).collect();
+    for build in builds {
+        let of = |at: &usize| builds_of(&kept[*at]).is_some_and(|[lo, hi]| lo <= build && build <= hi);
+        let holding: Vec<usize> = (0..kept.len()).filter(of).collect();
+        let went = holding.iter().filter(|at| gone.contains(*at)).count();
+        if went != 0 && went != holding.len() {
+            return Err(format!(
+                "build {build} lost {went} of its {} files and kept the rest: {gone:?} of {kept:?}",
+                holding.len()
+            ));
+        }
+        if went != 0 && running.contains(&build) {
+            return Err(format!("build {build} is running and lost its files: {gone:?}"));
+        }
+        if went != 0 && held.contains(&build) {
+            return Err(format!(
+                "build {build} is one of the last {keep} finished and lost its files: {gone:?}"
+            ));
+        }
+    }
+    if let Some(newest) = kept.len().checked_sub(1)
+        && builds_of(&kept[newest]).is_none()
+        && gone.contains(&newest)
+    {
+        return Err(format!("the newest flush's file of no build went: {gone:?}"));
+    }
+    Ok(())
+}
+
+/// What the cap's order promises beyond the kept builds: no unit goes while an older one the
+/// rules let go stays. A unit is the files whose build ranges chain together (a file of no
+/// build alone), as old as its newest flush; units of no build come before units of builds.
+fn oldest_first_oracle(
+    kept: &[Kept],
+    gone: &BTreeSet<usize>,
+    running: &BTreeSet<u64>,
+    keep: usize,
+) -> Result<(), String> {
+    let held = kept_builds_reference(kept, running, keep);
+    // Each file's unit, by the least file in it: files chained by overlapping ranges.
+    let mut unit: Vec<usize> = (0..kept.len()).collect();
+    loop {
+        let mut changed = false;
+        for a in 0..kept.len() {
+            for b in 0..kept.len() {
+                let overlaps = match (builds_of(&kept[a]), builds_of(&kept[b])) {
+                    (Some([lo, hi]), Some([c, d])) => c <= hi && lo <= d,
+                    _ => false,
+                };
+                if overlaps && unit[b] < unit[a] {
+                    unit[a] = unit[b];
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let newest = kept.len().saturating_sub(1);
+    // Each unit: (of a build, its newest flush, went, may go).
+    let mut units: BTreeMap<usize, (bool, u64, bool, bool)> = BTreeMap::new();
+    for (at, it) in kept.iter().enumerate() {
+        let entry = units.entry(unit[at]).or_insert((false, 0, false, true));
+        let builds = builds_of(it);
+        entry.0 |= builds.is_some();
+        entry.1 = entry.1.max(it.name.last);
+        entry.2 |= gone.contains(&at);
+        let kept_build = builds.is_some_and(|[lo, hi]| held.range(lo..=hi).next().is_some());
+        let newest_idle = at == newest && builds.is_none();
+        entry.3 &= !kept_build && !newest_idle;
+    }
+    let order = |it: &(bool, u64, bool, bool)| (it.0, it.1);
+    for (first, a) in &units {
+        for (second, b) in &units {
+            if a.2 && !b.2 && b.3 && order(b) < order(a) {
+                return Err(format!(
+                    "the unit of file {first} went before the older unit of file {second}, which \
+                     the rules let go: {gone:?} of {kept:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The cap as it was until 2026-11-11, the planted bug of [`cap_oracle`]'s control: the unit a
+/// file goes with is the build it is named for alone, whatever builds its rows are of.
+fn past_cap_by_name_alone(kept: &[Kept], total: u64, cap: u64) -> BTreeSet<usize> {
+    let mut gone = BTreeSet::new();
+    let newest = kept.last().map_or(0, |it| it.name.last);
+    let mut units: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+    for it in kept {
+        let unit = units.entry(it.name.build).or_insert((0, 0));
+        unit.0 = unit.0.max(it.name.last);
+        unit.1 += it.bytes;
+    }
+    let mut order: Vec<(u64, u64, u64)> =
+        units.into_iter().map(|(build, (last, bytes))| (last, build, bytes)).collect();
+    order.sort_unstable();
+    let mut left = total;
+    for (last, build, bytes) in order {
+        if left <= cap {
+            break;
+        }
+        if last == newest {
+            continue;
+        }
+        left -= bytes;
+        gone.extend((0..kept.len()).filter(|at| kept[*at].name.build == build));
+    }
+    gone
+}
+
+/// The invariant: past the cap no build loses a part of its rows, a running build and the last
+/// `keep` finished lose none, the newest flush's file of no build stays, and beyond those the
+/// oldest unit goes first, whichever builds ran at once and whatever each flush was named for.
+#[test]
+fn the_cap_retires_whole_builds_and_none_that_runs() {
+    blaze_sim::check(Config::cases(300), cap_retires_whole_builds);
+}
+
+fn cap_retires_whole_builds(tape: &Tape) {
+    let files = tape.int_in(1..=24u64, "files");
+    let mut kept = Vec::new();
+    for seq in 1..=files {
+        // A flush holds rows of builds `lo..=hi` and is named for the highest, or holds none.
+        let builds = match tape.one_in(6, "of no build") {
+            true => None,
+            false => {
+                let lo = tape.int_in(1..=12u64, "first build");
+                Some([lo, lo + tape.int_in(0..=3u64, "more builds")])
+            }
+        };
+        let named = builds.map_or(0, |[_, hi]| hi);
+        kept.push(capped_file(named, seq, builds, tape.int_in(1..=100u64, "bytes")));
+    }
+    let running: BTreeSet<u64> =
+        (0..tape.int_in(0..=3u64, "running builds")).map(|_| tape.int_in(1..=15u64, "running")).collect();
+    let total: u64 = kept.iter().map(|it| it.bytes).sum();
+    let cap = tape.int_in(0..=total, "cap");
+    let keep = usize::from(tape.int_in(0..=3u8, "kept builds"));
+    let gone = past_cap(kept.iter(), total, cap, &running, keep);
+    if let Err(broke) = cap_oracle(&kept, &gone, &running, keep)
+        .and_then(|()| oldest_first_oracle(&kept, &gone, &running, keep))
+    {
+        panic!("{broke}\ncap {cap} of {total}, running {running:?}, keep {keep}");
+    }
+    // What stays is under the cap, or every file left is one the rules keep: a part of a kept
+    // build's unit, or the newest flush's file of no build.
+    let left: u64 = (0..kept.len()).filter(|at| !gone.contains(at)).map(|at| kept[at].bytes).sum();
+    if left > cap {
+        let rest: Vec<usize> = (0..kept.len()).filter(|at| !gone.contains(at)).collect();
+        // Retiring any one more unit breaks a rule: try each file left with every file that
+        // shares a build with it, transitively, and see the oracle refuse it.
+        for at in rest {
+            let mut more = gone.clone();
+            let mut range = builds_of(&kept[at]);
+            more.insert(at);
+            loop {
+                let before = more.len();
+                for (other, it) in kept.iter().enumerate() {
+                    let overlaps = match (range, builds_of(it)) {
+                        (Some([lo, hi]), Some([a, b])) => a <= hi && lo <= b,
+                        _ => false,
+                    };
+                    if overlaps {
+                        more.insert(other);
+                        let [a, b] = builds_of(it).unwrap();
+                        range = range.map(|[lo, hi]| [lo.min(a), hi.max(b)]);
+                    }
+                }
+                if more.len() == before {
+                    break;
+                }
+            }
+            assert!(
+                cap_oracle(&kept, &more, &running, keep).is_err(),
+                "over the cap ({left} of {cap}) with a unit that could go: file {at} of {kept:?}, \
+                 gone {gone:?}, running {running:?}, keep {keep}"
+            );
+        }
+    }
+}
+
+/// What the cap's order promises: a build's file goes only once every file of no build has
+/// gone, the newest flush's aside (which never goes).
+fn no_build_first_oracle(kept: &[Kept], gone: &BTreeSet<usize>) -> Result<(), String> {
+    let Some(build) = gone.iter().find(|at| builds_of(&kept[**at]).is_some()) else { return Ok(()) };
+    let newest = kept.len() - 1;
+    match (0..newest).find(|at| builds_of(&kept[*at]).is_none() && !gone.contains(at)) {
+        Some(idle) => Err(format!(
+            "file {build}, a build's, went while file {idle}, of no build, stays: {gone:?} of {kept:?}"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The invariant: past the cap, rows of no build (a daemon's own between builds) go before
+/// any build's rows do, whatever their ages.
+#[test]
+fn the_cap_retires_rows_of_no_build_before_any_build_s() {
+    blaze_sim::check(Config::cases(300), |tape| {
+        let files = tape.int_in(1..=24u64, "files");
+        let mut kept = Vec::new();
+        for seq in 1..=files {
+            let builds = match tape.coin("of no build") {
+                true => None,
+                false => {
+                    let lo = tape.int_in(1..=12u64, "first build");
+                    Some([lo, lo + tape.int_in(0..=3u64, "more builds")])
+                }
+            };
+            kept.push(capped_file(builds.map_or(0, |[_, hi]| hi), seq, builds, tape.int_in(1..=100u64, "bytes")));
+        }
+        let running: BTreeSet<u64> =
+            (0..tape.int_in(0..=3u64, "running builds")).map(|_| tape.int_in(1..=15u64, "running")).collect();
+        let total: u64 = kept.iter().map(|it| it.bytes).sum();
+        let cap = tape.int_in(0..=total, "cap");
+        let keep = usize::from(tape.int_in(0..=3u8, "kept builds"));
+        let gone = past_cap(kept.iter(), total, cap, &running, keep);
+        if let Err(broke) = no_build_first_oracle(&kept, &gone) {
+            panic!("{broke}\ncap {cap} of {total}, running {running:?}, keep {keep}");
+        }
+        cap_oracle(&kept, &gone, &running, keep).unwrap();
+    });
+}
+
+/// A day of builds, then a daemon left idle: builds 1 and 2, then four flushes of no build.
+/// The cap as it was (age alone) retired the builds and kept the idle rows; the oracle
+/// catches that, and holds for the cap as it is, which retires the idle rows and keeps both
+/// builds.
+#[test]
+fn the_oracle_catches_a_build_retired_while_rows_of_no_build_stay() {
+    let kept = [
+        capped_file(1, 1, Some([1, 1]), 100),
+        capped_file(2, 2, Some([2, 2]), 100),
+        capped_file(0, 3, None, 100),
+        capped_file(0, 4, None, 100),
+        capped_file(0, 5, None, 100),
+        capped_file(0, 6, None, 100),
+    ];
+    // No finished build kept by count: what is tested is the order alone.
+    let none = BTreeSet::new();
+    let planted = past_cap_in(kept.iter(), 600, 400, &none, 0, CapRule::OldestFirst);
+    assert_eq!(planted, BTreeSet::from([0, 1]), "age alone retired both builds");
+    let caught = no_build_first_oracle(&kept, &planted).unwrap_err();
+    assert!(caught.contains("a build's, went while file 2, of no build, stays"), "{caught}");
+
+    let gone = past_cap(kept.iter(), 600, 400, &none, 0);
+    assert_eq!(gone, BTreeSet::from([2, 3]), "the oldest rows of no build go, and no build's");
+    no_build_first_oracle(&kept, &gone).unwrap();
+    cap_oracle(&kept, &gone, &none, 0).unwrap();
+}
+
+/// The 80-minute build of 2026-11-11: build 7 runs for the whole history while builds 8 and 9
+/// run beside it and end. The flushes that held build 8's or 9's rows were named for them,
+/// with build 7's rows inside. The cap as it was retired "build 8" and "build 9" whole, and
+/// with them build 7's rows of those stretches, leaving its last flushes: the oracle catches
+/// that (the control), and holds for the cap as it is, which retires none of them while build
+/// 7 runs and all of them at once after it ended. One finished build is kept by count (build
+/// 10, the last), so builds 7 to 9 are what the cap may take.
+#[test]
+fn a_long_build_keeps_the_rows_it_shares_files_with_shorter_builds_in() {
+    let kept = [
+        capped_file(7, 1, Some([7, 7]), 100),
+        capped_file(8, 2, Some([7, 8]), 100),
+        capped_file(8, 3, Some([7, 8]), 100),
+        capped_file(9, 4, Some([7, 9]), 100),
+        capped_file(7, 5, Some([7, 7]), 100),
+        capped_file(10, 6, Some([10, 10]), 100),
+    ];
+    let total = 600;
+    let cap = 300;
+
+    let planted = past_cap_by_name_alone(&kept, total, cap);
+    assert_eq!(planted, BTreeSet::from([1, 2, 3]), "the old cap retired builds 8 and 9");
+    let running = BTreeSet::from([7]);
+    let caught = cap_oracle(&kept, &planted, &running, 1).unwrap_err();
+    assert!(caught.contains("build 7 lost 3 of its 5 files"), "{caught}");
+
+    // While build 7 runs, nothing of it goes, though the history stays over its cap.
+    let gone = past_cap(kept.iter(), total, cap, &running, 1);
+    assert_eq!(gone, BTreeSet::new());
+    cap_oracle(&kept, &gone, &running, 1).unwrap();
+
+    // Once it ended, builds 7 to 9 are one unit and go together; build 10, the last, stays.
+    let gone = past_cap(kept.iter(), total, cap, &BTreeSet::new(), 1);
+    assert_eq!(gone, BTreeSet::from([0, 1, 2, 3, 4]));
+    cap_oracle(&kept, &gone, &BTreeSet::new(), 1).unwrap();
+
+    // What went is counted for the WARN event that says it; what is left fits, so nothing is
+    // over (the trim fills `over` in; adding files leaves it 0).
+    let mut capped = Capped::default();
+    for at in &gone {
+        capped.add(&kept[*at]);
+    }
+    assert_eq!(capped, Capped { files: 5, rows: 50, bytes: 500, builds: Some([7, 9]), over: 0 });
+}
+
+// --- The kept builds, through flushes, pins and restarts ------------------------------------
+
+/// The pid of the outside readers' pins (`<pid>-<n>`, as [`retire`] names them): a process the
+/// core never asks about, played by the test through [`Sim::hold_lock`].
+const READER_PID: u32 = 9_000;
+
+/// Most acts a case of the kept builds' test draws.
+const KEPT_ACTS: u64 = 40;
+
+/// An outside reader's pin, laid out as [`retire`] lays one: its lock file, held by another
+/// process, the generation it read said beside it, and the files the manifest it read listed.
+struct ReaderPin {
+    lock: FileName,
+    read: Vec<String>,
+}
+
+/// One case of the kept builds' test: the core of the live process, and the model it is held
+/// to.
+struct KeptWorld {
+    sim: Sim,
+    dir: FileName,
+    properties: Vec<WriterProperties>,
+    files: Files<TestHost>,
+    pid: u32,
+    keep: usize,
+    cap: u64,
+    rule: CapRule,
+    seq: u64,
+    next_row: i64,
+    next_build: u64,
+    running: BTreeSet<u64>,
+    /// Every row handed to the history and the builds it is of (empty: of no build).
+    rows: BTreeMap<i64, Vec<u64>>,
+    pins: Vec<ReaderPin>,
+    next_pin: u32,
+}
+
+/// A process `pid` opens the history at `dir`, the cap keeping `keep` finished builds by
+/// `rule`, holding `cap` bytes: its core and the next flush's number.
+fn opened_core(
+    sim: &mut Sim,
+    dir: &FileName,
+    properties: &[WriterProperties],
+    pid: u32,
+    keep: usize,
+    cap: u64,
+    rule: CapRule,
+) -> Result<(Files<TestHost>, u64), Broke> {
+    let host = TestHost { pid, properties: properties.to_vec() }; // clone: once a process
+    // clone: the directory's name and the properties, once a process
+    let mut files = Files::new(host, PathBuf::from(ROOT), dir.clone(), properties.to_vec());
+    files.keep_builds(keep);
+    files.cap_rule(rule);
+    files.open(cap, Vec::new());
+    let job = format!("the open of pid {pid}");
+    let opened = match drive(sim, &mut files, None, &mut Contention::none(), &job)? {
+        Driven::Done(outcome) => into_opened(outcome, &job)?,
+        Driven::Crashed => return Err(Broke::Harness(format!("{job}: crashed with no crash drawn"))),
+    };
+    match opened {
+        Ok(opened) => Ok((files, opened.seq)),
+        Err(error) => Err(Broke::Oracle(format!("{job}: the history did not open: {error:?}"))),
+    }
+}
+
+impl KeptWorld {
+    fn new(seed: u64, keep: usize, cap: u64, rule: CapRule) -> Result<KeptWorld, Broke> {
+        // No injected faults: the crash-safety of every commit is the other DST's; this one is
+        // about what the cap keeps.
+        let faults = Faults {
+            fail_one_in: 0,
+            max_latency: Duration::from_micros(50),
+            no_clone: false,
+            lose_change_one_in: 0,
+            interrupt_one_in: 0,
+        };
+        let mut sim = Sim::new(seed, faults);
+        let Some(dir) = FileName::new(DIR) else { unreachable!("`{DIR}` is a name") };
+        let properties: Vec<WriterProperties> =
+            schema::TABLES.iter().map(|it| super::super::properties(it)).collect();
+        let (files, seq) = opened_core(&mut sim, &dir, &properties, FIRST_PID, keep, cap, rule)?;
+        Ok(KeptWorld {
+            sim,
+            dir,
+            properties,
+            files,
+            pid: FIRST_PID,
+            keep,
+            cap,
+            rule,
+            seq,
+            next_row: 1,
+            next_build: 1,
+            running: BTreeSet::new(),
+            rows: BTreeMap::new(),
+            pins: Vec::new_in(Global),
+            next_pin: 1,
+        })
+    }
+
+    fn file(&self, name: &str) -> FileName {
+        match FileName::new(&format!("{}/{name}", self.dir)) {
+            Some(it) => it,
+            None => unreachable!("`{name}` is a file's name"),
+        }
+    }
+
+    fn manifest(&self) -> Result<Manifest, Broke> {
+        let file = self.file(manifest::FILE);
+        if !self.sim.exists(&file) {
+            return Ok(Manifest::new());
+        }
+        Manifest::decode(&self.sim.contents(&file))
+            .map_err(|why| Broke::Oracle(format!("the manifest does not decode: {why:?}")))
+    }
+
+    /// A build starts: the core keeps every file holding a row of it while it runs.
+    fn start(&mut self) {
+        let build = self.next_build;
+        self.next_build += 1;
+        self.running.insert(build);
+        self.files.running(build, true);
+    }
+
+    /// A flush of `rows` new rows, of every running build and of `ended` (a build whose end
+    /// this flush is for, noted ended before it as the daemon does), or of no build. Its files
+    /// are named as the daemon names them: for the highest build of their rows.
+    fn flush(&mut self, rows: u8, ended: Option<u64>) -> Result<(), Broke> {
+        if let Some(build) = ended {
+            self.running.remove(&build);
+            self.files.running(build, false);
+        }
+        let seq = self.seq;
+        self.seq += 1;
+        let mut of: Vec<u64> = self.running.iter().copied().chain(ended).collect();
+        of.sort_unstable();
+        of.dedup();
+        let mut placing = Vec::new_in(Global);
+        if rows > 0 {
+            let mut ids = Vec::new_in(Global);
+            for _ in 0..rows {
+                let row = self.next_row;
+                self.next_row += 1;
+                self.rows.insert(row, of.clone()); // clone: a row's builds, once a row
+                ids.push(row);
+            }
+            let named = of.last().copied().unwrap_or(0);
+            let name = Name { build: named, table: table("spans"), first: seq, last: seq, level: 0 };
+            let mut file = placed(name, &ids, self.pid, &self.properties);
+            file.entry.builds = of.first().zip(of.last()).map(|(&lo, &hi)| [lo, hi]);
+            placing.push(file);
+        }
+        self.files.flush(Flush { seq, files: placing, recorder: None, crashes: None, ended });
+        let job = format!("flush {seq} of pid {}", self.pid);
+        let flushed = match drive(&mut self.sim, &mut self.files, None, &mut Contention::none(), &job)? {
+            Driven::Done(outcome) => into_flushed(outcome, &job)?,
+            Driven::Crashed => return Err(Broke::Harness(format!("{job}: crashed with no crash drawn"))),
+        };
+        if let Err(error) = &flushed.committed {
+            return Err(Broke::Oracle(format!("{job}: not committed: {error:?}")));
+        }
+        if let Some(error) = flushed.placed.iter().flatten().next() {
+            return Err(Broke::Oracle(format!("{job}: a file not placed: {error:?}")));
+        }
+        if let Some(error) = flushed.deferred.first() {
+            return Err(Broke::Oracle(format!("{job}: failed after its commit: {error:?}")));
+        }
+        Ok(())
+    }
+
+    /// An outside reader pins the history and reads the manifest, as [`super::super::pin`]
+    /// does: its lock file made and held by another process, then the generation it read said.
+    fn pin(&mut self) -> Result<(), Broke> {
+        let id = format!("{READER_PID}-{}", self.next_pin);
+        self.next_pin += 1;
+        let lock = self.file(&format!("{PINS}/{}", PinFile::Lock { id: &id }.file_name()));
+        self.sim.change(&lock, b"");
+        self.sim.hold_lock(&lock, LockMode::Exclusive);
+        let manifest = self.manifest()?;
+        let generation = manifest.retired().generation;
+        let said = self.file(&format!("{PINS}/{}", PinFile::Said { id: &id, generation }.file_name()));
+        self.sim.change(&said, b"");
+        let read = manifest.all().map(str::to_owned).collect();
+        self.pins.push(ReaderPin { lock, read });
+        Ok(())
+    }
+
+    /// The reader at `at` ends without a word, as a killed `blaze slow` would: its lock goes,
+    /// its files stay for the writer's reap to find unlocked.
+    fn unpin(&mut self, at: usize) {
+        let pin = self.pins.remove(at);
+        self.sim.release_lock(&pin.lock);
+    }
+
+    /// The daemon stops and a new one opens the history: every lock goes (the readers' too),
+    /// and the builds that were running are builds that ended.
+    fn restart(&mut self) -> Result<(), Broke> {
+        let before = (self.running.is_empty()).then(|| self.manifest()).transpose()?;
+        self.sim.crash();
+        self.pins.clear();
+        self.running.clear();
+        self.pid += 1;
+        let (files, seq) =
+            opened_core(&mut self.sim, &self.dir, &self.properties, self.pid, self.keep, self.cap, self.rule)?;
+        self.files = files;
+        self.seq = seq;
+        // With nothing running the open's trim has nothing new to decide: the same files.
+        if let Some(before) = before {
+            let after = self.manifest()?;
+            let listed = |it: &Manifest| it.all().map(str::to_owned).collect::<BTreeSet<_>>();
+            if listed(&before) != listed(&after) {
+                return Err(Broke::Oracle(format!(
+                    "the restart of pid {} read other files back: {:?} before, {:?} after",
+                    self.pid,
+                    listed(&before),
+                    listed(&after)
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The invariant, after every act: each row of a kept build (every running build and the
+    /// last `keep` finished, of every build that ever had rows) is in a listed file; every file
+    /// a live pin read is on disk; after a flush with no pin held, no retired file is left.
+    fn check(&self, after: &str, flushed: bool) -> Result<(), Broke> {
+        let manifest = self.manifest()?;
+        let mut listed = BTreeSet::new();
+        for name in manifest.all() {
+            let file = self.file(name);
+            if !self.sim.exists(&file) {
+                return Err(Broke::Oracle(format!("after {after}: {name} is listed and not there")));
+            }
+            let rows = rows_of(self.sim.contents(&file))
+                .map_err(|why| Broke::Oracle(format!("after {after}: {name} is torn: {why}")))?;
+            listed.extend(rows);
+        }
+        let known: BTreeSet<u64> = self.rows.values().flatten().copied().collect();
+        let finished: Vec<u64> =
+            known.iter().rev().filter(|it| !self.running.contains(*it)).take(self.keep).copied().collect();
+        for (row, of) in &self.rows {
+            let kept = of.iter().find(|it| self.running.contains(*it) || finished.contains(*it));
+            if let Some(build) = kept
+                && !listed.contains(row)
+            {
+                return Err(Broke::Oracle(format!(
+                    "after {after}: build {build} is kept (running {:?}, the last {} finished \
+                     {finished:?}) and lost row {row}, under a cap of {} bytes",
+                    self.running, self.keep, self.cap
+                )));
+            }
+        }
+        for pin in &self.pins {
+            if let Some(name) = pin.read.iter().find(|it| !self.sim.exists(&self.file(it))) {
+                return Err(Broke::Oracle(format!(
+                    "after {after}: {name} was deleted under a pinned reader"
+                )));
+            }
+        }
+        if flushed && self.pins.is_empty() && !manifest.retired().files.is_empty() {
+            return Err(Broke::Oracle(format!(
+                "after {after}: no reader pins the history and retired files are left: {:?}",
+                manifest.retired().files
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// A case: a seed, a small cap and a small count of kept builds, then acts drawn one at a time.
+fn kept_case(tape: &Tape, rule: CapRule) -> Result<(), Broke> {
+    let seed = tape.next_u64("sim seed");
+    let keep = usize::from(tape.int_in(0..=3u8, "kept builds"));
+    // A flush's file is about a kilobyte (its footer mostly), so the cap meets builds within a
+    // few flushes, and is often under one build alone.
+    let cap = tape.int_in(0..=8_192u64, "cap");
+    let mut world = KeptWorld::new(seed, keep, cap, rule)?;
+    let acts = tape.int_in(1..=KEPT_ACTS, "acts");
+    for at in 0..acts {
+        let (after, flushed) = tape.span("act", |tape| -> Result<(String, bool), Broke> {
+            Ok(match tape.int_in(0..=9u8, "act") {
+                0 | 1 if world.running.len() < 3 => {
+                    world.start();
+                    (format!("act {at}, a start"), false)
+                }
+                5 | 6 if !world.running.is_empty() => {
+                    let running: Vec<u64> = world.running.iter().copied().collect();
+                    let which = usize::from(tape.int_in(0..=2u8, "which build ends")) % running.len();
+                    let build = running[which];
+                    world.flush(tape.int_in(0..=3u8, "rows"), Some(build))?;
+                    (format!("act {at}, the end of build {build}"), true)
+                }
+                7 => {
+                    world.pin()?;
+                    (format!("act {at}, a pin"), false)
+                }
+                8 if !world.pins.is_empty() => {
+                    let which = usize::from(tape.int_in(0..=3u8, "which pin goes")) % world.pins.len();
+                    world.unpin(which);
+                    (format!("act {at}, an unpin"), false)
+                }
+                9 => {
+                    world.restart()?;
+                    (format!("act {at}, a restart"), false)
+                }
+                // A flush: of the running builds' rows, or of no build's when none runs (a
+                // timer's, or the one a reader asks for before it reads); 0 rows is an empty one.
+                _ => {
+                    world.flush(tape.int_in(0..=4u8, "rows"), None)?;
+                    (format!("act {at}, a flush"), true)
+                }
+            })
+        })?;
+        world.check(&after, flushed)?;
+    }
+    Ok(())
+}
+
+/// The invariant: the history holds, whole, every running build and the last `keep` finished
+/// builds, whatever the cap and whatever flushes come after (a flush with no build protects
+/// nothing by itself, and moves nothing out); a file a reader pinned stays on disk until the
+/// pin goes, and goes at the next flush after; a restart with nothing running reads the same
+/// files back.
+#[test]
+fn the_last_builds_stay_whole_through_any_flushes_pins_and_restarts() {
+    blaze_sim::check(Config::cases(200), |tape| kept_case(tape, CapRule::Kept));
+}
+
+/// The cap as it was until 2026-11-14 (the newest flush's unit and the running builds kept, no
+/// finished build by count): a flush with no build retires the last build, the reproduction's
+/// "0 rows". The oracle catches it.
+#[test]
+fn the_oracle_catches_a_flush_with_no_build_retiring_the_last_build() {
+    blaze_sim::control(CONTROL, CapRule::Kept, CapRule::NewestFlushOnly, "is kept", kept_case);
+}
+
+/// The cap checked before the kept builds are set aside: past the cap, a kept build that is
+/// not running goes too. The oracle catches it.
+#[test]
+fn the_oracle_catches_the_cap_checked_before_the_kept_builds_are_set_aside() {
+    blaze_sim::control(CONTROL, CapRule::Kept, CapRule::CapBeforeKept, "is kept", kept_case);
 }

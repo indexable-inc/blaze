@@ -1,0 +1,16 @@
+{
+ "id": "sound-1112-7",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane sound-1112",
+ "where": "blaze why: steps recomputed for no recorded reason",
+ "what": "In the oracle's two smoke runs and its alternation run the daemon's log said `blaze why has no recorded reason for steps this build recomputed, which is a bug in blaze` for 9 of 53 builds: each cold build (unexplained=8, 15), a release build (10), and edits: a comment with lines moved saved by rename (2), a signature change after an interrupted build (1), a trait impl with an override after a second checkout built (4), a macro_rules value with an indent (1 and 4), a source cfg flip (2).",
+ "cost": "why answers that say nothing; the oracle's check (c) fails on them, so they hide other failures of the same revision until skipped",
+ "cause": "not looked into",
+ "whys": [
+  "a step can be recomputed without a miss recorded for it"
+ ],
+ "class": "work without a recorded cause",
+ "prevention": "the oracle holds it at zero (check alarms)",
+ "workaround": "none",
+ "state": "open, for the lane that owns serve/why"
+}

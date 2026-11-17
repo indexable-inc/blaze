@@ -1,0 +1,11 @@
+{
+ "id": "rev-4",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane revisions-1111",
+ "where": "blaze: no-op lane",
+ "what": "Which build is answered by the no-op lane is easy to get wrong from outside: only the third identical request in a row is (the first builds, the second walks and is kept), any difference in arguments (`--message-format=json`) or environment counts as another request, and `build` then `run` then `build` never reaches it. Nothing in a build's output says why a walk was not answered.",
+ "cost": "three wrong expectations in the first cases, 30 minutes",
+ "cause": "by design (docs/cargo.md, \"A build with nothing changed\"), but silent",
+ "workaround": "`\"build_id\": null` in `build-finished` is the only sign; the cases assert it",
+ "state": "open: `blaze why` after a walk that made nothing could say what kept the lane from answering"
+}

@@ -23,7 +23,7 @@ use arrow_array::{Array, RecordBatch, cast::AsArray, types};
 use blaze_api::{Request, ResponseRef};
 use blaze_core::exit::Exit;
 use blaze_profile::{
-    history, live, schema, slow, sql,
+    history, live, memory, schema, slow, sql,
     time::{load, report::By},
     views,
 };
@@ -45,17 +45,22 @@ const DEBUG_USAGE: &str = "blaze debug profile [--seconds N] | blaze debug live 
                            [--match TEXT] [--cores [LINES]] [--html FILE] [--trace FILE] \
                            | blaze debug gate [--build N] [--history DIR] [--json] [--summary FILE] \
                            | blaze debug locks [--build N] [--top N] [--json] \
-                           | blaze debug edits KIND [--file PATH] [--fn NAME[:LINE]] [--runs N] [--json] [-- BUILD ARGS]";
+                           | blaze debug edits KIND [--file PATH] [--fn NAME[:LINE]] [--runs N] [--json] [-- BUILD ARGS] \
+                           | blaze debug toolchain \
+                           | blaze debug inspect [--record] | blaze debug inspect --read FILE [--trace OUT]";
 const EXPLAIN_USAGE: &str =
     "blaze explain RULE | PACKAGE [--json] | memory [BUILD] [limit=N] [--json] | VIEW [NAME=VALUE ...] [--json]";
 const MEMORY_USAGE: &str = "blaze explain memory [BUILD] [limit=N] [--json]";
 
-/// The parts of `blaze explain memory`, each a view of `sql/examples.sql`, with its heading.
-const MEMORY_PARTS: [(&str, &str, &str); 4] = [
-    ("timeline", "memory_timeline", "the memory, minute by minute"),
-    ("peak_tasks", "memory_peak_tasks", "the tasks that held the most at once"),
-    ("at_peak", "memory_at_peak", "the memory by area at the footprint's peak"),
-    ("sites", "memory_sites", "what churns the global heap, by call site"),
+/// The parts of `blaze explain memory`, each a view of `sql/examples.sql` answered without
+/// DuckDB (`blaze_profile::memory`), with its JSON name and heading, in the order printed.
+const MEMORY_PARTS: [(memory::Part, &str, &str); 6] = [
+    (memory::Part::Timeline, "timeline", "the memory, minute by minute"),
+    (memory::Part::PeakTasks, "peak_tasks", "the tasks that held the most at once"),
+    (memory::Part::AtPeak, "at_peak", "the memory by area at the footprint's peak"),
+    (memory::Part::Held, "held", "what the global heap held at the footprint's peak, by call site"),
+    (memory::Part::Sites, "sites", "what churns the global heap, by call site"),
+    (memory::Part::GiveBacks, "give_backs", "what was given back because memory was short"),
 ];
 const WHY_USAGE: &str = "blaze why [ITEM] [--all] [--unexplained] [--json]";
 const SLOW_USAGE: &str = "blaze slow [--build N] [--top N] [--json]";
@@ -94,9 +99,9 @@ pub fn explore(words: Vec<OsString>, color: bool) -> i32 {
             color,
         );
     };
-    println!("{link}");
+    blaze_report::outln!("{link}");
     if !print && let Err(why) = open(&link) {
-        eprint!(
+        blaze_report::err!(
             "{}",
             say::warning(&format!("the link was not opened ({why}): open it in a browser"), color)
         );
@@ -137,11 +142,134 @@ pub fn debug(words: Vec<OsString>, color: bool) -> i32 {
         Some("time") => time(words.collect()),
         Some("gate") => gate(words.collect()),
         Some("locks") => locks(words.collect()),
+        Some("inspect") => inspect(words.collect()),
+        Some("toolchain") => match words.next() {
+            None => toolchain(),
+            Some(word) => Err(Refusal::Usage(format!(
+                "blaze debug toolchain takes nothing, not `{}`",
+                word.to_string_lossy()
+            ))),
+        },
         // The edit loop as one command (`edits.rs`), which says its own usage and exit code.
         Some("edits") => return super::edits::main(words.collect(), color),
         _ => Err(Refusal::Usage(DEBUG_USAGE.to_owned())),
     };
     said(result, color)
+}
+
+/// `blaze debug inspect [--record]`: what the live daemon is doing, as one line of JSON
+/// (`crate::serve::inspect::Inspected`: each thread's spans and what it waits on, the plane's
+/// queued and running tasks, the lock and scheduler waits, memory, the longest waits first),
+/// asked of the daemon's inspect thread on its own socket, so it answers while every work
+/// thread is busy and while the loop is stuck. It starts no daemon. `--record` also has the
+/// daemon write a flight recording and names it (`recorded`).
+///
+/// `blaze debug inspect --read FILE [--trace OUT]`: a flight recording as one line of JSON
+/// (why it was written, what the daemon said, every thread's open spans), with its trace's
+/// length in place of the trace; `--trace OUT` writes the trace, a Chrome trace
+/// ui.perfetto.dev opens, to `OUT`. No daemon.
+fn inspect(words: Vec<OsString>) -> Result<(), Refusal> {
+    const USAGE: &str =
+        "blaze debug inspect [--record] | blaze debug inspect --read FILE [--trace OUT]";
+    let (mut record, mut read, mut trace) = (false, None, None);
+    let mut words = texts(words)?.into_iter();
+    while let Some(word) = words.next() {
+        let file = |words: &mut std::vec::IntoIter<String>| {
+            words.next().ok_or_else(|| Refusal::Usage(format!("{USAGE}: `{word}` takes a file")))
+        };
+        match word.as_str() {
+            "--record" => record = true,
+            "--read" => read = Some(file(&mut words)?),
+            "--trace" => trace = Some(file(&mut words)?),
+            _ => return Err(Refusal::Usage(format!("{USAGE}, not `{word}`"))),
+        }
+    }
+    match (read, trace, record) {
+        (Some(file), trace, false) => read_recording(Path::new(&file), trace.as_deref()),
+        (Some(_), _, true) => {
+            Err(Refusal::Usage(format!("{USAGE}: `--record` asks a daemon, `--read` reads a file")))
+        }
+        (None, Some(_), _) => {
+            Err(Refusal::Usage(format!("{USAGE}: `--trace` is of the recording `--read` names")))
+        }
+        (None, None, record) => inspect_daemon(record),
+    }
+}
+
+#[cfg(all(unix, feature = "native"))]
+fn inspect_daemon(record: bool) -> Result<(), Refusal> {
+    use crate::serve::inspect::{self, Answer, Asked};
+    let daemon = blaze_api::client::socket().map_err(|why| Refusal::Failed(why.to_string()))?;
+    let asked = Asked { record, schema: inspect::SCHEMA };
+    match inspect::ask(&inspect::socket_of(&daemon), asked).map_err(Refusal::Failed)? {
+        Answer::Inspected(inspected) => {
+            let text = serde_json::to_string(&inspected).map_err(|error| {
+                Refusal::Failed(format!("`blaze debug inspect`'s answer as JSON: {error}"))
+            })?;
+            blaze_report::outln!("{text}");
+            Ok(())
+        }
+        Answer::Refused(why) => Err(Refusal::Failed(why)),
+    }
+}
+
+#[cfg(not(all(unix, feature = "native")))]
+fn inspect_daemon(_record: bool) -> Result<(), Refusal> {
+    Err(Refusal::Failed(
+        "`blaze debug inspect` asks a daemon over a Unix socket, and this blaze has none (it is \
+         not a Unix build with the `native` feature)"
+            .to_owned(),
+    ))
+}
+
+/// The flight recording `file` as one line of JSON, its trace's length in place of its bytes;
+/// the trace written to `trace` when given.
+fn read_recording(file: &Path, trace: Option<&str>) -> Result<(), Refusal> {
+    use crate::serve::flightrec::Recording;
+    let failed = |what: String| Refusal::Failed(format!("{}: {what}", file.display()));
+    let bytes = std::fs::read(file).map_err(|error| failed(format!("reading it: {error}")))?;
+    let mut recording = Recording::decode(&bytes).map_err(|refused| failed(refused.to_string()))?;
+    let bytes = std::mem::take(&mut recording.trace);
+    let Ok(Value::Object(mut said)) = serde_json::to_value(&recording) else {
+        return Err(failed("its recording is no JSON object".to_owned()));
+    };
+    said.remove("trace");
+    said.insert("trace_bytes".to_owned(), Value::from(bytes.len()));
+    if let Some(out) = trace {
+        std::fs::write(out, &bytes)
+            .map_err(|error| failed(format!("writing its trace to {out}: {error}")))?;
+        said.insert("trace_written".to_owned(), Value::String(out.to_owned()));
+    }
+    blaze_report::outln!("{}", Value::Object(said));
+    Ok(())
+}
+
+/// `blaze debug toolchain`: the three code identities this blaze keys what it stores by, as
+/// one line of JSON, with no daemon: `built` as its build script worked them out, `keyed` as
+/// it keys (other than `built` only under `BLAZE_DEV_TOOLCHAIN_AS`, `assumed` then true), and
+/// `as`, the value of `BLAZE_DEV_TOOLCHAIN_AS` under which another blaze keys as this one does
+/// (`crate::serve::dev_toolchain`).
+fn toolchain() -> Result<(), Refusal> {
+    use crate::serve::dev_toolchain::{self, Codes};
+    let keyed = crate::serve::record_makers().map_err(Refusal::Failed)?;
+    let keyed =
+        Codes { codegen: keyed.codegen, front_end: keyed.front_end, record: keyed.record };
+    let dev = dev_toolchain::dev();
+    let built = dev.map_or(keyed, |it| it.built);
+    let codes = |it: Codes| {
+        let mut map = Map::new();
+        map.insert("codegen".to_owned(), Value::String(format!("{:x}", it.codegen)));
+        map.insert("front_end".to_owned(), Value::String(format!("{:x}", it.front_end)));
+        map.insert("record".to_owned(), Value::String(format!("{:x}", it.record)));
+        Value::Object(map)
+    };
+    let mut out = Map::new();
+    out.insert("as".to_owned(), Value::String(keyed.spelled()));
+    out.insert("assumed".to_owned(), Value::Bool(dev.is_some()));
+    out.insert("built".to_owned(), codes(built));
+    out.insert("keyed".to_owned(), codes(keyed));
+    blaze_report::outln!("{}", Value::Object(out));
+    Ok(())
 }
 
 /// `blaze debug hot [--top N] [--last-build]`: the N keys (20) that took most time and each
@@ -178,7 +306,7 @@ fn hot(words: Vec<OsString>) -> Result<(), Refusal> {
             "the daemon answered `blaze debug hot` with no answer".to_owned(),
         ));
     }
-    print!("{text}");
+    blaze_report::out!("{text}");
     Ok(())
 }
 
@@ -316,7 +444,7 @@ fn rebuilt(words: Vec<OsString>) -> Result<(), Refusal> {
                 value.map_err(|error| format!("`blaze why`'s problems as JSON: {error}"))?;
             answer.insert(key.to_owned(), value);
         }
-        println!("{answer}");
+        blaze_report::outln!("{answer}");
         return Ok(());
     }
     let mut text = String::new();
@@ -338,7 +466,7 @@ fn rebuilt(words: Vec<OsString>) -> Result<(), Refusal> {
         true => blaze_ui::why::unexplained(&mut text, &rebuilt),
         false => blaze_ui::why::lines(&mut text, &rebuilt),
     }
-    print!("{text}");
+    blaze_report::out!("{text}");
     Ok(())
 }
 
@@ -354,6 +482,32 @@ fn problems_of(build: Option<u64>) -> Result<Vec<slow::Problem>, String> {
         .map_err(|error| error.to_string())
 }
 
+/// Where the summary of what a build recomputed comes from ([`recomputed`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SummaryFrom {
+    /// There is none to say: no build was heard, it recomputed nothing, or the summary is not
+    /// in the build's answer and is not to be asked for.
+    Nowhere,
+    /// The build's own answer carried it.
+    Answer,
+    /// The daemon is asked, which waits for its history thread to have explained the build.
+    Daemon,
+}
+
+/// [`SummaryFrom`] of build `build` (0 for none heard), which recomputed `misses` steps, whose
+/// answer `carried` its summary or not, for a command that asks the daemon (`ask`) or does not
+/// (a `run`: its program starts as soon as its image is built, and waits for no explanation).
+fn summary_from(build: u64, misses: u64, carried: bool, ask: bool) -> SummaryFrom {
+    if build == 0 || misses == 0 || !cfg!(feature = "native") {
+        return SummaryFrom::Nowhere;
+    }
+    match (carried, ask) {
+        (true, _) => SummaryFrom::Answer,
+        (false, true) => SummaryFrom::Daemon,
+        (false, false) => SummaryFrom::Nowhere,
+    }
+}
+
 /// Why the build this process asked for recomputed what it did, as the daemon sums it up once
 /// the build has ended (`Rebuilt::summary`, docs/v2/plan/design/why.md): a report a root
 /// cause. None when this process heard of no build, in the seed (whose engine is this
@@ -363,10 +517,28 @@ fn problems_of(build: Option<u64>) -> Result<Vec<slow::Problem>, String> {
 /// nothing again (`Worked::misses` of 0): its summary is of those misses, so it is empty, and
 /// a no-op build makes no second round trip and waits for no history thread. The daemon's
 /// error otherwise.
-pub(super) fn recomputed() -> Result<Vec<blaze_api::Report>, String> {
+///
+/// `ask` false: only what the build's own answer said; the daemon is asked nothing, so nothing
+/// waits for its history thread (a `run`, whose program is about to start).
+pub(super) fn recomputed(ask: bool) -> Result<Vec<blaze_api::Report>, String> {
     let build = super::client_rows::build();
-    if build == 0 || super::client_rows::misses() == 0 || !cfg!(feature = "native") {
-        return Ok(Vec::new());
+    let carried = super::client_rows::summary(build);
+    match summary_from(build, super::client_rows::misses(), carried.is_some(), ask) {
+        SummaryFrom::Nowhere => return Ok(Vec::new()),
+        // The build's own answer said it, when the daemon had explained the build by then: no
+        // second request.
+        SummaryFrom::Answer => {
+            let summary = carried.unwrap_or_default();
+            tracing::info_span!(
+                target: "blaze",
+                "client: why the build recomputed, from its answer",
+                build,
+                reports = summary.len(),
+            )
+            .in_scope(|| {});
+            return Ok(summary);
+        }
+        SummaryFrom::Daemon => {}
     }
     let _span =
         tracing::info_span!(target: "blaze", "client: ask why the build recomputed", build)
@@ -544,7 +716,7 @@ impl From<String> for Refusal {
 }
 
 fn refused(what: &str, code: i32, color: bool) -> i32 {
-    eprint!("{}", say::error(what, color));
+    blaze_report::err!("{}", say::error(what, color));
     code
 }
 
@@ -638,7 +810,7 @@ fn profile(words: Vec<OsString>) -> Result<(), Refusal> {
         .map_or(0, |it| it.as_secs());
     let path = state.join(format!("profile-{now}.json"));
     std::fs::write(&path, trace).map_err(|error| format!("writing {}: {error}", path.display()))?;
-    println!("{}", path.display());
+    blaze_report::outln!("{}", path.display());
     Ok(())
 }
 
@@ -846,7 +1018,91 @@ fn explained(words: Vec<OsString>) -> Result<(), Refusal> {
         args.insert(key.to_owned(), argument(view, key, value)?);
     }
     let sql = views::render(view, &args).map_err(|error| error.to_string())?;
-    print(&run(&sql)?, shape)
+    let batches = run(&sql)?;
+    // `problems` with no row says which builds it read and that nothing was said wrong in
+    // them, or that the build asked for is not there: an empty table reads the same for a
+    // clean build, a build of another history and a history with no build (no-fallback).
+    if name == "problems" && batches.iter().all(|it| it.num_rows() == 0) {
+        return no_problems(&args, shape);
+    }
+    // `edit_work` with no row is a build that counted nothing, or one that is not there:
+    // said, never an empty table that reads as "the edit cost nothing" (no-fallback).
+    if name == "edit_work" && batches.iter().all(|it| it.num_rows() == 0) {
+        return no_edit_work(&args);
+    }
+    print(&batches, shape)
+}
+
+/// What `blaze explain edit_work` says when its view has no row: which build it read and
+/// why a build has none, as an error in either shape.
+fn no_edit_work(args: &Map<String, Value>) -> Result<(), Refusal> {
+    let build = match args.get("build").and_then(Value::as_u64) {
+        Some(build) => Some(build),
+        // The view's own default: the last build with a span.
+        None => number("SELECT max(build_id) AS build FROM spans")?,
+    };
+    Err(Refusal::Failed(match build {
+        Some(build) => format!(
+            "`blaze explain edit_work`: build {build} counted no work in any stage: no query ran, no \
+             unit was checked, compiled or linked and no dependency was keyed in it (a build answered \
+             again with nothing to do counts none), or it is not in this history; `build=N` reads \
+             another build"
+        ),
+        None => "`blaze explain edit_work`: this history has no build, so there is nothing to read: \
+                 run a build under this daemon first (`blaze status` names its state directory)"
+            .to_owned(),
+    }))
+}
+
+/// The last build of the history.
+const LAST_BUILD: &str = "SELECT max(build_id) AS build FROM builds";
+
+/// The one number `sql` gives: its first row's first column; none for no row, or a null.
+fn number(sql: &str) -> Result<Option<u64>, Refusal> {
+    let rows = json(&run(sql)?)?;
+    let Some(line) = rows.lines().next() else { return Ok(None) };
+    let row: Value = serde_json::from_str(line)
+        .map_err(|error| format!("a row of `{sql}` as JSON: {error}"))?;
+    Ok(row.as_object().and_then(|it| it.values().next()).and_then(Value::as_u64))
+}
+
+/// What `blaze explain problems` says when its view has no row: which builds it read, or
+/// that the one asked for is not in this history. With `--json` a clean build prints no row
+/// (the data is that there is none); a build that is not there is still an error.
+fn no_problems(args: &Map<String, Value>, shape: Shape) -> Result<(), Refusal> {
+    let Some(last) = number(LAST_BUILD)? else {
+        return Err(Refusal::Failed(
+            "`blaze explain problems`: this history has no build, so there is nothing to read: run a \
+             build under this daemon first (`blaze status` names its state directory)"
+                .to_owned(),
+        ));
+    };
+    let said = match args.get("build").and_then(Value::as_u64) {
+        Some(build) => {
+            let there = number(&format!("SELECT count(*) AS n FROM builds WHERE build_id = {build}"))?;
+            if there.unwrap_or(0) == 0 {
+                return Err(Refusal::Failed(format!(
+                    "`blaze explain problems`: there is no build {build} in this history (its last build is {last})"
+                )));
+            }
+            format!(
+                "build {build}: blaze said nothing was wrong in it (no WARN or ERROR event, panic, fatal signal \
+                 or blaze bug, and it did not fail, stall or crash)\n"
+            )
+        }
+        None => {
+            let builds = args.get("builds").and_then(Value::as_u64).unwrap_or(5).max(1);
+            let first = last.saturating_sub(builds - 1).max(1);
+            format!(
+                "builds {first} to {last}: blaze said nothing was wrong in them (no WARN or ERROR event, panic, \
+                 fatal signal or blaze bug, and none failed, stalled or crashed); `build=N` reads one build\n"
+            )
+        }
+    };
+    match shape {
+        Shape::Table => stdout(&said),
+        Shape::Json => Ok(()),
+    }
 }
 
 /// `blaze explain memory [BUILD] [limit=N] [--json]`: who owned a build's memory, from its
@@ -854,8 +1110,10 @@ fn explained(words: Vec<OsString>) -> Result<(), Refusal> {
 /// heap, blaze-mem, kept), the tasks with the largest peaks with their crate and unit, the
 /// breakdown by tag at the footprint's peak, and the call sites that allocated the most. Each
 /// part is a view of its own (`memory_timeline`, `memory_peak_tasks`, `memory_at_peak`,
-/// `memory_sites`); the build is the last one unless named. With `--json`, a line a row, each
-/// with its `part`.
+/// `memory_held`, `memory_sites`, `memory_give_backs`), answered without DuckDB
+/// (`blaze_profile::memory`, held to each view's SQL by its test), so the command needs no
+/// setup; the build is the last one unless named. With `--json`, a line a row, each with its
+/// `part`.
 fn memory(words: impl Iterator<Item = String>) -> Result<(), Refusal> {
     let (mut build, mut limit, mut json) = (None, None, false);
     for word in words {
@@ -876,20 +1134,50 @@ fn memory(words: impl Iterator<Item = String>) -> Result<(), Refusal> {
             _ => return Err(Refusal::Usage(format!("{MEMORY_USAGE}, not `{word}`"))),
         }
     }
+    // With no build named: the last build that has memory rows, said when it is not the
+    // last build (a no-op, or a build of a daemon that had just started, records none, and
+    // four empty tables read as "no memory was used"). A history with none is an error.
+    // No DuckDB: the history's Parquet read and aggregated in Rust, each part held to its
+    // view's SQL by blaze_profile::memory's test.
+    let dir = history_dir()?;
+    let native = |error: blaze_profile::tables::TableError| Refusal::Failed(format!("`blaze explain memory`: {error}"));
     let mut out = String::new();
-    for (part, name, heading) in MEMORY_PARTS {
-        let view = views::find(name).map_err(|error| error.to_string())?;
-        let mut args = Map::new();
-        if let Some(build) = build {
-            args.insert("build".to_owned(), Value::from(build));
+    let build = match build {
+        Some(build) => build,
+        None => match (memory::last_with_memory(&dir).map_err(native)?, memory::last_build(&dir).map_err(native)?) {
+            (Some(with), Some(last)) if with != last => {
+                let note = format!(
+                    "build {with}: the last build with memory rows (the last build, {last}, has none: it \
+                     recorded no counter, task peak or allocation sample; `blaze explain memory {last}` \
+                     says so)"
+                );
+                match json {
+                    true => blaze_report::errln!("note: {note}"),
+                    false => _ = writeln!(out, "{note}\n"),
+                }
+                with
+            }
+            (Some(with), _) => with,
+            (None, last) => {
+                let last =
+                    last.map_or_else(|| "it has no build".to_owned(), |it| format!("its last build is {it}"));
+                return Err(Refusal::Failed(format!(
+                    "`blaze explain memory`: no build of this history has memory rows (a counter, a task's \
+                     peak or an allocation sample); {last}"
+                )));
+            }
+        },
+    };
+    let answers = memory::answer(&dir, build, limit.unwrap_or(memory::DEFAULT_LIMIT)).map_err(native)?;
+    let mut rows = 0;
+    for ((asked, part, heading), (answered, batches)) in MEMORY_PARTS.into_iter().zip(answers) {
+        if asked != answered {
+            return Err(Refusal::Failed(format!(
+                "`blaze explain memory`: the part {asked:?} was answered by {answered:?} (a bug: MEMORY_PARTS is not in memory::Part::ALL's order)"
+            )));
         }
-        if let Some(limit) = limit
-            && view.args.iter().any(|it| it.name == "limit")
-        {
-            args.insert("limit".to_owned(), Value::from(limit));
-        }
-        let sql = views::render(view, &args).map_err(|error| error.to_string())?;
-        let batches = run(&sql)?;
+        let name = asked.view();
+        rows += batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         if json {
             let rows = self::json(&batches)?;
             for line in rows.lines() {
@@ -903,6 +1191,13 @@ fn memory(words: impl Iterator<Item = String>) -> Result<(), Refusal> {
             out.push_str(&table(&batches)?);
             out.push('\n');
         }
+    }
+    // A build named that has none: said, never four empty tables.
+    if rows == 0 {
+        return Err(Refusal::Failed(format!(
+            "`blaze explain memory`: build {build} has no memory rows (no counter, task peak or allocation \
+             sample was recorded for it); with no build named it reads the last build that has some"
+        )));
     }
     stdout(&out)
 }
@@ -1031,6 +1326,12 @@ fn history_source() -> Result<(PathBuf, PathBuf), Refusal> {
 /// missing.
 pub(super) fn history_paths() -> Result<(PathBuf, PathBuf), String> {
     let duckdb = super::duckdb::path()?;
+    Ok((duckdb, history_dir()?))
+}
+
+/// The history in the daemon's state directory, flushed (see [`history_source`]): what a
+/// reader that needs no DuckDB (`blaze explain memory`) reads.
+fn history_dir() -> Result<PathBuf, String> {
     let state: PathBuf = crate::serve::state().map_err(|error| format!("{error:#}"))?;
     let dir = history::dir_in(&state);
     if let Some(pid) = history::writer(&dir) {
@@ -1062,7 +1363,7 @@ pub(super) fn history_paths() -> Result<(PathBuf, PathBuf), String> {
             format!("writing the rows a dead daemon left in the profile history {}: {error}", dir.display())
         })?;
     }
-    Ok((duckdb, dir))
+    Ok(dir)
 }
 
 fn print(batches: &[RecordBatch], shape: Shape) -> Result<(), Refusal> {
@@ -1209,6 +1510,22 @@ mod tests {
     use arrow_array::{ArrayRef, DictionaryArray, Float64Array, Int64Array, StringArray};
 
     use super::*;
+
+    /// The invariant: a `run` waits for nothing between its build's answer and its program.
+    /// Where the answer does not carry why the build recomputed, a `run` says nothing of it
+    /// and asks nothing; a build asks. The control is the build's row: with `ask` the daemon
+    /// is the source, so the `run`'s `Nowhere` is the flag's doing.
+    #[test]
+    fn a_run_asks_the_daemon_for_no_summary_of_its_build() {
+        assert_eq!(summary_from(7, 3, false, false), SummaryFrom::Nowhere);
+        assert_eq!(summary_from(7, 0, true, true), SummaryFrom::Nowhere);
+        assert_eq!(summary_from(0, 3, true, true), SummaryFrom::Nowhere);
+        if cfg!(feature = "native") {
+            assert_eq!(summary_from(7, 3, false, true), SummaryFrom::Daemon);
+            assert_eq!(summary_from(7, 3, true, false), SummaryFrom::Answer);
+            assert_eq!(summary_from(7, 3, true, true), SummaryFrom::Answer);
+        }
+    }
 
     fn batch() -> RecordBatch {
         let names: DictionaryArray<types::Int32Type> =

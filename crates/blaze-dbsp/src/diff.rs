@@ -27,6 +27,10 @@ impl SeqDiff {
     }
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "per-thread diff scratch, uncapped: it keeps the largest middle the thread diffed; a cap must bound it"
+)]
 thread_local! {
     /// The middle's `(hash, index)` rows of each side, kept for the next diff on this thread.
     static SCRATCH: RefCell<(Vec<(u64, u32)>, Vec<(u64, u32)>)> =

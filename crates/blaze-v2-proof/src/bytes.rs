@@ -30,7 +30,7 @@ const BLOCK: usize = 4 << 20;
 /// stops, so the answer is the same offset as on one core. The pieces are consecutive, so the
 /// least offset any piece finds is the answer: one atomic minimum, nothing collected.
 pub fn first_difference_across_cores(a: &[u8], b: &[u8]) -> Option<usize> {
-    first_difference_in(fastest(), a, b, crate::join::cores(), BLOCK)
+    first_difference_in(fastest(), a, b, crate::cores(), BLOCK)
 }
 
 fn first_difference_in(

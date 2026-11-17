@@ -1,0 +1,11 @@
+{
+ "id": "A19",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "the harness (Claude Code)",
+ "what": "Tools I needed were deferred or off: SendMessage, TaskStop and WebFetch had to be looked up before use, and the Artifact tool was listed but switched off when Andrew asked for a page to be opened.",
+ "cost": "a few turns",
+ "cause": "session configuration",
+ "workaround": "ToolSearch; a local HTML file opened with `open`",
+ "state": "accepted"
+}

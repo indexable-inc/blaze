@@ -1,0 +1,11 @@
+{
+ "id": "mem2-4",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane mem2-1111",
+ "where": "blaze: heap samples in a cargo-built binary",
+ "what": "`memory_sites` and `held_samples` named `__rustc::__rust_alloc` and `<Counting<Heaps> as GlobalAlloc>::realloc` as the call site of 90% of the bytes: the plumbing list knew the allocator shims only by the names blaze gives them.",
+ "cost": "the attribution table could not be made until it was fixed",
+ "cause": "a list of names with no test on a binary the system linker made",
+ "workaround": "none needed",
+ "state": "fixed on mem2-1111 (276ba7e15a)"
+}

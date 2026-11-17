@@ -1,0 +1,27 @@
+about = "A source file edited while no daemon ran is built (track 10, task C): run, then `blaze stop` and an edit of `main`'s body that keeps the file's size, and run: the edited output, by a daemon the run starts, since the file's stamp moved (its inode, size or times; never its size alone). Then `blaze stop` and run again: the edited output with no daemon, from the slot the second daemon wrote. The control of each revision is its expected output altered, which fails."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+prints = "hello 1, hello 2, hello 3\n"
+status = 3
+as_built = true
+
+[[revision]]
+steps = ["stop", "edit"]
+action = "run"
+prints = "howdy 1, howdy 2, howdy 3\n"
+status = 3
+as_built = true
+starts = 1
+
+[[revision]]
+steps = ["stop"]
+action = "run"
+prints = "howdy 1, howdy 2, howdy 3\n"
+status = 3
+as_built = true
+max_units = 0
+max_records = 0
+daemon_after = false
+starts = 0

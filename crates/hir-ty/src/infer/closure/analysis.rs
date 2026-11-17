@@ -244,6 +244,10 @@ impl<'f> MinCapturesBuf<'f> {
     }
 
     /// The result, at its size.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "a closure's capture ends are u32 in `MinCaptures`; a closure with 2^32 captures needs a typed refusal from capture analysis"
+    )]
     fn finish(&self) -> MinCaptures {
         let total = self.roots.iter().map(|(_, captures)| captures.len()).sum();
         // alloc: the result's captures, once at their number
@@ -807,6 +811,10 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     /// }
     /// ```
     #[instrument(level = "debug", skip(self))]
+    #[expect(
+        blaze::narrowed_len,
+        reason = "capture roots are indexed by u32; a closure capturing 2^32 variables needs a typed refusal from capture analysis"
+    )]
     fn compute_min_captures(
         &mut self,
         closure_def_id: ExprId,

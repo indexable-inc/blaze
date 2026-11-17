@@ -25,10 +25,8 @@
 //! [`Frame::alloc`] runs (collections in a frame drop their elements as usual); [`Frame::trim`]
 //! and [`trim_spare`] give pages back after a burst.
 //!
-//! A task's frame grows under the process's [`Cap`] when one is set ([`set_cap`]): past the
-//! chunks its thread keeps warm, each chunk and each span's pages are reserved from it first, a
-//! reserve over the limit waits, and when every holder waits the newest is cancelled: its task
-//! unwinds with [`Cancelled`] (from inside the allocation that waited) and is run again.
+//! Nothing limits a frame but its reserve ([`FRAME_RESERVE`]) and the kernel: a chunk or a
+//! span's pages the kernel refuses are a typed [`MemError`], never a wait, a cancel or a retry.
 //!
 //! Chunks are placed on the calling thread's NUMA node ([`chunks::set_thread_node`]), and so
 //! are spans.
@@ -42,10 +40,6 @@
 //! allocation happens in place, so a `Vec<T, &Frame>` pushed in a loop never copies while
 //! nothing else is allocated after it and it stays in its block (in a span, always).
 
-mod cap;
-
-pub use cap::{Cancelled, Cap, Grant, Spills, cap, set_cap};
-
 use std::{
     alloc::{AllocError, Allocator, Layout},
     cell::Cell,
@@ -54,7 +48,7 @@ use std::{
     panic::Location,
     ptr::{self, NonNull},
     slice, str,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
 use crate::{
@@ -74,7 +68,7 @@ pub const FRAME_RESERVE: usize = 4 << 30;
 #[cfg(not(target_pointer_width = "64"))]
 pub const FRAME_RESERVE: usize = 16 << 20;
 
-/// Chunks a thread keeps warm for its next tasks, outside the [`Cap`]: 16 MB.
+/// Chunks a thread keeps warm for its next tasks: 16 MB.
 pub const SHELF: usize = 8;
 
 /// Spans a thread keeps warm, each with its first [`SPAN_WARM`] bytes committed.
@@ -84,8 +78,8 @@ const SPANS: usize = SHELF;
 /// first big allocation fits it takes no page from the kernel. The pages past it go back as the
 /// task that grew the span ends: a span grows in place however big its task's top allocation
 /// gets, and a shelf that kept every page of it held a task's whole peak, on each thread, for
-/// as long as the thread lived, charged to no task and to no cap (an hour after a build the
-/// daemon still held 5.8 GiB of frames, #1726).
+/// as long as the thread lived, charged to no task (an hour after a build the daemon still held
+/// 5.8 GiB of frames, #1726).
 const SPAN_WARM: usize = CHUNK;
 
 /// The most frame memory a thread keeps warm between tasks ([`spare_bytes`]): [`SHELF`] chunks
@@ -118,8 +112,6 @@ struct Block {
     end: usize,
     /// The chunk it is, or `stack::NONE` for a span.
     chunk: u32,
-    /// The span's bytes reserved from the cap.
-    granted: usize,
     /// The span's region, which this header is in; none for a chunk.
     span: Option<ManuallyDrop<Region>>,
 }
@@ -176,7 +168,7 @@ pub struct Frame {
     /// The subsystem of the task using it, for [`tag::task_ended`].
     tag: Cell<Tag>,
     id: u32,
-    /// A task's frame: its blocks come from and go back to its thread's shelves, under the cap.
+    /// A task's frame: its blocks come from and go back to its thread's shelves.
     task: bool,
     /// The rest of the current block is lent to an inner task's frame: `end` stops at the
     /// cursor of the lend until that task ends or this frame moves to another block.
@@ -349,8 +341,8 @@ impl Frame {
         false
     }
 
-    /// Takes `layout`'s bytes, aligned; `MemError` when the frame's limit is reached or memory
-    /// cannot be had. A task the cap cancels unwinds with [`Cancelled`] from here.
+    /// Takes `layout`'s bytes, aligned; `MemError` when the frame's limit is reached or the
+    /// kernel refuses the memory.
     #[inline]
     pub fn try_alloc_layout(&self, layout: Layout) -> Result<NonNull<u8>, MemError> {
         let cursor = self.cursor.get();
@@ -438,30 +430,15 @@ impl Frame {
         Ok(())
     }
 
-    /// Commits the current span `block` up to address `end` (reserving the pages from the cap
-    /// first, for a task's frame) and moves the bump's end there.
+    /// Commits the current span `block` up to address `end` and moves the bump's end there.
     fn commit_span(&self, block: *mut Block, end: usize) -> Result<(), MemError> {
         let Some(region) = header(block).span.as_deref() else {
             unreachable!("a chunk has no pages to commit")
         };
         let len = end - region.base().addr().get();
         let before = region.committed();
-        let more = region.committed_after(len)? - before;
-        let granted = match self.task && more > 0 {
-            true => cap::frame_reserve(more).map_err(|why| refused(why, self.tag.get(), more))?,
-            false => false,
-        };
-        if let Err(error) = region.ensure(len) {
-            if granted {
-                cap::frame_release(more);
-            }
-            return Err(error);
-        }
-        let grew = region.committed() - before;
-        if granted {
-            header_mut(block).granted += more;
-        }
-        self.held.set(self.held.get() + grew);
+        region.ensure(len)?;
+        self.held.set(self.held.get() + region.committed() - before);
         self.end.set(self.usable_end(block, header(block).before));
         Ok(())
     }
@@ -516,9 +493,9 @@ impl Frame {
 
     fn new_chunk(&self) -> Result<*mut Block, MemError> {
         let chunk = match self.task {
-            true => match SHELF_OF.try_with(|shelf| shelf.take_chunk(self.tag.get())) {
-                Ok(taken) => taken?,
-                Err(_) => chunks::take(Tag::Frames)?,
+            true => match SHELF_OF.try_with(Shelf::take_chunk) {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) | Err(_) => chunks::take(Tag::Frames)?,
             },
             false => chunks::take(Tag::Frames)?,
         };
@@ -533,7 +510,6 @@ impl Frame {
                 before: 0,
                 end: base.addr().get() + CHUNK,
                 chunk: chunk.index(),
-                granted: 0,
                 span: None,
             })
         };
@@ -554,13 +530,6 @@ impl Frame {
         {
             let head = header_mut(block);
             let committed = head.span.as_deref().map_or(0, Region::committed);
-            match cap::frame_reserve(committed) {
-                Ok(granted) => head.granted = if granted { committed } else { 0 },
-                Err(why) => {
-                    _ = SHELF_OF.try_with(|shelf| shelf.give_span(block));
-                    return Err(refused(why, tag, committed));
-                }
-            }
             head.prev = ptr::null_mut();
             head.next = ptr::null_mut();
             self.held.set(self.held.get() + committed);
@@ -571,17 +540,7 @@ impl Frame {
             Some(node) => Region::reserve_huge_on(reserve, node, Tag::Frames)?,
             None => Region::reserve_huge(reserve, Tag::Frames)?,
         };
-        let first = region.committed_after(need)?;
-        let granted = match self.task {
-            true => cap::frame_reserve(first).map_err(|why| refused(why, tag, first))?,
-            false => false,
-        };
-        if let Err(error) = region.ensure(need) {
-            if granted {
-                cap::frame_release(first);
-            }
-            return Err(error);
-        }
+        region.ensure(need)?;
         let base = region.base();
         let end = base.addr().get() + region.reserved();
         let committed = region.committed();
@@ -595,7 +554,6 @@ impl Frame {
                 before: 0,
                 end,
                 chunk: crate::stack::NONE,
-                granted: if granted { committed } else { 0 },
                 span: Some(ManuallyDrop::new(region)),
             })
         };
@@ -625,10 +583,6 @@ impl Frame {
         }
         let committed = head.span.as_deref().map_or(0, Region::committed);
         self.held.set(self.held.get() - committed);
-        if head.granted > 0 {
-            cap::frame_release(head.granted);
-            head.granted = 0;
-        }
         if self.task && !cold && SHELF_OF.try_with(|shelf| shelf.give_span(block)).is_ok() {
             return;
         }
@@ -854,17 +808,8 @@ impl Frame {
             _ = region.decommit_after(in_use.max(HEADER));
             let freed = before - region.committed();
             self.held.set(self.held.get() - freed);
-            let back = freed.min(head.granted);
-            if back > 0 {
-                cap::frame_release(back);
-                head.granted -= back;
-            }
             self.end.set(self.usable_end(current, head.before));
         }
-    }
-
-    pub(crate) fn set_tag(&self, tag: Tag) {
-        self.tag.set(tag);
     }
 
     /// Whether `[ptr, ptr + size)` ends at the cursor, in the current block: the most recent
@@ -929,18 +874,6 @@ fn drop_span(block: *mut Block) {
     drop(ManuallyDrop::into_inner(region));
 }
 
-/// Why the cap refused, as the error to return; a cancel unwinds instead.
-fn refused(why: cap::Refused, tag: Tag, wanted: usize) -> MemError {
-    match why {
-        cap::Refused::Cancelled => cancel(),
-        cap::Refused::TooBig { limit } => MemError::Exhausted {
-            tag,
-            reserved: usize::try_from(limit).unwrap_or(usize::MAX),
-            wanted,
-        },
-    }
-}
-
 impl Drop for Frame {
     fn drop(&mut self) {
         let mut block = self.first.get();
@@ -963,7 +896,7 @@ impl Drop for Frame {
 // is reset, rolled back or dropped, each of which takes `&mut Frame` (or ownership), which no
 // live `&Frame` an allocation borrows allows; growing commits a span further, never moving it.
 // `deallocate` and `shrink` only move the cursor back over the top block, never touching
-// another. A cancel by the cap unwinds before any of the frame's state changes.
+// another.
 unsafe impl Allocator for Frame {
     #[inline]
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
@@ -1059,39 +992,17 @@ struct Shelf {
     /// Spans, linked through their headers' `next`.
     spans: Cell<*mut Block>,
     span_count: Cell<usize>,
-    /// Chunks the thread holds, on this shelf and in its tasks' frames.
-    held: Cell<usize>,
-    /// How many of those are reserved from the cap: those past the first [`SHELF`].
-    capped: Cell<usize>,
 }
 
 impl Shelf {
-    /// A chunk for a task's frame: the shelf's top, else one from the cache, reserved from the
-    /// cap when the thread holds [`SHELF`] already.
-    fn take_chunk(&self, tag: Tag) -> Result<Chunk, MemError> {
+    /// The shelf's top chunk, if it keeps any.
+    fn take_chunk(&self) -> Option<Chunk> {
         let len = self.len.get();
-        if len > 0 {
-            self.len.set(len - 1);
-            return Ok(Chunk::from_index(self.chunks[len - 1].get()));
+        if len == 0 {
+            return None;
         }
-        let capped = match self.held.get() >= SHELF {
-            true => cap::frame_reserve(CHUNK).map_err(|why| refused(why, tag, CHUNK))?,
-            false => false,
-        };
-        let chunk = match chunks::take(Tag::Frames) {
-            Ok(chunk) => chunk,
-            Err(error) => {
-                if capped {
-                    cap::frame_release(CHUNK);
-                }
-                return Err(error);
-            }
-        };
-        self.held.set(self.held.get() + 1);
-        if capped {
-            self.capped.set(self.capped.get() + 1);
-        }
-        Ok(chunk)
+        self.len.set(len - 1);
+        Some(Chunk::from_index(self.chunks[len - 1].get()))
     }
 
     /// Keeps a chunk a task's frame gave up, or gives it to the cache when the shelf is full
@@ -1106,12 +1017,6 @@ impl Shelf {
         match cold {
             true => chunks::give_cold(chunk, Tag::Frames),
             false => chunks::give(chunk, Tag::Frames),
-        }
-        let held = self.held.get().saturating_sub(1);
-        self.held.set(held);
-        if self.capped.get() > held.saturating_sub(SHELF) {
-            cap::frame_release(CHUNK);
-            self.capped.set(self.capped.get() - 1);
         }
     }
 
@@ -1135,7 +1040,7 @@ impl Shelf {
         None
     }
 
-    /// Keeps a span a task's frame gave up (its cap bytes given back), its pages past
+    /// Keeps a span a task's frame gave up, its pages past
     /// [`SPAN_WARM`] given to the kernel, or gives it whole to the kernel when the shelf is
     /// full.
     fn give_span(&self, span: *mut Block) {
@@ -1235,9 +1140,6 @@ struct Stack {
     peak: Cell<usize>,
     /// Frame ids handed out to this thread's tasks, `next..end`.
     ids: Cell<(u32, u32)>,
-    /// A cap's cancel is unwinding this thread: set by [`cancel`], cleared when the thread's
-    /// outermost task ends.
-    cancelling: Cell<bool>,
     /// What the thread's global allocations outside any task count to, while [`heap_of`] runs.
     heap: Cell<Option<Tag>>,
 }
@@ -1249,8 +1151,6 @@ thread_local! {
             len: Cell::new(0),
             spans: Cell::new(ptr::null_mut()),
             span_count: Cell::new(0),
-            held: Cell::new(0),
-            capped: Cell::new(0),
         }
     };
     static STACK: Stack = const {
@@ -1259,7 +1159,6 @@ thread_local! {
             below: Cell::new(0),
             peak: Cell::new(0),
             ids: Cell::new((0, 0)),
-            cancelling: Cell::new(false),
             heap: Cell::new(None),
         }
     };
@@ -1518,9 +1417,6 @@ fn end_task(frame: &Frame, outer: *const Frame, outer_below: usize, held: usize)
     _ = STACK.try_with(|stack| {
         frame.ended_on.set(ptr::from_ref(stack).addr());
         stack.current.set(outer);
-        if outer.is_null() {
-            stack.cancelling.set(false);
-        }
         stack.below.set(outer_below);
         if held > stack.peak.get() {
             stack.peak.set(held);
@@ -1543,7 +1439,7 @@ pub fn current<R>(f: impl FnOnce(&Frame) -> R) -> R {
 /// The calling thread's innermost task frame, taken off it for a job that switches out (a
 /// fiber's, which may resume on another thread): the thread is in no task after, until
 /// [`put_current`] puts back what this took, on the thread the job resumes on. With
-/// [`take_below`] and [`take_cancelling`], the rest of the job's task state.
+/// [`take_below`] and [`take_peak`], the rest of the job's task state.
 #[inline(never)]
 pub fn take_current() -> Option<NonZeroUsize> {
     let taken = STACK.try_with(|stack| stack.current.replace(ptr::null())).unwrap_or(ptr::null());
@@ -1596,20 +1492,6 @@ pub fn put_peak(taken: NonZeroUsize) {
     STACK.with(|stack| stack.peak.set(taken.get()));
 }
 
-/// Whether the switching job is unwinding from [`cancel`] ([`take_current`]).
-#[inline(never)]
-pub fn take_cancelling() -> Option<NonZeroUsize> {
-    STACK
-        .try_with(|stack| stack.cancelling.replace(false))
-        .unwrap_or(false)
-        .then_some(NonZeroUsize::MIN)
-}
-
-#[inline(never)]
-pub fn put_cancelling(_: NonZeroUsize) {
-    STACK.with(|stack| stack.cancelling.set(true));
-}
-
 /// The tag of the [`task`] the calling thread runs; outside any, the tag [`heap_of`] names,
 /// else `None`: what the global allocator charges an allocation to
 /// (`blaze_graph::arena::Counting`). Allocates nothing, takes no lock and never panics, so an
@@ -1649,24 +1531,6 @@ pub fn heap_of<R>(tag: Tag, f: impl FnOnce() -> R) -> R {
 #[inline(never)]
 pub fn in_task() -> bool {
     STACK.try_with(|stack| !stack.current.get().is_null()).unwrap_or(false)
-}
-
-/// Unwinds the calling task with [`Cancelled`], for its scheduler to run again: what the cap does
-/// to the newest waiter when every holder waits. Until the thread's outermost task ends,
-/// [`cancelling`] says so, for the guards the unwind drops on its way out (a query's claim,
-/// released to its waiters as a cancel, not a panic).
-#[track_caller]
-pub fn cancel() -> ! {
-    assert!(in_task(), "frame::cancel outside any frame::task");
-    _ = STACK.try_with(|stack| stack.cancelling.set(true));
-    // alloc: a cancel's payload, once per cancelled task
-    std::panic::resume_unwind(Box::new(Cancelled))
-}
-
-/// Whether the calling thread is unwinding from [`cancel`].
-#[inline(never)]
-pub fn cancelling() -> bool {
-    STACK.try_with(|stack| stack.cancelling.get()).unwrap_or(false)
 }
 
 /// Runs `f` and says the most bytes the calling thread's task frames held at once while it ran,
@@ -1746,9 +1610,33 @@ pub fn trim_spare(keep: usize) {
     _ = SHELF_OF.try_with(|shelf| shelf.trim(keep));
 }
 
-/// Bytes the calling thread's task frames hold of the [`Cap`] now.
-pub fn capped() -> u64 {
-    cap::thread_holding()
+/// How many times every thread was asked to let its warm frame memory go ([`ask_spare_trim`]).
+static SPARE_TRIMS: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// The last [`ask_spare_trim`] this thread answered ([`settle_spare`]). `const`, with no
+    /// destructor.
+    static SPARE_TRIMMED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Asks every thread to give its warm frame memory ([`WARM`] at most, a thread) back to the
+/// kernel: each does as it next goes idle ([`settle_spare`]). What a daemon with nothing to do
+/// asks, since the shelves are charged to no task and an idle daemon's next task can wait for
+/// the page faults. It wakes nobody and waits for nobody.
+pub fn ask_spare_trim() {
+    SPARE_TRIMS.fetch_add(1, Ordering::Release);
+}
+
+/// Gives the calling thread's warm frame memory back if [`ask_spare_trim`] was called since
+/// it last did; one load and a thread-local compare otherwise. What a pool worker does as it
+/// goes idle, outside any task. Whether it trimmed.
+pub fn settle_spare() -> bool {
+    let asked = SPARE_TRIMS.load(Ordering::Acquire);
+    if SPARE_TRIMMED.try_with(|done| done.replace(asked) == asked).unwrap_or(true) {
+        return false;
+    }
+    trim_spare(0);
+    true
 }
 
 /// The items of `items` in a vector in `frame`, its room the iterator's lower bound to start:

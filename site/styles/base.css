@@ -8,7 +8,7 @@ html {
 	-moz-osx-font-smoothing: grayscale;
 	font-synthesis: none;
 }
-/* No rubber band on a desk: the chat, the rail and the bar are fixed while the page bounced under them, and nothing on
+/* No rubber band on a desk: the sidebar and the top line stay put while the page bounced under them, and nothing on
    the page is worth pulling past its ends. Phones keep it (and pull to refresh). Only y: x is the swipe back. */
 @media (pointer: fine) { html { overscroll-behavior-y: none; } }
 body {

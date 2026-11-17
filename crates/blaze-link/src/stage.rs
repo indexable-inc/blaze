@@ -16,9 +16,10 @@
 use std::sync::Arc;
 
 use blaze_codegen::{
-    Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Made, RelocKind, Relocs, Static,
-    Target, Unwind,
+    Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Made, RelocKind, Relocation, Relocs,
+    Static, Target, Unwind, text,
 };
+use blaze_format::SpanRef;
 use blaze_format::cursor::{self, Reader};
 use blaze_graph::par;
 use blaze_hash::{HashMap, HashSet};
@@ -32,7 +33,7 @@ use crate::cow::{IdSet, SymSet};
 use crate::model::{Apply, Class, Fixup, Formats, Plan, Special, Sym, Writer};
 use crate::position::{self, Spans};
 use crate::reloc::{self, GotKind};
-use crate::state::{ClassId, Def, NewPiece, PieceId, PieceRef, State, What};
+use crate::state::{ClassId, Def, Hole, NewPiece, PieceId, PieceRef, Recipe, State, What};
 use crate::symbols::{IdNo, NameId, Obj, SymKey, Symbols, Wide};
 use crate::table;
 use crate::unwind::{self, Field};
@@ -246,6 +247,8 @@ fn wide<'t>(
         Target::Extern(name) => (Wide::Name(name), false),
         Target::Weak(name) => (Wide::Name(name), true),
         Target::Position(span) => (Wide::Position(span), false),
+        // The `&str` record [`Stage::texts`] composes from the recipe, never the recipe.
+        Target::Text(id) => (Wide::Text(id), false),
         Target::Coverage(array) => (Wide::Coverage(of?, *array), false),
         Target::Counter(_) => {
             of?;
@@ -275,6 +278,15 @@ fn function_keys<'f>(function: &'f CompiledFunction, table: bool, out: &mut [Wid
             put(wide(target, table, of).expect("a function's own target").0);
         }
     }
+}
+
+/// Whether `data` is a text's recipe ([`blaze_codegen::text`]): a [`Target::Text`] of its id
+/// in one of `tables`, its owner's. A recipe is never placed: [`Stage::texts`] places what it
+/// composes to.
+pub(crate) fn is_recipe<'r>(data: &Data, tables: impl IntoIterator<Item = &'r Relocs>) -> bool {
+    tables
+        .into_iter()
+        .any(|relocs| relocs.targets().iter().any(|it| matches!(it, Target::Text(id) if *id == data.id)))
 }
 
 fn key_count(function: &CompiledFunction) -> usize {
@@ -317,6 +329,7 @@ impl<'a> Stage<'a> {
             }
             Wide::Position(span) => SymKey::Position(self.symbols.id(&span.anchor), span.index),
             Wide::Coverage(key, array) => SymKey::Coverage(self.symbols.id(&key.0), array),
+            Wide::Text(id) => SymKey::Text(self.symbols.id(id)),
         };
         Ok(self.symbols.intern(key))
     }
@@ -354,9 +367,15 @@ impl<'a> Stage<'a> {
             return;
         }
         let piece = self.new.any(id).expect("just removed");
+        let own = piece.sym;
         self.changed.insert(piece.sym);
         for sym in piece.defines() {
             self.changed.insert(*sym);
+        }
+        // A text's recipe is kept while its record is: what goes with no record is never
+        // composed again.
+        if let SymKey::Text(recipe) = self.symbols.key(own) {
+            Arc::make_mut(&mut self.new.texts).remove(&recipe);
         }
         self.fresh.remove(id);
         self.write.remove(id);
@@ -509,6 +528,7 @@ impl<'a> Stage<'a> {
             }
         }
         self.positions()?;
+        self.texts()?;
         let mut seen: FrameVec<'a, Sym> = Vec::new_in(self.arena);
         for id in self.fresh.iter() {
             let piece = self.new.piece(id).expect("a fresh piece");
@@ -908,6 +928,7 @@ impl<'a> Stage<'a> {
         for (row, reloc) in relocs.rows().iter().zip(relocs.iter()) {
             let apply = reloc::of_kind(reloc.kind, self.output.format, self.arch(), in_code)
                 .map_err(|it| error(function, it))?;
+            let apply = reloc::in_output(apply, self.output.format, &self.output.kind);
             let target = syms[row.target as usize];
             let addend = match reloc.target {
                 Target::Counter(key) => {
@@ -1057,6 +1078,11 @@ impl<'a> Stage<'a> {
             let sym = syms[at];
             let relocs = &syms[at + 1..at + 1 + data.relocs.targets().len()];
             at += 1 + data.relocs.targets().len();
+            let tables = std::iter::once(&function.relocs).chain(function.data.iter().map(|it| &it.relocs));
+            if is_recipe(data, tables) {
+                self.keep_recipe(data, key)?;
+                continue;
+            }
             self.add_data(data, sym, relocs, key)?;
         }
         let mut fde_sym = None;
@@ -1375,6 +1401,180 @@ impl<'a> Stage<'a> {
         Ok(())
     }
 
+    /// Keeps the text recipe `data` in the state ([`State::texts`]), checked against the layout
+    /// [`blaze_codegen::text::recipe`] makes: each relocation a hole of [`text::HOLE`] bytes,
+    /// `Abs64` with no addend to a position, in order and inside the bytes. A recipe kept before
+    /// is the same bytes under the same id.
+    fn keep_recipe(&mut self, data: &Data, function: Option<InstanceKey>) -> Result<(), LinkError> {
+        let id = self.symbols.id(&data.id);
+        if self.new.texts.contains_key(&id) {
+            return Ok(());
+        }
+        let mut holes = Vec::with_capacity_in(data.relocs.len(), Global);
+        let mut from = 0usize;
+        for reloc in data.relocs.iter() {
+            let at = reloc.at as usize;
+            let span = match (reloc.kind, reloc.addend, reloc.target) {
+                (RelocKind::Abs64, 0, Target::Position(span)) => span,
+                _ => {
+                    return Err(error(
+                        function,
+                        format!("its text recipe {:?} has a relocation at {at} that is no file's hole", data.id),
+                    ));
+                }
+            };
+            if at < from || at.checked_add(text::HOLE).is_none_or(|end| end > data.bytes.len()) {
+                return Err(error(
+                    function,
+                    format!("its text recipe {:?} has a hole at {at} out of order or past its end", data.id),
+                ));
+            }
+            from = at + text::HOLE;
+            holes.push(Hole { at: reloc.at, anchor: self.symbols.id(&span.anchor), index: span.index });
+        }
+        let recipe = Recipe { bytes: data.bytes.to_vec(), holes };
+        Arc::make_mut(&mut self.new.texts).insert(id, recipe);
+        Ok(())
+    }
+
+    /// The text recipe `recipe` composes to with the span tables the stage has now
+    /// ([`text::compose`], each hole the name of its span's file, as [`Stage::location`] reads
+    /// it), in the stage's arena. A recipe of the program's literals and file names is UTF-8.
+    fn compose(&self, recipe: &Recipe) -> Result<&'a str, LinkError> {
+        let symbols = &*self.symbols;
+        let relocs: Relocs = recipe
+            .holes
+            .iter()
+            .map(|hole| Relocation {
+                at: hole.at,
+                kind: RelocKind::Abs64,
+                target: Target::Position(SpanRef { anchor: *symbols.content(hole.anchor), index: hole.index }),
+                addend: 0,
+            })
+            .collect();
+        let state = &self.new;
+        let file_of = |span: SpanRef| -> Result<&str, String> {
+            let table = symbols
+                .find_id(&span.anchor)
+                .and_then(|it| state.span_table(it))
+                .ok_or_else(|| format!("a position in {:?}, whose span table the link was not given", span.anchor))?;
+            let at = table
+                .span(span.index)
+                .ok_or_else(|| format!("span {} of {:?}, whose table has {}", span.index, span.anchor, table.len()))?;
+            Ok(table.file(at.file))
+        };
+        let mut out = Vec::with_capacity_in(recipe.bytes.len() + 64, self.arena);
+        text::compose(&recipe.bytes, relocs.view(), file_of, &mut out).map_err(|it| match it {
+            text::TextError::NoFile(why) => error(None, why),
+            other => error(None, format!("a text recipe that does not compose: {other:?}")),
+        })?;
+        let out = out.leak();
+        std::str::from_utf8(out).map_err(|_| error(None, "a composed text that is not UTF-8"))
+    }
+
+    /// The shared NUL-terminated string piece of `text` ([`SymKey::FileName`], as
+    /// [`Stage::location`] makes a file's name), made when missing: a composed text's bytes,
+    /// shared by content.
+    fn string(&mut self, text: &str) -> Sym {
+        let arena = self.arena;
+        let name = self.symbols.name(text);
+        let sym = self.symbols.intern(SymKey::FileName(name));
+        if self.new.home(sym).is_none() {
+            let out = arena.alloc_slice_fill_with(text.len() + 1, |_| 0);
+            out[..text.len()].copy_from_slice(text.as_bytes());
+            let bytes: &'a [u8] = out;
+            let piece = self.piece(sym, &Class::Rodata, 1, bytes.len() as u64, &[], What::Shared);
+            self.make(&piece, Content::Bytes(bytes));
+        }
+        sym
+    }
+
+    /// The `&str` record of a composed text, as the image's arch lays it out: its bytes (the
+    /// pointer zero, for its fixup; then the length), its size, its alignment and how its
+    /// pointer is written. 16 bytes 8-aligned; on wasm32 8 bytes 4-aligned.
+    fn str_record(&self, len: usize) -> Result<(&'a [u8], u64, u64), LinkError> {
+        Ok(match self.arch() {
+            Arch::Wasm32 => {
+                let len = u32::try_from(len).map_err(|_| error(None, "a composed text past 4 GiB in wasm32"))?;
+                let mut record = [0u8; 8];
+                record[4..].copy_from_slice(&len.to_le_bytes());
+                (self.arena.alloc_slice_copy(&record), 8, 4)
+            }
+            Arch::X86_64 | Arch::Aarch64 | Arch::Wasm64 => {
+                let mut record = [0u8; 16];
+                record[8..].copy_from_slice(&(len as u64).to_le_bytes());
+                (self.arena.alloc_slice_copy(&record), 16, 8)
+            }
+        })
+    }
+
+    /// The `&str` records the fresh pieces refer to and that don't exist yet: each recipe
+    /// composed, its bytes a shared string ([`Stage::string`]), the record pointing at them.
+    /// The recipe itself is never placed.
+    fn texts(&mut self) -> Result<(), LinkError> {
+        let mut wanted: FrameVec<'a, (Sym, IdNo)> = Vec::new_in(self.arena);
+        for id in self.fresh.iter() {
+            let piece = self.new.piece(id).expect("a fresh piece");
+            for fixup in piece.fixups() {
+                if let SymKey::Text(recipe) = self.symbols.key(fixup.target) {
+                    wanted.push((fixup.target, recipe));
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        radix::sort_copy_by_key(&mut wanted, |it| it.0.0);
+        wanted.dedup_by_key(|it| it.0);
+        let class = self.new.class_id(&Class::RelRo);
+        let pointer = self.location_layout().2;
+        for (sym, recipe) in wanted {
+            if self.new.home(sym).is_some() {
+                continue;
+            }
+            let Some(kept) = self.new.texts.get(&recipe) else {
+                let id = self.symbols.content(recipe);
+                return Err(error(None, format!("a text of recipe {id:?}, which no function or static gave")));
+            };
+            let text = self.compose(kept)?;
+            let string = self.string(text);
+            let (bytes, size, align) = self.str_record(text.len())?;
+            let fixups =
+                self.fixup_slice([Fixup { at: 0, apply: pointer, target: string, addend: 0, minus: None }]);
+            let piece = Self::piece_in(sym, class, align, size, fixups, What::Shared);
+            self.make(&piece, Content::Bytes(bytes));
+        }
+        Ok(())
+    }
+
+    /// The texts whose recipes name a span table in `changed`, composed again and their
+    /// records rewritten in place: a file renamed moves every text naming it, with nothing
+    /// recompiled. Costs every kept recipe's holes ([`State::texts`]: few).
+    fn recompose(&mut self, changed: &[(IdNo, u32)]) -> Result<(), LinkError> {
+        let mut again: FrameVec<'a, (PieceId, IdNo)> = Vec::new_in(self.arena);
+        for (recipe, kept) in self.new.texts.iter() {
+            if !kept.holes.iter().any(|hole| changed.iter().any(|it| it.0 == hole.anchor)) {
+                continue;
+            }
+            let Some(sym) = self.symbols.find(SymKey::Text(*recipe)) else { continue };
+            if let Some(id) = self.new.home(sym).map(|it| it.0).filter(|it| self.new.piece(*it).is_some()) {
+                again.push((id, *recipe));
+            }
+        }
+        let pointer = self.location_layout().2;
+        for (id, recipe) in again {
+            let kept = self.new.texts.get(&recipe).expect("listed above");
+            let text = self.compose(kept)?;
+            let string = self.string(text);
+            let (bytes, _, _) = self.str_record(text.len())?;
+            let fixups = [Fixup { at: 0, apply: pointer, target: string, addend: 0, minus: None }];
+            self.retarget(id, &fixups)?;
+            self.contents.insert(id, Content::Bytes(bytes));
+            self.write.insert(id);
+        }
+        Ok(())
+    }
+
     fn add_static(&mut self, it: &'a Static) -> Result<(), LinkError> {
         let (item, instance) = (self.symbols.id(&it.item.0), self.symbols.id(&it.instance));
         let sym = self.sym(SymKey::Static(item, instance));
@@ -1387,6 +1587,14 @@ impl<'a> Stage<'a> {
             self.unmake(piece);
         }
         for data in &it.data {
+            let init = match &it.init {
+                Init::Bytes { relocs, .. } => Some(relocs),
+                Init::Zeroed { .. } => None,
+            };
+            if is_recipe(data, init.into_iter().chain(it.data.iter().map(|it| &it.relocs))) {
+                self.keep_recipe(data, None)?;
+                continue;
+            }
             let id = self.symbols.id(&data.id);
             let data_sym = self.sym(SymKey::Data(id));
             let relocs = self.reloc_syms(&data.relocs)?;
@@ -1567,6 +1775,7 @@ impl<'a> Stage<'a> {
             self.spans_changed = true;
             changed.push((id, len));
         }
+        self.recompose(&changed)?;
         for (anchor, len) in changed {
             for index in 0..len {
                 let Some(sym) = self.symbols.find(SymKey::Position(anchor, index)) else {

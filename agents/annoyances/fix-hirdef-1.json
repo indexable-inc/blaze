@@ -1,0 +1,14 @@
+{
+ "id": "fix-hirdef-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane fix-hirdef",
+ "where": "hir-def tests that count queries by name (nameres/frozen/entries/tests.rs, nameres/frozen/items/tests.rs)",
+ "what": "Two 'no parse / no expansion' tests passed whatever the code did: they filtered the run log by substrings (`parse`, `outline`, `macro_expand`) and asserted the filtered list empty. `macro_expand` names no query of the tree; and a fixture database has parsed every file and compiled every `macro_rules!` expander by the time a test asks (name resolution runs when the fixture is made), so no parse query runs with or without the feature. Their controls were what failed, the first time anything ran.",
+ "cost": "about a fifth of the lane's context reading why an empty list was empty",
+ "cause": "an absence asserted by a substring over names nobody listed, in a database that had already done the work the test says is saved",
+ "class": "vacuous success: an absence check with no proof the thing can be present",
+ "prevention": "each control now asserts the exact names that run (items) or the store's own counts (entries); not built: a test-database way to start with nothing resolved (lib served from records) so 'no parse' can be shown, and a list of the run log's query names tests match exactly instead of by substring",
+ "workaround": "count what the store made and found (`Counts`), not query names",
+ "fix": "tests rewritten in the int-1112 tree; the parse saved by kept macro definitions is still shown by no test",
+ "state": "open"
+}

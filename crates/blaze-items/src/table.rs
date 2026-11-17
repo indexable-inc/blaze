@@ -12,7 +12,10 @@
 use std::cmp::Ordering;
 
 use base_db::{Crate, Db};
-use blaze_ids::{ContentId, bits::Ranked};
+use blaze_ids::{
+    ContentId,
+    bits::{self, Ranked},
+};
 use blaze_mem::{Frame, Tag, frame};
 use blaze_query::QueryKind;
 use hir_ty::next_solver::goal_store::{FactObject, FactRef};
@@ -31,45 +34,114 @@ const _: () = {
     assert!(size_of::<ItemKind>() == 1);
 };
 
-/// The hashes of a set of items, sorted by key, one column per hash kind. The items that have
-/// no hash are in a side table, by key with why.
-#[derive(PartialEq, Eq, Debug, Default)]
-pub struct HashColumns {
-    keys: Box<[ItemKey]>,
-    kinds: Box<[ItemKind]>,
-    interface: Box<[InterfaceHash]>,
-    deep: Box<[DeepHash]>,
-    has_layout: Ranked,
-    layout: Box<[LayoutHash]>,
-    has_code: Ranked,
-    code: Box<[CodeHash]>,
-    unhashable: Box<[(ItemKey, Unhashable)]>,
+/// Where a value's columns are kept: the arena of the query run that makes it (a memo's
+/// value owns nothing it drops), or a caller's frame, for a value made outside any run (a
+/// test's copy that outlives an edit).
+#[derive(Clone, Copy)]
+pub(crate) enum Keep<'a> {
+    Run(&'a blaze_memo::Memo),
+    Frame(&'a Frame),
 }
 
-impl HashColumns {
-    /// The columns of `rows`, which may come in any order and which it sorts; a key given
-    /// twice is a bug in the caller.
-    pub fn new(
+impl<'a> Keep<'a> {
+    /// The current run's arena.
+    ///
+    /// # Panics
+    ///
+    /// On the first column kept outside a query run (`blaze_memo::keep_iter`).
+    pub(crate) fn run(db: &'a Db) -> Keep<'a> {
+        Keep::Run(blaze_memo::Database::memo(db))
+    }
+
+    /// `values`, kept once at their length.
+    pub(crate) fn column<T: Copy + Send + Sync + 'static>(
+        self,
+        values: impl ExactSizeIterator<Item = T>,
+    ) -> &'a [T] {
+        match self {
+            Keep::Run(memo) => blaze_memo::keep_iter(memo, values),
+            Keep::Frame(frame) => {
+                let mut column: Vec<T, &'a Frame> = Vec::with_capacity_in(values.len(), frame);
+                column.extend(values);
+                column.leak()
+            }
+        }
+    }
+
+    /// A copy of `values`.
+    pub(crate) fn slice<T: Copy + Send + Sync + 'static>(self, values: &[T]) -> &'a [T] {
+        match self {
+            Keep::Run(memo) => blaze_memo::keep_slice(memo, values),
+            Keep::Frame(_) => self.column(values.iter().copied()),
+        }
+    }
+}
+
+/// A set of positions as a presence bitset with a count per word (`blaze_ids::bits::Ranked`'s
+/// layout, its columns kept by [`Keep`]): a member's rank, where its value sits in the dense
+/// column of the members' values, is one popcount ([`bits::rank_in`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct Presence<'a> {
+    words: &'a [u64],
+    ranks: &'a [u32],
+}
+
+impl<'a> Presence<'a> {
+    fn of(keep: Keep<'a>, set: impl Iterator<Item = bool>) -> (Presence<'a>, usize) {
+        let ranked = Ranked::from_bools(set);
+        let presence =
+            Presence { words: keep.slice(ranked.words()), ranks: keep.slice(ranked.ranks()) };
+        (presence, ranked.count())
+    }
+
+    /// `at`'s rank when it is a member.
+    fn place(self, at: usize) -> Option<usize> {
+        let word = *self.words.get(at / 64)?;
+        (word >> (at % 64) & 1 == 1).then(|| bits::rank_in(self.words, self.ranks, at))
+    }
+}
+
+/// The hashes of a set of items, sorted by key, one column per hash kind. The items that have
+/// no hash are in a side table, by key with why.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct HashColumns<'a> {
+    keys: &'a [ItemKey],
+    kinds: &'a [ItemKind],
+    interface: &'a [InterfaceHash],
+    deep: &'a [DeepHash],
+    has_layout: Presence<'a>,
+    layout: &'a [LayoutHash],
+    has_code: Presence<'a>,
+    code: &'a [CodeHash],
+    unhashable: &'a [(ItemKey, Unhashable)],
+}
+
+impl<'a> HashColumns<'a> {
+    /// The columns of `rows`, which may come in any order and which it sorts, kept by `keep`;
+    /// a key given twice is a bug in the caller.
+    pub(crate) fn new(
+        keep: Keep<'a>,
         rows: &mut [(ItemKey, ItemHashes)],
         unhashable: &mut [(ItemKey, Unhashable)],
-    ) -> HashColumns {
+    ) -> HashColumns<'a> {
         rows.sort_unstable_by_key(|&(key, _)| key);
         unhashable.sort_unstable_by_key(|&(key, _)| key);
         for pair in rows.windows(2) {
             assert_ne!(pair[0].0, pair[1].0, "blaze-items: two rows of one key");
         }
-        let has_layout = Ranked::from_bools(rows.iter().map(|(_, it)| it.layout.is_some()));
-        let has_code = Ranked::from_bools(rows.iter().map(|(_, it)| it.code.is_some()));
+        let (has_layout, layouts) =
+            Presence::of(keep, rows.iter().map(|(_, it)| it.layout.is_some()));
+        let (has_code, codes) = Presence::of(keep, rows.iter().map(|(_, it)| it.code.is_some()));
         HashColumns {
-            keys: column(rows.iter().map(|&(key, _)| key)),
-            kinds: column(rows.iter().map(|(_, it)| it.kind)),
-            interface: column(rows.iter().map(|(_, it)| it.interface)),
-            deep: column(rows.iter().map(|(_, it)| it.deep)),
-            layout: dense(has_layout.count(), rows.iter().filter_map(|(_, it)| it.layout)),
+            keys: keep.column(rows.iter().map(|&(key, _)| key)),
+            kinds: keep.column(rows.iter().map(|(_, it)| it.kind)),
+            interface: keep.column(rows.iter().map(|(_, it)| it.interface)),
+            deep: keep.column(rows.iter().map(|(_, it)| it.deep)),
+            layout: keep.column(Dense(layouts, rows.iter().filter_map(|(_, it)| it.layout))),
             has_layout,
-            code: dense(has_code.count(), rows.iter().filter_map(|(_, it)| it.code)),
+            code: keep.column(Dense(codes, rows.iter().filter_map(|(_, it)| it.code))),
             has_code,
-            unhashable: Box::from(&*unhashable),
+            unhashable: keep.slice(unhashable),
         }
     }
 
@@ -81,8 +153,8 @@ impl HashColumns {
         self.keys.is_empty()
     }
 
-    pub fn keys(&self) -> &[ItemKey] {
-        &self.keys
+    pub fn keys(&self) -> &'a [ItemKey] {
+        self.keys
     }
 
     /// The row of `key`, if it has hashes.
@@ -106,13 +178,13 @@ impl HashColumns {
     }
 
     /// The items that have no hash, sorted by key.
-    pub fn unhashable(&self) -> &[(ItemKey, Unhashable)] {
-        &self.unhashable
+    pub fn unhashable(&self) -> &'a [(ItemKey, Unhashable)] {
+        self.unhashable
     }
 
     /// The keys whose hashes differ from `old` to `self`: added, removed or changed, sorted;
     /// one merge over both key columns.
-    pub fn changed_since(&self, old: &HashColumns) -> Vec<ItemKey> {
+    pub fn changed_since(&self, old: &HashColumns<'_>) -> Vec<ItemKey> {
         let (mut a, mut b) = (0, 0);
         // alloc: the caller's list of what changed, once per build.
         let mut changed = Vec::new();
@@ -144,25 +216,44 @@ impl HashColumns {
     }
 }
 
-/// A memo's column of `values`, allocated once at its final length.
-pub(crate) fn column<T>(values: impl ExactSizeIterator<Item = T>) -> Box<[T]> {
-    dense(values.len(), values)
+/// The values the rows that have one give, `count` of them: an iterator of the length its
+/// presence set counted, so the column is kept once at it.
+struct Dense<I>(usize, I);
+
+impl<I: Iterator> Iterator for Dense<I> {
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<I::Item> {
+        let next = self.1.next();
+        if next.is_some() {
+            self.0 -= 1;
+        } else {
+            debug_assert_eq!(self.0, 0, "as many values as the presence set counted");
+        }
+        next
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.0, Some(self.0))
+    }
 }
 
-/// `count` values, the column of the rows that have one.
-fn dense<T>(count: usize, values: impl Iterator<Item = T>) -> Box<[T]> {
-    // alloc: a memo's column, kept as long as the memo, at the length its rows give.
-    let mut column = Vec::with_capacity(count);
+impl<I: Iterator> ExactSizeIterator for Dense<I> {}
+
+/// A fact set's column of `values`, allocated once at its final length.
+fn column<T>(values: impl ExactSizeIterator<Item = T>) -> Box<[T]> {
+    // alloc: a fact set's column, at the length its rows give.
+    let mut column = Vec::with_capacity(values.len());
     column.extend(values);
-    debug_assert_eq!(column.len(), count);
     column.into_boxed_slice()
 }
 
 /// The hashes of every item of `krate` with an [`crate::ItemId`], bodies' items included, in
 /// one pass: what the store keeps of a crate and diffs against the last build. Its rows are
-/// gathered in the task's frame (the hash queries it runs take frames of their own).
-#[blaze_query::tracked(returns(ref))]
-pub fn crate_hashes(db: &Db, krate: Crate) -> HashColumns {
+/// gathered in the task's frame (the hash queries it runs take frames of their own), its
+/// columns kept in the run's arena.
+#[blaze_memo::tracked(returns(ref))]
+pub fn crate_hashes<'db>(db: &'db Db, krate: Crate) -> HashColumns<'db> {
     frame::task(Tag::Other, |frame| {
         let items = crate_items_by_key(db, krate);
         let mut rows: Vec<(ItemKey, ItemHashes), &Frame> =
@@ -175,19 +266,21 @@ pub fn crate_hashes(db: &Db, krate: Crate) -> HashColumns {
             }
         }
         // Already in key order: the sort in `new` is one pass that finds it so.
-        HashColumns::new(&mut rows, &mut unhashable)
+        HashColumns::new(Keep::run(db), &mut rows, &mut unhashable)
     })
 }
 
 /// Every item of `krate` with an [`crate::ItemId`] and its key, sorted by key. An edit that
 /// adds, removes, renames or moves no item leaves it as it was, so [`crate_hashes`] rebuilt
 /// after a body edit reads no key and sorts nothing.
-#[blaze_query::tracked(returns(deref))]
-fn crate_items_by_key(db: &Db, krate: Crate) -> Box<[(ItemKey, crate::ItemId)]> {
-    let mut items: Vec<(ItemKey, crate::ItemId)> =
-        key::crate_item_ids(db, krate).map(|id| (key::item_key(db, id), id)).collect(); // alloc: a memo's column.
-    items.sort_unstable_by_key(|&(key, _)| key);
-    items.into_boxed_slice()
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn crate_items_by_key<'db>(db: &'db Db, krate: Crate) -> &'db [(ItemKey, crate::ItemId)] {
+    frame::task(Tag::Other, |frame| {
+        let mut items: Vec<(ItemKey, crate::ItemId), &Frame> = Vec::new_in(frame);
+        items.extend(key::crate_item_ids(db, krate).map(|id| (key::item_key(db, id), id)));
+        items.sort_unstable_by_key(|&(key, _)| key);
+        Keep::run(db).slice(&items)
+    })
 }
 
 const NO_OBJECT: u32 = u32::MAX;
@@ -239,7 +332,12 @@ fn split(fact: &Fact) -> (u8, ContentId, Object) {
         | Fact::DropCheck(it)
         | Fact::Derive(it)
         | Fact::HiddenTypes(it)
-        | Fact::RpititTys(it) => (tag, it.0, Object::None),
+        | Fact::RpititTys(it)
+        | Fact::TraitImpls(it)
+        | Fact::BlockImpls(it) => (tag, it.0, Object::None),
+        Fact::InherentImpls(self_ty) => (tag, self_ty.0, Object::None),
+        Fact::TraitsNamed(name) => (tag, name.0, Object::None),
+        Fact::ScopeTraitsNamed { scope, name } => (tag, scope.0, Object::Id(name.0)),
         Fact::Field { ty, field } => (tag, ty.0, Object::Field(field)),
         Fact::Method { self_ty, name } => (tag, self_ty.0, Object::Id(name.0)),
         Fact::Implements { trait_, self_ty } | Fact::Vtable { trait_, self_ty } => {
@@ -283,6 +381,11 @@ fn joined(tag: u8, subject: ContentId, object: Object) -> Option<Fact> {
         kinds::CRATE => return alone(Fact::Crate(subject)),
         kinds::HIDDEN_TYPES => return alone(Fact::HiddenTypes(item)),
         kinds::RPITIT_TYS => return alone(Fact::RpititTys(item)),
+        kinds::INHERENT_IMPLS => return alone(Fact::InherentImpls(SimplifiedType(subject))),
+        kinds::TRAIT_IMPLS => return alone(Fact::TraitImpls(item)),
+        kinds::TRAITS_NAMED => return alone(Fact::TraitsNamed(NameHash(subject))),
+        kinds::SCOPE_TRAITS_NAMED => Fact::ScopeTraitsNamed { scope: item, name: NameHash(id?) },
+        kinds::BLOCK_IMPLS => return alone(Fact::BlockImpls(item)),
         _ => return None,
     })
 }

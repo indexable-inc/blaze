@@ -1,0 +1,11 @@
+{
+ "id": "real-6",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane real-1111",
+ "where": "systemd-run on the VM",
+ "what": "A unit from `systemd-run` has an empty PATH, and its end kills the blaze daemon the script started (same cgroup), so the next command met a cold daemon; a unit name reused while that daemon lives is refused.",
+ "cost": "a failed first run and several cold restarts",
+ "cause": "systemd's defaults",
+ "workaround": "`export PATH` first; `-p KillMode=process`; a unique unit name per run",
+ "state": "open: vm.sh could do this"
+}

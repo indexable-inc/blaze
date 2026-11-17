@@ -2,7 +2,7 @@
 // incremental compilation (on in the dev profile) reloads its saved state from disk and recompiles only the codegen
 // units that changed, but cargo still reruns it for every crate downstream of an edit, and the program is linked again
 // every build (docs/v2/plan.md). blaze stays running, keeps the program in memory, redoes functions
-// and patches the built program. `blaze build/run/test` run no rustc; plain cargo after `blaze enable` still does
+// and patches the built program. `blaze build/run/test` run no rustc
 // (docs/no-rustc.md).
 site {
   learn {
@@ -10,8 +10,9 @@ site {
       Narrow
       Lesson: {1, "Compile, then link, and why a one-line edit can still take a while.", "pipeline"}
       (InTheme, themes.basics)
+      (Requires, site.start)
       Title: {"What a build does"}
-      Description: {"Lesson 1: what happens when you build Rust, and why a small edit can take seconds."}
+      Description: {"What happens when you build Rust, and why a small edit can take seconds."}
 
       Step source("From source to a program") {
         P what("When you run `cargo build`, your Rust source becomes one program you can run. Two jobs make that happen: **compiling** turns code into machine code, and **linking** joins the pieces into one file.")
@@ -34,7 +35,7 @@ site {
       }
 
       Step typo("Which crates?") {
-        Tap q(prompt: "You fix a typo in `json`. Which crates does cargo run `rustc` on again? Tap each one.", piece: "crates", right: "json,app", hint: "Start at json, then follow the arrows back to every crate that uses it.", why: "`json` changed, and `app` uses `json`, so `rustc` runs again for both, reusing what it can from its notes. `net` and `core` don't use `json`, so cargo leaves them alone.")
+        Tap q(prompt: "You fix a typo in `json`. Which crates does cargo run `rustc` on again? Tap each one.", piece: "crates", right: "json,app", hint: "Start at json and follow the arrows.", why: "`json` changed, and `app` uses `json`, so `rustc` runs again for both, reusing what it can from its notes. `net` and `core` don't use `json`, so cargo leaves them alone.")
       }
 
       Step link("Then it all links again") {
@@ -58,7 +59,7 @@ site {
       }
 
       Step same("Same commands") {
-        P commands("You still type cargo's commands, with `blaze` in place of `cargo`: `blaze build`, `blaze run`, `blaze test`. These don't run `rustc`: blaze compiles the code itself. (Plain `cargo build` after `blaze enable` still runs `rustc` for some crates, for now.)")
+        P commands("You still type cargo's commands, with `blaze` in place of `cargo`: `blaze build`, `blaze run`, `blaze test`. None of them runs `rustc` or cargo: blaze compiles the code itself.")
         Dim number("On a 200-crate workspace, an edit in the crate everything uses took 6.33 s with cargo and 0.60 s with blaze (measured once, by hand; [more runs](/bench)).")
       }
 

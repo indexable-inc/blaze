@@ -1,0 +1,14 @@
+{
+ "id": "plan-database-uncounted",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of handoff-12 request 1, int-1112",
+ "where": "crates/blaze-query/src/lib.rs (the plan database: Database, Pinned, resolve_held); crates/blaze-query/src/inputs.rs; crates/blaze-query/src/kind_counts.rs",
+ "what": "The daemon's plan database (lib.rs `Database`, the one `blaze_units::query::Plan` is asked of) counted nothing and could not say what a result read: build 58's 1.97 ms `plan` had no query_counts row, so whether it executed or verified was not measured, and the daemon could not keep a plan by its reads without walking edges it had no API for. A directory input kept only its fingerprint, not the content ID it stands for.",
+ "cost": "the plan's cost in a warm edit unattributable from the profile; E3 (plan kept by its reads) blocked on an engine API",
+ "cause": "the profile's query_counts are fed by the front end's engine (blaze_query::db::counts, per ingredient) alone; the older per-kind database grew no counters and no read-set walk",
+ "class": "two engines in one crate, with the instruments built for one only",
+ "prevention": "every engine a build asks reports through take_counts; a profile row per registered kind",
+ "workaround": "none",
+ "fix": "Pinned::inputs_of (the files and listings of the view under a memo, with their ids; control: a walk blind to dependencies proved by cutoff loses a leaf) and Database::take_counts (executed, verified, ran_new, ran_changed, evicted_asked per kind). The profile rows need observe.rs to call take_counts on the daemon's database: /tmp/plan/handoff-12-q.md.",
+ "state": "fixed in blaze-query, rows pending observe.rs"
+}

@@ -227,7 +227,6 @@ pub(crate) fn infer_body_in<'db>(
 
 fn infer_cycle_result<'db>(
     db: &'db Db,
-    _: blaze_query::db::Id,
     _: DefWithBodyId,
 ) -> InferenceResult<'db> {
     InferenceResult {
@@ -282,7 +281,6 @@ fn infer_anon_const_query<'db>(db: &'db Db, def: AnonConstId<'db>) -> InferenceR
 
 fn infer_anon_const_cycle_result<'db>(
     db: &'db Db,
-    _: blaze_query::db::Id,
     _: AnonConstId<'db>,
 ) -> InferenceResult<'db> {
     InferenceResult {
@@ -856,6 +854,13 @@ pub enum InferenceDiagnostic {
         #[type_visitable(ignore)]
         span: Span,
     },
+    /// `method_call_on_diverging_infer_var` (warn by default, to be a hard error) of a method
+    /// called at `span` on a type variable a coercion of `!` made, which the probe set to `!`:
+    /// "method call on a diverging inference variable".
+    MethodCallOnDivergingInferVar {
+        #[type_visitable(ignore)]
+        span: Span,
+    },
     /// E0308 "mismatched types" of a `&mut` pattern `pat` matching an inherited shared
     /// reference (rustc's `error_inherited_ref_mutability_mismatch`, only under
     /// `ref_pat_eat_one_layer_2024*`): noted "cannot match inherited `&` with `&mut` pattern".
@@ -981,7 +986,7 @@ fn trait_item_struct_path_def(db: &Db, trait_: TraitId, name: &Name) -> Option<S
 impl InferenceDiagnostic {
     /// Whether this is an error that leaves the body tainted by errors, like rustc's
     /// `InferCtxt::tainted_by_errors`: once it is, "type annotations needed" is not reported.
-    pub(crate) fn taints_body(&self) -> bool {
+    pub fn taints_body(&self) -> bool {
         let is_lint = |diag: &PathLoweringDiagnostic| {
             matches!(diag, PathLoweringDiagnostic::ElidedLifetimesInPath { hard_error: false, .. })
         };
@@ -993,7 +998,8 @@ impl InferenceDiagnostic {
             } => !is_lint(diag),
             InferenceDiagnostic::EditionDependentMethodCall { .. }
             | InferenceDiagnostic::FullyQualifiedCallFrom2018 { .. }
-            | InferenceDiagnostic::TyvarBehindRawPointer { .. } => false,
+            | InferenceDiagnostic::TyvarBehindRawPointer { .. }
+            | InferenceDiagnostic::MethodCallOnDivergingInferVar { .. } => false,
             _ => true,
         }
     }
@@ -1238,7 +1244,6 @@ pub enum PointerCast {
     /// Go from a mut raw pointer to a const raw pointer.
     MutToConstPointer,
 
-    #[allow(dead_code)]
     /// Go from `*const [T; N]` to `*const T`
     ArrayToPointer,
 
@@ -1274,6 +1279,12 @@ pub enum PatAdjust {
     /// An implicit call to `Deref(Mut)::deref(_mut)` before matching, such as when matching the
     /// pattern `[..]` against a scrutinee of type `Vec<T>`.
     OverloadedDeref,
+    /// blaze (`#![blaze::error_unions]`): the scrutinee is an error union (the adjustment's
+    /// `source`) and the pattern is of one of its members: it matches when the union holds
+    /// that member, against the member's value. Which member is the pattern's own type
+    /// ([`crate::error_union::member_index`]), so nothing but the kind is recorded
+    /// (docs/v2/plan/design/error-sets.md, "Matching").
+    UnionMember,
 }
 
 /// The result of type inference: A mapping from expressions and patterns to types.
@@ -1286,7 +1297,7 @@ pub enum PatAdjust {
 /// When you add a field that stores types (including `Substitution` and the like), don't forget
 /// `resolve_completely()`'ing  them in `InferenceContext::resolve_all()`. Inference variables must
 /// not appear in the final inference result.
-#[derive(Clone, PartialEq, Eq, Hash, Debug, blaze_query::Value)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct InferenceResult<'db> {
     /// For each method call expr, records the function it resolves to.
     pub(crate) method_resolutions: IndexColumn<ExprId, (FunctionId, StoredGenericArgs)>,
@@ -2122,22 +2133,9 @@ impl PartialOrd for UpvarCapture {
     }
 }
 
-/// What an inference result weighs for the byte budget of [`infer_body_query`] and
-/// [`infer_anon_const_body_query`]: [`InferenceResult::heap_bytes`].
-fn inference_bytes(value: &InferenceResult<'_>) -> usize {
-    value.heap_bytes()
-}
-
-/// The inference of a body. Free functions rather than methods of a tracked impl, so that
-/// [`crate::evict`] can name them to drop their values.
-#[blaze_query::tracked(
-    returns(ref),
-    cycle_result = infer_cycle_result,
-    lru,
-    weigh = inference_bytes,
-    mem_tag = Infer
-)]
-pub(crate) fn infer_body_query<'db>(db: &'db Db, def: DefWithBodyId) -> InferenceResult<'db> {
+/// The inference of a body.
+#[blaze_memo::tracked(returns(ref), cycle_result = infer_cycle_result, owns, mem_tag = Infer)]
+pub fn infer_body_query<'db>(db: &'db Db, def: DefWithBodyId) -> InferenceResult<'db> {
     if let Some(served) = crate::check_cache::served_inference(db, def) {
         return served;
     }
@@ -2149,13 +2147,7 @@ pub(crate) fn infer_body_query<'db>(db: &'db Db, def: DefWithBodyId) -> Inferenc
 /// Returns an `InferenceResult` containing type information for array lengths,
 /// const generic arguments, and other const expressions appearing in type
 /// positions within the item's signature.
-#[blaze_query::tracked(
-    returns(ref),
-    cycle_result = infer_anon_const_cycle_result,
-    lru,
-    weigh = inference_bytes,
-    mem_tag = Infer
-)]
+#[blaze_memo::tracked(returns(ref), cycle_result = infer_anon_const_cycle_result, owns, mem_tag = Infer)]
 pub(crate) fn infer_anon_const_body_query<'db>(
     db: &'db Db,
     def: AnonConstId<'db>,
@@ -2620,6 +2612,10 @@ impl<'db, 'f> TupleFieldTypes<'db, 'f> {
 
     /// The place of `tys`, which is added at the end if it is new: `IndexSet::insert_full`'s
     /// index.
+    #[expect(
+        blaze::narrowed_len,
+        reason = "tuple-type places are u32 in the inference record; a body with 2^32 tuple types needs a typed refusal from inference"
+    )]
     pub(crate) fn insert(&mut self, tys: Tys<'db>) -> u32 {
         let TupleFieldTypes { tys: list, places } = self;
         *places.entry(tys).or_insert_with(|| {
@@ -2660,7 +2656,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         lowering_mode: LoweringMode,
         frame: &'f Frame,
     ) -> Self {
-        let trait_env = db.trait_environment(generic_def);
+        // The owner's where clauses, or none for an anonymous constant that may not name its
+        // generic parameters (`InferBodyId::param_env` says why).
+        let trait_env = owner.param_env(db);
         let table = unify::InferenceTable::new(db, trait_env, resolver.krate(), owner);
         let types = crate::next_solver::default_types();
         let target_features = match store_owner {
@@ -3652,6 +3650,14 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         }
     }
 
+    /// rustc's `method_call_on_diverging_infer_var` from `probe_op`, once per call at `span`.
+    pub(crate) fn lint_method_call_on_diverging_infer_var(&self, span: Span) {
+        let reported = |diagnostic: &InferenceDiagnostic| matches!(diagnostic, InferenceDiagnostic::MethodCallOnDivergingInferVar { span: at } if *at == span);
+        if !self.diagnostics.any(reported) {
+            self.push_diagnostic(InferenceDiagnostic::MethodCallOnDivergingInferVar { span });
+        }
+    }
+
     pub(crate) fn require_type_is_sized(
         &mut self,
         ty: Ty<'db>,
@@ -3744,6 +3750,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     if let Some(segment) = segments.first()
                         && let Some(variant) = EnumVariants::variant_written(
                             self.db,
+                            self.resolver.ctx_table(),
                             id,
                             segment.name,
                             path.segment_hygiene(written - segments.len()).syntax_context(),
@@ -3969,7 +3976,13 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                         let at = path.segments().len() - remaining_segments.len();
                         let ctxt = path.segment_hygiene(at).syntax_context();
                         if let Some(variant) =
-                            EnumVariants::variant_written(self.db, id, current_segment.name, ctxt)
+                            EnumVariants::variant_written(
+                                self.db,
+                                self.resolver.ctx_table(),
+                                id,
+                                current_segment.name,
+                                ctxt,
+                            )
                         {
                             return if remaining_segments.len() == 1 {
                                 let segment = path.segments().len() - 1;
@@ -4058,7 +4071,13 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 {
                     let ctxt = path.segment_hygiene(remaining_idx + 1).syntax_context();
                     if let Some(variant) =
-                        EnumVariants::variant_written(self.db, id, segment.name, ctxt)
+                        EnumVariants::variant_written(
+                            self.db,
+                            self.resolver.ctx_table(),
+                            id,
+                            segment.name,
+                            ctxt,
+                        )
                     {
                         return if remaining_segments.len() == 2 {
                             let segment = remaining_idx + 1;
@@ -4131,6 +4150,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     && let Some((AdtId::EnumId(id), _)) = ty.as_adt()
                     && let Some(variant) = EnumVariants::variant_written(
                         self.db,
+                        self.resolver.ctx_table(),
                         id,
                         segment.name,
                         path.segment_hygiene(remaining_idx + 1).syntax_context(),
@@ -4321,6 +4341,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         if let Some((AdtId::EnumId(enum_id), _)) = ty.as_adt()
             && let Some(variant) = EnumVariants::variant_written(
                 self.db,
+                self.resolver.ctx_table(),
                 enum_id,
                 &segments[first],
                 path.segment_hygiene(first).syntax_context(),

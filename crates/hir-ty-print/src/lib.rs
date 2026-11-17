@@ -9,6 +9,8 @@
 //! source, through a [`DiagnosticHost`]; the other spellings need only the database, and
 //! refuse (naming the rule of rustc's not reproduced) a type they don't know how to spell.
 
+#![feature(allocator_api)]
+
 mod consts;
 pub mod def;
 mod printer;

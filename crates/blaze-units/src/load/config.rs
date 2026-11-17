@@ -12,7 +12,8 @@ use blaze_query::{Cancelled, Cx, Query, QueryKind};
 use serde::{Deserialize, Serialize};
 
 use super::files::{
-    FixedFile, FixedPath, Found, MountTable, Snap, ancestors, read_file, read_through,
+    FixedDir, FixedFile, FixedPath, Found, MountTable, Snap, ancestors, read_dir, read_file,
+    read_through,
 };
 use super::invocation::Asking;
 use super::{Unread, key_id, load_error};
@@ -51,6 +52,23 @@ impl ConfigOf {
                 let key =
                     FixedPath { table: ConfigOf::table(mounts, cwd, env), path: path.to_owned() };
                 Ok(cx.get::<FixedFile>(&key)?.get())
+            }
+        }
+    }
+
+    /// The names in the directory at `path`, sorted, each with whether it is a directory: read
+    /// through this configuration's mounts, as [`ConfigOf::read_file`] reads a file.
+    pub fn read_dir(
+        &self,
+        cx: &mut Cx<'_>,
+        path: &str,
+    ) -> Result<Found<Vec<(String, bool)>>, Cancelled> {
+        match self {
+            ConfigOf::View => read_dir(cx, path),
+            ConfigOf::Fixed { mounts, cwd, env } => {
+                let key =
+                    FixedPath { table: ConfigOf::table(mounts, cwd, env), path: path.to_owned() };
+                Ok(cx.get::<FixedDir>(&key)?.get())
             }
         }
     }

@@ -35,10 +35,12 @@ mod peek;
 mod pick;
 pub(super) mod plan;
 mod rename;
+mod palette;
 mod steps;
 
 pub(super) use rename::Rename;
 pub(super) use steps::live_face;
+pub(super) use pick::{effort_meter, model_icon};
 
 pub(super) use genui::Live as GenLive;
 pub(super) use peek::Live as PeekLive;
@@ -1685,18 +1687,22 @@ impl App {
     /// Fill a chat pane from its session's transcript: attach for its events, its rows in view, its input and status.
     pub(super) fn fill_chat_pane(&self, pane: u64, e: u64) {
         let Some(sid) = self.session_of(e) else { return };
+        let external = self.external_session(sid);
         let w = self.world.world_ref();
         let pv = View::of(w.entity_from_id(pane));
+        self.external_footer(pv, external);
         let mut states = self.chat.borrow_mut();
         let st = states.entry(sid).or_default();
-        if !st.draft_read {
+        if external.is_none() && !st.draft_read {
             st.read_draft(sid);
         }
         // Its own stream of events: attach (again a second after a try while it runs, once when it ended). The stream
         // outlives the agent (a resume's events come on it), and a past chat's is its log replayed by the daemon. A stream
         // the link holds from before the session was known to be a chat is a terminal's: dropped for ours.
         let attached = self.link.attached(sid);
-        if attached && !st.ours {
+        if external.is_some() {
+            // External transcripts are supplied by the library reader, never by a daemon attach.
+        } else if attached && !st.ours {
             self.link.detach(sid);
         } else if !attached {
             st.ours = false;
@@ -1798,8 +1804,11 @@ impl App {
                         h.set(HoverAmt::default());
                     }
                 }
-                let ctx = RowCtx { sid, sizes: Some(sizes), key: &rows[i].0, open: rows_open.get(&rows[i].0).copied(), ui: Some(&self.genui), playing: t.busy, cells: Some(&t.details) };
+                let ctx = RowCtx { sid, sizes: Some(sizes), key: &rows[i].0, open: rows_open.get(&rows[i].0).copied(), ui: external.is_none().then_some(&self.genui), playing: t.busy, cells: Some(&t.details) };
                 fill_row(row, &rows[i].1, &ctx, &mut measure);
+                if external.is_some() && matches!(rows[i].1, Row::Ui { .. }) {
+                    Self::external_inert_cell(row);
+                }
                 if let Some(mut pad) = view::prefab(w, rows[i].1.prefab()).and_then(|p| p.try_cloned::<&harness_native_ui_layout_api::Padding>()) {
                     if nested.contains(&rows[i].0) {
                         pad.l += nest_by;
@@ -1867,7 +1876,7 @@ impl App {
         // The input: its words (the marked text in), caret and selection, focused while the pane has the keyboard.
         let focused =
             self.focused && self.focused_pane() == Some(pane) && !self.tree_focus && self.palette.is_none() && !self.genui_editing()
-                && !self.renaming();
+                && !self.renaming() && st.pick.is_none();
         // Its chips: the one under the pointer, its card, and the live state of the pull requests, issues and places it
         // names (relative places from the session's directory, as a press opens them: chat_open_at).
         let cwd = self
@@ -1884,6 +1893,9 @@ impl App {
             if let Some(card) = View::of(w.entity_from_id(id)).part("card") {
                 self.fill_card(card, st, &tag.tag, &cwd, true);
             }
+        }
+        if external.is_some() {
+            return;
         }
         self.fill_chat_mention(pv, sid, st, &cwd, focused);
         let ended = self.status_of(e) != "running";
@@ -1936,16 +1948,7 @@ impl App {
                     txt.entity().set(MarkdownText::default());
                 }
                 txt.text(&shown);
-                let mut te = txt.entity().try_cloned::<&TextEdit>().unwrap_or_default();
-                // The caret blinks as the terminal's cursor does (Ghostty's cursor-style-blink), solid again as it moves.
-                let blink = self.look.themes[usize::from(self.dark)].blink;
-                let moved = (te.caret, te.anchor, te.mark_lo, te.mark_hi) != (caret, anchor, lo, hi) || (focused && !te.focused);
-                let since = if moved { self.time } else { te.since };
-                let next = TextEdit { caret, anchor, mark_lo: lo, mark_hi: hi, focused, blink, since, ..te };
-                if next != te {
-                    te = next;
-                    txt.entity().set(te);
-                }
+                self.sync_draft_caret(txt, [caret, anchor, lo, hi], focused);
                 // Grown past its most, it scrolls on its FieldScroll (step_chat_inputs), the caret kept in view.
             }
         }
@@ -1963,7 +1966,7 @@ impl App {
             // say.
             let listed = o.try_cloned::<&model::AgentModel>().unwrap_or_default();
             let listed = (listed.s.as_str(), listed.effort.as_str());
-            self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &mut st.effort, listed, ended, st.ctx_open);
+            self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &mut st.effort, listed, ended);
         }
         if let Some(foot) = pv.part("foot") {
             self.fill_chat_activity(foot, e, t, ended);
@@ -2090,6 +2093,9 @@ impl App {
     /// whose chip shows over its parent's composer. A shot's recorded chat is fed instead.
     /// Asked while the transcripts are borrowed (the pane's fill), so it waits for the next fill ([`App::watch_chats`]).
     fn watch_chat(&self, sid: u64) {
+        if self.external_session(sid).is_some() {
+            return;
+        }
         let mut w = self.watched.borrow_mut();
         if !w.0.contains(&sid) {
             w.0.insert(sid);
@@ -2101,7 +2107,7 @@ impl App {
     fn watch_chats(&self) {
         let due = std::mem::take(&mut self.watched.borrow_mut().1);
         for sid in due {
-            if self.link.attached(sid) || self.chats.borrow().contains_key(&sid) {
+            if self.external_session(sid).is_some() || self.link.attached(sid) || self.chats.borrow().contains_key(&sid) {
                 continue;
             }
             match self.shot_feed.get(&sid) {
@@ -2324,14 +2330,7 @@ impl App {
         if moving {
             self.poke();
         }
-        // A focused input's caret (or a name's being renamed) fades on the clock: keep drawing.
-        if self.focused
-            && self.look.themes[usize::from(self.dark)].blink
-            && (self.renaming()
-                || (self.chat_focused() && !self.tree_focus && self.palette.is_none() && !self.genui_editing()))
-        {
-            self.poke_why("caret blink");
-        }
+        // Visible caret animation is owned by the renderer's shared caret primitive, including overlays and rename fields.
         // A cell's controls: its field's typing, a dragged slider, an open select.
         self.step_genui();
         // A press off the picker's open menu closes it.
@@ -2491,14 +2490,21 @@ impl App {
 
     /// Run `f` on the focused chat's draft; true when there is one.
     fn with_draft(&mut self, f: impl FnOnce(&mut Draft)) -> bool {
+        if self.palette_editing() { return self.palette_draft(f); }
         // A name being renamed takes them first (chat/rename.rs), then a cell's field that has the keys, then the input.
         if self.renaming() {
             return self.rename_draft(f);
+        }
+        if self.focused_chat().is_some_and(|(_, _, sid)| self.external_session(sid).is_some()) {
+            return true;
         }
         if self.genui_editing() {
             return self.genui_draft(f);
         }
         let Some((_, _, sid)) = self.focused_chat() else { return false };
+        if self.external_session(sid).is_some() {
+            return true;
+        }
         f(&mut self.chat.borrow_mut().entry(sid).or_default().draft);
         self.poke();
         true
@@ -2507,6 +2513,9 @@ impl App {
     /// Send chat `sid`'s draft (Return) with the pictures pasted into it, the draft emptied; nothing while it holds only
     /// blanks and no picture. A draft that starts with a space is asked aside instead ([`App::chat_ask_aside`]).
     pub(in crate::app) fn chat_send_draft(&mut self, sid: u64) {
+        if self.external_session(sid).is_some() {
+            return;
+        }
         if self.chat.borrow().get(&sid).is_some_and(|st| is_aside(&st.draft)) {
             return self.chat_ask_aside(sid);
         }
@@ -2530,6 +2539,9 @@ impl App {
     /// emptied and its card over the composer asking; the pictures pasted into the draft stay for the next message (an
     /// aside takes none). Nothing while the draft holds only blanks.
     fn chat_ask_aside(&mut self, sid: u64) {
+        if self.external_session(sid).is_some() {
+            return;
+        }
         let (text, slot) = {
             let mut states = self.chat.borrow_mut();
             let Some(st) = states.get_mut(&sid) else { return };
@@ -2584,9 +2596,14 @@ impl App {
 
     /// An `act.Edit` on the focused chat's input (scene/20-keys.flecs ctx.Chat).
     pub(super) fn chat_edit(&mut self, op: &str) {
+        if self.palette_editing() { return self.palette_edit(op); }
         // A name being renamed has the keys before anything in the pane (chat/rename.rs).
         if self.renaming() {
             return self.rename_edit(op);
+        }
+        if self.focused_chat().is_some_and(|(_, _, sid)| self.external_session(sid).is_some()) {
+            // Its text remains selectable and copyable; there is no agent or draft here to edit or interrupt.
+            return;
         }
         if self.genui_editing() {
             return self.genui_edit(op);
@@ -2662,6 +2679,7 @@ impl App {
         let mut states = self.chat.borrow_mut();
         let changed: Vec<(u64, String, Vec<String>, (String, Vec<(usize, String)>))> = states
             .iter()
+            .filter(|(sid, _)| self.external_session(**sid).is_none())
             .filter(|(_, st)| st.draft_read && (st.draft.text.as_str(), st.images.as_slice()) != (st.draft_saved.0.as_str(), st.draft_saved.1.as_slice()))
             .map(|(sid, st)| (*sid, st.draft.text.clone(), st.images.clone(), st.draft.wire()))
             .collect();
@@ -2691,6 +2709,9 @@ impl App {
             return false;
         }
         let Some((_, _, sid)) = self.focused_chat() else { return false };
+        if self.external_session(sid).is_some() {
+            return false;
+        }
         let sizes: Vec<_> = paths.iter().map(|p| mention::image_size(p)).collect();
         if sizes.iter().any(Option::is_none) {
             return false;
@@ -2715,19 +2736,21 @@ impl App {
             eprintln!("harness-native: chat:ctx:{rest} names no session");
             return;
         };
-        if let Some(st) = self.chat.borrow_mut().get_mut(&sid) {
-            st.ctx_open = !st.ctx_open;
-        }
+        // Loading this chat's normal view fetches its detailed breakdown; all other rows use small summaries.
+        if let Some(entity) = self.entity_of(sid) { self.select(Some(entity)); self.tree_focus = false; }
+        let mut states = self.chat.borrow_mut();
+        let was = states.get(&sid).is_some_and(|st| st.ctx_open);
+        for st in states.values_mut() { st.ctx_open = false; }
+        states.entry(sid).or_default().ctx_open = !was;
+        drop(states);
         self.poke();
     }
 
-    /// Escape: the focused chat's opened context popover closes. Whether one was open.
-    fn chat_ctx_close(&mut self) -> bool {
-        let Some((_, _, sid)) = self.focused_chat() else { return false };
-        let closed = self.chat.borrow_mut().get_mut(&sid).is_some_and(|st| std::mem::take(&mut st.ctx_open));
-        if closed {
-            self.poke();
-        }
+    /// Escape or a device collapse closes every pinned inline context card, including another row's.
+    pub(in crate::app) fn chat_ctx_close(&mut self) -> bool {
+        let mut closed = false;
+        for st in self.chat.borrow_mut().values_mut() { closed |= std::mem::take(&mut st.ctx_open); }
+        if closed { self.poke(); }
         closed
     }
 
@@ -2748,6 +2771,10 @@ impl App {
     /// Text typed (a key no binding took), committed by an input method or pasted, into the focused chat's input.
     /// Whether a chat took it.
     pub(super) fn chat_type(&mut self, text: &str) -> bool {
+        if self.palette_editing() { self.palette_type(text); return true; }
+        if self.focused_chat().is_some_and(|(_, _, sid)| self.external_session(sid).is_some()) {
+            return true;
+        }
         // An open searchable menu (the models') has the keys: what is typed filters it.
         if let Some((_, _, sid)) = self.focused_chat()
             && self.chat_pick_type(sid, harness_native_ui_view::search::Edit::Type(text))
@@ -2789,23 +2816,33 @@ impl App {
     }
 
     pub(super) fn chat_marked(&self) -> Option<Option<String>> {
+        if self.palette_editing() { return Some(self.palette.as_ref().and_then(|p| p.query.marked.clone())); }
         if let Some(r) = &self.rename {
             return Some(r.marked());
+        }
+        if self.focused_chat().is_some_and(|(_, _, sid)| self.external_session(sid).is_some()) {
+            return Some(None);
         }
         if let Some(m) = self.genui_marked() {
             return Some(m);
         }
         let (_, _, sid) = self.focused_chat()?;
+        if self.external_session(sid).is_some() {
+            return Some(None);
+        }
         Some(self.chat.borrow().get(&sid).and_then(|s| s.draft.marked.clone()))
     }
 
     /// What the focused chat has selected, for Command-C: its transcript's selection (a row taken whole as markdown),
     /// else its input's.
     pub(super) fn chat_copy(&self) -> Option<Option<(String, Copied)>> {
+        if self.palette_editing() { return self.palette_copy(); }
         if let Some(c) = self.rename_copy() {
             return Some(c);
         }
-        if let Some((text, node)) = self.genui_copy() {
+        if !self.focused_chat().is_some_and(|(_, _, sid)| self.external_session(sid).is_some())
+            && let Some((text, node)) = self.genui_copy()
+        {
             return Some((!text.is_empty()).then_some((text, Copied::Field(node))));
         }
         let (_, _, sid) = self.focused_chat()?;
@@ -2922,6 +2959,7 @@ impl App {
     /// Command-A in the focused chat: the whole transcript after a press in it, else the input's draft. Whether a chat
     /// took it.
     pub(super) fn chat_select_all(&mut self) -> bool {
+        if self.palette_editing() { return self.palette_draft(|d| (d.anchor, d.caret) = (0, d.text.len())); }
         if self.renaming() {
             return self.with_draft(|d| (d.anchor, d.caret) = (0, d.text.len()));
         }
@@ -2969,6 +3007,11 @@ impl App {
     /// Where the focused chat's caret is (window points, zoomed), for the input method's candidate window: the start of
     /// the marked text, else the caret ([`words_caret`]): a cell's field's while it has the keys, else the input's.
     pub(super) fn chat_caret_rect(&mut self) -> Option<Option<[f32; 4]>> {
+        if self.palette_editing() {
+            let z = self.zoom();
+            let caret = self.palette_text().and_then(|t| words_caret(&mut self.paint.borrow_mut(), t.entity()));
+            return Some(caret.map(|r| r.map(|v| v * z)));
+        }
         let z = self.zoom();
         let zoomed = |r: Option<[f32; 4]>| r.map(|r| r.map(|v| v * z));
         if let Some(node) = self.rename.as_ref().and_then(|r| self.rename_node(r.obj)) {
@@ -3684,6 +3727,19 @@ fn fill_activity_pop<'v>(pop: View<'v>, strip: View<'v>, chips: &[Chip], item: O
 /// The remove button's glyph on a pasted picture (codicon's close).
 const REMOVE_ICON: &str = "\u{EA76}";
 
+/// Draw Markdown outside a live transcript using the same block parser and row widgets.
+pub(super) fn fill_markdown(v: View<'_>, source: &str, measure: &mut Measure<'_>) {
+    let mut rows = Vec::new(); // alloc: bounded Markdown blocks owned by this preview
+    blocks(source, false, &mut rows);
+    // Reference cards need live transcript context; a standalone preview keeps their inline links visible.
+    for row in &mut rows {
+        if let Row::RefCard(text) = row { *row = Row::Prose(std::mem::take(text)); }
+    }
+    view::for_each_of(v, rows.iter().enumerate().map(|(i, r)| (format!("m{i}"), r.prefab(), r)), |row, r, _| {
+        fill_row(row, r, &RowCtx::NOWHERE, measure);
+    });
+}
+
 /// Fill one transcript row from what it shows.
 fn fill_row(row: View<'_>, r: &Row, ctx: &RowCtx<'_>, measure: &mut Measure<'_>) {
     let text = |name: &str, s: &str| {
@@ -4054,6 +4110,21 @@ fn tooltip(v: View<'_>, s: &str) {
         }
     } else if had.is_none_or(|t| t.text.as_str() != s) {
         v.set(Tooltip { text: s.into() });
+    }
+}
+
+impl App {
+    /// Every Draft editor uses the same TextEdit/caret primitive and Ghostty blink preference, with no overlay-specific cursor.
+    pub(in crate::app) fn sync_draft_caret(&self, text: View<'_>, units: [u32; 4], focused: bool) {
+        let old = text.entity().try_cloned::<&TextEdit>().unwrap_or_default();
+        let [caret, anchor, mark_lo, mark_hi] = units;
+        let moved = [old.caret, old.anchor, old.mark_lo, old.mark_hi] != units || (focused && !old.focused);
+        let next = TextEdit {
+            caret, anchor, mark_lo, mark_hi, focused,
+            blink: self.look.themes[usize::from(self.dark)].blink,
+            since: if moved { self.time } else { old.since }, ..old
+        };
+        if next != old { text.set(next); }
     }
 }
 

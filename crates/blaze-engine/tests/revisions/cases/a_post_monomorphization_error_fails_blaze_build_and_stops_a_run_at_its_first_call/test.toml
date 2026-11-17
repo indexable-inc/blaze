@@ -1,0 +1,13 @@
+about = "An error made by instantiating (a constant evaluated with the instance's arguments) fails `blaze build`, which makes every instance ahead, naming it; a launched `blaze run` makes a function at its first call, so it prints what the program prints before that call, then stops with the same diagnostic and status 101 (the one deferral a launched run makes, beside a function the backend cannot make: the owner's decision of end-state.md, the launched run). Its control is the build's revision: the same program refused ahead."
+drivers = ["real"]
+
+[[revision]]
+action = "build"
+fails = "N is too large for Small"
+
+[[revision]]
+steps = []
+action = "run"
+fails = "N is too large for Small"
+prints = "before the call\n"
+status = 101

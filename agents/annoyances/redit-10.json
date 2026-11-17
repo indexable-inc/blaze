@@ -1,0 +1,11 @@
+{
+ "id": "redit-10",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+ "where": "ix VM made without `--memory-commit`",
+ "what": "After several 70 to 80 GiB daemons had been started and killed on the lane's VM (the brief's `ix new`, no `--memory-commit`), the same blaze binary's cold build of a three-crate fixture went from 39.5 s to 190 s, and reth's cold build was still at its first units after 8 minutes. `MemTotal` had moved 251, 243, 227, 238 GiB, `dmesg` held 2,591 `splits a leaf entry in vmemmap` lines, and a build spent 5.7 times as much system as user CPU (2,617 s against 457 s), its threads' kernel stacks in `do_page_fault` > `lock_mm_and_find_vma`. `drop_caches` and `compact_memory` changed nothing; THP `madvise` gave 117 s. A VM made again with `--memory-commit` ran the same fixture in 45 s.",
+ "cost": "about 50 minutes: the slowdown was first taken for a regression of the lane's own change, which was bisected across three binaries before the machine was suspected",
+ "cause": "not proven: it follows virtio-mem taking memory back and giving it again; the profile's `llvm compile` spans (85.8 s of CPU for 11,943 compiles before, 3,932 s after) were the row that said the code had not changed",
+ "workaround": "`ix new .. --memory-commit` for any lane that builds; compare a known build's time before trusting a new number",
+ "state": "open: the brief's and the skill's `ix new` line for a build lane should carry `--memory-commit`, and a measuring script should refuse when system CPU passes user CPU"
+}

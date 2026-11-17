@@ -15,7 +15,10 @@ use tt::{
 
 use crate::{MacroCallStyle, ParseError};
 
-pub(crate) fn parse_rule_style(src: &mut TtIter<'_>) -> Result<MacroCallStyle, ParseError> {
+/// The style of a rule, and for an `attr(..)` rule the group of its arguments' pattern.
+pub(crate) fn parse_rule_style<'a>(
+    src: &mut TtIter<'a>,
+) -> Result<(MacroCallStyle, Option<(tt::Subtree, TtIter<'a>)>), ParseError> {
     // Skip an optional `unsafe`. This is only actually allowed for `attr`
     // rules, but we'll let rustc worry about that.
     if let Some(TtElement::Leaf(tt::Leaf::Ident(ident))) = src.peek()
@@ -27,17 +30,15 @@ pub(crate) fn parse_rule_style(src: &mut TtIter<'_>) -> Result<MacroCallStyle, P
     let kind = match src.peek() {
         Some(TtElement::Leaf(tt::Leaf::Ident(ident))) if ident.sym == sym::attr => {
             src.next().expect("already peeked");
-            // FIXME: Add support for `attr(..)` rules with attribute arguments,
-            // which would be inside these parens.
-            src.expect_subtree().map_err(|_| ParseError::expected("expected `()`"))?;
-            MacroCallStyle::Attr
+            let args = src.expect_subtree().map_err(|_| ParseError::expected("expected `()`"))?;
+            (MacroCallStyle::Attr, Some(args))
         }
         Some(TtElement::Leaf(tt::Leaf::Ident(ident))) if ident.sym == sym::derive => {
             src.next().expect("already peeked");
             src.expect_subtree().map_err(|_| ParseError::expected("expected `()`"))?;
-            MacroCallStyle::Derive
+            (MacroCallStyle::Derive, None)
         }
-        _ => MacroCallStyle::FnLike,
+        _ => (MacroCallStyle::FnLike, None),
     };
     Ok(kind)
 }
@@ -85,11 +86,66 @@ impl MetaTemplate {
         // alloc: the template, once per rule, when the macro is defined.
         let mut res = Vec::new();
         while let Some(first) = src.peek() {
+            if let Mode::Pattern = mode
+                && let Some(after) = after_doc_comment(&src)
+            {
+                src = after;
+                continue;
+            }
             let op = next_op(edition, first, &mut src, mode)?;
             res.push(op);
         }
 
         Ok(MetaTemplate(res.into_boxed_slice()))
+    }
+}
+
+/// `src` past the doc comment it starts with, when it starts with one.
+///
+/// A doc comment in a matcher matches nothing: rustc's matcher (`macro_parser.rs`,
+/// `parse_tt_inner`, the `MatcherLoc::Token` arm) steps over a `DocComment` token of the
+/// matcher without looking at the input ("a bug, but #95267 showed that existing programs rely
+/// on this behaviour"; konst 0.2.20's `__declare_string_cmp_fns` has one between two of its
+/// `key = $value:ident,` pairs). A doc comment of the input is not stepped over: it is its
+/// `#[doc = ...]` attribute there, as before.
+///
+/// The bridge has already turned the comment into `#[doc = "..."]` (`#![doc = "..."]` for an
+/// inner one), every token of which, the brackets too, carries the one span of the comment
+/// (`syntax_bridge::convert_doc_comment`). That is how it is told from an attribute written out
+/// in the matcher, whose `#`, brackets, `doc`, `=` and literal each have their own span, and
+/// which still has to be matched by the input. It holds through a macro that defines a macro:
+/// transcribing keeps a template token's span.
+fn after_doc_comment<'a>(src: &TtIter<'a>) -> Option<TtIter<'a>> {
+    let mut src = src.clone();
+    let Some(TtElement::Leaf(tt::Leaf::Punct(tt::Punct { char: '#', span, .. }))) = src.next()
+    else {
+        return None;
+    };
+    let mut next = src.next()?;
+    if let TtElement::Leaf(tt::Leaf::Punct(tt::Punct { char: '!', span: bang, .. })) = next {
+        if bang != span {
+            return None;
+        }
+        next = src.next()?;
+    }
+    let TtElement::Subtree(subtree, mut inner) = next else { return None };
+    let delimiter = subtree.delimiter;
+    if delimiter.kind != tt::DelimiterKind::Bracket
+        || delimiter.open != span
+        || delimiter.close != span
+    {
+        return None;
+    }
+    match (inner.next()?, inner.next()?, inner.next()?, inner.next()) {
+        (
+            TtElement::Leaf(tt::Leaf::Ident(doc)),
+            TtElement::Leaf(tt::Leaf::Punct(tt::Punct { char: '=', span: eq, .. })),
+            TtElement::Leaf(tt::Leaf::Literal(text)),
+            None,
+        ) if doc.sym == sym::doc && doc.span == span && eq == span && text.span == span => {
+            Some(src)
+        }
+        _ => None,
     }
 }
 

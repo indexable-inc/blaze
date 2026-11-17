@@ -1,0 +1,210 @@
+== 5000 ms
+warning: profile package spec `aho-corasick` in profile `dev` did not match any packages
+warning: profile package spec `blaze-codegen-code` in profile `dev` did not match any packages
+warning: profile package spec `blaze-inproc` in profile `dev` did not match any packages
+warning: profile package spec `blaze-inproc-rt` in profile `dev` did not match any packages
+warning: profile package spec `blaze-script` in profile `dev` did not match any packages
+
+help: a package with a similar name exists: `blaze-screen`
+warning: profile package spec `dissimilar` in profile `dev` did not match any packages
+warning: profile package spec `miniz_oxide` in profile `dev` did not match any packages
+warning: profile package spec `regex` in profile `dev` did not match any packages
+
+help: a package with a similar name exists: `rend`
+warning: profile package spec `regex-automata` in profile `dev` did not match any packages
+warning: profile package spec `regex-syntax` in profile `dev` did not match any packages
+warning: profile package spec `rustc-hash` in profile `dev` did not match any packages
+warning: profile package spec `scripts` in profile `dev` did not match any packages
+warning: profile package spec `smol_str` in profile `dev` did not match any packages
+warning: profile package spec `syntax-tree` in profile `dev` did not match any packages
+warning: profile package spec `text-size` in profile `dev` did not match any packages
+warning: profile package spec `blaze-codegen-code` in profile `release` did not match any packages
+ ▶ lowering /root/blaze  names    1.8s
+ building  ━━━━━━━━━━━━━━━━━━━━━━━─  488/489 · 1 running · 5.0s
+== 9000 ms
+warning: profile package spec `aho-corasick` in profile `dev` did not match any packages
+warning: profile package spec `blaze-codegen-code` in profile `dev` did not match any packages
+warning: profile package spec `blaze-inproc` in profile `dev` did not match any packages
+warning: profile package spec `blaze-inproc-rt` in profile `dev` did not match any packages
+warning: profile package spec `blaze-script` in profile `dev` did not match any packages
+
+help: a package with a similar name exists: `blaze-screen`
+warning: profile package spec `dissimilar` in profile `dev` did not match any packages
+warning: profile package spec `miniz_oxide` in profile `dev` did not match any packages
+warning: profile package spec `regex` in profile `dev` did not match any packages
+
+help: a package with a similar name exists: `rend`
+warning: profile package spec `regex-automata` in profile `dev` did not match any packages
+warning: profile package spec `regex-syntax` in profile `dev` did not match any packages
+warning: profile package spec `rustc-hash` in profile `dev` did not match any packages
+warning: profile package spec `scripts` in profile `dev` did not match any packages
+warning: profile package spec `smol_str` in profile `dev` did not match any packages
+warning: profile package spec `syntax-tree` in profile `dev` did not match any packages
+warning: profile package spec `text-size` in profile `dev` did not match any packages
+warning: profile package spec `blaze-codegen-code` in profile `release` did not match any packages
+ ▶ lowering /root/blaze  names    5.8s
+ building  ━━━━━━━━━━━━━━━━━━━━━━━─  488/489 · 1 running · 9.0s
+== 13000 ms
+warning: profile package spec `aho-corasick` in profile `dev` did not match any packages
+warning: profile package spec `blaze-codegen-code` in profile `dev` did not match any packages
+warning: profile package spec `blaze-inproc` in profile `dev` did not match any packages
+warning: profile package spec `blaze-inproc-rt` in profile `dev` did not match any packages
+warning: profile package spec `blaze-script` in profile `dev` did not match any packages
+
+help: a package with a similar name exists: `blaze-screen`
+warning: profile package spec `dissimilar` in profile `dev` did not match any packages
+warning: profile package spec `miniz_oxide` in profile `dev` did not match any packages
+warning: profile package spec `regex` in profile `dev` did not match any packages
+
+help: a package with a similar name exists: `rend`
+warning: profile package spec `regex-automata` in profile `dev` did not match any packages
+warning: profile package spec `regex-syntax` in profile `dev` did not match any packages
+warning: profile package spec `rustc-hash` in profile `dev` did not match any packages
+warning: profile package spec `scripts` in profile `dev` did not match any packages
+warning: profile package spec `smol_str` in profile `dev` did not match any packages
+warning: profile package spec `syntax-tree` in profile `dev` did not match any packages
+warning: profile package spec `text-size` in profile `dev` did not match any packages
+warning: profile package spec `blaze-codegen-code` in profile `release` did not match any packages
+ ▶ core          names              4.6s  ← 831 wait on it
+ ▶ core (macro)  check + codegen    3.9s  ← 322 wait on it
+ building  ━━━━━━━━────────────────  538/1504 · 3 running · 13.0s
+== 17000 ms
+warning: profile package spec `aho-corasick` in profile `dev` did not match any packages
+warning: profile package spec `blaze-codegen-code` in profile `dev` did not match any packages
+warning: profile package spec `blaze-inproc` in profile `dev` did not match any packages
+warning: profile package spec `blaze-inproc-rt` in profile `dev` did not match any packages
+warning: profile package spec `blaze-script` in profile `dev` did not match any packages
+
+help: a package with a similar name exists: `blaze-screen`
+warning: profile package spec `dissimilar` in profile `dev` did not match any packages
+warning: profile package spec `miniz_oxide` in profile `dev` did not match any packages
+warning: profile package spec `regex` in profile `dev` did not match any packages
+
+help: a package with a similar name exists: `rend`
+warning: profile package spec `regex-automata` in profile `dev` did not match any packages
+warning: profile package spec `regex-syntax` in profile `dev` did not match any packages
+warning: profile package spec `rustc-hash` in profile `dev` did not match any packages
+warning: profile package spec `scripts` in profile `dev` did not match any packages
+warning: profile package spec `smol_str` in profile `dev` did not match any packages
+warning: profile package spec `syntax-tree` in profile `dev` did not match any packages
+warning: profile package spec `text-size` in profile `dev` did not match any packages
+warning: profile package spec `blaze-codegen-code` in profile `release` did not match any packages
+ ▶ core          names              8.6s  ← 831 wait on it
+ ▶ core (macro)  check + codegen    7.9s  ← 322 wait on it
+ building  ━━━━━━━━────────────────  538/1504 · 3 running · 17.0s
+== 21000 ms
+warning: profile package spec `aho-corasick` in profile `dev` did not match any packages
+warning: profile package spec `blaze-codegen-code` in profile `dev` did not match any packages
+warning: profile package spec `blaze-inproc` in profile `dev` did not match any packages
+warning: profile package spec `blaze-inproc-rt` in profile `dev` did not match any packages
+warning: profile package spec `blaze-script` in profile `dev` did not match any packages
+
+help: a package with a similar name exists: `blaze-screen`
+warning: profile package spec `dissimilar` in profile `dev` did not match any packages
+warning: profile package spec `miniz_oxide` in profile `dev` did not match any packages
+warning: profile package spec `regex` in profile `dev` did not match any packages
+
+help: a package with a similar name exists: `rend`
+warning: profile package spec `regex-automata` in profile `dev` did not match any packages
+warning: profile package spec `regex-syntax` in profile `dev` did not match any packages
+warning: profile package spec `rustc-hash` in profile `dev` did not match any packages
+warning: profile package spec `scripts` in profile `dev` did not match any packages
+warning: profile package spec `smol_str` in profile `dev` did not match any packages
+warning: profile package spec `syntax-tree` in profile `dev` did not match any packages
+warning: profile package spec `text-size` in profile `dev` did not match any packages
+warning: profile package spec `blaze-codegen-code` in profile `release` did not match any packages
+warning: the feature `allocator_api` has been partially stabilized since 1.100.0 and is succeeded by the feature `allocator_ext`
+  --> crates/blaze-radix/src/lib.rs:26:12
+   |
+26 | #![feature(allocator_api, allocator_ext)]
+   |            ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(stable_features)]` on by default
+help: if you are using features which are still unstable, change to using `allocator_ext`
+   |
+26 - #![feature(allocator_api, allocator_ext)]
+26 + #![feature(allocator_ext, allocator_ext)]
+   |
+help: if you are using features which are now stable, remove this line
+   |
+26 - #![feature(allocator_api, allocator_ext)]
+   |
+
+ ▶ libc (build script)              names      3.2s  ← 253 wait on it
+ ▶ blaze-phf                        codegen    3.0s
+ ▶ blaze-spin                       codegen    3.0s
+ ▶ blaze-radix                      codegen    3.0s  ← 67 wait on it
+ ▶ blaze-reclaim                    codegen    3.0s  ← 77 wait on it
+ ▶ blaze-rng                        codegen    3.0s  ← 67 wait on it
+ ▶ blaze-sys                        codegen    2.6s  ← 67 wait on it
+ ▶ blaze-serde-derive (proc macro)  codegen    2.6s  ← 72 wait on it
+ ▶ serde_json (build script)        codegen    1.9s
+ ▶ zstd-safe (build script)         codegen    1.9s  ← 63 wait on it
+ ▶ parking_lot_core (build script)  codegen    1.6s  ← 88 wait on it
+ ▶ crossbeam-deque (build script)   codegen    1.6s
+ ▶ crossbeam-utils (build script)   codegen    1.6s  ← 103 wait on it
+ ▶ object (build script)            codegen    1.0s  ← 64 wait on it
+ ▶ quote (build script)             codegen    1.0s  ← 153 wait on it
+ ▶ zmij (build script)              codegen    1.0s  ← 58 wait on it
+ ▶ getrandom (build script)         codegen    1.0s
+ ▶ blaze-thin (build script)        codegen    1.0s
+   … 7 more running
+ building  ━━━━━━━━━━━━━━━─────────  999/1504 · 27 running · 21.0s
+== end
+warning: profile package spec `aho-corasick` in profile `dev` did not match any packages
+warning: profile package spec `blaze-codegen-code` in profile `dev` did not match any packages
+warning: profile package spec `blaze-inproc` in profile `dev` did not match any packages
+warning: profile package spec `blaze-inproc-rt` in profile `dev` did not match any packages
+warning: profile package spec `blaze-script` in profile `dev` did not match any packages
+
+help: a package with a similar name exists: `blaze-screen`
+warning: profile package spec `dissimilar` in profile `dev` did not match any packages
+warning: profile package spec `miniz_oxide` in profile `dev` did not match any packages
+warning: profile package spec `regex` in profile `dev` did not match any packages
+
+help: a package with a similar name exists: `rend`
+warning: profile package spec `regex-automata` in profile `dev` did not match any packages
+warning: profile package spec `regex-syntax` in profile `dev` did not match any packages
+warning: profile package spec `rustc-hash` in profile `dev` did not match any packages
+warning: profile package spec `scripts` in profile `dev` did not match any packages
+warning: profile package spec `smol_str` in profile `dev` did not match any packages
+warning: profile package spec `syntax-tree` in profile `dev` did not match any packages
+warning: profile package spec `text-size` in profile `dev` did not match any packages
+warning: profile package spec `blaze-codegen-code` in profile `release` did not match any packages
+warning: the feature `allocator_api` has been partially stabilized since 1.100.0 and is succeeded by the feature `allocator_ext`
+  --> crates/blaze-radix/src/lib.rs:26:12
+   |
+26 | #![feature(allocator_api, allocator_ext)]
+   |            ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(stable_features)]` on by default
+help: if you are using features which are still unstable, change to using `allocator_ext`
+   |
+26 - #![feature(allocator_api, allocator_ext)]
+26 + #![feature(allocator_ext, allocator_ext)]
+   |
+help: if you are using features which are now stable, remove this line
+   |
+26 - #![feature(allocator_api, allocator_ext)]
+   |
+
+warning: unreachable `pub` item
+  --> crates/blaze-serde-derive/src/lib.rs:25:1
+   |
+25 | pub fn derive_serialize(input: TokenStream) -> TokenStream {
+   | ---^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   | |
+   | help: consider restricting its visibility: `pub(crate)`
+   |
+   = help: or consider exporting it for use by other crates
+   = note: requested on the command line with `-W unreachable-pub`
+
+warning: unreachable `pub` item
+  --> crates/blaze-serde-derive/src/lib.rs:33:1
+   |
+33 | pub fn derive_deserialize(input: TokenStream) -> TokenStream {
+   | ---^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   | |
+   | help: consider restricting its visibility: `pub(crate)`
+   |
+   = help: or consider exporting it for use by other crates

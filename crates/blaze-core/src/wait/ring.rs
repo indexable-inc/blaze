@@ -24,7 +24,7 @@ use std::{
     io,
     os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd},
     ptr,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -62,6 +62,9 @@ const REG_WAIT_TS: u32 = 1 << 0;
 const TIMEOUT_ABS: u32 = 1 << 0;
 /// `FUTEX2_SIZE_U32 | FUTEX2_PRIVATE`: a 32-bit word of this process.
 const FUTEX2_U32_PRIVATE: i32 = 0x02 | 0x80;
+/// `FUTEX2_SIZE_U32`: a 32-bit word of a shared mapping, keyed by its page, so processes that
+/// map one file meet on it ([`super::wait_shared`]).
+const FUTEX2_U32_SHARED: i32 = 0x02;
 /// `FUTEX_BITSET_MATCH_ANY`.
 const FUTEX_ANY: u64 = 0xffff_ffff;
 
@@ -82,6 +85,7 @@ const REGION: usize = 4096;
 const MASK_AT: usize = 64;
 
 #[allow(dead_code, reason = "a layout of linux/io_uring.h, read by the kernel")]
+#[expect(blaze::unwired, reason = "wired: a kernel ABI layout whose fields the kernel reads, not Rust")]
 #[repr(C)]
 #[derive(Default)]
 struct SqOffsets {
@@ -97,6 +101,7 @@ struct SqOffsets {
 }
 
 #[allow(dead_code, reason = "a layout of linux/io_uring.h, read by the kernel")]
+#[expect(blaze::unwired, reason = "wired: a kernel ABI layout whose fields the kernel reads, not Rust")]
 #[repr(C)]
 #[derive(Default)]
 struct CqOffsets {
@@ -112,6 +117,7 @@ struct CqOffsets {
 }
 
 #[allow(dead_code, reason = "a layout of linux/io_uring.h, read by the kernel")]
+#[expect(blaze::unwired, reason = "wired: a kernel ABI layout whose fields the kernel reads, not Rust")]
 #[repr(C)]
 #[derive(Default)]
 struct Params {
@@ -128,6 +134,7 @@ struct Params {
 }
 
 #[allow(dead_code, reason = "a layout of linux/io_uring.h, read by the kernel")]
+#[expect(blaze::unwired, reason = "wired: a kernel ABI layout whose fields the kernel reads, not Rust")]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Sqe {
@@ -148,6 +155,7 @@ struct Sqe {
 }
 
 #[allow(dead_code, reason = "a layout of linux/io_uring.h, read by the kernel")]
+#[expect(blaze::unwired, reason = "wired: a kernel ABI layout whose fields the kernel reads, not Rust")]
 #[repr(C)]
 struct Cqe {
     user_data: u64,
@@ -157,6 +165,7 @@ struct Cqe {
 
 /// `struct __kernel_timespec`.
 #[allow(dead_code, reason = "a layout of linux/io_uring.h, read by the kernel")]
+#[expect(blaze::unwired, reason = "wired: a kernel ABI layout whose fields the kernel reads, not Rust")]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Timespec {
@@ -166,6 +175,7 @@ struct Timespec {
 
 /// `struct io_uring_reg_wait`: one wait's argument in the registered region.
 #[allow(dead_code, reason = "a layout of linux/io_uring.h, read by the kernel")]
+#[expect(blaze::unwired, reason = "wired: a kernel ABI layout whose fields the kernel reads, not Rust")]
 #[repr(C)]
 struct RegWait {
     ts: Timespec,
@@ -179,6 +189,7 @@ struct RegWait {
 
 /// `struct io_uring_region_desc`.
 #[allow(dead_code, reason = "a layout of linux/io_uring.h, read by the kernel")]
+#[expect(blaze::unwired, reason = "wired: a kernel ABI layout whose fields the kernel reads, not Rust")]
 #[repr(C)]
 #[derive(Default)]
 struct RegionDesc {
@@ -192,6 +203,7 @@ struct RegionDesc {
 
 /// `struct io_uring_mem_region_reg`.
 #[allow(dead_code, reason = "a layout of linux/io_uring.h, read by the kernel")]
+#[expect(blaze::unwired, reason = "wired: a kernel ABI layout whose fields the kernel reads, not Rust")]
 #[repr(C)]
 struct MemRegionReg {
     region_uptr: u64,
@@ -578,18 +590,21 @@ impl WaitRing {
         }
     }
 
+    /// One futex wait on the 32-bit word at `word` (this process's alone with
+    /// [`FUTEX2_U32_PRIVATE`], keyed by the mapped page with [`FUTEX2_U32_SHARED`]).
     fn futex_wait(
         &mut self,
         what: &'static str,
-        word: &AtomicU32,
+        word: *const u32,
+        flags: i32,
         expected: u32,
         deadline: Option<Deadline>,
         clock: &impl Clock,
     ) -> Result<Waited<()>, WaitError> {
         let sqe = Sqe {
             opcode: OP_FUTEX_WAIT,
-            fd: FUTEX2_U32_PRIVATE,
-            addr: word.as_ptr() as u64,
+            fd: flags,
+            addr: word as u64,
             off: u64::from(expected),
             addr3: FUTEX_ANY,
             ..Sqe::default()
@@ -603,7 +618,7 @@ impl WaitRing {
     }
 
     /// Wakes one waiter on `word` through the ring: false where it could not be submitted.
-    fn futex_wake(&mut self, word: &AtomicU32) -> bool {
+    fn futex_wake(&mut self, word: &crate::atomic::AtomicU32) -> bool {
         _ = self.take();
         let sqe = Sqe {
             opcode: OP_FUTEX_WAKE,
@@ -724,16 +739,18 @@ impl Futex for Futexes {
     fn wait<C: Clock>(
         &self,
         what: &'static str,
-        word: &AtomicU32,
+        word: &crate::atomic::AtomicU32,
         expected: u32,
         deadline: Option<Deadline>,
         clock: &C,
     ) -> Result<Waited<()>, WaitError> {
-        with_ring(what, |ring| ring.futex_wait(what, word, expected, deadline, clock))
+        with_ring(what, |ring| {
+            ring.futex_wait(what, word.as_ptr(), FUTEX2_U32_PRIVATE, expected, deadline, clock)
+        })
     }
 
     #[inline(never)]
-    fn wake(&self, word: &AtomicU32) {
+    fn wake(&self, word: &crate::atomic::AtomicU32) {
         let woke = RING
             .try_with(|cell| match cell.try_borrow_mut() {
                 Ok(mut held) => held.as_mut().is_some_and(|ring| ring.futex_wake(word)),
@@ -757,6 +774,22 @@ impl Futex for Futexes {
     }
 }
 
+/// The shared-address wait of [`super::wait_shared`] on this thread's ring: one
+/// `IORING_OP_FUTEX_WAIT` of [`FUTEX2_U32_SHARED`] on `word`'s low half (its address, the
+/// word being little-endian), with the deadline in the ring's registered wait region.
+pub(crate) fn wait_shared(
+    what: &'static str,
+    word: &AtomicU64,
+    expected: u32,
+    deadline: Deadline,
+    clock: &impl Clock,
+) -> Result<Waited<()>, WaitError> {
+    let low = word.as_ptr().cast::<u32>().cast_const();
+    with_ring(what, |ring| {
+        ring.futex_wait(what, low, FUTEX2_U32_SHARED, expected, Some(deadline), clock)
+    })
+}
+
 /// This process's children on Linux: a reap is `wait4(WNOHANG)`, a wait for an exit is
 /// `IORING_OP_WAITID` on this thread's ring.
 pub(crate) struct Kids;
@@ -764,7 +797,7 @@ pub(crate) struct Kids;
 impl Children for Kids {
     type Reaped = (libc::c_int, libc::rusage);
 
-    fn reap_now(&self, pid: i32) -> io::Result<Option<Self::Reaped>> {
+    fn reap_now(&mut self, pid: i32) -> io::Result<Option<Self::Reaped>> {
         let mut status = 0;
         // SAFETY: all-zero bytes is a valid `rusage`.
         let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
@@ -783,7 +816,7 @@ impl Children for Kids {
     }
 
     fn exited<C: Clock>(
-        &self,
+        &mut self,
         what: &'static str,
         pid: i32,
         keep: bool,

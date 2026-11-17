@@ -68,11 +68,11 @@ theorem findFrame_setFrame_ne (id id' : Nat) (slots : List Slot) (hne : ¬ id = 
   | cons fr rest ih =>
     rw [setFrame_cons]
     by_cases h : fr.id = id
-    · rw [if_pos h, findFrame_cons, findFrame_cons]
+    · rw [ite_eq_left h, findFrame_cons, findFrame_cons]
       have hne1 : ¬ fr.id = id' := fun h' => hne (h.symm.trans h')
       have hne2 : ¬ (fr.withLocals slots).id = id' := hne1
-      exact (if_neg hne2).trans (if_neg hne1).symm
-    · rw [if_neg h, findFrame_cons, findFrame_cons, ih]
+      exact (ite_eq_right hne2).trans (ite_eq_right hne1).symm
+    · rw [ite_eq_right h, findFrame_cons, findFrame_cons, ih]
 
 theorem findFrame_setFrame_same (id : Nat) (slots : List Slot) :
     ∀ (l : List Frame),
@@ -84,21 +84,21 @@ theorem findFrame_setFrame_same (id : Nat) (slots : List Slot) :
   | cons fr rest ih =>
     by_cases h : fr.id = id
     · have e : setFrame (fr :: rest) id slots = fr.withLocals slots :: rest :=
-        (setFrame_cons fr rest id slots).trans (if_pos h)
+        (setFrame_cons fr rest id slots).trans (ite_eq_left h)
       have h2 : (fr.withLocals slots).id = id := h
       have left : findFrame (fr.withLocals slots :: rest) id = some (fr.withLocals slots) :=
-        (findFrame_cons (fr.withLocals slots) rest id).trans (if_pos h2)
+        (findFrame_cons (fr.withLocals slots) rest id).trans (ite_eq_left h2)
       have right : findFrame (fr :: rest) id = some fr :=
-        (findFrame_cons fr rest id).trans (if_pos h)
+        (findFrame_cons fr rest id).trans (ite_eq_left h)
       rw [e, left, right]
       try rfl
     · have e : setFrame (fr :: rest) id slots = fr :: setFrame rest id slots :=
-        (setFrame_cons fr rest id slots).trans (if_neg h)
+        (setFrame_cons fr rest id slots).trans (ite_eq_right h)
       have left : findFrame (fr :: setFrame rest id slots) id =
           findFrame (setFrame rest id slots) id :=
-        (findFrame_cons fr (setFrame rest id slots) id).trans (if_neg h)
+        (findFrame_cons fr (setFrame rest id slots) id).trans (ite_eq_right h)
       have right : findFrame (fr :: rest) id = findFrame rest id :=
-        (findFrame_cons fr rest id).trans (if_neg h)
+        (findFrame_cons fr rest id).trans (ite_eq_right h)
       rw [e, left, right]
       exact ih
 
@@ -174,50 +174,50 @@ theorem State.slots?_setSlots_ne (st : State) (f f' : Nat) (slots : List Slot)
     (hne : ¬ f = f') : (st.setSlots f slots).slots? f' = st.slots? f' := by
   by_cases hf : f = 0
   · have e : st.setSlots f slots = { base := slots, stack := st.stack, next := st.next } :=
-      (State.setSlots_def st f slots).trans (if_pos hf)
+      (State.setSlots_def st f slots).trans (ite_eq_left hf)
     have hf' : ¬ f' = 0 := fun h0 => hne (hf.trans h0.symm)
     have left : State.slots? { base := slots, stack := st.stack, next := st.next } f' =
         (findFrame st.stack f').map (fun fr => fr.locals) :=
-      (State.slots?_def _ f').trans (if_neg hf')
+      (State.slots?_def _ f').trans (ite_eq_right hf')
     have right : st.slots? f' = (findFrame st.stack f').map (fun fr => fr.locals) :=
-      (State.slots?_def st f').trans (if_neg hf')
+      (State.slots?_def st f').trans (ite_eq_right hf')
     rw [e, left, right]
   · have e : st.setSlots f slots =
         { base := st.base, stack := setFrame st.stack f slots, next := st.next } :=
-      (State.setSlots_def st f slots).trans (if_neg hf)
+      (State.setSlots_def st f slots).trans (ite_eq_right hf)
     by_cases hf' : f' = 0
     · have left :
           State.slots? { base := st.base, stack := setFrame st.stack f slots, next := st.next }
-            f' = some st.base := (State.slots?_def _ f').trans (if_pos hf')
-      have right : st.slots? f' = some st.base := (State.slots?_def st f').trans (if_pos hf')
+            f' = some st.base := (State.slots?_def _ f').trans (ite_eq_left hf')
+      have right : st.slots? f' = some st.base := (State.slots?_def st f').trans (ite_eq_left hf')
       rw [e, left, right]
     · have left :
           State.slots? { base := st.base, stack := setFrame st.stack f slots, next := st.next }
             f' = (findFrame (setFrame st.stack f slots) f').map (fun fr => fr.locals) :=
-        (State.slots?_def _ f').trans (if_neg hf')
+        (State.slots?_def _ f').trans (ite_eq_right hf')
       have right : st.slots? f' = (findFrame st.stack f').map (fun fr => fr.locals) :=
-        (State.slots?_def st f').trans (if_neg hf')
+        (State.slots?_def st f').trans (ite_eq_right hf')
       rw [e, left, right, findFrame_setFrame_ne f f' slots hne st.stack]
 
 theorem State.slots?_setSlots_same (st : State) (f : Nat) (slots : List Slot) :
     (st.setSlots f slots).slots? f = (st.slots? f).map (fun _ => slots) := by
   by_cases hf : f = 0
   · have e : st.setSlots f slots = { base := slots, stack := st.stack, next := st.next } :=
-      (State.setSlots_def st f slots).trans (if_pos hf)
+      (State.setSlots_def st f slots).trans (ite_eq_left hf)
     have left : State.slots? { base := slots, stack := st.stack, next := st.next } f =
-        some slots := (State.slots?_def _ f).trans (if_pos hf)
-    have right : st.slots? f = some st.base := (State.slots?_def st f).trans (if_pos hf)
+        some slots := (State.slots?_def _ f).trans (ite_eq_left hf)
+    have right : st.slots? f = some st.base := (State.slots?_def st f).trans (ite_eq_left hf)
     rw [e, left, right]
     try rfl
   · have e : st.setSlots f slots =
         { base := st.base, stack := setFrame st.stack f slots, next := st.next } :=
-      (State.setSlots_def st f slots).trans (if_neg hf)
+      (State.setSlots_def st f slots).trans (ite_eq_right hf)
     have left :
         State.slots? { base := st.base, stack := setFrame st.stack f slots, next := st.next } f =
           (findFrame (setFrame st.stack f slots) f).map (fun fr => fr.locals) :=
-      (State.slots?_def _ f).trans (if_neg hf)
+      (State.slots?_def _ f).trans (ite_eq_right hf)
     have right : st.slots? f = (findFrame st.stack f).map (fun fr => fr.locals) :=
-      (State.slots?_def st f).trans (if_neg hf)
+      (State.slots?_def st f).trans (ite_eq_right hf)
     rw [e, left, right, findFrame_setFrame_same f slots st.stack]
     cases findFrame st.stack f with
     | none => rfl

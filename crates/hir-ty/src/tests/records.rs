@@ -41,10 +41,12 @@ struct V {
     twice: { a: A, b: B, a: B },
     defaulted: { a: u8 = 1 },
 }
-//- /other.rs crate:other
+#[macro_export]
+macro_rules! one { ($t:ty) => { { a: $t } } }
+//- /other.rs crate:other deps:main
 struct A;
 struct V {
-    a: { a: A },
+    a: main::one!(A),
 }
 "#;
 
@@ -59,7 +61,7 @@ fn crate_named(db: &Db, name: &str) -> Crate {
 /// lowering them.
 fn fields(fixture: &str, krate: &str, check: impl FnOnce(&Db, &[Ty<'_>], &[TyLoweringDiagnostic])) {
     let db = fixture::db(fixture).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let krate = crate_named(&db, krate);
         let v = crate_def_map(&db, krate)
             .modules(&db)
@@ -130,8 +132,10 @@ fn a_record_type_is_refused_naming_the_field_and_the_rule() {
     });
 }
 
-/// `other` shares `main`'s source root, so its file parses with the record; hir-ty refuses
-/// it, as the crate lacks the attribute.
+/// `other` writes the record type through `main`'s macro, whose tokens parse under `main`'s
+/// `#![blaze::records]` (a token is parsed under the extensions of the crate that wrote it,
+/// d53c5a25ab; written in `other`'s own file it would not parse as a record at all); hir-ty
+/// refuses it, as the crate it is in lacks the attribute.
 #[test]
 fn a_crate_without_the_attribute_is_refused() {
     fields(TYPES, "other", |_, _, diagnostics| {
@@ -245,9 +249,11 @@ fn pattern_misses_a_field(p: { x: i32, y: i32 }) { let { x } = p; }
 fn pattern_names_no_field(p: { x: i32, y: i32 }) { let { x, z, .. } = p; }
 fn pattern_on_no_record(p: u8) { let { x, .. } = p; }
 fn field_of_no_such_name(p: { x: i32 }) -> i32 { p.z }
+#[macro_export]
+macro_rules! point { () => { { x: 1, y: 2 } } }
 //- /plain.rs crate:plain deps:main
 fn not_gated() {
-    main::takes({ x: 1, y: 2 });
+    main::takes(main::point!());
 }
 "#;
 
@@ -268,7 +274,7 @@ fn function(db: &Db, krate: &str, name: &str) -> FunctionId {
 /// Infers `krate`'s function `name` of [`BODIES`].
 fn inferred(krate: &str, name: &str, check: impl FnOnce(&Db, &InferenceResult<'_>)) {
     let db = fixture::db(BODIES).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let func = function(&db, krate, name);
         let body = InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func));
         check(&db, InferenceResult::of(&db, body));
@@ -364,8 +370,9 @@ fn a_field_left_out_with_no_default_names_the_field_and_the_function() {
     });
 }
 
-/// `plain` lacks the attribute: the record value it writes is refused, whatever it is
-/// passed to.
+/// `plain` lacks the attribute: the record value in its body is refused, whatever it is
+/// passed to. The value is `main`'s macro's, whose tokens parse as a record under `main`'s
+/// attribute (d53c5a25ab); written in `plain`'s file it would parse as a block.
 #[test]
 fn a_crate_without_the_attribute_writes_no_record_value() {
     inferred("plain", "not_gated", |_, result| {
@@ -386,7 +393,7 @@ fn parameter<'db>(db: &'db Db, function: FunctionId, index: usize) -> Ty<'db> {
 #[test]
 fn defaults_are_no_part_of_the_type_and_are_keyed_one_field_at_a_time() {
     let db = fixture::db(BODIES).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let open = function(&db, "main", "open");
         let other = function(&db, "main", "same_but_mode");
         // The parameter is the record `{ create: bool, depth: u32, mode: u32 }` in both: a
@@ -395,12 +402,12 @@ fn defaults_are_no_part_of_the_type_and_are_keyed_one_field_at_a_time() {
         let lang_items = hir_def::lang_item::lang_items(&db, crate_named(&db, "main"));
         let record = record_fields(lang_items, parameter(&db, open, 1)).expect("a record");
         assert_eq!(record.names().collect::<Vec<_>>(), ["create", "depth", "mode"]);
-
+    
         // The defaults, in the order declared.
         let declared = record_param_defaults(&db, open);
         let names: Vec<_> = declared.iter().map(|it| (it.param, it.field.as_str())).collect();
         assert_eq!(names, [(1, "create"), (1, "mode"), (1, "depth")]);
-
+    
         // The key is the function, the parameter and the field; the value that one constant.
         // The two functions differ in `mode`'s default alone: a caller that leaves out
         // `create` or `depth` reads a value that did not change, and one that leaves out
@@ -442,7 +449,7 @@ fn impl_method(db: &Db, for_: &str, name: &str) -> FunctionId {
 #[test]
 fn a_trait_methods_defaults_are_its_declarations() {
     let db = fixture::db(BODIES).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let disk = impl_method(&db, "Disk", "put");
         let declared = crate::record_defaults_owner(&db, disk);
         assert_ne!(declared, disk, "the trait's method declares them");
@@ -467,7 +474,7 @@ fn a_trait_methods_defaults_are_its_declarations() {
 #[test]
 fn a_function_of_another_abi_takes_no_record() {
     let db = fixture::db(BODIES).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let foreign = function(&db, "main", "foreign");
         let lowered = crate::lower::fn_sig_for_fn(&db, foreign);
         assert_eq!(refusals(lowered.diagnostics()), [RecordRefusal::ExternAbi]);

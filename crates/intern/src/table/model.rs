@@ -1,9 +1,9 @@
 //! Under the model checker (`RUSTFLAGS="--cfg blaze_check" blaze test -p intern --release
 //! model_`): a table's lock-free paths against a sequential set of values. Interning races on
-//! the overlay's index and on taking an ID (the image's freed IDs first, then the next); a find
-//! on another thread sees nothing or the whole value, and the ID it finds reads back its bytes
-//! through the ID column, whose slot is set before the index publishes the value. Each value
-//! gets one ID, distinct values distinct IDs, and a restored table hands out each freed ID once.
+//! the overlay's index and on taking the next ID; a find on another thread sees nothing or the
+//! whole value, and the ID it finds reads back its bytes through the ID column, whose slot is
+//! set before the index publishes the value. Each value gets one ID, distinct values distinct
+//! IDs.
 //!
 //! Each value has its own history, checked against a sequential set of that one value: the
 //! table is linearizable value by value, not across values. Two values may sit in different
@@ -21,14 +21,8 @@ use blaze_check::{
     linear::{History, Spec},
     thread,
 };
-use blaze_format::SchemaHash;
-use blaze_ids::ContentId;
-use blaze_image::{Builder, Image, SectionId};
 
 use super::*;
-
-const SCHEMA: SchemaHash = SchemaHash(ContentId([9; 32]));
-const ID: SectionId = SectionId::SYMBOLS;
 
 /// One compiled-in value, so made IDs start at 2.
 fn shape() -> Shape {
@@ -36,10 +30,6 @@ fn shape() -> Shape {
         statics: 1,
         static_bytes: |_| b"s",
         key: crate::order_key,
-        align: 1,
-        size: 1,
-        text: true,
-        overlay: Overlay::Secret,
     }
 }
 
@@ -129,49 +119,5 @@ fn model_racing_interns_get_one_id_each() {
         ids.sort_unstable();
         assert_eq!(ids, [2, 3], "made IDs are the next ones, each taken once");
         assert_eq!(table.end(), 4);
-    });
-}
-
-/// An image whose table freed one ID: two values made from two threads take that ID and the
-/// next, one each, while each finds the other's and reads it through the column.
-#[test]
-fn model_freed_ids_are_taken_once() {
-    let image: &'static Image<Vec<u8>> = {
-        let table = Table::new(shape());
-        let kept = table.intern(b"k");
-        assert_eq!(table.intern(b"f"), kept + 1);
-        let mut live = Live::new();
-        live.mark_id(kept);
-        let mut builder = Builder::new();
-        table.write(&live, &mut builder.section(ID, SCHEMA));
-        // alloc: the test's image, once, read by every execution
-        Box::leak(Box::new(Image::open(builder.finish().unwrap()).unwrap()))
-    };
-    blaze_check::model(|| {
-        let section = image.section(ID, SCHEMA).unwrap();
-        let table = Arc::new(Table::restore(shape(), image, &section, &serial).unwrap());
-        assert_eq!((table.get(2), table.get(3), table.end()), (Some(&b"k"[..]), None, 4));
-        let histories = Arc::new(Histories::default());
-        let other = {
-            let (table, histories) = (table.clone(), histories.clone());
-            thread::spawn(move || {
-                [Op::Intern(0), Op::Find(1)].map(|op| run(&histories, &table, op))
-            })
-        };
-        let one = run(&histories, &table, Op::Intern(1));
-        let zero = run(&histories, &table, Op::Find(0));
-        let [zero_there, one_found] = other.join().unwrap();
-        histories.iter().for_each(|history| history.check(Has::default()));
-        if zero.is_some() {
-            assert_eq!(zero, zero_there);
-        }
-        if one_found.is_some() {
-            assert_eq!(one_found, one);
-        }
-        let mut ids = [zero_there.unwrap(), one.unwrap()];
-        ids.sort_unstable();
-        assert_eq!(ids, [3, 4], "the freed ID once, then the next");
-        assert_eq!(table.find(b"k"), Some(2), "the kept value keeps its ID");
-        assert_eq!(table.end(), 5);
     });
 }

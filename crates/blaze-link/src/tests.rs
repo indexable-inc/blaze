@@ -23,7 +23,7 @@ use object::{
 
 use crate::{
     COLUMN, Change, Debug, Format, Image, LINE, LinkError, Live, Native, NativeKind, Output,
-    OutputKind, Position, SpanTable,
+    OutputKind, Position, Span, SpanTable,
 };
 
 const TO: &str = "out/app";
@@ -176,6 +176,9 @@ fn edit(g2: &CompiledFunction) -> Change<'_> {
     }
 }
 
+/// A page of zeros: what a [`Sparse`] page it has not got reads as.
+static ZERO_PAGE: [u8; PAGE as usize] = [0; PAGE as usize];
+
 /// A file as pages, most of an incremental image being room nothing has written.
 #[derive(Clone, Default, Debug)]
 struct Sparse {
@@ -192,8 +195,9 @@ impl Sparse {
             let n = (PAGE as usize - from).min(bytes.len() - done);
             let chunk = &bytes[done..done + n];
             // A page it has not got reads as zeros: zeros written there change nothing, and a
-            // gigabyte of zeroed code costs no memory.
-            if !self.pages.contains_key(&(addr / PAGE)) && chunk.iter().all(|it| *it == 0) {
+            // gigabyte of zeroed code costs no memory. Compared as slices (a `memcmp`), not byte
+            // by byte: a link writes hundreds of MiB here, and the test is built unoptimized.
+            if !self.pages.contains_key(&(addr / PAGE)) && chunk == &ZERO_PAGE[..n] {
                 done += n;
                 continue;
             }
@@ -213,8 +217,7 @@ impl Sparse {
     }
 
     fn page(&self, page: u64) -> &[u8] {
-        static ZERO: [u8; PAGE as usize] = [0; PAGE as usize];
-        self.pages.get(&page).map_or(&ZERO[..], |it| &it[..])
+        self.pages.get(&page).map_or(&ZERO_PAGE[..], |it| &it[..])
     }
 
     /// Whether two files have the same bytes.
@@ -348,6 +351,7 @@ impl Disk {
 }
 
 /// A linked file read back.
+#[derive(Debug)]
 struct Linked {
     words: Vec<u64>,
     len: usize,
@@ -1104,13 +1108,16 @@ fn a_thread_locals_cells_of_every_kind_go_with_it() {
         [GotKind::TpOff, GotKind::TlsGd],
     );
     // `adrp x0, :gottprel:tls; ldr x0, [x0, :gottprel_lo12:tls]; adrp x0, :tlsdesc:tls;
-    // ldr x1, [x0, :tlsdesc_lo12:tls]; add x0, x0, :tlsdesc_lo12:tls; blr x1; ret`
+    // ldr x1, [x0, :tlsdesc_lo12:tls]; add x0, x0, :tlsdesc_lo12:tls; blr x1; ret`, in a
+    // shared library: an executable's descriptors are relaxed and have no cell
+    // (`reloc::in_output`).
     let words: [u32; 7] =
         [0x9000_0000, 0xf940_0000, 0x9000_0000, 0xf940_0001, 0x9100_0000, 0xd63f_0020, 0xd65f_03c0];
     let a64 = (
         Output {
             arch: Arch::Aarch64,
-            interpreter: Some("/lib/ld-linux-aarch64.so.1".into()),
+            kind: OutputKind::Shared { name: "libt.so".into(), exports: vec!["_start".into()] },
+            interpreter: None,
             triple: "aarch64-unknown-linux-gnu".into(),
             ..output(true)
         },
@@ -1594,12 +1601,15 @@ fn a_relink_that_drops_a_covered_function_drops_its_entries() {
 #[test]
 fn positions_are_filled_from_span_tables_and_a_reformat_rewrites_only_them() {
     let anchor = id(50);
+    // Span 1 is item-relative: on its base's line, 8 columns right of it. A reformat that
+    // moves the item is a change of the base alone.
     let table = |line| SpanTable {
         files: vec!["src/main.rs".into()],
         spans: vec![
-            Position { file: 0, line: 1, column: 1 },
-            Position { file: 0, line, column: 9 },
+            Span::At(Position { file: 0, line: 1, column: 1 }),
+            Span::From { base: 0, line: 0, column: 8 },
         ],
+        bases: vec![Position { file: 0, line, column: 1 }],
     };
     // `lea rax, [rip + location]; ret`
     let start = function(
@@ -1695,7 +1705,121 @@ fn start_and_stop_symbols_bound_a_named_section() {
         ..Change::default()
     };
     let error = image.stage(change).unwrap_err();
-    assert!(error.what.contains("section `missing`"), "{error}");
+    assert!(
+        error.what.contains("undefined symbol `__start_missing`")
+            && error.what.contains("no input has a section `missing`"),
+        "{error}"
+    );
+}
+
+/// An x86-64 ELF object defining `c_counters`, `mov rax, [rip + start@GOTPCREL]; ret`, with
+/// `__start___libfuzzer_extra_counters` undefined, weakly when `weak`: libFuzzer's
+/// `FuzzerExtraCounters.cpp`, which declares the bounds `__attribute__((weak))`.
+fn counters_object(weak: bool) -> Vec<u8> {
+    let mut b = Builder::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+    let text = b.section_id(StandardSection::Text);
+    let at = b.append_section_data(text, &[0x48, 0x8b, 0x05, 0, 0, 0, 0, 0xc3], 16);
+    b.add_symbol(Def {
+        name: "c_counters".into(),
+        value: at,
+        size: 8,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Dynamic,
+        weak: false,
+        section: SymbolSection::Section(text),
+        flags: SymbolFlags::None,
+    });
+    let start = b.add_symbol(Def {
+        name: "__start___libfuzzer_extra_counters".into(),
+        value: 0,
+        size: 0,
+        kind: SymbolKind::Unknown,
+        scope: SymbolScope::Dynamic,
+        weak,
+        section: SymbolSection::Undefined,
+        flags: SymbolFlags::None,
+    });
+    b.add_relocation(
+        text,
+        Relocation {
+            offset: at + 3,
+            symbol: start,
+            addend: -4,
+            flags: RelocationFlags::Elf { r_type: elf::R_X86_64_GOTPCREL },
+        },
+    )
+    .unwrap();
+    b.write().unwrap()
+}
+
+/// An x86-64 ELF object whose only section is `__libfuzzer_extra_counters`, eight bytes.
+fn counted_object() -> Vec<u8> {
+    let mut b = Builder::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+    let counters = b.add_section(
+        Vec::new(),
+        b"__libfuzzer_extra_counters".to_vec(),
+        object::SectionKind::Data,
+    );
+    b.append_section_data(counters, &[0; 8], 8);
+    b.write().unwrap()
+}
+
+/// `__start_X` with no section `X` in any input is an undefined symbol, as it is to GNU ld and
+/// lld: 0 to a weak reference, its GOT cell included (tempo's `parse_attestation` fuzz target:
+/// libFuzzer reads `__start___libfuzzer_extra_counters` through the GOT), and the undefined
+/// symbol error to a strong one. With the section it is the section's start to both.
+#[test]
+fn a_start_symbol_of_no_section_is_zero_to_a_weak_reference() {
+    let start = function(1, &CALLER, vec![rel32(1, Target::Extern("c_counters".into()))]);
+    let link = |objects: &[(&'static str, std::sync::Arc<[u8]>)]| {
+        let mut image = Image::new(name(TO), output(false)).unwrap();
+        let mut disk = Disk::default();
+        let natives = (objects.iter().enumerate())
+            .map(|(at, (file, bytes))| Native {
+                id: id(60 + at as u8),
+                name: file,
+                bytes,
+                kind: NativeKind::Object,
+                order: at as u32,
+            })
+            .collect();
+        let change = Change {
+            added: vec![&start],
+            names: vec![("_start".into(), Target::Direct(key(1)))],
+            debug_names: vec![(key(1), "start".into())],
+            natives,
+            ..Change::default()
+        };
+        disk.link(&mut image, change).map(|_| Linked::of(disk.file(TO)))
+    };
+    // The cell `c_counters` loads: what its `mov` reads.
+    let cell = |linked: &Linked| {
+        let counters = linked.rel32(linked.symbol("start") + 1);
+        linked.u64_at(linked.rel32(counters + 3))
+    };
+
+    let linked = link(&[("counters.o", counters_object(true).into())]).unwrap();
+    assert_eq!(cell(&linked), 0, "an undefined weak symbol's GOT cell holds 0");
+
+    let error = link(&[("counters.o", counters_object(false).into())])
+        .err()
+        .expect("a strong reference to the start of a section no input has");
+    assert!(
+        error.what.contains("undefined symbol `__start___libfuzzer_extra_counters`")
+            && error.what.contains("no input has a section `__libfuzzer_extra_counters`"),
+        "{error}"
+    );
+
+    // The control: with the section, weak or not, the name is the section's start.
+    for weak in [true, false] {
+        let linked = link(&[
+            ("counters.o", counters_object(weak).into()),
+            ("counted.o", counted_object().into()),
+        ])
+        .unwrap();
+        let (at, size) = section_of(&linked, "__libfuzzer_extra_counters");
+        assert_eq!((cell(&linked), size), (at, 8), "weak: {weak}");
+    }
 }
 
 /// A static's writable object (rustc's global of a nested mutable allocation) is placed
@@ -1854,7 +1978,8 @@ fn line_tables_are_written_from_the_span_tables() {
     let anchor = id(70);
     let spans = SpanTable {
         files: vec!["src/lib.rs".into()],
-        spans: vec![Position { file: 0, line: 4, column: 1 }],
+        spans: vec![Span::At(Position { file: 0, line: 4, column: 1 })],
+        bases: Vec::new(),
     }
     .encode();
     let mut start = function(1, &returns(0), Vec::new());
@@ -1883,8 +2008,11 @@ fn line_tables_across_many_tasks_name_each_rows_file() {
         SpanTable {
             files: files.iter().map(|it| (*it).into()).collect(),
             spans: (0..spans)
-                .map(|it| Position { file: it % files.len() as u32, line: it + 1, column: 1 })
+                .map(|it| {
+                    Span::At(Position { file: it % files.len() as u32, line: it + 1, column: 1 })
+                })
                 .collect(),
+            bases: Vec::new(),
         }
         .encode()
     };
@@ -2181,9 +2309,13 @@ mod thunks;
 
 mod patch;
 
+mod keep;
+
 mod beside;
 
 mod eh_frame_reach;
+
+mod tls_desc;
 
 /// The state's columns, read and written as a stage does.
 mod columns {

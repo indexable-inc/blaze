@@ -3,9 +3,9 @@
 //!
 //! Plant: [`Plant::EnvOnlyReplaces`], `only` replacing what is allowed rather than narrowing.
 
-use hegel::TestCase;
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn, Seeds, check, control};
+use super::{check, control};
 use crate::{
     Plant,
     env::VarName,
@@ -21,9 +21,9 @@ struct Plan {
     chain: Vec<u64>,
 }
 
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
-    let chain = (0..d.int(0, 5)).map(|_| d.int(0, (1 << VARS.len()) - 1)).collect();
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
+    let chain = (0..tape.int_in(0..=5u64, "narrowings")).map(|_| tape.int_in(0..=(1u64 << VARS.len()) - 1, "mask")).collect();
     Plan { seed, chain }
 }
 
@@ -62,12 +62,12 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
 
 /// The invariant: `Env::only` never widens. After any chain of narrowings a variable reads
 /// only if every narrowing in the chain named it, and then reads as the world set it.
-#[hegel::test(test_cases = 200)]
-fn env_only_never_widens(tc: TestCase) {
-    check(plan(&mut Drawn(&tc)), run);
+#[test]
+fn env_only_never_widens() {
+    blaze_sim::check(Config::cases(200), |tape| check(plan(tape), run));
 }
 
 #[test]
 fn the_oracle_catches_only_that_replaces() {
-    control(Plant::EnvOnlyReplaces, |seeds: &mut Seeds| plan(seeds), run);
+    control(Plant::EnvOnlyReplaces, plan, run);
 }

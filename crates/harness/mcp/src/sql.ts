@@ -20,13 +20,14 @@
 // daemon's one-time NDJSON conversion renames over it, is read again), into chat_lines as JSON text,
 // numbered by record from 1 as the daemon reads them (log.rs). A torn tail (a crash mid-append) is one
 // row with line NULL, read again next query; so is an undecodable frame, and a file that is not a log.
+import type { Docs } from "./docs.ts";
+import { HOME } from "./self.ts";
 import { DuckDBInstance, type DuckDBConnection, type DuckDBValue } from "@duckdb/node-api";
 import { existsSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { table, type Table } from "./table.ts";
 import { effect } from "./effects.ts";
 import { MAGIC, Projection, json, readFrames, readLog, type Log } from "./wire.ts";
 
-const HOME = () => process.env.HARNESS_HOME ?? `${process.env.HOME}/.harness`;
 const lit = (s: string) => `'${s.replaceAll("'", "''")}'`;
 
 type Tail = { object: string; stream: string; offset: number; lines: number };
@@ -244,3 +245,15 @@ export function sql<Row extends object = Record<string, unknown>>(strings: Templ
   chain = p.catch(() => {});
   return effect("sql", "Querying the harness store", "Queried the harness store", text, () => p, (r) => ({ detail: `${r.length} row${r.length === 1 ? "" : "s"}`, show: r }));
 }
+
+/** What help() says about this module's calls (docs.ts). */
+export const docs: Docs = {
+  sql: {
+    area: "tables",
+    for: "query past sessions, chats and process output",
+    sig: "sql`select ...`: Promise<Table<Row>>",
+    about: "DuckDB over everything harness has stored, surviving daemon restarts; ${values} become bound parameters. Everything is an object: PTY sessions 's7' (kind claude|codex|cursor|shell), shell runs 'r12' (kind proc, every sh() call), their pipeline stages 'r12.0' (kind stage, parent r12), REPL cells (kind repl). Views: objects(id, kind, name, parent, cwd, args json, created_ms, ended_ms, status, exit_code, signal, meta json); sessions / runs (+cmd) / stages (+text, idx, pipeline) = objects by kind; streams(object, stream: pty|stdout|stderr|stdin|final_err|messages (TUI agent sessions only)|chat, path, bytes, compacted_ms); lines(object, kind, stream, line_no, ts_ms, text) = every line of every terminal and process stream, live and archived (alias events); messages(object, role, kind: text|thinking|tool_call|tool_result|turn_end, tool, text, ts_ms) = agent conversations (a chat session's rows come from its chat log, a TUI agent session's from its transcript); chat(session, n, ev, ts_ms, partial, block, kind, role, text, tool, input json, error, cell, status, ms, effects json, value json, ui json, ok, stop, duration_ms, cost_usd, usage json, agent, model, session_id, busy, valid, json) = one row per event of every chat session ever (its log, live or long finished alike), n its record in the log; ev is user|session|busy|block|tool_call|tool_result|tool_detail|note|error|turn_end, or block_start|delta|tool_start|tool_delta with partial = true (streaming pieces a later block/tool_call replaces: add `where not partial`); tool names the call on its result and detail rows too; valid = false (ev null) for a torn or undecodable frame a crash left; chats(id, agent, name, parent, cwd, status, started_ms, ended_ms, last_ms, model, agent_session, turns, messages, title, first_message, cost_usd, bad_lines) = one row per chat session, title its first user line. Examples: what chats asked about tests: sql`select c.session, c.ts_ms, c.text from chat c where c.ev = 'user' and c.text ilike '%test%' order by c.ts_ms desc limit 20`; the tools a chat used most: sql`select tool, count(*) n from chat where ev = 'tool_call' and session = ${'s12'} group by tool order by n desc`; errors across all runs: sql`select object, line_no, text from lines where kind = 'stage' and text ilike '%error%' order by object desc limit 20`; last clippy output from any agent: sql`select l.line_no, l.text from lines l where l.object = (select id from stages where text like 'cargo clippy%' order by created_ms desc limit 1) order by stream, line_no`; one run's stages: sql`select id, text, status, exit_code from stages where parent = ${'r12'} order by idx`.",
+    example: "await sql`select tool, count(*) n from chat where ev = 'tool_call' group by tool order by n desc`",
+    throws: "DuckDB's error for the statement.",
+  },
+};

@@ -8,11 +8,12 @@
 //!
 //! - `rustc-link-search` and `rustc-flags`' `-L`: a directory inside the script's `OUT_DIR`,
 //!   its package, the target directory's build directory (the `OUT_DIR`s of its dependencies,
-//!   which `DEP_*` names), or a system directory ([`SYSTEM`], and what the workspace adds in
-//!   `build-script-link-dirs`).
+//!   which `DEP_*` names), a system directory ([`SYSTEM`], and what the workspace adds in
+//!   `build-script-link-dirs`), or a layout of blaze's own store of pinned native inputs
+//!   ([`Ran::native`]).
 //! - `rustc-link-arg` (and its `-bins`, `-bin=`, `-tests`, `-benches`, `-examples` and
-//!   `-cdylib` forms): one of [`LINK_ARGS`], or an rpath to a directory `rustc-link-search`
-//!   may name.
+//!   `-cdylib` forms): one of [`LINK_ARGS`], one of [`LINK_ARG_PREFIXES`] with one value that
+//!   is no further linker word, or an rpath to a directory `rustc-link-search` may name.
 //! - `rustc-env`: not a variable cargo gives a crate itself, nor one rustc, rustdoc or cargo
 //!   reads when building it ([`given_by_cargo`]).
 //!
@@ -72,9 +73,15 @@ pub const LINK_ARGS: [&str; 20] = [
     "-Wl,-ObjC",
 ];
 
-/// The link arguments a script may give with a value of its own after the prefix.
-const LINK_ARG_PREFIXES: [&str; 5] = [
+/// The link arguments a script may give with a value of its own after the prefix: a symbol
+/// or a pattern of symbols to export, a library's own name, a version script. The value is
+/// one word of the linker's ([`one_value`]). `--export-dynamic-symbol` only adds names the
+/// image already defines to its dynamic symbol table, as `--export-dynamic` adds them all:
+/// it loads nothing and names no file (evm2-jit gives `__revmc_builtin_*` so, for the code
+/// its JIT makes to find them).
+const LINK_ARG_PREFIXES: [&str; 6] = [
     "-Wl,--export-dynamic-symbol=",
+    "-Wl,--export-dynamic-symbol,",
     "-Wl,-soname,",
     "-Wl,-install_name,@rpath/",
     "-Wl,-exported_symbol,",
@@ -87,6 +94,13 @@ pub struct Ran<'a> {
     pub out_dir: &'a Path,
     /// The system directories the workspace allows besides [`SYSTEM`].
     pub link_dirs: &'a [PathBuf],
+    /// blaze's store of pinned native inputs, `<BLAZE_HOME>/native`, when the daemon has a
+    /// home: each `sha256-<digest>` directly under it is the read-only unpacking of the
+    /// archive of that digest, which blaze laid out whole (docs/cargo.md, "Pinned native
+    /// inputs"), so one may be searched and be an rpath as a directory of `/nix/store` may,
+    /// whichever workspace pinned it: a machine whose only LLVM is the one blaze fetched
+    /// points `LLVM_SYS_231_PREFIX` at it.
+    pub native: Option<&'a Path>,
 }
 
 impl Ran<'_> {
@@ -109,12 +123,29 @@ impl Ran<'_> {
             return !dir.components().any(|it| it == std::path::Component::ParentDir);
         }
         let dir = blaze_manifest::paths::normalize_path(dir);
+        if self.in_native_layout(&dir) {
+            return true;
+        }
         [self.out_dir, self.package_dir]
             .into_iter()
             .chain(self.build_dir())
             .chain(SYSTEM.iter().map(Path::new))
             .chain(self.link_dirs.iter().map(PathBuf::as_path))
             .any(|it| dir.starts_with(it))
+    }
+
+    /// Whether `dir`, normalized, is a layout of [`Self::native`] or inside one: under a
+    /// `sha256-` and 64 lowercase hex digits directly below the store, never the store itself
+    /// or what a layout under way leaves beside the layouts.
+    fn in_native_layout(&self, dir: &Path) -> bool {
+        let Some(below) = self.native.and_then(|it| dir.strip_prefix(it).ok()) else {
+            return false;
+        };
+        below.components().next().is_some_and(|it| {
+            it.as_os_str().to_str().and_then(|it| it.strip_prefix("sha256-")).is_some_and(|hex| {
+                hex.len() == 64 && hex.bytes().all(|it| matches!(it, b'0'..=b'9' | b'a'..=b'f'))
+            })
+        })
     }
 
     /// Why the link argument `arg` is refused, `None` when it is not.
@@ -129,7 +160,7 @@ impl Ran<'_> {
             };
         }
         let known = LINK_ARGS.contains(&arg)
-            || LINK_ARG_PREFIXES.iter().any(|it| arg.strip_prefix(it).is_some_and(no_path_out))
+            || LINK_ARG_PREFIXES.iter().any(|it| arg.strip_prefix(it).is_some_and(one_value))
             || arg.strip_prefix("-l").is_some_and(|name| {
                 !name.is_empty()
                     && name.chars().all(|it| it.is_ascii_alphanumeric() || "_+.-".contains(it))
@@ -140,15 +171,18 @@ impl Ran<'_> {
     }
 
     fn places(&self) -> String {
-        "the script's OUT_DIR, its package, the build directory, a system directory or one \
-         `build-script-link-dirs` names"
+        "the script's OUT_DIR, its package, the build directory, a system directory, a layout \
+         of blaze's pinned native inputs or one `build-script-link-dirs` names"
             .to_owned()
     }
 }
 
-/// Whether a value names no path above where it is.
-fn no_path_out(value: &str) -> bool {
-    !value.split('/').any(|it| it == "..")
+/// Whether a value after a prefix is one word of the linker's that names no path above where
+/// it is. `-Wl,` splits at every comma, so a value with one is more words: after
+/// `-Wl,-soname,x` a `,--plugin,/tmp/p.so` or a `,-rpath,/home/u` would be an option of its
+/// own that no rule here read.
+fn one_value(value: &str) -> bool {
+    !value.is_empty() && !value.contains(',') && !value.split('/').any(|it| it == "..")
 }
 
 fn allowed_args() -> String {
@@ -408,6 +442,7 @@ mod tests {
             package_dir: Path::new("/src/pkg"),
             out_dir: Path::new("/t/debug/build/pkg/0123/out"),
             link_dirs: Vec::<PathBuf>::leak(vec!["/opt/vendor/lib".into()]), // alloc: a test's, leaked
+            native: Some(Path::new("/home/u/.blaze/native")),
         }
     }
 
@@ -461,6 +496,57 @@ mod tests {
                 "cargo::rustc-link-arg-bin=tool=-Wl,-plugin,/tmp/p.so",
             ]
         );
+    }
+
+    /// evm2-jit's `-Wl,--export-dynamic-symbol,__revmc_builtin_*` is a pattern of symbols to
+    /// export, in either spelling; a value that goes on into another linker word is refused
+    /// whatever prefix it follows.
+    #[test]
+    fn a_prefixed_link_arg_has_one_value_and_no_further_linker_word() {
+        let stdout = "cargo:rustc-link-arg=-Wl,--export-dynamic-symbol,__revmc_builtin_*\n\
+                      cargo:rustc-link-arg=-Wl,--export-dynamic-symbol=__revmc_builtin_*\n\
+                      cargo:rustc-cdylib-link-arg=-Wl,-soname,libx.so.1\n\
+                      cargo:rustc-link-arg=-Wl,--version-script=exports.map\n\
+                      cargo:rustc-link-arg=-Wl,--export-dynamic-symbol,x,--plugin,/tmp/p.so\n\
+                      cargo:rustc-link-arg=-Wl,--export-dynamic-symbol=x,-rpath,/home/u\n\
+                      cargo:rustc-cdylib-link-arg=-Wl,-soname,libx.so,-rpath,/home/u/lib\n\
+                      cargo:rustc-link-arg=-Wl,--export-dynamic-symbol,\n";
+        assert_eq!(
+            refused_lines(stdout),
+            [
+                "cargo:rustc-link-arg=-Wl,--export-dynamic-symbol,x,--plugin,/tmp/p.so",
+                "cargo:rustc-link-arg=-Wl,--export-dynamic-symbol=x,-rpath,/home/u",
+                "cargo:rustc-cdylib-link-arg=-Wl,-soname,libx.so,-rpath,/home/u/lib",
+                "cargo:rustc-link-arg=-Wl,--export-dynamic-symbol,",
+            ]
+        );
+    }
+
+    /// A layout of blaze's own store of pinned native inputs may be searched and be an rpath
+    /// (llvm-sys, pointed at the LLVM blaze fetched, prints its `lib`); the store itself, a
+    /// name beside the layouts and another home's store may not. With no store named, none is.
+    #[test]
+    fn a_layout_of_the_native_store_may_be_searched_and_nothing_beside_it() {
+        let digest = "918ef5bdb006b29b96d8f87dbbbac422593c6abf916cb7ad9afed17672648087";
+        let stdout = format!(
+            "cargo:rustc-link-search=native=/home/u/.blaze/native/sha256-{digest}/lib\n\
+             cargo:rustc-link-arg=-Wl,-rpath,/home/u/.blaze/native/sha256-{digest}/lib\n\
+             cargo:rustc-link-search=native=/home/u/.blaze/native\n\
+             cargo:rustc-link-search=native=/home/u/.blaze/native/sha256-{digest}.new/lib\n\
+             cargo:rustc-link-search=native=/home/u/.blaze/native/sha256-{digest}/../../../.ssh\n\
+             cargo:rustc-link-search=native=/home/other/.blaze/native/sha256-{digest}/lib\n"
+        );
+        assert_eq!(
+            refused_lines(&stdout),
+            [
+                "cargo:rustc-link-search=native=/home/u/.blaze/native".to_owned(),
+                format!("cargo:rustc-link-search=native=/home/u/.blaze/native/sha256-{digest}.new/lib"),
+                format!("cargo:rustc-link-search=native=/home/u/.blaze/native/sha256-{digest}/../../../.ssh"),
+                format!("cargo:rustc-link-search=native=/home/other/.blaze/native/sha256-{digest}/lib"),
+            ]
+        );
+        let none = Ran { native: None, ..ran() };
+        assert_eq!(refused(stdout.as_bytes(), &none).len(), 6, "with no store, each is refused");
     }
 
     #[test]

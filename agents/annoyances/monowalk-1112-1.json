@@ -1,0 +1,21 @@
+{
+ "id": "monowalk-1112-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane monowalk-1112",
+ "where": "crates/hir-ty-pure/src/walk.rs `summary_in`, through crates/hir-ty-mir/src/mir/dispatch.rs `body_of` (the `monomorphized_runtime_mir_body*` queries, `lru = 0, mem_tag = Mir`)",
+ "what": "A cold build of tempo (eb3376ba8c, blaze d45e70ddc) ran its last unit's codegen alone on one worker for over 5 minutes while the footprint rose from 89.8 to 121.8 GiB; the daemon's release then let go of 4,197,786 MIR bodies. Lane reth's allocation stacks put the top site, `monomorphized`, under `hir_ty_pure::walk::summary_in` recursing: the purity summary that `SpendFacts` asks of each direct callee walks the callee's whole closure depth first on one query stack and read every instance's body from a memo that keeps it until the build ends.",
+ "cost": "tempo's cold build did not finish (stopped at 2,073 s); the lane first guessed coroutine layout and promoted constants from the code and reported that before the stacks arrived",
+ "whys": [
+  "Why was the memory held? One monomorphized body per instance stayed in a query memo on the global heap.",
+  "Why a memo? `dispatch::body_of` was the only way to get an instance's body, and it is the interpreter's entry, which needs the memo because it runs one body many times.",
+  "Why did a walk that reads each body once use the interpreter's entry? Nothing distinguishes a value read once from one read often: every query result is kept by default, and `lru = 0` means kept until someone asks.",
+  "Why did nothing notice? The memo's count is by tag, not by query and not by instances per body, and the walk's span said nothing while it ran.",
+  "Why one worker? A summary asks its callees' summaries inside its own run, so the closure is one stack of queries; the pool only sees one job."
+ ],
+ "cause": "a per-instance value with a per-item lifetime kept in a per-build memo, read by a walk whose result is the only thing that outlives the item",
+ "class": "per-instance memo of a derived body: memory that grows with instances reached, not with code written (the same class: `monomorphized_promoted_mir_body_query`, `db.monomorphized_mir` in layout.rs:676 and debuginfo/types.rs:644, `body_of` in hir-ty-identity walk.rs and hir-ty-suspend summary.rs)",
+ "prevention": "written: `dispatch::body_once` (owned, dropped by the caller) and `summary_in` on it, with hir-ty-pure tests::held (MIR values held are equal for 8 and 64 instances of one generic; the control reads the memo). To build: a gate check that lists every `lru = 0` query whose key holds generic arguments (`StoredGenericArgs`) and whose value is a `MirBody`, and fails on one not on a short list with its reason (the interpreter's); and a per-query count of held values in `blaze explain memory`, so instances per body is a number someone can read",
+ "workaround": "none",
+ "fix": "written, not compiled or measured: this round's files of lane monowalk-1112",
+ "state": "open"
+}

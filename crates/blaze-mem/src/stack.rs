@@ -163,8 +163,4 @@ impl Stack {
         *head = pack(tag(*head).wrapping_add(1), NONE);
         top
     }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        index(self.head.load(Ordering::Relaxed)) == NONE
-    }
 }

@@ -418,6 +418,7 @@ fn a_template_kept_by_one_blaze_build_is_read_by_the_next() {
             heap_to_stack: false,
             report: false,
             fuel: false,
+            slots: false,
         };
         blaze_codegen::kernel::template(&stored, &spec.settings(), &spec.toolchain.id)
     };
@@ -434,10 +435,8 @@ fn a_template_kept_by_one_blaze_build_is_read_by_the_next() {
         "a blaze whose code generator changed keys templates apart"
     );
 
-    let root = std::env::temp_dir()
-        .join(format!("blaze-codegen-code-restart-store-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
+    let held = blaze_core::temp::TempDir::for_test("blaze-codegen-code-restart-store-");
+    let root = held.path();
     let template = b"the bytes of one dev template".to_vec();
     {
         let mut driven = blaze_cas::Driven::open(&root).unwrap();
@@ -453,5 +452,4 @@ fn a_template_kept_by_one_blaze_build_is_read_by_the_next() {
     assert_eq!(got.bytes, template.as_slice());
     assert!(driven.store().get(&key(codegen_edited)).unwrap().is_none());
     drop(driven);
-    std::fs::remove_dir_all(&root).unwrap();
 }

@@ -1,0 +1,86 @@
+== a build with nothing to do
+-- a terminal, 24-bit, dark
+\e[38;2;63;185;80m✓ up to date\e[0m\e[2m · 40ms\e[0m\e[2m → \e[0m\e]8;;file:///home/me/.cache/blaze/build/hello-world-5373d6c45d4151d3dfd664b10fb56112/debug/hello-world\e\\e[38;2;126;224;210m~/.cache/blaze/build/hello-world-5373…6112/debug/hello-world\e[0m\e]8;;\e\\e[2m · 4.1 MB\e[0m
+-- a terminal, 16 colours
+\e[32m✓ up to date\e[0m\e[2m · 40ms\e[0m\e[2m → \e[0m\e]8;;file:///home/me/.cache/blaze/build/hello-world-5373d6c45d4151d3dfd664b10fb56112/debug/hello-world\e\\e[4m~/.cache/blaze/build/hello-world-5373…6112/debug/hello-world\e[0m\e]8;;\e\\e[2m · 4.1 MB\e[0m
+-- a terminal, NO_COLOR
+✓ up to date · 40ms → ~/.cache/blaze/build/hello-world-5373…6112/debug/hello-world · 4.1 MB
+-- a pipe
+blaze: ok built=0 cached=31 warnings=0 elapsed_ms=40 tier="tier 0" program=/home/me/.cache/blaze/build/hello-world-5373d6c45d4151d3dfd664b10fb56112/debug/hello-world size_bytes=4123456
+== an edit
+-- a terminal, 24-bit, dark
+\e[38;2;63;185;80m✓ \e[0m\e[38;2;230;192;123mhello::add\e[0m recompiled\e[2m in 40ms\e[0m\e[2m · \e[0m\e]8;;file:///w/src/main.rs\e\\e[38;2;126;224;210msrc/main.rs\e[0m\e]8;;\e\\e[2m changed\e[0m\e[2m · tier 0\e[0m
+-- a terminal, 16 colours
+\e[32m✓ \e[0m\e[1mhello::add\e[0m recompiled\e[2m in 40ms\e[0m\e[2m · \e[0m\e]8;;file:///w/src/main.rs\e\\e[4msrc/main.rs\e[0m\e]8;;\e\\e[2m changed\e[0m\e[2m · tier 0\e[0m
+-- a terminal, NO_COLOR
+✓ `hello::add` recompiled in 40ms · src/main.rs changed · tier 0
+-- a pipe
+blaze: ok built=1 cached=31 warnings=0 elapsed_ms=40 tier="tier 0" cause="src/main.rs changed" recompiled=hello::add
+-- its why as JSON
+[{"wasted":false,"cause":[{"Path":"/w/src/main.rs"},{"Plain":" changed"}],"headline":[{"Plain":"recomputed "},{"Count":2},{"Plain":" steps because "},{"Path":"/w/src/main.rs"},{"Plain":" changed"}],"functions":["hello::add"],"more":"blaze explain why:input"}]
+== a failure
+-- a terminal, 24-bit, dark
+\e[1;38;2;255;123;114m✗ \e[0m\e[1mrun failed in 40ms\e[0m · 1 error in hello (bin)\e[2m · \e[0m\e[4;38;2;121;192;255mblaze explain hello\e[0m
+-- a terminal, 16 colours
+\e[1;31m✗ \e[0m\e[1mrun failed in 40ms\e[0m · 1 error in hello (bin)\e[2m · \e[0m\e[1;4mblaze explain hello\e[0m
+-- a terminal, NO_COLOR
+✗ run failed in 40ms · 1 error in hello (bin) · `blaze explain hello`
+-- a pipe
+blaze: failed errors=1 warnings=0 unbuilt=0 elapsed_ms=40 unit="hello (bin)" next="blaze explain hello"
+== work that should not have been done
+-- a terminal, 24-bit, dark
+\e[38;2;240;136;62m⚠ \e[0mrecomputed \e[1m1\e[0m step because \e]8;;file:///w/src/main.rs\e\\e[38;2;126;224;210msrc/main.rs\e[0m\e]8;;\e\ changed, though no item in it did (\e[38;2;230;192;123mfn main\e[0m is as it was)\e[2m · \e[0m\e[4;38;2;121;192;255mblaze explain why:input\e[0m
+-- a terminal, 16 colours
+\e[1;33m⚠ \e[0mrecomputed \e[1m1\e[0m step because \e]8;;file:///w/src/main.rs\e\\e[4msrc/main.rs\e[0m\e]8;;\e\ changed, though no item in it did (\e[1mfn main\e[0m is as it was)\e[2m · \e[0m\e[1;4mblaze explain why:input\e[0m
+-- a terminal, NO_COLOR
+⚠ recomputed 1 step because src/main.rs changed, though no item in it did (`fn main` is as it was) · `blaze explain why:input`
+-- a pipe
+blaze: ok built=0 cached=31 warnings=0 elapsed_ms=40 tier="tier 0"
+blaze: wasted why="recomputed 1 step because src/main.rs changed, though no item in it did (fn main is as it was)" next="blaze explain why:input"
+-- its why as JSON
+[{"wasted":true,"cause":[{"Path":"/w/src/main.rs"},{"Plain":" changed"}],"headline":[{"Plain":"recomputed "},{"Count":1},{"Plain":" step because "},{"Path":"/w/src/main.rs"},{"Plain":" changed, though no item in it did ("},{"Code":"fn main"},{"Plain":" is as it was)"}],"functions":["hello::add"],"more":"blaze explain why:input"}]
+== warnings with a fix
+-- a terminal, 24-bit, dark
+\e[38;2;63;185;80m✓ \e[0mbuilt \e[1m1 unit\e[0m, 31 cached\e[2m in 40ms\e[0m\e[2m · tier 0\e[0m\e[2m · \e[0m\e[38;2;240;136;62m2 warnings\e[0m
+\e[2m  hint: \e[0m\e[1m2 warnings\e[0m have a fix: \e[4;38;2;121;192;255mblaze check --fix\e[0m
+-- a terminal, 16 colours
+\e[32m✓ \e[0mbuilt \e[1m1 unit\e[0m, 31 cached\e[2m in 40ms\e[0m\e[2m · tier 0\e[0m\e[2m · \e[0m\e[1;33m2 warnings\e[0m
+\e[2m  hint: \e[0m\e[1m2 warnings\e[0m have a fix: \e[1;4mblaze check --fix\e[0m
+-- a terminal, NO_COLOR
+✓ built 1 unit, 31 cached in 40ms · tier 0 · 2 warnings
+  hint: 2 warnings have a fix: `blaze check --fix`
+-- a pipe
+blaze: ok built=1 cached=31 warnings=2 elapsed_ms=40 tier="tier 0"
+blaze: hint fixable=2 run="blaze check --fix"
+== a failed test
+-- a terminal, 24-bit, dark
+\e[1m testing\e[0m  0/0\e[38;2;63;185;80m · 0 passed\e[0m\e[38;2;200;162;242m · 1 binary waiting, build under way\e[0m\e[2m · 0.0s\e[0m
+\e[38;2;86;194;230m ▶ \e[0m\e[1mcalc lib\e[0m          0
+\e[1m testing\e[0m  0/0\e[38;2;63;185;80m · 0 passed\e[0m\e[2m · 0.0s\e[0m
+\e[1;38;2;255;123;114m✗ \e[0m\e[1mtests::adds_wrong\e[0m\e[2m  calc lib\e[0m\e[2m · 3ms\e[0m
+\e[38;2;86;194;230m ▶ \e[0m\e[1mcalc lib\e[0m          1\e[1;38;2;255;123;114m · 1 failed\e[0m
+\e[1m testing\e[0m  1/0\e[38;2;63;185;80m · 0 passed\e[0m\e[1;38;2;255;123;114m · 1 failed\e[0m\e[2m · 0.0s\e[0m
+\e[1;38;2;255;123;114m✗ \e[0m1 of 1 ran: \e[1m1 failed\e[0m · 0 passed\e[2m · 0 ignored\e[0m\e[2m · 0 filtered\e[0m\e[2m · 1 binary · 40ms\e[0m
+\e[2m  rerun: \e[0m\e[4;38;2;121;192;255mblaze test -p calc --lib\e[0m
+-- a terminal, 16 colours
+\e[1m testing\e[0m  0/0\e[32m · 0 passed\e[0m\e[35m · 1 binary waiting, build under way\e[0m\e[2m · 0.0s\e[0m
+\e[36m ▶ \e[0m\e[1mcalc lib\e[0m          0
+\e[1m testing\e[0m  0/0\e[32m · 0 passed\e[0m\e[2m · 0.0s\e[0m
+\e[1;31m✗ \e[0m\e[1mtests::adds_wrong\e[0m\e[2m  calc lib\e[0m\e[2m · 3ms\e[0m
+\e[36m ▶ \e[0m\e[1mcalc lib\e[0m          1\e[1;31m · 1 failed\e[0m
+\e[1m testing\e[0m  1/0\e[32m · 0 passed\e[0m\e[1;31m · 1 failed\e[0m\e[2m · 0.0s\e[0m
+\e[1;31m✗ \e[0m1 of 1 ran: \e[1m1 failed\e[0m · 0 passed\e[2m · 0 ignored\e[0m\e[2m · 0 filtered\e[0m\e[2m · 1 binary · 40ms\e[0m
+\e[2m  rerun: \e[0m\e[1;4mblaze test -p calc --lib\e[0m
+-- a terminal, NO_COLOR
+ testing  0/0 · 0 passed · 1 binary waiting, build under way · 0.0s
+ ▶ calc lib          0
+ testing  0/0 · 0 passed · 0.0s
+✗ tests::adds_wrong  calc lib · 3ms
+ ▶ calc lib          1 · 1 failed
+ testing  1/0 · 0 passed · 1 failed · 0.0s
+✗ 1 of 1 ran: 1 failed · 0 passed · 0 ignored · 0 filtered · 1 binary · 40ms
+  rerun: `blaze test -p calc --lib`
+-- a pipe
+x tests::adds_wrong  calc lib - 3ms
+x 1 of 1 ran: 1 failed - 0 passed - 0 ignored - 0 filtered - 1 binary - 40ms
+  rerun: `blaze test -p calc --lib`

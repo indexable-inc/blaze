@@ -876,7 +876,7 @@ impl fmt::Display for ClauseText<'_, '_> {
                 write!(f, "{}: {}", longer.display(db, target), region.display(db, target))
             }
             // `Debug` names the clause's items only through the attached database.
-            _ => blaze_query::db::attach(db, || write!(f, "{clause:?}")),
+            _ => blaze_memo::attach(db, || write!(f, "{clause:?}")),
         }
     }
 }

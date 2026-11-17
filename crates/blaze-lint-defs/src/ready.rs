@@ -29,14 +29,26 @@ pub const CAPABILITIES_FOR_BUILD_SCRIPTS: bool = false;
 
 /// Whether blaze's capability standard library (bstd, `crates/blaze-std`,
 /// docs/v2/plan/design/std.md) is in the tree, compiles on a stage-1 blaze and has an API the
-/// workspace can port to: steps S1 and S2 of that plan. Today `crates/blaze-std` is in the tree,
-/// but it is not yet built on a stage-1 blaze nor an API the workspace ports to. Turning this to `true` makes `blaze::std_use` warn in every crate of a
+/// workspace can port to: steps S1 and S2 of that plan. Today `crates/blaze-std` is in the tree
+/// and builds, and its tests run, under a blaze built from this tree (`blaze build -p blaze-std`,
+/// `blaze test -p blaze-std`; arm64 Linux, 2026-11-12), but it is not an API the workspace can
+/// port to: cargo still builds blaze's crates, and rustc refuses bstd's blaze-only syntax
+/// (decision D25 of docs/v2/plan/decisions.json). Turning this to `true` makes `blaze::std_use` warn in every crate of a
 /// workspace whose `lints-when-ready` table has `std_use = "warn"`, and its findings name what to
 /// write as something to do now. The lint's own default stays `allow`: another workspace's
 /// crates ask for it with `#![blaze::capabilities]`. blaze's own workspace does not wait: its
 /// `lints-ratchet` denies the lint ahead of this switch (Andrew's decision of 2026-11-11), each
 /// crate not yet ported held at `warn` by its line in the lint's baseline.
 pub const BSTD_IN_TREE: bool = false;
+
+/// Whether a package of the latest blaze edition builds wherever this blaze runs: bstd ships
+/// with blaze and is given to every crate of the edition (docs/v2/plan/design/std.md, row
+/// S5d), so `edition = "blaze-2026.11"` is all a package writes. Today a package of the
+/// edition names bstd as a dependency by path, which only a checkout of blaze has. Turning
+/// this to `true` makes `blaze::not_latest_edition` warn by default, and is turned with
+/// `blaze_new::BSTD_SHIPS`, which makes the edition what `blaze new` writes: telling every
+/// package to move to an edition it cannot build on would be a nag, not help.
+pub const EDITION_SHIPS: bool = false;
 
 /// Each lint that has a switch here, by its name after `blaze::`, with the switch: what the
 /// table `[workspace.metadata.blaze.lints-when-ready]` reads ([`switch_of`]).
@@ -45,6 +57,7 @@ pub const SWITCHES: &[(&str, bool)] = &[
     ("proc_macro_attribute", REFLECTION_REPLACES_MACROS),
     ("build_script_ambient", CAPABILITIES_FOR_BUILD_SCRIPTS),
     ("std_use", BSTD_IN_TREE),
+    ("not_latest_edition", EDITION_SHIPS),
 ];
 
 /// Whether what `blaze::{lint}` tells code to move to is in this blaze; `None` for a lint with

@@ -247,6 +247,37 @@ impl<'db> Term<'db> {
     }
 }
 
+impl<'db> table::Homed for GenericArg<'db> {
+    /// Its row's home, in the table of its kind.
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        match self.kind() {
+            GenericArgKind::Type(ty) => table::Homed::home(&ty),
+            GenericArgKind::Lifetime(region) => table::Homed::home(&region),
+            GenericArgKind::Const(konst) => table::Homed::home(&konst),
+        }
+    }
+}
+
+impl<'db> table::Homed for Term<'db> {
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        match self.kind() {
+            TermKind::Ty(ty) => table::Homed::home(&ty),
+            TermKind::Const(konst) => table::Homed::home(&konst),
+        }
+    }
+}
+
+impl table::Homed for StoredGenericArg {
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        table::Homed::home(&self.as_ref())
+    }
+}
+
+crate::next_solver::interner::memo_home!(GenericArg<'db>, Term<'db>, StoredGenericArg);
+
 impl<'db> From<Ty<'db>> for GenericArg<'db> {
     #[inline]
     fn from(value: Ty<'db>) -> Self {

@@ -1,0 +1,12 @@
+{
+ "id": "bstd-sim-test-4",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-sim-test",
+ "where": "bstd's own tests, compiled by rustc in a scratch copy",
+ "what": "On the base commit 136432aa02, with the blaze-only syntax cut, two bstd tests fail: tests::explicit::a_worlds_limits_are_the_ones_its_maker_said (`(2, 3)` against `(2, 2)`: the root context's own Opened record is counted) and tests::paths::a_path_never_escapes_its_directory (`the path \"a\" reached jail/in, not beneath jail/in`, plan seed 0). And tests/cell.rs does not compile: it shares an `Io` across threads and `Io` is not `Sync`, because `Sim` holds `Box<dyn FnMut(&Command, &mut Rng) -> Ran>` (its programs).",
+ "cost": "15 minutes to tell them from this lane's change (the same three fail before and after)",
+ "cause": "not found; branch bstd-builds-1112 has a commit `bstd tests: two oracles that never ran agree with the code` that may be these two",
+ "class": "tests that have never been compiled or run pass review",
+ "prevention": "as the first row: bstd's tests run under a blaze in the loop",
+ "state": "open"
+}

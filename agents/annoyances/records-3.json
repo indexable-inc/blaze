@@ -1,0 +1,11 @@
+{
+ "id": "records-3",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane records-1111",
+ "where": "the task's premise: an image served saves memory",
+ "what": "The brief took the dependency images as the mechanism that would make a restarted or warm daemon small. Measured, a restarted daemon is larger than a cold one (6,081 MB against 5,143 MB resident on hello-world): each image is decoded into the same heap values, after the crate was resolved from source anyway (F2), and the first edit after the restart makes 109,000 bodies and 60,000 MIR bodies again (R7).",
+ "cost": "the first plan (serve the images sooner and the memory follows) would have bought seconds and no megabyte",
+ "cause": "nothing measured the restarted daemon's memory before; measure.py had no restart row",
+ "workaround": "measure.py has restart rows now (first no-op, first edit, memory after)",
+ "state": "the rows are in /tmp/records-1111/measure.py; the script is not in the tree (open)"
+}

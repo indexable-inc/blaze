@@ -3,7 +3,12 @@
 //! `sql/examples.sql`, cut out at compile time; [`PRELUDE`] (`sql/views.sql`) defines the tables
 //! and views that SQL reads, over the files of the directories [`prelude`] is given.
 
-use std::{fmt, fmt::Write as _, path::Path};
+use std::{
+    alloc::{Allocator, Global},
+    fmt,
+    fmt::Write as _,
+    path::Path,
+};
 
 use serde_json::{Map, Value};
 
@@ -67,15 +72,79 @@ impl ArgType {
     }
 }
 
-const BUILD: Arg =
-    Arg { name: "build", ty: ArgType::U64, default: Some("(SELECT max(build_id) FROM spans)") };
+/// The last build: the last row of `builds`, never the greatest id a span has. What a build
+/// does after its answer (storing what it left) is recorded under the id after its own, which
+/// is no build: with that as the default, `blaze explain edit_work` after any build said
+/// `build 4 counted no work in any stage` and `writes` said `0 rows` (2026-11-12).
+///
+/// With no build in the table the default is an error that says why ([`NO_BUILD`]), never NULL:
+/// until 2026-11-14 a NULL build read as a build with no rows, and every view answered "0
+/// rows" about a build that was not there.
+const BUILD: Arg = Arg {
+    name: "build",
+    ty: ArgType::U64,
+    default: Some("coalesce((SELECT max(build_id) FROM builds), error($no_build))"),
+};
 /// A build for a view over its wall time: by default the last to end, as one still running has
 /// only its start's `builds` row, with no end to bound it.
 const ENDED_BUILD: Arg = Arg {
     name: "build",
     ty: ArgType::U64,
-    default: Some("(SELECT max(build_id) FROM builds WHERE dur_ns IS NOT NULL)"),
+    default: Some(
+        "coalesce((SELECT max(build_id) FROM builds WHERE dur_ns IS NOT NULL), error($no_build))",
+    ),
 };
+
+/// Where a default says why it has no build to name: replaced, as it is put in, by an SQL
+/// string saying why ([`NoBuild`]) with the count of `builds` rows in it. The count is there so
+/// the argument is no constant: DuckDB would fold `error` of a constant as it plans, and fail a
+/// query that never reaches it.
+const NO_BUILD: &str = "$no_build";
+
+/// Why a view has no build to read, as far as the caller knows: [`render`] knows nothing of the
+/// history; [`prelude`] reads it from the manifest it is given ([`Manifest::capped`]).
+#[derive(Clone, Copy, Debug)]
+enum NoBuild {
+    Unknown,
+    Capped(crate::history::manifest::CappedBuilds),
+    NoneRan,
+}
+
+impl NoBuild {
+    fn of(manifest: &Manifest) -> NoBuild {
+        manifest.capped().map_or(NoBuild::NoneRan, NoBuild::Capped)
+    }
+
+    /// The SQL expression of the message ([`NO_BUILD`]), written onto `out`.
+    fn sql<A: Allocator>(self, out: &mut blaze_mem::String<A>) {
+        out.push_str("concat(");
+        // Writing to a `blaze_mem::String` does not fail: it grows.
+        match self {
+            NoBuild::Unknown => _ = quote(
+                "the profile history holds no build for this view: none has run here, or its cap \
+                 retired every one; name one with build=N",
+                out,
+            ),
+            // Written straight between its quotes: its text has no quote and its numbers none,
+            // so nothing in it needs doubling.
+            NoBuild::Capped(capped) => _ = write!(
+                out,
+                "'the profile history holds no build for this view: its cap retired builds \
+                 through build {} (at flush {}), and those it keeps (every running build and the \
+                 last {} finished) hold none for it; name one with build=N'",
+                capped.through,
+                capped.flush,
+                crate::history::KEEP_BUILDS,
+            ),
+            NoBuild::NoneRan => _ = quote(
+                "the profile history holds no build for this view: none has run here (its cap \
+                 retired none); name one with build=N",
+                out,
+            ),
+        }
+        out.push_str(", ' (rows in builds: ', CAST((SELECT count(*) FROM builds) AS VARCHAR), ')')");
+    }
+}
 const LIMIT: Arg = Arg { name: "limit", ty: ArgType::U64, default: Some("20") };
 /// One build, or none: a view over the last builds (`problems`) reads them all unless one is
 /// named.
@@ -137,7 +206,10 @@ pub const VIEWS: &[View] = &[
     const { view("memory_timeline", &[BUILD]) },
     const { view("memory_peak_tasks", &[BUILD, LIMIT]) },
     const { view("memory_at_peak", &[BUILD]) },
+    const { view("memory_held", &[BUILD, LIMIT]) },
+    const { view("memory_held_now", &[LIMIT]) },
     const { view("memory_sites", &[BUILD, LIMIT]) },
+    const { view("memory_give_backs", &[BUILD, LIMIT]) },
     const { view("admission_waits", &[BUILD, LIMIT]) },
     const { view("busiest_threads", &[BUILD, LIMIT]) },
     const { view("longest_gaps", &[BUILD, LIMIT]) },
@@ -159,13 +231,19 @@ pub const VIEWS: &[View] = &[
     const { view("problems", &[ANY_BUILD, BUILDS, LIMIT]) },
     const { view("timeline", &[ENDED_BUILD, MIN_MS, MANY]) },
     const { view("long_spans", &[BUILD, LONG_MS, LIMIT]) },
+    const { view("wait_owner", &[BUILD, LONG_MS, LIMIT]) },
     const { view("waits_by_reason", &[BUILD, LIMIT]) },
     const { view("counts_by_cause", &[BUILD, MANY]) },
+    const { view("validity", &[BUILD]) },
     const { view("writes", &[BUILD, MANY]) },
     const { view("scripts", &[BUILD, MANY]) },
     const { view("pool", &[ENDED_BUILD]) },
     const { view("kept", &[ENDED_BUILD, MANY]) },
     const { view("syscalls", &[ENDED_BUILD, THREAD, WITHIN, MIN_MS, MANY]) },
+    const { view("unit_reads", &[BUILD, MANY]) },
+    const { view("edit_work", &[BUILD, MANY]) },
+    const { view("account", &[ENDED_BUILD]) },
+    const { view("unaccounted", &[LIMIT]) },
 ];
 
 /// The view named `name`.
@@ -415,8 +493,25 @@ pub fn render(view: &View, args: &Map<String, Value>) -> Result<String, ViewErro
         // alloc: an error, once a request
         return Err(ViewError::UnknownArg { view: view.name, arg: arg.to_owned() });
     }
-    // alloc: the query, once a request
-    let mut out = String::with_capacity(view.sql.len() + 64);
+    let out = render_in(view, |name| args.get(name), NoBuild::Unknown, Global)?;
+    // The bytes move into the std `String` callers take, with no copy.
+    match String::from_utf8(out.into_bytes()) {
+        Ok(it) => Ok(it),
+        Err(_) => unreachable!("a `blaze_mem::String` holds UTF-8"),
+    }
+}
+
+/// [`render`]'s binding of each argument, into a string of `alloc`: `value_of` gives an
+/// argument's value by name (`None`: not given, so its default), and a default build that
+/// finds none fails with `no_build` as its reason. The arguments are checked against the
+/// view's by the caller.
+fn render_in<'v, A: Allocator>(
+    view: &View,
+    value_of: impl Fn(&str) -> Option<&'v Value>,
+    no_build: NoBuild,
+    alloc: A,
+) -> Result<blaze_mem::String<A>, ViewError> {
+    let mut out = blaze_mem::String::with_capacity_in(view.sql.len() + 64, alloc);
     let mut copied = 0;
     scan(view.sql, |it| {
         if it.sigil != b'$' {
@@ -427,7 +522,7 @@ pub fn render(view: &View, args: &Map<String, Value>) -> Result<String, ViewErro
             return Err(ViewError::Undeclared { view: view.name, name: it.name.to_owned() });
         };
         out.push_str(&view.sql[copied..it.at]);
-        literal(view, arg, args.get(arg.name), &mut out)?;
+        literal(view, arg, value_of(arg.name), no_build, &mut out)?;
         copied = it.end;
         Ok(())
     })?;
@@ -435,11 +530,12 @@ pub fn render(view: &View, args: &Map<String, Value>) -> Result<String, ViewErro
     Ok(out)
 }
 
-fn literal(
+fn literal<A: Allocator>(
     view: &View,
     arg: &Arg,
     value: Option<&Value>,
-    out: &mut String,
+    no_build: NoBuild,
+    out: &mut blaze_mem::String<A>,
 ) -> Result<(), ViewError> {
     let bad = |got: &Value| ViewError::BadArg {
         view: view.name,
@@ -451,10 +547,17 @@ fn literal(
     let Some(value) = value else {
         let default =
             arg.default.ok_or(ViewError::MissingArg { view: view.name, arg: arg.name })?;
-        out.push_str(default);
+        match default.split_once(NO_BUILD) {
+            Some((before, after)) => {
+                out.push_str(before);
+                no_build.sql(out);
+                out.push_str(after);
+            }
+            None => out.push_str(default),
+        }
         return Ok(());
     };
-    // Writing to a `String` does not fail.
+    // Writing to a `blaze_mem::String` does not fail: it grows.
     match arg.ty {
         ArgType::U64 => _ = write!(out, "{}", value.as_u64().ok_or_else(|| bad(value))?),
         ArgType::I64 => _ = write!(out, "{}", value.as_i64().ok_or_else(|| bad(value))?),
@@ -464,23 +567,24 @@ fn literal(
         }
         ArgType::Text => {
             let it = value.as_str().filter(|it| !it.contains('\0')).ok_or_else(|| bad(value))?;
-            quote(it, out);
+            _ = quote(it, out);
         }
     }
     Ok(())
 }
 
-/// `text` as an SQL string literal: in single quotes, each quote doubled. DuckDB's plain
-/// literals take backslashes as they are.
-pub(crate) fn quote(text: &str, out: &mut String) {
-    out.push('\'');
+/// `text` as an SQL string literal onto `out`: in single quotes, each quote doubled. DuckDB's
+/// plain literals take backslashes as they are. Generic over the text it writes onto (a std
+/// `String`, a `blaze_mem::String` of any allocator), whose writes are what can fail.
+pub(crate) fn quote<W: fmt::Write>(text: &str, out: &mut W) -> fmt::Result {
+    out.write_char('\'')?;
     for (i, part) in text.split('\'').enumerate() {
         if i > 0 {
-            out.push_str("''");
+            out.write_str("''")?;
         }
-        out.push_str(part);
+        out.write_str(part)?;
     }
-    out.push('\'');
+    out.write_char('\'')
 }
 
 /// [`PRELUDE`] reading each table from the files of the history `dir` its `manifest` lists for
@@ -522,8 +626,9 @@ pub fn prelude(dir: &Path, manifest: &Manifest, scope: Scope) -> Result<String, 
         };
         out.push_str(&PRELUDE[copied..it.at]);
         out.push('[');
+        // Writing to a `String` does not fail.
         // alloc: the prelude, once a query
-        quote(&format!("{dir}/schema.{}.parquet", table.name), &mut out);
+        _ = quote(&format!("{dir}/schema.{}.parquet", table.name), &mut out);
         for (file, entry) in manifest.scoped(table.name, scope) {
             schema::readable(entry.version).map_err(|why| ViewError::Version {
                 // alloc: an error, once a request
@@ -533,22 +638,20 @@ pub fn prelude(dir: &Path, manifest: &Manifest, scope: Scope) -> Result<String, 
             })?;
             out.push_str(", ");
             // alloc: the prelude, once a query
-            quote(&format!("{dir}/{file}"), &mut out);
+            _ = quote(&format!("{dir}/{file}"), &mut out);
         }
         out.push(']');
         copied = it.end;
         Ok(())
     })?;
     out.push_str(&PRELUDE[copied..]);
+    let no_build = NoBuild::of(manifest);
     for view in VIEWS.iter().filter(|it| it.args.iter().all(|arg| arg.default.is_some())) {
+        // Every argument at its default: none is given.
+        let sql = render_in(view, |_| None, no_build, Global)?;
         // Writing to a `String` does not fail; a section may end in a comment, so `;` goes on a
         // line of its own.
-        _ = write!(
-            out,
-            "\nCREATE OR REPLACE VIEW {} AS\n{}\n;\n",
-            view.name,
-            render(view, &Map::new())?
-        );
+        _ = write!(out, "\nCREATE OR REPLACE VIEW {} AS\n{}\n;\n", view.name, sql.as_str());
     }
     crate::span::views(&mut out);
     Ok(out)
@@ -651,9 +754,10 @@ mod tests {
         let view = find("slowest_queries").unwrap();
         let sql = render(view, &args(json!({}))).unwrap();
         assert!(
-            sql.contains("build_id = (SELECT max(build_id) FROM spans)"),
-            "a missing argument takes its default: {sql}"
+            sql.contains("build_id = coalesce((SELECT max(build_id) FROM builds), error(concat('"),
+            "a missing argument takes its default, which says why when there is no build: {sql}"
         );
+        assert!(!sql.contains(NO_BUILD), "the reason is put in: {sql}");
         assert!(sql.ends_with("LIMIT 20"), "{sql}");
         let sql = render(view, &args(json!({"build": 41}))).unwrap();
         assert!(sql.contains("build_id = 41"), "{sql}");
@@ -741,7 +845,7 @@ mod tests {
             two.contains("read_parquet(['/p/schema.samples.parquet'], union_by_name = true)"),
             "outside build 2's window"
         );
-        let error = prelude(Path::new("/tmp/a*b"), &manifest, Scope::All).unwrap_err();
+        let error = prelude(Path::new("/p/a*b"), &manifest, Scope::All).unwrap_err();
         assert!(matches!(error, ViewError::BadPath { .. }), "{error:?}");
         let mut old = Manifest::new();
         old.insert("1-00000001.spans.parquet", Entry { version: 1, ..entry(None, None) }).unwrap();
@@ -856,6 +960,7 @@ mod tests {
         "floor",
         "nullif",
         "split_part",
+        "error",
     ];
 
     /// The identifiers of `sql` outside comments, strings, numbers and `$`/`@` names, each with

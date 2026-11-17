@@ -1,0 +1,11 @@
+{
+ "id": "edit2-1",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit2-1111",
+ "where": "the brief's VM line: `ix new --memory 96`",
+ "what": "`ix new` takes memory only as 4, 8, 16, 32, 64, 128 or 256 GiB: `--memory 96` is refused (`\"96\" is not a memory size in GiB`), and the next command (`ix shell`) then fails on a VM that does not exist.",
+ "cost": "a minute; the lane took 128",
+ "cause": "the brief was written from memory of the flag",
+ "workaround": "`--memory 128`",
+ "state": "open: briefs should name a size `ix new` takes"
+}

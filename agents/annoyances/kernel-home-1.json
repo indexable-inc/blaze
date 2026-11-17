@@ -1,0 +1,21 @@
+{
+ "id": "kernel-home-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane kernel-home",
+ "where": "crates/blaze-kernel/src/store.rs (`Put`, `Keeping`), crates/blaze-record/src/chain.rs (`Store`)",
+ "what": "Two store traits for one store do not fit each other: `blaze_kernel::Put::put` takes `&mut self` and its bytes as an owned `Vec<u8>` (every impl only borrows them), `blaze_record::Store::put` takes `&self` and `&[u8]`, and its `Held` has no lifetime of the borrow it was read under. Porting the kernel onto blaze-record therefore needed a `RefCell` adapter (`Keeping`: the store lent out a call at a time, a put while a value is held is a typed `Stopped::Held`) and copies every kept entry with reads once more (`bytes.to_vec()` in the adapter, after `entry::encode` already built it).",
+ "cost": "one extra copy of each entry with reads on the keep path (none exist in production yet: the dev template is an entry with no reads, copied once as before); an adapter whose soundness rests on blaze-record never holding a value across a put, which its trait does not promise",
+ "whys": [
+  "why a RefCell: blaze-record reads and puts through one `&S`, the kernel puts through `&mut P`",
+  "why `&mut P`: blaze-cas's `Store::put` and `Writer::put` are `&mut self`, and the kernel's trait copied that",
+  "why `&S` in blaze-record: its first users (hir-ty's stores over `&dyn ImageStore`) buffer puts behind a shared handle",
+  "why two traits at all: each crate drew the store it needed from its own first caller; there is no one statement of 'a write-once content-addressed store as a sans-IO core sees it'",
+  "why the owned Vec: the first kernel put was written before any second impl existed and no impl has ever needed ownership"
+ ],
+ "cause": "the store's interface for a sans-IO core is defined per caller (blaze-kernel `Get`/`Put`, blaze-record `Store`, hir-def `ImageStore`, hir-ty `slots::Records`), not once",
+ "class": "one concept (the store as a core sees it) with several homes (rule 30); an interface drawn from its first caller (rule 28)",
+ "prevention": "one store trait in blaze-record (a `Held<'s>` tied to the read's borrow, `put(&mut self, .., &[u8])`), which blaze-kernel's `Get`/`Put`, hir-def's `ImageStore` adapter and hir-ty's `Records` become impls of; then `Keeping`, `Looking`, `filed::Slots` and `slots::Records` are deleted and a lint bans a second `trait` with `fn put(.., key, .., bytes)` over `ContentId` outside it",
+ "workaround": "`blaze_kernel::store::{Looking, Keeping}`: a read-only adapter for lookups, a `RefCell` adapter with `try_borrow_mut` for keeps",
+ "fix": "not done: changing `Put::put` to borrow its bytes touches `crates/blaze-kernel/src/tests.rs` and `crates/blaze-storemodel/src/kernel.rs` (the judges of the port), so it is its own step after the port is green",
+ "state": "open"
+}

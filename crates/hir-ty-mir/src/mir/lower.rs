@@ -252,7 +252,7 @@ struct MirLowerCtx<'a, 'f, 'db> {
     inline_consts: u32,
     /// The `line!()` literals read where the code runs ([`location::slots_lines`]); `None`
     /// where each is its value.
-    line_slots: Option<&'db blaze_hash::HashSet<ExprId, Global>>,
+    line_slots: Option<&'db location::ExprSet<'db>>,
     /// How many shared borrows rustc may promote the expression being lowered is inside of: a
     /// promoted constant is a value, so a `line!()` in one stays a literal.
     promotable_borrows: u32,
@@ -353,6 +353,8 @@ struct MirLowerCtx<'a, 'f, 'db> {
     early_drops: &'a [EarlyDrop],
     /// How many of `early_drops` were lowered.
     early_drops_placed: usize,
+    /// The `#[loop_match]` loops being lowered, innermost last ([`loop_match`]).
+    loop_matches: Vec<loop_match::LoopMatchFrame<'f>, &'f Frame>,
 }
 
 /// A token to ensuring that each drop scope is popped at most once, thanks to the compiler that checks moves.
@@ -415,9 +417,10 @@ macro_rules! implementation_error {
 
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
 
-// After `not_supported!` and `implementation_error!`, which it uses.
+// After `not_supported!` and `implementation_error!`, which these use.
 mod comptime;
 mod contract;
+mod loop_match;
 
 impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
     fn new(
@@ -467,7 +470,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         };
         let store_owner = owner.expression_store_owner(db);
         let resolver = owner.resolver(db);
-        let env = db.trait_environment(owner.generic_def(db));
+        let env = owner.param_env(db);
         let interner = DbInterner::new_with(db, resolver.krate());
         // FIXME(next-solver): Is `non_body_analysis()` correct here? Don't we want to reveal opaque types defined by this body?
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
@@ -534,6 +537,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             probe: None,
             early_drops: &[],
             early_drops_placed: 0,
+            loop_matches: Vec::new_in(frame),
         }
     }
 
@@ -675,7 +679,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             && !self.is_line_slot(expr_id)
         {
             let ty = self.expr_ty_without_adjust(expr_id);
-            let mut operand = self.lower_literal_to_operand(ty, l)?;
+            let mut operand = self.lower_store_literal(ty, expr_id, l)?;
             operand.span = Some(expr_id.into());
             return Ok(Some((operand, current)));
         }
@@ -980,7 +984,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                             let operand = match self.store.expr(*value) {
                                 Expr::Literal(l) if !self.has_adjustments(*value) => {
                                     let ty = self.expr_ty_without_adjust(*value);
-                                    self.lower_literal_to_operand(ty, l)?
+                                    self.lower_store_literal(ty, *value, l)?
                                 }
                                 _ => {
                                     let Some(konst) = self.inline_const(*value) else {
@@ -1027,7 +1031,8 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                                     Operand::const_zst(ty.as_ref())
                                 }
                                 _ => not_supported!(
-                                    "inline assembly with a `sym` that is not a static or a                                      function without parameters"
+                                    "inline assembly with a `sym` that is not a static or a \
+                                     function without parameters"
                                 ),
                             };
                             operands.push(super::AsmOperand::Sym(named));
@@ -1127,6 +1132,20 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                         let name = &FunctionSignature::of(self.db, f).name;
                         // clone: error path
                         return Err(MirLowerError::TraitFunctionDefinition(t, name.clone()));
+                    }
+                    let signature = FunctionSignature::of(self.db, f);
+                    if !signature.has_body() {
+                        // A function declared without a body (a `#[rustc_intrinsic]` declaration
+                        // such as `mem::transmute`, an `extern` item): whoever asked for its MIR
+                        // should have taken the intrinsic or foreign path, so say which function.
+                        // FIXME(claude-opus-5-5): a typed `MirLowerError` variant for this, in
+                        // hir-ty's `mir.rs`, beside `TraitFunctionDefinition`.
+                        let edition = self.edition();
+                        let name = hir_ty_print::rustc_function_name(self.db, f, &[])
+                            .unwrap_or_else(|| signature.name.display(self.db, edition).to_string());
+                        return Err(MirLowerError::ImplementationError(format!(
+                            "the body of `{name}` was asked for, a function declared without one"
+                        )));
                     }
                 }
                 Err(MirLowerError::IncompleteExpr)
@@ -1392,7 +1411,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 }
             }
             Expr::Loop { body, label, source: _ } => {
-                self.lower_loop(current, place, label, expr_id.into(), |this, begin| {
+                self.enter_loop_match(expr_id)?;
+                let lowered = self.lower_loop(current, place, label, expr_id.into(), |this, begin| {
+                    this.loop_match_begins(expr_id);
                     let scope = this.push_drop_scope();
                     if let Some((_, mut current)) = this.lower_expr_as_place(begin, body, true)? {
                         current = scope.pop_and_drop(this, current, body.into());
@@ -1401,7 +1422,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                         scope.pop_assume_dropped(this);
                     }
                     Ok(())
-                })
+                })?;
+                self.leave_loop_match(expr_id)?;
+                Ok(lowered)
             }
             Expr::Call { callee, args, .. } => {
                 if let Some((func_id, generic_args)) = self.infer.method_resolution(expr_id) {
@@ -1512,6 +1535,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                     return Ok(None);
                 };
                 self.push_fake_read(current, cond_place, expr_id.into());
+                self.loop_match_dispatch(expr_id, cond_place);
                 let mut end = None;
                 let resolver_guard =
                     self.resolver.update_to_inner_scope(self.db, self.store_owner, expr_id);
@@ -1601,7 +1625,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                         }
                         next
                     } else {
-                        then
+                        self.loop_match_arm_entry(expr_id, index, *pat, then)?
                     };
                     if let Some(block) = self.lower_expr_to_place(*expr, place, then)? {
                         let block = arm.pop_and_drop(self, block, expr_id.into());
@@ -1654,6 +1678,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 Ok(None)
             }
             Expr::Break { expr, label } => {
+                if self.store.is_const_continue(expr_id) {
+                    return self.lower_const_continue(expr_id, expr, label, current);
+                }
                 let loop_data = match label {
                     Some(l) => {
                         self.labeled_loop_blocks.get(&l).ok_or(MirLowerError::UnresolvedLabel)?
@@ -1753,10 +1780,11 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                         let mut operands = Vec::with_capacity_in(count, self.frame);
                         operands.resize_with(count, || None);
                         let declared = self.declared_locals();
+                        let table = self.resolver.ctx_table();
                         for RecordLitField { name, expr } in fields.iter() {
                             let hygiene = self.store.record_field_hygiene(*expr);
                             let field_id = variant_fields
-                                .field_written(self.db, variant_id, name, hygiene)
+                                .field_written(self.db, table, variant_id, name, hygiene)
                                 .ok_or(MirLowerError::UnresolvedField)?;
                             let Some((op, c)) = self.lower_expr_to_some_operand(*expr, current)?
                             else {
@@ -1827,8 +1855,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                             not_supported!("Union record literal with more than one field");
                         };
                         let hygiene = self.store.record_field_hygiene(*expr);
+                        let table = self.resolver.ctx_table();
                         let local_id = variant_fields
-                            .field_written(self.db, variant_id, name, hygiene)
+                            .field_written(self.db, table, variant_id, name, hygiene)
                             .ok_or(MirLowerError::UnresolvedField)?;
                         let place = place.project(PlaceElem::Field(local_id.into()));
                         self.lower_expr_to_place(*expr, place, current)
@@ -2465,12 +2494,16 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             }
             Expr::Literal(l) => {
                 let ty = self.expr_ty_without_adjust(expr_id);
-                let mut op = self.lower_literal_to_operand(ty, l)?;
+                let mut op = self.lower_store_literal(ty, expr_id, l)?;
                 op.span = Some(expr_id.into());
                 self.push_assignment(current, place, op.into(), expr_id.into());
                 Ok(Some(current))
             }
-            Expr::Underscore => Ok(Some(current)),
+            // `_` is an expression only where a value is asked of it (as the left of an
+            // assignment it is a wildcard pattern, `ExprCollector::collect_pat_from_expr`):
+            // a typed hole, which type checking reports and nothing can run. Lowered to
+            // nothing it ran, with whatever was in its place before.
+            Expr::Underscore => Err(MirLowerError::TypeError("a typed hole (`_`) has no value")),
             Expr::IncludeBytes => not_supported!("include_bytes!()"),
         }
     }
@@ -2559,7 +2592,11 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                             // Looked up hygienically, as inference does (`variant_written`).
                             let ctxt = offset.field_hygiene(index).syntax_context();
                             let id = hir_def::signatures::EnumVariants::variant_written(
-                                self.db, it, name, ctxt,
+                                self.db,
+                                self.resolver.ctx_table(),
+                                it,
+                                name,
+                                ctxt,
                             )
                             .ok_or(no_field)?;
                             place = place.project(ProjectionElem::Downcast(id.into()));
@@ -2574,7 +2611,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                     let hygiene = offset.field_hygiene(index);
                     let field = of
                         .fields(self.db)
-                        .field_written(self.db, of, name, hygiene)
+                        .field_written(self.db, self.resolver.ctx_table(), of, name, hygiene)
                         .ok_or(no_field)?;
                     let field_ty = self.db.field_types(of)[field]
                         .ty()
@@ -2741,7 +2778,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
 
     fn lower_literal_or_const(&mut self, ty: Ty<'db>, loc: &ExprId) -> Result<'db, Operand> {
         match self.store.expr(*loc) {
-            Expr::Literal(l) => self.lower_literal_to_operand(ty, l),
+            Expr::Literal(l) => self.lower_store_literal(ty, *loc, l),
             Expr::Path(c) => {
                 if let Some((CandidateId::ConstId(c), subst)) =
                     self.infer.assoc_resolutions_for_expr(*loc)
@@ -2773,6 +2810,37 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             _ => {
                 not_supported!("only `char` and numeric types are allowed in range patterns");
             }
+        }
+    }
+
+    /// The literal `l` that the store's `expr` is, as a constant of type `ty`: a `line!()` or
+    /// `column!()` placeholder is first given the value of where its call is written
+    /// ([`Self::placed`]). Every literal of the store is lowered through this, never through
+    /// [`Self::lower_literal_to_operand`] alone.
+    fn lower_store_literal(
+        &mut self,
+        ty: Ty<'db>,
+        expr: ExprId,
+        l: &Literal,
+    ) -> Result<'db, Operand> {
+        let placed = self.placed(expr, l)?;
+        self.lower_literal_to_operand(ty, &placed)
+    }
+
+    /// `l`, the literal the store's `expr` is, with a `line!()` or `column!()` placeholder
+    /// resolved to the line or column of its call (`hir_ty::body_store::placed_literal`); a
+    /// call written in no file's text is an error naming it, never a zero.
+    #[expect(
+        blaze::reads_positions,
+        reason = "a `line!()` or `column!()` lowered where it is a constant is the line or column \
+                  it is written at, as rustc's is; one read where the code runs takes none \
+                  (`Self::is_line_slot`)"
+    )]
+    fn placed<'l>(&self, expr: ExprId, l: &'l Literal) -> Result<'db, Cow<'l, Literal>> {
+        match hir_ty::body_store::placed_literal(self.db, self.store_owner, expr) {
+            Ok(Some(placed)) => Ok(Cow::Owned(placed)),
+            Ok(None) => Ok(Cow::Borrowed(l)),
+            Err(message) => Err(MirLowerError::UnplacedLiteral(message.into_boxed_str())),
         }
     }
 
@@ -3600,6 +3668,13 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         };
         let literal = |expr: ExprId| match self.store.expr(expr) {
             Expr::Literal(&Literal::Int(it, _)) => Some(it),
+            // A `line!()` or `column!()` is a `u32` of at least 1 wherever it is written: a
+            // divisor rustc promotes by, told without reading the line (its placeholder is 0).
+            Expr::Literal(&Literal::Uint(..))
+                if hir_ty::body_store::place_call(self.db, self.store_owner, expr).is_some() =>
+            {
+                Some(1)
+            }
             Expr::Literal(&Literal::Uint(it, _)) => i128::try_from(it).ok(),
             Expr::UnaryOp { expr, op: hir_def::hir::UnaryOp::Neg } => match self.store.expr(expr) {
                 Expr::Literal(&Literal::Int(it, _)) => Some(-it),
@@ -3808,7 +3883,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             && let Expr::Literal(l) = self.store.expr(expr_id)
         {
             let ty = self.expr_ty_without_adjust(expr_id);
-            let mut operand = self.lower_literal_to_operand(ty, l)?;
+            let mut operand = self.lower_store_literal(ty, expr_id, l)?;
             operand.span = Some(expr_id.into());
             return Ok(Some((operand, current)));
         }
@@ -5162,20 +5237,21 @@ pub fn has_failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> bool {
 }
 
 /// What keeps a body's macro calls from being lowered.
-#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
-enum UnexpandedCall {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnexpandedCall<'db> {
     /// One failed to expand, an error at the call.
     Failed,
-    /// The first whose expansion is not what rustc parses it as, and why.
-    Misparsed(String),
+    /// The first whose expansion is not what rustc parses it as, and why: kept in the query's
+    /// arena.
+    Misparsed(&'db str),
 }
 
 /// What keeps the body's macro calls from being lowered: one that failed to expand, else the
 /// first, in the order lowering met them, whose expansion is not what rustc parses it as. It
 /// reads the store's macro calls and their sites, not the source map, so lowering a body
 /// never builds its map.
-#[blaze_query::tracked(returns(ref))]
-fn failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Option<UnexpandedCall> {
+#[blaze_memo::tracked(returns(ref))]
+fn failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Option<UnexpandedCall<'db>> {
     use syntax::view::AstNode;
     let calls = ExpressionStore::of(db, owner.expression_store_owner(db)).macro_calls();
     if calls.is_empty() {
@@ -5253,7 +5329,7 @@ fn failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Option<Unexpan
              parses as one expression, whose expansion is {what}"
         ))
     });
-    misparsed.map(UnexpandedCall::Misparsed)
+    misparsed.map(|it| UnexpandedCall::Misparsed(blaze_memo::keep_str(blaze_memo::Database::memo(db), &it)))
 }
 
 /// Whether rustc parses `call` as an expression (`parse_stmt_mac`): in statement position,
@@ -5335,6 +5411,13 @@ fn lower_closure_body_in<'db>(
     if let InferBodyId::DefWithBodyId(def) = body_owner
         && hir_ty_tailck::has_become(store)
         && hir_ty_tailck::tail_call_check(db, def).fails_body(Some(expr))
+    {
+        return Err(MirLowerError::HasErrors);
+    }
+    // rustc builds no MIR for a closure whose `#[loop_match]` it refused.
+    if let InferBodyId::DefWithBodyId(def) = body_owner
+        && store.has_loop_match()
+        && super::loop_match::loop_match_check(db, def).fails_body(Some(expr))
     {
         return Err(MirLowerError::HasErrors);
     }
@@ -5717,7 +5800,7 @@ pub(crate) fn lower_body<'db>(db: &'db Db, def: InferBodyId<'db>) -> Result<'db,
 }
 
 /// The body of the constant behind a promoted `&expr` of `def`, which evaluates `expr` alone.
-#[blaze_query::tracked(returns(as_ref), lru = 0, mem_tag = Mir)]
+#[blaze_memo::tracked(returns(as_ref), owns, mem_tag = Mir)]
 pub fn promoted_mir_body_query<'db>(
     db: &'db Db,
     def: InferBodyId<'db>,
@@ -5817,6 +5900,13 @@ fn lower_body_dropping<'db>(
     if let InferBodyId::DefWithBodyId(def) = owner
         && hir_ty_tailck::has_become(store)
         && hir_ty_tailck::tail_call_check(db, def).fails_body(None)
+    {
+        return Err(MirLowerError::HasErrors);
+    }
+    // rustc refused a `#[loop_match]` or `#[const_continue]` of the body: it builds no MIR.
+    if let InferBodyId::DefWithBodyId(def) = owner
+        && store.has_loop_match()
+        && super::loop_match::loop_match_check(db, def).fails_body(None)
     {
         return Err(MirLowerError::HasErrors);
     }

@@ -15,18 +15,13 @@ use blaze_manifest::manifest::Manifest;
 use blaze_resolve::Cfg;
 use cargo_util_schemas::manifest::{TomlLintLevel, TomlManifest};
 
+use crate::lint_level::{self, is_blazes};
 use crate::load::load_error;
 use crate::query::{LintProfile, LoadError};
 use crate::stdlib::target::{self as platform, CfgArgs};
 
 fn error(what: String) -> LoadError {
     LoadError { what, at: None }
-}
-
-/// Whether `blaze::{lint}` is a lint or group of the compile's registry, which has blaze-lints'
-/// as well as the front end's: a level set for any other name would set nothing.
-fn is_blazes(lint: &str) -> bool {
-    matches!(blaze_lint_defs::named(&format!("blaze::{lint}")), Named::Lint(_) | Named::Group(_))
 }
 
 /// What cargo's `TargetInfo` has of one kind of unit.
@@ -294,8 +289,9 @@ enum Table {
 /// by name; then those of [`WORKSPACE_LINTS_WHEN_READY`] whose lint's switch is on. Where the
 /// workspace has [`WORKSPACE_LINTS_RATCHET`], its levels in place of [`WORKSPACE_LINTS`]', after
 /// the second table's, so a line of both is the ratchet's. A level that is not `allow`, `warn`,
-/// `deny` or `forbid`, a name with a path, one that is no lint or group of blaze's, or a lint of
-/// the second table that has no switch, is an error.
+/// `deny` or `forbid`, a name with a path, one that is no lint or group of blaze's, a lint of
+/// the second table that has no switch, or `unreachable` at `allow` or `warn` in any of them
+/// ([`lint_level::FLOOR_RULE`]), is an error.
 pub(super) fn workspace_lints(
     metadata: Option<&toml::Value>,
     manifest: &Path,
@@ -376,6 +372,12 @@ fn table_flags(
                 )));
             }
         };
+        // `unreachable = "warn"`: no table lowers the lint, whichever of the three it is.
+        let level = &flag[2..];
+        if lint_level::blazes_below_floor(level, lint) {
+            // alloc: an error, once
+            return Err(wrong(format!("`{lint} = \"{level}\"`: {}", lint_level::FLOOR_RULE)));
+        }
         if kind == Table::WhenReady {
             match blaze_lint_defs::ready::switch_of(lint) {
                 Some(true) => {}
@@ -399,9 +401,10 @@ fn table_flags(
 /// `crate<TAB>count` or `crate<TAB>unmeasured` per crate). They go after the workspace's flags,
 /// so they win over its `deny`, and before the package's own `[lints]`. None without a ratchet.
 /// A ratchet with no directory, a directory that cannot be listed, a `blaze.*.txt` of no lint of
-/// blaze's or a line that does not read is an error naming it: never a crate quietly left at
-/// `deny` or at `warn`. The other files (`TARGET`, clippy's baselines) set no level here. Read
-/// through `files`, as the manifests are, so a changed baseline is a changed load.
+/// blaze's, one of `blaze::unreachable` (never at `warn`, [`lint_level::FLOOR_RULE`]) or a line
+/// that does not read is an error naming it: never a crate quietly left at `deny` or at `warn`.
+/// The other files (`TARGET`, clippy's baselines) set no level here. Read through `files`, as
+/// the manifests are, so a changed baseline is a changed load.
 pub(super) fn ratchet_downgrades<F: Files>(
     files: &F,
     metadata: Option<&toml::Value>,
@@ -434,6 +437,14 @@ pub(super) fn ratchet_downgrades<F: Files>(
         let named = blaze_lint_defs::named(&format!("blaze::{lint}"));
         if is_dir || !matches!(named, Named::Lint(_)) {
             return Err(wrong(format!("{shown} is the baseline of no lint of blaze's (`blaze::{lint}`)")));
+        }
+        // A baseline holds each crate it lists at `warn`, which this lint is never at.
+        if lint_level::blazes_below_floor("warn", lint) {
+            // alloc: an error, once
+            return Err(wrong(format!(
+                "{shown} is a baseline, which holds each crate it lists at `warn`: {}",
+                lint_level::FLOOR_RULE
+            )));
         }
         let bytes = files.read(&path).map_err(|why| wrong(format!("{shown}: {why}")))?;
         let text = std::str::from_utf8(&bytes)
@@ -512,7 +523,9 @@ pub(super) fn workspace_profile(
 
 /// cargo's `lints_to_rustflags` of the package's `[lints]` (inherited already): the level
 /// flags sorted by priority, then by name backwards, then by flag; and what follows each
-/// `--check-cfg` of `[lints.rust.unexpected_cfgs] check-cfg`.
+/// `--check-cfg` of `[lints.rust.unexpected_cfgs] check-cfg`. A `[lints.blaze]` line that names
+/// no lint or group of blaze's, or sets `unreachable` to `allow` or `warn`
+/// ([`lint_level::FLOOR_RULE`]), is an error naming the package.
 pub(super) fn lints(manifest: &Manifest) -> Result<(Vec<String>, Vec<String>), LoadError> {
     lints_of(&manifest.package_id.name, &manifest.normalized_toml)
 }
@@ -542,6 +555,16 @@ pub(super) fn lints_of(
                 TomlLintLevel::Warn => "--warn",
                 TomlLintLevel::Allow => "--allow",
             };
+            // `[lints.blaze] unreachable = "warn"`: a package lowers the lint no more than the
+            // workspace's tables do.
+            let level = &flag[2..];
+            if tool == blaze_lint_defs::BLAZE_TOOL && lint_level::blazes_below_floor(level, lint) {
+                // alloc: an error, once
+                return Err(error(format!(
+                    "the `[lints.blaze]` of `{name}` set `{lint}` to `{level}`: {}",
+                    lint_level::FLOOR_RULE
+                )));
+            }
             let option = if tool == "rust" {
                 format!("{flag}={lint}")
             } else {

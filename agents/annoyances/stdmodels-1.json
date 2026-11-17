@@ -1,0 +1,14 @@
+{
+ "id": "stdmodels-1",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane stdmodels (V15) under proofs-1113",
+ "where": "lean/Blaze/Ordering.lean and Duration.lean, Lean 4.35.0",
+ "what": "Three Lean traps cost a build round each: `Ordering` under `open Blaze` is ambiguous with `_root_.Ordering`; `if_pos`/`if_neg` are deprecated (warnings fail the gate); `fun e => nomatch e, rest` inside an anonymous constructor parses `nomatch e, rest` as two discriminants.",
+ "cost": "two VM lake rounds of several minutes each",
+ "cause": "library names that shadow Lean core names, and Lean syntax that reads a comma greedily",
+ "whys": "the Blaze namespace reuses Rust paths that collide with Lean core types; the warning-free gate turns deprecations into failures; nothing lists these traps for library authors",
+ "class": "Lean library code written without a list of known Lean 4.35 traps",
+ "prevention": "not done: a how-to row listing the traps (qualify `core.cmp.Ordering`, use `ite_eq_left`/`ite_eq_right`/`dite_eq_left`, parenthesize `(nomatch e)`)",
+ "workaround": "qualify every Rust-path type in full, and parenthesize nomatch",
+ "state": "open"
+}

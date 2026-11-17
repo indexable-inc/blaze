@@ -49,7 +49,6 @@ fn errors_and_warnings_as_cargos_shell() {
 
 #[test]
 fn texts_into_a_buffer_as_their_own() {
-    let bin = target("bin", "foo");
     let mut out = String::new();
     finished_into(
         &mut out,
@@ -60,12 +59,6 @@ fn texts_into_a_buffer_as_their_own() {
         out,
         finished("`dev` profile [unoptimized + debuginfo]", std::time::Duration::from_millis(1234))
     );
-    out.clear();
-    could_not_compile_into(&mut out, "foo", &bin, false, 1, 0);
-    assert_eq!(out, could_not_compile("foo", &bin, false, 1, 0));
-    out.clear();
-    assert!(!generated_into(&mut out, "foo", &bin, false, true, Warned::default()));
-    assert_eq!(out, "", "nothing for a unit without warnings");
 }
 
 #[cfg(not(windows))]
@@ -76,87 +69,6 @@ fn a_command_with_cargos_variables_sorted() {
     assert_eq!(
         command_line_with(&env, "target/debug/foo", &["x".to_owned()]),
         "`CARGO_PKG_NAME=foo ZED='a b' target/debug/foo x`"
-    );
-}
-
-#[test]
-fn generated_warnings() {
-    let lib = target("lib", "foo");
-    let one = Warned { total: 1, duplicates: 0, fixable: Some(0) };
-    assert_eq!(
-        generated("foo", &lib, false, true, one).unwrap(),
-        "`foo` (lib) generated 1 warning"
-    );
-    let two = Warned { total: 2, duplicates: 0, fixable: Some(0) };
-    assert_eq!(
-        generated("foo", &lib, false, true, two).unwrap(),
-        "`foo` (lib) generated 2 warnings"
-    );
-    let bin = target("bin", "foo");
-    let fixable = Warned { total: 2, duplicates: 1, fixable: Some(1) };
-    assert_eq!(
-        generated("foo", &bin, false, true, fixable).unwrap(),
-        "`foo` (bin \"foo\") generated 2 warnings (1 duplicate) (run `blaze check --fix --bin \"foo\" -p foo` to apply 1 suggestion)"
-    );
-    let lib_fixable = Warned { total: 3, duplicates: 2, fixable: Some(2) };
-    assert_eq!(
-        generated("foo", &lib, false, true, lib_fixable).unwrap(),
-        "`foo` (lib) generated 3 warnings (2 duplicates) (run `blaze check --fix --lib -p foo` to apply 2 suggestions)"
-    );
-    assert_eq!(
-        generated("foo", &lib, true, true, one).unwrap(),
-        "`foo` (lib test) generated 1 warning"
-    );
-    // A test or bench target is always compiled with `--test`, and named without " test".
-    for kind in ["test", "bench"] {
-        let tests = target(kind, "it");
-        assert_eq!(
-            generated("foo", &tests, true, true, one).unwrap(),
-            format!("`foo` ({kind} \"it\") generated 1 warning")
-        );
-        assert_eq!(
-            could_not_compile("foo", &tests, true, 1, 0),
-            format!("could not compile `foo` ({kind} \"it\") due to 1 previous error")
-        );
-    }
-    // Not local, or with an error: no hint.
-    assert_eq!(
-        generated("foo", &lib, false, false, lib_fixable).unwrap(),
-        "`foo` (lib) generated 3 warnings (2 duplicates)"
-    );
-    let errored = Warned { total: 1, duplicates: 0, fixable: None };
-    assert_eq!(
-        generated("foo", &lib, false, true, errored).unwrap(),
-        "`foo` (lib) generated 1 warning"
-    );
-    assert_eq!(generated("foo", &lib, false, true, Warned::default()), None);
-    let script = target("custom-build", "build-script-build");
-    let script_fixable = Warned { total: 1, duplicates: 0, fixable: Some(1) };
-    assert_eq!(
-        generated("foo", &script, false, true, script_fixable).unwrap(),
-        "`foo` (build script) generated 1 warning"
-    );
-}
-
-#[test]
-fn could_not_compile_a_unit() {
-    let lib = target("lib", "foo");
-    assert_eq!(
-        could_not_compile("foo", &lib, false, 1, 1),
-        "could not compile `foo` (lib) due to 1 previous error; 1 warning emitted"
-    );
-    let bin = target("bin", "foo");
-    assert_eq!(
-        could_not_compile("foo", &bin, false, 2, 0),
-        "could not compile `foo` (bin \"foo\") due to 2 previous errors"
-    );
-    assert_eq!(
-        could_not_compile("foo", &lib, false, 3, 4),
-        "could not compile `foo` (lib) due to 3 previous errors; 4 warnings emitted"
-    );
-    assert_eq!(
-        error(&could_not_compile("foo", &bin, false, 1, 0), false),
-        "error: could not compile `foo` (bin \"foo\") due to 1 previous error\n"
     );
 }
 

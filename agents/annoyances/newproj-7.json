@@ -1,0 +1,11 @@
+{
+ "id": "newproj-7",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane newproj-1111",
+ "where": "the daemon with two projects",
+ "what": "A second project's first build let go of the first project's kept front end (`a task waits for 7.45 GiB the process holds besides its tasks`): the program's codegen, never measured, asks the whole budget and was counted short of everything held, though no amount let go starts it. The first project's next edit then took 13.2 s where an edit takes 1 s.",
+ "cost": "found only because the measuring script went back to the first project",
+ "cause": "`Plane::pick` set `short` for a task that asks the whole ceiling",
+ "workaround": "none",
+ "state": "fixed on newproj-1111 (37495ec94d); open: a program never measured still waits for every granted task to end (1.2 s of a new hello-world's first build under `admission`) and is granted 101.8 GB where it peaks at 1.2 GB"
+}

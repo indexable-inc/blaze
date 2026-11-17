@@ -153,6 +153,10 @@ impl<B: Shelved + fmt::Debug> fmt::Debug for Lent<B> {
 
 macro_rules! shelves {
     ($($(#[$doc:meta])* $with:ident, $lend:ident, $shelf:ident: $buffer:ty;)*) => {
+        #[expect(
+            blaze::process_static,
+            reason = "per-thread shelves of at most DEPTH emptied buffers each; a buffer's capacity is uncapped"
+        )]
         thread_local! {
             $(
                 static $shelf: RefCell<Shelf<$buffer>> = const {
@@ -207,6 +211,10 @@ shelves! {
     with_string, lend_string, STRINGS: String;
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "a per-thread shelf of at most DEPTH emptied paths; a path's capacity is uncapped"
+)]
 thread_local! {
     static PATHS: RefCell<Shelf<PathBuf>> =
         const { RefCell::new(Shelf::new()) };

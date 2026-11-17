@@ -1,5 +1,6 @@
 //! A pretty-printer for HIR.
 #![allow(dead_code)]
+#![expect(blaze::unwired, reason = "a debug printer whose callers use only some of its entry points")]
 
 use std::{
     fmt::{self, Write},

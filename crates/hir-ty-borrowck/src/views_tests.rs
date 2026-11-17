@@ -95,7 +95,7 @@ fn function(db: &Db, name: &str) -> FunctionId {
 /// The errors of `name` in `fixture`, in each mode, checked to be the same in both.
 fn errors(fixture: &str, name: &str) -> Vec<BorrowckDiagnostic> {
     let db = fixture::db(fixture).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let function = function(&db, name);
         let [nll, polonius] = [Mode::Nll, Mode::Polonius].map(|mode| {
             let result = borrowck_in_mode(&db, function.into(), mode);

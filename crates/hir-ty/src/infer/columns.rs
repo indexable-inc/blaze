@@ -180,6 +180,7 @@ impl<'f, K: DenseKey, V> DenseMap<'f, K, V> {
     }
 
     #[allow(dead_code, reason = "ArenaMap's API, which DenseMap replaces for inference")]
+    #[expect(blaze::unwired, reason = "kept so DenseMap has all of the ArenaMap API it replaces")]
     pub(crate) fn get_mut(&mut self, key: K) -> Option<&mut V> {
         self.slots.get_mut(key.to_index())?.as_mut()
     }
@@ -192,6 +193,7 @@ impl<'f, K: DenseKey, V> DenseMap<'f, K, V> {
 
     /// The keys with a value and their values, taken out in key order: `ArenaMap::into_iter`.
     #[allow(dead_code, reason = "ArenaMap's API, which DenseMap replaces for inference")]
+    #[expect(blaze::unwired, reason = "kept so DenseMap has all of the ArenaMap API it replaces")]
     pub(crate) fn drain(&mut self) -> impl Iterator<Item = (K, V)> {
         (self.slots.drain(..).enumerate())
             .filter_map(|(index, slot)| Some((K::from_index(index), slot?)))
@@ -1250,7 +1252,7 @@ impl<K: DenseKey + fmt::Debug> fmt::Debug for ModeColumn<K> {
 }
 
 /// A side table of the few keys that have a value, sorted by key.
-#[derive(Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct SortedMap<K, V> {
     entries: Box<[(K, V)]>,
 }
@@ -1613,10 +1615,10 @@ mod tests {
 
     #[test]
     fn field_column_takes_back_its_parts_and_refuses_others() {
-        use blaze_query::db::FromId;
-        let id = |index: u32| blaze_query::db::Id::from_u32(index + (2 << 20));
+        use blaze_memo::Id as _;
+        let id = |index: u32| blaze_memo::Gid::for_test(index + (2 << 20));
         let field = |local: u32| FieldId {
-            parent: hir_def::StructId::from_id(id(3)).into(),
+            parent: hir_def::StructId::from_gid(id(3)).into(),
             local_id: Idx::from_raw(RawIdx::from_u32(local)),
         };
         let tuple_field =

@@ -12,7 +12,7 @@ use std::{
     io::{self, Write as _},
     net::{SocketAddr, TcpListener, TcpStream},
     os::{
-        fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd},
+        fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd},
         unix::{
             ffi::OsStrExt as _,
             fs::PermissionsExt as _,
@@ -152,6 +152,12 @@ pub(crate) fn listen(root: &Path, at: &Address) -> io::Result<Listener> {
 /// bound through a short directory of this process's own under `/tmp`, made with mode 0700, whose
 /// one entry links to `path`'s directory: the socket is still made in that directory, so its
 /// rename into place stays atomic.
+#[expect(
+    blaze::tmp_path,
+    reason = "the real /tmp is the policy here: the short directory a too-long socket name is bound through must \
+              be under a short base, checked to be one nobody else can replace entries of, and lives only for the \
+              bind; TMPDIR is the long name this exists to avoid"
+)]
 fn bind(path: &Path) -> io::Result<UnixListener> {
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 
@@ -355,8 +361,11 @@ pub(crate) enum Socket {
 }
 
 impl Socket {
-    /// A connected socket the driver got as a bare descriptor (an accept of the ring's).
+    /// A connected socket the driver got as a bare descriptor (an accept of kqueue's: the
+    /// ring's accepts go into its table of slots, so only that driver makes one this way).
+    #[cfg(target_os = "macos")]
     pub(crate) fn from_fd(fd: OwnedFd, unix: bool) -> Socket {
+        use std::os::fd::IntoRawFd as _;
         let raw = fd.into_raw_fd();
         match unix {
             // SAFETY: `raw` came from `fd.into_raw_fd()`, a connected socket of the kind `unix`
@@ -410,6 +419,9 @@ impl Socket {
         }
     }
 
+    /// One write, as much as the socket takes: the kqueue driver's, which writes when the
+    /// socket is ready. The other drivers write all of it ([`Socket::write_all`]).
+    #[cfg(target_os = "macos")]
     pub(crate) fn write(&self, bytes: &[u8]) -> io::Result<usize> {
         match self {
             Socket::Unix(stream) => (&*stream).write(bytes),
@@ -541,6 +553,8 @@ pub(crate) fn set_cloexec(fd: RawFd) -> io::Result<()> {
     }
     Ok(())
 }
+
+pub(crate) mod udp;
 
 #[cfg(test)]
 mod tests;

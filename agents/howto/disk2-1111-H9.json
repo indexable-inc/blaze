@@ -1,0 +1,9 @@
+{
+ "id": "disk2-1111-H9",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk2-1111",
+ "task": "Say what blaze leaves on disk, and what a change did to it",
+ "do": "python3 harness/diskbytes.py run '{\"bin\": <dir with blaze and blaze-engine>, \"commit\": <what was built>, \"work\": <an empty directory with no symlink in its path>, \"out\": <a .json>, \"zstd\": <the zstd binary>}': a fresh home, a build, five body and five comment edits with a pause between, a stop, then every byte by directory and by kind (the store's records by kind and form), with duplicates and what zstd makes of each kind; `home` and `tree` tabulate a directory that is there. Run the base binary and the changed one with the same input and compare.",
+ "why": "`du` counts a clone's blocks once a file and says nothing of what a byte is; edits made back to back measure the work the daemon does after an answer, not an edit (mem2-9).",
+ "state": "current"
+}

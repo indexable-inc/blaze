@@ -1,0 +1,1 @@
+blaze: ok built=1 cached=31 warnings=0 elapsed_ms=703 tier="tier 0 · 0% optimized" cause="src/main.rs changed" recompiled=hello::add program=/root/home7/build/hello-616f0827fcf2e2487fd4387b6ec0dcfc/debug/hello

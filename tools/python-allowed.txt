@@ -16,7 +16,6 @@
 .github/scripts/train_issue.py
 .github/scripts/train_release.py
 crates/blaze-diagnostics/src/checks/features/attributes/table.py
-crates/blaze-diagnostics/src/lints/syntax/attrs/features/table.py
 crates/harness/harness-native-render/fonts/nerd-symbols/gen_constraints.py
 crates/harness/scripts/cef.py
 crates/harness/vendor/hyperion-ecs-sys/gen-bindings.py
@@ -115,6 +114,7 @@ harness/v2/frontend/borrowck_flow.py
 harness/v2/frontend/cases.py
 harness/v2/guards.py
 harness/v2/incraudit.py
+harness/v2/integrate.py
 harness/v2/lean_differential.py
 harness/v2/lean_gate.py
 harness/v2/loop_syscalls.py
@@ -125,6 +125,7 @@ harness/v2/oracle.py
 harness/v2/pins.py
 harness/v2/proof.py
 harness/v2/pure_scripts.py
+harness/v2/ran.py
 harness/v2/reachable.py
 harness/v2/realprojects.py
 harness/v2/report.py

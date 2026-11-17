@@ -191,8 +191,8 @@ fn a_unit_met_again_is_free() {
 /// `rerun_if_env_exists_in_config`.
 #[test]
 fn when_a_script_runs_again() {
-    let dir = std::env::temp_dir().join(format!("blaze-build-script-rerun-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let tmp = blaze_core::temp::TempDir::for_test("blaze-build-script-rerun-");
+    let dir = tmp.path();
     std::fs::create_dir_all(dir.join("watched/deep")).unwrap();
     std::fs::write(dir.join("foo"), "").unwrap();
     std::fs::write(dir.join("watched/deep/file"), "").unwrap();
@@ -224,7 +224,6 @@ fn when_a_script_runs_again() {
     let missing = Some(Some(Stale::Missing(dir.join("foo"))));
     assert_eq!(rerun.stale(&dir, ran, &foo, &foo), missing);
     assert_eq!(Rerun::Package.stale(&dir, ran, &foo, &foo), None);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A check of a kept run's files and variables that finds nothing changed allocates nothing
@@ -232,8 +231,8 @@ fn when_a_script_runs_again() {
 /// borrowed.
 #[test]
 fn a_fresh_run_is_checked_without_allocating() {
-    let dir = std::env::temp_dir().join(format!("blaze-build-script-fresh-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let tmp = blaze_core::temp::TempDir::for_test("blaze-build-script-fresh-");
+    let dir = tmp.path();
     std::fs::create_dir_all(dir.join("src")).unwrap();
     for file in ["build.rs", "src/a.rs", "src/b.rs"] {
         std::fs::write(dir.join(file), "").unwrap();
@@ -253,5 +252,4 @@ fn a_fresh_run_is_checked_without_allocating() {
         rerun.stale(&dir, ran, &vars, &vars)
     });
     assert_eq!(fresh, Some(None));
-    let _ = std::fs::remove_dir_all(&dir);
 }

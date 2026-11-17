@@ -17,6 +17,7 @@ use crate::{
         assoc::{ImplItems, TraitItems},
         crate_def_map, crate_local_def_map,
         demand::{self, Look},
+        frozen,
     },
 };
 
@@ -77,9 +78,16 @@ fn settle(mut by_name: FrameMap<'_>, mut duplicates: Duplicates<'_>) -> Diagnost
 /// blocks, macros, `use`s and `extern crate`s, and those declared in bodies). Lowers only the
 /// bodies that may declare one ([`demand::walk_bodies_saying`]): those whose text says
 /// `rustc_diagnostic_item` or names a macro that may write it.
-#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+///
+/// A crate served from its image reads the table its image holds
+/// ([`frozen::served_diagnostic_items`]): no module's scope, no page of its def map and no
+/// item's attributes. Only a crate that is not served is walked.
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 pub fn crate_diagnostic_items(db: &Db, krate: Crate) -> DiagnosticItems {
     let _p = tracing::info_span!("crate_diagnostic_items_query").entered();
+    if let Some(served) = frozen::served_diagnostic_items(db, krate) {
+        return served;
+    }
     blaze_mem::frame::current(|frame| {
         let mut collect = Collect {
             db,
@@ -103,7 +111,7 @@ pub fn crate_diagnostic_items(db: &Db, krate: Crate) -> DiagnosticItems {
 /// The diagnostic items `krate` sees, rustc's `all_diagnostic_items`: its own, then those of the
 /// crates in its extern prelude and, in turn, theirs, breadth first. A name given in two crates
 /// keeps the first; `duplicates` lists `krate`'s own and those across crates.
-#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 pub fn diagnostic_items(db: &Db, krate: Crate) -> DiagnosticItems {
     let _p = tracing::info_span!("diagnostic_items_query").entered();
     blaze_mem::frame::current(|frame| {

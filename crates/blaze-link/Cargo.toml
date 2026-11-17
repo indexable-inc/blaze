@@ -28,18 +28,17 @@ blaze-ids.workspace = true
 blaze-inproc.workspace = true
 blaze-items.workspace = true
 blaze-lazy = { workspace = true, features = ["daemon"] }
-blaze-live.workspace = true
 blaze-mem.workspace = true
 blaze-sha256.workspace = true
 gimli.workspace = true
-object.workspace = true
+# `write`: the start object of a glibc image is made in process (src/target/shipped.rs).
+object = { workspace = true, features = ["write"] }
 smallvec.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
-hegeltest.workspace = true
-object = { workspace = true, features = ["write"] }
+blaze-sim.workspace = true
 zerocopy.workspace = true
 
 [lints]

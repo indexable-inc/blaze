@@ -12,6 +12,9 @@ def slices.first.mir : Program :=
         locals := [Ty.int ScalarTy.U32, Ty.ref false (Ty.slice (Ty.int ScalarTy.U32)), Ty.int ScalarTy.Usize],
         blocks := [
           { stmts := [
+              Statement.storageLive 2,
               Statement.assign (Place.mk 2 []) (Rvalue.use (Operand.const (Const.int ScalarTy.Usize 0))),
-              Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.copy (Place.mk 1 [ProjElem.deref, ProjElem.index 2])))],
+              Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.copy (Place.mk 1 [ProjElem.deref, ProjElem.index 2]))),
+              Statement.storageDead 2,
+              Statement.storageDead 1],
             terminator := Terminator.ret }] }] }

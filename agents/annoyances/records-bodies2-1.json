@@ -1,0 +1,21 @@
+{
+ "id": "records-bodies2-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane records-bodies2",
+ "where": "hir-ty closure ids (crates/hir-ty/src/db.rs ClosureKey::new and loc, closure_exprs) and blaze-item-hash keys.rs relative_def",
+ "what": "A closure id is interned by its place among its body's closures, so making one from a record (InternedClosureId::new) and asking one where it is (loc) both read closure_exprs, which opens the body's expression store: a lowering. Every body with a closure is therefore lowered on a store hit, whatever the record keeps. keys.rs also opened the store just to read the closure's kind, and named a path's target by its place among the body's resolutions (names_of: lower and resolve). Found only by reading every call under the decoders; the design said decode needed only counts.",
+ "cost": "an hour of reading; unknown seconds a restart (not measured: closures per crate times a lowering)",
+ "whys": [
+  "a hit lowered the body: interning a closure asked closure_exprs",
+  "the interned key is (owner, nth) and the record held (owner, expression)",
+  "nth was chosen so an edit above a closure keeps its type, with the body at hand to count",
+  "nothing lists what a decode may call: a lowering three calls down looks like any query",
+  "no test runs a hit in a database where body_query is counted for bodies with closures"
+ ],
+ "cause": "an id whose constructor reads the value the record exists to avoid making",
+ "class": "a cache whose lookup or decode costs the miss",
+ "prevention": "the small facts of a lowered body become a stored step of their own (Step::Lower: counts, closure_exprs, lowering errors), which closure_exprs answers from; the count test of restore.md (0 body_query on N-1 hits) must include a body with a closure and an async block",
+ "workaround": "none",
+ "fix": "keys.rs: plain item keys for targets, closure kind in the relative key (written, uncompiled); Step::Lower not written",
+ "state": "open"
+}

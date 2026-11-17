@@ -15,7 +15,10 @@
 //! The one `unsafe` block is `intern::name_at`'s `from_utf8_unchecked` of names it appended as
 //! `&str`s.
 
-#![feature(allocator_api, allocator_ext, variant_count)]
+// `btreemap_alloc`: a B-tree set over a named allocator (`elf::dynamic::KeptRela::open`'s empty slots).
+#![feature(allocator_api, allocator_ext, btreemap_alloc, variant_count)]
+#![feature(register_tool)]
+#![register_tool(blaze)]
 #![deny(unsafe_code)]
 
 pub mod args;
@@ -29,6 +32,7 @@ mod dwarf;
 mod elf;
 mod file;
 mod intern;
+mod keep;
 mod layout;
 mod lazy;
 mod live;
@@ -47,6 +51,7 @@ mod sanitize;
 mod shape;
 mod stage;
 mod state;
+mod step;
 mod symbols;
 mod table;
 pub mod target;
@@ -74,20 +79,23 @@ use blaze_items::ItemKey;
 use blaze_mem::Frame;
 use std::alloc::Global;
 
+pub use keep::{KeepError, KeepRefusal, LAYOUT, Unkept, Verified, verify};
 pub use layout::Heat;
 pub use live::descriptor_of;
 pub use lazy::{LazyPlacer, Slots};
-pub use patch::Patch;
+pub use patch::{FileEdit, Patch, PatchBase};
 pub use beside::{DebugWrite, crc32 as debuglink_crc32, id_of as debug_file_id};
 pub use output::{
     Debug, DevRun, Format, LinkArgs, Live, Native, NativeKind, Output, OutputKind, Platform,
     Undefined,
 };
 pub use position::{
-    COLUMN, LINE, LOCATION_ALIGN, LOCATION_SIZE, Position, SpanTable, file_name, location,
+    COLUMN, LINE, LOCATION_ALIGN, LOCATION_SIZE, Position, Span, SpanTable, file_name, location,
+    position_in,
 };
 pub use premap::{NoOutside, Outside};
 pub use shape::RegionShape;
+pub use step::{StepError, Stepped, step};
 
 use commit::{Pending, Undo, Writes};
 use model::{Formats, NativeFile, Plan, Writer};
@@ -380,6 +388,10 @@ pub struct Image {
     /// The debug side file as last given ([`Image::debug_file`]), of an image whose debug
     /// info is beside it ([`Debug::Beside`]); empty for every other.
     beside: beside::Kept,
+    /// The planted bug of `a_column_left_out_of_keep_is_named`: [`Image::keep`] writes this
+    /// section of the state as an empty state's.
+    #[cfg(test)]
+    plant_keep_empty: Option<&'static str>,
 }
 
 impl Image {
@@ -497,6 +509,8 @@ impl Image {
             placed_pairs: Vec::new(),
             filed: patch::Filed::new(),
             beside: beside::Kept::new(),
+            #[cfg(test)]
+            plant_keep_empty: None,
         })
     }
 
@@ -621,8 +635,17 @@ impl Image {
         if let Some(given) = change.given {
             new.given = given;
         }
-        if new.wants_compaction() {
-            new.compact();
+        // O(image), so it has a span of its own that says which list it is run for: a stage
+        // that compacts every link is a link that costs the image and not the change.
+        // The loader's lists are compacted alone, a pass over the pieces: every list at once
+        // only where another is mostly garbage. Bounded: each pass leaves its lists with none.
+        while let Some((list, garbage, live)) = new.compaction_of() {
+            let _span =
+                tracing::info_span!(target: "blaze", "link compact", list, garbage, live).entered();
+            match list {
+                "rebase" | "binds" => new.compact_loader(),
+                _ => new.compact(),
+            }
         }
         self.arena.reset();
         let arena = &self.arena;
@@ -662,6 +685,9 @@ impl Image {
             island: None,
             text: None,
         };
+        // A stage's steps, each its own span (rule 16): what of a link's time is the change
+        // applied, the pieces placed, the fixups applied, and the lists, tables and file made.
+        let step = tracing::info_span!(target: "blaze", "link stage: apply the change").entered();
         stage.inputs(&change)?;
         stage.apply(&change)?;
         stage.sanitize(&change)?;
@@ -677,6 +703,8 @@ impl Image {
         stage.cells_of_removed();
         stage.asan_globals(&change)?;
         stage.dangling()?;
+        drop(step);
+        let step = tracing::info_span!(target: "blaze", "link stage: place").entered();
         // Each round places what the last made; GOT cells and PLT stubs need nothing past the
         // next, and thunks (`thunk`) only what islands' bytes moved out of reach, so a stage
         // that still makes pieces after `ROUNDS` would write them unplaced.
@@ -703,6 +731,8 @@ impl Image {
                 ),
             ));
         }
+        drop(step);
+        let step = tracing::info_span!(target: "blaze", "link stage: relocate").entered();
         stage.coverage_moved();
         if let Some(place) = self.place {
             stage.fix_tls(&place)?;
@@ -716,6 +746,7 @@ impl Image {
         stage.check_reach(&layout)?;
         stage.fill_descriptor()?;
         stage.relocate_all().map_err(|error| shape::explained(error, &layout, stage.plan.base))?;
+        drop(step);
         let base = self.state.generation;
         let image_base = stage.plan.base;
         let finished =
@@ -969,6 +1000,34 @@ impl Image {
         Ok((self.state.file_len, file::whole(&self.state)))
     }
 
+    /// The file as the last commit left it, to be read later: the state it is in, shared, so
+    /// nothing is copied until [`FileView::runs`] is asked, and a link that commits after
+    /// this leaves the view as it was. For whoever places the file from what a link wrote of
+    /// it ([`Patch::writes`]) and needs the whole only where the file before is not at hand.
+    /// The same error as [`Image::file`] before the first commit or while one is in flight.
+    pub fn file_view(&self) -> Result<FileView, LinkError> {
+        if !self.state.laid_out || self.pending.is_some() {
+            return Err(LinkError {
+                function: None,
+                refusal: None,
+                // alloc: error path
+                what: format!(
+                    "{}: no committed file to give: the image is not laid out, or a commit is in flight",
+                    self.to
+                ),
+            });
+        }
+        // clone: the state's reference counts, no allocation (`a_clone_allocates_nothing`)
+        Ok(FileView { state: self.state.clone() })
+    }
+
+    /// The image's debug side file as [`Image::debug_file`] last gave it, whole and shared:
+    /// what a writer of the file writes where the side file its patch is over is not at
+    /// the path. Empty before the first.
+    pub fn debug_file_view(&self) -> std::sync::Arc<Vec<u8>> {
+        self.beside.view()
+    }
+
     /// Each table the image keeps as `(name, elements, bytes)`, for `blaze inspect tables`
     /// (`blaze_api::Response::Tables`): `relocation` and the rest.
     pub fn tables(&self) -> Vec<(&'static str, u64, u64)> {
@@ -1008,6 +1067,14 @@ impl Image {
     /// How many jump-table slots the image has given out: every [`Image::slot`] index is below it.
     pub fn slots(&self) -> u32 {
         self.state.slots
+    }
+
+    /// How many slots the jump table has room for: the count its header and its live
+    /// descriptor hold, fixed at the image's first link (an incremental link that would pass
+    /// it is refused), which the program's runtime arms a byte of the execution log for each
+    /// of; [`Image::slots`] of them are given out.
+    pub fn capacity(&self) -> u32 {
+        self.state.capacity
     }
 
     pub fn slot(&self, function: &InstanceKey) -> Option<Slot> {
@@ -1177,6 +1244,19 @@ impl Image {
             .collect();
         out.sort_unstable_by_key(|it| (it.1, it.0));
         out
+    }
+}
+
+/// An image's file as one commit left it ([`Image::file_view`]).
+pub struct FileView {
+    state: state::State,
+}
+
+impl FileView {
+    /// The file's length and the runs of it that hold bytes, as [`Image::file_runs`] gives
+    /// them, made on the calling thread.
+    pub fn runs(&self) -> (u64, Vec<(u64, Vec<u8>)>) {
+        (self.state.file_len, file::whole_here(&self.state))
     }
 }
 

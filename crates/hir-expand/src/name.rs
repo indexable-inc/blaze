@@ -23,7 +23,8 @@ use syntax::{ast, format_smolstr, view};
 /// keeps maps and sets apart, and nothing written out may follow it between two keyed names of
 /// one text. Output orders by [`Name::cmp_written`] and, among those, by construction (a
 /// scope's order of binding, `ItemScope::entries`).
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// A name names no arena (its symbol is process-wide): its [`blaze_memo::Home`] is none.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 #[repr(transparent)]
 pub struct Name {
     symbol: Symbol,

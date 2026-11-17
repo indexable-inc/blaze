@@ -14,7 +14,7 @@ doctest = false
 
 [dependencies]
 blaze-ids.workspace = true
-blaze-query.workspace = true
+blaze-memo.workspace = true
 
 rustc_type_ir.workspace = true
 
@@ -28,8 +28,9 @@ intern.workspace = true
 syntax.workspace = true
 
 [dev-dependencies]
+blaze-core.workspace = true
+blaze-sim.workspace = true
 expect-test.workspace = true
-hegeltest.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 hir-ty-mir.workspace = true
 

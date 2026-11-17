@@ -1,0 +1,11 @@
+{
+ "id": "edit3-11",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+ "where": "the prewarm: what it reads",
+ "what": "The prewarm asks for every page the cache holds of the path's file, and a file written whole by a first link is held whole, so each later clone is asked for all of the image's data again (hello world: about 1100 pages, 18 MB, a path an edit) though a run touches 755. `mincore`'s referenced bit is set for read-ahead pages too on macOS, so the pages a run touched cannot be told from those only read ahead.",
+ "cost": "18 MB of read-ahead a path an edit, off the answer's path; capped at 256 MiB for a large image",
+ "cause": "the system says what is in memory, not what was used",
+ "workaround": "none",
+ "state": "open: remember the ranges the last runs faulted (the daemon's dev-run hook could say), or lower the cap once measured on a large image"
+}

@@ -2,6 +2,7 @@
 
 use base_db::{Crate, Db};
 use blaze_mem::Frame;
+use blaze_memo::Database as _;
 use hir_def::{
     AssocItemId, AssocItemLoc, DefWithBodyId, FunctionId, HasModule, ImplId, ItemContainerId,
     ModuleDefId, TraitId, TypeAliasId,
@@ -20,7 +21,7 @@ use crate::{
     ImplTraitId, InferBodyId, InferenceResult,
     db::{HirDatabase, InternedOpaqueTyId},
     lower::{ImplTraitIdx, SelfAndAssocBounds},
-    method_resolution::may_hold,
+    method_resolution::{item_range, may_hold},
     next_solver::{
         DbInterner, ErrorGuaranteed, SolverDefId, StoredEarlyBinder, StoredTy, Ty, TypingMode,
         infer::{DbInternerInferExt, traits::ObligationCause},
@@ -118,25 +119,25 @@ impl SelfAndAssocBounds {
 
 /// The associated types of an impl, in order: what a body in it reads of its items for the
 /// opaque types it may define. A function or constant added to the impl leaves this equal.
-#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
-fn impl_type_aliases(db: &Db, impl_id: ImplId) -> Box<[TypeAliasId]> {
-    blaze_mem::frame::current(|frame| type_aliases_of(frame, &impl_id.impl_items(db).items))
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
+pub fn impl_type_aliases<'db>(db: &'db Db, impl_id: ImplId) -> &'db [TypeAliasId] {
+    type_aliases_of(db, &impl_id.impl_items(db).items)
 }
 
 /// As [`impl_type_aliases`], of a trait.
-#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
-fn trait_type_aliases(db: &Db, trait_id: TraitId) -> Box<[TypeAliasId]> {
-    blaze_mem::frame::current(|frame| type_aliases_of(frame, &trait_id.trait_items(db).items))
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
+pub fn trait_type_aliases<'db>(db: &'db Db, trait_id: TraitId) -> &'db [TypeAliasId] {
+    type_aliases_of(db, &trait_id.trait_items(db).items)
 }
 
-fn type_aliases_of(frame: &Frame, items: &[(Name, AssocItemId)]) -> Box<[TypeAliasId]> {
-    let mut aliases = Vec::new_in(frame);
-    aliases.extend(items.iter().filter_map(|&(_, assoc_id)| match assoc_id {
-        AssocItemId::TypeAliasId(it) => Some(it),
-        AssocItemId::FunctionId(_) | AssocItemId::ConstId(_) => None,
-    }));
-    // alloc: the memo, one block at its size
-    aliases.iter().copied().collect()
+fn type_aliases_of<'db>(db: &'db Db, items: &[(Name, AssocItemId)]) -> &'db [TypeAliasId] {
+    blaze_memo::keep_iter(
+        db.memo(),
+        items.iter().filter_map(|&(_, assoc_id)| match assoc_id {
+            AssocItemId::TypeAliasId(it) => Some(it),
+            AssocItemId::FunctionId(_) | AssocItemId::ConstId(_) => None,
+        }),
+    )
 }
 
 // These are firewall queries to prevent drawing dependencies between infers:
@@ -145,7 +146,7 @@ fn type_aliases_of(frame: &Frame, items: &[(Name, AssocItemId)]) -> Box<[TypeAli
 /// it. A function with no body defines none: a trait method's `impl Trait` without a default
 /// body is rustc's synthesized associated type with no value, whose type each impl's method
 /// gives (`crate::rpitit::impl_rpitit_tys`), so nothing is inferred for it and its map is empty.
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
 pub fn rpit_hidden_types(
     db: &Db,
     function: FunctionId,
@@ -169,7 +170,7 @@ pub fn rpit_hidden_types(
     result
 }
 
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
 pub fn tait_hidden_types(
     db: &Db,
     type_alias: TypeAliasId,
@@ -278,19 +279,15 @@ fn for_each_defining_body(
 /// The functions of the type alias's crate whose `#[define_opaque(..)]` names it: what its
 /// hidden types read of [`define_opaque_functions`], so another type alias's defining
 /// function added or removed leaves them as they were.
-#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
-fn defining_functions(db: &Db, type_alias: TypeAliasId) -> Box<[FunctionId]> {
-    blaze_mem::frame::current(|frame| {
-        let mut found = Vec::new_in(frame);
-        found.extend(
-            define_opaque_functions(db, type_alias.loc(db).module(db).krate(db))
-                .iter()
-                .copied()
-                .filter(|&func| defined_type_aliases(db, func).any(|alias| alias == type_alias)),
-        );
-        // alloc: the memo, one block at its size
-        found.iter().copied().collect()
-    })
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
+fn defining_functions<'db>(db: &'db Db, type_alias: TypeAliasId) -> &'db [FunctionId] {
+    blaze_memo::keep_iter(
+        db.memo(),
+        define_opaque_functions(db, type_alias.loc(db).module(db).krate(db))
+            .iter()
+            .copied()
+            .filter(|&func| defined_type_aliases(db, func).any(|alias| alias == type_alias)),
+    )
 }
 
 /// The type aliases `func` names in its `#[define_opaque(..)]`.
@@ -310,14 +307,13 @@ fn defined_type_aliases(db: &Db, func: FunctionId) -> impl Iterator<Item = TypeA
 /// defines `SplitPathsRef` inside it. Of a crate that is not local, a body is lowered for its
 /// blocks when its text says `define_opaque` or may have it written by a macro or an attribute
 /// ([`may_hold`]), and always when a macro wrote the body itself.
-#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
-fn define_opaque_functions(db: &Db, krate: Crate) -> Box<[FunctionId]> {
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
+fn define_opaque_functions<'db>(db: &'db Db, krate: Crate) -> &'db [FunctionId] {
     let local = krate.data(db).origin.is_local();
     return blaze_mem::frame::current(|frame| {
         let mut result = Vec::new_in(frame);
         collect(db, krate, crate_def_map(db, krate), local, &mut result);
-        // alloc: the memo, one block at its size
-        result.iter().copied().collect()
+        blaze_memo::keep_slice(db.memo(), &result)
     });
 
     fn collect(
@@ -389,7 +385,7 @@ fn text_may_define_opaque<N: syntax::AstNode>(
     let says = || {
         let at = define_opaque_at(db, file);
         !at.is_empty() && {
-            let range = id.file_id.ast_id_map(db).get(id.value).text_range();
+            let range = item_range(db, krate, id);
             at.iter().any(|&at| range.contains(at))
         }
     };
@@ -397,13 +393,11 @@ fn text_may_define_opaque<N: syntax::AstNode>(
 }
 
 /// Where the text of `file` says `define_opaque`.
-#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
-fn define_opaque_at(db: &Db, file: base_db::EditionedFileId) -> Box<[TextSize]> {
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
+fn define_opaque_at<'db>(db: &'db Db, file: base_db::EditionedFileId) -> &'db [TextSize] {
     let text = db.file_text(file.file_id(db)).text(db);
-    blaze_mem::frame::current(|frame| {
-        let mut found = Vec::new_in(frame);
-        found.extend(text.match_indices("define_opaque").map(|(at, _)| TextSize::from(at as u32)));
-        // alloc: the memo, one block at its size
-        found.iter().copied().collect()
-    })
+    blaze_memo::keep_iter(
+        db.memo(),
+        text.match_indices("define_opaque").map(|(at, _)| TextSize::from(at as u32)),
+    )
 }

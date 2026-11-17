@@ -39,7 +39,6 @@ pub mod unstable_features;
 pub mod expr_store;
 mod heap;
 pub mod hir;
-pub mod item_hash;
 pub mod resolver;
 pub mod span_names;
 pub mod upvars;
@@ -52,6 +51,7 @@ pub mod src;
 
 pub mod find_path;
 pub mod import_map;
+pub mod kinds;
 pub mod test_items;
 pub mod visibility;
 
@@ -70,7 +70,7 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use base_db::{Crate, Db, impl_intern_key};
+use base_db::{Crate, Db};
 use hir_expand::{
     AstId, EditionedFileId, ExpandResult, ExpandTo, HirFileId, InFile, MacroCallId, MacroCallKind,
     MacroCallStyles, MacroDefId, MacroDefKind,
@@ -144,6 +144,14 @@ impl<N: AstIdNode> Hash for ItemLoc<N> {
     }
 }
 
+/// Homed by its module: the `AstId`'s file is of the same crate, so it decides nothing.
+impl<N: AstIdNode> blaze_memo::Home for ItemLoc<N> {
+    #[inline]
+    fn home(&self, homes: &mut blaze_memo::Homes<'_>) {
+        self.container.home(homes);
+    }
+}
+
 /// Hashes the id of `id`'s file alone and returns the rest of `id` as the low 40 bits of a word
 /// (the file-local id, then the file's variant), for a loc to fill the high bits with its own
 /// small fields and hash the word once.
@@ -162,12 +170,12 @@ fn hash_ast_id<N, H: Hasher>(id: AstId<N>, state: &mut H) -> u64 {
     u64::from(id.value.erase().into_raw()) | file << 32
 }
 
-// An `AstId` is 12 bytes: the file 8 (a tag word and an id), the file-local id 4.
-const _: () = assert!(size_of::<AstId<ast::Struct>>() == 12);
+// An `AstId` is 16 bytes: the file 12 (a tag word and an 8-byte `Gid`), the file-local id 4.
+const _: () = assert!(size_of::<AstId<ast::Struct>>() == 16);
 
-// 16 bytes per item (module 4, `AstId` 12), no padding; hashed in 3 writes (module, file,
+// 24 bytes per item (module 8, `AstId` 16), no padding; hashed in 3 writes (module, file,
 // file-local id with the file's variant).
-const _: () = assert!(size_of::<ItemLoc<ast::Struct>>() == 16);
+const _: () = assert!(size_of::<ItemLoc<ast::Struct>>() == 24);
 const _: () = assert!(align_of::<ItemLoc<ast::Struct>>() == 4);
 
 impl<N: AstIdNode> HasModule for ItemLoc<N> {
@@ -179,7 +187,6 @@ impl<N: AstIdNode> HasModule for ItemLoc<N> {
 
 #[derive(Debug)]
 pub struct AssocItemLoc<N: AstIdNode> {
-    // FIXME: Store this as an erased `blaze_query::db::Id` to save space
     pub container: ItemContainerId,
     pub id: AstId<N>,
 }
@@ -209,9 +216,17 @@ impl<N: AstIdNode> Hash for AssocItemLoc<N> {
     }
 }
 
-// 20 bytes per item (container 8: a tag word and an id, `AstId` 12); hashed in 3 writes
-// (container, file, file-local id with both variants).
-const _: () = assert!(size_of::<AssocItemLoc<ast::Fn>>() == 20);
+/// Homed by its container, as [`ItemLoc`].
+impl<N: AstIdNode> blaze_memo::Home for AssocItemLoc<N> {
+    #[inline]
+    fn home(&self, homes: &mut blaze_memo::Homes<'_>) {
+        self.container.home(homes);
+    }
+}
+
+// 28 bytes per item (container 12: a tag word and an 8-byte id, `AstId` 16); hashed in 3
+// writes (container, file, file-local id with both variants).
+const _: () = assert!(size_of::<AssocItemLoc<ast::Fn>>() == 28);
 const _: () = assert!(align_of::<AssocItemLoc<ast::Fn>>() == 4);
 
 impl<N: AstIdNode> HasModule for AssocItemLoc<N> {
@@ -252,6 +267,26 @@ impl<N: AstIdNode> AstIdLoc for AssocItemLoc<N> {
     fn container(&self) -> Self::Container {
         self.container
     }
+}
+
+/// An interned id `$id` of the location `$loc`, homed where `$loc`'s ids are (`$loc` is
+/// `blaze_memo::Home`). Its order is the one `#[blaze_memo::interned]` derives (of the id,
+/// never of what a user sees).
+macro_rules! impl_intern_key {
+    ($id:ident, $loc:ident) => {
+        #[blaze_memo::interned(unsafe(no_lifetime))]
+        pub struct $id {
+            #[returns(ref)]
+            pub loc: $loc,
+        }
+
+        // The id alone: a `Debug` of the location prints it recursively, and blows the stack.
+        impl ::std::fmt::Debug for $id {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                f.debug_tuple(stringify!($id)).field(&self.0).finish()
+            }
+        }
+    };
 }
 
 macro_rules! impl_intern {
@@ -366,10 +401,12 @@ impl ImplId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, blaze_memo::Home)]
 pub struct BuiltinDeriveImplLoc {
     pub adt: AdtId,
+    #[home(skip)]
     pub trait_: BuiltinDeriveImplTrait,
+    #[home(skip)]
     pub derive_attr_id: AttrId,
     pub derive_index: u32,
 }
@@ -385,11 +422,10 @@ impl Hash for BuiltinDeriveImplLoc {
     }
 }
 
-// 20 bytes per impl (adt 8, attr id 4, index 4, trait 1, 3 of padding); hashed in 3 writes.
-const _: () = assert!(size_of::<BuiltinDeriveImplLoc>() == 20);
+// 24 bytes per impl (adt 12, attr id 4, index 4, trait 1, 3 of padding); hashed in 3 writes.
+const _: () = assert!(size_of::<BuiltinDeriveImplLoc>() == 24);
 
-#[blaze_query::interned(debug, unsafe(no_lifetime))]
-#[derive(PartialOrd, Ord)]
+#[blaze_memo::interned(debug, unsafe(no_lifetime))]
 pub struct BuiltinDeriveImplId {
     #[returns(ref)]
     pub loc: BuiltinDeriveImplLoc,
@@ -410,10 +446,13 @@ impl ExternBlockId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, blaze_memo::Home)]
 pub struct EnumVariantLoc {
+    /// Of the enum's crate: homed by `parent`.
+    #[home(skip)]
     pub id: AstId<ast::Variant>,
     pub parent: EnumId,
+    #[home(skip)]
     pub name: Name,
 }
 impl_intern!(EnumVariantId, EnumVariantLoc);
@@ -429,9 +468,9 @@ impl Hash for EnumVariantLoc {
     }
 }
 
-// 20 bytes per variant (`AstId` 12, enum 4, name 4), no padding; hashed in 4 writes (file,
+// 28 bytes per variant (`AstId` 16, enum 8, name 4), no padding; hashed in 4 writes (file,
 // file-local id, enum, name).
-const _: () = assert!(size_of::<EnumVariantLoc>() == 20);
+const _: () = assert!(size_of::<EnumVariantLoc>() == 28);
 
 impl EnumVariantLoc {
     pub fn index(&self, db: &Db) -> usize {
@@ -459,12 +498,15 @@ impl EnumVariantId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, blaze_memo::Home)]
 pub struct Macro2Loc {
     pub container: ModuleId,
+    #[home(skip)]
     pub id: AstId<ast::MacroDef>,
+    #[home(skip)]
     pub expander: MacroExpander,
     pub allow_internal_unsafe: bool,
+    #[home(skip)]
     pub edition: Edition,
 }
 impl_intern!(Macro2Id, Macro2Loc);
@@ -482,16 +524,20 @@ impl Hash for Macro2Loc {
     }
 }
 
-// 20 bytes per macro (module 4, `AstId` 12, expander 2, flag 1, edition 1), no padding; hashed
+// 28 bytes per macro (module 8, `AstId` 16, expander 2, flag 1, edition 1), no padding; hashed
 // in 3 writes.
-const _: () = assert!(size_of::<Macro2Loc>() == 20);
+const _: () = assert!(size_of::<Macro2Loc>() == 28);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, blaze_memo::Home)]
 pub struct MacroRulesLoc {
     pub container: ModuleId,
+    #[home(skip)]
     pub id: AstId<ast::MacroRules>,
+    #[home(skip)]
     pub expander: MacroExpander,
+    #[home(skip)]
     pub flags: MacroRulesLocFlags,
+    #[home(skip)]
     pub edition: Edition,
 }
 impl_intern!(MacroRulesId, MacroRulesLoc);
@@ -509,9 +555,9 @@ impl Hash for MacroRulesLoc {
     }
 }
 
-// 20 bytes per macro (module 4, `AstId` 12, expander 2, flags 1, edition 1), no padding; hashed
+// 28 bytes per macro (module 8, `AstId` 16, expander 2, flags 1, edition 1), no padding; hashed
 // in 3 writes.
-const _: () = assert!(size_of::<MacroRulesLoc>() == 20);
+const _: () = assert!(size_of::<MacroRulesLoc>() == 28);
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -551,12 +597,16 @@ impl MacroExpander {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, blaze_memo::Home)]
 pub struct ProcMacroLoc {
     pub container: ModuleId,
+    #[home(skip)]
     pub id: AstId<ast::Fn>,
+    #[home(skip)]
     pub expander: CustomProcMacroExpander,
+    #[home(skip)]
     pub kind: ProcMacroKind,
+    #[home(skip)]
     pub edition: Edition,
 }
 impl_intern!(ProcMacroId, ProcMacroLoc);
@@ -572,11 +622,11 @@ impl Hash for ProcMacroLoc {
     }
 }
 
-// 24 bytes per proc macro (module 4, `AstId` 12, expander 4, kind 1, edition 1, 2 of padding);
+// 32 bytes per proc macro (module 8, `AstId` 16, expander 4, kind 1, edition 1, 2 of padding);
 // hashed in 4 writes (module, file, expander, the rest in one word).
-const _: () = assert!(size_of::<ProcMacroLoc>() == 24);
+const _: () = assert!(size_of::<ProcMacroLoc>() == 32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub enum LoweringMode {
     Analysis,
     Ide,
@@ -603,8 +653,9 @@ mod tracked_struct_token {
     }
 }
 
-#[blaze_query::tracked(constructor = new_)]
-#[derive(PartialOrd, Ord)]
+/// Interned (spec rule 4): homed by its fields, so in its crate's arena (its module's), never
+/// the session's.
+#[blaze_memo::interned(constructor = new_)]
 pub struct BlockIdLt<'db> {
     #[returns(copy)]
     pub ast_id: AstId<ast::BlockExpr>,
@@ -643,11 +694,11 @@ impl<'db> BlockIdLt<'db> {
     ///
     /// # Contract
     ///
-    /// The id is only meaningful in the revision it was read in. Read after a revision that
-    /// deleted it, it gives the fields the `BlockId` last had (the query database frees no id);
-    /// it is never UB (`blaze_query::db::FromId` is safe for every lifetime).
+    /// The id is only meaningful in the snapshot it was read in, or one that kept its arena. A
+    /// read through it after its arena was dropped panics naming the dead id; it is never UB
+    /// (`blaze_memo::Id::from_gid` is safe for every lifetime).
     pub fn to_static(self) -> BlockId {
-        blaze_query::db::FromId::from_id(blaze_query::db::AsId::as_id(&self))
+        blaze_memo::Id::from_gid(blaze_memo::Id::gid(self))
     }
 }
 impl BlockId {
@@ -655,15 +706,15 @@ impl BlockId {
     ///
     /// # Contract
     ///
-    /// The id must come from `_db`, and is only meaningful in the revision it was read in;
-    /// otherwise its fields are unspecified, never UB, as for [`BlockIdLt::to_static`].
+    /// The id must come from `_db`'s snapshot (or one that kept its arena); otherwise a read
+    /// through it panics, never UB, as for [`BlockIdLt::to_static`].
     pub fn to_db<'db>(self, _db: &'db Db) -> BlockIdLt<'db> {
-        blaze_query::db::FromId::from_id(blaze_query::db::AsId::as_id(&self))
+        blaze_memo::Id::from_gid(blaze_memo::Id::gid(self))
     }
 }
 
-#[blaze_query::tracked(debug)]
-#[derive(PartialOrd, Ord)]
+/// Interned (spec rule 4): homed by its fields, so in its crate's arena, never the session's.
+#[blaze_memo::interned(debug)]
 pub struct ModuleIdLt<'db> {
     /// The crate this module belongs to.
     #[returns(copy)]
@@ -688,23 +739,23 @@ impl<'db> ModuleIdLt<'db> {
     ///
     /// # Contract
     ///
-    /// The id is only meaningful in the revision it was read in. Read after a revision that
-    /// deleted it, it gives the fields the `ModuleId` last had (the query database frees no id);
-    /// it is never UB (`blaze_query::db::FromId` is safe for every lifetime).
+    /// The id is only meaningful in the snapshot it was read in, or one that kept its arena. A
+    /// read through it after its arena was dropped panics naming the dead id; it is never UB
+    /// (`blaze_memo::Id::from_gid` is safe for every lifetime).
     pub fn to_static(self) -> ModuleId {
-        blaze_query::db::FromId::from_id(blaze_query::db::AsId::as_id(&self))
+        blaze_memo::Id::from_gid(blaze_memo::Id::gid(self))
     }
 
     pub fn def_map(self, db: &'db Db) -> &'db DefMap {
         match self.block(db) {
-            Some(block) => block_def_map(db, block),
+            Some(block) => block_def_map(db, block.to_static()),
             None => crate_def_map(db, self.krate(db)),
         }
     }
 
     pub(crate) fn local_def_map(self, db: &'db Db) -> (&'db DefMap, &'db LocalDefMap) {
         match self.block(db) {
-            Some(block) => (block_def_map(db, block), self.only_local_def_map(db)),
+            Some(block) => (block_def_map(db, block.to_static()), self.only_local_def_map(db)),
             None => {
                 let def_map = crate_local_def_map(db, self.krate(db));
                 (def_map.def_map(db), def_map.local(db))
@@ -742,10 +793,10 @@ impl ModuleId {
     ///
     /// # Contract
     ///
-    /// The id must come from `_db`, and is only meaningful in the revision it was read in;
-    /// otherwise its fields are unspecified, never UB, as for [`ModuleIdLt::to_static`].
+    /// The id must come from `_db`'s snapshot (or one that kept its arena); otherwise a read
+    /// through it panics, never UB, as for [`ModuleIdLt::to_static`].
     pub fn to_db<'db>(self, _db: &'db Db) -> ModuleIdLt<'db> {
-        blaze_query::db::FromId::from_id(blaze_query::db::AsId::as_id(&self))
+        blaze_memo::Id::from_gid(blaze_memo::Id::gid(self))
     }
 
     /// The prelude a name not in scope in this module is looked up in, and the
@@ -781,31 +832,31 @@ impl HasModule for ModuleId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub struct FieldId {
-    // FIXME: Store this as an erased `blaze_query::db::Id` to save space
     pub parent: VariantId,
+    #[home(skip)]
     pub local_id: LocalFieldId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub struct TupleId(pub u32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub struct TupleFieldId {
     pub tuple: TupleId,
     pub index: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, blaze_memo::Home)]
 pub struct TypeOrConstParamId {
-    // FIXME: Store this as an erased `blaze_query::db::Id` to save space
     pub parent: GenericDefId,
+    #[home(skip)]
     pub local_id: LocalTypeOrConstParamId,
 }
 
 /// A TypeOrConstParamId with an invariant that it actually belongs to a type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub struct TypeParamId(TypeOrConstParamId);
 
 impl TypeParamId {
@@ -841,7 +892,7 @@ impl From<TypeParamId> for TypeOrConstParamId {
 }
 
 /// A TypeOrConstParamId with an invariant that it actually belongs to a const
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub struct ConstParamId(TypeOrConstParamId);
 
 impl ConstParamId {
@@ -866,20 +917,20 @@ impl From<ConstParamId> for TypeOrConstParamId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub struct LifetimeParamId {
-    // FIXME: Store this as an erased `blaze_query::db::Id` to save space
     pub parent: GenericDefId,
+    #[home(skip)]
     pub local_id: LocalLifetimeParamId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub struct HrtbLifetimeParamId {
     pub scope: GenericDefId,
     pub local_id: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Supertype)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub enum ItemContainerId {
     ExternBlockId(ExternBlockId),
     ModuleId(ModuleId),
@@ -915,7 +966,7 @@ impl ItemContainerId {
 }
 
 /// A Data Type
-#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Supertype)]
+#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub enum AdtId {
     StructId(StructId),
     UnionId(UnionId),
@@ -956,7 +1007,7 @@ impl AdtId {
 }
 
 /// A macro
-#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Supertype)]
+#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub enum MacroId {
     Macro2Id(Macro2Id),
     MacroRulesId(MacroRulesId),
@@ -971,6 +1022,18 @@ impl MacroId {
 
     /// The name the macro is declared by: a derive's by the trait it derives.
     pub fn name(self, db: &Db) -> hir_expand::name::Name {
+        // Kept as an entry of the macro's item, keyed by its header (`deps::facts`).
+        let (kind, at) = match self {
+            MacroId::Macro2Id(it) => (11, deps::facts::at(db, it)),
+            MacroId::MacroRulesId(it) => (10, deps::facts::at(db, it)),
+            MacroId::ProcMacroId(it) => (12, deps::facts::at(db, it)),
+        };
+        let header = deps::facts::Part::Header;
+        deps::facts::fact(db, "macro name", "", kind, Some(at), header, || (self.name_made(db), true))
+    }
+
+    /// [`MacroId::name`] off the macro's syntax.
+    fn name_made(self, db: &Db) -> hir_expand::name::Name {
         use hir_expand::name::{AsName as _, Name};
         use src::HasSource as _;
         use syntax::view::HasName as _;
@@ -1000,6 +1063,16 @@ impl ExternCrateId {
     /// The name the crate is reached by from where the item is written: its alias, its own name
     /// with none, and no name for `extern crate krate as _`.
     pub fn alias_or_name(self, db: &Db) -> Option<hir_expand::name::Name> {
+        // Kept as an entry of the item, keyed by its header (`deps::facts`).
+        let at = deps::facts::at(db, self);
+        let header = deps::facts::Part::Header;
+        deps::facts::fact(db, "extern crate name", "", 15, Some(at), header, || {
+            (self.alias_or_name_made(db), true)
+        })
+    }
+
+    /// [`ExternCrateId::alias_or_name`] off the item's syntax.
+    fn alias_or_name_made(self, db: &Db) -> Option<hir_expand::name::Name> {
         use hir_expand::name::{AsName as _, Name};
         use src::HasSource as _;
         use syntax::view::HasName as _;
@@ -1015,10 +1088,10 @@ impl ExternCrateId {
     }
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 impl MacroId {
     /// Turns a MacroId into a MacroDefId, describing the macro's definition post name resolution.
-    #[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
+    #[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
     pub fn definition(self, db: &Db) -> MacroDefId {
         let kind = |expander, file_id, m| {
             let in_file = InFile::new(file_id, m);
@@ -1076,7 +1149,7 @@ impl MacroId {
 }
 
 /// A generic param
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub enum GenericParamId {
     TypeParamId(TypeParamId),
     ConstParamId(ConstParamId),
@@ -1085,7 +1158,7 @@ pub enum GenericParamId {
 impl_from!(TypeParamId, LifetimeParamId, ConstParamId for GenericParamId);
 
 /// The defs which can be visible in the module.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub enum ModuleDefId {
     ModuleId(ModuleId),
     FunctionId(FunctionId),
@@ -1096,7 +1169,8 @@ pub enum ModuleDefId {
     StaticId(StaticId),
     TraitId(TraitId),
     TypeAliasId(TypeAliasId),
-    BuiltinType(BuiltinType),
+    /// Names no arena.
+    BuiltinType(#[home(skip)] BuiltinType),
     MacroId(MacroId),
 }
 impl_from!(
@@ -1126,7 +1200,7 @@ impl From<DefWithBodyId> for ModuleDefId {
 }
 
 /// The defs which have a body.
-#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Supertype)]
+#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub enum DefWithBodyId {
     /// A function body.
     FunctionId(FunctionId),
@@ -1170,7 +1244,7 @@ impl DefWithBodyId {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, blaze_query::Supertype)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub enum AssocItemId {
     FunctionId(FunctionId),
     ConstId(ConstId),
@@ -1192,7 +1266,7 @@ impl_from!(
     for ModuleDefId
 );
 
-#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Supertype)]
+#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub enum GenericDefId {
     AdtId(AdtId),
     // consts can have type parameters from their parents (i.e. associated consts of traits)
@@ -1220,10 +1294,8 @@ impl_from!(
 /// Owner of an expression store - either a body or a signature.
 /// This is used for queries that operate on expression stores generically,
 /// such as `expr_scopes`.
-// NOTE: This type cannot be `blaze_query::Supertype` as its variants are overlapping.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord /* !blaze_query::Supertype */,
-)]
+/// A query keyed by it is homed by the item whose store it is (`blaze_memo::Home`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, blaze_memo::Home)]
 pub enum ExpressionStoreOwnerId {
     Signature(GenericDefId),
     /// A body, something with a root expression.
@@ -1233,18 +1305,6 @@ pub enum ExpressionStoreOwnerId {
     VariantFields(VariantId),
 }
 
-/// The item whose store it is, for a query keyed by it (`blaze_query::db::Storage::ids_of`, read by
-/// `crates/hir-firewall`).
-impl blaze_query::db::NamesIds for ExpressionStoreOwnerId {
-    fn names_ids(&self, out: &mut Vec<blaze_query::db::Id>) {
-        use blaze_query::db::AsId;
-        out.push(match *self {
-            ExpressionStoreOwnerId::Signature(it) => it.as_id(),
-            ExpressionStoreOwnerId::Body(it) => it.as_id(),
-            ExpressionStoreOwnerId::VariantFields(it) => it.as_id(),
-        });
-    }
-}
 
 impl ExpressionStoreOwnerId {
     // FIXME: Check callers of this, this method likely can be removed
@@ -1351,7 +1411,7 @@ impl_from!(
     for GenericDefId
 );
 
-#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Supertype)]
+#[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub enum CallableDefId {
     FunctionId(FunctionId),
     StructId(StructId),
@@ -1378,7 +1438,7 @@ impl CallableDefId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_query::Supertype)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub enum AttrDefId {
     ModuleId(ModuleId),
     AdtId(AdtId),
@@ -1426,8 +1486,7 @@ impl_from!(
     PartialOrd,
     Ord,
     Hash,
-    blaze_query::Supertype,
-    blaze_query::Value,
+    blaze_memo::Home,
 )]
 pub enum VariantId {
     EnumVariantId(EnumVariantId),
@@ -1743,10 +1802,13 @@ pub fn macro_call_as_call_id(
     let def = resolver(path, call_site).ok_or(UnresolvedMacro { path: *path })?;
 
     let res = match def.kind {
+        // What the call expands to is the caller's, which read it off the call's node; never
+        // the node again by `ast_id`, which reads the whole file's tree (a call in a body would
+        // list its file's text).
         MacroDefKind::BuiltInEager(..) => expand_eager_macro_input_view(
             db,
             krate,
-            ast_id.to_view(db),
+            Ok(expand_to),
             ast_id,
             def,
             call_site,
@@ -1843,8 +1905,11 @@ impl Complete {
 }
 
 // return: macro call id and include file id
-#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
-pub fn include_macro_invoc(db: &Db, krate: Crate) -> Box<[(MacroCallId, EditionedFileId)]> {
+#[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
+pub fn include_macro_invoc<'db>(
+    db: &'db Db,
+    krate: Crate,
+) -> &'db [(MacroCallId, EditionedFileId)] {
     blaze_mem::frame::current(|frame| {
         let mut found = Vec::new_in(frame);
         found.extend(
@@ -1855,8 +1920,7 @@ pub fn include_macro_invoc(db: &Db, krate: Crate) -> Box<[(MacroCallId, Editione
                     invoc.loc(db).include_file_id(db, invoc).map(|x| (invoc, x))
                 }),
         );
-        // alloc: the memo's calls, exact, once per crate
-        Box::from(&found[..])
+        blaze_memo::keep_slice(blaze_memo::Database::memo(db), &found)
     })
 }
 
@@ -1868,7 +1932,6 @@ mod loc_hash_tests {
     };
 
     use blaze_hash::{FixedState, HashSet};
-    use blaze_query::db::FromId;
     use hir_expand::{
         EditionedFileId, HirFileId, InFile, MacroCallId, MacroCallStyles,
         attrs::AttrId,
@@ -1890,8 +1953,8 @@ mod loc_hash_tests {
     }
 
     /// An id of an interned struct whose data no test reads.
-    fn query_id<T: FromId>(index: u32) -> T {
-        T::from_id(blaze_query::db::Id::from_u32(index))
+    fn query_id<T: blaze_memo::Id>(index: u32) -> T {
+        T::from_gid(blaze_memo::Gid::for_test(index))
     }
 
     fn ast_ids<N: AstIdNode>() -> [AstId<N>; 4] {

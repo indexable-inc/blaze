@@ -1,0 +1,49 @@
+// Lesson: formal verification. lean/Blaze/Mir is an executable Lean 4 semantics of a subset of MIR; passes are proved
+// against it (removeStorageMarkers, simplifyConstCondition, removeNops, constFold, permuteBlocks, removeDeadBlocks,
+// threadGotos, mergeGotos, switchToGoto, simplifyCfg_call; whole-graph dead-store elimination), with proved checkers
+// for translation validation (validate_sound). lean/theorems.json lists them; the axioms are propext, Classical.choice
+// and Quot.sound. Behind the `blaze_verify` gate; `blaze check --verify` is not built (formal-verification.md).
+site {
+  learn {
+    proofs : Page {
+      Narrow
+      Lesson: {9, "A compiler whose passes come with proofs, checked by Lean.", "proof"}
+      (InTheme, themes.beyond)
+      (Requires, site.learn.incremental)
+      Title: {"Proved correct"}
+      Description: {"How blaze is becoming a formally verified compiler: an executable Lean semantics of MIR, and passes proved against it."}
+
+      Step trust("Who checks the compiler?") {
+        P bugs("A compiler bug: your code is right, the program is wrong. Tests catch the cases someone thought of.")
+        P goal("blaze aims for a **formally verified** compiler: each step proved, by a machine, to keep your program's meaning.")
+      }
+
+      Step mir("One definition of meaning") {
+        P mir("blaze writes down what **MIR** (Rust's mid-level form) means once, as a program in [Lean](https://lean-lang.org). You can run it.")
+      }
+
+      Step passes("Passes, proved") {
+        Art art(piece: "proof", label: "A function's blocks before a pass, and after it with the dead block gone. An equals sign joins them and a check lights up.")
+        P pass("Folding constants, removing dead code, merging jumps: each pass is proved in Lean to keep the meaning, for **every** program.")
+      }
+
+      Step validate("Or check each run") {
+        P tv("Where a proof is too hard, a **proved checker** compares the code before and after each run of the pass.")
+      }
+
+      Step validate_q("Check: which is which?") {
+        Quiz q(prompt: "A pass is checked by translation validation. What does Lean prove?") {
+          Choice every("That the pass is right for every possible program.", "That is what a proved pass gets. With translation validation, each run is checked instead.")
+          Choice checker("That the checker is right: when it accepts, before and after mean the same.", "Right. The checker is proved once, and then every run of the pass is checked by it.") {
+            Right
+          }
+          Choice tests("That the pass passes rustc's tests.", "Tests are useful, but a proof covers what no one wrote a test for.")
+        }
+      }
+
+      Step trusted("What is still trusted") {
+        P axioms("Only Lean's three standard axioms, and a public list of what isn't proved yet: unsafe code, atomics, the code after MIR. More: [formal-verification.md](https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/design/formal-verification.md).")
+      }
+    }
+  }
+}

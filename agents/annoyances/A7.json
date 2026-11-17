@@ -1,0 +1,11 @@
+{
+ "id": "A7",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "blaze: profile",
+ "what": "`blaze debug sql` needs `BLAZE_DUCKDB` set by hand on the Mac (found one in /nix/store by listing it), and later failed with `the flush asked for was not written in 30s`.",
+ "cost": "20 minutes",
+ "cause": "blaze never looks for DuckDB on PATH; the history thread was stuck",
+ "workaround": "export the nix-store path",
+ "state": "the flush failure is in a lane's task (run-cost-1111)"
+}

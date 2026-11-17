@@ -124,6 +124,10 @@ fn data(function: &Function, refs: &Refs, index: usize) -> Option<ContentId> {
     })
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "a per-thread scratch cleared on each use, uncapped: it keeps the most requests one function held"
+)]
 thread_local! {
     /// [`data_of`]'s `known`, one per thread and reused.
     static KNOWN: RefCell<Vec<Option<ContentId>>> = RefCell::default();
@@ -148,8 +152,16 @@ fn data_of(
         DataPlace::Position(span) => {
             hasher.update(&[0]).id(&span.anchor).update(&span.index.to_le_bytes());
         }
-        DataPlace::Text(text) => {
-            hasher.update(&[1]).part(text.as_bytes());
+        DataPlace::Text(slots) => {
+            hasher.update(&[1]).update(&(slots.len() as u64).to_le_bytes());
+            for slot in slots {
+                match slot {
+                    super::TextSlot::Bytes(text) => hasher.update(&[0]).part(text.as_bytes()),
+                    super::TextSlot::File(span) => {
+                        hasher.update(&[1]).id(&span.anchor).update(&span.index.to_le_bytes())
+                    }
+                };
+            }
         }
         // Every one is the same `Location`, of no file (`convert`'s `nowhere`).
         DataPlace::Nowhere => {

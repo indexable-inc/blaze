@@ -1,0 +1,9 @@
+{
+ "id": "H4",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "task": "Say why something was slow, reran or used memory",
+ "do": "Query the daemon's profile first (`blaze slow`, `blaze explain <view>`, `blaze debug sql`) and quote the span or count rows; say `not measured` otherwise.",
+ "why": "Rule claims-from-evidence; a cause stated without rows (LLVM, 2026-11-11) was wrong by a factor of six.",
+ "state": "current"
+}

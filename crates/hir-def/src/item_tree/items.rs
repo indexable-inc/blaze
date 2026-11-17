@@ -28,7 +28,7 @@ use std::{
     sync::Arc,
 };
 
-use base_db::{Crate, Db, EditionedFileId, Nonce};
+use base_db::{Crate, CrateKey, Db, EditionedFileId, Nonce};
 use blaze_ids::Domain;
 use cfg::CfgOptions;
 use hir_expand::{HirFileId, span_map::SpanMap};
@@ -52,9 +52,13 @@ mod tests;
 /// The tree of a source file: the kept tree of its last lowering, or one assembled from its
 /// rows and the changed items', or a whole lowering ([`self`]).
 pub(super) fn file_item_tree(db: &Db, file: EditionedFileId, krate: Crate) -> Arc<ItemTree> {
-    let db_nonce = db.nonce_and_revision().0;
-    let kept = with_slot(db_nonce, file, krate, |it| it.lock().take());
-    let kept = kept.filter(|it| (it.db, it.file, it.krate) == (db_nonce, file, krate));
+    // The slot is found by what is the same in every snapshot: the database, the file's
+    // `span::EditionedFileId` and the crate's key. The interned `file` and `krate` are of this
+    // snapshot alone; a commit that drops their arena makes them again as other ids, so a slot
+    // found by them would never be found after an edit.
+    let slot = SlotKey { db: db.nonce(), file: file.span_file_id(db), krate: krate.key(db) };
+    let kept = with_slot(slot, |it| it.lock().take());
+    let kept = kept.filter(|it| it.slot == slot);
     // Read on every path, so the query depends on it even where nothing lowered reads it.
     let cfg = krate.cfg_options(db);
     let (tree, keyed) = match kept {
@@ -72,9 +76,7 @@ pub(super) fn file_item_tree(db: &Db, file: EditionedFileId, krate: Crate) -> Ar
             (keyed.tree.clone(), Some(keyed)) // clone: an `Arc`, the tree the slot keeps
         }
     };
-    let replaced = with_slot(db_nonce, file, krate, |it| {
-        (it.lock()).replace(Kept { db: db_nonce, file, krate, keyed })
-    });
+    let replaced = with_slot(slot, |it| (it.lock()).replace(Kept { slot, keyed }));
     // Dropped after the lock: a tree let go of may be a whole file's columns.
     drop(replaced);
     tree
@@ -98,9 +100,9 @@ thread_local! {
         const { [const { Lock::new("test.def.item_tree.kept", None) }; SLOTS] };
 }
 
-fn with_slot<R>(db: Nonce, file: EditionedFileId, krate: Crate, f: impl FnOnce(&Slot) -> R) -> R {
+fn with_slot<R>(slot: SlotKey, f: impl FnOnce(&Slot) -> R) -> R {
     let mut hasher = blaze_hash::FixedHasher::default();
-    (db, file, krate).hash(&mut hasher);
+    slot.hash(&mut hasher);
     // The multiply leaves its best bits at the top.
     let at = (hasher.finish() >> (64 - SLOTS.trailing_zeros())) as usize;
     #[cfg(not(test))]
@@ -109,11 +111,19 @@ fn with_slot<R>(db: Nonce, file: EditionedFileId, krate: Crate, f: impl FnOnce(&
     return KEPT.with(|kept| f(&kept[at]));
 }
 
-/// A file's last lowering in a crate, of a database: the ids are that database's.
-struct Kept {
+/// Which database's file in which crate a slot keeps, by what outlives a commit: an interned
+/// file or crate id is of one snapshot, and the slot is read again in the next.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct SlotKey {
     db: Nonce,
-    file: EditionedFileId,
-    krate: Crate,
+    file: span::EditionedFileId,
+    krate: CrateKey,
+}
+
+/// A file's last lowering in a crate, of a database. It holds no id of a snapshot (the tree of
+/// a real file names no crate and no interned id), so it is read across commits.
+struct Kept {
+    slot: SlotKey,
     /// None after a first lowering, which makes no keys.
     keyed: Option<Keyed>,
 }
@@ -528,6 +538,10 @@ fn item_keys(
     anchors.extend(starts.iter().zip(pairs).map(|(&start, &[ast_id, _])| [start, ast_id]));
 }
 
+#[expect(
+    blaze::narrowed_len,
+    reason = "ast ids are u32 and a file's text is under 4 GiB (a `TextSize`); a file with 2^32 ast ids would need a typed refusal from the parse"
+)]
 fn id(len: usize) -> u32 {
     u32::try_from(len).expect("a file of more than `u32` ast ids")
 }
@@ -1128,7 +1142,7 @@ fn item_anchors(map: &RealSpanMap, item: TextRange, ids: &[[u32; 3]], out: &mut 
 /// body that adds or removes no inner attribute leaves it equal. A query of its own so that it
 /// alone reads the parse.
 pub(crate) fn deferred_item_shape(db: &Db, item: crate::AstId<tag::Item>) -> u128 {
-    #[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
+    #[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
     fn deferred_item_shape(db: &Db, item: crate::AstId<tag::Item>, _: ()) -> u128 {
         let node = item.to_view(db);
         let mut bytes = Vec::new(); // alloc: one item's syntax, once per execution

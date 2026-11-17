@@ -1,0 +1,9 @@
+{
+ "id": "H-read-surviving-mutant",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane: crates/blaze-mutants, merge-1113",
+ "task": "Act on a surviving mutant (`warning[mutants::<operator>]`)",
+ "do": "Read the `-` and `+` lines: the `+` line is a program your tests accept. The `passed:` list is every test that runs that function, all passing with the change in; one of them, or a new one, must fail on it. Write the test the `help:` line names (for `mutants::cmp_boundary`, a case where the operands are equal; for `mutants::return_field`, assert the whole result or that field; for `mutants::return_default`, assert on the result at all), run `blaze mutants` again, and see the diagnostic go. Do not change the code to make the mutant go away. If the mutant truly cannot change behaviour, mark it on the item with `#[blaze::equivalent_mutant(rule = \"mutants::<operator>\", line = N, reason = \"...\")]` (never a comment): the ratchet counts marks per crate. `mutants::not_reached` means no test runs the function at all: write one before anything else.",
+ "why": "A survivor is a precise statement that the tests do not pin this behaviour; the fix is a test, and the verdict is keyed by the function's body and the reaching tests' keys, so the new test moves the key and the mutant is run again.",
+ "state": "current"
+}

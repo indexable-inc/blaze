@@ -205,6 +205,21 @@ impl BuildConfig {
         cbor::to_vec(self).unwrap_or_else(|error| panic!("a build config has no CBOR: {error}"))
     }
 
+    /// The configuration as the plan reads it, encoded: this one with, of the request's
+    /// environment, only the variables the workspace's load reads ([`read_by_plan`]). What a
+    /// build's database view is opened with and what its plan is kept by, so a request that
+    /// differs in any other variable (another pane's `TERM` or `COLUMNS`, systemd's
+    /// `INVOCATION_ID`, a `LIBCLANG_PATH` only build scripts read) is the same view and the
+    /// same plan (rule keys-cover-every-input: an input nothing read is not an input). The
+    /// whole environment stays in the job's own config, for what is keyed by its own reads of
+    /// it: a build script's run, a crate's `env!`, the program a `run` starts.
+    pub fn planned(&self) -> Vec<u8> {
+        // clone: once per request, the configuration without the variables no plan reads
+        let mut planned = self.clone();
+        planned.invocation.env.retain(|(name, _)| read_by_plan(name));
+        planned.encode()
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<BuildConfig, String> {
         cbor::from_slice(bytes).map_err(|error| format!("the view's build configuration: {error}"))
     }
@@ -274,6 +289,34 @@ pub struct Invocation {
     pub env: Vec<(String, String)>,
     /// Files outside every mount that cargo reads, by absolute path (`$CARGO_HOME/config.toml`).
     pub files: Vec<(String, Vec<u8>)>,
+}
+
+/// The variables cargo reads by name (cargo-notes section 1), and clippy's driver's
+/// `CLIPPY_CONF_DIR`: the load keeps no other one of the request's environment for the
+/// queries after its first.
+pub fn read_by_cargo(name: &str) -> bool {
+    name.starts_with("CARGO_")
+        || matches!(
+            name,
+            "RUSTFLAGS"
+                | "CLIPPY_CONF_DIR"
+                | "RUSTDOCFLAGS"
+                | "RUSTC_WORKSPACE_WRAPPER"
+                | "HOME"
+                | "USERPROFILE"
+                | "__CARGO_DEFAULT_LIB_METADATA"
+                | "__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT"
+                | "__CARGO_TEMPORARY_STOP_RLIB_UPLIFT_OPT_OUT"
+        )
+}
+
+/// The variables of a request's environment the workspace's load reads at all: cargo's
+/// ([`read_by_cargo`]) and the four its first query reads by name beside them (whether this is
+/// CI, whether `blaze.lock` is written, the packages whose pin is ignored). The one list:
+/// that query asserts each name it reads is here, and [`BuildConfig::planned`] keeps these
+/// alone, so a plan's key holds every variable its plan read and no other.
+pub fn read_by_plan(name: &str) -> bool {
+    read_by_cargo(name) || matches!(name, "CI" | "TF_BUILD" | crate::lock::LOCK_ENV | "BLAZE_IGNORE_PIN_FOR")
 }
 
 /// The variable `name` of a request's environment ([`Invocation::env`]).
@@ -394,7 +437,10 @@ pub enum Planned {
 }
 
 impl Versioned for Planned {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 9");
+    // 10: a git fetch carries the tree digest it is pinned by (`FetchKind::Git::tree`).
+    // 11: its `Units` lost `sandboxed_tests`, and `TestSandbox::opted_in` became
+    // `outside_by_host` (tests are sandboxed by default where the host can keep them apart).
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 11");
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -414,8 +460,10 @@ pub enum FetchKind {
     Crate { sha256: String },
     /// One file of a sparse index (`config.json`, a package's entry), as served: a file.
     IndexFile,
-    /// A git repository's tree at `commit`: a directory.
-    Git { commit: String },
+    /// A git repository's tree at `commit`: a directory. `tree` is the digest `blaze.lock`
+    /// pins it by (`blake3:<hex>`, [`blaze_audit::tree`]): the fetcher refuses a tree that is
+    /// not it, as the commit id alone (SHA-1) pins nothing.
+    Git { commit: String, tree: String },
     /// A path outside the view and every source, read from the disk where it is: what a
     /// `path` dependency outside the checkout is, or a manifest above one that its workspace
     /// search looks for. `at` is the path the load read. Its files are a root keyed by their
@@ -482,6 +530,11 @@ pub struct Units {
     pub lock: Option<LockWrite>,
     /// cargo's warnings of the load, each as cargo prints it after `warning: `.
     pub warnings: Vec<String>,
+    /// blaze's notes of the load, each as it is printed after `note: `: a setting it accepts
+    /// and does not honour yet, or one that does nothing on this host (`sandboxed-tests` on
+    /// Linux, where tests are sandboxed anyway), said
+    /// on every build that sets it.
+    pub notes: Vec<String>,
     pub target_dir: String,
     pub build_dir: String,
     /// The profile as cargo's `Finished` line names it: "`dev` profile [unoptimized + debuginfo]".
@@ -489,10 +542,6 @@ pub struct Units {
     /// The workspace's `build-script-link-dirs`, absolute or `${NAME}/rest` for a run to expand
     /// (`blaze_cargo::directives::link_dirs`).
     pub link_dirs: Vec<String>,
-    /// The workspace's root manifest lists `sandboxed-tests` in `experimental` under
-    /// `[workspace.metadata.blaze]`: every member's tests run sandboxed but those
-    /// [`TestSandbox`] takes out.
-    pub sandboxed_tests: bool,
     /// The pinned native inputs (`[workspace.metadata.blaze.native.<name>]`, docs/cargo.md,
     /// "Pinned native inputs") some build script run of this graph is given: one per input and
     /// target, sorted by name then target. The daemon fetches and lays out each before any
@@ -504,7 +553,10 @@ impl Versioned for Units {
     // 13: `CARGO_PRIMARY_PACKAGE` left the plans' variables ([`Units::is_primary`]).
     // 14: the pinned native inputs ([`Units::native`]).
     // 15: [`LockWrite`] writes `blaze.lock` too, and says what moved.
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 15");
+    // 16: a git package's tree digest ([`PackagePlan::tree`]).
+    // 17: `sandboxed_tests` left and `TestSandbox::opted_in` became `outside_by_host`: tests
+    // are sandboxed by default where the host can keep them apart.
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 17");
 }
 
 /// One pinned native input for one target: an archive named by its digest, which blaze fetches,
@@ -669,6 +721,10 @@ pub struct PackagePlan {
     /// download was checked against); `None` for any other source. How `blaze_global::Rule`
     /// names a public crate (`Origin::CratesIo`).
     pub checksum: Option<[u8; 32]>,
+    /// For a git package, the digest of its checkout's tree as `blaze.lock` pins it
+    /// (`blake3:<hex>`), which the fetcher checked; `None` for any other source. What seals a
+    /// git package (`sealed::pin`): its commit alone does not.
+    pub tree: Option<String>,
     /// What a member's `[package.metadata.blaze.sandbox]` says of its tests; nothing for any
     /// other package.
     pub tests: TestSandbox,
@@ -679,11 +735,13 @@ pub struct PackagePlan {
 }
 
 impl PackagePlan {
-    /// Whether the package's tests run sandboxed, when the build runs any so: `tests = true`
-    /// or the workspace's `sandboxed-tests` experiment ([`Units::sandboxed_tests`]), unless
-    /// `tests = false`.
-    pub fn tests_sandboxed(&self, experiment: bool) -> bool {
-        !self.tests.all && (self.tests.opted_in || experiment)
+    /// Whether the package's tests run sandboxed when the command does not take them out
+    /// (`BLAZE_SANDBOX=off`): unless `tests = false`, or the host the plan is for runs tests
+    /// sandboxed only on an opt-in and the package did not get one
+    /// ([`TestSandbox::outside_by_host`]); `unsandboxed-tests` takes out the tests it names
+    /// ([`TestSandbox::outside`]).
+    pub fn tests_sandboxed(&self) -> bool {
+        !self.tests.all && !self.tests.outside_by_host
     }
 }
 
@@ -692,9 +750,12 @@ impl PackagePlan {
 pub struct TestSandbox {
     /// `tests = false`: every test of the package runs outside.
     pub all: bool,
-    /// `tests = true`: every test of the package runs sandboxed but those of `tests`, whether
-    /// or not the workspace opts in.
-    pub opted_in: bool,
+    /// Its tests run outside because the host the plan is for sandboxes tests only where the
+    /// package (`tests = true`) or the workspace (`experimental = ["sandboxed-tests"]`) opts
+    /// in, and neither did: decided by the load, by
+    /// `crate::load::sandbox::tests_sandboxed_by_default`, which says why (macOS today).
+    /// False with `tests = false`, which says it alone.
+    pub outside_by_host: bool,
     /// `unsandboxed-tests`: the tests, by libtest's names, that run outside; sorted, each once.
     pub tests: Vec<String>,
 }
@@ -786,8 +847,72 @@ pub struct StdKey {
 impl StdKey {
     pub const DOMAIN: &'static str = "blaze v2 cargo std key 5";
 
+    /// The domain of [`StdKey::placement`].
+    pub const PLACEMENT: &'static str = "blaze v2 cargo std placement 1";
+
     pub fn id(&self) -> ContentId {
         crate::load::key_id(StdKey::DOMAIN, self)
+    }
+
+    /// What names the directory its units place what they make in (`<std>/<placement>`): the
+    /// key without [`StdKey::crates`], the crates of the library a build asked for.
+    ///
+    /// Which crates are asked decides which units there are, never what one of them is made
+    /// from: a unit's outputs and `OUT_DIR` carry cargo's hash of the unit (its package,
+    /// features, profile, mode, target, the release and its dependencies' hashes,
+    /// `load::plan::hash::compute_metadata`), so two builds that differ in the crates asked
+    /// name each unit they share by the same paths and each unit only one has by paths of its
+    /// own, as every command of cargo shares one `target/debug/deps`. Until 2026-11-11 the
+    /// directory was the whole key's: a program's tests ask for `test` too, so `blaze test`
+    /// after `blaze run` planned every unit of the standard library under another directory,
+    /// which moved each one's record key (its plan's outputs) and, through `OUT_DIR`, the
+    /// front end's crate of every crate above a build script (all but `core`), and all of
+    /// the library was resolved, checked and compiled again for a build that adds four units
+    /// to it.
+    ///
+    /// Every other field stays: each is an input of every unit (the library's sources, the
+    /// platform, the profile's settings, std's features, the rustflags, where its code runs),
+    /// so two stds apart in one are never placed together (rule 21). Every field is named
+    /// here, so one added to the key is a decision.
+    pub fn placement(&self) -> ContentId {
+        let StdKey {
+            library,
+            triple,
+            profile,
+            panic,
+            opt_level,
+            debug_assertions,
+            overflow_checks,
+            debuginfo,
+            crates: _,
+            features,
+            host,
+            rustflags,
+            profile_root,
+            macro_wasm,
+            runs_here,
+            codegen_backend,
+        } = self;
+        // clone: the key's strings, once per platform per load of a plan
+        let placed = StdKey {
+            library: library.clone(),
+            triple: triple.clone(),
+            profile: profile.clone(),
+            panic: panic.clone(),
+            opt_level: opt_level.clone(),
+            debug_assertions: *debug_assertions,
+            overflow_checks: *overflow_checks,
+            debuginfo: debuginfo.clone(),
+            crates: Vec::new(), // alloc: none
+            features: features.clone(),
+            host: host.clone(),
+            rustflags: rustflags.clone(),
+            profile_root: profile_root.clone(),
+            macro_wasm: *macro_wasm,
+            runs_here: *runs_here,
+            codegen_backend: codegen_backend.clone(),
+        };
+        crate::load::key_id(StdKey::PLACEMENT, &placed)
     }
 }
 
@@ -798,7 +923,8 @@ pub enum StdPlanned {
 }
 
 impl Versioned for StdPlanned {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo std planned 7");
+    // 8: [`PackagePlan::tree`].
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo std planned 8");
 }
 
 /// The standard library's units: a graph of their own, whose units the user's units depend on
@@ -835,6 +961,61 @@ pub fn key_input<K: Serialize>(domain: &'static str, key: &K) -> ContentId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The invariant: a plan's key (what its view is opened with) holds, of the request's
+    /// environment, the variables the load reads and no other, so two requests that differ in
+    /// a variable no plan reads are one plan, and two that differ in one it reads are not.
+    /// The control: the whole configuration, which the key was before, differs in both.
+    #[test]
+    fn a_plan_is_keyed_by_the_variables_the_load_reads_alone() {
+        let with = |env: &[(&str, &str)]| {
+            let mut env: Vec<(String, String)> =
+                env.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect();
+            env.sort();
+            BuildConfig {
+                invocation: Invocation {
+                    command: Command::Build,
+                    args: Vec::new(),
+                    root: "/w".to_owned(),
+                    cwd: "/w".to_owned(),
+                    env,
+                    files: Vec::new(),
+                },
+                mounts: Vec::new(),
+                host: "aarch64-unknown-linux-gnu".to_owned(),
+                library: "/rustc/abc/library".to_owned(),
+                std: "/s/std".to_owned(),
+                builds: "/s/build".to_owned(),
+                sources: "/s/sources".to_owned(),
+                blaze: String::new(),
+            }
+        };
+        let base = with(&[("HOME", "/home/u"), ("TERM", "xterm")]);
+        for unread in [("TERM", "dumb"), ("COLUMNS", "80"), ("INVOCATION_ID", "1"), ("LIBCLANG_PATH", "/lib")] {
+            let other = with(&[("HOME", "/home/u"), ("TERM", "xterm"), unread]);
+            assert_eq!(base.planned(), other.planned(), "{unread:?} is in a plan's key, and no plan reads it");
+            // The control.
+            assert_ne!(base.encode(), other.encode(), "{unread:?}");
+        }
+        for read in [
+            ("RUSTFLAGS", "-Cdebuginfo=0"),
+            ("CARGO_TARGET_DIR", "/t"),
+            ("CARGO_BUILD_JOBS", "2"),
+            ("HOME", "/home/v"),
+            ("CI", "true"),
+            ("TF_BUILD", "True"),
+            (crate::lock::LOCK_ENV, "write"),
+            ("BLAZE_IGNORE_PIN_FOR", "p"),
+            ("CLIPPY_CONF_DIR", "/c"),
+        ] {
+            assert!(read_by_plan(read.0), "{read:?}");
+            let other = with(&[("TERM", "xterm"), read]);
+            let base = with(&[("TERM", "xterm")]);
+            assert_ne!(base.planned(), other.planned(), "{read:?} is read by the plan, and not in its key");
+        }
+        // What is kept decodes as a configuration: the load's first query reads it as one.
+        assert!(BuildConfig::decode(&base.planned()).is_ok());
+    }
 
     fn env(vars: &[(&str, &str)]) -> Vec<(String, String)> {
         vars.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect()

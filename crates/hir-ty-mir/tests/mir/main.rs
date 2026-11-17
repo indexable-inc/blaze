@@ -3,7 +3,11 @@
 //! that `Release` references nothing `Debug` doesn't. An integration test, so the test
 //! database's queries are of the one copy of this crate the tests call.
 
+#![feature(allocator_api)]
+
 mod alloc_budget;
+mod anon_const_env;
+mod comptime_calls;
 mod const_check;
 mod const_check_drops;
 mod db;
@@ -12,6 +16,7 @@ mod devirt;
 mod erase_regions;
 mod foreign;
 mod held_across_calls;
+mod loop_match;
 #[path = "../../src/mir/optimize/inline/fixtures.rs"]
 mod inline;
 mod machine;
@@ -58,7 +63,7 @@ fn mir(fixture: &str, name: &str, options: MirOptions) -> String {
     let fx = fixture::db(fixture);
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let func = function(&db, name);
         let body = db
             .optimized_mir_body(func.into(), options)

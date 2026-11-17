@@ -13,10 +13,11 @@
 //
 // The one other transport is `external(endpoint)`: a DevTools websocket some other browser serves. Only the gmail
 // helpers use it, and only when asked by name (gmail.via({ cdp }) or HARNESS_GMAIL_CDP).
+import type { Docs } from "./docs.ts";
 import { decode, encode } from "./cbor.ts";
 import { req } from "./daemon.ts";
 import { effect } from "./effects.ts";
-import { REPL_ID } from "./repl.ts";
+import { REPL_ID } from "./self.ts";
 import { SHOWN, type Shown } from "./shown.ts";
 import { currentTask } from "./tasks.ts";
 import { SCHEMA, T_CBOR, frame, split } from "./wire.ts";
@@ -641,3 +642,13 @@ export async function external(endpoint: string): Promise<External> {
     throw e;
   }
 }
+
+/** What help() says about this module's calls (docs.ts). */
+export const docs: Docs = {
+  withHiddenPage: {
+    area: "web",
+    sig: "withHiddenPage<T>(fn: (page) => Promise<T>): Promise<T>",
+    about: "a page of the harness browser for fn, closed afterwards; page (a Page, as browser.open gives too) has view, goto(url) (waits for the load event), text() (its words, innerText, once the page has settled: no sleep before it), evaluate(fn | 'expression', arg) (fn runs in the page: it cannot close over cell variables, pass arg), waitForSelector(sel), url(), title(), close(), and all of DevTools: send(cdpMethod, params) (every page-session domain, and Browser.*, Target.*, Storage.* too), on(cdpEvent, fn), waitFor(cdpEvent, ms).",
+    throws: "CdpUnavailable when the harness browser cannot start; a timeout Error naming the event or selector waited for.",
+  },
+};

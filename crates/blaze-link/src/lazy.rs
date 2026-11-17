@@ -44,7 +44,8 @@
 
 use std::sync::Arc;
 
-use blaze_codegen::{Arch, CompiledFunction, InstanceKey, RelocKind, Relocs, Target};
+use blaze_codegen::{Arch, CompiledFunction, InstanceKey, RelocKind, Relocs, Target, text};
+use blaze_format::SpanRef;
 use blaze_hash::HashMap;
 use blaze_inproc::{CodeMemory, CodeRange};
 use blaze_lazy::runner::Placer;
@@ -207,6 +208,10 @@ struct Scratch {
     starts: Vec<usize>,
     /// The `Location` records the placement writes.
     records: Vec<Record>,
+    /// The composed texts' `&str` records the placement writes ([`Target::Text`]), and the
+    /// texts' bytes, one after another.
+    strs: Vec<Str>,
+    text: Vec<u8>,
     /// AArch64: the veneer of each of the code's targets a `bl` reaches in the image, by
     /// target index; empty elsewhere.
     veneers: Vec<Veneer>,
@@ -258,6 +263,24 @@ enum Name {
     Image(u64),
     Own(u64),
 }
+
+/// A composed text's `&str` record in the range: where it is, its bytes in
+/// [`Scratch::text`], and where those are (the image's string of the same bytes, or the
+/// range's own copy).
+#[derive(Clone, Copy, Debug)]
+struct Str {
+    at: u64,
+    from: usize,
+    len: usize,
+    name: Name,
+}
+
+/// [`Scratch::data_at`] of a text recipe, which is never placed ([`Target::Text`]).
+const NOT_PLACED: u64 = u64::MAX;
+
+/// A `&str` record (pointer, then length) as a lazy image's 64-bit code reads it.
+const STR_SIZE: u64 = 16;
+const STR_ALIGN: u64 = 8;
 
 /// A symbol's value in the image.
 #[derive(Clone, Copy)]
@@ -429,9 +452,16 @@ impl Scratch {
         self.resolved.clear();
         self.starts.clear();
         self.records.clear();
+        self.strs.clear();
+        self.text.clear();
         let mut align = u64::from(function.align).max(1);
         let mut end = function.code.len() as u64;
+        let tables = || std::iter::once(&function.relocs).chain(function.data.iter().map(|it| &it.relocs));
         for data in &function.data {
+            if crate::stage::is_recipe(data, tables()) {
+                self.data_at.push(NOT_PLACED);
+                continue;
+            }
             let data_align = u64::from(data.align).max(1);
             align = align.max(data_align);
             let at = align_up_u64(end, data_align);
@@ -441,9 +471,13 @@ impl Scratch {
         }
         let tables = std::iter::once((&function.relocs, true))
             .chain(function.data.iter().map(|it| (&it.relocs, false)));
-        for (relocs, in_code) in tables {
+        for (n, (relocs, in_code)) in tables.enumerate() {
             // alloc: reused across placements, as `data_at`
             self.starts.push(self.resolved.len());
+            // A recipe's holes are the composed text's, never resolved as positions.
+            if n > 0 && self.data_at[n - 1] == NOT_PLACED {
+                continue;
+            }
             for target in relocs.targets() {
                 let resolved = self.resolve(image, function, target, in_code, &mut end)?;
                 // alloc: reused across placements; grows only for a function with more targets
@@ -452,6 +486,9 @@ impl Scratch {
         }
         if !self.records.is_empty() {
             align = align.max(LOCATION_ALIGN);
+        }
+        if !self.strs.is_empty() {
+            align = align.max(STR_ALIGN);
         }
         self.veneers.clear();
         if image.output.arch == Arch::Aarch64 {
@@ -601,6 +638,53 @@ impl Scratch {
                 self.records.push(Record { at: record, anchor, index: span.index, name });
                 Resolved::Own(record)
             }
+            Target::Text(id) => {
+                // The image's record of the same recipe, composed from the same span tables.
+                if let Some(sym) = symbols
+                    .find_id(id)
+                    .and_then(|it| symbols.find(SymKey::Text(it)))
+                    .filter(|it| state.home(*it).is_some())
+                {
+                    return Ok(Resolved::Sym(sym));
+                }
+                let Some(recipe) = function.data.iter().find(|it| it.id == *id) else {
+                    return Err(fail(format!("refers to the text of recipe {id:?}, which is not among its data")));
+                };
+                let file_of = |span: SpanRef| -> Result<&str, String> {
+                    let table = symbols.find_id(&span.anchor).and_then(|it| state.span_table(it)).ok_or_else(|| {
+                        format!("a position in {:?}, whose span table the image was not given", span.anchor)
+                    })?;
+                    let at = table.span(span.index).ok_or_else(|| {
+                        format!("span {} of {:?}, whose table has {}", span.index, span.anchor, table.len())
+                    })?;
+                    Ok(table.file(at.file))
+                };
+                let from = self.text.len();
+                text::compose(&recipe.bytes, recipe.relocs.view(), file_of, &mut self.text).map_err(|it| match it {
+                    text::TextError::NoFile(why) => fail(why),
+                    other => fail(format!("its text recipe {id:?} does not compose: {other:?}")),
+                })?;
+                let len = self.text.len() - from;
+                let Ok(composed) = std::str::from_utf8(&self.text[from..]) else {
+                    return Err(fail(format!("its text recipe {id:?} composes to bytes that are not UTF-8")));
+                };
+                let record = align_up_u64(*end, STR_ALIGN);
+                *end = record + STR_SIZE;
+                let in_image = symbols
+                    .find_name(composed)
+                    .and_then(|it| symbols.find(SymKey::FileName(it)))
+                    .and_then(|it| state.addr_of(it));
+                let name = match in_image {
+                    Some(addr) => Name::Image(addr),
+                    None => {
+                        let at = *end;
+                        *end += len as u64 + 1;
+                        Name::Own(at)
+                    }
+                };
+                self.strs.push(Str { at: record, from, len, name });
+                Resolved::Own(record)
+            }
             Target::Coverage(_) => {
                 return Err(fail("SanitizerCoverage arrays in lazily placed code, which the image places none of".into()));
             }
@@ -635,7 +719,24 @@ impl Scratch {
         self.bytes.resize(self.len as usize, 0);
         self.bytes[..function.code.len()].copy_from_slice(&function.code);
         for (data, at) in function.data.iter().zip(&self.data_at) {
+            if *at == NOT_PLACED {
+                continue;
+            }
             self.bytes[*at as usize..][..data.bytes.len()].copy_from_slice(&data.bytes);
+        }
+        for it in &self.strs {
+            let name = match it.name {
+                Name::Image(addr) => addr,
+                Name::Own(offset) => {
+                    // The NUL after it is the zero the buffer was filled with.
+                    self.bytes[offset as usize..][..it.len]
+                        .copy_from_slice(&self.text[it.from..][..it.len]);
+                    linked + offset
+                }
+            };
+            let record = &mut self.bytes[it.at as usize..][..STR_SIZE as usize];
+            record[..8].copy_from_slice(&name.wrapping_add(slide).to_le_bytes());
+            record[8..].copy_from_slice(&(it.len as u64).to_le_bytes());
         }
         for record in &self.records {
             let table = image.state.span_table(record.anchor).expect("resolved when laid out");
@@ -662,6 +763,9 @@ impl Scratch {
                 .map_err(fail)?;
         }
         for (n, (data, at)) in function.data.iter().zip(&self.data_at).enumerate() {
+            if *at == NOT_PLACED {
+                continue;
+            }
             let resolved = &self.resolved[self.starts[n + 1]..][..data.relocs.targets().len()];
             let field = &mut self.bytes[*at as usize..][..data.bytes.len()];
             relocate(image, &data.relocs, resolved, field, linked, *at, None, slide)
@@ -778,6 +882,15 @@ fn relocate(
         };
         let apply =
             reloc::of_kind(reloc.kind, output.format, output.arch, in_code).map_err(at_fail)?;
+        // A TLS descriptor in an executable is relaxed, to local exec for all but an import
+        // ([`reloc::in_output`], [`reloc::known`]).
+        let apply = reloc::in_output(apply, output.format, &output.kind);
+        let apply = match resolved[row.target as usize] {
+            Resolved::Sym(sym) => {
+                reloc::known(apply, matches!(def_value(image, sym), Ok(Value::Import)))
+            }
+            _ => apply,
+        };
         let p = linked + start + u64::from(reloc.at);
         let (s, g, tp, slid) = match resolved[row.target as usize] {
             Resolved::Own(offset) if reloc::got_kind(apply).is_none() => (linked + offset, 0, None, true),

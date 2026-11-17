@@ -1,0 +1,19 @@
+{
+ "id": "proofs-1113-23",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113",
+ "where": "`ix shell blaze-vm` from the Mac",
+ "what": "From 16:05 PST `ix shell blaze-vm --noninteractive` failed with `failed to open WebTransport session to https://52.37.172.228:8443/ixrpc/0: no response within 7s`, and a session that did open ended mid-command with `RPC session failed: the session ended or its path broke`. `ix ls` said the VM was running; the one session that got through at 16:08 showed a load average of 83. Eleven tries over ten minutes, one success. The run it cut was `blaze prove` on main`s exact tree after #2164, whose build and smoke had already passed there.",
+ "cost": "the prove on main`s merged tree was not read back; every later VM step of the lane waits",
+ "cause": "not known from here: the VM`s agent starved under load, or the path to its host",
+ "whys": [
+  "a long command`s result was lost with its session",
+  "my helper scripts run the work inside the session that reads its output",
+  "a session that drops kills what it started"
+ ],
+ "class": "work whose life is tied to the connection that watches it",
+ "prevention": "run each VM step as a systemd unit that writes its result to a file, and read the file with short sessions that may be retried (as the build queue`s long runs are meant to: rule work-in-ix-vms); the lane`s helpers (`tipvm2.sh`, `dogvm2.sh`, `provevm.sh`) do not yet. Not built.",
+ "workaround": "retry; start the step detached (`systemd-run --unit=..`) once a session opens",
+ "fix": "",
+ "state": "open"
+}

@@ -642,7 +642,8 @@ fn expand_doc_macro_call<'db>(
     }
 
     let path = macro_call.path()?;
-    let mod_path = ModPath::from_src_view(expander.db, path, &mut |range| {
+    let arena = expander.file_id.context_arena();
+    let mod_path = ModPath::from_src_view(expander.db, arena, path, &mut |range| {
         expander.span_map.span_for_range(range).ctx
     })?;
     let call_site = expander.span_map.span_for_range(macro_call.syntax().text_range());

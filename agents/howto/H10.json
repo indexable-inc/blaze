@@ -1,0 +1,9 @@
+{
+ "id": "H10",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane repl-clean-1112",
+ "task": "Change or drive the harness ts kernel (crates/harness/mcp)",
+ "do": "In crates/harness/mcp: `bun install` (a new worktree has no node_modules), `bun test` (about 10 s; bunfig.toml preloads src/test-setup.ts, so no test reaches the live daemon or ~/.harness), `bunx tsc --noEmit`. Drive the real kernel from a shell with `bun scripts/cell.ts '{\"cells\": [\"help()\", \"1 + 1\"]}'` (a kernel of its own) or `{\"sock\": path, \"cells\": [...]}` for one started with HARNESS_REPL_SOCK=path. Decisions live in pure modules with their tests (patience.ts, stop.ts, notices.ts, disclose.ts, help.ts, journal.ts, shell-rule.ts); kernel.ts is the one API and mcp.ts/serve.ts only adapt it. A new function needs a `docs` entry beside it or functions/docs.test.ts fails. HARNESS_REPL_TYPECHECK=0 starts a kernel that does not type-check cells.",
+ "why": "Nothing here needs cargo or a VM, so this is the one place a lane runs its own tests; the end-to-end test (src/e2e.test.ts) starts the real MCP server, which is how a wrong reply is seen before an agent sees it.",
+ "state": "current"
+}

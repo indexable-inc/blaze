@@ -218,50 +218,52 @@ impl<K: Copy + Ord, V> std::ops::Index<&K> for Rows<K, V> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use hegel::generators as gs;
+    use blaze_sim::Config;
 
     use super::*;
 
     /// The refinement: after any sequence of inserts, removals and changes, a map in chunks
     /// holds what a `BTreeMap` given the same sequence holds, in the same order, and each
     /// call gave what the `BTreeMap`'s gave; a copy taken midway holds what the map held then.
-    #[hegel::test]
-    fn rows_hold_what_a_sorted_map_holds(tc: hegel::TestCase) {
-        let count: usize = tc.draw(gs::integers::<usize>().max_value(600));
-        let start: Vec<u16> = tc.draw(gs::vecs(gs::integers::<u16>().max_value(400)).max_size(300));
-        let mut model: BTreeMap<u16, u32> = start.iter().map(|key| (*key, u32::from(*key))).collect();
-        let mut rows = Rows::of_sorted(model.iter().map(|(key, value)| (*key, *value)));
-        let mut copy = None;
-        for step in 0..count {
-            let key: u16 = tc.draw(gs::integers::<u16>().max_value(400));
-            match tc.draw(gs::integers::<u8>().max_value(3)) {
-                0 => assert_eq!(rows.remove(&key), model.remove(&key)),
-                1 => {
-                    if let Some(value) = rows.get_mut(&key) {
-                        *value += 1;
+    #[test]
+    fn rows_hold_what_a_sorted_map_holds() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let count: usize = tape.int_in(0..=600usize, "count");
+            let start: Vec<u16> = tape.vec(0..=300, "start", |tape| tape.int_in(0..=400u16, "key"));
+            let mut model: BTreeMap<u16, u32> = start.iter().map(|key| (*key, u32::from(*key))).collect();
+            let mut rows = Rows::of_sorted(model.iter().map(|(key, value)| (*key, *value)));
+            let mut copy = None;
+            for step in 0..count {
+                let key: u16 = tape.int_in(0..=400u16, "key");
+                match tape.int_in(0..=3u8, "op") {
+                    0 => assert_eq!(rows.remove(&key), model.remove(&key)),
+                    1 => {
+                        if let Some(value) = rows.get_mut(&key) {
+                            *value += 1;
+                        }
+                        if let Some(value) = model.get_mut(&key) {
+                            *value += 1;
+                        }
                     }
-                    if let Some(value) = model.get_mut(&key) {
-                        *value += 1;
-                    }
+                    _ => assert_eq!(rows.insert(key, step as u32), model.insert(key, step as u32)),
                 }
-                _ => assert_eq!(rows.insert(key, step as u32), model.insert(key, step as u32)),
+                assert_eq!(rows.get(&key), model.get(&key));
+                if step == count / 2 {
+                    // clone: the test's copy of the map and its model
+                    copy = Some((rows.clone(), model.clone()));
+                }
             }
-            assert_eq!(rows.get(&key), model.get(&key));
-            if step == count / 2 {
-                // clone: the test's copy of the map and its model
-                copy = Some((rows.clone(), model.clone()));
+            let held = |rows: &Rows<u16, u32>| -> Vec<(u16, u32)> {
+                rows.iter().map(|(key, value)| (*key, *value)).collect()
+            };
+            assert_eq!(held(&rows), model.iter().map(|(key, value)| (*key, *value)).collect::<Vec<_>>());
+            assert_eq!(rows.len(), model.len());
+            assert!(rows.chunks.iter().all(|it| !it.keys.is_empty() && it.keys.len() <= CHUNK));
+            if let Some((rows, model)) = copy {
+                let model: Vec<(u16, u32)> = model.into_iter().collect();
+                assert_eq!(held(&rows), model, "a copy holds what the map held when it was taken");
             }
-        }
-        let held = |rows: &Rows<u16, u32>| -> Vec<(u16, u32)> {
-            rows.iter().map(|(key, value)| (*key, *value)).collect()
-        };
-        assert_eq!(held(&rows), model.iter().map(|(key, value)| (*key, *value)).collect::<Vec<_>>());
-        assert_eq!(rows.len(), model.len());
-        assert!(rows.chunks.iter().all(|it| !it.keys.is_empty() && it.keys.len() <= CHUNK));
-        if let Some((rows, model)) = copy {
-            let model: Vec<(u16, u32)> = model.into_iter().collect();
-            assert_eq!(held(&rows), model, "a copy holds what the map held when it was taken");
-        }
+        })
     }
 
     /// The control of [`rows_hold_what_a_sorted_map_holds`]: a key before every chunk's first

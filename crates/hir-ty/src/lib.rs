@@ -1,7 +1,9 @@
 //! The type system. We currently use this to infer types for completion, hover
 //! information and various assists.
 
-#![feature(allocator_api, allocator_ext)]
+#![feature(allocator_api, allocator_ext, register_tool)]
+// `#[blaze::renders_positions]` and `#[expect(blaze::reads_positions)]`; inert under rustc.
+#![register_tool(blaze)]
 // It's useful to refer to code that is private in doc comments.
 #![allow(rustdoc::private_intra_doc_links)]
 
@@ -46,9 +48,12 @@ pub mod drop;
 pub mod dropck;
 pub mod dyn_compatibility;
 pub mod effects;
+pub mod entry;
+pub mod error_union;
 pub mod evict;
 pub mod facts;
 pub mod fn_cache;
+pub mod kinds;
 pub mod lang_items;
 pub mod layout;
 pub mod method_resolution;
@@ -58,7 +63,9 @@ pub mod primitive;
 pub mod providers;
 pub mod record;
 pub mod solver_errors;
+mod store_registry;
 pub mod traits;
+pub mod type_of;
 pub mod used_imports;
 pub mod where_const;
 
@@ -133,6 +140,7 @@ pub use lower::{
     elided_groups, elided_lifetimes, hir_mutability, hybrid_param_env, lower_mutability,
     persist::{BatchKind, ColdBatch, ColdBatchRef, PredicatesRec},
     predicate_sources,
+    written_implied_predicates,
     record::{
         RecordParamDefault, record_defaults_owner, record_param_default, record_param_defaults,
     },
@@ -179,6 +187,14 @@ pub fn frame_map<K, V>(frame: &Frame) -> FrameMap<'_, K, V> {
 
 pub fn frame_set<T>(frame: &Frame) -> FrameSet<'_, T> {
     hashbrown::HashSet::with_hasher_in(FixedState, frame)
+}
+
+/// The table the syntax contexts of what `krate`'s bodies and signatures write are of (see
+/// [`span::SyntaxContext`]): the crate's arena, where every expansion of its bodies is called
+/// (hir-def's `Resolver::ctx_table`, for code that holds an expression store and no resolver).
+#[inline]
+pub fn ctx_table(krate: base_db::Crate) -> blaze_memo::ArenaId {
+    blaze_memo::Id::gid(krate).arena()
 }
 
 /// A constant can have reference to other things. Memory map job is holding
@@ -812,7 +828,7 @@ mod memory_map_tests {
         with_static.statics.push(StaticMemory {
             start: 8,
             size: 4,
-            id: blaze_query::db::FromId::from_id(blaze_query::db::Id::from_u32(1)),
+            id: blaze_memo::Id::from_gid(blaze_memo::Gid::for_test(1)),
         });
         let empty = MemoryMap::Complex(Box::default());
         let with_static = MemoryMap::Complex(Box::new(with_static));
@@ -867,10 +883,11 @@ pub fn lifetime_param_idx(db: &Db, id: LifetimeParamId) -> u32 {
     generics::generics(db, id.parent).lifetime_param_idx(id, false).0
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, blaze_memo::Home)]
 pub enum ImplTraitId {
-    ReturnTypeImplTrait(hir_def::FunctionId, next_solver::ImplTraitIdx),
-    TypeAliasImplTrait(hir_def::TypeAliasId, next_solver::ImplTraitIdx),
+    // The index is a place in its owner's list, no id: the owner is the home.
+    ReturnTypeImplTrait(hir_def::FunctionId, #[home(skip)] next_solver::ImplTraitIdx),
+    TypeAliasImplTrait(hir_def::TypeAliasId, #[home(skip)] next_solver::ImplTraitIdx),
 }
 
 /// 'Canonicalizes' the `t` by replacing any errors with new variables. Also
@@ -1199,8 +1216,7 @@ impl Span {
     Hash,
     PartialOrd,
     Ord,
-    blaze_query::Supertype,
-    blaze_query::Value,
+    blaze_memo::Home,
 )]
 pub enum InferBodyId<'db> {
     DefWithBodyId(DefWithBodyId),
@@ -1248,6 +1264,33 @@ impl InferBodyId<'_> {
         match self {
             InferBodyId::DefWithBodyId(id) => id.generic_def(db),
             InferBodyId::AnonConstId(id) => id.loc(db).owner.generic_def(db),
+        }
+    }
+
+    /// The environment the body is checked and evaluated in: its generic def's where clauses,
+    /// but for an anonymous constant that may not name its owner's generic parameters (any
+    /// but an array repeat's count), none.
+    ///
+    /// rustc's rule (`generics_of` of an `AnonConst`): a constant of a type, a const argument
+    /// or a where clause under `min_const_generics` (`AnonConstKind::MCG`) has no parent, so
+    /// its `predicates_of` and its `param_env` are empty; only a repeat count
+    /// (`RepeatExprCount`) has its owner's. The solver's view of such a constant has said so
+    /// already (`next_solver::generics::generics_of` gives it no generics,
+    /// `interner::generic_predicates_of` no predicates); this is the same rule for the
+    /// environment. Taking the owner's where clauses instead was a cycle where the constant
+    /// is in one of them: alloc's `impl<From, To> Recyclable<From> for To where &MaybeUninit<To>:
+    /// TransmuteFrom<&MaybeUninit<From>, { Assume::SAFETY }>` normalizes `{ Assume::SAFETY }`
+    /// while building the impl's environment (`lower::trait_environment_query`), whose
+    /// inference (`infer::infer_anon_const_body_query`) asked that environment again. What a
+    /// program sees is rustc's: such a constant names no generic parameter (a use is refused,
+    /// `InferenceContext::allow_using_generic_params`), and a global where clause of its owner
+    /// (`where u32: Copy`, under `trivial_bounds`) is not assumed in its body, as in rustc.
+    pub fn param_env<'db>(self, db: &'db Db) -> next_solver::ParamEnv<'db> {
+        match self {
+            InferBodyId::AnonConstId(id) if !id.loc(db).allow_using_generic_params => {
+                next_solver::ParamEnv::empty()
+            }
+            _ => db.trait_environment(self.generic_def(db)),
         }
     }
 

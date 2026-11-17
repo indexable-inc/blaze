@@ -47,6 +47,10 @@ pub use self::files::normal_text;
 pub use self::view::{ResolveAsk, Resolving, ViewResolved, platform_cfg, resolve_view};
 pub use crate::Read;
 
+#[expect(
+    blaze::process_static,
+    reason = "a per-thread key buffer, uncapped: it keeps the largest key the thread hashed"
+)]
 thread_local! {
     // alloc: grown once to the largest key the thread hashes, then reused by every key.
     static KEY_BYTES: RefCell<(cbor::Writer, Vec<u8>)> = RefCell::new((cbor::Writer::new(), Vec::new()));
@@ -142,6 +146,8 @@ pub(crate) struct Spec {
     pub run: bool,
     /// `check`: the workspace's crates are linted by rustc's, clippy's and blaze's lints.
     pub lints: bool,
+    /// `check`'s lint levels of the command line ([`invocation::Asked::lint_levels`]).
+    pub lint_levels: Vec<String>,
     pub release: bool,
     pub profile: Option<String>,
     pub host: String,
@@ -256,6 +262,8 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
         filter,
         run: asked.command() == Command::Run,
         lints: asked.command() == Command::Check,
+        // clone: the spec owns its levels, once per plan
+        lint_levels: asked.lint_levels.clone(),
         release: asked.release,
         profile: asked.profile.clone(),
         host: asked.host.clone(),
@@ -313,6 +321,7 @@ fn foreign_spec(ask: &ForeignAsk) -> Spec {
         },
         run: false,
         lints: false,
+        lint_levels: Vec::new(),
         release: false,
         profile: None,
         host: ask.host.clone(),
@@ -357,7 +366,7 @@ fn load(cx: &mut Cx<'_>, spec: &Spec) -> Result<Staged<Built>, Cancelled> {
 impl Query for Plan {
     const KIND: QueryKind = kinds::PLAN;
     const NAME: &'static str = "cargo plan";
-    const PRODUCER: ContentId = producer("blaze v2 cargo plan 8");
+    const PRODUCER: ContentId = producer("blaze v2 cargo plan 10");
     type Key = ();
     type Value = Cbor<Planned>;
 
@@ -382,11 +391,11 @@ impl Query for Plan {
                 packages: built.packages,
                 lock: built.lock,
                 warnings: built.warnings,
+                notes: built.notes,
                 target_dir: built.target_dir,
                 build_dir: built.build_dir,
                 finished: built.finished,
                 link_dirs: built.link_dirs,
-                sandboxed_tests: built.sandboxed_tests,
                 native: built.native,
             }),
             Staged::Needs(fetches) => Planned::Needs(fetches),

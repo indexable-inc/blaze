@@ -1,0 +1,9 @@
+{
+ "id": "content-keys-1112-H10",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane diagkey-1111",
+ "task": "Add something a unit says (a warning, a note, a refusal)",
+ "do": "Push a `drawn::Item` onto the unit's `Said` (crates/blaze-cargo/src/serve/unit/drawn.rs): what it says, never text. `drawn::draw` is the one place a unit's diagnostics become text, for the job's client (`Drawing`: colour, width, short, `--refused`), from the record. Never read `job.input.color`, `.width`, `.short` or `.refused` while making a unit, and never put one in a key.",
+ "why": "Rule keys-cover-every-input, the other way: a key holds only what its value is made from. Width in the record's key recompiled all 28 units of hello world from a pane of another width (2026-11-11).",
+ "state": "current"
+}

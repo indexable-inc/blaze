@@ -1,13 +1,13 @@
 /**
  * The course's glyphs: one small line drawing per lesson and per update, the picture on its node on the course path
- * (the home page), on What's new, and above its title on its page. A lesson or update names its glyph
+ * (the course map), on What's new, and above its title on its page. A lesson or update names its glyph
  * (`Lesson: {1, "...", "pipeline"}` in content/learn/*.flecs, `Update: {..., "fetch"}` in content/updates/*.flecs);
  * gen/build.ts bakes the drawing onto the page as its `Baked {html}`, and the renderer (render.rs `glyph`) inlines it.
  * An unknown name fails the build.
  *
  * Drawn as the site's icons are (Phosphor light, renderer/core/src/icons.rs): thin round-capped strokes in
  * `currentColor`, here on a 32x32 canvas. Each glyph also has one filled pixel cell, `.g-cell`: the one part that
- * matters (the function that changed, the kept output), as the home page's drawings mark it. styles/learn.css colours
+ * matters (the function that changed, the kept output), as the lessons' drawings mark it. styles/learn.css colours
  * it: the ink of its node, and the fire orange once the lesson is mastered. Inline rather than a `<use>` sprite, so
  * the page's CSS reaches inside, and no fetch.
  */
@@ -69,6 +69,17 @@ export const GLYPHS: Record<string, Glyph> = {
 		...as('pulse', curve(7.25, 9.5, 12.5, 17), curve(24.75, 9.5, 19.5, 17)),
 		cell(16, 24.2, 2.8),
 	],
+
+	/** Start here: a terminal prompt, the cursor blinking where the first command goes. */
+	start: [box(3.5, 5.5, 25, 21, 3), ...as('code', line(9, 12.5, 13, 16, 9, 19.5)), cell(19, 19.5)],
+	/** Const generic expressions: N + M, two lengths joined into one. */
+	consts: [box(3.5, 6.5, 9, 7, 1.2), box(19.5, 6.5, 9, 7, 1.2), ...as('flow', curve(8, 13.5, 16, 21), curve(24, 13.5, 16, 21)), ...as('link', box(6.5, 21, 19, 6, 1.2)), cell(16, 24)],
+	/** Saying more in the code: a signature with a guard on it. */
+	contract: [...as('code', line(4.5, 9.5, 19.5, 9.5), line(4.5, 16, 15.5, 16), line(4.5, 22.5, 17.5, 22.5)), ...as('wall', closed(24, 7, 28.5, 9, 28.5, 15, 24, 18.5, 19.5, 15, 19.5, 9)), cell(24, 12.5, 2.6)],
+	/** bstd: a capability handed in, one door into a walled room. */
+	capability: [...as('wall', line(10.5, 4.5, 4.5, 4.5, 4.5, 27.5, 27.5, 27.5, 27.5, 4.5, 21.5, 4.5)), ...as('flow', line(16, 1.5, 16, 13), line(12, 9, 16, 13, 20, 9)), cell(16, 20)],
+	/** Proved correct: before and after, joined by a proof. */
+	proof: [box(3.5, 8.5, 9, 15, 1.5), box(19.5, 8.5, 9, 15, 1.5), ...as('flow', line(13.5, 13.5, 18.5, 13.5), line(13.5, 18.5, 18.5, 18.5)), cell(8, 16), cell(24, 16)],
 
 	// Updates (content/updates/*.flecs name these in `Update`), drawn the same way.
 	/** Pinned downloads: a download comes down into the build, held where the lock says (the cell). */

@@ -15,6 +15,7 @@ use hir_def::{FunctionId, ModuleDefId, nameres::crate_def_map, signatures::Funct
 use hir_expand::fixture;
 use hir_ty::{
     ParamEnvAndCrate,
+    facts::Tier,
     mir::{MirOptLevel, MirOptions},
     next_solver::{GenericArgs, ParamEnv},
     traits::StoredParamEnvAndCrate,
@@ -24,7 +25,9 @@ use hir_ty_identity::{
 };
 use hir_ty_mir::mir::dispatch::Body;
 
-use super::{Edit, LIBRARIES, Model, TestDB, Width, edits, run_cases};
+use blaze_sim::Config;
+
+use super::{Edit, LIBRARIES, Model, TestDB, Width, edits};
 
 impl Edit {
     /// An edit of comments, formatting or item order: no code changes.
@@ -74,6 +77,7 @@ const DEBUG: Compiled = Compiled::every(MirOptions {
     inline: false,
     heap_to_stack: false,
     world: None,
+    tier: Tier::Zero,
 });
 
 /// A debug unit of a program whose allocations are unobserved: `HeapToStack` moves `boxed`'s
@@ -85,6 +89,7 @@ const MOVED: Compiled = Compiled::every(MirOptions {
     inline: false,
     heap_to_stack: true,
     world: None,
+    tier: Tier::Zero,
 });
 
 /// A release unit: level 2 with the inliner on.
@@ -95,6 +100,7 @@ const RELEASE: Compiled = Compiled::every(MirOptions {
     inline: true,
     heap_to_stack: false,
     world: None,
+    tier: Tier::Optimizing,
 });
 
 /// The model's functions with no generic parameter, each a root, by name.
@@ -103,7 +109,7 @@ const ROOTS: [&str; 6] = ["entry", "mix", "mode", "wide", "read_s", "boxed"];
 /// Of each of [`ROOTS`]: its compile identity in a debug, a moving and a release unit, and its
 /// `CodeId`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Ids {
+pub(super) struct Ids {
     debug: CompileIdentity,
     moved: CompileIdentity,
     release: CompileIdentity,
@@ -112,16 +118,16 @@ struct Ids {
 
 /// Which way round [`identities`] asks for [`ROOTS`].
 #[derive(Clone, Copy)]
-enum Order {
+pub(super) enum Order {
     TopDown,
     BottomUp,
 }
 
 /// [`Ids`] of each root of `text`, in a database of its own, as another process would have
-/// them, asked in `order`.
-fn identities(text: &str, order: Order) -> BTreeMap<&'static str, Ids> {
+/// them, asked in `order`. Also the shift property's (`edits/shift.rs`).
+pub(super) fn identities(text: &str, order: Order) -> BTreeMap<&'static str, Ids> {
     let db = fixture::db(text).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let env: StoredParamEnvAndCrate =
             ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: fixture::test_crate(&db) }
                 .store();
@@ -237,5 +243,5 @@ fn each_edit_kind_keeps_or_changes_the_identities() {
 
 #[test]
 fn cosmetic_edits_keep_every_identity_and_behaviour_edits_change_the_code_id() {
-    run_cases(12, |tc| identities_keep_or_change(&edits(&tc)));
+    blaze_sim::check(Config::cases(12), |tape| identities_keep_or_change(&edits(tape)));
 }

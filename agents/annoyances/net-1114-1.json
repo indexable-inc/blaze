@@ -1,0 +1,14 @@
+{
+ "id": "net-1114-1",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), write-only lane porting the network branch's last Hegel tests, land-net-1113",
+ "where": "crates/ix-prof/src/explore/tests.rs and crates/blaze-explore/src/probe/tests.rs, porting controls to blaze_sim::control",
+ "what": "The old controls looped `for seed in 0..4 { assert!(run(seed, CLEAN, plant).is_err()) }`: every seed had to catch the plant, and any error counted. `blaze_sim::control(Config::cases(4), ..)` passes when some one case is caught, and only as `Broke::Oracle`. A literal port of the loop into one control call weakens 'every seed' to 'some seed'; the port guide's control recipe does not say so. Kept the claim with one `control(Config::cases(1).first(seed), ..)` a seed, and had to split each run's errors into Oracle (the server's misstep) and Harness (setup, tag bookkeeping, socket failure) by hand, since the old `String` error did not say which.",
+ "cost": "a re-read of control.rs to find the semantics, and a judgement per error site",
+ "cause": "control was designed for 'the oracle can catch this plant', the old loops claimed 'every seed catches it'; the guide maps the loop shape without naming the quantifier",
+ "whys": "two claims share one syntactic shape (a seed loop of is_err); the port guide lists shapes, not claims; nothing in blaze-sim offers 'every case must be caught'",
+ "class": "a port mapping by shape that silently changes a test's quantifier",
+ "prevention": "a `blaze_sim::control_every(config, clean, plant, says, run)` (every planted case caught as the oracle saying `says`) or a `Config` flag for it, and a line in the port guide: a loop that asserted every seed maps to it, not to `control`",
+ "workaround": "one control of one case a seed (`Config::cases(1).first(seed)`), which also runs the clean run of each seed",
+ "state": "open"
+}

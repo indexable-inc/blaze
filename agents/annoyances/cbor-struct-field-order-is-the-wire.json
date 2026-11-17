@@ -1,0 +1,14 @@
+{
+ "id": "cbor-struct-field-order-is-the-wire",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), test selection lane, fix-hello-1113",
+ "where": "crates/blaze-api/src/lib.rs TestResult, TestsOf; crates/blaze-api/src/borrowed.rs TestResultRef; crates/blaze-api/src/frames/identity.rs",
+ "what": "A field added to TestResult (`not_kept`) was declared after `executable`; the deterministic CBOR codec writes fields in declaration order and requires that order to be the canonical one (shorter key first, then bytewise), so the struct encoded in a non-canonical order and only the identity test over every response would have caught it.",
+ "cost": "a pass of the lane reordering the owned and the borrowed struct by hand, with nothing compiled to say which was wrong",
+ "cause": "the wire order is implied by the Rust declaration order and checked only by a byte-identity test, not where the struct is written",
+ "class": "a persisted or wire layout that a source-level reorder changes silently: the order of declaration is a format decision nobody sees as one",
+ "prevention": "a derive-time (reflection) check that every API struct's fields are declared in canonical CBOR key order, failing to compile with the field named; until then the identity test is the only guard",
+ "workaround": "declare fields by encoded key length, then bytewise, in both the owned and the borrowed struct",
+ "fix": "reordered by hand in the working tree of fix-hello-1113; the compile-time check is not built",
+ "state": "open"
+}

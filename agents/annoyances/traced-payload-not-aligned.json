@@ -1,0 +1,14 @@
+{
+ "id": "traced-payload-not-aligned",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor, host round 2 piece front (blaze-front onto read-addressed blaze-keyed), port-memo-1113",
+ "where": "crates/blaze-keyed/src/record.rs `write_traced` (`out.push_slice(payload)` after the reads and facts); crates/blaze-format/src/lib.rs `HEADER_LEN` = 56, `header` refuses a buffer not at a 16-aligned address",
+ "what": "A Traced record's payload lands at 56 + 64 * (reads + facts), always 8 mod 16, so a blaze-format buffer nested in it (a surface's sections, its image) cannot open in place; blaze-front wrote its own Traced writer to pad it, and moving onto `record::write_read` loses that.",
+ "cost": "an hour of reading blaze-format's writer to find why the surface's sections would not open; the surface task now refuses its own record until record.rs pads",
+ "cause": "write_traced pads each slice to its element's alignment (1 for bytes), not to the alignment a nested record needs; nothing says a payload may hold a record",
+ "class": "a container format that does not promise the alignment its contents need to be read in place (rule outputs-are-records: read in place)",
+ "prevention": "every Traced payload starts at blaze_format::ALIGN, and a test opens a nested record in a payload",
+ "workaround": "none: crates/blaze-front/src/surface.rs checks its own record and refuses with UNALIGNED",
+ "fix": "record.rs write_traced: pad `out.bytes` to `blaze_format::ALIGN` before `push_slice(payload)` (listed in the front lane's report)",
+ "state": "open"
+}

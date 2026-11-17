@@ -25,7 +25,7 @@ la-arena.workspace = true
 triomphe.workspace = true
 inventory.workspace = true
 rustc_apfloat.workspace = true
-blaze-query.workspace = true
+blaze-memo.workspace = true
 
 rustc_abi.workspace = true
 ra-ap-rustc_ast_ir.workspace = true
@@ -58,9 +58,12 @@ syntax-bridge.workspace = true
 [dev-dependencies]
 cov-mark.workspace = true
 expect-test.workspace = true
-hegeltest.workspace = true
 blaze-alloc-count.workspace = true
 blaze-format.workspace = true
+# `field_order::adt_key`: the stable key a field order plan names an ADT by. blaze-items
+# depends on hir-ty, not on this crate, so this edge makes no cycle.
+blaze-items.workspace = true
+blaze-sim.workspace = true
 blaze-units.workspace = true
 hir.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }

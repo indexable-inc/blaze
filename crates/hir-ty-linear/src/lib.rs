@@ -2,7 +2,9 @@
 //! the code that holds one consumes it: moves it into a function that takes it by value (which
 //! destructures it, or is marked `#[blaze::consumes]`), or destructures it in place. A drop at
 //! the end of a scope, on an early exit (`return`, `?`, `break`, `continue`) or of an
-//! overwritten place is an error naming the value and the path, at the line of the drop.
+//! overwritten place is an error naming the value and the path, at the line of the drop, with
+//! a note naming the `#[blaze::consumes]` functions of the value's type ([`names`]). A value
+//! given to `mem::drop` or `mem::forget` is an error of its own ([`generic`]).
 //!
 //! The check reads the MIR lowering builds ([`hir_ty_mir::mir::MirPhase::Built`]), where every
 //! value that may be dropped has a `Drop` at each place it may be, and the move paths and
@@ -51,7 +53,7 @@ pub use ty::{contains_linear, is_holder_adt, is_linear_adt};
 
 /// An error of the check: a linear value dropped implicitly, or a linear type given where
 /// code may drop it.
-#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinearDiagnostic {
     /// What the error is about, as the drop or the call is written.
     pub span: MirSpan,

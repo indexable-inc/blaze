@@ -1,3 +1,7 @@
+// blaze's, not upstream's: harness/toolchain_bump.py (`ABI_ROOT`) writes this line and the three below on each copy.
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::trust(unsafe, reason = "`rustc_index::newtype_index!` (`FieldIdx`, `VariantIdx`) expands to const fns that transmute a `u32` into the index's niche-restricted type after checking it against `MAX`; the `Step` impl of `Size` forwards to `u64`'s unchecked steps only with the `nightly` feature, which blaze never turns on")]
 // tidy-alphabetical-start
 #![cfg_attr(feature = "nightly", allow(internal_features))]
 #![cfg_attr(feature = "nightly", feature(rustc_attrs))]

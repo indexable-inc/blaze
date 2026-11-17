@@ -22,7 +22,8 @@ smallvec.workspace = true
 tracing = { workspace = true, features = ["attributes"] }
 triomphe.workspace = true
 la-arena.workspace = true
-blaze-query.workspace = true
+blaze-memo.workspace = true
+blaze-graph.workspace = true
 
 rustc_type_ir.workspace = true
 
@@ -31,6 +32,7 @@ base-db.workspace = true
 blaze-hashcons.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
+blaze-report.workspace = true
 cfg.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true

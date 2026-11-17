@@ -7,9 +7,9 @@
 use base_db::Db;
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher};
-use blaze_item_hash::identity::identity;
+use blaze_item_hash::identity::early_identity;
 use blaze_items::{ItemId, item_key};
-use blaze_query::db::FromId;
+use blaze_memo::Id as _;
 use hir_def::{
     DefWithBodyId, StaticId,
     signatures::{StaticFlags, StaticSignature},
@@ -30,10 +30,11 @@ use std::alloc::Global;
 use crate::{
     models::tag,
     values::evaluate,
-    walk::{Def, Instance, body_of},
+    walk::{Def, Instance, body_once},
 };
 
-pub(crate) const DOMAIN: &str = "blaze v2 pure script identity 1";
+/// 2: a body by its key made from its text, not the identity made from its lowered HIR.
+pub(crate) const DOMAIN: &str = "blaze v2 pure script identity 2";
 /// The domain of one instance's part of a script's identity.
 pub(crate) const INSTANCE_DOMAIN: &str = "blaze v2 pure script instance 1";
 
@@ -75,10 +76,10 @@ pub(crate) fn content(
 }
 
 /// [`content`] in `env`, the instance's home.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
+    reason = "a tracked query's arguments are its key, which `blaze_memo::tracked` hands the body by value"
 )]
 pub(crate) fn content_in(
     db: &Db,
@@ -91,12 +92,12 @@ pub(crate) fn content_in(
             h.update(&[1]).id(&body(db, func.into())?);
         }
         Def::Body(Body::Closure(id)) => {
-            let loc = InternedClosureId::from_id(id).loc(db);
+            let loc = InternedClosureId::from_gid(id).loc(db);
             h.update(&[2]);
             closure(db, &mut h, loc)?;
         }
         Def::Body(Body::Coroutine(id) | Body::CoroutineByMove(id)) => {
-            let loc = InternedCoroutineId::from_id(id).loc(db);
+            let loc = InternedCoroutineId::from_gid(id).loc(db);
             h.update(&[if matches!(instance.def, Def::Body(Body::Coroutine(_))) { 3 } else { 4 }]);
             closure(db, &mut h, loc)?;
         }
@@ -108,7 +109,8 @@ pub(crate) fn content_in(
     let args = share::args(db, instance.args.as_ref())
         .map_err(|it| format!("its type arguments have no identity: {it}"))?; // alloc: an impure script's reason, once
     h.id(&args);
-    let body = match body_of(db, &env, &instance) {
+    // Read once and dropped as the part is made: the row keeps the part, never the body.
+    let body = match body_once(db, &env, &instance) {
         Some(Ok(body)) => body,
         // alloc: an impure script's reason, once
         Some(Err(error)) => {
@@ -120,7 +122,7 @@ pub(crate) fn content_in(
     let infcx = DbInterner::new_with(db, env.krate).infer_ctxt().build(TypingMode::Codegen);
     let mut facts =
         Facts { db, infcx, env, h, tys: HashSet::new_in(Global), statics: HashSet::new_in(Global) };
-    facts.body(body)?;
+    facts.body(&body)?;
     Ok(facts.h.finish())
 }
 
@@ -137,9 +139,12 @@ fn closure(db: &Db, h: &mut Hasher, loc: InternedClosure<'_>) -> Result<(), Stri
     Ok(())
 }
 
+/// The body's key made from its own text (`blaze_item_hash::identity::early_identity`). What
+/// its paths resolve to is not in it: a callee is an instance of the walk (its own part), a
+/// type is each local's type and a constant or static its value, all hashed after it here.
 fn body(db: &Db, def: DefWithBodyId) -> Result<ContentId, String> {
     // alloc: an impure script's reason, once
-    identity(db, def).map_err(|it| format!("its body has no identity: {}", it.what))
+    early_identity(db, def).map_err(|it| format!("its body has no key: {}", it.what))
 }
 
 /// The facts one monomorphized body reads, streamed into its instance's hash in body order,

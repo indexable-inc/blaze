@@ -1,9 +1,5 @@
-//! Den's model and effort picker in a chat's status bar under its composer (scene/widgets/chat.flecs `hn.ChatPick`,
-//! in hn.ChatPane's `foot.status`), its context meter, and its plan meter (plan.rs).
-//!
-//! The status bar's leading edge shows one quiet control, the model's name, its effort as a level meter (a bar per effort the
-//! model takes, those up to the effort lit) and a small chevron, on a wash under the pointer, its words and lit bars
-//! easing toward the ink. Its tooltip says the model and effort and how to change them; never while its menu is open.
+//! The model and effort selectors live inline on each chat's sidebar row. Their separate hit targets open the
+//! existing model menu or effort slider beside the row; the bottom status area retains context and plan meters.
 //!
 //! The effort moves without opening anything: a sideways two-finger swipe over the control steps it a stop per detent
 //! (harness_native_ui_view::level::Swipe: each `PickFeel::step` points the fingers travel, momentum never steps), with a
@@ -12,7 +8,7 @@
 //! moment after), sent `PickFeel::commit` after the last step (one switch for a swipe through several stops, never two
 //! requests racing), and dropped once the chat says it runs with it.
 //!
-//! A press opens the menu above it (hn.ChatPickMenu, a fixed width): the models (Command-/ opens them alone), then the
+//! A press opens the menu beside it (hn.ChatPickMenu, a fixed width): the models (Command-/ opens them alone), then the
 //! effort as a level slider (prims level.flecs `ui.LevelSlider`: press or drag to a stop, the arrows step it, a swipe
 //! over it steps it as over the control; the menu stays open). The models are searchable (search_menu.flecs's filter,
 //! harness_native_ui_view::search): typing filters them, the first match highlighted, up and down move, Return picks.
@@ -86,7 +82,8 @@ fn maker(cur: Option<&ModelChoice>, model: &str, agent: &str) -> &'static str {
     let is = |pre: &[&str]| names.iter().any(|n| pre.iter().any(|p| n.to_ascii_lowercase().starts_with(p)));
     if is(&["claude", "opus", "sonnet", "haiku", "fable"]) {
         "claude"
-    } else if is(&["gpt", "o1", "o3", "o4", "codex"]) {
+    } else if is(&["gpt", "o1", "o3", "o4", "codex"])
+        || names.iter().any(|name| matches!(name.to_ascii_lowercase().as_str(), "astra" | "sol" | "terra" | "luna")) {
         "codex"
     } else {
         match agent {
@@ -128,9 +125,6 @@ struct Label<'a> {
     cur: Option<&'a ModelChoice>,
     name: &'a str,
     effort: &'a str,
-    words: String,
-    level: Option<(usize, usize)>,
-    tip: String,
 }
 
 impl<'a> Label<'a> {
@@ -140,19 +134,7 @@ impl<'a> Label<'a> {
         let (model, effort) = shown(t, listed);
         let cur = current(t, models, model);
         let name = cur.map_or(model, |c| if c.name.is_empty() { c.id.as_str() } else { c.name.as_str() });
-        // The model's name and its effort's level; an effort with no place among its model's said in words
-        // ("Opus · Medium"), and the model alone when the effort is unknown. The effort's name is the tooltip either way.
-        let level = level(cur, effort);
-        let words = match level {
-            None if !effort.is_empty() => format!("{name} \u{b7} {}", effort_word(effort)),
-            _ => name.to_owned(),
-        };
-        let tip = if effort.is_empty() {
-            "Model and effort  \u{2318}/".to_owned()
-        } else {
-            format!("{name} \u{b7} {} effort  \u{2318}/", effort_word(effort))
-        };
-        Self { models, cur, name, effort, words, level, tip }
+        Self { models, cur, name, effort }
     }
 }
 
@@ -163,6 +145,130 @@ fn effort_word(e: &str) -> String {
     }
     let mut c = e.chars();
     c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
+/// Broad, curated capability families, not benchmark scores. Unknown models remain unranked.
+/// The menu and sidebar use this one policy so their ordering and labels agree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Capability {
+    Light,
+    Balanced,
+    Advanced,
+    Frontier,
+}
+
+impl Capability {
+    fn of(model: &ModelChoice) -> Option<Self> {
+        Self::named([&model.id, &model.model, &model.name])
+    }
+
+    fn named(names: [&str; 3]) -> Option<Self> {
+        let mut words = names.into_iter().flat_map(|s| s.split(['-', ' ', '_']));
+        words.find_map(|word| match word.to_ascii_lowercase().as_str() {
+            // The provider catalogue describes Fable as its most capable model and Opus for everyday complex tasks.
+            "fable" | "astra" => Some(Self::Frontier),
+            "opus" => Some(Self::Advanced),
+            "sol" | "terra" | "sonnet" => Some(Self::Balanced),
+            "haiku" | "luna" => Some(Self::Light),
+            _ => None,
+        })
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            Self::Light => "Light",
+            Self::Balanced => "Balanced",
+            Self::Advanced => "Advanced",
+            Self::Frontier => "Frontier",
+        }
+    }
+}
+
+/// A provider identity plus the same curated capability used for sorting; effort never changes this glyph.
+#[derive(Clone, Copy)]
+enum ModelProvider { Claude, Codex }
+
+#[derive(Clone, Copy)]
+struct ModelIcon {
+    provider: ModelProvider,
+    capability: Option<Capability>,
+}
+
+impl ModelIcon {
+    fn of(model: Option<&ModelChoice>, name: &str, agent: &str) -> Option<Self> {
+        let provider = match maker(model, name, agent) {
+            "claude" => ModelProvider::Claude,
+            "codex" => ModelProvider::Codex,
+            _ => return None,
+        };
+        Some(Self {
+            provider,
+            capability: model.and_then(Capability::of).or_else(|| Capability::named([name, "", ""])),
+        })
+    }
+
+    fn prefab(self) -> &'static str {
+        match (self.provider, self.capability) {
+            (ModelProvider::Claude, Some(Capability::Light)) => "hn.ModelIconClaudeLight",
+            (ModelProvider::Claude, Some(Capability::Balanced)) => "hn.ModelIconClaudeBalanced",
+            (ModelProvider::Claude, Some(Capability::Advanced)) => "hn.ModelIconClaudeAdvanced",
+            (ModelProvider::Claude, Some(Capability::Frontier)) => "hn.ModelIconClaudeFrontier",
+            (ModelProvider::Claude, None) => "hn.ModelIconClaudeUnknown",
+            (ModelProvider::Codex, Some(Capability::Light)) => "hn.ModelIconCodexLight",
+            (ModelProvider::Codex, Some(Capability::Balanced)) => "hn.ModelIconCodexBalanced",
+            (ModelProvider::Codex, Some(Capability::Advanced)) => "hn.ModelIconCodexAdvanced",
+            (ModelProvider::Codex, Some(Capability::Frontier)) => "hn.ModelIconCodexFrontier",
+            (ModelProvider::Codex, None) => "hn.ModelIconCodexUnknown",
+        }
+    }
+}
+
+fn icon(slot: View<'_>, spec: Option<ModelIcon>) {
+    view::for_each_of(slot, spec.map(|s| ("glyph", s.prefab(), ())), |_, (), _| {});
+}
+
+pub(in crate::app) fn model_icon(slot: View<'_>, family: &str, agent: &str) {
+    icon(slot, (!family.is_empty()).then(|| ModelIcon::of(None, family, agent)).flatten());
+}
+
+/// A sidebar's quiet model profile and its full explanation. The transcript and daemon listing resolve exactly as
+/// the model picker does; no effort or capability is invented for a model the agent has not described.
+#[cfg(test)]
+fn sidebar_model(
+    transcript: Option<&Transcript>, kind: &str, kept: &BTreeMap<String, Vec<ModelChoice>>, listed: (&str, &str),
+) -> (String, String, Option<(usize, usize)>) {
+    let empty = Transcript::default();
+    let label = Label::of(transcript.unwrap_or(&empty), kind, kept, listed);
+    sidebar_label(&label, label.effort)
+}
+
+fn sidebar_label(label: &Label<'_>, effort: &str) -> (String, String, Option<(usize, usize)>) {
+    if label.name.is_empty() {
+        return (String::new(), String::new(), None);
+    }
+    let capability = label.cur.and_then(Capability::of).or_else(|| Capability::named([label.name, "", ""]));
+    let (family, version, _) = label.cur.map(row_words).unwrap_or_else(|| {
+        let (family, version) = family_version(label.name);
+        (family, version, String::new())
+    });
+    let mut tip = if label.cur.is_some() && !version.is_empty() { format!("{family} {version}") } else { label.name.to_owned() };
+    if let Some(c) = capability {
+        tip.push_str(&format!("\n{} capability", c.word()));
+    }
+    if !effort.is_empty() {
+        tip.push_str(&format!("\n{} thinking effort", effort_word(effort)));
+    }
+    (family, tip, level(label.cur, effort))
+}
+
+/// Find a chat's inline control by its action rather than coupling menus to the tree's keyed row storage.
+fn sidebar_control(w: WorldRef<'_>, sid: u64, page: Pick) -> Option<View<'_>> {
+    let name = format!("chat:pick:{sid}:{}", if page == Pick::Effort { "effort" } else { "model" });
+    let mut found = None;
+    w.new_query::<&Action>().each_entity(|e, action| {
+        if action.name.as_str() == name { found = Some(View::of(e)); }
+    });
+    found
 }
 
 /// A token count as the meter's popover says it: 950, 46.2k, 258k, 1M.
@@ -177,8 +283,9 @@ pub(super) fn tokens(n: u64) -> String {
 }
 
 /// The ring's arc for share `f` of the window: clockwise from the top of a 12-unit box, radius 5 (a hair at the least, the
-/// whole circle at the most).
+/// whole circle at the most). Zero usage draws no arc, leaving only the empty track.
 fn arc(f: f64) -> String {
+    if f <= 0.0 { return String::new(); }
     let f = f.clamp(0.01, 1.0);
     if f >= 0.999 {
         return "M6 1 A5 5 0 1 1 6 11 A5 5 0 1 1 6 1".to_owned();
@@ -188,12 +295,7 @@ fn arc(f: f64) -> String {
     format!("M6 1 A5 5 0 {} 1 {x:.3} {y:.3}", u8::from(f > 0.5))
 }
 
-fn mix(a: Rgba, b: Rgba, k: f32) -> Rgba {
-    let m = |x: f32, y: f32| x + (y - x) * k;
-    Rgba { r: m(a.r, b.r), g: m(a.g, b.g), b: m(a.b, b.b), a: m(a.a, b.a) }
-}
-
-/// The Fill of scene prefab `path` (`hn.ChatControlInk.rest`); the scene always has it.
+/// The Fill of scene prefab `path`; the scene always has it.
 pub(super) fn fill_of(w: WorldRef<'_>, path: &str) -> Fill {
     view::prefab(w, path).and_then(|p| p.try_cloned::<&Fill>()).unwrap_or_else(|| panic!("scene/widgets/chat.flecs has no Fill on {path}"))
 }
@@ -201,33 +303,6 @@ pub(super) fn fill_of(w: WorldRef<'_>, path: &str) -> Fill {
 pub(super) fn set_fill(v: View<'_>, f: Fill) {
     if v.entity().try_cloned::<&Fill>() != Some(f) {
         v.set(f);
-    }
-}
-
-/// The status bar's quiet controls' inks (hn.ChatControlInk): at rest, under the pointer, and a level's unlit bars.
-pub(super) struct ControlInk {
-    pub rest: Fill,
-    pub hot: Fill,
-    pub off: Fill,
-}
-
-impl ControlInk {
-    pub(super) fn of(w: WorldRef<'_>) -> Self {
-        Self {
-            rest: fill_of(w, "hn.ChatControlInk.rest"),
-            hot: fill_of(w, "hn.ChatControlInk.hot"),
-            off: fill_of(w, "hn.ChatControlInk.off"),
-        }
-    }
-
-    /// The ink of control `v` now: at rest eased toward hot by its hover spring (which starts with it).
-    pub(super) fn now(&self, v: View<'_>) -> Fill {
-        let e = v.entity();
-        if !e.has(HoverAmt::id()) {
-            e.set(HoverAmt::default());
-        }
-        let k = e.try_cloned::<&HoverAmt>().map_or(0.0, |h| h.spring.x.clamp(0.0, 1.0));
-        Fill { dark: mix(self.rest.dark, self.hot.dark, k), light: mix(self.rest.light, self.hot.light, k) }
     }
 }
 
@@ -289,72 +364,65 @@ fn efforts_of(t: &Transcript, kind: &str, kept: &BTreeMap<String, Vec<ModelChoic
     current(t, models_of(t, kind, kept), shown(t, ("", "")).0).map(|m| m.efforts.clone()).unwrap_or_default()
 }
 
+/// Every chat reserves the same context column. Unknown usage is an empty, non-actionable ring, never a reported zero.
+fn sidebar_meter(slot: View<'_>, sid: u64, context: Option<&harness_proto::event::ContextUse>, working: bool) {
+    let w = slot.entity().world();
+    view::for_each_of(slot, [("meter", "hn.SidebarContext", ())], |v, (), _| {
+        meter(v, context.map_or((0, 1), |c| (c.used, c.window)), tone(w, "ink"));
+        breathe(v, working);
+        if context.is_some() {
+            v.add(harness_native_ui_input_api::Pressable::id()).action(&format!("chat:ctx:{sid}"));
+        } else {
+            v.entity().remove(harness_native_ui_input_api::Pressable::id());
+            v.action("");
+        }
+        let tip = context.map_or_else(|| "Context\nUsage has not arrived yet".to_owned(), |c| format!("Context · {:.0}% used\n{} of {} tokens\nClick for breakdown", c.used as f64 * 100.0 / c.window as f64, tokens(c.used), tokens(c.window)));
+        v.set(Tooltip { text: tip.as_str().into() });
+    });
+}
+
 impl App {
-    /// The status bar's picker, context meter and plan meter for chat `sid` (`bar`: hn.ChatPane's foot.status; transcript
-    /// `t`, an agent of kind `kind`, `listed` the daemon's `(model, effort)` for it, `ended` when no agent runs it), and
-    /// its menu while `open`.
+    /// Every visible agent owns its context meter and popover, so inspecting one never depends on pane focus.
+    pub(in crate::app) fn fill_sidebar_context(&self, row: View<'_>, sid: u64, t: &Transcript, kind: &str, working: bool, summary: Option<model::AgentContext>) {
+        let summary = summary.filter(|c| c.window > 0).map(|c| harness_proto::event::ContextUse { used: c.used, window: c.window, ..Default::default() });
+        let rich = t.context.as_ref().filter(|c| c.window > 0);
+        // An unselected chat needs only its current summary. A loaded transcript supplies the breakdown when current.
+        let context = match (rich, summary.as_ref()) {
+            (Some(rich), Some(summary)) if rich.used != summary.used || rich.window != summary.window => Some(summary),
+            (rich, summary) => rich.or(summary),
+        };
+        let Some(slot) = row.part("context") else { return };
+        sidebar_meter(slot, sid, context, working);
+        let (open, menu) = self.chat.borrow().get(&sid).map_or((false, false), |s| (s.ctx_open, s.pick.is_some()));
+        if let Some(pop) = row.part("context_pop") {
+            super::context::fill_context_pop(pop, slot.part("meter"), context, if t.agent.is_empty() { kind } else { &t.agent }, menu || !self.side_open || self.palette.is_some(), open, (self.pointer.x, self.pointer.y));
+        }
+    }
+
+    /// The inline row follows a pending effort immediately, using the same state as the menu and keyboard shortcut.
+    pub(in crate::app) fn sidebar_profile(
+        &self, sid: u64, transcript: Option<&Transcript>, kind: &str, kept: &BTreeMap<String, Vec<ModelChoice>>,
+        listed: (&str, &str), ended: bool,
+    ) -> (String, String, Option<(usize, usize)>) {
+        let empty = Transcript::default();
+        let t = transcript.unwrap_or(&empty);
+        let label = Label::of(t, kind, kept, listed);
+        let effort = self.chat.borrow_mut().entry(sid).or_default().effort.shown(t, ended, label.effort, self.time);
+        sidebar_label(&label, &effort)
+    }
+
+    /// The selected row's model/effort menu, hosted outside tree clipping and anchored to its inline control.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn fill_chat_pick(
         &self, bar: View<'_>, sid: u64, t: &Transcript, kind: &str, open: Option<Pick>, nav: &mut PickNav, eff: &mut EffortState,
-        listed: (&str, &str), ended: bool, ctx_open: bool,
+        listed: (&str, &str), ended: bool,
     ) {
         let w = self.world.world_ref();
         let kept = self.link.agent_models();
         let Label { models, cur, name, effort: said, .. } = Label::of(t, kind, &kept, listed);
         let effort = eff.shown(t, ended, said, self.time);
-        let context = t.context.as_ref().filter(|c| c.window > 0);
-        let (Some(pick), Some(meter_slot)) = (bar.part("pick"), bar.part("meter")) else { return };
-        let ink = ControlInk::of(w);
-        // The model's name and its effort's level; an effort with no place among its model's said in words
-        // ("Opus · Medium"), and the model alone when the effort is unknown. While the effort moves, and a moment after,
-        // its name after the meter.
-        let level = level(cur, &effort);
-        let words = match level {
-            None if !effort.is_empty() => format!("{name} \u{b7} {}", effort_word(&effort)),
-            _ => name.to_owned(),
-        };
-        let feel = crate::look::pick_feel(w);
-        let moving = eff.wish.is_some() || eff.moved.is_some_and(|m| self.time - m < feel.word);
-        let word = (moving && level.is_some()).then(|| effort_word(&effort));
-        // Its tooltip says what it is and how to change it; none while the menu is open (it would cover the menu).
-        let tip = match (open, level.is_some()) {
-            (Some(_), _) => String::new(),
-            (None, true) => format!("{name} \u{b7} {} effort  \u{2318}/\nSwipe sideways here to change the effort", effort_word(&effort)),
-            (None, false) if !effort.is_empty() => format!("{name} \u{b7} {} effort  \u{2318}/", effort_word(&effort)),
-            (None, false) => "Model and effort  \u{2318}/".to_owned(),
-        };
-        let shown = (!name.is_empty()).then_some(("model", "hn.ChatPick", ()));
-        view::for_each_of(pick, shown, |v, (), _| {
-            control(v, &format!("chat:pick:{sid}:all"), &words, &tip, level, &ink, word.as_deref());
-        });
-        // One ring: how full the context is, breathing while the agent works (the composer's one sign of work: Return sends,
-        // Escape stops). Before the first turn says how full, a working agent's ring is an empty track.
-        let working = t.busy && !ended;
-        let shown = (context.is_some() || working).then_some(("context", "hn.ChatContext", ()));
-        view::for_each_of(meter_slot, shown, |v, (), _| {
-            meter(v, context.map_or((0, 1), |c| (c.used, c.window)), ink.hot);
-            breathe(v, working);
-            // A press opens the popover to the whole account (context.rs), another closes it.
-            let action = Action { name: format!("chat:ctx:{sid}").as_str().into() };
-            if v.entity().try_cloned::<&Action>() != Some(action.clone()) {
-                v.entity().set(action);
-            }
-        });
-        let agent = if t.agent.is_empty() { kind } else { t.agent.as_str() };
-        // Under the pointer, the meter's popover (context.rs), anchored to the ring; never over the open menu.
-        if let Some(pop) = bar.part("pop") {
-            super::context::fill_context_pop(
-                pop,
-                meter_slot.part("context"),
-                context,
-                agent,
-                open.is_some(),
-                ctx_open,
-                (self.pointer.x, self.pointer.y),
-            );
-        }
-        // Open, the menu floats above the control, its leading edge on the control's.
-        let trigger = open.and_then(|_| pick.part("model"));
+        // The menu belongs to the selected sidebar row, beside the model or effort control that opened it.
+        let trigger = open.and_then(|page| sidebar_control(w, sid, page));
         let Some(menu) = bar.part("menu") else { return };
         let page = open.filter(|_| trigger.is_some());
         view::for_each_of(menu, page.map(|_| ("plate", "hn.ChatPickMenu", ())), |_, (), _| {});
@@ -381,6 +449,17 @@ impl App {
     /// Open chat `sid`'s menu `page`, or close it when that one is open (a press on its control again); any other chat's
     /// closes.
     pub(in crate::app) fn chat_pick_toggle(&mut self, sid: u64, page: Pick) {
+        if self.external_session(sid).is_some() {
+            return;
+        }
+        self.genui_blur();
+        let w = self.world.world_ref();
+        if let Some(e) = self.entity_of(sid) {
+            for parent in std::iter::successors(w.entity_from_id(e).parent(), |p| p.parent()).take(64) {
+                if parent.has(model::Device::id()) { model::set_folded(w, *parent.id(), false); break; }
+            }
+        }
+        self.side_open = true;
         let mut states = self.chat.borrow_mut();
         for (s, st) in states.iter_mut() {
             if *s != sid {
@@ -398,7 +477,12 @@ impl App {
     pub(in crate::app) fn chat_pick_action(&mut self, rest: &str) {
         let Some((sid, page)) = rest.split_once(':') else { return };
         if let (Ok(sid), Some(page)) = (sid.parse(), Pick::parse(page)) {
-            self.chat_pick_toggle(sid, page);
+            if self.external_session(sid).is_some() { return; }
+            if let Some(entity) = self.entity_of(sid) {
+                self.select(Some(entity));
+                self.tree_focus = false;
+                self.chat_pick_toggle(sid, page);
+            }
         }
     }
 
@@ -420,6 +504,9 @@ impl App {
     pub(in crate::app) fn chat_pick_set(&mut self, rest: &str) {
         let Some((sid, rest)) = rest.split_once(':') else { return };
         let Ok(sid) = sid.parse::<u64>() else { return };
+        if self.external_session(sid).is_some() {
+            return;
+        }
         let (model, effort) = match rest.split_once(':') {
             Some(("model", m)) => (Some(m.to_owned()), None),
             Some(("effort", e)) => (None, Some(e.to_owned())),
@@ -438,6 +525,9 @@ impl App {
     pub(in crate::app) fn chat_pick_spawn(&mut self, rest: &str) {
         let mut it = rest.splitn(3, ':');
         let (Some(sid), Some(kind), Some(m)) = (it.next().and_then(|s| s.parse::<u64>().ok()), it.next(), it.next()) else { return };
+        if self.external_session(sid).is_some() {
+            return;
+        }
         let (kind, m) = (kind.to_owned(), m.to_owned());
         self.chat_pick_close();
         let e = self.entity_of(sid);
@@ -570,6 +660,11 @@ impl App {
         let mut due = Vec::new(); // alloc: the wishes due this frame, rarely more than one
         let mut waiting = false;
         for (sid, st) in self.chat.borrow_mut().iter_mut() {
+            if self.external_session(*sid).is_some() {
+                st.effort.wish = None;
+                st.effort.moved = None;
+                continue;
+            }
             if let Some(w) = st.effort.wish.as_mut().filter(|w| !w.sent) {
                 if !w.held && now - w.at >= feel.commit {
                     w.sent = true;
@@ -581,6 +676,9 @@ impl App {
             waiting |= st.effort.wish.is_some() || st.effort.moved.is_some_and(|m| now - m < feel.word + 0.1);
         }
         for (sid, e) in due {
+            if self.external_session(sid).is_some() {
+                continue;
+            }
             self.link.chat_choose(sid, None, Some(e.clone()));
             self.remember_chat_choice(sid, None, Some(e));
         }
@@ -592,6 +690,9 @@ impl App {
     /// Chat `sid`'s effort moved to `effort` here (shown at once, sent once let go and rested): `held` while a drag or a
     /// swipe goes on, `pulse` for a trackpad tick when it changes. Whether it changed.
     fn chat_effort_to(&mut self, sid: u64, effort: &str, held: bool, pulse: bool) -> bool {
+        if self.external_session(sid).is_some() {
+            return false;
+        }
         let now = self.time;
         let changed = {
             let mut states = self.chat.borrow_mut();
@@ -616,6 +717,9 @@ impl App {
     /// Chat `sid`'s effort `by` stops along its model's efforts from the one shown (held at the ends, or `round` past
     /// them). The efforts are its model's; None when it has none (or is not in the list), else whether it moved.
     fn chat_effort_step(&mut self, sid: u64, by: i32, round: bool, held: bool, pulse: bool) -> Option<bool> {
+        if self.external_session(sid).is_some() {
+            return None;
+        }
         let (efforts, shown) = {
             let chats = self.chats.borrow();
             let t = chats.get(&sid)?;
@@ -691,16 +795,12 @@ impl App {
             over(w.entity_from_id(s)).then_some(*sid)
         });
         slider.or_else(|| {
-            self.panes().into_iter().find_map(|p| {
-                let o = model::shows(w, p)?;
-                if model::pane_kind(o) != model::PaneKind::Chat {
-                    return None;
-                }
-                if self.focused_pane() != Some(p) {
-                    return None;
-                }
-                let control = View::of(w.entity_from_id(self.ids.side_chat)).part("pick")?.part("model")?;
-                over(control.entity()).then(|| self.session_of(*o.id())).flatten()
+            let hovered = w.lookup(APP).target(Hovered::id(), 0)?;
+            std::iter::successors(Some(hovered), |e| e.parent()).take(64).find_map(|e| {
+                let action = e.try_cloned::<&Action>()?;
+                let mut parts = action.name.as_str().strip_prefix("chat:pick:")?.split(':');
+                let sid = parts.next()?.parse().ok()?;
+                (parts.next()? == "effort").then_some(sid)
             })
         })
     }
@@ -783,32 +883,9 @@ impl App {
     }
 }
 
-/// The picker's control: its action, its tooltip (none: empty), its words, its effort's level (`level`: the effort's
-/// place among how many) and, while the effort moves, its name after the meter (`word`); in the rest ink eased toward
-/// the hot one by its hover spring, a level's unlit bars faint.
-fn control(v: View<'_>, action: &str, words: &str, tip: &str, level: Option<(usize, usize)>, ink: &ControlInk, word: Option<&str>) {
-    v.action(action);
-    if v.entity().try_cloned::<&Tooltip>().is_none_or(|t| t.text.as_str() != tip) {
-        v.set(Tooltip { text: tip.into() });
-    }
-    let now = ink.now(v);
-    if let Some(p) = v.part("label") {
-        p.text(words);
-        set_fill(p, now);
-    }
-    if let Some(m) = v.part("effort") {
-        effort_meter(m, level, now, ink.off);
-    }
-    if let Some(slot) = v.part("word") {
-        view::for_each_of(slot, word.map(|w| ("word", "hn.ChatPickWord", w)), |p, w, _| {
-            p.text(w);
-        });
-    }
-}
-
 /// The effort's level meter (hn.ChatEffort): a bar (hn.ChatEffortBar) per effort of `n`, their heights rising evenly
 /// from the bar's least to its height, those up to `at` in `lit`, the rest in `off`; with no level, no bars and no room.
-fn effort_meter(m: View<'_>, level: Option<(usize, usize)>, lit: Fill, off: Fill) {
+pub(in crate::app) fn effort_meter(m: View<'_>, level: Option<(usize, usize)>, lit: Fill, off: Fill) {
     let w = m.entity().world();
     let bar = view::prefab(w, "hn.ChatEffortBar")
         .and_then(|b| b.try_cloned::<&Size>())
@@ -905,6 +982,7 @@ struct Choice {
     detail: String,
     on: bool,
     action: String,
+    icon: Option<ModelIcon>,
 }
 
 /// What the menu is built from: chat `sid`'s own models (`own`, of agent kind `kind`), every kind's kept lists, the
@@ -972,6 +1050,10 @@ fn family_version(name: &str) -> (String, String) {
             _ if version.is_empty() && t.starts_with(|c: char| c.is_ascii_digit()) && t.chars().all(|c| c.is_ascii_digit() || c == '.') => {
                 t.clone_into(&mut version);
             }
+            _ if !version.is_empty() && t.chars().all(|c| c.is_ascii_digit()) => {
+                version.push('.');
+                version.push_str(t);
+            }
             _ if t.chars().any(|c| c.is_ascii_digit()) => words.push(t.to_owned()),
             _ => {
                 let mut c = t.chars();
@@ -987,6 +1069,15 @@ fn family_version(name: &str) -> (String, String) {
 fn newer(a: &str, b: &str) -> bool {
     let parts = |v: &str| v.split('.').map(|p| p.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>();
     !a.is_empty() && parts(a) > parts(b)
+}
+
+/// Visible generations first, then older ones. Within each, strongest known capability tier first; equal and
+/// unranked models retain the provider's order. The running older model stays among visible generations.
+fn model_order(models: &[ModelChoice], words: &[(String, String, String)], running: Option<&str>) -> Vec<usize> {
+    let older = |i: usize| words.iter().any(|(f, v, _)| *f == words[i].0 && newer(v, &words[i].1));
+    let mut order: Vec<usize> = (0..models.len()).collect(); // alloc: indices of one open menu's models
+    order.sort_by_cached_key(|&i| (older(i) && running != Some(models[i].id.as_str()), std::cmp::Reverse(Capability::of(&models[i]))));
+    order
 }
 
 /// The menu's models (hn.ChatPickModels `list`): every kind's under its head led by its maker's mark, the chat's own
@@ -1018,12 +1109,18 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
         let fold = !searching && !nav.older.iter().any(|k| k == kind);
         let folded: Vec<bool> = (0..models.len()).map(|i| fold && older(i) && !runs(&models[i])).collect(); // alloc: per model
         let hidden = folded.iter().filter(|f| **f).count();
-        // The newest first, then (opened) the older ones, each kept in the order the agent lists them.
-        let order: Vec<usize> = (0..models.len()).filter(|&i| !older(i) || runs(&models[i])).chain((0..models.len()).filter(|&i| older(i) && !runs(&models[i]))).collect(); // alloc: per model
+        // Newest generations first, strongest tier first; provider order breaks ties. The fold and selected tick
+        // still follow model identity, so sorting never changes which model the chat runs.
+        let order = model_order(models, &words, c.cur.filter(|_| own).map(|m| m.id.as_str()));
         let shown: Vec<(&ModelChoice, &(String, String, String))> = order.iter().filter(|&&i| !folded[i]).map(|&i| (&models[i], &words[i])).collect(); // alloc: per model
         rows.extend(shown.into_iter().map(|(m, (label, meta, about))| {
             let (label, meta, about) = (label.clone(), meta.clone(), about.clone());
             let on = runs(m);
+            let about = match Capability::of(m) {
+                Some(tier) if about.is_empty() => format!("{} capability tier", tier.word()),
+                Some(tier) => format!("{} \u{b7} {about}", tier.word()),
+                None => about,
+            };
             let detail = if own { about } else { format!("Starts a new {title} chat. {about}").trim_end().to_owned() };
             if on {
                 own_detail.clone_from(&detail);
@@ -1035,6 +1132,7 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
                     meta,
                     detail,
                     on,
+                    icon: ModelIcon::of(Some(m), &m.model, kind),
                     action: if own {
                         format!("chat:set:{}:model:{}", c.sid, m.id)
                     } else {
@@ -1051,6 +1149,7 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
                     meta: String::new(),
                     detail: "Earlier versions of these models.".to_owned(),
                     on: false,
+                    icon: None,
                     action: format!("chat:older:{}:{kind}", c.sid),
                 },
             });
@@ -1125,6 +1224,9 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
         Entry::Item { data: c, .. } => {
             harness_native_ui_view::menu::light(v.entity(), hot == Some(i));
             v.action(&c.action);
+            if let Some(lead) = v.part("lead") {
+                view::for_each_of(lead, c.icon.map(|spec| ("model", "hn.ModelIconSlot", spec)), |slot, spec, _| icon(slot, Some(spec)));
+            }
             if let Some(l) = v.part("label") {
                 l.text(&c.label);
             }
@@ -1188,6 +1290,57 @@ fn effort_section(slot: View<'_>, c: &MenuCtx<'_>, page: Pick, nav: &mut PickNav
 mod tests {
     use super::*;
 
+    /// The invariant: missing, zero and reported context occupy identical columns; zero never paints a usage arc.
+    /// Activity and optional effort must not push the model controls away from the row's trailing edge.
+    #[test]
+    fn sidebar_columns_stay_aligned_before_and_after_usage_arrives() {
+        use harness_native_ui_layout_api::{Padding, Viewport};
+        let world = super::super::scene_world().unwrap();
+        let w = world.world_ref();
+        harness_native_ui_layout::install(w);
+        world.set(Viewport { w: 360.0, h: 200.0 });
+        let list = View::root(w, "ui.Column");
+        let zero = harness_proto::event::ContextUse { used: 0, window: 200000, ..Default::default() };
+        let used = harness_proto::event::ContextUse { used: 24000, window: 200000, ..Default::default() };
+        let rows: Vec<_> = [None, Some(&zero), Some(&used)].into_iter().enumerate().map(|(i, context)| {
+            let row = list.child("hn.ObjRow");
+            row.props("hn.ObjRow", &[("name", Prop::Str("New chat")), ("profile", Prop::Str("Fable")), ("meta", Prop::Str(if i == 2 { "Editing code" } else { "" }))]);
+            let profile = row.part("profile").unwrap();
+            sidebar_meter(profile.part("context").unwrap(), i as u64, context, i == 2);
+            let meter = profile.part("context").unwrap().part("meter").unwrap();
+            let path = meter.part("ring").unwrap().part("arc").unwrap().entity().try_cloned::<&Vector>().unwrap();
+            assert_eq!(path.d.as_str().is_empty(), i != 2);
+            assert_eq!(meter.entity().has(harness_native_ui_input_api::Pressable::id()), context.is_some());
+            let tip = meter.entity().try_cloned::<&Tooltip>().unwrap();
+            assert!(tip.text.as_str().contains(match i { 0 => "not arrived", 1 => "0% used", _ => "12% used" }));
+            let effort = profile.part("effort").unwrap();
+            view::for_each_of(effort, (i != 0).then_some(("meter", "hn.ChatEffort", ())), |v, (), _| {
+                effort_meter(v, Some((i, if i == 1 { 4 } else { 7 })), tone(w, "ink"), tone(w, "ink_faint"));
+            });
+            row
+        }).collect(); // alloc: the three cases in this headless layout check
+        for _ in 0..4 { world.progress_time(1.0 / 60.0); }
+        let laid = |v: View<'_>| v.entity().try_cloned::<&Laid>().unwrap();
+        let parts = |row: View<'_>| {
+            let profile = row.part("profile").unwrap();
+            [laid(profile.part("label").unwrap()).x, laid(profile.part("effort").unwrap()).x, laid(profile.part("context").unwrap()).x]
+        };
+        assert_eq!(parts(rows[0]), parts(rows[1]));
+        assert_eq!(parts(rows[1]), parts(rows[2]));
+        let row = rows[0];
+        let pad = row.entity().try_cloned::<&Padding>().unwrap();
+        let kind = row.part("kind_icon").unwrap();
+        assert_eq!(laid(row.part("name").unwrap()).x, laid(row).x + pad.l + laid(kind).w, "empty optional slots add no spacing");
+        assert_eq!(laid(row).h, 28.0, "tabs remain one line");
+        // In-place data updates preserve the same target and clear a previous nonzero arc.
+        let profile = rows[2].part("profile").unwrap();
+        let slot = profile.part("context").unwrap();
+        let id = slot.part("meter").unwrap().id();
+        sidebar_meter(slot, 2, Some(&zero), false);
+        assert_eq!(slot.part("meter").unwrap().id(), id);
+        assert!(slot.part("meter").unwrap().part("ring").unwrap().part("arc").unwrap().entity().try_cloned::<&Vector>().unwrap().d.as_str().is_empty());
+    }
+
     #[test]
     fn a_models_line_splits_into_its_version_and_the_rest() {
         let s = |n: &str, a: &str| split_about(n, a);
@@ -1205,6 +1358,7 @@ mod tests {
         assert_eq!(family_version("GPT-6.1-Sol"), ("Sol".into(), "6.1".into()));
         assert_eq!(family_version("GPT-6.1 Terra"), ("Terra".into(), "6.1".into()));
         assert_eq!(family_version("GPT-6-Astra"), ("Astra".into(), "6".into()));
+        assert_eq!(family_version("claude-fable-5-2"), ("Fable".into(), "5.2".into()));
         assert_eq!(family_version("gpt-5.6"), ("GPT".into(), "5.6".into()));
         assert_eq!(family_version("o4-mini"), ("o4 Mini".into(), String::new()));
         let m = |name: &str, about: &str| ModelChoice { id: name.to_ascii_lowercase(), name: name.into(), about: about.into(), ..ModelChoice::default() };
@@ -1212,6 +1366,20 @@ mod tests {
         assert_eq!(row_words(&m("GPT-6-Luna", "Fast and affordable model for easier tasks.")), ("Luna".into(), "6".into(), "Fast and affordable model for easier tasks.".into()));
         assert_eq!(row_words(&m("Opus", "Opus 5.5 · Best for everyday, complex tasks")), ("Opus".into(), "5.5".into(), "Best for everyday, complex tasks".into()));
         assert!(newer("6.1", "6") && newer("6", "5.6") && !newer("5.6", "6") && !newer("", "6") && !newer("6", "6"));
+    }
+
+    /// Sorting by capability keeps provider ties and the older-generation fold; the running old model stays visible.
+    #[test]
+    fn capable_models_lead_without_losing_old_or_unknown_models() {
+        let models: Vec<ModelChoice> = ["GPT-6.1-Sol", "GPT-6-Luna", "GPT-6-Astra", "GPT-6.1-Terra", "Unknown-A", "GPT-6-Sol", "Unknown-B"]
+            .into_iter().map(|name| ModelChoice { id: name.to_owned(), name: name.to_owned(), ..ModelChoice::default() }).collect();
+        let words: Vec<_> = models.iter().map(row_words).collect();
+        assert_eq!(model_order(&models, &words, None), [2, 0, 3, 1, 4, 6, 5]);
+        assert_eq!(model_order(&models, &words, Some("GPT-6-Sol")), [2, 0, 3, 5, 1, 4, 6]);
+        assert_eq!(Capability::of(&models[4]), None, "an unfamiliar family has no guessed capability");
+        let claude: Vec<ModelChoice> = ["Fable 5.2", "Haiku 5.5", "Opus 5.5", "Sonnet 5.5"]
+            .into_iter().map(|name| ModelChoice { id: name.to_owned(), name: name.to_owned(), ..ModelChoice::default() }).collect();
+        assert_eq!(model_order(&claude, &claude.iter().map(row_words).collect::<Vec<_>>(), None), [0, 2, 3, 1]);
     }
 
     use harness_proto::event::{Body, Event};
@@ -1222,6 +1390,23 @@ mod tests {
         BTreeMap::from([("claude".to_owned(), vec![opus])])
     }
 
+    /// A sidebar's profile follows the same transcript/daemon choice as its picker, including a new chat's seed.
+    #[test]
+    fn sidebar_model_profile_uses_the_chats_actual_choice() {
+        let kept = kept();
+        let mut t = Transcript::default();
+        t.start_on(Some("opus"), Some("high"));
+        let (words, tip, meter) = sidebar_model(Some(&t), "claude", &kept, ("", ""));
+        assert_eq!(words, "Opus");
+        assert_eq!(meter, Some((2, 4)));
+        assert!(tip.starts_with("Opus 5.5\n") && tip.contains("High thinking effort"));
+        assert_eq!(sidebar_model(None, "claude", &kept, ("", "")), (String::new(), String::new(), None));
+        let (words, tip, meter) = sidebar_model(None, "codex", &kept, ("unknown-model", ""));
+        assert_eq!(meter, None);
+        assert_eq!(words, "Unknown Model");
+        assert_eq!(tip, "unknown-model", "unknown capability and effort are left absent");
+    }
+
     /// A cmd+N chat's control says the remembered model and effort from its first frame (its transcript seeded, before
     /// the agent or the daemon's listing say anything), and the same once its agent says it runs them and lists its
     /// models: never blank, never the effort in words, the meter's bars there from the start. Without the seed the first
@@ -1229,14 +1414,14 @@ mod tests {
     #[test]
     fn a_new_chat_shows_its_remembered_choice_from_its_first_frame() {
         let kept = kept();
-        let said = |l: &Label<'_>| (l.words.clone(), l.level, l.tip.clone());
+        let said = |l: &Label<'_>| (l.name.to_owned(), level(l.cur, l.effort));
         let unseeded = Transcript::default();
         assert_eq!(Label::of(&unseeded, "claude", &kept, ("", "")).name, "", "the cause: nothing names a model yet");
 
         let mut t = Transcript::default();
         t.start_on(Some("opus"), Some("high"));
         let first = said(&Label::of(&t, "claude", &kept, ("", "")));
-        assert_eq!(first, ("Opus 5.5".to_owned(), Some((2, 4)), "Opus 5.5 \u{b7} High effort  \u{2318}/".to_owned()));
+        assert_eq!(first, ("Opus 5.5".to_owned(), Some((2, 4))));
 
         // The agent is up: its `session` names the model as it runs; then the daemon's listing; then its own list.
         let ev = |body: Body| Event { ts: 1, body };
@@ -1250,6 +1435,6 @@ mod tests {
         let mut c = Transcript::default();
         c.apply(&ev(Body::Choice { model: Some("opus".into()), effort: Some("low".into()) }));
         c.start_on(Some("opus"), Some("high"));
-        assert_eq!(Label::of(&c, "claude", &kept, ("", "")).level, Some((0, 4)));
+        assert_eq!(said(&Label::of(&c, "claude", &kept, ("", ""))).1, Some((0, 4)));
     }
 }

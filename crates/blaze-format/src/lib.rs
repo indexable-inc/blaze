@@ -19,6 +19,8 @@
 //! Spans are never in a record that is hashed: they sit in a side table ([`Spans`]), and a
 //! record names one by [`SpanRef`].
 
+#![feature(allocator_api)]
+
 pub mod cursor;
 pub mod hex;
 pub mod leb;
@@ -28,6 +30,7 @@ mod schema;
 pub mod tiers;
 
 use std::{
+    alloc::{Allocator, Global},
     fmt,
     marker::PhantomData,
     mem::{align_of, offset_of, size_of},
@@ -87,60 +90,6 @@ pub unsafe trait Record: Copy + 'static {
     fn columns(bytes: &[u8], buffer: &[u8], out: &mut Vec<WordTable>) {
         let _ = (bytes, buffer, out);
     }
-    /// Whether a [`Sym`] is in the value's own bytes, not behind a [`Rel`] or [`Slice`]: so it
-    /// never refers back to a type that holds a slice of itself, and [`Record::SYMBOLS`] of
-    /// such a slice can read it.
-    const SYMBOLS_INLINE: bool = false;
-    /// Whether a [`Sym`] may be reachable from a value (`true` when it may, `false` only when
-    /// it can't): [`Record::symbols`] walks only what may hold one.
-    const SYMBOLS: bool = false;
-    /// Pushes the ID of each [`Sym`] reachable from the value at `bytes`, which
-    /// [`Record::check`] accepted: what the image's GC keeps (`intern::Live`).
-    fn symbols(bytes: &[u8], buffer: &[u8], out: &mut Vec<u32>) {
-        let _ = (bytes, buffer, out);
-    }
-}
-
-/// A symbol in a persisted value: its ID in the image's symbol table (`intern::Symbol::id`),
-/// which means the same in every process that restores the image. A value names a symbol this
-/// way, not by its text, so it is read in place with no re-interning and the image's GC finds
-/// it through [`Record::symbols`].
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default)]
-#[repr(transparent)]
-pub struct Sym(pub u32);
-
-// SAFETY: a `u32`: no padding, every bit pattern a value.
-unsafe impl Record for Sym {
-    const SCHEMA: SchemaHash = schema("Sym");
-    const PLAIN: bool = true;
-    const SYMBOLS_INLINE: bool = true;
-    const SYMBOLS: bool = true;
-    fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
-        fits::<Sym>(bytes, buffer)
-    }
-    fn symbols(bytes: &[u8], _: &[u8], out: &mut Vec<u32>) {
-        out.push(u32::from_le_bytes(bytes[..4].try_into().expect("a Sym is 4 bytes")));
-    }
-}
-
-/// [`Record::symbols`] of the field of type `F` at `offset` in `record`, a checked record.
-pub fn field_symbols<F: Record>(record: &[u8], offset: usize, buffer: &[u8], out: &mut Vec<u32>) {
-    if F::SYMBOLS {
-        F::symbols(&record[offset..offset + size_of::<F>()], buffer, out);
-    }
-}
-
-/// Pushes every [`Sym`] the buffer's root record `R` reaches, the buffer checked as
-/// [`open_as`] checks it: what an owner of persisted values marks live before an image is
-/// written.
-pub fn symbols_of<R: Record>(
-    buffer: &[u8],
-    schema: SchemaHash,
-    out: &mut Vec<u32>,
-) -> Result<(), FormatError> {
-    let root = open_as::<R>(buffer, schema)?;
-    R::symbols(bytes_of(root), buffer, out);
-    Ok(())
 }
 
 /// The items of a [`Slice`] as a table of `u32` words: `rows` rows of `stride` words from
@@ -294,11 +243,6 @@ unsafe impl<T: Record, const N: usize> Record for [T; N] {
     }
     fn columns(bytes: &[u8], buffer: &[u8], out: &mut Vec<WordTable>) {
         (0..N).for_each(|i| field_columns::<T>(bytes, i * size_of::<T>(), buffer, out));
-    }
-    const SYMBOLS_INLINE: bool = T::SYMBOLS_INLINE;
-    const SYMBOLS: bool = T::SYMBOLS;
-    fn symbols(bytes: &[u8], buffer: &[u8], out: &mut Vec<u32>) {
-        (0..N).for_each(|i| field_symbols::<T>(bytes, i * size_of::<T>(), buffer, out));
     }
 }
 
@@ -475,14 +419,6 @@ unsafe impl<T: Record> Record for Rel<T> {
             T::columns(bytes_of(target), buffer, out);
         }
     }
-    // As for `COLUMNS`: neither constant of `T` read here refers back to a type holding this.
-    const SYMBOLS: bool = !T::PLAIN || T::SYMBOLS_INLINE;
-    fn symbols(bytes: &[u8], buffer: &[u8], out: &mut Vec<u32>) {
-        let rel = raw::in_place::<Rel<T>>(bytes, buffer).expect("a checked Rel");
-        if let Some(target) = rel.get(buffer) {
-            T::symbols(bytes_of(target), buffer, out);
-        }
-    }
 }
 
 // SAFETY: an `i32`, a `u32` and a zero-sized marker: every bit pattern is a `Slice`; `check`
@@ -509,11 +445,6 @@ unsafe impl<T: Record> Record for Slice<T> {
         if !T::PLAIN {
             items.iter().for_each(|item| T::columns(bytes_of(item), buffer, out));
         }
-    }
-    const SYMBOLS: bool = !T::PLAIN || T::SYMBOLS_INLINE;
-    fn symbols(bytes: &[u8], buffer: &[u8], out: &mut Vec<u32>) {
-        let slice = raw::in_place::<Slice<T>>(bytes, buffer).expect("a checked Slice");
-        slice.get(buffer).iter().for_each(|item| T::symbols(bytes_of(item), buffer, out));
     }
 }
 
@@ -592,25 +523,6 @@ macro_rules! record {
             ) {
                 $(
                     $crate::field_columns::<$ty>(
-                        bytes,
-                        ::core::mem::offset_of!($name, $field),
-                        buffer,
-                        out,
-                    );
-                )*
-                let _ = (bytes, buffer, out);
-            }
-
-            const SYMBOLS_INLINE: bool = false $( || <$ty as $crate::Record>::SYMBOLS_INLINE )*;
-            const SYMBOLS: bool = false $( || <$ty as $crate::Record>::SYMBOLS )*;
-
-            fn symbols(
-                bytes: &[u8],
-                buffer: &[u8],
-                out: &mut ::std::vec::Vec<u32>,
-            ) {
-                $(
-                    $crate::field_symbols::<$ty>(
                         bytes,
                         ::core::mem::offset_of!($name, $field),
                         buffer,
@@ -769,9 +681,9 @@ fn verify(buffer: &[u8], key: ContentId) -> Result<(), FormatError> {
 
 /// Appends records to one buffer, aligned, and gives each a place for the [`Rel`]s of others.
 /// Padding between records is zeros, so equal values written in the same order are equal
-/// bytes.
-pub struct Writer {
-    pub bytes: Vec<u8>,
+/// bytes. The buffer is in `A`, the caller's allocator ([`Writer::new_in`]).
+pub struct Writer<A: Allocator = Global> {
+    pub bytes: Vec<u8, A>,
 }
 
 fn align_up(at: usize, align: usize) -> usize {
@@ -781,13 +693,20 @@ fn align_up(at: usize, align: usize) -> usize {
 
 impl Writer {
     pub fn new(schema: SchemaHash) -> Writer {
-        Writer::with_buffer(schema, Vec::with_capacity(4096))
+        Writer::with_buffer(schema, Vec::with_capacity_in(4096, Global))
+    }
+}
+
+impl<A: Allocator> Writer<A> {
+    /// [`Writer::new`] with its buffer in `alloc`: [`Writer::finish`] hands back a `Vec<u8, A>`.
+    pub fn new_in(schema: SchemaHash, alloc: A) -> Writer<A> {
+        Writer::with_buffer(schema, Vec::with_capacity_in(4096, alloc))
     }
 
     /// [`Writer::new`] over `bytes`, cleared and keeping its capacity: a caller that writes
     /// many values hands each [`Writer::finish`]'s buffer back, and once it has grown a write
     /// allocates nothing.
-    pub fn with_buffer(schema: SchemaHash, mut bytes: Vec<u8>) -> Writer {
+    pub fn with_buffer(schema: SchemaHash, mut bytes: Vec<u8, A>) -> Writer<A> {
         bytes.clear();
         bytes.extend_from_slice(&MAGIC);
         bytes.extend_from_slice(&schema.0.0);
@@ -819,13 +738,22 @@ impl Writer {
         at
     }
 
+    /// Where `bytes` were written, at a multiple of [`ALIGN`]: a buffer of this format held
+    /// inside another (a record's payload) is then opened where it is, with no copy, since
+    /// [`open`] takes only a buffer aligned to [`ALIGN`].
+    pub fn push_buffer(&mut self, bytes: &[u8]) -> u64 {
+        let at = self.pad(ALIGN);
+        self.bytes.extend_from_slice(bytes);
+        at
+    }
+
     /// Where `text` was written, for a [`Str`] of `text.len()` bytes.
     pub fn push_str(&mut self, text: &str) -> u64 {
         self.push_slice(text.as_bytes())
     }
 
     /// The buffer, with `root` as its root record.
-    pub fn finish(mut self, root: u64) -> Vec<u8> {
+    pub fn finish(mut self, root: u64) -> Vec<u8, A> {
         assert!(
             root >= HEADER_LEN as u64 && root < self.bytes.len() as u64,
             "the root is not a record of this buffer"
@@ -850,15 +778,6 @@ pub trait Persist: Send + Sync + 'static {
     /// are read through [`read_verified`], so a `read` may rely on the buffer being one some
     /// blaze wrote whole.
     fn read(buffer: &[u8]) -> Result<Self::Ref<'_>, FormatError>;
-    /// Pushes the ID of every [`Sym`] the value in `buffer` names: what its owner marks live
-    /// before an image is written, so the image's GC keeps those symbols. A value that names
-    /// none (it holds no `Sym`, or keeps names as text) is right with this default; one whose
-    /// root record `R` reaches a `Sym` returns [`symbols_of::<R>`](symbols_of) of its buffer,
-    /// or the next process panics reading a symbol the GC freed.
-    fn symbols(buffer: &[u8], out: &mut Vec<u32>) -> Result<(), FormatError> {
-        let _ = (buffer, out);
-        Ok(())
-    }
 }
 
 /// `value` as a buffer of its own.

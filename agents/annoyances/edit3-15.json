@@ -1,0 +1,11 @@
+{
+ "id": "edit3-15",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+ "where": "blaze: an edit back to a source built before",
+ "what": "An edit that sets the source to a text the daemon has built before is not the patch path: its link is replayed from what is kept and its executable placed by a clone or a derive of the store's file. `blaze build -q` of such an edit takes 80 to 127 ms where an edit to a new text takes 55 (this lane's build, hello world), and until 241ccec6b2 its clone was not prewarmed either. `/tmp/blaze-h2h2.py` writes the same fifteen numbers (300 to 314) every run, so from its second run in a home its `body edit + run` row measures this path, not a body edit's.",
+ "cost": "the lane's row moved between 50 and 97 ms from run to run until the two paths were told apart",
+ "cause": "the script's edits repeat; and the replay of a kept link is slower than making the link again",
+ "workaround": "write numbers the daemon has not seen (this lane's `h2h2.py` takes a start, `inter.py` counts on)",
+ "state": "open: the replayed path's 80 ms is the daemon's (not looked into in this lane); the shared script should count on from where the file is"
+}

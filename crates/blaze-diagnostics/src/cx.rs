@@ -11,7 +11,7 @@ use std::alloc::Global;
     reason = "OnceCell: memos of one check, dropped with it, not global state"
 )]
 use std::{
-    cell::{OnceCell, RefCell},
+    cell::{Cell, OnceCell, RefCell},
     collections::HashMap,
     ops::ControlFlow,
 };
@@ -36,13 +36,57 @@ use crate::{
         syntax::Walk,
     },
     model::{Expansion, MacroKind, Span},
+    pieces::{Piece, Scope},
 };
+
+/// What a probe was asked that its key does not cover, the first such ask kept
+/// ([`Cx::beyond_why`]): what a by-piece check counts a piece unclean by
+/// (`crate::pieces::unclean`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Beyond {
+    /// [`Cx::vsema`], whose trees are the live files' (`hir::view::Semantics::asked`).
+    Semantics,
+    /// A macro call, an attribute macro, a derive or a module in a block: an expansion, which
+    /// a piece names only through its file's position-bound ids.
+    Expansion,
+    /// A span, a place, a snippet, a file's text or name, a root or a view of the live tree.
+    Place,
+    /// An `#[expect]`: fulfilled by any lint under it, which only the whole check knows.
+    Expect,
+    /// Anything else of the build: the lint flags, a level, the crate's items or effective
+    /// visibilities, the printing of a type or a path, a `cfg` checked by `--check-cfg`.
+    Other,
+}
+
+/// What a probe of a piece ([`Cx::piece_probe`]) unwinds with when it is asked for something
+/// its key does not cover, the reason kept in the probe ([`Cx::beyond_why`]): the probe's
+/// query catches it and says the piece is not clean. No panic hook runs (`resume_unwind`).
+#[derive(Debug)]
+pub(crate) struct Unwound;
+
+/// Which probe a context is, if any.
+#[derive(Clone, Copy, Debug)]
+enum Probe {
+    /// A build's context.
+    None,
+    /// [`Cx::probe`]: a body's lints, which notes what is beyond its key and goes on with a
+    /// stand-in.
+    Body,
+    /// [`Cx::piece_probe`]: one piece's passes, which stops at the first read beyond its key.
+    Piece {
+        piece: Piece,
+        /// The build's lint flags check cfgs (`--check-cfg`), which the probe is not given:
+        /// a `cfg` in the piece is beyond its key.
+        check_cfg: bool,
+    },
+}
 
 /// The names files are shown by: the front end's path of each file, and the root of the
 /// workspace they are named from.
 #[derive(Clone, Copy)]
 pub struct Files<'a> {
-    paths: &'a HashMap<FileId, String>,
+    /// None for [`Files::unnamed`].
+    paths: Option<&'a HashMap<FileId, String>>,
     root: &'a str,
 }
 
@@ -50,13 +94,25 @@ impl<'a> Files<'a> {
     /// `paths` named from `root`; a `root` of `""` keeps each relative path whole, as the tests'
     /// paths, already names, are.
     pub fn new(paths: &'a HashMap<FileId, String>, root: &'a str) -> Files<'a> {
-        Files { paths, root }
+        Files { paths: Some(paths), root }
+    }
+
+    /// No names: each file is `<file N>`, one name a file, so a span still says which file it
+    /// is in ([`Cx::file_of`]) and nothing more. What a query that has no build's names checks
+    /// with ([`Cx::probe`]): nothing it gives is written.
+    pub(crate) const fn unnamed() -> Files<'static> {
+        Files { paths: None, root: "" }
+    }
+
+    /// The front end's path of `file`, if it has one.
+    fn path(&self, file: FileId) -> Option<&'a String> {
+        self.paths.and_then(|it| it.get(&file))
     }
 
     /// The name rustc gives `file` in a diagnostic, by [`Files::relative`]; a file the front end
     /// has no path for is `<file N>` (a crate attribute's is named by [`Cx::file_name`]).
     pub fn name(&self, file: FileId) -> String {
-        match self.paths.get(&file) {
+        match self.path(file) {
             // alloc: a span's file name, made only as a diagnostic is built
             Some(path) => Files::relative(path, self.root).to_owned(),
             // alloc: as above
@@ -131,6 +187,19 @@ pub struct Cx<'a, 'db> {
     levels: RefCell<Option<LevelMap<'a, 'db>>>,
     /// The lints that may fire anywhere in the crate, made the first time a pass asks.
     may_fire: OnceCell<LintSet>,
+    /// Every trait, by the names of its items, made the first time an error asks which traits
+    /// have an item of a name.
+    traits: OnceCell<crate::lower::unresolved_method_call::TraitIndex>,
+    /// Made by [`Cx::probe`] or [`Cx::piece_probe`]: a query's context, which has of the build
+    /// only what the query's key says.
+    probing: Probe,
+    /// What a probe was first asked that its key does not cover ([`Cx::beyond`]).
+    beyond: Cell<Option<Beyond>>,
+    /// Made by [`Cx::scoped`]: the pieces the walk visits ([`Cx::walk`]).
+    scope: Option<Scope<'a>>,
+    /// The check's pieces ([`Cx::set_pieces`]), what a pass that folds the pieces' facts reads
+    /// ([`Cx::pieces`]).
+    pieces: OnceCell<&'a crate::pieces::Pieces<'a>>,
 }
 
 impl<'a, 'db> Cx<'a, 'db> {
@@ -139,11 +208,8 @@ impl<'a, 'db> Cx<'a, 'db> {
         reason = "OnceCell: memos of one check, dropped with it, not global state"
     )]
     pub fn new(db: &'db Db, krate: hir::Crate, files: Files<'a>, frame: &'a Frame) -> Cx<'a, 'db> {
-        // A file of two crates (a crate built for the host and the target) is a module of each:
-        // its syntax must map to this crate's items, not the first crate's.
-        let within = std::sync::Arc::new(blaze_hash::HashSet::from_iter_in([krate.base()], Global)); // alloc: once a check, one crate
         Cx {
-            vsema: hir::view::Semantics::new_within(db, within),
+            vsema: hir::view::Semantics::new_within(db, within(krate)),
             db,
             krate,
             edition: krate.edition(db),
@@ -158,7 +224,186 @@ impl<'a, 'db> Cx<'a, 'db> {
             effective: OnceCell::new(),
             levels: RefCell::new(None),
             may_fire: OnceCell::new(),
+            traits: OnceCell::new(),
+            probing: Probe::None,
+            beyond: Cell::new(None),
+            scope: None,
+            pieces: OnceCell::new(),
         }
+    }
+
+    /// The context a query checks one part of `krate` with (a body's lints,
+    /// `lints::bodies::body_lints_clean`): it has no build's file names, lint flags or
+    /// crate-wide tables, only `may_fire`, the lints that may fire in the crate, which the
+    /// query's key holds. So what it is asked is the database's, which the engine tracks, or
+    /// the key's; anything else it is asked (the lint flags, a level, the crate's walk, its
+    /// items, its effective visibilities, the printing of a type or a path, which reads the
+    /// names of the crate and its dependencies) is answered with a stand-in and noted
+    /// ([`Cx::beyond`]), and the query then says nothing of what it found
+    /// (keys-cover-every-input). Its files are [`Files::unnamed`].
+    #[expect(
+        clippy::disallowed_types,
+        reason = "OnceCell: memos of one check, dropped with it, not global state"
+    )]
+    pub(crate) fn probe(
+        db: &'db Db,
+        krate: hir::Crate,
+        frame: &'a Frame,
+        may_fire: LintSet,
+    ) -> Cx<'a, 'db> {
+        Cx {
+            may_fire: OnceCell::from(may_fire),
+            probing: Probe::Body,
+            ..Cx::new(db, krate, Files::unnamed(), frame)
+        }
+    }
+
+    /// The context a piece's passes are run with (`crate::pieces::piece_clean`): as
+    /// [`Cx::probe`], but its walk is the piece's own position-free tree ([`Cx::walk`],
+    /// `Walk::of`), its [`Cx::vsema`] a probe (`hir::view::Semantics::new_probe`), and the
+    /// first read beyond its key (a span or any read of the live tree, a macro's expansion,
+    /// an `#[expect]`, the build's flags or tables) stops the run: it notes why and unwinds
+    /// with [`Unwound`], so nothing stands in for what was asked. `check_cfg` is whether the
+    /// build's flags check cfgs, which the probe is not given.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "OnceCell: memos of one check, dropped with it, not global state"
+    )]
+    pub(crate) fn piece_probe(
+        db: &'db Db,
+        krate: hir::Crate,
+        frame: &'a Frame,
+        may_fire: LintSet,
+        piece: Piece,
+        check_cfg: bool,
+    ) -> Cx<'a, 'db> {
+        Cx {
+            vsema: hir::view::Semantics::new_probe(db, within(krate)),
+            may_fire: OnceCell::from(may_fire),
+            probing: Probe::Piece { piece, check_cfg },
+            ..Cx::new(db, krate, Files::unnamed(), frame)
+        }
+    }
+
+    /// The build's context whose walk ([`Cx::walk`]) visits only `unclean` of `pieces`: a file
+    /// none of whose pieces is unclean is left out, and in a file that is walked the subtree of
+    /// each clean body; a file with no pieces is walked whole. What else it is asked is the
+    /// build's: its file names, its lint flags, and the lints that may fire, taken from this
+    /// context's whole walk, never from the walk it visits.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "OnceCell: memos of one check, dropped with it, not global state"
+    )]
+    pub(crate) fn scoped<'s>(
+        &'s self,
+        pieces: &'s crate::pieces::Pieces<'_>,
+        unclean: &'s [Piece],
+    ) -> Cx<'s, 'db> {
+        Cx {
+            may_fire: OnceCell::from(self.may_fire_set()),
+            lints: self.lints,
+            scope: Some(Scope { pieces, unclean }),
+            ..Cx::new(self.db, self.krate, self.files, self.frame)
+        }
+    }
+
+    /// What the crate root's attributes say that a by-piece pass reads (the features, the
+    /// channel, the registered tools, the root): the database's query, so a probe's key
+    /// covers it.
+    pub(crate) fn settings(&self) -> crate::checks::settings::CrateSettings<'db> {
+        crate::checks::settings::crate_settings(self.db, self.krate.base())
+    }
+
+    /// The piece this context is the probe of ([`Cx::piece_probe`]).
+    pub(crate) fn probed_piece(&self) -> Option<Piece> {
+        match self.probing {
+            Probe::Piece { piece, .. } => Some(piece),
+            Probe::None | Probe::Body => None,
+        }
+    }
+
+    /// Of a piece's probe, whether the build's flags check cfgs ([`Cx::piece_probe`]).
+    pub(crate) fn probe_checks_cfg(&self) -> bool {
+        matches!(self.probing, Probe::Piece { check_cfg: true, .. })
+    }
+
+    /// Sets the check's pieces (`check::run`, once, right after they are made in the frame).
+    pub(crate) fn set_pieces(&self, pieces: &'a crate::pieces::Pieces<'a>) {
+        if self.pieces.set(pieces).is_err() {
+            panic!("the pieces of the check of {} are set twice", self.crate_name(self.krate));
+        }
+    }
+
+    /// The check's pieces, as `check::run` made them ([`Cx::set_pieces`]): a pass that folds
+    /// the pieces' facts is never run without them.
+    pub(crate) fn pieces(&self) -> &crate::pieces::Pieces<'a> {
+        match self.pieces.get() {
+            Some(pieces) => pieces,
+            None => panic!(
+                "the check of {} asked its pieces before `check::run` set them",
+                self.crate_name(self.krate)
+            ),
+        }
+    }
+
+    /// The pieces this context's walk visits, of a context made by [`Cx::scoped`].
+    pub(crate) fn scope(&self) -> Option<Scope<'a>> {
+        self.scope
+    }
+
+    /// Whether a probe was asked for something its key does not cover: what it found, or did
+    /// not find, may then differ from what the build's own context finds. Always false of a
+    /// build's context.
+    pub(crate) fn beyond(&self) -> bool {
+        self.beyond.get().is_some() || self.vsema.asked()
+    }
+
+    /// What a probe was first asked that its key does not cover, if anything.
+    pub(crate) fn beyond_why(&self) -> Option<Beyond> {
+        self.beyond.get().or_else(|| self.vsema.asked().then_some(Beyond::Semantics))
+    }
+
+    /// Notes that `why`, something a probe's key does not cover, was asked: a body's probe
+    /// keeps the first reason and goes on; a piece's keeps it and unwinds with [`Unwound`].
+    /// Nothing of a build's context.
+    #[inline]
+    pub(crate) fn note_beyond(&self, why: Beyond) {
+        match self.probing {
+            Probe::None => {}
+            Probe::Body => {
+                if self.beyond.get().is_none() {
+                    self.beyond.set(Some(why));
+                }
+            }
+            Probe::Piece { .. } => {
+                if self.beyond.get().is_none() {
+                    self.beyond.set(Some(why));
+                }
+                std::panic::resume_unwind(Box::new(Unwound)); // alloc: an unwind's payload
+            }
+        }
+    }
+
+    /// Notes `why` of a piece's probe only: what a body's probe is given as the build's (a
+    /// span, the live tree), which a piece's key does not cover.
+    #[inline]
+    fn piece_beyond(&self, why: Beyond) {
+        if let Probe::Piece { .. } = self.probing {
+            self.note_beyond(why);
+        }
+    }
+
+    /// Notes that something a probe's key does not cover was asked. Nothing of a build's
+    /// context.
+    #[inline]
+    fn asked_beyond(&self) {
+        self.note_beyond(Beyond::Other);
+    }
+
+    /// The lints that may fire anywhere in the crate ([`Cx::lint_may_fire`]): what a probe of
+    /// the crate is made with.
+    pub(crate) fn may_fire_set(&self) -> LintSet {
+        *self.lints_that_may_fire()
     }
 
     /// The check's task frame, for the crate-sized tables a pass builds.
@@ -174,6 +419,7 @@ impl<'a, 'db> Cx<'a, 'db> {
     /// What rustc's printing of paths and the import suggestions read: the crate's visible
     /// names and its declarations by name, built in the check's frame when first read.
     pub(crate) fn paths(&self) -> &crate::print::Paths<'a> {
+        self.asked_beyond();
         self.paths.get_or_init(|| crate::print::Paths::new(self))
     }
 
@@ -191,24 +437,32 @@ impl<'a, 'db> Cx<'a, 'db> {
     /// The lint flags the crate is checked with: rustc's defaults when none were given.
     pub fn lint_flags(&self) -> &'a crate::lints::CommandLine {
         static NONE: crate::lints::CommandLine = crate::lints::CommandLine::NONE;
+        self.asked_beyond();
         self.lints.unwrap_or(&NONE)
     }
 
     /// The crate as rustc's early lint pass walks it: made once per check, for every pass that
     /// walks the crate's syntax.
+    /// Of a piece's probe it is the piece's own tree, which its key covers; of a context made
+    /// by [`Cx::scoped`], the pieces it was made with.
     pub(crate) fn walk(&self) -> &Walk<'db> {
+        if !matches!(self.probing, Probe::Piece { .. }) {
+            self.asked_beyond();
+        }
         self.walk.get_or_init(|| Walk::of(self))
     }
 
     /// The crate's items in the order rustc's item passes visit them: made once per check, for
     /// the item lints before the abort and after it.
     pub(crate) fn items(&self) -> &ItemWalk<'db> {
+        self.asked_beyond();
         self.items.get_or_init(|| ItemWalk::of(self))
     }
 
     /// The crate's effective visibilities (rustc's `effective_visibilities`): made once per
     /// check, for the stability pass, the dead-code pass and the item lints after the abort.
     pub(crate) fn effective(&self) -> &Effective {
+        self.asked_beyond();
         self.effective.get_or_init(|| Effective::of(self))
     }
 
@@ -262,6 +516,13 @@ impl<'a, 'db> Cx<'a, 'db> {
         self.lints_that_may_fire().intersects(lints)
     }
 
+    /// Every trait of every crate with, for each name, the traits that have an item of it:
+    /// walked once a check, the first time an error asks.
+    pub(crate) fn traits(&self) -> &crate::lower::unresolved_method_call::TraitIndex {
+        self.piece_beyond(Beyond::Other);
+        self.traits.get_or_init(|| crate::lower::unresolved_method_call::TraitIndex::new(self))
+    }
+
     fn lints_that_may_fire(&self) -> &LintSet {
         self.may_fire.get_or_init(|| crate::lints::may_fire(self, self.lint_flags(), self.walk()))
     }
@@ -269,6 +530,7 @@ impl<'a, 'db> Cx<'a, 'db> {
     /// Whether cargo runs the compile (rustc's `was_invoked_from_cargo`: `CARGO_CRATE_NAME` is
     /// set), as it is under blaze: some help then names `cargo add` and `Cargo.toml`.
     pub fn cargo(&self) -> bool {
+        self.asked_beyond();
         self.lints.is_some_and(|it| it.check_cfg.cargo)
     }
 
@@ -278,8 +540,9 @@ impl<'a, 'db> Cx<'a, 'db> {
     /// read from outside every source root has no path of the front end's: it is named by its
     /// path there ([`base_db::Files::included_source_path`]).
     pub fn file_name(&self, file: FileId) -> String {
+        self.piece_beyond(Beyond::Place);
         let outside = || self.db.files().included_source_path(file);
-        let name = match self.files.paths.contains_key(&file) {
+        let name = match self.files.path(file).is_some() {
             true => Files::of_text(self.db, file, self.files.name(file)),
             // alloc: a span's file name, made only as a diagnostic is built
             false => match outside() {
@@ -303,6 +566,7 @@ impl<'a, 'db> Cx<'a, 'db> {
     }
 
     pub fn file_text(&self, file: FileId) -> &'db str {
+        self.piece_beyond(Beyond::Place);
         self.db.file_text(file).text(self.db)
     }
 
@@ -327,6 +591,7 @@ impl<'a, 'db> Cx<'a, 'db> {
 
     /// The source text a span covers.
     pub fn snippet(&self, span: &Span) -> Option<&'db str> {
+        self.piece_beyond(Beyond::Place);
         let file = self.file_of(span)?;
         self.file_text(file).get(span.lo as usize..span.hi as usize)
     }
@@ -336,6 +601,7 @@ impl<'a, 'db> Cx<'a, 'db> {
     /// macro's expansion; else the call of the outermost macro of another crate it came from,
     /// inside that macro's expansion.
     pub fn span(&self, range: InFile<TextRange>) -> Span {
+        self.piece_beyond(Beyond::Place);
         let Some(call) = range.file_id.macro_file() else {
             let file = range.file_id.file_id().expect("a file that is not a macro's");
             return self.span_in_file(file.file_id(self.db), range.value);
@@ -370,6 +636,7 @@ impl<'a, 'db> Cx<'a, 'db> {
     /// no expansion made, for a scan that orders places and writes nothing. Takes `span`'s cases
     /// in its order.
     pub fn place(&self, range: InFile<TextRange>) -> (FileId, TextRange) {
+        self.piece_beyond(Beyond::Place);
         let Some(call) = range.file_id.macro_file() else {
             let file = range.file_id.file_id().expect("a file that is not a macro's");
             return (file.file_id(self.db), range.value);
@@ -425,6 +692,7 @@ impl<'a, 'db> Cx<'a, 'db> {
     /// crate's levels (a `#![forbid(unsafe_code)]` included), and an unstable feature it uses
     /// is allowed.
     pub(crate) fn in_appended(&self, file: HirFileId, range: TextRange) -> bool {
+        self.piece_beyond(Beyond::Place);
         use syntax::view::{HasModuleItem as _, HasName as _};
         let db = self.db;
         let Some(real) = file.file_id() else { return false };
@@ -439,6 +707,7 @@ impl<'a, 'db> Cx<'a, 'db> {
 
     /// The root of `file`, parsed or expanded, as a view of a tree [`Cx::vsema`] gave out.
     pub fn root(&self, file: HirFileId) -> view::Node<'db> {
+        self.piece_beyond(Beyond::Place);
         self.vsema.parse_or_expand(file)
     }
 
@@ -447,17 +716,20 @@ impl<'a, 'db> Cx<'a, 'db> {
         &self,
         ptr: InFile<AstPtr<N>>,
     ) -> InFile<N::Of<'db>> {
+        self.piece_beyond(Beyond::Place);
         InFile::new(ptr.file_id, self.vsema.to_view(ptr))
     }
 
     /// The syntax node `ptr` points to, as a view.
     pub fn syntax_view(&self, ptr: InFile<SyntaxNodePtr>) -> InFile<view::Node<'db>> {
+        self.piece_beyond(Beyond::Place);
         InFile::new(ptr.file_id, self.vsema.to_view_syntax(ptr))
     }
 
     /// What rustc says of the expansion of the macro call `call`: where it was called (itself
     /// in an expansion when it was), what it is and where it is defined.
     pub fn expansion_of(&self, call: MacroCallId) -> Option<Expansion> {
+        self.piece_beyond(Beyond::Expansion);
         let db = self.db;
         let loc = call.loc(db);
         let (kind, name, at) = self.call_of(call, true)?;
@@ -548,12 +820,23 @@ impl<'a, 'db> Cx<'a, 'db> {
     /// rustc's printing of `ty`: trimmed paths, `{integer}` for an integer variable, closures
     /// by where they are written.
     pub fn ty(&self, ty: &hir::Type<'db>) -> String {
+        if !matches!(self.probing, Probe::None) {
+            // A probe prints nothing: the names a type is printed by are the crate's and its
+            // dependencies', which its key does not hold.
+            self.note_beyond(Beyond::Other);
+            return "_".to_owned(); // alloc: a stand-in, only of a body a lint is found in
+        }
         crate::print::ty(self, ty)
     }
 
     /// rustc's `def_path_str` of `def`: the shortest path that names it, trimmed to its name
     /// when that name is unique.
     pub fn def_path(&self, def: hir::ModuleDef) -> String {
+        if !matches!(self.probing, Probe::None) {
+            // As `Cx::ty`.
+            self.note_beyond(Beyond::Other);
+            return "_".to_owned(); // alloc: a stand-in, only of a body a lint is found in
+        }
         crate::print::def_path(self, def)
     }
 
@@ -594,6 +877,14 @@ impl<'a, 'db> Cx<'a, 'db> {
     }
 }
 
+/// The crates a file of `krate` is taken as a module of: `krate` only, as a file of two crates
+/// (a crate built for the host and the target) is a module of each and its syntax must map to
+/// this crate's items, not the first crate's.
+fn within(krate: hir::Crate) -> std::sync::Arc<blaze_hash::HashSet<base_db::Crate, Global>> {
+    // alloc: once a check, one crate
+    std::sync::Arc::new(blaze_hash::HashSet::from_iter_in([krate.base()], Global))
+}
+
 /// rustc's `fast_print_path`: a macro's path as its call writes it, the segments joined by
 /// `::` (a global path's starting with it), the name rustc gives the expansion.
 fn fast_print_path(path: view::Path<'_>) -> Option<String> {
@@ -612,6 +903,13 @@ fn fast_print_path(path: view::Path<'_>) -> Option<String> {
         out.push_str(segment.name_ref()?.text());
     }
     Some(out)
+}
+
+/// The arena whose syntax-context table the contexts of `file`'s span map index: the one rule,
+/// [`HirFileId::context_arena`] (a macro file's call's; a real file's own id's, as its root
+/// contexts read no table).
+pub(crate) fn context_arena(file: HirFileId) -> blaze_memo::ArenaId {
+    file.context_arena()
 }
 
 /// The paths of a `#[derive(...)]`, in order, with where each is, as text: for a diagnostic
@@ -828,7 +1126,7 @@ mod tests {
         assert_eq!(Files::relative("/wsx/lib.rs", "/ws"), "/wsx/lib.rs");
         assert_eq!(Files::relative("/std/lib.rs", "/ws"), "/std/lib.rs");
         assert_eq!(Files::relative("src/lib.rs", ""), "src/lib.rs");
-        assert_eq!(Files::relative("/tmp/probe.rs", ""), "/tmp/probe.rs");
+        assert_eq!(Files::relative("/srv/probe.rs", ""), "/srv/probe.rs");
         assert_eq!(Files::relative("/ws/src/lib.rs", "/"), "ws/src/lib.rs");
         assert_eq!(Files::relative("$DIR/a.rs", ""), "$DIR/a.rs");
 

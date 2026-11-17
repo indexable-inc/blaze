@@ -30,10 +30,10 @@ use std::{
 };
 
 use base_db::Db;
+use blaze_core::lock::{Lock, Signal};
 use blaze_graph::sched::Event;
 use blaze_lower::{SubRequest, SubResponse};
-use blaze_core::lock::{Lock, Signal};
-use span::{Edition, SyntaxContext};
+use blaze_memo::ArenaId;
 
 use crate::{guest::Stop, server::Answer};
 
@@ -41,20 +41,12 @@ use crate::{guest::Stop, server::Answer};
 /// shims and the server under it.
 const STACK: usize = 16 << 20;
 
-enum Question {
-    Span(SubRequest),
-    Edition(SyntaxContext),
-}
-
-enum Reply {
-    Span(SubResponse),
-    Edition(Edition),
-}
-
-/// What the job and its expansion thread pass each other.
+/// What the job and its expansion thread pass each other. A question is a span's (a span's
+/// edition is in its context's word, so it is never one), with the table its contexts are
+/// words of.
 struct Board<T> {
-    question: Option<Question>,
-    reply: Option<Reply>,
+    question: Option<(ArenaId, SubRequest)>,
+    reply: Option<SubResponse>,
     /// What the expansion gave, or why its thread panicked.
     done: Option<Result<T, Stop>>,
     /// The job unwound while it waited: no reply comes.
@@ -72,13 +64,10 @@ pub(crate) struct Link<T> {
 impl<T> Link<T> {
     fn new() -> Link<T> {
         Link {
-            board: Lock::new("macro.thread.board", Board {
-                question: None,
-                reply: None,
-                done: None,
-                gone: false,
-                wake: None,
-            }),
+            board: Lock::new(
+                "macro.thread.board",
+                Board { question: None, reply: None, done: None, gone: false, wake: None },
+            ),
             replied: Signal::new("macro.thread.replied"),
         }
     }
@@ -94,10 +83,12 @@ impl<T> Link<T> {
         }
     }
 
-    /// The job's reply to `question`, the expansion thread blocked until it comes.
-    fn ask(&self, question: Question) -> Result<Reply, Stop> {
-        self.post(|board| board.question = Some(question));
+    /// The job's reply to `question`, the expansion thread blocked until it comes, counted in
+    /// [`ASKING`] for as long as it waits.
+    fn ask(&self, contexts: ArenaId, question: SubRequest) -> Result<SubResponse, Stop> {
+        self.post(|board| board.question = Some((contexts, question)));
         let mut board = self.board.lock();
+        let _asking = Asking::now();
         // wakes: the job's reply and the link's end (`gone`) each notify `replied`
         self.replied.wait_while(&mut board, |it| it.reply.is_none() && !it.gone);
         board.reply.take().ok_or_else(|| {
@@ -107,20 +98,8 @@ impl<T> Link<T> {
 }
 
 impl<T> Answer for Link<T> {
-    fn answer(&self, req: SubRequest) -> Result<SubResponse, Stop> {
-        match self.ask(Question::Span(req))? {
-            Reply::Span(it) => Ok(it),
-            Reply::Edition(_) => {
-                Err(Stop("was told an edition when it asked of a span".to_owned()))
-            } // alloc: error path
-        }
-    }
-
-    fn edition(&self, ctx: SyntaxContext) -> Result<Edition, Stop> {
-        match self.ask(Question::Edition(ctx))? {
-            Reply::Edition(it) => Ok(it),
-            Reply::Span(_) => Err(Stop("was told of a span when it asked an edition".to_owned())), // alloc: error path
-        }
+    fn answer(&self, contexts: ArenaId, req: SubRequest) -> Result<SubResponse, Stop> {
+        self.ask(contexts, req)
     }
 }
 
@@ -170,13 +149,10 @@ pub(crate) fn run<T: Send + 'static>(
         if let Some(done) = board.done.take() {
             return done;
         }
-        if let Some(question) = board.question.take() {
+        if let Some((contexts, question)) = board.question.take() {
             drop(board);
             let answering = Answering::enter();
-            let reply = match question {
-                Question::Span(req) => Reply::Span(db.answer(req)?),
-                Question::Edition(ctx) => Reply::Edition(db.edition(ctx)?),
-            };
+            let reply = db.answer(contexts, question)?;
             drop(answering);
             link.board.lock().reply = Some(reply);
             link.replied.notify_all();
@@ -208,13 +184,66 @@ struct Threads {
     started: usize,
 }
 
-static THREADS: Lock<Threads> =
-    Lock::new("macro.thread.pool", Threads { idle: Vec::new(), queued: VecDeque::new(), started: 0 }); // alloc: none: empty in a const
+static THREADS: Lock<Threads> = Lock::new(
+    "macro.thread.pool",
+    Threads { idle: Vec::new(), queued: VecDeque::new(), started: 0 },
+); // alloc: none: empty in a const
 
 /// The expansion threads alive now, idle ones included: the proc-macro lane's width the build
 /// view shows (`proc macros 3 of 32 expanding`).
 pub fn alive() -> usize {
     THREADS.lock().started
+}
+
+/// The expansion threads blocked in [`Link::ask`] now, on `macro.thread.replied`: each waits
+/// for the job that runs its expansion to answer a question of the database.
+static ASKING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One count of [`ASKING`], given back however the wait ends.
+struct Asking;
+
+impl Asking {
+    fn now() -> Asking {
+        ASKING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Asking
+    }
+}
+
+impl Drop for Asking {
+    fn drop(&mut self) {
+        ASKING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The expansion threads at one look: what `blaze debug inspect` and a stall say of the
+/// proc-macro lane, so a build stopped in an expansion shows whether its threads run, wait for
+/// a thread, or wait on their jobs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    /// Threads alive, idle ones included.
+    pub alive: usize,
+    /// Of them, waiting for an expansion.
+    pub idle: usize,
+    /// Expansions handed in and waiting for a thread, the cap's threads all running others.
+    pub queued: usize,
+    /// Threads blocked on `macro.thread.replied`, each waiting for its job's answer.
+    pub asking: usize,
+    /// The most threads kept ([`cap`]).
+    pub cap: usize,
+}
+
+/// The expansion threads now, read without waiting: `None` while the pool's lock is held, so
+/// a reader off the loop never waits on an expansion thread's hand-off (`blaze debug inspect`
+/// answers while everything else is stuck).
+pub fn counts() -> Option<Counts> {
+    let threads = THREADS.try_lock()?;
+    Some(Counts {
+        alive: threads.started,
+        idle: threads.idle.len(),
+        queued: threads.queued.len(),
+        asking: ASKING.load(std::sync::atomic::Ordering::Relaxed),
+        cap: cap(),
+    })
 }
 
 /// The most expansion threads kept: twice the process's workers, so every worker's job can
@@ -237,7 +266,7 @@ pub(crate) fn ceiling() -> usize {
 
 thread_local! {
     /// How many expansions' questions the job on this thread is answering now: carried with
-    /// the job across its waits ([`blaze_query::carry`]), so an expansion its answer asks for
+    /// the job across its waits ([`blaze_graph::sched::carry`]), so an expansion its answer asks for
     /// is known as nested wherever the job resumes.
     static ANSWERING: Cell<usize> = const { Cell::new(0) };
 }
@@ -265,7 +294,7 @@ fn put_answering(taken: std::num::NonZeroUsize) {
 fn carry_answering() {
     static CARRIED: std::sync::Once = std::sync::Once::new();
     CARRIED.call_once(|| {
-        blaze_query::carry(blaze_query::Carried::word(take_answering, put_answering))
+        blaze_graph::sched::carry(blaze_graph::sched::Carried::word(take_answering, put_answering))
     });
 }
 
@@ -286,6 +315,13 @@ impl Drop for Answering {
     fn drop(&mut self) {
         ANSWERING.set(ANSWERING.get().saturating_sub(1));
     }
+}
+
+/// Gives back the warm frame memory the calling expansion thread keeps, if an idle daemon asked
+/// for it (`blaze_mem::frame::settle_spare`). Outside any expansion: what a thread does as it
+/// goes idle.
+fn settle_here() {
+    blaze_mem::frame::settle_spare();
 }
 
 /// Gives `job` to an idle expansion thread, or to a new one while fewer than [`cap`] are alive
@@ -347,6 +383,9 @@ fn submit(nested: bool, mut job: Job) -> Result<(), Stop> {
                         None => threads.idle.push(mine.clone()),
                     }
                 }
+                // Idle now, outside any expansion: its warm frame memory goes back if asked
+                // meanwhile, as a pool worker's does as it parks.
+                settle_here();
             }
         });
     spawned.map(drop).map_err(|error| {

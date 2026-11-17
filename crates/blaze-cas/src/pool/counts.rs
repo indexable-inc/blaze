@@ -48,6 +48,9 @@ pub struct PoolCounts {
     pub evicted: u64,
     /// Reads that waited at the pinned bound, ever.
     pub bound_waits: u64,
+    /// Bytes every store holds on the global heap, as each last counted itself
+    /// ([`crate::Store::heap_bytes`]): `store heap bytes`.
+    pub store_heap: u64,
 }
 
 /// The counters of every store's pool in this process.
@@ -62,6 +65,7 @@ pub fn pool_counts() -> PoolCounts {
         prefetched: PREFETCHED.load(Ordering::Relaxed),
         evicted: EVICTED.load(Ordering::Relaxed),
         bound_waits: BOUND_WAITS.load(Ordering::Relaxed),
+        store_heap: crate::heap::store_heap(),
     }
 }
 

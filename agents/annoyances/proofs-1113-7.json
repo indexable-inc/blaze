@@ -1,0 +1,14 @@
+{
+ "id": "proofs-1113-7",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113",
+ "where": "crates/blaze-core/src/uring.rs, test `uring::tests::a_warm_watch_allocates_its_changes_alone`",
+ "what": "`cargo test -p blaze-core --lib` with RUST_TEST_THREADS=16 on blaze-vm, at a merge of main b9baccfc9f's parent with a branch that does not touch the io_uring driver, failed that one test once (303 passed, 1 failed); run alone three times it passed, and the whole suite run again passed 304 of 304. Seen again on 2026-11-14: in 3 of 8 runs of the whole suite that night, on a VM at load 20 to 30, and never in 5 runs of the test alone.",
+ "cost": "ten minutes to tell a flake from a break before a landing",
+ "cause": "not known. A first guess recorded here was wrong: blaze-alloc-count counts per thread (thread_local cells), so another test's allocations do not reach it. The test waits on real inotify events through io_uring (`poll_until`), and its count of allocations is compared with the payload of the changes it was told; under load the kernel may tell the changes in more pieces, or the polls take more turns. Not checked which.",
+ "whys": "a test of a real kernel's event delivery asserts an exact resource count over a number of deliveries it does not control; the suite's other tests change the machine's timing, so the count holds alone and not in company",
+ "class": "a test of real kernel timing with an oracle that assumes one schedule of deliveries",
+ "prevention": "the oracle counts allocations per delivery it was told (each `Done::Changed` allocates its payload and nothing else), not per round; or the test runs the watch under the simulation, where deliveries are drawn, and keeps one real-kernel case without the count. Not built.",
+ "workaround": "run the test alone",
+ "state": "open"
+}

@@ -1,0 +1,14 @@
+{
+ "id": "interned-rows-outlive-tables",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), track 5 executors T2 and T2b, int-1112",
+ "where": "crates/hir-ty/src/next_solver/interner.rs mod table; crates/hir-ty-codegen/mod.rs erase_regions ERASED; crates/hir-ty-codegen/imports.rs EXPORTS",
+ "what": "The trait solver's interner tables were written on the assumption that a row is never freed ('db is a marker, Stored* handles are bare u32 rows), so caches across the process keep rows with no way to be told the tables went: a thread-local map of erased GenericArgs and the LLVM export table, neither keyed by a database nonce nor cleared. Releasing the tables to reach the idle budget (track 5) turns each such cache into a wrong answer (a freed number names a new value), not a crash.",
+ "cost": "until both caches started over on hir_ty::evict::tables_released(), hir::evict::release_process_tables refused (panicked) on every call, so the idle daemon kept its intern heap",
+ "cause": "an interned handle carries no generation, so nothing can tell a stale row from a live one, and a process cache of rows has no owner that a release can reach",
+ "class": "a handle that is only an index into a table whose lifetime the type system does not see",
+ "prevention": "every process static of rows is keyed by a database nonce or starts over on hir_ty::evict::tables_released() (its doc says so); the test hir-ty-codegen v2::tests::a_build_after_a_release_equals_a_fresh_build builds after a release and compares with a fresh process, with a planted stale ERASED as its control. The census rg 'static .*(Lock|SharedMap|OnceLock|LazyLock)|thread_local!' over hir-ty-codegen, hir-ty-mir, hir-ty-pure and blaze-codegen found no third such cache (frontend.rs FOUND holds rows under a database nonce, never read by another database)",
+ "workaround": "none needed",
+ "fix": "ERASED keeps the release count beside its map and EXPORTS keeps one in EXPORTS_UNDER; each empties itself when the count moved. UNRELEASED_ROW_CACHES and its refusal were deleted once empty",
+ "state": "fixed, not yet built"
+}

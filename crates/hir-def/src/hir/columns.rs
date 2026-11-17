@@ -80,7 +80,7 @@
 
 use std::ops::Deref;
 
-use blaze_query::db::{AsId, FromId};
+use blaze_memo::Id;
 use la_arena::{Idx, RawIdx};
 
 use crate::{
@@ -566,18 +566,15 @@ pub(crate) fn take_exact<T>(column: &mut Vec<T>) -> Box<[T]> {
 }
 
 fn block_words(id: Option<BlockId>) -> (u32, u32) {
-    id.map_or((0, 0), |id| (id.as_id().as_u32(), 0))
+    let bits = id.map_or(0, |id| super::persist::session_word(id.gid()));
+    (bits as u32, (bits >> 32) as u32)
 }
 
+/// The block of [`block_words`]'s two words: `None` for 0, which no block's id is (a block is
+/// homed in its crate's arena, whose index is at least 1).
 fn block(low: u32, high: u32) -> Checked<Option<BlockId>> {
-    match (low, high) {
-        (0, 0) => Ok(None),
-        (0, _) => Err("a block id of index 0"),
-        (_, 0) => blaze_query::db::Id::new(low)
-            .map(|id| Some(BlockId::from_id(id)))
-            .ok_or("a block id past `Id::MAX_U32`, which no query storage gives"),
-        _ => Err("a block id past 32 bits"),
-    }
+    let bits = u64::from(low) | (u64::from(high) << 32);
+    Ok(super::persist::session_id(bits).map(BlockId::from_gid))
 }
 
 const UNARY_OPS: [UnaryOp; 3] = [UnaryOp::Deref, UnaryOp::Not, UnaryOp::Neg];
@@ -2064,10 +2061,11 @@ mod tests {
         use hir_expand::{AstId, HirFileId, MacroCallId, MacroCallStyles, MacroDefKind};
         use span::{Edition, ErasedFileAstId, FileAstId};
 
-        let file = HirFileId::MacroFile(MacroCallId::from_id(blaze_query::db::Id::from_u32(bits)));
+        let gid = blaze_memo::Gid::for_test(bits);
+        let file = HirFileId::MacroFile(MacroCallId::from_gid(gid));
         let ast_id = FileAstId::from_erased_unchecked(ErasedFileAstId::from_raw(bits));
         MacroDefId {
-            krate: base_db::Crate::from_id(blaze_query::db::Id::from_u32(bits)),
+            krate: base_db::Crate::from_gid(gid),
             edition: Edition::Edition2021,
             kind: MacroDefKind::Declarative(AstId::new(file, ast_id), MacroCallStyles::FN_LIKE),
             local_inner: false,
@@ -2190,7 +2188,7 @@ mod tests {
     }
 
     fn block_id(bits: u32) -> BlockId {
-        BlockId::from_id(blaze_query::db::Id::from_u32(bits))
+        BlockId::from_gid(blaze_memo::Gid::for_test(bits))
     }
 
     /// A closure's `for<'a, 'b>`: the first two names of the paths [`paths_with_binder`] makes.

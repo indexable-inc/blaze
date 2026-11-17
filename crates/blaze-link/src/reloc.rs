@@ -12,7 +12,8 @@ use blaze_mem::align::align_up_u64;
 
 use crate::{
     Format,
-    model::{Apply, Tls},
+    OutputKind,
+    model::{Apply, Tls, TlsDescStep},
 };
 
 /// Why a relocation can't be written. `Copy` and 24 bytes: the success path builds nothing.
@@ -33,6 +34,8 @@ pub(crate) enum Bad {
     Lo12Insn(u32),
     Lo12Align { low: u64, shift: u8 },
     TpRange(i64),
+    TpRange32(i64),
+    TlsCellAddend(i64),
     Native,
     WasmTls,
 }
@@ -51,6 +54,7 @@ impl Bad {
                 | Bad::Adrp(_)
                 | Bad::Adr(_)
                 | Bad::TpRange(_)
+                | Bad::TpRange32(_)
         )
     }
 }
@@ -91,6 +95,16 @@ impl fmt::Display for Bad {
                 1u32 << shift
             ),
             Bad::TpRange(off) => write!(f, "a thread-pointer offset {off:#x} past 16 MiB"),
+            Bad::TpRange32(off) => write!(
+                f,
+                "a thread-pointer offset {off:#x} past the 4 GiB a TLS descriptor relaxed to local exec \
+                 (`movz`, `movk`) holds"
+            ),
+            Bad::TlsCellAddend(addend) => write!(
+                f,
+                "a TLS descriptor of an imported thread-local with addend {addend:#x}, relaxed to initial \
+                 exec: its GOT cell holds the thread-local's own offset, and nothing adds the addend"
+            ),
             Bad::Native => f.write_str("a native relocation is the format writer's to apply"),
             Bad::WasmTls => f.write_str("thread-locals of wasm are the wasm writer's"),
         }
@@ -165,6 +179,44 @@ pub(crate) fn of_kind(
     })
 }
 
+/// `apply` as an image of `kind` in `format` writes it: what a reader or codegen made, but
+/// for an AArch64 TLS descriptor's four relocations (`R_AARCH64_TLSDESC_ADR_PAGE21`,
+/// `_LD64_LO12`, `_ADD_LO12`, `_CALL`) in an ELF executable, which are relaxed.
+///
+/// The rule (the AArch64 ELF TLS ABI's descriptor relaxations, as LLD's
+/// `AArch64::relaxTlsGdToIe`/`relaxTlsGdToLe` and mold's `relax_tlsdesc` do them): an
+/// executable's thread-locals, and those of the libraries it starts with, are in the static
+/// TLS block, each at an offset from the thread pointer fixed before any code runs, so no
+/// descriptor call is needed. The sequence becomes [`Apply::A64TlsDescIe`] here, and
+/// [`known`] makes it [`Apply::A64TlsDescLe`] at each relocation whose target's offset the
+/// link knows. A shared library keeps the descriptor: where its block is, is the loader's to
+/// say (a GOT pair with `R_AARCH64_TLSDESC`).
+pub(crate) fn in_output(apply: Apply, format: Format, kind: &OutputKind) -> Apply {
+    if format != Format::Elf || !matches!(kind, OutputKind::Executable { .. }) {
+        return apply;
+    }
+    match apply {
+        Apply::A64TlsDescPage21 => Apply::A64TlsDescIe(TlsDescStep::Page),
+        Apply::A64TlsDescLo12 => Apply::A64TlsDescIe(TlsDescStep::Load),
+        Apply::A64TlsDescAdd12 => Apply::A64TlsDescIe(TlsDescStep::Add),
+        Apply::A64TlsDescCall => Apply::A64TlsDescIe(TlsDescStep::Call),
+        other => other,
+    }
+}
+
+/// `apply` at a relocation whose target is `imported` or not: a relaxed TLS descriptor
+/// ([`in_output`]) to a thread-local that is not imported is local exec, its offset from the
+/// thread pointer being known to the link (the image's own, or one of the image this one is
+/// linked beside); to an imported one it stays initial exec, the offset being the loader's
+/// to write into the GOT cell (`R_AARCH64_TLS_TPREL64`).
+#[inline]
+pub(crate) fn known(apply: Apply, imported: bool) -> Apply {
+    match apply {
+        Apply::A64TlsDescIe(step) if !imported => Apply::A64TlsDescLe(step),
+        other => other,
+    }
+}
+
 /// The wasm relocation types whose value the core computes before the writer encodes it:
 /// a function's index (`R_WASM_FUNCTION_INDEX_LEB`, `_I32`) or its table slot, the index
 /// + 1 (`R_WASM_TABLE_INDEX_SLEB`, `_I32`, and wasm64's `_SLEB64`, `_I64`).
@@ -198,7 +250,7 @@ pub(crate) fn width(apply: Apply) -> usize {
     }
 }
 
-/// Whether the kind reaches its target through a GOT cell, and which.
+/// Which GOT cell the kind reaches its target through, when it does.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub(crate) enum GotKind {
     Address,
@@ -239,11 +291,22 @@ pub(crate) fn got_kind(apply: Apply) -> Option<GotKind> {
         | Apply::TlvPage21
         | Apply::TlvLo12
         | Apply::TlvRel32 => Some(GotKind::Address),
-        Apply::X86GotTpOff32 | Apply::A64TlsIePage21 | Apply::A64TlsIeLo12 => Some(GotKind::TpOff),
+        // Every step of a descriptor's sequence relaxed to initial exec reaches its target
+        // through the cell, the two `nop`s too: an imported target has no other value. The
+        // cell is made for a target the link knows the offset of as well (`known` is decided
+        // per relocation when it is written, after the cells are): 8 bytes local exec does
+        // not read.
+        Apply::X86GotTpOff32
+        | Apply::A64TlsIePage21
+        | Apply::A64TlsIeLo12
+        | Apply::A64TlsDescIe(_) => Some(GotKind::TpOff),
         Apply::X86TlsGd32 => Some(GotKind::TlsGd),
-        Apply::A64TlsDescPage21 | Apply::A64TlsDescLo12 | Apply::A64TlsDescAdd12 => {
-            Some(GotKind::TlsDesc)
-        }
+        // The call too (`R_AARCH64_TLSDESC_CALL` writes nothing, and marks the `blr` of the
+        // descriptor): its target is reached through the pair, an imported one only so.
+        Apply::A64TlsDescPage21
+        | Apply::A64TlsDescLo12
+        | Apply::A64TlsDescAdd12
+        | Apply::A64TlsDescCall => Some(GotKind::TlsDesc),
         _ => None,
     }
 }
@@ -263,6 +326,7 @@ pub(crate) fn is_tls(apply: Apply) -> bool {
             | Apply::DtpOff64
             | Apply::A64TpHi12
             | Apply::A64TpLo12
+            | Apply::A64TlsDescLe(_)
             | Apply::TlsOffset
             | Apply::TpOff64
             | Apply::SecRel32
@@ -380,6 +444,36 @@ pub(crate) fn apply(apply: Apply, ctx: &Ctx, field: &mut [u8]) -> Result<(), Bad
         }
         Apply::A64TlsDescAdd12 => a64_lo12(field, ga, 0)?,
         Apply::A64TlsDescCall => {}
+        // TLSDESC -> initial exec (LLD's `relaxTlsGdToIe`): the whole instruction is written,
+        // whatever was there (the descriptor's, or this from the link before), then the
+        // cell's address as `R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21` and
+        // `_LD64_GOTTPREL_LO12_NC` write it. The caller adds x0 to the thread pointer. The
+        // cell holds the target's own offset, so an addend has nowhere to go.
+        Apply::A64TlsDescIe(_) if a != 0 => return Err(Bad::TlsCellAddend(a)),
+        Apply::A64TlsDescIe(TlsDescStep::Page) => {
+            write32(field, A64_ADRP_X0);
+            a64_adrp(field, g, p)?
+        }
+        Apply::A64TlsDescIe(TlsDescStep::Load) => {
+            write32(field, A64_LDR_X0_X0);
+            a64_lo12(field, g, 3)?
+        }
+        // TLSDESC -> local exec (LLD's `relaxTlsGdToLe`): x0 is the offset from the thread
+        // pointer, 32 bits of it.
+        Apply::A64TlsDescLe(step @ (TlsDescStep::Page | TlsDescStep::Load)) => {
+            let off = tp()? + a;
+            let Ok(off) = u32::try_from(off) else { return Err(Bad::TpRange32(off)) };
+            write32(
+                field,
+                match step {
+                    TlsDescStep::Page => A64_MOVZ_X0_LSL16 | ((off >> 16) << 5),
+                    _ => A64_MOVK_X0 | ((off & 0xffff) << 5),
+                },
+            );
+        }
+        // Either way the `add x0, x0, :tlsdesc_lo12:` and the `blr x1` have nothing to do.
+        Apply::A64TlsDescIe(TlsDescStep::Add | TlsDescStep::Call)
+        | Apply::A64TlsDescLe(TlsDescStep::Add | TlsDescStep::Call) => write32(field, A64_NOP),
         Apply::A64TpHi12 | Apply::A64TpLo12 => {
             let off = tp()? + a;
             if !(0..1 << 24).contains(&off) {
@@ -408,6 +502,14 @@ fn fits_i32(value: i64) -> Result<i32, Bad> {
 fn fits_u32(value: u64) -> Result<u32, Bad> {
     u32::try_from(value).map_err(|_| Bad::Unsigned32(value))
 }
+
+/// What a relaxed TLS descriptor's instructions become: `adrp x0, 0`, `ldr x0, [x0]`,
+/// `movz x0, #0, lsl #16`, `movk x0, #0` and `nop`.
+const A64_ADRP_X0: u32 = 0x9000_0000;
+const A64_LDR_X0_X0: u32 = 0xf940_0000;
+const A64_MOVZ_X0_LSL16: u32 = 0xd2a0_0000;
+const A64_MOVK_X0: u32 = 0xf280_0000;
+const A64_NOP: u32 = 0xd503_201f;
 
 fn read32(field: &[u8]) -> u32 {
     u32::from_le_bytes(field[..4].try_into().expect("four bytes"))
@@ -623,6 +725,69 @@ mod tests {
         assert_eq!(tp_offset(Arch::Aarch64, tls, 0x1008).unwrap(), 16 + 8);
         let big = Tls { align: 64, ..tls };
         assert_eq!(tp_offset(Arch::Aarch64, big, 0x1000).unwrap(), 64);
+    }
+
+    /// The words LLD's `relaxTlsGdToLe` and `relaxTlsGdToIe` write for a TLS descriptor's
+    /// four instructions, from the descriptor's own words and, as a relink starts from the
+    /// bytes the link before wrote, from the relaxed ones.
+    #[test]
+    fn an_executables_tls_descriptor_is_local_exec_or_initial_exec() {
+        use TlsDescStep::*;
+        let executable = OutputKind::Executable { entry: "_start".into() };
+        let shared = OutputKind::Shared { name: "lib.so".into(), exports: Vec::new() };
+        let read = [
+            (Apply::A64TlsDescPage21, Page, 0x9000_0000u32), // adrp x0, :tlsdesc:v
+            (Apply::A64TlsDescLo12, Load, 0xf940_0001),      // ldr x1, [x0, :tlsdesc_lo12:v]
+            (Apply::A64TlsDescAdd12, Add, 0x9100_0000),      // add x0, x0, :tlsdesc_lo12:v
+            (Apply::A64TlsDescCall, Call, 0xd63f_0020),      // blr x1
+        ];
+        for (apply, step, _) in read {
+            assert_eq!(in_output(apply, Format::Elf, &executable), Apply::A64TlsDescIe(step));
+            assert_eq!(in_output(apply, Format::Elf, &shared), apply, "a shared library keeps it");
+            assert_eq!(in_output(apply, Format::MachO, &executable), apply);
+            assert_eq!(known(Apply::A64TlsDescIe(step), true), Apply::A64TlsDescIe(step));
+            assert_eq!(known(Apply::A64TlsDescIe(step), false), Apply::A64TlsDescLe(step));
+            assert_eq!(known(apply, false), apply, "only a relaxed one is local exec");
+            assert_eq!(got_kind(apply), Some(GotKind::TlsDesc), "{apply:?}");
+            assert_eq!(got_kind(Apply::A64TlsDescIe(step)), Some(GotKind::TpOff));
+            assert_eq!(got_kind(Apply::A64TlsDescLe(step)), None);
+            assert!(is_tls(Apply::A64TlsDescLe(step)) && !is_tls(Apply::A64TlsDescIe(step)));
+        }
+        let word = |apply: Apply, ctx: &Ctx, insn: u32| {
+            let mut field = insn.to_le_bytes();
+            super::apply(apply, ctx, &mut field).map(|()| u32::from_le_bytes(field))
+        };
+        // The thread-local at 0x12335 of a block 16 bytes after the thread pointer: 0x12345.
+        let tls = Tls { addr: 0x1000, init: 8, size: 0x20000, align: 8 };
+        let local = Ctx { tls: Some(tls), ..ctx(Arch::Aarch64, 0x1000 + 0x12335, 0, 0x1000c) };
+        // movz x0, #0x1, lsl #16; movk x0, #0x2345; nop; nop
+        let le = [0xd2a0_0020u32, 0xf284_68a0, 0xd503_201f, 0xd503_201f];
+        // Through the cell at 0x7ff8 from 0x1000c: adrp x0, 0; ldr x0, [x0, #0xff8]; nop; nop
+        let imported = Ctx { g: 0x7ff8, ..ctx(Arch::Aarch64, 0, 0, 0x1000c) };
+        let ie = [0xf0ff_ffa0u32, 0xf947_fc00, 0xd503_201f, 0xd503_201f];
+        for (at, (_, step, descriptor)) in read.into_iter().enumerate() {
+            for before in [descriptor, le[at], ie[at]] {
+                assert_eq!(word(Apply::A64TlsDescLe(step), &local, before), Ok(le[at]), "{step:?}");
+                assert_eq!(word(Apply::A64TlsDescIe(step), &imported, before), Ok(ie[at]));
+            }
+        }
+        // The addend is the thread-local's: local exec adds it, a cell can't.
+        let plus = Ctx { s: 0x1000 + 0x12300, a: 0x35, ..local };
+        assert_eq!(word(Apply::A64TlsDescLe(Load), &plus, 0xf940_0001), Ok(le[1]));
+        let cell_plus = word(Apply::A64TlsDescIe(Page), &Ctx { a: 8, ..imported }, 0x9000_0000);
+        assert_eq!(cell_plus, Err(Bad::TlsCellAddend(8)));
+        // An image's fixed place for its thread-locals is the offset, whatever `tls` says.
+        let fixed = Ctx { tp: Some(0x2_0010), ..local };
+        assert_eq!(word(Apply::A64TlsDescLe(Page), &fixed, 0x9000_0000), Ok(0xd2a0_0040));
+        assert_eq!(word(Apply::A64TlsDescLe(Load), &fixed, 0xf940_0001), Ok(0xf280_0200));
+        let far = word(Apply::A64TlsDescLe(Page), &Ctx { tp: Some(1 << 32), ..local }, 0);
+        assert_eq!(far, Err(Bad::TpRange32(1 << 32)));
+        assert!(far.unwrap_err().reach());
+        let none = word(Apply::A64TlsDescLe(Page), &ctx(Arch::Aarch64, 0, 0, 0), 0);
+        assert_eq!(none, Err(Bad::NoTls));
+        let mut short = [0u8; 2];
+        let past = super::apply(Apply::A64TlsDescLe(Call), &local, &mut short);
+        assert_eq!(past, Err(Bad::PastEnd { apply: Apply::A64TlsDescLe(Call), need: 4 }));
     }
 
     #[test]

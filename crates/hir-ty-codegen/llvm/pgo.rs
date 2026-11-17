@@ -125,6 +125,10 @@ impl Profile {
 /// The profiles given, by content ID, while something holds them: a [`Profile`], or the
 /// passes a thread keeps for one ([`super::Machinery`]).
 // alloc: none until a profile is given; one entry per profile a build uses
+#[expect(
+    blaze::process_static,
+    reason = "weak rows of the profiles given, one per profile a build uses; dead rows must be pruned or the build must own the list"
+)]
 static GIVEN: Lock<Vec<(ContentId, Weak<[u8]>)>> = Lock::new("codegen.pgo.given", Vec::new());
 
 /// Gives the process the profile `bytes`, read from the store under `id`, for the builds whose

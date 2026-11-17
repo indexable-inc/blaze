@@ -140,8 +140,7 @@ mod tests {
 
     #[test]
     fn records_are_followed_as_they_are_written() {
-        let dir = std::env::temp_dir().join(format!("blaze-events-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = blaze_core::temp::TempDir::for_test("blaze-events-");
         let path = dir.join("events.1");
         let frame = |event: Event| {
             let record = crate::events::Record { at_ns: 5, event };
@@ -153,7 +152,7 @@ mod tests {
         let before = frame(Event::Said { level: Level::Note, text: "before".to_owned() });
         std::fs::write(&path, &before).unwrap();
         let len = |path: &std::path::Path| std::fs::metadata(path).unwrap().len();
-        let mut follow = super::Follow::from_now(&dir);
+        let mut follow = super::Follow::from_now(dir.path());
         assert!(follow.read(&path, len(&path)).is_empty(), "what was said before is not read");
         let started = frame(Event::Started { step: Step::Codegen, of: None });
         let ended = frame(Event::Ended { step: Step::Codegen, of: None });
@@ -171,7 +170,6 @@ mod tests {
         let other = dir.join("events.2");
         std::fs::write(&other, &before).unwrap();
         assert_eq!(follow.read(&other, len(&other)).len(), 1);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The records written since the last read, read into a kept list from the file kept open,
@@ -179,8 +177,7 @@ mod tests {
     #[test]
     fn a_warm_read_allocates_nothing() {
         use std::io::Write as _;
-        let dir = std::env::temp_dir().join(format!("blaze-events-warm-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = blaze_core::temp::TempDir::for_test("blaze-events-warm-");
         let path = dir.join("events.1");
         let record = crate::events::Record {
             at_ns: 5,
@@ -213,6 +210,5 @@ mod tests {
         records.clear();
         follow.read_into(&path, len(&path), &mut records);
         assert_eq!(records.len(), 3, "read on from the ninth frame, as a file opened again is");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -412,6 +412,121 @@ pub const fn fn_info<F: FnItem>(f: &F) -> FnInfo {
     FnInfo::of::<F>()
 }
 
+/// A type described by a value: what [`type_of!`] turns into a type (docs/v2/plan/design/type-of.md).
+/// Const code computes one (blaze-sql's checker computes a query's row and parameters); the
+/// trait solver reads its value tree, so two equal descriptions over the same arguments are one
+/// type in every crate.
+///
+/// A type the description cannot spell (`String`, a newtype of the program) is one of the
+/// `Args` of [`Described`] ([`TypeDesc::Arg`]), or reached from one through its fields
+/// ([`TypeDesc::FieldOf`]) and type arguments ([`TypeDesc::ArgOf`]). `TypeId` is no part of it:
+/// an id has no value tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crate::marker::ConstParamTy)]
+#[unstable(feature = "blaze_comptime", issue = "none")]
+pub enum TypeDesc {
+    /// A primitive type.
+    Prim(Prim),
+    /// The type at this index of [`Described`]'s `Args` tuple.
+    Arg(u32),
+    /// The type of the field at this index, in declaration order, of the described struct or
+    /// tuple.
+    FieldOf(&'static TypeDesc, u32),
+    /// The type argument at this index of the described ADT (`Option<T>`'s `T` is index 0).
+    ArgOf(&'static TypeDesc, u32),
+    /// `Option<T>` of the described `T`.
+    Option(&'static TypeDesc),
+    /// `&'a T` of the described `T`, `'a` the lifetime of [`Described`].
+    Ref(&'static TypeDesc),
+    /// `[T]` of the described `T`; only directly under [`TypeDesc::Ref`].
+    Slice(&'static TypeDesc),
+    /// The tuple of the described types.
+    Tuple(&'static [TypeDesc]),
+    /// The record of these fields (`core::record::Record` of their names sorted by their bytes
+    /// over the tuple of their types in that order), whatever order they are listed in.
+    Record(&'static [FieldDesc]),
+}
+
+/// A field of a [`TypeDesc::Record`]: its name, which is not empty and has no `,`, and its type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crate::marker::ConstParamTy)]
+#[unstable(feature = "blaze_comptime", issue = "none")]
+pub struct FieldDesc {
+    /// The field's name.
+    pub name: &'static str,
+    /// The field's type.
+    pub ty: TypeDesc,
+}
+
+/// A primitive type of a [`TypeDesc`]. `Str` is `str`, only directly under [`TypeDesc::Ref`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crate::marker::ConstParamTy)]
+#[unstable(feature = "blaze_comptime", issue = "none")]
+#[allow(missing_docs)]
+pub enum Prim {
+    Bool,
+    Char,
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
+    Isize,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+    Usize,
+    F32,
+    F64,
+    Str,
+}
+
+/// The described type `D` over the types `Args` (a tuple), with the lifetime `'a` of its
+/// references: `<Described<'a, D, Args> as TypeOf>::Type` is the type, which [`type_of!`]
+/// writes. Never a value.
+#[lang = "blaze_described"]
+#[unstable(feature = "blaze_comptime", issue = "none")]
+pub struct Described<'a, const D: TypeDesc, Args = ()> {
+    _never: PhantomData<(&'a (), Args)>,
+}
+
+/// The type a [`Described`] describes, as [`TypeOf::Type`]. Only the trait solver implements
+/// it: for a `Described` whose description names a type; for any other, it does not hold, and
+/// a description that depends on a generic parameter is a rigid alias until it is known.
+#[lang = "blaze_type_of"]
+#[rustc_deny_explicit_impl]
+#[rustc_dyn_incompatible_trait]
+#[unstable(feature = "blaze_comptime", issue = "none")]
+pub trait TypeOf {
+    /// The described type.
+    #[lang = "blaze_type_of_type"]
+    type Type: ?Sized;
+}
+
+/// The type a [`TypeDesc`] describes: `type_of!(D)`, `type_of!(D; A, B)` over the types its
+/// [`TypeDesc::Arg`]s name, and `type_of!('a, D; A, B)` with the lifetime of its
+/// [`TypeDesc::Ref`]s (`'static` when none is written).
+///
+/// ```ignore (blaze_comptime)
+/// const ROW: TypeDesc = TypeDesc::Record(&[
+///     FieldDesc { name: "name", ty: TypeDesc::Arg(0) },
+///     FieldDesc { name: "age", ty: TypeDesc::Prim(Prim::I64) },
+/// ]);
+/// type Row = type_of!(ROW; String); // `Record<"age,name", (i64, String)>`
+/// ```
+#[unstable(feature = "blaze_comptime", issue = "none")]
+#[allow_internal_unstable(blaze_comptime)]
+#[rustc_macro_transparency = "semiopaque"]
+pub macro type_of {
+    ($lt:lifetime, $desc:expr $(; $($arg:ty),* $(,)?)?) => {
+        <$crate::reflect::Described<$lt, { $desc }, ($($($arg,)*)?)>
+            as $crate::reflect::TypeOf>::Type
+    },
+    ($desc:expr $(; $($arg:ty),* $(,)?)?) => {
+        <$crate::reflect::Described<'static, { $desc }, ($($($arg,)*)?)>
+            as $crate::reflect::TypeOf>::Type
+    },
+}
+
 /// Whether `a` and `b` are the same bytes. For discriminants, which are integers, so every byte
 /// is initialized; `PartialEq` of a discriminant type is not usable in a `const` trait's body.
 const fn same_bytes<D>(a: &D, b: &D) -> bool {

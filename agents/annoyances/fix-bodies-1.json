@@ -1,0 +1,14 @@
+{
+ "id": "fix-bodies-1",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane fix-bodies",
+ "where": "crates/hir-ty/src/body_store/tests.rs (TestFacts::def_key, def_of), crates/hir-def/src/nameres/frozen.rs (Enc::finish, Dec::files, checked)",
+ "what": "hir-ty's stand-in for the item store's facts keyed every item, the record's own body included, by the hash of its `PortableIds` bytes, and those bytes carry the content ID of each file named; `def_of` turned the decode error into `None` with `.ok()?`. A record of a body read in a database whose file was edited then failed as \"it names item .., which this database does not have\", which reads as a missing item or an unstable key and was neither: the real facts name the body itself as `Rel::Own`.",
+ "cost": "the failure was handed over as a possible consequence of plain item keys in answers; finding the real reason took reading the test double, PortableIds, the frozen encoder's header and its content check",
+ "cause": "the double ignored the `body` argument `BodyFacts::def_key` documents (the body itself is \"self\"), and it dropped the decoder's own message, which names the file and both content IDs",
+ "class": "a test double that does not keep the contract of the trait it stands for, and an error turned into an absence (rule 3)",
+ "prevention": "a double of `BodyFacts` shares the relative-key rule with the real one: one `own(body)` in hir-ty that both blaze-item-hash `keys::relative` and the double call; `def_of` returning `Result<Option<..>, String>` so a decode error cannot become \"not here\"",
+ "workaround": "none",
+ "fix": "the double names the body's own item by a fixed `OWN` key and reads it back as the body's item; its doc says another item is found again only where its file is the same text. `def_of`'s signature unchanged (a whole port across four implementors)",
+ "state": "open"
+}

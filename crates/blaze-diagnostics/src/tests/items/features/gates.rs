@@ -3,9 +3,7 @@
 //! the soft gates `feature_warn` gives, and `PostExpansionVisitor`'s gates.
 
 use super::{ui, ui_core, ui_fixture};
-use crate::tests::{
-    LIBRARY_FEATURES, assert_reports, error, library_features, lints::bodies::types::ui_std,
-};
+use crate::tests::{LIBRARY_FEATURES, assert_reports, error, library_features};
 
 #[test]
 fn become_is_gated_before_expansion() {
@@ -513,25 +511,19 @@ warning: 1 warning emitted
     assert_eq!(ui("soft-feature-gate-auto_traits.rs", "2015", source), stderr);
 }
 
-/// std's `Box`, with `Box::new`, as the test uses it, and std's prelude of it.
-const BOX_STD: (&str, &str) = (
-    "pub use crate::boxed::Box;",
-    "pub mod boxed {
-    #[lang = \"owned_box\"]
-    pub struct Box<T: ?Sized>(*mut T);
-    impl<T> Box<T> {
-        pub fn new(x: T) -> Box<T> {
-            loop {}
-        }
-    }
-}
-",
-);
-
 #[test]
 fn a_box_pattern_is_removed_syntax() {
-    // tests/ui/parser/removed-syntax/removed-syntax-box-patterns.rs: `box_patterns` is removed, and the parser errors at each `box` of a pattern, a field shorthand's too
-    let source = r#"fn main() {
+    // tests/ui/parser/removed-syntax/removed-syntax-box-patterns.rs at the pinned nightly:
+    // `box_patterns` is removed (Rust 1.100), and the parser errors at each `box` of a pattern,
+    // a field shorthand's too, then goes on with the pattern under it. std's `Box` is the lang
+    // item, so the patterns under the `box`es have their types and nothing else is said.
+    let fixture = concat!(
+        "//- minicore: sized\n//- /std.rs crate:std\n#![feature(lang_items)]\n",
+        "pub mod prelude { pub mod rust_2015 { pub use core::prelude::rust_2015::*; pub use crate::boxed::Box; } }\n",
+        "pub mod boxed {\n    #[lang = \"owned_box\"]\n    pub struct Box<T: ?Sized>(*mut T);\n",
+        "    impl<T> Box<T> { pub fn new(x: T) -> Box<T> { loop {} } }\n}\n",
+        "//- /removed-syntax-box-patterns.rs crate:other:main edition:2015 deps:std\n",
+        r#"fn main() {
     let box x = Box::new('c'); //~ ERROR `box` patterns have been removed
     let _: char = x;
 
@@ -542,12 +534,66 @@ fn a_box_pattern_is_removed_syntax() {
 
     let Packet { box ref mut x }; //~ ERROR `box` patterns have been removed
 }
-"#;
-    let removed = ["`box` patterns have been removed (feature `box_patterns`)", "deref!("];
-    assert_reports(
-        &ui_std("removed-syntax-box-patterns.rs", "2015", "sized", BOX_STD, source),
-        &[error(2, &removed), error(7, &removed), error(10, &removed)],
+"#
     );
+    let stderr = r#"error: `box` patterns have been removed (feature `box_patterns`)
+  --> $DIR/removed-syntax-box-patterns.rs:2:9
+   |
+LL |     let box x = Box::new('c');
+   |         ^^^
+   |
+   = help: enable feature `deref_patterns` instead and...
+help: ...if possible just remove keyword `box`...
+   |
+LL -     let box x = Box::new('c');
+LL +     let x = Box::new('c');
+   |
+help: ...otherwise replace it with an invocation of macro `deref`
+   |
+LL -     let box x = Box::new('c');
+LL +     let deref!(x) = Box::new('c');
+   |
+
+error: `box` patterns have been removed (feature `box_patterns`)
+  --> $DIR/removed-syntax-box-patterns.rs:7:18
+   |
+LL |     let Packet { box x } = Packet { x: Box::new(0) };
+   |                  ^^^
+   |
+   = help: enable feature `deref_patterns` instead and...
+help: ...if possible just remove keyword `box`...
+   |
+LL -     let Packet { box x } = Packet { x: Box::new(0) };
+LL +     let Packet { x } = Packet { x: Box::new(0) };
+   |
+help: ...otherwise replace it with an invocation of macro `deref`
+   |
+LL -     let Packet { box x } = Packet { x: Box::new(0) };
+LL +     let Packet { x: deref!(x) } = Packet { x: Box::new(0) };
+   |
+
+error: `box` patterns have been removed (feature `box_patterns`)
+  --> $DIR/removed-syntax-box-patterns.rs:10:18
+   |
+LL |     let Packet { box ref mut x };
+   |                  ^^^
+   |
+   = help: enable feature `deref_patterns` instead and...
+help: ...if possible just remove keyword `box`...
+   |
+LL -     let Packet { box ref mut x };
+LL +     let Packet { ref mut x };
+   |
+help: ...otherwise replace it with an invocation of macro `deref`
+   |
+LL -     let Packet { box ref mut x };
+LL +     let Packet { x: deref!(ref mut x) };
+   |
+
+error: aborting due to 3 previous errors
+
+"#;
+    assert_eq!(ui_fixture(fixture), stderr);
 }
 
 #[test]

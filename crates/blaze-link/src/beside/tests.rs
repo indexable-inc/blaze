@@ -6,8 +6,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use blaze_sim::{Config, Tape};
 use gimli::{EndianSlice, LittleEndian};
-use hegel::generators as gs;
 use object::read::elf::ElfFile64;
 use object::{Endianness, Object as _, ObjectSection as _};
 
@@ -80,7 +80,9 @@ impl DebugProgram {
         let rows = (0..count)
             .map(|row| {
                 let at = (row * 3).min(size as u32 - 1);
-                (at, (seed + row as u8) % 2, 10 + u32::from(seed) * 7 + row * 300 * (row % 2), row)
+                // In u32: a seed of 255 and a row past 0 overflow a u8.
+                let of_file = ((u32::from(seed) + row) % 2) as u8;
+                (at, of_file, 10 + u32::from(seed) * 7 + row * 300 * (row % 2), row)
             })
             .collect();
         let name = (seed % 7 != 6).then(|| format!("_RNvCs{n}_1f{}", "x".repeat(seed as usize % 3)));
@@ -521,11 +523,10 @@ enum Op {
     File(u8, u8),
 }
 
-#[hegel::composite]
-fn op(tc: &hegel::TestCase) -> Op {
-    let n = tc.draw(gs::integers::<u8>().max_value(NAMES - 1));
-    let seed = tc.draw(gs::integers::<u8>());
-    match tc.draw(gs::integers::<u8>().max_value(9)) {
+fn op(tape: &Tape) -> Op {
+    let n = tape.int_in(0..=NAMES - 1, "function");
+    let seed = tape.int::<u8>("seed");
+    match tape.int_in(0..=9u8, "op") {
         0..=3 => Op::Edit(n, seed),
         4 => Op::Add(n, seed),
         5 => Op::Remove(n),
@@ -557,13 +558,15 @@ fn refines_by(ops: &[Op], plant: Plant, follow: bool) -> Result<(), String> {
 /// functions renamed, new files), the side file kept by patches resolves every function and
 /// every row as the same program's debug info linked inside does, is the bytes the model
 /// holds, and carries the executable's build id, symbols and CRC.
-#[hegel::test(test_cases = 128)]
-fn a_side_file_kept_by_patches_resolves_as_debug_info_inside(tc: hegel::TestCase) {
-    let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(12));
-    let follow = tc.draw(gs::integers::<u8>().max_value(1)) == 1;
-    if let Err(why) = refines_by(&ops, Plant::None, follow) {
-        panic!("{why}");
-    }
+#[test]
+fn a_side_file_kept_by_patches_resolves_as_debug_info_inside() {
+    blaze_sim::check(Config::cases(128), |tape| {
+        let ops: Vec<Op> = tape.vec(0..=12, "ops", op);
+        let follow = tape.int_in(0..=1u8, "follow the change") == 1;
+        if let Err(why) = refines_by(&ops, Plant::None, follow) {
+            panic!("{why}");
+        }
+    })
 }
 
 /// A function renamed in place and left out of the change keeps its old record, and the

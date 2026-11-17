@@ -89,21 +89,21 @@ fn local<'db>(analysis: &BodyAnalysis<'db>, name: &str) -> Local<'db> {
 #[test]
 fn the_tree_is_the_body_s_own_and_types_are_read_off_it() {
     let db = fixture::db(BODY).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let analysis = BodyAnalysis::new(&db, DefWithBody::from(func(&db, "takes")));
         let target = target(&db, "takes");
         let (root, file) = analysis.tree();
         assert!(matches!(file, HirFileId::FileId(_)), "{file:?}");
         assert!(root.text().starts_with("fn takes"), "{root}");
-
+    
         let (_, get) = find::<ast::Expr>(root, file, "w.get()");
         let info = analysis.type_of_expr(get).expect("a type of `w.get()`");
         assert_eq!(show(&db, &info.original, target), "u8");
-
+    
         let (_, w) = find::<ast::Pat>(root, file, "w");
         let info = analysis.type_of_pat(w).expect("a type of `w`");
         assert_eq!(show(&db, &info.original, target), "Wrap");
-
+    
         let (_, receiver) = find::<ast::Expr>(root, file, "w");
         let adjustments = analysis.expr_adjustments(receiver).expect("`w` is borrowed for `get`");
         let shown: Vec<_> = adjustments.iter().map(|it| show(&db, &it.target, target)).collect();
@@ -114,13 +114,13 @@ fn the_tree_is_the_body_s_own_and_types_are_read_off_it() {
 #[test]
 fn a_method_call_resolves_to_the_impl_s_function() {
     let db = fixture::db(BODY).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let analysis = BodyAnalysis::new(&db, DefWithBody::from(func(&db, "takes")));
         let (root, file) = analysis.tree();
         let (call, ptr) = find::<ast::MethodCallExpr>(root, file, "w.show()");
         let method = analysis.resolve_method_call(ptr).expect("`show` resolves");
         assert_eq!(method.name(&db).as_str(), "show");
-
+    
         let id = analysis
             .source_map()
             .store
@@ -136,10 +136,10 @@ fn a_method_call_resolves_to_the_impl_s_function() {
 #[test]
 fn paths_and_names_resolve_in_the_scope_of_their_block() {
     let db = fixture::db(BODY).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let analysis = BodyAnalysis::new(&db, DefWithBody::from(func(&db, "takes")));
         let (root, file) = analysis.tree();
-
+    
         let (_, wrap) = find::<ast::Path>(root, file, "Wrap");
         match analysis.resolve_path(wrap).unwrap() {
             Some(PathResolution::Def(ModuleDef::Adt(it))) => {
@@ -149,7 +149,7 @@ fn paths_and_names_resolve_in_the_scope_of_their_block() {
         }
         let (_, n) = find::<ast::Path>(root, file, "n");
         assert!(matches!(analysis.resolve_path(n).unwrap(), Some(PathResolution::Local(_))));
-
+    
         let (sum, _) = find::<ast::Expr>(root, file, "a + b + c");
         let at = InFile::new(file, view::ptr(sum.syntax()));
         let inner = Name::new_symbol_root(intern::Symbol::intern("Inner"));
@@ -167,7 +167,7 @@ fn paths_and_names_resolve_in_the_scope_of_their_block() {
 #[test]
 fn types_resolve_in_the_body_the_signature_and_a_nested_item() {
     let db = fixture::db(BODY).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let analysis = BodyAnalysis::new(&db, DefWithBody::from(func(&db, "takes")));
         let target = target(&db, "takes");
         let (root, file) = analysis.tree();
@@ -190,14 +190,14 @@ fn types_resolve_in_the_body_the_signature_and_a_nested_item() {
 #[test]
 fn a_macro_call_resolves_and_its_expressions_are_where_the_call_is() {
     let db = fixture::db(BODY).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let analysis = BodyAnalysis::new(&db, DefWithBody::from(func(&db, "takes")));
         let (root, file) = analysis.tree();
         let (call, ptr) = find::<ast::MacroCall>(root, file, "twice!(n)");
         let mac = analysis.resolve_macro_call(ptr).expect("`twice` resolves");
         assert_eq!(mac.name(&db).as_str(), "twice");
         let expansion = analysis.expansion(ptr).expect("the call is of the body");
-
+    
         let in_expansion: Vec<ExprId> = analysis
             .body()
             .store
@@ -217,13 +217,13 @@ fn a_macro_call_resolves_and_its_expressions_are_where_the_call_is() {
 #[test]
 fn a_moved_local_is_consumed_and_a_read_one_is_not() {
     let db = fixture::db(BODY).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let analysis = BodyAnalysis::new(&db, DefWithBody::from(func(&db, "takes")));
         assert!(analysis.consumes(local(&analysis, "v")));
         assert!(!analysis.consumes(local(&analysis, "r")));
         assert!(!analysis.consumes(local(&analysis, "n")));
         assert!(!analysis.consumes(local(&analysis, "w")));
-
+    
         let captures = BodyAnalysis::new(&db, DefWithBody::from(func(&db, "captures")));
         let p = local(&captures, "p");
         assert!(captures.consumes(p), "a `move` closure moves what it captures");
@@ -235,7 +235,7 @@ fn a_moved_local_is_consumed_and_a_read_one_is_not() {
 #[test]
 fn a_body_a_macro_writes_is_read_off_its_expansion() {
     let db = fixture::db(BODY).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let analysis = BodyAnalysis::new(&db, DefWithBody::from(func(&db, "made")));
         let target = target(&db, "made");
         let (root, file) = analysis.tree();

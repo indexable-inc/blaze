@@ -22,8 +22,10 @@
 //! one whose output, read variables or given strings still hold a root once ported ([`left`],
 //! a literal the macro made of `CARGO_MANIFEST_DIR`) is kept here alone.
 //!
-//! Not kept: an expansion that asked the database about a span (its text, file or line),
-//! since the key does not say what it was told; one whose output has an anchor or a context
+//! Not kept: an expansion that asked the database about a span (its text, file, line or
+//! join with another), since the key does not say what it was told (where the answer is a
+//! function of the calling crate's sources by position, what it read is still known, and
+//! the unit and image made from it are kept: `blaze-macro-eval`'s `Asked::by_position`); one whose output has an anchor or a context
 //! its input has not, which the next call could not be given back; one that read what can't
 //! be traced (the clock, randomness); and one that failed. `BLAZE_PROC_MACRO_CACHE=check`
 //! expands every call it finds kept anyway, and an output other than the kept one is an error
@@ -204,6 +206,9 @@ struct Seen<'a> {
     call: &'a Env,
     made: Option<inputs::Env>,
     /// What file, directory and listing reads are asked through: no variable is read there.
+    /// Their looks at the disk are kept by no build ([`base_db::Looks::none`]): an
+    /// expansion's lookup is shared by every job, and what it read is in the reads of the
+    /// unit's record, which each build that uses the unit takes.
     none: inputs::Env,
 }
 
@@ -228,15 +233,15 @@ impl Inputs for Seen<'_> {
         &mut self,
         path: &std::path::Path,
     ) -> Result<blaze_usercode::trace::Entry, Self::Error> {
-        inputs::Now { files: inputs::Files::shared(), env: &self.none }.entry(path)
+        inputs::Now { files: inputs::Files::shared(), env: &self.none, looks: &base_db::Looks::none() }.entry(path)
     }
 
     fn file(&mut self, path: &std::path::Path) -> Result<Option<[u8; 32]>, Self::Error> {
-        inputs::Now { files: inputs::Files::shared(), env: &self.none }.file(path)
+        inputs::Now { files: inputs::Files::shared(), env: &self.none, looks: &base_db::Looks::none() }.file(path)
     }
 
     fn dir(&mut self, path: &std::path::Path) -> Result<Option<[u8; 32]>, Self::Error> {
-        inputs::Now { files: inputs::Files::shared(), env: &self.none }.dir(path)
+        inputs::Now { files: inputs::Files::shared(), env: &self.none, looks: &base_db::Looks::none() }.dir(path)
     }
 
     fn env(&mut self, name: &std::ffi::OsStr) -> Option<&std::ffi::OsStr> {
@@ -256,7 +261,7 @@ impl Inputs for Seen<'_> {
         path: &std::path::Path,
         out: &mut blaze_usercode::trace::Names<'_>,
     ) -> Result<bool, Self::Error> {
-        inputs::Now { files: inputs::Files::shared(), env: &self.none }.names(path, out)
+        inputs::Now { files: inputs::Files::shared(), env: &self.none, looks: &base_db::Looks::none() }.names(path, out)
     }
 }
 
@@ -472,6 +477,10 @@ pub struct Spans {
     contexts: Vec<SyntaxContext>,
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "one per-thread shelf holding the room of the last Spans dropped there, uncapped: it keeps the most spans one call grew"
+)]
 thread_local! {
     /// The room of the last [`Spans`] dropped on this thread.
     // alloc: none, an empty shelf; what it keeps is grown by the calls.
@@ -733,7 +742,8 @@ mod budget {
             store.complete(completion, effects);
         }).expect("the effects end");
         assert!(store.ready());
-        let lib = std::env::temp_dir().join(format!("blaze-kept-budget-{}", std::process::id()));
+        let held = blaze_core::temp::TempDir::for_test("blaze-kept-budget-");
+        let lib = held.join("lib");
         std::fs::write(&lib, b"a macro's library").unwrap();
         let hash = inputs::hash_reader(b"a macro's library".as_slice()).unwrap();
         let run = RunKey {
@@ -770,7 +780,7 @@ mod budget {
             &mut find
         ));
         drop(guard);
-        _ = std::fs::remove_file(&lib);
+        drop(held);
     }
 
     /// What an expansion that read a file reports is what [`reads_in`] works out of its shape
@@ -787,7 +797,8 @@ mod budget {
             store.complete(completion, effects);
         }).expect("the effects end");
         assert!(store.ready());
-        let read = std::env::temp_dir().join(format!("blaze-kept-reads-{}", std::process::id()));
+        let held = blaze_core::temp::TempDir::for_test("blaze-kept-reads-");
+        let read = held.join("read");
         std::fs::write(&read, b"included").unwrap();
         let hash = inputs::hash_reader(b"included".as_slice()).unwrap();
         let traced = Traced {
@@ -821,6 +832,6 @@ mod budget {
         assert_ne!(reads_in(&[], &other, &shape), Ok(reported));
         std::fs::write(&read, b"included, and changed").unwrap();
         assert_ne!(reads_in(&[], &call, &shape), Ok(reported));
-        _ = std::fs::remove_file(&read);
+        drop(held);
     }
 }

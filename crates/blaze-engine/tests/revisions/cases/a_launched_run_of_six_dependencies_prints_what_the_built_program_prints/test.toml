@@ -1,0 +1,22 @@
+about = "A launched run of a program over six registry crates (regex, hashbrown, bitflags, itoa, memchr, smallvec, pinned by harness/v2/versus/six's lock) is the program `blaze build` makes: cold, after a body edit, and under a second home whose store is a copy of the first's and whose `$CARGO_HOME` is another directory. A registry crate's files are named under `$CARGO_HOME` (cargo passes their roots so), and the program prints the directory a panic inside hashbrown names: a bind key that left out what the build calls the files (hir-ty-codegen's `naming_of`) would serve the second home the record bound under the first, and the run would print the first's, which the case's `prints` and `as_built` both catch."
+drivers = ["real"]
+
+[[revision]]
+action = "run"
+env = { CARGO_HOME = "../cargo-first" }
+prints = "a lookup of a missing key panicked in cargo-first\nsix: 55 8 true\n"
+as_built = true
+spans = { "codegen walk" = 0 }
+
+[[revision]]
+action = "run"
+prints = "a lookup of a missing key panicked in cargo-first\nsix: 56 8 true\n"
+as_built = true
+
+# Another home, and a `$CARGO_HOME` that names the registry crates' files otherwise.
+[[revision]]
+steps = ["home second"]
+action = "run"
+env = { CARGO_HOME = "../cargo-second" }
+prints = "a lookup of a missing key panicked in cargo-second\nsix: 56 8 true\n"
+as_built = true

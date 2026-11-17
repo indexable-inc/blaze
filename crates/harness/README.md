@@ -14,6 +14,16 @@ Only blaze can: harness-native-render takes Kip's shaders from blaze's device bu
 harness-native-shaders (`artifact = "gpu"`, docs/future/gpu/shaders.md), a dependency cargo
 refuses to read.
 
+Install the existing release build as a regular macOS app (Finder, Spotlight and Dock):
+
+    uv run --frozen crates/harness/scripts/cef.py '{"op": "install"}'
+
+This installs `/Applications/blaze.app` with the blaze icon, GUI, daemon, Bun, kernel dependencies and
+the already-bundled `Harness Browser.app`. It preserves running sessions. Build the binaries and
+bundle the browser first; `target_dir`, `profile` and `destination` can select another build or
+`~/Applications/blaze.app`. The installer verifies the app's ad-hoc signature before replacing
+an existing harness installation. Agent CLIs use the tool PATH captured at installation.
+
 ## Map
 
 | Path | What |
@@ -34,11 +44,16 @@ refuses to read.
 | `vendor/` | the hyperion-* crates over flecs (flecs itself is the indexable-inc/flecs fork, pinned by rev in `vendor/hyperion-flecs-c/Cargo.toml`; `vendor/SOURCE.md`) |
 | `scripts/zig` | fetches the pinned zig through Nix |
 | `scripts/harness` | builds (with blaze) and runs the `harness` binary from this checkout |
-| `mcp/` | the Bun/TypeScript kernel the daemon runs (`mcp/src/mcp.ts`; `bun install` in `mcp/`), with its smoke scripts in `mcp/scripts/` |
+| `mcp/` | the Bun/TypeScript kernel the daemon runs: one API (`mcp/src/kernel.ts`) behind an MCP adapter (`mcp/src/mcp.ts`) and its own socket (`mcp/src/serve.ts`); `bun install` and `bun test` in `mcp/`; `mcp/scripts/cell.ts` runs cells from a shell |
 | `mcp/skills/` | harness's skills: one topic's instructions each (`<name>.md` with `name` and `description` front matter); the agent's note carries only their index, `await skill('name')` in ts loads one (`harness/src/skills.rs`, `mcp/src/skills.ts`) |
 | `harness/src/system_note/` | the always-on part of every agent's note, one file per topic (`harness/src/profiles.rs`) |
 
 ## Skills
+
+Every agent's note starts with the goal-understanding policy: recover the root objective, concrete constraints and
+success criteria, and ranked priorities from context; use the existing `ask()` UI for material gaps and challenge
+misaligned proxy metrics with evidence. Every question addressed to the person, including casual questions,
+uses `await ask(...)` rather than a question in plain chat text. Clear small requests stay autonomous.
 
 An agent's system note carries what every turn needs (`harness/src/system_note/`) and ends with an index of skills,
 one line each (name and description), generated from the skill files at each launch. The full text of a skill loads
@@ -51,6 +66,11 @@ serves are one list, for claude, codex and cursor alike. A topic only some tasks
 
 The daemon finds the TypeScript kernel at `$HARNESS_ROOT/src/mcp.ts`, by default `crates/harness/mcp`
 in the checkout it was built from. UI work: the `flecs-ui` skill (`.agents/skills/flecs-ui`).
+
+For offscreen visual checks, `HARNESS_NATIVE_SHOT_CALLS=<file.json>` schedules live native world calls:
+`[{"at": 0.8, "call": {"op": "emotion", "device": "/private/tmp/shot/harnessd.sock", "session": 1,
+"emotion": "focused", "reason": "Checking the design"}}]`. Use a private `HARNESS_HOME` and shot fixture;
+calls are never journaled. The input is bounded to 1 MiB, 128 calls, and times within the shot duration.
 
 ## Protocol and chat logs
 

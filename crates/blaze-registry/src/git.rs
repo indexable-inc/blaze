@@ -10,6 +10,8 @@
 //! bytes git says it received, and a fetch that prints nothing for
 //! [`blaze_fetch::progress::STALL`] is killed and fails as [`Stalled`].
 
+mod repository;
+
 use std::{
     collections::VecDeque,
     io::{self, Read as _},

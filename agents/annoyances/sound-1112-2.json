@@ -1,0 +1,17 @@
+{
+ "id": "sound-1112-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane sound-1112",
+ "where": "/root/loop.sh on blaze-vm: a pushed manifest change without its Cargo.lock line",
+ "what": "A commit that added a dev-dependency (hegeltest to blaze-engine) was pushed before its Cargo.lock line; the queue`s cargo wrote the line into /root/blaze itself, and the next caller`s `git checkout --detach` stopped with `Your local changes to the following files would be overwritten by checkout: Cargo.lock` for every lane until the file was restored (`flock /root/loop.lock git checkout -- Cargo.lock`, done by this lane by hand, which the script`s header forbids).",
+ "cost": "one failed queue call; the queue was unusable for about a minute",
+ "cause": "loop.sh builds without `--locked` in a tree it then expects clean",
+ "whys": [
+  "cargo updates a lock file that lacks a line",
+  "the shared tree is both a build directory and a checkout"
+ ],
+ "class": "a build that writes into the tree it was given",
+ "prevention": "loop.sh: `cargo build --locked` (the caller sees `the lock file needs to be updated` as its own failure) and `git checkout -f --detach`; on the Mac `cargo metadata --offline` refreshes the lock without building",
+ "workaround": "refresh and commit Cargo.lock with the manifest",
+ "state": "open: loop.sh is the main agent`s"
+}

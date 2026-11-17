@@ -373,10 +373,10 @@ theorem killFirst_refines {B : FnId → Local → Prop} {g : List (Nat × FnId)}
   | s :: rest, st, hs, htop, hfn, hB => by
     rw [killFirst_cons]
     by_cases hk : killable bw s rest = true
-    · rw [if_pos hk]
+    · rw [ite_eq_left hk]
       exact killable_refines adts sig term fn bw hbw hf hpos hs htop hfn rest
         (fun s' m => hB s' (List.mem_cons.mpr (Or.inr m))) s hk
-    · rw [if_neg hk]
+    · rw [ite_eq_right hk]
       have hsB : StmtFine B fn s := hB s (List.mem_cons.mpr (Or.inl rfl))
       exact Outcome.Refines.bind (fun st1 h1 =>
         killFirst_refines adts sig term fn bw hbw hf hpos rest st1

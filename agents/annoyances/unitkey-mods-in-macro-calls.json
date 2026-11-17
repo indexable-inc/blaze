@@ -1,0 +1,18 @@
+{
+  "id": "unitkey-mods-in-macro-calls",
+  "date": "2026-11-14",
+  "who": "claude-opus-5-5 (Claude Opus 5.5), command/unitkey lane, round two",
+  "where": "crates/blaze-unitkey/src/image.rs (Walk::call_mods), crates/blaze-unitkey/src/mods.rs, crates/blaze-unitkey/src/quiet.rs",
+  "what": "core's surface task was refused OutsideSourceRoot because the gather skipped `#[path = \"io_slice/repr_iovec.rs\"] mod repr;` inside a `cfg_select!` call; a first fix evaluated cfg_select!/cfg_if! by name and was replaced in the same round by a name-agnostic token rule",
+  "cost": "one round of a lane writing a cfg evaluator for two macro names, then deleting it",
+  "cause": "the image only made mod rows for parsed `mod` items; `cfg_select` was in QUIET as if it wrote no items",
+  "whys": [
+    "macro calls were treated as opaque to the gather",
+    "the key comes before expansion, so no expansion can say which files a call names",
+    "the first fix matched macros by name, which libc's own cfg_if! and compiler_builtins' cfg_select_nofmt! would have needed one by one"
+  ],
+  "class": "an input set derived from a parse that skips macro token trees",
+  "prevention": "every item-level macro call's tokens are scanned for `mod` declarations, all candidate files over-approximated; the std test asserts the census list of such files",
+  "workaround": "none needed now",
+  "state": "fixed in the tree, not compiled"
+}

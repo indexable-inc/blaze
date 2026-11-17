@@ -368,7 +368,7 @@ mod tests {
 
     #[test]
     fn an_outcome_prints_as_report_py_prints_it() {
-        let mut rep = Report::new("share.py", &spec(), "/tmp/x/../r.json");
+        let mut rep = Report::new("share.py", &spec(), "/out/x/../r.json");
         let o = rep.add("share/a", Verdict::Pass, "", vec![("blaze_s", Number::Float(1.5)), ("n", Number::Int(2))]);
         assert_eq!(o.line(), "PASS       share/a  blaze_s=1.5  n=2");
         let o = rep.add("b", Verdict::Unmeasured, &format!("{}\nsecond", "x".repeat(300)), vec![]);
@@ -376,7 +376,7 @@ mod tests {
         let o = rep.add("c", Verdict::Fail, "why", vec![("ok", Number::Bool(true)), ("none", Number::None)]);
         assert_eq!(o.line(), "FAIL       c  ok=True  none=None  why");
         rep.add("d", Verdict::Pass, "", vec![]);
-        assert_eq!(rep.summary(), "share.py: 1 fail, 2 pass, 1 unmeasured; result /tmp/x/../r.json");
+        assert_eq!(rep.summary(), "share.py: 1 fail, 2 pass, 1 unmeasured; result /out/x/../r.json");
         assert_eq!(rep.failing().len(), 2);
     }
 

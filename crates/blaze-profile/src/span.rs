@@ -38,7 +38,7 @@ use arrow_array::{
     cast::AsArray,
     types::{UInt32Type, UInt64Type},
 };
-use blaze_graph::wait::WaitKind;
+use blaze_graph::wait::{OwnedBy, WaitKind};
 use blaze_hash::HashMap;
 use std::alloc::Global;
 
@@ -77,6 +77,10 @@ impl PartialEq for Name {
 
 impl Eq for Name {}
 
+#[expect(
+    blaze::process_static,
+    reason = "a per-thread memo of span names by their static text, bounded by the span sites compiled into the program"
+)]
 thread_local! {
     /// The names [`Name::kept`] gave on this thread, by the address and length of their text.
     // alloc: once per thread, grown to the kept names it opens spans of
@@ -294,7 +298,7 @@ macro_rules! enum_values {
     )*};
 }
 
-enum_values!(Outcome, WaitKind, ModuleFrom);
+enum_values!(Outcome, WaitKind, ModuleFrom, OwnedBy);
 
 /// The fields a column of value `V` may have: `V`, or `Option<V>` where it may go unsaid.
 pub trait FieldOf<V: Value>: Value {}
@@ -306,7 +310,7 @@ macro_rules! fields_of {
     )*};
 }
 
-fields_of!(Name, u64, Outcome, WaitKind, ModuleFrom);
+fields_of!(Name, u64, Outcome, WaitKind, ModuleFrom, OwnedBy);
 
 // --- Columns ----------------------------------------------------------------------------
 
@@ -606,6 +610,15 @@ pub(crate) fn open_raw<K: Span>(kind: K) -> u64 {
 
 pub(crate) fn close_raw(id: u64) {
     close_id(id);
+}
+
+/// The open `wait` span `id` was woken by job `by`: its `owner` and `owned_by` from now on, for
+/// a wait that knows its waker only as it ends (`blaze_graph::wait::wait_woken`).
+pub(crate) fn woken_raw(id: u64, by: u64) {
+    flight::said_after(id, |said| {
+        put::<col::Owner, Option<u64>>(said, Some(by));
+        put::<col::OwnedBy, OwnedBy>(said, OwnedBy::Job);
+    });
 }
 
 // --- Reading back -----------------------------------------------------------------------
@@ -947,7 +960,7 @@ span_kinds! {
         Awaits = "awaits" (Utf8): Name,
             "what a `wait` waits for: a query's key, a lock, a channel, a scope and the span its caller opened it in; every `wait` has it. For an `admission` span, what held the task back: memory, a work or io thread, or nothing";
         Owner = "owner" (U64): u64,
-            "who runs what a `wait` waits for (for a key, the job running it, as `switches.job` names it; null when not known), or the job that holds a `hold`";
+            "who runs what a `wait` waits for when that is one job (for a key, the job running it, as `switches.job` names it; for a wait that said who woke it as it ended, that job; null when `owned_by` is not `job`), or the job that holds a `hold`";
         Steps = "steps" (U64): u64,
             "the basic blocks a `macro expand` ran on the evaluator, or the instances a `build script proof` walked (the same on a cold, warm or busy daemon: the margin under its bound); null for a compiled run, a run or proof that did not end, and any other span";
         PeakBytes = "peak_bytes" (U64): u64,
@@ -966,6 +979,8 @@ span_kinds! {
             "the span open on the thread that gave a `job` span's job to the pool, as `span_id` numbers it in the same process: what the job stands on when no job gave it (the daemon's loop on no fiber), which the critical path crosses into; null when the giver was inside no span, and for any other span";
         GrantedBytes = "granted_bytes" (U64): u64,
             "the memory the plane granted a daemon `task` as it started: its predicted peak (`blaze_graph::admission`), what its memory admission held it to; against `peak_bytes`, how far off the forecast was; null for any other span";
+        ForecastBasis = "forecast_basis" (Utf8): Name,
+            "where a daemon `task`'s or `admission`'s forecast (its `granted_bytes`) came from (`blaze_graph::forecast::Basis`): `own record` (its learn key's last runs), `size x kind's measured rate`, `kind's measured peak`, `unseen kind's default`, or `given` (not forecast); against `peak_bytes`, which part of the model was off; null for any other span and in files of a blaze before it";
         Passed = "passed" (U64): u64,
             "the times a daemon `task` was passed over for memory before it started: another task started while its granted bytes did not fit (0: memory never held it back); null for any other span";
         Node = "node" (U64): u64,
@@ -976,6 +991,8 @@ span_kinds! {
             "the bytes a daemon `task`'s work freed to the global heap in all, whoever allocated them (a memo it replaced counts); null as `heap_allocated_bytes` is";
         Fields = "fields" (Utf8): Name,
             "an ad hoc span's fields that fill no other column, as `key=value` text in the order it recorded them, a space between (cut at 1 KiB): a field of any name is kept, so adding one needs no column; null for a span with none, for a span of a kind, and for one too short for a row of its own (`folded`); null in files of a blaze before it";
+        OwnedBy = "owned_by" (Dict): OwnedBy,
+            "who ends a `wait`, said by every one: `job` (its `owner` names it), or what stands in a job's place: `the scope's jobs`, `whoever sends` (a channel or a signal), `the kernel` (io), `the child`, `the lock's holder` (a thread, in `lock_waits`), `the daemon` (a client's wait for its answer, which the critical path crosses at the daemon's answer) or `not said` (a key's wait whose caller named no runner: a bug at that call); null for any other span and in files of a blaze before it";
     }
     kinds {
         /// A unit's names phase: its crate's names resolved, or its record replayed.
@@ -993,8 +1010,10 @@ span_kinds! {
         MacroExpand = "macro expand" { path: Name => Function, krate: Name => Crate }
             => MacroExpanded { steps: Option<u64> => Steps, peak_bytes: Option<u64> => PeakBytes, outcome: Outcome => Outcome }
         /// A thread or fiber blocked on `awaits` (also its `function`, which the sketches key
-        /// by), run by `owner` when known.
-        Wait = "wait" { awaits: Name => Awaits, function: Name => Function, owner: Option<u64> => Owner, on: WaitKind => WaitsOn }
+        /// by), ended by `by`: the job `owner` when `by` is a job, else what stands in a job's
+        /// place. Every wait says `by` (rule every-wait-says-what): a site that leaves it out
+        /// does not compile.
+        Wait = "wait" { awaits: Name => Awaits, function: Name => Function, owner: Option<u64> => Owner, on: WaitKind => WaitsOn, by: OwnedBy => OwnedBy }
         /// A hold of `what` by `holder`: what a waiter's `owner` names.
         Hold = "hold" { what: Name => Function, holder: u64 => Owner }
         /// A job a pool runs, `kind` the type of its closure (or of the plane's runner), from
@@ -1021,12 +1040,13 @@ span_kinds! {
         /// One run of a daemon plane task on a thread (`blaze_cargo::serve::plane`): `kind` its
         /// task kind and subsystem (`unit bodies (infer)`), `node` the plane node it ran as,
         /// `granted` the memory the plane granted it (its predicted peak) and `passed` the
-        /// times it was passed over for memory before it started, `krate` and `unit` the unit
+        /// times it was passed over for memory before it started, `basis` where its forecast came
+        /// from (`blaze_graph::forecast::Basis`), `krate` and `unit` the unit
         /// it is a phase of as the unit phase spans name it (none for a task of no unit); as
         /// it ends, `peak` the most it held, and `heap_allocated` and `heap_freed` what it
         /// allocated and freed of the global heap in all. The unit phase and query spans of its
         /// work are under it.
-        Task = "task" { kind: Name => Function, node: u64 => Node, granted: u64 => GrantedBytes, passed: u64 => Passed, krate: Option<Name> => Crate, unit: Option<Name> => Unit }
+        Task = "task" { kind: Name => Function, node: u64 => Node, granted: u64 => GrantedBytes, passed: u64 => Passed, basis: Name => ForecastBasis, krate: Option<Name> => Crate, unit: Option<Name> => Unit }
             => TaskEnded { peak: Option<u64> => PeakBytes, heap_allocated: Option<u64> => HeapAllocated, heap_freed: Option<u64> => HeapFreed }
         /// A daemon plane task's wait for admission (`blaze_cargo::serve::plane`): from the
         /// step its node became ready to the step it started, `kind` its task kind as its
@@ -1034,10 +1054,10 @@ span_kinds! {
         /// queues the task), so it is [`detached`]: on no thread's stack, under no span. As
         /// it ends, `waited_for` what held it back (memory when another task with memory
         /// started while it did not fit, else a thread of its pool, or nothing when it started
-        /// in the step it became ready), `passed` and `granted` as its `task` span's. One
+        /// in the step it became ready), `passed`, `granted` and `basis` as its `task` span's. One
         /// that never started (its request cancelled, it settled from the memo) ends unsaid.
         Admission = "admission" { kind: Name => Function, node: u64 => Node }
-            => Admitted { waited_for: Name => Awaits, passed: u64 => Passed, granted: u64 => GrantedBytes }
+            => Admitted { waited_for: Name => Awaits, passed: u64 => Passed, granted: u64 => GrantedBytes, basis: Name => ForecastBasis }
     }
 }
 
@@ -1107,7 +1127,13 @@ mod tests {
             outcome: Outcome::MemoryLimit,
         };
         let awaits = Name::of("span kinds key");
-        let wait = Wait { awaits, function: awaits, owner: Some(7), on: WaitKind::Channel };
+        let wait = Wait {
+            awaits,
+            function: awaits,
+            owner: Some(7),
+            on: WaitKind::Channel,
+            by: OwnedBy::Job,
+        };
         let hold = Hold { what: Name::of("span kinds round"), holder: 9 };
         let tid = std::thread::spawn(move || {
             drop(UnitNames { krate, unit }.open());

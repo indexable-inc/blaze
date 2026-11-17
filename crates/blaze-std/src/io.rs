@@ -71,6 +71,7 @@ use crate::{
     mem::Mem,
     net::Net,
     opener::Opener,
+    out::{Out, Stream},
     power::Power,
     requests::Http,
     rng::Rng,
@@ -173,6 +174,8 @@ impl Backend {
         }
     }
 
+    /// A test's view: the lib asks no driver how much it holds.
+    #[cfg(test)]
     fn in_flight(&self) -> usize {
         match self {
             #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
@@ -337,6 +340,10 @@ offers! {
     http,
     /// Streams the host carries for the program ([`Io::streams`]).
     streams,
+    /// Standard output ([`Io::out`]).
+    out,
+    /// Standard error ([`Io::err`]).
+    err,
 }
 
 impl Offers {
@@ -351,6 +358,8 @@ impl Offers {
         rng: true,
         mem: true,
         host: true,
+        out: true,
+        err: true,
         ..Offers::NONE
     };
 }
@@ -395,6 +404,8 @@ pub struct SimWorld {
 impl SimWorld {
     /// The world of [`Io::sim`]: no faults beyond latency, no environment, no arguments, the
     /// simulated host, every capability offered, with the bounds `limits`.
+    #[blaze::pure]
+    #[blaze::nonblocking]
     pub fn new(seed: u64, limits: Limits) -> SimWorld {
         SimWorld {
             limits,
@@ -578,6 +589,9 @@ impl Io {
     }
 
     /// What the host offers: fixed when this `Io` was made.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn offers(&self) -> Offers {
         self.offers
     }
@@ -651,6 +665,45 @@ impl Io {
 
     pub fn need_mem(&self) -> Result<Mem, Missing> {
         self.mem().ok_or(Missing { capability: "mem" })
+    }
+
+    /// Standard output, if the host offers it.
+    pub fn out(&self) -> Option<Out> {
+        self.offered(|it| it.out).then(|| Out::new(self.clone(), Stream::Out))
+    }
+
+    /// Standard output, which `main` requires.
+    pub fn need_out(&self) -> Result<Out, Missing> {
+        self.out().ok_or(Missing { capability: "out" })
+    }
+
+    /// Standard error, if the host offers it: an [`Out`] of the other stream.
+    pub fn err(&self) -> Option<Out> {
+        self.offered(|it| it.err).then(|| Out::new(self.clone(), Stream::Err))
+    }
+
+    /// Standard error, which `main` requires.
+    pub fn need_err(&self) -> Result<Out, Missing> {
+        self.err().ok_or(Missing { capability: "err" })
+    }
+
+    /// `parts`, in order, on this world's `stream`, as one write: kept by the simulated host
+    /// ([`SimHost::out`], [`SimHost::err`]), or written to the process's by `rt`.
+    pub(crate) fn write_out(&self, stream: Stream, parts: &[&[u8]]) -> Result<(), String> {
+        let mut world = self.world.lock();
+        match world.hosted.as_deref_mut() {
+            Some(host) => {
+                let kept = match stream {
+                    Stream::Out => &mut host.out,
+                    Stream::Err => &mut host.err,
+                };
+                for part in parts {
+                    kept.extend_from_slice(part);
+                }
+                Ok(())
+            }
+            None => crate::rt::write_out(stream, parts),
+        }
     }
 
     /// Sockets, if the host offers them (a wasm worker does not).
@@ -989,11 +1042,19 @@ impl Io {
         }
         change(&mut world.changed, &effect, tag.0 + 1);
         let World { driver, effects, disk, .. } = &mut *world;
-        if let (Some(disk), Some(sim)) = (disk.as_deref_mut(), driver.sim()) {
+        // A machine whose power `bstd::test` cut takes nothing: its ledger is told nothing.
+        if let (Some(disk), Some(sim)) = (disk.as_deref_mut(), driver.sim().filter(|sim| !sim.is_off())) {
             disk.submitted(sim, &effect);
         }
         effects.push(effect);
         driver.submit(effects);
+        // Under `bstd::test` the armed simulation cuts the power at an effect of its seed's: the
+        // world crashes and the program's start ends here, unwound, with the lock let go first.
+        let cut = driver.sim().is_some_and(Sim::cut_due);
+        drop(world);
+        if cut {
+            crate::simtest::power_lost(self);
+        }
         tag
     }
 
@@ -1052,6 +1113,7 @@ impl Io {
 
     /// How many effects the driver holds that have not completed: a test's view of whether
     /// anything a wait gave back is still in flight.
+    #[cfg(test)]
     pub(crate) fn in_flight(&self) -> usize {
         self.world.lock().driver.in_flight()
     }
@@ -1147,6 +1209,7 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
         | Effect::Map { file, .. } => named(file, false),
         Effect::Append { file, .. }
         | Effect::Sync { file, .. }
+        | Effect::Barrier { file, .. }
         | Effect::WriteBack { file, .. }
         | Effect::Truncate { file, .. }
         | Effect::Write { file, .. }
@@ -1165,12 +1228,29 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
             named(from, true);
             named(to, true);
         }
+        // A copy of a file's data reads `from` and makes `to`.
+        Effect::CopyData { from, to, .. } => {
+            named(from, false);
+            named(to, true);
+        }
+        // A prewarm reads which pages of `like` are cached and asks for those of `file`: it
+        // names both and changes neither.
+        Effect::Prewarm { like, file, .. } => {
+            named(like, false);
+            named(file, false);
+        }
         Effect::List { dir, .. } | Effect::Entries { dir, .. } | Effect::Watch { dir, .. } => named(dir, false),
         Effect::Private { dir, .. }
         | Effect::MakeDir { dir, .. }
         | Effect::RemoveDir { dir, .. }
         | Effect::SyncDir { dir, .. } => named(dir, true),
         Effect::Journal { dir, .. } => named(dir, false),
+        // A batch of reads names each part's file, and changes none.
+        Effect::ReadMany { parts, .. } => {
+            for part in parts {
+                named(&part.file, false);
+            }
+        }
         Effect::Unlock { .. }
         | Effect::Unwatch { .. }
         | Effect::Stamp { .. }
@@ -1191,6 +1271,7 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
         | Effect::SendTo { .. }
         | Effect::RecvFrom { .. }
         | Effect::Unbind { .. }
+        | Effect::Resolve { .. }
         | Effect::ReadStdin { .. }
         | Effect::WriteOut { .. }
         | Effect::Now { .. }
@@ -1219,12 +1300,14 @@ fn change(changed: &mut BTreeMap<FileName, u64>, effect: &Effect, stamp: u64) {
             // clone: the table's key, a refcount.
             changed.insert(to.clone(), stamp);
         }
-        Effect::Clone { to, .. } | Effect::Link { to, .. } => {
+        Effect::Clone { to, .. } | Effect::CopyData { to, .. } | Effect::Link { to, .. } => {
             // clone: the table's key, a refcount.
             changed.insert(to.clone(), stamp);
         }
-        // Everything else leaves every file's bytes and names as they were.
-        _ => {}
+        // Everything else leaves every file's bytes and names as they were: a barrier orders
+        // what was written and a prewarm asks the page cache to read ahead, as a sync and a
+        // write-back change no byte.
+        Effect::ReadAll { .. } | Effect::Read { .. } | Effect::ReadInto { .. } | Effect::ReadMany { .. } | Effect::ReadLink { .. } | Effect::Sync { .. } | Effect::Barrier { .. } | Effect::Prewarm { .. } | Effect::WriteBack { .. } | Effect::SyncDir { .. } | Effect::WriteUnsynced { .. } | Effect::List { .. } | Effect::RenameUnsynced { .. } | Effect::Mode { .. } | Effect::Seal { .. } | Effect::Private { .. } | Effect::Times { .. } | Effect::Stat { .. } | Effect::Lstat { .. } | Effect::Lock { .. } | Effect::Unlock { .. } | Effect::Watch { .. } | Effect::Journal { .. } | Effect::Unwatch { .. } | Effect::Stamp { .. } | Effect::Entries { .. } | Effect::Flush { .. } | Effect::Timer { .. } | Effect::Map { .. } | Effect::Spawn { .. } | Effect::Kill { .. } | Effect::Listen { .. } | Effect::Unlisten { .. } | Effect::Connect { .. } | Effect::Recv { .. } | Effect::Send { .. } | Effect::Hangup { .. } | Effect::Pressure { .. } | Effect::Bind { .. } | Effect::SendTo { .. } | Effect::RecvFrom { .. } | Effect::Unbind { .. } | Effect::Resolve { .. } | Effect::ReadStdin { .. } | Effect::WriteOut { .. } | Effect::Now { .. } | Effect::Random { .. } | Effect::MakeDir { .. } | Effect::RemoveDir { .. } => {}
     }
 }
 

@@ -1,7 +1,12 @@
 //! Database used for testing `hir_def`: the build's [`Db`], made by `Db::for_tests()`, with the
 //! tests' helpers in [`TestDBExt`].
 
-use base_db::{Crate, Db, RunOrder, all_crates, relevant_crates, set_run_order};
+use std::alloc::Global;
+
+use base_db::{
+    BuiltCrateData, Committed, Crate, Db, Edit, EditionedFileId, RunOrder, all_crates, relevant_crates,
+    set_run_order,
+};
 use hir_expand::{InFile, files::FilePosition};
 use itertools::Itertools;
 use span::FileId;
@@ -23,22 +28,92 @@ pub(crate) trait TestDBExt {
 
     fn module_at_position(&self, position: FilePosition) -> ModuleId;
 
-    /// The events of `f`, in the order they happened: a batch's tasks are left to the queries
-    /// that read their results ([`RunOrder::LeftToReaders`]), so the order is the one a test
-    /// expects of the collection alone.
-    fn log_in_read_order(&self, f: impl FnOnce()) -> Vec<blaze_query::db::Event>;
+    /// The runs of `f`, in the order they started, each `kind(key)`: the query's full name and
+    /// its key's `Debug` text, as the run log ([`blaze_memo::testing::RunLog`]) names a row. A
+    /// batch's tasks are left to the queries that read their results
+    /// ([`RunOrder::LeftToReaders`]), so the order is the one a test expects of the collection
+    /// alone.
+    fn executed_in_read_order(&self, f: impl FnOnce()) -> Vec<String, Global>;
 
-    /// The names of the queries `f` executed, in [`TestDBExt::log_in_read_order`]'s order.
-    fn executed_in_read_order(&self, f: impl FnOnce()) -> Vec<String>;
+    /// The runs of `f` as [`TestDBExt::executed_in_read_order`] orders them, each with its
+    /// typed key, which [`blaze_memo::testing::Ran::is`] asks.
+    fn runs_in_read_order(&self, f: impl FnOnce()) -> Vec<blaze_memo::testing::Ran, Global>;
 
-    /// [`TestDBExt::log_in_read_order`] of a write and what reads after it: `f` gets the
-    /// database to set inputs on, so the events include what the write-side maintainers ran in
-    /// it ([`Db::log_mut`]). Every write ends in them: what a read once ran first, the write
-    /// runs now.
-    fn log_write_in_read_order(&mut self, f: impl FnOnce(&mut Db)) -> Vec<blaze_query::db::Event>;
+    /// [`TestDBExt::executed_in_read_order`] of a write and what reads after it: `f` gets the
+    /// database to set inputs on, so the runs include what the next snapshot ran for them.
+    fn executed_in_write(&mut self, f: impl FnOnce(&mut Db)) -> Vec<String, Global>;
 
-    /// The names of the queries `f` executed, in [`TestDBExt::log_write_in_read_order`]'s order.
-    fn executed_in_write(&mut self, f: impl FnOnce(&mut Db)) -> Vec<String>;
+    /// [`TestDBExt::executed_in_write`]'s runs, each with its typed key, which
+    /// [`blaze_memo::testing::Ran::is`] asks.
+    fn runs_in_write(&mut self, f: impl FnOnce(&mut Db)) -> Vec<blaze_memo::testing::Ran, Global>;
+
+    /// `change` made in one edit ([`Db::edit`]) and committed: what the commit did.
+    /// [`Edit::commit`] takes the edit by value, so a setter's `&mut Edit` cannot end a chain.
+    fn commit_with(&mut self, change: impl FnOnce(&mut Edit<'_>)) -> Committed;
+
+    /// `file`'s text set to `text` in one edit, committed.
+    fn set_file_text(&mut self, file: FileId, text: &str) -> Committed {
+        self.commit_with(|edit| _ = edit.set_file_text(file, text))
+    }
+
+    /// [`TestDBExt::set_file_text`] of `file`'s file, and `file` again in the new snapshot: an
+    /// edit of a file's text drops what is homed with the text, the interned
+    /// [`EditionedFileId`] among it, so one held across the commit is dead.
+    fn set_text_of(&mut self, file: EditionedFileId, text: &str) -> EditionedFileId;
+
+    /// `krate`'s data set to `data` (each dependency by its key, `BuiltCrateData::keyed`) in
+    /// one edit, committed; `krate` again in the new snapshot, as the commit drops its arena.
+    fn set_crate_data(&mut self, krate: Crate, data: &BuiltCrateData) -> Crate;
+}
+
+/// The runs logged since the last take, as [`TestDBExt::executed_in_read_order`] names them:
+/// written inside `attach`, as a run's key is text only when read.
+fn named_runs(db: &Db) -> Vec<String, Global> {
+    let mut named = Vec::new_in(Global);
+    let runs = runs_of(db).take();
+    blaze_memo::attach(db, || named.extend(runs.iter().map(|ran| ran.key())));
+    named
+}
+
+/// `db`'s run log: a test database logs its runs (`Db::for_tests`).
+fn runs_of(db: &Db) -> &blaze_memo::testing::RunLog {
+    db.runs().expect("a test database logs its runs (`Db::for_tests`)")
+}
+
+/// [`blaze_alloc_count::assert_at_most`] of `f` on `db`, a test database, which logs each run:
+/// `max` is the budget of `f` itself, and what the log allocated for the runs `f` made is
+/// counted around it. A row costs one allocation (its key's `Arc`), and the log's list, taken
+/// empty here, its growths: the first row's, and each time the list doubles past 4 rows (a
+/// `Vec` of rows this size grows from 0 to 4, then by doubling). A build's database logs
+/// nothing; the log is the test's, not the code's.
+#[track_caller]
+pub(crate) fn assert_at_most_beside_runs<R>(
+    db: &Db,
+    max: u64,
+    what: &str,
+    f: impl FnOnce() -> R,
+) -> R {
+    let log = runs_of(db);
+    drop(log.take());
+    let (out, used) = blaze_alloc_count::measure(f);
+    let rows = log.take().len() as u64;
+    let mut grows = 0;
+    let mut capacity = 0;
+    for row in 1..=rows {
+        if row > capacity {
+            capacity = (capacity * 2).max(4);
+            grows += 1;
+        }
+    }
+    let logged = rows + grows;
+    assert!(
+        used.allocations <= max + logged,
+        "{what}: {} allocations ({} bytes), budget {max} and {logged} of the run log's \
+         ({rows} runs)",
+        used.allocations,
+        used.bytes,
+    );
+    out
 }
 
 impl TestDBExt for Db {
@@ -89,41 +164,55 @@ impl TestDBExt for Db {
         }
     }
 
-    fn log_in_read_order(&self, f: impl FnOnce()) -> Vec<blaze_query::db::Event> {
+    fn executed_in_read_order(&self, f: impl FnOnce()) -> Vec<String, Global> {
+        _ = runs_of(self).take();
         let order = set_run_order(RunOrder::LeftToReaders);
-        let events = self.log(f);
+        f();
         set_run_order(order);
-        events
+        named_runs(self)
     }
 
-    fn executed_in_read_order(&self, f: impl FnOnce()) -> Vec<String> {
+    fn runs_in_read_order(&self, f: impl FnOnce()) -> Vec<blaze_memo::testing::Ran, Global> {
+        _ = runs_of(self).take();
         let order = set_run_order(RunOrder::LeftToReaders);
-        let executed = self.log_executed(f);
+        f();
         set_run_order(order);
-        executed
+        runs_of(self).take()
     }
 
-    fn log_write_in_read_order(&mut self, f: impl FnOnce(&mut Db)) -> Vec<blaze_query::db::Event> {
+    fn executed_in_write(&mut self, f: impl FnOnce(&mut Db)) -> Vec<String, Global> {
+        _ = runs_of(self).take();
         let order = set_run_order(RunOrder::LeftToReaders);
-        let events = self.log_mut(f);
+        f(self);
         set_run_order(order);
-        events
+        named_runs(self)
     }
 
-    fn executed_in_write(&mut self, f: impl FnOnce(&mut Db)) -> Vec<String> {
-        let events = self.log_write_in_read_order(f);
-        let db: &Db = self;
-        events
-            .into_iter()
-            .filter_map(|event| match event.kind {
-                blaze_query::db::EventKind::WillExecute { database_key } => Some(
-                    blaze_query::db::Database::storage(db)
-                        .ingredient_name(database_key.ingredient_index())
-                        .to_owned(),
-                ),
-                _ => None,
-            })
-            .collect()
+    fn runs_in_write(&mut self, f: impl FnOnce(&mut Db)) -> Vec<blaze_memo::testing::Ran, Global> {
+        _ = runs_of(self).take();
+        let order = set_run_order(RunOrder::LeftToReaders);
+        f(self);
+        set_run_order(order);
+        runs_of(self).take()
+    }
+
+    fn commit_with(&mut self, change: impl FnOnce(&mut Edit<'_>)) -> Committed {
+        let mut edit = self.edit();
+        change(&mut edit);
+        edit.commit()
+    }
+
+    fn set_text_of(&mut self, file: EditionedFileId, text: &str) -> EditionedFileId {
+        let span = file.span_file_id(self);
+        _ = self.set_file_text(span.file_id(), text);
+        EditionedFileId::from_span_file_id(self, span)
+    }
+
+    fn set_crate_data(&mut self, krate: Crate, data: &BuiltCrateData) -> Crate {
+        let key = krate.key(self);
+        let data = data.keyed(self);
+        _ = self.commit_with(|edit| _ = edit.set_crate_data(key, data));
+        self.krate(key)
     }
 }
 

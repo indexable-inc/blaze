@@ -1,0 +1,14 @@
+{
+ "id": "const-macro-output-host-check",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), task 9.2 executor, int-1112",
+ "where": "crates/hir-ty-mir/src/const_macro/output.rs expansion; crates/hir-ty-mir/src/mir/eval/macro_call.rs read_output",
+ "what": "A const macro's output was a `String` the host lexed again: a derive could write any text, its spans were lost (every token at one site), and a tree it meant could parse as another. The output is now a flat tree read from the evaluator's heap; nothing stopped a builder from labelling tokens with nodes the parser would not give them, nor a forged `Kind` holding a keyword's number from passing as a node.",
+ "cost": "derive output whose tokens all had the call's span; a tree check that would have let a keyword number through as a node kind",
+ "cause": "the host took the macro's output as text and trusted it, instead of as untrusted structure checked against the parser",
+ "class": "untrusted structured output from user code taken without checking it against the one authority on its shape",
+ "prevention": "the host turns the built tree into tokens, parses them at the entry the output names, and refuses unless the two trees agree node for node; every index is bounds-checked against the arrays read and the call's span table, and a node kind is a number at or after `ABI` whose `SyntaxKind::text()` is empty",
+ "workaround": "none",
+ "fix": "output::expansion and read_output; controls Mislabeled, FarSpan, NoElement, Byte and TakesByte in tests/consteval/const_macro.rs. Written, not yet compiled or run.",
+ "state": "fixed-unverified"
+}

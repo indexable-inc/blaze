@@ -331,13 +331,13 @@ theorem Reads.write {st0 : State} {σ : List (Local × Expr)} {st st' : State}
   refine And.intro top ?_
   intro x
   by_cases hx : l = x
-  · have found : look ((l, e) :: σ) x = e := (look_cons (l, e) σ x).trans (if_pos hx)
+  · have found : look ((l, e) :: σ) x = e := (look_cons (l, e) σ x).trans (ite_eq_left hx)
     have live : v.Live := Expr.eval_live st0 e v he
     have read : st'.read { frame := st0.top, slot := l, path := [] } = Outcome.ok v :=
       State.read_write_whole st st' st0.top l v live hw
     rw [found, ← hx]
     exact read.trans he.symm
-  · have found : look ((l, e) :: σ) x = look σ x := (look_cons (l, e) σ x).trans (if_neg hx)
+  · have found : look ((l, e) :: σ) x = look σ x := (look_cons (l, e) σ x).trans (ite_eq_right hx)
     have other : st'.read { frame := st0.top, slot := x, path := [] } =
         st.read { frame := st0.top, slot := x, path := [] } :=
       State.read_write_other st st' { frame := st0.top, slot := l, path := [] }

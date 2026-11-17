@@ -1,5 +1,4 @@
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
 use super::*;
 
@@ -232,50 +231,61 @@ fn cargo_suggestion() {
 
 /// Names from a small alphabet (so that near-misses, transpositions and `_`-separated word
 /// reorderings are common), with upper case and a non-ASCII letter to reach both paths.
-fn name() -> gs::TextGenerator {
-    gs::text().alphabet("abAB_éΣ").max_size(9)
+fn name(tape: &Tape) -> String {
+    tape.text_from("abAB_éΣ", 0..=9, "name")
 }
 
-#[hegel::test]
-fn distance_is_rustcs(tc: TestCase) {
-    let a = tc.draw(name());
-    let b = tc.draw(name());
-    let limit = tc.draw(hegel::one_of!(gs::integers::<usize>().max_value(5), gs::just(usize::MAX)));
-    assert_eq!(edit_distance(&a, &b, limit), rustc::edit_distance(&a, &b, limit));
+#[test]
+fn distance_is_rustcs() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let a = name(tape);
+        let b = name(tape);
+        let limit = match tape.below(2, "unlimited") {
+            0 => tape.int_in(0..=5usize, "limit"),
+            _ => usize::MAX,
+        };
+        assert_eq!(edit_distance(&a, &b, limit), rustc::edit_distance(&a, &b, limit));
+    });
 }
 
-#[hegel::test]
-fn substring_score_is_rustcs(tc: TestCase) {
-    let a = tc.draw(name());
-    let b = tc.draw(name());
-    let limit = tc.draw(gs::integers::<usize>().max_value(5));
-    assert_eq!(
-        edit_distance_with_substrings(&a, &b, limit),
-        rustc::edit_distance_with_substrings(&a, &b, limit)
-    );
+#[test]
+fn substring_score_is_rustcs() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let a = name(tape);
+        let b = name(tape);
+        let limit = tape.int_in(0..=5usize, "limit");
+        assert_eq!(
+            edit_distance_with_substrings(&a, &b, limit),
+            rustc::edit_distance_with_substrings(&a, &b, limit)
+        );
+    });
 }
 
-#[hegel::test]
-fn best_match_is_rustcs(tc: TestCase) {
-    let candidates = tc.draw(gs::vecs(name()).max_size(7));
-    let lookup = tc.draw(name());
-    let dist = tc.draw(gs::optional(gs::integers::<usize>().max_value(3)));
-    let use_substring_score = tc.draw(gs::booleans());
-    let candidates: Vec<&str> = candidates.iter().map(String::as_str).collect();
-    let ours = match use_substring_score {
-        true => best_with_substrings(&candidates, &lookup, dist),
-        false => best(&candidates, &lookup, dist),
-    };
-    assert_eq!(ours, rustc::find_best_match(use_substring_score, &candidates, &lookup, dist));
+#[test]
+fn best_match_is_rustcs() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let candidates = tape.vec(0..=7, "candidates", name);
+        let lookup = name(tape);
+        let dist = tape.option("dist", |tape| tape.int_in(0..=3usize, "dist"));
+        let use_substring_score = tape.bool("use substring score");
+        let candidates: Vec<&str> = candidates.iter().map(String::as_str).collect();
+        let ours = match use_substring_score {
+            true => best_with_substrings(&candidates, &lookup, dist),
+            false => best(&candidates, &lookup, dist),
+        };
+        assert_eq!(ours, rustc::find_best_match(use_substring_score, &candidates, &lookup, dist));
+    });
 }
 
-#[hegel::test]
-fn cargo_distance_is_rustcs_lowercased(tc: TestCase) {
-    let a = tc.draw(name());
-    let b = tc.draw(name());
-    let limit = tc.draw(gs::integers::<usize>().max_value(5));
-    assert_eq!(
-        cargo::edit_distance(&a, &b, limit),
-        rustc::edit_distance(&a.to_lowercase(), &b.to_lowercase(), limit)
-    );
+#[test]
+fn cargo_distance_is_rustcs_lowercased() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let a = name(tape);
+        let b = name(tape);
+        let limit = tape.int_in(0..=5usize, "limit");
+        assert_eq!(
+            cargo::edit_distance(&a, &b, limit),
+            rustc::edit_distance(&a.to_lowercase(), &b.to_lowercase(), limit)
+        );
+    });
 }

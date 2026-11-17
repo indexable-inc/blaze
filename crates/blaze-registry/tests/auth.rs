@@ -93,15 +93,16 @@ struct Fixture {
     home: PathBuf,
     said: Said,
     package: Package,
+    /// The directory `home` is, removed with all it holds when the fixture drops.
+    _tmp: blaze_core::temp::TempDir,
 }
 
 impl Fixture {
     /// A registry `private` at [`BASE`] wanting `token`, with `config` as
     /// `$CARGO_HOME/config.toml` and `credentials` as `credentials.toml`.
     fn new(name: &str, token: &str, config: &str, credentials: &str) -> Fixture {
-        let home = std::env::temp_dir().join(format!("blaze-auth-{name}-{}", std::process::id()));
-        _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).unwrap();
+        let tmp = blaze_core::temp::TempDir::for_test(&format!("blaze-auth-{name}-"));
+        let home = tmp.path().to_path_buf();
         let config = format!("[registries.private]\nindex = \"sparse+{BASE}\"\n{config}");
         std::fs::write(home.join("config.toml"), config).unwrap();
         if !credentials.is_empty() {
@@ -128,7 +129,7 @@ impl Fixture {
         });
         let package =
             Package { name: "secret".to_owned(), version: Version::new(1, 0, 0), checksum: sum };
-        Fixture { server, home, said: Said::default(), package }
+        Fixture { server, home, said: Said::default(), package, _tmp: tmp }
     }
 
     fn sources(&self, env: &[(&str, &str)]) -> Sources {

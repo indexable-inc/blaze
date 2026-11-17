@@ -99,16 +99,14 @@ fn check(fixture: &Path, scratch: &Path) -> Vec<String> {
 #[test]
 fn config_fixtures_read_as_cargo_reads_them() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/config-fixtures");
-    let scratch =
-        std::env::temp_dir().join(format!("blaze-manifest-config-{}", std::process::id()));
+    let scratch = blaze_core::temp::TempDir::for_test("blaze-manifest-config-");
     let mut names: Vec<_> =
         std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
     names.sort();
     let mut failed = Vec::new();
     for name in &names {
-        failed.extend(check(&dir.join(name), &scratch));
+        failed.extend(check(&dir.join(name), scratch.path()));
     }
-    let _ = std::fs::remove_dir_all(&scratch);
     assert!(failed.is_empty(), "{}", failed.join("\n\n"));
     assert!(names.len() >= 10);
 }

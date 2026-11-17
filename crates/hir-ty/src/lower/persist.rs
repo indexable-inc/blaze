@@ -2,8 +2,8 @@
 //! dependency's signatures once nothing reads them, written into a [`blaze_format`] buffer and
 //! read back in place.
 //!
-//! The cold form is columns, as the batch is: the keys as their ids (the database that
-//! wrote a buffer is the one reading it, as `hir_def::hir::persist` writes them), each value
+//! The cold form is columns, as the batch is: the keys as the words of hir-ty's one persisted
+//! id scheme (`check_cache::id_bits`: portable inside `check_cache::relocating`), each value
 //! column as indices into the buffer's type table (`next_solver::persist`), and the side table's
 //! diagnostics as words. The type table is a buffer of its own inside this one, at a buffer's
 //! alignment, so it is read in place too. [`ColdBatch`] is the `'static` form, which
@@ -17,7 +17,6 @@ use blaze_format::{
     ALIGN, FormatError, Part, Persist, Placed, Record, SchemaHash, Slice, Writer, open_as,
     schema_of,
 };
-use blaze_query::db::{AsId, FromId};
 use hir_def::{
     AdtId, AssocItemId, ConstParamId, EnumVariantId, GenericDefId, GenericParamId, ImplId,
     LifetimeParamId, StructId, TraitId, TypeOrConstParamId, TypeParamId, UnionId, VariantId,
@@ -26,6 +25,7 @@ use la_arena::{Idx, RawIdx};
 
 use crate::{
     Span, TyLoweringDiagnostic,
+    check_cache::{IdRefused, Relocate, id_of},
     consteval::CreateConstError,
     db::AnonConstId,
     lower::{
@@ -196,19 +196,28 @@ fn bytes_of(words: &[u128]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), size_of_val(words)) }
 }
 
-/// The id whose bits are the word `bits`: `None` for 0 or a word past
-/// [`blaze_query::db::Id::MAX_U32`].
-fn query_id(bits: u64) -> Option<blaze_query::db::Id> {
-    u32::try_from(bits).ok().and_then(blaze_query::db::Id::new)
+/// The id of `T` the word `bits` names ([`id_bits`]' word), or the error of the record at `at`
+/// holding it: 0 names none, and inside `check_cache::relocating` an index past the record's
+/// table, or of another kind, names none either.
+fn decode_id<T: Relocate>(bits: u64, at: u64, what: &'static str) -> Result<T, FormatError> {
+    match id_of::<T>(bits) {
+        Ok(id) => Ok(id),
+        Err(IdRefused::Zero) => Err(FormatError::Zero { at, what }),
+        Err(refused) => Err(refused.at(at)),
+    }
 }
 
-fn id_bits(id: impl AsId + Copy) -> u64 {
-    u64::from(id.as_id().as_u32())
-}
-
-/// A diagnostic's id: [`id_bits`], or inside `check_cache::relocating` its place in the table.
-fn def_bits<T: crate::check_cache::Relocate>(id: T) -> u64 {
+/// `id` as a word, the one id scheme of every persisted record of hir-ty
+/// (`check_cache::id_bits`): inside `check_cache::relocating` its place in the record's table
+/// of portable ids, outside it the word this process reads back. Never a memo id's bits of
+/// this file's own making (a `Gid` means nothing in another process).
+fn id_bits<T: Relocate>(id: T) -> u64 {
     crate::check_cache::id_bits(id)
+}
+
+/// A diagnostic's id: [`id_bits`].
+fn def_bits<T: Relocate>(id: T) -> u64 {
+    id_bits(id)
 }
 
 fn variant_key(variant: VariantId) -> (u8, u64) {
@@ -220,11 +229,10 @@ fn variant_key(variant: VariantId) -> (u8, u64) {
 }
 
 fn variant_of(tag: u8, bits: u64) -> Option<VariantId> {
-    let id = query_id(bits)?;
     Some(match tag {
-        0 => EnumVariantId::from_id(id).into(),
-        1 => StructId::from_id(id).into(),
-        2 => UnionId::from_id(id).into(),
+        0 => id_of::<EnumVariantId>(bits).ok()?.into(),
+        1 => id_of::<StructId>(bits).ok()?.into(),
+        2 => id_of::<UnionId>(bits).ok()?.into(),
         _ => return None,
     })
 }
@@ -547,9 +555,7 @@ impl<'a> ColdBatchRef<'a> {
     fn impl_keys(&self) -> Result<Box<[ImplId]>, FormatError> {
         let keys: Box<[ImplId]> = exact(
             self.keys.len(),
-            self.keys.iter().map(|&bits| {
-                blaze_query::db::Id::decode(bits, self.at, "an impl's id").map(ImplId::from_id)
-            }),
+            self.keys.iter().map(|&bits| decode_id::<ImplId>(bits, self.at, "an impl's id")),
         )?;
         self.ensure(keys.is_sorted_by(|a, b| a < b), "impls that are not ascending")?;
         Ok(keys)
@@ -615,8 +621,7 @@ impl<'a> ColdBatchRef<'a> {
                 if trait_id == 0 {
                     return Ok::<_, FormatError>(None);
                 }
-                let trait_id = blaze_query::db::Id::decode(trait_id, self.at, "a trait's id")
-                    .map(TraitId::from_id)?;
+                let trait_id = decode_id::<TraitId>(trait_id, self.at, "a trait's id")?;
                 let trait_ref = TraitRef::new_from_args(interner, trait_id.into(), tys.args(args)?);
                 Ok(Some(StoredEarlyBinder::bind(interner, StoredTraitRef::new(trait_ref))))
             }),
@@ -677,8 +682,7 @@ impl<'a> ColdBatchRef<'a> {
         let anon_consts: Box<[AnonConstId<'db>]> = exact(
             side.anon_consts.len(),
             side.anon_consts.iter().map(|&bits| {
-                blaze_query::db::Id::decode(bits, self.at, "a constant's id")
-                    .map(AnonConstId::from_id)
+                decode_id::<AnonConstId<'db>>(bits, self.at, "a constant's id")
             }),
         )?;
         let range = |starts: &[u32], at: usize, len: usize| {
@@ -1408,6 +1412,7 @@ impl Words<'_> {
 #[cfg(test)]
 mod tests {
     use blaze_format::{Aligned, to_bytes};
+    use blaze_memo::{Gid, Id as _};
     use hir_def::{EnumId, TypeAliasId, type_ref::TypeRefId};
 
     use super::*;
@@ -1430,15 +1435,15 @@ mod tests {
         assert_eq!((used.allocations, column.unwrap().len()), (1, 1000));
     }
 
-    fn id(index: u32) -> blaze_query::db::Id {
-        blaze_query::db::Id::from_u32(index + (3 << 20))
+    fn id(index: u32) -> Gid {
+        Gid::for_test(index + (3 << 20))
     }
 
     fn every_diagnostic() -> Vec<TyLoweringDiagnostic> {
         let source: TypeRefId = Idx::from_raw(RawIdx::from_u32(7));
-        let def: GenericDefId = ImplId::from_id(id(9)).into();
-        let trait_def: GenericDefId = TraitId::from_id(id(10)).into();
-        let adt: GenericDefId = AdtId::EnumId(EnumId::from_id(id(11))).into();
+        let def: GenericDefId = ImplId::from_gid(id(9)).into();
+        let trait_def: GenericDefId = TraitId::from_gid(id(10)).into();
+        let adt: GenericDefId = AdtId::EnumId(EnumId::from_gid(id(11))).into();
         let param =
             TypeOrConstParamId { parent: def, local_id: Idx::from_raw(RawIdx::from_u32(2)) };
         let path = |diag| TyLoweringDiagnostic::PathDiagnostic { source, diag };
@@ -1512,9 +1517,9 @@ mod tests {
             }),
             path(PathLoweringDiagnostic::AmbiguousAssociatedItem {
                 segment: 1,
-                variant: EnumVariantId::from_id(id(13)),
-                item: TypeAliasId::from_id(id(14)),
-                impl_: ImplId::from_id(id(9)),
+                variant: EnumVariantId::from_gid(id(13)),
+                item: TypeAliasId::from_gid(id(14)),
+                impl_: ImplId::from_gid(id(9)),
             }),
             path(PathLoweringDiagnostic::AssocTypeNotResolved {
                 segment: 1,
@@ -1528,7 +1533,7 @@ mod tests {
             }),
             path(PathLoweringDiagnostic::AssocTypeNotResolved {
                 segment: 2,
-                qself: AssocTypeQself::Trait(TraitId::from_id(id(10))),
+                qself: AssocTypeQself::Trait(TraitId::from_gid(id(10))),
                 failure: AssocTypeFailure::Cycle,
             }),
             path(PathLoweringDiagnostic::AmbiguousAssocType { segment: 3 }),
@@ -1542,11 +1547,11 @@ mod tests {
             },
             TyLoweringDiagnostic::ConflictingAssocTypeBindings {
                 source,
-                assoc: AssocItemId::TypeAliasId(TypeAliasId::from_id(id(14))),
+                assoc: AssocItemId::TypeAliasId(TypeAliasId::from_gid(id(14))),
             },
             TyLoweringDiagnostic::MissingSelfDefaultParams {
                 source,
-                trait_: TraitId::from_id(id(10)),
+                trait_: TraitId::from_gid(id(10)),
                 params: Box::new([TypeParamId::from_unchecked(param)]),
             },
             TyLoweringDiagnostic::ObjectWithoutTrait { source },
@@ -1676,9 +1681,9 @@ mod tests {
             kind: BatchKind::FieldTypes,
             key_tags: vec![1, 1, 2],
             keys: vec![
-                id_bits(StructId::from_id(id(1))),
-                id_bits(StructId::from_id(id(4))),
-                id_bits(UnionId::from_id(id(2))),
+                id_bits(StructId::from_gid(id(1))),
+                id_bits(StructId::from_gid(id(4))),
+                id_bits(UnionId::from_gid(id(2))),
             ],
             starts: vec![0, 2, 2, 3],
             tys: vec![0, 1, 0],
@@ -1691,7 +1696,7 @@ mod tests {
                 diagnostics_at: vec![0],
                 anon_consts_at: vec![0],
                 diagnostics: words,
-                anon_consts: vec![id_bits(id(12))],
+                anon_consts: vec![id_bits(AnonConstId::from_gid(id(12)))],
             },
             table: table_words(&table),
             table_root,
@@ -1774,14 +1779,14 @@ mod tests {
     #[test]
     fn variant_keys_round_trip() {
         for variant in [
-            VariantId::from(EnumVariantId::from_id(id(5))),
-            VariantId::from(StructId::from_id(id(6))),
-            VariantId::from(UnionId::from_id(id(7))),
+            VariantId::from(EnumVariantId::from_gid(id(5))),
+            VariantId::from(StructId::from_gid(id(6))),
+            VariantId::from(UnionId::from_gid(id(7))),
         ] {
             let (tag, bits) = variant_key(variant);
             assert_eq!(variant_of(tag, bits), Some(variant));
         }
-        assert_eq!(variant_of(3, id_bits(id(1))), None);
+        assert_eq!(variant_of(3, id_bits(StructId::from_gid(id(1)))), None);
         assert_eq!(variant_of(0, 0), None);
     }
 }

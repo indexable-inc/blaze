@@ -1,0 +1,11 @@
+{
+ "id": "edit4-3",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+ "where": "blaze-link's tests: allocations counted, not bytes",
+ "what": "`tests::an_incremental_stage_allocates_a_constant_whatever_the_image_holds` holds a stage to 400 allocations and no bytes: a table made whole is one allocation of 360 KB and passes, while a `BTreeSet` given 4,098 slots (my first slot code, for a splice that kept its length) failed it.",
+ "cost": "it caught my bug and misses the one the lane is about (bytes an edit allocates grow with the image)",
+ "cause": "`blaze_alloc_count::Used` has `bytes` and `largest`; the test asserts only `allocations`",
+ "workaround": "none",
+ "state": "open: assert bytes at two image sizes too, once the lists and tables are deltas"
+}

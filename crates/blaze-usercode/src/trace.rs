@@ -132,9 +132,10 @@ pub fn whole_env(what: &str) -> bool {
     what == ALL_ENV || what.starts_with("* ")
 }
 
-/// The name a [`Traced`] of a run that read the whole environment has, beside every variable,
-/// with the [`listing`] hash of the names (in hex) as its value: a variable added later is
-/// one it would have seen. No variable has this name: a name is a C string.
+/// The name a [`Traced`] of a run that walked its environment has, beside every variable the
+/// walk saw ([`Inputs::env_all`]: the whole environment, or the walk set of a run lent its
+/// environment), with the [`listing`] hash of those names (in hex) as its value: a variable
+/// added later is one it would have seen. No variable has this name: a name is a C string.
 pub const ALL_ENV_NAME: &str = "\0*";
 
 /// One line of a record: the letter, the scope and what, by tabs, ended by a line break. The
@@ -231,8 +232,10 @@ pub trait Inputs {
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Self::Error>;
     /// The variable's value, lent: a check hashes it where it is.
     fn env(&mut self, name: &OsStr) -> Option<&OsStr>;
-    /// The whole environment, for a run that read all of it: sorted by name, each name once,
-    /// lent rather than copied, as [`crate::inputs::Env`] keeps it.
+    /// What a walk of the environment sees, for a run that walked it: all of it, or the walk
+    /// set of a run that is lent its environment ([`crate::inputs::Env::lent`]), in which a
+    /// variable outside the set is still read by name ([`Inputs::env`]). Sorted by name, each
+    /// name once, lent rather than copied, as [`crate::inputs::Env`] keeps it.
     fn env_all(&mut self) -> &[(OsString, OsString)];
     /// The names in the directory, each with whether it is a directory, pushed to `out` (given
     /// empty) and sorted ([`Names::sort`]); `false` for no directory there. What [`walk`]
@@ -255,6 +258,20 @@ pub enum Entry {
     Dir,
     File(ContentId, blaze_vfs::Mode),
     Missing,
+}
+
+/// What a look at the disk for an [`Entry`] is kept by ([`blaze_vfs::outside::LookKind::Entry`]):
+/// `None` for a path that is not there, else a hash of which it is, and for a file of its
+/// content ID and git mode. Equal entries give equal digests and unequal ones do not, so a
+/// later ask of an unchanged disk gives the digest kept.
+pub fn entry_digest(entry: &Entry) -> Option<[u8; 32]> {
+    let mut hasher = Hasher::new("blaze v2 disk entry look 1");
+    match entry {
+        Entry::Missing => return None,
+        Entry::Dir => hasher.update(&[0]),
+        Entry::File(id, mode) => hasher.update(&[1]).part(&id.0).part(&mode.git().to_le_bytes()),
+    };
+    Some(hasher.finish().0)
 }
 
 /// A directory's names as [`Inputs::names`] gives them, in a task's frame, each with whether it
@@ -1111,9 +1128,33 @@ mod tests {
         assert_eq!(assemble(&why, None, &mut fixed()).unwrap().env, traced.env);
     }
 
-    /// What the sandbox answered from the run's provider is no input and nothing that can't
-    /// be traced: a run with only such lines is kept as any traced run, and a pure script's
-    /// check (`pure::check`) passes it.
+    /// What can't be traced in a run whose record has `lines`, by the rule stated on the
+    /// invariant below, written apart from `assemble`: each `T` line's kind (a name this blaze
+    /// doesn't know is a descriptor) and a descriptor for an `X` line, except the lines that say
+    /// the sandbox answered; sorted, each once. Whether `got` is it; the first difference.
+    fn untraceable_held(lines: &[Line], got: &[Untraceable]) -> Result<(), String> {
+        let mut want: Vec<Untraceable> = lines
+            .iter()
+            .filter_map(|line| match line.seen {
+                Seen::Untraceable if line.what == ANSWERED_RANDOM || line.what == ANSWERED_DEVICE => None,
+                Seen::Untraceable => Some(untraceable_of(&line.what).unwrap_or(Untraceable::Descriptor)),
+                Seen::Incomplete => Some(Untraceable::Descriptor),
+                _ => None,
+            })
+            .collect();
+        want.sort_unstable();
+        want.dedup();
+        if got == want.as_slice() {
+            Ok(())
+        } else {
+            Err(format!("untraceable {got:?} where the lines say {want:?}"))
+        }
+    }
+
+    /// The invariant: what the sandbox answered from the run's provider is no input and nothing
+    /// that can't be traced, and only what it answered: a run with only such lines is kept as any
+    /// traced run, and a pure script's check (`pure::check`) passes it, while randomness it did
+    /// not answer, beside an answer, is still what can't be traced.
     #[test]
     fn what_the_sandbox_answered_is_not_what_cannot_be_traced() {
         let lines = [
@@ -1121,19 +1162,39 @@ mod tests {
             Line::new(Seen::Untraceable, "", ANSWERED_DEVICE),
         ];
         let traced = assemble(&lines, None, &mut fixed()).unwrap();
+        untraceable_held(&lines, &traced.untraceable).unwrap();
         assert_eq!(traced.untraceable, Vec::new());
         assert_eq!((traced.files.len(), traced.dirs.len(), traced.env.len()), (0, 0, 0));
+        let beside = [
+            Line::new(Seen::Untraceable, "", ANSWERED_RANDOM),
+            Line::new(Seen::Untraceable, "", "random"),
+            Line::new(Seen::Untraceable, "", ANSWERED_DEVICE),
+            Line::new(Seen::Incomplete, "", "a program that did not load the library"),
+        ];
+        let traced = assemble(&beside, None, &mut fixed()).unwrap();
+        untraceable_held(&beside, &traced.untraceable).unwrap();
+        assert_eq!(traced.untraceable, vec![Untraceable::Random, Untraceable::Descriptor]);
     }
 
-    /// The control: randomness the sandbox did not answer is still what can't be traced.
     #[test]
     fn the_oracle_catches_randomness_that_was_not_answered() {
         let lines = [
             Line::new(Seen::Untraceable, "", ANSWERED_RANDOM),
             Line::new(Seen::Untraceable, "", "random"),
         ];
-        let traced = assemble(&lines, None, &mut fixed()).unwrap();
-        assert_eq!(traced.untraceable, vec![Untraceable::Random]);
+        // The planted bug: every line naming randomness taken for answered (`answered` as
+        // `what.contains("random")`), so the unanswered one is dropped.
+        let why = untraceable_held(&lines, &[]).expect_err("the oracle missed unanswered randomness dropped");
+        assert_eq!(why, "untraceable [] where the lines say [Random]");
+    }
+
+    #[test]
+    fn the_oracle_catches_an_answer_taken_for_what_cannot_be_traced() {
+        let lines = [Line::new(Seen::Untraceable, "", ANSWERED_DEVICE)];
+        // The planted bug: an answer read as a name this blaze doesn't know, so a descriptor.
+        let why = untraceable_held(&lines, &[Untraceable::Descriptor])
+            .expect_err("the oracle missed an answer taken for a descriptor");
+        assert_eq!(why, "untraceable [Descriptor] where the lines say []");
     }
 
     /// [`Fixed`], noting what it was asked in the order it was asked.

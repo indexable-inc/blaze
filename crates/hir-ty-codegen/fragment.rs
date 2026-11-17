@@ -12,7 +12,7 @@ use std::{
     sync::LazyLock,
 };
 
-use base_db::{Db, FileId};
+use base_db::Db;
 use blaze_hash::{FixedHasher, FixedState, HashMap};
 use cranelift_codegen::{
     MachReloc, RelocTarget, binemit,
@@ -120,9 +120,9 @@ pub(super) enum DataRequest {
     /// A `core::panic::Location` of where a function is declared: what a pointer to a
     /// `#[track_caller]` function passes it.
     Declaration(FunctionId),
-    /// The path of a file as rustc reports it, without a terminator.
-    FilePath(FileId),
-    /// A `&str` with the paths of files in it.
+    /// A `&str` with the paths of files in it: a `concat!` with `file!()`. A `file!()` alone
+    /// is a [`DataRequest::Location`], whose record's first field is its `&str`
+    /// (`builtin_location` in the IR builder).
     Text(Vec<TextPart>),
 }
 
@@ -130,8 +130,10 @@ pub(super) enum DataRequest {
 #[derive(Clone, PartialEq, Eq, Hash)] // clone: inside `DataRequest`
 pub(super) enum TextPart {
     Text(String),
-    /// The path of a file as rustc reports it.
-    FilePath(FileId),
+    /// The path of the file of a place in a body, as rustc reports `file!()`: never read here.
+    /// It is the link's to write (`blaze_codegen::text`), by the place's span, item-relative
+    /// (rule 71), so neither the code, its key nor its plan holds a file's name.
+    FileOf(DefWithBodyId, MirSpan),
 }
 
 /// Everything a compiled function or static refers to. `FuncId` and `DataId` index these
@@ -781,6 +783,10 @@ impl Code {
     }
 }
 
+#[expect(
+    blaze::process_static,
+    reason = "a per-thread print buffer, uncapped: it keeps the longest unwind rules printed on the thread"
+)]
 thread_local! {
     /// What [`Code::hash_with`] prints unwind rules into, kept for the thread's next function.
     // alloc: empty, allocates nothing until the first print, then grows to the longest
@@ -1678,10 +1684,6 @@ impl<'db> Recorder<'db> {
         self.data(DataRequest::Declaration(func))
     }
 
-    pub(super) fn file_path(&mut self, file: FileId) -> DataId {
-        self.data(DataRequest::FilePath(file))
-    }
-
     pub(super) fn text(&mut self, parts: Vec<TextPart>) -> DataId {
         self.data(DataRequest::Text(parts))
     }
@@ -1792,7 +1794,6 @@ impl<'db> Recorder<'db> {
                 DataRequest::Static(id) => self.static_data(*id),
                 DataRequest::Location(at) => self.location(*at),
                 DataRequest::Declaration(func) => self.declaration(*func),
-                DataRequest::FilePath(file) => self.file_path(*file),
                 // clone: the request's own parts: a text is one object per body moved in
                 DataRequest::Text(parts) => self.text(parts.clone()),
             };

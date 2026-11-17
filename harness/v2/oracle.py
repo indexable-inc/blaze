@@ -332,11 +332,12 @@ class Round:
 
     def tests(self, step: str, env: dict[str, str], target: Path, release: list[str], built: Built) -> object:
         # JSON for blaze-work (engine.V2.work_since).
-        args = ["--message-format=json", "--no-fail-fast", *release]
+        # `--run-all`: every test runs, none reported cached, so the edited build's results are
+        # its own run's to compare with the fresh build's, never a pass kept from before the
+        # edit (docs/cargo.md, "Which tests run"). It writes no `tests.ndjson`.
+        args = ["--message-format=json", "--no-fail-fast", "--run-all", *release]
         ran = self.eng.build(f"{step}: test", self.ws, env, args, command="test", timeout=BUILD_SECS)
         built.not_blazes = built.not_blazes or self.eng.not_blazes(ran)
-        # Plain `blaze test` runs every test: v2 keeps no pass without `--reached` and writes no
-        # `tests.ndjson` (docs/cargo.md, "Which tests run").
         return test_results(SimpleNamespace(returncode=ran.returncode, stdout=ran.stdout, kept=[]))
 
     def codegen(self, env: dict[str, str]) -> dict[str, str] | None:

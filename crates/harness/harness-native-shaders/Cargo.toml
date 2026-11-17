@@ -10,7 +10,7 @@ publish = false
 gpu = { path = "../../gpu" }
 
 [dev-dependencies]
+# Property tests: blaze's own test engine (crates/blaze-sim).
+blaze-sim = { path = "../../blaze-sim" }
 # The host's own copies of the mascot's buffers, which the layouts here must match byte for byte.
 harness-native-kip = { path = "../harness-native-kip" }
-# Property tests: Hegel, imported as `hegel` (blaze's vendor/hegeltest).
-hegeltest = { path = "../../../vendor/hegeltest", default-features = false, features = ["static-engine"] }

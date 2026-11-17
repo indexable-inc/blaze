@@ -38,6 +38,10 @@ fn ui_fixture(fixture: &str) -> String {
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_call_of_a_variant_or_a_local_that_is_not_a_function() {
     // tests/ui/error-codes/E0618.rs
     let source = "enum X {
@@ -127,6 +131,10 @@ For more information about this error, try `rustc --explain E0604`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn an_integer_is_compared_with_zero_not_cast_as_bool() {
     // tests/ui/error-codes/E0054.rs
     let source = "fn main() {
@@ -167,6 +175,10 @@ fn a_cast_to_an_unsized_type_is_to_a_reference() {
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_cast_to_a_pointer_of_an_unknown_kind() {
     // tests/ui/inference/order-dependent-cast-inference.rs
     let source = r#"fn main() {
@@ -194,6 +206,10 @@ For more information about this error, try `rustc --explain E0641`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn an_enum_with_drop_is_not_cast_to_an_integer() {
     // tests/ui/enum/enum-drop-cast-error.rs
     let source = r#"//! Check that trying to cast an enum with a Drop impl to an integer is rejected.
@@ -298,6 +314,10 @@ fn main() {
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_binary_operator_of_types_without_its_impl() {
     // tests/ui/binop/binop-typeck.rs
     let source = "// issue #500
@@ -366,6 +386,10 @@ For more information about this error, try `rustc --explain E0614`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn an_index_into_an_integer() {
     // tests/ui/error-codes/E0608.rs
     let source = "fn main() {
@@ -476,6 +500,10 @@ For more information about this error, try `rustc --explain E0040`.
 }
 
 #[test]
+#[expect(
+    blaze::gapped_literal,
+    reason = "expected rustc output: its `|` gutter and `^`/`-` labels align under the source's columns"
+)]
 fn a_method_with_a_sized_bound_on_a_trait_object() {
     // tests/ui/illegal-sized-bound/regular.rs
     let source = "struct MutType;

@@ -16,7 +16,7 @@ use blaze_format::{
     cursor::{Put, Reader},
 };
 use blaze_hash::HashMap;
-use blaze_query::db::{AsId, FromId};
+use blaze_memo::{Gid, Id as _};
 use hir_def::{
     AdtId, BuiltinDeriveImplId, BuiltinDeriveImplLoc, ConstId, DefWithBodyId, EnumId,
     EnumVariantId, ExpressionStoreOwnerId, FunctionId, GenericDefId, ImplId, LoweringMode,
@@ -113,7 +113,7 @@ const _: () = {
 
 /// An id type the inference record and its type tables write, by the kind its table
 /// entries are.
-pub(crate) trait Relocate: AsId + FromId + Copy {
+pub(crate) trait Relocate: blaze_memo::Id {
     const KIND: IdKind;
 }
 
@@ -168,8 +168,8 @@ pub(crate) struct Table {
 
 impl Table {
     /// The index of the id `id` of `kind`, added when it is new.
-    fn index(&mut self, kind: IdKind, id: blaze_query::db::Id) -> u32 {
-        let bits = u64::from(id.as_u32());
+    fn index(&mut self, kind: IdKind, id: Gid) -> u32 {
+        let bits = gid_bits(id);
         let next = self.entries.len();
         *self.indexes.entry((kind, bits)).or_insert_with(|| {
             self.entries.push((kind, bits));
@@ -181,7 +181,7 @@ impl Table {
     /// it is not made yet (bits 0).
     fn get(&self, kind: IdKind, index: u32) -> Option<u64> {
         let &(found, bits) = self.entries.get(index as usize)?;
-        (found == kind && bits as u32 != 0).then_some(bits)
+        (found == kind && bits != 0).then_some(bits)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -257,9 +257,9 @@ pub(crate) fn in_scope() -> bool {
 /// outside a scope.
 #[inline(never)]
 pub(crate) fn id_bits<T: Relocate>(id: T) -> u64 {
-    let id = id.as_id();
+    let id = id.gid();
     TABLE.with(|slot| match slot.borrow_mut().as_mut() {
-        None => u64::from(id.as_u32()),
+        None => gid_bits(id),
         Some(table) => {
             if table.locs && T::KIND.is_late() {
                 table.refused.get_or_insert(
@@ -276,13 +276,13 @@ pub(crate) fn id_bits<T: Relocate>(id: T) -> u64 {
 pub(crate) enum IdRefused {
     /// Bits 0, which name no id.
     Zero,
-    /// Outside a scope, bits past [`blaze_query::db::Id::MAX_U32`] (or past 32 bits): no
-    /// query storage gives that id, so the record is corrupt or another space's.
-    PastIds { bits: u64 },
     /// In a scope, an index (the bits less one) past the record's table of `len` entries.
     PastTable { index: u64, len: u64 },
     /// In a scope, an entry of another kind than the reader's, or one not made yet.
     OtherKind,
+    /// Outside a scope, bits no id of this session has ([`id_at`]: a zero local or an
+    /// all-ones arena half).
+    NoId { bits: u64 },
 }
 
 impl IdRefused {
@@ -290,12 +290,6 @@ impl IdRefused {
     pub(crate) fn at(self, at: u64) -> FormatError {
         match self {
             IdRefused::Zero => FormatError::Zero { at, what: "an id's bits" },
-            IdRefused::PastIds { bits } => FormatError::Bound {
-                at,
-                what: "an id's bits (past `Id::MAX_U32`, which no query storage gives)",
-                found: bits,
-                bound: u64::from(blaze_query::db::Id::MAX_U32),
-            },
             IdRefused::PastTable { index, len } => FormatError::Bound {
                 at,
                 what: "an id's index in the record's table",
@@ -306,19 +300,26 @@ impl IdRefused {
                 at,
                 what: "an id whose entry in the record's table is of another kind or not made",
             },
+            IdRefused::NoId { .. } => FormatError::Invalid {
+                at,
+                what: "an id's bits that name no id of this session (a zero local or an all-ones arena)",
+            },
         }
     }
 }
 
-/// The id `bits` name, as [`id_bits`] wrote them, or why they name none: 0, bits past every
-/// id outside a scope, and in a scope an index the table has no id of `T`'s kind at.
+/// The id `bits` name, as [`id_bits`] wrote them, or why they name none: 0, and in a scope an
+/// index the table has no id of `T`'s kind at. Outside a scope a word is refused when no id
+/// has its bits ([`id_at`]: a damaged word can name none, so this is an error, never a
+/// panic); an id it does name is checked where its fields are read, once
+/// (`blaze_memo::Id::from_gid`).
 #[inline(never)]
 pub(crate) fn id_of<T: Relocate>(bits: u64) -> Result<T, IdRefused> {
     if bits == 0 {
         return Err(IdRefused::Zero);
     }
     TABLE.with(|slot| match slot.borrow().as_ref() {
-        None => id_at(bits).map(T::from_id).ok_or(IdRefused::PastIds { bits }),
+        None => id_at(bits).map(T::from_gid).ok_or(IdRefused::NoId { bits }),
         Some(table) => {
             let index = bits - 1;
             let len = table.len() as u64;
@@ -327,19 +328,32 @@ pub(crate) fn id_of<T: Relocate>(bits: u64) -> Result<T, IdRefused> {
                 .filter(|&it| u64::from(it) < len)
                 .ok_or(IdRefused::PastTable { index, len })?;
             let bits = table.get(T::KIND, index).ok_or(IdRefused::OtherKind)?;
-            Ok(T::from_id(entry_id(bits)))
+            Ok(T::from_gid(entry_id(bits)))
         }
     })
 }
 
-/// The id whose bits are the word `bits`: `None` for 0 or a word past
-/// [`blaze_query::db::Id::MAX_U32`].
-fn id_at(bits: u64) -> Option<blaze_query::db::Id> {
-    u32::try_from(bits).ok().and_then(blaze_query::db::Id::new)
+/// The word an id is in this process, inside a [`Table`] and outside a scope: its arena and
+/// index ([`Gid::session_bits`]) plus one, so that no id is 0, the word of no id. Never written
+/// across processes: [`write`] gives each table entry its portable form (an index in the
+/// crate's [`PortableIds`], or what a hir-ty id is interned by), and [`read`] makes the ids
+/// again; a `Gid` means nothing in another process (spec B, `Revision`).
+pub(crate) fn gid_bits(id: Gid) -> u64 {
+    id.session_bits().checked_add(1).expect("an id's bits under the last word (an arena index of 2^20 - 1 at its last generation)")
+}
+
+/// The word of the id `id`, as [`gid_bits`] gives it.
+pub(crate) fn word_of<T: blaze_memo::Id>(id: T) -> u64 {
+    gid_bits(id.gid())
+}
+
+/// The id whose word is `bits` ([`gid_bits`]): `None` for 0 and for bits no id has.
+pub(crate) fn id_at(bits: u64) -> Option<Gid> {
+    bits.checked_sub(1).and_then(Gid::from_session_bits)
 }
 
 /// The id a [`Table`] entry holds: [`Table::index`] adds only an id's bits.
-fn entry_id(bits: u64) -> blaze_query::db::Id {
+fn entry_id(bits: u64) -> Gid {
     id_at(bits).expect("a table entry is an id's bits")
 }
 
@@ -462,7 +476,7 @@ pub(crate) fn write_with<'db>(
             | IdKind::EnumVariant => Loc::Item(0),
             IdKind::BuiltinDeriveImpl => {
                 let BuiltinDeriveImplLoc { adt, trait_, derive_attr_id, derive_index } =
-                    *BuiltinDeriveImplId::from_id(entry_id(bits)).loc(db);
+                    *BuiltinDeriveImplId::from_gid(entry_id(bits)).loc(db);
                 let trait_ = BuiltinDeriveImplTrait::ALL
                     .iter()
                     .position(|it| *it == trait_)
@@ -474,24 +488,24 @@ pub(crate) fn write_with<'db>(
                     index: derive_index,
                 }
             }
-            IdKind::OpaqueTy => match InternedOpaqueTyId::from_id(entry_id(bits)).loc(db) {
+            IdKind::OpaqueTy => match InternedOpaqueTyId::from_gid(entry_id(bits)).loc(db) {
                 ImplTraitId::ReturnTypeImplTrait(def, idx) => Loc::Opaque {
                     alias: false,
-                    def: table.index(IdKind::Function, def.as_id()),
+                    def: table.index(IdKind::Function, def.gid()),
                     idx: idx.into_raw().into_u32(),
                 },
                 ImplTraitId::TypeAliasImplTrait(def, idx) => Loc::Opaque {
                     alias: true,
-                    def: table.index(IdKind::TypeAlias, def.as_id()),
+                    def: table.index(IdKind::TypeAlias, def.gid()),
                     idx: idx.into_raw().into_u32(),
                 },
             },
             IdKind::Closure | IdKind::Coroutine | IdKind::CoroutineClosure => {
                 let id = entry_id(bits);
                 let InternedClosure { owner, expr, kind: closure_kind } = match kind {
-                    IdKind::Closure => InternedClosureId::from_id(id).loc(db),
-                    IdKind::Coroutine => InternedCoroutineId::from_id(id).loc(db),
-                    _ => InternedCoroutineClosureId::from_id(id).loc(db),
+                    IdKind::Closure => InternedClosureId::from_gid(id).loc(db),
+                    IdKind::Coroutine => InternedCoroutineId::from_gid(id).loc(db),
+                    _ => InternedCoroutineClosureId::from_gid(id).loc(db),
                 };
                 Loc::Closure {
                     owner: infer_owner_entry(table, owner),
@@ -500,7 +514,7 @@ pub(crate) fn write_with<'db>(
                 }
             }
             IdKind::AnonConst => {
-                let loc = AnonConstId::from_id(entry_id(bits)).loc(db);
+                let loc = AnonConstId::from_gid(entry_id(bits)).loc(db);
                 let ty = loc.ty.as_ref().skip_binder().as_ref();
                 let owner = store_owner_entry(table, loc.owner);
                 table.locs = true;
@@ -566,16 +580,16 @@ pub(crate) fn write_with<'db>(
 fn index_item(items: &mut PortableIds, kind: IdKind, bits: u64) -> R<u32> {
     let id = entry_id(bits);
     Ok(match kind {
-        IdKind::Function => items.index(FunctionId::from_id(id)),
-        IdKind::Struct => items.index(StructId::from_id(id)),
-        IdKind::Union => items.index(UnionId::from_id(id)),
-        IdKind::Enum => items.index(EnumId::from_id(id)),
-        IdKind::Const => items.index(ConstId::from_id(id)),
-        IdKind::Static => items.index(StaticId::from_id(id)),
-        IdKind::Trait => items.index(TraitId::from_id(id)),
-        IdKind::TypeAlias => items.index(TypeAliasId::from_id(id)),
-        IdKind::Impl => items.index(ImplId::from_id(id)),
-        IdKind::EnumVariant => items.index(EnumVariantId::from_id(id)),
+        IdKind::Function => items.index(FunctionId::from_gid(id)),
+        IdKind::Struct => items.index(StructId::from_gid(id)),
+        IdKind::Union => items.index(UnionId::from_gid(id)),
+        IdKind::Enum => items.index(EnumId::from_gid(id)),
+        IdKind::Const => items.index(ConstId::from_gid(id)),
+        IdKind::Static => items.index(StaticId::from_gid(id)),
+        IdKind::Trait => items.index(TraitId::from_gid(id)),
+        IdKind::TypeAlias => items.index(TypeAliasId::from_gid(id)),
+        IdKind::Impl => items.index(ImplId::from_gid(id)),
+        IdKind::EnumVariant => items.index(EnumVariantId::from_gid(id)),
         // alloc: the error that leaves the body out
         _ => return Err(format!("a {kind:?} is no item of a portable table")),
     })
@@ -583,8 +597,8 @@ fn index_item(items: &mut PortableIds, kind: IdKind, bits: u64) -> R<u32> {
 
 /// The bits of the item `index` names in `items` as a `kind`, `None` when it names another.
 pub(crate) fn item_bits(items: &PortableIds, kind: IdKind, index: u32) -> Option<u64> {
-    fn bits(id: impl AsId + Copy) -> u64 {
-        u64::from(id.as_id().as_u32())
+    fn bits(id: impl blaze_memo::Id) -> u64 {
+        word_of(id)
     }
     match kind {
         IdKind::Function => items.get::<FunctionId>(index).map(bits),
@@ -608,9 +622,9 @@ pub(crate) fn item_kind_of(byte: u8) -> Option<IdKind> {
 
 fn adt_entry(table: &mut Table, adt: AdtId) -> u32 {
     match adt {
-        AdtId::StructId(it) => table.index(IdKind::Struct, it.as_id()),
-        AdtId::UnionId(it) => table.index(IdKind::Union, it.as_id()),
-        AdtId::EnumId(it) => table.index(IdKind::Enum, it.as_id()),
+        AdtId::StructId(it) => table.index(IdKind::Struct, it.gid()),
+        AdtId::UnionId(it) => table.index(IdKind::Union, it.gid()),
+        AdtId::EnumId(it) => table.index(IdKind::Enum, it.gid()),
     }
 }
 
@@ -618,10 +632,10 @@ fn adt_entry(table: &mut Table, adt: AdtId) -> u32 {
 /// and its entry.
 fn body_entry(table: &mut Table, def: DefWithBodyId) -> (u8, u32) {
     match def {
-        DefWithBodyId::FunctionId(it) => (0, table.index(IdKind::Function, it.as_id())),
-        DefWithBodyId::StaticId(it) => (1, table.index(IdKind::Static, it.as_id())),
-        DefWithBodyId::ConstId(it) => (2, table.index(IdKind::Const, it.as_id())),
-        DefWithBodyId::VariantId(it) => (3, table.index(IdKind::EnumVariant, it.as_id())),
+        DefWithBodyId::FunctionId(it) => (0, table.index(IdKind::Function, it.gid())),
+        DefWithBodyId::StaticId(it) => (1, table.index(IdKind::Static, it.gid())),
+        DefWithBodyId::ConstId(it) => (2, table.index(IdKind::Const, it.gid())),
+        DefWithBodyId::VariantId(it) => (3, table.index(IdKind::EnumVariant, it.gid())),
     }
 }
 
@@ -629,34 +643,34 @@ fn body_entry(table: &mut Table, def: DefWithBodyId) -> (u8, u32) {
 fn infer_owner_entry(table: &mut Table, owner: InferBodyId<'_>) -> (u8, u32) {
     match owner {
         InferBodyId::DefWithBodyId(def) => body_entry(table, def),
-        InferBodyId::AnonConstId(it) => (4, table.index(IdKind::AnonConst, it.as_id())),
+        InferBodyId::AnonConstId(it) => (4, table.index(IdKind::AnonConst, it.gid())),
     }
 }
 
 /// An anonymous constant's store: a signature (tags 0 to 8, `GenericDefId`'s variants in
 /// order, an ADT as its three), a body (9 to 12) or a variant's fields (13 to 15).
 fn store_owner_entry(table: &mut Table, owner: ExpressionStoreOwnerId) -> (u8, u32) {
-    let mut item = |kind, id: blaze_query::db::Id| table.index(kind, id);
+    let mut item = |kind, id: Gid| table.index(kind, id);
     match owner {
         ExpressionStoreOwnerId::Signature(def) => match def {
-            GenericDefId::AdtId(AdtId::StructId(it)) => (0, item(IdKind::Struct, it.as_id())),
-            GenericDefId::AdtId(AdtId::EnumId(it)) => (1, item(IdKind::Enum, it.as_id())),
-            GenericDefId::AdtId(AdtId::UnionId(it)) => (2, item(IdKind::Union, it.as_id())),
-            GenericDefId::ConstId(it) => (3, item(IdKind::Const, it.as_id())),
-            GenericDefId::FunctionId(it) => (4, item(IdKind::Function, it.as_id())),
-            GenericDefId::ImplId(it) => (5, item(IdKind::Impl, it.as_id())),
-            GenericDefId::StaticId(it) => (6, item(IdKind::Static, it.as_id())),
-            GenericDefId::TraitId(it) => (7, item(IdKind::Trait, it.as_id())),
-            GenericDefId::TypeAliasId(it) => (8, item(IdKind::TypeAlias, it.as_id())),
+            GenericDefId::AdtId(AdtId::StructId(it)) => (0, item(IdKind::Struct, it.gid())),
+            GenericDefId::AdtId(AdtId::EnumId(it)) => (1, item(IdKind::Enum, it.gid())),
+            GenericDefId::AdtId(AdtId::UnionId(it)) => (2, item(IdKind::Union, it.gid())),
+            GenericDefId::ConstId(it) => (3, item(IdKind::Const, it.gid())),
+            GenericDefId::FunctionId(it) => (4, item(IdKind::Function, it.gid())),
+            GenericDefId::ImplId(it) => (5, item(IdKind::Impl, it.gid())),
+            GenericDefId::StaticId(it) => (6, item(IdKind::Static, it.gid())),
+            GenericDefId::TraitId(it) => (7, item(IdKind::Trait, it.gid())),
+            GenericDefId::TypeAliasId(it) => (8, item(IdKind::TypeAlias, it.gid())),
         },
         ExpressionStoreOwnerId::Body(def) => {
             let (tag, entry) = body_entry(table, def);
             (9 + tag, entry)
         }
         ExpressionStoreOwnerId::VariantFields(variant) => match variant {
-            VariantId::EnumVariantId(it) => (13, item(IdKind::EnumVariant, it.as_id())),
-            VariantId::StructId(it) => (14, item(IdKind::Struct, it.as_id())),
-            VariantId::UnionId(it) => (15, item(IdKind::Union, it.as_id())),
+            VariantId::EnumVariantId(it) => (13, item(IdKind::EnumVariant, it.gid())),
+            VariantId::StructId(it) => (14, item(IdKind::Struct, it.gid())),
+            VariantId::UnionId(it) => (15, item(IdKind::Union, it.gid())),
         },
     }
 }
@@ -669,7 +683,10 @@ fn coroutine_kind_code(kind: CoroutineKind) -> u8 {
     }
 }
 
-fn closure_kind_code(kind: ClosureKind) -> [u8; 3] {
+/// A closure's kind as three bytes, the same in every database: what a stored id of a closure
+/// and a body-relative record key (`blaze_item_hash::keys`) carry, so reading one back opens
+/// no expression store.
+pub fn closure_kind_code(kind: ClosureKind) -> [u8; 3] {
     match kind {
         ClosureKind::Closure => [0, 0, 0],
         ClosureKind::OldCoroutine(movability) => [
@@ -703,7 +720,8 @@ fn coroutine_kind_of(code: u8) -> R<CoroutineKind> {
     })
 }
 
-fn closure_kind_of([tag, a, b]: [u8; 3]) -> R<ClosureKind> {
+/// The kind [`closure_kind_code`] wrote, or why the bytes are no kind.
+pub fn closure_kind_of([tag, a, b]: [u8; 3]) -> R<ClosureKind> {
     Ok(match (tag, a, b) {
         (0, 0, 0) => ClosureKind::Closure,
         (1, 0, 0) => ClosureKind::OldCoroutine(Movability::Static),
@@ -818,7 +836,7 @@ pub(crate) fn read<'db>(
                 derive_attr_id: AttrId::from_item_tree_index(attr),
                 derive_index: index,
             };
-            table.entries[at].1 = u64::from(BuiltinDeriveImplId::new(db, loc).as_id().as_u32());
+            table.entries[at].1 = word_of(BuiltinDeriveImplId::new(db, loc));
         }
     }
 
@@ -833,7 +851,7 @@ pub(crate) fn read<'db>(
                     false => ImplTraitId::ReturnTypeImplTrait(entry(&table, def)?, idx),
                     true => ImplTraitId::TypeAliasImplTrait(entry(&table, def)?, idx),
                 };
-                InternedOpaqueTyId::new(db, loc).as_id().as_u32()
+                word_of(InternedOpaqueTyId::new(db, loc))
             }
             Loc::AnonConst { owner, expr, ty, allow } => {
                 // alloc: the reason of a refusal
@@ -847,11 +865,11 @@ pub(crate) fn read<'db>(
                 let token = LoweringMode::Analysis
                     .allow_tracked_structs()
                     .expect("analysis lowering may make tracked structs");
-                AnonConstId::new(db, loc, &token).as_id().as_u32()
+                word_of(AnonConstId::new(db, loc, &token))
             }
             _ => continue,
         };
-        table.entries[at].1 = u64::from(bits);
+        table.entries[at].1 = bits;
     }
     // Closures last: an owner may be an anonymous constant.
     for (at, loc) in found.iter().enumerate() {
@@ -859,16 +877,13 @@ pub(crate) fn read<'db>(
             let owner = infer_owner_of(&table, owner)?;
             let closure_kind = closure_kind_of(kind)?;
             let id_kind = table.entries[at].0;
-            let expr = closure_expr(db, owner, expr, id_kind)?;
+            let expr = closure_expr(db, owner, expr, id_kind, closure_kind)?;
             let loc = InternedClosure { owner, expr, kind: closure_kind };
-            table.entries[at].1 = u64::from(
-                match id_kind {
-                    IdKind::Closure => InternedClosureId::new(db, loc).as_id(),
-                    IdKind::Coroutine => InternedCoroutineId::new(db, loc).as_id(),
-                    _ => InternedCoroutineClosureId::new(db, loc).as_id(),
-                }
-                .as_u32(),
-            );
+            table.entries[at].1 = gid_bits(match id_kind {
+                IdKind::Closure => InternedClosureId::new(db, loc).gid(),
+                IdKind::Coroutine => InternedCoroutineId::new(db, loc).gid(),
+                _ => InternedCoroutineClosureId::new(db, loc).gid(),
+            });
         }
     }
     Ok(table)
@@ -879,7 +894,7 @@ fn entry<T: Relocate>(table: &Table, index: u32) -> R<T> {
     table
         .get(T::KIND, index)
         .and_then(id_at)
-        .map(T::from_id)
+        .map(T::from_gid)
         // alloc: the reason of a refusal
         .ok_or_else(|| format!("an entry {index} that is no {:?} made before it", T::KIND))
 }
@@ -936,7 +951,27 @@ fn store_owner_of(table: &Table, (tag, index): (u8, u32)) -> R<ExpressionStoreOw
 
 /// The expression `expr` of `owner`'s store, checked to be a closure an id of `kind` may name:
 /// what `InternedClosureId::new` and its siblings assert in debug builds.
-fn closure_expr(db: &Db, owner: InferBodyId<'_>, expr: u32, kind: IdKind) -> R<ExprId> {
+///
+/// Where the body is given from its record (`body_store::given`) its store is not there (its
+/// text is absent): the expression is checked to be one of the closures the record lists
+/// (`db::closure_exprs`), and the closure kind the record wrote (`written`) against `kind`.
+fn closure_expr(db: &Db, owner: InferBodyId<'_>, expr: u32, kind: IdKind, written: ClosureKind) -> R<ExprId> {
+    let fits_kind = |closure_kind: &ClosureKind| match kind {
+        IdKind::Closure => matches!(closure_kind, ClosureKind::Closure | ClosureKind::CoroutineClosure(_)),
+        IdKind::Coroutine => matches!(closure_kind, ClosureKind::OldCoroutine(_) | ClosureKind::Coroutine { .. }),
+        _ => matches!(closure_kind, ClosureKind::CoroutineClosure(_)),
+    };
+    if crate::body_store::given(db) {
+        let at = ExprId::from_raw(RawIdx::from_u32(expr));
+        let listed = crate::db::closure_exprs(db, owner.expression_store_owner(db)).binary_search(&at).is_ok();
+        return match (listed, fits_kind(&written)) {
+            (true, true) => Ok(at),
+            // alloc: the reason of a refusal
+            (false, _) => Err(format!("a closure at expression {expr}, which the body's record lists no closure at")),
+            // alloc: the reason of a refusal
+            (true, false) => Err(format!("a {kind:?} written of a closure kind {written:?}")),
+        };
+    }
     let store = ExpressionStore::of(db, owner.expression_store_owner(db));
     if expr as usize >= store.expr_count() {
         // alloc: the reason of a refusal
@@ -944,15 +979,7 @@ fn closure_expr(db: &Db, owner: InferBodyId<'_>, expr: u32, kind: IdKind) -> R<E
     }
     let expr = ExprId::from_raw(RawIdx::from_u32(expr));
     let fits = match store.expr(expr) {
-        Expr::Closure { closure_kind, .. } => match kind {
-            IdKind::Closure => {
-                matches!(closure_kind, ClosureKind::Closure | ClosureKind::CoroutineClosure(_))
-            }
-            IdKind::Coroutine => {
-                matches!(closure_kind, ClosureKind::OldCoroutine(_) | ClosureKind::Coroutine { .. })
-            }
-            _ => matches!(closure_kind, ClosureKind::CoroutineClosure(_)),
-        },
+        Expr::Closure { closure_kind, .. } => fits_kind(&closure_kind),
         _ => false,
     };
     match fits {

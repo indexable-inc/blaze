@@ -214,13 +214,15 @@ mod tests {
         Ok(())
     }
 
-    #[hegel::test]
-    fn every_event_reaches_the_newest_live_listener_or_is_refused(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let ops: Vec<(u8, u8, u8)> = tc.draw(gs::vecs(gs::tuples3(gs::integers(), gs::integers(), gs::integers())).max_size(120));
-        if let Err(e) = run(&ops, false) {
-            panic!("{e}");
-        }
+    #[test]
+    fn every_event_reaches_the_newest_live_listener_or_is_refused() {
+        blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+            let ops: Vec<(u8, u8, u8)> =
+                tape.vec(0..=120, "ops", |tape| (tape.int::<u8>("op"), tape.int::<u8>("repl"), tape.int::<u8>("arg")));
+            if let Err(e) = run(&ops, false) {
+                panic!("{e}");
+            }
+        });
     }
 
     /// The oracle catches the planted bug: listen twice on one REPL, the older hangs up, an event comes.

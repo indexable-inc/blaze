@@ -56,6 +56,20 @@ pub enum ReflectContainer<I: Interner> {
     Unknown,
 }
 
+/// What `Interner::reflect_type_of` answers for `Described<'a, D, Args>`
+/// (`core::reflect::TypeOf`, `type_of!`; docs/v2/plan/design/type-of.md).
+#[derive_where(Clone, Copy, PartialEq, Eq, Debug, Hash; I: Interner)]
+pub enum TypeOfAnswer<I: Interner> {
+    /// The type the description describes.
+    Type(I::Ty),
+    /// The description or `Args` is not known yet: an inference variable, a generic
+    /// parameter, a constant not evaluated.
+    Unknown,
+    /// The description names no type (an `Arg` past `Args`, a field past its struct's, two
+    /// record fields of one name), or the type is no `Described`.
+    Refused,
+}
+
 /// A variable of a field binder: `F` of `for<F: Field<C>>`.
 #[derive_where(Clone, Copy, PartialEq, Eq, Debug, Hash; I: Interner)]
 #[derive(Lift_Generic, GenericTypeVisitable)]

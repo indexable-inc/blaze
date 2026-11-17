@@ -448,6 +448,7 @@ impl<'db> Ctx<'db> {
         let start = self.tree.attrs.len();
         let cfg = lower_attrs_into(
             db,
+            self.file.context_arena(),
             node,
             &|| *cfg_options.get_or_init(|| krate.cfg_options(db)),
             span_map,
@@ -486,11 +487,13 @@ impl<'db> Ctx<'db> {
             if cfg.is_some() {
                 break;
             }
+            let attr_file_id = HirFileId::from(attr_file);
             cfg = lower_attrs_into(
                 db,
+                attr_file_id.context_arena(),
                 ast::AnyHasAttrs::new(attr_file.parse(db).view()),
                 &|| *cfg_options.get_or_init(|| krate.cfg_options(db)),
-                HirFileId::from(attr_file).span_map(db),
+                attr_file_id.span_map(db),
                 &mut self.tree.attrs,
             );
         }
@@ -842,7 +845,8 @@ impl<'db> Ctx<'db> {
             db: self.db,
             mapping: None,
             tree: &mut self.tree,
-            file: Some(self.file),
+            file: self.file,
+            contexts: true,
         };
         let use_tree = lowering.lower_use_tree(use_item.use_tree()?, &mut |range| {
             span_map.span_for_range(range).ctx
@@ -947,7 +951,7 @@ impl<'db> Ctx<'db> {
     }
 
     fn lower_visibility_from_ast<'t>(&self, item: impl HasVisibility<'t> + Copy) -> RawVisibility {
-        visibility_from_ast(self.db, item.visibility(), &mut |range| {
+        visibility_from_ast(self.db, self.file.context_arena(), item.visibility(), &mut |range| {
             self.span_map().span_for_range(range).ctx
         })
     }
@@ -959,9 +963,12 @@ struct UseTreeLowering<'a, 't> {
     /// children. Only the source map ([`lower_use_tree`]) wants it.
     mapping: Option<&'a mut Arena<ast::UseTree<'t>>>,
     tree: &'a mut TreeBuilder,
-    /// The file the trees are written in, whose paths keep their segments' contexts
-    /// ([`lower_mod_path`]); `None` where only the syntax is wanted.
-    file: Option<HirFileId>,
+    /// The file the trees are written in, whose arena's table the contexts of the paths are
+    /// of ([`HirFileId::context_arena`]).
+    file: HirFileId,
+    /// Whether the paths keep their segments' contexts ([`lower_mod_path`]); not where only
+    /// the syntax is wanted.
+    contexts: bool,
 }
 
 impl<'t> UseTreeLowering<'_, 't> {
@@ -1073,23 +1080,32 @@ impl UseTreeLowering<'_, '_> {
         path: ast::Path<'_>,
         span_for_range: &mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized),
     ) -> Option<ModPath> {
-        match self.file {
-            Some(file) => lower_mod_path(self.db, file, path, span_for_range),
-            None => ModPath::from_src_view(self.db, path, span_for_range),
+        match self.contexts {
+            true => lower_mod_path(self.db, self.file, path, span_for_range),
+            false => {
+                ModPath::from_src_view(self.db, self.file.context_arena(), path, span_for_range)
+            }
         }
     }
 }
 
-/// The syntax of `tree`'s `use` trees, in the order [`Use::expand`] numbers them.
+/// The syntax of `tree`'s `use` trees, written in `file`, in the order [`Use::expand`]
+/// numbers them.
 pub(crate) fn lower_use_tree<'t>(
     db: &Db,
+    file: HirFileId,
     tree: ast::UseTree<'t>,
     span_for_range: &mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized),
 ) -> Option<Arena<ast::UseTree<'t>>> {
     let mut scratch = SCRATCH.take();
     let mut mapping = Arena::new();
-    let mut lowering =
-        UseTreeLowering { db, mapping: Some(&mut mapping), tree: &mut scratch, file: None };
+    let mut lowering = UseTreeLowering {
+        db,
+        mapping: Some(&mut mapping),
+        tree: &mut scratch,
+        file,
+        contexts: false,
+    };
     let lowered = lowering.lower_use_tree(tree, span_for_range);
     scratch.clear_use_trees();
     if scratch.kinds.capacity() <= SCRATCH_ITEMS {
@@ -1111,21 +1127,25 @@ fn lower_mod_path(
     path: ast::Path<'_>,
     span_for_range: &mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized),
 ) -> Option<ModPath> {
+    let arena = file.context_arena();
     match file.macro_file() {
-        Some(_) => ModPath::from_src_view_with_contexts(db, path, span_for_range),
-        None => ModPath::from_src_view(db, path, span_for_range),
+        Some(_) => ModPath::from_src_view_with_contexts(db, arena, path, span_for_range),
+        None => ModPath::from_src_view(db, arena, path, span_for_range),
     }
 }
 
+/// `table`: the arena whose syntax contexts `span_for_range` gives (`HirFileId::context_arena`
+/// of the file `node` is in).
 pub(crate) fn visibility_from_ast(
     db: &Db,
+    table: blaze_memo::ArenaId,
     node: Option<ast::Visibility<'_>>,
     span_for_range: &mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized),
 ) -> RawVisibility {
     let Some(node) = node else { return private_vis() };
     let path = match node.kind() {
         ast::VisibilityKind::In(path) => {
-            let path = ModPath::from_src_view(db, path, span_for_range);
+            let path = ModPath::from_src_view(db, table, path, span_for_range);
             match path {
                 None => return private_vis(),
                 Some(path) => path,
@@ -1143,7 +1163,7 @@ pub(crate) fn visibility_from_ast(
     // `resolve_visibility` resolves the path with its spans. A root context in a real file.
     let written = node.visibility_inner().and_then(|inner| inner.path());
     let ctxt = written.map_or(SyntaxContext::root(span::Edition::Edition2015), |path| {
-        span_for_range(path.syntax().text_range()).normalize_to_macros_2_0(db)
+        span_for_range(path.syntax().text_range()).normalize_to_macros_2_0(db, table)
     });
     RawVisibility::Module(path, VisibilityExplicitness::Explicit, ctxt)
 }

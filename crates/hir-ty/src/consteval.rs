@@ -38,7 +38,7 @@ use crate::{
 pub mod deps;
 pub mod discriminants;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ConstEvalError<'db> {
     MirLowerError(MirLowerError<'db>),
     MirEvalError(MirEvalError<'db>),
@@ -400,6 +400,14 @@ pub(crate) fn create_anon_const<'a, 'db: 'a>(
         // it yet.
         expr = store.expr(tail);
     }
+    // A `line!()` or `column!()` is a placeholder in the store, its value where it is written
+    // (`body_store::placed_literal`): an anon const, whose MIR makes the value. Told by the
+    // call alone (`body_store::place_call`), so no line is read here.
+    if let Expr::Literal(_) = expr
+        && crate::body_store::is_place(interner.db, owner, store, path_expr)
+    {
+        return Err(CreateConstError::NeedsAnonConst);
+    }
     match expr {
         // A literal of another type is, as in rustc, an anon const whose own type check gives
         // E0308, when `mismatched_literal_as_anon_const`.
@@ -484,8 +492,8 @@ pub fn anon_const_is_dependent<'db>(db: &'db Db, anon: AnonConstId<'db>) -> bool
 
 /// One variant's discriminant, kept per variant so that what reads it is invalidated only when
 /// its own value changes. Every variant's at once is [`discriminants::enum_discriminants`].
-#[blaze_query::tracked(cycle_result = const_eval_discriminant_cycle_result, returns(clone), mem_tag = Infer)]
-pub(crate) fn const_eval_discriminant_variant<'db>(
+#[blaze_memo::tracked(cycle_result = const_eval_discriminant_cycle_result, returns(clone), owns, mem_tag = Infer)]
+pub fn const_eval_discriminant_variant<'db>(
     db: &'db Db,
     variant_id: EnumVariantId,
 ) -> Result<i128, ConstEvalError<'db>> {
@@ -494,7 +502,6 @@ pub(crate) fn const_eval_discriminant_variant<'db>(
 
 fn const_eval_discriminant_cycle_result<'db>(
     _: &'db Db,
-    _: blaze_query::db::Id,
     _: EnumVariantId,
 ) -> Result<i128, ConstEvalError<'db>> {
     Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
@@ -635,7 +642,7 @@ pub fn evaluate_by_mir<'db>(
         // The crate the constant is evaluated for, not the one it is in: the impls its
         // generic arguments select can be in crates its own doesn't depend on.
         ParamEnvAndCrate {
-            param_env: db.trait_environment(owner.generic_def(db)),
+            param_env: owner.param_env(db),
             krate: trait_env.map_or_else(|| owner.krate(db), |env| env.krate),
         }
         .store(),
@@ -643,7 +650,7 @@ pub fn evaluate_by_mir<'db>(
     Ok(db.interpret_mir(body, trait_env)?)
 }
 
-#[blaze_query::tracked(returns(ref), cycle_result = const_eval_cycle_result, lru = 0, mem_tag = Infer)]
+#[blaze_memo::tracked(returns(ref), cycle_result = const_eval_cycle_result, owns, mem_tag = Infer)]
 pub fn const_eval_query<'db>(
     db: &'db Db,
     def: ConstId,
@@ -660,9 +667,28 @@ pub fn const_eval_query<'db>(
     value
 }
 
+/// `run`, the evaluation of `def`, a constant with no generic arguments, through the item
+/// store's constant step ([`crate::body_store::konst`]): its value from its own entry when the
+/// store has it, else `run`, offered with what it read. Call it inside a query.
+///
+/// [`const_eval_query`] does not go through it, and [`deps`] (a constant under its crate's
+/// check key) is its one store. The one condition that turns it on: runtime MIR being a step
+/// of the item store. Until then `run` reads the constant's own runtime MIR
+/// (`monomorphized_runtime_mir_body_query`), which no fact stands for, so every offer is
+/// refused and a constant would pay a lookup, a capture and a classification for an entry it
+/// can never have (docs/v2/plan/design/caches.md, the `item-store` and `dep-consts` rows).
+/// Then `const_eval_query` calls this for `subst.is_empty()` and `deps` is deleted. Public for
+/// hir-ty-mir's `tests::consteval::items`, which hold what the step does once it can hit.
+pub fn stored_constant<'db>(
+    db: &'db Db,
+    def: ConstId,
+    run: impl FnOnce() -> Result<StoredAllocation, ConstEvalError<'db>>,
+) -> Result<StoredAllocation, ConstEvalError<'db>> {
+    crate::body_store::constant(db, def, run)
+}
+
 fn const_eval_cycle_result<'db>(
     _: &'db Db,
-    _: blaze_query::db::Id,
     _: ConstId,
     _: StoredGenericArgs,
     _: Option<StoredParamEnvAndCrate>,
@@ -682,7 +708,7 @@ pub(crate) fn anon_const_eval<'db>(
     }
 }
 
-#[blaze_query::tracked(returns(ref), cycle_result = anon_const_eval_cycle_result, lru = 0, mem_tag = Infer)]
+#[blaze_memo::tracked(returns(ref), cycle_result = anon_const_eval_cycle_result, owns, mem_tag = Infer)]
 pub(crate) fn anon_const_eval_query<'db>(
     db: &'db Db,
     def: AnonConstId<'db>,
@@ -695,7 +721,6 @@ pub(crate) fn anon_const_eval_query<'db>(
 
 fn anon_const_eval_cycle_result<'db>(
     _: &'db Db,
-    _: blaze_query::db::Id,
     _: AnonConstId<'db>,
     _: StoredGenericArgs,
     _: Option<StoredParamEnvAndCrate>,
@@ -713,8 +738,8 @@ pub(crate) fn const_eval_static<'db>(
     }
 }
 
-#[blaze_query::tracked(returns(ref), cycle_result = const_eval_static_cycle_result, lru = 0, mem_tag = Infer)]
-pub(crate) fn const_eval_static_query<'db>(
+#[blaze_memo::tracked(returns(ref), cycle_result = const_eval_static_cycle_result, owns, mem_tag = Infer)]
+pub fn const_eval_static_query<'db>(
     db: &'db Db,
     def: StaticId,
 ) -> Result<StoredAllocation, ConstEvalError<'db>> {
@@ -723,7 +748,6 @@ pub(crate) fn const_eval_static_query<'db>(
 
 fn const_eval_static_cycle_result<'db>(
     _: &'db Db,
-    _: blaze_query::db::Id,
     _: StaticId,
 ) -> Result<StoredAllocation, ConstEvalError<'db>> {
     Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
@@ -1091,7 +1115,7 @@ mod tests {
         map.statics.push(StaticMemory {
             start: 0x9000,
             size: 16,
-            id: blaze_query::db::FromId::from_id(blaze_query::db::Id::from_u32(7 + (2 << 20))),
+            id: blaze_memo::Id::from_gid(blaze_memo::Gid::for_test(7 + (2 << 20))),
         });
         map.note_pointer(crate::PointerAt::Memory(0x2000));
         map.note_pointer(crate::PointerAt::Value(8));

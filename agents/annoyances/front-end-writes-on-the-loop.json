@@ -1,0 +1,14 @@
+{
+ "id": "front-end-writes-on-the-loop",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane: blaze check --workspace of blaze stops in proc-macro codegen, int-1112",
+ "where": "crates/blaze-cargo/src/serve/job.rs Jobs::apply_writes; crates/blaze-cargo/src/serve/unit.rs UnitWriter::apply, identify; crates/blaze-lower/src/lib.rs Lowered::library_narrows",
+ "what": "Each front-end write (proc macros' loads, build scripts' runs, the harness, every newly ready unit's identity and narrowed identity, deps::serve of the units it reached) runs inside the loop's turn, in the plane's step. identify parses every Rust file of a library crate the store has no narrowed identity of (code::library_narrow, a fresh BLAZE_HOME: all of them) and reads the store for each; deps::serve walks image keys and reads images. A turn of blaze check --workspace of blaze sat 60 s in `unit narrowed identity, unit 610` and the loop guard fired.",
+ "cost": "the loop's turn is unbounded: no completion, answer, status or admission moves while a write runs",
+ "cause": "the front end's write is defined as the loop's (unit.rs module docs: written by the loop alone), so all of its work runs where the loop runs",
+ "class": "front-end work done on the daemon's loop instead of on a task",
+ "prevention": "the write is a thread task of the job (posted once its readers are gone, holding the writer, its result the loop's completion), as the tables' and doc's tasks already take the writer; the loop then only decides when to post it",
+ "workaround": "none; spans added in identify (read, parsed, its library crates, its closure's texts) to say which part takes the time",
+ "fix": "not yet",
+ "state": "open"
+}

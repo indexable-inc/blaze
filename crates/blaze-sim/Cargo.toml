@@ -1,0 +1,21 @@
+[package]
+name = "blaze-sim"
+description = "blaze's own test engine and simulation kit (docs/v2/plan/design/sim.md): a case is a function of one tape of labelled, bounded choices where 0 is calm; the tape, the search that shrinks a failing tape and replays it, the driver, and what every simulation shared (answers in flight, planted-bug controls)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `SplitMix64`: a seeded tape is its stream.
+blaze-rng.workspace = true
+
+[lints]
+workspace = true

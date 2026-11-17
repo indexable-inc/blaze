@@ -143,7 +143,7 @@ fn send(db: &Db) -> TraitId {
 #[test]
 fn a_coroutine_is_send_only_when_what_it_holds_across_an_await_is() {
     let db = fixture::db(HELD_ACROSS_AWAIT).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let send = send(&db);
         for (name, expected) in [
             ("holds_rc", EvaluationResult::EvaluatedToErr),
@@ -166,7 +166,7 @@ fn a_coroutine_is_send_only_when_what_it_holds_across_an_await_is() {
 
 #[test]
 fn each_free_region_of_a_witness_is_a_bound_region_of_its_own() {
-    let db = Db::for_tests();
+    let db = Db::for_tests(|_| {});
     let interner = DbInterner::new_no_crate(&db);
     let types = &default_types().types;
     let regions = &default_types().regions;
@@ -208,7 +208,7 @@ fn each_free_region_of_a_witness_is_a_bound_region_of_its_own() {
 
 #[test]
 fn a_witness_list_with_no_region_binds_nothing() {
-    let db = Db::for_tests();
+    let db = Db::for_tests(|_| {});
     let interner = DbInterner::new_no_crate(&db);
     let types = &default_types().types;
     let bound_types = bind_witness_regions(interner, [types.u32, types.bool].into_iter());

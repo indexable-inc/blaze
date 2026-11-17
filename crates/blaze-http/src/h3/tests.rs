@@ -14,8 +14,10 @@ use quinn_proto::{DatagramEvent, EndpointConfig};
 
 use super::{
     ClientConfig, Closed, Direction, Endpoint, Event, Identity, SETTINGS_WAIT, ServerConfig,
-    SessionId, Step, StreamRef, Transport, config, frame,
+    SessionId, Step, StreamRef, Transport, Trust, config, frame,
 };
+
+mod requests;
 
 const SERVER: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 4433);
@@ -45,7 +47,7 @@ fn server(epoch: Instant) -> (Endpoint, [u8; 32]) {
     let (identity, hash) = identity();
     let server = Endpoint::new(
         epoch,
-        Some(ServerConfig { identity, transport: Transport::default() }),
+        Some(ServerConfig { identity, transport: Transport::default(), requests: false }),
         None,
     )
     .unwrap();
@@ -91,9 +93,12 @@ struct Mute {
 
 impl Mute {
     fn new(epoch: Instant, pin: [u8; 32]) -> Mute {
-        let client =
-            config::client(&ClientConfig { pins: vec![pin], transport: Transport::default() })
-                .unwrap();
+        let client = config::client(&ClientConfig {
+            trust: Trust::Pinned(vec![pin]),
+            transport: Transport::default(),
+        })
+        .unwrap()
+        .quic;
         let mut endpoint =
             quinn_proto::Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
         let (handle, conn) = endpoint.connect(epoch, client, SERVER, "localhost").unwrap();
@@ -211,7 +216,7 @@ impl Pair<Endpoint> {
         let client = Endpoint::new(
             epoch,
             None,
-            Some(ClientConfig { pins: vec![pin], transport: Transport::default() }),
+            Some(ClientConfig { trust: Trust::Pinned(vec![pin]), transport: Transport::default() }),
         )
         .unwrap();
         Pair {
@@ -425,7 +430,7 @@ fn a_certificate_not_pinned_fails_the_handshake_naming_the_server() {
     let client = Endpoint::new(
         epoch,
         None,
-        Some(ClientConfig { pins: vec![[7; 32]], transport: Transport::default() }),
+        Some(ClientConfig { trust: Trust::Pinned(vec![[7; 32]]), transport: Transport::default() }),
     )
     .unwrap();
     let mut pair = Pair {
@@ -547,4 +552,81 @@ fn a_request_that_is_not_webtransport_is_answered_and_reported() {
     let error = refused.unwrap_or_else(|| panic!("{:?}", pair.server_events));
     assert_eq!(error.step, Step::Connect);
     assert!(error.why.contains("websocket"), "{error}");
+}
+
+fn acks_of(events: &[Event], stream: StreamRef) -> usize {
+    events.iter().filter(|it| matches!(it, Event::StreamAcked { stream: at } if *at == stream)).count()
+}
+
+/// The server answers a request stream with bytes and its FIN, the packets held at each step:
+/// whether [`Event::StreamAcked`] kept its promise, with `plant` on the server's connection.
+fn an_answer_acknowledged(plant: super::endpoint::Plant) -> Result<(), String> {
+    let mut pair = Pair::new();
+    let (server, client) = pair.open();
+    pair.server.plant(server.conn, plant);
+    let stream =
+        pair.client.open(client, Direction::Bi).unwrap().expect("the server allows streams");
+    pair.client.send(stream, b"ask").unwrap();
+    pair.client.finish(stream).unwrap();
+    pair.settle();
+    let at = opened(&pair.server_events, server, Direction::Bi)
+        .unwrap_or_else(|| panic!("{:?}", pair.server_events));
+    pair.server.consumed(at, 3);
+    pair.server_events.clear();
+    pair.client_events.clear();
+    // More than one packet's worth, so the FIN rides behind data that must come first.
+    let answer: Vec<u8> = (0..5_000u32).map(|it| it as u8).collect();
+    pair.server.send(at, &answer).unwrap();
+    pair.server.finish(at).unwrap();
+    pair.drain();
+    if acks_of(&pair.server_events, at) > 0 {
+        return Err("acknowledged before any byte of it left the server".to_owned());
+    }
+    // The answer's packets leave the server and reach the client; the client's own packets
+    // (its acknowledgements) are held.
+    let mut held = Vec::new();
+    while let Some(transmit) = pair.server.next_transmit() {
+        held.push(transmit.bytes);
+    }
+    for bytes in &held {
+        pair.client.received(SERVER, bytes);
+    }
+    pair.client_events.extend(std::iter::from_fn(|| pair.client.next_event()));
+    if data_of(&pair.client_events, stream) != answer || !finished(&pair.client_events, stream) {
+        return Err(format!("the client did not read the whole answer and its FIN: {:?}", pair.client_events));
+    }
+    pair.drain();
+    if acks_of(&pair.server_events, at) > 0 {
+        return Err("acknowledged before the client's acknowledgement reached the server".to_owned());
+    }
+    // The client's packets go; the clock runs past its acknowledgement delay.
+    let until = pair.now + Duration::from_secs(1);
+    pair.run_until(until);
+    pair.drain();
+    if acks_of(&pair.server_events, at) != 1 {
+        return Err(format!("acknowledged {} times, not once: {:?}", acks_of(&pair.server_events, at), pair.server_events));
+    }
+    let sent = pair.server_events.iter().position(|it| matches!(it, Event::StreamSent { stream: s } if *s == at));
+    let acked = pair.server_events.iter().position(|it| matches!(it, Event::StreamAcked { stream: s } if *s == at));
+    if sent.is_none_or(|sent| acked.is_some_and(|acked| acked < sent)) {
+        return Err(format!("StreamAcked came before StreamSent: {:?}", pair.server_events));
+    }
+    Ok(())
+}
+
+/// The invariant: a finished stream's [`Event::StreamAcked`] comes exactly once, after its
+/// [`Event::StreamSent`], only once the peer's endpoint has read every byte of it and its FIN
+/// and its acknowledgement came back: never while the bytes are still here or the peer's
+/// acknowledgement is not.
+#[test]
+fn a_stream_is_acknowledged_once_the_peer_has_its_fin_and_never_before() {
+    an_answer_acknowledged(super::endpoint::Plant::None).unwrap();
+}
+
+/// Control: with the acknowledgement told as the FIN is handed to QUIC (the meaning of
+/// `StreamSent`), the test above fails.
+#[test]
+fn the_acknowledgement_test_catches_an_ack_told_at_sent() {
+    let failed = an_answer_acknowledged(super::endpoint::Plant::AckedAtSent).unwrap_err();
+    assert!(failed.contains("before any byte of it left"), "{failed}");
 }

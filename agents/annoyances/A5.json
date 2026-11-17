@@ -1,0 +1,11 @@
+{
+ "id": "A5",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code",
+ "where": "my own method",
+ "what": "`CARGO_TARGET_DIR` and `LLVM_SYS_231_PREFIX`, exported in my shell for cargo, were inherited by some blaze commands and not others; blaze then used cargo's target directory and rebuilt the world between requests.",
+ "cost": "an afternoon of polluted timings",
+ "cause": "blaze honours `CARGO_TARGET_DIR`; a change in it re-keys 22 dependency images; my shell state leaked",
+ "workaround": "run every measured command under `env -i` with a fixed list",
+ "state": "open: moving the target directory should recompute nothing in the front end"
+}

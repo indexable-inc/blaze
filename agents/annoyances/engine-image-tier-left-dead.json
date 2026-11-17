@@ -1,0 +1,14 @@
+{
+ "id": "engine-image-tier-left-dead",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), track 6 dead-code lane, int-1112",
+ "where": "crates/blaze-query/src/{lib.rs,image.rs,db.rs,table.rs,memo.rs}, crates/intern/src/{table.rs,symbol.rs,mapped.rs,fuzz.rs}, crates/base-db/src/trees.rs, crates/blaze-format/src/lib.rs (Sym, Record::symbols, Persist::symbols), crates/blaze-image/src/lib.rs SectionId",
+ "what": "Once the daemon start stopped restoring engine state, the code it used to call stayed behind with no caller on the start path: the old database's image tier (from_image_with, write_image, settle, the cold-slot and edge-record readers), intern's mapped base, GC marks and table writer and restorer with its fuzz target, the Mapped interner, base-db's stored library trees, and blaze-format's walk for symbols that existed only to feed the symbol GC. Every one still compiled and was tested, so nothing said it was dead.",
+ "cost": "a lane to find and delete it; until then each reader of intern, blaze-query or base-db read restore paths the daemon never takes, and the DbError enum carried four variants no run could produce",
+ "cause": "the start was rewritten without deleting what it stopped calling in the same piece, and the items were pub, so the dead-code lint could not see them",
+ "class": "a pub API whose only caller is removed in another crate stays, tested, as if live",
+ "prevention": "a change that removes a call deletes its callee and the callee's own tests in the same piece (rule 66); a pub item with no caller outside its own tests is a gate finding",
+ "workaround": "none",
+ "fix": "deleted whole: blaze-query's image tier, intern's restore/write/Live/Mapped/fuzz (Table is the overlay alone), base-db's trees, blaze-format's Sym walk; the section ids moved to SectionId::RETIRED, never reused. serve/image.rs, serve/tests.rs and daemon.rs call sites are handed to their owner (/tmp/plan/handoff-6.md H-dead).",
+ "state": "written, not compiled"
+}

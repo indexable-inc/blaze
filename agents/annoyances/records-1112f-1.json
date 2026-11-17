@@ -1,0 +1,20 @@
+{
+  "id": "records-1112f-1",
+  "date": "2026-11-12",
+  "who": "records-1112f (claude-fable-5-2)",
+  "what": "No registry crate had a front-end image on a real daemon (80 of 80 refused on a hello-world, measured by lane reth-1112): `nameres::frozen`'s encoder took an OUT_DIR's text up to its FIRST `/build/` as a checkout's build directory, and blaze's default target directory is `<home>/build/<name>-<id>`, so the whole home was the place and every fetched source (`<home>/sources/..`) was a file below it.",
+  "whys": [
+    "The encoder guessed which directory is one checkout's from the text of a path, by a marker (`/build/`) that the home's own layout also uses.",
+    "It had to guess because hir-def was told no directories: the build's named roots (blaze-usercode's `Roots`, blaze-cargo's `Places`) reached the database only as a one-way `Port::ported` for keys.",
+    "The fetched-sources directory was no named root at all, so nothing could write a registry path portably or say that a path was under it.",
+    "Every test of the codec used fixture paths (`/first/target/out`) with no `/build/` in them, so the layout a daemon really has was never encoded once in a test."
+  ],
+  "class": "A property of a directory (whose it is) guessed from a path's text where the owner of the layout already has it by name.",
+  "prevention": "The port is the one place a record asks about directories: `base_db::Port` gained `placed` (the inverse) and `held` (the one searcher, `Roots::embedded`), `Role::Sources` is a root of every build's `Places`, and the codec writes a literal's paths with the port and refuses bytes that still hold a root by the root's name. Tests use the daemon's real layout (`<home>/sources/registry/..`, `<home>/build/<id>/debug/build/<pkg>/out`).",
+  "where": "crates/hir-def/src/nameres/frozen.rs (Enc::finish_naming, Enc::unplaced, Dec::placed); crates/base-db/src/files.rs (Port); crates/blaze-cargo/src/serve/unit/portable.rs; crates/blaze-usercode/src/roots.rs (Role::Sources)",
+  "state": "open",
+  "cause": "`out.find(\"/build/\")` in `Enc::finish_naming`.",
+  "cost": "every registry crate resolved from source by every daemon, every start",
+  "workaround": "",
+  "fix": "Written 2026-11-12 by records-1112f, not compiled or run by it: the last `/build/` of an OUT_DIR, the port's roots for the rest."
+}

@@ -1,0 +1,14 @@
+{
+ "id": "thin-client-spans-have-no-recorder",
+ "date": "2026-11-12",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor of handoff-12 request 2, int-1112",
+ "where": "crates/blaze-thin/src/{main.rs,talk.rs}, crates/blaze-api/src/lib.rs Request::ClientRows, crates/blaze-cargo/src/serve/unit/run/launch.rs ProgramTimes",
+ "what": "20 to 51 ms of a warm edit's run were outside every span: the thin `blaze` (the warm path) has no flight recorder and links no Arrow, so it sent no client rows at all, and the program's exec, Hello and exit were seen by nobody as spans. `client_started_ns` was NULL for every warm run's build.",
+ "cost": "the edit floor's outside-the-daemon part could only be quoted as one number (client sample less builds.dur_ns), never split (rule 16)",
+ "cause": "client rows were defined as Arrow IPC streams of the flight recorder's tables, which only the full CLI can make; the thin client was added later as the warm path and inherited no way to time itself",
+ "class": "a record format that only the heavy producer can write, so the light producer records nothing",
+ "prevention": "a record a light process sends is plain named spans (`blaze_api::Timed`), made rows by the daemon, which has the recorder",
+ "workaround": "none",
+ "fix": "Request::ClientRows gains `pid` and `timed` (schema 55, the 54 layout read as pid 0 and none); the thin client times exec to main (kernel start time), solo check, connect, request on the wire and answer to exec and sends them on the request's own connection before it execs; the daemon makes them rows (cli/client_rows.rs spans_of); launch.rs ProgramTimes joins exec, Hello and exit into program: exec to Hello and program: Hello to exit. The loop's drain of those and a solo answer's rows: /tmp/plan/handoff-12-spans.md.",
+ "state": "partly fixed"
+}

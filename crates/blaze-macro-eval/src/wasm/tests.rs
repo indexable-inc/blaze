@@ -126,21 +126,25 @@ fn reading_relative(relative: &str) -> String {
 
 /// A workspace whose member `pkg` holds `data/a.txt`, with `secret.txt` in its root outside
 /// the member, in a fresh directory of its own: its real path.
-struct Workspace(std::path::PathBuf);
+struct Workspace {
+    top: std::path::PathBuf,
+    /// The directory `top` is (canonicalized), removed with it when this drops.
+    _held: blaze_core::temp::TempDir,
+}
 
 impl Workspace {
     fn new(name: &str) -> Workspace {
-        let top = std::env::temp_dir()
-            .join(format!("blaze-macro-eval-wasm-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&top);
+        let held = blaze_core::temp::TempDir::for_test(&format!("blaze-macro-eval-wasm-{name}-"));
+        let top = held.path();
         std::fs::create_dir_all(top.join("pkg/data")).unwrap();
         std::fs::write(top.join("pkg/data/a.txt"), "hello, macro").unwrap();
         std::fs::write(top.join("secret.txt"), "not yours").unwrap();
-        Workspace(std::fs::canonicalize(&top).unwrap())
+        let top = std::fs::canonicalize(top).unwrap();
+        Workspace { top, _held: held }
     }
 
     fn path(&self, rel: &str) -> String {
-        let top = self.0.to_str().unwrap();
+        let top = self.top.to_str().unwrap();
         if rel.is_empty() { top.to_owned() } else { format!("{top}/{rel}") }
     }
 
@@ -150,12 +154,6 @@ impl Workspace {
         env.set("CARGO_MANIFEST_DIR", self.path("pkg"));
         env.set("OUT_DIR", self.path("pkg/target/out"));
         env
-    }
-}
-
-impl Drop for Workspace {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -169,8 +167,10 @@ fn expand_in(
 ) -> (Result<(), String>, Vec<(Seen, String)>) {
     use std::sync::Arc;
     let input = [a_plus()];
-    let g = given(&input);
-    let new_server = || crate::server::Server::new(g.sites, g.edition, g.forced_keywords);
+    let db = Db::new(|_| {}, blaze_memo::Reads::Off);
+    let g = given(&db, &input);
+    let new_server =
+        || crate::server::Server::new(g.sites, g.contexts, g.edition, g.forced_keywords);
     let mut server = new_server();
     let mut wire = Vec::new();
     server.input(g.inputs, &mut wire);
@@ -178,7 +178,6 @@ fn expand_in(
     let placeholder = new_server();
     let pre = library.pre.clone();
     let statics = Arc::clone(&library.statics);
-    let db = Db::new();
     super::thread::run(
         &db,
         move |link: &super::thread::Link<(Result<(), String>, Vec<(Seen, String)>)>| {
@@ -216,8 +215,9 @@ fn a_relative_path_a_module_reads_starts_in_the_calling_packages_directory() {
             .unwrap();
     let input = [a_plus()];
     let mut spent = Spent::default();
+    let db = Db::new(|_| {}, blaze_memo::Reads::Off);
     let ran = library
-        .expand(&Db::new(), &ws.env(), &[(0, given(&input))], &[], &ws.path("pkg"), &mut spent)
+        .expand(&db, &ws.env(), &[(0, given(&db, &input))], &[], &ws.path("pkg"), &mut spent)
         .unwrap();
     assert!(ran.output.is_ok(), "{:?}", ran.output.err());
     assert!(ran.seen.contains(&(Seen::Read, ws.path("pkg/data/a.txt"))), "{:?}", ran.seen);
@@ -545,19 +545,22 @@ fn a_kept_modules_machine_code_loads_in_another_process_without_compiling() {
     assert!(put.is_none(), "a module found in the store is kept again");
 
     // And what it loaded runs.
-    let db = Db::new();
+    let db = Db::new(|_| {}, blaze_memo::Reads::Off);
     let input = [a_plus()];
     let mut spent = Spent::default();
     let ran =
-        library.expand(&db, &Env::default(), &[(0, given(&input))], &[], "/", &mut spent).unwrap();
+        library.expand(&db, &Env::default(), &[(0, given(&db, &input))], &[], "/", &mut spent).unwrap();
     let output = ran.output.unwrap();
     assert!(matches!(output.trees(), [Tree::Ident { .. }, Tree::Punct { ch: b'+', .. }]));
 }
 
-fn given(inputs: &[Stream]) -> Given<'_> {
+fn given<'a>(db: &Db, inputs: &'a [Stream]) -> Given<'a> {
     Given {
         inputs,
         sites: [at(0, 0), at(1, 1), at(2, 2)],
+        // The sites' contexts are roots, the same word in every table: `db`'s live session
+        // arena stands for the calling crate's, never a constant of one generation.
+        contexts: blaze_memo::Database::memo(db).session(),
         edition: Edition::CURRENT,
         forced_keywords: false,
     }
@@ -565,24 +568,24 @@ fn given(inputs: &[Stream]) -> Given<'_> {
 
 #[test]
 fn an_expansion_in_a_module_gives_back_its_streams_tokens_and_reads_nothing() {
-    let db = Db::new();
+    let db = Db::new(|_| {}, blaze_memo::Reads::Off);
     let (library, _) = Library::load_with(&modules(), &echo(), None, WHAT).unwrap();
     let input = [a_plus()];
     let mut spent = Spent::default();
     let first =
-        library.expand(&db, &Env::default(), &[(0, given(&input))], &[], "/", &mut spent).unwrap();
+        library.expand(&db, &Env::default(), &[(0, given(&db, &input))], &[], "/", &mut spent).unwrap();
     assert!(!spent.evaluated && spent.steps > 0 && spent.over.is_none(), "{spent:?}");
     assert!(
-        first.seen.is_empty() && first.unkeyable.is_none() && !first.asked,
+        first.seen.is_empty() && first.unkeyable.is_none() && first.asked.is_none(),
         "an echo read nothing"
     );
     // A fresh instance each time: the second run is the first again.
     let second =
-        library.expand(&db, &Env::default(), &[(0, given(&input))], &[], "/", &mut spent).unwrap();
+        library.expand(&db, &Env::default(), &[(0, given(&db, &input))], &[], "/", &mut spent).unwrap();
     assert_eq!(first.output.unwrap().trees().len(), second.output.unwrap().trees().len());
 
     let missing = library
-        .expand(&db, &Env::default(), &[(7, given(&input))], &[], "/", &mut spent)
+        .expand(&db, &Env::default(), &[(7, given(&db, &input))], &[], "/", &mut spent)
         .unwrap_err();
     assert!(missing.0.contains("no macro at index 7"), "{missing}");
 }
@@ -598,14 +601,12 @@ fn env(a: &str, profile: &str) -> Env {
 
 #[test]
 fn an_expansion_is_found_again_when_only_a_variable_it_never_read_differs() {
-    let db = Db::new();
+    let db = Db::new(|_| {}, blaze_memo::Reads::Off);
     let (library, _) = Library::load_with(&modules(), &binary(&reading_a()), None, WHAT).unwrap();
     let input = [a_plus()];
     let mut spent = Spent::default();
-    let first = env("1", "/tmp/blaze-lanes/profile-1855");
-    let ran = library.expand(&db, &first, &[(0, given(&input))], &[], "/", &mut spent).unwrap();
-    let first = env("1", "/tmp/blaze-profile-1855");
-    let ran = library.expand(&db, &first, 0, &given(&input), &[], "/", &mut spent).unwrap();
+    let first = env("1", "/profiles/blaze-lanes/profile-1855");
+    let ran = library.expand(&db, &first, &[(0, given(&db, &input))], &[], "/", &mut spent).unwrap();
     assert_eq!(
         ran.seen,
         [(Seen::Env, "A".to_owned())],
@@ -634,11 +635,11 @@ fn an_expansion_is_found_again_when_only_a_variable_it_never_read_differs() {
         matches!(index::find(&reader, &guard, &key, &mut Calling::new(env)), Ok(Found::Hit { .. }))
     };
     assert!(
-        found(&env("1", "/tmp/blaze-profile-1910")),
+        found(&env("1", "/profiles/blaze-profile-1910")),
         "a variable it never read made it miss"
     );
     assert!(
-        !found(&env("2", "/tmp/blaze-profile-1855")),
+        !found(&env("2", "/profiles/blaze-profile-1855")),
         "the variable it read changed and it was found"
     );
 }
@@ -741,7 +742,8 @@ fn machine_code_in_a_store_behind_the_daemons_own_is_refused_by_name() {
     use blaze_cas::{Kind, Origin};
     let (key, code) = echo_code();
     let mut sim = Sim::new(5, Faults::default());
-    let mut base = opened_in(&mut sim, "base", &[]);
+    // A layer is a shared directory of writers' stores: this one has one writer, `w-1`.
+    let mut base = opened_in(&mut sim, "base/w-1", &[]);
     let put = Put { keep: Keep::Machine(key), value: code, what: WHAT.to_owned() };
     let published = publish(&mut base, vec![put]);
     assert!(published.refused.is_empty(), "{:?}", published.refused);
@@ -751,7 +753,7 @@ fn machine_code_in_a_store_behind_the_daemons_own_is_refused_by_name() {
     let mine = opened_in(&mut sim, "mine", &["base"]);
     let daemon = modules();
     let error = Library::load_with(&daemon, &echo(), Some(&mine.reader()), WHAT).unwrap_err();
-    let base = FileName::new("base").unwrap();
+    let base = FileName::new("base/w-1").unwrap();
     assert!(
         matches!(&error, LoadError::NotLocal { origin: Origin::Behind(dir), kind: Kind::Machine } if *dir == base),
         "{error:?}"
@@ -865,7 +867,7 @@ fn counter_crate() -> (Db, base_db::Crate, hir_def::StaticId, [u8; 32]) {
     use hir_def::{ModuleDefId, test_items};
     let db = hir_expand::fixture::db("pub static mut COUNT: u32 = 0;").into_db();
     let krate = hir_expand::fixture::test_crate(&db);
-    let id = blaze_query::db::attach(&db, || {
+    let id = blaze_memo::attach(&db, || {
         test_items::declarations(&db, krate)
             .into_iter()
             .find_map(|it| match it {
@@ -889,17 +891,17 @@ fn a_static_a_run_changes_is_carried_into_the_next_calls_instance() {
     let mut spent = Spent::default();
     // Unresolved, it runs nothing.
     let error = library
-        .expand(&db, &Env::default(), &[(0, given(&input))], &[], "/", &mut spent)
+        .expand(&db, &Env::default(), &[(0, given(&db, &input))], &[], "/", &mut spent)
         .unwrap_err();
     assert!(error.0.contains("not resolved"), "{error}");
 
     library.watch(&db, krate).unwrap();
     let first =
-        library.expand(&db, &Env::default(), &[(0, given(&input))], &[], "/", &mut spent).unwrap();
+        library.expand(&db, &Env::default(), &[(0, given(&db, &input))], &[], "/", &mut spent).unwrap();
     assert_eq!(first.statics, [(id, vec![1, 0, 0, 0], false)]);
     let preset = [(id, first.statics[0].1.clone())];
     let second = library
-        .expand(&db, &Env::default(), &[(0, given(&input))], &preset, "/", &mut spent)
+        .expand(&db, &Env::default(), &[(0, given(&db, &input))], &preset, "/", &mut spent)
         .unwrap();
     assert_eq!(
         second.statics,
@@ -909,7 +911,7 @@ fn a_static_a_run_changes_is_carried_into_the_next_calls_instance() {
 
     // A preset of another size is refused, naming nothing it can't.
     let error = library
-        .expand(&db, &Env::default(), &[(0, given(&input))], &[(id, vec![0; 3])], "/", &mut spent)
+        .expand(&db, &Env::default(), &[(0, given(&db, &input))], &[(id, vec![0; 3])], "/", &mut spent)
         .unwrap_err();
     assert!(error.0.contains("3 bytes of state"), "{error}");
 }
@@ -944,7 +946,7 @@ fn a_static_left_holding_a_heap_address_is_said_to_hold_one() {
     let input = [a_plus()];
     let mut spent = Spent::default();
     let ran =
-        library.expand(&db, &Env::default(), &[(0, given(&input))], &[], "/", &mut spent).unwrap();
+        library.expand(&db, &Env::default(), &[(0, given(&db, &input))], &[], "/", &mut spent).unwrap();
     assert!(ran.output.is_ok(), "{:?}", ran.output);
     assert_eq!(ran.statics, [(id, 5000u32.to_le_bytes().to_vec(), true)]);
 }
@@ -961,10 +963,10 @@ fn a_runs_calls_run_in_order_in_one_instance_from_the_heap_the_ones_before_left(
     let input = [a_plus()];
     let mut spent = Spent::default();
     let one =
-        library.expand(&db, &Env::default(), &[(0, given(&input))], &[], "/", &mut spent).unwrap();
+        library.expand(&db, &Env::default(), &[(0, given(&db, &input))], &[], "/", &mut spent).unwrap();
     assert_eq!(one.statics, [(id, 5000u32.to_le_bytes().to_vec(), true)]);
     let alone = spent.steps;
-    let calls = [(0, given(&input)), (0, given(&input)), (0, given(&input))];
+    let calls = [(0, given(&db, &input)), (0, given(&db, &input)), (0, given(&db, &input))];
     let three = library.expand(&db, &Env::default(), &calls, &[], "/", &mut spent).unwrap();
     assert!(three.output.is_ok(), "{:?}", three.output);
     assert_eq!(
@@ -985,7 +987,7 @@ fn an_earlier_call_that_stops_stops_the_run_naming_it() {
     library.watch(&db, krate).unwrap();
     let input = [a_plus()];
     let mut spent = Spent::default();
-    let calls = [(0, given(&input)), (7, given(&input)), (0, given(&input))];
+    let calls = [(0, given(&db, &input)), (7, given(&db, &input)), (0, given(&db, &input))];
     let error = library.expand(&db, &Env::default(), &calls, &[], "/", &mut spent).unwrap_err();
     assert!(
         error.0.contains("call 2 of the 2 its session made before this one")

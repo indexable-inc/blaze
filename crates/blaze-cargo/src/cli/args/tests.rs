@@ -18,6 +18,78 @@ fn refused(words: &[&str]) -> String {
 }
 
 #[test]
+fn query_rules_and_replace_refuse_each_build_selection_flag_by_name() {
+    let unhonored = |words: &[&str]| super::refused(&cargo(words));
+    let modes: [&[&str]; 3] = [&["--query", "q"], &["--rules", "r", "--dry-run"], &["--replace", "a::B=c::D"]];
+    let selections: [(&str, &[&str]); 14] = [
+        ("--package", &["-p", "a"]),
+        ("--workspace", &["--workspace"]),
+        ("--exclude", &["--workspace", "--exclude", "a"]),
+        ("--features", &["--features", "x"]),
+        ("--all-features", &["--all-features"]),
+        ("--no-default-features", &["--no-default-features"]),
+        ("--release", &["--release"]),
+        ("--profile", &["--profile", "dev"]),
+        ("--target", &["--target", "x86_64-unknown-linux-gnu"]),
+        ("--lib", &["--lib"]),
+        ("--bin", &["--bin", "b"]),
+        ("--tests", &["--tests"]),
+        ("--all-targets", &["--all-targets"]),
+        ("--timings", &["--timings"]),
+    ];
+    for mode in modes {
+        assert_eq!(unhonored(&[&["check"], mode].concat()), None, "{mode:?} alone");
+        for (flag, words) in selections {
+            let line = [&["check"], mode, words].concat();
+            let said = unhonored(&line).unwrap_or_else(|| panic!("{line:?} is accepted"));
+            assert!(said.contains(&format!("`{flag}`")), "{line:?}: {said}");
+        }
+    }
+    // What the client reads to show the answer stays allowed.
+    assert_eq!(unhonored(&["check", "--query", "q", "--message-format", "json", "-v"]), None);
+}
+
+#[test]
+fn query_rules_and_replace_refuse_each_flag_that_steers_a_build_by_name() {
+    let unhonored = |words: &[&str]| super::refused(&cargo(words));
+    let modes: [&[&str]; 3] = [&["--query", "q"], &["--rules", "r"], &["--replace", "a::B=c::D"]];
+    // Each flag, and whether it is a global, which may come before the command too.
+    let steering: [(&str, &[&str], bool); 9] = [
+        ("`--jobs`", &["-j", "4"], false),
+        ("`--keep-going`", &["--keep-going"], false),
+        ("`--locked`", &["--locked"], true),
+        ("`--offline`", &["--offline"], true),
+        ("`--frozen`", &["--frozen"], true),
+        ("`--no-locked`", &["--no-locked"], true),
+        ("`--config`", &["--config", "build.jobs=2"], true),
+        ("`-Z build-std`", &["-Z", "build-std"], true),
+        ("`-Z build-std`", &["-Zbuild-std"], true),
+    ];
+    for mode in modes {
+        for (flag, words, global) in steering {
+            let mut lines = vec![[&["check"], mode, words].concat()];
+            if global {
+                lines.push([words, &["check"], mode].concat());
+            }
+            for line in lines {
+                let said = unhonored(&line).unwrap_or_else(|| panic!("{line:?} is accepted"));
+                assert!(said.contains(flag) && said.contains("runs no build"), "{line:?}: {said}");
+            }
+        }
+    }
+    // `--rules` and `--replace` print a diff or a status line; only `--query` writes JSON.
+    for mode in &modes[1..] {
+        let line = [&["check"], *mode, &["--message-format", "json"]].concat();
+        let said = unhonored(&line).unwrap_or_else(|| panic!("{line:?} is accepted"));
+        assert!(said.contains("no JSON messages"), "{line:?}: {said}");
+    }
+    // `-Z unstable-options` allows `-C`, which the rules modes honour.
+    assert_eq!(unhonored(&["-Z", "unstable-options", "check", "--query", "q"]), None);
+    // A build still takes them.
+    assert_eq!(unhonored(&["check", "--locked", "-j", "4", "--keep-going"]), None);
+}
+
+#[test]
 fn check_reads_its_fix_replace_and_baseline_flags_and_keeps_them_from_the_load() {
     let asked = cargo(&[
         "check",
@@ -95,6 +167,24 @@ fn check_reads_its_fix_replace_and_baseline_flags_and_keeps_them_from_the_load()
         unhonored(&["check", "--replace", "a::B=c::D", "--fix"]).is_some(),
         "a replace checks nothing"
     );
+    let rules = cargo(&["check", "--rules", "move.astlog", "--dry-run", "--replace=a::B=c::D"]);
+    assert_eq!(rules.flags.rules.as_deref(), Some("move.astlog"));
+    assert!(rules.flags.dry_run);
+    assert!(rules.args.is_empty(), "`--rules` and `--dry-run` stay with the client");
+    assert_eq!(unhonored(&["check", "--rules", "r", "--replace", "a::B=c::D"]), None);
+    let query = cargo(&["check", "--query=find.astlog"]);
+    assert_eq!(query.flags.query.as_deref(), Some("find.astlog"));
+    assert!(query.args.is_empty(), "`--query` stays with the client");
+    for (words, why) in [
+        (&["check", "--query", "q", "--rules", "r"][..], "a query writes nothing"),
+        (&["check", "--query", "q", "--dry-run"][..], "a query writes nothing already"),
+        (&["check", "--dry-run"][..], "a dry run of no edits"),
+        (&["check", "--rules", "r", "--fix"][..], "rules check nothing"),
+        (&["check", "--query", "q", "--deny", "unused_imports"][..], "a query checks nothing"),
+    ] {
+        assert!(unhonored(words).is_some(), "{why}: {words:?}");
+    }
+    assert!(refused(&["build", "--rules", "r"]).contains("--rules"), "`check`'s alone");
     assert!(unhonored(&["check", "--bless-baselines"]).is_some(), "no directory to bless");
     let whole = |words: &[&str]| unhonored(&[&["check", "--workspace", t], words].concat());
     assert_eq!(
@@ -110,6 +200,127 @@ fn check_reads_its_fix_replace_and_baseline_flags_and_keeps_them_from_the_load()
         "--new-baseline=clippy::c",
     ]);
     assert_eq!(many.flags.new_baselines, ["clippy::a", "blaze::b", "clippy::c"]);
+}
+
+/// `check` takes a lint's level as rustc's long flags spell it, any number of times, kept in
+/// the order given and handed to the daemon's load as typed (a level is an input of the plan).
+#[test]
+fn check_reads_lint_levels_and_hands_them_to_the_load() {
+    let asked = cargo(&[
+        "check",
+        "--deny",
+        "blaze::todo",
+        "--workspace",
+        "--warn=clippy::all",
+        "--deny",
+        "unused",
+        "--allow",
+        "blaze::hot_alloc",
+        "--forbid=unsafe_code",
+    ]);
+    assert_eq!(
+        asked.flags.lint_levels,
+        [
+            "--deny=blaze::todo",
+            "--warn=clippy::all",
+            "--deny=unused",
+            "--allow=blaze::hot_alloc",
+            "--forbid=unsafe_code",
+        ]
+    );
+    assert_eq!(
+        asked.args,
+        [
+            "--deny",
+            "blaze::todo",
+            "--workspace",
+            "--warn=clippy::all",
+            "--deny",
+            "unused",
+            "--allow",
+            "blaze::hot_alloc",
+            "--forbid=unsafe_code",
+        ],
+        "the load reads them too: they are no flags of the client alone"
+    );
+    assert!(cargo(&["check"]).flags.lint_levels.is_empty());
+    assert_eq!(cargo(&["c", "--deny=blaze::unreachable"]).flags.lint_levels.len(), 1);
+    assert_eq!(cargo(&["check", "--forbid", "blaze::unreachable"]).flags.lint_levels.len(), 1);
+    // With the baselines, as the merge gate runs it.
+    let t = "--target=aarch64-unknown-linux-gnu";
+    let gate = cargo(&["check", "--workspace", t, "--baselines", "b", "--deny", "blaze::todo"]);
+    assert_eq!(super::refused(&gate), None);
+    assert_eq!(gate.args, ["--workspace", t, "--deny", "blaze::todo"]);
+    assert!(help(Command::Check).contains("      --deny <LINT>\n"));
+    assert!(!help(Command::Build).contains("--deny"));
+    assert!(parse(os(&["check", "--deny"])).is_err(), "a level names its lint");
+    assert!(
+        refused(&["check", "-D", "warnings"]).starts_with("error: unexpected argument '-D' found"),
+        "the long flags only"
+    );
+}
+
+/// A level is refused where it would set nothing or what it may not, naming the flag and why:
+/// on a command other than `check`, for a name that is no lint's, and below `deny` for
+/// `blaze::unreachable`.
+#[test]
+fn a_lint_level_is_refused_naming_the_flag_and_why() {
+    for command in ["build", "run", "test", "bench", "doc"] {
+        assert_eq!(
+            refused(&[command, "--deny", "blaze::todo"]),
+            format!(
+                "error: `--deny` sets a lint's level, which `blaze check` alone takes from its command \
+                 line: `blaze {command}` reads each lint's level from `[lints]` and the workspace's \
+                 tables\n\nFor more information, try '--help'.\n"
+            )
+        );
+    }
+    assert!(
+        refused(&["build", "--allow=unused"]).starts_with("error: `--allow` sets a lint's level")
+    );
+    let floor = "`blaze::unreachable` can't be set below `deny`: a `blaze::unreachable!()` compiles \
+                 only where blaze proves no path reaches it";
+    assert_eq!(
+        refused(&["check", "--allow", "blaze::unreachable"]),
+        format!(
+            "error: invalid value 'blaze::unreachable' for '--allow <LINT>': {floor}\n\nFor more \
+             information, try '--help'.\n"
+        )
+    );
+    assert!(refused(&["check", "--warn=blaze::unreachable"]).starts_with(
+        "error: invalid value 'blaze::unreachable' for '--warn <LINT>': `blaze::unreachable` can't"
+    ));
+    for name in ["a::b::c", "blaze::", "unused,dead_code", "not a lint"] {
+        let said = refused(&["check", "--deny", name]);
+        assert!(
+            said.starts_with(&format!(
+                "error: invalid value '{name}' for '--deny <LINT>': `{name}` names no lint: "
+            )),
+            "{said}"
+        );
+    }
+    assert!(
+        refused(&["check", "--deny", "blaze::todos"]).starts_with(
+            "error: invalid value 'blaze::todos' for '--deny <LINT>': `blaze::todos` is no lint or group of blaze's"
+        )
+    );
+    // What checks nothing takes no level.
+    let unhonored = |words: &[&str]| super::refused(&cargo(words));
+    assert_eq!(
+        unhonored(&["check", "--replace", "a::B=c::D", "--deny", "blaze::todo"]).as_deref(),
+        Some(
+            "`--replace` checks nothing, so `--deny=blaze::todo` would set no lint's level: give it \
+             to a `blaze check`"
+        )
+    );
+    assert_eq!(
+        unhonored(&["lock", "--deny", "blaze::todo"]).as_deref(),
+        Some(
+            "`blaze lock` checks nothing, so `--deny=blaze::todo` would set no lint's level: give it \
+             to a `blaze check`"
+        )
+    );
+    assert_eq!(unhonored(&["check", "--fix", "--deny", "blaze::todo"]), None);
 }
 
 /// `check` lints and fixes, so `clippy` and `fix` are no commands of blaze's.
@@ -262,9 +473,9 @@ fn test_names_its_filter_and_the_harness_args() {
     assert_eq!(bench.test_args(), os(&["fast", "--bench"]));
     assert_eq!(bench.profile(), "bench");
 
-    let reached = cargo(&["test", "--reached"]);
-    assert!(reached.flags.reached);
-    assert!(reached.args.is_empty());
+    let run_all = cargo(&["test", "--run-all"]);
+    assert!(run_all.flags.run_all && !cargo(&["test"]).flags.run_all);
+    assert!(run_all.args.is_empty(), "cargo never sees `--run-all`");
 }
 
 #[test]
@@ -313,6 +524,45 @@ fn refused_is_blazes_a_count_or_all() {
     assert!(parse(os(&["build", "--refused"])).is_err());
 }
 
+/// The invariant: `--no-prebuilt` is blaze's, read on build, run, test and check, never passed
+/// to cargo's words. Control: `bench` and `doc` refuse it, so a list missing it is seen.
+#[test]
+fn no_prebuilt_is_blazes_on_build_run_test_and_check() {
+    assert!(!cargo(&["build"]).flags.no_prebuilt, "prebuilt records by default");
+    for command in ["build", "run", "test", "check"] {
+        let asked = cargo(&[command, "--no-prebuilt", "--release"]);
+        assert!(asked.flags.no_prebuilt, "{command}");
+        assert_eq!(asked.args, ["--release"], "cargo never sees `--no-prebuilt` ({command})");
+    }
+    assert!(parse(os(&["bench", "--no-prebuilt"])).is_err());
+    assert!(parse(os(&["doc", "--no-prebuilt"])).is_err());
+    assert!(parse(os(&["build", "--no-prebuilt=yes"])).is_err(), "a switch takes no value");
+}
+
+#[test]
+fn goal_is_blazes_edit_or_max_on_build_run_test_and_check() {
+    use blaze_api::Goal;
+    assert_eq!(cargo(&["build"]).flags.goal, None, "the profile's own goal");
+    let max = cargo(&["build", "--goal", "max", "--release"]);
+    assert_eq!(max.flags.goal, Some(Goal::Max));
+    assert_eq!(max.args, ["--release"], "cargo never sees `--goal`");
+    assert_eq!(cargo(&["run", "--goal=edit"]).flags.goal, Some(Goal::Edit));
+    assert_eq!(cargo(&["test", "--goal", "edit"]).flags.goal, Some(Goal::Edit));
+    assert_eq!(cargo(&["check", "--goal", "max"]).flags.goal, Some(Goal::Max));
+    assert_eq!(cargo(&["build", "--goal", "MAX"]).flags.goal, Some(Goal::Max));
+    for other in ["fast", "balanced", "release", "0"] {
+        let said = refused(&["build", "--goal", other]);
+        assert!(
+            said.starts_with(&format!("error: invalid value '{other}' for '--goal <GOAL>'")),
+            "{said}"
+        );
+        assert!(said.contains("edit") && said.contains("max"), "{said}");
+    }
+    assert!(parse(os(&["doc", "--goal", "max"])).is_err(), "doc compiles no program");
+    assert!(parse(os(&["build", "--goal"])).is_err());
+    assert!(parse(os(&["build", "--goal", "edit", "--goal", "max"])).is_err(), "one goal");
+}
+
 #[test]
 fn run_has_the_rest() {
     let asked = cargo(&["run", "--release", "a", "--verbose", "--", "b"]);
@@ -343,8 +593,8 @@ fn an_unknown_flag() {
         "error: unexpected argument 'b' found\n\nUsage: cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]\n\nFor \
          more information, try '--help'.\n"
     );
-    // `--doc` and `--reached` are `test`'s alone.
-    assert!(parse(os(&["build", "--reached"])).is_err());
+    // `--doc` and `--run-all` are `test`'s alone.
+    assert!(parse(os(&["build", "--run-all"])).is_err());
     assert!(parse(os(&["build", "--", "x"])).is_err());
 }
 
@@ -381,6 +631,14 @@ fn hidden_flags_that_point_elsewhere() {
     tip(&["build", "-s"], "--silent", &similar("--quiet"), "cargo build [OPTIONS]");
     tip(&["run", "--silent"], "--silent", &similar("--quiet"), "cargo run [OPTIONS] [ARGS]...");
     tip(&["build", "-t", "x"], "-t", &similar("--target"), "cargo build [OPTIONS]");
+    // Selection is the default: the flag that opted into it is refused, naming the default and
+    // `--run-all`, never accepted and ignored.
+    tip(
+        &["test", "--reached"],
+        "--reached",
+        super::REACHED_GONE,
+        "cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]",
+    );
     tip(&["build", "--path", "x"], "--path", &similar("--manifest-path"), "cargo build [OPTIONS]");
     tip(
         &["build", "--out-dir", "x"],

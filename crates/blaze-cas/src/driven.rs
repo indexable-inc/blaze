@@ -27,6 +27,13 @@ impl Driven {
     /// packs open ([`crate::Loader::Pumped`]), or by a loader's thread over the same root as
     /// they are read.
     pub fn open_with(root: &Path, loader: crate::Loader) -> Result<Driven, String> {
+        Driven::open_reserving(root, loader, crate::pool::WINDOWS)
+    }
+
+    /// [`Driven::open_with`], its pool reserving `windows` windows ([`Store::open_reserving`]):
+    /// a test's store, which a property test may open (and leak a handle of) once a case,
+    /// reserves the few it uses.
+    pub fn open_reserving(root: &Path, loader: crate::Loader, windows: u32) -> Result<Driven, String> {
         let dir = FileName::new("store").expect("a relative name");
         let at = root.join(dir.as_str());
         let mut driver = blaze_core::native(root, 2)
@@ -35,7 +42,8 @@ impl Driven {
         // alloc: setup, once a store
         let mut effects = Vec::new();
         // alloc: setup, no layers: allocates nothing
-        let mut store = Store::open(Config { dir, layers: Vec::new(), tags: TAGS, load_tags: TAGS + (1 << 32), loader }, &mut effects);
+        let config = Config { dir, layers: Vec::new(), tags: TAGS, load_tags: TAGS + (1 << 32), loader };
+        let mut store = Store::open_reserving(config, windows, &mut effects);
         drive(&mut driver, &mut store, &mut effects)?;
         if let Some(broken) = store.broken() {
             // alloc: the error of a store that cannot open

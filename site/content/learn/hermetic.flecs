@@ -10,7 +10,7 @@ site {
       (Requires, site.learn.incremental)
       (Requires, site.learn.macros)
       Title: {"Hermetic builds"}
-      Description: {"Lesson 4: what a hermetic build is, and how blaze names the work it keeps."}
+      Description: {"What a hermetic build is, and how blaze names the work it keeps."}
 
       Step machine("It works on my machine") {
         P quietly("Builds can quietly depend on things nobody wrote down: a tool on your laptop, a file in your home folder, the network.")

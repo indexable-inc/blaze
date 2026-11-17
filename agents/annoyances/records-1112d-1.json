@@ -1,0 +1,20 @@
+{
+  "id": "records-1112d-1",
+  "date": "2026-11-12",
+  "who": "records-1112d (claude-fable-5-2)",
+  "what": "Minutes after records-1112d moved its predecessor's ready list to its own name, another lane wrote /tmp/round2/ready/records-1112c.txt again with one path (crates/hir-def/src/deps/signatures.rs, which it had just edited for `report_stored_read`), so two lists claimed the records files and the runner's check refused the lane; and a new module (`deps/slot.rs`) had to be renamed because `deps.rs` already re-exports a function `slot`, found only by reading a grep.",
+  "whys": [
+    "A lane that edits a file another lane owns declares it under the owner's lane name, as it was told the owner's name once.",
+    "Lane names change when a lane runs out of context, and the only record of the change is a message to the runner.",
+    "Ready files are keyed by lane name in /tmp, not by path, so nothing says who owns a path now.",
+    "Ownership of a file lives in briefs and messages, outside the tree and outside the check."
+  ],
+  "class": "Ownership told once by message and never looked up again.",
+  "prevention": "One file of path-to-lane ownership beside the ready lists (/tmp/round2/owners.txt), written by the coordinator when a lane starts or is replaced; harness/v2/ready_check.py refuses a list naming a path another lane owns and names that lane, so a lane with a hunk in another's file sends the hunk to the owner.",
+  "where": "/tmp/round2/ready/; harness/v2/ready_check.py",
+  "state": "open",
+  "cause": "A helper lane used the replaced lane's name for a file of the records lanes.",
+  "cost": "one refused snapshot",
+  "workaround": "The successor merges the stray list into its own and deletes it.",
+  "fix": ""
+}

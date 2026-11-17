@@ -1,0 +1,14 @@
+{
+ "id": "body-entries-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane body-entries",
+ "where": "crates/hir-ty/src/body_store/entries/tests.rs (BodyFacts::def_key)",
+ "what": "Kept body entries differed from a fresh run after any edit of the leaf file, a comment included, with nothing rerun: an inference answer names each item it uses by `BodyFacts::def_key`, and the item store's test facts key an item by its portable form, whose header holds the text of the item's file. The caller's answer bytes thus depended on leaf.rs's text, which no read in the caller's trace covers.",
+ "cost": "one round trip with the main agent; the oracle first said only `false`",
+ "cause": "a value (the answer's bytes) held an input (another file's text, through an item key) that the entry's reads did not name",
+ "class": "a key inside a value that depends on more than the value's reads (keys-cover-every-input, inside out)",
+ "prevention": "an item key in an answer is item-hash's stable key (kind, container, ast id), never a hash of the file holding the item; the oracle names the entry, step and first differing byte",
+ "workaround": "the entry tests key items by kind and database id, stable across revisions of one database",
+ "fix": "the test facts' def_key; the oracle's `differs`",
+ "state": "fixed in the test; item-hash's def_key must keep it so"
+}

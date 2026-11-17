@@ -5,20 +5,36 @@ import Blaze.Mir.Syntax
 open Blaze Blaze.Mir
 
 def enums.side.mir : Program :=
-  { adts := [{ name := "enums::Shape", discr := ScalarTy.Isize, variants := [(0, []), (1, [Ty.int ScalarTy.U32])] }],
+  { adts := [{ name := "enums::Shape", discr := ScalarTy.I128, variants := [(0, []), (1, [Ty.int ScalarTy.U32])] }],
     fns := [
       { name := "enums::side",
         args := 1,
-        locals := [Ty.int ScalarTy.U32, Ty.adt 0, Ty.int ScalarTy.Isize],
+        locals := [Ty.int ScalarTy.U32, Ty.adt 0, Ty.int ScalarTy.I128, Ty.int ScalarTy.U32],
         blocks := [
           { stmts := [
+              Statement.nop,
+              Statement.storageLive 2,
               Statement.assign (Place.mk 2 []) (Rvalue.discriminant 0 (Place.mk 1 []))],
-            terminator := Terminator.switchInt (Operand.move (Place.mk 2 [])) [(0, 1), (1, 2)] 3 },
-          { stmts := [
-              Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.const (Const.int ScalarTy.U32 0)))],
-            terminator := Terminator.ret },
-          { stmts := [
-              Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.copy (Place.mk 1 [ProjElem.downcast 1, ProjElem.field 0])))],
-            terminator := Terminator.ret },
+            terminator := Terminator.switchInt (Operand.move (Place.mk 2 [])) [(0, 1)] 2 },
           { stmts := [],
-            terminator := Terminator.unreachable }] }] }
+            terminator := Terminator.goto 3 },
+          { stmts := [
+              Statement.assign (Place.mk 2 []) (Rvalue.discriminant 0 (Place.mk 1 []))],
+            terminator := Terminator.switchInt (Operand.move (Place.mk 2 [])) [(1, 4)] 5 },
+          { stmts := [
+              Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.const (Const.int ScalarTy.U32 0))),
+              Statement.storageDead 2],
+            terminator := Terminator.goto 6 },
+          { stmts := [
+              Statement.storageLive 3,
+              Statement.assign (Place.mk 3 []) (Rvalue.use (Operand.copy (Place.mk 1 [ProjElem.downcast 1, ProjElem.field 0]))),
+              Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.copy (Place.mk 3 []))),
+              Statement.storageDead 3],
+            terminator := Terminator.goto 6 },
+          { stmts := [],
+            terminator := Terminator.unreachable },
+          { stmts := [],
+            terminator := Terminator.drop (Place.mk 1 []) 7 },
+          { stmts := [
+              Statement.storageDead 1],
+            terminator := Terminator.ret }] }] }

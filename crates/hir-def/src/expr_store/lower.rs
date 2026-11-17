@@ -370,23 +370,44 @@ pub(crate) fn lower_impl(
     let mut expr_collector =
         ExprCollector::with_maps(db, module, impl_syntax.file_id, LoweringMode::Analysis, maps);
     expr_collector.set_lowering(lowering);
-    expr_collector.impl_header_lifetimes = Some(0);
-    let self_ty =
-        expr_collector.lower_type_ref_opt_disallow_impl_trait(impl_syntax.value.self_ty());
-    let trait_ = impl_syntax.value.trait_().and_then(|it| match it {
-        ast::Type::PathType(path_type) => {
-            let path = expr_collector.lower_path_type(path_type, &mut ImplTraitLowering::Opaque)?;
-            Some(TraitRef { path: expr_collector.alloc_path(path, TypePtr::of(it)) })
-        }
-        _ => None,
-    });
-    let fresh = expr_collector.impl_header_lifetimes.take().unwrap_or(0);
     let mut collector = generics::GenericParamsCollector::new(impl_id.into());
-    collector.lower(
-        &mut expr_collector,
-        impl_syntax.value.generic_param_list(),
-        impl_syntax.value.where_clause(),
-    );
+    let lower_trait = |ec: &mut ExprCollector<'_>, lowering: &mut ImplTraitLowering<'_>| {
+        impl_syntax.value.trait_().and_then(|it| match it {
+            ast::Type::PathType(path_type) => {
+                let path = ec.lower_path_type(path_type, lowering)?;
+                Some(TraitRef { path: ec.alloc_path(path, TypePtr::of(it)) })
+            }
+            _ => None,
+        })
+    };
+    let (self_ty, trait_, fresh) = if expr_collector.features().blaze_anon_params {
+        // A `_` of the header is a parameter of the impl after those its list names, so the
+        // list is lowered first, before the header's fresh lifetimes are counted.
+        collector.lower(
+            &mut expr_collector,
+            impl_syntax.value.generic_param_list(),
+            impl_syntax.value.where_clause(),
+        );
+        expr_collector.impl_header_lifetimes = Some(0);
+        let self_ty = collector.collect_impl_header(&mut expr_collector, false, |ec, lowering| {
+            ec.lower_type_ref_opt(impl_syntax.value.self_ty(), lowering)
+        });
+        let trait_ = collector.collect_impl_header(&mut expr_collector, true, lower_trait);
+        let fresh = expr_collector.impl_header_lifetimes.take().unwrap_or(0);
+        (self_ty, trait_, fresh)
+    } else {
+        expr_collector.impl_header_lifetimes = Some(0);
+        let self_ty =
+            expr_collector.lower_type_ref_opt_disallow_impl_trait(impl_syntax.value.self_ty());
+        let trait_ = lower_trait(&mut expr_collector, &mut ImplTraitLowering::Opaque);
+        let fresh = expr_collector.impl_header_lifetimes.take().unwrap_or(0);
+        collector.lower(
+            &mut expr_collector,
+            impl_syntax.value.generic_param_list(),
+            impl_syntax.value.where_clause(),
+        );
+        (self_ty, trait_, fresh)
+    };
     collector.push_fresh_lifetimes(fresh);
     let params = collector.finish();
     let (store, source_map) = expr_collector.finish_store();
@@ -831,6 +852,10 @@ struct Stacks {
 const STACK_SETS: usize = 4;
 const STACK_ELEMENTS: usize = 1 << 16;
 
+#[expect(
+    blaze::process_static,
+    reason = "a per-thread spare pool capped at STACK_SETS sets of at most STACK_ELEMENTS elements each"
+)]
 thread_local! {
     /// This thread's spare stacks: a collector can run a query that lowers another store on
     /// the same thread, which takes the next set (or a fresh one).
@@ -1165,7 +1190,12 @@ impl<'db> ExprCollector<'db> {
                     ptr,
                 )
             }
-            ast::Type::InferType(_inner) => self.alloc_type_ref(TypeRef::Placeholder, ptr),
+            // A parameter of the item where `_` is one (`#![feature(blaze_anon_params)]`),
+            // else the placeholder.
+            ast::Type::InferType(_inner) => match impl_trait_lower_fn.anonymous(self, ptr) {
+                Some(param) => param,
+                None => self.alloc_type_ref(TypeRef::Placeholder, ptr),
+            },
             ast::Type::FnPtrType(inner) => {
                 // Taken before the parameters are lowered: a function pointer among them
                 // is not what the `for` is written on.
@@ -1465,7 +1495,7 @@ impl<'db> ExprCollector<'db> {
         if has_use {
             return;
         }
-        let edition = self.expander.ctx_for_range(opaque.syntax().text_range()).edition(self.db);
+        let edition = self.expander.ctx_for_range(opaque.syntax().text_range()).edition();
         let store = &mut self.named_lifetime_store;
         store.return_opaque_without_use = true;
         store.return_opaque_2024_without_use |= edition.at_least_2024();
@@ -1940,7 +1970,14 @@ impl<'db> ExprCollector<'db> {
                     (self.hygiene_id_for(label.syntax().text_range()), self.collect_label(label))
                 });
                 let body = self.collect_labelled_block_opt(label, e.loop_body());
-                self.alloc_expr(Expr::Loop { body, label: label.map(|it| it.1), source: LoopSource::Loop }, syntax_ptr)
+                let lowered = self.alloc_expr(Expr::Loop { body, label: label.map(|it| it.1), source: LoopSource::Loop }, syntax_ptr);
+                // `#[loop_match]` changes how MIR lowers the loop's `#[const_continue]` breaks;
+                // the attribute stays off `Expr::Loop`, in the store's marked column.
+                let loop_match = |attr: ast::Attr<'_>| attr.simple_name().is_some_and(|it| it == "loop_match");
+                if ast::HasAttrs::attrs(&e).any(loop_match) {
+                    self.store.marked_exprs.insert(lowered);
+                }
+                lowered
             }
             ast::Expr::WhileExpr(e) => self.collect_while_loop(syntax_ptr, e),
             ast::Expr::ForExpr(e) if e.const_token().is_some() => {
@@ -2032,7 +2069,14 @@ impl<'db> ExprCollector<'db> {
                     None
                 });
                 let expr = e.expr().map(|e| self.collect_expr(e));
-                self.alloc_expr(Expr::Break { expr, label }, syntax_ptr)
+                let lowered = self.alloc_expr(Expr::Break { expr, label }, syntax_ptr);
+                // `#[const_continue]` makes the break a jump into the `#[loop_match]` arm its
+                // value selects; kept off `Expr::Break`, in the store's marked column.
+                let const_continue = |attr: ast::Attr<'_>| attr.simple_name().is_some_and(|it| it == "const_continue");
+                if ast::HasAttrs::attrs(&e).any(const_continue) {
+                    self.store.marked_exprs.insert(lowered);
+                }
+                lowered
             }
             ast::Expr::ParenExpr(e) => {
                 // A macro puts its `$x:expr` in parentheses: with `#[cfg]` on what was handed in,
@@ -2052,7 +2096,7 @@ impl<'db> ExprCollector<'db> {
                             && src.value.text_range().contains_range(it.value.text_range())
                     });
                     if widen {
-                        self.store.expr_map_back.insert(inner, src.map(AstPtr::wrap_left));
+                        self.store.map_expr_back(inner, src.map(AstPtr::wrap_left));
                     }
                 }
                 inner
@@ -2298,7 +2342,7 @@ impl<'db> ExprCollector<'db> {
                         attr.simple_name().is_some_and(|it| it == "rustc_inherit_overflow_checks")
                     };
                     if ast::HasAttrs::attrs(&e).any(inherits) {
-                        this.store.overflow_inheriting.insert(closure);
+                        this.store.marked_exprs.insert(closure);
                     }
 
                     (if is_coroutine_closure { body } else { closure }, closure)
@@ -2603,6 +2647,7 @@ impl<'db> ExprCollector<'db> {
         // declared outside a block with items (`struct S(u8); fn f() { struct L; S(a) = s; }`)
         // is still one.
         let (resolution, unresolved_idx, _) = self.def_map.resolve_path_around(
+            self.def_map.ctx_table(),
             self.local_def_map,
             self.db,
             self.module,
@@ -3606,7 +3651,7 @@ impl<'db> ExprCollector<'db> {
             .filter(|it| !it.is_root());
         let expr_id = f(self, block_id);
         if let Some(written_in) = written_in {
-            self.store.block_editions.insert(expr_id, written_in.edition(self.db));
+            self.store.block_editions.insert(expr_id, written_in.edition());
         }
 
         self.def_map = prev_def_map;
@@ -4230,12 +4275,15 @@ impl<'db> ExprCollector<'db> {
         let Some(lifetime) = lifetime else { return Ok(None) };
         let mut hygiene_id =
             self.expander.hygiene_for_range(self.db, lifetime.syntax().text_range());
+        // The table the label's context is of: its expansion's, the calling crate's, which the
+        // labels of the body's other expansions share.
+        let table = self.expander.current_file_id().context_arena();
         let mut hygiene_info = if hygiene_id.is_root() {
             None
         } else {
-            hygiene_id.syntax_context().outer_expn(self.db).map(|expansion| {
+            hygiene_id.syntax_context().outer_expn(self.db, table).map(|expansion| {
                 let expansion = hir_expand::MacroCallId::from(expansion).loc(self.db);
-                (hygiene_id.syntax_context().parent(self.db), expansion.def)
+                (hygiene_id.syntax_context().parent(self.db, table), expansion.def)
             })
         };
         let name = Name::new_lifetime(lifetime.text());
@@ -4262,10 +4310,10 @@ impl<'db> ExprCollector<'db> {
                         // Therefore, if we got to the rib of its declaration, give up its hygiene
                         // and use its parent expansion.
 
-                        hygiene_id = HygieneId::new(parent_ctx.opaque_and_semiopaque(self.db));
-                        hygiene_info = parent_ctx.outer_expn(self.db).map(|expansion| {
+                        hygiene_id = HygieneId::new(parent_ctx.opaque_and_semiopaque(self.db, table));
+                        hygiene_info = parent_ctx.outer_expn(self.db, table).map(|expansion| {
                             let expansion = hir_expand::MacroCallId::from(expansion).loc(self.db);
-                            (parent_ctx.parent(self.db), expansion.def)
+                            (parent_ctx.parent(self.db, table), expansion.def)
                         });
                     }
                 }
@@ -4541,15 +4589,16 @@ impl<'db> ExprCollector<'db> {
     }
     /// The source maps of an expression just allocated for `ptr`.
     fn map_expr(&mut self, id: ExprId, ptr: ExprPtr) -> ExprId {
+        let src = self.expander.in_file(ptr);
+        self.store.map_expr_back(id, src.map(AstPtr::wrap_left));
         if self.store.record {
-            let src = self.expander.in_file(ptr);
-            self.store.expr_map_back.insert(id, src.map(AstPtr::wrap_left));
             self.store.expr_map.push((src, id.into()));
         }
         id
     }
-    // FIXME: desugared exprs don't have ptr, that's wrong and should be fixed.
-    // Migrate to alloc_expr_desugared_with_ptr and then rename back
+    /// An expression lowering makes that the source does not write, with no syntax of its own:
+    /// one of the store's synthesized expressions ([`ExpressionStore::is_synthesized`]), as is
+    /// every expression no [`ExpressionStoreBuilder::map_expr_back`] gives syntax.
     fn alloc_expr_desugared(&mut self, expr: Expr<'_>) -> ExprId {
         self.store.alloc_expr(expr)
     }
@@ -4559,12 +4608,18 @@ impl<'db> ExprCollector<'db> {
     }
     /// The back map of a desugared expression just allocated for `ptr`.
     fn map_expr_desugared(&mut self, id: ExprId, ptr: ExprPtr) -> ExprId {
-        if self.store.record {
-            let src = self.expander.in_file(ptr);
-            self.store.expr_map_back.insert(id, src.map(AstPtr::wrap_left));
-            // We intentionally don't fill this as it could overwrite a non-desugared entry
-            // self.store.expr_map.push((src, id));
+        let src = self.expander.in_file(ptr).map(AstPtr::wrap_left);
+        #[cfg(test)]
+        if planted::DESUGARED_SYNTAX_FORGOTTEN.get() {
+            // The planted bug: the syntax is given, but not through `map_expr_back`, so the
+            // store calls the expression synthesized while the map has its syntax.
+            if self.store.record {
+                self.store.expr_map_back.insert(id, src);
+            }
+            return id;
         }
+        // The forward map is not filled: it could overwrite a non-desugared entry.
+        self.store.map_expr_back(id, src);
         id
     }
     fn missing_expr(&mut self) -> ExprId {
@@ -4598,10 +4653,10 @@ impl<'db> ExprCollector<'db> {
 
     /// The source maps of an expression just allocated for the pattern `ptr`.
     fn map_expr_from_pat(&mut self, id: ExprId, ptr: PatPtr) -> ExprId {
+        let src = self.expander.in_file(ptr);
+        self.store.map_expr_back(id, src.map(AstPtr::wrap_right));
         if self.store.record {
-            let src = self.expander.in_file(ptr);
             self.store.pat_map.push((src, id.into()));
-            self.store.expr_map_back.insert(id, src.map(AstPtr::wrap_right));
         }
         id
     }
@@ -4687,7 +4742,9 @@ impl<'db> ExprCollector<'db> {
     fn member_hygiene_for(&self, range: TextRange) -> Option<HygieneId> {
         let hygiene = self.hygiene_id_for(range);
         let marked = !hygiene.is_root()
-            && !hygiene.syntax_context().normalize_to_macros_2_0(self.db).is_root();
+            && !(hygiene.syntax_context())
+                .normalize_to_macros_2_0(self.db, self.expander.current_file_id().context_arena())
+                .is_root();
         marked.then_some(hygiene)
     }
 
@@ -4708,6 +4765,7 @@ impl<'db> ExprCollector<'db> {
             SpanMap::RealSpanMap(_) => name,
             SpanMap::ExpansionSpanMap(_) => crate::nameres::written_name(
                 self.db,
+                self.expander.current_file_id().context_arena(),
                 name,
                 HygieneId::new(self.expander.ctx_for_range(range)),
             ),
@@ -4717,9 +4775,12 @@ impl<'db> ExprCollector<'db> {
     pub(in crate::expr_store) fn param_name(&self, name: Name, range: TextRange) -> Name {
         match self.span_map() {
             SpanMap::RealSpanMap(_) => name,
-            SpanMap::ExpansionSpanMap(_) => {
-                crate::nameres::param_name(self.db, name, self.expander.ctx_for_range(range))
-            }
+            SpanMap::ExpansionSpanMap(_) => crate::nameres::param_name(
+                self.db,
+                self.expander.current_file_id().context_arena(),
+                name,
+                self.expander.ctx_for_range(range),
+            ),
         }
     }
 
@@ -4777,22 +4838,27 @@ impl<'db> ExprCollector<'db> {
             .filter_map(|&idx| lifetime_args.get(idx as usize).copied());
         return Some(res);
 
-        #[blaze_query::tracked(returns(deref), cycle_result = get_constrained_lifetimes_cycle_result)]
-        fn get_constrained_lifetimes(db: &Db, type_alias_id: TypeAliasId) -> Box<[u32]> {
+        #[blaze_memo::tracked(returns(copy), cycle_result = get_constrained_lifetimes_cycle_result)]
+        fn get_constrained_lifetimes<'db>(
+            db: &'db Db,
+            type_alias_id: TypeAliasId,
+        ) -> &'db [u32] {
             let TypeAliasSignature { generic_params, store, ty, .. } =
                 TypeAliasSignature::of(db, type_alias_id);
-            let &Some(ty) = ty else { return Default::default() };
+            let &Some(ty) = ty else { return &[] };
 
             let mut visitor = Visitor {
                 store,
                 generic_params,
                 parent: type_alias_id,
-                // alloc: the query's result, once per type alias.
-                constrained_lt_indices: Vec::new(),
+                constrained_lt_indices: Vec::new_in(std::alloc::Global),
             };
             store.visit_type_ref_children(ty, &mut visitor);
 
-            return visitor.constrained_lt_indices.into_boxed_slice();
+            return blaze_memo::keep_slice(
+                blaze_memo::Database::memo(db),
+                &visitor.constrained_lt_indices,
+            );
 
             struct Visitor<'a> {
                 store: &'a ExpressionStore,
@@ -4820,12 +4886,11 @@ impl<'db> ExprCollector<'db> {
             }
         }
 
-        fn get_constrained_lifetimes_cycle_result(
-            _db: &Db,
-            _: blaze_query::db::Id,
+        fn get_constrained_lifetimes_cycle_result<'db>(
+            _db: &'db Db,
             _id: TypeAliasId,
-        ) -> Box<[u32]> {
-            Default::default()
+        ) -> &'db [u32] {
+            &[]
         }
     }
 }
@@ -4903,4 +4968,19 @@ pub fn hir_generic_arg_to_ast_view<'t>(
             ast::GenericArg::ConstArg(_) | ast::GenericArg::TypeArg(_) => true,
         })
         .nth(arg_idx as usize - has_self_arg as usize)
+}
+
+/// Bugs planted for the controls of the tests of lowering, each off but in the test that plants
+/// it.
+#[cfg(test)]
+pub(crate) mod planted {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// A desugared expression lowering maps to the syntax it stands for (the `for` loop's
+        /// `into_iter` call, the `?`'s branch) is given that syntax in the source map but not
+        /// through `map_expr_back`, so the store still lists it as synthesized
+        /// (`tests::body::synthesized::the_oracle_catches_a_desugared_expression_given_syntax_unrecorded`).
+        pub(crate) static DESUGARED_SYNTAX_FORGOTTEN: Cell<bool> = const { Cell::new(false) };
+    }
 }

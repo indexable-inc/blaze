@@ -23,6 +23,8 @@ mod code;
 mod expander;
 mod guest;
 mod keep;
+#[cfg(test)]
+mod kept_contexts_tests;
 mod lex;
 mod os;
 mod print;
@@ -35,7 +37,9 @@ mod wasm;
 mod wire;
 
 pub use expander::{Macros, load, load_wasm};
-pub use wasm::{GLUE_MODULE, Loads, Modules, expansion_threads, wasm_glue};
+pub use wasm::{
+    ExpansionCounts, GLUE_MODULE, Loads, Modules, expansion_counts, expansion_threads, wasm_glue,
+};
 
 #[cfg(test)]
 #[global_allocator]

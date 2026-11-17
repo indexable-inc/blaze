@@ -976,7 +976,8 @@ fn a_bits_field_of_no_fixed_width_names_the_struct_the_field_and_the_type() {
     let errors: Vec<String> = checked
         .diags
         .iter()
-        .filter(|it| it.is_error() && !it.is_lint())
+        // The closing lines ("aborting due to ..."), errors too, are not the check's findings.
+        .filter(|it| it.is_error() && !it.is_lint() && !crate::tests::closing(it))
         .map(|it| it.message.to_string())
         .collect();
     assert_eq!(

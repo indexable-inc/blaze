@@ -6,7 +6,9 @@
 //! their code (`mir::providers`). An edit of a pass compiles this crate again, not hir-ty. The passes see hir-ty's modules at this crate's root, and its `mir` as their
 //! parent, as when they were in hir-ty.
 
-#![feature(allocator_api, allocator_ext)]
+#![feature(allocator_api, allocator_ext, register_tool)]
+// `#[blaze::renders_positions]` and `#[expect(blaze::reads_positions)]`; inert under rustc.
+#![register_tool(blaze)]
 #![forbid(unsafe_code)]
 #![allow(rustdoc::private_intra_doc_links)]
 

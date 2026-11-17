@@ -97,11 +97,16 @@ fn add(
         if !keep(page) || !seen.insert((id, page)) {
             continue;
         }
-        match entries.last_mut() {
-            Some(last) if last.id == id && last.first + last.pages == page => last.pages += 1,
-            _ if entries.len() < TRACE_RUNS => entries.push(Entry { id, first: page, pages: 1 }), // alloc: the trace, capped
-            _ => return,
+        if let Some(last) =
+            entries.last_mut().filter(|last| last.id == id && last.first + last.pages == page)
+        {
+            last.pages += 1;
+            continue;
         }
+        if entries.len() >= TRACE_RUNS {
+            return;
+        }
+        entries.push(Entry { id, first: page, pages: 1 }); // alloc: the trace, capped
     }
 }
 

@@ -1,0 +1,11 @@
+{
+ "id": "records-4",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane records-1111",
+ "where": "blaze-query: letting go of values",
+ "what": "Letting go of the unread values of every durable row at a build's end (every function, not only `lru` ones; sound through the `keep` path) freed 110 MiB of live heap and not one MB of resident memory, and made each build's end 15 ms longer (`unread values` 1.1 ms to 16.4 ms median, a walk of 2.3 million rows). Built, measured, taken out.",
+ "cost": "two hours",
+ "cause": "freed blocks share mimalloc pages with live ones, so nothing goes back (docs/memory-footprint.md says so of codegen; it holds for query values too); the query storage line in serve.log counts live bytes, which is not what the daemon weighs",
+ "workaround": "only whole arrays, regions and pool pages can go back; values have to be records in pool pages to count",
+ "state": "recorded in restore.md; the patch is /tmp/records-1111/tried-durable-value-eviction.patch on the Mac"
+}

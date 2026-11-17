@@ -1,5 +1,5 @@
 //! A dev run that checks it is exact: `inproc-exact <path>`, started by blaze as the
-//! executable written at `<path>` (cargo's), exits 0 when
+//! executable its build placed at `<path>` (cargo's), exits 0 when
 //!
 //! - `current_exe` names `<path>` (on Linux `/proc/self/exe`, on macOS dyld's image 0, on
 //!   Windows the module the PEB names);

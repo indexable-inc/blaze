@@ -9,8 +9,12 @@ def arith.add_one.mir : Program :=
     fns := [
       { name := "arith::add_one",
         args := 1,
-        locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32],
+        locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.int ScalarTy.U32],
         blocks := [
           { stmts := [
-              Statement.assign (Place.mk 0 []) (Rvalue.checked BinOp.add (Operand.copy (Place.mk 1 [])) (Operand.const (Const.int ScalarTy.U32 1)))],
+              Statement.storageLive 2,
+              Statement.assign (Place.mk 2 []) (Rvalue.use (Operand.copy (Place.mk 1 []))),
+              Statement.assign (Place.mk 0 []) (Rvalue.checked BinOp.add (Operand.move (Place.mk 2 [])) (Operand.const (Const.int ScalarTy.U32 1))),
+              Statement.storageDead 2,
+              Statement.storageDead 1],
             terminator := Terminator.ret }] }] }

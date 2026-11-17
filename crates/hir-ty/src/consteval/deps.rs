@@ -11,13 +11,13 @@
 //! every impl that could apply in that crate or one it depends on, so no dependent can add one.
 //! rustc evaluates it once, in its crate, and every dependent reads the value from `.rmeta`.
 
-mod codec;
+pub(crate) mod codec;
 #[cfg(test)]
 mod tests;
 
 use std::sync::Arc;
 
-use base_db::{Crate, Db};
+use base_db::{Crate, CrateKey, Db};
 use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Domain, Hasher};
 use crossbeam_queue::SegQueue;
@@ -54,16 +54,17 @@ pub fn key(base: ContentId, item: ContentId) -> ContentId {
     hasher.finish()
 }
 
-/// Where the values of dependencies' constants are kept, and which crates' are: set by the
-/// driver ([`set`]).
-#[blaze_query::input(singleton, debug)]
+/// Where the values of dependencies' constants are kept, and which crates' are: given by the
+/// driver while it builds a snapshot ([`set`]).
+#[blaze_memo::input(singleton, debug)]
 pub struct KeptConsts {
     #[returns(ref)]
     pub kept: Kept,
 }
 
-/// The store, the mode, the crates whose constants are kept, and the values noted to be
-/// written. Compares by identity: [`set`] gives a new one only when something in it changed.
+/// The store, the mode and the values noted to be written. Which crates' constants are kept,
+/// and under which key, is each crate's own located gift ([`give_base`]), never this session
+/// input. Compares by identity: [`set`] gives a new one only when something in it changed.
 #[derive(Clone)]
 pub struct Kept(Arc<Shared>);
 
@@ -71,10 +72,6 @@ struct Shared {
     // dyn: the driver's store, one probe per constant of a dependency per session
     store: Arc<dyn ImageStore + Send + Sync>,
     mode: Mode,
-    /// Each crate whose constants are kept, with the key its check results are filed under
-    /// when that is known now: `None` for a crate checked in this session, whose key is known
-    /// only once its bodies are, at [`drain`].
-    crates: HashMap<Crate, Option<ContentId>, Global>,
     pending: SegQueue<Pending>,
 }
 
@@ -102,49 +99,87 @@ impl std::hash::Hash for Kept {
 
 impl std::fmt::Debug for Kept {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Kept")
-            .field("mode", &self.0.mode)
-            .field("crates", &self.0.crates.len())
-            .finish_non_exhaustive()
+        f.debug_struct("Kept").field("mode", &self.0.mode).finish_non_exhaustive()
     }
 }
 
-/// Has `db` read and keep the constants of `crates` in `store`, doing `mode` with them
-/// ([`Mode::Serve`] serves a kept value, [`Mode::Check`] evaluates and records a difference from
-/// the kept value, [`Mode::Verify`] serves and records a difference between the value written
-/// again and the kept bytes). `crates` are dependencies (`hir_def::deps::eligible`) whose check
-/// results are filed by frontend-fast-bodies-cache, each with the key they are filed under when
-/// it is known now.
-///
+/// The fact [`set`] gives [`KeptConsts`] by: the mode and the version alone, so it moves only
+/// when the mode does. Which crates are kept, under which key, is each crate's own gift
+/// ([`give_base`]): the session arena, which every arena borrows, holds nothing that moves
+/// for one crate. Until round 28 a second form named every kept crate's key in the session's
+/// fact (`kept_fact`, the tests' fixtures), so one crate stored dropped every arena; that form
+/// is gone, and the tests give each crate's key as the driver does.
+pub fn session_fact(mode: Mode) -> blaze_memo::Fact {
+    let mut digest = Hasher::new("hir-ty kept constants");
+    digest.part(&[mode as u8, VERSION]).part(b"keys given per crate");
+    let id = Hasher::new("hir-ty kept constants slot").finish();
+    blaze_memo::Fact { id, digest: digest.finish() }
+}
+
+/// The kind of a crate's gift that says its constants are kept and under which key its check
+/// results are filed ([`Base`]): located ([`base_db::Located`]). The promise: a constant
+/// served from the store under that key ([`cached`]) is the value its evaluation gives, since
+/// the key covers every input of the crate's check; so a reader computes the same value with
+/// the gift as without it, and its first gift to a sealed crate whose arena holds evaluated
+/// queries marks nothing (round 27: given after the lang items in the first body edit, 24
+/// arenas dropped). What it changes besides values: [`record`] notes a value to write only
+/// where a gift stands, so a constant evaluated before its crate's first gift is not written
+/// at that [`drain`] (a later build's miss, never a wrong value).
+pub struct BaseSlot;
+
+impl base_db::Located for BaseSlot {}
+
+/// The value of a [`BaseSlot`]: the key the crate's check results are filed under, `None` for
+/// a crate checked in this session (known only at [`drain`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Base(pub Option<ContentId>);
+
+/// The fact of a [`BaseSlot`] gift of `base`: of the version and the key, so a gift of the key
+/// the crate holds marks nothing.
+pub fn base_fact(base: Option<ContentId>) -> blaze_memo::Fact {
+    let mut digest = Hasher::new("hir-ty kept constants base");
+    digest.part(&[VERSION]);
+    match base {
+        Some(base) => digest.part(&[1]).id(&base),
+        None => digest.part(&[0]),
+    };
+    let id = Hasher::new("hir-ty kept constants base slot").finish();
+    blaze_memo::Fact { id, digest: digest.finish() }
+}
+
+/// Has the crate `krate` keep its constants under `base` ([`Base`]), a located gift of its
+/// own: the first marks no arena; one under another key marks that crate alone (and so its
+/// dependents), never the session.
+pub fn give_base(edit: &mut base_db::Edit<'_>, krate: CrateKey, base: Option<ContentId>) {
+    edit.give_located::<BaseSlot>(krate, base_fact(base), base_db::Given::new(Base(base)));
+}
+
+/// The key `krate` keeps its constants under in the world as `edit` has it: `None` for a crate
+/// given none ([`give_base`]), `Some(None)` for one checked in this session.
+pub fn given_base(edit: &base_db::Edit<'_>, krate: CrateKey) -> Option<Option<ContentId>> {
+    edit.written_given::<BaseSlot, Base>(krate).map(|it| it.0)
+}
+
+/// Takes `krate`'s [`BaseSlot`] away: its constants are no longer kept. Whether it held one.
+pub fn take_base(edit: &mut base_db::Edit<'_>, krate: CrateKey) -> bool {
+    edit.take_located::<BaseSlot>(krate)
+}
+
 /// Values noted and not yet drained are dropped with the input they were noted in: drain before
-/// setting again. The same store, mode and crates as now changes nothing, so a constant served
-/// before is not asked again.
+/// giving the next snapshot its own. Given in the session arena of the snapshot `builder`
+/// builds, read by `fact` ([`session_fact`] of `mode`), so that a snapshot given the same
+/// reads every constant's record as before. Which crates are kept is each one's
+/// [`give_base`].
 pub fn set(
-    db: &mut Db,
+    builder: &blaze_memo::Builder,
+    fact: blaze_memo::Fact,
     // dyn: the driver's store, as `Shared::store`
     store: Arc<dyn ImageStore + Send + Sync>,
-    crates: HashMap<Crate, Option<ContentId>, Global>,
     mode: Mode,
 ) {
-    use blaze_query::db::{Durability, Setter};
-    let current = KeptConsts::try_get(&*db);
-    if let Some(it) = current {
-        let now = &it.kept(&*db).0;
-        if Arc::ptr_eq(&now.store, &store) && now.mode == mode && now.crates == crates {
-            return;
-        }
-    }
     let pending = SegQueue::new();
-    // alloc: setup: the one input value, once per session
-    let kept = Kept(Arc::new(Shared { store, mode, crates, pending }));
-    match current {
-        Some(it) => {
-            it.set_kept(db).with_durability(Durability::HIGH).to(kept);
-        }
-        None => {
-            _ = KeptConsts::new(db, Durability::HIGH, kept);
-        }
-    }
+    let kept = Kept(Arc::new_in(Shared { store, mode, pending }, Global));
+    KeptConsts::set(&builder.inputs(builder.session()), fact, kept);
 }
 
 /// A constant whose value is kept: its crate's entry and its item's key.
@@ -167,7 +202,8 @@ fn site<'a>(db: &'a Db, def: ConstId, subst: GenericArgs<'_>) -> Option<Site<'a>
         return None;
     }
     let shared = &*KeptConsts::try_get(db)?.kept(db).0;
-    let &base = shared.crates.get(&krate)?;
+    // The crate's own located gift ([`give_base`]): the one home of which crates are kept.
+    let &Base(base) = krate.located::<BaseSlot, Base>(db)?;
     let item = hir_def::deps::const_key(db, def)?;
     Some(Site { shared, krate, item, base })
 }

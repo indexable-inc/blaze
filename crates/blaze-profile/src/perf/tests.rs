@@ -17,11 +17,12 @@ const PROGRAM: &str = "app";
 const IMAGE: &str = "/nowhere/app";
 const PERIOD: u64 = 1_000_000;
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("blaze-perf-{}-{name}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A fresh directory for `name`: the guard, which removes it with all it holds when it drops,
+/// and its path.
+fn scratch(name: &str) -> (blaze_core::temp::TempDir, PathBuf) {
+    let tmp = blaze_core::temp::TempDir::for_test(&format!("blaze-perf-{name}-"));
+    let dir = tmp.path().to_path_buf();
+    (tmp, dir)
 }
 
 fn id(n: u8) -> Id {
@@ -140,7 +141,7 @@ fn run(
 
 #[test]
 fn a_function_whose_code_did_not_change_lines_up_across_two_builds() {
-    let dir = scratch("lines-up");
+    let (_tmp, dir) = scratch("lines-up");
     let perf = dir.join("perf");
     // The same code at other addresses, under another build id.
     link(
@@ -184,7 +185,7 @@ fn a_function_whose_code_did_not_change_lines_up_across_two_builds() {
 
 #[test]
 fn a_changed_function_is_classed_its_code_changed() {
-    let dir = scratch("code-changed");
+    let (_tmp, dir) = scratch("code-changed");
     let perf = dir.join("perf");
     link(
         &perf,
@@ -284,7 +285,7 @@ fn a_difference_inside_the_noise_bound_is_reported_as_noise() {
 
 #[test]
 fn perf_rows_round_trip_through_parquet() {
-    let dir = scratch("round-trip");
+    let (_tmp, dir) = scratch("round-trip");
     let perf = dir.join("perf");
     let history = dir.join("history");
     std::fs::create_dir_all(&history).unwrap();

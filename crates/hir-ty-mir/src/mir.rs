@@ -25,8 +25,10 @@ pub mod early_drop;
 mod eval;
 mod framed;
 pub mod handles;
+pub mod held;
 pub mod home;
 pub mod location;
+pub mod loop_match;
 mod lower;
 mod monomorphization;
 mod optimize;
@@ -43,7 +45,7 @@ pub use eval::{
         Access, AtomicOrd, EvalThread, MResult, Machine, MemKind, Plain, Ptr, RetagMode, Shadow,
         Site, Stop, TypedCx,
     },
-    macro_call::{FlatInput, MacroArg, call_const_macro},
+    macro_call::{FlatInput, FlatOutput, OUTPUT_ELEMENTS, OUTPUT_TEXT, call_const_macro},
     render_const_using_debug_impl, run_function,
 };
 /// The function a cached function calls for the code of its body. The code generator answers
@@ -86,9 +88,10 @@ pub use monomorphization::monomorphized_promoted_mir_body_query;
 pub use monomorphization::normalize_or_keep;
 pub use monomorphization::{monomorphized_args, monomorphized_const, monomorphized_ty};
 pub use optimize::{
-    BOX_IN_PLACE_MIN, CallerLocation, CloneId, MAX_COPIES, MAX_COPIES_PER_BODY, caller_location,
-    heap_held, owner_of, passes_not_ported, relied_on_own_no_unwind,
-    set_interpreter_mir_opt_level, source_span, specialized_mir_body, written_checked_at,
+    BOX_IN_PLACE_MIN, CallerLocation, CloneId, MAX_COPIES, MAX_COPIES_PER_BODY, Reaching,
+    SpendFactsAt, caller_location, heap_held, owner_of, passes_at, passes_not_ported,
+    relied_on_own_no_unwind, runs, set_interpreter_mir_opt_level, source_span, spend_facts_at,
+    specialized_mir_body, written_checked_at,
 };
 pub use pretty::{closure_path_suffix, impl_written_at, print_mir_body};
 pub use storage::{FrameStorage, SharedSlots, StorageConflicts, share_greedily};

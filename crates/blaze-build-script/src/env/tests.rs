@@ -496,8 +496,7 @@ fn no_sysroot_library_directory_adds_none() {
 /// `SSL_CERT_DIR` and blaze's did not).
 #[test]
 fn certificates_libgit2_finds() {
-    let dir = std::env::temp_dir().join(format!("blaze-build-script-certs-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = blaze_core::temp::TempDir::for_test("blaze-build-script-certs-");
     let (empty, pki, ssl) = (dir.join("empty"), dir.join("pki"), dir.join("ssl"));
     std::fs::create_dir_all(&empty).unwrap();
     std::fs::create_dir_all(pki.join("certs")).unwrap();
@@ -588,7 +587,7 @@ fn the_sorted_environment_is_the_one_built_before() {
         unit.profile.debuginfo = rng.index(2) == 0;
         unit.profile.release = rng.index(2) == 0;
         unit.jobs = [0, 1, 8, 10, u32::MAX][rng.index(5)];
-        unit.jobserver = (rng.index(2) == 0).then(|| "fifo:/tmp/j".to_owned());
+        unit.jobserver = (rng.index(2) == 0).then(|| "fifo:/run/j".to_owned());
         unit.workspace_member = rng.index(2) == 0;
         unit.tools.rustc_wrapper = (rng.index(2) == 0).then(|| "/wrap".into());
         unit.tools.rustc_workspace_wrapper = (rng.index(2) == 0).then(|| "/ww".into());

@@ -17,6 +17,9 @@
 
 #![forbid(unsafe_code)]
 #![feature(allocator_api)]
+// `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
+#![feature(register_tool)]
+#![register_tool(blaze)]
 
 #[cfg(test)]
 #[global_allocator]
@@ -24,6 +27,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 mod graph;
 pub mod index;
+pub mod lint_level;
 pub mod load;
 pub mod lock;
 mod order;

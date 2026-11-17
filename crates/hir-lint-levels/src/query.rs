@@ -8,6 +8,7 @@
 //! has any, and keeps two short slices.
 
 use base_db::{Crate, Db};
+use blaze_memo::Database as _;
 use blaze_lint_defs::{Level, LintId, LintSet};
 use hir_def::{
     AdtId, DefWithBodyId, ExpressionStoreOwnerId, GenericDefId, HasModule, Lookup, VariantId,
@@ -25,25 +26,30 @@ use crate::{
 /// The levels in force at one node, flattened: each lint the command line or an attribute from
 /// the crate root to the node names, at the innermost level, before `warnings` and the cap,
 /// which [`ScopeLevels::level`] applies.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScopeLevels {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScopeLevels<'db> {
     /// The lints of `ids`: one bit test says a lint is at its default level.
     named: LintSet,
-    ids: Box<[LintId]>,
-    levels: Box<[Level]>,
+    /// Kept in the query's arena, as `levels`.
+    ids: &'db [LintId],
+    levels: &'db [Level],
     edition: Edition,
     cap: Option<Level>,
 }
 
-impl ScopeLevels {
-    fn of(cx: &LevelCx<'_, '_>, levels: &Levels<'_>, set: SetId) -> ScopeLevels {
+impl<'db> ScopeLevels<'db> {
+    /// Made in the run of a query, whose arena keeps the two slices.
+    fn of(
+        db: &'db Db,
+        cx: &LevelCx<'_, '_>,
+        levels: &Levels<'_>,
+        set: SetId,
+    ) -> ScopeLevels<'db> {
         let (named, flat) = levels.flatten(set);
         ScopeLevels {
             named,
-            // alloc: once per query result, the few lints named from the owner out
-            ids: flat.iter().map(|&(id, _)| id).collect(),
-            // alloc: as `ids`
-            levels: flat.iter().map(|&(_, level)| level).collect(),
+            ids: blaze_memo::keep_iter(db.memo(), flat.iter().map(|&(id, _)| id)),
+            levels: blaze_memo::keep_iter(db.memo(), flat.iter().map(|&(_, level)| level)),
             edition: cx.edition,
             cap: cx.opts.cap,
         }
@@ -68,35 +74,29 @@ impl ScopeLevels {
 /// command line the crate is given (base-db's `Crate::lint_options`) and the attributes of the
 /// item and of what is around it, through the macro calls it is made by and the `mod`s it is
 /// in, as the HIR has them: the innermost wins, and a `forbid` does not hold against one.
-///
-/// The `()` is there because the query engine needs it: a tracked function of one argument is
-/// keyed by that argument, an interned or input struct or a `blaze_query::Supertype` enum, and
-/// `ExpressionStoreOwnerId` can be neither (its variants overlap: `Body(FunctionId)` and
-/// `Signature(FunctionId)` are one id). With two arguments the engine interns the pair into the
-/// function's hidden key (as hir-ty's `closure_exprs`).
-#[blaze_query::tracked(returns(ref))]
-pub fn lint_levels_on(db: &Db, owner: ExpressionStoreOwnerId, _: ()) -> ScopeLevels {
+#[blaze_memo::tracked(returns(ref))]
+pub fn lint_levels_on<'db>(db: &'db Db, owner: ExpressionStoreOwnerId) -> ScopeLevels<'db> {
     let krate = owner.krate(db);
     let mut cx = LevelCx::new(db, krate, krate.lint_options(db));
     let mut levels = Levels::new(&mut cx, &mut (), false, false);
     let set = levels.set_at(&mut cx, &mut (), owner_node(db, owner));
-    ScopeLevels::of(&cx, &levels, set)
+    ScopeLevels::of(db, &cx, &levels, set)
 }
 
 /// The levels at `krate`'s root: what is in force where no item of the crate is, as rustc's
 /// `CRATE_HIR_ID` has them.
-#[blaze_query::tracked(returns(ref))]
-pub fn crate_lint_levels(db: &Db, krate: Crate) -> ScopeLevels {
+#[blaze_memo::tracked(returns(ref))]
+pub fn crate_lint_levels<'db>(db: &'db Db, krate: Crate) -> ScopeLevels<'db> {
     let mut cx = LevelCx::new(db, krate, krate.lint_options(db));
     let mut levels = Levels::new(&mut cx, &mut (), false, false);
     let root = InFile::new(cx.root, cx.root.root(db));
     let set = levels.set_at(&mut cx, &mut (), root);
-    ScopeLevels::of(&cx, &levels, set)
+    ScopeLevels::of(db, &cx, &levels, set)
 }
 
 /// The level of `lint` at `owner`'s item.
 pub fn lint_level(db: &Db, owner: DefWithBodyId, lint: LintId) -> Level {
-    lint_levels_on(db, ExpressionStoreOwnerId::Body(owner), ()).level(lint)
+    lint_levels_on(db, ExpressionStoreOwnerId::Body(owner)).level(lint)
 }
 
 /// The level of `lint` at the crate root of `krate`: for an evaluation with no frame of a body
@@ -144,7 +144,7 @@ pub fn lint_level_at(
     expr: Option<ExprId>,
     lint: LintId,
 ) -> Result<Level, LevelError> {
-    let Some(expr) = expr else { return Ok(lint_levels_on(db, owner, ()).level(lint)) };
+    let Some(expr) = expr else { return Ok(lint_levels_on(db, owner).level(lint)) };
     let Some(node) = expr_node(db, owner, expr) else {
         return Err(LevelError::NoSyntax { owner, expr });
     };
@@ -167,7 +167,7 @@ pub fn lint_level_at(
         at = attrs::parent(db, krate, here);
     }
     if !attributed {
-        return Ok(lint_levels_on(db, owner, ()).level(lint));
+        return Ok(lint_levels_on(db, owner).level(lint));
     }
     let mut cx = LevelCx::new(db, krate, krate.lint_options(db));
     let mut levels = Levels::new(&mut cx, &mut (), false, false);

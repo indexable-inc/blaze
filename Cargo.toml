@@ -1,31 +1,77 @@
 [workspace]
 members = [
     "crates/*",
-    "fuzz",
     # The repository's scripts, built by the pinned released blaze (docs/v2/plan/design/scripts.md).
     "scripts",
     # ix's linter and rewriter (tools/astlog/UPSTREAM).
     "tools/astlog/cli",
     "tools/astlog/core",
     "tools/astlog/edit-applier",
+    "tools/astlog/engine",
     "tools/astlog/error-chain",
     "tools/astlog/langs",
 ]
 exclude = [
+    # Parked (docs/v2/plan/parked.md): kept on disk, out of the build until the new item layer
+    # (docs/v2/plan/design/bottom.md) gives what each waits on. The list there says why.
+    "crates/base-db",
+    "crates/blaze-cargo",
+    "crates/blaze-certify",
+    "crates/blaze-codegen",
+    "crates/blaze-command",
+    "crates/blaze-diagnostics",
+    "crates/blaze-doc",
+    "crates/blaze-engine",
+    "crates/blaze-front",
+    "crates/blaze-global",
+    "crates/blaze-item-hash",
+    "crates/blaze-items",
+    "crates/blaze-launch-host",
+    "crates/blaze-launcher",
+    "crates/blaze-lazy",
+    "crates/blaze-link",
+    "crates/blaze-macro-eval",
+    "crates/blaze-metadata",
+    "crates/blaze-registry",
+    "crates/blaze-shader",
+    "crates/blaze-stencil",
+    "crates/blaze-testsel",
+    "crates/blaze-thin",
+    "crates/blaze-tree",
+    "crates/blaze-units",
+    "crates/blaze-usercode",
+    "crates/hir",
+    "crates/hir-def",
+    "crates/hir-expand",
+    "crates/hir-lint-levels",
+    "crates/hir-ty",
+    "crates/hir-ty-borrowck",
+    "crates/hir-ty-codegen",
+    "crates/hir-ty-coherence",
+    "crates/hir-ty-comptime",
+    "crates/hir-ty-identity",
+    "crates/hir-ty-lean",
+    "crates/hir-ty-linear",
+    "crates/hir-ty-matchck",
+    "crates/hir-ty-mir",
+    "crates/hir-ty-print",
+    "crates/hir-ty-pure",
+    "crates/hir-ty-share",
+    "crates/hir-ty-specialization",
+    "crates/hir-ty-suspend",
+    "crates/hir-ty-tailck",
+    "crates/hir-ty-ub",
+    "crates/hir-ty-unsafeck",
+    "crates/hir-ty-wfcheck",
+    "crates/mbe",
+    "crates/proc-macro-api",
     # harness, its own workspace with its own lock: a macOS app and daemon blaze does not build
     # (crates/harness/README.md).
     "crates/harness",
     "demo",
-    # Extensions (docs/v2/plan/design/extensions.md): crates outside the workspace, as a user's
-    # are; blaze-ext-host's tests link the worked example by path.
-    "extensions",
     "harness",
     # The standard library's own workspace (docs/toolchain.md).
     "library",
-    # Hegel, built only as a dependency of blaze's tests (vendor/hegeltest/SOURCE.md).
-    "vendor/hegeltest",
-    "vendor/hegeltest-c",
-    "vendor/hegeltest-macros",
     # Patched below; its own tests need dev-dependencies blaze has no use for.
     "vendor/sonic-rs",
     # Patched below; its own tests and benches need dev-dependencies blaze has no use for.
@@ -47,175 +93,21 @@ exclude = [
     # workspace for its tests, whose dev-dependencies stay out of blaze's lock (vendor/*/PATCHES.md).
     "vendor/quinn-proto",
     "vendor/ra-ap-rustc_pattern_analysis",
+    # Patched below with a ticket's bytes; its tests and benches need dev-dependencies blaze has
+    # no use for (vendor/rustls/SOURCE.md).
+    "vendor/rustls",
 ]
 resolver = "2"
 
 [workspace.metadata.blaze]
+# `sandboxed-tests` sandboxes every member's tests on macOS, where tests are sandboxed only on
+# an opt-in (docs/cargo.md, "Sandboxed tests"), and on the stage 0 at `version` below, which
+# predates sandboxed tests by default. On Linux a blaze since notes that it does nothing there.
 experimental = ["sandboxed-tests"]
 version = "0.20261105.4"
 # A build may not change Cargo.lock or blaze.lock, here as under CI: `blaze lock` changes them,
 # saying what moved (docs/cargo.md, "Lock files").
 lock = "required"
-
-# blaze-lints' own lints (AGENTS.md rules 3, 12, 14, 18-20, 25, 27) as a released blaze reads
-# them: the stage 0 at `version` above, which builds this tree and runs the gate's `blaze check
-# --workspace`. It does not know `lints-ratchet` below, nor half the names there, and holds no
-# crate at `warn` the way the ratchet's baselines do, so this table stays at `warn` for it. This
-# tree's blaze reads `lints-ratchet` in place of this table. Delete this one when `version` is a
-# release that reads the ratchet. The other `hot_*` lints are set by the hot crates that opt in.
-# Here, not in `[workspace.lints]`: cargo hands that to rustc, which refuses the tool `blaze`
-# (E0602).
-[workspace.metadata.blaze.lints]
-# blaze's own lints come in two kinds (docs/lints.md): `blaze::general` warns in every workspace
-# by default; `blaze::internal` needs blaze's types and conventions and waits until a workspace
-# turns it on, as this one does. Groups apply before single lints, so each line below wins.
-internal = "warn"
-# `blaze::hot` stays with the crates that deny it (`#![deny(blaze::hot)]`); its members turned
-# on everywhere are named below (`hot_alloc`, `default_hasher`, `cold_error`).
-hot = "allow"
-# The parallel lints are read in their own lane (docs/lints.md).
-parallelizable = "allow"
-serial_dependence = "allow"
-hot_alloc = "warn"
-fiber_boundary = "warn"
-held_across_wait = "warn"
-lock_across_query = "warn"
-# A guard held across IO or a global-heap allocation (docs/v2/plan/design/named-locks.md).
-error_debug = "warn"
-blocking_on_pool = "warn"
-shared_collection_lock = "warn"
-open_wait_loop = "warn"
-unnamed_wait = "warn"
-wall_clock = "warn"
-# Was `std_hashmap`; every hash collection whose hasher nobody chose (AGENTS.md rules 12, 25).
-default_hasher = "warn"
-dropped_error = "warn"
-untyped_error = "warn"
-hash_order_output = "warn"
-# Keys known at compile time looked up by a map filled at run time or a run of compares
-# (AGENTS.md rule 12); no baseline yet.
-fixed_key_lookup = "warn"
-# Code written by agents: a new field or a new answer forces a decision at every site. A struct
-# literal of the workspace writes every field (no `..base`), and a parameter that chooses is an
-# enum named for the choice, not a `bool` (docs/lints.md).
-struct_update = "warn"
-bool_param = "warn"
-# A `#![blaze::sans_io]` core that reaches the wall clock or IO (AGENTS.md rule 14), and a
-# hand-written key that leaves a field out unnamed (rule 21); no baseline yet.
-sans_io_core = "warn"
-key_ignores_field = "warn"
-# A catch-all `match` arm over an enum of the workspace: a new variant is a compile error at
-# every match (replaces clippy's wildcard_enum_match_arm and match_wildcard_for_single_variants,
-# which blaze check doesn't implement); no baseline yet.
-wildcard_arm = "warn"
-# Performance: atomics or locks written apart in one 128-byte line of a shared struct, a
-# `SeqCst` with no `// seqcst: <why>`, and a `collect` only iterated or asked its length;
-# no baseline yet. `large_move` is in `blaze::hot`, set by the hot
-# crates that deny it, not here.
-false_sharing = "warn"
-seqcst_unexplained = "warn"
-collect_then_consume = "warn"
-# Performance: a key hashed twice (lookup then write), a stat or open per element in hot and
-# store crates, a query per element where a batch query exists, and a string key made from an
-# interned identifier; no baseline yet.
-hash_twice = "warn"
-syscall_in_loop = "warn"
-query_in_loop = "warn"
-string_key = "warn"
-# Code size and layout: a generic function whose body past an entry conversion is copied into
-# every instantiation, a `Result` error over 128 bytes (and, where `blaze::hot` is on, an error
-# built inline outside a `#[cold]` function), and a non-public `Vec`/`String` field nothing
-# changes; no baseline yet.
-outline_generic_body = "warn"
-cold_error = "warn"
-frozen_collection = "warn"
-# Correctness: a blocking call in async code, a `Relaxed` flag that guards data, a panic in an
-# `extern "C"` fn or in `Drop::drop`, and growth per round of a loop that reads input.
-# `dos_hasher_on_input` is not named: it yields to `blaze::internal` (on above), since this
-# workspace keys maps by fixed-seed hashers on purpose (AGENTS.md rule 25).
-blocking_in_async = "warn"
-relaxed_publish = "warn"
-unwind_across_ffi = "warn"
-unbounded_from_input = "warn"
-panic_in_drop = "warn"
-# Speed: a bounds check left in a range loop, unbuffered file and socket IO, a print locking
-# stdout per loop round, a `Vec` used as a queue, an iterator with no `size_hint`, a `String`
-# built inside `fmt`, a frozen `Vec<Vec<T>>` field, a needless stable sort, and a `dyn` field
-# called in a loop.
-bounds_check_in_loop = "warn"
-unbuffered_io = "warn"
-stdout_lock_in_loop = "warn"
-front_vec_ops = "warn"
-missing_size_hint = "warn"
-fmt_allocates = "warn"
-jagged_vec = "warn"
-stable_sort_needless = "warn"
-dyn_in_hot_field = "warn"
-# Drawn from Goose (docs/lints.md): growth without a reserve, scratch made per round, a
-# self-linked heap node, a `usize` index field, a small bounded heap field, a padded `Vec` of an
-# enum, a `dyn Fn` parameter called in a loop and a large `Box::new`; `checkfree` is `deny` by
-# default and fires only on `#[blaze::checkfree]` functions.
-push_without_reserve = "warn"
-scratch_in_loop = "warn"
-boxed_recursive_node = "warn"
-wide_index = "warn"
-bounded_heap_field = "warn"
-enum_vec_padded = "warn"
-dyn_fn_param = "warn"
-box_large_new = "warn"
-# Zero findings since every span outside a `blaze*` crate named `target: "blaze"`.
-unrecorded_span = "deny"
-# `lenient_deserialize` (a serde `Deserialize` derive without `#[serde(deny_unknown_fields)]`,
-# which drops an unknown field silently; AGENTS.md rule 3) is on through `internal` above, at
-# `warn`; other workspaces opt in.
-
-# Every lint of blaze's at `deny` in every crate, as this tree's blaze reads them (in place of
-# `lints` above; docs/lints.md, "Workspace levels and the ratchet"). A crate that still trips a
-# lint is held at `warn` on it by its line in the lint's baseline, `baselines/blaze.<lint>.txt`:
-# `crate<TAB>count`, or `crate<TAB>unmeasured` until a counted run. The baselines only shrink
-# (harness/v2/guards.py `ratchet`, in the gate's `lint-baselines` job), and `blaze check
-# --workspace --target aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines
-# --bless-baselines` records each run's counts and drops each crate at zero, which turns the
-# lint to `deny` for it. A new crate is held to every lint from its first line. A table of its
-# own: a released blaze reads no table it does not know.
-[workspace.metadata.blaze.lints-ratchet]
-baselines = "crates/blaze-lints/baselines"
-# The whole of each group, the today-`deny` lints among them (the effects lints, `checkfree`,
-# `program_lifetime`, `unrecorded_span`), which no baseline loosens.
-general = "deny"
-internal = "deny"
-edition = "deny"
-pedantic_perf = "deny"
-reach = "deny"
-proc_macro = "deny"
-# Every use of Rust's std that blaze's own standard library replaces (docs/lints.md#std_use,
-# docs/v2/plan/design/std.md, step S3), in `edition` above and named here: on by Andrew's
-# decision of 2026-11-11 ahead of the switch (`ready::BSTD_IN_TREE` is `false`: bstd does not
-# yet build on a stage-1 blaze with an API to port to). harness/v2/std_uses.py is the worklist.
-std_use = "deny"
-# `blaze::hot` is the lints of code where the time goes, each decided here. `allow` outside
-# hot code, as docs/lints.md#profile_hot says, for the three that find what is right in cold
-# code and `large_move` (moves of over 512 bytes, and lopsided enums, "in hot code" by its own
-# rule): a clone, a call that allocates or a call through a vtable is not a fault where it
-# runs once. Hot crates deny the group (`#![deny(blaze::hot)]`), and a profile raises them in
-# the functions it shows hot (`profile_hot`, denied through `general`).
-hot = "allow"
-# The four members that hold everywhere: a global-heap allocation with no `// alloc: <why>`
-# and a call to the global allocator where one was handed in (AGENTS.md rule bump-allocate), a
-# hash collection whose hasher nobody chose (rules standard-structures, deterministic-output),
-# and an error built inline where `#[cold]` belongs.
-hot_alloc = "deny"
-implicit_allocator = "deny"
-default_hasher = "deny"
-cold_error = "deny"
-# The parallel lints find loops that could run in parallel, a suggestion, not a fault; read in
-# their own lane (docs/lints.md).
-parallelizable = "allow"
-serial_dependence = "allow"
-# Not run by `blaze check` (the release build reports it from LLVM's code), so no run of the
-# ratchet counts it: at `deny` a crate whose baseline a check emptied would fail its release
-# build. Turned on for one build by `RUSTFLAGS="-W blaze::vecreport"` (docs/lints.md#vecreport).
-vecreport = "allow"
 
 # The pinned LLVM (docs/cargo.md, "Pinned native inputs"): blaze fetches the release
 # crates/hir-ty-codegen/llvm.json names for the target, checks its sha256, unpacks it read-only
@@ -345,12 +237,14 @@ corosensei = { path = "vendor/corosensei" }
 # (docs/v2/plan/design/http3-sans-io.md).
 quinn-proto = { path = "vendor/quinn-proto" }
 ra-ap-rustc_pattern_analysis = { path = "vendor/ra-ap-rustc_pattern_analysis" }
+# 0.23.46 plus a TLS 1.3 client ticket as bytes, so a process resumes (and sends 0-RTT) with a
+# ticket an earlier one got: the remote cache's HTTP/3 reads (vendor/rustls/SOURCE.md).
+rustls = { path = "vendor/rustls" }
 
 [workspace.dependencies]
 # local crates
 macros = { path = "crates/macros", version = "0.0.0" }
 base-db = { path = "crates/base-db", version = "0.0.0" }
-blaze-live = { path = "crates/blaze-live" }
 blaze-build-script = { path = "crates/blaze-build-script" }
 cfg = { path = "crates/cfg", version = "0.0.0" }
 hir = { path = "crates/hir", version = "0.0.0" }
@@ -367,7 +261,6 @@ hir-ty-tailck = { path = "crates/hir-ty-tailck", version = "0.0.0" }
 hir-ty-mir = { path = "crates/hir-ty-mir", version = "0.0.0" }
 hir-ty-print = { path = "crates/hir-ty-print", version = "0.0.0" }
 hir-ty-identity = { path = "crates/hir-ty-identity" }
-hir-ty-charon = { path = "crates/hir-ty-charon", version = "0.0.0" }
 hir-ty-lean = { path = "crates/hir-ty-lean", version = "0.0.0" }
 hir-ty-pure = { path = "crates/hir-ty-pure", version = "0.0.0" }
 hir-ty-suspend = { path = "crates/hir-ty-suspend", version = "0.0.0" }
@@ -385,7 +278,6 @@ blaze-tree = { path = "crates/blaze-tree" }
 blaze-resolve = { path = "crates/blaze-resolve" }
 blaze-source = { path = "crates/blaze-source" }
 blaze-units = { path = "crates/blaze-units" }
-blaze-lower = { path = "crates/blaze-lower" }
 blaze-shader = { path = "crates/blaze-shader" }
 blaze-doc = { path = "crates/blaze-doc" }
 blaze-fmt = { path = "crates/blaze-fmt" }
@@ -395,25 +287,19 @@ blaze-graph = { path = "crates/blaze-graph" }
 blaze-image = { path = "crates/blaze-image" }
 blaze-profile = { path = "crates/blaze-profile" }
 ix-prof = { path = "crates/ix-prof", default-features = false }
-blaze-explore = { path = "crates/blaze-explore" }
-blaze-explore-core = { path = "crates/blaze-explore-core" }
 blaze-protocol = { path = "crates/blaze-protocol" }
 blaze-report = { path = "crates/blaze-report" }
+blaze-screen = { path = "crates/blaze-screen" }
 blaze-script = { path = "crates/blaze-script" }
 blaze-serde = { path = "crates/blaze-serde" }
 blaze-serde-derive = { path = "crates/blaze-serde-derive" }
-blaze-ui = { path = "crates/blaze-ui" }
 # v2 (docs/v2/plan.md)
 blaze-alloc-count = { path = "crates/blaze-alloc-count" }
 blaze-bytes = { path = "crates/blaze-bytes" }
-blaze-api = { path = "crates/blaze-api" }
-# The daemon's clients with no process launch (docs/client.md): the library, its C ABI and its
-# Node-API addon.
-blaze-client = { path = "crates/blaze-client" }
-blaze-client-c = { path = "crates/blaze-client-c" }
-blaze-napi = { path = "crates/blaze-napi" }
+blaze-thin = { path = "crates/blaze-thin" }
 blaze-cas = { path = "crates/blaze-cas" }
 blaze-kernel = { path = "crates/blaze-kernel" }
+blaze-front-items = { path = "crates/blaze-front-items" }
 blaze-gc = { path = "crates/blaze-gc" }
 blaze-check = { path = "crates/blaze-check" }
 blaze-spin = { path = "crates/blaze-spin" }
@@ -421,22 +307,48 @@ blaze-sys = { path = "crates/blaze-sys" }
 blaze-codegen = { path = "crates/blaze-codegen" }
 blaze-codegen-code = { path = "crates/blaze-codegen-code" }
 blaze-dbsp = { path = "crates/blaze-dbsp" }
-blaze-diff = { path = "crates/blaze-diff", version = "0.0.0" }
-blaze-diff-mir = { path = "crates/blaze-diff-mir", version = "0.0.0" }
 blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
-blaze-ext = { path = "crates/blaze-ext" }
-blaze-ext-host = { path = "crates/blaze-ext-host" }
+# `blaze audit`: sources pinned by strong digests, advisories, yanked versions (sans-IO).
+blaze-audit = { path = "crates/blaze-audit" }
 blaze-fetch = { path = "crates/blaze-fetch" }
 blaze-format = { path = "crates/blaze-format" }
 blaze-hash = { path = "crates/blaze-hash" }
-# blaze's sans-IO HTTP/1.1 client and its tokio driver (blaze-registry's `HyperHttp`).
+# blaze's sans-IO HTTP/1.1 and HTTP/3 cores and their drivers on blaze-core's effects.
 blaze-http = { path = "crates/blaze-http", default-features = false }
 blaze-ids = { path = "crates/blaze-ids" }
+# An item's portable identity: its key, the `Portable` bound and the tables that outlive a snapshot (docs/v2/plan/design/identity.md).
+blaze-id = { path = "crates/blaze-id" }
+blaze-impls = { path = "crates/blaze-impls" } # The impl index, lang items and crate graph records (docs/v2/plan/design/bottom.md).
+blaze-file-items = { path = "crates/blaze-file-items" } # A file's text to its outline of items, no tree kept (docs/v2/plan/design/bottom.md, `FileItems`).
+blaze-surface = { path = "crates/blaze-surface" }
+# The fresh core's vocabulary: record kinds, keys, the store, memo, executor and driver interfaces.
+blaze-keyed = { path = "crates/blaze-keyed" }
+# The host of the keyed driver (docs/v2/plan/design/host.md): a unit's keys from its own text,
+# the front end's tasks, and the process that performs the driver's effects.
+blaze-unitkey = { path = "crates/blaze-unitkey" }
+blaze-front = { path = "crates/blaze-front" }
+blaze-host = { path = "crates/blaze-host" }
+# `blaze check --no-daemon`: a checkout to a request for the host, run and printed.
+blaze-command = { path = "crates/blaze-command" }
+# The no-daemon leaf table and its sweep.
+blaze-solo = { path = "crates/blaze-solo" }
 blaze-lir = { path = "crates/blaze-lir" }
 blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
 blaze-radix = { path = "crates/blaze-radix" }
+blaze-record = { path = "crates/blaze-record" }
+blaze-remote = { path = "crates/blaze-remote" }
+# The request certificate, its slot and the client's own check, with no compiler in it.
+blaze-certify = { path = "crates/blaze-certify" }
 blaze-rng = { path = "crates/blaze-rng" }
 blaze-sha256 = { path = "crates/blaze-sha256" }
+# blaze's own test engine and simulation kit (docs/v2/plan/design/sim.md).
+blaze-sim = { path = "crates/blaze-sim" }
+# Typed SQL (docs/v2/plan/design/sql.md): the checker, and its drivers for C SQLite and Postgres.
+blaze-sql = { path = "crates/blaze-sql" }
+blaze-sqlite = { path = "crates/blaze-sqlite" }
+blaze-pg = { path = "crates/blaze-pg" }
+# C SQLite itself, built from the amalgamation; blaze-sqlite is its only user and takes nothing of rusqlite.
+libsqlite3-sys = { version = "0.39.1", features = ["bundled"] }
 # bstd, blaze's own standard library (docs/v2/plan/design/std.md).
 blaze-std = { path = "crates/blaze-std" }
 blaze-items = { path = "crates/blaze-items" }
@@ -447,25 +359,26 @@ blaze-phf = { path = "crates/blaze-phf", version = "0.0.0" }
 # fastcompile (docs/v2/plan/design/compile-time.md)
 blaze-global = { path = "crates/blaze-global", default-features = false }
 blaze-hashcons = { path = "crates/blaze-hashcons" }
-blaze-history = { path = "crates/blaze-history" }
 blaze-inproc = { path = "crates/blaze-inproc" }
+blaze-launch = { path = "crates/blaze-launch" }
+blaze-pack = { path = "crates/blaze-pack" }
+blaze-launch-host = { path = "crates/blaze-launch-host" }
+blaze-launch-rt = { path = "crates/blaze-launch-rt" }
+blaze-program = { path = "crates/blaze-program" }
 blaze-inproc-rt = { path = "crates/blaze-inproc-rt" }
-blaze-intent = { path = "crates/blaze-intent" }
-blaze-lints = { path = "crates/blaze-lints" }
 blaze-lazy = { path = "crates/blaze-lazy", default-features = false }
 blaze-stencil = { path = "crates/blaze-stencil", default-features = false }
 blaze-testsel = { path = "crates/blaze-testsel" }
-blaze-query = { path = "crates/blaze-query" }
-blaze-query-macros = { path = "crates/blaze-query-macros" }
+# The session memo the front end runs on, and its attributes.
+blaze-memo = { path = "crates/blaze-memo" }
+blaze-memo-macros = { path = "crates/blaze-memo-macros" }
 blaze-reclaim = { path = "crates/blaze-reclaim" }
 blaze-mem = { path = "crates/blaze-mem" }
 blaze-usercode = { path = "crates/blaze-usercode" }
 blaze-v2-proof = { path = "crates/blaze-v2-proof" }
 blaze-vfs = { path = "crates/blaze-vfs" }
-# WASI preview 1 for wasm guests at both pointer widths, and the bootstrap seed's runner
-# (docs/future/bootstrap.md).
+# WASI preview 1 for wasm guests at both pointer widths.
 blaze-wasi = { path = "crates/blaze-wasi" }
-blaze-seed-run = { path = "crates/blaze-seed-run" }
 intern = { path = "crates/intern", version = "0.0.0" }
 mbe = { path = "crates/mbe", version = "0.0.0" }
 parser = { path = "crates/parser", version = "0.0.0" }
@@ -571,19 +484,12 @@ addr2line = { version = "0.26", default-features = false }
 gimli = { version = "0.33", default-features = false, features = ["read", "write", "std"] }
 either = "1.19.0"
 expect-test = "1.5.1"
-# Property tests: Hegel, Hypothesis's engine, linked as a Rust crate; test-only, imported as `hegel`
-# (docs/contributing.md, vendor/hegeltest/SOURCE.md).
-hegeltest = { path = "vendor/hegeltest", default-features = false, features = ["static-engine"] }
 indexmap = { version = "2.14.2", features = ["serde"] }
 # hir-ty's MIR provider table, which hir-ty-mir registers into.
 inventory = "0.3.25"
 itertools = "0.15.0"
 libc = "0.2.191"
 memchr = "2.8.3"
-# mimalloc's C side: the `blaze` binary's general-purpose allocator, a first-class heap per
-# blaze-mem tag (blaze-engine's `heaps.rs`, docs/v2/plan/design/memory.md), `mi_collect` when the
-# daemon gives freed pages back, and (`extended`) its options for huge pages.
-libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"] }
 postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
 pulldown-cmark = { version = "0.13.6", default-features = false }
 syntax-tree = { path = "crates/syntax-tree", version = "0.0.0" }
@@ -616,9 +522,6 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 ] }
 triomphe = { version = "0.1.17", default-features = false, features = ["std"] }
 unicode-width = "0.2.3"
-# `blaze test`'s live view on a terminal (blaze_ui::test_view, drawn by blaze-cargo's
-# cli/live.rs): an inline viewport, never the alternate screen. Each crate turns on what it uses.
-ratatui = { version = "0.30.2", default-features = false }
 url = "2.5.8"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
@@ -716,7 +619,6 @@ tar = { version = "0.4.46", default-features = false }
 target-lexicon = "0.13.5"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
-tokio = "1.54.1"
 toml_edit = { version = "=0.25.12", default-features = false }
 uds_windows = "1.2.1"
 unicode-segmentation = "=1.12.0"
@@ -729,6 +631,7 @@ zip = { version = "9.1.3", default-features = false }
 astlog-core = { path = "tools/astlog/core" }
 ast-merge-langs = { path = "tools/astlog/langs" }
 edit-applier = { path = "tools/astlog/edit-applier" }
+astlog-engine = { path = "tools/astlog/engine" }
 error-chain = { path = "tools/astlog/error-chain" }
 clap = "4.6.7"
 ignore = "0.4.33"
@@ -744,8 +647,7 @@ tree-sitter-toml-ng = "0.7.0"
 unused_dependencies = "allow"
 
 [workspace.lints.rust]
-# remember to update RUSTFLAGS in ci.yml if you add something here, and crates/blaze-live/Cargo.toml's
-# [lints], a written-out copy of these
+# remember to update RUSTFLAGS in ci.yml if you add something here
 
 elided_lifetimes_in_paths = "warn"
 explicit_outlives_requirements = "warn"
@@ -825,20 +727,34 @@ multiple_unsafe_ops_per_block = "warn" # no baseline yet; back to deny at zero f
 
 ## warn at following lints
 # CI raises these to deny
-dbg_macro = "warn"
+# deny (int-1112): a `dbg!` left in prints to stderr on every run and is never what a change
+# means; the tree has none outside lint fixtures' strings.
+dbg_macro = "deny"
 todo = "warn"
 print_stdout = "warn"
 print_stderr = "warn"
 
 ## restriction lints for code written by agents: more typing, and each choice made where it
 ## is written (`blaze check` implements each of these; crates/blaze-lints/src/lints/mod.rs)
-# an `#[allow]` that no longer suppresses anything is never noticed; `#[expect]` is
+# an `#[allow]` that no longer suppresses anything is never noticed; `#[expect]` is. These two are
+# the "unexplained allow" check (any `#[allow]`, an `#[expect]` with no reason), so blaze has no
+# lint of its own for it (docs/lints.md#suspicious-code); `--fix` turns an outer `allow` into
+# `expect`.
 allow_attributes = "warn"
 allow_attributes_without_reason = "warn"
 # `let _ = f()` of a `#[must_use]` value throws away what it says
 let_underscore_must_use = "warn"
+# Copy-paste mistakes in one expression (docs/lints.md#duplicates): `eq_op`, `ifs_same_cond` and
+# `self_assignment` are in `correctness`, denied above. Two branches written alike is the same
+# mistake, so `if_same_then_else` (in `style`) is denied too; `match_same_arms` (pedantic) warns,
+# since arms kept apart for their patterns' sake are common. Like the list below, `blaze check`
+# does not implement these yet.
+if_same_then_else = "deny"
+match_same_arms = "warn"
 # Listed in clippy's table but not implemented by `blaze check`, so turning them on does nothing
-# until they are: string_slice, missing_assert_message. wildcard_enum_match_arm and
+# until they are: string_slice, missing_assert_message, let_underscore_lock, unused_async,
+# unused_self. wildcard_imports and shadow_unrelated are `blaze::glob_import` and
+# `blaze::shadow_changes_meaning` instead (in `internal`; their levels are in `lints-ratchet`). wildcard_enum_match_arm and
 # match_wildcard_for_single_variants are `blaze::wildcard_arm` instead, which checks the
 # workspace's enums only (clippy's also fires on other crates' enums such as
 # `std::io::ErrorKind`).

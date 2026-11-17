@@ -1,0 +1,18 @@
+{
+ "id": "bstd-sim-test-2",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane bstd-sim-test",
+ "where": "blaze-core tests on macOS",
+ "what": "`cargo +nightly-2026-10-27 test -p blaze-core` did not compile on the Mac at origin/main 136432aa02: kqueue.rs:1782 called `driver.poll(&mut out, Duration::from_millis(20))` and `Driver::poll` takes a `Deadline` (E0308).",
+ "cost": "10 minutes",
+ "cause": "the test is under cfg(target_os = \"macos\") and whoever changed `Driver::poll` compiled the tests on Linux",
+ "whys": [
+  "a macOS-only test kept the old call",
+  "the port of Driver::poll's signature was checked where that test is not compiled",
+  "the green head's check-compile of test targets runs on one platform"
+ ],
+ "class": "a test target only one platform compiles is not covered by a check on another: a signature port leaves it broken",
+ "prevention": "the head moves only when test targets check-compile for macOS too (`cargo check --tests --target aarch64-apple-darwin` needs no Mac to type check); state: not built",
+ "fix": "a829378d62 (lane bstd-sim-test): the call passes Deadline::after(driver.now(), ..); 214 passed",
+ "state": "fixed: a829378d62 on branch bstd-sim-test"
+}

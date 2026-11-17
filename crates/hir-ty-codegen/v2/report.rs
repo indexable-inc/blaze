@@ -268,6 +268,7 @@ impl super::HirFrontend<'_> {
     /// span tables: only rows [`Heat::reported`] keeps (with a profile, the hot loops alone),
     /// sorted by position and message, the same finding of two instances once. A row whose
     /// statement no table of the build has is an error naming the function.
+    #[blaze::renders_positions]
     pub fn vecreport(
         &self,
         built: &blaze_codegen::driver::Built,
@@ -283,6 +284,7 @@ impl super::HirFrontend<'_> {
     }
 }
 
+#[blaze::renders_positions]
 fn reported(
     db: &base_db::Db,
     hashes: &super::HashSource,
@@ -364,15 +366,13 @@ fn reported(
                     at.anchor
                 ));
             };
-            let body = super::linked::positions(db, owner).as_ref().map_err(Clone::clone)?;
-            let start = body.starts[table] as usize;
-            let end = body.starts[table + 1] as usize;
-            let Some(&(file, line, column)) = body.rows[start..end].get(at.index as usize) else {
+            let rows = super::linked::table_rows(db, owner, table)?;
+            let Some(&(file, line, column)) = rows.get(at.index as usize) else {
                 // alloc: the error's message
                 return Err(format!(
                     "`{function}`'s finding is span {} of a table of {}",
                     at.index,
-                    end - start
+                    rows.len()
                 ));
             };
             if !files.contains_key(&file) {

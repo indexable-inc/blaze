@@ -124,6 +124,21 @@ BOUNDS: tuple[Bound, ...] = (
           "the daemon's loop thread spent 0.8 to 1.1 s in one turn with no span"),
     Bound("uncovered_ms", "ms", 100, 100, 100, "the view `uncovered_time` of the build: wall time inside no span",
           "time the profile cannot name (every-wait-says-what, slow-is-p0-traced)"),
+    # The build's account (`accounts`, blaze-profile's `account`; docs/profiling.md): the standing
+    # expectations of every build, whatever the step. A step with no build of its own (the
+    # no-op lane's answer) reads the last build's, as the other facts do.
+    Bound("unexplained", "pieces", 0, 0, 0,
+          "`accounts`: steps with no recorded reason or an unstable key, and rows no cause counts",
+          "`blaze why` had no recorded reason for steps in 9 of 53 builds of the soundness oracle (2026-11-12)"),
+    Bound("unbalanced", "sums", 0, 0, 0, "`accounts.unbalanced`: sums of the account that do not hold",
+          "a run path that counts a run under no cause"),
+    Bound("alarms", "alarms", 0, 0, 0,
+          "`accounts.alarms`: how many alarms the account names (work without a change, needless writes, work "
+          "out of proportion to the change, an unkept unit, an unattributed write)",
+          "a no-op that wrote 53 inputs, and 46 units remade by every build of reth, each found by hand (2026-11-12)"),
+    Bound("history_dropped", "rows", 0, 0, 0,
+          "`accounts.history_dropped`: rows the profile history could not write since its daemon began",
+          "a history whose thread ended on a panic and dropped every later build's rows unsaid (2026-11-12)"),
 )
 # The other outcome the smoke has to give: the build-script sandbox's (`probe_source`).
 PROBE = "guard: sandbox: a build script that runs rustc ends, and its probe compiles"
@@ -184,6 +199,13 @@ WITH b AS (
 ), gone AS (
     SELECT count(*) AS n FROM spans s
     WHERE s.name = 'kept front ends let go for memory' AND s.start_ns >= @WARM_FROM@
+), account AS (
+    SELECT max(a.by_unexplained + a.by_unstable + a.ran_uncaused) AS unexplained,
+        max(a.unbalanced) AS unbalanced, max(a.history_dropped) AS history_dropped,
+        max(CASE WHEN a.alarms IS NULL THEN 0
+            ELSE 1 + length(a.alarms) - length(replace(a.alarms, ',', '')) END) AS alarms
+    FROM accounts a, w
+    WHERE a.build_id = w.build_id
 )
 SELECT w.build_id AS build_id,
     counts.executed AS executed, counts.ran_new AS ran_new, counts.ran_untracked AS ran_untracked,
@@ -191,14 +213,16 @@ SELECT w.build_id AS build_id,
     named.lower_ns / 1e6 AS lower_ms, named.maintain_ns / 1e6 AS maintain_ms,
     CASE WHEN tasks.n > 0 AND w.replied IS NOT NULL THEN (w.replied - tasks.last_end) / 1e6 END AS answer_delay_ms,
     worst.own_ns / 1e6 AS turn_uncovered_ms,
-    tasks.n AS tasks
-FROM w, counts, gone, named, tasks, worst
+    tasks.n AS tasks,
+    account.unexplained AS unexplained, account.unbalanced AS unbalanced, account.alarms AS alarms,
+    account.history_dropped AS history_dropped
+FROM w, counts, gone, named, tasks, worst, account
 """
 UNCOVERED_SQL = "SELECT uncovered_s * 1000 AS uncovered_ms FROM uncovered_time"
 MARK_SQL = "SELECT max(build_id) AS build_id, max(started_ns + coalesce(dur_ns, 0)) AS warm_from FROM builds"
 # The facts `FACTS_SQL` and `UNCOVERED_SQL` give, by column; `ms` and `let_go_logged` are the harness's own.
 PROFILE_FACTS = ("executed", "ran_new", "ran_untracked", "let_go", "lower_ms", "maintain_ms", "answer_delay_ms",
-                 "turn_uncovered_ms", "tasks", "build_id")
+                 "turn_uncovered_ms", "tasks", "build_id", "unexplained", "unbalanced", "alarms", "history_dropped")
 
 
 def facts_sql(warm_from: int) -> str:
@@ -540,11 +564,19 @@ def ratchet_dir(manifest: str) -> str | None:
     return found
 
 
-def ratchet_off(base: Mapping[str, Mapping[str, int | None]], now: Mapping[str, Mapping[str, int | None]]) -> list[str]:
+def ratchet_off(base: Mapping[str, Mapping[str, int | None]], now: Mapping[str, Mapping[str, int | None]],
+                first: frozenset[str] = frozenset()) -> list[str]:
     """Each way `now`'s baselines, by file name, hold more than `base`'s: a crate the file did not
-    list there, a count over the base's, a count turned back to `unmeasured`."""
+    list there, a count over the base's, a count turned back to `unmeasured`.
+
+    `first` names the lints the base's registry did not have (`new_lints`). Such a lint's baseline
+    is its first: every crate it lists is where the lint begins, so nothing is compared. Without
+    this a new lint could only enter with every finding in the tree fixed in the same change, and
+    was left at `warn` with no baseline at all, which holds nothing (three lints, 2026-11-14)."""
     off: list[str] = []
     for name in sorted(now):
+        if name not in base and name.removeprefix("blaze.").removesuffix(".txt") in first:
+            continue
         was = base.get(name, {})
         for krate, held in now[name].items():
             if krate not in was:
@@ -580,6 +612,24 @@ def baselines_at(rev: str | None) -> tuple[str | None, dict[str, Baseline]]:
     return found, {name: read_baseline(f"{found}/{name}", text) for name, text in files.items()}
 
 
+LINT_NAMES = "crates/blaze-lint-defs/src/names.rs"
+
+
+def lint_names(text: str) -> frozenset[str]:
+    """The lints a registry names: each `"blaze::<name>"` in blaze-lint-defs' names.rs."""
+    found: set[str] = set()
+    for part in text.split('"blaze::')[1:]:
+        name = part.split('"', 1)[0]
+        if name and all(it.islower() or it.isdigit() or it == "_" for it in name):
+            found.add(name)
+    return frozenset(found)
+
+
+def new_lints(base: str) -> frozenset[str]:
+    """The lints the tree's registry names that `base`'s does not: their baselines are their first."""
+    return lint_names((ROOT / LINT_NAMES).read_text()) - lint_names(git("show", f"{base}:{LINT_NAMES}"))
+
+
 def ratchet(base: str) -> list[str]:
     """What the tree's baselines hold that `base`'s did not; empty when the ratchet held."""
     found, now = baselines_at(None)
@@ -592,7 +642,12 @@ def ratchet(base: str) -> list[str]:
         print(f"{SCRIPT}: the base {base} has no ratchet: it begins here, with "
               f"{sum(len(it) for it in now.values())} crates held at `warn` over {len(now)} lints")
         return []
-    return ratchet_off(was, now)
+    first = new_lints(base)
+    for lint in sorted(first):
+        if f"blaze.{lint}.txt" in now:
+            print(f"{SCRIPT}: `{lint}` is new since {base}: its baseline begins here, "
+                  f"{len(now[f'blaze.{lint}.txt'])} crates held at `warn`")
+    return ratchet_off(was, now, first)
 
 
 def empty(lint: str) -> list[str]:
@@ -676,11 +731,14 @@ def refused(what: str, text: str) -> None:
 # A warm build of a fixture as it should be: nothing dropped, nothing run that need not be.
 FIXED: dict[Step, dict[str, float | None]] = {
     "noop": dict(ms=40, let_go=0, let_go_logged=0, ran_new=0, ran_untracked=0, executed=0, lower_ms=0, maintain_ms=0,
-                 answer_delay_ms=None, turn_uncovered_ms=2, uncovered_ms=0, tasks=0),
+                 answer_delay_ms=None, turn_uncovered_ms=2, uncovered_ms=0, tasks=0,
+                 unexplained=0, unbalanced=0, alarms=0, history_dropped=0),
     "comment": dict(ms=80, let_go=0, let_go_logged=0, ran_new=0, ran_untracked=0, executed=0, lower_ms=0,
-                    maintain_ms=0, answer_delay_ms=1.5, turn_uncovered_ms=3, uncovered_ms=10, tasks=2),
+                    maintain_ms=0, answer_delay_ms=1.5, turn_uncovered_ms=3, uncovered_ms=10, tasks=2,
+                    unexplained=0, unbalanced=0, alarms=0, history_dropped=0),
     "body": dict(ms=300, let_go=0, let_go_logged=0, ran_new=20, ran_untracked=0, executed=90, lower_ms=40,
-                 maintain_ms=30, answer_delay_ms=4, turn_uncovered_ms=8, uncovered_ms=10, tasks=6),
+                 maintain_ms=30, answer_delay_ms=4, turn_uncovered_ms=8, uncovered_ms=10, tasks=6,
+                 unexplained=0, unbalanced=0, alarms=0, history_dropped=0),
 }
 
 
@@ -710,6 +768,13 @@ def selftest() -> None:
            "a build with tasks and no reply span is unmeasured, never passed")
     # Finding 4: an untracked query run 10,000 times a build; 200 ms lowering and 190 ms maintaining nothing.
     expect(failing("noop", ran_untracked=10_000, executed=10_000) == {"ran_untracked", "executed"}, "untracked reruns")
+    # The account's standing expectations hold on every step: work with no recorded cause, a
+    # sum that does not hold, an alarm, and rows the history dropped each fail the step.
+    for step in STEPS:
+        expect(failing(step, unexplained=8) == {"unexplained"}, f"unexplained work on a {step}")
+        expect(failing(step, alarms=1, unbalanced=1, history_dropped=5293) == {"alarms", "unbalanced", "history_dropped"},
+               f"an account that alarms on a {step}")
+    expect("alarms" in failing("body", alarms=None), "a build with no account is not taken as accounted")
     expect(failing("comment", lower_ms=200, maintain_ms=190) == {"lower_ms", "maintain_ms"}, "a comment edit's lowering")
     expect(not failing("body", lower_ms=200, ran_untracked=5), "a body edit's lowering is not held (yet)")
     expect("executed" in failing("comment", executed=None), "a fact the profile did not give is unmeasured")
@@ -789,7 +854,14 @@ def ratchet_selftest() -> None:
     added = ratchet_off(base, {**base, "blaze.wall_clock.txt": {"a": 3, "b": 1}})
     expect(len(added) == 1 and "`b` is held at `warn` and was not" in added[0], f"a new crate is refused: {added}")
     new_file = ratchet_off(base, {**base, "blaze.dead.txt": {"a": None}})
-    expect(len(new_file) == 1 and new_file[0].startswith("blaze.dead.txt"), f"a new lint's file is refused: {new_file}")
+    expect(len(new_file) == 1 and new_file[0].startswith("blaze.dead.txt"),
+           f"a file for a lint the base's registry had (held at `deny` everywhere there) is refused: {new_file}")
+    begun = ratchet_off(base, {**base, "blaze.dead.txt": {"a": None}}, frozenset({"dead"}))
+    expect(begun == [], f"the first baseline of a lint the base's registry did not have passes: {begun}")
+    grown = ratchet_off(base, {**base, "blaze.wall_clock.txt": {"a": 3, "b": 1}}, frozenset({"wall_clock"}))
+    expect(len(grown) == 1, f"a lint named new whose file the base has is still held to it: {grown}")
+    expect(lint_names('["blaze::a_b", "blaze::c2", "clippy::x", "blaze::"]') == frozenset({"a_b", "c2"}),
+           "the registry's names read")
     rose = ratchet_off(base, {**base, "blaze.wall_clock.txt": {"a": 4}})
     expect(rose == ["blaze.wall_clock.txt: `a` holds 4, over the base's 3"], f"a count that rose is refused: {rose}")
     again = ratchet_off(base, {**base, "blaze.wall_clock.txt": {"a": None}})

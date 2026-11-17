@@ -257,7 +257,25 @@ pub fn hold(
             worked.packages.contains(package) && parts.get(out) == Some(&"out")
         })
     };
-    let llvm_prefix = worked.llvm_prefix.as_ref().and_then(|it| it.canonicalize().ok());
+    // The pinned LLVM's prefix: the identity's, or else the one the closure's build scripts
+    // were given (`$LLVM_SYS_231_PREFIX`, which cargo keeps in a build script run's fingerprint
+    // as `RerunIfEnvChanged`): the identity the build works out in that environment checks the
+    // prefix to be the pin and hashes its marker ([`crate::LLVM_PREFIX`], step 5), where this
+    // test's environment names no prefix. Only when the identity is of the pin at all.
+    let given_prefix = || {
+        units
+            .iter()
+            .flat_map(|unit| jsons.get(unit).into_iter().flatten())
+            .filter_map(|json| std::fs::read_to_string(json).ok())
+            .find_map(|text| rerun_env_value(&text, crate::LLVM_PREFIX))
+            .map(PathBuf::from)
+    };
+    let llvm_prefix = match &worked.llvm_prefix {
+        Some(prefix) => Some(prefix.clone()),
+        None if worked.inputs.iter().any(|it| it.kind == "llvm") => given_prefix(),
+        None => None,
+    };
+    let llvm_prefix = llvm_prefix.and_then(|it| it.canonicalize().ok());
     let dirs: Vec<PathBuf> = worked.dirs.iter().filter_map(|it| it.canonicalize().ok()).collect();
     let covered = |path: &Path| {
         files.contains(path)
@@ -489,6 +507,24 @@ fn dep_fingerprints(json: &str) -> Option<Vec<(String, u64)>> {
         let [_, name, _, fingerprint] = fields[..] else { return None };
         deps.push((name.trim_matches('"').to_owned(), fingerprint.trim().parse().ok()?));
         rest = &entry[end + 1..];
+    }
+}
+
+/// The value a build script run was given of the variable `var` it said it reads
+/// (`rerun-if-env-changed`), as cargo keeps it in the run's fingerprint:
+/// `{"RerunIfEnvChanged":{"var":"<var>","val":"<value>"}}`; `None` when unset or not listed.
+fn rerun_env_value(json: &str, var: &str) -> Option<String> {
+    let entry = format!("\"RerunIfEnvChanged\":{{\"var\":\"{var}\",\"val\":");
+    let rest = &json[json.find(&entry)? + entry.len()..];
+    let rest = rest.strip_prefix('"')?;
+    let mut value = String::new();
+    let mut chars = rest.chars();
+    loop {
+        match chars.next()? {
+            '"' => return Some(value),
+            '\\' => value.push(chars.next()?),
+            it => value.push(it),
+        }
     }
 }
 

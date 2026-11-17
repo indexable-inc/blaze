@@ -46,7 +46,7 @@ fn compile_one_gives_what_a_whole_build_compiles() {
     for walked in &built.walked {
         let function = build.compile_one(walked.key, &store).unwrap();
         let want = whole.functions.iter().find(|it| it.key == walked.key).unwrap();
-        assert_eq!(&function, want);
+        assert_eq!(function, **want);
     }
     // The entry is the memo's, by the stored key its compile ahead landed under; 2's IR again
     // and its compile; 3 takes 2's template by the shape its check kept, building nothing; 4
@@ -165,7 +165,7 @@ fn compile_one_reads_a_store_behind_a_trait_object() {
     let lookup: &dyn Lookup = &store;
     let before = counts(&machine);
     let entry = build.compile_one(built.entry[0], lookup).unwrap();
-    assert_eq!(entry, built.functions[0]);
+    assert_eq!(entry, *built.functions[0]);
     assert_eq!(counts(&machine), before);
 }
 
@@ -228,7 +228,7 @@ fn an_owned_walk_compiles_what_a_whole_build_compiles() {
         let (function, _) =
             later.compile_kept(&machine, &program, &memo, walked.key, &store).unwrap();
         let want = whole.functions.iter().find(|it| it.key == walked.key).unwrap();
-        assert_eq!(&function, want);
+        assert_eq!(function, **want);
     }
 }
 
@@ -286,9 +286,9 @@ fn a_first_call_after_an_edit_compiles_only_what_still_has_its_key() {
     assert_eq!(counts(&machine), before, "refused before its IR is built");
 
     let (five, _) = later.compile_kept(&machine, &program, &memo, key(5), &store).unwrap();
-    assert_eq!(five, want(key(5)));
+    assert_eq!(five, *want(key(5)));
     let (three, _) = later.compile_kept(&machine, &program, &memo, key(3), &store).unwrap();
-    assert_eq!(three, want(key(3)), "2's template, by the shape 3's check recorded");
+    assert_eq!(three, *want(key(3)), "2's template, by the shape 3's check recorded");
 }
 
 /// A tier-up compiles the function alone at each tier, under the tier's own key, and refuses
@@ -366,4 +366,80 @@ fn a_second_lazy_build_of_the_memo_takes_what_the_first_compiled_ahead() {
     assert_eq!(second.functions, first.functions);
     // Only the checks of the four functions compiled later.
     assert_eq!(counts(&machine), (4, 0));
+}
+
+/// What a first call of a program's function makes, as the store would keep it: the function,
+/// and each put's key, kind and bytes (`Put::of`, which names how it was made, left out).
+type FirstCall = Result<(CompiledFunction, Vec<(Key, Kind, Vec<u8>)>), CodegenError>;
+
+/// The first call of `2` after a lazy build of `program` on `memo`, each build with a store of
+/// its own (a daemon's memo outlives its builds; nothing here is in a store), and the
+/// landings that call added to the memo's flights.
+fn first_call_of_two(program: &Program, memo: &Memo) -> (FirstCall, Vec<(InstanceKey, ContentId)>) {
+    let (machine, store, policy) = (Machine::default(), Store::default(), live());
+    let mut build = Build::new(&machine, program, &policy, memo);
+    let built = build.run_later(&[(1, member())], &[], &[0], &store).unwrap();
+    let key = built.walked.iter().find(|it| it.item == item(2)).unwrap().key;
+    let before = memo.flights().landings();
+    let made = build.into_later().compile_kept(&machine, program, memo, key, &store);
+    let made = made.map(|(function, puts)| {
+        (function, puts.into_iter().map(|it| (it.key, it.kind, it.bytes)).collect())
+    });
+    let added = memo.flights().landings().into_iter().filter(|it| !before.contains(it)).collect();
+    (made, added)
+}
+
+/// A function compiled after its walk (a lazy run's first call, a tier-up, a launched run's
+/// function made alone: `later::claimed`) flies under one flight key with a walk's
+/// ([`flight_key`]): of its stored key and its form. Two describes of one stored key, one whose
+/// template holds its own positions by table (relative, kept under a name-free template code)
+/// and one whose template holds them as its code's, are two flights: the second form's
+/// compile takes nothing the first landed. Taken, the first form's template is kept under the
+/// second's template key (rule 21), and the next build that compiles it fresh (a daemon's
+/// after a restart, its memo empty) puts other bytes under a key the store holds.
+#[test]
+fn a_later_compile_never_takes_the_landing_of_the_other_form() {
+    let anchors: [ContentId; crate::template::OWN_TABLES] =
+        std::array::from_fn(|t| ContentId([0x20 + t as u8; 32]));
+    let program_of = |relative: bool| {
+        let mut program = program();
+        if relative {
+            program.functions.get_mut(&2).unwrap().anchors = Some(anchors);
+        }
+        program
+    };
+    let (absolute, relative) = (program_of(false), program_of(true));
+    // The oracle: the relative form's first call on a memo of its own.
+    let (fresh, _) = first_call_of_two(&relative, &Memo::new());
+    let fresh = fresh.expect("the relative form compiles alone");
+
+    // The invariant: after the absolute form's first call landed on the memo, the relative
+    // form's is the fresh one.
+    let memo = Memo::new();
+    let (made, landed) = first_call_of_two(&absolute, &memo);
+    made.expect("the absolute form compiles");
+    let &[(stored, shape)] = &landed[..] else {
+        panic!("the absolute form's first call lands once, under its stored key: {landed:?}")
+    };
+    let (after, landed) = first_call_of_two(&relative, &memo);
+    assert_eq!(after.as_ref().ok(), Some(&fresh), "the relative form took the absolute form's landing");
+    assert_eq!(
+        landed.iter().map(|it| it.0).collect::<Vec<_>>(),
+        [flight_key(stored, true)],
+        "the relative form flies under its own flight key"
+    );
+
+    // The control: the absolute form's landing planted under the key the relative form's
+    // compile asks, as a flight key of the stored key alone (the bug) would have it. The
+    // first call takes it, and the oracle says it is another than the fresh one.
+    let planted = Memo::new();
+    let (made, landed) = first_call_of_two(&absolute, &planted);
+    made.expect("the absolute form compiles");
+    assert_eq!(landed, [(stored, shape)], "the same key and shape on a memo of its own");
+    let owner: std::sync::Arc<str> = std::sync::Arc::from("the planted landing");
+    let asked = planted.flights().ask(flight_key(stored, true), &owner, || (Some(shape), ()));
+    assert_eq!(asked, crate::flight::Asked::Ran(()));
+    let (taken, landed) = first_call_of_two(&relative, &planted);
+    assert!(landed.is_empty(), "the planted landing is taken, nothing compiled: {landed:?}");
+    assert_ne!(taken.as_ref().ok(), Some(&fresh), "the oracle missed a landing of the other form");
 }

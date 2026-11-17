@@ -16,7 +16,7 @@ use target_features::multiversion::{Plan, Refusal};
 mod tests;
 
 /// The arch of `krate`'s target, from its `target_arch` cfg: once per crate.
-#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
 pub fn crate_target_arch(db: &Db, krate: Crate) -> TargetArch {
     krate
         .cfg_options(db)
@@ -111,14 +111,14 @@ impl Declared {
     }
 }
 
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
 fn declared_target_features(db: &Db, owner: FunctionId) -> Declared {
     blaze_mem::frame::current(|frame| Declared::of(frame, AttrFlags::target_features(db, owner)))
 }
 
 /// The target features of rustc's tables that `krate`'s cfg has (`cfg(target_feature = "…")`),
 /// without what they imply: `CfgOptions::check_atom` of each, once per crate.
-#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
 pub fn crate_target_features(db: &Db, krate: Crate) -> TargetFeatureSet {
     let values = krate.cfg_options(db).get_cfg_values("target_feature");
     // alloc: none, the set is bits by value

@@ -44,6 +44,8 @@ pub(crate) struct Built {
     pub packages: Vec<PackagePlan>,
     pub lock: Option<LockWrite>,
     pub warnings: Vec<String>,
+    /// blaze's notes of the load ([`crate::query::Units::notes`]).
+    pub notes: Vec<String>,
     pub target_dir: String,
     pub build_dir: String,
     pub finished: String,
@@ -51,8 +53,6 @@ pub(crate) struct Built {
     pub roots: Vec<(String, usize)>,
     /// The workspace's `build-script-link-dirs`, absolute or `${NAME}/rest` for a run to expand.
     pub link_dirs: Vec<String>,
-    /// The workspace's `sandboxed-tests` experiment ([`crate::query::Units::sandboxed_tests`]).
-    pub sandboxed_tests: bool,
     /// The pinned native inputs the graph's build script runs are given ([`crate::query::Units::native`]).
     pub native: Vec<crate::query::NativeInput>,
 }
@@ -179,7 +179,11 @@ pub(crate) fn units(
         // alloc: the spec is how a unit names its package (`Unit::pkg_id`), once per package.
         packages_by_spec.insert(id.to_spec().to_string(), (*id, package));
     }
-    let opt_out = match super::sandbox::workspace(ws.custom_metadata(), ws.root_manifest()) {
+    let opt_out = match super::sandbox::workspace(
+        ws.custom_metadata(),
+        ws.root_manifest(),
+        &host.triple,
+    ) {
         Ok(it) => it,
         Err(error) => return Ok(Staged::Failed(error)),
     };
@@ -200,8 +204,18 @@ pub(crate) fn units(
         if own.build_script_outside || opt_out.unsandboxed(id.name().as_str()) {
             unsandboxed.insert(spec.as_str());
         }
-        if own.tests != TestSandbox::default() {
-            test_sandbox.insert(*id, own.tests);
+        // Whether a member's tests run sandboxed by default is the host's
+        // (`sandbox::tests_sandboxed_by_default`), decided here once, into its plan.
+        let tests = match package.is_member {
+            true => super::sandbox::tests_on(
+                own.tests,
+                own.tests_opted_in || opt_out.sandboxed_tests,
+                &host.triple,
+            ),
+            false => own.tests,
+        };
+        if tests != TestSandbox::default() {
+            test_sandbox.insert(*id, tests);
         }
     }
     let request = Request {
@@ -376,6 +390,8 @@ pub(crate) fn units(
             // units of one key would build and place the same files twice.
             let mut merged: Vec<(blaze_ids::ContentId, Vec<(String, usize)>)> = Vec::new(); // alloc: a few platforms, once per load
             let links_runtime = links_dev_runtime(&graph, &packages_by_spec);
+            // alloc: a few platforms, once per load
+            let mut keyed: Vec<(BuiltFor<'_>, StdKey)> = Vec::with_capacity(platforms_used.len());
             for built_for in platforms_used {
                 let triple = built_for.platform.unwrap_or(host.triple.as_str());
                 // The wasm macros' std is planned as their units are: no rustflags, std's
@@ -401,6 +417,10 @@ pub(crate) fn units(
                     Ok(it) => it,
                     Err(error) => return Ok(Staged::Failed(error)),
                 };
+                keyed.push((built_for, key));
+            }
+            one_std_a_place(&mut keyed);
+            for (built_for, key) in keyed {
                 let id = key.id();
                 if let Some((_, roots)) = merged.iter().find(|(it, _)| *it == id) {
                     if let Err(error) = runs_as_keyed(&graph, roots, &key, id, built_for) {
@@ -414,15 +434,17 @@ pub(crate) fn units(
                         StdPlanned::Ready(std) => std,
                         StdPlanned::Failed(error) => return Ok(Staged::Failed(error)),
                     };
-                // Named by its key alone, never by the workspace: every workspace on the daemon
-                // asking for the same std names the same outputs, and builds it once.
+                // Named by what its units are made from alone ([`StdKey::placement`]), never
+                // by the workspace nor by which of its crates the build asks for: every
+                // workspace on the daemon, and every command of one (a program's build and its
+                // tests'), names each unit of one std by the same outputs, and builds it once.
                 if !Path::new(&spec.std).has_root() {
                     return Ok(fail(anyhow::anyhow!(
                         "the daemon names `{}`, no absolute directory, for the standard library's builds",
                         spec.std
                     )));
                 }
-                let out = format!("{}/{:x}", spec.std, id);
+                let out = format!("{}/{:x}", spec.std, placed(&key));
                 let roots = merge_std(
                     &mut graph,
                     &mut std_plans,
@@ -461,6 +483,7 @@ pub(crate) fn units(
         config,
         intent: spec.intent,
         lints: spec.lints,
+        lint_levels: &spec.lint_levels,
         build_std: spec.build_std.is_some(),
         ws_root: ws.root(),
         ws_manifest: ws.root_manifest(),
@@ -510,6 +533,25 @@ pub(crate) fn units(
         }
     }
 
+    // A foreign load builds another build's dependencies, whose profile is that build's.
+    let mut notes = match &spec.foreign {
+        Some(_) => Vec::new(),
+        None => strip_notes(
+            &profiles.strips(),
+            graph
+                .units
+                .iter()
+                .zip(&plans)
+                .filter(|(unit, _)| !unit.is_std)
+                .map(|(_, plan)| plan.rustflags.as_slice()),
+        ),
+    };
+    // A retired experiment the root manifest still lists: said by the build of this
+    // workspace, not by a foreign load of another's dependencies.
+    if spec.foreign.is_none() {
+        notes.extend(opt_out.notes);
+    }
+
     let checksums = resolved.resolve.checksums();
     let const_macros_on = super::sandbox::const_macros_on(ws.custom_metadata());
     let mut packages: Vec<PackagePlan> = Vec::with_capacity(by_id.len());
@@ -532,6 +574,7 @@ pub(crate) fn units(
                 manifest_path,
                 package.is_member,
                 checksum,
+                git_tree(&resolved.pins, *id),
                 tests,
                 const_macros,
             )),
@@ -582,14 +625,48 @@ pub(crate) fn units(
         packages,
         lock: resolved.lock,
         warnings,
+        notes,
         target_dir: target_dir.display().to_string(),
         build_dir: build_dir.display().to_string(),
         finished: planned.finished,
         roots: named_roots,
         link_dirs: opt_out.link_dirs,
-        sandboxed_tests: opt_out.sandboxed_tests,
         native,
     }))
+}
+
+/// What a build says of each `strip` it accepts and does not honour yet (ledger D44): one note
+/// per setting the requested profile makes (`strips`, from [`Profiles::strips`]), then one per
+/// value of `-C strip` the workspace's units' `rustflags` pass (`-C strip=none` asks for
+/// nothing). Not a refusal: real projects set `strip = true` (superset-of-rust); a named note on
+/// every build that sets it, so the setting is never quietly dropped (no-fallback).
+pub(crate) fn strip_notes<'a>(
+    strips: &[(String, String)],
+    rustflags: impl IntoIterator<Item = &'a [String]>,
+) -> Vec<String> {
+    const NOT_YET: &str = "blaze accepts it and does not strip yet: its linker writes the symbol \
+                           table and debug info all the same (ledger D44)";
+    // alloc: a note per setting, once per load
+    let mut notes: Vec<String> =
+        strips.iter().map(|(at, value)| format!("{at} sets `strip = {value}`: {NOT_YET}")).collect();
+    let mut values: Vec<&str> = Vec::new(); // alloc: each `-C strip` value, once per load
+    for flags in rustflags {
+        let mut words = flags.iter().map(String::as_str);
+        while let Some(word) = words.next() {
+            let option = match word {
+                "-C" | "--codegen" => words.next(),
+                _ => word.strip_prefix("-C").or_else(|| word.strip_prefix("--codegen=")),
+            };
+            match option.and_then(|it| it.strip_prefix("strip=")) {
+                Some("none") | None => {}
+                Some(value) => values.push(value),
+            }
+        }
+    }
+    values.sort_unstable();
+    values.dedup();
+    notes.extend(values.into_iter().map(|value| format!("the rustflags pass `-C strip={value}`: {NOT_YET}")));
+    notes
 }
 
 /// `-j` or `build.jobs` as cargo's `JobsConfig` reads it, when it names a number of jobs; none
@@ -1062,6 +1139,46 @@ fn std_key(
     })
 }
 
+/// The ID of the directory `key`'s units place what they make in: [`StdKey::placement`].
+fn placed(key: &StdKey) -> blaze_ids::ContentId {
+    #[cfg(test)]
+    if PLACES_BY_CRATES_ASKED.get() {
+        return key.id();
+    }
+    key.placement()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bug a test planted: the standard library's directory is named by its whole key,
+    /// the crates asked among it, as it was until 2026-11-11.
+    pub(crate) static PLACES_BY_CRATES_ASKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Gives the platforms of one build whose stds are placed in one directory
+/// ([`StdKey::placement`]) one key: each asks for every crate any of them asks for. Their
+/// keys are then equal, so the build has that std's units once and both platforms' units
+/// depend on them (`merged`, in the caller). Left apart, two keys of one placement would be
+/// two sets of units in one graph writing the same files, each unit they share twice. A crate
+/// one platform did not ask for is one more `--extern` its units do not name (`nounused`),
+/// as cargo's `-Zbuild-std` gives every unit every root.
+fn one_std_a_place(keyed: &mut [(BuiltFor<'_>, StdKey)]) {
+    // alloc: a few platforms' ids, once per load
+    let places: Vec<blaze_ids::ContentId> = keyed.iter().map(|(_, key)| key.placement()).collect();
+    for at in 0..keyed.len() {
+        // clone: a few crate names, once per platform per load
+        let mut crates = keyed[at].1.crates.clone();
+        for (other, (_, key)) in keyed.iter().enumerate() {
+            if other != at && places[other] == places[at] {
+                crates.extend(key.crates.iter().cloned());
+            }
+        }
+        crates.sort();
+        crates.dedup();
+        keyed[at].1.crates = crates;
+    }
+}
+
 /// Refuses std's `roots` for `built_for` when one of them runs elsewhere than `key`, of ID
 /// `id`, says: a key that missed where std's code runs would give the target a std compiled
 /// for this machine's CPU, or the host one for the baseline (rule 21).
@@ -1330,14 +1447,28 @@ fn foreign_profiles(
     Ok(profiles)
 }
 
+/// The digest `blaze.lock` pins a git package's tree by, which the load required before it
+/// located the package ([`blaze_audit::source::require_git`]); `None` for any other source.
+fn git_tree(pins: &blaze_audit::pins::SourcePins, id: PackageId) -> Option<String> {
+    let source = id.source_id();
+    if !source.is_git() {
+        return None;
+    }
+    let commit = source.precise_git_fragment()?;
+    pins.git(source.url().as_str(), commit).map(|it| it.tree.to_string())
+}
+
 /// A package as the build names it. `checksum` is the resolve's, in hex: kept only for a
-/// crates.io package, whose `.crate` it is the SHA-256 of.
+/// crates.io package, whose `.crate` it is the SHA-256 of. `tree` is a git package's pinned
+/// tree digest ([`git_tree`]).
+#[allow(clippy::too_many_arguments)] // a package's parts, each once
 fn package_plan(
     id: PackageId,
     manifest: &Manifest,
     manifest_path: &Path,
     is_member: bool,
     checksum: Option<&str>,
+    tree: Option<String>,
     tests: TestSandbox,
     const_macros: Option<String>,
 ) -> PackagePlan {
@@ -1356,6 +1487,7 @@ fn package_plan(
         checksum: checksum
             .filter(|_| id.source_id().is_crates_io())
             .and_then(blaze_format::hex::decode::<32>),
+        tree,
         tests,
         const_macros,
     }

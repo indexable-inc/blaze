@@ -37,9 +37,9 @@ tracing.workspace = true
 unicode-normalization.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 # The resume property test (`tests::a_cut_download_resumes_and_keeps_only_the_pinned_bytes`).
-hegeltest.workspace = true
+blaze-sim.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

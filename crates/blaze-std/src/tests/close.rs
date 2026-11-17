@@ -8,9 +8,9 @@
 use std::time::Duration;
 
 use blaze_core::sim::Faults;
-use hegel::TestCase;
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn, Seeds, check, control, path, root};
+use super::{check, control, path, root};
 use crate::{
     Cx, Plant,
     fs::{File, FsKind, FsOp, ReadWrite, Unsynced},
@@ -26,11 +26,11 @@ struct Plan {
     fail: bool,
 }
 
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
-    let latency_us = d.pick(&[0, 50, 2_000]);
-    let appends = (0..d.int(1, 8)).map(|_| d.int(1, 32) as usize).collect();
-    Plan { seed, latency_us, appends, fail: d.one_in(2) }
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
+    let latency_us = *tape.one_of(&[0, 50, 2_000], "latency us");
+    let appends = (0..tape.int_in(1..=8u64, "appends")).map(|_| tape.int_in(1..=32u64, "append len") as usize).collect();
+    Plan { seed, latency_us, appends, fail: tape.one_in(2, "fail") }
 }
 
 /// The plan's appends to `file`: everything appended.
@@ -87,12 +87,12 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
 /// The invariant: a `File::close_synced` that returned `Ok` has made the file and every append
 /// durable (a crash right after keeps them all), and one whose flush the disk fails returns
 /// that failure, op `Close`, never `Ok`.
-#[hegel::test(test_cases = 100)]
-fn closing_a_file_syncs_it_or_says_why_not(tc: TestCase) {
-    check(plan(&mut Drawn(&tc)), run);
+#[test]
+fn closing_a_file_syncs_it_or_says_why_not() {
+    blaze_sim::check(Config::cases(100), |tape| check(plan(tape), run));
 }
 
 #[test]
 fn the_oracle_catches_a_close_that_skips_its_sync() {
-    control(Plant::CloseSkipsSync, |seeds: &mut Seeds| plan(seeds), run);
+    control(Plant::CloseSkipsSync, plan, run);
 }

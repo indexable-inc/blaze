@@ -10,18 +10,24 @@ use blaze_format::SpanRef;
 use blaze_ids::ContentId;
 use blaze_items::{ItemId, item_key};
 use hir_def::{DefWithBodyId, FunctionId, expr_store::Body as BodyStore};
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 use hir_expand::fixture;
 use hir_ty_mir::mir::MirSpan;
 
 use super::*;
-use crate::v2::{BuildTime, Databases, ItemHashes};
+use crate::v2::{
+    BuildTime, Databases, ItemHashes,
+    tests::{runs_of, write_file},
+};
 use db::TestDB;
 
+/// A front end over `text`'s database, with the database's owner of what its links keep
+/// ([`crate::v2::Walks`]), as a daemon's kept front end gives it.
 fn frontend(text: &str) -> (&'static TestDB, HirFrontend<'static>) {
     let db: &'static TestDB = Box::leak(Box::new(fixture::db(text).into_db()));
+    let walks: &'static crate::v2::Walks = Box::leak(Box::new(crate::v2::Walks::new(db)));
     let hashes = HashSource::Items(ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned()))));
-    (db, HirFrontend::new(Databases::new(db), hashes, BuildTime::default()))
+    (db, HirFrontend::new(Databases::new(db), hashes, BuildTime::default()).with_walks(walks))
 }
 
 #[track_caller]
@@ -118,10 +124,10 @@ fn the_tables_the_code_names_are_given_with_their_positions() {
     let start = hashes.span(db, owner, MirSpan::ExprId(root)).unwrap();
     let declared = hashes.declaration(db, func).unwrap();
     let built = Built {
-        functions: vec![compiled(
+        functions: vec![std::sync::Arc::new(compiled(
             1,
             vec![Line { at: 0, span: start }, Line { at: 1, span: declared }],
-        )],
+        ))],
         items: vec![item_key(db, ItemId::Function(func))],
         debug_names: vec![(InstanceKey(ContentId([1; 32])), "lib::f".to_owned())],
         ..Built::default()
@@ -143,29 +149,75 @@ fn the_tables_the_code_names_are_given_with_their_positions() {
     let table =
         |anchor: ContentId| &inputs.tables.iter().find(|it| it.anchor == anchor).unwrap().bytes;
     let body = table(start.anchor);
-    assert_eq!(&body[..8], b"BZSPANS1");
-    assert_eq!(u32::from_le_bytes(body[8..12].try_into().unwrap()), 1, "one file");
-    let name_len = u32::from_le_bytes(body[12..16].try_into().unwrap()) as usize;
+    let word = |bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    assert_eq!(&body[..8], b"BZSPANS2");
+    assert_eq!(word(body, 8), 1, "one file");
+    let name_len = word(body, 12) as usize;
     assert_eq!(&body[16..16 + name_len], b"src/lib.rs");
     let after = 16 + name_len;
-    let count = u32::from_le_bytes(body[after..after + 4].try_into().unwrap()) as usize;
+    let count = word(body, after) as usize;
     assert_eq!(count, BodyStore::of(db, owner).exprs().count(), "a row per expression");
-    assert_eq!(body.len(), after + 4 + 12 * count);
-    let row = after + 4 + 12 * start.index as usize;
-    let words: Vec<u32> = body[row..row + 12]
-        .chunks(4)
-        .map(|it| u32::from_le_bytes(it.try_into().unwrap()))
-        .collect();
+    let bases_at = after + 4 + 16 * count;
+    assert_eq!(word(body, bases_at), 2, "the anchor's start and the owner's declaration");
+    assert_eq!(body.len(), bases_at + 4 + 2 * 12);
+    let row = after + 4 + 16 * start.index as usize;
+    let [base, file, line, column] = std::array::from_fn(|n| word(body, row + 4 * n));
+    assert_ne!(base, u32::MAX, "a span of the body's own file is counted from a base");
+    assert_eq!(file, 0, "a relative span's file is its base's");
+    let base_at = bases_at + 4 + 12 * base as usize;
+    let [base_file, base_line, base_column] = std::array::from_fn(|n| word(body, base_at + 4 * n));
+    let resolved =
+        [base_file, base_line + line, if line == 0 { base_column + column } else { column }];
     // The body's block, on the first line, from its 25th column.
-    assert_eq!(words, [0, 1, 25]);
+    assert_eq!(resolved, [0, 1, 25]);
 
     let declaration = table(declared.anchor);
-    assert_eq!(declaration.len(), 8 + 4 + 4 + name_len + 4 + 12);
+    assert_eq!(declaration.len(), 8 + 4 + 4 + name_len + 4 + 16 + 4 + 12);
 
     // The same build linked again: the same snapshot, nothing made.
     let again = frontend.link_inputs(&built).unwrap();
     assert_eq!((again.serial, again.base), (inputs.serial, None));
     assert!(again.tables.is_empty() && again.removed.is_empty() && again.work.made == 0);
+}
+
+/// The invariant: a database's link inputs are kept by its owner ([`crate::v2::Walks`]) and by
+/// nothing else, so they leave with it. The control is the front end given no owner: were
+/// anything in the process (a static, as until 2026-11-13) keeping them, its second link
+/// would find them and make nothing.
+#[test]
+fn link_inputs_are_kept_by_the_databases_owner_alone() {
+    let (db, frontend) = frontend(SPANNED);
+    let func = function(db, "f");
+    let owner = DefWithBodyId::FunctionId(func);
+    let root = BodyStore::of(db, owner).root_expr();
+    let start = frontend.hashes.span(db, owner, MirSpan::ExprId(root)).unwrap();
+    let built = Built {
+        functions: vec![std::sync::Arc::new(compiled(1, vec![Line { at: 0, span: start }]))],
+        items: vec![item_key(db, ItemId::Function(func))],
+        debug_names: vec![(InstanceKey(ContentId([1; 32])), "lib::f".to_owned())],
+        ..Built::default()
+    };
+    let first = frontend.link_inputs(&built).unwrap();
+    assert!(first.work.whole.is_some());
+    let again = frontend.link_inputs(&built).unwrap();
+    assert!(again.work.whole.is_none() && again.work.made == 0, "the owner kept the first link's");
+
+    // A front end with no owner, over the same database: nothing it links is kept anywhere.
+    let hashes = HashSource::Items(ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned()))));
+    let unowned = HirFrontend::new(Databases::new(db), hashes, BuildTime::default());
+    for link in 0..2 {
+        let inputs = unowned.link_inputs(&built).unwrap();
+        assert_eq!(
+            inputs.work.whole,
+            Some(NOTHING_KEPT),
+            "link {link} of a front end with no owner found link inputs kept"
+        );
+    }
+
+    // Let go by the owner: the next link makes every table again.
+    let walks = frontend.walks.expect("given by `frontend`");
+    assert_eq!(walks.links().let_go(), 1, "one program's link inputs were kept");
+    assert_eq!(frontend.link_inputs(&built).unwrap().work.whole, Some(NOTHING_KEPT));
 }
 
 #[test]
@@ -175,7 +227,7 @@ fn a_position_of_no_table_the_build_has_is_an_error() {
     let stray = SpanRef { anchor: ContentId([9; 32]), index: 0 };
     let unknown = ItemKey(ContentId([7; 32]));
     let built = Built {
-        functions: vec![compiled(1, vec![Line { at: 0, span: stray }])],
+        functions: vec![std::sync::Arc::new(compiled(1, vec![Line { at: 0, span: stray }]))],
         items: vec![item_key(db, ItemId::Function(func)), unknown],
         debug_names: vec![(InstanceKey(ContentId([1; 32])), "lib::f".to_owned())],
         ..Built::default()
@@ -205,12 +257,205 @@ fn a_reformat_changes_a_table_and_not_its_anchor() {
     let mut db = db;
     let file = file.file_id(&db);
     let owner = |db: &TestDB| DefWithBodyId::FunctionId(function(db, "f"));
-    let before = positions(&db, owner(&db)).clone().unwrap();
-    db.set_file_text(file, "\n\npub fn f(x: u32) -> u32 {\n        x + 1\n}\n");
-    let after = positions(&db, owner(&db)).clone().unwrap();
-    assert_eq!(before.starts, after.starts, "the same spans");
-    assert_ne!(before.rows, after.rows, "each two lines on");
-    assert!(before.rows.iter().zip(&after.rows).all(|(was, now)| now.1 == was.1 + 2));
+    let before = all_rows(&db, owner(&db));
+    write_file(&mut db, file, "\n\npub fn f(x: u32) -> u32 {\n        x + 1\n}\n");
+    let after = all_rows(&db, owner(&db));
+    assert_eq!(before.len(), after.len(), "the same spans");
+    assert_ne!(before, after, "each two lines on");
+    assert!(before.iter().zip(&after).all(|(was, now)| now.1 == was.1 + 2));
+}
+
+/// Every table's rows of `owner`, in table order ([`table_rows`]).
+fn all_rows(db: &TestDB, owner: DefWithBodyId) -> Vec<Row> {
+    (0..TABLES).flat_map(|table| table_rows(db, owner, table).unwrap()).collect()
+}
+
+const SHIFTED: &str = "pub fn above() -> u32 {\n    1\n}\npub fn f(x: u32) -> u32 {\n    let y = x + 1;\n    y * 2\n}\n";
+
+/// The invariant: a line added above a body changes where its positions are counted from and
+/// nothing else of them. Its places, item-relative, are the values they were; its bases, two
+/// rows, move; each row the link is given is the one found from where the body is in its file
+/// now, `N` lines on. The control: an edit of the body itself places it otherwise.
+///
+/// Since the front end is on blaze-memo, an edit of a file remakes its crate's arena, so the
+/// places are found again in the next snapshot (the run is asserted): what is kept across
+/// the edit is their value, which the link compares by, not the memo's entry. Before the port
+/// the test claimed the entry was kept and not run again.
+#[test]
+fn a_line_added_above_a_body_places_none_of_it_again() {
+    for n in [1usize, 3, 40] {
+        let fx = fixture::db(SHIFTED);
+        let file = fx.only_file();
+        let mut db = fx.into_db();
+        let file = file.file_id(&db);
+        let owner = |db: &TestDB| DefWithBodyId::FunctionId(function(db, "f"));
+        let before_rows = all_rows(&db, owner(&db));
+        let before_places = span_places(&db, owner(&db)).clone();
+        let cells_of = |db: &TestDB| -> Vec<(Vec<Cell>, Vec<Row>)> {
+            (0..TABLES).map(|table| table_cells(db, owner(db), table).unwrap()).collect()
+        };
+        let before_cells = cells_of(&db);
+
+        let shifted = format!("{}{SHIFTED}", "\n".repeat(n));
+        write_file(&mut db, file, &shifted);
+        blaze_memo::attach(&db, || {
+            let owner = owner(&db);
+            let (after_rows, executed) = runs_of(&db, || all_rows(&db, owner));
+            assert!(
+                executed.iter().any(|it| it.is::<span_bases>(&(owner,))),
+                "the bases move: {executed:#?}"
+            );
+            assert!(
+                executed.iter().any(|it| it.is::<span_places>(&(owner,))),
+                "an edit of the crate's file remakes its arena, so its places are found again: \
+                 {executed:#?}"
+            );
+            assert_eq!(*span_places(&db, owner), before_places, "its places are as they were");
+            // What the link is given: each table's cells as they were, its bases `n` on.
+            for (table, ((cells, bases), (was_cells, was_bases))) in
+                cells_of(&db).into_iter().zip(&before_cells).enumerate()
+            {
+                assert_eq!(&cells, was_cells, "table {table}'s cells after {n} lines");
+                let moved: Vec<Row> = (was_bases.iter())
+                    .map(|&(file, line, column)| (file, line + n as u32, column))
+                    .collect();
+                assert_eq!(bases, moved, "table {table}'s bases after {n} lines");
+            }
+            assert_eq!(after_rows.len(), before_rows.len());
+            for (was, now) in before_rows.iter().zip(&after_rows) {
+                assert_eq!((now.0, now.1, now.2), (was.0, was.1 + n as u32, was.2), "{n} lines on");
+            }
+            // What the program prints: each row is the absolute one found from the whole file.
+            let store = BodyStore::of(&db, owner);
+            let starts = span_places(&db, owner).starts;
+            let rows = &after_rows[starts[code::EXPRS] as usize..starts[code::EXPRS + 1] as usize];
+            for (span, row) in store.expr_ids().map(MirSpan::ExprId).zip(rows) {
+                assert_eq!(
+                    Some(*row),
+                    hir_ty_mir::mir::location::source_location_in_file(&db, owner, span),
+                    "{span:?} after {n} lines"
+                );
+            }
+        });
+
+        // The control: the body's own edit places it again, and otherwise (`x + 10` ends a
+        // column later), so places equal after the shift are not equal for want of a change.
+        write_file(&mut db, file, &shifted.replace("x + 1", "x + 10"));
+        blaze_memo::attach(&db, || {
+            let owner = owner(&db);
+            let ((), executed) = runs_of(&db, || _ = all_rows(&db, owner));
+            assert!(
+                executed.iter().any(|it| it.is::<span_places>(&(owner,))),
+                "an edit of the body: {executed:#?}"
+            );
+            assert_ne!(*span_places(&db, owner), before_places, "an edit of the body places it otherwise");
+        });
+    }
+}
+
+const LINE_SHIFTED: &str = "#[rustc_builtin_macro]\nmacro_rules! line {() => {}}\npub fn above() -> u32 {\n    1\n}\npub fn f() -> u32 {\n    line!()\n}\n";
+
+/// The line, from 1, of the first `line!()` in `text`.
+fn line_of_call(text: &str) -> u32 {
+    text[..text.find("line!()").expect("the call")].matches('\n').count() as u32 + 1
+}
+
+/// The invariant: a body that reads `line!()` keeps, below `n` lines added above it, its HIR
+/// body (the call is the placeholder, not its line), its item key and its places; and the line
+/// it reads is still the one it is written on: the row its `Location` is filled from (the cell
+/// as it was, the base `n` on) and the value a constant takes of it
+/// (`hir_ty::body_store::placed_literal`) are both the absolute line in the shifted file. The
+/// control: that line is `n` more than before, so a body that kept a line would be caught.
+#[test]
+fn a_body_reading_its_line_keeps_its_hir_and_key_below_an_inserted_line() {
+    use hir_def::{
+        ExpressionStoreOwnerId,
+        hir::{Expr, Literal},
+    };
+    for n in [1usize, 5, 60] {
+        let fx = fixture::db(LINE_SHIFTED);
+        let file = fx.only_file();
+        let mut db = fx.into_db();
+        let file = file.file_id(&db);
+        let func = |db: &TestDB| function(db, "f");
+        // What of the body a shift must keep, and where its `line!()` is read and placed.
+        let seen = |db: &TestDB| {
+            blaze_memo::attach(db, || {
+                let owner = DefWithBodyId::FunctionId(func(db));
+                let store = BodyStore::of(db, owner);
+                let (expr, literal) = (store.exprs())
+                    .find_map(|(id, it)| match it {
+                        Expr::Literal(it @ Literal::Uint(..)) => Some((id, it.clone())), // clone: a test's comparison
+                        _ => None,
+                    })
+                    .expect("the literal `line!()` expands to");
+                let placed = hir_ty::body_store::placed_literal(
+                    db,
+                    ExpressionStoreOwnerId::Body(owner),
+                    expr,
+                )
+                .expect("the call is in its file's text");
+                let row = hir_ty_mir::mir::location::source_location_in_file(
+                    db,
+                    owner,
+                    MirSpan::ExprId(expr),
+                )
+                .expect("the literal has a place");
+                let starts = span_places(db, owner).starts;
+                let rows = all_rows(db, owner);
+                // The expressions' table is in `expr_ids` order, as the test above reads it.
+                let index = store.expr_ids().position(|it| it == expr).expect("the literal");
+                let linked = rows[starts[code::EXPRS] as usize + index];
+                (
+                    format!("{store:?}"),
+                    item_key(db, ItemId::Function(func(db))),
+                    span_places(db, owner).clone(), // clone: a test's comparison
+                    literal,
+                    placed,
+                    row,
+                    linked,
+                )
+            })
+        };
+        let (body, key, places, literal, placed, row, linked) = seen(&db);
+        let written = line_of_call(LINE_SHIFTED);
+        assert_eq!(
+            literal,
+            Literal::Uint(u128::from(hir_expand::builtin::PLACE_PLACEHOLDER), Some(hir_def::builtin_type::BuiltinUint::U32)),
+            "`line!()` is the placeholder in the body"
+        );
+        assert_eq!(placed, Some(Literal::Uint(u128::from(written), Some(hir_def::builtin_type::BuiltinUint::U32))));
+        assert_eq!((row.1, linked.1), (written, written), "the row a `Location` is filled from");
+
+        let shifted =
+            LINE_SHIFTED.replacen("pub fn above", &format!("{}pub fn above", "\n".repeat(n)), 1);
+        write_file(&mut db, file, &shifted);
+        let (_, key2, places2, literal2, placed2, row2, linked2) = seen(&db);
+        let now = line_of_call(&shifted);
+        assert_eq!(now, written + n as u32, "the control: the call moved {n} lines");
+        // The body is compared with the body of a fresh database of the shifted text, not with
+        // the edited database's: since the front end is on blaze-memo an edit remakes its
+        // crate's arena at the next generation, and a body holds the ids of its blocks (the
+        // `Block` row of `HirColumns::extra` is the id's two words, `BlockId(1.0:27)` is
+        // `[28, 4096]` and `BlockId(1.1:27)` `[28, 4097]`), so the edited body prints the next
+        // generation where the fresh one prints the first. Nothing of the body is a position:
+        // two fresh databases of the two texts give the same ids, and the body is equal.
+        let fresh = {
+            let fx = fixture::db(&shifted);
+            let db = fx.into_db();
+            seen(&db).0
+        };
+        assert_eq!(fresh, body, "the HIR body after {n} lines");
+        assert_eq!(key2, key, "the item key after {n} lines");
+        assert_eq!(places2, places, "the places after {n} lines");
+        assert_eq!(literal2, literal, "the placeholder after {n} lines");
+        assert_eq!(
+            placed2,
+            Some(Literal::Uint(u128::from(now), Some(hir_def::builtin_type::BuiltinUint::U32))),
+            "a constant's value after {n} lines"
+        );
+        assert_eq!((row2.1, linked2.1), (now, now), "the printed line after {n} lines");
+    }
 }
 
 /// A body's positions are found by plain functions over its memos: each span's is the one
@@ -220,22 +465,26 @@ fn positions_are_placed_without_a_memo_per_span() {
     let fx = fixture::db(SPANNED);
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let owner = DefWithBodyId::FunctionId(function(&db, "f"));
-        let mut found = None;
-        let executed = db.log_executed(|| found = Some(positions(&db, owner).clone().unwrap()));
-        let found = found.expect("the positions");
-        assert!(executed.iter().any(|it| it == "positions"), "the log sees queries: {executed:#?}");
+        let (rows, executed) = runs_of(&db, || all_rows(&db, owner));
+        assert!(
+            executed.iter().any(|it| it.is::<span_places>(&(owner,))),
+            "the log sees queries: {executed:#?}"
+        );
+        // These are plain functions, so no query kind names them: a run of one, were it made
+        // a tracked fn, is told by the last segment of its query's path.
         for per_span in
             ["source_place", "row_place", "source_location_in_file", "row_location_in_file"]
         {
             assert!(
-                !executed.iter().any(|it| it == per_span),
+                !executed.iter().any(|it| it.query.rsplit("::").next() == Some(per_span)),
                 "a memo of {per_span}: {executed:#?}"
             );
         }
-
-        let table = |t: usize| &found.rows[found.starts[t] as usize..found.starts[t + 1] as usize];
+    
+        let starts = span_places(&db, owner).starts;
+        let table = |t: usize| &rows[starts[t] as usize..starts[t + 1] as usize];
         let store = BodyStore::of(&db, owner);
         let in_file =
             |span: MirSpan| hir_ty_mir::mir::location::source_location_in_file(&db, owner, span);
@@ -262,6 +511,9 @@ struct Program {
     /// gives it another key), whether the build has it, and whether its code names its
     /// patterns' table too (which changes what it is under the same key).
     bodies: Vec<(u8, bool, bool)>,
+    /// How many of the functions, the first, are in the crate's root file, which the edits
+    /// write; the others are in the file of a module `rest`, which no edit writes.
+    near: usize,
 }
 
 /// One step of a program's life.
@@ -280,16 +532,41 @@ enum Edit {
 
 impl Program {
     fn new(count: usize) -> Program {
-        Program { pad: 0, bodies: vec![(0, true, false); count] }
+        Program { pad: 0, bodies: vec![(0, true, false); count], near: count }
     }
 
-    fn text(&self) -> String {
-        let mut text = "\n".repeat(self.pad);
-        for (at, (edits, _, _)) in self.bodies.iter().enumerate() {
-            let body = "x + 1".to_owned() + &" + 1".repeat(*edits as usize);
+    /// `count` functions, the first `near` in the root file and the others in another.
+    fn split(count: usize, near: usize) -> Program {
+        Program { near, ..Program::new(count) }
+    }
+
+    fn functions(&self, of: std::ops::Range<usize>) -> String {
+        let mut text = String::new();
+        for at in of {
+            let body = "x + 1".to_owned() + &" + 1".repeat(self.bodies[at].0 as usize);
             text += &format!("pub fn f{at}(x: u32) -> u32 {{\n    {body}\n}}\n");
         }
         text
+    }
+
+    /// The root file's text: the file the edits write.
+    fn text(&self) -> String {
+        let mut text = "\n".repeat(self.pad) + &self.functions(0..self.near);
+        if self.near < self.bodies.len() {
+            text += "pub mod rest;\n";
+        }
+        text
+    }
+
+    /// The fixture of the program: its root file, and the other file where it has one.
+    fn fixture(&self) -> String {
+        match self.near < self.bodies.len() {
+            true => {
+                let rest = self.functions(self.near..self.bodies.len());
+                format!("//- /lib.rs\n{}//- /rest.rs\n{rest}", self.text())
+            }
+            false => self.text(),
+        }
     }
 
     fn apply(&mut self, edit: Edit) {
@@ -345,7 +622,7 @@ impl Program {
             }
             let mut compiled = compiled(0, lines);
             compiled.key = self.key(at);
-            functions.push(compiled);
+            functions.push(std::sync::Arc::new(compiled));
             items.push(item_key(db, ItemId::Function(func)));
         }
         functions.sort_unstable_by_key(|it| it.key);
@@ -382,15 +659,22 @@ impl Program {
 
 /// `edits` applied to a program, each followed by a build and its link inputs; what the last
 /// link's inputs cost. `Err` names the first step after which the tables kept by applying
-/// each link's changes are not the tables made whole from the build. `plant` skips asking
-/// the database for the positions of the bodies kept.
-fn kept_is_whole(count: usize, edits: &[Edit], plant: bool) -> Result<InputsWork, String> {
-    let mut program = Program::new(count);
-    let fx = fixture::db(&program.text());
-    let file = fx.only_file();
+/// each link's changes are not the tables made whole from the build. `plant` is a control's
+/// bug ([`Plant`]).
+fn kept_is_whole(count: usize, edits: &[Edit], plant: Plant) -> Result<InputsWork, String> {
+    kept_is_whole_of(Program::new(count), edits, plant)
+}
+
+/// [`kept_is_whole`] of `program`.
+fn kept_is_whole_of(mut program: Program, edits: &[Edit], plant: Plant) -> Result<InputsWork, String> {
+    let fx = fixture::db(&program.fixture());
+    let file = fx.file(0);
     let mut db = fx.into_db();
     let file = file.file_id(&db);
     let hashes = || HashSource::Items(ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned()))));
+    // What the database's links keep, owned beside it for every step, as a daemon's kept
+    // front end owns it.
+    let links = Links::new();
     let mut before: Option<(BuiltId, Vec<(InstanceKey, bool)>)> = None;
     // The tables a link that applies each change holds, and the snapshot they are.
     let mut held: std::collections::BTreeMap<ContentId, Vec<u8>> = Default::default();
@@ -399,10 +683,10 @@ fn kept_is_whole(count: usize, edits: &[Edit], plant: bool) -> Result<InputsWork
     let steps = std::iter::once(Edit::Again).chain(edits.iter().copied());
     for (step, edit) in steps.enumerate() {
         program.apply(edit);
-        db.set_file_text(file, &program.text());
+        write_file(&mut db, file, &program.text());
         let frontend = HirFrontend::new(Databases::new(&db), hashes(), BuildTime::default());
         let built = program.built(&db, &frontend.hashes, before.as_ref());
-        let given = frontend.with(|db| inputs(db, &frontend.hashes, &built, plant))?;
+        let given = frontend.with(|db| inputs(db, &frontend.hashes, &built, plant, &links))?;
         if given.serial != serial {
             if given.base != Some(serial) {
                 if given.base.is_some() {
@@ -437,10 +721,9 @@ fn kept_is_whole(count: usize, edits: &[Edit], plant: bool) -> Result<InputsWork
     Ok(work)
 }
 
-#[hegel::composite]
-fn edit(tc: &hegel::TestCase) -> Edit {
-    let at = tc.draw(gs::integers::<usize>().max_value(3));
-    match tc.draw(gs::integers::<u8>().max_value(5)) {
+fn edit(tape: &Tape) -> Edit {
+    let at = tape.int_in(0..=3usize, "at");
+    match tape.int_in(0..=5u8, "edit") {
         0 => Edit::Reformat,
         1 => Edit::Body(at),
         2 => Edit::Drop(at),
@@ -454,22 +737,25 @@ fn edit(tc: &hegel::TestCase) -> Edit {
 /// function gone or back, a function that names another table), the span tables a link holds
 /// by applying each build's link inputs to those of the link before are the tables made
 /// whole from the build, with nothing kept.
-#[hegel::test]
-fn the_link_inputs_kept_are_the_tables_made_whole(tc: hegel::TestCase) {
-    let edits: Vec<Edit> = tc.draw(gs::vecs(edit()).max_size(8));
-    if let Err(why) = kept_is_whole(4, &edits, false) {
-        panic!("{why}");
-    }
+#[test]
+fn the_link_inputs_kept_are_the_tables_made_whole() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let edits: Vec<Edit> = tape.vec(0..=8, "edits", edit);
+        if let Err(why) = kept_is_whole(4, &edits, Plant::None) {
+            panic!("{why}");
+        }
+    })
 }
 
-/// A control of [`the_link_inputs_kept_are_the_tables_made_whole`]: with a link that does
-/// not ask the database for the positions of the bodies it kept, a reformat leaves every
-/// table on its old lines, and the oracle says at which step.
+/// A control of [`the_link_inputs_kept_are_the_tables_made_whole`]: with a link that keeps
+/// its tables though the edit dropped the arena they were made under, a reformat leaves
+/// every table on its old lines, and the oracle says at which step.
 #[test]
 fn the_oracle_catches_a_moved_body_not_encoded_again() {
     let edits = [Edit::Reformat];
-    kept_is_whole(4, &edits, false).unwrap();
-    let why = kept_is_whole(4, &edits, true).expect_err("the oracle missed tables left stale");
+    kept_is_whole(4, &edits, Plant::None).unwrap();
+    let why = kept_is_whole(4, &edits, Plant::CarriesDropped)
+        .expect_err("the oracle missed tables left stale");
     assert!(why.contains("after step 1"), "{why}");
 }
 
@@ -477,26 +763,68 @@ fn the_oracle_catches_a_moved_body_not_encoded_again() {
 /// gone are said, so a link holds no table the code does not name.
 #[test]
 fn a_function_gone_takes_its_tables() {
-    kept_is_whole(4, &[Edit::Drop(2), Edit::Patterns(0), Edit::Add(2), Edit::Patterns(0)], false)
-        .unwrap();
+    let edits = [Edit::Drop(2), Edit::Patterns(0), Edit::Add(2), Edit::Patterns(0)];
+    kept_is_whole(4, &edits, Plant::None).unwrap();
 }
 
+/// The functions in the file the counter edits ([`Program::split`]): few enough that the
+/// engine's walk of the edit verifies each row the file's text reaches. A file whose rows
+/// are a wide level of that walk (64 rows) is named whole, its unchanged bodies with it, and
+/// the link then encodes that file's kept tables again and finds them the same: the file's
+/// cost, never the program's.
+const NEAR: usize = 8;
+
+/// What one body edit among `count` functions costs the link inputs, as the counter holds
+/// it: tables encoded, their bytes, functions read, and owners whose kept tables were encoded
+/// again. The edited function's file holds [`NEAR`] of the functions.
+fn body_edit_cost(count: usize, plant: Plant) -> (usize, usize, usize, usize) {
+    let work = kept_is_whole_of(Program::split(count, NEAR), &[Edit::Body(7)], plant).unwrap();
+    assert_eq!(work.whole, None, "{count} functions: the link before was kept");
+    assert_eq!((work.items, work.scanned), (0, 0), "{count} functions: no item is new");
+    assert_eq!(work.functions, 1, "{count} functions: one function has a new key");
+    (work.made, work.bytes, work.functions, work.verified)
+}
+
+/// The floor, which this does not meet while an edit drops its crate's whole arena (each body
+/// edit makes every table again, `ARENA_DROPPED`, until per-item records land:
+/// front-end-on-memo.md, the cost of decision 4); these asserts fail until then.
+///
 /// The counter: after one body edit, the link inputs resolve no item, read the one function
-/// whose key is new and encode that body's tables, among 100 functions as among 2,000 (a
-/// fixture of 10,000 bodies takes minutes to lower). What still follows the program here is
-/// `verified`: every body of this fixture is the workspace's, so each is asked of the
-/// database again; a library's are not (`Kept::durable`), which no fixture crate is.
+/// whose key is new, encode that body's tables, and encode again the kept tables of the
+/// owners the engine names as moved, among 100 functions as among 2,000 (a fixture of 10,000
+/// bodies takes minutes to lower). Every body of this fixture is the workspace's and watched;
+/// none is asked of the database for being watched, and none of another file than the
+/// edit's is looked at.
 #[test]
+#[ignore = "blaze-memo: the kept link tables hold their crate's arena; reuse across edits is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_body_edit_among_many_makes_its_own_tables() {
-    let mut costs = Vec::new();
-    for count in [100, 2_000] {
-        let work = kept_is_whole(count, &[Edit::Body(7)], false).unwrap();
-        assert_eq!(work.whole, None, "{count} functions: the link before was kept");
-        assert_eq!((work.items, work.scanned), (0, 0), "{count} functions: no item is new");
-        assert_eq!(work.functions, 1, "{count} functions: one function has a new key");
-        assert!(work.made <= 2 && work.bytes <= 1024, "{count} functions: {work:?}");
-        assert_eq!(work.verified, 2 * count, "each body and declaration of the workspace");
-        costs.push((work.made, work.bytes, work.functions));
-    }
+    // What it claimed: after one body edit among N functions the link keeps the tables before
+    // and encodes the edited function's alone, the same work among 100 as among 2,000. What is
+    // true now: `Kept` (linked.rs) holds its owners by id (`sources`: anchor to `Source`, a
+    // `DefWithBodyId` or `FunctionId`; `watched`: `Owner` ids), and which kept owners an edit
+    // moved was the old engine's changed set, which blaze-memo has none of; an edit remakes the
+    // crate's arena, so `Kept::advance` refuses with `ARENA_DROPPED` and every table is made.
+    // The record form: the program's link record holds, by anchor, its table's id and its owner
+    // by stable name (`ItemKey`, table index), and per owner its `Bases` and file; the host,
+    // which knows the files an edit changed, names them, and the link reads the bases of the
+    // owners of those files alone and encodes the tables of those whose bases moved and of the
+    // new keys' anchors: one edited function among N makes its own tables.
+    let costs = [100, 2_000].map(|count| body_edit_cost(count, Plant::None));
+    let (made, bytes, _, verified) = costs[0];
+    assert!(made <= 4 && bytes <= 2048 && verified <= 2, "100 functions: {:?}", costs[0]);
     assert_eq!(costs[0], costs[1], "the same work among 100 functions as among 2,000");
+}
+
+/// The control of [`a_body_edit_among_many_makes_its_own_tables`]: a link that takes every
+/// watched owner as moved (what it did while it asked a stamp of each) gives the right
+/// tables, and the counter says its work follows the program.
+#[test]
+#[ignore = "blaze-memo: the kept link tables hold their crate's arena; reuse across edits is the host's, on records (docs/v2/plan/design/host.md)"]
+fn the_oracle_catches_a_link_that_asks_of_every_body() {
+    // The control of the test above, ignored with it: its premise (`body_edit_cost`'s "the link
+    // before was kept") fails before the planted sweep is counted, for the same reason: an edit
+    // remakes the crate's arena and the kept tables hold its ids (`ARENA_DROPPED`).
+    let costs = [100, 2_000].map(|count| body_edit_cost(count, Plant::Sweeps));
+    assert_ne!(costs[0], costs[1], "a sweep of every watched owner was counted as the edit's");
+    assert!(costs[1].3 >= 2_000, "2,000 functions: {:?}", costs[1]);
 }

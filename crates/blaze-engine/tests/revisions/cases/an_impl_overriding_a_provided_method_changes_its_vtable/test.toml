@@ -1,0 +1,11 @@
+about = "An impl given its own copy of a method its trait provides: its vtable's slot names the impl's method where it named the trait's, so the function that coerces to the `dyn` is made again under another identity, never found in the store under the old one with other bytes (rule keys-cover-every-input)."
+drivers = ["sim", "real"]
+
+[[revision]]
+action = "run"
+prints = "0\n"
+
+[[revision]]
+action = "run"
+prints = "4\n"
+redone_has = ["<app::Square as app::Shape>::sides"]

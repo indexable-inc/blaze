@@ -16,6 +16,7 @@
 //! `message` are rustc's.
 
 mod calls;
+pub mod comptime;
 mod qualifs;
 mod stability;
 
@@ -51,7 +52,7 @@ use super::{
     framed::{Bits, bits_in},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConstCheckDiagnostic {
     pub kind: ConstCheckKind,
     /// The const context of the body the error is in, which rustc's messages name.
@@ -67,7 +68,7 @@ pub struct ConstCheckDiagnostic {
 /// `ConditionallyConstCall`: the callee is const when its `[const]` bounds hold, which they do,
 /// and calling it needs `#![feature(const_trait_impl)]` (`E0658`); otherwise the callee is not
 /// const (`FnCallNonConst`, `E0015`).
-#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConstCheckKind {
     /// `RawPtrToIntCast`.
     PointerToInt,
@@ -156,7 +157,7 @@ pub enum ConstCheckKind {
 }
 
 /// rustc's `NonConstClosureNote`: what the closure called is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClosureNote {
     FnDef(CallableDefId),
     FnPtr,
@@ -165,7 +166,7 @@ pub enum ClosureNote {
 }
 
 /// rustc's `CallDesugaringKind`, of the desugarings a const context can have.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Desugaring {
     ForLoopIntoIter,
     ForLoopNext,
@@ -328,7 +329,7 @@ impl fmt::Display for TypeName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConstCheck {
     pub diagnostics: Vec<ConstCheckDiagnostic>,
 }
@@ -375,7 +376,7 @@ pub(crate) fn of_a_trait(db: &Db, func: FunctionId) -> bool {
 }
 
 /// What rustc's const checker reports in `def`'s body, when it is a const context.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn const_check<'db>(db: &'db Db, def: DefWithBodyId) -> ConstCheck {
     let Some(context) = const_context(db, def) else { return ConstCheck::default() };
     if let DefWithBodyId::FunctionId(func) = def
@@ -390,7 +391,7 @@ pub fn const_check<'db>(db: &'db Db, def: DefWithBodyId) -> ConstCheck {
 /// count, a const generic argument or default, an enum discriminant's or a `const { .. }`
 /// block. rustc checks each as a body of its own, a `const` (`ConstContext::Const`), whatever
 /// the body it is written in is.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn anon_const_check<'db>(db: &'db Db, konst: AnonConstId<'db>) -> ConstCheck {
     // blaze: a `const static { .. }` block (`#![feature(blaze_comptime)]`) is evaluated with no
     // const checking; the evaluator refuses what cannot run at compile time.
@@ -659,14 +660,17 @@ impl<'a, 'db> Checker<'a, 'db> {
 
     /// Whether `span` is of something written in the source, not of what lowering made. Asked
     /// last, of what would be reported: a body with nothing to report is checked without
-    /// building its source map.
+    /// building its source map. An expression's is the store's fact
+    /// ([`ExpressionStore::is_synthesized`]); only a pattern's reads the map.
+    #[expect(
+        blaze::reads_positions,
+        reason = "whether a pattern was written is read off the source map: the store must keep its \
+                  synthesized patterns as it keeps its synthesized expressions (`is_synthesized`)"
+    )]
     fn written(&self, span: MirSpan) -> bool {
-        let source_map = || self.source_map();
         match span {
-            MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => {
-                source_map().expr_syntax(expr).is_ok()
-            }
-            MirSpan::PatId(pat) => source_map().pat_syntax(pat).is_ok(),
+            MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => !self.store.is_synthesized(expr),
+            MirSpan::PatId(pat) => self.source_map().pat_syntax(pat).is_ok(),
             MirSpan::BindingId(_) | MirSpan::SelfParam => true,
             MirSpan::Unknown | MirSpan::Inlined(_) => false,
         }
@@ -674,22 +678,22 @@ impl<'a, 'db> Checker<'a, 'db> {
 
     /// The source map of the store the body's expressions are in: the body's own, or for an
     /// anonymous constant the store of the body or signature it is written in.
+    #[expect(
+        blaze::reads_positions,
+        reason = "`const_check` reads the store's source map for a pattern's being written and a call's \
+                  wording: both must be facts of the store, or worded by a marked reporter outside the check"
+    )]
     fn source_map(&self) -> &'db ExpressionStoreSourceMap {
         ExpressionStore::with_source_map(self.db, self.owner.expression_store_owner(self.db)).1
     }
 }
 
 /// Whether `func` is written with `#[rustc_do_not_const_check]`, whose body rustc does not
-/// check: core's `panic!` makes such a `const fn` in the body it is written in.
+/// check: core's `panic!` makes such a `const fn` in the body it is written in. Read from the
+/// item's attributes (`cfg_attr` expanded), not the file's live parse, so an edit of a body
+/// elsewhere in the file does not run `const_check` again.
 fn not_const_checked(db: &Db, func: FunctionId) -> bool {
-    use hir_def::src::HasSource;
-    use syntax::view::HasAttrs;
-    let source = func.lookup(db).ast_ptr(db);
-    source
-        .value
-        .to_view(source.file_id.root(db))
-        .attrs()
-        .any(|attr| attr.simple_name() == Some("rustc_do_not_const_check"))
+    hir_def::attrs::AttrFlags::has_word(db, func.into(), "rustc_do_not_const_check")
 }
 
 /// Whether a call of `func` in a const context is one rustc does not refuse as a call of a
@@ -699,12 +703,12 @@ fn not_const_checked(db: &Db, func: FunctionId) -> bool {
 /// otherwise callable only when it is declared `const`, as the nightly declares the others const
 /// eval runs (`atomic_load` and the rest of the atomics, `transmute`, ..).
 ///
-/// A comptime function called from a `const fn` is accepted too, where rustc may refuse it: this
-/// check reports only what rustc reports.
+/// Where a comptime function may be called is not this check's: a `const fn` may not call one
+/// outside a `const { .. }` block, which [`comptime::comptime_calls`] reports, of every function.
 fn is_const_callable(db: &Db, func: FunctionId) -> bool {
     FunctionSignature::of(db, func).is_const()
         || of_a_trait(db, func)
-        || hir_def::attrs::AttrFlags::has_word(db, func.into(), "rustc_comptime")
+        || comptime::is_comptime(db, func)
 }
 
 /// How rustc's message names the function called: `function`, `method` or `associated

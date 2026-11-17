@@ -20,6 +20,8 @@
  *   done something.
  * - On by default; the lesson's top bar has the switch (`blaze.sound`). All storage is wrapped, since it can be
  *   missing.
+ * - The intro's soundtrack (client/lib/intro-sound.ts) shares the switch, the context and the output (`unlock`), so
+ *   the site has one of each.
  *
  * Under client/lib/ (not bundled as an entry).
  */
@@ -44,11 +46,19 @@ function write(key: string, v: string) {
 let on = read(KEY) !== 'off';
 export const enabled = () => on;
 
-export function setEnabled(v: boolean) {
+/** Turns the site's sound on or off. Off suspends the context, after `fade` seconds when something is fading out. */
+export function setEnabled(v: boolean, fade = 0) {
 	on = v;
 	write(KEY, v ? 'on' : 'off');
 	if (v) unlock();
-	else if (live?.ctx instanceof AudioContext) void live.ctx.suspend().catch(() => {});
+	else if (live?.ctx instanceof AudioContext) {
+		const ctx = live.ctx;
+		const rest = () => {
+			if (!on) void ctx.suspend().catch(() => {});
+		};
+		if (fade > 0) setTimeout(rest, fade * 1000);
+		else rest();
+	}
 }
 
 // ---------- The key ----------
@@ -65,7 +75,7 @@ const D5 = 10;
 
 // ---------- The output: compressor, rooms, voices ----------
 
-type Out = {
+export type Out = {
 	ctx: BaseAudioContext;
 	bus: GainNode;
 	room: GainNode;
@@ -94,7 +104,8 @@ function impulse(ctx: BaseAudioContext, seconds: number, gap: number): AudioBuff
 /** Peak target: the output gain is set so the loudest sound lands near -14 dBFS (measured with an OfflineAudioContext). */
 const OUTPUT = 0.265;
 
-function output(ctx: BaseAudioContext): Out {
+/** The output on `ctx`: what `unlock` makes on the page's context, and what a level is measured through offline. */
+export function output(ctx: BaseAudioContext): Out {
 	const comp = ctx.createDynamicsCompressor();
 	comp.threshold.value = -16;
 	comp.knee.value = 10;
@@ -322,8 +333,8 @@ let live: Out | null = null;
 
 type AudioCtor = typeof AudioContext;
 
-/** Makes or resumes the context. Call it from inside a gesture's handler. */
-function unlock(): Out | null {
+/** Makes or resumes the context, and gives the output on it. Call it from inside a gesture's handler. */
+export function unlock(): Out | null {
 	if (!on) return null;
 	try {
 		if (!live) {

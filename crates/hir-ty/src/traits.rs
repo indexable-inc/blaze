@@ -54,7 +54,7 @@ impl<'db> ParamEnvAndCrate<'db> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub struct StoredParamEnvAndCrate {
     param_env: StoredClauses,
     pub krate: Crate,
@@ -84,7 +84,7 @@ pub fn structurally_normalize_ty<'db>(
     ty.replace_infer_with_error(infcx.interner)
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, blaze_query::Value)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, blaze_memo::Home)]
 pub enum FnTrait {
     // Warning: Order is important. If something implements `x` it should also implement
     // `y` if `y <= x`.
@@ -460,8 +460,9 @@ pub fn is_inherent_impl_coherent(db: &Db, def_map: &DefMap, impl_id: ImplId) -> 
     inherent_impl_coherent(db, impl_id, def_map.krate(), def_map.is_rustc_coherence_is_core())
 }
 
-#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
-fn inherent_impl_coherent(
+// `pub`: a query kind tests above this crate name (`blaze_items`' narrowing tests).
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
+pub fn inherent_impl_coherent(
     db: &Db,
     impl_id: ImplId,
     krate: Crate,
@@ -574,8 +575,8 @@ pub fn check_orphan_rules<'db>(db: &'db Db, impl_: ImplId) -> bool {
     orphan_rules_hold(db, impl_)
 }
 
-#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
-fn orphan_rules_hold(db: &Db, impl_: ImplId) -> bool {
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
+pub fn orphan_rules_hold(db: &Db, impl_: ImplId) -> bool {
     check_orphan_rules_uncached(db, impl_)
 }
 
@@ -812,7 +813,7 @@ pub fn param_is_sized(db: &Db, impl_: ImplId, param: TypeParamId) -> bool {
 /// reach is checked) gets them run alone when this holds (`hir::check::check_sealed`), and
 /// for a graph with no `#[blaze::sealed]` anywhere this is the one thing asked. Tracked per
 /// crate, so a graph costs one [`declares_sealed`] per crate, once.
-#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
 pub fn sealed_in_graph(db: &Db, krate: Crate) -> bool {
     declares_sealed(db, krate)
         || krate.data(db).dependencies.iter().any(|dep| sealed_in_graph(db, dep.crate_id))
@@ -822,12 +823,17 @@ pub fn sealed_in_graph(db: &Db, krate: Crate) -> bool {
 /// one in a body's block that a relaxed impl there leans on (an impl in a block with a sealed
 /// bound, [`sealed_bounds`]; a block's trait no impl outside the block can name). Reads each
 /// module-level trait's attributes and the crate's impl table ([`TraitImpls::for_crate`],
-/// which holds the impls of bodies' blocks too).
+/// which holds the impls of bodies' blocks too). A crate read from impl table pages has the
+/// answer in their header, written by this query when the pages were: one read, no module
+/// scope and no table decoded.
 ///
 /// [`TraitImpls::for_crate`]: crate::method_resolution::TraitImpls::for_crate
-#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
 pub fn declares_sealed(db: &Db, krate: Crate) -> bool {
     let _p = tracing::info_span!(target: "blaze", "declares_sealed", ?krate).entered();
+    if crate::method_resolution::frozen::served(db, krate) {
+        return crate::method_resolution::frozen::pages::declares_sealed(db, krate);
+    }
     let in_modules = hir_def::nameres::crate_def_map(db, krate).modules(db).any(|(_, module)| {
         module.scope(db).declarations().any(|def| {
             matches!(def, hir_def::ModuleDefId::TraitId(it)
@@ -843,7 +849,7 @@ pub fn declares_sealed(db: &Db, krate: Crate) -> bool {
 }
 
 /// Why a `#[blaze::sealed]` trait is not closed over its crate's local types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SealedOpen {
     /// An auto trait: the solver implements it for types no impl names.
     Auto,
@@ -867,7 +873,7 @@ pub fn sealed_closure(db: &Db, trait_: TraitId) -> Result<(), SealedOpen> {
     sealed_closure_query(db, trait_)
 }
 
-#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
 fn sealed_closure_query(db: &Db, trait_: TraitId) -> Result<(), SealedOpen> {
     let _p = tracing::info_span!(target: "blaze", "sealed_closure", ?trait_).entered();
     if TraitSignature::of(db, trait_).flags.contains(TraitFlags::AUTO) {

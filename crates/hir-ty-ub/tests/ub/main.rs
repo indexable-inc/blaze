@@ -130,7 +130,7 @@ fn run_with(fixture: &str, config: &Config) -> Outcome {
     let fx = fixture::db(fixture);
     let file = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || run_test(&db, main_of(&db, file), config))
+    blaze_memo::attach(&db, || run_test(&db, main_of(&db, file), config))
 }
 
 fn run(fixture: &str) -> Outcome {
@@ -164,7 +164,7 @@ fn main_mir(fixture: &str) -> String {
     let fx = fixture::db(fixture);
     let file = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let main = main_of(&db, file);
         let env = ParamEnvAndCrate {
             param_env: db.trait_environment(main.into()),
@@ -1192,7 +1192,7 @@ fn main() {
     let fx = fixture::db(fixture);
     let file = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let main = main_of(&db, file);
         let (plain, plain_out, _) = run_function(&db, main, Plain);
         let checker: Checker<'_> = Checker::new(8, &Config::default(), 0);
@@ -1385,7 +1385,7 @@ fn sites_are_interned_densely() {
     let fx = fixture::db(program!("sized", "fn main() {}\n"));
     let file = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let owner = InferBodyId::DefWithBodyId(main_of(&db, file).into());
         let a = Site { owner, span: MirSpan::Unknown };
         let b = Site { owner, span: MirSpan::SelfParam };

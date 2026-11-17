@@ -138,7 +138,7 @@ self type live; `#[derive(Clone)]` and `#[derive(Debug)]` impls read nothing.
 ### Cost
 
 Per linted unit, one more run of the dead-code pass (numbering, seeds, marking, report) over
-the crate, reading what its check inferred, still in the front end (`Goal::Check` lets go of
+the crate, reading what its check inferred, still in the front end (`JobKind::Check` lets go of
 nothing, `release.rs`), plus one walk of the code that configuration does not use and one scan
 of its files' syntax for `#[cfg]`s that are false. The merge is a sort of every keyed item of
 the package and linear passes; the fix check is linear in the reference pairs times the nesting

@@ -4,6 +4,14 @@
 //! answer's header). An answer's Arrow IPC is [`frame::answer_bytes`]'s: arrow's IPC writer keys
 //! its dictionaries in a `HashMap` of `RandomState`, OS randomness a core does not reach.
 //!
+//! For the same reason the core makes no `serde_json::Map` and parses no `serde_json::Value`:
+//! where a crate of the build turns on serde_json's `preserve_order`, a `Map` is an `IndexMap`
+//! seeded from OS randomness. A header the core writes is a typed value serialized field by
+//! field ([`HelloHeader`], [`LiveHeader`], [`CertHeader`], [`CoreHeader`],
+//! [`super::source::ErrorHeader`]), so its bytes are the same in every build; of a request the
+//! core reads what it decides on (its `op`, a hello's token), and the driver, which holds the
+//! request's bytes, parses them whole for the source.
+//!
 //! - **Hello first.** A session's first good request is `hello` with the link's token: until
 //!   then every other op is answered `unauthenticated`. A wrong token is answered `bad_token`
 //!   and the session closed with [`CLOSE_BAD_TOKEN`]. After hello every op but `hello` is the
@@ -23,12 +31,15 @@
 
 use std::time::Duration;
 
-use serde_json::{Map, Value};
+use serde::{
+    de::{Deserialize, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor},
+    ser::{Serialize, SerializeMap, SerializeSeq, Serializer},
+};
 
 use super::{
     PROTOCOL, frame,
     link::Token,
-    source::{Answer, Hello, Kind, OpError, Rule, Table, Tick},
+    source::{Answer, ErrorHeader, Hello, Kind, Layer, OpError, Rule, Table, Tick},
     wasm::CoreWasm,
 };
 
@@ -95,8 +106,9 @@ pub enum Step {
     /// `hello` with the token: answer [`hello_header`]. `first` is the session's first good
     /// hello, after which the driver opens the live stream.
     Hello { first: bool },
-    /// Op `name`, which the source answers ([`super::Source::op`]), `args` the request whole.
-    Op { name: String, args: Value },
+    /// Op `name`, which the source answers ([`super::Source::op`]) with the request whole: a
+    /// JSON object, which the driver parses from the bytes it gave [`Session::request`].
+    Op { name: String },
     /// `core`: answer [`core_bytes`], the explorer core the server serves.
     Core,
     /// Answer the error; the session goes on.
@@ -140,16 +152,16 @@ impl Session {
 
     /// What to do with `bytes`, a request stream's whole request, given the server's `token`.
     pub fn request(&mut self, token: &Token, bytes: &[u8]) -> Step {
-        let (op, value) = match parse(bytes) {
+        let (op, request) = match parse(bytes) {
             Ok(it) => it,
             Err(why) => return Step::Refuse(why),
         };
         if op == "hello" {
-            return self.hello(token, &value);
+            return self.hello(token, &request);
         }
         match self.phase {
             Phase::Open if op == "core" => Step::Core,
-            Phase::Open => Step::Op { name: op, args: value },
+            Phase::Open => Step::Op { name: op },
             Phase::Hello => Step::Refuse(OpError::new(
                 Kind::Unauthenticated,
                 "the first request of a session is hello with the link's token",
@@ -158,8 +170,8 @@ impl Session {
         }
     }
 
-    fn hello(&mut self, token: &Token, value: &Value) -> Step {
-        let given = match token_of(value) {
+    fn hello(&mut self, token: &Token, request: &Request) -> Step {
+        let given = match token_of(request) {
             Ok(it) => it,
             Err(why) => {
                 return Step::Refuse(
@@ -191,30 +203,159 @@ fn closed() -> OpError {
     OpError::new(Kind::Unauthenticated, "the session is closed: its hello had a bad token")
 }
 
-/// The request in `bytes`: its op and the whole object.
-fn parse(bytes: &[u8]) -> Result<(String, Value), OpError> {
-    let value: Value = serde_json::from_slice(bytes)
+/// The request in `bytes`: its op, and what the session reads of it.
+fn parse(bytes: &[u8]) -> Result<(String, Request), OpError> {
+    let mut request: Request = serde_json::from_slice(bytes)
         .map_err(|why| OpError::new(Kind::BadArgs, format!("the request is not JSON: {why}")))?;
-    let op = match value.get("op") {
-        // clone: once a request, its op's name
-        Some(Value::String(op)) => op.clone(),
-        _ => return Err(OpError::new(Kind::BadArgs, "the request has no string `op`")),
-    };
-    Ok((op, value))
+    match request.op.take() {
+        Some(Given::Text(op)) => Ok((op, request)),
+        _ => Err(OpError::new(Kind::BadArgs, "the request has no string `op`")),
+    }
 }
 
 /// The token of a `hello`: its one field beside `op`.
-fn token_of(value: &Value) -> Result<&str, String> {
-    let Value::Object(fields) = value else {
-        return Err("the request is not a JSON object".to_owned()); // alloc: an error path
-    };
-    if let Some(extra) = fields.keys().find(|it| !matches!(it.as_str(), "op" | "token")) {
+fn token_of(request: &Request) -> Result<&str, String> {
+    if let Some(extra) = &request.extra {
         return Err(format!("unknown field `{extra}`, expected `token`"));
     }
-    match fields.get("token") {
-        Some(Value::String(token)) => Ok(token),
-        Some(other) => Err(format!("`token` is {other}, not a string")),
+    match &request.token {
+        Some(Given::Text(token)) => Ok(token),
+        Some(Given::Other(what)) => Err(format!("`token` is {what}, not a string")),
         None => Err("missing field `token`".to_owned()), // alloc: an error path
+    }
+}
+
+/// What the session reads of a request: its `op`, a hello's `token`, and the first field that
+/// is neither, which a hello may not have. Any JSON but an object reads as a request with no
+/// `op`. The request's other fields are the source's, which is given the request whole by the
+/// driver: nothing of them is kept here.
+#[derive(Debug, Default)]
+struct Request {
+    op: Option<Given>,
+    token: Option<Given>,
+    extra: Option<String>,
+}
+
+/// What a field the session reads holds: its text, or what else it is, for the error.
+#[derive(Debug)]
+enum Given {
+    Text(String),
+    Other(&'static str),
+}
+
+impl<'de> Deserialize<'de> for Request {
+    fn deserialize<D: Deserializer<'de>>(from: D) -> Result<Request, D::Error> {
+        struct Read;
+
+        impl<'de> Visitor<'de> for Read {
+            type Value = Request;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a request: a JSON object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Request, A::Error> {
+                let mut request = Request::default();
+                // alloc: once a field of a request, its name
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "op" => request.op = Some(map.next_value()?),
+                        "token" => request.token = Some(map.next_value()?),
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                            request.extra.get_or_insert(key);
+                        }
+                    }
+                }
+                Ok(request)
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Request, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(Request::default())
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Request, E> {
+                Ok(Request::default())
+            }
+
+            fn visit_i64<E>(self, _: i64) -> Result<Request, E> {
+                Ok(Request::default())
+            }
+
+            fn visit_u64<E>(self, _: u64) -> Result<Request, E> {
+                Ok(Request::default())
+            }
+
+            fn visit_f64<E>(self, _: f64) -> Result<Request, E> {
+                Ok(Request::default())
+            }
+
+            fn visit_str<E>(self, _: &str) -> Result<Request, E> {
+                Ok(Request::default())
+            }
+
+            fn visit_unit<E>(self) -> Result<Request, E> {
+                Ok(Request::default())
+            }
+        }
+
+        from.deserialize_any(Read)
+    }
+}
+
+impl<'de> Deserialize<'de> for Given {
+    fn deserialize<D: Deserializer<'de>>(from: D) -> Result<Given, D::Error> {
+        struct Read;
+
+        impl<'de> Visitor<'de> for Read {
+            type Value = Given;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+
+            fn visit_str<E>(self, text: &str) -> Result<Given, E> {
+                // alloc: once a request, its op's name or its token
+                Ok(Given::Text(text.to_owned()))
+            }
+
+            fn visit_string<E>(self, text: String) -> Result<Given, E> {
+                Ok(Given::Text(text))
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Given, E> {
+                Ok(Given::Other("a boolean"))
+            }
+
+            fn visit_i64<E>(self, _: i64) -> Result<Given, E> {
+                Ok(Given::Other("a number"))
+            }
+
+            fn visit_u64<E>(self, _: u64) -> Result<Given, E> {
+                Ok(Given::Other("a number"))
+            }
+
+            fn visit_f64<E>(self, _: f64) -> Result<Given, E> {
+                Ok(Given::Other("a number"))
+            }
+
+            fn visit_unit<E>(self) -> Result<Given, E> {
+                Ok(Given::Other("null"))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Given, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(Given::Other("a list"))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Given, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(Given::Other("an object"))
+            }
+        }
+
+        from.deserialize_any(Read)
     }
 }
 
@@ -263,62 +404,103 @@ pub struct Served {
 
 /// The header of `hello`: the source's fields, the certificate served, the live stream's
 /// period, and the core's `protocol` beside the source's `layers`.
-pub fn hello_header(
-    hello: &Hello,
-    served: &Served,
+pub fn hello_header<'a>(
+    hello: &'a Hello,
+    served: &'a Served,
     live_every: Duration,
-    core: Option<&CoreWasm>,
-) -> Map<String, Value> {
-    let mut source = Map::new();
-    // alloc: once a session
-    source.insert("kind".to_owned(), hello.kind.into());
-    // alloc: once a session
-    source.insert("extensions".to_owned(), hello.extensions.iter().copied().collect());
-    let layers: Value = hello
-        .layers
-        .iter()
-        .map(|layer| {
-            let mut it = Map::new();
-            // alloc: once a session
-            it.insert("name".to_owned(), layer.name.into());
-            // alloc: once a session
-            it.insert("version".to_owned(), layer.version.into());
-            Value::Object(it)
-        })
-        .collect();
-    let header = [
-        ("op", Value::from("hello")),
-        ("daemon", hello.daemon.as_str().into()),
-        ("schema", hello.schema.into()),
-        ("clock", hello.clock.into()),
-        ("now_ns", hello.now_ns.into()),
-        ("certhash", served.hash.as_str().into()),
-        ("cert_not_after_unix_s", served.not_after_s.into()),
-        ("live_every_ms", (live_every.as_millis() as u64).into()),
-        ("source", Value::Object(source)),
-        ("protocol", PROTOCOL.into()),
-        ("layers", layers),
-    ];
-    // alloc: once a session
-    let mut header: Map<String, Value> =
-        header.into_iter().map(|(key, value)| (key.to_owned(), value)).collect();
-    if let Some(core) = core {
-        // alloc: once a session
-        header.insert("core".to_owned(), core_header(core).into());
+    core: Option<&'a CoreWasm>,
+) -> HelloHeader<'a> {
+    HelloHeader { hello, served, live_every, core }
+}
+
+/// [`hello_header`]: `op`, `daemon`, `schema`, `clock`, `now_ns`, `certhash`,
+/// `cert_not_after_unix_s`, `live_every_ms`, `source: {kind, extensions}`, `protocol`,
+/// `layers: [{name, version}]`, and `core` ([`CoreHeader`]) from a server that serves one.
+#[derive(Clone, Copy, Debug)]
+pub struct HelloHeader<'a> {
+    hello: &'a Hello,
+    served: &'a Served,
+    live_every: Duration,
+    core: Option<&'a CoreWasm>,
+}
+
+impl Serialize for HelloHeader<'_> {
+    fn serialize<S: Serializer>(&self, to: S) -> Result<S::Ok, S::Error> {
+        let HelloHeader { hello, served, live_every, core } = *self;
+        let mut map = to.serialize_map(Some(11 + usize::from(core.is_some())))?;
+        map.serialize_entry("op", "hello")?;
+        map.serialize_entry("daemon", &hello.daemon)?;
+        map.serialize_entry("schema", &hello.schema)?;
+        map.serialize_entry("clock", hello.clock)?;
+        map.serialize_entry("now_ns", &hello.now_ns)?;
+        map.serialize_entry("certhash", &served.hash)?;
+        map.serialize_entry("cert_not_after_unix_s", &served.not_after_s)?;
+        map.serialize_entry("live_every_ms", &(live_every.as_millis() as u64))?;
+        map.serialize_entry("source", &SourceHeader(hello))?;
+        map.serialize_entry("protocol", &PROTOCOL)?;
+        map.serialize_entry("layers", &Layers(hello.layers))?;
+        if let Some(core) = core {
+            map.serialize_entry("core", &CoreHeader { core, op: false })?;
+        }
+        map.end()
     }
-    header
+}
+
+/// hello's `source`: `{kind, extensions}`.
+struct SourceHeader<'a>(&'a Hello);
+
+impl Serialize for SourceHeader<'_> {
+    fn serialize<S: Serializer>(&self, to: S) -> Result<S::Ok, S::Error> {
+        let mut map = to.serialize_map(Some(2))?;
+        map.serialize_entry("kind", self.0.kind)?;
+        map.serialize_entry("extensions", self.0.extensions)?;
+        map.end()
+    }
+}
+
+/// hello's `layers`: `[{name, version}]`.
+struct Layers<'a>(&'a [Layer]);
+
+impl Serialize for Layers<'_> {
+    fn serialize<S: Serializer>(&self, to: S) -> Result<S::Ok, S::Error> {
+        struct One<'a>(&'a Layer);
+
+        impl Serialize for One<'_> {
+            fn serialize<S: Serializer>(&self, to: S) -> Result<S::Ok, S::Error> {
+                let mut map = to.serialize_map(Some(2))?;
+                map.serialize_entry("name", self.0.name)?;
+                map.serialize_entry("version", &self.0.version)?;
+                map.end()
+            }
+        }
+
+        let mut seq = to.serialize_seq(Some(self.0.len()))?;
+        for layer in self.0 {
+            seq.serialize_element(&One(layer))?;
+        }
+        seq.end()
+    }
 }
 
 /// What `hello` and the `core` answer say of a core: its ABI, the hex SHA-256 of its bytes and
-/// how many there are.
-fn core_header(core: &CoreWasm) -> Map<String, Value> {
-    let fields = [
-        ("abi", Value::from(core.abi)),
-        ("sha256", core.sha256.as_str().into()),
-        ("bytes", core.bytes.len().into()),
-    ];
-    // alloc: once a session, or a `core` answer
-    fields.into_iter().map(|(key, value)| (key.to_owned(), value)).collect()
+/// how many there are; and `op: "core"` after them in the `core` answer's own header.
+#[derive(Clone, Copy, Debug)]
+pub struct CoreHeader<'a> {
+    core: &'a CoreWasm,
+    op: bool,
+}
+
+impl Serialize for CoreHeader<'_> {
+    fn serialize<S: Serializer>(&self, to: S) -> Result<S::Ok, S::Error> {
+        let mut map = to.serialize_map(Some(3 + usize::from(self.op)))?;
+        map.serialize_entry("abi", &self.core.abi)?;
+        map.serialize_entry("sha256", &self.core.sha256)?;
+        map.serialize_entry("bytes", &self.core.bytes.len())?;
+        if self.op {
+            map.serialize_entry("op", "core")?;
+        }
+        map.end()
+    }
 }
 
 /// The `core` answer's bytes: a header naming the core (`op`, `abi`, `sha256`, `bytes`), then
@@ -330,12 +512,9 @@ pub fn core_bytes(core: &Result<CoreWasm, String>) -> Vec<u8> {
         // clone: an error path
         Err(why) => return error_bytes(&OpError::new(Kind::NoCore, why.clone()).with("op", "core")),
     };
-    let mut header = core_header(core);
-    // alloc: once a `core` answer
-    header.insert("op".to_owned(), "core".into());
     // alloc: once a `core` answer, the bytes the driver writes
     let mut out = Vec::with_capacity(core.bytes.len() + 256);
-    head(&mut out, &header);
+    head(&mut out, &CoreHeader { core, op: true });
     out.extend_from_slice(&core.bytes);
     out
 }
@@ -383,37 +562,55 @@ impl Feed {
 }
 
 /// The header of `table`'s frame of `tick`, which has `rows`.
-pub fn live_header(table: &str, rows: usize, tick: &Tick) -> Map<String, Value> {
-    let header = [
-        ("op", Value::from("live")),
-        ("table", table.into()),
-        ("rows", rows.into()),
-        ("at_ns", tick.at_ns.into()),
-        ("skipped", tick.skipped.into()),
-        ("lost", tick.lost.into()),
-    ];
-    // alloc: a live frame's header, a few a tick
-    header.into_iter().map(|(key, value)| (key.to_owned(), value)).collect()
+pub fn live_header<'a>(table: &'a str, rows: usize, tick: &Tick) -> LiveHeader<'a> {
+    LiveHeader { table, rows, at_ns: tick.at_ns, skipped: tick.skipped, lost: tick.lost }
+}
+
+/// [`live_header`]: `op: "live"`, `table`, `rows`, `at_ns`, `skipped`, `lost`.
+#[derive(Clone, Copy, Debug)]
+pub struct LiveHeader<'a> {
+    table: &'a str,
+    rows: usize,
+    at_ns: i64,
+    skipped: u64,
+    lost: u64,
+}
+
+impl Serialize for LiveHeader<'_> {
+    fn serialize<S: Serializer>(&self, to: S) -> Result<S::Ok, S::Error> {
+        let mut map = to.serialize_map(Some(6))?;
+        map.serialize_entry("op", "live")?;
+        map.serialize_entry("table", self.table)?;
+        map.serialize_entry("rows", &self.rows)?;
+        map.serialize_entry("at_ns", &self.at_ns)?;
+        map.serialize_entry("skipped", &self.skipped)?;
+        map.serialize_entry("lost", &self.lost)?;
+        map.end()
+    }
 }
 
 /// The header of a tick that failed: its error, `op: live`.
-pub fn live_error_header(error: &OpError) -> Map<String, Value> {
-    let mut header = error.header();
-    // alloc: an error path
-    header.insert("op".to_owned(), "live".into());
-    header
+pub fn live_error_header(error: &OpError) -> ErrorHeader<'_> {
+    error.header().with_op("live")
 }
 
 /// The header of the live stream's `cert` frame: the certificate was made anew.
-pub fn cert_header(served: &Served) -> Map<String, Value> {
-    let mut header = Map::new();
-    // alloc: every 12 days
-    header.insert("op".to_owned(), "cert".into());
-    // alloc: every 12 days
-    header.insert("certhash".to_owned(), served.hash.as_str().into());
-    // alloc: every 12 days
-    header.insert("not_after_unix_s".to_owned(), served.not_after_s.into());
-    header
+pub fn cert_header(served: &Served) -> CertHeader<'_> {
+    CertHeader(served)
+}
+
+/// [`cert_header`]: `op: "cert"`, `certhash`, `not_after_unix_s`.
+#[derive(Clone, Copy, Debug)]
+pub struct CertHeader<'a>(&'a Served);
+
+impl Serialize for CertHeader<'_> {
+    fn serialize<S: Serializer>(&self, to: S) -> Result<S::Ok, S::Error> {
+        let mut map = to.serialize_map(Some(3))?;
+        map.serialize_entry("op", "cert")?;
+        map.serialize_entry("certhash", &self.0.hash)?;
+        map.serialize_entry("not_after_unix_s", &self.0.not_after_s)?;
+        map.end()
+    }
 }
 
 /// What the core adds to an answer's header: `rows` when it has a table, and `elapsed_ns`.
@@ -448,8 +645,9 @@ pub fn hello_bytes(
     out
 }
 
-/// [`frame::head`] of a header that is a JSON map of strings to JSON values, which serde_json
-/// always writes.
-fn head(out: &mut Vec<u8>, header: &Map<String, Value>) {
-    frame::head(out, header).expect("a JSON map always serializes");
+/// [`frame::head`] of one of the core's typed headers: an object of strings, integers and
+/// lists and objects of them (an error's detail holds JSON values), which serde_json always
+/// writes.
+fn head<H: Serialize>(out: &mut Vec<u8>, header: &H) {
+    frame::head(out, header).expect("a header of strings and integers always serializes");
 }

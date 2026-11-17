@@ -1,0 +1,11 @@
+{
+ "id": "edit3-8",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+ "where": "blaze's tests under cargo on macOS",
+ "what": "blaze-core's test target did not compile (`kqueue::tests::the_memory_pressure_filter_is_there` called `poll` with a `Duration`), and blaze-cas's `place_made::a_made_output_is_placed_with_no_clone_and_no_wait_for_a_write_back` failed before it tested anything: its generator drew two runs at offset 0 for a patch of a 1-byte file, which the place refuses as no file (found with the prewarm removed too; not run on the untouched base).",
+ "cost": "half an hour to tell them from this lane's changes",
+ "cause": "tests that are not run under cargo on macOS in any gate",
+ "workaround": "none",
+ "state": "fixed in 9c279f4ef0 and 6fb586a779; five more of blaze-cas and six of blaze-cargo's `serve` and five of its `cli` fail here as the rows before say (edit2-5, disk-4, disk-12)"
+}

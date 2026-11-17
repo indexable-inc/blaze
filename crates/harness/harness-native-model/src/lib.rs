@@ -152,6 +152,10 @@ pub struct Ended {
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct Unfolded;
 
+/// On a device: its header is collapsed. Ephemeral view state, independent of session folds; devices start expanded.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct DeviceCollapsed;
+
 /// On an object: the user killed it with cmd+W (or the palette's or menu's Kill). It leaves the tree for the sidebar's
 /// Archive, where it stays selectable; an object that ended on its own stays in the tree.
 #[derive(Component, Clone, Copy, Debug, Default)]
@@ -190,6 +194,14 @@ pub struct AgentModel {
     pub s: ScriptString,
     /// The reasoning effort it runs with (the daemon's `effort`; empty when unknown).
     pub effort: ScriptString,
+}
+
+/// A session's latest context usage, supplied by the daemon's list without subscribing to full chat events.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AgentContext {
+    pub used: u64,
+    pub window: u64,
+    pub updated_ms: u64,
 }
 
 /// On a run: it came from a page of older history (the Archive's), so the poll's window does not drop it.
@@ -408,6 +420,7 @@ pub fn register(world: &World) {
     world.component::<StageNo>().writable();
     world.component::<Ended>().writable();
     world.component::<Unfolded>();
+    world.component::<DeviceCollapsed>();
     world.component::<Archived>();
     world.component::<Closed>();
     world.component::<Pinned>();
@@ -416,6 +429,7 @@ pub fn register(world: &World) {
     world.component::<Past>();
     world.component::<ChatMode>();
     world.component::<AgentModel>().writable();
+    world.component::<AgentContext>().writable();
     world.component::<Paged>();
     world.component::<ArchiveView>();
     world.component::<ArchiveAfter>().writable();
@@ -541,7 +555,7 @@ pub fn install(world: WorldRef<'_>, host: &str, sock: &str, mail: Mailbox) -> (T
 }
 
 /// The session fields [`reconcile`] reads.
-const LIST_KEYS: &[&str] = &["id", "kind", "status", "exit", "name", "title", "cwd", "created_ms", "ended_ms", "parent", "busy", "mode", "model", "past"];
+const LIST_KEYS: &[&str] = &["id", "kind", "status", "exit", "name", "label", "title", "cwd", "created_ms", "ended_ms", "parent", "busy", "mode", "model", "effort", "context", "past"];
 /// The run fields [`reconcile_runs`] reads, and each stage's.
 const RUN_KEYS: &[&str] = &["id", "status", "exit_code", "cmd", "cwd", "start_ms", "end_ms", "session", "owner"];
 const STAGE_KEYS: &[&str] = &["status", "exit_code", "text", "start_ms", "end_ms"];
@@ -932,6 +946,15 @@ fn reconcile(w: WorldRef<'_>, dev: u64, by_id: &mut HashMap<u64, u64>, sessions:
         if e.try_cloned::<&AgentModel>().is_none_or(|m| m.s.as_str() != model || m.effort.as_str() != effort) {
             e.set(AgentModel { s: model.into(), effort: effort.into() });
         }
+        let context = s.get("context").and_then(|c| Some(AgentContext {
+            used: c.get("used")?.as_u64()?, window: c.get("window")?.as_u64()?,
+            updated_ms: c.get("updated_ms").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        }));
+        match context {
+            Some(context) if e.try_cloned::<&AgentContext>() != Some(context) => { e.set(context); }
+            None if e.has(AgentContext::id()) => { e.remove(AgentContext::id()); }
+            _ => {}
+        }
         let past = s["past"].as_bool().unwrap_or(false);
         if e.has(Past::id()) != past {
             if past {
@@ -1065,6 +1088,9 @@ impl<'a> Walk<'a> {
             || c.try_cloned::<&Ended>().is_some_and(|t| t.ms > self.since)
     }
     fn walk(&mut self, e: EntityView<'_>, depth: usize) {
+        // A device's fold hides the whole group, including the selected session and its agents. Its own header is
+        // outside this walk, and all objects keep their individual fold and runtime state.
+        if e.has(Device::id()) && folded(e) { return; }
         let all = depth == 0;
         let folded = !all && !e.has(Unfolded::id());
         let mut kids: Vec<(u8, u64, u64)> = Vec::new();
@@ -1097,7 +1123,8 @@ pub struct Row {
 }
 
 /// The sidebar's rows: sessions, their runs and stages in tree order (siblings by start, stages by index, a sub-agent
-/// that sleeps after those at work). The device's sessions always show; under a session or run only the selected one
+/// that sleeps after those at work). An expanded device shows its sessions; a collapsed device shows no descendants.
+/// Under a session or run only the selected one
 /// (and its parent) until the person opens it ([`Unfolded`]), then the live ones: running, with something running under
 /// them, ended less than [`Linger`] ago, and the selected one. So what finished shows its mark a moment, then folds
 /// away, and the tree lists what is live.
@@ -1178,21 +1205,24 @@ pub fn archive_view(world: WorldRef<'_>) -> u64 {
     *world.lookup(ARCHIVE).id()
 }
 
-/// Fold `e` (its chevron closed: none of its children show in the tree, as every node starts) or open it (its live
-/// ones do).
+/// Fold `e` or open it. A device fold hides its entire group, independent of descendant folds; sessions and runs
+/// keep the selected child visible when folded and show their live children when opened.
 pub fn set_folded(world: WorldRef<'_>, e: u64, folded: bool) {
     let e = world.entity_from_id(e);
-    if !folded {
+    if e.has(Device::id()) {
+        if folded { e.add(DeviceCollapsed::id()); }
+        else if e.has(DeviceCollapsed::id()) { e.remove(DeviceCollapsed::id()); }
+    } else if !folded {
         e.add(Unfolded::id());
     } else if e.has(Unfolded::id()) {
         e.remove(Unfolded::id());
     }
 }
 
-/// Whether `e` is folded: its chevron closed, as every node starts until the person opens it.
+/// Whether `e` is folded: devices start expanded; sessions and runs start folded until their chevron is opened.
 #[must_use]
 pub fn folded(e: EntityView<'_>) -> bool {
-    !e.has(Unfolded::id())
+    if e.has(Device::id()) { e.has(DeviceCollapsed::id()) } else { !e.has(Unfolded::id()) }
 }
 
 /// How many of folded `e`'s children are at work (running and not a sub-agent asleep between turns, or with something

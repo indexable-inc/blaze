@@ -1,0 +1,64 @@
+//! blaze's launcher under the `edit` goal, step 2 (docs/v2/plan/design/launcher.md): the
+//! drivers. `blaze-launch` decides; this crate does.
+//!
+//! | module | what |
+//! |---|---|
+//! | [`sys`] | memory that code runs from and one thread writes: macOS `MAP_JIT` with the thread's write switch, Linux a memfd mapped twice; a thread's stack bounds |
+//! | [`arch`] | the launcher's own machine code, AArch64 and x86-64: a gate's entry, the lazy stubs, the resolver |
+//! | [`table`] | what a program thread touches: the slot words, the published epoch, a stub's wait for code, a safepoint's report of the thread's own stack |
+//! | [`drive`] | [`Driver`]: the core over real memory, each `Write` carried out in order; an edit as one transaction |
+//! | [`control`] | the control thread: the patch protocol over a Unix socket, the stubs' needs, the threads' reports |
+//! | [`records`] | [`Loaded`]: the records the daemon sends, checked against their ids; the program's data and statics in a mapping of their own; outside symbols by `dlsym` |
+//! | [`tls`] | the program's thread-locals: a table a thread, a copy made on first touch, reached through a record's pool |
+//! | [`threads`] | the program's own threads told to the core: its `pthread_create` announces each birth, a key's destructor each end |
+//! | [`symbols`] | the names of placed code where the program's own backtrace looks: one more image of `dl_iterate_phdr`, whose file is a symbol table (Linux) |
+//! | [`unwind`] | a placed function's unwind entry, told to the system's unwinder and taken back when the body is freed |
+//!
+//! Who touches what, which is the whole of the design's safety:
+//!
+//! - **The control thread** owns the [`Driver`] and is the only writer of code, words, gate
+//!   flags and the epoch. Code is written only where nothing can be running (ranges the core
+//!   handed out and no word names yet); a word, a flag and the epoch are each one aligned
+//!   atomic store.
+//! - **A program thread** loads a word and jumps (machine code), waits in a stub, and reports
+//!   its own stack. It writes nothing the control thread reads but the queue.
+//!
+//! Not built here, each named where it is missing: the scan of a thread from outside
+//! (`thread_suspend`, a signal), so a thread that never reaches a safepoint holds every batch;
+//! thread-locals on x86-64 (`tls`); `Probe` and `Restart`. The crate is on
+//! `std`, not bstd, for the reason blaze-launch's documentation gives.
+//!
+//! Built for AArch64 macOS and for x86-64 and AArch64 Linux; on any other target the crate is
+//! empty, so nothing can ask it for a launcher it does not have.
+
+#![cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+))]
+#![feature(allocator_api)]
+// `#![blaze::trust]` below names blaze's tool; inert under rustc.
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::trust(
+    unsafe,
+    reason = "a launcher runs code it placed itself: memory that code runs from (`MAP_JIT`, a memfd mapped twice), its own machine code (gates, stubs, the resolver), slot words and thread-locals the program's threads read, `dlsym` and the system's unwinder; the control thread is the only writer, and writes code only where nothing can be running"
+)]
+
+pub mod arch;
+pub mod control;
+pub mod drive;
+pub mod records;
+pub mod symbols;
+pub mod sys;
+pub mod table;
+pub mod threads;
+pub mod tls;
+pub mod unwind;
+
+#[cfg(test)]
+mod tests;
+
+pub use control::{ControlError, Start, run};
+pub use drive::{Config, Driver, EditError, Error, Place, REACH, Records};
+pub use records::Loaded;
+pub use table::{Birth, Bound, Event, Mutator, Shared, Told};

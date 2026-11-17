@@ -5,7 +5,7 @@
 //! - a page joins one with `Nav {label, order}`, `Icon` and `(InGroup, nav.<section>)`;
 //! - a `Link {label, href, order}` child of a section is a row that goes elsewhere (another site, or an anchor);
 //! - a page's RFCs (`World::rfcs`, by number) are its row's kids, folded under a caret;
-//! - a page holding a `Course` (the home page) is followed by its lessons, numbered, each with a progress mark that
+//! - a page holding a `Course` (the course map) is followed by its lessons, numbered, each with a progress mark that
 //!   client/side.ts fills from the reader's progress;
 //! - a page holding an `UpdateLog` (What's new) carries the keys of the course's updates, and client/side.ts shows
 //!   how many are new since the reader's last visit and not yet studied;
@@ -237,6 +237,15 @@ pub fn hover_picture(world: &World, site: Id, served: &Served) -> String {
     )
 }
 
+/// The logo's still frame, the word already burning: what the front door shows until client/intro.ts draws it live
+/// (and all it shows without JS). Without `Brand`'s still files it is the animated logo.
+pub fn still_picture(world: &World, site: Id, served: &Served) -> String {
+    if field(world.get(site), "Brand", "still_dark").is_empty() {
+        return picture(world, site, served, "logo", "");
+    }
+    picture_of(world, site, served, ("still_dark", "still_light"), "logo", "")
+}
+
 /// The logo from `Brand`'s two file fields `keys` (dark, light).
 fn picture_of(
     world: &World,
@@ -349,6 +358,12 @@ pub fn sidebar(groups: &[Group], page: &Page, served: &Served, world: &World, si
         close = svg("close"),
         search = svg("search"),
     )
+}
+
+/// The bar at the top of the page column on a wide screen: the button that shuts the sidebar for more room to read
+/// (client/side.ts, which shows it; keep.ts shuts the sidebar again before the first paint). A phone has the drawer.
+pub fn topline() -> String {
+    "<div class=\"topline\"><button type=\"button\" class=\"tl-btn tl-side\" data-side-toggle hidden aria-pressed=\"false\" aria-label=\"Hide the sidebar\"><svg viewBox=\"0 0 16 16\" aria-hidden=\"true\"><rect x=\"2\" y=\"3\" width=\"12\" height=\"10\" rx=\"2\"/><path d=\"M6.5 3v10\"/></svg></button></div>".to_string()
 }
 
 /// The phone bar above the page: Menu (opens the drawer, `#menu`), the logo, search.

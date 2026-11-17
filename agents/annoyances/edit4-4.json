@@ -1,0 +1,11 @@
+{
+ "id": "edit4-4",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit4-1111",
+ "where": "the lane's VM: timings after the first measurement",
+ "what": "The same base binary measured 66 ms a body edit in its first run on the VM (07:16) and 260 to 370 ms in every run after (place 15 ms to 80-125, `memory purge` 5.6 ms to 96, CPU-bound spans 1.3 to 1.8 times longer), alone on the machine with fresh homes. `dd oflag=dsync` and file creates were as fast as before; `/proc/pressure/io` said 99% the whole time, with one idle daemon.",
+ "cost": "every end-to-end row after the first is of a slow machine: the before and after here are compared as pairs run back to back, and the edit-loop rows are not comparable with other lanes'",
+ "cause": "not found. The VM was made as the brief said, with no `--memory-commit` and no `--cpu` class; dmesg shows virtio-mem adding memory in 50 ms steps while two daemons ran; io pressure may be the daemons' io_uring waits counted as iowait",
+ "workaround": "A/B back to back (`/root/ab.sh`), spans of CPU-bound stages, counts and bytes in place of wall time",
+ "state": "open: a lane that measures edit loops needs a benchmark VM (`--memory-commit`, a `--cpu` class), and the brief should say so"
+}

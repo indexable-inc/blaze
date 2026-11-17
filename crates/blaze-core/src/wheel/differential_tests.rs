@@ -4,8 +4,7 @@
 //! copy's tests, moved.
 
 use blaze_ids::rng::SplitMix64;
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
 use super::{Handle, Wheel};
 
@@ -198,17 +197,16 @@ enum Op {
 }
 
 /// Below one of `ends`, picked evenly, so every wheel level is reached.
-fn below(tc: &TestCase, ends: [u64; 4]) -> u64 {
-    let end = ends[tc.draw(gs::integers::<usize>().max_value(3))];
-    tc.draw(gs::integers().max_value(end - 1))
+fn below(tape: &Tape, ends: [u64; 4], label: &'static str) -> u64 {
+    let end = ends[tape.int_in(0..=3usize, "level")];
+    tape.int_in(0..=end - 1, label)
 }
 
-#[hegel::composite]
-fn op(tc: &TestCase) -> Op {
-    match tc.draw(gs::integers::<u8>().max_value(8)) {
-        0..4 => Op::Insert(below(tc, [64, 70_000, 4_000_000, 1 << 40])),
-        4..6 => Op::Cancel(tc.draw(gs::integers())),
-        _ => Op::Advance(below(tc, [3, 5_000, 3_600_000, 1 << 41])),
+fn op(tape: &Tape) -> Op {
+    match tape.int_in(0..=8u8, "op") {
+        0..4 => Op::Insert(below(tape, [64, 70_000, 4_000_000, 1 << 40], "due after")),
+        4..6 => Op::Cancel(tape.int("cancel at")),
+        _ => Op::Advance(below(tape, [3, 5_000, 3_600_000, 1 << 41], "advance by")),
     }
 }
 
@@ -216,10 +214,14 @@ fn op(tc: &TestCase) -> Op {
 /// when a timer is due), cancels and advances: both fire the same timers at each advance,
 /// this wheel in deadline then insertion order; its soonest deadline is the earliest set,
 /// at or past the queue wheel's next expiry.
-#[hegel::test]
-fn the_queue_wheel_and_this_one_fire_alike(tc: TestCase) {
-    let start: u64 = tc.draw(gs::integers().max_value((1 << 42) - 1));
-    let ops = tc.draw(gs::vecs(op()).min_size(1).max_size(299));
+#[test]
+fn the_queue_wheel_and_this_one_fire_alike() {
+    blaze_sim::check(Config::DEFAULT, |tape| the_wheels_fire_alike(tape));
+}
+
+fn the_wheels_fire_alike(tape: &Tape) {
+    let start: u64 = tape.int_in(0..=(1 << 42) - 1, "start");
+    let ops = tape.vec(1..=299, "ops", op);
     let mut wheel: Wheel<u64> = starting_at(start);
     let mut old: queue::Wheel<u64> = queue::Wheel::new(start);
     let mut now = start;

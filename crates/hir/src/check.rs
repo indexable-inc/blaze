@@ -20,7 +20,7 @@
 pub mod bodies;
 
 use base_db::Db;
-use hir_def::{DefWithBodyId, GenericDefId, Lookup, nameres::crate_def_map};
+use hir_def::{DefWithBodyId, GenericDefId, Lookup};
 
 use self::bodies::Plan;
 use crate::{
@@ -42,10 +42,9 @@ pub fn workspace_crates(db: &Db) -> Vec<Crate> {
 /// The modules of `krate` a check takes one at a time: every module but the inline ones, which
 /// are checked with the module they are written in, in the def map's order.
 pub fn file_modules(db: &Db, krate: Crate) -> Vec<Module> {
-    crate_def_map(db, krate.id)
-        .modules(db)
-        .filter(|(_, data)| !data.origin.is_inline())
-        .map(|(id, _)| Module { id })
+    bodies::crate_file_modules(db, krate.id)
+        .iter()
+        .map(|&id| Module { id })
         // alloc: once a crate, its result, a word per file module
         .collect()
 }
@@ -195,7 +194,7 @@ pub fn check_crates<'db>(
     crates: &[Crate],
     style_lints: bool,
 ) -> Vec<(Crate, Vec<AnyDiagnostic<'db>>)> {
-    let found = Plan::of_every_body(db, crates).run(db, style_lints);
+    let found = Plan::of_every_body(db, crates, style_lints).run(db, style_lints);
     // alloc: once a check, its result, a pair per crate
     crates.iter().copied().zip(found).collect()
 }

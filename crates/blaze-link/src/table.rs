@@ -76,6 +76,10 @@ pub(crate) fn stub_fixups(arch: Arch) -> &'static [StubFixup] {
 }
 
 /// Writes the stub of `slot` into `out`, [`stub_size`] bytes; its fixups are [`stub_fixups`].
+#[expect(
+    blaze::narrowed_len,
+    reason = "the x86-64 stub's displacement is the slot's offset (slot * 8) in u32, and nothing caps the slots of a table below 2^29: that needs a typed refusal where slots are given out"
+)]
 pub(crate) fn write_stub(arch: Arch, slot: u32, out: &mut [u8]) {
     let offset = u64::from(slot) * 8;
     match arch {

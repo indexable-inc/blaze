@@ -1,0 +1,11 @@
+{
+ "id": "disk-11",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane disk-1111",
+ "where": "cargo: one CARGO_TARGET_DIR for two worktrees",
+ "what": "A second worktree of the same tree built into the same target directory (to get a baseline of the tests) left its `blaze-profile` there, and cargo then took it as fresh for the lane's worktree: blaze-cargo's tests failed to compile against the base's blaze-profile (`cannot find value DETAIL_VAR`), with nothing saying the artifact was another tree's. The first sign was an empty result file.",
+ "cost": "one wrong test run and 20 minutes",
+ "cause": "the unit's directory under `debug/build/<package>/<hash>` has the same hash for both worktrees, and freshness is by modification time",
+ "workaround": "removed the base worktree and touched the changed crates' roots",
+ "state": "open: a baseline needs its own target directory, which the disk had no room for"
+}

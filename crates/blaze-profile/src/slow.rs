@@ -57,7 +57,7 @@ pub use render::{problems_text, text, thread_line};
 /// each stretch of the critical path of [`GAP_NS`] or more under no span, with its thread, the
 /// spans before and after it, and the stacks sampled in it; and the finding `unfinished` (fix
 /// `compare_after`) of a build that did the work its checkout's last, failed build left.
-pub const VERSION: u32 = 9;
+pub const VERSION: u32 = 10;
 
 /// The least stretch of the critical path under no span that is listed as a gap
 /// ([`Report::gaps`]): 20 ms, the bound the daemon's loop holds one step of a turn to
@@ -229,6 +229,9 @@ pub struct Facts {
     pub thread_cpu: Vec<ThreadCpu>,
     pub memory: Memory,
     pub recorder: Recorder,
+    /// The build's account (`accounts`): none in a history from before the table, or when the
+    /// history's writer lost the build's end.
+    pub account: Option<crate::account::AccountRow>,
     /// Which of the build's spans the model read ([`crate::time::load::SPAN_BUDGET`]).
     pub spans: crate::time::SpanCut,
 }
@@ -373,6 +376,57 @@ pub struct Report {
     pub gaps: Vec<Gap>,
     /// What the profile could not see, most time hidden first.
     pub blind_spots: Vec<BlindSpot>,
+    /// The build's account: the change it saw, the work it did by cause, and what the account
+    /// warns of. None when the history holds no account of the build.
+    pub account: Option<Accounted>,
+}
+
+/// A build's account as a report says it ([`crate::account`]).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Accounted {
+    /// The account in one line ([`crate::account::Account::line`]).
+    pub line: String,
+    /// Each alarm's name ([`crate::account::Alarm::name`]) and its warning in words.
+    pub warnings: Vec<Warning>,
+    /// Work with no recorded cause: steps `blaze why` cannot explain and rows no cause counts.
+    /// Must be 0.
+    pub unexplained: u64,
+    /// Rows run for a change or verified, for each input written from outside; none when
+    /// nothing was written.
+    pub rows_per_write: Option<f64>,
+    /// Steps made again for a change, for each changed input; none when nothing changed.
+    pub steps_per_change: Option<f64>,
+    /// Rows the history could not write since the daemon began.
+    pub history_dropped: u64,
+}
+
+/// One warning of a build's account: the alarm's name and what it says.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Warning {
+    pub name: String,
+    pub says: String,
+}
+
+impl Accounted {
+    /// The account of `row`, a build's `accounts` row.
+    pub fn of(row: &crate::account::AccountRow) -> Accounted {
+        let account = row.clone().account(); // clone: a row, once a report
+        let outside = row.written_source + row.written_environment + row.written_plan;
+        Accounted {
+            line: account.line(),
+            // alloc: once a report
+            warnings: account
+                .alarms()
+                .iter()
+                .map(|it| Warning { name: it.name().to_owned(), says: it.text(row.build_id) })
+                .collect(),
+            unexplained: row.by_unexplained + row.by_unstable + row.ran_uncaused,
+            rows_per_write: (outside > 0)
+                .then(|| (row.ran_changed + row.verified) as f64 / outside as f64),
+            steps_per_change: (row.changes > 0).then(|| row.caused() as f64 / row.changes as f64),
+            history_dropped: row.history_dropped,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -668,6 +722,7 @@ pub fn analyse(model: &Model, path: &Path, facts: &Facts) -> Report {
         findings,
         gaps: ctx.gaps(),
         blind_spots: blind,
+        account: facts.account.as_ref().map(Accounted::of),
     }
 }
 
@@ -1006,7 +1061,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// Waits by what they wait for, charged by the critical path; and the blind spots of waits
-    /// that name nothing or no owner.
+    /// that name nothing or whose owner the path could not cross to.
     fn waits(&self, out: &mut Vec<Finding>) -> Vec<BlindSpot> {
         let model = self.model;
         #[derive(Default)]
@@ -1023,6 +1078,9 @@ impl<'a> Ctx<'a> {
             /// Its waits' spans were under the floor the model read from ([`crate::time::SpanCut`]).
             under_floor: bool,
             moved: bool,
+            /// Who its waits say ends them (`spans.owned_by`), the first that says: what an
+            /// ownerless class is told to do about it.
+            by: Option<blaze_graph::wait::OwnedBy>,
         }
         // alloc: once a report
         let mut of_wait = vec![0i64; model.waits.len()];
@@ -1100,6 +1158,7 @@ impl<'a> Ctx<'a> {
             class.named |= named;
             class.under_floor |= under_floor;
             class.moved |= wait.on == Some(crate::flight::WaitedOn::Moved);
+            class.by = class.by.or(wait.span.and_then(|it| model.spans[it].owned_by));
             if let Some(lane) = wait.waker.lane() {
                 class.known += 1;
                 let at = wait.ready_ns.or(wait.resumed_ns).unwrap_or(wait.parked_ns);
@@ -1173,7 +1232,8 @@ impl<'a> Ctx<'a> {
                     subject: name.clone(),
                     // clone: its evidence, also the finding's
                     evidence: evidence.clone(),
-                    fix: "set the wait's `owner` (the job running the key, the lock's holder) so the critical path can cross it".to_owned(),
+                    // alloc: a blind spot's fix, once a class a report
+                    fix: ownerless_fix(class.by).to_owned(),
                 });
             }
             let (saves, estimate) = match (on_path > 0, self.path_trusted) {
@@ -1359,7 +1419,7 @@ impl<'a> Ctx<'a> {
                     title: format!("evicted: `{}` ran {} times for values evicted earlier in the build", it.query, it.evicted_asked),
                     // clone: a finding's subject
                     subject: it.query.clone(),
-                    owner: Some("blaze_query".to_owned()),
+                    owner: Some("blaze_memo".to_owned()),
                     evidence: vec![
                         format!(
                             "{} runs, {} verified; {} values let go under their tag's budget, {} dropped",
@@ -1383,7 +1443,7 @@ impl<'a> Ctx<'a> {
                     ),
                     // clone: a finding's subject
                     subject: it.query.clone(),
-                    owner: Some("blaze_query".to_owned()),
+                    owner: Some("blaze_memo".to_owned()),
                     evidence: vec![format!("{} runs, {} verified", it.executed, it.verified), per],
                 });
             }
@@ -1401,7 +1461,7 @@ impl<'a> Ctx<'a> {
                     ),
                     // clone: a finding's subject
                     subject: it.query.clone(),
-                    owner: Some("blaze_query".to_owned()),
+                    owner: Some("blaze_memo".to_owned()),
                     evidence: vec![format!(
                         "flagged past {} reads one run or {} reads recorded a read kept (with {} recorded)",
                         QueryCount::MANY_READS,
@@ -2066,8 +2126,9 @@ fn subject_of(model: &Model, mut span: usize) -> Option<&str> {
 /// The first path in a type name that is not the scheduler's or the query engine's plumbing:
 /// `hir_def::nameres::facts::collect::expand_all` out of a pool job's closure type.
 fn code_in(function: &str) -> &str {
-    const PLUMBING: [&str; 8] = [
+    const PLUMBING: [&str; 9] = [
         "blaze_graph::",
+        "blaze_memo::",
         "blaze_query::",
         "base_db::db::",
         "core::",
@@ -2122,4 +2183,37 @@ fn file_in(text: &str) -> Option<String> {
     let end = rest.find(|c: char| c.is_whitespace() || c == ')' || c == ',').unwrap_or(rest.len());
     let it = &rest[..end];
     it.contains(".rs").then(|| it.to_owned())
+}
+
+/// What to do about waits the critical path could not cross, by who they say ends them
+/// (`spans.owned_by`): each kind of owner is crossed by another row, and a class that still
+/// reads as ownerless lacks that row.
+fn ownerless_fix(by: Option<blaze_graph::wait::OwnedBy>) -> &'static str {
+    use blaze_graph::wait::OwnedBy;
+    match by {
+        Some(OwnedBy::Job) => {
+            "its `owner` names a job with no lane in the record (a job on no fiber, or one whose switches are of no build read): give that job's work a `job` span, or run it on the pool"
+        }
+        Some(OwnedBy::Sender) => {
+            "say who woke it as the wait ends: `blaze_graph::wait::wait_woken` with the job that posted (as `blaze_graph::sched::observed` numbers it), so the critical path crosses into that job"
+        }
+        Some(OwnedBy::Daemon) => {
+            "the record holds no `loop: a job's answer` span of its daemon while it waited: the daemon's rows of this build are missing, or its answer's span was too short for a row"
+        }
+        Some(OwnedBy::ScopeJobs) => {
+            "the scope's jobs wrote no `ready` row for the waiter: the recorder lost switches, or the scope's caller is on no fiber"
+        }
+        Some(OwnedBy::Holder) => {
+            "the lock's holder is a thread: `blaze debug locks` (`lock_waits`) names it and what to use in the lock's place"
+        }
+        Some(OwnedBy::Kernel | OwnedBy::Child) => {
+            "the wait is on the kernel or a child process, which no job ends: shorten the io, or move it off the path"
+        }
+        Some(OwnedBy::Unsaid) => {
+            "a key's wait whose caller named no runner: pass the runner's job to `blaze_graph::wait::wait` at that call"
+        }
+        None => {
+            "a wait of a blaze before `spans.owned_by`: set the wait's `owner` (the job running the key) so the critical path can cross it"
+        }
+    }
 }

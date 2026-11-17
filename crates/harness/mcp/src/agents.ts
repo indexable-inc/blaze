@@ -1,7 +1,9 @@
 // Deprecated: the first agent-tree API, kept as thin aliases over the object API in obj.ts
 // (spawn/obj/objects/tree, Obj.prompt/screen/kill/reply). Ids here are bare session numbers.
+import type { Docs } from "./docs.ts";
 import { table, type Table } from "./table.ts";
 import { req } from "./daemon.ts";
+import { session as selfId } from "./self.ts";
 
 export type Kind = "claude" | "codex" | "cursor" | "shell";
 export type AgentInfo = {
@@ -9,7 +11,6 @@ export type AgentInfo = {
   exit: number | null; attached: number; cols: number; rows: number; created_ms: number;
 };
 
-const selfId = (): number | null => (process.env.HARNESS_SESSION ? Number(process.env.HARNESS_SESSION) : null);
 
 const pick = (s: AgentInfo): AgentInfo => ({
   id: s.id, kind: s.kind, parent: s.parent, title: s.title, cwd: s.cwd, exit: s.exit,
@@ -84,5 +85,14 @@ export const agents = {
   async url(id?: number): Promise<string> {
     const { web } = await req<{ web: string }>({ op: "info" });
     return id === undefined ? web : `${web}/#${id}`;
+  },
+};
+
+/** What help() says about this module's calls (docs.ts). */
+export const docs: Docs = {
+  agents: {
+    area: "agents",
+    sig: "agents.*",
+    about: "deprecated aliases of the above (bare session numbers): self(), parent(), list(), tree(), spawn(), send(), notifyParent(text), screen(), waitFor(), kill(), url(id?) (web UI link).",
   },
 };

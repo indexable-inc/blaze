@@ -1,0 +1,11 @@
+{
+ "id": "edit3-1",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane edit3-1111",
+ "where": "the task's premise: the 50 ms Status round trip",
+ "what": "The brief's spans (`client: connect to the daemon` 50.8 ms with `client: ask the daemon which blaze it is and what it keeps` inside) were of a command run with `BLAZE_DUCKDB` in its environment, as the brief's one fixed environment has it. Any `BLAZE_*` but `BLAZE_HOME` makes the thin blaze hand the command line to the engine before it connects (`blaze --thin-route run -q` says `engine: the environment sets BLAZE_DUCKDB`), and the engine's client does its own Status and a second connect. The timed row (no such variable) never ran that path: there the thin blaze asked one Status, answered at once (`request: read to reply` of request 1, 0.0 ms), and handed over after 25 ms. So the profile that was read was of another client than the one timed.",
+ "cost": "the first hour looked for a Status that queues behind the loop; there was none on the timed path",
+ "cause": "the daemon keeps `BLAZE_DUCKDB` for its life and refuses a client whose value differs, so the measuring environment sets it, and the thin blaze leaves every `BLAZE_*` to the engine (`blaze_thin::route::refuses`)",
+ "workaround": "start the daemon with `BLAZE_DUCKDB` set, time commands without it, and run `debug sql` with it",
+ "state": "open: a measuring environment that changes which client runs is a trap; `blaze debug sql` could take the daemon's DuckDB when the client sets none (it does), so the brief's line can drop the variable from the timed commands"
+}

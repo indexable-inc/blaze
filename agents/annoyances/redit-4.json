@@ -1,0 +1,11 @@
+{
+ "id": "redit-4",
+ "date": "2026-11-11",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane redit-1111",
+ "where": "blaze: `blaze why` after the first edit",
+ "what": "For 198 of the 249 units reth's first edit computed again `blaze why` said `the reason could not be worked out: its crate's identity was not worked out since the front end's last write`, and for 4 `this build computed it 2 times under different keys` (serde's and serde_core's build scripts, built for two profiles).",
+ "cost": "the tool meant to say why gave a reason for 6 units of 249",
+ "cause": "identities are cleared by every write and made again only for units that miss; two units of one package and target kind are told apart by less than their keys",
+ "workaround": "read `key_parts` and the spans by hand",
+ "state": "open"
+}

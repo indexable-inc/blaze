@@ -13,7 +13,7 @@ doctest = false
 gpu-macros = { path = "../gpu-macros" }
 
 [dev-dependencies]
-hegeltest = { path = "../../vendor/hegeltest", default-features = false, features = ["static-engine"] }
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

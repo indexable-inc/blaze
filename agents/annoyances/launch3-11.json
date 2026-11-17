@@ -1,0 +1,12 @@
+{
+ "id": "launch3-11",
+ "date": "2026-11-12",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), lane launch3-1111",
+ "where": "blaze-cargo's unit records, a launched program",
+ "what": "A unit's record is replayed when its inputs are ones the store has seen, and says which file the build made. A launched program's file is the launcher, the same bytes for every build, so a replay left the daemon's core of the program on the code of the build before: `v1, v2, v1` printed `v1, v2, v2`. After a daemon restart a replay left no code held at all.",
+ "cost": "found only because the measuring script checks each run's output; one wrong output in an interleaved run of 22 edits, on values a run before had built",
+ "cause": "the record model assumes an output file is the build; for a launched program the build is state in the daemon",
+ "workaround": "a launched program's unit is never replayed (`launch::never_replayed`): its codegen walks what is kept",
+ "state": "fixed in 37183494ee; open: a record that names the build's code (its functions' and statics' ids), so a replay can give the core that build without the walk",
+ "fix": ""
+}

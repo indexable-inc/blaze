@@ -17,25 +17,41 @@ pub struct Rng {
 }
 
 impl Rng {
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn new(seed: u64) -> Rng {
         Rng { draws: SplitMix64::new(seed) }
     }
 
     /// Another generator, seeded from this one's next number.
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn fork(&mut self) -> Rng {
         Rng::new(self.draws.next_u64())
     }
 
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn next_u64(&mut self) -> u64 {
         self.draws.next_u64()
     }
 
     /// A number in `0..n`. An empty range cannot be asked for: `n` is not zero (it was once
     /// answered 0, a number not in the range, unsaid).
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn below(&mut self, n: NonZero<u64>) -> u64 {
         self.draws.below(n.get())
     }
 
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn fill(&mut self, out: &mut [u8]) {
         self.draws.fill(out);
     }

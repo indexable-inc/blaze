@@ -46,6 +46,8 @@ use crate::Format;
 use crate::dwarf::{self, Row};
 use crate::unwind::uleb;
 
+mod crc;
+
 /// A subprogram entry's bytes: its abbreviation, a name's offset (or 4 unread bytes), an
 /// 8-byte address and a 4-byte size.
 pub(crate) const DIE: usize = 17;
@@ -193,6 +195,9 @@ pub struct DebugWrite {
     /// The functions whose rows were encoded to make this: those of the link's change when
     /// the update followed one, every function otherwise ([`DebugWrite::all`] says why).
     pub encoded: u64,
+    /// The bytes of the file read to seal it (ELF: its CRC-32, kept by block, [`crc`]): the
+    /// blocks the writes touch for a patch, the file for one laid out whole.
+    pub summed: u64,
     /// Why every function was encoded and compared, when the update did not follow a
     /// link's change.
     pub all: Option<&'static str>,
@@ -437,10 +442,31 @@ impl From<String> for Stop {
     }
 }
 
+/// The side file's bytes, which whoever places the file may hold a view of
+/// ([`Kept::view`]) while the next update patches them: the update then copies them once
+/// (`Arc::make_mut`), and writes in place when no view is held, which is every update whose
+/// last file was placed by then.
+struct Bytes(std::sync::Arc<Vec<u8>>);
+
+impl std::ops::Deref for Bytes {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Vec<u8> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Bytes {
+    fn deref_mut(&mut self) -> &mut Vec<u8> {
+        // clone: the whole file, only while a view of the last update's is still held
+        std::sync::Arc::make_mut(&mut self.0)
+    }
+}
+
 /// The side file as last given, and where each function's record is in it: what the next
 /// [`Kept::update`] is a patch of. Holds the file's bytes (its sections with their room).
 pub(crate) struct Kept {
-    file: Vec<u8>,
+    file: Bytes,
     /// The build id the file carries; `None` before the first.
     id: Option<[u8; 16]>,
     format: Format,
@@ -470,12 +496,18 @@ pub(crate) struct Kept {
     asked: Option<&'static str>,
     /// The functions the update in hand encoded.
     encoded: u64,
+    /// ELF: the sums of the file's blocks before its last four bytes, which its seal's
+    /// CRC-32 is made of; `None` before the first seal.
+    sums: Option<crc::Sums>,
+    /// The bytes the update in hand read to seal the file.
+    summed: u64,
 }
 
 impl Kept {
     pub(crate) fn new() -> Kept {
         Kept {
-            file: Vec::new(),
+            // alloc: a reference count, once per image
+            file: Bytes(std::sync::Arc::new(Vec::new())),
             id: None,
             format: Format::Elf,
             // alloc: none, empty
@@ -495,6 +527,8 @@ impl Kept {
             high: 0,
             asked: None,
             encoded: 0,
+            sums: None,
+            summed: 0,
         }
     }
 
@@ -507,6 +541,7 @@ impl Kept {
     /// The bytes it holds kept.
     pub(crate) fn held(&self) -> u64 {
         (self.file.capacity()
+            + self.sums.as_ref().map_or(0, crc::Sums::held)
             + self.records.capacity() * size_of::<(InstanceKey, Record)>()
             + self.files.iter().map(|it| 2 * it.capacity()).sum::<usize>()) as u64
     }
@@ -520,6 +555,13 @@ impl Kept {
     #[cfg(test)]
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.file
+    }
+
+    /// The side file's whole bytes as last given, shared: what whoever places the file
+    /// writes when what is at its path is not the file the last update's patch is over.
+    /// Nothing is copied unless the next update finds the view still held ([`Bytes`]).
+    pub(crate) fn view(&self) -> std::sync::Arc<Vec<u8>> {
+        std::sync::Arc::clone(&self.file.0) // clone: a reference count
     }
 
     /// What brings the side file to `input`: a patch of the file last given where it fits one,
@@ -538,6 +580,7 @@ impl Kept {
     ) -> Result<Option<DebugWrite>, String> {
         let changed = matches!(input.given, Given::Changed { .. });
         self.encoded = 0;
+        self.summed = 0;
         let Some(name) = file_name(input.format, input.name) else {
             // alloc: error path
             return Err(format!(
@@ -574,6 +617,7 @@ impl Kept {
                         writes,
                         records,
                         encoded: self.encoded,
+                        summed: self.summed,
                         all,
                         whole: None,
                         plist: plist(input.format, input.name),
@@ -605,6 +649,7 @@ impl Kept {
             writes: vec![(0, self.file.clone())],
             records: input.functions.len() as u64,
             encoded: self.encoded,
+            summed: self.summed,
             all,
             whole: Some(why),
             plist: plist(input.format, input.name),
@@ -756,17 +801,37 @@ impl Kept {
         for (slot, bytes) in slots.iter().zip([&abbrev, &info, &strings, &line, &symtab, &strtab]) {
             self.file[slot.range()].copy_from_slice(bytes);
         }
-        self.seal(input, end);
+        self.seal(input, end, None);
         Ok(())
     }
 
     /// ELF: the last four bytes, so the file's CRC-32 is [`link_crc`] of the build id.
-    fn seal(&mut self, input: &Input<'_>, end: u64) {
-        if input.format == Format::Elf {
-            let end = end as usize;
-            let fix = crc_fix(crc32(&self.file[..end]), link_crc(&input.id));
-            self.file[end..end + 4].copy_from_slice(&fix);
+    /// `wrote` is every range of the file written since its last seal, for a patch: the
+    /// sums kept of its blocks ([`crc::Sums`]) read those blocks alone. `None` sums the file
+    /// whole, as do sums of another length (a layout that moved the end).
+    fn seal(&mut self, input: &Input<'_>, end: u64, wrote: Option<&[(u64, u64)]>) {
+        if input.format != Format::Elf {
+            return;
         }
+        let end = end as usize;
+        let before = &self.file[..end];
+        let read = match (&mut self.sums, wrote) {
+            (Some(sums), Some(wrote)) if sums.len() == end => {
+                let had = sums.read;
+                sums.wrote_all(before, wrote);
+                sums.read - had
+            }
+            _ => {
+                let sums = crc::Sums::of(before);
+                let read = sums.read;
+                self.sums = Some(sums);
+                read
+            }
+        };
+        self.summed += read;
+        let crc = self.sums.as_ref().map_or(0, crc::Sums::crc32);
+        let fix = crc_fix(crc, link_crc(&input.id));
+        self.file[end..end + 4].copy_from_slice(&fix);
     }
 
     /// The file last given brought to `input` in place: the ranges written, by offset, and
@@ -992,7 +1057,7 @@ impl Kept {
             self.head_len = head.len() as u64;
         }
         if input.format == Format::Elf {
-            self.seal(input, end);
+            self.seal(input, end, Some(&dirty));
             dirty.push((end, 4));
         }
         dirty.sort_unstable();

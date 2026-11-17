@@ -103,6 +103,12 @@ impl Setting {
         self.rate <= 0.0
     }
 
+    /// This setting at a rate of at least `rate`, its seed kept: what a build that must be
+    /// checked runs with whatever its request asked (blaze-cargo's `serve::dev_toolchain`).
+    pub fn at_least(self, rate: f64) -> Setting {
+        Setting { rate: self.rate.max(rate), ..self }
+    }
+
     /// Whether the hit stored under `identity` is recomputed: the first eight bytes of
     /// `hash(seed, identity)` below `rate` of their range, so a rate of one takes every hit
     /// and zero none.
