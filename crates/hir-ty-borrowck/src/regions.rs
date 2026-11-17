@@ -1807,47 +1807,67 @@ impl<'a, 'db> Builder<'_, 'a, 'db> {
     /// The type of the closure's parameter `index`, where the closure is typed without an
     /// expected signature, with each lifetime elided in its written type a late-bound one of
     /// the closure's own, as rustc's closure signature binds them: `|x: &i32| -> &i32 { x }`
-    /// returns what lives as long as the call, not as long as the closure's type says.
+    /// returns what lives as long as the call, not as long as the closure's type says. One
+    /// lifetime left out is one region wherever it appears: a trait object's default lifetime
+    /// is its reference's (rustc's `resolve_object_lifetime_default`), so `|x: W<&mut dyn T>|`
+    /// takes a `W<&'a mut (dyn T + 'a)>`, not a `W<&'a mut (dyn T + 'b)>` that no
+    /// `W<&mut dyn T>` parameter would accept.
     fn elided_own(&mut self, index: usize, ty: Ty<'db>) -> Option<Ty<'db>> {
         let closure = self.ctx.closure_expr?;
         if !self.ctx.infer.closures_without_expectation.contains(&closure) {
             return None;
         }
-        let hir_def::hir::Expr::Closure { arg_types, .. } = self.ctx.store.expr(closure) else {
+        let hir_def::hir::Expr::Closure { arg_types, binder, .. } = self.ctx.store.expr(closure)
+        else {
             return None;
         };
-        // A lifetime of the closure's `for<'a, ..>` is bound here, so not left out.
-        let written = self.lower_closure_written(closure, (*arg_types.get(index)?)?);
-        let frame = self.ctx.frame;
-        let regions = |ty: Ty<'db>| {
-            let mut found = Vec::new_in(frame);
-            rustc_type_ir::fold_regions(self.interner(), ty, |region, _| {
-                found.push(region);
-                region
-            });
-            found
+        let type_ref = (*arg_types.get(index)?)?;
+        // A lifetime of the closure's `for<'a, ..>` is bound here, so not left out. Without the
+        // binder, each lifetime left out is a region the signature binds, escaping the type.
+        let unbound = binder.is_empty();
+        let written = match unbound {
+            true => {
+                self.lowering(MirSpan::ExprId(closure), |ctx| ctx.lower_closure_param(type_ref))
+            }
+            false => self.lower_closure_written(closure, type_ref),
         };
-        let elided: FVec<'_, bool> = mem::collect(
-            frame,
-            regions(written).into_iter().map(|region| {
-                !matches!(
-                    region.kind(),
-                    RegionKind::ReEarlyParam(_)
-                        | RegionKind::ReLateParam(_)
-                        | RegionKind::ReStatic
-                        | RegionKind::ReBound(..)
-                )
-            }),
-        );
-        if elided.len() != regions(ty).len() || !elided.contains(&true) {
+        let frame = self.ctx.frame;
+        // Per region of the written type, in order: `None` where it is written, else the
+        // lifetime left out it stands for (`Some(None)`: none named, a region of its own).
+        let mut left_out = Vec::new_in(frame);
+        rustc_type_ir::fold_regions(self.interner(), written, |region, depth| {
+            left_out.push(match region.kind() {
+                RegionKind::ReBound(rustc_type_ir::BoundVarIndexKind::Bound(debruijn), bound)
+                    if unbound && debruijn == depth =>
+                {
+                    Some(Some(bound.var.as_u32()))
+                }
+                RegionKind::ReEarlyParam(_)
+                | RegionKind::ReLateParam(_)
+                | RegionKind::ReStatic
+                | RegionKind::ReBound(..) => None,
+                _ => Some(None),
+            });
+            region
+        });
+        let mut count = 0;
+        rustc_type_ir::fold_regions(self.interner(), ty, |region, _| {
+            count += 1;
+            region
+        });
+        if left_out.len() != count || !left_out.iter().any(Option::is_some) {
             return None;
         }
+        let mut own = mem::map(frame);
         let mut position = 0;
         Some(rustc_type_ir::fold_regions(self.interner(), ty, |region, _| {
             position += 1;
-            match elided[position - 1] {
-                true => self.new_universal(UniversalKind::AnonParam),
-                false => region,
+            match left_out[position - 1] {
+                Some(Some(var)) => {
+                    *own.entry(var).or_insert_with(|| self.new_universal(UniversalKind::AnonParam))
+                }
+                Some(None) => self.new_universal(UniversalKind::AnonParam),
+                None => region,
             }
         }))
     }

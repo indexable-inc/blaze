@@ -1490,6 +1490,17 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         result
     }
 
+    /// `type_ref`, a parameter's type of a closure written without a `for<'a, ..>` binder,
+    /// lowered as its signature has it ([`Self::lower_closure_params`]): each lifetime it leaves
+    /// out a region bound at the innermost binder, which escapes the type. A trait object's
+    /// default lifetime is the lifetime it defaults to, so `&dyn Trait` is
+    /// `&'^0 (dyn Trait + '^0)`, one lifetime left out where a region appears twice.
+    pub fn lower_closure_param(&mut self, type_ref: TypeRefId) -> Ty<'db> {
+        let (ty, _) =
+            self.with_shifted_in(&[], |ctx| ctx.with_elision(true, |ctx| ctx.lower_ty(type_ref)));
+        ty
+    }
+
     /// `type_ref`, a parameter's or the return type of a closure whose `for<'a, ..>` binder
     /// has the lifetimes `binder`, lowered as its signature has it: each of the binder's
     /// lifetimes a region bound at the innermost binder, which escapes the type
